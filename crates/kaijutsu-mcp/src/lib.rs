@@ -60,7 +60,7 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
 use kaijutsu_client::{ActorHandle, ServerEvent, SshConfig, SyncManager, connect_ssh, spawn_actor};
-use kaijutsu_crdt::{ContextId, ConversationDAG, PrincipalId};
+use kaijutsu_crdt::{ContextId, ConversationDAG, PrincipalId, Status};
 use kaijutsu_kernel::{DocumentKind, SharedBlockStore, shared_block_store, shared_block_flow_bus};
 
 // Re-export public types
@@ -704,6 +704,7 @@ impl KaijutsuMcp {
             role,
             kind,
             &content,
+            Status::Done,
             Some(PrincipalId::system()),
         ) {
             Ok(block_id) => {
@@ -2915,7 +2916,7 @@ mod tests {
         let server = shared_block_store(PrincipalId::new());
         server.create_document(context_id, DocumentKind::Conversation, None)
             .expect("create server document");
-        server.insert_block(context_id, None, None, Role::User, BlockKind::Text, "Hello from server")
+        server.insert_block(context_id, None, None, Role::User, BlockKind::Text, "Hello from server", Status::Done)
             .expect("insert block on server");
 
         // Client store — synced from server via SyncPayload
@@ -2951,7 +2952,7 @@ mod tests {
 
         // Server inserts a new block
         let pre_frontier = server.frontier(ctx_id).unwrap();
-        let block_id = server.insert_block(ctx_id, None, None, Role::Model, BlockKind::Text, "New block from server")
+        let block_id = server.insert_block(ctx_id, None, None, Role::Model, BlockKind::Text, "New block from server", Status::Done)
             .expect("insert");
         let ops_bytes = server_ops_bytes(&server, ctx_id, &pre_frontier);
         let block = server.get(ctx_id).unwrap().doc.get_block_snapshot(&block_id).unwrap();
@@ -3052,7 +3053,7 @@ mod tests {
 
         // Server inserts a new block
         let pre_frontier = server.frontier(ctx_id).unwrap();
-        let block_id = server.insert_block(ctx_id, None, None, Role::Model, BlockKind::Text, "Should not appear")
+        let block_id = server.insert_block(ctx_id, None, None, Role::Model, BlockKind::Text, "Should not appear", Status::Done)
             .expect("insert");
         let ops_bytes = server_ops_bytes(&server, ctx_id, &pre_frontier);
         let block = server.get(ctx_id).unwrap().doc.get_block_snapshot(&block_id).unwrap();
@@ -3083,7 +3084,7 @@ mod tests {
 
         // Apply a block insert
         let pre_frontier = server.frontier(ctx_id).unwrap();
-        let block_id = server.insert_block(ctx_id, None, None, Role::User, BlockKind::Text, "Version bump test")
+        let block_id = server.insert_block(ctx_id, None, None, Role::User, BlockKind::Text, "Version bump test", Status::Done)
             .expect("insert");
         let ops_bytes = server_ops_bytes(&server, ctx_id, &pre_frontier);
         let block = server.get(ctx_id).unwrap().doc.get_block_snapshot(&block_id).unwrap();
@@ -3112,7 +3113,7 @@ mod tests {
         let mut inserted_ids = Vec::new();
         for i in 0..3 {
             let pre = server.frontier(ctx_id).unwrap();
-            let bid = server.insert_block(ctx_id, None, None, Role::Model, BlockKind::Text, &format!("Block {i}"))
+            let bid = server.insert_block(ctx_id, None, None, Role::Model, BlockKind::Text, &format!("Block {i}"), Status::Done)
                 .expect("insert");
             let ops = server_ops_bytes(&server, ctx_id, &pre);
             let block = server.get(ctx_id).unwrap().doc.get_block_snapshot(&bid).unwrap();
@@ -3249,7 +3250,7 @@ mod tests {
         // Server adds a new block. Ops are incremental (not full oplog) —
         // this is what would arrive after missing some events.
         let pre_frontier = server.frontier(ctx_id).unwrap();
-        let block_id = server.insert_block(ctx_id, None, None, Role::Model, BlockKind::Text, "Post-reset block")
+        let block_id = server.insert_block(ctx_id, None, None, Role::Model, BlockKind::Text, "Post-reset block", Status::Done)
             .expect("insert");
         let ops_bytes = server_ops_bytes(&server, ctx_id, &pre_frontier);
         let block = server.get(ctx_id).unwrap().doc.get_block_snapshot(&block_id).unwrap();

@@ -291,6 +291,7 @@ impl BlockCreateEngine {
                 role,
                 kind,
                 &content,
+                Status::Done,
                 Some(ctx.principal_id),
             )
             .map_err(|e| EditError::StoreError(e.to_string()))?;
@@ -1484,7 +1485,7 @@ mod tests {
         let (store, ctx, tool_ctx) = setup_test_store();
 
         // Create a block first
-        let block_id = store.insert_block(ctx, None, None, Role::User, BlockKind::Text, "hello").unwrap();
+        let block_id = store.insert_block(ctx, None, None, Role::User, BlockKind::Text, "hello", Status::Done).unwrap();
 
         let engine = BlockAppendEngine::new(store.clone());
         let params = format!(r#"{{"block_id": "{}", "text": " world"}}"#, block_id.to_key());
@@ -1501,7 +1502,7 @@ mod tests {
     async fn test_block_edit_insert() {
         let (store, ctx, tool_ctx) = setup_test_store();
 
-        let block_id = store.insert_block(ctx, None, None, Role::User, BlockKind::Text, "line1\nline3\n").unwrap();
+        let block_id = store.insert_block(ctx, None, None, Role::User, BlockKind::Text, "line1\nline3\n", Status::Done).unwrap();
 
         let engine = BlockEditEngine::new(store.clone());
         let params = format!(
@@ -1522,7 +1523,7 @@ mod tests {
     async fn test_block_edit_replace_with_cas() {
         let (store, ctx, tool_ctx) = setup_test_store();
 
-        let block_id = store.insert_block(ctx, None, None, Role::User, BlockKind::Text, "hello\nworld\n").unwrap();
+        let block_id = store.insert_block(ctx, None, None, Role::User, BlockKind::Text, "hello\nworld\n", Status::Done).unwrap();
 
         let engine = BlockEditEngine::new(store.clone());
 
@@ -1548,7 +1549,7 @@ mod tests {
     async fn test_block_read() {
         let (store, ctx, _tool_ctx) = setup_test_store();
 
-        let block_id = store.insert_block(ctx, None, None, Role::User, BlockKind::Text, "fn main() {\n    println!(\"Hi\");\n}").unwrap();
+        let block_id = store.insert_block(ctx, None, None, Role::User, BlockKind::Text, "fn main() {\n    println!(\"Hi\");\n}", Status::Done).unwrap();
 
         let engine = BlockReadEngine::new(store.clone());
         let params = format!(r#"{{"block_id": "{}"}}"#, block_id.to_key());
@@ -1564,7 +1565,7 @@ mod tests {
     async fn test_block_search() {
         let (store, ctx, _tool_ctx) = setup_test_store();
 
-        let block_id = store.insert_block(ctx, None, None, Role::User, BlockKind::Text, "apple\nbanana\napricot\ncherry\n").unwrap();
+        let block_id = store.insert_block(ctx, None, None, Role::User, BlockKind::Text, "apple\nbanana\napricot\ncherry\n", Status::Done).unwrap();
 
         let engine = BlockSearchEngine::new(store.clone());
         let params = format!(r#"{{"block_id": "{}", "query": "ap", "context_lines": 1}}"#, block_id.to_key());
@@ -1580,8 +1581,8 @@ mod tests {
     async fn test_block_list() {
         let (store, ctx, _tool_ctx) = setup_test_store();
 
-        store.insert_block(ctx, None, None, Role::User, BlockKind::Text, "user message").unwrap();
-        store.insert_block(ctx, None, None, Role::Model, BlockKind::Thinking, "thinking...").unwrap();
+        store.insert_block(ctx, None, None, Role::User, BlockKind::Text, "user message", Status::Done).unwrap();
+        store.insert_block(ctx, None, None, Role::Model, BlockKind::Thinking, "thinking...", Status::Done).unwrap();
 
         let engine = BlockListEngine::new(store.clone());
         let params = r#"{}"#;
@@ -1596,8 +1597,8 @@ mod tests {
     async fn test_block_list_with_filter() {
         let (store, ctx, _tool_ctx) = setup_test_store();
 
-        store.insert_block(ctx, None, None, Role::User, BlockKind::Text, "user message").unwrap();
-        store.insert_block(ctx, None, None, Role::Model, BlockKind::Thinking, "thinking...").unwrap();
+        store.insert_block(ctx, None, None, Role::User, BlockKind::Text, "user message", Status::Done).unwrap();
+        store.insert_block(ctx, None, None, Role::Model, BlockKind::Thinking, "thinking...", Status::Done).unwrap();
 
         let engine = BlockListEngine::new(store.clone());
         let params = r#"{"kind": "thinking"}"#;
@@ -1612,7 +1613,7 @@ mod tests {
     async fn test_block_status() {
         let (store, ctx, _tool_ctx) = setup_test_store();
 
-        let block_id = store.insert_block(ctx, None, None, Role::Model, BlockKind::ToolCall, "{}").unwrap();
+        let block_id = store.insert_block(ctx, None, None, Role::Model, BlockKind::ToolCall, "{}", Status::Done).unwrap();
 
         let engine = BlockStatusEngine::new(store.clone());
         let params = format!(r#"{{"block_id": "{}", "status": "running"}}"#, block_id.to_key());
@@ -1634,9 +1635,9 @@ mod tests {
         let ctx2 = ContextId::new();
         store.create_document(ctx2, DocumentKind::Code, Some("rust".into())).unwrap();
 
-        store.insert_block(ctx, None, None, Role::User, BlockKind::Text, "hello world\nfoo bar\nbaz").unwrap();
-        store.insert_block(ctx, None, None, Role::Model, BlockKind::Text, "hello rust\nfoo qux").unwrap();
-        store.insert_block(ctx2, None, None, Role::User, BlockKind::Text, "hello python\nbar baz").unwrap();
+        store.insert_block(ctx, None, None, Role::User, BlockKind::Text, "hello world\nfoo bar\nbaz", Status::Done).unwrap();
+        store.insert_block(ctx, None, None, Role::Model, BlockKind::Text, "hello rust\nfoo qux", Status::Done).unwrap();
+        store.insert_block(ctx2, None, None, Role::User, BlockKind::Text, "hello python\nbar baz", Status::Done).unwrap();
 
         let engine = KernelSearchEngine::new(store.clone());
 
@@ -1678,7 +1679,7 @@ mod tests {
     async fn test_batch_edit_cas_pre_validation_rejects_whole_batch() {
         let (store, ctx, tool_ctx) = setup_test_store();
         let block_id = store
-            .insert_block(ctx, None, None, Role::User, BlockKind::Text, "aaa\nbbb\nccc\n")
+            .insert_block(ctx, None, None, Role::User, BlockKind::Text, "aaa\nbbb\nccc\n", Status::Done)
             .unwrap();
         let engine = BlockEditEngine::new(store.clone());
 

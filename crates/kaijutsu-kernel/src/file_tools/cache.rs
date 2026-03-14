@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use kaijutsu_crdt::{BlockId, BlockKind, ContextId, Role};
+use kaijutsu_crdt::{BlockId, BlockKind, ContextId, Role, Status};
 use parking_lot::RwLock;
 
 use crate::block_store::SharedBlockStore;
@@ -89,7 +89,7 @@ impl FileDocumentCache {
         {
             Ok(()) => {
                 self.block_store
-                    .insert_block(ctx_id, None, None, Role::System, BlockKind::Text, text)
+                    .insert_block(ctx_id, None, None, Role::System, BlockKind::Text, text, Status::Done)
                     .map_err(|e| format!("failed to insert block for {}: {}", path, e))?
             }
             Err(_) => {
@@ -321,7 +321,7 @@ impl FileDocumentCache {
 
         let block_id = self
             .block_store
-            .insert_block(ctx_id, None, None, Role::System, BlockKind::Text, content)
+            .insert_block(ctx_id, None, None, Role::System, BlockKind::Text, content, Status::Done)
             .map_err(|e| format!("failed to insert block for {}: {}", path, e))?;
 
         {

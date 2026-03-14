@@ -256,7 +256,7 @@ impl<'a> Iterator for BfsIterator<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BlockKind, ContextId, PrincipalId, Role};
+    use crate::{BlockKind, ContextId, PrincipalId, Role, Status};
 
     fn test_doc() -> BlockDocument {
         BlockDocument::new(ContextId::new(), PrincipalId::new())
@@ -266,8 +266,8 @@ mod tests {
     fn test_dag_from_flat_document() {
         let mut doc = test_doc();
 
-        let id1 = doc.insert_block(None, None, Role::User, BlockKind::Text, "First").unwrap();
-        let id2 = doc.insert_block(None, Some(&id1), Role::Model, BlockKind::Text, "Second").unwrap();
+        let id1 = doc.insert_block(None, None, Role::User, BlockKind::Text, "First", Status::Done).unwrap();
+        let id2 = doc.insert_block(None, Some(&id1), Role::Model, BlockKind::Text, "Second", Status::Done).unwrap();
 
         let dag = ConversationDAG::from_document(&doc);
 
@@ -280,9 +280,9 @@ mod tests {
     fn test_dag_with_parent_child() {
         let mut doc = test_doc();
 
-        let parent = doc.insert_block(None, None, Role::User, BlockKind::Text, "Question").unwrap();
-        let child1 = doc.insert_block(Some(&parent), Some(&parent), Role::Model, BlockKind::Thinking, "Thinking...").unwrap();
-        let child2 = doc.insert_block(Some(&parent), Some(&child1), Role::Model, BlockKind::Text, "Answer").unwrap();
+        let parent = doc.insert_block(None, None, Role::User, BlockKind::Text, "Question", Status::Done).unwrap();
+        let child1 = doc.insert_block(Some(&parent), Some(&parent), Role::Model, BlockKind::Thinking, "Thinking...", Status::Done).unwrap();
+        let child2 = doc.insert_block(Some(&parent), Some(&child1), Role::Model, BlockKind::Text, "Answer", Status::Done).unwrap();
 
         let dag = ConversationDAG::from_document(&doc);
 
@@ -303,9 +303,9 @@ mod tests {
     fn test_dfs_iteration() {
         let mut doc = test_doc();
 
-        let root = doc.insert_block(None, None, Role::User, BlockKind::Text, "Root").unwrap();
-        let child1 = doc.insert_block(Some(&root), Some(&root), Role::Model, BlockKind::Text, "Child1").unwrap();
-        let grandchild = doc.insert_block(Some(&child1), Some(&child1), Role::Model, BlockKind::Text, "Grandchild").unwrap();
+        let root = doc.insert_block(None, None, Role::User, BlockKind::Text, "Root", Status::Done).unwrap();
+        let child1 = doc.insert_block(Some(&root), Some(&root), Role::Model, BlockKind::Text, "Child1", Status::Done).unwrap();
+        let grandchild = doc.insert_block(Some(&child1), Some(&child1), Role::Model, BlockKind::Text, "Grandchild", Status::Done).unwrap();
 
         let dag = ConversationDAG::from_document(&doc);
 
@@ -413,9 +413,9 @@ mod tests {
     fn test_subtree() {
         let mut doc = test_doc();
 
-        let root = doc.insert_block(None, None, Role::User, BlockKind::Text, "Root").unwrap();
-        let child = doc.insert_block(Some(&root), Some(&root), Role::Model, BlockKind::Text, "Child").unwrap();
-        let _other_root = doc.insert_block(None, Some(&child), Role::User, BlockKind::Text, "Other").unwrap();
+        let root = doc.insert_block(None, None, Role::User, BlockKind::Text, "Root", Status::Done).unwrap();
+        let child = doc.insert_block(Some(&root), Some(&root), Role::Model, BlockKind::Text, "Child", Status::Done).unwrap();
+        let _other_root = doc.insert_block(None, Some(&child), Role::User, BlockKind::Text, "Other", Status::Done).unwrap();
 
         let dag = ConversationDAG::from_document(&doc);
 

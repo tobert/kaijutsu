@@ -553,6 +553,7 @@ impl BlockDocument {
         role: Role,
         kind: BlockKind,
         content: impl Into<String>,
+        status: Status,
     ) -> Result<BlockId> {
         let id = self.new_block_id();
         let content_str = content.into();
@@ -564,6 +565,7 @@ impl BlockDocument {
             role,
             kind,
             content_str,
+            status,
             None, // tool_kind
             None, // tool_name
             None, // tool_input
@@ -601,6 +603,7 @@ impl BlockDocument {
             role.unwrap_or(Role::Model),
             BlockKind::ToolCall,
             input_json.clone(),
+            Status::Done,
             tool_kind,
             Some(tool_name.into()),
             Some(input_json),
@@ -639,6 +642,7 @@ impl BlockDocument {
             Role::Tool,
             BlockKind::ToolResult,
             content.into(),
+            Status::Done,
             tool_kind,
             None,
             None,
@@ -678,6 +682,7 @@ impl BlockDocument {
             Role::System,
             BlockKind::Drift,
             content.into(),
+            Status::Done,
             None, // tool_kind
             None, // tool_name
             None, // tool_input
@@ -718,6 +723,7 @@ impl BlockDocument {
             snapshot.role,
             snapshot.kind,
             snapshot.content,
+            snapshot.status,
             snapshot.tool_kind,
             snapshot.tool_name,
             snapshot.tool_input,
@@ -744,6 +750,7 @@ impl BlockDocument {
         role: Role,
         kind: BlockKind,
         content: String,
+        status: Status,
         tool_kind: Option<ToolKind>,
         tool_name: Option<String>,
         tool_input: Option<String>,
@@ -809,7 +816,7 @@ impl BlockDocument {
                 block_map.set(KEY_CREATED_AT, created_at);
                 block_map.set(KEY_KIND, kind.as_str());
                 block_map.set(KEY_ROLE, role.as_str());
-                block_map.set(KEY_STATUS, Status::Done.as_str());
+                block_map.set(KEY_STATUS, status.as_str());
                 block_map.set(KEY_COLLAPSED, false);
 
                 // Store compacted flag (only when true)
@@ -1245,6 +1252,7 @@ impl BlockDocument {
                 block.role,
                 block.kind,
                 block.content,
+                block.status,
                 block.tool_kind,
                 block.tool_name,
                 block.tool_input,
@@ -1380,6 +1388,7 @@ impl BlockDocument {
                 block_snap.role,
                 block_snap.kind,
                 content,
+                block_snap.status,
                 block_snap.tool_kind,
                 block_snap.tool_name.clone(),
                 block_snap.tool_input.clone(),
@@ -1455,11 +1464,11 @@ mod tests {
         let mut doc = test_doc();
 
         let id1 = doc.insert_block(
-            None, None, Role::User, BlockKind::Text, "Hello!",
+            None, None, Role::User, BlockKind::Text, "Hello!", Status::Done,
         ).unwrap();
 
         let id2 = doc.insert_block(
-            Some(&id1), Some(&id1), Role::Model, BlockKind::Text, "Hi there!",
+            Some(&id1), Some(&id1), Role::Model, BlockKind::Text, "Hi there!", Status::Done,
         ).unwrap();
 
         let blocks = doc.blocks_ordered();
@@ -1476,17 +1485,17 @@ mod tests {
         let mut doc = test_doc();
 
         let parent_id = doc.insert_block(
-            None, None, Role::User, BlockKind::Text, "Question",
+            None, None, Role::User, BlockKind::Text, "Question", Status::Done,
         ).unwrap();
 
         let child1 = doc.insert_block(
             Some(&parent_id), Some(&parent_id),
-            Role::Model, BlockKind::Thinking, "Thinking...",
+            Role::Model, BlockKind::Thinking, "Thinking...", Status::Done,
         ).unwrap();
 
         let child2 = doc.insert_block(
             Some(&parent_id), Some(&child1),
-            Role::Model, BlockKind::Text, "Answer",
+            Role::Model, BlockKind::Text, "Answer", Status::Done,
         ).unwrap();
 
         let children = doc.get_children(&parent_id);
@@ -1509,7 +1518,7 @@ mod tests {
         let mut doc = test_doc();
 
         let id = doc.insert_block(
-            None, None, Role::Model, BlockKind::ToolCall, "{}",
+            None, None, Role::Model, BlockKind::ToolCall, "{}", Status::Done,
         ).unwrap();
 
         let snap = doc.get_block_snapshot(&id).unwrap();
@@ -1555,9 +1564,9 @@ mod tests {
     fn test_insert_and_order() {
         let mut doc = test_doc();
 
-        let id1 = doc.insert_block(None, None, Role::User, BlockKind::Text, "First").unwrap();
-        let id2 = doc.insert_block(None, Some(&id1), Role::User, BlockKind::Text, "Second").unwrap();
-        let id3 = doc.insert_block(None, Some(&id2), Role::User, BlockKind::Text, "Third").unwrap();
+        let id1 = doc.insert_block(None, None, Role::User, BlockKind::Text, "First", Status::Done).unwrap();
+        let id2 = doc.insert_block(None, Some(&id1), Role::User, BlockKind::Text, "Second", Status::Done).unwrap();
+        let id3 = doc.insert_block(None, Some(&id2), Role::User, BlockKind::Text, "Third", Status::Done).unwrap();
 
         let order: Vec<_> = doc.blocks_ordered().iter().map(|b| b.id).collect();
         assert_eq!(order, vec![id1, id2, id3]);
@@ -1567,8 +1576,8 @@ mod tests {
     fn test_insert_at_beginning() {
         let mut doc = test_doc();
 
-        let id1 = doc.insert_block(None, None, Role::User, BlockKind::Text, "First").unwrap();
-        let id2 = doc.insert_block(None, None, Role::User, BlockKind::Text, "Before First").unwrap();
+        let id1 = doc.insert_block(None, None, Role::User, BlockKind::Text, "First", Status::Done).unwrap();
+        let id2 = doc.insert_block(None, None, Role::User, BlockKind::Text, "Before First", Status::Done).unwrap();
 
         let order: Vec<_> = doc.blocks_ordered().iter().map(|b| b.id).collect();
         assert_eq!(order, vec![id2, id1]);
@@ -1578,8 +1587,8 @@ mod tests {
     fn test_snapshot_roundtrip() {
         let mut doc = test_doc();
 
-        doc.insert_block(None, None, Role::Model, BlockKind::Thinking, "Thinking...").unwrap();
-        doc.insert_block(None, None, Role::Model, BlockKind::Text, "Response").unwrap();
+        doc.insert_block(None, None, Role::Model, BlockKind::Thinking, "Thinking...", Status::Done).unwrap();
+        doc.insert_block(None, None, Role::Model, BlockKind::Text, "Response", Status::Done).unwrap();
 
         let snapshot = doc.snapshot();
         let restored = BlockDocument::from_snapshot(snapshot.clone(), PrincipalId::new());
@@ -1592,7 +1601,7 @@ mod tests {
     fn test_text_editing() {
         let mut doc = test_doc();
 
-        let id = doc.insert_block(None, None, Role::User, BlockKind::Text, "Hello").unwrap();
+        let id = doc.insert_block(None, None, Role::User, BlockKind::Text, "Hello", Status::Done).unwrap();
         doc.append_text(&id, " World").unwrap();
 
         let text = doc.get_block_snapshot(&id).unwrap().content;
@@ -1607,9 +1616,9 @@ mod tests {
     fn test_move_block() {
         let mut doc = test_doc();
 
-        let a = doc.insert_block(None, None, Role::User, BlockKind::Text, "A").unwrap();
-        let b = doc.insert_block(None, Some(&a), Role::User, BlockKind::Text, "B").unwrap();
-        let c = doc.insert_block(None, Some(&b), Role::User, BlockKind::Text, "C").unwrap();
+        let a = doc.insert_block(None, None, Role::User, BlockKind::Text, "A", Status::Done).unwrap();
+        let b = doc.insert_block(None, Some(&a), Role::User, BlockKind::Text, "B", Status::Done).unwrap();
+        let c = doc.insert_block(None, Some(&b), Role::User, BlockKind::Text, "C", Status::Done).unwrap();
 
         let ordered = doc.blocks_ordered();
         assert_eq!(ordered.len(), 3);
@@ -1644,7 +1653,7 @@ mod tests {
         let frontier_after_init = server.frontier();
 
         let _block_id = server.insert_block(
-            None, None, Role::User, BlockKind::Text, "Hello from server",
+            None, None, Role::User, BlockKind::Text, "Hello from server", Status::Done,
         ).unwrap();
 
         let incremental_ops = server.ops_since(&frontier_after_init);
@@ -1670,7 +1679,7 @@ mod tests {
         let mut server = test_doc();
 
         let _block_id = server.insert_block(
-            None, None, Role::User, BlockKind::Text, "Hello from server",
+            None, None, Role::User, BlockKind::Text, "Hello from server", Status::Done,
         ).unwrap();
 
         let full_ops = server.ops_since(&Frontier::root());
@@ -1698,7 +1707,7 @@ mod tests {
         let frontier_before_block = server.frontier();
 
         let _block_id = server.insert_block(
-            None, None, Role::User, BlockKind::Text, "New block",
+            None, None, Role::User, BlockKind::Text, "New block", Status::Done,
         ).unwrap();
 
         let incremental_ops = server.ops_since(&frontier_before_block);
@@ -1711,7 +1720,7 @@ mod tests {
     fn test_snapshot_then_streaming_should_work() {
         let mut server = test_doc();
         let block_id = server.insert_block(
-            None, None, Role::Model, BlockKind::Text, "Initial content",
+            None, None, Role::Model, BlockKind::Text, "Initial content", Status::Done,
         ).unwrap();
 
         let oplog_bytes = server.oplog_bytes().unwrap();
@@ -1744,7 +1753,7 @@ mod tests {
 
         let mut server = test_doc();
         let block_id = server.insert_block(
-            None, None, Role::Model, BlockKind::Text, "",
+            None, None, Role::Model, BlockKind::Text, "", Status::Done,
         ).unwrap();
 
         let full_ops = server.ops_since(&Frontier::root());
@@ -1772,12 +1781,12 @@ mod tests {
         let original_agent = original.agent_id();
 
         let user_msg = original.insert_block(
-            None, None, Role::User, BlockKind::Text, "Hello Claude!",
+            None, None, Role::User, BlockKind::Text, "Hello Claude!", Status::Done,
         ).unwrap();
 
         let _model_response = original.insert_block(
             Some(&user_msg), Some(&user_msg),
-            Role::Model, BlockKind::Text, "Hi Amy!",
+            Role::Model, BlockKind::Text, "Hi Amy!", Status::Done,
         ).unwrap();
 
         let fork_ctx = ContextId::new();
@@ -1832,7 +1841,7 @@ mod tests {
         let mut doc = BlockDocument::new(ctx, alice);
 
         let alice_msg = doc.insert_block(
-            None, None, Role::User, BlockKind::Text, "Alice here",
+            None, None, Role::User, BlockKind::Text, "Alice here", Status::Done,
         ).unwrap();
         assert_eq!(alice_msg.agent_id, alice);
 
@@ -1949,18 +1958,18 @@ mod tests {
         let mut doc = test_doc();
 
         let first = doc.insert_block(
-            None, None, Role::User, BlockKind::Text, "First",
+            None, None, Role::User, BlockKind::Text, "First", Status::Done,
         ).unwrap();
 
         let _last = doc.insert_block(
-            None, Some(&first), Role::User, BlockKind::Text, "Last",
+            None, Some(&first), Role::User, BlockKind::Text, "Last", Status::Done,
         ).unwrap();
 
         let mut middle_ids = Vec::new();
         for i in 0..100 {
             let id = doc.insert_block(
                 None, Some(&first),
-                Role::User, BlockKind::Text, &format!("Middle-{}", i),
+                Role::User, BlockKind::Text, &format!("Middle-{}", i), Status::Done,
             ).unwrap();
             middle_ids.push(id);
         }
@@ -2002,7 +2011,7 @@ mod tests {
         let source_ctx = ContextId::new();
 
         let user_msg = original.insert_block(
-            None, None, Role::User, BlockKind::Text, "Hello!",
+            None, None, Role::User, BlockKind::Text, "Hello!", Status::Done,
         ).unwrap();
 
         let drift_id = BlockId::new(original.context_id(), original.agent_id(), 99);
@@ -2139,9 +2148,9 @@ mod tests {
     fn test_compact_preserves_blocks() {
         let mut doc = test_doc();
 
-        let id1 = doc.insert_block(None, None, Role::User, BlockKind::Text, "Hello!").unwrap();
-        let id2 = doc.insert_block(Some(&id1), Some(&id1), Role::Model, BlockKind::Text, "Hi there!").unwrap();
-        let id3 = doc.insert_block(Some(&id2), Some(&id2), Role::Model, BlockKind::Thinking, "Let me think...").unwrap();
+        let id1 = doc.insert_block(None, None, Role::User, BlockKind::Text, "Hello!", Status::Done).unwrap();
+        let id2 = doc.insert_block(Some(&id1), Some(&id1), Role::Model, BlockKind::Text, "Hi there!", Status::Done).unwrap();
+        let id3 = doc.insert_block(Some(&id2), Some(&id2), Role::Model, BlockKind::Thinking, "Let me think...", Status::Done).unwrap();
 
         doc.edit_text(&id1, 6, " World", 0).unwrap();
         doc.edit_text(&id2, 9, " How are you?", 0).unwrap();
@@ -2174,7 +2183,7 @@ mod tests {
         let server_agent = PrincipalId::new();
         let mut doc = BlockDocument::new(ctx, server_agent);
 
-        let id1 = doc.insert_block(None, None, Role::User, BlockKind::Text, "First").unwrap();
+        let id1 = doc.insert_block(None, None, Role::User, BlockKind::Text, "First", Status::Done).unwrap();
         doc.edit_text(&id1, 5, " message", 0).unwrap();
 
         doc.compact().unwrap();
@@ -2188,7 +2197,7 @@ mod tests {
         assert_eq!(client_blocks.len(), 1);
         assert_eq!(client_blocks[0].content, "First message");
 
-        let client_id = client.insert_block(Some(&id1), Some(&id1), Role::Model, BlockKind::Text, "Reply").unwrap();
+        let client_id = client.insert_block(Some(&id1), Some(&id1), Role::Model, BlockKind::Text, "Reply", Status::Done).unwrap();
         let client_ops = client.ops_since(&doc.frontier());
         doc.merge_ops_owned(client_ops).unwrap();
 
@@ -2207,7 +2216,7 @@ mod tests {
             let role = if ids.len() % 2 == 0 { Role::User } else { Role::Model };
             let id = doc.insert_block(
                 last_id.as_ref(), last_id.as_ref(),
-                role, BlockKind::Text, "initial content here",
+                role, BlockKind::Text, "initial content here", Status::Done,
             ).unwrap();
             ids.push(id);
             last_id = Some(id);
@@ -2245,7 +2254,7 @@ mod tests {
     fn test_promote_to_register() {
         let mut doc = test_doc();
 
-        let id = doc.insert_block(None, None, Role::Model, BlockKind::Text, "Hello World").unwrap();
+        let id = doc.insert_block(None, None, Role::Model, BlockKind::Text, "Hello World", Status::Done).unwrap();
         doc.promote_to_register(&id).unwrap();
 
         let snap = doc.get_block_snapshot(&id).unwrap();
@@ -2256,11 +2265,11 @@ mod tests {
     fn test_promote_roundtrip_through_snapshot() {
         let mut doc = test_doc();
 
-        let id1 = doc.insert_block(None, None, Role::Model, BlockKind::Text, "Done block").unwrap();
+        let id1 = doc.insert_block(None, None, Role::Model, BlockKind::Text, "Done block", Status::Done).unwrap();
         doc.set_status(&id1, Status::Done).unwrap();
         doc.promote_to_register(&id1).unwrap();
 
-        let id2 = doc.insert_block(None, Some(&id1), Role::Model, BlockKind::Text, "Running block").unwrap();
+        let id2 = doc.insert_block(None, Some(&id1), Role::Model, BlockKind::Text, "Running block", Status::Done).unwrap();
         doc.set_status(&id2, Status::Running).unwrap();
 
         let snapshot = doc.snapshot();
@@ -2277,7 +2286,7 @@ mod tests {
     fn test_running_blocks_not_promoted() {
         let mut doc = test_doc();
 
-        let id = doc.insert_block(None, None, Role::Model, BlockKind::Text, "Streaming...").unwrap();
+        let id = doc.insert_block(None, None, Role::Model, BlockKind::Text, "Streaming...", Status::Done).unwrap();
         doc.set_status(&id, Status::Running).unwrap();
 
         let snapshot = doc.snapshot();
@@ -2291,8 +2300,8 @@ mod tests {
     fn test_compaction_promotes_done_blocks() {
         let mut doc = test_doc();
 
-        let id1 = doc.insert_block(None, None, Role::User, BlockKind::Text, "Done content").unwrap();
-        let id2 = doc.insert_block(None, Some(&id1), Role::Model, BlockKind::Text, "Still streaming").unwrap();
+        let id1 = doc.insert_block(None, None, Role::User, BlockKind::Text, "Done content", Status::Done).unwrap();
+        let id2 = doc.insert_block(None, Some(&id1), Role::Model, BlockKind::Text, "Still streaming", Status::Done).unwrap();
         doc.set_status(&id2, Status::Running).unwrap();
 
         doc.compact().unwrap();

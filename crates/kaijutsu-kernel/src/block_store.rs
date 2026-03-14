@@ -588,8 +588,9 @@ impl BlockStore {
         role: Role,
         kind: BlockKind,
         content: impl Into<String>,
+        status: Status,
     ) -> BlockStoreResult<BlockId> {
-        self.insert_block_as(context_id, parent_id, after, role, kind, content, None)
+        self.insert_block_as(context_id, parent_id, after, role, kind, content, status, None)
     }
 
     /// Insert a block with an explicit author identity.
@@ -604,6 +605,7 @@ impl BlockStore {
         role: Role,
         kind: BlockKind,
         content: impl Into<String>,
+        status: Status,
         agent_id: Option<PrincipalId>,
     ) -> BlockStoreResult<BlockId> {
         let after_id = after.cloned();
@@ -619,7 +621,7 @@ impl BlockStore {
             // Clients that are out of sync will get full oplog via get_document_state.
             let frontier_before = entry.doc.frontier();
 
-            let block_id = entry.doc.insert_block(parent_id, after, role, kind, content)
+            let block_id = entry.doc.insert_block(parent_id, after, role, kind, content, status)
                 ?;
             let snapshot = entry.doc.get_block_snapshot(&block_id)
                 .ok_or(BlockStoreError::BlockNotFoundAfterInsert)?;
@@ -1657,7 +1659,7 @@ mod tests {
         store.create_document(ctx, DocumentKind::Code, Some("rust".into())).unwrap();
 
         // Insert a text block using new API
-        let block_id = store.insert_block(ctx, None, None, Role::User, BlockKind::Text, "hello world").unwrap();
+        let block_id = store.insert_block(ctx, None, None, Role::User, BlockKind::Text, "hello world", Status::Done).unwrap();
         assert_eq!(store.get_content(ctx).unwrap(), "hello world");
 
         // Append to the block
@@ -1677,10 +1679,10 @@ mod tests {
         store.create_document(ctx, DocumentKind::Conversation, None).unwrap();
 
         // Insert thinking block
-        let thinking_id = store.insert_block(ctx, None, None, Role::Model, BlockKind::Thinking, "Let me think...").unwrap();
+        let thinking_id = store.insert_block(ctx, None, None, Role::Model, BlockKind::Thinking, "Let me think...", Status::Done).unwrap();
 
         // Insert text block after thinking (as child of root, after thinking in order)
-        let text_id = store.insert_block(ctx, None, Some(&thinking_id), Role::Model, BlockKind::Text, "Here's my answer").unwrap();
+        let text_id = store.insert_block(ctx, None, Some(&thinking_id), Role::Model, BlockKind::Text, "Here's my answer", Status::Done).unwrap();
 
         // Should have both blocks
         let content = store.get_content(ctx).unwrap();
@@ -1704,7 +1706,7 @@ mod tests {
 
         store.create_document(ctx, DocumentKind::Code, Some("rust".into())).unwrap();
 
-        store.insert_block(ctx, None, None, Role::User, BlockKind::Text, "fn main() {}").unwrap();
+        store.insert_block(ctx, None, None, Role::User, BlockKind::Text, "fn main() {}", Status::Done).unwrap();
 
         assert_eq!(store.get_content(ctx).unwrap(), "fn main() {}");
 
@@ -1719,8 +1721,8 @@ mod tests {
 
         store.create_document(ctx, DocumentKind::Conversation, None).unwrap();
 
-        let thinking_id = store.insert_block(ctx, None, None, Role::Model, BlockKind::Thinking, "thinking...").unwrap();
-        store.insert_block(ctx, None, Some(&thinking_id), Role::Model, BlockKind::Text, "response").unwrap();
+        let thinking_id = store.insert_block(ctx, None, None, Role::Model, BlockKind::Thinking, "thinking...", Status::Done).unwrap();
+        store.insert_block(ctx, None, Some(&thinking_id), Role::Model, BlockKind::Text, "response", Status::Done).unwrap();
 
         let snapshots = store.block_snapshots(ctx).unwrap();
         assert_eq!(snapshots.len(), 2);
@@ -1754,7 +1756,7 @@ mod tests {
 
         store.create_document(ctx, DocumentKind::Conversation, None).unwrap();
 
-        let block_id = store.insert_block(ctx, None, None, Role::Model, BlockKind::ToolCall, "{}").unwrap();
+        let block_id = store.insert_block(ctx, None, None, Role::Model, BlockKind::ToolCall, "{}", Status::Done).unwrap();
 
         // Set status to Running
         store.set_status(ctx, &block_id, Status::Running).unwrap();
@@ -1791,7 +1793,7 @@ mod tests {
                 for j in 0..ops_per_task {
                     // Each task inserts a uniquely identifiable block
                     let text = format!("[task-{}-op-{}]", i, j);
-                    let _ = store_clone.insert_block(ctx, None, None, Role::User, BlockKind::Text, &text);
+                    let _ = store_clone.insert_block(ctx, None, None, Role::User, BlockKind::Text, &text, Status::Done);
                 }
             });
         }
@@ -1844,7 +1846,7 @@ mod tests {
             tasks.spawn(async move {
                 for j in 0..5 {
                     let text = format!("task-{}-op-{}", i, j);
-                    let _ = store_clone.insert_block(ctx, None, None, Role::User, BlockKind::Text, &text);
+                    let _ = store_clone.insert_block(ctx, None, None, Role::User, BlockKind::Text, &text, Status::Done);
                 }
             });
         }
@@ -1873,7 +1875,7 @@ mod tests {
             .unwrap();
 
         // Insert initial content
-        let block_id = store.insert_block(ctx, None, None, Role::User, BlockKind::Text, "initial content").unwrap();
+        let block_id = store.insert_block(ctx, None, None, Role::User, BlockKind::Text, "initial content", Status::Done).unwrap();
 
         let mut tasks = JoinSet::new();
 
@@ -1945,7 +1947,7 @@ mod tests {
 
         // Server inserts a block
         let block_id = store.insert_block(
-            ctx, None, None, Role::User, BlockKind::Text, "Hello from server"
+            ctx, None, None, Role::User, BlockKind::Text, "Hello from server", Status::Done
         ).unwrap();
 
         // Get the BlockInserted event with ops
@@ -2009,7 +2011,7 @@ mod tests {
 
         for i in 0..5 {
             let _ = store.insert_block(
-                ctx, None, None, Role::User, BlockKind::Text, format!("Message {}", i)
+                ctx, None, None, Role::User, BlockKind::Text, format!("Message {}", i), Status::Done
             ).unwrap();
 
             let msg = sub.try_recv().expect("should receive event");
@@ -2041,7 +2043,7 @@ mod tests {
         store.create_document(ctx, DocumentKind::Conversation, None).unwrap();
 
         let block_id = store.insert_block(
-            ctx, None, None, Role::Model, BlockKind::Text, ""
+            ctx, None, None, Role::Model, BlockKind::Text, "", Status::Done
         ).unwrap();
         let _ = sub.try_recv(); // drain insert event
 
@@ -2090,7 +2092,7 @@ mod tests {
         let frontier_before = server.frontier(ctx).unwrap();
 
         let _block_id = server.insert_block(
-            ctx, None, None, Role::User, BlockKind::Text, "hello from remote",
+            ctx, None, None, Role::User, BlockKind::Text, "hello from remote", Status::Done,
         ).unwrap();
 
         let msg = sub.try_recv().expect("should get Inserted from insert_block");
@@ -2128,7 +2130,7 @@ mod tests {
         server_a.create_document(ctx, DocumentKind::Conversation, None).unwrap();
 
         let block_id = server_a.insert_block(
-            ctx, None, None, Role::Model, BlockKind::Text, "initial",
+            ctx, None, None, Role::Model, BlockKind::Text, "initial", Status::Done,
         ).unwrap();
 
         // Receiver syncs via proper protocol: empty document + ops_since
@@ -2170,7 +2172,7 @@ mod tests {
         store.create_document(ctx, DocumentKind::Conversation, None).unwrap();
 
         let block_id = store.insert_block(
-            ctx, None, None, Role::Model, BlockKind::Text, "",
+            ctx, None, None, Role::Model, BlockKind::Text, "", Status::Done,
         ).unwrap();
         store.set_status(ctx, &block_id, Status::Running).unwrap();
 

@@ -208,7 +208,7 @@ mod tests {
     use super::*;
     use crate::block_store::shared_block_store;
     use crate::db::DocumentKind;
-    use kaijutsu_crdt::{BlockKind, PrincipalId, Role};
+    use kaijutsu_crdt::{BlockKind, PrincipalId, Role, Status};
 
     fn test_context_id() -> ContextId {
         let uuid = uuid::Uuid::new_v5(
@@ -230,7 +230,7 @@ mod tests {
         let (cells, ctx_id) = setup_test_store();
 
         // Create a block
-        let block_id = cells.insert_block(ctx_id, None, None, Role::Model, BlockKind::Text, "").unwrap();
+        let block_id = cells.insert_block(ctx_id, None, None, Role::Model, BlockKind::Text, "", Status::Done).unwrap();
 
         let batcher = AppendBatcher::new(cells.clone());
 
@@ -252,7 +252,7 @@ mod tests {
     async fn test_batch_on_size() {
         let (cells, ctx_id) = setup_test_store();
 
-        let block_id = cells.insert_block(ctx_id, None, None, Role::Model, BlockKind::Text, "").unwrap();
+        let block_id = cells.insert_block(ctx_id, None, None, Role::Model, BlockKind::Text, "", Status::Done).unwrap();
 
         // Config with small buffer, no newline flush
         let config = BatchConfig {
@@ -279,8 +279,8 @@ mod tests {
     async fn test_flush_all() {
         let (cells, ctx_id) = setup_test_store();
 
-        let block1 = cells.insert_block(ctx_id, None, None, Role::Model, BlockKind::Text, "").unwrap();
-        let block2 = cells.insert_block(ctx_id, None, None, Role::Model, BlockKind::Text, "").unwrap();
+        let block1 = cells.insert_block(ctx_id, None, None, Role::Model, BlockKind::Text, "", Status::Done).unwrap();
+        let block2 = cells.insert_block(ctx_id, None, None, Role::Model, BlockKind::Text, "", Status::Done).unwrap();
 
         // Config that never auto-flushes
         let config = BatchConfig {
@@ -320,7 +320,7 @@ mod tests {
     async fn test_finalize_removes_buffer() {
         let (cells, ctx_id) = setup_test_store();
 
-        let block_id = cells.insert_block(ctx_id, None, None, Role::Model, BlockKind::Text, "").unwrap();
+        let block_id = cells.insert_block(ctx_id, None, None, Role::Model, BlockKind::Text, "", Status::Done).unwrap();
 
         let batcher = AppendBatcher::new(cells.clone());
 

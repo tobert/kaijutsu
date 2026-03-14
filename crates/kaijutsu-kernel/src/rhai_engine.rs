@@ -23,7 +23,7 @@ use crate::block_store::SharedBlockStore;
 use crate::db::DocumentKind;
 use crate::tools::{ExecResult, ExecutionEngine, ToolContext};
 use async_trait::async_trait;
-use kaijutsu_crdt::{BlockKind, Role};
+use kaijutsu_crdt::{BlockKind, Role, Status};
 use kaijutsu_types::ContextId;
 use rhai::{Dynamic, Engine, Scope};
 use std::collections::HashMap;
@@ -172,7 +172,7 @@ impl RhaiEngine {
 
             // Insert new content as a single text block
             if !content.is_empty() {
-                match store_set.insert_block(ctx, None, None, Role::User, BlockKind::Text, &content) {
+                match store_set.insert_block(ctx, None, None, Role::User, BlockKind::Text, &content, Status::Done) {
                     Ok(_) => {
                         debug!("Rhai: set_content({}, {} chars)", cell_id, content.len());
                     }
@@ -267,8 +267,8 @@ impl RhaiEngine {
                 let after_ref = after.as_ref();
 
                 let result = match kind.as_str() {
-                    "text" => store_insert.insert_block(ctx, None, after_ref, Role::User, BlockKind::Text, &content),
-                    "thinking" => store_insert.insert_block(ctx, None, after_ref, Role::Model, BlockKind::Thinking, &content),
+                    "text" => store_insert.insert_block(ctx, None, after_ref, Role::User, BlockKind::Text, &content, Status::Done),
+                    "thinking" => store_insert.insert_block(ctx, None, after_ref, Role::Model, BlockKind::Thinking, &content, Status::Done),
                     "tool_use" | "tool_call" => {
                         // Parse content as JSON, or use as tool name
                         let input = serde_json::from_str(&content).unwrap_or(serde_json::Value::Null);
@@ -281,10 +281,10 @@ impl RhaiEngine {
                             store_insert.insert_tool_result(ctx, tc_id, after_ref, &content, false, None, None)
                         } else {
                             // Fallback to text if no tool_call_id
-                            store_insert.insert_block(ctx, None, after_ref, Role::Tool, BlockKind::Text, &content)
+                            store_insert.insert_block(ctx, None, after_ref, Role::Tool, BlockKind::Text, &content, Status::Done)
                         }
                     }
-                    _ => store_insert.insert_block(ctx, None, after_ref, Role::User, BlockKind::Text, &content),
+                    _ => store_insert.insert_block(ctx, None, after_ref, Role::User, BlockKind::Text, &content, Status::Done),
                 };
 
                 match result {
@@ -477,6 +477,7 @@ impl RhaiEngine {
                 Role::Tool,
                 BlockKind::Text,
                 &content,
+                Status::Done,
             ) {
                 Ok(id) => {
                     let key = id.to_key();

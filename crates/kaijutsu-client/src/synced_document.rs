@@ -438,7 +438,7 @@ impl SyncedDocument {
 mod tests {
     use super::*;
     use kaijutsu_crdt::block_store::BlockStore as CrdtBlockStore;
-    use kaijutsu_types::{BlockKind, Role};
+    use kaijutsu_types::{BlockKind, Role, Status};
     use std::collections::HashMap;
 
     fn test_context_id() -> ContextId {
@@ -458,6 +458,7 @@ mod tests {
                 Role::User,
                 BlockKind::Text,
                 "Hello from server",
+                Status::Done,
             )
             .expect("insert block");
         store
@@ -518,6 +519,7 @@ mod tests {
                 Role::Model,
                 BlockKind::Text,
                 "Response",
+                Status::Done,
             )
             .unwrap();
         let block = server.get_block_snapshot(&block_id).unwrap();
@@ -589,7 +591,7 @@ mod tests {
 
         // Create a streaming block and add text on the server
         let block_id = server
-            .insert_block(None, None, Role::Model, BlockKind::Text, "Hello!")
+            .insert_block(None, None, Role::Model, BlockKind::Text, "Hello!", Status::Done)
             .unwrap();
 
         // Client gets updated snapshot
@@ -658,9 +660,9 @@ mod tests {
 
         // Server creates a realistic conversation with explicit ordering
         let mut server = CrdtBlockStore::new(ctx, server_agent);
-        let b1 = server.insert_block(None, None, Role::User, BlockKind::Text, "Hello").unwrap();
-        let b2 = server.insert_block(None, Some(&b1), Role::Model, BlockKind::Text, "Hi there").unwrap();
-        let b3 = server.insert_block(Some(&b2), Some(&b2), Role::Model, BlockKind::ToolCall, "search").unwrap();
+        let b1 = server.insert_block(None, None, Role::User, BlockKind::Text, "Hello", Status::Done).unwrap();
+        let b2 = server.insert_block(None, Some(&b1), Role::Model, BlockKind::Text, "Hi there", Status::Done).unwrap();
+        let b3 = server.insert_block(Some(&b2), Some(&b2), Role::Model, BlockKind::ToolCall, "search", Status::Done).unwrap();
 
         // Client syncs initial state via SyncState
         let snap = snapshot_bytes(&server);
@@ -675,7 +677,7 @@ mod tests {
 
         // Server adds a new block (after b3)
         let frontier_before = server.frontier();
-        let b4 = server.insert_block(Some(&b3), Some(&b3), Role::Model, BlockKind::ToolResult, "found it").unwrap();
+        let b4 = server.insert_block(Some(&b3), Some(&b3), Role::Model, BlockKind::ToolResult, "found it", Status::Done).unwrap();
         let _ = b4;
         let ops = sync_payload_bytes(&server, &frontier_before);
         // Get snapshot of the new block for the event
@@ -719,7 +721,7 @@ mod tests {
 
         // Insert command block (arrives in order)
         let cmd_id = server
-            .insert_block(None, None, Role::User, BlockKind::ToolCall, "ls -l")
+            .insert_block(None, None, Role::User, BlockKind::ToolCall, "ls -l", Status::Done)
             .unwrap();
 
         // Insert output block on server
@@ -731,6 +733,7 @@ mod tests {
                 Role::System,
                 BlockKind::ToolResult,
                 "",
+                Status::Done,
             )
             .unwrap();
         let out_block = server.get_block_snapshot(&out_id).unwrap();
@@ -739,7 +742,7 @@ mod tests {
         // Client syncs initial state (just the command block)
         let initial_frontier = {
             let mut s = CrdtBlockStore::new(ctx, server_agent);
-            s.insert_block(None, None, Role::User, BlockKind::ToolCall, "ls -l")
+            s.insert_block(None, None, Role::User, BlockKind::ToolCall, "ls -l", Status::Done)
                 .unwrap();
             snapshot_bytes(&s)
         };
@@ -786,7 +789,7 @@ mod tests {
         let mut server = CrdtBlockStore::new(ctx, server_agent);
 
         let cmd_id = server
-            .insert_block(None, None, Role::User, BlockKind::ToolCall, "ls")
+            .insert_block(None, None, Role::User, BlockKind::ToolCall, "ls", Status::Done)
             .unwrap();
 
         let frontier_before = server.frontier();
@@ -797,6 +800,7 @@ mod tests {
                 Role::System,
                 BlockKind::ToolResult,
                 "",
+                Status::Done,
             )
             .unwrap();
         let out_block = server.get_block_snapshot(&out_id).unwrap();
@@ -805,7 +809,7 @@ mod tests {
         // Client with just command block
         let initial = {
             let mut s = CrdtBlockStore::new(ctx, server_agent);
-            s.insert_block(None, None, Role::User, BlockKind::ToolCall, "ls")
+            s.insert_block(None, None, Role::User, BlockKind::ToolCall, "ls", Status::Done)
                 .unwrap();
             snapshot_bytes(&s)
         };
@@ -901,7 +905,7 @@ mod tests {
         // Now add a new block on server and sync it
         let mut server2 = server; // move
         let frontier_before = server2.frontier();
-        let b2 = server2.insert_block(None, None, Role::Model, BlockKind::Text, "Response").unwrap();
+        let b2 = server2.insert_block(None, None, Role::Model, BlockKind::Text, "Response", Status::Done).unwrap();
         let ops = sync_payload_bytes(&server2, &frontier_before);
         let block = server2.get_block_snapshot(&b2).unwrap();
 

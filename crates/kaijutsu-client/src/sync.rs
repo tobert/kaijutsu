@@ -571,7 +571,7 @@ impl SyncManager {
 mod tests {
     use super::*;
     use kaijutsu_crdt::block_store::BlockStore as CrdtBlockStore;
-    use kaijutsu_types::{BlockKind, PrincipalId, Role};
+    use kaijutsu_types::{BlockKind, PrincipalId, Role, Status};
 
     fn test_context_id() -> ContextId {
         ContextId::new()
@@ -589,7 +589,7 @@ mod tests {
     fn create_server_store(context_id: ContextId) -> CrdtBlockStore {
         let mut store = CrdtBlockStore::new(context_id, server_agent());
         store
-            .insert_block(None, None, Role::User, BlockKind::Text, "Hello from server")
+            .insert_block(None, None, Role::User, BlockKind::Text, "Hello from server", Status::Done)
             .expect("insert block");
         store
     }
@@ -653,7 +653,7 @@ mod tests {
         // Server adds a new block
         let server_frontier = server.frontier();
         let block_id = server
-            .insert_block(None, None, Role::Model, BlockKind::Text, "Response from model")
+            .insert_block(None, None, Role::Model, BlockKind::Text, "Response from model", Status::Done)
             .expect("insert block");
         let block = server.get_block_snapshot(&block_id).expect("block exists");
 
@@ -759,7 +759,7 @@ mod tests {
 
         let server_frontier_before = server.frontier();
         let new_block_id = server
-            .insert_block(None, None, Role::Model, BlockKind::Text, "New content")
+            .insert_block(None, None, Role::Model, BlockKind::Text, "New content", Status::Done)
             .expect("insert block");
         let new_block = server.get_block_snapshot(&new_block_id).expect("block exists");
 
@@ -807,7 +807,7 @@ mod tests {
         assert!(sync.needs_full_sync(ctx));
 
         let new_block_id = server
-            .insert_block(None, None, Role::Model, BlockKind::Text, "Recovery content")
+            .insert_block(None, None, Role::Model, BlockKind::Text, "Recovery content", Status::Done)
             .expect("insert block");
         let full_snap = snapshot_bytes(&server);
         let new_block = server
@@ -907,7 +907,7 @@ mod tests {
 
         // Server creates a streaming block and appends text
         let block_id = server
-            .insert_block(None, None, Role::Model, BlockKind::Text, "")
+            .insert_block(None, None, Role::Model, BlockKind::Text, "", Status::Done)
             .expect("insert block");
 
         let chunks = ["Hello", ", ", "world", "!"];
@@ -965,7 +965,7 @@ mod tests {
         assert!(sync.needs_full_sync(ctx));
 
         let new_block_id = server
-            .insert_block(None, None, Role::Model, BlockKind::Text, "After error")
+            .insert_block(None, None, Role::Model, BlockKind::Text, "After error", Status::Done)
             .expect("insert block");
         let full_snap = snapshot_bytes(&server);
         let new_block = server
@@ -1091,14 +1091,14 @@ mod tests {
 
         let mut client = create_client_store(ctx);
         client
-            .insert_block(None, None, Role::User, BlockKind::Text, "Client content")
+            .insert_block(None, None, Role::User, BlockKind::Text, "Client content", Status::Done)
             .expect("insert client block");
 
         let mut sync = SyncManager::new();
 
         let server_frontier_before = server.frontier();
         let new_block_id = server
-            .insert_block(None, None, Role::Model, BlockKind::Text, "New content")
+            .insert_block(None, None, Role::Model, BlockKind::Text, "New content", Status::Done)
             .expect("insert block");
         let new_block = server
             .get_block_snapshot(&new_block_id)
@@ -1121,7 +1121,7 @@ mod tests {
         let mut server = create_server_store(ctx);
         let mut client = create_client_store(ctx);
         client
-            .insert_block(None, None, Role::User, BlockKind::Text, "Client content")
+            .insert_block(None, None, Role::User, BlockKind::Text, "Client content", Status::Done)
             .expect("insert client block");
 
         let mut sync = SyncManager::new();
@@ -1129,7 +1129,7 @@ mod tests {
         // Manually buffer some ops to simulate a prior failure
         let server_frontier_before = server.frontier();
         let new_block_id = server
-            .insert_block(None, None, Role::Model, BlockKind::Text, "Buffered content")
+            .insert_block(None, None, Role::Model, BlockKind::Text, "Buffered content", Status::Done)
             .expect("insert block");
         let _new_block = server
             .get_block_snapshot(&new_block_id)
@@ -1167,7 +1167,7 @@ mod tests {
 
         let server_frontier_before = server.frontier();
         let block_id = server
-            .insert_block(None, None, Role::Model, BlockKind::Text, "")
+            .insert_block(None, None, Role::Model, BlockKind::Text, "", Status::Done)
             .expect("insert block");
         let block_frontier = server.frontier();
 
@@ -1232,7 +1232,7 @@ mod tests {
 
         let frontier_before = server.frontier();
         let block_id = server
-            .insert_block(None, None, Role::Model, BlockKind::Text, "Valid block")
+            .insert_block(None, None, Role::Model, BlockKind::Text, "Valid block", Status::Done)
             .expect("insert block");
         let valid_block_ops = sync_payload_bytes(&server, &frontier_before);
 

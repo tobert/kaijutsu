@@ -1410,6 +1410,7 @@ impl kernel::Server for KernelImpl {
                     block.role,
                     block.kind,
                     &block.content,
+                    Status::Done,
                     Some(user_agent_id),
                 ) {
                     return Promise::err(capnp::Error::failed(e.to_string()));
@@ -1685,7 +1686,7 @@ impl kernel::Server for KernelImpl {
             // Create user message block at the end of the document
             let last_block = documents.last_block_id(context_id);
             log::info!("Inserting user block into context {}, after={:?}", context_id, last_block);
-            let user_block_id = documents.insert_block_as(context_id, None, last_block.as_ref(), Role::User, BlockKind::Text, &content, Some(user_agent_id))
+            let user_block_id = documents.insert_block_as(context_id, None, last_block.as_ref(), Role::User, BlockKind::Text, &content, Status::Done, Some(user_agent_id))
                 .map_err(|e| {
                     log::error!("Failed to insert user block: {}", e);
                     capnp::Error::failed(format!("failed to insert user block: {}", e))
@@ -3117,6 +3118,7 @@ impl kernel::Server for KernelImpl {
                 block_snapshot.role,
                 block_snapshot.kind,
                 block_snapshot.content,
+                Status::Done,
                 Some(user_agent_id),
             ).map_err(|e| capnp::Error::failed(format!("Failed to insert block: {}", e)))?;
 
@@ -4127,7 +4129,7 @@ impl kernel::Server for KernelImpl {
                 let last_block = documents.last_block_id(context_id);
                 let user_block_id = documents.insert_block_as(
                     context_id, None, last_block.as_ref(),
-                    Role::User, BlockKind::Text, &text, Some(user_agent_id),
+                    Role::User, BlockKind::Text, &text, Status::Done, Some(user_agent_id),
                 ).map_err(|e| capnp::Error::failed(format!("failed to insert user block: {}", e)))?;
 
                 // Spawn LLM streaming in background
@@ -5329,7 +5331,7 @@ async fn process_llm_stream(
         iteration += 1;
         if iteration > max_iterations {
             log::warn!("Agentic loop hit max iterations ({}), stopping", max_iterations);
-            let _ = documents.insert_block_as(context_id, None, Some(&last_block_id), Role::Model, BlockKind::Text, "⚠️ Maximum tool iterations reached", Some(PrincipalId::system()));
+            let _ = documents.insert_block_as(context_id, None, Some(&last_block_id), Role::Model, BlockKind::Text, "⚠️ Maximum tool iterations reached", Status::Done, Some(PrincipalId::system()));
             break;
         }
 
@@ -5373,7 +5375,7 @@ async fn process_llm_stream(
                     }
                     Err(e) => {
                         log::error!("Failed to start LLM stream after {} attempts: {}", attempt, e);
-                        let _ = documents.insert_block_as(context_id, None, Some(&last_block_id), Role::Model, BlockKind::Text, format!("❌ Error: {}", e), Some(PrincipalId::system()));
+                        let _ = documents.insert_block_as(context_id, None, Some(&last_block_id), Role::Model, BlockKind::Text, format!("❌ Error: {}", e), Status::Done, Some(PrincipalId::system()));
                         return;
                     }
                 }
@@ -5418,7 +5420,7 @@ async fn process_llm_stream(
             log::debug!("Received stream event: {:?}", event);
             match event {
                 StreamEvent::ThinkingStart => {
-                    match documents.insert_block_as(context_id, None, Some(&last_block_id), Role::Model, BlockKind::Thinking, "", Some(PrincipalId::system())) {
+                    match documents.insert_block_as(context_id, None, Some(&last_block_id), Role::Model, BlockKind::Thinking, "", Status::Running, Some(PrincipalId::system())) {
                         Ok(block_id) => {
                             last_block_id = block_id.clone();
                             current_block_id = Some(block_id);
@@ -5436,11 +5438,14 @@ async fn process_llm_stream(
                 }
 
                 StreamEvent::ThinkingEnd => {
+                    if let Some(ref block_id) = current_block_id {
+                        let _ = documents.set_status(context_id, block_id, Status::Done);
+                    }
                     current_block_id = None;
                 }
 
                 StreamEvent::TextStart => {
-                    match documents.insert_block_as(context_id, None, Some(&last_block_id), Role::Model, BlockKind::Text, "", Some(PrincipalId::system())) {
+                    match documents.insert_block_as(context_id, None, Some(&last_block_id), Role::Model, BlockKind::Text, "", Status::Running, Some(PrincipalId::system())) {
                         Ok(block_id) => {
                             last_block_id = block_id.clone();
                             current_block_id = Some(block_id);
@@ -5461,6 +5466,9 @@ async fn process_llm_stream(
                 }
 
                 StreamEvent::TextEnd => {
+                    if let Some(ref block_id) = current_block_id {
+                        let _ = documents.set_status(context_id, block_id, Status::Done);
+                    }
                     current_block_id = None;
                 }
 
@@ -5508,6 +5516,7 @@ async fn process_llm_stream(
                             context_id, None, Some(&last_block_id),
                             Role::Model, BlockKind::Text,
                             "⛔ Interrupted",
+                            Status::Done,
                             Some(PrincipalId::system()),
                         );
                         // Exit the agentic loop; cleanup runs below.
@@ -5521,7 +5530,7 @@ async fn process_llm_stream(
 
                 StreamEvent::Error(err) => {
                     log::error!("LLM stream error: {}", err);
-                    let _ = documents.insert_block_as(context_id, None, Some(&last_block_id), Role::Model, BlockKind::Text, format!("❌ Error: {}", err), Some(PrincipalId::system()));
+                    let _ = documents.insert_block_as(context_id, None, Some(&last_block_id), Role::Model, BlockKind::Text, format!("❌ Error: {}", err), Status::Error, Some(PrincipalId::system()));
                     return;
                 }
             }

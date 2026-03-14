@@ -6,7 +6,7 @@
 use bevy::prelude::*;
 
 // Re-export CRDT types for convenience
-pub use kaijutsu_crdt::{BlockId, BlockKind, BlockSnapshot, DriftKind, Role};
+pub use kaijutsu_crdt::{BlockId, BlockKind, BlockSnapshot, DriftKind, Role, Status};
 pub use kaijutsu_types::{ContextId, PrincipalId};
 
 /// Session-scoped agent identity for CRDT operations.
@@ -120,7 +120,7 @@ impl CellEditor {
     pub fn with_text(mut self, text: impl Into<String>) -> Self {
         let text = text.into();
         if !text.is_empty()
-            && let Ok(block_id) = self.store.insert_block(None, None, Role::User, BlockKind::Text, &text) {
+            && let Ok(block_id) = self.store.insert_block(None, None, Role::User, BlockKind::Text, &text, Status::Done) {
                 self.cursor = BlockCursor::at(block_id, text.len());
             }
         self

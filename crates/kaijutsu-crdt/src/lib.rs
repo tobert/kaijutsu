@@ -70,7 +70,7 @@ mod tests {
     fn test_document_basic_operations() {
         let mut doc = test_doc();
 
-        let block_id = doc.insert_block(None, None, Role::User, BlockKind::Text, "Hello, world!").unwrap();
+        let block_id = doc.insert_block(None, None, Role::User, BlockKind::Text, "Hello, world!", Status::Done).unwrap();
         assert_eq!(doc.full_text(), "Hello, world!");
 
         doc.append_text(&block_id, " How are you?").unwrap();
@@ -84,8 +84,8 @@ mod tests {
     fn test_document_multiple_blocks() {
         let mut doc = test_doc();
 
-        let thinking_id = doc.insert_block(None, None, Role::Model, BlockKind::Thinking, "Let me think...").unwrap();
-        let text_id = doc.insert_block(None, Some(&thinking_id), Role::Model, BlockKind::Text, "Here's my answer.").unwrap();
+        let thinking_id = doc.insert_block(None, None, Role::Model, BlockKind::Thinking, "Let me think...", Status::Done).unwrap();
+        let text_id = doc.insert_block(None, Some(&thinking_id), Role::Model, BlockKind::Text, "Here's my answer.", Status::Done).unwrap();
 
         let text = doc.full_text();
         assert!(text.contains("Let me think..."));
@@ -126,9 +126,9 @@ mod tests {
     fn test_document_delete_block() {
         let mut doc = test_doc();
 
-        let id1 = doc.insert_block(None, None, Role::User, BlockKind::Text, "First").unwrap();
-        let id2 = doc.insert_block(None, Some(&id1), Role::User, BlockKind::Text, "Second").unwrap();
-        let _id3 = doc.insert_block(None, Some(&id2), Role::User, BlockKind::Text, "Third").unwrap();
+        let id1 = doc.insert_block(None, None, Role::User, BlockKind::Text, "First", Status::Done).unwrap();
+        let id2 = doc.insert_block(None, Some(&id1), Role::User, BlockKind::Text, "Second", Status::Done).unwrap();
+        let _id3 = doc.insert_block(None, Some(&id2), Role::User, BlockKind::Text, "Third", Status::Done).unwrap();
 
         assert_eq!(doc.block_count(), 3);
 
@@ -146,8 +146,8 @@ mod tests {
 
         doc2.merge_ops_owned(doc1.ops_since(&Frontier::root())).unwrap();
 
-        let _alice_id = doc1.insert_block(None, None, Role::User, BlockKind::Text, "Alice's block").unwrap();
-        let _bob_id = doc2.insert_block(None, None, Role::User, BlockKind::Text, "Bob's block").unwrap();
+        let _alice_id = doc1.insert_block(None, None, Role::User, BlockKind::Text, "Alice's block", Status::Done).unwrap();
+        let _bob_id = doc2.insert_block(None, None, Role::User, BlockKind::Text, "Bob's block", Status::Done).unwrap();
 
         let doc1_frontier = doc1.frontier();
         let doc2_frontier = doc2.frontier();
@@ -167,7 +167,7 @@ mod tests {
         let mut doc1 = BlockDocument::new(ctx, PrincipalId::new());
         let mut doc2 = BlockDocument::new(ctx, PrincipalId::new());
 
-        let block_id = doc1.insert_block(None, None, Role::User, BlockKind::Text, "hello").unwrap();
+        let block_id = doc1.insert_block(None, None, Role::User, BlockKind::Text, "hello", Status::Done).unwrap();
         doc2.merge_ops_owned(doc1.ops_since(&Frontier::root())).unwrap();
 
         doc1.edit_text(&block_id, 5, " alice", 0).unwrap();
@@ -194,7 +194,7 @@ mod tests {
     fn test_store_basic_operations() {
         let mut store = test_store();
 
-        let block_id = store.insert_block(None, None, Role::User, BlockKind::Text, "Hello, world!").unwrap();
+        let block_id = store.insert_block(None, None, Role::User, BlockKind::Text, "Hello, world!", Status::Done).unwrap();
         assert_eq!(store.full_text(), "Hello, world!");
 
         store.append_text(&block_id, " How are you?").unwrap();
@@ -208,9 +208,9 @@ mod tests {
     fn test_store_delete_block() {
         let mut store = test_store();
 
-        let id1 = store.insert_block(None, None, Role::User, BlockKind::Text, "First").unwrap();
-        let id2 = store.insert_block(None, Some(&id1), Role::User, BlockKind::Text, "Second").unwrap();
-        let _id3 = store.insert_block(None, Some(&id2), Role::User, BlockKind::Text, "Third").unwrap();
+        let id1 = store.insert_block(None, None, Role::User, BlockKind::Text, "First", Status::Done).unwrap();
+        let id2 = store.insert_block(None, Some(&id1), Role::User, BlockKind::Text, "Second", Status::Done).unwrap();
+        let _id3 = store.insert_block(None, Some(&id2), Role::User, BlockKind::Text, "Third", Status::Done).unwrap();
 
         assert_eq!(store.block_count(), 3);
 
