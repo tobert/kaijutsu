@@ -19,6 +19,7 @@ pub mod content;
 pub mod index;
 pub mod metadata;
 pub mod cluster;
+pub mod synthesis;
 pub mod watcher;
 
 pub use config::IndexConfig;
@@ -118,6 +119,7 @@ pub struct SemanticIndex {
     hnsw: RwLock<index::HnswIndex>,
     metadata: Mutex<metadata::MetadataStore>,
     config: IndexConfig,
+    synthesis_cache: synthesis::SynthesisCache,
 }
 
 impl SemanticIndex {
@@ -133,6 +135,7 @@ impl SemanticIndex {
             hnsw: RwLock::new(hnsw),
             metadata: Mutex::new(metadata),
             config,
+            synthesis_cache: synthesis::SynthesisCache::new(),
         })
     }
 
@@ -306,6 +309,16 @@ impl SemanticIndex {
     /// Access the embedder (for external use, e.g. reranking).
     pub fn embedder(&self) -> &dyn Embedder {
         &*self.embedder
+    }
+
+    /// Access the embedder as an Arc (for Rhai registration).
+    pub fn embedder_arc(&self) -> Arc<dyn Embedder> {
+        self.embedder.clone()
+    }
+
+    /// Access the synthesis cache.
+    pub fn synthesis_cache(&self) -> &synthesis::SynthesisCache {
+        &self.synthesis_cache
     }
 }
 

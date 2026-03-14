@@ -279,6 +279,14 @@ fn sync_model_info_to_constellation(
             if node.fork_kind != ctx_info.fork_kind {
                 node.fork_kind = ctx_info.fork_kind.clone();
             }
+
+            // Sync synthesis data
+            if node.keywords != ctx_info.keywords {
+                node.keywords = ctx_info.keywords.clone();
+            }
+            if node.top_block_preview != ctx_info.top_block_preview {
+                node.top_block_preview = ctx_info.top_block_preview.clone();
+            }
         } else {
             // Create placeholder node for server-known contexts not yet in constellation.
             // This makes all contexts visible in the constellation, not just joined ones.

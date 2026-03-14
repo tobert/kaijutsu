@@ -224,6 +224,8 @@ impl Constellation {
             joined: true,
             last_activity_time: 0.0,
             fork_kind: None,
+            keywords: Vec::new(),
+            top_block_preview: None,
         };
 
         self.nodes.push(node);
@@ -262,6 +264,8 @@ impl Constellation {
             joined: false,
             last_activity_time: 0.0,
             fork_kind: ctx_info.fork_kind.clone(),
+            keywords: ctx_info.keywords.clone(),
+            top_block_preview: ctx_info.top_block_preview.clone(),
         };
 
         self.nodes.push(node);
@@ -331,6 +335,10 @@ pub struct ContextNode {
     pub last_activity_time: f64,
     /// How this context was forked (e.g. "shallow", "compact", "subtree")
     pub fork_kind: Option<String>,
+    /// Synthesis keywords (empty if not yet synthesized)
+    pub keywords: Vec<String>,
+    /// Preview of the most representative block
+    pub top_block_preview: Option<String>,
 }
 
 /// Activity state of a context node

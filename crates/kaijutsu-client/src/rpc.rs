@@ -175,6 +175,10 @@ pub struct ContextInfo {
     pub fork_kind: Option<String>,
     /// Whether this context has been archived.
     pub archived: bool,
+    /// Synthesis keywords (empty if not yet synthesized).
+    pub keywords: Vec<String>,
+    /// Preview of the most representative block (empty if none).
+    pub top_block_preview: Option<String>,
 }
 
 /// Preset template info from the server.
@@ -1812,6 +1816,24 @@ fn parse_context_info(
     let fork_kind = if fork_kind_str.is_empty() { None } else { Some(fork_kind_str.to_string()) };
     let archived = reader.get_archived_at() > 0;
 
+    // Parse synthesis keywords
+    let keywords = if reader.has_keywords() {
+        reader
+            .get_keywords()?
+            .into_iter()
+            .filter_map(|k| k.ok().map(|s| s.to_string().unwrap_or_default()))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let top_block_preview = if reader.has_top_block_preview() {
+        let s = reader.get_top_block_preview()?.to_str().unwrap_or("");
+        if s.is_empty() { None } else { Some(s.to_string()) }
+    } else {
+        None
+    };
+
     Ok(ContextInfo {
         id,
         label,
@@ -1822,6 +1844,8 @@ fn parse_context_info(
         trace_id,
         fork_kind,
         archived,
+        keywords,
+        top_block_preview,
     })
 }
 

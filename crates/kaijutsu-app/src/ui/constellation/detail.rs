@@ -132,6 +132,8 @@ fn update_detail_content(
         h = h.wrapping_mul(31).wrapping_add(node.activity as u64);
         h = h.wrapping_mul(31).wrapping_add(if node.joined { 1 } else { 0 });
         h = h.wrapping_mul(31).wrapping_add(node.graph_distance as u64);
+        h = h.wrapping_mul(31).wrapping_add(node.keywords.len() as u64);
+        h = h.wrapping_mul(31).wrapping_add(node.top_block_preview.as_ref().map(|p| p.len()).unwrap_or(0) as u64);
         h
     };
 
@@ -243,6 +245,30 @@ fn update_detail_content(
     if node.joined {
         let joined = spawn_detail_text(&mut commands, font, "joined", theme.ansi.green, 9.0);
         commands.entity(sidebar_entity).add_child(joined);
+    }
+
+    // Synthesis keywords
+    if !node.keywords.is_empty() {
+        let div3 = spawn_divider(&mut commands, &theme);
+        commands.entity(sidebar_entity).add_child(div3);
+
+        let kw_header = spawn_detail_text(&mut commands, font, "keywords", theme.fg_dim, 9.0);
+        commands.entity(sidebar_entity).add_child(kw_header);
+
+        let kw_text = node.keywords.join(", ");
+        let kw_ent = spawn_detail_text(&mut commands, font, &kw_text, theme.fg, 10.0);
+        commands.entity(sidebar_entity).add_child(kw_ent);
+    }
+
+    // Representative block preview
+    if let Some(ref preview) = node.top_block_preview {
+        if !preview.is_empty() {
+            let preview_header = spawn_detail_text(&mut commands, font, "representative", theme.fg_dim, 9.0);
+            commands.entity(sidebar_entity).add_child(preview_header);
+
+            let preview_ent = spawn_detail_text(&mut commands, font, preview, theme.fg_dim, 9.0);
+            commands.entity(sidebar_entity).add_child(preview_ent);
+        }
     }
 
     *last_fingerprint = fingerprint;

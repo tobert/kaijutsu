@@ -842,10 +842,29 @@ pub async fn create_shared_kernel(
                         let status_receiver = FlowBusStatusReceiver {
                             sub: block_flows_for_index.subscribe("block.status"),
                         };
+
+                        // Build synthesis callback — runs Rhai after each indexing.
+                        // Must spawn_blocking: Rhai eval + ONNX embed are CPU-bound.
+                        let synth_idx = idx.clone();
+                        let synth_blocks: Arc<dyn kaijutsu_index::BlockSource> = Arc::new(BlockStoreSource(documents.clone()));
+                        let on_indexed: kaijutsu_index::watcher::OnIndexed = Arc::new(move |ctx_id| {
+                            let idx_clone = synth_idx.clone();
+                            let blocks_clone = synth_blocks.clone();
+                            tokio::task::spawn_blocking(move || {
+                                run_synthesis(
+                                    ctx_id,
+                                    idx_clone.embedder_arc(),
+                                    blocks_clone,
+                                    idx_clone.synthesis_cache(),
+                                );
+                            });
+                        });
+
                         kaijutsu_index::watcher::spawn_index_watcher(
                             idx.clone(),
                             block_source,
                             Box::new(status_receiver),
+                            Some(on_indexed),
                         );
                         log::info!("Semantic index initialized with {}", emb_config.model_dir.display());
                         Some(idx)
@@ -1697,6 +1716,7 @@ impl kernel::Server for KernelImpl {
         let kernel_arc = self.kernel.kernel.clone();
         let kernel_db_arc = self.kernel.kernel_db.clone();
         let kernel_id = self.kernel.id;
+        let semantic_index = self.kernel.semantic_index.clone();
 
         let span = extract_rpc_trace(pry!(params.get()).get_trace(), "list_contexts");
         Promise::from_future(async move {
@@ -1729,6 +1749,20 @@ impl kernel::Server for KernelImpl {
                 if let Some(row) = db_map.get(&ctx.id) {
                     c.set_fork_kind(row.fork_kind.as_ref().map(|fk| fk.as_str()).unwrap_or(""));
                     c.set_archived_at(row.archived_at.map(|ts| ts as u64).unwrap_or(0));
+                }
+
+                // Supplement with synthesis data (keywords + preview)
+                if let Some(ref idx) = semantic_index {
+                    if let Some(synth) = idx.synthesis_cache().get_any(ctx.id) {
+                        let kw_strs: Vec<&str> = synth.keywords.iter().map(|(k, _)| k.as_str()).collect();
+                        let mut kw_list = c.reborrow().init_keywords(kw_strs.len() as u32);
+                        for (j, kw) in kw_strs.iter().enumerate() {
+                            kw_list.set(j as u32, kw);
+                        }
+                        if let Some((_, _, preview)) = synth.top_blocks.first() {
+                            c.set_top_block_preview(preview);
+                        }
+                    }
                 }
             }
 
@@ -6744,3 +6778,137 @@ impl vfs::Server for VfsImpl {
         })
     }
 }
+
+// ============================================================================
+// Synthesis (Rhai-driven keyword extraction + representative block selection)
+// ============================================================================
+
+/// Default synthesis script, embedded at compile time.
+const DEFAULT_SYNTHESIS_RHAI: &str = include_str!("../../../assets/defaults/synthesis.rhai");
+
+/// Run synthesis for a context: evaluate Rhai script, cache results.
+///
+/// Called from the watcher callback (on the async task). This is a blocking
+/// operation (Rhai eval + ONNX embed calls) — acceptable because the watcher
+/// already runs on spawn_blocking for indexing.
+fn run_synthesis(
+    ctx_id: kaijutsu_types::ContextId,
+    embedder: std::sync::Arc<dyn kaijutsu_index::Embedder>,
+    block_source: std::sync::Arc<dyn kaijutsu_index::BlockSource>,
+    cache: &kaijutsu_index::synthesis::SynthesisCache,
+) {
+    // Load user override or fall back to embedded default
+    let script = load_synthesis_script();
+
+    let engine = crate::synthesis_rhai::create_synthesis_engine(embedder, block_source);
+
+    let mut scope = rhai::Scope::new();
+    scope.push_constant("CONTEXT_ID", ctx_id.to_string());
+
+    let ast = match engine.compile(&script) {
+        Ok(ast) => ast,
+        Err(e) => {
+            tracing::warn!(error = %e, "synthesis.rhai compile error");
+            return;
+        }
+    };
+
+    let result = match engine.eval_ast_with_scope::<rhai::Dynamic>(&mut scope, &ast) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, ctx = %ctx_id.short(), "synthesis.rhai eval error");
+            return;
+        }
+    };
+
+    // Parse the Rhai Map into SynthesisResult
+    let map = match result.try_cast::<rhai::Map>() {
+        Some(m) => m,
+        None => {
+            tracing::debug!(ctx = %ctx_id.short(), "synthesis.rhai returned non-map, skipping");
+            return;
+        }
+    };
+
+    if map.is_empty() {
+        tracing::debug!(ctx = %ctx_id.short(), "synthesis.rhai returned empty map");
+        return;
+    }
+
+    let keywords: Vec<(String, f32)> = map
+        .get("keywords")
+        .and_then(|v| v.clone().into_array().ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|d| {
+            // Accept either plain string (from .map(|k| k.keyword)) or map with keyword+score
+            if let Ok(s) = d.clone().into_string() {
+                Some((s, 0.0))
+            } else if let Some(m) = d.try_cast::<rhai::Map>() {
+                let kw = m.get("keyword")?.clone().into_string().ok()?;
+                let score = m.get("score").and_then(|v| v.as_float().ok()).unwrap_or(0.0) as f32;
+                Some((kw, score))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let top_blocks: Vec<(String, f32, String)> = map
+        .get("top_blocks")
+        .and_then(|v| v.clone().into_array().ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|d| {
+            let m = d.try_cast::<rhai::Map>()?;
+            let id = m.get("id")?.clone().into_string().ok()?;
+            let score = m.get("score").and_then(|v| v.as_float().ok()).unwrap_or(0.0) as f32;
+            let preview = m.get("preview").and_then(|v| v.clone().into_string().ok()).unwrap_or_default();
+            Some((id, score, preview))
+        })
+        .collect();
+
+    let synth = kaijutsu_index::synthesis::SynthesisResult {
+        keywords,
+        top_blocks,
+        content_hash: String::new(), // hash not critical for cache — watcher already deduplicates
+    };
+
+    tracing::debug!(
+        ctx = %ctx_id.short(),
+        keywords = synth.keywords.len(),
+        blocks = synth.top_blocks.len(),
+        "synthesis complete"
+    );
+
+    cache.insert(ctx_id, synth);
+}
+
+/// Load synthesis.rhai from user config dir, falling back to embedded default.
+fn load_synthesis_script() -> String {
+    if let Some(config_dir) = dirs_config_path() {
+        let user_script = config_dir.join("synthesis.rhai");
+        if user_script.exists() {
+            match std::fs::read_to_string(&user_script) {
+                Ok(s) => return s,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        path = %user_script.display(),
+                        "failed to read user synthesis.rhai, using default"
+                    );
+                }
+            }
+        }
+    }
+    DEFAULT_SYNTHESIS_RHAI.to_string()
+}
+
+/// Get the kaijutsu config directory (~/.config/kaijutsu).
+fn dirs_config_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
+        .map(|d| d.join("kaijutsu"))
+}
+

@@ -74,6 +74,10 @@ struct CardModelText;
 #[derive(Component)]
 struct CardRecencyText;
 
+/// Marker on the keywords text leaf.
+#[derive(Component)]
+struct CardKeywordsText;
+
 /// Marker for the edge scene entity (Bezier curves between cards).
 #[derive(Component)]
 pub struct ConstellationSceneMarker;
@@ -235,6 +239,21 @@ fn spawn_card(
                         },
                         Node::default(),
                     ));
+
+                    // Keywords (only visible when non-empty)
+                    content.spawn((
+                        CardKeywordsText,
+                        UiVelloText {
+                            value: String::new(),
+                            style: crate::text::vello_style(
+                                &font_handles.mono,
+                                theme.fg_dim,
+                                9.0,
+                            ),
+                            ..default()
+                        },
+                        Node::default(),
+                    ));
                 });
         })
         .id();
@@ -303,9 +322,10 @@ fn update_card_visuals(
     card_map: Res<CardEntityMap>,
     children_q: Query<&Children>,
     mut bg_q: Query<&mut UiVelloScene, With<CardBg>>,
-    mut label_q: Query<&mut UiVelloText, (With<CardLabelText>, Without<CardModelText>, Without<CardRecencyText>)>,
-    mut model_q: Query<&mut UiVelloText, (With<CardModelText>, Without<CardLabelText>, Without<CardRecencyText>)>,
-    mut recency_q: Query<&mut UiVelloText, (With<CardRecencyText>, Without<CardLabelText>, Without<CardModelText>)>,
+    mut label_q: Query<&mut UiVelloText, (With<CardLabelText>, Without<CardModelText>, Without<CardRecencyText>, Without<CardKeywordsText>)>,
+    mut model_q: Query<&mut UiVelloText, (With<CardModelText>, Without<CardLabelText>, Without<CardRecencyText>, Without<CardKeywordsText>)>,
+    mut recency_q: Query<&mut UiVelloText, (With<CardRecencyText>, Without<CardLabelText>, Without<CardModelText>, Without<CardKeywordsText>)>,
+    mut keywords_q: Query<&mut UiVelloText, (With<CardKeywordsText>, Without<CardLabelText>, Without<CardModelText>, Without<CardRecencyText>)>,
 ) {
     let elapsed = time.elapsed_secs();
     let elapsed_f64 = time.elapsed_secs_f64();
@@ -417,6 +437,12 @@ fn update_card_visuals(
                 }
                 if let Ok(mut text) = recency_q.get_mut(gc) {
                     let new_val = format_recency(node.last_activity_time, elapsed_f64);
+                    if text.value != new_val {
+                        text.value = new_val;
+                    }
+                }
+                if let Ok(mut text) = keywords_q.get_mut(gc) {
+                    let new_val = card_keywords_text(node);
                     if text.value != new_val {
                         text.value = new_val;
                     }
@@ -545,6 +571,15 @@ fn card_model_text(node: &super::ContextNode) -> String {
         Some("subtree") => format!("{model_str} [subtree]"),
         _ => model_str, // "full" or None — no badge
     }
+}
+
+/// Keywords display text for a card: comma-separated, truncated.
+fn card_keywords_text(node: &super::ContextNode) -> String {
+    if node.keywords.is_empty() {
+        return String::new();
+    }
+    let joined = node.keywords.join(", ");
+    truncate_chars(&joined, 30)
 }
 
 /// Format recency as a human-readable relative time.

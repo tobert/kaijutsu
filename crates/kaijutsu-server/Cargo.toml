@@ -37,6 +37,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 kaijutsu-telemetry = { workspace = true }
 
+# Rhai (for synthesis scripts)
+rhai.workspace = true
+kaijutsu-rhai.workspace = true
+
 # Hostname detection
 hostname = "0.3"
 

@@ -12,15 +12,24 @@ use tokio::task::JoinHandle;
 
 use crate::{BlockSource, SemanticIndex, StatusReceiver};
 
+/// Callback invoked after a context is successfully (re-)indexed.
+///
+/// Runs on the async task — implementations should spawn_blocking if needed.
+pub type OnIndexed = Arc<dyn Fn(kaijutsu_types::ContextId) + Send + Sync>;
+
 /// Spawn a background task that re-indexes contexts when blocks complete.
 ///
 /// Receives `StatusEvent`s via the trait. On terminal status, collects a batch
 /// (1s debounce window), then indexes each context on a blocking thread.
 /// Content hash comparison naturally deduplicates across batches.
+///
+/// If `on_indexed` is provided, it is called for each context that was
+/// successfully (re-)indexed — use this to trigger synthesis.
 pub fn spawn_index_watcher(
     index: Arc<SemanticIndex>,
     blocks: Arc<dyn BlockSource>,
     mut events: Box<dyn StatusReceiver>,
+    on_indexed: Option<OnIndexed>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         tracing::info!("semantic index watcher started");
@@ -71,6 +80,9 @@ pub fn spawn_index_watcher(
                 }).await {
                     Ok(Ok(true)) => {
                         tracing::debug!(context = %ctx_id.short(), "indexed context");
+                        if let Some(ref cb) = on_indexed {
+                            cb(ctx_id);
+                        }
                     }
                     Ok(Ok(false)) => {} // content unchanged
                     Ok(Err(e)) => {
