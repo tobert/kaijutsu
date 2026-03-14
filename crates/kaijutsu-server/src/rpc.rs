@@ -769,8 +769,9 @@ pub async fn create_shared_kernel(
         };
         let db_ids: std::collections::HashSet<ContextId> = db_contexts.iter().map(|r| r.context_id).collect();
 
-        // Step 2: Discover BlockStore documents not in KernelDb → bootstrap minimal rows
-        let block_store_ids: Vec<ContextId> = documents.list_ids();
+        // Step 2: Discover Conversation documents not in KernelDb → bootstrap minimal rows.
+        // Only conversations are contexts — code/config/text docs are internal.
+        let block_store_ids: Vec<ContextId> = documents.list_ids_by_kind(DocumentKind::Conversation);
         for &bs_ctx_id in &block_store_ids {
             if !db_ids.contains(&bs_ctx_id) {
                 let row = ContextRow {

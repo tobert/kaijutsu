@@ -327,6 +327,14 @@ impl BlockStore {
         self.documents.iter().map(|r| *r.key()).collect()
     }
 
+    /// List document IDs filtered by kind.
+    pub fn list_ids_by_kind(&self, kind: DocumentKind) -> Vec<ContextId> {
+        self.documents.iter()
+            .filter(|r| r.kind == kind)
+            .map(|r| *r.key())
+            .collect()
+    }
+
     /// Check if a document exists.
     pub fn contains(&self, context_id: ContextId) -> bool {
         self.documents.contains_key(&context_id)
@@ -1712,6 +1720,38 @@ mod tests {
 
         store.delete_document(ctx).unwrap();
         assert!(store.get(ctx).is_none());
+    }
+
+    #[test]
+    fn test_list_ids_by_kind() {
+        let store = BlockStore::new(test_agent());
+        let conv1 = ContextId::new();
+        let conv2 = ContextId::new();
+        let code1 = ContextId::new();
+        let config1 = ContextId::new();
+
+        store.create_document(conv1, DocumentKind::Conversation, None).unwrap();
+        store.create_document(conv2, DocumentKind::Conversation, None).unwrap();
+        store.create_document(code1, DocumentKind::Code, Some("rust".into())).unwrap();
+        store.create_document(config1, DocumentKind::Config, None).unwrap();
+
+        assert_eq!(store.list_ids().len(), 4);
+
+        let convs = store.list_ids_by_kind(DocumentKind::Conversation);
+        assert_eq!(convs.len(), 2);
+        assert!(convs.contains(&conv1));
+        assert!(convs.contains(&conv2));
+
+        let codes = store.list_ids_by_kind(DocumentKind::Code);
+        assert_eq!(codes.len(), 1);
+        assert!(codes.contains(&code1));
+
+        let configs = store.list_ids_by_kind(DocumentKind::Config);
+        assert_eq!(configs.len(), 1);
+        assert!(configs.contains(&config1));
+
+        let texts = store.list_ids_by_kind(DocumentKind::Text);
+        assert!(texts.is_empty());
     }
 
     #[test]
