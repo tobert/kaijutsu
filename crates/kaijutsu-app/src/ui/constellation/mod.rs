@@ -40,8 +40,9 @@ mod legend;
 pub mod model_picker;
 mod render2d;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
+use avian2d::prelude::*;
 use bevy::prelude::*;
 use kaijutsu_client::ContextMembership;
 use kaijutsu_types::ContextId;
@@ -70,9 +71,13 @@ pub struct ConstellationPlugin;
 
 impl Plugin for ConstellationPlugin {
     fn build(&self, app: &mut App) {
+        // Avian2D physics (pixel-scale: 100px ≈ 1m for threshold tuning)
+        app.add_plugins(PhysicsPlugins::default().with_length_unit(100.0));
+        app.insert_resource(Gravity::ZERO);
+
         app.init_resource::<Constellation>()
             .init_resource::<ConstellationCamera>()
-            .init_resource::<ForceGraph>()
+            .init_resource::<PhysicsEntityMap>()
             .init_resource::<NewContextConfig>()
             .register_type::<NewContextConfig>()
             .register_type::<ActivityState>()
@@ -86,11 +91,26 @@ impl Plugin for ConstellationPlugin {
                     track_agent_activity,
                     // Input handling in input::systems (toggle_constellation + constellation_nav)
                     handle_node_click,
-                    run_force_simulation,
+                    sync_physics_entities,
+                    wake_on_topology_change,
+                    update_constellation_graph,
+                    apply_radial_gravity,
+                    update_center_exclusion_radius,
+                    sync_physics_to_constellation,
                     interpolate_camera,
                 )
                     .chain(),
             );
+
+        // Pause physics when not on constellation screen
+        app.add_systems(
+            OnEnter(crate::ui::screen::Screen::Constellation),
+            unpause_constellation_physics,
+        );
+        app.add_systems(
+            OnExit(crate::ui::screen::Screen::Constellation),
+            pause_constellation_physics,
+        );
 
         // Constellation container + legend panel
         legend::setup_legend_systems(app);
@@ -463,83 +483,252 @@ fn handle_node_click(
 }
 
 // ============================================================================
-// FORCE-DIRECTED LAYOUT
+// PHYSICS LAYOUT (Avian2D)
 // ============================================================================
 
-/// Force-directed graph simulation state.
-#[derive(Resource)]
-pub struct ForceGraph {
-    /// Per-node velocities for the simulation
-    velocities: Vec<Vec2>,
-    /// Whether the simulation has settled (max velocity < threshold)
-    pub settled: bool,
+/// Marker on physics entities representing constellation nodes.
+#[derive(Component)]
+struct PhysicsNode {
+    context_id: ContextId,
 }
 
-impl Default for ForceGraph {
-    fn default() -> Self {
-        Self {
-            velocities: Vec::new(),
-            settled: false,
+/// Maps ContextId → physics Entity for lifecycle management.
+#[derive(Resource, Default)]
+struct PhysicsEntityMap {
+    /// Node entities keyed by ContextId
+    map: HashMap<ContextId, Entity>,
+    /// Center exclusion zone (static body)
+    center_body: Option<Entity>,
+    /// Joint entities keyed by child ContextId
+    joints: HashMap<ContextId, Entity>,
+}
+
+/// Collision layers for constellation physics.
+#[derive(PhysicsLayer, Clone, Copy, Debug, Default)]
+enum ConstellationLayer {
+    #[default]
+    Node,
+    CenterZone,
+}
+
+// ── Physics constants ──
+
+/// Radial gravity strength for all nodes toward origin.
+const RADIAL_GRAVITY_K: f32 = 0.05;
+/// Additional center pull for the focused node.
+const FOCUS_PULL_K: f32 = 0.8;
+/// Node collider radius in simulation-space pixels.
+const NODE_COLLIDER_RADIUS: f32 = 70.0;
+/// DistanceJoint rest length range.
+const JOINT_MIN_DIST: f32 = 200.0;
+const JOINT_MAX_DIST: f32 = 300.0;
+/// Joint compliance (inverse stiffness: smaller = stiffer).
+const JOINT_COMPLIANCE: f32 = 0.001;
+/// Linear damping coefficient.
+const NODE_DAMPING: f32 = 3.0;
+/// Center exclusion zone radius as fraction of min(viewport_w, viewport_h).
+const CENTER_EXCLUSION_FRACTION: f32 = 0.15;
+
+// ── Pause/unpause ──
+
+fn pause_constellation_physics(mut physics_time: ResMut<Time<Physics>>) {
+    physics_time.pause();
+}
+
+fn unpause_constellation_physics(mut physics_time: ResMut<Time<Physics>>) {
+    physics_time.unpause();
+}
+
+// ── Physics entity sync ──
+
+/// Sync physics entities with constellation topology.
+///
+/// Spawns/despawns Avian2D rigid bodies to mirror constellation nodes.
+/// Creates DistanceJoint entities for fork edges.
+/// Spawns the center exclusion zone body once.
+fn sync_physics_entities(
+    mut commands: Commands,
+    constellation: Res<Constellation>,
+    mut entity_map: ResMut<PhysicsEntityMap>,
+) {
+    let n = constellation.nodes.len();
+
+    // Build set of current context IDs
+    let current_ids: HashSet<ContextId> =
+        constellation.nodes.iter().map(|n| n.context_id).collect();
+
+    // Despawn entities for removed nodes
+    let removed: Vec<ContextId> = entity_map
+        .map
+        .keys()
+        .filter(|id| !current_ids.contains(id))
+        .copied()
+        .collect();
+    for id in &removed {
+        if let Some(entity) = entity_map.map.remove(id) {
+            commands.entity(entity).despawn();
         }
+        if let Some(joint_entity) = entity_map.joints.remove(id) {
+            commands.entity(joint_entity).despawn();
+        }
+    }
+
+    // Spawn entities for new nodes
+    let scatter_radius = 150.0 + (n as f32).sqrt() * 50.0;
+    for (i, node) in constellation.nodes.iter().enumerate() {
+        if entity_map.map.contains_key(&node.context_id) {
+            continue;
+        }
+
+        // Initial position: use existing position, or ring scatter for new nodes
+        let pos = if node.position != Vec2::ZERO {
+            node.position
+        } else if Some(node.context_id) == constellation.focus_id {
+            Vec2::ZERO
+        } else {
+            let angle = std::f32::consts::TAU * i as f32 / n.max(1) as f32;
+            Vec2::new(angle.cos(), angle.sin()) * scatter_radius
+        };
+
+        let entity = commands
+            .spawn((
+                PhysicsNode {
+                    context_id: node.context_id,
+                },
+                RigidBody::Dynamic,
+                Collider::circle(NODE_COLLIDER_RADIUS),
+                Transform::from_xyz(pos.x, pos.y, 0.0),
+                LinearDamping(NODE_DAMPING),
+                LockedAxes::ROTATION_LOCKED,
+                ConstantForce(Vec2::ZERO), // Updated by apply_radial_gravity
+                CollisionLayers::new(
+                    [ConstellationLayer::Node],
+                    [ConstellationLayer::Node, ConstellationLayer::CenterZone],
+                ),
+            ))
+            .id();
+
+        entity_map.map.insert(node.context_id, entity);
+    }
+
+    // Sync joints for fork edges
+    let desired_edges: HashMap<ContextId, ContextId> = constellation
+        .nodes
+        .iter()
+        .filter_map(|node| {
+            let parent_id = node.forked_from?;
+            if entity_map.map.contains_key(&node.context_id)
+                && entity_map.map.contains_key(&parent_id)
+            {
+                Some((node.context_id, parent_id))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Remove stale joints
+    let stale_joints: Vec<ContextId> = entity_map
+        .joints
+        .keys()
+        .filter(|child_id| !desired_edges.contains_key(child_id))
+        .copied()
+        .collect();
+    for child_id in stale_joints {
+        if let Some(joint_entity) = entity_map.joints.remove(&child_id) {
+            commands.entity(joint_entity).despawn();
+        }
+    }
+
+    // Create joints for new edges
+    for (child_id, parent_id) in &desired_edges {
+        if entity_map.joints.contains_key(child_id) {
+            continue;
+        }
+        let Some(&child_entity) = entity_map.map.get(child_id) else {
+            continue;
+        };
+        let Some(&parent_entity) = entity_map.map.get(parent_id) else {
+            continue;
+        };
+
+        let joint_entity = commands
+            .spawn(
+                DistanceJoint::new(parent_entity, child_entity)
+                    .with_limits(JOINT_MIN_DIST, JOINT_MAX_DIST)
+                    .with_compliance(JOINT_COMPLIANCE),
+            )
+            .id();
+
+        entity_map.joints.insert(*child_id, joint_entity);
+    }
+
+    // Spawn center exclusion body once
+    if entity_map.center_body.is_none() {
+        let center = commands
+            .spawn((
+                RigidBody::Static,
+                Collider::circle(100.0), // Updated by update_center_exclusion_radius
+                Transform::from_xyz(0.0, 0.0, 0.0),
+                CollisionLayers::new(
+                    [ConstellationLayer::CenterZone],
+                    [ConstellationLayer::Node],
+                ),
+            ))
+            .id();
+        entity_map.center_body = Some(center);
     }
 }
 
-/// Force simulation constants.
-const REPULSION_STRENGTH: f32 = 80000.0;
-const SPRING_K: f32 = 0.3;
-const REST_LENGTH: f32 = 250.0;
-const CENTER_K: f32 = 0.8;
-/// Weak gravity toward center for ALL nodes — prevents disconnected nodes
-/// (no fork edges) from flying away indefinitely under repulsion.
-const GRAVITY: f32 = 0.05;
-const DAMPING: f32 = 0.85;
-const MAX_VELOCITY: f32 = 200.0;
-const SETTLE_THRESHOLD: f32 = 0.5;
-const ITERATIONS_PER_FRAME: u32 = 3;
+/// Wake all sleeping physics bodies when topology or focus changes.
+fn wake_on_topology_change(
+    mut commands: Commands,
+    constellation: Res<Constellation>,
+    entity_map: Res<PhysicsEntityMap>,
+    mut last_entity_count: Local<usize>,
+    mut last_joint_count: Local<usize>,
+    mut last_focus: Local<Option<ContextId>>,
+    sleeping_bodies: Query<Entity, (With<PhysicsNode>, With<Sleeping>)>,
+) {
+    let ec = entity_map.map.len();
+    let jc = entity_map.joints.len();
+    let focus = constellation.focus_id;
 
-/// Run the force-directed graph simulation.
+    if ec != *last_entity_count || jc != *last_joint_count || focus != *last_focus {
+        for entity in &sleeping_bodies {
+            commands.entity(entity).remove::<Sleeping>();
+        }
+        *last_entity_count = ec;
+        *last_joint_count = jc;
+        *last_focus = focus;
+    }
+}
+
+/// Graph metadata update — ring order, BFS distances, depth, camera follow.
 ///
-/// Replaces the old carousel ring layout. Nodes repel each other (Coulomb),
-/// parent→child edges attract (Hooke spring), and the focused node is pulled
-/// toward center. Simulation runs until settled, then skips computation.
-fn run_force_simulation(
+/// This is the non-physics remainder of the old `run_force_simulation`.
+/// Force computation is now handled by Avian2D.
+fn update_constellation_graph(
     mut constellation: ResMut<Constellation>,
     mut camera: ResMut<ConstellationCamera>,
-    mut force_graph: ResMut<ForceGraph>,
     mut cached_ring: Local<Vec<usize>>,
-    mut last_focus: Local<Option<ContextId>>,
-    mut last_node_count: Local<usize>,
+    mut prev_focus: Local<Option<ContextId>>,
+    mut prev_node_count: Local<usize>,
 ) {
     let n = constellation.nodes.len();
     if n == 0 {
         return;
     }
 
-    let focus_changed = *last_focus != constellation.focus_id;
-    let topology_changed = n != *last_node_count;
+    let focus_changed = *prev_focus != constellation.focus_id;
+    let topology_changed = n != *prev_node_count;
 
     if focus_changed || topology_changed {
-        // Rebuild ring order (still useful for tree-ordered cycling)
+        // Rebuild ring order (tree-ordered cycling for keyboard nav)
         if topology_changed || cached_ring.len() != n {
             *cached_ring = build_ring_order(&constellation);
             for (ring_idx, &node_idx) in cached_ring.iter().enumerate() {
                 constellation.nodes[node_idx].ring_index = ring_idx;
-            }
-        }
-
-        // Resize velocities for new nodes
-        force_graph.velocities.resize(n, Vec2::ZERO);
-
-        // Initialize positions for new nodes (avoid all-at-origin singularity).
-        // Scatter radius scales with sqrt(n) so nodes aren't crammed together.
-        let scatter_radius = 150.0 + (n as f32).sqrt() * 50.0;
-        for i in 0..n {
-            if constellation.nodes[i].position == Vec2::ZERO
-                && Some(constellation.nodes[i].context_id) != constellation.focus_id
-            {
-                let angle = std::f32::consts::TAU * i as f32 / n as f32;
-                constellation.nodes[i].position =
-                    Vec2::new(angle.cos(), angle.sin()) * scatter_radius;
             }
         }
 
@@ -551,126 +740,88 @@ fn run_force_simulation(
             }
         }
 
-        // Unsettle to trigger re-simulation
-        force_graph.settled = false;
-        *last_focus = constellation.focus_id;
-        *last_node_count = n;
+        // Update depth from graph distances (1.0 = focused, 0.0 = farthest)
+        let max_dist = constellation
+            .nodes
+            .iter()
+            .filter(|n| n.graph_distance != u32::MAX)
+            .map(|n| n.graph_distance)
+            .max()
+            .unwrap_or(1)
+            .max(1);
 
-        // Follow-focus camera pan
-        if focus_changed {
-            if let Some(focus_id) = constellation.focus_id {
-                if let Some(node) = constellation.node_by_id(focus_id) {
-                    camera.target_offset = -node.position;
-                }
-            }
+        for node in &mut constellation.nodes {
+            node.depth = if node.graph_distance == u32::MAX {
+                0.0
+            } else {
+                1.0 - (node.graph_distance as f32 / max_dist as f32).min(1.0)
+            };
         }
+
+        *prev_focus = constellation.focus_id;
+        *prev_node_count = n;
     }
 
-    if force_graph.settled {
+    // Camera tracks focused node continuously (follows physics motion)
+    if let Some(focus_id) = constellation.focus_id {
+        if let Some(node) = constellation.node_by_id(focus_id) {
+            camera.target_offset = -node.position;
+        }
+    }
+}
+
+/// Apply radial gravity via ConstantForce — pulls all nodes toward origin.
+/// Focused node gets stronger pull.
+fn apply_radial_gravity(
+    constellation: Res<Constellation>,
+    mut forces: Query<(&PhysicsNode, &Transform, &mut ConstantForce)>,
+) {
+    for (phys_node, transform, mut force) in &mut forces {
+        let pos = transform.translation.truncate();
+        let k = if constellation.focus_id == Some(phys_node.context_id) {
+            RADIAL_GRAVITY_K + FOCUS_PULL_K
+        } else {
+            RADIAL_GRAVITY_K
+        };
+        force.0 = -pos * k;
+    }
+}
+
+/// Update center exclusion zone radius based on viewport size.
+fn update_center_exclusion_radius(
+    mut commands: Commands,
+    entity_map: Res<PhysicsEntityMap>,
+    container_q: Query<&ComputedNode, With<ConstellationContainer>>,
+) {
+    let Some(center_entity) = entity_map.center_body else {
+        return;
+    };
+    let Ok(computed) = container_q.single() else {
+        return;
+    };
+    let size = computed.size();
+    if size.x < 1.0 || size.y < 1.0 {
         return;
     }
+    let radius = size.x.min(size.y) * CENTER_EXCLUSION_FRACTION;
+    commands
+        .entity(center_entity)
+        .insert(Collider::circle(radius));
+}
 
-    // Build index maps for O(1) lookups
-    let id_to_idx: HashMap<ContextId, usize> = constellation
-        .nodes
-        .iter()
-        .enumerate()
-        .map(|(i, n)| (n.context_id, i))
-        .collect();
-
-    // Collect edges (parent → child)
-    let edges: Vec<(usize, usize)> = constellation
-        .nodes
-        .iter()
-        .enumerate()
-        .filter_map(|(i, node)| {
-            node.forked_from
-                .and_then(|pid| id_to_idx.get(&pid).map(|&pi| (pi, i)))
-        })
-        .collect();
-
-    let focused_idx = constellation
-        .focus_id
-        .and_then(|fid| id_to_idx.get(&fid).copied());
-
-    for _ in 0..ITERATIONS_PER_FRAME {
-        let mut forces = vec![Vec2::ZERO; n];
-
-        // Repulsion: all node pairs (Coulomb's law)
-        for i in 0..n {
-            for j in (i + 1)..n {
-                let delta =
-                    constellation.nodes[i].position - constellation.nodes[j].position;
-                let dist_sq = delta.length_squared().max(100.0); // avoid singularity
-                let force_mag = REPULSION_STRENGTH / dist_sq;
-                let force = delta.normalize_or_zero() * force_mag;
-                forces[i] += force;
-                forces[j] -= force;
-            }
+/// Sync physics Transform → ContextNode.position each frame.
+fn sync_physics_to_constellation(
+    mut constellation: ResMut<Constellation>,
+    physics_nodes: Query<(&PhysicsNode, &Transform)>,
+) {
+    for (phys_node, transform) in &physics_nodes {
+        if let Some(node) = constellation
+            .nodes
+            .iter_mut()
+            .find(|n| n.context_id == phys_node.context_id)
+        {
+            node.position = transform.translation.truncate();
         }
-
-        // Spring attraction: parent→child edges only (Hooke's law)
-        for &(parent, child) in &edges {
-            let delta =
-                constellation.nodes[child].position - constellation.nodes[parent].position;
-            let dist = delta.length();
-            let displacement = dist - REST_LENGTH;
-            let force = delta.normalize_or_zero() * SPRING_K * displacement;
-            forces[parent] += force;
-            forces[child] -= force;
-        }
-
-        // Weak gravity toward center for all nodes (prevents disconnected nodes escaping)
-        for i in 0..n {
-            forces[i] += -GRAVITY * constellation.nodes[i].position;
-        }
-
-        // Stronger center pull on focused node
-        if let Some(fi) = focused_idx {
-            forces[fi] += -CENTER_K * constellation.nodes[fi].position;
-        }
-
-        // Apply forces with damping and velocity cap
-        let mut max_v = 0.0f32;
-        for i in 0..n {
-            force_graph.velocities[i] =
-                (force_graph.velocities[i] + forces[i]) * DAMPING;
-            let v = force_graph.velocities[i].length();
-            if v > MAX_VELOCITY {
-                force_graph.velocities[i] *= MAX_VELOCITY / v;
-            }
-            max_v = max_v.max(force_graph.velocities[i].length());
-            constellation.nodes[i].position += force_graph.velocities[i];
-        }
-
-        if max_v < SETTLE_THRESHOLD {
-            force_graph.settled = true;
-            break;
-        }
-    }
-
-    // Update depth from graph distances (compatibility: 1.0 = focused, 0.0 = far)
-    let max_dist = constellation
-        .nodes
-        .iter()
-        .filter(|n| n.graph_distance != u32::MAX)
-        .map(|n| n.graph_distance)
-        .max()
-        .unwrap_or(1)
-        .max(1);
-
-    for i in 0..n {
-        let dist = constellation.nodes[i].graph_distance;
-        constellation.nodes[i].depth = if dist == u32::MAX {
-            0.0
-        } else {
-            1.0 - (dist as f32 / max_dist as f32).min(1.0)
-        };
-    }
-
-    // Camera follows focused node during settling
-    if let Some(fi) = focused_idx {
-        camera.target_offset = -constellation.nodes[fi].position;
     }
 }
 
