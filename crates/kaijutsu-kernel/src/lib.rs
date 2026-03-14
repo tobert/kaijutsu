@@ -17,7 +17,6 @@ pub mod block_tools;
 pub mod input_doc;
 pub mod config_backend;
 pub mod control;
-pub mod db;
 pub mod drift;
 pub mod file_tools;
 pub mod flows;
@@ -43,7 +42,8 @@ pub use block_tools::{
     EditOp,
 };
 pub use control::ConsentMode;
-pub use db::{DocumentDb, DocumentKind, DocumentMeta};
+pub use block_store::DocumentKind;
+pub use kaijutsu_types::DocKind;
 pub use kernel::Kernel;
 pub use rhai_engine::RhaiEngine;
 pub use state::KernelState;
@@ -114,6 +114,7 @@ pub use input_doc::InputDocEntry;
 pub use kernel_db::{
     KernelDb, KernelDbError, KernelDbResult,
     ContextRow, ContextShellRow, ContextEnvRow,
+    DocumentRow, SnapshotRow,
     PresetRow, WorkspaceRow, WorkspacePathRow, ContextEdgeRow,
 };
 pub use kj::{KjDispatcher, KjCaller, KjResult};

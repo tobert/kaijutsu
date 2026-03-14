@@ -206,6 +206,11 @@ impl KjDispatcher {
         // Write-through: KernelDb first, then DriftRouter
         {
             let db = self.kernel_db().lock().unwrap();
+            let default_ws = match db.get_or_create_default_workspace(kernel_id, caller.principal_id) {
+                Ok(id) => id,
+                Err(e) => return KjResult::Err(format!("kj context create: {e}")),
+            };
+
             let row = ContextRow {
                 context_id: new_id,
                 kernel_id,
@@ -223,7 +228,7 @@ impl KjDispatcher {
                 workspace_id: None,
                 preset_id: None,
             };
-            if let Err(e) = db.insert_context(&row) {
+            if let Err(e) = db.insert_context_with_document(&row, default_ws) {
                 return KjResult::Err(format!("kj context create: {e}"));
             }
 

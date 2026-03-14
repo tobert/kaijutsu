@@ -6,7 +6,7 @@
 //! - **Tier 3:** Shell command e2e through EmbeddedKaish
 use std::sync::Arc;
 
-use kaijutsu_kernel::db::DocumentKind;
+use kaijutsu_types::DocKind;
 use kaijutsu_kernel::tools::EngineArgs;
 use kaijutsu_kernel::{shared_block_store, Kernel, LocalBackend};
 use kaijutsu_crdt::{ContextId, PrincipalId};
@@ -125,7 +125,7 @@ async fn setup_shell_e2e(fs: &TestFs, project_root: Option<std::path::PathBuf>) 
     let documents = shared_block_store(PrincipalId::system());
 
     documents
-        .create_document(ContextId::new(), DocumentKind::Conversation, None)
+        .create_document(ContextId::new(), DocKind::Conversation, None)
         .unwrap();
 
     // Mount the test filesystem — mirrors real server setup but rooted in tempdir

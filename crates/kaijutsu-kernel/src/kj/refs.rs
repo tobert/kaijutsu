@@ -170,7 +170,8 @@ mod tests {
             workspace_id: None,
             preset_id: None,
         };
-        db.insert_context(&row).unwrap();
+        let ws_id = db.get_or_create_default_workspace(kid, principal).unwrap();
+        db.insert_context_with_document(&row, ws_id).unwrap();
 
         let caller = KjCaller {
             principal_id: principal,
@@ -193,9 +194,10 @@ mod tests {
         let grandparent_id = ContextId::new();
         let parent_id = ContextId::new();
         let child_id = ContextId::new();
+        let ws_id = db.get_or_create_default_workspace(kid, principal).unwrap();
 
         // Insert grandparent
-        db.insert_context(&crate::kernel_db::ContextRow {
+        db.insert_context_with_document(&crate::kernel_db::ContextRow {
             context_id: grandparent_id,
             kernel_id: kid,
             label: Some("grandparent".to_string()),
@@ -211,11 +213,11 @@ mod tests {
             archived_at: None,
             workspace_id: None,
             preset_id: None,
-        })
+        }, ws_id)
         .unwrap();
 
         // Insert parent
-        db.insert_context(&crate::kernel_db::ContextRow {
+        db.insert_context_with_document(&crate::kernel_db::ContextRow {
             context_id: parent_id,
             kernel_id: kid,
             label: Some("parent".to_string()),
@@ -231,11 +233,11 @@ mod tests {
             archived_at: None,
             workspace_id: None,
             preset_id: None,
-        })
+        }, ws_id)
         .unwrap();
 
         // Insert child
-        db.insert_context(&crate::kernel_db::ContextRow {
+        db.insert_context_with_document(&crate::kernel_db::ContextRow {
             context_id: child_id,
             kernel_id: kid,
             label: Some("child".to_string()),
@@ -251,7 +253,7 @@ mod tests {
             archived_at: None,
             workspace_id: None,
             preset_id: None,
-        })
+        }, ws_id)
         .unwrap();
 
         let caller = KjCaller {

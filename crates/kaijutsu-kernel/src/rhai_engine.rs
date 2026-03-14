@@ -20,7 +20,7 @@
 //! ```
 
 use crate::block_store::SharedBlockStore;
-use crate::db::DocumentKind;
+use kaijutsu_types::DocKind;
 use crate::tools::{ExecResult, ExecutionEngine, ToolContext};
 use async_trait::async_trait;
 use kaijutsu_crdt::{BlockKind, Role, Status};
@@ -131,11 +131,11 @@ impl RhaiEngine {
         // Note: Keeps old function name for Rhai script compatibility
         engine.register_fn("create_cell", move |kind: String| -> String {
             let doc_kind = match kind.as_str() {
-                "code" => DocumentKind::Code,
-                "markdown" | "text" => DocumentKind::Text,
+                "code" => DocKind::Code,
+                "markdown" | "text" => DocKind::Text,
                 // Legacy kinds map to Conversation
-                "output" | "system" | "user_message" | "agent_message" | "conversation" => DocumentKind::Conversation,
-                _ => DocumentKind::Code,
+                "output" | "system" | "user_message" | "agent_message" | "conversation" => DocKind::Conversation,
+                _ => DocKind::Code,
             };
 
             let ctx = ContextId::new();
@@ -1052,7 +1052,7 @@ mod tests {
         let context_id = ctx.context_id;
 
         // Create the document first so insert_block has a target
-        store.create_document(context_id, DocumentKind::Conversation, None).unwrap();
+        store.create_document(context_id, DocKind::Conversation, None).unwrap();
 
         let result = engine
             .execute(

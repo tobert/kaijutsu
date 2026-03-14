@@ -80,7 +80,11 @@ impl KjDispatcher {
                 workspace_id: source_ws,
                 preset_id: None,
             };
-            if let Err(e) = db.insert_context(&row) {
+            let default_ws = match db.get_or_create_default_workspace(kernel_id, caller.principal_id) {
+                Ok(id) => id,
+                Err(e) => return KjResult::Err(format!("kj fork: {e}")),
+            };
+            if let Err(e) = db.insert_context_with_document(&row, default_ws) {
                 return KjResult::Err(format!("kj fork: {e}"));
             }
 
@@ -198,7 +202,11 @@ impl KjDispatcher {
                 workspace_id: source_ws,
                 preset_id: None,
             };
-            if let Err(e) = db.insert_context(&row) {
+            let default_ws = match db.get_or_create_default_workspace(kernel_id, caller.principal_id) {
+                Ok(id) => id,
+                Err(e) => return KjResult::Err(format!("kj fork --shallow: {e}")),
+            };
+            if let Err(e) = db.insert_context_with_document(&row, default_ws) {
                 return KjResult::Err(format!("kj fork --shallow: {e}"));
             }
 
@@ -330,7 +338,11 @@ impl KjDispatcher {
                 workspace_id: source_ws,
                 preset_id: None,
             };
-            if let Err(e) = db.insert_context(&row) {
+            let default_ws = match db.get_or_create_default_workspace(kernel_id, caller.principal_id) {
+                Ok(id) => id,
+                Err(e) => return KjResult::Err(format!("kj fork --compact: {e}")),
+            };
+            if let Err(e) = db.insert_context_with_document(&row, default_ws) {
                 return KjResult::Err(format!("kj fork --compact: {e}"));
             }
 
@@ -454,7 +466,11 @@ impl KjDispatcher {
                     workspace_id: row.workspace_id,
                     preset_id: row.preset_id,
                 };
-                if let Err(e) = db.insert_context(&new_row) {
+                let default_ws = match db.get_or_create_default_workspace(kernel_id, caller.principal_id) {
+                    Ok(id) => id,
+                    Err(e) => return KjResult::Err(format!("kj fork --as: {e}")),
+                };
+                if let Err(e) = db.insert_context_with_document(&new_row, default_ws) {
                     return KjResult::Err(format!("kj fork --as: failed to create context: {e}"));
                 }
 

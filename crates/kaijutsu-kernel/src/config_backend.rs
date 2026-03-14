@@ -40,7 +40,7 @@ use tokio::sync::mpsc;
 use kaijutsu_crdt::{BlockId, BlockKind, ContextId, Role, Status};
 
 use crate::block_store::SharedBlockStore;
-use crate::db::DocumentKind;
+use kaijutsu_types::DocKind;
 use crate::flows::{ConfigFlow, ConfigSource, OpSource, SharedConfigFlowBus};
 
 /// Derive a deterministic ContextId from a config path.
@@ -310,7 +310,7 @@ impl ConfigCrdtBackend {
 
         // Create CRDT document with content
         self.blocks
-            .create_document(ctx, DocumentKind::Config, None)
+            .create_document(ctx, DocKind::Config, None)
             .map_err(|e| ConfigError::Crdt(e.to_string()))?;
 
         // Insert content as a single block
@@ -364,7 +364,7 @@ impl ConfigCrdtBackend {
         // Get or create document
         if !self.blocks.contains(ctx) {
             self.blocks
-                .create_document(ctx, DocumentKind::Config, None)
+                .create_document(ctx, DocKind::Config, None)
                 .map_err(|e| ConfigError::Crdt(e.to_string()))?;
         }
 
@@ -406,7 +406,7 @@ impl ConfigCrdtBackend {
         // Get or create document
         if !self.blocks.contains(ctx) {
             self.blocks
-                .create_document(ctx, DocumentKind::Config, None)
+                .create_document(ctx, DocKind::Config, None)
                 .map_err(|e| ConfigError::Crdt(e.to_string()))?;
         }
 
@@ -695,7 +695,7 @@ impl ConfigCrdtBackend {
                 // Get or create document
                 if !self.blocks.contains(ctx) {
                     self.blocks
-                        .create_document(ctx, DocumentKind::Config, None)
+                        .create_document(ctx, DocKind::Config, None)
                         .map_err(|e| ConfigError::Crdt(e.to_string()))?;
                 }
 

@@ -275,7 +275,8 @@ mod tests {
         let c = test_caller();
         let result = d.dispatch(&[s("workspace"), s("list")], &c).await;
         assert!(result.is_ok());
-        assert_eq!(result.message(), "(no workspaces)");
+        // __default workspace is auto-created by test_dispatcher
+        assert!(result.message().contains("__default"));
     }
 
     #[tokio::test]

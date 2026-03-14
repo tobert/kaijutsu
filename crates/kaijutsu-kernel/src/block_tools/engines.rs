@@ -1447,7 +1447,7 @@ impl ExecutionEngine for KernelSearchEngine {
 mod tests {
     use super::*;
     use crate::block_store::shared_block_store;
-    use crate::db::DocumentKind;
+    use kaijutsu_types::DocKind as DocumentKind;
     use kaijutsu_types::PrincipalId;
 
     /// Test context ID, deterministic for test reproducibility.

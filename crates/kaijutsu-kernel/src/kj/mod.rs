@@ -236,6 +236,11 @@ pub(crate) mod test_helpers {
             KernelDb::in_memory().expect("in-memory KernelDb"),
         ));
         let kernel_id = KernelId::new();
+        // Create default workspace for test contexts
+        {
+            let db = kernel_db.lock().unwrap();
+            db.get_or_create_default_workspace(kernel_id, PrincipalId::system()).unwrap();
+        }
         let kernel = Arc::new(Kernel::new("test").await);
         KjDispatcher::new(drift, blocks, kernel_db, kernel_id, kernel)
     }
@@ -280,9 +285,23 @@ pub(crate) mod test_helpers {
         let id = ContextId::new();
         let kernel_id = dispatcher.kernel_id();
 
-        // Insert into KernelDb
+        // Insert document + context into KernelDb
         {
             let db = dispatcher.kernel_db().lock().unwrap();
+            let ws_id = db.get_or_create_default_workspace(kernel_id, created_by).unwrap();
+
+            // Document row first (contexts FK to documents)
+            db.insert_document(&crate::kernel_db::DocumentRow {
+                document_id: id,
+                kernel_id,
+                workspace_id: ws_id,
+                doc_kind: kaijutsu_types::DocKind::Conversation,
+                language: None,
+                path: None,
+                created_at: kaijutsu_types::now_millis() as i64,
+                created_by,
+            }).unwrap();
+
             let row = crate::kernel_db::ContextRow {
                 context_id: id,
                 kernel_id,
@@ -293,7 +312,7 @@ pub(crate) mod test_helpers {
                 tool_filter: None,
                 consent_mode: kaijutsu_types::ConsentMode::Collaborative,
                 created_at: kaijutsu_types::now_millis() as i64,
-                created_by: created_by,
+                created_by,
                 forked_from,
                 fork_kind: forked_from.map(|_| kaijutsu_types::ForkKind::Full),
                 archived_at: None,

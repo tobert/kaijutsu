@@ -178,6 +178,49 @@ impl ToolFilter {
 }
 
 // ============================================================================
+// DocKind — type of document content
+// ============================================================================
+
+/// Type of document content.
+///
+/// Role distinctions (User/Model/System) stay at the block level via `Role` enum.
+/// This enum categorizes the document itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default, EnumString)]
+#[serde(rename_all = "lowercase")]
+#[strum(ascii_case_insensitive)]
+pub enum DocKind {
+    /// Interactive human/model dialog.
+    #[default]
+    #[strum(serialize = "conversation", serialize = "output", serialize = "system", serialize = "user_message", serialize = "agent_message")]
+    Conversation,
+    /// Executable code.
+    Code,
+    /// Static markdown/text.
+    #[strum(serialize = "text", serialize = "markdown")]
+    Text,
+    /// Configuration file (theme.rhai, models.rhai).
+    #[strum(serialize = "config")]
+    Config,
+}
+
+impl DocKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Conversation => "conversation",
+            Self::Code => "code",
+            Self::Text => "text",
+            Self::Config => "config",
+        }
+    }
+}
+
+impl fmt::Display for DocKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -389,4 +432,59 @@ mod tests {
     // NOTE: ToolFilter uses HashSet which doesn't support postcard (positional format).
     // Wire serialization uses JSON (TEXT column in SQLite, JSON on Cap'n Proto).
     // Postcard roundtrip is intentionally not tested for ToolFilter.
+
+    // ── DocKind ────────────────────────────────────────────────────────
+
+    #[test]
+    fn doc_kind_default() {
+        assert_eq!(DocKind::default(), DocKind::Conversation);
+    }
+
+    #[test]
+    fn doc_kind_as_str_roundtrip() {
+        for kind in [DocKind::Conversation, DocKind::Code, DocKind::Text, DocKind::Config] {
+            let s = kind.as_str();
+            let parsed = DocKind::from_str(s).unwrap();
+            assert_eq!(kind, parsed);
+        }
+    }
+
+    #[test]
+    fn doc_kind_case_insensitive() {
+        assert_eq!(DocKind::from_str("CONVERSATION").unwrap(), DocKind::Conversation);
+        assert_eq!(DocKind::from_str("Code").unwrap(), DocKind::Code);
+    }
+
+    #[test]
+    fn doc_kind_legacy_aliases() {
+        assert_eq!(DocKind::from_str("output").unwrap(), DocKind::Conversation);
+        assert_eq!(DocKind::from_str("system").unwrap(), DocKind::Conversation);
+        assert_eq!(DocKind::from_str("user_message").unwrap(), DocKind::Conversation);
+        assert_eq!(DocKind::from_str("agent_message").unwrap(), DocKind::Conversation);
+        assert_eq!(DocKind::from_str("markdown").unwrap(), DocKind::Text);
+    }
+
+    #[test]
+    fn doc_kind_display() {
+        assert_eq!(format!("{}", DocKind::Conversation), "conversation");
+        assert_eq!(format!("{}", DocKind::Config), "config");
+    }
+
+    #[test]
+    fn doc_kind_serde_roundtrip() {
+        let kind = DocKind::Config;
+        let json = serde_json::to_string(&kind).unwrap();
+        assert_eq!(json, "\"config\"");
+        let parsed: DocKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(kind, parsed);
+    }
+
+    #[test]
+    fn doc_kind_postcard_roundtrip() {
+        for kind in [DocKind::Conversation, DocKind::Code, DocKind::Text, DocKind::Config] {
+            let bytes = postcard::to_stdvec(&kind).unwrap();
+            let parsed: DocKind = postcard::from_bytes(&bytes).unwrap();
+            assert_eq!(kind, parsed);
+        }
+    }
 }

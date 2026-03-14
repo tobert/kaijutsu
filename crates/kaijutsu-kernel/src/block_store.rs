@@ -20,11 +20,14 @@ use parking_lot::RwLock;
 use kaijutsu_crdt::block_store::{BlockStore as CrdtBlockStore, ForkBlockFilter, StoreSnapshot, SyncPayload};
 use kaijutsu_crdt::{BlockId, BlockKind, BlockSnapshot, Role, Status, ToolKind};
 use kaijutsu_types::BlockFilter;
-use kaijutsu_types::{ContextId, PrincipalId};
+use kaijutsu_types::{ContextId, DocKind, KernelId, PrincipalId, WorkspaceId};
 
-use crate::db::{DocumentDb, DocumentKind, DocumentMeta};
+use crate::kernel_db::{DocumentRow, KernelDb};
 use crate::flows::{BlockFlow, InputDocFlow, OpSource, SharedBlockFlowBus, SharedInputDocFlowBus};
 use crate::input_doc::InputDocEntry;
+
+/// Backward-compatible alias during migration.
+pub type DocumentKind = DocKind;
 
 // ============================================================================
 // Error types
@@ -64,15 +67,15 @@ pub enum BlockStoreError {
 /// Result type alias for BlockStore operations.
 pub type BlockStoreResult<T> = Result<T, BlockStoreError>;
 
-/// Thread-safe database handle.
-pub type DbHandle = Arc<std::sync::Mutex<DocumentDb>>;
+/// Thread-safe database handle (unified KernelDb).
+pub type DbHandle = Arc<std::sync::Mutex<KernelDb>>;
 
 /// Entry for a document in the store.
 pub struct DocumentEntry {
     /// Per-block CRDT store (each block owns its own DTE Document).
     pub doc: CrdtBlockStore,
     /// Document metadata.
-    pub kind: DocumentKind,
+    pub kind: DocKind,
     /// Programming language (if code).
     pub language: Option<String>,
     /// Version counter (incremented on each modification).
@@ -85,7 +88,7 @@ pub struct DocumentEntry {
 
 impl DocumentEntry {
     /// Create a new document entry.
-    fn new(context_id: ContextId, kind: DocumentKind, language: Option<String>, agent_id: PrincipalId) -> Self {
+    fn new(context_id: ContextId, kind: DocKind, language: Option<String>, agent_id: PrincipalId) -> Self {
         Self {
             doc: CrdtBlockStore::new(context_id, agent_id),
             kind,
@@ -99,7 +102,7 @@ impl DocumentEntry {
     /// Create a document entry from a store snapshot.
     fn from_store_snapshot(
         snapshot: StoreSnapshot,
-        kind: DocumentKind,
+        kind: DocKind,
         language: Option<String>,
         agent_id: PrincipalId,
     ) -> Self {
@@ -148,8 +151,12 @@ pub struct BlockStore {
     documents: DashMap<ContextId, DocumentEntry>,
     /// Per-context input documents (compose scratchpads).
     input_docs: DashMap<ContextId, InputDocEntry>,
-    /// Database for persistence.
+    /// Database for persistence (unified KernelDb).
     db: Option<DbHandle>,
+    /// Kernel ID for document rows.
+    kernel_id: Option<KernelId>,
+    /// Default workspace ID for new documents.
+    default_workspace_id: Option<WorkspaceId>,
     /// Default agent ID for this store.
     agent_id: RwLock<PrincipalId>,
     /// FlowBus for typed pub/sub.
@@ -165,6 +172,8 @@ impl BlockStore {
             documents: DashMap::new(),
             input_docs: DashMap::new(),
             db: None,
+            kernel_id: None,
+            default_workspace_id: None,
             agent_id: RwLock::new(agent_id),
             block_flows: None,
             input_flows: None,
@@ -177,34 +186,47 @@ impl BlockStore {
             documents: DashMap::new(),
             input_docs: DashMap::new(),
             db: None,
+            kernel_id: None,
+            default_workspace_id: None,
             agent_id: RwLock::new(agent_id),
             block_flows: Some(block_flows),
             input_flows: None,
         }
     }
 
-    /// Create a block store with SQLite persistence.
-    pub fn with_db(db: DocumentDb, agent_id: PrincipalId) -> Self {
+    /// Create a block store with unified KernelDb persistence.
+    pub fn with_db(
+        db: DbHandle,
+        kernel_id: KernelId,
+        default_workspace_id: WorkspaceId,
+        agent_id: PrincipalId,
+    ) -> Self {
         Self {
             documents: DashMap::new(),
             input_docs: DashMap::new(),
-            db: Some(Arc::new(std::sync::Mutex::new(db))),
+            db: Some(db),
+            kernel_id: Some(kernel_id),
+            default_workspace_id: Some(default_workspace_id),
             agent_id: RwLock::new(agent_id),
             block_flows: None,
             input_flows: None,
         }
     }
 
-    /// Create a block store with SQLite persistence and FlowBus.
+    /// Create a block store with unified KernelDb persistence and FlowBus.
     pub fn with_db_and_flows(
-        db: DocumentDb,
+        db: DbHandle,
+        kernel_id: KernelId,
+        default_workspace_id: WorkspaceId,
         agent_id: PrincipalId,
         block_flows: SharedBlockFlowBus,
     ) -> Self {
         Self {
             documents: DashMap::new(),
             input_docs: DashMap::new(),
-            db: Some(Arc::new(std::sync::Mutex::new(db))),
+            db: Some(db),
+            kernel_id: Some(kernel_id),
+            default_workspace_id: Some(default_workspace_id),
             agent_id: RwLock::new(agent_id),
             block_flows: Some(block_flows),
             input_flows: None,
@@ -245,40 +267,41 @@ impl BlockStore {
     pub fn create_document(
         &self,
         context_id: ContextId,
-        kind: DocumentKind,
+        kind: DocKind,
         language: Option<String>,
     ) -> BlockStoreResult<()> {
         use dashmap::mapref::entry::Entry;
 
-        let id_hex = context_id.to_hex();
         match self.documents.entry(context_id) {
             Entry::Occupied(_) => {
                 Err(BlockStoreError::DocumentAlreadyExists(context_id))
             }
             Entry::Vacant(vacant) => {
+                let agent_id = self.agent_id();
+
                 // Persist metadata if we have a DB
                 if let Some(db) = &self.db {
                     let db_guard = db.lock().map_err(|e| BlockStoreError::Db(e.to_string()))?;
-                    let meta = DocumentMeta {
-                        id: id_hex.clone(),
-                        kind,
+                    let row = DocumentRow {
+                        document_id: context_id,
+                        kernel_id: self.kernel_id.unwrap_or_else(KernelId::new),
+                        workspace_id: self.default_workspace_id.unwrap_or_else(WorkspaceId::new),
+                        doc_kind: kind,
                         language: language.clone(),
-                        parent_document: None,
-                        created_at: 0, // Unused - DB default (unixepoch()) handles timestamp
+                        path: None,
+                        created_at: kaijutsu_types::now_millis() as i64,
+                        created_by: agent_id,
                     };
-                    match db_guard.create_document(&meta) {
+                    match db_guard.insert_document(&row) {
                         Ok(()) => {}
-                        Err(e) if e.to_string().contains("UNIQUE constraint") => {
-                            // Document exists in DB (e.g., load_from_db skipped a
-                            // corrupted snapshot) but not in memory. Proceed with
-                            // DashMap insert so the document becomes usable again.
-                            tracing::warn!(context_id = %id_hex, "Document already in DB but not in memory, recovering");
+                        Err(e) if e.to_string().contains("UNIQUE constraint")
+                            || e.to_string().contains("already exists") => {
+                            tracing::warn!(context_id = %context_id.to_hex(), "Document already in DB but not in memory, recovering");
                         }
                         Err(e) => return Err(BlockStoreError::Db(e.to_string())),
                     }
                 }
 
-                let agent_id = self.agent_id();
                 let entry = DocumentEntry::new(context_id, kind, language, agent_id);
                 vacant.insert(entry);
 
@@ -294,7 +317,7 @@ impl BlockStore {
     pub fn create_document_from_snapshot(
         &self,
         context_id: ContextId,
-        kind: DocumentKind,
+        kind: DocKind,
         language: Option<String>,
         snapshot_bytes: &[u8],
     ) -> BlockStoreResult<()> {
@@ -328,7 +351,7 @@ impl BlockStore {
     }
 
     /// List document IDs filtered by kind.
-    pub fn list_ids_by_kind(&self, kind: DocumentKind) -> Vec<ContextId> {
+    pub fn list_ids_by_kind(&self, kind: DocKind) -> Vec<ContextId> {
         self.documents.iter()
             .filter(|r| r.kind == kind)
             .map(|r| *r.key())
@@ -345,7 +368,7 @@ impl BlockStore {
         if let Some(db) = &self.db {
             let db_guard = db.lock().map_err(|e| BlockStoreError::Db(e.to_string()))?;
             db_guard
-                .delete_document(&context_id.to_hex())
+                .delete_document(context_id)
                 .map_err(|e| BlockStoreError::Db(e.to_string()))?;
         }
 
@@ -393,15 +416,18 @@ impl BlockStore {
         // Persist metadata if we have a DB
         if let Some(db) = &self.db {
             let db_guard = db.lock().map_err(|e| BlockStoreError::Db(e.to_string()))?;
-            let meta = DocumentMeta {
-                id: new_id.to_hex(),
-                kind,
+            let row = DocumentRow {
+                document_id: new_id,
+                kernel_id: self.kernel_id.unwrap_or_else(KernelId::new),
+                workspace_id: self.default_workspace_id.unwrap_or_else(WorkspaceId::new),
+                doc_kind: kind,
                 language: language.clone(),
-                parent_document: Some(source_id.to_hex()),
-                created_at: 0, // DB default handles timestamp
+                path: None,
+                created_at: kaijutsu_types::now_millis() as i64,
+                created_by: agent_id,
             };
             db_guard
-                .create_document(&meta)
+                .insert_document(&row)
                 .map_err(|e| BlockStoreError::Db(e.to_string()))?;
         }
 
@@ -464,15 +490,18 @@ impl BlockStore {
         // Persist metadata if we have a DB
         if let Some(db) = &self.db {
             let db_guard = db.lock().map_err(|e| BlockStoreError::Db(e.to_string()))?;
-            let meta = DocumentMeta {
-                id: new_id.to_hex(),
-                kind,
+            let row = DocumentRow {
+                document_id: new_id,
+                kernel_id: self.kernel_id.unwrap_or_else(KernelId::new),
+                workspace_id: self.default_workspace_id.unwrap_or_else(WorkspaceId::new),
+                doc_kind: kind,
                 language: language.clone(),
-                parent_document: Some(source_id.to_hex()),
-                created_at: 0, // DB default handles timestamp
+                path: None,
+                created_at: kaijutsu_types::now_millis() as i64,
+                created_by: agent_id,
             };
             db_guard
-                .create_document(&meta)
+                .insert_document(&row)
                 .map_err(|e| BlockStoreError::Db(e.to_string()))?;
         }
 
@@ -525,15 +554,18 @@ impl BlockStore {
         // Persist metadata if we have a DB
         if let Some(db) = &self.db {
             let db_guard = db.lock().map_err(|e| BlockStoreError::Db(e.to_string()))?;
-            let meta = DocumentMeta {
-                id: new_id.to_hex(),
-                kind,
+            let row = DocumentRow {
+                document_id: new_id,
+                kernel_id: self.kernel_id.unwrap_or_else(KernelId::new),
+                workspace_id: self.default_workspace_id.unwrap_or_else(WorkspaceId::new),
+                doc_kind: kind,
                 language: language.clone(),
-                parent_document: Some(source_id.to_hex()),
-                created_at: 0,
+                path: None,
+                created_at: kaijutsu_types::now_millis() as i64,
+                created_by: agent_id,
             };
             db_guard
-                .create_document(&meta)
+                .insert_document(&row)
                 .map_err(|e| BlockStoreError::Db(e.to_string()))?;
         }
 
@@ -1295,40 +1327,30 @@ impl BlockStore {
         let db = self.db.as_ref().ok_or(BlockStoreError::NoDatabaseConfigured)?;
         let db_guard = db.lock().map_err(|e| BlockStoreError::Db(e.to_string()))?;
 
-        let document_metas = db_guard
-            .list_documents()
+        let kernel_id = self.kernel_id.ok_or_else(|| BlockStoreError::Db("no kernel_id configured".into()))?;
+        let documents = db_guard
+            .list_documents(kernel_id)
             .map_err(|e| BlockStoreError::Db(e.to_string()))?;
 
         let agent_id = self.agent_id();
-        for meta in document_metas {
-            // Parse the DB string ID back to ContextId
-            let context_id = match ContextId::parse(&meta.id) {
-                Ok(id) => id,
-                Err(e) => {
-                    tracing::error!(
-                        document_id = %meta.id,
-                        error = %e,
-                        "Failed to parse document ID as ContextId, skipping"
-                    );
-                    continue;
-                }
-            };
+        for doc in documents {
+            let context_id = doc.document_id;
 
             // Try to load snapshot for this document
-            let entry = if let Ok(Some(snapshot_record)) = db_guard.get_snapshot(&meta.id) {
+            let entry = if let Ok(Some(snapshot_record)) = db_guard.get_snapshot(context_id) {
                 if let Some(oplog_bytes) = snapshot_record.oplog_bytes {
                     match postcard::from_bytes::<StoreSnapshot>(&oplog_bytes) {
                         Ok(store_snapshot) => {
                             tracing::debug!(
-                                document_id = %meta.id,
+                                document_id = %context_id.to_hex(),
                                 blocks = store_snapshot.blocks.len(),
                                 "Restored document from store snapshot"
                             );
-                            DocumentEntry::from_store_snapshot(store_snapshot, meta.kind, meta.language.clone(), agent_id)
+                            DocumentEntry::from_store_snapshot(store_snapshot, doc.doc_kind, doc.language.clone(), agent_id)
                         }
                         Err(e) => {
                             tracing::error!(
-                                document_id = %meta.id,
+                                document_id = %context_id.to_hex(),
                                 error = %e,
                                 "Failed to deserialize store snapshot, skipping (wipe DB to recover)"
                             );
@@ -1336,12 +1358,10 @@ impl BlockStore {
                         }
                     }
                 } else {
-                    // Snapshot exists but no oplog_bytes, start empty
-                    DocumentEntry::new(context_id, meta.kind, meta.language.clone(), agent_id)
+                    DocumentEntry::new(context_id, doc.doc_kind, doc.language.clone(), agent_id)
                 }
             } else {
-                // No snapshot, start empty
-                DocumentEntry::new(context_id, meta.kind, meta.language.clone(), agent_id)
+                DocumentEntry::new(context_id, doc.doc_kind, doc.language.clone(), agent_id)
             };
 
             self.documents.insert(context_id, entry);
@@ -1363,37 +1383,36 @@ impl BlockStore {
         let db = self.db.as_ref().ok_or(BlockStoreError::NoDatabaseConfigured)?;
         let db_guard = db.lock().map_err(|e| BlockStoreError::Db(e.to_string()))?;
 
-        let hex = context_id.to_hex();
-        let meta = db_guard
-            .get_document(&hex)
-            .map_err(|e: rusqlite::Error| BlockStoreError::Db(e.to_string()))?;
+        let doc = db_guard
+            .get_document(context_id)
+            .map_err(|e| BlockStoreError::Db(e.to_string()))?;
 
-        let Some(meta) = meta else {
-            return Ok(false); // not in database
+        let Some(doc) = doc else {
+            return Ok(false);
         };
 
         let agent_id = self.agent_id();
-        let entry = if let Ok(Some(snapshot_record)) = db_guard.get_snapshot(&hex) {
+        let entry = if let Ok(Some(snapshot_record)) = db_guard.get_snapshot(context_id) {
             if let Some(oplog_bytes) = snapshot_record.oplog_bytes {
                 match postcard::from_bytes::<StoreSnapshot>(&oplog_bytes) {
                     Ok(store_snapshot) => {
                         tracing::debug!(
-                            document_id = %hex,
+                            document_id = %context_id.to_hex(),
                             blocks = store_snapshot.blocks.len(),
                             "Hydrated document from DB"
                         );
-                        DocumentEntry::from_store_snapshot(store_snapshot, meta.kind, meta.language.clone(), agent_id)
+                        DocumentEntry::from_store_snapshot(store_snapshot, doc.doc_kind, doc.language.clone(), agent_id)
                     }
                     Err(e) => {
-                        tracing::warn!(document_id = %hex, error = %e, "Failed to deserialize snapshot");
+                        tracing::warn!(document_id = %context_id.to_hex(), error = %e, "Failed to deserialize snapshot");
                         return Ok(false);
                     }
                 }
             } else {
-                return Ok(false); // snapshot row but no oplog data
+                return Ok(false);
             }
         } else {
-            return Ok(false); // no snapshot
+            return Ok(false);
         };
 
         self.documents.insert(context_id, entry);
@@ -1418,7 +1437,7 @@ impl BlockStore {
 
         let db_guard = db.lock().map_err(|e| BlockStoreError::Db(e.to_string()))?;
         db_guard
-            .save_snapshot(&context_id.to_hex(), version, &content, Some(&snapshot_bytes))
+            .save_snapshot(context_id, version, &content, Some(&snapshot_bytes))
             .map_err(|e| BlockStoreError::Db(e.to_string()))?;
 
         Ok(())
@@ -1460,7 +1479,7 @@ impl BlockStore {
                 // Persist if we have a DB
                 if let Some(db) = &self.db {
                     let db_guard = db.lock().map_err(|e| BlockStoreError::Db(e.to_string()))?;
-                    let _ = db_guard.create_input_doc(&context_id.to_hex());
+                    let _ = db_guard.create_input_doc(context_id);
                 }
 
                 vacant.insert(entry);
@@ -1547,7 +1566,7 @@ impl BlockStore {
         // Persist cleared state
         if let Some(db) = &self.db {
             if let Ok(db_guard) = db.lock() {
-                let _ = db_guard.clear_input_doc(&context_id.to_hex());
+                let _ = db_guard.clear_input_doc(context_id);
             }
         }
 
@@ -1567,7 +1586,7 @@ impl BlockStore {
         drop(entry);
 
         let db_guard = db.lock().map_err(|e| BlockStoreError::Db(e.to_string()))?;
-        db_guard.upsert_input_doc(&context_id.to_hex(), &text, Some(&ops_bytes), version)
+        db_guard.upsert_input_doc(context_id, &text, Some(&ops_bytes), version)
             .map_err(|e| BlockStoreError::Db(e.to_string()))?;
 
         Ok(())
@@ -1584,23 +1603,15 @@ impl BlockStore {
 
         let agent_id = self.agent_id();
 
-        for (ctx_hex, oplog_bytes) in rows {
-            let context_id = match ContextId::parse(&ctx_hex) {
-                Ok(id) => id,
-                Err(e) => {
-                    tracing::warn!(context_id = %ctx_hex, error = %e, "Failed to parse input doc context ID, skipping");
-                    continue;
-                }
-            };
-
+        for (context_id, oplog_bytes) in rows {
             let entry = if let Some(ops_bytes) = oplog_bytes {
                 match InputDocEntry::from_ops(&ops_bytes, agent_id) {
                     Ok(entry) => {
-                        tracing::debug!(context_id = %ctx_hex, text_len = entry.get_text().len(), "Restored input doc from oplog");
+                        tracing::debug!(context_id = %context_id.to_hex(), text_len = entry.get_text().len(), "Restored input doc from oplog");
                         entry
                     }
                     Err(e) => {
-                        tracing::warn!(context_id = %ctx_hex, error = %e, "Failed to restore input doc, creating empty");
+                        tracing::warn!(context_id = %context_id.to_hex(), error = %e, "Failed to restore input doc, creating empty");
                         InputDocEntry::new(agent_id)
                     }
                 }
@@ -1712,8 +1723,13 @@ pub fn shared_block_store(agent_id: PrincipalId) -> SharedBlockStore {
 }
 
 /// Create a shared block store with database persistence.
-pub fn shared_block_store_with_db(db: DocumentDb, agent_id: PrincipalId) -> SharedBlockStore {
-    Arc::new(BlockStore::with_db(db, agent_id))
+pub fn shared_block_store_with_db(
+    db: DbHandle,
+    kernel_id: KernelId,
+    default_workspace_id: WorkspaceId,
+    agent_id: PrincipalId,
+) -> SharedBlockStore {
+    Arc::new(BlockStore::with_db(db, kernel_id, default_workspace_id, agent_id))
 }
 
 #[cfg(test)]

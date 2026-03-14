@@ -68,7 +68,7 @@ pub use compaction::CompactionBoundary;
 pub use context::{Context, fork_lineage};
 pub use kernel::Kernel;
 pub use session::Session;
-pub use enums::{ConsentMode, EdgeKind, ForkKind, ToolFilter};
+pub use enums::{ConsentMode, DocKind, EdgeKind, ForkKind, ToolFilter};
 
 /// Current time as Unix milliseconds. Canonical source — used by constructors
 /// throughout the crate and by downstream crates (drift, kernel_db, rpc).

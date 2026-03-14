@@ -25,7 +25,7 @@ use crate::embedded_kaish::EmbeddedKaish;
 use crate::interrupt::ContextInterruptState;
 
 use kaijutsu_kernel::{
-    DocumentDb, DocumentKind, Kernel,
+    Kernel,
     LocalBackend, SharedBlockStore, ToolInfo, VfsOps,
     RigProvider, LlmMessage, llm::stream::{LlmStream, StreamRequest, StreamEvent},
     // Block tools
@@ -354,52 +354,29 @@ fn kernel_data_dir() -> std::path::PathBuf {
     dir
 }
 
-/// Open or create a BlockStore with database persistence for a kernel.
-///
-/// If `data_dir_override` is set, uses that directory directly for the database.
-/// Otherwise uses the stable XDG default (~/.local/share/kaijutsu/kernel/).
-fn create_block_store_with_db(agent_id: PrincipalId, block_flows: SharedBlockFlowBus, input_flows: SharedInputDocFlowBus, data_dir_override: Option<&Path>) -> SharedBlockStore {
-    let db_dir = match data_dir_override {
-        Some(dir) => {
-            if let Err(e) = std::fs::create_dir_all(dir) {
-                log::warn!("Failed to create data dir {:?}: {}", dir, e);
-            }
-            dir.to_path_buf()
-        }
-        None => kernel_data_dir(),
-    };
-    let db_path = db_dir.join("data.db");
-    match DocumentDb::open(&db_path) {
-        Ok(db) => {
-            log::info!("Opened document database at {:?}", db_path);
-            // Ensure migration tables exist for existing DBs
-            if let Err(e) = db.ensure_input_docs_table() {
-                log::warn!("Failed to create input_docs table: {}", e);
-            }
-            if let Err(e) = db.ensure_bootstrap_table() {
-                log::warn!("Failed to create bootstrap table: {}", e);
-            }
-            let mut inner = BlockStore::with_db_and_flows(db, agent_id, block_flows);
-            inner.set_input_flows(input_flows);
-            let store = Arc::new(inner);
-            if let Err(e) = store.load_from_db() {
-                log::warn!("Failed to load documents from DB: {}", e);
-            } else {
-                log::info!("Loaded {} documents from database", store.len());
-            }
-            // Load persisted input documents
-            if let Err(e) = store.load_input_docs_from_db() {
-                log::warn!("Failed to load input docs from DB: {}", e);
-            }
-            store
-        }
-        Err(e) => {
-            log::warn!("Failed to open document database at {:?}: {}, using in-memory", db_path, e);
-            let mut inner = BlockStore::with_flows(agent_id, block_flows);
-            inner.set_input_flows(input_flows);
-            Arc::new(inner)
-        }
+/// Create a BlockStore backed by the shared KernelDb.
+fn create_block_store_with_kernel_db(
+    db: Arc<std::sync::Mutex<KernelDb>>,
+    kernel_id: KernelId,
+    default_workspace_id: kaijutsu_types::WorkspaceId,
+    agent_id: PrincipalId,
+    block_flows: SharedBlockFlowBus,
+    input_flows: SharedInputDocFlowBus,
+) -> SharedBlockStore {
+    let mut inner = BlockStore::with_db_and_flows(
+        db, kernel_id, default_workspace_id, agent_id, block_flows,
+    );
+    inner.set_input_flows(input_flows);
+    let store = Arc::new(inner);
+    if let Err(e) = store.load_from_db() {
+        log::warn!("Failed to load documents from DB: {}", e);
+    } else {
+        log::info!("Loaded {} documents from database", store.len());
     }
+    if let Err(e) = store.load_input_docs_from_db() {
+        log::warn!("Failed to load input docs from DB: {}", e);
+    }
+    store
 }
 
 /// Get the config directory path.
@@ -739,11 +716,18 @@ pub async fn create_shared_kernel(
     // No more mount/unmount via RPC after this point.
     kernel.freeze_mounts();
 
-    // Create block store with database persistence and shared FlowBus
+    // Wrap KernelDb in Arc<Mutex> and create auto-workspaces
+    let kernel_db_arc = Arc::new(std::sync::Mutex::new(kernel_db));
+    let default_ws_id = {
+        let db = kernel_db_arc.lock().unwrap();
+        db.get_or_create_default_workspace(id, PrincipalId::system()).unwrap()
+    };
+
+    // Create block store backed by unified KernelDb
     let block_flows_for_index = block_flows.clone();
-    let documents = create_block_store_with_db(
+    let documents = create_block_store_with_kernel_db(
+        kernel_db_arc.clone(), id, default_ws_id,
         PrincipalId::system(), block_flows, input_flows,
-        Some(&resolved_data_dir),
     );
 
     // Create config backend
@@ -752,7 +736,6 @@ pub async fn create_shared_kernel(
 
     // Register block tools (including context engine + drift)
     let kernel_arc = Arc::new(kernel);
-    let kernel_db_arc = Arc::new(std::sync::Mutex::new(kernel_db));
     let workspace_guard = Some(kaijutsu_kernel::file_tools::WorkspaceGuard::new(
         kernel_db_arc.clone(),
     ));
@@ -773,7 +756,7 @@ pub async fn create_shared_kernel(
 
         // Step 2: Discover Conversation documents not in KernelDb → bootstrap minimal rows.
         // Only conversations are contexts — code/config/text docs are internal.
-        let block_store_ids: Vec<ContextId> = documents.list_ids_by_kind(DocumentKind::Conversation);
+        let block_store_ids: Vec<ContextId> = documents.list_ids_by_kind(kaijutsu_types::DocKind::Conversation);
         for &bs_ctx_id in &block_store_ids {
             if !db_ids.contains(&bs_ctx_id) {
                 let row = ContextRow {
@@ -793,7 +776,9 @@ pub async fn create_shared_kernel(
                     workspace_id: None,
                     preset_id: None,
                 };
-                if let Err(e) = db.insert_context(&row) {
+                let default_ws = db.get_or_create_default_workspace(row.kernel_id, row.created_by)
+                        .unwrap_or_else(|_| kaijutsu_types::WorkspaceId::new());
+                if let Err(e) = db.insert_context_with_document(&row, default_ws) {
                     log::warn!("Failed to bootstrap context {} into KernelDb: {}", bs_ctx_id.short(), e);
                 } else {
                     log::info!("Bootstrapped context {} into KernelDb from BlockStore", bs_ctx_id.short());
@@ -1827,7 +1812,7 @@ impl kernel::Server for KernelImpl {
             // Create the document for this context
             if let Err(e) = kernel.documents.create_document(
                 context_id,
-                DocumentKind::Conversation,
+                kaijutsu_types::DocKind::Conversation,
                 None,
             ) {
                 return Err(capnp::Error::failed(
@@ -1863,7 +1848,9 @@ impl kernel::Server for KernelImpl {
                     workspace_id: None,
                     preset_id: None,
                 };
-                if let Err(e) = db.insert_context(&row) {
+                let default_ws = db.get_or_create_default_workspace(row.kernel_id, row.created_by)
+                        .unwrap_or_else(|_| kaijutsu_types::WorkspaceId::new());
+                if let Err(e) = db.insert_context_with_document(&row, default_ws) {
                     log::warn!("KernelDb insert_context failed for {}: {}", context_id.short(), e);
                 }
             }
@@ -1912,7 +1899,7 @@ impl kernel::Server for KernelImpl {
                 log::info!("Creating document for context {}", context_id);
                 if let Err(e) = kernel.documents.create_document(
                     context_id,
-                    DocumentKind::Conversation,
+                    kaijutsu_types::DocKind::Conversation,
                     None,
                 ) {
                     log::error!("Failed to create document for context {}: {}", context_id, e);
@@ -1953,7 +1940,9 @@ impl kernel::Server for KernelImpl {
                                 workspace_id: None,
                                 preset_id: None,
                             };
-                            if let Err(e) = db.insert_context(&row) {
+                            let default_ws = db.get_or_create_default_workspace(row.kernel_id, row.created_by)
+                        .unwrap_or_else(|_| kaijutsu_types::WorkspaceId::new());
+                if let Err(e) = db.insert_context_with_document(&row, default_ws) {
                                 log::warn!("KernelDb insert_context failed for {}: {}", context_id.short(), e);
                             }
                         }
@@ -3046,7 +3035,9 @@ impl kernel::Server for KernelImpl {
                     workspace_id: parent_row.as_ref().and_then(|r| r.workspace_id),
                     preset_id: None,
                 };
-                if let Err(e) = db.insert_context(&row) {
+                let default_ws = db.get_or_create_default_workspace(row.kernel_id, row.created_by)
+                        .unwrap_or_else(|_| kaijutsu_types::WorkspaceId::new());
+                if let Err(e) = db.insert_context_with_document(&row, default_ws) {
                     log::warn!("KernelDb insert_context failed for fork {}: {}", new_ctx_id.short(), e);
                 }
                 // Insert structural edge
@@ -3817,7 +3808,9 @@ impl kernel::Server for KernelImpl {
                     workspace_id: parent_row.as_ref().and_then(|r| r.workspace_id),
                     preset_id: None,
                 };
-                if let Err(e) = db.insert_context(&row) {
+                let default_ws = db.get_or_create_default_workspace(row.kernel_id, row.created_by)
+                        .unwrap_or_else(|_| kaijutsu_types::WorkspaceId::new());
+                if let Err(e) = db.insert_context_with_document(&row, default_ws) {
                     log::warn!("KernelDb insert_context failed for fork {}: {}", new_ctx_id.short(), e);
                 }
                 let edge = ContextEdgeRow {

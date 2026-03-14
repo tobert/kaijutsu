@@ -3,6 +3,8 @@
 //! Parsing functions delegate to strum-derived FromStr implementations on the
 //! enums in kaijutsu-crdt and kaijutsu-kernel.
 
+use std::str::FromStr;
+
 use kaijutsu_crdt::{BlockId, BlockKind, ContextId, Role, Status};
 use kaijutsu_kernel::{DocumentKind, SharedBlockStore};
 
@@ -12,7 +14,7 @@ use kaijutsu_kernel::{DocumentKind, SharedBlockStore};
 
 /// Parse document kind from string.
 pub fn parse_document_kind(s: &str) -> Option<DocumentKind> {
-    DocumentKind::from_str(s)
+    DocumentKind::from_str(s).ok()
 }
 
 /// Parse role from string.

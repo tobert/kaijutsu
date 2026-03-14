@@ -61,7 +61,8 @@ use serde::{Deserialize, Serialize};
 
 use kaijutsu_client::{ActorHandle, ServerEvent, SshConfig, SyncManager, connect_ssh, spawn_actor};
 use kaijutsu_crdt::{ContextId, ConversationDAG, PrincipalId, Status};
-use kaijutsu_kernel::{DocumentKind, SharedBlockStore, shared_block_store, shared_block_flow_bus};
+use kaijutsu_kernel::{SharedBlockStore, shared_block_store, shared_block_flow_bus};
+use kaijutsu_kernel::block_store::DocumentKind as DocKind;
 
 // Re-export public types
 pub use models::*;
@@ -283,14 +284,14 @@ impl KaijutsuMcp {
         if !sync_state.ops.is_empty() {
             store.create_document_from_snapshot(
                 sync_state.context_id,
-                DocumentKind::Conversation,
+                DocKind::Conversation,
                 None,
                 &sync_state.ops,
             ).map_err(|e| anyhow::anyhow!(e))?;
         } else {
             store.create_document(
                 sync_state.context_id,
-                DocumentKind::Conversation,
+                DocKind::Conversation,
                 None,
             ).map_err(|e| anyhow::anyhow!(e))?;
         }
@@ -2914,14 +2915,14 @@ mod tests {
 
         // Server store — the authoritative source
         let server = shared_block_store(PrincipalId::new());
-        server.create_document(context_id, DocumentKind::Conversation, None)
+        server.create_document(context_id, DocKind::Conversation, None)
             .expect("create server document");
         server.insert_block(context_id, None, None, Role::User, BlockKind::Text, "Hello from server", Status::Done)
             .expect("insert block on server");
 
         // Client store — synced from server via SyncPayload
         let client = shared_block_store(PrincipalId::system());
-        client.create_document(context_id, DocumentKind::Conversation, None)
+        client.create_document(context_id, DocKind::Conversation, None)
             .expect("create client document");
         let initial_payload = server.ops_since(context_id, &HashMap::new())
             .expect("ops_since from empty frontier");

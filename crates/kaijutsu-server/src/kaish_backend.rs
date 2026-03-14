@@ -33,7 +33,7 @@ use serde_json::Value as JsonValue;
 
 use kaijutsu_crdt::BlockId;
 use kaijutsu_kernel::block_store::SharedBlockStore;
-use kaijutsu_kernel::db::DocumentKind;
+use kaijutsu_types::DocKind;
 use kaijutsu_kernel::tools::{ExecResult, ToolInfo as KaijutsuToolInfo};
 use kaijutsu_kernel::Kernel as KaijutsuKernel;
 use kaijutsu_types::{ContextId, KernelId, PrincipalId, SessionId};
@@ -303,7 +303,7 @@ impl KernelBackend for KaijutsuBackend {
                             return Err(BackendError::AlreadyExists(ctx_id.to_hex()));
                         }
                         self.blocks
-                            .create_document(ctx_id, DocumentKind::Code, None)
+                            .create_document(ctx_id, DocKind::Code, None)
                             .map_err(|e| BackendError::Io(e.to_string()))?;
                     }
                     WriteMode::UpdateOnly => {
@@ -314,7 +314,7 @@ impl KernelBackend for KaijutsuBackend {
                     WriteMode::Overwrite | WriteMode::Truncate => {
                         if !self.blocks.contains(ctx_id) {
                             self.blocks
-                                .create_document(ctx_id, DocumentKind::Code, None)
+                                .create_document(ctx_id, DocKind::Code, None)
                                 .map_err(|e| BackendError::Io(e.to_string()))?;
                         }
                     }
@@ -507,7 +507,7 @@ impl KernelBackend for KaijutsuBackend {
                     return Err(BackendError::AlreadyExists(ctx_id.to_hex()));
                 }
                 self.blocks
-                    .create_document(ctx_id, DocumentKind::Code, None)
+                    .create_document(ctx_id, DocKind::Code, None)
                     .map_err(|e| BackendError::Io(e.to_string()))?;
                 Ok(())
             }

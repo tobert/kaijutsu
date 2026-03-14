@@ -13,8 +13,8 @@ use rusqlite::{params, Connection, Result as SqliteResult};
 use tracing::{info, warn};
 
 use kaijutsu_types::{
-    ConsentMode, ContextId, EdgeKind, ForkKind, KernelId, PresetId, PrincipalId, ToolFilter,
-    WorkspaceId,
+    ConsentMode, ContextId, DocKind, EdgeKind, ForkKind, KernelId, PresetId, PrincipalId,
+    ToolFilter, WorkspaceId,
 };
 
 // ============================================================================
@@ -126,6 +126,29 @@ pub struct WorkspacePathRow {
     pub created_at: i64,
 }
 
+/// A document row — CRDT content layer.
+#[derive(Debug, Clone)]
+pub struct DocumentRow {
+    pub document_id: ContextId,
+    pub kernel_id: KernelId,
+    pub workspace_id: WorkspaceId,
+    pub doc_kind: DocKind,
+    pub language: Option<String>,
+    pub path: Option<String>,
+    pub created_at: i64,
+    pub created_by: PrincipalId,
+}
+
+/// A snapshot row — serialized CRDT state.
+#[derive(Debug, Clone)]
+pub struct SnapshotRow {
+    pub document_id: ContextId,
+    pub version: i64,
+    pub content: String,
+    pub oplog_bytes: Option<Vec<u8>>,
+    pub created_at: i64,
+}
+
 /// Per-context shell configuration.
 #[derive(Debug, Clone)]
 pub struct ContextShellRow {
@@ -159,8 +182,74 @@ pub struct ContextEdgeRow {
 // ============================================================================
 
 const SCHEMA: &str = r#"
+-- ── Kernel Identity ─────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS kernel (
+    kernel_id  BLOB NOT NULL PRIMARY KEY,
+    created_at INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER))
+);
+
+-- ── Workspaces ──────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS workspaces (
+    workspace_id BLOB NOT NULL PRIMARY KEY,
+    kernel_id    BLOB NOT NULL,
+    label        TEXT NOT NULL,
+    description  TEXT,
+    created_at   INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
+    created_by   BLOB NOT NULL,
+    archived_at  INTEGER
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_workspaces_label
+    ON workspaces(kernel_id, label);
+
+CREATE TABLE IF NOT EXISTS workspace_paths (
+    workspace_id BLOB NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+    path         TEXT NOT NULL,
+    read_only    INTEGER NOT NULL DEFAULT 0,
+    created_at   INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
+    PRIMARY KEY (workspace_id, path)
+);
+
+-- ── Presets ─────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS presets (
+    preset_id    BLOB NOT NULL PRIMARY KEY,
+    kernel_id    BLOB NOT NULL,
+    label        TEXT NOT NULL,
+    description  TEXT,
+    provider     TEXT,
+    model        TEXT,
+    system_prompt TEXT,
+    tool_filter  TEXT,
+    consent_mode TEXT NOT NULL DEFAULT 'collaborative',
+    created_at   INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
+    created_by   BLOB NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_presets_label
+    ON presets(kernel_id, label);
+
+-- ── Documents (CRDT content layer) ─────────────────────────────
+CREATE TABLE IF NOT EXISTS documents (
+    document_id  BLOB NOT NULL PRIMARY KEY,
+    kernel_id    BLOB NOT NULL,
+    workspace_id BLOB NOT NULL REFERENCES workspaces(workspace_id) ON DELETE RESTRICT,
+    doc_kind     TEXT NOT NULL DEFAULT 'conversation',
+    language     TEXT,
+    path         TEXT,
+    created_at   INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
+    created_by   BLOB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_documents_kernel
+    ON documents(kernel_id);
+CREATE INDEX IF NOT EXISTS idx_documents_workspace
+    ON documents(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_documents_kind
+    ON documents(kernel_id, doc_kind);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_path
+    ON documents(workspace_id, path) WHERE path IS NOT NULL;
+
+-- ── Contexts (conversation metadata, extends documents) ────────
 CREATE TABLE IF NOT EXISTS contexts (
-    context_id   BLOB NOT NULL PRIMARY KEY,
+    context_id   BLOB NOT NULL PRIMARY KEY
+        REFERENCES documents(document_id) ON DELETE CASCADE,
     kernel_id    BLOB NOT NULL,
     label        TEXT,
     provider     TEXT,
@@ -176,16 +265,14 @@ CREATE TABLE IF NOT EXISTS contexts (
     workspace_id BLOB REFERENCES workspaces(workspace_id) ON DELETE SET NULL,
     preset_id    BLOB REFERENCES presets(preset_id) ON DELETE SET NULL
 );
-
 CREATE UNIQUE INDEX IF NOT EXISTS idx_contexts_label
     ON contexts(kernel_id, label) WHERE label IS NOT NULL;
-
 CREATE INDEX IF NOT EXISTS idx_contexts_kernel
     ON contexts(kernel_id);
-
 CREATE INDEX IF NOT EXISTS idx_contexts_workspace
     ON contexts(workspace_id) WHERE workspace_id IS NOT NULL;
 
+-- ── Context Edges ───────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS context_edges (
     edge_id    BLOB NOT NULL PRIMARY KEY,
     source_id  BLOB NOT NULL REFERENCES contexts(context_id) ON DELETE CASCADE,
@@ -194,54 +281,32 @@ CREATE TABLE IF NOT EXISTS context_edges (
     metadata   TEXT,
     created_at INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER))
 );
-
 CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_structural_unique
     ON context_edges(source_id, target_id) WHERE kind = 'structural';
+CREATE INDEX IF NOT EXISTS idx_edges_source ON context_edges(source_id);
+CREATE INDEX IF NOT EXISTS idx_edges_target ON context_edges(target_id);
 
-CREATE INDEX IF NOT EXISTS idx_edges_source
-    ON context_edges(source_id);
-
-CREATE INDEX IF NOT EXISTS idx_edges_target
-    ON context_edges(target_id);
-
-CREATE TABLE IF NOT EXISTS presets (
-    preset_id    BLOB NOT NULL PRIMARY KEY,
-    kernel_id    BLOB NOT NULL,
-    label        TEXT NOT NULL,
-    description  TEXT,
-    provider     TEXT,
-    model        TEXT,
-    system_prompt TEXT,
-    tool_filter  TEXT,
-    consent_mode TEXT NOT NULL DEFAULT 'collaborative',
-    created_at   INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
-    created_by   BLOB NOT NULL
+-- ── Snapshots ───────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS snapshots (
+    document_id BLOB NOT NULL PRIMARY KEY
+        REFERENCES documents(document_id) ON DELETE CASCADE,
+    version     INTEGER NOT NULL,
+    content     TEXT NOT NULL,
+    oplog_bytes BLOB,
+    created_at  INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER))
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_presets_label
-    ON presets(kernel_id, label);
-
-CREATE TABLE IF NOT EXISTS workspaces (
-    workspace_id BLOB NOT NULL PRIMARY KEY,
-    kernel_id    BLOB NOT NULL,
-    label        TEXT NOT NULL,
-    description  TEXT,
-    created_at   INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
-    created_by   BLOB NOT NULL,
-    archived_at  INTEGER
+-- ── Input Documents ─────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS input_docs (
+    document_id BLOB NOT NULL PRIMARY KEY
+        REFERENCES documents(document_id) ON DELETE CASCADE,
+    content     TEXT NOT NULL DEFAULT '',
+    oplog_bytes BLOB,
+    version     INTEGER NOT NULL DEFAULT 0,
+    updated_at  INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER))
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_workspaces_label
-    ON workspaces(kernel_id, label);
-
-CREATE TABLE IF NOT EXISTS workspace_paths (
-    workspace_id BLOB NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
-    path         TEXT NOT NULL,
-    read_only    INTEGER NOT NULL DEFAULT 0,
-    created_at   INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
-    PRIMARY KEY (workspace_id, path)
-);
-
+-- ── Context Shell / Env ─────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS context_shell (
     context_id  BLOB NOT NULL PRIMARY KEY REFERENCES contexts(context_id) ON DELETE CASCADE,
     cwd         TEXT,
@@ -255,13 +320,7 @@ CREATE TABLE IF NOT EXISTS context_env (
     value      TEXT NOT NULL,
     PRIMARY KEY (context_id, key)
 );
-
 CREATE INDEX IF NOT EXISTS idx_ctx_env ON context_env(context_id);
-
-CREATE TABLE IF NOT EXISTS kernel (
-    kernel_id  BLOB NOT NULL PRIMARY KEY,
-    created_at INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER))
-);
 "#;
 
 // ============================================================================
@@ -411,6 +470,14 @@ fn consent_mode_from_sql(s: &str) -> ConsentMode {
 /// Parse ForkKind from TEXT column.
 fn fork_kind_from_sql(s: Option<String>) -> Option<ForkKind> {
     s.and_then(|v| ForkKind::from_str(&v).ok())
+}
+
+/// Parse DocKind from TEXT column.
+fn doc_kind_from_sql(s: &str) -> DocKind {
+    DocKind::from_str(s).unwrap_or_else(|_| {
+        warn!(kind = %s, "unknown DocKind in DB, defaulting to Conversation");
+        DocKind::Conversation
+    })
 }
 
 /// Parse EdgeKind from TEXT column.
@@ -576,10 +643,291 @@ impl KernelDb {
     }
 
     // ========================================================================
+    // Auto-Workspaces
+    // ========================================================================
+
+    /// Get or create the `__system` workspace (for config docs).
+    /// Returns the workspace ID.
+    pub fn get_or_create_system_workspace(
+        &self,
+        kernel_id: KernelId,
+        created_by: PrincipalId,
+    ) -> KernelDbResult<WorkspaceId> {
+        self.get_or_create_builtin_workspace(kernel_id, "__system", "System configuration documents", created_by)
+    }
+
+    /// Get or create the `__default` workspace (for conversations and file cache).
+    /// Returns the workspace ID.
+    pub fn get_or_create_default_workspace(
+        &self,
+        kernel_id: KernelId,
+        created_by: PrincipalId,
+    ) -> KernelDbResult<WorkspaceId> {
+        self.get_or_create_builtin_workspace(kernel_id, "__default", "Default workspace", created_by)
+    }
+
+    /// Get or create a built-in workspace by label.
+    fn get_or_create_builtin_workspace(
+        &self,
+        kernel_id: KernelId,
+        label: &str,
+        description: &str,
+        created_by: PrincipalId,
+    ) -> KernelDbResult<WorkspaceId> {
+        if let Some(ws) = self.get_workspace_by_label(kernel_id, label)? {
+            return Ok(ws.workspace_id);
+        }
+        let ws_id = WorkspaceId::new();
+        let row = WorkspaceRow {
+            workspace_id: ws_id,
+            kernel_id,
+            label: label.to_string(),
+            description: Some(description.to_string()),
+            created_at: now_millis() as i64,
+            created_by,
+            archived_at: None,
+        };
+        self.insert_workspace(&row)?;
+        info!(workspace_id = %ws_id.to_hex(), label, "Created built-in workspace");
+        Ok(ws_id)
+    }
+
+    // ========================================================================
+    // Document CRUD
+    // ========================================================================
+
+    /// Insert a new document.
+    pub fn insert_document(&self, row: &DocumentRow) -> KernelDbResult<()> {
+        self.conn.execute(
+            "INSERT INTO documents (
+                document_id, kernel_id, workspace_id, doc_kind,
+                language, path, created_at, created_by
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                blob_param(row.document_id.as_bytes()),
+                blob_param(row.kernel_id.as_bytes()),
+                blob_param(row.workspace_id.as_bytes()),
+                row.doc_kind.as_str(),
+                row.language,
+                row.path,
+                row.created_at,
+                blob_param(row.created_by.as_bytes()),
+            ],
+        ).map_err(|e| map_unique_violation(e, "document already exists or path conflict"))?;
+        Ok(())
+    }
+
+    /// Insert a document, ignoring if it already exists (idempotent).
+    pub fn insert_document_or_ignore(&self, row: &DocumentRow) -> KernelDbResult<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO documents (
+                document_id, kernel_id, workspace_id, doc_kind,
+                language, path, created_at, created_by
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                blob_param(row.document_id.as_bytes()),
+                blob_param(row.kernel_id.as_bytes()),
+                blob_param(row.workspace_id.as_bytes()),
+                row.doc_kind.as_str(),
+                row.language,
+                row.path,
+                row.created_at,
+                blob_param(row.created_by.as_bytes()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Get a document by ID.
+    pub fn get_document(&self, id: ContextId) -> KernelDbResult<Option<DocumentRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT document_id, kernel_id, workspace_id, doc_kind,
+                    language, path, created_at, created_by
+             FROM documents WHERE document_id = ?1",
+        )?;
+        let mut rows = stmt.query(params![blob_param(id.as_bytes())])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row_to_document_row(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// List all documents for a kernel.
+    pub fn list_documents(&self, kernel_id: KernelId) -> KernelDbResult<Vec<DocumentRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT document_id, kernel_id, workspace_id, doc_kind,
+                    language, path, created_at, created_by
+             FROM documents WHERE kernel_id = ?1
+             ORDER BY created_at",
+        )?;
+        let rows = stmt.query_map(params![blob_param(kernel_id.as_bytes())], |row| {
+            row_to_document_row(row)
+        })?;
+        Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
+    }
+
+    /// List documents filtered by kind for a kernel.
+    pub fn list_documents_by_kind(
+        &self,
+        kernel_id: KernelId,
+        kind: DocKind,
+    ) -> KernelDbResult<Vec<DocumentRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT document_id, kernel_id, workspace_id, doc_kind,
+                    language, path, created_at, created_by
+             FROM documents WHERE kernel_id = ?1 AND doc_kind = ?2
+             ORDER BY created_at",
+        )?;
+        let rows = stmt.query_map(
+            params![blob_param(kernel_id.as_bytes()), kind.as_str()],
+            |row| row_to_document_row(row),
+        )?;
+        Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
+    }
+
+    /// Delete a document (CASCADE deletes snapshots, input_docs, and context).
+    pub fn delete_document(&self, id: ContextId) -> KernelDbResult<bool> {
+        let deleted = self.conn.execute(
+            "DELETE FROM documents WHERE document_id = ?1",
+            params![blob_param(id.as_bytes())],
+        )?;
+        Ok(deleted > 0)
+    }
+
+    // ========================================================================
+    // Snapshots
+    // ========================================================================
+
+    /// Save (upsert) a snapshot for a document.
+    pub fn save_snapshot(
+        &self,
+        document_id: ContextId,
+        version: i64,
+        content: &str,
+        oplog_bytes: Option<&[u8]>,
+    ) -> KernelDbResult<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO snapshots (document_id, version, content, oplog_bytes)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                blob_param(document_id.as_bytes()),
+                version,
+                content,
+                oplog_bytes,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Get the snapshot for a document.
+    pub fn get_snapshot(&self, document_id: ContextId) -> KernelDbResult<Option<SnapshotRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT document_id, version, content, oplog_bytes, created_at
+             FROM snapshots WHERE document_id = ?1",
+        )?;
+        let mut rows = stmt.query(params![blob_param(document_id.as_bytes())])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(SnapshotRow {
+                document_id: read_context_id(row, 0)?,
+                version: row.get(1)?,
+                content: row.get(2)?,
+                oplog_bytes: row.get(3)?,
+                created_at: row.get(4)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    // ========================================================================
+    // Input Documents
+    // ========================================================================
+
+    /// Create or update an input document.
+    pub fn upsert_input_doc(
+        &self,
+        document_id: ContextId,
+        content: &str,
+        oplog_bytes: Option<&[u8]>,
+        version: i64,
+    ) -> KernelDbResult<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO input_docs (document_id, content, oplog_bytes, version, updated_at)
+             VALUES (?1, ?2, ?3, ?4, CAST((unixepoch('subsec') * 1000) AS INTEGER))",
+            params![
+                blob_param(document_id.as_bytes()),
+                content,
+                oplog_bytes,
+                version,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Create an empty input document (idempotent).
+    pub fn create_input_doc(&self, document_id: ContextId) -> KernelDbResult<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO input_docs (document_id, content, version) VALUES (?1, '', 0)",
+            params![blob_param(document_id.as_bytes())],
+        )?;
+        Ok(())
+    }
+
+    /// Clear an input document's content.
+    pub fn clear_input_doc(&self, document_id: ContextId) -> KernelDbResult<()> {
+        self.conn.execute(
+            "UPDATE input_docs SET content = '', oplog_bytes = NULL, version = version + 1,
+             updated_at = CAST((unixepoch('subsec') * 1000) AS INTEGER)
+             WHERE document_id = ?1",
+            params![blob_param(document_id.as_bytes())],
+        )?;
+        Ok(())
+    }
+
+    /// Load all input documents (document_id BLOB + oplog_bytes).
+    pub fn list_input_docs(&self) -> KernelDbResult<Vec<(ContextId, Option<Vec<u8>>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT document_id, oplog_bytes FROM input_docs",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let doc_id = read_context_id(row, 0)?;
+            let oplog_bytes: Option<Vec<u8>> = row.get(1)?;
+            Ok((doc_id, oplog_bytes))
+        })?;
+        Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
+    }
+
+    // ========================================================================
     // Context CRUD
     // ========================================================================
 
+    /// Insert a document + context pair in one call (convenience for conversations).
+    ///
+    /// Creates the document row first, then the context row. Uses the
+    /// default workspace if no workspace_id is set on the context.
+    pub fn insert_context_with_document(
+        &self,
+        row: &ContextRow,
+        default_workspace_id: WorkspaceId,
+    ) -> KernelDbResult<()> {
+        let ws_id = row.workspace_id.unwrap_or(default_workspace_id);
+        self.insert_document_or_ignore(&DocumentRow {
+            document_id: row.context_id,
+            kernel_id: row.kernel_id,
+            workspace_id: ws_id,
+            doc_kind: DocKind::Conversation,
+            language: None,
+            path: None,
+            created_at: row.created_at,
+            created_by: row.created_by,
+        })?;
+        self.insert_context(row)
+    }
+
     /// Insert a new context.
+    ///
+    /// The corresponding document row must already exist (FK enforced).
     pub fn insert_context(&self, row: &ContextRow) -> KernelDbResult<()> {
         if let Some(ref label) = row.label {
             validate_label(label)?;
@@ -1715,6 +2063,20 @@ impl KernelDb {
 // Row parsers
 // ============================================================================
 
+fn row_to_document_row(row: &rusqlite::Row<'_>) -> SqliteResult<DocumentRow> {
+    let kind_str: String = row.get(3)?;
+    Ok(DocumentRow {
+        document_id: read_context_id(row, 0)?,
+        kernel_id: read_kernel_id(row, 1)?,
+        workspace_id: read_workspace_id(row, 2)?,
+        doc_kind: doc_kind_from_sql(&kind_str),
+        language: row.get(4)?,
+        path: row.get(5)?,
+        created_at: row.get(6)?,
+        created_by: read_principal_id(row, 7)?,
+    })
+}
+
 fn row_to_context_row(row: &rusqlite::Row<'_>) -> SqliteResult<ContextRow> {
     let consent_str: String = row.get(7)?;
     let fork_kind_str: Option<String> = row.get(11)?;
@@ -1807,6 +2169,32 @@ fn make_context_row(kernel_id: KernelId, label: Option<&str>) -> ContextRow {
     }
 }
 
+/// Insert both a document row and context row for a context.
+/// Tests need this because contexts FK to documents.
+#[cfg(test)]
+fn insert_context_with_doc(db: &KernelDb, row: &ContextRow, ws_id: WorkspaceId) {
+    db.insert_document(&DocumentRow {
+        document_id: row.context_id,
+        kernel_id: row.kernel_id,
+        workspace_id: ws_id,
+        doc_kind: DocKind::Conversation,
+        language: None,
+        path: None,
+        created_at: row.created_at,
+        created_by: row.created_by,
+    }).unwrap();
+    db.insert_context(row).unwrap();
+}
+
+/// Set up a test DB with kernel + default workspace. Returns (KernelId, WorkspaceId).
+#[cfg(test)]
+fn setup_test_db(db: &KernelDb) -> (KernelId, WorkspaceId) {
+    let kid = KernelId::new();
+    let creator = PrincipalId::system();
+    let ws_id = db.get_or_create_default_workspace(kid, creator).unwrap();
+    (kid, ws_id)
+}
+
 #[cfg(test)]
 fn make_edge(source: ContextId, target: ContextId, kind: EdgeKind) -> ContextEdgeRow {
     ContextEdgeRow {
@@ -1841,11 +2229,11 @@ mod tests {
     #[test]
     fn context_lifecycle() {
         let db = KernelDb::in_memory().unwrap();
-        let kid = KernelId::new();
+        let (kid, ws_id) = setup_test_db(&db);
         let row = make_context_row(kid, Some("main"));
         let cid = row.context_id;
 
-        db.insert_context(&row).unwrap();
+        insert_context_with_doc(&db, &row, ws_id);
 
         // Get
         let loaded = db.get_context(cid).unwrap().unwrap();
@@ -1886,26 +2274,32 @@ mod tests {
     #[test]
     fn label_uniqueness() {
         let db = KernelDb::in_memory().unwrap();
-        let kid = KernelId::new();
+        let (kid, ws_id) = setup_test_db(&db);
 
         let row1 = make_context_row(kid, Some("shared"));
-        db.insert_context(&row1).unwrap();
+        insert_context_with_doc(&db, &row1, ws_id);
 
-        // Same kernel, same label → conflict
+        // Same kernel, same label → conflict (doc insert ok, context label conflicts)
         let row2 = make_context_row(kid, Some("shared"));
+        db.insert_document(&DocumentRow {
+            document_id: row2.context_id, kernel_id: kid, workspace_id: ws_id,
+            doc_kind: DocKind::Conversation, language: None, path: None,
+            created_at: row2.created_at, created_by: row2.created_by,
+        }).unwrap();
         let err = db.insert_context(&row2).unwrap_err();
         assert!(matches!(err, KernelDbError::LabelConflict(_)));
 
-        // Different kernel, same label → OK
+        // Different kernel, same label → OK (needs its own workspace)
         let kid2 = KernelId::new();
+        let ws_id2 = db.get_or_create_default_workspace(kid2, PrincipalId::system()).unwrap();
         let row3 = make_context_row(kid2, Some("shared"));
-        db.insert_context(&row3).unwrap();
+        insert_context_with_doc(&db, &row3, ws_id2);
 
         // NULL + NULL → OK (multiple)
         let n1 = make_context_row(kid, None);
         let n2 = make_context_row(kid, None);
-        db.insert_context(&n1).unwrap();
-        db.insert_context(&n2).unwrap();
+        insert_context_with_doc(&db, &n1, ws_id);
+        insert_context_with_doc(&db, &n2, ws_id);
     }
 
     // ── 5. Fork lineage 3 deep ─────────────────────────────────────────
@@ -1913,20 +2307,20 @@ mod tests {
     #[test]
     fn fork_lineage_3_deep() {
         let db = KernelDb::in_memory().unwrap();
-        let kid = KernelId::new();
+        let (kid, ws_id) = setup_test_db(&db);
 
         let root = make_context_row(kid, Some("root"));
-        db.insert_context(&root).unwrap();
+        insert_context_with_doc(&db, &root, ws_id);
 
         let mut child = make_context_row(kid, Some("child"));
         child.forked_from = Some(root.context_id);
         child.fork_kind = Some(ForkKind::Full);
-        db.insert_context(&child).unwrap();
+        insert_context_with_doc(&db, &child, ws_id);
 
         let mut grandchild = make_context_row(kid, Some("grandchild"));
         grandchild.forked_from = Some(child.context_id);
         grandchild.fork_kind = Some(ForkKind::Shallow);
-        db.insert_context(&grandchild).unwrap();
+        insert_context_with_doc(&db, &grandchild, ws_id);
 
         let lineage = db.fork_lineage(grandchild.context_id).unwrap();
         assert_eq!(lineage.len(), 3);
@@ -1943,18 +2337,18 @@ mod tests {
     #[test]
     fn subtree_snapshot() {
         let db = KernelDb::in_memory().unwrap();
-        let kid = KernelId::new();
+        let (kid, ws_id) = setup_test_db(&db);
 
         let parent = make_context_row(kid, Some("template"));
-        db.insert_context(&parent).unwrap();
+        insert_context_with_doc(&db, &parent, ws_id);
 
         let c1 = make_context_row(kid, Some("child1"));
-        db.insert_context(&c1).unwrap();
+        insert_context_with_doc(&db, &c1, ws_id);
         db.insert_edge(&make_edge(parent.context_id, c1.context_id, EdgeKind::Structural))
             .unwrap();
 
         let c2 = make_context_row(kid, Some("child2"));
-        db.insert_context(&c2).unwrap();
+        insert_context_with_doc(&db, &c2, ws_id);
         db.insert_edge(&make_edge(parent.context_id, c2.context_id, EdgeKind::Structural))
             .unwrap();
 
@@ -1970,12 +2364,12 @@ mod tests {
     #[test]
     fn structural_edge_unique() {
         let db = KernelDb::in_memory().unwrap();
-        let kid = KernelId::new();
+        let (kid, ws_id) = setup_test_db(&db);
 
         let a = make_context_row(kid, Some("a"));
         let b = make_context_row(kid, Some("b"));
-        db.insert_context(&a).unwrap();
-        db.insert_context(&b).unwrap();
+        insert_context_with_doc(&db, &a, ws_id);
+        insert_context_with_doc(&db, &b, ws_id);
 
         // First structural edge OK
         db.insert_edge(&make_edge(a.context_id, b.context_id, EdgeKind::Structural))
@@ -1997,12 +2391,12 @@ mod tests {
     #[test]
     fn drift_edge_allows_dupes() {
         let db = KernelDb::in_memory().unwrap();
-        let kid = KernelId::new();
+        let (kid, ws_id) = setup_test_db(&db);
 
         let a = make_context_row(kid, None);
         let b = make_context_row(kid, None);
-        db.insert_context(&a).unwrap();
-        db.insert_context(&b).unwrap();
+        insert_context_with_doc(&db, &a, ws_id);
+        insert_context_with_doc(&db, &b, ws_id);
 
         // Multiple drift edges same pair → all stored
         for _ in 0..3 {
@@ -2019,12 +2413,12 @@ mod tests {
     #[test]
     fn cycle_detection() {
         let db = KernelDb::in_memory().unwrap();
-        let kid = KernelId::new();
+        let (kid, ws_id) = setup_test_db(&db);
 
         let a = make_context_row(kid, Some("cyc-a"));
         let b = make_context_row(kid, Some("cyc-b"));
-        db.insert_context(&a).unwrap();
-        db.insert_context(&b).unwrap();
+        insert_context_with_doc(&db, &a, ws_id);
+        insert_context_with_doc(&db, &b, ws_id);
 
         // A → B structural OK
         db.insert_edge(&make_edge(a.context_id, b.context_id, EdgeKind::Structural))
@@ -2038,7 +2432,7 @@ mod tests {
 
         // Self-loop also detected
         let c = make_context_row(kid, Some("cyc-c"));
-        db.insert_context(&c).unwrap();
+        insert_context_with_doc(&db, &c, ws_id);
         let err = db
             .insert_edge(&make_edge(c.context_id, c.context_id, EdgeKind::Structural))
             .unwrap_err();
@@ -2165,7 +2559,7 @@ mod tests {
         // Create context referencing this workspace
         let mut ctx = make_context_row(kid, Some("ctx-ws"));
         ctx.workspace_id = Some(ws.workspace_id);
-        db.insert_context(&ctx).unwrap();
+        insert_context_with_doc(&db, &ctx, ws.workspace_id);
 
         // Archive workspace
         db.archive_workspace(ws.workspace_id).unwrap();
@@ -2184,12 +2578,12 @@ mod tests {
     #[test]
     fn drift_push_creates_edge() {
         let db = KernelDb::in_memory().unwrap();
-        let kid = KernelId::new();
+        let (kid, ws_id) = setup_test_db(&db);
 
         let a = make_context_row(kid, Some("source"));
         let b = make_context_row(kid, Some("target"));
-        db.insert_context(&a).unwrap();
-        db.insert_context(&b).unwrap();
+        insert_context_with_doc(&db, &a, ws_id);
+        insert_context_with_doc(&db, &b, ws_id);
 
         // Simulate drift push → create drift edge
         let edge1 = make_edge(a.context_id, b.context_id, EdgeKind::Drift);
@@ -2215,7 +2609,7 @@ mod tests {
     #[test]
     fn context_dag_recursive() {
         let db = KernelDb::in_memory().unwrap();
-        let kid = KernelId::new();
+        let (kid, ws_id) = setup_test_db(&db);
 
         // Create a 5-node tree: root → [a, b], a → [c, d]
         let root = make_context_row(kid, Some("root"));
@@ -2225,7 +2619,7 @@ mod tests {
         let d = make_context_row(kid, Some("d"));
 
         for ctx in [&root, &a, &b, &c, &d] {
-            db.insert_context(ctx).unwrap();
+            insert_context_with_doc(&db, ctx, ws_id);
         }
 
         db.insert_edge(&make_edge(root.context_id, a.context_id, EdgeKind::Structural))
@@ -2258,12 +2652,12 @@ mod tests {
     #[test]
     fn tag_resolution() {
         let db = KernelDb::in_memory().unwrap();
-        let kid = KernelId::new();
+        let (kid, ws_id) = setup_test_db(&db);
 
         let ctx1 = make_context_row(kid, Some("opusplan"));
         let ctx2 = make_context_row(kid, Some("sonnet"));
-        db.insert_context(&ctx1).unwrap();
-        db.insert_context(&ctx2).unwrap();
+        insert_context_with_doc(&db, &ctx1, ws_id);
+        insert_context_with_doc(&db, &ctx2, ws_id);
 
         // Exact label match
         let resolved = db.resolve_context(kid, "opusplan").unwrap();
@@ -2279,10 +2673,10 @@ mod tests {
     #[test]
     fn resolve_context_basic() {
         let db = KernelDb::in_memory().unwrap();
-        let kid = KernelId::new();
+        let (kid, ws_id) = setup_test_db(&db);
 
         let ctx = make_context_row(kid, Some("unique-label"));
-        db.insert_context(&ctx).unwrap();
+        insert_context_with_doc(&db, &ctx, ws_id);
 
         // Exact label
         let r = db.resolve_context(kid, "unique-label").unwrap();
@@ -2307,12 +2701,12 @@ mod tests {
     #[test]
     fn null_labels_coexist() {
         let db = KernelDb::in_memory().unwrap();
-        let kid = KernelId::new();
+        let (kid, ws_id) = setup_test_db(&db);
 
         // Insert 5 contexts with NULL label — all succeed
         for _ in 0..5 {
             let row = make_context_row(kid, None);
-            db.insert_context(&row).unwrap();
+            insert_context_with_doc(&db, &row, ws_id);
         }
 
         let all = db.list_all_contexts(kid).unwrap();
@@ -2324,12 +2718,12 @@ mod tests {
     #[test]
     fn archive_excludes_from_active() {
         let db = KernelDb::in_memory().unwrap();
-        let kid = KernelId::new();
+        let (kid, ws_id) = setup_test_db(&db);
 
         let parent = make_context_row(kid, Some("parent"));
         let child = make_context_row(kid, Some("child"));
-        db.insert_context(&parent).unwrap();
-        db.insert_context(&child).unwrap();
+        insert_context_with_doc(&db, &parent, ws_id);
+        insert_context_with_doc(&db, &child, ws_id);
         db.insert_edge(&make_edge(
             parent.context_id,
             child.context_id,
@@ -2359,12 +2753,12 @@ mod tests {
     #[test]
     fn context_edge_cascade() {
         let db = KernelDb::in_memory().unwrap();
-        let kid = KernelId::new();
+        let (kid, ws_id) = setup_test_db(&db);
 
         let a = make_context_row(kid, Some("edge-a"));
         let b = make_context_row(kid, Some("edge-b"));
-        db.insert_context(&a).unwrap();
-        db.insert_context(&b).unwrap();
+        insert_context_with_doc(&db, &a, ws_id);
+        insert_context_with_doc(&db, &b, ws_id);
 
         db.insert_edge(&make_edge(a.context_id, b.context_id, EdgeKind::Structural))
             .unwrap();
@@ -2429,7 +2823,7 @@ mod tests {
     #[test]
     fn roundtrip_create_and_recover() {
         let db = KernelDb::in_memory().unwrap();
-        let kid = KernelId::new();
+        let (kid, ws_id) = setup_test_db(&db);
         let creator = PrincipalId::new();
         let parent_id = ContextId::new();
 
@@ -2451,7 +2845,7 @@ mod tests {
             workspace_id: None,
             preset_id: None,
         };
-        db.insert_context(&parent).unwrap();
+        insert_context_with_doc(&db, &parent, ws_id);
 
         // Insert child forked from parent
         let child_id = ContextId::new();
@@ -2472,7 +2866,7 @@ mod tests {
             workspace_id: None,
             preset_id: None,
         };
-        db.insert_context(&child).unwrap();
+        insert_context_with_doc(&db, &child, ws_id);
 
         // Read back and verify all 15 fields
         let recovered = db.get_context(child_id).unwrap().expect("child not found");
@@ -2519,11 +2913,19 @@ mod tests {
     #[test]
     fn fk_violation_is_validation_error() {
         let db = KernelDb::in_memory().unwrap();
-        let kid = KernelId::new();
+        let (kid, ws_id) = setup_test_db(&db);
 
-        // Reference a workspace_id that doesn't exist
+        // Reference a workspace_id that doesn't exist on the context
+        let ctx_id = ContextId::new();
+        // Insert document with valid workspace first
+        db.insert_document(&DocumentRow {
+            document_id: ctx_id, kernel_id: kid, workspace_id: ws_id,
+            doc_kind: DocKind::Conversation, language: None, path: None,
+            created_at: now_millis() as i64, created_by: PrincipalId::new(),
+        }).unwrap();
+
         let row = ContextRow {
-            context_id: ContextId::new(),
+            context_id: ctx_id,
             kernel_id: kid,
             label: Some("fk-test".into()),
             provider: None,
@@ -2551,9 +2953,9 @@ mod tests {
     #[test]
     fn context_shell_upsert_and_get() {
         let db = KernelDb::in_memory().unwrap();
-        let kid = KernelId::new();
+        let (kid, ws_id) = setup_test_db(&db);
         let ctx = make_context_row(kid, Some("shell-test"));
-        db.insert_context(&ctx).unwrap();
+        insert_context_with_doc(&db, &ctx, ws_id);
 
         // Initially none
         assert!(db.get_context_shell(ctx.context_id).unwrap().is_none());
@@ -2594,11 +2996,11 @@ mod tests {
     #[test]
     fn context_shell_copy() {
         let db = KernelDb::in_memory().unwrap();
-        let kid = KernelId::new();
+        let (kid, ws_id) = setup_test_db(&db);
         let src = make_context_row(kid, Some("src"));
         let tgt = make_context_row(kid, Some("tgt"));
-        db.insert_context(&src).unwrap();
-        db.insert_context(&tgt).unwrap();
+        insert_context_with_doc(&db, &src, ws_id);
+        insert_context_with_doc(&db, &tgt, ws_id);
 
         // Copy from context with shell config
         let row = ContextShellRow {
@@ -2619,11 +3021,11 @@ mod tests {
     #[test]
     fn context_shell_copy_empty() {
         let db = KernelDb::in_memory().unwrap();
-        let kid = KernelId::new();
+        let (kid, ws_id) = setup_test_db(&db);
         let src = make_context_row(kid, Some("src"));
         let tgt = make_context_row(kid, Some("tgt"));
-        db.insert_context(&src).unwrap();
-        db.insert_context(&tgt).unwrap();
+        insert_context_with_doc(&db, &src, ws_id);
+        insert_context_with_doc(&db, &tgt, ws_id);
 
         // Copy from context with no shell config → returns false
         assert!(!db.copy_context_shell(src.context_id, tgt.context_id).unwrap());
@@ -2633,9 +3035,9 @@ mod tests {
     #[test]
     fn context_shell_cascade_delete() {
         let db = KernelDb::in_memory().unwrap();
-        let kid = KernelId::new();
+        let (kid, ws_id) = setup_test_db(&db);
         let ctx = make_context_row(kid, Some("cascade"));
-        db.insert_context(&ctx).unwrap();
+        insert_context_with_doc(&db, &ctx, ws_id);
 
         db.upsert_context_shell(&ContextShellRow {
             context_id: ctx.context_id,
@@ -2655,9 +3057,9 @@ mod tests {
     #[test]
     fn context_env_set_and_get() {
         let db = KernelDb::in_memory().unwrap();
-        let kid = KernelId::new();
+        let (kid, ws_id) = setup_test_db(&db);
         let ctx = make_context_row(kid, Some("env-test"));
-        db.insert_context(&ctx).unwrap();
+        insert_context_with_doc(&db, &ctx, ws_id);
 
         // Initially empty
         let vars = db.get_context_env(ctx.context_id).unwrap();
@@ -2679,9 +3081,9 @@ mod tests {
     #[test]
     fn context_env_upsert() {
         let db = KernelDb::in_memory().unwrap();
-        let kid = KernelId::new();
+        let (kid, ws_id) = setup_test_db(&db);
         let ctx = make_context_row(kid, Some("env-upsert"));
-        db.insert_context(&ctx).unwrap();
+        insert_context_with_doc(&db, &ctx, ws_id);
 
         db.set_context_env(ctx.context_id, "RUST_LOG", "debug").unwrap();
         db.set_context_env(ctx.context_id, "RUST_LOG", "trace").unwrap();
@@ -2701,9 +3103,9 @@ mod tests {
     #[test]
     fn context_env_delete() {
         let db = KernelDb::in_memory().unwrap();
-        let kid = KernelId::new();
+        let (kid, ws_id) = setup_test_db(&db);
         let ctx = make_context_row(kid, Some("env-del"));
-        db.insert_context(&ctx).unwrap();
+        insert_context_with_doc(&db, &ctx, ws_id);
 
         db.set_context_env(ctx.context_id, "FOO", "bar").unwrap();
         assert!(db.delete_context_env(ctx.context_id, "FOO").unwrap());
@@ -2714,9 +3116,9 @@ mod tests {
     #[test]
     fn context_env_clear() {
         let db = KernelDb::in_memory().unwrap();
-        let kid = KernelId::new();
+        let (kid, ws_id) = setup_test_db(&db);
         let ctx = make_context_row(kid, Some("env-clear"));
-        db.insert_context(&ctx).unwrap();
+        insert_context_with_doc(&db, &ctx, ws_id);
 
         db.set_context_env(ctx.context_id, "A", "1").unwrap();
         db.set_context_env(ctx.context_id, "B", "2").unwrap();
@@ -2729,11 +3131,11 @@ mod tests {
     #[test]
     fn context_env_copy() {
         let db = KernelDb::in_memory().unwrap();
-        let kid = KernelId::new();
+        let (kid, ws_id) = setup_test_db(&db);
         let src = make_context_row(kid, Some("env-src"));
         let tgt = make_context_row(kid, Some("env-tgt"));
-        db.insert_context(&src).unwrap();
-        db.insert_context(&tgt).unwrap();
+        insert_context_with_doc(&db, &src, ws_id);
+        insert_context_with_doc(&db, &tgt, ws_id);
 
         db.set_context_env(src.context_id, "RUST_LOG", "debug").unwrap();
         db.set_context_env(src.context_id, "EDITOR", "vim").unwrap();
@@ -2749,9 +3151,9 @@ mod tests {
     #[test]
     fn context_env_cascade_delete() {
         let db = KernelDb::in_memory().unwrap();
-        let kid = KernelId::new();
+        let (kid, ws_id) = setup_test_db(&db);
         let ctx = make_context_row(kid, Some("env-cascade"));
-        db.insert_context(&ctx).unwrap();
+        insert_context_with_doc(&db, &ctx, ws_id);
 
         db.set_context_env(ctx.context_id, "FOO", "bar").unwrap();
         db.set_context_env(ctx.context_id, "BAZ", "qux").unwrap();
@@ -2810,11 +3212,11 @@ mod tests {
     #[test]
     fn fork_context_config_full() {
         let db = KernelDb::in_memory().unwrap();
-        let kid = KernelId::new();
+        let (kid, ws_id) = setup_test_db(&db);
         let src = make_context_row(kid, Some("fork-src"));
         let tgt = make_context_row(kid, Some("fork-tgt"));
-        db.insert_context(&src).unwrap();
-        db.insert_context(&tgt).unwrap();
+        insert_context_with_doc(&db, &src, ws_id);
+        insert_context_with_doc(&db, &tgt, ws_id);
 
         // Set up source with shell config + env vars
         db.upsert_context_shell(&ContextShellRow {
@@ -2841,11 +3243,11 @@ mod tests {
     #[test]
     fn fork_context_config_empty_source() {
         let db = KernelDb::in_memory().unwrap();
-        let kid = KernelId::new();
+        let (kid, ws_id) = setup_test_db(&db);
         let src = make_context_row(kid, Some("empty-src"));
         let tgt = make_context_row(kid, Some("empty-tgt"));
-        db.insert_context(&src).unwrap();
-        db.insert_context(&tgt).unwrap();
+        insert_context_with_doc(&db, &src, ws_id);
+        insert_context_with_doc(&db, &tgt, ws_id);
 
         // Fork from context with no config → no error, no data on target
         db.fork_context_config(src.context_id, tgt.context_id).unwrap();
@@ -2890,7 +3292,7 @@ mod tests {
         // Create context with workspace bound
         let mut ctx = make_context_row(kid, Some("bound"));
         ctx.workspace_id = Some(ws.workspace_id);
-        db.insert_context(&ctx).unwrap();
+        insert_context_with_doc(&db, &ctx, ws.workspace_id);
 
         let paths = db.context_workspace_paths(ctx.context_id).unwrap();
         let paths = paths.unwrap();
@@ -2900,9 +3302,9 @@ mod tests {
     #[test]
     fn context_workspace_paths_unbound() {
         let db = KernelDb::in_memory().unwrap();
-        let kid = KernelId::new();
+        let (kid, ws_id) = setup_test_db(&db);
         let ctx = make_context_row(kid, Some("unbound"));
-        db.insert_context(&ctx).unwrap();
+        insert_context_with_doc(&db, &ctx, ws_id);
 
         let paths = db.context_workspace_paths(ctx.context_id).unwrap();
         assert!(paths.is_none());
@@ -2930,8 +3332,9 @@ mod tests {
 
         // Simulate pre-stable-ID era: contexts exist with an old kernel_id
         let old_kid = KernelId::new();
+        let ws_id = db.get_or_create_default_workspace(old_kid, PrincipalId::system()).unwrap();
         let ctx = make_context_row(old_kid, Some("legacy"));
-        db.insert_context(&ctx).unwrap();
+        insert_context_with_doc(&db, &ctx, ws_id);
 
         // kernel table is empty — should adopt the context's kernel_id
         let id = db.get_or_create_kernel_id().unwrap();
@@ -2947,9 +3350,9 @@ mod tests {
     #[test]
     fn check_workspace_path_unbound_context() {
         let db = KernelDb::in_memory().unwrap();
-        let kid = KernelId::new();
+        let (kid, ws_id) = setup_test_db(&db);
         let ctx = make_context_row(kid, Some("unbound"));
-        db.insert_context(&ctx).unwrap();
+        insert_context_with_doc(&db, &ctx, ws_id);
 
         // Unbound context → None (no restriction)
         let result = db.check_workspace_path(ctx.context_id, "/anywhere").unwrap();
@@ -2982,7 +3385,7 @@ mod tests {
 
         let mut ctx = make_context_row(kid, Some("bound"));
         ctx.workspace_id = Some(ws.workspace_id);
-        db.insert_context(&ctx).unwrap();
+        insert_context_with_doc(&db, &ctx, ws.workspace_id);
 
         // Path inside workspace rw path → Some(false)
         let result = db.check_workspace_path(ctx.context_id, "/home/user/src/kaijutsu/src/main.rs").unwrap();
@@ -3015,7 +3418,7 @@ mod tests {
 
         let mut ctx = make_context_row(kid, Some("bound"));
         ctx.workspace_id = Some(ws.workspace_id);
-        db.insert_context(&ctx).unwrap();
+        insert_context_with_doc(&db, &ctx, ws.workspace_id);
 
         // Path inside workspace ro path → Some(true)
         let result = db.check_workspace_path(ctx.context_id, "/home/user/docs/README.md").unwrap();
@@ -3048,7 +3451,7 @@ mod tests {
 
         let mut ctx = make_context_row(kid, Some("bound"));
         ctx.workspace_id = Some(ws.workspace_id);
-        db.insert_context(&ctx).unwrap();
+        insert_context_with_doc(&db, &ctx, ws.workspace_id);
 
         // Path outside all workspace paths → Validation error
         let err = db.check_workspace_path(ctx.context_id, "/etc/passwd").unwrap_err();
@@ -3087,7 +3490,7 @@ mod tests {
 
         let mut ctx = make_context_row(kid, Some("bound"));
         ctx.workspace_id = Some(ws.workspace_id);
-        db.insert_context(&ctx).unwrap();
+        insert_context_with_doc(&db, &ctx, ws.workspace_id);
 
         // /home/user/src/kaijutsu/src → matches /home/user/src (rw)
         assert_eq!(

@@ -207,7 +207,7 @@ pub struct BatcherStats {
 mod tests {
     use super::*;
     use crate::block_store::shared_block_store;
-    use crate::db::DocumentKind;
+    use kaijutsu_types::DocKind as DocumentKind;
     use kaijutsu_crdt::{BlockKind, PrincipalId, Role, Status};
 
     fn test_context_id() -> ContextId {

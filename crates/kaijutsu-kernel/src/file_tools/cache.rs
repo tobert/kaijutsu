@@ -12,7 +12,7 @@ use kaijutsu_crdt::{BlockId, BlockKind, ContextId, Role, Status};
 use parking_lot::RwLock;
 
 use crate::block_store::SharedBlockStore;
-use crate::db::DocumentKind;
+use kaijutsu_types::DocKind;
 use crate::vfs::{MountTable, VfsOps};
 
 /// Default maximum cached file documents.
@@ -34,7 +34,7 @@ struct CachedFileDoc {
 
 /// Cache that maps VFS files to CRDT documents.
 ///
-/// Each file becomes a document with `DocumentKind::Code` and a single
+/// Each file becomes a document with `DocKind::Code` and a single
 /// `BlockKind::Text` block. Edits go through the CRDT, enabling
 /// concurrent modification with proper conflict resolution.
 pub struct FileDocumentCache {
@@ -85,7 +85,7 @@ impl FileDocumentCache {
         // Create CRDT document — handle race where another thread loaded it first
         let block_id = match self
             .block_store
-            .create_document(ctx_id, DocumentKind::Code, language)
+            .create_document(ctx_id, DocKind::Code, language)
         {
             Ok(()) => {
                 self.block_store
@@ -316,7 +316,7 @@ impl FileDocumentCache {
         let language = detect_language(path);
 
         self.block_store
-            .create_document(ctx_id, DocumentKind::Code, language)
+            .create_document(ctx_id, DocKind::Code, language)
             .map_err(|e| format!("failed to create document for {}: {}", path, e))?;
 
         let block_id = self
