@@ -514,11 +514,11 @@ enum ConstellationLayer {
 // ── Physics constants ──
 
 /// Radial gravity strength for all nodes toward origin.
-const RADIAL_GRAVITY_K: f32 = 0.05;
+const RADIAL_GRAVITY_K: f32 = 0.3;
 /// Additional center pull for the focused node.
-const FOCUS_PULL_K: f32 = 0.8;
+const FOCUS_PULL_K: f32 = 1.5;
 /// Node collider radius in simulation-space pixels.
-const NODE_COLLIDER_RADIUS: f32 = 70.0;
+const NODE_COLLIDER_RADIUS: f32 = 45.0;
 /// DistanceJoint rest length range.
 const JOINT_MIN_DIST: f32 = 200.0;
 const JOINT_MAX_DIST: f32 = 300.0;
@@ -771,19 +771,41 @@ fn update_constellation_graph(
 }
 
 /// Apply radial gravity via ConstantForce — pulls all nodes toward origin.
-/// Focused node gets stronger pull.
+/// Focused node gets stronger pull and passes through the center exclusion zone.
 fn apply_radial_gravity(
     constellation: Res<Constellation>,
-    mut forces: Query<(&PhysicsNode, &Transform, &mut ConstantForce)>,
+    mut forces: Query<(
+        &PhysicsNode,
+        &Transform,
+        &mut ConstantForce,
+        &mut CollisionLayers,
+    )>,
 ) {
-    for (phys_node, transform, mut force) in &mut forces {
+    for (phys_node, transform, mut force, mut layers) in &mut forces {
         let pos = transform.translation.truncate();
-        let k = if constellation.focus_id == Some(phys_node.context_id) {
+        let is_focused = constellation.focus_id == Some(phys_node.context_id);
+        let k = if is_focused {
             RADIAL_GRAVITY_K + FOCUS_PULL_K
         } else {
             RADIAL_GRAVITY_K
         };
         force.0 = -pos * k;
+
+        // Focused node ignores center exclusion zone so it can reach origin
+        let desired = if is_focused {
+            CollisionLayers::new(
+                [ConstellationLayer::Node],
+                [ConstellationLayer::Node],
+            )
+        } else {
+            CollisionLayers::new(
+                [ConstellationLayer::Node],
+                [ConstellationLayer::Node, ConstellationLayer::CenterZone],
+            )
+        };
+        if *layers != desired {
+            *layers = desired;
+        }
     }
 }
 
