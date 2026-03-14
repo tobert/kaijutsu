@@ -136,8 +136,9 @@ pub fn sync_block_cell_buffers(
             vello_text.value = text.clone();
         }
 
-        // Rich content rendering for Model/Text blocks (markdown, sparklines)
-        let is_rich_candidate = block.kind == kaijutsu_crdt::BlockKind::Text && block.role == kaijutsu_crdt::Role::Model;
+        // Rich content rendering for Text blocks from Model or Tool roles (markdown, sparklines, SVG)
+        let is_rich_candidate = block.kind == kaijutsu_crdt::BlockKind::Text
+            && matches!(block.role, kaijutsu_crdt::Role::Model | kaijutsu_crdt::Role::Tool);
         // Rich content for ToolResult blocks with structured OutputData
         let is_output_candidate = block.kind == kaijutsu_crdt::BlockKind::ToolResult
             && block.output.is_some()

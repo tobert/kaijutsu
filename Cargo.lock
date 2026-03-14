@@ -5583,7 +5583,7 @@ dependencies = [
 
 [[package]]
 name = "kaish-glob"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "thiserror 2.0.18",
@@ -5591,7 +5591,7 @@ dependencies = [
 
 [[package]]
 name = "kaish-kernel"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "ariadne",
@@ -5622,7 +5622,7 @@ dependencies = [
 
 [[package]]
 name = "kaish-types"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -6369,6 +6369,15 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+]
+
+[[package]]
+name = "no-std-compat"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b93853da6d84c2e3c7d730d6473e8817692dd89be387eb01b94d7f108ecb5b8c"
+dependencies = [
+ "spin 0.5.2",
 ]
 
 [[package]]
@@ -8239,6 +8248,7 @@ checksum = "1f9ef5dabe4c0b43d8f1187dc6beb67b53fe607fff7e30c5eb7f71b814b8c2c1"
 dependencies = [
  "ahash",
  "bitflags 2.10.0",
+ "no-std-compat",
  "num-traits",
  "once_cell",
  "rhai_codegen",
@@ -9151,6 +9161,12 @@ dependencies = [
  "libc",
  "winapi",
 ]
+
+[[package]]
+name = "spin"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e63cff320ae2c57904679ba7cb63280a3dc4613885beafb148ee7bf9aa9042d"
 
 [[package]]
 name = "spin"

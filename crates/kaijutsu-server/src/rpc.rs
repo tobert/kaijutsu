@@ -33,6 +33,8 @@ use kaijutsu_kernel::{
     BlockSearchEngine, BlockSpliceEngine, BlockStatusEngine, KernelSearchEngine,
     // File tools
     FileDocumentCache, ReadEngine, EditEngine, WriteEngine, GlobEngine, GrepEngine, WhoamiEngine,
+    // Rhai scripting
+    RhaiEngine,
     // MCP
     McpServerPool, McpServerConfig, McpTransport, McpToolEngine, extract_tool_result_text,
     // FlowBus
@@ -164,6 +166,12 @@ async fn register_block_tools(
     kernel.register_tool_with_engine(
         ToolInfo::new("whoami", "Show current context identity", "drift"),
         Arc::new(WhoamiEngine::new(kernel.drift().clone())),
+    ).await;
+
+    // ── Rhai scripting (persistent per-context state) ──
+    kernel.register_tool_with_engine(
+        ToolInfo::new("rhai", "Execute Rhai scripts with persistent per-context state", "kernel"),
+        Arc::new(RhaiEngine::new(documents.clone())),
     ).await;
 }
 

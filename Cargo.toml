@@ -77,7 +77,7 @@ diamond-types-extended = { path = "../diamond-types-extended" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 # Scripting
-rhai = "1.21"
+rhai = { version = "1.21", features = ["sync"] }
 kaijutsu-rhai = { path = "crates/kaijutsu-rhai" }
 palette = { version = "0.7", default-features = false, features = ["std"] }
 

@@ -5,9 +5,8 @@
 //! - Implements the `ExecutionEngine` trait for tool integration
 //! - Provides CRDT-aware block operations (insert_block, edit_text, delete_block)
 //! - Supports execution interruption
-//!
-//! Note: Script caching is not implemented because Rhai's AST type is not
-//! `Send + Sync`. Scripts are compiled fresh on each execution.
+//! - Maintains persistent per-context `Scope` so variables and functions survive
+//!   across tool calls within the same conversation
 //!
 //! # Example
 //!
@@ -17,7 +16,7 @@
 //!     let cell = create_cell("markdown");
 //!     insert_block(cell, "", "text", "# Hello World");
 //!     cell
-//! "#).await?;
+//! "#, &ctx).await?;
 //! ```
 
 use crate::block_store::SharedBlockStore;
@@ -27,16 +26,25 @@ use async_trait::async_trait;
 use kaijutsu_crdt::{BlockKind, Role};
 use kaijutsu_types::ContextId;
 use rhai::{Dynamic, Engine, Scope};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
 
 /// Async-safe Rhai execution engine implementing ExecutionEngine.
+///
+/// Maintains a per-context `Scope` so variables and helper functions persist
+/// across tool calls within the same conversation. The Rhai `Engine` itself is
+/// stateless and recreated each call (it only holds registered functions, which
+/// are the same every time).
 pub struct RhaiEngine {
     /// Block store for CRDT operations.
     block_store: SharedBlockStore,
     /// Interrupt flag for cancellation.
     interrupted: Arc<AtomicBool>,
+    /// Per-context persistent scopes. `Scope<'static>` is the rhai convention.
+    /// `Mutex` (not `RwLock`) because `eval_with_scope` requires `&mut Scope`.
+    scopes: Arc<Mutex<HashMap<ContextId, Scope<'static>>>>,
 }
 
 impl RhaiEngine {
@@ -45,6 +53,7 @@ impl RhaiEngine {
         Self {
             block_store,
             interrupted: Arc::new(AtomicBool::new(false)),
+            scopes: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -52,6 +61,7 @@ impl RhaiEngine {
     fn create_engine(
         block_store: SharedBlockStore,
         interrupted: Arc<AtomicBool>,
+        context_id: ContextId,
     ) -> (Engine, kaijutsu_rhai::OutputCollector) {
         let mut engine = Engine::new();
 
@@ -71,7 +81,10 @@ impl RhaiEngine {
         Self::register_cell_functions(&mut engine, block_store.clone());
 
         // Register block-level CRDT functions
-        Self::register_block_functions(&mut engine, block_store);
+        Self::register_block_functions(&mut engine, block_store.clone());
+
+        // Register context-aware functions (emit into current context)
+        Self::register_context_functions(&mut engine, block_store, context_id);
 
         // Register utility functions
         Self::register_utility_functions(&mut engine, interrupted);
@@ -444,6 +457,40 @@ impl RhaiEngine {
         );
     }
 
+    /// Register context-aware functions that insert blocks into the current context.
+    fn register_context_functions(
+        engine: &mut Engine,
+        block_store: SharedBlockStore,
+        context_id: ContextId,
+    ) {
+        // svg_block(svg_content) -> String
+        // Inserts SVG content as a Text block at the end of the current context, returns block ID.
+        engine.register_fn("svg_block", move |content: String| -> String {
+            // Find the last block so we append at the end, not the beginning
+            let last_block_id = block_store.get(context_id)
+                .and_then(|doc| doc.doc.blocks_ordered().last().map(|b| b.id.clone()));
+
+            match block_store.insert_block(
+                context_id,
+                None,
+                last_block_id.as_ref(),
+                Role::Tool,
+                BlockKind::Text,
+                &content,
+            ) {
+                Ok(id) => {
+                    let key = id.to_key();
+                    info!("Rhai: svg_block inserted {} ({} bytes)", key, content.len());
+                    key
+                }
+                Err(e) => {
+                    warn!("Rhai: svg_block error: {}", e);
+                    String::new()
+                }
+            }
+        });
+    }
+
     /// Register utility functions.
     fn register_utility_functions(engine: &mut Engine, interrupted: Arc<AtomicBool>) {
         // println(msg: &str) - avoid conflict with Rhai's built-in 'print'
@@ -492,15 +539,27 @@ impl RhaiEngine {
     }
 
     /// Execute a script synchronously (called from spawn_blocking).
+    ///
+    /// Takes the scope out of the map for the duration of execution so we don't
+    /// hold the mutex while eval runs. Puts it back afterward regardless of
+    /// success/failure.
     fn execute_sync(
         block_store: &SharedBlockStore,
         code: &str,
         interrupted: Arc<AtomicBool>,
+        scopes: &Mutex<HashMap<ContextId, Scope<'static>>>,
+        context_id: ContextId,
     ) -> ExecResult {
-        let (engine, collector) = Self::create_engine(block_store.clone(), interrupted);
-        let mut scope = Scope::new();
+        let (engine, collector) = Self::create_engine(block_store.clone(), interrupted, context_id);
 
-        match engine.eval_with_scope::<Dynamic>(&mut scope, code) {
+        // Take scope out of the map (or create a new one)
+        let mut scope = scopes
+            .lock()
+            .expect("rhai scope mutex poisoned")
+            .remove(&context_id)
+            .unwrap_or_default();
+
+        let result = match engine.eval_with_scope::<Dynamic>(&mut scope, code) {
             Ok(result) => {
                 let captured_print = collector.take_stdout();
 
@@ -545,7 +604,15 @@ impl RhaiEngine {
                 }
                 result
             }
-        }
+        };
+
+        // Put the scope back so the next call in this context picks it up
+        scopes
+            .lock()
+            .expect("rhai scope mutex poisoned")
+            .insert(context_id, scope);
+
+        result
     }
 }
 
@@ -564,26 +631,37 @@ impl ExecutionEngine for RhaiEngine {
     }
 
     fn description(&self) -> &str {
-        "Rhai scripting engine with CRDT-aware cell and block operations. \
-         Stdlib includes: math (sin, cos, lerp, clamp, etc.), \
-         color (hex, oklch, hsl, color_mix, color_lighten, hue_shift, etc.), \
+        "Rhai scripting engine with persistent per-context state. \
+         Key function: svg_block(svg_string) — inserts SVG as a visible block in the conversation. \
+         Stdlib: math (sin, cos, lerp, clamp, PI, sqrt, etc.), \
+         color (hex, oklch, hsl, rgb, color_mix, color_lighten, hue_shift, etc.), \
          format (xml_escape, fmt_f, to_float, to_int), \
-         output (svg(), print()). \
-         Use `list_kernel_tools` for full function catalog."
+         output (svg(), print()). Variables persist across calls."
     }
 
-    #[tracing::instrument(skip(self, code, _ctx), name = "engine.rhai")]
-    async fn execute(&self, code: &str, _ctx: &ToolContext) -> anyhow::Result<ExecResult> {
+    #[tracing::instrument(skip(self, code, ctx), fields(context_id = %ctx.context_id), name = "engine.rhai")]
+    async fn execute(&self, code: &str, ctx: &ToolContext) -> anyhow::Result<ExecResult> {
         // Clear interrupt flag before execution
         self.interrupted.store(false, Ordering::SeqCst);
 
+        // The RPC layer passes raw JSON params (e.g. {"code": "..."}).
+        // Extract the "code" field if present, otherwise treat input as raw Rhai.
+        let code = match serde_json::from_str::<serde_json::Value>(code) {
+            Ok(v) => v.get("code")
+                .and_then(|c| c.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| code.to_string()),
+            Err(_) => code.to_string(),
+        };
+
         let block_store = Arc::clone(&self.block_store);
-        let code = code.to_string();
         let interrupted = Arc::clone(&self.interrupted);
+        let scopes = Arc::clone(&self.scopes);
+        let context_id = ctx.context_id;
 
         // Execute in spawn_blocking for async safety
         let result = tokio::task::spawn_blocking(move || {
-            Self::execute_sync(&block_store, &code, interrupted)
+            Self::execute_sync(&block_store, &code, interrupted, &scopes, context_id)
         })
         .await?;
 
@@ -611,6 +689,8 @@ impl ExecutionEngine for RhaiEngine {
             "delete_block",
             "list_blocks",
             "get_block_content",
+            // Context-aware
+            "svg_block",
             // Utility
             "println",
             "log",
@@ -645,6 +725,25 @@ impl ExecutionEngine for RhaiEngine {
         self.interrupted.store(true, Ordering::SeqCst);
         debug!("Rhai engine interrupted");
         Ok(())
+    }
+
+    fn schema(&self) -> Option<serde_json::Value> {
+        let catalog = kaijutsu_rhai::function_catalog();
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "Rhai script to execute. State (variables, functions) persists across calls within the same context. Use svg_block(svg_string) to insert SVG as a visible block.",
+                },
+            },
+            "required": ["code"],
+            "additionalProperties": false,
+            "context_functions": [
+                { "name": "svg_block", "sig": "svg_block(content: string) -> string", "doc": "Insert SVG content as a block in the current conversation. Returns block ID." },
+            ],
+            "stdlib": catalog["functions"],
+        }))
     }
 }
 
@@ -864,5 +963,93 @@ mod tests {
         let engine = RhaiEngine::new(store);
         let debug_str = format!("{:?}", engine);
         assert!(debug_str.contains("RhaiEngine"));
+    }
+
+    #[tokio::test]
+    async fn test_scope_persists_across_calls() {
+        let store = shared_block_store(PrincipalId::new());
+        let engine = RhaiEngine::new(store);
+
+        // Use a fixed context so both calls share the same scope
+        let ctx = ToolContext::test();
+
+        // First call: define a variable
+        let r1 = engine.execute("let x = 42;", &ctx).await.unwrap();
+        assert!(r1.success, "define failed: {}", r1.stderr);
+
+        // Second call: read it back
+        let r2 = engine.execute("x", &ctx).await.unwrap();
+        assert!(r2.success, "read failed: {}", r2.stderr);
+        assert_eq!(r2.stdout, "42");
+    }
+
+    #[tokio::test]
+    async fn test_scope_isolated_between_contexts() {
+        let store = shared_block_store(PrincipalId::new());
+        let engine = RhaiEngine::new(store);
+
+        let ctx_a = ToolContext::test(); // unique ContextId
+        let ctx_b = ToolContext::test(); // different ContextId
+
+        // Define variable in context A
+        let r1 = engine.execute("let secret = 99;", &ctx_a).await.unwrap();
+        assert!(r1.success);
+
+        // Context B should NOT see it
+        let r2 = engine.execute("secret", &ctx_b).await.unwrap();
+        assert!(!r2.success, "context B should not see context A's variable");
+    }
+
+    #[tokio::test]
+    async fn test_schema_includes_code_property() {
+        let store = shared_block_store(PrincipalId::new());
+        let engine = RhaiEngine::new(store);
+
+        let schema = engine.schema().expect("schema should be Some");
+        let props = schema["properties"].as_object().expect("properties should be object");
+        assert!(props.contains_key("code"), "schema missing 'code' property");
+        assert!(schema["stdlib"].is_array(), "schema should include stdlib catalog");
+        assert!(schema["context_functions"].is_array(), "schema should include context_functions");
+    }
+
+    #[tokio::test]
+    async fn test_svg_block_inserts_into_context() {
+        let store = shared_block_store(PrincipalId::new());
+        let engine = RhaiEngine::new(store.clone());
+        let ctx = ToolContext::test();
+        let context_id = ctx.context_id;
+
+        // Create the document first so insert_block has a target
+        store.create_document(context_id, DocumentKind::Conversation, None).unwrap();
+
+        let result = engine
+            .execute(
+                r#"svg_block("<svg><circle r='10'/></svg>")"#,
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "svg_block failed: {}", result.stderr);
+        // Return value is the block ID key
+        assert!(!result.stdout.is_empty(), "should return block ID");
+
+        // Verify the block actually landed in the document
+        let doc = store.get(context_id).expect("document should exist");
+        let blocks = doc.doc.blocks_ordered();
+        assert_eq!(blocks.len(), 1, "should have exactly one block");
+        assert!(blocks[0].content.contains("<svg>"), "block content should be SVG");
+    }
+
+    #[tokio::test]
+    async fn test_json_wrapped_code_extraction() {
+        // This is what the RPC layer actually sends: JSON with a "code" field
+        let store = shared_block_store(PrincipalId::new());
+        let engine = RhaiEngine::new(store);
+
+        let json_input = r#"{"code": "40 + 2"}"#;
+        let result = engine.execute(json_input, &ToolContext::test()).await.unwrap();
+        assert!(result.success, "JSON-wrapped code failed: {}", result.stderr);
+        assert_eq!(result.stdout, "42");
     }
 }
