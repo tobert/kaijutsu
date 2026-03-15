@@ -488,6 +488,76 @@ impl RhaiEngine {
         block_store: SharedBlockStore,
         context_id: ContextId,
     ) {
+        // abc_block(abc_text) -> String
+        // Parses ABC notation, engraves to SVG, inserts parent ABC block + child SVG block.
+        let abc_store = block_store.clone();
+        engine.register_fn("abc_block", move |abc_text: String| -> String {
+            // Parse ABC
+            let result = kaijutsu_abc::parse(&abc_text);
+            if result.has_errors() {
+                let errs: Vec<_> = result.errors().map(|e| e.message.clone()).collect();
+                warn!("Rhai: abc_block parse errors: {:?}", errs);
+                return format!("ABC parse error: {}", errs.join("; "));
+            }
+
+            // Engrave to SVG
+            let options = kaijutsu_abc::engrave::EngravingOptions::default();
+            let svg = kaijutsu_abc::engrave::engrave_to_svg(&result.value, &options);
+
+            // Find last block for ordering
+            let last_block_id = abc_store.get(context_id)
+                .and_then(|doc| doc.doc.blocks_ordered().last().map(|b| b.id));
+
+            // Insert ABC parent block
+            let abc_id = match abc_store.insert_block(
+                context_id,
+                None,
+                last_block_id.as_ref(),
+                Role::Tool,
+                BlockKind::Text,
+                &abc_text,
+                Status::Done,
+            ) {
+                Ok(id) => id,
+                Err(e) => {
+                    warn!("Rhai: abc_block parent insert error: {}", e);
+                    return String::new();
+                }
+            };
+
+            // Set content type on parent
+            if let Some(mut entry) = abc_store.get_mut(context_id) {
+                let _ = entry.doc.set_content_type(&abc_id, Some("text/vnd.abc".into()));
+            }
+
+            // Insert SVG child block (parent = abc_id, after = abc_id)
+            match abc_store.insert_block(
+                context_id,
+                Some(&abc_id),
+                Some(&abc_id),
+                Role::Tool,
+                BlockKind::Text,
+                &svg,
+                Status::Done,
+            ) {
+                Ok(svg_id) => {
+                    if let Some(mut entry) = abc_store.get_mut(context_id) {
+                        let _ = entry.doc.set_content_type(&svg_id, Some("image/svg+xml".into()));
+                    }
+                    let key = svg_id.to_key();
+                    info!("Rhai: abc_block inserted parent {} + SVG child {} ({} bytes)",
+                        abc_id.to_key(), key, svg.len());
+                    key
+                }
+                Err(e) => {
+                    warn!("Rhai: abc_block SVG child insert error: {}", e);
+                    // Best-effort cleanup: delete parent
+                    let _ = abc_store.delete_block(context_id, &abc_id);
+                    String::new()
+                }
+            }
+        });
+
         // svg_block(svg_content) -> String
         // Inserts SVG content as a Text block at the end of the current context, returns block ID.
         engine.register_fn("svg_block", move |content: String| -> String {

@@ -1,0 +1,14 @@
+[package]
+name = "kaijutsu-abc"
+version = "0.1.0"
+edition = "2021"
+description = "ABC music notation parser, engraver, and MIDI generator"
+
+[dependencies]
+winnow = "0.6"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+skrifa = "0.40"
+
+[dev-dependencies]
+pretty_assertions = "1"

@@ -474,6 +474,17 @@ pub fn detect_rich_content_typed(text: &str, version: u64, content_type: Option<
                     last_max_advance: 0.0,
                 });
             }
+            "text/vnd.abc" => {
+                // Show collapsed summary: "🎵 ABC: Title (Key)"
+                let summary = abc_summary(text);
+                let spans = parse_to_rich_spans(&summary);
+                return Some(RichContent {
+                    kind: RichContentKind::Markdown { spans, plain_text: summary },
+                    version,
+                    last_render_version: 0,
+                    last_max_advance: 0.0,
+                });
+            }
             _ => {} // Unknown content types fall through to heuristic detection
         }
     }
@@ -516,4 +527,36 @@ pub fn detect_rich_content_typed(text: &str, version: u64, content_type: Option<
         last_render_version: 0,
         last_max_advance: 0.0,
     })
+}
+
+/// Extract a compact summary from raw ABC notation text.
+/// Parses T: and K: header fields without a full ABC parser dependency.
+fn abc_summary(abc: &str) -> String {
+    let mut title = None;
+    let mut key = None;
+
+    for line in abc.lines() {
+        let trimmed = line.trim();
+        if trimmed.len() >= 2 && trimmed.as_bytes()[1] == b':' {
+            match trimmed.as_bytes()[0] {
+                b'T' => {
+                    if title.is_none() {
+                        title = Some(trimmed[2..].trim());
+                    }
+                }
+                b'K' => {
+                    key = Some(trimmed[2..].trim());
+                    break; // K: is always last header field
+                }
+                _ => {}
+            }
+        }
+    }
+
+    match (title, key) {
+        (Some(t), Some(k)) => format!("**ABC: {} ({})**", t, k),
+        (Some(t), None) => format!("**ABC: {}**", t),
+        (None, Some(k)) => format!("**ABC ({})**", k),
+        (None, None) => "**ABC notation**".to_string(),
+    }
 }

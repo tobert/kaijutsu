@@ -1,0 +1,16 @@
+X:1
+T:Three Voice Test
+C:Test Fixture
+M:4/4
+L:1/4
+Q:1/4=120
+V:1 name="Soprano" clef=treble
+V:2 name="Alto" clef=treble
+V:3 name="Bass" clef=bass
+K:C
+V:1
+c'd'e'f'|g'a'b'c''|
+V:2
+cdef|gabc'|
+V:3
+C,D,E,F,|G,A,B,C|

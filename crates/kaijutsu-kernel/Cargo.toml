@@ -42,6 +42,9 @@ ron = "0.9"
 rhai.workspace = true
 kaijutsu-rhai.workspace = true
 
+# ABC music notation
+kaijutsu-abc.workspace = true
+
 # LLM providers - unified via rig-core
 rig-core.workspace = true
 
