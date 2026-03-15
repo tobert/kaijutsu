@@ -51,7 +51,7 @@ use kaijutsu_kernel::{
 };
 use kaijutsu_crdt::{BlockKind, Role, Status};
 use kaijutsu_types::{ContextId, Principal, PrincipalId, KernelId, SessionId};
-use kaijutsu_kernel::kernel_db::{KernelDb, ContextRow, ContextEdgeRow, PresetRow};
+use kaijutsu_kernel::kernel_db::{KernelDb, ContextRow};
 // Alias to avoid conflict with kaijutsu_capnp::ToolKind (glob-imported)
 use kaijutsu_types::ToolKind as TypesToolKind;
 use serde_json;
@@ -1828,6 +1828,17 @@ impl kernel::Server for KernelImpl {
             let label_ref = if label.is_empty() { None } else { Some(label.as_str()) };
             let created_by = connection.borrow().principal.id;
 
+            // Read LLM defaults so new contexts start with a model set
+            let (default_provider, default_model) = {
+                let registry = kernel.kernel.llm().read().await;
+                (
+                    registry.default_provider_name().map(|s| s.to_string()),
+                    Some(registry.default_model()
+                        .unwrap_or(kaijutsu_kernel::DEFAULT_MODEL)
+                        .to_string()),
+                )
+            };
+
             // Write-through: KernelDb first, then DriftRouter
             {
                 let db = kernel.kernel_db.lock().unwrap();
@@ -1835,8 +1846,8 @@ impl kernel::Server for KernelImpl {
                     context_id,
                     kernel_id: kernel.id,
                     label: label_ref.map(|s| s.to_string()),
-                    provider: None,
-                    model: None,
+                    provider: default_provider.clone(),
+                    model: default_model.clone(),
                     system_prompt: None,
                     tool_filter: None,
                     consent_mode: kaijutsu_kernel::control::ConsentMode::Collaborative,
@@ -1858,6 +1869,9 @@ impl kernel::Server for KernelImpl {
             {
                 let mut drift = kernel.kernel.drift().write().await;
                 drift.register(context_id, label_ref, parent_ctx, created_by);
+                if let (Some(p), Some(m)) = (&default_provider, &default_model) {
+                    let _ = drift.configure_llm(context_id, p, m);
+                }
                 log::info!("Created context {} (label={:?}) in kernel DriftRouter", context_id, label_ref);
             }
 
@@ -1913,6 +1927,17 @@ impl kernel::Server for KernelImpl {
                 log::warn!("Failed to create input doc for context {}: {}", context_id, e);
             }
 
+            // Read LLM defaults before taking the drift write lock
+            let (default_provider, default_model) = {
+                let registry = kernel.kernel.llm().read().await;
+                (
+                    registry.default_provider_name().map(|s| s.to_string()),
+                    Some(registry.default_model()
+                        .unwrap_or(kaijutsu_kernel::DEFAULT_MODEL)
+                        .to_string()),
+                )
+            };
+
             // Register context in kernel-level drift router (only if new)
             {
                 let mut drift = kernel.kernel.drift().write().await;
@@ -1927,8 +1952,8 @@ impl kernel::Server for KernelImpl {
                                 context_id,
                                 kernel_id: kernel.id,
                                 label: None,
-                                provider: None,
-                                model: None,
+                                provider: default_provider.clone(),
+                                model: default_model.clone(),
                                 system_prompt: None,
                                 tool_filter: None,
                                 consent_mode: kaijutsu_kernel::control::ConsentMode::Collaborative,
@@ -1949,6 +1974,9 @@ impl kernel::Server for KernelImpl {
                     }
 
                     drift.register(context_id, None, parent_ctx, created_by);
+                    if let (Some(p), Some(m)) = (&default_provider, &default_model) {
+                        let _ = drift.configure_llm(context_id, p, m);
+                    }
                     log::info!("Registered context {} in kernel DriftRouter", context_id);
                 }
                 let trace_id = drift.get(context_id).map(|h| h.trace_id).unwrap_or([0u8; 16]);
@@ -2960,117 +2988,10 @@ impl kernel::Server for KernelImpl {
     }
 
     // ========================================================================
-    // Timeline Navigation (Phase 3: Fork-First Temporal Model)
+    // Timeline Navigation
     // ========================================================================
 
-    fn fork_from_version(
-        self: Rc<Self>,
-        params: kernel::ForkFromVersionParams,
-        mut results: kernel::ForkFromVersionResults,
-    ) -> Promise<(), capnp::Error> {
-        let params_reader = pry!(params.get());
-        let context_id_bytes = pry!(params_reader.get_context_id());
-        let source_context_id = pry!(ContextId::try_from_slice(context_id_bytes)
-            .ok_or_else(|| capnp::Error::failed("invalid context ID".into())));
-        let version = params_reader.get_version();
-        // Schema: forkFromVersion(contextId, version, contextLabel) -> (newContextId :Data)
-        let context_label = pry!(pry!(params_reader.get_context_label()).to_str()).to_owned();
-
-        let new_ctx_id = ContextId::new();
-
-        log::info!(
-            "Fork request: context={}, version={}, label='{}', new_ctx={}",
-            source_context_id, version, context_label, new_ctx_id
-        );
-
-        let documents = self.kernel.documents.clone();
-        let kernel_arc = self.kernel.kernel.clone();
-        let parent_ctx_id = source_context_id;
-
-        // Validate document and version (DashMap access is sync)
-        let doc_entry = match documents.get(source_context_id) {
-            Some(entry) => entry,
-            None => return Promise::err(capnp::Error::failed("Document not found".into())),
-        };
-        let current_version = doc_entry.version();
-        if current_version < version {
-            return Promise::err(capnp::Error::failed(
-                format!("Requested version {} is in the future (current: {})", version, current_version)
-            ));
-        }
-        drop(doc_entry);
-
-        // Fork the document at the specified version
-        if let Err(e) = documents.fork_document_at_version(source_context_id, new_ctx_id, version) {
-            return Promise::err(capnp::Error::failed(format!("Fork failed: {}", e)));
-        }
-
-        let label_owned = if context_label.is_empty() { None } else { Some(context_label.clone()) };
-
-        let shared_kernel = self.kernel.clone();
-        let connection = self.connection.clone();
-        let span = extract_rpc_trace(params_reader.get_trace(), "fork_from_version");
-        Promise::from_future(async move {
-            let label = label_owned.as_deref();
-            let created_by = connection.borrow().principal.id;
-
-            // Write-through: KernelDb first
-            {
-                let db = shared_kernel.kernel_db.lock().unwrap();
-                let parent_row = db.get_context(parent_ctx_id).ok().flatten();
-                let row = ContextRow {
-                    context_id: new_ctx_id,
-                    kernel_id: shared_kernel.id,
-                    label: label.map(|s| s.to_string()),
-                    provider: parent_row.as_ref().and_then(|r| r.provider.clone()),
-                    model: parent_row.as_ref().and_then(|r| r.model.clone()),
-                    system_prompt: parent_row.as_ref().and_then(|r| r.system_prompt.clone()),
-                    tool_filter: parent_row.as_ref().and_then(|r| r.tool_filter.clone()),
-                    consent_mode: parent_row.as_ref().map(|r| r.consent_mode).unwrap_or(kaijutsu_kernel::control::ConsentMode::Collaborative),
-                    created_at: kaijutsu_types::now_millis() as i64,
-                    created_by,
-                    forked_from: Some(parent_ctx_id),
-                    fork_kind: Some(kaijutsu_types::ForkKind::Full),
-                    archived_at: None,
-                    workspace_id: parent_row.as_ref().and_then(|r| r.workspace_id),
-                    preset_id: None,
-                };
-                let default_ws = db.get_or_create_default_workspace(row.kernel_id, row.created_by)
-                        .unwrap_or_else(|_| kaijutsu_types::WorkspaceId::new());
-                if let Err(e) = db.insert_context_with_document(&row, default_ws) {
-                    log::warn!("KernelDb insert_context failed for fork {}: {}", new_ctx_id.short(), e);
-                }
-                // Insert structural edge
-                let edge = ContextEdgeRow {
-                    edge_id: uuid::Uuid::new_v4(),
-                    source_id: parent_ctx_id,
-                    target_id: new_ctx_id,
-                    kind: kaijutsu_types::EdgeKind::Structural,
-                    metadata: None,
-                    created_at: kaijutsu_types::now_millis() as i64,
-                };
-                if let Err(e) = db.insert_edge(&edge) {
-                    log::warn!("KernelDb insert_edge failed for fork {}: {}", new_ctx_id.short(), e);
-                }
-            }
-
-            // Register in drift router — inherits parent's provider/model
-            let mut drift = kernel_arc.drift().write().await;
-            drift.register_fork(new_ctx_id, label, parent_ctx_id, created_by);
-            // Link to the parent context's long-running trace
-            let trace_id = drift.get(parent_ctx_id).map(|h| h.trace_id).unwrap_or([0u8; 16]);
-            let _ctx_span = kaijutsu_telemetry::context_root_span(&trace_id, "fork_from_version").entered();
-
-            // Return the new context ID
-            results.get().set_new_context_id(new_ctx_id.as_bytes());
-
-            log::info!(
-                "Fork created: ctx={} (label={:?}) from context {} at version {}",
-                new_ctx_id, label, source_context_id, version
-            );
-            Ok(())
-        }.instrument(span))
-    }
+    // forkFromVersion removed — consolidated to kj fork
 
     fn cherry_pick_block(
         self: Rc<Self>,
@@ -3338,26 +3259,24 @@ impl kernel::Server for KernelImpl {
         let shared_kernel = self.kernel.clone();
         let span = extract_rpc_trace(params_reader.get_trace(), "configure_llm");
         Promise::from_future(async move {
-            // Write-through: KernelDb first
-            {
-                let db = shared_kernel.kernel_db.lock().unwrap();
-                if let Err(e) = db.update_model(ctx_id, Some(&provider_name), Some(&model)) {
-                    log::warn!("KernelDb update_model failed for {}: {}", ctx_id.short(), e);
-                }
-            }
-
-            // Update drift router metadata (per-context model assignment)
-            {
-                let mut drift = kernel_arc.drift().write().await;
-                let _ = drift.configure_llm(ctx_id, &provider_name, &model);
-            }
-
-            // Ensure provider is registered in LLM registry (for API client),
-            // but do NOT change kernel-wide defaults — model is per-context
+            // Validate provider before persisting — never write bad data
             let config = kaijutsu_kernel::llm::ProviderConfig::new(&provider_name)
                 .with_default_model(&model);
             match kaijutsu_kernel::llm::RigProvider::from_config(&config) {
                 Ok(new_provider) => {
+                    // Provider is valid — now persist
+                    {
+                        let db = shared_kernel.kernel_db.lock().unwrap();
+                        if let Err(e) = db.update_model(ctx_id, Some(&provider_name), Some(&model)) {
+                            log::warn!("KernelDb update_model failed for {}: {}", ctx_id.short(), e);
+                        }
+                    }
+                    {
+                        let mut drift = kernel_arc.drift().write().await;
+                        let _ = drift.configure_llm(ctx_id, &provider_name, &model);
+                    }
+                    // Ensure provider is registered in LLM registry (for API client),
+                    // but do NOT change kernel-wide defaults — model is per-context
                     let mut registry = kernel_arc.llm().write().await;
                     if registry.get(&provider_name).is_none() {
                         registry.register(&provider_name, Arc::new(new_provider));
@@ -3369,7 +3288,7 @@ impl kernel::Server for KernelImpl {
                 Err(e) => {
                     results.get().set_success(false);
                     results.get().set_error(&format!("{}", e));
-                    log::warn!("Failed to configure LLM for context {}: {}", ctx_id.short(), e);
+                    log::warn!("Failed to configure LLM for context {}: provider={}, model={}, err={}", ctx_id.short(), provider_name, model, e);
                 }
             }
 
@@ -3724,132 +3643,7 @@ impl kernel::Server for KernelImpl {
         }.instrument(span))
     }
 
-    fn fork_filtered(
-        self: Rc<Self>,
-        params: kernel::ForkFilteredParams,
-        mut results: kernel::ForkFilteredResults,
-    ) -> Promise<(), capnp::Error> {
-        let params_reader = pry!(params.get());
-        let context_id_bytes = pry!(params_reader.get_context_id());
-        let source_context_id = pry!(ContextId::try_from_slice(context_id_bytes)
-            .ok_or_else(|| capnp::Error::failed("invalid context ID".into())));
-        let version = params_reader.get_version();
-        let context_label = pry!(pry!(params_reader.get_context_label()).to_str()).to_owned();
-        let apply_tool_filter = params_reader.get_apply_tool_filter();
-
-        // Parse block filter
-        let block_filter_reader = pry!(params_reader.get_block_filter());
-        let block_filter = pry!(parse_block_filter_from_capnp(block_filter_reader));
-
-        // Parse optional tool filter
-        let tool_filter = if apply_tool_filter {
-            let tf_reader = pry!(params_reader.get_tool_filter());
-            Some(pry!(parse_tool_filter_from_capnp(tf_reader)))
-        } else {
-            None
-        };
-
-        let new_ctx_id = ContextId::new();
-        let documents = self.kernel.documents.clone();
-        let kernel_arc = self.kernel.kernel.clone();
-
-        log::info!(
-            "Filtered fork request: context={}, version={}, label='{}', new_ctx={}",
-            source_context_id, version, context_label, new_ctx_id
-        );
-
-        // Validate document and version
-        let doc_entry = match documents.get(source_context_id) {
-            Some(entry) => entry,
-            None => return Promise::err(capnp::Error::failed("Document not found".into())),
-        };
-        let current_version = doc_entry.version();
-        if current_version < version {
-            return Promise::err(capnp::Error::failed(
-                format!("Requested version {} is in the future (current: {})", version, current_version)
-            ));
-        }
-        drop(doc_entry);
-
-        // Fork with block filter
-        if let Err(e) = documents.fork_document_filtered(
-            source_context_id, new_ctx_id, version, &block_filter,
-        ) {
-            return Promise::err(capnp::Error::failed(format!("Filtered fork failed: {}", e)));
-        }
-
-        let label_owned = if context_label.is_empty() { None } else { Some(context_label.clone()) };
-        let shared_kernel = self.kernel.clone();
-        let connection = self.connection.clone();
-
-        let span = extract_rpc_trace(params_reader.get_trace(), "fork_filtered");
-        Promise::from_future(async move {
-            let label = label_owned.as_deref();
-            let created_by = connection.borrow().principal.id;
-
-            // Write-through: KernelDb first
-            {
-                let db = shared_kernel.kernel_db.lock().unwrap();
-                let parent_row = db.get_context(source_context_id).ok().flatten();
-                let row = ContextRow {
-                    context_id: new_ctx_id,
-                    kernel_id: shared_kernel.id,
-                    label: label.map(|s| s.to_string()),
-                    provider: parent_row.as_ref().and_then(|r| r.provider.clone()),
-                    model: parent_row.as_ref().and_then(|r| r.model.clone()),
-                    system_prompt: parent_row.as_ref().and_then(|r| r.system_prompt.clone()),
-                    tool_filter: tool_filter.clone().or_else(|| parent_row.as_ref().and_then(|r| r.tool_filter.clone())),
-                    consent_mode: parent_row.as_ref().map(|r| r.consent_mode).unwrap_or(kaijutsu_kernel::control::ConsentMode::Collaborative),
-                    created_at: kaijutsu_types::now_millis() as i64,
-                    created_by,
-                    forked_from: Some(source_context_id),
-                    fork_kind: Some(kaijutsu_types::ForkKind::Full),
-                    archived_at: None,
-                    workspace_id: parent_row.as_ref().and_then(|r| r.workspace_id),
-                    preset_id: None,
-                };
-                let default_ws = db.get_or_create_default_workspace(row.kernel_id, row.created_by)
-                        .unwrap_or_else(|_| kaijutsu_types::WorkspaceId::new());
-                if let Err(e) = db.insert_context_with_document(&row, default_ws) {
-                    log::warn!("KernelDb insert_context failed for fork {}: {}", new_ctx_id.short(), e);
-                }
-                let edge = ContextEdgeRow {
-                    edge_id: uuid::Uuid::new_v4(),
-                    source_id: source_context_id,
-                    target_id: new_ctx_id,
-                    kind: kaijutsu_types::EdgeKind::Structural,
-                    metadata: None,
-                    created_at: kaijutsu_types::now_millis() as i64,
-                };
-                if let Err(e) = db.insert_edge(&edge) {
-                    log::warn!("KernelDb insert_edge failed for fork {}: {}", new_ctx_id.short(), e);
-                }
-            }
-
-            // Register in drift router — inherits parent's provider/model/tool_filter
-            let mut drift = kernel_arc.drift().write().await;
-            drift.register_fork(new_ctx_id, label, source_context_id, created_by);
-
-            // Apply per-context tool filter if specified
-            if let Some(filter) = tool_filter {
-                if let Err(e) = drift.configure_tools(new_ctx_id, Some(filter)) {
-                    log::warn!("Failed to set tool filter on forked context: {}", e);
-                }
-            }
-
-            // Link to the parent context's long-running trace
-            let trace_id = drift.get(source_context_id).map(|h| h.trace_id).unwrap_or([0u8; 16]);
-            let _ctx_span = kaijutsu_telemetry::context_root_span(&trace_id, "fork_filtered").entered();
-
-            results.get().set_new_context_id(new_ctx_id.as_bytes());
-
-            log::info!(
-                "Filtered fork created: ctx={} (label={:?}) from context {} at version {}",
-                new_ctx_id, label, source_context_id, version
-            );
-            Ok(())
-        }.instrument(span))
-    }
+    // forkFiltered removed — consolidated to kj fork
 
     // =========================================================================
     // Shell Variable Introspection
@@ -4871,7 +4665,6 @@ fn agent_status_to_capnp(status: AgentStatus) -> CapnpAgentStatus {
 // Cap'n Proto ↔ Rust Type Helpers
 // ============================================================================
 
-use kaijutsu_crdt::block_store::ForkBlockFilter;
 
 /// Parse a ToolFilter from a Cap'n Proto ToolFilterConfig reader.
 fn parse_tool_filter_from_capnp(
@@ -4922,42 +4715,6 @@ fn serialize_tool_filter_to_capnp(
             }
         }
     }
-}
-
-/// Parse a BlockFilter from a Cap'n Proto ForkBlockFilter reader.
-fn parse_block_filter_from_capnp(
-    reader: fork_block_filter::Reader<'_>,
-) -> Result<ForkBlockFilter, capnp::Error> {
-    let exclude_compacted = reader.get_exclude_compacted();
-
-    let kinds_list = reader.get_exclude_kinds()?;
-    let mut exclude_kinds = std::collections::HashSet::new();
-    for i in 0..kinds_list.len() {
-        exclude_kinds.insert(kinds_list.get(i)?.to_str()?.to_string());
-    }
-
-    let roles_list = reader.get_exclude_roles()?;
-    let mut exclude_roles = std::collections::HashSet::new();
-    for i in 0..roles_list.len() {
-        exclude_roles.insert(roles_list.get(i)?.to_str()?.to_string());
-    }
-
-    let max_blocks = reader.get_max_blocks();
-
-    let ids_list = reader.get_exclude_block_ids()?;
-    let mut exclude_block_ids = std::collections::HashSet::new();
-    for i in 0..ids_list.len() {
-        let id = parse_block_id_from_reader(&ids_list.get(i))?;
-        exclude_block_ids.insert(id.to_key());
-    }
-
-    Ok(ForkBlockFilter {
-        exclude_compacted,
-        exclude_kinds,
-        exclude_roles,
-        max_blocks: if max_blocks == 0 { None } else { Some(max_blocks as usize) },
-        exclude_block_ids,
-    })
 }
 
 // ============================================================================

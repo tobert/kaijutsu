@@ -108,12 +108,6 @@ pub enum RpcResultMessage {
     },
     /// Context left.
     ContextLeft,
-    /// Fork completed.
-    Forked {
-        success: bool,
-        context_id: Option<ContextId>,
-        error: Option<String>,
-    },
     /// Cherry-pick completed.
     CherryPicked {
         success: bool,

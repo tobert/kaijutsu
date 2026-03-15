@@ -702,7 +702,6 @@ pub fn update_mode(
     use crate::ui::screen::Screen;
     let (color, name) = match screen.get() {
         Screen::Constellation => (theme.mode_visual, "CONSTELLATION"),
-        Screen::ForkForm => (theme.mode_shell, "FORK"),
         Screen::Conversation => match focus_area.as_ref() {
             FocusArea::Compose => (theme.mode_chat, "INPUT"),
             FocusArea::Conversation => (theme.mode_normal, focus_area.name()),
@@ -830,8 +829,7 @@ pub fn update_hints(
 
     use crate::ui::screen::Screen;
     let hints = match screen.get() {
-        Screen::Constellation => "Enter: switch \u{2502} f: fork \u{2502} m: model \u{2502} n: new \u{2502} Tab: compose \u{2502} Esc: back",
-        Screen::ForkForm => "Tab: switch field \u{2502} j/k: select model \u{2502} Enter: fork \u{2502} Esc: cancel",
+        Screen::Constellation => "Enter: switch \u{2502} m: model \u{2502} n: new \u{2502} Tab: compose \u{2502} Esc: back",
         Screen::Conversation => match focus_area.as_ref() {
             FocusArea::Compose => "Enter: submit \u{2502} Shift+Enter: newline \u{2502} Tab: mode ring \u{2502} Esc: dismiss",
             FocusArea::Conversation => "i: chat \u{2502} :: shell \u{2502} j/k: navigate \u{2502} f: expand \u{2502} `: constellation \u{2502} Alt+hjkl: pane",

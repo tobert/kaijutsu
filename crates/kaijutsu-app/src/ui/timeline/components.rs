@@ -133,18 +133,6 @@ impl TimelineState {
 // FORK/CHERRY-PICK SUPPORT
 // ============================================================================
 
-/// Request to fork the current context from a specific point.
-///
-/// When triggered, this creates a new context that branches from the
-/// timeline position where the fork was requested.
-#[derive(Message, Debug, Clone)]
-pub struct ForkRequest {
-    /// The version to fork from (0 = fork from current viewing position).
-    pub from_version: u64,
-    /// Name for the new forked context (optional, auto-generated if None).
-    pub name: Option<String>,
-}
-
 /// Request to cherry-pick a block into another context.
 ///
 /// Cherry-picked blocks carry their lineage - the history of how they
@@ -155,17 +143,6 @@ pub struct CherryPickRequest {
     pub block_id: BlockId,
     /// Target context to pick into.
     pub target_context: String,
-}
-
-/// Result of a fork operation.
-#[derive(Message, Debug, Clone)]
-pub struct ForkResult {
-    /// Whether the fork succeeded.
-    pub success: bool,
-    /// New context ID if successful.
-    pub context_id: Option<String>,
-    /// Error message if failed.
-    pub error: Option<String>,
 }
 
 /// Result of a cherry-pick operation.

@@ -794,33 +794,6 @@ impl KernelHandle {
     // Timeline / Fork operations
     // =========================================================================
 
-    /// Fork a document at a specific version, creating a new context.
-    ///
-    /// Returns the server-assigned ContextId for the new fork.
-    #[tracing::instrument(skip(self), name = "rpc_client.fork_from_version")]
-    pub async fn fork_from_version(
-        &self,
-        context_id: ContextId,
-        version: u64,
-        label: &str,
-    ) -> Result<ContextId, RpcError> {
-        let mut request = self.kernel.fork_from_version_request();
-        {
-            let mut params = request.get();
-            params.set_context_id(context_id.as_bytes());
-            params.set_version(version);
-            params.set_context_label(label);
-        }
-        {
-            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
-            let mut trace = request.get().init_trace();
-            trace.set_traceparent(&traceparent);
-            trace.set_tracestate(&tracestate);
-        }
-        let response = request.send().promise.await?;
-        parse_context_id(response.get()?.get_new_context_id()?)
-    }
-
     /// Cherry-pick a block from one context into another.
     ///
     /// Returns the new block ID in the target context.
@@ -1235,77 +1208,6 @@ impl KernelHandle {
                 Ok(Some(ClientToolFilter::DenyList(tools)))
             }
         }
-    }
-
-    /// Fork a document with block filtering and optional tool filter.
-    #[tracing::instrument(skip(self, block_filter, tool_filter), name = "rpc_client.fork_filtered")]
-    pub async fn fork_filtered(
-        &self,
-        context_id: ContextId,
-        version: u64,
-        label: &str,
-        block_filter: &ClientForkBlockFilter,
-        tool_filter: Option<&ClientToolFilter>,
-    ) -> Result<ContextId, RpcError> {
-        let mut request = self.kernel.fork_filtered_request();
-        {
-            let mut params = request.get();
-            params.set_context_id(context_id.as_bytes());
-            params.set_version(version);
-            params.set_context_label(label);
-
-            // Set block filter
-            let mut bf = params.reborrow().init_block_filter();
-            bf.set_exclude_compacted(block_filter.exclude_compacted);
-            bf.set_max_blocks(block_filter.max_blocks.unwrap_or(0) as u32);
-            {
-                let mut kinds = bf.reborrow().init_exclude_kinds(block_filter.exclude_kinds.len() as u32);
-                for (i, k) in block_filter.exclude_kinds.iter().enumerate() {
-                    kinds.set(i as u32, k);
-                }
-            }
-            {
-                let mut roles = bf.reborrow().init_exclude_roles(block_filter.exclude_roles.len() as u32);
-                for (i, r) in block_filter.exclude_roles.iter().enumerate() {
-                    roles.set(i as u32, r);
-                }
-            }
-            {
-                let mut ids = bf.reborrow().init_exclude_block_ids(block_filter.exclude_block_ids.len() as u32);
-                for (i, id) in block_filter.exclude_block_ids.iter().enumerate() {
-                    set_block_id_builder(&mut ids.reborrow().get(i as u32), id);
-                }
-            }
-
-            // Set tool filter if present
-            params.set_apply_tool_filter(tool_filter.is_some());
-            if let Some(tf) = tool_filter {
-                let mut filter_builder = params.init_tool_filter();
-                match tf {
-                    ClientToolFilter::All => filter_builder.set_all(()),
-                    ClientToolFilter::AllowList(tools) => {
-                        let mut list = filter_builder.init_allow_list(tools.len() as u32);
-                        for (i, tool) in tools.iter().enumerate() {
-                            list.set(i as u32, tool);
-                        }
-                    }
-                    ClientToolFilter::DenyList(tools) => {
-                        let mut list = filter_builder.init_deny_list(tools.len() as u32);
-                        for (i, tool) in tools.iter().enumerate() {
-                            list.set(i as u32, tool);
-                        }
-                    }
-                }
-            }
-        }
-        {
-            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
-            let mut trace = request.get().init_trace();
-            trace.set_traceparent(&traceparent);
-            trace.set_tracestate(&tracestate);
-        }
-        let response = request.send().promise.await?;
-        parse_context_id(response.get()?.get_new_context_id()?)
     }
 
     // =========================================================================
@@ -2145,21 +2047,6 @@ pub enum ClientToolFilter {
     AllowList(Vec<String>),
     /// All except these tools available
     DenyList(Vec<String>),
-}
-
-/// Block filter for filtered fork operations.
-#[derive(Debug, Clone, Default)]
-pub struct ClientForkBlockFilter {
-    /// Skip blocks marked as compacted.
-    pub exclude_compacted: bool,
-    /// Skip blocks with these BlockKind names.
-    pub exclude_kinds: Vec<String>,
-    /// Skip blocks with these Role names.
-    pub exclude_roles: Vec<String>,
-    /// Limit total blocks (None = unlimited).
-    pub max_blocks: Option<usize>,
-    /// Skip specific blocks by typed BlockId.
-    pub exclude_block_ids: Vec<BlockId>,
 }
 
 /// Shell variable value (mirrors kaish `ast::Value`).

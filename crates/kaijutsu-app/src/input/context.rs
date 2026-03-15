@@ -67,14 +67,6 @@ pub fn sync_input_context(
         return;
     }
 
-    // ForkForm screen has its own input handling gated by in_state(Screen::ForkForm)
-    if matches!(screen.get(), Screen::ForkForm) {
-        // Dialog context for j/k/Enter/Escape + text input for name field
-        active.0.push(InputContext::Dialog);
-        active.0.push(InputContext::TextInput);
-        return;
-    }
-
     // Within-conversation focus areas
     match focus.as_ref() {
         FocusArea::Compose => {

@@ -8,13 +8,11 @@
 //!
 //! - `Constellation` — 2.5D context navigation graph (default)
 //! - `Conversation` — chat/shell conversation view
-//! - `ForkForm` — full-viewport fork configuration form
 //!
 //! ## Design
 //!
 //! Long-lived entities (3D scene, containers, block cells) persist across transitions
-//! and are shown/hidden via Visibility + camera `is_active`. Screen-scoped
-//! entities (fork form UI) use `DespawnOnExit` for automatic cleanup.
+//! and are shown/hidden via Visibility + camera `is_active`.
 
 use bevy::prelude::*;
 
@@ -34,8 +32,6 @@ pub enum Screen {
     Constellation,
     /// Chat/shell conversation view.
     Conversation,
-    /// Full-viewport fork configuration form.
-    ForkForm,
 }
 
 /// Plugin that registers the Screen state and its transition systems.
@@ -63,11 +59,6 @@ impl Plugin for ScreenPlugin {
             show_cell_text,
             set_focus_conversation,
         ));
-
-        // ── ForkForm ──
-        // Form UI is spawned by the message handler that triggers the transition.
-        // DespawnOnExit(Screen::ForkForm) handles cleanup automatically.
-        // OnExit(Constellation) already deactivated the camera.
 
         // ── Continuous ──
         // Hide newly-added text entities that appear while not in conversation

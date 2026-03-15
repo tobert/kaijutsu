@@ -22,9 +22,7 @@ impl Plugin for TimelinePlugin {
         app.init_resource::<TimelineState>();
 
         // Register messages
-        app.add_message::<ForkRequest>()
-            .add_message::<ForkResult>()
-            .add_message::<CherryPickRequest>()
+        app.add_message::<CherryPickRequest>()
             .add_message::<CherryPickResult>();
 
         // Core systems
@@ -37,10 +35,8 @@ impl Plugin for TimelinePlugin {
                 // Block visibility updates
                 systems::update_block_visibility,
                 // Request processing
-                systems::process_fork_requests,
                 systems::process_cherry_pick_requests,
                 // Completion handlers
-                systems::handle_fork_complete,
                 systems::handle_cherry_pick_complete,
             ),
         );

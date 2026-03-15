@@ -428,15 +428,6 @@ struct ToolFilterConfig {
   }
 }
 
-# Block filter for filtered fork operations
-struct ForkBlockFilter {
-  excludeCompacted @0 :Bool;      # Skip blocks marked as compacted
-  excludeKinds @1 :List(Text);    # Skip blocks with these BlockKind names
-  excludeRoles @2 :List(Text);    # Skip blocks with these Role names
-  maxBlocks @3 :UInt32;           # Limit total blocks (0 = unlimited)
-  excludeBlockIds @4 :List(BlockId); # Skip specific blocks by typed BlockId
-}
-
 # ============================================================================
 # OutputData Types (Structured Output from kaish commands)
 # ============================================================================
@@ -932,8 +923,8 @@ interface Kernel {
   # Navigate through context history with fork and cherry-pick operations.
   # The past is read-only, but forking is ubiquitous.
 
-  # Fork from a specific context version (context-level fork, not kernel-level)
-  forkFromVersion @50 (contextId :Data, version :UInt64, contextLabel :Text, trace :TraceContext) -> (newContextId :Data);
+  # Removed: use `kj fork` instead. Ordinal kept for schema compatibility.
+  forkFromVersionRemoved @50 () -> ();
 
   # Cherry-pick a block into another context (carries lineage)
   cherryPickBlock @51 (sourceBlockId :BlockId, targetContextId :Data, trace :TraceContext) -> (newBlockId :BlockId);
@@ -1088,15 +1079,8 @@ interface Kernel {
   # Get the per-context tool filter (None = inherit kernel default).
   getContextToolFilter @86 (contextId :Data, trace :TraceContext) -> (filter :ToolFilterConfig, hasFilter :Bool);
 
-  # ============================================================================
-  # Filtered Fork
-  # ============================================================================
-
-  # Fork a context with block filtering and optional tool filter.
-  forkFiltered @87 (contextId :Data, version :UInt64, contextLabel :Text,
-                    blockFilter :ForkBlockFilter, toolFilter :ToolFilterConfig,
-                    applyToolFilter :Bool,
-                    trace :TraceContext) -> (newContextId :Data);
+  # Removed: use `kj fork` instead. Ordinal kept for schema compatibility.
+  forkFilteredRemoved @87 () -> ();
 
   # Interrupt a running LLM stream or shell jobs for a context.
   # immediate=false → soft interrupt (stop agentic loop after current tool turn).

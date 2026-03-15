@@ -114,8 +114,6 @@ pub enum Action {
     /// Reset zoom — gamepad only for now (Phase N: gamepad workflow).
     // Phase N: gamepad workflow
     ZoomReset,
-    /// f in constellation — fork focused context
-    ConstellationFork,
     /// n in constellation — create new context immediately
     ConstellationCreate,
     /// m in constellation — open model picker

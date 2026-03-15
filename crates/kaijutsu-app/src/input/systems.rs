@@ -281,7 +281,6 @@ pub fn handle_toggle_constellation(
         match screen.get() {
             Screen::Constellation => next_screen.set(Screen::Conversation),
             Screen::Conversation => next_screen.set(Screen::Constellation),
-            Screen::ForkForm => {} // Don't toggle while fork form is open
         }
     }
 }
@@ -597,7 +596,7 @@ pub fn handle_tiling(
 
 use crate::ui::constellation::{
     Constellation, ConstellationCamera,
-    NewContextConfig, OpenForkForm, create_or_fork_context,
+    NewContextConfig, create_or_fork_context,
     find_nearest_in_direction,
     model_picker::OpenModelPicker,
 };
@@ -613,7 +612,6 @@ pub fn handle_constellation_nav(
     mut camera: ResMut<ConstellationCamera>,
     mut switch_writer: MessageWriter<crate::cell::ContextSwitchRequested>,
     mut model_writer: MessageWriter<OpenModelPicker>,
-    mut fork_form_writer: MessageWriter<OpenForkForm>,
     bootstrap: Res<crate::connection::BootstrapChannel>,
     conn_state: Res<crate::connection::RpcConnectionState>,
     new_ctx_config: Res<NewContextConfig>,
@@ -658,26 +656,12 @@ pub fn handle_constellation_nav(
                     next_screen.set(crate::ui::screen::Screen::Conversation);
                 }
             }
-            Action::ConstellationFork => {
-                if let Some(focus_id) = constellation.focus_id {
-                    let node = constellation.node_by_id(focus_id);
-                    let parent_provider = node.and_then(|n| n.provider.clone());
-                    let parent_model = node.and_then(|n| n.model.clone());
-                    fork_form_writer.write(OpenForkForm {
-                        source_context: focus_id.to_string(),
-                        source_context_id: focus_id,
-                        parent_provider,
-                        parent_model,
-                    });
-                }
-            }
             Action::ConstellationCreate => {
                 info!("Constellation: creating new context");
                 create_or_fork_context(
                     &new_ctx_config,
                     &bootstrap,
                     &conn_state,
-                    actor.as_deref(),
                 );
             }
             Action::ConstellationModelPicker => {

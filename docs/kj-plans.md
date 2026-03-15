@@ -52,7 +52,7 @@ assignments, fork lineage, and tool filters survive server restart.
 - Recovery rewrite: KernelDb primary source, BlockStore discovery as fallback for
   documents not yet in DB
 - Write-through on 6 mutation sites: `create_context`, `join_context`,
-  `fork_from_version`, `fork_filtered`, `configure_llm`, `set_context_tool_filter`
+  `kj fork` (all variants), `configure_llm`, `set_context_tool_filter`
 - Fork paths insert structural edges via `insert_edge()`
 - `update_tool_filter()` added to KernelDb
 - `map_unique_violation()` now distinguishes FK (→ Validation) from UNIQUE (→ LabelConflict)

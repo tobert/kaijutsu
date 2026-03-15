@@ -272,6 +272,24 @@ impl KjDispatcher {
         let cwd_spec = extract_named_arg(argv, &["--cwd"]);
         let env_spec = extract_named_arg(argv, &["--env"]);
 
+        // Validate provider against LlmRegistry BEFORE taking DB lock
+        let parsed_model = match model_spec {
+            Some(ref spec) => {
+                let (provider, model) = parse_model_spec(spec);
+                if let Some(ref p) = provider {
+                    let registry = self.kernel().llm().read().await;
+                    if registry.get(p).is_none() {
+                        return KjResult::Err(format!(
+                            "kj context set: unknown provider '{}'",
+                            p,
+                        ));
+                    }
+                }
+                Some((provider, model))
+            }
+            None => None,
+        };
+
         // Resolve target + apply DB changes (lock scope)
         let (target_id, changes, tool_filter_for_drift, model_for_drift) = {
             let db = self.kernel_db().lock().unwrap();
@@ -285,13 +303,12 @@ impl KjDispatcher {
             let mut tool_filter_for_drift = None;
             let mut model_for_drift: Option<(String, String)> = None;
 
-            // Update model
-            if let Some(ref spec) = model_spec {
-                let (provider, model) = parse_model_spec(spec);
+            // Update model (already validated above)
+            if let Some((provider, model)) = parsed_model {
                 if let Err(e) = db.update_model(target_id, provider.as_deref(), model.as_deref()) {
                     return KjResult::Err(format!("kj context set: {e}"));
                 }
-                changes.push(format!("model={spec}"));
+                changes.push(format!("model={}", model_spec.as_deref().unwrap_or("?")));
                 if let (Some(p), Some(m)) = (provider, model) {
                     model_for_drift = Some((p, m));
                 }
@@ -841,9 +858,18 @@ mod tests {
         let principal = PrincipalId::new();
         let ctx = register_context(&d, Some("target"), None, principal).await;
 
+        // Register mock provider so validation passes
+        {
+            use std::sync::Arc;
+            use crate::llm::{MockClient, RigProvider};
+            let mock = Arc::new(RigProvider::Mock(MockClient::new("mock")));
+            let mut registry = d.kernel().llm().write().await;
+            registry.register("mock", mock);
+        }
+
         let c = caller_with_context(ctx);
         let result = d
-            .dispatch(&[s("context"), s("set"), s("."), s("--model"), s("anthropic/claude-opus-4-6")], &c)
+            .dispatch(&[s("context"), s("set"), s("."), s("--model"), s("mock/test-model")], &c)
             .await;
         assert!(result.is_ok(), "set failed: {}", result.message());
         assert!(result.message().contains("model="), "msg: {}", result.message());
@@ -851,8 +877,26 @@ mod tests {
         // Verify in DriftRouter
         let router = d.drift_router().read().await;
         let handle = router.get(ctx).unwrap();
-        assert_eq!(handle.provider.as_deref(), Some("anthropic"));
-        assert_eq!(handle.model.as_deref(), Some("claude-opus-4-6"));
+        assert_eq!(handle.provider.as_deref(), Some("mock"));
+        assert_eq!(handle.model.as_deref(), Some("test-model"));
+    }
+
+    #[tokio::test]
+    async fn context_set_invalid_provider_errors() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("target"), None, principal).await;
+
+        let c = caller_with_context(ctx);
+        let result = d
+            .dispatch(&[s("context"), s("set"), s("."), s("--model"), s("nonexistent/foo")], &c)
+            .await;
+        assert!(!result.is_ok(), "should fail: {}", result.message());
+        assert!(
+            result.message().contains("unknown provider"),
+            "expected 'unknown provider' error, got: {}",
+            result.message()
+        );
     }
 
     #[tokio::test]

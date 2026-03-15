@@ -1,17 +1,14 @@
 //! New context tile for the constellation.
 //!
 //! The "New" tile creates contexts instantly (click or `n` key) with a
-//! UUID-based name. `NewContextConfig` controls whether "New" forks from
-//! a parent context or creates empty.
-//!
-//! Fork configuration is handled by `fork_form.rs` (full-viewport form).
+//! UUID-based name. Fork configuration is done via `kj fork` in the shell.
 
 use bevy::prelude::*;
 use kaijutsu_crdt::ContextId;
 use kaijutsu_types::KernelId;
 use uuid::Uuid;
 
-use crate::connection::{BootstrapChannel, BootstrapCommand, RpcActor, RpcConnectionState};
+use crate::connection::{BootstrapChannel, BootstrapCommand, RpcConnectionState};
 
 use super::NewContextConfig;
 
@@ -28,56 +25,18 @@ pub struct CreateContextNode;
 // INSTANT CONTEXT CREATION
 // ============================================================================
 
-/// Create a new context immediately, optionally forking from a parent.
+/// Create a new empty context immediately.
 ///
-/// When `config.parent_context` is set and found in the document cache,
-/// forks from that context. Otherwise creates an empty context.
 /// Used by both the "New" tile click and the `n` key binding.
+/// Fork configuration is handled by `kj fork` in the shell.
 pub fn create_or_fork_context(
-    config: &NewContextConfig,
+    _config: &NewContextConfig,
     bootstrap: &BootstrapChannel,
     conn_state: &RpcConnectionState,
-    actor: Option<&RpcActor>,
 ) {
     let kernel_id = conn_state.kernel_id.unwrap_or_else(KernelId::nil);
     let context_label = Uuid::new_v4().to_string()[..8].to_string();
-
-    if let Some(ref parent) = config.parent_context {
-        if let Ok(parent_ctx_id) = ContextId::parse(parent) {
-            let Some(actor) = actor else {
-                error!("Cannot fork from parent: no active RPC actor");
-                create_empty(bootstrap, conn_state, kernel_id, &context_label);
-                return;
-            };
-            let handle = actor.handle.clone();
-            let fork_label = context_label.clone();
-            let config = conn_state.ssh_config.clone();
-            let bootstrap_tx = bootstrap.tx.clone();
-
-            bevy::tasks::IoTaskPool::get()
-                .spawn(async move {
-                    match handle.fork_from_version(parent_ctx_id, 0, &fork_label).await {
-                        Ok(ctx_id) => {
-                            info!("Fork created: {}", ctx_id);
-                            let instance = Uuid::new_v4().to_string();
-                            let _ = bootstrap_tx.send(BootstrapCommand::SpawnActor {
-                                config,
-                                kernel_id,
-                                context_id: Some(ctx_id),
-                                instance,
-                            });
-                        }
-                        Err(e) => error!("Fork from parent failed: {}", e),
-                    }
-                })
-                .detach();
-        } else {
-            warn!("Parent context '{}' not in cache, creating empty", parent);
-            create_empty(bootstrap, conn_state, kernel_id, &context_label);
-        }
-    } else {
-        create_empty(bootstrap, conn_state, kernel_id, &context_label);
-    }
+    create_empty(bootstrap, conn_state, kernel_id, &context_label);
 }
 
 /// Create an empty context by spawning an actor.
@@ -118,7 +77,6 @@ fn handle_create_node_click(
     new_ctx_config: Res<NewContextConfig>,
     bootstrap: Res<BootstrapChannel>,
     conn_state: Res<RpcConnectionState>,
-    actor: Option<Res<RpcActor>>,
 ) {
     for interaction in create_nodes.iter() {
         if *interaction == Interaction::Pressed {
@@ -127,7 +85,6 @@ fn handle_create_node_click(
                 &new_ctx_config,
                 &bootstrap,
                 &conn_state,
-                actor.as_deref(),
             );
         }
     }

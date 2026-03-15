@@ -37,6 +37,6 @@ pub use plugin::TimelinePlugin;
 // Some aren't consumed externally yet but will be when RPC integration completes
 #[allow(unused_imports)]
 pub use components::{
-    ForkRequest, ForkResult, CherryPickRequest, CherryPickResult,
+    CherryPickRequest, CherryPickResult,
     TimelineState, TimelineViewMode, TimelineVisibility,
 };

@@ -24,7 +24,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::Instrument;
 
 use crate::rpc::{
-    ClientForkBlockFilter, ClientToolFilter, Completion, ContextInfo, HistoryEntry, Identity,
+    ClientToolFilter, Completion, ContextInfo, HistoryEntry, Identity,
     InputState, KernelInfo, LlmConfigInfo, McpResource, McpResourceContents, McpToolResult,
     ShellValue, StagedDriftInfo, SubmitResult, SyncState, ToolResult, ToolSchema,
     VersionSnapshot,
@@ -127,9 +127,7 @@ enum RpcCommand {
     GetContextToolFilter { context_id: ContextId, reply: oneshot::Sender<Result<Option<ClientToolFilter>, ActorError>> },
     SetContextToolFilter { context_id: ContextId, filter: ClientToolFilter, reply: oneshot::Sender<Result<bool, ActorError>> },
 
-    // ── Timeline / Fork ──────────────────────────────────────────────────
-    ForkFromVersion { context_id: ContextId, version: u64, label: String, reply: oneshot::Sender<Result<ContextId, ActorError>> },
-    ForkFiltered { context_id: ContextId, version: u64, label: String, block_filter: ClientForkBlockFilter, tool_filter: Option<ClientToolFilter>, reply: oneshot::Sender<Result<ContextId, ActorError>> },
+    // ── Timeline ─────────────────────────────────────────────────────────
     CherryPickBlock { block_id: BlockId, target_context: ContextId, reply: oneshot::Sender<Result<BlockId, ActorError>> },
     GetContextHistory { context_id: ContextId, limit: u32, reply: oneshot::Sender<Result<Vec<VersionSnapshot>, ActorError>> },
 
@@ -185,8 +183,6 @@ impl RpcCommand {
             Self::SetToolFilter { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetContextToolFilter { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::SetContextToolFilter { reply, .. } => { let _ = reply.send(Err(err)); }
-            Self::ForkFromVersion { reply, .. } => { let _ = reply.send(Err(err)); }
-            Self::ForkFiltered { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::CherryPickBlock { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetContextHistory { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetInfo { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -582,37 +578,7 @@ impl ActorHandle {
         self.send(|reply| RpcCommand::SetContextToolFilter { context_id, filter, reply }).await
     }
 
-    // ── Timeline / Fork ──────────────────────────────────────────────────
-
-    /// Fork a document at a specific version, creating a new context.
-    ///
-    /// Returns the server-assigned ContextId for the new fork.
-    #[tracing::instrument(skip(self))]
-    pub async fn fork_from_version(
-        &self,
-        context_id: ContextId,
-        version: u64,
-        label: &str,
-    ) -> Result<ContextId, ActorError> {
-        self.send(|reply| RpcCommand::ForkFromVersion {
-            context_id, version, label: label.into(), reply,
-        }).await
-    }
-
-    /// Fork a document with block filtering and optional tool filter.
-    #[tracing::instrument(skip(self, block_filter, tool_filter))]
-    pub async fn fork_filtered(
-        &self,
-        context_id: ContextId,
-        version: u64,
-        label: &str,
-        block_filter: ClientForkBlockFilter,
-        tool_filter: Option<ClientToolFilter>,
-    ) -> Result<ContextId, ActorError> {
-        self.send(|reply| RpcCommand::ForkFiltered {
-            context_id, version, label: label.into(), block_filter, tool_filter, reply,
-        }).await
-    }
+    // ── Timeline ─────────────────────────────────────────────────────────
 
     /// Cherry-pick a block from one context into another.
     #[tracing::instrument(skip(self))]
@@ -1136,13 +1102,7 @@ async fn dispatch_command(
             rpc_call!(kernel, reply, err_tx, k, k.set_context_tool_filter(context_id, &filter));
         }
 
-        // ── Timeline / Fork ──────────────────────────────────────
-        RpcCommand::ForkFromVersion { context_id, version, label, reply } => {
-            rpc_call!(kernel, reply, err_tx, k, k.fork_from_version(context_id, version, &label));
-        }
-        RpcCommand::ForkFiltered { context_id, version, label, block_filter, tool_filter, reply } => {
-            rpc_call!(kernel, reply, err_tx, k, k.fork_filtered(context_id, version, &label, &block_filter, tool_filter.as_ref()));
-        }
+        // ── Timeline ─────────────────────────────────────────────
         RpcCommand::CherryPickBlock { block_id, target_context, reply } => {
             rpc_call!(kernel, reply, err_tx, k, k.cherry_pick_block(&block_id, target_context));
         }

@@ -3,7 +3,7 @@
 use bevy::prelude::*;
 
 use super::components::*;
-use crate::cell::{CellEditor, MainCell, ViewingConversation};
+use crate::cell::{CellEditor, MainCell};
 use crate::connection::{RpcActor, RpcResultChannel, RpcResultMessage};
 
 // ============================================================================
@@ -65,81 +65,8 @@ pub fn update_block_visibility(
 }
 
 // ============================================================================
-// FORK/CHERRY-PICK PROCESSING
+// CHERRY-PICK PROCESSING
 // ============================================================================
-
-/// Process fork requests.
-///
-/// Sends the fork request to the server via ActorHandle async task.
-/// The actual forking happens server-side; results arrive via RpcResultChannel.
-pub fn process_fork_requests(
-    mut fork_reader: MessageReader<ForkRequest>,
-    actor: Option<Res<RpcActor>>,
-    channel: Res<RpcResultChannel>,
-    conversation_query: Query<&ViewingConversation, With<MainCell>>,
-) {
-    let Some(actor) = actor else { return };
-
-    for request in fork_reader.read() {
-        info!(
-            "Fork requested from version {} with name {:?}",
-            request.from_version, request.name
-        );
-
-        let document_id = if let Ok(viewing) = conversation_query.single() {
-            viewing.conversation_id.clone()
-        } else {
-            warn!("No active conversation for fork");
-            continue;
-        };
-
-        let context_name = request.name.clone().unwrap_or_else(|| {
-            format!("fork-v{}", request.from_version)
-        });
-
-        let handle = actor.handle.clone();
-        let tx = channel.sender();
-        let version = request.from_version;
-        let doc_id = document_id;
-        let ctx_name = context_name.clone();
-        bevy::tasks::IoTaskPool::get()
-            .spawn(async move {
-                match handle.fork_from_version(doc_id, version, &ctx_name).await {
-                    Ok(ctx_id) => {
-                        let _ = tx.send(RpcResultMessage::Forked {
-                            success: true,
-                            context_id: Some(ctx_id),
-                            error: None,
-                        });
-                    }
-                    Err(e) => {
-                        let _ = tx.send(RpcResultMessage::Forked {
-                            success: false,
-                            context_id: None,
-                            error: Some(e.to_string()),
-                        });
-                    }
-                }
-            })
-            .detach();
-    }
-}
-
-/// Handle fork completion results from async RPC tasks.
-pub fn handle_fork_complete(
-    mut events: MessageReader<RpcResultMessage>,
-    mut result_writer: MessageWriter<ForkResult>,
-) {
-    for event in events.read() {
-        if let RpcResultMessage::Forked { success, context_id, error, .. } = event {
-            result_writer.write(ForkResult {
-                success: *success,
-                context_id: context_id.map(|c| c.to_string()),
-                error: error.clone(),
-            });
-        }
-    }
-}
 
 /// Process cherry-pick requests via ActorHandle async task.
 pub fn process_cherry_pick_requests(

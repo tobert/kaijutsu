@@ -11,7 +11,6 @@
 //! - `legend.rs` — Info panel overlay (context count, staged drifts)
 //! - `detail.rs` — Detail sidebar (focused node info)
 //! - `create_dialog.rs` — "New context" dialog
-//! - `fork_form.rs` — Full-viewport fork configuration form
 //! - `model_picker.rs` — Model selection overlay
 //!
 //! ## Activation
@@ -28,14 +27,12 @@
 //! - `+/-` — Zoom in/out
 //! - `0` — Reset camera to default view
 //! - `Enter` — Switch to focused context
-//! - `f` — Fork focused context (opens fork form)
 //! - `n` — Create new context
 //! - `m` — Model picker for focused context
 //! - `a` — Archive focused context
 
 mod create_dialog;
 mod detail;
-pub mod fork_form;
 mod legend;
 pub mod model_picker;
 mod render2d;
@@ -50,7 +47,6 @@ use kaijutsu_types::ContextId;
 use crate::agents::AgentActivityMessage;
 
 pub use create_dialog::create_or_fork_context;
-pub use fork_form::OpenForkForm;
 
 // Render module provides visual systems (used by the plugin internally)
 
@@ -126,9 +122,6 @@ impl Plugin for ConstellationPlugin {
 
         // Add model picker systems
         model_picker::setup_model_picker_systems(app);
-
-        // Add fork form systems (full-viewport fork configuration)
-        fork_form::setup_fork_form_systems(app);
 
         // Form primitives (selectable list, tree view, form field sync)
         app.add_plugins(crate::ui::form::FormPlugin);

@@ -6,10 +6,62 @@ use kaijutsu_types::{ConsentMode, ContextId, EdgeKind, ForkKind};
 
 use crate::kernel_db::{ContextEdgeRow, ContextRow, ContextShellRow};
 
-use super::parse::{extract_named_arg, has_flag};
+use super::parse::{extract_named_arg, has_flag, parse_model_spec};
 use super::{KjCaller, KjDispatcher, KjResult};
 
+/// Resolved provider+model for a fork.
+struct ResolvedModel {
+    provider: Option<String>,
+    model: Option<String>,
+    /// True when `--model` was explicitly given (needs `configure_llm` call).
+    explicit: bool,
+}
+
 impl KjDispatcher {
+    /// Resolve the model for a fork: parse `--model`, validate provider, or inherit from parent.
+    async fn resolve_fork_model(
+        &self,
+        argv: &[String],
+        source_id: ContextId,
+    ) -> Result<ResolvedModel, String> {
+        let model_spec = extract_named_arg(argv, &["--model", "-m"]);
+
+        // Read parent's provider+model from DriftRouter (before any mutations)
+        let (parent_provider, parent_model) = {
+            let router = self.drift_router().read().await;
+            router
+                .get(source_id)
+                .map(|h| (h.provider.clone(), h.model.clone()))
+                .unwrap_or((None, None))
+        };
+
+        match model_spec {
+            Some(spec) => {
+                let (provider, model) = parse_model_spec(&spec);
+                // Validate provider exists in LlmRegistry
+                if let Some(ref p) = provider {
+                    let registry = self.kernel().llm().read().await;
+                    if registry.get(p).is_none() {
+                        return Err(format!(
+                            "unknown provider '{}'",
+                            p,
+                        ));
+                    }
+                }
+                Ok(ResolvedModel {
+                    provider,
+                    model,
+                    explicit: true,
+                })
+            }
+            None => Ok(ResolvedModel {
+                provider: parent_provider,
+                model: parent_model,
+                explicit: false,
+            }),
+        }
+    }
+
     pub(crate) async fn dispatch_fork(&self, argv: &[String], caller: &KjCaller) -> KjResult {
         if has_flag(argv, &["help", "--help", "-h"]) {
             return KjResult::ok_typed(self.fork_help(), "text/markdown");
@@ -49,6 +101,12 @@ impl KjDispatcher {
         let new_id = ContextId::new();
         let kernel_id = self.kernel_id();
 
+        // Validate --model BEFORE any mutations
+        let resolved = match self.resolve_fork_model(argv, source_id).await {
+            Ok(r) => r,
+            Err(e) => return KjResult::Err(format!("kj fork: {e}")),
+        };
+
         // Deep-copy the BlockStore document
         if let Err(e) = self.block_store().fork_document(source_id, new_id) {
             return KjResult::Err(format!("kj fork: failed to copy document: {e}"));
@@ -67,8 +125,8 @@ impl KjDispatcher {
                 context_id: new_id,
                 kernel_id,
                 label: label.clone(),
-                provider: None,
-                model: None,
+                provider: resolved.provider.clone(),
+                model: resolved.model.clone(),
                 system_prompt: None,
                 tool_filter: None,
                 consent_mode: ConsentMode::Collaborative,
@@ -126,6 +184,12 @@ impl KjDispatcher {
         {
             let mut drift = self.drift_router().write().await;
             drift.register_fork(new_id, label.as_deref(), source_id, caller.principal_id);
+            // If --model was explicit, override the inherited model
+            if resolved.explicit {
+                if let (Some(p), Some(m)) = (&resolved.provider, &resolved.model) {
+                    let _ = drift.configure_llm(new_id, p, m);
+                }
+            }
         }
 
         // Apply preset if requested
@@ -162,6 +226,12 @@ impl KjDispatcher {
         let new_id = ContextId::new();
         let kernel_id = self.kernel_id();
 
+        // Validate --model BEFORE any mutations
+        let resolved = match self.resolve_fork_model(argv, source_id).await {
+            Ok(r) => r,
+            Err(e) => return KjResult::Err(format!("kj fork --shallow: {e}")),
+        };
+
         // Get current version for the source document
         let version = self.block_store().get(source_id)
             .map(|e| e.version())
@@ -189,8 +259,8 @@ impl KjDispatcher {
                 context_id: new_id,
                 kernel_id,
                 label: label.clone(),
-                provider: None,
-                model: None,
+                provider: resolved.provider.clone(),
+                model: resolved.model.clone(),
                 system_prompt: None,
                 tool_filter: None,
                 consent_mode: ConsentMode::Collaborative,
@@ -244,6 +314,11 @@ impl KjDispatcher {
         {
             let mut drift = self.drift_router().write().await;
             drift.register_fork(new_id, label.as_deref(), source_id, caller.principal_id);
+            if resolved.explicit {
+                if let (Some(p), Some(m)) = (&resolved.provider, &resolved.model) {
+                    let _ = drift.configure_llm(new_id, p, m);
+                }
+            }
         }
 
         if let Some(ref preset) = preset_label {
@@ -271,6 +346,12 @@ impl KjDispatcher {
         let source_id = caller.context_id;
         let new_id = ContextId::new();
         let kernel_id = self.kernel_id();
+
+        // Validate --model BEFORE any mutations
+        let resolved = match self.resolve_fork_model(argv, source_id).await {
+            Ok(r) => r,
+            Err(e) => return KjResult::Err(format!("kj fork --compact: {e}")),
+        };
 
         // Summarize source context via LLM
         let summary = match self.summarize(source_id, None).await {
@@ -325,8 +406,8 @@ impl KjDispatcher {
                 context_id: new_id,
                 kernel_id,
                 label: label.clone(),
-                provider: None,
-                model: None,
+                provider: resolved.provider.clone(),
+                model: resolved.model.clone(),
                 system_prompt: None,
                 tool_filter: None,
                 consent_mode: ConsentMode::Collaborative,
@@ -380,6 +461,11 @@ impl KjDispatcher {
         {
             let mut drift = self.drift_router().write().await;
             drift.register_fork(new_id, label.as_deref(), source_id, caller.principal_id);
+            if resolved.explicit {
+                if let (Some(p), Some(m)) = (&resolved.provider, &resolved.model) {
+                    let _ = drift.configure_llm(new_id, p, m);
+                }
+            }
         }
 
         let short = new_id.short();
@@ -419,6 +505,22 @@ impl KjDispatcher {
 
         if template_nodes.is_empty() {
             return KjResult::Err("kj fork --as: template context not found".to_string());
+        }
+
+        // Validate all template node providers BEFORE any mutations
+        {
+            let registry = self.kernel().llm().read().await;
+            for (row, _depth) in &template_nodes {
+                if let Some(ref p) = row.provider {
+                    if registry.get(p).is_none() {
+                        return KjResult::Err(format!(
+                            "kj fork --as: template node '{}' references unknown provider '{}'",
+                            row.label.as_deref().unwrap_or("(unnamed)"),
+                            p,
+                        ));
+                    }
+                }
+            }
         }
 
         // Build ID mapping: old → new
@@ -780,6 +882,110 @@ mod tests {
         let child = db.find_context_by_label(d.kernel_id(), "research").unwrap().unwrap();
         let shell = db.get_context_shell(child.context_id).unwrap().unwrap();
         assert_eq!(shell.cwd, Some("/home/user/src/bevy_vello".into()));
+    }
+
+    /// Register a mock LLM provider on the kernel so --model validation passes.
+    async fn register_mock_provider(d: &super::super::KjDispatcher) {
+        use std::sync::Arc;
+        use crate::llm::{MockClient, RigProvider};
+        let mock = Arc::new(RigProvider::Mock(MockClient::new("mock response")));
+        let mut registry = d.kernel().llm().write().await;
+        registry.register("mock", mock);
+    }
+
+    /// Configure provider+model on a context in DriftRouter.
+    async fn configure_context_model(
+        d: &super::super::KjDispatcher,
+        id: kaijutsu_types::ContextId,
+        provider: &str,
+        model: &str,
+    ) {
+        let mut drift = d.drift_router().write().await;
+        let _ = drift.configure_llm(id, provider, model);
+    }
+
+    #[tokio::test]
+    async fn fork_inherits_parent_model_in_db() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("parent"), None, principal).await;
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+
+        // Set parent's model in DriftRouter
+        register_mock_provider(&d).await;
+        configure_context_model(&d, source, "mock", "mock-model").await;
+
+        let c = caller_with_context(source);
+        let result = d.dispatch(&[s("fork"), s("--name"), s("child")], &c).await;
+        assert!(result.is_ok(), "fork failed: {}", result.message());
+
+        // Verify child inherited provider+model in DB
+        let db = d.kernel_db().lock().unwrap();
+        let child = db.find_context_by_label(d.kernel_id(), "child").unwrap().unwrap();
+        assert_eq!(child.provider.as_deref(), Some("mock"), "child should inherit parent provider");
+        assert_eq!(child.model.as_deref(), Some("mock-model"), "child should inherit parent model");
+    }
+
+    #[tokio::test]
+    async fn fork_model_flag_overrides_parent() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("parent"), None, principal).await;
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+
+        register_mock_provider(&d).await;
+        configure_context_model(&d, source, "mock", "mock-model").await;
+
+        let c = caller_with_context(source);
+        let result = d.dispatch(
+            &[s("fork"), s("--name"), s("override"), s("--model"), s("mock/custom-model")],
+            &c,
+        ).await;
+        assert!(result.is_ok(), "fork failed: {}", result.message());
+
+        // Verify child has overridden model in DB
+        let db = d.kernel_db().lock().unwrap();
+        let child = db.find_context_by_label(d.kernel_id(), "override").unwrap().unwrap();
+        assert_eq!(child.provider.as_deref(), Some("mock"));
+        assert_eq!(child.model.as_deref(), Some("custom-model"));
+
+        // And in DriftRouter
+        drop(db);
+        let drift = d.drift_router().read().await;
+        let handle = drift.get(child.context_id).expect("child should be in DriftRouter");
+        assert_eq!(handle.provider.as_deref(), Some("mock"));
+        assert_eq!(handle.model.as_deref(), Some("custom-model"));
+    }
+
+    #[tokio::test]
+    async fn fork_invalid_provider_errors() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("parent"), None, principal).await;
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+
+        let c = caller_with_context(source);
+        let result = d.dispatch(
+            &[s("fork"), s("--name"), s("bad"), s("--model"), s("nonexistent/foo")],
+            &c,
+        ).await;
+        assert!(!result.is_ok(), "should have failed: {}", result.message());
+        assert!(
+            result.message().contains("unknown provider"),
+            "expected 'unknown provider' error, got: {}",
+            result.message()
+        );
+
+        // Verify no context was created (mutation didn't happen)
+        let db = d.kernel_db().lock().unwrap();
+        let found = db.find_context_by_label(d.kernel_id(), "bad").unwrap();
+        assert!(found.is_none(), "no context should have been created for invalid provider");
     }
 
     #[tokio::test]

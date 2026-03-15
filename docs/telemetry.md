@@ -71,7 +71,7 @@ Sync methods use `span.entered()` guards.
 |----------|---------|
 | Execution | `execute`, `execute_tool`, `shell_execute`, `prompt` |
 | Context | `create_context`, `join_context`, `list_contexts`, `get_context_id` |
-| Fork/Thread | `fork`, `thread`, `fork_from_version`, `cherry_pick_block` |
+| Fork/Thread | `fork`, `thread`, `cherry_pick_block` |
 | Document | `attach_document`, `detach_document`, `push_ops`, `get_document_state`, `get_document_history`, `compact_document` |
 | Drift | `drift_push`, `drift_pull`, `drift_merge`, `drift_flush`, `drift_queue`, `drift_cancel` |
 | MCP | `register_mcp`, `unregister_mcp`, `list_mcp_servers`, `call_mcp_tool`, `list_mcp_resources`, `read_mcp_resource` |
@@ -211,7 +211,7 @@ operation touching that context creates a span under the context's trace via
 in context X" in Jaeger/Grafana.
 
 **Instrumented RPC methods:** join_context, push_ops, get_document_state,
-shell_execute, drift_push/pull/merge/flush, fork_from_version, cherry_pick_block,
+shell_execute, drift_push/pull/merge/flush, cherry_pick_block,
 get_document_history, compact_document.
 
 The `trace_id` is exposed on the wire via `ContextHandleInfo.traceId` and parsed
