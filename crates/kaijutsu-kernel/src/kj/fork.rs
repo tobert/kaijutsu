@@ -37,15 +37,18 @@ impl KjDispatcher {
 
         match model_spec {
             Some(spec) => {
-                let (provider, model) = parse_model_spec(&spec);
-                // Validate provider exists in LlmRegistry
+                let (mut provider, model) = parse_model_spec(&spec);
+                let registry = self.kernel().llm().read().await;
                 if let Some(ref p) = provider {
-                    let registry = self.kernel().llm().read().await;
+                    // Explicit provider — validate it exists
                     if registry.get(p).is_none() {
-                        return Err(format!(
-                            "unknown provider '{}'",
-                            p,
-                        ));
+                        return Err(format!("unknown provider '{p}'"));
+                    }
+                } else if let Some(ref m) = model {
+                    // Bare model name — resolve provider from registry
+                    match registry.default_provider_name() {
+                        Some(p) => provider = Some(p.to_string()),
+                        None => return Err(format!("no provider configured for model '{m}'")),
                     }
                 }
                 Ok(ResolvedModel {
@@ -148,7 +151,7 @@ impl KjDispatcher {
 
             // Copy shell config + env vars from source
             if let Err(e) = db.fork_context_config(source_id, new_id) {
-                tracing::warn!("failed to copy context config on fork: {e}");
+                return KjResult::Err(format!("kj fork: failed to copy context config: {e}"));
             }
 
             // Apply --pwd override
@@ -162,7 +165,7 @@ impl KjDispatcher {
                     updated_at: kaijutsu_types::now_millis() as i64,
                 };
                 if let Err(e) = db.upsert_context_shell(&shell) {
-                    tracing::warn!("failed to set --pwd on fork: {e}");
+                    return KjResult::Err(format!("kj fork: failed to set --pwd: {e}"));
                 }
             }
 
@@ -176,18 +179,29 @@ impl KjDispatcher {
                 created_at: kaijutsu_types::now_millis() as i64,
             };
             if let Err(e) = db.insert_edge(&edge) {
-                tracing::warn!("failed to insert fork edge: {e}");
+                return KjResult::Err(format!("kj fork: failed to insert structural edge: {e}"));
             }
         }
 
         // Register in DriftRouter (inherits parent's model)
         {
             let mut drift = self.drift_router().write().await;
-            drift.register_fork(new_id, label.as_deref(), source_id, caller.principal_id);
+            if let Err(e) = drift.register_fork(new_id, label.as_deref(), source_id, caller.principal_id) {
+                return KjResult::Err(format!("kj fork: parent context not in router: {e}"));
+            }
             // If --model was explicit, override the inherited model
             if resolved.explicit {
-                if let (Some(p), Some(m)) = (&resolved.provider, &resolved.model) {
-                    let _ = drift.configure_llm(new_id, p, m);
+                match (&resolved.provider, &resolved.model) {
+                    (Some(p), Some(m)) => {
+                        if let Err(e) = drift.configure_llm(new_id, p, m) {
+                            return KjResult::Err(format!("kj fork: failed to configure model: {e}"));
+                        }
+                    }
+                    _ => {
+                        return KjResult::Err(
+                            "kj fork: --model resolved without both provider and model".to_string()
+                        );
+                    }
                 }
             }
         }
@@ -195,14 +209,14 @@ impl KjDispatcher {
         // Apply preset if requested
         if let Some(ref preset) = preset_label {
             if let Err(e) = self.apply_preset(new_id, preset).await {
-                tracing::warn!("failed to apply preset '{}': {e}", preset);
+                return KjResult::Err(format!("kj fork: failed to apply preset '{preset}': {e}"));
             }
         }
 
         // If --prompt given, inject a Drift block
         if let Some(note) = prompt {
             if let Err(e) = self.inject_fork_note(new_id, caller, &note) {
-                tracing::warn!("failed to inject fork note: {e}");
+                return KjResult::Err(format!("kj fork: failed to inject fork note: {e}"));
             }
         }
 
@@ -210,7 +224,7 @@ impl KjDispatcher {
         let display = label
             .as_deref()
             .unwrap_or(&short);
-        KjResult::ok(format!("forked to '{}' ({})", display, new_id.short()))
+        KjResult::Switch(new_id, format!("forked to '{}' ({})", display, new_id.short()))
     }
 
     async fn fork_shallow(&self, argv: &[String], caller: &KjCaller) -> KjResult {
@@ -281,7 +295,7 @@ impl KjDispatcher {
             }
 
             if let Err(e) = db.fork_context_config(source_id, new_id) {
-                tracing::warn!("failed to copy context config on shallow fork: {e}");
+                return KjResult::Err(format!("kj fork --shallow: failed to copy context config: {e}"));
             }
 
             if let Some(ref pwd) = pwd_override {
@@ -294,7 +308,7 @@ impl KjDispatcher {
                     updated_at: kaijutsu_types::now_millis() as i64,
                 };
                 if let Err(e) = db.upsert_context_shell(&shell) {
-                    tracing::warn!("failed to set --pwd on shallow fork: {e}");
+                    return KjResult::Err(format!("kj fork --shallow: failed to set --pwd: {e}"));
                 }
             }
 
@@ -307,35 +321,46 @@ impl KjDispatcher {
                 created_at: kaijutsu_types::now_millis() as i64,
             };
             if let Err(e) = db.insert_edge(&edge) {
-                tracing::warn!("failed to insert fork edge: {e}");
+                return KjResult::Err(format!("kj fork --shallow: failed to insert structural edge: {e}"));
             }
         }
 
         {
             let mut drift = self.drift_router().write().await;
-            drift.register_fork(new_id, label.as_deref(), source_id, caller.principal_id);
+            if let Err(e) = drift.register_fork(new_id, label.as_deref(), source_id, caller.principal_id) {
+                return KjResult::Err(format!("kj fork --shallow: parent context not in router: {e}"));
+            }
             if resolved.explicit {
-                if let (Some(p), Some(m)) = (&resolved.provider, &resolved.model) {
-                    let _ = drift.configure_llm(new_id, p, m);
+                match (&resolved.provider, &resolved.model) {
+                    (Some(p), Some(m)) => {
+                        if let Err(e) = drift.configure_llm(new_id, p, m) {
+                            return KjResult::Err(format!("kj fork --shallow: failed to configure model: {e}"));
+                        }
+                    }
+                    _ => {
+                        return KjResult::Err(
+                            "kj fork --shallow: --model resolved without both provider and model".to_string()
+                        );
+                    }
                 }
             }
         }
 
         if let Some(ref preset) = preset_label {
             if let Err(e) = self.apply_preset(new_id, preset).await {
-                tracing::warn!("failed to apply preset '{}': {e}", preset);
+                return KjResult::Err(format!("kj fork --shallow: failed to apply preset '{preset}': {e}"));
             }
         }
 
         if let Some(note) = prompt {
             if let Err(e) = self.inject_fork_note(new_id, caller, &note) {
-                tracing::warn!("failed to inject fork note: {e}");
+                return KjResult::Err(format!("kj fork --shallow: failed to inject fork note: {e}"));
             }
         }
 
         let short = new_id.short();
         let display = label.as_deref().unwrap_or(&short);
-        KjResult::ok(format!("shallow-forked to '{}' ({}, depth {})", display, new_id.short(), depth))
+        KjResult::Switch(new_id, format!("shallow-forked to '{}' ({}, depth {})", display, new_id.short(), depth))
     }
 
     async fn fork_compact(&self, argv: &[String], caller: &KjCaller) -> KjResult {
@@ -428,7 +453,7 @@ impl KjDispatcher {
             }
 
             if let Err(e) = db.fork_context_config(source_id, new_id) {
-                tracing::warn!("failed to copy context config on compact fork: {e}");
+                return KjResult::Err(format!("kj fork --compact: failed to copy context config: {e}"));
             }
 
             if let Some(ref pwd) = pwd_override {
@@ -441,7 +466,7 @@ impl KjDispatcher {
                     updated_at: kaijutsu_types::now_millis() as i64,
                 };
                 if let Err(e) = db.upsert_context_shell(&shell) {
-                    tracing::warn!("failed to set --pwd on compact fork: {e}");
+                    return KjResult::Err(format!("kj fork --compact: failed to set --pwd: {e}"));
                 }
             }
 
@@ -454,23 +479,34 @@ impl KjDispatcher {
                 created_at: kaijutsu_types::now_millis() as i64,
             };
             if let Err(e) = db.insert_edge(&edge) {
-                tracing::warn!("failed to insert compact fork edge: {e}");
+                return KjResult::Err(format!("kj fork --compact: failed to insert structural edge: {e}"));
             }
         }
 
         {
             let mut drift = self.drift_router().write().await;
-            drift.register_fork(new_id, label.as_deref(), source_id, caller.principal_id);
+            if let Err(e) = drift.register_fork(new_id, label.as_deref(), source_id, caller.principal_id) {
+                return KjResult::Err(format!("kj fork --compact: parent context not in router: {e}"));
+            }
             if resolved.explicit {
-                if let (Some(p), Some(m)) = (&resolved.provider, &resolved.model) {
-                    let _ = drift.configure_llm(new_id, p, m);
+                match (&resolved.provider, &resolved.model) {
+                    (Some(p), Some(m)) => {
+                        if let Err(e) = drift.configure_llm(new_id, p, m) {
+                            return KjResult::Err(format!("kj fork --compact: failed to configure model: {e}"));
+                        }
+                    }
+                    _ => {
+                        return KjResult::Err(
+                            "kj fork --compact: --model resolved without both provider and model".to_string()
+                        );
+                    }
                 }
             }
         }
 
         let short = new_id.short();
         let display = label.as_deref().unwrap_or(&short);
-        KjResult::ok(format!("compact-forked to '{}' ({})", display, new_id.short()))
+        KjResult::Switch(new_id, format!("compact-forked to '{}' ({})", display, new_id.short()))
     }
 
     async fn fork_subtree(&self, argv: &[String], caller: &KjCaller) -> KjResult {
@@ -578,7 +614,7 @@ impl KjDispatcher {
 
                 // Copy shell config + env vars from template context
                 if let Err(e) = db.fork_context_config(row.context_id, new_id) {
-                    tracing::warn!("failed to copy context config for subtree fork: {e}");
+                    return KjResult::Err(format!("kj fork --as: failed to copy context config: {e}"));
                 }
 
                 // Create empty document for each new context
@@ -587,7 +623,7 @@ impl KjDispatcher {
                     crate::DocumentKind::Conversation,
                     None,
                 ) {
-                    tracing::warn!("failed to create document for subtree fork: {e}");
+                    return KjResult::Err(format!("kj fork --as: failed to create document: {e}"));
                 }
             }
 
@@ -597,20 +633,22 @@ impl KjDispatcher {
                 let new_parent = id_map[&old_parent];
 
                 // Get template's structural children
-                if let Ok(children) = db.structural_children(old_parent) {
-                    for child in children {
-                        if let Some(&new_child) = id_map.get(&child.context_id) {
-                            let edge = ContextEdgeRow {
-                                edge_id: uuid::Uuid::now_v7(),
-                                source_id: new_parent,
-                                target_id: new_child,
-                                kind: EdgeKind::Structural,
-                                metadata: None,
-                                created_at: kaijutsu_types::now_millis() as i64,
-                            };
-                            if let Err(e) = db.insert_edge(&edge) {
-                                tracing::warn!("failed to insert subtree edge: {e}");
-                            }
+                let children = match db.structural_children(old_parent) {
+                    Ok(c) => c,
+                    Err(e) => return KjResult::Err(format!("kj fork --as: failed to read template edges: {e}")),
+                };
+                for child in children {
+                    if let Some(&new_child) = id_map.get(&child.context_id) {
+                        let edge = ContextEdgeRow {
+                            edge_id: uuid::Uuid::now_v7(),
+                            source_id: new_parent,
+                            target_id: new_child,
+                            kind: EdgeKind::Structural,
+                            metadata: None,
+                            created_at: kaijutsu_types::now_millis() as i64,
+                        };
+                        if let Err(e) = db.insert_edge(&edge) {
+                            return KjResult::Err(format!("kj fork --as: failed to insert subtree edge: {e}"));
                         }
                     }
                 }
@@ -626,7 +664,7 @@ impl KjDispatcher {
                 created_at: kaijutsu_types::now_millis() as i64,
             };
             if let Err(e) = db.insert_edge(&root_edge) {
-                tracing::warn!("failed to insert subtree root edge: {e}");
+                return KjResult::Err(format!("kj fork --as: failed to insert root edge: {e}"));
             }
         }
 
@@ -645,7 +683,9 @@ impl KjDispatcher {
                     .and_then(|fid| id_map.get(&fid).copied())
                     .or(Some(caller.context_id));
                 if let Some(parent) = forked_from {
-                    drift.register_fork(new_id, label, parent, caller.principal_id);
+                    if let Err(e) = drift.register_fork(new_id, label, parent, caller.principal_id) {
+                        return KjResult::Err(format!("kj fork --as: parent context not in router: {e}"));
+                    }
                 } else {
                     drift.register(new_id, label, None, caller.principal_id);
                 }
@@ -986,6 +1026,69 @@ mod tests {
         let db = d.kernel_db().lock().unwrap();
         let found = db.find_context_by_label(d.kernel_id(), "bad").unwrap();
         assert!(found.is_none(), "no context should have been created for invalid provider");
+    }
+
+    /// Bare model name (no provider/ prefix) should resolve provider from registry.
+    /// This is the bug that caused `kj fork --model claude-sonnet-4-6` to silently
+    /// keep the parent's model.
+    #[tokio::test]
+    async fn fork_bare_model_resolves_provider() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("parent"), None, principal).await;
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+
+        register_mock_provider(&d).await;
+        // Set mock as default so bare model names resolve to it
+        {
+            let mut registry = d.kernel().llm().write().await;
+            registry.set_default("mock");
+        }
+        configure_context_model(&d, source, "mock", "old-model").await;
+
+        let c = caller_with_context(source);
+        // Bare model name — no "mock/" prefix
+        let result = d.dispatch(
+            &[s("fork"), s("--name"), s("bare"), s("--model"), s("new-model")],
+            &c,
+        ).await;
+        assert!(result.is_ok(), "fork failed: {}", result.message());
+
+        // Verify provider was resolved from registry default
+        let db = d.kernel_db().lock().unwrap();
+        let child = db.find_context_by_label(d.kernel_id(), "bare").unwrap().unwrap();
+        assert_eq!(child.provider.as_deref(), Some("mock"), "provider should be resolved from registry");
+        assert_eq!(child.model.as_deref(), Some("new-model"));
+
+        // And in DriftRouter
+        drop(db);
+        let drift = d.drift_router().read().await;
+        let handle = drift.get(child.context_id).expect("child should be in DriftRouter");
+        assert_eq!(handle.provider.as_deref(), Some("mock"), "DriftRouter provider should match");
+        assert_eq!(handle.model.as_deref(), Some("new-model"), "DriftRouter model should match");
+    }
+
+    /// Fork should return Switch so the session moves to the new context.
+    #[tokio::test]
+    async fn fork_returns_switch() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("parent"), None, principal).await;
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+
+        let c = caller_with_context(source);
+        let result = d.dispatch(&[s("fork"), s("--name"), s("child")], &c).await;
+        match &result {
+            super::super::KjResult::Switch(id, msg) => {
+                assert_ne!(*id, source, "should switch to new context, not stay on source");
+                assert!(msg.contains("child"), "msg: {msg}");
+            }
+            other => panic!("expected Switch, got: {}", other.message()),
+        }
     }
 
     #[tokio::test]

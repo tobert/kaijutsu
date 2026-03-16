@@ -201,6 +201,7 @@ impl DriftRouter {
     /// Register a forked context, inheriting provider/model from the parent.
     ///
     /// Model is immutable on a context after creation — fork to change it.
+    /// Returns an error if the parent context is not registered.
     #[tracing::instrument(skip(self), name = "drift.register_fork")]
     pub fn register_fork(
         &mut self,
@@ -208,17 +209,18 @@ impl DriftRouter {
         label: Option<&str>,
         forked_from: ContextId,
         created_by: PrincipalId,
-    ) {
+    ) -> Result<(), DriftError> {
+        let parent = self.contexts.get(&forked_from)
+            .ok_or_else(|| DriftError::UnknownContext(forked_from.short()))?;
+
+        // Inherit parent's provider/model/tool_filter (COW semantics — snapshot at fork time)
+        let parent_provider = parent.provider.clone();
+        let parent_model = parent.model.clone();
+        let parent_tool_filter = parent.tool_filter.clone();
+
         if let Some(l) = label {
             self.label_to_id.insert(l.to_string(), id);
         }
-
-        // Inherit parent's provider/model/tool_filter (COW semantics — snapshot at fork time)
-        let (parent_provider, parent_model, parent_tool_filter) = self
-            .contexts
-            .get(&forked_from)
-            .map(|h| (h.provider.clone(), h.model.clone(), h.tool_filter.clone()))
-            .unwrap_or((None, None, None));
 
         let handle = ContextHandle {
             id,
@@ -234,6 +236,7 @@ impl DriftRouter {
         };
 
         self.contexts.insert(id, handle);
+        Ok(())
     }
 
     /// Unregister a context (e.g., when a context is destroyed).
@@ -686,7 +689,7 @@ mod tests {
             .unwrap();
 
         let child_id = ContextId::new();
-        router.register_fork(child_id, Some("child"), parent_id, PrincipalId::system());
+        router.register_fork(child_id, Some("child"), parent_id, PrincipalId::system()).unwrap();
 
         let child = router.get(child_id).unwrap();
         assert_eq!(child.provider.as_deref(), Some("anthropic"));
@@ -702,12 +705,21 @@ mod tests {
         // Parent has no model set
 
         let child_id = ContextId::new();
-        router.register_fork(child_id, None, parent_id, PrincipalId::system());
+        router.register_fork(child_id, None, parent_id, PrincipalId::system()).unwrap();
 
         let child = router.get(child_id).unwrap();
         assert_eq!(child.provider, None);
         assert_eq!(child.model, None);
         assert_eq!(child.forked_from, Some(parent_id));
+    }
+
+    #[test]
+    fn test_register_fork_missing_parent_errors() {
+        let mut router = DriftRouter::new();
+        let missing_parent = ContextId::new();
+        let child_id = ContextId::new();
+        let result = router.register_fork(child_id, Some("orphan"), missing_parent, PrincipalId::system());
+        assert!(result.is_err(), "should error when parent is not registered");
     }
 
     #[test]
