@@ -982,6 +982,14 @@ impl BlockStore {
         let mut entry = self.get_mut(context_id).ok_or(BlockStoreError::DocumentNotFound(context_id))?;
         entry.doc.set_ephemeral(block_id, ephemeral)?;
         entry.touch(self.agent_id());
+        drop(entry);
+
+        self.emit(BlockFlow::MetadataChanged {
+            context_id,
+            block_id: *block_id,
+            source: OpSource::Local,
+        });
+
         Ok(())
     }
 

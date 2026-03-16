@@ -700,8 +700,9 @@ impl BlockStore {
 
     /// Set the ephemeral flag on a block.
     pub fn set_ephemeral(&mut self, id: &BlockId, ephemeral: bool) -> Result<()> {
+        let ts = self.tick();
         let block = self.blocks.get_mut(id).ok_or(CrdtError::BlockNotFound(*id))?;
-        block.set_ephemeral(ephemeral);
+        block.set_ephemeral(ephemeral, ts);
         self.version += 1;
         Ok(())
     }

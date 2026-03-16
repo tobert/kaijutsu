@@ -363,8 +363,10 @@ impl BlockContent {
         self.ephemeral
     }
 
-    pub fn set_ephemeral(&mut self, val: bool) {
+    pub fn set_ephemeral(&mut self, val: bool, lamport_ts: u64) {
         self.ephemeral = val;
+        self.header.ephemeral = val;
+        self.header.updated_at = lamport_ts;
     }
 
     // ── Sync ────────────────────────────────────────────────────────────
@@ -440,6 +442,7 @@ impl BlockContent {
             self.header.exit_code = remote.exit_code;
             self.header.is_error = remote.is_error;
             self.ephemeral = remote.ephemeral;
+            self.header.ephemeral = remote.ephemeral;
         }
     }
 }
