@@ -162,6 +162,10 @@ struct BlockSnapshot {
 
   # MIME content type hint (e.g. "text/markdown", "image/svg+xml")
   contentType @24 :Text;      # Optional — consumers fall back to heuristic detection
+
+  # Ephemeral blocks are displayed but excluded from LLM hydration.
+  # Use for human-only output (help text, status info) that wastes model context.
+  ephemeral @25 :Bool;
 }
 
 # Operations on block documents

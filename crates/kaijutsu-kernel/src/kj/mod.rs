@@ -54,6 +54,8 @@ pub enum KjResult {
     Ok {
         message: String,
         content_type: Option<String>,
+        /// When true, the output is for humans only — excluded from LLM context.
+        ephemeral: bool,
     },
     /// Error — exit 1, stderr content.
     Err(String),
@@ -90,12 +92,17 @@ impl KjResult {
 
     /// Convenience: create a plain text Ok result.
     pub fn ok(msg: impl Into<String>) -> Self {
-        KjResult::Ok { message: msg.into(), content_type: None }
+        KjResult::Ok { message: msg.into(), content_type: None, ephemeral: false }
     }
 
     /// Convenience: create an Ok result with a content type hint.
     pub fn ok_typed(msg: impl Into<String>, ct: impl Into<String>) -> Self {
-        KjResult::Ok { message: msg.into(), content_type: Some(ct.into()) }
+        KjResult::Ok { message: msg.into(), content_type: Some(ct.into()), ephemeral: false }
+    }
+
+    /// Convenience: create an ephemeral Ok result (excluded from LLM hydration).
+    pub fn ok_ephemeral(msg: impl Into<String>, ct: impl Into<String>) -> Self {
+        KjResult::Ok { message: msg.into(), content_type: Some(ct.into()), ephemeral: true }
     }
 }
 
@@ -146,7 +153,7 @@ impl KjDispatcher {
             "drift" => self.dispatch_drift(&argv[1..], caller).await,
             "preset" => self.dispatch_preset(&argv[1..], caller),
             "workspace" | "ws" => self.dispatch_workspace(&argv[1..], caller),
-            "help" | "--help" | "-h" => KjResult::ok_typed(self.help(), "text/markdown"),
+            "help" | "--help" | "-h" => KjResult::ok_ephemeral(self.help(), "text/markdown"),
             other => KjResult::Err(format!("kj: unknown command '{}'\n\n{}", other, self.help())),
         }
     }

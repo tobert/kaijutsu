@@ -139,6 +139,9 @@ pub fn sync_block_cell_buffers(
         // Rich content rendering for Text blocks from Model or Tool roles (markdown, sparklines, SVG)
         let is_rich_candidate = block.kind == kaijutsu_crdt::BlockKind::Text
             && matches!(block.role, kaijutsu_crdt::Role::Model | kaijutsu_crdt::Role::Tool);
+        // ToolResult blocks with an explicit content_type (e.g. text/markdown from `kj help`)
+        let is_typed_result = block.kind == kaijutsu_crdt::BlockKind::ToolResult
+            && block.content_type.is_some();
         // Rich content for ToolResult blocks with structured OutputData
         let is_output_candidate = block.kind == kaijutsu_crdt::BlockKind::ToolResult
             && block.output.is_some()
@@ -152,6 +155,14 @@ pub fn sync_block_cell_buffers(
                 if is_sparkline {
                     vello_text.value = String::new();
                 }
+                vello_text.style.brush = bevy_color_to_brush(Color::NONE);
+                commands.entity(entity).insert(rich);
+                actually_rich = true;
+                block_cell.is_rich = true;
+            }
+        }
+        if !actually_rich && is_typed_result {
+            if let Some(rich) = crate::text::rich::detect_rich_content_typed(&text, doc_version, block.content_type.as_deref()) {
                 vello_text.style.brush = bevy_color_to_brush(Color::NONE);
                 commands.entity(entity).insert(rich);
                 actually_rich = true;

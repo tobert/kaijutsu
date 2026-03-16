@@ -964,6 +964,7 @@ pub fn hydrate_from_blocks(blocks: &[kaijutsu_types::BlockSnapshot]) -> Vec<Mess
     for block in blocks {
         // Skip blocks that shouldn't appear in LLM history
         if block.compacted { continue; }
+        if block.ephemeral { continue; }
         if matches!(block.kind, BlockKind::Thinking | BlockKind::File) {
             continue;
         }

@@ -972,6 +972,19 @@ impl BlockStore {
     /// Output data provides formatting information (tables, trees) for richer output.
     /// Emits `OutputChanged` flow event. Also piggybacked on `StatusChanged` for
     /// wire compat — see `set_status`.
+    /// Set the ephemeral flag on a block (excluded from LLM hydration).
+    pub fn set_ephemeral(
+        &self,
+        context_id: ContextId,
+        block_id: &BlockId,
+        ephemeral: bool,
+    ) -> BlockStoreResult<()> {
+        let mut entry = self.get_mut(context_id).ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+        entry.doc.set_ephemeral(block_id, ephemeral)?;
+        entry.touch(self.agent_id());
+        Ok(())
+    }
+
     /// Set the content_type hint on a block (e.g., "text/markdown", "image/svg+xml").
     pub fn set_content_type(
         &self,

@@ -67,7 +67,7 @@ impl KjDispatcher {
 
     pub(crate) async fn dispatch_fork(&self, argv: &[String], caller: &KjCaller) -> KjResult {
         if has_flag(argv, &["help", "--help", "-h"]) {
-            return KjResult::ok_typed(self.fork_help(), "text/markdown");
+            return KjResult::ok_ephemeral(self.fork_help(), "text/markdown");
         }
 
         if has_flag(argv, &["--shallow"]) {

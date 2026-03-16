@@ -21,7 +21,7 @@ impl KjDispatcher {
             "queue" | "q" => self.drift_queue().await,
             "cancel" => self.drift_cancel(argv).await,
             "history" => self.drift_history(argv, caller),
-            "help" | "--help" | "-h" => KjResult::ok_typed(self.drift_help(), "text/markdown"),
+            "help" | "--help" | "-h" => KjResult::ok_ephemeral(self.drift_help(), "text/markdown"),
             other => KjResult::Err(format!(
                 "kj drift: unknown subcommand '{}'\n\n{}",
                 other,

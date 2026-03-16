@@ -18,7 +18,7 @@ impl KjDispatcher {
             "show" => self.preset_show(argv),
             "save" => self.preset_save(argv, caller),
             "remove" | "rm" => self.preset_remove(argv, caller),
-            "help" | "--help" | "-h" => KjResult::ok_typed(self.preset_help(), "text/markdown"),
+            "help" | "--help" | "-h" => KjResult::ok_ephemeral(self.preset_help(), "text/markdown"),
             other => KjResult::Err(format!(
                 "kj preset: unknown subcommand '{}'\n\n{}",
                 other,

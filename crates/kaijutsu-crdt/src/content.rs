@@ -90,6 +90,9 @@ pub struct BlockContent {
     /// Whether this block is collapsed (only meaningful for Thinking blocks).
     collapsed: bool,
 
+    /// Ephemeral blocks are displayed but excluded from LLM hydration.
+    ephemeral: bool,
+
     /// Whether this block has been deleted (tombstone).
     deleted: bool,
 }
@@ -122,6 +125,7 @@ impl BlockContent {
             file_path: None,
             content_type: None,
             collapsed: false,
+            ephemeral: false,
             deleted: false,
         }
     }
@@ -163,6 +167,7 @@ impl BlockContent {
         block.file_path = snap.file_path.clone();
         block.content_type = snap.content_type.clone();
         block.collapsed = snap.collapsed;
+        block.ephemeral = snap.ephemeral;
         block
     }
 
@@ -197,6 +202,7 @@ impl BlockContent {
             file_path: snap.file_path.clone(),
             content_type: snap.content_type.clone(),
             collapsed: snap.collapsed,
+            ephemeral: snap.ephemeral,
             deleted: false,
         };
         block
@@ -353,6 +359,14 @@ impl BlockContent {
         self.content_type = ct;
     }
 
+    pub fn ephemeral(&self) -> bool {
+        self.ephemeral
+    }
+
+    pub fn set_ephemeral(&mut self, val: bool) {
+        self.ephemeral = val;
+    }
+
     // ── Sync ────────────────────────────────────────────────────────────
 
     /// Get operations since a frontier (per-block sync).
@@ -392,6 +406,7 @@ impl BlockContent {
             content: self.text(),
             collapsed: self.collapsed,
             compacted: self.header.compacted,
+            ephemeral: self.ephemeral,
             created_at: self.header.created_at,
             tool_kind: self.header.tool_kind,
             tool_name: self.tool_name.clone(),
@@ -424,6 +439,7 @@ impl BlockContent {
             self.header.tool_kind = remote.tool_kind;
             self.header.exit_code = remote.exit_code;
             self.header.is_error = remote.is_error;
+            self.ephemeral = remote.ephemeral;
         }
     }
 }

@@ -374,6 +374,7 @@ impl BlockDocument {
             content,
             collapsed,
             compacted,
+            ephemeral: false, // Legacy document predates ephemeral
             created_at,
             tool_kind,
             tool_name,

@@ -138,6 +138,8 @@ pub struct BlockHeader {
     pub compacted: bool,
     /// Whether this block is collapsed (mutable, LWW via `updated_at`).
     pub collapsed: bool,
+    /// Ephemeral blocks are displayed but excluded from LLM hydration.
+    pub ephemeral: bool,
     pub created_at: u64,
     /// Lamport timestamp for LWW conflict resolution on mutable fields
     /// (status, collapsed). Highest `updated_at` wins, `agent_id` tiebreaks.
@@ -162,6 +164,7 @@ impl BlockHeader {
             status: snap.status,
             compacted: snap.compacted,
             collapsed: snap.collapsed,
+            ephemeral: snap.ephemeral,
             created_at: snap.created_at,
             updated_at: 0, // Lamport default: no local mutations yet
             tool_kind: snap.tool_kind,
@@ -488,6 +491,10 @@ pub struct BlockSnapshot {
     /// Compacted blocks are retained for history but excluded from active views.
     #[serde(default)]
     pub compacted: bool,
+    /// Ephemeral blocks are displayed but excluded from LLM hydration.
+    /// Use for human-only output (help text, status info) that wastes model context.
+    #[serde(default)]
+    pub ephemeral: bool,
     /// Timestamp when block was created (Unix millis).
     pub created_at: u64,
 
@@ -585,6 +592,7 @@ impl BlockSnapshot {
             content: content.into(),
             collapsed: false,
             compacted: false,
+            ephemeral: false,
             created_at: crate::now_millis(),
             tool_kind: None,
             tool_name: None,
@@ -622,6 +630,7 @@ impl BlockSnapshot {
             content: content.into(),
             collapsed: false,
             compacted: false,
+            ephemeral: false,
             created_at: crate::now_millis(),
             tool_kind: None,
             tool_name: None,
@@ -667,6 +676,7 @@ impl BlockSnapshot {
             content: input_json.clone(),
             collapsed: false,
             compacted: false,
+            ephemeral: false,
             created_at: crate::now_millis(),
             tool_kind: Some(tool_kind),
             tool_name: Some(tool_name.into()),
@@ -708,6 +718,7 @@ impl BlockSnapshot {
             content: content.into(),
             collapsed: false,
             compacted: false,
+            ephemeral: false,
             created_at: crate::now_millis(),
             tool_kind: Some(tool_kind),
             tool_name: None,
@@ -753,6 +764,7 @@ impl BlockSnapshot {
             content: content.into(),
             collapsed: false,
             compacted: false,
+            ephemeral: false,
             created_at: crate::now_millis(),
             tool_kind: Some(tool_kind),
             tool_name: None,
@@ -793,6 +805,7 @@ impl BlockSnapshot {
             content: content.into(),
             collapsed: false,
             compacted: false,
+            ephemeral: false,
             created_at: crate::now_millis(),
             tool_kind: None,
             tool_name: None,
@@ -831,6 +844,7 @@ impl BlockSnapshot {
             content: content.into(),
             collapsed: false,
             compacted: false,
+            ephemeral: false,
             created_at: crate::now_millis(),
             tool_kind: None,
             tool_name: None,
@@ -882,6 +896,7 @@ impl BlockSnapshot {
             && self.content == other.content
             && self.collapsed == other.collapsed
             && self.compacted == other.compacted
+            && self.ephemeral == other.ephemeral
             && self.tool_kind == other.tool_kind
             && self.tool_name == other.tool_name
             && self.tool_input == other.tool_input
@@ -936,6 +951,7 @@ impl BlockSnapshotBuilder {
                 content: String::new(),
                 collapsed: false,
                 compacted: false,
+                ephemeral: false,
                 created_at: crate::now_millis(),
                 tool_kind: None,
                 tool_name: None,
@@ -1050,6 +1066,11 @@ impl BlockSnapshotBuilder {
 
     pub fn content_type(mut self, ct: impl Into<String>) -> Self {
         self.snap.content_type = Some(ct.into());
+        self
+    }
+
+    pub fn ephemeral(mut self, ephemeral: bool) -> Self {
+        self.snap.ephemeral = ephemeral;
         self
     }
 

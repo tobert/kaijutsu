@@ -378,6 +378,7 @@ impl BlockStore {
             status,
             compacted: false,
             collapsed: false,
+            ephemeral: false,
             created_at: now_millis(),
             updated_at: ts,
             tool_kind: None,
@@ -428,6 +429,7 @@ impl BlockStore {
             status: Status::Running,
             compacted: false,
             collapsed: false,
+            ephemeral: false,
             created_at: now,
             updated_at: ts,
             tool_kind,
@@ -477,6 +479,7 @@ impl BlockStore {
             status: if is_error { Status::Error } else { Status::Done },
             compacted: false,
             collapsed: false,
+            ephemeral: false,
             created_at: now,
             updated_at: ts,
             tool_kind,
@@ -691,6 +694,14 @@ impl BlockStore {
     pub fn set_content_type(&mut self, id: &BlockId, content_type: Option<String>) -> Result<()> {
         let block = self.blocks.get_mut(id).ok_or(CrdtError::BlockNotFound(*id))?;
         block.set_content_type(content_type);
+        self.version += 1;
+        Ok(())
+    }
+
+    /// Set the ephemeral flag on a block.
+    pub fn set_ephemeral(&mut self, id: &BlockId, ephemeral: bool) -> Result<()> {
+        let block = self.blocks.get_mut(id).ok_or(CrdtError::BlockNotFound(*id))?;
+        block.set_ephemeral(ephemeral);
         self.version += 1;
         Ok(())
     }

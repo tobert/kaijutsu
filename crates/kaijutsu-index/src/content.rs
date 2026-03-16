@@ -77,6 +77,7 @@ mod tests {
             status: Status::Done,
             content: content.to_string(),
             compacted: false,
+            ephemeral: false,
             collapsed: false,
             created_at: 0,
             tool_name: None,

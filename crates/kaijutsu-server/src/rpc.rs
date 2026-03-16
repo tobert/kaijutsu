@@ -5032,6 +5032,15 @@ async fn execute_shell_command(
                     }
                 }
 
+                // Read baggage: mark blocks ephemeral if tool signaled it
+                if result.baggage.get("kaijutsu.ephemeral").map(|v| v == "true").unwrap_or(false) {
+                    for bid in [&command_block_id_clone, &output_block_id_clone] {
+                        if let Err(e) = documents_clone.set_ephemeral(context_id, bid, true) {
+                            log::error!("Failed to set ephemeral on block: {}", e);
+                        }
+                    }
+                }
+
                 // Exit 2: latch gate (rm/trash) — confirmation message shown, not a failure
                 // Exit 3 / did_spill: output truncated to spill file — command ran, not a failure
                 let final_status = match result.code {
@@ -5672,6 +5681,9 @@ fn set_block_snapshot(
         builder.set_content_type(ct);
     }
 
+    // Set ephemeral flag
+    builder.set_ephemeral(block.ephemeral);
+
     // Set drift-specific fields if present
     if let Some(ref ctx) = block.source_context {
         builder.set_source_context(ctx.as_bytes());
@@ -5987,6 +5999,7 @@ fn parse_block_snapshot(
         content: reader.get_content()?.to_str()?.to_owned(),
         collapsed: reader.get_collapsed(),
         compacted: false,
+        ephemeral: reader.get_ephemeral(),
         created_at: reader.get_created_at(),
         tool_kind: if reader.get_has_tool_kind() {
             capnp_tool_kind_to_crdt(reader.get_tool_kind().ok())

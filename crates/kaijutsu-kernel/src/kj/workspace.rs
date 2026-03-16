@@ -20,7 +20,7 @@ impl KjDispatcher {
             "add" => self.workspace_add(argv),
             "bind" => self.workspace_bind(argv, caller),
             "remove" | "rm" => self.workspace_remove(argv, caller),
-            "help" | "--help" | "-h" => KjResult::ok_typed(self.workspace_help(), "text/markdown"),
+            "help" | "--help" | "-h" => KjResult::ok_ephemeral(self.workspace_help(), "text/markdown"),
             other => KjResult::Err(format!(
                 "kj workspace: unknown subcommand '{}'\n\n{}",
                 other,

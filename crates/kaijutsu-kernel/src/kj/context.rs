@@ -27,7 +27,7 @@ impl KjDispatcher {
             "archive" => self.context_archive(argv, caller).await,
             "remove" | "rm" => self.context_remove(argv, caller).await,
             "retag" => self.context_retag(argv, caller).await,
-            "help" | "--help" | "-h" => KjResult::ok_typed(self.context_help(), "text/markdown"),
+            "help" | "--help" | "-h" => KjResult::ok_ephemeral(self.context_help(), "text/markdown"),
             other => KjResult::Err(format!(
                 "kj context: unknown subcommand '{}'\n\n{}",
                 other,

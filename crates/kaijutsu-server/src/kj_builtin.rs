@@ -395,9 +395,12 @@ impl Tool for KjBuiltin {
         let result = self.dispatcher.dispatch(&argv, &caller).await;
 
         match result {
-            KjResult::Ok { message, content_type } => {
+            KjResult::Ok { message, content_type, ephemeral } => {
                 let mut result = ExecResult::success(message);
                 result.content_type = content_type;
+                if ephemeral {
+                    result.baggage.insert("kaijutsu.ephemeral".into(), "true".into());
+                }
                 result
             }
             KjResult::Err(msg) => ExecResult::failure(1, msg),

@@ -1948,6 +1948,11 @@ pub(crate) fn parse_block_snapshot(
         }
     }
 
+    // Ephemeral flag (human-only, excluded from LLM hydration)
+    if reader.get_ephemeral() {
+        builder = builder.ephemeral(true);
+    }
+
     Ok(builder.build())
 }
 
