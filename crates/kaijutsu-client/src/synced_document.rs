@@ -101,7 +101,8 @@ impl SyncedDocument {
             | ServerEvent::BlockMoved { context_id, .. }
             | ServerEvent::SyncReset { context_id, .. }
             | ServerEvent::InputTextOps { context_id, .. }
-            | ServerEvent::InputCleared { context_id, .. } => Some(*context_id),
+            | ServerEvent::InputCleared { context_id, .. }
+            | ServerEvent::ContextSwitched { context_id, .. } => Some(*context_id),
             ServerEvent::ResourceUpdated { .. }
             | ServerEvent::ResourceListChanged { .. } => None,
         }
@@ -369,7 +370,8 @@ impl SyncedDocument {
             ServerEvent::ResourceUpdated { .. }
             | ServerEvent::ResourceListChanged { .. }
             | ServerEvent::InputTextOps { .. }
-            | ServerEvent::InputCleared { .. } => SyncEffect::Ignored,
+            | ServerEvent::InputCleared { .. }
+            | ServerEvent::ContextSwitched { .. } => SyncEffect::Ignored,
         }
     }
 

@@ -88,6 +88,10 @@ pub enum ServerEvent {
     ResourceListChanged {
         server: String,
     },
+    /// Server-side context switch (fork, context switch command).
+    ContextSwitched {
+        context_id: ContextId,
+    },
 }
 
 /// Connection lifecycle status.
@@ -435,6 +439,28 @@ impl block_events::Server for BlockEventsForwarder {
         };
 
         let _ = self.event_tx.send(ServerEvent::InputCleared { context_id });
+        Promise::ok(())
+    }
+
+    fn on_context_switched(
+        self: Rc<Self>,
+        params: block_events::OnContextSwitchedParams,
+        _results: block_events::OnContextSwitchedResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = match params.get() {
+            Ok(p) => p,
+            Err(e) => return Promise::err(e),
+        };
+
+        let context_id = match params.get_context_id() {
+            Ok(s) => match parse_context_id_data(s) {
+                Ok(id) => id,
+                Err(e) => return Promise::err(e),
+            },
+            Err(e) => return Promise::err(e),
+        };
+
+        let _ = self.event_tx.send(ServerEvent::ContextSwitched { context_id });
         Promise::ok(())
     }
 }

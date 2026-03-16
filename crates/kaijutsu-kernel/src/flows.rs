@@ -361,6 +361,12 @@ pub enum BlockFlow {
         #[serde(default)]
         source: OpSource,
     },
+
+    /// Session context switched (server → client control).
+    ContextSwitched {
+        /// The new active context ID.
+        context_id: ContextId,
+    },
 }
 
 impl BlockFlow {
@@ -376,6 +382,7 @@ impl BlockFlow {
             Self::SyncReset { .. } => "block.sync_reset",
             Self::OutputChanged { .. } => "block.output",
             Self::MetadataChanged { .. } => "block.metadata",
+            Self::ContextSwitched { .. } => "block.context_switched",
         }
     }
 
@@ -390,7 +397,8 @@ impl BlockFlow {
             | Self::Moved { context_id, .. }
             | Self::SyncReset { context_id, .. }
             | Self::OutputChanged { context_id, .. }
-            | Self::MetadataChanged { context_id, .. } => *context_id,
+            | Self::MetadataChanged { context_id, .. }
+            | Self::ContextSwitched { context_id, .. } => *context_id,
         }
     }
 
@@ -405,7 +413,7 @@ impl BlockFlow {
             | Self::Moved { block_id, .. }
             | Self::OutputChanged { block_id, .. }
             | Self::MetadataChanged { block_id, .. } => Some(block_id),
-            Self::SyncReset { .. } => None,
+            Self::SyncReset { .. } | Self::ContextSwitched { .. } => None,
         }
     }
 
@@ -428,7 +436,7 @@ impl BlockFlow {
             | Self::Moved { source, .. }
             | Self::OutputChanged { source, .. }
             | Self::MetadataChanged { source, .. } => *source,
-            Self::SyncReset { .. } => OpSource::Local,
+            Self::SyncReset { .. } | Self::ContextSwitched { .. } => OpSource::Local,
         }
     }
 
@@ -454,6 +462,7 @@ impl BlockFlow {
             Self::SyncReset { .. } => BlockFlowKind::SyncReset,
             Self::OutputChanged { .. } => BlockFlowKind::OutputChanged,
             Self::MetadataChanged { .. } => BlockFlowKind::MetadataChanged,
+            Self::ContextSwitched { .. } => BlockFlowKind::ContextSwitched,
         }
     }
 

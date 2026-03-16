@@ -1170,6 +1170,7 @@ pub enum BlockFlowKind {
     SyncReset,
     OutputChanged,
     MetadataChanged,
+    ContextSwitched,
 }
 
 /// Server-side filter for block event subscriptions.

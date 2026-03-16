@@ -10,6 +10,7 @@ use crate::cell::{
     CachedDocument, CellEditor, ConversationScrollState, EditorEntities, LayoutGeneration,
     MainCell, ViewingConversation,
 };
+use kaijutsu_client::ServerEvent;
 use crate::connection::{RpcResultMessage, ServerEventMessage};
 
 /// Handle block events from the server, routing through DocumentCache.
@@ -398,6 +399,24 @@ pub fn handle_context_switch(
             scroll_state.target_offset = cached.scroll_offset;
             scroll_state.following = false;
             info!("Context switch complete: {} (scroll: {:.0})", ctx_id, cached.scroll_offset);
+        }
+    }
+}
+
+/// Handle server-pushed context switches (fork, kj context switch).
+///
+/// Converts `ServerEvent::ContextSwitched` into `ContextSwitchRequested`,
+/// which is handled by `handle_context_switch` above.
+pub fn handle_server_context_switch(
+    mut server_events: MessageReader<ServerEventMessage>,
+    mut switch_writer: MessageWriter<crate::cell::ContextSwitchRequested>,
+) {
+    for ServerEventMessage(event) in server_events.read() {
+        if let ServerEvent::ContextSwitched { context_id } = event {
+            info!("Server context switch → {}", context_id);
+            switch_writer.write(crate::cell::ContextSwitchRequested {
+                context_id: *context_id,
+            });
         }
     }
 }

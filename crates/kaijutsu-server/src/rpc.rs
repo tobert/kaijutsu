@@ -1578,6 +1578,14 @@ impl kernel::Server for KernelImpl {
                                     }
                                     req.send().promise.await.is_ok()
                                 }
+                                BlockFlow::ContextSwitched { context_id } => {
+                                    let mut req = callback.on_context_switched_request();
+                                    {
+                                        let mut params = req.get();
+                                        params.set_context_id(context_id.as_bytes());
+                                    }
+                                    req.send().promise.await.is_ok()
+                                }
                                 // No wire protocol for these yet — drop silently
                                 BlockFlow::OutputChanged { .. }
                                 | BlockFlow::MetadataChanged { .. } => true,
@@ -4199,6 +4207,7 @@ impl kernel::Server for KernelImpl {
                     kaijutsu_types::BlockFlowKind::SyncReset => "block.sync_reset",
                     kaijutsu_types::BlockFlowKind::OutputChanged => "block.output",
                     kaijutsu_types::BlockFlowKind::MetadataChanged => "block.metadata",
+                    kaijutsu_types::BlockFlowKind::ContextSwitched => "block.context_switched",
                 }
             } else {
                 "block.*"
@@ -4306,6 +4315,14 @@ impl kernel::Server for KernelImpl {
                                         let mut params = req.get();
                                         params.set_context_id(context_id.as_bytes());
                                         params.set_generation(generation);
+                                    }
+                                    req.send().promise.await.is_ok()
+                                }
+                                BlockFlow::ContextSwitched { context_id } => {
+                                    let mut req = callback.on_context_switched_request();
+                                    {
+                                        let mut params = req.get();
+                                        params.set_context_id(context_id.as_bytes());
                                     }
                                     req.send().promise.await.is_ok()
                                 }
@@ -4976,6 +4993,7 @@ async fn execute_shell_command(
     let documents_clone = documents.clone();
     let output_block_id_clone = output_block_id;
     let command_block_id_clone = command_block_id;
+    let block_flows = kernel_arc.block_flows().clone();
 
     tokio::task::spawn_local(async move {
         // Yield to let the event loop flush BlockInserted events to clients
@@ -5025,6 +5043,17 @@ async fn execute_shell_command(
                 }
                 if let Err(e) = documents_clone.set_status(context_id, &command_block_id_clone, final_status) {
                     log::error!("Failed to set command block status: {}", e);
+                }
+
+                // Detect context switch (kj fork, kj context switch)
+                let new_context_id = kaish.context_id();
+                if new_context_id != context_id {
+                    log::info!("shell_execute: context switched {} → {}", context_id, new_context_id);
+                    block_flows.publish(
+                        kaijutsu_kernel::flows::BlockFlow::ContextSwitched {
+                            context_id: new_context_id,
+                        },
+                    );
                 }
             }
             Err(e) => {

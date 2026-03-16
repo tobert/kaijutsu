@@ -261,6 +261,9 @@ interface BlockEvents {
   # Input document events (compose scratchpad)
   onInputTextOps @7 (contextId :Data, ops :Data);
   onInputCleared @8 (contextId :Data);
+
+  # Session control events (server → client)
+  onContextSwitched @9 (contextId :Data);
 }
 
 # ============================================================================

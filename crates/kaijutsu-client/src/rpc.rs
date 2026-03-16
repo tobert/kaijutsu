@@ -1592,7 +1592,8 @@ fn set_block_event_filter_builder(
                 kaijutsu_types::BlockFlowKind::SyncReset => crate::kaijutsu_capnp::BlockFlowKind::SyncReset,
                 // Not on wire yet — map to status as closest approximation
                 kaijutsu_types::BlockFlowKind::OutputChanged
-                | kaijutsu_types::BlockFlowKind::MetadataChanged => crate::kaijutsu_capnp::BlockFlowKind::StatusChanged,
+                | kaijutsu_types::BlockFlowKind::MetadataChanged
+                | kaijutsu_types::BlockFlowKind::ContextSwitched => crate::kaijutsu_capnp::BlockFlowKind::StatusChanged,
             });
         }
     }

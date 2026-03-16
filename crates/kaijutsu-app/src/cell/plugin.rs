@@ -98,6 +98,7 @@ impl Plugin for CellPlugin {
                 view_sync::handle_block_events,
                 view_sync::handle_input_doc_events.after(view_sync::handle_block_events),
                 view_sync::handle_context_switch.after(view_sync::handle_block_events),
+                view_sync::handle_server_context_switch.before(view_sync::handle_context_switch),
                 view_submit::handle_submit_failed
                     .after(view_sync::handle_context_switch),
                 view_sync::sync_main_cell_to_conversation
