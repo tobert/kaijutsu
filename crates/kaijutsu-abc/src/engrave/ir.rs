@@ -23,7 +23,7 @@ impl Default for EngravingOptions {
         EngravingOptions {
             staff_spacing: 10.0,
             margin: 20.0,
-            color: "white".to_string(),
+            color: "#ffffff".to_string(),
         }
     }
 }

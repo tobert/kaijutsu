@@ -172,7 +172,7 @@ mod tests {
     }
 
     #[test]
-    fn white_color_renders_white() {
+    fn custom_color_renders() {
         let elements = vec![EngravingElement::Line {
             x1: 0.0,
             y1: 0.0,
@@ -181,7 +181,7 @@ mod tests {
             width: 1.0,
             source_span: (0, 0),
         }];
-        let svg = to_svg(&elements, 10.0, "white");
-        assert!(svg.contains("stroke=\"white\""));
+        let svg = to_svg(&elements, 10.0, "#ffffff");
+        assert!(svg.contains("stroke=\"#ffffff\""));
     }
 }

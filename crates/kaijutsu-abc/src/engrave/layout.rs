@@ -229,12 +229,21 @@ pub fn engrave(tune: &Tune, options: &EngravingOptions) -> Vec<EngravingElement>
                             } else {
                                 (bot_pos, top_pos)
                             };
-                            let stem_x = cursor_x + sp * 0.65;
+                            let cp = notehead_codepoint(&chord.duration);
+                            let nw = font.glyph_advance(cp).unwrap_or(500.0) * scale;
+                            // Use average position to decide stem direction
+                            let avg_pos = (stem_top + stem_bot) / 2.0;
+                            let stem_x = if avg_pos <= 2.0 {
+                                cursor_x // left edge, stem down
+                            } else {
+                                cursor_x + nw // right edge, stem up
+                            };
+                            let stem_dir = if avg_pos <= 2.0 { 1.0 } else { -1.0 };
                             elements.push(EngravingElement::Line {
                                 x1: stem_x,
-                                y1: staff_top + stem_top * sp - sp * 1.75,
+                                y1: staff_top + stem_top * sp,
                                 x2: stem_x,
-                                y2: staff_top + stem_bot * sp,
+                                y2: staff_top + stem_bot * sp + stem_dir * sp * 3.5,
                                 width: 0.8,
                                 source_span: span,
                             });
@@ -309,6 +318,7 @@ pub fn engrave(tune: &Tune, options: &EngravingOptions) -> Vec<EngravingElement>
                                 cursor_x,
                                 staff_top,
                                 sp,
+                                scale,
                                 &note.duration,
                                 span,
                             );
@@ -395,7 +405,7 @@ fn emit_note(
     emit_ledger_lines(elements, pos, cursor_x, staff_top, sp, span);
 
     // Stem
-    emit_stem(elements, pos, cursor_x, staff_top, sp, &note.duration, span);
+    emit_stem(elements, pos, cursor_x, staff_top, sp, scale, &note.duration, span);
 
     // Flag for 8th and 16th notes
     emit_flag(elements, pos, cursor_x, staff_top, sp, scale, &note.duration, span);
@@ -494,6 +504,7 @@ fn emit_stem(
     x: f64,
     staff_top: f64,
     sp: f64,
+    scale: f64,
     duration: &Duration,
     span: SourceSpan,
 ) {
@@ -502,13 +513,17 @@ fn emit_stem(
         return; // Whole notes have no stem
     }
 
-    // Stem direction: notes above middle line go down, below go up
+    let font = font_cache();
+    let cp = notehead_codepoint(duration);
+    let notehead_width = font.glyph_advance(cp).unwrap_or(500.0) * scale;
+
+    // Stem direction: notes on or above middle line get stems down, below get stems up
     let stem_length = sp * 3.5;
     let note_y = staff_top + pos * sp;
 
     if pos <= 2.0 {
-        // Stem down (right side of notehead)
-        let stem_x = x + sp * 0.65;
+        // Stem down: hangs from left side of notehead
+        let stem_x = x;
         elements.push(EngravingElement::Line {
             x1: stem_x,
             y1: note_y,
@@ -518,8 +533,8 @@ fn emit_stem(
             source_span: span,
         });
     } else {
-        // Stem up (left side of notehead — actually right side going up)
-        let stem_x = x + sp * 0.65;
+        // Stem up: rises from right side of notehead
+        let stem_x = x + notehead_width;
         elements.push(EngravingElement::Line {
             x1: stem_x,
             y1: note_y,
@@ -562,9 +577,17 @@ fn emit_flag(
     };
 
     if let Some(cp) = flag_cp {
+        let font = font_cache();
+        let notehead_cp = notehead_codepoint(duration);
+        let notehead_width = font.glyph_advance(notehead_cp).unwrap_or(500.0) * scale;
+
         let stem_length = sp * 3.5;
         let note_y = staff_top + pos * sp;
-        let stem_x = x + sp * 0.65;
+        let stem_x = if pos <= 2.0 {
+            x // left edge for stems down
+        } else {
+            x + notehead_width // right edge for stems up
+        };
         let flag_y = if pos <= 2.0 {
             note_y + stem_length
         } else {
