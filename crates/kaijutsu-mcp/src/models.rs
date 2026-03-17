@@ -336,6 +336,18 @@ pub struct InputSubmitRequest {
 }
 
 // ============================================================================
+// Session Registration
+// ============================================================================
+
+/// Register this agent session and create a context.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RegisterSessionRequest {
+    /// Human-readable label for the context (auto-generated if omitted).
+    #[schemars(description = "Human-readable label for the context (auto-generated if omitted)")]
+    pub label: Option<String>,
+}
+
+// ============================================================================
 // Response Types
 // ============================================================================
 

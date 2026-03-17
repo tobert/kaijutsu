@@ -1888,11 +1888,10 @@ impl kernel::Server for KernelImpl {
         })
     }
 
-    /// Join a context, returning its context_id.
+    /// Join an existing context, returning its context_id.
     ///
-    /// Creates the context document if it doesn't exist. Registers in
-    /// the kernel-level drift router. The `instance` param identifies which
-    /// client connected (for logging/debugging).
+    /// The context must already exist (created via `createContext`). Returns an
+    /// error if the context doesn't exist — no auto-creation.
     fn join_context(
         self: Rc<Self>,
         params: kernel::JoinContextParams,
@@ -1908,84 +1907,32 @@ impl kernel::Server for KernelImpl {
         let kernel = self.kernel.clone();
         let connection = self.connection.clone();
 
-        // Determine parent from connection's current context before switching
-        let parent_ctx = connection.borrow().current_context_id;
-
         log::info!("join_context: context_id={} instance='{}' kernel='{}'",
             context_id, instance, kernel.id.to_hex());
 
         let span = extract_rpc_trace(params.get_trace(), "join_context");
         Promise::from_future(async move {
-            // Create the document for this context (join_context is the sole creator)
+            // Context must already exist — no auto-creation
             if !kernel.documents.contains(context_id) {
-                log::info!("Creating document for context {}", context_id);
-                if let Err(e) = kernel.documents.create_document(
-                    context_id,
-                    kaijutsu_types::DocKind::Conversation,
-                    None,
-                ) {
-                    log::error!("Failed to create document for context {}: {}", context_id, e);
-                }
-            } else {
-                log::debug!("Re-joining existing context {}", context_id);
+                return Err(capnp::Error::failed(
+                    format!("context {} does not exist — use createContext first", context_id)
+                ));
             }
+
+            log::debug!("Re-joining existing context {}", context_id);
 
             // Ensure input doc exists (idempotent)
             if let Err(e) = kernel.documents.create_input_doc(context_id) {
                 log::warn!("Failed to create input doc for context {}: {}", context_id, e);
             }
 
-            // Read LLM defaults before taking the drift write lock
-            let (default_provider, default_model) = {
-                let registry = kernel.kernel.llm().read().await;
-                (
-                    registry.default_provider_name().map(|s| s.to_string()),
-                    Some(registry.default_model()
-                        .unwrap_or(kaijutsu_kernel::DEFAULT_MODEL)
-                        .to_string()),
-                )
-            };
-
-            // Register context in kernel-level drift router (only if new)
+            // Verify context is registered in drift router
             {
-                let mut drift = kernel.kernel.drift().write().await;
+                let drift = kernel.kernel.drift().read().await;
                 if drift.get(context_id).is_none() {
-                    let created_by = connection.borrow().principal.id;
-
-                    // Write-through: KernelDb first
-                    {
-                        let db = kernel.kernel_db.lock().unwrap();
-                        if db.get_context(context_id).ok().flatten().is_none() {
-                            let row = ContextRow {
-                                context_id,
-                                kernel_id: kernel.id,
-                                label: None,
-                                provider: default_provider.clone(),
-                                model: default_model.clone(),
-                                system_prompt: None,
-                                tool_filter: None,
-                                consent_mode: kaijutsu_kernel::control::ConsentMode::Collaborative,
-                                created_at: kaijutsu_types::now_millis() as i64,
-                                created_by,
-                                forked_from: parent_ctx,
-                                fork_kind: None,
-                                archived_at: None,
-                                workspace_id: None,
-                                preset_id: None,
-                            };
-                            let default_ws = db.get_or_create_default_workspace(row.kernel_id, row.created_by)
-                        .unwrap_or_else(|_| kaijutsu_types::WorkspaceId::new());
-                if let Err(e) = db.insert_context_with_document(&row, default_ws) {
-                                log::warn!("KernelDb insert_context failed for {}: {}", context_id.short(), e);
-                            }
-                        }
-                    }
-
-                    drift.register(context_id, None, parent_ctx, created_by);
-                    if let (Some(p), Some(m)) = (&default_provider, &default_model) {
-                        let _ = drift.configure_llm(context_id, p, m);
-                    }
-                    log::info!("Registered context {} in kernel DriftRouter", context_id);
+                    return Err(capnp::Error::failed(
+                        format!("context {} not registered in drift router — use createContext first", context_id)
+                    ));
                 }
                 let trace_id = drift.get(context_id).map(|h| h.trace_id).unwrap_or([0u8; 16]);
                 let _ctx_span = kaijutsu_telemetry::context_root_span(&trace_id, "join_context").entered();

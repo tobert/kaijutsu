@@ -29,8 +29,10 @@ const DEFAULT_MAX_BLOCK_SIZE: usize = 4096;
 pub struct HookListener {
     /// Block store — shared with the MCP server.
     store: SharedBlockStore,
-    /// Context ID for the active context.
-    context_id: ContextId,
+    /// Shared context ID — updated by register_session (None until then).
+    shared_context_id: Arc<Mutex<Option<ContextId>>>,
+    /// Fixed context ID for local mode (not shared).
+    local_context_id: Option<ContextId>,
     /// Remote state for push_ops + drift (None in local mode).
     remote: Option<RemoteState>,
     /// Max content size per block.
@@ -42,11 +44,20 @@ pub struct HookListener {
 }
 
 impl HookListener {
+    /// Get the current context ID (from shared or local).
+    fn context_id(&self) -> Option<ContextId> {
+        if let Some(id) = self.local_context_id {
+            return Some(id);
+        }
+        self.shared_context_id.lock().ok().and_then(|g| *g)
+    }
+
     /// Create a listener backed by a local-only store.
     pub fn local(store: SharedBlockStore, context_id: ContextId) -> Self {
         Self {
             store,
-            context_id,
+            shared_context_id: Arc::new(Mutex::new(None)),
+            local_context_id: Some(context_id),
             remote: None,
             max_block_size: DEFAULT_MAX_BLOCK_SIZE,
             push_lock: TokioMutex::new(()),
@@ -55,14 +66,17 @@ impl HookListener {
     }
 
     /// Create a listener backed by a remote connection.
+    ///
+    /// `shared_context_id` is updated by `register_session` when a context is joined.
     pub fn remote(
         remote: RemoteState,
-        context_id: ContextId,
+        shared_context_id: Arc<Mutex<Option<ContextId>>>,
         session_id: Arc<Mutex<Option<String>>>,
     ) -> Self {
         Self {
             store: remote.store.clone(),
-            context_id,
+            shared_context_id,
+            local_context_id: None,
             remote: Some(remote),
             max_block_size: DEFAULT_MAX_BLOCK_SIZE,
             push_lock: TokioMutex::new(()),
@@ -134,8 +148,8 @@ impl HookListener {
                 status: "ok".to_string(),
                 pid: std::process::id(),
                 cwd: std::env::current_dir().ok().map(|p| p.display().to_string()),
-                context_name: Some(self.context_id.short()),
-                document_id: Some(self.context_id.to_hex()),
+                context_name: self.context_id().map(|id| id.short()),
+                document_id: self.context_id().map(|id| id.to_hex()),
                 session_id,
                 pending_drifts: pending,
             };
@@ -262,8 +276,12 @@ impl HookListener {
     // -- Block insertion helpers --
 
     fn insert_text_block(&self, role: Role, content: &str) {
+        let Some(ctx_id) = self.context_id() else {
+            tracing::debug!("Hook insert_text_block: no context yet (register_session not called)");
+            return;
+        };
         if let Err(e) = self.store.insert_block_as(
-            self.context_id,
+            ctx_id,
             None,  // parent
             None,  // after (append)
             role,
@@ -277,10 +295,14 @@ impl HookListener {
     }
 
     fn insert_tool_blocks(&self, tool: &crate::hook_types::ToolInfo, is_error: bool) {
+        let Some(ctx_id) = self.context_id() else {
+            tracing::debug!("Hook insert_tool_blocks: no context yet (register_session not called)");
+            return;
+        };
         // Insert tool call block
         let input = tool.input.clone();
         let call_id = match self.store.insert_tool_call_as(
-            self.context_id,
+            ctx_id,
             None,
             None,
             &tool.name,
@@ -306,7 +328,7 @@ impl HookListener {
         let truncated = truncate(content, self.max_block_size);
 
         if let Err(e) = self.store.insert_tool_result_as(
-            self.context_id,
+            ctx_id,
             &call_id,
             None,
             &truncated,
@@ -324,9 +346,10 @@ impl HookListener {
 
     async fn pending_drift_count(&self) -> u32 {
         let Some(ref remote) = self.remote else { return 0 };
+        let Some(ctx_id) = self.context_id() else { return 0 };
         match remote.actor.drift_queue().await {
             Ok(queue) => queue.iter()
-                .filter(|d| d.target_ctx == self.context_id)
+                .filter(|d| d.target_ctx == ctx_id)
                 .count() as u32,
             Err(_) => 0,
         }
@@ -334,6 +357,9 @@ impl HookListener {
 
     async fn maybe_inject_drift(&self) -> HookResponse {
         let Some(ref remote) = self.remote else {
+            return HookResponse::allow();
+        };
+        let Some(ctx_id) = self.context_id() else {
             return HookResponse::allow();
         };
 
@@ -344,7 +370,7 @@ impl HookListener {
         };
 
         let our_drifts: Vec<_> = queue.iter()
-            .filter(|d| d.target_ctx == self.context_id)
+            .filter(|d| d.target_ctx == ctx_id)
             .collect();
 
         if our_drifts.is_empty() {
@@ -376,13 +402,17 @@ impl HookListener {
 
 /// Push local ops to the server. Mirrors `KaijutsuMcp::push_to_server()`.
 async fn push_ops(remote: &RemoteState) -> anyhow::Result<()> {
+    let guard = remote.joined.read().await;
+    let joined = guard.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("No active context — register_session not called"))?;
+
     let frontier = {
-        let sync = remote.sync.lock()
+        let sync = joined.sync.lock()
             .map_err(|e| anyhow::anyhow!("Lock error: {e}"))?;
         sync.frontier().cloned().unwrap_or_default()
     };
 
-    let ops = remote.store.ops_since(remote.context_id, &frontier)
+    let ops = remote.store.ops_since(joined.context_id, &frontier)
         .map_err(|e| anyhow::anyhow!(e))?;
 
     // Check for empty payload before serializing
@@ -395,7 +425,7 @@ async fn push_ops(remote: &RemoteState) -> anyhow::Result<()> {
     let ops_bytes = postcard::to_allocvec(&ops)
         .map_err(|e| anyhow::anyhow!("Serialize error: {e}"))?;
 
-    remote.actor.push_ops(remote.context_id, &ops_bytes).await
+    remote.actor.push_ops(joined.context_id, &ops_bytes).await
         .map_err(|e| anyhow::anyhow!("Push ops: {e}"))?;
 
     Ok(())

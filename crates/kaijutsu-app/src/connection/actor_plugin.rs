@@ -127,6 +127,8 @@ pub enum RpcResultMessage {
         context_id: ContextId,
         state: kaijutsu_client::InputState,
     },
+    /// Context created on server — spawn an actor to join it.
+    ContextCreated(ContextId),
     /// Generic RPC error (for toast/notification).
     RpcError {
         operation: String,

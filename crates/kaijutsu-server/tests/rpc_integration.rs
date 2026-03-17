@@ -111,6 +111,21 @@ fn test_create_context_joinable() {
 }
 
 #[test]
+fn test_join_nonexistent_context_fails() {
+    run_local(async {
+        let addr = start_server().await;
+        let client = connect_client(addr).await;
+
+        let (kernel, _kernel_id) = client.attach_kernel().await.unwrap();
+
+        // Joining a random context that was never created should fail
+        let random_id = kaijutsu_crdt::ContextId::new();
+        let result = kernel.join_context(random_id, "test-instance").await;
+        assert!(result.is_err(), "join_context with nonexistent ID should fail");
+    });
+}
+
+#[test]
 fn test_create_context_unique_ids() {
     run_local(async {
         let addr = start_server().await;

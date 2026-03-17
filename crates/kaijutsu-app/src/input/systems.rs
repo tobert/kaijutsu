@@ -612,10 +612,10 @@ pub fn handle_constellation_nav(
     mut camera: ResMut<ConstellationCamera>,
     mut switch_writer: MessageWriter<crate::cell::ContextSwitchRequested>,
     mut model_writer: MessageWriter<OpenModelPicker>,
-    bootstrap: Res<crate::connection::BootstrapChannel>,
     conn_state: Res<crate::connection::RpcConnectionState>,
     new_ctx_config: Res<NewContextConfig>,
     actor: Option<Res<crate::connection::RpcActor>>,
+    result_channel: Res<crate::connection::RpcResultChannel>,
 ) {
     for ActionFired(action) in actions.read() {
         match action {
@@ -657,12 +657,17 @@ pub fn handle_constellation_nav(
                 }
             }
             Action::ConstellationCreate => {
-                info!("Constellation: creating new context");
-                create_or_fork_context(
-                    &new_ctx_config,
-                    &bootstrap,
-                    &conn_state,
-                );
+                if let Some(ref actor) = actor {
+                    info!("Constellation: creating new context");
+                    create_or_fork_context(
+                        &new_ctx_config,
+                        actor,
+                        &result_channel,
+                        &conn_state,
+                    );
+                } else {
+                    info!("Constellation: no actor available for context creation");
+                }
             }
             Action::ConstellationModelPicker => {
                 if let Some(focus_id) = constellation.focus_id {

@@ -141,6 +141,9 @@ enum RpcCommand {
     // ── World-level (handled inline, not dispatched to child tasks) ──────
     Whoami { reply: oneshot::Sender<Result<Identity, ActorError>> },
     ListKernels { reply: oneshot::Sender<Result<Vec<KernelInfo>, ActorError>> },
+
+    // ── Join Context (inline — updates actor state) ─────────────────────
+    JoinContext { context_id: ContextId, instance: String, reply: oneshot::Sender<Result<ContextId, ActorError>> },
 }
 
 impl RpcCommand {
@@ -190,6 +193,7 @@ impl RpcCommand {
             Self::ListPresets { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::Whoami { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ListKernels { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::JoinContext { reply, .. } => { let _ = reply.send(Err(err)); }
         }
     }
 }
@@ -633,6 +637,17 @@ impl ActorHandle {
         self.send(|reply| RpcCommand::ListPresets { reply }).await
     }
 
+    // ── Join Context ─────────────────────────────────────────────────────
+
+    /// Join an existing context. Updates the actor's internal context so
+    /// reconnects re-join the same context automatically.
+    #[tracing::instrument(skip(self))]
+    pub async fn join_context(&self, context_id: ContextId, instance: &str) -> Result<ContextId, ActorError> {
+        self.send(|reply| RpcCommand::JoinContext {
+            context_id, instance: instance.into(), reply,
+        }).await
+    }
+
     // ── World-level Methods ──────────────────────────────────────────────
 
     /// Get the current user's identity.
@@ -944,6 +959,17 @@ impl RpcActor {
                             let _ = reply.send(result);
                             continue;
                         }
+                        RpcCommand::JoinContext { context_id, instance, reply } => {
+                            let result = conn.kernel.join_context(context_id, &instance).await
+                                .map_err(|e| ActorError::Rpc(e.to_string()));
+                            if result.is_ok() {
+                                // Update actor state so reconnects re-join this context
+                                self.context_id = Some(context_id);
+                                self.joined_context_id = Some(context_id);
+                            }
+                            let _ = reply.send(result);
+                            continue;
+                        }
                         _ => {}
                     }
 
@@ -1123,12 +1149,15 @@ async fn dispatch_command(
             rpc_call!(kernel, reply, err_tx, k, k.list_presets());
         }
 
-        // World-level commands are handled inline in run() — unreachable here
+        // World-level / inline commands are handled in run() — unreachable here
         RpcCommand::Whoami { reply } => {
             let _ = reply.send(Err(ActorError::Rpc("world command in kernel dispatch".into())));
         }
         RpcCommand::ListKernels { reply } => {
             let _ = reply.send(Err(ActorError::Rpc("world command in kernel dispatch".into())));
+        }
+        RpcCommand::JoinContext { reply, .. } => {
+            let _ = reply.send(Err(ActorError::Rpc("inline command in kernel dispatch".into())));
         }
     }
 }

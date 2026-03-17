@@ -179,9 +179,10 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
                 Arc::new(HookListener::local(store.clone(), ctx_id))
             }
             kaijutsu_mcp::Backend::Remote(remote) => {
+                // shared_context_id is updated by register_session when a context is joined
                 Arc::new(HookListener::remote(
                     remote.clone(),
-                    remote.context_id,
+                    Arc::clone(&remote.shared_context_id),
                     Arc::clone(mcp.session_id_arc()),
                 ))
             }

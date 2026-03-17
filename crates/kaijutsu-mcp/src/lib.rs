@@ -124,23 +124,32 @@ pub enum Backend {
 /// The `ActorHandle` is `Send+Sync` and wraps the `!Send` Cap'n Proto
 /// types in a `spawn_local` task with auto-reconnect.
 ///
-/// The `store` is the single source of truth for document state. A background
-/// event listener applies incoming `ServerEvent`s directly to the store's
-/// `BlockDocument` via `SyncManager`, keeping reads consistent across all
-/// MCP tools.
+/// Context joining is deferred — `connect()` establishes the SSH connection
+/// and spawns the actor, but does not join a context. Call `register_session`
+/// to create and join a context, which populates the store.
 #[derive(Clone)]
 pub struct RemoteState {
     /// Kernel ID we connected to
     pub kernel_id: kaijutsu_crdt::KernelId,
-    /// Context ID we joined
-    pub context_id: kaijutsu_crdt::ContextId,
-    /// Local cache of synced state (with FlowBus for local event tracking).
-    /// Single source of truth — background listener applies events here.
-    pub store: SharedBlockStore,
     /// Send+Sync actor handle for RPC operations
     pub actor: ActorHandle,
+    /// Local block store — starts empty, populated by register_session.
+    pub store: SharedBlockStore,
+    /// Joined context state (None until register_session is called)
+    pub joined: Arc<tokio::sync::RwLock<Option<JoinedContext>>>,
+    /// Shared context_id for hook listener (updated by register_session)
+    pub shared_context_id: Arc<Mutex<Option<kaijutsu_crdt::ContextId>>>,
+}
+
+/// State for a joined context — created by `register_session`.
+#[derive(Clone)]
+pub struct JoinedContext {
+    /// Context ID we joined
+    pub context_id: kaijutsu_crdt::ContextId,
     /// Frontier-tracking sync state machine.
     pub sync: Arc<Mutex<SyncManager>>,
+    /// Abort handle for the background event listener.
+    _bg_task: Arc<AbortOnDrop>,
 }
 
 // ============================================================================
@@ -222,12 +231,8 @@ impl KaijutsuMcp {
     ///
     /// Uses ssh-agent for authentication. Must be called within a `LocalSet`.
     ///
-    /// If `cc_session_id` is provided (e.g., from Claude Code session detection),
-    /// it is used as the `ContextId` directly — same UUID everywhere for easy
-    /// correlation. Otherwise a fresh UUIDv7 `ContextId` is generated.
-    ///
-    /// `joinContext` auto-creates the context on the server if it doesn't exist,
-    /// so reconnection with the same UUID re-joins the same context.
+    /// Establishes the SSH connection and spawns the actor, but does NOT
+    /// join a context. Call `register_session` to create and join a context.
     pub async fn connect(
         host: &str,
         port: u16,
@@ -246,124 +251,45 @@ impl KaijutsuMcp {
         let client = connect_ssh(config.clone()).await?;
         let (kernel, kernel_id_typed) = client.attach_kernel().await?;
 
-        // Client provides ContextId — CC session UUID or fresh v7
-        let context_id = match cc_session_id {
-            Some(uuid) => {
-                let id = kaijutsu_crdt::ContextId::parse(uuid)
-                    .map_err(|e| anyhow::anyhow!("Invalid CC session UUID '{uuid}': {e}"))?;
-                tracing::info!(
-                    cc_session = uuid,
-                    context_id = %id,
-                    "Using Claude Code session UUID as ContextId"
-                );
-                id
-            }
-            None => kaijutsu_crdt::ContextId::new(),
-        };
-
-        // joinContext auto-creates if the context doesn't exist
-        let _joined_ctx = kernel.join_context(context_id, "mcp-server").await?;
-
         tracing::info!(
             kernel = %kernel_id_typed,
-            context_id = %context_id,
             context_label = %context_name,
-            "Connected to server"
+            "Connected to server (no context joined yet)"
         );
 
-        // Create store with FlowBus for local event tracking
-        let block_flows = shared_block_flow_bus(1024);
-        let store = std::sync::Arc::new(
-            kaijutsu_kernel::BlockStore::with_flows(PrincipalId::system(), block_flows.clone())
-        );
-
-        // Sync CRDT state from server (ops only, no blocks — they arrive via events)
-        let sync_state = kernel.get_context_sync(context_id).await?;
-
-        // Populate the store — single source of truth for all MCP reads
-        if !sync_state.ops.is_empty() {
-            store.create_document_from_snapshot(
-                sync_state.context_id,
-                DocKind::Conversation,
-                None,
-                &sync_state.ops,
-            ).map_err(|e| anyhow::anyhow!(e))?;
-        } else {
-            store.create_document(
-                sync_state.context_id,
-                DocKind::Conversation,
-                None,
-            ).map_err(|e| anyhow::anyhow!(e))?;
-        }
-
-        // Extract frontier from the store's document
-        let frontier = store.frontier(sync_state.context_id)
-            .unwrap_or_default();
-
-        let sync = SyncManager::with_state(
-            Some(sync_state.context_id),
-            Some(frontier),
-        );
-
-        let block_count = store.get(sync_state.context_id)
-            .map(|e| e.doc.block_count())
-            .unwrap_or(0);
-
-        tracing::debug!(
-            ctx = %sync_state.context_id,
-            blocks = block_count,
-            "Initial sync complete, SyncManager initialized"
-        );
-
-        let sync_arc = Arc::new(Mutex::new(sync));
-
-        // Spawn actor with the existing connection (no double-connect)
+        // Spawn actor with no context — it will join via register_session
         let actor = spawn_actor(
             config,
             kernel_id_typed,
-            Some(context_id),
+            None,
             "mcp-server".to_string(),
             Some((client, kernel)),
         );
 
         tracing::info!("RPC actor spawned, persistent connection ready");
 
-        // Spawn background event listener to keep store in sync
-        let bg_abort = {
-            let mut event_rx = actor.subscribe_events();
-            let store_bg = Arc::clone(&store);
-            let sync_bg = Arc::clone(&sync_arc);
-            let ctx_id_bg = context_id;
+        let shared_context_id = Arc::new(Mutex::new(None));
 
-            let bg_handle = tokio::spawn(async move {
-                loop {
-                    match event_rx.recv().await {
-                        Ok(event) => {
-                            apply_server_event(&store_bg, &sync_bg, ctx_id_bg, event);
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            tracing::warn!("Missed {n} events, forcing full resync");
-                            sync_bg.lock().expect("sync mutex poisoned").reset();
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    }
-                }
-            });
-            bg_handle.abort_handle()
-        };
+        // Create an empty store — populated by register_session
+        let store = std::sync::Arc::new(
+            kaijutsu_kernel::BlockStore::with_flows(
+                PrincipalId::system(),
+                shared_block_flow_bus(1024),
+            )
+        );
 
         Ok(Self {
             backend: Backend::Remote(RemoteState {
                 kernel_id: kernel_id_typed,
-                context_id,
-                store,
                 actor,
-                sync: sync_arc,
+                store,
+                joined: Arc::new(tokio::sync::RwLock::new(None)),
+                shared_context_id,
             }),
             tool_router: Self::tool_router(),
             prompt_router: Self::prompt_router(),
             server_state: McpServerState::default(),
-            _bg_task: Some(Arc::new(AbortOnDrop(bg_abort))),
+            _bg_task: None,
             session_id: Arc::new(Mutex::new(cc_session_id.map(String::from))),
             context_name: context_name.to_string(),
             agent_name: cc_session_id.map(|_| "claude-code".to_string()),
@@ -381,6 +307,9 @@ impl KaijutsuMcp {
     }
 
     /// Get the underlying store for tool operations.
+    ///
+    /// For Remote mode, returns the store which starts empty and is populated
+    /// by `register_session`.
     fn store(&self) -> &SharedBlockStore {
         match &self.backend {
             Backend::Local(store) => store,
@@ -396,6 +325,25 @@ impl KaijutsuMcp {
         }
     }
 
+    /// Get the joined context's context_id and sync state.
+    /// Returns an error string if no context has been joined (register_session not called).
+    async fn require_joined(&self) -> Result<(ContextId, &SharedBlockStore, &ActorHandle), String> {
+        match &self.backend {
+            Backend::Local(_) => Err("Error: not connected to server".to_string()),
+            Backend::Remote(remote) => {
+                let guard = remote.joined.read().await;
+                match guard.as_ref() {
+                    Some(joined) => Ok((
+                        joined.context_id,
+                        &remote.store,
+                        &remote.actor,
+                    )),
+                    None => Err("Error: no active context — call register_session first".to_string()),
+                }
+            }
+        }
+    }
+
     /// Push local changes to the server via the actor.
     ///
     /// Returns the number of ops pushed and the new ack version.
@@ -403,14 +351,18 @@ impl KaijutsuMcp {
         let remote = self.remote()
             .ok_or_else(|| anyhow::anyhow!("Not connected to server"))?;
 
+        let guard = remote.joined.read().await;
+        let joined = guard.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No active context — call register_session first"))?;
+
         // Get ops since last sync frontier from SyncManager
         let frontier = {
-            let sync = remote.sync.lock()
+            let sync = joined.sync.lock()
                 .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
             sync.frontier().cloned().unwrap_or_default()
         };
 
-        let ops = remote.store.ops_since(remote.context_id, &frontier)
+        let ops = remote.store.ops_since(joined.context_id, &frontier)
             .map_err(|e| anyhow::anyhow!(e))?;
 
         // Check for empty payload before serializing
@@ -425,16 +377,16 @@ impl KaijutsuMcp {
             .map_err(|e| anyhow::anyhow!("Serialize error: {}", e))?;
 
         tracing::debug!(
-            ctx = %remote.context_id,
+            ctx = %joined.context_id,
             ops_bytes = ops_bytes.len(),
             "Pushing ops to server"
         );
 
         // Push via persistent actor (no reconnect dance)
-        let ack_version = remote.actor.push_ops(remote.context_id, &ops_bytes).await
+        let ack_version = remote.actor.push_ops(joined.context_id, &ops_bytes).await
             .map_err(|e| anyhow::anyhow!("Push ops: {e}"))?;
 
-        tracing::info!(ctx = %remote.context_id, ack_version, "Pushed ops");
+        tracing::info!(ctx = %joined.context_id, ack_version, "Pushed ops");
 
         let ops_count = ops_bytes.len() / 50; // Rough estimate
         Ok((ops_count.max(1), ack_version))
@@ -481,7 +433,7 @@ impl KaijutsuMcp {
     /// Resolve a context ID for input document operations.
     ///
     /// If `query` is Some, resolves via label/hex prefix lookup (Remote) or
-    /// direct parse (Local). If None, falls back to the current connected
+    /// direct parse (Local). If None, falls back to the current joined
     /// context (Remote) or errors (Local).
     async fn resolve_input_context(
         &self,
@@ -496,8 +448,14 @@ impl KaijutsuMcp {
                 ContextId::parse(q)
                     .map_err(|e| format!("Error: invalid context ID '{}': {}", q, e))
             }
-            // No context provided — use current
-            (Backend::Remote(remote), None) => Ok(remote.context_id),
+            // No context provided — use current joined context
+            (Backend::Remote(remote), None) => {
+                let guard = remote.joined.read().await;
+                match guard.as_ref() {
+                    Some(joined) => Ok(joined.context_id),
+                    None => Err("Error: no active context — call register_session first".to_string()),
+                }
+            }
             (Backend::Local(_), None) => {
                 Err("Error: context_id is required in local mode".to_string())
             }
@@ -1380,17 +1338,15 @@ impl KaijutsuMcp {
         }
     }
 
-    #[tool(description = "Execute a kaish command through the kernel. Output is written to CRDT blocks (observable in kaijutsu-app) and returned when complete. Use for shell commands like cargo, git, ls, etc. Requires --connect.",
+    #[tool(description = "Execute a kaish command through the kernel. Output is written to CRDT blocks (observable in kaijutsu-app) and returned when complete. Use for shell commands like cargo, git, ls, etc. Requires --connect and register_session.",
         annotations(open_world_hint = true))]
     #[tracing::instrument(skip(self, req), name = "mcp.shell")]
     async fn shell(&self, Parameters(req): Parameters<ShellRequest>) -> String {
-        let remote = match self.remote() {
-            Some(r) => r,
-            None => return "Error: shell requires --connect to kaijutsu-server".to_string(),
+        let (ctx_id, _store, actor) = match self.require_joined().await {
+            Ok(v) => v,
+            Err(e) => return e,
         };
-
-        let actor = &remote.actor;
-        let ctx_id = remote.context_id;
+        let remote = self.remote().unwrap();
 
         // Execute command — creates ToolCall + ToolResult blocks in the document.
         // The output block starts as Status::Running and transitions to Done/Error
@@ -1481,19 +1437,17 @@ impl KaijutsuMcp {
         }
     }
 
-    #[tool(description = "Context-bound kaish shell. Executes commands in your current kernel context — '.' references it in kj commands. Full kaish: pipes, variables, scripting. Run `kj help` for context/drift/fork management or `kj drift help` for cross-context communication. Examples: 'kj context list --tree', 'kj fork --name alt', 'kj drift push impl \"found the bug\"', 'ls /mnt/project | grep rs'. Requires --connect.",
+    #[tool(description = "Context-bound kaish shell. Executes commands in your current kernel context — '.' references it in kj commands. Full kaish: pipes, variables, scripting. Run `kj help` for context/drift/fork management or `kj drift help` for cross-context communication. Examples: 'kj context list --tree', 'kj fork --name alt', 'kj drift push impl \"found the bug\"', 'ls /mnt/project | grep rs'. Requires --connect and register_session.",
         annotations(open_world_hint = true))]
     #[tracing::instrument(skip(self, req), name = "mcp.context_shell")]
     async fn context_shell(&self, Parameters(req): Parameters<ContextShellRequest>) -> String {
         // Route through shell_execute — same path as the shell tool.
         // The command is passed verbatim to kaish (no auto-prepending).
-        let remote = match self.remote() {
-            Some(r) => r,
-            None => return "Error: context_shell requires --connect to kaijutsu-server".to_string(),
+        let (ctx_id, _store, actor) = match self.require_joined().await {
+            Ok(v) => v,
+            Err(e) => return e,
         };
-
-        let actor = &remote.actor;
-        let ctx_id = remote.context_id;
+        let remote = self.remote().unwrap();
 
         let cmd_block_id = match actor.shell_execute(&req.command, ctx_id, false).await {
             Ok(id) => id,
@@ -1565,6 +1519,134 @@ impl KaijutsuMcp {
                 _ => continue,
             }
         }
+    }
+
+    // ========================================================================
+    // Session Registration
+    // ========================================================================
+
+    #[tool(description = "Register this agent session and create a context. Must be called before using context-dependent tools (block_create, shell, context_shell, etc.). Returns the new context ID and session info.",
+        annotations(destructive_hint = false, idempotent_hint = false, open_world_hint = false))]
+    #[tracing::instrument(skip(self, req), name = "mcp.register_session")]
+    async fn register_session(&self, Parameters(req): Parameters<RegisterSessionRequest>) -> String {
+        let remote = match self.remote() {
+            Some(r) => r,
+            None => return "Error: register_session requires --connect to kaijutsu-server".to_string(),
+        };
+
+        // Check if already joined
+        {
+            let guard = remote.joined.read().await;
+            if let Some(joined) = guard.as_ref() {
+                return serde_json::json!({
+                    "already_registered": true,
+                    "context_id": joined.context_id.to_hex(),
+                    "context_short": joined.context_id.short(),
+                }).to_string();
+            }
+        }
+
+        // Generate label
+        let label = req.label.unwrap_or_else(|| {
+            let session = self.session_id.lock().ok().and_then(|g| g.clone());
+            session.unwrap_or_else(|| format!("mcp-{}", &ContextId::new().short()))
+        });
+
+        // 1. Create context on the server
+        let context_id = match remote.actor.create_context(&label).await {
+            Ok(id) => id,
+            Err(e) => return format!("Error creating context: {e}"),
+        };
+
+        // 2. Join it via the actor (updates actor's internal state for reconnects)
+        if let Err(e) = remote.actor.join_context(context_id, "mcp-server").await {
+            return format!("Error joining context: {e}");
+        }
+
+        // 3. Sync initial state from server
+        let sync_state = match remote.actor.get_context_sync(context_id).await {
+            Ok(s) => s,
+            Err(e) => return format!("Error syncing context: {e}"),
+        };
+
+        // 4. Populate the store
+        if !sync_state.ops.is_empty() {
+            if let Err(e) = remote.store.create_document_from_snapshot(
+                sync_state.context_id,
+                DocKind::Conversation,
+                None,
+                &sync_state.ops,
+            ) {
+                return format!("Error populating store: {e}");
+            }
+        } else if let Err(e) = remote.store.create_document(
+            sync_state.context_id,
+            DocKind::Conversation,
+            None,
+        ) {
+            return format!("Error creating document: {e}");
+        }
+
+        // 5. Init SyncManager
+        let frontier = remote.store.frontier(sync_state.context_id)
+            .unwrap_or_default();
+        let sync = SyncManager::with_state(
+            Some(sync_state.context_id),
+            Some(frontier),
+        );
+        let sync_arc = Arc::new(Mutex::new(sync));
+
+        // 6. Spawn background event listener
+        let bg_abort = {
+            let mut event_rx = remote.actor.subscribe_events();
+            let store_bg = Arc::clone(&remote.store);
+            let sync_bg = Arc::clone(&sync_arc);
+            let ctx_id_bg = context_id;
+
+            let bg_handle = tokio::spawn(async move {
+                loop {
+                    match event_rx.recv().await {
+                        Ok(event) => {
+                            apply_server_event(&store_bg, &sync_bg, ctx_id_bg, event);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!("Missed {n} events, forcing full resync");
+                            sync_bg.lock().expect("sync mutex poisoned").reset();
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+            bg_handle.abort_handle()
+        };
+
+        // 7. Write JoinedContext
+        {
+            let mut guard = remote.joined.write().await;
+            *guard = Some(JoinedContext {
+                context_id,
+                sync: sync_arc,
+                _bg_task: Arc::new(AbortOnDrop(bg_abort)),
+            });
+        }
+
+        // 8. Update shared context_id for hook listener
+        if let Ok(mut ctx) = remote.shared_context_id.lock() {
+            *ctx = Some(context_id);
+        }
+
+        tracing::info!(
+            context_id = %context_id,
+            label = %label,
+            "Session registered with new context"
+        );
+
+        serde_json::json!({
+            "success": true,
+            "context_id": context_id.to_hex(),
+            "context_short": context_id.short(),
+            "label": label,
+        }).to_string()
     }
 
     // ========================================================================
