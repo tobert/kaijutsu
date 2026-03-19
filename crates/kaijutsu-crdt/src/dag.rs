@@ -355,6 +355,11 @@ mod tests {
             content_type: None,
             order_key: None,
             updated_at: 0,
+            status_at: 0,
+            collapsed_at: 0,
+            ephemeral_at: 0,
+            compacted_at: 0,
+            tool_meta_at: 0,
         };
         let snap_b = BlockSnapshot {
             id: id_b,
@@ -382,6 +387,11 @@ mod tests {
             content_type: None,
             order_key: None,
             updated_at: 0,
+            status_at: 0,
+            collapsed_at: 0,
+            ephemeral_at: 0,
+            compacted_at: 0,
+            tool_meta_at: 0,
         };
 
         // Build DAG manually (from_document would not create cycles)

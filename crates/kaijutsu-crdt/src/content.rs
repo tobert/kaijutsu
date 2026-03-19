@@ -9,6 +9,14 @@ use diamond_types_extended::{AgentId, Document, Frontier, SerializedOpsOwned, Uu
 
 use crate::{BlockHeader, BlockId, BlockSnapshot, PrincipalId, Status};
 
+/// Value-based tiebreaker for per-field LWW merge.
+///
+/// Remote wins if its timestamp is higher, or if timestamps are equal and
+/// the remote value is greater. Both peers compute the same result independently.
+fn field_wins<T: Ord>(remote_ts: u64, local_ts: u64, remote_val: &T, local_val: &T) -> bool {
+    remote_ts > local_ts || (remote_ts == local_ts && remote_val > local_val)
+}
+
 /// Base-62 charset for fractional indexing (0-9, A-Z, a-z).
 /// Lexicographically ordered: '0' < '9' < 'A' < 'Z' < 'a' < 'z'.
 pub const BASE62: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
@@ -265,17 +273,19 @@ impl BlockContent {
         self.order_key = key;
     }
 
-    /// Set the status, bumping updated_at with Lamport timestamp.
+    /// Set the status, bumping per-field and aggregate timestamps.
     pub fn set_status(&mut self, status: Status, lamport_ts: u64) {
         self.header.status = status;
-        self.header.updated_at = lamport_ts;
+        self.header.status_at = lamport_ts;
+        self.header.updated_at = self.header.max_field_ts();
     }
 
-    /// Set collapsed state, bumping updated_at with Lamport timestamp.
+    /// Set collapsed state, bumping per-field and aggregate timestamps.
     pub fn set_collapsed(&mut self, collapsed: bool, lamport_ts: u64) {
         self.collapsed = collapsed;
         self.header.collapsed = collapsed;
-        self.header.updated_at = lamport_ts;
+        self.header.collapsed_at = lamport_ts;
+        self.header.updated_at = self.header.max_field_ts();
     }
 
     /// Whether this block is deleted (tombstone).
@@ -366,7 +376,8 @@ impl BlockContent {
     pub fn set_ephemeral(&mut self, val: bool, lamport_ts: u64) {
         self.ephemeral = val;
         self.header.ephemeral = val;
-        self.header.updated_at = lamport_ts;
+        self.header.ephemeral_at = lamport_ts;
+        self.header.updated_at = self.header.max_field_ts();
     }
 
     // ── Sync ────────────────────────────────────────────────────────────
@@ -425,31 +436,61 @@ impl BlockContent {
             content_type: self.content_type.clone(),
             order_key: Some(self.order_key.clone()),
             updated_at: self.header.updated_at,
+            status_at: self.header.status_at,
+            collapsed_at: self.header.collapsed_at,
+            ephemeral_at: self.header.ephemeral_at,
+            compacted_at: self.header.compacted_at,
+            tool_meta_at: self.header.tool_meta_at,
         }
     }
 
-    /// Merge a remote header (LWW by updated_at, agent_id tiebreak).
+    /// Merge a remote header using per-field LWW.
     ///
-    /// **Known limitation:** This is whole-header LWW — all mutable fields
-    /// (status, collapsed, ephemeral, compacted, exit_code, is_error, tool_kind)
-    /// are replaced atomically. A race where peer A sets `ephemeral = true` and
-    /// peer B sets `status = Done` at the same Lamport tick will drop the loser's
-    /// change entirely. Per-field LWW would fix this; see `docs/LWW-critical-todo.md`.
+    /// Each mutable field group has its own Lamport timestamp. When timestamps
+    /// tie, the greater value wins (value-based tiebreaker). Both peers
+    /// independently compute the same result, guaranteeing convergence.
     pub fn merge_header(&mut self, remote: &BlockHeader) {
-        if remote.updated_at > self.header.updated_at
-            || (remote.updated_at == self.header.updated_at
-                && remote.id.agent_id > self.header.id.agent_id)
-        {
+        // status
+        if field_wins(remote.status_at, self.header.status_at,
+                      &remote.status, &self.header.status) {
             self.header.status = remote.status;
-            self.header.compacted = remote.compacted;
+            self.header.status_at = remote.status_at;
+        }
+
+        // collapsed
+        if field_wins(remote.collapsed_at, self.header.collapsed_at,
+                      &remote.collapsed, &self.header.collapsed) {
             self.header.collapsed = remote.collapsed;
             self.collapsed = remote.collapsed;
-            self.header.updated_at = remote.updated_at;
+            self.header.collapsed_at = remote.collapsed_at;
+        }
+
+        // ephemeral
+        if field_wins(remote.ephemeral_at, self.header.ephemeral_at,
+                      &remote.ephemeral, &self.header.ephemeral) {
+            self.header.ephemeral = remote.ephemeral;
+            self.ephemeral = remote.ephemeral;
+            self.header.ephemeral_at = remote.ephemeral_at;
+        }
+
+        // compacted
+        if field_wins(remote.compacted_at, self.header.compacted_at,
+                      &remote.compacted, &self.header.compacted) {
+            self.header.compacted = remote.compacted;
+            self.header.compacted_at = remote.compacted_at;
+        }
+
+        // tool_meta (tool_kind, exit_code, is_error)
+        if field_wins(remote.tool_meta_at, self.header.tool_meta_at,
+                      &remote.tool_kind, &self.header.tool_kind) {
             self.header.tool_kind = remote.tool_kind;
             self.header.exit_code = remote.exit_code;
             self.header.is_error = remote.is_error;
-            self.ephemeral = remote.ephemeral;
-            self.header.ephemeral = remote.ephemeral;
+            self.header.tool_meta_at = remote.tool_meta_at;
         }
+
+        // Recompute aggregate timestamp
+        self.header.updated_at = self.header.max_field_ts()
+            .max(remote.max_field_ts());
     }
 }

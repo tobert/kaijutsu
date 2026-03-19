@@ -95,6 +95,11 @@ mod tests {
             content_type: None,
             order_key: None,
             updated_at: 0,
+            status_at: 0,
+            collapsed_at: 0,
+            ephemeral_at: 0,
+            compacted_at: 0,
+            tool_meta_at: 0,
         }
     }
 

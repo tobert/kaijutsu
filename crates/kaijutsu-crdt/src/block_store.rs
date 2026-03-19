@@ -385,6 +385,11 @@ impl BlockStore {
             tool_kind: None,
             exit_code: None,
             is_error: false,
+            status_at: ts,
+            collapsed_at: ts,
+            ephemeral_at: ts,
+            compacted_at: ts,
+            tool_meta_at: ts,
         };
 
         let block = BlockContent::with_content(header, &content_str, self.agent_id, order_key);
@@ -436,6 +441,11 @@ impl BlockStore {
             tool_kind,
             exit_code: None,
             is_error: false,
+            status_at: ts,
+            collapsed_at: ts,
+            ephemeral_at: ts,
+            compacted_at: ts,
+            tool_meta_at: ts,
         };
 
         let mut block = BlockContent::with_content(header, &input_json, self.agent_id, order_key);
@@ -486,6 +496,11 @@ impl BlockStore {
             tool_kind,
             exit_code,
             is_error,
+            status_at: ts,
+            collapsed_at: ts,
+            ephemeral_at: ts,
+            compacted_at: ts,
+            tool_meta_at: ts,
         };
 
         let mut block = BlockContent::with_content(
@@ -2197,6 +2212,11 @@ mod tests {
             tool_kind: None,
             exit_code: None,
             is_error: false,
+            status_at: 0,
+            collapsed_at: 0,
+            ephemeral_at: 0,
+            compacted_at: 0,
+            tool_meta_at: 0,
         };
         let b1 = BlockContent::with_content(h1, "early", agent, "V".to_string());
         store.blocks.insert(id1, b1);
@@ -2217,6 +2237,11 @@ mod tests {
             tool_kind: None,
             exit_code: None,
             is_error: false,
+            status_at: 0,
+            collapsed_at: 0,
+            ephemeral_at: 0,
+            compacted_at: 0,
+            tool_meta_at: 0,
         };
         let b2 = BlockContent::with_content(h2, "mid", agent, "W".to_string());
         store.blocks.insert(id2, b2);
@@ -2237,6 +2262,11 @@ mod tests {
             tool_kind: None,
             exit_code: None,
             is_error: false,
+            status_at: 0,
+            collapsed_at: 0,
+            ephemeral_at: 0,
+            compacted_at: 0,
+            tool_meta_at: 0,
         };
         let b3 = BlockContent::with_content(h3, "late", agent, "X".to_string());
         store.blocks.insert(id3, b3);
@@ -2291,6 +2321,11 @@ mod tests {
             tool_kind: None,
             exit_code: None,
             is_error: false,
+            status_at: 0,
+            collapsed_at: 0,
+            ephemeral_at: 0,
+            compacted_at: 0,
+            tool_meta_at: 0,
         };
         store.blocks.insert(id1, BlockContent::with_content(h1, "keep", agent, "V".to_string()));
         store.version += 1;
@@ -2310,6 +2345,11 @@ mod tests {
             tool_kind: None,
             exit_code: None,
             is_error: false,
+            status_at: 0,
+            collapsed_at: 0,
+            ephemeral_at: 0,
+            compacted_at: 0,
+            tool_meta_at: 0,
         };
         store.blocks.insert(id2, BlockContent::with_content(h2, "drop", agent, "W".to_string()));
         store.version += 1;
@@ -2326,12 +2366,8 @@ mod tests {
         assert_eq!(snaps[0].content, "keep");
     }
 
-    /// Regression baseline: documents that whole-header LWW can drop concurrent
-    /// field mutations. If peer A sets ephemeral=true and peer B sets status=Done
-    /// at the same Lamport tick, the loser's change is silently dropped.
-    /// See `docs/LWW-critical-todo.md` for the design direction.
-    /// Regression baseline: documents that whole-header LWW can drop concurrent
-    /// field mutations. See `docs/LWW-critical-todo.md`.
+    /// Per-field LWW: concurrent mutations to different fields are both preserved.
+    /// (Was: regression baseline showing whole-header LWW dropping one change.)
     #[test]
     fn test_lww_race_ephemeral_overwritten_by_status() {
         let ctx = ContextId::new();
@@ -2353,26 +2389,140 @@ mod tests {
         // Peer B sets status=Done (at the same logical time)
         store_b.set_status(&block_id, Status::Done).unwrap();
 
-        // Merge A→B: B should get ephemeral=true
+        // Merge A→B
         let payload_a = store_a.ops_since(&store_b.frontier());
         store_b.merge_ops(payload_a).unwrap();
 
-        // Merge B→A: A should get status=Done
+        // Merge B→A
         let payload_b = store_b.ops_since(&store_a.frontier());
         store_a.merge_ops(payload_b).unwrap();
 
-        // With whole-header LWW, one side wins entirely — the loser's field change is dropped.
-        // This test documents current behavior as a regression baseline.
         let header_a = store_a.blocks.get(&block_id).unwrap().header();
         let header_b = store_b.blocks.get(&block_id).unwrap().header();
 
-        // Both stores should converge to the same state (LWW determinism)
+        // Both stores converge
         assert_eq!(header_a.status, header_b.status, "stores must converge on status");
         assert_eq!(header_a.ephemeral, header_b.ephemeral, "stores must converge on ephemeral");
 
-        // But one field mutation was lost — this is the known limitation
-        let both_preserved = header_a.ephemeral && header_a.status == Status::Done;
-        assert!(!both_preserved,
-            "whole-header LWW should NOT preserve both concurrent field changes (if this fails, per-field LWW was implemented — update this test!)");
+        // Per-field LWW: BOTH concurrent changes are preserved
+        assert!(header_a.ephemeral, "ephemeral=true must survive (independent field)");
+        assert_eq!(header_a.status, Status::Done, "status=Done must survive (independent field)");
+    }
+
+    /// Per-field LWW: different fields with different timestamps both preserved.
+    #[test]
+    fn test_per_field_lww_independent_merge() {
+        let ctx = ContextId::new();
+        let agent_a = PrincipalId::new();
+        let agent_b = PrincipalId::new();
+
+        let mut store_a = BlockStore::new(ctx, agent_a);
+        let block_id = store_a.insert_block(
+            None, None, Role::User, BlockKind::Text, "test", Status::Running,
+        ).unwrap();
+
+        let mut store_b = BlockStore::new(ctx, agent_b);
+        let payload = store_a.ops_since(&HashMap::new());
+        store_b.merge_ops(payload).unwrap();
+
+        // A: set collapsed=true (tick 1 after sync)
+        store_a.set_collapsed(&block_id, true).unwrap();
+        // A: then set status=Done (tick 2) — higher ts
+        store_a.set_status(&block_id, Status::Done).unwrap();
+
+        // B: just set ephemeral=true (tick 1 after sync)
+        store_b.set_ephemeral(&block_id, true).unwrap();
+
+        // Merge both ways
+        let payload_a = store_a.ops_since(&store_b.frontier());
+        store_b.merge_ops(payload_a).unwrap();
+        let payload_b = store_b.ops_since(&store_a.frontier());
+        store_a.merge_ops(payload_b).unwrap();
+
+        let ha = store_a.blocks.get(&block_id).unwrap().header();
+        let hb = store_b.blocks.get(&block_id).unwrap().header();
+
+        // All three field changes survive
+        assert_eq!(ha.status, Status::Done);
+        assert!(ha.collapsed);
+        assert!(ha.ephemeral);
+
+        // Convergence
+        assert_eq!(ha.status, hb.status);
+        assert_eq!(ha.collapsed, hb.collapsed);
+        assert_eq!(ha.ephemeral, hb.ephemeral);
+    }
+
+    /// Per-field LWW: same field, higher timestamp wins.
+    #[test]
+    fn test_per_field_lww_same_field_higher_ts_wins() {
+        let ctx = ContextId::new();
+        let agent_a = PrincipalId::new();
+        let agent_b = PrincipalId::new();
+
+        let mut store_a = BlockStore::new(ctx, agent_a);
+        let block_id = store_a.insert_block(
+            None, None, Role::User, BlockKind::Text, "test", Status::Running,
+        ).unwrap();
+
+        let mut store_b = BlockStore::new(ctx, agent_b);
+        let payload = store_a.ops_since(&HashMap::new());
+        store_b.merge_ops(payload).unwrap();
+
+        // A sets status to Done
+        store_a.set_status(&block_id, Status::Done).unwrap();
+
+        // B does two ticks before setting status to Error → higher Lamport ts
+        store_b.set_collapsed(&block_id, true).unwrap(); // tick to advance clock
+        store_b.set_status(&block_id, Status::Error).unwrap();
+
+        // Merge
+        let payload_a = store_a.ops_since(&store_b.frontier());
+        store_b.merge_ops(payload_a).unwrap();
+        let payload_b = store_b.ops_since(&store_a.frontier());
+        store_a.merge_ops(payload_b).unwrap();
+
+        let ha = store_a.blocks.get(&block_id).unwrap().header();
+        let hb = store_b.blocks.get(&block_id).unwrap().header();
+
+        // B's status wins (higher timestamp)
+        assert_eq!(ha.status, Status::Error, "higher-ts status should win");
+        assert_eq!(ha.status, hb.status, "stores must converge");
+    }
+
+    /// Per-field LWW tiebreaker: equal timestamps, greater value wins.
+    /// Both peers must converge to the same result.
+    #[test]
+    fn test_per_field_lww_tiebreaker_convergence() {
+        let ctx = ContextId::new();
+        let agent_a = PrincipalId::new();
+        let agent_b = PrincipalId::new();
+
+        let mut store_a = BlockStore::new(ctx, agent_a);
+        let block_id = store_a.insert_block(
+            None, None, Role::User, BlockKind::Text, "test", Status::Pending,
+        ).unwrap();
+
+        let mut store_b = BlockStore::new(ctx, agent_b);
+        let payload = store_a.ops_since(&HashMap::new());
+        store_b.merge_ops(payload).unwrap();
+
+        // Both peers set status at the same Lamport tick.
+        // A sets Done, B sets Error. Error > Done, so Error should win.
+        store_a.set_status(&block_id, Status::Done).unwrap();
+        store_b.set_status(&block_id, Status::Error).unwrap();
+
+        // Merge A→B then B→A
+        let payload_a = store_a.ops_since(&store_b.frontier());
+        store_b.merge_ops(payload_a).unwrap();
+        let payload_b = store_b.ops_since(&store_a.frontier());
+        store_a.merge_ops(payload_b).unwrap();
+
+        let ha = store_a.blocks.get(&block_id).unwrap().header();
+        let hb = store_b.blocks.get(&block_id).unwrap().header();
+
+        // Both converge to Error (greater value wins on tie)
+        assert_eq!(ha.status, Status::Error, "Error > Done on tiebreak");
+        assert_eq!(ha.status, hb.status, "stores must converge");
     }
 }

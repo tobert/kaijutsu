@@ -141,8 +141,8 @@ pub struct BlockHeader {
     /// Ephemeral blocks are displayed but excluded from LLM hydration.
     pub ephemeral: bool,
     pub created_at: u64,
-    /// Lamport timestamp for LWW conflict resolution on mutable fields
-    /// (status, collapsed). Highest `updated_at` wins, `agent_id` tiebreaks.
+    /// Aggregate Lamport timestamp — `max(all per-field timestamps)`.
+    /// Used for clock advancement in `merge_ops()`.
     /// NOT wall-clock time — use `created_at` for human-visible timestamps.
     pub updated_at: u64,
     /// Which execution engine (Shell, Mcp, Builtin). Copy-safe subset of tool metadata.
@@ -151,6 +151,21 @@ pub struct BlockHeader {
     pub exit_code: Option<i32>,
     /// Whether this is an error result.
     pub is_error: bool,
+
+    // ── Per-field LWW timestamps ────────────────────────────────────────
+    // Each mutable field group has its own Lamport timestamp for independent
+    // conflict resolution. On tie, value-based tiebreak (greater value wins).
+
+    /// Lamport timestamp for `status` field.
+    pub status_at: u64,
+    /// Lamport timestamp for `collapsed` field.
+    pub collapsed_at: u64,
+    /// Lamport timestamp for `ephemeral` field.
+    pub ephemeral_at: u64,
+    /// Lamport timestamp for `compacted` field.
+    pub compacted_at: u64,
+    /// Lamport timestamp for `tool_kind`, `exit_code`, `is_error` fields.
+    pub tool_meta_at: u64,
 }
 
 impl BlockHeader {
@@ -170,7 +185,21 @@ impl BlockHeader {
             tool_kind: snap.tool_kind,
             exit_code: snap.exit_code,
             is_error: snap.is_error,
+            status_at: snap.status_at,
+            collapsed_at: snap.collapsed_at,
+            ephemeral_at: snap.ephemeral_at,
+            compacted_at: snap.compacted_at,
+            tool_meta_at: snap.tool_meta_at,
         }
+    }
+
+    /// Maximum of all per-field timestamps.
+    pub fn max_field_ts(&self) -> u64 {
+        self.status_at
+            .max(self.collapsed_at)
+            .max(self.ephemeral_at)
+            .max(self.compacted_at)
+            .max(self.tool_meta_at)
     }
 
     /// Check if this is a root block (no parent).
@@ -242,7 +271,11 @@ impl std::fmt::Display for Role {
 }
 
 /// Execution status for blocks (CRDT-synced).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default, EnumString)]
+///
+/// Discriminant order matters for LWW tiebreaking: when two peers write at the
+/// same Lamport timestamp, the greater value wins. `Error > Done > Running > Pending`
+/// ensures errors are never masked by a concurrent completion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default, EnumString)]
 #[serde(rename_all = "lowercase")]
 #[strum(ascii_case_insensitive)]
 pub enum Status {
@@ -376,7 +409,7 @@ impl std::fmt::Display for BlockKind {
 /// Parallel to `DriftKind` — mechanism metadata on ToolCall/ToolResult blocks.
 /// The `Role` on the block tells you *who* (user typed a command vs model
 /// requested execution). `ToolKind` tells you *how* (kaish, MCP server, builtin).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default, EnumString)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default, EnumString)]
 #[serde(rename_all = "snake_case")]
 #[strum(ascii_case_insensitive)]
 pub enum ToolKind {
@@ -567,11 +600,29 @@ pub struct BlockSnapshot {
 
     // CRDT metadata
 
-    /// Lamport timestamp for LWW conflict resolution.
+    /// Aggregate Lamport timestamp — `max(all per-field timestamps)`.
     /// Propagated during sync so receivers can advance their clocks.
     /// Defaults to 0 for snapshots from persistence or older wire formats.
     #[serde(default)]
     pub updated_at: u64,
+
+    // Per-field LWW timestamps (CRDT-internal, not on Cap'n Proto wire).
+
+    /// Lamport timestamp for `status` field.
+    #[serde(default)]
+    pub status_at: u64,
+    /// Lamport timestamp for `collapsed` field.
+    #[serde(default)]
+    pub collapsed_at: u64,
+    /// Lamport timestamp for `ephemeral` field.
+    #[serde(default)]
+    pub ephemeral_at: u64,
+    /// Lamport timestamp for `compacted` field.
+    #[serde(default)]
+    pub compacted_at: u64,
+    /// Lamport timestamp for `tool_kind`, `exit_code`, `is_error` fields.
+    #[serde(default)]
+    pub tool_meta_at: u64,
 }
 
 impl BlockSnapshot {
@@ -617,6 +668,11 @@ impl BlockSnapshot {
             content_type: None,
             order_key: None,
             updated_at: 0,
+            status_at: 0,
+            collapsed_at: 0,
+            ephemeral_at: 0,
+            compacted_at: 0,
+            tool_meta_at: 0,
         }
     }
 
@@ -656,6 +712,11 @@ impl BlockSnapshot {
             content_type: None,
             order_key: None,
             updated_at: 0,
+            status_at: 0,
+            collapsed_at: 0,
+            ephemeral_at: 0,
+            compacted_at: 0,
+            tool_meta_at: 0,
         }
     }
 
@@ -703,6 +764,11 @@ impl BlockSnapshot {
             content_type: None,
             order_key: None,
             updated_at: 0,
+            status_at: 0,
+            collapsed_at: 0,
+            ephemeral_at: 0,
+            compacted_at: 0,
+            tool_meta_at: 0,
         }
     }
 
@@ -746,6 +812,11 @@ impl BlockSnapshot {
             content_type: None,
             order_key: None,
             updated_at: 0,
+            status_at: 0,
+            collapsed_at: 0,
+            ephemeral_at: 0,
+            compacted_at: 0,
+            tool_meta_at: 0,
         }
     }
 
@@ -793,6 +864,11 @@ impl BlockSnapshot {
             content_type: None,
             order_key: None,
             updated_at: 0,
+            status_at: 0,
+            collapsed_at: 0,
+            ephemeral_at: 0,
+            compacted_at: 0,
+            tool_meta_at: 0,
         }
     }
 
@@ -835,6 +911,11 @@ impl BlockSnapshot {
             content_type: None,
             order_key: None,
             updated_at: 0,
+            status_at: 0,
+            collapsed_at: 0,
+            ephemeral_at: 0,
+            compacted_at: 0,
+            tool_meta_at: 0,
         }
     }
 
@@ -875,6 +956,11 @@ impl BlockSnapshot {
             content_type: None,
             order_key: None,
             updated_at: 0,
+            status_at: 0,
+            collapsed_at: 0,
+            ephemeral_at: 0,
+            compacted_at: 0,
+            tool_meta_at: 0,
         }
     }
 
@@ -983,6 +1069,11 @@ impl BlockSnapshotBuilder {
                 content_type: None,
                 order_key: None,
                 updated_at: 0,
+                status_at: 0,
+                collapsed_at: 0,
+                ephemeral_at: 0,
+                compacted_at: 0,
+                tool_meta_at: 0,
             },
         }
     }

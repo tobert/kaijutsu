@@ -6018,6 +6018,11 @@ fn parse_block_snapshot(
             capnp_drift_kind_to_crdt(reader.get_drift_kind().ok())
         } else { None },
         updated_at: 0, // Not in wire protocol; receiver advances clock from header sync
+        status_at: 0,
+        collapsed_at: 0,
+        ephemeral_at: 0,
+        compacted_at: 0,
+        tool_meta_at: 0,
     })
 }
 

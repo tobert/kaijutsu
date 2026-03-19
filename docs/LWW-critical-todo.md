@@ -1,75 +1,40 @@
-# LWW Critical TODO: Per-Field Header Merge
+# Per-Field LWW Header Merge — Implemented
 
-## Problem
+## Status: Done
 
-`BlockContent::merge_header()` uses whole-header Last-Writer-Wins (LWW):
-when a remote header has a higher `updated_at` (Lamport timestamp), **all**
-mutable fields are replaced atomically. This means concurrent mutations to
-different fields will silently drop the loser's change.
+Per-field LWW merge for `BlockHeader` is implemented. Each mutable field group
+has its own Lamport timestamp. Concurrent mutations to independent fields are
+both preserved.
 
-## Affected Fields
+## Design
 
-All fields updated in `merge_header()`:
-- `status` (Running → Done / Error)
-- `collapsed` (user toggle)
-- `ephemeral` (LLM hydration filter)
-- `compacted` (summary flag)
-- `tool_kind`, `exit_code`, `is_error` (tool lifecycle)
+### Field Groups (5 timestamps)
 
-## Race Scenario
+| Timestamp | Fields | Setter |
+|-----------|--------|--------|
+| `status_at` | `status` | `set_status()` |
+| `collapsed_at` | `collapsed` | `set_collapsed()` |
+| `ephemeral_at` | `ephemeral` | `set_ephemeral()` |
+| `compacted_at` | `compacted` | (set via merge/direct) |
+| `tool_meta_at` | `tool_kind`, `exit_code`, `is_error` | (set at block creation) |
 
-```
-Store A (Lamport=5):  set_ephemeral(block, true)   → updated_at=6
-Store B (Lamport=5):  set_status(block, Done)       → updated_at=6
+`updated_at` = `max(all per-field timestamps)` for clock advancement.
 
-Merge A→B: same timestamp, agent_id tiebreak → one wins entirely
-Result: loser's field change is silently dropped
-```
+### Tiebreaker
 
-## Impact
+When timestamps are equal, the **greater value** wins (both peers compute the
+same result independently). `Status` discriminant order: `Pending < Running <
+Done < Error` — Error wins on tie, which is correct.
 
-- **ephemeral + status race**: An LLM stream finishes (`status=Done`) while
-  another peer marks the block ephemeral. The loser's change is dropped.
-- **collapsed + status race**: User collapses a block while the LLM finishes
-  streaming it. One change is lost.
+### Wire Format
 
-In practice, most of these races are unlikely because the fields change at
-different lifecycle stages. The highest-risk scenario is `ephemeral` being
-set concurrently with `status` completion on streaming blocks.
+Per-field timestamps are CRDT-internal (postcard serialization in `SyncPayload`).
+Not in the Cap'n Proto schema — no RPC changes needed. Clean break from old
+format (no backward-compat fallback; persisted state must be wiped).
 
-## Regression Baseline
+## Test Coverage
 
-`test_lww_race_ephemeral_overwritten_by_status` in `block_store.rs` documents
-the current behavior. If per-field LWW is implemented, that test's final
-assertion will fail (by design) to signal the test needs updating.
-
-## Proposed Fix: Per-Field LWW
-
-Replace the single `updated_at` with per-field timestamps:
-
-```rust
-struct BlockHeader {
-    // ... existing fields ...
-    status_at: u64,
-    collapsed_at: u64,
-    ephemeral_at: u64,
-    compacted_at: u64,
-    tool_meta_at: u64,  // covers tool_kind, exit_code, is_error
-}
-```
-
-Each `set_*` method ticks the Lamport clock and writes to the field-specific
-timestamp. `merge_header` compares per-field, accepting the highest timestamp
-for each independently.
-
-## Wire Protocol Impact
-
-- `BlockHeader` gains 5 new `u64` fields (40 bytes per header on wire)
-- Cap'n Proto schema change needed
-- Backward compatible: old peers send `updated_at` only; new peers can fall
-  back to whole-header merge when per-field timestamps are all 0
-
-## Design Session
-
-This is a follow-up design task. The current whole-header LWW is documented
-and tested as a known limitation.
+- `test_lww_race_ephemeral_overwritten_by_status` — both concurrent changes preserved
+- `test_per_field_lww_independent_merge` — three fields, different timestamps, all preserved
+- `test_per_field_lww_same_field_higher_ts_wins` — higher timestamp wins on same field
+- `test_per_field_lww_tiebreaker_convergence` — equal timestamps, value-based tiebreak converges
