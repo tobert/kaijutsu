@@ -229,11 +229,15 @@ mod tests {
         assert_eq!(results[0].0, 0);
 
         // Embeddings cache must be rebuilt from HNSW on reload
-        let emb0 = index.get_embedding(0).expect("embedding 0 should exist after reload");
+        let emb0 = index
+            .get_embedding(0)
+            .expect("embedding 0 should exist after reload");
         assert_eq!(emb0.len(), 4);
         assert!((emb0[0] - 1.0).abs() < 1e-6);
 
-        let emb1 = index.get_embedding(1).expect("embedding 1 should exist after reload");
+        let emb1 = index
+            .get_embedding(1)
+            .expect("embedding 1 should exist after reload");
         assert_eq!(emb1.len(), 4);
         assert!((emb1[1] - 1.0).abs() < 1e-6);
 

@@ -2,12 +2,15 @@
 //!
 //! Provides typed interface to the World and Kernel capabilities.
 
-use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
+use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
 use futures::AsyncReadExt;
 use kaijutsu_crdt::{ContextId, KernelId};
-use kaijutsu_types::{BlockFilter, BlockId, BlockKind, BlockQuery, BlockSnapshot, BlockSnapshotBuilder, DriftKind, PrincipalId, Role, Status, ToolKind};
-use russh::client::Msg;
+use kaijutsu_types::{
+    BlockFilter, BlockId, BlockKind, BlockQuery, BlockSnapshot, BlockSnapshotBuilder, DriftKind,
+    PrincipalId, Role, Status, ToolKind,
+};
 use russh::ChannelStream;
+use russh::client::Msg;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
 use crate::kaijutsu_capnp::world;
@@ -62,7 +65,11 @@ impl RpcClient {
         // Spawn the RPC system to run in the background (requires LocalSet)
         tokio::task::spawn_local(rpc_system);
 
-        Ok(Self { world, retained_channels: None, ssh_session: None })
+        Ok(Self {
+            world,
+            retained_channels: None,
+            ssh_session: None,
+        })
     }
 
     /// Retain SSH channels to prevent them from being dropped (which closes them).
@@ -125,7 +132,6 @@ impl RpcClient {
 
         Ok((KernelHandle { kernel }, kernel_id))
     }
-
 }
 
 // ============================================================================
@@ -274,7 +280,11 @@ impl KernelHandle {
     /// Returns the document_id for the joined context. The `instance` param
     /// identifies which client connected (for logging/debugging).
     #[tracing::instrument(skip(self), name = "rpc_client.join_context")]
-    pub async fn join_context(&self, context_id: ContextId, instance: &str) -> Result<ContextId, RpcError> {
+    pub async fn join_context(
+        &self,
+        context_id: ContextId,
+        instance: &str,
+    ) -> Result<ContextId, RpcError> {
         let mut request = self.kernel.join_context_request();
         request.get().set_context_id(context_id.as_bytes());
         request.get().set_instance(instance);
@@ -435,10 +445,7 @@ impl KernelHandle {
     /// Get document state (blocks and CRDT oplog)
     /// Compact a document's oplog, returning new size and sync generation.
     #[tracing::instrument(skip(self), name = "rpc_client.compact_context")]
-    pub async fn compact_context(
-        &self,
-        context_id: ContextId,
-    ) -> Result<(u64, u64), RpcError> {
+    pub async fn compact_context(&self, context_id: ContextId) -> Result<(u64, u64), RpcError> {
         let mut request = self.kernel.compact_context_request();
         request.get().set_context_id(context_id.as_bytes());
         {
@@ -483,10 +490,7 @@ impl KernelHandle {
 
     /// Fetch CRDT sync state (ops + version) without blocks.
     #[tracing::instrument(skip(self), name = "rpc_client.get_context_sync")]
-    pub async fn get_context_sync(
-        &self,
-        context_id: ContextId,
-    ) -> Result<SyncState, RpcError> {
+    pub async fn get_context_sync(&self, context_id: ContextId) -> Result<SyncState, RpcError> {
         let mut request = self.kernel.get_context_sync_request();
         request.get().set_context_id(context_id.as_bytes());
         {
@@ -500,7 +504,11 @@ impl KernelHandle {
         let context_id = parse_context_id(r.get_context_id()?)?;
         let ops = r.get_ops().map(|d| d.to_vec()).unwrap_or_default();
         let version = r.get_version();
-        Ok(SyncState { context_id, ops, version })
+        Ok(SyncState {
+            context_id,
+            ops,
+            version,
+        })
     }
 
     // =========================================================================
@@ -555,7 +563,10 @@ impl KernelHandle {
     ///
     /// Like `subscribe_blocks` but the server applies the filter before sending,
     /// reducing bandwidth and client CPU during high-throughput streaming.
-    #[tracing::instrument(skip(self, callback, filter), name = "rpc_client.subscribe_blocks_filtered")]
+    #[tracing::instrument(
+        skip(self, callback, filter),
+        name = "rpc_client.subscribe_blocks_filtered"
+    )]
     pub async fn subscribe_blocks_filtered(
         &self,
         callback: crate::kaijutsu_capnp::block_events::Client,
@@ -581,11 +592,7 @@ impl KernelHandle {
     /// This is the general-purpose tool execution path (executeTool @16).
     /// Tools include git, drift, and any registered execution engines.
     #[tracing::instrument(skip(self, params), name = "rpc_client.execute_tool")]
-    pub async fn execute_tool(
-        &self,
-        tool: &str,
-        params: &str,
-    ) -> Result<ToolResult, RpcError> {
+    pub async fn execute_tool(&self, tool: &str, params: &str) -> Result<ToolResult, RpcError> {
         let mut request = self.kernel.execute_tool_request();
         {
             let mut call = request.get().init_call();
@@ -649,8 +656,11 @@ impl KernelHandle {
             let mut call = request.get().init_call();
             call.set_server(server);
             call.set_tool(tool);
-            call.set_arguments(&serde_json::to_string(arguments)
-                .map_err(|e| RpcError::Other(format!("Failed to serialize MCP arguments: {e}")))?);
+            call.set_arguments(
+                &serde_json::to_string(arguments).map_err(|e| {
+                    RpcError::Other(format!("Failed to serialize MCP arguments: {e}"))
+                })?,
+            );
         }
         {
             let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
@@ -957,11 +967,7 @@ impl KernelHandle {
 
     /// Rename a context's human-friendly label.
     #[tracing::instrument(skip(self), name = "rpc_client.rename_context")]
-    pub async fn rename_context(
-        &self,
-        context_id: ContextId,
-        label: &str,
-    ) -> Result<(), RpcError> {
+    pub async fn rename_context(&self, context_id: ContextId, label: &str) -> Result<(), RpcError> {
         let mut request = self.kernel.rename_context_request();
         request.get().set_context_id(context_id.as_bytes());
         request.get().set_label(label);
@@ -1354,10 +1360,7 @@ impl KernelHandle {
     ///
     /// Returns the current content, CRDT oplog, and version.
     #[tracing::instrument(skip(self), name = "rpc_client.get_input_state")]
-    pub async fn get_input_state(
-        &self,
-        context_id: ContextId,
-    ) -> Result<InputState, RpcError> {
+    pub async fn get_input_state(&self, context_id: ContextId) -> Result<InputState, RpcError> {
         let mut request = self.kernel.get_input_state_request();
         request.get().set_context_id(context_id.as_bytes());
         {
@@ -1380,11 +1383,7 @@ impl KernelHandle {
     /// For CRDT-aware clients that maintain their own DTE document.
     /// Returns the acknowledged version.
     #[tracing::instrument(skip(self, ops), name = "rpc_client.push_input_ops")]
-    pub async fn push_input_ops(
-        &self,
-        context_id: ContextId,
-        ops: &[u8],
-    ) -> Result<u64, RpcError> {
+    pub async fn push_input_ops(&self, context_id: ContextId, ops: &[u8]) -> Result<u64, RpcError> {
         let mut request = self.kernel.push_input_ops_request();
         request.get().set_context_id(context_id.as_bytes());
         request.get().set_ops(ops);
@@ -1432,10 +1431,7 @@ impl KernelHandle {
     /// subscribers. Use this for Escape×3 (discard draft) — `submit_input`
     /// already clears internally.
     #[tracing::instrument(skip(self), name = "rpc_client.clear_input")]
-    pub async fn clear_input(
-        &self,
-        context_id: ContextId,
-    ) -> Result<(), RpcError> {
+    pub async fn clear_input(&self, context_id: ContextId) -> Result<(), RpcError> {
         let mut request = self.kernel.clear_input_request();
         request.get().set_context_id(context_id.as_bytes());
         {
@@ -1450,7 +1446,9 @@ impl KernelHandle {
 }
 
 /// Read a `ShellValue` from a Cap'n Proto reader.
-fn read_shell_value(reader: crate::kaijutsu_capnp::shell_value::Reader<'_>) -> Result<ShellValue, RpcError> {
+fn read_shell_value(
+    reader: crate::kaijutsu_capnp::shell_value::Reader<'_>,
+) -> Result<ShellValue, RpcError> {
     use crate::kaijutsu_capnp::shell_value;
     match reader.which().map_err(|e| RpcError::Capnp(e.into()))? {
         shell_value::Null(()) => Ok(ShellValue::Null),
@@ -1469,14 +1467,17 @@ fn read_shell_value(reader: crate::kaijutsu_capnp::shell_value::Reader<'_>) -> R
 }
 
 /// Write a `ShellValue` into a Cap'n Proto builder.
-fn write_shell_value(mut builder: crate::kaijutsu_capnp::shell_value::Builder<'_>, value: &ShellValue) {
+fn write_shell_value(
+    mut builder: crate::kaijutsu_capnp::shell_value::Builder<'_>,
+    value: &ShellValue,
+) {
     match value {
         ShellValue::Null => builder.set_null(()),
         ShellValue::Bool(b) => builder.set_bool(*b),
         ShellValue::Int(i) => builder.set_int(*i),
         ShellValue::Float(f) => builder.set_float(*f),
         ShellValue::String(s) => builder.set_string(s),
-        ShellValue::Json(j) => builder.set_json(&serde_json::to_string(j).unwrap_or_default()),
+        ShellValue::Json(j) => builder.set_json(serde_json::to_string(j).unwrap_or_default()),
         ShellValue::Blob(b) => builder.set_blob(b),
     }
 }
@@ -1485,7 +1486,6 @@ fn write_shell_value(mut builder: crate::kaijutsu_capnp::shell_value::Builder<'_
 // Helper Functions
 // ============================================================================
 
-/// Parse 16-byte Data into ContextId.
 // ============================================================================
 // Block Query Builder Helpers
 // ============================================================================
@@ -1518,14 +1518,17 @@ fn set_block_filter_builder(
         builder.set_has_kinds(true);
         let mut list = builder.reborrow().init_kinds(filter.kinds.len() as u32);
         for (i, kind) in filter.kinds.iter().enumerate() {
-            list.set(i as u32, match kind {
-                BlockKind::Text => crate::kaijutsu_capnp::BlockKind::Text,
-                BlockKind::Thinking => crate::kaijutsu_capnp::BlockKind::Thinking,
-                BlockKind::ToolCall => crate::kaijutsu_capnp::BlockKind::ToolCall,
-                BlockKind::ToolResult => crate::kaijutsu_capnp::BlockKind::ToolResult,
-                BlockKind::Drift => crate::kaijutsu_capnp::BlockKind::Drift,
-                BlockKind::File => crate::kaijutsu_capnp::BlockKind::File,
-            });
+            list.set(
+                i as u32,
+                match kind {
+                    BlockKind::Text => crate::kaijutsu_capnp::BlockKind::Text,
+                    BlockKind::Thinking => crate::kaijutsu_capnp::BlockKind::Thinking,
+                    BlockKind::ToolCall => crate::kaijutsu_capnp::BlockKind::ToolCall,
+                    BlockKind::ToolResult => crate::kaijutsu_capnp::BlockKind::ToolResult,
+                    BlockKind::Drift => crate::kaijutsu_capnp::BlockKind::Drift,
+                    BlockKind::File => crate::kaijutsu_capnp::BlockKind::File,
+                },
+            );
         }
     }
 
@@ -1533,26 +1536,34 @@ fn set_block_filter_builder(
         builder.set_has_roles(true);
         let mut list = builder.reborrow().init_roles(filter.roles.len() as u32);
         for (i, role) in filter.roles.iter().enumerate() {
-            list.set(i as u32, match role {
-                Role::User => crate::kaijutsu_capnp::Role::User,
-                Role::Model => crate::kaijutsu_capnp::Role::Model,
-                Role::System => crate::kaijutsu_capnp::Role::System,
-                Role::Tool => crate::kaijutsu_capnp::Role::Tool,
-                Role::Asset => crate::kaijutsu_capnp::Role::Asset,
-            });
+            list.set(
+                i as u32,
+                match role {
+                    Role::User => crate::kaijutsu_capnp::Role::User,
+                    Role::Model => crate::kaijutsu_capnp::Role::Model,
+                    Role::System => crate::kaijutsu_capnp::Role::System,
+                    Role::Tool => crate::kaijutsu_capnp::Role::Tool,
+                    Role::Asset => crate::kaijutsu_capnp::Role::Asset,
+                },
+            );
         }
     }
 
     if !filter.statuses.is_empty() {
         builder.set_has_statuses(true);
-        let mut list = builder.reborrow().init_statuses(filter.statuses.len() as u32);
+        let mut list = builder
+            .reborrow()
+            .init_statuses(filter.statuses.len() as u32);
         for (i, status) in filter.statuses.iter().enumerate() {
-            list.set(i as u32, match status {
-                Status::Pending => crate::kaijutsu_capnp::Status::Pending,
-                Status::Running => crate::kaijutsu_capnp::Status::Running,
-                Status::Done => crate::kaijutsu_capnp::Status::Done,
-                Status::Error => crate::kaijutsu_capnp::Status::Error,
-            });
+            list.set(
+                i as u32,
+                match status {
+                    Status::Pending => crate::kaijutsu_capnp::Status::Pending,
+                    Status::Running => crate::kaijutsu_capnp::Status::Running,
+                    Status::Done => crate::kaijutsu_capnp::Status::Done,
+                    Status::Error => crate::kaijutsu_capnp::Status::Error,
+                },
+            );
         }
     }
 
@@ -1573,7 +1584,9 @@ fn set_block_event_filter_builder(
 ) {
     if !filter.context_ids.is_empty() {
         builder.set_has_context_ids(true);
-        let mut list = builder.reborrow().init_context_ids(filter.context_ids.len() as u32);
+        let mut list = builder
+            .reborrow()
+            .init_context_ids(filter.context_ids.len() as u32);
         for (i, ctx_id) in filter.context_ids.iter().enumerate() {
             list.set(i as u32, ctx_id.as_bytes());
         }
@@ -1581,43 +1594,70 @@ fn set_block_event_filter_builder(
 
     if !filter.event_types.is_empty() {
         builder.set_has_event_types(true);
-        let mut list = builder.reborrow().init_event_types(filter.event_types.len() as u32);
+        let mut list = builder
+            .reborrow()
+            .init_event_types(filter.event_types.len() as u32);
         for (i, kind) in filter.event_types.iter().enumerate() {
-            list.set(i as u32, match kind {
-                kaijutsu_types::BlockFlowKind::Inserted => crate::kaijutsu_capnp::BlockFlowKind::Inserted,
-                kaijutsu_types::BlockFlowKind::TextOps => crate::kaijutsu_capnp::BlockFlowKind::TextOps,
-                kaijutsu_types::BlockFlowKind::Deleted => crate::kaijutsu_capnp::BlockFlowKind::Deleted,
-                kaijutsu_types::BlockFlowKind::StatusChanged => crate::kaijutsu_capnp::BlockFlowKind::StatusChanged,
-                kaijutsu_types::BlockFlowKind::CollapsedChanged => crate::kaijutsu_capnp::BlockFlowKind::CollapsedChanged,
-                kaijutsu_types::BlockFlowKind::Moved => crate::kaijutsu_capnp::BlockFlowKind::Moved,
-                kaijutsu_types::BlockFlowKind::SyncReset => crate::kaijutsu_capnp::BlockFlowKind::SyncReset,
-                kaijutsu_types::BlockFlowKind::OutputChanged => crate::kaijutsu_capnp::BlockFlowKind::OutputChanged,
-                kaijutsu_types::BlockFlowKind::MetadataChanged => crate::kaijutsu_capnp::BlockFlowKind::MetadataChanged,
-                kaijutsu_types::BlockFlowKind::ContextSwitched => crate::kaijutsu_capnp::BlockFlowKind::ContextSwitched,
-            });
+            list.set(
+                i as u32,
+                match kind {
+                    kaijutsu_types::BlockFlowKind::Inserted => {
+                        crate::kaijutsu_capnp::BlockFlowKind::Inserted
+                    }
+                    kaijutsu_types::BlockFlowKind::TextOps => {
+                        crate::kaijutsu_capnp::BlockFlowKind::TextOps
+                    }
+                    kaijutsu_types::BlockFlowKind::Deleted => {
+                        crate::kaijutsu_capnp::BlockFlowKind::Deleted
+                    }
+                    kaijutsu_types::BlockFlowKind::StatusChanged => {
+                        crate::kaijutsu_capnp::BlockFlowKind::StatusChanged
+                    }
+                    kaijutsu_types::BlockFlowKind::CollapsedChanged => {
+                        crate::kaijutsu_capnp::BlockFlowKind::CollapsedChanged
+                    }
+                    kaijutsu_types::BlockFlowKind::Moved => {
+                        crate::kaijutsu_capnp::BlockFlowKind::Moved
+                    }
+                    kaijutsu_types::BlockFlowKind::SyncReset => {
+                        crate::kaijutsu_capnp::BlockFlowKind::SyncReset
+                    }
+                    kaijutsu_types::BlockFlowKind::OutputChanged => {
+                        crate::kaijutsu_capnp::BlockFlowKind::OutputChanged
+                    }
+                    kaijutsu_types::BlockFlowKind::MetadataChanged => {
+                        crate::kaijutsu_capnp::BlockFlowKind::MetadataChanged
+                    }
+                    kaijutsu_types::BlockFlowKind::ContextSwitched => {
+                        crate::kaijutsu_capnp::BlockFlowKind::ContextSwitched
+                    }
+                },
+            );
         }
     }
 
     if !filter.block_kinds.is_empty() {
         builder.set_has_block_kinds(true);
-        let mut list = builder.reborrow().init_block_kinds(filter.block_kinds.len() as u32);
+        let mut list = builder
+            .reborrow()
+            .init_block_kinds(filter.block_kinds.len() as u32);
         for (i, kind) in filter.block_kinds.iter().enumerate() {
-            list.set(i as u32, match kind {
-                BlockKind::Text => crate::kaijutsu_capnp::BlockKind::Text,
-                BlockKind::Thinking => crate::kaijutsu_capnp::BlockKind::Thinking,
-                BlockKind::ToolCall => crate::kaijutsu_capnp::BlockKind::ToolCall,
-                BlockKind::ToolResult => crate::kaijutsu_capnp::BlockKind::ToolResult,
-                BlockKind::Drift => crate::kaijutsu_capnp::BlockKind::Drift,
-                BlockKind::File => crate::kaijutsu_capnp::BlockKind::File,
-            });
+            list.set(
+                i as u32,
+                match kind {
+                    BlockKind::Text => crate::kaijutsu_capnp::BlockKind::Text,
+                    BlockKind::Thinking => crate::kaijutsu_capnp::BlockKind::Thinking,
+                    BlockKind::ToolCall => crate::kaijutsu_capnp::BlockKind::ToolCall,
+                    BlockKind::ToolResult => crate::kaijutsu_capnp::BlockKind::ToolResult,
+                    BlockKind::Drift => crate::kaijutsu_capnp::BlockKind::Drift,
+                    BlockKind::File => crate::kaijutsu_capnp::BlockKind::File,
+                },
+            );
         }
     }
 }
 
-fn set_block_id_builder(
-    builder: &mut crate::kaijutsu_capnp::block_id::Builder,
-    id: &BlockId,
-) {
+fn set_block_id_builder(builder: &mut crate::kaijutsu_capnp::block_id::Builder, id: &BlockId) {
     builder.set_context_id(id.context_id.as_bytes());
     builder.set_agent_id(id.agent_id.as_bytes());
     builder.set_seq(id.seq);
@@ -1635,7 +1675,9 @@ fn entry_type_from_capnp(et: crate::kaijutsu_capnp::EntryType) -> kaijutsu_types
     }
 }
 
-fn parse_output_node(reader: crate::kaijutsu_capnp::output_node::Reader<'_>) -> Result<kaijutsu_types::OutputNode, capnp::Error> {
+fn parse_output_node(
+    reader: crate::kaijutsu_capnp::output_node::Reader<'_>,
+) -> Result<kaijutsu_types::OutputNode, capnp::Error> {
     let name = reader.get_name()?.to_str()?.to_owned();
     let entry_type = entry_type_from_capnp(reader.get_entry_type()?);
     let text = if reader.get_has_text() {
@@ -1662,7 +1704,9 @@ fn parse_output_node(reader: crate::kaijutsu_capnp::output_node::Reader<'_>) -> 
     })
 }
 
-pub(crate) fn parse_output_data(reader: crate::kaijutsu_capnp::output_data::Reader<'_>) -> Result<kaijutsu_types::OutputData, capnp::Error> {
+pub(crate) fn parse_output_data(
+    reader: crate::kaijutsu_capnp::output_data::Reader<'_>,
+) -> Result<kaijutsu_types::OutputData, capnp::Error> {
     let headers = if reader.get_has_headers() {
         let hlist = reader.get_headers()?;
         let mut v = Vec::with_capacity(hlist.len() as usize);
@@ -1683,14 +1727,20 @@ pub(crate) fn parse_output_data(reader: crate::kaijutsu_capnp::output_data::Read
 
 fn parse_context_id(data: &[u8]) -> Result<ContextId, RpcError> {
     ContextId::try_from_slice(data).ok_or_else(|| {
-        RpcError::ServerError(format!("invalid context ID: expected 16 bytes, got {}", data.len()))
+        RpcError::ServerError(format!(
+            "invalid context ID: expected 16 bytes, got {}",
+            data.len()
+        ))
     })
 }
 
 /// Parse 16-byte Data into KernelId.
 fn parse_kernel_id(data: &[u8]) -> Result<KernelId, RpcError> {
     KernelId::try_from_slice(data).ok_or_else(|| {
-        RpcError::ServerError(format!("invalid kernel ID: expected 16 bytes, got {}", data.len()))
+        RpcError::ServerError(format!(
+            "invalid kernel ID: expected 16 bytes, got {}",
+            data.len()
+        ))
     })
 }
 
@@ -1719,7 +1769,11 @@ fn parse_context_info(
     };
 
     let fork_kind_str = reader.get_fork_kind()?.to_str().unwrap_or("");
-    let fork_kind = if fork_kind_str.is_empty() { None } else { Some(fork_kind_str.to_string()) };
+    let fork_kind = if fork_kind_str.is_empty() {
+        None
+    } else {
+        Some(fork_kind_str.to_string())
+    };
     let archived = reader.get_archived_at() > 0;
 
     // Parse synthesis keywords
@@ -1735,7 +1789,11 @@ fn parse_context_info(
 
     let top_block_preview = if reader.has_top_block_preview() {
         let s = reader.get_top_block_preview()?.to_str().unwrap_or("");
-        if s.is_empty() { None } else { Some(s.to_string()) }
+        if s.is_empty() {
+            None
+        } else {
+            Some(s.to_string())
+        }
     } else {
         None
     };
@@ -1861,91 +1919,81 @@ pub(crate) fn parse_block_snapshot(
     }
 
     // Structured output data
-    if let Ok(output_data_reader) = reader.get_output_data() {
-        if let Ok(data) = parse_output_data(output_data_reader) {
-            if !data.root.is_empty() || data.headers.is_some() {
-                builder = builder.output(data);
-            }
-        }
+    if let Ok(output_data_reader) = reader.get_output_data()
+        && let Ok(data) = parse_output_data(output_data_reader)
+        && (!data.root.is_empty() || data.headers.is_some())
+    {
+        builder = builder.output(data);
     }
 
     // Drift-specific fields — source_context is now binary Data (16-byte ContextId)
     let source_data = reader.get_source_context()?;
-    if source_data.len() == 16 {
-        if let Some(ctx) = ContextId::try_from_slice(source_data) {
-            if !ctx.is_nil() {
-                builder = builder.source_context(ctx);
-            }
-        }
+    if source_data.len() == 16
+        && let Some(ctx) = ContextId::try_from_slice(source_data)
+        && !ctx.is_nil()
+    {
+        builder = builder.source_context(ctx);
     }
 
-    if reader.has_source_model() {
-        if let Ok(model) = reader.get_source_model() {
-            if let Ok(s) = model.to_str() {
-                if !s.is_empty() {
-                    builder = builder.source_model(s);
-                }
-            }
-        }
+    if reader.has_source_model()
+        && let Ok(model) = reader.get_source_model()
+        && let Ok(s) = model.to_str()
+        && !s.is_empty()
+    {
+        builder = builder.source_model(s);
     }
 
     // DriftKind — wire is now an enum, not a string
-    if reader.get_has_drift_kind() {
-        if let Ok(dk) = reader.get_drift_kind() {
-            let drift_kind = match dk {
-                crate::kaijutsu_capnp::DriftKind::Push => DriftKind::Push,
-                crate::kaijutsu_capnp::DriftKind::Pull => DriftKind::Pull,
-                crate::kaijutsu_capnp::DriftKind::Merge => DriftKind::Merge,
-                crate::kaijutsu_capnp::DriftKind::Distill => DriftKind::Distill,
-                crate::kaijutsu_capnp::DriftKind::Commit => DriftKind::Commit,
-            };
-            builder = builder.drift_kind(drift_kind);
-        }
+    if reader.get_has_drift_kind()
+        && let Ok(dk) = reader.get_drift_kind()
+    {
+        let drift_kind = match dk {
+            crate::kaijutsu_capnp::DriftKind::Push => DriftKind::Push,
+            crate::kaijutsu_capnp::DriftKind::Pull => DriftKind::Pull,
+            crate::kaijutsu_capnp::DriftKind::Merge => DriftKind::Merge,
+            crate::kaijutsu_capnp::DriftKind::Distill => DriftKind::Distill,
+            crate::kaijutsu_capnp::DriftKind::Commit => DriftKind::Commit,
+        };
+        builder = builder.drift_kind(drift_kind);
     }
 
     // ToolKind — wire enum
-    if reader.get_has_tool_kind() {
-        if let Ok(tk) = reader.get_tool_kind() {
-            let tool_kind = match tk {
-                crate::kaijutsu_capnp::ToolKind::Shell => ToolKind::Shell,
-                crate::kaijutsu_capnp::ToolKind::Mcp => ToolKind::Mcp,
-                crate::kaijutsu_capnp::ToolKind::Builtin => ToolKind::Builtin,
-            };
-            builder = builder.tool_kind(tool_kind);
-        }
+    if reader.get_has_tool_kind()
+        && let Ok(tk) = reader.get_tool_kind()
+    {
+        let tool_kind = match tk {
+            crate::kaijutsu_capnp::ToolKind::Shell => ToolKind::Shell,
+            crate::kaijutsu_capnp::ToolKind::Mcp => ToolKind::Mcp,
+            crate::kaijutsu_capnp::ToolKind::Builtin => ToolKind::Builtin,
+        };
+        builder = builder.tool_kind(tool_kind);
     }
 
     // tool_use_id (LLM-assigned tool invocation ID)
-    if reader.has_tool_use_id() {
-        if let Ok(tui) = reader.get_tool_use_id() {
-            if let Ok(s) = tui.to_str() {
-                if !s.is_empty() {
-                    builder = builder.tool_use_id(s);
-                }
-            }
-        }
+    if reader.has_tool_use_id()
+        && let Ok(tui) = reader.get_tool_use_id()
+        && let Ok(s) = tui.to_str()
+        && !s.is_empty()
+    {
+        builder = builder.tool_use_id(s);
     }
 
     // File path (for BlockKind::File blocks)
-    if reader.has_file_path() {
-        if let Ok(path) = reader.get_file_path() {
-            if let Ok(s) = path.to_str() {
-                if !s.is_empty() {
-                    builder = builder.file_path(s);
-                }
-            }
-        }
+    if reader.has_file_path()
+        && let Ok(path) = reader.get_file_path()
+        && let Ok(s) = path.to_str()
+        && !s.is_empty()
+    {
+        builder = builder.file_path(s);
     }
 
     // Content type hint (MIME type)
-    if reader.has_content_type() {
-        if let Ok(ct) = reader.get_content_type() {
-            if let Ok(s) = ct.to_str() {
-                if !s.is_empty() {
-                    builder = builder.content_type(s);
-                }
-            }
-        }
+    if reader.has_content_type()
+        && let Ok(ct) = reader.get_content_type()
+        && let Ok(s) = ct.to_str()
+        && !s.is_empty()
+    {
+        builder = builder.content_type(s);
     }
 
     // Ephemeral flag (human-only, excluded from LLM hydration)
@@ -2248,7 +2296,11 @@ mod tests {
     fn test_parse_block_snapshot_file_path_roundtrip() {
         let ctx = ContextId::new();
         let agent = PrincipalId::new();
-        let id = BlockId { context_id: ctx, agent_id: agent, seq: 1 };
+        let id = BlockId {
+            context_id: ctx,
+            agent_id: agent,
+            seq: 1,
+        };
 
         let snap = BlockSnapshotBuilder::new(id, BlockKind::File)
             .role(Role::Asset)
@@ -2268,7 +2320,11 @@ mod tests {
     fn test_parse_block_snapshot_no_file_path() {
         let ctx = ContextId::new();
         let agent = PrincipalId::new();
-        let id = BlockId { context_id: ctx, agent_id: agent, seq: 2 };
+        let id = BlockId {
+            context_id: ctx,
+            agent_id: agent,
+            seq: 2,
+        };
 
         let snap = BlockSnapshotBuilder::new(id, BlockKind::Text)
             .role(Role::User)
@@ -2286,7 +2342,11 @@ mod tests {
     fn test_parse_block_snapshot_tool_kind_roundtrip() {
         let ctx = ContextId::new();
         let agent = PrincipalId::new();
-        let id = BlockId { context_id: ctx, agent_id: agent, seq: 3 };
+        let id = BlockId {
+            context_id: ctx,
+            agent_id: agent,
+            seq: 3,
+        };
 
         let snap = BlockSnapshotBuilder::new(id, BlockKind::ToolCall)
             .role(Role::Model)

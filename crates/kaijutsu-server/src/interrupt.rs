@@ -10,8 +10,8 @@
 //! - **Hard** (`immediate=true`): cancels the `CancellationToken` → the stream
 //!   event loop aborts immediately via `tokio::select!`.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio_util::sync::CancellationToken;
 
 /// Per-context cancellation state.

@@ -175,7 +175,10 @@ mod tests {
         let cache = font_cache();
         let path = cache.glyph_path(0xE050);
         assert!(path.is_some(), "Bravura should have treble clef glyph");
-        assert!(!path.unwrap().is_empty(), "Treble clef path should not be empty");
+        assert!(
+            !path.unwrap().is_empty(),
+            "Treble clef path should not be empty"
+        );
     }
 
     #[test]

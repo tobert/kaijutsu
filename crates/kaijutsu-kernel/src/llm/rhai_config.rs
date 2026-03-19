@@ -58,14 +58,14 @@ pub struct EmbeddingModelConfig {
 pub fn load_models_config(script: &str) -> LlmResult<ModelsConfig> {
     let mut engine = rhai::Engine::new();
     kaijutsu_rhai::register_stdlib(&mut engine);
-    let ast = engine.compile(script).map_err(|e| {
-        LlmError::InvalidRequest(format!("models.rhai parse error: {}", e))
-    })?;
+    let ast = engine
+        .compile(script)
+        .map_err(|e| LlmError::InvalidRequest(format!("models.rhai parse error: {}", e)))?;
 
     let mut scope = rhai::Scope::new();
-    engine.run_ast_with_scope(&mut scope, &ast).map_err(|e| {
-        LlmError::InvalidRequest(format!("models.rhai evaluation error: {}", e))
-    })?;
+    engine
+        .run_ast_with_scope(&mut scope, &ast)
+        .map_err(|e| LlmError::InvalidRequest(format!("models.rhai evaluation error: {}", e)))?;
 
     let llm = load_llm_config_from_scope(&scope);
     let embedding = extract_embedding_config(&scope);
@@ -82,14 +82,14 @@ pub fn load_models_config(script: &str) -> LlmResult<ModelsConfig> {
 pub fn load_llm_config(script: &str) -> LlmResult<LlmConfig> {
     let mut engine = rhai::Engine::new();
     kaijutsu_rhai::register_stdlib(&mut engine);
-    let ast = engine.compile(script).map_err(|e| {
-        LlmError::InvalidRequest(format!("models.rhai parse error: {}", e))
-    })?;
+    let ast = engine
+        .compile(script)
+        .map_err(|e| LlmError::InvalidRequest(format!("models.rhai parse error: {}", e)))?;
 
     let mut scope = rhai::Scope::new();
-    engine.run_ast_with_scope(&mut scope, &ast).map_err(|e| {
-        LlmError::InvalidRequest(format!("models.rhai evaluation error: {}", e))
-    })?;
+    engine
+        .run_ast_with_scope(&mut scope, &ast)
+        .map_err(|e| LlmError::InvalidRequest(format!("models.rhai evaluation error: {}", e)))?;
 
     Ok(load_llm_config_from_scope(&scope))
 }
@@ -316,10 +316,13 @@ pub fn initialize_llm_registry(config: &LlmConfig) -> LlmRegistry {
     // Set default provider
     if registry.set_default(&config.default_provider) {
         // Set default model from the provider's config
-        if let Some(pc) = config.providers.iter().find(|p| p.provider_type == config.default_provider) {
-            if let Some(ref model) = pc.default_model {
-                registry.set_default_model(model);
-            }
+        if let Some(pc) = config
+            .providers
+            .iter()
+            .find(|p| p.provider_type == config.default_provider)
+            && let Some(ref model) = pc.default_model
+        {
+            registry.set_default_model(model);
         }
         tracing::info!(provider = %config.default_provider, "set default LLM provider");
     } else {
@@ -384,12 +387,23 @@ let model_aliases = #{
         assert_eq!(config.default_provider, "anthropic");
         assert_eq!(config.providers.len(), 3);
 
-        let anthropic = config.providers.iter().find(|p| p.provider_type == "anthropic").unwrap();
+        let anthropic = config
+            .providers
+            .iter()
+            .find(|p| p.provider_type == "anthropic")
+            .unwrap();
         assert!(anthropic.enabled);
         assert_eq!(anthropic.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
-        assert_eq!(anthropic.default_model.as_deref(), Some("claude-haiku-4-5-20251001"));
+        assert_eq!(
+            anthropic.default_model.as_deref(),
+            Some("claude-haiku-4-5-20251001")
+        );
 
-        let gemini = config.providers.iter().find(|p| p.provider_type == "gemini").unwrap();
+        let gemini = config
+            .providers
+            .iter()
+            .find(|p| p.provider_type == "gemini")
+            .unwrap();
         assert!(!gemini.enabled);
 
         assert_eq!(config.model_aliases.len(), 3);
@@ -423,10 +437,18 @@ let providers = #{
 let model_aliases = #{};
 "#;
         let config = load_llm_config(script).unwrap();
-        let ollama = config.providers.iter().find(|p| p.provider_type == "ollama").unwrap();
+        let ollama = config
+            .providers
+            .iter()
+            .find(|p| p.provider_type == "ollama")
+            .unwrap();
         assert_eq!(ollama.default_tools, ToolFilter::deny(["shell", "bash"]));
 
-        let anthropic = config.providers.iter().find(|p| p.provider_type == "anthropic").unwrap();
+        let anthropic = config
+            .providers
+            .iter()
+            .find(|p| p.provider_type == "anthropic")
+            .unwrap();
         assert_eq!(anthropic.default_tools, ToolFilter::All);
     }
 
@@ -446,7 +468,11 @@ let providers = #{
 let model_aliases = #{};
 "#;
         let config = load_llm_config(script).unwrap();
-        let test = config.providers.iter().find(|p| p.provider_type == "test").unwrap();
+        let test = config
+            .providers
+            .iter()
+            .find(|p| p.provider_type == "test")
+            .unwrap();
         assert_eq!(test.default_tools, ToolFilter::allow(["read", "write"]));
     }
 
@@ -496,7 +522,9 @@ let model_aliases = #{};
         assert!(!config.llm.model_aliases.is_empty());
 
         // Embedding config should be present and enabled
-        let emb = config.embedding.expect("embedding section should be present");
+        let emb = config
+            .embedding
+            .expect("embedding section should be present");
         assert!(emb.enabled);
         assert_eq!(emb.dimensions, 384);
         assert_eq!(emb.max_tokens, 512);

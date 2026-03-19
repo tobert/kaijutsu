@@ -34,39 +34,56 @@ impl Drop for AbortOnDrop {
 }
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
-    handler::server::{router::tool::ToolRouter, router::prompt::PromptRouter, wrapper::Parameters},
+    handler::server::{
+        router::prompt::PromptRouter, router::tool::ToolRouter, wrapper::Parameters,
+    },
     model::{
-        // Prompt types
-        GetPromptRequestParams, GetPromptResult, ListPromptsResult,
-        PaginatedRequestParams, PromptMessage, PromptMessageRole,
         // Resource types
-        AnnotateAble, RawResource, ReadResourceRequestParams, ReadResourceResult, ResourceContents,
-        ListResourcesResult, SubscribeRequestParams, UnsubscribeRequestParams,
-        // Completion types
-        CompleteRequestParams, CompleteResult, CompletionInfo,
-        // Logging types
-        SetLevelRequestParams, LoggingLevel,
+        AnnotateAble,
         // Cancellation types
         CancelledNotificationParam,
+        // Completion types
+        CompleteRequestParams,
+        CompleteResult,
+        CompletionInfo,
+        // Prompt types
+        GetPromptRequestParams,
+        GetPromptResult,
+        ListPromptsResult,
+        ListResourcesResult,
+        LoggingLevel,
+        PaginatedRequestParams,
+        PromptMessage,
+        PromptMessageRole,
+        RawResource,
+        ReadResourceRequestParams,
+        ReadResourceResult,
+        ResourceContents,
         // Server types
-        ServerCapabilities, ServerInfo,
+        ServerCapabilities,
+        ServerInfo,
+        // Logging types
+        SetLevelRequestParams,
+        SubscribeRequestParams,
+        UnsubscribeRequestParams,
     },
-    prompt, prompt_handler, prompt_router, tool, tool_handler, tool_router,
+    prompt, prompt_handler, prompt_router,
     schemars::JsonSchema,
     service::{NotificationContext, RequestContext},
+    tool, tool_handler, tool_router,
 };
 
-use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
+use std::sync::{Arc, Mutex};
 
 use kaijutsu_client::{ActorHandle, ServerEvent, SshConfig, SyncManager, connect_ssh, spawn_actor};
 use kaijutsu_crdt::{BlockId, ContextId, ConversationDAG, PrincipalId, Status};
-use kaijutsu_kernel::{SharedBlockStore, shared_block_store, shared_block_flow_bus};
 use kaijutsu_kernel::block_store::DocumentKind as DocKind;
+use kaijutsu_kernel::{SharedBlockStore, shared_block_flow_bus, shared_block_store};
 
 // Re-export public types
-pub use models::*;
 use helpers::*;
+pub use models::*;
 use tree::format_dag_tree;
 
 // ============================================================================
@@ -273,12 +290,10 @@ impl KaijutsuMcp {
         let session_principal = PrincipalId::new();
 
         // Create an empty store — populated by register_session
-        let store = std::sync::Arc::new(
-            kaijutsu_kernel::BlockStore::with_flows(
-                session_principal,
-                shared_block_flow_bus(1024),
-            )
-        );
+        let store = std::sync::Arc::new(kaijutsu_kernel::BlockStore::with_flows(
+            session_principal,
+            shared_block_flow_bus(1024),
+        ));
 
         Ok(Self {
             backend: Backend::Remote(RemoteState {
@@ -336,12 +351,10 @@ impl KaijutsuMcp {
             Backend::Remote(remote) => {
                 let guard = remote.joined.read().await;
                 match guard.as_ref() {
-                    Some(joined) => Ok((
-                        joined.context_id,
-                        &remote.store,
-                        &remote.actor,
-                    )),
-                    None => Err("Error: no active context — call register_session first".to_string()),
+                    Some(joined) => Ok((joined.context_id, &remote.store, &remote.actor)),
+                    None => {
+                        Err("Error: no active context — call register_session first".to_string())
+                    }
                 }
             }
         }
@@ -351,33 +364,41 @@ impl KaijutsuMcp {
     ///
     /// Returns the number of ops pushed and the new ack version.
     pub async fn push_to_server(&self) -> Result<(usize, u64), anyhow::Error> {
-        let remote = self.remote()
+        let remote = self
+            .remote()
             .ok_or_else(|| anyhow::anyhow!("Not connected to server"))?;
 
         let guard = remote.joined.read().await;
-        let joined = guard.as_ref()
+        let joined = guard
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("No active context — call register_session first"))?;
 
         // Get ops since last sync frontier from SyncManager
         let frontier = {
-            let sync = joined.sync.lock()
+            let sync = joined
+                .sync
+                .lock()
                 .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
             sync.frontier().cloned().unwrap_or_default()
         };
 
-        let ops = remote.store.ops_since(joined.context_id, &frontier)
+        let ops = remote
+            .store
+            .ops_since(joined.context_id, &frontier)
             .map_err(|e| anyhow::anyhow!(e))?;
 
         // Check for empty payload before serializing
-        if ops.block_ops.is_empty() && ops.new_blocks.is_empty()
-            && ops.updated_headers.is_empty() && ops.deleted_blocks.is_empty()
+        if ops.block_ops.is_empty()
+            && ops.new_blocks.is_empty()
+            && ops.updated_headers.is_empty()
+            && ops.deleted_blocks.is_empty()
         {
             tracing::debug!("No ops to push");
             return Ok((0, 0));
         }
 
-        let ops_bytes = postcard::to_allocvec(&ops)
-            .map_err(|e| anyhow::anyhow!("Serialize error: {}", e))?;
+        let ops_bytes =
+            postcard::to_allocvec(&ops).map_err(|e| anyhow::anyhow!("Serialize error: {}", e))?;
 
         tracing::debug!(
             ctx = %joined.context_id,
@@ -386,7 +407,10 @@ impl KaijutsuMcp {
         );
 
         // Push via persistent actor (no reconnect dance)
-        let ack_version = remote.actor.push_ops(joined.context_id, &ops_bytes).await
+        let ack_version = remote
+            .actor
+            .push_ops(joined.context_id, &ops_bytes)
+            .await
             .map_err(|e| anyhow::anyhow!("Push ops: {e}"))?;
 
         tracing::info!(ctx = %joined.context_id, ack_version, "Pushed ops");
@@ -399,9 +423,7 @@ impl KaijutsuMcp {
     /// fails — the mutation already succeeded locally and the server echo will
     /// eventually converge via the background event listener.
     async fn push_after_mutation(&self) -> Option<String> {
-        if self.remote().is_none() {
-            return None; // Local mode, no server to push to
-        }
+        self.remote()?;
         match self.push_to_server().await {
             Ok((0, _)) => None, // No ops (shouldn't happen right after mutation, but harmless)
             Ok((n, v)) => {
@@ -429,10 +451,16 @@ impl KaijutsuMcp {
         actor: &ActorHandle,
         query: &str,
     ) -> Result<kaijutsu_crdt::ContextId, String> {
-        let contexts = actor.list_contexts().await
+        let contexts = actor
+            .list_contexts()
+            .await
             .map_err(|e| format!("Error listing contexts: {e}"))?;
         let entries = contexts.iter().map(|c| {
-            let label: Option<&str> = if c.label.is_empty() { None } else { Some(&c.label) };
+            let label: Option<&str> = if c.label.is_empty() {
+                None
+            } else {
+                Some(&c.label)
+            };
             (c.id, label)
         });
         kaijutsu_crdt::resolve_context_prefix(entries, query)
@@ -450,19 +478,18 @@ impl KaijutsuMcp {
     ) -> Result<kaijutsu_crdt::ContextId, String> {
         match (&self.backend, query) {
             // Explicit context provided — resolve it
-            (Backend::Remote(remote), Some(q)) => {
-                self.resolve_context(&remote.actor, q).await
-            }
+            (Backend::Remote(remote), Some(q)) => self.resolve_context(&remote.actor, q).await,
             (Backend::Local(_), Some(q)) => {
-                ContextId::parse(q)
-                    .map_err(|e| format!("Error: invalid context ID '{}': {}", q, e))
+                ContextId::parse(q).map_err(|e| format!("Error: invalid context ID '{}': {}", q, e))
             }
             // No context provided — use current joined context
             (Backend::Remote(remote), None) => {
                 let guard = remote.joined.read().await;
                 match guard.as_ref() {
                     Some(joined) => Ok(joined.context_id),
-                    None => Err("Error: no active context — call register_session first".to_string()),
+                    None => {
+                        Err("Error: no active context — call register_session first".to_string())
+                    }
                 }
             }
             (Backend::Local(_), None) => {
@@ -480,7 +507,10 @@ impl KaijutsuMcp {
         match &self.backend {
             Backend::Local(store) => Ok(store.list_ids()),
             Backend::Remote(remote) => {
-                let contexts = remote.actor.list_contexts().await
+                let contexts = remote
+                    .actor
+                    .list_contexts()
+                    .await
                     .map_err(|e| format!("Error listing contexts: {e}"))?;
                 Ok(contexts.iter().map(|c| c.id).collect())
             }
@@ -498,7 +528,9 @@ impl KaijutsuMcp {
         }
         // For Remote, fetch via getBlocks (all)
         if let Some(actor) = self.actor() {
-            actor.get_all_blocks(ctx_id).await
+            actor
+                .get_all_blocks(ctx_id)
+                .await
                 .map_err(|e| format!("Error fetching context {}: {e}", ctx_id.short()))
         } else {
             Err(format!("Context {} not found", ctx_id.short()))
@@ -510,22 +542,26 @@ impl KaijutsuMcp {
     async fn resolve_block(
         &self,
         block_id_str: &str,
-    ) -> Option<(ContextId, kaijutsu_crdt::BlockId, kaijutsu_crdt::BlockSnapshot)> {
+    ) -> Option<(
+        ContextId,
+        kaijutsu_crdt::BlockId,
+        kaijutsu_crdt::BlockSnapshot,
+    )> {
         let block_id = parse_block_id(block_id_str)?;
         let ctx = block_id.context_id;
 
         // Local store first
-        if let Some(entry) = self.store().get(ctx) {
-            if let Some(snap) = entry.doc.get_block_snapshot(&block_id) {
-                return Some((ctx, block_id, snap));
-            }
+        if let Some(entry) = self.store().get(ctx)
+            && let Some(snap) = entry.doc.get_block_snapshot(&block_id)
+        {
+            return Some((ctx, block_id, snap));
         }
 
         // Remote: single-block fetch via getBlocks(byIds)
-        if let Some(actor) = self.actor() {
-            if let Ok(Some(snap)) = actor.get_block(ctx, block_id).await {
-                return Some((ctx, block_id, snap));
-            }
+        if let Some(actor) = self.actor()
+            && let Ok(Some(snap)) = actor.get_block(ctx, block_id).await
+        {
+            return Some((ctx, block_id, snap));
         }
 
         None
@@ -558,7 +594,10 @@ impl KaijutsuMcp {
                 b.parent_id.as_ref() == Some(&cmd_block_id)
                     && b.is_shell()
                     && b.kind == kaijutsu_crdt::BlockKind::ToolResult
-                    && matches!(b.status, kaijutsu_crdt::Status::Done | kaijutsu_crdt::Status::Error)
+                    && matches!(
+                        b.status,
+                        kaijutsu_crdt::Status::Done | kaijutsu_crdt::Status::Error
+                    )
             })?;
             tracing::info!(
                 command = %command,
@@ -578,7 +617,8 @@ impl KaijutsuMcp {
             if start.elapsed().as_secs() > timeout_secs {
                 return format!(
                     "Timeout after {}s waiting for command.\nCommand block: {}\nCheck kaijutsu-app for partial output.",
-                    timeout_secs, cmd_block_id.to_key()
+                    timeout_secs,
+                    cmd_block_id.to_key()
                 );
             }
 
@@ -586,9 +626,10 @@ impl KaijutsuMcp {
             let event = tokio::time::timeout(fallback_interval, event_rx.recv()).await;
 
             match event {
-                Ok(Ok(ServerEvent::BlockStatusChanged { status, .. }))
-                    if matches!(status, kaijutsu_crdt::Status::Done | kaijutsu_crdt::Status::Error) =>
-                {
+                Ok(Ok(ServerEvent::BlockStatusChanged {
+                    status: kaijutsu_crdt::Status::Done | kaijutsu_crdt::Status::Error,
+                    ..
+                })) => {
                     if let Some(result) = check_completion("event") {
                         return result;
                     }
@@ -626,18 +667,34 @@ impl KaijutsuMcp {
     // Document Tools
     // ========================================================================
 
-    #[tool(description = "Create a new document for collaborative editing. Documents contain blocks of content organized in a DAG structure.",
-        annotations(destructive_hint = false, idempotent_hint = false, open_world_hint = false))]
+    #[tool(
+        description = "Create a new document for collaborative editing. Documents contain blocks of content organized in a DAG structure.",
+        annotations(
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
     #[tracing::instrument(skip(self, req), name = "mcp.doc_create")]
     fn doc_create(&self, Parameters(req): Parameters<DocCreateRequest>) -> String {
         let kind = match parse_document_kind(&req.kind) {
             Some(k) => k,
-            None => return format!("Error: invalid document kind '{}'. Use: conversation, code, text, or git", req.kind),
+            None => {
+                return format!(
+                    "Error: invalid document kind '{}'. Use: conversation, code, text, or git",
+                    req.kind
+                );
+            }
         };
 
         let context_id = match ContextId::parse(&req.id) {
             Ok(id) => id,
-            Err(e) => return format!("Error: invalid document ID '{}': {}. Must be a hex UUID.", req.id, e),
+            Err(e) => {
+                return format!(
+                    "Error: invalid document ID '{}': {}. Must be a hex UUID.",
+                    req.id, e
+                );
+            }
         };
 
         match self.store().create_document(context_id, kind, req.language) {
@@ -645,13 +702,16 @@ impl KaijutsuMcp {
                 "success": true,
                 "document_id": context_id.to_hex(),
                 "kind": req.kind
-            }).to_string(),
+            })
+            .to_string(),
             Err(e) => format!("Error: {}", e),
         }
     }
 
-    #[tool(description = "List all documents in the kernel with their metadata and block counts.",
-        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false))]
+    #[tool(
+        description = "List all documents in the kernel with their metadata and block counts.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
+    )]
     #[tracing::instrument(skip(self), name = "mcp.doc_list")]
     async fn doc_list(&self) -> String {
         // Get context metadata from server if connected
@@ -673,7 +733,9 @@ impl KaijutsuMcp {
 
         let mut docs = Vec::new();
         for id in &all_ids {
-            let (kind, language, block_count) = self.store().get(*id)
+            let (kind, language, block_count) = self
+                .store()
+                .get(*id)
                 .map(|entry| {
                     let kind = entry.kind.as_str().to_string();
                     let lang = entry.language.clone();
@@ -698,11 +760,14 @@ impl KaijutsuMcp {
         serde_json::json!({
             "documents": docs,
             "count": docs.len()
-        }).to_string()
+        })
+        .to_string()
     }
 
-    #[tool(description = "Delete a document and all its blocks.",
-        annotations(destructive_hint = true, open_world_hint = false))]
+    #[tool(
+        description = "Delete a document and all its blocks.",
+        annotations(destructive_hint = true, open_world_hint = false)
+    )]
     #[tracing::instrument(skip(self, req), name = "mcp.doc_delete")]
     fn doc_delete(&self, Parameters(req): Parameters<DocDeleteRequest>) -> String {
         let context_id = match ContextId::parse(&req.id) {
@@ -714,7 +779,8 @@ impl KaijutsuMcp {
             Ok(()) => serde_json::json!({
                 "success": true,
                 "deleted": req.id
-            }).to_string(),
+            })
+            .to_string(),
             Err(e) => format!("Error: {}", e),
         }
     }
@@ -723,8 +789,14 @@ impl KaijutsuMcp {
     // Block Tools
     // ========================================================================
 
-    #[tool(description = "Create a new block with role, kind, and optional content. Blocks are the atomic units of content in documents.",
-        annotations(destructive_hint = false, idempotent_hint = false, open_world_hint = false))]
+    #[tool(
+        description = "Create a new block with role, kind, and optional content. Blocks are the atomic units of content in documents.",
+        annotations(
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
     #[tracing::instrument(skip(self, req), name = "mcp.block_create")]
     async fn block_create(&self, Parameters(req): Parameters<BlockCreateRequest>) -> String {
         let context_id = match ContextId::parse(&req.document_id) {
@@ -734,12 +806,22 @@ impl KaijutsuMcp {
 
         let role = match parse_role(&req.role) {
             Some(r) => r,
-            None => return format!("Error: invalid role '{}'. Use: user, model, system, or tool", req.role),
+            None => {
+                return format!(
+                    "Error: invalid role '{}'. Use: user, model, system, or tool",
+                    req.role
+                );
+            }
         };
 
         let kind = match parse_block_kind(&req.kind) {
             Some(k) => k,
-            None => return format!("Error: invalid kind '{}'. Use: text, thinking, tool_call, or tool_result", req.kind),
+            None => {
+                return format!(
+                    "Error: invalid kind '{}'. Use: text, thinking, tool_call, or tool_result",
+                    req.kind
+                );
+            }
         };
 
         // Parse parent_id if provided
@@ -758,7 +840,9 @@ impl KaijutsuMcp {
             Some(self.session_principal),
         ) {
             Ok(block_id) => {
-                let version = self.store().get(context_id)
+                let version = self
+                    .store()
+                    .get(context_id)
                     .map(|e| e.version())
                     .unwrap_or(0);
 
@@ -766,7 +850,8 @@ impl KaijutsuMcp {
                     "success": true,
                     "block_id": block_id.to_key(),
                     "version": version
-                }).to_string();
+                })
+                .to_string();
 
                 if let Some(warn) = self.push_after_mutation().await {
                     result.push_str(&format!("\n\nWarning: {warn}"));
@@ -778,8 +863,10 @@ impl KaijutsuMcp {
         }
     }
 
-    #[tool(description = "Read block content with optional line numbers and range filtering. Returns formatted content suitable for editing.",
-        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false))]
+    #[tool(
+        description = "Read block content with optional line numbers and range filtering. Returns formatted content suitable for editing.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
+    )]
     #[tracing::instrument(skip(self, req), name = "mcp.block_read")]
     async fn block_read(&self, Parameters(req): Parameters<BlockReadRequest>) -> String {
         let (context_id, _block_id, snapshot) = match self.resolve_block(&req.block_id).await {
@@ -787,7 +874,9 @@ impl KaijutsuMcp {
             None => return format!("Error: block '{}' not found", req.block_id),
         };
 
-        let version = self.store().get(context_id)
+        let version = self
+            .store()
+            .get(context_id)
             .map(|e| e.version())
             .unwrap_or(0);
 
@@ -841,11 +930,14 @@ impl KaijutsuMcp {
             "version": version,
             "line_count": total_lines,
             "metadata": metadata,
-        }).to_string()
+        })
+        .to_string()
     }
 
-    #[tool(description = "Append text to a block. Optimized for streaming output - use this for incremental content updates.",
-        annotations(destructive_hint = false, open_world_hint = false))]
+    #[tool(
+        description = "Append text to a block. Optimized for streaming output - use this for incremental content updates.",
+        annotations(destructive_hint = false, open_world_hint = false)
+    )]
     #[tracing::instrument(skip(self, req), name = "mcp.block_append")]
     async fn block_append(&self, Parameters(req): Parameters<BlockAppendRequest>) -> String {
         let (context_id, block_id) = match find_block(self.store(), &req.block_id) {
@@ -853,16 +945,24 @@ impl KaijutsuMcp {
             None => return format!("Error: block '{}' not found", req.block_id),
         };
 
-        match self.store().append_text_as(context_id, &block_id, &req.text, Some(self.session_principal)) {
+        match self.store().append_text_as(
+            context_id,
+            &block_id,
+            &req.text,
+            Some(self.session_principal),
+        ) {
             Ok(()) => {
-                let version = self.store().get(context_id)
+                let version = self
+                    .store()
+                    .get(context_id)
                     .map(|e| e.version())
                     .unwrap_or(0);
 
                 let mut result = serde_json::json!({
                     "success": true,
                     "version": version
-                }).to_string();
+                })
+                .to_string();
 
                 if let Some(warn) = self.push_after_mutation().await {
                     result.push_str(&format!("\n\nWarning: {warn}"));
@@ -874,8 +974,10 @@ impl KaijutsuMcp {
         }
     }
 
-    #[tool(description = "Edit block content with line-based operations. Supports insert, delete, and replace with optional CAS validation.",
-        annotations(destructive_hint = false, open_world_hint = false))]
+    #[tool(
+        description = "Edit block content with line-based operations. Supports insert, delete, and replace with optional CAS validation.",
+        annotations(destructive_hint = false, open_world_hint = false)
+    )]
     #[tracing::instrument(skip(self, req), name = "mcp.block_edit")]
     async fn block_edit(&self, Parameters(req): Parameters<BlockEditRequest>) -> String {
         let (context_id, block_id) = match find_block(self.store(), &req.block_id) {
@@ -886,16 +988,19 @@ impl KaijutsuMcp {
         for (idx, op) in req.operations.into_iter().enumerate() {
             // Get current content
             let content = match self.store().get(context_id) {
-                Some(entry) => {
-                    entry.doc.get_block_snapshot(&block_id)
-                        .map(|s| s.content.clone())
-                        .unwrap_or_default()
-                }
-                None => return format!("Error: document not found"),
+                Some(entry) => entry
+                    .doc
+                    .get_block_snapshot(&block_id)
+                    .map(|s| s.content.clone())
+                    .unwrap_or_default(),
+                None => return "Error: document not found".to_string(),
             };
 
             let result = match op {
-                EditOp::Insert { line, content: text } => {
+                EditOp::Insert {
+                    line,
+                    content: text,
+                } => {
                     let total_lines = line_count(&content);
                     if let Some(pos) = line_to_byte_offset(&content, line) {
                         let text_with_newline = if text.ends_with('\n') || content.is_empty() {
@@ -903,31 +1008,65 @@ impl KaijutsuMcp {
                         } else {
                             format!("{}\n", text)
                         };
-                        self.store().edit_text_as(context_id, &block_id, pos, &text_with_newline, 0, Some(self.session_principal)).map_err(|e| e.to_string())
+                        self.store()
+                            .edit_text_as(
+                                context_id,
+                                &block_id,
+                                pos,
+                                &text_with_newline,
+                                0,
+                                Some(self.session_principal),
+                            )
+                            .map_err(|e| e.to_string())
                     } else {
                         Err(format!(
                             "Invalid line number {}: block has {} line{} (valid range: 0-{})",
-                            line, total_lines, if total_lines == 1 { "" } else { "s" }, total_lines
+                            line,
+                            total_lines,
+                            if total_lines == 1 { "" } else { "s" },
+                            total_lines
                         ))
                     }
                 }
-                EditOp::Delete { start_line, end_line } => {
+                EditOp::Delete {
+                    start_line,
+                    end_line,
+                } => {
                     let total_lines = line_count(&content);
-                    if let Some((start, end)) = line_range_to_byte_range(&content, start_line, end_line) {
+                    if let Some((start, end)) =
+                        line_range_to_byte_range(&content, start_line, end_line)
+                    {
                         if start < end {
-                            self.store().edit_text_as(context_id, &block_id, start, "", end - start, Some(self.session_principal)).map_err(|e| e.to_string())
+                            self.store()
+                                .edit_text_as(
+                                    context_id,
+                                    &block_id,
+                                    start,
+                                    "",
+                                    end - start,
+                                    Some(self.session_principal),
+                                )
+                                .map_err(|e| e.to_string())
                         } else {
                             Ok(())
                         }
                     } else {
                         Err(format!(
                             "Invalid line range {}-{}: block has {} line{} (valid range: 0-{})",
-                            start_line, end_line, total_lines,
-                            if total_lines == 1 { "" } else { "s" }, total_lines
+                            start_line,
+                            end_line,
+                            total_lines,
+                            if total_lines == 1 { "" } else { "s" },
+                            total_lines
                         ))
                     }
                 }
-                EditOp::Replace { start_line, end_line, content: text, expected_text } => {
+                EditOp::Replace {
+                    start_line,
+                    end_line,
+                    content: text,
+                    expected_text,
+                } => {
                     let total_lines = line_count(&content);
 
                     // CAS validation
@@ -939,22 +1078,39 @@ impl KaijutsuMcp {
                             .collect::<Vec<_>>()
                             .join("\n");
                         if actual.trim() != expected.trim() {
-                            return format!("Error: CAS validation failed at operation {}. Expected '{}' but found '{}'", idx, expected, actual);
+                            return format!(
+                                "Error: CAS validation failed at operation {}. Expected '{}' but found '{}'",
+                                idx, expected, actual
+                            );
                         }
                     }
 
-                    if let Some((start, end)) = line_range_to_byte_range(&content, start_line, end_line) {
+                    if let Some((start, end)) =
+                        line_range_to_byte_range(&content, start_line, end_line)
+                    {
                         let text_with_newline = if text.ends_with('\n') || text.is_empty() {
                             text
                         } else {
                             format!("{}\n", text)
                         };
-                        self.store().edit_text_as(context_id, &block_id, start, &text_with_newline, end - start, Some(self.session_principal)).map_err(|e| e.to_string())
+                        self.store()
+                            .edit_text_as(
+                                context_id,
+                                &block_id,
+                                start,
+                                &text_with_newline,
+                                end - start,
+                                Some(self.session_principal),
+                            )
+                            .map_err(|e| e.to_string())
                     } else {
                         Err(format!(
                             "Invalid line range {}-{}: block has {} line{} (valid range: 0-{})",
-                            start_line, end_line, total_lines,
-                            if total_lines == 1 { "" } else { "s" }, total_lines
+                            start_line,
+                            end_line,
+                            total_lines,
+                            if total_lines == 1 { "" } else { "s" },
+                            total_lines
                         ))
                     }
                 }
@@ -965,14 +1121,17 @@ impl KaijutsuMcp {
             }
         }
 
-        let version = self.store().get(context_id)
+        let version = self
+            .store()
+            .get(context_id)
             .map(|e| e.version())
             .unwrap_or(0);
 
         let mut result = serde_json::json!({
             "success": true,
             "version": version
-        }).to_string();
+        })
+        .to_string();
 
         if let Some(warn) = self.push_after_mutation().await {
             result.push_str(&format!("\n\nWarning: {warn}"));
@@ -981,8 +1140,10 @@ impl KaijutsuMcp {
         result
     }
 
-    #[tool(description = "List blocks with optional filters for document, kind, status, and role.",
-        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false))]
+    #[tool(
+        description = "List blocks with optional filters for document, kind, status, and role.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
+    )]
     #[tracing::instrument(skip(self, req), name = "mcp.block_list")]
     async fn block_list(&self, Parameters(req): Parameters<BlockListRequest>) -> String {
         let kind_filter = req.kind.as_ref().and_then(|k| parse_block_kind(k));
@@ -1034,7 +1195,6 @@ impl KaijutsuMcp {
                 }
             };
             for snapshot in snapshots {
-
                 // Create summary (first 100 chars)
                 let summary = if snapshot.content.chars().count() > 100 {
                     let truncated: String = snapshot.content.chars().take(100).collect();
@@ -1053,14 +1213,12 @@ impl KaijutsuMcp {
                 };
 
                 // Prepend drift source to summary for drift blocks
-                if snapshot.kind == kaijutsu_crdt::BlockKind::Drift {
-                    if let Some(ref ctx) = snapshot.source_context {
-                        let model = snapshot.source_model.as_deref().unwrap_or("?");
-                        block_sum.summary = format!(
-                            "[drift from {} via {}] {}",
-                            ctx, model, block_sum.summary
-                        );
-                    }
+                if snapshot.kind == kaijutsu_crdt::BlockKind::Drift
+                    && let Some(ref ctx) = snapshot.source_context
+                {
+                    let model = snapshot.source_model.as_deref().unwrap_or("?");
+                    block_sum.summary =
+                        format!("[drift from {} via {}] {}", ctx, model, block_sum.summary);
                 }
 
                 blocks.push(block_sum);
@@ -1070,11 +1228,18 @@ impl KaijutsuMcp {
         serde_json::json!({
             "blocks": blocks,
             "count": blocks.len()
-        }).to_string()
+        })
+        .to_string()
     }
 
-    #[tool(description = "Set the status of a block: pending, running, done, or error.",
-        annotations(destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
+    #[tool(
+        description = "Set the status of a block: pending, running, done, or error.",
+        annotations(
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
     #[tracing::instrument(skip(self, req), name = "mcp.block_status")]
     async fn block_status(&self, Parameters(req): Parameters<BlockStatusRequest>) -> String {
         let (context_id, block_id) = match find_block(self.store(), &req.block_id) {
@@ -1084,19 +1249,27 @@ impl KaijutsuMcp {
 
         let status = match parse_status(&req.status) {
             Some(s) => s,
-            None => return format!("Error: invalid status '{}'. Use: pending, running, done, or error", req.status),
+            None => {
+                return format!(
+                    "Error: invalid status '{}'. Use: pending, running, done, or error",
+                    req.status
+                );
+            }
         };
 
         match self.store().set_status(context_id, &block_id, status) {
             Ok(()) => {
-                let version = self.store().get(context_id)
+                let version = self
+                    .store()
+                    .get(context_id)
                     .map(|e| e.version())
                     .unwrap_or(0);
 
                 let mut result = serde_json::json!({
                     "success": true,
                     "version": version
-                }).to_string();
+                })
+                .to_string();
 
                 if let Some(warn) = self.push_after_mutation().await {
                     result.push_str(&format!("\n\nWarning: {warn}"));
@@ -1112,8 +1285,10 @@ impl KaijutsuMcp {
     // Search Tools
     // ========================================================================
 
-    #[tool(description = "Search across all blocks using regex patterns. Returns matches with context lines.",
-        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false))]
+    #[tool(
+        description = "Search across all blocks using regex patterns. Returns matches with context lines.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
+    )]
     #[tracing::instrument(skip(self, req), name = "mcp.kernel_search")]
     async fn kernel_search(&self, Parameters(req): Parameters<KernelSearchRequest>) -> String {
         let regex = match Regex::new(&req.query) {
@@ -1146,15 +1321,15 @@ impl KaijutsuMcp {
 
             for snapshot in snapshots {
                 // Apply filters
-                if let Some(kind) = kind_filter {
-                    if snapshot.kind != kind {
-                        continue;
-                    }
+                if let Some(kind) = kind_filter
+                    && snapshot.kind != kind
+                {
+                    continue;
                 }
-                if let Some(role) = role_filter {
-                    if snapshot.role != role {
-                        continue;
-                    }
+                if let Some(role) = role_filter
+                    && snapshot.role != role
+                {
+                    continue;
                 }
 
                 // Search content
@@ -1164,7 +1339,7 @@ impl KaijutsuMcp {
                         // Collect context
                         let before: Vec<String> = (0..req.context_lines as usize)
                             .filter_map(|i| {
-                                if line_idx >= i + 1 {
+                                if line_idx > i {
                                     Some(lines[line_idx - i - 1].to_string())
                                 } else {
                                     None
@@ -1176,9 +1351,7 @@ impl KaijutsuMcp {
                             .collect();
 
                         let after: Vec<String> = (1..=req.context_lines as usize)
-                            .filter_map(|i| {
-                                lines.get(line_idx + i).map(|s| s.to_string())
-                            })
+                            .filter_map(|i| lines.get(line_idx + i).map(|s| s.to_string()))
                             .collect();
 
                         matches.push(SearchMatch {
@@ -1202,15 +1375,18 @@ impl KaijutsuMcp {
             "matches": matches,
             "total": matches.len(),
             "truncated": matches.len() >= req.max_matches
-        }).to_string()
+        })
+        .to_string()
     }
 
     // ========================================================================
     // Debug/Visualization Tools
     // ========================================================================
 
-    #[tool(description = "Display a document's conversation DAG as a compact ASCII tree. Useful for understanding conversation structure and debugging.",
-        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false))]
+    #[tool(
+        description = "Display a document's conversation DAG as a compact ASCII tree. Useful for understanding conversation structure and debugging.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
+    )]
     #[tracing::instrument(skip(self, req), name = "mcp.doc_tree")]
     async fn doc_tree(&self, Parameters(req): Parameters<DocTreeRequest>) -> String {
         let context_id = match ContextId::parse(&req.document_id) {
@@ -1219,7 +1395,9 @@ impl KaijutsuMcp {
         };
 
         // Try local store first for kind metadata, fall back to "conversation"
-        let kind = self.store().get(context_id)
+        let kind = self
+            .store()
+            .get(context_id)
             .map(|e| e.kind.as_str().to_string())
             .unwrap_or_else(|| "conversation".to_string());
 
@@ -1232,8 +1410,11 @@ impl KaijutsuMcp {
         let mut output = String::new();
 
         // Header: document_id (kind, N blocks)
-        output.push_str(&format!("{} ({}, {} block{})\n",
-            req.document_id, kind, dag.len(),
+        output.push_str(&format!(
+            "{} ({}, {} block{})\n",
+            req.document_id,
+            kind,
+            dag.len(),
             if dag.len() == 1 { "" } else { "s" }
         ));
 
@@ -1247,8 +1428,10 @@ impl KaijutsuMcp {
         output
     }
 
-    #[tool(description = "Inspect CRDT internals of a block for debugging. Returns version, frontier, operation counts, and metadata.",
-        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false))]
+    #[tool(
+        description = "Inspect CRDT internals of a block for debugging. Returns version, frontier, operation counts, and metadata.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
+    )]
     #[tracing::instrument(skip(self, req), name = "mcp.block_inspect")]
     async fn block_inspect(&self, Parameters(req): Parameters<BlockInspectRequest>) -> String {
         let (context_id, _block_id, snapshot) = match self.resolve_block(&req.block_id).await {
@@ -1257,7 +1440,9 @@ impl KaijutsuMcp {
         };
 
         // Get CRDT internals from local store if available
-        let (version, block_count) = self.store().get(context_id)
+        let (version, block_count) = self
+            .store()
+            .get(context_id)
             .map(|e| (e.version(), e.doc.block_count()))
             .unwrap_or((0, 0));
 
@@ -1285,11 +1470,14 @@ impl KaijutsuMcp {
                 "is_error": snapshot.is_error,
                 "exit_code": snapshot.exit_code,
             }
-        }).to_string()
+        })
+        .to_string()
     }
 
-    #[tool(description = "Get version history information for a block. Shows creation time and current version details.",
-        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false))]
+    #[tool(
+        description = "Get version history information for a block. Shows creation time and current version details.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
+    )]
     #[tracing::instrument(skip(self, req), name = "mcp.block_history")]
     async fn block_history(&self, Parameters(req): Parameters<BlockHistoryRequest>) -> String {
         let (context_id, _block_id, snapshot) = match self.resolve_block(&req.block_id).await {
@@ -1298,7 +1486,9 @@ impl KaijutsuMcp {
         };
 
         let content_lines = line_count(&snapshot.content);
-        let version = self.store().get(context_id)
+        let version = self
+            .store()
+            .get(context_id)
             .map(|e| e.version())
             .unwrap_or(0);
 
@@ -1314,19 +1504,28 @@ impl KaijutsuMcp {
             "unknown".to_string()
         };
 
-        output.push_str(&format!("created: {} by {}\n", created_time, snapshot.author().to_hex()));
+        output.push_str(&format!(
+            "created: {} by {}\n",
+            created_time,
+            snapshot.author().to_hex()
+        ));
         output.push_str(&format!("version: {} (document version)\n", version));
-        output.push_str(&format!("content: {} line{}, {} byte{}\n",
-            content_lines, if content_lines == 1 { "" } else { "s" },
-            snapshot.content.len(), if snapshot.content.len() == 1 { "" } else { "s" }
+        output.push_str(&format!(
+            "content: {} line{}, {} byte{}\n",
+            content_lines,
+            if content_lines == 1 { "" } else { "s" },
+            snapshot.content.len(),
+            if snapshot.content.len() == 1 { "" } else { "s" }
         ));
         output.push_str(&format!("status: {}\n", snapshot.status.as_str()));
 
         output
     }
 
-    #[tool(description = "Compare block content against original text, showing a unified diff with +/- prefixes.",
-        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false))]
+    #[tool(
+        description = "Compare block content against original text, showing a unified diff with +/- prefixes.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
+    )]
     #[tracing::instrument(skip(self, req), name = "mcp.block_diff")]
     async fn block_diff(&self, Parameters(req): Parameters<BlockDiffRequest>) -> String {
         let (_context_id, _block_id, snapshot) = match self.resolve_block(&req.block_id).await {
@@ -1343,9 +1542,12 @@ impl KaijutsuMcp {
                 let mut output = String::new();
                 output.push_str(&format!("block: {}\n", req.block_id));
                 output.push_str(&format!("{}\n", "─".repeat(40)));
-                output.push_str(&format!("No original text provided for comparison.\n"));
-                output.push_str(&format!("Current content ({} lines, {} bytes):\n\n",
-                    line_count(current), current.len()));
+                output.push_str("No original text provided for comparison.\n");
+                output.push_str(&format!(
+                    "Current content ({} lines, {} bytes):\n\n",
+                    line_count(current),
+                    current.len()
+                ));
                 output.push_str(current);
                 return output;
             }
@@ -1399,8 +1601,10 @@ impl KaijutsuMcp {
     // Kaish Execution (via ActorHandle → ToolRegistry)
     // ========================================================================
 
-    #[tool(description = "Execute a kernel tool by exact name. Use list_kernel_tools to discover available tool names and their input schemas. Common tools: glob, grep, kernel_search. Requires --connect.",
-        annotations(open_world_hint = true))]
+    #[tool(
+        description = "Execute a kernel tool by exact name. Use list_kernel_tools to discover available tool names and their input schemas. Common tools: glob, grep, kernel_search. Requires --connect.",
+        annotations(open_world_hint = true)
+    )]
     #[tracing::instrument(skip(self, req), name = "mcp.kaish_exec")]
     async fn kaish_exec(&self, Parameters(req): Parameters<KaishExecRequest>) -> String {
         let actor = match self.actor() {
@@ -1420,13 +1624,18 @@ impl KaijutsuMcp {
         }
     }
 
-    #[tool(description = "List all kernel tools with their names, descriptions, categories, and input schemas. Use this to discover exact tool names for kaish_exec. Requires --connect.",
-        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false))]
+    #[tool(
+        description = "List all kernel tools with their names, descriptions, categories, and input schemas. Use this to discover exact tool names for kaish_exec. Requires --connect.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
+    )]
     #[tracing::instrument(skip(self), name = "mcp.list_kernel_tools")]
     async fn list_kernel_tools(&self) -> String {
         let actor = match self.actor() {
             Some(a) => a,
-            None => return "Error: list_kernel_tools requires --connect to kaijutsu-server".to_string(),
+            None => {
+                return "Error: list_kernel_tools requires --connect to kaijutsu-server"
+                    .to_string();
+            }
         };
 
         match actor.get_tool_schemas().await {
@@ -1439,14 +1648,17 @@ impl KaijutsuMcp {
                         "input_schema": serde_json::from_str::<serde_json::Value>(&s.input_schema).unwrap_or(serde_json::Value::Object(Default::default())),
                     })
                 }).collect();
-                serde_json::to_string_pretty(&tools).unwrap_or_else(|e| format!("Error serializing: {e}"))
+                serde_json::to_string_pretty(&tools)
+                    .unwrap_or_else(|e| format!("Error serializing: {e}"))
             }
             Err(e) => format!("Error: {e}"),
         }
     }
 
-    #[tool(description = "Execute a kaish command through the kernel. Output is written to CRDT blocks (observable in kaijutsu-app) and returned when complete. Use for shell commands like cargo, git, ls, etc. Requires --connect and register_session.",
-        annotations(open_world_hint = true))]
+    #[tool(
+        description = "Execute a kaish command through the kernel. Output is written to CRDT blocks (observable in kaijutsu-app) and returned when complete. Use for shell commands like cargo, git, ls, etc. Requires --connect and register_session.",
+        annotations(open_world_hint = true)
+    )]
     #[tracing::instrument(skip(self, req), name = "mcp.shell")]
     async fn shell(&self, Parameters(req): Parameters<ShellRequest>) -> String {
         let (ctx_id, _store, actor) = match self.require_joined().await {
@@ -1475,13 +1687,20 @@ impl KaijutsuMcp {
 
         let timeout_secs = req.timeout_secs.unwrap_or(300).min(600);
         self.execute_and_poll_shell(
-            remote, ctx_id, cmd_block_id, &req.command,
-            timeout_secs, "Shell command",
-        ).await
+            remote,
+            ctx_id,
+            cmd_block_id,
+            &req.command,
+            timeout_secs,
+            "Shell command",
+        )
+        .await
     }
 
-    #[tool(description = "Context-bound kaish shell. Executes commands in your current kernel context — '.' references it in kj commands. Full kaish: pipes, variables, scripting. Run `kj help` for context/drift/fork management or `kj drift help` for cross-context communication. Examples: 'kj context list --tree', 'kj fork --name alt', 'kj drift push impl \"found the bug\"', 'ls /mnt/project | grep rs'. Requires --connect and register_session.",
-        annotations(open_world_hint = true))]
+    #[tool(
+        description = "Context-bound kaish shell. Executes commands in your current kernel context — '.' references it in kj commands. Full kaish: pipes, variables, scripting. Run `kj help` for context/drift/fork management or `kj drift help` for cross-context communication. Examples: 'kj context list --tree', 'kj fork --name alt', 'kj drift push impl \"found the bug\"', 'ls /mnt/project | grep rs'. Requires --connect and register_session.",
+        annotations(open_world_hint = true)
+    )]
     #[tracing::instrument(skip(self, req), name = "mcp.context_shell")]
     async fn context_shell(&self, Parameters(req): Parameters<ContextShellRequest>) -> String {
         // Route through shell_execute — same path as the shell tool.
@@ -1509,22 +1728,38 @@ impl KaijutsuMcp {
 
         let timeout_secs = req.timeout_secs.unwrap_or(300).min(600);
         self.execute_and_poll_shell(
-            remote, ctx_id, cmd_block_id, &req.command,
-            timeout_secs, "Context shell command",
-        ).await
+            remote,
+            ctx_id,
+            cmd_block_id,
+            &req.command,
+            timeout_secs,
+            "Context shell command",
+        )
+        .await
     }
 
     // ========================================================================
     // Session Registration
     // ========================================================================
 
-    #[tool(description = "Register this agent session and create a context. Must be called before using context-dependent tools (block_create, shell, context_shell, etc.). Returns the new context ID and session info.",
-        annotations(destructive_hint = false, idempotent_hint = false, open_world_hint = false))]
+    #[tool(
+        description = "Register this agent session and create a context. Must be called before using context-dependent tools (block_create, shell, context_shell, etc.). Returns the new context ID and session info.",
+        annotations(
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
     #[tracing::instrument(skip(self, req), name = "mcp.register_session")]
-    async fn register_session(&self, Parameters(req): Parameters<RegisterSessionRequest>) -> String {
+    async fn register_session(
+        &self,
+        Parameters(req): Parameters<RegisterSessionRequest>,
+    ) -> String {
         let remote = match self.remote() {
             Some(r) => r,
-            None => return "Error: register_session requires --connect to kaijutsu-server".to_string(),
+            None => {
+                return "Error: register_session requires --connect to kaijutsu-server".to_string();
+            }
         };
 
         // Check if already joined
@@ -1535,7 +1770,8 @@ impl KaijutsuMcp {
                     "already_registered": true,
                     "context_id": joined.context_id.to_hex(),
                     "context_short": joined.context_id.short(),
-                }).to_string();
+                })
+                .to_string();
             }
         }
 
@@ -1572,21 +1808,20 @@ impl KaijutsuMcp {
             ) {
                 return format!("Error populating store: {e}");
             }
-        } else if let Err(e) = remote.store.create_document(
-            sync_state.context_id,
-            DocKind::Conversation,
-            None,
-        ) {
+        } else if let Err(e) =
+            remote
+                .store
+                .create_document(sync_state.context_id, DocKind::Conversation, None)
+        {
             return format!("Error creating document: {e}");
         }
 
         // 5. Init SyncManager
-        let frontier = remote.store.frontier(sync_state.context_id)
+        let frontier = remote
+            .store
+            .frontier(sync_state.context_id)
             .unwrap_or_default();
-        let sync = SyncManager::with_state(
-            Some(sync_state.context_id),
-            Some(frontier),
-        );
+        let sync = SyncManager::with_state(Some(sync_state.context_id), Some(frontier));
         let sync_arc = Arc::new(Mutex::new(sync));
 
         // 6. Spawn background event listener
@@ -1639,15 +1874,18 @@ impl KaijutsuMcp {
             "context_id": context_id.to_hex(),
             "context_short": context_id.short(),
             "label": label,
-        }).to_string()
+        })
+        .to_string()
     }
 
     // ========================================================================
     // Context Identity
     // ========================================================================
 
-    #[tool(description = "Get this MCP server's identity: context short ID, context name, authenticated user, agent session info. Useful for understanding your position in the drift network.",
-        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false))]
+    #[tool(
+        description = "Get this MCP server's identity: context short ID, context name, authenticated user, agent session info. Useful for understanding your position in the drift network.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
+    )]
     #[tracing::instrument(skip(self), name = "mcp.whoami")]
     async fn whoami(&self) -> String {
         let session_id = self.session_id.lock().ok().and_then(|g| g.clone());
@@ -1661,7 +1899,8 @@ impl KaijutsuMcp {
                     "context_name": self.context_name,
                     "session_id": session_id,
                     "agent_name": self.agent_name,
-                }).to_string();
+                })
+                .to_string();
             }
         };
 
@@ -1683,16 +1922,18 @@ impl KaijutsuMcp {
             "context_name": self.context_name,
             "session_id": session_id,
             "agent_name": self.agent_name,
-        }).to_string()
+        })
+        .to_string()
     }
-
 
     // ========================================================================
     // Input Document Tools (CRDT compose scratchpad)
     // ========================================================================
 
-    #[tool(description = "Read the current input document text for a context. The input document is a CRDT-backed scratchpad shared across all participants (compose box, agents, MCP tools). Omit context_id to use the current context.",
-        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false))]
+    #[tool(
+        description = "Read the current input document text for a context. The input document is a CRDT-backed scratchpad shared across all participants (compose box, agents, MCP tools). Omit context_id to use the current context.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
+    )]
     #[tracing::instrument(skip(self, req), name = "mcp.read_input")]
     async fn read_input(&self, Parameters(req): Parameters<InputReadRequest>) -> String {
         let ctx_id = match self.resolve_input_context(req.context_id.as_deref()).await {
@@ -1709,26 +1950,28 @@ impl KaijutsuMcp {
                         "context_id": ctx_id.short(),
                         "content": text,
                         "length": text.len(),
-                    }).to_string(),
+                    })
+                    .to_string(),
                     Err(e) => format!("Error: {}", e),
                 }
             }
-            Backend::Remote(remote) => {
-                match remote.actor.get_input_state(ctx_id).await {
-                    Ok(state) => serde_json::json!({
-                        "context_id": ctx_id.short(),
-                        "content": state.content,
-                        "length": state.content.len(),
-                        "version": state.version,
-                    }).to_string(),
-                    Err(e) => format!("Error: {}", e),
-                }
-            }
+            Backend::Remote(remote) => match remote.actor.get_input_state(ctx_id).await {
+                Ok(state) => serde_json::json!({
+                    "context_id": ctx_id.short(),
+                    "content": state.content,
+                    "length": state.content.len(),
+                    "version": state.version,
+                })
+                .to_string(),
+                Err(e) => format!("Error: {}", e),
+            },
         }
     }
 
-    #[tool(description = "Replace all text in the input document. Clears existing content and writes the new text. The input document is shared — changes are visible to all participants immediately. Omit context_id to use the current context.",
-        annotations(destructive_hint = false, open_world_hint = false))]
+    #[tool(
+        description = "Replace all text in the input document. Clears existing content and writes the new text. The input document is shared — changes are visible to all participants immediately. Omit context_id to use the current context.",
+        annotations(destructive_hint = false, open_world_hint = false)
+    )]
     #[tracing::instrument(skip(self, req), name = "mcp.write_input")]
     async fn write_input(&self, Parameters(req): Parameters<InputWriteRequest>) -> String {
         let ctx_id = match self.resolve_input_context(req.context_id.as_deref()).await {
@@ -1742,16 +1985,17 @@ impl KaijutsuMcp {
                 let _ = store.create_input_doc(ctx_id);
                 // Clear then write
                 let _ = store.clear_input(ctx_id);
-                if !req.text.is_empty() {
-                    if let Err(e) = store.edit_input(ctx_id, 0, &req.text, 0) {
-                        return format!("Error: {}", e);
-                    }
+                if !req.text.is_empty()
+                    && let Err(e) = store.edit_input(ctx_id, 0, &req.text, 0)
+                {
+                    return format!("Error: {}", e);
                 }
                 serde_json::json!({
                     "success": true,
                     "context_id": ctx_id.short(),
                     "length": req.text.len(),
-                }).to_string()
+                })
+                .to_string()
             }
             Backend::Remote(remote) => {
                 // Get current state to know how much to delete
@@ -1760,21 +2004,28 @@ impl KaijutsuMcp {
                     Err(e) => return format!("Error getting current state: {}", e),
                 };
                 // Delete all, then insert new text in one operation
-                match remote.actor.edit_input(ctx_id, 0, &req.text, current_len).await {
+                match remote
+                    .actor
+                    .edit_input(ctx_id, 0, &req.text, current_len)
+                    .await
+                {
                     Ok(version) => serde_json::json!({
                         "success": true,
                         "context_id": ctx_id.short(),
                         "length": req.text.len(),
                         "version": version,
-                    }).to_string(),
+                    })
+                    .to_string(),
                     Err(e) => format!("Error: {}", e),
                 }
             }
         }
     }
 
-    #[tool(description = "Surgical edit on the input document: insert and/or delete characters at a specific position. More efficient than write_input for small edits to large text. Omit context_id to use the current context.",
-        annotations(destructive_hint = false, open_world_hint = false))]
+    #[tool(
+        description = "Surgical edit on the input document: insert and/or delete characters at a specific position. More efficient than write_input for small edits to large text. Omit context_id to use the current context.",
+        annotations(destructive_hint = false, open_world_hint = false)
+    )]
     #[tracing::instrument(skip(self, req), name = "mcp.edit_input")]
     async fn edit_input(&self, Parameters(req): Parameters<InputEditRequest>) -> String {
         let ctx_id = match self.resolve_input_context(req.context_id.as_deref()).await {
@@ -1793,26 +2044,34 @@ impl KaijutsuMcp {
                             "success": true,
                             "context_id": ctx_id.short(),
                             "length": text.len(),
-                        }).to_string()
+                        })
+                        .to_string()
                     }
                     Err(e) => format!("Error: {}", e),
                 }
             }
             Backend::Remote(remote) => {
-                match remote.actor.edit_input(ctx_id, req.pos, &req.insert, req.delete).await {
+                match remote
+                    .actor
+                    .edit_input(ctx_id, req.pos, &req.insert, req.delete)
+                    .await
+                {
                     Ok(version) => serde_json::json!({
                         "success": true,
                         "context_id": ctx_id.short(),
                         "version": version,
-                    }).to_string(),
+                    })
+                    .to_string(),
                     Err(e) => format!("Error: {}", e),
                 }
             }
         }
     }
 
-    #[tool(description = "Submit the input document: snapshot its content into a conversation block and clear it. This is equivalent to pressing Enter in the compose box. Returns the created block ID and whether it was detected as a shell command. Omit context_id to use the current context.",
-        annotations(destructive_hint = true, open_world_hint = false))]
+    #[tool(
+        description = "Submit the input document: snapshot its content into a conversation block and clear it. This is equivalent to pressing Enter in the compose box. Returns the created block ID and whether it was detected as a shell command. Omit context_id to use the current context.",
+        annotations(destructive_hint = true, open_world_hint = false)
+    )]
     #[tracing::instrument(skip(self, req), name = "mcp.submit_input")]
     async fn submit_input(&self, Parameters(req): Parameters<InputSubmitRequest>) -> String {
         let ctx_id = match self.resolve_input_context(req.context_id.as_deref()).await {
@@ -1832,7 +2091,8 @@ impl KaijutsuMcp {
                         "success": true,
                         "context_id": ctx_id.short(),
                         "block_id": result.block_id.to_key(),
-                    }).to_string(),
+                    })
+                    .to_string(),
                     Err(e) => format!("Error: {}", e),
                 }
             }
@@ -1858,17 +2118,16 @@ impl KaijutsuMcp {
         &self,
         Parameters(args): Parameters<AnalyzeDocumentArgs>,
     ) -> Result<GetPromptResult, McpError> {
-        let context_id = ContextId::parse(&args.document_id)
-            .map_err(|e| McpError::invalid_params(
+        let context_id = ContextId::parse(&args.document_id).map_err(|e| {
+            McpError::invalid_params(
                 format!("Invalid document ID '{}': {}", args.document_id, e),
-                None
-            ))?;
+                None,
+            )
+        })?;
 
-        let entry = self.store().get(context_id)
-            .ok_or_else(|| McpError::invalid_params(
-                format!("Document '{}' not found", args.document_id),
-                None
-            ))?;
+        let entry = self.store().get(context_id).ok_or_else(|| {
+            McpError::invalid_params(format!("Document '{}' not found", args.document_id), None)
+        })?;
 
         let focus = args.focus.as_deref().unwrap_or("all");
         let blocks = entry.doc.blocks_ordered();
@@ -1927,7 +2186,8 @@ impl KaijutsuMcp {
             content.push_str(&format!("**Authors:** {}\n", authors_sorted.join(", ")));
 
             // Count by role
-            let mut role_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+            let mut role_counts: std::collections::HashMap<&str, usize> =
+                std::collections::HashMap::new();
             for block in &blocks {
                 *role_counts.entry(block.role.as_str()).or_insert(0) += 1;
             }
@@ -1941,9 +2201,7 @@ impl KaijutsuMcp {
             description: Some(format!("Analysis of document '{}'", args.document_id)),
             messages: vec![PromptMessage {
                 role: PromptMessageRole::User,
-                content: rmcp::model::PromptMessageContent::Text {
-                    text: content,
-                },
+                content: rmcp::model::PromptMessageContent::Text { text: content },
             }],
         })
     }
@@ -1960,24 +2218,20 @@ impl KaijutsuMcp {
         &self,
         Parameters(args): Parameters<SearchContextArgs>,
     ) -> Result<GetPromptResult, McpError> {
-        let regex = Regex::new(&args.query)
-            .map_err(|e| McpError::invalid_params(
-                format!("Invalid regex '{}': {}", args.query, e),
-                None
-            ))?;
+        let regex = Regex::new(&args.query).map_err(|e| {
+            McpError::invalid_params(format!("Invalid regex '{}': {}", args.query, e), None)
+        })?;
 
         let context_ids: Vec<ContextId> = if let Some(ref doc_id) = args.document_id {
-            let id = ContextId::parse(doc_id)
-                .map_err(|e| McpError::invalid_params(
-                    format!("Invalid document ID '{}': {}", doc_id, e),
-                    None
-                ))?;
+            let id = ContextId::parse(doc_id).map_err(|e| {
+                McpError::invalid_params(format!("Invalid document ID '{}': {}", doc_id, e), None)
+            })?;
             if self.store().contains(id) {
                 vec![id]
             } else {
                 return Err(McpError::invalid_params(
                     format!("Document '{}' not found", doc_id),
-                    None
+                    None,
                 ));
             }
         } else {
@@ -2013,8 +2267,8 @@ impl KaijutsuMcp {
 
                         // Context before
                         let start = line_idx.saturating_sub(context_lines);
-                        for i in start..line_idx {
-                            content.push_str(&format!("{:4} │ {}\n", i + 1, lines[i]));
+                        for (i, ctx_line) in lines[start..line_idx].iter().enumerate() {
+                            content.push_str(&format!("{:4} │ {}\n", start + i + 1, ctx_line));
                         }
 
                         // Matching line (highlighted)
@@ -2022,8 +2276,8 @@ impl KaijutsuMcp {
 
                         // Context after
                         let end = (line_idx + 1 + context_lines).min(lines.len());
-                        for i in (line_idx + 1)..end {
-                            content.push_str(&format!("{:4} │ {}\n", i + 1, lines[i]));
+                        for (i, ctx_line) in lines[(line_idx + 1)..end].iter().enumerate() {
+                            content.push_str(&format!("{:4} │ {}\n", line_idx + 2 + i, ctx_line));
                         }
 
                         content.push_str("```\n\n");
@@ -2047,9 +2301,7 @@ impl KaijutsuMcp {
             description: Some(format!("Search results for '{}'", args.query)),
             messages: vec![PromptMessage {
                 role: PromptMessageRole::User,
-                content: rmcp::model::PromptMessageContent::Text {
-                    text: content,
-                },
+                content: rmcp::model::PromptMessageContent::Text { text: content },
             }],
         })
     }
@@ -2066,16 +2318,18 @@ impl KaijutsuMcp {
         &self,
         Parameters(args): Parameters<EditingAssistantArgs>,
     ) -> Result<GetPromptResult, McpError> {
-        let (context_id, block_id) = find_block(self.store(), &args.block_id)
-            .ok_or_else(|| McpError::invalid_params(
-                format!("Block '{}' not found", args.block_id),
-                None
-            ))?;
+        let (context_id, block_id) = find_block(self.store(), &args.block_id).ok_or_else(|| {
+            McpError::invalid_params(format!("Block '{}' not found", args.block_id), None)
+        })?;
 
-        let entry = self.store().get(context_id)
+        let entry = self
+            .store()
+            .get(context_id)
             .ok_or_else(|| McpError::invalid_params("Document not found", None))?;
 
-        let snapshot = entry.doc.get_block_snapshot(&block_id)
+        let snapshot = entry
+            .doc
+            .get_block_snapshot(&block_id)
             .ok_or_else(|| McpError::invalid_params("Block not found", None))?;
 
         let edit_type = args.edit_type.as_deref().unwrap_or("refine");
@@ -2097,21 +2351,21 @@ impl KaijutsuMcp {
         content.push_str("```\n\n");
 
         // Add parent context if available
-        if let Some(parent_id) = snapshot.parent_id {
-            if let Some(parent_snap) = entry.doc.get_block_snapshot(&parent_id) {
-                content.push_str("## Parent Context\n\n");
-                let preview = if parent_snap.content.len() > 500 {
-                    format!("{}...", &parent_snap.content[..500])
-                } else {
-                    parent_snap.content.clone()
-                };
-                content.push_str(&format!(
-                    "[{}/{}]\n```\n{}\n```\n\n",
-                    parent_snap.role.as_str(),
-                    parent_snap.kind.as_str(),
-                    preview
-                ));
-            }
+        if let Some(parent_id) = snapshot.parent_id
+            && let Some(parent_snap) = entry.doc.get_block_snapshot(&parent_id)
+        {
+            content.push_str("## Parent Context\n\n");
+            let preview = if parent_snap.content.len() > 500 {
+                format!("{}...", &parent_snap.content[..500])
+            } else {
+                parent_snap.content.clone()
+            };
+            content.push_str(&format!(
+                "[{}/{}]\n```\n{}\n```\n\n",
+                parent_snap.role.as_str(),
+                parent_snap.kind.as_str(),
+                preview
+            ));
         }
 
         // Add edit-type specific instructions
@@ -2153,9 +2407,7 @@ impl KaijutsuMcp {
             description: Some(format!("Editing assistant for block '{}'", args.block_id)),
             messages: vec![PromptMessage {
                 role: PromptMessageRole::User,
-                content: rmcp::model::PromptMessageContent::Text {
-                    text: content,
-                },
+                content: rmcp::model::PromptMessageContent::Text { text: content },
             }],
         })
     }
@@ -2177,7 +2429,12 @@ fn apply_server_event(
     event: ServerEvent,
 ) {
     match event {
-        ServerEvent::BlockInserted { context_id: event_ctx_id, block, ops, .. } => {
+        ServerEvent::BlockInserted {
+            context_id: event_ctx_id,
+            block,
+            ops,
+            ..
+        } => {
             if event_ctx_id != context_id {
                 return;
             }
@@ -2192,7 +2449,11 @@ fn apply_server_event(
                 }
             }
         }
-        ServerEvent::BlockTextOps { context_id: event_ctx_id, ops, .. } => {
+        ServerEvent::BlockTextOps {
+            context_id: event_ctx_id,
+            ops,
+            ..
+        } => {
             if event_ctx_id != context_id {
                 return;
             }
@@ -2207,15 +2468,20 @@ fn apply_server_event(
                 }
             }
         }
-        ServerEvent::BlockStatusChanged { context_id: event_ctx_id, block_id, status, ref output } => {
+        ServerEvent::BlockStatusChanged {
+            context_id: event_ctx_id,
+            block_id,
+            status,
+            ref output,
+        } => {
             if event_ctx_id != context_id {
                 return;
             }
             // Apply piggybacked output data (not DTE-tracked)
-            if let Some(output_data) = output {
-                if let Err(e) = store.set_output(context_id, &block_id, Some(output_data)) {
-                    tracing::warn!("BlockStatusChanged set_output error: {e}");
-                }
+            if let Some(output_data) = output
+                && let Err(e) = store.set_output(context_id, &block_id, Some(output_data))
+            {
+                tracing::warn!("BlockStatusChanged set_output error: {e}");
             }
             // Use store's set_status — handles version bump and flow events
             if let Err(e) = store.set_status(context_id, &block_id, status) {
@@ -2267,53 +2533,66 @@ impl ServerHandler for KaijutsuMcp {
             let mut resources = Vec::new();
 
             // Add root docs resource
-            resources.push(RawResource {
-                uri: "kaijutsu://docs".to_string(),
-                name: "documents".to_string(),
-                title: Some("All Documents".to_string()),
-                description: Some("List of all documents in the kernel".to_string()),
-                mime_type: Some("application/json".to_string()),
-                size: None,
-                icons: None,
-                meta: None,
-            }.no_annotation());
+            resources.push(
+                RawResource {
+                    uri: "kaijutsu://docs".to_string(),
+                    name: "documents".to_string(),
+                    title: Some("All Documents".to_string()),
+                    description: Some("List of all documents in the kernel".to_string()),
+                    mime_type: Some("application/json".to_string()),
+                    size: None,
+                    icons: None,
+                    meta: None,
+                }
+                .no_annotation(),
+            );
 
             // Add each document as a resource
             for doc_id in self.store().list_ids() {
                 if let Some(entry) = self.store().get(doc_id) {
                     let doc_hex = doc_id.to_hex();
-                    resources.push(RawResource {
-                        uri: format!("kaijutsu://docs/{}", doc_hex),
-                        name: doc_hex.clone(),
-                        title: Some(format!("Document: {}", doc_hex)),
-                        description: Some(format!(
-                            "{} document with {} blocks",
-                            entry.kind.as_str(),
-                            entry.doc.blocks_ordered().len()
-                        )),
-                        mime_type: Some("application/json".to_string()),
-                        size: None,
-                        icons: None,
-                        meta: None,
-                    }.no_annotation());
+                    resources.push(
+                        RawResource {
+                            uri: format!("kaijutsu://docs/{}", doc_hex),
+                            name: doc_hex.clone(),
+                            title: Some(format!("Document: {}", doc_hex)),
+                            description: Some(format!(
+                                "{} document with {} blocks",
+                                entry.kind.as_str(),
+                                entry.doc.blocks_ordered().len()
+                            )),
+                            mime_type: Some("application/json".to_string()),
+                            size: None,
+                            icons: None,
+                            meta: None,
+                        }
+                        .no_annotation(),
+                    );
 
                     // Add each block as a resource
                     for snapshot in entry.doc.blocks_ordered() {
                         let block_key = snapshot.id.to_key();
-                        resources.push(RawResource {
-                            uri: format!("kaijutsu://blocks/{}/{}", doc_hex, block_key),
-                            name: block_key.clone(),
-                            title: Some(format!("[{}/{}]", snapshot.role.as_str(), snapshot.kind.as_str())),
-                            description: Some(format!(
-                                "{} block, {} bytes",
-                                snapshot.kind.as_str(),
-                                snapshot.content.len()
-                            )),
-                            mime_type: Some("text/plain".to_string()),
-                            size: Some(snapshot.content.len() as u32),
-                            icons: None,
-                            meta: None,
-                        }.no_annotation());
+                        resources.push(
+                            RawResource {
+                                uri: format!("kaijutsu://blocks/{}/{}", doc_hex, block_key),
+                                name: block_key.clone(),
+                                title: Some(format!(
+                                    "[{}/{}]",
+                                    snapshot.role.as_str(),
+                                    snapshot.kind.as_str()
+                                )),
+                                description: Some(format!(
+                                    "{} block, {} bytes",
+                                    snapshot.kind.as_str(),
+                                    snapshot.content.len()
+                                )),
+                                mime_type: Some("text/plain".to_string()),
+                                size: Some(snapshot.content.len() as u32),
+                                icons: None,
+                                meta: None,
+                            }
+                            .no_annotation(),
+                        );
                     }
                 }
             }
@@ -2338,19 +2617,26 @@ impl ServerHandler for KaijutsuMcp {
             // Parse URI: kaijutsu://docs, kaijutsu://docs/{id}, kaijutsu://blocks/{id}/{key}
             if uri == "kaijutsu://docs" {
                 // Return list of all documents
-                let docs: Vec<serde_json::Value> = self.store().list_ids().iter().map(|id| {
-                    let (kind, block_count) = self.store().get(*id)
-                        .map(|e| (e.kind.as_str().to_string(), e.doc.blocks_ordered().len()))
-                        .unwrap_or(("unknown".to_string(), 0));
-                    serde_json::json!({
-                        "id": id.to_hex(),
-                        "kind": kind,
-                        "block_count": block_count
+                let docs: Vec<serde_json::Value> = self
+                    .store()
+                    .list_ids()
+                    .iter()
+                    .map(|id| {
+                        let (kind, block_count) = self
+                            .store()
+                            .get(*id)
+                            .map(|e| (e.kind.as_str().to_string(), e.doc.blocks_ordered().len()))
+                            .unwrap_or(("unknown".to_string(), 0));
+                        serde_json::json!({
+                            "id": id.to_hex(),
+                            "kind": kind,
+                            "block_count": block_count
+                        })
                     })
-                }).collect();
+                    .collect();
 
-                let content = serde_json::to_string_pretty(&docs)
-                    .unwrap_or_else(|_| "[]".to_string());
+                let content =
+                    serde_json::to_string_pretty(&docs).unwrap_or_else(|_| "[]".to_string());
 
                 return Ok(ReadResourceResult {
                     contents: vec![ResourceContents::text(content, uri.clone())],
@@ -2358,31 +2644,35 @@ impl ServerHandler for KaijutsuMcp {
             }
 
             if let Some(doc_id_str) = uri.strip_prefix("kaijutsu://docs/") {
-                let doc_ctx_id = ContextId::parse(doc_id_str)
-                    .map_err(|e| McpError::invalid_params(
+                let doc_ctx_id = ContextId::parse(doc_id_str).map_err(|e| {
+                    McpError::invalid_params(
                         format!("Invalid document ID '{}': {}", doc_id_str, e),
-                        None
-                    ))?;
+                        None,
+                    )
+                })?;
                 // Return document metadata and block list
-                let entry = self.store().get(doc_ctx_id)
-                    .ok_or_else(|| McpError::invalid_params(
-                        format!("Document '{}' not found", doc_id_str),
-                        None
-                    ))?;
+                let entry = self.store().get(doc_ctx_id).ok_or_else(|| {
+                    McpError::invalid_params(format!("Document '{}' not found", doc_id_str), None)
+                })?;
 
-                let blocks: Vec<serde_json::Value> = entry.doc.blocks_ordered().iter().map(|s| {
-                    serde_json::json!({
-                        "id": s.id.to_key(),
-                        "role": s.role.as_str(),
-                        "kind": s.kind.as_str(),
-                        "status": s.status.as_str(),
-                        "content_preview": if s.content.len() > 100 {
-                            format!("{}...", &s.content[..100])
-                        } else {
-                            s.content.clone()
-                        }
+                let blocks: Vec<serde_json::Value> = entry
+                    .doc
+                    .blocks_ordered()
+                    .iter()
+                    .map(|s| {
+                        serde_json::json!({
+                            "id": s.id.to_key(),
+                            "role": s.role.as_str(),
+                            "kind": s.kind.as_str(),
+                            "status": s.status.as_str(),
+                            "content_preview": if s.content.len() > 100 {
+                                format!("{}...", &s.content[..100])
+                            } else {
+                                s.content.clone()
+                            }
+                        })
                     })
-                }).collect();
+                    .collect();
 
                 let result = serde_json::json!({
                     "id": doc_id_str,
@@ -2392,8 +2682,8 @@ impl ServerHandler for KaijutsuMcp {
                     "blocks": blocks
                 });
 
-                let content = serde_json::to_string_pretty(&result)
-                    .unwrap_or_else(|_| "{}".to_string());
+                let content =
+                    serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
 
                 return Ok(ReadResourceResult {
                     contents: vec![ResourceContents::text(content, uri.clone())],
@@ -2406,36 +2696,44 @@ impl ServerHandler for KaijutsuMcp {
                 if parts.len() != 2 {
                     return Err(McpError::invalid_params(
                         format!("Invalid block URI format: {}", uri),
-                        None
+                        None,
                     ));
                 }
 
                 let doc_id_str = parts[0];
                 let block_key = parts[1];
 
-                let (found_ctx_id, block_id) = find_block(self.store(), block_key)
-                    .ok_or_else(|| McpError::invalid_params(
-                        format!("Block '{}' not found in document '{}'", block_key, doc_id_str),
-                        None
-                    ))?;
+                let (found_ctx_id, block_id) =
+                    find_block(self.store(), block_key).ok_or_else(|| {
+                        McpError::invalid_params(
+                            format!(
+                                "Block '{}' not found in document '{}'",
+                                block_key, doc_id_str
+                            ),
+                            None,
+                        )
+                    })?;
 
-                let entry = self.store().get(found_ctx_id)
-                    .ok_or_else(|| McpError::invalid_params(
-                        format!("Document '{}' not found", doc_id_str),
-                        None
-                    ))?;
+                let entry = self.store().get(found_ctx_id).ok_or_else(|| {
+                    McpError::invalid_params(format!("Document '{}' not found", doc_id_str), None)
+                })?;
 
-                let snapshot = entry.doc.get_block_snapshot(&block_id)
+                let snapshot = entry
+                    .doc
+                    .get_block_snapshot(&block_id)
                     .ok_or_else(|| McpError::invalid_params("Block not found", None))?;
 
                 return Ok(ReadResourceResult {
-                    contents: vec![ResourceContents::text(snapshot.content.clone(), uri.clone())],
+                    contents: vec![ResourceContents::text(
+                        snapshot.content.clone(),
+                        uri.clone(),
+                    )],
                 });
             }
 
             Err(McpError::invalid_params(
                 format!("Unknown resource URI: {}", uri),
-                None
+                None,
             ))
         }
     }
@@ -2447,7 +2745,10 @@ impl ServerHandler for KaijutsuMcp {
         _context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<(), McpError>> + Send + '_ {
         async move {
-            let mut subs = self.server_state.subscriptions.lock()
+            let mut subs = self
+                .server_state
+                .subscriptions
+                .lock()
                 .map_err(|_| McpError::internal_error("Lock error", None))?;
             subs.insert(request.uri);
             Ok(())
@@ -2461,7 +2762,10 @@ impl ServerHandler for KaijutsuMcp {
         _context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<(), McpError>> + Send + '_ {
         async move {
-            let mut subs = self.server_state.subscriptions.lock()
+            let mut subs = self
+                .server_state
+                .subscriptions
+                .lock()
                 .map_err(|_| McpError::internal_error("Lock error", None))?;
             subs.remove(&request.uri);
             Ok(())
@@ -2484,9 +2788,13 @@ impl ServerHandler for KaijutsuMcp {
                     // Complete prompt arguments
                     match prompt_ref.name.as_str() {
                         "analyze_document" | "editing_assistant" => {
-                            if request.argument.name == "document_id" || request.argument.name == "block_id" {
+                            if request.argument.name == "document_id"
+                                || request.argument.name == "block_id"
+                            {
                                 // Complete document IDs
-                                self.store().list_ids().into_iter()
+                                self.store()
+                                    .list_ids()
+                                    .into_iter()
                                     .map(|id| id.to_hex())
                                     .filter(|id| id.contains(&request.argument.value))
                                     .take(10)
@@ -2511,7 +2819,9 @@ impl ServerHandler for KaijutsuMcp {
                         }
                         "search_context" => {
                             if request.argument.name == "document_id" {
-                                self.store().list_ids().into_iter()
+                                self.store()
+                                    .list_ids()
+                                    .into_iter()
                                     .map(|id| id.to_hex())
                                     .filter(|id| id.contains(&request.argument.value))
                                     .take(10)
@@ -2527,7 +2837,9 @@ impl ServerHandler for KaijutsuMcp {
                     // Complete resource URIs
                     let prefix = &resource_ref.uri;
                     if prefix.starts_with("kaijutsu://docs") {
-                        self.store().list_ids().into_iter()
+                        self.store()
+                            .list_ids()
+                            .into_iter()
                             .map(|id| format!("kaijutsu://docs/{}", id.to_hex()))
                             .filter(|uri| uri.contains(&request.argument.value))
                             .take(10)
@@ -2559,7 +2871,10 @@ impl ServerHandler for KaijutsuMcp {
         _context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<(), McpError>> + Send + '_ {
         async move {
-            let mut level = self.server_state.log_level.lock()
+            let mut level = self
+                .server_state
+                .log_level
+                .lock()
                 .map_err(|_| McpError::internal_error("Lock error", None))?;
             *level = request.level;
             tracing::info!("Log level set to {:?}", request.level);
@@ -2600,7 +2915,10 @@ mod tests {
             language: None,
         }));
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert!(parsed["success"].as_bool().unwrap_or(false), "doc_create failed: {result}");
+        assert!(
+            parsed["success"].as_bool().unwrap_or(false),
+            "doc_create failed: {result}"
+        );
         parsed["document_id"].as_str().unwrap().to_string()
     }
 
@@ -2625,14 +2943,16 @@ mod tests {
         let doc_id = create_test_doc(&mcp, "code");
 
         // Create a block
-        let result = mcp.block_create(Parameters(BlockCreateRequest {
-            document_id: doc_id.clone(),
-            parent_id: None,
-            after_id: None,
-            role: "user".to_string(),
-            kind: "text".to_string(),
-            content: Some("Hello, world!".to_string()),
-        })).await;
+        let result = mcp
+            .block_create(Parameters(BlockCreateRequest {
+                document_id: doc_id.clone(),
+                parent_id: None,
+                after_id: None,
+                role: "user".to_string(),
+                kind: "text".to_string(),
+                content: Some("Hello, world!".to_string()),
+            }))
+            .await;
         assert!(result.contains("success"));
         assert!(result.contains("block_id"));
 
@@ -2641,11 +2961,13 @@ mod tests {
         let block_id = parsed["block_id"].as_str().unwrap();
 
         // Read the block
-        let result = mcp.block_read(Parameters(BlockReadRequest {
-            block_id: block_id.to_string(),
-            line_numbers: true,
-            range: None,
-        })).await;
+        let result = mcp
+            .block_read(Parameters(BlockReadRequest {
+                block_id: block_id.to_string(),
+                line_numbers: true,
+                range: None,
+            }))
+            .await;
         assert!(result.contains("Hello, world!"));
         assert!(result.contains("user"));
         assert!(result.contains("text"));
@@ -2657,31 +2979,37 @@ mod tests {
 
         let doc_id = create_test_doc(&mcp, "conversation");
 
-        let result = mcp.block_create(Parameters(BlockCreateRequest {
-            document_id: doc_id.clone(),
-            parent_id: None,
-            after_id: None,
-            role: "model".to_string(),
-            kind: "text".to_string(),
-            content: Some("Hello".to_string()),
-        })).await;
+        let result = mcp
+            .block_create(Parameters(BlockCreateRequest {
+                document_id: doc_id.clone(),
+                parent_id: None,
+                after_id: None,
+                role: "model".to_string(),
+                kind: "text".to_string(),
+                content: Some("Hello".to_string()),
+            }))
+            .await;
 
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         let block_id = parsed["block_id"].as_str().unwrap();
 
         // Append text
-        let result = mcp.block_append(Parameters(BlockAppendRequest {
-            block_id: block_id.to_string(),
-            text: ", world!".to_string(),
-        })).await;
+        let result = mcp
+            .block_append(Parameters(BlockAppendRequest {
+                block_id: block_id.to_string(),
+                text: ", world!".to_string(),
+            }))
+            .await;
         assert!(result.contains("success"));
 
         // Verify content
-        let result = mcp.block_read(Parameters(BlockReadRequest {
-            block_id: block_id.to_string(),
-            line_numbers: false,
-            range: None,
-        })).await;
+        let result = mcp
+            .block_read(Parameters(BlockReadRequest {
+                block_id: block_id.to_string(),
+                line_numbers: false,
+                range: None,
+            }))
+            .await;
         assert!(result.contains("Hello, world!"));
     }
 
@@ -2698,7 +3026,8 @@ mod tests {
             role: "user".to_string(),
             kind: "text".to_string(),
             content: Some("The quick brown fox".to_string()),
-        })).await;
+        }))
+        .await;
 
         mcp.block_create(Parameters(BlockCreateRequest {
             document_id: doc_id,
@@ -2707,17 +3036,20 @@ mod tests {
             role: "model".to_string(),
             kind: "text".to_string(),
             content: Some("The lazy dog".to_string()),
-        })).await;
+        }))
+        .await;
 
         // Search for "The"
-        let result = mcp.kernel_search(Parameters(KernelSearchRequest {
-            query: "The".to_string(),
-            document_id: None,
-            kind: None,
-            role: None,
-            context_lines: 0,
-            max_matches: 100,
-        })).await;
+        let result = mcp
+            .kernel_search(Parameters(KernelSearchRequest {
+                query: "The".to_string(),
+                document_id: None,
+                kind: None,
+                role: None,
+                context_lines: 0,
+                max_matches: 100,
+            }))
+            .await;
 
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["total"], 2);
@@ -2730,14 +3062,16 @@ mod tests {
         let doc_id = create_test_doc(&mcp, "conversation");
 
         // Create a simple conversation structure
-        let result = mcp.block_create(Parameters(BlockCreateRequest {
-            document_id: doc_id.clone(),
-            parent_id: None,
-            after_id: None,
-            role: "user".to_string(),
-            kind: "text".to_string(),
-            content: Some("Hello!".to_string()),
-        })).await;
+        let result = mcp
+            .block_create(Parameters(BlockCreateRequest {
+                document_id: doc_id.clone(),
+                parent_id: None,
+                after_id: None,
+                role: "user".to_string(),
+                kind: "text".to_string(),
+                content: Some("Hello!".to_string()),
+            }))
+            .await;
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         let user_block_id = parsed["block_id"].as_str().unwrap().to_string();
 
@@ -2748,14 +3082,17 @@ mod tests {
             role: "model".to_string(),
             kind: "text".to_string(),
             content: Some("Hi there!".to_string()),
-        })).await;
+        }))
+        .await;
 
         // Test doc_tree output
-        let result = mcp.doc_tree(Parameters(DocTreeRequest {
-            document_id: doc_id,
-            max_depth: None,
-            expand_tools: false,
-        })).await;
+        let result = mcp
+            .doc_tree(Parameters(DocTreeRequest {
+                document_id: doc_id,
+                max_depth: None,
+                expand_tools: false,
+            }))
+            .await;
 
         assert!(result.contains("conversation"));
         assert!(result.contains("2 blocks"));
@@ -2770,14 +3107,16 @@ mod tests {
         let doc_id = create_test_doc(&mcp, "conversation");
 
         // Create a tool call
-        let result = mcp.block_create(Parameters(BlockCreateRequest {
-            document_id: doc_id.clone(),
-            parent_id: None,
-            after_id: None,
-            role: "model".to_string(),
-            kind: "tool_call".to_string(),
-            content: Some("{\"path\": \"/test\"}".to_string()),
-        })).await;
+        let result = mcp
+            .block_create(Parameters(BlockCreateRequest {
+                document_id: doc_id.clone(),
+                parent_id: None,
+                after_id: None,
+                role: "model".to_string(),
+                kind: "tool_call".to_string(),
+                content: Some("{\"path\": \"/test\"}".to_string()),
+            }))
+            .await;
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         let tool_call_id = parsed["block_id"].as_str().unwrap().to_string();
 
@@ -2789,24 +3128,29 @@ mod tests {
             role: "tool".to_string(),
             kind: "tool_result".to_string(),
             content: Some("File contents".to_string()),
-        })).await;
+        }))
+        .await;
 
         // Test collapsed format (default)
-        let result = mcp.doc_tree(Parameters(DocTreeRequest {
-            document_id: doc_id.clone(),
-            max_depth: None,
-            expand_tools: false,
-        })).await;
+        let result = mcp
+            .doc_tree(Parameters(DocTreeRequest {
+                document_id: doc_id.clone(),
+                max_depth: None,
+                expand_tools: false,
+            }))
+            .await;
 
         // Collapsed format shows "→ ✓" or "→ ✗"
         assert!(result.contains("→ ✓") || result.contains("tool("));
 
         // Test expanded format
-        let result = mcp.doc_tree(Parameters(DocTreeRequest {
-            document_id: doc_id,
-            max_depth: None,
-            expand_tools: true,
-        })).await;
+        let result = mcp
+            .doc_tree(Parameters(DocTreeRequest {
+                document_id: doc_id,
+                max_depth: None,
+                expand_tools: true,
+            }))
+            .await;
 
         // Expanded format shows both nodes separately
         assert!(result.contains("[model/tool_call]"));
@@ -2819,21 +3163,25 @@ mod tests {
 
         let doc_id = create_test_doc(&mcp, "conversation");
 
-        let result = mcp.block_create(Parameters(BlockCreateRequest {
-            document_id: doc_id,
-            parent_id: None,
-            after_id: None,
-            role: "user".to_string(),
-            kind: "text".to_string(),
-            content: Some("Test content".to_string()),
-        })).await;
+        let result = mcp
+            .block_create(Parameters(BlockCreateRequest {
+                document_id: doc_id,
+                parent_id: None,
+                after_id: None,
+                role: "user".to_string(),
+                kind: "text".to_string(),
+                content: Some("Test content".to_string()),
+            }))
+            .await;
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         let block_id = parsed["block_id"].as_str().unwrap();
 
         // Test block_inspect
-        let result = mcp.block_inspect(Parameters(BlockInspectRequest {
-            block_id: block_id.to_string(),
-        })).await;
+        let result = mcp
+            .block_inspect(Parameters(BlockInspectRequest {
+                block_id: block_id.to_string(),
+            }))
+            .await;
 
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert!(parsed["block_id"].is_string());
@@ -2850,22 +3198,26 @@ mod tests {
 
         let doc_id = create_test_doc(&mcp, "conversation");
 
-        let result = mcp.block_create(Parameters(BlockCreateRequest {
-            document_id: doc_id,
-            parent_id: None,
-            after_id: None,
-            role: "model".to_string(),
-            kind: "text".to_string(),
-            content: Some("Initial content".to_string()),
-        })).await;
+        let result = mcp
+            .block_create(Parameters(BlockCreateRequest {
+                document_id: doc_id,
+                parent_id: None,
+                after_id: None,
+                role: "model".to_string(),
+                kind: "text".to_string(),
+                content: Some("Initial content".to_string()),
+            }))
+            .await;
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         let block_id = parsed["block_id"].as_str().unwrap();
 
         // Test block_history
-        let result = mcp.block_history(Parameters(BlockHistoryRequest {
-            block_id: block_id.to_string(),
-            limit: None,
-        })).await;
+        let result = mcp
+            .block_history(Parameters(BlockHistoryRequest {
+                block_id: block_id.to_string(),
+                limit: None,
+            }))
+            .await;
 
         assert!(result.contains("block:"));
         assert!(result.contains("created:"));
@@ -2880,25 +3232,29 @@ mod tests {
 
         let doc_id = create_test_doc(&mcp, "conversation");
 
-        let result = mcp.block_create(Parameters(BlockCreateRequest {
-            document_id: doc_id,
-            parent_id: None,
-            after_id: None,
-            role: "user".to_string(),
-            kind: "text".to_string(),
-            content: Some("Single line".to_string()),
-        })).await;
+        let result = mcp
+            .block_create(Parameters(BlockCreateRequest {
+                document_id: doc_id,
+                parent_id: None,
+                after_id: None,
+                role: "user".to_string(),
+                kind: "text".to_string(),
+                content: Some("Single line".to_string()),
+            }))
+            .await;
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         let block_id = parsed["block_id"].as_str().unwrap();
 
         // Try to delete a line range that doesn't exist
-        let result = mcp.block_edit(Parameters(BlockEditRequest {
-            block_id: block_id.to_string(),
-            operations: vec![EditOp::Delete {
-                start_line: 5,
-                end_line: 10,
-            }],
-        })).await;
+        let result = mcp
+            .block_edit(Parameters(BlockEditRequest {
+                block_id: block_id.to_string(),
+                operations: vec![EditOp::Delete {
+                    start_line: 5,
+                    end_line: 10,
+                }],
+            }))
+            .await;
 
         // Should have improved error message
         assert!(result.contains("Invalid line range 5-10"));
@@ -2912,22 +3268,26 @@ mod tests {
 
         let doc_id = create_test_doc(&mcp, "conversation");
 
-        let result = mcp.block_create(Parameters(BlockCreateRequest {
-            document_id: doc_id,
-            parent_id: None,
-            after_id: None,
-            role: "user".to_string(),
-            kind: "text".to_string(),
-            content: Some("Hello\nWorld\nFoo".to_string()),
-        })).await;
+        let result = mcp
+            .block_create(Parameters(BlockCreateRequest {
+                document_id: doc_id,
+                parent_id: None,
+                after_id: None,
+                role: "user".to_string(),
+                kind: "text".to_string(),
+                content: Some("Hello\nWorld\nFoo".to_string()),
+            }))
+            .await;
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         let block_id = parsed["block_id"].as_str().unwrap();
 
         // Test diff with original
-        let result = mcp.block_diff(Parameters(BlockDiffRequest {
-            block_id: block_id.to_string(),
-            original: Some("Hello\nOld\nFoo".to_string()),
-        })).await;
+        let result = mcp
+            .block_diff(Parameters(BlockDiffRequest {
+                block_id: block_id.to_string(),
+                original: Some("Hello\nOld\nFoo".to_string()),
+            }))
+            .await;
 
         assert!(result.contains("diff"));
         assert!(result.contains("- Old"));
@@ -2935,10 +3295,12 @@ mod tests {
         assert!(result.contains("  Hello")); // Unchanged line
 
         // Test diff without original (shows summary)
-        let result = mcp.block_diff(Parameters(BlockDiffRequest {
-            block_id: block_id.to_string(),
-            original: None,
-        })).await;
+        let result = mcp
+            .block_diff(Parameters(BlockDiffRequest {
+                block_id: block_id.to_string(),
+                original: None,
+            }))
+            .await;
 
         assert!(result.contains("No original text provided"));
         assert!(result.contains("3 lines"));
@@ -2950,22 +3312,26 @@ mod tests {
 
         let doc_id = create_test_doc(&mcp, "conversation");
 
-        let result = mcp.block_create(Parameters(BlockCreateRequest {
-            document_id: doc_id,
-            parent_id: None,
-            after_id: None,
-            role: "user".to_string(),
-            kind: "text".to_string(),
-            content: Some("Same content".to_string()),
-        })).await;
+        let result = mcp
+            .block_create(Parameters(BlockCreateRequest {
+                document_id: doc_id,
+                parent_id: None,
+                after_id: None,
+                role: "user".to_string(),
+                kind: "text".to_string(),
+                content: Some("Same content".to_string()),
+            }))
+            .await;
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         let block_id = parsed["block_id"].as_str().unwrap();
 
         // Test diff with identical original
-        let result = mcp.block_diff(Parameters(BlockDiffRequest {
-            block_id: block_id.to_string(),
-            original: Some("Same content".to_string()),
-        })).await;
+        let result = mcp
+            .block_diff(Parameters(BlockDiffRequest {
+                block_id: block_id.to_string(),
+                original: Some("Same content".to_string()),
+            }))
+            .await;
 
         assert!(result.contains("(no changes)"));
     }
@@ -2977,37 +3343,56 @@ mod tests {
     // SyncPayload (postcard-serialized) ops, matching the real sync protocol.
     // =========================================================================
 
-    use std::collections::HashMap;
     use kaijutsu_crdt::{BlockId, BlockKind, BlockSnapshot, ContextId, PrincipalId, Role, Status};
+    use std::collections::HashMap;
 
     /// Helper: create a synced client/server pair with one block ("Hello from server").
     ///
     /// The server store inserts the block, then the client store syncs from it
     /// via `ops_since` + `merge_ops`, so both share CRDT causal history.
     /// Returns (client_store, sync_manager, server_store, context_id).
-    fn setup_synced_store() -> (SharedBlockStore, Arc<Mutex<SyncManager>>, SharedBlockStore, ContextId) {
+    fn setup_synced_store() -> (
+        SharedBlockStore,
+        Arc<Mutex<SyncManager>>,
+        SharedBlockStore,
+        ContextId,
+    ) {
         let context_id = ContextId::new();
 
         // Server store — the authoritative source
         let server = shared_block_store(PrincipalId::new());
-        server.create_document(context_id, DocKind::Conversation, None)
+        server
+            .create_document(context_id, DocKind::Conversation, None)
             .expect("create server document");
-        server.insert_block(context_id, None, None, Role::User, BlockKind::Text, "Hello from server", Status::Done)
+        server
+            .insert_block(
+                context_id,
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "Hello from server",
+                Status::Done,
+            )
             .expect("insert block on server");
 
         // Client store — synced from server via SyncPayload
         let client = shared_block_store(PrincipalId::system());
-        client.create_document(context_id, DocKind::Conversation, None)
+        client
+            .create_document(context_id, DocKind::Conversation, None)
             .expect("create client document");
-        let initial_payload = server.ops_since(context_id, &HashMap::new())
+        let initial_payload = server
+            .ops_since(context_id, &HashMap::new())
             .expect("ops_since from empty frontier");
-        client.merge_ops(context_id, initial_payload)
+        client
+            .merge_ops(context_id, initial_payload)
             .expect("initial sync merge");
 
         let frontier = client.frontier(context_id).unwrap_or_default();
-        let sync = Arc::new(Mutex::new(
-            SyncManager::with_state(Some(context_id), Some(frontier)),
-        ));
+        let sync = Arc::new(Mutex::new(SyncManager::with_state(
+            Some(context_id),
+            Some(frontier),
+        )));
 
         (client, sync, server, context_id)
     }
@@ -3028,20 +3413,37 @@ mod tests {
 
         // Server inserts a new block
         let pre_frontier = server.frontier(ctx_id).unwrap();
-        let block_id = server.insert_block(ctx_id, None, None, Role::Model, BlockKind::Text, "New block from server", Status::Done)
+        let block_id = server
+            .insert_block(
+                ctx_id,
+                None,
+                None,
+                Role::Model,
+                BlockKind::Text,
+                "New block from server",
+                Status::Done,
+            )
             .expect("insert");
         let ops_bytes = server_ops_bytes(&server, ctx_id, &pre_frontier);
-        let block = server.get(ctx_id).unwrap().doc.get_block_snapshot(&block_id).unwrap();
+        let block = server
+            .get(ctx_id)
+            .unwrap()
+            .doc
+            .get_block_snapshot(&block_id)
+            .unwrap();
 
         // Before applying: store should have 1 block
         assert_eq!(
-            store.get(ctx_id).unwrap().doc.block_count(), 1,
+            store.get(ctx_id).unwrap().doc.block_count(),
+            1,
             "Store should have 1 block before event"
         );
 
         // Apply the event through our function
         apply_server_event(
-            &store, &sync, ctx_id,
+            &store,
+            &sync,
+            ctx_id,
             ServerEvent::BlockInserted {
                 context_id: ctx_id,
                 block: Box::new(block),
@@ -3051,7 +3453,11 @@ mod tests {
 
         // After: store should have 2 blocks
         let entry = store.get(ctx_id).expect("doc exists");
-        assert_eq!(entry.doc.block_count(), 2, "Store should have 2 blocks after BlockInserted");
+        assert_eq!(
+            entry.doc.block_count(),
+            2,
+            "Store should have 2 blocks after BlockInserted"
+        );
         assert!(
             entry.doc.full_text().contains("New block from server"),
             "Store should contain the new block's content"
@@ -3067,17 +3473,26 @@ mod tests {
 
         // Server edits the block's text
         let pre_frontier = server.frontier(ctx_id).unwrap();
-        server.edit_text(ctx_id, &block_id, 17, " — updated!", 0).expect("edit");
+        server
+            .edit_text(ctx_id, &block_id, 17, " — updated!", 0)
+            .expect("edit");
         let ops_bytes = server_ops_bytes(&server, ctx_id, &pre_frontier);
 
         // Before: store has original text
         assert!(
-            store.get(ctx_id).unwrap().doc.full_text().contains("Hello from server"),
+            store
+                .get(ctx_id)
+                .unwrap()
+                .doc
+                .full_text()
+                .contains("Hello from server"),
             "Store should have original text"
         );
 
         apply_server_event(
-            &store, &sync, ctx_id,
+            &store,
+            &sync,
+            ctx_id,
             ServerEvent::BlockTextOps {
                 context_id: ctx_id,
                 block_id,
@@ -3102,13 +3517,21 @@ mod tests {
 
         // The block starts as Done (from BlockSnapshot::text constructor)
         assert_eq!(
-            store.get(ctx_id).unwrap().doc.get_block_snapshot(&block_id).unwrap().status,
+            store
+                .get(ctx_id)
+                .unwrap()
+                .doc
+                .get_block_snapshot(&block_id)
+                .unwrap()
+                .status,
             Status::Done,
         );
 
         // Apply status change to Error
         apply_server_event(
-            &store, &sync, ctx_id,
+            &store,
+            &sync,
+            ctx_id,
             ServerEvent::BlockStatusChanged {
                 context_id: ctx_id,
                 block_id,
@@ -3119,8 +3542,15 @@ mod tests {
 
         // Store should reflect the new status
         let entry = store.get(ctx_id).expect("doc exists");
-        let snap = entry.doc.get_block_snapshot(&block_id).expect("block exists");
-        assert_eq!(snap.status, Status::Error, "Status should be Error after event");
+        let snap = entry
+            .doc
+            .get_block_snapshot(&block_id)
+            .expect("block exists");
+        assert_eq!(
+            snap.status,
+            Status::Error,
+            "Status should be Error after event"
+        );
     }
 
     #[test]
@@ -3129,15 +3559,31 @@ mod tests {
 
         // Server inserts a new block
         let pre_frontier = server.frontier(ctx_id).unwrap();
-        let block_id = server.insert_block(ctx_id, None, None, Role::Model, BlockKind::Text, "Should not appear", Status::Done)
+        let block_id = server
+            .insert_block(
+                ctx_id,
+                None,
+                None,
+                Role::Model,
+                BlockKind::Text,
+                "Should not appear",
+                Status::Done,
+            )
             .expect("insert");
         let ops_bytes = server_ops_bytes(&server, ctx_id, &pre_frontier);
-        let block = server.get(ctx_id).unwrap().doc.get_block_snapshot(&block_id).unwrap();
+        let block = server
+            .get(ctx_id)
+            .unwrap()
+            .doc
+            .get_block_snapshot(&block_id)
+            .unwrap();
 
         // Apply with WRONG context_id — should be silently ignored
         let wrong_ctx = ContextId::new();
         apply_server_event(
-            &store, &sync, ctx_id,
+            &store,
+            &sync,
+            ctx_id,
             ServerEvent::BlockInserted {
                 context_id: wrong_ctx,
                 block: Box::new(block),
@@ -3147,7 +3593,8 @@ mod tests {
 
         // Store should still have only 1 block
         assert_eq!(
-            store.get(ctx_id).unwrap().doc.block_count(), 1,
+            store.get(ctx_id).unwrap().doc.block_count(),
+            1,
             "Store should not be affected by events for other documents"
         );
     }
@@ -3160,13 +3607,29 @@ mod tests {
 
         // Apply a block insert
         let pre_frontier = server.frontier(ctx_id).unwrap();
-        let block_id = server.insert_block(ctx_id, None, None, Role::User, BlockKind::Text, "Version bump test", Status::Done)
+        let block_id = server
+            .insert_block(
+                ctx_id,
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "Version bump test",
+                Status::Done,
+            )
             .expect("insert");
         let ops_bytes = server_ops_bytes(&server, ctx_id, &pre_frontier);
-        let block = server.get(ctx_id).unwrap().doc.get_block_snapshot(&block_id).unwrap();
+        let block = server
+            .get(ctx_id)
+            .unwrap()
+            .doc
+            .get_block_snapshot(&block_id)
+            .unwrap();
 
         apply_server_event(
-            &store, &sync, ctx_id,
+            &store,
+            &sync,
+            ctx_id,
             ServerEvent::BlockInserted {
                 context_id: ctx_id,
                 block: Box::new(block),
@@ -3189,41 +3652,78 @@ mod tests {
         let mut inserted_ids = Vec::new();
         for i in 0..3 {
             let pre = server.frontier(ctx_id).unwrap();
-            let bid = server.insert_block(ctx_id, None, None, Role::Model, BlockKind::Text, &format!("Block {i}"), Status::Done)
+            let bid = server
+                .insert_block(
+                    ctx_id,
+                    None,
+                    None,
+                    Role::Model,
+                    BlockKind::Text,
+                    &format!("Block {i}"),
+                    Status::Done,
+                )
                 .expect("insert");
             let ops = server_ops_bytes(&server, ctx_id, &pre);
-            let block = server.get(ctx_id).unwrap().doc.get_block_snapshot(&bid).unwrap();
+            let block = server
+                .get(ctx_id)
+                .unwrap()
+                .doc
+                .get_block_snapshot(&bid)
+                .unwrap();
             inserted_ids.push(bid);
 
-            apply_server_event(&store, &sync, ctx_id, ServerEvent::BlockInserted {
-                context_id: ctx_id,
-                block: Box::new(block),
-                ops,
-            });
+            apply_server_event(
+                &store,
+                &sync,
+                ctx_id,
+                ServerEvent::BlockInserted {
+                    context_id: ctx_id,
+                    block: Box::new(block),
+                    ops,
+                },
+            );
         }
 
         // Now edit the last-inserted block's text ("Block 2" → "Block 2 — edited")
         let last_block_id = inserted_ids[2];
-        let last_content_len = server.get(ctx_id).unwrap().doc
-            .get_block_snapshot(&last_block_id).unwrap().content.len();
+        let last_content_len = server
+            .get(ctx_id)
+            .unwrap()
+            .doc
+            .get_block_snapshot(&last_block_id)
+            .unwrap()
+            .content
+            .len();
         let pre = server.frontier(ctx_id).unwrap();
-        server.edit_text(ctx_id, &last_block_id, last_content_len, " — edited", 0).expect("edit");
+        server
+            .edit_text(ctx_id, &last_block_id, last_content_len, " — edited", 0)
+            .expect("edit");
         let ops = server_ops_bytes(&server, ctx_id, &pre);
 
-        apply_server_event(&store, &sync, ctx_id, ServerEvent::BlockTextOps {
-            context_id: ctx_id,
-            block_id: last_block_id,
-            ops,
-        });
+        apply_server_event(
+            &store,
+            &sync,
+            ctx_id,
+            ServerEvent::BlockTextOps {
+                context_id: ctx_id,
+                block_id: last_block_id,
+                ops,
+            },
+        );
 
         // Status change on the first inserted block
         let first_new_block = inserted_ids[0];
-        apply_server_event(&store, &sync, ctx_id, ServerEvent::BlockStatusChanged {
-            context_id: ctx_id,
-            block_id: first_new_block,
-            status: Status::Running,
-            output: None,
-        });
+        apply_server_event(
+            &store,
+            &sync,
+            ctx_id,
+            ServerEvent::BlockStatusChanged {
+                context_id: ctx_id,
+                block_id: first_new_block,
+                status: Status::Running,
+                output: None,
+            },
+        );
 
         // Verify everything is visible through store.get() — the path MCP tools use
         let entry = store.get(ctx_id).expect("doc exists");
@@ -3231,12 +3731,24 @@ mod tests {
         let block_count = entry.doc.block_count();
 
         assert_eq!(block_count, 4, "1 original + 3 inserted");
-        assert!(text.contains("Hello from server"), "Original content preserved, got: {text}");
-        assert!(text.contains("Block 0"), "First inserted block, got: {text}");
-        assert!(text.contains("Block 1"), "Second inserted block, got: {text}");
+        assert!(
+            text.contains("Hello from server"),
+            "Original content preserved, got: {text}"
+        );
+        assert!(
+            text.contains("Block 0"),
+            "First inserted block, got: {text}"
+        );
+        assert!(
+            text.contains("Block 1"),
+            "Second inserted block, got: {text}"
+        );
         assert!(text.contains("— edited"), "Text edit applied, got: {text}");
 
-        let first_snap = entry.doc.get_block_snapshot(&first_new_block).expect("block exists");
+        let first_snap = entry
+            .doc
+            .get_block_snapshot(&first_new_block)
+            .expect("block exists");
         assert_eq!(first_snap.status, Status::Running, "Status change applied");
     }
 
@@ -3251,14 +3763,18 @@ mod tests {
         // Apply BlockInserted with garbage ops
         let evil_agent = PrincipalId::new();
         apply_server_event(
-            &store, &sync, ctx_id,
+            &store,
+            &sync,
+            ctx_id,
             ServerEvent::BlockInserted {
                 context_id: ctx_id,
                 // This block already exists (idempotent skip), but let's also test garbage ops
                 // with a "new" block that doesn't exist yet
                 block: Box::new(BlockSnapshot::text(
                     BlockId::new(ctx_id, evil_agent, 99),
-                    None, Role::User, "corrupted block",
+                    None,
+                    Role::User,
+                    "corrupted block",
                 )),
                 ops: vec![0xFF, 0xDE, 0xAD, 0xBE, 0xEF],
             },
@@ -3267,13 +3783,23 @@ mod tests {
         // Store should be unchanged — no corruption
         {
             let entry = store.get(ctx_id).unwrap();
-            assert_eq!(entry.doc.block_count(), original_block_count, "Block count unchanged after corrupt ops");
-            assert_eq!(entry.version(), original_version, "Version unchanged — touch() not called on error");
+            assert_eq!(
+                entry.doc.block_count(),
+                original_block_count,
+                "Block count unchanged after corrupt ops"
+            );
+            assert_eq!(
+                entry.version(),
+                original_version,
+                "Version unchanged — touch() not called on error"
+            );
         } // Drop DashMap Ref before next event needs get_mut()
 
         // Apply BlockTextOps with garbage ops
         apply_server_event(
-            &store, &sync, ctx_id,
+            &store,
+            &sync,
+            ctx_id,
             ServerEvent::BlockTextOps {
                 context_id: ctx_id,
                 block_id,
@@ -3296,7 +3822,9 @@ mod tests {
         // Send status change for a block that doesn't exist
         let ghost_agent = PrincipalId::new();
         apply_server_event(
-            &store, &sync, ctx_id,
+            &store,
+            &sync,
+            ctx_id,
             ServerEvent::BlockStatusChanged {
                 context_id: ctx_id,
                 block_id: BlockId::new(ctx_id, ghost_agent, 999),
@@ -3310,7 +3838,10 @@ mod tests {
         // is no panic and no corruption.
         let entry = store.get(ctx_id).unwrap();
         assert_eq!(entry.doc.block_count(), 1, "Block count unchanged");
-        assert!(entry.doc.full_text().contains("Hello from server"), "Content unchanged");
+        assert!(
+            entry.doc.full_text().contains("Hello from server"),
+            "Content unchanged"
+        );
     }
 
     #[test]
@@ -3326,13 +3857,29 @@ mod tests {
         // Server adds a new block. Ops are incremental (not full oplog) —
         // this is what would arrive after missing some events.
         let pre_frontier = server.frontier(ctx_id).unwrap();
-        let block_id = server.insert_block(ctx_id, None, None, Role::Model, BlockKind::Text, "Post-reset block", Status::Done)
+        let block_id = server
+            .insert_block(
+                ctx_id,
+                None,
+                None,
+                Role::Model,
+                BlockKind::Text,
+                "Post-reset block",
+                Status::Done,
+            )
             .expect("insert");
         let ops_bytes = server_ops_bytes(&server, ctx_id, &pre_frontier);
-        let block = server.get(ctx_id).unwrap().doc.get_block_snapshot(&block_id).unwrap();
+        let block = server
+            .get(ctx_id)
+            .unwrap()
+            .doc
+            .get_block_snapshot(&block_id)
+            .unwrap();
 
         apply_server_event(
-            &store, &sync, ctx_id,
+            &store,
+            &sync,
+            ctx_id,
             ServerEvent::BlockInserted {
                 context_id: ctx_id,
                 block: Box::new(block),
@@ -3346,7 +3893,8 @@ mod tests {
         // If it falls through to do_full_sync with incremental ops, we lose block 1.
         let entry = store.get(ctx_id).unwrap();
         assert_eq!(
-            entry.doc.block_count(), 2,
+            entry.doc.block_count(),
+            2,
             "Both original and new block should be preserved after reset + incremental event"
         );
         assert!(
@@ -3366,19 +3914,24 @@ mod tests {
     #[tokio::test]
     async fn test_read_input_local_requires_context() {
         let mcp = KaijutsuMcp::new();
-        let result = mcp.read_input(Parameters(InputReadRequest {
-            context_id: None,
-        })).await;
-        assert!(result.contains("Error"), "Should error without context_id in local mode: {result}");
+        let result = mcp
+            .read_input(Parameters(InputReadRequest { context_id: None }))
+            .await;
+        assert!(
+            result.contains("Error"),
+            "Should error without context_id in local mode: {result}"
+        );
     }
 
     #[tokio::test]
     async fn test_read_input_local_empty() {
         let mcp = KaijutsuMcp::new();
         let ctx_id = ContextId::new();
-        let result = mcp.read_input(Parameters(InputReadRequest {
-            context_id: Some(ctx_id.to_hex()),
-        })).await;
+        let result = mcp
+            .read_input(Parameters(InputReadRequest {
+                context_id: Some(ctx_id.to_hex()),
+            }))
+            .await;
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["content"].as_str().unwrap(), "");
         assert_eq!(parsed["length"].as_u64().unwrap(), 0);
@@ -3391,18 +3944,25 @@ mod tests {
         let hex = ctx_id.to_hex();
 
         // Write some text
-        let result = mcp.write_input(Parameters(InputWriteRequest {
-            context_id: Some(hex.clone()),
-            text: "hello from MCP".to_string(),
-        })).await;
+        let result = mcp
+            .write_input(Parameters(InputWriteRequest {
+                context_id: Some(hex.clone()),
+                text: "hello from MCP".to_string(),
+            }))
+            .await;
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert!(parsed["success"].as_bool().unwrap(), "write_input failed: {result}");
+        assert!(
+            parsed["success"].as_bool().unwrap(),
+            "write_input failed: {result}"
+        );
         assert_eq!(parsed["length"].as_u64().unwrap(), 14);
 
         // Read it back
-        let result = mcp.read_input(Parameters(InputReadRequest {
-            context_id: Some(hex.clone()),
-        })).await;
+        let result = mcp
+            .read_input(Parameters(InputReadRequest {
+                context_id: Some(hex.clone()),
+            }))
+            .await;
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["content"].as_str().unwrap(), "hello from MCP");
     }
@@ -3416,16 +3976,20 @@ mod tests {
         mcp.write_input(Parameters(InputWriteRequest {
             context_id: Some(hex.clone()),
             text: "first".to_string(),
-        })).await;
+        }))
+        .await;
 
         mcp.write_input(Parameters(InputWriteRequest {
             context_id: Some(hex.clone()),
             text: "second".to_string(),
-        })).await;
+        }))
+        .await;
 
-        let result = mcp.read_input(Parameters(InputReadRequest {
-            context_id: Some(hex.clone()),
-        })).await;
+        let result = mcp
+            .read_input(Parameters(InputReadRequest {
+                context_id: Some(hex.clone()),
+            }))
+            .await;
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["content"].as_str().unwrap(), "second");
     }
@@ -3440,22 +4004,30 @@ mod tests {
         mcp.write_input(Parameters(InputWriteRequest {
             context_id: Some(hex.clone()),
             text: "hello world".to_string(),
-        })).await;
+        }))
+        .await;
 
         // Insert " beautiful" at position 5
-        let result = mcp.edit_input(Parameters(InputEditRequest {
-            context_id: Some(hex.clone()),
-            pos: 5,
-            insert: " beautiful".to_string(),
-            delete: 0,
-        })).await;
+        let result = mcp
+            .edit_input(Parameters(InputEditRequest {
+                context_id: Some(hex.clone()),
+                pos: 5,
+                insert: " beautiful".to_string(),
+                delete: 0,
+            }))
+            .await;
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert!(parsed["success"].as_bool().unwrap(), "edit_input failed: {result}");
+        assert!(
+            parsed["success"].as_bool().unwrap(),
+            "edit_input failed: {result}"
+        );
 
         // Read back
-        let result = mcp.read_input(Parameters(InputReadRequest {
-            context_id: Some(hex.clone()),
-        })).await;
+        let result = mcp
+            .read_input(Parameters(InputReadRequest {
+                context_id: Some(hex.clone()),
+            }))
+            .await;
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["content"].as_str().unwrap(), "hello beautiful world");
     }
@@ -3469,7 +4041,8 @@ mod tests {
         mcp.write_input(Parameters(InputWriteRequest {
             context_id: Some(hex.clone()),
             text: "hello world".to_string(),
-        })).await;
+        }))
+        .await;
 
         // Delete "world" (5 chars starting at position 6)
         mcp.edit_input(Parameters(InputEditRequest {
@@ -3477,11 +4050,14 @@ mod tests {
             pos: 6,
             insert: String::new(),
             delete: 5,
-        })).await;
+        }))
+        .await;
 
-        let result = mcp.read_input(Parameters(InputReadRequest {
-            context_id: Some(hex.clone()),
-        })).await;
+        let result = mcp
+            .read_input(Parameters(InputReadRequest {
+                context_id: Some(hex.clone()),
+            }))
+            .await;
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["content"].as_str().unwrap(), "hello ");
     }
@@ -3490,10 +4066,15 @@ mod tests {
     async fn test_submit_input_local_errors() {
         let mcp = KaijutsuMcp::new();
         let ctx_id = ContextId::new();
-        let result = mcp.submit_input(Parameters(InputSubmitRequest {
-            context_id: Some(ctx_id.to_hex()),
-            mode: None,
-        })).await;
-        assert!(result.contains("Error"), "submit_input should error in local mode: {result}");
+        let result = mcp
+            .submit_input(Parameters(InputSubmitRequest {
+                context_id: Some(ctx_id.to_hex()),
+                mode: None,
+            }))
+            .await;
+        assert!(
+            result.contains("Error"),
+            "submit_input should error in local mode: {result}"
+        );
     }
 }

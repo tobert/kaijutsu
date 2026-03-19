@@ -30,10 +30,10 @@ pub struct MarkdownColors {
 impl Default for MarkdownColors {
     fn default() -> Self {
         Self {
-            heading: Color::srgb_u8(0xBB, 0x9A, 0xF7),   // Purple accent
-            code: Color::srgb_u8(0x9E, 0xCE, 0x6A),       // Green
-            strong: None,                                    // Inherit
-            code_block: Color::srgb_u8(0x7A, 0xA2, 0xF7),  // Blue
+            heading: Color::srgb_u8(0xBB, 0x9A, 0xF7), // Purple accent
+            code: Color::srgb_u8(0x9E, 0xCE, 0x6A),    // Green
+            strong: None,                              // Inherit
+            code_block: Color::srgb_u8(0x7A, 0xA2, 0xF7), // Blue
         }
     }
 }
@@ -203,7 +203,10 @@ pub fn parse_to_rich_spans(text: &str) -> Vec<RichSpan> {
 
             Event::SoftBreak => push_span(&mut spans, "\n"),
             Event::HardBreak => push_span(&mut spans, "\n"),
-            Event::Rule => push_span(&mut spans, "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n"),
+            Event::Rule => push_span(
+                &mut spans,
+                "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n",
+            ),
 
             // HTML passthrough, footnotes, etc. -- render as plain text
             Event::Html(cow) | Event::InlineHtml(cow) => {

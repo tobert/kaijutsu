@@ -31,11 +31,9 @@ impl ClaudeCodeSession {
     /// 3. Parse the filename as session UUID
     /// 4. Read first few lines for slug, version, cwd
     pub fn discover() -> Result<Self, String> {
-        let cwd = std::env::current_dir()
-            .map_err(|e| format!("Cannot get cwd: {e}"))?;
+        let cwd = std::env::current_dir().map_err(|e| format!("Cannot get cwd: {e}"))?;
 
-        let home = dirs::home_dir()
-            .ok_or("Cannot determine home directory")?;
+        let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
 
         let encoded = encode_project_path(&cwd);
         let projects_dir = home.join(".claude").join("projects").join(&encoded);
@@ -119,8 +117,8 @@ pub fn encode_project_path(path: &Path) -> String {
 
 /// Find the most recently modified `.jsonl` file in a directory.
 fn most_recent_jsonl(dir: &Path) -> Result<PathBuf, String> {
-    let entries = std::fs::read_dir(dir)
-        .map_err(|e| format!("Cannot read {}: {e}", dir.display()))?;
+    let entries =
+        std::fs::read_dir(dir).map_err(|e| format!("Cannot read {}: {e}", dir.display()))?;
 
     let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
 
@@ -134,7 +132,7 @@ fn most_recent_jsonl(dir: &Path) -> Result<PathBuf, String> {
             .and_then(|m| m.modified())
             .unwrap_or(std::time::UNIX_EPOCH);
 
-        if best.as_ref().map_or(true, |(_, prev)| mtime > *prev) {
+        if best.as_ref().is_none_or(|(_, prev)| mtime > *prev) {
             best = Some((path, mtime));
         }
     }
@@ -173,20 +171,20 @@ fn parse_session_metadata(path: &Path) -> SessionMeta {
             continue;
         };
 
-        if meta.slug.is_none() {
-            if let Some(s) = val.get("slug").and_then(|v| v.as_str()) {
-                meta.slug = Some(s.to_string());
-            }
+        if meta.slug.is_none()
+            && let Some(s) = val.get("slug").and_then(|v| v.as_str())
+        {
+            meta.slug = Some(s.to_string());
         }
-        if meta.version.is_none() {
-            if let Some(v) = val.get("version").and_then(|v| v.as_str()) {
-                meta.version = Some(v.to_string());
-            }
+        if meta.version.is_none()
+            && let Some(v) = val.get("version").and_then(|v| v.as_str())
+        {
+            meta.version = Some(v.to_string());
         }
-        if meta.cwd.is_none() {
-            if let Some(c) = val.get("cwd").and_then(|v| v.as_str()) {
-                meta.cwd = Some(c.to_string());
-            }
+        if meta.cwd.is_none()
+            && let Some(c) = val.get("cwd").and_then(|v| v.as_str())
+        {
+            meta.cwd = Some(c.to_string());
         }
 
         // Got everything we need

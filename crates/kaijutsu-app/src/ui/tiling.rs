@@ -135,10 +135,7 @@ pub enum TileNode {
         ratios: Vec<f32>,
     },
     /// A leaf pane with content.
-    Leaf {
-        id: PaneId,
-        content: PaneContent,
-    },
+    Leaf { id: PaneId, content: PaneContent },
 }
 
 impl TileNode {
@@ -233,9 +230,7 @@ impl TileNode {
             return true;
         }
         match self {
-            TileNode::Split { children, .. } => {
-                children.iter().any(|c| c.contains_pane(target))
-            }
+            TileNode::Split { children, .. } => children.iter().any(|c| c.contains_pane(target)),
             TileNode::Leaf { .. } => false,
         }
     }
@@ -373,11 +368,7 @@ impl TilingTree {
     /// if directions match, wrapped otherwise).
     ///
     /// Returns the PaneId of the new conversation pane.
-    pub fn split(
-        &mut self,
-        target: PaneId,
-        direction: SplitDirection,
-    ) -> Option<PaneId> {
+    pub fn split(&mut self, target: PaneId, direction: SplitDirection) -> Option<PaneId> {
         // Verify target is a conversation pane
         if let Some(TileNode::Leaf { content, .. }) = self.root.find(target) {
             if !matches!(content, PaneContent::Conversation { .. }) {
@@ -555,7 +546,10 @@ impl TilingTree {
                 Some(p) => p,
                 None => return false,
             };
-            if let TileNode::Split { children, ratios, .. } = parent {
+            if let TileNode::Split {
+                children, ratios, ..
+            } = parent
+            {
                 if idx_a < children.len() && idx_b < children.len() {
                     children.swap(idx_a, idx_b);
                     ratios.swap(idx_a, idx_b);
@@ -628,32 +622,32 @@ impl TilingTree {
                 children,
                 ..
             }) = self.root.find(parent_id)
+                && *split_dir == axis
+                && children.len() > 1
             {
-                if *split_dir == axis && children.len() > 1 {
-                    let target_idx = if forward {
-                        if child_idx + 1 < children.len() {
-                            Some(child_idx + 1)
-                        } else {
-                            None // Already at end
-                        }
-                    } else if child_idx > 0 {
-                        Some(child_idx - 1)
+                let target_idx = if forward {
+                    if child_idx + 1 < children.len() {
+                        Some(child_idx + 1)
                     } else {
-                        None // Already at start
+                        None // Already at end
+                    }
+                } else if child_idx > 0 {
+                    Some(child_idx - 1)
+                } else {
+                    None // Already at start
+                };
+
+                if let Some(idx) = target_idx {
+                    // Find a conversation in the target child
+                    let target_conv = if forward {
+                        children[idx].first_conversation()
+                    } else {
+                        children[idx].last_conversation()
                     };
 
-                    if let Some(idx) = target_idx {
-                        // Find a conversation in the target child
-                        let target_conv = if forward {
-                            children[idx].first_conversation()
-                        } else {
-                            children[idx].last_conversation()
-                        };
-
-                        if let Some(conv_id) = target_conv {
-                            self.focus(conv_id);
-                            return true;
-                        }
+                    if let Some(conv_id) = target_conv {
+                        self.focus(conv_id);
+                        return true;
                     }
                 }
             }
@@ -767,10 +761,10 @@ impl TilingTree {
             // Try right neighbor, then left
             let candidates = [target_idx.wrapping_add(1), target_idx.wrapping_sub(1)];
             for idx in candidates {
-                if let Some(conv) = children.get(idx).and_then(|c| c.first_conversation()) {
-                    if conv != target {
-                        return Some(conv);
-                    }
+                if let Some(conv) = children.get(idx).and_then(|c| c.first_conversation())
+                    && conv != target
+                {
+                    return Some(conv);
                 }
             }
         }
@@ -810,24 +804,23 @@ impl TilingTree {
     /// Find the first conversation pane (by tree order).
     #[allow(dead_code)] // used in tests + Phase 3 preset loading
     pub fn first_conversation_pane(&self) -> Option<PaneId> {
-        self.root
-            .conversation_panes()
-            .first()
-            .map(|(id, _)| *id)
+        self.root.conversation_panes().first().map(|(id, _)| *id)
     }
 
     /// Update the document_id for a conversation pane.
     #[allow(dead_code)] // used in tests + context join wiring
     pub fn set_conversation_document(&mut self, pane: PaneId, document_id: &str) {
-        if let Some(node) = self.root.find_mut(pane) {
-            if let TileNode::Leaf {
-                content: PaneContent::Conversation { document_id: doc_id },
+        if let Some(node) = self.root.find_mut(pane)
+            && let TileNode::Leaf {
+                content:
+                    PaneContent::Conversation {
+                        document_id: doc_id,
+                    },
                 ..
             } = node
-            {
-                *doc_id = document_id.to_string();
-                self.bump_visual();
-            }
+        {
+            *doc_id = document_id.to_string();
+            self.bump_visual();
         }
     }
 
@@ -950,7 +943,11 @@ mod tests {
     fn default_layout_has_conversation() {
         let tree = TilingTree::default_layout();
         let convs = tree.root.conversation_panes();
-        assert_eq!(convs.len(), 1, "Default layout should have one conversation pane");
+        assert_eq!(
+            convs.len(),
+            1,
+            "Default layout should have one conversation pane"
+        );
     }
 
     #[test]
@@ -989,11 +986,21 @@ mod tests {
         let gen_before = tree.structural_gen;
 
         let conv2 = tree.split(conv1, SplitDirection::Row);
-        assert!(conv2.is_some(), "Split should return new conversation PaneId");
+        assert!(
+            conv2.is_some(),
+            "Split should return new conversation PaneId"
+        );
 
         let convs = tree.root.conversation_panes();
-        assert_eq!(convs.len(), 2, "Should have two conversation panes after split");
-        assert!(tree.structural_gen > gen_before, "Structural generation should bump");
+        assert_eq!(
+            convs.len(),
+            2,
+            "Should have two conversation panes after split"
+        );
+        assert!(
+            tree.structural_gen > gen_before,
+            "Structural generation should bump"
+        );
     }
 
     #[test]
@@ -1159,8 +1166,14 @@ mod tests {
         let v_before = tree.visual_gen;
 
         tree.split(conv1, SplitDirection::Row);
-        assert!(tree.structural_gen > s_before, "split should bump structural_gen");
-        assert!(tree.visual_gen > v_before, "split should also bump visual_gen");
+        assert!(
+            tree.structural_gen > s_before,
+            "split should bump structural_gen"
+        );
+        assert!(
+            tree.visual_gen > v_before,
+            "split should also bump visual_gen"
+        );
     }
 
     #[test]
@@ -1172,7 +1185,10 @@ mod tests {
         let v_before = tree.visual_gen;
 
         tree.focus(conv2);
-        assert_eq!(tree.structural_gen, s_before, "focus should NOT bump structural_gen");
+        assert_eq!(
+            tree.structural_gen, s_before,
+            "focus should NOT bump structural_gen"
+        );
         assert!(tree.visual_gen > v_before, "focus should bump visual_gen");
     }
 
@@ -1185,7 +1201,10 @@ mod tests {
         let v_before = tree.visual_gen;
 
         tree.resize(conv1, 0.1);
-        assert_eq!(tree.structural_gen, s_before, "resize should NOT bump structural_gen");
+        assert_eq!(
+            tree.structural_gen, s_before,
+            "resize should NOT bump structural_gen"
+        );
         assert!(tree.visual_gen > v_before, "resize should bump visual_gen");
     }
 
@@ -1197,7 +1216,10 @@ mod tests {
         let s_before = tree.structural_gen;
 
         tree.close(conv2);
-        assert!(tree.structural_gen > s_before, "close should bump structural_gen");
+        assert!(
+            tree.structural_gen > s_before,
+            "close should bump structural_gen"
+        );
     }
 
     // ── Swap tests ────────────────────────────────────────────────────
@@ -1215,22 +1237,42 @@ mod tests {
         // Swap conv1 and conv3 (cross-parent)
         let gen_before = tree.structural_gen;
         assert!(tree.swap(conv1, conv3), "Cross-parent swap should succeed");
-        assert!(tree.structural_gen > gen_before, "Swap should bump structural_gen");
+        assert!(
+            tree.structural_gen > gen_before,
+            "Swap should bump structural_gen"
+        );
 
         // After swap, both panes should still be findable in the tree
-        assert!(tree.root.find(conv1).is_some(), "conv1 should still exist after swap");
-        assert!(tree.root.find(conv3).is_some(), "conv3 should still exist after swap");
-        assert!(tree.root.find(conv2).is_some(), "conv2 should be unaffected");
+        assert!(
+            tree.root.find(conv1).is_some(),
+            "conv1 should still exist after swap"
+        );
+        assert!(
+            tree.root.find(conv3).is_some(),
+            "conv3 should still exist after swap"
+        );
+        assert!(
+            tree.root.find(conv2).is_some(),
+            "conv2 should be unaffected"
+        );
 
         // All three conversations should still exist
         let convs = tree.root.conversation_panes();
-        assert_eq!(convs.len(), 3, "Should still have 3 conversations after swap");
+        assert_eq!(
+            convs.len(),
+            3,
+            "Should still have 3 conversations after swap"
+        );
 
         // All IDs should be unique (no corruption from DFS collision)
         let mut ids = Vec::new();
         tree.root.collect_ids(&mut ids);
         let deduped: std::collections::HashSet<_> = ids.iter().collect();
-        assert_eq!(ids.len(), deduped.len(), "All PaneIds should remain unique after swap");
+        assert_eq!(
+            ids.len(),
+            deduped.len(),
+            "All PaneIds should remain unique after swap"
+        );
     }
 
     #[test]
@@ -1242,7 +1284,11 @@ mod tests {
         assert!(tree.swap(conv1, conv2), "Sibling swap should succeed");
 
         let convs = tree.root.conversation_panes();
-        assert_eq!(convs.len(), 2, "Should still have 2 conversations after swap");
+        assert_eq!(
+            convs.len(),
+            2,
+            "Should still have 2 conversations after swap"
+        );
     }
 
     // ── Close focuses neighbor test ───────────────────────────────────

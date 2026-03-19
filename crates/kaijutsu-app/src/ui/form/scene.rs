@@ -6,18 +6,13 @@
 
 use bevy::prelude::*;
 use bevy_vello::vello;
-use vello::kurbo::{Affine, RoundedRect, Stroke, Cap};
+use vello::kurbo::{Affine, Cap, RoundedRect, Stroke};
 use vello::peniko::Fill;
 
 use crate::text::components::bevy_color_to_brush;
 
 /// Draw a filled rect for a full-viewport overlay background.
-pub fn build_overlay_bg(
-    scene: &mut vello::Scene,
-    width: f64,
-    height: f64,
-    color: Color,
-) {
+pub fn build_overlay_bg(scene: &mut vello::Scene, width: f64, height: f64, color: Color) {
     let brush = bevy_color_to_brush(color);
     let rect = RoundedRect::new(0.0, 0.0, width, height, 0.0);
     scene.fill(Fill::NonZero, Affine::IDENTITY, &brush, None, &rect);
@@ -40,12 +35,7 @@ pub fn build_form_field_border(
 }
 
 /// Draw a filled rect for row selection highlight.
-pub fn build_row_highlight(
-    scene: &mut vello::Scene,
-    width: f64,
-    height: f64,
-    color: Color,
-) {
+pub fn build_row_highlight(scene: &mut vello::Scene, width: f64, height: f64, color: Color) {
     let brush = bevy_color_to_brush(color);
     let rect = RoundedRect::new(0.0, 0.0, width, height, 2.0);
     scene.fill(Fill::NonZero, Affine::IDENTITY, &brush, None, &rect);

@@ -7,9 +7,9 @@ pub mod block_border;
 pub mod plugin;
 
 // Re-export everything from view/ so crate::cell::X still resolves
-#[allow(unused_imports)]
-pub use crate::view::*;
 pub use crate::view::document::CachedDocument;
 pub use crate::view::lifecycle::EditorEntities;
+#[allow(unused_imports)]
+pub use crate::view::*;
 
 pub use plugin::CellPlugin;

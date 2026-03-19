@@ -26,7 +26,7 @@ pub mod theme;
 
 pub use catalog::function_catalog;
 pub use color::parse_hex;
-pub use output::{register_output_callbacks, OutputCollector};
+pub use output::{OutputCollector, register_output_callbacks};
 pub use scope::{dynamic_to_json, json_to_dynamic, scope_from_json, scope_to_json};
 
 /// Register the full kaijutsu Rhai stdlib: math + color + format functions.
@@ -63,7 +63,7 @@ mod tests {
         let svg = collector.take_svg().unwrap();
         assert!(svg.starts_with("<svg>"));
         assert!(svg.contains("1.0")); // sin(pi/2) = 1.0
-        assert!(svg.contains('#'));   // color hex value
+        assert!(svg.contains('#')); // color hex value
     }
 
     #[test]

@@ -28,16 +28,15 @@ pub enum CellPhase {
     Layout,
 }
 
-use crate::ui::tiling_reconciler::TilingPhase;
-use crate::view::{
-    BlockCellContainer, BlockCellLayout,
-    ContextSwitchRequested, ConversationContainer, ConversationScrollState,
-    DocumentCache, FocusTarget, LayoutGeneration, MainCell, SessionAgent,
-    PendingContextSwitch, RoleGroupBorderLayout, SubmitFailed,
-    ViewingConversation, EditorEntities,
-};
-use crate::view::overlay::{OverlayAnimation, OverlayStyle, OverlaySummonState};
 use super::block_border;
+use crate::ui::tiling_reconciler::TilingPhase;
+use crate::view::overlay::{OverlayAnimation, OverlayStyle, OverlaySummonState};
+use crate::view::{
+    BlockCellContainer, BlockCellLayout, ContextSwitchRequested, ConversationContainer,
+    ConversationScrollState, DocumentCache, EditorEntities, FocusTarget, LayoutGeneration,
+    MainCell, PendingContextSwitch, RoleGroupBorderLayout, SessionAgent, SubmitFailed,
+    ViewingConversation,
+};
 
 use crate::view::lifecycle as view_lifecycle;
 use crate::view::overlay as view_overlay;
@@ -99,8 +98,7 @@ impl Plugin for CellPlugin {
                 view_sync::handle_input_doc_events.after(view_sync::handle_block_events),
                 view_sync::handle_context_switch.after(view_sync::handle_block_events),
                 view_sync::handle_server_context_switch.before(view_sync::handle_context_switch),
-                view_submit::handle_submit_failed
-                    .after(view_sync::handle_context_switch),
+                view_submit::handle_submit_failed.after(view_sync::handle_context_switch),
                 view_sync::sync_main_cell_to_conversation
                     .after(view_sync::handle_block_events)
                     .after(view_sync::handle_context_switch),
@@ -136,8 +134,7 @@ impl Plugin for CellPlugin {
                 // Block cell buffers (TopLeft anchor)
                 view_render::init_block_cell_buffers,
                 ApplyDeferred.after(view_render::init_block_cell_buffers),
-                view_render::sync_block_cell_buffers
-                    .after(view_render::init_block_cell_buffers),
+                view_render::sync_block_cell_buffers.after(view_render::init_block_cell_buffers),
                 // Input overlay
                 view_overlay::update_summon_animation,
                 view_overlay::sync_overlay_visibility.after(view_overlay::update_summon_animation),
@@ -149,8 +146,7 @@ impl Plugin for CellPlugin {
                 // Block border style
                 block_border::determine_block_border_style
                     .after(view_render::sync_block_cell_buffers),
-                ApplyDeferred
-                    .after(block_border::determine_block_border_style),
+                ApplyDeferred.after(block_border::determine_block_border_style),
                 // Rich content rendering — must run AFTER ApplyDeferred so the
                 // RichContent component inserted by sync_block_cell_buffers is visible.
                 crate::text::rich::render_rich_content
@@ -168,7 +164,8 @@ impl Plugin for CellPlugin {
                 view_render::sync_text_max_advance,
                 view_render::layout_block_cells,
                 view_render::update_block_cell_nodes.after(view_render::layout_block_cells),
-                view_render::reorder_conversation_children.after(view_render::update_block_cell_nodes),
+                view_render::reorder_conversation_children
+                    .after(view_render::update_block_cell_nodes),
                 view_scroll::smooth_scroll.after(view_render::layout_block_cells),
                 view_render::cull_offscreen_blocks.after(view_scroll::smooth_scroll),
             )
@@ -192,17 +189,14 @@ impl Plugin for CellPlugin {
             PostUpdate,
             (
                 view_render::readback_block_heights.after(bevy::ui::UiSystems::Layout),
-                block_border::spawn_vello_borders
-                    .after(view_render::readback_block_heights),
+                block_border::spawn_vello_borders.after(view_render::readback_block_heights),
                 // Flush UiVelloScene insertions from spawn_vello_borders so
                 // update_vello_borders can see Added<UiVelloScene> this frame.
-                ApplyDeferred
-                    .after(block_border::spawn_vello_borders),
+                ApplyDeferred.after(block_border::spawn_vello_borders),
                 block_border::update_vello_borders
                     .after(block_border::spawn_vello_borders)
                     .after(ApplyDeferred),
-                block_border::animate_vello_borders
-                    .after(block_border::update_vello_borders),
+                block_border::animate_vello_borders.after(block_border::update_vello_borders),
                 view_render::update_role_group_scenes.after(bevy::ui::UiSystems::Layout),
                 view_overlay::update_overlay_scene.after(bevy::ui::UiSystems::Layout),
             ),

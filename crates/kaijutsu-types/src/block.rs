@@ -20,8 +20,8 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use strum::EnumString;
 
-use crate::ids::{ContextId, PrincipalId};
 use crate::OutputData;
+use crate::ids::{ContextId, PrincipalId};
 
 /// Globally unique block identifier with typed IDs.
 ///
@@ -155,7 +155,6 @@ pub struct BlockHeader {
     // ── Per-field LWW timestamps ────────────────────────────────────────
     // Each mutable field group has its own Lamport timestamp for independent
     // conflict resolution. On tie, value-based tiebreak (greater value wins).
-
     /// Lamport timestamp for `status` field.
     pub status_at: u64,
     /// Lamport timestamp for `collapsed` field.
@@ -275,7 +274,9 @@ impl std::fmt::Display for Role {
 /// Discriminant order matters for LWW tiebreaking: when two peers write at the
 /// same Lamport timestamp, the greater value wins. `Error > Done > Running > Pending`
 /// ensures errors are never masked by a concurrent completion.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default, EnumString)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default, EnumString,
+)]
 #[serde(rename_all = "lowercase")]
 #[strum(ascii_case_insensitive)]
 pub enum Status {
@@ -409,7 +410,9 @@ impl std::fmt::Display for BlockKind {
 /// Parallel to `DriftKind` — mechanism metadata on ToolCall/ToolResult blocks.
 /// The `Role` on the block tells you *who* (user typed a command vs model
 /// requested execution). `ToolKind` tells you *how* (kaish, MCP server, builtin).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default, EnumString)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default, EnumString,
+)]
 #[serde(rename_all = "snake_case")]
 #[strum(ascii_case_insensitive)]
 pub enum ToolKind {
@@ -532,7 +535,6 @@ pub struct BlockSnapshot {
     pub created_at: u64,
 
     // Tool-specific fields (ToolCall / ToolResult)
-
     /// Which execution engine (Shell, Mcp, Builtin). Present on ToolCall/ToolResult.
     #[serde(default)]
     pub tool_kind: Option<ToolKind>,
@@ -565,7 +567,6 @@ pub struct BlockSnapshot {
     pub output: Option<OutputData>,
 
     // Drift-specific fields (Drift)
-
     /// Originating context (for Drift blocks).
     #[serde(default)]
     pub source_context: Option<ContextId>,
@@ -577,13 +578,11 @@ pub struct BlockSnapshot {
     pub drift_kind: Option<DriftKind>,
 
     // File-specific fields (File)
-
     /// Logical file path (for File blocks). Not unique — downstream resolves duplicates.
     #[serde(default)]
     pub file_path: Option<String>,
 
     // Content type hint
-
     /// MIME content type (e.g., "text/markdown", "image/svg+xml").
     /// When set, consumers can skip heuristic detection and use the declared type directly.
     /// Producers that know what they're generating should set this at creation time.
@@ -591,7 +590,6 @@ pub struct BlockSnapshot {
     pub content_type: Option<String>,
 
     // Ordering
-
     /// Fractional index for sibling ordering (base-62 lexicographic).
     /// Set by BlockStore on insertion. Not present on snapshots created
     /// via named constructors (those get order_key assigned when inserted).
@@ -599,7 +597,6 @@ pub struct BlockSnapshot {
     pub order_key: Option<String>,
 
     // CRDT metadata
-
     /// Aggregate Lamport timestamp — `max(all per-field timestamps)`.
     /// Propagated during sync so receivers can advance their clocks.
     /// Defaults to 0 for snapshots from persistence or older wire formats.
@@ -607,7 +604,6 @@ pub struct BlockSnapshot {
     pub updated_at: u64,
 
     // Per-field LWW timestamps (CRDT-internal, not on Cap'n Proto wire).
-
     /// Lamport timestamp for `status` field.
     #[serde(default)]
     pub status_at: u64,
@@ -677,11 +673,7 @@ impl BlockSnapshot {
     }
 
     /// Create a new thinking block snapshot.
-    pub fn thinking(
-        id: BlockId,
-        parent_id: Option<BlockId>,
-        content: impl Into<String>,
-    ) -> Self {
+    pub fn thinking(id: BlockId, parent_id: Option<BlockId>, content: impl Into<String>) -> Self {
         assert!(
             parent_id.is_none_or(|p| p.context_id == id.context_id),
             "parent_id must be in same context as block (use source_context for drift)"
@@ -790,7 +782,11 @@ impl BlockSnapshot {
             id,
             parent_id: Some(tool_call_id),
             role: Role::Tool,
-            status: if is_error { Status::Error } else { Status::Done },
+            status: if is_error {
+                Status::Error
+            } else {
+                Status::Done
+            },
             kind: BlockKind::ToolResult,
             content: content.into(),
             collapsed: false,
@@ -842,7 +838,11 @@ impl BlockSnapshot {
             id,
             parent_id: Some(tool_call_id),
             role: Role::Tool,
-            status: if is_error { Status::Error } else { Status::Done },
+            status: if is_error {
+                Status::Error
+            } else {
+                Status::Done
+            },
             kind: BlockKind::ToolResult,
             content: content.into(),
             collapsed: false,
@@ -1242,7 +1242,9 @@ impl BlockFilter {
     /// - No active constraints (use `BlockQuery::All` instead)
     pub fn validate(&self) -> Result<(), String> {
         if !self.has_active_constraint() {
-            return Err("BlockFilter has no active constraints — use BlockQuery::All instead".into());
+            return Err(
+                "BlockFilter has no active constraints — use BlockQuery::All instead".into(),
+            );
         }
         Ok(())
     }
@@ -1322,9 +1324,7 @@ pub struct BlockEventFilter {
 impl BlockEventFilter {
     /// Check if this filter has at least one active constraint.
     pub fn has_active_constraint(&self) -> bool {
-        !self.context_ids.is_empty()
-            || !self.event_types.is_empty()
-            || !self.block_kinds.is_empty()
+        !self.context_ids.is_empty() || !self.event_types.is_empty() || !self.block_kinds.is_empty()
     }
 }
 
@@ -1496,7 +1496,10 @@ mod tests {
         assert_eq!(BlockKind::from_str("text"), Some(BlockKind::Text));
         assert_eq!(BlockKind::from_str("THINKING"), Some(BlockKind::Thinking));
         assert_eq!(BlockKind::from_str("tool_call"), Some(BlockKind::ToolCall));
-        assert_eq!(BlockKind::from_str("toolresult"), Some(BlockKind::ToolResult));
+        assert_eq!(
+            BlockKind::from_str("toolresult"),
+            Some(BlockKind::ToolResult)
+        );
         assert_eq!(BlockKind::from_str("drift"), Some(BlockKind::Drift));
         assert!(BlockKind::ToolCall.is_tool());
         assert!(BlockKind::ToolResult.is_tool());
@@ -1630,15 +1633,8 @@ mod tests {
         let user = test_agent();
         let id = BlockId::new(ctx, user, 1);
         let input = serde_json::json!({"command": "ls -la"});
-        let snap = BlockSnapshot::tool_call(
-            id,
-            None,
-            ToolKind::Shell,
-            "shell",
-            input,
-            Role::User,
-            None,
-        );
+        let snap =
+            BlockSnapshot::tool_call(id, None, ToolKind::Shell, "shell", input, Role::User, None);
 
         assert_eq!(snap.kind, BlockKind::ToolCall);
         assert_eq!(snap.tool_kind, Some(ToolKind::Shell));
@@ -1652,15 +1648,8 @@ mod tests {
         let model = test_agent();
         let id = BlockId::new(ctx, model, 1);
         let input = serde_json::json!({"command": "cargo build"});
-        let snap = BlockSnapshot::tool_call(
-            id,
-            None,
-            ToolKind::Shell,
-            "shell",
-            input,
-            Role::Model,
-            None,
-        );
+        let snap =
+            BlockSnapshot::tool_call(id, None, ToolKind::Shell, "shell", input, Role::Model, None);
 
         assert_eq!(snap.tool_kind, Some(ToolKind::Shell));
         assert_eq!(snap.role, Role::Model);
@@ -1829,8 +1818,14 @@ mod tests {
         let call_id = BlockId::new(ctx, author, 0);
         let output_data = OutputData::text("formatted output");
         let snap = BlockSnapshot::tool_result_with_output(
-            id, call_id, ToolKind::Shell, "raw output", false, Some(0),
-            Some(output_data.clone()), None,
+            id,
+            call_id,
+            ToolKind::Shell,
+            "raw output",
+            false,
+            Some(0),
+            Some(output_data.clone()),
+            None,
         );
         let bytes = postcard::to_allocvec(&snap).unwrap();
         let parsed: BlockSnapshot = postcard::from_bytes(&bytes).unwrap();
@@ -1846,8 +1841,14 @@ mod tests {
         let call_id = BlockId::new(ctx, author, 0);
         let output_data = OutputData::text("formatted");
         let snap = BlockSnapshot::tool_result_with_output(
-            id, call_id, ToolKind::Shell, "raw", false, Some(0),
-            Some(output_data.clone()), None,
+            id,
+            call_id,
+            ToolKind::Shell,
+            "raw",
+            false,
+            Some(0),
+            Some(output_data.clone()),
+            None,
         );
         let json = serde_json::to_string(&snap).unwrap();
         let parsed: BlockSnapshot = serde_json::from_str(&json).unwrap();
@@ -1860,15 +1861,8 @@ mod tests {
         let author = test_agent();
         let id = BlockId::new(ctx, author, 1);
         let input = serde_json::json!({"cmd": "ls"});
-        let snap = BlockSnapshot::tool_call(
-            id,
-            None,
-            ToolKind::Shell,
-            "shell",
-            input,
-            Role::User,
-            None,
-        );
+        let snap =
+            BlockSnapshot::tool_call(id, None, ToolKind::Shell, "shell", input, Role::User, None);
         let json = serde_json::to_string(&snap).unwrap();
         let parsed: BlockSnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.tool_kind, Some(ToolKind::Shell));
@@ -2072,7 +2066,13 @@ mod tests {
         let call_id = BlockId::new(ctx, author, 1);
         let id = BlockId::new(ctx, PrincipalId::system(), 1);
         let snap = BlockSnapshot::tool_result(
-            id, call_id, ToolKind::Shell, "output", true, Some(127), None,
+            id,
+            call_id,
+            ToolKind::Shell,
+            "output",
+            true,
+            Some(127),
+            None,
         );
         let header = BlockHeader::from_snapshot(&snap);
         assert_eq!(header.tool_kind, Some(ToolKind::Shell));
@@ -2143,7 +2143,12 @@ mod tests {
         let ctx2 = ContextId::new();
         let agent = test_agent();
         let parent = BlockId::new(ctx1, agent, 0);
-        BlockSnapshot::text(BlockId::new(ctx2, agent, 1), Some(parent), Role::User, "bad");
+        BlockSnapshot::text(
+            BlockId::new(ctx2, agent, 1),
+            Some(parent),
+            Role::User,
+            "bad",
+        );
     }
 
     #[test]
@@ -2237,14 +2242,21 @@ mod tests {
         ctx: ContextId,
         agent: PrincipalId,
         n: usize,
-    ) -> (Vec<BlockSnapshot>, std::collections::HashMap<BlockId, BlockHeader>) {
+    ) -> (
+        Vec<BlockSnapshot>,
+        std::collections::HashMap<BlockId, BlockHeader>,
+    ) {
         let mut snaps = Vec::with_capacity(n);
         let mut index = std::collections::HashMap::with_capacity(n);
         let mut parent: Option<BlockId> = None;
 
         for seq in 0..n as u64 {
             let id = BlockId::new(ctx, agent, seq);
-            let role = if seq % 2 == 0 { Role::User } else { Role::Model };
+            let role = if seq % 2 == 0 {
+                Role::User
+            } else {
+                Role::Model
+            };
             let snap = BlockSnapshot::text(id, parent, role, format!("block {seq}"));
             index.insert(id, BlockHeader::from_snapshot(&snap));
             parent = Some(id);
@@ -2303,7 +2315,10 @@ mod tests {
 
         let leaf = snaps.last().unwrap().id;
         let (depth, reached_root) = walk_to_root(leaf, &index);
-        assert!(!reached_root, "circuit breaker should prevent full traversal");
+        assert!(
+            !reached_root,
+            "circuit breaker should prevent full traversal"
+        );
         assert_eq!(depth, MAX_DAG_DEPTH);
     }
 
@@ -2319,7 +2334,12 @@ mod tests {
         for seq in 1..=1000u64 {
             let child_agent = PrincipalId::new(); // each response from a different model
             let id = BlockId::new(ctx, child_agent, seq);
-            children.push(BlockSnapshot::text(id, Some(root_id), Role::Model, format!("response {seq}")));
+            children.push(BlockSnapshot::text(
+                id,
+                Some(root_id),
+                Role::Model,
+                format!("response {seq}"),
+            ));
         }
 
         // All children point to root
@@ -2388,7 +2408,14 @@ mod tests {
         );
 
         // Build header index and walk the DAG
-        let all = [&user_msg, &thinking, &text1, &tool_call, &tool_result, &text2];
+        let all = [
+            &user_msg,
+            &thinking,
+            &text1,
+            &tool_call,
+            &tool_result,
+            &text2,
+        ];
         let index: std::collections::HashMap<BlockId, BlockHeader> = all
             .iter()
             .map(|s| (s.id, BlockHeader::from_snapshot(s)))
@@ -2474,7 +2501,10 @@ mod tests {
         // Drift metadata is preserved
         assert_eq!(drift_in_b.drift_kind, Some(DriftKind::Distill));
         assert_eq!(drift_in_b.source_model.as_deref(), Some("claude-opus-4-6"));
-        assert!(drift_in_b.tool_kind.is_none(), "drift blocks should not have tool_kind");
+        assert!(
+            drift_in_b.tool_kind.is_none(),
+            "drift blocks should not have tool_kind"
+        );
         // Original lives in A
         assert_eq!(finding_in_a.id.context_id, ctx_a);
         // Both are roots in their respective contexts
@@ -2511,7 +2541,10 @@ mod tests {
         assert_eq!(active.len(), 21); // 1 summary + 20 live blocks
 
         // Headers preserve compacted flag
-        let headers: Vec<_> = snaps.iter().map(|s| BlockHeader::from_snapshot(s)).collect();
+        let headers: Vec<_> = snaps
+            .iter()
+            .map(|s| BlockHeader::from_snapshot(s))
+            .collect();
         let compacted_count = headers.iter().filter(|h| h.compacted).count();
         let live_count = headers.iter().filter(|h| !h.compacted).count();
         assert_eq!(compacted_count, 80);
@@ -2570,7 +2603,13 @@ mod tests {
         assert_ne!(claude_thinks.author(), gemini_thinks.author());
 
         // Build index and verify both branches walk to root
-        let all = [&prompt, &claude_thinks, &gemini_thinks, &claude_reply, &gemini_reply];
+        let all = [
+            &prompt,
+            &claude_thinks,
+            &gemini_thinks,
+            &claude_reply,
+            &gemini_reply,
+        ];
         let index: std::collections::HashMap<_, _> = all
             .iter()
             .map(|s| (s.id, BlockHeader::from_snapshot(s)))
@@ -2597,7 +2636,13 @@ mod tests {
             "Deploy the app",
         );
 
-        let tools = ["git pull", "cargo build", "cargo test", "docker build", "kubectl apply"];
+        let tools = [
+            "git pull",
+            "cargo build",
+            "cargo test",
+            "docker build",
+            "kubectl apply",
+        ];
         let mut parent = prompt.id;
         let mut model_seq = 1u64;
         let mut sys_seq = 0u64;
@@ -2627,8 +2672,16 @@ mod tests {
             sys_seq += 1;
 
             // Verify call→result linkage at construction time
-            assert_eq!(result.parent_id, Some(call.id), "result parent must be the call");
-            assert_eq!(result.tool_call_id, Some(call.id), "tool_call_id must match");
+            assert_eq!(
+                result.parent_id,
+                Some(call.id),
+                "result parent must be the call"
+            );
+            assert_eq!(
+                result.tool_call_id,
+                Some(call.id),
+                "tool_call_id must match"
+            );
             assert_eq!(result.status, Status::Done);
             assert_eq!(call.status, Status::Running);
             assert!(call.is_shell());
@@ -2669,7 +2722,9 @@ mod tests {
         let mut forward: HashMap<BlockId, Vec<BlockId>> = HashMap::new(); // parent → children
         let n: usize = 200;
 
-        let ids: Vec<BlockId> = (0..n).map(|seq| BlockId::new(ctx, agent, seq as u64)).collect();
+        let ids: Vec<BlockId> = (0..n)
+            .map(|seq| BlockId::new(ctx, agent, seq as u64))
+            .collect();
 
         // Build a binary tree: node i has children 2i+1 and 2i+2
         for i in 0..n {
@@ -2722,7 +2777,10 @@ mod tests {
         // Walk from the leaf — circuit breaker fires (5000 > 512)
         let leaf = snaps.last().unwrap().id;
         let (depth, reached) = walk_to_root(leaf, &index);
-        assert!(!reached, "5000-deep chain should hit MAX_DAG_DEPTH circuit breaker");
+        assert!(
+            !reached,
+            "5000-deep chain should hit MAX_DAG_DEPTH circuit breaker"
+        );
         assert_eq!(depth, MAX_DAG_DEPTH);
     }
 
@@ -2755,8 +2813,13 @@ mod tests {
         let agent = test_agent();
         let text = BlockSnapshot::text(BlockId::new(ctx, agent, 0), None, Role::User, "hi");
         let tool = BlockSnapshot::tool_call(
-            BlockId::new(ctx, agent, 1), None, ToolKind::Shell, "ls",
-            serde_json::json!({}), Role::Model, None,
+            BlockId::new(ctx, agent, 1),
+            None,
+            ToolKind::Shell,
+            "ls",
+            serde_json::json!({}),
+            Role::Model,
+            None,
         );
         assert!(!f.matches(&text));
         assert!(f.matches(&tool));

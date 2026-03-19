@@ -226,5 +226,4 @@ mod tests {
             std::env::remove_var("TEST_API_KEY");
         }
     }
-
 }

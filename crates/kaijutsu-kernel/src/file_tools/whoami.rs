@@ -15,9 +15,7 @@ pub struct WhoamiEngine {
 
 impl WhoamiEngine {
     pub fn new(drift_router: Arc<RwLock<DriftRouter>>) -> Self {
-        Self {
-            drift_router,
-        }
+        Self { drift_router }
     }
 }
 

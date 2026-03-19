@@ -244,7 +244,10 @@ mod tests {
 
         // Insert 5 chars at position 5 (before cursor)
         cursor.transform(5, 0, 5);
-        assert_eq!(cursor.offset, 15, "cursor should shift right after insert before");
+        assert_eq!(
+            cursor.offset, 15,
+            "cursor should shift right after insert before"
+        );
     }
 
     #[test]
@@ -254,7 +257,10 @@ mod tests {
 
         // Insert 5 chars at position 15 (after cursor)
         cursor.transform(15, 0, 5);
-        assert_eq!(cursor.offset, 10, "cursor should stay put after insert after");
+        assert_eq!(
+            cursor.offset, 10,
+            "cursor should stay put after insert after"
+        );
     }
 
     #[test]
@@ -264,7 +270,10 @@ mod tests {
 
         // Delete 3 chars at position 2 (before cursor)
         cursor.transform(2, 3, 0);
-        assert_eq!(cursor.offset, 7, "cursor should shift left after delete before");
+        assert_eq!(
+            cursor.offset, 7,
+            "cursor should shift left after delete before"
+        );
     }
 
     #[test]
@@ -274,7 +283,10 @@ mod tests {
 
         // Delete 10 chars at position 5 (overlaps cursor at 10)
         cursor.transform(5, 10, 0);
-        assert_eq!(cursor.offset, 5, "cursor should move to delete point when overlapped");
+        assert_eq!(
+            cursor.offset, 5,
+            "cursor should move to delete point when overlapped"
+        );
     }
 
     #[test]
@@ -289,10 +301,13 @@ mod tests {
 
     fn test_agent(n: u64) -> PrincipalId {
         // Deterministic agents for tests
-        PrincipalId::from_bytes(*uuid::Uuid::new_v5(
-            &uuid::Uuid::NAMESPACE_URL,
-            format!("test-agent-{}", n).as_bytes(),
-        ).as_bytes())
+        PrincipalId::from_bytes(
+            *uuid::Uuid::new_v5(
+                &uuid::Uuid::NAMESPACE_URL,
+                format!("test-agent-{}", n).as_bytes(),
+            )
+            .as_bytes(),
+        )
     }
 
     #[test]
@@ -336,7 +351,11 @@ mod tests {
     fn test_cursor_tracker_different_blocks() {
         let tracker = CursorTracker::new();
         let block1 = test_block_id();
-        let block2 = BlockId::new(kaijutsu_types::ContextId::new(), kaijutsu_types::PrincipalId::system(), 2);
+        let block2 = BlockId::new(
+            kaijutsu_types::ContextId::new(),
+            kaijutsu_types::PrincipalId::system(),
+            2,
+        );
         let agent1 = test_agent(1);
         let agent2 = test_agent(2);
 
@@ -377,7 +396,11 @@ mod tests {
     fn test_cursors_in_block() {
         let tracker = CursorTracker::new();
         let block1 = test_block_id();
-        let block2 = BlockId::new(kaijutsu_types::ContextId::new(), kaijutsu_types::PrincipalId::system(), 2);
+        let block2 = BlockId::new(
+            kaijutsu_types::ContextId::new(),
+            kaijutsu_types::PrincipalId::system(),
+            2,
+        );
         let agent1 = test_agent(1);
         let agent2 = test_agent(2);
         let agent3 = test_agent(3);

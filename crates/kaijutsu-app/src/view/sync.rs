@@ -10,8 +10,8 @@ use crate::cell::{
     CachedDocument, CellEditor, ConversationScrollState, EditorEntities, LayoutGeneration,
     MainCell, ViewingConversation,
 };
-use kaijutsu_client::ServerEvent;
 use crate::connection::{RpcResultMessage, ServerEventMessage};
+use kaijutsu_client::ServerEvent;
 
 /// Handle block events from the server, routing through DocumentCache.
 ///
@@ -41,38 +41,45 @@ pub fn handle_block_events(
     // Handle initial document state from ContextJoined
     for result in result_events.read() {
         match result {
-        RpcResultMessage::ContextJoined { membership, initial_sync } => {
-            let ctx_id = membership.context_id;
+            RpcResultMessage::ContextJoined {
+                membership,
+                initial_sync,
+            } => {
+                let ctx_id = membership.context_id;
 
-            if !doc_cache.contains(ctx_id) {
-                let mut synced = kaijutsu_client::SyncedDocument::new(ctx_id, agent_id);
+                if !doc_cache.contains(ctx_id) {
+                    let mut synced = kaijutsu_client::SyncedDocument::new(ctx_id, agent_id);
 
-                if let Some(state) = initial_sync {
-                    match synced.apply_sync_state(state) {
-                        Ok(effect) => {
-                            info!("Cache: initial sync for {} effect: {:?}", ctx_id, effect);
-                        }
-                        Err(e) => {
-                            error!("Cache: initial sync error for {}: {}", ctx_id, e);
+                    if let Some(state) = initial_sync {
+                        match synced.apply_sync_state(state) {
+                            Ok(effect) => {
+                                info!("Cache: initial sync for {} effect: {:?}", ctx_id, effect);
+                            }
+                            Err(e) => {
+                                error!("Cache: initial sync error for {}: {}", ctx_id, e);
+                            }
                         }
                     }
-                }
 
-                let cached = CachedDocument {
-                    synced,
-                    input: None,
-                    input_pending_clear: false,
-                    context_name: membership.context_id.short(),
-                    synced_at_generation: sync_gen.0,
-                    last_accessed: std::time::Instant::now(),
-                    scroll_offset: 0.0,
-                };
-                doc_cache.insert(ctx_id, cached);
-            } else if let Some(state) = initial_sync {
-                if let Some(cached) = doc_cache.get_mut(ctx_id) {
+                    let cached = CachedDocument {
+                        synced,
+                        input: None,
+                        input_pending_clear: false,
+                        context_name: membership.context_id.short(),
+                        synced_at_generation: sync_gen.0,
+                        last_accessed: std::time::Instant::now(),
+                        scroll_offset: 0.0,
+                    };
+                    doc_cache.insert(ctx_id, cached);
+                } else if let Some(state) = initial_sync
+                    && let Some(cached) = doc_cache.get_mut(ctx_id)
+                {
                     match cached.synced.apply_sync_state(state) {
                         Ok(effect) => {
-                            info!("Cache: reconnect refresh for {} effect: {:?}", ctx_id, effect);
+                            info!(
+                                "Cache: reconnect refresh for {} effect: {:?}",
+                                ctx_id, effect
+                            );
                             cached.synced_at_generation = sync_gen.0;
                         }
                         Err(e) => {
@@ -80,73 +87,80 @@ pub fn handle_block_events(
                         }
                     }
                 }
-            }
 
-            // Fetch input document state for the joined context
-            if let Some(ref actor) = actor {
-                let handle = actor.handle.clone();
-                let tx = channel.sender();
-                bevy::tasks::IoTaskPool::get()
-                    .spawn(async move {
-                        match handle.get_input_state(ctx_id).await {
-                            Ok(state) => {
-                                let _ = tx.send(RpcResultMessage::InputStateReceived {
-                                    context_id: ctx_id,
-                                    state,
-                                });
+                // Fetch input document state for the joined context
+                if let Some(ref actor) = actor {
+                    let handle = actor.handle.clone();
+                    let tx = channel.sender();
+                    bevy::tasks::IoTaskPool::get()
+                        .spawn(async move {
+                            match handle.get_input_state(ctx_id).await {
+                                Ok(state) => {
+                                    let _ = tx.send(RpcResultMessage::InputStateReceived {
+                                        context_id: ctx_id,
+                                        state,
+                                    });
+                                }
+                                Err(e) => {
+                                    log::warn!("get_input_state failed for {}: {}", ctx_id, e);
+                                    let _ = tx.send(RpcResultMessage::InputStateReceived {
+                                        context_id: ctx_id,
+                                        state: kaijutsu_client::InputState {
+                                            content: String::new(),
+                                            ops: Vec::new(),
+                                            version: 0,
+                                        },
+                                    });
+                                }
+                            }
+                        })
+                        .detach();
+                }
+
+                if doc_cache.active_id().is_none() {
+                    doc_cache.set_active(ctx_id);
+                }
+
+                if pending_switch.0 == Some(ctx_id) {
+                    info!(
+                        "Pending context switch satisfied: {} joined, auto-switching",
+                        ctx_id
+                    );
+                    pending_switch.0 = None;
+                    switch_writer.write(crate::cell::ContextSwitchRequested { context_id: ctx_id });
+                }
+            }
+            RpcResultMessage::InputStateReceived { context_id, state } => {
+                let ctx_id = *context_id;
+                if let Some(cached) = doc_cache.get_mut(ctx_id)
+                    && cached.input.is_none()
+                {
+                    if state.ops.is_empty() {
+                        cached.input = Some(kaijutsu_client::SyncedInput::new(ctx_id, agent_id));
+                        info!("Initialized empty SyncedInput for {}", ctx_id);
+                    } else {
+                        match kaijutsu_client::SyncedInput::from_state(ctx_id, agent_id, &state.ops)
+                        {
+                            Ok(input) => {
+                                info!(
+                                    "Initialized SyncedInput for {} (text='{}')",
+                                    ctx_id, state.content
+                                );
+                                cached.input = Some(input);
                             }
                             Err(e) => {
-                                log::warn!("get_input_state failed for {}: {}", ctx_id, e);
-                                let _ = tx.send(RpcResultMessage::InputStateReceived {
-                                    context_id: ctx_id,
-                                    state: kaijutsu_client::InputState {
-                                        content: String::new(),
-                                        ops: Vec::new(),
-                                        version: 0,
-                                    },
-                                });
+                                warn!(
+                                    "Failed to create SyncedInput from state for {}: {}",
+                                    ctx_id, e
+                                );
+                                cached.input =
+                                    Some(kaijutsu_client::SyncedInput::new(ctx_id, agent_id));
                             }
-                        }
-                    })
-                    .detach();
-            }
-
-            if doc_cache.active_id().is_none() {
-                doc_cache.set_active(ctx_id);
-            }
-
-            if pending_switch.0 == Some(ctx_id) {
-                info!("Pending context switch satisfied: {} joined, auto-switching", ctx_id);
-                pending_switch.0 = None;
-                switch_writer.write(crate::cell::ContextSwitchRequested {
-                    context_id: ctx_id,
-                });
-            }
-
-        }
-        RpcResultMessage::InputStateReceived { context_id, state } => {
-            let ctx_id = *context_id;
-            if let Some(cached) = doc_cache.get_mut(ctx_id)
-                && cached.input.is_none()
-            {
-                if state.ops.is_empty() {
-                    cached.input = Some(kaijutsu_client::SyncedInput::new(ctx_id, agent_id));
-                    info!("Initialized empty SyncedInput for {}", ctx_id);
-                } else {
-                    match kaijutsu_client::SyncedInput::from_state(ctx_id, agent_id, &state.ops) {
-                        Ok(input) => {
-                            info!("Initialized SyncedInput for {} (text='{}')", ctx_id, state.content);
-                            cached.input = Some(input);
-                        }
-                        Err(e) => {
-                            warn!("Failed to create SyncedInput from state for {}: {}", ctx_id, e);
-                            cached.input = Some(kaijutsu_client::SyncedInput::new(ctx_id, agent_id));
                         }
                     }
                 }
             }
-        }
-        _ => {}
+            _ => {}
         }
     }
 
@@ -163,26 +177,29 @@ pub fn handle_block_events(
             _ => None,
         };
 
-        if let Some(ctx_id) = event_ctx_id {
-            if let Some(cached) = doc_cache.get_mut(ctx_id) {
-                let effect = cached.synced.apply_event(event);
-                match &effect {
-                    kaijutsu_client::SyncEffect::Updated { .. }
-                    | kaijutsu_client::SyncEffect::FullSync { .. } => {
-                        cached.synced_at_generation = sync_gen.0;
-                    }
-                    kaijutsu_client::SyncEffect::NeedsResync => {
-                        cached.synced_at_generation = 0;
-                        sync_gen.0 = sync_gen.0.wrapping_add(1);
-                    }
-                    kaijutsu_client::SyncEffect::Ignored => {}
+        if let Some(ctx_id) = event_ctx_id
+            && let Some(cached) = doc_cache.get_mut(ctx_id)
+        {
+            let effect = cached.synced.apply_event(event);
+            match &effect {
+                kaijutsu_client::SyncEffect::Updated { .. }
+                | kaijutsu_client::SyncEffect::FullSync { .. } => {
+                    cached.synced_at_generation = sync_gen.0;
                 }
-                trace!("Cache: event for {}: {:?}", ctx_id, effect);
+                kaijutsu_client::SyncEffect::NeedsResync => {
+                    cached.synced_at_generation = 0;
+                    sync_gen.0 = sync_gen.0.wrapping_add(1);
+                }
+                kaijutsu_client::SyncEffect::Ignored => {}
             }
+            trace!("Cache: event for {}: {:?}", ctx_id, effect);
         }
     }
 
-    if was_at_bottom && layout_gen.0 > scroll_state.last_content_gen && !scroll_state.user_scrolled_this_frame {
+    if was_at_bottom
+        && layout_gen.0 > scroll_state.last_content_gen
+        && !scroll_state.user_scrolled_this_frame
+    {
         scroll_state.start_following();
         scroll_state.last_content_gen = layout_gen.0;
     }
@@ -217,11 +234,14 @@ pub fn handle_input_doc_events(
                         trace!("Suppressed InputTextOps for {} (pending clear)", context_id);
                         continue;
                     }
-                    if let Some(input) = &mut cached.input {
-                        if let Err(e) = input.apply_remote_ops(ops) {
-                            warn!("Failed to apply remote input ops for {}: {}, dropping input for re-sync", context_id, e);
-                            cached.input = None;
-                        }
+                    if let Some(input) = &mut cached.input
+                        && let Err(e) = input.apply_remote_ops(ops)
+                    {
+                        warn!(
+                            "Failed to apply remote input ops for {}: {}, dropping input for re-sync",
+                            context_id, e
+                        );
+                        cached.input = None;
                     }
                 }
             }
@@ -251,7 +271,11 @@ pub fn handle_input_doc_events(
                                     });
                                 }
                                 Err(e) => {
-                                    log::warn!("get_input_state re-fetch after clear failed for {}: {}", ctx_id, e);
+                                    log::warn!(
+                                        "get_input_state re-fetch after clear failed for {}: {}",
+                                        ctx_id,
+                                        e
+                                    );
                                     let _ = tx.send(RpcResultMessage::InputStateReceived {
                                         context_id: ctx_id,
                                         state: kaijutsu_client::InputState {
@@ -347,7 +371,10 @@ pub fn sync_main_cell_to_conversation(
         }
     }
 
-    trace!("Synced MainCell to conversation {} (version {})", ctx_id, sync_version);
+    trace!(
+        "Synced MainCell to conversation {} (version {})",
+        ctx_id, sync_version
+    );
 }
 
 /// Handle context switch requests.
@@ -367,18 +394,23 @@ pub fn handle_context_switch(
                 continue;
             }
 
-            info!("Context switch: cache miss for {}, spawning actor to join", ctx_id);
+            info!(
+                "Context switch: cache miss for {}, spawning actor to join",
+                ctx_id
+            );
             pending_switch.0 = Some(ctx_id);
 
             let kernel_id = conn_state.kernel_id.unwrap_or_else(KernelId::nil);
 
             let instance = uuid::Uuid::new_v4().to_string();
-            let _ = bootstrap.tx.send(crate::connection::BootstrapCommand::SpawnActor {
-                config: conn_state.ssh_config.clone(),
-                kernel_id,
-                context_id: Some(ctx_id),
-                instance,
-            });
+            let _ = bootstrap
+                .tx
+                .send(crate::connection::BootstrapCommand::SpawnActor {
+                    config: conn_state.ssh_config.clone(),
+                    kernel_id,
+                    context_id: Some(ctx_id),
+                    instance,
+                });
             continue;
         }
 
@@ -398,7 +430,10 @@ pub fn handle_context_switch(
             scroll_state.offset = cached.scroll_offset;
             scroll_state.target_offset = cached.scroll_offset;
             scroll_state.following = false;
-            info!("Context switch complete: {} (scroll: {:.0})", ctx_id, cached.scroll_offset);
+            info!(
+                "Context switch complete: {} (scroll: {:.0})",
+                ctx_id, cached.scroll_offset
+            );
         }
     }
 }
@@ -458,7 +493,11 @@ pub fn check_cache_staleness(
             .spawn(async move {
                 match handle.get_context_sync(ctx_id).await {
                     Ok(sync) => {
-                        info!("Staleness re-fetch complete for {}: {} bytes oplog", ctx_id, sync.ops.len());
+                        info!(
+                            "Staleness re-fetch complete for {}: {} bytes oplog",
+                            ctx_id,
+                            sync.ops.len()
+                        );
                     }
                     Err(e) => {
                         warn!("Staleness re-fetch failed for {}: {}", ctx_id, e);

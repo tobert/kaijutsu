@@ -16,7 +16,7 @@
 use bevy::picking::mesh_picking::{MeshPickingPlugin, MeshPickingSettings};
 use bevy::prelude::*;
 use bevy_brp_extras::BrpExtrasPlugin;
-use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 mod agents;
 mod cell;
@@ -36,13 +36,14 @@ pub use kaijutsu_client::kaijutsu_capnp;
 
 fn main() {
     // Set up file logging
-    let log_dir = std::env::var("KAIJUTSU_LOG_DIR")
-        .unwrap_or_else(|_| "/tmp".to_string());
+    let log_dir = std::env::var("KAIJUTSU_LOG_DIR").unwrap_or_else(|_| "/tmp".to_string());
     let file_appender = tracing_appender::rolling::never(&log_dir, "kaijutsu-app.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
 
     let registry = tracing_subscriber::registry()
-        .with(EnvFilter::new("warn,kaijutsu_app=debug,kaijutsu_client=debug"))
+        .with(EnvFilter::new(
+            "warn,kaijutsu_app=debug,kaijutsu_client=debug",
+        ))
         .with(fmt::layer().with_writer(non_blocking).with_ansi(false))
         .with(fmt::layer().with_writer(std::io::stderr));
 
@@ -55,29 +56,37 @@ fn main() {
         None
     };
 
-    info!("Starting Kaijutsu App - logging to {}/kaijutsu-app.log", log_dir);
+    info!(
+        "Starting Kaijutsu App - logging to {}/kaijutsu-app.log",
+        log_dir
+    );
 
     // Load theme and bindings from ~/.config/kaijutsu/ (or use defaults)
     let app_config = config::load_app_config();
     let theme = app_config.theme;
 
     App::new()
-        .add_plugins(DefaultPlugins
-            .set(WindowPlugin {
-                primary_window: Some(Window {
-                    title: "会術 Kaijutsu".into(),
-                    resolution: (constants::DEFAULT_WINDOW_WIDTH, constants::DEFAULT_WINDOW_HEIGHT).into(),
+        .add_plugins(
+            DefaultPlugins
+                .set(WindowPlugin {
+                    primary_window: Some(Window {
+                        title: "会術 Kaijutsu".into(),
+                        resolution: (
+                            constants::DEFAULT_WINDOW_WIDTH,
+                            constants::DEFAULT_WINDOW_HEIGHT,
+                        )
+                            .into(),
+                        ..default()
+                    }),
                     ..default()
-                }),
-                ..default()
-            })
-            .set(AssetPlugin {
-                // Assets are at workspace root, not crate directory
-                file_path: "../../assets".into(),
-                ..default()
-            })
-            // Disable Bevy's LogPlugin - we set up our own tracing subscriber
-            .disable::<bevy::log::LogPlugin>()
+                })
+                .set(AssetPlugin {
+                    // Assets are at workspace root, not crate directory
+                    file_path: "../../assets".into(),
+                    ..default()
+                })
+                // Disable Bevy's LogPlugin - we set up our own tracing subscriber
+                .disable::<bevy::log::LogPlugin>(),
         )
         // 3D mesh picking for constellation node clicks
         .add_plugins(MeshPickingPlugin)
@@ -120,11 +129,10 @@ fn main() {
         // Resources - theme loaded from ~/.config/kaijutsu/theme.rhai
         .insert_resource(theme)
         // Startup
-        .add_systems(Startup, (
-            setup_camera,
-            setup_ui,
-            ui::debug::setup_debug_overlay,
-        ).chain())
+        .add_systems(
+            Startup,
+            (setup_camera, setup_ui, ui::debug::setup_debug_overlay).chain(),
+        )
         // Update
         // NOTE: handle_debug_toggle, handle_screenshot, handle_quit
         // migrated to input::systems — they consume ActionFired now
@@ -158,9 +166,7 @@ fn setup_camera(mut commands: Commands, theme: Res<ui::theme::Theme>) {
 ///       [ConversationContainer — spawned by tiling reconciler]
 ///   [SouthDock — spawned by DockPlugin]
 /// ```
-fn setup_ui(
-    mut commands: Commands,
-) {
+fn setup_ui(mut commands: Commands) {
     // Root container — marked with TilingRoot for the reconciler to find.
     // Docks are inserted as children by the tiling reconciler.
     commands
@@ -184,7 +190,7 @@ fn setup_ui(
                     flex_grow: 1.0,
                     height: Val::Percent(100.0),
                     flex_direction: FlexDirection::Column,
-                    overflow: Overflow::clip(),  // Hard boundary for all children
+                    overflow: Overflow::clip(), // Hard boundary for all children
                     ..default()
                 },
                 ZIndex(constants::ZLayer::CONTENT),
@@ -196,7 +202,7 @@ fn setup_ui(
                     ui::state::ConversationRoot,
                     Node {
                         width: Val::Percent(100.0),
-                        flex_grow: 1.0,  // Participate in flex layout properly
+                        flex_grow: 1.0, // Participate in flex layout properly
                         flex_direction: FlexDirection::Column,
                         ..default()
                     },

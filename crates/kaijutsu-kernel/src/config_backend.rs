@@ -40,15 +40,18 @@ use tokio::sync::mpsc;
 use kaijutsu_crdt::{BlockId, BlockKind, ContextId, Role, Status};
 
 use crate::block_store::SharedBlockStore;
-use kaijutsu_types::DocKind;
 use crate::flows::{ConfigFlow, ConfigSource, OpSource, SharedConfigFlowBus};
+use kaijutsu_types::DocKind;
 
 /// Derive a deterministic ContextId from a config path.
 ///
 /// Config documents aren't real contexts, but BlockStore is keyed by ContextId.
 /// We use UUIDv5 (namespace: URL) so the same path always maps to the same ID.
 fn config_context_id(path: &str) -> ContextId {
-    let uuid = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, format!("kaijutsu:config:{}", path).as_bytes());
+    let uuid = uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_URL,
+        format!("kaijutsu:config:{}", path).as_bytes(),
+    );
     ContextId::from_bytes(*uuid.as_bytes())
 }
 
@@ -265,7 +268,12 @@ impl ConfigCrdtBackend {
     /// Config documents have exactly one block. Returns None if the document
     /// doesn't exist or has no blocks yet.
     fn first_block_id(&self, ctx: ContextId) -> Option<BlockId> {
-        self.blocks.get(ctx)?.doc.blocks_ordered().first().map(|b| b.id)
+        self.blocks
+            .get(ctx)?
+            .doc
+            .blocks_ordered()
+            .first()
+            .map(|b| b.id)
     }
 
     /// Emit a ConfigFlow event.
@@ -370,8 +378,15 @@ impl ConfigCrdtBackend {
 
         if let Some(block_id) = self.first_block_id(ctx) {
             // Replace content of existing block
-            let current_len = self.blocks.get(ctx)
-                .and_then(|entry| entry.doc.get_block_snapshot(&block_id).map(|b| b.content.chars().count()))
+            let current_len = self
+                .blocks
+                .get(ctx)
+                .and_then(|entry| {
+                    entry
+                        .doc
+                        .get_block_snapshot(&block_id)
+                        .map(|b| b.content.chars().count())
+                })
                 .unwrap_or(0);
 
             self.blocks
@@ -380,7 +395,15 @@ impl ConfigCrdtBackend {
         } else {
             // Create new block
             self.blocks
-                .insert_block(ctx, None, None, Role::System, BlockKind::Text, &content, Status::Done)
+                .insert_block(
+                    ctx,
+                    None,
+                    None,
+                    Role::System,
+                    BlockKind::Text,
+                    &content,
+                    Status::Done,
+                )
                 .map_err(|e| ConfigError::Crdt(e.to_string()))?;
         }
 
@@ -412,8 +435,15 @@ impl ConfigCrdtBackend {
 
         if let Some(block_id) = self.first_block_id(ctx) {
             // Replace content of existing block
-            let current_len = self.blocks.get(ctx)
-                .and_then(|entry| entry.doc.get_block_snapshot(&block_id).map(|b| b.content.chars().count()))
+            let current_len = self
+                .blocks
+                .get(ctx)
+                .and_then(|entry| {
+                    entry
+                        .doc
+                        .get_block_snapshot(&block_id)
+                        .map(|b| b.content.chars().count())
+                })
                 .unwrap_or(0);
 
             self.blocks
@@ -563,9 +593,7 @@ impl ConfigCrdtBackend {
     /// Start the file watcher for the config directory.
     ///
     /// Watches for external changes (from editors) and syncs them to CRDT.
-    pub fn start_watcher(
-        self: &std::sync::Arc<Self>,
-    ) -> Result<ConfigWatcherHandle, ConfigError> {
+    pub fn start_watcher(self: &std::sync::Arc<Self>) -> Result<ConfigWatcherHandle, ConfigError> {
         let backend = std::sync::Arc::clone(self);
         let tx = self.watcher_event_tx.clone();
         let config_root = self.config_root.clone();
@@ -600,7 +628,7 @@ impl ConfigCrdtBackend {
             },
             notify::Config::default().with_poll_interval(Duration::from_millis(500)),
         )
-        .map_err(|e| ConfigError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        .map_err(|e| ConfigError::Io(std::io::Error::other(e)))?;
 
         // Create config directory if it doesn't exist
         std::fs::create_dir_all(&self.config_root)?;
@@ -608,7 +636,7 @@ impl ConfigCrdtBackend {
         // Watch the config directory
         watcher
             .watch(&self.config_root, RecursiveMode::Recursive)
-            .map_err(|e| ConfigError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+            .map_err(|e| ConfigError::Io(std::io::Error::other(e)))?;
 
         // Create shutdown channel
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
@@ -618,10 +646,7 @@ impl ConfigCrdtBackend {
             .watcher_event_rx
             .write()
             .take()
-            .ok_or_else(|| ConfigError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "watcher already started",
-            )))?;
+            .ok_or_else(|| ConfigError::Io(std::io::Error::other("watcher already started")))?;
 
         // Spawn the event processor task
         tokio::spawn(async move {
@@ -644,11 +669,10 @@ impl ConfigCrdtBackend {
 
                         // Debounce: skip if we saw this file very recently
                         let now = Instant::now();
-                        if let Some(last) = debounce_map.get(&event.path) {
-                            if now.duration_since(*last) < debounce_duration {
+                        if let Some(last) = debounce_map.get(&event.path)
+                            && now.duration_since(*last) < debounce_duration {
                                 continue;
                             }
-                        }
                         debounce_map.insert(event.path.clone(), now);
 
                         // Process the event
@@ -701,8 +725,15 @@ impl ConfigCrdtBackend {
 
                 if let Some(block_id) = self.first_block_id(ctx) {
                     // Replace content of existing block
-                    let current_len = self.blocks.get(ctx)
-                        .and_then(|entry| entry.doc.get_block_snapshot(&block_id).map(|b| b.content.chars().count()))
+                    let current_len = self
+                        .blocks
+                        .get(ctx)
+                        .and_then(|entry| {
+                            entry
+                                .doc
+                                .get_block_snapshot(&block_id)
+                                .map(|b| b.content.chars().count())
+                        })
                         .unwrap_or(0);
 
                     self.blocks
@@ -711,7 +742,15 @@ impl ConfigCrdtBackend {
                 } else {
                     // Create new block
                     self.blocks
-                        .insert_block(ctx, None, None, Role::System, BlockKind::Text, &content, Status::Done)
+                        .insert_block(
+                            ctx,
+                            None,
+                            None,
+                            Role::System,
+                            BlockKind::Text,
+                            &content,
+                            Status::Done,
+                        )
                         .map_err(|e| ConfigError::Crdt(e.to_string()))?;
                 }
 
@@ -731,7 +770,6 @@ impl ConfigCrdtBackend {
 
         Ok(())
     }
-
 }
 
 #[cfg(test)]
@@ -838,8 +876,14 @@ mod tests {
     #[test]
     fn test_default_theme_loaded() {
         // Verify the include_str! loaded actual content
-        assert!(!DEFAULT_THEME.is_empty(), "DEFAULT_THEME should not be empty");
-        assert!(DEFAULT_THEME.contains("let"), "DEFAULT_THEME should contain Rhai code");
+        assert!(
+            !DEFAULT_THEME.is_empty(),
+            "DEFAULT_THEME should not be empty"
+        );
+        assert!(
+            DEFAULT_THEME.contains("let"),
+            "DEFAULT_THEME should contain Rhai code"
+        );
         println!("DEFAULT_THEME length: {}", DEFAULT_THEME.len());
     }
 }

@@ -3,9 +3,9 @@
 //! All functions in this module are stateless — they map block data to
 //! display strings. No ECS, no systems, just data transforms.
 
+use crate::ui::theme::Theme;
 use kaijutsu_crdt::{BlockKind, BlockSnapshot, DriftKind, Role, Status};
 use kaijutsu_types::{ContextId, OutputData, OutputEntryType, OutputNode};
-use crate::ui::theme::Theme;
 
 /// Map a block to its semantic text color based on BlockKind and Role.
 ///
@@ -18,14 +18,12 @@ use crate::ui::theme::Theme;
 /// - Shell: cyan for commands, gray for output
 pub fn block_color(block: &BlockSnapshot, theme: &Theme) -> bevy::prelude::Color {
     match block.kind {
-        BlockKind::Text | BlockKind::File => {
-            match block.role {
-                Role::User => theme.block_user,
-                Role::Model => theme.block_assistant,
-                Role::System => theme.fg_dim,
-                Role::Tool | Role::Asset => theme.block_tool_result,
-            }
-        }
+        BlockKind::Text | BlockKind::File => match block.role {
+            Role::User => theme.block_user,
+            Role::Model => theme.block_assistant,
+            Role::System => theme.fg_dim,
+            Role::Tool | Role::Asset => theme.block_tool_result,
+        },
         BlockKind::Thinking => theme.block_thinking,
         BlockKind::ToolCall => {
             if block.role == Role::User {
@@ -65,8 +63,15 @@ fn truncate_model(model: &str) -> &str {
 ///
 /// `local_ctx`: if provided, determines push direction arrow (→ outgoing, ← incoming).
 fn format_drift_block(block: &BlockSnapshot, local_ctx: Option<ContextId>) -> String {
-    let ctx_short = block.source_context.map(|c| c.short()).unwrap_or_else(|| "?".to_string());
-    let model = block.source_model.as_deref().map(truncate_model).unwrap_or("unknown");
+    let ctx_short = block
+        .source_context
+        .map(|c| c.short())
+        .unwrap_or_else(|| "?".to_string());
+    let model = block
+        .source_model
+        .as_deref()
+        .map(truncate_model)
+        .unwrap_or("unknown");
     let ctx_label = format!("@{}", ctx_short);
 
     // Determine direction arrow: → if we sent it, ← if we received it
@@ -84,13 +89,25 @@ fn format_drift_block(block: &BlockSnapshot, local_ctx: Option<ContextId>) -> St
             format!("pulled from {} ({})\n{}", ctx_label, model, block.content)
         }
         Some(DriftKind::Merge) => {
-            format!("\u{21c4} merged from {} ({})\n{}", ctx_label, model, block.content)
+            format!(
+                "\u{21c4} merged from {} ({})\n{}",
+                ctx_label, model, block.content
+            )
         }
         Some(DriftKind::Commit) => {
-            format!("# {}  {}", ctx_label, block.content.lines().next().unwrap_or(""))
+            format!(
+                "# {}  {}",
+                ctx_label,
+                block.content.lines().next().unwrap_or("")
+            )
         }
         None => {
-            format!("~ {} ({})  {}", ctx_label, model, block.content.lines().next().unwrap_or(""))
+            format!(
+                "~ {} ({})  {}",
+                ctx_label,
+                model,
+                block.content.lines().next().unwrap_or("")
+            )
         }
     }
 }
@@ -129,12 +146,7 @@ fn display_json_value(value: &serde_json::Value, indent: usize) -> String {
             let inner_pad = "  ".repeat(indent + 1);
             let entries: Vec<String> = obj
                 .iter()
-                .map(|(k, v)| {
-                    format!(
-                        "{inner_pad}\"{k}\": {}",
-                        display_json_value(v, indent + 1)
-                    )
-                })
+                .map(|(k, v)| format!("{inner_pad}\"{k}\": {}", display_json_value(v, indent + 1)))
                 .collect();
             format!("{{\n{}\n{pad}}}", entries.join(",\n"))
         }
@@ -208,6 +220,7 @@ pub struct OutputLayout {
 }
 
 /// Layout info for a single row in the formatted output.
+#[allow(dead_code)]
 pub struct OutputLayoutRow {
     /// Entry type of this row's node (for coloring the name column).
     pub entry_type: OutputEntryType,
@@ -283,11 +296,15 @@ pub fn compute_output_layout(data: &OutputData, formatted_text: &str) -> Option<
 
     // Tabular: recompute column widths (same logic as format_output_table)
     let headers = data.headers.as_deref();
-    let node_rows: Vec<Vec<&str>> = data.root.iter().map(|node| {
-        let mut row = vec![node.display_name()];
-        row.extend(node.cells.iter().map(|s| s.as_str()));
-        row
-    }).collect();
+    let node_rows: Vec<Vec<&str>> = data
+        .root
+        .iter()
+        .map(|node| {
+            let mut row = vec![node.display_name()];
+            row.extend(node.cells.iter().map(|s| s.as_str()));
+            row
+        })
+        .collect();
 
     let header_cols = headers.map_or(0, |h| h.len());
     let max_row_cols = node_rows.iter().map(|r| r.len()).max().unwrap_or(0);
@@ -344,18 +361,22 @@ pub fn compute_output_layout(data: &OutputData, formatted_text: &str) -> Option<
         let line_start = byte_offset;
         let mut col_ranges = Vec::new();
         let mut col_offset = byte_offset;
-        for i in 0..num_cols {
+        for (i, &width) in widths.iter().enumerate() {
             let cell = node_row.get(i).copied().unwrap_or("");
             let start = col_offset;
             let end = start + cell.len();
             col_ranges.push((start, end));
             if i + 1 < num_cols {
-                col_offset = start + widths[i] + gap;
+                col_offset = start + width + gap;
             } else {
                 col_offset = end;
             }
         }
-        let line_idx = if headers.is_some() { row_idx + 1 } else { row_idx };
+        let line_idx = if headers.is_some() {
+            row_idx + 1
+        } else {
+            row_idx
+        };
         let line_len = formatted_text.lines().nth(line_idx).map_or(0, |l| l.len());
         byte_offset += line_len + 1;
 
@@ -396,7 +417,9 @@ pub fn format_output_data(data: &OutputData) -> String {
 
     // 4. Flat list (names only)
     if !data.root.is_empty() && data.root.iter().all(|n| n.cells.is_empty()) {
-        return data.root.iter()
+        return data
+            .root
+            .iter()
             .map(|n| n.display_name().to_string())
             .collect::<Vec<_>>()
             .join("\n");
@@ -411,11 +434,15 @@ fn format_output_table(data: &OutputData) -> String {
     let headers = data.headers.as_deref();
 
     // Build rows as [name, cell0, cell1, ...]
-    let rows: Vec<Vec<&str>> = data.root.iter().map(|node| {
-        let mut row = vec![node.display_name()];
-        row.extend(node.cells.iter().map(|s| s.as_str()));
-        row
-    }).collect();
+    let rows: Vec<Vec<&str>> = data
+        .root
+        .iter()
+        .map(|node| {
+            let mut row = vec![node.display_name()];
+            row.extend(node.cells.iter().map(|s| s.as_str()));
+            row
+        })
+        .collect();
 
     // Determine number of columns
     let header_cols = headers.map_or(0, |h| h.len());
@@ -446,26 +473,34 @@ fn format_output_table(data: &OutputData) -> String {
 
     // Header line
     if let Some(hdrs) = headers {
-        let line: String = hdrs.iter().enumerate().map(|(i, h)| {
-            if i + 1 < num_cols {
-                format!("{:<width$}", h, width = widths[i])
-            } else {
-                h.to_string()
-            }
-        }).collect::<Vec<_>>().join(gap);
+        let line: String = hdrs
+            .iter()
+            .enumerate()
+            .map(|(i, h)| {
+                if i + 1 < num_cols {
+                    format!("{:<width$}", h, width = widths[i])
+                } else {
+                    h.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(gap);
         lines.push(line);
     }
 
     // Data rows
     for row in &rows {
-        let line: String = (0..num_cols).map(|i| {
-            let cell = row.get(i).copied().unwrap_or("");
-            if i + 1 < num_cols {
-                format!("{:<width$}", cell, width = widths[i])
-            } else {
-                cell.to_string()
-            }
-        }).collect::<Vec<_>>().join(gap);
+        let line: String = (0..num_cols)
+            .map(|i| {
+                let cell = row.get(i).copied().unwrap_or("");
+                if i + 1 < num_cols {
+                    format!("{:<width$}", cell, width = widths[i])
+                } else {
+                    cell.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(gap);
         lines.push(line);
     }
 
@@ -522,58 +557,56 @@ fn format_block_inner(block: &BlockSnapshot, local_ctx: Option<ContextId>) -> St
                 format!("Thinking\n{}", block.content)
             }
         }
-        BlockKind::Text => {
-            block.content.to_string()
-        }
+        BlockKind::Text => block.content.to_string(),
         BlockKind::ToolCall => {
             let name = block.tool_name.as_deref().unwrap_or("unknown");
             // For shell commands, show just the code value
             // For other tools, show "ToolName: primary_arg" on one line
-            if let Some(ref input_str) = block.tool_input {
-                if let Ok(input_val) = serde_json::from_str::<serde_json::Value>(input_str) {
-                    if let Some(obj) = input_val.as_object() {
-                        // Shell: show the code (with $ prefix for user-initiated)
-                        if let Some(code) = obj.get("code").and_then(|v| v.as_str()) {
-                            return if block.role == Role::User {
-                                format!("$ {}", code)
-                            } else {
-                                code.to_string()
-                            };
-                        }
-                        // Single-arg tool: "ToolName: value"
-                        if obj.len() == 1 {
-                            let (key, val) = obj.iter().next().unwrap();
-                            let val_str = match val {
-                                serde_json::Value::String(s) => s.clone(),
-                                other => serde_json::to_string(other).unwrap_or_default(),
-                            };
-                            let _ = key; // suppress unused
-                            return format!("{}: {}", name, val_str);
-                        }
-                        // Multi-arg: "ToolName: primary" then remaining args
-                        if !obj.is_empty() {
-                            let mut iter = obj.iter();
-                            let (_, first_val) = iter.next().unwrap();
-                            let primary = match first_val {
-                                serde_json::Value::String(s) => s.clone(),
-                                other => serde_json::to_string(other).unwrap_or_default(),
-                            };
-                            let mut output = format!("{}: {}", name, primary);
-                            let remaining: serde_json::Map<String, serde_json::Value> =
-                                iter.map(|(k, v)| (k.clone(), v.clone())).collect();
-                            if !remaining.is_empty() {
-                                let args = format_tool_args(&serde_json::Value::Object(remaining));
-                                output.push('\n');
-                                output.push_str(&args);
-                            }
-                            return output;
-                        }
+            if let Some(ref input_str) = block.tool_input
+                && let Ok(input_val) = serde_json::from_str::<serde_json::Value>(input_str)
+            {
+                if let Some(obj) = input_val.as_object() {
+                    // Shell: show the code (with $ prefix for user-initiated)
+                    if let Some(code) = obj.get("code").and_then(|v| v.as_str()) {
+                        return if block.role == Role::User {
+                            format!("$ {}", code)
+                        } else {
+                            code.to_string()
+                        };
                     }
-                    if !input_val.is_null() {
-                        let args = format_tool_args(&input_val);
-                        if !args.is_empty() {
-                            return format!("{}: {}", name, args);
+                    // Single-arg tool: "ToolName: value"
+                    if obj.len() == 1 {
+                        let (key, val) = obj.iter().next().unwrap();
+                        let val_str = match val {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => serde_json::to_string(other).unwrap_or_default(),
+                        };
+                        let _ = key; // suppress unused
+                        return format!("{}: {}", name, val_str);
+                    }
+                    // Multi-arg: "ToolName: primary" then remaining args
+                    if !obj.is_empty() {
+                        let mut iter = obj.iter();
+                        let (_, first_val) = iter.next().unwrap();
+                        let primary = match first_val {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => serde_json::to_string(other).unwrap_or_default(),
+                        };
+                        let mut output = format!("{}: {}", name, primary);
+                        let remaining: serde_json::Map<String, serde_json::Value> =
+                            iter.map(|(k, v)| (k.clone(), v.clone())).collect();
+                        if !remaining.is_empty() {
+                            let args = format_tool_args(&serde_json::Value::Object(remaining));
+                            output.push('\n');
+                            output.push_str(&args);
                         }
+                        return output;
+                    }
+                }
+                if !input_val.is_null() {
+                    let args = format_tool_args(&input_val);
+                    if !args.is_empty() {
+                        return format!("{}: {}", name, args);
                     }
                 }
             }
@@ -583,10 +616,18 @@ fn format_block_inner(block: &BlockSnapshot, local_ctx: Option<ContextId>) -> St
             // Prefer structured OutputData when available
             let body = if let Some(ref output) = block.output {
                 let formatted = format_output_data(output);
-                if formatted.is_empty() { None } else { Some(formatted) }
+                if formatted.is_empty() {
+                    None
+                } else {
+                    Some(formatted)
+                }
             } else {
                 let trimmed = block.content.trim();
-                if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
             };
 
             if block.is_error {
@@ -775,14 +816,10 @@ mod tests {
 
     #[test]
     fn test_format_output_tree() {
-        let data = OutputData::nodes(vec![
-            OutputNode::new("src").with_children(vec![
-                OutputNode::new("main.rs"),
-                OutputNode::new("lib").with_children(vec![
-                    OutputNode::new("utils.rs"),
-                ]),
-            ]),
-        ]);
+        let data = OutputData::nodes(vec![OutputNode::new("src").with_children(vec![
+            OutputNode::new("main.rs"),
+            OutputNode::new("lib").with_children(vec![OutputNode::new("utils.rs")]),
+        ])]);
         let result = format_output_data(&data);
         let lines: Vec<&str> = result.lines().collect();
         assert_eq!(lines[0], "src");
@@ -825,8 +862,12 @@ mod tests {
         let data = OutputData::table(
             vec!["NAME".into(), "SIZE".into()],
             vec![
-                OutputNode::new("foo").with_entry_type(OutputEntryType::File).with_cells(vec!["100".into()]),
-                OutputNode::new("bar").with_entry_type(OutputEntryType::Directory).with_cells(vec!["4096".into()]),
+                OutputNode::new("foo")
+                    .with_entry_type(OutputEntryType::File)
+                    .with_cells(vec!["100".into()]),
+                OutputNode::new("bar")
+                    .with_entry_type(OutputEntryType::Directory)
+                    .with_cells(vec!["4096".into()]),
             ],
         );
         let text = format_output_data(&data);
@@ -917,7 +958,10 @@ mod tests {
             None,
         );
         let color = block_color(&block, &theme);
-        assert_eq!(color, theme.block_user, "user shell should use block_user color");
+        assert_eq!(
+            color, theme.block_user,
+            "user shell should use block_user color"
+        );
     }
 
     #[test]

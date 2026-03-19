@@ -217,14 +217,14 @@ pub struct StatFs {
 impl Default for StatFs {
     fn default() -> Self {
         Self {
-            blocks: 1024 * 1024,      // 1M blocks
-            bfree: 512 * 1024,        // 512K free
-            bavail: 512 * 1024,       // same for non-root
-            files: 1024 * 1024,       // 1M inodes
-            ffree: 512 * 1024,        // 512K free
-            bsize: 4096,              // 4KB blocks
-            namelen: 255,             // standard
-            frsize: 4096,             // same as bsize
+            blocks: 1024 * 1024, // 1M blocks
+            bfree: 512 * 1024,   // 512K free
+            bavail: 512 * 1024,  // same for non-root
+            files: 1024 * 1024,  // 1M inodes
+            ffree: 512 * 1024,   // 512K free
+            bsize: 4096,         // 4KB blocks
+            namelen: 255,        // standard
+            frsize: 4096,        // same as bsize
         }
     }
 }
@@ -344,9 +344,7 @@ mod tests {
 
     #[test]
     fn test_setattr_builder() {
-        let attr = SetAttr::new()
-            .with_size(2048)
-            .with_perm(0o600);
+        let attr = SetAttr::new().with_size(2048).with_perm(0o600);
         assert_eq!(attr.size, Some(2048));
         assert_eq!(attr.perm, Some(0o600));
         assert!(attr.mtime.is_none());

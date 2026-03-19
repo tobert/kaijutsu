@@ -2,9 +2,7 @@
 
 use bevy::prelude::*;
 
-use crate::cell::{
-    ComposeError, InputOverlay, InputOverlayMarker, SubmitFailed,
-};
+use crate::cell::{ComposeError, InputOverlay, InputOverlayMarker, SubmitFailed};
 use crate::ui::theme::Theme;
 
 /// Restore overlay text and flash error border when submit fails.

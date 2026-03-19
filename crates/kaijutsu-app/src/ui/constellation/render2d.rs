@@ -17,7 +17,7 @@ use super::{
 };
 use crate::text::truncate_chars;
 use crate::ui::screen::Screen;
-use crate::ui::theme::{agent_color_for_provider, Theme};
+use crate::ui::theme::{Theme, agent_color_for_provider};
 
 /// Card height estimate for positioning (4 text lines + padding).
 const CARD_HEIGHT: f32 = 105.0;
@@ -30,18 +30,17 @@ const CARD_BORDER_WIDTH: f64 = 2.0;
 
 /// Register card rendering systems.
 pub fn setup_render2d_systems(app: &mut App) {
-    app.init_resource::<CardEntityMap>()
-        .add_systems(
-            Update,
-            (
-                sync_card_entities,
-                update_card_positions,
-                update_card_visuals,
-                rebuild_edge_scene,
-            )
-                .chain()
-                .run_if(in_state(Screen::Constellation)),
-        );
+    app.init_resource::<CardEntityMap>().add_systems(
+        Update,
+        (
+            sync_card_entities,
+            update_card_positions,
+            update_card_visuals,
+            rebuild_edge_scene,
+        )
+            .chain()
+            .run_if(in_state(Screen::Constellation)),
+    );
 }
 
 // ============================================================================
@@ -105,11 +104,8 @@ fn sync_card_entities(
     };
 
     // Current node IDs
-    let current_ids: std::collections::HashSet<ContextId> = constellation
-        .nodes
-        .iter()
-        .map(|n| n.context_id)
-        .collect();
+    let current_ids: std::collections::HashSet<ContextId> =
+        constellation.nodes.iter().map(|n| n.context_id).collect();
 
     // Quick check: if card map already matches, nothing to do
     if card_map.map.len() == current_ids.len()
@@ -156,7 +152,7 @@ fn spawn_card(
     let label_text = card_label_text(node);
     let model_text = card_model_text(node);
 
-    let card_root = commands
+    commands
         .spawn((
             CardMarker,
             ConstellationNode {
@@ -200,11 +196,7 @@ fn spawn_card(
                         CardLabelText,
                         UiVelloText {
                             value: label_text,
-                            style: crate::text::vello_style(
-                                &font_handles.mono,
-                                theme.fg,
-                                16.0,
-                            ),
+                            style: crate::text::vello_style(&font_handles.mono, theme.fg, 16.0),
                             ..default()
                         },
                         Node::default(),
@@ -215,11 +207,7 @@ fn spawn_card(
                         CardModelText,
                         UiVelloText {
                             value: model_text,
-                            style: crate::text::vello_style(
-                                &font_handles.mono,
-                                theme.fg_dim,
-                                13.0,
-                            ),
+                            style: crate::text::vello_style(&font_handles.mono, theme.fg_dim, 13.0),
                             ..default()
                         },
                         Node::default(),
@@ -230,11 +218,7 @@ fn spawn_card(
                         CardRecencyText,
                         UiVelloText {
                             value: "—".into(),
-                            style: crate::text::vello_style(
-                                &font_handles.mono,
-                                theme.fg_dim,
-                                11.0,
-                            ),
+                            style: crate::text::vello_style(&font_handles.mono, theme.fg_dim, 11.0),
                             ..default()
                         },
                         Node::default(),
@@ -256,9 +240,7 @@ fn spawn_card(
                     ));
                 });
         })
-        .id();
-
-    card_root
+        .id()
 }
 
 /// Update card absolute positions, scale, and depth sorting each frame.
@@ -281,7 +263,10 @@ fn update_card_positions(
     }
 
     // Center cards slightly below vertical center (55%) for visual comfort
-    let center = Vec2::new(viewport_size.x / 2.0, viewport_size.y * CAROUSEL_VERTICAL_CENTER);
+    let center = Vec2::new(
+        viewport_size.x / 2.0,
+        viewport_size.y * CAROUSEL_VERTICAL_CENTER,
+    );
     let base_card_width = theme.constellation_card_width;
 
     for node in &constellation.nodes {
@@ -322,10 +307,42 @@ fn update_card_visuals(
     card_map: Res<CardEntityMap>,
     children_q: Query<&Children>,
     mut bg_q: Query<&mut UiVelloScene, With<CardBg>>,
-    mut label_q: Query<&mut UiVelloText, (With<CardLabelText>, Without<CardModelText>, Without<CardRecencyText>, Without<CardKeywordsText>)>,
-    mut model_q: Query<&mut UiVelloText, (With<CardModelText>, Without<CardLabelText>, Without<CardRecencyText>, Without<CardKeywordsText>)>,
-    mut recency_q: Query<&mut UiVelloText, (With<CardRecencyText>, Without<CardLabelText>, Without<CardModelText>, Without<CardKeywordsText>)>,
-    mut keywords_q: Query<&mut UiVelloText, (With<CardKeywordsText>, Without<CardLabelText>, Without<CardModelText>, Without<CardRecencyText>)>,
+    mut label_q: Query<
+        &mut UiVelloText,
+        (
+            With<CardLabelText>,
+            Without<CardModelText>,
+            Without<CardRecencyText>,
+            Without<CardKeywordsText>,
+        ),
+    >,
+    mut model_q: Query<
+        &mut UiVelloText,
+        (
+            With<CardModelText>,
+            Without<CardLabelText>,
+            Without<CardRecencyText>,
+            Without<CardKeywordsText>,
+        ),
+    >,
+    mut recency_q: Query<
+        &mut UiVelloText,
+        (
+            With<CardRecencyText>,
+            Without<CardLabelText>,
+            Without<CardModelText>,
+            Without<CardKeywordsText>,
+        ),
+    >,
+    mut keywords_q: Query<
+        &mut UiVelloText,
+        (
+            With<CardKeywordsText>,
+            Without<CardLabelText>,
+            Without<CardModelText>,
+            Without<CardRecencyText>,
+        ),
+    >,
 ) {
     let elapsed = time.elapsed_secs();
     let elapsed_f64 = time.elapsed_secs_f64();
@@ -400,7 +417,13 @@ fn update_card_visuals(
         if node.activity == ActivityState::Error {
             let error_color = VelloColor::new([0.97, 0.46, 0.56, 0.8]);
             let error_rect = RoundedRect::new(0.0, 0.0, 3.0, card_h, 0.0);
-            scene.fill(Fill::NonZero, Affine::IDENTITY, error_color, None, &error_rect);
+            scene.fill(
+                Fill::NonZero,
+                Affine::IDENTITY,
+                error_color,
+                None,
+                &error_rect,
+            );
         }
 
         // Apply scene to CardBg
@@ -424,7 +447,11 @@ fn update_card_visuals(
                         // Update color based on focus
                         text.style = crate::text::vello_style(
                             &font_handles.mono,
-                            if is_focused { theme.fg } else if node.joined { theme.fg } else { theme.fg_dim },
+                            if is_focused || node.joined {
+                                theme.fg
+                            } else {
+                                theme.fg_dim
+                            },
                             16.0,
                         );
                     }
@@ -470,7 +497,10 @@ fn rebuild_edge_scene(
         return;
     }
 
-    let center = Vec2::new(viewport_size.x / 2.0, viewport_size.y * CAROUSEL_VERTICAL_CENTER);
+    let center = Vec2::new(
+        viewport_size.x / 2.0,
+        viewport_size.y * CAROUSEL_VERTICAL_CENTER,
+    );
 
     // Build id → screen position map
     let positions: std::collections::HashMap<ContextId, Vec2> = constellation
@@ -497,7 +527,13 @@ fn rebuild_edge_scene(
             continue;
         };
 
-        draw_edge(&mut vello_scene, from, to, edge_color, node.fork_kind.as_deref());
+        draw_edge(
+            &mut vello_scene,
+            from,
+            to,
+            edge_color,
+            node.fork_kind.as_deref(),
+        );
     }
 
     // Update or spawn the edge scene
@@ -619,10 +655,7 @@ fn draw_edge(
     let to_pt = Point::new(to.x as f64, to.y as f64);
 
     // Control point offset perpendicular to line
-    let mid = Point::new(
-        (from.x + to.x) as f64 / 2.0,
-        (from.y + to.y) as f64 / 2.0,
-    );
+    let mid = Point::new((from.x + to.x) as f64 / 2.0, (from.y + to.y) as f64 / 2.0);
     let delta = Vec2::new(to.x - from.x, to.y - from.y);
     let perp = Vec2::new(-delta.y, delta.x).normalize_or_zero() * 15.0;
     let control = Point::new(mid.x + perp.x as f64, mid.y + perp.y as f64);
@@ -632,8 +665,12 @@ fn draw_edge(
     path.quad_to(control, to_pt);
 
     let stroke = match fork_kind {
-        Some("shallow") => Stroke::new(1.5).with_caps(Cap::Round).with_dashes(0.0, [6.0, 4.0]),
-        Some("compact") => Stroke::new(1.5).with_caps(Cap::Round).with_dashes(0.0, [2.0, 4.0]),
+        Some("shallow") => Stroke::new(1.5)
+            .with_caps(Cap::Round)
+            .with_dashes(0.0, [6.0, 4.0]),
+        Some("compact") => Stroke::new(1.5)
+            .with_caps(Cap::Round)
+            .with_dashes(0.0, [2.0, 4.0]),
         Some("subtree") => Stroke::new(2.5).with_caps(Cap::Round),
         _ => Stroke::new(1.5).with_caps(Cap::Round),
     };

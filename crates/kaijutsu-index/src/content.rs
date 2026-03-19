@@ -9,10 +9,7 @@ use sha2::{Digest, Sha256};
 /// Concatenates with role prefixes. Truncates to `max_chars`.
 ///
 /// Returns `(text, sha256_hex)`.
-pub fn extract_context_content(
-    blocks: &[BlockSnapshot],
-    max_chars: usize,
-) -> (String, String) {
+pub fn extract_context_content(blocks: &[BlockSnapshot], max_chars: usize) -> (String, String) {
     let mut buf = String::new();
 
     for block in blocks {
@@ -70,7 +67,11 @@ mod tests {
         let ctx = ContextId::new();
         let agent = PrincipalId::new();
         BlockSnapshot {
-            id: BlockId { context_id: ctx, agent_id: agent, seq: 1 },
+            id: BlockId {
+                context_id: ctx,
+                agent_id: agent,
+                seq: 1,
+            },
             parent_id: None,
             role,
             kind,
@@ -107,7 +108,11 @@ mod tests {
     fn test_extract_basic() {
         let blocks = vec![
             test_block(Role::User, BlockKind::Text, "What is Rust?"),
-            test_block(Role::Model, BlockKind::Text, "Rust is a systems programming language."),
+            test_block(
+                Role::Model,
+                BlockKind::Text,
+                "Rust is a systems programming language.",
+            ),
         ];
 
         let (text, hash) = extract_context_content(&blocks, 10000);
@@ -151,9 +156,7 @@ mod tests {
 
     #[test]
     fn test_deterministic_hash() {
-        let blocks = vec![
-            test_block(Role::User, BlockKind::Text, "hello world"),
-        ];
+        let blocks = vec![test_block(Role::User, BlockKind::Text, "hello world")];
         let (_, hash1) = extract_context_content(&blocks, 10000);
         let (_, hash2) = extract_context_content(&blocks, 10000);
         assert_eq!(hash1, hash2);

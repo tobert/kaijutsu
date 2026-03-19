@@ -94,14 +94,9 @@ mod tests {
         let mut engine = Engine::new();
         let collector = register_output_callbacks(&mut engine);
 
-        engine
-            .eval::<()>(r#"svg("<svg>hello</svg>")"#)
-            .unwrap();
+        engine.eval::<()>(r#"svg("<svg>hello</svg>")"#).unwrap();
 
-        assert_eq!(
-            collector.take_svg().as_deref(),
-            Some("<svg>hello</svg>")
-        );
+        assert_eq!(collector.take_svg().as_deref(), Some("<svg>hello</svg>"));
         // Second take returns None
         assert!(collector.take_svg().is_none());
     }
@@ -128,7 +123,9 @@ mod tests {
         let mut engine = Engine::new();
         let collector = register_output_callbacks(&mut engine);
 
-        engine.eval::<()>(r#"svg("test"); print("hello");"#).unwrap();
+        engine
+            .eval::<()>(r#"svg("test"); print("hello");"#)
+            .unwrap();
 
         collector.clear();
         assert!(collector.take_svg().is_none());

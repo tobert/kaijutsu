@@ -10,9 +10,9 @@
 //! - `render` — buffer sync (text → UiVelloText), layout readback
 
 pub mod components;
+pub mod cursor;
 pub mod document;
 pub mod fieldset;
-pub mod cursor;
 pub mod format;
 pub mod lifecycle;
 pub mod overlay;

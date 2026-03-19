@@ -59,7 +59,7 @@ pub fn register(engine: &mut Engine) {
 #[cfg(test)]
 mod tests {
     use super::*;
-        fn eval(expr: &str) -> f64 {
+    fn eval(expr: &str) -> f64 {
         let mut engine = Engine::new();
         register(&mut engine);
         engine.eval::<f64>(expr).unwrap()

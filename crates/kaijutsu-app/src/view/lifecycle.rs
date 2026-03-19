@@ -10,8 +10,8 @@ use bevy_vello::integrations::text::VelloFontAxes;
 use bevy_vello::prelude::{UiVelloText, VelloFont, VelloTextAnchor};
 
 use crate::cell::{
-    BlockCell, BlockCellContainer, BlockCellLayout, BlockId, CellEditor,
-    LayoutGeneration, MainCell, RoleGroupBorder, RoleGroupBorderLayout,
+    BlockCell, BlockCellContainer, BlockCellLayout, BlockId, CellEditor, LayoutGeneration,
+    MainCell, RoleGroupBorder, RoleGroupBorderLayout,
 };
 
 /// Consolidated resource tracking editor-related singleton entities.
@@ -61,21 +61,18 @@ pub fn spawn_main_cell(
 
     entities.conversation_container = Some(conv_entity);
 
-    let welcome_text = "No context joined\n\nOpen constellation (Tab) to select or create a context";
+    let welcome_text =
+        "No context joined\n\nOpen constellation (Tab) to select or create a context";
 
     // MainCell does NOT get UiVelloText directly.
     // The BlockCell system handles per-block rendering.
     // MainCell only holds the CellEditor (source of truth for content).
     let entity = commands
-        .spawn((
-            CellEditor::default().with_text(welcome_text),
-            MainCell,
-        ))
+        .spawn((CellEditor::default().with_text(welcome_text), MainCell))
         .id();
 
     entities.main_cell = Some(entity);
     info!("Spawned main kernel cell");
-
 }
 
 /// Track the focused ConversationContainer and re-parent block cells when it changes.
@@ -88,7 +85,13 @@ pub fn spawn_main_cell(
 pub fn track_conversation_container(
     mut commands: Commands,
     mut entities: ResMut<EditorEntities>,
-    focused_containers: Query<Entity, (With<crate::cell::ConversationContainer>, With<crate::ui::tiling::PaneFocus>)>,
+    focused_containers: Query<
+        Entity,
+        (
+            With<crate::cell::ConversationContainer>,
+            With<crate::ui::tiling::PaneFocus>,
+        ),
+    >,
     containers: Query<&BlockCellContainer>,
 ) {
     let Ok(focused) = focused_containers.single() else {
@@ -103,10 +106,14 @@ pub fn track_conversation_container(
         return;
     };
 
-    // RE-PARENTING: When the container changes (e.g. pane split), 
+    // RE-PARENTING: When the container changes (e.g. pane split),
     // all existing block cells must move to the new container.
     if let Ok(container) = containers.get(main_ent) {
-        trace!("Re-parenting {} block cells to new container {:?}", container.block_cells.len(), focused);
+        trace!(
+            "Re-parenting {} block cells to new container {:?}",
+            container.block_cells.len(),
+            focused
+        );
         for &block_ent in container.block_cells.values() {
             commands.entity(focused).add_child(block_ent);
         }
@@ -153,7 +160,9 @@ pub fn spawn_block_cells(
     let mut container = if let Ok(c) = containers.get_mut(main_ent) {
         c
     } else {
-        commands.entity(main_ent).insert(BlockCellContainer::default());
+        commands
+            .entity(main_ent)
+            .insert(BlockCellContainer::default());
         return;
     };
 
@@ -167,11 +176,12 @@ pub fn spawn_block_cells(
     if container_count > 0 && live_count != container_count {
         warn!(
             "spawn_block_cells: container has {} refs, {} alive BlockCells, {} editor blocks",
-            container_count, live_count, current_blocks.len()
+            container_count,
+            live_count,
+            current_blocks.len()
         );
     }
-    let live_entities: std::collections::HashSet<Entity> =
-        existing_block_cells.iter().collect();
+    let live_entities: std::collections::HashSet<Entity> = existing_block_cells.iter().collect();
     let stale: Vec<Entity> = container
         .block_cells
         .values()
@@ -179,7 +189,10 @@ pub fn spawn_block_cells(
         .copied()
         .collect();
     if !stale.is_empty() {
-        warn!("Purging {} stale block cell refs from container", stale.len());
+        warn!(
+            "Purging {} stale block cell refs from container",
+            stale.len()
+        );
         for entity in stale {
             container.remove(entity);
         }
@@ -211,7 +224,8 @@ pub fn spawn_block_cells(
     // Log diagnostics once when blocks first appear or counts change
     {
         static LAST_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let key = (current_blocks.len() as u64).wrapping_mul(1000003)
+        let key = (current_blocks.len() as u64)
+            .wrapping_mul(1000003)
             .wrapping_add(container.block_cells.len() as u64);
         if LAST_LOG.swap(key, std::sync::atomic::Ordering::Relaxed) != key {
             info!(
@@ -282,8 +296,10 @@ pub fn spawn_block_cells(
                     },
                 ))
                 .id();
-            if let Some(conv) = conv_entity {
-                if let Ok(mut ec) = commands.get_entity(conv) { ec.add_child(entity); }
+            if let Some(conv) = conv_entity
+                && let Ok(mut ec) = commands.get_entity(conv)
+            {
+                ec.add_child(entity);
             }
             container.add(*block_id, entity);
             had_additions = true;
@@ -293,7 +309,9 @@ pub fn spawn_block_cells(
     if had_additions || had_removals {
         info!(
             "spawn_block_cells: additions={} removals={} container_now={}",
-            had_additions, had_removals, container.block_cells.len(),
+            had_additions,
+            had_removals,
+            container.block_cells.len(),
         );
         layout_gen.bump();
     }
@@ -365,12 +383,16 @@ pub fn sync_role_headers(
 
     // Skip rebuild if transitions match (prevents despawn/respawn flash)
     let existing_matches = container.role_headers.len() == expected.len()
-        && container.role_headers.iter().zip(expected.iter()).all(|(ent, (role, block_id))| {
-            role_header_query
-                .get(*ent)
-                .map(|h| h.role == *role && h.block_id == *block_id)
-                .unwrap_or(false)
-        });
+        && container
+            .role_headers
+            .iter()
+            .zip(expected.iter())
+            .all(|(ent, (role, block_id))| {
+                role_header_query
+                    .get(*ent)
+                    .map(|h| h.role == *role && h.block_id == *block_id)
+                    .unwrap_or(false)
+            });
 
     if existing_matches {
         return;
@@ -383,10 +405,7 @@ pub fn sync_role_headers(
     for (role, block_id) in expected {
         let entity = commands
             .spawn((
-                RoleGroupBorder {
-                    role,
-                    block_id,
-                },
+                RoleGroupBorder { role, block_id },
                 RoleGroupBorderLayout::default(),
                 Node {
                     width: Val::Percent(100.0),
@@ -397,8 +416,10 @@ pub fn sync_role_headers(
                 bevy_vello::prelude::UiVelloScene::default(),
             ))
             .id();
-        if let Some(conv) = entities.conversation_container {
-            if let Ok(mut ec) = commands.get_entity(conv) { ec.add_child(entity); }
+        if let Some(conv) = entities.conversation_container
+            && let Ok(mut ec) = commands.get_entity(conv)
+        {
+            ec.add_child(entity);
         }
 
         container.role_headers.push(entity);

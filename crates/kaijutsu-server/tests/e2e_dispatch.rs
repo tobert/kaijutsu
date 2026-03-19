@@ -6,11 +6,11 @@
 //! - **Tier 3:** Shell command e2e through EmbeddedKaish
 use std::sync::Arc;
 
-use kaijutsu_types::DocKind;
-use kaijutsu_kernel::tools::EngineArgs;
-use kaijutsu_kernel::{shared_block_store, Kernel, LocalBackend};
 use kaijutsu_crdt::{ContextId, PrincipalId};
+use kaijutsu_kernel::tools::EngineArgs;
+use kaijutsu_kernel::{Kernel, LocalBackend, shared_block_store};
 use kaijutsu_server::EmbeddedKaish;
+use kaijutsu_types::DocKind;
 
 // ============================================================================
 // Tier 0: EngineArgs unit tests (kaish-style JSON → argv reconstruction)
@@ -28,8 +28,16 @@ fn engine_args_kaish_commit_m_reconstructs_correctly() {
 
     // to_argv() should reconstruct: ["commit", "-m", "add hello"]
     assert_eq!(argv[0], "commit");
-    assert!(argv.contains(&"-m".to_string()), "missing -m flag in {:?}", argv);
-    assert!(argv.contains(&"add hello".to_string()), "missing message in {:?}", argv);
+    assert!(
+        argv.contains(&"-m".to_string()),
+        "missing -m flag in {:?}",
+        argv
+    );
+    assert!(
+        argv.contains(&"add hello".to_string()),
+        "missing message in {:?}",
+        argv
+    );
 }
 
 #[test]
@@ -109,10 +117,19 @@ impl TestFs {
         std::fs::create_dir_all(&tmp).unwrap();
 
         // Seed with known files
-        std::fs::write(project.join("Cargo.toml"), "[package]\nname = \"kaijutsu\"\n").unwrap();
+        std::fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname = \"kaijutsu\"\n",
+        )
+        .unwrap();
         std::fs::write(project.join("README.md"), "# Kaijutsu\n").unwrap();
 
-        Self { _tmpdir: tmpdir, root, home, project }
+        Self {
+            _tmpdir: tmpdir,
+            root,
+            home,
+            project,
+        }
     }
 }
 
@@ -130,11 +147,15 @@ async fn setup_shell_e2e(fs: &TestFs, project_root: Option<std::path::PathBuf>) 
 
     // Mount the test filesystem — mirrors real server setup but rooted in tempdir
     kernel.mount("/", LocalBackend::read_only(&fs.root)).await;
-    kernel.mount(
-        &format!("{}", fs.home.join("src").display()),
-        LocalBackend::new(fs.home.join("src")),
-    ).await;
-    kernel.mount("/tmp", LocalBackend::new(fs.root.join("tmp"))).await;
+    kernel
+        .mount(
+            &format!("{}", fs.home.join("src").display()),
+            LocalBackend::new(fs.home.join("src")),
+        )
+        .await;
+    kernel
+        .mount("/tmp", LocalBackend::new(fs.root.join("tmp")))
+        .await;
 
     EmbeddedKaish::new("e2e-shell", documents, kernel, project_root)
         .expect("EmbeddedKaish::new failed")
@@ -144,7 +165,10 @@ async fn setup_shell_e2e(fs: &TestFs, project_root: Option<std::path::PathBuf>) 
 async fn test_ls_through_embedded_kaish() {
     let fs = TestFs::new();
     let kaish = setup_shell_e2e(&fs, None).await;
-    let result = kaish.execute(&format!("ls {}", fs.project.display())).await.unwrap();
+    let result = kaish
+        .execute(&format!("ls {}", fs.project.display()))
+        .await
+        .unwrap();
 
     assert_eq!(result.code, 0, "ls failed: {}", result.err);
     assert!(

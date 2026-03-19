@@ -22,7 +22,7 @@ use std::sync::Arc;
 use kaijutsu_types::{ContextId, KernelId, PrincipalId, SessionId};
 
 use crate::block_store::SharedBlockStore;
-use crate::drift::{SharedDriftRouter, build_distillation_prompt, DISTILLATION_SYSTEM_PROMPT};
+use crate::drift::{DISTILLATION_SYSTEM_PROMPT, SharedDriftRouter, build_distillation_prompt};
 use crate::kernel::Kernel;
 use crate::kernel_db::KernelDb;
 
@@ -85,24 +85,38 @@ impl KjResult {
 
     pub fn message(&self) -> &str {
         match self {
-            KjResult::Ok { message, .. } | KjResult::Err(message) | KjResult::Switch(_, message) => message,
+            KjResult::Ok { message, .. }
+            | KjResult::Err(message)
+            | KjResult::Switch(_, message) => message,
             KjResult::Latch { message, .. } => message,
         }
     }
 
     /// Convenience: create a plain text Ok result.
     pub fn ok(msg: impl Into<String>) -> Self {
-        KjResult::Ok { message: msg.into(), content_type: None, ephemeral: false }
+        KjResult::Ok {
+            message: msg.into(),
+            content_type: None,
+            ephemeral: false,
+        }
     }
 
     /// Convenience: create an Ok result with a content type hint.
     pub fn ok_typed(msg: impl Into<String>, ct: impl Into<String>) -> Self {
-        KjResult::Ok { message: msg.into(), content_type: Some(ct.into()), ephemeral: false }
+        KjResult::Ok {
+            message: msg.into(),
+            content_type: Some(ct.into()),
+            ephemeral: false,
+        }
     }
 
     /// Convenience: create an ephemeral Ok result (excluded from LLM hydration).
     pub fn ok_ephemeral(msg: impl Into<String>, ct: impl Into<String>) -> Self {
-        KjResult::Ok { message: msg.into(), content_type: Some(ct.into()), ephemeral: true }
+        KjResult::Ok {
+            message: msg.into(),
+            content_type: Some(ct.into()),
+            ephemeral: true,
+        }
     }
 }
 
@@ -154,7 +168,11 @@ impl KjDispatcher {
             "preset" => self.dispatch_preset(&argv[1..], caller),
             "workspace" | "ws" => self.dispatch_workspace(&argv[1..], caller),
             "help" | "--help" | "-h" => KjResult::ok_ephemeral(self.help(), "text/markdown"),
-            other => KjResult::Err(format!("kj: unknown command '{}'\n\n{}", other, self.help())),
+            other => KjResult::Err(format!(
+                "kj: unknown command '{}'\n\n{}",
+                other,
+                self.help()
+            )),
         }
     }
 
@@ -193,7 +211,9 @@ impl KjDispatcher {
         context_id: ContextId,
         directed_prompt: Option<&str>,
     ) -> Result<String, String> {
-        let blocks = self.blocks.block_snapshots(context_id)
+        let blocks = self
+            .blocks
+            .block_snapshots(context_id)
             .map_err(|e| e.to_string())?;
         if blocks.is_empty() {
             return Err("context has no blocks to summarize".into());
@@ -208,19 +228,21 @@ impl KjDispatcher {
         let registry = self.kernel.llm().read().await;
 
         let (provider, model) = match &model_name {
-            Some(m) => registry.resolve_model(m)
+            Some(m) => registry
+                .resolve_model(m)
                 .ok_or_else(|| format!("model '{}' not found in registry", m))?,
             None => {
-                let p = registry.default_provider()
-                    .ok_or("no LLM configured")?;
-                let m = registry.default_model()
+                let p = registry.default_provider().ok_or("no LLM configured")?;
+                let m = registry
+                    .default_model()
                     .ok_or("no default model configured")?
                     .to_string();
                 (p, m)
             }
         };
 
-        provider.prompt_with_system(&model, Some(DISTILLATION_SYSTEM_PROMPT), &user_prompt)
+        provider
+            .prompt_with_system(&model, Some(DISTILLATION_SYSTEM_PROMPT), &user_prompt)
             .await
             .map_err(|e| format!("LLM summarization failed: {e}"))
     }
@@ -246,7 +268,8 @@ pub(crate) mod test_helpers {
         // Create default workspace for test contexts
         {
             let db = kernel_db.lock();
-            db.get_or_create_default_workspace(kernel_id, PrincipalId::system()).unwrap();
+            db.get_or_create_default_workspace(kernel_id, PrincipalId::system())
+                .unwrap();
         }
         let kernel = Arc::new(Kernel::new("test").await);
         KjDispatcher::new(drift, blocks, kernel_db, kernel_id, kernel)
@@ -295,7 +318,9 @@ pub(crate) mod test_helpers {
         // Insert document + context into KernelDb
         {
             let db = dispatcher.kernel_db().lock();
-            let ws_id = db.get_or_create_default_workspace(kernel_id, created_by).unwrap();
+            let ws_id = db
+                .get_or_create_default_workspace(kernel_id, created_by)
+                .unwrap();
 
             // Document row first (contexts FK to documents)
             db.insert_document(&crate::kernel_db::DocumentRow {
@@ -307,7 +332,8 @@ pub(crate) mod test_helpers {
                 path: None,
                 created_at: kaijutsu_types::now_millis() as i64,
                 created_by,
-            }).unwrap();
+            })
+            .unwrap();
 
             let row = crate::kernel_db::ContextRow {
                 context_id: id,

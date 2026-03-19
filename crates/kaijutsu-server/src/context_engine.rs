@@ -74,7 +74,8 @@ impl ContextEngine {
                 let router = self.drift.read().await;
                 match router.resolve_context(query) {
                     Ok(ctx_id) => {
-                        let label = router.get(ctx_id)
+                        let label = router
+                            .get(ctx_id)
                             .and_then(|h| h.label.as_deref())
                             .unwrap_or("(unlabeled)");
                         let label_owned = label.to_string();
@@ -111,7 +112,8 @@ impl ContextEngine {
                 match current_id {
                     Some(id) => {
                         let router = self.drift.read().await;
-                        let label = router.get(id)
+                        let label = router
+                            .get(id)
                             .and_then(|h| h.label.as_deref())
                             .unwrap_or("(unlabeled)");
                         Ok(format!("Current context: {} [{}]", label, id.short()))
@@ -124,7 +126,8 @@ impl ContextEngine {
                 match old {
                     Some(id) => {
                         let router = self.drift.read().await;
-                        let label = router.get(id)
+                        let label = router
+                            .get(id)
                             .and_then(|h| h.label.as_deref())
                             .unwrap_or("(unlabeled)");
                         Ok(format!("Left context '{}' [{}]", label, id.short()))
@@ -186,7 +189,11 @@ impl ExecutionEngine for ContextEngine {
         }))
     }
 
-    async fn execute(&self, params: &str, _ctx: &kaijutsu_kernel::ToolContext) -> anyhow::Result<ExecResult> {
+    async fn execute(
+        &self,
+        params: &str,
+        _ctx: &kaijutsu_kernel::ToolContext,
+    ) -> anyhow::Result<ExecResult> {
         // Parse the JSON params
         let parsed: serde_json::Value = match serde_json::from_str(params) {
             Ok(v) => v,
@@ -226,13 +233,21 @@ mod tests {
     async fn test_context_engine_list() {
         let drift = shared_drift_router();
         let ctx_id = ContextId::new();
-        drift.write().await.register(ctx_id, Some("default"), None, kaijutsu_types::PrincipalId::system());
+        drift.write().await.register(
+            ctx_id,
+            Some("default"),
+            None,
+            kaijutsu_types::PrincipalId::system(),
+        );
 
         let current = current_context();
         let engine = ContextEngine::new(drift, current);
 
         let result = engine
-            .execute(r#"{"_positional": ["list"]}"#, &kaijutsu_kernel::ToolContext::test())
+            .execute(
+                r#"{"_positional": ["list"]}"#,
+                &kaijutsu_kernel::ToolContext::test(),
+            )
             .await
             .unwrap();
         assert!(result.success);
@@ -243,13 +258,21 @@ mod tests {
     async fn test_context_engine_switch() {
         let drift = shared_drift_router();
         let ctx_id = ContextId::new();
-        drift.write().await.register(ctx_id, Some("planning"), None, kaijutsu_types::PrincipalId::system());
+        drift.write().await.register(
+            ctx_id,
+            Some("planning"),
+            None,
+            kaijutsu_types::PrincipalId::system(),
+        );
 
         let current = current_context();
         let engine = ContextEngine::new(drift, current.clone());
 
         let result = engine
-            .execute(r#"{"_positional": ["switch", "planning"]}"#, &kaijutsu_kernel::ToolContext::test())
+            .execute(
+                r#"{"_positional": ["switch", "planning"]}"#,
+                &kaijutsu_kernel::ToolContext::test(),
+            )
             .await
             .unwrap();
         assert!(result.success);
@@ -264,7 +287,10 @@ mod tests {
         let engine = ContextEngine::new(drift, current);
 
         let result = engine
-            .execute(r#"{"_positional": ["help"]}"#, &kaijutsu_kernel::ToolContext::test())
+            .execute(
+                r#"{"_positional": ["help"]}"#,
+                &kaijutsu_kernel::ToolContext::test(),
+            )
             .await
             .unwrap();
         assert!(result.success);

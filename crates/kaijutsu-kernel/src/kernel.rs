@@ -20,13 +20,11 @@ use crate::agents::{
 use crate::control::ConsentMode;
 use crate::drift::{SharedDriftRouter, shared_drift_router};
 use crate::flows::{SharedBlockFlowBus, shared_block_flow_bus};
-use crate::llm::{LlmRegistry, RigProvider};
 use crate::llm::config::{ToolConfig, ToolFilter};
+use crate::llm::{LlmRegistry, RigProvider};
 use crate::state::KernelState;
 use crate::tools::{ExecResult, ExecutionEngine, ToolContext, ToolInfo, ToolRegistry};
-use crate::vfs::{
-    DirEntry, FileAttr, MountTable, SetAttr, StatFs, VfsOps, VfsResult,
-};
+use crate::vfs::{DirEntry, FileAttr, MountTable, SetAttr, StatFs, VfsOps, VfsResult};
 
 /// The Kernel: fundamental primitive of kaijutsu.
 ///
@@ -152,7 +150,11 @@ impl Kernel {
 
     /// Mount a filesystem at the given path.
     /// Returns false if the mount table is frozen.
-    pub async fn mount(&self, path: impl Into<std::path::PathBuf>, fs: impl VfsOps + 'static) -> bool {
+    pub async fn mount(
+        &self,
+        path: impl Into<std::path::PathBuf>,
+        fs: impl VfsOps + 'static,
+    ) -> bool {
         self.vfs.mount(path, fs).await
     }
 
@@ -258,7 +260,13 @@ impl Kernel {
 
     /// List available tools.
     pub async fn list_tools(&self) -> Vec<ToolInfo> {
-        self.tools.read().await.list().into_iter().cloned().collect()
+        self.tools
+            .read()
+            .await
+            .list()
+            .into_iter()
+            .cloned()
+            .collect()
     }
 
     /// List tools that have registered engines.
@@ -306,7 +314,12 @@ impl Kernel {
     }
 
     /// Execute code using a specific engine.
-    pub async fn execute_with(&self, engine_name: &str, code: &str, ctx: &ToolContext) -> anyhow::Result<ExecResult> {
+    pub async fn execute_with(
+        &self,
+        engine_name: &str,
+        code: &str,
+        ctx: &ToolContext,
+    ) -> anyhow::Result<ExecResult> {
         let engine = self
             .tools
             .read()
@@ -347,7 +360,13 @@ impl Kernel {
 
     /// List registered LLM providers.
     pub async fn list_llm_providers(&self) -> Vec<String> {
-        self.llm.read().await.list().into_iter().map(|s| s.to_string()).collect()
+        self.llm
+            .read()
+            .await
+            .list()
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect()
     }
 
     // ========================================================================
@@ -387,7 +406,13 @@ impl Kernel {
 
     /// List all attached agents.
     pub async fn list_agents(&self) -> Vec<AgentInfo> {
-        self.agents.read().await.list().into_iter().cloned().collect()
+        self.agents
+            .read()
+            .await
+            .list()
+            .into_iter()
+            .cloned()
+            .collect()
     }
 
     /// Get agents with a specific capability.
@@ -414,12 +439,18 @@ impl Kernel {
     }
 
     /// Update an agent's status.
-    pub async fn set_agent_status(&self, nick: &str, status: AgentStatus) -> Result<(), AgentError> {
+    pub async fn set_agent_status(
+        &self,
+        nick: &str,
+        status: AgentStatus,
+    ) -> Result<(), AgentError> {
         self.agents.write().await.set_status(nick, status)
     }
 
     /// Subscribe to agent activity events.
-    pub async fn subscribe_agent_events(&self) -> tokio::sync::broadcast::Receiver<AgentActivityEvent> {
+    pub async fn subscribe_agent_events(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<AgentActivityEvent> {
         self.agents.read().await.subscribe()
     }
 
@@ -582,10 +613,12 @@ mod tests {
     async fn test_tools() {
         let kernel = Kernel::new("test").await;
 
-        kernel.register_tool_with_engine(
-            ToolInfo::new("noop", "Noop engine", "test"),
-            Arc::new(NoopEngine),
-        ).await;
+        kernel
+            .register_tool_with_engine(
+                ToolInfo::new("noop", "Noop engine", "test"),
+                Arc::new(NoopEngine),
+            )
+            .await;
         kernel.set_default_engine("noop").await;
 
         let result = kernel.execute("hello", &ToolContext::test()).await.unwrap();
@@ -617,5 +650,4 @@ mod tests {
         let result = kernel.llm().read().await.prompt("Hello").await;
         assert!(result.is_err());
     }
-
 }

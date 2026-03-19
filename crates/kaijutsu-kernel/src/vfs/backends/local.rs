@@ -80,14 +80,19 @@ impl LocalBackend {
             full.canonicalize().map_err(VfsError::from)?
         } else {
             // For new files, canonicalize parent and append filename
-            let parent = full.parent().ok_or_else(|| VfsError::invalid_path("no parent"))?;
+            let parent = full
+                .parent()
+                .ok_or_else(|| VfsError::invalid_path("no parent"))?;
 
             let filename = full
                 .file_name()
                 .ok_or_else(|| VfsError::invalid_path("no filename"))?;
 
             if parent.exists() {
-                parent.canonicalize().map_err(VfsError::from)?.join(filename)
+                parent
+                    .canonicalize()
+                    .map_err(VfsError::from)?
+                    .join(filename)
             } else {
                 // Parent doesn't exist, will fail on actual operation
                 full
@@ -141,14 +146,15 @@ impl LocalBackend {
             gid: Some(meta.gid()),
         }
     }
-
 }
 
 #[async_trait]
 impl VfsOps for LocalBackend {
     async fn getattr(&self, path: &Path) -> VfsResult<FileAttr> {
         let full_path = self.resolve(path).await?;
-        let meta = fs::symlink_metadata(&full_path).await.map_err(VfsError::from)?;
+        let meta = fs::symlink_metadata(&full_path)
+            .await
+            .map_err(VfsError::from)?;
         Ok(Self::metadata_to_attr(&meta))
     }
 
@@ -204,7 +210,10 @@ impl VfsOps for LocalBackend {
         for component in path.components() {
             if matches!(component, std::path::Component::ParentDir) {
                 // Could escape - do a more thorough check
-                let canonical_root = self.root.canonicalize().unwrap_or_else(|_| self.root.clone());
+                let canonical_root = self
+                    .root
+                    .canonicalize()
+                    .unwrap_or_else(|_| self.root.clone());
                 let parent = full_path.parent().unwrap_or(&full_path);
                 if parent.exists() {
                     let canonical_parent = parent.canonicalize().map_err(VfsError::from)?;
@@ -345,10 +354,7 @@ impl VfsOps for LocalBackend {
         // For now, we just touch mtime if needed
         if attr.mtime.is_some() || attr.atime.is_some() {
             // Best effort - touch the file
-            let _ = fs::OpenOptions::new()
-                .write(true)
-                .open(&full_path)
-                .await;
+            let _ = fs::OpenOptions::new().write(true).open(&full_path).await;
         }
 
         // Handle uid/gid (requires nix crate or libc)
@@ -429,12 +435,12 @@ impl VfsOps for LocalBackend {
         let canonical = dunce::canonicalize(&full).map_err(VfsError::from)?;
 
         // Security check: ensure path is under root
-        let canonical_root = dunce::canonicalize(&self.root)
-            .unwrap_or_else(|_| self.root.clone());
+        let canonical_root = dunce::canonicalize(&self.root).unwrap_or_else(|_| self.root.clone());
         if !canonical.starts_with(&canonical_root) {
-            return Err(VfsError::PermissionDenied(
-                format!("path escapes mount root: {}", path.display())
-            ));
+            return Err(VfsError::PermissionDenied(format!(
+                "path escapes mount root: {}",
+                path.display()
+            )));
         }
 
         Ok(Some(canonical))
@@ -518,7 +524,10 @@ mod tests {
     async fn test_symlink() {
         let (backend, _dir) = setup().await;
 
-        backend.create(Path::new("target.txt"), 0o644).await.unwrap();
+        backend
+            .create(Path::new("target.txt"), 0o644)
+            .await
+            .unwrap();
         backend
             .write(Path::new("target.txt"), 0, b"content")
             .await
@@ -573,7 +582,10 @@ mod tests {
     async fn test_hard_link() {
         let (backend, _dir) = setup().await;
 
-        backend.create(Path::new("original.txt"), 0o644).await.unwrap();
+        backend
+            .create(Path::new("original.txt"), 0o644)
+            .await
+            .unwrap();
         backend
             .write(Path::new("original.txt"), 0, b"shared content")
             .await
@@ -640,7 +652,7 @@ mod tests {
 
         // Verify the error is PathEscapesRoot
         match result {
-            Err(VfsError::PathEscapesRoot(_)) => {}, // Expected
+            Err(VfsError::PathEscapesRoot(_)) => {} // Expected
             other => panic!("Expected PathEscapesRoot, got: {:?}", other),
         }
     }
@@ -650,17 +662,32 @@ mod tests {
         let (backend, _dir) = setup().await;
 
         // Create nested directory structure
-        backend.mkdir(Path::new("subdir/nested"), 0o755).await.unwrap();
-        backend.create(Path::new("subdir/nested/file.txt"), 0o644).await.unwrap();
-        backend.write(Path::new("subdir/nested/file.txt"), 0, b"content").await.unwrap();
+        backend
+            .mkdir(Path::new("subdir/nested"), 0o755)
+            .await
+            .unwrap();
+        backend
+            .create(Path::new("subdir/nested/file.txt"), 0o644)
+            .await
+            .unwrap();
+        backend
+            .write(Path::new("subdir/nested/file.txt"), 0, b"content")
+            .await
+            .unwrap();
 
         // Normal paths should work fine
-        let data = backend.read(Path::new("subdir/nested/file.txt"), 0, 100).await.unwrap();
+        let data = backend
+            .read(Path::new("subdir/nested/file.txt"), 0, 100)
+            .await
+            .unwrap();
         assert_eq!(data, b"content");
 
         // Root-level file
         backend.create(Path::new("root.txt"), 0o644).await.unwrap();
-        backend.write(Path::new("root.txt"), 0, b"root").await.unwrap();
+        backend
+            .write(Path::new("root.txt"), 0, b"root")
+            .await
+            .unwrap();
         let data = backend.read(Path::new("root.txt"), 0, 100).await.unwrap();
         assert_eq!(data, b"root");
     }

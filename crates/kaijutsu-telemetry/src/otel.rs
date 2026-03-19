@@ -4,12 +4,12 @@ use std::collections::HashMap;
 
 use opentelemetry::trace::{
     Link, SamplingDecision, SamplingResult, SpanContext, SpanId, SpanKind, TraceContextExt,
-    TraceFlags, TracerProvider as _, TraceId, TraceState,
+    TraceFlags, TraceId, TraceState, TracerProvider as _,
 };
-use opentelemetry::{global, Context, KeyValue};
+use opentelemetry::{Context, KeyValue, global};
 use opentelemetry_otlp::SpanExporter;
-use opentelemetry_sdk::trace::{SdkTracerProvider, Sampler, ShouldSample, SpanLimits};
 use opentelemetry_sdk::Resource;
+use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider, ShouldSample, SpanLimits};
 use tracing_opentelemetry::OpenTelemetryLayer;
 
 /// Guard that shuts down the OTel tracer provider on drop, flushing pending spans.
@@ -36,7 +36,10 @@ impl Drop for OtelGuard {
 /// held alive for the lifetime of the application to ensure spans are flushed.
 pub fn otel_layer<S>(
     service_name: &str,
-) -> (OpenTelemetryLayer<S, opentelemetry_sdk::trace::SdkTracer>, OtelGuard)
+) -> (
+    OpenTelemetryLayer<S, opentelemetry_sdk::trace::SdkTracer>,
+    OtelGuard,
+)
 where
     S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
 {
@@ -53,9 +56,9 @@ where
             (exp, None, None)
         }
         Err(_) => {
-            let rt: &'static tokio::runtime::Runtime =
-                Box::leak(Box::new(tokio::runtime::Runtime::new()
-                    .expect("failed to create OTel tokio runtime")));
+            let rt: &'static tokio::runtime::Runtime = Box::leak(Box::new(
+                tokio::runtime::Runtime::new().expect("failed to create OTel tokio runtime"),
+            ));
             let guard = rt.enter();
             let exp = rt.block_on(async {
                 SpanExporter::builder()
@@ -83,7 +86,14 @@ where
     let tracer = provider.tracer(service_name.to_string());
     let layer = tracing_opentelemetry::layer().with_tracer(tracer);
 
-    (layer, OtelGuard { provider, _runtime_enter: enter_guard, _runtime: runtime_ref })
+    (
+        layer,
+        OtelGuard {
+            provider,
+            _runtime_enter: enter_guard,
+            _runtime: runtime_ref,
+        },
+    )
 }
 
 // ============================================================================

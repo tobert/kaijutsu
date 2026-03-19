@@ -18,10 +18,7 @@ use super::focus::FocusArea;
 /// Within-conversation Tab cycle: Compose → Conversation → Compose.
 /// Screen-level toggling (Constellation ↔ Conversation) is handled by
 /// `handle_toggle_constellation` via `NextState<Screen>`.
-pub fn handle_focus_cycle(
-    mut actions: MessageReader<ActionFired>,
-    mut focus: ResMut<FocusArea>,
-) {
+pub fn handle_focus_cycle(mut actions: MessageReader<ActionFired>, mut focus: ResMut<FocusArea>) {
     for ActionFired(action) in actions.read() {
         match action {
             Action::CycleFocusForward => {
@@ -68,19 +65,16 @@ pub fn handle_focus_compose(
                 overlay.mode = mode;
                 // Restore draft from CRDT InputDocEntry if overlay is empty
                 // and no clear is pending (submit/escape×3 in flight).
-                if overlay.text.is_empty() {
-                    if let Some(ctx_id) = doc_cache.active_id() {
-                        if let Some(cached) = doc_cache.get(ctx_id) {
-                            if !cached.input_pending_clear {
-                                if let Some(ref input) = cached.input {
-                                    let crdt_text = input.text();
-                                    if !crdt_text.is_empty() {
-                                        overlay.text = crdt_text;
-                                        overlay.cursor = overlay.text.len();
-                                    }
-                                }
-                            }
-                        }
+                if overlay.text.is_empty()
+                    && let Some(ctx_id) = doc_cache.active_id()
+                    && let Some(cached) = doc_cache.get(ctx_id)
+                    && !cached.input_pending_clear
+                    && let Some(ref input) = cached.input
+                {
+                    let crdt_text = input.text();
+                    if !crdt_text.is_empty() {
+                        overlay.text = crdt_text;
+                        overlay.cursor = overlay.text.len();
                     }
                 }
             }
@@ -152,23 +146,25 @@ pub fn handle_escape(
         let effective_immediate = count >= 2;
 
         // Fire RPC interrupt (fire-and-forget)
-        if let Some(ref actor) = actor {
-            if let Some(ctx_id) = doc_cache.active_id() {
-                let handle = actor.handle.clone();
-                bevy::tasks::IoTaskPool::get()
-                    .spawn(async move {
-                        match handle.interrupt_context(ctx_id, effective_immediate).await {
-                            Ok(success) => {
-                                log::debug!(
-                                    "interrupt_context: ctx={}, immediate={}, success={}",
-                                    ctx_id, effective_immediate, success
-                                );
-                            }
-                            Err(e) => log::warn!("interrupt_context failed: {e}"),
+        if let Some(ref actor) = actor
+            && let Some(ctx_id) = doc_cache.active_id()
+        {
+            let handle = actor.handle.clone();
+            bevy::tasks::IoTaskPool::get()
+                .spawn(async move {
+                    match handle.interrupt_context(ctx_id, effective_immediate).await {
+                        Ok(success) => {
+                            log::debug!(
+                                "interrupt_context: ctx={}, immediate={}, success={}",
+                                ctx_id,
+                                effective_immediate,
+                                success
+                            );
                         }
-                    })
-                    .detach();
-            }
+                        Err(e) => log::warn!("interrupt_context failed: {e}"),
+                    }
+                })
+                .detach();
         }
 
         // 3rd press: clear compose buffer + tell kernel to clear input doc
@@ -205,16 +201,12 @@ pub fn handle_escape(
     }
 }
 
-
 // ============================================================================
 // DEBUG HANDLERS — migrated from ui/debug.rs to consume ActionFired
 // ============================================================================
 
 /// Handle Quit action.
-pub fn handle_quit(
-    mut actions: MessageReader<ActionFired>,
-    mut exit: MessageWriter<AppExit>,
-) {
+pub fn handle_quit(mut actions: MessageReader<ActionFired>, mut exit: MessageWriter<AppExit>) {
     for ActionFired(action) in actions.read() {
         if matches!(action, Action::Quit) {
             info!("Quitting...");
@@ -240,11 +232,8 @@ pub fn handle_debug_toggle(
 }
 
 /// Handle Screenshot action.
-pub fn handle_screenshot(
-    mut commands: Commands,
-    mut actions: MessageReader<ActionFired>,
-) {
-    use bevy::render::view::screenshot::{save_to_disk, Screenshot};
+pub fn handle_screenshot(mut commands: Commands, mut actions: MessageReader<ActionFired>) {
+    use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 
     for ActionFired(action) in actions.read() {
         if matches!(action, Action::Screenshot) {
@@ -290,8 +279,8 @@ pub fn handle_toggle_constellation(
 // ============================================================================
 
 use crate::cell::{
-    BlockCell, BlockCellContainer, BlockCellLayout, CellEditor,
-    ConversationScrollState, EditorEntities, FocusTarget, FocusedBlockCell, MainCell,
+    BlockCell, BlockCellContainer, BlockCellLayout, CellEditor, ConversationScrollState,
+    EditorEntities, FocusTarget, FocusedBlockCell, MainCell,
 };
 
 /// Navigation direction for block focus.
@@ -374,7 +363,7 @@ pub fn handle_navigate_blocks(
     let new_block = &blocks[new_idx];
 
     // Update focus resource
-    focus.focus_block(new_block.id.clone());
+    focus.focus_block(new_block.id);
 
     // Remove old FocusedBlockCell markers
     for entity in focused_markers.iter() {
@@ -395,10 +384,7 @@ pub fn handle_navigate_blocks(
 }
 
 /// Scroll to keep a block visible in the viewport.
-fn scroll_to_block_visible(
-    scroll_state: &mut ConversationScrollState,
-    layout: &BlockCellLayout,
-) {
+fn scroll_to_block_visible(scroll_state: &mut ConversationScrollState, layout: &BlockCellLayout) {
     let block_top = layout.y_offset;
     let block_bottom = layout.y_offset + layout.height;
     let view_top = scroll_state.offset;
@@ -461,9 +447,7 @@ pub fn handle_scroll(
 // ============================================================================
 
 /// Handle ExpandBlock action (placeholder — ExpandedBlockView was removed).
-pub fn handle_expand_block(
-    mut actions: MessageReader<ActionFired>,
-) {
+pub fn handle_expand_block(mut actions: MessageReader<ActionFired>) {
     for ActionFired(action) in actions.read() {
         if matches!(action, Action::ExpandBlock) {
             info!("ExpandBlock action received (view removed)");
@@ -497,7 +481,7 @@ pub fn handle_collapse_toggle(
             .blocks()
             .iter()
             .filter(|b| matches!(b.kind, kaijutsu_crdt::BlockKind::Thinking))
-            .map(|b| b.id.clone())
+            .map(|b| b.id)
             .collect();
 
         if thinking_blocks.is_empty() {
@@ -519,7 +503,6 @@ pub fn handle_collapse_toggle(
     }
 }
 
-
 // ============================================================================
 // TILING PANE MANAGEMENT
 // ============================================================================
@@ -529,10 +512,7 @@ use crate::ui::tiling::{FocusDirection, SplitDirection, TilingTree};
 /// Handle tiling pane actions (Alt+hjkl, split, close, resize).
 ///
 /// Replaces the old `handle_tiling_keys` system.
-pub fn handle_tiling(
-    mut actions: MessageReader<ActionFired>,
-    mut tree: ResMut<TilingTree>,
-) {
+pub fn handle_tiling(mut actions: MessageReader<ActionFired>, mut tree: ResMut<TilingTree>) {
     for ActionFired(action) in actions.read() {
         match action {
             Action::FocusPaneLeft => {
@@ -595,10 +575,8 @@ pub fn handle_tiling(
 // ============================================================================
 
 use crate::ui::constellation::{
-    Constellation, ConstellationCamera,
-    NewContextConfig, create_or_fork_context,
-    find_nearest_in_direction,
-    model_picker::OpenModelPicker,
+    Constellation, ConstellationCamera, NewContextConfig, create_or_fork_context,
+    find_nearest_in_direction, model_picker::OpenModelPicker,
 };
 
 /// Handle constellation navigation actions (spatial nav, pan, zoom, fork, model picker).
@@ -650,21 +628,14 @@ pub fn handle_constellation_nav(
             Action::ToggleAlternate => {
                 if let Some(alt_id) = constellation.alternate_id {
                     constellation.focus(alt_id);
-                    switch_writer.write(crate::cell::ContextSwitchRequested {
-                        context_id: alt_id,
-                    });
+                    switch_writer.write(crate::cell::ContextSwitchRequested { context_id: alt_id });
                     next_screen.set(crate::ui::screen::Screen::Conversation);
                 }
             }
             Action::ConstellationCreate => {
                 if let Some(ref actor) = actor {
                     info!("Constellation: creating new context");
-                    create_or_fork_context(
-                        &new_ctx_config,
-                        actor,
-                        &result_channel,
-                        &conn_state,
-                    );
+                    create_or_fork_context(&new_ctx_config, actor, &result_channel, &conn_state);
                 } else {
                     info!("Constellation: no actor available for context creation");
                 }
@@ -677,22 +648,26 @@ pub fn handle_constellation_nav(
                 }
             }
             Action::ConstellationArchive => {
-                if let Some(focus_id) = constellation.focus_id {
-                    if let Some(ref actor) = actor {
-                        let handle = actor.handle.clone();
-                        let short_id = focus_id.short();
-                        // Execute from root context, not the context being archived
-                        let exec_ctx = constellation.root_of(focus_id).unwrap_or(focus_id);
-                        let cmd = format!("kj context archive {}", short_id);
-                        info!("Constellation: archiving {} via shell (exec from {})", short_id, exec_ctx.short());
-                        bevy::tasks::IoTaskPool::get()
-                            .spawn(async move {
-                                if let Err(e) = handle.shell_execute(&cmd, exec_ctx, true).await {
-                                    log::error!("archive command failed: {e}");
-                                }
-                            })
-                            .detach();
-                    }
+                if let Some(focus_id) = constellation.focus_id
+                    && let Some(ref actor) = actor
+                {
+                    let handle = actor.handle.clone();
+                    let short_id = focus_id.short();
+                    // Execute from root context, not the context being archived
+                    let exec_ctx = constellation.root_of(focus_id).unwrap_or(focus_id);
+                    let cmd = format!("kj context archive {}", short_id);
+                    info!(
+                        "Constellation: archiving {} via shell (exec from {})",
+                        short_id,
+                        exec_ctx.short()
+                    );
+                    bevy::tasks::IoTaskPool::get()
+                        .spawn(async move {
+                            if let Err(e) = handle.shell_execute(&cmd, exec_ctx, true).await {
+                                log::error!("archive command failed: {e}");
+                            }
+                        })
+                        .detach();
                 }
             }
             _ => {}
@@ -754,34 +729,36 @@ pub fn handle_compose_input(
                 info!("Input mode: {:?}", overlay.mode);
             }
             Action::Submit => {
-                if !overlay.is_empty() {
-                    if let (Some(actor), Some(ctx)) = (&actor, ctx_id) {
-                        let handle = actor.handle.clone();
-                        let is_shell = overlay.is_shell();
-                        bevy::tasks::IoTaskPool::get()
-                            .spawn(async move {
-                                match handle.submit_input(ctx, is_shell).await {
-                                    Ok(result) => log::info!("submit_input ok: {:?}", result.block_id),
-                                    Err(e) => log::error!("submit_input failed: {e}"),
+                if !overlay.is_empty()
+                    && let (Some(actor), Some(ctx)) = (&actor, ctx_id)
+                {
+                    let handle = actor.handle.clone();
+                    let is_shell = overlay.is_shell();
+                    bevy::tasks::IoTaskPool::get()
+                        .spawn(async move {
+                            match handle.submit_input(ctx, is_shell).await {
+                                Ok(result) => {
+                                    log::info!("submit_input ok: {:?}", result.block_id)
                                 }
-                            })
-                            .detach();
-                        // Clear overlay optimistically. The server's InputCleared
-                        // confirms via re-fetch (see handle_input_doc_events).
-                        overlay.text.clear();
-                        overlay.cursor = 0;
-                        overlay.selection_anchor = None;
+                                Err(e) => log::error!("submit_input failed: {e}"),
+                            }
+                        })
+                        .detach();
+                    // Clear overlay optimistically. The server's InputCleared
+                    // confirms via re-fetch (see handle_input_doc_events).
+                    overlay.text.clear();
+                    overlay.cursor = 0;
+                    overlay.selection_anchor = None;
 
-                        // Suppress late TextOps until InputCleared re-fetch
-                        if let Some(cached) = doc_cache.get_mut(ctx) {
-                            cached.input_pending_clear = true;
-                        }
-
-                        // Dismiss overlay by transitioning focus
-                        *focus = FocusArea::Conversation;
+                    // Suppress late TextOps until InputCleared re-fetch
+                    if let Some(cached) = doc_cache.get_mut(ctx) {
+                        cached.input_pending_clear = true;
                     }
-                    // No else — if not connected, do nothing (no offline fallback)
+
+                    // Dismiss overlay by transitioning focus
+                    *focus = FocusArea::Conversation;
                 }
+                // No else — if not connected, do nothing (no offline fallback)
             }
             Action::InsertNewline => {
                 let pos_before = overlay.cursor;
@@ -869,38 +846,37 @@ pub fn handle_compose_input(
             Action::CursorRight => overlay.move_right(),
             Action::SelectAll => overlay.select_all(),
             Action::Copy => {
-                if let Some(ref mut clip) = clipboard {
-                    if let Some(text) = overlay.selected_text() {
-                        if let Err(e) = clip.0.set_text(text) {
-                            warn!("Copy failed: {e}");
-                        }
-                    }
+                if let Some(ref mut clip) = clipboard
+                    && let Some(text) = overlay.selected_text()
+                    && let Err(e) = clip.0.set_text(text)
+                {
+                    warn!("Copy failed: {e}");
                 }
             }
             Action::Cut => {
-                if let Some(ref mut clip) = clipboard {
-                    if let Some(text) = overlay.selected_text() {
-                        let range = overlay.selection_range().unwrap();
-                        let del_pos = range.start;
-                        let del_len = range.end - range.start;
+                if let Some(ref mut clip) = clipboard
+                    && let Some(text) = overlay.selected_text()
+                {
+                    let range = overlay.selection_range().unwrap();
+                    let del_pos = range.start;
+                    let del_len = range.end - range.start;
 
-                        if let Err(e) = clip.0.set_text(text) {
-                            warn!("Cut failed: {e}");
-                        } else {
-                            overlay.delete_selection();
+                    if let Err(e) = clip.0.set_text(text) {
+                        warn!("Cut failed: {e}");
+                    } else {
+                        overlay.delete_selection();
 
-                            if let (Some(actor), Some(ctx)) = (&actor, ctx_id) {
-                                let handle = actor.handle.clone();
-                                let pos = del_pos as u64;
-                                let delete = del_len as u64;
-                                bevy::tasks::IoTaskPool::get()
-                                    .spawn(async move {
-                                        if let Err(e) = handle.edit_input(ctx, pos, "", delete).await {
-                                            log::warn!("edit_input (cut) failed: {e}");
-                                        }
-                                    })
-                                    .detach();
-                            }
+                        if let (Some(actor), Some(ctx)) = (&actor, ctx_id) {
+                            let handle = actor.handle.clone();
+                            let pos = del_pos as u64;
+                            let delete = del_len as u64;
+                            bevy::tasks::IoTaskPool::get()
+                                .spawn(async move {
+                                    if let Err(e) = handle.edit_input(ctx, pos, "", delete).await {
+                                        log::warn!("edit_input (cut) failed: {e}");
+                                    }
+                                })
+                                .detach();
                         }
                     }
                 }
@@ -926,7 +902,9 @@ pub fn handle_compose_input(
                                 let insert_text = text.clone();
                                 bevy::tasks::IoTaskPool::get()
                                     .spawn(async move {
-                                        if let Err(e) = handle.edit_input(ctx, pos, &insert_text, delete).await {
+                                        if let Err(e) =
+                                            handle.edit_input(ctx, pos, &insert_text, delete).await
+                                        {
                                             log::warn!("edit_input (paste) failed: {e}");
                                         }
                                     })

@@ -4,7 +4,7 @@ use bevy::prelude::*;
 use bevy_vello::prelude::VelloFont;
 
 /// Loaded font handles for consistent rendering.
-#[derive(Resource, Clone)]
+#[derive(Resource, Clone, Default)]
 pub struct FontHandles {
     /// Monospace font (primary — code, blocks, compose).
     pub mono: Handle<VelloFont>,
@@ -14,16 +14,6 @@ pub struct FontHandles {
     pub cjk: Handle<VelloFont>,
 }
 
-impl Default for FontHandles {
-    fn default() -> Self {
-        Self {
-            mono: Handle::default(),
-            serif: Handle::default(),
-            cjk: Handle::default(),
-        }
-    }
-}
-
 /// Centralized text metrics for consistent, DPI-aware font sizing.
 ///
 /// All text rendering should use this resource instead of hardcoding
@@ -31,6 +21,7 @@ impl Default for FontHandles {
 /// `cell_line_height` and `cell_char_width` start as reasonable defaults
 /// and are updated from the actual font metrics once the font asset loads.
 #[derive(Resource, Clone)]
+#[allow(dead_code)]
 pub struct TextMetrics {
     /// Base font size for content cells (blocks, code). Default: 16.0
     pub cell_font_size: f32,

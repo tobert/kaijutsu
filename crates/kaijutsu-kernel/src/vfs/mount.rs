@@ -5,8 +5,8 @@
 use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
 
 use super::error::{VfsError, VfsResult};
@@ -216,13 +216,14 @@ impl MountTable {
             if mount_str == "/" {
                 // Root mount: list its contents directly
                 if let Some(fs) = mounts.get(mount_path)
-                    && let Ok(root_entries) = fs.readdir(Path::new("")).await {
-                        for entry in root_entries {
-                            if seen_names.insert(entry.name.clone()) {
-                                entries.push(entry);
-                            }
+                    && let Ok(root_entries) = fs.readdir(Path::new("")).await
+                {
+                    for entry in root_entries {
+                        if seen_names.insert(entry.name.clone()) {
+                            entries.push(entry);
                         }
                     }
+                }
             } else {
                 // Non-root mount: extract first path component
                 let first_component = mount_str
@@ -403,7 +404,10 @@ mod tests {
 
         let scratch = MemoryBackend::new();
         scratch.create(Path::new("a.txt"), 0o644).await.unwrap();
-        scratch.write(Path::new("a.txt"), 0, b"scratch").await.unwrap();
+        scratch
+            .write(Path::new("a.txt"), 0, b"scratch")
+            .await
+            .unwrap();
         table.mount("/scratch", scratch).await;
 
         let data = MemoryBackend::new();
@@ -412,7 +416,10 @@ mod tests {
         table.mount("/data", data).await;
 
         assert_eq!(
-            table.read(Path::new("/scratch/a.txt"), 0, 100).await.unwrap(),
+            table
+                .read(Path::new("/scratch/a.txt"), 0, 100)
+                .await
+                .unwrap(),
             b"scratch"
         );
         assert_eq!(
@@ -443,7 +450,10 @@ mod tests {
 
         // /mnt/outer.txt should come from outer mount
         assert_eq!(
-            table.read(Path::new("/mnt/outer.txt"), 0, 100).await.unwrap(),
+            table
+                .read(Path::new("/mnt/outer.txt"), 0, 100)
+                .await
+                .unwrap(),
             b"outer"
         );
 
@@ -480,11 +490,21 @@ mod tests {
         fs.write(Path::new("test.txt"), 0, b"data").await.unwrap();
         table.mount("/scratch", fs).await;
 
-        assert!(table.read(Path::new("/scratch/test.txt"), 0, 100).await.is_ok());
+        assert!(
+            table
+                .read(Path::new("/scratch/test.txt"), 0, 100)
+                .await
+                .is_ok()
+        );
 
         table.unmount("/scratch").await;
 
-        assert!(table.read(Path::new("/scratch/test.txt"), 0, 100).await.is_err());
+        assert!(
+            table
+                .read(Path::new("/scratch/test.txt"), 0, 100)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -537,7 +557,10 @@ mod tests {
             .await
             .unwrap();
 
-        let data = table.read(Path::new("/scratch/new.txt"), 0, 100).await.unwrap();
+        let data = table
+            .read(Path::new("/scratch/new.txt"), 0, 100)
+            .await
+            .unwrap();
         assert_eq!(data, b"created");
     }
 
@@ -565,7 +588,9 @@ mod tests {
 
         table.create(Path::new("/a/file.txt"), 0o644).await.unwrap();
 
-        let result = table.rename(Path::new("/a/file.txt"), Path::new("/b/file.txt")).await;
+        let result = table
+            .rename(Path::new("/a/file.txt"), Path::new("/b/file.txt"))
+            .await;
         assert!(matches!(result, Err(VfsError::CrossDeviceLink)));
     }
 
@@ -573,9 +598,15 @@ mod tests {
     async fn test_real_path_memory_returns_none() {
         let table = MountTable::new();
         table.mount("/scratch", MemoryBackend::new()).await;
-        table.create(Path::new("/scratch/test.txt"), 0o644).await.unwrap();
+        table
+            .create(Path::new("/scratch/test.txt"), 0o644)
+            .await
+            .unwrap();
 
-        let real = table.real_path(Path::new("/scratch/test.txt")).await.unwrap();
+        let real = table
+            .real_path(Path::new("/scratch/test.txt"))
+            .await
+            .unwrap();
         assert!(real.is_none());
     }
 
@@ -587,9 +618,14 @@ mod tests {
         std::fs::write(dir.path().join("test.txt"), "hello").unwrap();
 
         let table = MountTable::new();
-        table.mount("/mnt/project", LocalBackend::new(dir.path())).await;
+        table
+            .mount("/mnt/project", LocalBackend::new(dir.path()))
+            .await;
 
-        let real = table.real_path(Path::new("/mnt/project/test.txt")).await.unwrap();
+        let real = table
+            .real_path(Path::new("/mnt/project/test.txt"))
+            .await
+            .unwrap();
         assert!(real.is_some());
         let real = real.unwrap();
         assert!(real.is_absolute());
@@ -631,18 +667,33 @@ mod tests {
     async fn test_freeze_does_not_block_reads_writes() {
         let table = MountTable::new();
         table.mount("/scratch", MemoryBackend::new()).await;
-        table.create(Path::new("/scratch/test.txt"), 0o644).await.unwrap();
-        table.write(Path::new("/scratch/test.txt"), 0, b"hello").await.unwrap();
+        table
+            .create(Path::new("/scratch/test.txt"), 0o644)
+            .await
+            .unwrap();
+        table
+            .write(Path::new("/scratch/test.txt"), 0, b"hello")
+            .await
+            .unwrap();
 
         table.freeze();
 
         // reads still work
-        let data = table.read(Path::new("/scratch/test.txt"), 0, 100).await.unwrap();
+        let data = table
+            .read(Path::new("/scratch/test.txt"), 0, 100)
+            .await
+            .unwrap();
         assert_eq!(data, b"hello");
 
         // writes still work (freeze only affects mount/unmount, not data ops)
-        table.write(Path::new("/scratch/test.txt"), 0, b"updated").await.unwrap();
-        let data = table.read(Path::new("/scratch/test.txt"), 0, 100).await.unwrap();
+        table
+            .write(Path::new("/scratch/test.txt"), 0, b"updated")
+            .await
+            .unwrap();
+        let data = table
+            .read(Path::new("/scratch/test.txt"), 0, 100)
+            .await
+            .unwrap();
         assert_eq!(data, b"updated");
     }
 }

@@ -41,8 +41,13 @@ mod tests {
         let mut engine = Engine::new();
         register(&mut engine);
 
-        let result: String = engine.eval(r#"xml_escape("<b>\"hello\" & 'world'</b>")"#).unwrap();
-        assert_eq!(result, "&lt;b&gt;&quot;hello&quot; &amp; &apos;world&apos;&lt;/b&gt;");
+        let result: String = engine
+            .eval(r#"xml_escape("<b>\"hello\" & 'world'</b>")"#)
+            .unwrap();
+        assert_eq!(
+            result,
+            "&lt;b&gt;&quot;hello&quot; &amp; &apos;world&apos;&lt;/b&gt;"
+        );
     }
 
     #[test]

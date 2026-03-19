@@ -14,12 +14,12 @@
 pub mod agents;
 pub mod block_store;
 pub mod block_tools;
-pub mod input_doc;
 pub mod config_backend;
 pub mod control;
 pub mod drift;
 pub mod file_tools;
 pub mod flows;
+pub mod input_doc;
 pub mod kernel;
 pub mod kernel_db;
 pub mod kj;
@@ -35,86 +35,135 @@ pub use agents::{
     AgentActivityEvent, AgentCapability, AgentConfig, AgentError, AgentInfo, AgentRegistry,
     AgentStatus, SharedAgentRegistry, shared_agent_registry,
 };
-pub use block_store::{BlockStore, BlockStoreError, BlockStoreResult, DbHandle, SharedBlockStore, shared_block_store};
+pub use block_store::DocumentKind;
+pub use block_store::{
+    BlockStore, BlockStoreError, BlockStoreResult, DbHandle, SharedBlockStore, shared_block_store,
+};
 pub use block_tools::{
     BlockAppendEngine, BlockCreateEngine, BlockEditEngine, BlockListEngine, BlockReadEngine,
-    BlockSearchEngine, BlockSpliceEngine, BlockStatusEngine, KernelSearchEngine,
-    EditOp,
+    BlockSearchEngine, BlockSpliceEngine, BlockStatusEngine, EditOp, KernelSearchEngine,
+};
+pub use config_backend::{
+    ConfigCrdtBackend, ConfigWatcherHandle, DEFAULT_SYSTEM_PROMPT, ValidationResult,
 };
 pub use control::ConsentMode;
-pub use block_store::DocumentKind;
 pub use kaijutsu_types::DocKind;
 pub use kernel::Kernel;
+pub use llm::{
+    // Default model
+    DEFAULT_MODEL,
+    EmbeddingModelConfig,
+    LlmConfig,
+    // Core types
+    LlmError,
+    LlmRegistry,
+    LlmResult,
+    LlmStream,
+    Message as LlmMessage,
+    ModelAlias,
+    ModelsConfig,
+    // Configuration
+    ProviderConfig,
+    ResponseBlock,
+    RigProvider,
+    RigStreamAdapter,
+    Role as LlmRole,
+    // Streaming
+    StreamEvent,
+    StreamRequest,
+    ToolConfig,
+    // Tool definitions
+    ToolDefinition as LlmToolDefinition,
+    ToolFilter,
+    Usage as LlmUsage,
+    // Hydration
+    hydrate_from_blocks,
+    initialize_llm_registry,
+    load_llm_config,
+    load_models_config,
+};
+pub use mcp_config::{McpConfig, load_mcp_config};
+pub use mcp_pool::{
+    // Resource types
+    CachedResource,
+    McpForkMode,
+    McpPoolError,
+    McpRegistration,
+    McpResourceInfo,
+    McpServerConfig,
+    McpServerInfo,
+    McpServerPool,
+    McpToolEngine,
+    McpToolInfo,
+    McpTransport,
+    ResourceCache,
+    extract_tool_result_text,
+};
 pub use rhai_engine::RhaiEngine;
 pub use state::KernelState;
 pub use tools::{EngineArgs, ExecResult, ExecutionEngine, ToolContext, ToolInfo, ToolRegistry};
-pub use llm::{
-    // Core types
-    LlmError, LlmRegistry, LlmResult, RigProvider,
-    Message as LlmMessage, ResponseBlock, Role as LlmRole, Usage as LlmUsage,
-    // Hydration
-    hydrate_from_blocks,
-    // Tool definitions
-    ToolDefinition as LlmToolDefinition,
-    // Streaming
-    StreamEvent, StreamRequest, RigStreamAdapter, LlmStream,
-    // Configuration
-    ProviderConfig, ToolConfig, ToolFilter,
-    LlmConfig, ModelAlias, ModelsConfig, EmbeddingModelConfig,
-    initialize_llm_registry, load_llm_config, load_models_config,
-    // Default model
-    DEFAULT_MODEL,
-};
 pub use vfs::{
-    backends::{LocalBackend, MemoryBackend},
     DirEntry, FileAttr, FileType, MountTable, SetAttr, StatFs, VfsError, VfsOps, VfsResult,
-};
-pub use mcp_pool::{
-    McpPoolError, McpServerConfig, McpServerInfo, McpServerPool, McpToolEngine, McpToolInfo,
-    McpTransport, McpForkMode, McpRegistration, extract_tool_result_text,
-    // Resource types
-    CachedResource, McpResourceInfo, ResourceCache,
-};
-pub use mcp_config::{McpConfig, load_mcp_config};
-pub use config_backend::{
-    ConfigCrdtBackend, ConfigWatcherHandle, ValidationResult,
-    DEFAULT_SYSTEM_PROMPT,
+    backends::{LocalBackend, MemoryBackend},
 };
 
 pub use drift::{
-    ContextHandle, DriftError, DriftRouter,
-    SharedDriftRouter, StagedDrift, shared_drift_router,
+    ContextHandle,
     // Distillation helpers
-    DISTILLATION_SYSTEM_PROMPT, build_distillation_prompt,
+    DISTILLATION_SYSTEM_PROMPT,
+    DriftError,
+    DriftRouter,
+    SharedDriftRouter,
+    StagedDrift,
+    build_distillation_prompt,
+    shared_drift_router,
 };
 pub use file_tools::{
-    FileDocumentCache, ReadEngine, EditEngine, WriteEngine, GlobEngine, GrepEngine, WhoamiEngine,
+    EditEngine, FileDocumentCache, GlobEngine, GrepEngine, ReadEngine, WhoamiEngine, WriteEngine,
 };
 
 // Re-export rmcp types needed for resource handling
-pub use rmcp::model::ResourceContents as McpResourceContents;
 pub use flows::{
-    BlockFlow, FlowBus, FlowMessage, HasSubject, OpSource, SharedBlockFlowBus, Subscription,
-    shared_block_flow_bus,
-    // Resource flow types
-    ResourceFlow, SharedResourceFlowBus, shared_resource_flow_bus,
-    // Progress flow types
-    ProgressFlow, SharedProgressFlowBus, shared_progress_flow_bus,
-    // Elicitation flow types
-    ElicitationFlow, ElicitationAction, ElicitationResponse,
-    SharedElicitationFlowBus, shared_elicitation_flow_bus,
-    // Logging flow types
-    LoggingFlow, SharedLoggingFlowBus, shared_logging_flow_bus,
+    BlockFlow,
     // Config flow types
-    ConfigFlow, ConfigSource, SharedConfigFlowBus, shared_config_flow_bus,
+    ConfigFlow,
+    ConfigSource,
+    ElicitationAction,
+    // Elicitation flow types
+    ElicitationFlow,
+    ElicitationResponse,
+    FlowBus,
+    FlowMessage,
+    HasSubject,
     // Input doc flow types
-    InputDocFlow, SharedInputDocFlowBus, shared_input_doc_flow_bus,
+    InputDocFlow,
+    // Logging flow types
+    LoggingFlow,
+    OpSource,
+    // Progress flow types
+    ProgressFlow,
+    // Resource flow types
+    ResourceFlow,
+    SharedBlockFlowBus,
+    SharedConfigFlowBus,
+    SharedElicitationFlowBus,
+    SharedInputDocFlowBus,
+    SharedLoggingFlowBus,
+    SharedProgressFlowBus,
+    SharedResourceFlowBus,
+    Subscription,
+    shared_block_flow_bus,
+    shared_config_flow_bus,
+    shared_elicitation_flow_bus,
+    shared_input_doc_flow_bus,
+    shared_logging_flow_bus,
+    shared_progress_flow_bus,
+    shared_resource_flow_bus,
 };
 pub use input_doc::InputDocEntry;
 pub use kernel_db::{
-    KernelDb, KernelDbError, KernelDbResult,
-    ContextRow, ContextShellRow, ContextEnvRow,
-    DocumentRow, SnapshotRow,
-    PresetRow, WorkspaceRow, WorkspacePathRow, ContextEdgeRow,
+    ContextEdgeRow, ContextEnvRow, ContextRow, ContextShellRow, DocumentRow, KernelDb,
+    KernelDbError, KernelDbResult, PresetRow, SnapshotRow, WorkspacePathRow, WorkspaceRow,
 };
-pub use kj::{KjDispatcher, KjCaller, KjResult};
+pub use kj::{KjCaller, KjDispatcher, KjResult};
+pub use rmcp::model::ResourceContents as McpResourceContents;

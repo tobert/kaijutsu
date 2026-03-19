@@ -23,7 +23,7 @@
 
 mod otel;
 
-pub use otel::{otel_layer, OtelGuard};
+pub use otel::{OtelGuard, otel_layer};
 
 /// Check whether OTel export should be enabled.
 ///

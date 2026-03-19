@@ -12,8 +12,8 @@ use kaijutsu_crdt::{BlockId, BlockKind, ContextId, Role, Status};
 use parking_lot::RwLock;
 
 use crate::block_store::SharedBlockStore;
-use kaijutsu_types::DocKind;
 use crate::vfs::{MountTable, VfsOps};
+use kaijutsu_types::DocKind;
 
 /// Default maximum cached file documents.
 const DEFAULT_MAX_CACHED: usize = 64;
@@ -64,7 +64,7 @@ impl FileDocumentCache {
             let mut cache = self.cache.write();
             if let Some(entry) = cache.get_mut(&ctx_id) {
                 entry.last_access = Instant::now();
-                return Ok((entry.context_id, entry.block_id.clone()));
+                return Ok((entry.context_id, entry.block_id));
             }
         }
 
@@ -87,11 +87,18 @@ impl FileDocumentCache {
             .block_store
             .create_document(ctx_id, DocKind::Code, language)
         {
-            Ok(()) => {
-                self.block_store
-                    .insert_block(ctx_id, None, None, Role::System, BlockKind::Text, text, Status::Done)
-                    .map_err(|e| format!("failed to insert block for {}: {}", path, e))?
-            }
+            Ok(()) => self
+                .block_store
+                .insert_block(
+                    ctx_id,
+                    None,
+                    None,
+                    Role::System,
+                    BlockKind::Text,
+                    text,
+                    Status::Done,
+                )
+                .map_err(|e| format!("failed to insert block for {}: {}", path, e))?,
             Err(_) => {
                 // Document already exists (concurrent load race). Re-check cache first,
                 // then fall back to fetching the existing block from the store.
@@ -99,7 +106,7 @@ impl FileDocumentCache {
                     let mut cache = self.cache.write();
                     if let Some(entry) = cache.get_mut(&ctx_id) {
                         entry.last_access = Instant::now();
-                        return Ok((entry.context_id, entry.block_id.clone()));
+                        return Ok((entry.context_id, entry.block_id));
                     }
                 }
                 // Not in cache yet — the other thread hasn't inserted. Grab from store.
@@ -109,7 +116,7 @@ impl FileDocumentCache {
                     .map_err(|e| format!("failed to read existing doc {}: {}", path, e))?;
                 snapshots
                     .first()
-                    .map(|s| s.id.clone())
+                    .map(|s| s.id)
                     .ok_or_else(|| format!("document {} exists but has no blocks", path))?
             }
         };
@@ -123,7 +130,7 @@ impl FileDocumentCache {
                 CachedFileDoc {
                     context_id: ctx_id,
                     path: path.to_string(),
-                    block_id: block_id.clone(),
+                    block_id,
                     dirty: false,
                     last_access: Instant::now(),
                 },
@@ -173,15 +180,11 @@ impl FileDocumentCache {
                     })
                     .unwrap_or_default();
 
-                self.block_store.edit_text(
-                    ctx_id,
-                    &entry.block_id,
-                    0,
-                    content,
-                    old_content.len(),
-                ).map_err(|e| e.to_string())?;
+                self.block_store
+                    .edit_text(ctx_id, &entry.block_id, 0, content, old_content.len())
+                    .map_err(|e| e.to_string())?;
 
-                return Ok((entry.context_id, entry.block_id.clone()));
+                return Ok((entry.context_id, entry.block_id));
             }
         }
 
@@ -205,7 +208,7 @@ impl FileDocumentCache {
             cache
                 .values()
                 .filter(|e| e.dirty)
-                .map(|e| (e.path.clone(), e.context_id, e.block_id.clone()))
+                .map(|e| (e.path.clone(), e.context_id, e.block_id))
                 .collect()
         };
 
@@ -226,7 +229,8 @@ impl FileDocumentCache {
                 })
                 .unwrap_or_default();
 
-            match self.vfs
+            match self
+                .vfs
                 .write_all(std::path::Path::new(path), content.as_bytes())
                 .await
             {
@@ -253,7 +257,12 @@ impl FileDocumentCache {
         if errors.is_empty() {
             Ok(flushed)
         } else {
-            Err(format!("flush_dirty: {}/{} failed: {}", errors.len(), dirty_entries.len(), errors.join("; ")))
+            Err(format!(
+                "flush_dirty: {}/{} failed: {}",
+                errors.len(),
+                dirty_entries.len(),
+                errors.join("; ")
+            ))
         }
     }
 
@@ -263,7 +272,7 @@ impl FileDocumentCache {
         let block_id = {
             let cache = self.cache.read();
             match cache.get(&ctx_id) {
-                Some(entry) if entry.dirty => entry.block_id.clone(),
+                Some(entry) if entry.dirty => entry.block_id,
                 Some(_) => return Ok(()), // not dirty
                 None => return Ok(()),    // not cached
             }
@@ -321,7 +330,15 @@ impl FileDocumentCache {
 
         let block_id = self
             .block_store
-            .insert_block(ctx_id, None, None, Role::System, BlockKind::Text, content, Status::Done)
+            .insert_block(
+                ctx_id,
+                None,
+                None,
+                Role::System,
+                BlockKind::Text,
+                content,
+                Status::Done,
+            )
             .map_err(|e| format!("failed to insert block for {}: {}", path, e))?;
 
         {
@@ -332,7 +349,7 @@ impl FileDocumentCache {
                 CachedFileDoc {
                     context_id: ctx_id,
                     path: path.to_string(),
-                    block_id: block_id.clone(),
+                    block_id,
                     dirty: false,
                     last_access: Instant::now(),
                 },
@@ -351,7 +368,7 @@ impl FileDocumentCache {
                 .iter()
                 .filter(|(_, e)| !e.dirty)
                 .min_by_key(|(_, e)| e.last_access)
-                .map(|(k, _)| k.clone());
+                .map(|(k, _)| *k);
 
             if let Some(key) = oldest_clean {
                 cache.remove(&key);
@@ -428,7 +445,10 @@ mod tests {
         assert_eq!(id1, id2, "same path should produce same ContextId");
 
         let id3 = file_context_id("/mnt/project/lib.rs");
-        assert_ne!(id1, id3, "different paths should produce different ContextIds");
+        assert_ne!(
+            id1, id3,
+            "different paths should produce different ContextIds"
+        );
     }
 
     #[test]

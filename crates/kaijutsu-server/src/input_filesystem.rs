@@ -15,9 +15,9 @@ use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 
-use kaish_kernel::vfs::{DirEntry, DirEntryKind, Filesystem};
 use kaijutsu_kernel::block_store::SharedBlockStore;
 use kaijutsu_types::ContextId;
+use kaish_kernel::vfs::{DirEntry, DirEntryKind, Filesystem};
 
 /// Shared mutable context ID (same type as kaish_backend::SharedContextId).
 type SharedContextId = Arc<RwLock<ContextId>>;
@@ -62,7 +62,7 @@ impl Filesystem for InputFilesystem {
         // Ensure the input doc exists (idempotent)
         self.blocks
             .create_input_doc(ctx)
-            .map_err(|e| io::Error::other(e))?;
+            .map_err(io::Error::other)?;
 
         match self.blocks.get_input_text(ctx) {
             Ok(text) => Ok(text.into_bytes()),
@@ -89,7 +89,7 @@ impl Filesystem for InputFilesystem {
         // Ensure the input doc exists (idempotent)
         self.blocks
             .create_input_doc(ctx)
-            .map_err(|e| io::Error::other(e))?;
+            .map_err(io::Error::other)?;
 
         // Clear existing content first, then write new text
         let _ = self.blocks.clear_input(ctx);
@@ -97,7 +97,7 @@ impl Filesystem for InputFilesystem {
         if !new_text.is_empty() {
             self.blocks
                 .edit_input(ctx, 0, &new_text, 0)
-                .map_err(|e| io::Error::other(e))?;
+                .map_err(io::Error::other)?;
         }
 
         Ok(())
@@ -171,9 +171,7 @@ impl Filesystem for InputFilesystem {
 
         // "Removing" the input file clears its content
         let ctx = self.current_context();
-        self.blocks
-            .clear_input(ctx)
-            .map_err(|e| io::Error::other(e))?;
+        self.blocks.clear_input(ctx).map_err(io::Error::other)?;
         Ok(())
     }
 

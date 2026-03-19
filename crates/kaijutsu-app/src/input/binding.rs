@@ -88,7 +88,12 @@ pub struct Binding {
 
 impl Binding {
     /// Create a simple key binding with no modifiers.
-    pub fn key(key: KeyCode, context: InputContext, action: Action, desc: impl Into<String>) -> Self {
+    pub fn key(
+        key: KeyCode,
+        context: InputContext,
+        action: Action,
+        desc: impl Into<String>,
+    ) -> Self {
         Self {
             source: InputSource::Key(key),
             modifiers: Modifiers::NONE,

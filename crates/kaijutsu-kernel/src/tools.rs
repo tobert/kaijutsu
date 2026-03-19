@@ -500,10 +500,7 @@ mod tests {
     async fn test_register_with_engine() {
         let mut registry = ToolRegistry::new();
 
-        registry.register_with_engine(
-            ToolInfo::new("noop", "Noop", "test"),
-            Arc::new(NoopEngine),
-        );
+        registry.register_with_engine(ToolInfo::new("noop", "Noop", "test"), Arc::new(NoopEngine));
         assert!(registry.has_engine("noop"));
         assert!(registry.get_engine("noop").is_some());
         assert_eq!(registry.list_with_engines().len(), 1);
@@ -513,13 +510,13 @@ mod tests {
     async fn test_default_engine() {
         let mut registry = ToolRegistry::new();
 
-        registry.register_with_engine(
-            ToolInfo::new("noop", "Noop", "test"),
-            Arc::new(NoopEngine),
-        );
+        registry.register_with_engine(ToolInfo::new("noop", "Noop", "test"), Arc::new(NoopEngine));
         registry.set_default_engine("noop");
 
-        let result = registry.execute("hello", &ToolContext::test()).await.unwrap();
+        let result = registry
+            .execute("hello", &ToolContext::test())
+            .await
+            .unwrap();
         assert!(result.success);
         assert!(result.stdout.contains("hello"));
     }
@@ -550,7 +547,7 @@ mod tests {
 
     #[test]
     fn test_output_data_serialization() {
-        use kaijutsu_types::{OutputData, OutputNode, OutputEntryType};
+        use kaijutsu_types::{OutputData, OutputEntryType, OutputNode};
         let mut node1 = OutputNode::new("src");
         node1.entry_type = OutputEntryType::Directory;
         let mut node2 = OutputNode::new("Cargo.toml");

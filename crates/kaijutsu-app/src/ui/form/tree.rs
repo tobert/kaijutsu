@@ -5,9 +5,9 @@
 
 use bevy::prelude::*;
 
-use bevy_vello::prelude::{UiVelloScene, UiVelloText};
 use crate::text::{FontHandles, vello_style};
 use crate::ui::theme::Theme;
+use bevy_vello::prelude::{UiVelloScene, UiVelloText};
 
 // ============================================================================
 // DATA TYPES
@@ -73,6 +73,7 @@ pub struct TreeView {
     pub dirty: bool,
 }
 
+#[allow(dead_code)]
 impl TreeView {
     pub fn new(categories: Vec<TreeCategory>, font_size: f32) -> Self {
         Self {

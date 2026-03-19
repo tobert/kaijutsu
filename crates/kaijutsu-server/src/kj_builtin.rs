@@ -61,11 +61,17 @@ impl KjBuiltin {
     }
 
     fn current_context_id(&self) -> ContextId {
-        *self.shared_context_id.read().expect("context_id lock poisoned")
+        *self
+            .shared_context_id
+            .read()
+            .expect("context_id lock poisoned")
     }
 
     fn set_context_id(&self, id: ContextId) {
-        *self.shared_context_id.write().expect("context_id lock poisoned") = id;
+        *self
+            .shared_context_id
+            .write()
+            .expect("context_id lock poisoned") = id;
     }
 
     /// Load context shell config (cwd + env vars) from KernelDb and apply to ExecContext.
@@ -73,21 +79,22 @@ impl KjBuiltin {
         let db = self.dispatcher.kernel_db().lock();
 
         // Apply cwd
-        if let Ok(Some(shell)) = db.get_context_shell(context_id) {
-            if let Some(cwd) = shell.cwd {
-                let path = std::path::PathBuf::from(&cwd);
-                if path.is_dir() {
-                    ctx.set_cwd(path);
-                } else {
-                    tracing::warn!("context cwd '{}' is not a directory, skipping", cwd);
-                }
+        if let Ok(Some(shell)) = db.get_context_shell(context_id)
+            && let Some(cwd) = shell.cwd
+        {
+            let path = std::path::PathBuf::from(&cwd);
+            if path.is_dir() {
+                ctx.set_cwd(path);
+            } else {
+                tracing::warn!("context cwd '{}' is not a directory, skipping", cwd);
             }
         }
 
         // Apply env vars (exported so they propagate to child processes)
         if let Ok(vars) = db.get_context_env(context_id) {
             for var in &vars {
-                ctx.scope.set_exported(&var.key, Value::String(var.value.clone()));
+                ctx.scope
+                    .set_exported(&var.key, Value::String(var.value.clone()));
             }
         }
     }
@@ -112,7 +119,10 @@ impl KjBuiltin {
     /// `kj synth all` — index + synthesize all active contexts.
     async fn synth_all(&self) -> ExecResult {
         let Some(ref idx) = self.semantic_index else {
-            return ExecResult::failure(1, "semantic index not configured (check embedding model in models.rhai)".to_string());
+            return ExecResult::failure(
+                1,
+                "semantic index not configured (check embedding model in models.rhai)".to_string(),
+            );
         };
 
         let kernel_id = self.dispatcher.kernel_id();
@@ -149,23 +159,24 @@ impl KjBuiltin {
                     Err(_) => return Ok(None), // no document in DB either, skip
                 };
 
-                let was_indexed = idx.index_context(ctx_id, &blocks)
+                let was_indexed = idx
+                    .index_context(ctx_id, &blocks)
                     .map_err(|e| format!("index: {e}"))?;
 
-                let synth = crate::synthesis_rhai::run_synthesis(
-                    ctx_id,
-                    idx.embedder_arc(),
-                    block_source,
-                );
+                let synth =
+                    crate::synthesis_rhai::run_synthesis(ctx_id, idx.embedder_arc(), block_source);
 
                 Ok::<Option<(bool, Option<kaijutsu_index::synthesis::SynthesisResult>)>, String>(
-                    Some((was_indexed, synth))
+                    Some((was_indexed, synth)),
                 )
-            }).await;
+            })
+            .await;
 
             match result {
                 Ok(Ok(Some((was_indexed, synth_result)))) => {
-                    if was_indexed { indexed += 1; }
+                    if was_indexed {
+                        indexed += 1;
+                    }
                     if let Some(synth) = synth_result {
                         if let Some(ref si) = self.semantic_index {
                             si.synthesis_cache().insert(ctx_id, synth);
@@ -173,7 +184,9 @@ impl KjBuiltin {
                         synthesized += 1;
                     }
                 }
-                Ok(Ok(None)) => { skipped += 1; } // no document or empty
+                Ok(Ok(None)) => {
+                    skipped += 1;
+                } // no document or empty
                 Ok(Err(e)) => errors.push(format!("{}: {e}", ctx_id.short())),
                 Err(e) => errors.push(format!("{}: join error: {e}", ctx_id.short())),
             }
@@ -183,7 +196,11 @@ impl KjBuiltin {
             "{total} contexts: {indexed} indexed, {synthesized} synthesized, {skipped} skipped"
         );
         if !errors.is_empty() {
-            out.push_str(&format!("\nerrors ({}):\n  {}", errors.len(), errors.join("\n  ")));
+            out.push_str(&format!(
+                "\nerrors ({}):\n  {}",
+                errors.len(),
+                errors.join("\n  ")
+            ));
         }
         ExecResult::success(out)
     }
@@ -191,7 +208,10 @@ impl KjBuiltin {
     /// `kj synth <ctx_ref>` — index + synthesize a single context.
     async fn synth_context(&self, ctx_ref: &str, caller: &KjCaller) -> ExecResult {
         let Some(ref idx) = self.semantic_index else {
-            return ExecResult::failure(1, "semantic index not configured (check embedding model in models.rhai)".to_string());
+            return ExecResult::failure(
+                1,
+                "semantic index not configured (check embedding model in models.rhai)".to_string(),
+            );
         };
 
         // Resolve context reference
@@ -209,34 +229,41 @@ impl KjBuiltin {
         let block_source = self.block_source.clone();
 
         let result = tokio::task::spawn_blocking(move || {
-            let blocks = block_source.block_snapshots(ctx_id)
+            let blocks = block_source
+                .block_snapshots(ctx_id)
                 .map_err(|e| format!("block fetch: {e}"))?;
 
-            let was_indexed = idx.index_context(ctx_id, &blocks)
+            let was_indexed = idx
+                .index_context(ctx_id, &blocks)
                 .map_err(|e| format!("index: {e}"))?;
 
-            let synth = crate::synthesis_rhai::run_synthesis(
-                ctx_id,
-                idx.embedder_arc(),
-                block_source,
-            );
+            let synth =
+                crate::synthesis_rhai::run_synthesis(ctx_id, idx.embedder_arc(), block_source);
 
             if let Some(ref s) = synth {
                 idx.synthesis_cache().insert(ctx_id, s.clone());
             }
 
-            Ok::<(bool, Option<kaijutsu_index::synthesis::SynthesisResult>), String>((was_indexed, synth))
-        }).await;
+            Ok::<(bool, Option<kaijutsu_index::synthesis::SynthesisResult>), String>((
+                was_indexed,
+                synth,
+            ))
+        })
+        .await;
 
         match result {
             Ok(Ok((was_indexed, synth_result))) => {
-                let mut out = format!("{}", ctx_id.short());
+                let mut out = ctx_id.short().to_string();
                 if was_indexed {
                     out.push_str(" (newly indexed)");
                 }
                 if let Some(synth) = synth_result {
                     let kw: Vec<&str> = synth.keywords.iter().map(|(k, _)| k.as_str()).collect();
-                    let kw_str = if kw.is_empty() { "(none)".to_string() } else { kw.join(", ") };
+                    let kw_str = if kw.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        kw.join(", ")
+                    };
                     out.push_str(&format!("\nkeywords: {kw_str}"));
                     if !synth.top_blocks.is_empty() {
                         let preview = &synth.top_blocks[0].2;
@@ -256,7 +283,9 @@ impl KjBuiltin {
     /// `kj synth status` — show index statistics.
     fn synth_status(&self) -> ExecResult {
         let Some(ref idx) = self.semantic_index else {
-            return ExecResult::success("semantic index: not configured\n(set embedding model in models.rhai)".to_string());
+            return ExecResult::success(
+                "semantic index: not configured\n(set embedding model in models.rhai)".to_string(),
+            );
         };
 
         let count = idx.len();
@@ -395,11 +424,17 @@ impl Tool for KjBuiltin {
         let result = self.dispatcher.dispatch(&argv, &caller).await;
 
         match result {
-            KjResult::Ok { message, content_type, ephemeral } => {
+            KjResult::Ok {
+                message,
+                content_type,
+                ephemeral,
+            } => {
                 let mut result = ExecResult::success(message);
                 result.content_type = content_type;
                 if ephemeral {
-                    result.baggage.insert("kaijutsu.ephemeral".into(), "true".into());
+                    result
+                        .baggage
+                        .insert("kaijutsu.ephemeral".into(), "true".into());
                 }
                 result
             }
@@ -413,7 +448,11 @@ impl Tool for KjBuiltin {
 
                 ExecResult::success(msg)
             }
-            KjResult::Latch { command, target, message } => {
+            KjResult::Latch {
+                command,
+                target,
+                message,
+            } => {
                 let original_argv = argv.join(" ");
                 ctx.latch_result(&command, &[&target], &message, |nonce| {
                     format!("kj {} --confirm {}", original_argv, nonce)

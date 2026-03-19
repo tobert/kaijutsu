@@ -303,7 +303,6 @@ pub enum BlockFlow {
         source: OpSource,
     },
 
-
     /// Block collapsed state changed (for thinking blocks).
     CollapsedChanged {
         /// The context ID.
@@ -480,14 +479,13 @@ impl BlockFlow {
             return false;
         }
         // Block kind constraint (only for Inserted events which carry a snapshot)
-        if !filter.block_kinds.is_empty() {
-            if let Some(bk) = self.block_kind() {
-                if !filter.block_kinds.contains(&bk) {
-                    return false;
-                }
-            }
-            // Non-Inserted events don't carry block kind — pass this constraint
+        if !filter.block_kinds.is_empty()
+            && let Some(bk) = self.block_kind()
+            && !filter.block_kinds.contains(&bk)
+        {
+            return false;
         }
+        // Non-Inserted events don't carry block kind — pass this constraint
         true
     }
 }
@@ -711,7 +709,10 @@ impl<T: Clone + Send + 'static> Subscription<T> {
                         // Slow subscriber — oldest messages dropped from the channel buffer.
                         // CRDT data is safe in BlockStore; the caller may want to re-fetch
                         // ops_since() to recover any missed text ops after streaming ends.
-                        tracing::warn!(skipped = n, "subscription overflowed — missed realtime updates");
+                        tracing::warn!(
+                            skipped = n,
+                            "subscription overflowed — missed realtime updates"
+                        );
                         continue;
                     }
                     Err(async_broadcast::RecvError::Closed) => return None,
@@ -727,15 +728,15 @@ impl<T: Clone + Send + 'static> Subscription<T> {
 
                     // Non-blocking first pass: drain any ready messages
                     let mut closed_idx = None;
-                    for i in 0..receivers.len() {
+                    for (i, (topic, rx)) in receivers.iter_mut().enumerate() {
                         loop {
-                            match receivers[i].1.try_recv() {
+                            match rx.try_recv() {
                                 Ok(msg) => return Some(msg),
                                 Err(async_broadcast::TryRecvError::Overflowed(n)) => {
                                     // Slow subscriber — oldest messages dropped.
                                     // CRDT data is safe; caller may re-fetch ops_since() to recover.
                                     tracing::warn!(
-                                        topic = receivers[i].0,
+                                        topic = *topic,
                                         skipped = n,
                                         "multi-subscription overflowed — missed realtime updates"
                                     );
@@ -798,11 +799,16 @@ impl<T: Clone + Send + 'static> Subscription<T> {
                 match rx.try_recv() {
                     Ok(msg) => return Some(msg),
                     Err(async_broadcast::TryRecvError::Overflowed(n)) => {
-                        tracing::warn!(skipped = n, "subscription overflowed on try_recv — missed realtime updates");
+                        tracing::warn!(
+                            skipped = n,
+                            "subscription overflowed on try_recv — missed realtime updates"
+                        );
                         continue;
                     }
-                    Err(async_broadcast::TryRecvError::Empty
-                        | async_broadcast::TryRecvError::Closed) => return None,
+                    Err(
+                        async_broadcast::TryRecvError::Empty
+                        | async_broadcast::TryRecvError::Closed,
+                    ) => return None,
                 }
             },
             Self::Multi { receivers } => {
@@ -812,11 +818,16 @@ impl<T: Clone + Send + 'static> Subscription<T> {
                         match rx.try_recv() {
                             Ok(msg) => return Some(msg),
                             Err(async_broadcast::TryRecvError::Overflowed(n)) => {
-                                tracing::warn!(skipped = n, "multi try_recv overflowed — missed realtime updates");
+                                tracing::warn!(
+                                    skipped = n,
+                                    "multi try_recv overflowed — missed realtime updates"
+                                );
                                 continue;
                             }
-                            Err(async_broadcast::TryRecvError::Empty
-                                | async_broadcast::TryRecvError::Closed) => break,
+                            Err(
+                                async_broadcast::TryRecvError::Empty
+                                | async_broadcast::TryRecvError::Closed,
+                            ) => break,
                         }
                     }
                 }
@@ -989,20 +1000,15 @@ impl HasSubject for ProgressFlow {
 // ============================================================================
 
 /// Action to take in response to an elicitation request.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ElicitationAction {
     /// Accept the elicitation with provided content.
     Accept,
     /// Decline the elicitation.
+    #[default]
     Decline,
     /// Cancel the elicitation.
     Cancel,
-}
-
-impl Default for ElicitationAction {
-    fn default() -> Self {
-        Self::Decline
-    }
 }
 
 impl std::fmt::Display for ElicitationAction {
@@ -1293,8 +1299,7 @@ impl InputDocFlow {
     /// Get the context ID for this event.
     pub fn context_id(&self) -> ContextId {
         match self {
-            Self::TextOps { context_id, .. }
-            | Self::Cleared { context_id, .. } => *context_id,
+            Self::TextOps { context_id, .. } | Self::Cleared { context_id, .. } => *context_id,
         }
     }
 }
@@ -1530,7 +1535,10 @@ mod tests {
         // status_sub should see exactly 1 message (no TextOps noise)
         let msg = status_sub.try_recv().expect("should receive StatusChanged");
         assert_eq!(msg.topic, "block.status");
-        assert!(status_sub.try_recv().is_none(), "should have no more messages");
+        assert!(
+            status_sub.try_recv().is_none(),
+            "should have no more messages"
+        );
     }
 
     /// Subscribe to "block.*", publish one of each variant, assert all received.
@@ -1693,7 +1701,11 @@ mod tests {
         // so instead verify that all known subjects ARE routable.
         let bus: FlowBus<BlockFlow> = FlowBus::new(64);
         for &topic in BlockFlow::TOPICS {
-            assert!(bus.topics.contains_key(topic), "topic {} should exist", topic);
+            assert!(
+                bus.topics.contains_key(topic),
+                "topic {} should exist",
+                topic
+            );
         }
     }
 
@@ -1721,8 +1733,12 @@ mod tests {
 
         // Both subscribers should have the same Arc (pointer equality)
         if let (
-            BlockFlow::Inserted { block: b1, ops: o1, .. },
-            BlockFlow::Inserted { block: b2, ops: o2, .. },
+            BlockFlow::Inserted {
+                block: b1, ops: o1, ..
+            },
+            BlockFlow::Inserted {
+                block: b2, ops: o2, ..
+            },
         ) = (&msg1.payload, &msg2.payload)
         {
             assert!(Arc::ptr_eq(b1, b2), "block Arcs should share allocation");
@@ -1783,7 +1799,9 @@ mod tests {
         let msg = sub.try_recv().expect("should have message");
         assert_eq!(msg.topic, "progress.update");
         match msg.payload {
-            ProgressFlow::Update { server, progress, .. } => {
+            ProgressFlow::Update {
+                server, progress, ..
+            } => {
                 assert_eq!(server, "git");
                 assert!((progress - 25.0).abs() < f64::EPSILON);
             }
@@ -1863,10 +1881,22 @@ mod tests {
 
     #[test]
     fn test_elicitation_action_parsing() {
-        assert_eq!("accept".parse::<ElicitationAction>().unwrap(), ElicitationAction::Accept);
-        assert_eq!("decline".parse::<ElicitationAction>().unwrap(), ElicitationAction::Decline);
-        assert_eq!("cancel".parse::<ElicitationAction>().unwrap(), ElicitationAction::Cancel);
-        assert_eq!("ACCEPT".parse::<ElicitationAction>().unwrap(), ElicitationAction::Accept);
+        assert_eq!(
+            "accept".parse::<ElicitationAction>().unwrap(),
+            ElicitationAction::Accept
+        );
+        assert_eq!(
+            "decline".parse::<ElicitationAction>().unwrap(),
+            ElicitationAction::Decline
+        );
+        assert_eq!(
+            "cancel".parse::<ElicitationAction>().unwrap(),
+            ElicitationAction::Cancel
+        );
+        assert_eq!(
+            "ACCEPT".parse::<ElicitationAction>().unwrap(),
+            ElicitationAction::Accept
+        );
         assert!("invalid".parse::<ElicitationAction>().is_err());
     }
 

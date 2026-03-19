@@ -77,7 +77,6 @@ impl RpcResultChannel {
 #[derive(Resource, Default)]
 pub struct SyncGeneration(pub u64);
 
-
 // ============================================================================
 // Bevy Messages (written by poll systems, read by consumer systems)
 // ============================================================================
@@ -130,10 +129,7 @@ pub enum RpcResultMessage {
     /// Context created on server — spawn an actor to join it.
     ContextCreated(ContextId),
     /// Generic RPC error (for toast/notification).
-    RpcError {
-        operation: String,
-        error: String,
-    },
+    RpcError { operation: String, error: String },
 }
 
 // ============================================================================
@@ -196,11 +192,23 @@ fn poll_bootstrap_results(
     channel: Res<BootstrapChannel>,
     result_channel: Res<RpcResultChannel>,
 ) {
-    let Ok(mut rx) = channel.rx.lock() else { return };
+    let Ok(mut rx) = channel.rx.lock() else {
+        return;
+    };
     while let Ok(result) = rx.try_recv() {
         match result {
-            bootstrap::BootstrapResult::ActorReady { handle, generation, kernel_id, context_id } => {
-                log::info!("Actor ready (generation {}) kernel={} context={:?}", generation, kernel_id, context_id);
+            bootstrap::BootstrapResult::ActorReady {
+                handle,
+                generation,
+                kernel_id,
+                context_id,
+            } => {
+                log::info!(
+                    "Actor ready (generation {}) kernel={} context={:?}",
+                    generation,
+                    kernel_id,
+                    context_id
+                );
 
                 // Eagerly connect: fire whoami to trigger ensure_connected
                 // (SSH → attach_kernel → subscriptions → Connected).
@@ -251,8 +259,12 @@ fn poll_bootstrap_results(
                         // 3. No context specified — fetch context list to populate constellation
                         match h.list_contexts().await {
                             Ok(contexts) => {
-                                log::info!("Bootstrap: list_contexts returned {} contexts", contexts.len());
-                                let _ = tx.send(RpcResultMessage::DriftContextsReceived { contexts });
+                                log::info!(
+                                    "Bootstrap: list_contexts returned {} contexts",
+                                    contexts.len()
+                                );
+                                let _ =
+                                    tx.send(RpcResultMessage::DriftContextsReceived { contexts });
                             }
                             Err(e) => {
                                 log::warn!("Bootstrap: list_contexts failed: {e}");
@@ -342,7 +354,10 @@ fn poll_connection_status(
             }
             Err(broadcast::error::TryRecvError::Closed) => {
                 // Actor exited — remove resource so periodic_reconnect can spawn a new one
-                log::debug!("Actor status channel closed, removing RpcActor resource (gen {})", actor.generation);
+                log::debug!(
+                    "Actor status channel closed, removing RpcActor resource (gen {})",
+                    actor.generation
+                );
                 commands.remove_resource::<RpcActor>();
                 *receiver = None;
                 break;
@@ -352,11 +367,10 @@ fn poll_connection_status(
 }
 
 /// Drain results from async RPC tasks and write them as Bevy messages.
-fn poll_rpc_results(
-    channel: Res<RpcResultChannel>,
-    mut events: MessageWriter<RpcResultMessage>,
-) {
-    let Ok(mut rx) = channel.rx.lock() else { return };
+fn poll_rpc_results(channel: Res<RpcResultChannel>, mut events: MessageWriter<RpcResultMessage>) {
+    let Ok(mut rx) = channel.rx.lock() else {
+        return;
+    };
     while let Ok(result) = rx.try_recv() {
         events.write(result);
     }
@@ -370,7 +384,10 @@ fn update_connection_state(
 ) {
     for ConnectionStatusMessage(status) in status_events.read() {
         match status {
-            kaijutsu_client::ConnectionStatus::Connected { kernel_id, context_id } => {
+            kaijutsu_client::ConnectionStatus::Connected {
+                kernel_id,
+                context_id,
+            } => {
                 state.connected = true;
                 state.reconnect_attempt = 0;
                 state.kernel_id = Some(*kernel_id);

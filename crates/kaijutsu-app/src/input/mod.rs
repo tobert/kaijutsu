@@ -45,13 +45,13 @@ pub mod systems;
 // Re-export core types for ergonomic use.
 // FocusArea is consumed by cell, dock, timeline, conversation, frame_assembly.
 // others are pub API for future external consumers.
-pub use focus::FocusArea;
 #[allow(unused_imports)]
 pub use action::Action;
 #[allow(unused_imports)]
 pub use context::InputContext;
 #[allow(unused_imports)]
 pub use events::{ActionFired, TextInputReceived};
+pub use focus::FocusArea;
 #[allow(unused_imports)]
 pub use map::InputMap;
 
@@ -140,10 +140,7 @@ impl Plugin for InputPlugin {
         // SyncContext phase: derive focus + contexts
         app.add_systems(
             Update,
-            (
-                context::sync_input_context,
-            )
-                .in_set(InputPhase::SyncContext),
+            (context::sync_input_context,).in_set(InputPhase::SyncContext),
         );
 
         // Dispatch phase: raw input → ActionFired/TextInputReceived
@@ -151,7 +148,6 @@ impl Plugin for InputPlugin {
             Update,
             dispatch::dispatch_input.in_set(InputPhase::Dispatch),
         );
-
 
         // Handle phase: consume ActionFired for focus management + domain actions
         app.add_systems(
@@ -174,9 +170,8 @@ impl Plugin for InputPlugin {
                 systems::handle_expand_block.run_if(focus::in_conversation),
                 systems::handle_collapse_toggle.run_if(focus::in_conversation),
                 // Constellation context (gated by Screen state, not FocusArea)
-                systems::handle_constellation_nav.run_if(
-                    in_state(crate::ui::screen::Screen::Constellation)
-                ),
+                systems::handle_constellation_nav
+                    .run_if(in_state(crate::ui::screen::Screen::Constellation)),
                 // Scrolling (multi-context)
                 systems::handle_scroll.run_if(focus::scroll_context_active),
                 // Text input context
@@ -188,8 +183,7 @@ impl Plugin for InputPlugin {
         // Cleanup phase: defensive logic
         app.add_systems(
             Update,
-            systems::cleanup_stale_focused_markers
-                .in_set(InputPhase::Cleanup),
+            systems::cleanup_stale_focused_markers.in_set(InputPhase::Cleanup),
         );
     }
 }

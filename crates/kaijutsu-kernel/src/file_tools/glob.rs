@@ -86,10 +86,10 @@ impl ExecutionEngine for GlobEngine {
             None => std::path::PathBuf::from(base),
         };
 
-        if let Some(ref guard) = self.guard {
-            if let Err(denied) = guard.check_read(ctx, &search_root.to_string_lossy()) {
-                return Ok(denied);
-            }
+        if let Some(ref guard) = self.guard
+            && let Err(denied) = guard.check_read(ctx, &search_root.to_string_lossy())
+        {
+            return Ok(denied);
         }
 
         let adapter = VfsWalkerAdapter(&self.vfs);

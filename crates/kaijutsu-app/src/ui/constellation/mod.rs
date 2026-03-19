@@ -170,7 +170,6 @@ impl ConstellationCamera {
     }
 }
 
-
 /// Constellation of contexts - the spatial navigation model
 #[derive(Resource, Default)]
 pub struct Constellation {
@@ -200,10 +199,10 @@ impl Constellation {
     /// Falls back to the focused node if the block_id can't be parsed.
     fn node_by_block_id_mut(&mut self, block_id: &str) -> Option<&mut ContextNode> {
         let ctx_hex = block_id.split('_').next()?;
-        if let Ok(ctx_id) = ContextId::parse(ctx_hex) {
-            if let Some(idx) = self.nodes.iter().position(|n| n.context_id == ctx_id) {
-                return Some(&mut self.nodes[idx]);
-            }
+        if let Ok(ctx_id) = ContextId::parse(ctx_hex)
+            && let Some(idx) = self.nodes.iter().position(|n| n.context_id == ctx_id)
+        {
+            return Some(&mut self.nodes[idx]);
         }
         // Fallback to focused node
         let focus_id = self.focus_id?;
@@ -217,7 +216,10 @@ impl Constellation {
         // If node already exists (e.g. from DriftState), mark it as joined
         if let Some(node) = self.nodes.iter_mut().find(|n| n.context_id == context_id) {
             if !node.joined {
-                info!("Constellation: Marking existing node {} as joined", context_id);
+                info!(
+                    "Constellation: Marking existing node {} as joined",
+                    context_id
+                );
                 node.joined = true;
             }
             return;
@@ -226,7 +228,7 @@ impl Constellation {
         let node = ContextNode {
             context_id,
             forked_from: None, // Populated by sync_model_info_to_constellation
-            label: None,     // Populated by sync_model_info_to_constellation
+            label: None,       // Populated by sync_model_info_to_constellation
             position: Vec2::ZERO,
             depth: 0.0,
             ring_index: self.nodes.len(),
@@ -266,14 +268,26 @@ impl Constellation {
         let node = ContextNode {
             context_id,
             forked_from: ctx_info.forked_from,
-            label: if ctx_info.label.is_empty() { None } else { Some(ctx_info.label.clone()) },
+            label: if ctx_info.label.is_empty() {
+                None
+            } else {
+                Some(ctx_info.label.clone())
+            },
             position: Vec2::ZERO,
             depth: 0.0,
             ring_index: self.nodes.len(),
             graph_distance: u32::MAX,
             activity: ActivityState::Idle,
-            model: if ctx_info.model.is_empty() { None } else { Some(ctx_info.model.clone()) },
-            provider: if ctx_info.provider.is_empty() { None } else { Some(ctx_info.provider.clone()) },
+            model: if ctx_info.model.is_empty() {
+                None
+            } else {
+                Some(ctx_info.model.clone())
+            },
+            provider: if ctx_info.provider.is_empty() {
+                None
+            } else {
+                Some(ctx_info.provider.clone())
+            },
             joined: false,
             last_activity_time: 0.0,
             fork_kind: ctx_info.fork_kind.clone(),
@@ -293,10 +307,10 @@ impl Constellation {
     pub fn focus(&mut self, context_id: ContextId) {
         if self.node_by_id(context_id).is_some() {
             // Save current focus as alternate
-            if let Some(current) = self.focus_id.take() {
-                if current != context_id {
-                    self.alternate_id = Some(current);
-                }
+            if let Some(current) = self.focus_id.take()
+                && current != context_id
+            {
+                self.alternate_id = Some(current);
             }
             self.focus_id = Some(context_id);
         }
@@ -316,7 +330,6 @@ impl Constellation {
         }
         Some(current)
     }
-
 }
 
 /// A node in the constellation representing a context
@@ -372,7 +385,6 @@ pub enum ActivityState {
     Completed,
 }
 
-
 // ============================================================================
 // SYSTEMS
 // ============================================================================
@@ -387,7 +399,10 @@ fn track_context_events(
     for event in events.read() {
         match event {
             RpcResultMessage::ContextJoined { membership, .. } => {
-                info!("Constellation: Adding node for context '{}' (kernel: {})", membership.context_id, membership.kernel_id);
+                info!(
+                    "Constellation: Adding node for context '{}' (kernel: {})",
+                    membership.context_id, membership.kernel_id
+                );
                 constellation.add_node(membership);
             }
             RpcResultMessage::ContextLeft => {
@@ -414,7 +429,11 @@ fn track_agent_activity(
     let now = time.elapsed_secs_f64();
     for event in events.read() {
         match event {
-            AgentActivityMessage::Started { nick, action, block_id } => {
+            AgentActivityMessage::Started {
+                nick,
+                action,
+                block_id,
+            } => {
                 info!("Agent {} started: {}", nick, action);
                 if let Some(node) = constellation.node_by_block_id_mut(block_id) {
                     node.activity = ActivityState::Streaming;
@@ -429,7 +448,9 @@ fn track_agent_activity(
                     node.last_activity_time = now;
                 }
             }
-            AgentActivityMessage::Completed { block_id, success, .. } => {
+            AgentActivityMessage::Completed {
+                block_id, success, ..
+            } => {
                 if let Some(node) = constellation.node_by_block_id_mut(block_id) {
                     node.activity = if *success {
                         ActivityState::Completed
@@ -663,10 +684,7 @@ fn sync_physics_entities(
                 RigidBody::Static,
                 Collider::circle(100.0), // Updated by update_center_exclusion_radius
                 Transform::from_xyz(0.0, 0.0, 0.0),
-                CollisionLayers::new(
-                    [ConstellationLayer::CenterZone],
-                    [ConstellationLayer::Node],
-                ),
+                CollisionLayers::new([ConstellationLayer::CenterZone], [ConstellationLayer::Node]),
             ))
             .id();
         entity_map.center_body = Some(center);
@@ -756,10 +774,10 @@ fn update_constellation_graph(
     }
 
     // Camera tracks focused node continuously (follows physics motion)
-    if let Some(focus_id) = constellation.focus_id {
-        if let Some(node) = constellation.node_by_id(focus_id) {
-            camera.target_offset = -node.position;
-        }
+    if let Some(focus_id) = constellation.focus_id
+        && let Some(node) = constellation.node_by_id(focus_id)
+    {
+        camera.target_offset = -node.position;
     }
 }
 
@@ -786,10 +804,7 @@ fn apply_radial_gravity(
 
         // Focused node ignores center exclusion zone so it can reach origin
         let desired = if is_focused {
-            CollisionLayers::new(
-                [ConstellationLayer::Node],
-                [ConstellationLayer::Node],
-            )
+            CollisionLayers::new([ConstellationLayer::Node], [ConstellationLayer::Node])
         } else {
             CollisionLayers::new(
                 [ConstellationLayer::Node],
@@ -855,11 +870,11 @@ fn compute_graph_distances(constellation: &Constellation, focus_id: ContextId) -
     // Build undirected adjacency list from fork edges
     let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
     for (i, node) in constellation.nodes.iter().enumerate() {
-        if let Some(parent_id) = node.forked_from {
-            if let Some(&parent_idx) = id_to_idx.get(&parent_id) {
-                adj[i].push(parent_idx);
-                adj[parent_idx].push(i);
-            }
+        if let Some(parent_id) = node.forked_from
+            && let Some(&parent_idx) = id_to_idx.get(&parent_id)
+        {
+            adj[i].push(parent_idx);
+            adj[parent_idx].push(i);
         }
     }
 
@@ -976,7 +991,10 @@ fn interpolate_camera(
 ///
 /// Filters nodes to the correct half-plane (dot product with direction > 0),
 /// then scores by `distance / cos_angle` to prefer closer, more on-axis nodes.
-pub fn find_nearest_in_direction(constellation: &Constellation, direction: Vec2) -> Option<ContextId> {
+pub fn find_nearest_in_direction(
+    constellation: &Constellation,
+    direction: Vec2,
+) -> Option<ContextId> {
     let focus_id = constellation.focus_id?;
     let focus_pos = constellation.node_by_id(focus_id)?.position;
 

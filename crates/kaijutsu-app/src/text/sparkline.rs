@@ -32,7 +32,7 @@ pub struct SparklineColors {
 impl Default for SparklineColors {
     fn default() -> Self {
         Self {
-            line: Color::srgb(0.490, 0.812, 1.00),           // #7dcfff Tokyo Night cyan
+            line: Color::srgb(0.490, 0.812, 1.00), // #7dcfff Tokyo Night cyan
             fill: Some(Color::srgba(0.490, 0.812, 1.00, 0.15)), // cyan at 15% alpha
         }
     }
@@ -60,7 +60,7 @@ pub fn try_parse_sparkline(text: &str) -> Option<SparklineData> {
 
     // Match ```sparkline ... ``` fence
     let inner = trimmed.strip_prefix("```sparkline")?;
-    let inner = inner.trim_start_matches(|c: char| c == ' ' || c == '\t');
+    let inner = inner.trim_start_matches([' ', '\t']);
     let inner = inner.strip_prefix('\n').unwrap_or(inner);
     let inner = inner.strip_suffix("```")?;
     let inner = inner.trim();
@@ -70,7 +70,7 @@ pub fn try_parse_sparkline(text: &str) -> Option<SparklineData> {
     }
 
     let values: Vec<f64> = inner
-        .split(|c: char| c == ',' || c == ' ' || c == '\n' || c == '\t')
+        .split([',', ' ', '\n', '\t'])
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .filter_map(|s| s.parse::<f64>().ok())
@@ -109,10 +109,18 @@ pub fn build_sparkline_paths(
     let draw_height = (height - 2.0 * padding).max(1.0);
 
     let min_val = data.values.iter().copied().fold(f64::INFINITY, f64::min);
-    let max_val = data.values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let max_val = data
+        .values
+        .iter()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max);
     let range = (max_val - min_val).max(f64::EPSILON);
 
-    let x_step = if n > 1 { draw_width / (n - 1) as f64 } else { 0.0 };
+    let x_step = if n > 1 {
+        draw_width / (n - 1) as f64
+    } else {
+        0.0
+    };
 
     let point_at = |i: usize| -> Point {
         let x = padding + i as f64 * x_step;
@@ -172,11 +180,23 @@ pub fn render_sparkline_scene(
     // Fill area under the curve
     if let (Some(fill_path), Some(fill_color)) = (&paths.fill, &colors.fill) {
         let fill_brush = bevy_color_to_brush(*fill_color);
-        scene.fill(Fill::NonZero, vello::kurbo::Affine::IDENTITY, &fill_brush, None, fill_path);
+        scene.fill(
+            Fill::NonZero,
+            vello::kurbo::Affine::IDENTITY,
+            &fill_brush,
+            None,
+            fill_path,
+        );
     }
 
     // Stroke the line on top
-    scene.stroke(&stroke, vello::kurbo::Affine::IDENTITY, &line_brush, None, &paths.line);
+    scene.stroke(
+        &stroke,
+        vello::kurbo::Affine::IDENTITY,
+        &line_brush,
+        None,
+        &paths.line,
+    );
 }
 
 /// Render sparkline paths to a minimal SVG document string.
@@ -242,7 +262,9 @@ fn bevy_color_to_brush(color: Color) -> Brush {
 
 #[cfg(test)]
 fn golden_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests").join("golden")
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("golden")
 }
 
 #[cfg(test)]
@@ -255,8 +277,9 @@ fn assert_golden(name: &str, actual: &str) {
         return;
     }
 
-    let expected = std::fs::read_to_string(&path)
-        .unwrap_or_else(|_| panic!("Golden file not found: {path:?}\nRun with UPDATE_GOLDEN=1 to generate"));
+    let expected = std::fs::read_to_string(&path).unwrap_or_else(|_| {
+        panic!("Golden file not found: {path:?}\nRun with UPDATE_GOLDEN=1 to generate")
+    });
     assert_eq!(
         actual, expected,
         "Golden mismatch for {name}. Run with UPDATE_GOLDEN=1 to update."
@@ -328,7 +351,10 @@ mod tests {
 
     #[test]
     fn build_paths_basic() {
-        let data = SparklineData { values: vec![1.0, 3.0, 7.0, 2.0, 5.0], label: None };
+        let data = SparklineData {
+            values: vec![1.0, 3.0, 7.0, 2.0, 5.0],
+            label: None,
+        };
         let paths = build_sparkline_paths(&data, 200.0, 48.0, 4.0);
         assert!(!paths.line.elements().is_empty());
         assert!(paths.fill.is_some());
@@ -336,7 +362,10 @@ mod tests {
 
     #[test]
     fn build_paths_single_value() {
-        let data = SparklineData { values: vec![42.0], label: None };
+        let data = SparklineData {
+            values: vec![42.0],
+            label: None,
+        };
         let paths = build_sparkline_paths(&data, 200.0, 48.0, 4.0);
         assert!(!paths.line.elements().is_empty());
         assert!(paths.fill.is_none()); // single value has no fill area
@@ -344,14 +373,20 @@ mod tests {
 
     #[test]
     fn build_paths_empty() {
-        let data = SparklineData { values: vec![], label: None };
+        let data = SparklineData {
+            values: vec![],
+            label: None,
+        };
         let paths = build_sparkline_paths(&data, 200.0, 48.0, 4.0);
         assert!(paths.line.elements().is_empty());
     }
 
     #[test]
     fn build_paths_flat_values() {
-        let data = SparklineData { values: vec![5.0, 5.0, 5.0, 5.0], label: None };
+        let data = SparklineData {
+            values: vec![5.0, 5.0, 5.0, 5.0],
+            label: None,
+        };
         let paths = build_sparkline_paths(&data, 200.0, 48.0, 4.0);
         assert!(!paths.line.elements().is_empty());
     }
@@ -360,7 +395,10 @@ mod tests {
 
     #[test]
     fn golden_basic_sparkline() {
-        let data = SparklineData { values: vec![1.0, 3.0, 7.0, 2.0, 5.0], label: None };
+        let data = SparklineData {
+            values: vec![1.0, 3.0, 7.0, 2.0, 5.0],
+            label: None,
+        };
         let paths = build_sparkline_paths(&data, 200.0, 48.0, 4.0);
         let svg = render_to_svg(&paths, 200.0, 48.0, &SparklineColors::default());
         assert_golden("sparkline_basic", &svg);
@@ -368,7 +406,10 @@ mod tests {
 
     #[test]
     fn golden_single_sparkline() {
-        let data = SparklineData { values: vec![42.0], label: None };
+        let data = SparklineData {
+            values: vec![42.0],
+            label: None,
+        };
         let paths = build_sparkline_paths(&data, 200.0, 48.0, 4.0);
         let svg = render_to_svg(&paths, 200.0, 48.0, &SparklineColors::default());
         assert_golden("sparkline_single", &svg);
@@ -376,7 +417,10 @@ mod tests {
 
     #[test]
     fn golden_flat_sparkline() {
-        let data = SparklineData { values: vec![5.0, 5.0, 5.0, 5.0], label: None };
+        let data = SparklineData {
+            values: vec![5.0, 5.0, 5.0, 5.0],
+            label: None,
+        };
         let paths = build_sparkline_paths(&data, 200.0, 48.0, 4.0);
         let svg = render_to_svg(&paths, 200.0, 48.0, &SparklineColors::default());
         assert_golden("sparkline_flat", &svg);

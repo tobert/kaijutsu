@@ -106,7 +106,9 @@ fn extract_servers(scope: &rhai::Scope) -> Vec<McpServerConfig> {
             .and_then(|v| v.clone().try_cast::<rhai::Map>())
             .map(|m| {
                 m.into_iter()
-                    .filter_map(|(k, v)| v.into_string().ok().map(|s| (k.to_string(), s.to_string())))
+                    .filter_map(|(k, v)| {
+                        v.into_string().ok().map(|s| (k.to_string(), s.to_string()))
+                    })
                     .collect()
             })
             .unwrap_or_default();

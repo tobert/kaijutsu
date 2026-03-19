@@ -39,34 +39,39 @@ pub struct ScreenPlugin;
 
 impl Plugin for ScreenPlugin {
     fn build(&self, app: &mut App) {
-        app.init_state::<Screen>()
-            .register_type::<Screen>();
+        app.init_state::<Screen>().register_type::<Screen>();
 
         // ── Constellation ──
-        app.add_systems(OnEnter(Screen::Constellation), (
-            show_constellation_container,
-            hide_conversation_root,
-            hide_cell_text,
-        ));
-        app.add_systems(OnExit(Screen::Constellation), (
-            hide_constellation_container,
-        ));
+        app.add_systems(
+            OnEnter(Screen::Constellation),
+            (
+                show_constellation_container,
+                hide_conversation_root,
+                hide_cell_text,
+            ),
+        );
+        app.add_systems(
+            OnExit(Screen::Constellation),
+            (hide_constellation_container,),
+        );
 
         // ── Conversation ──
-        app.add_systems(OnEnter(Screen::Conversation), (
-            show_conversation_root,
-            hide_constellation_container,
-            show_cell_text,
-            set_focus_conversation,
-        ));
+        app.add_systems(
+            OnEnter(Screen::Conversation),
+            (
+                show_conversation_root,
+                hide_constellation_container,
+                show_cell_text,
+                set_focus_conversation,
+            ),
+        );
 
         // ── Continuous ──
         // Hide newly-added text entities that appear while not in conversation
         // (e.g., block cells created by background sync while constellation is showing).
         app.add_systems(
             Update,
-            hide_new_cell_text_outside_conversation
-                .run_if(not(in_state(Screen::Conversation))),
+            hide_new_cell_text_outside_conversation.run_if(not(in_state(Screen::Conversation))),
         );
     }
 }
@@ -101,10 +106,7 @@ fn hide_constellation_container(
 
 /// Show the conversation root.
 fn show_conversation_root(
-    mut roots: Query<
-        &mut Visibility,
-        (With<ConversationRoot>, Without<ConstellationContainer>),
-    >,
+    mut roots: Query<&mut Visibility, (With<ConversationRoot>, Without<ConstellationContainer>)>,
 ) {
     for mut vis in roots.iter_mut() {
         *vis = Visibility::Inherited;
@@ -113,10 +115,7 @@ fn show_conversation_root(
 
 /// Hide the conversation root.
 fn hide_conversation_root(
-    mut roots: Query<
-        &mut Visibility,
-        (With<ConversationRoot>, Without<ConstellationContainer>),
-    >,
+    mut roots: Query<&mut Visibility, (With<ConversationRoot>, Without<ConstellationContainer>)>,
 ) {
     for mut vis in roots.iter_mut() {
         *vis = Visibility::Hidden;
@@ -153,9 +152,7 @@ fn show_cell_text(
 ///
 /// Input is now an ephemeral overlay summoned with i/:, not a permanent fixture.
 /// Entering conversation view = navigation mode by default.
-fn set_focus_conversation(
-    mut focus: ResMut<crate::input::focus::FocusArea>,
-) {
+fn set_focus_conversation(mut focus: ResMut<crate::input::focus::FocusArea>) {
     *focus = crate::input::focus::FocusArea::Conversation;
 }
 
@@ -165,10 +162,7 @@ fn set_focus_conversation(
 /// fork form is showing. Without this, they'd bleed through until the next
 /// screen transition.
 fn hide_new_cell_text_outside_conversation(
-    mut new_blocks: Query<&mut Visibility, Or<(
-        Added<BlockCell>,
-        Added<RoleGroupBorder>,
-    )>>,
+    mut new_blocks: Query<&mut Visibility, Or<(Added<BlockCell>, Added<RoleGroupBorder>)>>,
 ) {
     for mut vis in new_blocks.iter_mut() {
         *vis = Visibility::Hidden;

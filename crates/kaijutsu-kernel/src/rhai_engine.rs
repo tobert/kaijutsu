@@ -20,11 +20,11 @@
 //! ```
 
 use crate::block_store::SharedBlockStore;
-use kaijutsu_types::DocKind;
 use crate::tools::{ExecResult, ExecutionEngine, ToolContext};
 use async_trait::async_trait;
 use kaijutsu_crdt::{BlockKind, Role, Status};
 use kaijutsu_types::ContextId;
+use kaijutsu_types::DocKind;
 use rhai::{Dynamic, Engine, Scope};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -134,7 +134,9 @@ impl RhaiEngine {
                 "code" => DocKind::Code,
                 "markdown" | "text" => DocKind::Text,
                 // Legacy kinds map to Conversation
-                "output" | "system" | "user_message" | "agent_message" | "conversation" => DocKind::Conversation,
+                "output" | "system" | "user_message" | "agent_message" | "conversation" => {
+                    DocKind::Conversation
+                }
                 _ => DocKind::Code,
             };
 
@@ -181,13 +183,7 @@ impl RhaiEngine {
             // Get block IDs to delete
             let block_ids: Vec<_> = store_set
                 .get(ctx)
-                .map(|cell| {
-                    cell.doc
-                        .blocks_ordered()
-                        .iter()
-                        .map(|b| b.id.clone())
-                        .collect()
-                })
+                .map(|cell| cell.doc.blocks_ordered().iter().map(|b| b.id).collect())
                 .unwrap_or_default();
 
             // Delete all existing blocks
@@ -197,7 +193,15 @@ impl RhaiEngine {
 
             // Insert new content as a single text block
             if !content.is_empty() {
-                match store_set.insert_block(ctx, None, None, Role::User, BlockKind::Text, &content, Status::Done) {
+                match store_set.insert_block(
+                    ctx,
+                    None,
+                    None,
+                    Role::User,
+                    BlockKind::Text,
+                    &content,
+                    Status::Done,
+                ) {
                     Ok(_) => {
                         debug!("Rhai: set_content({}, {} chars)", cell_id, content.len());
                     }
@@ -292,24 +296,59 @@ impl RhaiEngine {
                 let after_ref = after.as_ref();
 
                 let result = match kind.as_str() {
-                    "text" => store_insert.insert_block(ctx, None, after_ref, Role::User, BlockKind::Text, &content, Status::Done),
-                    "thinking" => store_insert.insert_block(ctx, None, after_ref, Role::Model, BlockKind::Thinking, &content, Status::Done),
+                    "text" => store_insert.insert_block(
+                        ctx,
+                        None,
+                        after_ref,
+                        Role::User,
+                        BlockKind::Text,
+                        &content,
+                        Status::Done,
+                    ),
+                    "thinking" => store_insert.insert_block(
+                        ctx,
+                        None,
+                        after_ref,
+                        Role::Model,
+                        BlockKind::Thinking,
+                        &content,
+                        Status::Done,
+                    ),
                     "tool_use" | "tool_call" => {
                         // Parse content as JSON, or use as tool name
-                        let input = serde_json::from_str(&content).unwrap_or(serde_json::Value::Null);
+                        let input =
+                            serde_json::from_str(&content).unwrap_or(serde_json::Value::Null);
                         store_insert.insert_tool_call(ctx, None, after_ref, "unknown", input, None)
                     }
                     "tool_result" => {
                         // For tool_result, we need a tool_call_id. Use after_ref if available.
                         let tool_call_id = after.as_ref();
                         if let Some(tc_id) = tool_call_id {
-                            store_insert.insert_tool_result(ctx, tc_id, after_ref, &content, false, None, None)
+                            store_insert.insert_tool_result(
+                                ctx, tc_id, after_ref, &content, false, None, None,
+                            )
                         } else {
                             // Fallback to text if no tool_call_id
-                            store_insert.insert_block(ctx, None, after_ref, Role::Tool, BlockKind::Text, &content, Status::Done)
+                            store_insert.insert_block(
+                                ctx,
+                                None,
+                                after_ref,
+                                Role::Tool,
+                                BlockKind::Text,
+                                &content,
+                                Status::Done,
+                            )
                         }
                     }
-                    _ => store_insert.insert_block(ctx, None, after_ref, Role::User, BlockKind::Text, &content, Status::Done),
+                    _ => store_insert.insert_block(
+                        ctx,
+                        None,
+                        after_ref,
+                        Role::User,
+                        BlockKind::Text,
+                        &content,
+                        Status::Done,
+                    ),
                 };
 
                 match result {
@@ -505,7 +544,8 @@ impl RhaiEngine {
             let svg = kaijutsu_abc::engrave::engrave_to_svg(&result.value, &options);
 
             // Find last block for ordering
-            let last_block_id = abc_store.get(context_id)
+            let last_block_id = abc_store
+                .get(context_id)
                 .and_then(|doc| doc.doc.blocks_ordered().last().map(|b| b.id));
 
             // Insert ABC parent block
@@ -527,7 +567,9 @@ impl RhaiEngine {
 
             // Set content type on parent
             if let Some(mut entry) = abc_store.get_mut(context_id) {
-                let _ = entry.doc.set_content_type(&abc_id, Some("text/vnd.abc".into()));
+                let _ = entry
+                    .doc
+                    .set_content_type(&abc_id, Some("text/vnd.abc".into()));
             }
 
             // Insert SVG child block (parent = abc_id, after = abc_id)
@@ -542,11 +584,17 @@ impl RhaiEngine {
             ) {
                 Ok(svg_id) => {
                     if let Some(mut entry) = abc_store.get_mut(context_id) {
-                        let _ = entry.doc.set_content_type(&svg_id, Some("image/svg+xml".into()));
+                        let _ = entry
+                            .doc
+                            .set_content_type(&svg_id, Some("image/svg+xml".into()));
                     }
                     let key = svg_id.to_key();
-                    info!("Rhai: abc_block inserted parent {} + SVG child {} ({} bytes)",
-                        abc_id.to_key(), key, svg.len());
+                    info!(
+                        "Rhai: abc_block inserted parent {} + SVG child {} ({} bytes)",
+                        abc_id.to_key(),
+                        key,
+                        svg.len()
+                    );
                     key
                 }
                 Err(e) => {
@@ -562,7 +610,8 @@ impl RhaiEngine {
         // Inserts SVG content as a Text block at the end of the current context, returns block ID.
         engine.register_fn("svg_block", move |content: String| -> String {
             // Find the last block so we append at the end, not the beginning
-            let last_block_id = block_store.get(context_id)
+            let last_block_id = block_store
+                .get(context_id)
                 .and_then(|doc| doc.doc.blocks_ordered().last().map(|b| b.id));
 
             match block_store.insert_block(
@@ -577,7 +626,9 @@ impl RhaiEngine {
                 Ok(id) => {
                     // Tag the block with SVG content type so the app skips heuristic detection
                     if let Some(mut entry) = block_store.get_mut(context_id) {
-                        let _ = entry.doc.set_content_type(&id, Some("image/svg+xml".into()));
+                        let _ = entry
+                            .doc
+                            .set_content_type(&id, Some("image/svg+xml".into()));
                     }
                     let key = id.to_key();
                     info!("Rhai: svg_block inserted {} ({} bytes)", key, content.len());
@@ -599,14 +650,12 @@ impl RhaiEngine {
         });
 
         // log(level: &str, msg: &str)
-        engine.register_fn("log", |level: String, msg: String| {
-            match level.as_str() {
-                "debug" => debug!("[rhai] {}", msg),
-                "info" => info!("[rhai] {}", msg),
-                "warn" => warn!("[rhai] {}", msg),
-                "error" => tracing::error!("[rhai] {}", msg),
-                _ => info!("[rhai] {}", msg),
-            }
+        engine.register_fn("log", |level: String, msg: String| match level.as_str() {
+            "debug" => debug!("[rhai] {}", msg),
+            "info" => info!("[rhai] {}", msg),
+            "warn" => warn!("[rhai] {}", msg),
+            "error" => tracing::error!("[rhai] {}", msg),
+            _ => info!("[rhai] {}", msg),
         });
 
         // is_interrupted() -> bool
@@ -651,7 +700,12 @@ impl RhaiEngine {
         context_id: ContextId,
         extra_registrar: Option<&ExtraRegistrar>,
     ) -> ExecResult {
-        let (engine, collector) = Self::create_engine(block_store.clone(), interrupted, context_id, extra_registrar);
+        let (engine, collector) = Self::create_engine(
+            block_store.clone(),
+            interrupted,
+            context_id,
+            extra_registrar,
+        );
 
         // Take scope out of the map (or create a new one)
         let mut scope = scopes
@@ -748,7 +802,8 @@ impl ExecutionEngine for RhaiEngine {
         // The RPC layer passes raw JSON params (e.g. {"code": "..."}).
         // Extract the "code" field if present, otherwise treat input as raw Rhai.
         let code = match serde_json::from_str::<serde_json::Value>(code) {
-            Ok(v) => v.get("code")
+            Ok(v) => v
+                .get("code")
                 .and_then(|c| c.as_str())
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| code.to_string()),
@@ -763,7 +818,14 @@ impl ExecutionEngine for RhaiEngine {
 
         // Execute in spawn_blocking for async safety
         let result = tokio::task::spawn_blocking(move || {
-            Self::execute_sync(&block_store, &code, interrupted, &scopes, context_id, extra_registrar.as_ref())
+            Self::execute_sync(
+                &block_store,
+                &code,
+                interrupted,
+                &scopes,
+                context_id,
+                extra_registrar.as_ref(),
+            )
         })
         .await?;
 
@@ -799,19 +861,60 @@ impl ExecutionEngine for RhaiEngine {
             "is_interrupted",
             "sleep_ms",
             // Stdlib — math
-            "sin", "cos", "tan", "asin", "acos", "atan", "atan2",
-            "sqrt", "abs_f", "floor", "ceil", "round", "min_f", "max_f",
-            "PI", "TAU", "E",
-            "pow", "exp", "ln", "log2", "log10",
-            "sinh", "cosh", "tanh",
-            "hypot", "lerp", "clamp", "degrees", "radians",
-            "fract", "signum", "rem_euclid", "copysign",
+            "sin",
+            "cos",
+            "tan",
+            "asin",
+            "acos",
+            "atan",
+            "atan2",
+            "sqrt",
+            "abs_f",
+            "floor",
+            "ceil",
+            "round",
+            "min_f",
+            "max_f",
+            "PI",
+            "TAU",
+            "E",
+            "pow",
+            "exp",
+            "ln",
+            "log2",
+            "log10",
+            "sinh",
+            "cosh",
+            "tanh",
+            "hypot",
+            "lerp",
+            "clamp",
+            "degrees",
+            "radians",
+            "fract",
+            "signum",
+            "rem_euclid",
+            "copysign",
             // Stdlib — color
-            "hex", "hexa", "rgb", "rgba", "hsl", "hsla", "oklch", "oklcha",
-            "color_mix", "color_lighten", "color_darken",
-            "color_saturate", "color_desaturate", "hue_shift",
+            "hex",
+            "hexa",
+            "rgb",
+            "rgba",
+            "hsl",
+            "hsla",
+            "oklch",
+            "oklcha",
+            "color_mix",
+            "color_lighten",
+            "color_darken",
+            "color_saturate",
+            "color_desaturate",
+            "hue_shift",
             // Stdlib — format
-            "to_float", "to_int", "xml_escape", "fmt_f",
+            "to_float",
+            "to_int",
+            "xml_escape",
+            "fmt_f",
             // Stdlib — output
             "svg",
         ];
@@ -860,7 +963,10 @@ mod tests {
         let store = shared_block_store(PrincipalId::new());
         let engine = RhaiEngine::new(store);
 
-        let result = engine.execute("40 + 2", &ToolContext::test()).await.unwrap();
+        let result = engine
+            .execute("40 + 2", &ToolContext::test())
+            .await
+            .unwrap();
         assert!(result.success);
         assert_eq!(result.stdout, "42");
     }
@@ -870,7 +976,10 @@ mod tests {
         let store = shared_block_store(PrincipalId::new());
         let engine = RhaiEngine::new(store);
 
-        let result = engine.execute(r#""hello" + " " + "world""#, &ToolContext::test()).await.unwrap();
+        let result = engine
+            .execute(r#""hello" + " " + "world""#, &ToolContext::test())
+            .await
+            .unwrap();
         assert!(result.success);
         assert_eq!(result.stdout, "hello world");
     }
@@ -880,7 +989,10 @@ mod tests {
         let store = shared_block_store(PrincipalId::new());
         let engine = RhaiEngine::new(store.clone());
 
-        let result = engine.execute(r#"create_cell("markdown")"#, &ToolContext::test()).await.unwrap();
+        let result = engine
+            .execute(r#"create_cell("markdown")"#, &ToolContext::test())
+            .await
+            .unwrap();
         assert!(result.success);
         assert!(!result.stdout.is_empty());
 
@@ -983,7 +1095,10 @@ mod tests {
         let store = shared_block_store(PrincipalId::new());
         let engine = RhaiEngine::new(store);
 
-        let result = engine.execute("undefined_function()", &ToolContext::test()).await.unwrap();
+        let result = engine
+            .execute("undefined_function()", &ToolContext::test())
+            .await
+            .unwrap();
         assert!(!result.success);
         assert!(!result.stderr.is_empty());
     }
@@ -1108,10 +1223,18 @@ mod tests {
         let engine = RhaiEngine::new(store);
 
         let schema = engine.schema().expect("schema should be Some");
-        let props = schema["properties"].as_object().expect("properties should be object");
+        let props = schema["properties"]
+            .as_object()
+            .expect("properties should be object");
         assert!(props.contains_key("code"), "schema missing 'code' property");
-        assert!(schema["stdlib"].is_array(), "schema should include stdlib catalog");
-        assert!(schema["context_functions"].is_array(), "schema should include context_functions");
+        assert!(
+            schema["stdlib"].is_array(),
+            "schema should include stdlib catalog"
+        );
+        assert!(
+            schema["context_functions"].is_array(),
+            "schema should include context_functions"
+        );
     }
 
     #[tokio::test]
@@ -1122,13 +1245,12 @@ mod tests {
         let context_id = ctx.context_id;
 
         // Create the document first so insert_block has a target
-        store.create_document(context_id, DocKind::Conversation, None).unwrap();
+        store
+            .create_document(context_id, DocKind::Conversation, None)
+            .unwrap();
 
         let result = engine
-            .execute(
-                r#"svg_block("<svg><circle r='10'/></svg>")"#,
-                &ctx,
-            )
+            .execute(r#"svg_block("<svg><circle r='10'/></svg>")"#, &ctx)
             .await
             .unwrap();
 
@@ -1140,7 +1262,10 @@ mod tests {
         let doc = store.get(context_id).expect("document should exist");
         let blocks = doc.doc.blocks_ordered();
         assert_eq!(blocks.len(), 1, "should have exactly one block");
-        assert!(blocks[0].content.contains("<svg>"), "block content should be SVG");
+        assert!(
+            blocks[0].content.contains("<svg>"),
+            "block content should be SVG"
+        );
     }
 
     #[tokio::test]
@@ -1150,8 +1275,15 @@ mod tests {
         let engine = RhaiEngine::new(store);
 
         let json_input = r#"{"code": "40 + 2"}"#;
-        let result = engine.execute(json_input, &ToolContext::test()).await.unwrap();
-        assert!(result.success, "JSON-wrapped code failed: {}", result.stderr);
+        let result = engine
+            .execute(json_input, &ToolContext::test())
+            .await
+            .unwrap();
+        assert!(
+            result.success,
+            "JSON-wrapped code failed: {}",
+            result.stderr
+        );
         assert_eq!(result.stdout, "42");
     }
 }

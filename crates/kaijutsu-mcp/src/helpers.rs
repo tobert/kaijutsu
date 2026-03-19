@@ -108,7 +108,11 @@ pub fn line_to_byte_offset(content: &str, line: u32) -> Option<usize> {
 }
 
 /// Convert line range to byte range.
-pub fn line_range_to_byte_range(content: &str, start_line: u32, end_line: u32) -> Option<(usize, usize)> {
+pub fn line_range_to_byte_range(
+    content: &str,
+    start_line: u32,
+    end_line: u32,
+) -> Option<(usize, usize)> {
     let start = line_to_byte_offset(content, start_line)?;
     let end = line_to_byte_offset(content, end_line)?;
     Some((start, end))

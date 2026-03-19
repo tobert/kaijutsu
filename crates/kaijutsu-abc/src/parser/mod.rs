@@ -453,9 +453,18 @@ mod tests {
         assert!(!result.has_errors(), "Parse errors: {:?}", result.feedback);
 
         // Should have TWO voices, not one merged voice
-        assert_eq!(result.value.voices.len(), 2, "Expected 2 voices, got {}. Voices: {:?}",
+        assert_eq!(
             result.value.voices.len(),
-            result.value.voices.iter().map(|v| v.id.clone()).collect::<Vec<_>>());
+            2,
+            "Expected 2 voices, got {}. Voices: {:?}",
+            result.value.voices.len(),
+            result
+                .value
+                .voices
+                .iter()
+                .map(|v| v.id.clone())
+                .collect::<Vec<_>>()
+        );
 
         // Voice 1 should have C, D
         let v1_notes: Vec<_> = result.value.voices[0]
@@ -466,7 +475,11 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(v1_notes, vec![NoteName::C, NoteName::D], "Voice 1 notes wrong");
+        assert_eq!(
+            v1_notes,
+            vec![NoteName::C, NoteName::D],
+            "Voice 1 notes wrong"
+        );
 
         // Voice 2 should have E, F
         let v2_notes: Vec<_> = result.value.voices[1]
@@ -477,7 +490,11 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(v2_notes, vec![NoteName::E, NoteName::F], "Voice 2 notes wrong");
+        assert_eq!(
+            v2_notes,
+            vec![NoteName::E, NoteName::F],
+            "Voice 2 notes wrong"
+        );
     }
 
     #[test]

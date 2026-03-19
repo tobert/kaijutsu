@@ -13,11 +13,11 @@
 
 use bevy::prelude::*;
 
-use bevy_vello::prelude::{UiVelloScene, UiVelloText, VelloFont};
 use crate::text::{FontHandles, vello_style};
 use crate::ui::form::field::{ActiveFormField, FormField};
 use crate::ui::form::text::vello_label;
 use crate::ui::theme::Theme;
+use bevy_vello::prelude::{UiVelloScene, UiVelloText, VelloFont};
 
 // ============================================================================
 // SCHEMA TYPES
@@ -36,6 +36,7 @@ pub struct Form {
 }
 
 /// How fields are arranged within the form.
+#[allow(dead_code)]
 pub enum FormLayout {
     /// Single column of fields.
     Column(Vec<FieldDesc>),
@@ -68,10 +69,14 @@ pub struct ButtonDesc {
 
 /// How the form is presented. Determines the outermost wrapping.
 #[derive(Component)]
+#[allow(dead_code)]
 pub enum FormPresentation {
     /// Full-viewport overlay (centered content with max width/height).
     /// `max_width: None` means fill container width (responsive).
-    FullViewport { max_width: Option<f32>, max_height_pct: f32 },
+    FullViewport {
+        max_width: Option<f32>,
+        max_height_pct: f32,
+    },
     /// Modal dialog over a backdrop.
     Modal { max_width: f32, min_height: f32 },
 }
@@ -86,6 +91,7 @@ pub struct FormRoot;
 
 /// Marker on loading placeholder text within a field container.
 #[derive(Component)]
+#[allow(dead_code)]
 pub struct FormLoadingText(pub u8);
 
 /// Marker on the modal dialog panel entity. The `sync_modal_panel_scene` system
@@ -118,22 +124,43 @@ pub fn build_form(
     query: Query<(Entity, &Form, &FormPresentation), Added<Form>>,
 ) {
     for (entity, form, presentation) in query.iter() {
-        info!("build_form: building {:?} with {} fields", entity, form.field_count);
+        info!(
+            "build_form: building {:?} with {} fields",
+            entity, form.field_count
+        );
         // Insert FormRoot + ActiveFormField on the form entity
-        commands.entity(entity).insert((
-            FormRoot,
-            ActiveFormField(form.initial_field),
-        ));
+        commands
+            .entity(entity)
+            .insert((FormRoot, ActiveFormField(form.initial_field)));
 
         match presentation {
             FormPresentation::FullViewport {
                 max_width,
                 max_height_pct,
             } => {
-                build_full_viewport(&mut commands, entity, form, &theme, &font_handles, *max_width, *max_height_pct);
+                build_full_viewport(
+                    &mut commands,
+                    entity,
+                    form,
+                    &theme,
+                    &font_handles,
+                    *max_width,
+                    *max_height_pct,
+                );
             }
-            FormPresentation::Modal { max_width, min_height } => {
-                build_modal(&mut commands, entity, form, &theme, &font_handles, *max_width, *min_height);
+            FormPresentation::Modal {
+                max_width,
+                min_height,
+            } => {
+                build_modal(
+                    &mut commands,
+                    entity,
+                    form,
+                    &theme,
+                    &font_handles,
+                    *max_width,
+                    *min_height,
+                );
             }
         }
     }
@@ -438,11 +465,17 @@ fn spawn_button(
     theme: &Theme,
     font: &Handle<VelloFont>,
 ) {
-    let text_color = if desc.primary { theme.accent } else { theme.fg_dim };
+    let text_color = if desc.primary {
+        theme.accent
+    } else {
+        theme.fg_dim
+    };
 
     // Scene is filled in by sync_form_button_scenes (PostUpdate, after layout)
     parent.spawn((
-        FormButton { primary: desc.primary },
+        FormButton {
+            primary: desc.primary,
+        },
         Node {
             padding: UiRect::axes(Val::Px(20.0), Val::Px(10.0)),
             ..default()

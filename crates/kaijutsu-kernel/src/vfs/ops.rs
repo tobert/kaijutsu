@@ -6,8 +6,8 @@
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 
-use super::types::{DirEntry, FileAttr, SetAttr, StatFs};
 use super::VfsResult;
+use super::types::{DirEntry, FileAttr, SetAttr, StatFs};
 
 /// Core VFS operations trait.
 ///

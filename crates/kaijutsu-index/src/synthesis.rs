@@ -124,10 +124,10 @@ impl SynthesisCache {
     pub fn get(&self, ctx: ContextId, content_hash: Option<&str>) -> Option<SynthesisResult> {
         let map = self.inner.read().unwrap();
         let result = map.get(&ctx)?;
-        if let Some(hash) = content_hash {
-            if result.content_hash != hash {
-                return None;
-            }
+        if let Some(hash) = content_hash
+            && result.content_hash != hash
+        {
+            return None;
         }
         Some(result.clone())
     }
@@ -283,11 +283,14 @@ mod tests {
 
         assert!(cache.get_any(ctx).is_none());
 
-        cache.insert(ctx, SynthesisResult {
-            keywords: vec![("test".into(), 0.9)],
-            top_blocks: vec![],
-            content_hash: "abc123".into(),
-        });
+        cache.insert(
+            ctx,
+            SynthesisResult {
+                keywords: vec![("test".into(), 0.9)],
+                top_blocks: vec![],
+                content_hash: "abc123".into(),
+            },
+        );
 
         let result = cache.get_any(ctx).unwrap();
         assert_eq!(result.keywords.len(), 1);

@@ -31,7 +31,12 @@ impl IndexConfig {
     ///
     /// `model_dir` and `dimensions`/`max_tokens` come from models.rhai.
     /// `kernel_data_dir` is typically `~/.local/share/kaijutsu/kernels/{id}/`.
-    pub fn new(model_dir: PathBuf, dimensions: usize, max_tokens: usize, kernel_data_dir: &Path) -> Self {
+    pub fn new(
+        model_dir: PathBuf,
+        dimensions: usize,
+        max_tokens: usize,
+        kernel_data_dir: &Path,
+    ) -> Self {
         let data_dir = kernel_data_dir.join("index");
         Self {
             model_dir,

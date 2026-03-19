@@ -27,15 +27,9 @@ use super::translate::{
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum EditOp {
     /// Insert text before a line.
-    Insert {
-        line: u32,
-        content: String,
-    },
+    Insert { line: u32, content: String },
     /// Delete lines from start_line to end_line (exclusive).
-    Delete {
-        start_line: u32,
-        end_line: u32,
-    },
+    Delete { start_line: u32, end_line: u32 },
     /// Replace lines with new content, with optional CAS validation.
     Replace {
         start_line: u32,
@@ -163,9 +157,8 @@ pub struct BlockStatusParams {
 
 /// Parse a block ID from string key format (context_hex:agent_hex:seq).
 fn parse_block_id(s: &str) -> Result<BlockId> {
-    BlockId::from_key(s).ok_or_else(|| {
-        EditError::InvalidParams(format!("invalid block_id format: {}", s))
-    })
+    BlockId::from_key(s)
+        .ok_or_else(|| EditError::InvalidParams(format!("invalid block_id format: {}", s)))
 }
 
 /// Parse a role string to Role enum.
@@ -209,10 +202,10 @@ fn find_block(documents: &SharedBlockStore, block_id_str: &str) -> Result<(Conte
     let block_id = parse_block_id(block_id_str)?;
     let context_id = block_id.context_id;
 
-    if let Some(entry) = documents.get(context_id) {
-        if entry.doc.get_block_snapshot(&block_id).is_some() {
-            return Ok((context_id, block_id));
-        }
+    if let Some(entry) = documents.get(context_id)
+        && entry.doc.get_block_snapshot(&block_id).is_some()
+    {
+        return Ok((context_id, block_id));
     }
     Err(EditError::BlockNotFound(block_id_str.to_string()))
 }
@@ -262,7 +255,11 @@ impl BlockCreateEngine {
         })
     }
 
-    fn execute_inner(&self, params: BlockCreateParams, ctx: &ToolContext) -> Result<serde_json::Value> {
+    fn execute_inner(
+        &self,
+        params: BlockCreateParams,
+        ctx: &ToolContext,
+    ) -> Result<serde_json::Value> {
         let role = parse_role(&params.role)?;
         let kind = parse_kind(&params.kind)?;
         let content = params.content.unwrap_or_default();
@@ -278,7 +275,8 @@ impl BlockCreateEngine {
 
         if !self.documents.contains(context_id) {
             return Err(EditError::StoreError(format!(
-                "no document for context {}", context_id.short()
+                "no document for context {}",
+                context_id.short()
             )));
         }
 
@@ -376,7 +374,11 @@ impl BlockAppendEngine {
         })
     }
 
-    fn execute_inner(&self, params: BlockAppendParams, ctx: &ToolContext) -> Result<serde_json::Value> {
+    fn execute_inner(
+        &self,
+        params: BlockAppendParams,
+        ctx: &ToolContext,
+    ) -> Result<serde_json::Value> {
         let (context_id, block_id) = find_block(&self.documents, &params.block_id)?;
 
         self.documents
@@ -495,18 +497,35 @@ impl BlockEditEngine {
         })
     }
 
-    fn execute_inner(&self, params: BlockEditParams, ctx: &ToolContext) -> Result<serde_json::Value> {
+    fn execute_inner(
+        &self,
+        params: BlockEditParams,
+        ctx: &ToolContext,
+    ) -> Result<serde_json::Value> {
         let (context_id, block_id) = find_block(&self.documents, &params.block_id)?;
 
         // Pre-validate CAS checks before applying any operations.
         // This prevents partial application when a later CAS check would fail.
         {
-            let content = self.documents.get(context_id)
-                .and_then(|entry| entry.doc.get_block_snapshot(&block_id).map(|s| s.content.clone()))
+            let content = self
+                .documents
+                .get(context_id)
+                .and_then(|entry| {
+                    entry
+                        .doc
+                        .get_block_snapshot(&block_id)
+                        .map(|s| s.content.clone())
+                })
                 .unwrap_or_default();
 
             for (idx, op) in params.operations.iter().enumerate() {
-                if let EditOp::Replace { start_line, end_line, expected_text: Some(expected), .. } = op {
+                if let EditOp::Replace {
+                    start_line,
+                    end_line,
+                    expected_text: Some(expected),
+                    ..
+                } = op
+                {
                     validate_expected_text(&content, *start_line, *end_line, expected)
                         .map_err(|e| e.in_batch(idx))?;
                 }
@@ -530,7 +549,13 @@ impl BlockEditEngine {
         }))
     }
 
-    fn apply_op(&self, context_id: ContextId, block_id: &BlockId, op: EditOp, ctx: &ToolContext) -> Result<()> {
+    fn apply_op(
+        &self,
+        context_id: ContextId,
+        block_id: &BlockId,
+        op: EditOp,
+        ctx: &ToolContext,
+    ) -> Result<()> {
         // Get current content
         let content = {
             let entry = self
@@ -547,7 +572,10 @@ impl BlockEditEngine {
         };
 
         match op {
-            EditOp::Insert { line, content: text } => {
+            EditOp::Insert {
+                line,
+                content: text,
+            } => {
                 let pos = line_to_byte_offset(&content, line)?;
                 let text_with_newline = if text.ends_with('\n') || content.is_empty() {
                     text
@@ -555,7 +583,14 @@ impl BlockEditEngine {
                     format!("{}\n", text)
                 };
                 self.documents
-                    .edit_text_as(context_id, block_id, pos, &text_with_newline, 0, Some(ctx.principal_id))
+                    .edit_text_as(
+                        context_id,
+                        block_id,
+                        pos,
+                        &text_with_newline,
+                        0,
+                        Some(ctx.principal_id),
+                    )
                     .map_err(|e| EditError::StoreError(e.to_string()))?;
             }
             EditOp::Delete {
@@ -565,7 +600,14 @@ impl BlockEditEngine {
                 let (start, end) = line_range_to_byte_range(&content, start_line, end_line)?;
                 if start < end {
                     self.documents
-                        .edit_text_as(context_id, block_id, start, "", end - start, Some(ctx.principal_id))
+                        .edit_text_as(
+                            context_id,
+                            block_id,
+                            start,
+                            "",
+                            end - start,
+                            Some(ctx.principal_id),
+                        )
                         .map_err(|e| EditError::StoreError(e.to_string()))?;
                 }
             }
@@ -587,7 +629,14 @@ impl BlockEditEngine {
                     format!("{}\n", text)
                 };
                 self.documents
-                    .edit_text_as(context_id, block_id, start, &text_with_newline, end - start, Some(ctx.principal_id))
+                    .edit_text_as(
+                        context_id,
+                        block_id,
+                        start,
+                        &text_with_newline,
+                        end - start,
+                        Some(ctx.principal_id),
+                    )
                     .map_err(|e| EditError::StoreError(e.to_string()))?;
             }
         }
@@ -673,13 +722,24 @@ impl BlockSpliceEngine {
         })
     }
 
-    fn execute_inner(&self, params: BlockSpliceParams, ctx: &ToolContext) -> Result<serde_json::Value> {
+    fn execute_inner(
+        &self,
+        params: BlockSpliceParams,
+        ctx: &ToolContext,
+    ) -> Result<serde_json::Value> {
         let (context_id, block_id) = find_block(&self.documents, &params.block_id)?;
 
         let insert = params.insert.unwrap_or_default();
 
         self.documents
-            .edit_text_as(context_id, &block_id, params.offset, &insert, params.delete_count, Some(ctx.principal_id))
+            .edit_text_as(
+                context_id,
+                &block_id,
+                params.offset,
+                &insert,
+                params.delete_count,
+                Some(ctx.principal_id),
+            )
             .map_err(|e| EditError::StoreError(e.to_string()))?;
 
         let version = self
@@ -1045,7 +1105,10 @@ impl BlockListEngine {
     fn execute_inner(&self, params: BlockListParams) -> Result<serde_json::Value> {
         let kind_filter = params.kind.as_ref().and_then(|k| parse_kind(k).ok());
         let status_filter = params.status.as_ref().and_then(|s| parse_status(s).ok());
-        let parent_id_filter = params.parent_id.as_ref().and_then(|s| parse_block_id(s).ok());
+        let parent_id_filter = params
+            .parent_id
+            .as_ref()
+            .and_then(|s| parse_block_id(s).ok());
 
         let mut blocks = Vec::new();
 
@@ -1054,25 +1117,29 @@ impl BlockListEngine {
         for context_id in context_ids {
             if let Some(entry) = self.documents.get(context_id) {
                 let doc_blocks = entry.doc.blocks_ordered();
-                tracing::debug!("block_list: document {} has {} blocks", context_id.to_hex(), doc_blocks.len());
+                tracing::debug!(
+                    "block_list: document {} has {} blocks",
+                    context_id.to_hex(),
+                    doc_blocks.len()
+                );
                 for snapshot in doc_blocks {
                     // Apply filters
-                    if let Some(ref parent_id) = parent_id_filter {
-                        if snapshot.parent_id.as_ref() != Some(parent_id) {
-                            continue;
-                        }
+                    if let Some(ref parent_id) = parent_id_filter
+                        && snapshot.parent_id.as_ref() != Some(parent_id)
+                    {
+                        continue;
                     }
 
-                    if let Some(kind) = kind_filter {
-                        if snapshot.kind != kind {
-                            continue;
-                        }
+                    if let Some(kind) = kind_filter
+                        && snapshot.kind != kind
+                    {
+                        continue;
                     }
 
-                    if let Some(status) = status_filter {
-                        if snapshot.status != status {
-                            continue;
-                        }
+                    if let Some(status) = status_filter
+                        && snapshot.status != status
+                    {
+                        continue;
                     }
 
                     // TODO: path_prefix filter for file blocks
@@ -1319,9 +1386,13 @@ impl KernelSearchEngine {
         })
     }
 
-    fn execute_inner(&self, params: KernelSearchParams, ctx: &ToolContext) -> Result<serde_json::Value> {
-        let regex = Regex::new(&params.query)
-            .map_err(|e| EditError::InvalidRegex(e.to_string()))?;
+    fn execute_inner(
+        &self,
+        params: KernelSearchParams,
+        ctx: &ToolContext,
+    ) -> Result<serde_json::Value> {
+        let regex =
+            Regex::new(&params.query).map_err(|e| EditError::InvalidRegex(e.to_string()))?;
 
         let kind_filter = params.kind.as_ref().map(|k| parse_kind(k)).transpose()?;
         let role_filter = params.role.as_ref().map(|r| parse_role(r)).transpose()?;
@@ -1349,15 +1420,15 @@ impl KernelSearchEngine {
 
             for snapshot in snapshots {
                 // Apply filters
-                if let Some(ref kind) = kind_filter {
-                    if snapshot.kind != *kind {
-                        continue;
-                    }
+                if let Some(ref kind) = kind_filter
+                    && snapshot.kind != *kind
+                {
+                    continue;
                 }
-                if let Some(ref role) = role_filter {
-                    if snapshot.role != *role {
-                        continue;
-                    }
+                if let Some(ref role) = role_filter
+                    && snapshot.role != *role
+                {
+                    continue;
                 }
 
                 // Search content
@@ -1367,7 +1438,7 @@ impl KernelSearchEngine {
                         // Collect context
                         let before: Vec<String> = (0..params.context_lines as usize)
                             .filter_map(|i| {
-                                if line_idx >= i + 1 {
+                                if line_idx > i {
                                     Some(lines[line_idx - i - 1].to_string())
                                 } else {
                                     None
@@ -1379,9 +1450,7 @@ impl KernelSearchEngine {
                             .collect();
 
                         let after: Vec<String> = (1..=params.context_lines as usize)
-                            .filter_map(|i| {
-                                lines.get(line_idx + i).map(|s| s.to_string())
-                            })
+                            .filter_map(|i| lines.get(line_idx + i).map(|s| s.to_string()))
                             .collect();
 
                         matches.push(KernelSearchMatch {
@@ -1458,7 +1527,9 @@ mod tests {
     fn setup_test_store() -> (SharedBlockStore, ContextId, ToolContext) {
         let store = shared_block_store(PrincipalId::new());
         let ctx = test_context_id();
-        store.create_document(ctx, DocumentKind::Code, Some("rust".into())).unwrap();
+        store
+            .create_document(ctx, DocumentKind::Code, Some("rust".into()))
+            .unwrap();
         let tool_ctx = ToolContext {
             context_id: ctx,
             ..ToolContext::test()
@@ -1485,10 +1556,23 @@ mod tests {
         let (store, ctx, tool_ctx) = setup_test_store();
 
         // Create a block first
-        let block_id = store.insert_block(ctx, None, None, Role::User, BlockKind::Text, "hello", Status::Done).unwrap();
+        let block_id = store
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "hello",
+                Status::Done,
+            )
+            .unwrap();
 
         let engine = BlockAppendEngine::new(store.clone());
-        let params = format!(r#"{{"block_id": "{}", "text": " world"}}"#, block_id.to_key());
+        let params = format!(
+            r#"{{"block_id": "{}", "text": " world"}}"#,
+            block_id.to_key()
+        );
         let result = engine.execute(&params, &tool_ctx).await.unwrap();
 
         assert!(result.success, "append failed: {}", result.stderr);
@@ -1502,7 +1586,17 @@ mod tests {
     async fn test_block_edit_insert() {
         let (store, ctx, tool_ctx) = setup_test_store();
 
-        let block_id = store.insert_block(ctx, None, None, Role::User, BlockKind::Text, "line1\nline3\n", Status::Done).unwrap();
+        let block_id = store
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "line1\nline3\n",
+                Status::Done,
+            )
+            .unwrap();
 
         let engine = BlockEditEngine::new(store.clone());
         let params = format!(
@@ -1523,7 +1617,17 @@ mod tests {
     async fn test_block_edit_replace_with_cas() {
         let (store, ctx, tool_ctx) = setup_test_store();
 
-        let block_id = store.insert_block(ctx, None, None, Role::User, BlockKind::Text, "hello\nworld\n", Status::Done).unwrap();
+        let block_id = store
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "hello\nworld\n",
+                Status::Done,
+            )
+            .unwrap();
 
         let engine = BlockEditEngine::new(store.clone());
 
@@ -1549,7 +1653,17 @@ mod tests {
     async fn test_block_read() {
         let (store, ctx, _tool_ctx) = setup_test_store();
 
-        let block_id = store.insert_block(ctx, None, None, Role::User, BlockKind::Text, "fn main() {\n    println!(\"Hi\");\n}", Status::Done).unwrap();
+        let block_id = store
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "fn main() {\n    println!(\"Hi\");\n}",
+                Status::Done,
+            )
+            .unwrap();
 
         let engine = BlockReadEngine::new(store.clone());
         let params = format!(r#"{{"block_id": "{}"}}"#, block_id.to_key());
@@ -1565,10 +1679,23 @@ mod tests {
     async fn test_block_search() {
         let (store, ctx, _tool_ctx) = setup_test_store();
 
-        let block_id = store.insert_block(ctx, None, None, Role::User, BlockKind::Text, "apple\nbanana\napricot\ncherry\n", Status::Done).unwrap();
+        let block_id = store
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "apple\nbanana\napricot\ncherry\n",
+                Status::Done,
+            )
+            .unwrap();
 
         let engine = BlockSearchEngine::new(store.clone());
-        let params = format!(r#"{{"block_id": "{}", "query": "ap", "context_lines": 1}}"#, block_id.to_key());
+        let params = format!(
+            r#"{{"block_id": "{}", "query": "ap", "context_lines": 1}}"#,
+            block_id.to_key()
+        );
         let result = engine.execute(&params, &ToolContext::test()).await.unwrap();
 
         assert!(result.success, "search failed: {}", result.stderr);
@@ -1581,8 +1708,28 @@ mod tests {
     async fn test_block_list() {
         let (store, ctx, _tool_ctx) = setup_test_store();
 
-        store.insert_block(ctx, None, None, Role::User, BlockKind::Text, "user message", Status::Done).unwrap();
-        store.insert_block(ctx, None, None, Role::Model, BlockKind::Thinking, "thinking...", Status::Done).unwrap();
+        store
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "user message",
+                Status::Done,
+            )
+            .unwrap();
+        store
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::Model,
+                BlockKind::Thinking,
+                "thinking...",
+                Status::Done,
+            )
+            .unwrap();
 
         let engine = BlockListEngine::new(store.clone());
         let params = r#"{}"#;
@@ -1597,8 +1744,28 @@ mod tests {
     async fn test_block_list_with_filter() {
         let (store, ctx, _tool_ctx) = setup_test_store();
 
-        store.insert_block(ctx, None, None, Role::User, BlockKind::Text, "user message", Status::Done).unwrap();
-        store.insert_block(ctx, None, None, Role::Model, BlockKind::Thinking, "thinking...", Status::Done).unwrap();
+        store
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "user message",
+                Status::Done,
+            )
+            .unwrap();
+        store
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::Model,
+                BlockKind::Thinking,
+                "thinking...",
+                Status::Done,
+            )
+            .unwrap();
 
         let engine = BlockListEngine::new(store.clone());
         let params = r#"{"kind": "thinking"}"#;
@@ -1613,10 +1780,23 @@ mod tests {
     async fn test_block_status() {
         let (store, ctx, _tool_ctx) = setup_test_store();
 
-        let block_id = store.insert_block(ctx, None, None, Role::Model, BlockKind::ToolCall, "{}", Status::Done).unwrap();
+        let block_id = store
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::Model,
+                BlockKind::ToolCall,
+                "{}",
+                Status::Done,
+            )
+            .unwrap();
 
         let engine = BlockStatusEngine::new(store.clone());
-        let params = format!(r#"{{"block_id": "{}", "status": "running"}}"#, block_id.to_key());
+        let params = format!(
+            r#"{{"block_id": "{}", "status": "running"}}"#,
+            block_id.to_key()
+        );
         let result = engine.execute(&params, &ToolContext::test()).await.unwrap();
 
         assert!(result.success, "status update failed: {}", result.stderr);
@@ -1633,11 +1813,43 @@ mod tests {
 
         // Create blocks in different documents
         let ctx2 = ContextId::new();
-        store.create_document(ctx2, DocumentKind::Code, Some("rust".into())).unwrap();
+        store
+            .create_document(ctx2, DocumentKind::Code, Some("rust".into()))
+            .unwrap();
 
-        store.insert_block(ctx, None, None, Role::User, BlockKind::Text, "hello world\nfoo bar\nbaz", Status::Done).unwrap();
-        store.insert_block(ctx, None, None, Role::Model, BlockKind::Text, "hello rust\nfoo qux", Status::Done).unwrap();
-        store.insert_block(ctx2, None, None, Role::User, BlockKind::Text, "hello python\nbar baz", Status::Done).unwrap();
+        store
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "hello world\nfoo bar\nbaz",
+                Status::Done,
+            )
+            .unwrap();
+        store
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::Model,
+                BlockKind::Text,
+                "hello rust\nfoo qux",
+                Status::Done,
+            )
+            .unwrap();
+        store
+            .insert_block(
+                ctx2,
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "hello python\nbar baz",
+                Status::Done,
+            )
+            .unwrap();
 
         let engine = KernelSearchEngine::new(store.clone());
 
@@ -1646,13 +1858,19 @@ mod tests {
         let result = engine.execute(params, &tool_ctx).await.unwrap();
         assert!(result.success, "search failed: {}", result.stderr);
         let response: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
-        assert_eq!(response["total"], 2, "should find 2 matches in current context");
+        assert_eq!(
+            response["total"], 2,
+            "should find 2 matches in current context"
+        );
 
         // Search across all documents with all_documents flag
         let params = r#"{"query": "hello", "all_documents": true}"#;
         let result = engine.execute(params, &tool_ctx).await.unwrap();
         let response: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
-        assert_eq!(response["total"], 3, "should find 3 matches across all docs");
+        assert_eq!(
+            response["total"], 3,
+            "should find 3 matches across all docs"
+        );
 
         // Search with document filter (using hex ContextId)
         let params = format!(r#"{{"query": "hello", "document_id": "{}"}}"#, ctx.to_hex());
@@ -1672,14 +1890,25 @@ mod tests {
         let response: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
         let matches = response["matches"].as_array().unwrap();
         assert_eq!(matches.len(), 1);
-        assert!(!matches[0]["before"].as_array().unwrap().is_empty() || !matches[0]["after"].as_array().unwrap().is_empty());
+        assert!(
+            !matches[0]["before"].as_array().unwrap().is_empty()
+                || !matches[0]["after"].as_array().unwrap().is_empty()
+        );
     }
 
     #[tokio::test]
     async fn test_batch_edit_cas_pre_validation_rejects_whole_batch() {
         let (store, ctx, tool_ctx) = setup_test_store();
         let block_id = store
-            .insert_block(ctx, None, None, Role::User, BlockKind::Text, "aaa\nbbb\nccc\n", Status::Done)
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "aaa\nbbb\nccc\n",
+                Status::Done,
+            )
             .unwrap();
         let engine = BlockEditEngine::new(store.clone());
 
@@ -1696,14 +1925,24 @@ mod tests {
             block_id.to_key()
         );
         let result = engine.execute(&params, &tool_ctx).await.unwrap();
-        assert!(!result.success, "batch should fail due to CAS mismatch in op[1]");
-        assert!(result.stderr.contains("content mismatch"), "error: {}", result.stderr);
+        assert!(
+            !result.success,
+            "batch should fail due to CAS mismatch in op[1]"
+        );
+        assert!(
+            result.stderr.contains("content mismatch"),
+            "error: {}",
+            result.stderr
+        );
 
         // Verify no operations were applied — content unchanged
         {
             let entry = store.get(ctx).unwrap();
             let snapshot = entry.doc.get_block_snapshot(&block_id).unwrap();
-            assert_eq!(snapshot.content, "aaa\nbbb\nccc\n", "content must be unchanged after rejected batch");
+            assert_eq!(
+                snapshot.content, "aaa\nbbb\nccc\n",
+                "content must be unchanged after rejected batch"
+            );
         } // drop DashMap Ref before next execute (avoids read/write deadlock)
 
         // Now submit a fully valid batch — both ops should apply
@@ -1718,12 +1957,22 @@ mod tests {
             block_id.to_key()
         );
         let result = engine.execute(&params, &tool_ctx).await.unwrap();
-        assert!(result.success, "valid batch should succeed: {}", result.stderr);
+        assert!(
+            result.success,
+            "valid batch should succeed: {}",
+            result.stderr
+        );
 
         let entry = store.get(ctx).unwrap();
         let snapshot = entry.doc.get_block_snapshot(&block_id).unwrap();
         // After replacing line 0 with "AAA" and line 1 with "BBB":
-        assert!(snapshot.content.contains("AAA"), "first replace should be applied");
-        assert!(snapshot.content.contains("BBB"), "second replace should be applied");
+        assert!(
+            snapshot.content.contains("AAA"),
+            "first replace should be applied"
+        );
+        assert!(
+            snapshot.content.contains("BBB"),
+            "second replace should be applied"
+        );
     }
 }

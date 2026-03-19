@@ -7,8 +7,8 @@
 
 use bevy::prelude::*;
 
-use crate::input::FocusArea;
 use crate::cell::{ContextSwitchRequested, DocumentCache};
+use crate::input::FocusArea;
 
 /// Handle conversation quick-switch shortcuts (Ctrl+1/2/3).
 pub fn handle_conversation_shortcuts(

@@ -4,7 +4,9 @@ use kaijutsu_types::{ConsentMode, ContextId, EdgeKind};
 
 use crate::kernel_db::{ContextEdgeRow, ContextRow, ContextShellRow};
 
-use super::format::{format_context_info, format_context_table, format_context_tree, format_fork_lineage};
+use super::format::{
+    format_context_info, format_context_table, format_context_tree, format_fork_lineage,
+};
 use super::parse::{extract_named_arg, parse_model_spec, parse_tool_filter_spec};
 use super::refs::{parse_context_ref, resolve_context_ref};
 use super::{KjCaller, KjDispatcher, KjResult};
@@ -27,7 +29,9 @@ impl KjDispatcher {
             "archive" => self.context_archive(argv, caller).await,
             "remove" | "rm" => self.context_remove(argv, caller).await,
             "retag" => self.context_retag(argv, caller).await,
-            "help" | "--help" | "-h" => KjResult::ok_ephemeral(self.context_help(), "text/markdown"),
+            "help" | "--help" | "-h" => {
+                KjResult::ok_ephemeral(self.context_help(), "text/markdown")
+            }
             other => KjResult::Err(format!(
                 "kj context: unknown subcommand '{}'\n\n{}",
                 other,
@@ -71,7 +75,7 @@ impl KjDispatcher {
 
         let row = match db.get_context(target_id) {
             Ok(Some(r)) => r,
-            Ok(None) => return KjResult::Err(format!("kj context info: not found")),
+            Ok(None) => return KjResult::Err("kj context info: not found".to_string()),
             Err(e) => return KjResult::Err(format!("kj context info: {e}")),
         };
 
@@ -92,12 +96,7 @@ impl KjDispatcher {
             .unwrap_or(0);
 
         let is_current = target_id == caller.context_id;
-        let mut info = format_context_info(
-            &row,
-            children_count,
-            drift_from + drift_to,
-            is_current,
-        );
+        let mut info = format_context_info(&row, children_count, drift_from + drift_to, is_current);
 
         // Shell config
         if let Ok(Some(shell)) = db.get_context_shell(target_id) {
@@ -111,28 +110,29 @@ impl KjDispatcher {
         }
 
         // Env vars
-        if let Ok(vars) = db.get_context_env(target_id) {
-            if !vars.is_empty() {
-                info.push_str("\nEnv:");
-                for v in &vars {
-                    info.push_str(&format!("\n  {}={}", v.key, v.value));
-                }
+        if let Ok(vars) = db.get_context_env(target_id)
+            && !vars.is_empty()
+        {
+            info.push_str("\nEnv:");
+            for v in &vars {
+                info.push_str(&format!("\n  {}={}", v.key, v.value));
             }
         }
 
         // Workspace paths
-        if let Ok(Some(paths)) = db.context_workspace_paths(target_id) {
-            if !paths.is_empty() {
-                // Get workspace label
-                let ws_label = row.workspace_id
-                    .and_then(|wsid| db.get_workspace(wsid).ok().flatten())
-                    .map(|ws| ws.label)
-                    .unwrap_or_else(|| "?".into());
-                info.push_str(&format!("\nWorkspace: {ws_label}"));
-                for p in &paths {
-                    let ro = if p.read_only { " (ro)" } else { "" };
-                    info.push_str(&format!("\n  {}{ro}", p.path));
-                }
+        if let Ok(Some(paths)) = db.context_workspace_paths(target_id)
+            && !paths.is_empty()
+        {
+            // Get workspace label
+            let ws_label = row
+                .workspace_id
+                .and_then(|wsid| db.get_workspace(wsid).ok().flatten())
+                .map(|ws| ws.label)
+                .unwrap_or_else(|| "?".into());
+            info.push_str(&format!("\nWorkspace: {ws_label}"));
+            for p in &paths {
+                let ro = if p.read_only { " (ro)" } else { "" };
+                info.push_str(&format!("\n  {}{ro}", p.path));
             }
         }
 
@@ -142,7 +142,11 @@ impl KjDispatcher {
     async fn context_switch(&self, argv: &[String], caller: &KjCaller) -> KjResult {
         let query = match argv.get(1) {
             Some(q) => q.as_str(),
-            None => return KjResult::Err("kj context switch: requires a context reference".to_string()),
+            None => {
+                return KjResult::Err(
+                    "kj context switch: requires a context reference".to_string(),
+                );
+            }
         };
 
         let ctx_ref = parse_context_ref(query);
@@ -186,7 +190,7 @@ impl KjDispatcher {
                 None => {
                     return KjResult::Err(
                         "kj context create: --parent requires a context reference".to_string(),
-                    )
+                    );
                 }
             };
             let db = self.kernel_db().lock();
@@ -206,10 +210,11 @@ impl KjDispatcher {
         // Write-through: KernelDb first, then DriftRouter
         {
             let db = self.kernel_db().lock();
-            let default_ws = match db.get_or_create_default_workspace(kernel_id, caller.principal_id) {
-                Ok(id) => id,
-                Err(e) => return KjResult::Err(format!("kj context create: {e}")),
-            };
+            let default_ws =
+                match db.get_or_create_default_workspace(kernel_id, caller.principal_id) {
+                    Ok(id) => id,
+                    Err(e) => return KjResult::Err(format!("kj context create: {e}")),
+                };
 
             let row = ContextRow {
                 context_id: new_id,
@@ -262,7 +267,8 @@ impl KjDispatcher {
         let kernel_id = self.kernel_id();
 
         // Parse all args upfront (no locks needed)
-        let target_arg = argv.get(1)
+        let target_arg = argv
+            .get(1)
             .filter(|a| !a.starts_with('-'))
             .map(|s| s.as_str());
         let model_spec = extract_named_arg(argv, &["--model", "-m"]);
@@ -279,10 +285,7 @@ impl KjDispatcher {
                 if let Some(ref p) = provider {
                     let registry = self.kernel().llm().read().await;
                     if registry.get(p).is_none() {
-                        return KjResult::Err(format!(
-                            "kj context set: unknown provider '{}'",
-                            p,
-                        ));
+                        return KjResult::Err(format!("kj context set: unknown provider '{}'", p,));
                     }
                 }
                 Some((provider, model))
@@ -294,10 +297,11 @@ impl KjDispatcher {
         let (target_id, changes, tool_filter_for_drift, model_for_drift) = {
             let db = self.kernel_db().lock();
 
-            let target_id = match super::refs::resolve_context_arg(target_arg, caller, &db, kernel_id) {
-                Ok(id) => id,
-                Err(e) => return KjResult::Err(format!("kj context set: {e}")),
-            };
+            let target_id =
+                match super::refs::resolve_context_arg(target_arg, caller, &db, kernel_id) {
+                    Ok(id) => id,
+                    Err(e) => return KjResult::Err(format!("kj context set: {e}")),
+                };
 
             let mut changes = Vec::new();
             let mut tool_filter_for_drift = None;
@@ -325,12 +329,15 @@ impl KjDispatcher {
 
             // Parse consent mode
             let consent_mode = match consent_spec {
-                Some(ref spec) => {
-                    match spec.parse::<ConsentMode>() {
-                        Ok(cm) => Some(cm),
-                        Err(_) => return KjResult::Err(format!("kj context set: invalid consent mode '{}' — use 'collaborative' or 'autonomous'", spec)),
+                Some(ref spec) => match spec.parse::<ConsentMode>() {
+                    Ok(cm) => Some(cm),
+                    Err(_) => {
+                        return KjResult::Err(format!(
+                            "kj context set: invalid consent mode '{}' — use 'collaborative' or 'autonomous'",
+                            spec
+                        ));
                     }
-                }
+                },
                 None => None,
             };
 
@@ -338,25 +345,41 @@ impl KjDispatcher {
             if system_prompt.is_some() || tool_filter.is_some() || consent_mode.is_some() {
                 let current = match db.get_context(target_id) {
                     Ok(Some(row)) => row,
-                    Ok(None) => return KjResult::Err("kj context set: context not found".to_string()),
+                    Ok(None) => {
+                        return KjResult::Err("kj context set: context not found".to_string());
+                    }
                     Err(e) => return KjResult::Err(format!("kj context set: {e}")),
                 };
 
-                let new_prompt = system_prompt.as_deref().or(current.system_prompt.as_deref());
-                let new_filter = if tool_filter.is_some() { &tool_filter } else { &current.tool_filter };
+                let new_prompt = system_prompt
+                    .as_deref()
+                    .or(current.system_prompt.as_deref());
+                let new_filter = if tool_filter.is_some() {
+                    &tool_filter
+                } else {
+                    &current.tool_filter
+                };
                 let new_consent = consent_mode.unwrap_or(current.consent_mode);
 
                 if let Err(e) = db.update_settings(target_id, new_prompt, new_filter, new_consent) {
                     return KjResult::Err(format!("kj context set: {e}"));
                 }
 
-                if system_prompt.is_some() { changes.push("system-prompt".to_string()); }
+                if system_prompt.is_some() {
+                    changes.push("system-prompt".to_string());
+                }
                 if tool_filter.is_some() {
-                    changes.push(format!("tool-filter={}", tool_filter_spec.as_deref().unwrap_or("?")));
+                    changes.push(format!(
+                        "tool-filter={}",
+                        tool_filter_spec.as_deref().unwrap_or("?")
+                    ));
                     tool_filter_for_drift = tool_filter;
                 }
                 if consent_mode.is_some() {
-                    changes.push(format!("consent={}", consent_spec.as_deref().unwrap_or("?")));
+                    changes.push(format!(
+                        "consent={}",
+                        consent_spec.as_deref().unwrap_or("?")
+                    ));
                 }
             }
 
@@ -383,7 +406,9 @@ impl KjDispatcher {
                     }
                     changes.push(format!("env {key}={value}"));
                 } else {
-                    return KjResult::Err("kj context set: --env requires KEY=VALUE format".to_string());
+                    return KjResult::Err(
+                        "kj context set: --env requires KEY=VALUE format".to_string(),
+                    );
                 }
             }
 
@@ -413,7 +438,8 @@ impl KjDispatcher {
     fn context_unset(&self, argv: &[String], caller: &KjCaller) -> KjResult {
         let kernel_id = self.kernel_id();
 
-        let target_arg = argv.get(1)
+        let target_arg = argv
+            .get(1)
             .filter(|a| !a.starts_with('-'))
             .map(|s| s.as_str());
         let env_key = extract_named_arg(argv, &["--env"]);
@@ -456,11 +482,17 @@ impl KjDispatcher {
     async fn context_move(&self, argv: &[String], _caller: &KjCaller) -> KjResult {
         let ctx_ref = match argv.get(1) {
             Some(r) => r.as_str(),
-            None => return KjResult::Err("kj context move: requires a context reference".to_string()),
+            None => {
+                return KjResult::Err("kj context move: requires a context reference".to_string());
+            }
         };
         let new_parent_ref = match argv.get(2) {
             Some(r) => r.as_str(),
-            None => return KjResult::Err("kj context move: requires a new parent reference".to_string()),
+            None => {
+                return KjResult::Err(
+                    "kj context move: requires a new parent reference".to_string(),
+                );
+            }
         };
 
         let kernel_id = self.kernel_id();
@@ -499,11 +531,15 @@ impl KjDispatcher {
             return KjResult::Err(format!("kj context move: {e}"));
         }
 
-        let ctx_label = db.get_context(ctx_id).ok()
+        let ctx_label = db
+            .get_context(ctx_id)
+            .ok()
             .flatten()
             .and_then(|r| r.label)
             .unwrap_or_else(|| ctx_id.short());
-        let parent_label = db.get_context(new_parent_id).ok()
+        let parent_label = db
+            .get_context(new_parent_id)
+            .ok()
             .flatten()
             .and_then(|r| r.label)
             .unwrap_or_else(|| new_parent_id.short());
@@ -515,17 +551,24 @@ impl KjDispatcher {
     async fn context_archive(&self, argv: &[String], caller: &KjCaller) -> KjResult {
         let ctx_ref = match argv.get(1) {
             Some(r) => r.as_str(),
-            None => return KjResult::Err("kj context archive: requires a context reference".to_string()),
+            None => {
+                return KjResult::Err(
+                    "kj context archive: requires a context reference".to_string(),
+                );
+            }
         };
 
         let kernel_id = self.kernel_id();
         let (target_id, target_label) = {
             let db = self.kernel_db().lock();
-            let target_id = match super::refs::resolve_context_arg(Some(ctx_ref), caller, &db, kernel_id) {
-                Ok(id) => id,
-                Err(e) => return KjResult::Err(format!("kj context archive: {e}")),
-            };
-            let label = db.get_context(target_id).ok()
+            let target_id =
+                match super::refs::resolve_context_arg(Some(ctx_ref), caller, &db, kernel_id) {
+                    Ok(id) => id,
+                    Err(e) => return KjResult::Err(format!("kj context archive: {e}")),
+                };
+            let label = db
+                .get_context(target_id)
+                .ok()
                 .flatten()
                 .and_then(|r| r.label)
                 .unwrap_or_else(|| target_id.short());
@@ -535,19 +578,33 @@ impl KjDispatcher {
         if !caller.confirmed {
             // Gather stats for latch message
             let db = self.kernel_db().lock();
-            let block_count = self.block_store().get(target_id)
+            let block_count = self
+                .block_store()
+                .get(target_id)
                 .map(|e| e.doc.block_count())
                 .unwrap_or(0);
-            let children_count = db.structural_children(target_id)
+            let children_count = db
+                .structural_children(target_id)
                 .map(|c| c.len())
                 .unwrap_or(0);
-            let drift_from = db.edges_from(target_id, Some(EdgeKind::Drift)).map(|e| e.len()).unwrap_or(0);
-            let drift_to = db.edges_to(target_id, Some(EdgeKind::Drift)).map(|e| e.len()).unwrap_or(0);
+            let drift_from = db
+                .edges_from(target_id, Some(EdgeKind::Drift))
+                .map(|e| e.len())
+                .unwrap_or(0);
+            let drift_to = db
+                .edges_to(target_id, Some(EdgeKind::Drift))
+                .map(|e| e.len())
+                .unwrap_or(0);
 
             return KjResult::Latch {
                 command: "kj context archive".to_string(),
                 target: target_label,
-                message: format!("{} blocks | {} children | {} drift edges", block_count, children_count, drift_from + drift_to),
+                message: format!(
+                    "{} blocks | {} children | {} drift edges",
+                    block_count,
+                    children_count,
+                    drift_from + drift_to
+                ),
             };
         }
 
@@ -568,17 +625,24 @@ impl KjDispatcher {
     async fn context_remove(&self, argv: &[String], caller: &KjCaller) -> KjResult {
         let ctx_ref = match argv.get(1) {
             Some(r) => r.as_str(),
-            None => return KjResult::Err("kj context remove: requires a context reference".to_string()),
+            None => {
+                return KjResult::Err(
+                    "kj context remove: requires a context reference".to_string(),
+                );
+            }
         };
 
         let kernel_id = self.kernel_id();
         let (target_id, target_label) = {
             let db = self.kernel_db().lock();
-            let target_id = match super::refs::resolve_context_arg(Some(ctx_ref), caller, &db, kernel_id) {
-                Ok(id) => id,
-                Err(e) => return KjResult::Err(format!("kj context remove: {e}")),
-            };
-            let label = db.get_context(target_id).ok()
+            let target_id =
+                match super::refs::resolve_context_arg(Some(ctx_ref), caller, &db, kernel_id) {
+                    Ok(id) => id,
+                    Err(e) => return KjResult::Err(format!("kj context remove: {e}")),
+                };
+            let label = db
+                .get_context(target_id)
+                .ok()
                 .flatten()
                 .and_then(|r| r.label)
                 .unwrap_or_else(|| target_id.short());
@@ -586,22 +650,30 @@ impl KjDispatcher {
         };
 
         if target_id == caller.context_id {
-            return KjResult::Err("kj context remove: cannot remove the current context".to_string());
+            return KjResult::Err(
+                "kj context remove: cannot remove the current context".to_string(),
+            );
         }
 
         if !caller.confirmed {
             let db = self.kernel_db().lock();
-            let block_count = self.block_store().get(target_id)
+            let block_count = self
+                .block_store()
+                .get(target_id)
                 .map(|e| e.doc.block_count())
                 .unwrap_or(0);
-            let children_count = db.structural_children(target_id)
+            let children_count = db
+                .structural_children(target_id)
                 .map(|c| c.len())
                 .unwrap_or(0);
 
             return KjResult::Latch {
                 command: "kj context remove".to_string(),
                 target: target_label,
-                message: format!("{} blocks | {} children — this is permanent", block_count, children_count),
+                message: format!(
+                    "{} blocks | {} children — this is permanent",
+                    block_count, children_count
+                ),
             };
         }
 
@@ -631,7 +703,11 @@ impl KjDispatcher {
         };
         let ctx_ref = match argv.get(2) {
             Some(r) => r.as_str(),
-            None => return KjResult::Err("kj context retag: requires a target context reference".to_string()),
+            None => {
+                return KjResult::Err(
+                    "kj context retag: requires a target context reference".to_string(),
+                );
+            }
         };
 
         let kernel_id = self.kernel_id();
@@ -639,21 +715,25 @@ impl KjDispatcher {
         // Resolve the new holder and find old holder (single lock scope)
         let (new_holder_id, old_holder) = {
             let db = self.kernel_db().lock();
-            let new_holder_id = match super::refs::resolve_context_arg(Some(ctx_ref), caller, &db, kernel_id) {
-                Ok(id) => id,
-                Err(e) => return KjResult::Err(format!("kj context retag: {e}")),
-            };
-            let old_holder = db.find_context_by_label(kernel_id, label)
-                .ok()
-                .flatten();
+            let new_holder_id =
+                match super::refs::resolve_context_arg(Some(ctx_ref), caller, &db, kernel_id) {
+                    Ok(id) => id,
+                    Err(e) => return KjResult::Err(format!("kj context retag: {e}")),
+                };
+            let old_holder = db.find_context_by_label(kernel_id, label).ok().flatten();
             (new_holder_id, old_holder)
         };
 
         if !caller.confirmed {
-            let current_holder = old_holder.as_ref()
+            let current_holder = old_holder
+                .as_ref()
                 .map(|r| {
                     let old_short = r.context_id.short();
-                    format!("currently held by {} ({})", r.label.as_deref().unwrap_or(&old_short), old_short)
+                    format!(
+                        "currently held by {} ({})",
+                        r.label.as_deref().unwrap_or(&old_short),
+                        old_short
+                    )
                 })
                 .unwrap_or_else(|| "label is free".to_string());
 
@@ -667,10 +747,10 @@ impl KjDispatcher {
         // Apply label changes (single lock scope, no await)
         {
             let db = self.kernel_db().lock();
-            if let Some(ref old) = old_holder {
-                if let Err(e) = db.update_label(old.context_id, None) {
-                    return KjResult::Err(format!("kj context retag: failed to clear old label: {e}"));
-                }
+            if let Some(ref old) = old_holder
+                && let Err(e) = db.update_label(old.context_id, None)
+            {
+                return KjResult::Err(format!("kj context retag: failed to clear old label: {e}"));
             }
             if let Err(e) = db.update_label(new_holder_id, Some(label)) {
                 return KjResult::Err(format!("kj context retag: {e}"));
@@ -691,9 +771,9 @@ impl KjDispatcher {
 #[cfg(test)]
 mod tests {
     use crate::kernel_db::ContextEdgeRow;
-    use crate::kj::test_helpers::*;
     #[allow(unused_imports)]
     use crate::kj::KjResult;
+    use crate::kj::test_helpers::*;
     use kaijutsu_types::{EdgeKind, PrincipalId};
 
     fn s(v: &str) -> String {
@@ -815,12 +895,20 @@ mod tests {
             .dispatch(&[s("context"), s("create"), s("child-ctx")], &c)
             .await;
         assert!(result.is_ok());
-        assert!(result.message().contains("child-ctx"), "msg: {}", result.message());
+        assert!(
+            result.message().contains("child-ctx"),
+            "msg: {}",
+            result.message()
+        );
 
         // Verify it's in the DB
         let db = d.kernel_db().lock();
         let contexts = db.list_active_contexts(d.kernel_id()).unwrap();
-        assert!(contexts.iter().any(|r| r.label.as_deref() == Some("child-ctx")));
+        assert!(
+            contexts
+                .iter()
+                .any(|r| r.label.as_deref() == Some("child-ctx"))
+        );
     }
 
     #[tokio::test]
@@ -831,15 +919,11 @@ mod tests {
 
         let c = caller_with_context(parent);
         // First create succeeds
-        let r1 = d
-            .dispatch(&[s("context"), s("create"), s("dup")], &c)
-            .await;
+        let r1 = d.dispatch(&[s("context"), s("create"), s("dup")], &c).await;
         assert!(r1.is_ok());
 
         // Second create with same label should fail
-        let r2 = d
-            .dispatch(&[s("context"), s("create"), s("dup")], &c)
-            .await;
+        let r2 = d.dispatch(&[s("context"), s("create"), s("dup")], &c).await;
         assert!(!r2.is_ok(), "expected error, got: {}", r2.message());
     }
 
@@ -860,8 +944,8 @@ mod tests {
 
         // Register mock provider so validation passes
         {
-            use std::sync::Arc;
             use crate::llm::{MockClient, RigProvider};
+            use std::sync::Arc;
             let mock = Arc::new(RigProvider::Mock(MockClient::new("mock")));
             let mut registry = d.kernel().llm().write().await;
             registry.register("mock", mock);
@@ -869,10 +953,23 @@ mod tests {
 
         let c = caller_with_context(ctx);
         let result = d
-            .dispatch(&[s("context"), s("set"), s("."), s("--model"), s("mock/test-model")], &c)
+            .dispatch(
+                &[
+                    s("context"),
+                    s("set"),
+                    s("."),
+                    s("--model"),
+                    s("mock/test-model"),
+                ],
+                &c,
+            )
             .await;
         assert!(result.is_ok(), "set failed: {}", result.message());
-        assert!(result.message().contains("model="), "msg: {}", result.message());
+        assert!(
+            result.message().contains("model="),
+            "msg: {}",
+            result.message()
+        );
 
         // Verify in DriftRouter
         let router = d.drift_router().read().await;
@@ -889,7 +986,16 @@ mod tests {
 
         let c = caller_with_context(ctx);
         let result = d
-            .dispatch(&[s("context"), s("set"), s("."), s("--model"), s("nonexistent/foo")], &c)
+            .dispatch(
+                &[
+                    s("context"),
+                    s("set"),
+                    s("."),
+                    s("--model"),
+                    s("nonexistent/foo"),
+                ],
+                &c,
+            )
             .await;
         assert!(!result.is_ok(), "should fail: {}", result.message());
         assert!(
@@ -932,7 +1038,8 @@ mod tests {
                 kind: EdgeKind::Structural,
                 metadata: None,
                 created_at: kaijutsu_types::now_millis() as i64,
-            }).unwrap();
+            })
+            .unwrap();
         }
 
         let c = caller_with_context(a);
@@ -940,7 +1047,11 @@ mod tests {
             .dispatch(&[s("context"), s("move"), s("child"), s("b")], &c)
             .await;
         assert!(result.is_ok(), "move failed: {}", result.message());
-        assert!(result.message().contains("moved"), "msg: {}", result.message());
+        assert!(
+            result.message().contains("moved"),
+            "msg: {}",
+            result.message()
+        );
 
         // Verify new parent
         let db = d.kernel_db().lock();
@@ -974,7 +1085,11 @@ mod tests {
             .dispatch(&[s("context"), s("archive"), s("target")], &c)
             .await;
         assert!(result.is_ok(), "archive failed: {}", result.message());
-        assert!(result.message().contains("archived"), "msg: {}", result.message());
+        assert!(
+            result.message().contains("archived"),
+            "msg: {}",
+            result.message()
+        );
 
         // Verify archived
         let db = d.kernel_db().lock();
@@ -1040,10 +1155,17 @@ mod tests {
 
         let c = caller_with_context(ctx);
         let result = d
-            .dispatch(&[s("context"), s("set"), s("."), s("--cwd"), s("/tmp/work")], &c)
+            .dispatch(
+                &[s("context"), s("set"), s("."), s("--cwd"), s("/tmp/work")],
+                &c,
+            )
             .await;
         assert!(result.is_ok(), "set --cwd failed: {}", result.message());
-        assert!(result.message().contains("cwd="), "msg: {}", result.message());
+        assert!(
+            result.message().contains("cwd="),
+            "msg: {}",
+            result.message()
+        );
 
         let db = d.kernel_db().lock();
         let shell = db.get_context_shell(ctx).unwrap().unwrap();
@@ -1058,10 +1180,23 @@ mod tests {
 
         let c = caller_with_context(ctx);
         let result = d
-            .dispatch(&[s("context"), s("set"), s("."), s("--env"), s("RUST_LOG=debug")], &c)
+            .dispatch(
+                &[
+                    s("context"),
+                    s("set"),
+                    s("."),
+                    s("--env"),
+                    s("RUST_LOG=debug"),
+                ],
+                &c,
+            )
             .await;
         assert!(result.is_ok(), "set --env failed: {}", result.message());
-        assert!(result.message().contains("env RUST_LOG=debug"), "msg: {}", result.message());
+        assert!(
+            result.message().contains("env RUST_LOG=debug"),
+            "msg: {}",
+            result.message()
+        );
 
         let db = d.kernel_db().lock();
         let env = db.get_context_env(ctx).unwrap();
@@ -1078,10 +1213,21 @@ mod tests {
 
         let c = caller_with_context(ctx);
         let result = d
-            .dispatch(&[s("context"), s("set"), s("."), s("--env"), s("NOEQUALS")], &c)
+            .dispatch(
+                &[s("context"), s("set"), s("."), s("--env"), s("NOEQUALS")],
+                &c,
+            )
             .await;
-        assert!(!result.is_ok(), "should fail without =: {}", result.message());
-        assert!(result.message().contains("KEY=VALUE"), "msg: {}", result.message());
+        assert!(
+            !result.is_ok(),
+            "should fail without =: {}",
+            result.message()
+        );
+        assert!(
+            result.message().contains("KEY=VALUE"),
+            "msg: {}",
+            result.message()
+        );
     }
 
     #[tokio::test]
@@ -1098,10 +1244,17 @@ mod tests {
 
         let c = caller_with_context(ctx);
         let result = d
-            .dispatch(&[s("context"), s("unset"), s("."), s("--env"), s("FOO")], &c)
+            .dispatch(
+                &[s("context"), s("unset"), s("."), s("--env"), s("FOO")],
+                &c,
+            )
             .await;
         assert!(result.is_ok(), "unset failed: {}", result.message());
-        assert!(result.message().contains("unset env FOO"), "msg: {}", result.message());
+        assert!(
+            result.message().contains("unset env FOO"),
+            "msg: {}",
+            result.message()
+        );
 
         // Verify it's gone
         let db = d.kernel_db().lock();
@@ -1117,9 +1270,16 @@ mod tests {
 
         let c = caller_with_context(ctx);
         let result = d
-            .dispatch(&[s("context"), s("unset"), s("."), s("--env"), s("NOPE")], &c)
+            .dispatch(
+                &[s("context"), s("unset"), s("."), s("--env"), s("NOPE")],
+                &c,
+            )
             .await;
-        assert!(!result.is_ok(), "should error for missing var: {}", result.message());
+        assert!(
+            !result.is_ok(),
+            "should error for missing var: {}",
+            result.message()
+        );
     }
 
     #[tokio::test]
@@ -1136,7 +1296,8 @@ mod tests {
                 cwd: Some("/home/user/project".into()),
                 init_script: None,
                 updated_at: kaijutsu_types::now_millis() as i64,
-            }).unwrap();
+            })
+            .unwrap();
             db.set_context_env(ctx, "RUST_LOG", "debug").unwrap();
         }
 
@@ -1145,7 +1306,10 @@ mod tests {
         assert!(result.is_ok(), "info failed: {}", result.message());
         let msg = result.message();
         assert!(msg.contains("Cwd:"), "should show cwd: {msg}");
-        assert!(msg.contains("/home/user/project"), "should show cwd path: {msg}");
+        assert!(
+            msg.contains("/home/user/project"),
+            "should show cwd path: {msg}"
+        );
         assert!(msg.contains("Env:"), "should show env: {msg}");
         assert!(msg.contains("RUST_LOG=debug"), "should show env var: {msg}");
     }

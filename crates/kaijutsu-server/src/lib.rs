@@ -22,12 +22,12 @@ pub mod kaijutsu_capnp {
 }
 
 pub use auth_db::{AuthDb, SshKeyRecord};
-pub use kaijutsu_kernel::{DriftRouter, ContextHandle, StagedDrift, DriftError};
 pub use context_engine::ContextEngine;
 pub use docs_filesystem::KaijutsuFilesystem;
 pub use embedded_kaish::EmbeddedKaish;
 pub use input_filesystem::InputFilesystem;
+pub use kaijutsu_kernel::{ContextHandle, DriftError, DriftRouter, StagedDrift};
 pub use kaish_backend::KaijutsuBackend;
 pub use mount_backend::MountBackend;
-pub use rpc::{WorldImpl, SharedKernel, SharedKernelState, ServerRegistry, ConnectionState};
+pub use rpc::{ConnectionState, ServerRegistry, SharedKernel, SharedKernelState, WorldImpl};
 pub use ssh::{KeySource, SshServer, SshServerConfig};

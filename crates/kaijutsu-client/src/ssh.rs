@@ -24,9 +24,10 @@ use crate::constants::{
 };
 
 /// Source for SSH authentication keys
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum KeySource {
     /// Use SSH agent (default) - tries all keys in the agent
+    #[default]
     Agent,
     /// Load key from file, with optional passphrase
     File {
@@ -35,12 +36,6 @@ pub enum KeySource {
     },
     /// Use an in-memory private key (for testing)
     InMemory(Arc<PrivateKey>),
-}
-
-impl Default for KeySource {
-    fn default() -> Self {
-        Self::Agent
-    }
 }
 
 impl KeySource {
@@ -60,7 +55,10 @@ impl KeySource {
     }
 
     /// Load a key from a file with passphrase
-    pub fn from_file_with_passphrase(path: impl Into<PathBuf>, passphrase: impl Into<String>) -> Self {
+    pub fn from_file_with_passphrase(
+        path: impl Into<PathBuf>,
+        passphrase: impl Into<String>,
+    ) -> Self {
         Self::File {
             path: path.into(),
             passphrase: Some(passphrase.into()),
@@ -126,7 +124,9 @@ impl client::Handler for ClientHandler {
             Ok(true) => {
                 log::info!(
                     "Server key verified for {}:{} ({})",
-                    self.host, self.port, fingerprint
+                    self.host,
+                    self.port,
+                    fingerprint
                 );
                 Ok(true)
             }
@@ -134,11 +134,13 @@ impl client::Handler for ClientHandler {
                 // Host not in known_hosts — first use, learn and accept
                 log::info!(
                     "First connection to {}:{}, trusting server key: {}",
-                    self.host, self.port, fingerprint
+                    self.host,
+                    self.port,
+                    fingerprint
                 );
-                if let Err(e) = known_hosts::learn_known_hosts(
-                    &self.host, self.port, server_public_key,
-                ) {
+                if let Err(e) =
+                    known_hosts::learn_known_hosts(&self.host, self.port, server_public_key)
+                {
                     log::warn!(
                         "Failed to save server key to known_hosts: {}. \
                          Connection will proceed but key won't be remembered.",
@@ -160,12 +162,10 @@ impl client::Handler for ClientHandler {
                     line,
                 })
             }
-            Err(e) => {
-                Err(SshError::HostKeyVerificationFailed(format!(
-                    "Failed to verify server key for {}:{}: {}",
-                    self.host, self.port, e
-                )))
-            }
+            Err(e) => Err(SshError::HostKeyVerificationFailed(format!(
+                "Failed to verify server key for {}:{}: {}",
+                self.host, self.port, e
+            ))),
         }
     }
 }
@@ -223,7 +223,8 @@ impl SshClient {
                 self.auth_with_agent(&mut session).await?;
             }
             KeySource::File { path, passphrase } => {
-                self.auth_with_file(&mut session, path, passphrase.as_deref()).await?;
+                self.auth_with_file(&mut session, path, passphrase.as_deref())
+                    .await?;
             }
             KeySource::InMemory(key) => {
                 self.auth_with_key(&mut session, Arc::clone(key)).await?;
@@ -249,7 +250,11 @@ impl SshClient {
         log::info!("Opened control, rpc, and events channels");
         self.session = Some(session);
 
-        Ok(SshChannels { control, rpc, events })
+        Ok(SshChannels {
+            control,
+            rpc,
+            events,
+        })
     }
 
     /// Authenticate using SSH agent
@@ -280,7 +285,12 @@ impl SshClient {
                 .flatten();
 
             let result = session
-                .authenticate_publickey_with(&self.config.username, key.clone(), hash_alg, &mut agent)
+                .authenticate_publickey_with(
+                    &self.config.username,
+                    key.clone(),
+                    hash_alg,
+                    &mut agent,
+                )
                 .await;
 
             match result {
@@ -341,7 +351,11 @@ impl SshClient {
             .map_err(|e| SshError::AuthFailed(e.to_string()))?;
 
         if result.success() {
-            log::info!("Authenticated as {} with key {}", self.config.username, fingerprint);
+            log::info!(
+                "Authenticated as {} with key {}",
+                self.config.username,
+                fingerprint
+            );
             Ok(())
         } else {
             Err(SshError::AuthFailed("Key rejected by server".into()))
@@ -361,7 +375,10 @@ impl SshClient {
 
     /// Check if connected
     pub fn is_connected(&self) -> bool {
-        self.session.as_ref().map(|s| !s.is_closed()).unwrap_or(false)
+        self.session
+            .as_ref()
+            .map(|s| !s.is_closed())
+            .unwrap_or(false)
     }
 }
 

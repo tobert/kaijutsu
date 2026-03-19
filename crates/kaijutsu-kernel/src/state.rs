@@ -201,7 +201,6 @@ impl KernelState {
             false
         }
     }
-
 }
 
 /// A command history entry.
@@ -300,5 +299,4 @@ mod tests {
         assert_eq!(state.get_var("X"), Some("1"));
         assert_eq!(state.history().len(), 1);
     }
-
 }

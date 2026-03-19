@@ -7,6 +7,7 @@
 ///
 /// O(N) string scan but only runs when cursor position changes.
 #[inline]
+#[allow(dead_code)]
 pub fn cursor_row_col(text: &str, offset: usize) -> (usize, usize) {
     let offset = offset.min(text.len());
     let before = &text[..offset];

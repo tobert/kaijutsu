@@ -120,7 +120,9 @@ impl KjDispatcher {
             let db = self.kernel_db().lock();
 
             // Inherit workspace from source
-            let source_ws = db.get_context(source_id).ok()
+            let source_ws = db
+                .get_context(source_id)
+                .ok()
                 .flatten()
                 .and_then(|r| r.workspace_id);
 
@@ -141,10 +143,11 @@ impl KjDispatcher {
                 workspace_id: source_ws,
                 preset_id: None,
             };
-            let default_ws = match db.get_or_create_default_workspace(kernel_id, caller.principal_id) {
-                Ok(id) => id,
-                Err(e) => return KjResult::Err(format!("kj fork: {e}")),
-            };
+            let default_ws =
+                match db.get_or_create_default_workspace(kernel_id, caller.principal_id) {
+                    Ok(id) => id,
+                    Err(e) => return KjResult::Err(format!("kj fork: {e}")),
+                };
             if let Err(e) = db.insert_context_with_document(&row, default_ws) {
                 return KjResult::Err(format!("kj fork: {e}"));
             }
@@ -159,7 +162,9 @@ impl KjDispatcher {
                 let shell = ContextShellRow {
                     context_id: new_id,
                     cwd: Some(pwd.clone()),
-                    init_script: db.get_context_shell(source_id).ok()
+                    init_script: db
+                        .get_context_shell(source_id)
+                        .ok()
                         .flatten()
                         .and_then(|s| s.init_script),
                     updated_at: kaijutsu_types::now_millis() as i64,
@@ -186,7 +191,9 @@ impl KjDispatcher {
         // Register in DriftRouter (inherits parent's model)
         {
             let mut drift = self.drift_router().write().await;
-            if let Err(e) = drift.register_fork(new_id, label.as_deref(), source_id, caller.principal_id) {
+            if let Err(e) =
+                drift.register_fork(new_id, label.as_deref(), source_id, caller.principal_id)
+            {
                 return KjResult::Err(format!("kj fork: parent context not in router: {e}"));
             }
             // If --model was explicit, override the inherited model
@@ -194,12 +201,14 @@ impl KjDispatcher {
                 match (&resolved.provider, &resolved.model) {
                     (Some(p), Some(m)) => {
                         if let Err(e) = drift.configure_llm(new_id, p, m) {
-                            return KjResult::Err(format!("kj fork: failed to configure model: {e}"));
+                            return KjResult::Err(format!(
+                                "kj fork: failed to configure model: {e}"
+                            ));
                         }
                     }
                     _ => {
                         return KjResult::Err(
-                            "kj fork: --model resolved without both provider and model".to_string()
+                            "kj fork: --model resolved without both provider and model".to_string(),
                         );
                     }
                 }
@@ -207,24 +216,25 @@ impl KjDispatcher {
         }
 
         // Apply preset if requested
-        if let Some(ref preset) = preset_label {
-            if let Err(e) = self.apply_preset(new_id, preset).await {
-                return KjResult::Err(format!("kj fork: failed to apply preset '{preset}': {e}"));
-            }
+        if let Some(ref preset) = preset_label
+            && let Err(e) = self.apply_preset(new_id, preset).await
+        {
+            return KjResult::Err(format!("kj fork: failed to apply preset '{preset}': {e}"));
         }
 
         // If --prompt given, inject a Drift block
-        if let Some(note) = prompt {
-            if let Err(e) = self.inject_fork_note(new_id, caller, &note) {
-                return KjResult::Err(format!("kj fork: failed to inject fork note: {e}"));
-            }
+        if let Some(note) = prompt
+            && let Err(e) = self.inject_fork_note(new_id, caller, &note)
+        {
+            return KjResult::Err(format!("kj fork: failed to inject fork note: {e}"));
         }
 
         let short = new_id.short();
-        let display = label
-            .as_deref()
-            .unwrap_or(&short);
-        KjResult::Switch(new_id, format!("forked to '{}' ({})", display, new_id.short()))
+        let display = label.as_deref().unwrap_or(&short);
+        KjResult::Switch(
+            new_id,
+            format!("forked to '{}' ({})", display, new_id.short()),
+        )
     }
 
     async fn fork_shallow(&self, argv: &[String], caller: &KjCaller) -> KjResult {
@@ -254,7 +264,10 @@ impl KjDispatcher {
             ..Default::default()
         };
         let before_timestamp = kaijutsu_types::now_millis();
-        if let Err(e) = self.block_store().fork_document_filtered(source_id, new_id, before_timestamp, &filter) {
+        if let Err(e) =
+            self.block_store()
+                .fork_document_filtered(source_id, new_id, before_timestamp, &filter)
+        {
             return KjResult::Err(format!("kj fork --shallow: {e}"));
         }
 
@@ -262,7 +275,9 @@ impl KjDispatcher {
         {
             let db = self.kernel_db().lock();
 
-            let source_ws = db.get_context(source_id).ok()
+            let source_ws = db
+                .get_context(source_id)
+                .ok()
                 .flatten()
                 .and_then(|r| r.workspace_id);
 
@@ -283,23 +298,28 @@ impl KjDispatcher {
                 workspace_id: source_ws,
                 preset_id: None,
             };
-            let default_ws = match db.get_or_create_default_workspace(kernel_id, caller.principal_id) {
-                Ok(id) => id,
-                Err(e) => return KjResult::Err(format!("kj fork --shallow: {e}")),
-            };
+            let default_ws =
+                match db.get_or_create_default_workspace(kernel_id, caller.principal_id) {
+                    Ok(id) => id,
+                    Err(e) => return KjResult::Err(format!("kj fork --shallow: {e}")),
+                };
             if let Err(e) = db.insert_context_with_document(&row, default_ws) {
                 return KjResult::Err(format!("kj fork --shallow: {e}"));
             }
 
             if let Err(e) = db.fork_context_config(source_id, new_id) {
-                return KjResult::Err(format!("kj fork --shallow: failed to copy context config: {e}"));
+                return KjResult::Err(format!(
+                    "kj fork --shallow: failed to copy context config: {e}"
+                ));
             }
 
             if let Some(ref pwd) = pwd_override {
                 let shell = ContextShellRow {
                     context_id: new_id,
                     cwd: Some(pwd.clone()),
-                    init_script: db.get_context_shell(source_id).ok()
+                    init_script: db
+                        .get_context_shell(source_id)
+                        .ok()
                         .flatten()
                         .and_then(|s| s.init_script),
                     updated_at: kaijutsu_types::now_millis() as i64,
@@ -318,46 +338,67 @@ impl KjDispatcher {
                 created_at: kaijutsu_types::now_millis() as i64,
             };
             if let Err(e) = db.insert_edge(&edge) {
-                return KjResult::Err(format!("kj fork --shallow: failed to insert structural edge: {e}"));
+                return KjResult::Err(format!(
+                    "kj fork --shallow: failed to insert structural edge: {e}"
+                ));
             }
         }
 
         {
             let mut drift = self.drift_router().write().await;
-            if let Err(e) = drift.register_fork(new_id, label.as_deref(), source_id, caller.principal_id) {
-                return KjResult::Err(format!("kj fork --shallow: parent context not in router: {e}"));
+            if let Err(e) =
+                drift.register_fork(new_id, label.as_deref(), source_id, caller.principal_id)
+            {
+                return KjResult::Err(format!(
+                    "kj fork --shallow: parent context not in router: {e}"
+                ));
             }
             if resolved.explicit {
                 match (&resolved.provider, &resolved.model) {
                     (Some(p), Some(m)) => {
                         if let Err(e) = drift.configure_llm(new_id, p, m) {
-                            return KjResult::Err(format!("kj fork --shallow: failed to configure model: {e}"));
+                            return KjResult::Err(format!(
+                                "kj fork --shallow: failed to configure model: {e}"
+                            ));
                         }
                     }
                     _ => {
                         return KjResult::Err(
-                            "kj fork --shallow: --model resolved without both provider and model".to_string()
+                            "kj fork --shallow: --model resolved without both provider and model"
+                                .to_string(),
                         );
                     }
                 }
             }
         }
 
-        if let Some(ref preset) = preset_label {
-            if let Err(e) = self.apply_preset(new_id, preset).await {
-                return KjResult::Err(format!("kj fork --shallow: failed to apply preset '{preset}': {e}"));
-            }
+        if let Some(ref preset) = preset_label
+            && let Err(e) = self.apply_preset(new_id, preset).await
+        {
+            return KjResult::Err(format!(
+                "kj fork --shallow: failed to apply preset '{preset}': {e}"
+            ));
         }
 
-        if let Some(note) = prompt {
-            if let Err(e) = self.inject_fork_note(new_id, caller, &note) {
-                return KjResult::Err(format!("kj fork --shallow: failed to inject fork note: {e}"));
-            }
+        if let Some(note) = prompt
+            && let Err(e) = self.inject_fork_note(new_id, caller, &note)
+        {
+            return KjResult::Err(format!(
+                "kj fork --shallow: failed to inject fork note: {e}"
+            ));
         }
 
         let short = new_id.short();
         let display = label.as_deref().unwrap_or(&short);
-        KjResult::Switch(new_id, format!("shallow-forked to '{}' ({}, depth {})", display, new_id.short(), depth))
+        KjResult::Switch(
+            new_id,
+            format!(
+                "shallow-forked to '{}' ({}, depth {})",
+                display,
+                new_id.short(),
+                depth
+            ),
+        )
     }
 
     async fn fork_compact(&self, argv: &[String], caller: &KjCaller) -> KjResult {
@@ -382,11 +423,10 @@ impl KjDispatcher {
         };
 
         // Create empty document for the new context
-        if let Err(e) = self.block_store().create_document(
-            new_id,
-            crate::DocumentKind::Conversation,
-            None,
-        ) {
+        if let Err(e) =
+            self.block_store()
+                .create_document(new_id, crate::DocumentKind::Conversation, None)
+        {
             return KjResult::Err(format!("kj fork --compact: failed to create document: {e}"));
         }
 
@@ -410,17 +450,19 @@ impl KjDispatcher {
         }
 
         // If --prompt given, inject a fork note after the summary
-        if let Some(note) = prompt {
-            if let Err(e) = self.inject_fork_note(new_id, caller, &note) {
-                tracing::warn!("failed to inject fork note: {e}");
-            }
+        if let Some(note) = prompt
+            && let Err(e) = self.inject_fork_note(new_id, caller, &note)
+        {
+            tracing::warn!("failed to inject fork note: {e}");
         }
 
         // Write-through: KernelDb then DriftRouter
         {
             let db = self.kernel_db().lock();
 
-            let source_ws = db.get_context(source_id).ok()
+            let source_ws = db
+                .get_context(source_id)
+                .ok()
                 .flatten()
                 .and_then(|r| r.workspace_id);
 
@@ -441,23 +483,28 @@ impl KjDispatcher {
                 workspace_id: source_ws,
                 preset_id: None,
             };
-            let default_ws = match db.get_or_create_default_workspace(kernel_id, caller.principal_id) {
-                Ok(id) => id,
-                Err(e) => return KjResult::Err(format!("kj fork --compact: {e}")),
-            };
+            let default_ws =
+                match db.get_or_create_default_workspace(kernel_id, caller.principal_id) {
+                    Ok(id) => id,
+                    Err(e) => return KjResult::Err(format!("kj fork --compact: {e}")),
+                };
             if let Err(e) = db.insert_context_with_document(&row, default_ws) {
                 return KjResult::Err(format!("kj fork --compact: {e}"));
             }
 
             if let Err(e) = db.fork_context_config(source_id, new_id) {
-                return KjResult::Err(format!("kj fork --compact: failed to copy context config: {e}"));
+                return KjResult::Err(format!(
+                    "kj fork --compact: failed to copy context config: {e}"
+                ));
             }
 
             if let Some(ref pwd) = pwd_override {
                 let shell = ContextShellRow {
                     context_id: new_id,
                     cwd: Some(pwd.clone()),
-                    init_script: db.get_context_shell(source_id).ok()
+                    init_script: db
+                        .get_context_shell(source_id)
+                        .ok()
                         .flatten()
                         .and_then(|s| s.init_script),
                     updated_at: kaijutsu_types::now_millis() as i64,
@@ -476,25 +523,34 @@ impl KjDispatcher {
                 created_at: kaijutsu_types::now_millis() as i64,
             };
             if let Err(e) = db.insert_edge(&edge) {
-                return KjResult::Err(format!("kj fork --compact: failed to insert structural edge: {e}"));
+                return KjResult::Err(format!(
+                    "kj fork --compact: failed to insert structural edge: {e}"
+                ));
             }
         }
 
         {
             let mut drift = self.drift_router().write().await;
-            if let Err(e) = drift.register_fork(new_id, label.as_deref(), source_id, caller.principal_id) {
-                return KjResult::Err(format!("kj fork --compact: parent context not in router: {e}"));
+            if let Err(e) =
+                drift.register_fork(new_id, label.as_deref(), source_id, caller.principal_id)
+            {
+                return KjResult::Err(format!(
+                    "kj fork --compact: parent context not in router: {e}"
+                ));
             }
             if resolved.explicit {
                 match (&resolved.provider, &resolved.model) {
                     (Some(p), Some(m)) => {
                         if let Err(e) = drift.configure_llm(new_id, p, m) {
-                            return KjResult::Err(format!("kj fork --compact: failed to configure model: {e}"));
+                            return KjResult::Err(format!(
+                                "kj fork --compact: failed to configure model: {e}"
+                            ));
                         }
                     }
                     _ => {
                         return KjResult::Err(
-                            "kj fork --compact: --model resolved without both provider and model".to_string()
+                            "kj fork --compact: --model resolved without both provider and model"
+                                .to_string(),
                         );
                     }
                 }
@@ -503,17 +559,28 @@ impl KjDispatcher {
 
         let short = new_id.short();
         let display = label.as_deref().unwrap_or(&short);
-        KjResult::Switch(new_id, format!("compact-forked to '{}' ({})", display, new_id.short()))
+        KjResult::Switch(
+            new_id,
+            format!("compact-forked to '{}' ({})", display, new_id.short()),
+        )
     }
 
     async fn fork_subtree(&self, argv: &[String], caller: &KjCaller) -> KjResult {
         let template_ref = match extract_named_arg(argv, &["--as"]) {
             Some(r) => r,
-            None => return KjResult::Err("kj fork --as: requires a template context reference".to_string()),
+            None => {
+                return KjResult::Err(
+                    "kj fork --as: requires a template context reference".to_string(),
+                );
+            }
         };
         let name = match extract_named_arg(argv, &["--name", "-n"]) {
             Some(n) => n,
-            None => return KjResult::Err("kj fork --as: requires --name for the new subtree".to_string()),
+            None => {
+                return KjResult::Err(
+                    "kj fork --as: requires --name for the new subtree".to_string(),
+                );
+            }
         };
 
         let kernel_id = self.kernel_id();
@@ -544,14 +611,14 @@ impl KjDispatcher {
         {
             let registry = self.kernel().llm().read().await;
             for (row, _depth) in &template_nodes {
-                if let Some(ref p) = row.provider {
-                    if registry.get(p).is_none() {
-                        return KjResult::Err(format!(
-                            "kj fork --as: template node '{}' references unknown provider '{}'",
-                            row.label.as_deref().unwrap_or("(unnamed)"),
-                            p,
-                        ));
-                    }
+                if let Some(ref p) = row.provider
+                    && registry.get(p).is_none()
+                {
+                    return KjResult::Err(format!(
+                        "kj fork --as: template node '{}' references unknown provider '{}'",
+                        row.label.as_deref().unwrap_or("(unnamed)"),
+                        p,
+                    ));
                 }
             }
         }
@@ -580,7 +647,8 @@ impl KjDispatcher {
 
                 // Map forked_from to the new parent (if it's in the subtree),
                 // otherwise point to caller's context
-                let new_forked_from = row.forked_from
+                let new_forked_from = row
+                    .forked_from
                     .and_then(|fid| id_map.get(&fid).copied())
                     .or(Some(caller.context_id));
 
@@ -601,17 +669,20 @@ impl KjDispatcher {
                     workspace_id: row.workspace_id,
                     preset_id: row.preset_id,
                 };
-                let default_ws = match db.get_or_create_default_workspace(kernel_id, caller.principal_id) {
-                    Ok(id) => id,
-                    Err(e) => return KjResult::Err(format!("kj fork --as: {e}")),
-                };
+                let default_ws =
+                    match db.get_or_create_default_workspace(kernel_id, caller.principal_id) {
+                        Ok(id) => id,
+                        Err(e) => return KjResult::Err(format!("kj fork --as: {e}")),
+                    };
                 if let Err(e) = db.insert_context_with_document(&new_row, default_ws) {
                     return KjResult::Err(format!("kj fork --as: failed to create context: {e}"));
                 }
 
                 // Copy shell config + env vars from template context
                 if let Err(e) = db.fork_context_config(row.context_id, new_id) {
-                    return KjResult::Err(format!("kj fork --as: failed to copy context config: {e}"));
+                    return KjResult::Err(format!(
+                        "kj fork --as: failed to copy context config: {e}"
+                    ));
                 }
 
                 // Create empty document for each new context
@@ -632,7 +703,11 @@ impl KjDispatcher {
                 // Get template's structural children
                 let children = match db.structural_children(old_parent) {
                     Ok(c) => c,
-                    Err(e) => return KjResult::Err(format!("kj fork --as: failed to read template edges: {e}")),
+                    Err(e) => {
+                        return KjResult::Err(format!(
+                            "kj fork --as: failed to read template edges: {e}"
+                        ));
+                    }
                 };
                 for child in children {
                     if let Some(&new_child) = id_map.get(&child.context_id) {
@@ -645,7 +720,9 @@ impl KjDispatcher {
                             created_at: kaijutsu_types::now_millis() as i64,
                         };
                         if let Err(e) = db.insert_edge(&edge) {
-                            return KjResult::Err(format!("kj fork --as: failed to insert subtree edge: {e}"));
+                            return KjResult::Err(format!(
+                                "kj fork --as: failed to insert subtree edge: {e}"
+                            ));
                         }
                     }
                 }
@@ -676,12 +753,16 @@ impl KjDispatcher {
                 } else {
                     row.label.as_deref()
                 };
-                let forked_from = row.forked_from
+                let forked_from = row
+                    .forked_from
                     .and_then(|fid| id_map.get(&fid).copied())
                     .or(Some(caller.context_id));
                 if let Some(parent) = forked_from {
-                    if let Err(e) = drift.register_fork(new_id, label, parent, caller.principal_id) {
-                        return KjResult::Err(format!("kj fork --as: parent context not in router: {e}"));
+                    if let Err(e) = drift.register_fork(new_id, label, parent, caller.principal_id)
+                    {
+                        return KjResult::Err(format!(
+                            "kj fork --as: parent context not in router: {e}"
+                        ));
                     }
                 } else {
                     drift.register(new_id, label, None, caller.principal_id);
@@ -689,10 +770,15 @@ impl KjDispatcher {
             }
         }
 
-        KjResult::Switch(new_root_id, format!(
-            "subtree-forked '{}' ({} contexts) from template '{}'",
-            name, template_nodes.len(), template_ref
-        ))
+        KjResult::Switch(
+            new_root_id,
+            format!(
+                "subtree-forked '{}' ({} contexts) from template '{}'",
+                name,
+                template_nodes.len(),
+                template_ref
+            ),
+        )
     }
 
     /// Apply a preset's settings to a context (post-fork).
@@ -713,14 +799,16 @@ impl KjDispatcher {
                     context_id,
                     preset.provider.as_deref(),
                     preset.model.as_deref(),
-                ).map_err(|e| e.to_string())?;
+                )
+                .map_err(|e| e.to_string())?;
             }
             db.update_settings(
                 context_id,
                 preset.system_prompt.as_deref(),
                 &preset.tool_filter,
                 preset.consent_mode,
-            ).map_err(|e| e.to_string())?;
+            )
+            .map_err(|e| e.to_string())?;
         }
 
         // Update DriftRouter
@@ -761,7 +849,6 @@ impl KjDispatcher {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use crate::kj::test_helpers::*;
@@ -785,12 +872,20 @@ mod tests {
         let c = caller_with_context(source);
         let result = d.dispatch(&[s("fork"), s("--name"), s("branch")], &c).await;
         assert!(result.is_ok(), "fork failed: {}", result.message());
-        assert!(result.message().contains("branch"), "msg: {}", result.message());
+        assert!(
+            result.message().contains("branch"),
+            "msg: {}",
+            result.message()
+        );
 
         // Verify new context exists in DB
         let db = d.kernel_db().lock();
         let contexts = db.list_active_contexts(d.kernel_id()).unwrap();
-        assert!(contexts.iter().any(|r| r.label.as_deref() == Some("branch")));
+        assert!(
+            contexts
+                .iter()
+                .any(|r| r.label.as_deref() == Some("branch"))
+        );
     }
 
     #[tokio::test]
@@ -820,7 +915,13 @@ mod tests {
         let c = caller_with_context(source);
         let result = d
             .dispatch(
-                &[s("fork"), s("--name"), s("noted"), s("--prompt"), s("explore auth bug")],
+                &[
+                    s("fork"),
+                    s("--name"),
+                    s("noted"),
+                    s("--prompt"),
+                    s("explore auth bug"),
+                ],
                 &c,
             )
             .await;
@@ -848,9 +949,22 @@ mod tests {
             .unwrap();
 
         let c = caller_with_context(source);
-        let result = d.dispatch(&[s("fork"), s("--compact"), s("--name"), s("compacted")], &c).await;
-        assert!(!result.is_ok(), "should fail on empty source: {}", result.message());
-        assert!(result.message().contains("no blocks"), "msg: {}", result.message());
+        let result = d
+            .dispatch(
+                &[s("fork"), s("--compact"), s("--name"), s("compacted")],
+                &c,
+            )
+            .await;
+        assert!(
+            !result.is_ok(),
+            "should fail on empty source: {}",
+            result.message()
+        );
+        assert!(
+            result.message().contains("no blocks"),
+            "msg: {}",
+            result.message()
+        );
     }
 
     #[tokio::test]
@@ -870,7 +984,8 @@ mod tests {
                 cwd: Some("/home/user/project".into()),
                 init_script: None,
                 updated_at: kaijutsu_types::now_millis() as i64,
-            }).unwrap();
+            })
+            .unwrap();
             db.set_context_env(source, "RUST_LOG", "debug").unwrap();
             db.set_context_env(source, "EDITOR", "vim").unwrap();
         }
@@ -881,7 +996,10 @@ mod tests {
 
         // Find the new context and verify config was copied
         let db = d.kernel_db().lock();
-        let child = db.find_context_by_label(d.kernel_id(), "child").unwrap().unwrap();
+        let child = db
+            .find_context_by_label(d.kernel_id(), "child")
+            .unwrap()
+            .unwrap();
         let shell = db.get_context_shell(child.context_id).unwrap().unwrap();
         assert_eq!(shell.cwd, Some("/home/user/project".into()));
         let env = db.get_context_env(child.context_id).unwrap();
@@ -905,26 +1023,38 @@ mod tests {
                 cwd: Some("/home/user/project".into()),
                 init_script: None,
                 updated_at: kaijutsu_types::now_millis() as i64,
-            }).unwrap();
+            })
+            .unwrap();
         }
 
         let c = caller_with_context(source);
-        let result = d.dispatch(
-            &[s("fork"), s("--name"), s("research"), s("--pwd"), s("/home/user/src/bevy_vello")],
-            &c,
-        ).await;
+        let result = d
+            .dispatch(
+                &[
+                    s("fork"),
+                    s("--name"),
+                    s("research"),
+                    s("--pwd"),
+                    s("/home/user/src/bevy_vello"),
+                ],
+                &c,
+            )
+            .await;
         assert!(result.is_ok(), "fork failed: {}", result.message());
 
         let db = d.kernel_db().lock();
-        let child = db.find_context_by_label(d.kernel_id(), "research").unwrap().unwrap();
+        let child = db
+            .find_context_by_label(d.kernel_id(), "research")
+            .unwrap()
+            .unwrap();
         let shell = db.get_context_shell(child.context_id).unwrap().unwrap();
         assert_eq!(shell.cwd, Some("/home/user/src/bevy_vello".into()));
     }
 
     /// Register a mock LLM provider on the kernel so --model validation passes.
     async fn register_mock_provider(d: &super::super::KjDispatcher) {
-        use std::sync::Arc;
         use crate::llm::{MockClient, RigProvider};
+        use std::sync::Arc;
         let mock = Arc::new(RigProvider::Mock(MockClient::new("mock response")));
         let mut registry = d.kernel().llm().write().await;
         registry.register("mock", mock);
@@ -960,9 +1090,20 @@ mod tests {
 
         // Verify child inherited provider+model in DB
         let db = d.kernel_db().lock();
-        let child = db.find_context_by_label(d.kernel_id(), "child").unwrap().unwrap();
-        assert_eq!(child.provider.as_deref(), Some("mock"), "child should inherit parent provider");
-        assert_eq!(child.model.as_deref(), Some("mock-model"), "child should inherit parent model");
+        let child = db
+            .find_context_by_label(d.kernel_id(), "child")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            child.provider.as_deref(),
+            Some("mock"),
+            "child should inherit parent provider"
+        );
+        assert_eq!(
+            child.model.as_deref(),
+            Some("mock-model"),
+            "child should inherit parent model"
+        );
     }
 
     #[tokio::test]
@@ -978,22 +1119,35 @@ mod tests {
         configure_context_model(&d, source, "mock", "mock-model").await;
 
         let c = caller_with_context(source);
-        let result = d.dispatch(
-            &[s("fork"), s("--name"), s("override"), s("--model"), s("mock/custom-model")],
-            &c,
-        ).await;
+        let result = d
+            .dispatch(
+                &[
+                    s("fork"),
+                    s("--name"),
+                    s("override"),
+                    s("--model"),
+                    s("mock/custom-model"),
+                ],
+                &c,
+            )
+            .await;
         assert!(result.is_ok(), "fork failed: {}", result.message());
 
         // Verify child has overridden model in DB
         let db = d.kernel_db().lock();
-        let child = db.find_context_by_label(d.kernel_id(), "override").unwrap().unwrap();
+        let child = db
+            .find_context_by_label(d.kernel_id(), "override")
+            .unwrap()
+            .unwrap();
         assert_eq!(child.provider.as_deref(), Some("mock"));
         assert_eq!(child.model.as_deref(), Some("custom-model"));
 
         // And in DriftRouter
         drop(db);
         let drift = d.drift_router().read().await;
-        let handle = drift.get(child.context_id).expect("child should be in DriftRouter");
+        let handle = drift
+            .get(child.context_id)
+            .expect("child should be in DriftRouter");
         assert_eq!(handle.provider.as_deref(), Some("mock"));
         assert_eq!(handle.model.as_deref(), Some("custom-model"));
     }
@@ -1008,10 +1162,18 @@ mod tests {
             .unwrap();
 
         let c = caller_with_context(source);
-        let result = d.dispatch(
-            &[s("fork"), s("--name"), s("bad"), s("--model"), s("nonexistent/foo")],
-            &c,
-        ).await;
+        let result = d
+            .dispatch(
+                &[
+                    s("fork"),
+                    s("--name"),
+                    s("bad"),
+                    s("--model"),
+                    s("nonexistent/foo"),
+                ],
+                &c,
+            )
+            .await;
         assert!(!result.is_ok(), "should have failed: {}", result.message());
         assert!(
             result.message().contains("unknown provider"),
@@ -1022,7 +1184,10 @@ mod tests {
         // Verify no context was created (mutation didn't happen)
         let db = d.kernel_db().lock();
         let found = db.find_context_by_label(d.kernel_id(), "bad").unwrap();
-        assert!(found.is_none(), "no context should have been created for invalid provider");
+        assert!(
+            found.is_none(),
+            "no context should have been created for invalid provider"
+        );
     }
 
     /// Bare model name (no provider/ prefix) should resolve provider from registry.
@@ -1047,24 +1212,49 @@ mod tests {
 
         let c = caller_with_context(source);
         // Bare model name — no "mock/" prefix
-        let result = d.dispatch(
-            &[s("fork"), s("--name"), s("bare"), s("--model"), s("new-model")],
-            &c,
-        ).await;
+        let result = d
+            .dispatch(
+                &[
+                    s("fork"),
+                    s("--name"),
+                    s("bare"),
+                    s("--model"),
+                    s("new-model"),
+                ],
+                &c,
+            )
+            .await;
         assert!(result.is_ok(), "fork failed: {}", result.message());
 
         // Verify provider was resolved from registry default
         let db = d.kernel_db().lock();
-        let child = db.find_context_by_label(d.kernel_id(), "bare").unwrap().unwrap();
-        assert_eq!(child.provider.as_deref(), Some("mock"), "provider should be resolved from registry");
+        let child = db
+            .find_context_by_label(d.kernel_id(), "bare")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            child.provider.as_deref(),
+            Some("mock"),
+            "provider should be resolved from registry"
+        );
         assert_eq!(child.model.as_deref(), Some("new-model"));
 
         // And in DriftRouter
         drop(db);
         let drift = d.drift_router().read().await;
-        let handle = drift.get(child.context_id).expect("child should be in DriftRouter");
-        assert_eq!(handle.provider.as_deref(), Some("mock"), "DriftRouter provider should match");
-        assert_eq!(handle.model.as_deref(), Some("new-model"), "DriftRouter model should match");
+        let handle = drift
+            .get(child.context_id)
+            .expect("child should be in DriftRouter");
+        assert_eq!(
+            handle.provider.as_deref(),
+            Some("mock"),
+            "DriftRouter provider should match"
+        );
+        assert_eq!(
+            handle.model.as_deref(),
+            Some("new-model"),
+            "DriftRouter model should match"
+        );
     }
 
     /// Fork should return Switch so the session moves to the new context.
@@ -1081,7 +1271,10 @@ mod tests {
         let result = d.dispatch(&[s("fork"), s("--name"), s("child")], &c).await;
         match &result {
             super::super::KjResult::Switch(id, msg) => {
-                assert_ne!(*id, source, "should switch to new context, not stay on source");
+                assert_ne!(
+                    *id, source,
+                    "should switch to new context, not stay on source"
+                );
                 assert!(msg.contains("child"), "msg: {msg}");
             }
             other => panic!("expected Switch, got: {}", other.message()),
@@ -1109,7 +1302,8 @@ mod tests {
                 created_at: kaijutsu_types::now_millis() as i64,
                 created_by: principal,
                 archived_at: None,
-            }).unwrap();
+            })
+            .unwrap();
             db.update_workspace(source, Some(ws_id)).unwrap();
         }
 
@@ -1118,7 +1312,10 @@ mod tests {
         assert!(result.is_ok(), "fork failed: {}", result.message());
 
         let db = d.kernel_db().lock();
-        let child = db.find_context_by_label(d.kernel_id(), "child").unwrap().unwrap();
+        let child = db
+            .find_context_by_label(d.kernel_id(), "child")
+            .unwrap()
+            .unwrap();
         assert_eq!(child.workspace_id, Some(ws_id));
     }
 }

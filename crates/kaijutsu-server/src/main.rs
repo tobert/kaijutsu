@@ -66,8 +66,7 @@ DATABASE:
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     let registry = tracing_subscriber::registry()
         .with(filter)
@@ -95,7 +94,10 @@ async fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         "--port" => {
-            let port = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_SSH_PORT);
+            let port = args
+                .get(2)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(DEFAULT_SSH_PORT);
             run_server(port).await
         }
         "add-key" => cmd_add_key(&args[2..]),
@@ -199,7 +201,10 @@ fn cmd_add_key(args: &[String]) -> ExitCode {
         Ok(Some(existing)) => {
             eprintln!("Key already exists: {}", fingerprint);
             if let Ok(Some(principal)) = db.get_principal(existing.principal_id) {
-                eprintln!("  User: {} ({})", principal.username, principal.display_name);
+                eprintln!(
+                    "  User: {} ({})",
+                    principal.username, principal.display_name
+                );
             }
             return ExitCode::FAILURE;
         }
@@ -250,10 +255,7 @@ fn cmd_remove_user(args: &[String]) -> ExitCode {
     // Check if user exists first
     match db.get_principal_by_username(username) {
         Ok(Some(principal)) => {
-            let key_count = db
-                .list_keys(principal.id)
-                .map(|k| k.len())
-                .unwrap_or(0);
+            let key_count = db.list_keys(principal.id).map(|k| k.len()).unwrap_or(0);
 
             match db.remove_principal(username) {
                 Ok(true) => {
@@ -354,7 +356,10 @@ fn cmd_list_keys(args: &[String]) -> ExitCode {
             }
         };
 
-        println!("Keys for {} ({}):", principal.username, principal.display_name);
+        println!(
+            "Keys for {} ({}):",
+            principal.username, principal.display_name
+        );
         println!();
 
         for key in keys {
@@ -382,8 +387,8 @@ fn cmd_list_keys(args: &[String]) -> ExitCode {
         }
 
         println!(
-            "{:<16} {:<12} {:<48} {}",
-            "USER", "TYPE", "FINGERPRINT", "COMMENT"
+            "{:<16} {:<12} {:<48} COMMENT",
+            "USER", "TYPE", "FINGERPRINT"
         );
         println!("{}", "-".repeat(90));
 

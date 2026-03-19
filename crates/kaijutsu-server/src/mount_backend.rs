@@ -17,17 +17,14 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use kaish_kernel::{
-    BackendError, BackendResult, KernelBackend,
-    PatchOp, ReadRange, ToolInfo, ToolResult, WriteMode,
-};
 use kaish_kernel::backend::ConflictError;
 use kaish_kernel::tools::{ExecContext, ToolArgs};
 use kaish_kernel::vfs::{DirEntry, DirEntryKind};
-
-use kaijutsu_kernel::vfs::{
-    FileType, MountTable, VfsError, VfsOps,
+use kaish_kernel::{
+    BackendError, BackendResult, KernelBackend, PatchOp, ReadRange, ToolInfo, ToolResult, WriteMode,
 };
+
+use kaijutsu_kernel::vfs::{FileType, MountTable, VfsError, VfsOps};
 
 use crate::kaish_backend::KaijutsuBackend;
 
@@ -42,10 +39,7 @@ pub struct MountBackend {
 
 impl MountBackend {
     /// Create a new MountBackend.
-    pub fn new(
-        mount_table: Arc<MountTable>,
-        docs_tools: Arc<KaijutsuBackend>,
-    ) -> Self {
+    pub fn new(mount_table: Arc<MountTable>, docs_tools: Arc<KaijutsuBackend>) -> Self {
         Self {
             mount_table,
             docs_tools,
@@ -62,7 +56,9 @@ fn vfs_to_backend(err: VfsError) -> BackendError {
         VfsError::ReadOnly => BackendError::ReadOnly,
         VfsError::NotADirectory(msg) => BackendError::NotDirectory(msg),
         VfsError::IsADirectory(msg) => BackendError::IsDirectory(msg),
-        VfsError::DirectoryNotEmpty(msg) => BackendError::Io(format!("directory not empty: {}", msg)),
+        VfsError::DirectoryNotEmpty(msg) => {
+            BackendError::Io(format!("directory not empty: {}", msg))
+        }
         VfsError::PathEscapesRoot(msg) => BackendError::PermissionDenied(msg),
         VfsError::InvalidPath(msg) => BackendError::InvalidOperation(msg),
         VfsError::NoMountPoint(msg) => BackendError::NotFound(msg),
@@ -128,15 +124,19 @@ impl KernelBackend for MountBackend {
                     .await
                     .map_err(vfs_to_backend)
             }
-            Some(ReadRange { offset: Some(off), limit: Some(lim), .. }) => {
-                self.mount_table
-                    .read(path, off, lim as u32)
-                    .await
-                    .map_err(vfs_to_backend)
-            }
+            Some(ReadRange {
+                offset: Some(off),
+                limit: Some(lim),
+                ..
+            }) => self
+                .mount_table
+                .read(path, off, lim as u32)
+                .await
+                .map_err(vfs_to_backend),
             Some(range) => {
                 // Line-based or partial: read all then slice
-                let data = self.mount_table
+                let data = self
+                    .mount_table
                     .read_all(path)
                     .await
                     .map_err(vfs_to_backend)?;
@@ -190,12 +190,11 @@ impl KernelBackend for MountBackend {
                     .await
                     .map_err(vfs_to_backend)
             }
-            WriteMode::Overwrite | WriteMode::Truncate => {
-                self.mount_table
-                    .write_all(path, content)
-                    .await
-                    .map_err(vfs_to_backend)
-            }
+            WriteMode::Overwrite | WriteMode::Truncate => self
+                .mount_table
+                .write_all(path, content)
+                .await
+                .map_err(vfs_to_backend),
             _ => Err(BackendError::InvalidOperation(
                 "unsupported write mode".into(),
             )),
@@ -203,7 +202,8 @@ impl KernelBackend for MountBackend {
     }
 
     async fn append(&self, path: &Path, content: &[u8]) -> BackendResult<()> {
-        let attr = self.mount_table
+        let attr = self
+            .mount_table
             .getattr(path)
             .await
             .map_err(vfs_to_backend)?;
@@ -216,7 +216,8 @@ impl KernelBackend for MountBackend {
 
     async fn patch(&self, path: &Path, ops: &[PatchOp]) -> BackendResult<()> {
         // Read current content, apply patches in memory, write back
-        let mut data = self.mount_table
+        let mut data = self
+            .mount_table
             .read_all(path)
             .await
             .map_err(vfs_to_backend)?;
@@ -226,18 +227,27 @@ impl KernelBackend for MountBackend {
             match op {
                 PatchOp::Insert { offset, content } => {
                     if *offset > text.len() {
-                        return Err(BackendError::InvalidOperation(
-                            format!("insert offset {} beyond end of file ({})", offset, text.len()),
-                        ));
+                        return Err(BackendError::InvalidOperation(format!(
+                            "insert offset {} beyond end of file ({})",
+                            offset,
+                            text.len()
+                        )));
                     }
                     text.insert_str(*offset, content);
                 }
-                PatchOp::Delete { offset, len, expected } => {
+                PatchOp::Delete {
+                    offset,
+                    len,
+                    expected,
+                } => {
                     let end = offset + len;
                     if end > text.len() {
-                        return Err(BackendError::InvalidOperation(
-                            format!("delete range {}..{} beyond end of file ({})", offset, end, text.len()),
-                        ));
+                        return Err(BackendError::InvalidOperation(format!(
+                            "delete range {}..{} beyond end of file ({})",
+                            offset,
+                            end,
+                            text.len()
+                        )));
                     }
                     if let Some(exp) = expected {
                         let actual = &text[*offset..end];
@@ -251,12 +261,20 @@ impl KernelBackend for MountBackend {
                     }
                     text.replace_range(*offset..end, "");
                 }
-                PatchOp::Replace { offset, len, content, expected } => {
+                PatchOp::Replace {
+                    offset,
+                    len,
+                    content,
+                    expected,
+                } => {
                     let end = offset + len;
                     if end > text.len() {
-                        return Err(BackendError::InvalidOperation(
-                            format!("replace range {}..{} beyond end of file ({})", offset, end, text.len()),
-                        ));
+                        return Err(BackendError::InvalidOperation(format!(
+                            "replace range {}..{} beyond end of file ({})",
+                            offset,
+                            end,
+                            text.len()
+                        )));
                     }
                     if let Some(exp) = expected {
                         let actual = &text[*offset..end];
@@ -280,38 +298,46 @@ impl KernelBackend for MountBackend {
                     let mut lines: Vec<&str> = text.split('\n').collect();
                     let idx = line.saturating_sub(1);
                     if idx >= lines.len() {
-                        return Err(BackendError::InvalidOperation(
-                            format!("line {} out of range ({})", line, lines.len()),
-                        ));
+                        return Err(BackendError::InvalidOperation(format!(
+                            "line {} out of range ({})",
+                            line,
+                            lines.len()
+                        )));
                     }
-                    if let Some(exp) = expected {
-                        if lines[idx] != exp.as_str() {
-                            return Err(BackendError::Conflict(ConflictError {
-                                location: format!("line {}", line),
-                                expected: exp.clone(),
-                                actual: lines[idx].to_string(),
-                            }));
-                        }
+                    if let Some(exp) = expected
+                        && lines[idx] != exp.as_str()
+                    {
+                        return Err(BackendError::Conflict(ConflictError {
+                            location: format!("line {}", line),
+                            expected: exp.clone(),
+                            actual: lines[idx].to_string(),
+                        }));
                     }
                     lines.remove(idx);
                     text = lines.join("\n");
                 }
-                PatchOp::ReplaceLine { line, content, expected } => {
+                PatchOp::ReplaceLine {
+                    line,
+                    content,
+                    expected,
+                } => {
                     let mut lines: Vec<&str> = text.split('\n').collect();
                     let idx = line.saturating_sub(1);
                     if idx >= lines.len() {
-                        return Err(BackendError::InvalidOperation(
-                            format!("line {} out of range ({})", line, lines.len()),
-                        ));
+                        return Err(BackendError::InvalidOperation(format!(
+                            "line {} out of range ({})",
+                            line,
+                            lines.len()
+                        )));
                     }
-                    if let Some(exp) = expected {
-                        if lines[idx] != exp.as_str() {
-                            return Err(BackendError::Conflict(ConflictError {
-                                location: format!("line {}", line),
-                                expected: exp.clone(),
-                                actual: lines[idx].to_string(),
-                            }));
-                        }
+                    if let Some(exp) = expected
+                        && lines[idx] != exp.as_str()
+                    {
+                        return Err(BackendError::Conflict(ConflictError {
+                            location: format!("line {}", line),
+                            expected: exp.clone(),
+                            actual: lines[idx].to_string(),
+                        }));
                     }
                     lines[idx] = content;
                     text = lines.join("\n");
@@ -334,7 +360,8 @@ impl KernelBackend for MountBackend {
     // =========================================================================
 
     async fn list(&self, path: &Path) -> BackendResult<Vec<DirEntry>> {
-        let entries = self.mount_table
+        let entries = self
+            .mount_table
             .readdir(path)
             .await
             .map_err(vfs_to_backend)?;
@@ -342,7 +369,8 @@ impl KernelBackend for MountBackend {
     }
 
     async fn stat(&self, path: &Path) -> BackendResult<DirEntry> {
-        let attr = self.mount_table
+        let attr = self
+            .mount_table
             .getattr(path)
             .await
             .map_err(vfs_to_backend)?;
@@ -366,7 +394,8 @@ impl KernelBackend for MountBackend {
             // Walk and remove children first
             self.remove_recursive(path).await
         } else {
-            let attr = self.mount_table
+            let attr = self
+                .mount_table
                 .getattr(path)
                 .await
                 .map_err(vfs_to_backend)?;
@@ -452,7 +481,8 @@ impl KernelBackend for MountBackend {
 impl MountBackend {
     /// Recursively remove a directory and all its contents.
     async fn remove_recursive(&self, path: &Path) -> BackendResult<()> {
-        let entries = self.mount_table
+        let entries = self
+            .mount_table
             .readdir(path)
             .await
             .map_err(vfs_to_backend)?;
@@ -463,7 +493,10 @@ impl MountBackend {
                 // Recurse into subdirectory using Box::pin for async recursion
                 Box::pin(self.remove_recursive(&child)).await?;
             } else {
-                self.mount_table.unlink(&child).await.map_err(vfs_to_backend)?;
+                self.mount_table
+                    .unlink(&child)
+                    .await
+                    .map_err(vfs_to_backend)?;
             }
         }
 
@@ -474,8 +507,8 @@ impl MountBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kaijutsu_kernel::block_store::shared_block_store;
     use kaijutsu_kernel::Kernel as KaijutsuKernel;
+    use kaijutsu_kernel::block_store::shared_block_store;
     use kaijutsu_kernel::vfs::backends::MemoryBackend;
     use kaijutsu_types::PrincipalId;
 
@@ -503,11 +536,18 @@ mod tests {
         let backend = test_mount_backend().await;
 
         backend
-            .write(Path::new("/tmp/test.txt"), b"hello world", WriteMode::Overwrite)
+            .write(
+                Path::new("/tmp/test.txt"),
+                b"hello world",
+                WriteMode::Overwrite,
+            )
             .await
             .unwrap();
 
-        let data = backend.read(Path::new("/tmp/test.txt"), None).await.unwrap();
+        let data = backend
+            .read(Path::new("/tmp/test.txt"), None)
+            .await
+            .unwrap();
         assert_eq!(data, b"hello world");
     }
 
@@ -566,7 +606,10 @@ mod tests {
         backend.mkdir(Path::new("/tmp/subdir")).await.unwrap();
         assert!(backend.exists(Path::new("/tmp/subdir")).await);
 
-        backend.remove(Path::new("/tmp/subdir"), false).await.unwrap();
+        backend
+            .remove(Path::new("/tmp/subdir"), false)
+            .await
+            .unwrap();
         assert!(!backend.exists(Path::new("/tmp/subdir")).await);
     }
 
@@ -597,9 +640,15 @@ mod tests {
             .await
             .unwrap();
 
-        backend.append(Path::new("/tmp/append.txt"), b" world").await.unwrap();
+        backend
+            .append(Path::new("/tmp/append.txt"), b" world")
+            .await
+            .unwrap();
 
-        let data = backend.read(Path::new("/tmp/append.txt"), None).await.unwrap();
+        let data = backend
+            .read(Path::new("/tmp/append.txt"), None)
+            .await
+            .unwrap();
         assert_eq!(data, b"hello world");
     }
 }

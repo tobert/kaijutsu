@@ -32,21 +32,20 @@ use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 
 use kaijutsu_crdt::BlockId;
-use kaijutsu_kernel::block_store::SharedBlockStore;
-use kaijutsu_types::DocKind;
-use kaijutsu_kernel::tools::{ExecResult, ToolInfo as KaijutsuToolInfo};
 use kaijutsu_kernel::Kernel as KaijutsuKernel;
+use kaijutsu_kernel::block_store::SharedBlockStore;
+use kaijutsu_kernel::tools::{ExecResult, ToolInfo as KaijutsuToolInfo};
+use kaijutsu_types::DocKind;
 use kaijutsu_types::{ContextId, KernelId, PrincipalId, SessionId};
 
 /// Shared mutable context ID, updated when a connection switches context.
 pub type SharedContextId = Arc<RwLock<ContextId>>;
 
-use kaish_kernel::{
-    BackendError, BackendResult, KernelBackend, PatchOp, ReadRange, ToolInfo,
-    ToolResult, WriteMode,
-};
 use kaish_kernel::tools::{ExecContext, ParamSchema, ToolArgs, ToolSchema};
 use kaish_kernel::vfs::{DirEntry, MountInfo};
+use kaish_kernel::{
+    BackendError, BackendResult, KernelBackend, PatchOp, ReadRange, ToolInfo, ToolResult, WriteMode,
+};
 
 /// Backend that routes kaish operations to kaijutsu's CRDT block store.
 ///
@@ -84,7 +83,14 @@ impl KaijutsuBackend {
         session_id: SessionId,
         kernel_id: KernelId,
     ) -> Self {
-        Self { blocks, kernel, principal_id, context_id, session_id, kernel_id }
+        Self {
+            blocks,
+            kernel,
+            principal_id,
+            context_id,
+            session_id,
+            kernel_id,
+        }
     }
 
     /// Resolve a VFS path to a ContextId and optional block ID.
@@ -105,30 +111,24 @@ impl KaijutsuBackend {
         match components.as_slice() {
             [] => PathResolution::Root,
             ["docs"] => PathResolution::DocsRoot,
-            ["docs", ctx_hex] => {
-                match ContextId::parse(ctx_hex) {
-                    Ok(ctx_id) => PathResolution::Document(ctx_id),
-                    Err(_) => PathResolution::Invalid(format!("invalid context ID: {}", ctx_hex)),
-                }
-            }
-            ["docs", ctx_hex, "_meta"] => {
-                match ContextId::parse(ctx_hex) {
-                    Ok(ctx_id) => PathResolution::DocumentMeta(ctx_id),
-                    Err(_) => PathResolution::Invalid(format!("invalid context ID: {}", ctx_hex)),
-                }
-            }
-            ["docs", ctx_hex, block_key] => {
-                match ContextId::parse(ctx_hex) {
-                    Ok(ctx_id) => {
-                        if let Some(block_id) = BlockId::from_key(block_key) {
-                            PathResolution::Block(ctx_id, block_id)
-                        } else {
-                            PathResolution::Invalid(format!("invalid block key: {}", block_key))
-                        }
+            ["docs", ctx_hex] => match ContextId::parse(ctx_hex) {
+                Ok(ctx_id) => PathResolution::Document(ctx_id),
+                Err(_) => PathResolution::Invalid(format!("invalid context ID: {}", ctx_hex)),
+            },
+            ["docs", ctx_hex, "_meta"] => match ContextId::parse(ctx_hex) {
+                Ok(ctx_id) => PathResolution::DocumentMeta(ctx_id),
+                Err(_) => PathResolution::Invalid(format!("invalid context ID: {}", ctx_hex)),
+            },
+            ["docs", ctx_hex, block_key] => match ContextId::parse(ctx_hex) {
+                Ok(ctx_id) => {
+                    if let Some(block_id) = BlockId::from_key(block_key) {
+                        PathResolution::Block(ctx_id, block_id)
+                    } else {
+                        PathResolution::Invalid(format!("invalid block key: {}", block_key))
                     }
-                    Err(_) => PathResolution::Invalid(format!("invalid context ID: {}", ctx_hex)),
                 }
-            }
+                Err(_) => PathResolution::Invalid(format!("invalid context ID: {}", ctx_hex)),
+            },
             _ => PathResolution::Invalid(format!("unsupported path: {}", path_str)),
         }
     }
@@ -137,38 +137,25 @@ impl KaijutsuBackend {
     ///
     /// When a JSON Schema is provided (from the engine), converts its properties
     /// to kaish `ParamSchema` entries so that positional→named mapping works.
-    fn convert_tool_info(info: &KaijutsuToolInfo, json_schema: Option<serde_json::Value>) -> ToolInfo {
+    fn convert_tool_info(
+        info: &KaijutsuToolInfo,
+        json_schema: Option<serde_json::Value>,
+    ) -> ToolInfo {
         let mut schema = ToolSchema::new(&info.name, &info.description);
 
-        if let Some(js) = json_schema {
-            if let Some(props) = js.get("properties").and_then(|p| p.as_object()) {
-                let required: Vec<&str> = js
-                    .get("required")
-                    .and_then(|r| r.as_array())
-                    .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
-                    .unwrap_or_default();
+        if let Some(js) = json_schema
+            && let Some(props) = js.get("properties").and_then(|p| p.as_object())
+        {
+            let required: Vec<&str> = js
+                .get("required")
+                .and_then(|r| r.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
 
-                // Add required params first (in `required` array order) so positional
-                // mapping assigns args to the right params regardless of JSON key order.
-                for &req_name in &required {
-                    if let Some(prop) = props.get(req_name) {
-                        let param_type = prop
-                            .get("type")
-                            .and_then(|t| t.as_str())
-                            .unwrap_or("string");
-                        let desc = prop
-                            .get("description")
-                            .and_then(|d| d.as_str())
-                            .unwrap_or("");
-                        schema = schema.param(ParamSchema::required(req_name, param_type, desc));
-                    }
-                }
-
-                // Then optional params
-                for (name, prop) in props {
-                    if required.contains(&name.as_str()) {
-                        continue; // Already added above
-                    }
+            // Add required params first (in `required` array order) so positional
+            // mapping assigns args to the right params regardless of JSON key order.
+            for &req_name in &required {
+                if let Some(prop) = props.get(req_name) {
                     let param_type = prop
                         .get("type")
                         .and_then(|t| t.as_str())
@@ -177,13 +164,29 @@ impl KaijutsuBackend {
                         .get("description")
                         .and_then(|d| d.as_str())
                         .unwrap_or("");
-                    let default = prop
-                        .get("default")
-                        .cloned()
-                        .map(json_to_kaish_value)
-                        .unwrap_or(kaish_kernel::ast::Value::Null);
-                    schema = schema.param(ParamSchema::optional(name, param_type, default, desc));
+                    schema = schema.param(ParamSchema::required(req_name, param_type, desc));
                 }
+            }
+
+            // Then optional params
+            for (name, prop) in props {
+                if required.contains(&name.as_str()) {
+                    continue; // Already added above
+                }
+                let param_type = prop
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("string");
+                let desc = prop
+                    .get("description")
+                    .and_then(|d| d.as_str())
+                    .unwrap_or("");
+                let default = prop
+                    .get("default")
+                    .cloned()
+                    .map(json_to_kaish_value)
+                    .unwrap_or(kaish_kernel::ast::Value::Null);
+                schema = schema.param(ParamSchema::optional(name, param_type, default, desc));
             }
         }
 
@@ -236,7 +239,10 @@ impl KernelBackend for KaijutsuBackend {
             PathResolution::DocsRoot => {
                 // List all documents
                 let ctx_ids = self.blocks.list_ids();
-                let listing: String = ctx_ids.iter().map(|id| format!("{}\n", id.to_hex())).collect();
+                let listing: String = ctx_ids
+                    .iter()
+                    .map(|id| format!("{}\n", id.to_hex()))
+                    .collect();
                 Ok(listing.into_bytes())
             }
             PathResolution::Document(ctx_id) => {
@@ -348,7 +354,10 @@ impl KernelBackend for KaijutsuBackend {
                         .find(|b| b.id == block_id)
                         .map(|b| b.content.len())
                         .ok_or_else(|| {
-                            BackendError::NotFound(format!("block not found: {}", block_id.to_key()))
+                            BackendError::NotFound(format!(
+                                "block not found: {}",
+                                block_id.to_key()
+                            ))
                         })?
                 };
 
@@ -359,12 +368,12 @@ impl KernelBackend for KaijutsuBackend {
 
                 Ok(())
             }
-            PathResolution::DocsRoot | PathResolution::Root => {
-                Err(BackendError::IsDirectory(path.to_string_lossy().to_string()))
-            }
-            PathResolution::DocumentMeta(_) => {
-                Err(BackendError::PermissionDenied("cannot write to _meta".into()))
-            }
+            PathResolution::DocsRoot | PathResolution::Root => Err(BackendError::IsDirectory(
+                path.to_string_lossy().to_string(),
+            )),
+            PathResolution::DocumentMeta(_) => Err(BackendError::PermissionDenied(
+                "cannot write to _meta".into(),
+            )),
             PathResolution::Invalid(msg) => Err(BackendError::InvalidOperation(msg)),
         }
     }
@@ -380,12 +389,12 @@ impl KernelBackend for KaijutsuBackend {
                     .map_err(|e| BackendError::Io(e.to_string()))?;
                 Ok(())
             }
-            PathResolution::Document(_) | PathResolution::DocsRoot | PathResolution::Root => {
-                Err(BackendError::IsDirectory(path.to_string_lossy().to_string()))
-            }
-            PathResolution::DocumentMeta(_) => {
-                Err(BackendError::PermissionDenied("cannot append to _meta".into()))
-            }
+            PathResolution::Document(_) | PathResolution::DocsRoot | PathResolution::Root => Err(
+                BackendError::IsDirectory(path.to_string_lossy().to_string()),
+            ),
+            PathResolution::DocumentMeta(_) => Err(BackendError::PermissionDenied(
+                "cannot append to _meta".into(),
+            )),
             PathResolution::Invalid(msg) => Err(BackendError::InvalidOperation(msg)),
         }
     }
@@ -404,21 +413,25 @@ impl KernelBackend for KaijutsuBackend {
                         .find(|b| b.id == block_id)
                         .map(|b| b.content.clone())
                         .ok_or_else(|| {
-                            BackendError::NotFound(format!("block not found: {}", block_id.to_key()))
+                            BackendError::NotFound(format!(
+                                "block not found: {}",
+                                block_id.to_key()
+                            ))
                         })?
                 };
 
                 // Apply patch operations in order
                 let mut current_content = content;
                 for op in ops {
-                    current_content = apply_patch_op(&self.blocks, ctx_id, &block_id, op, &current_content)?;
+                    current_content =
+                        apply_patch_op(&self.blocks, ctx_id, &block_id, op, &current_content)?;
                 }
 
                 Ok(())
             }
-            PathResolution::Document(_) | PathResolution::DocsRoot | PathResolution::Root => {
-                Err(BackendError::IsDirectory(path.to_string_lossy().to_string()))
-            }
+            PathResolution::Document(_) | PathResolution::DocsRoot | PathResolution::Root => Err(
+                BackendError::IsDirectory(path.to_string_lossy().to_string()),
+            ),
             PathResolution::DocumentMeta(_) => {
                 Err(BackendError::PermissionDenied("cannot patch _meta".into()))
             }
@@ -432,9 +445,7 @@ impl KernelBackend for KaijutsuBackend {
 
     async fn list(&self, path: &Path) -> BackendResult<Vec<DirEntry>> {
         match self.resolve_path(path) {
-            PathResolution::Root => {
-                Ok(vec![DirEntry::directory("docs")])
-            }
+            PathResolution::Root => Ok(vec![DirEntry::directory("docs")]),
             PathResolution::DocsRoot => {
                 let entries = self
                     .blocks
@@ -457,9 +468,9 @@ impl KernelBackend for KaijutsuBackend {
                 entries.push(DirEntry::file("_meta", 0));
                 Ok(entries)
             }
-            PathResolution::Block(_, _) | PathResolution::DocumentMeta(_) => {
-                Err(BackendError::NotDirectory(path.to_string_lossy().to_string()))
-            }
+            PathResolution::Block(_, _) | PathResolution::DocumentMeta(_) => Err(
+                BackendError::NotDirectory(path.to_string_lossy().to_string()),
+            ),
             PathResolution::Invalid(msg) => Err(BackendError::InvalidOperation(msg)),
         }
     }
@@ -490,7 +501,10 @@ impl KernelBackend for KaijutsuBackend {
                 let block = blocks.iter().find(|b| b.id == block_id).ok_or_else(|| {
                     BackendError::NotFound(format!("block not found: {}", block_id.to_key()))
                 })?;
-                Ok(DirEntry::file(block_id.to_key(), block.content.len() as u64))
+                Ok(DirEntry::file(
+                    block_id.to_key(),
+                    block.content.len() as u64,
+                ))
             }
             PathResolution::Invalid(msg) => Err(BackendError::InvalidOperation(msg)),
         }
@@ -511,12 +525,12 @@ impl KernelBackend for KaijutsuBackend {
                     .map_err(|e| BackendError::Io(e.to_string()))?;
                 Ok(())
             }
-            PathResolution::Root | PathResolution::DocsRoot => {
-                Err(BackendError::AlreadyExists(path.to_string_lossy().to_string()))
-            }
-            PathResolution::Block(_, _) | PathResolution::DocumentMeta(_) => {
-                Err(BackendError::InvalidOperation("cannot mkdir on block or meta".into()))
-            }
+            PathResolution::Root | PathResolution::DocsRoot => Err(BackendError::AlreadyExists(
+                path.to_string_lossy().to_string(),
+            )),
+            PathResolution::Block(_, _) | PathResolution::DocumentMeta(_) => Err(
+                BackendError::InvalidOperation("cannot mkdir on block or meta".into()),
+            ),
             PathResolution::Invalid(msg) => Err(BackendError::InvalidOperation(msg)),
         }
     }
@@ -549,9 +563,9 @@ impl KernelBackend for KaijutsuBackend {
                     .map_err(|e| BackendError::Io(e.to_string()))?;
                 Ok(())
             }
-            PathResolution::Root | PathResolution::DocsRoot => {
-                Err(BackendError::PermissionDenied("cannot remove root directories".into()))
-            }
+            PathResolution::Root | PathResolution::DocsRoot => Err(BackendError::PermissionDenied(
+                "cannot remove root directories".into(),
+            )),
             PathResolution::DocumentMeta(_) => {
                 Err(BackendError::PermissionDenied("cannot remove _meta".into()))
             }
@@ -617,8 +631,8 @@ impl KernelBackend for KaijutsuBackend {
         ctx: &mut ExecContext,
     ) -> BackendResult<ToolResult> {
         let params_json = tool_args_to_json(&args);
-        let params_str = serde_json::to_string(&params_json)
-            .map_err(|e| BackendError::Io(e.to_string()))?;
+        let params_str =
+            serde_json::to_string(&params_json).map_err(|e| BackendError::Io(e.to_string()))?;
 
         let engine = self
             .kernel
@@ -664,11 +678,7 @@ impl KernelBackend for KaijutsuBackend {
         let tool = self.kernel.get_tool(name).await;
         match tool {
             Some(t) => {
-                let engine_schema = self
-                    .kernel
-                    .get_engine(name)
-                    .await
-                    .and_then(|e| e.schema());
+                let engine_schema = self.kernel.get_engine(name).await.and_then(|e| e.schema());
                 Ok(Some(Self::convert_tool_info(&t, engine_schema)))
             }
             None => Ok(None),
@@ -738,15 +748,21 @@ fn apply_patch_op(
             result.insert_str(*offset, content);
             Ok(result)
         }
-        PatchOp::Delete { offset, len, expected } => {
+        PatchOp::Delete {
+            offset,
+            len,
+            expected,
+        } => {
             if let Some(exp) = expected {
                 let actual = current_content.get(*offset..*offset + *len).unwrap_or("");
                 if actual != exp {
-                    return Err(BackendError::Conflict(kaish_kernel::backend::ConflictError {
-                        location: format!("offset {}", offset),
-                        expected: exp.clone(),
-                        actual: actual.to_string(),
-                    }));
+                    return Err(BackendError::Conflict(
+                        kaish_kernel::backend::ConflictError {
+                            location: format!("offset {}", offset),
+                            expected: exp.clone(),
+                            actual: actual.to_string(),
+                        },
+                    ));
                 }
             }
             blocks
@@ -756,15 +772,22 @@ fn apply_patch_op(
             result.replace_range(*offset..*offset + *len, "");
             Ok(result)
         }
-        PatchOp::Replace { offset, len, content, expected } => {
+        PatchOp::Replace {
+            offset,
+            len,
+            content,
+            expected,
+        } => {
             if let Some(exp) = expected {
                 let actual = current_content.get(*offset..*offset + *len).unwrap_or("");
                 if actual != exp {
-                    return Err(BackendError::Conflict(kaish_kernel::backend::ConflictError {
-                        location: format!("offset {}", offset),
-                        expected: exp.clone(),
-                        actual: actual.to_string(),
-                    }));
+                    return Err(BackendError::Conflict(
+                        kaish_kernel::backend::ConflictError {
+                            location: format!("offset {}", offset),
+                            expected: exp.clone(),
+                            actual: actual.to_string(),
+                        },
+                    ));
                 }
             }
             blocks
@@ -787,14 +810,16 @@ fn apply_patch_op(
             let (start, end) = line_range(current_content, *line);
             let actual_line = current_content.get(start..end).unwrap_or("");
 
-            if let Some(exp) = expected {
-                if actual_line.trim_end_matches('\n') != exp.trim_end_matches('\n') {
-                    return Err(BackendError::Conflict(kaish_kernel::backend::ConflictError {
+            if let Some(exp) = expected
+                && actual_line.trim_end_matches('\n') != exp.trim_end_matches('\n')
+            {
+                return Err(BackendError::Conflict(
+                    kaish_kernel::backend::ConflictError {
                         location: format!("line {}", line),
                         expected: exp.clone(),
                         actual: actual_line.to_string(),
-                    }));
-                }
+                    },
+                ));
             }
 
             blocks
@@ -804,18 +829,24 @@ fn apply_patch_op(
             result.replace_range(start..end, "");
             Ok(result)
         }
-        PatchOp::ReplaceLine { line, content, expected } => {
+        PatchOp::ReplaceLine {
+            line,
+            content,
+            expected,
+        } => {
             let (start, end) = line_range(current_content, *line);
             let actual_line = current_content.get(start..end).unwrap_or("");
 
-            if let Some(exp) = expected {
-                if actual_line.trim_end_matches('\n') != exp.trim_end_matches('\n') {
-                    return Err(BackendError::Conflict(kaish_kernel::backend::ConflictError {
+            if let Some(exp) = expected
+                && actual_line.trim_end_matches('\n') != exp.trim_end_matches('\n')
+            {
+                return Err(BackendError::Conflict(
+                    kaish_kernel::backend::ConflictError {
                         location: format!("line {}", line),
                         expected: exp.clone(),
                         actual: actual_line.to_string(),
-                    }));
-                }
+                    },
+                ));
             }
 
             let replacement = format!("{}\n", content);
@@ -875,11 +906,7 @@ fn tool_args_to_json(args: &ToolArgs) -> JsonValue {
     let mut obj = serde_json::Map::new();
 
     if !args.positional.is_empty() {
-        let positional: Vec<JsonValue> = args
-            .positional
-            .iter()
-            .map(kaish_value_to_json)
-            .collect();
+        let positional: Vec<JsonValue> = args.positional.iter().map(kaish_value_to_json).collect();
         obj.insert("_positional".to_string(), JsonValue::Array(positional));
     }
 
@@ -983,7 +1010,7 @@ mod tests {
         let content = "line 1\nline 2\nline 3";
 
         assert_eq!(line_to_byte_offset(content, 1), 0);
-        assert_eq!(line_to_byte_offset(content, 2), 7);  // "line 1\n" = 7 bytes
+        assert_eq!(line_to_byte_offset(content, 2), 7); // "line 1\n" = 7 bytes
         assert_eq!(line_to_byte_offset(content, 3), 14); // "line 1\nline 2\n" = 14 bytes
     }
 
@@ -991,8 +1018,8 @@ mod tests {
     fn test_line_range() {
         let content = "line 1\nline 2\nline 3";
 
-        assert_eq!(line_range(content, 1), (0, 7));   // "line 1\n"
-        assert_eq!(line_range(content, 2), (7, 14));  // "line 2\n"
+        assert_eq!(line_range(content, 1), (0, 7)); // "line 1\n"
+        assert_eq!(line_range(content, 2), (7, 14)); // "line 2\n"
         assert_eq!(line_range(content, 3), (14, 20)); // "line 3" (no trailing newline)
     }
 

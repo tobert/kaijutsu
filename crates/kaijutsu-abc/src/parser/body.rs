@@ -49,7 +49,7 @@ pub fn parse_body(input: &str, collector: &mut FeedbackCollector) -> Vec<Element
             // Check for %%MIDI directive in body - warn that it's ignored
             if remaining.starts_with("%%MIDI") {
                 collector.warning(
-                    "%%MIDI directive found after K: field - move it before K: to take effect"
+                    "%%MIDI directive found after K: field - move it before K: to take effect",
                 );
             }
             // Skip to end of line

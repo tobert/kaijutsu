@@ -199,7 +199,9 @@ pub struct DocTreeRequest {
     #[schemars(description = "Maximum tree depth to display (omit for full tree)")]
     pub max_depth: Option<u32>,
     /// Show tool_call and tool_result as separate expanded nodes
-    #[schemars(description = "Show tool_call and tool_result as separate nodes (default: false, collapsed shows as single line)")]
+    #[schemars(
+        description = "Show tool_call and tool_result as separate nodes (default: false, collapsed shows as single line)"
+    )]
     #[serde(default)]
     pub expand_tools: bool,
 }
@@ -230,7 +232,9 @@ pub struct BlockDiffRequest {
     #[schemars(description = "Block ID to compare (format: context_id:agent_id:seq)")]
     pub block_id: String,
     /// Text to compare against current content
-    #[schemars(description = "Original text to diff against (if not provided, shows current content summary)")]
+    #[schemars(
+        description = "Original text to diff against (if not provided, shows current content summary)"
+    )]
     pub original: Option<String>,
 }
 
@@ -242,7 +246,9 @@ pub struct BlockDiffRequest {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct KaishExecRequest {
     /// Exact tool name to execute (use list_kernel_tools to discover names)
-    #[schemars(description = "Exact tool name (use list_kernel_tools to discover available names, e.g., 'drift_ls', 'glob', 'grep')")]
+    #[schemars(
+        description = "Exact tool name (use list_kernel_tools to discover available names, e.g., 'drift_ls', 'glob', 'grep')"
+    )]
     pub tool: String,
     /// JSON parameters for the tool
     #[schemars(description = "JSON parameters for the tool (tool-specific)")]

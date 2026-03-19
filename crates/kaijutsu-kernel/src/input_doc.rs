@@ -74,11 +74,18 @@ impl InputDocEntry {
     ///
     /// Inserts `insert` text at `pos` and deletes `delete` characters starting at `pos`.
     /// Returns serialized ops for broadcasting to subscribers.
-    pub fn edit_text(&mut self, pos: usize, insert: &str, delete: usize) -> Result<Vec<u8>, String> {
+    pub fn edit_text(
+        &mut self,
+        pos: usize,
+        insert: &str,
+        delete: usize,
+    ) -> Result<Vec<u8>, String> {
         let frontier_before: Frontier = self.doc.version().clone();
 
         // Compute text length before borrowing doc mutably via writer
-        let text_len = self.doc.text_content(&[INPUT_TEXT_KEY])
+        let text_len = self
+            .doc
+            .text_content(&[INPUT_TEXT_KEY])
             .map(|s| s.len())
             .unwrap_or(0);
 
@@ -111,8 +118,7 @@ impl InputDocEntry {
     /// Get serialized ops since a frontier (for sync).
     pub fn ops_since(&self, frontier: &Frontier) -> Result<Vec<u8>, String> {
         let ops = self.doc.ops_since_owned(frontier);
-        postcard::to_allocvec(&ops)
-            .map_err(|e| format!("Failed to serialize ops: {}", e))
+        postcard::to_allocvec(&ops).map_err(|e| format!("Failed to serialize ops: {}", e))
     }
 
     /// Get all ops from the beginning (for full state transfer).
@@ -124,7 +130,8 @@ impl InputDocEntry {
     pub fn merge_ops(&mut self, ops_bytes: &[u8]) -> Result<(), String> {
         let ops: SerializedOpsOwned = postcard::from_bytes(ops_bytes)
             .map_err(|e| format!("Failed to deserialize ops: {}", e))?;
-        self.doc.merge_ops(ops)
+        self.doc
+            .merge_ops(ops)
             .map_err(|e| format!("Failed to merge ops: {}", e))?;
         self.version.fetch_add(1, Ordering::SeqCst);
         Ok(())
@@ -166,7 +173,6 @@ impl InputDocEntry {
     pub fn frontier(&self) -> Frontier {
         self.doc.version().clone()
     }
-
 
     /// Record that a principal modified the input.
     pub fn touch(&self, principal_id: PrincipalId) {

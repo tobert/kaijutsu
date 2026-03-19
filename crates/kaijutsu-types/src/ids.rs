@@ -189,8 +189,7 @@ pub trait PrefixResolvable: Copy + PartialEq {
 // ── PrincipalId sentinels ───────────────────────────────────────────────────
 
 /// Fixed namespace for deriving deterministic PrincipalIds via UUIDv5.
-const KAIJUTSU_PRINCIPAL_NS: uuid::Uuid =
-    uuid::uuid!("e8a3c6f1-7b2d-4e90-a5f8-1c9d0e3b4a67");
+const KAIJUTSU_PRINCIPAL_NS: uuid::Uuid = uuid::uuid!("e8a3c6f1-7b2d-4e90-a5f8-1c9d0e3b4a67");
 
 impl PrincipalId {
     /// The well-known "system" principal.

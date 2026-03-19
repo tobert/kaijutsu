@@ -6,8 +6,8 @@
 
 use std::collections::HashMap;
 
-use kaijutsu_crdt::block_store::BlockStore as CrdtBlockStore;
 use kaijutsu_crdt::ContextId;
+use kaijutsu_crdt::block_store::BlockStore as CrdtBlockStore;
 use kaijutsu_types::{BlockId, BlockSnapshot, PrincipalId};
 use tracing::{debug, info, warn};
 
@@ -65,10 +65,7 @@ impl SyncedDocument {
     }
 
     /// Create from a [`SyncState`] (ops + version, no blocks).
-    pub fn from_sync_state(
-        state: &SyncState,
-        agent_id: PrincipalId,
-    ) -> Result<Self, SyncError> {
+    pub fn from_sync_state(state: &SyncState, agent_id: PrincipalId) -> Result<Self, SyncError> {
         let mut sd = Self::new(state.context_id, agent_id);
         if !state.ops.is_empty() {
             sd.sync
@@ -103,8 +100,7 @@ impl SyncedDocument {
             | ServerEvent::InputTextOps { context_id, .. }
             | ServerEvent::InputCleared { context_id, .. }
             | ServerEvent::ContextSwitched { context_id, .. } => Some(*context_id),
-            ServerEvent::ResourceUpdated { .. }
-            | ServerEvent::ResourceListChanged { .. } => None,
+            ServerEvent::ResourceUpdated { .. } | ServerEvent::ResourceListChanged { .. } => None,
         }
     }
 
@@ -209,15 +205,14 @@ impl SyncedDocument {
         // For per-block events (not BlockInserted), check if the block exists.
         // If not, buffer the event — it arrived before its BlockInserted due to
         // cross-topic FlowBus ordering. Only buffer events for our context.
-        if let Some(block_id) = Self::event_block_id(event) {
-            if Self::event_context_id(event) == Some(self.context_id)
-                && self.doc.get_block_snapshot(&block_id).is_none()
-            {
-                self.buffer_event(block_id, event);
-                return SyncEffect::Updated {
-                    block_count: self.doc.block_count(),
-                };
-            }
+        if let Some(block_id) = Self::event_block_id(event)
+            && Self::event_context_id(event) == Some(self.context_id)
+            && self.doc.get_block_snapshot(&block_id).is_none()
+        {
+            self.buffer_event(block_id, event);
+            return SyncEffect::Updated {
+                block_count: self.doc.block_count(),
+            };
         }
 
         self.apply_event_inner(event)
@@ -234,23 +229,24 @@ impl SyncedDocument {
                 if *context_id != self.context_id {
                     return SyncEffect::Ignored;
                 }
-                let effect = match self
-                    .sync
-                    .apply_block_inserted(&mut self.doc, *context_id, block, ops)
-                {
-                    Ok(crate::sync::SyncResult::FullSync { block_count }) => {
-                        SyncEffect::FullSync { block_count }
-                    }
-                    Ok(_) => SyncEffect::Updated {
-                        block_count: self.doc.block_count(),
-                    },
-                    Err(e) => {
-                        warn!("SyncedDocument: block insert error: {e}");
-                        SyncEffect::Updated {
-                            block_count: self.doc.block_count(),
+                let effect =
+                    match self
+                        .sync
+                        .apply_block_inserted(&mut self.doc, *context_id, block, ops)
+                    {
+                        Ok(crate::sync::SyncResult::FullSync { block_count }) => {
+                            SyncEffect::FullSync { block_count }
                         }
-                    }
-                };
+                        Ok(_) => SyncEffect::Updated {
+                            block_count: self.doc.block_count(),
+                        },
+                        Err(e) => {
+                            warn!("SyncedDocument: block insert error: {e}");
+                            SyncEffect::Updated {
+                                block_count: self.doc.block_count(),
+                            }
+                        }
+                    };
 
                 // Replay any events that arrived before this insert
                 self.replay_pending(&block.id);
@@ -290,10 +286,10 @@ impl SyncedDocument {
                     warn!("SyncedDocument: set_status error: {e}");
                 }
                 // Apply piggybacked output data (output is not DTE-tracked)
-                if let Some(output_data) = output {
-                    if let Err(e) = self.doc.set_output(block_id, Some(output_data.clone())) {
-                        warn!("SyncedDocument: set_output error: {e}");
-                    }
+                if let Some(output_data) = output
+                    && let Err(e) = self.doc.set_output(block_id, Some(output_data.clone()))
+                {
+                    warn!("SyncedDocument: set_output error: {e}");
                 }
                 SyncEffect::Updated {
                     block_count: self.doc.block_count(),
@@ -376,10 +372,7 @@ impl SyncedDocument {
     }
 
     /// Apply a sync state (from `get_context_sync` RPC or reconnect).
-    pub fn apply_sync_state(
-        &mut self,
-        state: &SyncState,
-    ) -> Result<SyncEffect, SyncError> {
+    pub fn apply_sync_state(&mut self, state: &SyncState) -> Result<SyncEffect, SyncError> {
         if state.ops.is_empty() {
             return Ok(SyncEffect::Ignored);
         }
@@ -593,7 +586,14 @@ mod tests {
 
         // Create a streaming block and add text on the server
         let block_id = server
-            .insert_block(None, None, Role::Model, BlockKind::Text, "Hello!", Status::Done)
+            .insert_block(
+                None,
+                None,
+                Role::Model,
+                BlockKind::Text,
+                "Hello!",
+                Status::Done,
+            )
             .unwrap();
 
         // Client gets updated snapshot
@@ -662,9 +662,36 @@ mod tests {
 
         // Server creates a realistic conversation with explicit ordering
         let mut server = CrdtBlockStore::new(ctx, server_agent);
-        let b1 = server.insert_block(None, None, Role::User, BlockKind::Text, "Hello", Status::Done).unwrap();
-        let b2 = server.insert_block(None, Some(&b1), Role::Model, BlockKind::Text, "Hi there", Status::Done).unwrap();
-        let b3 = server.insert_block(Some(&b2), Some(&b2), Role::Model, BlockKind::ToolCall, "search", Status::Done).unwrap();
+        let b1 = server
+            .insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "Hello",
+                Status::Done,
+            )
+            .unwrap();
+        let b2 = server
+            .insert_block(
+                None,
+                Some(&b1),
+                Role::Model,
+                BlockKind::Text,
+                "Hi there",
+                Status::Done,
+            )
+            .unwrap();
+        let b3 = server
+            .insert_block(
+                Some(&b2),
+                Some(&b2),
+                Role::Model,
+                BlockKind::ToolCall,
+                "search",
+                Status::Done,
+            )
+            .unwrap();
 
         // Client syncs initial state via SyncState
         let snap = snapshot_bytes(&server);
@@ -679,7 +706,16 @@ mod tests {
 
         // Server adds a new block (after b3)
         let frontier_before = server.frontier();
-        let b4 = server.insert_block(Some(&b3), Some(&b3), Role::Model, BlockKind::ToolResult, "found it", Status::Done).unwrap();
+        let b4 = server
+            .insert_block(
+                Some(&b3),
+                Some(&b3),
+                Role::Model,
+                BlockKind::ToolResult,
+                "found it",
+                Status::Done,
+            )
+            .unwrap();
         let _ = b4;
         let ops = sync_payload_bytes(&server, &frontier_before);
         // Get snapshot of the new block for the event
@@ -723,7 +759,14 @@ mod tests {
 
         // Insert command block (arrives in order)
         let cmd_id = server
-            .insert_block(None, None, Role::User, BlockKind::ToolCall, "ls -l", Status::Done)
+            .insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::ToolCall,
+                "ls -l",
+                Status::Done,
+            )
             .unwrap();
 
         // Insert output block on server
@@ -744,8 +787,15 @@ mod tests {
         // Client syncs initial state (just the command block)
         let initial_frontier = {
             let mut s = CrdtBlockStore::new(ctx, server_agent);
-            s.insert_block(None, None, Role::User, BlockKind::ToolCall, "ls -l", Status::Done)
-                .unwrap();
+            s.insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::ToolCall,
+                "ls -l",
+                Status::Done,
+            )
+            .unwrap();
             snapshot_bytes(&s)
         };
         let state = SyncState {
@@ -791,7 +841,14 @@ mod tests {
         let mut server = CrdtBlockStore::new(ctx, server_agent);
 
         let cmd_id = server
-            .insert_block(None, None, Role::User, BlockKind::ToolCall, "ls", Status::Done)
+            .insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::ToolCall,
+                "ls",
+                Status::Done,
+            )
             .unwrap();
 
         let frontier_before = server.frontier();
@@ -811,14 +868,26 @@ mod tests {
         // Client with just command block
         let initial = {
             let mut s = CrdtBlockStore::new(ctx, server_agent);
-            s.insert_block(None, None, Role::User, BlockKind::ToolCall, "ls", Status::Done)
-                .unwrap();
+            s.insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::ToolCall,
+                "ls",
+                Status::Done,
+            )
+            .unwrap();
             snapshot_bytes(&s)
         };
         let mut sd = SyncedDocument::from_sync_state(
-            &SyncState { context_id: ctx, version: 1, ops: initial },
+            &SyncState {
+                context_id: ctx,
+                version: 1,
+                ops: initial,
+            },
             test_agent_id(),
-        ).unwrap();
+        )
+        .unwrap();
 
         // All three arrive before insert
         sd.apply_event(&ServerEvent::BlockStatusChanged {
@@ -907,7 +976,16 @@ mod tests {
         // Now add a new block on server and sync it
         let mut server2 = server; // move
         let frontier_before = server2.frontier();
-        let b2 = server2.insert_block(None, None, Role::Model, BlockKind::Text, "Response", Status::Done).unwrap();
+        let b2 = server2
+            .insert_block(
+                None,
+                None,
+                Role::Model,
+                BlockKind::Text,
+                "Response",
+                Status::Done,
+            )
+            .unwrap();
         let ops = sync_payload_bytes(&server2, &frontier_before);
         let block = server2.get_block_snapshot(&b2).unwrap();
 

@@ -27,7 +27,9 @@ pub trait Embedder: Send + Sync {
     /// Embed a single text. Default: batch of 1.
     fn embed(&self, text: &str) -> Result<Vec<f32>, IndexError> {
         let mut results = self.embed_batch(&[text])?;
-        results.pop().ok_or_else(|| IndexError::Embedding("empty batch result".into()))
+        results
+            .pop()
+            .ok_or_else(|| IndexError::Embedding("empty batch result".into()))
     }
 }
 
@@ -58,7 +60,9 @@ impl OnnxEmbedder {
             return Err(IndexError::ModelNotFound(model_path.display().to_string()));
         }
         if !tokenizer_path.exists() {
-            return Err(IndexError::ModelNotFound(tokenizer_path.display().to_string()));
+            return Err(IndexError::ModelNotFound(
+                tokenizer_path.display().to_string(),
+            ));
         }
 
         let session = ort::session::Session::builder()
@@ -157,7 +161,9 @@ impl Embedder for OnnxEmbedder {
             .map_err(|e| IndexError::Onnx(e.to_string()))?;
 
         // Run inference with named inputs
-        let mut session = self.session.lock()
+        let mut session = self
+            .session
+            .lock()
             .map_err(|e| IndexError::Onnx(format!("session lock: {}", e)))?;
         let outputs = session
             .run(ort::inputs![
@@ -178,8 +184,10 @@ impl Embedder for OnnxEmbedder {
         // emb_shape is [batch_size, seq_len, dims] (deref to &[i64])
         let dims = emb_shape.get(2).copied().unwrap_or(self.dims as i64) as usize;
         let actual_seq_len = emb_shape.get(1).copied().unwrap_or(seq_len as i64) as usize;
-        assert!(actual_seq_len <= seq_len,
-            "ONNX output seq_len ({actual_seq_len}) exceeds input seq_len ({seq_len})");
+        assert!(
+            actual_seq_len <= seq_len,
+            "ONNX output seq_len ({actual_seq_len}) exceeds input seq_len ({seq_len})"
+        );
 
         // Mean-pool over sequence length, respecting attention mask
         let mut results = Vec::with_capacity(batch_size);

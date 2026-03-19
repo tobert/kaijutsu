@@ -66,10 +66,7 @@ impl Context {
 ///
 /// Given a set of contexts and a starting ID, returns the chain from
 /// the starting context up to the root (inclusive).
-pub fn fork_lineage(
-    contexts: &[Context],
-    start: ContextId,
-) -> Vec<&Context> {
+pub fn fork_lineage(contexts: &[Context], start: ContextId) -> Vec<&Context> {
     let mut chain = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut current = Some(start);
@@ -144,8 +141,7 @@ mod tests {
 
         let root = Context::new(kernel, Some("root".into()), None, creator);
         let child = Context::new(kernel, Some("child".into()), Some(root.id), creator);
-        let grandchild =
-            Context::new(kernel, Some("grandchild".into()), Some(child.id), creator);
+        let grandchild = Context::new(kernel, Some("grandchild".into()), Some(child.id), creator);
 
         let contexts = vec![root.clone(), child.clone(), grandchild.clone()];
         let chain = fork_lineage(&contexts, grandchild.id);

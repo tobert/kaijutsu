@@ -59,10 +59,7 @@ pub fn in_compose(focus: Res<FocusArea>) -> bool {
 
 /// System run condition: FocusArea allows conversation scrolling.
 pub fn scroll_context_active(focus: Res<FocusArea>) -> bool {
-    matches!(
-        *focus,
-        FocusArea::Conversation | FocusArea::Compose
-    )
+    matches!(*focus, FocusArea::Conversation | FocusArea::Compose)
 }
 
 /// What area of the UI currently has keyboard focus.

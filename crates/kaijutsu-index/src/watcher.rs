@@ -45,7 +45,8 @@ pub fn spawn_index_watcher(
                         if let Err(e) = idx.save() {
                             tracing::warn!(error = %e, "failed to save HNSW on shutdown");
                         }
-                    }).await;
+                    })
+                    .await;
                     break;
                 }
             };
@@ -74,10 +75,13 @@ pub fn spawn_index_watcher(
                 let idx = index.clone();
                 let src = blocks.clone();
                 match tokio::task::spawn_blocking(move || {
-                    let snaps = src.block_snapshots(ctx_id)
-                        .map_err(|e| crate::IndexError::Index(e))?;
+                    let snaps = src
+                        .block_snapshots(ctx_id)
+                        .map_err(crate::IndexError::Index)?;
                     idx.index_context(ctx_id, &snaps)
-                }).await {
+                })
+                .await
+                {
                     Ok(Ok(true)) => {
                         tracing::debug!(context = %ctx_id.short(), "indexed context");
                         if let Some(ref cb) = on_indexed {

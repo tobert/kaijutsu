@@ -405,8 +405,8 @@ pub fn parse_theme_data_from_scope(scope: &Scope) -> ThemeData {
     // Mode colors
     color!(mode_normal);
     // Support both mode_chat and mode_insert (legacy)
-    if let Some(c) = get_color_hex(scope, "mode_chat")
-        .or_else(|| get_color_hex(scope, "mode_insert"))
+    if let Some(c) =
+        get_color_hex(scope, "mode_chat").or_else(|| get_color_hex(scope, "mode_insert"))
     {
         td.mode_chat = c;
     }

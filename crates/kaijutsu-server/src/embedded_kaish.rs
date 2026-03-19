@@ -34,8 +34,8 @@ use anyhow::Result;
 use kaish_kernel::interpreter::ExecResult;
 use kaish_kernel::{Kernel as KaishKernel, KernelBackend, KernelConfig as KaishConfig};
 
-use kaijutsu_kernel::block_store::SharedBlockStore;
 use kaijutsu_kernel::Kernel as KaijutsuKernel;
+use kaijutsu_kernel::block_store::SharedBlockStore;
 use kaijutsu_types::{ContextId, KernelId, PrincipalId, SessionId};
 
 use crate::docs_filesystem::KaijutsuFilesystem;
@@ -69,7 +69,10 @@ impl EmbeddedKaish {
         project_root: Option<PathBuf>,
     ) -> Result<Self> {
         Self::with_identity(
-            name, blocks, kernel, project_root,
+            name,
+            blocks,
+            kernel,
+            project_root,
             PrincipalId::system(),
             ContextId::new(),
             SessionId::new(),
@@ -112,9 +115,8 @@ impl EmbeddedKaish {
         ));
         let mount_table = kernel.vfs().clone();
 
-        let mount_backend: Arc<dyn KernelBackend> = Arc::new(MountBackend::new(
-            mount_table, docs_backend.clone(),
-        ));
+        let mount_backend: Arc<dyn KernelBackend> =
+            Arc::new(MountBackend::new(mount_table, docs_backend.clone()));
 
         let docs_fs = Arc::new(KaijutsuFilesystem::new(docs_backend));
 
@@ -132,12 +134,17 @@ impl EmbeddedKaish {
         };
 
         let ctx_for_tools = shared_context_id.clone();
-        let kaish_kernel = KaishKernel::with_backend(mount_backend, config, |vfs| {
-            vfs.mount_arc("/v/docs", docs_fs);
-            vfs.mount_arc("/v/input", input_fs);
-        }, |tools| {
-            configure_tools(ctx_for_tools, tools);
-        })?;
+        let kaish_kernel = KaishKernel::with_backend(
+            mount_backend,
+            config,
+            |vfs| {
+                vfs.mount_arc("/v/docs", docs_fs);
+                vfs.mount_arc("/v/input", input_fs);
+            },
+            |tools| {
+                configure_tools(ctx_for_tools, tools);
+            },
+        )?;
 
         Ok(Self {
             kernel: kaish_kernel,
@@ -163,7 +170,12 @@ impl EmbeddedKaish {
 
     /// List all variable names.
     pub async fn list_vars(&self) -> Vec<String> {
-        self.kernel.list_vars().await.into_iter().map(|(name, _)| name).collect()
+        self.kernel
+            .list_vars()
+            .await
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
     }
 
     /// Get the kernel name.
@@ -207,7 +219,6 @@ impl EmbeddedKaish {
     pub fn cancel(&self) {
         self.kernel.cancel();
     }
-
 }
 
 #[cfg(test)]
@@ -234,7 +245,9 @@ mod tests {
         let kaish = EmbeddedKaish::new("test-vars", blocks, kernel, None).unwrap();
 
         // Set and get a variable
-        kaish.set_var("X", kaish_kernel::ast::Value::String("hello".into())).await;
+        kaish
+            .set_var("X", kaish_kernel::ast::Value::String("hello".into()))
+            .await;
         let val = kaish.get_var("X").await;
         assert!(val.is_some());
 
@@ -253,7 +266,11 @@ mod tests {
         let cwd = kaish.cwd().await;
         // KaishConfig::named() sets cwd to home_dir(). We can't control HOME
         // in parallel tests, so just verify it's a real existing directory.
-        assert!(cwd.is_dir(), "cwd should be an existing directory, got {:?}", cwd);
+        assert!(
+            cwd.is_dir(),
+            "cwd should be an existing directory, got {:?}",
+            cwd
+        );
         assert!(cwd.is_absolute(), "cwd should be absolute, got {:?}", cwd);
     }
 
@@ -267,11 +284,15 @@ mod tests {
             blocks,
             kernel,
             Some(tmp.path().to_path_buf()),
-        ).unwrap();
+        )
+        .unwrap();
 
         let cwd = kaish.cwd().await;
         // Canonicalize both to handle symlinks (e.g., /tmp → /private/tmp on macOS)
-        let expected = tmp.path().canonicalize().unwrap_or_else(|_| tmp.path().to_path_buf());
+        let expected = tmp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| tmp.path().to_path_buf());
         let actual = cwd.canonicalize().unwrap_or(cwd.clone());
         assert_eq!(actual, expected, "cwd should be project root");
     }

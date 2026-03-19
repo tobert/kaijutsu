@@ -205,21 +205,30 @@ mod tests {
     #[test]
     fn test_tokenize_variable() {
         let tokens = tokenize("echo $HOME");
-        let var_tokens: Vec<_> = tokens.iter().filter(|t| t.kind == TokenKind::Variable).collect();
+        let var_tokens: Vec<_> = tokens
+            .iter()
+            .filter(|t| t.kind == TokenKind::Variable)
+            .collect();
         assert!(!var_tokens.is_empty());
     }
 
     #[test]
     fn test_tokenize_pipe() {
         let tokens = tokenize("ls | grep foo");
-        let pipe_tokens: Vec<_> = tokens.iter().filter(|t| t.kind == TokenKind::Operator).collect();
+        let pipe_tokens: Vec<_> = tokens
+            .iter()
+            .filter(|t| t.kind == TokenKind::Operator)
+            .collect();
         assert!(!pipe_tokens.is_empty());
     }
 
     #[test]
     fn test_tokenize_flags() {
         let tokens = tokenize("ls -la --color");
-        let flag_tokens: Vec<_> = tokens.iter().filter(|t| t.kind == TokenKind::Flag).collect();
+        let flag_tokens: Vec<_> = tokens
+            .iter()
+            .filter(|t| t.kind == TokenKind::Flag)
+            .collect();
         assert_eq!(flag_tokens.len(), 2);
     }
 }

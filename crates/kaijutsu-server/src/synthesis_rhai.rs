@@ -21,7 +21,10 @@ pub fn register_synthesis_fns(
     let emb = embedder.clone();
     engine.register_fn("embed", move |text: String| -> rhai::Array {
         match emb.embed(&text) {
-            Ok(v) => v.into_iter().map(|f| rhai::Dynamic::from(f as f64)).collect(),
+            Ok(v) => v
+                .into_iter()
+                .map(|f| rhai::Dynamic::from(f as f64))
+                .collect(),
             Err(e) => {
                 tracing::warn!(error = %e, "embed() failed");
                 rhai::Array::new()
@@ -108,18 +111,12 @@ pub fn register_synthesis_fns(
                 let sa = a
                     .clone()
                     .try_cast::<rhai::Map>()
-                    .and_then(|m| {
-                        m.get("score")
-                            .and_then(|v| v.as_float().ok())
-                    })
+                    .and_then(|m| m.get("score").and_then(|v| v.as_float().ok()))
                     .unwrap_or(0.0);
                 let sb = b
                     .clone()
                     .try_cast::<rhai::Map>()
-                    .and_then(|m| {
-                        m.get("score")
-                            .and_then(|v| v.as_float().ok())
-                    })
+                    .and_then(|m| m.get("score").and_then(|v| v.as_float().ok()))
                     .unwrap_or(0.0);
                 sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
             });
@@ -238,7 +235,10 @@ pub fn run_synthesis(
                 Some((s, 0.0))
             } else if let Some(m) = d.try_cast::<rhai::Map>() {
                 let kw = m.get("keyword")?.clone().into_string().ok()?;
-                let score = m.get("score").and_then(|v| v.as_float().ok()).unwrap_or(0.0) as f32;
+                let score = m
+                    .get("score")
+                    .and_then(|v| v.as_float().ok())
+                    .unwrap_or(0.0) as f32;
                 Some((kw, score))
             } else {
                 None
@@ -254,8 +254,14 @@ pub fn run_synthesis(
         .filter_map(|d| {
             let m = d.try_cast::<rhai::Map>()?;
             let id = m.get("id")?.clone().into_string().ok()?;
-            let score = m.get("score").and_then(|v| v.as_float().ok()).unwrap_or(0.0) as f32;
-            let preview = m.get("preview").and_then(|v| v.clone().into_string().ok()).unwrap_or_default();
+            let score = m
+                .get("score")
+                .and_then(|v| v.as_float().ok())
+                .unwrap_or(0.0) as f32;
+            let preview = m
+                .get("preview")
+                .and_then(|v| v.clone().into_string().ok())
+                .unwrap_or_default();
             Some((id, score, preview))
         })
         .collect();
@@ -376,7 +382,12 @@ mod tests {
                 kind: BlockKind::Text,
                 status: Status::Done,
                 content: "Hello world, this is a test block with enough content.".to_string(),
-                ..BlockSnapshot::text(id, None, Role::Model, "Hello world, this is a test block with enough content.")
+                ..BlockSnapshot::text(
+                    id,
+                    None,
+                    Role::Model,
+                    "Hello world, this is a test block with enough content.",
+                )
             }])
         }
     }
@@ -402,9 +413,7 @@ mod tests {
     #[test]
     fn test_embed_batch_returns_nested_array() {
         let engine = test_engine();
-        let result: rhai::Array = engine
-            .eval(r#"embed_batch(["hello", "world"])"#)
-            .unwrap();
+        let result: rhai::Array = engine.eval(r#"embed_batch(["hello", "world"])"#).unwrap();
         assert_eq!(result.len(), 2);
     }
 
@@ -414,7 +423,10 @@ mod tests {
         let result: f64 = engine
             .eval(r#"let v = embed("test"); cosine_sim(v, v)"#)
             .unwrap();
-        assert!((result - 1.0).abs() < 1e-5, "self-similarity should be ~1.0, got {result}");
+        assert!(
+            (result - 1.0).abs() < 1e-5,
+            "self-similarity should be ~1.0, got {result}"
+        );
     }
 
     #[test]

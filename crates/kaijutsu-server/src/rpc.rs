@@ -11,47 +11,79 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::RwLock as TokioRwLock;
 // tokio::sync::Mutex used inside ConversationCache for per-context locking
 
 use capnp::capability::Promise;
 use capnp_rpc::pry;
 
-use crate::kaijutsu_capnp::*;
 use crate::context_engine::ContextEngine;
 use crate::embedded_kaish::EmbeddedKaish;
 use crate::interrupt::ContextInterruptState;
+use crate::kaijutsu_capnp::*;
 
+use kaijutsu_crdt::{BlockKind, Role, Status};
+use kaijutsu_kernel::kernel_db::{ContextRow, KernelDb};
 use kaijutsu_kernel::{
-    Kernel,
-    LocalBackend, SharedBlockStore, ToolInfo, VfsOps,
-    RigProvider, LlmMessage, llm::stream::{LlmStream, StreamRequest, StreamEvent},
+    AgentActivityEvent,
+    // Agents
+    AgentCapability,
+    AgentConfig,
+    AgentInfo,
+    AgentStatus,
     // Block tools
-    BlockAppendEngine, BlockCreateEngine, BlockEditEngine, BlockListEngine, BlockReadEngine,
-    BlockSearchEngine, BlockSpliceEngine, BlockStatusEngine, KernelSearchEngine,
+    BlockAppendEngine,
+    BlockCreateEngine,
+    BlockEditEngine,
+    // FlowBus
+    BlockFlow,
+    BlockListEngine,
+    BlockReadEngine,
+    BlockSearchEngine,
+    BlockSpliceEngine,
+    BlockStatusEngine,
+    // Config
+    ConfigCrdtBackend,
+    ConfigWatcherHandle,
+    EditEngine,
     // File tools
-    FileDocumentCache, ReadEngine, EditEngine, WriteEngine, GlobEngine, GrepEngine, WhoamiEngine,
+    FileDocumentCache,
+    GlobEngine,
+    GrepEngine,
+    InputDocFlow,
+    Kernel,
+    KernelSearchEngine,
+    LlmMessage,
+    LocalBackend,
+    McpServerConfig,
+    // MCP
+    McpServerPool,
+    McpToolEngine,
+    McpTransport,
+    ReadEngine,
     // Rhai scripting
     RhaiEngine,
-    // MCP
-    McpServerPool, McpServerConfig, McpTransport, McpToolEngine, extract_tool_result_text,
-    // FlowBus
-    BlockFlow, SharedBlockFlowBus, shared_block_flow_bus,
-    SharedConfigFlowBus, shared_config_flow_bus,
-    InputDocFlow, SharedInputDocFlowBus, shared_input_doc_flow_bus,
-    block_store::BlockStore,
-    // Agents
-    AgentCapability, AgentConfig, AgentInfo, AgentStatus, AgentActivityEvent,
-    // Config
-    ConfigCrdtBackend, ConfigWatcherHandle,
+    RigProvider,
+    SharedBlockFlowBus,
+    SharedBlockStore,
+    SharedConfigFlowBus,
+    SharedInputDocFlowBus,
     // Tool filtering
     ToolFilter,
+    ToolInfo,
+    VfsOps,
+    WhoamiEngine,
+    WriteEngine,
+    block_store::BlockStore,
+    extract_tool_result_text,
+    llm::stream::{LlmStream, StreamEvent, StreamRequest},
+    shared_block_flow_bus,
+    shared_config_flow_bus,
+    shared_input_doc_flow_bus,
 };
-use kaijutsu_crdt::{BlockKind, Role, Status};
-use kaijutsu_types::{ContextId, Principal, PrincipalId, KernelId, SessionId};
-use kaijutsu_kernel::kernel_db::{KernelDb, ContextRow};
+use kaijutsu_types::{ContextId, KernelId, Principal, PrincipalId, SessionId};
 // Alias to avoid conflict with kaijutsu_capnp::ToolKind (glob-imported)
 use kaijutsu_types::ToolKind as TypesToolKind;
 use serde_json;
@@ -61,11 +93,22 @@ use tracing::Instrument;
 ///
 /// Returns a tracing span linked to the remote parent (or a root span if empty).
 /// Safe to call even when trace is not present — returns a detached span.
-fn extract_rpc_trace(trace: capnp::Result<trace_context::Reader<'_>>, name: &'static str) -> tracing::Span {
+fn extract_rpc_trace(
+    trace: capnp::Result<trace_context::Reader<'_>>,
+    name: &'static str,
+) -> tracing::Span {
     let (traceparent, tracestate) = match trace {
         Ok(t) => {
-            let tp = t.get_traceparent().ok().and_then(|r| r.to_str().ok()).unwrap_or("");
-            let ts = t.get_tracestate().ok().and_then(|r| r.to_str().ok()).unwrap_or("");
+            let tp = t
+                .get_traceparent()
+                .ok()
+                .and_then(|r| r.to_str().ok())
+                .unwrap_or("");
+            let ts = t
+                .get_tracestate()
+                .ok()
+                .and_then(|r| r.to_str().ok())
+                .unwrap_or("");
             (tp.to_string(), ts.to_string())
         }
         Err(_) => (String::new(), String::new()),
@@ -87,86 +130,165 @@ async fn register_block_tools(
     documents: SharedBlockStore,
     workspace_guard: Option<kaijutsu_kernel::file_tools::WorkspaceGuard>,
 ) {
-
     let current = crate::context_engine::current_context();
-    kernel.register_tool_with_engine(
-        ToolInfo::new("context", "Manage conversation contexts (switch, list)", "kernel"),
-        Arc::new(ContextEngine::new(kernel.drift().clone(), current)),
-    ).await;
+    kernel
+        .register_tool_with_engine(
+            ToolInfo::new(
+                "context",
+                "Manage conversation contexts (switch, list)",
+                "kernel",
+            ),
+            Arc::new(ContextEngine::new(kernel.drift().clone(), current)),
+        )
+        .await;
 
-    kernel.register_tool_with_engine(
-        ToolInfo::new("block_create", "Create a new block with role, kind, content", "block"),
-        Arc::new(BlockCreateEngine::new(documents.clone())),
-    ).await;
+    kernel
+        .register_tool_with_engine(
+            ToolInfo::new(
+                "block_create",
+                "Create a new block with role, kind, content",
+                "block",
+            ),
+            Arc::new(BlockCreateEngine::new(documents.clone())),
+        )
+        .await;
 
-    kernel.register_tool_with_engine(
-        ToolInfo::new("block_append", "Append text to a block", "block"),
-        Arc::new(BlockAppendEngine::new(documents.clone())),
-    ).await;
+    kernel
+        .register_tool_with_engine(
+            ToolInfo::new("block_append", "Append text to a block", "block"),
+            Arc::new(BlockAppendEngine::new(documents.clone())),
+        )
+        .await;
 
-    kernel.register_tool_with_engine(
-        ToolInfo::new("block_edit", "Line-based editing with atomic ops and CAS validation", "block"),
-        Arc::new(BlockEditEngine::new(documents.clone())),
-    ).await;
+    kernel
+        .register_tool_with_engine(
+            ToolInfo::new(
+                "block_edit",
+                "Line-based editing with atomic ops and CAS validation",
+                "block",
+            ),
+            Arc::new(BlockEditEngine::new(documents.clone())),
+        )
+        .await;
 
-    kernel.register_tool_with_engine(
-        ToolInfo::new("block_splice", "Character-based splice editing", "block"),
-        Arc::new(BlockSpliceEngine::new(documents.clone())),
-    ).await;
+    kernel
+        .register_tool_with_engine(
+            ToolInfo::new("block_splice", "Character-based splice editing", "block"),
+            Arc::new(BlockSpliceEngine::new(documents.clone())),
+        )
+        .await;
 
-    kernel.register_tool_with_engine(
-        ToolInfo::new("block_read", "Read block content with optional line numbers", "block"),
-        Arc::new(BlockReadEngine::new(documents.clone())),
-    ).await;
+    kernel
+        .register_tool_with_engine(
+            ToolInfo::new(
+                "block_read",
+                "Read block content with optional line numbers",
+                "block",
+            ),
+            Arc::new(BlockReadEngine::new(documents.clone())),
+        )
+        .await;
 
-    kernel.register_tool_with_engine(
-        ToolInfo::new("block_search", "Search within a block using regex", "block"),
-        Arc::new(BlockSearchEngine::new(documents.clone())),
-    ).await;
+    kernel
+        .register_tool_with_engine(
+            ToolInfo::new("block_search", "Search within a block using regex", "block"),
+            Arc::new(BlockSearchEngine::new(documents.clone())),
+        )
+        .await;
 
-    kernel.register_tool_with_engine(
-        ToolInfo::new("block_list", "List blocks with optional filters", "block"),
-        Arc::new(BlockListEngine::new(documents.clone())),
-    ).await;
+    kernel
+        .register_tool_with_engine(
+            ToolInfo::new("block_list", "List blocks with optional filters", "block"),
+            Arc::new(BlockListEngine::new(documents.clone())),
+        )
+        .await;
 
-    kernel.register_tool_with_engine(
-        ToolInfo::new("block_status", "Set block status", "block"),
-        Arc::new(BlockStatusEngine::new(documents.clone())),
-    ).await;
+    kernel
+        .register_tool_with_engine(
+            ToolInfo::new("block_status", "Set block status", "block"),
+            Arc::new(BlockStatusEngine::new(documents.clone())),
+        )
+        .await;
 
-    kernel.register_tool_with_engine(
-        ToolInfo::new("kernel_search", "Search across blocks using regex", "kernel"),
-        Arc::new(KernelSearchEngine::new(documents.clone())),
-    ).await;
+    kernel
+        .register_tool_with_engine(
+            ToolInfo::new(
+                "kernel_search",
+                "Search across blocks using regex",
+                "kernel",
+            ),
+            Arc::new(KernelSearchEngine::new(documents.clone())),
+        )
+        .await;
 
     // ── File tools (CRDT-backed) ──
     // default_root removed from glob/grep — engines now read cwd from ToolContext at call time
-    let file_cache = Arc::new(FileDocumentCache::new(documents.clone(), kernel.vfs().clone()));
+    let file_cache = Arc::new(FileDocumentCache::new(
+        documents.clone(),
+        kernel.vfs().clone(),
+    ));
     let g = &workspace_guard; // borrow for closures below
-    kernel.register_tool_with_engine(
-        ToolInfo::new("read", "Read file content with optional line numbers", "file"),
-        Arc::new(match g { Some(g) => ReadEngine::new(file_cache.clone()).with_guard(g.clone()), None => ReadEngine::new(file_cache.clone()) }),
-    ).await;
-    kernel.register_tool_with_engine(
-        ToolInfo::new("edit", "Edit a file by exact string replacement", "file"),
-        Arc::new(match g { Some(g) => EditEngine::new(file_cache.clone()).with_guard(g.clone()), None => EditEngine::new(file_cache.clone()) }),
-    ).await;
-    kernel.register_tool_with_engine(
-        ToolInfo::new("write", "Write or create a file with the given content", "file"),
-        Arc::new(match g { Some(g) => WriteEngine::new(file_cache.clone()).with_guard(g.clone()), None => WriteEngine::new(file_cache.clone()) }),
-    ).await;
-    kernel.register_tool_with_engine(
-        ToolInfo::new("glob", "Find files matching a glob pattern", "file"),
-        Arc::new(match g { Some(g) => GlobEngine::new(kernel.vfs().clone()).with_guard(g.clone()), None => GlobEngine::new(kernel.vfs().clone()) }),
-    ).await;
-    kernel.register_tool_with_engine(
-        ToolInfo::new("grep", "Search file content with regex", "file"),
-        Arc::new(match g { Some(g) => GrepEngine::new(file_cache.clone(), kernel.vfs().clone()).with_guard(g.clone()), None => GrepEngine::new(file_cache.clone(), kernel.vfs().clone()) }),
-    ).await;
-    kernel.register_tool_with_engine(
-        ToolInfo::new("whoami", "Show current context identity", "drift"),
-        Arc::new(WhoamiEngine::new(kernel.drift().clone())),
-    ).await;
+    kernel
+        .register_tool_with_engine(
+            ToolInfo::new(
+                "read",
+                "Read file content with optional line numbers",
+                "file",
+            ),
+            Arc::new(match g {
+                Some(g) => ReadEngine::new(file_cache.clone()).with_guard(g.clone()),
+                None => ReadEngine::new(file_cache.clone()),
+            }),
+        )
+        .await;
+    kernel
+        .register_tool_with_engine(
+            ToolInfo::new("edit", "Edit a file by exact string replacement", "file"),
+            Arc::new(match g {
+                Some(g) => EditEngine::new(file_cache.clone()).with_guard(g.clone()),
+                None => EditEngine::new(file_cache.clone()),
+            }),
+        )
+        .await;
+    kernel
+        .register_tool_with_engine(
+            ToolInfo::new(
+                "write",
+                "Write or create a file with the given content",
+                "file",
+            ),
+            Arc::new(match g {
+                Some(g) => WriteEngine::new(file_cache.clone()).with_guard(g.clone()),
+                None => WriteEngine::new(file_cache.clone()),
+            }),
+        )
+        .await;
+    kernel
+        .register_tool_with_engine(
+            ToolInfo::new("glob", "Find files matching a glob pattern", "file"),
+            Arc::new(match g {
+                Some(g) => GlobEngine::new(kernel.vfs().clone()).with_guard(g.clone()),
+                None => GlobEngine::new(kernel.vfs().clone()),
+            }),
+        )
+        .await;
+    kernel
+        .register_tool_with_engine(
+            ToolInfo::new("grep", "Search file content with regex", "file"),
+            Arc::new(match g {
+                Some(g) => {
+                    GrepEngine::new(file_cache.clone(), kernel.vfs().clone()).with_guard(g.clone())
+                }
+                None => GrepEngine::new(file_cache.clone(), kernel.vfs().clone()),
+            }),
+        )
+        .await;
+    kernel
+        .register_tool_with_engine(
+            ToolInfo::new("whoami", "Show current context identity", "drift"),
+            Arc::new(WhoamiEngine::new(kernel.drift().clone())),
+        )
+        .await;
 
     // Rhai scripting is registered later (after semantic index init) so synthesis
     // functions can be injected. See the register_rhai_engine() call after
@@ -210,10 +332,10 @@ impl ConversationCache {
                 let ctx_id = *entry.key();
                 let accessed = *entry.value();
                 // Skip entries in active use
-                if let Some(e) = self.entries.get(&ctx_id) {
-                    if Arc::strong_count(&e) > 1 {
-                        continue;
-                    }
+                if let Some(e) = self.entries.get(&ctx_id)
+                    && Arc::strong_count(&e) > 1
+                {
+                    continue;
                 }
                 if oldest.is_none() || accessed < oldest.unwrap().1 {
                     oldest = Some((ctx_id, accessed));
@@ -266,7 +388,10 @@ impl SharedKernelState {
     /// Returns the interrupt state and its generation number. The generation
     /// must be passed to `remove_interrupt` to prevent the race where stream A's
     /// cleanup removes stream B's newer interrupt.
-    pub async fn create_interrupt(&self, context_id: ContextId) -> (Arc<ContextInterruptState>, u64) {
+    pub async fn create_interrupt(
+        &self,
+        context_id: ContextId,
+    ) -> (Arc<ContextInterruptState>, u64) {
         let generation = self.interrupt_generation.fetch_add(1, Ordering::Relaxed) + 1;
         let state = ContextInterruptState::new(generation);
         let mut map = self.context_interrupts.write().await;
@@ -289,10 +414,10 @@ impl SharedKernelState {
     /// interrupt state.
     pub async fn remove_interrupt(&self, context_id: ContextId, generation: u64) {
         let mut map = self.context_interrupts.write().await;
-        if let Some(state) = map.get(&context_id) {
-            if state.generation == generation {
-                map.remove(&context_id);
-            }
+        if let Some(state) = map.get(&context_id)
+            && state.generation == generation
+        {
+            map.remove(&context_id);
         }
     }
 }
@@ -327,8 +452,9 @@ impl ConnectionState {
 
     /// Get the connection's active context, or error if none joined.
     pub fn require_context(&self) -> Result<ContextId, capnp::Error> {
-        self.current_context_id
-            .ok_or_else(|| capnp::Error::failed("no context joined — call joinContext first".into()))
+        self.current_context_id.ok_or_else(|| {
+            capnp::Error::failed("no context joined — call joinContext first".into())
+        })
     }
 
     fn next_exec_id(&self) -> u64 {
@@ -351,16 +477,21 @@ fn kernel_data_dir() -> std::path::PathBuf {
     let old_dir = kaish_kernel::xdg_data_home()
         .join("kaijutsu")
         .join("kernels");
-    if old_dir.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(&old_dir) {
-            let count = entries.filter_map(|e| e.ok()).filter(|e| e.path().is_dir()).count();
-            if count > 0 {
-                log::warn!(
-                    "Found {} old kernel data dir(s) in {:?}. \
+    if old_dir.is_dir()
+        && let Ok(entries) = std::fs::read_dir(&old_dir)
+    {
+        let count = entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_dir())
+            .count();
+        if count > 0 {
+            log::warn!(
+                "Found {} old kernel data dir(s) in {:?}. \
                      To recover, copy the most recent data.db to {:?}",
-                    count, old_dir, dir
-                );
-            }
+                count,
+                old_dir,
+                dir
+            );
         }
     }
 
@@ -376,9 +507,8 @@ fn create_block_store_with_kernel_db(
     block_flows: SharedBlockFlowBus,
     input_flows: SharedInputDocFlowBus,
 ) -> Result<SharedBlockStore, String> {
-    let mut inner = BlockStore::with_db_and_flows(
-        db, kernel_id, default_workspace_id, agent_id, block_flows,
-    );
+    let mut inner =
+        BlockStore::with_db_and_flows(db, kernel_id, default_workspace_id, agent_id, block_flows);
     inner.set_input_flows(input_flows);
     let store = Arc::new(inner);
     store.load_from_db().map_err(|e| {
@@ -394,8 +524,7 @@ fn create_block_store_with_kernel_db(
 /// Get the config directory path.
 /// Returns: ~/.config/kaijutsu/
 fn config_dir() -> std::path::PathBuf {
-    kaish_kernel::xdg_config_home()
-        .join("kaijutsu")
+    kaish_kernel::xdg_config_home().join("kaijutsu")
 }
 
 /// Create and initialize the config CRDT backend.
@@ -470,7 +599,10 @@ async fn initialize_kernel_models(
             models_config.embedding
         }
         Err(e) => {
-            log::warn!("Failed to parse models.rhai from CRDT: {}, reloading from disk", e);
+            log::warn!(
+                "Failed to parse models.rhai from CRDT: {}, reloading from disk",
+                e
+            );
             // CRDT snapshot is corrupted — reload from disk and retry
             if let Err(reload_err) = config_backend.reload_from_disk("models.rhai").await {
                 log::error!("Failed to reload models.rhai from disk: {}", reload_err);
@@ -487,7 +619,9 @@ async fn initialize_kernel_models(
                 Ok(models_config) => {
                     let registry = kaijutsu_kernel::initialize_llm_registry(&models_config.llm);
                     *kernel.llm().write().await = registry;
-                    log::info!("Initialized kernel LLM registry from models.rhai (reloaded from disk)");
+                    log::info!(
+                        "Initialized kernel LLM registry from models.rhai (reloaded from disk)"
+                    );
                     models_config.embedding
                 }
                 Err(e) => {
@@ -545,54 +679,80 @@ async fn initialize_kernel_mcp(
     // just register their tools with this kernel. For new servers, do full
     // registration including process spawn.
     let timeout = std::time::Duration::from_secs(5);
-    let futs: Vec<_> = config.servers.into_iter().map(|server_config| {
-        let pool = mcp_pool.clone();
-        let kernel = kernel.clone();
-        let name = server_config.name.clone();
-        let is_pre_registered = already_registered.contains(&name);
-        async move {
-            if is_pre_registered {
-                // Server already running — just get its info and register tools
-                match pool.get_server_info(&name).await {
-                    Ok(info) => {
-                        let tools = McpToolEngine::from_server_tools(pool.clone(), &name, &info.tools);
-                        for (qualified_name, engine) in tools {
-                            let desc = engine.description().to_string();
-                            kernel.register_tool_with_engine(
-                                ToolInfo::new(&qualified_name, &desc, "mcp"),
-                                engine,
-                            ).await;
+    let futs: Vec<_> = config
+        .servers
+        .into_iter()
+        .map(|server_config| {
+            let pool = mcp_pool.clone();
+            let kernel = kernel.clone();
+            let name = server_config.name.clone();
+            let is_pre_registered = already_registered.contains(&name);
+            async move {
+                if is_pre_registered {
+                    // Server already running — just get its info and register tools
+                    match pool.get_server_info(&name).await {
+                        Ok(info) => {
+                            let tools =
+                                McpToolEngine::from_server_tools(pool.clone(), &name, &info.tools);
+                            for (qualified_name, engine) in tools {
+                                let desc = engine.description().to_string();
+                                kernel
+                                    .register_tool_with_engine(
+                                        ToolInfo::new(&qualified_name, &desc, "mcp"),
+                                        engine,
+                                    )
+                                    .await;
+                            }
+                            log::info!(
+                                "MCP server '{}' tools registered from pool ({} tools)",
+                                name,
+                                info.tools.len()
+                            );
                         }
-                        log::info!("MCP server '{}' tools registered from pool ({} tools)", name, info.tools.len());
-                    }
-                    Err(e) => {
-                        log::warn!("MCP server '{}' in pool but get_server_info failed: {}", name, e);
-                    }
-                }
-            } else {
-                // Server not in pool yet — full registration with timeout
-                match tokio::time::timeout(timeout, pool.register(server_config)).await {
-                    Ok(Ok(info)) => {
-                        let tools = McpToolEngine::from_server_tools(pool.clone(), &name, &info.tools);
-                        for (qualified_name, engine) in tools {
-                            let desc = engine.description().to_string();
-                            kernel.register_tool_with_engine(
-                                ToolInfo::new(&qualified_name, &desc, "mcp"),
-                                engine,
-                            ).await;
+                        Err(e) => {
+                            log::warn!(
+                                "MCP server '{}' in pool but get_server_info failed: {}",
+                                name,
+                                e
+                            );
                         }
-                        log::info!("MCP server '{}' registered ({} tools)", name, info.tools.len());
                     }
-                    Ok(Err(e)) => {
-                        log::warn!("MCP server '{}' failed to register: {}", name, e);
-                    }
-                    Err(_) => {
-                        log::warn!("MCP server '{}' timed out during registration ({}s)", name, timeout.as_secs());
+                } else {
+                    // Server not in pool yet — full registration with timeout
+                    match tokio::time::timeout(timeout, pool.register(server_config)).await {
+                        Ok(Ok(info)) => {
+                            let tools =
+                                McpToolEngine::from_server_tools(pool.clone(), &name, &info.tools);
+                            for (qualified_name, engine) in tools {
+                                let desc = engine.description().to_string();
+                                kernel
+                                    .register_tool_with_engine(
+                                        ToolInfo::new(&qualified_name, &desc, "mcp"),
+                                        engine,
+                                    )
+                                    .await;
+                            }
+                            log::info!(
+                                "MCP server '{}' registered ({} tools)",
+                                name,
+                                info.tools.len()
+                            );
+                        }
+                        Ok(Err(e)) => {
+                            log::warn!("MCP server '{}' failed to register: {}", name, e);
+                        }
+                        Err(_) => {
+                            log::warn!(
+                                "MCP server '{}' timed out during registration ({}s)",
+                                name,
+                                timeout.as_secs()
+                            );
+                        }
                     }
                 }
             }
-        }
-    }).collect();
+        })
+        .collect();
 
     futures::future::join_all(futs).await;
 }
@@ -612,7 +772,10 @@ pub struct CommandEntry {
 pub(crate) struct BlockStoreSource(pub(crate) SharedBlockStore);
 
 impl kaijutsu_index::BlockSource for BlockStoreSource {
-    fn block_snapshots(&self, ctx: ContextId) -> Result<Vec<kaijutsu_types::BlockSnapshot>, String> {
+    fn block_snapshots(
+        &self,
+        ctx: ContextId,
+    ) -> Result<Vec<kaijutsu_types::BlockSnapshot>, String> {
         // Try in-memory first; if missing, hydrate from DB on demand.
         if !self.0.contains(ctx) {
             let _ = self.0.load_one_from_db(ctx);
@@ -627,17 +790,20 @@ struct FlowBusStatusReceiver {
 }
 
 impl kaijutsu_index::StatusReceiver for FlowBusStatusReceiver {
-    fn recv(&mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<kaijutsu_index::StatusEvent>> + Send + '_>> {
+    fn recv(
+        &mut self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<kaijutsu_index::StatusEvent>> + Send + '_>,
+    > {
         Box::pin(async {
             loop {
                 let msg = self.sub.recv().await?;
-                if let BlockFlow::StatusChanged { context_id, status, .. } = msg.payload {
-                    if status.is_terminal() {
-                        return Some(kaijutsu_index::StatusEvent {
-                            context_id,
-                            status,
-                        });
-                    }
+                if let BlockFlow::StatusChanged {
+                    context_id, status, ..
+                } = msg.payload
+                    && status.is_terminal()
+                {
+                    return Some(kaijutsu_index::StatusEvent { context_id, status });
                 }
             }
         })
@@ -712,7 +878,10 @@ pub async fn create_shared_kernel(
     let home = kaish_kernel::home_dir();
     let src_dir = home.join("src");
     kernel
-        .mount(&format!("{}", src_dir.display()), LocalBackend::new(&src_dir))
+        .mount(
+            &format!("{}", src_dir.display()),
+            LocalBackend::new(&src_dir),
+        )
         .await;
 
     // Read-write /tmp for scratch/interop with external tools
@@ -726,15 +895,21 @@ pub async fn create_shared_kernel(
     let kernel_db_arc = Arc::new(parking_lot::Mutex::new(kernel_db));
     let default_ws_id = {
         let db = kernel_db_arc.lock();
-        db.get_or_create_default_workspace(id, PrincipalId::system()).unwrap()
+        db.get_or_create_default_workspace(id, PrincipalId::system())
+            .unwrap()
     };
 
     // Create block store backed by unified KernelDb
     let block_flows_for_index = block_flows.clone();
     let documents = create_block_store_with_kernel_db(
-        kernel_db_arc.clone(), id, default_ws_id,
-        PrincipalId::system(), block_flows, input_flows,
-    ).map_err(|e| capnp::Error::failed(e))?;
+        kernel_db_arc.clone(),
+        id,
+        default_ws_id,
+        PrincipalId::system(),
+        block_flows,
+        input_flows,
+    )
+    .map_err(capnp::Error::failed)?;
 
     // Create config backend
     let (config_backend, config_watcher) =
@@ -758,11 +933,13 @@ pub async fn create_shared_kernel(
                 Vec::new()
             }
         };
-        let db_ids: std::collections::HashSet<ContextId> = db_contexts.iter().map(|r| r.context_id).collect();
+        let db_ids: std::collections::HashSet<ContextId> =
+            db_contexts.iter().map(|r| r.context_id).collect();
 
         // Step 2: Discover Conversation documents not in KernelDb → bootstrap minimal rows.
         // Only conversations are contexts — code/config/text docs are internal.
-        let block_store_ids: Vec<ContextId> = documents.list_ids_by_kind(kaijutsu_types::DocKind::Conversation);
+        let block_store_ids: Vec<ContextId> =
+            documents.list_ids_by_kind(kaijutsu_types::DocKind::Conversation);
         for &bs_ctx_id in &block_store_ids {
             if !db_ids.contains(&bs_ctx_id) {
                 let row = ContextRow {
@@ -782,12 +959,20 @@ pub async fn create_shared_kernel(
                     workspace_id: None,
                     preset_id: None,
                 };
-                let default_ws = db.get_or_create_default_workspace(row.kernel_id, row.created_by)
-                        .unwrap_or_else(|_| kaijutsu_types::WorkspaceId::new());
+                let default_ws = db
+                    .get_or_create_default_workspace(row.kernel_id, row.created_by)
+                    .unwrap_or_else(|_| kaijutsu_types::WorkspaceId::new());
                 if let Err(e) = db.insert_context_with_document(&row, default_ws) {
-                    log::warn!("Failed to bootstrap context {} into KernelDb: {}", bs_ctx_id.short(), e);
+                    log::warn!(
+                        "Failed to bootstrap context {} into KernelDb: {}",
+                        bs_ctx_id.short(),
+                        e
+                    );
                 } else {
-                    log::info!("Bootstrapped context {} into KernelDb from BlockStore", bs_ctx_id.short());
+                    log::info!(
+                        "Bootstrapped context {} into KernelDb from BlockStore",
+                        bs_ctx_id.short()
+                    );
                 }
             }
         }
@@ -806,7 +991,12 @@ pub async fn create_shared_kernel(
     if !all_contexts.is_empty() {
         let mut drift = kernel_arc.drift().write().await;
         for row in &all_contexts {
-            drift.register(row.context_id, row.label.as_deref(), row.forked_from, row.created_by);
+            drift.register(
+                row.context_id,
+                row.label.as_deref(),
+                row.forked_from,
+                row.created_by,
+            );
             if let (Some(provider), Some(model)) = (&row.provider, &row.model) {
                 let _ = drift.configure_llm(row.context_id, provider, model);
             }
@@ -815,7 +1005,9 @@ pub async fn create_shared_kernel(
             }
             log::info!(
                 "Recovered context {} (label={:?}, provider={:?}) from KernelDb",
-                row.context_id.short(), row.label, row.provider,
+                row.context_id.short(),
+                row.label,
+                row.provider,
             );
         }
     }
@@ -834,7 +1026,11 @@ pub async fn create_shared_kernel(
             emb_config.max_tokens,
             &resolved_data_dir,
         );
-        match kaijutsu_index::OnnxEmbedder::new(&emb_config.model_dir, emb_config.dimensions, emb_config.max_tokens) {
+        match kaijutsu_index::OnnxEmbedder::new(
+            &emb_config.model_dir,
+            emb_config.dimensions,
+            emb_config.max_tokens,
+        ) {
             Ok(embedder) => {
                 match kaijutsu_index::SemanticIndex::new(index_config, Box::new(embedder)) {
                     Ok(idx) => {
@@ -848,19 +1044,21 @@ pub async fn create_shared_kernel(
                         // Build synthesis callback — runs Rhai after each indexing.
                         // Must spawn_blocking: Rhai eval + ONNX embed are CPU-bound.
                         let synth_idx = idx.clone();
-                        let synth_blocks: Arc<dyn kaijutsu_index::BlockSource> = Arc::new(BlockStoreSource(documents.clone()));
-                        let on_indexed: kaijutsu_index::watcher::OnIndexed = Arc::new(move |ctx_id| {
-                            let idx_clone = synth_idx.clone();
-                            let blocks_clone = synth_blocks.clone();
-                            tokio::task::spawn_blocking(move || {
-                                crate::synthesis_rhai::run_synthesis_and_cache(
-                                    ctx_id,
-                                    idx_clone.embedder_arc(),
-                                    blocks_clone,
-                                    idx_clone.synthesis_cache(),
-                                );
+                        let synth_blocks: Arc<dyn kaijutsu_index::BlockSource> =
+                            Arc::new(BlockStoreSource(documents.clone()));
+                        let on_indexed: kaijutsu_index::watcher::OnIndexed =
+                            Arc::new(move |ctx_id| {
+                                let idx_clone = synth_idx.clone();
+                                let blocks_clone = synth_blocks.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    crate::synthesis_rhai::run_synthesis_and_cache(
+                                        ctx_id,
+                                        idx_clone.embedder_arc(),
+                                        blocks_clone,
+                                        idx_clone.synthesis_cache(),
+                                    );
+                                });
                             });
-                        });
 
                         kaijutsu_index::watcher::spawn_index_watcher(
                             idx.clone(),
@@ -868,7 +1066,10 @@ pub async fn create_shared_kernel(
                             Box::new(status_receiver),
                             Some(on_indexed),
                         );
-                        log::info!("Semantic index initialized with {}", emb_config.model_dir.display());
+                        log::info!(
+                            "Semantic index initialized with {}",
+                            emb_config.model_dir.display()
+                        );
                         Some(idx)
                     }
                     Err(e) => {
@@ -890,17 +1091,24 @@ pub async fn create_shared_kernel(
     {
         let rhai_engine = if let Some(ref idx) = semantic_index {
             let embedder = idx.embedder_arc();
-            let bs: Arc<dyn kaijutsu_index::BlockSource> = Arc::new(BlockStoreSource(documents.clone()));
+            let bs: Arc<dyn kaijutsu_index::BlockSource> =
+                Arc::new(BlockStoreSource(documents.clone()));
             RhaiEngine::new(documents.clone()).with_extra_registrar(Arc::new(move |eng| {
                 crate::synthesis_rhai::register_synthesis_fns(eng, embedder.clone(), bs.clone());
             }))
         } else {
             RhaiEngine::new(documents.clone())
         };
-        kernel_arc.register_tool_with_engine(
-            ToolInfo::new("rhai", "Execute Rhai scripts with persistent per-context state", "kernel"),
-            Arc::new(rhai_engine),
-        ).await;
+        kernel_arc
+            .register_tool_with_engine(
+                ToolInfo::new(
+                    "rhai",
+                    "Execute Rhai scripts with persistent per-context state",
+                    "kernel",
+                ),
+                Arc::new(rhai_engine),
+            )
+            .await;
     }
 
     // Create kj dispatcher — shared across all connections
@@ -942,7 +1150,10 @@ pub struct WorldImpl {
 
 impl WorldImpl {
     pub fn new(registry: Arc<ServerRegistry>, connection: Rc<RefCell<ConnectionState>>) -> Self {
-        Self { registry, connection }
+        Self {
+            registry,
+            connection,
+        }
     }
 }
 
@@ -984,7 +1195,11 @@ impl world::Server for WorldImpl {
 
         // No kernel creation — just hand out the shared kernel
         let kernel = self.registry.kernel.clone();
-        let kernel_impl = KernelImpl::new(kernel.clone(), self.connection.clone(), self.registry.mcp_pool.clone());
+        let kernel_impl = KernelImpl::new(
+            kernel.clone(),
+            self.connection.clone(),
+            self.registry.mcp_pool.clone(),
+        );
         results.get().set_kernel(capnp_rpc::new_client(kernel_impl));
         results.get().set_kernel_id(kernel.id.as_bytes());
         Promise::ok(())
@@ -1002,8 +1217,16 @@ struct KernelImpl {
 }
 
 impl KernelImpl {
-    fn new(kernel: SharedKernel, connection: Rc<RefCell<ConnectionState>>, mcp_pool: Arc<McpServerPool>) -> Self {
-        Self { kernel, connection, mcp_pool }
+    fn new(
+        kernel: SharedKernel,
+        connection: Rc<RefCell<ConnectionState>>,
+        mcp_pool: Arc<McpServerPool>,
+    ) -> Self {
+        Self {
+            kernel,
+            connection,
+            mcp_pool,
+        }
     }
 }
 
@@ -1038,79 +1261,93 @@ impl kernel::Server for KernelImpl {
 
         // Use Promise::from_future for async execution
 
-        Promise::from_future(async move {
-            // Get or create embedded kaish executor with real connection identity
-            let kaish = {
-                let mut conn = connection.borrow_mut();
+        Promise::from_future(
+            async move {
+                // Get or create embedded kaish executor with real connection identity
+                let kaish = {
+                    let mut conn = connection.borrow_mut();
 
-                if conn.kaish.is_none() {
-                    log::info!("Creating embedded kaish for kernel {}", kernel.id.to_hex());
-                    let context_id = conn.require_context()?;
-                    let kj_disp = kernel.kj_dispatcher.clone();
-                    let kj_principal = conn.principal.id;
-                    let kj_session = conn.session_id;
-                    match EmbeddedKaish::with_identity(
-                        &format!("{}-{}-{}", kernel.name, conn.principal.username, conn.session_id.short()),
-                        kernel.documents.clone(),
-                        kernel.kernel.clone(),
-                        None,
-                        conn.principal.id,
-                        context_id,
-                        conn.session_id,
-                        kernel.id,
-                        |shared_ctx, tools| {
-                            let block_source: Arc<dyn kaijutsu_index::BlockSource> =
-                                Arc::new(BlockStoreSource(kernel.documents.clone()));
-                            tools.register(crate::kj_builtin::KjBuiltin::new(
-                                kj_disp, shared_ctx, kj_principal, kj_session,
-                                kernel.semantic_index.clone(),
-                                block_source,
-                            ));
-                        },
-                    ) {
-                        Ok(kaish) => {
-                            conn.kaish = Some(Rc::new(kaish));
-                        }
-                        Err(e) => {
-                            log::error!("Failed to create embedded kaish: {}", e);
-                            return Err(capnp::Error::failed(format!("kaish creation failed: {}", e)));
+                    if conn.kaish.is_none() {
+                        log::info!("Creating embedded kaish for kernel {}", kernel.id.to_hex());
+                        let context_id = conn.require_context()?;
+                        let kj_disp = kernel.kj_dispatcher.clone();
+                        let kj_principal = conn.principal.id;
+                        let kj_session = conn.session_id;
+                        match EmbeddedKaish::with_identity(
+                            &format!(
+                                "{}-{}-{}",
+                                kernel.name,
+                                conn.principal.username,
+                                conn.session_id.short()
+                            ),
+                            kernel.documents.clone(),
+                            kernel.kernel.clone(),
+                            None,
+                            conn.principal.id,
+                            context_id,
+                            conn.session_id,
+                            kernel.id,
+                            |shared_ctx, tools| {
+                                let block_source: Arc<dyn kaijutsu_index::BlockSource> =
+                                    Arc::new(BlockStoreSource(kernel.documents.clone()));
+                                tools.register(crate::kj_builtin::KjBuiltin::new(
+                                    kj_disp,
+                                    shared_ctx,
+                                    kj_principal,
+                                    kj_session,
+                                    kernel.semantic_index.clone(),
+                                    block_source,
+                                ));
+                            },
+                        ) {
+                            Ok(kaish) => {
+                                conn.kaish = Some(Rc::new(kaish));
+                            }
+                            Err(e) => {
+                                log::error!("Failed to create embedded kaish: {}", e);
+                                return Err(capnp::Error::failed(format!(
+                                    "kaish creation failed: {}",
+                                    e
+                                )));
+                            }
                         }
                     }
+
+                    conn.kaish.as_ref().unwrap().clone()
+                };
+
+                // Execute code via embedded kaish (routes through CRDT backend)
+                let _exec_result = match kaish.execute(&code).await {
+                    Ok(result) => result,
+                    Err(e) => {
+                        log::error!("kaish execute error: {}", e);
+                        kaish_kernel::interpreter::ExecResult::failure(1, e.to_string())
+                    }
+                };
+
+                // Record in state and build response
+                {
+                    let mut conn = connection.borrow_mut();
+                    let exec_id = conn.next_exec_id();
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .expect("system clock before UNIX epoch")
+                        .as_secs();
+
+                    // Record command history
+                    conn.command_history.push(CommandEntry {
+                        id: exec_id,
+                        code: code.clone(),
+                        timestamp,
+                    });
+
+                    results.get().set_exec_id(exec_id);
                 }
 
-                conn.kaish.as_ref().unwrap().clone()
-            };
-
-            // Execute code via embedded kaish (routes through CRDT backend)
-            let _exec_result = match kaish.execute(&code).await {
-                Ok(result) => result,
-                Err(e) => {
-                    log::error!("kaish execute error: {}", e);
-                    kaish_kernel::interpreter::ExecResult::failure(1, e.to_string())
-                }
-            };
-
-            // Record in state and build response
-            {
-                let mut conn = connection.borrow_mut();
-                let exec_id = conn.next_exec_id();
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .expect("system clock before UNIX epoch")
-                    .as_secs();
-
-                // Record command history
-                conn.command_history.push(CommandEntry {
-                    id: exec_id,
-                    code: code.clone(),
-                    timestamp,
-                });
-
-                results.get().set_exec_id(exec_id);
+                Ok(())
             }
-
-            Ok(())
-        }.instrument(trace_span))
+            .instrument(trace_span),
+        )
     }
 
     fn interrupt(
@@ -1152,10 +1389,7 @@ impl kernel::Server for KernelImpl {
         let limit = p.get_limit() as usize;
 
         let conn = self.connection.borrow();
-        let entries: Vec<_> = conn.command_history.iter()
-            .rev()
-            .take(limit)
-            .collect();
+        let entries: Vec<_> = conn.command_history.iter().rev().take(limit).collect();
 
         let mut result_entries = results.get().init_entries(entries.len() as u32);
         for (i, entry) in entries.iter().enumerate() {
@@ -1187,16 +1421,19 @@ impl kernel::Server for KernelImpl {
         let kernel_arc = self.kernel.kernel.clone();
 
         let span = tracing::info_span!("rpc", method = "list_mounts");
-        Promise::from_future(async move {
-            let mounts = kernel_arc.list_mounts().await;
-            let mut builder = results.get().init_mounts(mounts.len() as u32);
-            for (i, mount) in mounts.iter().enumerate() {
-                let mut m = builder.reborrow().get(i as u32);
-                m.set_path(&mount.path.to_string_lossy());
-                m.set_read_only(mount.read_only);
+        Promise::from_future(
+            async move {
+                let mounts = kernel_arc.list_mounts().await;
+                let mut builder = results.get().init_mounts(mounts.len() as u32);
+                for (i, mount) in mounts.iter().enumerate() {
+                    let mut m = builder.reborrow().get(i as u32);
+                    m.set_path(mount.path.to_string_lossy());
+                    m.set_read_only(mount.read_only);
+                }
+                Ok(())
             }
-            Ok(())
-        }.instrument(span))
+            .instrument(span),
+        )
     }
 
     fn mount(
@@ -1221,31 +1458,34 @@ impl kernel::Server for KernelImpl {
         let kernel_arc = self.kernel.kernel.clone();
 
         let span = tracing::info_span!("rpc", method = "mount");
-        Promise::from_future(async move {
-            // Expand source path (e.g., ~ to home dir)
-            let expanded = shellexpand::tilde(&source);
-            let source_path = std::path::PathBuf::from(expanded.as_ref());
+        Promise::from_future(
+            async move {
+                // Expand source path (e.g., ~ to home dir)
+                let expanded = shellexpand::tilde(&source);
+                let source_path = std::path::PathBuf::from(expanded.as_ref());
 
-            if !source_path.exists() {
-                return Err(capnp::Error::failed(format!(
-                    "source path does not exist: {}",
-                    source_path.display()
-                )));
+                if !source_path.exists() {
+                    return Err(capnp::Error::failed(format!(
+                        "source path does not exist: {}",
+                        source_path.display()
+                    )));
+                }
+
+                let backend = if writable {
+                    LocalBackend::new(source_path)
+                } else {
+                    LocalBackend::read_only(source_path)
+                };
+
+                if !kernel_arc.mount(&path, backend).await {
+                    return Err(capnp::Error::failed(
+                        "mount table is frozen — mounts cannot be changed at runtime".to_string(),
+                    ));
+                }
+                Ok(())
             }
-
-            let backend = if writable {
-                LocalBackend::new(source_path)
-            } else {
-                LocalBackend::read_only(source_path)
-            };
-
-            if !kernel_arc.mount(&path, backend).await {
-                return Err(capnp::Error::failed(
-                    "mount table is frozen — mounts cannot be changed at runtime".to_string(),
-                ));
-            }
-            Ok(())
-        }.instrument(span))
+            .instrument(span),
+        )
     }
 
     fn unmount(
@@ -1253,7 +1493,11 @@ impl kernel::Server for KernelImpl {
         params: kernel::UnmountParams,
         mut results: kernel::UnmountResults,
     ) -> Promise<(), capnp::Error> {
-        let path = match params.get().and_then(|p| p.get_path()).and_then(|p| get_path_str(p)) {
+        let path = match params
+            .get()
+            .and_then(|p| p.get_path())
+            .and_then(|p| get_path_str(p))
+        {
             Ok(s) => s,
             Err(e) => return Promise::err(e),
         };
@@ -1261,11 +1505,14 @@ impl kernel::Server for KernelImpl {
         let kernel_arc = self.kernel.kernel.clone();
 
         let span = tracing::info_span!("rpc", method = "unmount");
-        Promise::from_future(async move {
-            let success = kernel_arc.unmount(&path).await;
-            results.get().set_success(success);
-            Ok(())
-        }.instrument(span))
+        Promise::from_future(
+            async move {
+                let success = kernel_arc.unmount(&path).await;
+                results.get().set_success(success);
+                Ok(())
+            }
+            .instrument(span),
+        )
     }
 
     // Tool execution
@@ -1296,43 +1543,52 @@ impl kernel::Server for KernelImpl {
             )
         };
 
-        Promise::from_future(async move {
-            let mut result = results.get().init_result();
-            result.set_request_id(&request_id);
+        Promise::from_future(
+            async move {
+                let mut result = results.get().init_result();
+                result.set_request_id(&request_id);
 
-            // Resolve cwd from kaish session (now in async context, can await)
-            let cwd = match &kaish_ref {
-                Some(k) => k.cwd().await,
-                None => std::path::PathBuf::from("/"),
-            };
+                // Resolve cwd from kaish session (now in async context, can await)
+                let cwd = match &kaish_ref {
+                    Some(k) => k.cwd().await,
+                    None => std::path::PathBuf::from("/"),
+                };
 
-            let tool_ctx = kaijutsu_kernel::ToolContext::new(
-                principal_id, context_id, cwd, session_id, kernel_id,
-            );
+                let tool_ctx = kaijutsu_kernel::ToolContext::new(
+                    principal_id,
+                    context_id,
+                    cwd,
+                    session_id,
+                    kernel_id,
+                );
 
-            // Check if tool is allowed by kernel + context tool filters
-            if !kernel_arc.tool_allowed(&tool_name).await {
-                result.set_success(false);
-                result.set_error(&format!("Tool filtered out by kernel config: {}", tool_name));
-                return Ok(());
-            }
-            // Per-context tool filter (restricts further, can't relax kernel filter)
-            if let Some(ctx_filter) = kernel_arc.drift().read().await
-                .get(context_id)
-                .and_then(|h| h.tool_filter.as_ref())
-            {
-                if !ctx_filter.allows(&tool_name) {
+                // Check if tool is allowed by kernel + context tool filters
+                if !kernel_arc.tool_allowed(&tool_name).await {
                     result.set_success(false);
-                    result.set_error(&format!("Tool filtered out by context config: {}", tool_name));
+                    result.set_error(format!("Tool filtered out by kernel config: {}", tool_name));
                     return Ok(());
                 }
-            }
+                // Per-context tool filter (restricts further, can't relax kernel filter)
+                if let Some(ctx_filter) = kernel_arc
+                    .drift()
+                    .read()
+                    .await
+                    .get(context_id)
+                    .and_then(|h| h.tool_filter.as_ref())
+                    && !ctx_filter.allows(&tool_name)
+                {
+                    result.set_success(false);
+                    result.set_error(format!(
+                        "Tool filtered out by context config: {}",
+                        tool_name
+                    ));
+                    return Ok(());
+                }
 
-            // Get the engine for this tool
-            let engine = kernel_arc.tools().read().await.get_engine(&tool_name);
-            match engine {
-                Some(engine) => {
-                    match engine.execute(&tool_params, &tool_ctx).await {
+                // Get the engine for this tool
+                let engine = kernel_arc.tools().read().await.get_engine(&tool_name);
+                match engine {
+                    Some(engine) => match engine.execute(&tool_params, &tool_ctx).await {
                         Ok(exec_result) => {
                             result.set_success(exec_result.success);
                             result.set_output(&exec_result.stdout);
@@ -1342,17 +1598,18 @@ impl kernel::Server for KernelImpl {
                         }
                         Err(e) => {
                             result.set_success(false);
-                            result.set_error(&e.to_string());
+                            result.set_error(e.to_string());
                         }
+                    },
+                    None => {
+                        result.set_success(false);
+                        result.set_error(format!("No engine registered for tool: {}", tool_name));
                     }
                 }
-                None => {
-                    result.set_success(false);
-                    result.set_error(&format!("No engine registered for tool: {}", tool_name));
-                }
+                Ok(())
             }
-            Ok(())
-        }.instrument(trace_span))
+            .instrument(trace_span),
+        )
     }
 
     fn get_tool_schemas(
@@ -1363,25 +1620,28 @@ impl kernel::Server for KernelImpl {
         let kernel_arc = self.kernel.kernel.clone();
 
         let span = extract_rpc_trace(pry!(params.get()).get_trace(), "get_tool_schemas");
-        Promise::from_future(async move {
-            let registry = kernel_arc.tools().read().await;
-            let tools = registry.list_with_engines();
-            let mut builder = results.get().init_schemas(tools.len() as u32);
-            for (i, tool) in tools.iter().enumerate() {
-                let mut s = builder.reborrow().get(i as u32);
-                s.set_name(&tool.name);
-                s.set_description(&tool.description);
-                s.set_category(&tool.category);
-                // Get schema from the engine if available
-                let schema = registry
-                    .get_engine(&tool.name)
-                    .and_then(|e| e.schema())
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "{}".to_string());
-                s.set_input_schema(&schema);
+        Promise::from_future(
+            async move {
+                let registry = kernel_arc.tools().read().await;
+                let tools = registry.list_with_engines();
+                let mut builder = results.get().init_schemas(tools.len() as u32);
+                for (i, tool) in tools.iter().enumerate() {
+                    let mut s = builder.reborrow().get(i as u32);
+                    s.set_name(&tool.name);
+                    s.set_description(&tool.description);
+                    s.set_category(&tool.category);
+                    // Get schema from the engine if available
+                    let schema = registry
+                        .get_engine(&tool.name)
+                        .and_then(|e| e.schema())
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "{}".to_string());
+                    s.set_input_schema(&schema);
+                }
+                Ok(())
             }
-            Ok(())
-        }.instrument(span))
+            .instrument(span),
+        )
     }
 
     // =========================================================================
@@ -1396,8 +1656,10 @@ impl kernel::Server for KernelImpl {
         let _span = tracing::info_span!("sync.apply_block_op").entered();
         let params = pry!(params.get());
         let context_id_bytes = pry!(params.get_context_id());
-        let context_id = pry!(ContextId::try_from_slice(context_id_bytes)
-            .ok_or_else(|| capnp::Error::failed("invalid context ID".into())));
+        let context_id = pry!(
+            ContextId::try_from_slice(context_id_bytes)
+                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
+        );
         let op = pry!(params.get_op());
 
         log::debug!("apply_block_op called for context {}", context_id);
@@ -1470,7 +1732,8 @@ impl kernel::Server for KernelImpl {
         };
 
         // Return the new version
-        let new_version = documents.get(context_id)
+        let new_version = documents
+            .get(context_id)
             .map(|entry| entry.version())
             .unwrap_or(0);
         results.get().set_new_version(new_version);
@@ -1498,8 +1761,11 @@ impl kernel::Server for KernelImpl {
                 let mut block_sub = block_flows.subscribe("block.*");
                 // Input flows are optional (only present if set_input_flows was called)
                 let mut input_sub = input_flows.map(|f| f.subscribe("input.*"));
-                log::debug!("Started FlowBus subscription for kernel {} (input_flows={})",
-                    kernel_id.to_hex(), input_sub.is_some());
+                log::debug!(
+                    "Started FlowBus subscription for kernel {} (input_flows={})",
+                    kernel_id.to_hex(),
+                    input_sub.is_some()
+                );
 
                 loop {
                     let success = tokio::select! {
@@ -1651,7 +1917,7 @@ impl kernel::Server for KernelImpl {
         // Tombstoned: use getBlocks @82 + getContextSync @83 instead.
         // Schema ordinal @14 is preserved for wire compatibility.
         Promise::err(capnp::Error::failed(
-            "getContextState removed: use getBlocks @82 + getContextSync @83".into()
+            "getContextState removed: use getBlocks @82 + getContextSync @83".into(),
         ))
     }
 
@@ -1670,12 +1936,19 @@ impl kernel::Server for KernelImpl {
         let request = pry!(params.get_request());
         let content = pry!(pry!(request.get_content()).to_str()).to_owned();
         let context_id_bytes = pry!(request.get_context_id());
-        let context_id = pry!(ContextId::try_from_slice(context_id_bytes)
-            .ok_or_else(|| capnp::Error::failed("invalid context ID".into())));
-        log::info!("Received prompt request: context_id={}, content_len={}",
-            context_id, content.len());
+        let context_id = pry!(
+            ContextId::try_from_slice(context_id_bytes)
+                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
+        );
+        log::info!(
+            "Received prompt request: context_id={}, content_len={}",
+            context_id,
+            content.len()
+        );
         // Note: Cap'n Proto defaults unset Text fields to "", so we filter empty strings
-        let model = request.get_model().ok()
+        let model = request
+            .get_model()
+            .ok()
             .and_then(|m| m.to_str().ok())
             .filter(|s| !s.is_empty())
             .map(|s| s.to_owned());
@@ -1686,55 +1959,90 @@ impl kernel::Server for KernelImpl {
             (conn.principal.id, conn.session_id, conn.kaish.clone())
         };
 
-        Promise::from_future(async move {
-            log::debug!("prompt future started for context_id={}", context_id);
+        Promise::from_future(
+            async move {
+                log::debug!("prompt future started for context_id={}", context_id);
 
-            // Resolve cwd from kaish session (in async context, can await)
-            let cwd = match &kaish_ref {
-                Some(k) => k.cwd().await,
-                None => std::path::PathBuf::from("/"),
-            };
-            let tool_ctx = kaijutsu_kernel::ToolContext::new(
-                user_agent_id, context_id, cwd, session_id, kernel.id,
-            );
+                // Resolve cwd from kaish session (in async context, can await)
+                let cwd = match &kaish_ref {
+                    Some(k) => k.cwd().await,
+                    None => std::path::PathBuf::from("/"),
+                };
+                let tool_ctx = kaijutsu_kernel::ToolContext::new(
+                    user_agent_id,
+                    context_id,
+                    cwd,
+                    session_id,
+                    kernel.id,
+                );
 
-            let documents = kernel.documents.clone();
+                let documents = kernel.documents.clone();
 
-            // Document must exist — join_context is the sole creator
-            if documents.get(context_id).is_none() {
-                return Err(capnp::Error::failed(
-                    format!("context {} not found — call join_context first", context_id)
-                ));
+                // Document must exist — join_context is the sole creator
+                if documents.get(context_id).is_none() {
+                    return Err(capnp::Error::failed(format!(
+                        "context {} not found — call join_context first",
+                        context_id
+                    )));
+                }
+
+                // Create user message block at the end of the document
+                let last_block = documents.last_block_id(context_id);
+                log::info!(
+                    "Inserting user block into context {}, after={:?}",
+                    context_id,
+                    last_block
+                );
+                let user_block_id = documents
+                    .insert_block_as(
+                        context_id,
+                        None,
+                        last_block.as_ref(),
+                        Role::User,
+                        BlockKind::Text,
+                        &content,
+                        Status::Done,
+                        Some(user_agent_id),
+                    )
+                    .map_err(|e| {
+                        log::error!("Failed to insert user block: {}", e);
+                        capnp::Error::failed(format!("failed to insert user block: {}", e))
+                    })?;
+                log::debug!("Inserted user block: {:?}", user_block_id);
+
+                // Generate prompt ID
+                let prompt_id = uuid::Uuid::new_v4().to_string();
+                log::debug!("Generated prompt_id={}", prompt_id);
+
+                log::info!("User message block inserted, spawning LLM stream task");
+                log::info!(
+                    "Using model: {} (requested: {:?})",
+                    model.as_deref().unwrap_or("default"),
+                    model
+                );
+
+                // Spawn LLM streaming in background
+                spawn_llm_for_prompt(
+                    &kernel,
+                    context_id,
+                    &content,
+                    model.as_deref(),
+                    &user_block_id,
+                    tool_ctx,
+                    user_agent_id,
+                )
+                .await?;
+
+                // Return immediately with prompt_id - streaming happens in background
+                results.get().set_prompt_id(&prompt_id);
+                log::debug!(
+                    "prompt() returning immediately with prompt_id={}",
+                    prompt_id
+                );
+                Ok(())
             }
-
-            // Create user message block at the end of the document
-            let last_block = documents.last_block_id(context_id);
-            log::info!("Inserting user block into context {}, after={:?}", context_id, last_block);
-            let user_block_id = documents.insert_block_as(context_id, None, last_block.as_ref(), Role::User, BlockKind::Text, &content, Status::Done, Some(user_agent_id))
-                .map_err(|e| {
-                    log::error!("Failed to insert user block: {}", e);
-                    capnp::Error::failed(format!("failed to insert user block: {}", e))
-                })?;
-            log::debug!("Inserted user block: {:?}", user_block_id);
-
-            // Generate prompt ID
-            let prompt_id = uuid::Uuid::new_v4().to_string();
-            log::debug!("Generated prompt_id={}", prompt_id);
-
-            log::info!("User message block inserted, spawning LLM stream task");
-            log::info!("Using model: {} (requested: {:?})", model.as_deref().unwrap_or("default"), model);
-
-            // Spawn LLM streaming in background
-            spawn_llm_for_prompt(
-                &kernel, context_id, &content, model.as_deref(),
-                &user_block_id, tool_ctx, user_agent_id,
-            ).await?;
-
-            // Return immediately with prompt_id - streaming happens in background
-            results.get().set_prompt_id(&prompt_id);
-            log::debug!("prompt() returning immediately with prompt_id={}", prompt_id);
-            Ok(())
-        }.instrument(trace_span))
+            .instrument(trace_span),
+        )
     }
 
     // =========================================================================
@@ -1752,42 +2060,50 @@ impl kernel::Server for KernelImpl {
         let semantic_index = self.kernel.semantic_index.clone();
 
         let span = extract_rpc_trace(pry!(params.get()).get_trace(), "list_contexts");
-        Promise::from_future(async move {
-            // Build KernelDb lookup for fork_kind + archived_at (fields not on DriftRouter)
-            let db_map: HashMap<ContextId, ContextRow> = {
-                let db = kernel_db_arc.lock();
-                match db.list_all_contexts(kernel_id) {
-                    Ok(rows) => rows.into_iter().map(|r| (r.context_id, r)).collect(),
-                    Err(_) => HashMap::new(),
-                }
-            };
+        Promise::from_future(
+            async move {
+                // Build KernelDb lookup for fork_kind + archived_at (fields not on DriftRouter)
+                let db_map: HashMap<ContextId, ContextRow> = {
+                    let db = kernel_db_arc.lock();
+                    match db.list_all_contexts(kernel_id) {
+                        Ok(rows) => rows.into_iter().map(|r| (r.context_id, r)).collect(),
+                        Err(_) => HashMap::new(),
+                    }
+                };
 
-            // Read from the kernel's drift router — runtime authority for provider/model
-            let drift = kernel_arc.drift().read().await;
-            let contexts = drift.list_contexts();
-            let mut ctx_list = results.get().init_contexts(contexts.len() as u32);
+                // Read from the kernel's drift router — runtime authority for provider/model
+                let drift = kernel_arc.drift().read().await;
+                let contexts = drift.list_contexts();
+                let mut ctx_list = results.get().init_contexts(contexts.len() as u32);
 
-            for (i, ctx) in contexts.iter().enumerate() {
-                let mut c = ctx_list.reborrow().get(i as u32);
-                c.set_id(ctx.id.as_bytes());
-                c.set_label(ctx.label.as_deref().unwrap_or(""));
-                // Wire field is still named `parentId` — Rust side renamed to `forked_from`
-                c.set_parent_id(ctx.forked_from.map(|p| *p.as_bytes()).unwrap_or([0u8; 16]).as_slice());
-                c.set_provider(ctx.provider.as_deref().unwrap_or(""));
-                c.set_model(ctx.model.as_deref().unwrap_or(""));
-                c.set_created_at(ctx.created_at);
-                c.set_trace_id(&ctx.trace_id);
+                for (i, ctx) in contexts.iter().enumerate() {
+                    let mut c = ctx_list.reborrow().get(i as u32);
+                    c.set_id(ctx.id.as_bytes());
+                    c.set_label(ctx.label.as_deref().unwrap_or(""));
+                    // Wire field is still named `parentId` — Rust side renamed to `forked_from`
+                    c.set_parent_id(
+                        ctx.forked_from
+                            .map(|p| *p.as_bytes())
+                            .unwrap_or([0u8; 16])
+                            .as_slice(),
+                    );
+                    c.set_provider(ctx.provider.as_deref().unwrap_or(""));
+                    c.set_model(ctx.model.as_deref().unwrap_or(""));
+                    c.set_created_at(ctx.created_at);
+                    c.set_trace_id(&ctx.trace_id);
 
-                // Supplement with KernelDb metadata
-                if let Some(row) = db_map.get(&ctx.id) {
-                    c.set_fork_kind(row.fork_kind.as_ref().map(|fk| fk.as_str()).unwrap_or(""));
-                    c.set_archived_at(row.archived_at.map(|ts| ts as u64).unwrap_or(0));
-                }
+                    // Supplement with KernelDb metadata
+                    if let Some(row) = db_map.get(&ctx.id) {
+                        c.set_fork_kind(row.fork_kind.as_ref().map(|fk| fk.as_str()).unwrap_or(""));
+                        c.set_archived_at(row.archived_at.map(|ts| ts as u64).unwrap_or(0));
+                    }
 
-                // Supplement with synthesis data (keywords + preview)
-                if let Some(ref idx) = semantic_index {
-                    if let Some(synth) = idx.synthesis_cache().get_any(ctx.id) {
-                        let kw_strs: Vec<&str> = synth.keywords.iter().map(|(k, _)| k.as_str()).collect();
+                    // Supplement with synthesis data (keywords + preview)
+                    if let Some(ref idx) = semantic_index
+                        && let Some(synth) = idx.synthesis_cache().get_any(ctx.id)
+                    {
+                        let kw_strs: Vec<&str> =
+                            synth.keywords.iter().map(|(k, _)| k.as_str()).collect();
                         let mut kw_list = c.reborrow().init_keywords(kw_strs.len() as u32);
                         for (j, kw) in kw_strs.iter().enumerate() {
                             kw_list.set(j as u32, kw);
@@ -1797,10 +2113,11 @@ impl kernel::Server for KernelImpl {
                         }
                     }
                 }
-            }
 
-            Ok(())
-        }.instrument(span))
+                Ok(())
+            }
+            .instrument(span),
+        )
     }
 
     /// Create a new context with the given label.
@@ -1819,7 +2136,11 @@ impl kernel::Server for KernelImpl {
 
         let parent_ctx = connection.borrow().current_context_id;
 
-        log::info!("create_context: label='{}' kernel='{}'", label, kernel.id.to_hex());
+        log::info!(
+            "create_context: label='{}' kernel='{}'",
+            label,
+            kernel.id.to_hex()
+        );
 
         Promise::from_future(async move {
             let context_id = ContextId::new();
@@ -1830,17 +2151,26 @@ impl kernel::Server for KernelImpl {
                 kaijutsu_types::DocKind::Conversation,
                 None,
             ) {
-                return Err(capnp::Error::failed(
-                    format!("Failed to create document for context {}: {}", context_id, e),
-                ));
+                return Err(capnp::Error::failed(format!(
+                    "Failed to create document for context {}: {}",
+                    context_id, e
+                )));
             }
 
             // Create the input document for this context
             if let Err(e) = kernel.documents.create_input_doc(context_id) {
-                log::warn!("Failed to create input doc for context {}: {}", context_id, e);
+                log::warn!(
+                    "Failed to create input doc for context {}: {}",
+                    context_id,
+                    e
+                );
             }
 
-            let label_ref = if label.is_empty() { None } else { Some(label.as_str()) };
+            let label_ref = if label.is_empty() {
+                None
+            } else {
+                Some(label.as_str())
+            };
             let created_by = connection.borrow().principal.id;
 
             // Read LLM defaults so new contexts start with a model set
@@ -1848,9 +2178,12 @@ impl kernel::Server for KernelImpl {
                 let registry = kernel.kernel.llm().read().await;
                 (
                     registry.default_provider_name().map(|s| s.to_string()),
-                    Some(registry.default_model()
-                        .unwrap_or(kaijutsu_kernel::DEFAULT_MODEL)
-                        .to_string()),
+                    Some(
+                        registry
+                            .default_model()
+                            .unwrap_or(kaijutsu_kernel::DEFAULT_MODEL)
+                            .to_string(),
+                    ),
                 )
             };
 
@@ -1874,10 +2207,15 @@ impl kernel::Server for KernelImpl {
                     workspace_id: None,
                     preset_id: None,
                 };
-                let default_ws = db.get_or_create_default_workspace(row.kernel_id, row.created_by)
-                        .unwrap_or_else(|_| kaijutsu_types::WorkspaceId::new());
+                let default_ws = db
+                    .get_or_create_default_workspace(row.kernel_id, row.created_by)
+                    .unwrap_or_else(|_| kaijutsu_types::WorkspaceId::new());
                 if let Err(e) = db.insert_context_with_document(&row, default_ws) {
-                    log::warn!("KernelDb insert_context failed for {}: {}", context_id.short(), e);
+                    log::warn!(
+                        "KernelDb insert_context failed for {}: {}",
+                        context_id.short(),
+                        e
+                    );
                 }
             }
 
@@ -1887,7 +2225,11 @@ impl kernel::Server for KernelImpl {
                 if let (Some(p), Some(m)) = (&default_provider, &default_model) {
                     let _ = drift.configure_llm(context_id, p, m);
                 }
-                log::info!("Created context {} (label={:?}) in kernel DriftRouter", context_id, label_ref);
+                log::info!(
+                    "Created context {} (label={:?}) in kernel DriftRouter",
+                    context_id,
+                    label_ref
+                );
             }
 
             results.get().set_id(context_id.as_bytes());
@@ -1907,52 +2249,72 @@ impl kernel::Server for KernelImpl {
         let params = pry!(params.get());
         // Schema: joinContext(contextId :Data, instance :Text) -> (contextId :Data)
         let context_id_bytes = pry!(params.get_context_id());
-        let context_id = pry!(ContextId::try_from_slice(context_id_bytes)
-            .ok_or_else(|| capnp::Error::failed("invalid context ID (expected 16 bytes)".into())));
+        let context_id = pry!(
+            ContextId::try_from_slice(context_id_bytes).ok_or_else(|| capnp::Error::failed(
+                "invalid context ID (expected 16 bytes)".into()
+            ))
+        );
         let instance = pry!(pry!(params.get_instance()).to_str()).to_owned();
 
         let kernel = self.kernel.clone();
         let connection = self.connection.clone();
 
-        log::info!("join_context: context_id={} instance='{}' kernel='{}'",
-            context_id, instance, kernel.id.to_hex());
+        log::info!(
+            "join_context: context_id={} instance='{}' kernel='{}'",
+            context_id,
+            instance,
+            kernel.id.to_hex()
+        );
 
         let span = extract_rpc_trace(params.get_trace(), "join_context");
-        Promise::from_future(async move {
-            // Context must already exist — no auto-creation
-            if !kernel.documents.contains(context_id) {
-                return Err(capnp::Error::failed(
-                    format!("context {} does not exist — use createContext first", context_id)
-                ));
-            }
-
-            log::debug!("Re-joining existing context {}", context_id);
-
-            // Ensure input doc exists (idempotent)
-            if let Err(e) = kernel.documents.create_input_doc(context_id) {
-                log::warn!("Failed to create input doc for context {}: {}", context_id, e);
-            }
-
-            // Verify context is registered in drift router
-            {
-                let drift = kernel.kernel.drift().read().await;
-                if drift.get(context_id).is_none() {
-                    return Err(capnp::Error::failed(
-                        format!("context {} not registered in drift router — use createContext first", context_id)
-                    ));
+        Promise::from_future(
+            async move {
+                // Context must already exist — no auto-creation
+                if !kernel.documents.contains(context_id) {
+                    return Err(capnp::Error::failed(format!(
+                        "context {} does not exist — use createContext first",
+                        context_id
+                    )));
                 }
-                let trace_id = drift.get(context_id).map(|h| h.trace_id).unwrap_or([0u8; 16]);
-                let _ctx_span = kaijutsu_telemetry::context_root_span(&trace_id, "join_context").entered();
+
+                log::debug!("Re-joining existing context {}", context_id);
+
+                // Ensure input doc exists (idempotent)
+                if let Err(e) = kernel.documents.create_input_doc(context_id) {
+                    log::warn!(
+                        "Failed to create input doc for context {}: {}",
+                        context_id,
+                        e
+                    );
+                }
+
+                // Verify context is registered in drift router
+                {
+                    let drift = kernel.kernel.drift().read().await;
+                    if drift.get(context_id).is_none() {
+                        return Err(capnp::Error::failed(format!(
+                            "context {} not registered in drift router — use createContext first",
+                            context_id
+                        )));
+                    }
+                    let trace_id = drift
+                        .get(context_id)
+                        .map(|h| h.trace_id)
+                        .unwrap_or([0u8; 16]);
+                    let _ctx_span =
+                        kaijutsu_telemetry::context_root_span(&trace_id, "join_context").entered();
+                }
+
+                // Update connection's active context
+                connection.borrow_mut().current_context_id = Some(context_id);
+
+                // Return the context_id
+                results.get().set_context_id(context_id.as_bytes());
+
+                Ok(())
             }
-
-            // Update connection's active context
-            connection.borrow_mut().current_context_id = Some(context_id);
-
-            // Return the context_id
-            results.get().set_context_id(context_id.as_bytes());
-
-            Ok(())
-        }.instrument(span))
+            .instrument(span),
+        )
     }
 
     // ========================================================================
@@ -1982,10 +2344,10 @@ impl kernel::Server for KernelImpl {
         let mut env = std::collections::HashMap::new();
         if config_reader.has_env() {
             for env_var in pry!(config_reader.get_env()).iter() {
-                if let (Ok(key_reader), Ok(value_reader)) = (env_var.get_key(), env_var.get_value()) {
-                    if let (Ok(key), Ok(value)) = (key_reader.to_str(), value_reader.to_str()) {
-                        env.insert(key.to_owned(), value.to_owned());
-                    }
+                if let (Ok(key_reader), Ok(value_reader)) = (env_var.get_key(), env_var.get_value())
+                    && let (Ok(key), Ok(value)) = (key_reader.to_str(), value_reader.to_str())
+                {
+                    env.insert(key.to_owned(), value.to_owned());
                 }
             }
         }
@@ -1994,7 +2356,11 @@ impl kernel::Server for KernelImpl {
         let cwd = if config_reader.has_cwd() {
             let cwd_reader = pry!(config_reader.get_cwd());
             if let Ok(cwd_str) = cwd_reader.to_str() {
-                if cwd_str.is_empty() { None } else { Some(cwd_str.to_owned()) }
+                if cwd_str.is_empty() {
+                    None
+                } else {
+                    Some(cwd_str.to_owned())
+                }
             } else {
                 None
             }
@@ -2008,7 +2374,11 @@ impl kernel::Server for KernelImpl {
                 Ok("stdio") | Ok("") => McpTransport::Stdio,
                 Ok("streamable_http") => McpTransport::StreamableHttp,
                 Ok(other) => {
-                    log::warn!("Unknown MCP transport '{}' for '{}', defaulting to stdio", other, name);
+                    log::warn!(
+                        "Unknown MCP transport '{}' for '{}', defaulting to stdio",
+                        other,
+                        name
+                    );
                     McpTransport::Stdio
                 }
                 Err(_) => McpTransport::Stdio,
@@ -2021,7 +2391,11 @@ impl kernel::Server for KernelImpl {
         let url = if config_reader.has_url() {
             let url_reader = pry!(config_reader.get_url());
             if let Ok(url_str) = url_reader.to_str() {
-                if url_str.is_empty() { None } else { Some(url_str.to_owned()) }
+                if url_str.is_empty() {
+                    None
+                } else {
+                    Some(url_str.to_owned())
+                }
             } else {
                 None
             }
@@ -2044,40 +2418,47 @@ impl kernel::Server for KernelImpl {
         let kernel_arc = self.kernel.kernel.clone();
 
         let span = tracing::info_span!("rpc", method = "register_mcp");
-        Promise::from_future(async move {
-            let info = mcp_pool.register(config).await
-                .map_err(|e| capnp::Error::failed(format!("Failed to register MCP server: {}", e)))?;
+        Promise::from_future(
+            async move {
+                let info = mcp_pool.register(config).await.map_err(|e| {
+                    capnp::Error::failed(format!("Failed to register MCP server: {}", e))
+                })?;
 
-            // Register MCP tools with the kernel
-            // Tools with engines are automatically available via ToolFilter
-            {
-                let tools = McpToolEngine::from_server_tools(mcp_pool.clone(), &name, &info.tools);
-                for (qualified_name, engine) in tools {
-                    let desc = engine.description().to_string();
-                    kernel_arc.register_tool_with_engine(
-                        ToolInfo::new(&qualified_name, &desc, "mcp"),
-                        engine,
-                    ).await;
+                // Register MCP tools with the kernel
+                // Tools with engines are automatically available via ToolFilter
+                {
+                    let tools =
+                        McpToolEngine::from_server_tools(mcp_pool.clone(), &name, &info.tools);
+                    for (qualified_name, engine) in tools {
+                        let desc = engine.description().to_string();
+                        kernel_arc
+                            .register_tool_with_engine(
+                                ToolInfo::new(&qualified_name, &desc, "mcp"),
+                                engine,
+                            )
+                            .await;
+                    }
                 }
+
+                // Build the result
+                let mut info_builder = results.get().init_info();
+                info_builder.set_name(&info.name);
+                info_builder.set_protocol_version(&info.protocol_version);
+                info_builder.set_server_name(&info.server_name);
+                info_builder.set_server_version(&info.server_version);
+
+                let mut tools_builder = info_builder.init_tools(info.tools.len() as u32);
+                for (i, tool) in info.tools.iter().enumerate() {
+                    let mut tool_builder = tools_builder.reborrow().get(i as u32);
+                    tool_builder.set_name(&tool.name);
+                    tool_builder.set_description(tool.description.clone().unwrap_or_default());
+                    tool_builder.set_input_schema(tool.input_schema.to_string());
+                }
+
+                Ok(())
             }
-
-            // Build the result
-            let mut info_builder = results.get().init_info();
-            info_builder.set_name(&info.name);
-            info_builder.set_protocol_version(&info.protocol_version);
-            info_builder.set_server_name(&info.server_name);
-            info_builder.set_server_version(&info.server_version);
-
-            let mut tools_builder = info_builder.init_tools(info.tools.len() as u32);
-            for (i, tool) in info.tools.iter().enumerate() {
-                let mut tool_builder = tools_builder.reborrow().get(i as u32);
-                tool_builder.set_name(&tool.name);
-                tool_builder.set_description(&tool.description.clone().unwrap_or_default());
-                tool_builder.set_input_schema(&tool.input_schema.to_string());
-            }
-
-            Ok(())
-        }.instrument(span))
+            .instrument(span),
+        )
     }
 
     fn unregister_mcp(
@@ -2090,20 +2471,24 @@ impl kernel::Server for KernelImpl {
         let kernel_arc = self.kernel.kernel.clone();
 
         let span = tracing::info_span!("rpc", method = "unregister_mcp");
-        Promise::from_future(async move {
-            // Remove engines for MCP tools before unregistering the server
-            if let Ok(info) = mcp_pool.get_server_info(&name).await {
-                let mut registry = kernel_arc.tools().write().await;
-                for tool in &info.tools {
-                    let qualified_name = format!("{}:{}", name, tool.name);
-                    registry.remove_engine(&qualified_name);
+        Promise::from_future(
+            async move {
+                // Remove engines for MCP tools before unregistering the server
+                if let Ok(info) = mcp_pool.get_server_info(&name).await {
+                    let mut registry = kernel_arc.tools().write().await;
+                    for tool in &info.tools {
+                        let qualified_name = format!("{}:{}", name, tool.name);
+                        registry.remove_engine(&qualified_name);
+                    }
                 }
-            }
 
-            mcp_pool.unregister(&name).await
-                .map_err(|e| capnp::Error::failed(format!("Failed to unregister MCP server: {}", e)))?;
-            Ok(())
-        }.instrument(span))
+                mcp_pool.unregister(&name).await.map_err(|e| {
+                    capnp::Error::failed(format!("Failed to unregister MCP server: {}", e))
+                })?;
+                Ok(())
+            }
+            .instrument(span),
+        )
     }
 
     fn list_mcp_servers(
@@ -2114,36 +2499,39 @@ impl kernel::Server for KernelImpl {
         let mcp_pool = self.mcp_pool.clone();
 
         let span = tracing::info_span!("rpc", method = "list_mcp_servers");
-        Promise::from_future(async move {
-            let server_names = mcp_pool.list_servers();
-            let mut servers_info = Vec::new();
+        Promise::from_future(
+            async move {
+                let server_names = mcp_pool.list_servers();
+                let mut servers_info = Vec::new();
 
-            for name in server_names {
-                if let Ok(info) = mcp_pool.get_server_info(&name).await {
-                    servers_info.push(info);
+                for name in server_names {
+                    if let Ok(info) = mcp_pool.get_server_info(&name).await {
+                        servers_info.push(info);
+                    }
                 }
-            }
 
-            // Build the result
-            let mut servers_builder = results.get().init_servers(servers_info.len() as u32);
-            for (i, info) in servers_info.iter().enumerate() {
-                let mut server_builder = servers_builder.reborrow().get(i as u32);
-                server_builder.set_name(&info.name);
-                server_builder.set_protocol_version(&info.protocol_version);
-                server_builder.set_server_name(&info.server_name);
-                server_builder.set_server_version(&info.server_version);
+                // Build the result
+                let mut servers_builder = results.get().init_servers(servers_info.len() as u32);
+                for (i, info) in servers_info.iter().enumerate() {
+                    let mut server_builder = servers_builder.reborrow().get(i as u32);
+                    server_builder.set_name(&info.name);
+                    server_builder.set_protocol_version(&info.protocol_version);
+                    server_builder.set_server_name(&info.server_name);
+                    server_builder.set_server_version(&info.server_version);
 
-                let mut tools_builder = server_builder.init_tools(info.tools.len() as u32);
-                for (j, tool) in info.tools.iter().enumerate() {
-                    let mut tool_builder = tools_builder.reborrow().get(j as u32);
-                    tool_builder.set_name(&tool.name);
-                    tool_builder.set_description(&tool.description.clone().unwrap_or_default());
-                    tool_builder.set_input_schema(&tool.input_schema.to_string());
+                    let mut tools_builder = server_builder.init_tools(info.tools.len() as u32);
+                    for (j, tool) in info.tools.iter().enumerate() {
+                        let mut tool_builder = tools_builder.reborrow().get(j as u32);
+                        tool_builder.set_name(&tool.name);
+                        tool_builder.set_description(tool.description.clone().unwrap_or_default());
+                        tool_builder.set_input_schema(tool.input_schema.to_string());
+                    }
                 }
-            }
 
-            Ok(())
-        }.instrument(span))
+                Ok(())
+            }
+            .instrument(span),
+        )
     }
 
     fn call_mcp_tool(
@@ -2167,7 +2555,7 @@ impl kernel::Server for KernelImpl {
                 Err(e) => {
                     let mut result_builder = results.get().init_result();
                     result_builder.set_is_error(true);
-                    result_builder.set_content(&format!("Invalid JSON arguments: {}", e));
+                    result_builder.set_content(format!("Invalid JSON arguments: {}", e));
                     return Promise::ok(());
                 }
             }
@@ -2175,26 +2563,29 @@ impl kernel::Server for KernelImpl {
 
         let mcp_pool = self.mcp_pool.clone();
 
-        Promise::from_future(async move {
-            let mcp_result = mcp_pool.call_tool(&server, &tool, arguments).await;
+        Promise::from_future(
+            async move {
+                let mcp_result = mcp_pool.call_tool(&server, &tool, arguments).await;
 
-            let mut result_builder = results.get().init_result();
-            match mcp_result {
-                Ok(r) => {
-                    let is_error = r.is_error.unwrap_or(false);
-                    result_builder.set_is_error(is_error);
+                let mut result_builder = results.get().init_result();
+                match mcp_result {
+                    Ok(r) => {
+                        let is_error = r.is_error.unwrap_or(false);
+                        result_builder.set_is_error(is_error);
 
-                    let content = extract_tool_result_text(&r);
-                    result_builder.set_content(&content);
+                        let content = extract_tool_result_text(&r);
+                        result_builder.set_content(&content);
+                    }
+                    Err(e) => {
+                        result_builder.set_is_error(true);
+                        result_builder.set_content(e.to_string());
+                    }
                 }
-                Err(e) => {
-                    result_builder.set_is_error(true);
-                    result_builder.set_content(&e.to_string());
-                }
+
+                Ok(())
             }
-
-            Ok(())
-        }.instrument(trace_span))
+            .instrument(trace_span),
+        )
     }
 
     // =========================================================================
@@ -2206,30 +2597,48 @@ impl kernel::Server for KernelImpl {
         params: kernel::ShellExecuteParams,
         mut results: kernel::ShellExecuteResults,
     ) -> Promise<(), capnp::Error> {
-        log::debug!("shell_execute() called for kernel {}", self.kernel.id.to_hex());
+        log::debug!(
+            "shell_execute() called for kernel {}",
+            self.kernel.id.to_hex()
+        );
         let params = pry!(params.get());
         let trace_span = extract_rpc_trace(params.get_trace(), "shell_execute");
         let code = pry!(pry!(params.get_code()).to_str()).to_owned();
         let context_id_bytes = pry!(params.get_context_id());
-        let context_id = pry!(ContextId::try_from_slice(context_id_bytes)
-            .ok_or_else(|| capnp::Error::failed("invalid context ID".into())));
+        let context_id = pry!(
+            ContextId::try_from_slice(context_id_bytes)
+                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
+        );
         let user_initiated = params.get_user_initiated();
-        log::info!("Shell execute: context_id={}, code={}, user_initiated={}", context_id, code, user_initiated);
+        log::info!(
+            "Shell execute: context_id={}, code={}, user_initiated={}",
+            context_id,
+            code,
+            user_initiated
+        );
 
         let kernel = self.kernel.clone();
         let connection = self.connection.clone();
         let user_agent_id = self.connection.borrow().principal.id;
 
-        Promise::from_future(async move {
-            let command_block_id = execute_shell_command(
-                &code, context_id, user_agent_id, user_initiated,
-                &kernel, &connection,
-            ).await?;
+        Promise::from_future(
+            async move {
+                let command_block_id = execute_shell_command(
+                    &code,
+                    context_id,
+                    user_agent_id,
+                    user_initiated,
+                    &kernel,
+                    &connection,
+                )
+                .await?;
 
-            let mut block_id_builder = results.get().init_command_block_id();
-            set_block_id_builder(&mut block_id_builder, &command_block_id);
-            Ok(())
-        }.instrument(trace_span))
+                let mut block_id_builder = results.get().init_command_block_id();
+                set_block_id_builder(&mut block_id_builder, &command_block_id);
+                Ok(())
+            }
+            .instrument(trace_span),
+        )
     }
 
     // =========================================================================
@@ -2244,21 +2653,24 @@ impl kernel::Server for KernelImpl {
         let connection = self.connection.clone();
 
         let span = tracing::info_span!("rpc", method = "get_cwd");
-        Promise::from_future(async move {
-            let kaish = {
-                let conn = connection.borrow();
-                conn.kaish.clone()
-            };
+        Promise::from_future(
+            async move {
+                let kaish = {
+                    let conn = connection.borrow();
+                    conn.kaish.clone()
+                };
 
-            let cwd = if let Some(kaish) = kaish {
-                kaish.cwd().await
-            } else {
-                std::path::PathBuf::from("/docs")
-            };
+                let cwd = if let Some(kaish) = kaish {
+                    kaish.cwd().await
+                } else {
+                    std::path::PathBuf::from("/docs")
+                };
 
-            results.get().set_path(&cwd.to_string_lossy());
-            Ok(())
-        }.instrument(span))
+                results.get().set_path(cwd.to_string_lossy());
+                Ok(())
+            }
+            .instrument(span),
+        )
     }
 
     fn set_cwd(
@@ -2269,7 +2681,9 @@ impl kernel::Server for KernelImpl {
         let path = match params.get().and_then(|p| p.get_path()) {
             Ok(p) => match p.to_str() {
                 Ok(s) => s.to_owned(),
-                Err(e) => return Promise::err(capnp::Error::failed(format!("invalid path: {}", e))),
+                Err(e) => {
+                    return Promise::err(capnp::Error::failed(format!("invalid path: {}", e)));
+                }
             },
             Err(e) => return Promise::err(capnp::Error::failed(format!("missing path: {}", e))),
         };
@@ -2277,19 +2691,23 @@ impl kernel::Server for KernelImpl {
         let connection = self.connection.clone();
 
         let span = tracing::info_span!("rpc", method = "set_cwd");
-        Promise::from_future(async move {
-            let kaish = {
-                let conn = connection.borrow();
-                conn.kaish.clone()
-                    .ok_or_else(|| capnp::Error::failed("kaish not initialized".into()))?
-            };
+        Promise::from_future(
+            async move {
+                let kaish = {
+                    let conn = connection.borrow();
+                    conn.kaish
+                        .clone()
+                        .ok_or_else(|| capnp::Error::failed("kaish not initialized".into()))?
+                };
 
-            // set_cwd doesn't return a Result in kaish
-            kaish.set_cwd(std::path::PathBuf::from(&path)).await;
-            results.get().set_success(true);
-            results.get().set_error("");
-            Ok(())
-        }.instrument(span))
+                // set_cwd doesn't return a Result in kaish
+                kaish.set_cwd(std::path::PathBuf::from(&path)).await;
+                results.get().set_success(true);
+                results.get().set_error("");
+                Ok(())
+            }
+            .instrument(span),
+        )
     }
 
     fn get_last_result(
@@ -2300,44 +2718,50 @@ impl kernel::Server for KernelImpl {
         let connection = self.connection.clone();
 
         let span = tracing::info_span!("rpc", method = "get_last_result");
-        Promise::from_future(async move {
-            let kaish = {
-                let conn = connection.borrow();
-                conn.kaish.clone()
-            };
+        Promise::from_future(
+            async move {
+                let kaish = {
+                    let conn = connection.borrow();
+                    conn.kaish.clone()
+                };
 
-            let last_result = if let Some(kaish) = kaish {
-                kaish.last_result().await
-            } else {
-                None
-            };
+                let last_result = if let Some(kaish) = kaish {
+                    kaish.last_result().await
+                } else {
+                    None
+                };
 
-            let mut result_builder = results.get().init_result();
-            if let Some(exec_result) = last_result {
-                result_builder.set_code(exec_result.code);
-                result_builder.set_ok(exec_result.ok());
-                result_builder.set_stdout(exec_result.out.as_bytes());
-                result_builder.set_stderr(&exec_result.err);
+                let mut result_builder = results.get().init_result();
+                if let Some(exec_result) = last_result {
+                    result_builder.set_code(exec_result.code);
+                    result_builder.set_ok(exec_result.ok());
+                    result_builder.set_stdout(exec_result.out.as_bytes());
+                    result_builder.set_stderr(&exec_result.err);
 
-                // Serialize data if present
-                if let Some(ref data) = exec_result.data {
-                    value_to_shell_value(result_builder.reborrow().init_data(), data);
+                    // Serialize data if present
+                    if let Some(ref data) = exec_result.data {
+                        value_to_shell_value(result_builder.reborrow().init_data(), data);
+                    }
+
+                    // Serialize structured output data
+                    if let Some(ref output_data) = exec_result.output {
+                        build_output_data(
+                            result_builder.reborrow().init_output_data(),
+                            output_data,
+                        );
+                    }
+                } else {
+                    // No last result - return empty/zero values
+                    result_builder.set_code(0);
+                    result_builder.set_ok(true);
+                    result_builder.set_stdout(&[]);
+                    result_builder.set_stderr("");
                 }
 
-                // Serialize structured output data
-                if let Some(ref output_data) = exec_result.output {
-                    build_output_data(result_builder.reborrow().init_output_data(), output_data);
-                }
-            } else {
-                // No last result - return empty/zero values
-                result_builder.set_code(0);
-                result_builder.set_ok(true);
-                result_builder.set_stdout(&[]);
-                result_builder.set_stderr("");
+                Ok(())
             }
-
-            Ok(())
-        }.instrument(span))
+            .instrument(span),
+        )
     }
 
     // =========================================================================
@@ -2384,11 +2808,17 @@ impl kernel::Server for KernelImpl {
         let params_reader = pry!(params.get());
         let _trace_guard = extract_rpc_trace(params_reader.get_trace(), "push_ops").entered();
         let context_id_bytes = pry!(params_reader.get_context_id());
-        let context_id = pry!(ContextId::try_from_slice(context_id_bytes)
-            .ok_or_else(|| capnp::Error::failed("invalid context ID".into())));
+        let context_id = pry!(
+            ContextId::try_from_slice(context_id_bytes)
+                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
+        );
         let ops_data = pry!(params_reader.get_ops()).to_vec();
 
-        log::debug!("push_ops called for context {} with {} bytes", context_id, ops_data.len());
+        log::debug!(
+            "push_ops called for context {} with {} bytes",
+            context_id,
+            ops_data.len()
+        );
 
         let _ctx_span = if let Ok(drift) = self.kernel.kernel.drift().try_read() {
             let trace_id = drift.trace_id_for_context(context_id).unwrap_or([0u8; 16]);
@@ -2400,7 +2830,8 @@ impl kernel::Server for KernelImpl {
         let documents = &self.kernel.documents;
 
         // Deserialize the sync payload
-        let payload: kaijutsu_crdt::block_store::SyncPayload = match postcard::from_bytes(&ops_data) {
+        let payload: kaijutsu_crdt::block_store::SyncPayload = match postcard::from_bytes(&ops_data)
+        {
             Ok(p) => p,
             Err(e) => {
                 return Promise::err(capnp::Error::failed(format!(
@@ -2414,10 +2845,7 @@ impl kernel::Server for KernelImpl {
         let ack_version = match documents.merge_ops(context_id, payload) {
             Ok(version) => version,
             Err(e) => {
-                return Promise::err(capnp::Error::failed(format!(
-                    "failed to merge ops: {}",
-                    e
-                )));
+                return Promise::err(capnp::Error::failed(format!("failed to merge ops: {}", e)));
             }
         };
 
@@ -2442,31 +2870,34 @@ impl kernel::Server for KernelImpl {
         let mcp_pool = self.mcp_pool.clone();
 
         let span = extract_rpc_trace(params_reader.get_trace(), "list_mcp_resources");
-        Promise::from_future(async move {
-            match mcp_pool.list_resources(&server).await {
-                Ok(resources) => {
-                    let mut list = results.get().init_resources(resources.len() as u32);
-                    for (i, res) in resources.iter().enumerate() {
-                        let mut builder = list.reborrow().get(i as u32);
-                        builder.set_uri(&res.uri);
-                        builder.set_name(res.name.as_deref().unwrap_or(""));
-                        builder.set_has_description(res.description.is_some());
-                        if let Some(desc) = &res.description {
-                            builder.set_description(desc);
+        Promise::from_future(
+            async move {
+                match mcp_pool.list_resources(&server).await {
+                    Ok(resources) => {
+                        let mut list = results.get().init_resources(resources.len() as u32);
+                        for (i, res) in resources.iter().enumerate() {
+                            let mut builder = list.reborrow().get(i as u32);
+                            builder.set_uri(&res.uri);
+                            builder.set_name(res.name.as_deref().unwrap_or(""));
+                            builder.set_has_description(res.description.is_some());
+                            if let Some(desc) = &res.description {
+                                builder.set_description(desc);
+                            }
+                            builder.set_has_mime_type(res.mime_type.is_some());
+                            if let Some(mime) = &res.mime_type {
+                                builder.set_mime_type(mime);
+                            }
                         }
-                        builder.set_has_mime_type(res.mime_type.is_some());
-                        if let Some(mime) = &res.mime_type {
-                            builder.set_mime_type(mime);
-                        }
+                        Ok(())
                     }
-                    Ok(())
+                    Err(e) => Err(capnp::Error::failed(format!(
+                        "failed to list resources: {}",
+                        e
+                    ))),
                 }
-                Err(e) => Err(capnp::Error::failed(format!(
-                    "failed to list resources: {}",
-                    e
-                ))),
             }
-        }.instrument(span))
+            .instrument(span),
+        )
     }
 
     fn read_mcp_resource(
@@ -2482,46 +2913,53 @@ impl kernel::Server for KernelImpl {
         let mcp_pool = self.mcp_pool.clone();
 
         let span = extract_rpc_trace(params_reader.get_trace(), "read_mcp_resource");
-        Promise::from_future(async move {
-            match mcp_pool.read_resource(&server, &uri).await {
-                Ok(contents) => {
-                    results.get().set_has_contents(true);
-                    let mut contents_builder = results.get().init_contents();
-                    contents_builder.set_uri(&uri);
+        Promise::from_future(
+            async move {
+                match mcp_pool.read_resource(&server, &uri).await {
+                    Ok(contents) => {
+                        results.get().set_has_contents(true);
+                        let mut contents_builder = results.get().init_contents();
+                        contents_builder.set_uri(&uri);
 
-                    match contents {
-                        kaijutsu_kernel::McpResourceContents::TextResourceContents {
-                            mime_type, text, ..
-                        } => {
-                            contents_builder.set_has_mime_type(mime_type.is_some());
-                            if let Some(mime) = &mime_type {
-                                contents_builder.set_mime_type(mime);
+                        match contents {
+                            kaijutsu_kernel::McpResourceContents::TextResourceContents {
+                                mime_type,
+                                text,
+                                ..
+                            } => {
+                                contents_builder.set_has_mime_type(mime_type.is_some());
+                                if let Some(mime) = &mime_type {
+                                    contents_builder.set_mime_type(mime);
+                                }
+                                contents_builder.set_text(&text);
                             }
-                            contents_builder.set_text(&text);
-                        }
-                        kaijutsu_kernel::McpResourceContents::BlobResourceContents {
-                            mime_type, blob, ..
-                        } => {
-                            contents_builder.set_has_mime_type(mime_type.is_some());
-                            if let Some(mime) = &mime_type {
-                                contents_builder.set_mime_type(mime);
+                            kaijutsu_kernel::McpResourceContents::BlobResourceContents {
+                                mime_type,
+                                blob,
+                                ..
+                            } => {
+                                contents_builder.set_has_mime_type(mime_type.is_some());
+                                if let Some(mime) = &mime_type {
+                                    contents_builder.set_mime_type(mime);
+                                }
+                                // blob is base64-encoded string in rmcp, store as-is
+                                // (clients will need to decode)
+                                contents_builder.set_blob(blob.as_bytes());
                             }
-                            // blob is base64-encoded string in rmcp, store as-is
-                            // (clients will need to decode)
-                            contents_builder.set_blob(blob.as_bytes());
                         }
+                        Ok(())
                     }
-                    Ok(())
-                }
-                Err(e) => {
-                    results.get().set_has_contents(false);
-                    Err(capnp::Error::failed(format!(
-                        "failed to read resource: {}",
-                        e
-                    )))
+                    Err(e) => {
+                        results.get().set_has_contents(false);
+                        Err(capnp::Error::failed(format!(
+                            "failed to read resource: {}",
+                            e
+                        )))
+                    }
                 }
             }
-        }.instrument(span))
+            .instrument(span),
+        )
     }
 
     fn subscribe_mcp_resources(
@@ -2562,10 +3000,7 @@ impl kernel::Server for KernelImpl {
                         }
                         req.send().promise.await.is_ok()
                     }
-                    kaijutsu_kernel::ResourceFlow::ListChanged {
-                        ref server,
-                        ..
-                    } => {
+                    kaijutsu_kernel::ResourceFlow::ListChanged { ref server, .. } => {
                         // Notify-then-fetch pattern: we only send the notification.
                         // Resource list is not included; clients should call listMcpResources().
                         let mut req = callback.on_resource_list_changed_request();
@@ -2615,7 +3050,10 @@ impl kernel::Server for KernelImpl {
         // Use spawn_local because Cap'n Proto callbacks are not Send
         tokio::task::spawn_local(async move {
             let mut sub = elicitation_flows.subscribe("elicitation.*");
-            log::debug!("Started ElicitationFlow subscription for kernel {}", kernel_id);
+            log::debug!(
+                "Started ElicitationFlow subscription for kernel {}",
+                kernel_id
+            );
 
             while let Some(msg) = sub.recv().await {
                 match msg.payload {
@@ -2633,7 +3071,7 @@ impl kernel::Server for KernelImpl {
                             request_builder.set_server(server);
                             request_builder.set_message(message);
                             if let Some(s) = schema {
-                                request_builder.set_schema(&s.to_string());
+                                request_builder.set_schema(s.to_string());
                                 request_builder.set_has_schema(true);
                             } else {
                                 request_builder.set_has_schema(false);
@@ -2648,16 +3086,19 @@ impl kernel::Server for KernelImpl {
                                         // Parse response, defaulting to decline on any error
                                         if let Ok(response_reader) = reader.get_response() {
                                             // Parse the action string
-                                            let action_str = response_reader.get_action()
+                                            let action_str = response_reader
+                                                .get_action()
                                                 .ok()
                                                 .and_then(|r| r.to_str().ok())
                                                 .unwrap_or("decline");
-                                            let action = action_str.parse()
-                                                .unwrap_or(kaijutsu_kernel::ElicitationAction::Decline);
+                                            let action = action_str.parse().unwrap_or(
+                                                kaijutsu_kernel::ElicitationAction::Decline,
+                                            );
 
                                             // Parse the content if present
                                             let content = if response_reader.get_has_content() {
-                                                response_reader.get_content()
+                                                response_reader
+                                                    .get_content()
                                                     .ok()
                                                     .and_then(|s| s.to_str().ok())
                                                     .and_then(|s| serde_json::from_str(s).ok())
@@ -2687,7 +3128,8 @@ impl kernel::Server for KernelImpl {
                                 // Network/callback error, decline
                                 log::warn!(
                                     "Elicitation callback failed for kernel {}: {}",
-                                    kernel_id, e
+                                    kernel_id,
+                                    e
                                 );
                                 kaijutsu_kernel::ElicitationResponse {
                                     action: kaijutsu_kernel::ElicitationAction::Decline,
@@ -2720,16 +3162,32 @@ impl kernel::Server for KernelImpl {
         let config_reader = pry!(pry!(params.get()).get_config());
 
         // Extract config fields
-        let nick = pry!(config_reader.get_nick()).to_str().unwrap_or("unknown").to_owned();
-        let instance = pry!(config_reader.get_instance()).to_str().unwrap_or("default").to_owned();
-        let provider = pry!(config_reader.get_provider()).to_str().unwrap_or("unknown").to_owned();
-        let model_id = pry!(config_reader.get_model_id()).to_str().unwrap_or("unknown").to_owned();
+        let nick = pry!(config_reader.get_nick())
+            .to_str()
+            .unwrap_or("unknown")
+            .to_owned();
+        let instance = pry!(config_reader.get_instance())
+            .to_str()
+            .unwrap_or("default")
+            .to_owned();
+        let provider = pry!(config_reader.get_provider())
+            .to_str()
+            .unwrap_or("unknown")
+            .to_owned();
+        let model_id = pry!(config_reader.get_model_id())
+            .to_str()
+            .unwrap_or("unknown")
+            .to_owned();
 
         // Extract capabilities
         let caps_reader = pry!(config_reader.get_capabilities());
         let capabilities: Vec<AgentCapability> = (0..caps_reader.len())
             .filter_map(|i| {
-                caps_reader.get(i).map(|c| capnp_to_agent_capability(c)).ok().flatten()
+                caps_reader
+                    .get(i)
+                    .map(capnp_to_agent_capability)
+                    .ok()
+                    .flatten()
             })
             .collect();
 
@@ -2744,18 +3202,21 @@ impl kernel::Server for KernelImpl {
         let kernel_arc = self.kernel.kernel.clone();
 
         let span = tracing::info_span!("rpc", method = "attach_agent");
-        Promise::from_future(async move {
-            let agent_info = kernel_arc
-                .attach_agent(config)
-                .await
-                .map_err(|e| capnp::Error::failed(format!("failed to attach agent: {}", e)))?;
+        Promise::from_future(
+            async move {
+                let agent_info = kernel_arc
+                    .attach_agent(config)
+                    .await
+                    .map_err(|e| capnp::Error::failed(format!("failed to attach agent: {}", e)))?;
 
-            // Build response
-            let mut info = results.get().init_info();
-            set_agent_info(&mut info, &agent_info);
+                // Build response
+                let mut info = results.get().init_info();
+                set_agent_info(&mut info, &agent_info);
 
-            Ok(())
-        }.instrument(span))
+                Ok(())
+            }
+            .instrument(span),
+        )
     }
 
     fn list_agents(
@@ -2766,17 +3227,20 @@ impl kernel::Server for KernelImpl {
         let kernel_arc = self.kernel.kernel.clone();
 
         let span = tracing::info_span!("rpc", method = "list_agents");
-        Promise::from_future(async move {
-            let agents = kernel_arc.list_agents().await;
+        Promise::from_future(
+            async move {
+                let agents = kernel_arc.list_agents().await;
 
-            let mut list = results.get().init_agents(agents.len() as u32);
-            for (i, agent) in agents.iter().enumerate() {
-                let mut a = list.reborrow().get(i as u32);
-                set_agent_info(&mut a, agent);
+                let mut list = results.get().init_agents(agents.len() as u32);
+                for (i, agent) in agents.iter().enumerate() {
+                    let mut a = list.reborrow().get(i as u32);
+                    set_agent_info(&mut a, agent);
+                }
+
+                Ok(())
             }
-
-            Ok(())
-        }.instrument(span))
+            .instrument(span),
+        )
     }
 
     fn detach_agent(
@@ -2789,10 +3253,13 @@ impl kernel::Server for KernelImpl {
         let kernel_arc = self.kernel.kernel.clone();
 
         let span = tracing::info_span!("rpc", method = "detach_agent");
-        Promise::from_future(async move {
-            kernel_arc.detach_agent(&nick).await;
-            Ok(())
-        }.instrument(span))
+        Promise::from_future(
+            async move {
+                kernel_arc.detach_agent(&nick).await;
+                Ok(())
+            }
+            .instrument(span),
+        )
     }
 
     fn set_agent_capabilities(
@@ -2806,21 +3273,30 @@ impl kernel::Server for KernelImpl {
 
         let capabilities: Vec<AgentCapability> = (0..caps_reader.len())
             .filter_map(|i| {
-                caps_reader.get(i).map(|c| capnp_to_agent_capability(c)).ok().flatten()
+                caps_reader
+                    .get(i)
+                    .map(capnp_to_agent_capability)
+                    .ok()
+                    .flatten()
             })
             .collect();
 
         let kernel_arc = self.kernel.kernel.clone();
 
         let span = tracing::info_span!("rpc", method = "set_agent_capabilities");
-        Promise::from_future(async move {
-            kernel_arc
-                .set_agent_capabilities(&nick, capabilities)
-                .await
-                .map_err(|e| capnp::Error::failed(format!("failed to set capabilities: {}", e)))?;
+        Promise::from_future(
+            async move {
+                kernel_arc
+                    .set_agent_capabilities(&nick, capabilities)
+                    .await
+                    .map_err(|e| {
+                        capnp::Error::failed(format!("failed to set capabilities: {}", e))
+                    })?;
 
-            Ok(())
-        }.instrument(span))
+                Ok(())
+            }
+            .instrument(span),
+        )
     }
 
     fn invoke_agent(
@@ -2839,32 +3315,35 @@ impl kernel::Server for KernelImpl {
         let kernel_arc = self.kernel.kernel.clone();
 
         let span = tracing::info_span!("rpc", method = "invoke_agent");
-        Promise::from_future(async move {
-            // Generate a request ID for tracking
-            let request_id = uuid::Uuid::new_v4().to_string();
+        Promise::from_future(
+            async move {
+                // Generate a request ID for tracking
+                let request_id = uuid::Uuid::new_v4().to_string();
 
-            // Emit a started event
-            kernel_arc
-                .emit_agent_event(AgentActivityEvent::Started {
-                    agent: nick.clone(),
-                    block_id: block_id.to_string(),
-                    action: action.clone(),
-                })
-                .await;
+                // Emit a started event
+                kernel_arc
+                    .emit_agent_event(AgentActivityEvent::Started {
+                        agent: nick.clone(),
+                        block_id: block_id.to_string(),
+                        action: action.clone(),
+                    })
+                    .await;
 
-            // TODO: Actually invoke the agent's capability here
-            // For now, just emit a completed event
-            kernel_arc
-                .emit_agent_event(AgentActivityEvent::Completed {
-                    agent: nick.clone(),
-                    block_id: block_id.to_string(),
-                    success: true,
-                })
-                .await;
+                // TODO: Actually invoke the agent's capability here
+                // For now, just emit a completed event
+                kernel_arc
+                    .emit_agent_event(AgentActivityEvent::Completed {
+                        agent: nick.clone(),
+                        block_id: block_id.to_string(),
+                        success: true,
+                    })
+                    .await;
 
-            results.get().set_request_id(&request_id);
-            Ok(())
-        }.instrument(span))
+                results.get().set_request_id(&request_id);
+                Ok(())
+            }
+            .instrument(span),
+        )
     }
 
     fn subscribe_agent_events(
@@ -2886,7 +3365,11 @@ impl kernel::Server for KernelImpl {
 
             while let Ok(event) = receiver.recv().await {
                 let success = match &event {
-                    AgentActivityEvent::Started { agent, block_id: _, action } => {
+                    AgentActivityEvent::Started {
+                        agent,
+                        block_id: _,
+                        action,
+                    } => {
                         let mut req = callback.on_activity_request();
                         {
                             let mut params = req.get().init_event();
@@ -2898,7 +3381,12 @@ impl kernel::Server for KernelImpl {
                         }
                         req.send().promise.await.is_ok()
                     }
-                    AgentActivityEvent::Progress { agent, block_id: _, message, percent } => {
+                    AgentActivityEvent::Progress {
+                        agent,
+                        block_id: _,
+                        message,
+                        percent,
+                    } => {
                         let mut req = callback.on_activity_request();
                         {
                             let mut params = req.get().init_event();
@@ -2910,7 +3398,11 @@ impl kernel::Server for KernelImpl {
                         }
                         req.send().promise.await.is_ok()
                     }
-                    AgentActivityEvent::Completed { agent, block_id: _, success: ok } => {
+                    AgentActivityEvent::Completed {
+                        agent,
+                        block_id: _,
+                        success: ok,
+                    } => {
                         let mut req = callback.on_activity_request();
                         {
                             let mut params = req.get().init_event();
@@ -2921,7 +3413,11 @@ impl kernel::Server for KernelImpl {
                         }
                         req.send().promise.await.is_ok()
                     }
-                    AgentActivityEvent::CursorMoved { agent, block_id: _, offset } => {
+                    AgentActivityEvent::CursorMoved {
+                        agent,
+                        block_id: _,
+                        offset,
+                    } => {
                         let mut req = callback.on_activity_request();
                         {
                             let mut params = req.get().init_event();
@@ -2965,12 +3461,17 @@ impl kernel::Server for KernelImpl {
         let source_block_id = pry!(parse_block_id_from_reader(&source_block_id_reader));
         // Schema: cherryPickBlock(sourceBlockId, targetContextId :Data)
         let target_ctx_bytes = pry!(params_reader.get_target_context_id());
-        let target_ctx_id = pry!(ContextId::try_from_slice(target_ctx_bytes)
-            .ok_or_else(|| capnp::Error::failed("invalid target context ID (expected 16 bytes)".into())));
+        let target_ctx_id =
+            pry!(
+                ContextId::try_from_slice(target_ctx_bytes).ok_or_else(|| capnp::Error::failed(
+                    "invalid target context ID (expected 16 bytes)".into()
+                ))
+            );
 
         log::info!(
             "Cherry-pick request: block={} to context={}",
-            source_block_id.to_key(), target_ctx_id
+            source_block_id.to_key(),
+            target_ctx_id
         );
 
         let documents = self.kernel.documents.clone();
@@ -2989,44 +3490,54 @@ impl kernel::Server for KernelImpl {
         drop(doc_entry);
 
         let span = extract_rpc_trace(params_reader.get_trace(), "cherry_pick_block");
-        Promise::from_future(async move {
-            // Look up target context in drift router for trace linkage
-            let drift = kernel_arc.drift().read().await;
-            let target_handle = drift.get(target_ctx_id)
-                .ok_or_else(|| capnp::Error::failed(
-                    format!("target context {} not found", target_ctx_id)
-                ))?;
-            let trace_id = target_handle.trace_id;
-            drop(drift);
-            let _ctx_span = kaijutsu_telemetry::context_root_span(&trace_id, "cherry_pick_block").entered();
+        Promise::from_future(
+            async move {
+                // Look up target context in drift router for trace linkage
+                let drift = kernel_arc.drift().read().await;
+                let target_handle = drift.get(target_ctx_id).ok_or_else(|| {
+                    capnp::Error::failed(format!("target context {} not found", target_ctx_id))
+                })?;
+                let trace_id = target_handle.trace_id;
+                drop(drift);
+                let _ctx_span =
+                    kaijutsu_telemetry::context_root_span(&trace_id, "cherry_pick_block").entered();
 
-            // Target document must exist
-            if !documents.contains(target_ctx_id) {
-                return Err(capnp::Error::failed(
-                    format!("target context {} not found — join target context first", target_ctx_id)
-                ));
+                // Target document must exist
+                if !documents.contains(target_ctx_id) {
+                    return Err(capnp::Error::failed(format!(
+                        "target context {} not found — join target context first",
+                        target_ctx_id
+                    )));
+                }
+
+                // Insert the block into target document (authored by calling user)
+                let after_id = documents.last_block_id(target_ctx_id);
+                let new_block_id = documents
+                    .insert_block_as(
+                        target_ctx_id,
+                        None,
+                        after_id.as_ref(),
+                        block_snapshot.role,
+                        block_snapshot.kind,
+                        block_snapshot.content,
+                        Status::Done,
+                        Some(user_agent_id),
+                    )
+                    .map_err(|e| capnp::Error::failed(format!("Failed to insert block: {}", e)))?;
+
+                // Build result
+                let mut new_block_builder = results.get().init_new_block_id();
+                set_block_id_builder(&mut new_block_builder, &new_block_id);
+
+                log::info!(
+                    "Cherry-pick complete: {} -> {}",
+                    source_block_id.to_key(),
+                    new_block_id.to_key()
+                );
+                Ok(())
             }
-
-            // Insert the block into target document (authored by calling user)
-            let after_id = documents.last_block_id(target_ctx_id);
-            let new_block_id = documents.insert_block_as(
-                target_ctx_id,
-                None,
-                after_id.as_ref(),
-                block_snapshot.role,
-                block_snapshot.kind,
-                block_snapshot.content,
-                Status::Done,
-                Some(user_agent_id),
-            ).map_err(|e| capnp::Error::failed(format!("Failed to insert block: {}", e)))?;
-
-            // Build result
-            let mut new_block_builder = results.get().init_new_block_id();
-            set_block_id_builder(&mut new_block_builder, &new_block_id);
-
-            log::info!("Cherry-pick complete: {} -> {}", source_block_id.to_key(), new_block_id.to_key());
-            Ok(())
-        }.instrument(span))
+            .instrument(span),
+        )
     }
 
     fn get_context_history(
@@ -3037,8 +3548,10 @@ impl kernel::Server for KernelImpl {
         let params_reader = pry!(params.get());
         let _span = extract_rpc_trace(params_reader.get_trace(), "get_context_history").entered();
         let context_id_bytes = pry!(params_reader.get_context_id());
-        let context_id = pry!(ContextId::try_from_slice(context_id_bytes)
-            .ok_or_else(|| capnp::Error::failed("invalid context ID".into())));
+        let context_id = pry!(
+            ContextId::try_from_slice(context_id_bytes)
+                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
+        );
         let limit = params_reader.get_limit() as usize;
 
         let _ctx_span = if let Ok(drift) = self.kernel.kernel.drift().try_read() {
@@ -3077,7 +3590,8 @@ impl kernel::Server for KernelImpl {
 
         log::debug!(
             "Document history: {} snapshots (current version: {})",
-            snapshot_count, current_version
+            snapshot_count,
+            current_version
         );
         Promise::ok(())
     }
@@ -3111,20 +3625,23 @@ impl kernel::Server for KernelImpl {
         let config_backend = self.kernel.config_backend.clone();
 
         let span = tracing::info_span!("rpc", method = "reload_config");
-        Promise::from_future(async move {
-            match config_backend.reload_from_disk(&path).await {
-                Ok(()) => {
-                    results.get().set_success(true);
-                    results.get().set_error("");
+        Promise::from_future(
+            async move {
+                match config_backend.reload_from_disk(&path).await {
+                    Ok(()) => {
+                        results.get().set_success(true);
+                        results.get().set_error("");
+                    }
+                    Err(e) => {
+                        results.get().set_success(false);
+                        results.get().set_error(format!("{}", e));
+                    }
                 }
-                Err(e) => {
-                    results.get().set_success(false);
-                    results.get().set_error(&format!("{}", e));
-                }
-            }
 
-            Ok(())
-        }.instrument(span))
+                Ok(())
+            }
+            .instrument(span),
+        )
     }
 
     fn reset_config(
@@ -3136,20 +3653,23 @@ impl kernel::Server for KernelImpl {
         let config_backend = self.kernel.config_backend.clone();
 
         let span = tracing::info_span!("rpc", method = "reset_config");
-        Promise::from_future(async move {
-            match config_backend.reset_to_default(&path).await {
-                Ok(()) => {
-                    results.get().set_success(true);
-                    results.get().set_error("");
+        Promise::from_future(
+            async move {
+                match config_backend.reset_to_default(&path).await {
+                    Ok(()) => {
+                        results.get().set_success(true);
+                        results.get().set_error("");
+                    }
+                    Err(e) => {
+                        results.get().set_success(false);
+                        results.get().set_error(format!("{}", e));
+                    }
                 }
-                Err(e) => {
-                    results.get().set_success(false);
-                    results.get().set_error(&format!("{}", e));
-                }
-            }
 
-            Ok(())
-        }.instrument(span))
+                Ok(())
+            }
+            .instrument(span),
+        )
     }
 
     fn get_config(
@@ -3167,13 +3687,12 @@ impl kernel::Server for KernelImpl {
             }
             Err(e) => {
                 results.get().set_content("");
-                results.get().set_error(&format!("{}", e));
+                results.get().set_error(format!("{}", e));
             }
         }
 
         Promise::ok(())
     }
-
 
     // ========================================================================
     // Drift: Cross-Context Communication
@@ -3188,15 +3707,19 @@ impl kernel::Server for KernelImpl {
         let kernel_arc = self.kernel.kernel.clone();
 
         let span = extract_rpc_trace(pry!(params.get()).get_trace(), "get_context_id");
-        Promise::from_future(async move {
-            results.get().set_id(ctx_id.as_bytes());
-            let drift = kernel_arc.drift().read().await;
-            let label = drift.get(ctx_id)
-                .and_then(|h| h.label.as_deref())
-                .unwrap_or("");
-            results.get().set_label(label);
-            Ok(())
-        }.instrument(span))
+        Promise::from_future(
+            async move {
+                results.get().set_id(ctx_id.as_bytes());
+                let drift = kernel_arc.drift().read().await;
+                let label = drift
+                    .get(ctx_id)
+                    .and_then(|h| h.label.as_deref())
+                    .unwrap_or("");
+                results.get().set_label(label);
+                Ok(())
+            }
+            .instrument(span),
+        )
     }
 
     fn configure_llm(
@@ -3212,50 +3735,72 @@ impl kernel::Server for KernelImpl {
         // Use explicit contextId if provided (16 bytes), otherwise connection's current
         let ctx_id_bytes = pry!(params_reader.get_context_id());
         let ctx_id = if ctx_id_bytes.len() == 16 {
-            pry!(ContextId::try_from_slice(ctx_id_bytes)
-                .ok_or_else(|| capnp::Error::failed("invalid context ID".into())))
+            pry!(
+                ContextId::try_from_slice(ctx_id_bytes)
+                    .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
+            )
         } else {
             pry!(self.connection.borrow().require_context())
         };
 
         let shared_kernel = self.kernel.clone();
         let span = extract_rpc_trace(params_reader.get_trace(), "configure_llm");
-        Promise::from_future(async move {
-            // Validate provider before persisting — never write bad data
-            let config = kaijutsu_kernel::llm::ProviderConfig::new(&provider_name)
-                .with_default_model(&model);
-            match kaijutsu_kernel::llm::RigProvider::from_config(&config) {
-                Ok(new_provider) => {
-                    // Provider is valid — now persist
-                    {
-                        let db = shared_kernel.kernel_db.lock();
-                        if let Err(e) = db.update_model(ctx_id, Some(&provider_name), Some(&model)) {
-                            log::warn!("KernelDb update_model failed for {}: {}", ctx_id.short(), e);
+        Promise::from_future(
+            async move {
+                // Validate provider before persisting — never write bad data
+                let config = kaijutsu_kernel::llm::ProviderConfig::new(&provider_name)
+                    .with_default_model(&model);
+                match kaijutsu_kernel::llm::RigProvider::from_config(&config) {
+                    Ok(new_provider) => {
+                        // Provider is valid — now persist
+                        {
+                            let db = shared_kernel.kernel_db.lock();
+                            if let Err(e) =
+                                db.update_model(ctx_id, Some(&provider_name), Some(&model))
+                            {
+                                log::warn!(
+                                    "KernelDb update_model failed for {}: {}",
+                                    ctx_id.short(),
+                                    e
+                                );
+                            }
                         }
+                        {
+                            let mut drift = kernel_arc.drift().write().await;
+                            let _ = drift.configure_llm(ctx_id, &provider_name, &model);
+                        }
+                        // Ensure provider is registered in LLM registry (for API client),
+                        // but do NOT change kernel-wide defaults — model is per-context
+                        let mut registry = kernel_arc.llm().write().await;
+                        if registry.get(&provider_name).is_none() {
+                            registry.register(&provider_name, Arc::new(new_provider));
+                        }
+                        results.get().set_success(true);
+                        results.get().set_error("");
+                        log::info!(
+                            "Context {} model set: provider={}, model={}",
+                            ctx_id.short(),
+                            provider_name,
+                            model
+                        );
                     }
-                    {
-                        let mut drift = kernel_arc.drift().write().await;
-                        let _ = drift.configure_llm(ctx_id, &provider_name, &model);
+                    Err(e) => {
+                        results.get().set_success(false);
+                        results.get().set_error(format!("{}", e));
+                        log::warn!(
+                            "Failed to configure LLM for context {}: provider={}, model={}, err={}",
+                            ctx_id.short(),
+                            provider_name,
+                            model,
+                            e
+                        );
                     }
-                    // Ensure provider is registered in LLM registry (for API client),
-                    // but do NOT change kernel-wide defaults — model is per-context
-                    let mut registry = kernel_arc.llm().write().await;
-                    if registry.get(&provider_name).is_none() {
-                        registry.register(&provider_name, Arc::new(new_provider));
-                    }
-                    results.get().set_success(true);
-                    results.get().set_error("");
-                    log::info!("Context {} model set: provider={}, model={}", ctx_id.short(), provider_name, model);
                 }
-                Err(e) => {
-                    results.get().set_success(false);
-                    results.get().set_error(&format!("{}", e));
-                    log::warn!("Failed to configure LLM for context {}: provider={}, model={}, err={}", ctx_id.short(), provider_name, model, e);
-                }
-            }
 
-            Ok(())
-        }.instrument(span))
+                Ok(())
+            }
+            .instrument(span),
+        )
     }
 
     // REMOVED pre-1.0: use shell_execute("kj drift push ...") instead
@@ -3288,24 +3833,27 @@ impl kernel::Server for KernelImpl {
         let kernel_arc = self.kernel.kernel.clone();
 
         let span = tracing::info_span!("rpc", method = "drift_queue");
-        Promise::from_future(async move {
-            let drift = kernel_arc.drift().read().await;
-            let queue = drift.queue();
+        Promise::from_future(
+            async move {
+                let drift = kernel_arc.drift().read().await;
+                let queue = drift.queue();
 
-            let mut list = results.get().init_staged(queue.len() as u32);
-            for (i, drift_item) in queue.iter().enumerate() {
-                let mut entry = list.reborrow().get(i as u32);
-                entry.set_id(drift_item.id);
-                entry.set_source_ctx(drift_item.source_ctx.as_bytes());
-                entry.set_target_ctx(drift_item.target_ctx.as_bytes());
-                entry.set_content(&drift_item.content);
-                entry.set_source_model(drift_item.source_model.as_deref().unwrap_or(""));
-                entry.set_drift_kind(drift_kind_to_capnp(drift_item.drift_kind));
-                entry.set_created_at(drift_item.created_at);
+                let mut list = results.get().init_staged(queue.len() as u32);
+                for (i, drift_item) in queue.iter().enumerate() {
+                    let mut entry = list.reborrow().get(i as u32);
+                    entry.set_id(drift_item.id);
+                    entry.set_source_ctx(drift_item.source_ctx.as_bytes());
+                    entry.set_target_ctx(drift_item.target_ctx.as_bytes());
+                    entry.set_content(&drift_item.content);
+                    entry.set_source_model(drift_item.source_model.as_deref().unwrap_or(""));
+                    entry.set_drift_kind(drift_kind_to_capnp(drift_item.drift_kind));
+                    entry.set_created_at(drift_item.created_at);
+                }
+
+                Ok(())
             }
-
-            Ok(())
-        }.instrument(span))
+            .instrument(span),
+        )
     }
 
     fn drift_cancel(
@@ -3317,12 +3865,15 @@ impl kernel::Server for KernelImpl {
         let kernel_arc = self.kernel.kernel.clone();
 
         let span = tracing::info_span!("rpc", method = "drift_cancel");
-        Promise::from_future(async move {
-            let mut drift = kernel_arc.drift().write().await;
-            let success = drift.cancel(staged_id);
-            results.get().set_success(success);
-            Ok(())
-        }.instrument(span))
+        Promise::from_future(
+            async move {
+                let mut drift = kernel_arc.drift().write().await;
+                let success = drift.cancel(staged_id);
+                results.get().set_success(success);
+                Ok(())
+            }
+            .instrument(span),
+        )
     }
 
     // REMOVED pre-1.0: use shell_execute("kj drift pull ...") instead
@@ -3361,40 +3912,41 @@ impl kernel::Server for KernelImpl {
         let kernel_arc = self.kernel.kernel.clone();
 
         let span = extract_rpc_trace(pry!(params.get()).get_trace(), "get_llm_config");
-        Promise::from_future(async move {
-            let registry = kernel_arc.llm().read().await;
+        Promise::from_future(
+            async move {
+                let registry = kernel_arc.llm().read().await;
 
-            let mut config = results.get().init_config();
-            config.set_default_provider(
-                registry.default_provider_name().unwrap_or("")
-            );
-            config.set_default_model(
-                registry.default_model().unwrap_or("")
-            );
+                let mut config = results.get().init_config();
+                config.set_default_provider(registry.default_provider_name().unwrap_or(""));
+                config.set_default_model(registry.default_model().unwrap_or(""));
 
-            // Only include available providers (skip disabled/unconfigured)
-            let provider_names: Vec<&str> = registry.list().into_iter()
-                .filter(|name| registry.get(name).is_some())
-                .collect();
-            let mut providers = config.init_providers(provider_names.len() as u32);
-            for (i, name) in provider_names.iter().enumerate() {
-                let mut entry = providers.reborrow().get(i as u32);
-                entry.set_name(name);
-                entry.set_available(true);
-                if let Some(p) = registry.get(name) {
-                    let avail = p.available_models();
-                    entry.set_default_model(avail.first().copied().unwrap_or(""));
+                // Only include available providers (skip disabled/unconfigured)
+                let provider_names: Vec<&str> = registry
+                    .list()
+                    .into_iter()
+                    .filter(|name| registry.get(name).is_some())
+                    .collect();
+                let mut providers = config.init_providers(provider_names.len() as u32);
+                for (i, name) in provider_names.iter().enumerate() {
+                    let mut entry = providers.reborrow().get(i as u32);
+                    entry.set_name(name);
+                    entry.set_available(true);
+                    if let Some(p) = registry.get(name) {
+                        let avail = p.available_models();
+                        entry.set_default_model(avail.first().copied().unwrap_or(""));
+                    }
+                    // Populate full models list from aliases + default
+                    let model_ids = registry.models_for_provider(name);
+                    let mut models_list = entry.init_models(model_ids.len() as u32);
+                    for (j, model_id) in model_ids.iter().enumerate() {
+                        models_list.set(j as u32, model_id);
+                    }
                 }
-                // Populate full models list from aliases + default
-                let model_ids = registry.models_for_provider(name);
-                let mut models_list = entry.init_models(model_ids.len() as u32);
-                for (j, model_id) in model_ids.iter().enumerate() {
-                    models_list.set(j as u32, model_id);
-                }
+
+                Ok(())
             }
-
-            Ok(())
-        }.instrument(span))
+            .instrument(span),
+        )
     }
 
     fn set_default_provider(
@@ -3406,18 +3958,23 @@ impl kernel::Server for KernelImpl {
         let kernel_arc = self.kernel.kernel.clone();
 
         let span = tracing::info_span!("rpc", method = "set_default_provider");
-        Promise::from_future(async move {
-            let mut registry = kernel_arc.llm().write().await;
-            if registry.set_default(&provider_name) {
-                results.get().set_success(true);
-                results.get().set_error("");
-                log::info!("Default LLM provider set to: {}", provider_name);
-            } else {
-                results.get().set_success(false);
-                results.get().set_error(&format!("provider '{}' not found", provider_name));
+        Promise::from_future(
+            async move {
+                let mut registry = kernel_arc.llm().write().await;
+                if registry.set_default(&provider_name) {
+                    results.get().set_success(true);
+                    results.get().set_error("");
+                    log::info!("Default LLM provider set to: {}", provider_name);
+                } else {
+                    results.get().set_success(false);
+                    results
+                        .get()
+                        .set_error(format!("provider '{}' not found", provider_name));
+                }
+                Ok(())
             }
-            Ok(())
-        }.instrument(span))
+            .instrument(span),
+        )
     }
 
     fn set_default_model(
@@ -3431,20 +3988,29 @@ impl kernel::Server for KernelImpl {
         let kernel_arc = self.kernel.kernel.clone();
 
         let span = tracing::info_span!("rpc", method = "set_default_model");
-        Promise::from_future(async move {
-            let mut registry = kernel_arc.llm().write().await;
-            // Verify the provider exists
-            if registry.get(&provider_name).is_none() {
-                results.get().set_success(false);
-                results.get().set_error(&format!("provider '{}' not found", provider_name));
-                return Ok(());
+        Promise::from_future(
+            async move {
+                let mut registry = kernel_arc.llm().write().await;
+                // Verify the provider exists
+                if registry.get(&provider_name).is_none() {
+                    results.get().set_success(false);
+                    results
+                        .get()
+                        .set_error(format!("provider '{}' not found", provider_name));
+                    return Ok(());
+                }
+                registry.set_default_model(&model);
+                results.get().set_success(true);
+                results.get().set_error("");
+                log::info!(
+                    "Default model set to: {} (provider: {})",
+                    model,
+                    provider_name
+                );
+                Ok(())
             }
-            registry.set_default_model(&model);
-            results.get().set_success(true);
-            results.get().set_error("");
-            log::info!("Default model set to: {} (provider: {})", model, provider_name);
-            Ok(())
-        }.instrument(span))
+            .instrument(span),
+        )
     }
 
     // ========================================================================
@@ -3459,32 +4025,35 @@ impl kernel::Server for KernelImpl {
         let kernel_arc = self.kernel.kernel.clone();
 
         let span = tracing::info_span!("rpc", method = "get_tool_filter");
-        Promise::from_future(async move {
-            let tool_config = kernel_arc.tool_config().await;
-            let mut filter = results.get().init_filter();
+        Promise::from_future(
+            async move {
+                let tool_config = kernel_arc.tool_config().await;
+                let mut filter = results.get().init_filter();
 
-            match &tool_config.filter {
-                ToolFilter::All => {
-                    filter.set_all(());
-                }
-                ToolFilter::AllowList(tools) => {
-                    let tools_vec: Vec<&str> = tools.iter().map(|s| s.as_str()).collect();
-                    let mut list = filter.init_allow_list(tools_vec.len() as u32);
-                    for (i, tool) in tools_vec.iter().enumerate() {
-                        list.set(i as u32, tool);
+                match &tool_config.filter {
+                    ToolFilter::All => {
+                        filter.set_all(());
+                    }
+                    ToolFilter::AllowList(tools) => {
+                        let tools_vec: Vec<&str> = tools.iter().map(|s| s.as_str()).collect();
+                        let mut list = filter.init_allow_list(tools_vec.len() as u32);
+                        for (i, tool) in tools_vec.iter().enumerate() {
+                            list.set(i as u32, tool);
+                        }
+                    }
+                    ToolFilter::DenyList(tools) => {
+                        let tools_vec: Vec<&str> = tools.iter().map(|s| s.as_str()).collect();
+                        let mut list = filter.init_deny_list(tools_vec.len() as u32);
+                        for (i, tool) in tools_vec.iter().enumerate() {
+                            list.set(i as u32, tool);
+                        }
                     }
                 }
-                ToolFilter::DenyList(tools) => {
-                    let tools_vec: Vec<&str> = tools.iter().map(|s| s.as_str()).collect();
-                    let mut list = filter.init_deny_list(tools_vec.len() as u32);
-                    for (i, tool) in tools_vec.iter().enumerate() {
-                        list.set(i as u32, tool);
-                    }
-                }
+
+                Ok(())
             }
-
-            Ok(())
-        }.instrument(span))
+            .instrument(span),
+        )
     }
 
     fn set_tool_filter(
@@ -3518,13 +4087,16 @@ impl kernel::Server for KernelImpl {
         let kernel_arc = self.kernel.kernel.clone();
 
         let span = tracing::info_span!("rpc", method = "set_tool_filter");
-        Promise::from_future(async move {
-            kernel_arc.set_tool_filter(filter).await;
-            results.get().set_success(true);
-            results.get().set_error("");
-            log::info!("Tool filter updated for kernel");
-            Ok(())
-        }.instrument(span))
+        Promise::from_future(
+            async move {
+                kernel_arc.set_tool_filter(filter).await;
+                results.get().set_success(true);
+                results.get().set_error("");
+                log::info!("Tool filter updated for kernel");
+                Ok(())
+            }
+            .instrument(span),
+        )
     }
 
     // ========================================================================
@@ -3538,8 +4110,10 @@ impl kernel::Server for KernelImpl {
     ) -> Promise<(), capnp::Error> {
         let params_reader = pry!(params.get());
         let context_id_bytes = pry!(params_reader.get_context_id());
-        let context_id = pry!(ContextId::try_from_slice(context_id_bytes)
-            .ok_or_else(|| capnp::Error::failed("invalid context ID".into())));
+        let context_id = pry!(
+            ContextId::try_from_slice(context_id_bytes)
+                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
+        );
 
         let filter_reader = pry!(params_reader.get_filter());
         let filter = pry!(parse_tool_filter_from_capnp(filter_reader));
@@ -3548,29 +4122,36 @@ impl kernel::Server for KernelImpl {
         let shared_kernel = self.kernel.clone();
 
         let span = extract_rpc_trace(params_reader.get_trace(), "set_context_tool_filter");
-        Promise::from_future(async move {
-            // Write-through: KernelDb first
-            {
-                let db = shared_kernel.kernel_db.lock();
-                if let Err(e) = db.update_tool_filter(context_id, &Some(filter.clone())) {
-                    log::warn!("KernelDb update_tool_filter failed for {}: {}", context_id.short(), e);
+        Promise::from_future(
+            async move {
+                // Write-through: KernelDb first
+                {
+                    let db = shared_kernel.kernel_db.lock();
+                    if let Err(e) = db.update_tool_filter(context_id, &Some(filter.clone())) {
+                        log::warn!(
+                            "KernelDb update_tool_filter failed for {}: {}",
+                            context_id.short(),
+                            e
+                        );
+                    }
                 }
-            }
 
-            let mut drift = kernel_arc.drift().write().await;
-            match drift.configure_tools(context_id, Some(filter)) {
-                Ok(()) => {
-                    results.get().set_success(true);
-                    results.get().set_error("");
-                    log::info!("Context tool filter updated: {}", context_id);
+                let mut drift = kernel_arc.drift().write().await;
+                match drift.configure_tools(context_id, Some(filter)) {
+                    Ok(()) => {
+                        results.get().set_success(true);
+                        results.get().set_error("");
+                        log::info!("Context tool filter updated: {}", context_id);
+                    }
+                    Err(e) => {
+                        results.get().set_success(false);
+                        results.get().set_error(e.to_string());
+                    }
                 }
-                Err(e) => {
-                    results.get().set_success(false);
-                    results.get().set_error(&e.to_string());
-                }
+                Ok(())
             }
-            Ok(())
-        }.instrument(span))
+            .instrument(span),
+        )
     }
 
     fn get_context_tool_filter(
@@ -3580,29 +4161,34 @@ impl kernel::Server for KernelImpl {
     ) -> Promise<(), capnp::Error> {
         let params_reader = pry!(params.get());
         let context_id_bytes = pry!(params_reader.get_context_id());
-        let context_id = pry!(ContextId::try_from_slice(context_id_bytes)
-            .ok_or_else(|| capnp::Error::failed("invalid context ID".into())));
+        let context_id = pry!(
+            ContextId::try_from_slice(context_id_bytes)
+                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
+        );
 
         let kernel_arc = self.kernel.kernel.clone();
 
         let span = extract_rpc_trace(params_reader.get_trace(), "get_context_tool_filter");
-        Promise::from_future(async move {
-            let drift = kernel_arc.drift().read().await;
-            let handle = drift.get(context_id);
+        Promise::from_future(
+            async move {
+                let drift = kernel_arc.drift().read().await;
+                let handle = drift.get(context_id);
 
-            let mut res = results.get();
-            match handle.and_then(|h| h.tool_filter.as_ref()) {
-                Some(filter) => {
-                    res.set_has_filter(true);
-                    serialize_tool_filter_to_capnp(filter, res.init_filter());
+                let mut res = results.get();
+                match handle.and_then(|h| h.tool_filter.as_ref()) {
+                    Some(filter) => {
+                        res.set_has_filter(true);
+                        serialize_tool_filter_to_capnp(filter, res.init_filter());
+                    }
+                    None => {
+                        res.set_has_filter(false);
+                        res.init_filter().set_all(());
+                    }
                 }
-                None => {
-                    res.set_has_filter(false);
-                    res.init_filter().set_all(());
-                }
+                Ok(())
             }
-            Ok(())
-        }.instrument(span))
+            .instrument(span),
+        )
     }
 
     // forkFiltered removed — consolidated to kj fork
@@ -3619,7 +4205,9 @@ impl kernel::Server for KernelImpl {
         let name = match params.get().and_then(|p| p.get_name()) {
             Ok(n) => match n.to_str() {
                 Ok(s) => s.to_owned(),
-                Err(e) => return Promise::err(capnp::Error::failed(format!("invalid name: {}", e))),
+                Err(e) => {
+                    return Promise::err(capnp::Error::failed(format!("invalid name: {}", e)));
+                }
             },
             Err(e) => return Promise::err(capnp::Error::failed(format!("missing name: {}", e))),
         };
@@ -3627,23 +4215,27 @@ impl kernel::Server for KernelImpl {
         let connection = self.connection.clone();
 
         let span = tracing::info_span!("rpc", method = "get_shell_var");
-        Promise::from_future(async move {
-            let kaish = {
-                let conn = connection.borrow();
-                conn.kaish.clone()
-                    .ok_or_else(|| capnp::Error::failed("kaish not initialized".into()))?
-            };
+        Promise::from_future(
+            async move {
+                let kaish = {
+                    let conn = connection.borrow();
+                    conn.kaish
+                        .clone()
+                        .ok_or_else(|| capnp::Error::failed("kaish not initialized".into()))?
+                };
 
-            let value = kaish.get_var(&name).await;
-            let mut builder = results.get();
-            if let Some(val) = value {
-                builder.set_found(true);
-                value_to_shell_value(builder.init_value(), &val);
-            } else {
-                builder.set_found(false);
+                let value = kaish.get_var(&name).await;
+                let mut builder = results.get();
+                if let Some(val) = value {
+                    builder.set_found(true);
+                    value_to_shell_value(builder.init_value(), &val);
+                } else {
+                    builder.set_found(false);
+                }
+                Ok(())
             }
-            Ok(())
-        }.instrument(span))
+            .instrument(span),
+        )
     }
 
     fn set_shell_var(
@@ -3657,28 +4249,31 @@ impl kernel::Server for KernelImpl {
         let value = match shell_value_to_value(value_reader) {
             Ok(v) => v,
             Err(e) => {
-                return Promise::ok({
-                    results.get().set_success(false);
-                    results.get().set_error(&format!("invalid value: {}", e));
-                });
+                results.get().set_success(false);
+                results.get().set_error(format!("invalid value: {}", e));
+                return Promise::ok(());
             }
         };
 
         let connection = self.connection.clone();
 
         let span = tracing::info_span!("rpc", method = "set_shell_var");
-        Promise::from_future(async move {
-            let kaish = {
-                let conn = connection.borrow();
-                conn.kaish.clone()
-                    .ok_or_else(|| capnp::Error::failed("kaish not initialized".into()))?
-            };
+        Promise::from_future(
+            async move {
+                let kaish = {
+                    let conn = connection.borrow();
+                    conn.kaish
+                        .clone()
+                        .ok_or_else(|| capnp::Error::failed("kaish not initialized".into()))?
+                };
 
-            kaish.set_var(&name, value).await;
-            results.get().set_success(true);
-            results.get().set_error("");
-            Ok(())
-        }.instrument(span))
+                kaish.set_var(&name, value).await;
+                results.get().set_success(true);
+                results.get().set_error("");
+                Ok(())
+            }
+            .instrument(span),
+        )
     }
 
     fn list_shell_vars(
@@ -3689,28 +4284,32 @@ impl kernel::Server for KernelImpl {
         let connection = self.connection.clone();
 
         let span = tracing::info_span!("rpc", method = "list_shell_vars");
-        Promise::from_future(async move {
-            let kaish = {
-                let conn = connection.borrow();
-                conn.kaish.clone()
-                    .ok_or_else(|| capnp::Error::failed("kaish not initialized".into()))?
-            };
+        Promise::from_future(
+            async move {
+                let kaish = {
+                    let conn = connection.borrow();
+                    conn.kaish
+                        .clone()
+                        .ok_or_else(|| capnp::Error::failed("kaish not initialized".into()))?
+                };
 
-            let var_names = kaish.list_vars().await;
-            let mut list_builder = results.get().init_vars(var_names.len() as u32);
+                let var_names = kaish.list_vars().await;
+                let mut list_builder = results.get().init_vars(var_names.len() as u32);
 
-            for (i, name) in var_names.iter().enumerate() {
-                let mut entry = list_builder.reborrow().get(i as u32);
-                entry.set_name(name);
+                for (i, name) in var_names.iter().enumerate() {
+                    let mut entry = list_builder.reborrow().get(i as u32);
+                    entry.set_name(name);
 
-                // Fetch each variable's value for the full listing
-                if let Some(val) = kaish.get_var(name).await {
-                    value_to_shell_value(entry.init_value(), &val);
+                    // Fetch each variable's value for the full listing
+                    if let Some(val) = kaish.get_var(name).await {
+                        value_to_shell_value(entry.init_value(), &val);
+                    }
                 }
-            }
 
-            Ok(())
-        }.instrument(span))
+                Ok(())
+            }
+            .instrument(span),
+        )
     }
 
     fn compact_context(
@@ -3721,8 +4320,10 @@ impl kernel::Server for KernelImpl {
         let p = pry!(params.get());
         let _span = extract_rpc_trace(p.get_trace(), "compact_context").entered();
         let context_id_bytes = pry!(p.get_context_id());
-        let context_id = pry!(ContextId::try_from_slice(context_id_bytes)
-            .ok_or_else(|| capnp::Error::failed("invalid context ID".into())));
+        let context_id = pry!(
+            ContextId::try_from_slice(context_id_bytes)
+                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
+        );
 
         let _ctx_span = if let Ok(drift) = self.kernel.kernel.drift().try_read() {
             let trace_id = drift.trace_id_for_context(context_id).unwrap_or([0u8; 16]);
@@ -3754,13 +4355,21 @@ impl kernel::Server for KernelImpl {
         let p = pry!(params.get());
         let _trace_guard = extract_rpc_trace(p.get_trace(), "edit_input").entered();
         let context_id_bytes = pry!(p.get_context_id());
-        let context_id = pry!(ContextId::try_from_slice(context_id_bytes)
-            .ok_or_else(|| capnp::Error::failed("invalid context ID".into())));
+        let context_id = pry!(
+            ContextId::try_from_slice(context_id_bytes)
+                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
+        );
         let pos = p.get_pos() as usize;
         let insert = pry!(pry!(p.get_insert()).to_str()).to_owned();
         let delete = p.get_delete() as usize;
 
-        log::debug!("edit_input: context={}, pos={}, insert_len={}, delete={}", context_id, pos, insert.len(), delete);
+        log::debug!(
+            "edit_input: context={}, pos={}, insert_len={}, delete={}",
+            context_id,
+            pos,
+            insert.len(),
+            delete
+        );
 
         let documents = &self.kernel.documents;
 
@@ -3772,9 +4381,7 @@ impl kernel::Server for KernelImpl {
                 results.get().set_ack_version(0);
                 Promise::ok(())
             }
-            Err(e) => {
-                Promise::err(capnp::Error::failed(format!("edit_input failed: {}", e)))
-            }
+            Err(e) => Promise::err(capnp::Error::failed(format!("edit_input failed: {}", e))),
         }
     }
 
@@ -3786,8 +4393,10 @@ impl kernel::Server for KernelImpl {
         let p = pry!(params.get());
         let _trace_guard = extract_rpc_trace(p.get_trace(), "get_input_state").entered();
         let context_id_bytes = pry!(p.get_context_id());
-        let context_id = pry!(ContextId::try_from_slice(context_id_bytes)
-            .ok_or_else(|| capnp::Error::failed("invalid context ID".into())));
+        let context_id = pry!(
+            ContextId::try_from_slice(context_id_bytes)
+                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
+        );
 
         log::debug!("get_input_state: context={}", context_id);
 
@@ -3801,9 +4410,10 @@ impl kernel::Server for KernelImpl {
                 r.set_version(version);
                 Promise::ok(())
             }
-            Err(e) => {
-                Promise::err(capnp::Error::failed(format!("get_input_state failed: {}", e)))
-            }
+            Err(e) => Promise::err(capnp::Error::failed(format!(
+                "get_input_state failed: {}",
+                e
+            ))),
         }
     }
 
@@ -3815,11 +4425,17 @@ impl kernel::Server for KernelImpl {
         let p = pry!(params.get());
         let _trace_guard = extract_rpc_trace(p.get_trace(), "push_input_ops").entered();
         let context_id_bytes = pry!(p.get_context_id());
-        let context_id = pry!(ContextId::try_from_slice(context_id_bytes)
-            .ok_or_else(|| capnp::Error::failed("invalid context ID".into())));
+        let context_id = pry!(
+            ContextId::try_from_slice(context_id_bytes)
+                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
+        );
         let ops_data = pry!(p.get_ops()).to_vec();
 
-        log::debug!("push_input_ops: context={}, ops_len={}", context_id, ops_data.len());
+        log::debug!(
+            "push_input_ops: context={}, ops_len={}",
+            context_id,
+            ops_data.len()
+        );
 
         let documents = &self.kernel.documents;
 
@@ -3828,9 +4444,10 @@ impl kernel::Server for KernelImpl {
                 results.get().set_ack_version(version);
                 Promise::ok(())
             }
-            Err(e) => {
-                Promise::err(capnp::Error::failed(format!("push_input_ops failed: {}", e)))
-            }
+            Err(e) => Promise::err(capnp::Error::failed(format!(
+                "push_input_ops failed: {}",
+                e
+            ))),
         }
     }
 
@@ -3842,8 +4459,10 @@ impl kernel::Server for KernelImpl {
         let p = pry!(params.get());
         let trace_span = extract_rpc_trace(p.get_trace(), "submit_input");
         let context_id_bytes = pry!(p.get_context_id());
-        let context_id = pry!(ContextId::try_from_slice(context_id_bytes)
-            .ok_or_else(|| capnp::Error::failed("invalid context ID".into())));
+        let context_id = pry!(
+            ContextId::try_from_slice(context_id_bytes)
+                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
+        );
         let is_shell = pry!(p.get_mode()) == InputMode::Shell;
 
         log::info!("submit_input: context={} shell={}", context_id, is_shell);
@@ -3852,71 +4471,102 @@ impl kernel::Server for KernelImpl {
         let connection = self.connection.clone();
         let user_agent_id = self.connection.borrow().principal.id;
 
-        Promise::from_future(async move {
-            let documents = kernel.documents.clone();
+        Promise::from_future(
+            async move {
+                let documents = kernel.documents.clone();
 
-            // Read text first, validate, THEN clear — avoids clearing compose
-            // on whitespace-only input (InputCleared would fire with no block created).
-            let text = documents.get_input_text(context_id)
-                .map_err(|e| capnp::Error::failed(format!("get_input_text: {}", e)))?;
-            let text = text.trim().to_string();
-            if text.is_empty() {
-                return Err(capnp::Error::failed("input is empty".into()));
-            }
-            // Input has content — now clear it
-            documents.clear_input(context_id)
-                .map_err(|e| capnp::Error::failed(format!("clear_input failed: {}", e)))?;
+                // Read text first, validate, THEN clear — avoids clearing compose
+                // on whitespace-only input (InputCleared would fire with no block created).
+                let text = documents
+                    .get_input_text(context_id)
+                    .map_err(|e| capnp::Error::failed(format!("get_input_text: {}", e)))?;
+                let text = text.trim().to_string();
+                if text.is_empty() {
+                    return Err(capnp::Error::failed("input is empty".into()));
+                }
+                // Input has content — now clear it
+                documents
+                    .clear_input(context_id)
+                    .map_err(|e| capnp::Error::failed(format!("clear_input failed: {}", e)))?;
 
-            if is_shell {
-                let command_block_id = execute_shell_command(
-                    &text, context_id, user_agent_id, true,
-                    &kernel, &connection,
-                ).await?;
+                if is_shell {
+                    let command_block_id = execute_shell_command(
+                        &text,
+                        context_id,
+                        user_agent_id,
+                        true,
+                        &kernel,
+                        &connection,
+                    )
+                    .await?;
 
-                let mut block_id_builder = results.get().init_command_block_id();
-                set_block_id_builder(&mut block_id_builder, &command_block_id);
-            } else {
-                // Chat prompt — create user message block and invoke LLM
+                    let mut block_id_builder = results.get().init_command_block_id();
+                    set_block_id_builder(&mut block_id_builder, &command_block_id);
+                } else {
+                    // Chat prompt — create user message block and invoke LLM
 
-                // Document must exist — join_context is the sole creator
-                if documents.get(context_id).is_none() {
-                    return Err(capnp::Error::failed(
-                        format!("context {} not found — call join_context first", context_id)
-                    ));
+                    // Document must exist — join_context is the sole creator
+                    if documents.get(context_id).is_none() {
+                        return Err(capnp::Error::failed(format!(
+                            "context {} not found — call join_context first",
+                            context_id
+                        )));
+                    }
+
+                    // Build ToolContext from connection state
+                    let (session_id, kaish_ref) = {
+                        let conn = connection.borrow();
+                        (conn.session_id, conn.kaish.clone())
+                    };
+                    let cwd = match &kaish_ref {
+                        Some(k) => k.cwd().await,
+                        None => std::path::PathBuf::from("/"),
+                    };
+                    let tool_ctx = kaijutsu_kernel::ToolContext::new(
+                        user_agent_id,
+                        context_id,
+                        cwd,
+                        session_id,
+                        kernel.id,
+                    );
+
+                    // Create user message block at the end of the document
+                    let last_block = documents.last_block_id(context_id);
+                    let user_block_id = documents
+                        .insert_block_as(
+                            context_id,
+                            None,
+                            last_block.as_ref(),
+                            Role::User,
+                            BlockKind::Text,
+                            &text,
+                            Status::Done,
+                            Some(user_agent_id),
+                        )
+                        .map_err(|e| {
+                            capnp::Error::failed(format!("failed to insert user block: {}", e))
+                        })?;
+
+                    // Spawn LLM streaming in background
+                    spawn_llm_for_prompt(
+                        &kernel,
+                        context_id,
+                        &text,
+                        None,
+                        &user_block_id,
+                        tool_ctx,
+                        user_agent_id,
+                    )
+                    .await?;
+
+                    let mut block_id_builder = results.get().init_command_block_id();
+                    set_block_id_builder(&mut block_id_builder, &user_block_id);
                 }
 
-                // Build ToolContext from connection state
-                let (session_id, kaish_ref) = {
-                    let conn = connection.borrow();
-                    (conn.session_id, conn.kaish.clone())
-                };
-                let cwd = match &kaish_ref {
-                    Some(k) => k.cwd().await,
-                    None => std::path::PathBuf::from("/"),
-                };
-                let tool_ctx = kaijutsu_kernel::ToolContext::new(
-                    user_agent_id, context_id, cwd, session_id, kernel.id,
-                );
-
-                // Create user message block at the end of the document
-                let last_block = documents.last_block_id(context_id);
-                let user_block_id = documents.insert_block_as(
-                    context_id, None, last_block.as_ref(),
-                    Role::User, BlockKind::Text, &text, Status::Done, Some(user_agent_id),
-                ).map_err(|e| capnp::Error::failed(format!("failed to insert user block: {}", e)))?;
-
-                // Spawn LLM streaming in background
-                spawn_llm_for_prompt(
-                    &kernel, context_id, &text, None,
-                    &user_block_id, tool_ctx, user_agent_id,
-                ).await?;
-
-                let mut block_id_builder = results.get().init_command_block_id();
-                set_block_id_builder(&mut block_id_builder, &user_block_id);
+                Ok(())
             }
-
-            Ok(())
-        }.instrument(trace_span))
+            .instrument(trace_span),
+        )
     }
 
     fn clear_input(
@@ -3927,8 +4577,10 @@ impl kernel::Server for KernelImpl {
         let p = pry!(params.get());
         let _trace_guard = extract_rpc_trace(p.get_trace(), "clear_input").entered();
         let context_id_bytes = pry!(p.get_context_id());
-        let context_id = pry!(ContextId::try_from_slice(context_id_bytes)
-            .ok_or_else(|| capnp::Error::failed("invalid context ID".into())));
+        let context_id = pry!(
+            ContextId::try_from_slice(context_id_bytes)
+                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
+        );
 
         log::info!("clear_input: context={}", context_id);
 
@@ -3949,35 +4601,38 @@ impl kernel::Server for KernelImpl {
         let k = p.get_k() as usize;
         let kernel = self.kernel.clone();
 
-        Promise::from_future(async move {
-            let search_results = match &kernel.semantic_index {
-                Some(idx) => {
-                    let idx = idx.clone();
-                    let q = query.clone();
-                    tokio::task::spawn_blocking(move || idx.search(&q, k))
-                        .await
-                        .map_err(|e| capnp::Error::failed(format!("spawn_blocking: {}", e)))?
-                        .map_err(|e| capnp::Error::failed(format!("search: {}", e)))?
-                }
-                None => vec![],
-            };
+        Promise::from_future(
+            async move {
+                let search_results = match &kernel.semantic_index {
+                    Some(idx) => {
+                        let idx = idx.clone();
+                        let q = query.clone();
+                        tokio::task::spawn_blocking(move || idx.search(&q, k))
+                            .await
+                            .map_err(|e| capnp::Error::failed(format!("spawn_blocking: {}", e)))?
+                            .map_err(|e| capnp::Error::failed(format!("search: {}", e)))?
+                    }
+                    None => vec![],
+                };
 
-            // Populate labels from drift router
-            let drift = kernel.kernel.drift().read().await;
+                // Populate labels from drift router
+                let drift = kernel.kernel.drift().read().await;
 
-            let mut list = results.get().init_results(search_results.len() as u32);
-            for (i, r) in search_results.iter().enumerate() {
-                let mut entry = list.reborrow().get(i as u32);
-                entry.set_context_id(r.context_id.as_bytes());
-                entry.set_score(r.score);
-                if let Some(handle) = drift.get(r.context_id) {
-                    if let Some(ref label) = handle.label {
+                let mut list = results.get().init_results(search_results.len() as u32);
+                for (i, r) in search_results.iter().enumerate() {
+                    let mut entry = list.reborrow().get(i as u32);
+                    entry.set_context_id(r.context_id.as_bytes());
+                    entry.set_score(r.score);
+                    if let Some(handle) = drift.get(r.context_id)
+                        && let Some(ref label) = handle.label
+                    {
                         entry.set_label(label);
                     }
                 }
+                Ok(())
             }
-            Ok(())
-        }.instrument(span))
+            .instrument(span),
+        )
     }
 
     fn get_neighbors(
@@ -3988,38 +4643,43 @@ impl kernel::Server for KernelImpl {
         let p = pry!(params.get());
         let span = extract_rpc_trace(p.get_trace(), "get_neighbors");
         let context_id_bytes = pry!(p.get_context_id());
-        let context_id = pry!(ContextId::try_from_slice(context_id_bytes)
-            .ok_or_else(|| capnp::Error::failed("invalid context ID".into())));
+        let context_id = pry!(
+            ContextId::try_from_slice(context_id_bytes)
+                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
+        );
         let k = p.get_k() as usize;
         let kernel = self.kernel.clone();
 
-        Promise::from_future(async move {
-            let search_results = match &kernel.semantic_index {
-                Some(idx) => {
-                    let idx = idx.clone();
-                    tokio::task::spawn_blocking(move || idx.neighbors(context_id, k))
-                        .await
-                        .map_err(|e| capnp::Error::failed(format!("spawn_blocking: {}", e)))?
-                        .map_err(|e| capnp::Error::failed(format!("neighbors: {}", e)))?
-                }
-                None => vec![],
-            };
+        Promise::from_future(
+            async move {
+                let search_results = match &kernel.semantic_index {
+                    Some(idx) => {
+                        let idx = idx.clone();
+                        tokio::task::spawn_blocking(move || idx.neighbors(context_id, k))
+                            .await
+                            .map_err(|e| capnp::Error::failed(format!("spawn_blocking: {}", e)))?
+                            .map_err(|e| capnp::Error::failed(format!("neighbors: {}", e)))?
+                    }
+                    None => vec![],
+                };
 
-            let drift = kernel.kernel.drift().read().await;
+                let drift = kernel.kernel.drift().read().await;
 
-            let mut list = results.get().init_results(search_results.len() as u32);
-            for (i, r) in search_results.iter().enumerate() {
-                let mut entry = list.reborrow().get(i as u32);
-                entry.set_context_id(r.context_id.as_bytes());
-                entry.set_score(r.score);
-                if let Some(handle) = drift.get(r.context_id) {
-                    if let Some(ref label) = handle.label {
+                let mut list = results.get().init_results(search_results.len() as u32);
+                for (i, r) in search_results.iter().enumerate() {
+                    let mut entry = list.reborrow().get(i as u32);
+                    entry.set_context_id(r.context_id.as_bytes());
+                    entry.set_score(r.score);
+                    if let Some(handle) = drift.get(r.context_id)
+                        && let Some(ref label) = handle.label
+                    {
                         entry.set_label(label);
                     }
                 }
+                Ok(())
             }
-            Ok(())
-        }.instrument(span))
+            .instrument(span),
+        )
     }
 
     fn get_clusters(
@@ -4032,29 +4692,32 @@ impl kernel::Server for KernelImpl {
         let min_cluster_size = p.get_min_cluster_size() as usize;
         let kernel = self.kernel.clone();
 
-        Promise::from_future(async move {
-            let clusters = match &kernel.semantic_index {
-                Some(idx) => {
-                    let idx = idx.clone();
-                    tokio::task::spawn_blocking(move || idx.clusters(min_cluster_size))
-                        .await
-                        .map_err(|e| capnp::Error::failed(format!("spawn_blocking: {}", e)))?
-                        .map_err(|e| capnp::Error::failed(format!("clusters: {}", e)))?
-                }
-                None => vec![],
-            };
+        Promise::from_future(
+            async move {
+                let clusters = match &kernel.semantic_index {
+                    Some(idx) => {
+                        let idx = idx.clone();
+                        tokio::task::spawn_blocking(move || idx.clusters(min_cluster_size))
+                            .await
+                            .map_err(|e| capnp::Error::failed(format!("spawn_blocking: {}", e)))?
+                            .map_err(|e| capnp::Error::failed(format!("clusters: {}", e)))?
+                    }
+                    None => vec![],
+                };
 
-            let mut list = results.get().init_clusters(clusters.len() as u32);
-            for (i, c) in clusters.iter().enumerate() {
-                let mut entry = list.reborrow().get(i as u32);
-                entry.set_cluster_id(c.cluster_id as u32);
-                let mut ids = entry.init_context_ids(c.context_ids.len() as u32);
-                for (j, ctx_id) in c.context_ids.iter().enumerate() {
-                    ids.set(j as u32, ctx_id.as_bytes());
+                let mut list = results.get().init_clusters(clusters.len() as u32);
+                for (i, c) in clusters.iter().enumerate() {
+                    let mut entry = list.reborrow().get(i as u32);
+                    entry.set_cluster_id(c.cluster_id as u32);
+                    let mut ids = entry.init_context_ids(c.context_ids.len() as u32);
+                    for (j, ctx_id) in c.context_ids.iter().enumerate() {
+                        ids.set(j as u32, ctx_id.as_bytes());
+                    }
                 }
+                Ok(())
             }
-            Ok(())
-        }.instrument(span))
+            .instrument(span),
+        )
     }
 
     fn get_blocks(
@@ -4065,8 +4728,10 @@ impl kernel::Server for KernelImpl {
         let p = pry!(params.get());
         let _trace_guard = extract_rpc_trace(p.get_trace(), "get_blocks").entered();
         let context_id_bytes = pry!(p.get_context_id());
-        let context_id = pry!(ContextId::try_from_slice(context_id_bytes)
-            .ok_or_else(|| capnp::Error::failed("invalid context ID".into())));
+        let context_id = pry!(
+            ContextId::try_from_slice(context_id_bytes)
+                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
+        );
 
         let query_reader = pry!(p.get_query());
         let query = pry!(parse_block_query(&query_reader));
@@ -4075,22 +4740,35 @@ impl kernel::Server for KernelImpl {
 
         let blocks = match query {
             kaijutsu_types::BlockQuery::All => {
-                pry!(documents.block_snapshots(context_id)
-                    .map_err(|e| capnp::Error::failed(e.to_string())))
+                pry!(
+                    documents
+                        .block_snapshots(context_id)
+                        .map_err(|e| capnp::Error::failed(e.to_string()))
+                )
             }
             kaijutsu_types::BlockQuery::ByIds(ids) => {
                 if ids.is_empty() {
                     return Promise::err(capnp::Error::failed(
-                        "byIds requires at least one block ID".into()
+                        "byIds requires at least one block ID".into(),
                     ));
                 }
-                pry!(documents.get_blocks_by_ids(context_id, &ids)
-                    .map_err(|e| capnp::Error::failed(e.to_string())))
+                pry!(
+                    documents
+                        .get_blocks_by_ids(context_id, &ids)
+                        .map_err(|e| capnp::Error::failed(e.to_string()))
+                )
             }
             kaijutsu_types::BlockQuery::ByFilter(filter) => {
-                pry!(filter.validate().map_err(|e| capnp::Error::failed(e.to_string())));
-                pry!(documents.query_blocks(context_id, &filter)
-                    .map_err(|e| capnp::Error::failed(e.to_string())))
+                pry!(
+                    filter
+                        .validate()
+                        .map_err(|e| capnp::Error::failed(e.to_string()))
+                );
+                pry!(
+                    documents
+                        .query_blocks(context_id, &filter)
+                        .map_err(|e| capnp::Error::failed(e.to_string()))
+                )
             }
         };
 
@@ -4111,12 +4789,17 @@ impl kernel::Server for KernelImpl {
         let p = pry!(params.get());
         let _trace_guard = extract_rpc_trace(p.get_trace(), "get_context_sync").entered();
         let context_id_bytes = pry!(p.get_context_id());
-        let context_id = pry!(ContextId::try_from_slice(context_id_bytes)
-            .ok_or_else(|| capnp::Error::failed("invalid context ID".into())));
+        let context_id = pry!(
+            ContextId::try_from_slice(context_id_bytes)
+                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
+        );
 
         let documents = &self.kernel.documents;
-        let (ops, version) = pry!(documents.context_sync_state(context_id)
-            .map_err(|e| capnp::Error::failed(e.to_string())));
+        let (ops, version) = pry!(
+            documents
+                .context_sync_state(context_id)
+                .map_err(|e| capnp::Error::failed(e.to_string()))
+        );
 
         let mut r = results.get();
         r.set_context_id(context_id.as_bytes());
@@ -4180,7 +4863,9 @@ impl kernel::Server for KernelImpl {
                 let mut input_sub = input_flows.map(|f| f.subscribe("input.*"));
                 log::debug!(
                     "Started filtered FlowBus subscription for kernel {} (filter_active={}, pattern={})",
-                    kernel_id.to_hex(), has_filter, subscribe_pattern
+                    kernel_id.to_hex(),
+                    has_filter,
+                    subscribe_pattern
                 );
 
                 loop {
@@ -4323,7 +5008,10 @@ impl kernel::Server for KernelImpl {
                     }
                 }
 
-                log::debug!("Filtered FlowBus bridge task for kernel {} ended", kernel_id);
+                log::debug!(
+                    "Filtered FlowBus bridge task for kernel {} ended",
+                    kernel_id
+                );
             });
         }
         Promise::ok(())
@@ -4340,15 +5028,15 @@ impl kernel::Server for KernelImpl {
     ) -> Promise<(), capnp::Error> {
         let params_reader = pry!(params.get());
         let context_id_bytes = pry!(params_reader.get_context_id());
-        let context_id = pry!(ContextId::try_from_slice(context_id_bytes)
-            .ok_or_else(|| capnp::Error::failed("invalid context ID".into())));
+        let context_id = pry!(
+            ContextId::try_from_slice(context_id_bytes)
+                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
+        );
         let immediate = params_reader.get_immediate();
 
         // Cancel kaish synchronously — cancel() is a sync method.
-        if immediate {
-            if let Some(kaish) = self.connection.borrow().kaish.as_ref() {
-                kaish.cancel();
-            }
+        if immediate && let Some(kaish) = self.connection.borrow().kaish.as_ref() {
+            kaish.cancel();
         }
 
         let kernel = self.kernel.clone();
@@ -4368,7 +5056,9 @@ impl kernel::Server for KernelImpl {
 
             log::info!(
                 "interruptContext: context={}, immediate={}, success={}",
-                context_id, immediate, success
+                context_id,
+                immediate,
+                success
             );
 
             results.get().set_success(success);
@@ -4416,13 +5106,15 @@ fn value_to_shell_value(mut builder: shell_value::Builder<'_>, value: &kaish_ker
         Value::Int(i) => builder.set_int(*i),
         Value::Float(f) => builder.set_float(*f),
         Value::String(s) => builder.set_string(s),
-        Value::Json(j) => builder.set_json(&serde_json::to_string(j).unwrap_or_default()),
+        Value::Json(j) => builder.set_json(serde_json::to_string(j).unwrap_or_default()),
         Value::Blob(b) => builder.set_blob(&b.id),
     }
 }
 
 /// Convert Cap'n Proto `ShellValue` reader → kaish `ast::Value`.
-fn shell_value_to_value(reader: shell_value::Reader<'_>) -> Result<kaish_kernel::ast::Value, capnp::Error> {
+fn shell_value_to_value(
+    reader: shell_value::Reader<'_>,
+) -> Result<kaish_kernel::ast::Value, capnp::Error> {
     use kaish_kernel::ast::Value;
     match reader.which()? {
         shell_value::Null(()) => Ok(Value::Null),
@@ -4453,8 +5145,8 @@ fn shell_value_to_value(reader: shell_value::Reader<'_>) -> Result<kaish_kernel:
 // ============================================================================
 
 fn entry_type_to_capnp(et: kaijutsu_types::OutputEntryType) -> crate::kaijutsu_capnp::EntryType {
-    use kaijutsu_types::OutputEntryType;
     use crate::kaijutsu_capnp::EntryType;
+    use kaijutsu_types::OutputEntryType;
     match et {
         OutputEntryType::Text => EntryType::Text,
         OutputEntryType::File => EntryType::File,
@@ -4465,7 +5157,10 @@ fn entry_type_to_capnp(et: kaijutsu_types::OutputEntryType) -> crate::kaijutsu_c
     }
 }
 
-fn build_output_node(mut builder: crate::kaijutsu_capnp::output_node::Builder<'_>, node: &kaijutsu_types::OutputNode) {
+fn build_output_node(
+    mut builder: crate::kaijutsu_capnp::output_node::Builder<'_>,
+    node: &kaijutsu_types::OutputNode,
+) {
     builder.set_name(&node.name);
     builder.set_entry_type(entry_type_to_capnp(node.entry_type));
     if let Some(ref text) = node.text {
@@ -4498,7 +5193,9 @@ fn entry_type_from_capnp(et: crate::kaijutsu_capnp::EntryType) -> kaijutsu_types
     }
 }
 
-fn parse_output_node(reader: crate::kaijutsu_capnp::output_node::Reader<'_>) -> Result<kaijutsu_types::OutputNode, capnp::Error> {
+fn parse_output_node(
+    reader: crate::kaijutsu_capnp::output_node::Reader<'_>,
+) -> Result<kaijutsu_types::OutputNode, capnp::Error> {
     let name = reader.get_name()?.to_str()?.to_owned();
     let entry_type = entry_type_from_capnp(reader.get_entry_type()?);
     let text = if reader.get_has_text() {
@@ -4525,7 +5222,9 @@ fn parse_output_node(reader: crate::kaijutsu_capnp::output_node::Reader<'_>) -> 
     })
 }
 
-fn parse_output_data(reader: crate::kaijutsu_capnp::output_data::Reader<'_>) -> Result<kaijutsu_types::OutputData, capnp::Error> {
+fn parse_output_data(
+    reader: crate::kaijutsu_capnp::output_data::Reader<'_>,
+) -> Result<kaijutsu_types::OutputData, capnp::Error> {
     let headers = if reader.get_has_headers() {
         let hlist = reader.get_headers()?;
         let mut v = Vec::with_capacity(hlist.len() as usize);
@@ -4544,7 +5243,10 @@ fn parse_output_data(reader: crate::kaijutsu_capnp::output_data::Reader<'_>) -> 
     Ok(kaijutsu_types::OutputData { headers, root })
 }
 
-fn build_output_data(mut builder: crate::kaijutsu_capnp::output_data::Builder<'_>, data: &kaijutsu_types::OutputData) {
+fn build_output_data(
+    mut builder: crate::kaijutsu_capnp::output_data::Builder<'_>,
+    data: &kaijutsu_types::OutputData,
+) {
     if let Some(ref headers) = data.headers {
         builder.set_has_headers(true);
         let mut hlist = builder.reborrow().init_headers(headers.len() as u32);
@@ -4565,8 +5267,7 @@ fn build_output_data(mut builder: crate::kaijutsu_capnp::output_data::Builder<'_
 // ============================================================================
 
 use crate::kaijutsu_capnp::{
-    AgentCapability as CapnpAgentCapability,
-    AgentStatus as CapnpAgentStatus,
+    AgentCapability as CapnpAgentCapability, AgentStatus as CapnpAgentStatus,
 };
 
 /// Convert capnp AgentCapability to kernel AgentCapability.
@@ -4636,7 +5337,6 @@ fn agent_status_to_capnp(status: AgentStatus) -> CapnpAgentStatus {
 // Cap'n Proto ↔ Rust Type Helpers
 // ============================================================================
 
-
 /// Parse a ToolFilter from a Cap'n Proto ToolFilterConfig reader.
 fn parse_tool_filter_from_capnp(
     reader: tool_filter_config::Reader<'_>,
@@ -4692,7 +5392,7 @@ fn serialize_tool_filter_to_capnp(
 // LLM Stream Helpers
 // ============================================================================
 
-use kaijutsu_kernel::llm::{ToolDefinition, ContentBlock};
+use kaijutsu_kernel::llm::{ContentBlock, ToolDefinition};
 
 /// Build tool definitions from tools with engines, filtered by kernel + context tool config.
 ///
@@ -4720,9 +5420,7 @@ async fn build_tool_definitions(
         .filter_map(|info| {
             // Only include tools that provide a schema — models can't use tools
             // without knowing the expected parameters
-            let input_schema = registry
-                .get_engine(&info.name)
-                .and_then(|e| e.schema())?;
+            let input_schema = registry.get_engine(&info.name).and_then(|e| e.schema())?;
             Some(ToolDefinition {
                 name: info.name.clone(),
                 description: info.description.clone(),
@@ -4761,7 +5459,8 @@ async fn spawn_llm_for_prompt(
         if let Err(e) = config_backend.ensure_config("system.md").await {
             log::warn!("Failed to ensure system.md config: {}", e);
         }
-        config_backend.get_content("system.md")
+        config_backend
+            .get_content("system.md")
             .unwrap_or_else(|_| kaijutsu_kernel::DEFAULT_SYSTEM_PROMPT.to_string())
     };
 
@@ -4785,12 +5484,15 @@ async fn spawn_llm_for_prompt(
         match effective_model {
             Some(name) => {
                 // Prefer per-context provider, then resolve via registry
-                let provider = ctx_provider_name.as_deref()
+                let provider = ctx_provider_name
+                    .as_deref()
                     .and_then(|pn| registry.get(pn))
                     .or_else(|| registry.default_provider())
                     .ok_or_else(|| {
                         log::error!("No LLM provider configured");
-                        capnp::Error::failed("No LLM provider configured (check models.rhai)".into())
+                        capnp::Error::failed(
+                            "No LLM provider configured (check models.rhai)".into(),
+                        )
                     })?;
                 (provider, name, max_tokens)
             }
@@ -4800,7 +5502,8 @@ async fn spawn_llm_for_prompt(
                     log::error!("No LLM provider configured");
                     capnp::Error::failed("No LLM provider configured (check models.rhai)".into())
                 })?;
-                let m = registry.default_model()
+                let m = registry
+                    .default_model()
                     .unwrap_or(kaijutsu_kernel::DEFAULT_MODEL)
                     .to_string();
                 (p, m, max_tokens)
@@ -4811,7 +5514,11 @@ async fn spawn_llm_for_prompt(
     // Build tool definitions from equipped tools, filtered by kernel + context config
     let tools = build_tool_definitions(&kernel_arc, ctx_tool_filter.as_ref()).await;
 
-    log::info!("Spawning LLM stream: context={}, model={}", context_id, model_name);
+    log::info!(
+        "Spawning LLM stream: context={}, model={}",
+        context_id,
+        model_name
+    );
 
     let content = content.to_owned();
     let after_block_id = *after_block_id;
@@ -4876,7 +5583,12 @@ async fn execute_shell_command(
             let kj_principal = conn.principal.id;
             let kj_session = conn.session_id;
             match EmbeddedKaish::with_identity(
-                &format!("{}-{}-{}", kernel.name, conn.principal.username, conn.session_id.short()),
+                &format!(
+                    "{}-{}-{}",
+                    kernel.name,
+                    conn.principal.username,
+                    conn.session_id.short()
+                ),
                 kernel.documents.clone(),
                 kernel.kernel.clone(),
                 None,
@@ -4888,7 +5600,10 @@ async fn execute_shell_command(
                     let block_source: Arc<dyn kaijutsu_index::BlockSource> =
                         Arc::new(BlockStoreSource(kernel.documents.clone()));
                     tools.register(crate::kj_builtin::KjBuiltin::new(
-                        kj_disp, shared_ctx, kj_principal, kj_session,
+                        kj_disp,
+                        shared_ctx,
+                        kj_principal,
+                        kj_session,
                         kernel.semantic_index.clone(),
                         block_source,
                     ));
@@ -4899,7 +5614,10 @@ async fn execute_shell_command(
                 }
                 Err(e) => {
                     log::error!("Failed to create embedded kaish: {}", e);
-                    return Err(capnp::Error::failed(format!("kaish creation failed: {}", e)));
+                    return Err(capnp::Error::failed(format!(
+                        "kaish creation failed: {}",
+                        e
+                    )));
                 }
             }
         }
@@ -4919,26 +5637,47 @@ async fn execute_shell_command(
 
     // Document must exist — join_context is the sole creator
     if documents.get(context_id).is_none() {
-        return Err(capnp::Error::failed(
-            format!("context {} not found — call join_context first", context_id)
-        ));
+        return Err(capnp::Error::failed(format!(
+            "context {} not found — call join_context first",
+            context_id
+        )));
     }
 
     // Create ToolCall block for the shell command (authored by user if user_initiated)
     let last_block = documents.last_block_id(context_id);
-    let role = if user_initiated { Some(Role::User) } else { None };
-    let command_block_id = documents.insert_tool_call_as(
-        context_id, None, last_block.as_ref(),
-        "shell", serde_json::json!({"code": code}),
-        Some(TypesToolKind::Shell), Some(user_agent_id), None, role,
-    ).map_err(|e| capnp::Error::failed(format!("failed to insert shell command: {}", e)))?;
+    let role = if user_initiated {
+        Some(Role::User)
+    } else {
+        None
+    };
+    let command_block_id = documents
+        .insert_tool_call_as(
+            context_id,
+            None,
+            last_block.as_ref(),
+            "shell",
+            serde_json::json!({"code": code}),
+            Some(TypesToolKind::Shell),
+            Some(user_agent_id),
+            None,
+            role,
+        )
+        .map_err(|e| capnp::Error::failed(format!("failed to insert shell command: {}", e)))?;
 
     // Create ToolResult block (empty, will be filled by execution — system-authored)
-    let output_block_id = documents.insert_tool_result_as(
-        context_id, &command_block_id, Some(&command_block_id),
-        "", false, None,
-        Some(TypesToolKind::Shell), Some(PrincipalId::system()), None,
-    ).map_err(|e| capnp::Error::failed(format!("failed to insert shell output: {}", e)))?;
+    let output_block_id = documents
+        .insert_tool_result_as(
+            context_id,
+            &command_block_id,
+            Some(&command_block_id),
+            "",
+            false,
+            None,
+            Some(TypesToolKind::Shell),
+            Some(PrincipalId::system()),
+            None,
+        )
+        .map_err(|e| capnp::Error::failed(format!("failed to insert shell output: {}", e)))?;
 
     // Mark output block as Running — clients poll this to detect completion
     if let Err(e) = documents.set_status(context_id, &output_block_id, Status::Running) {
@@ -4959,11 +5698,20 @@ async fn execute_shell_command(
         // BlockInserted, causing DataMissing errors on the client side.
         tokio::task::yield_now().await;
 
-        log::info!("shell_execute: executing code via EmbeddedKaish: {:?}", code);
+        log::info!(
+            "shell_execute: executing code via EmbeddedKaish: {:?}",
+            code
+        );
         match kaish.execute(&code).await {
             Ok(result) => {
-                log::info!("shell_execute: kaish returned code={} original_code={:?} did_spill={} out_len={} err_len={}",
-                    result.code, result.original_code, result.did_spill, result.out.len(), result.err.len());
+                log::info!(
+                    "shell_execute: kaish returned code={} original_code={:?} did_spill={} out_len={} err_len={}",
+                    result.code,
+                    result.original_code,
+                    result.did_spill,
+                    result.out.len(),
+                    result.err.len()
+                );
 
                 let output_text = if result.err.is_empty() {
                     result.out
@@ -4973,24 +5721,44 @@ async fn execute_shell_command(
                     format!("{}\n{}", result.out, result.err)
                 };
 
-                if let Err(e) = documents_clone.edit_text_as(context_id, &output_block_id_clone, 0, &output_text, 0, Some(PrincipalId::system())) {
+                if let Err(e) = documents_clone.edit_text_as(
+                    context_id,
+                    &output_block_id_clone,
+                    0,
+                    &output_text,
+                    0,
+                    Some(PrincipalId::system()),
+                ) {
                     log::error!("Failed to update shell output: {}", e);
                 }
 
-                if let Some(ref output_data) = result.output {
-                    if let Err(e) = documents_clone.set_output(context_id, &output_block_id_clone, Some(output_data)) {
-                        log::error!("Failed to set output data: {}", e);
-                    }
+                if let Some(ref output_data) = result.output
+                    && let Err(e) = documents_clone.set_output(
+                        context_id,
+                        &output_block_id_clone,
+                        Some(output_data),
+                    )
+                {
+                    log::error!("Failed to set output data: {}", e);
                 }
 
-                if result.content_type.is_some() {
-                    if let Err(e) = documents_clone.set_content_type(context_id, &output_block_id_clone, result.content_type) {
-                        log::error!("Failed to set content_type: {}", e);
-                    }
+                if result.content_type.is_some()
+                    && let Err(e) = documents_clone.set_content_type(
+                        context_id,
+                        &output_block_id_clone,
+                        result.content_type,
+                    )
+                {
+                    log::error!("Failed to set content_type: {}", e);
                 }
 
                 // Read baggage: mark blocks ephemeral if tool signaled it
-                if result.baggage.get("kaijutsu.ephemeral").map(|v| v == "true").unwrap_or(false) {
+                if result
+                    .baggage
+                    .get("kaijutsu.ephemeral")
+                    .map(|v| v == "true")
+                    .unwrap_or(false)
+                {
                     for bid in [&command_block_id_clone, &output_block_id_clone] {
                         if let Err(e) = documents_clone.set_ephemeral(context_id, bid, true) {
                             log::error!("Failed to set ephemeral on block: {}", e);
@@ -5004,34 +5772,51 @@ async fn execute_shell_command(
                     0 | 2 | 3 => Status::Done,
                     _ => Status::Error,
                 };
-                if let Err(e) = documents_clone.set_status(context_id, &output_block_id_clone, final_status) {
+                if let Err(e) =
+                    documents_clone.set_status(context_id, &output_block_id_clone, final_status)
+                {
                     log::error!("Failed to set output block status: {}", e);
                 }
-                if let Err(e) = documents_clone.set_status(context_id, &command_block_id_clone, final_status) {
+                if let Err(e) =
+                    documents_clone.set_status(context_id, &command_block_id_clone, final_status)
+                {
                     log::error!("Failed to set command block status: {}", e);
                 }
 
                 // Detect context switch (kj fork, kj context switch)
                 let new_context_id = kaish.context_id();
                 if new_context_id != context_id {
-                    log::info!("shell_execute: context switched {} → {}", context_id, new_context_id);
-                    block_flows.publish(
-                        kaijutsu_kernel::flows::BlockFlow::ContextSwitched {
-                            context_id: new_context_id,
-                        },
+                    log::info!(
+                        "shell_execute: context switched {} → {}",
+                        context_id,
+                        new_context_id
                     );
+                    block_flows.publish(kaijutsu_kernel::flows::BlockFlow::ContextSwitched {
+                        context_id: new_context_id,
+                    });
                 }
             }
             Err(e) => {
                 let error_msg = format!("Error: {}", e);
                 log::error!("Shell execution failed: {}", e);
-                if let Err(e) = documents_clone.edit_text_as(context_id, &output_block_id_clone, 0, &error_msg, 0, Some(PrincipalId::system())) {
+                if let Err(e) = documents_clone.edit_text_as(
+                    context_id,
+                    &output_block_id_clone,
+                    0,
+                    &error_msg,
+                    0,
+                    Some(PrincipalId::system()),
+                ) {
                     log::error!("Failed to update shell output with error: {}", e);
                 }
-                if let Err(e) = documents_clone.set_status(context_id, &output_block_id_clone, Status::Error) {
+                if let Err(e) =
+                    documents_clone.set_status(context_id, &output_block_id_clone, Status::Error)
+                {
                     log::error!("Failed to set output block error status: {}", e);
                 }
-                if let Err(e) = documents_clone.set_status(context_id, &command_block_id_clone, Status::Error) {
+                if let Err(e) =
+                    documents_clone.set_status(context_id, &command_block_id_clone, Status::Error)
+                {
                     log::error!("Failed to set command block error status: {}", e);
                 }
             }
@@ -5079,7 +5864,9 @@ async fn process_llm_stream(
             let hydrated = kaijutsu_kernel::hydrate_from_blocks(&blocks);
             log::info!(
                 "Hydrated {} messages from {} blocks for context {}",
-                hydrated.len(), blocks.len(), context_id
+                hydrated.len(),
+                blocks.len(),
+                context_id
             );
             *messages = hydrated;
         }
@@ -5090,12 +5877,20 @@ async fn process_llm_stream(
             // falling back. An empty cache means the model sees no history, which
             // produces confusing responses after cache eviction or first prompt
             // post-restart. Consider inserting a System block explaining the gap.
-            log::warn!("Could not hydrate cache for {}: {}, falling back to cache + append", context_id, e);
+            log::warn!(
+                "Could not hydrate cache for {}: {}, falling back to cache + append",
+                context_id,
+                e
+            );
             messages.push(LlmMessage::user(&content));
         }
     }
 
-    log::info!("Sending {} messages for context {}", messages.len(), context_id);
+    log::info!(
+        "Sending {} messages for context {}",
+        messages.len(),
+        context_id
+    );
 
     // Track total iterations to prevent infinite loops
     let max_iterations = 20;
@@ -5110,18 +5905,41 @@ async fn process_llm_stream(
     loop {
         iteration += 1;
         if iteration > max_iterations {
-            log::warn!("Agentic loop hit max iterations ({}), stopping", max_iterations);
-            let _ = documents.insert_block_as(context_id, None, Some(&last_block_id), Role::Model, BlockKind::Text, "⚠️ Maximum tool iterations reached", Status::Done, Some(PrincipalId::system()));
+            log::warn!(
+                "Agentic loop hit max iterations ({}), stopping",
+                max_iterations
+            );
+            let _ = documents.insert_block_as(
+                context_id,
+                None,
+                Some(&last_block_id),
+                Role::Model,
+                BlockKind::Text,
+                "⚠️ Maximum tool iterations reached",
+                Status::Done,
+                Some(PrincipalId::system()),
+            );
             break;
         }
 
         // Soft interrupt: stop before the next LLM call.
-        if interrupt.stop_after_turn.load(std::sync::atomic::Ordering::Relaxed) {
-            log::info!("Soft interrupt requested for {}, stopping agentic loop", context_id);
+        if interrupt
+            .stop_after_turn
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            log::info!(
+                "Soft interrupt requested for {}, stopping agentic loop",
+                context_id
+            );
             break;
         }
 
-        log::info!("Agentic loop iteration {} with {} messages, {} tools", iteration, messages.len(), tools.len());
+        log::info!(
+            "Agentic loop iteration {} with {} messages, {} tools",
+            iteration,
+            messages.len(),
+            tools.len()
+        );
 
         // Create streaming request with tools
         let stream_request = StreamRequest::new(&model_name, messages.clone())
@@ -5149,13 +5967,29 @@ async fn process_llm_stream(
                         let delay_secs = attempt as u64;
                         log::warn!(
                             "LLM stream failed (attempt {}/{}): {}, retrying in {}s",
-                            attempt, MAX_LLM_RETRIES + 1, e, delay_secs
+                            attempt,
+                            MAX_LLM_RETRIES + 1,
+                            e,
+                            delay_secs
                         );
                         tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
                     }
                     Err(e) => {
-                        log::error!("Failed to start LLM stream after {} attempts: {}", attempt, e);
-                        let _ = documents.insert_block_as(context_id, None, Some(&last_block_id), Role::Model, BlockKind::Text, format!("❌ Error: {}", e), Status::Done, Some(PrincipalId::system()));
+                        log::error!(
+                            "Failed to start LLM stream after {} attempts: {}",
+                            attempt,
+                            e
+                        );
+                        let _ = documents.insert_block_as(
+                            context_id,
+                            None,
+                            Some(&last_block_id),
+                            Role::Model,
+                            BlockKind::Text,
+                            format!("❌ Error: {}", e),
+                            Status::Done,
+                            Some(PrincipalId::system()),
+                        );
                         return;
                     }
                 }
@@ -5167,7 +6001,10 @@ async fn process_llm_stream(
         // Collect tool calls for this iteration
         let mut tool_calls: Vec<(String, String, serde_json::Value, TypesToolKind)> = vec![]; // (id, name, input, tool_kind)
         // Track tool_use_id → BlockId mapping for CRDT
-        let mut tool_call_blocks: std::collections::HashMap<String, Option<kaijutsu_crdt::BlockId>> = std::collections::HashMap::new();
+        let mut tool_call_blocks: std::collections::HashMap<
+            String,
+            Option<kaijutsu_crdt::BlockId>,
+        > = std::collections::HashMap::new();
         // Collect text output for conversation history
         let mut assistant_text = String::new();
 
@@ -5200,9 +6037,18 @@ async fn process_llm_stream(
             log::debug!("Received stream event: {:?}", event);
             match event {
                 StreamEvent::ThinkingStart => {
-                    match documents.insert_block_as(context_id, None, Some(&last_block_id), Role::Model, BlockKind::Thinking, "", Status::Running, Some(PrincipalId::system())) {
+                    match documents.insert_block_as(
+                        context_id,
+                        None,
+                        Some(&last_block_id),
+                        Role::Model,
+                        BlockKind::Thinking,
+                        "",
+                        Status::Running,
+                        Some(PrincipalId::system()),
+                    ) {
                         Ok(block_id) => {
-                            last_block_id = block_id.clone();
+                            last_block_id = block_id;
                             current_block_id = Some(block_id);
                         }
                         Err(e) => log::error!("Failed to insert thinking block: {}", e),
@@ -5210,10 +6056,15 @@ async fn process_llm_stream(
                 }
 
                 StreamEvent::ThinkingDelta(text) => {
-                    if let Some(ref block_id) = current_block_id {
-                        if let Err(e) = documents.append_text_as(context_id, block_id, &text, Some(PrincipalId::system())) {
-                            log::error!("Failed to append thinking text: {}", e);
-                        }
+                    if let Some(ref block_id) = current_block_id
+                        && let Err(e) = documents.append_text_as(
+                            context_id,
+                            block_id,
+                            &text,
+                            Some(PrincipalId::system()),
+                        )
+                    {
+                        log::error!("Failed to append thinking text: {}", e);
                     }
                 }
 
@@ -5225,9 +6076,18 @@ async fn process_llm_stream(
                 }
 
                 StreamEvent::TextStart => {
-                    match documents.insert_block_as(context_id, None, Some(&last_block_id), Role::Model, BlockKind::Text, "", Status::Running, Some(PrincipalId::system())) {
+                    match documents.insert_block_as(
+                        context_id,
+                        None,
+                        Some(&last_block_id),
+                        Role::Model,
+                        BlockKind::Text,
+                        "",
+                        Status::Running,
+                        Some(PrincipalId::system()),
+                    ) {
                         Ok(block_id) => {
-                            last_block_id = block_id.clone();
+                            last_block_id = block_id;
                             current_block_id = Some(block_id);
                         }
                         Err(e) => log::error!("Failed to insert text block: {}", e),
@@ -5238,10 +6098,15 @@ async fn process_llm_stream(
                     // Collect text for conversation history
                     assistant_text.push_str(&text);
 
-                    if let Some(ref block_id) = current_block_id {
-                        if let Err(e) = documents.append_text_as(context_id, block_id, &text, Some(PrincipalId::system())) {
-                            log::error!("Failed to append text: {}", e);
-                        }
+                    if let Some(ref block_id) = current_block_id
+                        && let Err(e) = documents.append_text_as(
+                            context_id,
+                            block_id,
+                            &text,
+                            Some(PrincipalId::system()),
+                        )
+                    {
+                        log::error!("Failed to append text: {}", e);
                     }
                 }
 
@@ -5256,7 +6121,8 @@ async fn process_llm_stream(
                     // Resolve tool_kind from registry category
                     let tool_kind = {
                         let registry = kernel.tools().read().await;
-                        registry.get(&name)
+                        registry
+                            .get(&name)
                             .map(|info| tool_kind_for_category(&info.category))
                             .unwrap_or(TypesToolKind::Builtin)
                     };
@@ -5267,9 +6133,19 @@ async fn process_llm_stream(
                     // Insert block and track it — on failure, store None so
                     // the execution future can surface the error to the model
                     // instead of silently losing the tool result.
-                    match documents.insert_tool_call_as(context_id, None, Some(&last_block_id), &name, input.clone(), Some(tool_kind), Some(PrincipalId::system()), Some(id.clone()), None) {
+                    match documents.insert_tool_call_as(
+                        context_id,
+                        None,
+                        Some(&last_block_id),
+                        &name,
+                        input.clone(),
+                        Some(tool_kind),
+                        Some(PrincipalId::system()),
+                        Some(id.clone()),
+                        None,
+                    ) {
                         Ok(block_id) => {
-                            last_block_id = block_id.clone();
+                            last_block_id = block_id;
                             tool_call_blocks.insert(id.clone(), Some(block_id));
                         }
                         Err(e) => {
@@ -5284,17 +6160,25 @@ async fn process_llm_stream(
                     log::warn!("Unexpected ToolResult event during streaming");
                 }
 
-                StreamEvent::Done { stop_reason, input_tokens, output_tokens } => {
+                StreamEvent::Done {
+                    stop_reason,
+                    input_tokens,
+                    output_tokens,
+                } => {
                     if stream_cancelled {
                         // Hard interrupt confirmation: rig flushed its buffer cleanly.
                         // stop_reason is None on cancel (vs "end_turn"/"tool_use" normally).
                         log::info!(
                             "LLM stream cancelled: tokens_in={:?}, tokens_out={:?}",
-                            input_tokens, output_tokens
+                            input_tokens,
+                            output_tokens
                         );
                         let _ = documents.insert_block_as(
-                            context_id, None, Some(&last_block_id),
-                            Role::Model, BlockKind::Text,
+                            context_id,
+                            None,
+                            Some(&last_block_id),
+                            Role::Model,
+                            BlockKind::Text,
                             "⛔ Interrupted",
                             Status::Done,
                             Some(PrincipalId::system()),
@@ -5304,13 +6188,24 @@ async fn process_llm_stream(
                     }
                     log::info!(
                         "LLM stream completed: stop_reason={:?}, tokens_in={:?}, tokens_out={:?}",
-                        stop_reason, input_tokens, output_tokens
+                        stop_reason,
+                        input_tokens,
+                        output_tokens
                     );
                 }
 
                 StreamEvent::Error(err) => {
                     log::error!("LLM stream error: {}", err);
-                    let _ = documents.insert_block_as(context_id, None, Some(&last_block_id), Role::Model, BlockKind::Text, format!("❌ Error: {}", err), Status::Error, Some(PrincipalId::system()));
+                    let _ = documents.insert_block_as(
+                        context_id,
+                        None,
+                        Some(&last_block_id),
+                        Role::Model,
+                        BlockKind::Text,
+                        format!("❌ Error: {}", err),
+                        Status::Error,
+                        Some(PrincipalId::system()),
+                    );
                     return;
                 }
             }
@@ -5339,7 +6234,8 @@ async fn process_llm_stream(
         log::info!("Executing {} tool calls concurrently", tool_calls.len());
 
         // Build assistant tool uses (for conversation history)
-        let assistant_tool_uses: Vec<ContentBlock> = tool_calls.iter()
+        let assistant_tool_uses: Vec<ContentBlock> = tool_calls
+            .iter()
             .map(|(id, name, input, _)| ContentBlock::ToolUse {
                 id: id.clone(),
                 name: name.clone(),
@@ -5350,11 +6246,11 @@ async fn process_llm_stream(
         // Execute all tools concurrently with streaming results.
         // Pattern mirrors shell_execute: create empty Running block → yield →
         // execute → write content → set final status.
-        let futures: Vec<_> = tool_calls.into_iter()
+        let futures: Vec<_> = tool_calls
+            .into_iter()
             .map(|(tool_use_id, tool_name, input, tool_kind)| {
                 let kernel = kernel.clone();
                 let documents = documents.clone();
-                let context_id = context_id;
                 let tool_ctx = tool_ctx.clone();
                 // Option<Option<BlockId>>: None = not in map (shouldn't happen),
                 // Some(None) = insertion failed, Some(Some(id)) = normal
@@ -5372,7 +6268,8 @@ async fn process_llm_stream(
                             log::warn!(
                                 "Tool {} (id={}) has no ToolCall block — \
                                  returning error to model",
-                                tool_name, tool_use_id,
+                                tool_name,
+                                tool_use_id,
                             );
                             return (
                                 ContentBlock::ToolResult {
@@ -5394,8 +6291,15 @@ async fn process_llm_stream(
                     let mut result_block_id = None;
                     if let Some(ref tcb_id) = tool_call_block_id {
                         match documents.insert_tool_result_as(
-                            context_id, tcb_id, Some(tcb_id), "", false, None,
-                            Some(tool_kind), Some(PrincipalId::system()), Some(tool_use_id.clone()),
+                            context_id,
+                            tcb_id,
+                            Some(tcb_id),
+                            "",
+                            false,
+                            None,
+                            Some(tool_kind),
+                            Some(PrincipalId::system()),
+                            Some(tool_use_id.clone()),
                         ) {
                             Ok(id) => {
                                 let _ = documents.set_status(context_id, &id, Status::Running);
@@ -5408,7 +6312,8 @@ async fn process_llm_stream(
                                 // visible in the conversation view.
                                 "Failed to insert tool result block for {} — \
                                  model will still receive result but user won't see it: {}",
-                                tool_name, e,
+                                tool_name,
+                                e,
                             ),
                         }
                     }
@@ -5422,12 +6327,23 @@ async fn process_llm_stream(
                     let result = tokio::time::timeout(
                         std::time::Duration::from_secs(TOOL_TIMEOUT_SECS),
                         kernel.execute_with(&tool_name, &params, &tool_ctx),
-                    ).await;
+                    )
+                    .await;
 
                     let (result_content, is_error) = match result {
                         Err(_elapsed) => {
-                            log::error!("Tool {} timed out after {}s", tool_name, TOOL_TIMEOUT_SECS);
-                            (format!("Error: tool '{}' timed out after {}s", tool_name, TOOL_TIMEOUT_SECS), true)
+                            log::error!(
+                                "Tool {} timed out after {}s",
+                                tool_name,
+                                TOOL_TIMEOUT_SECS
+                            );
+                            (
+                                format!(
+                                    "Error: tool '{}' timed out after {}s",
+                                    tool_name, TOOL_TIMEOUT_SECS
+                                ),
+                                true,
+                            )
                         }
                         Ok(Ok(r)) if r.success => {
                             log::debug!("Tool {} succeeded: {}", tool_name, r.stdout);
@@ -5445,21 +6361,33 @@ async fn process_llm_stream(
 
                     // Step 5: Write result content via CRDT text ops
                     if let Some(ref rb_id) = result_block_id {
-                        if !result_content.is_empty() {
-                            if let Err(e) = documents.edit_text_as(
-                                context_id, rb_id, 0, &result_content, 0,
+                        if !result_content.is_empty()
+                            && let Err(e) = documents.edit_text_as(
+                                context_id,
+                                rb_id,
+                                0,
+                                &result_content,
+                                0,
                                 Some(PrincipalId::system()),
-                            ) {
-                                log::error!("Failed to write tool result text: {}", e);
-                            }
+                            )
+                        {
+                            log::error!("Failed to write tool result text: {}", e);
                         }
 
                         // Step 6: Set final status on result and call blocks
-                        let final_status = if is_error { Status::Error } else { Status::Done };
+                        let final_status = if is_error {
+                            Status::Error
+                        } else {
+                            Status::Done
+                        };
                         let _ = documents.set_status(context_id, rb_id, final_status);
                     }
                     if let Some(ref tcb_id) = tool_call_block_id {
-                        let final_status = if is_error { Status::Error } else { Status::Done };
+                        let final_status = if is_error {
+                            Status::Error
+                        } else {
+                            Status::Done
+                        };
                         let _ = documents.set_status(context_id, tcb_id, final_status);
                     }
 
@@ -5490,7 +6418,11 @@ async fn process_llm_stream(
 
         // Add assistant message with tool uses to conversation
         messages.push(LlmMessage::with_tool_uses(
-            if assistant_text.is_empty() { None } else { Some(assistant_text) },
+            if assistant_text.is_empty() {
+                None
+            } else {
+                Some(assistant_text)
+            },
             assistant_tool_uses,
         ));
 
@@ -5502,7 +6434,11 @@ async fn process_llm_stream(
 
     // Conversation history is already persisted in the per-context lock.
     // The MutexGuard drops when this function returns.
-    log::info!("Conversation cache updated: {} messages for cell {}", messages.len(), context_id);
+    log::info!(
+        "Conversation cache updated: {} messages for cell {}",
+        messages.len(),
+        context_id
+    );
 
     // Save final state after streaming completes
     if let Err(e) = documents.save_snapshot(context_id) {
@@ -5513,10 +6449,10 @@ async fn process_llm_stream(
     // A newer stream may have replaced our entry; removing it would be a bug.
     {
         let mut map = context_interrupts.write().await;
-        if let Some(state) = map.get(&context_id) {
-            if state.generation == interrupt_generation {
-                map.remove(&context_id);
-            }
+        if let Some(state) = map.get(&context_id)
+            && state.generation == interrupt_generation
+        {
+            map.remove(&context_id);
         }
     }
 
@@ -5664,7 +6600,9 @@ fn set_block_snapshot(
 }
 
 /// Convert a Cap'n Proto ToolKind to CRDT ToolKind.
-fn capnp_tool_kind_to_crdt(tk: Option<crate::kaijutsu_capnp::ToolKind>) -> Option<kaijutsu_crdt::ToolKind> {
+fn capnp_tool_kind_to_crdt(
+    tk: Option<crate::kaijutsu_capnp::ToolKind>,
+) -> Option<kaijutsu_crdt::ToolKind> {
     match tk? {
         crate::kaijutsu_capnp::ToolKind::Shell => Some(kaijutsu_crdt::ToolKind::Shell),
         crate::kaijutsu_capnp::ToolKind::Mcp => Some(kaijutsu_crdt::ToolKind::Mcp),
@@ -5682,7 +6620,9 @@ fn tool_kind_to_capnp(tk: kaijutsu_crdt::ToolKind) -> crate::kaijutsu_capnp::Too
 }
 
 /// Convert a Cap'n Proto DriftKind to CRDT DriftKind.
-fn capnp_drift_kind_to_crdt(dk: Option<crate::kaijutsu_capnp::DriftKind>) -> Option<kaijutsu_crdt::DriftKind> {
+fn capnp_drift_kind_to_crdt(
+    dk: Option<crate::kaijutsu_capnp::DriftKind>,
+) -> Option<kaijutsu_crdt::DriftKind> {
     match dk? {
         crate::kaijutsu_capnp::DriftKind::Push => Some(kaijutsu_crdt::DriftKind::Push),
         crate::kaijutsu_capnp::DriftKind::Pull => Some(kaijutsu_crdt::DriftKind::Pull),
@@ -5708,9 +6648,7 @@ fn parse_block_query(
     reader: &crate::kaijutsu_capnp::block_query::Reader<'_>,
 ) -> Result<kaijutsu_types::BlockQuery, capnp::Error> {
     match reader.which()? {
-        crate::kaijutsu_capnp::block_query::All(()) => {
-            Ok(kaijutsu_types::BlockQuery::All)
-        }
+        crate::kaijutsu_capnp::block_query::All(()) => Ok(kaijutsu_types::BlockQuery::All),
         crate::kaijutsu_capnp::block_query::ByIds(ids_reader) => {
             let ids_reader = ids_reader?;
             let mut ids = Vec::with_capacity(ids_reader.len() as usize);
@@ -5744,7 +6682,9 @@ fn parse_block_filter(
             });
         }
         if kinds.is_empty() {
-            return Err(capnp::Error::failed("hasKinds=true but kinds list is empty".into()));
+            return Err(capnp::Error::failed(
+                "hasKinds=true but kinds list is empty".into(),
+            ));
         }
         kinds
     } else {
@@ -5764,7 +6704,9 @@ fn parse_block_filter(
             });
         }
         if roles.is_empty() {
-            return Err(capnp::Error::failed("hasRoles=true but roles list is empty".into()));
+            return Err(capnp::Error::failed(
+                "hasRoles=true but roles list is empty".into(),
+            ));
         }
         roles
     } else {
@@ -5783,7 +6725,9 @@ fn parse_block_filter(
             });
         }
         if statuses.is_empty() {
-            return Err(capnp::Error::failed("hasStatuses=true but statuses list is empty".into()));
+            return Err(capnp::Error::failed(
+                "hasStatuses=true but statuses list is empty".into(),
+            ));
         }
         statuses
     } else {
@@ -5816,7 +6760,7 @@ fn parse_block_event_filter(
             .get_context_ids()
             .map(|list| {
                 list.iter()
-                    .filter_map(|bytes| bytes.ok().and_then(|b| ContextId::try_from_slice(b)))
+                    .filter_map(|bytes| bytes.ok().and_then(ContextId::try_from_slice))
                     .collect()
             })
             .unwrap_or_default()
@@ -5954,14 +6898,16 @@ fn parse_block_snapshot(
         None
     };
 
-    let tool_input = reader.get_tool_input()
+    let tool_input = reader
+        .get_tool_input()
         .ok()
         .and_then(|s| s.to_str().ok())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_owned());
 
     // Read output data from wire protocol
-    let output = reader.get_output_data()
+    let output = reader
+        .get_output_data()
         .ok()
         .and_then(|r| parse_output_data(r).ok());
 
@@ -5978,45 +6924,78 @@ fn parse_block_snapshot(
         created_at: reader.get_created_at(),
         tool_kind: if reader.get_has_tool_kind() {
             capnp_tool_kind_to_crdt(reader.get_tool_kind().ok())
-        } else { None },
-        tool_name: reader.get_tool_name().ok().and_then(|s| s.to_str().ok()).filter(|s| !s.is_empty()).map(|s| s.to_owned()),
+        } else {
+            None
+        },
+        tool_name: reader
+            .get_tool_name()
+            .ok()
+            .and_then(|s| s.to_str().ok())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_owned()),
         tool_input,
         tool_use_id: if reader.has_tool_use_id() {
-            reader.get_tool_use_id().ok()
+            reader
+                .get_tool_use_id()
+                .ok()
                 .and_then(|s| s.to_str().ok())
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_owned())
-        } else { None },
+        } else {
+            None
+        },
         tool_call_id,
-        exit_code: if reader.get_has_exit_code() { Some(reader.get_exit_code()) } else { None },
+        exit_code: if reader.get_has_exit_code() {
+            Some(reader.get_exit_code())
+        } else {
+            None
+        },
         is_error: reader.get_is_error(),
         output,
         file_path: if reader.has_file_path() {
-            reader.get_file_path().ok()
+            reader
+                .get_file_path()
+                .ok()
                 .and_then(|s| s.to_str().ok())
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_owned())
-        } else { None },
+        } else {
+            None
+        },
         content_type: if reader.has_content_type() {
-            reader.get_content_type().ok()
+            reader
+                .get_content_type()
+                .ok()
                 .and_then(|s| s.to_str().ok())
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_owned())
-        } else { None },
+        } else {
+            None
+        },
         order_key: None,
         source_context: if reader.has_source_context() {
-            reader.get_source_context().ok()
-                .and_then(|bytes| ContextId::try_from_slice(bytes))
-        } else { None },
+            reader
+                .get_source_context()
+                .ok()
+                .and_then(ContextId::try_from_slice)
+        } else {
+            None
+        },
         source_model: if reader.has_source_model() {
-            reader.get_source_model().ok()
+            reader
+                .get_source_model()
+                .ok()
                 .and_then(|s| s.to_str().ok())
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_owned())
-        } else { None },
+        } else {
+            None
+        },
         drift_kind: if reader.get_has_drift_kind() {
             capnp_drift_kind_to_crdt(reader.get_drift_kind().ok())
-        } else { None },
+        } else {
+            None
+        },
         updated_at: 0, // Not in wire protocol; receiver advances clock from header sync
         status_at: 0,
         collapsed_at: 0,
@@ -6092,7 +7071,10 @@ impl vfs::Server for VfsImpl {
         let kernel = self.kernel.clone();
 
         Promise::from_future(async move {
-            let attr = kernel.getattr(Path::new(&path)).await.map_err(vfs_err_to_capnp)?;
+            let attr = kernel
+                .getattr(Path::new(&path))
+                .await
+                .map_err(vfs_err_to_capnp)?;
             let mut builder = results.get().init_attr();
             set_file_attr(&mut builder, &attr);
             Ok(())
@@ -6114,14 +7096,19 @@ impl vfs::Server for VfsImpl {
         let kernel = self.kernel.clone();
 
         Promise::from_future(async move {
-            let entries = kernel.readdir(Path::new(&path)).await.map_err(vfs_err_to_capnp)?;
+            let entries = kernel
+                .readdir(Path::new(&path))
+                .await
+                .map_err(vfs_err_to_capnp)?;
             let mut builder = results.get().init_entries(entries.len() as u32);
             for (i, entry) in entries.iter().enumerate() {
                 let mut e = builder.reborrow().get(i as u32);
                 e.set_name(&entry.name);
                 e.set_kind(match entry.kind {
                     kaijutsu_kernel::FileType::File => crate::kaijutsu_capnp::FileType::File,
-                    kaijutsu_kernel::FileType::Directory => crate::kaijutsu_capnp::FileType::Directory,
+                    kaijutsu_kernel::FileType::Directory => {
+                        crate::kaijutsu_capnp::FileType::Directory
+                    }
                     kaijutsu_kernel::FileType::Symlink => crate::kaijutsu_capnp::FileType::Symlink,
                 });
             }
@@ -6171,8 +7158,11 @@ impl vfs::Server for VfsImpl {
         let kernel = self.kernel.clone();
 
         Promise::from_future(async move {
-            let target = kernel.readlink(Path::new(&path)).await.map_err(vfs_err_to_capnp)?;
-            results.get().set_target(&target.to_string_lossy());
+            let target = kernel
+                .readlink(Path::new(&path))
+                .await
+                .map_err(vfs_err_to_capnp)?;
+            results.get().set_target(target.to_string_lossy());
             Ok(())
         })
     }
@@ -6276,7 +7266,10 @@ impl vfs::Server for VfsImpl {
         let kernel = self.kernel.clone();
 
         Promise::from_future(async move {
-            kernel.unlink(Path::new(&path)).await.map_err(vfs_err_to_capnp)?;
+            kernel
+                .unlink(Path::new(&path))
+                .await
+                .map_err(vfs_err_to_capnp)?;
             Ok(())
         })
     }
@@ -6296,7 +7289,10 @@ impl vfs::Server for VfsImpl {
         let kernel = self.kernel.clone();
 
         Promise::from_future(async move {
-            kernel.rmdir(Path::new(&path)).await.map_err(vfs_err_to_capnp)?;
+            kernel
+                .rmdir(Path::new(&path))
+                .await
+                .map_err(vfs_err_to_capnp)?;
             Ok(())
         })
     }
@@ -6487,7 +7483,7 @@ impl vfs::Server for VfsImpl {
         Promise::from_future(async move {
             match kernel.real_path(Path::new(&path)).await {
                 Ok(Some(real)) => {
-                    results.get().set_real_path(&real.to_string_lossy());
+                    results.get().set_real_path(real.to_string_lossy());
                     Ok(())
                 }
                 Ok(None) => {
@@ -6504,5 +7500,3 @@ impl vfs::Server for VfsImpl {
 // ============================================================================
 // Synthesis (Rhai-driven keyword extraction + representative block selection)
 // ============================================================================
-
-

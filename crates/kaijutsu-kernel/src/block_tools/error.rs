@@ -18,7 +18,9 @@ pub enum EditError {
     },
 
     /// Content mismatch during compare-and-set validation.
-    #[error("content mismatch at lines {start_line}..{end_line}\nexpected:\n{expected}\nactual:\n{actual}")]
+    #[error(
+        "content mismatch at lines {start_line}..{end_line}\nexpected:\n{expected}\nactual:\n{actual}"
+    )]
     ContentMismatch {
         /// The expected content.
         expected: String,

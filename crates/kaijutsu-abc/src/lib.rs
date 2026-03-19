@@ -331,7 +331,10 @@ fn format_element(output: &mut String, element: &Element) {
                 format_element(output, elem);
             }
         }
-        Element::GraceNotes { acciaccatura, notes } => {
+        Element::GraceNotes {
+            acciaccatura,
+            notes,
+        } => {
             if *acciaccatura {
                 output.push_str("{/");
             } else {
@@ -428,7 +431,11 @@ mod tests {
 
     fn round_trip(abc: &str) -> String {
         let result = parse(abc);
-        assert!(!result.has_errors(), "parse errors: {:?}", result.errors().collect::<Vec<_>>());
+        assert!(
+            !result.has_errors(),
+            "parse errors: {:?}",
+            result.errors().collect::<Vec<_>>()
+        );
         to_abc(&result.value)
     }
 
@@ -436,27 +443,43 @@ mod tests {
     fn tuplet_round_trip_preserves_ratio() {
         let abc = "X:1\nT:Test\nM:4/4\nL:1/8\nK:C\n(3:2ABC\n";
         let output = round_trip(abc);
-        assert!(output.contains("(3:2"), "expected tuplet (3:2, got: {}", output);
+        assert!(
+            output.contains("(3:2"),
+            "expected tuplet (3:2, got: {}",
+            output
+        );
     }
 
     #[test]
     fn grace_notes_round_trip() {
         let abc = "X:1\nT:Test\nM:4/4\nL:1/8\nK:C\n{AB}c\n";
         let output = round_trip(abc);
-        assert!(output.contains("{AB}"), "expected grace notes {{AB}}, got: {}", output);
+        assert!(
+            output.contains("{AB}"),
+            "expected grace notes {{AB}}, got: {}",
+            output
+        );
     }
 
     #[test]
     fn acciaccatura_round_trip() {
         let abc = "X:1\nT:Test\nM:4/4\nL:1/8\nK:C\n{/A}B\n";
         let output = round_trip(abc);
-        assert!(output.contains("{/A}"), "expected acciaccatura {{/A}}, got: {}", output);
+        assert!(
+            output.contains("{/A}"),
+            "expected acciaccatura {{/A}}, got: {}",
+            output
+        );
     }
 
     #[test]
     fn chord_symbol_round_trip() {
         let abc = "X:1\nT:Test\nM:4/4\nL:1/8\nK:C\n\"Am\"A2\n";
         let output = round_trip(abc);
-        assert!(output.contains("\"Am\""), "expected chord symbol \"Am\", got: {}", output);
+        assert!(
+            output.contains("\"Am\""),
+            "expected chord symbol \"Am\", got: {}",
+            output
+        );
     }
 }

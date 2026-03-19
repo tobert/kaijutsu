@@ -43,7 +43,10 @@ fn svg_has_clef_path() {
 
     let svg = engrave_to_svg(&result.value, &default_options());
     // The treble clef should produce a <path> element
-    assert!(svg.contains("<path"), "Should contain a path element (clef glyph)");
+    assert!(
+        svg.contains("<path"),
+        "Should contain a path element (clef glyph)"
+    );
 }
 
 #[test]
@@ -57,7 +60,15 @@ fn key_signature_adds_accidental_glyphs() {
     // Should have at least one glyph with the sharp codepoint (0xE262)
     let sharp_glyphs: Vec<_> = elements
         .iter()
-        .filter(|e| matches!(e, kaijutsu_abc::engrave::EngravingElement::Glyph { codepoint: 0xE262, .. }))
+        .filter(|e| {
+            matches!(
+                e,
+                kaijutsu_abc::engrave::EngravingElement::Glyph {
+                    codepoint: 0xE262,
+                    ..
+                }
+            )
+        })
         .collect();
     assert_eq!(
         sharp_glyphs.len(),
@@ -76,7 +87,15 @@ fn flat_key_signature() {
     let elements = layout::engrave(&result.value, &default_options());
     let flat_glyphs: Vec<_> = elements
         .iter()
-        .filter(|e| matches!(e, kaijutsu_abc::engrave::EngravingElement::Glyph { codepoint: 0xE260, .. }))
+        .filter(|e| {
+            matches!(
+                e,
+                kaijutsu_abc::engrave::EngravingElement::Glyph {
+                    codepoint: 0xE260,
+                    ..
+                }
+            )
+        })
         .collect();
     assert_eq!(
         flat_glyphs.len(),
@@ -95,7 +114,15 @@ fn time_signature_glyphs() {
     // Should have time sig digit 4 (U+E084) twice (4/4)
     let digit_4_count = elements
         .iter()
-        .filter(|e| matches!(e, kaijutsu_abc::engrave::EngravingElement::Glyph { codepoint: 0xE084, .. }))
+        .filter(|e| {
+            matches!(
+                e,
+                kaijutsu_abc::engrave::EngravingElement::Glyph {
+                    codepoint: 0xE084,
+                    ..
+                }
+            )
+        })
         .count();
     assert_eq!(digit_4_count, 2, "4/4 should produce two '4' digit glyphs");
 }
@@ -136,7 +163,10 @@ fn all_elements_have_source_spans() {
     // Every rendered element should have data-span-start and data-span-end
     for line in svg.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with("<line") || trimmed.starts_with("<path") || trimmed.starts_with("<text") {
+        if trimmed.starts_with("<line")
+            || trimmed.starts_with("<path")
+            || trimmed.starts_with("<text")
+        {
             assert!(
                 trimmed.contains("data-span-start="),
                 "Element missing data-span-start: {}",
@@ -165,13 +195,20 @@ fn multi_measure_layout_does_not_overflow() {
         let after = &svg[vb_start + 9..];
         if let Some(vb_end) = after.find('"') {
             let vb = &after[..vb_end];
-            let parts: Vec<f64> = vb.split_whitespace().filter_map(|s| s.parse().ok()).collect();
+            let parts: Vec<f64> = vb
+                .split_whitespace()
+                .filter_map(|s| s.parse().ok())
+                .collect();
             assert_eq!(parts.len(), 4, "viewBox should have 4 values");
             let width = parts[2];
             let height = parts[3];
             assert!(width > 100.0, "Width should be > 100, got {}", width);
             assert!(height > 40.0, "Height should be > 40, got {}", height);
-            assert!(width < 10000.0, "Width should be reasonable (<10000), got {}", width);
+            assert!(
+                width < 10000.0,
+                "Width should be reasonable (<10000), got {}",
+                width
+            );
         }
     }
 }
@@ -197,11 +234,20 @@ fn rest_produces_rest_glyph() {
     // Quarter rest = U+E4E5, half rest = U+E4E4
     let rest_glyphs: Vec<_> = elements
         .iter()
-        .filter(|e| matches!(e, kaijutsu_abc::engrave::EngravingElement::Glyph {
-            codepoint: 0xE4E3..=0xE4E7, ..
-        }))
+        .filter(|e| {
+            matches!(
+                e,
+                kaijutsu_abc::engrave::EngravingElement::Glyph {
+                    codepoint: 0xE4E3..=0xE4E7,
+                    ..
+                }
+            )
+        })
         .collect();
-    assert!(!rest_glyphs.is_empty(), "Should have at least one rest glyph");
+    assert!(
+        !rest_glyphs.is_empty(),
+        "Should have at least one rest glyph"
+    );
 }
 
 #[test]
@@ -211,10 +257,7 @@ fn title_appears_as_text_element() {
     assert!(!result.has_errors());
 
     let svg = engrave_to_svg(&result.value, &default_options());
-    assert!(
-        svg.contains("Cooley"),
-        "SVG should contain the tune title"
-    );
+    assert!(svg.contains("Cooley"), "SVG should contain the tune title");
 }
 
 #[test]
@@ -237,7 +280,15 @@ fn accidental_note_gets_accidental_glyph() {
     // Should have a sharp glyph (0xE262) for the ^C
     let sharp_count = elements
         .iter()
-        .filter(|e| matches!(e, kaijutsu_abc::engrave::EngravingElement::Glyph { codepoint: 0xE262, .. }))
+        .filter(|e| {
+            matches!(
+                e,
+                kaijutsu_abc::engrave::EngravingElement::Glyph {
+                    codepoint: 0xE262,
+                    ..
+                }
+            )
+        })
         .count();
     assert!(
         sharp_count >= 1,

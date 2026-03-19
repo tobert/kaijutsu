@@ -38,8 +38,16 @@ pub(crate) fn order_midpoint(a: &str, b: &str) -> String {
     let mut result = Vec::new();
 
     for i in 0..=max_len {
-        let a_val = if i < a_bytes.len() { base62_index(a_bytes[i]) } else { 0 };
-        let b_val = if i < b_bytes.len() { base62_index(b_bytes[i]) } else { 62 };
+        let a_val = if i < a_bytes.len() {
+            base62_index(a_bytes[i])
+        } else {
+            0
+        };
+        let b_val = if i < b_bytes.len() {
+            base62_index(b_bytes[i])
+        } else {
+            62
+        };
 
         if a_val + 1 < b_val {
             let mid = (a_val + b_val) / 2;
@@ -49,7 +57,11 @@ pub(crate) fn order_midpoint(a: &str, b: &str) -> String {
             result.push(BASE62[a_val]);
         } else {
             result.push(BASE62[a_val]);
-            let a_next = if i + 1 < a_bytes.len() { base62_index(a_bytes[i + 1]) } else { 0 };
+            let a_next = if i + 1 < a_bytes.len() {
+                base62_index(a_bytes[i + 1])
+            } else {
+                0
+            };
             let mid = (a_next + 62) / 2;
             result.push(BASE62[mid]);
             return String::from_utf8(result).unwrap_or_else(|_| "V".to_string());
@@ -160,7 +172,11 @@ impl BlockContent {
     ///
     /// If the snapshot carries an `order_key`, it is used; otherwise falls back
     /// to `fallback_order_key`.
-    pub fn from_snapshot(snap: &BlockSnapshot, agent_id: PrincipalId, fallback_order_key: String) -> Self {
+    pub fn from_snapshot(
+        snap: &BlockSnapshot,
+        agent_id: PrincipalId,
+        fallback_order_key: String,
+    ) -> Self {
         let header = BlockHeader::from_snapshot(snap);
         let order_key = snap.order_key.clone().unwrap_or(fallback_order_key);
         let mut block = Self::with_content(header, &snap.content, agent_id, order_key);
@@ -185,7 +201,11 @@ impl BlockContent {
     /// is completely empty — no `create_text("content")` op. The sender's full
     /// DTE ops (including the structure creation) will be merged in, preserving
     /// causal history so subsequent incremental DTE ops can merge successfully.
-    pub fn from_snapshot_for_sync(snap: &BlockSnapshot, agent_id: PrincipalId, fallback_order_key: String) -> Self {
+    pub fn from_snapshot_for_sync(
+        snap: &BlockSnapshot,
+        agent_id: PrincipalId,
+        fallback_order_key: String,
+    ) -> Self {
         let header = BlockHeader::from_snapshot(snap);
         let order_key = snap.order_key.clone().unwrap_or(fallback_order_key);
 
@@ -194,7 +214,7 @@ impl BlockContent {
         let dte_uuid = Uuid::from_bytes(*agent_id.as_bytes());
         let agent = doc.create_agent(dte_uuid);
 
-        let block = Self {
+        Self {
             header,
             doc,
             agent,
@@ -212,8 +232,7 @@ impl BlockContent {
             collapsed: snap.collapsed,
             ephemeral: snap.ephemeral,
             deleted: false,
-        };
-        block
+        }
     }
 
     // ── Content access ──────────────────────────────────────────────────
@@ -389,12 +408,14 @@ impl BlockContent {
 
     /// Merge remote operations into this block's content.
     pub fn merge_ops(&mut self, ops: SerializedOpsOwned) -> crate::Result<()> {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.doc.merge_ops(ops)
-        }));
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.doc.merge_ops(ops)));
         match result {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => Err(crate::CrdtError::Internal(format!("block merge error: {:?}", e))),
+            Ok(Err(e)) => Err(crate::CrdtError::Internal(format!(
+                "block merge error: {:?}",
+                e
+            ))),
             Err(_) => Err(crate::CrdtError::Internal(
                 "block CRDT merge panicked".into(),
             )),
@@ -451,38 +472,58 @@ impl BlockContent {
     /// independently compute the same result, guaranteeing convergence.
     pub fn merge_header(&mut self, remote: &BlockHeader) {
         // status
-        if field_wins(remote.status_at, self.header.status_at,
-                      &remote.status, &self.header.status) {
+        if field_wins(
+            remote.status_at,
+            self.header.status_at,
+            &remote.status,
+            &self.header.status,
+        ) {
             self.header.status = remote.status;
             self.header.status_at = remote.status_at;
         }
 
         // collapsed
-        if field_wins(remote.collapsed_at, self.header.collapsed_at,
-                      &remote.collapsed, &self.header.collapsed) {
+        if field_wins(
+            remote.collapsed_at,
+            self.header.collapsed_at,
+            &remote.collapsed,
+            &self.header.collapsed,
+        ) {
             self.header.collapsed = remote.collapsed;
             self.collapsed = remote.collapsed;
             self.header.collapsed_at = remote.collapsed_at;
         }
 
         // ephemeral
-        if field_wins(remote.ephemeral_at, self.header.ephemeral_at,
-                      &remote.ephemeral, &self.header.ephemeral) {
+        if field_wins(
+            remote.ephemeral_at,
+            self.header.ephemeral_at,
+            &remote.ephemeral,
+            &self.header.ephemeral,
+        ) {
             self.header.ephemeral = remote.ephemeral;
             self.ephemeral = remote.ephemeral;
             self.header.ephemeral_at = remote.ephemeral_at;
         }
 
         // compacted
-        if field_wins(remote.compacted_at, self.header.compacted_at,
-                      &remote.compacted, &self.header.compacted) {
+        if field_wins(
+            remote.compacted_at,
+            self.header.compacted_at,
+            &remote.compacted,
+            &self.header.compacted,
+        ) {
             self.header.compacted = remote.compacted;
             self.header.compacted_at = remote.compacted_at;
         }
 
         // tool_meta (tool_kind, exit_code, is_error)
-        if field_wins(remote.tool_meta_at, self.header.tool_meta_at,
-                      &remote.tool_kind, &self.header.tool_kind) {
+        if field_wins(
+            remote.tool_meta_at,
+            self.header.tool_meta_at,
+            &remote.tool_kind,
+            &self.header.tool_kind,
+        ) {
             self.header.tool_kind = remote.tool_kind;
             self.header.exit_code = remote.exit_code;
             self.header.is_error = remote.is_error;
@@ -490,7 +531,6 @@ impl BlockContent {
         }
 
         // Recompute aggregate timestamp
-        self.header.updated_at = self.header.max_field_ts()
-            .max(remote.max_field_ts());
+        self.header.updated_at = self.header.max_field_ts().max(remote.max_field_ts());
     }
 }

@@ -4,7 +4,7 @@
 //! This module re-exports the relevant types for convenience.
 
 // Re-export key types from diamond_types_extended for sync operations
-pub use diamond_types_extended::{Frontier, SerializedOps, SerializedOpsOwned, LV};
+pub use diamond_types_extended::{Frontier, LV, SerializedOps, SerializedOpsOwned};
 
 #[cfg(test)]
 mod tests {

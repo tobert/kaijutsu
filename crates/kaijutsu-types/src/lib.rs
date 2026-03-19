@@ -43,32 +43,31 @@
 //! | [`BlockSnapshot`] | Serializable block state                     |
 //! |-------------------|----------------------------------------------|
 
-pub mod ids;
-pub mod enums;
-pub mod principal;
 pub mod block;
 pub mod compaction;
 pub mod context;
+pub mod enums;
+pub mod ids;
 pub mod kernel;
+pub mod principal;
 pub mod session;
 
 // Re-export kaish output types for structured tool results.
 pub use kaish_types::output::{EntryType as OutputEntryType, OutputData, OutputNode};
 
 // Re-export primary types at crate root for convenience.
-pub use ids::{ContextId, KernelId, PrincipalId, PresetId, SessionId, WorkspaceId};
-pub use ids::{PrefixError, PrefixResolvable, resolve_prefix, resolve_context_prefix};
-pub use principal::{Principal, Credential, CredentialKind};
 pub use block::{
-    BlockEventFilter, BlockFilter, BlockFlowKind, BlockHeader, BlockId, BlockKind,
-    BlockQuery, BlockSnapshot, BlockSnapshotBuilder, DriftKind, MAX_DAG_DEPTH, Role,
-    Status, ToolKind,
+    BlockEventFilter, BlockFilter, BlockFlowKind, BlockHeader, BlockId, BlockKind, BlockQuery,
+    BlockSnapshot, BlockSnapshotBuilder, DriftKind, MAX_DAG_DEPTH, Role, Status, ToolKind,
 };
 pub use compaction::CompactionBoundary;
 pub use context::{Context, fork_lineage};
-pub use kernel::Kernel;
-pub use session::Session;
 pub use enums::{ConsentMode, DocKind, EdgeKind, ForkKind, ToolFilter};
+pub use ids::{ContextId, KernelId, PresetId, PrincipalId, SessionId, WorkspaceId};
+pub use ids::{PrefixError, PrefixResolvable, resolve_context_prefix, resolve_prefix};
+pub use kernel::Kernel;
+pub use principal::{Credential, CredentialKind, Principal};
+pub use session::Session;
 
 /// Current time as Unix milliseconds. Canonical source — used by constructors
 /// throughout the crate and by downstream crates (drift, kernel_db, rpc).

@@ -43,7 +43,9 @@ pub fn format_context_tree(dag: &[(ContextRow, i64)], current: ContextId) -> Str
         let id_short = ctx.context_id.short();
 
         let prefix = if *depth > 0 { "└─ " } else { "" };
-        lines.push(format!("{marker} {indent}{prefix}{id_short}  {label:<16} {model}"));
+        lines.push(format!(
+            "{marker} {indent}{prefix}{id_short}  {label:<16} {model}"
+        ));
     }
 
     lines.join("\n")
@@ -65,7 +67,10 @@ pub fn format_context_info(
         lines.push(format!("Context: {}", label_display));
     }
     lines.push(format!("ID:      {}", ctx.context_id.short()));
-    lines.push(format!("Model:   {}", format_model(&ctx.provider, &ctx.model)));
+    lines.push(format!(
+        "Model:   {}",
+        format_model(&ctx.provider, &ctx.model)
+    ));
 
     if let Some(forked_from) = ctx.forked_from {
         let kind = ctx
@@ -140,12 +145,15 @@ pub fn format_fork_lineage(lineage: &[(ContextRow, i64)], current: ContextId) ->
             format!("{} ← ", "·".repeat(*depth as usize))
         };
 
-        let kind = ctx.fork_kind
+        let kind = ctx
+            .fork_kind
             .as_ref()
             .map(|k| format!(" ({k:?})"))
             .unwrap_or_default();
 
-        lines.push(format!("{marker} {depth_indicator}{id_short}  {label:<16} {model}{kind}"));
+        lines.push(format!(
+            "{marker} {depth_indicator}{id_short}  {label:<16} {model}{kind}"
+        ));
     }
     lines.join("\n")
 }
@@ -161,11 +169,17 @@ pub fn format_drift_history(
     if !outgoing.is_empty() {
         lines.push("Sent:".to_string());
         for edge in outgoing {
-            let target_label = db.get_context(edge.target_id).ok()
+            let target_label = db
+                .get_context(edge.target_id)
+                .ok()
                 .flatten()
                 .and_then(|r| r.label)
                 .unwrap_or_else(|| edge.target_id.short());
-            lines.push(format!("  → {}  {}", target_label, format_timestamp(edge.created_at)));
+            lines.push(format!(
+                "  → {}  {}",
+                target_label,
+                format_timestamp(edge.created_at)
+            ));
         }
     }
 
@@ -175,11 +189,17 @@ pub fn format_drift_history(
         }
         lines.push("Received:".to_string());
         for edge in incoming {
-            let source_label = db.get_context(edge.source_id).ok()
+            let source_label = db
+                .get_context(edge.source_id)
+                .ok()
                 .flatten()
                 .and_then(|r| r.label)
                 .unwrap_or_else(|| edge.source_id.short());
-            lines.push(format!("  ← {}  {}", source_label, format_timestamp(edge.created_at)));
+            lines.push(format!(
+                "  ← {}  {}",
+                source_label,
+                format_timestamp(edge.created_at)
+            ));
         }
     }
 
@@ -244,7 +264,10 @@ mod tests {
     fn table_marks_current() {
         let current = ContextId::new();
         let other = ContextId::new();
-        let rows = vec![make_row(Some("default"), current), make_row(Some("alt"), other)];
+        let rows = vec![
+            make_row(Some("default"), current),
+            make_row(Some("alt"), other),
+        ];
 
         let output = format_context_table(&rows, current);
         assert!(output.contains("* "));
@@ -271,10 +294,7 @@ mod tests {
 
     #[test]
     fn model_format_variants() {
-        assert_eq!(
-            format_model(&Some("a".into()), &Some("b".into())),
-            "a/b"
-        );
+        assert_eq!(format_model(&Some("a".into()), &Some("b".into())), "a/b");
         assert_eq!(format_model(&None, &Some("b".into())), "b");
         assert_eq!(format_model(&None, &None), "(no model)");
     }

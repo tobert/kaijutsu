@@ -134,16 +134,19 @@ pub fn register_binding_fns(engine: &mut Engine, defaults: Vec<Binding>) {
     });
 
     // Register `binding(key, context, action, label)` → Map
-    engine.register_fn("binding", |key: &str, context: &str, action: &str, label: &str| -> Map {
-        let mut m = Map::new();
-        m.insert("key".into(), Dynamic::from(key.to_string()));
-        m.insert("modifiers".into(), Dynamic::from(String::new()));
-        m.insert("context".into(), Dynamic::from(context.to_string()));
-        m.insert("action".into(), Dynamic::from(action.to_string()));
-        m.insert("gamepad".into(), Dynamic::from(false));
-        m.insert("label".into(), Dynamic::from(label.to_string()));
-        m
-    });
+    engine.register_fn(
+        "binding",
+        |key: &str, context: &str, action: &str, label: &str| -> Map {
+            let mut m = Map::new();
+            m.insert("key".into(), Dynamic::from(key.to_string()));
+            m.insert("modifiers".into(), Dynamic::from(String::new()));
+            m.insert("context".into(), Dynamic::from(context.to_string()));
+            m.insert("action".into(), Dynamic::from(action.to_string()));
+            m.insert("gamepad".into(), Dynamic::from(false));
+            m.insert("label".into(), Dynamic::from(label.to_string()));
+            m
+        },
+    );
 
     // Register `binding_mod(key, mods, context, action, label)` → Map
     engine.register_fn(
@@ -193,7 +196,10 @@ fn binding_to_map(b: &Binding) -> Map {
         super::binding::InputSource::GamepadButton(btn) => (format!("{:?}", btn), true),
     };
     m.insert("key".into(), Dynamic::from(key_str));
-    m.insert("modifiers".into(), Dynamic::from(modifiers_to_str(&b.modifiers)));
+    m.insert(
+        "modifiers".into(),
+        Dynamic::from(modifiers_to_str(&b.modifiers)),
+    );
     m.insert("context".into(), Dynamic::from(context_to_str(b.context)));
     m.insert("action".into(), Dynamic::from(action_to_str(&b.action)));
     m.insert("gamepad".into(), Dynamic::from(is_gamepad));
@@ -206,7 +212,10 @@ fn binding_from_map(m: Map) -> Result<Binding, String> {
     let mods_str = get_str(&m, "modifiers").unwrap_or_default();
     let ctx_str = get_str(&m, "context")?;
     let action_str = get_str(&m, "action")?;
-    let is_gamepad = m.get("gamepad").and_then(|v| v.as_bool().ok()).unwrap_or(false);
+    let is_gamepad = m
+        .get("gamepad")
+        .and_then(|v| v.as_bool().ok())
+        .unwrap_or(false);
     let label = get_str(&m, "label").unwrap_or_default();
 
     let context = parse_context(&ctx_str)?;
@@ -219,7 +228,13 @@ fn binding_from_map(m: Map) -> Result<Binding, String> {
         super::binding::InputSource::Key(parse_key_code(&key_str)?)
     };
 
-    Ok(Binding { source, modifiers, context, action, description: label })
+    Ok(Binding {
+        source,
+        modifiers,
+        context,
+        action,
+        description: label,
+    })
 }
 
 fn get_str(m: &Map, key: &str) -> Result<String, String> {
@@ -232,10 +247,18 @@ fn get_str(m: &Map, key: &str) -> Result<String, String> {
 
 fn modifiers_to_str(m: &Modifiers) -> String {
     let mut parts = Vec::new();
-    if m.ctrl { parts.push("CTRL"); }
-    if m.shift { parts.push("SHIFT"); }
-    if m.alt { parts.push("ALT"); }
-    if m.super_key { parts.push("SUPER"); }
+    if m.ctrl {
+        parts.push("CTRL");
+    }
+    if m.shift {
+        parts.push("SHIFT");
+    }
+    if m.alt {
+        parts.push("ALT");
+    }
+    if m.super_key {
+        parts.push("SUPER");
+    }
     parts.join("+")
 }
 
@@ -413,30 +436,54 @@ fn parse_action(s: &str) -> Result<Action, String> {
 fn parse_key_code(s: &str) -> Result<KeyCode, String> {
     // Map string names to KeyCode variants
     match s {
-        "KeyA" => Ok(KeyCode::KeyA), "KeyB" => Ok(KeyCode::KeyB),
-        "KeyC" => Ok(KeyCode::KeyC), "KeyD" => Ok(KeyCode::KeyD),
-        "KeyE" => Ok(KeyCode::KeyE), "KeyF" => Ok(KeyCode::KeyF),
-        "KeyG" => Ok(KeyCode::KeyG), "KeyH" => Ok(KeyCode::KeyH),
-        "KeyI" => Ok(KeyCode::KeyI), "KeyJ" => Ok(KeyCode::KeyJ),
-        "KeyK" => Ok(KeyCode::KeyK), "KeyL" => Ok(KeyCode::KeyL),
-        "KeyM" => Ok(KeyCode::KeyM), "KeyN" => Ok(KeyCode::KeyN),
-        "KeyO" => Ok(KeyCode::KeyO), "KeyP" => Ok(KeyCode::KeyP),
-        "KeyQ" => Ok(KeyCode::KeyQ), "KeyR" => Ok(KeyCode::KeyR),
-        "KeyS" => Ok(KeyCode::KeyS), "KeyT" => Ok(KeyCode::KeyT),
-        "KeyU" => Ok(KeyCode::KeyU), "KeyV" => Ok(KeyCode::KeyV),
-        "KeyW" => Ok(KeyCode::KeyW), "KeyX" => Ok(KeyCode::KeyX),
-        "KeyY" => Ok(KeyCode::KeyY), "KeyZ" => Ok(KeyCode::KeyZ),
-        "Digit0" => Ok(KeyCode::Digit0), "Digit1" => Ok(KeyCode::Digit1),
-        "Digit2" => Ok(KeyCode::Digit2), "Digit3" => Ok(KeyCode::Digit3),
-        "Digit4" => Ok(KeyCode::Digit4), "Digit5" => Ok(KeyCode::Digit5),
-        "Digit6" => Ok(KeyCode::Digit6), "Digit7" => Ok(KeyCode::Digit7),
-        "Digit8" => Ok(KeyCode::Digit8), "Digit9" => Ok(KeyCode::Digit9),
-        "F1" => Ok(KeyCode::F1), "F2" => Ok(KeyCode::F2),
-        "F3" => Ok(KeyCode::F3), "F4" => Ok(KeyCode::F4),
-        "F5" => Ok(KeyCode::F5), "F6" => Ok(KeyCode::F6),
-        "F7" => Ok(KeyCode::F7), "F8" => Ok(KeyCode::F8),
-        "F9" => Ok(KeyCode::F9), "F10" => Ok(KeyCode::F10),
-        "F11" => Ok(KeyCode::F11), "F12" => Ok(KeyCode::F12),
+        "KeyA" => Ok(KeyCode::KeyA),
+        "KeyB" => Ok(KeyCode::KeyB),
+        "KeyC" => Ok(KeyCode::KeyC),
+        "KeyD" => Ok(KeyCode::KeyD),
+        "KeyE" => Ok(KeyCode::KeyE),
+        "KeyF" => Ok(KeyCode::KeyF),
+        "KeyG" => Ok(KeyCode::KeyG),
+        "KeyH" => Ok(KeyCode::KeyH),
+        "KeyI" => Ok(KeyCode::KeyI),
+        "KeyJ" => Ok(KeyCode::KeyJ),
+        "KeyK" => Ok(KeyCode::KeyK),
+        "KeyL" => Ok(KeyCode::KeyL),
+        "KeyM" => Ok(KeyCode::KeyM),
+        "KeyN" => Ok(KeyCode::KeyN),
+        "KeyO" => Ok(KeyCode::KeyO),
+        "KeyP" => Ok(KeyCode::KeyP),
+        "KeyQ" => Ok(KeyCode::KeyQ),
+        "KeyR" => Ok(KeyCode::KeyR),
+        "KeyS" => Ok(KeyCode::KeyS),
+        "KeyT" => Ok(KeyCode::KeyT),
+        "KeyU" => Ok(KeyCode::KeyU),
+        "KeyV" => Ok(KeyCode::KeyV),
+        "KeyW" => Ok(KeyCode::KeyW),
+        "KeyX" => Ok(KeyCode::KeyX),
+        "KeyY" => Ok(KeyCode::KeyY),
+        "KeyZ" => Ok(KeyCode::KeyZ),
+        "Digit0" => Ok(KeyCode::Digit0),
+        "Digit1" => Ok(KeyCode::Digit1),
+        "Digit2" => Ok(KeyCode::Digit2),
+        "Digit3" => Ok(KeyCode::Digit3),
+        "Digit4" => Ok(KeyCode::Digit4),
+        "Digit5" => Ok(KeyCode::Digit5),
+        "Digit6" => Ok(KeyCode::Digit6),
+        "Digit7" => Ok(KeyCode::Digit7),
+        "Digit8" => Ok(KeyCode::Digit8),
+        "Digit9" => Ok(KeyCode::Digit9),
+        "F1" => Ok(KeyCode::F1),
+        "F2" => Ok(KeyCode::F2),
+        "F3" => Ok(KeyCode::F3),
+        "F4" => Ok(KeyCode::F4),
+        "F5" => Ok(KeyCode::F5),
+        "F6" => Ok(KeyCode::F6),
+        "F7" => Ok(KeyCode::F7),
+        "F8" => Ok(KeyCode::F8),
+        "F9" => Ok(KeyCode::F9),
+        "F10" => Ok(KeyCode::F10),
+        "F11" => Ok(KeyCode::F11),
+        "F12" => Ok(KeyCode::F12),
         "Enter" => Ok(KeyCode::Enter),
         "Escape" => Ok(KeyCode::Escape),
         "Space" => Ok(KeyCode::Space),

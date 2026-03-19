@@ -13,7 +13,10 @@
 use bevy::prelude::*;
 use bevy_vello::prelude::UiVelloScene;
 
-use crate::ui::form::scene::{build_button_bg, build_form_field_border, build_modal_panel, build_overlay_bg, build_row_highlight};
+use crate::ui::form::scene::{
+    build_button_bg, build_form_field_border, build_modal_panel, build_overlay_bg,
+    build_row_highlight,
+};
 use crate::ui::form::schema::{FormButton, FormOverlay, ModalPanel};
 use crate::ui::form::selectable::{SelectableList, SelectableListRow};
 use crate::ui::form::tree::{TreeView, TreeViewRow};
@@ -57,10 +60,7 @@ pub fn sync_form_field_borders(
 pub fn sync_form_field_borders_on_resize(
     theme: Res<Theme>,
     active_query: Query<&ActiveFormField>,
-    mut fields: Query<
-        (&FormField, &mut UiVelloScene, &ComputedNode),
-        Changed<ComputedNode>,
-    >,
+    mut fields: Query<(&FormField, &mut UiVelloScene, &ComputedNode), Changed<ComputedNode>>,
 ) {
     let Ok(active) = active_query.single() else {
         return;
@@ -90,21 +90,17 @@ fn rebuild_one_field_border(
     };
 
     let mut scene = bevy_vello::vello::Scene::new();
-    build_form_field_border(
-        &mut scene,
-        size.x as f64,
-        size.y as f64,
-        color,
-        4.0,
-        1.0,
-    );
+    build_form_field_border(&mut scene, size.x as f64, size.y as f64, color, 4.0, 1.0);
     *scene_component = UiVelloScene::from(scene);
 }
 
 /// Draws modal panel background + border from `ComputedNode` dimensions.
 pub fn sync_modal_panel_scene(
     theme: Res<Theme>,
-    mut panels: Query<(&mut UiVelloScene, &ComputedNode), (With<ModalPanel>, Changed<ComputedNode>)>,
+    mut panels: Query<
+        (&mut UiVelloScene, &ComputedNode),
+        (With<ModalPanel>, Changed<ComputedNode>),
+    >,
 ) {
     for (mut scene_component, computed) in panels.iter_mut() {
         let size = computed.size();
@@ -154,7 +150,12 @@ pub fn sync_form_button_scenes(
 pub fn sync_row_highlights(
     theme: Res<Theme>,
     mut selectable_rows: Query<
-        (&SelectableListRow, &mut UiVelloScene, &ComputedNode, &ChildOf),
+        (
+            &SelectableListRow,
+            &mut UiVelloScene,
+            &ComputedNode,
+            &ChildOf,
+        ),
         (Changed<ComputedNode>, Without<TreeViewRow>),
     >,
     mut tree_rows: Query<
@@ -173,8 +174,8 @@ pub fn sync_row_highlights(
         let Ok(list) = selectable_lists.get(child_of.0) else {
             continue;
         };
-        let is_selected = row.0 == list.selected
-            && list.items.get(row.0).is_some_and(|item| !item.is_header);
+        let is_selected =
+            row.0 == list.selected && list.items.get(row.0).is_some_and(|item| !item.is_header);
 
         if is_selected {
             let mut scene = bevy_vello::vello::Scene::new();
@@ -223,7 +224,10 @@ pub fn sync_row_highlights(
 /// canvas, covering all Vello text.
 pub fn sync_form_overlay_scene(
     theme: Res<Theme>,
-    mut overlays: Query<(&mut UiVelloScene, &ComputedNode), (With<FormOverlay>, Changed<ComputedNode>)>,
+    mut overlays: Query<
+        (&mut UiVelloScene, &ComputedNode),
+        (With<FormOverlay>, Changed<ComputedNode>),
+    >,
 ) {
     for (mut scene_component, computed) in overlays.iter_mut() {
         let size = computed.size();

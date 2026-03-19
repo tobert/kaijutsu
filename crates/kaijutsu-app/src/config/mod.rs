@@ -52,7 +52,10 @@ pub fn build_app_engine(config_dir: &Path) -> Engine {
 pub fn load_app_config() -> AppConfig {
     let Some(config_dir) = dirs::config_dir().map(|p| p.join("kaijutsu")) else {
         info!("No config directory available, using defaults for theme and bindings");
-        return AppConfig { theme: Theme::default(), bindings: default_bindings() };
+        return AppConfig {
+            theme: Theme::default(),
+            bindings: default_bindings(),
+        };
     };
 
     let engine = build_app_engine(&config_dir);

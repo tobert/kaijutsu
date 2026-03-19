@@ -241,9 +241,9 @@ impl StreamRequest {
                                         is_error: _,
                                     } => Some(UserContent::tool_result(
                                         tool_use_id.clone(),
-                                        rig::OneOrMany::one(
-                                            rig::message::ToolResultContent::text(content.clone()),
-                                        ),
+                                        rig::OneOrMany::one(rig::message::ToolResultContent::text(
+                                            content.clone(),
+                                        )),
                                     )),
                                     _ => None,
                                 })
@@ -286,10 +286,11 @@ impl StreamRequest {
         }
 
         // Convert Vec<Message> to OneOrMany<Message>
-        let chat_history = rig::OneOrMany::many(chat_history)
-            .unwrap_or_else(|_| rig::OneOrMany::one(RigMessage::User {
+        let chat_history = rig::OneOrMany::many(chat_history).unwrap_or_else(|_| {
+            rig::OneOrMany::one(RigMessage::User {
                 content: rig::OneOrMany::one(UserContent::text("")),
-            }));
+            })
+        });
 
         let mut req = CompletionRequest {
             preamble: self.system.clone(),
@@ -307,15 +308,15 @@ impl StreamRequest {
         };
 
         // Add thinking params if enabled (Anthropic-specific)
-        if self.thinking_enabled {
-            if let Some(budget) = self.thinking_budget {
-                req.additional_params = Some(serde_json::json!({
-                    "thinking": {
-                        "type": "enabled",
-                        "budget_tokens": budget
-                    }
-                }));
-            }
+        if self.thinking_enabled
+            && let Some(budget) = self.thinking_budget
+        {
+            req.additional_params = Some(serde_json::json!({
+                "thinking": {
+                    "type": "enabled",
+                    "budget_tokens": budget
+                }
+            }));
         }
 
         req
@@ -441,7 +442,6 @@ impl RigStreamAdapter {
             pending_event: None,
         })
     }
-
 }
 
 impl RigStreamAdapter {
@@ -644,12 +644,14 @@ mod tests {
 
     #[test]
     fn test_stream_event_is_terminal() {
-        assert!(StreamEvent::Done {
-            stop_reason: None,
-            input_tokens: None,
-            output_tokens: None
-        }
-        .is_terminal());
+        assert!(
+            StreamEvent::Done {
+                stop_reason: None,
+                input_tokens: None,
+                output_tokens: None
+            }
+            .is_terminal()
+        );
         assert!(StreamEvent::Error("oops".into()).is_terminal());
         assert!(!StreamEvent::TextStart.is_terminal());
     }

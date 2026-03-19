@@ -55,7 +55,11 @@ pub fn resolve_context_ref(
                     .get_context(current)
                     .map_err(|e| format!("db error: {e}"))?
                     .ok_or_else(|| {
-                        format!("context {} not found at parent depth {}", current.short(), i)
+                        format!(
+                            "context {} not found at parent depth {}",
+                            current.short(),
+                            i
+                        )
                     })?;
                 current = row.forked_from.ok_or_else(|| {
                     let short = current.short();
@@ -197,63 +201,72 @@ mod tests {
         let ws_id = db.get_or_create_default_workspace(kid, principal).unwrap();
 
         // Insert grandparent
-        db.insert_context_with_document(&crate::kernel_db::ContextRow {
-            context_id: grandparent_id,
-            kernel_id: kid,
-            label: Some("grandparent".to_string()),
-            provider: None,
-            model: None,
-            system_prompt: None,
-            tool_filter: None,
-            consent_mode: kaijutsu_types::ConsentMode::Collaborative,
-            created_at: 1000,
-            created_by: principal,
-            forked_from: None,
-            fork_kind: None,
-            archived_at: None,
-            workspace_id: None,
-            preset_id: None,
-        }, ws_id)
+        db.insert_context_with_document(
+            &crate::kernel_db::ContextRow {
+                context_id: grandparent_id,
+                kernel_id: kid,
+                label: Some("grandparent".to_string()),
+                provider: None,
+                model: None,
+                system_prompt: None,
+                tool_filter: None,
+                consent_mode: kaijutsu_types::ConsentMode::Collaborative,
+                created_at: 1000,
+                created_by: principal,
+                forked_from: None,
+                fork_kind: None,
+                archived_at: None,
+                workspace_id: None,
+                preset_id: None,
+            },
+            ws_id,
+        )
         .unwrap();
 
         // Insert parent
-        db.insert_context_with_document(&crate::kernel_db::ContextRow {
-            context_id: parent_id,
-            kernel_id: kid,
-            label: Some("parent".to_string()),
-            provider: None,
-            model: None,
-            system_prompt: None,
-            tool_filter: None,
-            consent_mode: kaijutsu_types::ConsentMode::Collaborative,
-            created_at: 2000,
-            created_by: principal,
-            forked_from: Some(grandparent_id),
-            fork_kind: Some(kaijutsu_types::ForkKind::Full),
-            archived_at: None,
-            workspace_id: None,
-            preset_id: None,
-        }, ws_id)
+        db.insert_context_with_document(
+            &crate::kernel_db::ContextRow {
+                context_id: parent_id,
+                kernel_id: kid,
+                label: Some("parent".to_string()),
+                provider: None,
+                model: None,
+                system_prompt: None,
+                tool_filter: None,
+                consent_mode: kaijutsu_types::ConsentMode::Collaborative,
+                created_at: 2000,
+                created_by: principal,
+                forked_from: Some(grandparent_id),
+                fork_kind: Some(kaijutsu_types::ForkKind::Full),
+                archived_at: None,
+                workspace_id: None,
+                preset_id: None,
+            },
+            ws_id,
+        )
         .unwrap();
 
         // Insert child
-        db.insert_context_with_document(&crate::kernel_db::ContextRow {
-            context_id: child_id,
-            kernel_id: kid,
-            label: Some("child".to_string()),
-            provider: None,
-            model: None,
-            system_prompt: None,
-            tool_filter: None,
-            consent_mode: kaijutsu_types::ConsentMode::Collaborative,
-            created_at: 3000,
-            created_by: principal,
-            forked_from: Some(parent_id),
-            fork_kind: Some(kaijutsu_types::ForkKind::Full),
-            archived_at: None,
-            workspace_id: None,
-            preset_id: None,
-        }, ws_id)
+        db.insert_context_with_document(
+            &crate::kernel_db::ContextRow {
+                context_id: child_id,
+                kernel_id: kid,
+                label: Some("child".to_string()),
+                provider: None,
+                model: None,
+                system_prompt: None,
+                tool_filter: None,
+                consent_mode: kaijutsu_types::ConsentMode::Collaborative,
+                created_at: 3000,
+                created_by: principal,
+                forked_from: Some(parent_id),
+                fork_kind: Some(kaijutsu_types::ForkKind::Full),
+                archived_at: None,
+                workspace_id: None,
+                preset_id: None,
+            },
+            ws_id,
+        )
         .unwrap();
 
         let caller = KjCaller {

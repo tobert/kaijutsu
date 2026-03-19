@@ -71,27 +71,15 @@ pub enum ServerEvent {
         generation: u64,
     },
     /// CRDT text operations applied to a context's input document.
-    InputTextOps {
-        context_id: ContextId,
-        ops: Vec<u8>,
-    },
+    InputTextOps { context_id: ContextId, ops: Vec<u8> },
     /// A context's input document was cleared (after submit).
-    InputCleared {
-        context_id: ContextId,
-    },
+    InputCleared { context_id: ContextId },
     /// An MCP resource's content was updated.
-    ResourceUpdated {
-        server: String,
-        uri: String,
-    },
+    ResourceUpdated { server: String, uri: String },
     /// An MCP server's resource list changed.
-    ResourceListChanged {
-        server: String,
-    },
+    ResourceListChanged { server: String },
     /// Server-side context switch (fork, context switch command).
-    ContextSwitched {
-        context_id: ContextId,
-    },
+    ContextSwitched { context_id: ContextId },
 }
 
 /// Connection lifecycle status.
@@ -99,9 +87,14 @@ pub enum ServerEvent {
 /// Subscribe via [`ActorHandle::subscribe_status()`](crate::ActorHandle::subscribe_status).
 #[derive(Clone, Debug)]
 pub enum ConnectionStatus {
-    Connected { kernel_id: KernelId, context_id: Option<ContextId> },
+    Connected {
+        kernel_id: KernelId,
+        context_id: Option<ContextId>,
+    },
     Disconnected,
-    Reconnecting { attempt: u32 },
+    Reconnecting {
+        attempt: u32,
+    },
     Error(String),
 }
 
@@ -123,13 +116,19 @@ pub(crate) struct BlockEventsForwarder {
 
 /// Extract a String from a capnp text reader, mapping errors to capnp::Error.
 fn read_text(reader: capnp::text::Reader<'_>) -> Result<String, capnp::Error> {
-    reader.to_str().map(|s| s.to_owned()).map_err(|e| capnp::Error::failed(e.to_string()))
+    reader
+        .to_str()
+        .map(|s| s.to_owned())
+        .map_err(|e| capnp::Error::failed(e.to_string()))
 }
 
 /// Parse contextId binary data (16-byte UUID) into ContextId at the wire boundary.
 fn parse_context_id_data(data: &[u8]) -> Result<ContextId, capnp::Error> {
     ContextId::try_from_slice(data).ok_or_else(|| {
-        capnp::Error::failed(format!("invalid context ID: expected 16 bytes, got {}", data.len()))
+        capnp::Error::failed(format!(
+            "invalid context ID: expected 16 bytes, got {}",
+            data.len()
+        ))
     })
 }
 
@@ -178,7 +177,11 @@ impl block_events::Server for BlockEventsForwarder {
 
         let ops = params.get_ops().map(|d| d.to_vec()).unwrap_or_default();
 
-        let event = ServerEvent::BlockInserted { context_id, block, ops };
+        let event = ServerEvent::BlockInserted {
+            context_id,
+            block,
+            ops,
+        };
         if self.event_tx.send(event).is_err() {
             tracing::warn!("Event channel closed, dropping BlockInserted event");
         }
@@ -211,7 +214,10 @@ impl block_events::Server for BlockEventsForwarder {
             Err(e) => return Promise::err(e),
         };
 
-        let event = ServerEvent::BlockDeleted { context_id, block_id };
+        let event = ServerEvent::BlockDeleted {
+            context_id,
+            block_id,
+        };
         if self.event_tx.send(event).is_err() {
             tracing::warn!("Event channel closed, dropping BlockDeleted event");
         }
@@ -293,7 +299,11 @@ impl block_events::Server for BlockEventsForwarder {
             None
         };
 
-        let event = ServerEvent::BlockMoved { context_id, block_id, after_id };
+        let event = ServerEvent::BlockMoved {
+            context_id,
+            block_id,
+            after_id,
+        };
         if self.event_tx.send(event).is_err() {
             tracing::warn!("Event channel closed, dropping BlockMoved event");
         }
@@ -332,7 +342,8 @@ impl block_events::Server for BlockEventsForwarder {
         };
 
         // Parse optional outputData
-        let output = params.get_output_data()
+        let output = params
+            .get_output_data()
             .ok()
             .and_then(|r| crate::rpc::parse_output_data(r).ok())
             .filter(|d| !d.root.is_empty() || d.headers.is_some());
@@ -380,7 +391,11 @@ impl block_events::Server for BlockEventsForwarder {
             Err(e) => return Promise::err(e),
         };
 
-        let event = ServerEvent::BlockTextOps { context_id, block_id, ops };
+        let event = ServerEvent::BlockTextOps {
+            context_id,
+            block_id,
+            ops,
+        };
         if self.event_tx.send(event).is_err() {
             tracing::warn!("Event channel closed, dropping BlockTextOps event");
         }
@@ -407,7 +422,10 @@ impl block_events::Server for BlockEventsForwarder {
 
         let generation = params.get_generation();
 
-        let event = ServerEvent::SyncReset { context_id, generation };
+        let event = ServerEvent::SyncReset {
+            context_id,
+            generation,
+        };
         if self.event_tx.send(event).is_err() {
             tracing::warn!("Event channel closed, dropping SyncReset event");
         }

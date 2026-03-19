@@ -17,7 +17,13 @@ pub fn to_svg(elements: &[EngravingElement], margin: f64, color: &str) -> String
 
     for elem in elements {
         match elem {
-            EngravingElement::Glyph { x, y, scale, codepoint, .. } => {
+            EngravingElement::Glyph {
+                x,
+                y,
+                scale,
+                codepoint,
+                ..
+            } => {
                 let advance = font.glyph_advance(*codepoint).unwrap_or(500.0) * scale;
                 let glyph_height = font.upem() * scale;
                 min_x = min_x.min(*x);
@@ -25,15 +31,19 @@ pub fn to_svg(elements: &[EngravingElement], margin: f64, color: &str) -> String
                 max_x = max_x.max(x + advance);
                 max_y = max_y.max(y + glyph_height * 0.5);
             }
-            EngravingElement::Line {
-                x1, y1, x2, y2, ..
-            } => {
+            EngravingElement::Line { x1, y1, x2, y2, .. } => {
                 min_x = min_x.min(*x1).min(*x2);
                 min_y = min_y.min(*y1).min(*y2);
                 max_x = max_x.max(*x1).max(*x2);
                 max_y = max_y.max(*y1).max(*y2);
             }
-            EngravingElement::Text { x, y, size, content, .. } => {
+            EngravingElement::Text {
+                x,
+                y,
+                size,
+                content,
+                ..
+            } => {
                 min_x = min_x.min(*x);
                 min_y = min_y.min(y - size);
                 // Rough text width estimate

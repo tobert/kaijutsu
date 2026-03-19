@@ -16,10 +16,10 @@ use vello::kurbo::Affine;
 use vello::peniko::Fill;
 
 use crate::cell::ContextSwitchRequested;
-use crate::connection::actor_plugin::ServerEventMessage;
 use crate::connection::RpcConnectionState;
+use crate::connection::actor_plugin::ServerEventMessage;
 use crate::input::FocusArea;
-use crate::text::sparkline::{build_sparkline_paths, SparklineColors, SparklineData};
+use crate::text::sparkline::{SparklineColors, SparklineData, build_sparkline_paths};
 
 /// A dock sparkline — ring-buffer time series with fixed capacity.
 #[derive(Clone, Debug)]
@@ -31,7 +31,10 @@ pub struct DockSparkline {
 impl DockSparkline {
     pub fn new(capacity: usize) -> Self {
         Self {
-            data: SparklineData { values: Vec::with_capacity(capacity), label: None },
+            data: SparklineData {
+                values: Vec::with_capacity(capacity),
+                label: None,
+            },
             capacity,
         }
     }
@@ -44,7 +47,7 @@ impl DockSparkline {
         self.data.values.push(value);
     }
 }
-use crate::text::{bevy_color_to_brush, FontHandles};
+use crate::text::{FontHandles, bevy_color_to_brush};
 use crate::ui::constellation::{ActivityState, Constellation};
 use crate::ui::drift::DriftState;
 use crate::ui::theme::Theme;
@@ -391,10 +394,18 @@ pub fn render_north_dock(
     // Right group: sparklines + pulse + gap + connection (right-aligned)
     let gap = 12.0_f64;
     let conn_brush = bevy_color_to_brush(dock_state.connection.color);
-    let conn_w = measure_text(&dock_state.connection.text, dock_state.connection.font_size, font);
+    let conn_w = measure_text(
+        &dock_state.connection.text,
+        dock_state.connection.font_size,
+        font,
+    );
 
     let pulse_brush = bevy_color_to_brush(dock_state.event_pulse.color);
-    let pulse_w = measure_text(&dock_state.event_pulse.text, dock_state.event_pulse.font_size, font);
+    let pulse_w = measure_text(
+        &dock_state.event_pulse.text,
+        dock_state.event_pulse.font_size,
+        font,
+    );
 
     // Sparkline dimensions
     let spark_w = 80.0_f64;
@@ -567,15 +578,7 @@ pub fn render_south_dock(
         // Notification mode: single text
         let notif_text = format!("\u{2190} @{}: \"{}\"", source, preview);
         let brush = bevy_color_to_brush(theme.accent);
-        let w = draw_dock_text(
-            &mut scene,
-            &notif_text,
-            x,
-            pad_v,
-            11.0,
-            font,
-            &brush,
-        );
+        let w = draw_dock_text(&mut scene, &notif_text, x, pad_v, 11.0, font, &brush);
         let _ = w; // advance x not needed — notification is a single item
     } else if !ctx.badges.is_empty() {
         let badge_gap = 8.0_f64;
@@ -585,51 +588,33 @@ pub fn render_south_dock(
             } else {
                 badge.label.clone()
             };
-            let color = if badge.is_active { theme.accent } else { theme.fg_dim };
+            let color = if badge.is_active {
+                theme.accent
+            } else {
+                theme.fg_dim
+            };
             let brush = bevy_color_to_brush(color);
 
             let x_start = x as f32;
-            let w = draw_dock_text(
-                &mut scene,
-                &label,
-                x,
-                pad_v,
-                11.0,
-                font,
-                &brush,
-            );
+            let w = draw_dock_text(&mut scene, &label, x, pad_v, 11.0, font, &brush);
             let x_end = (x + w) as f32;
-            hit_regions.south_regions.push((x_start, x_end, badge.context_id));
+            hit_regions
+                .south_regions
+                .push((x_start, x_end, badge.context_id));
             x += w + badge_gap;
         }
 
         if ctx.overflow_count > 0 {
             let overflow_text = format!("+{}", ctx.overflow_count);
             let brush = bevy_color_to_brush(theme.fg_dim);
-            let w = draw_dock_text(
-                &mut scene,
-                &overflow_text,
-                x,
-                pad_v,
-                11.0,
-                font,
-                &brush,
-            );
+            let w = draw_dock_text(&mut scene, &overflow_text, x, pad_v, 11.0, font, &brush);
             x += w + badge_gap;
         }
 
         if ctx.staged_count > 0 {
             let staged_text = format!("\u{00b7}{} staged", ctx.staged_count);
             let brush = bevy_color_to_brush(theme.fg_dim);
-            draw_dock_text(
-                &mut scene,
-                &staged_text,
-                x,
-                pad_v,
-                11.0,
-                font,
-                &brush,
-            );
+            draw_dock_text(&mut scene, &staged_text, x, pad_v, 11.0, font, &brush);
         }
     }
 
@@ -732,7 +717,10 @@ pub fn update_connection(
         (status, theme.success)
     } else if conn_state.reconnect_attempt > 0 {
         (
-            format!("\u{27f3} Reconnecting ({})...", conn_state.reconnect_attempt),
+            format!(
+                "\u{27f3} Reconnecting ({})...",
+                conn_state.reconnect_attempt
+            ),
             theme.warning,
         )
     } else {
@@ -829,10 +817,16 @@ pub fn update_hints(
 
     use crate::ui::screen::Screen;
     let hints = match screen.get() {
-        Screen::Constellation => "Enter: switch \u{2502} m: model \u{2502} n: new \u{2502} Tab: compose \u{2502} Esc: back",
+        Screen::Constellation => {
+            "Enter: switch \u{2502} m: model \u{2502} n: new \u{2502} Tab: compose \u{2502} Esc: back"
+        }
         Screen::Conversation => match focus_area.as_ref() {
-            FocusArea::Compose => "Enter: submit \u{2502} Shift+Enter: newline \u{2502} Tab: mode ring \u{2502} Esc: dismiss",
-            FocusArea::Conversation => "i: chat \u{2502} :: shell \u{2502} j/k: navigate \u{2502} f: expand \u{2502} `: constellation \u{2502} Alt+hjkl: pane",
+            FocusArea::Compose => {
+                "Enter: submit \u{2502} Shift+Enter: newline \u{2502} Tab: mode ring \u{2502} Esc: dismiss"
+            }
+            FocusArea::Conversation => {
+                "i: chat \u{2502} :: shell \u{2502} j/k: navigate \u{2502} f: expand \u{2502} `: constellation \u{2502} Alt+hjkl: pane"
+            }
             FocusArea::Dialog => "Enter: confirm \u{2502} Esc: cancel \u{2502} j/k: navigate",
         },
     };
@@ -929,10 +923,11 @@ pub fn update_model_badge(
 /// Shorten a model name for display (e.g. "claude-opus-4-6" -> "opus-4.6").
 fn shorten_model_name(model: &str) -> String {
     let m = model.strip_prefix("claude-").unwrap_or(model);
-    if let Some(pos) = m.rfind('-') {
-        if pos > 0 && m[pos + 1..].chars().all(|c| c.is_ascii_digit()) {
-            return format!("{}.{}", &m[..pos], &m[pos + 1..]);
-        }
+    if let Some(pos) = m.rfind('-')
+        && pos > 0
+        && m[pos + 1..].chars().all(|c| c.is_ascii_digit())
+    {
+        return format!("{}.{}", &m[..pos], &m[pos + 1..]);
     }
     m.to_string()
 }
@@ -1001,21 +996,18 @@ pub fn update_block_activity(
 
     for event in events.read() {
         if let kaijutsu_client::ServerEvent::BlockStatusChanged {
-            context_id,
-            status,
-            ..
+            context_id, status, ..
         } = &event.0
+            && active_doc.as_deref() == Some(&context_id.to_string())
         {
-            if active_doc.as_deref() == Some(&context_id.to_string()) {
-                match status {
-                    kaijutsu_crdt::Status::Running => {
-                        state.running = state.running.saturating_add(1);
-                    }
-                    kaijutsu_crdt::Status::Done | kaijutsu_crdt::Status::Error => {
-                        state.running = state.running.saturating_sub(1);
-                    }
-                    _ => {}
+            match status {
+                kaijutsu_crdt::Status::Running => {
+                    state.running = state.running.saturating_add(1);
                 }
+                kaijutsu_crdt::Status::Done | kaijutsu_crdt::Status::Error => {
+                    state.running = state.running.saturating_sub(1);
+                }
+                _ => {}
             }
         }
     }
@@ -1038,7 +1030,6 @@ pub fn update_block_activity(
         dock.activity_spark.push(state.running as f64);
     }
 }
-
 
 // ============================================================================
 // PLUGIN
@@ -1071,8 +1062,7 @@ impl Plugin for DockPlugin {
             )
             .add_systems(
                 PostUpdate,
-                (render_north_dock, render_south_dock)
-                    .after(bevy::ui::UiSystems::Layout),
+                (render_north_dock, render_south_dock).after(bevy::ui::UiSystems::Layout),
             );
     }
 }

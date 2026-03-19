@@ -69,9 +69,7 @@ impl KjDispatcher {
         let db = self.kernel_db().lock();
         match db.get_preset_by_label(self.kernel_id(), label) {
             Ok(Some(p)) => {
-                let mut lines = vec![
-                    format!("Preset: {}", p.label),
-                ];
+                let mut lines = vec![format!("Preset: {}", p.label)];
                 if let Some(desc) = &p.description {
                     lines.push(format!("Description: {desc}"));
                 }
@@ -127,12 +125,12 @@ impl KjDispatcher {
         };
 
         let consent_mode = match consent_spec {
-            Some(ref spec) => {
-                match spec.parse::<kaijutsu_types::ConsentMode>() {
-                    Ok(cm) => cm,
-                    Err(_) => return KjResult::Err(format!("kj preset save: invalid consent mode '{spec}'")),
+            Some(ref spec) => match spec.parse::<kaijutsu_types::ConsentMode>() {
+                Ok(cm) => cm,
+                Err(_) => {
+                    return KjResult::Err(format!("kj preset save: invalid consent mode '{spec}'"));
                 }
-            }
+            },
             None => kaijutsu_types::ConsentMode::Collaborative,
         };
 
@@ -200,7 +198,9 @@ impl KjDispatcher {
         };
 
         if !caller.confirmed {
-            let usage_count = db.contexts_using_preset(kernel_id, preset.preset_id).unwrap_or(0);
+            let usage_count = db
+                .contexts_using_preset(kernel_id, preset.preset_id)
+                .unwrap_or(0);
             return KjResult::Latch {
                 command: "kj preset remove".to_string(),
                 target: label.to_string(),
@@ -253,7 +253,18 @@ mod tests {
         let c = caller_with_context(ctx);
 
         let result = d
-            .dispatch(&[s("preset"), s("save"), s("fast"), s("--model"), s("anthropic/claude-haiku-4-5-20251001"), s("--desc"), s("Fast preset")], &c)
+            .dispatch(
+                &[
+                    s("preset"),
+                    s("save"),
+                    s("fast"),
+                    s("--model"),
+                    s("anthropic/claude-haiku-4-5-20251001"),
+                    s("--desc"),
+                    s("Fast preset"),
+                ],
+                &c,
+            )
             .await;
         assert!(result.is_ok(), "save failed: {}", result.message());
         assert!(result.message().contains("created"));
@@ -261,7 +272,11 @@ mod tests {
         // List should show it
         let result = d.dispatch(&[s("preset"), s("list")], &c).await;
         assert!(result.is_ok());
-        assert!(result.message().contains("fast"), "msg: {}", result.message());
+        assert!(
+            result.message().contains("fast"),
+            "msg: {}",
+            result.message()
+        );
     }
 
     #[tokio::test]
@@ -272,11 +287,18 @@ mod tests {
         let c = caller_with_context(ctx);
 
         // Create
-        d.dispatch(&[s("preset"), s("save"), s("p"), s("--model"), s("a/b")], &c).await;
+        d.dispatch(
+            &[s("preset"), s("save"), s("p"), s("--model"), s("a/b")],
+            &c,
+        )
+        .await;
 
         // Update same label
         let result = d
-            .dispatch(&[s("preset"), s("save"), s("p"), s("--model"), s("c/d")], &c)
+            .dispatch(
+                &[s("preset"), s("save"), s("p"), s("--model"), s("c/d")],
+                &c,
+            )
             .await;
         assert!(result.is_ok(), "update failed: {}", result.message());
         assert!(result.message().contains("updated"));
@@ -289,9 +311,15 @@ mod tests {
         let ctx = register_context(&d, Some("ctx"), None, principal).await;
         let c = caller_with_context(ctx);
 
-        d.dispatch(&[s("preset"), s("save"), s("doomed"), s("--model"), s("a/b")], &c).await;
+        d.dispatch(
+            &[s("preset"), s("save"), s("doomed"), s("--model"), s("a/b")],
+            &c,
+        )
+        .await;
 
-        let result = d.dispatch(&[s("preset"), s("remove"), s("doomed")], &c).await;
+        let result = d
+            .dispatch(&[s("preset"), s("remove"), s("doomed")], &c)
+            .await;
         assert!(result.is_latch(), "expected latch, got: {:?}", result);
     }
 
@@ -302,10 +330,16 @@ mod tests {
         let ctx = register_context(&d, Some("ctx"), None, principal).await;
         let c = caller_with_context(ctx);
 
-        d.dispatch(&[s("preset"), s("save"), s("doomed"), s("--model"), s("a/b")], &c).await;
+        d.dispatch(
+            &[s("preset"), s("save"), s("doomed"), s("--model"), s("a/b")],
+            &c,
+        )
+        .await;
 
         let c = confirmed_caller(ctx);
-        let result = d.dispatch(&[s("preset"), s("remove"), s("doomed")], &c).await;
+        let result = d
+            .dispatch(&[s("preset"), s("remove"), s("doomed")], &c)
+            .await;
         assert!(result.is_ok(), "remove failed: {}", result.message());
         assert!(result.message().contains("deleted"));
 

@@ -67,10 +67,10 @@ impl ExecutionEngine for WriteEngine {
             Err(e) => return Ok(ExecResult::failure(1, format!("Invalid params: {}", e))),
         };
 
-        if let Some(ref guard) = self.guard {
-            if let Err(denied) = guard.check_write(ctx, &p.path) {
-                return Ok(denied);
-            }
+        if let Some(ref guard) = self.guard
+            && let Err(denied) = guard.check_write(ctx, &p.path)
+        {
+            return Ok(denied);
         }
 
         match self.cache.create_or_replace(&p.path, &p.content).await {

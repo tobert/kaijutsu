@@ -33,7 +33,6 @@ pub struct HookEvent {
     pub transcript_path: Option<String>,
 
     // -- Event-specific fields --
-
     /// Tool info (tool.before, tool.after, tool.error).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool: Option<ToolInfo>,

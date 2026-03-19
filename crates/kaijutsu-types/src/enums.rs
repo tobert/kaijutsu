@@ -164,9 +164,7 @@ impl ToolFilter {
             (Self::AllowList(a), Self::AllowList(b)) => {
                 Self::AllowList(a.intersection(b).cloned().collect())
             }
-            (Self::DenyList(a), Self::DenyList(b)) => {
-                Self::DenyList(a.union(b).cloned().collect())
-            }
+            (Self::DenyList(a), Self::DenyList(b)) => Self::DenyList(a.union(b).cloned().collect()),
             (Self::AllowList(allowed), Self::DenyList(denied)) => {
                 Self::AllowList(allowed.difference(denied).cloned().collect())
             }
@@ -191,7 +189,13 @@ impl ToolFilter {
 pub enum DocKind {
     /// Interactive human/model dialog.
     #[default]
-    #[strum(serialize = "conversation", serialize = "output", serialize = "system", serialize = "user_message", serialize = "agent_message")]
+    #[strum(
+        serialize = "conversation",
+        serialize = "output",
+        serialize = "system",
+        serialize = "user_message",
+        serialize = "agent_message"
+    )]
     Conversation,
     /// Executable code.
     Code,
@@ -238,7 +242,12 @@ mod tests {
 
     #[test]
     fn fork_kind_as_str_roundtrip() {
-        for kind in [ForkKind::Full, ForkKind::Shallow, ForkKind::Compact, ForkKind::Subtree] {
+        for kind in [
+            ForkKind::Full,
+            ForkKind::Shallow,
+            ForkKind::Compact,
+            ForkKind::Subtree,
+        ] {
             let s = kind.as_str();
             let parsed = ForkKind::from_str(s).unwrap();
             assert_eq!(kind, parsed);
@@ -268,7 +277,12 @@ mod tests {
 
     #[test]
     fn fork_kind_postcard_roundtrip() {
-        for kind in [ForkKind::Full, ForkKind::Shallow, ForkKind::Compact, ForkKind::Subtree] {
+        for kind in [
+            ForkKind::Full,
+            ForkKind::Shallow,
+            ForkKind::Compact,
+            ForkKind::Subtree,
+        ] {
             let bytes = postcard::to_stdvec(&kind).unwrap();
             let parsed: ForkKind = postcard::from_bytes(&bytes).unwrap();
             assert_eq!(kind, parsed);
@@ -293,7 +307,10 @@ mod tests {
 
     #[test]
     fn edge_kind_case_insensitive() {
-        assert_eq!(EdgeKind::from_str("STRUCTURAL").unwrap(), EdgeKind::Structural);
+        assert_eq!(
+            EdgeKind::from_str("STRUCTURAL").unwrap(),
+            EdgeKind::Structural
+        );
         assert_eq!(EdgeKind::from_str("Drift").unwrap(), EdgeKind::Drift);
     }
 
@@ -339,8 +356,14 @@ mod tests {
 
     #[test]
     fn consent_mode_case_insensitive() {
-        assert_eq!(ConsentMode::from_str("COLLABORATIVE").unwrap(), ConsentMode::Collaborative);
-        assert_eq!(ConsentMode::from_str("Autonomous").unwrap(), ConsentMode::Autonomous);
+        assert_eq!(
+            ConsentMode::from_str("COLLABORATIVE").unwrap(),
+            ConsentMode::Collaborative
+        );
+        assert_eq!(
+            ConsentMode::from_str("Autonomous").unwrap(),
+            ConsentMode::Autonomous
+        );
     }
 
     #[test]
@@ -442,7 +465,12 @@ mod tests {
 
     #[test]
     fn doc_kind_as_str_roundtrip() {
-        for kind in [DocKind::Conversation, DocKind::Code, DocKind::Text, DocKind::Config] {
+        for kind in [
+            DocKind::Conversation,
+            DocKind::Code,
+            DocKind::Text,
+            DocKind::Config,
+        ] {
             let s = kind.as_str();
             let parsed = DocKind::from_str(s).unwrap();
             assert_eq!(kind, parsed);
@@ -451,7 +479,10 @@ mod tests {
 
     #[test]
     fn doc_kind_case_insensitive() {
-        assert_eq!(DocKind::from_str("CONVERSATION").unwrap(), DocKind::Conversation);
+        assert_eq!(
+            DocKind::from_str("CONVERSATION").unwrap(),
+            DocKind::Conversation
+        );
         assert_eq!(DocKind::from_str("Code").unwrap(), DocKind::Code);
     }
 
@@ -459,8 +490,14 @@ mod tests {
     fn doc_kind_legacy_aliases() {
         assert_eq!(DocKind::from_str("output").unwrap(), DocKind::Conversation);
         assert_eq!(DocKind::from_str("system").unwrap(), DocKind::Conversation);
-        assert_eq!(DocKind::from_str("user_message").unwrap(), DocKind::Conversation);
-        assert_eq!(DocKind::from_str("agent_message").unwrap(), DocKind::Conversation);
+        assert_eq!(
+            DocKind::from_str("user_message").unwrap(),
+            DocKind::Conversation
+        );
+        assert_eq!(
+            DocKind::from_str("agent_message").unwrap(),
+            DocKind::Conversation
+        );
         assert_eq!(DocKind::from_str("markdown").unwrap(), DocKind::Text);
     }
 
@@ -481,7 +518,12 @@ mod tests {
 
     #[test]
     fn doc_kind_postcard_roundtrip() {
-        for kind in [DocKind::Conversation, DocKind::Code, DocKind::Text, DocKind::Config] {
+        for kind in [
+            DocKind::Conversation,
+            DocKind::Code,
+            DocKind::Text,
+            DocKind::Config,
+        ] {
             let bytes = postcard::to_stdvec(&kind).unwrap();
             let parsed: DocKind = postcard::from_bytes(&bytes).unwrap();
             assert_eq!(kind, parsed);

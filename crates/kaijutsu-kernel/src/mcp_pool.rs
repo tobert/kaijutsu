@@ -60,8 +60,8 @@ use rmcp::model::{
     ArgumentInfo, CallToolRequestParams, CallToolResult, ClientCapabilities, ClientInfo,
     CompleteRequestParams, CompleteResult, CreateElicitationRequestParams, CreateElicitationResult,
     ElicitationAction as RmcpElicitationAction, GetPromptRequestParams, GetPromptResult,
-    ListRootsResult, LoggingLevel, ProgressNotificationParam, Prompt, PromptArgument,
-    Reference, Root, RootsCapabilities, SetLevelRequestParams, Tool as McpTool,
+    ListRootsResult, LoggingLevel, ProgressNotificationParam, Prompt, PromptArgument, Reference,
+    Root, RootsCapabilities, SetLevelRequestParams, Tool as McpTool,
 };
 use rmcp::service::{RequestContext, RunningService, ServiceError};
 use rmcp::transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess};
@@ -662,10 +662,8 @@ impl KaijutsuClientHandler {
         request_id: String,
         response_tx: oneshot::Sender<ElicitationResponse>,
     ) {
-        self.pending_elicitations.insert(
-            request_id,
-            PendingElicitation { response_tx },
-        );
+        self.pending_elicitations
+            .insert(request_id, PendingElicitation { response_tx });
     }
 
     /// Get the pending elicitations map for external response handling.
@@ -833,7 +831,8 @@ impl ClientHandler for KaijutsuClientHandler {
         &self,
         request: CreateElicitationRequestParams,
         _ctx: RequestContext<RoleClient>,
-    ) -> impl std::future::Future<Output = Result<CreateElicitationResult, ErrorData>> + Send + '_ {
+    ) -> impl std::future::Future<Output = Result<CreateElicitationResult, ErrorData>> + Send + '_
+    {
         let server_name = self.server_name.clone();
         let elicitation_flows = self.elicitation_flows.clone();
         let pending_elicitations = self.pending_elicitations.clone();
@@ -845,10 +844,14 @@ impl ClientHandler for KaijutsuClientHandler {
             // Extract message and schema from the elicitation request variant
             let (message, schema) = match &request {
                 rmcp::model::CreateElicitationRequestParams::FormElicitationParams {
-                    message, requested_schema, ..
+                    message,
+                    requested_schema,
+                    ..
                 } => (message.clone(), serde_json::to_value(requested_schema).ok()),
                 rmcp::model::CreateElicitationRequestParams::UrlElicitationParams {
-                    message, url, ..
+                    message,
+                    url,
+                    ..
                 } => (message.clone(), Some(serde_json::json!({ "url": url }))),
             };
 
@@ -863,10 +866,7 @@ impl ClientHandler for KaijutsuClientHandler {
             let (response_tx, response_rx) = oneshot::channel();
 
             // Store the pending elicitation
-            pending_elicitations.insert(
-                request_id.clone(),
-                PendingElicitation { response_tx },
-            );
+            pending_elicitations.insert(request_id.clone(), PendingElicitation { response_tx });
 
             // Publish to FlowBus for UI handling
             elicitation_flows.publish(ElicitationFlow::Request {
@@ -1044,7 +1044,11 @@ impl McpServerPool {
 
     /// Get the roots advertised to servers.
     pub fn roots(&self) -> Vec<McpRootInfo> {
-        self.roots.read().iter().map(|r| McpRootInfo::from(r.clone())).collect()
+        self.roots
+            .read()
+            .iter()
+            .map(|r| McpRootInfo::from(r.clone()))
+            .collect()
     }
 
     /// Set the roots advertised to servers.
@@ -1133,16 +1137,17 @@ impl McpServerPool {
                 }
                 let transport = TokioChildProcess::new(cmd.configure(|_| {}))
                     .map_err(|e| McpPoolError::SpawnError(e.to_string()))?;
-                rmcp::serve_client(handler, transport).await
+                rmcp::serve_client(handler, transport)
+                    .await
                     .map_err(|e| McpPoolError::InitError(e.to_string()))?
             }
             McpTransport::StreamableHttp => {
-                let url = config.url.as_deref()
-                    .ok_or_else(|| McpPoolError::InitError(
-                        "StreamableHttp transport requires url".into(),
-                    ))?;
+                let url = config.url.as_deref().ok_or_else(|| {
+                    McpPoolError::InitError("StreamableHttp transport requires url".into())
+                })?;
                 let transport = StreamableHttpClientTransport::from_uri(url);
-                rmcp::serve_client(handler, transport).await
+                rmcp::serve_client(handler, transport)
+                    .await
                     .map_err(|e| McpPoolError::InitError(e.to_string()))?
             }
         };
@@ -1234,7 +1239,7 @@ impl McpServerPool {
             protocol_version: peer_info
                 .as_ref()
                 .map(|i| i.protocol_version.to_string())
-                .unwrap_or_else(|| String::new()),
+                .unwrap_or_else(String::new),
             server_name: peer_info
                 .as_ref()
                 .map(|i| i.server_info.name.clone())
@@ -1323,12 +1328,13 @@ impl McpServerPool {
         qualified_name: &str,
         arguments: JsonValue,
     ) -> Result<CallToolResult, McpPoolError> {
-        let (server_name, tool_name) = qualified_name.split_once("__").ok_or_else(|| {
-            McpPoolError::ToolNotFound {
-                server: "".to_string(),
-                tool: qualified_name.to_string(),
-            }
-        })?;
+        let (server_name, tool_name) =
+            qualified_name
+                .split_once("__")
+                .ok_or_else(|| McpPoolError::ToolNotFound {
+                    server: "".to_string(),
+                    tool: qualified_name.to_string(),
+                })?;
 
         self.call_tool(server_name, tool_name, arguments).await
     }
@@ -1360,7 +1366,10 @@ impl McpServerPool {
     ///
     /// Uses cache if available and not stale, otherwise fetches from server.
     /// Results are cached for future calls.
-    pub async fn list_resources(&self, server_name: &str) -> Result<Vec<McpResourceInfo>, McpPoolError> {
+    pub async fn list_resources(
+        &self,
+        server_name: &str,
+    ) -> Result<Vec<McpResourceInfo>, McpPoolError> {
         // Check cache first
         let cached = self.cache.list_for_server(server_name);
         if !cached.is_empty() {
@@ -1415,13 +1424,13 @@ impl McpServerPool {
         uri: &str,
     ) -> Result<rmcp::model::ResourceContents, McpPoolError> {
         // Check cache for content
-        if let Some(cached) = self.cache.get(server_name, uri) {
-            if let Some(content_bytes) = &cached.content {
-                if let Ok(contents) = serde_json::from_slice::<rmcp::model::ResourceContents>(content_bytes) {
-                    debug!(server = %server_name, uri = %uri, "Returning cached resource content");
-                    return Ok(contents);
-                }
-            }
+        if let Some(cached) = self.cache.get(server_name, uri)
+            && let Some(content_bytes) = &cached.content
+            && let Ok(contents) =
+                serde_json::from_slice::<rmcp::model::ResourceContents>(content_bytes)
+        {
+            debug!(server = %server_name, uri = %uri, "Returning cached resource content");
+            return Ok(contents);
         }
 
         let server_arc = self
@@ -1443,14 +1452,15 @@ impl McpServerPool {
             .await?;
 
         // Get the first content (typical case)
-        let contents = result
-            .contents
-            .into_iter()
-            .next()
-            .ok_or_else(|| McpPoolError::ToolNotFound {
-                server: server_name.to_string(),
-                tool: format!("resource:{}", uri),
-            })?;
+        let contents =
+            result
+                .contents
+                .into_iter()
+                .next()
+                .ok_or_else(|| McpPoolError::ToolNotFound {
+                    server: server_name.to_string(),
+                    tool: format!("resource:{}", uri),
+                })?;
 
         // Cache the content
         if let Ok(content_bytes) = serde_json::to_vec(&contents) {
@@ -1565,7 +1575,10 @@ impl McpServerPool {
     /// List all prompts from an MCP server.
     ///
     /// Results are cached with TTL-based invalidation.
-    pub async fn list_prompts(&self, server_name: &str) -> Result<Vec<McpPromptInfo>, McpPoolError> {
+    pub async fn list_prompts(
+        &self,
+        server_name: &str,
+    ) -> Result<Vec<McpPromptInfo>, McpPoolError> {
         let server_arc = self
             .servers
             .read()
@@ -1895,9 +1908,8 @@ impl ExecutionEngine for McpToolEngine {
         let arguments: JsonValue = if code.trim().is_empty() {
             JsonValue::Object(serde_json::Map::new())
         } else {
-            serde_json::from_str(code).map_err(|e| {
-                anyhow::anyhow!("Failed to parse tool arguments as JSON: {}", e)
-            })?
+            serde_json::from_str(code)
+                .map_err(|e| anyhow::anyhow!("Failed to parse tool arguments as JSON: {}", e))?
         };
 
         // Call the MCP tool
@@ -1947,10 +1959,7 @@ mod tests {
 
     #[test]
     fn test_extract_mixed_text() {
-        let result = CallToolResult::success(vec![
-            Content::text("line1"),
-            Content::text("line2"),
-        ]);
+        let result = CallToolResult::success(vec![Content::text("line1"), Content::text("line2")]);
         assert_eq!(extract_tool_result_text(&result), "line1\nline2");
     }
 
@@ -2004,11 +2013,15 @@ mod tests {
         let pool = McpServerPool::new();
 
         // Should fail because server doesn't exist, but parsing should work
-        let result = pool.call_tool_qualified("git__status", serde_json::json!({})).await;
+        let result = pool
+            .call_tool_qualified("git__status", serde_json::json!({}))
+            .await;
         assert!(matches!(result, Err(McpPoolError::ServerNotFound(_))));
 
         // Invalid format (no double-underscore separator)
-        let result = pool.call_tool_qualified("invalid_name", serde_json::json!({})).await;
+        let result = pool
+            .call_tool_qualified("invalid_name", serde_json::json!({}))
+            .await;
         assert!(matches!(result, Err(McpPoolError::ToolNotFound { .. })));
     }
 }

@@ -42,10 +42,10 @@ pub fn has_flag(argv: &[String], names: &[&str]) -> bool {
 pub fn extract_all_named_args(argv: &[String], names: &[&str]) -> Vec<String> {
     let mut values = Vec::new();
     for (i, arg) in argv.iter().enumerate() {
-        if names.contains(&arg.as_str()) {
-            if let Some(val) = argv.get(i + 1) {
-                values.push(val.clone());
-            }
+        if names.contains(&arg.as_str())
+            && let Some(val) = argv.get(i + 1)
+        {
+            values.push(val.clone());
         }
     }
     values
@@ -60,8 +60,16 @@ pub fn parse_model_spec(spec: &str) -> (Option<String>, Option<String>) {
     }
     match spec.split_once('/') {
         Some((provider, model)) => {
-            let p = if provider.is_empty() { None } else { Some(provider.to_string()) };
-            let m = if model.is_empty() { None } else { Some(model.to_string()) };
+            let p = if provider.is_empty() {
+                None
+            } else {
+                Some(provider.to_string())
+            };
+            let m = if model.is_empty() {
+                None
+            } else {
+                Some(model.to_string())
+            };
             (p, m)
         }
         None => (None, Some(spec.to_string())),
@@ -80,20 +88,31 @@ pub fn parse_tool_filter_spec(spec: &str) -> Result<ToolFilter, String> {
         return Ok(ToolFilter::All);
     }
     if let Some(list) = spec.strip_prefix("allow:") {
-        let tools: HashSet<String> = list.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        let tools: HashSet<String> = list
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
         if tools.is_empty() {
             return Err("allow list must contain at least one tool".to_string());
         }
         return Ok(ToolFilter::AllowList(tools));
     }
     if let Some(list) = spec.strip_prefix("deny:") {
-        let tools: HashSet<String> = list.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        let tools: HashSet<String> = list
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
         if tools.is_empty() {
             return Err("deny list must contain at least one tool".to_string());
         }
         return Ok(ToolFilter::DenyList(tools));
     }
-    Err(format!("invalid tool filter spec '{}' — use 'all', 'allow:tool1,tool2', or 'deny:tool1,tool2'", spec))
+    Err(format!(
+        "invalid tool filter spec '{}' — use 'all', 'allow:tool1,tool2', or 'deny:tool1,tool2'",
+        spec
+    ))
 }
 
 #[cfg(test)]

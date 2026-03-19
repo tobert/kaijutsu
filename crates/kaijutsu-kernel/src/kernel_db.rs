@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::str::FromStr;
 
-use rusqlite::{params, Connection, Result as SqliteResult};
+use rusqlite::{Connection, Result as SqliteResult, params};
 use tracing::{info, warn};
 
 use kaijutsu_types::{
@@ -345,15 +345,13 @@ fn read_context_id(row: &rusqlite::Row<'_>, idx: usize) -> SqliteResult<ContextI
 fn read_opt_context_id(row: &rusqlite::Row<'_>, idx: usize) -> SqliteResult<Option<ContextId>> {
     let bytes: Option<Vec<u8>> = row.get(idx)?;
     match bytes {
-        Some(b) => ContextId::try_from_slice(&b)
-            .map(Some)
-            .ok_or_else(|| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    idx,
-                    rusqlite::types::Type::Blob,
-                    "invalid ContextId bytes".into(),
-                )
-            }),
+        Some(b) => ContextId::try_from_slice(&b).map(Some).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                idx,
+                rusqlite::types::Type::Blob,
+                "invalid ContextId bytes".into(),
+            )
+        }),
         None => Ok(None),
     }
 }
@@ -383,15 +381,13 @@ fn read_principal_id(row: &rusqlite::Row<'_>, idx: usize) -> SqliteResult<Princi
 fn read_opt_workspace_id(row: &rusqlite::Row<'_>, idx: usize) -> SqliteResult<Option<WorkspaceId>> {
     let bytes: Option<Vec<u8>> = row.get(idx)?;
     match bytes {
-        Some(b) => WorkspaceId::try_from_slice(&b)
-            .map(Some)
-            .ok_or_else(|| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    idx,
-                    rusqlite::types::Type::Blob,
-                    "invalid WorkspaceId bytes".into(),
-                )
-            }),
+        Some(b) => WorkspaceId::try_from_slice(&b).map(Some).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                idx,
+                rusqlite::types::Type::Blob,
+                "invalid WorkspaceId bytes".into(),
+            )
+        }),
         None => Ok(None),
     }
 }
@@ -399,15 +395,13 @@ fn read_opt_workspace_id(row: &rusqlite::Row<'_>, idx: usize) -> SqliteResult<Op
 fn read_opt_preset_id(row: &rusqlite::Row<'_>, idx: usize) -> SqliteResult<Option<PresetId>> {
     let bytes: Option<Vec<u8>> = row.get(idx)?;
     match bytes {
-        Some(b) => PresetId::try_from_slice(&b)
-            .map(Some)
-            .ok_or_else(|| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    idx,
-                    rusqlite::types::Type::Blob,
-                    "invalid PresetId bytes".into(),
-                )
-            }),
+        Some(b) => PresetId::try_from_slice(&b).map(Some).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                idx,
+                rusqlite::types::Type::Blob,
+                "invalid PresetId bytes".into(),
+            )
+        }),
         None => Ok(None),
     }
 }
@@ -451,7 +445,8 @@ fn read_edge_id(row: &rusqlite::Row<'_>, idx: usize) -> SqliteResult<uuid::Uuid>
 
 /// Serialize ToolFilter to JSON TEXT for SQLite.
 fn tool_filter_to_sql(tf: &Option<ToolFilter>) -> Option<String> {
-    tf.as_ref().map(|f| serde_json::to_string(f).unwrap_or_default())
+    tf.as_ref()
+        .map(|f| serde_json::to_string(f).unwrap_or_default())
 }
 
 /// Deserialize ToolFilter from JSON TEXT.
@@ -499,9 +494,10 @@ fn now_millis() -> i64 {
 /// Validate a label: no colons allowed (reserved for tag:prefix syntax).
 fn validate_label(label: &str) -> KernelDbResult<()> {
     if label.contains(':') {
-        return Err(KernelDbError::InvalidLabel(
-            format!("label '{}' must not contain ':'", label),
-        ));
+        return Err(KernelDbError::InvalidLabel(format!(
+            "label '{}' must not contain ':'",
+            label
+        )));
     }
     if label.is_empty() {
         return Err(KernelDbError::InvalidLabel(
@@ -517,16 +513,16 @@ fn validate_label(label: &str) -> KernelDbResult<()> {
 /// We use `ConstraintViolation` as the primary code for both, so we check the
 /// extended code to produce the right error variant.
 fn map_unique_violation(e: rusqlite::Error, msg: impl Into<String>) -> KernelDbError {
-    if let rusqlite::Error::SqliteFailure(err, ref detail) = e {
-        if err.code == rusqlite::ErrorCode::ConstraintViolation {
-            // SQLITE_CONSTRAINT_FOREIGNKEY = 787
-            if err.extended_code == 787 {
-                let detail_str = detail.as_deref().unwrap_or("foreign key constraint failed");
-                return KernelDbError::Validation(detail_str.to_string());
-            }
-            // SQLITE_CONSTRAINT_UNIQUE = 2067, or any other constraint
-            return KernelDbError::LabelConflict(msg.into());
+    if let rusqlite::Error::SqliteFailure(err, ref detail) = e
+        && err.code == rusqlite::ErrorCode::ConstraintViolation
+    {
+        // SQLITE_CONSTRAINT_FOREIGNKEY = 787
+        if err.extended_code == 787 {
+            let detail_str = detail.as_deref().unwrap_or("foreign key constraint failed");
+            return KernelDbError::Validation(detail_str.to_string());
         }
+        // SQLITE_CONSTRAINT_UNIQUE = 2067, or any other constraint
+        return KernelDbError::LabelConflict(msg.into());
     }
     KernelDbError::Db(e)
 }
@@ -584,11 +580,10 @@ impl KernelDb {
     /// (pre-stable-ID era), adopts the most recent context's kernel_id so
     /// existing context rows remain joinable without data loss.
     pub fn get_or_create_kernel_id(&self) -> KernelDbResult<KernelId> {
-        let existing: Option<Vec<u8>> = self.conn.query_row(
-            "SELECT kernel_id FROM kernel LIMIT 1",
-            [],
-            |row| row.get(0),
-        ).ok();
+        let existing: Option<Vec<u8>> = self
+            .conn
+            .query_row("SELECT kernel_id FROM kernel LIMIT 1", [], |row| row.get(0))
+            .ok();
 
         if let Some(bytes) = existing {
             if let Some(id) = KernelId::try_from_slice(&bytes) {
@@ -600,11 +595,14 @@ impl KernelDb {
 
         // No kernel row yet. Check if contexts exist from a previous run
         // (before the kernel table was added) and adopt their kernel_id.
-        let adopted: Option<Vec<u8>> = self.conn.query_row(
-            "SELECT kernel_id FROM contexts ORDER BY created_at DESC LIMIT 1",
-            [],
-            |row| row.get(0),
-        ).ok();
+        let adopted: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT kernel_id FROM contexts ORDER BY created_at DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .ok();
 
         let id = if let Some(bytes) = adopted {
             if let Some(kid) = KernelId::try_from_slice(&bytes) {
@@ -623,11 +621,14 @@ impl KernelDb {
         )?;
 
         // Warn if contexts reference multiple kernel_ids — needs manual cleanup
-        let distinct_count: u32 = self.conn.query_row(
-            "SELECT COUNT(DISTINCT kernel_id) FROM contexts",
-            [],
-            |row| row.get(0),
-        ).unwrap_or(0);
+        let distinct_count: u32 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(DISTINCT kernel_id) FROM contexts",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
         if distinct_count > 1 {
             warn!(
                 "contexts table has {} distinct kernel_ids — run \
@@ -653,7 +654,12 @@ impl KernelDb {
         kernel_id: KernelId,
         created_by: PrincipalId,
     ) -> KernelDbResult<WorkspaceId> {
-        self.get_or_create_builtin_workspace(kernel_id, "__system", "System configuration documents", created_by)
+        self.get_or_create_builtin_workspace(
+            kernel_id,
+            "__system",
+            "System configuration documents",
+            created_by,
+        )
     }
 
     /// Get or create the `__default` workspace (for conversations and file cache).
@@ -663,7 +669,12 @@ impl KernelDb {
         kernel_id: KernelId,
         created_by: PrincipalId,
     ) -> KernelDbResult<WorkspaceId> {
-        self.get_or_create_builtin_workspace(kernel_id, "__default", "Default workspace", created_by)
+        self.get_or_create_builtin_workspace(
+            kernel_id,
+            "__default",
+            "Default workspace",
+            created_by,
+        )
     }
 
     /// Get or create a built-in workspace by label.
@@ -683,7 +694,7 @@ impl KernelDb {
             kernel_id,
             label: label.to_string(),
             description: Some(description.to_string()),
-            created_at: now_millis() as i64,
+            created_at: now_millis(),
             created_by,
             archived_at: None,
         };
@@ -698,22 +709,24 @@ impl KernelDb {
 
     /// Insert a new document.
     pub fn insert_document(&self, row: &DocumentRow) -> KernelDbResult<()> {
-        self.conn.execute(
-            "INSERT INTO documents (
+        self.conn
+            .execute(
+                "INSERT INTO documents (
                 document_id, kernel_id, workspace_id, doc_kind,
                 language, path, created_at, created_by
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                blob_param(row.document_id.as_bytes()),
-                blob_param(row.kernel_id.as_bytes()),
-                blob_param(row.workspace_id.as_bytes()),
-                row.doc_kind.as_str(),
-                row.language,
-                row.path,
-                row.created_at,
-                blob_param(row.created_by.as_bytes()),
-            ],
-        ).map_err(|e| map_unique_violation(e, "document already exists or path conflict"))?;
+                params![
+                    blob_param(row.document_id.as_bytes()),
+                    blob_param(row.kernel_id.as_bytes()),
+                    blob_param(row.workspace_id.as_bytes()),
+                    row.doc_kind.as_str(),
+                    row.language,
+                    row.path,
+                    row.created_at,
+                    blob_param(row.created_by.as_bytes()),
+                ],
+            )
+            .map_err(|e| map_unique_violation(e, "document already exists or path conflict"))?;
         Ok(())
     }
 
@@ -781,7 +794,7 @@ impl KernelDb {
         )?;
         let rows = stmt.query_map(
             params![blob_param(kernel_id.as_bytes()), kind.as_str()],
-            |row| row_to_document_row(row),
+            row_to_document_row,
         )?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
     }
@@ -887,9 +900,9 @@ impl KernelDb {
 
     /// Load all input documents (document_id BLOB + oplog_bytes).
     pub fn list_input_docs(&self) -> KernelDbResult<Vec<(ContextId, Option<Vec<u8>>)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT document_id, oplog_bytes FROM input_docs",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT document_id, oplog_bytes FROM input_docs")?;
         let rows = stmt.query_map([], |row| {
             let doc_id = read_context_id(row, 0)?;
             let oplog_bytes: Option<Vec<u8>> = row.get(1)?;
@@ -933,8 +946,9 @@ impl KernelDb {
             validate_label(label)?;
         }
 
-        self.conn.execute(
-            "INSERT INTO contexts (
+        self.conn
+            .execute(
+                "INSERT INTO contexts (
                 context_id, kernel_id, label, provider, model,
                 system_prompt, tool_filter, consent_mode, created_at,
                 created_by, forked_from, fork_kind, archived_at,
@@ -945,30 +959,31 @@ impl KernelDb {
                 ?10, ?11, ?12, ?13,
                 ?14, ?15
             )",
-            params![
-                blob_param(row.context_id.as_bytes()),
-                blob_param(row.kernel_id.as_bytes()),
-                row.label,
-                row.provider,
-                row.model,
-                row.system_prompt,
-                tool_filter_to_sql(&row.tool_filter),
-                row.consent_mode.as_str(),
-                row.created_at,
-                blob_param(row.created_by.as_bytes()),
-                row.forked_from.as_ref().map(|id| id.as_bytes().to_vec()),
-                row.fork_kind.map(|fk| fk.as_str().to_string()),
-                row.archived_at,
-                row.workspace_id.as_ref().map(|id| id.as_bytes().to_vec()),
-                row.preset_id.as_ref().map(|id| id.as_bytes().to_vec()),
-            ],
-        ).map_err(|e| {
-            if let Some(ref label) = row.label {
-                map_unique_violation(e, format!("label '{}' already in use", label))
-            } else {
-                KernelDbError::Db(e)
-            }
-        })?;
+                params![
+                    blob_param(row.context_id.as_bytes()),
+                    blob_param(row.kernel_id.as_bytes()),
+                    row.label,
+                    row.provider,
+                    row.model,
+                    row.system_prompt,
+                    tool_filter_to_sql(&row.tool_filter),
+                    row.consent_mode.as_str(),
+                    row.created_at,
+                    blob_param(row.created_by.as_bytes()),
+                    row.forked_from.as_ref().map(|id| id.as_bytes().to_vec()),
+                    row.fork_kind.map(|fk| fk.as_str().to_string()),
+                    row.archived_at,
+                    row.workspace_id.as_ref().map(|id| id.as_bytes().to_vec()),
+                    row.preset_id.as_ref().map(|id| id.as_bytes().to_vec()),
+                ],
+            )
+            .map_err(|e| {
+                if let Some(ref label) = row.label {
+                    map_unique_violation(e, format!("label '{}' already in use", label))
+                } else {
+                    KernelDbError::Db(e)
+                }
+            })?;
         Ok(())
     }
 
@@ -996,16 +1011,19 @@ impl KernelDb {
             validate_label(l)?;
         }
 
-        let updated = self.conn.execute(
-            "UPDATE contexts SET label = ?1 WHERE context_id = ?2",
-            params![label, blob_param(id.as_bytes())],
-        ).map_err(|e| {
-            if let Some(l) = label {
-                map_unique_violation(e, format!("label '{}' already in use", l))
-            } else {
-                KernelDbError::Db(e)
-            }
-        })?;
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE contexts SET label = ?1 WHERE context_id = ?2",
+                params![label, blob_param(id.as_bytes())],
+            )
+            .map_err(|e| {
+                if let Some(l) = label {
+                    map_unique_violation(e, format!("label '{}' already in use", l))
+                } else {
+                    KernelDbError::Db(e)
+                }
+            })?;
 
         if updated == 0 {
             return Err(KernelDbError::NotFound(format!("context {}", id.short())));
@@ -1062,10 +1080,7 @@ impl KernelDb {
     ) -> KernelDbResult<()> {
         let updated = self.conn.execute(
             "UPDATE contexts SET tool_filter = ?1 WHERE context_id = ?2",
-            params![
-                tool_filter_to_sql(tool_filter),
-                blob_param(id.as_bytes()),
-            ],
+            params![tool_filter_to_sql(tool_filter), blob_param(id.as_bytes()),],
         )?;
         if updated == 0 {
             return Err(KernelDbError::NotFound(format!("context {}", id.short())));
@@ -1094,7 +1109,7 @@ impl KernelDb {
 
     /// Archive a context (soft delete). Returns true if it was active.
     pub fn archive_context(&self, id: ContextId) -> KernelDbResult<bool> {
-        let now = now_millis() as i64;
+        let now = now_millis();
         let updated = self.conn.execute(
             "UPDATE contexts SET archived_at = ?1
              WHERE context_id = ?2 AND archived_at IS NULL",
@@ -1143,16 +1158,10 @@ impl KernelDb {
     ///
     /// Supports exact label, label prefix, hex prefix. For tag:prefix syntax
     /// (future), walks lineage via CTE.
-    pub fn resolve_context(
-        &self,
-        kernel_id: KernelId,
-        query: &str,
-    ) -> KernelDbResult<ContextId> {
+    pub fn resolve_context(&self, kernel_id: KernelId, query: &str) -> KernelDbResult<ContextId> {
         // Load active contexts for this kernel (set is small, <100)
         let contexts = self.list_active_contexts(kernel_id)?;
-        let items = contexts
-            .iter()
-            .map(|c| (c.context_id, c.label.as_deref()));
+        let items = contexts.iter().map(|c| (c.context_id, c.label.as_deref()));
 
         kaijutsu_types::resolve_prefix(items, query).map_err(|e| match e {
             kaijutsu_types::PrefixError::NoMatch(q) => {
@@ -1276,10 +1285,7 @@ impl KernelDb {
 
     /// Snapshot a subtree rooted at `root_id` via structural edges.
     /// Returns `(ContextRow, depth)`.
-    pub fn subtree_snapshot(
-        &self,
-        root_id: ContextId,
-    ) -> KernelDbResult<Vec<(ContextRow, i64)>> {
+    pub fn subtree_snapshot(&self, root_id: ContextId) -> KernelDbResult<Vec<(ContextRow, i64)>> {
         let mut stmt = self.conn.prepare(
             "WITH RECURSIVE subtree(ctx_id, depth) AS (
                 SELECT ?1, 0
@@ -1340,11 +1346,7 @@ impl KernelDb {
     }
 
     /// Check if adding source→target structural edge would create a cycle.
-    fn would_create_cycle(
-        &self,
-        source: ContextId,
-        target: ContextId,
-    ) -> KernelDbResult<bool> {
+    fn would_create_cycle(&self, source: ContextId, target: ContextId) -> KernelDbResult<bool> {
         if source == target {
             return Ok(true);
         }
@@ -1468,27 +1470,29 @@ impl KernelDb {
     pub fn insert_preset(&self, row: &PresetRow) -> KernelDbResult<()> {
         validate_label(&row.label)?;
 
-        self.conn.execute(
-            "INSERT INTO presets (
+        self.conn
+            .execute(
+                "INSERT INTO presets (
                 preset_id, kernel_id, label, description, provider, model,
                 system_prompt, tool_filter, consent_mode, created_at, created_by
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![
-                blob_param(row.preset_id.as_bytes()),
-                blob_param(row.kernel_id.as_bytes()),
-                row.label,
-                row.description,
-                row.provider,
-                row.model,
-                row.system_prompt,
-                tool_filter_to_sql(&row.tool_filter),
-                row.consent_mode.as_str(),
-                row.created_at,
-                blob_param(row.created_by.as_bytes()),
-            ],
-        ).map_err(|e| {
-            map_unique_violation(e, format!("preset label '{}' already in use", row.label))
-        })?;
+                params![
+                    blob_param(row.preset_id.as_bytes()),
+                    blob_param(row.kernel_id.as_bytes()),
+                    row.label,
+                    row.description,
+                    row.provider,
+                    row.model,
+                    row.system_prompt,
+                    tool_filter_to_sql(&row.tool_filter),
+                    row.consent_mode.as_str(),
+                    row.created_at,
+                    blob_param(row.created_by.as_bytes()),
+                ],
+            )
+            .map_err(|e| {
+                map_unique_violation(e, format!("preset label '{}' already in use", row.label))
+            })?;
         Ok(())
     }
 
@@ -1547,30 +1551,30 @@ impl KernelDb {
     pub fn update_preset(&self, row: &PresetRow) -> KernelDbResult<()> {
         validate_label(&row.label)?;
 
-        let updated = self.conn.execute(
-            "UPDATE presets SET
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE presets SET
                 label = ?1, description = ?2, provider = ?3, model = ?4,
                 system_prompt = ?5, tool_filter = ?6, consent_mode = ?7
              WHERE preset_id = ?8",
-            params![
-                row.label,
-                row.description,
-                row.provider,
-                row.model,
-                row.system_prompt,
-                tool_filter_to_sql(&row.tool_filter),
-                row.consent_mode.as_str(),
-                blob_param(row.preset_id.as_bytes()),
-            ],
-        ).map_err(|e| {
-            map_unique_violation(e, format!("preset label '{}' already in use", row.label))
-        })?;
+                params![
+                    row.label,
+                    row.description,
+                    row.provider,
+                    row.model,
+                    row.system_prompt,
+                    tool_filter_to_sql(&row.tool_filter),
+                    row.consent_mode.as_str(),
+                    blob_param(row.preset_id.as_bytes()),
+                ],
+            )
+            .map_err(|e| {
+                map_unique_violation(e, format!("preset label '{}' already in use", row.label))
+            })?;
 
         if updated == 0 {
-            return Err(KernelDbError::NotFound(format!(
-                "preset {}",
-                row.preset_id
-            )));
+            return Err(KernelDbError::NotFound(format!("preset {}", row.preset_id)));
         }
         Ok(())
     }
@@ -1592,23 +1596,25 @@ impl KernelDb {
     pub fn insert_workspace(&self, row: &WorkspaceRow) -> KernelDbResult<()> {
         validate_label(&row.label)?;
 
-        self.conn.execute(
-            "INSERT INTO workspaces (
+        self.conn
+            .execute(
+                "INSERT INTO workspaces (
                 workspace_id, kernel_id, label, description, created_at,
                 created_by, archived_at
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                blob_param(row.workspace_id.as_bytes()),
-                blob_param(row.kernel_id.as_bytes()),
-                row.label,
-                row.description,
-                row.created_at,
-                blob_param(row.created_by.as_bytes()),
-                row.archived_at,
-            ],
-        ).map_err(|e| {
-            map_unique_violation(e, format!("workspace label '{}' already in use", row.label))
-        })?;
+                params![
+                    blob_param(row.workspace_id.as_bytes()),
+                    blob_param(row.kernel_id.as_bytes()),
+                    row.label,
+                    row.description,
+                    row.created_at,
+                    blob_param(row.created_by.as_bytes()),
+                    row.archived_at,
+                ],
+            )
+            .map_err(|e| {
+                map_unique_violation(e, format!("workspace label '{}' already in use", row.label))
+            })?;
         Ok(())
     }
 
@@ -1682,7 +1688,7 @@ impl KernelDb {
 
     /// Archive a workspace (soft delete). Returns true if it was active.
     pub fn archive_workspace(&self, id: WorkspaceId) -> KernelDbResult<bool> {
-        let now = now_millis() as i64;
+        let now = now_millis();
         let updated = self.conn.execute(
             "UPDATE workspaces SET archived_at = ?1
              WHERE workspace_id = ?2 AND archived_at IS NULL",
@@ -1697,21 +1703,20 @@ impl KernelDb {
 
     /// Insert a workspace path.
     pub fn insert_workspace_path(&self, row: &WorkspacePathRow) -> KernelDbResult<()> {
-        self.conn.execute(
-            "INSERT INTO workspace_paths (workspace_id, path, read_only, created_at)
+        self.conn
+            .execute(
+                "INSERT INTO workspace_paths (workspace_id, path, read_only, created_at)
              VALUES (?1, ?2, ?3, ?4)",
-            params![
-                blob_param(row.workspace_id.as_bytes()),
-                row.path,
-                row.read_only as i64,
-                row.created_at,
-            ],
-        ).map_err(|e| {
-            map_unique_violation(
-                e,
-                format!("workspace path '{}' already exists", row.path),
+                params![
+                    blob_param(row.workspace_id.as_bytes()),
+                    row.path,
+                    row.read_only as i64,
+                    row.created_at,
+                ],
             )
-        })?;
+            .map_err(|e| {
+                map_unique_violation(e, format!("workspace path '{}' already exists", row.path))
+            })?;
         Ok(())
     }
 
@@ -1726,18 +1731,15 @@ impl KernelDb {
              ORDER BY path",
         )?;
 
-        let rows = stmt.query_map(
-            params![blob_param(workspace_id.as_bytes())],
-            |row| {
-                let ro: i64 = row.get(2)?;
-                Ok(WorkspacePathRow {
-                    workspace_id: read_workspace_id(row, 0)?,
-                    path: row.get(1)?,
-                    read_only: ro != 0,
-                    created_at: row.get(3)?,
-                })
-            },
-        )?;
+        let rows = stmt.query_map(params![blob_param(workspace_id.as_bytes())], |row| {
+            let ro: i64 = row.get(2)?;
+            Ok(WorkspacePathRow {
+                workspace_id: read_workspace_id(row, 0)?,
+                path: row.get(1)?,
+                read_only: ro != 0,
+                created_at: row.get(3)?,
+            })
+        })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
     }
 
@@ -1786,17 +1788,14 @@ impl KernelDb {
             "SELECT context_id, cwd, init_script, updated_at
              FROM context_shell WHERE context_id = ?1",
         )?;
-        let mut rows = stmt.query_map(
-            params![blob_param(context_id.as_bytes())],
-            |row| {
-                Ok(ContextShellRow {
-                    context_id: read_context_id(row, 0)?,
-                    cwd: row.get(1)?,
-                    init_script: row.get(2)?,
-                    updated_at: row.get(3)?,
-                })
-            },
-        )?;
+        let mut rows = stmt.query_map(params![blob_param(context_id.as_bytes())], |row| {
+            Ok(ContextShellRow {
+                context_id: read_context_id(row, 0)?,
+                cwd: row.get(1)?,
+                init_script: row.get(2)?,
+                updated_at: row.get(3)?,
+            })
+        })?;
         match rows.next() {
             Some(r) => Ok(Some(r?)),
             None => Ok(None),
@@ -1804,11 +1803,7 @@ impl KernelDb {
     }
 
     /// Copy shell config from source to target. Returns true if source had config.
-    pub fn copy_context_shell(
-        &self,
-        source: ContextId,
-        target: ContextId,
-    ) -> KernelDbResult<bool> {
+    pub fn copy_context_shell(&self, source: ContextId, target: ContextId) -> KernelDbResult<bool> {
         let src = match self.get_context_shell(source)? {
             Some(s) => s,
             None => return Ok(false),
@@ -1817,7 +1812,7 @@ impl KernelDb {
             context_id: target,
             cwd: src.cwd,
             init_script: src.init_script,
-            updated_at: now_millis() as i64,
+            updated_at: now_millis(),
         };
         self.upsert_context_shell(&row)?;
         Ok(true)
@@ -1844,33 +1839,23 @@ impl KernelDb {
     }
 
     /// Get all environment variables for a context.
-    pub fn get_context_env(
-        &self,
-        context_id: ContextId,
-    ) -> KernelDbResult<Vec<ContextEnvRow>> {
+    pub fn get_context_env(&self, context_id: ContextId) -> KernelDbResult<Vec<ContextEnvRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT context_id, key, value FROM context_env
              WHERE context_id = ?1 ORDER BY key",
         )?;
-        let rows = stmt.query_map(
-            params![blob_param(context_id.as_bytes())],
-            |row| {
-                Ok(ContextEnvRow {
-                    context_id: read_context_id(row, 0)?,
-                    key: row.get(1)?,
-                    value: row.get(2)?,
-                })
-            },
-        )?;
+        let rows = stmt.query_map(params![blob_param(context_id.as_bytes())], |row| {
+            Ok(ContextEnvRow {
+                context_id: read_context_id(row, 0)?,
+                key: row.get(1)?,
+                value: row.get(2)?,
+            })
+        })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
     }
 
     /// Delete a single environment variable. Returns true if it existed.
-    pub fn delete_context_env(
-        &self,
-        context_id: ContextId,
-        key: &str,
-    ) -> KernelDbResult<bool> {
+    pub fn delete_context_env(&self, context_id: ContextId, key: &str) -> KernelDbResult<bool> {
         let deleted = self.conn.execute(
             "DELETE FROM context_env WHERE context_id = ?1 AND key = ?2",
             params![blob_param(context_id.as_bytes()), key],
@@ -1888,11 +1873,7 @@ impl KernelDb {
     }
 
     /// Copy all env vars from source to target. Returns count copied.
-    pub fn copy_context_env(
-        &self,
-        source: ContextId,
-        target: ContextId,
-    ) -> KernelDbResult<u64> {
+    pub fn copy_context_env(&self, source: ContextId, target: ContextId) -> KernelDbResult<u64> {
         let vars = self.get_context_env(source)?;
         for var in &vars {
             self.set_context_env(target, &var.key, &var.value)?;
@@ -1906,11 +1887,7 @@ impl KernelDb {
 
     /// Copy shell config + env vars from source context to target.
     /// Called during all fork operations.
-    pub fn fork_context_config(
-        &self,
-        source: ContextId,
-        target: ContextId,
-    ) -> KernelDbResult<()> {
+    pub fn fork_context_config(&self, source: ContextId, target: ContextId) -> KernelDbResult<()> {
         self.copy_context_shell(source, target)?;
         self.copy_context_env(source, target)?;
         Ok(())
@@ -1922,7 +1899,8 @@ impl KernelDb {
         &self,
         context_id: ContextId,
     ) -> KernelDbResult<Option<Vec<WorkspacePathRow>>> {
-        let ctx = self.get_context(context_id)?
+        let ctx = self
+            .get_context(context_id)?
             .ok_or_else(|| KernelDbError::NotFound(format!("context {}", context_id.short())))?;
         match ctx.workspace_id {
             Some(ws_id) => {
@@ -2015,7 +1993,10 @@ impl KernelDb {
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM contexts
              WHERE kernel_id = ?1 AND preset_id = ?2 AND archived_at IS NULL",
-            params![blob_param(kernel_id.as_bytes()), blob_param(preset_id.as_bytes())],
+            params![
+                blob_param(kernel_id.as_bytes()),
+                blob_param(preset_id.as_bytes())
+            ],
             |row| row.get(0),
         )?;
         Ok(count as usize)
@@ -2030,7 +2011,10 @@ impl KernelDb {
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM contexts
              WHERE kernel_id = ?1 AND workspace_id = ?2 AND archived_at IS NULL",
-            params![blob_param(kernel_id.as_bytes()), blob_param(workspace_id.as_bytes())],
+            params![
+                blob_param(kernel_id.as_bytes()),
+                blob_param(workspace_id.as_bytes())
+            ],
             |row| row.get(0),
         )?;
         Ok(count as usize)
@@ -2182,7 +2166,8 @@ fn insert_context_with_doc(db: &KernelDb, row: &ContextRow, ws_id: WorkspaceId) 
         path: None,
         created_at: row.created_at,
         created_by: row.created_by,
-    }).unwrap();
+    })
+    .unwrap();
     db.insert_context(row).unwrap();
 }
 
@@ -2282,16 +2267,24 @@ mod tests {
         // Same kernel, same label → conflict (doc insert ok, context label conflicts)
         let row2 = make_context_row(kid, Some("shared"));
         db.insert_document(&DocumentRow {
-            document_id: row2.context_id, kernel_id: kid, workspace_id: ws_id,
-            doc_kind: DocKind::Conversation, language: None, path: None,
-            created_at: row2.created_at, created_by: row2.created_by,
-        }).unwrap();
+            document_id: row2.context_id,
+            kernel_id: kid,
+            workspace_id: ws_id,
+            doc_kind: DocKind::Conversation,
+            language: None,
+            path: None,
+            created_at: row2.created_at,
+            created_by: row2.created_by,
+        })
+        .unwrap();
         let err = db.insert_context(&row2).unwrap_err();
         assert!(matches!(err, KernelDbError::LabelConflict(_)));
 
         // Different kernel, same label → OK (needs its own workspace)
         let kid2 = KernelId::new();
-        let ws_id2 = db.get_or_create_default_workspace(kid2, PrincipalId::system()).unwrap();
+        let ws_id2 = db
+            .get_or_create_default_workspace(kid2, PrincipalId::system())
+            .unwrap();
         let row3 = make_context_row(kid2, Some("shared"));
         insert_context_with_doc(&db, &row3, ws_id2);
 
@@ -2344,13 +2337,21 @@ mod tests {
 
         let c1 = make_context_row(kid, Some("child1"));
         insert_context_with_doc(&db, &c1, ws_id);
-        db.insert_edge(&make_edge(parent.context_id, c1.context_id, EdgeKind::Structural))
-            .unwrap();
+        db.insert_edge(&make_edge(
+            parent.context_id,
+            c1.context_id,
+            EdgeKind::Structural,
+        ))
+        .unwrap();
 
         let c2 = make_context_row(kid, Some("child2"));
         insert_context_with_doc(&db, &c2, ws_id);
-        db.insert_edge(&make_edge(parent.context_id, c2.context_id, EdgeKind::Structural))
-            .unwrap();
+        db.insert_edge(&make_edge(
+            parent.context_id,
+            c2.context_id,
+            EdgeKind::Structural,
+        ))
+        .unwrap();
 
         let snapshot = db.subtree_snapshot(parent.context_id).unwrap();
         assert_eq!(snapshot.len(), 3);
@@ -2524,9 +2525,10 @@ mod tests {
         assert_eq!(paths.len(), 2);
 
         // Delete one path
-        assert!(db
-            .delete_workspace_path(ws.workspace_id, "/home/user/src/kaish")
-            .unwrap());
+        assert!(
+            db.delete_workspace_path(ws.workspace_id, "/home/user/src/kaish")
+                .unwrap()
+        );
         let paths = db.list_workspace_paths(ws.workspace_id).unwrap();
         assert_eq!(paths.len(), 1);
 
@@ -2622,10 +2624,18 @@ mod tests {
             insert_context_with_doc(&db, ctx, ws_id);
         }
 
-        db.insert_edge(&make_edge(root.context_id, a.context_id, EdgeKind::Structural))
-            .unwrap();
-        db.insert_edge(&make_edge(root.context_id, b.context_id, EdgeKind::Structural))
-            .unwrap();
+        db.insert_edge(&make_edge(
+            root.context_id,
+            a.context_id,
+            EdgeKind::Structural,
+        ))
+        .unwrap();
+        db.insert_edge(&make_edge(
+            root.context_id,
+            b.context_id,
+            EdgeKind::Structural,
+        ))
+        .unwrap();
         db.insert_edge(&make_edge(a.context_id, c.context_id, EdgeKind::Structural))
             .unwrap();
         db.insert_edge(&make_edge(a.context_id, d.context_id, EdgeKind::Structural))
@@ -2856,7 +2866,9 @@ mod tests {
             provider: Some("google".into()),
             model: Some("gemini-2.0-flash".into()),
             system_prompt: Some("Be concise.".into()),
-            tool_filter: Some(ToolFilter::AllowList(["read".to_string(), "write".to_string()].into())),
+            tool_filter: Some(ToolFilter::AllowList(
+                ["read".to_string(), "write".to_string()].into(),
+            )),
             consent_mode: ConsentMode::Autonomous,
             created_at: 2000,
             created_by: creator,
@@ -2876,7 +2888,9 @@ mod tests {
         assert_eq!(recovered.provider, Some("google".into()));
         assert_eq!(recovered.model, Some("gemini-2.0-flash".into()));
         assert_eq!(recovered.system_prompt, Some("Be concise.".into()));
-        assert!(matches!(recovered.tool_filter, Some(ToolFilter::AllowList(ref s)) if s.len() == 2));
+        assert!(
+            matches!(recovered.tool_filter, Some(ToolFilter::AllowList(ref s)) if s.len() == 2)
+        );
         assert_eq!(recovered.consent_mode, ConsentMode::Autonomous);
         assert_eq!(recovered.created_at, 2000);
         assert_eq!(recovered.created_by, creator);
@@ -2902,7 +2916,8 @@ mod tests {
         assert_eq!(updated.tool_filter, Some(ToolFilter::All));
 
         // Verify update_model roundtrip
-        db.update_model(child_id, Some("deepseek"), Some("deepseek-r1")).unwrap();
+        db.update_model(child_id, Some("deepseek"), Some("deepseek-r1"))
+            .unwrap();
         let updated = db.get_context(child_id).unwrap().unwrap();
         assert_eq!(updated.provider, Some("deepseek".into()));
         assert_eq!(updated.model, Some("deepseek-r1".into()));
@@ -2919,10 +2934,16 @@ mod tests {
         let ctx_id = ContextId::new();
         // Insert document with valid workspace first
         db.insert_document(&DocumentRow {
-            document_id: ctx_id, kernel_id: kid, workspace_id: ws_id,
-            doc_kind: DocKind::Conversation, language: None, path: None,
-            created_at: now_millis() as i64, created_by: PrincipalId::new(),
-        }).unwrap();
+            document_id: ctx_id,
+            kernel_id: kid,
+            workspace_id: ws_id,
+            doc_kind: DocKind::Conversation,
+            language: None,
+            path: None,
+            created_at: now_millis() as i64,
+            created_by: PrincipalId::new(),
+        })
+        .unwrap();
 
         let row = ContextRow {
             context_id: ctx_id,
@@ -3011,7 +3032,10 @@ mod tests {
         };
         db.upsert_context_shell(&row).unwrap();
 
-        assert!(db.copy_context_shell(src.context_id, tgt.context_id).unwrap());
+        assert!(
+            db.copy_context_shell(src.context_id, tgt.context_id)
+                .unwrap()
+        );
 
         let copied = db.get_context_shell(tgt.context_id).unwrap().unwrap();
         assert_eq!(copied.cwd, Some("/home/user/project".into()));
@@ -3028,7 +3052,10 @@ mod tests {
         insert_context_with_doc(&db, &tgt, ws_id);
 
         // Copy from context with no shell config → returns false
-        assert!(!db.copy_context_shell(src.context_id, tgt.context_id).unwrap());
+        assert!(
+            !db.copy_context_shell(src.context_id, tgt.context_id)
+                .unwrap()
+        );
         assert!(db.get_context_shell(tgt.context_id).unwrap().is_none());
     }
 
@@ -3044,7 +3071,8 @@ mod tests {
             cwd: Some("/tmp".into()),
             init_script: None,
             updated_at: now_millis() as i64,
-        }).unwrap();
+        })
+        .unwrap();
         assert!(db.get_context_shell(ctx.context_id).unwrap().is_some());
 
         // Delete context → shell row should cascade
@@ -3066,7 +3094,8 @@ mod tests {
         assert!(vars.is_empty());
 
         // Set vars
-        db.set_context_env(ctx.context_id, "RUST_LOG", "debug").unwrap();
+        db.set_context_env(ctx.context_id, "RUST_LOG", "debug")
+            .unwrap();
         db.set_context_env(ctx.context_id, "EDITOR", "vim").unwrap();
 
         let vars = db.get_context_env(ctx.context_id).unwrap();
@@ -3085,8 +3114,10 @@ mod tests {
         let ctx = make_context_row(kid, Some("env-upsert"));
         insert_context_with_doc(&db, &ctx, ws_id);
 
-        db.set_context_env(ctx.context_id, "RUST_LOG", "debug").unwrap();
-        db.set_context_env(ctx.context_id, "RUST_LOG", "trace").unwrap();
+        db.set_context_env(ctx.context_id, "RUST_LOG", "debug")
+            .unwrap();
+        db.set_context_env(ctx.context_id, "RUST_LOG", "trace")
+            .unwrap();
 
         let vars = db.get_context_env(ctx.context_id).unwrap();
         assert_eq!(vars.len(), 1);
@@ -3137,9 +3168,11 @@ mod tests {
         insert_context_with_doc(&db, &src, ws_id);
         insert_context_with_doc(&db, &tgt, ws_id);
 
-        db.set_context_env(src.context_id, "RUST_LOG", "debug").unwrap();
+        db.set_context_env(src.context_id, "RUST_LOG", "debug")
+            .unwrap();
         db.set_context_env(src.context_id, "EDITOR", "vim").unwrap();
-        db.set_context_env(src.context_id, "SHELL", "/bin/bash").unwrap();
+        db.set_context_env(src.context_id, "SHELL", "/bin/bash")
+            .unwrap();
 
         let count = db.copy_context_env(src.context_id, tgt.context_id).unwrap();
         assert_eq!(count, 3);
@@ -3224,12 +3257,16 @@ mod tests {
             cwd: Some("/home/user/src/kaijutsu".into()),
             init_script: None,
             updated_at: now_millis() as i64,
-        }).unwrap();
-        db.set_context_env(src.context_id, "RUST_LOG", "debug").unwrap();
+        })
+        .unwrap();
+        db.set_context_env(src.context_id, "RUST_LOG", "debug")
+            .unwrap();
         db.set_context_env(src.context_id, "EDITOR", "vim").unwrap();
-        db.set_context_env(src.context_id, "TERM", "xterm-256color").unwrap();
+        db.set_context_env(src.context_id, "TERM", "xterm-256color")
+            .unwrap();
 
-        db.fork_context_config(src.context_id, tgt.context_id).unwrap();
+        db.fork_context_config(src.context_id, tgt.context_id)
+            .unwrap();
 
         // Shell config copied
         let shell = db.get_context_shell(tgt.context_id).unwrap().unwrap();
@@ -3250,7 +3287,8 @@ mod tests {
         insert_context_with_doc(&db, &tgt, ws_id);
 
         // Fork from context with no config → no error, no data on target
-        db.fork_context_config(src.context_id, tgt.context_id).unwrap();
+        db.fork_context_config(src.context_id, tgt.context_id)
+            .unwrap();
 
         assert!(db.get_context_shell(tgt.context_id).unwrap().is_none());
         assert!(db.get_context_env(tgt.context_id).unwrap().is_empty());
@@ -3281,13 +3319,15 @@ mod tests {
             path: "/home/user/src/project".into(),
             read_only: false,
             created_at: now,
-        }).unwrap();
+        })
+        .unwrap();
         db.insert_workspace_path(&WorkspacePathRow {
             workspace_id: ws.workspace_id,
             path: "/home/user/docs".into(),
             read_only: true,
             created_at: now,
-        }).unwrap();
+        })
+        .unwrap();
 
         // Create context with workspace bound
         let mut ctx = make_context_row(kid, Some("bound"));
@@ -3332,7 +3372,9 @@ mod tests {
 
         // Simulate pre-stable-ID era: contexts exist with an old kernel_id
         let old_kid = KernelId::new();
-        let ws_id = db.get_or_create_default_workspace(old_kid, PrincipalId::system()).unwrap();
+        let ws_id = db
+            .get_or_create_default_workspace(old_kid, PrincipalId::system())
+            .unwrap();
         let ctx = make_context_row(old_kid, Some("legacy"));
         insert_context_with_doc(&db, &ctx, ws_id);
 
@@ -3355,7 +3397,9 @@ mod tests {
         insert_context_with_doc(&db, &ctx, ws_id);
 
         // Unbound context → None (no restriction)
-        let result = db.check_workspace_path(ctx.context_id, "/anywhere").unwrap();
+        let result = db
+            .check_workspace_path(ctx.context_id, "/anywhere")
+            .unwrap();
         assert!(result.is_none());
     }
 
@@ -3381,14 +3425,17 @@ mod tests {
             path: "/home/user/src/kaijutsu".into(),
             read_only: false,
             created_at: now,
-        }).unwrap();
+        })
+        .unwrap();
 
         let mut ctx = make_context_row(kid, Some("bound"));
         ctx.workspace_id = Some(ws.workspace_id);
         insert_context_with_doc(&db, &ctx, ws.workspace_id);
 
         // Path inside workspace rw path → Some(false)
-        let result = db.check_workspace_path(ctx.context_id, "/home/user/src/kaijutsu/src/main.rs").unwrap();
+        let result = db
+            .check_workspace_path(ctx.context_id, "/home/user/src/kaijutsu/src/main.rs")
+            .unwrap();
         assert_eq!(result, Some(false));
     }
 
@@ -3414,14 +3461,17 @@ mod tests {
             path: "/home/user/docs".into(),
             read_only: true,
             created_at: now,
-        }).unwrap();
+        })
+        .unwrap();
 
         let mut ctx = make_context_row(kid, Some("bound"));
         ctx.workspace_id = Some(ws.workspace_id);
         insert_context_with_doc(&db, &ctx, ws.workspace_id);
 
         // Path inside workspace ro path → Some(true)
-        let result = db.check_workspace_path(ctx.context_id, "/home/user/docs/README.md").unwrap();
+        let result = db
+            .check_workspace_path(ctx.context_id, "/home/user/docs/README.md")
+            .unwrap();
         assert_eq!(result, Some(true));
     }
 
@@ -3447,14 +3497,17 @@ mod tests {
             path: "/home/user/src/kaijutsu".into(),
             read_only: false,
             created_at: now,
-        }).unwrap();
+        })
+        .unwrap();
 
         let mut ctx = make_context_row(kid, Some("bound"));
         ctx.workspace_id = Some(ws.workspace_id);
         insert_context_with_doc(&db, &ctx, ws.workspace_id);
 
         // Path outside all workspace paths → Validation error
-        let err = db.check_workspace_path(ctx.context_id, "/etc/passwd").unwrap_err();
+        let err = db
+            .check_workspace_path(ctx.context_id, "/etc/passwd")
+            .unwrap_err();
         assert!(matches!(err, KernelDbError::Validation(_)));
     }
 
@@ -3480,13 +3533,15 @@ mod tests {
             path: "/home/user/src".into(),
             read_only: false,
             created_at: now,
-        }).unwrap();
+        })
+        .unwrap();
         db.insert_workspace_path(&WorkspacePathRow {
             workspace_id: ws.workspace_id,
             path: "/home/user/src/kaijutsu/docs".into(),
             read_only: true,
             created_at: now,
-        }).unwrap();
+        })
+        .unwrap();
 
         let mut ctx = make_context_row(kid, Some("bound"));
         ctx.workspace_id = Some(ws.workspace_id);
@@ -3494,13 +3549,15 @@ mod tests {
 
         // /home/user/src/kaijutsu/src → matches /home/user/src (rw)
         assert_eq!(
-            db.check_workspace_path(ctx.context_id, "/home/user/src/kaijutsu/src/main.rs").unwrap(),
+            db.check_workspace_path(ctx.context_id, "/home/user/src/kaijutsu/src/main.rs")
+                .unwrap(),
             Some(false),
         );
 
         // /home/user/src/kaijutsu/docs/README.md → matches /home/user/src/kaijutsu/docs (ro, longer prefix)
         assert_eq!(
-            db.check_workspace_path(ctx.context_id, "/home/user/src/kaijutsu/docs/README.md").unwrap(),
+            db.check_workspace_path(ctx.context_id, "/home/user/src/kaijutsu/docs/README.md")
+                .unwrap(),
             Some(true),
         );
     }

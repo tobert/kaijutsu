@@ -77,7 +77,9 @@ fn spawn_constellation_container(
         ))
         .id();
 
-    commands.entity(content_entity).add_child(constellation_entity);
+    commands
+        .entity(content_entity)
+        .add_child(constellation_entity);
     info!("Spawned constellation container");
 }
 
@@ -101,7 +103,13 @@ fn spawn_legend_panel(
     let vello_bg = VelloColor::new([bg_color.red, bg_color.green, bg_color.blue, bg_color.alpha]);
     let mut scene = bevy_vello::vello::Scene::new();
     let rect = RoundedRect::new(0.0, 0.0, 160.0, 120.0, 4.0);
-    scene.fill(Fill::NonZero, bevy_vello::vello::kurbo::Affine::IDENTITY, vello_bg, None, &rect);
+    scene.fill(
+        Fill::NonZero,
+        bevy_vello::vello::kurbo::Affine::IDENTITY,
+        vello_bg,
+        None,
+        &rect,
+    );
 
     let legend_entity = commands
         .spawn((
@@ -156,8 +164,12 @@ fn update_legend_content(
 
     let fingerprint = {
         let mut h: u64 = constellation.nodes.len() as u64;
-        h = h.wrapping_mul(31).wrapping_add(drift_state.staged.len() as u64);
-        h = h.wrapping_mul(31).wrapping_add(drift_state.contexts.len() as u64);
+        h = h
+            .wrapping_mul(31)
+            .wrapping_add(drift_state.staged.len() as u64);
+        h = h
+            .wrapping_mul(31)
+            .wrapping_add(drift_state.contexts.len() as u64);
         for ctx in &drift_state.contexts {
             h = h.wrapping_mul(31).wrapping_add(ctx.provider.len() as u64);
         }
@@ -183,7 +195,13 @@ fn update_legend_content(
     let font = &font_handles.mono;
 
     // Header: kernel name
-    let header = spawn_legend_text(&mut commands, font, &truncate_chars(kernel_name, 18), theme.fg, 11.0);
+    let header = spawn_legend_text(
+        &mut commands,
+        font,
+        &truncate_chars(kernel_name, 18),
+        theme.fg,
+        11.0,
+    );
     commands.entity(legend_entity).add_child(header);
 
     // Summary line
@@ -194,7 +212,8 @@ fn update_legend_content(
     // Staged drift count
     if staged_count > 0 {
         let drift_text = format!("{} staged drifts", staged_count);
-        let drift_entity = spawn_legend_text(&mut commands, font, &drift_text, theme.ansi.cyan, 9.0);
+        let drift_entity =
+            spawn_legend_text(&mut commands, font, &drift_text, theme.ansi.cyan, 9.0);
         commands.entity(legend_entity).add_child(drift_entity);
     }
 
@@ -231,4 +250,3 @@ fn spawn_legend_text(
         })
         .id()
 }
-

@@ -129,9 +129,7 @@ impl From<VfsError> for io::Error {
         match e {
             VfsError::NotFound(msg) => io::Error::new(io::ErrorKind::NotFound, msg),
             VfsError::AlreadyExists(msg) => io::Error::new(io::ErrorKind::AlreadyExists, msg),
-            VfsError::PermissionDenied(msg) => {
-                io::Error::new(io::ErrorKind::PermissionDenied, msg)
-            }
+            VfsError::PermissionDenied(msg) => io::Error::new(io::ErrorKind::PermissionDenied, msg),
             VfsError::ReadOnly => {
                 io::Error::new(io::ErrorKind::PermissionDenied, "filesystem is read-only")
             }
@@ -140,18 +138,12 @@ impl From<VfsError> for io::Error {
             VfsError::DirectoryNotEmpty(msg) => {
                 io::Error::new(io::ErrorKind::DirectoryNotEmpty, msg)
             }
-            VfsError::PathEscapesRoot(msg) => {
-                io::Error::new(io::ErrorKind::PermissionDenied, msg)
-            }
+            VfsError::PathEscapesRoot(msg) => io::Error::new(io::ErrorKind::PermissionDenied, msg),
             VfsError::InvalidPath(msg) => io::Error::new(io::ErrorKind::InvalidInput, msg),
             VfsError::NoMountPoint(msg) => io::Error::new(io::ErrorKind::NotFound, msg),
             VfsError::NotASymlink(msg) => io::Error::new(io::ErrorKind::InvalidInput, msg),
-            VfsError::CrossDeviceLink => {
-                io::Error::other("cross-device link")
-            }
-            VfsError::TooManySymlinks => {
-                io::Error::other("too many symbolic links")
-            }
+            VfsError::CrossDeviceLink => io::Error::other("cross-device link"),
+            VfsError::TooManySymlinks => io::Error::other("too many symbolic links"),
             VfsError::NameTooLong => {
                 io::Error::new(io::ErrorKind::InvalidInput, "file name too long")
             }

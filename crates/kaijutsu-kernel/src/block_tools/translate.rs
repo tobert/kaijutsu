@@ -46,14 +46,10 @@ pub fn line_to_byte_offset(content: &str, line: u32) -> Result<usize> {
 
     // Allow inserting at end (one past the last line)
     let line_count = content.lines().count() as u32;
-    let has_trailing_newline = content.ends_with('\n');
-
-    // Calculate the actual number of "line positions" available
-    let max_line = if has_trailing_newline || content.is_empty() {
-        line_count
-    } else {
-        line_count // Can insert at the start of a virtual line after content
-    };
+    // The maximum addressable line position is always line_count:
+    // - trailing newline or empty content: line_count lines exist
+    // - no trailing newline: we allow inserting at a virtual line after content
+    let max_line = line_count;
 
     if line == max_line {
         Ok(content.len())
@@ -217,8 +213,8 @@ mod tests {
     #[test]
     fn test_line_to_byte_offset_multiple_lines() {
         let content = "hello\nworld\n";
-        assert_eq!(line_to_byte_offset(content, 0), Ok(0));  // Start of "hello"
-        assert_eq!(line_to_byte_offset(content, 1), Ok(6));  // Start of "world"
+        assert_eq!(line_to_byte_offset(content, 0), Ok(0)); // Start of "hello"
+        assert_eq!(line_to_byte_offset(content, 1), Ok(6)); // Start of "world"
         assert_eq!(line_to_byte_offset(content, 2), Ok(12)); // After final newline
     }
 
@@ -243,8 +239,8 @@ mod tests {
 
         // Range for line 1 only
         let (start, end) = line_range_to_byte_range(content, 1, 2).unwrap();
-        assert_eq!(start, 6);  // Start of line2
-        assert_eq!(end, 12);   // Start of line3
+        assert_eq!(start, 6); // Start of line2
+        assert_eq!(end, 12); // Start of line3
         assert_eq!(&content[start..end], "line2\n");
     }
 
@@ -264,7 +260,10 @@ mod tests {
         let result = validate_expected_text(content, 1, 2, "wrong");
         assert!(result.is_err());
 
-        if let Err(EditError::ContentMismatch { expected, actual, .. }) = result {
+        if let Err(EditError::ContentMismatch {
+            expected, actual, ..
+        }) = result
+        {
             assert_eq!(expected, "wrong");
             assert_eq!(actual, "line2");
         } else {

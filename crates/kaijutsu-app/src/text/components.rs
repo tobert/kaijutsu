@@ -58,8 +58,8 @@ pub fn bevy_color_to_brush(color: Color) -> vello::peniko::Brush {
 ///
 /// Uses `Extend::Repeat` so the palette tiles seamlessly across any text width.
 pub fn rainbow_brush(offset: f32, alpha: f32) -> vello::peniko::Brush {
-    use vello::peniko::{Extend, Gradient};
     use vello::peniko::color::DynamicColor;
+    use vello::peniko::{Extend, Gradient};
 
     fn c(r: u8, g: u8, b: u8, a: f32) -> DynamicColor {
         vello::peniko::Color::from_rgba8(r, g, b, (a * 255.0) as u8).into()

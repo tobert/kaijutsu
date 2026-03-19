@@ -6,7 +6,7 @@
 //! - Import from OpenSSH authorized_keys format
 
 use kaijutsu_types::{Principal, PrincipalId};
-use rusqlite::{params, Connection, Result as SqliteResult};
+use rusqlite::{Connection, Result as SqliteResult, params};
 use russh::keys::ssh_key::{self, HashAlg};
 use std::fs;
 use std::path::Path;
@@ -148,10 +148,7 @@ impl AuthDb {
     }
 
     /// Get a principal by username.
-    pub fn get_principal_by_username(
-        &self,
-        username: &str,
-    ) -> SqliteResult<Option<Principal>> {
+    pub fn get_principal_by_username(&self, username: &str) -> SqliteResult<Option<Principal>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, username, display_name
              FROM principals WHERE username = ?1",
@@ -187,7 +184,7 @@ impl AuthDb {
              FROM principals ORDER BY username",
         )?;
 
-        let rows = stmt.query_map([], |row| row_to_principal(row))?;
+        let rows = stmt.query_map([], row_to_principal)?;
         rows.collect()
     }
 
@@ -453,13 +450,9 @@ impl AuthDb {
     /// Creates a principal for each unique key.
     ///
     /// Returns the number of keys imported.
-    pub fn import_authorized_keys<P: AsRef<Path>>(
-        &mut self,
-        path: P,
-    ) -> SqliteResult<usize> {
-        let content = fs::read_to_string(path).map_err(|e| {
-            rusqlite::Error::ToSqlConversionFailure(Box::new(e))
-        })?;
+    pub fn import_authorized_keys<P: AsRef<Path>>(&mut self, path: P) -> SqliteResult<usize> {
+        let content = fs::read_to_string(path)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
 
         let mut imported = 0;
 
@@ -573,10 +566,7 @@ mod tests {
 
     #[test]
     fn test_nick_from_fingerprint() {
-        assert_eq!(
-            nick_from_fingerprint("SHA256:abcdefghijklmnop"),
-            "ijklmnop"
-        );
+        assert_eq!(nick_from_fingerprint("SHA256:abcdefghijklmnop"), "ijklmnop");
         assert_eq!(nick_from_fingerprint("SHA256:short"), "short");
         assert_eq!(nick_from_fingerprint("SHA256:12345678"), "12345678");
     }
@@ -599,9 +589,7 @@ mod tests {
         let db = AuthDb::in_memory().unwrap();
         assert!(db.is_empty().unwrap());
 
-        let id = db
-            .create_principal("amy", "Amy Tobey")
-            .unwrap();
+        let id = db.create_principal("amy", "Amy Tobey").unwrap();
         assert!(!db.is_empty().unwrap());
 
         let principal = db.get_principal_by_username("amy").unwrap().unwrap();
@@ -615,14 +603,8 @@ mod tests {
 
         // Rename
         assert!(db.set_username("amy", "atobey").unwrap());
-        assert!(db
-            .get_principal_by_username("amy")
-            .unwrap()
-            .is_none());
-        assert!(db
-            .get_principal_by_username("atobey")
-            .unwrap()
-            .is_some());
+        assert!(db.get_principal_by_username("amy").unwrap().is_none());
+        assert!(db.get_principal_by_username("atobey").unwrap().is_some());
     }
 
     #[test]
@@ -674,9 +656,7 @@ mod tests {
     fn test_multiple_keys_per_principal() {
         let db = AuthDb::in_memory().unwrap();
 
-        let principal_id = db
-            .create_principal("multikey", "Multi Key User")
-            .unwrap();
+        let principal_id = db.create_principal("multikey", "Multi Key User").unwrap();
 
         let key1 = make_test_key();
         let key2 = make_test_key();
@@ -734,10 +714,7 @@ mod tests {
         assert!(db.get_key(&fingerprint).unwrap().is_none());
 
         // Principal should be gone
-        assert!(db
-            .get_principal_by_username("test-user")
-            .unwrap()
-            .is_none());
+        assert!(db.get_principal_by_username("test-user").unwrap().is_none());
     }
 
     #[test]

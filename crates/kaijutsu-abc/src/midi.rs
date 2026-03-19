@@ -1130,8 +1130,7 @@ mod tests {
         assert!(!result.has_errors());
         // Currently NOT parsed because it's after K:
         assert_eq!(
-            result.value.header.midi_program,
-            None,
+            result.value.header.midi_program, None,
             "%%MIDI program after K: is not parsed (in body, not header)"
         );
     }
@@ -1140,11 +1139,31 @@ mod tests {
     fn test_midi_program_various_positions() {
         // Test %%MIDI program works in various valid header positions
         let cases = [
-            ("X:1\n%%MIDI program 40\nT:Test\nM:4/4\nK:C\nC|\n", Some(40), "after X:"),
-            ("X:1\nT:Test\n%%MIDI program 41\nM:4/4\nK:C\nC|\n", Some(41), "after T:"),
-            ("X:1\nT:Test\nM:4/4\n%%MIDI program 42\nL:1/4\nK:C\nC|\n", Some(42), "after M:"),
-            ("X:1\nT:Test\nM:4/4\nL:1/4\n%%MIDI program 43\nK:C\nC|\n", Some(43), "before K:"),
-            ("X:1\nT:Test\nM:4/4\nL:1/4\nK:C\n%%MIDI program 44\nC|\n", None, "after K: (body)"),
+            (
+                "X:1\n%%MIDI program 40\nT:Test\nM:4/4\nK:C\nC|\n",
+                Some(40),
+                "after X:",
+            ),
+            (
+                "X:1\nT:Test\n%%MIDI program 41\nM:4/4\nK:C\nC|\n",
+                Some(41),
+                "after T:",
+            ),
+            (
+                "X:1\nT:Test\nM:4/4\n%%MIDI program 42\nL:1/4\nK:C\nC|\n",
+                Some(42),
+                "after M:",
+            ),
+            (
+                "X:1\nT:Test\nM:4/4\nL:1/4\n%%MIDI program 43\nK:C\nC|\n",
+                Some(43),
+                "before K:",
+            ),
+            (
+                "X:1\nT:Test\nM:4/4\nL:1/4\nK:C\n%%MIDI program 44\nC|\n",
+                None,
+                "after K: (body)",
+            ),
         ];
 
         for (abc, expected_program, position) in cases {
@@ -1152,7 +1171,8 @@ mod tests {
             assert!(!result.has_errors(), "Parse failed for {}", position);
             assert_eq!(
                 result.value.header.midi_program, expected_program,
-                "Wrong program for %%MIDI {}", position
+                "Wrong program for %%MIDI {}",
+                position
             );
         }
     }

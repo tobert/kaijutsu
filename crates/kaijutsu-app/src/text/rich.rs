@@ -9,8 +9,8 @@
 //! (more specific fence pattern), then SVG, then falls back to markdown.
 
 use bevy::prelude::*;
-use bevy_vello::prelude::*;
 use bevy_vello::parley;
+use bevy_vello::prelude::*;
 use vello::kurbo::Affine;
 use vello::peniko::{Brush, Fill};
 
@@ -18,9 +18,12 @@ use std::sync::Arc;
 
 use kaijutsu_types::{OutputData, OutputEntryType};
 
-use super::markdown::{MarkdownColors, RichSpan, parse_to_rich_spans};
-use super::sparkline::{SparklineData, SparklineColors, try_parse_sparkline, build_sparkline_paths, render_sparkline_scene};
 use super::components::bevy_color_to_brush;
+use super::markdown::{MarkdownColors, RichSpan, parse_to_rich_spans};
+use super::sparkline::{
+    SparklineColors, SparklineData, build_sparkline_paths, render_sparkline_scene,
+    try_parse_sparkline,
+};
 
 use crate::view::format::{OutputLayout, compute_output_layout, format_output_data};
 
@@ -173,8 +176,8 @@ fn render_layout_with_brushes(
 
             // Determine brush from the glyph run's text range
             let text_range = run.text_range();
-            let run_brush = brush_at_offset(span_brushes, text_range.start)
-                .unwrap_or(fallback_brush);
+            let run_brush =
+                brush_at_offset(span_brushes, text_range.start).unwrap_or(fallback_brush);
 
             scene
                 .draw_glyphs(font)
@@ -227,8 +230,8 @@ pub fn render_rich_content(
 
     for (entity, mut rich, vello_text, node) in query.iter_mut() {
         let current_advance = node.size().x;
-        let advance_changed = (rich.last_max_advance - current_advance).abs() > 1.0
-            && current_advance > 0.0;
+        let advance_changed =
+            (rich.last_max_advance - current_advance).abs() > 1.0 && current_advance > 0.0;
 
         if rich.version == rich.last_render_version && !advance_changed {
             continue;
@@ -243,7 +246,11 @@ pub fn render_rich_content(
                 };
 
                 let max_advance = {
-                    if current_advance > 0.0 { Some(current_advance) } else { None }
+                    if current_advance > 0.0 {
+                        Some(current_advance)
+                    } else {
+                        None
+                    }
                 };
 
                 let layout = font.layout(
@@ -253,11 +260,7 @@ pub fn render_rich_content(
                     max_advance,
                 );
 
-                let span_brushes = build_span_brushes(
-                    spans,
-                    theme.block_assistant,
-                    &md_colors,
-                );
+                let span_brushes = build_span_brushes(spans, theme.block_assistant, &md_colors);
 
                 let fallback_brush = bevy_color_to_brush(theme.block_assistant);
                 render_layout_with_brushes(&mut scene, &layout, &span_brushes, &fallback_brush);
@@ -270,7 +273,11 @@ pub fn render_rich_content(
                     render_sparkline_scene(&mut scene, &paths, &sparkline_colors);
                 }
             }
-            RichContentKind::Svg { scene: svg_scene, width: svg_w, height: svg_h } => {
+            RichContentKind::Svg {
+                scene: svg_scene,
+                width: svg_w,
+                height: svg_h,
+            } => {
                 let container_w = node.size().x;
                 if container_w > 0.0 && *svg_w > 0.0 {
                     // Scale SVG to fit container width while preserving aspect ratio
@@ -286,7 +293,11 @@ pub fn render_rich_content(
                     continue;
                 };
 
-                let max_advance = if current_advance > 0.0 { Some(current_advance) } else { None };
+                let max_advance = if current_advance > 0.0 {
+                    Some(current_advance)
+                } else {
+                    None
+                };
 
                 let parley_layout = font.layout(
                     plain_text,
@@ -297,7 +308,12 @@ pub fn render_rich_content(
 
                 let span_brushes = build_output_span_brushes(layout, &theme);
                 let fallback_brush = bevy_color_to_brush(theme.block_tool_result);
-                render_layout_with_brushes(&mut scene, &parley_layout, &span_brushes, &fallback_brush);
+                render_layout_with_brushes(
+                    &mut scene,
+                    &parley_layout,
+                    &span_brushes,
+                    &fallback_brush,
+                );
             }
         }
 
@@ -438,6 +454,7 @@ fn extract_fenced_block<'a>(text: &'a str, lang: &str) -> Option<&'a str> {
 ///
 /// When `content_type` is provided, skips heuristic detection and uses the
 /// declared type directly. Falls back to sniffing when `content_type` is `None`.
+#[allow(dead_code)]
 pub fn detect_rich_content(text: &str, version: u64) -> Option<RichContent> {
     detect_rich_content_typed(text, version, None)
 }
@@ -450,14 +467,22 @@ pub fn detect_rich_content(text: &str, version: u64) -> Option<RichContent> {
 /// - Other types → fall through to heuristic detection
 ///
 /// When `content_type` is `None`, tries sparkline, then SVG, then markdown.
-pub fn detect_rich_content_typed(text: &str, version: u64, content_type: Option<&str>) -> Option<RichContent> {
+pub fn detect_rich_content_typed(
+    text: &str,
+    version: u64,
+    content_type: Option<&str>,
+) -> Option<RichContent> {
     // If content type is declared, use it directly
     if let Some(ct) = content_type {
         match ct {
             "image/svg+xml" => {
                 if let Some((scene, width, height)) = try_parse_svg(text) {
                     return Some(RichContent {
-                        kind: RichContentKind::Svg { scene, width, height },
+                        kind: RichContentKind::Svg {
+                            scene,
+                            width,
+                            height,
+                        },
                         version,
                         last_render_version: 0,
                         last_max_advance: 0.0,
@@ -479,7 +504,10 @@ pub fn detect_rich_content_typed(text: &str, version: u64, content_type: Option<
                 let summary = abc_summary(text);
                 let spans = parse_to_rich_spans(&summary);
                 return Some(RichContent {
-                    kind: RichContentKind::Markdown { spans, plain_text: summary },
+                    kind: RichContentKind::Markdown {
+                        spans,
+                        plain_text: summary,
+                    },
                     version,
                     last_render_version: 0,
                     last_max_advance: 0.0,
@@ -501,7 +529,11 @@ pub fn detect_rich_content_typed(text: &str, version: u64, content_type: Option<
     // Try SVG
     if let Some((scene, width, height)) = try_parse_svg(text) {
         return Some(RichContent {
-            kind: RichContentKind::Svg { scene, width, height },
+            kind: RichContentKind::Svg {
+                scene,
+                width,
+                height,
+            },
             version,
             last_render_version: 0,
             last_max_advance: 0.0,
@@ -511,9 +543,9 @@ pub fn detect_rich_content_typed(text: &str, version: u64, content_type: Option<
     // Fall back to markdown
     let spans = parse_to_rich_spans(text);
 
-    let has_formatting = spans.iter().any(|s| {
-        s.bold || s.italic || s.code || s.code_block || s.heading_level.is_some()
-    });
+    let has_formatting = spans
+        .iter()
+        .any(|s| s.bold || s.italic || s.code || s.code_block || s.heading_level.is_some());
 
     if !has_formatting {
         return None;

@@ -20,7 +20,9 @@ impl KjDispatcher {
             "add" => self.workspace_add(argv),
             "bind" => self.workspace_bind(argv, caller),
             "remove" | "rm" => self.workspace_remove(argv, caller),
-            "help" | "--help" | "-h" => KjResult::ok_ephemeral(self.workspace_help(), "text/markdown"),
+            "help" | "--help" | "-h" => {
+                KjResult::ok_ephemeral(self.workspace_help(), "text/markdown")
+            }
             other => KjResult::Err(format!(
                 "kj workspace: unknown subcommand '{}'\n\n{}",
                 other,
@@ -146,7 +148,9 @@ impl KjDispatcher {
     fn workspace_add(&self, argv: &[String]) -> KjResult {
         let label = match argv.get(1) {
             Some(l) => l.as_str(),
-            None => return KjResult::Err("kj workspace add: requires a workspace label".to_string()),
+            None => {
+                return KjResult::Err("kj workspace add: requires a workspace label".to_string());
+            }
         };
         let path = match argv.get(2) {
             Some(p) => p.as_str(),
@@ -160,7 +164,9 @@ impl KjDispatcher {
 
         let ws = match db.get_workspace_by_label(kernel_id, label) {
             Ok(Some(w)) => w,
-            Ok(None) => return KjResult::Err(format!("kj workspace add: workspace '{}' not found", label)),
+            Ok(None) => {
+                return KjResult::Err(format!("kj workspace add: workspace '{}' not found", label));
+            }
             Err(e) => return KjResult::Err(format!("kj workspace add: {e}")),
         };
 
@@ -180,7 +186,9 @@ impl KjDispatcher {
     fn workspace_bind(&self, argv: &[String], caller: &KjCaller) -> KjResult {
         let label = match argv.get(1) {
             Some(l) => l.as_str(),
-            None => return KjResult::Err("kj workspace bind: requires a workspace label".to_string()),
+            None => {
+                return KjResult::Err("kj workspace bind: requires a workspace label".to_string());
+            }
         };
 
         let db = self.kernel_db().lock();
@@ -194,7 +202,12 @@ impl KjDispatcher {
 
         let ws = match db.get_workspace_by_label(kernel_id, label) {
             Ok(Some(w)) => w,
-            Ok(None) => return KjResult::Err(format!("kj workspace bind: workspace '{}' not found", label)),
+            Ok(None) => {
+                return KjResult::Err(format!(
+                    "kj workspace bind: workspace '{}' not found",
+                    label
+                ));
+            }
             Err(e) => return KjResult::Err(format!("kj workspace bind: {e}")),
         };
 
@@ -203,28 +216,33 @@ impl KjDispatcher {
         }
 
         // Set cwd to workspace's first rw path if context has no cwd yet
-        let has_cwd = db.get_context_shell(target_id).ok()
+        let has_cwd = db
+            .get_context_shell(target_id)
+            .ok()
             .flatten()
             .and_then(|s| s.cwd)
             .is_some();
 
-        if !has_cwd {
-            if let Ok(paths) = db.list_workspace_paths(ws.workspace_id) {
-                if let Some(first_rw) = paths.iter().find(|p| !p.read_only) {
-                    let shell = crate::kernel_db::ContextShellRow {
-                        context_id: target_id,
-                        cwd: Some(first_rw.path.clone()),
-                        init_script: None,
-                        updated_at: kaijutsu_types::now_millis() as i64,
-                    };
-                    if let Err(e) = db.upsert_context_shell(&shell) {
-                        tracing::warn!("failed to set cwd on workspace bind: {e}");
-                    }
-                }
+        if !has_cwd
+            && let Ok(paths) = db.list_workspace_paths(ws.workspace_id)
+            && let Some(first_rw) = paths.iter().find(|p| !p.read_only)
+        {
+            let shell = crate::kernel_db::ContextShellRow {
+                context_id: target_id,
+                cwd: Some(first_rw.path.clone()),
+                init_script: None,
+                updated_at: kaijutsu_types::now_millis() as i64,
+            };
+            if let Err(e) = db.upsert_context_shell(&shell) {
+                tracing::warn!("failed to set cwd on workspace bind: {e}");
             }
         }
 
-        KjResult::ok(format!("bound workspace '{}' to context {}", label, target_id.short()))
+        KjResult::ok(format!(
+            "bound workspace '{}' to context {}",
+            label,
+            target_id.short()
+        ))
     }
 
     /// `kj workspace remove <label>` — archive a workspace (latched).
@@ -239,12 +257,16 @@ impl KjDispatcher {
 
         let ws = match db.get_workspace_by_label(kernel_id, label) {
             Ok(Some(w)) => w,
-            Ok(None) => return KjResult::Err(format!("kj workspace remove: '{}' not found", label)),
+            Ok(None) => {
+                return KjResult::Err(format!("kj workspace remove: '{}' not found", label));
+            }
             Err(e) => return KjResult::Err(format!("kj workspace remove: {e}")),
         };
 
         if !caller.confirmed {
-            let usage_count = db.contexts_using_workspace(kernel_id, ws.workspace_id).unwrap_or(0);
+            let usage_count = db
+                .contexts_using_workspace(kernel_id, ws.workspace_id)
+                .unwrap_or(0);
             return KjResult::Latch {
                 command: "kj workspace remove".to_string(),
                 target: label.to_string(),
@@ -254,7 +276,9 @@ impl KjDispatcher {
 
         match db.archive_workspace(ws.workspace_id) {
             Ok(true) => KjResult::ok(format!("archived workspace '{}'", label)),
-            Ok(false) => KjResult::Err(format!("kj workspace remove: '{}' already archived", label)),
+            Ok(false) => {
+                KjResult::Err(format!("kj workspace remove: '{}' already archived", label))
+            }
             Err(e) => KjResult::Err(format!("kj workspace remove: {e}")),
         }
     }
@@ -306,14 +330,27 @@ mod tests {
         let c = caller_with_context(ctx);
 
         let result = d
-            .dispatch(&[s("workspace"), s("create"), s("myws"), s("--desc"), s("Test workspace")], &c)
+            .dispatch(
+                &[
+                    s("workspace"),
+                    s("create"),
+                    s("myws"),
+                    s("--desc"),
+                    s("Test workspace"),
+                ],
+                &c,
+            )
             .await;
         assert!(result.is_ok(), "create failed: {}", result.message());
         assert!(result.message().contains("myws"));
 
         let result = d.dispatch(&[s("workspace"), s("list")], &c).await;
         assert!(result.is_ok());
-        assert!(result.message().contains("myws"), "msg: {}", result.message());
+        assert!(
+            result.message().contains("myws"),
+            "msg: {}",
+            result.message()
+        );
     }
 
     #[tokio::test]
@@ -324,10 +361,25 @@ mod tests {
         let c = caller_with_context(ctx);
 
         let result = d
-            .dispatch(&[s("workspace"), s("create"), s("ws2"), s("--path"), s("/src"), s("--path"), s("/docs")], &c)
+            .dispatch(
+                &[
+                    s("workspace"),
+                    s("create"),
+                    s("ws2"),
+                    s("--path"),
+                    s("/src"),
+                    s("--path"),
+                    s("/docs"),
+                ],
+                &c,
+            )
             .await;
         assert!(result.is_ok(), "create failed: {}", result.message());
-        assert!(result.message().contains("2 paths"), "msg: {}", result.message());
+        assert!(
+            result.message().contains("2 paths"),
+            "msg: {}",
+            result.message()
+        );
 
         // Show should list paths
         let result = d.dispatch(&[s("workspace"), s("show"), s("ws2")], &c).await;
@@ -344,10 +396,21 @@ mod tests {
         let ctx = register_context(&d, Some("ctx"), None, principal).await;
         let c = caller_with_context(ctx);
 
-        d.dispatch(&[s("workspace"), s("create"), s("ws3")], &c).await;
+        d.dispatch(&[s("workspace"), s("create"), s("ws3")], &c)
+            .await;
 
         let result = d
-            .dispatch(&[s("workspace"), s("add"), s("ws3"), s("/extra"), s("--mount"), s("/mnt/extra")], &c)
+            .dispatch(
+                &[
+                    s("workspace"),
+                    s("add"),
+                    s("ws3"),
+                    s("/extra"),
+                    s("--mount"),
+                    s("/mnt/extra"),
+                ],
+                &c,
+            )
             .await;
         assert!(result.is_ok(), "add failed: {}", result.message());
     }
@@ -359,13 +422,16 @@ mod tests {
         let ctx = register_context(&d, Some("ctx"), None, principal).await;
         let c = caller_with_context(ctx);
 
-        d.dispatch(&[s("workspace"), s("create"), s("ws4")], &c).await;
-
-        let result = d
-            .dispatch(&[s("workspace"), s("bind"), s("ws4")], &c)
+        d.dispatch(&[s("workspace"), s("create"), s("ws4")], &c)
             .await;
+
+        let result = d.dispatch(&[s("workspace"), s("bind"), s("ws4")], &c).await;
         assert!(result.is_ok(), "bind failed: {}", result.message());
-        assert!(result.message().contains("bound"), "msg: {}", result.message());
+        assert!(
+            result.message().contains("bound"),
+            "msg: {}",
+            result.message()
+        );
     }
 
     #[tokio::test]
@@ -375,9 +441,12 @@ mod tests {
         let ctx = register_context(&d, Some("ctx"), None, principal).await;
         let c = caller_with_context(ctx);
 
-        d.dispatch(&[s("workspace"), s("create"), s("ws5")], &c).await;
+        d.dispatch(&[s("workspace"), s("create"), s("ws5")], &c)
+            .await;
 
-        let result = d.dispatch(&[s("workspace"), s("remove"), s("ws5")], &c).await;
+        let result = d
+            .dispatch(&[s("workspace"), s("remove"), s("ws5")], &c)
+            .await;
         assert!(result.is_latch(), "expected latch, got: {:?}", result);
     }
 
@@ -388,11 +457,18 @@ mod tests {
         let ctx = register_context(&d, Some("ctx"), None, principal).await;
 
         let c = caller_with_context(ctx);
-        d.dispatch(&[s("workspace"), s("create"), s("ws6")], &c).await;
+        d.dispatch(&[s("workspace"), s("create"), s("ws6")], &c)
+            .await;
 
         let c = confirmed_caller(ctx);
-        let result = d.dispatch(&[s("workspace"), s("remove"), s("ws6")], &c).await;
+        let result = d
+            .dispatch(&[s("workspace"), s("remove"), s("ws6")], &c)
+            .await;
         assert!(result.is_ok(), "remove failed: {}", result.message());
-        assert!(result.message().contains("archived"), "msg: {}", result.message());
+        assert!(
+            result.message().contains("archived"),
+            "msg: {}",
+            result.message()
+        );
     }
 }

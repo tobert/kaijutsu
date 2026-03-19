@@ -3,8 +3,8 @@
 //! Checks whether a file path is allowed by the caller's workspace binding.
 //! Unbound contexts (no workspace) are unrestricted — kernel perimeter defaults apply.
 
-use std::sync::Arc;
 use parking_lot::Mutex;
+use std::sync::Arc;
 
 use crate::kernel_db::{KernelDb, KernelDbError};
 use crate::tools::{ExecResult, ToolContext};
@@ -25,8 +25,8 @@ impl WorkspaceGuard {
     pub fn check_read(&self, ctx: &ToolContext, path: &str) -> Result<(), ExecResult> {
         let db = self.db.lock();
         match db.check_workspace_path(ctx.context_id, path) {
-            Ok(None) => Ok(()),       // unbound context — no restriction
-            Ok(Some(_)) => Ok(()),    // in scope (ro or rw both allow reads)
+            Ok(None) => Ok(()),    // unbound context — no restriction
+            Ok(Some(_)) => Ok(()), // in scope (ro or rw both allow reads)
             Err(KernelDbError::Validation(msg)) => {
                 Err(ExecResult::failure(1, format!("workspace: {msg}")))
             }
@@ -45,12 +45,10 @@ impl WorkspaceGuard {
         match db.check_workspace_path(ctx.context_id, path) {
             Ok(None) => Ok(()),        // unbound context — no restriction
             Ok(Some(false)) => Ok(()), // in scope, read-write
-            Ok(Some(true)) => {
-                Err(ExecResult::failure(1, format!(
-                    "workspace: path '{}' is read-only",
-                    path,
-                )))
-            }
+            Ok(Some(true)) => Err(ExecResult::failure(
+                1,
+                format!("workspace: path '{}' is read-only", path,),
+            )),
             Err(KernelDbError::Validation(msg)) => {
                 Err(ExecResult::failure(1, format!("workspace: {msg}")))
             }

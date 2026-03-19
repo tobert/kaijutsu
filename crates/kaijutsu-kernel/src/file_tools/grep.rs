@@ -22,7 +22,11 @@ pub struct GrepEngine {
 
 impl GrepEngine {
     pub fn new(cache: Arc<FileDocumentCache>, vfs: Arc<MountTable>) -> Self {
-        Self { cache, vfs, guard: None }
+        Self {
+            cache,
+            vfs,
+            guard: None,
+        }
     }
 
     pub fn with_guard(mut self, guard: WorkspaceGuard) -> Self {
@@ -93,12 +97,7 @@ impl ExecutionEngine for GrepEngine {
                 // Fall back to literal search
                 match regex::Regex::new(&regex::escape(&p.pattern)) {
                     Ok(r) => r,
-                    Err(e) => {
-                        return Ok(ExecResult::failure(
-                            1,
-                            format!("Invalid pattern: {}", e),
-                        ))
-                    }
+                    Err(e) => return Ok(ExecResult::failure(1, format!("Invalid pattern: {}", e))),
                 }
             }
         };
@@ -106,10 +105,10 @@ impl ExecutionEngine for GrepEngine {
         let default_root = ctx.cwd.to_string_lossy();
         let search_root = p.path.as_deref().unwrap_or(&default_root);
 
-        if let Some(ref guard) = self.guard {
-            if let Err(denied) = guard.check_read(ctx, search_root) {
-                return Ok(denied);
-            }
+        if let Some(ref guard) = self.guard
+            && let Err(denied) = guard.check_read(ctx, search_root)
+        {
+            return Ok(denied);
         }
 
         let adapter = VfsWalkerAdapter(&self.vfs);
@@ -125,12 +124,7 @@ impl ExecutionEngine for GrepEngine {
         if let Some(ref glob_pattern) = p.glob {
             match GlobPath::new(glob_pattern) {
                 Ok(g) => walker = walker.with_pattern(g),
-                Err(e) => {
-                    return Ok(ExecResult::failure(
-                        1,
-                        format!("Invalid glob: {}", e),
-                    ))
-                }
+                Err(e) => return Ok(ExecResult::failure(1, format!("Invalid glob: {}", e))),
             }
         }
 
@@ -160,10 +154,10 @@ impl ExecutionEngine for GrepEngine {
                 }
                 Err(_) => {
                     // Check size before loading to avoid OOM on huge files
-                    if let Ok(attr) = self.vfs.getattr(file_path).await {
-                        if attr.size as usize > MAX_FILE_SIZE {
-                            continue;
-                        }
+                    if let Ok(attr) = self.vfs.getattr(file_path).await
+                        && attr.size as usize > MAX_FILE_SIZE
+                    {
+                        continue;
                     }
                     match self.vfs.read_all(file_path).await {
                         Ok(bytes) => match String::from_utf8(bytes) {
@@ -189,24 +183,20 @@ impl ExecutionEngine for GrepEngine {
                     if ctx > 0 {
                         let start = line_idx.saturating_sub(ctx);
                         let end = (line_idx + ctx + 1).min(lines.len());
-                        for i in start..end {
-                            let prefix = if i == line_idx { ">" } else { " " };
+                        for (i, line_text) in lines[start..end].iter().enumerate() {
+                            let abs_idx = start + i;
+                            let prefix = if abs_idx == line_idx { ">" } else { " " };
                             output.push_str(&format!(
                                 "{}{}:{}:{}\n",
                                 prefix,
                                 path_str,
-                                i + 1,
-                                lines[i]
+                                abs_idx + 1,
+                                line_text
                             ));
                         }
                         output.push_str("--\n");
                     } else {
-                        output.push_str(&format!(
-                            "{}:{}:{}\n",
-                            path_str,
-                            line_idx + 1,
-                            line
-                        ));
+                        output.push_str(&format!("{}:{}:{}\n", path_str, line_idx + 1, line));
                     }
                 }
             }

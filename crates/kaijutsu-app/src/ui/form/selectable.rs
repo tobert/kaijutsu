@@ -6,9 +6,9 @@
 
 use bevy::prelude::*;
 
-use bevy_vello::prelude::{UiVelloScene, UiVelloText};
 use crate::text::{FontHandles, vello_style};
 use crate::ui::theme::Theme;
+use bevy_vello::prelude::{UiVelloScene, UiVelloText};
 
 // ============================================================================
 // DATA TYPES
@@ -27,6 +27,7 @@ pub struct ListItem {
     pub is_header: bool,
 }
 
+#[allow(dead_code)]
 impl ListItem {
     /// Create a normal selectable item.
     pub fn new(label: impl Into<String>) -> Self {
@@ -184,11 +185,7 @@ pub fn sync_selectable_list_visuals(
                         Node {
                             width: Val::Percent(100.0),
                             height: Val::Px((header_font_size * 1.2).ceil() + 4.0),
-                            margin: UiRect::top(if i == 0 {
-                                Val::Px(0.0)
-                            } else {
-                                Val::Px(8.0)
-                            }),
+                            margin: UiRect::top(if i == 0 { Val::Px(0.0) } else { Val::Px(8.0) }),
                             ..default()
                         },
                         UiVelloText {

@@ -13,9 +13,14 @@ pub fn smooth_scroll(
     mut scroll_state: ResMut<ConversationScrollState>,
     time: Res<Time>,
     entities: Res<EditorEntities>,
-    mut scroll_positions: Query<(&mut ScrollPosition, &ComputedNode), With<crate::cell::ConversationContainer>>,
+    mut scroll_positions: Query<
+        (&mut ScrollPosition, &ComputedNode),
+        With<crate::cell::ConversationContainer>,
+    >,
 ) {
-    scroll_state.bypass_change_detection().user_scrolled_this_frame = false;
+    scroll_state
+        .bypass_change_detection()
+        .user_scrolled_this_frame = false;
 
     let old_offset = scroll_state.offset;
     let old_target = scroll_state.target_offset;
@@ -76,16 +81,16 @@ pub fn smooth_scroll(
         state.visible_height = new_visible;
     }
 
-    if let Some(conv) = entities.conversation_container {
-        if let Ok((mut scroll_pos, _)) = scroll_positions.get_mut(conv) {
-            // Round to integer pixels to prevent sub-pixel jitter at clip boundaries.
-            // Fractional scroll offsets cause clip rects to land between pixels,
-            // producing antialiasing artifacts at the container edge.
-            let pixel_offset = new_offset.round();
-            let current_y = scroll_pos.y;
-            if (pixel_offset - current_y).abs() > 0.01 {
-                **scroll_pos = Vec2::new(scroll_pos.x, pixel_offset);
-            }
+    if let Some(conv) = entities.conversation_container
+        && let Ok((mut scroll_pos, _)) = scroll_positions.get_mut(conv)
+    {
+        // Round to integer pixels to prevent sub-pixel jitter at clip boundaries.
+        // Fractional scroll offsets cause clip rects to land between pixels,
+        // producing antialiasing artifacts at the container edge.
+        let pixel_offset = new_offset.round();
+        let current_y = scroll_pos.y;
+        if (pixel_offset - current_y).abs() > 0.01 {
+            **scroll_pos = Vec2::new(scroll_pos.x, pixel_offset);
         }
     }
 }

@@ -8,10 +8,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use diamond_types_extended::Frontier;
 
-use crate::content::{order_midpoint, BlockContent};
+use crate::content::{BlockContent, order_midpoint};
 use crate::{
-    BlockHeader, BlockId, BlockKind, BlockSnapshot, ContextId, CrdtError, DriftKind,
-    PrincipalId, Result, Role, Status, ToolKind, MAX_DAG_DEPTH,
+    BlockHeader, BlockId, BlockKind, BlockSnapshot, ContextId, CrdtError, DriftKind, MAX_DAG_DEPTH,
+    PrincipalId, Result, Role, Status, ToolKind,
 };
 
 /// Filter criteria for selective block inclusion during fork.
@@ -50,10 +50,9 @@ impl ForkBlockFilter {
                 return false;
             }
         }
-        if !self.exclude_block_ids.is_empty() {
-            if self.exclude_block_ids.contains(&snap.id.to_key()) {
-                return false;
-            }
+        if !self.exclude_block_ids.is_empty() && self.exclude_block_ids.contains(&snap.id.to_key())
+        {
+            return false;
         }
         true
     }
@@ -216,10 +215,7 @@ impl BlockStore {
     /// Get ancestors of a block (walk up the parent chain).
     pub fn get_ancestors(&self, id: &BlockId) -> Vec<BlockId> {
         let mut ancestors = Vec::new();
-        let mut current_id = self
-            .blocks
-            .get(id)
-            .and_then(|b| b.header().parent_id);
+        let mut current_id = self.blocks.get(id).and_then(|b| b.header().parent_id);
 
         while let Some(pid) = current_id {
             if ancestors.len() >= MAX_DAG_DEPTH {
@@ -227,10 +223,7 @@ impl BlockStore {
                 break;
             }
             ancestors.push(pid);
-            current_id = self
-                .blocks
-                .get(&pid)
-                .and_then(|b| b.header().parent_id);
+            current_id = self.blocks.get(&pid).and_then(|b| b.header().parent_id);
         }
 
         ancestors
@@ -358,15 +351,15 @@ impl BlockStore {
         let content_str = content.into();
 
         // Validate references
-        if let Some(after_id) = after {
-            if !self.blocks.contains_key(after_id) || self.blocks[after_id].is_deleted() {
-                return Err(CrdtError::InvalidReference(*after_id));
-            }
+        if let Some(after_id) = after
+            && (!self.blocks.contains_key(after_id) || self.blocks[after_id].is_deleted())
+        {
+            return Err(CrdtError::InvalidReference(*after_id));
         }
-        if let Some(pid) = parent_id {
-            if !self.blocks.contains_key(pid) || self.blocks[pid].is_deleted() {
-                return Err(CrdtError::InvalidReference(*pid));
-            }
+        if let Some(pid) = parent_id
+            && (!self.blocks.contains_key(pid) || self.blocks[pid].is_deleted())
+        {
+            return Err(CrdtError::InvalidReference(*pid));
         }
 
         let order_key = self.calc_order_key(after);
@@ -413,15 +406,15 @@ impl BlockStore {
             .map_err(|e| CrdtError::Serialization(e.to_string()))?;
 
         // Validate references
-        if let Some(after_id) = after {
-            if !self.blocks.contains_key(after_id) || self.blocks[after_id].is_deleted() {
-                return Err(CrdtError::InvalidReference(*after_id));
-            }
+        if let Some(after_id) = after
+            && (!self.blocks.contains_key(after_id) || self.blocks[after_id].is_deleted())
+        {
+            return Err(CrdtError::InvalidReference(*after_id));
         }
-        if let Some(pid) = parent_id {
-            if !self.blocks.contains_key(pid) || self.blocks[pid].is_deleted() {
-                return Err(CrdtError::InvalidReference(*pid));
-            }
+        if let Some(pid) = parent_id
+            && (!self.blocks.contains_key(pid) || self.blocks[pid].is_deleted())
+        {
+            return Err(CrdtError::InvalidReference(*pid));
         }
 
         let order_key = self.calc_order_key(after);
@@ -473,10 +466,10 @@ impl BlockStore {
         if !self.blocks.contains_key(tool_call_id) || self.blocks[tool_call_id].is_deleted() {
             return Err(CrdtError::InvalidReference(*tool_call_id));
         }
-        if let Some(after_id) = after {
-            if !self.blocks.contains_key(after_id) || self.blocks[after_id].is_deleted() {
-                return Err(CrdtError::InvalidReference(*after_id));
-            }
+        if let Some(after_id) = after
+            && (!self.blocks.contains_key(after_id) || self.blocks[after_id].is_deleted())
+        {
+            return Err(CrdtError::InvalidReference(*after_id));
         }
 
         let order_key = self.calc_order_key(after);
@@ -487,7 +480,11 @@ impl BlockStore {
             parent_id: Some(*tool_call_id),
             role: Role::Tool,
             kind: BlockKind::ToolResult,
-            status: if is_error { Status::Error } else { Status::Done },
+            status: if is_error {
+                Status::Error
+            } else {
+                Status::Done
+            },
             compacted: false,
             collapsed: false,
             ephemeral: false,
@@ -503,12 +500,8 @@ impl BlockStore {
             tool_meta_at: ts,
         };
 
-        let mut block = BlockContent::with_content(
-            header,
-            &content.into(),
-            self.agent_id,
-            order_key,
-        );
+        let mut block =
+            BlockContent::with_content(header, &content.into(), self.agent_id, order_key);
         block.set_tool_call_id(Some(*tool_call_id));
         self.blocks.insert(id, block);
         self.version += 1;
@@ -527,20 +520,27 @@ impl BlockStore {
     ) -> Result<BlockId> {
         let id = self.new_block_id();
 
-        if let Some(after_id) = after {
-            if !self.blocks.contains_key(after_id) || self.blocks[after_id].is_deleted() {
-                return Err(CrdtError::InvalidReference(*after_id));
-            }
+        if let Some(after_id) = after
+            && (!self.blocks.contains_key(after_id) || self.blocks[after_id].is_deleted())
+        {
+            return Err(CrdtError::InvalidReference(*after_id));
         }
-        if let Some(pid) = parent_id {
-            if !self.blocks.contains_key(pid) || self.blocks[pid].is_deleted() {
-                return Err(CrdtError::InvalidReference(*pid));
-            }
+        if let Some(pid) = parent_id
+            && (!self.blocks.contains_key(pid) || self.blocks[pid].is_deleted())
+        {
+            return Err(CrdtError::InvalidReference(*pid));
         }
 
         let order_key = self.calc_order_key(after);
 
-        let snap = BlockSnapshot::drift(id, parent_id.copied(), content, source_context, source_model, drift_kind);
+        let snap = BlockSnapshot::drift(
+            id,
+            parent_id.copied(),
+            content,
+            source_context,
+            source_model,
+            drift_kind,
+        );
         let block = BlockContent::from_snapshot(&snap, self.agent_id, order_key);
         self.blocks.insert(id, block);
         self.version += 1;
@@ -557,15 +557,15 @@ impl BlockStore {
     ) -> Result<BlockId> {
         let id = self.new_block_id();
 
-        if let Some(after_id) = after {
-            if !self.blocks.contains_key(after_id) || self.blocks[after_id].is_deleted() {
-                return Err(CrdtError::InvalidReference(*after_id));
-            }
+        if let Some(after_id) = after
+            && (!self.blocks.contains_key(after_id) || self.blocks[after_id].is_deleted())
+        {
+            return Err(CrdtError::InvalidReference(*after_id));
         }
-        if let Some(pid) = parent_id {
-            if !self.blocks.contains_key(pid) || self.blocks[pid].is_deleted() {
-                return Err(CrdtError::InvalidReference(*pid));
-            }
+        if let Some(pid) = parent_id
+            && (!self.blocks.contains_key(pid) || self.blocks[pid].is_deleted())
+        {
+            return Err(CrdtError::InvalidReference(*pid));
         }
 
         let order_key = self.calc_order_key(after);
@@ -683,7 +683,11 @@ impl BlockStore {
     }
 
     /// Set structured output data on a block.
-    pub fn set_output(&mut self, id: &BlockId, output: Option<kaijutsu_types::OutputData>) -> Result<()> {
+    pub fn set_output(
+        &mut self,
+        id: &BlockId,
+        output: Option<kaijutsu_types::OutputData>,
+    ) -> Result<()> {
         let block = self
             .blocks
             .get_mut(id)
@@ -708,7 +712,10 @@ impl BlockStore {
 
     /// Set the content_type hint on a block (e.g., "image/svg+xml", "text/markdown").
     pub fn set_content_type(&mut self, id: &BlockId, content_type: Option<String>) -> Result<()> {
-        let block = self.blocks.get_mut(id).ok_or(CrdtError::BlockNotFound(*id))?;
+        let block = self
+            .blocks
+            .get_mut(id)
+            .ok_or(CrdtError::BlockNotFound(*id))?;
         block.set_content_type(content_type);
         self.version += 1;
         Ok(())
@@ -717,7 +724,10 @@ impl BlockStore {
     /// Set the ephemeral flag on a block.
     pub fn set_ephemeral(&mut self, id: &BlockId, ephemeral: bool) -> Result<()> {
         let ts = self.tick();
-        let block = self.blocks.get_mut(id).ok_or(CrdtError::BlockNotFound(*id))?;
+        let block = self
+            .blocks
+            .get_mut(id)
+            .ok_or(CrdtError::BlockNotFound(*id))?;
         block.set_ephemeral(ephemeral, ts);
         self.version += 1;
         Ok(())
@@ -728,10 +738,10 @@ impl BlockStore {
         if !self.blocks.contains_key(id) || self.blocks[id].is_deleted() {
             return Err(CrdtError::BlockNotFound(*id));
         }
-        if let Some(after_id) = after {
-            if !self.blocks.contains_key(after_id) || self.blocks[after_id].is_deleted() {
-                return Err(CrdtError::InvalidReference(*after_id));
-            }
+        if let Some(after_id) = after
+            && (!self.blocks.contains_key(after_id) || self.blocks[after_id].is_deleted())
+        {
+            return Err(CrdtError::InvalidReference(*after_id));
         }
 
         let order_key = self.calc_order_key(after);
@@ -807,9 +817,8 @@ impl BlockStore {
         // preserving causal history for subsequent incremental sync.
         // Falls back to from_snapshot (with content) if no DTE ops are
         // present for this block (e.g., persistence restore).
-        let has_ops_for: std::collections::HashSet<BlockId> = payload.block_ops.iter()
-            .map(|(id, _)| *id)
-            .collect();
+        let has_ops_for: std::collections::HashSet<BlockId> =
+            payload.block_ops.iter().map(|(id, _)| *id).collect();
 
         for snap in &payload.new_blocks {
             if !self.blocks.contains_key(&snap.id) {
@@ -855,10 +864,10 @@ impl BlockStore {
         for id in &payload.deleted_blocks {
             // Tick once per deletion to get a unique Lamport timestamp
             let ts = self.tick();
-            if let Some(block) = self.blocks.get_mut(id) {
-                if !block.is_deleted() {
-                    block.mark_deleted(ts);
-                }
+            if let Some(block) = self.blocks.get_mut(id)
+                && !block.is_deleted()
+            {
+                block.mark_deleted(ts);
             }
         }
 
@@ -895,7 +904,7 @@ impl BlockStore {
     pub fn fork(&self, new_context_id: ContextId, new_agent_id: PrincipalId) -> Self {
         let mut forked = Self::new(new_context_id, new_agent_id);
 
-        for (_, block) in &self.blocks {
+        for block in self.blocks.values() {
             if block.is_deleted() {
                 continue;
             }
@@ -939,7 +948,7 @@ impl BlockStore {
     ) -> Self {
         let mut forked = Self::new(new_context_id, new_agent_id);
 
-        for (_, block) in &self.blocks {
+        for block in self.blocks.values() {
             if block.is_deleted() {
                 continue;
             }
@@ -992,7 +1001,7 @@ impl BlockStore {
         // Collect passing blocks first (for max_blocks truncation)
         let mut passing: Vec<(&BlockContent, BlockSnapshot)> = Vec::new();
 
-        for (_, block) in &self.blocks {
+        for block in self.blocks.values() {
             if block.is_deleted() {
                 continue;
             }
@@ -1007,11 +1016,11 @@ impl BlockStore {
         }
 
         // Apply max_blocks — keep the most recent (by order_key, since BTreeMap is ordered)
-        if let Some(max) = filter.max_blocks {
-            if passing.len() > max {
-                let skip = passing.len() - max;
-                passing = passing.into_iter().skip(skip).collect();
-            }
+        if let Some(max) = filter.max_blocks
+            && passing.len() > max
+        {
+            let skip = passing.len() - max;
+            passing = passing.into_iter().skip(skip).collect();
         }
 
         for (block, snap) in passing {
@@ -1056,15 +1065,12 @@ impl BlockStore {
     /// Restore from a snapshot.
     pub fn from_snapshot(snapshot: StoreSnapshot, agent_id: PrincipalId) -> Self {
         let mut store = Self::new(snapshot.context_id, agent_id);
-        let mut order_seq = 0u64;
-
-        for block_snap in &snapshot.blocks {
+        for (order_seq, block_snap) in snapshot.blocks.iter().enumerate() {
             if block_snap.id.agent_id == agent_id {
                 store.next_seq = store.next_seq.max(block_snap.id.seq + 1);
             }
 
             let fallback_key = format!("{:020}", order_seq);
-            order_seq += 1;
 
             let content = BlockContent::from_snapshot(block_snap, agent_id, fallback_key);
             store.blocks.insert(block_snap.id, content);
@@ -1147,10 +1153,24 @@ mod tests {
         let mut store = test_store();
 
         let id1 = store
-            .insert_block(None, None, Role::User, BlockKind::Text, "Hello!", Status::Done)
+            .insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "Hello!",
+                Status::Done,
+            )
             .unwrap();
         let id2 = store
-            .insert_block(Some(&id1), Some(&id1), Role::Model, BlockKind::Text, "Hi!", Status::Done)
+            .insert_block(
+                Some(&id1),
+                Some(&id1),
+                Role::Model,
+                BlockKind::Text,
+                "Hi!",
+                Status::Done,
+            )
             .unwrap();
 
         assert_eq!(store.block_count(), 2);
@@ -1168,7 +1188,14 @@ mod tests {
     fn test_text_editing() {
         let mut store = test_store();
         let id = store
-            .insert_block(None, None, Role::User, BlockKind::Text, "Hello", Status::Done)
+            .insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "Hello",
+                Status::Done,
+            )
             .unwrap();
 
         store.append_text(&id, " World").unwrap();
@@ -1185,13 +1212,34 @@ mod tests {
         let mut store = test_store();
 
         let id1 = store
-            .insert_block(None, None, Role::User, BlockKind::Text, "First", Status::Done)
+            .insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "First",
+                Status::Done,
+            )
             .unwrap();
         let id2 = store
-            .insert_block(None, Some(&id1), Role::User, BlockKind::Text, "Second", Status::Done)
+            .insert_block(
+                None,
+                Some(&id1),
+                Role::User,
+                BlockKind::Text,
+                "Second",
+                Status::Done,
+            )
             .unwrap();
         let id3 = store
-            .insert_block(None, Some(&id2), Role::User, BlockKind::Text, "Third", Status::Done)
+            .insert_block(
+                None,
+                Some(&id2),
+                Role::User,
+                BlockKind::Text,
+                "Third",
+                Status::Done,
+            )
             .unwrap();
 
         let order: Vec<_> = store.blocks_ordered().iter().map(|b| b.id).collect();
@@ -1203,10 +1251,24 @@ mod tests {
         let mut store = test_store();
 
         let id1 = store
-            .insert_block(None, None, Role::User, BlockKind::Text, "First", Status::Done)
+            .insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "First",
+                Status::Done,
+            )
             .unwrap();
         let id2 = store
-            .insert_block(None, None, Role::User, BlockKind::Text, "Before First", Status::Done)
+            .insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "Before First",
+                Status::Done,
+            )
             .unwrap();
 
         let order: Vec<_> = store.blocks_ordered().iter().map(|b| b.id).collect();
@@ -1217,7 +1279,14 @@ mod tests {
     fn test_set_status() {
         let mut store = test_store();
         let id = store
-            .insert_block(None, None, Role::Model, BlockKind::ToolCall, "{}", Status::Done)
+            .insert_block(
+                None,
+                None,
+                Role::Model,
+                BlockKind::ToolCall,
+                "{}",
+                Status::Done,
+            )
             .unwrap();
 
         store.set_status(&id, Status::Running).unwrap();
@@ -1227,17 +1296,21 @@ mod tests {
         );
 
         store.set_status(&id, Status::Error).unwrap();
-        assert_eq!(
-            store.get_block_snapshot(&id).unwrap().status,
-            Status::Error
-        );
+        assert_eq!(store.get_block_snapshot(&id).unwrap().status, Status::Error);
     }
 
     #[test]
     fn test_set_collapsed() {
         let mut store = test_store();
         let id = store
-            .insert_block(None, None, Role::Model, BlockKind::Thinking, "Thinking...", Status::Done)
+            .insert_block(
+                None,
+                None,
+                Role::Model,
+                BlockKind::Thinking,
+                "Thinking...",
+                Status::Done,
+            )
             .unwrap();
 
         store.set_collapsed(&id, true).unwrap();
@@ -1251,7 +1324,14 @@ mod tests {
     fn test_collapsed_not_restricted_to_thinking() {
         let mut store = test_store();
         let id = store
-            .insert_block(None, None, Role::Model, BlockKind::ToolCall, "{}", Status::Done)
+            .insert_block(
+                None,
+                None,
+                Role::Model,
+                BlockKind::ToolCall,
+                "{}",
+                Status::Done,
+            )
             .unwrap();
 
         // Should succeed for ToolCall blocks too
@@ -1280,7 +1360,14 @@ mod tests {
         assert_eq!(snap.status, Status::Running);
 
         let result_id = store
-            .insert_tool_result_block(&call_id, Some(&call_id), "127.0.0.1 localhost", false, Some(0), None)
+            .insert_tool_result_block(
+                &call_id,
+                Some(&call_id),
+                "127.0.0.1 localhost",
+                false,
+                Some(0),
+                None,
+            )
             .unwrap();
 
         let snap = store.get_block_snapshot(&result_id).unwrap();
@@ -1333,13 +1420,34 @@ mod tests {
         let mut store = test_store();
 
         let id1 = store
-            .insert_block(None, None, Role::User, BlockKind::Text, "First", Status::Done)
+            .insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "First",
+                Status::Done,
+            )
             .unwrap();
         let id2 = store
-            .insert_block(None, Some(&id1), Role::User, BlockKind::Text, "Second", Status::Done)
+            .insert_block(
+                None,
+                Some(&id1),
+                Role::User,
+                BlockKind::Text,
+                "Second",
+                Status::Done,
+            )
             .unwrap();
         let _id3 = store
-            .insert_block(None, Some(&id2), Role::User, BlockKind::Text, "Third", Status::Done)
+            .insert_block(
+                None,
+                Some(&id2),
+                Role::User,
+                BlockKind::Text,
+                "Third",
+                Status::Done,
+            )
             .unwrap();
 
         assert_eq!(store.block_count(), 3);
@@ -1359,10 +1467,24 @@ mod tests {
             .insert_block(None, None, Role::User, BlockKind::Text, "A", Status::Done)
             .unwrap();
         let b = store
-            .insert_block(None, Some(&a), Role::User, BlockKind::Text, "B", Status::Done)
+            .insert_block(
+                None,
+                Some(&a),
+                Role::User,
+                BlockKind::Text,
+                "B",
+                Status::Done,
+            )
             .unwrap();
         let c = store
-            .insert_block(None, Some(&b), Role::User, BlockKind::Text, "C", Status::Done)
+            .insert_block(
+                None,
+                Some(&b),
+                Role::User,
+                BlockKind::Text,
+                "C",
+                Status::Done,
+            )
             .unwrap();
 
         let ordered = store.blocks_ordered();
@@ -1382,7 +1504,14 @@ mod tests {
         let mut store = test_store();
 
         let parent = store
-            .insert_block(None, None, Role::User, BlockKind::Text, "Question", Status::Done)
+            .insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "Question",
+                Status::Done,
+            )
             .unwrap();
         let child1 = store
             .insert_block(
@@ -1425,10 +1554,24 @@ mod tests {
         let mut store = test_store();
 
         store
-            .insert_block(None, None, Role::Model, BlockKind::Thinking, "Thinking...", Status::Done)
+            .insert_block(
+                None,
+                None,
+                Role::Model,
+                BlockKind::Thinking,
+                "Thinking...",
+                Status::Done,
+            )
             .unwrap();
         store
-            .insert_block(None, None, Role::Model, BlockKind::Text, "Response", Status::Done)
+            .insert_block(
+                None,
+                None,
+                Role::Model,
+                BlockKind::Text,
+                "Response",
+                Status::Done,
+            )
             .unwrap();
 
         let snapshot = store.snapshot();
@@ -1444,9 +1587,18 @@ mod tests {
 
         // Insert a tool call and set tool_use_id
         let tc_id = store
-            .insert_tool_call(None, None, "shell", serde_json::json!({"cmd": "ls"}), None, None)
+            .insert_tool_call(
+                None,
+                None,
+                "shell",
+                serde_json::json!({"cmd": "ls"}),
+                None,
+                None,
+            )
             .unwrap();
-        store.set_tool_use_id(&tc_id, Some("toolu_01ABC".to_string())).unwrap();
+        store
+            .set_tool_use_id(&tc_id, Some("toolu_01ABC".to_string()))
+            .unwrap();
 
         // Verify it's on the snapshot
         let snap = store.get_block_snapshot(&tc_id).unwrap();
@@ -1467,7 +1619,14 @@ mod tests {
         let original_agent = original.agent_id();
 
         let user_msg = original
-            .insert_block(None, None, Role::User, BlockKind::Text, "Hello Claude!", Status::Done)
+            .insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "Hello Claude!",
+                Status::Done,
+            )
             .unwrap();
         let _model_response = original
             .insert_block(
@@ -1522,10 +1681,24 @@ mod tests {
         let mut store = test_store();
 
         let first = store
-            .insert_block(None, None, Role::User, BlockKind::Text, "First", Status::Done)
+            .insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "First",
+                Status::Done,
+            )
             .unwrap();
         let _last = store
-            .insert_block(None, Some(&first), Role::User, BlockKind::Text, "Last", Status::Done)
+            .insert_block(
+                None,
+                Some(&first),
+                Role::User,
+                BlockKind::Text,
+                "Last",
+                Status::Done,
+            )
             .unwrap();
 
         for i in 0..100 {
@@ -1555,7 +1728,14 @@ mod tests {
         let mut store2 = BlockStore::new(ctx, PrincipalId::new());
 
         let id1 = store1
-            .insert_block(None, None, Role::User, BlockKind::Text, "Hello from store1", Status::Done)
+            .insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "Hello from store1",
+                Status::Done,
+            )
             .unwrap();
 
         // Sync store1 → store2
@@ -1574,7 +1754,14 @@ mod tests {
         let mut store2 = BlockStore::new(ctx, PrincipalId::new());
 
         let id1 = store1
-            .insert_block(None, None, Role::User, BlockKind::Text, "Hello", Status::Done)
+            .insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "Hello",
+                Status::Done,
+            )
             .unwrap();
 
         // Initial sync
@@ -1584,13 +1771,24 @@ mod tests {
 
         // Store1 adds a new block
         let id2 = store1
-            .insert_block(Some(&id1), Some(&id1), Role::Model, BlockKind::Text, "World", Status::Done)
+            .insert_block(
+                Some(&id1),
+                Some(&id1),
+                Role::Model,
+                BlockKind::Text,
+                "World",
+                Status::Done,
+            )
             .unwrap();
 
         // Incremental sync — new block arrives as full snapshot
         let frontiers = store2.frontier();
         let payload = store1.ops_since(&frontiers);
-        assert_eq!(payload.new_blocks.len(), 1, "new block should be in new_blocks");
+        assert_eq!(
+            payload.new_blocks.len(),
+            1,
+            "new block should be in new_blocks"
+        );
         store2.merge_ops(payload).unwrap();
 
         assert_eq!(store2.block_count(), 2);
@@ -1607,7 +1805,14 @@ mod tests {
         let mut store2 = BlockStore::new(ctx, PrincipalId::new());
 
         let id1 = store1
-            .insert_block(None, None, Role::User, BlockKind::Text, "First", Status::Done)
+            .insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "First",
+                Status::Done,
+            )
             .unwrap();
 
         // Initial sync so store2 knows about id1
@@ -1617,7 +1822,14 @@ mod tests {
 
         // Add a new block to store1
         let id2 = store1
-            .insert_block(Some(&id1), Some(&id1), Role::Model, BlockKind::Text, "Second", Status::Done)
+            .insert_block(
+                Some(&id1),
+                Some(&id1),
+                Role::Model,
+                BlockKind::Text,
+                "Second",
+                Status::Done,
+            )
             .unwrap();
 
         // Generate incremental sync payload
@@ -1625,14 +1837,20 @@ mod tests {
         let payload = store1.ops_since(&frontiers);
 
         // The new block should appear in new_blocks (as a snapshot)
-        assert_eq!(payload.new_blocks.len(), 1, "new block should be in new_blocks");
+        assert_eq!(
+            payload.new_blocks.len(),
+            1,
+            "new block should be in new_blocks"
+        );
         assert_eq!(payload.new_blocks[0].id, id2);
 
         // The new block's header should NOT also appear in updated_headers —
         // the snapshot already contains all header data; sending both is redundant.
         let redundant = payload.updated_headers.iter().any(|h| h.id == id2);
-        assert!(!redundant,
-            "new block header should not appear in updated_headers (snapshot is sufficient)");
+        assert!(
+            !redundant,
+            "new block header should not appear in updated_headers (snapshot is sufficient)"
+        );
 
         // Merge into store2 and verify all header fields match
         store2.merge_ops(payload).unwrap();
@@ -1659,7 +1877,14 @@ mod tests {
         let mut store2 = BlockStore::new(ctx, PrincipalId::new());
 
         let id = store1
-            .insert_block(None, None, Role::Model, BlockKind::ToolCall, "{}", Status::Done)
+            .insert_block(
+                None,
+                None,
+                Role::Model,
+                BlockKind::ToolCall,
+                "{}",
+                Status::Done,
+            )
             .unwrap();
 
         // Initial sync
@@ -1672,11 +1897,18 @@ mod tests {
         // Incremental sync — header update should propagate
         let frontiers = store2.frontier();
         let payload = store1.ops_since(&frontiers);
-        assert!(!payload.updated_headers.is_empty(), "should include updated header");
+        assert!(
+            !payload.updated_headers.is_empty(),
+            "should include updated header"
+        );
         store2.merge_ops(payload).unwrap();
 
         let snap = store2.get_block_snapshot(&id).unwrap();
-        assert_eq!(snap.status, Status::Done, "status change should propagate via sync");
+        assert_eq!(
+            snap.status,
+            Status::Done,
+            "status change should propagate via sync"
+        );
     }
 
     #[test]
@@ -1686,7 +1918,14 @@ mod tests {
         let mut store2 = BlockStore::new(ctx, PrincipalId::new());
 
         let id = store1
-            .insert_block(None, None, Role::Model, BlockKind::Thinking, "Thinking...", Status::Done)
+            .insert_block(
+                None,
+                None,
+                Role::Model,
+                BlockKind::Thinking,
+                "Thinking...",
+                Status::Done,
+            )
             .unwrap();
 
         // Initial sync
@@ -1715,10 +1954,24 @@ mod tests {
         let mut store2 = BlockStore::new(ctx, PrincipalId::new());
 
         let id1 = store1
-            .insert_block(None, None, Role::User, BlockKind::Text, "Keep", Status::Done)
+            .insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "Keep",
+                Status::Done,
+            )
             .unwrap();
         let id2 = store1
-            .insert_block(None, Some(&id1), Role::User, BlockKind::Text, "Delete me", Status::Done)
+            .insert_block(
+                None,
+                Some(&id1),
+                Role::User,
+                BlockKind::Text,
+                "Delete me",
+                Status::Done,
+            )
             .unwrap();
 
         // Initial sync
@@ -1732,11 +1985,19 @@ mod tests {
         // Incremental sync — deletion should propagate
         let frontiers = store2.frontier();
         let payload = store1.ops_since(&frontiers);
-        assert_eq!(payload.deleted_blocks.len(), 1, "should include deleted block ID");
+        assert_eq!(
+            payload.deleted_blocks.len(),
+            1,
+            "should include deleted block ID"
+        );
         assert_eq!(payload.deleted_blocks[0], id2);
         store2.merge_ops(payload).unwrap();
 
-        assert_eq!(store2.block_count(), 1, "deletion should propagate via sync");
+        assert_eq!(
+            store2.block_count(),
+            1,
+            "deletion should propagate via sync"
+        );
         assert!(store2.get_block_snapshot(&id2).is_none());
     }
 
@@ -1749,13 +2010,34 @@ mod tests {
         let mut store2 = BlockStore::new(ctx, PrincipalId::new());
 
         let id1 = store1
-            .insert_block(None, None, Role::User, BlockKind::Text, "First", Status::Done)
+            .insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "First",
+                Status::Done,
+            )
             .unwrap();
         let id2 = store1
-            .insert_block(None, Some(&id1), Role::User, BlockKind::Text, "Second", Status::Done)
+            .insert_block(
+                None,
+                Some(&id1),
+                Role::User,
+                BlockKind::Text,
+                "Second",
+                Status::Done,
+            )
             .unwrap();
         let _id3 = store1
-            .insert_block(None, Some(&id2), Role::User, BlockKind::Text, "Third", Status::Done)
+            .insert_block(
+                None,
+                Some(&id2),
+                Role::User,
+                BlockKind::Text,
+                "Third",
+                Status::Done,
+            )
             .unwrap();
 
         // Sync to store2
@@ -1763,9 +2045,20 @@ mod tests {
         store2.merge_ops(payload).unwrap();
 
         // Ordering should match
-        let order1: Vec<_> = store1.blocks_ordered().iter().map(|b| b.content.clone()).collect();
-        let order2: Vec<_> = store2.blocks_ordered().iter().map(|b| b.content.clone()).collect();
-        assert_eq!(order1, order2, "synced store should preserve document order");
+        let order1: Vec<_> = store1
+            .blocks_ordered()
+            .iter()
+            .map(|b| b.content.clone())
+            .collect();
+        let order2: Vec<_> = store2
+            .blocks_ordered()
+            .iter()
+            .map(|b| b.content.clone())
+            .collect();
+        assert_eq!(
+            order1, order2,
+            "synced store should preserve document order"
+        );
     }
 
     // ── Lamport clock ─────────────────────────────────────────────────
@@ -1775,7 +2068,14 @@ mod tests {
         let mut store = test_store();
 
         let id = store
-            .insert_block(None, None, Role::User, BlockKind::Text, "Hello", Status::Done)
+            .insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "Hello",
+                Status::Done,
+            )
             .unwrap();
 
         // Each mutation bumps the Lamport clock
@@ -1795,7 +2095,14 @@ mod tests {
 
         // Store1 does many operations, advancing its Lamport clock
         let id = store1
-            .insert_block(None, None, Role::User, BlockKind::Text, "Hello", Status::Done)
+            .insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "Hello",
+                Status::Done,
+            )
             .unwrap();
         for _ in 0..10 {
             store1.set_status(&id, Status::Running).unwrap();
@@ -1824,7 +2131,14 @@ mod tests {
         let suffix = store.agent_order_suffix();
 
         let id = store
-            .insert_block(None, None, Role::User, BlockKind::Text, "Hello", Status::Done)
+            .insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "Hello",
+                Status::Done,
+            )
             .unwrap();
 
         let snap = store.get_block_snapshot(&id).unwrap();
@@ -1852,7 +2166,14 @@ mod tests {
             .insert_block(None, None, Role::User, BlockKind::Text, "A", Status::Done)
             .unwrap();
         let _b = store1
-            .insert_block(None, Some(&a), Role::User, BlockKind::Text, "B", Status::Done)
+            .insert_block(
+                None,
+                Some(&a),
+                Role::User,
+                BlockKind::Text,
+                "B",
+                Status::Done,
+            )
             .unwrap();
 
         // Store2 inserts C, D (independently)
@@ -1860,7 +2181,14 @@ mod tests {
             .insert_block(None, None, Role::User, BlockKind::Text, "C", Status::Done)
             .unwrap();
         let _d = store2
-            .insert_block(None, Some(&c), Role::User, BlockKind::Text, "D", Status::Done)
+            .insert_block(
+                None,
+                Some(&c),
+                Role::User,
+                BlockKind::Text,
+                "D",
+                Status::Done,
+            )
             .unwrap();
 
         // Sync both ways
@@ -1870,8 +2198,16 @@ mod tests {
         store2.merge_ops(payload1).unwrap();
 
         // Both stores should see 4 blocks in the same order
-        let order1: Vec<_> = store1.blocks_ordered().iter().map(|b| b.content.clone()).collect();
-        let order2: Vec<_> = store2.blocks_ordered().iter().map(|b| b.content.clone()).collect();
+        let order1: Vec<_> = store1
+            .blocks_ordered()
+            .iter()
+            .map(|b| b.content.clone())
+            .collect();
+        let order2: Vec<_> = store2
+            .blocks_ordered()
+            .iter()
+            .map(|b| b.content.clone())
+            .collect();
         assert_eq!(order1, order2, "both stores should converge to same order");
 
         // A and B should be adjacent, C and D should be adjacent (no interleaving)
@@ -1931,7 +2267,14 @@ mod tests {
     fn test_snapshot_postcard_roundtrip() {
         let mut store = test_store();
         store
-            .insert_block(None, None, Role::User, BlockKind::Text, "Hello", Status::Done)
+            .insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "Hello",
+                Status::Done,
+            )
             .unwrap();
 
         let snapshot = store.snapshot();
@@ -1957,11 +2300,56 @@ mod tests {
         let mut store = BlockStore::new(ctx, agent);
 
         // Create a realistic conversation: user, model, tool call, tool result, model
-        let b1 = store.insert_block(None, None, Role::User, BlockKind::Text, "Hello", Status::Done).unwrap();
-        let b2 = store.insert_block(None, Some(&b1), Role::Model, BlockKind::Text, "Let me check...", Status::Done).unwrap();
-        let b3 = store.insert_block(Some(&b2), Some(&b2), Role::Model, BlockKind::ToolCall, "search", Status::Done).unwrap();
-        let b4 = store.insert_block(Some(&b3), Some(&b3), Role::Model, BlockKind::ToolResult, "results here", Status::Done).unwrap();
-        let b5 = store.insert_block(None, Some(&b4), Role::Model, BlockKind::Text, "Based on the results...", Status::Done).unwrap();
+        let b1 = store
+            .insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "Hello",
+                Status::Done,
+            )
+            .unwrap();
+        let b2 = store
+            .insert_block(
+                None,
+                Some(&b1),
+                Role::Model,
+                BlockKind::Text,
+                "Let me check...",
+                Status::Done,
+            )
+            .unwrap();
+        let b3 = store
+            .insert_block(
+                Some(&b2),
+                Some(&b2),
+                Role::Model,
+                BlockKind::ToolCall,
+                "search",
+                Status::Done,
+            )
+            .unwrap();
+        let b4 = store
+            .insert_block(
+                Some(&b3),
+                Some(&b3),
+                Role::Model,
+                BlockKind::ToolResult,
+                "results here",
+                Status::Done,
+            )
+            .unwrap();
+        let b5 = store
+            .insert_block(
+                None,
+                Some(&b4),
+                Role::Model,
+                BlockKind::Text,
+                "Based on the results...",
+                Status::Done,
+            )
+            .unwrap();
 
         // Take snapshot (what sync_main_cell does)
         let store_snap = store.snapshot();
@@ -1977,7 +2365,10 @@ mod tests {
         let doc_ids: Vec<BlockId> = doc.blocks_ordered().iter().map(|b| b.id).collect();
 
         // Ordering must match
-        assert_eq!(store_ids, doc_ids, "Store and Document block ordering diverged");
+        assert_eq!(
+            store_ids, doc_ids,
+            "Store and Document block ordering diverged"
+        );
         assert_eq!(store_ids, vec![b1, b2, b3, b4, b5]);
     }
 
@@ -1989,8 +2380,26 @@ mod tests {
     fn test_fork_filtered_empty_filter_includes_all() {
         let mut store = test_store();
 
-        let b1 = store.insert_block(None, None, Role::User, BlockKind::Text, "hello", Status::Done).unwrap();
-        let _b2 = store.insert_block(Some(&b1), Some(&b1), Role::Model, BlockKind::Text, "world", Status::Done).unwrap();
+        let b1 = store
+            .insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "hello",
+                Status::Done,
+            )
+            .unwrap();
+        let _b2 = store
+            .insert_block(
+                Some(&b1),
+                Some(&b1),
+                Role::Model,
+                BlockKind::Text,
+                "world",
+                Status::Done,
+            )
+            .unwrap();
 
         let filter = ForkBlockFilter::default();
         let new_ctx = ContextId::new();
@@ -2004,9 +2413,36 @@ mod tests {
     fn test_fork_filtered_exclude_kinds() {
         let mut store = test_store();
 
-        let b1 = store.insert_block(None, None, Role::User, BlockKind::Text, "hello", Status::Done).unwrap();
-        let _b2 = store.insert_block(Some(&b1), Some(&b1), Role::Model, BlockKind::Thinking, "hmm", Status::Done).unwrap();
-        let _b3 = store.insert_block(Some(&b1), None, Role::Model, BlockKind::Text, "response", Status::Done).unwrap();
+        let b1 = store
+            .insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "hello",
+                Status::Done,
+            )
+            .unwrap();
+        let _b2 = store
+            .insert_block(
+                Some(&b1),
+                Some(&b1),
+                Role::Model,
+                BlockKind::Thinking,
+                "hmm",
+                Status::Done,
+            )
+            .unwrap();
+        let _b3 = store
+            .insert_block(
+                Some(&b1),
+                None,
+                Role::Model,
+                BlockKind::Text,
+                "response",
+                Status::Done,
+            )
+            .unwrap();
 
         let mut filter = ForkBlockFilter::default();
         filter.exclude_kinds.insert("Thinking".to_string());
@@ -2022,9 +2458,36 @@ mod tests {
     fn test_fork_filtered_exclude_roles() {
         let mut store = test_store();
 
-        let b1 = store.insert_block(None, None, Role::User, BlockKind::Text, "hello", Status::Done).unwrap();
-        let _b2 = store.insert_block(Some(&b1), Some(&b1), Role::Tool, BlockKind::ToolResult, "result", Status::Done).unwrap();
-        let _b3 = store.insert_block(Some(&b1), None, Role::Model, BlockKind::Text, "response", Status::Done).unwrap();
+        let b1 = store
+            .insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "hello",
+                Status::Done,
+            )
+            .unwrap();
+        let _b2 = store
+            .insert_block(
+                Some(&b1),
+                Some(&b1),
+                Role::Tool,
+                BlockKind::ToolResult,
+                "result",
+                Status::Done,
+            )
+            .unwrap();
+        let _b3 = store
+            .insert_block(
+                Some(&b1),
+                None,
+                Role::Model,
+                BlockKind::Text,
+                "response",
+                Status::Done,
+            )
+            .unwrap();
 
         let mut filter = ForkBlockFilter::default();
         filter.exclude_roles.insert("Tool".to_string());
@@ -2033,15 +2496,37 @@ mod tests {
         let new_agent = PrincipalId::new();
         let forked = store.fork_filtered(new_ctx, new_agent, u64::MAX, &filter);
 
-        assert_eq!(forked.block_count(), 2, "Tool role blocks should be excluded");
+        assert_eq!(
+            forked.block_count(),
+            2,
+            "Tool role blocks should be excluded"
+        );
     }
 
     #[test]
     fn test_fork_filtered_exclude_compacted() {
         let mut store = test_store();
 
-        let b1 = store.insert_block(None, None, Role::User, BlockKind::Text, "old message", Status::Done).unwrap();
-        let _b2 = store.insert_block(Some(&b1), Some(&b1), Role::Model, BlockKind::Text, "summary", Status::Done).unwrap();
+        let b1 = store
+            .insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "old message",
+                Status::Done,
+            )
+            .unwrap();
+        let _b2 = store
+            .insert_block(
+                Some(&b1),
+                Some(&b1),
+                Role::Model,
+                BlockKind::Text,
+                "summary",
+                Status::Done,
+            )
+            .unwrap();
 
         // Mark b1 as compacted via SyncPayload with updated header
         let mut header = BlockHeader::from_snapshot(&store.get_block_snapshot(&b1).unwrap());
@@ -2056,7 +2541,10 @@ mod tests {
         store.merge_ops(payload).unwrap();
 
         // Verify compacted flag took effect
-        assert!(store.get_block_snapshot(&b1).unwrap().compacted, "Block should be compacted");
+        assert!(
+            store.get_block_snapshot(&b1).unwrap().compacted,
+            "Block should be compacted"
+        );
 
         let mut filter = ForkBlockFilter::default();
         filter.exclude_compacted = true;
@@ -2065,17 +2553,57 @@ mod tests {
         let new_agent = PrincipalId::new();
         let forked = store.fork_filtered(new_ctx, new_agent, u64::MAX, &filter);
 
-        assert_eq!(forked.block_count(), 1, "Compacted block should be excluded");
+        assert_eq!(
+            forked.block_count(),
+            1,
+            "Compacted block should be excluded"
+        );
     }
 
     #[test]
     fn test_fork_filtered_max_blocks() {
         let mut store = test_store();
 
-        let b1 = store.insert_block(None, None, Role::User, BlockKind::Text, "msg 1", Status::Done).unwrap();
-        let b2 = store.insert_block(Some(&b1), Some(&b1), Role::Model, BlockKind::Text, "msg 2", Status::Done).unwrap();
-        let b3 = store.insert_block(Some(&b2), Some(&b2), Role::User, BlockKind::Text, "msg 3", Status::Done).unwrap();
-        let _b4 = store.insert_block(Some(&b3), Some(&b3), Role::Model, BlockKind::Text, "msg 4", Status::Done).unwrap();
+        let b1 = store
+            .insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "msg 1",
+                Status::Done,
+            )
+            .unwrap();
+        let b2 = store
+            .insert_block(
+                Some(&b1),
+                Some(&b1),
+                Role::Model,
+                BlockKind::Text,
+                "msg 2",
+                Status::Done,
+            )
+            .unwrap();
+        let b3 = store
+            .insert_block(
+                Some(&b2),
+                Some(&b2),
+                Role::User,
+                BlockKind::Text,
+                "msg 3",
+                Status::Done,
+            )
+            .unwrap();
+        let _b4 = store
+            .insert_block(
+                Some(&b3),
+                Some(&b3),
+                Role::Model,
+                BlockKind::Text,
+                "msg 4",
+                Status::Done,
+            )
+            .unwrap();
 
         let mut filter = ForkBlockFilter::default();
         filter.max_blocks = Some(2);
@@ -2091,9 +2619,36 @@ mod tests {
     fn test_fork_filtered_exclude_block_ids() {
         let mut store = test_store();
 
-        let b1 = store.insert_block(None, None, Role::User, BlockKind::Text, "keep me", Status::Done).unwrap();
-        let b2 = store.insert_block(Some(&b1), Some(&b1), Role::Model, BlockKind::Text, "exclude me", Status::Done).unwrap();
-        let _b3 = store.insert_block(Some(&b2), Some(&b2), Role::User, BlockKind::Text, "also keep", Status::Done).unwrap();
+        let b1 = store
+            .insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "keep me",
+                Status::Done,
+            )
+            .unwrap();
+        let b2 = store
+            .insert_block(
+                Some(&b1),
+                Some(&b1),
+                Role::Model,
+                BlockKind::Text,
+                "exclude me",
+                Status::Done,
+            )
+            .unwrap();
+        let _b3 = store
+            .insert_block(
+                Some(&b2),
+                Some(&b2),
+                Role::User,
+                BlockKind::Text,
+                "also keep",
+                Status::Done,
+            )
+            .unwrap();
 
         let mut filter = ForkBlockFilter::default();
         filter.exclude_block_ids.insert(b2.to_key());
@@ -2109,10 +2664,46 @@ mod tests {
     fn test_fork_filtered_combined_criteria() {
         let mut store = test_store();
 
-        let b1 = store.insert_block(None, None, Role::User, BlockKind::Text, "question", Status::Done).unwrap();
-        let _b2 = store.insert_block(Some(&b1), Some(&b1), Role::Model, BlockKind::Thinking, "thinking...", Status::Done).unwrap();
-        let _b3 = store.insert_block(Some(&b1), None, Role::Tool, BlockKind::ToolResult, "tool output", Status::Done).unwrap();
-        let _b4 = store.insert_block(Some(&b1), None, Role::Model, BlockKind::Text, "answer", Status::Done).unwrap();
+        let b1 = store
+            .insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "question",
+                Status::Done,
+            )
+            .unwrap();
+        let _b2 = store
+            .insert_block(
+                Some(&b1),
+                Some(&b1),
+                Role::Model,
+                BlockKind::Thinking,
+                "thinking...",
+                Status::Done,
+            )
+            .unwrap();
+        let _b3 = store
+            .insert_block(
+                Some(&b1),
+                None,
+                Role::Tool,
+                BlockKind::ToolResult,
+                "tool output",
+                Status::Done,
+            )
+            .unwrap();
+        let _b4 = store
+            .insert_block(
+                Some(&b1),
+                None,
+                Role::Model,
+                BlockKind::Text,
+                "answer",
+                Status::Done,
+            )
+            .unwrap();
 
         let mut filter = ForkBlockFilter::default();
         filter.exclude_kinds.insert("Thinking".to_string());
@@ -2123,7 +2714,11 @@ mod tests {
         let forked = store.fork_filtered(new_ctx, new_agent, u64::MAX, &filter);
 
         // Should keep: user text + model text = 2
-        assert_eq!(forked.block_count(), 2, "Thinking + Tool blocks should be excluded");
+        assert_eq!(
+            forked.block_count(),
+            2,
+            "Thinking + Tool blocks should be excluded"
+        );
     }
 
     // =====================================================================
@@ -2160,8 +2755,14 @@ mod tests {
 
         // Confirm this is a DTE-only payload
         assert!(!payload.block_ops.is_empty(), "payload should have DTE ops");
-        assert!(payload.new_blocks.is_empty(), "payload should have no new blocks");
-        assert!(payload.updated_headers.is_empty(), "payload should have no updated headers");
+        assert!(
+            payload.new_blocks.is_empty(),
+            "payload should have no new blocks"
+        );
+        assert!(
+            payload.updated_headers.is_empty(),
+            "payload should have no updated headers"
+        );
 
         // Merge into store2
         store2.merge_ops(payload).unwrap();
@@ -2193,9 +2794,9 @@ mod tests {
 
         // Insert 3 blocks with distinct created_at timestamps.
         // We construct BlockContent directly so we can control created_at.
-        let ts_early = 1_000_000u64;  // 1 second after epoch
-        let ts_mid   = 2_000_000u64;  // 2 seconds
-        let ts_late  = 3_000_000u64;  // 3 seconds
+        let ts_early = 1_000_000u64; // 1 second after epoch
+        let ts_mid = 2_000_000u64; // 2 seconds
+        let ts_late = 3_000_000u64; // 3 seconds
 
         let id1 = store.new_block_id();
         let h1 = BlockHeader {
@@ -2283,9 +2884,13 @@ mod tests {
         let forked = store.fork_at_version(new_ctx, new_agent, cutoff);
 
         assert_eq!(
-            forked.block_count(), 2,
+            forked.block_count(),
+            2,
             "Fork at timestamp {} should include 2 blocks (created_at {} and {}), not block with created_at {}",
-            cutoff, ts_early, ts_mid, ts_late
+            cutoff,
+            ts_early,
+            ts_mid,
+            ts_late
         );
 
         // Verify the correct blocks are present by checking content
@@ -2304,7 +2909,7 @@ mod tests {
         let mut store = BlockStore::new(ctx, agent);
 
         let ts_early = 1_000_000u64;
-        let ts_late  = 3_000_000u64;
+        let ts_late = 3_000_000u64;
 
         let id1 = store.new_block_id();
         let h1 = BlockHeader {
@@ -2327,7 +2932,10 @@ mod tests {
             compacted_at: 0,
             tool_meta_at: 0,
         };
-        store.blocks.insert(id1, BlockContent::with_content(h1, "keep", agent, "V".to_string()));
+        store.blocks.insert(
+            id1,
+            BlockContent::with_content(h1, "keep", agent, "V".to_string()),
+        );
         store.version += 1;
 
         let id2 = store.new_block_id();
@@ -2351,7 +2959,10 @@ mod tests {
             compacted_at: 0,
             tool_meta_at: 0,
         };
-        store.blocks.insert(id2, BlockContent::with_content(h2, "drop", agent, "W".to_string()));
+        store.blocks.insert(
+            id2,
+            BlockContent::with_content(h2, "drop", agent, "W".to_string()),
+        );
         store.version += 1;
 
         // Fork at cutoff between the two timestamps, with empty filter
@@ -2361,7 +2972,11 @@ mod tests {
         let new_agent = PrincipalId::new();
         let forked = store.fork_filtered(new_ctx, new_agent, cutoff, &filter);
 
-        assert_eq!(forked.block_count(), 1, "Only the early block should survive the timestamp cutoff");
+        assert_eq!(
+            forked.block_count(),
+            1,
+            "Only the early block should survive the timestamp cutoff"
+        );
         let snaps = forked.blocks_ordered();
         assert_eq!(snaps[0].content, "keep");
     }
@@ -2375,9 +2990,16 @@ mod tests {
         let agent_b = PrincipalId::new();
 
         let mut store_a = BlockStore::new(ctx, agent_a);
-        let block_id = store_a.insert_block(
-            None, None, Role::User, BlockKind::Text, "test", Status::Running,
-        ).unwrap();
+        let block_id = store_a
+            .insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "test",
+                Status::Running,
+            )
+            .unwrap();
 
         // Sync to store_b so both have the same block
         let mut store_b = BlockStore::new(ctx, agent_b);
@@ -2401,12 +3023,25 @@ mod tests {
         let header_b = store_b.blocks.get(&block_id).unwrap().header();
 
         // Both stores converge
-        assert_eq!(header_a.status, header_b.status, "stores must converge on status");
-        assert_eq!(header_a.ephemeral, header_b.ephemeral, "stores must converge on ephemeral");
+        assert_eq!(
+            header_a.status, header_b.status,
+            "stores must converge on status"
+        );
+        assert_eq!(
+            header_a.ephemeral, header_b.ephemeral,
+            "stores must converge on ephemeral"
+        );
 
         // Per-field LWW: BOTH concurrent changes are preserved
-        assert!(header_a.ephemeral, "ephemeral=true must survive (independent field)");
-        assert_eq!(header_a.status, Status::Done, "status=Done must survive (independent field)");
+        assert!(
+            header_a.ephemeral,
+            "ephemeral=true must survive (independent field)"
+        );
+        assert_eq!(
+            header_a.status,
+            Status::Done,
+            "status=Done must survive (independent field)"
+        );
     }
 
     /// Per-field LWW: different fields with different timestamps both preserved.
@@ -2417,9 +3052,16 @@ mod tests {
         let agent_b = PrincipalId::new();
 
         let mut store_a = BlockStore::new(ctx, agent_a);
-        let block_id = store_a.insert_block(
-            None, None, Role::User, BlockKind::Text, "test", Status::Running,
-        ).unwrap();
+        let block_id = store_a
+            .insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "test",
+                Status::Running,
+            )
+            .unwrap();
 
         let mut store_b = BlockStore::new(ctx, agent_b);
         let payload = store_a.ops_since(&HashMap::new());
@@ -2461,9 +3103,16 @@ mod tests {
         let agent_b = PrincipalId::new();
 
         let mut store_a = BlockStore::new(ctx, agent_a);
-        let block_id = store_a.insert_block(
-            None, None, Role::User, BlockKind::Text, "test", Status::Running,
-        ).unwrap();
+        let block_id = store_a
+            .insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "test",
+                Status::Running,
+            )
+            .unwrap();
 
         let mut store_b = BlockStore::new(ctx, agent_b);
         let payload = store_a.ops_since(&HashMap::new());
@@ -2499,9 +3148,16 @@ mod tests {
         let agent_b = PrincipalId::new();
 
         let mut store_a = BlockStore::new(ctx, agent_a);
-        let block_id = store_a.insert_block(
-            None, None, Role::User, BlockKind::Text, "test", Status::Pending,
-        ).unwrap();
+        let block_id = store_a
+            .insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "test",
+                Status::Pending,
+            )
+            .unwrap();
 
         let mut store_b = BlockStore::new(ctx, agent_b);
         let payload = store_a.ops_since(&HashMap::new());

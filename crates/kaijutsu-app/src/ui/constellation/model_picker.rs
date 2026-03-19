@@ -13,8 +13,8 @@ use crate::input::action::Action;
 use crate::input::events::ActionFired;
 use crate::input::focus::{FocusArea, FocusStack};
 use crate::ui::form::{
-    handle_form_action, AsyncSlot, FieldDesc, Form, FormActionResult, FormFieldContainer,
-    FormLayout, FormLoadingText, FormPresentation, ListItem, SelectableList,
+    AsyncSlot, FieldDesc, Form, FormActionResult, FormFieldContainer, FormLayout, FormLoadingText,
+    FormPresentation, ListItem, SelectableList, handle_form_action,
 };
 use crate::ui::theme::Theme;
 
@@ -176,9 +176,7 @@ fn poll_model_picker_result(
     existing_list: Query<(&FormFieldContainer, &SelectableList)>,
 ) {
     // Nothing to do if already populated
-    let has_list = existing_list
-        .iter()
-        .any(|(ffc, _)| ffc.0 == FIELD_MODELS);
+    let has_list = existing_list.iter().any(|(ffc, _)| ffc.0 == FIELD_MODELS);
     if has_list {
         return;
     }
@@ -227,10 +225,7 @@ fn handle_model_picker_input(
     mut focus: ResMut<FocusArea>,
     mut focus_stack: ResMut<FocusStack>,
     dialogs: Query<(Entity, &Form), With<ModelPickerDialog>>,
-    mut active_field_query: Query<
-        &mut crate::ui::form::ActiveFormField,
-        With<ModelPickerDialog>,
-    >,
+    mut active_field_query: Query<&mut crate::ui::form::ActiveFormField, With<ModelPickerDialog>>,
     mut list_query: Query<(&FormFieldContainer, &mut SelectableList)>,
     mut tree_query: Query<(&FormFieldContainer, &mut crate::ui::form::TreeView)>,
     actor: Option<Res<RpcActor>>,
@@ -256,8 +251,13 @@ fn handle_model_picker_input(
     };
 
     for ActionFired(action) in actions.read() {
-        match handle_form_action(action, form, &mut active_field, &mut list_query, &mut tree_query)
-        {
+        match handle_form_action(
+            action,
+            form,
+            &mut active_field,
+            &mut list_query,
+            &mut tree_query,
+        ) {
             FormActionResult::Cancel => {
                 close_model_picker(&mut commands, dialog_entity, &mut focus, &mut focus_stack);
                 return;
@@ -277,10 +277,7 @@ fn handle_model_picker_input(
 
                         bevy::tasks::IoTaskPool::get()
                             .spawn(async move {
-                                match handle
-                                    .set_default_model(&provider, &model)
-                                    .await
-                                {
+                                match handle.set_default_model(&provider, &model).await {
                                     Ok(true) => {
                                         info!("Model set to {}/{}", provider, model)
                                     }

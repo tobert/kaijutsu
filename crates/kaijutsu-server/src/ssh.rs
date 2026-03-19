@@ -8,13 +8,13 @@ use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
+use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
 use parking_lot::Mutex;
-use russh::keys::ssh_key::{self, HashAlg};
 use russh::keys::PrivateKey;
+use russh::keys::ssh_key::{self, HashAlg};
 use russh::server::{self, Auth, Msg, Server as _, Session};
 use russh::{Channel, ChannelId};
 use tokio::net::TcpListener;
@@ -63,9 +63,8 @@ pub fn load_or_generate_host_key(path: &Path) -> Result<PrivateKey, std::io::Err
     if path.exists() {
         log::info!("Loading host key from {}", path.display());
         let key_data = fs::read_to_string(path)?;
-        PrivateKey::from_openssh(&key_data).map_err(|e| {
-            std::io::Error::other(format!("Failed to parse host key: {}", e))
-        })
+        PrivateKey::from_openssh(&key_data)
+            .map_err(|e| std::io::Error::other(format!("Failed to parse host key: {}", e)))
     } else {
         log::info!("Generating new host key at {}", path.display());
 
@@ -78,9 +77,9 @@ pub fn load_or_generate_host_key(path: &Path) -> Result<PrivateKey, std::io::Err
             .map_err(std::io::Error::other)?;
 
         // Save in OpenSSH format
-        let key_pem = key.to_openssh(ssh_key::LineEnding::LF).map_err(|e| {
-            std::io::Error::other(format!("Failed to serialize host key: {}", e))
-        })?;
+        let key_pem = key
+            .to_openssh(ssh_key::LineEnding::LF)
+            .map_err(|e| std::io::Error::other(format!("Failed to serialize host key: {}", e)))?;
         fs::write(path, key_pem.as_bytes())?;
 
         // Set restrictive permissions on Unix
@@ -129,7 +128,8 @@ impl SshServerConfig {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let config_dir = std::env::temp_dir().join(format!("kaijutsu-test-{}-{}", std::process::id(), stamp));
+        let config_dir =
+            std::env::temp_dir().join(format!("kaijutsu-test-{}-{}", std::process::id(), stamp));
         std::fs::create_dir_all(&config_dir).ok();
 
         Self {
@@ -177,14 +177,9 @@ impl SshServer {
     ///
     /// This runs concurrently with the SSH accept loop so server startup
     /// isn't blocked by slow MCP servers (e.g. streamable_http with no listener).
-    fn start_mcp_initialization(
-        pool: Arc<McpServerPool>,
-        config_dir: Option<PathBuf>,
-    ) {
+    fn start_mcp_initialization(pool: Arc<McpServerPool>, config_dir: Option<PathBuf>) {
         let config_path = config_dir
-            .unwrap_or_else(|| {
-                kaish_kernel::xdg_config_home().join("kaijutsu")
-            })
+            .unwrap_or_else(|| kaish_kernel::xdg_config_home().join("kaijutsu"))
             .join("mcp.rhai");
 
         tokio::spawn(async move {
@@ -217,31 +212,35 @@ impl SshServer {
             );
 
             let timeout = std::time::Duration::from_secs(5);
-            let futs: Vec<_> = config.servers.into_iter().map(|server_config| {
-                let pool = pool.clone();
-                let name = server_config.name.clone();
-                async move {
-                    match tokio::time::timeout(timeout, pool.register(server_config)).await {
-                        Ok(Ok(info)) => {
-                            log::info!(
-                                "MCP server '{}' pre-initialized ({} tools)",
-                                name,
-                                info.tools.len(),
-                            );
-                        }
-                        Ok(Err(e)) => {
-                            log::warn!("MCP server '{}' failed to pre-initialize: {}", name, e);
-                        }
-                        Err(_) => {
-                            log::warn!(
-                                "MCP server '{}' timed out during pre-initialization ({}s)",
-                                name,
-                                timeout.as_secs(),
-                            );
+            let futs: Vec<_> = config
+                .servers
+                .into_iter()
+                .map(|server_config| {
+                    let pool = pool.clone();
+                    let name = server_config.name.clone();
+                    async move {
+                        match tokio::time::timeout(timeout, pool.register(server_config)).await {
+                            Ok(Ok(info)) => {
+                                log::info!(
+                                    "MCP server '{}' pre-initialized ({} tools)",
+                                    name,
+                                    info.tools.len(),
+                                );
+                            }
+                            Ok(Err(e)) => {
+                                log::warn!("MCP server '{}' failed to pre-initialize: {}", name, e);
+                            }
+                            Err(_) => {
+                                log::warn!(
+                                    "MCP server '{}' timed out during pre-initialization ({}s)",
+                                    name,
+                                    timeout.as_secs(),
+                                );
+                            }
                         }
                     }
-                }
-            }).collect();
+                })
+                .collect();
 
             futures::future::join_all(futs).await;
             log::info!("MCP pre-initialization complete");
@@ -313,7 +312,9 @@ impl SshServer {
             &mcp_pool,
             self.config.config_dir.as_deref(),
             self.config.data_dir.as_deref(),
-        ).await.map_err(|e| std::io::Error::other(format!("Failed to create shared kernel: {}", e)))?;
+        )
+        .await
+        .map_err(|e| std::io::Error::other(format!("Failed to create shared kernel: {}", e)))?;
 
         let registry = Arc::new(ServerRegistry {
             kernel: shared_kernel,
@@ -621,14 +622,11 @@ impl server::Handler for ConnectionHandler {
                         });
                     }
 
-                    const RESERVED: &[&str] =
-                        &["root", "admin", "system", "nobody", "daemon"];
+                    const RESERVED: &[&str] = &["root", "admin", "system", "nobody", "daemon"];
                     if RESERVED.contains(&safe_user.as_str())
                         || safe_user.chars().all(|c| c.is_ascii_digit())
                     {
-                        log::warn!(
-                            "Anonymous auth rejected: reserved username '{safe_user}'"
-                        );
+                        log::warn!("Anonymous auth rejected: reserved username '{safe_user}'");
                         return Ok(Auth::Reject {
                             proceed_with_methods: None,
                             partial_success: false,
@@ -651,12 +649,17 @@ impl server::Handler for ConnectionHandler {
 
                     let result = tokio::task::spawn_blocking(move || {
                         // Reconstruct the key from OpenSSH format
-                        let key = ssh_key::PublicKey::from_openssh(&key_openssh)
-                            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(
-                                std::io::Error::other(format!("Failed to parse key: {}", e))
-                            )))?;
+                        let key = ssh_key::PublicKey::from_openssh(&key_openssh).map_err(|e| {
+                            rusqlite::Error::ToSqlConversionFailure(Box::new(
+                                std::io::Error::other(format!("Failed to parse key: {}", e)),
+                            ))
+                        })?;
                         let mut db = db.lock();
-                        db.add_key_auto_principal(&key, Some(&safe_user_clone), Some(&safe_user_clone))
+                        db.add_key_auto_principal(
+                            &key,
+                            Some(&safe_user_clone),
+                            Some(&safe_user_clone),
+                        )
                     })
                     .await
                     .map_err(|e| {

@@ -9,16 +9,16 @@ use bevy_vello::prelude::UiVelloScene;
 
 use kaijutsu_types::ToolKind;
 
-use crate::view::{
-    BlockCell, BlockKind, BlockSnapshot, CellEditor, DriftKind, MainCell,
-    BlockCellContainer, EditorEntities, Role,
-};
-use crate::view::fieldset;
-use crate::text::{FontHandles, TextMetrics};
-use crate::ui::theme::Theme;
 use crate::connection::RpcConnectionState;
+use crate::text::{FontHandles, TextMetrics};
 use crate::ui::drift::DriftState;
+use crate::ui::theme::Theme;
 use crate::view::document::DocumentCache;
+use crate::view::fieldset;
+use crate::view::{
+    BlockCell, BlockCellContainer, BlockKind, BlockSnapshot, CellEditor, DriftKind, EditorEntities,
+    MainCell, Role,
+};
 
 // ============================================================================
 // COMPONENTS
@@ -143,10 +143,7 @@ pub fn determine_block_border_style(
     };
 
     let blocks_vec = editor.blocks();
-    let blocks: std::collections::HashMap<_, _> = blocks_vec
-        .iter()
-        .map(|b| (b.id, b))
-        .collect();
+    let blocks: std::collections::HashMap<_, _> = blocks_vec.iter().map(|b| (b.id, b)).collect();
 
     // Build set of tool_call_ids that have a ToolResult
     let has_result: std::collections::HashSet<_> = blocks_vec
@@ -157,8 +154,13 @@ pub fn determine_block_border_style(
 
     // Build context for labels
     let ctx = BorderContext {
-        username: conn_state.identity.as_ref().map(|i| i.username.clone()).unwrap_or_default(),
-        model: doc_cache.active_id()
+        username: conn_state
+            .identity
+            .as_ref()
+            .map(|i| i.username.clone())
+            .unwrap_or_default(),
+        model: doc_cache
+            .active_id()
             .and_then(|ctx_id| drift_state.contexts.iter().find(|c| c.id == ctx_id))
             .map(|c| c.model.clone())
             .unwrap_or_default(),
@@ -178,7 +180,13 @@ pub fn determine_block_border_style(
         };
 
         let has_result_below = has_result.contains(&block.id);
-        let new_style = compute_border_style(block, &theme, &ctx, has_result_below, text_metrics.cell_font_size);
+        let new_style = compute_border_style(
+            block,
+            &theme,
+            &ctx,
+            has_result_below,
+            text_metrics.cell_font_size,
+        );
 
         match (&new_style, existing_style) {
             (Some(style), Some(existing)) if style == existing => {
@@ -225,7 +233,10 @@ fn compute_border_style(
                 _ => {
                     // Unified boxes (with result below) keep higher opacity for visible sides
                     let alpha = if has_result { 0.85 } else { 0.7 };
-                    (BorderAnimation::None, theme.block_border_tool_call.with_alpha(alpha))
+                    (
+                        BorderAnimation::None,
+                        theme.block_border_tool_call.with_alpha(alpha),
+                    )
                 }
             };
 
@@ -321,7 +332,11 @@ fn compute_border_style(
                 thickness: theme.block_border_thickness,
                 corner_radius: theme.block_border_corner_radius,
                 padding: BorderPadding {
-                    top: if has_paired_call { base * 0.25 } else { padding.top },
+                    top: if has_paired_call {
+                        base * 0.25
+                    } else {
+                        padding.top
+                    },
                     ..padding
                 },
                 animation,
@@ -404,10 +419,9 @@ pub fn spawn_vello_borders(
     block_cells: Query<Entity, (With<BlockBorderStyle>, Without<BlockBorderActive>)>,
 ) {
     for entity in block_cells.iter() {
-        commands.entity(entity).insert((
-            UiVelloScene::default(),
-            BlockBorderActive,
-        ));
+        commands
+            .entity(entity)
+            .insert((UiVelloScene::default(), BlockBorderActive));
     }
 }
 
@@ -425,7 +439,11 @@ pub fn spawn_vello_borders(
 pub fn update_vello_borders(
     mut block_cells: Query<
         (&BlockBorderStyle, &mut UiVelloScene, &ComputedNode),
-        Or<(Added<UiVelloScene>, Changed<BlockBorderStyle>, Changed<ComputedNode>)>,
+        Or<(
+            Added<UiVelloScene>,
+            Changed<BlockBorderStyle>,
+            Changed<ComputedNode>,
+        )>,
     >,
     fonts: Res<Assets<bevy_vello::prelude::VelloFont>>,
     font_handles: Res<FontHandles>,
@@ -504,6 +522,8 @@ pub fn cleanup_block_borders(
     removed_style: Query<Entity, (With<BlockBorderActive>, Without<BlockBorderStyle>)>,
 ) {
     for entity in removed_style.iter() {
-        commands.entity(entity).remove::<(UiVelloScene, BlockBorderActive)>();
+        commands
+            .entity(entity)
+            .remove::<(UiVelloScene, BlockBorderActive)>();
     }
 }

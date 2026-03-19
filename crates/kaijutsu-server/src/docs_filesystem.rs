@@ -34,9 +34,7 @@ fn backend_to_io(err: BackendError) -> io::Error {
     match err {
         BackendError::NotFound(msg) => io::Error::new(io::ErrorKind::NotFound, msg),
         BackendError::AlreadyExists(msg) => io::Error::new(io::ErrorKind::AlreadyExists, msg),
-        BackendError::PermissionDenied(msg) => {
-            io::Error::new(io::ErrorKind::PermissionDenied, msg)
-        }
+        BackendError::PermissionDenied(msg) => io::Error::new(io::ErrorKind::PermissionDenied, msg),
         BackendError::IsDirectory(msg) => io::Error::new(io::ErrorKind::IsADirectory, msg),
         BackendError::NotDirectory(msg) => io::Error::new(io::ErrorKind::NotADirectory, msg),
         BackendError::ReadOnly => {
@@ -84,11 +82,17 @@ impl Filesystem for KaijutsuFilesystem {
     }
 
     async fn list(&self, path: &Path) -> io::Result<Vec<DirEntry>> {
-        self.backend.list(&docs_path(path)).await.map_err(backend_to_io)
+        self.backend
+            .list(&docs_path(path))
+            .await
+            .map_err(backend_to_io)
     }
 
     async fn stat(&self, path: &Path) -> io::Result<DirEntry> {
-        self.backend.stat(&docs_path(path)).await.map_err(backend_to_io)
+        self.backend
+            .stat(&docs_path(path))
+            .await
+            .map_err(backend_to_io)
     }
 
     async fn mkdir(&self, path: &Path) -> io::Result<()> {
@@ -128,8 +132,8 @@ impl Filesystem for KaijutsuFilesystem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kaijutsu_kernel::block_store::shared_block_store;
     use kaijutsu_kernel::Kernel as KaijutsuKernel;
+    use kaijutsu_kernel::block_store::shared_block_store;
     use kaijutsu_types::PrincipalId;
 
     #[tokio::test]

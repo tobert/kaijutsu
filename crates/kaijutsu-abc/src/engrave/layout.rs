@@ -72,7 +72,7 @@ fn note_to_staff_position(pitch: &NoteName, octave: i8) -> f64 {
     // E4 (bottom line) = (E, octave 1) → abs diatonic = 1*7+2 = 9
     // Middle C (C4) = (C, octave 1) → abs diatonic = 7 → pos 5.0 (ledger line below)
 
-    let abs_diatonic = octave as i32 * 7 + diatonic as i32;
+    let abs_diatonic = octave as i32 * 7 + diatonic;
     let b4_abs = 13i32; // B4 = (B, octave 1)
 
     // Each diatonic step = half a staff_spacing
@@ -190,8 +190,7 @@ pub fn engrave(tune: &Tune, options: &EngravingOptions) -> Vec<EngravingElement>
                 Element::Chord(chord) => {
                     let span = (0usize, 0usize);
                     // Emit stacked noteheads with shared stem
-                    let dur_width =
-                        duration_to_width(&chord.duration, unit_width);
+                    let dur_width = duration_to_width(&chord.duration, unit_width);
 
                     for note in &chord.notes {
                         let pos = note_to_staff_position(&note.pitch, note.octave);
@@ -204,14 +203,7 @@ pub fn engrave(tune: &Tune, options: &EngravingOptions) -> Vec<EngravingElement>
                             scale,
                             source_span: span,
                         });
-                        emit_ledger_lines(
-                            &mut elements,
-                            pos,
-                            cursor_x,
-                            staff_top,
-                            sp,
-                            span,
-                        );
+                        emit_ledger_lines(&mut elements, pos, cursor_x, staff_top, sp, span);
                     }
 
                     // Stem on the chord (use highest and lowest notes)
@@ -219,8 +211,7 @@ pub fn engrave(tune: &Tune, options: &EngravingOptions) -> Vec<EngravingElement>
                         && !(chord.duration.numerator >= 4 && chord.duration.denominator == 1)
                     {
                         // Not a whole note: draw stem
-                        if let (Some(first), Some(last)) =
-                            (chord.notes.first(), chord.notes.last())
+                        if let (Some(first), Some(last)) = (chord.notes.first(), chord.notes.last())
                         {
                             let top_pos = note_to_staff_position(&first.pitch, first.octave);
                             let bot_pos = note_to_staff_position(&last.pitch, last.octave);
@@ -286,13 +277,11 @@ pub fn engrave(tune: &Tune, options: &EngravingOptions) -> Vec<EngravingElement>
                 }
                 Element::Tuplet(tuplet) => {
                     let span = (0usize, 0usize);
-                    let scale_factor =
-                        tuplet.q as f64 / tuplet.p as f64;
+                    let scale_factor = tuplet.q as f64 / tuplet.p as f64;
                     for elem in &tuplet.elements {
                         if let Element::Note(note) = elem {
                             // Scale the width by the tuplet ratio
-                            let orig_width =
-                                duration_to_width(&note.duration, unit_width);
+                            let orig_width = duration_to_width(&note.duration, unit_width);
                             let scaled_width = orig_width * scale_factor;
                             let pos = note_to_staff_position(&note.pitch, note.octave);
                             let y = staff_top + pos * sp;
@@ -304,14 +293,7 @@ pub fn engrave(tune: &Tune, options: &EngravingOptions) -> Vec<EngravingElement>
                                 scale,
                                 source_span: span,
                             });
-                            emit_ledger_lines(
-                                &mut elements,
-                                pos,
-                                cursor_x,
-                                staff_top,
-                                sp,
-                                span,
-                            );
+                            emit_ledger_lines(&mut elements, pos, cursor_x, staff_top, sp, span);
                             emit_stem(
                                 &mut elements,
                                 pos,
@@ -352,8 +334,8 @@ pub fn engrave(tune: &Tune, options: &EngravingOptions) -> Vec<EngravingElement>
     });
 
     // Fix staff line widths
-    for i in staff_line_start_idx..staff_line_start_idx + 5 {
-        if let EngravingElement::Line { x2, .. } = &mut elements[i] {
+    for element in &mut elements[staff_line_start_idx..staff_line_start_idx + 5] {
+        if let EngravingElement::Line { x2, .. } = element {
             *x2 = cursor_x;
         }
     }
@@ -405,10 +387,28 @@ fn emit_note(
     emit_ledger_lines(elements, pos, cursor_x, staff_top, sp, span);
 
     // Stem
-    emit_stem(elements, pos, cursor_x, staff_top, sp, scale, &note.duration, span);
+    emit_stem(
+        elements,
+        pos,
+        cursor_x,
+        staff_top,
+        sp,
+        scale,
+        &note.duration,
+        span,
+    );
 
     // Flag for 8th and 16th notes
-    emit_flag(elements, pos, cursor_x, staff_top, sp, scale, &note.duration, span);
+    emit_flag(
+        elements,
+        pos,
+        cursor_x,
+        staff_top,
+        sp,
+        scale,
+        &note.duration,
+        span,
+    );
 
     let dur_width = duration_to_width(&note.duration, unit_width);
     cursor_x + dur_width
@@ -651,27 +651,43 @@ mod tests {
     fn middle_c_is_below_staff() {
         // Middle C (C4) = ABC (C, octave 1) → pos 5.0, one ledger line below
         let pos = note_to_staff_position(&NoteName::C, 1);
-        assert!((pos - 5.0).abs() < 0.01, "Middle C should be at pos 5.0, got {}", pos);
+        assert!(
+            (pos - 5.0).abs() < 0.01,
+            "Middle C should be at pos 5.0, got {}",
+            pos
+        );
     }
 
     #[test]
     fn b4_is_middle_line() {
         // B4 = ABC (B, octave 1) = lowercase b → middle line
         let pos = note_to_staff_position(&NoteName::B, 1);
-        assert!((pos - 2.0).abs() < 0.01, "B4 should be at position 2.0, got {}", pos);
+        assert!(
+            (pos - 2.0).abs() < 0.01,
+            "B4 should be at position 2.0, got {}",
+            pos
+        );
     }
 
     #[test]
     fn f5_is_top_line() {
         // F5 = ABC (F, octave 2) = f' → top line
         let pos = note_to_staff_position(&NoteName::F, 2);
-        assert!((pos - 0.0).abs() < 0.01, "F5 should be at position 0.0, got {}", pos);
+        assert!(
+            (pos - 0.0).abs() < 0.01,
+            "F5 should be at position 0.0, got {}",
+            pos
+        );
     }
 
     #[test]
     fn e4_is_bottom_line() {
         // E4 = ABC (E, octave 1) = lowercase e → bottom line
         let pos = note_to_staff_position(&NoteName::E, 1);
-        assert!((pos - 4.0).abs() < 0.01, "E4 should be at position 4.0, got {}", pos);
+        assert!(
+            (pos - 4.0).abs() < 0.01,
+            "E4 should be at position 4.0, got {}",
+            pos
+        );
     }
 }

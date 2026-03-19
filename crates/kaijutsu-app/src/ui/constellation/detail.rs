@@ -11,7 +11,7 @@ use bevy_vello::vello::peniko::{Color as VelloColor, Fill};
 
 use super::{Constellation, ConstellationContainer};
 use crate::ui::screen::Screen;
-use crate::ui::theme::{agent_color_for_provider, Theme};
+use crate::ui::theme::{Theme, agent_color_for_provider};
 
 /// Marker for the detail sidebar container.
 #[derive(Component)]
@@ -28,11 +28,7 @@ struct DetailBg;
 pub fn setup_detail_systems(app: &mut App) {
     app.add_systems(
         Update,
-        (
-            spawn_detail_sidebar,
-            update_detail_content,
-        )
-            .chain(),
+        (spawn_detail_sidebar, update_detail_content).chain(),
     );
 }
 
@@ -126,14 +122,27 @@ fn update_detail_content(
         for byte in focus_id.to_string().bytes() {
             h = h.wrapping_mul(31).wrapping_add(byte as u64);
         }
-        h = h.wrapping_mul(31).wrapping_add(node.label.as_ref().map(|l| l.len()).unwrap_or(0) as u64);
-        h = h.wrapping_mul(31).wrapping_add(node.model.as_ref().map(|m| m.len()).unwrap_or(0) as u64);
-        h = h.wrapping_mul(31).wrapping_add(node.provider.as_ref().map(|p| p.len()).unwrap_or(0) as u64);
+        h = h
+            .wrapping_mul(31)
+            .wrapping_add(node.label.as_ref().map(|l| l.len()).unwrap_or(0) as u64);
+        h = h
+            .wrapping_mul(31)
+            .wrapping_add(node.model.as_ref().map(|m| m.len()).unwrap_or(0) as u64);
+        h = h
+            .wrapping_mul(31)
+            .wrapping_add(node.provider.as_ref().map(|p| p.len()).unwrap_or(0) as u64);
         h = h.wrapping_mul(31).wrapping_add(node.activity as u64);
-        h = h.wrapping_mul(31).wrapping_add(if node.joined { 1 } else { 0 });
+        h = h
+            .wrapping_mul(31)
+            .wrapping_add(if node.joined { 1 } else { 0 });
         h = h.wrapping_mul(31).wrapping_add(node.graph_distance as u64);
         h = h.wrapping_mul(31).wrapping_add(node.keywords.len() as u64);
-        h = h.wrapping_mul(31).wrapping_add(node.top_block_preview.as_ref().map(|p| p.len()).unwrap_or(0) as u64);
+        h = h.wrapping_mul(31).wrapping_add(
+            node.top_block_preview
+                .as_ref()
+                .map(|p| p.len())
+                .unwrap_or(0) as u64,
+        );
         h
     };
 
@@ -156,7 +165,8 @@ fn update_detail_content(
     // Rebuild background with accent stripe
     for mut bg in bg_q.iter_mut() {
         let bg_srgba = theme.panel_bg.with_alpha(0.90).to_srgba();
-        let vello_bg = VelloColor::new([bg_srgba.red, bg_srgba.green, bg_srgba.blue, bg_srgba.alpha]);
+        let vello_bg =
+            VelloColor::new([bg_srgba.red, bg_srgba.green, bg_srgba.blue, bg_srgba.alpha]);
         let accent_srgba = agent_color.to_srgba();
         let vello_accent = VelloColor::new([
             accent_srgba.red,
@@ -261,14 +271,15 @@ fn update_detail_content(
     }
 
     // Representative block preview
-    if let Some(ref preview) = node.top_block_preview {
-        if !preview.is_empty() {
-            let preview_header = spawn_detail_text(&mut commands, font, "representative", theme.fg_dim, 9.0);
-            commands.entity(sidebar_entity).add_child(preview_header);
+    if let Some(ref preview) = node.top_block_preview
+        && !preview.is_empty()
+    {
+        let preview_header =
+            spawn_detail_text(&mut commands, font, "representative", theme.fg_dim, 9.0);
+        commands.entity(sidebar_entity).add_child(preview_header);
 
-            let preview_ent = spawn_detail_text(&mut commands, font, preview, theme.fg_dim, 9.0);
-            commands.entity(sidebar_entity).add_child(preview_ent);
-        }
+        let preview_ent = spawn_detail_text(&mut commands, font, preview, theme.fg_dim, 9.0);
+        commands.entity(sidebar_entity).add_child(preview_ent);
     }
 
     *last_fingerprint = fingerprint;
@@ -305,21 +316,20 @@ fn spawn_detail_text(
         .id()
 }
 
-fn spawn_divider(
-    commands: &mut Commands,
-    theme: &Theme,
-) -> Entity {
+fn spawn_divider(commands: &mut Commands, theme: &Theme) -> Entity {
     let border_srgba = theme.border.to_srgba();
-    let vello_border = VelloColor::new([
-        border_srgba.red,
-        border_srgba.green,
-        border_srgba.blue,
-        0.3,
-    ]);
+    let vello_border =
+        VelloColor::new([border_srgba.red, border_srgba.green, border_srgba.blue, 0.3]);
 
     let mut scene = bevy_vello::vello::Scene::new();
     let line_rect = RoundedRect::new(0.0, 0.0, 256.0, 1.0, 0.0);
-    scene.fill(Fill::NonZero, Affine::IDENTITY, vello_border, None, &line_rect);
+    scene.fill(
+        Fill::NonZero,
+        Affine::IDENTITY,
+        vello_border,
+        None,
+        &line_rect,
+    );
 
     commands
         .spawn((

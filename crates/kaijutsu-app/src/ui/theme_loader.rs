@@ -86,8 +86,8 @@ pub fn load_theme_from_script(script: &str) -> Result<Theme, String> {
 /// Load and parse a theme file.
 #[allow(dead_code)] // For future file-based reload
 fn load_theme_from_file(path: &PathBuf) -> Result<Theme, String> {
-    let script = std::fs::read_to_string(path)
-        .map_err(|e| format!("Failed to read file: {}", e))?;
+    let script =
+        std::fs::read_to_string(path).map_err(|e| format!("Failed to read file: {}", e))?;
 
     parse_theme_script(&script)
 }

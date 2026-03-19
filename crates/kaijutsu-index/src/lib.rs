@@ -13,26 +13,26 @@
 //! kaijutsu-server (implements BlockSource/StatusReceiver traits)
 //! ```
 
+pub mod cluster;
 pub mod config;
-pub mod embedder;
 pub mod content;
+pub mod embedder;
 pub mod index;
 pub mod metadata;
-pub mod cluster;
 pub mod synthesis;
 pub mod watcher;
 
 pub use config::IndexConfig;
-pub use embedder::{Embedder, OnnxEmbedder};
 pub use content::extract_context_content;
+pub use embedder::{Embedder, OnnxEmbedder};
 
-use std::pin::Pin;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use kaijutsu_types::{BlockSnapshot, ContextId, Status};
-use std::sync::RwLock;
 use std::sync::Mutex;
+use std::sync::RwLock;
 
 // ============================================================================
 // Error Types
@@ -251,11 +251,7 @@ impl SemanticIndex {
     /// Find contexts similar to a given context.
     ///
     /// Blocking — call from `spawn_blocking`.
-    pub fn neighbors(
-        &self,
-        ctx_id: ContextId,
-        k: usize,
-    ) -> Result<Vec<SearchResult>, IndexError> {
+    pub fn neighbors(&self, ctx_id: ContextId, k: usize) -> Result<Vec<SearchResult>, IndexError> {
         let meta = self.metadata.lock().unwrap();
         let slot = match meta.get_slot(ctx_id)? {
             Some(s) => s,
@@ -289,10 +285,7 @@ impl SemanticIndex {
     /// Compute clusters of related contexts.
     ///
     /// Blocking — call from `spawn_blocking`.
-    pub fn clusters(
-        &self,
-        min_cluster_size: usize,
-    ) -> Result<Vec<ClusterInfo>, IndexError> {
+    pub fn clusters(&self, min_cluster_size: usize) -> Result<Vec<ClusterInfo>, IndexError> {
         let hnsw = self.hnsw.read().unwrap();
         let all_embeddings = hnsw.get_all_embeddings()?;
         drop(hnsw);
@@ -456,7 +449,11 @@ mod tests {
 
         // Scores must be in [0.0, 1.0]
         for r in &results {
-            assert!(r.score >= 0.0 && r.score <= 1.0, "score {} out of range", r.score);
+            assert!(
+                r.score >= 0.0 && r.score <= 1.0,
+                "score {} out of range",
+                r.score
+            );
         }
     }
 
@@ -496,7 +493,11 @@ mod tests {
 
         // Scores must be in [0.0, 1.0]
         for r in &neighbors {
-            assert!(r.score >= 0.0 && r.score <= 1.0, "score {} out of range", r.score);
+            assert!(
+                r.score >= 0.0 && r.score <= 1.0,
+                "score {} out of range",
+                r.score
+            );
         }
     }
 
@@ -510,9 +511,12 @@ mod tests {
 
         // Index and save
         {
-            let idx = SemanticIndex::new(config.clone(), Box::new(MockEmbedder { dims: 32 })).unwrap();
-            idx.index_context(ctx1, &make_blocks(ctx1, "persistence test alpha")).unwrap();
-            idx.index_context(ctx2, &make_blocks(ctx2, "persistence test beta")).unwrap();
+            let idx =
+                SemanticIndex::new(config.clone(), Box::new(MockEmbedder { dims: 32 })).unwrap();
+            idx.index_context(ctx1, &make_blocks(ctx1, "persistence test alpha"))
+                .unwrap();
+            idx.index_context(ctx2, &make_blocks(ctx2, "persistence test beta"))
+                .unwrap();
             idx.save().unwrap();
         }
 
@@ -535,7 +539,10 @@ mod tests {
         let idx = SemanticIndex::new(config, Box::new(MockEmbedder { dims: 32 })).unwrap();
 
         let results = idx.search("anything", 5).unwrap();
-        assert!(results.is_empty(), "empty index should return empty results");
+        assert!(
+            results.is_empty(),
+            "empty index should return empty results"
+        );
     }
 
     #[test]
@@ -549,19 +556,25 @@ mod tests {
         let ctx2 = ContextId::new();
         let ctx3 = ContextId::new();
 
-        idx.index_context(ctx1, &make_blocks(ctx1, "alpha context first")).unwrap();
+        idx.index_context(ctx1, &make_blocks(ctx1, "alpha context first"))
+            .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));
-        idx.index_context(ctx2, &make_blocks(ctx2, "beta context second")).unwrap();
+        idx.index_context(ctx2, &make_blocks(ctx2, "beta context second"))
+            .unwrap();
         assert_eq!(idx.len(), 2);
 
         // Indexing a third should evict the oldest (ctx1)
         std::thread::sleep(std::time::Duration::from_millis(10));
-        idx.index_context(ctx3, &make_blocks(ctx3, "gamma context third")).unwrap();
+        idx.index_context(ctx3, &make_blocks(ctx3, "gamma context third"))
+            .unwrap();
         assert_eq!(idx.len(), 2, "should have evicted down to max_contexts");
 
         // ctx1 should be gone from metadata
         let meta = idx.metadata.lock().unwrap();
-        assert!(meta.get_slot(ctx1).unwrap().is_none(), "ctx1 should be evicted");
+        assert!(
+            meta.get_slot(ctx1).unwrap().is_none(),
+            "ctx1 should be evicted"
+        );
         assert!(meta.get_slot(ctx2).unwrap().is_some(), "ctx2 should remain");
         assert!(meta.get_slot(ctx3).unwrap().is_some(), "ctx3 should remain");
     }

@@ -26,7 +26,9 @@ use rmcp::{ServiceExt, transport::stdio};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use kaijutsu_mcp::KaijutsuMcp;
-use kaijutsu_mcp::hook_listener::{HookListener, default_socket_path, send_hook_event, discover_sockets};
+use kaijutsu_mcp::hook_listener::{
+    HookListener, default_socket_path, discover_sockets, send_hook_event,
+};
 
 /// MCP server exposing kaijutsu CRDT kernel.
 #[derive(Parser, Debug)]
@@ -91,8 +93,7 @@ struct HookArgs {
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing to stderr (MCP uses stdio for protocol)
-    let filter = EnvFilter::from_default_env()
-        .add_directive(tracing::Level::INFO.into());
+    let filter = EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into());
     let registry = tracing_subscriber::registry()
         .with(filter)
         .with(fmt::layer().with_writer(std::io::stderr).with_ansi(false));
@@ -130,7 +131,9 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
     }
 
     // Extract session ID from agent detection (if any)
-    let detected_session_id = agent.as_ref().and_then(|a| a.session_id().map(String::from));
+    let detected_session_id = agent
+        .as_ref()
+        .and_then(|a| a.session_id().map(String::from));
 
     // Cap'n Proto RPC requires LocalSet for !Send types
     let local_set = tokio::task::LocalSet::new();
@@ -261,7 +264,9 @@ async fn run_hook_client(args: HookArgs) -> Result<()> {
             let response = response.trim();
             if !response.is_empty() {
                 // Check if the response indicates deny
-                if let Ok(parsed) = serde_json::from_str::<kaijutsu_mcp::hook_types::HookResponse>(response) {
+                if let Ok(parsed) =
+                    serde_json::from_str::<kaijutsu_mcp::hook_types::HookResponse>(response)
+                {
                     print!("{response}");
                     if parsed.is_deny() {
                         std::process::exit(2);

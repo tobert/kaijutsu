@@ -19,7 +19,7 @@ use vello::peniko::Fill;
 
 use crate::cell::{InputOverlay, InputOverlayMarker};
 use crate::input::FocusArea;
-use crate::text::{bevy_color_to_brush, FontHandles, KjText, KjTextEffects, TextMetrics};
+use crate::text::{FontHandles, KjText, KjTextEffects, TextMetrics, bevy_color_to_brush};
 use crate::ui::theme::Theme;
 use crate::view::fieldset::apply_alpha;
 
@@ -294,7 +294,13 @@ pub fn update_overlay_scene(
     fonts: Res<Assets<VelloFont>>,
     theme: Res<Theme>,
     mut query: Query<
-        (&OverlayStyle, &InputOverlay, &UiVelloText, &ComputedNode, &mut UiVelloScene),
+        (
+            &OverlayStyle,
+            &InputOverlay,
+            &UiVelloText,
+            &ComputedNode,
+            &mut UiVelloScene,
+        ),
         With<InputOverlayMarker>,
     >,
 ) {
@@ -458,7 +464,9 @@ fn build_overlay_panel(
         scene.stroke(&stroke, Affine::IDENTITY, &border_brush, None, &border_rect);
     } else {
         let path = build_warped_border(
-            width, height, half_t,
+            width,
+            height,
+            half_t,
             style.corner_radius as f64,
             break_warps,
         );
@@ -481,7 +489,9 @@ fn build_warped_border(
     corner_radius: f64,
     break_warps: &[(f64, f64)],
 ) -> BezPath {
-    let r = corner_radius.min((width - 2.0 * half_t) / 2.0).min((height - 2.0 * half_t) / 2.0);
+    let r = corner_radius
+        .min((width - 2.0 * half_t) / 2.0)
+        .min((height - 2.0 * half_t) / 2.0);
     let bulge = 6.0; // How far the border bulges outward
 
     let left = half_t;
@@ -628,7 +638,7 @@ fn draw_chase_overlay(
     // Use dashed stroke to create a single bright segment
     let stroke = Stroke::new(style.border_thickness as f64 * 1.5)
         .with_caps(vello::kurbo::Cap::Round)
-        .with_dashes(position, &[chase_len, perimeter - chase_len]);
+        .with_dashes(position, [chase_len, perimeter - chase_len]);
 
     scene.stroke(&stroke, Affine::IDENTITY, &brush, None, &rect);
 }

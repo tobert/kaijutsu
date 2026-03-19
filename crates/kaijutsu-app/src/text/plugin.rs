@@ -25,23 +25,23 @@ impl Plugin for KjTextPlugin {
             .init_resource::<FontHandles>()
             .init_resource::<TextMetrics>()
             .add_systems(Startup, load_fonts)
-            .add_systems(Update, (
-                sync_text_metrics_from_window,
-                update_text_metrics_from_font,
-                animate_rainbow_text,
-                // render_rich_content is registered in CellPlugin (CellPhase::Buffer)
-                // so it runs after sync_block_cell_buffers + ApplyDeferred.
-                // NOTE: sync_text_max_advance is in view/render.rs (CellPhase::Layout)
-                // with Changed<ComputedNode> filter — intentionally not here.
-            ));
+            .add_systems(
+                Update,
+                (
+                    sync_text_metrics_from_window,
+                    update_text_metrics_from_font,
+                    animate_rainbow_text,
+                    // render_rich_content is registered in CellPlugin (CellPhase::Buffer)
+                    // so it runs after sync_block_cell_buffers + ApplyDeferred.
+                    // NOTE: sync_text_max_advance is in view/render.rs (CellPhase::Layout)
+                    // with Changed<ComputedNode> filter — intentionally not here.
+                ),
+            );
     }
 }
 
 /// Load bundled fonts into VelloFont asset handles.
-fn load_fonts(
-    asset_server: Res<AssetServer>,
-    mut font_handles: ResMut<FontHandles>,
-) {
+fn load_fonts(asset_server: Res<AssetServer>, mut font_handles: ResMut<FontHandles>) {
     font_handles.mono = asset_server.load("fonts/CascadiaCodeNF.ttf");
     font_handles.serif = asset_server.load("fonts/NotoSerif-Regular.ttf");
     font_handles.cjk = asset_server.load("fonts/NotoSansCJKJP-Light.ttf");
@@ -94,17 +94,17 @@ fn update_text_metrics_from_font(
     // Measure character width from "M" (standard em-width reference)
     if !text_metrics.cell_char_width_from_font {
         let layout = font.layout("M", &style, VelloTextAlign::Left, None);
-        if let Some(line) = layout.lines().next() {
-            if let Some(run) = line.runs().next() {
-                let advance = run.advance();
-                if advance > 0.0 {
-                    info!(
-                        "TextMetrics: cell_char_width updated from font: {:.1} → {:.1}",
-                        text_metrics.cell_char_width, advance
-                    );
-                    text_metrics.cell_char_width = advance;
-                    text_metrics.cell_char_width_from_font = true;
-                }
+        if let Some(line) = layout.lines().next()
+            && let Some(run) = line.runs().next()
+        {
+            let advance = run.advance();
+            if advance > 0.0 {
+                info!(
+                    "TextMetrics: cell_char_width updated from font: {:.1} → {:.1}",
+                    text_metrics.cell_char_width, advance
+                );
+                text_metrics.cell_char_width = advance;
+                text_metrics.cell_char_width_from_font = true;
             }
         }
     }
@@ -131,10 +131,7 @@ fn sync_text_metrics_from_window(
 /// Entities with `KjTextEffects { rainbow: true }` get a scrolling
 /// linear gradient brush. The phase advances with elapsed time,
 /// creating a smooth cycling rainbow effect.
-fn animate_rainbow_text(
-    time: Res<Time>,
-    mut query: Query<(&KjTextEffects, &mut UiVelloText)>,
-) {
+fn animate_rainbow_text(time: Res<Time>, mut query: Query<(&KjTextEffects, &mut UiVelloText)>) {
     // Phase cycles 0→1 over ~4 seconds
     let phase = (time.elapsed_secs() * 0.25) % 1.0;
 

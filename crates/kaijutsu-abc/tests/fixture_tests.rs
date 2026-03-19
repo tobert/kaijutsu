@@ -903,14 +903,18 @@ K:C
     assert!(!result.has_errors(), "Parse errors: {:?}", result.feedback);
 
     // Check that bar types are in the AST
-    let has_first_ending = result.value.voices[0]
-        .elements
-        .iter()
-        .any(|e| matches!(e, kaijutsu_abc::Element::Bar(kaijutsu_abc::Bar::FirstEnding)));
-    let has_second_ending = result.value.voices[0]
-        .elements
-        .iter()
-        .any(|e| matches!(e, kaijutsu_abc::Element::Bar(kaijutsu_abc::Bar::SecondEnding)));
+    let has_first_ending = result.value.voices[0].elements.iter().any(|e| {
+        matches!(
+            e,
+            kaijutsu_abc::Element::Bar(kaijutsu_abc::Bar::FirstEnding)
+        )
+    });
+    let has_second_ending = result.value.voices[0].elements.iter().any(|e| {
+        matches!(
+            e,
+            kaijutsu_abc::Element::Bar(kaijutsu_abc::Bar::SecondEnding)
+        )
+    });
 
     assert!(has_first_ending, "Should have parsed first ending |1");
     assert!(has_second_ending, "Should have parsed second ending :|2");

@@ -5,12 +5,25 @@
 use kaijutsu_crdt::{BlockId, BlockKind, ConversationDAG};
 
 /// Format a DAG as ASCII tree lines.
-pub fn format_dag_tree(dag: &ConversationDAG, max_depth: Option<u32>, expand_tools: bool) -> Vec<String> {
+pub fn format_dag_tree(
+    dag: &ConversationDAG,
+    max_depth: Option<u32>,
+    expand_tools: bool,
+) -> Vec<String> {
     let mut lines = Vec::new();
 
     for (idx, root_id) in dag.roots.iter().enumerate() {
         let is_last_root = idx == dag.roots.len() - 1;
-        format_dag_node(dag, root_id, 0, "", is_last_root, max_depth, expand_tools, &mut lines);
+        format_dag_node(
+            dag,
+            root_id,
+            0,
+            "",
+            is_last_root,
+            max_depth,
+            expand_tools,
+            &mut lines,
+        );
     }
 
     lines
@@ -28,10 +41,10 @@ fn format_dag_node(
     lines: &mut Vec<String>,
 ) {
     // Check max depth
-    if let Some(max) = max_depth {
-        if depth as u32 > max {
-            return;
-        }
+    if let Some(max) = max_depth
+        && depth as u32 > max
+    {
+        return;
     }
 
     let block = match dag.get(block_id) {
@@ -62,7 +75,10 @@ fn format_dag_node(
     let can_collapse = !expand_tools
         && block.kind == BlockKind::ToolCall
         && children.len() == 1
-        && dag.get(&children[0]).map(|c| c.kind == BlockKind::ToolResult).unwrap_or(false);
+        && dag
+            .get(&children[0])
+            .map(|c| c.kind == BlockKind::ToolResult)
+            .unwrap_or(false);
 
     if can_collapse {
         // Collapsed tool format: tool_name(...) → ✓/✗
@@ -70,8 +86,10 @@ fn format_dag_node(
         let tool_name = block.tool_name.as_deref().unwrap_or("tool");
         let status_icon = if result_block.is_error { "✗" } else { "✓" };
 
-        let line = format!("{}{}{}({}) → {}",
-            prefix, connector, tool_name, summary, status_icon);
+        let line = format!(
+            "{}{}{}({}) → {}",
+            prefix, connector, tool_name, summary, status_icon
+        );
         lines.push(line);
 
         // Skip children since we collapsed them
@@ -79,8 +97,10 @@ fn format_dag_node(
     }
 
     // Normal format
-    let line = format!("{}{}{} {} \"{}\"",
-        prefix, connector, short_id, role_kind, summary);
+    let line = format!(
+        "{}{}{} {} \"{}\"",
+        prefix, connector, short_id, role_kind, summary
+    );
     lines.push(line);
 
     // Process children
@@ -95,7 +115,16 @@ fn format_dag_node(
 
     for (i, child_id) in children.iter().enumerate() {
         let is_last_child = i == children.len() - 1;
-        format_dag_node(dag, child_id, depth + 1, child_prefix, is_last_child, max_depth, expand_tools, lines);
+        format_dag_node(
+            dag,
+            child_id,
+            depth + 1,
+            child_prefix,
+            is_last_child,
+            max_depth,
+            expand_tools,
+            lines,
+        );
     }
 }
 

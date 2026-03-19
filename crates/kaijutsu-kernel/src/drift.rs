@@ -29,7 +29,9 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
-use kaijutsu_crdt::{BlockKind, BlockSnapshot, ContextId, DriftKind, PrefixError, Role, resolve_context_prefix};
+use kaijutsu_crdt::{
+    BlockKind, BlockSnapshot, ContextId, DriftKind, PrefixError, Role, resolve_context_prefix,
+};
 use kaijutsu_types::PrincipalId;
 
 use crate::llm::config::ToolFilter;
@@ -210,7 +212,9 @@ impl DriftRouter {
         forked_from: ContextId,
         created_by: PrincipalId,
     ) -> Result<(), DriftError> {
-        let parent = self.contexts.get(&forked_from)
+        let parent = self
+            .contexts
+            .get(&forked_from)
             .ok_or_else(|| DriftError::UnknownContext(forked_from.short()))?;
 
         // Inherit parent's provider/model/tool_filter (COW semantics — snapshot at fork time)
@@ -242,17 +246,18 @@ impl DriftRouter {
     /// Unregister a context (e.g., when a context is destroyed).
     #[tracing::instrument(skip(self), name = "drift.unregister")]
     pub fn unregister(&mut self, id: ContextId) {
-        if let Some(handle) = self.contexts.remove(&id) {
-            if let Some(label) = &handle.label {
-                self.label_to_id.remove(label);
-            }
+        if let Some(handle) = self.contexts.remove(&id)
+            && let Some(label) = &handle.label
+        {
+            self.label_to_id.remove(label);
         }
         // Move staged drifts involving this context to the dead letter queue
         // so content is never silently discarded. Source-deleted drifts are
         // still deliverable (we have the content string); target-deleted drifts
         // can never reach their destination. Both go to dead letter so the
         // flush engine can write them to "lost+found" for human recovery.
-        let (dead, keep): (Vec<_>, Vec<_>) = self.staging
+        let (dead, keep): (Vec<_>, Vec<_>) = self
+            .staging
             .drain(..)
             .partition(|s| s.source_ctx == id || s.target_ctx == id);
         self.staging = keep;
@@ -279,7 +284,9 @@ impl DriftRouter {
     /// Rename a context's label.
     #[tracing::instrument(skip(self), name = "drift.rename")]
     pub fn rename(&mut self, id: ContextId, new_label: Option<&str>) -> Result<(), DriftError> {
-        let handle = self.contexts.get_mut(&id)
+        let handle = self
+            .contexts
+            .get_mut(&id)
             .ok_or_else(|| DriftError::UnknownContext(id.short()))?;
 
         // Remove old label from index
@@ -345,11 +352,7 @@ impl DriftRouter {
     }
 
     /// Set the working directory for a context.
-    pub fn set_pwd(
-        &mut self,
-        id: ContextId,
-        pwd: Option<String>,
-    ) -> Result<(), DriftError> {
+    pub fn set_pwd(&mut self, id: ContextId, pwd: Option<String>) -> Result<(), DriftError> {
         let handle = self
             .contexts
             .get_mut(&id)
@@ -431,10 +434,9 @@ impl DriftRouter {
         match for_context {
             None => std::mem::take(&mut self.staging),
             Some(ctx) => {
-                let (matched, remaining): (Vec<_>, Vec<_>) =
-                    std::mem::take(&mut self.staging)
-                        .into_iter()
-                        .partition(|s| s.source_ctx == ctx || s.target_ctx == ctx);
+                let (matched, remaining): (Vec<_>, Vec<_>) = std::mem::take(&mut self.staging)
+                    .into_iter()
+                    .partition(|s| s.source_ctx == ctx || s.target_ctx == ctx);
                 self.staging = remaining;
                 matched
             }
@@ -579,18 +581,13 @@ pub fn build_distillation_prompt(
     }
 
     if let Some(prompt) = directed_prompt {
-        transcript.push_str(&format!(
-            "\n---\n\nFocus your summary on: {}\n",
-            prompt
-        ));
+        transcript.push_str(&format!("\n---\n\nFocus your summary on: {}\n", prompt));
     }
 
     transcript
 }
 
 // Drift engines removed — all drift operations go through `kj` commands via KjDispatcher.
-
-
 
 // ============================================================================
 // Tests
@@ -617,7 +614,12 @@ mod tests {
         let parent_id = ContextId::new();
         let child_id = ContextId::new();
         router.register(parent_id, Some("main"), None, PrincipalId::system());
-        router.register(child_id, Some("fork-debug"), Some(parent_id), PrincipalId::system());
+        router.register(
+            child_id,
+            Some("fork-debug"),
+            Some(parent_id),
+            PrincipalId::system(),
+        );
 
         let child = router.get(child_id).unwrap();
         assert_eq!(child.forked_from, Some(parent_id));
@@ -689,7 +691,9 @@ mod tests {
             .unwrap();
 
         let child_id = ContextId::new();
-        router.register_fork(child_id, Some("child"), parent_id, PrincipalId::system()).unwrap();
+        router
+            .register_fork(child_id, Some("child"), parent_id, PrincipalId::system())
+            .unwrap();
 
         let child = router.get(child_id).unwrap();
         assert_eq!(child.provider.as_deref(), Some("anthropic"));
@@ -705,7 +709,9 @@ mod tests {
         // Parent has no model set
 
         let child_id = ContextId::new();
-        router.register_fork(child_id, None, parent_id, PrincipalId::system()).unwrap();
+        router
+            .register_fork(child_id, None, parent_id, PrincipalId::system())
+            .unwrap();
 
         let child = router.get(child_id).unwrap();
         assert_eq!(child.provider, None);
@@ -718,8 +724,16 @@ mod tests {
         let mut router = DriftRouter::new();
         let missing_parent = ContextId::new();
         let child_id = ContextId::new();
-        let result = router.register_fork(child_id, Some("orphan"), missing_parent, PrincipalId::system());
-        assert!(result.is_err(), "should error when parent is not registered");
+        let result = router.register_fork(
+            child_id,
+            Some("orphan"),
+            missing_parent,
+            PrincipalId::system(),
+        );
+        assert!(
+            result.is_err(),
+            "should error when parent is not registered"
+        );
     }
 
     #[test]
@@ -911,8 +925,7 @@ mod tests {
             "Let's discuss auth and caching.",
         )];
 
-        let prompt =
-            build_distillation_prompt(&blocks, Some("what was decided about caching?"));
+        let prompt = build_distillation_prompt(&blocks, Some("what was decided about caching?"));
         assert!(prompt.contains("Focus your summary on: what was decided about caching?"));
     }
 
@@ -947,12 +960,7 @@ mod tests {
         let agent = PrincipalId::new();
 
         let blocks = vec![
-            BlockSnapshot::text(
-                BlockId::new(ctx, agent, 0),
-                None,
-                Role::User,
-                "",
-            ),
+            BlockSnapshot::text(BlockId::new(ctx, agent, 0), None, Role::User, ""),
             BlockSnapshot::text(
                 BlockId::new(ctx, agent, 1),
                 None,
@@ -992,7 +1000,12 @@ mod tests {
         let child_id = ContextId::new();
         {
             let mut r = child_router.write().await;
-            r.register(child_id, Some("debug-fork"), Some(parent_id), PrincipalId::system());
+            r.register(
+                child_id,
+                Some("debug-fork"),
+                Some(parent_id),
+                PrincipalId::system(),
+            );
         }
 
         // Parent should see the child's context
@@ -1024,7 +1037,10 @@ mod tests {
         router.unregister(tgt);
 
         // Staging queue is now empty — item moved to dead letter.
-        assert!(router.queue().is_empty(), "staging queue should be empty after unregister");
+        assert!(
+            router.queue().is_empty(),
+            "staging queue should be empty after unregister"
+        );
 
         // Dead letter should have exactly the item that was waiting for tgt.
         let dead = router.drain_dead_letter();
@@ -1079,16 +1095,33 @@ mod tests {
         // push to dead letter.
         for i in 0..=MAX_DRIFT_RETRIES {
             let drained = router.drain(None);
-            assert_eq!(drained.len(), 1, "expected item in queue on iteration {}", i);
+            assert_eq!(
+                drained.len(),
+                1,
+                "expected item in queue on iteration {}",
+                i
+            );
             router.requeue(drained);
             if i < MAX_DRIFT_RETRIES {
-                assert_eq!(router.queue().len(), 1, "item should still be in queue after {} requeues", i + 1);
-                assert!(router.drain_dead_letter().is_empty(), "dead letter should be empty at retry {}", i);
+                assert_eq!(
+                    router.queue().len(),
+                    1,
+                    "item should still be in queue after {} requeues",
+                    i + 1
+                );
+                assert!(
+                    router.drain_dead_letter().is_empty(),
+                    "dead letter should be empty at retry {}",
+                    i
+                );
             }
         }
 
         // After MAX_DRIFT_RETRIES+1 requeues, staging is empty and dead letter has the item.
-        assert!(router.queue().is_empty(), "staging should be empty after retry limit");
+        assert!(
+            router.queue().is_empty(),
+            "staging should be empty after retry limit"
+        );
         let dead = router.drain_dead_letter();
         assert_eq!(dead.len(), 1);
         assert_eq!(dead[0].content, "persistent failure");

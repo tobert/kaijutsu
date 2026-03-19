@@ -17,9 +17,6 @@ impl Plugin for AgentsPlugin {
         app.add_message::<AgentActivityMessage>();
 
         // Add systems
-        app.add_systems(
-            Update,
-            systems::handle_agent_activity,
-        );
+        app.add_systems(Update, systems::handle_agent_activity);
     }
 }

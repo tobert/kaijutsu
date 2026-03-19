@@ -18,8 +18,8 @@ impl MetadataStore {
     /// Open or create the metadata database.
     pub fn open(data_dir: &Path) -> Result<Self, IndexError> {
         let db_path = data_dir.join("index_meta.db");
-        let conn = Connection::open(&db_path)
-            .map_err(|e| IndexError::Database(format!("open: {}", e)))?;
+        let conn =
+            Connection::open(&db_path).map_err(|e| IndexError::Database(format!("open: {}", e)))?;
 
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS index_entries (
@@ -44,9 +44,7 @@ impl MetadataStore {
             .map_err(|e| IndexError::Database(e.to_string()))?;
 
         let result = stmt
-            .query_row([ctx.as_bytes().as_slice()], |row| {
-                row.get::<_, u32>(0)
-            })
+            .query_row([ctx.as_bytes().as_slice()], |row| row.get::<_, u32>(0))
             .optional()
             .map_err(|e| IndexError::Database(e.to_string()))?;
 
@@ -61,9 +59,7 @@ impl MetadataStore {
             .map_err(|e| IndexError::Database(e.to_string()))?;
 
         let result = stmt
-            .query_row([ctx.as_bytes().as_slice()], |row| {
-                row.get::<_, String>(0)
-            })
+            .query_row([ctx.as_bytes().as_slice()], |row| row.get::<_, String>(0))
             .optional()
             .map_err(|e| IndexError::Database(e.to_string()))?;
 
@@ -109,7 +105,9 @@ impl MetadataStore {
         model_name: &str,
         dimensions: usize,
     ) -> Result<u32, IndexError> {
-        let tx = self.conn.transaction()
+        let tx = self
+            .conn
+            .transaction()
             .map_err(|e| IndexError::Database(format!("begin transaction: {}", e)))?;
 
         // Check if we already have a slot
@@ -132,17 +130,16 @@ impl MetadataStore {
                 ],
             )
             .map_err(|e| IndexError::Database(e.to_string()))?;
-            tx.commit().map_err(|e| IndexError::Database(format!("commit: {}", e)))?;
+            tx.commit()
+                .map_err(|e| IndexError::Database(format!("commit: {}", e)))?;
             return Ok(slot);
         }
 
         // Allocate next slot
         let next_slot: u32 = tx
-            .query_row(
-                "SELECT MAX(hnsw_slot) FROM index_entries",
-                [],
-                |row| row.get::<_, Option<i64>>(0),
-            )
+            .query_row("SELECT MAX(hnsw_slot) FROM index_entries", [], |row| {
+                row.get::<_, Option<i64>>(0)
+            })
             .map_err(|e| IndexError::Database(e.to_string()))?
             .map(|m| m as u32 + 1)
             .unwrap_or(0);
@@ -161,7 +158,8 @@ impl MetadataStore {
         )
         .map_err(|e| IndexError::Database(e.to_string()))?;
 
-        tx.commit().map_err(|e| IndexError::Database(format!("commit: {}", e)))?;
+        tx.commit()
+            .map_err(|e| IndexError::Database(format!("commit: {}", e)))?;
         Ok(next_slot)
     }
 
@@ -229,7 +227,6 @@ impl MetadataStore {
             .map_err(|e| IndexError::Database(format!("evict_oldest: {}", e)))?;
         Ok(deleted)
     }
-
 }
 
 fn now_millis() -> i64 {
@@ -286,11 +283,17 @@ mod tests {
         let ctx = ContextId::new();
         store.assign_slot(ctx, "hash1", "model", 384).unwrap();
 
-        assert_eq!(store.get_content_hash(ctx).unwrap(), Some("hash1".to_string()));
+        assert_eq!(
+            store.get_content_hash(ctx).unwrap(),
+            Some("hash1".to_string())
+        );
 
         // Update
         store.assign_slot(ctx, "hash2", "model", 384).unwrap();
-        assert_eq!(store.get_content_hash(ctx).unwrap(), Some("hash2".to_string()));
+        assert_eq!(
+            store.get_content_hash(ctx).unwrap(),
+            Some("hash2".to_string())
+        );
     }
 
     #[test]
@@ -312,8 +315,12 @@ mod tests {
 
         assert_eq!(store.count().unwrap(), 0);
 
-        store.assign_slot(ContextId::new(), "h1", "model", 384).unwrap();
-        store.assign_slot(ContextId::new(), "h2", "model", 384).unwrap();
+        store
+            .assign_slot(ContextId::new(), "h1", "model", 384)
+            .unwrap();
+        store
+            .assign_slot(ContextId::new(), "h2", "model", 384)
+            .unwrap();
 
         assert_eq!(store.count().unwrap(), 2);
     }
@@ -352,7 +359,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut store = MetadataStore::open(dir.path()).unwrap();
 
-        store.assign_slot(ContextId::new(), "h1", "model", 384).unwrap();
+        store
+            .assign_slot(ContextId::new(), "h1", "model", 384)
+            .unwrap();
         assert_eq!(store.count().unwrap(), 1);
 
         let evicted = store.evict_oldest(10).unwrap();

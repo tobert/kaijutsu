@@ -42,23 +42,23 @@ impl Default for AnsiColors {
     fn default() -> Self {
         // Tokyo Night inspired ANSI palette
         Self {
-            black: Color::srgb(0.10, 0.11, 0.15),         // #1a1b26
-            red: Color::srgb(0.97, 0.38, 0.45),           // #f7616a
-            green: Color::srgb(0.62, 0.81, 0.42),         // #9ece6a
-            yellow: Color::srgb(0.89, 0.79, 0.49),        // #e0c97d
-            blue: Color::srgb(0.48, 0.64, 0.97),          // #7aa2f7
-            magenta: Color::srgb(0.73, 0.47, 0.91),       // #bb79e8
-            cyan: Color::srgb(0.49, 0.85, 0.82),          // #7dd9d1
-            white: Color::srgb(0.78, 0.80, 0.85),         // #c8ccd9
+            black: Color::srgb(0.10, 0.11, 0.15),   // #1a1b26
+            red: Color::srgb(0.97, 0.38, 0.45),     // #f7616a
+            green: Color::srgb(0.62, 0.81, 0.42),   // #9ece6a
+            yellow: Color::srgb(0.89, 0.79, 0.49),  // #e0c97d
+            blue: Color::srgb(0.48, 0.64, 0.97),    // #7aa2f7
+            magenta: Color::srgb(0.73, 0.47, 0.91), // #bb79e8
+            cyan: Color::srgb(0.49, 0.85, 0.82),    // #7dd9d1
+            white: Color::srgb(0.78, 0.80, 0.85),   // #c8ccd9
             // Bright variants
-            bright_black: Color::srgb(0.27, 0.29, 0.35),  // #444b59
-            bright_red: Color::srgb(1.00, 0.53, 0.58),    // #ff8894
-            bright_green: Color::srgb(0.72, 0.91, 0.52),  // #b8e885
+            bright_black: Color::srgb(0.27, 0.29, 0.35), // #444b59
+            bright_red: Color::srgb(1.00, 0.53, 0.58),   // #ff8894
+            bright_green: Color::srgb(0.72, 0.91, 0.52), // #b8e885
             bright_yellow: Color::srgb(1.00, 0.89, 0.59), // #ffe397
-            bright_blue: Color::srgb(0.58, 0.74, 1.00),   // #94bdff
-            bright_magenta: Color::srgb(0.83, 0.57, 1.00),// #d491ff
-            bright_cyan: Color::srgb(0.59, 0.95, 0.92),   // #96f2eb
-            bright_white: Color::srgb(0.90, 0.90, 0.90),  // #e5e5e5
+            bright_blue: Color::srgb(0.58, 0.74, 1.00),  // #94bdff
+            bright_magenta: Color::srgb(0.83, 0.57, 1.00), // #d491ff
+            bright_cyan: Color::srgb(0.59, 0.95, 0.92),  // #96f2eb
+            bright_white: Color::srgb(0.90, 0.90, 0.90), // #e5e5e5
         }
     }
 }
@@ -88,6 +88,7 @@ pub struct SyntaxColors {
 /// Contains all colors used throughout the application, from base UI
 /// to vim-style mode colors and cursor colors.
 #[derive(Resource, Clone)]
+#[allow(dead_code)]
 pub struct Theme {
     // ═══════════════════════════════════════════════════════════════════════
     // Base UI colors
@@ -208,7 +209,6 @@ pub struct Theme {
     // ═══════════════════════════════════════════════════════════════════════
     // Input Area Configuration
     // ═══════════════════════════════════════════════════════════════════════
-
     /// Height of the minimized chasing line (default: 6px)
     pub input_minimized_height: f32,
     /// Default height when docked (default: 80px)
@@ -221,7 +221,6 @@ pub struct Theme {
     // ═══════════════════════════════════════════════════════════════════════
     // OutputData Rendering Colors (structured tool results)
     // ═══════════════════════════════════════════════════════════════════════
-
     /// Directory entries in structured output (soft blue)
     pub output_directory: Color,
     /// Executable entries in structured output (soft green)
@@ -234,7 +233,6 @@ pub struct Theme {
     // ═══════════════════════════════════════════════════════════════════════
     // Markdown Rendering Colors — Phase 4: per-span styling via Parley
     // ═══════════════════════════════════════════════════════════════════════
-
     #[allow(dead_code)]
     pub md_heading_color: Color,
     #[allow(dead_code)]
@@ -247,7 +245,6 @@ pub struct Theme {
     // ═══════════════════════════════════════════════════════════════════════
     // Sparkline Rendering
     // ═══════════════════════════════════════════════════════════════════════
-
     /// Height of sparkline mini-charts in pixels.
     pub sparkline_height: f32,
     /// Sparkline line color.
@@ -258,14 +255,12 @@ pub struct Theme {
     // ═══════════════════════════════════════════════════════════════════════
     // Font Effects
     // ═══════════════════════════════════════════════════════════════════════
-
     /// Enable rainbow color cycling effect on user text.
     pub font_rainbow: bool,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Constellation Configuration
     // ═══════════════════════════════════════════════════════════════════════
-
     /// Base radius for radial tree root ring (pixels, 2D fallback layout)
     pub constellation_base_radius: f32,
     /// Spacing between concentric rings in radial tree (pixels, 2D fallback layout)
@@ -288,7 +283,6 @@ pub struct Theme {
     // ═══════════════════════════════════════════════════════════════════════
     // Constellation 3D Configuration (hyperbolic layout)
     // ═══════════════════════════════════════════════════════════════════════
-
     /// Base hemisphere radius for leaf nodes in the H3 layout
     pub constellation_base_leaf_radius: f64,
     /// Packing factor for hemisphere area sums (gap compensation)
@@ -297,7 +291,6 @@ pub struct Theme {
     // ═══════════════════════════════════════════════════════════════════════
     // Block Border Configuration (shader-rendered per-block borders)
     // ═══════════════════════════════════════════════════════════════════════
-
     /// Tool call border color (amber, default from block_tool_call)
     pub block_border_tool_call: Color,
     /// Tool result border color (green, default from block_tool_result)
@@ -349,41 +342,41 @@ impl Default for Theme {
     fn default() -> Self {
         Self {
             // Base UI — Tokyo Night palette
-            bg: Color::srgb(0.102, 0.106, 0.149),               // #1a1b26
-            panel_bg: Color::srgba(0.102, 0.106, 0.149, 0.95),  // #1a1b26 semi-transparent
-            fg: Color::srgb(0.753, 0.792, 0.961),               // #c0caf5
-            fg_dim: Color::srgb(0.337, 0.373, 0.537),           // #565f89
-            accent: Color::srgb(0.478, 0.635, 0.969),           // #7aa2f7
-            accent2: Color::srgb(0.620, 0.808, 0.416),          // #9ece6a
-            border: Color::srgb(0.231, 0.259, 0.380),           // #3b4261
+            bg: Color::srgb(0.102, 0.106, 0.149), // #1a1b26
+            panel_bg: Color::srgba(0.102, 0.106, 0.149, 0.95), // #1a1b26 semi-transparent
+            fg: Color::srgb(0.753, 0.792, 0.961), // #c0caf5
+            fg_dim: Color::srgb(0.337, 0.373, 0.537), // #565f89
+            accent: Color::srgb(0.478, 0.635, 0.969), // #7aa2f7
+            accent2: Color::srgb(0.620, 0.808, 0.416), // #9ece6a
+            border: Color::srgb(0.231, 0.259, 0.380), // #3b4261
             selection_bg: Color::srgba(0.478, 0.635, 0.969, 0.30), // #7aa2f7 selection
 
             // Row type colors
-            row_tool: Color::srgb(0.733, 0.604, 0.969),         // #bb9af7 purple
-            row_result: Color::srgb(0.878, 0.686, 0.404),       // #e0af68 amber
+            row_tool: Color::srgb(0.733, 0.604, 0.969), // #bb9af7 purple
+            row_result: Color::srgb(0.878, 0.686, 0.404), // #e0af68 amber
 
             // Block text colors
-            block_user: Color::srgb(0.753, 0.792, 0.961),       // #c0caf5 main fg
-            block_assistant: Color::srgb(0.478, 0.635, 0.969),  // #7aa2f7 blue
-            block_thinking: Color::srgb(0.337, 0.373, 0.537),   // #565f89 dim
-            block_tool_call: Color::srgb(0.878, 0.686, 0.404),  // #e0af68 amber
+            block_user: Color::srgb(0.753, 0.792, 0.961), // #c0caf5 main fg
+            block_assistant: Color::srgb(0.478, 0.635, 0.969), // #7aa2f7 blue
+            block_thinking: Color::srgb(0.337, 0.373, 0.537), // #565f89 dim
+            block_tool_call: Color::srgb(0.878, 0.686, 0.404), // #e0af68 amber
             block_tool_result: Color::srgb(0.620, 0.808, 0.416), // #9ece6a green
             block_tool_error: Color::srgb(0.969, 0.463, 0.557), // #f7768e red
-            block_drift_push: Color::srgb(0.490, 0.812, 1.00),  // #7dcfff cyan
+            block_drift_push: Color::srgb(0.490, 0.812, 1.00), // #7dcfff cyan
             block_drift_pull: Color::srgb(0.478, 0.635, 0.969), // #7aa2f7 blue
             block_drift_merge: Color::srgb(0.733, 0.604, 0.969), // #bb9af7 purple
             block_drift_commit: Color::srgb(0.620, 0.808, 0.416), // #9ece6a green
 
             // Semantic
-            error: Color::srgb(0.969, 0.463, 0.557),            // #f7768e
-            warning: Color::srgb(0.878, 0.686, 0.404),          // #e0af68
-            success: Color::srgb(0.620, 0.808, 0.416),          // #9ece6a
+            error: Color::srgb(0.969, 0.463, 0.557), // #f7768e
+            warning: Color::srgb(0.878, 0.686, 0.404), // #e0af68
+            success: Color::srgb(0.620, 0.808, 0.416), // #9ece6a
 
             // Mode colors (vim-style)
-            mode_normal: Color::srgb(0.478, 0.635, 0.969),      // #7aa2f7 blue
-            mode_chat: Color::srgb(0.620, 0.808, 0.416),        // #9ece6a green
-            mode_shell: Color::srgb(0.878, 0.686, 0.404),       // #e0af68 amber
-            mode_visual: Color::srgb(0.733, 0.604, 0.969),      // #bb9af7 purple
+            mode_normal: Color::srgb(0.478, 0.635, 0.969), // #7aa2f7 blue
+            mode_chat: Color::srgb(0.620, 0.808, 0.416),   // #9ece6a green
+            mode_shell: Color::srgb(0.878, 0.686, 0.404),  // #e0af68 amber
+            mode_visual: Color::srgb(0.733, 0.604, 0.969), // #bb9af7 purple
 
             // Cursor colors
             cursor_normal: Vec4::new(0.478, 0.635, 0.969, 0.8), // #7aa2f7 blue
@@ -392,38 +385,38 @@ impl Default for Theme {
 
             // ANSI palette — Tokyo Night
             ansi: AnsiColors {
-                black: Color::srgb(0.082, 0.086, 0.118),        // #15161e
-                red: Color::srgb(0.969, 0.463, 0.557),          // #f7768e
-                green: Color::srgb(0.620, 0.808, 0.416),        // #9ece6a
-                yellow: Color::srgb(0.878, 0.686, 0.404),       // #e0af68
-                blue: Color::srgb(0.478, 0.635, 0.969),         // #7aa2f7
-                magenta: Color::srgb(0.733, 0.604, 0.969),      // #bb9af7
-                cyan: Color::srgb(0.490, 0.812, 1.00),          // #7dcfff
-                white: Color::srgb(0.663, 0.694, 0.839),        // #a9b1d6
-                bright_black: Color::srgb(0.255, 0.282, 0.408), // #414868
-                bright_red: Color::srgb(0.969, 0.463, 0.557),   // #f7768e
-                bright_green: Color::srgb(0.620, 0.808, 0.416), // #9ece6a
-                bright_yellow: Color::srgb(0.878, 0.686, 0.404), // #e0af68
-                bright_blue: Color::srgb(0.478, 0.635, 0.969),  // #7aa2f7
+                black: Color::srgb(0.082, 0.086, 0.118),          // #15161e
+                red: Color::srgb(0.969, 0.463, 0.557),            // #f7768e
+                green: Color::srgb(0.620, 0.808, 0.416),          // #9ece6a
+                yellow: Color::srgb(0.878, 0.686, 0.404),         // #e0af68
+                blue: Color::srgb(0.478, 0.635, 0.969),           // #7aa2f7
+                magenta: Color::srgb(0.733, 0.604, 0.969),        // #bb9af7
+                cyan: Color::srgb(0.490, 0.812, 1.00),            // #7dcfff
+                white: Color::srgb(0.663, 0.694, 0.839),          // #a9b1d6
+                bright_black: Color::srgb(0.255, 0.282, 0.408),   // #414868
+                bright_red: Color::srgb(0.969, 0.463, 0.557),     // #f7768e
+                bright_green: Color::srgb(0.620, 0.808, 0.416),   // #9ece6a
+                bright_yellow: Color::srgb(0.878, 0.686, 0.404),  // #e0af68
+                bright_blue: Color::srgb(0.478, 0.635, 0.969),    // #7aa2f7
                 bright_magenta: Color::srgb(0.733, 0.604, 0.969), // #bb9af7
-                bright_cyan: Color::srgb(0.490, 0.812, 1.00),   // #7dcfff
-                bright_white: Color::srgb(0.753, 0.792, 0.961), // #c0caf5
+                bright_cyan: Color::srgb(0.490, 0.812, 1.00),     // #7dcfff
+                bright_white: Color::srgb(0.753, 0.792, 0.961),   // #c0caf5
             },
 
             // Syntax highlighting — derived from ANSI palette
             syntax: SyntaxColors {
-                keyword: Color::srgb(0.733, 0.604, 0.969),      // magenta
-                string: Color::srgb(0.620, 0.808, 0.416),       // green
-                number: Color::srgb(0.878, 0.686, 0.404),       // yellow
-                operator: Color::srgb(0.490, 0.812, 1.00),      // cyan
-                variable: Color::srgb(0.878, 0.686, 0.404),     // bright_yellow
-                flag: Color::srgb(0.478, 0.635, 0.969),         // bright_blue
-                comment: Color::srgb(0.255, 0.282, 0.408),      // bright_black
-                command: Color::srgb(0.478, 0.635, 0.969),       // blue
-                path: Color::srgb(0.490, 0.812, 1.00),          // cyan
-                punctuation: Color::srgb(0.753, 0.792, 0.961),  // fg
-                error: Color::srgb(0.969, 0.463, 0.557),        // red
-                prefix: Color::srgb(0.255, 0.282, 0.408),       // bright_black
+                keyword: Color::srgb(0.733, 0.604, 0.969),     // magenta
+                string: Color::srgb(0.620, 0.808, 0.416),      // green
+                number: Color::srgb(0.878, 0.686, 0.404),      // yellow
+                operator: Color::srgb(0.490, 0.812, 1.00),     // cyan
+                variable: Color::srgb(0.878, 0.686, 0.404),    // bright_yellow
+                flag: Color::srgb(0.478, 0.635, 0.969),        // bright_blue
+                comment: Color::srgb(0.255, 0.282, 0.408),     // bright_black
+                command: Color::srgb(0.478, 0.635, 0.969),     // blue
+                path: Color::srgb(0.490, 0.812, 1.00),         // cyan
+                punctuation: Color::srgb(0.753, 0.792, 0.961), // fg
+                error: Color::srgb(0.969, 0.463, 0.557),       // red
+                prefix: Color::srgb(0.255, 0.282, 0.408),      // bright_black
             },
 
             // Frame configuration
@@ -437,7 +430,7 @@ impl Default for Theme {
             frame_insert: Color::srgba(0.620, 0.808, 0.416, 0.12), // #9ece6a
             frame_visual: Color::srgba(0.733, 0.604, 0.969, 0.12), // #bb9af7
             frame_unfocused: Color::srgba(0.102, 0.106, 0.149, 0.80), // #1a1b26
-            frame_edge: Color::srgba(0.231, 0.259, 0.380, 0.6), // #3b4261
+            frame_edge: Color::srgba(0.231, 0.259, 0.380, 0.6),  // #3b4261
 
             // Frame shader params
             frame_params_base: Vec4::new(0.0, 0.0, 0.0, 0.0),
@@ -471,10 +464,10 @@ impl Default for Theme {
             input_backdrop_color: Color::srgba(0.102, 0.106, 0.149, 0.85),
 
             // OutputData rendering (structured tool results)
-            output_directory: Color::srgb(0.478, 0.635, 0.969),  // #7aa2f7 soft blue
+            output_directory: Color::srgb(0.478, 0.635, 0.969), // #7aa2f7 soft blue
             output_executable: Color::srgb(0.620, 0.808, 0.416), // #9ece6a soft green
-            output_symlink: Color::srgb(0.490, 0.812, 1.00),     // #7dcfff cyan
-            output_header: Color::srgb(0.337, 0.373, 0.537),     // #565f89 dim
+            output_symlink: Color::srgb(0.490, 0.812, 1.00),    // #7dcfff cyan
+            output_header: Color::srgb(0.337, 0.373, 0.537),    // #565f89 dim
 
             // Markdown rendering
             md_heading_color: Color::srgb(0.733, 0.604, 0.969), // #bb9af7 purple
@@ -495,23 +488,23 @@ impl Default for Theme {
             constellation_ring_spacing: 550.0,
             constellation_card_width: 180.0,
 
-            agent_color_default: Color::srgba(0.49, 0.85, 0.82, 0.8),   // #7dd9d1 dim cyan
-            agent_color_human: Color::srgba(0.49, 0.98, 1.00, 0.9),     // #7df9ff electric cyan
-            agent_color_claude: Color::srgba(1.00, 0.43, 0.78, 0.9),    // #ff6ec7 hot pink
-            agent_color_gemini: Color::srgba(1.00, 0.84, 0.00, 0.9),    // #ffd700 gold
-            agent_color_local: Color::srgba(0.31, 0.98, 0.48, 0.9),     // #50fa7b matrix green
-            agent_color_deepseek: Color::srgba(1.00, 0.72, 0.42, 0.9),  // #ffb86c orange
+            agent_color_default: Color::srgba(0.49, 0.85, 0.82, 0.8), // #7dd9d1 dim cyan
+            agent_color_human: Color::srgba(0.49, 0.98, 1.00, 0.9),   // #7df9ff electric cyan
+            agent_color_claude: Color::srgba(1.00, 0.43, 0.78, 0.9),  // #ff6ec7 hot pink
+            agent_color_gemini: Color::srgba(1.00, 0.84, 0.00, 0.9),  // #ffd700 gold
+            agent_color_local: Color::srgba(0.31, 0.98, 0.48, 0.9),   // #50fa7b matrix green
+            agent_color_deepseek: Color::srgba(1.00, 0.72, 0.42, 0.9), // #ffb86c orange
 
             // Constellation 2.5D layout
-            constellation_base_leaf_radius: 1.2,  // Increased for better spread with many nodes
-            constellation_packing_factor: 1.8,    // More gap between nodes
+            constellation_base_leaf_radius: 1.2, // Increased for better spread with many nodes
+            constellation_packing_factor: 1.8,   // More gap between nodes
 
             // Block borders
-            block_border_tool_call: Color::srgba(1.00, 0.67, 0.00, 0.6),   // #ffaa00 amber
+            block_border_tool_call: Color::srgba(1.00, 0.67, 0.00, 0.6), // #ffaa00 amber
             block_border_tool_result: Color::srgba(0.00, 1.00, 0.53, 0.4), // #00ff88 green
-            block_border_error: Color::srgba(1.00, 0.13, 0.38, 0.8),       // #ff2060 red
-            block_border_thinking: Color::srgba(0.38, 0.50, 0.63, 0.3),    // #6080a0 muted
-            block_border_drift: Color::srgba(0.00, 0.67, 1.00, 0.5),       // #00aaff blue
+            block_border_error: Color::srgba(1.00, 0.13, 0.38, 0.8),     // #ff2060 red
+            block_border_thinking: Color::srgba(0.38, 0.50, 0.63, 0.3),  // #6080a0 muted
+            block_border_drift: Color::srgba(0.00, 0.67, 1.00, 0.5),     // #00aaff blue
             block_border_thickness: 1.5,
             block_border_corner_radius: 4.0,
             block_border_glow_radius: 0.15,

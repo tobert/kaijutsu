@@ -67,7 +67,10 @@ fn test_create_context_returns_valid_id() {
         let (kernel, _kernel_id) = client.attach_kernel().await.unwrap();
         let context_id = kernel.create_context("test-ctx").await.unwrap();
 
-        assert!(!context_id.is_nil(), "createContext should return a non-nil ContextId");
+        assert!(
+            !context_id.is_nil(),
+            "createContext should return a non-nil ContextId"
+        );
     });
 }
 
@@ -87,7 +90,11 @@ fn test_create_context_appears_in_list() {
 
         // Should appear in list with correct label
         let after = kernel.list_contexts().await.unwrap();
-        assert_eq!(after.len(), before_count + 1, "New context should appear in list");
+        assert_eq!(
+            after.len(),
+            before_count + 1,
+            "New context should appear in list"
+        );
 
         let found = after.iter().find(|c| c.id == context_id);
         assert!(found.is_some(), "Created context should be findable by ID");
@@ -105,8 +112,14 @@ fn test_create_context_joinable() {
         let context_id = kernel.create_context("joinable").await.unwrap();
 
         // Should be joinable
-        let joined_id = kernel.join_context(context_id, "test-instance").await.unwrap();
-        assert_eq!(joined_id, context_id, "Joining a created context should return the same ID");
+        let joined_id = kernel
+            .join_context(context_id, "test-instance")
+            .await
+            .unwrap();
+        assert_eq!(
+            joined_id, context_id,
+            "Joining a created context should return the same ID"
+        );
     });
 }
 
@@ -121,7 +134,10 @@ fn test_join_nonexistent_context_fails() {
         // Joining a random context that was never created should fail
         let random_id = kaijutsu_crdt::ContextId::new();
         let result = kernel.join_context(random_id, "test-instance").await;
-        assert!(result.is_err(), "join_context with nonexistent ID should fail");
+        assert!(
+            result.is_err(),
+            "join_context with nonexistent ID should fail"
+        );
     });
 }
 

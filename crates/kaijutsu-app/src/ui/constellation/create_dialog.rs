@@ -48,7 +48,10 @@ pub fn create_or_fork_context(
         .spawn(async move {
             match handle.create_context(&context_label).await {
                 Ok(ctx_id) => {
-                    info!("Server created context: {} (label: {})", ctx_id, context_label);
+                    info!(
+                        "Server created context: {} (label: {})",
+                        ctx_id, context_label
+                    );
                     let _ = tx.send(RpcResultMessage::ContextCreated(ctx_id));
                 }
                 Err(e) => {
@@ -85,12 +88,7 @@ fn handle_create_node_click(
     for interaction in create_nodes.iter() {
         if *interaction == Interaction::Pressed {
             info!("New context tile clicked — creating via server RPC");
-            create_or_fork_context(
-                &new_ctx_config,
-                &actor,
-                &result_channel,
-                &conn_state,
-            );
+            create_or_fork_context(&new_ctx_config, &actor, &result_channel, &conn_state);
         }
     }
 }
@@ -103,7 +101,9 @@ fn handle_context_created(
 ) {
     for event in events.read() {
         if let RpcResultMessage::ContextCreated(ctx_id) = event {
-            let kernel_id = conn_state.kernel_id.unwrap_or_else(kaijutsu_types::KernelId::nil);
+            let kernel_id = conn_state
+                .kernel_id
+                .unwrap_or_else(kaijutsu_types::KernelId::nil);
             let instance = Uuid::new_v4().to_string();
             info!("Spawning actor for server-created context: {}", ctx_id);
             let _ = bootstrap.tx.send(BootstrapCommand::SpawnActor {
@@ -115,4 +115,3 @@ fn handle_context_created(
         }
     }
 }
-

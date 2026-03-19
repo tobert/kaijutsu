@@ -85,13 +85,12 @@ pub fn dispatch_input(
     // Use first connected gamepad (single-player). Multi-gamepad later.
     if let Some(gamepad) = gamepads.iter().next() {
         for binding in &input_map.bindings {
-            if let InputSource::GamepadButton(btn) = &binding.source {
-                if gamepad.just_pressed(*btn)
-                    && binding.modifiers == Modifiers::NONE
-                    && active_contexts.contains(binding.context)
-                {
-                    action_writer.write(ActionFired(binding.action.clone()));
-                }
+            if let InputSource::GamepadButton(btn) = &binding.source
+                && gamepad.just_pressed(*btn)
+                && binding.modifiers == Modifiers::NONE
+                && active_contexts.contains(binding.context)
+            {
+                action_writer.write(ActionFired(binding.action.clone()));
             }
         }
 
@@ -111,18 +110,14 @@ pub fn dispatch_input(
 
         // Left stick → scroll (Navigation context)
         // 500 px/s at full deflection
-        if active_contexts.contains(InputContext::Navigation)
-            && left.y.abs() > THRESHOLD
-        {
+        if active_contexts.contains(InputContext::Navigation) && left.y.abs() > THRESHOLD {
             let scroll_speed = -left.y * 500.0 * dt;
             action_writer.write(ActionFired(Action::ScrollDelta(scroll_speed)));
         }
 
         // Left stick → pan (Constellation context)
         // Scale pan direction by dt so constellation camera moves consistently.
-        if active_contexts.contains(InputContext::Constellation)
-            && left.length() > THRESHOLD
-        {
+        if active_contexts.contains(InputContext::Constellation) && left.length() > THRESHOLD {
             action_writer.write(ActionFired(Action::Pan(left * dt * 60.0)));
         }
     } else {

@@ -72,18 +72,17 @@ pub struct DriftPlugin;
 
 impl Plugin for DriftPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<DriftState>()
-            .add_systems(
-                Update,
-                (
-                    poll_drift_state,
-                    update_drift_state,
-                    detect_drift_arrival,
-                    dismiss_stale_notifications,
-                    sync_model_info_to_constellation,
-                )
-                    .chain(),
-            );
+        app.init_resource::<DriftState>().add_systems(
+            Update,
+            (
+                poll_drift_state,
+                update_drift_state,
+                detect_drift_arrival,
+                dismiss_stale_notifications,
+                sync_model_info_to_constellation,
+            )
+                .chain(),
+        );
     }
 }
 
@@ -183,7 +182,10 @@ fn detect_drift_arrival(
         if let kaijutsu_client::ServerEvent::BlockInserted { block, .. } = event
             && block.kind == BlockKind::Drift
         {
-            let source_ctx = block.source_context.map(|c| c.short()).unwrap_or_else(|| "?".to_string());
+            let source_ctx = block
+                .source_context
+                .map(|c| c.short())
+                .unwrap_or_else(|| "?".to_string());
             let preview: String = block.content.chars().take(40).collect();
 
             drift_state.notification = Some(DriftNotification {
@@ -198,10 +200,7 @@ fn detect_drift_arrival(
 }
 
 /// Auto-dismiss stale notifications after NOTIFICATION_DURATION.
-fn dismiss_stale_notifications(
-    mut drift_state: ResMut<DriftState>,
-    time: Res<Time>,
-) {
+fn dismiss_stale_notifications(mut drift_state: ResMut<DriftState>, time: Res<Time>) {
     if let Some(ref notif) = drift_state.notification
         && time.elapsed_secs_f64() - notif.created_at > NOTIFICATION_DURATION
     {
@@ -223,7 +222,10 @@ fn sync_model_info_to_constellation(
 
     // Remove nodes that have been archived since last poll
     constellation.nodes.retain(|node| {
-        !drift_state.contexts.iter().any(|c| c.id == node.context_id && c.archived)
+        !drift_state
+            .contexts
+            .iter()
+            .any(|c| c.id == node.context_id && c.archived)
     });
 
     for ctx_info in &drift_state.contexts {

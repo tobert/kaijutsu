@@ -79,14 +79,17 @@ impl ExecutionEngine for EditEngine {
             Err(e) => return Ok(ExecResult::failure(1, format!("Invalid params: {}", e))),
         };
 
-        if let Some(ref guard) = self.guard {
-            if let Err(denied) = guard.check_write(ctx, &p.path) {
-                return Ok(denied);
-            }
+        if let Some(ref guard) = self.guard
+            && let Err(denied) = guard.check_write(ctx, &p.path)
+        {
+            return Ok(denied);
         }
 
         if p.old_string == p.new_string {
-            return Ok(ExecResult::failure(1, "old_string and new_string are identical"));
+            return Ok(ExecResult::failure(
+                1,
+                "old_string and new_string are identical",
+            ));
         }
 
         let (ctx_id, block_id) = match self.cache.get_or_load(&p.path).await {
@@ -134,13 +137,9 @@ impl ExecutionEngine for EditEngine {
             if !p.replace_all && replacements > 0 {
                 break;
             }
-            if let Err(e) = store.edit_text(
-                ctx_id,
-                &block_id,
-                offset,
-                &p.new_string,
-                p.old_string.len(),
-            ) {
+            if let Err(e) =
+                store.edit_text(ctx_id, &block_id, offset, &p.new_string, p.old_string.len())
+            {
                 return Ok(ExecResult::failure(1, e.to_string()));
             }
             replacements += 1;

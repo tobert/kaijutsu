@@ -84,7 +84,7 @@ pub fn process_cherry_pick_requests(
 
         let handle = actor.handle.clone();
         let tx = channel.sender();
-        let block_id = request.block_id.clone();
+        let block_id = request.block_id;
         let target = request.target_context.clone();
         bevy::tasks::IoTaskPool::get()
             .spawn(async move {
@@ -126,10 +126,15 @@ pub fn handle_cherry_pick_complete(
     mut result_writer: MessageWriter<CherryPickResult>,
 ) {
     for event in events.read() {
-        if let RpcResultMessage::CherryPicked { success, new_block_id, error } = event {
+        if let RpcResultMessage::CherryPicked {
+            success,
+            new_block_id,
+            error,
+        } = event
+        {
             result_writer.write(CherryPickResult {
                 success: *success,
-                new_block_id: new_block_id.clone(),
+                new_block_id: *new_block_id,
                 error: error.clone(),
             });
         }

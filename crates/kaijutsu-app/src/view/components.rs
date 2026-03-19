@@ -43,6 +43,7 @@ pub struct ViewingConversation {
 
 /// Cursor position within a block document.
 #[derive(Debug, Clone, Default, Reflect)]
+#[allow(dead_code)]
 pub struct BlockCursor {
     /// Which block the cursor is in.
     #[reflect(ignore)]
@@ -89,6 +90,7 @@ pub struct CursorCache {
 /// Note: Not reflectable due to BlockStore lacking Default.
 /// Use query filters to find CellEditor entities instead of BRP inspection.
 #[derive(Component)]
+#[allow(dead_code)]
 pub struct CellEditor {
     /// Block store - local editor buffer (per-block DTE).
     pub store: kaijutsu_crdt::BlockStore,
@@ -120,9 +122,17 @@ impl CellEditor {
     pub fn with_text(mut self, text: impl Into<String>) -> Self {
         let text = text.into();
         if !text.is_empty()
-            && let Ok(block_id) = self.store.insert_block(None, None, Role::User, BlockKind::Text, &text, Status::Done) {
-                self.cursor = BlockCursor::at(block_id, text.len());
-            }
+            && let Ok(block_id) = self.store.insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                &text,
+                Status::Done,
+            )
+        {
+            self.cursor = BlockCursor::at(block_id, text.len());
+        }
         self
     }
 
@@ -164,7 +174,6 @@ impl CellEditor {
             let _ = self.store.set_collapsed(block_id, new_state);
         }
     }
-
 }
 
 // ============================================================================
@@ -237,6 +246,7 @@ pub struct FocusedBlockCell;
 /// Added when: User presses `i` with a FocusedBlockCell active
 /// Removed when: User presses `Escape` to exit edit mode
 #[derive(Component)]
+#[allow(dead_code)]
 pub struct EditingBlockCell;
 
 /// Tracks the edit cursor position within an editing block.
@@ -569,7 +579,7 @@ impl Default for ConversationScrollState {
             target_offset: 0.0,
             content_height: 0.0,
             visible_height: 600.0, // Will be updated by layout system
-            following: true, // Start in follow mode
+            following: true,       // Start in follow mode
             user_scrolled_this_frame: false,
             last_content_gen: 0,
             new_blocks_added: false,
@@ -800,7 +810,11 @@ pub struct RoleGroupBorderLayout {
 mod tests {
     use super::*;
 
-    fn scroll_state(content_height: f32, visible_height: f32, target_offset: f32) -> ConversationScrollState {
+    fn scroll_state(
+        content_height: f32,
+        visible_height: f32,
+        target_offset: f32,
+    ) -> ConversationScrollState {
         ConversationScrollState {
             offset: target_offset,
             target_offset,
@@ -882,4 +896,3 @@ mod tests {
         assert!(state.following);
     }
 }
-

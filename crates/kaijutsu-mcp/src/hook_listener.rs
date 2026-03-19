@@ -19,8 +19,8 @@ use tokio::sync::Mutex as TokioMutex;
 use kaijutsu_crdt::{BlockKind, ContextId, PrincipalId, Role, Status, ToolKind};
 use kaijutsu_kernel::SharedBlockStore;
 
-use crate::hook_types::{HookEvent, HookResponse, PingResponse, KAIJUTSU_MCP_TOOLS};
 use crate::RemoteState;
+use crate::hook_types::{HookEvent, HookResponse, KAIJUTSU_MCP_TOOLS, PingResponse};
 
 /// Maximum size of a block's content created from hook events.
 const DEFAULT_MAX_BLOCK_SIZE: usize = 4096;
@@ -147,7 +147,9 @@ impl HookListener {
             let ping = PingResponse {
                 status: "ok".to_string(),
                 pid: std::process::id(),
-                cwd: std::env::current_dir().ok().map(|p| p.display().to_string()),
+                cwd: std::env::current_dir()
+                    .ok()
+                    .map(|p| p.display().to_string()),
                 context_name: self.context_id().map(|id| id.short()),
                 document_id: self.context_id().map(|id| id.to_hex()),
                 session_id,
@@ -160,13 +162,12 @@ impl HookListener {
         }
 
         // Capture session_id from hook events if we don't have one yet
-        if let Some(ref event_session_id) = event.session_id {
-            if let Ok(mut guard) = self.session_id.lock() {
-                if guard.is_none() {
-                    tracing::info!(session_id = %event_session_id, "Captured session ID from hook event");
-                    *guard = Some(event_session_id.clone());
-                }
-            }
+        if let Some(ref event_session_id) = event.session_id
+            && let Ok(mut guard) = self.session_id.lock()
+            && guard.is_none()
+        {
+            tracing::info!(session_id = %event_session_id, "Captured session ID from hook event");
+            *guard = Some(event_session_id.clone());
         }
 
         let response = self.process_event(&event).await;
@@ -182,7 +183,9 @@ impl HookListener {
     async fn process_event(&self, event: &HookEvent) -> HookResponse {
         // 1. Filter self-referential kaijutsu MCP tools
         if let Some(ref tool) = event.tool
-            && KAIJUTSU_MCP_TOOLS.iter().any(|t| tool.name.eq_ignore_ascii_case(t))
+            && KAIJUTSU_MCP_TOOLS
+                .iter()
+                .any(|t| tool.name.eq_ignore_ascii_case(t))
         {
             // MCP server already recorded this — just check drift
             return self.maybe_inject_drift().await;
@@ -238,7 +241,12 @@ impl HookListener {
                 if let Some(ref file) = event.file {
                     let edit_count = file.edits.as_ref().map(|e| e.len()).unwrap_or(0);
                     let content = if edit_count > 0 {
-                        format!("File edited: {} ({} edit{})", file.path, edit_count, if edit_count == 1 { "" } else { "s" })
+                        format!(
+                            "File edited: {} ({} edit{})",
+                            file.path,
+                            edit_count,
+                            if edit_count == 1 { "" } else { "s" }
+                        )
                     } else {
                         format!("File edited: {}", file.path)
                     };
@@ -249,7 +257,10 @@ impl HookListener {
             "subagent.start" => {
                 let agent = event.agent_id.as_deref().unwrap_or("unknown");
                 let kind = event.agent_type.as_deref().unwrap_or("subagent");
-                self.insert_text_block(Role::System, &format!("Subagent started: {agent} ({kind})"));
+                self.insert_text_block(
+                    Role::System,
+                    &format!("Subagent started: {agent} ({kind})"),
+                );
             }
 
             "subagent.stop" => {
@@ -282,8 +293,8 @@ impl HookListener {
         };
         if let Err(e) = self.store.insert_block_as(
             ctx_id,
-            None,  // parent
-            None,  // after (append)
+            None, // parent
+            None, // after (append)
             role,
             BlockKind::Text,
             content,
@@ -296,7 +307,9 @@ impl HookListener {
 
     fn insert_tool_blocks(&self, tool: &crate::hook_types::ToolInfo, is_error: bool) {
         let Some(ctx_id) = self.context_id() else {
-            tracing::debug!("Hook insert_tool_blocks: no context yet (register_session not called)");
+            tracing::debug!(
+                "Hook insert_tool_blocks: no context yet (register_session not called)"
+            );
             return;
         };
         // Insert tool call block
@@ -345,12 +358,14 @@ impl HookListener {
     // -- Drift injection --
 
     async fn pending_drift_count(&self) -> u32 {
-        let Some(ref remote) = self.remote else { return 0 };
-        let Some(ctx_id) = self.context_id() else { return 0 };
+        let Some(ref remote) = self.remote else {
+            return 0;
+        };
+        let Some(ctx_id) = self.context_id() else {
+            return 0;
+        };
         match remote.actor.drift_queue().await {
-            Ok(queue) => queue.iter()
-                .filter(|d| d.target_ctx == ctx_id)
-                .count() as u32,
+            Ok(queue) => queue.iter().filter(|d| d.target_ctx == ctx_id).count() as u32,
             Err(_) => 0,
         }
     }
@@ -369,16 +384,15 @@ impl HookListener {
             Err(_) => return HookResponse::allow(),
         };
 
-        let our_drifts: Vec<_> = queue.iter()
-            .filter(|d| d.target_ctx == ctx_id)
-            .collect();
+        let our_drifts: Vec<_> = queue.iter().filter(|d| d.target_ctx == ctx_id).collect();
 
         if our_drifts.is_empty() {
             return HookResponse::allow();
         }
 
         // Build context string from drifts targeted at us
-        let context: String = our_drifts.iter()
+        let context: String = our_drifts
+            .iter()
             .map(|d| format!("[Drift from {}]: {}", d.source_ctx.short(), d.content))
             .collect::<Vec<_>>()
             .join("\n\n");
@@ -403,29 +417,39 @@ impl HookListener {
 /// Push local ops to the server. Mirrors `KaijutsuMcp::push_to_server()`.
 async fn push_ops(remote: &RemoteState) -> anyhow::Result<()> {
     let guard = remote.joined.read().await;
-    let joined = guard.as_ref()
+    let joined = guard
+        .as_ref()
         .ok_or_else(|| anyhow::anyhow!("No active context — register_session not called"))?;
 
     let frontier = {
-        let sync = joined.sync.lock()
+        let sync = joined
+            .sync
+            .lock()
             .map_err(|e| anyhow::anyhow!("Lock error: {e}"))?;
         sync.frontier().cloned().unwrap_or_default()
     };
 
-    let ops = remote.store.ops_since(joined.context_id, &frontier)
+    let ops = remote
+        .store
+        .ops_since(joined.context_id, &frontier)
         .map_err(|e| anyhow::anyhow!(e))?;
 
     // Check for empty payload before serializing
-    if ops.block_ops.is_empty() && ops.new_blocks.is_empty()
-        && ops.updated_headers.is_empty() && ops.deleted_blocks.is_empty()
+    if ops.block_ops.is_empty()
+        && ops.new_blocks.is_empty()
+        && ops.updated_headers.is_empty()
+        && ops.deleted_blocks.is_empty()
     {
         return Ok(()); // No ops
     }
 
-    let ops_bytes = postcard::to_allocvec(&ops)
-        .map_err(|e| anyhow::anyhow!("Serialize error: {e}"))?;
+    let ops_bytes =
+        postcard::to_allocvec(&ops).map_err(|e| anyhow::anyhow!("Serialize error: {e}"))?;
 
-    remote.actor.push_ops(joined.context_id, &ops_bytes).await
+    remote
+        .actor
+        .push_ops(joined.context_id, &ops_bytes)
+        .await
         .map_err(|e| anyhow::anyhow!("Push ops: {e}"))?;
 
     Ok(())
@@ -458,7 +482,11 @@ fn truncate(s: &str, max_len: usize) -> String {
 pub fn default_socket_path() -> Option<PathBuf> {
     let ppid = std::os::unix::process::parent_id();
     let runtime_dir = dirs::runtime_dir()?;
-    Some(runtime_dir.join("kaijutsu").join(format!("hook-{ppid}.sock")))
+    Some(
+        runtime_dir
+            .join("kaijutsu")
+            .join(format!("hook-{ppid}.sock")),
+    )
 }
 
 /// Discover hook sockets by scanning the runtime directory.

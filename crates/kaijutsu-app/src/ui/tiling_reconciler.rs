@@ -29,11 +29,11 @@
 
 use bevy::prelude::*;
 
-use super::tiling::*;
 use super::theme::Theme;
+use super::tiling::*;
 use crate::cell::ConversationContainer;
-use bevy_vello::prelude::UiVelloText;
 use crate::text::{FontHandles, vello_style};
+use bevy_vello::prelude::UiVelloText;
 
 // ============================================================================
 // MARKERS
@@ -101,17 +101,21 @@ pub fn reconcile_tiling_tree(
     if state.initialized {
         // Detach block cells from ConversationContainer before despawning panes.
         // Without this, despawn() recursively kills block cell children.
-        if let Some(main_ent) = editor_entities.main_cell {
-            if let Ok(container) = block_containers.get(main_ent) {
-                for &entity in container.block_cells.values().chain(container.role_headers.iter()) {
-                    commands.entity(entity).remove_parent_in_place();
-                }
-                info!(
-                    "Detached {} block cells + {} role headers before pane rebuild",
-                    container.block_cells.len(),
-                    container.role_headers.len()
-                );
+        if let Some(main_ent) = editor_entities.main_cell
+            && let Ok(container) = block_containers.get(main_ent)
+        {
+            for &entity in container
+                .block_cells
+                .values()
+                .chain(container.role_headers.iter())
+            {
+                commands.entity(entity).remove_parent_in_place();
             }
+            info!(
+                "Detached {} block cells + {} role headers before pane rebuild",
+                container.block_cells.len(),
+                container.role_headers.len()
+            );
         }
 
         // Despawn all existing pane-managed entities for rebuild
@@ -147,7 +151,9 @@ fn spawn_conversation_content(
     conv_root: Entity,
 ) {
     match &tree.root {
-        TileNode::Split { children, ratios, .. } => {
+        TileNode::Split {
+            children, ratios, ..
+        } => {
             for (i, child) in children.iter().enumerate() {
                 let ratio = ratios.get(i).copied().unwrap_or(1.0);
                 spawn_content_subtree(commands, child, theme, conv_root, tree, ratio);
@@ -225,34 +231,34 @@ fn spawn_content_subtree(
             };
 
             let mut entity_cmd = commands.spawn((
-                    PaneMarker {
-                        pane_id: *id,
-                        content: PaneContent::Conversation {
-                            document_id: document_id.clone(),
-                        },
-                    },
-                    *id,
-                    crate::cell::ConversationContainer,
-                    PaneSavedState {
+                PaneMarker {
+                    pane_id: *id,
+                    content: PaneContent::Conversation {
                         document_id: document_id.clone(),
-                        ..default()
                     },
-                    Node {
-                        flex_grow: if flex_grow > 0.0 { flex_grow } else { 1.0 },
-                        flex_basis: if flex_grow > 0.0 {
-                            Val::Px(0.0)
-                        } else {
-                            Val::Auto
-                        },
-                        flex_direction: FlexDirection::Column,
-                        overflow: Overflow::scroll_y(),
-                        padding: UiRect::axes(Val::Px(4.0), Val::Px(4.0)),
-                        border: UiRect::all(Val::Px(2.0)),
-                        ..default()
+                },
+                *id,
+                crate::cell::ConversationContainer,
+                PaneSavedState {
+                    document_id: document_id.clone(),
+                    ..default()
+                },
+                Node {
+                    flex_grow: if flex_grow > 0.0 { flex_grow } else { 1.0 },
+                    flex_basis: if flex_grow > 0.0 {
+                        Val::Px(0.0)
+                    } else {
+                        Val::Auto
                     },
-                    ScrollPosition::default(),
-                    BorderColor::all(border_color),
-                ));
+                    flex_direction: FlexDirection::Column,
+                    overflow: Overflow::scroll_y(),
+                    padding: UiRect::axes(Val::Px(4.0), Val::Px(4.0)),
+                    border: UiRect::all(Val::Px(2.0)),
+                    ..default()
+                },
+                ScrollPosition::default(),
+                BorderColor::all(border_color),
+            ));
             if is_focused {
                 entity_cmd.insert(PaneFocus);
             }
@@ -326,25 +332,23 @@ pub fn sync_tiling_visuals(
     for (marker, mut node) in pane_nodes.iter_mut() {
         if let Some(tile_node) = tree.root.find(marker.pane_id) {
             // For Split containers, find our ratio from the parent
-            if let Some((parent_id, child_idx)) = tree.root.find_parent(marker.pane_id) {
-                if let Some(TileNode::Split { ratios, .. }) = tree.root.find(parent_id) {
-                    if let Some(&ratio) = ratios.get(child_idx) {
-                        let new_grow = if ratio > 0.0 { ratio } else { 0.0 };
-                        // Only for content panes that use flex_grow (not docks/widgets)
-                        if matches!(tile_node, TileNode::Split { .. })
-                            || matches!(
-                                tile_node,
-                                TileNode::Leaf {
-                                    content: PaneContent::Conversation { .. },
-                                    ..
-                                }
-                            )
-                        {
-                            if (node.flex_grow - new_grow).abs() > 0.001 {
-                                node.flex_grow = new_grow;
-                            }
+            if let Some((parent_id, child_idx)) = tree.root.find_parent(marker.pane_id)
+                && let Some(TileNode::Split { ratios, .. }) = tree.root.find(parent_id)
+                && let Some(&ratio) = ratios.get(child_idx)
+            {
+                let new_grow = if ratio > 0.0 { ratio } else { 0.0 };
+                // Only for content panes that use flex_grow (not docks/widgets)
+                if (matches!(tile_node, TileNode::Split { .. })
+                    || matches!(
+                        tile_node,
+                        TileNode::Leaf {
+                            content: PaneContent::Conversation { .. },
+                            ..
                         }
-                    }
+                    ))
+                    && (node.flex_grow - new_grow).abs() > 0.001
+                {
+                    node.flex_grow = new_grow;
                 }
             }
         }
@@ -426,22 +430,18 @@ pub fn handle_pane_focus_change(
             })
             .unwrap_or_default();
 
-        if incoming_doc_id != outgoing_doc_id {
-            if let Some(TileNode::Leaf {
+        if incoming_doc_id != outgoing_doc_id
+            && let Some(TileNode::Leaf {
                 content: PaneContent::Conversation { document_id },
                 ..
             }) = tree.root.find(current)
-            {
-                if !document_id.is_empty() {
-                    if let Ok(ctx_id) = kaijutsu_types::ContextId::parse(document_id) {
-                        switch_writer.write(crate::cell::ContextSwitchRequested {
-                            context_id: ctx_id,
-                        });
-                        info!("Pane focus change: switching context to '{}'", document_id);
-                    } else {
-                        warn!("Pane focus change: invalid context ID '{}'", document_id);
-                    }
-                }
+            && !document_id.is_empty()
+        {
+            if let Ok(ctx_id) = kaijutsu_types::ContextId::parse(document_id) {
+                switch_writer.write(crate::cell::ContextSwitchRequested { context_id: ctx_id });
+                info!("Pane focus change: switching context to '{}'", document_id);
+            } else {
+                warn!("Pane focus change: invalid context ID '{}'", document_id);
             }
         }
     }
@@ -467,7 +467,10 @@ pub fn sync_unfocused_pane_summaries(
     theme: Res<Theme>,
     font_handles: Res<FontHandles>,
     doc_cache: Res<crate::cell::DocumentCache>,
-    conv_containers: Query<(Entity, &PaneMarker, &PaneSavedState, Option<&Children>), With<ConversationContainer>>,
+    conv_containers: Query<
+        (Entity, &PaneMarker, &PaneSavedState, Option<&Children>),
+        With<ConversationContainer>,
+    >,
     summaries: Query<Entity, With<UnfocusedPaneSummary>>,
 ) {
     // Only relevant with multiple panes
@@ -506,7 +509,7 @@ pub fn sync_unfocused_pane_summaries(
                 let doc_id = &saved.document_id;
                 let (context_label, block_count) = if doc_id.is_empty() {
                     ("No context".to_string(), 0)
-                } else if let Some(ctx_id) = kaijutsu_types::ContextId::parse(doc_id).ok() {
+                } else if let Ok(ctx_id) = kaijutsu_types::ContextId::parse(doc_id) {
                     if let Some(cached) = doc_cache.get(ctx_id) {
                         let name = if cached.context_name.is_empty() {
                             short_id(doc_id)
@@ -609,16 +612,15 @@ pub fn assign_mru_to_empty_panes(
             // Update PaneMarker.content and PaneSavedState
             for (mut marker, mut saved) in saved_states.iter_mut() {
                 if marker.pane_id == *pane_id {
-                    marker.content = PaneContent::Conversation { document_id: doc_id.clone() };
+                    marker.content = PaneContent::Conversation {
+                        document_id: doc_id.clone(),
+                    };
                     saved.document_id = doc_id.clone();
                     break;
                 }
             }
 
-            info!(
-                "Assigned MRU context '{}' to new pane {}",
-                doc_id, pane_id
-            );
+            info!("Assigned MRU context '{}' to new pane {}", doc_id, pane_id);
         }
     }
 }

@@ -11,7 +11,7 @@
 
 use bevy::prelude::*;
 use bevy_vello::vello;
-use vello::kurbo::{Affine, Arc, BezPath, Line, Point, RoundedRect, Shape, Stroke, Cap};
+use vello::kurbo::{Affine, Arc, BezPath, Cap, Line, Point, RoundedRect, Shape, Stroke};
 use vello::peniko::{Brush, Fill};
 
 use crate::cell::block_border::{BlockBorderStyle, BorderAnimation, BorderKind};
@@ -58,8 +58,7 @@ pub fn build_fieldset_border(
     let alpha = animation_alpha(&style.animation, time);
     let brush = apply_alpha(&brush, alpha);
 
-    let stroke = Stroke::new(style.thickness as f64)
-        .with_caps(Cap::Butt);
+    let stroke = Stroke::new(style.thickness as f64).with_caps(Cap::Butt);
     let r = style.corner_radius as f64;
 
     match style.kind {
@@ -68,7 +67,9 @@ pub fn build_fieldset_border(
             let top_gap = top_label.map(|l| measure_label_width(l, font));
             let bottom_gap = bottom_label.map(|l| measure_label_width(l, font));
 
-            draw_fieldset_rect(scene, width, height, r, &stroke, &brush, top_gap, bottom_gap);
+            draw_fieldset_rect(
+                scene, width, height, r, &stroke, &brush, top_gap, bottom_gap,
+            );
         }
         BorderKind::OpenBottom => {
             let top_gap = top_label.map(|l| measure_label_width(l, font));
@@ -86,7 +87,7 @@ pub fn build_fieldset_border(
         BorderKind::Dashed => {
             let dashed_stroke = Stroke::new(style.thickness as f64)
                 .with_caps(Cap::Butt)
-                .with_dashes(0.0, &[6.0, 4.0]);
+                .with_dashes(0.0, [6.0, 4.0]);
 
             let rect = RoundedRect::new(
                 style.thickness as f64 / 2.0,
@@ -100,18 +101,32 @@ pub fn build_fieldset_border(
     }
 
     // Animation overlays (before labels so labels are always on top)
-    match style.animation {
-        BorderAnimation::Chase => {
-            chase_overlay(scene, width, height, r, style.thickness as f64, time, &style.color, style.kind);
-        }
-        _ => {}
+    if style.animation == BorderAnimation::Chase {
+        chase_overlay(
+            scene,
+            width,
+            height,
+            r,
+            style.thickness as f64,
+            time,
+            &style.color,
+            style.kind,
+        );
     }
 
     // Labels drawn last — always visible above borders and animations
     match style.kind {
         BorderKind::Full | BorderKind::OpenBottom => {
             if let (Some(label), Some(font)) = (top_label, font) {
-                draw_label_text(scene, label, LABEL_INSET + LABEL_PAD, 0.0, font, &brush, bg_color);
+                draw_label_text(
+                    scene,
+                    label,
+                    LABEL_INSET + LABEL_PAD,
+                    0.0,
+                    font,
+                    &brush,
+                    bg_color,
+                );
             }
             if let (Some(label), Some(font)) = (bottom_label, font) {
                 let label_w = measure_label_width(label, Some(font));
@@ -129,7 +144,15 @@ pub fn build_fieldset_border(
         }
         BorderKind::TopAccent => {
             if let (Some(label), Some(font)) = (top_label, font) {
-                draw_label_text(scene, label, LABEL_INSET + LABEL_PAD, 0.0, font, &brush, bg_color);
+                draw_label_text(
+                    scene,
+                    label,
+                    LABEL_INSET + LABEL_PAD,
+                    0.0,
+                    font,
+                    &brush,
+                    bg_color,
+                );
             }
         }
         _ => {}
@@ -186,7 +209,15 @@ pub fn build_role_group_line(
 
     // Draw label text centered vertically on the line (no knockout needed — no animation)
     if let Some(font) = font {
-        draw_label_text(scene, role_label, LABEL_INSET + LABEL_PAD, y, font, &brush, Color::NONE);
+        draw_label_text(
+            scene,
+            role_label,
+            LABEL_INSET + LABEL_PAD,
+            y,
+            font,
+            &brush,
+            Color::NONE,
+        );
     }
 }
 
@@ -241,7 +272,14 @@ fn draw_fieldset_rect(
             let clamped_end = gap_end.min(x1 - r);
             path.move_to((clamped_end, y0));
             path.line_to((x1 - r, y0));
-            arc_corner(&mut path, x1 - r, y0 + r, r, -std::f64::consts::FRAC_PI_2, true);
+            arc_corner(
+                &mut path,
+                x1 - r,
+                y0 + r,
+                r,
+                -std::f64::consts::FRAC_PI_2,
+                true,
+            );
             scene.stroke(stroke, Affine::IDENTITY, brush, None, &path);
         }
         None => {
@@ -249,7 +287,14 @@ fn draw_fieldset_rect(
             let mut path = BezPath::new();
             arc_corner(&mut path, x0 + r, y0 + r, r, std::f64::consts::PI, true);
             path.line_to((x1 - r, y0));
-            arc_corner(&mut path, x1 - r, y0 + r, r, -std::f64::consts::FRAC_PI_2, true);
+            arc_corner(
+                &mut path,
+                x1 - r,
+                y0 + r,
+                r,
+                -std::f64::consts::FRAC_PI_2,
+                true,
+            );
             scene.stroke(stroke, Affine::IDENTITY, brush, None, &path);
         }
     }
@@ -281,7 +326,14 @@ fn draw_fieldset_rect(
             let clamped_gap_start = gap_start.max(x0 + r);
             path.move_to((clamped_gap_start, y1));
             path.line_to((x0 + r, y1));
-            arc_corner(&mut path, x0 + r, y1 - r, r, std::f64::consts::FRAC_PI_2, true);
+            arc_corner(
+                &mut path,
+                x0 + r,
+                y1 - r,
+                r,
+                std::f64::consts::FRAC_PI_2,
+                true,
+            );
             scene.stroke(stroke, Affine::IDENTITY, brush, None, &path);
         }
         None => {
@@ -289,7 +341,14 @@ fn draw_fieldset_rect(
             let mut path = BezPath::new();
             arc_corner(&mut path, x1 - r, y1 - r, r, 0.0, true);
             path.line_to((x0 + r, y1));
-            arc_corner(&mut path, x0 + r, y1 - r, r, std::f64::consts::FRAC_PI_2, true);
+            arc_corner(
+                &mut path,
+                x0 + r,
+                y1 - r,
+                r,
+                std::f64::consts::FRAC_PI_2,
+                true,
+            );
             scene.stroke(stroke, Affine::IDENTITY, brush, None, &path);
         }
     }
@@ -339,25 +398,49 @@ fn draw_open_bottom(
             let clamped_end = gap_end.min(x1 - r);
             path.move_to((clamped_end, y0));
             path.line_to((x1 - r, y0));
-            arc_corner(&mut path, x1 - r, y0 + r, r, -std::f64::consts::FRAC_PI_2, true);
+            arc_corner(
+                &mut path,
+                x1 - r,
+                y0 + r,
+                r,
+                -std::f64::consts::FRAC_PI_2,
+                true,
+            );
             scene.stroke(stroke, Affine::IDENTITY, brush, None, &path);
         }
         None => {
             let mut path = BezPath::new();
             arc_corner(&mut path, x0 + r, y0 + r, r, std::f64::consts::PI, true);
             path.line_to((x1 - r, y0));
-            arc_corner(&mut path, x1 - r, y0 + r, r, -std::f64::consts::FRAC_PI_2, true);
+            arc_corner(
+                &mut path,
+                x1 - r,
+                y0 + r,
+                r,
+                -std::f64::consts::FRAC_PI_2,
+                true,
+            );
             scene.stroke(stroke, Affine::IDENTITY, brush, None, &path);
         }
     }
 
     // === Left edge (top to bottom, no corner at bottom) ===
-    scene.stroke(stroke, Affine::IDENTITY, brush, None,
-        &Line::new((x0, y0 + r), (x0, y1)));
+    scene.stroke(
+        stroke,
+        Affine::IDENTITY,
+        brush,
+        None,
+        &Line::new((x0, y0 + r), (x0, y1)),
+    );
 
     // === Right edge (top to bottom, no corner at bottom) ===
-    scene.stroke(stroke, Affine::IDENTITY, brush, None,
-        &Line::new((x1, y0 + r), (x1, y1)));
+    scene.stroke(
+        stroke,
+        Affine::IDENTITY,
+        brush,
+        None,
+        &Line::new((x1, y0 + r), (x1, y1)),
+    );
 }
 
 /// Draw left + right + bottom edges with horizontal divider at top.
@@ -380,8 +463,13 @@ fn draw_open_top(
     let y1 = height - half_t;
 
     // === Horizontal divider at top (full width) ===
-    scene.stroke(stroke, Affine::IDENTITY, brush, None,
-        &Line::new((x0, half_t), (x1, half_t)));
+    scene.stroke(
+        stroke,
+        Affine::IDENTITY,
+        brush,
+        None,
+        &Line::new((x0, half_t), (x1, half_t)),
+    );
 
     // === Left edge (top to bottom corner) ===
     {
@@ -418,14 +506,28 @@ fn draw_open_top(
             let clamped_gap_start = gap_start.max(x0 + r);
             path.move_to((clamped_gap_start, y1));
             path.line_to((x0 + r, y1));
-            arc_corner(&mut path, x0 + r, y1 - r, r, std::f64::consts::FRAC_PI_2, true);
+            arc_corner(
+                &mut path,
+                x0 + r,
+                y1 - r,
+                r,
+                std::f64::consts::FRAC_PI_2,
+                true,
+            );
             scene.stroke(stroke, Affine::IDENTITY, brush, None, &path);
         }
         None => {
             let mut path = BezPath::new();
             arc_corner(&mut path, x1 - r, y1 - r, r, 0.0, true);
             path.line_to((x0 + r, y1));
-            arc_corner(&mut path, x0 + r, y1 - r, r, std::f64::consts::FRAC_PI_2, true);
+            arc_corner(
+                &mut path,
+                x0 + r,
+                y1 - r,
+                r,
+                std::f64::consts::FRAC_PI_2,
+                true,
+            );
             scene.stroke(stroke, Affine::IDENTITY, brush, None, &path);
         }
     }
@@ -448,18 +550,33 @@ fn draw_top_accent(
 
             // Left segment
             if gap_start > 0.0 {
-                scene.stroke(stroke, Affine::IDENTITY, brush, None,
-                    &Line::new((0.0, y), (gap_start, y)));
+                scene.stroke(
+                    stroke,
+                    Affine::IDENTITY,
+                    brush,
+                    None,
+                    &Line::new((0.0, y), (gap_start, y)),
+                );
             }
             // Right segment
             if gap_end < width {
-                scene.stroke(stroke, Affine::IDENTITY, brush, None,
-                    &Line::new((gap_end, y), (width, y)));
+                scene.stroke(
+                    stroke,
+                    Affine::IDENTITY,
+                    brush,
+                    None,
+                    &Line::new((gap_end, y), (width, y)),
+                );
             }
         }
         None => {
-            scene.stroke(stroke, Affine::IDENTITY, brush, None,
-                &Line::new((0.0, y), (width, y)));
+            scene.stroke(
+                stroke,
+                Affine::IDENTITY,
+                brush,
+                None,
+                &Line::new((0.0, y), (width, y)),
+            );
         }
     }
 }
@@ -486,7 +603,7 @@ fn arc_corner(path: &mut BezPath, cx: f64, cy: f64, radius: f64, start_angle: f6
                 if first {
                     // If the path already has content, line_to the arc start.
                     // If empty, move_to it.
-                    if path.elements().len() > 0 {
+                    if !path.elements().is_empty() {
                         path.line_to(*p);
                     } else {
                         path.move_to(*p);
@@ -521,7 +638,12 @@ fn draw_label_text(
         ..default()
     };
 
-    let layout = font.layout(text, &style, bevy_vello::prelude::VelloTextAlign::Left, None);
+    let layout = font.layout(
+        text,
+        &style,
+        bevy_vello::prelude::VelloTextAlign::Left,
+        None,
+    );
 
     // Offset y so the text baseline sits at the border line.
     // For top labels: text sits just below the line (y ≈ 0).
@@ -538,7 +660,13 @@ fn draw_label_text(
         x + label_w + LABEL_PAD,
         text_y + line_height,
     );
-    scene.fill(Fill::NonZero, Affine::IDENTITY, &bevy_color_to_brush(bg_color), None, &bg_rect);
+    scene.fill(
+        Fill::NonZero,
+        Affine::IDENTITY,
+        &bevy_color_to_brush(bg_color),
+        None,
+        &bg_rect,
+    );
 
     let transform = Affine::translate((x, text_y));
 
@@ -588,7 +716,12 @@ fn measure_label_width(label: &str, font: Option<&bevy_vello::prelude::VelloFont
             font_size: FIELDSET_LABEL_FONT_SIZE,
             ..default()
         };
-        let layout = font.layout(label, &style, bevy_vello::prelude::VelloTextAlign::Left, None);
+        let layout = font.layout(
+            label,
+            &style,
+            bevy_vello::prelude::VelloTextAlign::Left,
+            None,
+        );
         layout.width() as f64
     } else {
         // Heuristic: monospace at 11px ≈ 6.6px per char
@@ -604,7 +737,12 @@ pub fn measure_role_label_width(label: &str, font: Option<&bevy_vello::prelude::
             font_size: ROLE_LABEL_FONT_SIZE,
             ..default()
         };
-        let layout = font.layout(label, &style, bevy_vello::prelude::VelloTextAlign::Left, None);
+        let layout = font.layout(
+            label,
+            &style,
+            bevy_vello::prelude::VelloTextAlign::Left,
+            None,
+        );
         layout.width() as f64
     } else {
         label.len() as f64 * 7.2
@@ -651,14 +789,21 @@ fn chase_overlay(
             path.line_to((x0, y0 + r));
             arc_corner(&mut path, x0 + r, y0 + r, r, std::f64::consts::PI, true);
             path.line_to((x1 - r, y0));
-            arc_corner(&mut path, x1 - r, y0 + r, r, -std::f64::consts::FRAC_PI_2, true);
+            arc_corner(
+                &mut path,
+                x1 - r,
+                y0 + r,
+                r,
+                -std::f64::consts::FRAC_PI_2,
+                true,
+            );
             path.line_to((x1, height));
             let perimeter = path.perimeter(0.1);
             let chase_len = perimeter * 0.15;
             let position = (time as f64 * 2.0) % perimeter;
             let stroke = Stroke::new(thickness * 1.5)
                 .with_caps(Cap::Round)
-                .with_dashes(position, &[chase_len, perimeter - chase_len]);
+                .with_dashes(position, [chase_len, perimeter - chase_len]);
             scene.stroke(&stroke, Affine::IDENTITY, &brush, None, &path);
         }
         BorderKind::OpenTop => {
@@ -666,7 +811,14 @@ fn chase_overlay(
             let mut path = BezPath::new();
             path.move_to((x0, 0.0));
             path.line_to((x0, y1 - r));
-            arc_corner(&mut path, x0 + r, y1 - r, r, std::f64::consts::FRAC_PI_2, true);
+            arc_corner(
+                &mut path,
+                x0 + r,
+                y1 - r,
+                r,
+                std::f64::consts::FRAC_PI_2,
+                true,
+            );
             path.line_to((x1 - r, y1));
             arc_corner(&mut path, x1 - r, y1 - r, r, 0.0, true);
             path.line_to((x1, 0.0));
@@ -675,7 +827,7 @@ fn chase_overlay(
             let position = (time as f64 * 2.0) % perimeter;
             let stroke = Stroke::new(thickness * 1.5)
                 .with_caps(Cap::Round)
-                .with_dashes(position, &[chase_len, perimeter - chase_len]);
+                .with_dashes(position, [chase_len, perimeter - chase_len]);
             scene.stroke(&stroke, Affine::IDENTITY, &brush, None, &path);
         }
         _ => {
@@ -686,7 +838,7 @@ fn chase_overlay(
             let position = (time as f64 * 2.0) % perimeter;
             let stroke = Stroke::new(thickness * 1.5)
                 .with_caps(Cap::Round)
-                .with_dashes(position, &[chase_len, perimeter - chase_len]);
+                .with_dashes(position, [chase_len, perimeter - chase_len]);
             scene.stroke(&stroke, Affine::IDENTITY, &brush, None, &rect);
         }
     }
@@ -719,7 +871,9 @@ pub fn apply_alpha(brush: &Brush, alpha: f32) -> Brush {
         Brush::Solid(color) => {
             let rgba = color.to_rgba8();
             let new_a = ((rgba.a as f32) * alpha) as u8;
-            Brush::Solid(vello::peniko::Color::from_rgba8(rgba.r, rgba.g, rgba.b, new_a))
+            Brush::Solid(vello::peniko::Color::from_rgba8(
+                rgba.r, rgba.g, rgba.b, new_a,
+            ))
         }
         _ => brush.clone(), // Gradients: leave as-is
     }

@@ -49,12 +49,27 @@ pub mod translate;
 
 // Re-export engine types
 pub use engines::{
-    BlockAppendEngine, BlockCreateEngine, BlockEditEngine, BlockListEngine, BlockReadEngine,
-    BlockSearchEngine, BlockSpliceEngine, BlockStatusEngine, KernelSearchEngine,
+    BlockAppendEngine,
     // Parameter types
-    BlockAppendParams, BlockCreateParams, BlockEditParams, BlockListParams, BlockReadParams,
-    BlockSearchParams, BlockSpliceParams, BlockStatusParams, KernelSearchParams,
-    EditOp, KernelSearchMatch,
+    BlockAppendParams,
+    BlockCreateEngine,
+    BlockCreateParams,
+    BlockEditEngine,
+    BlockEditParams,
+    BlockListEngine,
+    BlockListParams,
+    BlockReadEngine,
+    BlockReadParams,
+    BlockSearchEngine,
+    BlockSearchParams,
+    BlockSpliceEngine,
+    BlockSpliceParams,
+    BlockStatusEngine,
+    BlockStatusParams,
+    EditOp,
+    KernelSearchEngine,
+    KernelSearchMatch,
+    KernelSearchParams,
 };
 
 // Re-export error types
@@ -62,8 +77,8 @@ pub use error::{EditError, Result};
 
 // Re-export translation utilities
 pub use translate::{
-    content_with_line_numbers, extract_lines_with_numbers, line_count,
-    line_range_to_byte_range, line_to_byte_offset, validate_expected_text,
+    content_with_line_numbers, extract_lines_with_numbers, line_count, line_range_to_byte_range,
+    line_to_byte_offset, validate_expected_text,
 };
 
 // Re-export batching utilities

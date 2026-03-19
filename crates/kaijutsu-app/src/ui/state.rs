@@ -29,9 +29,7 @@ impl Plugin for AppScreenPlugin {
 /// Handle ContextJoined events — log for diagnostics.
 ///
 /// Document cache management happens in `handle_block_events` (view/sync.rs).
-fn handle_context_joined(
-    mut result_events: MessageReader<crate::connection::RpcResultMessage>,
-) {
+fn handle_context_joined(mut result_events: MessageReader<crate::connection::RpcResultMessage>) {
     for result in result_events.read() {
         if let crate::connection::RpcResultMessage::ContextJoined { membership, .. } = result {
             info!("Context joined: {}", membership.context_id);

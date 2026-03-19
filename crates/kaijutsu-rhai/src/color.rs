@@ -96,7 +96,11 @@ pub fn register(engine: &mut Engine) {
     // --- Constructors ---
 
     engine.register_fn("rgb", |r: f64, g: f64, b: f64| -> String {
-        srgb_to_hex(Srgb::new(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0))
+        srgb_to_hex(Srgb::new(
+            r as f32 / 255.0,
+            g as f32 / 255.0,
+            b as f32 / 255.0,
+        ))
     });
 
     engine.register_fn("rgba", |r: f64, g: f64, b: f64, a: f64| -> String {

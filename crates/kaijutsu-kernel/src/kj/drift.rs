@@ -45,7 +45,7 @@ impl KjDispatcher {
             _ => {
                 return KjResult::Err(
                     "kj drift push: requires a destination context reference".to_string(),
-                )
+                );
             }
         };
 
@@ -108,7 +108,11 @@ impl KjDispatcher {
         // kj drift pull <src> [prompt...]
         let src_query = match argv.get(1) {
             Some(q) => q.as_str(),
-            None => return KjResult::Err("kj drift pull: requires a source context reference".to_string()),
+            None => {
+                return KjResult::Err(
+                    "kj drift pull: requires a source context reference".to_string(),
+                );
+            }
         };
 
         // Resolve source context
@@ -190,7 +194,12 @@ impl KjDispatcher {
         // Default target = caller's forked_from parent
         let target_id = if let Some(target_query) = argv.get(1) {
             let db = self.kernel_db().lock();
-            match refs::resolve_context_arg(Some(target_query.as_str()), caller, &db, self.kernel_id()) {
+            match refs::resolve_context_arg(
+                Some(target_query.as_str()),
+                caller,
+                &db,
+                self.kernel_id(),
+            ) {
                 Ok(id) => id,
                 Err(e) => return KjResult::Err(format!("kj drift merge: {e}")),
             }
@@ -199,7 +208,11 @@ impl KjDispatcher {
             let db = self.kernel_db().lock();
             let row = match db.get_context(caller.context_id) {
                 Ok(Some(r)) => r,
-                Ok(None) => return KjResult::Err("kj drift merge: current context not found in db".to_string()),
+                Ok(None) => {
+                    return KjResult::Err(
+                        "kj drift merge: current context not found in db".to_string(),
+                    );
+                }
                 Err(e) => return KjResult::Err(format!("kj drift merge: {e}")),
             };
             match row.forked_from {
@@ -330,11 +343,9 @@ impl KjDispatcher {
                 router.ensure_lost_found()
             };
             // create_document is idempotent (DashMap entry-based)
-            let _ = self.block_store().create_document(
-                lf_id,
-                crate::DocumentKind::Conversation,
-                None,
-            );
+            let _ =
+                self.block_store()
+                    .create_document(lf_id, crate::DocumentKind::Conversation, None);
             let dead_count = dead.len();
             for item in dead {
                 let after = self.block_store().last_block_id(lf_id);
@@ -392,15 +403,21 @@ impl KjDispatcher {
         };
 
         let outgoing = db.drift_provenance(target_id).unwrap_or_default();
-        let incoming = db.edges_to(target_id, Some(kaijutsu_types::EdgeKind::Drift)).unwrap_or_default();
+        let incoming = db
+            .edges_to(target_id, Some(kaijutsu_types::EdgeKind::Drift))
+            .unwrap_or_default();
 
-        KjResult::ok(super::format::format_drift_history(&outgoing, &incoming, &db))
+        KjResult::ok(super::format::format_drift_history(
+            &outgoing, &incoming, &db,
+        ))
     }
 
     async fn drift_cancel(&self, argv: &[String]) -> KjResult {
         let id_str = match argv.get(1) {
             Some(s) => s,
-            None => return KjResult::Err("kj drift cancel: requires a staged drift ID".to_string()),
+            None => {
+                return KjResult::Err("kj drift cancel: requires a staged drift ID".to_string());
+            }
         };
 
         let id: u64 = match id_str.parse() {
@@ -409,7 +426,7 @@ impl KjDispatcher {
                 return KjResult::Err(format!(
                     "kj drift cancel: '{}' is not a valid drift ID",
                     id_str
-                ))
+                ));
             }
         };
 
@@ -517,17 +534,27 @@ mod tests {
         let c = caller_with_context(ctx);
         let result = d.dispatch(&[s("drift"), s("history")], &c).await;
         assert!(result.is_ok());
-        assert!(result.message().contains("no drift history"), "msg: {}", result.message());
+        assert!(
+            result.message().contains("no drift history"),
+            "msg: {}",
+            result.message()
+        );
     }
 
     #[tokio::test]
     async fn drift_pull_missing_source() {
         let d = test_dispatcher().await;
         let c = test_caller();
-        let result = d.dispatch(&[s("drift"), s("pull"), s("nonexistent")], &c).await;
+        let result = d
+            .dispatch(&[s("drift"), s("pull"), s("nonexistent")], &c)
+            .await;
         assert!(!result.is_ok());
         // Should fail on context resolution, not "not yet implemented"
-        assert!(!result.message().contains("not yet implemented"), "msg: {}", result.message());
+        assert!(
+            !result.message().contains("not yet implemented"),
+            "msg: {}",
+            result.message()
+        );
     }
 
     #[tokio::test]
@@ -536,7 +563,11 @@ mod tests {
         let c = test_caller();
         let result = d.dispatch(&[s("drift"), s("pull")], &c).await;
         assert!(!result.is_ok());
-        assert!(result.message().contains("requires a source"), "msg: {}", result.message());
+        assert!(
+            result.message().contains("requires a source"),
+            "msg: {}",
+            result.message()
+        );
     }
 
     #[tokio::test]
@@ -557,7 +588,11 @@ mod tests {
         let c = caller_with_context(dst);
         let result = d.dispatch(&[s("drift"), s("pull"), s("src-ctx")], &c).await;
         assert!(!result.is_ok());
-        assert!(result.message().contains("no blocks"), "msg: {}", result.message());
+        assert!(
+            result.message().contains("no blocks"),
+            "msg: {}",
+            result.message()
+        );
     }
 
     #[tokio::test]
@@ -567,9 +602,15 @@ mod tests {
         let ctx = register_context(&d, Some("self-ctx"), None, principal).await;
 
         let c = caller_with_context(ctx);
-        let result = d.dispatch(&[s("drift"), s("pull"), s("self-ctx")], &c).await;
+        let result = d
+            .dispatch(&[s("drift"), s("pull"), s("self-ctx")], &c)
+            .await;
         assert!(!result.is_ok());
-        assert!(result.message().contains("cannot pull from self"), "msg: {}", result.message());
+        assert!(
+            result.message().contains("cannot pull from self"),
+            "msg: {}",
+            result.message()
+        );
     }
 
     #[tokio::test]
@@ -581,7 +622,11 @@ mod tests {
         let c = caller_with_context(ctx);
         let result = d.dispatch(&[s("drift"), s("merge")], &c).await;
         assert!(!result.is_ok());
-        assert!(result.message().contains("not a fork"), "msg: {}", result.message());
+        assert!(
+            result.message().contains("not a fork"),
+            "msg: {}",
+            result.message()
+        );
     }
 
     #[tokio::test]
@@ -602,7 +647,11 @@ mod tests {
         let c = caller_with_context(child);
         let result = d.dispatch(&[s("drift"), s("merge")], &c).await;
         assert!(!result.is_ok());
-        assert!(result.message().contains("no blocks"), "msg: {}", result.message());
+        assert!(
+            result.message().contains("no blocks"),
+            "msg: {}",
+            result.message()
+        );
     }
 
     #[tokio::test]
@@ -615,7 +664,11 @@ mod tests {
         let c = caller_with_context(ctx);
         let result = d.dispatch(&[s("drift"), s("push"), s("y")], &c).await;
         assert!(!result.is_ok());
-        assert!(result.message().contains("requires content"), "msg: {}", result.message());
+        assert!(
+            result.message().contains("requires content"),
+            "msg: {}",
+            result.message()
+        );
     }
 
     #[tokio::test]
@@ -628,7 +681,11 @@ mod tests {
         let c = caller_with_context(ctx);
         let result = d.dispatch(&[s("drift"), s("push"), s("y")], &c).await;
         assert!(!result.is_ok());
-        assert!(result.message().contains("--summarize"), "msg: {}", result.message());
+        assert!(
+            result.message().contains("--summarize"),
+            "msg: {}",
+            result.message()
+        );
     }
 
     #[tokio::test]
@@ -648,7 +705,11 @@ mod tests {
             .dispatch(&[s("drift"), s("push"), s("dst"), s("--summarize")], &c)
             .await;
         assert!(!result.is_ok());
-        assert!(result.message().contains("no blocks"), "msg: {}", result.message());
+        assert!(
+            result.message().contains("no blocks"),
+            "msg: {}",
+            result.message()
+        );
     }
 
     #[tokio::test]
@@ -662,19 +723,24 @@ mod tests {
         let c = caller_with_context(src);
 
         // Push to a context WITHOUT a document — insertion will fail
-        d.dispatch(
-            &[s("drift"), s("push"), s("nodoc"), s("will fail")],
-            &c,
-        )
-        .await;
+        d.dispatch(&[s("drift"), s("push"), s("nodoc"), s("will fail")], &c)
+            .await;
 
         let result = d.dispatch(&[s("drift"), s("flush")], &c).await;
         assert!(result.is_ok(), "flush: {}", result.message());
-        assert!(result.message().contains("requeued"), "msg: {}", result.message());
+        assert!(
+            result.message().contains("requeued"),
+            "msg: {}",
+            result.message()
+        );
 
         // The item should be back in the queue
         let result = d.dispatch(&[s("drift"), s("queue")], &c).await;
-        assert!(result.message().contains("will fail"), "queue: {}", result.message());
+        assert!(
+            result.message().contains("will fail"),
+            "queue: {}",
+            result.message()
+        );
 
         // Now create the document and flush successfully
         d.block_store()
@@ -682,6 +748,10 @@ mod tests {
             .unwrap();
         let result = d.dispatch(&[s("drift"), s("flush")], &c).await;
         assert!(result.is_ok(), "flush2: {}", result.message());
-        assert!(result.message().contains("flushed 1 drift"), "msg: {}", result.message());
+        assert!(
+            result.message().contains("flushed 1 drift"),
+            "msg: {}",
+            result.message()
+        );
     }
 }

@@ -62,10 +62,10 @@ async fn shell_exec_wait_timeout(
             .unwrap_or_else(|e| panic!("get_blocks failed while polling {code:?}: {e}"));
 
         // Find the ToolResult block whose parent is our command block
-        if let Some(output) = blocks.iter().find(|b| {
-            b.kind == BlockKind::ToolResult
-                && b.tool_call_id == Some(cmd_block_id)
-        }) {
+        if let Some(output) = blocks
+            .iter()
+            .find(|b| b.kind == BlockKind::ToolResult && b.tool_call_id == Some(cmd_block_id))
+        {
             match output.status {
                 Status::Done | Status::Error => {
                     return (cmd_block_id, output.content.clone(), output.status);
@@ -148,7 +148,11 @@ fn test_fork_work_drift_merge_e2e() {
         // Work in fork
         let (_cmd_id, work_output, work_status) =
             shell_exec_wait(&kernel, "echo 'found the bug'", exploration_id).await;
-        assert_eq!(work_status, Status::Done, "echo in fork failed: {work_output}");
+        assert_eq!(
+            work_status,
+            Status::Done,
+            "echo in fork failed: {work_output}"
+        );
 
         // Drift push: stage content for main
         let (_cmd_id, push_output, push_status) = shell_exec_wait(
@@ -157,7 +161,11 @@ fn test_fork_work_drift_merge_e2e() {
             exploration_id,
         )
         .await;
-        assert_eq!(push_status, Status::Done, "kj drift push failed: {push_output}");
+        assert_eq!(
+            push_status,
+            Status::Done,
+            "kj drift push failed: {push_output}"
+        );
         assert!(
             push_output.to_lowercase().contains("staged")
                 || push_output.to_lowercase().contains("queued"),
@@ -167,7 +175,11 @@ fn test_fork_work_drift_merge_e2e() {
         // Drift flush
         let (_cmd_id, flush_output, flush_status) =
             shell_exec_wait(&kernel, "kj drift flush", exploration_id).await;
-        assert_eq!(flush_status, Status::Done, "kj drift flush failed: {flush_output}");
+        assert_eq!(
+            flush_status,
+            Status::Done,
+            "kj drift flush failed: {flush_output}"
+        );
         assert!(
             flush_output.to_lowercase().contains("flush"),
             "expected 'flush' in output, got: {flush_output}"
@@ -175,13 +187,14 @@ fn test_fork_work_drift_merge_e2e() {
 
         // Verify drift landed in main
         let main_blocks = get_all_blocks(&kernel, main_ctx).await;
-        let drift_block = main_blocks
-            .iter()
-            .find(|b| b.kind == BlockKind::Drift);
+        let drift_block = main_blocks.iter().find(|b| b.kind == BlockKind::Drift);
         assert!(
             drift_block.is_some(),
             "expected a Drift block in main context, blocks: {:?}",
-            main_blocks.iter().map(|b| (&b.kind, &b.content)).collect::<Vec<_>>()
+            main_blocks
+                .iter()
+                .map(|b| (&b.kind, &b.content))
+                .collect::<Vec<_>>()
         );
         assert!(
             drift_block.unwrap().content.contains("auth bypass"),
@@ -192,7 +205,11 @@ fn test_fork_work_drift_merge_e2e() {
         // Context tree listing
         let (_cmd_id, list_output, list_status) =
             shell_exec_wait(&kernel, "kj context list", exploration_id).await;
-        assert_eq!(list_status, Status::Done, "kj context list failed: {list_output}");
+        assert_eq!(
+            list_status,
+            Status::Done,
+            "kj context list failed: {list_output}"
+        );
         assert!(
             list_output.contains("main") && list_output.contains("exploration"),
             "context list should show both contexts, got: {list_output}"
@@ -287,14 +304,9 @@ fn test_two_clients_same_kernel_e2e() {
         );
 
         // Client B joins and reads blocks
-        kernel_b
-            .join_context(root_ctx, "client-b")
-            .await
-            .unwrap();
+        kernel_b.join_context(root_ctx, "client-b").await.unwrap();
         let blocks = get_all_blocks(&kernel_b, root_ctx).await;
-        let has_client_a_output = blocks
-            .iter()
-            .any(|b| b.content.contains("from client A"));
+        let has_client_a_output = blocks.iter().any(|b| b.content.contains("from client A"));
         assert!(
             has_client_a_output,
             "Client B should see Client A's blocks, got: {:?}",
@@ -324,7 +336,11 @@ fn test_context_list_e2e() {
         // List via kj
         let (_cmd_id, list_output, list_status) =
             shell_exec_wait(&kernel, "kj context list", ctx_a).await;
-        assert_eq!(list_status, Status::Done, "kj context list failed: {list_output}");
+        assert_eq!(
+            list_status,
+            Status::Done,
+            "kj context list failed: {list_output}"
+        );
         assert!(
             list_output.contains("ctx-alpha"),
             "should see ctx-alpha: {list_output}"

@@ -114,6 +114,7 @@ pub fn handle_form_action(
 ///
 /// Call from your domain input handler when processing text events on a field
 /// that contains a TreeView. Returns true if the toggle was handled.
+#[allow(dead_code)]
 pub fn handle_form_space(
     active_field_id: u8,
     trees: &mut Query<(&FormFieldContainer, &mut TreeView)>,

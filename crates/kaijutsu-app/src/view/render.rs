@@ -10,9 +10,9 @@
 use bevy::prelude::*;
 
 use crate::cell::{
-    BlockCell, BlockCellContainer, BlockCellLayout, CellEditor,
-    EditorEntities, LayoutGeneration, MainCell, RoleGroupBorder,
-    RoleGroupBorderLayout, ConversationScrollState, FocusedBlockCell,
+    BlockCell, BlockCellContainer, BlockCellLayout, CellEditor, ConversationScrollState,
+    EditorEntities, FocusedBlockCell, LayoutGeneration, MainCell, RoleGroupBorder,
+    RoleGroupBorderLayout,
 };
 use crate::text::{FontHandles, bevy_color_to_brush};
 use crate::ui::theme::Theme;
@@ -47,7 +47,11 @@ pub fn sync_block_cell_buffers(
     entities: Res<EditorEntities>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     containers: Query<&BlockCellContainer>,
-    mut block_cells: Query<(&mut BlockCell, &mut UiVelloText, Option<&TimelineVisibility>)>,
+    mut block_cells: Query<(
+        &mut BlockCell,
+        &mut UiVelloText,
+        Option<&TimelineVisibility>,
+    )>,
     theme: Res<Theme>,
     doc_cache: Res<crate::cell::DocumentCache>,
     mut layout_gen: ResMut<LayoutGeneration>,
@@ -66,13 +70,13 @@ pub fn sync_block_cell_buffers(
 
     let doc_version = editor.version();
 
-    // Quick dirty check before allocating. 
-    // We must run if the document has a new version, OR if any cell 
+    // Quick dirty check before allocating.
+    // We must run if the document has a new version, OR if any cell
     // in the container has never been rendered (None).
     let needs_update = container.entities().any(|e| {
         block_cells
             .get(e)
-            .map(|(bc, _, _)| bc.last_render_version.map_or(true, |v| v < doc_version))
+            .map(|(bc, _, _)| bc.last_render_version.is_none_or(|v| v < doc_version))
             .unwrap_or(false)
     });
 
@@ -81,7 +85,8 @@ pub fn sync_block_cell_buffers(
     }
 
     let blocks_ordered = editor.blocks();
-    let block_index: std::collections::HashMap<&kaijutsu_crdt::BlockId, usize> = blocks_ordered.iter()
+    let block_index: std::collections::HashMap<&kaijutsu_crdt::BlockId, usize> = blocks_ordered
+        .iter()
         .enumerate()
         .map(|(i, b)| (&b.id, i))
         .collect();
@@ -93,7 +98,10 @@ pub fn sync_block_cell_buffers(
         };
 
         // Run if content changed OR if this is the first render pass
-        if block_cell.last_render_version.map_or(false, |v| v >= doc_version) {
+        if block_cell
+            .last_render_version
+            .is_some_and(|v| v >= doc_version)
+        {
             continue;
         }
 
@@ -123,9 +131,13 @@ pub fn sync_block_cell_buffers(
         let base_color = block_color(block, &theme);
 
         // Rainbow effect for user text
-        let rainbow = theme.font_rainbow && block.kind == kaijutsu_crdt::BlockKind::Text && block.role == kaijutsu_crdt::Role::User;
+        let rainbow = theme.font_rainbow
+            && block.kind == kaijutsu_crdt::BlockKind::Text
+            && block.role == kaijutsu_crdt::Role::User;
         if block_cell.last_rainbow != rainbow {
-            commands.entity(entity).insert(crate::text::KjTextEffects { rainbow });
+            commands
+                .entity(entity)
+                .insert(crate::text::KjTextEffects { rainbow });
             block_cell.last_rainbow = rainbow;
         }
 
@@ -138,50 +150,65 @@ pub fn sync_block_cell_buffers(
 
         // Rich content rendering for Text blocks from Model or Tool roles (markdown, sparklines, SVG)
         let is_rich_candidate = block.kind == kaijutsu_crdt::BlockKind::Text
-            && matches!(block.role, kaijutsu_crdt::Role::Model | kaijutsu_crdt::Role::Tool);
+            && matches!(
+                block.role,
+                kaijutsu_crdt::Role::Model | kaijutsu_crdt::Role::Tool
+            );
         // ToolResult blocks with an explicit content_type (e.g. text/markdown from `kj help`)
-        let is_typed_result = block.kind == kaijutsu_crdt::BlockKind::ToolResult
-            && block.content_type.is_some();
+        let is_typed_result =
+            block.kind == kaijutsu_crdt::BlockKind::ToolResult && block.content_type.is_some();
         // Rich content for ToolResult blocks with structured OutputData
         let is_output_candidate = block.kind == kaijutsu_crdt::BlockKind::ToolResult
             && block.output.is_some()
             && !block.is_error;
 
         let mut actually_rich = false;
-        if is_rich_candidate {
-            if let Some(rich) = crate::text::rich::detect_rich_content_typed(&text, doc_version, block.content_type.as_deref()) {
-                // For sparklines: clear text so Parley won't fight min_height
-                let is_sparkline = matches!(rich.kind, crate::text::rich::RichContentKind::Sparkline(_));
-                if is_sparkline {
-                    vello_text.value = String::new();
-                }
-                vello_text.style.brush = bevy_color_to_brush(Color::NONE);
-                commands.entity(entity).insert(rich);
-                actually_rich = true;
-                block_cell.is_rich = true;
+        if is_rich_candidate
+            && let Some(rich) = crate::text::rich::detect_rich_content_typed(
+                &text,
+                doc_version,
+                block.content_type.as_deref(),
+            )
+        {
+            // For sparklines: clear text so Parley won't fight min_height
+            let is_sparkline =
+                matches!(rich.kind, crate::text::rich::RichContentKind::Sparkline(_));
+            if is_sparkline {
+                vello_text.value = String::new();
             }
+            vello_text.style.brush = bevy_color_to_brush(Color::NONE);
+            commands.entity(entity).insert(rich);
+            actually_rich = true;
+            block_cell.is_rich = true;
         }
-        if !actually_rich && is_typed_result {
-            if let Some(rich) = crate::text::rich::detect_rich_content_typed(&text, doc_version, block.content_type.as_deref()) {
-                vello_text.style.brush = bevy_color_to_brush(Color::NONE);
-                commands.entity(entity).insert(rich);
-                actually_rich = true;
-                block_cell.is_rich = true;
-            }
+        if !actually_rich
+            && is_typed_result
+            && let Some(rich) = crate::text::rich::detect_rich_content_typed(
+                &text,
+                doc_version,
+                block.content_type.as_deref(),
+            )
+        {
+            vello_text.style.brush = bevy_color_to_brush(Color::NONE);
+            commands.entity(entity).insert(rich);
+            actually_rich = true;
+            block_cell.is_rich = true;
         }
-        if !actually_rich && is_output_candidate {
-            if let Some(ref output) = block.output {
-                if let Some(rich) = crate::text::rich::detect_output_content(output, doc_version) {
-                    vello_text.style.brush = bevy_color_to_brush(Color::NONE);
-                    commands.entity(entity).insert(rich);
-                    actually_rich = true;
-                    block_cell.is_rich = true;
-                }
-            }
+        if !actually_rich
+            && is_output_candidate
+            && let Some(ref output) = block.output
+            && let Some(rich) = crate::text::rich::detect_output_content(output, doc_version)
+        {
+            vello_text.style.brush = bevy_color_to_brush(Color::NONE);
+            commands.entity(entity).insert(rich);
+            actually_rich = true;
+            block_cell.is_rich = true;
         }
         if !actually_rich {
             commands.entity(entity).remove::<crate::text::RichContent>();
-            commands.entity(entity).remove::<bevy_vello::prelude::UiVelloScene>();
+            commands
+                .entity(entity)
+                .remove::<bevy_vello::prelude::UiVelloScene>();
             block_cell.is_rich = false;
         }
 
@@ -224,10 +251,7 @@ pub fn sync_block_cell_buffers(
 /// - `sync_block_cell_buffers` only runs when doc content changes
 /// - This needs to run whenever the layout width changes (window resize, etc.)
 pub fn sync_text_max_advance(
-    mut block_cells: Query<
-        (&mut UiVelloText, &ComputedNode),
-        With<BlockCell>,
-    >,
+    mut block_cells: Query<(&mut UiVelloText, &ComputedNode), With<BlockCell>>,
 ) {
     for (mut vello_text, computed_node) in block_cells.iter_mut() {
         let width = computed_node.size().x;
@@ -274,8 +298,10 @@ pub fn layout_block_cells(
     };
 
     let blocks_ordered = editor.blocks();
-    let block_lookup: std::collections::HashMap<kaijutsu_crdt::BlockId, &kaijutsu_crdt::BlockSnapshot> =
-        blocks_ordered.iter().map(|b| (b.id, b)).collect();
+    let block_lookup: std::collections::HashMap<
+        kaijutsu_crdt::BlockId,
+        &kaijutsu_crdt::BlockSnapshot,
+    > = blocks_ordered.iter().map(|b| (b.id, b)).collect();
 
     for &entity in container.block_cells.values() {
         let Ok((block_cell, mut block_layout)) = block_cells.get_mut(entity) else {
@@ -311,12 +337,15 @@ pub fn layout_block_cells(
 pub fn update_block_cell_nodes(
     entities: Res<EditorEntities>,
     containers: Query<&BlockCellContainer>,
-    mut block_cells: Query<(
-        &BlockCellLayout,
-        &mut Node,
-        Option<&crate::cell::block_border::BlockBorderStyle>,
-        Option<&crate::text::RichContent>,
-    ), With<BlockCell>>,
+    mut block_cells: Query<
+        (
+            &BlockCellLayout,
+            &mut Node,
+            Option<&crate::cell::block_border::BlockBorderStyle>,
+            Option<&crate::text::RichContent>,
+        ),
+        With<BlockCell>,
+    >,
     mut role_header_nodes: Query<&mut Node, (With<RoleGroupBorder>, Without<BlockCell>)>,
     layout_gen: Res<LayoutGeneration>,
     theme: Res<Theme>,
@@ -350,14 +379,20 @@ pub fn update_block_cell_nodes(
         };
 
         // Tiny gap for OpenBottom (ToolCall → ToolResult) so the divider line has breathing room
-        let bottom_spacing = if border_style.map(|s| s.kind) == Some(crate::cell::block_border::BorderKind::OpenBottom) {
+        let bottom_spacing = if border_style.map(|s| s.kind)
+            == Some(crate::cell::block_border::BorderKind::OpenBottom)
+        {
             1.0
         } else {
             theme.block_spacing
         };
         // Bordered blocks need horizontal margin so the stroke isn't clipped at the node edge.
         // Use stroke width as the margin — just enough to clear the stroke on each side.
-        let h_margin = if border_style.is_some() { theme.block_border_thickness } else { 0.0 };
+        let h_margin = if border_style.is_some() {
+            theme.block_border_thickness
+        } else {
+            0.0
+        };
         let target_margin = UiRect {
             left: Val::Px(layout.indent_level as f32 * INDENT_WIDTH + h_margin),
             right: Val::Px(h_margin),
@@ -449,10 +484,8 @@ pub fn reorder_conversation_children(
 
         if !dominated_by_border {
             let is_transition = prev_role != Some(block.role);
-            if is_transition {
-                if let Some(&header_ent) = header_map.get(&block.id) {
-                    ordered_children.push(header_ent);
-                }
+            if is_transition && let Some(&header_ent) = header_map.get(&block.id) {
+                ordered_children.push(header_ent);
             }
             prev_role = Some(block.role);
         }
@@ -465,12 +498,15 @@ pub fn reorder_conversation_children(
     let order_matches = current_children
         .map(|children| {
             children.len() == ordered_children.len()
-                && children.iter().zip(ordered_children.iter()).all(|(a, b)| a == *b)
+                && children
+                    .iter()
+                    .zip(ordered_children.iter())
+                    .all(|(a, b)| a == *b)
         })
         .unwrap_or(false);
 
-    if !order_matches {
-        if let Ok(mut ec) = commands.get_entity(conv_entity) { ec.replace_children(&ordered_children); }
+    if !order_matches && let Ok(mut ec) = commands.get_entity(conv_entity) {
+        ec.replace_children(&ordered_children);
     }
 }
 
@@ -505,11 +541,12 @@ pub fn readback_block_heights(
                 _ => 0.0,
             };
 
-            if let Ok(mut layout) = block_layouts.get_mut(child) {
-                if (layout.y_offset - y_offset).abs() > 0.5 || (layout.height - height).abs() > 0.5 {
-                    layout.y_offset = y_offset;
-                    layout.height = height;
-                }
+            if let Ok(mut layout) = block_layouts.get_mut(child)
+                && ((layout.y_offset - y_offset).abs() > 0.5
+                    || (layout.height - height).abs() > 0.5)
+            {
+                layout.y_offset = y_offset;
+                layout.height = height;
             }
 
             y_offset += height + margin_bottom;
@@ -520,10 +557,10 @@ pub fn readback_block_heights(
                 _ => 0.0,
             };
 
-            if let Ok(mut layout) = header_layouts.get_mut(child) {
-                if (layout.y_offset - y_offset).abs() > 0.5 {
-                    layout.y_offset = y_offset;
-                }
+            if let Ok(mut layout) = header_layouts.get_mut(child)
+                && (layout.y_offset - y_offset).abs() > 0.5
+            {
+                layout.y_offset = y_offset;
             }
 
             y_offset += height + margin_bottom;
@@ -546,7 +583,11 @@ pub fn readback_block_heights(
 /// Rebuild role group border Vello scenes when ComputedNode changes.
 pub fn update_role_group_scenes(
     mut role_borders: Query<
-        (&RoleGroupBorder, &mut bevy_vello::prelude::UiVelloScene, &ComputedNode),
+        (
+            &RoleGroupBorder,
+            &mut bevy_vello::prelude::UiVelloScene,
+            &ComputedNode,
+        ),
         Changed<ComputedNode>,
     >,
     fonts: Res<Assets<VelloFont>>,
@@ -609,11 +650,8 @@ pub fn highlight_focused_block(
         return;
     };
 
-    let blocks: std::collections::HashMap<_, _> = editor
-        .blocks()
-        .into_iter()
-        .map(|b| (b.id, b))
-        .collect();
+    let blocks: std::collections::HashMap<_, _> =
+        editor.blocks().into_iter().map(|b| (b.id, b)).collect();
 
     for (block_cell, mut vello_text) in focused_cells.iter_mut() {
         // Skip rich content blocks — their UiVelloText brush must stay transparent
@@ -670,10 +708,13 @@ pub fn cull_offscreen_blocks(
         let block_top = layout.y_offset;
         let block_bottom = layout.y_offset + layout.height;
         let should_show = block_bottom >= top && block_top <= bottom;
-        let target = if should_show { Visibility::Inherited } else { Visibility::Hidden };
+        let target = if should_show {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
         if *vis != target {
             *vis = target;
         }
     }
 }
-

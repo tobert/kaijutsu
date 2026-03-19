@@ -86,9 +86,7 @@ impl SyncedInput {
 
     /// Get current text content.
     pub fn text(&self) -> String {
-        self.doc
-            .text_content(&[INPUT_TEXT_KEY])
-            .unwrap_or_default()
+        self.doc.text_content(&[INPUT_TEXT_KEY]).unwrap_or_default()
     }
 
     /// Apply remote ops (from `InputTextOps` server event).
