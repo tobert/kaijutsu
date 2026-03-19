@@ -32,7 +32,7 @@ impl KjDispatcher {
     }
 
     fn preset_list(&self) -> KjResult {
-        let db = self.kernel_db().lock().unwrap();
+        let db = self.kernel_db().lock();
         match db.list_presets(self.kernel_id()) {
             Ok(presets) => {
                 if presets.is_empty() {
@@ -66,7 +66,7 @@ impl KjDispatcher {
             None => return KjResult::Err("kj preset show: requires a label".to_string()),
         };
 
-        let db = self.kernel_db().lock().unwrap();
+        let db = self.kernel_db().lock();
         match db.get_preset_by_label(self.kernel_id(), label) {
             Ok(Some(p)) => {
                 let mut lines = vec![
@@ -136,7 +136,7 @@ impl KjDispatcher {
             None => kaijutsu_types::ConsentMode::Collaborative,
         };
 
-        let db = self.kernel_db().lock().unwrap();
+        let db = self.kernel_db().lock();
         let kernel_id = self.kernel_id();
 
         // Check if preset already exists → update
@@ -190,7 +190,7 @@ impl KjDispatcher {
             None => return KjResult::Err("kj preset remove: requires a label".to_string()),
         };
 
-        let db = self.kernel_db().lock().unwrap();
+        let db = self.kernel_db().lock();
         let kernel_id = self.kernel_id();
 
         let preset = match db.get_preset_by_label(kernel_id, label) {

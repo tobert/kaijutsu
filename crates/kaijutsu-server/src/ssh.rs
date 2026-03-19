@@ -8,6 +8,7 @@ use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
@@ -113,6 +114,8 @@ pub struct SshServerConfig {
     pub config_dir: Option<PathBuf>,
     /// Data directory override. None = use XDG default (~/.local/share/kaijutsu/kernel).
     pub data_dir: Option<PathBuf>,
+    /// Maximum number of concurrent SSH connections. Default: 100.
+    pub max_connections: usize,
 }
 
 impl SshServerConfig {
@@ -136,6 +139,7 @@ impl SshServerConfig {
             allow_anonymous: true, // Tests need to accept any key
             config_dir: Some(config_dir.clone()),
             data_dir: Some(config_dir),
+            max_connections: 100,
         }
     }
 
@@ -148,6 +152,7 @@ impl SshServerConfig {
             allow_anonymous: false,
             config_dir: None, // Use XDG default
             data_dir: None,   // Use XDG default
+            max_connections: 100,
         }
     }
 
@@ -317,10 +322,15 @@ impl SshServer {
 
         log::info!("Shared kernel created: {}", registry.kernel.name);
 
+        let active_connections = Arc::new(AtomicUsize::new(0));
+        log::info!("Max connections: {}", self.config.max_connections);
+
         let mut server = Server {
             auth_db: Arc::new(Mutex::new(auth_db)),
             allow_anonymous,
             registry,
+            active_connections,
+            max_connections: self.config.max_connections,
         };
 
         server
@@ -336,6 +346,10 @@ struct Server {
     allow_anonymous: bool,
     /// Shared kernel and MCP pool (created at server startup)
     registry: Arc<ServerRegistry>,
+    /// Number of currently active SSH connections.
+    active_connections: Arc<AtomicUsize>,
+    /// Maximum allowed concurrent connections.
+    max_connections: usize,
 }
 
 impl server::Server for Server {
@@ -347,6 +361,8 @@ impl server::Server for Server {
             peer_addr,
             self.allow_anonymous,
             self.registry.clone(),
+            self.active_connections.clone(),
+            self.max_connections,
         )
     }
 
@@ -365,6 +381,12 @@ struct ConnectionHandler {
     registry: Arc<ServerRegistry>,
     /// Channel index counter — only channel 1 (RPC) gets a handler thread
     channel_count: u32,
+    /// Shared counter of active connections (decremented on drop).
+    active_connections: Arc<AtomicUsize>,
+    /// Maximum allowed concurrent connections.
+    max_connections: usize,
+    /// Whether this handler has been counted in active_connections.
+    counted: bool,
 }
 
 impl ConnectionHandler {
@@ -373,6 +395,8 @@ impl ConnectionHandler {
         peer_addr: Option<SocketAddr>,
         allow_anonymous: bool,
         registry: Arc<ServerRegistry>,
+        active_connections: Arc<AtomicUsize>,
+        max_connections: usize,
     ) -> Self {
         Self {
             auth_db,
@@ -381,6 +405,22 @@ impl ConnectionHandler {
             identity: None,
             registry,
             channel_count: 0,
+            active_connections,
+            max_connections,
+            counted: false,
+        }
+    }
+}
+
+impl Drop for ConnectionHandler {
+    fn drop(&mut self) {
+        if self.counted {
+            let prev = self.active_connections.fetch_sub(1, Ordering::Relaxed);
+            log::debug!(
+                "Connection closed for {:?}, active connections: {}",
+                self.peer_addr,
+                prev - 1,
+            );
         }
     }
 }
@@ -445,6 +485,30 @@ impl server::Handler for ConnectionHandler {
                 return Ok(false);
             }
         };
+
+        // On the first channel open for this connection, claim a slot in the
+        // active-connections counter. Reject if we're at capacity.
+        if !self.counted {
+            let current = self.active_connections.fetch_add(1, Ordering::Relaxed);
+            if current >= self.max_connections {
+                self.active_connections.fetch_sub(1, Ordering::Relaxed);
+                log::warn!(
+                    "Connection rejected for {} ({:?}): at capacity ({}/{})",
+                    principal.username,
+                    self.peer_addr,
+                    current,
+                    self.max_connections,
+                );
+                return Ok(false);
+            }
+            self.counted = true;
+            log::debug!(
+                "Connection accepted for {} ({:?}), active connections: {}",
+                principal.username,
+                self.peer_addr,
+                current + 1,
+            );
+        }
 
         let channel_index = self.channel_count;
         self.channel_count += 1;
@@ -551,6 +615,20 @@ impl server::Handler for ConnectionHandler {
                     let safe_user = sanitize_username(user);
                     if safe_user.is_empty() {
                         log::warn!("Anonymous auth rejected: empty username after sanitization");
+                        return Ok(Auth::Reject {
+                            proceed_with_methods: None,
+                            partial_success: false,
+                        });
+                    }
+
+                    const RESERVED: &[&str] =
+                        &["root", "admin", "system", "nobody", "daemon"];
+                    if RESERVED.contains(&safe_user.as_str())
+                        || safe_user.chars().all(|c| c.is_ascii_digit())
+                    {
+                        log::warn!(
+                            "Anonymous auth rejected: reserved username '{safe_user}'"
+                        );
                         return Ok(Auth::Reject {
                             proceed_with_methods: None,
                             partial_success: false,

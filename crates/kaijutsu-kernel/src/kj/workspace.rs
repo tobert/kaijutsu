@@ -34,7 +34,7 @@ impl KjDispatcher {
     }
 
     fn workspace_list(&self) -> KjResult {
-        let db = self.kernel_db().lock().unwrap();
+        let db = self.kernel_db().lock();
         match db.list_workspaces(self.kernel_id()) {
             Ok(workspaces) => {
                 if workspaces.is_empty() {
@@ -63,7 +63,7 @@ impl KjDispatcher {
             None => return KjResult::Err("kj workspace show: requires a label".to_string()),
         };
 
-        let db = self.kernel_db().lock().unwrap();
+        let db = self.kernel_db().lock();
         match db.get_workspace_by_label(self.kernel_id(), label) {
             Ok(Some(w)) => {
                 let mut lines = vec![format!("Workspace: {}", w.label)];
@@ -104,7 +104,7 @@ impl KjDispatcher {
         let desc = extract_named_arg(argv, &["--desc", "--description"]);
         let paths = extract_all_named_args(argv, &["--path"]);
 
-        let db = self.kernel_db().lock().unwrap();
+        let db = self.kernel_db().lock();
         let kernel_id = self.kernel_id();
         let ws_id = WorkspaceId::new();
 
@@ -155,7 +155,7 @@ impl KjDispatcher {
 
         let read_only = has_flag(argv, &["--read-only"]);
 
-        let db = self.kernel_db().lock().unwrap();
+        let db = self.kernel_db().lock();
         let kernel_id = self.kernel_id();
 
         let ws = match db.get_workspace_by_label(kernel_id, label) {
@@ -183,7 +183,7 @@ impl KjDispatcher {
             None => return KjResult::Err("kj workspace bind: requires a workspace label".to_string()),
         };
 
-        let db = self.kernel_db().lock().unwrap();
+        let db = self.kernel_db().lock();
         let kernel_id = self.kernel_id();
 
         let ctx_arg = argv.get(2).map(|s| s.as_str());
@@ -234,7 +234,7 @@ impl KjDispatcher {
             None => return KjResult::Err("kj workspace remove: requires a label".to_string()),
         };
 
-        let db = self.kernel_db().lock().unwrap();
+        let db = self.kernel_db().lock();
         let kernel_id = self.kernel_id();
 
         let ws = match db.get_workspace_by_label(kernel_id, label) {

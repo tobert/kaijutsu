@@ -117,7 +117,7 @@ impl KjDispatcher {
 
         // Write-through: KernelDb then DriftRouter
         {
-            let db = self.kernel_db().lock().unwrap();
+            let db = self.kernel_db().lock();
 
             // Inherit workspace from source
             let source_ws = db.get_context(source_id).ok()
@@ -246,24 +246,21 @@ impl KjDispatcher {
             Err(e) => return KjResult::Err(format!("kj fork --shallow: {e}")),
         };
 
-        // Get current version for the source document
-        let version = self.block_store().get(source_id)
-            .map(|e| e.version())
-            .unwrap_or(0);
-
-        // Shallow fork with block filter
+        // Shallow fork with block filter — include all blocks up to now;
+        // max_blocks handles truncation to the most recent N.
         let filter = kaijutsu_crdt::ForkBlockFilter {
             max_blocks: Some(depth),
             exclude_compacted: true,
             ..Default::default()
         };
-        if let Err(e) = self.block_store().fork_document_filtered(source_id, new_id, version, &filter) {
+        let before_timestamp = kaijutsu_types::now_millis();
+        if let Err(e) = self.block_store().fork_document_filtered(source_id, new_id, before_timestamp, &filter) {
             return KjResult::Err(format!("kj fork --shallow: {e}"));
         }
 
         // Write-through
         {
-            let db = self.kernel_db().lock().unwrap();
+            let db = self.kernel_db().lock();
 
             let source_ws = db.get_context(source_id).ok()
                 .flatten()
@@ -421,7 +418,7 @@ impl KjDispatcher {
 
         // Write-through: KernelDb then DriftRouter
         {
-            let db = self.kernel_db().lock().unwrap();
+            let db = self.kernel_db().lock();
 
             let source_ws = db.get_context(source_id).ok()
                 .flatten()
@@ -523,7 +520,7 @@ impl KjDispatcher {
 
         // Resolve template root
         let template_root_id = {
-            let db = self.kernel_db().lock().unwrap();
+            let db = self.kernel_db().lock();
             match db.resolve_context(kernel_id, &template_ref) {
                 Ok(id) => id,
                 Err(e) => return KjResult::Err(format!("kj fork --as: {e}")),
@@ -532,7 +529,7 @@ impl KjDispatcher {
 
         // Get the template subtree shape
         let template_nodes = {
-            let db = self.kernel_db().lock().unwrap();
+            let db = self.kernel_db().lock();
             match db.subtree_snapshot(template_root_id) {
                 Ok(nodes) => nodes,
                 Err(e) => return KjResult::Err(format!("kj fork --as: {e}")),
@@ -569,7 +566,7 @@ impl KjDispatcher {
 
         // Create new contexts (BFS order — template_nodes is already ordered by depth)
         {
-            let db = self.kernel_db().lock().unwrap();
+            let db = self.kernel_db().lock();
 
             for (row, _depth) in &template_nodes {
                 let new_id = id_map[&row.context_id];
@@ -702,7 +699,7 @@ impl KjDispatcher {
     async fn apply_preset(&self, context_id: ContextId, preset_label: &str) -> Result<(), String> {
         let kernel_id = self.kernel_id();
         let preset = {
-            let db = self.kernel_db().lock().unwrap();
+            let db = self.kernel_db().lock();
             db.get_preset_by_label(kernel_id, preset_label)
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| format!("preset '{}' not found", preset_label))?
@@ -710,7 +707,7 @@ impl KjDispatcher {
 
         // Update DB
         {
-            let db = self.kernel_db().lock().unwrap();
+            let db = self.kernel_db().lock();
             if preset.provider.is_some() || preset.model.is_some() {
                 db.update_model(
                     context_id,
@@ -791,7 +788,7 @@ mod tests {
         assert!(result.message().contains("branch"), "msg: {}", result.message());
 
         // Verify new context exists in DB
-        let db = d.kernel_db().lock().unwrap();
+        let db = d.kernel_db().lock();
         let contexts = db.list_active_contexts(d.kernel_id()).unwrap();
         assert!(contexts.iter().any(|r| r.label.as_deref() == Some("branch")));
     }
@@ -867,7 +864,7 @@ mod tests {
 
         // Set shell config and env on source
         {
-            let db = d.kernel_db().lock().unwrap();
+            let db = d.kernel_db().lock();
             db.upsert_context_shell(&crate::kernel_db::ContextShellRow {
                 context_id: source,
                 cwd: Some("/home/user/project".into()),
@@ -883,7 +880,7 @@ mod tests {
         assert!(result.is_ok(), "fork failed: {}", result.message());
 
         // Find the new context and verify config was copied
-        let db = d.kernel_db().lock().unwrap();
+        let db = d.kernel_db().lock();
         let child = db.find_context_by_label(d.kernel_id(), "child").unwrap().unwrap();
         let shell = db.get_context_shell(child.context_id).unwrap().unwrap();
         assert_eq!(shell.cwd, Some("/home/user/project".into()));
@@ -902,7 +899,7 @@ mod tests {
 
         // Set cwd on source
         {
-            let db = d.kernel_db().lock().unwrap();
+            let db = d.kernel_db().lock();
             db.upsert_context_shell(&crate::kernel_db::ContextShellRow {
                 context_id: source,
                 cwd: Some("/home/user/project".into()),
@@ -918,7 +915,7 @@ mod tests {
         ).await;
         assert!(result.is_ok(), "fork failed: {}", result.message());
 
-        let db = d.kernel_db().lock().unwrap();
+        let db = d.kernel_db().lock();
         let child = db.find_context_by_label(d.kernel_id(), "research").unwrap().unwrap();
         let shell = db.get_context_shell(child.context_id).unwrap().unwrap();
         assert_eq!(shell.cwd, Some("/home/user/src/bevy_vello".into()));
@@ -962,7 +959,7 @@ mod tests {
         assert!(result.is_ok(), "fork failed: {}", result.message());
 
         // Verify child inherited provider+model in DB
-        let db = d.kernel_db().lock().unwrap();
+        let db = d.kernel_db().lock();
         let child = db.find_context_by_label(d.kernel_id(), "child").unwrap().unwrap();
         assert_eq!(child.provider.as_deref(), Some("mock"), "child should inherit parent provider");
         assert_eq!(child.model.as_deref(), Some("mock-model"), "child should inherit parent model");
@@ -988,7 +985,7 @@ mod tests {
         assert!(result.is_ok(), "fork failed: {}", result.message());
 
         // Verify child has overridden model in DB
-        let db = d.kernel_db().lock().unwrap();
+        let db = d.kernel_db().lock();
         let child = db.find_context_by_label(d.kernel_id(), "override").unwrap().unwrap();
         assert_eq!(child.provider.as_deref(), Some("mock"));
         assert_eq!(child.model.as_deref(), Some("custom-model"));
@@ -1023,7 +1020,7 @@ mod tests {
         );
 
         // Verify no context was created (mutation didn't happen)
-        let db = d.kernel_db().lock().unwrap();
+        let db = d.kernel_db().lock();
         let found = db.find_context_by_label(d.kernel_id(), "bad").unwrap();
         assert!(found.is_none(), "no context should have been created for invalid provider");
     }
@@ -1057,7 +1054,7 @@ mod tests {
         assert!(result.is_ok(), "fork failed: {}", result.message());
 
         // Verify provider was resolved from registry default
-        let db = d.kernel_db().lock().unwrap();
+        let db = d.kernel_db().lock();
         let child = db.find_context_by_label(d.kernel_id(), "bare").unwrap().unwrap();
         assert_eq!(child.provider.as_deref(), Some("mock"), "provider should be resolved from registry");
         assert_eq!(child.model.as_deref(), Some("new-model"));
@@ -1103,7 +1100,7 @@ mod tests {
         // Bind a workspace to source
         let ws_id = kaijutsu_types::WorkspaceId::new();
         {
-            let db = d.kernel_db().lock().unwrap();
+            let db = d.kernel_db().lock();
             db.insert_workspace(&crate::kernel_db::WorkspaceRow {
                 workspace_id: ws_id,
                 kernel_id: d.kernel_id(),
@@ -1120,7 +1117,7 @@ mod tests {
         let result = d.dispatch(&[s("fork"), s("--name"), s("child")], &c).await;
         assert!(result.is_ok(), "fork failed: {}", result.message());
 
-        let db = d.kernel_db().lock().unwrap();
+        let db = d.kernel_db().lock();
         let child = db.find_context_by_label(d.kernel_id(), "child").unwrap().unwrap();
         assert_eq!(child.workspace_id, Some(ws_id));
     }

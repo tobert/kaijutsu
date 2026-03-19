@@ -117,7 +117,7 @@ impl KjResult {
 pub struct KjDispatcher {
     drift: SharedDriftRouter,
     blocks: SharedBlockStore,
-    kernel_db: Arc<std::sync::Mutex<KernelDb>>,
+    kernel_db: Arc<parking_lot::Mutex<KernelDb>>,
     kernel_id: KernelId,
     kernel: Arc<Kernel>,
 }
@@ -126,7 +126,7 @@ impl KjDispatcher {
     pub fn new(
         drift: SharedDriftRouter,
         blocks: SharedBlockStore,
-        kernel_db: Arc<std::sync::Mutex<KernelDb>>,
+        kernel_db: Arc<parking_lot::Mutex<KernelDb>>,
         kernel_id: KernelId,
         kernel: Arc<Kernel>,
     ) -> Self {
@@ -171,7 +171,7 @@ impl KjDispatcher {
         &self.blocks
     }
 
-    pub fn kernel_db(&self) -> &Arc<std::sync::Mutex<KernelDb>> {
+    pub fn kernel_db(&self) -> &Arc<parking_lot::Mutex<KernelDb>> {
         &self.kernel_db
     }
 
@@ -239,13 +239,13 @@ pub(crate) mod test_helpers {
     pub async fn test_dispatcher() -> KjDispatcher {
         let drift = shared_drift_router();
         let blocks = shared_block_store(PrincipalId::system());
-        let kernel_db = Arc::new(std::sync::Mutex::new(
+        let kernel_db = Arc::new(parking_lot::Mutex::new(
             KernelDb::in_memory().expect("in-memory KernelDb"),
         ));
         let kernel_id = KernelId::new();
         // Create default workspace for test contexts
         {
-            let db = kernel_db.lock().unwrap();
+            let db = kernel_db.lock();
             db.get_or_create_default_workspace(kernel_id, PrincipalId::system()).unwrap();
         }
         let kernel = Arc::new(Kernel::new("test").await);
@@ -294,7 +294,7 @@ pub(crate) mod test_helpers {
 
         // Insert document + context into KernelDb
         {
-            let db = dispatcher.kernel_db().lock().unwrap();
+            let db = dispatcher.kernel_db().lock();
             let ws_id = db.get_or_create_default_workspace(kernel_id, created_by).unwrap();
 
             // Document row first (contexts FK to documents)

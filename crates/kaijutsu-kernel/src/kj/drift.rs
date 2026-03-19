@@ -113,7 +113,7 @@ impl KjDispatcher {
 
         // Resolve source context
         let source_id = {
-            let db = self.kernel_db().lock().unwrap();
+            let db = self.kernel_db().lock();
             match refs::resolve_context_arg(Some(src_query), caller, &db, self.kernel_id()) {
                 Ok(id) => id,
                 Err(e) => return KjResult::Err(format!("kj drift pull: {e}")),
@@ -157,7 +157,7 @@ impl KjDispatcher {
 
         // Record drift edge
         {
-            let db = self.kernel_db().lock().unwrap();
+            let db = self.kernel_db().lock();
             let edge = crate::kernel_db::ContextEdgeRow {
                 edge_id: uuid::Uuid::now_v7(),
                 source_id,
@@ -189,14 +189,14 @@ impl KjDispatcher {
         // kj drift merge [ctx]
         // Default target = caller's forked_from parent
         let target_id = if let Some(target_query) = argv.get(1) {
-            let db = self.kernel_db().lock().unwrap();
+            let db = self.kernel_db().lock();
             match refs::resolve_context_arg(Some(target_query.as_str()), caller, &db, self.kernel_id()) {
                 Ok(id) => id,
                 Err(e) => return KjResult::Err(format!("kj drift merge: {e}")),
             }
         } else {
             // Default: forked_from parent
-            let db = self.kernel_db().lock().unwrap();
+            let db = self.kernel_db().lock();
             let row = match db.get_context(caller.context_id) {
                 Ok(Some(r)) => r,
                 Ok(None) => return KjResult::Err("kj drift merge: current context not found in db".to_string()),
@@ -238,7 +238,7 @@ impl KjDispatcher {
 
         // Record drift edge
         {
-            let db = self.kernel_db().lock().unwrap();
+            let db = self.kernel_db().lock();
             let edge = crate::kernel_db::ContextEdgeRow {
                 edge_id: uuid::Uuid::now_v7(),
                 source_id: caller.context_id,
@@ -254,7 +254,7 @@ impl KjDispatcher {
 
         // Preview: first ~200 chars
         let target_label = {
-            let db = self.kernel_db().lock().unwrap();
+            let db = self.kernel_db().lock();
             db.get_context(target_id)
                 .ok()
                 .flatten()
@@ -382,7 +382,7 @@ impl KjDispatcher {
 
     /// `kj drift history [ctx]` — show drift history (edges) for a context.
     fn drift_history(&self, argv: &[String], caller: &KjCaller) -> KjResult {
-        let db = self.kernel_db().lock().unwrap();
+        let db = self.kernel_db().lock();
         let kernel_id = self.kernel_id();
 
         let target_arg = argv.get(1).map(|s| s.as_str());

@@ -178,6 +178,8 @@ impl Embedder for OnnxEmbedder {
         // emb_shape is [batch_size, seq_len, dims] (deref to &[i64])
         let dims = emb_shape.get(2).copied().unwrap_or(self.dims as i64) as usize;
         let actual_seq_len = emb_shape.get(1).copied().unwrap_or(seq_len as i64) as usize;
+        assert!(actual_seq_len <= seq_len,
+            "ONNX output seq_len ({actual_seq_len}) exceeds input seq_len ({seq_len})");
 
         // Mean-pool over sequence length, respecting attention mask
         let mut results = Vec::with_capacity(batch_size);

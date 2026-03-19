@@ -70,7 +70,7 @@ impl KjBuiltin {
 
     /// Load context shell config (cwd + env vars) from KernelDb and apply to ExecContext.
     fn apply_context_config(&self, context_id: ContextId, ctx: &mut ExecContext) {
-        let db = self.dispatcher.kernel_db().lock().unwrap();
+        let db = self.dispatcher.kernel_db().lock();
 
         // Apply cwd
         if let Ok(Some(shell)) = db.get_context_shell(context_id) {
@@ -117,7 +117,7 @@ impl KjBuiltin {
 
         let kernel_id = self.dispatcher.kernel_id();
         let contexts = {
-            let db = self.dispatcher.kernel_db().lock().unwrap();
+            let db = self.dispatcher.kernel_db().lock();
             match db.list_active_contexts(kernel_id) {
                 Ok(rows) => rows,
                 Err(e) => return ExecResult::failure(1, format!("failed to list contexts: {e}")),
@@ -198,7 +198,7 @@ impl KjBuiltin {
         let parsed = kaijutsu_kernel::kj::refs::parse_context_ref(ctx_ref);
         let kernel_id = self.dispatcher.kernel_id();
         let ctx_id = {
-            let db = self.dispatcher.kernel_db().lock().unwrap();
+            let db = self.dispatcher.kernel_db().lock();
             match kaijutsu_kernel::kj::refs::resolve_context_ref(&parsed, caller, &db, kernel_id) {
                 Ok(id) => id,
                 Err(e) => return ExecResult::failure(1, e),

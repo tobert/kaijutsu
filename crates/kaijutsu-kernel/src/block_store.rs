@@ -68,7 +68,7 @@ pub enum BlockStoreError {
 pub type BlockStoreResult<T> = Result<T, BlockStoreError>;
 
 /// Thread-safe database handle (unified KernelDb).
-pub type DbHandle = Arc<std::sync::Mutex<KernelDb>>;
+pub type DbHandle = Arc<parking_lot::Mutex<KernelDb>>;
 
 /// Entry for a document in the store.
 pub struct DocumentEntry {
@@ -281,7 +281,7 @@ impl BlockStore {
 
                 // Persist metadata if we have a DB
                 if let Some(db) = &self.db {
-                    let db_guard = db.lock().map_err(|e| BlockStoreError::Db(e.to_string()))?;
+                    let db_guard = db.lock();
                     let row = DocumentRow {
                         document_id: context_id,
                         kernel_id: self.kernel_id.unwrap_or_else(KernelId::new),
@@ -366,7 +366,7 @@ impl BlockStore {
     /// Delete a document.
     pub fn delete_document(&self, context_id: ContextId) -> BlockStoreResult<()> {
         if let Some(db) = &self.db {
-            let db_guard = db.lock().map_err(|e| BlockStoreError::Db(e.to_string()))?;
+            let db_guard = db.lock();
             db_guard
                 .delete_document(context_id)
                 .map_err(|e| BlockStoreError::Db(e.to_string()))?;
@@ -415,7 +415,7 @@ impl BlockStore {
 
         // Persist metadata if we have a DB
         if let Some(db) = &self.db {
-            let db_guard = db.lock().map_err(|e| BlockStoreError::Db(e.to_string()))?;
+            let db_guard = db.lock();
             let row = DocumentRow {
                 document_id: new_id,
                 kernel_id: self.kernel_id.unwrap_or_else(KernelId::new),
@@ -445,25 +445,25 @@ impl BlockStore {
         Ok(())
     }
 
-    /// Fork a document at a specific version, creating a copy with only blocks up to that version.
+    /// Fork a document at a specific timestamp, creating a copy with only blocks up to that time.
     ///
-    /// This creates a new document containing only blocks that existed at the given version,
+    /// This creates a new document containing only blocks with `created_at <= before_timestamp`,
     /// useful for timeline branching and "what if" explorations.
     ///
     /// # Arguments
     ///
     /// * `source_id` - ID of the document to fork
     /// * `new_id` - ID for the forked document
-    /// * `at_version` - Only include blocks with created_at <= this version
+    /// * `before_timestamp` - Only include blocks with `created_at` <= this value (wall-clock millis)
     ///
     /// # Returns
     ///
-    /// Ok(()) on success, Err if source not found, target exists, or version invalid.
+    /// Ok(()) on success, Err if source not found, target exists, or timestamp in the future.
     pub fn fork_document_at_version(
         &self,
         source_id: ContextId,
         new_id: ContextId,
-        at_version: u64,
+        before_timestamp: u64,
     ) -> BlockStoreResult<()> {
         if self.documents.contains_key(&new_id) {
             return Err(BlockStoreError::DocumentAlreadyExists(new_id));
@@ -472,24 +472,24 @@ impl BlockStore {
         let source_entry = self.get(source_id)
             .ok_or(BlockStoreError::DocumentNotFound(source_id))?;
 
-        // Validate version
-        let current_version = source_entry.version();
-        if at_version > current_version {
+        // Validate timestamp is not in the future
+        let now = kaijutsu_types::now_millis();
+        if before_timestamp > now {
             return Err(BlockStoreError::Validation(format!(
-                "Requested version {} is in the future (current: {})",
-                at_version, current_version
+                "Requested timestamp {} is in the future (now: {})",
+                before_timestamp, now
             )));
         }
 
         let agent_id = self.agent_id();
-        let forked_store = source_entry.doc.fork_at_version(new_id, agent_id, at_version);
+        let forked_store = source_entry.doc.fork_at_version(new_id, agent_id, before_timestamp);
         let kind = source_entry.kind;
         let language = source_entry.language.clone();
         drop(source_entry); // Release the read lock
 
         // Persist metadata if we have a DB
         if let Some(db) = &self.db {
-            let db_guard = db.lock().map_err(|e| BlockStoreError::Db(e.to_string()))?;
+            let db_guard = db.lock();
             let row = DocumentRow {
                 document_id: new_id,
                 kernel_id: self.kernel_id.unwrap_or_else(KernelId::new),
@@ -519,7 +519,7 @@ impl BlockStore {
         Ok(())
     }
 
-    /// Fork a document at a specific version with block filtering.
+    /// Fork a document at a specific timestamp with block filtering.
     ///
     /// Like [`fork_document_at_version`] but additionally filters blocks via `ForkBlockFilter`.
     /// Blocks that don't pass the filter are excluded from the fork.
@@ -527,7 +527,7 @@ impl BlockStore {
         &self,
         source_id: ContextId,
         new_id: ContextId,
-        at_version: u64,
+        before_timestamp: u64,
         filter: &ForkBlockFilter,
     ) -> BlockStoreResult<()> {
         if self.documents.contains_key(&new_id) {
@@ -537,23 +537,24 @@ impl BlockStore {
         let source_entry = self.get(source_id)
             .ok_or(BlockStoreError::DocumentNotFound(source_id))?;
 
-        let current_version = source_entry.version();
-        if at_version > current_version {
+        // Validate timestamp is not in the future
+        let now = kaijutsu_types::now_millis();
+        if before_timestamp > now {
             return Err(BlockStoreError::Validation(format!(
-                "Requested version {} is in the future (current: {})",
-                at_version, current_version
+                "Requested timestamp {} is in the future (now: {})",
+                before_timestamp, now
             )));
         }
 
         let agent_id = self.agent_id();
-        let forked_store = source_entry.doc.fork_filtered(new_id, agent_id, at_version, filter);
+        let forked_store = source_entry.doc.fork_filtered(new_id, agent_id, before_timestamp, filter);
         let kind = source_entry.kind;
         let language = source_entry.language.clone();
         drop(source_entry);
 
         // Persist metadata if we have a DB
         if let Some(db) = &self.db {
-            let db_guard = db.lock().map_err(|e| BlockStoreError::Db(e.to_string()))?;
+            let db_guard = db.lock();
             let row = DocumentRow {
                 document_id: new_id,
                 kernel_id: self.kernel_id.unwrap_or_else(KernelId::new),
@@ -1346,7 +1347,7 @@ impl BlockStore {
     /// The `oplog_bytes` column stores postcard-encoded StoreSnapshot.
     pub fn load_from_db(&self) -> BlockStoreResult<()> {
         let db = self.db.as_ref().ok_or(BlockStoreError::NoDatabaseConfigured)?;
-        let db_guard = db.lock().map_err(|e| BlockStoreError::Db(e.to_string()))?;
+        let db_guard = db.lock();
 
         let kernel_id = self.kernel_id.ok_or_else(|| BlockStoreError::Db("no kernel_id configured".into()))?;
         let documents = db_guard
@@ -1402,7 +1403,7 @@ impl BlockStore {
         }
 
         let db = self.db.as_ref().ok_or(BlockStoreError::NoDatabaseConfigured)?;
-        let db_guard = db.lock().map_err(|e| BlockStoreError::Db(e.to_string()))?;
+        let db_guard = db.lock();
 
         let doc = db_guard
             .get_document(context_id)
@@ -1456,7 +1457,7 @@ impl BlockStore {
 
         drop(entry); // Release the read lock before acquiring DB lock
 
-        let db_guard = db.lock().map_err(|e| BlockStoreError::Db(e.to_string()))?;
+        let db_guard = db.lock();
         db_guard
             .save_snapshot(context_id, version, &content, Some(&snapshot_bytes))
             .map_err(|e| BlockStoreError::Db(e.to_string()))?;
@@ -1499,7 +1500,7 @@ impl BlockStore {
 
                 // Persist if we have a DB
                 if let Some(db) = &self.db {
-                    let db_guard = db.lock().map_err(|e| BlockStoreError::Db(e.to_string()))?;
+                    let db_guard = db.lock();
                     let _ = db_guard.create_input_doc(context_id);
                 }
 
@@ -1586,9 +1587,8 @@ impl BlockStore {
 
         // Persist cleared state
         if let Some(db) = &self.db {
-            if let Ok(db_guard) = db.lock() {
-                let _ = db_guard.clear_input_doc(context_id);
-            }
+            let db_guard = db.lock();
+            let _ = db_guard.clear_input_doc(context_id);
         }
 
         Ok(text)
@@ -1606,7 +1606,7 @@ impl BlockStore {
         let version = entry.version() as i64;
         drop(entry);
 
-        let db_guard = db.lock().map_err(|e| BlockStoreError::Db(e.to_string()))?;
+        let db_guard = db.lock();
         db_guard.upsert_input_doc(context_id, &text, Some(&ops_bytes), version)
             .map_err(|e| BlockStoreError::Db(e.to_string()))?;
 
@@ -1616,7 +1616,7 @@ impl BlockStore {
     /// Load input documents from database on startup.
     pub fn load_input_docs_from_db(&self) -> BlockStoreResult<()> {
         let db = self.db.as_ref().ok_or(BlockStoreError::NoDatabaseConfigured)?;
-        let db_guard = db.lock().map_err(|e| BlockStoreError::Db(e.to_string()))?;
+        let db_guard = db.lock();
 
         let rows = db_guard.list_input_docs()
             .map_err(|e| BlockStoreError::Db(e.to_string()))?;

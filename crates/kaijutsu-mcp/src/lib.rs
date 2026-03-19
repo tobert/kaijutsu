@@ -60,7 +60,7 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
 use kaijutsu_client::{ActorHandle, ServerEvent, SshConfig, SyncManager, connect_ssh, spawn_actor};
-use kaijutsu_crdt::{ContextId, ConversationDAG, PrincipalId, Status};
+use kaijutsu_crdt::{BlockId, ContextId, ConversationDAG, PrincipalId, Status};
 use kaijutsu_kernel::{SharedBlockStore, shared_block_store, shared_block_flow_bus};
 use kaijutsu_kernel::block_store::DocumentKind as DocKind;
 
@@ -189,6 +189,8 @@ pub struct KaijutsuMcp {
     context_name: String,
     /// Detected agent name (e.g., "claude-code").
     agent_name: Option<String>,
+    /// Per-session principal for block authorship.
+    session_principal: PrincipalId,
 }
 
 impl std::fmt::Debug for KaijutsuMcp {
@@ -216,15 +218,14 @@ impl KaijutsuMcp {
             session_id: Arc::new(Mutex::new(None)),
             context_name: "local".to_string(),
             agent_name: None,
+            session_principal: PrincipalId::new(),
         }
     }
 
     /// Create a new MCP server with an in-memory store.
-    // TODO: consider per-session or per-system (mcp, app, etc.) PrincipalId
-    // instead of system() — multiple clients sharing a context could collide
-    // on BlockId sequences.
     pub fn new() -> Self {
-        Self::with_store(shared_block_store(PrincipalId::system()))
+        let principal = PrincipalId::new();
+        Self::with_store(shared_block_store(principal))
     }
 
     /// Connect to a running kaijutsu-server via SSH.
@@ -269,11 +270,12 @@ impl KaijutsuMcp {
         tracing::info!("RPC actor spawned, persistent connection ready");
 
         let shared_context_id = Arc::new(Mutex::new(None));
+        let session_principal = PrincipalId::new();
 
         // Create an empty store — populated by register_session
         let store = std::sync::Arc::new(
             kaijutsu_kernel::BlockStore::with_flows(
-                PrincipalId::system(),
+                session_principal,
                 shared_block_flow_bus(1024),
             )
         );
@@ -293,6 +295,7 @@ impl KaijutsuMcp {
             session_id: Arc::new(Mutex::new(cc_session_id.map(String::from))),
             context_name: context_name.to_string(),
             agent_name: cc_session_id.map(|_| "claude-code".to_string()),
+            session_principal,
         })
     }
 
@@ -392,17 +395,23 @@ impl KaijutsuMcp {
         Ok((ops_count.max(1), ack_version))
     }
 
-    /// Push local ops after a tool mutation. Logs errors but doesn't propagate —
-    /// the mutation already succeeded locally and the server echo will eventually
-    /// converge via the background event listener.
-    async fn push_after_mutation(&self) {
+    /// Push local ops after a tool mutation. Returns a warning string if the push
+    /// fails — the mutation already succeeded locally and the server echo will
+    /// eventually converge via the background event listener.
+    async fn push_after_mutation(&self) -> Option<String> {
         if self.remote().is_none() {
-            return; // Local mode, no server to push to
+            return None; // Local mode, no server to push to
         }
         match self.push_to_server().await {
-            Ok((0, _)) => {} // No ops (shouldn't happen right after mutation, but harmless)
-            Ok((n, v)) => tracing::debug!(ops = n, ack = v, "Pushed mutation ops"),
-            Err(e) => tracing::warn!("Failed to push mutation ops: {e}"),
+            Ok((0, _)) => None, // No ops (shouldn't happen right after mutation, but harmless)
+            Ok((n, v)) => {
+                tracing::debug!(ops = n, ack = v, "Pushed mutation ops");
+                None
+            }
+            Err(e) => {
+                tracing::warn!("Failed to push mutation ops: {e}");
+                Some(format!("Failed to push mutation ops: {e}"))
+            }
         }
     }
 
@@ -520,6 +529,88 @@ impl KaijutsuMcp {
         }
 
         None
+    }
+
+    /// Shared polling loop for shell command completion.
+    ///
+    /// Both `shell()` and `context_shell()` dispatch a command via `shell_execute`
+    /// then wait for the ToolResult child block to reach Done/Error status.
+    /// This helper encapsulates that wait loop.
+    async fn execute_and_poll_shell(
+        &self,
+        remote: &RemoteState,
+        ctx_id: ContextId,
+        cmd_block_id: BlockId,
+        command: &str,
+        timeout_secs: u64,
+        label: &str,
+    ) -> String {
+        let start = std::time::Instant::now();
+        let mut event_rx = remote.actor.subscribe_events();
+        let fallback_interval = tokio::time::Duration::from_millis(500);
+
+        // Completion check — looks for a finished ToolResult child of our command block.
+        // One shell command produces exactly one ToolResult child, so parent_id match is sufficient.
+        let check_completion = |source: &str| -> Option<String> {
+            let entry = remote.store.get(ctx_id)?;
+            let blocks = entry.doc.blocks_ordered();
+            let output = blocks.iter().find(|b| {
+                b.parent_id.as_ref() == Some(&cmd_block_id)
+                    && b.is_shell()
+                    && b.kind == kaijutsu_crdt::BlockKind::ToolResult
+                    && matches!(b.status, kaijutsu_crdt::Status::Done | kaijutsu_crdt::Status::Error)
+            })?;
+            tracing::info!(
+                command = %command,
+                status = %output.status.as_str(),
+                output_len = output.content.len(),
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                "{label} completed (via {source})"
+            );
+            Some(if output.content.is_empty() {
+                "(no output)".to_string()
+            } else {
+                output.content.clone()
+            })
+        };
+
+        loop {
+            if start.elapsed().as_secs() > timeout_secs {
+                return format!(
+                    "Timeout after {}s waiting for command.\nCommand block: {}\nCheck kaijutsu-app for partial output.",
+                    timeout_secs, cmd_block_id.to_key()
+                );
+            }
+
+            // Wait for either an event or the fallback timeout
+            let event = tokio::time::timeout(fallback_interval, event_rx.recv()).await;
+
+            match event {
+                Ok(Ok(ServerEvent::BlockStatusChanged { status, .. }))
+                    if matches!(status, kaijutsu_crdt::Status::Done | kaijutsu_crdt::Status::Error) =>
+                {
+                    if let Some(result) = check_completion("event") {
+                        return result;
+                    }
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                    return "Error: event stream closed".to_string();
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(n))) => {
+                    tracing::warn!(skipped = n, "Event stream lagged, checking store");
+                    if let Some(result) = check_completion("lagged") {
+                        return result;
+                    }
+                }
+                Err(_timeout) => {
+                    // 500ms fallback — check store state
+                    if let Some(result) = check_completion("fallback") {
+                        return result;
+                    }
+                }
+                _ => continue, // Other events — keep waiting
+            }
+        }
     }
 }
 
@@ -664,20 +755,24 @@ impl KaijutsuMcp {
             kind,
             &content,
             Status::Done,
-            Some(PrincipalId::system()),
+            Some(self.session_principal),
         ) {
             Ok(block_id) => {
                 let version = self.store().get(context_id)
                     .map(|e| e.version())
                     .unwrap_or(0);
 
-                self.push_after_mutation().await;
-
-                serde_json::json!({
+                let mut result = serde_json::json!({
                     "success": true,
                     "block_id": block_id.to_key(),
                     "version": version
-                }).to_string()
+                }).to_string();
+
+                if let Some(warn) = self.push_after_mutation().await {
+                    result.push_str(&format!("\n\nWarning: {warn}"));
+                }
+
+                result
             }
             Err(e) => format!("Error: {}", e),
         }
@@ -758,18 +853,22 @@ impl KaijutsuMcp {
             None => return format!("Error: block '{}' not found", req.block_id),
         };
 
-        match self.store().append_text_as(context_id, &block_id, &req.text, Some(PrincipalId::system())) {
+        match self.store().append_text_as(context_id, &block_id, &req.text, Some(self.session_principal)) {
             Ok(()) => {
                 let version = self.store().get(context_id)
                     .map(|e| e.version())
                     .unwrap_or(0);
 
-                self.push_after_mutation().await;
-
-                serde_json::json!({
+                let mut result = serde_json::json!({
                     "success": true,
                     "version": version
-                }).to_string()
+                }).to_string();
+
+                if let Some(warn) = self.push_after_mutation().await {
+                    result.push_str(&format!("\n\nWarning: {warn}"));
+                }
+
+                result
             }
             Err(e) => format!("Error: {}", e),
         }
@@ -804,7 +903,7 @@ impl KaijutsuMcp {
                         } else {
                             format!("{}\n", text)
                         };
-                        self.store().edit_text_as(context_id, &block_id, pos, &text_with_newline, 0, Some(PrincipalId::system())).map_err(|e| e.to_string())
+                        self.store().edit_text_as(context_id, &block_id, pos, &text_with_newline, 0, Some(self.session_principal)).map_err(|e| e.to_string())
                     } else {
                         Err(format!(
                             "Invalid line number {}: block has {} line{} (valid range: 0-{})",
@@ -816,7 +915,7 @@ impl KaijutsuMcp {
                     let total_lines = line_count(&content);
                     if let Some((start, end)) = line_range_to_byte_range(&content, start_line, end_line) {
                         if start < end {
-                            self.store().edit_text_as(context_id, &block_id, start, "", end - start, Some(PrincipalId::system())).map_err(|e| e.to_string())
+                            self.store().edit_text_as(context_id, &block_id, start, "", end - start, Some(self.session_principal)).map_err(|e| e.to_string())
                         } else {
                             Ok(())
                         }
@@ -850,7 +949,7 @@ impl KaijutsuMcp {
                         } else {
                             format!("{}\n", text)
                         };
-                        self.store().edit_text_as(context_id, &block_id, start, &text_with_newline, end - start, Some(PrincipalId::system())).map_err(|e| e.to_string())
+                        self.store().edit_text_as(context_id, &block_id, start, &text_with_newline, end - start, Some(self.session_principal)).map_err(|e| e.to_string())
                     } else {
                         Err(format!(
                             "Invalid line range {}-{}: block has {} line{} (valid range: 0-{})",
@@ -870,12 +969,16 @@ impl KaijutsuMcp {
             .map(|e| e.version())
             .unwrap_or(0);
 
-        self.push_after_mutation().await;
-
-        serde_json::json!({
+        let mut result = serde_json::json!({
             "success": true,
             "version": version
-        }).to_string()
+        }).to_string();
+
+        if let Some(warn) = self.push_after_mutation().await {
+            result.push_str(&format!("\n\nWarning: {warn}"));
+        }
+
+        result
     }
 
     #[tool(description = "List blocks with optional filters for document, kind, status, and role.",
@@ -990,12 +1093,16 @@ impl KaijutsuMcp {
                     .map(|e| e.version())
                     .unwrap_or(0);
 
-                self.push_after_mutation().await;
-
-                serde_json::json!({
+                let mut result = serde_json::json!({
                     "success": true,
                     "version": version
-                }).to_string()
+                }).to_string();
+
+                if let Some(warn) = self.push_after_mutation().await {
+                    result.push_str(&format!("\n\nWarning: {warn}"));
+                }
+
+                result
             }
             Err(e) => format!("Error: {}", e),
         }
@@ -1346,7 +1453,10 @@ impl KaijutsuMcp {
             Ok(v) => v,
             Err(e) => return e,
         };
-        let remote = self.remote().unwrap();
+        let remote = match self.remote() {
+            Some(r) => r,
+            None => return "Error: shell requires --connect to server".to_string(),
+        };
 
         // Execute command — creates ToolCall + ToolResult blocks in the document.
         // The output block starts as Status::Running and transitions to Done/Error
@@ -1363,78 +1473,11 @@ impl KaijutsuMcp {
             "Shell command dispatched"
         );
 
-        // Wait for completion via event stream + periodic fallback.
-        //
-        // Primary: listen for BlockStatusChanged matching our command's output block.
-        // Fallback: every 500ms, check local doc (kept in sync by background listener).
-        // This eliminates N full-document round-trips per shell command.
         let timeout_secs = req.timeout_secs.unwrap_or(300).min(600);
-        let start = std::time::Instant::now();
-        let mut event_rx = remote.actor.subscribe_events();
-        let fallback_interval = tokio::time::Duration::from_millis(500);
-
-        // Shared completion check — looks for a finished ToolResult child of our command block.
-        // One shell command produces exactly one ToolResult child, so parent_id match is sufficient.
-        let check_completion = |source: &str| -> Option<String> {
-            let entry = remote.store.get(ctx_id)?;
-            let blocks = entry.doc.blocks_ordered();
-            let output = blocks.iter().find(|b| {
-                b.parent_id.as_ref() == Some(&cmd_block_id)
-                    && b.is_shell()
-                    && b.kind == kaijutsu_crdt::BlockKind::ToolResult
-                    && matches!(b.status, kaijutsu_crdt::Status::Done | kaijutsu_crdt::Status::Error)
-            })?;
-            tracing::info!(
-                command = %req.command,
-                status = %output.status.as_str(),
-                output_len = output.content.len(),
-                elapsed_ms = start.elapsed().as_millis() as u64,
-                "Shell command completed (via {source})"
-            );
-            Some(if output.content.is_empty() {
-                "(no output)".to_string()
-            } else {
-                output.content.clone()
-            })
-        };
-
-        loop {
-            if start.elapsed().as_secs() > timeout_secs {
-                return format!(
-                    "Timeout after {}s waiting for command.\nCommand block: {}\nCheck kaijutsu-app for partial output.",
-                    timeout_secs, cmd_block_id.to_key()
-                );
-            }
-
-            // Wait for either an event or the fallback timeout
-            let event = tokio::time::timeout(fallback_interval, event_rx.recv()).await;
-
-            match event {
-                Ok(Ok(ServerEvent::BlockStatusChanged { status, .. }))
-                    if matches!(status, kaijutsu_crdt::Status::Done | kaijutsu_crdt::Status::Error) =>
-                {
-                    if let Some(result) = check_completion("event") {
-                        return result;
-                    }
-                }
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
-                    return "Error: event stream closed".to_string();
-                }
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(n))) => {
-                    tracing::warn!(skipped = n, "Event stream lagged, checking store");
-                    if let Some(result) = check_completion("lagged") {
-                        return result;
-                    }
-                }
-                Err(_timeout) => {
-                    // 500ms fallback — check store state
-                    if let Some(result) = check_completion("fallback") {
-                        return result;
-                    }
-                }
-                _ => continue, // Other events — keep waiting
-            }
-        }
+        self.execute_and_poll_shell(
+            remote, ctx_id, cmd_block_id, &req.command,
+            timeout_secs, "Shell command",
+        ).await
     }
 
     #[tool(description = "Context-bound kaish shell. Executes commands in your current kernel context — '.' references it in kj commands. Full kaish: pipes, variables, scripting. Run `kj help` for context/drift/fork management or `kj drift help` for cross-context communication. Examples: 'kj context list --tree', 'kj fork --name alt', 'kj drift push impl \"found the bug\"', 'ls /mnt/project | grep rs'. Requires --connect and register_session.",
@@ -1447,7 +1490,10 @@ impl KaijutsuMcp {
             Ok(v) => v,
             Err(e) => return e,
         };
-        let remote = self.remote().unwrap();
+        let remote = match self.remote() {
+            Some(r) => r,
+            None => return "Error: shell requires --connect to server".to_string(),
+        };
 
         let cmd_block_id = match actor.shell_execute(&req.command, ctx_id, false).await {
             Ok(id) => id,
@@ -1461,64 +1507,11 @@ impl KaijutsuMcp {
             "Context shell command dispatched"
         );
 
-        // Same completion polling as shell tool
         let timeout_secs = req.timeout_secs.unwrap_or(300).min(600);
-        let start = std::time::Instant::now();
-        let mut event_rx = remote.actor.subscribe_events();
-        let fallback_interval = tokio::time::Duration::from_millis(500);
-
-        let check_completion = |source: &str| -> Option<String> {
-            let entry = remote.store.get(ctx_id)?;
-            let blocks = entry.doc.blocks_ordered();
-            let output = blocks.iter().find(|b| {
-                b.parent_id.as_ref() == Some(&cmd_block_id)
-                    && b.is_shell()
-                    && b.kind == kaijutsu_crdt::BlockKind::ToolResult
-                    && matches!(b.status, kaijutsu_crdt::Status::Done | kaijutsu_crdt::Status::Error)
-            })?;
-            tracing::info!(
-                command = %req.command,
-                status = %output.status.as_str(),
-                output_len = output.content.len(),
-                elapsed_ms = start.elapsed().as_millis() as u64,
-                "Context shell command completed (via {source})"
-            );
-            Some(if output.content.is_empty() {
-                "(no output)".to_string()
-            } else {
-                output.content.clone()
-            })
-        };
-
-        loop {
-            if start.elapsed().as_secs() > timeout_secs {
-                return format!(
-                    "Timeout after {}s waiting for command.\nCommand block: {}\nCheck kaijutsu-app for partial output.",
-                    timeout_secs, cmd_block_id.to_key()
-                );
-            }
-
-            let event = tokio::time::timeout(fallback_interval, event_rx.recv()).await;
-
-            match event {
-                Ok(Ok(ServerEvent::BlockStatusChanged { status, .. }))
-                    if matches!(status, kaijutsu_crdt::Status::Done | kaijutsu_crdt::Status::Error) =>
-                {
-                    if let Some(result) = check_completion("event") {
-                        return result;
-                    }
-                }
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
-                    return "Error: event stream closed".to_string();
-                }
-                Err(_timeout) => {
-                    if let Some(result) = check_completion("fallback") {
-                        return result;
-                    }
-                }
-                _ => continue,
-            }
-        }
+        self.execute_and_poll_shell(
+            remote, ctx_id, cmd_block_id, &req.command,
+            timeout_secs, "Context shell command",
+        ).await
     }
 
     // ========================================================================

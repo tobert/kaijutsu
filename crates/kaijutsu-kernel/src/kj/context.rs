@@ -44,7 +44,7 @@ impl KjDispatcher {
         let tree = argv.iter().any(|a| a == "--tree" || a == "-t");
         let kernel_id = self.kernel_id();
 
-        let db = self.kernel_db().lock().unwrap();
+        let db = self.kernel_db().lock();
         if tree {
             match db.context_dag(kernel_id) {
                 Ok(dag) => KjResult::ok(format_context_tree(&dag, caller.context_id)),
@@ -59,7 +59,7 @@ impl KjDispatcher {
     }
 
     fn context_info(&self, argv: &[String], caller: &KjCaller) -> KjResult {
-        let db = self.kernel_db().lock().unwrap();
+        let db = self.kernel_db().lock();
         let kernel_id = self.kernel_id();
 
         // Resolve target context (default: current)
@@ -149,7 +149,7 @@ impl KjDispatcher {
 
         // Resolve using DriftRouter for live state (not just DB)
         let resolved = {
-            let db = self.kernel_db().lock().unwrap();
+            let db = self.kernel_db().lock();
             resolve_context_ref(&ctx_ref, caller, &db, self.kernel_id())
         };
 
@@ -189,7 +189,7 @@ impl KjDispatcher {
                     )
                 }
             };
-            let db = self.kernel_db().lock().unwrap();
+            let db = self.kernel_db().lock();
             match super::refs::resolve_context_arg(Some(parent_ref), caller, &db, self.kernel_id())
             {
                 Ok(id) => Some(id),
@@ -205,7 +205,7 @@ impl KjDispatcher {
 
         // Write-through: KernelDb first, then DriftRouter
         {
-            let db = self.kernel_db().lock().unwrap();
+            let db = self.kernel_db().lock();
             let default_ws = match db.get_or_create_default_workspace(kernel_id, caller.principal_id) {
                 Ok(id) => id,
                 Err(e) => return KjResult::Err(format!("kj context create: {e}")),
@@ -292,7 +292,7 @@ impl KjDispatcher {
 
         // Resolve target + apply DB changes (lock scope)
         let (target_id, changes, tool_filter_for_drift, model_for_drift) = {
-            let db = self.kernel_db().lock().unwrap();
+            let db = self.kernel_db().lock();
 
             let target_id = match super::refs::resolve_context_arg(target_arg, caller, &db, kernel_id) {
                 Ok(id) => id,
@@ -418,7 +418,7 @@ impl KjDispatcher {
             .map(|s| s.as_str());
         let env_key = extract_named_arg(argv, &["--env"]);
 
-        let db = self.kernel_db().lock().unwrap();
+        let db = self.kernel_db().lock();
         let target_id = match super::refs::resolve_context_arg(target_arg, caller, &db, kernel_id) {
             Ok(id) => id,
             Err(e) => return KjResult::Err(format!("kj context unset: {e}")),
@@ -437,7 +437,7 @@ impl KjDispatcher {
 
     /// `kj context log [<ctx>]` — show fork lineage from context up to root.
     fn context_log(&self, argv: &[String], caller: &KjCaller) -> KjResult {
-        let db = self.kernel_db().lock().unwrap();
+        let db = self.kernel_db().lock();
         let kernel_id = self.kernel_id();
 
         let target_arg = argv.get(1).map(|s| s.as_str());
@@ -466,7 +466,7 @@ impl KjDispatcher {
         let kernel_id = self.kernel_id();
 
         // All DB work in a single lock scope, no await
-        let db = self.kernel_db().lock().unwrap();
+        let db = self.kernel_db().lock();
 
         let ctx_id = match db.resolve_context(kernel_id, ctx_ref) {
             Ok(id) => id,
@@ -520,7 +520,7 @@ impl KjDispatcher {
 
         let kernel_id = self.kernel_id();
         let (target_id, target_label) = {
-            let db = self.kernel_db().lock().unwrap();
+            let db = self.kernel_db().lock();
             let target_id = match super::refs::resolve_context_arg(Some(ctx_ref), caller, &db, kernel_id) {
                 Ok(id) => id,
                 Err(e) => return KjResult::Err(format!("kj context archive: {e}")),
@@ -534,7 +534,7 @@ impl KjDispatcher {
 
         if !caller.confirmed {
             // Gather stats for latch message
-            let db = self.kernel_db().lock().unwrap();
+            let db = self.kernel_db().lock();
             let block_count = self.block_store().get(target_id)
                 .map(|e| e.doc.block_count())
                 .unwrap_or(0);
@@ -552,7 +552,7 @@ impl KjDispatcher {
         }
 
         // Archive the target + recursive children
-        let db = self.kernel_db().lock().unwrap();
+        let db = self.kernel_db().lock();
         let subtree = db.subtree_snapshot(target_id).unwrap_or_default();
         let mut archived = 0;
         for (row, _depth) in &subtree {
@@ -573,7 +573,7 @@ impl KjDispatcher {
 
         let kernel_id = self.kernel_id();
         let (target_id, target_label) = {
-            let db = self.kernel_db().lock().unwrap();
+            let db = self.kernel_db().lock();
             let target_id = match super::refs::resolve_context_arg(Some(ctx_ref), caller, &db, kernel_id) {
                 Ok(id) => id,
                 Err(e) => return KjResult::Err(format!("kj context remove: {e}")),
@@ -590,7 +590,7 @@ impl KjDispatcher {
         }
 
         if !caller.confirmed {
-            let db = self.kernel_db().lock().unwrap();
+            let db = self.kernel_db().lock();
             let block_count = self.block_store().get(target_id)
                 .map(|e| e.doc.block_count())
                 .unwrap_or(0);
@@ -607,7 +607,7 @@ impl KjDispatcher {
 
         // Delete from DB (CASCADE deletes edges)
         {
-            let db = self.kernel_db().lock().unwrap();
+            let db = self.kernel_db().lock();
             if let Err(e) = db.delete_context(target_id) {
                 return KjResult::Err(format!("kj context remove: {e}"));
             }
@@ -638,7 +638,7 @@ impl KjDispatcher {
 
         // Resolve the new holder and find old holder (single lock scope)
         let (new_holder_id, old_holder) = {
-            let db = self.kernel_db().lock().unwrap();
+            let db = self.kernel_db().lock();
             let new_holder_id = match super::refs::resolve_context_arg(Some(ctx_ref), caller, &db, kernel_id) {
                 Ok(id) => id,
                 Err(e) => return KjResult::Err(format!("kj context retag: {e}")),
@@ -666,7 +666,7 @@ impl KjDispatcher {
 
         // Apply label changes (single lock scope, no await)
         {
-            let db = self.kernel_db().lock().unwrap();
+            let db = self.kernel_db().lock();
             if let Some(ref old) = old_holder {
                 if let Err(e) = db.update_label(old.context_id, None) {
                     return KjResult::Err(format!("kj context retag: failed to clear old label: {e}"));
@@ -735,7 +735,7 @@ mod tests {
         // Add structural edge for child
         let child = register_context(&d, Some("child"), Some(root), principal).await;
         {
-            let db = d.kernel_db().lock().unwrap();
+            let db = d.kernel_db().lock();
             db.insert_edge(&ContextEdgeRow {
                 edge_id: uuid::Uuid::now_v7(),
                 source_id: root,
@@ -818,7 +818,7 @@ mod tests {
         assert!(result.message().contains("child-ctx"), "msg: {}", result.message());
 
         // Verify it's in the DB
-        let db = d.kernel_db().lock().unwrap();
+        let db = d.kernel_db().lock();
         let contexts = db.list_active_contexts(d.kernel_id()).unwrap();
         assert!(contexts.iter().any(|r| r.label.as_deref() == Some("child-ctx")));
     }
@@ -924,7 +924,7 @@ mod tests {
 
         // Insert original structural edge a → child
         {
-            let db = d.kernel_db().lock().unwrap();
+            let db = d.kernel_db().lock();
             db.insert_edge(&ContextEdgeRow {
                 edge_id: uuid::Uuid::now_v7(),
                 source_id: a,
@@ -943,7 +943,7 @@ mod tests {
         assert!(result.message().contains("moved"), "msg: {}", result.message());
 
         // Verify new parent
-        let db = d.kernel_db().lock().unwrap();
+        let db = d.kernel_db().lock();
         let parents = db.structural_parents(child).unwrap();
         assert_eq!(parents.len(), 1);
         assert_eq!(parents[0].context_id, b);
@@ -977,7 +977,7 @@ mod tests {
         assert!(result.message().contains("archived"), "msg: {}", result.message());
 
         // Verify archived
-        let db = d.kernel_db().lock().unwrap();
+        let db = d.kernel_db().lock();
         let row = db.get_context(target).unwrap().unwrap();
         assert!(row.archived_at.is_some());
     }
@@ -1010,7 +1010,7 @@ mod tests {
         assert!(result.is_ok(), "remove failed: {}", result.message());
 
         // Verify gone from DB
-        let db = d.kernel_db().lock().unwrap();
+        let db = d.kernel_db().lock();
         assert!(db.get_context(target).unwrap().is_none());
 
         // Verify gone from DriftRouter
@@ -1045,7 +1045,7 @@ mod tests {
         assert!(result.is_ok(), "set --cwd failed: {}", result.message());
         assert!(result.message().contains("cwd="), "msg: {}", result.message());
 
-        let db = d.kernel_db().lock().unwrap();
+        let db = d.kernel_db().lock();
         let shell = db.get_context_shell(ctx).unwrap().unwrap();
         assert_eq!(shell.cwd, Some("/tmp/work".into()));
     }
@@ -1063,7 +1063,7 @@ mod tests {
         assert!(result.is_ok(), "set --env failed: {}", result.message());
         assert!(result.message().contains("env RUST_LOG=debug"), "msg: {}", result.message());
 
-        let db = d.kernel_db().lock().unwrap();
+        let db = d.kernel_db().lock();
         let env = db.get_context_env(ctx).unwrap();
         assert_eq!(env.len(), 1);
         assert_eq!(env[0].key, "RUST_LOG");
@@ -1092,7 +1092,7 @@ mod tests {
 
         // Set env var first
         {
-            let db = d.kernel_db().lock().unwrap();
+            let db = d.kernel_db().lock();
             db.set_context_env(ctx, "FOO", "bar").unwrap();
         }
 
@@ -1104,7 +1104,7 @@ mod tests {
         assert!(result.message().contains("unset env FOO"), "msg: {}", result.message());
 
         // Verify it's gone
-        let db = d.kernel_db().lock().unwrap();
+        let db = d.kernel_db().lock();
         let env = db.get_context_env(ctx).unwrap();
         assert!(env.is_empty());
     }
@@ -1130,7 +1130,7 @@ mod tests {
 
         // Set shell config and env
         {
-            let db = d.kernel_db().lock().unwrap();
+            let db = d.kernel_db().lock();
             db.upsert_context_shell(&crate::kernel_db::ContextShellRow {
                 context_id: ctx,
                 cwd: Some("/home/user/project".into()),

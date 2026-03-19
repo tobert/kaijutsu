@@ -178,7 +178,10 @@ impl block_events::Server for BlockEventsForwarder {
 
         let ops = params.get_ops().map(|d| d.to_vec()).unwrap_or_default();
 
-        let _ = self.event_tx.send(ServerEvent::BlockInserted { context_id, block, ops });
+        let event = ServerEvent::BlockInserted { context_id, block, ops };
+        if self.event_tx.send(event).is_err() {
+            tracing::warn!("Event channel closed, dropping BlockInserted event");
+        }
         Promise::ok(())
     }
 
@@ -208,7 +211,10 @@ impl block_events::Server for BlockEventsForwarder {
             Err(e) => return Promise::err(e),
         };
 
-        let _ = self.event_tx.send(ServerEvent::BlockDeleted { context_id, block_id });
+        let event = ServerEvent::BlockDeleted { context_id, block_id };
+        if self.event_tx.send(event).is_err() {
+            tracing::warn!("Event channel closed, dropping BlockDeleted event");
+        }
         Promise::ok(())
     }
 
@@ -238,11 +244,14 @@ impl block_events::Server for BlockEventsForwarder {
             Err(e) => return Promise::err(e),
         };
 
-        let _ = self.event_tx.send(ServerEvent::BlockCollapsedChanged {
+        let event = ServerEvent::BlockCollapsedChanged {
             context_id,
             block_id,
             collapsed: params.get_collapsed(),
-        });
+        };
+        if self.event_tx.send(event).is_err() {
+            tracing::warn!("Event channel closed, dropping BlockCollapsedChanged event");
+        }
         Promise::ok(())
     }
 
@@ -284,7 +293,10 @@ impl block_events::Server for BlockEventsForwarder {
             None
         };
 
-        let _ = self.event_tx.send(ServerEvent::BlockMoved { context_id, block_id, after_id });
+        let event = ServerEvent::BlockMoved { context_id, block_id, after_id };
+        if self.event_tx.send(event).is_err() {
+            tracing::warn!("Event channel closed, dropping BlockMoved event");
+        }
         Promise::ok(())
     }
 
@@ -325,12 +337,15 @@ impl block_events::Server for BlockEventsForwarder {
             .and_then(|r| crate::rpc::parse_output_data(r).ok())
             .filter(|d| !d.root.is_empty() || d.headers.is_some());
 
-        let _ = self.event_tx.send(ServerEvent::BlockStatusChanged {
+        let event = ServerEvent::BlockStatusChanged {
             context_id,
             block_id,
             status,
             output,
-        });
+        };
+        if self.event_tx.send(event).is_err() {
+            tracing::warn!("Event channel closed, dropping BlockStatusChanged event");
+        }
         Promise::ok(())
     }
 
@@ -365,7 +380,10 @@ impl block_events::Server for BlockEventsForwarder {
             Err(e) => return Promise::err(e),
         };
 
-        let _ = self.event_tx.send(ServerEvent::BlockTextOps { context_id, block_id, ops });
+        let event = ServerEvent::BlockTextOps { context_id, block_id, ops };
+        if self.event_tx.send(event).is_err() {
+            tracing::warn!("Event channel closed, dropping BlockTextOps event");
+        }
         Promise::ok(())
     }
 
@@ -389,7 +407,10 @@ impl block_events::Server for BlockEventsForwarder {
 
         let generation = params.get_generation();
 
-        let _ = self.event_tx.send(ServerEvent::SyncReset { context_id, generation });
+        let event = ServerEvent::SyncReset { context_id, generation };
+        if self.event_tx.send(event).is_err() {
+            tracing::warn!("Event channel closed, dropping SyncReset event");
+        }
         Promise::ok(())
     }
 
@@ -416,7 +437,10 @@ impl block_events::Server for BlockEventsForwarder {
             Err(e) => return Promise::err(e),
         };
 
-        let _ = self.event_tx.send(ServerEvent::InputTextOps { context_id, ops });
+        let event = ServerEvent::InputTextOps { context_id, ops };
+        if self.event_tx.send(event).is_err() {
+            tracing::warn!("Event channel closed, dropping InputTextOps event");
+        }
         Promise::ok(())
     }
 
@@ -438,7 +462,10 @@ impl block_events::Server for BlockEventsForwarder {
             Err(e) => return Promise::err(e),
         };
 
-        let _ = self.event_tx.send(ServerEvent::InputCleared { context_id });
+        let event = ServerEvent::InputCleared { context_id };
+        if self.event_tx.send(event).is_err() {
+            tracing::warn!("Event channel closed, dropping InputCleared event");
+        }
         Promise::ok(())
     }
 
@@ -460,7 +487,10 @@ impl block_events::Server for BlockEventsForwarder {
             Err(e) => return Promise::err(e),
         };
 
-        let _ = self.event_tx.send(ServerEvent::ContextSwitched { context_id });
+        let event = ServerEvent::ContextSwitched { context_id };
+        if self.event_tx.send(event).is_err() {
+            tracing::warn!("Event channel closed, dropping ContextSwitched event");
+        }
         Promise::ok(())
     }
 }
@@ -503,7 +533,10 @@ impl resource_events::Server for ResourceEventsForwarder {
             Err(e) => return Promise::err(e),
         };
 
-        let _ = self.event_tx.send(ServerEvent::ResourceUpdated { server, uri });
+        let event = ServerEvent::ResourceUpdated { server, uri };
+        if self.event_tx.send(event).is_err() {
+            tracing::warn!("Event channel closed, dropping ResourceUpdated event");
+        }
         Promise::ok(())
     }
 
@@ -525,7 +558,10 @@ impl resource_events::Server for ResourceEventsForwarder {
             Err(e) => return Promise::err(e),
         };
 
-        let _ = self.event_tx.send(ServerEvent::ResourceListChanged { server });
+        let event = ServerEvent::ResourceListChanged { server };
+        if self.event_tx.send(event).is_err() {
+            tracing::warn!("Event channel closed, dropping ResourceListChanged event");
+        }
         Promise::ok(())
     }
 }
