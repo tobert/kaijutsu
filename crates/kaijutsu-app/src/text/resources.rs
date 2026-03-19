@@ -1,7 +1,41 @@
 //! Text rendering resources for Vello-based text.
 
+use std::sync::Arc;
+
 use bevy::prelude::*;
+use bevy_vello::integrations::svg::usvg;
 use bevy_vello::prelude::VelloFont;
+
+/// Shared font database for SVG `<text>` rendering.
+///
+/// usvg needs fonts loaded into a `fontdb::Database` to convert SVG text
+/// elements into outlines. Without this, `<text>` elements are silently dropped.
+#[derive(Resource, Clone)]
+pub struct SvgFontDb {
+    pub fontdb: Arc<usvg::fontdb::Database>,
+    /// Default font family for usvg (from theme's font_mono).
+    pub default_family: String,
+}
+
+impl SvgFontDb {
+    /// Build `usvg::Options` with this font database.
+    pub fn usvg_options(&self) -> usvg::Options<'static> {
+        usvg::Options {
+            fontdb: self.fontdb.clone(),
+            font_family: self.default_family.clone(),
+            ..Default::default()
+        }
+    }
+}
+
+impl Default for SvgFontDb {
+    fn default() -> Self {
+        Self {
+            fontdb: Arc::new(usvg::fontdb::Database::new()),
+            default_family: "Cascadia Code NF".into(),
+        }
+    }
+}
 
 /// Loaded font handles for consistent rendering.
 #[derive(Resource, Clone, Default)]

@@ -9,7 +9,7 @@ use bevy_vello::integrations::text::VelloFontAxes;
 use bevy_vello::prelude::*;
 
 use super::components::{KjTextEffects, rainbow_brush};
-use super::resources::{FontHandles, TextMetrics};
+use super::resources::{FontHandles, SvgFontDb, TextMetrics};
 
 /// Plugin that enables Vello text rendering in Bevy.
 ///
@@ -24,7 +24,8 @@ impl Plugin for KjTextPlugin {
         app.add_plugins(VelloPlugin::default())
             .init_resource::<FontHandles>()
             .init_resource::<TextMetrics>()
-            .add_systems(Startup, load_fonts)
+            .init_resource::<SvgFontDb>()
+            .add_systems(Startup, (load_fonts, load_svg_fontdb))
             .add_systems(
                 Update,
                 (
@@ -46,6 +47,53 @@ fn load_fonts(asset_server: Res<AssetServer>, mut font_handles: ResMut<FontHandl
     font_handles.serif = asset_server.load("fonts/NotoSerif-Regular.ttf");
     font_handles.cjk = asset_server.load("fonts/NotoSansCJKJP-Light.ttf");
     info!("Loaded Vello fonts: CascadiaCodeNF, NotoSerif, NotoSansCJKJP");
+}
+
+/// Load bundled fonts into the SVG fontdb for `<text>` element rendering.
+///
+/// usvg flattens SVG text to outlines during parsing, but only if the
+/// referenced fonts are in its database. Without this, `<text>` elements
+/// are silently dropped from rendered SVGs.
+fn load_svg_fontdb(mut svg_fontdb: ResMut<SvgFontDb>, theme: Res<crate::ui::theme::Theme>) {
+    use bevy_vello::integrations::svg::usvg::fontdb;
+    use std::sync::Arc;
+
+    let mut db = fontdb::Database::new();
+
+    // Load our bundled fonts from the assets directory.
+    // The working directory is the workspace root when the app runs.
+    let font_dir = std::path::Path::new("assets/fonts");
+    if font_dir.is_dir() {
+        db.load_fonts_dir(font_dir);
+        info!(
+            "SvgFontDb: loaded {} font faces from {}",
+            db.len(),
+            font_dir.display()
+        );
+    } else {
+        // Try relative to the crate directory (cargo test, etc.)
+        let alt_dir = std::path::Path::new("../../assets/fonts");
+        if alt_dir.is_dir() {
+            db.load_fonts_dir(alt_dir);
+            info!(
+                "SvgFontDb: loaded {} font faces from {}",
+                db.len(),
+                alt_dir.display()
+            );
+        } else {
+            warn!("SvgFontDb: no font directory found — SVG <text> will not render");
+        }
+    }
+
+    // Map CSS generic families to our bundled fonts (from Rhai theme).
+    // Default fontdb maps these to system fonts (Times New Roman, Arial, Courier)
+    // which we don't bundle.
+    db.set_serif_family(&theme.font_serif);
+    db.set_sans_serif_family(&theme.font_sans);
+    db.set_monospace_family(&theme.font_mono);
+
+    svg_fontdb.fontdb = Arc::new(db);
+    svg_fontdb.default_family = theme.font_mono.clone();
 }
 
 /// Measure actual line height and character width from the loaded font.

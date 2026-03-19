@@ -257,6 +257,12 @@ pub struct Theme {
     // ═══════════════════════════════════════════════════════════════════════
     /// Enable rainbow color cycling effect on user text.
     pub font_rainbow: bool,
+    /// Monospace font family name (for SVG generic family fallback + usvg default).
+    pub font_mono: String,
+    /// Serif font family name (for SVG generic family fallback).
+    pub font_serif: String,
+    /// Sans-serif font family name (for SVG generic family fallback).
+    pub font_sans: String,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Constellation Configuration
@@ -480,8 +486,11 @@ impl Default for Theme {
             sparkline_line_color: Color::srgb(0.490, 0.812, 1.00), // #7dcfff Tokyo Night cyan
             sparkline_fill_color: Some(Color::srgba(0.490, 0.812, 1.00, 0.15)), // cyan 15% alpha
 
-            // Font effects
+            // Font configuration
             font_rainbow: true,
+            font_mono: "Cascadia Code NF".into(),
+            font_serif: "Noto Serif".into(),
+            font_sans: "Noto Sans CJK JP".into(),
 
             // Constellation radial tree layout
             constellation_base_radius: 500.0,
@@ -643,8 +652,11 @@ impl From<kaijutsu_rhai::theme::ThemeData> for Theme {
         theme.input_overlay_width_pct = td.input_overlay_width_pct;
         theme.input_backdrop_color = hex_to_color(&td.input_backdrop_color);
 
-        // Font effects
+        // Font configuration
         theme.font_rainbow = td.font_rainbow;
+        theme.font_mono = td.font_mono;
+        theme.font_serif = td.font_serif;
+        theme.font_sans = td.font_sans;
 
         // Constellation
         theme.constellation_base_radius = td.constellation_base_radius;

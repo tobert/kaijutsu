@@ -405,7 +405,13 @@ const SVG_MAX_HEIGHT: f32 = 400.0;
 /// Recognizes two patterns:
 /// - Raw SVG: text starts with `<svg`
 /// - Fenced SVG: ` ```svg\n...\n``` `
-fn try_parse_svg(text: &str) -> Option<(Arc<vello::Scene>, f32, f32)> {
+///
+/// When `svg_fontdb` is provided, SVG `<text>` elements are rendered using
+/// the fonts in the database. Without it, text elements are silently dropped.
+fn try_parse_svg(
+    text: &str,
+    svg_fontdb: Option<&super::SvgFontDb>,
+) -> Option<(Arc<vello::Scene>, f32, f32)> {
     let svg_str = if text.trim_start().starts_with("<svg") {
         text.trim()
     } else if let Some(inner) = extract_fenced_block(text, "svg") {
@@ -418,7 +424,14 @@ fn try_parse_svg(text: &str) -> Option<(Arc<vello::Scene>, f32, f32)> {
         return None;
     }
 
-    match bevy_vello::integrations::svg::load_svg_from_str(svg_str) {
+    let result = if let Some(fdb) = svg_fontdb {
+        let options = fdb.usvg_options();
+        bevy_vello::integrations::svg::load_svg_from_str_with_options(svg_str, &options)
+    } else {
+        bevy_vello::integrations::svg::load_svg_from_str(svg_str)
+    };
+
+    match result {
         Ok(svg) => {
             let w = svg.width;
             let h = svg.height.min(SVG_MAX_HEIGHT);
@@ -456,7 +469,7 @@ fn extract_fenced_block<'a>(text: &'a str, lang: &str) -> Option<&'a str> {
 /// declared type directly. Falls back to sniffing when `content_type` is `None`.
 #[allow(dead_code)]
 pub fn detect_rich_content(text: &str, version: u64) -> Option<RichContent> {
-    detect_rich_content_typed(text, version, None)
+    detect_rich_content_typed(text, version, None, None)
 }
 
 /// Detect rich content with an optional content type hint.
@@ -467,16 +480,20 @@ pub fn detect_rich_content(text: &str, version: u64) -> Option<RichContent> {
 /// - Other types → fall through to heuristic detection
 ///
 /// When `content_type` is `None`, tries sparkline, then SVG, then markdown.
+///
+/// `svg_fontdb` provides fonts for SVG `<text>` rendering. Pass `None` if
+/// the resource isn't available (text elements will be dropped).
 pub fn detect_rich_content_typed(
     text: &str,
     version: u64,
     content_type: Option<&str>,
+    svg_fontdb: Option<&super::SvgFontDb>,
 ) -> Option<RichContent> {
     // If content type is declared, use it directly
     if let Some(ct) = content_type {
         match ct {
             "image/svg+xml" => {
-                if let Some((scene, width, height)) = try_parse_svg(text) {
+                if let Some((scene, width, height)) = try_parse_svg(text, svg_fontdb) {
                     return Some(RichContent {
                         kind: RichContentKind::Svg {
                             scene,
@@ -527,7 +544,7 @@ pub fn detect_rich_content_typed(
     }
 
     // Try SVG
-    if let Some((scene, width, height)) = try_parse_svg(text) {
+    if let Some((scene, width, height)) = try_parse_svg(text, svg_fontdb) {
         return Some(RichContent {
             kind: RichContentKind::Svg {
                 scene,

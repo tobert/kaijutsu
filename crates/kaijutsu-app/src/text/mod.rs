@@ -12,7 +12,7 @@ pub mod sparkline;
 
 pub use components::{KjText, KjTextEffects, bevy_color_to_brush, vello_style};
 pub use plugin::KjTextPlugin;
-pub use resources::{FontHandles, TextMetrics};
+pub use resources::{FontHandles, SvgFontDb, TextMetrics};
 pub use rich::RichContent;
 
 /// Char-aware truncation (safe for multi-byte UTF-8).

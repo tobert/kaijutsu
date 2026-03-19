@@ -138,8 +138,14 @@ pub struct ThemeData {
     pub input_overlay_width_pct: f32,
     pub input_backdrop_color: String,
 
-    // Font effects
+    // Font configuration
     pub font_rainbow: bool,
+    /// Font family for monospace (code, blocks). Used for both Vello text and SVG fallback.
+    pub font_mono: String,
+    /// Font family for serif text.
+    pub font_serif: String,
+    /// Font family for sans-serif text (SVG generic family fallback).
+    pub font_sans: String,
 
     // Constellation
     pub constellation_base_radius: f32,
@@ -250,8 +256,11 @@ impl Default for ThemeData {
             input_overlay_width_pct: 0.6,
             input_backdrop_color: "#1a1b26d9".into(),
 
-            // Font effects
+            // Font configuration
             font_rainbow: true,
+            font_mono: "Cascadia Code NF".into(),
+            font_serif: "Noto Serif".into(),
+            font_sans: "Noto Sans CJK JP".into(),
 
             // Constellation
             constellation_base_radius: 500.0,
@@ -345,6 +354,13 @@ fn get_float(scope: &Scope, name: &str) -> Option<f32> {
 /// Extract a bool from a Rhai scope.
 fn get_bool(scope: &Scope, name: &str) -> Option<bool> {
     scope.get_value::<bool>(name)
+}
+
+/// Extract a String from a Rhai scope.
+fn get_string(scope: &Scope, name: &str) -> Option<String> {
+    scope
+        .get_value::<rhai::ImmutableString>(name)
+        .map(|s| s.to_string())
 }
 
 /// Parse a `ThemeData` from a Rhai scope.
@@ -487,9 +503,18 @@ pub fn parse_theme_data_from_scope(scope: &Scope) -> ThemeData {
     float!(input_overlay_width_pct);
     color!(input_backdrop_color);
 
-    // Font effects
+    // Font configuration
     if let Some(v) = get_bool(scope, "font_rainbow") {
         td.font_rainbow = v;
+    }
+    if let Some(v) = get_string(scope, "font_mono") {
+        td.font_mono = v;
+    }
+    if let Some(v) = get_string(scope, "font_serif") {
+        td.font_serif = v;
+    }
+    if let Some(v) = get_string(scope, "font_sans") {
+        td.font_sans = v;
     }
 
     // Constellation

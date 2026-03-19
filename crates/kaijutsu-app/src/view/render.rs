@@ -53,6 +53,7 @@ pub fn sync_block_cell_buffers(
         Option<&TimelineVisibility>,
     )>,
     theme: Res<Theme>,
+    svg_fontdb: Res<crate::text::SvgFontDb>,
     doc_cache: Res<crate::cell::DocumentCache>,
     mut layout_gen: ResMut<LayoutGeneration>,
 ) {
@@ -168,6 +169,7 @@ pub fn sync_block_cell_buffers(
                 &text,
                 doc_version,
                 block.content_type.as_deref(),
+                Some(&svg_fontdb),
             )
         {
             // For sparklines: clear text so Parley won't fight min_height
@@ -187,6 +189,7 @@ pub fn sync_block_cell_buffers(
                 &text,
                 doc_version,
                 block.content_type.as_deref(),
+                Some(&svg_fontdb),
             )
         {
             vello_text.style.brush = bevy_color_to_brush(Color::NONE);
