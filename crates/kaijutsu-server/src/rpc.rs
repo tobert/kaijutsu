@@ -2735,7 +2735,7 @@ impl kernel::Server for KernelImpl {
                 if let Some(exec_result) = last_result {
                     result_builder.set_code(exec_result.code);
                     result_builder.set_ok(exec_result.ok());
-                    result_builder.set_stdout(exec_result.out.as_bytes());
+                    result_builder.set_stdout(exec_result.text_out().as_bytes());
                     result_builder.set_stderr(&exec_result.err);
 
                     // Serialize data if present
@@ -2744,7 +2744,7 @@ impl kernel::Server for KernelImpl {
                     }
 
                     // Serialize structured output data
-                    if let Some(ref output_data) = exec_result.output {
+                    if let Some(output_data) = exec_result.output() {
                         build_output_data(
                             result_builder.reborrow().init_output_data(),
                             output_data,
@@ -5709,16 +5709,17 @@ async fn execute_shell_command(
                     result.code,
                     result.original_code,
                     result.did_spill,
-                    result.out.len(),
+                    result.text_out().len(),
                     result.err.len()
                 );
 
+                let out_text = result.text_out().into_owned();
                 let output_text = if result.err.is_empty() {
-                    result.out
-                } else if result.out.is_empty() {
-                    result.err
+                    out_text
+                } else if out_text.is_empty() {
+                    result.err.clone()
                 } else {
-                    format!("{}\n{}", result.out, result.err)
+                    format!("{}\n{}", out_text, result.err)
                 };
 
                 if let Err(e) = documents_clone.edit_text_as(
@@ -5732,7 +5733,7 @@ async fn execute_shell_command(
                     log::error!("Failed to update shell output: {}", e);
                 }
 
-                if let Some(ref output_data) = result.output
+                if let Some(output_data) = result.output()
                     && let Err(e) = documents_clone.set_output(
                         context_id,
                         &output_block_id_clone,

@@ -172,9 +172,9 @@ async fn test_ls_through_embedded_kaish() {
 
     assert_eq!(result.code, 0, "ls failed: {}", result.err);
     assert!(
-        result.out.contains("Cargo.toml"),
+        result.text_out().contains("Cargo.toml"),
         "expected Cargo.toml in ls output, got: {}",
-        result.out
+        result.text_out()
     );
 }
 
@@ -189,9 +189,9 @@ async fn test_ls_tmp() {
 
     assert_eq!(result.code, 0, "ls /tmp failed: {}", result.err);
     assert!(
-        result.out.contains("scratch.txt"),
+        result.text_out().contains("scratch.txt"),
         "expected scratch.txt in ls /tmp output, got: {}",
-        result.out
+        result.text_out()
     );
 }
 
@@ -208,9 +208,9 @@ async fn test_rapid_shell_commands() {
     assert_eq!(r2.code, 0, "echo b failed: {}", r2.err);
     assert_eq!(r3.code, 0, "echo c failed: {}", r3.err);
 
-    assert_eq!(r1.out.trim(), "a");
-    assert_eq!(r2.out.trim(), "b");
-    assert_eq!(r3.out.trim(), "c");
+    assert_eq!(r1.text_out().trim(), "a");
+    assert_eq!(r2.text_out().trim(), "b");
+    assert_eq!(r3.text_out().trim(), "c");
 }
 
 #[tokio::test]
@@ -221,13 +221,13 @@ async fn test_shell_command_with_project_root() {
 
     assert_eq!(result.code, 0, "ls failed: {}", result.err);
     assert!(
-        result.out.contains("Cargo.toml"),
+        result.text_out().contains("Cargo.toml"),
         "expected Cargo.toml in ls output (cwd=project), got: {}",
-        result.out
+        result.text_out()
     );
     assert!(
-        result.out.contains("README.md"),
+        result.text_out().contains("README.md"),
         "expected README.md in ls output (cwd=project), got: {}",
-        result.out
+        result.text_out()
     );
 }
