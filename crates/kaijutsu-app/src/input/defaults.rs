@@ -235,6 +235,20 @@ pub fn default_bindings() -> Vec<Binding> {
         Action::HalfPageUp,
         "Half page up",
     ));
+    b.push(Binding::key_mod(
+        KeyCode::Home,
+        Modifiers::CTRL,
+        InputContext::Navigation,
+        Action::ScrollToTop,
+        "Scroll to top",
+    ));
+    b.push(Binding::key_mod(
+        KeyCode::End,
+        Modifiers::CTRL,
+        InputContext::Navigation,
+        Action::ScrollToEnd,
+        "Scroll to end",
+    ));
 
     // Backtick toggles constellation
     b.push(Binding::key(
