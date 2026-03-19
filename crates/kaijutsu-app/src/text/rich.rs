@@ -52,20 +52,7 @@ pub struct RichContent {
     pub last_max_advance: f32,
 }
 
-impl RichContent {
-    /// Desired height for non-text content (sparklines, SVGs).
-    ///
-    /// Returns `Some(height)` for formats that need explicit sizing
-    /// (no Parley text to measure). Returns `None` for text-based formats.
-    pub fn desired_height(&self, theme: &crate::ui::theme::Theme) -> Option<f32> {
-        match &self.kind {
-            RichContentKind::Markdown { .. } => None,
-            RichContentKind::Sparkline(_) => Some(theme.sparkline_height),
-            RichContentKind::Svg { height, .. } => Some(*height),
-            RichContentKind::Output { .. } => None,
-        }
-    }
-}
+
 
 /// The actual content variant being rendered.
 pub enum RichContentKind {
@@ -214,7 +201,7 @@ pub fn render_rich_content(
     fonts: Res<Assets<VelloFont>>,
     font_handles: Res<super::resources::FontHandles>,
     theme: Res<crate::ui::theme::Theme>,
-    mut query: Query<(Entity, &mut RichContent, &UiVelloText, &ComputedNode)>,
+    mut query: Query<(Entity, &mut RichContent, &UiVelloText, &ComputedNode, &mut Node)>,
 ) {
     let md_colors = MarkdownColors {
         heading: theme.md_heading_color,
@@ -228,8 +215,8 @@ pub fn render_rich_content(
         fill: theme.sparkline_fill_color,
     };
 
-    for (entity, mut rich, vello_text, node) in query.iter_mut() {
-        let current_advance = node.size().x;
+    for (entity, mut rich, vello_text, computed, mut ui_node) in query.iter_mut() {
+        let current_advance = computed.size().x;
         let advance_changed =
             (rich.last_max_advance - current_advance).abs() > 1.0 && current_advance > 0.0;
 
@@ -266,7 +253,7 @@ pub fn render_rich_content(
                 render_layout_with_brushes(&mut scene, &layout, &span_brushes, &fallback_brush);
             }
             RichContentKind::Sparkline(data) => {
-                let w = node.size().x as f64;
+                let w = computed.size().x as f64;
                 let h = theme.sparkline_height as f64;
                 if w > 0.0 && h > 0.0 {
                     let paths = build_sparkline_paths(data, w, h, 4.0);
@@ -278,14 +265,92 @@ pub fn render_rich_content(
                 width: svg_w,
                 height: svg_h,
             } => {
-                let container_w = node.size().x;
-                if container_w > 0.0 && *svg_w > 0.0 {
-                    // Scale SVG to fit container width while preserving aspect ratio
-                    let scale = (container_w / svg_w).min(1.0) as f64;
-                    scene.append(svg_scene, Some(Affine::scale(scale)));
+                // UiVelloScene renders at the border-box top-left. We need to
+                // translate the SVG into the content area and scale to fit the
+                // content width (not border-box width which includes padding).
+                let node_size = computed.size();
+                let pad = &computed.padding;
+                let bdr = &computed.border;
+
+                // Content area offset from border-box origin
+                let inset_x = (pad.min_inset.x + bdr.min_inset.x) as f64;
+                let inset_y = (pad.min_inset.y + bdr.min_inset.y) as f64;
+
+                // Content area dimensions
+                let content_w = node_size.x
+                    - pad.min_inset.x - pad.max_inset.x
+                    - bdr.min_inset.x - bdr.max_inset.x;
+
+                let vertical_chrome = node_size.y - (node_size.y
+                    - pad.min_inset.y - pad.max_inset.y
+                    - bdr.min_inset.y - bdr.max_inset.y);
+
+                // Small buffer for text descenders and filter bleed near SVG edges.
+                // SVG <text> y-coordinates specify the baseline; descenders extend
+                // below, and usvg may not clip them to the viewBox boundary.
+                const SVG_EDGE_MARGIN: f32 = 8.0;
+
+                if content_w > 0.0 && *svg_w > 0.0 {
+                    // Scale to fit content width, then further constrain to max height.
+                    let w_scale = (content_w / svg_w).min(1.0);
+                    let h_scale = (SVG_MAX_HEIGHT / svg_h).min(1.0);
+                    let scale = w_scale.min(h_scale) as f64;
+                    let scaled_h = (*svg_h as f64) * scale;
+
+                    // Translate into content area, then scale
+                    let transform = Affine::translate((inset_x, inset_y))
+                        * Affine::scale(scale);
+
+                    // Node height = scaled SVG + vertical chrome + descent margin
+                    let target_h_f32 = scaled_h as f32 + vertical_chrome + SVG_EDGE_MARGIN;
+
+                    // Clip to the border box. This allows filter effects and text
+                    // descenders to bleed into the padding area without being
+                    // abruptly cut off, while preventing overflow past the node.
+                    let clip_h = (node_size.y.max(target_h_f32)) as f64;
+                    scene.push_layer(
+                        Fill::NonZero,
+                        vello::peniko::Mix::Normal,
+                        1.0,
+                        Affine::IDENTITY,
+                        &vello::kurbo::Rect::new(
+                            0.0, 0.0,
+                            node_size.x as f64, clip_h,
+                        ),
+                    );
+                    scene.append(svg_scene, Some(transform));
+                    scene.pop_layer();
+
+                    let target_h = Val::Px(target_h_f32);
+                    if ui_node.height != target_h {
+                        ui_node.height = target_h;
+                    }
+                    if ui_node.min_height != target_h {
+                        ui_node.min_height = target_h;
+                    }
                 } else {
-                    let _ = svg_h; // suppress unused warning when width is zero
-                    scene.append(svg_scene, None);
+                    // Container not laid out yet — clip to intrinsic bounds and
+                    // render unscaled. Will re-render with proper scaling once
+                    // ComputedNode has real dimensions (advance_changed trigger).
+                    let iw = *svg_w as f64 + inset_x * 2.0;
+                    let ih = *svg_h as f64 + inset_y * 2.0;
+                    let transform = Affine::translate((inset_x, inset_y));
+                    scene.push_layer(
+                        Fill::NonZero,
+                        vello::peniko::Mix::Normal,
+                        1.0,
+                        Affine::IDENTITY,
+                        &vello::kurbo::Rect::new(0.0, 0.0, iw, ih),
+                    );
+                    scene.append(svg_scene, Some(transform));
+                    scene.pop_layer();
+                    let target_h = Val::Px(*svg_h + vertical_chrome + SVG_EDGE_MARGIN);
+                    if ui_node.height != target_h {
+                        ui_node.height = target_h;
+                    }
+                    if ui_node.min_height != target_h {
+                        ui_node.min_height = target_h;
+                    }
                 }
             }
             RichContentKind::Output { layout, plain_text } => {
@@ -433,9 +498,9 @@ fn try_parse_svg(
 
     match result {
         Ok(svg) => {
-            let w = svg.width;
-            let h = svg.height.min(SVG_MAX_HEIGHT);
-            Some((svg.scene, w, h))
+            // Store the true intrinsic dimensions — render_rich_content handles
+            // scaling to fit both the container width and SVG_MAX_HEIGHT.
+            Some((svg.scene, svg.width, svg.height))
         }
         Err(e) => {
             warn!("SVG parse failed: {}", e);
