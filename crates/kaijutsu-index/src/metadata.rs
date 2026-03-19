@@ -100,7 +100,8 @@ impl MetadataStore {
 
     /// Assign a slot for a context (create or update).
     ///
-    /// Returns the slot number.
+    /// Returns the slot number. The check-then-insert is wrapped in a
+    /// transaction so the slot allocation is atomic.
     pub fn assign_slot(
         &mut self,
         ctx: ContextId,
@@ -108,40 +109,59 @@ impl MetadataStore {
         model_name: &str,
         dimensions: usize,
     ) -> Result<u32, IndexError> {
+        let tx = self.conn.transaction()
+            .map_err(|e| IndexError::Database(format!("begin transaction: {}", e)))?;
+
         // Check if we already have a slot
-        if let Some(existing_slot) = self.get_slot(ctx)? {
+        let existing_slot: Option<u32> = tx
+            .prepare("SELECT hnsw_slot FROM index_entries WHERE context_id = ?1")
+            .and_then(|mut stmt| {
+                stmt.query_row([ctx.as_bytes().as_slice()], |row| row.get::<_, u32>(0))
+                    .optional()
+            })
+            .map_err(|e| IndexError::Database(e.to_string()))?;
+
+        if let Some(slot) = existing_slot {
             // Update the hash
-            self.conn
-                .execute(
-                    "UPDATE index_entries SET content_hash = ?1, embedded_at = ?2 WHERE context_id = ?3",
-                    rusqlite::params![
-                        content_hash,
-                        now_millis(),
-                        ctx.as_bytes().as_slice(),
-                    ],
-                )
-                .map_err(|e| IndexError::Database(e.to_string()))?;
-            return Ok(existing_slot);
-        }
-
-        // Allocate next slot
-        let next_slot = self.next_slot()?;
-
-        self.conn
-            .execute(
-                "INSERT INTO index_entries (context_id, hnsw_slot, content_hash, dimensions, model_name, embedded_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            tx.execute(
+                "UPDATE index_entries SET content_hash = ?1, embedded_at = ?2 WHERE context_id = ?3",
                 rusqlite::params![
-                    ctx.as_bytes().as_slice(),
-                    next_slot,
                     content_hash,
-                    dimensions as i64,
-                    model_name,
                     now_millis(),
+                    ctx.as_bytes().as_slice(),
                 ],
             )
             .map_err(|e| IndexError::Database(e.to_string()))?;
+            tx.commit().map_err(|e| IndexError::Database(format!("commit: {}", e)))?;
+            return Ok(slot);
+        }
 
+        // Allocate next slot
+        let next_slot: u32 = tx
+            .query_row(
+                "SELECT MAX(hnsw_slot) FROM index_entries",
+                [],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .map_err(|e| IndexError::Database(e.to_string()))?
+            .map(|m| m as u32 + 1)
+            .unwrap_or(0);
+
+        tx.execute(
+            "INSERT INTO index_entries (context_id, hnsw_slot, content_hash, dimensions, model_name, embedded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                ctx.as_bytes().as_slice(),
+                next_slot,
+                content_hash,
+                dimensions as i64,
+                model_name,
+                now_millis(),
+            ],
+        )
+        .map_err(|e| IndexError::Database(e.to_string()))?;
+
+        tx.commit().map_err(|e| IndexError::Database(format!("commit: {}", e)))?;
         Ok(next_slot)
     }
 
@@ -191,19 +211,25 @@ impl MetadataStore {
         Ok(count as usize)
     }
 
-    /// Get the next available slot number.
-    fn next_slot(&self) -> Result<u32, IndexError> {
-        let max: Option<i64> = self
+    /// Evict the `n` oldest entries by `embedded_at` timestamp.
+    ///
+    /// Returns the number of rows actually deleted.
+    ///
+    /// Note: HNSW does not support point deletion — evicted slots become dead
+    /// weight in the graph until a full `rebuild()` is performed.
+    pub fn evict_oldest(&mut self, n: usize) -> Result<usize, IndexError> {
+        let deleted = self
             .conn
-            .query_row(
-                "SELECT MAX(hnsw_slot) FROM index_entries",
-                [],
-                |row| row.get(0),
+            .execute(
+                "DELETE FROM index_entries WHERE rowid IN (
+                    SELECT rowid FROM index_entries ORDER BY embedded_at ASC LIMIT ?1
+                )",
+                [n as i64],
             )
-            .map_err(|e| IndexError::Database(e.to_string()))?;
-
-        Ok(max.map(|m| m as u32 + 1).unwrap_or(0))
+            .map_err(|e| IndexError::Database(format!("evict_oldest: {}", e)))?;
+        Ok(deleted)
     }
+
 }
 
 fn now_millis() -> i64 {
@@ -290,6 +316,48 @@ mod tests {
         store.assign_slot(ContextId::new(), "h2", "model", 384).unwrap();
 
         assert_eq!(store.count().unwrap(), 2);
+    }
+
+    #[test]
+    fn test_evict_oldest() {
+        let dir = TempDir::new().unwrap();
+        let mut store = MetadataStore::open(dir.path()).unwrap();
+
+        let ctx1 = ContextId::new();
+        let ctx2 = ContextId::new();
+        let ctx3 = ContextId::new();
+
+        // Insert with increasing timestamps (assign_slot uses now_millis)
+        store.assign_slot(ctx1, "h1", "model", 384).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        store.assign_slot(ctx2, "h2", "model", 384).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        store.assign_slot(ctx3, "h3", "model", 384).unwrap();
+
+        assert_eq!(store.count().unwrap(), 3);
+
+        // Evict the 2 oldest
+        let evicted = store.evict_oldest(2).unwrap();
+        assert_eq!(evicted, 2);
+        assert_eq!(store.count().unwrap(), 1);
+
+        // ctx3 (newest) should remain
+        assert!(store.get_slot(ctx3).unwrap().is_some());
+        assert!(store.get_slot(ctx1).unwrap().is_none());
+        assert!(store.get_slot(ctx2).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_evict_oldest_more_than_available() {
+        let dir = TempDir::new().unwrap();
+        let mut store = MetadataStore::open(dir.path()).unwrap();
+
+        store.assign_slot(ContextId::new(), "h1", "model", 384).unwrap();
+        assert_eq!(store.count().unwrap(), 1);
+
+        let evicted = store.evict_oldest(10).unwrap();
+        assert_eq!(evicted, 1);
+        assert_eq!(store.count().unwrap(), 0);
     }
 
     #[test]

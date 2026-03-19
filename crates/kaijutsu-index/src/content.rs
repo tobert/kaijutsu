@@ -94,6 +94,7 @@ mod tests {
             output: None,
             content_type: None,
             order_key: None,
+            updated_at: 0,
         }
     }
 

@@ -19,6 +19,11 @@ pub struct IndexConfig {
     pub hnsw_ef_construction: usize,
     /// Maximum input tokens for the embedding model.
     pub max_tokens: usize,
+    /// Maximum number of contexts to keep in the index.
+    /// When exceeded, the oldest contexts (by `embedded_at`) are evicted.
+    /// `None` means unbounded.
+    #[serde(default)]
+    pub max_contexts: Option<usize>,
 }
 
 impl IndexConfig {
@@ -35,6 +40,7 @@ impl IndexConfig {
             hnsw_max_nb_connection: 16,
             hnsw_ef_construction: 200,
             max_tokens,
+            max_contexts: None,
         }
     }
 }

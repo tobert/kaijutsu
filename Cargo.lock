@@ -5581,6 +5581,7 @@ dependencies = [
  "diamond-types-extended",
  "env_logger",
  "futures",
+ "home",
  "kaijutsu-crdt",
  "kaijutsu-telemetry",
  "kaijutsu-types",

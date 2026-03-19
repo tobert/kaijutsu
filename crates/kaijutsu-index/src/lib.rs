@@ -154,19 +154,20 @@ impl SemanticIndex {
             return Ok(false);
         }
 
+        // Hold the metadata lock across hash-check + embed + assign_slot to prevent
+        // another thread from embedding the same context concurrently.
+        // Embedding is CPU-bound on a blocking thread, so holding std::sync::Mutex is fine.
+        let mut meta = self.metadata.lock().unwrap();
+
         // Check if already indexed with same content
-        {
-            let meta = self.metadata.lock().unwrap();
-            if meta.get_content_hash(ctx_id)?.is_some_and(|h| h == hash) {
-                return Ok(false);
-            }
+        if meta.get_content_hash(ctx_id)?.is_some_and(|h| h == hash) {
+            return Ok(false);
         }
 
         // Embed — ONNX inference is CPU-bound, fine on a blocking thread
         let embedding = self.embedder.embed(&text)?;
 
         // Assign or get slot
-        let mut meta = self.metadata.lock().unwrap();
         let slot = meta.assign_slot(
             ctx_id,
             &hash,
@@ -187,7 +188,40 @@ impl SemanticIndex {
             "indexed context"
         );
 
+        // LRU eviction: if max_contexts is set and we've exceeded it, evict oldest
+        if let Some(max) = self.config.max_contexts {
+            let count = meta.count()?;
+            if count > max {
+                let to_evict = count - max;
+                let evicted = meta.evict_oldest(to_evict)?;
+                tracing::info!(
+                    evicted = evicted,
+                    max_contexts = max,
+                    "evicted oldest contexts from index"
+                );
+            }
+        }
+
         Ok(true)
+    }
+
+    /// Rebuild the HNSW index from scratch, reclaiming dead slots from eviction.
+    ///
+    /// HNSW does not support point deletion — `evict_oldest` removes metadata
+    /// rows but leaves orphaned vectors in the graph. Call this periodically
+    /// (e.g. on server startup or via admin command) to compact the index.
+    ///
+    /// Blocking — call from `spawn_blocking`.
+    pub fn rebuild(&self) -> Result<(), IndexError> {
+        // TODO: implement full rebuild
+        //  1. Read all (slot, context_id) from metadata
+        //  2. Collect embeddings from current HNSW for live slots
+        //  3. Create a fresh HnswIndex
+        //  4. Re-insert all live embeddings with compacted slot numbers
+        //  5. Update metadata slot numbers to match
+        //  6. Swap the new index into self.hnsw
+        tracing::warn!("rebuild() is not yet implemented — dead HNSW slots persist until then");
+        Ok(())
     }
 
     /// Search for contexts similar to a text query.
@@ -386,6 +420,7 @@ mod tests {
             hnsw_max_nb_connection: 8,
             hnsw_ef_construction: 50,
             max_tokens: 512,
+            max_contexts: None,
         }
     }
 
@@ -501,6 +536,34 @@ mod tests {
 
         let results = idx.search("anything", 5).unwrap();
         assert!(results.is_empty(), "empty index should return empty results");
+    }
+
+    #[test]
+    fn test_max_contexts_eviction() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_contexts = Some(2);
+        let idx = SemanticIndex::new(config, Box::new(MockEmbedder { dims: 32 })).unwrap();
+
+        let ctx1 = ContextId::new();
+        let ctx2 = ContextId::new();
+        let ctx3 = ContextId::new();
+
+        idx.index_context(ctx1, &make_blocks(ctx1, "alpha context first")).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        idx.index_context(ctx2, &make_blocks(ctx2, "beta context second")).unwrap();
+        assert_eq!(idx.len(), 2);
+
+        // Indexing a third should evict the oldest (ctx1)
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        idx.index_context(ctx3, &make_blocks(ctx3, "gamma context third")).unwrap();
+        assert_eq!(idx.len(), 2, "should have evicted down to max_contexts");
+
+        // ctx1 should be gone from metadata
+        let meta = idx.metadata.lock().unwrap();
+        assert!(meta.get_slot(ctx1).unwrap().is_none(), "ctx1 should be evicted");
+        assert!(meta.get_slot(ctx2).unwrap().is_some(), "ctx2 should remain");
+        assert!(meta.get_slot(ctx3).unwrap().is_some(), "ctx3 should remain");
     }
 
     #[test]

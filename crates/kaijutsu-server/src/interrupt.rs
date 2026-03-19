@@ -17,20 +17,28 @@ use tokio_util::sync::CancellationToken;
 /// Per-context cancellation state.
 ///
 /// A fresh instance is created at the start of every `process_llm_stream`
-/// call (via `get_or_create_interrupt`). The `CancellationToken` cannot be
+/// call (via `create_interrupt`). The `CancellationToken` cannot be
 /// reset, so re-creating on each prompt is the correct approach.
+///
+/// Each instance carries a `generation` counter to prevent a race where
+/// stream A's cleanup removes stream B's interrupt state. The cleanup
+/// path compares generations before removing.
 pub struct ContextInterruptState {
     /// Soft interrupt: stop the agentic loop before the NEXT LLM call.
     pub stop_after_turn: AtomicBool,
     /// Hard interrupt: abort the current LLM stream immediately.
     pub cancel: CancellationToken,
+    /// Monotonically increasing generation counter. Assigned by
+    /// `SharedKernelState::create_interrupt` from a per-map atomic.
+    pub generation: u64,
 }
 
 impl ContextInterruptState {
-    pub fn new() -> Arc<Self> {
+    pub fn new(generation: u64) -> Arc<Self> {
         Arc::new(Self {
             stop_after_turn: AtomicBool::new(false),
             cancel: CancellationToken::new(),
+            generation,
         })
     }
 

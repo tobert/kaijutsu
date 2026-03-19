@@ -88,6 +88,7 @@ pub async fn connect_client(addr: SocketAddr) -> RpcClient {
         port: addr.port(),
         username: "test_user".to_string(),
         key_source: KeySource::ephemeral(),
+        insecure: true,
     };
 
     let mut ssh_client = kaijutsu_client::SshClient::new(config);

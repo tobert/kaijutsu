@@ -75,6 +75,9 @@ pub struct SshConfig {
     pub port: u16,
     pub username: String,
     pub key_source: KeySource,
+    /// Skip known_hosts verification (accept any server key with a warning).
+    /// Intended for `--insecure` CLI flag; default is false (TOFU enabled).
+    pub insecure: bool,
 }
 
 impl Default for SshConfig {
@@ -84,12 +87,16 @@ impl Default for SshConfig {
             port: DEFAULT_SSH_PORT,
             username: whoami::username(),
             key_source: KeySource::Agent,
+            insecure: false,
         }
     }
 }
 
-/// Client handler for russh - handles server key verification
+/// Client handler for russh - handles server key verification via TOFU
 struct ClientHandler {
+    host: String,
+    port: u16,
+    insecure: bool,
     #[allow(dead_code)]
     server_key: Option<PublicKey>,
 }
@@ -101,23 +108,65 @@ impl client::Handler for ClientHandler {
         &mut self,
         server_public_key: &PublicKey,
     ) -> Result<bool, Self::Error> {
-        // ╔═══════════════════════════════════════════════════════════════════════════╗
-        // ║ SECURITY WARNING: SSH KEY VERIFICATION DISABLED                           ║
-        // ║                                                                           ║
-        // ║ This client accepts ANY server key without verification.                  ║
-        // ║ This is acceptable for local development but NOT for production.          ║
-        // ║                                                                           ║
-        // ║ TODO: Implement proper known_hosts verification before production use.    ║
-        // ║ - Parse ~/.ssh/known_hosts                                                ║
-        // ║ - Verify server key fingerprint matches                                   ║
-        // ║ - Prompt user for unknown keys                                            ║
-        // ╚═══════════════════════════════════════════════════════════════════════════╝
-        log::warn!(
-            "Accepting server key without verification: {}",
-            server_public_key.fingerprint(HashAlg::Sha256)
-        );
+        let fingerprint = server_public_key.fingerprint(HashAlg::Sha256);
         self.server_key = Some(server_public_key.clone());
-        Ok(true)
+
+        if self.insecure {
+            log::warn!(
+                "INSECURE: accepting server key without verification: {}",
+                fingerprint
+            );
+            return Ok(true);
+        }
+
+        // TOFU: Trust On First Use via ~/.ssh/known_hosts
+        use russh::keys::known_hosts;
+
+        match known_hosts::check_known_hosts(&self.host, self.port, server_public_key) {
+            Ok(true) => {
+                log::info!(
+                    "Server key verified for {}:{} ({})",
+                    self.host, self.port, fingerprint
+                );
+                Ok(true)
+            }
+            Ok(false) => {
+                // Host not in known_hosts — first use, learn and accept
+                log::info!(
+                    "First connection to {}:{}, trusting server key: {}",
+                    self.host, self.port, fingerprint
+                );
+                if let Err(e) = known_hosts::learn_known_hosts(
+                    &self.host, self.port, server_public_key,
+                ) {
+                    log::warn!(
+                        "Failed to save server key to known_hosts: {}. \
+                         Connection will proceed but key won't be remembered.",
+                        e
+                    );
+                }
+                Ok(true)
+            }
+            Err(russh::keys::Error::KeyChanged { line }) => {
+                let path = home::home_dir()
+                    .map(|h| h.join(".ssh/known_hosts"))
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "~/.ssh/known_hosts".into());
+                Err(SshError::HostKeyMismatch {
+                    host: self.host.clone(),
+                    port: self.port,
+                    fingerprint: fingerprint.to_string(),
+                    known_hosts_path: path,
+                    line,
+                })
+            }
+            Err(e) => {
+                Err(SshError::HostKeyVerificationFailed(format!(
+                    "Failed to verify server key for {}:{}: {}",
+                    self.host, self.port, e
+                )))
+            }
+        }
     }
 }
 
@@ -151,7 +200,12 @@ impl SshClient {
             ..<_>::default()
         };
 
-        let handler = ClientHandler { server_key: None };
+        let handler = ClientHandler {
+            host: self.config.host.clone(),
+            port: self.config.port,
+            insecure: self.config.insecure,
+            server_key: None,
+        };
         let addr = (self.config.host.as_str(), self.config.port);
         let mut session = client::connect(Arc::new(config), addr, handler)
             .await
@@ -327,6 +381,19 @@ pub enum SshError {
     NoKeysAvailable,
     #[error("Disconnected")]
     Disconnected,
+    #[error(
+        "HOST KEY CHANGED for {host}:{port}! Server fingerprint: {fingerprint}. \
+         If this is expected, remove the old entry from {known_hosts_path} line {line}"
+    )]
+    HostKeyMismatch {
+        host: String,
+        port: u16,
+        fingerprint: String,
+        known_hosts_path: String,
+        line: usize,
+    },
+    #[error("Host key verification failed: {0}")]
+    HostKeyVerificationFailed(String),
 }
 
 impl From<russh::Error> for SshError {

@@ -31,13 +31,20 @@ impl HnswIndex {
         let data_path = data_dir.join("index.hnsw.data");
 
         if graph_path.exists() && data_path.exists() {
-            // Leak the HnswIo so the loaded Hnsw can have 'static lifetime.
-            // This is intentional — the index lives for the server's lifetime.
-            let hnsw_io: &'static HnswIo =
-                Box::leak(Box::new(HnswIo::new(&data_dir, "index")));
+            // Box the HnswIo first without leaking — only leak after successful load.
+            let hnsw_io_box = Box::new(HnswIo::new(&data_dir, "index"));
 
-            match hnsw_io.load_hnsw_with_dist(DistCosine) {
+            // SAFETY: We need a &'static reference for load_hnsw_with_dist, which
+            // returns an Hnsw that borrows from HnswIo. We create a raw pointer to
+            // get the reference, then leak only on success. On failure we reclaim the Box.
+            let hnsw_io_ptr: *const HnswIo = &*hnsw_io_box;
+            let hnsw_io_ref: &'static HnswIo = unsafe { &*hnsw_io_ptr };
+
+            match hnsw_io_ref.load_hnsw_with_dist(DistCosine) {
                 Ok(loaded) => {
+                    // Load succeeded — the Hnsw borrows from HnswIo, so leak it now.
+                    let hnsw_io: &'static HnswIo = Box::leak(hnsw_io_box);
+
                     // Rebuild embeddings cache from HNSW's persisted vectors.
                     // Layer 0 contains all points — iterate to populate the cache
                     // so get_embedding() and get_all_embeddings() work after reload.
@@ -67,11 +74,12 @@ impl HnswIndex {
                     });
                 }
                 Err(e) => {
+                    // Load failed — drop the Box normally, no leak.
+                    drop(hnsw_io_box);
                     tracing::warn!(
                         error = %e,
                         "failed to load HNSW index, creating new"
                     );
-                    // Can't un-leak, but this is a rare error path
                 }
             }
         }
@@ -175,6 +183,7 @@ mod tests {
             hnsw_max_nb_connection: 8,
             hnsw_ef_construction: 50,
             max_tokens: 512,
+            max_contexts: None,
         }
     }
 
