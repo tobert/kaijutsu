@@ -242,14 +242,17 @@ pub struct SharedKernelState {
     pub config_watcher: Option<ConfigWatcherHandle>,
     pub conversation_cache: Arc<ConversationCache>,
     /// SQLite persistence for context metadata, edges, presets, workspaces.
-    /// Arc<std::sync::Mutex> (not tokio) — shared with KjDispatcher, all ops sync and sub-ms.
-    pub kernel_db: Arc<std::sync::Mutex<KernelDb>>,
+    /// Arc<parking_lot::Mutex> (not tokio) — shared with KjDispatcher, all ops sync and sub-ms.
+    pub kernel_db: Arc<parking_lot::Mutex<KernelDb>>,
     /// Semantic vector index for context search/clustering.
     /// None if embedding model not configured or unavailable.
     pub semantic_index: Option<Arc<kaijutsu_index::SemanticIndex>>,
     /// Per-context interrupt state. Created fresh at the start of each
     /// `process_llm_stream` call; looked up by `interruptContext` RPC.
     pub context_interrupts: Arc<TokioRwLock<HashMap<ContextId, Arc<ContextInterruptState>>>>,
+    /// Monotonically increasing generation counter for interrupt state.
+    /// Prevents race where stream A's cleanup removes stream B's interrupt.
+    pub interrupt_generation: AtomicU64,
     /// kj command dispatcher — shared across all connections.
     pub kj_dispatcher: Arc<kaijutsu_kernel::KjDispatcher>,
 }
@@ -260,11 +263,15 @@ impl SharedKernelState {
     /// Create a fresh `ContextInterruptState` for a new prompt, replacing any previous entry.
     ///
     /// `CancellationToken` cannot be reset — so each prompt gets a new one.
-    pub async fn create_interrupt(&self, context_id: ContextId) -> Arc<ContextInterruptState> {
-        let state = ContextInterruptState::new();
+    /// Returns the interrupt state and its generation number. The generation
+    /// must be passed to `remove_interrupt` to prevent the race where stream A's
+    /// cleanup removes stream B's newer interrupt.
+    pub async fn create_interrupt(&self, context_id: ContextId) -> (Arc<ContextInterruptState>, u64) {
+        let generation = self.interrupt_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        let state = ContextInterruptState::new(generation);
         let mut map = self.context_interrupts.write().await;
         map.insert(context_id, state.clone());
-        state
+        (state, generation)
     }
 
     /// Look up an existing interrupt state for a context.
@@ -276,9 +283,17 @@ impl SharedKernelState {
     }
 
     /// Remove the interrupt state for a context (called when stream finishes).
-    pub async fn remove_interrupt(&self, context_id: ContextId) {
+    ///
+    /// Only removes the entry if `generation` matches the current state's
+    /// generation, preventing a stale stream from removing a newer stream's
+    /// interrupt state.
+    pub async fn remove_interrupt(&self, context_id: ContextId, generation: u64) {
         let mut map = self.context_interrupts.write().await;
-        map.remove(&context_id);
+        if let Some(state) = map.get(&context_id) {
+            if state.generation == generation {
+                map.remove(&context_id);
+            }
+        }
     }
 }
 
@@ -295,7 +310,6 @@ pub struct ConnectionState {
     pub current_context_id: Option<ContextId>,
     pub kaish: Option<Rc<EmbeddedKaish>>,
     pub command_history: Vec<CommandEntry>,
-    pub consent_mode: ConsentMode,
     next_exec_id: AtomicU64,
 }
 
@@ -307,7 +321,6 @@ impl ConnectionState {
             current_context_id: None,
             kaish: None,
             command_history: Vec::new(),
-            consent_mode: ConsentMode::Collaborative,
             next_exec_id: AtomicU64::new(1),
         }
     }
@@ -356,27 +369,26 @@ fn kernel_data_dir() -> std::path::PathBuf {
 
 /// Create a BlockStore backed by the shared KernelDb.
 fn create_block_store_with_kernel_db(
-    db: Arc<std::sync::Mutex<KernelDb>>,
+    db: Arc<parking_lot::Mutex<KernelDb>>,
     kernel_id: KernelId,
     default_workspace_id: kaijutsu_types::WorkspaceId,
     agent_id: PrincipalId,
     block_flows: SharedBlockFlowBus,
     input_flows: SharedInputDocFlowBus,
-) -> SharedBlockStore {
+) -> Result<SharedBlockStore, String> {
     let mut inner = BlockStore::with_db_and_flows(
         db, kernel_id, default_workspace_id, agent_id, block_flows,
     );
     inner.set_input_flows(input_flows);
     let store = Arc::new(inner);
-    if let Err(e) = store.load_from_db() {
-        log::warn!("Failed to load documents from DB: {}", e);
-    } else {
-        log::info!("Loaded {} documents from database", store.len());
-    }
+    store.load_from_db().map_err(|e| {
+        format!("Failed to load documents from DB (refusing to start with empty store): {e}")
+    })?;
+    log::info!("Loaded {} documents from database", store.len());
     if let Err(e) = store.load_input_docs_from_db() {
         log::warn!("Failed to load input docs from DB: {}", e);
     }
-    store
+    Ok(store)
 }
 
 /// Get the config directory path.
@@ -585,12 +597,6 @@ async fn initialize_kernel_mcp(
     futures::future::join_all(futs).await;
 }
 
-#[derive(Clone, Copy)]
-pub enum ConsentMode {
-    Collaborative,
-    Autonomous,
-}
-
 #[derive(Clone)]
 pub struct CommandEntry {
     pub id: u64,
@@ -717,9 +723,9 @@ pub async fn create_shared_kernel(
     kernel.freeze_mounts();
 
     // Wrap KernelDb in Arc<Mutex> and create auto-workspaces
-    let kernel_db_arc = Arc::new(std::sync::Mutex::new(kernel_db));
+    let kernel_db_arc = Arc::new(parking_lot::Mutex::new(kernel_db));
     let default_ws_id = {
-        let db = kernel_db_arc.lock().unwrap();
+        let db = kernel_db_arc.lock();
         db.get_or_create_default_workspace(id, PrincipalId::system()).unwrap()
     };
 
@@ -728,7 +734,7 @@ pub async fn create_shared_kernel(
     let documents = create_block_store_with_kernel_db(
         kernel_db_arc.clone(), id, default_ws_id,
         PrincipalId::system(), block_flows, input_flows,
-    );
+    ).map_err(|e| capnp::Error::failed(e))?;
 
     // Create config backend
     let (config_backend, config_watcher) =
@@ -743,7 +749,7 @@ pub async fn create_shared_kernel(
 
     // Recover contexts: KernelDb is the primary source, with BlockStore discovery as fallback.
     let all_contexts = {
-        let db = kernel_db_arc.lock().unwrap();
+        let db = kernel_db_arc.lock();
         // Step 1: Load active contexts from KernelDb
         let db_contexts = match db.list_active_contexts(id) {
             Ok(rows) => rows,
@@ -917,6 +923,7 @@ pub async fn create_shared_kernel(
         kernel_db: kernel_db_arc,
         semantic_index,
         context_interrupts: Arc::new(TokioRwLock::new(HashMap::new())),
+        interrupt_generation: AtomicU64::new(0),
         kj_dispatcher,
     };
 
@@ -1748,7 +1755,7 @@ impl kernel::Server for KernelImpl {
         Promise::from_future(async move {
             // Build KernelDb lookup for fork_kind + archived_at (fields not on DriftRouter)
             let db_map: HashMap<ContextId, ContextRow> = {
-                let db = kernel_db_arc.lock().unwrap();
+                let db = kernel_db_arc.lock();
                 match db.list_all_contexts(kernel_id) {
                     Ok(rows) => rows.into_iter().map(|r| (r.context_id, r)).collect(),
                     Err(_) => HashMap::new(),
@@ -1849,7 +1856,7 @@ impl kernel::Server for KernelImpl {
 
             // Write-through: KernelDb first, then DriftRouter
             {
-                let db = kernel.kernel_db.lock().unwrap();
+                let db = kernel.kernel_db.lock();
                 let row = ContextRow {
                     context_id,
                     kernel_id: kernel.id,
@@ -3221,7 +3228,7 @@ impl kernel::Server for KernelImpl {
                 Ok(new_provider) => {
                     // Provider is valid — now persist
                     {
-                        let db = shared_kernel.kernel_db.lock().unwrap();
+                        let db = shared_kernel.kernel_db.lock();
                         if let Err(e) = db.update_model(ctx_id, Some(&provider_name), Some(&model)) {
                             log::warn!("KernelDb update_model failed for {}: {}", ctx_id.short(), e);
                         }
@@ -3544,7 +3551,7 @@ impl kernel::Server for KernelImpl {
         Promise::from_future(async move {
             // Write-through: KernelDb first
             {
-                let db = shared_kernel.kernel_db.lock().unwrap();
+                let db = shared_kernel.kernel_db.lock();
                 if let Err(e) = db.update_tool_filter(context_id, &Some(filter.clone())) {
                     log::warn!("KernelDb update_tool_filter failed for {}: {}", context_id.short(), e);
                 }
@@ -4378,7 +4385,7 @@ impl kernel::Server for KernelImpl {
         let kernel_id = self.kernel.id;
 
         let presets = {
-            let db = self.kernel.kernel_db.lock().unwrap();
+            let db = self.kernel.kernel_db.lock();
             db.list_presets(kernel_id).unwrap_or_default()
         };
 
@@ -4744,7 +4751,9 @@ async fn spawn_llm_for_prompt(
     let config_backend = kernel.config_backend.clone();
     let conversation_cache = kernel.conversation_cache.clone();
     // Create a fresh interrupt state for this prompt (replaces any previous entry).
-    let interrupt = kernel.create_interrupt(context_id).await;
+    // The generation counter prevents the race where stream A's cleanup removes
+    // stream B's interrupt state.
+    let (interrupt, interrupt_generation) = kernel.create_interrupt(context_id).await;
     let context_interrupts = kernel.context_interrupts.clone();
 
     // Load system prompt from config
@@ -4822,6 +4831,7 @@ async fn spawn_llm_for_prompt(
         user_agent_id,
         tool_ctx,
         interrupt,
+        interrupt_generation,
         context_interrupts,
     ));
 
@@ -5051,6 +5061,7 @@ async fn process_llm_stream(
     _user_agent_id: PrincipalId,
     tool_ctx: kaijutsu_kernel::ToolContext,
     interrupt: Arc<ContextInterruptState>,
+    interrupt_generation: u64,
     context_interrupts: Arc<TokioRwLock<HashMap<ContextId, Arc<ContextInterruptState>>>>,
 ) {
     // Get per-context lock — held for the entire stream, serializing
@@ -5498,8 +5509,16 @@ async fn process_llm_stream(
         log::warn!("Failed to save snapshot for cell {}: {}", context_id, e);
     }
 
-    // Clean up interrupt state — the context is no longer actively streaming.
-    context_interrupts.write().await.remove(&context_id);
+    // Clean up interrupt state — only remove if our generation still matches.
+    // A newer stream may have replaced our entry; removing it would be a bug.
+    {
+        let mut map = context_interrupts.write().await;
+        if let Some(state) = map.get(&context_id) {
+            if state.generation == interrupt_generation {
+                map.remove(&context_id);
+            }
+        }
+    }
 
     log::info!("LLM stream processing complete for cell {}", context_id);
 }
@@ -5833,6 +5852,15 @@ fn parse_block_event_filter(
                             crate::kaijutsu_capnp::BlockFlowKind::SyncReset => {
                                 kaijutsu_types::BlockFlowKind::SyncReset
                             }
+                            crate::kaijutsu_capnp::BlockFlowKind::OutputChanged => {
+                                kaijutsu_types::BlockFlowKind::OutputChanged
+                            }
+                            crate::kaijutsu_capnp::BlockFlowKind::MetadataChanged => {
+                                kaijutsu_types::BlockFlowKind::MetadataChanged
+                            }
+                            crate::kaijutsu_capnp::BlockFlowKind::ContextSwitched => {
+                                kaijutsu_types::BlockFlowKind::ContextSwitched
+                            }
                         })
                     })
                     .collect()
@@ -5989,6 +6017,7 @@ fn parse_block_snapshot(
         drift_kind: if reader.get_has_drift_kind() {
             capnp_drift_kind_to_crdt(reader.get_drift_kind().ok())
         } else { None },
+        updated_at: 0, // Not in wire protocol; receiver advances clock from header sync
     })
 }
 

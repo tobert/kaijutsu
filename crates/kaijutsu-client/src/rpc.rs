@@ -649,7 +649,8 @@ impl KernelHandle {
             let mut call = request.get().init_call();
             call.set_server(server);
             call.set_tool(tool);
-            call.set_arguments(&serde_json::to_string(arguments).unwrap_or_default());
+            call.set_arguments(&serde_json::to_string(arguments)
+                .map_err(|e| RpcError::Other(format!("Failed to serialize MCP arguments: {e}")))?);
         }
         {
             let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
@@ -1590,10 +1591,9 @@ fn set_block_event_filter_builder(
                 kaijutsu_types::BlockFlowKind::CollapsedChanged => crate::kaijutsu_capnp::BlockFlowKind::CollapsedChanged,
                 kaijutsu_types::BlockFlowKind::Moved => crate::kaijutsu_capnp::BlockFlowKind::Moved,
                 kaijutsu_types::BlockFlowKind::SyncReset => crate::kaijutsu_capnp::BlockFlowKind::SyncReset,
-                // Not on wire yet — map to status as closest approximation
-                kaijutsu_types::BlockFlowKind::OutputChanged
-                | kaijutsu_types::BlockFlowKind::MetadataChanged
-                | kaijutsu_types::BlockFlowKind::ContextSwitched => crate::kaijutsu_capnp::BlockFlowKind::StatusChanged,
+                kaijutsu_types::BlockFlowKind::OutputChanged => crate::kaijutsu_capnp::BlockFlowKind::OutputChanged,
+                kaijutsu_types::BlockFlowKind::MetadataChanged => crate::kaijutsu_capnp::BlockFlowKind::MetadataChanged,
+                kaijutsu_types::BlockFlowKind::ContextSwitched => crate::kaijutsu_capnp::BlockFlowKind::ContextSwitched,
             });
         }
     }
@@ -2169,6 +2169,8 @@ pub enum RpcError {
     CapabilityLost,
     #[error("Server error: {0}")]
     ServerError(String),
+    #[error("{0}")]
+    Other(String),
 }
 
 #[cfg(test)]

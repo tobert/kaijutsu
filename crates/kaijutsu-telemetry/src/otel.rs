@@ -80,7 +80,7 @@ where
 
     global::set_tracer_provider(provider.clone());
 
-    let tracer = provider.tracer("kaijutsu");
+    let tracer = provider.tracer(service_name.to_string());
     let layer = tracing_opentelemetry::layer().with_tracer(tracer);
 
     (layer, OtelGuard { provider, _runtime_enter: enter_guard, _runtime: runtime_ref })

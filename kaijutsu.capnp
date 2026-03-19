@@ -90,6 +90,9 @@ enum BlockFlowKind {
   collapsedChanged @4;
   moved @5;
   syncReset @6;
+  outputChanged @7;
+  metadataChanged @8;
+  contextSwitched @9;
 }
 
 # Server-side filter for block event subscriptions.

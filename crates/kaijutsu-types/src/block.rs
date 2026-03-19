@@ -166,7 +166,7 @@ impl BlockHeader {
             collapsed: snap.collapsed,
             ephemeral: snap.ephemeral,
             created_at: snap.created_at,
-            updated_at: 0, // Lamport default: no local mutations yet
+            updated_at: snap.updated_at,
             tool_kind: snap.tool_kind,
             exit_code: snap.exit_code,
             is_error: snap.is_error,
@@ -564,6 +564,14 @@ pub struct BlockSnapshot {
     /// via named constructors (those get order_key assigned when inserted).
     #[serde(default)]
     pub order_key: Option<String>,
+
+    // CRDT metadata
+
+    /// Lamport timestamp for LWW conflict resolution.
+    /// Propagated during sync so receivers can advance their clocks.
+    /// Defaults to 0 for snapshots from persistence or older wire formats.
+    #[serde(default)]
+    pub updated_at: u64,
 }
 
 impl BlockSnapshot {
@@ -579,7 +587,7 @@ impl BlockSnapshot {
         role: Role,
         content: impl Into<String>,
     ) -> Self {
-        debug_assert!(
+        assert!(
             parent_id.is_none_or(|p| p.context_id == id.context_id),
             "parent_id must be in same context as block (use source_context for drift)"
         );
@@ -608,6 +616,7 @@ impl BlockSnapshot {
             file_path: None,
             content_type: None,
             order_key: None,
+            updated_at: 0,
         }
     }
 
@@ -617,7 +626,7 @@ impl BlockSnapshot {
         parent_id: Option<BlockId>,
         content: impl Into<String>,
     ) -> Self {
-        debug_assert!(
+        assert!(
             parent_id.is_none_or(|p| p.context_id == id.context_id),
             "parent_id must be in same context as block (use source_context for drift)"
         );
@@ -646,6 +655,7 @@ impl BlockSnapshot {
             file_path: None,
             content_type: None,
             order_key: None,
+            updated_at: 0,
         }
     }
 
@@ -662,7 +672,7 @@ impl BlockSnapshot {
         role: Role,
         tool_use_id: Option<String>,
     ) -> Self {
-        debug_assert!(
+        assert!(
             parent_id.is_none_or(|p| p.context_id == id.context_id),
             "parent_id must be in same context as block (use source_context for drift)"
         );
@@ -692,6 +702,7 @@ impl BlockSnapshot {
             file_path: None,
             content_type: None,
             order_key: None,
+            updated_at: 0,
         }
     }
 
@@ -705,7 +716,7 @@ impl BlockSnapshot {
         exit_code: Option<i32>,
         tool_use_id: Option<String>,
     ) -> Self {
-        debug_assert!(
+        assert!(
             tool_call_id.context_id == id.context_id,
             "tool_call_id must be in same context as result block"
         );
@@ -734,6 +745,7 @@ impl BlockSnapshot {
             file_path: None,
             content_type: None,
             order_key: None,
+            updated_at: 0,
         }
     }
 
@@ -751,7 +763,7 @@ impl BlockSnapshot {
         output: Option<OutputData>,
         tool_use_id: Option<String>,
     ) -> Self {
-        debug_assert!(
+        assert!(
             tool_call_id.context_id == id.context_id,
             "tool_call_id must be in same context as result block"
         );
@@ -780,6 +792,7 @@ impl BlockSnapshot {
             file_path: None,
             content_type: None,
             order_key: None,
+            updated_at: 0,
         }
     }
 
@@ -792,7 +805,7 @@ impl BlockSnapshot {
         source_model: Option<String>,
         drift_kind: DriftKind,
     ) -> Self {
-        debug_assert!(
+        assert!(
             parent_id.is_none_or(|p| p.context_id == id.context_id),
             "parent_id must be in same context as block (use source_context for drift)"
         );
@@ -821,6 +834,7 @@ impl BlockSnapshot {
             file_path: None,
             content_type: None,
             order_key: None,
+            updated_at: 0,
         }
     }
 
@@ -831,7 +845,7 @@ impl BlockSnapshot {
         file_path: impl Into<String>,
         content: impl Into<String>,
     ) -> Self {
-        debug_assert!(
+        assert!(
             parent_id.is_none_or(|p| p.context_id == id.context_id),
             "parent_id must be in same context as block"
         );
@@ -860,6 +874,7 @@ impl BlockSnapshot {
             file_path: Some(file_path.into()),
             content_type: None,
             order_key: None,
+            updated_at: 0,
         }
     }
 
@@ -967,6 +982,7 @@ impl BlockSnapshotBuilder {
                 file_path: None,
                 content_type: None,
                 order_key: None,
+                updated_at: 0,
             },
         }
     }
@@ -2030,7 +2046,6 @@ mod tests {
     // ── debug_assert! safety rails ───────────────────────────────────
 
     #[test]
-    #[cfg_attr(not(debug_assertions), ignore)]
     #[should_panic(expected = "parent_id must be in same context")]
     fn test_panic_on_cross_context_parent_text() {
         let ctx1 = ContextId::new();
@@ -2041,7 +2056,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(not(debug_assertions), ignore)]
     #[should_panic(expected = "parent_id must be in same context")]
     fn test_panic_on_cross_context_parent_thinking() {
         let ctx1 = ContextId::new();
@@ -2052,7 +2066,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(not(debug_assertions), ignore)]
     #[should_panic(expected = "parent_id must be in same context")]
     fn test_panic_on_cross_context_parent_tool_call() {
         let ctx1 = ContextId::new();
@@ -2071,7 +2084,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(not(debug_assertions), ignore)]
     #[should_panic(expected = "tool_call_id must be in same context")]
     fn test_panic_on_cross_context_tool_result() {
         let ctx1 = ContextId::new();
@@ -2090,7 +2102,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(not(debug_assertions), ignore)]
     #[should_panic(expected = "tool_call_id must be in same context")]
     fn test_panic_on_cross_context_tool_result_with_output() {
         let ctx1 = ContextId::new();
@@ -2110,7 +2121,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(not(debug_assertions), ignore)]
     #[should_panic(expected = "parent_id must be in same context")]
     fn test_panic_on_cross_context_parent_drift() {
         let ctx1 = ContextId::new();
