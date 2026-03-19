@@ -787,7 +787,8 @@ impl ExecutionEngine for RhaiEngine {
 
     fn description(&self) -> &str {
         "Rhai scripting engine with persistent per-context state. \
-         Key function: svg_block(svg_string) — inserts SVG as a visible block in the conversation. \
+         Key functions: svg_block(svg_string) — inserts SVG as a visible block; \
+         abc_block(abc_string) — inserts ABC music notation as sheet music. \
          Stdlib: math (sin, cos, lerp, clamp, PI, sqrt, etc.), \
          color (hex, oklch, hsl, rgb, color_mix, color_lighten, hue_shift, etc.), \
          format (xml_escape, fmt_f, to_float, to_int), \
@@ -855,6 +856,7 @@ impl ExecutionEngine for RhaiEngine {
             "get_block_content",
             // Context-aware
             "svg_block",
+            "abc_block",
             // Utility
             "println",
             "log",
@@ -939,13 +941,14 @@ impl ExecutionEngine for RhaiEngine {
             "properties": {
                 "code": {
                     "type": "string",
-                    "description": "Rhai script to execute. State (variables, functions) persists across calls within the same context. Use svg_block(svg_string) to insert SVG as a visible block.",
+                    "description": "Rhai script to execute. State (variables, functions) persists across calls within the same context. Use svg_block(svg_string) to insert SVG as a visible block, or abc_block(abc_string) to insert ABC music notation as sheet music.",
                 },
             },
             "required": ["code"],
             "additionalProperties": false,
             "context_functions": [
                 { "name": "svg_block", "sig": "svg_block(content: string) -> string", "doc": "Insert SVG content as a block in the current conversation. Returns block ID." },
+                { "name": "abc_block", "sig": "abc_block(content: string) -> string", "doc": "Insert ABC music notation as a block in the current conversation. Renders to sheet music SVG. Returns block ID." },
             ],
             "stdlib": catalog["functions"],
         }))
