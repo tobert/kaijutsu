@@ -296,6 +296,10 @@ fn poll_server_events(
 
     // Re-subscribe when actor changes (new generation)
     if actor.is_changed() {
+        log::debug!(
+            "poll_server_events: subscribing to event broadcast (gen {})",
+            actor.generation
+        );
         *receiver = Some(actor.handle.subscribe_events());
     }
 

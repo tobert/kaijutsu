@@ -15,6 +15,23 @@ use tokio_util::compat::TokioAsyncReadCompatExt;
 
 use crate::kaijutsu_capnp::world;
 
+/// Aborts the Cap'n Proto RPC system task when the last reference is dropped.
+///
+/// Without this, `spawn_local(rpc_system)` runs forever — the task owns the
+/// underlying SSH stream, so the server never sees a disconnect even after
+/// the actor exits and drops `ConnectionState`.
+#[derive(Clone)]
+struct RpcSystemGuard(#[allow(dead_code)] std::rc::Rc<RpcSystemGuardInner>);
+
+#[allow(dead_code)]
+struct RpcSystemGuardInner(tokio::task::AbortHandle);
+
+impl Drop for RpcSystemGuardInner {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// RPC client wrapper
 ///
 /// Holds the World capability bootstrapped from the server.
@@ -24,6 +41,10 @@ use crate::kaijutsu_capnp::world;
 #[derive(Clone)]
 pub struct RpcClient {
     world: world::Client,
+    /// Aborts the RPC system task when the last RpcClient clone is dropped.
+    /// This closes the underlying stream, causing the server to detect
+    /// the disconnect and stop its FlowBus bridge task.
+    _rpc_guard: RpcSystemGuard,
     /// Retained SSH channels to prevent SSH_MSG_CHANNEL_CLOSE on drop.
     /// These are unused but must stay alive for the connection's lifetime.
     #[allow(dead_code)]
@@ -62,11 +83,14 @@ impl RpcClient {
         let mut rpc_system = RpcSystem::new(rpc_network, None);
         let world: world::Client = rpc_system.bootstrap(rpc_twoparty_capnp::Side::Server);
 
-        // Spawn the RPC system to run in the background (requires LocalSet)
-        tokio::task::spawn_local(rpc_system);
+        // Spawn the RPC system to run in the background (requires LocalSet).
+        // Store the abort handle so we can cancel it when the connection drops.
+        let handle = tokio::task::spawn_local(rpc_system);
+        let rpc_guard = RpcSystemGuard(std::rc::Rc::new(RpcSystemGuardInner(handle.abort_handle())));
 
         Ok(Self {
             world,
+            _rpc_guard: rpc_guard,
             retained_channels: None,
             ssh_session: None,
         })
