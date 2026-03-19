@@ -172,10 +172,16 @@ pub fn sync_block_cell_buffers(
                 Some(&svg_fontdb),
             )
         {
-            // For sparklines: clear text so Parley won't fight min_height
-            let is_sparkline =
-                matches!(rich.kind, crate::text::rich::RichContentKind::Sparkline(_));
-            if is_sparkline {
+            // For sparklines and SVGs: clear text so Parley's ContentSize
+            // doesn't fight min_height. The invisible source text would otherwise
+            // drive the block height, causing overlap when the source is shorter
+            // than the rendered graphic.
+            let needs_text_cleared = matches!(
+                rich.kind,
+                crate::text::rich::RichContentKind::Sparkline(_)
+                    | crate::text::rich::RichContentKind::Svg { .. }
+            );
+            if needs_text_cleared {
                 vello_text.value = String::new();
             }
             vello_text.style.brush = bevy_color_to_brush(Color::NONE);
@@ -336,7 +342,8 @@ pub fn layout_block_cells(
 ///
 /// Sets margin (indent), width, min_height, and padding on block cell nodes.
 /// Text block heights are determined by Parley via ContentSize.
-/// Non-text rich content (sparklines) gets explicit min_height from the theme.
+/// Sparklines get explicit min_height from the theme; SVG heights are set
+/// in `render_rich_content` where the actual scale factor is known.
 pub fn update_block_cell_nodes(
     entities: Res<EditorEntities>,
     containers: Query<&BlockCellContainer>,
@@ -417,10 +424,14 @@ pub fn update_block_cell_nodes(
             node.padding = target_padding;
         }
 
-        // Set explicit min_height for non-text rich content (sparklines)
+        // Set explicit min_height for sparklines (SVG height is set in render_rich_content).
         let target_min_height = rich_content
-            .and_then(|rc| rc.desired_height(&theme))
-            .map(Val::Px)
+            .and_then(|rc| match &rc.kind {
+                crate::text::rich::RichContentKind::Sparkline(_) => {
+                    Some(Val::Px(theme.sparkline_height))
+                }
+                _ => None,
+            })
             .unwrap_or(Val::Auto);
         if node.min_height != target_min_height {
             node.min_height = target_min_height;

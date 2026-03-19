@@ -146,11 +146,14 @@ impl Plugin for CellPlugin {
                 // Block border style
                 block_border::determine_block_border_style
                     .after(view_render::sync_block_cell_buffers),
-                ApplyDeferred.after(block_border::determine_block_border_style),
                 // Rich content rendering — must run AFTER ApplyDeferred so the
                 // RichContent component inserted by sync_block_cell_buffers is visible.
-                crate::text::rich::render_rich_content
-                    .after(block_border::determine_block_border_style),
+                // Chain guarantees ordering against this specific ApplyDeferred instance.
+                (
+                    ApplyDeferred.after(block_border::determine_block_border_style),
+                    crate::text::rich::render_rich_content,
+                )
+                    .chain(),
             )
                 .in_set(CellPhase::Buffer),
         );
