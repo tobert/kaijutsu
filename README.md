@@ -2,31 +2,31 @@
 
 *"The Art of Meeting"*
 
-Kaijutsu is an agentic kernel, MCP, and UI that offers a crdt-all-the-things
-approach to collaborative editing with multiple models and users participating
-in real time. The kernel relies on [diamond-types-extended][dte], our fork of
-diamond-types that completes Map, Set, and Register types alongside the
-existing Text CRDT.
+Kaijutsu is an agent system with a graphical UI that manages contexts in a directed
+acyclic graph (DAG). The DAG supports `fork` and `drift` operations that simplify
+breaking down work as a context develops, and then merging the results, while keeping
+provenance intact.
 
-**Context forking and drift** are central to the workflow. Any context can be
-[forked](docs/kernel-model.md) for isolated exploration or
-[threaded](docs/kernel-model.md) for parallel work on the same codebase.
-[Drift](docs/drift.md) is how contexts share knowledge without sharing
-conversation history — multiple agents (Claude, Gemini, local models, humans)
-work in parallel contexts on the same kernel, drifting findings between each
-other with optional LLM distillation.
+## Features
 
-Kaijutsu's kernel uses Cap'n Protocol over ssh for its network IO, inheriting
-the ease & flexibility of ssh key access.
-
-[dte]: https://github.com/tobert/diamond-types-extended
+- Cybernetics-focused design for users and models, aiming to make the flow between
+system components as smooth as possible rather than minimizing or trying to eliminate it.
+- *Multi-Context Multi-Model Drifting*: a context can be forked to explore
+an idea then a summary drifted back to the parent.
+- Conflict-Free Replicated Data Types (CRDT) via [dte](https://github.com/tobert/diamond-types-extended)
+allows safe concurrent edits across workspaces, network interruptions, and *multiple users*.
+- Transport is SSH with ssh key authentication. Works with ssh-agent.
+- Binary Cap'n Proto protocol over SSH
+- User interface built on Bevy and Vello for high performance and beautiful vectors.
 
 ## Status
 
 **Kaijutsu is not released yet**. The kernel feels solid and reliable, and
-diamond-types-extended seems to be stable. The UI is very work in progress
-but demonstrates the possibilities beyond the terminal. The MCP works well
-and can be used right away as MCP and hook receiver.
+diamond-types-extended seems to be stable. The UI is coming along.
+
+You may need my branches of bevy_vello and kaish for this to build. Kaish
+will go back to cargo versions soon, and I'm working to upstream the bevy_vello
+patches.
 
 -Amy
 
