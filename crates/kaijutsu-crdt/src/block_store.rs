@@ -264,7 +264,7 @@ impl BlockStore {
     // Order key calculation
     // =========================================================================
 
-    /// 2-char base62 suffix derived from agent ID.
+    /// 4-char base62 agent suffix derived from agent ID.
     ///
     /// Each agent gets a unique "lane" in the keyspace. Since the chars are
     /// valid base62, they participate normally in midpoint calculations — no
@@ -277,12 +277,13 @@ impl BlockStore {
         let c1 = crate::content::BASE62[(bytes[10] as usize) % 62] as char;
         let c2 = crate::content::BASE62[(bytes[11] as usize) % 62] as char;
         let c3 = crate::content::BASE62[(bytes[12] as usize) % 62] as char;
-        format!("{c1}{c2}{c3}")
+        let c4 = crate::content::BASE62[(bytes[13] as usize) % 62] as char;
+        format!("{c1}{c2}{c3}{c4}")
     }
 
     /// Compute an order_key for a new block inserted after `after`.
     ///
-    /// Appends a 2-char agent suffix (base62-encoded from agent UUID) to
+    /// Appends a 4-char base62 agent suffix (derived from agent UUID) to
     /// the midpoint. Since the suffix chars are valid base62, they participate
     /// naturally in subsequent midpoint calculations — no stripping needed.
     /// Concurrent inserts at the same position get different keys (different
@@ -764,7 +765,6 @@ impl BlockStore {
                     // The receiver creates with empty content then merges the DTE ops,
                     // preserving causal history for subsequent incremental sync.
                     new_blocks.push(block.snapshot());
-                    updated_headers.push(*block.header());
                     // Full ops from root so receiver gets complete DTE causal graph
                     let full_ops = block.ops_since(&Frontier::root());
                     if !full_ops.is_empty() {
@@ -807,7 +807,7 @@ impl BlockStore {
                     // No DTE ops (persistence restore) — use snapshot content
                     BlockContent::from_snapshot(snap, self.agent_id, fallback_key)
                 };
-                max_remote_ts = max_remote_ts.max(block.header().updated_at);
+                max_remote_ts = max_remote_ts.max(snap.updated_at);
                 self.blocks.insert(snap.id, block);
                 if snap.id.agent_id == self.agent_id {
                     self.next_seq = self.next_seq.max(snap.id.seq + 1);
@@ -824,8 +824,12 @@ impl BlockStore {
         }
 
         // Merge per-block incremental DTE ops
+        let mut had_dte_merges = false;
         for (id, ops) in payload.block_ops {
             if let Some(block) = self.blocks.get_mut(&id) {
+                if !ops.is_empty() {
+                    had_dte_merges = true;
+                }
                 block.merge_ops(ops)?;
             } else {
                 tracing::warn!("sync payload has ops for unknown block {id}, skipping");
@@ -843,8 +847,9 @@ impl BlockStore {
             }
         }
 
-        // Advance Lamport clock past any remote timestamp
-        if max_remote_ts > 0 {
+        // Advance Lamport clock past any remote timestamp, or bump if
+        // DTE ops were merged (even without header/new-block timestamps)
+        if max_remote_ts > 0 || had_dte_merges {
             self.merge_clock(max_remote_ts);
         }
 
@@ -908,14 +913,14 @@ impl BlockStore {
         forked
     }
 
-    /// Fork the store at a specific version, excluding blocks created after that version.
+    /// Fork the store, excluding blocks with `created_at` after `before_timestamp` (wall-clock millis).
     ///
     /// Preserves original authorship — see [`fork`] for details.
     pub fn fork_at_version(
         &self,
         new_context_id: ContextId,
         new_agent_id: PrincipalId,
-        at_version: u64,
+        before_timestamp: u64,
     ) -> Self {
         let mut forked = Self::new(new_context_id, new_agent_id);
 
@@ -923,7 +928,7 @@ impl BlockStore {
             if block.is_deleted() {
                 continue;
             }
-            if block.header().created_at > at_version {
+            if block.header().created_at > before_timestamp {
                 continue;
             }
             let snap = block.snapshot();
@@ -955,7 +960,7 @@ impl BlockStore {
         forked
     }
 
-    /// Fork the store at a specific version with block filtering.
+    /// Fork the store with block filtering, excluding blocks with `created_at` after `before_timestamp` (wall-clock millis).
     ///
     /// Like [`fork_at_version`] but additionally filters blocks via `BlockFilter`.
     /// Blocks that don't pass the filter are excluded from the fork.
@@ -964,7 +969,7 @@ impl BlockStore {
         &self,
         new_context_id: ContextId,
         new_agent_id: PrincipalId,
-        at_version: u64,
+        before_timestamp: u64,
         filter: &ForkBlockFilter,
     ) -> Self {
         let mut forked = Self::new(new_context_id, new_agent_id);
@@ -976,7 +981,7 @@ impl BlockStore {
             if block.is_deleted() {
                 continue;
             }
-            if block.header().created_at > at_version {
+            if block.header().created_at > before_timestamp {
                 continue;
             }
             let snap = block.snapshot();
@@ -1579,6 +1584,57 @@ mod tests {
         assert_eq!(snap.parent_id, Some(id1));
     }
 
+    #[test]
+    fn test_new_block_sync_no_redundant_header() {
+        // Create store1 with a block, sync to store2, then add a new block to store1
+        let ctx = ContextId::new();
+        let mut store1 = BlockStore::new(ctx, PrincipalId::new());
+        let mut store2 = BlockStore::new(ctx, PrincipalId::new());
+
+        let id1 = store1
+            .insert_block(None, None, Role::User, BlockKind::Text, "First", Status::Done)
+            .unwrap();
+
+        // Initial sync so store2 knows about id1
+        let payload = store1.ops_since(&HashMap::new());
+        store2.merge_ops(payload).unwrap();
+        assert_eq!(store2.block_count(), 1);
+
+        // Add a new block to store1
+        let id2 = store1
+            .insert_block(Some(&id1), Some(&id1), Role::Model, BlockKind::Text, "Second", Status::Done)
+            .unwrap();
+
+        // Generate incremental sync payload
+        let frontiers = store2.frontier();
+        let payload = store1.ops_since(&frontiers);
+
+        // The new block should appear in new_blocks (as a snapshot)
+        assert_eq!(payload.new_blocks.len(), 1, "new block should be in new_blocks");
+        assert_eq!(payload.new_blocks[0].id, id2);
+
+        // The new block's header should NOT also appear in updated_headers —
+        // the snapshot already contains all header data; sending both is redundant.
+        let redundant = payload.updated_headers.iter().any(|h| h.id == id2);
+        assert!(!redundant,
+            "new block header should not appear in updated_headers (snapshot is sufficient)");
+
+        // Merge into store2 and verify all header fields match
+        store2.merge_ops(payload).unwrap();
+        assert_eq!(store2.block_count(), 2);
+
+        let snap1 = store1.get_block_snapshot(&id2).unwrap();
+        let snap2 = store2.get_block_snapshot(&id2).unwrap();
+        assert_eq!(snap2.role, snap1.role);
+        assert_eq!(snap2.kind, snap1.kind);
+        assert_eq!(snap2.status, snap1.status);
+        assert_eq!(snap2.parent_id, snap1.parent_id);
+        assert_eq!(snap2.content, snap1.content);
+        assert_eq!(snap2.compacted, snap1.compacted);
+        assert_eq!(snap2.collapsed, snap1.collapsed);
+        assert_eq!(snap2.ephemeral, snap1.ephemeral);
+    }
+
     // ── Sync: header propagation ──────────────────────────────────────
 
     #[test]
@@ -2053,5 +2109,270 @@ mod tests {
 
         // Should keep: user text + model text = 2
         assert_eq!(forked.block_count(), 2, "Thinking + Tool blocks should be excluded");
+    }
+
+    // =====================================================================
+    // Lamport clock: DTE-only merge
+    // =====================================================================
+
+    #[test]
+    fn test_lamport_clock_advances_after_dte_only_sync() {
+        // Two stores for the same context
+        let ctx = ContextId::new();
+        let mut store1 = BlockStore::new(ctx, PrincipalId::new());
+        let mut store2 = BlockStore::new(ctx, PrincipalId::new());
+
+        // Create a block in store1 and sync it to store2 (initial sync)
+        let id = store1
+            .insert_block(None, None, Role::Model, BlockKind::Text, "", Status::Done)
+            .unwrap();
+        let payload = store1.ops_since(&HashMap::new());
+        store2.merge_ops(payload).unwrap();
+        assert_eq!(store2.block_count(), 1);
+
+        // Record store2's clock after initial sync
+        let clock_after_initial = store2.lamport_clock;
+
+        // Store1 appends text (DTE ops only — no header changes, no new blocks)
+        store1.append_text(&id, "Hello world").unwrap();
+
+        // Generate incremental sync and strip headers to simulate a DTE-only payload.
+        // This happens when a relay or middleware forwards only the DTE delta
+        // without header metadata (e.g., ephemeral streaming, partial sync).
+        let frontiers = store2.frontier();
+        let mut payload = store1.ops_since(&frontiers);
+        payload.updated_headers.clear(); // DTE-only: no header updates
+
+        // Confirm this is a DTE-only payload
+        assert!(!payload.block_ops.is_empty(), "payload should have DTE ops");
+        assert!(payload.new_blocks.is_empty(), "payload should have no new blocks");
+        assert!(payload.updated_headers.is_empty(), "payload should have no updated headers");
+
+        // Merge into store2
+        store2.merge_ops(payload).unwrap();
+
+        // Verify the text arrived
+        let snap = store2.get_block_snapshot(&id).unwrap();
+        assert_eq!(snap.content, "Hello world");
+
+        // The bug: store2's Lamport clock should have advanced, but it didn't
+        assert!(
+            store2.lamport_clock > clock_after_initial,
+            "Lamport clock should advance after DTE-only merge: got {} (should be > {})",
+            store2.lamport_clock,
+            clock_after_initial
+        );
+    }
+
+    // =====================================================================
+    // fork_at_version / fork_filtered timestamp semantics
+    // =====================================================================
+
+    #[test]
+    fn test_fork_at_version_uses_wall_clock_timestamp() {
+        // Create blocks with explicit wall-clock timestamps to verify
+        // fork_at_version filters by created_at (millis), not by version counter.
+        let ctx = ContextId::new();
+        let agent = PrincipalId::new();
+        let mut store = BlockStore::new(ctx, agent);
+
+        // Insert 3 blocks with distinct created_at timestamps.
+        // We construct BlockContent directly so we can control created_at.
+        let ts_early = 1_000_000u64;  // 1 second after epoch
+        let ts_mid   = 2_000_000u64;  // 2 seconds
+        let ts_late  = 3_000_000u64;  // 3 seconds
+
+        let id1 = store.new_block_id();
+        let h1 = BlockHeader {
+            id: id1,
+            parent_id: None,
+            role: Role::User,
+            kind: BlockKind::Text,
+            status: Status::Done,
+            compacted: false,
+            collapsed: false,
+            ephemeral: false,
+            created_at: ts_early,
+            updated_at: 0,
+            tool_kind: None,
+            exit_code: None,
+            is_error: false,
+        };
+        let b1 = BlockContent::with_content(h1, "early", agent, "V".to_string());
+        store.blocks.insert(id1, b1);
+        store.version += 1;
+
+        let id2 = store.new_block_id();
+        let h2 = BlockHeader {
+            id: id2,
+            parent_id: Some(id1),
+            role: Role::Model,
+            kind: BlockKind::Text,
+            status: Status::Done,
+            compacted: false,
+            collapsed: false,
+            ephemeral: false,
+            created_at: ts_mid,
+            updated_at: 0,
+            tool_kind: None,
+            exit_code: None,
+            is_error: false,
+        };
+        let b2 = BlockContent::with_content(h2, "mid", agent, "W".to_string());
+        store.blocks.insert(id2, b2);
+        store.version += 1;
+
+        let id3 = store.new_block_id();
+        let h3 = BlockHeader {
+            id: id3,
+            parent_id: Some(id2),
+            role: Role::User,
+            kind: BlockKind::Text,
+            status: Status::Done,
+            compacted: false,
+            collapsed: false,
+            ephemeral: false,
+            created_at: ts_late,
+            updated_at: 0,
+            tool_kind: None,
+            exit_code: None,
+            is_error: false,
+        };
+        let b3 = BlockContent::with_content(h3, "late", agent, "X".to_string());
+        store.blocks.insert(id3, b3);
+        store.version += 1;
+
+        assert_eq!(store.block_count(), 3);
+        assert_eq!(store.version(), 3);
+
+        // Fork at a timestamp between ts_mid and ts_late.
+        // Should include "early" and "mid", exclude "late".
+        let cutoff = 2_500_000u64;
+        let new_ctx = ContextId::new();
+        let new_agent = PrincipalId::new();
+        let forked = store.fork_at_version(new_ctx, new_agent, cutoff);
+
+        assert_eq!(
+            forked.block_count(), 2,
+            "Fork at timestamp {} should include 2 blocks (created_at {} and {}), not block with created_at {}",
+            cutoff, ts_early, ts_mid, ts_late
+        );
+
+        // Verify the correct blocks are present by checking content
+        let snaps: Vec<BlockSnapshot> = forked.blocks_ordered();
+        let contents: Vec<&str> = snaps.iter().map(|s| s.content.as_str()).collect();
+        assert!(contents.contains(&"early"), "Should include early block");
+        assert!(contents.contains(&"mid"), "Should include mid block");
+        assert!(!contents.contains(&"late"), "Should NOT include late block");
+    }
+
+    #[test]
+    fn test_fork_filtered_uses_wall_clock_timestamp() {
+        // Same as above but through fork_filtered to verify both paths.
+        let ctx = ContextId::new();
+        let agent = PrincipalId::new();
+        let mut store = BlockStore::new(ctx, agent);
+
+        let ts_early = 1_000_000u64;
+        let ts_late  = 3_000_000u64;
+
+        let id1 = store.new_block_id();
+        let h1 = BlockHeader {
+            id: id1,
+            parent_id: None,
+            role: Role::User,
+            kind: BlockKind::Text,
+            status: Status::Done,
+            compacted: false,
+            collapsed: false,
+            ephemeral: false,
+            created_at: ts_early,
+            updated_at: 0,
+            tool_kind: None,
+            exit_code: None,
+            is_error: false,
+        };
+        store.blocks.insert(id1, BlockContent::with_content(h1, "keep", agent, "V".to_string()));
+        store.version += 1;
+
+        let id2 = store.new_block_id();
+        let h2 = BlockHeader {
+            id: id2,
+            parent_id: Some(id1),
+            role: Role::Model,
+            kind: BlockKind::Text,
+            status: Status::Done,
+            compacted: false,
+            collapsed: false,
+            ephemeral: false,
+            created_at: ts_late,
+            updated_at: 0,
+            tool_kind: None,
+            exit_code: None,
+            is_error: false,
+        };
+        store.blocks.insert(id2, BlockContent::with_content(h2, "drop", agent, "W".to_string()));
+        store.version += 1;
+
+        // Fork at cutoff between the two timestamps, with empty filter
+        let cutoff = 2_000_000u64;
+        let filter = ForkBlockFilter::default();
+        let new_ctx = ContextId::new();
+        let new_agent = PrincipalId::new();
+        let forked = store.fork_filtered(new_ctx, new_agent, cutoff, &filter);
+
+        assert_eq!(forked.block_count(), 1, "Only the early block should survive the timestamp cutoff");
+        let snaps = forked.blocks_ordered();
+        assert_eq!(snaps[0].content, "keep");
+    }
+
+    /// Regression baseline: documents that whole-header LWW can drop concurrent
+    /// field mutations. If peer A sets ephemeral=true and peer B sets status=Done
+    /// at the same Lamport tick, the loser's change is silently dropped.
+    /// See `docs/LWW-critical-todo.md` for the design direction.
+    /// Regression baseline: documents that whole-header LWW can drop concurrent
+    /// field mutations. See `docs/LWW-critical-todo.md`.
+    #[test]
+    fn test_lww_race_ephemeral_overwritten_by_status() {
+        let ctx = ContextId::new();
+        let agent_a = PrincipalId::new();
+        let agent_b = PrincipalId::new();
+
+        let mut store_a = BlockStore::new(ctx, agent_a);
+        let block_id = store_a.insert_block(
+            None, None, Role::User, BlockKind::Text, "test", Status::Running,
+        ).unwrap();
+
+        // Sync to store_b so both have the same block
+        let mut store_b = BlockStore::new(ctx, agent_b);
+        let payload = store_a.ops_since(&HashMap::new());
+        store_b.merge_ops(payload).unwrap();
+
+        // Peer A sets ephemeral=true
+        store_a.set_ephemeral(&block_id, true).unwrap();
+        // Peer B sets status=Done (at the same logical time)
+        store_b.set_status(&block_id, Status::Done).unwrap();
+
+        // Merge A→B: B should get ephemeral=true
+        let payload_a = store_a.ops_since(&store_b.frontier());
+        store_b.merge_ops(payload_a).unwrap();
+
+        // Merge B→A: A should get status=Done
+        let payload_b = store_b.ops_since(&store_a.frontier());
+        store_a.merge_ops(payload_b).unwrap();
+
+        // With whole-header LWW, one side wins entirely — the loser's field change is dropped.
+        // This test documents current behavior as a regression baseline.
+        let header_a = store_a.blocks.get(&block_id).unwrap().header();
+        let header_b = store_b.blocks.get(&block_id).unwrap().header();
+
+        // Both stores should converge to the same state (LWW determinism)
+        assert_eq!(header_a.status, header_b.status, "stores must converge on status");
+        assert_eq!(header_a.ephemeral, header_b.ephemeral, "stores must converge on ephemeral");
+
+        // But one field mutation was lost — this is the known limitation
+        let both_preserved = header_a.ephemeral && header_a.status == Status::Done;
+        assert!(!both_preserved,
+            "whole-header LWW should NOT preserve both concurrent field changes (if this fails, per-field LWW was implemented — update this test!)");
     }
 }

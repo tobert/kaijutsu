@@ -390,6 +390,7 @@ impl BlockDocument {
             file_path: None, // Legacy document doesn't track file_path
             content_type: None, // Legacy document predates content_type
         order_key: None, // Legacy document uses DTE-backed ordering
+            updated_at: 0, // Legacy document predates Lamport propagation
         })
     }
 

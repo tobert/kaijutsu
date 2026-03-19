@@ -424,10 +424,17 @@ impl BlockContent {
             file_path: self.file_path.clone(),
             content_type: self.content_type.clone(),
             order_key: Some(self.order_key.clone()),
+            updated_at: self.header.updated_at,
         }
     }
 
     /// Merge a remote header (LWW by updated_at, agent_id tiebreak).
+    ///
+    /// **Known limitation:** This is whole-header LWW — all mutable fields
+    /// (status, collapsed, ephemeral, compacted, exit_code, is_error, tool_kind)
+    /// are replaced atomically. A race where peer A sets `ephemeral = true` and
+    /// peer B sets `status = Done` at the same Lamport tick will drop the loser's
+    /// change entirely. Per-field LWW would fix this; see `docs/LWW-critical-todo.md`.
     pub fn merge_header(&mut self, remote: &BlockHeader) {
         if remote.updated_at > self.header.updated_at
             || (remote.updated_at == self.header.updated_at
