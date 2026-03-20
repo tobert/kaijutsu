@@ -1,11 +1,10 @@
-//! Buffer sync — text content → UiVelloText, layout measurement.
+//! Buffer sync — text content → BlockScene, layout measurement.
 //!
 //! This module owns the systems that format block content into display text,
-//! set it on UiVelloText components, and manage layout readback from Taffy.
+//! set it on BlockScene components, and manage layout readback from Taffy.
 //!
-//! Key architectural difference from the cell/ version:
-//! `VelloTextAnchor::TopLeft` — text starts at the content box top-left.
-//! No UiTransform hack needed.
+//! BlockScene is the data source for `block_render::build_block_scenes`, which
+//! renders text and rich content into UiVelloScene via Parley + Vello.
 
 use bevy::prelude::*;
 
@@ -14,10 +13,9 @@ use crate::cell::{
     EditorEntities, FocusedBlockCell, LayoutGeneration, MainCell, RoleGroupBorder,
     RoleGroupBorderLayout,
 };
-use crate::text::{FontHandles, bevy_color_to_brush};
 use crate::ui::theme::Theme;
 use crate::ui::timeline::TimelineVisibility;
-use bevy_vello::prelude::{UiVelloText, VelloFont};
+use crate::view::block_render::BlockScene;
 
 use super::format::{block_color, format_single_block};
 use super::lifecycle::{INDENT_WIDTH, ROLE_HEADER_SPACING};
@@ -26,22 +24,6 @@ use super::lifecycle::{INDENT_WIDTH, ROLE_HEADER_SPACING};
 // BUFFER INIT / SYNC
 // ============================================================================
 
-/// Safety net: log a warning if any BlockCell lacks UiVelloText.
-///
-/// With single-phase spawning in `spawn_block_cells`, this should never fire.
-/// If it does, something bypassed the normal spawn path.
-pub fn init_block_cell_buffers(
-    block_cells: Query<Entity, (With<BlockCell>, Without<UiVelloText>)>,
-) {
-    let count = block_cells.iter().count();
-    if count > 0 {
-        warn!(
-            "{} BlockCell entities missing UiVelloText — spawn_block_cells should include it",
-            count
-        );
-    }
-}
-
 pub fn sync_block_cell_buffers(
     mut commands: Commands,
     entities: Res<EditorEntities>,
@@ -49,7 +31,7 @@ pub fn sync_block_cell_buffers(
     containers: Query<&BlockCellContainer>,
     mut block_cells: Query<(
         &mut BlockCell,
-        &mut UiVelloText,
+        &mut BlockScene,
         Option<&TimelineVisibility>,
     )>,
     theme: Res<Theme>,
@@ -94,7 +76,7 @@ pub fn sync_block_cell_buffers(
 
     let mut layout_changed = false;
     for &entity in container.block_cells.values() {
-        let Ok((mut block_cell, mut vello_text, timeline_vis)) = block_cells.get_mut(entity) else {
+        let Ok((mut block_cell, mut block_scene, timeline_vis)) = block_cells.get_mut(entity) else {
             continue;
         };
 
@@ -143,10 +125,9 @@ pub fn sync_block_cell_buffers(
         }
 
         // Always set the value if this is the first render for this block entity,
-        // or if the text actually changed. This ensures `Changed<UiVelloText>`
-        // triggers for `bevy_vello`'s measurement system.
-        if vello_text.value != text || block_cell.last_render_version.is_none() {
-            vello_text.value = text.clone();
+        // or if the text actually changed.
+        if block_scene.text != text || block_cell.last_render_version.is_none() {
+            block_scene.text = text.clone();
         }
 
         // Rich content rendering for Text blocks from Model or Tool roles (markdown, sparklines, SVG)
@@ -172,22 +153,19 @@ pub fn sync_block_cell_buffers(
                 Some(&svg_fontdb),
             )
         {
-            // For sparklines and SVGs: clear text so Parley's ContentSize
-            // doesn't fight min_height. The invisible source text would otherwise
-            // drive the block height, causing overlap when the source is shorter
-            // than the rendered graphic.
+            // For sparklines and SVGs: clear text so Parley doesn't re-measure
+            // large source text every frame. Height is driven by min_height
+            // set in render_rich_content.
             let needs_text_cleared = matches!(
                 rich.kind,
                 crate::text::rich::RichContentKind::Sparkline(_)
                     | crate::text::rich::RichContentKind::Svg { .. }
             );
             if needs_text_cleared {
-                vello_text.value = String::new();
+                block_scene.text = String::new();
             }
-            vello_text.style.brush = bevy_color_to_brush(Color::NONE);
             commands.entity(entity).insert(rich);
             actually_rich = true;
-            block_cell.is_rich = true;
         }
         if !actually_rich
             && is_typed_result
@@ -198,39 +176,30 @@ pub fn sync_block_cell_buffers(
                 Some(&svg_fontdb),
             )
         {
-            vello_text.style.brush = bevy_color_to_brush(Color::NONE);
             commands.entity(entity).insert(rich);
             actually_rich = true;
-            block_cell.is_rich = true;
         }
         if !actually_rich
             && is_output_candidate
             && let Some(ref output) = block.output
             && let Some(rich) = crate::text::rich::detect_output_content(output, doc_version)
         {
-            vello_text.style.brush = bevy_color_to_brush(Color::NONE);
             commands.entity(entity).insert(rich);
             actually_rich = true;
-            block_cell.is_rich = true;
         }
         if !actually_rich {
             commands.entity(entity).remove::<crate::text::RichContent>();
-            commands
-                .entity(entity)
-                .remove::<bevy_vello::prelude::UiVelloScene>();
-            block_cell.is_rich = false;
         }
 
-        // Apply color (skip when rainbow or actively rendering rich content)
-        if !rainbow && !actually_rich {
+        // Store color on BlockScene for build_block_scenes
+        {
             let color = if let Some(vis) = timeline_vis {
                 base_color.with_alpha(base_color.alpha() * vis.opacity)
             } else {
                 base_color
             };
-            let new_brush = bevy_color_to_brush(color);
-            if vello_text.style.brush != new_brush {
-                vello_text.style.brush = new_brush;
+            if block_scene.color != color {
+                block_scene.color = color;
             }
         }
 
@@ -246,30 +215,11 @@ pub fn sync_block_cell_buffers(
         }
 
         block_cell.last_render_version = Some(doc_version);
+        block_scene.content_version = doc_version;
     }
 
     if layout_changed {
         layout_gen.bump();
-    }
-}
-
-/// Keep `UiVelloText.max_advance` in sync with `ComputedNode.size().x`.
-///
-/// This must be a separate system from `sync_block_cell_buffers` because:
-/// - On spawn frame, Taffy hasn't run yet so ComputedNode.size() is zero
-/// - `sync_block_cell_buffers` only runs when doc content changes
-/// - This needs to run whenever the layout width changes (window resize, etc.)
-pub fn sync_text_max_advance(
-    mut block_cells: Query<(&mut UiVelloText, &ComputedNode), With<BlockCell>>,
-) {
-    for (mut vello_text, computed_node) in block_cells.iter_mut() {
-        let width = computed_node.size().x;
-        if width > 0.0 {
-            let new_advance = Some(width);
-            if vello_text.max_advance != new_advance {
-                vello_text.max_advance = new_advance;
-            }
-        }
     }
 }
 
@@ -352,7 +302,6 @@ pub fn update_block_cell_nodes(
             &BlockCellLayout,
             &mut Node,
             Option<&crate::cell::block_border::BlockBorderStyle>,
-            Option<&crate::text::RichContent>,
         ),
         With<BlockCell>,
     >,
@@ -374,19 +323,10 @@ pub fn update_block_cell_nodes(
     };
 
     for &entity in container.block_cells.values() {
-        let Ok((layout, mut node, border_style, rich_content)) = block_cells.get_mut(entity) else {
+        let Ok((layout, mut node, border_style)) = block_cells.get_mut(entity) else {
             continue;
         };
-        let target_padding = if let Some(style) = border_style {
-            UiRect {
-                left: Val::Px(style.padding.left),
-                right: Val::Px(style.padding.right),
-                top: Val::Px(style.padding.top),
-                bottom: Val::Px(style.padding.bottom),
-            }
-        } else {
-            UiRect::ZERO
-        };
+        let target_padding = UiRect::ZERO;
 
         // Tiny gap for OpenBottom (ToolCall → ToolResult) so the divider line has breathing room
         let bottom_spacing = if border_style.map(|s| s.kind)
@@ -424,18 +364,7 @@ pub fn update_block_cell_nodes(
             node.padding = target_padding;
         }
 
-        // Set explicit min_height for sparklines (SVG height is set in render_rich_content).
-        let target_min_height = rich_content
-            .and_then(|rc| match &rc.kind {
-                crate::text::rich::RichContentKind::Sparkline(_) => {
-                    Some(Val::Px(theme.sparkline_height))
-                }
-                _ => None,
-            })
-            .unwrap_or(Val::Auto);
-        if node.min_height != target_min_height {
-            node.min_height = target_min_height;
-        }
+        // min_height no longer needed — heights are set explicitly by build_block_scenes.
     }
 
     for entity in &container.role_headers {
@@ -594,60 +523,11 @@ pub fn readback_block_heights(
     }
 }
 
-/// Rebuild role group border Vello scenes when ComputedNode changes.
-pub fn update_role_group_scenes(
-    mut role_borders: Query<
-        (
-            &RoleGroupBorder,
-            &mut bevy_vello::prelude::UiVelloScene,
-            &ComputedNode,
-        ),
-        Changed<ComputedNode>,
-    >,
-    fonts: Res<Assets<VelloFont>>,
-    font_handles: Res<FontHandles>,
-    theme: Res<Theme>,
-) {
-    let font = fonts.get(&font_handles.mono);
-
-    for (border, mut scene_component, computed) in role_borders.iter_mut() {
-        let size = computed.size();
-        if size.x < 1.0 || size.y < 1.0 {
-            continue;
-        }
-
-        let color = match border.role {
-            kaijutsu_crdt::Role::User => theme.block_user,
-            kaijutsu_crdt::Role::Model => theme.block_assistant,
-            kaijutsu_crdt::Role::System => theme.fg_dim,
-            kaijutsu_crdt::Role::Tool | kaijutsu_crdt::Role::Asset => theme.block_tool_call,
-        };
-
-        let label = match border.role {
-            kaijutsu_crdt::Role::User => "USER",
-            kaijutsu_crdt::Role::Model => "ASSISTANT",
-            kaijutsu_crdt::Role::System => "SYSTEM",
-            kaijutsu_crdt::Role::Tool => "TOOL",
-            kaijutsu_crdt::Role::Asset => "ASSET",
-        };
-
-        let mut scene = bevy_vello::vello::Scene::new();
-        crate::view::fieldset::build_role_group_line(
-            &mut scene,
-            size.x as f64,
-            size.y as f64,
-            label,
-            color,
-            font,
-        );
-
-        *scene_component = bevy_vello::prelude::UiVelloScene::from(scene);
-    }
-}
+// Role group scene building moved to block_render::build_role_group_scenes.
 
 /// Highlight the focused block cell with a visual indicator.
 pub fn highlight_focused_block(
-    mut focused_cells: Query<(&BlockCell, &mut UiVelloText), With<FocusedBlockCell>>,
+    mut focused_cells: Query<(&BlockCell, &mut BlockScene), With<FocusedBlockCell>>,
     entities: Res<EditorEntities>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     theme: Res<Theme>,
@@ -667,12 +547,7 @@ pub fn highlight_focused_block(
     let blocks: std::collections::HashMap<_, _> =
         editor.blocks().into_iter().map(|b| (b.id, b)).collect();
 
-    for (block_cell, mut vello_text) in focused_cells.iter_mut() {
-        // Skip rich content blocks — their UiVelloText brush must stay transparent
-        // so the rich renderer (UiVelloScene) is the only visible text layer.
-        if block_cell.is_rich {
-            continue;
-        }
+    for (block_cell, mut block_scene) in focused_cells.iter_mut() {
         if let Some(block) = blocks.get(&block_cell.block_id) {
             let base_color = block_color(block, &theme);
             let srgba = base_color.to_srgba();
@@ -682,9 +557,10 @@ pub fn highlight_focused_block(
                 (srgba.blue * 1.15).min(1.0),
                 srgba.alpha,
             );
-            let new_brush = bevy_color_to_brush(focused_color);
-            if vello_text.style.brush != new_brush {
-                vello_text.style.brush = new_brush;
+            if block_scene.color != focused_color {
+                block_scene.color = focused_color;
+                // Force rebuild so the highlight is visible
+                block_scene.content_version = block_scene.content_version.wrapping_add(1);
             }
         }
     }

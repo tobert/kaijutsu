@@ -21,35 +21,28 @@ use kaijutsu_types::{OutputData, OutputEntryType};
 use super::components::bevy_color_to_brush;
 use super::markdown::{MarkdownColors, RichSpan, parse_to_rich_spans};
 use super::sparkline::{
-    SparklineColors, SparklineData, build_sparkline_paths, render_sparkline_scene,
-    try_parse_sparkline,
+    SparklineData, try_parse_sparkline,
 };
 
 use crate::view::format::{OutputLayout, compute_output_layout, format_output_data};
 
 /// Per-span brush mapping: byte range → Brush.
-struct SpanBrush {
+pub struct SpanBrush {
     /// Byte offset of span start in the concatenated plain text.
-    start: usize,
+    pub start: usize,
     /// Byte offset of span end.
-    end: usize,
+    pub end: usize,
     /// Brush for this span.
-    brush: Brush,
+    pub brush: Brush,
 }
 
 /// Rich content for a block cell — dispatches rendering by format.
 ///
-/// When present on a block cell entity alongside `UiVelloText`,
-/// the `render_rich_content` system will render the appropriate format.
+/// When present on a block cell entity, `build_block_scenes` renders
+/// the content into the per-block vello scene.
 #[derive(Component)]
 pub struct RichContent {
     pub kind: RichContentKind,
-    /// Version tracking — skip re-render when unchanged.
-    pub version: u64,
-    /// Last rendered version.
-    pub last_render_version: u64,
-    /// The max_advance used for the last render (0.0 = None).
-    pub last_max_advance: f32,
 }
 
 
@@ -88,7 +81,7 @@ pub enum RichContentKind {
 /// - Code/code blocks → `md_code_fg` / `md_code_block_fg`
 /// - Bold → `md_strong_color` or base_color
 /// - Plain text → `base_color`
-fn build_span_brushes(
+pub fn build_span_brushes(
     spans: &[RichSpan],
     base_color: Color,
     md_colors: &MarkdownColors,
@@ -125,7 +118,7 @@ fn build_span_brushes(
 }
 
 /// Find the brush for a given byte offset in the span mapping.
-fn brush_at_offset(span_brushes: &[SpanBrush], offset: usize) -> Option<&Brush> {
+pub fn brush_at_offset(span_brushes: &[SpanBrush], offset: usize) -> Option<&Brush> {
     // Spans are contiguous and ordered — binary search on start.
     span_brushes
         .iter()
@@ -137,13 +130,14 @@ fn brush_at_offset(span_brushes: &[SpanBrush], offset: usize) -> Option<&Brush> 
 ///
 /// This is a modified version of bevy_vello's `VelloFont::render()` that
 /// uses per-glyph-run brush lookup instead of a single global brush.
-fn render_layout_with_brushes(
+pub fn render_layout_with_brushes(
     scene: &mut vello::Scene,
     layout: &parley::Layout<Brush>,
     span_brushes: &[SpanBrush],
     fallback_brush: &Brush,
+    offset: (f64, f64),
 ) {
-    let transform = Affine::IDENTITY;
+    let transform = Affine::translate(offset);
 
     for line in layout.lines() {
         for item in line.items() {
@@ -191,203 +185,6 @@ fn render_layout_with_brushes(
     }
 }
 
-/// System: render `RichContent` blocks as `UiVelloScene`.
-///
-/// Dispatches on `RichContentKind`:
-/// - **Markdown**: builds Parley layout with per-span brushes
-/// - **Sparkline**: renders Vello vector paths (line + fill)
-pub fn render_rich_content(
-    mut commands: Commands,
-    fonts: Res<Assets<VelloFont>>,
-    font_handles: Res<super::resources::FontHandles>,
-    theme: Res<crate::ui::theme::Theme>,
-    mut query: Query<(Entity, &mut RichContent, &UiVelloText, &ComputedNode, &mut Node)>,
-) {
-    let md_colors = MarkdownColors {
-        heading: theme.md_heading_color,
-        code: theme.md_code_fg,
-        strong: theme.md_strong_color,
-        code_block: theme.md_code_block_fg,
-    };
-
-    let sparkline_colors = SparklineColors {
-        line: theme.sparkline_line_color,
-        fill: theme.sparkline_fill_color,
-    };
-
-    for (entity, mut rich, vello_text, computed, mut ui_node) in query.iter_mut() {
-        let current_advance = computed.size().x;
-        let advance_changed =
-            (rich.last_max_advance - current_advance).abs() > 1.0 && current_advance > 0.0;
-
-        if rich.version == rich.last_render_version && !advance_changed {
-            continue;
-        }
-
-        let mut scene = vello::Scene::new();
-
-        match &rich.kind {
-            RichContentKind::Markdown { spans, plain_text } => {
-                let Some(font) = fonts.get(&font_handles.mono) else {
-                    continue;
-                };
-
-                let max_advance = {
-                    if current_advance > 0.0 {
-                        Some(current_advance)
-                    } else {
-                        None
-                    }
-                };
-
-                let layout = font.layout(
-                    plain_text,
-                    &vello_text.style,
-                    vello_text.text_align,
-                    max_advance,
-                );
-
-                let span_brushes = build_span_brushes(spans, theme.block_assistant, &md_colors);
-
-                let fallback_brush = bevy_color_to_brush(theme.block_assistant);
-                render_layout_with_brushes(&mut scene, &layout, &span_brushes, &fallback_brush);
-            }
-            RichContentKind::Sparkline(data) => {
-                let w = computed.size().x as f64;
-                let h = theme.sparkline_height as f64;
-                if w > 0.0 && h > 0.0 {
-                    let paths = build_sparkline_paths(data, w, h, 4.0);
-                    render_sparkline_scene(&mut scene, &paths, &sparkline_colors);
-                }
-            }
-            RichContentKind::Svg {
-                scene: svg_scene,
-                width: svg_w,
-                height: svg_h,
-            } => {
-                // UiVelloScene renders at the border-box top-left. We need to
-                // translate the SVG into the content area and scale to fit the
-                // content width (not border-box width which includes padding).
-                let node_size = computed.size();
-                let pad = &computed.padding;
-                let bdr = &computed.border;
-
-                // Content area offset from border-box origin
-                let inset_x = (pad.min_inset.x + bdr.min_inset.x) as f64;
-                let inset_y = (pad.min_inset.y + bdr.min_inset.y) as f64;
-
-                // Content area dimensions
-                let content_w = node_size.x
-                    - pad.min_inset.x - pad.max_inset.x
-                    - bdr.min_inset.x - bdr.max_inset.x;
-
-                let vertical_chrome = node_size.y - (node_size.y
-                    - pad.min_inset.y - pad.max_inset.y
-                    - bdr.min_inset.y - bdr.max_inset.y);
-
-                // Small buffer for text descenders and filter bleed near SVG edges.
-                // SVG <text> y-coordinates specify the baseline; descenders extend
-                // below, and usvg may not clip them to the viewBox boundary.
-                const SVG_EDGE_MARGIN: f32 = 8.0;
-
-                if content_w > 0.0 && *svg_w > 0.0 {
-                    // Scale to fit content width, then further constrain to max height.
-                    let w_scale = (content_w / svg_w).min(1.0);
-                    let h_scale = (SVG_MAX_HEIGHT / svg_h).min(1.0);
-                    let scale = w_scale.min(h_scale) as f64;
-                    let scaled_h = (*svg_h as f64) * scale;
-
-                    // Translate into content area, then scale
-                    let transform = Affine::translate((inset_x, inset_y))
-                        * Affine::scale(scale);
-
-                    // Node height = scaled SVG + vertical chrome + descent margin
-                    let target_h_f32 = scaled_h as f32 + vertical_chrome + SVG_EDGE_MARGIN;
-
-                    // Clip to the border box. This allows filter effects and text
-                    // descenders to bleed into the padding area without being
-                    // abruptly cut off, while preventing overflow past the node.
-                    let clip_h = (node_size.y.max(target_h_f32)) as f64;
-                    scene.push_layer(
-                        Fill::NonZero,
-                        vello::peniko::Mix::Normal,
-                        1.0,
-                        Affine::IDENTITY,
-                        &vello::kurbo::Rect::new(
-                            0.0, 0.0,
-                            node_size.x as f64, clip_h,
-                        ),
-                    );
-                    scene.append(svg_scene, Some(transform));
-                    scene.pop_layer();
-
-                    let target_h = Val::Px(target_h_f32);
-                    if ui_node.height != target_h {
-                        ui_node.height = target_h;
-                    }
-                    if ui_node.min_height != target_h {
-                        ui_node.min_height = target_h;
-                    }
-                } else {
-                    // Container not laid out yet — clip to intrinsic bounds and
-                    // render unscaled. Will re-render with proper scaling once
-                    // ComputedNode has real dimensions (advance_changed trigger).
-                    let iw = *svg_w as f64 + inset_x * 2.0;
-                    let ih = *svg_h as f64 + inset_y * 2.0;
-                    let transform = Affine::translate((inset_x, inset_y));
-                    scene.push_layer(
-                        Fill::NonZero,
-                        vello::peniko::Mix::Normal,
-                        1.0,
-                        Affine::IDENTITY,
-                        &vello::kurbo::Rect::new(0.0, 0.0, iw, ih),
-                    );
-                    scene.append(svg_scene, Some(transform));
-                    scene.pop_layer();
-                    let target_h = Val::Px(*svg_h + vertical_chrome + SVG_EDGE_MARGIN);
-                    if ui_node.height != target_h {
-                        ui_node.height = target_h;
-                    }
-                    if ui_node.min_height != target_h {
-                        ui_node.min_height = target_h;
-                    }
-                }
-            }
-            RichContentKind::Output { layout, plain_text } => {
-                let Some(font) = fonts.get(&font_handles.mono) else {
-                    continue;
-                };
-
-                let max_advance = if current_advance > 0.0 {
-                    Some(current_advance)
-                } else {
-                    None
-                };
-
-                let parley_layout = font.layout(
-                    plain_text,
-                    &vello_text.style,
-                    vello_text.text_align,
-                    max_advance,
-                );
-
-                let span_brushes = build_output_span_brushes(layout, &theme);
-                let fallback_brush = bevy_color_to_brush(theme.block_tool_result);
-                render_layout_with_brushes(
-                    &mut scene,
-                    &parley_layout,
-                    &span_brushes,
-                    &fallback_brush,
-                );
-            }
-        }
-
-        commands.entity(entity).insert(UiVelloScene::from(scene));
-        rich.last_render_version = rich.version;
-        rich.last_max_advance = current_advance;
-    }
-}
-
 /// Map an `OutputEntryType` to a theme color for the name column.
 fn entry_type_color(entry_type: OutputEntryType, theme: &crate::ui::theme::Theme) -> Color {
     match entry_type {
@@ -404,7 +201,7 @@ fn entry_type_color(entry_type: OutputEntryType, theme: &crate::ui::theme::Theme
 ///
 /// - Header rows → `theme.output_header` for all columns
 /// - Data rows: name column (index 0) → `entry_type_color`, others → `theme.block_tool_result`
-fn build_output_span_brushes(
+pub fn build_output_span_brushes(
     layout: &OutputLayout,
     theme: &crate::ui::theme::Theme,
 ) -> Vec<SpanBrush> {
@@ -438,7 +235,7 @@ fn build_output_span_brushes(
 /// Returns `None` for simple text (no coloring needed).
 /// For tabular/tree/list data, returns a `RichContent::Output` with
 /// pre-computed layout for per-cell coloring.
-pub fn detect_output_content(output: &OutputData, version: u64) -> Option<RichContent> {
+pub fn detect_output_content(output: &OutputData, _version: u64) -> Option<RichContent> {
     // Simple text gets no rich treatment
     if output.as_text().is_some() {
         return None;
@@ -453,9 +250,6 @@ pub fn detect_output_content(output: &OutputData, version: u64) -> Option<RichCo
 
     Some(RichContent {
         kind: RichContentKind::Output { layout, plain_text },
-        version,
-        last_render_version: 0,
-        last_max_advance: 0.0,
     })
 }
 
@@ -463,7 +257,7 @@ pub fn detect_output_content(output: &OutputData, version: u64) -> Option<RichCo
 const SVG_MAX_BYTES: usize = 100 * 1024;
 
 /// Maximum rendered height for inline SVGs.
-const SVG_MAX_HEIGHT: f32 = 400.0;
+pub const SVG_MAX_HEIGHT: f32 = 400.0;
 
 /// Try to extract and parse SVG content from block text.
 ///
@@ -533,8 +327,8 @@ fn extract_fenced_block<'a>(text: &'a str, lang: &str) -> Option<&'a str> {
 /// When `content_type` is provided, skips heuristic detection and uses the
 /// declared type directly. Falls back to sniffing when `content_type` is `None`.
 #[allow(dead_code)]
-pub fn detect_rich_content(text: &str, version: u64) -> Option<RichContent> {
-    detect_rich_content_typed(text, version, None, None)
+pub fn detect_rich_content(text: &str, _version: u64) -> Option<RichContent> {
+    detect_rich_content_typed(text, 0, None, None)
 }
 
 /// Detect rich content with an optional content type hint.
@@ -550,7 +344,7 @@ pub fn detect_rich_content(text: &str, version: u64) -> Option<RichContent> {
 /// the resource isn't available (text elements will be dropped).
 pub fn detect_rich_content_typed(
     text: &str,
-    version: u64,
+    _version: u64,
     content_type: Option<&str>,
     svg_fontdb: Option<&super::SvgFontDb>,
 ) -> Option<RichContent> {
@@ -565,9 +359,7 @@ pub fn detect_rich_content_typed(
                             width,
                             height,
                         },
-                        version,
-                        last_render_version: 0,
-                        last_max_advance: 0.0,
+
                     });
                 }
             }
@@ -576,9 +368,7 @@ pub fn detect_rich_content_typed(
                 let plain_text: String = spans.iter().map(|s| s.text.as_str()).collect();
                 return Some(RichContent {
                     kind: RichContentKind::Markdown { spans, plain_text },
-                    version,
-                    last_render_version: 0,
-                    last_max_advance: 0.0,
+
                 });
             }
             "text/vnd.abc" => {
@@ -590,9 +380,7 @@ pub fn detect_rich_content_typed(
                         spans,
                         plain_text: summary,
                     },
-                    version,
-                    last_render_version: 0,
-                    last_max_advance: 0.0,
+
                 });
             }
             _ => {} // Unknown content types fall through to heuristic detection
@@ -602,9 +390,6 @@ pub fn detect_rich_content_typed(
     if let Some(data) = try_parse_sparkline(text) {
         return Some(RichContent {
             kind: RichContentKind::Sparkline(data),
-            version,
-            last_render_version: 0,
-            last_max_advance: 0.0,
         });
     }
 
@@ -616,9 +401,6 @@ pub fn detect_rich_content_typed(
                 width,
                 height,
             },
-            version,
-            last_render_version: 0,
-            last_max_advance: 0.0,
         });
     }
 
@@ -637,9 +419,6 @@ pub fn detect_rich_content_typed(
 
     Some(RichContent {
         kind: RichContentKind::Markdown { spans, plain_text },
-        version,
-        last_render_version: 0,
-        last_max_advance: 0.0,
     })
 }
 

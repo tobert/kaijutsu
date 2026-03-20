@@ -8,7 +8,6 @@ use bevy_vello::VelloPlugin;
 use bevy_vello::integrations::text::VelloFontAxes;
 use bevy_vello::prelude::*;
 
-use super::components::{KjTextEffects, rainbow_brush};
 use super::resources::{FontHandles, SvgFontDb, TextMetrics};
 
 /// Plugin that enables Vello text rendering in Bevy.
@@ -31,11 +30,8 @@ impl Plugin for KjTextPlugin {
                 (
                     sync_text_metrics_from_window,
                     update_text_metrics_from_font,
-                    animate_rainbow_text,
-                    // render_rich_content is registered in CellPlugin (CellPhase::Buffer)
-                    // so it runs after sync_block_cell_buffers + ApplyDeferred.
-                    // NOTE: sync_text_max_advance is in view/render.rs (CellPhase::Layout)
-                    // with Changed<ComputedNode> filter — intentionally not here.
+                    // Rainbow text and rich content rendering are now handled
+                    // by build_block_scenes in BlockRenderPlugin.
                 ),
             );
     }
@@ -174,24 +170,4 @@ fn sync_text_metrics_from_window(
     }
 }
 
-/// Animate rainbow gradient text each frame.
-///
-/// Entities with `KjTextEffects { rainbow: true }` get a scrolling
-/// linear gradient brush. The phase advances with elapsed time,
-/// creating a smooth cycling rainbow effect.
-fn animate_rainbow_text(time: Res<Time>, mut query: Query<(&KjTextEffects, &mut UiVelloText)>) {
-    // Phase cycles 0→1 over ~4 seconds
-    let phase = (time.elapsed_secs() * 0.25) % 1.0;
-
-    for (effects, mut vello_text) in query.iter_mut() {
-        if !effects.rainbow {
-            continue;
-        }
-        // Alpha from current brush (preserve timeline dimming)
-        let alpha = match &vello_text.style.brush {
-            vello::peniko::Brush::Solid(c) => c.components[3],
-            _ => 1.0,
-        };
-        vello_text.style.brush = rainbow_brush(phase, alpha);
-    }
-}
+// Rainbow text animation moved to block_render::build_block_scenes.

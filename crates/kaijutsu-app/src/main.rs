@@ -102,6 +102,8 @@ fn main() {
         .add_plugins(input::InputPlugin)
         // Cell editing
         .add_plugins(cell::CellPlugin)
+        // Per-block Vello texture rendering
+        .add_plugins(view::block_render::BlockRenderPlugin)
         // Agent attachment and collaboration
         .add_plugins(agents::AgentsPlugin)
         // Shader effects

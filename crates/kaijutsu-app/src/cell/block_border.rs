@@ -5,16 +5,14 @@
 //! ignore ContentSize from UiVelloText, collapsing block height to just padding.
 
 use bevy::prelude::*;
-use bevy_vello::prelude::UiVelloScene;
 
 use kaijutsu_types::ToolKind;
 
 use crate::connection::RpcConnectionState;
-use crate::text::{FontHandles, TextMetrics};
+use crate::text::TextMetrics;
 use crate::ui::drift::DriftState;
 use crate::ui::theme::Theme;
 use crate::view::document::DocumentCache;
-use crate::view::fieldset;
 use crate::view::{
     BlockCell, BlockCellContainer, BlockKind, BlockSnapshot, CellEditor, DriftKind, EditorEntities,
     MainCell, Role,
@@ -90,14 +88,6 @@ pub enum BorderAnimation {
     /// Subtle breathing (thinking expanded).
     Breathe,
 }
-
-/// Marker that the block cell has a `UiVelloScene` border drawn on it.
-///
-/// The border is rendered directly on the BlockCell entity (not a child),
-/// so that Taffy continues to use `ContentSize` from `UiVelloText` for sizing.
-/// (Child entities turn the parent into a container, causing Taffy to ignore ContentSize.)
-#[derive(Component)]
-pub struct BlockBorderActive;
 
 // ============================================================================
 // SYSTEMS
@@ -406,124 +396,3 @@ fn compute_border_style(
     }
 }
 
-/// Add `UiVelloScene` directly to BlockCells that have a border style.
-///
-/// The scene is rendered on the same entity as `UiVelloText` so Taffy continues
-/// to use `ContentSize` (from bevy_vello's text measurement) for height sizing.
-/// Using a child entity would make Taffy treat the block as a container and
-/// ignore ContentSize, collapsing the height to just the padding (3-4px).
-///
-/// Runs in PostUpdate (after UiSystems::Layout so ComputedNode is available).
-pub fn spawn_vello_borders(
-    mut commands: Commands,
-    block_cells: Query<Entity, (With<BlockBorderStyle>, Without<BlockBorderActive>)>,
-) {
-    for entity in block_cells.iter() {
-        commands
-            .entity(entity)
-            .insert((UiVelloScene::default(), BlockBorderActive));
-    }
-}
-
-/// Rebuild border scenes when style or size changes, or when first added.
-///
-/// `Added<UiVelloScene>` handles the initial render: `spawn_vello_borders`
-/// inserts `UiVelloScene::default()` (empty), then `ApplyDeferred` flushes
-/// the insertion, then this system sees `Added<UiVelloScene>` and builds the
-/// scene. Without `Added`, static borders (`BorderAnimation::None`) would
-/// never be populated because `Changed<BlockBorderStyle>` only fires once
-/// (the frame the component is inserted) while `UiVelloScene` isn't available
-/// until after `ApplyDeferred` runs.
-///
-/// Runs in PostUpdate (after ApplyDeferred after spawn_vello_borders).
-pub fn update_vello_borders(
-    mut block_cells: Query<
-        (&BlockBorderStyle, &mut UiVelloScene, &ComputedNode),
-        Or<(
-            Added<UiVelloScene>,
-            Changed<BlockBorderStyle>,
-            Changed<ComputedNode>,
-        )>,
-    >,
-    fonts: Res<Assets<bevy_vello::prelude::VelloFont>>,
-    font_handles: Res<FontHandles>,
-    theme: Res<Theme>,
-) {
-    let font = fonts.get(&font_handles.mono);
-
-    for (style, mut scene_component, computed) in block_cells.iter_mut() {
-        let size = computed.size();
-        if size.x < 1.0 || size.y < 1.0 {
-            continue;
-        }
-
-        let mut scene = bevy_vello::vello::Scene::new();
-        fieldset::build_fieldset_border(
-            &mut scene,
-            size.x as f64,
-            size.y as f64,
-            style,
-            style.top_label.as_deref(),
-            style.bottom_label.as_deref(),
-            font,
-            0.0, // initial time — animate_vello_borders handles ongoing animation
-            theme.bg,
-        );
-
-        *scene_component = UiVelloScene::from(scene);
-    }
-}
-
-/// Animate borders every frame for blocks with active animations.
-///
-/// Runs in PostUpdate (after update_vello_borders).
-pub fn animate_vello_borders(
-    time: Res<Time>,
-    mut block_cells: Query<(&BlockBorderStyle, &mut UiVelloScene, &ComputedNode)>,
-    fonts: Res<Assets<bevy_vello::prelude::VelloFont>>,
-    font_handles: Res<FontHandles>,
-    theme: Res<Theme>,
-) {
-    let t = time.elapsed_secs();
-    let font = fonts.get(&font_handles.mono);
-
-    for (style, mut scene_component, computed) in block_cells.iter_mut() {
-        // Only animate blocks with active animations
-        if style.animation == BorderAnimation::None {
-            continue;
-        }
-
-        let size = computed.size();
-        if size.x < 1.0 || size.y < 1.0 {
-            continue;
-        }
-
-        let mut scene = bevy_vello::vello::Scene::new();
-        fieldset::build_fieldset_border(
-            &mut scene,
-            size.x as f64,
-            size.y as f64,
-            style,
-            style.top_label.as_deref(),
-            style.bottom_label.as_deref(),
-            font,
-            t,
-            theme.bg,
-        );
-
-        *scene_component = UiVelloScene::from(scene);
-    }
-}
-
-/// Clean up border scenes when BlockCell loses its style.
-pub fn cleanup_block_borders(
-    mut commands: Commands,
-    // BlockCells that have BlockBorderActive but no BlockBorderStyle
-    removed_style: Query<Entity, (With<BlockBorderActive>, Without<BlockBorderStyle>)>,
-) {
-    for entity in removed_style.iter() {
-        commands
-            .entity(entity)
-            .remove::<(UiVelloScene, BlockBorderActive)>();
-    }
-}

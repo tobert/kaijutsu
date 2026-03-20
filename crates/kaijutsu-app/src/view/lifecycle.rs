@@ -1,13 +1,11 @@
 //! Entity lifecycle — spawn and despawn block cell entities.
 //!
 //! Owns spawn_main_cell, spawn_block_cells, sync_role_headers, and
-//! track_conversation_container. The key architectural change from the
-//! cell/ version: block cells use VelloTextAnchor::TopLeft with Bevy
-//! flex layout for positioning — no UiTransform hack.
+//! track_conversation_container. Block cells use BlockScene + BlockTexture
+//! + ImageNode for CPU-rasterized Vello rendering with Bevy flex layout.
 
 use bevy::prelude::*;
-use bevy_vello::integrations::text::VelloFontAxes;
-use bevy_vello::prelude::{UiVelloText, VelloFont, VelloTextAnchor};
+use bevy_vello::prelude::VelloFont;
 
 use crate::cell::{
     BlockCell, BlockCellContainer, BlockCellLayout, BlockId, CellEditor, LayoutGeneration,
@@ -22,7 +20,7 @@ pub struct EditorEntities {
     /// The ConversationContainer entity (flex parent for BlockCells).
     pub conversation_container: Option<Entity>,
 }
-use crate::text::{FontHandles, TextMetrics, bevy_color_to_brush};
+use crate::text::FontHandles;
 use crate::ui::timeline::TimelineVisibility;
 
 // ============================================================================
@@ -132,10 +130,10 @@ pub fn track_conversation_container(
 /// - Despawns BlockCells for removed blocks
 /// - Maintains order in BlockCellContainer
 ///
-/// **Single-phase spawning:** UiVelloText is included in the initial spawn
-/// bundle to avoid font handle corruption during deferred try_insert.
-/// Spawning is gated on font availability — block cells appear once the
-/// font asset loads (typically within the first few frames).
+/// **Single-phase spawning:** BlockScene + BlockTexture + ImageNode are
+/// included in the initial spawn bundle. Spawning is gated on font
+/// availability — block cells appear once the font asset loads
+/// (typically within the first few frames).
 pub fn spawn_block_cells(
     mut commands: Commands,
     entities: Res<EditorEntities>,
@@ -145,8 +143,6 @@ pub fn spawn_block_cells(
     mut layout_gen: ResMut<LayoutGeneration>,
     font_handles: Res<FontHandles>,
     fonts: Res<Assets<VelloFont>>,
-    text_metrics: Res<TextMetrics>,
-    computed_nodes: Query<&ComputedNode>,
     mut scroll_state: ResMut<crate::cell::ConversationScrollState>,
 ) {
     let Some(main_ent) = entities.main_cell else {
@@ -237,8 +233,8 @@ pub fn spawn_block_cells(
         }
     }
 
-    // Gate new spawns on font availability — UiVelloText needs a valid font
-    // handle at spawn time to avoid content sizing failures.
+    // Gate new spawns on font availability — build_block_scenes needs a valid
+    // font to render text into the Vello scene.
     let font_loaded = fonts.get(&font_handles.mono).is_some();
     if !font_loaded && current_blocks.iter().any(|id| !container.contains(id)) {
         // Blocks waiting to spawn but font not ready yet — will retry next frame.
@@ -248,43 +244,22 @@ pub fn spawn_block_cells(
     let current_version = editor.version();
     let conv_entity = entities.conversation_container;
 
-    // Use the container's current content width as the initial max_advance so
-    // Parley wraps text correctly from the very first frame. Without this,
-    // blocks spawn with max_advance=None, measure as a single line, then snap
-    // to their true wrapped height one frame later — causing a visible scroll jump.
-    let initial_max_advance = conv_entity
-        .and_then(|e| computed_nodes.get(e).ok())
-        .map(|cn| cn.content_box().width())
-        .filter(|&w| w > 0.0);
-
     let mut had_additions = false;
 
     for block_id in &current_blocks {
         if !container.contains(block_id) {
-            // Single-phase spawn: BlockCell + UiVelloText in one bundle.
-            // Let UiVelloText's #[require] system handle ContentSize,
-            // UiTransform, VisibilityClass (with on_add hook), etc.
-            // Only override VelloTextAnchor (TopLeft, not default Center).
+            // Single-phase spawn: BlockCell + BlockScene + BlockTexture + ImageNode.
             let entity = commands
                 .spawn((
                     BlockCell::new(*block_id),
                     BlockCellLayout::default(),
-                    UiVelloText {
-                        value: String::new(),
-                        style: bevy_vello::prelude::VelloTextStyle {
-                            font: font_handles.mono.clone(),
-                            brush: bevy_color_to_brush(Color::WHITE),
-                            font_size: text_metrics.cell_font_size,
-                            font_axes: VelloFontAxes {
-                                weight: Some(200.0),
-                                ..default()
-                            },
-                            ..default()
-                        },
-                        max_advance: initial_max_advance,
-                        ..default()
+                    crate::view::block_render::BlockScene::default(),
+                    crate::view::block_render::BlockTexture {
+                        image: Handle::default(),
+                        width: 1,
+                        height: 1,
                     },
-                    VelloTextAnchor::TopLeft,
+                    ImageNode::default(),
                     Node {
                         width: Val::Percent(100.0),
                         ..default()
@@ -335,8 +310,8 @@ pub fn spawn_block_cells(
 
 /// Sync RoleGroupBorder entities for role transitions.
 ///
-/// Spawns role group border entities with `UiVelloScene` for Vello-drawn
-/// horizontal lines with inset role labels.
+/// Spawns role group border entities with BlockScene + BlockTexture for
+/// Vello-drawn horizontal lines with inset role labels.
 pub fn sync_role_headers(
     mut commands: Commands,
     entities: Res<EditorEntities>,
@@ -407,13 +382,19 @@ pub fn sync_role_headers(
             .spawn((
                 RoleGroupBorder { role, block_id },
                 RoleGroupBorderLayout::default(),
+                crate::view::block_render::BlockScene::default(),
+                crate::view::block_render::BlockTexture {
+                    image: Handle::default(),
+                    width: 1,
+                    height: 1,
+                },
+                ImageNode::default(),
                 Node {
                     width: Val::Percent(100.0),
                     min_height: Val::Px(ROLE_HEADER_HEIGHT),
                     margin: UiRect::bottom(Val::Px(ROLE_HEADER_SPACING)),
                     ..default()
                 },
-                bevy_vello::prelude::UiVelloScene::default(),
             ))
             .id();
         if let Some(conv) = entities.conversation_container

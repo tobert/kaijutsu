@@ -9,6 +9,7 @@
 //! - `lifecycle` — spawn/despawn block cell entities (TopLeft anchor, no UiTransform)
 //! - `render` — buffer sync (text → UiVelloText), layout readback
 
+pub mod block_render;
 pub mod components;
 pub mod cursor;
 pub mod document;
