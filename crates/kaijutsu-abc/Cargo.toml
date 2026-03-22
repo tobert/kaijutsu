@@ -9,6 +9,7 @@ winnow = "0.6"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 skrifa = "0.40"
+kurbo = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = "1"

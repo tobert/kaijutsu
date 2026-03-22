@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::fmt::Write;
 use std::sync::OnceLock;
 
+use kurbo::BezPath;
 use skrifa::instance::Size;
 use skrifa::outline::DrawSettings;
 use skrifa::raw::FontRef;
@@ -22,6 +23,7 @@ static FONT_CACHE: OnceLock<FontCache> = OnceLock::new();
 /// Font cache holding pre-extracted glyph outlines.
 pub struct FontCache {
     glyphs: HashMap<u32, GlyphData>,
+    bezpaths: HashMap<u32, BezPath>,
     upem: f64,
 }
 
@@ -69,6 +71,47 @@ impl skrifa::outline::OutlinePen for SvgPathPen {
     }
 }
 
+/// Outline pen that builds a `kurbo::BezPath` instead of an SVG string.
+/// Same Y-flip convention as `SvgPathPen` (font Y-up → display Y-down).
+struct BezPathPen {
+    path: BezPath,
+}
+
+impl BezPathPen {
+    fn new() -> Self {
+        BezPathPen {
+            path: BezPath::new(),
+        }
+    }
+}
+
+impl skrifa::outline::OutlinePen for BezPathPen {
+    fn move_to(&mut self, x: f32, y: f32) {
+        self.path.move_to((x as f64, -y as f64));
+    }
+
+    fn line_to(&mut self, x: f32, y: f32) {
+        self.path.line_to((x as f64, -y as f64));
+    }
+
+    fn quad_to(&mut self, cx0: f32, cy0: f32, x: f32, y: f32) {
+        self.path
+            .quad_to((cx0 as f64, -cy0 as f64), (x as f64, -y as f64));
+    }
+
+    fn curve_to(&mut self, cx0: f32, cy0: f32, cx1: f32, cy1: f32, x: f32, y: f32) {
+        self.path.curve_to(
+            (cx0 as f64, -cy0 as f64),
+            (cx1 as f64, -cy1 as f64),
+            (x as f64, -y as f64),
+        );
+    }
+
+    fn close(&mut self) {
+        self.path.close_path();
+    }
+}
+
 /// Codepoints we pre-cache from Bravura (SMuFL).
 const PRELOAD_CODEPOINTS: &[u32] = &[
     0xE050, // Treble clef
@@ -109,6 +152,7 @@ impl FontCache {
         let size = Size::unscaled();
 
         let mut glyphs = HashMap::new();
+        let mut bezpaths = HashMap::new();
 
         for &cp in PRELOAD_CODEPOINTS {
             let Some(ch) = char::from_u32(cp) else {
@@ -118,13 +162,22 @@ impl FontCache {
                 continue;
             };
 
-            let mut pen = SvgPathPen::new();
             let Some(outline) = outline_glyphs.get(glyph_id) else {
                 continue;
             };
+
+            // Draw SVG path
+            let mut svg_pen = SvgPathPen::new();
             let settings = DrawSettings::unhinted(size, skrifa::instance::LocationRef::default());
-            if outline.draw(settings, &mut pen).is_err() {
+            if outline.draw(settings, &mut svg_pen).is_err() {
                 continue;
+            }
+
+            // Draw BezPath
+            let mut bez_pen = BezPathPen::new();
+            let settings = DrawSettings::unhinted(size, skrifa::instance::LocationRef::default());
+            if outline.draw(settings, &mut bez_pen).is_ok() {
+                bezpaths.insert(cp, bez_pen.path);
             }
 
             // Get advance width from hmtx
@@ -136,13 +189,17 @@ impl FontCache {
             glyphs.insert(
                 cp,
                 GlyphData {
-                    path_d: pen.d,
+                    path_d: svg_pen.d,
                     advance,
                 },
             );
         }
 
-        FontCache { glyphs, upem }
+        FontCache {
+            glyphs,
+            bezpaths,
+            upem,
+        }
     }
 
     /// Get the SVG path `d` attribute for a glyph.
@@ -153,6 +210,11 @@ impl FontCache {
     /// Get the advance width for a glyph (in font units).
     pub fn glyph_advance(&self, codepoint: u32) -> Option<f64> {
         self.glyphs.get(&codepoint).map(|g| g.advance)
+    }
+
+    /// Get the `kurbo::BezPath` outline for a glyph.
+    pub fn glyph_bezpath(&self, codepoint: u32) -> Option<&BezPath> {
+        self.bezpaths.get(&codepoint)
     }
 
     /// Units per em for this font.
@@ -191,6 +253,19 @@ mod tests {
                 cp
             );
         }
+    }
+
+    #[test]
+    fn glyph_bezpath_treble_clef() {
+        let cache = font_cache();
+        let path = cache.glyph_bezpath(0xE050);
+        assert!(path.is_some(), "Bravura should have treble clef BezPath");
+        // Non-empty BezPath should have path elements
+        let elements: Vec<_> = path.unwrap().elements().to_vec();
+        assert!(
+            !elements.is_empty(),
+            "Treble clef BezPath should not be empty"
+        );
     }
 
     #[test]

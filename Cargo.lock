@@ -5510,6 +5510,7 @@ dependencies = [
 name = "kaijutsu-abc"
 version = "0.1.0"
 dependencies = [
+ "kurbo",
  "pretty_assertions",
  "serde",
  "skrifa 0.40.0",
@@ -5546,6 +5547,7 @@ dependencies = [
  "hostname",
  "image",
  "indexmap",
+ "kaijutsu-abc",
  "kaijutsu-client",
  "kaijutsu-crdt",
  "kaijutsu-kernel",

@@ -1,8 +1,9 @@
 //! Per-block Vello texture rendering.
 //!
-//! Each conversation block renders its own `vello::Scene` to a per-block texture,
-//! displayed as a Bevy `ImageNode`. Bevy's UI system handles scroll, clip, z-order.
-//! `BackgroundColor` works again. No more coordinate space mismatches.
+//! Each conversation block renders its own `vello::Scene` to a per-block texture.
+//! Block cells use `MaterialNode<BlockFxMaterial>` for hybrid Vello+shader effects.
+//! Role group borders use plain `ImageNode`. Bevy's UI system handles scroll,
+//! clip, z-order. `BackgroundColor` works again. No coordinate space mismatches.
 
 use std::collections::HashMap;
 
@@ -21,6 +22,7 @@ use vello::peniko::Fill;
 
 use crate::cell::block_border::{BlockBorderStyle, BorderAnimation};
 use crate::cell::{BlockCell, RoleGroupBorder};
+use crate::shaders::BlockFxMaterial;
 use crate::text::rich::{RichContent, RichContentKind, SVG_MAX_HEIGHT};
 use crate::text::{
     FontHandles, KjTextEffects, TextMetrics, bevy_color_to_brush,
@@ -323,13 +325,14 @@ pub fn build_block_scenes(
                 scene: svg_scene,
                 width: svg_w,
                 height: svg_h,
+                ..
             }) => {
                 if *svg_w <= 0.0 {
                     content_height = 0.0;
                 } else {
-                    // Scale to fit content width, then constrain to max height
-                    let w_scale = (content_width / svg_w).min(1.0);
-                    let h_scale = (SVG_MAX_HEIGHT / svg_h).min(1.0);
+                    // Scale to fill content width, constrain to max height
+                    let w_scale = content_width / svg_w;
+                    let h_scale = SVG_MAX_HEIGHT / svg_h;
                     let scale = w_scale.min(h_scale) as f64;
                     let scaled_h = *svg_h as f64 * scale;
                     content_height = scaled_h as f32;
@@ -353,6 +356,46 @@ pub fn build_block_scenes(
                     scene.append(svg_scene, Some(transform));
                     scene.pop_layer();
                 }
+            }
+            Some(RichContentKind::Abc { tune, .. }) => {
+                let default_opts = kaijutsu_abc::engrave::EngravingOptions::default();
+                let elements =
+                    kaijutsu_abc::engrave::layout::engrave(tune, &default_opts);
+
+                let notation_brush = bevy_color_to_brush(theme.block_assistant);
+                let (abc_scene, intrinsic_w, intrinsic_h) =
+                    crate::text::abc::render_engraving_to_scene(
+                        &elements,
+                        default_opts.margin,
+                        &notation_brush,
+                        Some(font),
+                        &text_metrics,
+                    );
+
+                // Scale to fill content_width, cap at SVG_MAX_HEIGHT
+                let w_scale = content_width as f64 / intrinsic_w;
+                let h_scale = SVG_MAX_HEIGHT as f64 / intrinsic_h;
+                let scale = w_scale.min(h_scale);
+                content_height = (intrinsic_h * scale) as f32;
+
+                let clip_rect = vello::kurbo::Rect::new(
+                    pad_left as f64,
+                    pad_top as f64,
+                    (pad_left + content_width) as f64,
+                    (pad_top + content_height) as f64,
+                );
+                scene.push_layer(
+                    Fill::NonZero,
+                    vello::peniko::Mix::Normal,
+                    1.0,
+                    Affine::IDENTITY,
+                    &clip_rect,
+                );
+                scene.append(
+                    &abc_scene,
+                    Some(Affine::translate(text_offset) * Affine::scale(scale)),
+                );
+                scene.pop_layer();
             }
             Some(RichContentKind::Output { layout, plain_text }) => {
                 let parley_layout = font.layout(
@@ -484,14 +527,69 @@ pub fn build_role_group_scenes(
 /// Resize block textures to match physical pixel dimensions.
 ///
 /// Runs after build_block_scenes so built_width/built_height are up to date.
+/// Block cells update their `BlockFxMaterial` texture binding.
+/// Role group borders update their `ImageNode` directly.
 pub fn resize_block_textures(
-    mut query: Query<(&BlockScene, &mut BlockTexture, &mut ImageNode)>,
+    mut block_query: Query<
+        (&BlockScene, &mut BlockTexture, &MaterialNode<BlockFxMaterial>),
+        (With<BlockCell>, Without<RoleGroupBorder>),
+    >,
+    mut role_query: Query<
+        (&BlockScene, &mut BlockTexture, &mut ImageNode),
+        (With<RoleGroupBorder>, Without<BlockCell>),
+    >,
     text_metrics: Res<TextMetrics>,
     mut images: ResMut<Assets<Image>>,
+    mut fx_materials: ResMut<Assets<BlockFxMaterial>>,
 ) {
     let scale = text_metrics.scale_factor;
 
-    for (scene, mut texture, mut image_node) in query.iter_mut() {
+    // Block cells: update material texture binding
+    let block_count = block_query.iter().count();
+    let mut skipped = 0u32;
+    let mut resized = 0u32;
+    for (scene, mut texture, mat_node) in block_query.iter_mut() {
+        if scene.built_width <= 0.0 || scene.built_height <= 0.0 {
+            skipped += 1;
+            continue;
+        }
+
+        let target_w = (scene.built_width * scale).ceil() as u32;
+        let target_h = (scene.built_height * scale).ceil() as u32;
+        let target_w = target_w.clamp(1, MAX_TEXTURE_DIM);
+        let target_h = target_h.clamp(1, MAX_TEXTURE_DIM);
+
+        if texture.width != target_w || texture.height != target_h {
+            let new_handle = create_block_texture(&mut images, target_w, target_h);
+            info!(
+                "resize_block_textures: block fx {}x{} mat_handle={:?} tex_handle={:?}",
+                target_w, target_h, mat_node.0.id(), new_handle.id()
+            );
+            if let Some(mat) = fx_materials.get_mut(&mat_node.0) {
+                mat.texture = new_handle.clone();
+            } else {
+                warn!("resize_block_textures: material handle not found!");
+            }
+            texture.image = new_handle;
+            texture.width = target_w;
+            texture.height = target_h;
+            resized += 1;
+        }
+    }
+
+    if block_count > 0 {
+        static LAST_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+        let key = (block_count as u64) << 32 | (skipped as u64) << 16 | resized as u64;
+        if LAST_LOG.swap(key, std::sync::atomic::Ordering::Relaxed) != key {
+            info!(
+                "resize_block_textures: {} blocks, {} skipped (zero dims), {} resized",
+                block_count, skipped, resized
+            );
+        }
+    }
+
+    // Role group borders: update ImageNode directly (no shader effects)
+    for (scene, mut texture, mut image_node) in role_query.iter_mut() {
         if scene.built_width <= 0.0 || scene.built_height <= 0.0 {
             continue;
         }

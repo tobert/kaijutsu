@@ -3,6 +3,7 @@
 //! Provides GPU-accelerated text rendering via bevy_vello, which uses
 //! Parley for text layout and Vello for vector path rendering.
 
+pub mod abc;
 pub mod components;
 pub mod markdown;
 mod plugin;

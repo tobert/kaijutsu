@@ -528,10 +528,10 @@ impl RhaiEngine {
         context_id: ContextId,
     ) {
         // abc_block(abc_text) -> String
-        // Parses ABC notation, engraves to SVG, inserts parent ABC block + child SVG block.
+        // Parses ABC notation, inserts a single text/vnd.abc block (rendered natively by the app).
         let abc_store = block_store.clone();
         engine.register_fn("abc_block", move |abc_text: String| -> String {
-            // Parse ABC
+            // Validate parse
             let result = kaijutsu_abc::parse(&abc_text);
             if result.has_errors() {
                 let errs: Vec<_> = result.errors().map(|e| e.message.clone()).collect();
@@ -539,17 +539,12 @@ impl RhaiEngine {
                 return format!("ABC parse error: {}", errs.join("; "));
             }
 
-            // Engrave to SVG
-            let options = kaijutsu_abc::engrave::EngravingOptions::default();
-            let svg = kaijutsu_abc::engrave::engrave_to_svg(&result.value, &options);
-
-            // Find last block for ordering
+            // Insert single text/vnd.abc block (no SVG child needed — app renders natively)
             let last_block_id = abc_store
                 .get(context_id)
                 .and_then(|doc| doc.doc.blocks_ordered().last().map(|b| b.id));
 
-            // Insert ABC parent block
-            let abc_id = match abc_store.insert_block(
+            match abc_store.insert_block(
                 context_id,
                 None,
                 last_block_id.as_ref(),
@@ -558,49 +553,22 @@ impl RhaiEngine {
                 &abc_text,
                 Status::Done,
             ) {
-                Ok(id) => id,
-                Err(e) => {
-                    warn!("Rhai: abc_block parent insert error: {}", e);
-                    return String::new();
-                }
-            };
-
-            // Set content type on parent
-            if let Some(mut entry) = abc_store.get_mut(context_id) {
-                let _ = entry
-                    .doc
-                    .set_content_type(&abc_id, Some("text/vnd.abc".into()));
-            }
-
-            // Insert SVG child block (parent = abc_id, after = abc_id)
-            match abc_store.insert_block(
-                context_id,
-                Some(&abc_id),
-                Some(&abc_id),
-                Role::Tool,
-                BlockKind::Text,
-                &svg,
-                Status::Done,
-            ) {
-                Ok(svg_id) => {
+                Ok(abc_id) => {
                     if let Some(mut entry) = abc_store.get_mut(context_id) {
                         let _ = entry
                             .doc
-                            .set_content_type(&svg_id, Some("image/svg+xml".into()));
+                            .set_content_type(&abc_id, Some("text/vnd.abc".into()));
                     }
-                    let key = svg_id.to_key();
+                    let key = abc_id.to_key();
                     info!(
-                        "Rhai: abc_block inserted parent {} + SVG child {} ({} bytes)",
-                        abc_id.to_key(),
+                        "Rhai: abc_block inserted {} ({} bytes)",
                         key,
-                        svg.len()
+                        abc_text.len()
                     );
                     key
                 }
                 Err(e) => {
-                    warn!("Rhai: abc_block SVG child insert error: {}", e);
-                    // Best-effort cleanup: delete parent
-                    let _ = abc_store.delete_block(context_id, &abc_id);
+                    warn!("Rhai: abc_block insert error: {}", e);
                     String::new()
                 }
             }
@@ -948,7 +916,7 @@ impl ExecutionEngine for RhaiEngine {
             "additionalProperties": false,
             "context_functions": [
                 { "name": "svg_block", "sig": "svg_block(content: string) -> string", "doc": "Insert SVG content as a block in the current conversation. Returns block ID." },
-                { "name": "abc_block", "sig": "abc_block(content: string) -> string", "doc": "Insert ABC music notation as a block in the current conversation. Renders to sheet music SVG. Returns block ID." },
+                { "name": "abc_block", "sig": "abc_block(content: string) -> string", "doc": "Insert ABC music notation as a block in the current conversation, rendered as sheet music. Returns block ID." },
             ],
             "stdlib": catalog["functions"],
         }))

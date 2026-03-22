@@ -5,6 +5,7 @@ edition.workspace = true
 description = "Bevy GUI client for kaijutsu"
 
 [dependencies]
+kaijutsu-abc = { workspace = true }
 kaijutsu-crdt = { path = "../kaijutsu-crdt" }
 kaijutsu-client = { path = "../kaijutsu-client" }
 kaijutsu-kernel = { path = "../kaijutsu-kernel" }

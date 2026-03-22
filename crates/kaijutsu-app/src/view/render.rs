@@ -160,6 +160,7 @@ pub fn sync_block_cell_buffers(
                 rich.kind,
                 crate::text::rich::RichContentKind::Sparkline(_)
                     | crate::text::rich::RichContentKind::Svg { .. }
+                    | crate::text::rich::RichContentKind::Abc { .. }
             );
             if needs_text_cleared {
                 block_scene.text = String::new();

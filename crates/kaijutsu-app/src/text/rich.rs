@@ -64,6 +64,17 @@ pub enum RichContentKind {
         width: f32,
         /// Display height (capped to a reasonable maximum).
         height: f32,
+        /// Raw SVG source for future re-parse (e.g. DPI-aware re-rendering).
+        source: Arc<String>,
+        /// Scale factor at parse time (placeholder for future DPI re-parse).
+        rendered_at_dpi: f32,
+    },
+    /// ABC music notation — rendered directly to vello from engraving IR.
+    Abc {
+        /// Raw ABC source text.
+        source: Arc<String>,
+        /// Parsed AST (avoids re-parsing on resize).
+        tune: Arc<kaijutsu_abc::Tune>,
     },
     /// Structured OutputData with per-cell coloring by EntryType.
     Output {
@@ -270,7 +281,7 @@ pub const SVG_MAX_HEIGHT: f32 = 400.0;
 fn try_parse_svg(
     text: &str,
     svg_fontdb: Option<&super::SvgFontDb>,
-) -> Option<(Arc<vello::Scene>, f32, f32)> {
+) -> Option<(Arc<vello::Scene>, f32, f32, Arc<String>)> {
     let svg_str = if text.trim_start().starts_with("<svg") {
         text.trim()
     } else if let Some(inner) = extract_fenced_block(text, "svg") {
@@ -292,9 +303,8 @@ fn try_parse_svg(
 
     match result {
         Ok(svg) => {
-            // Store the true intrinsic dimensions — render_rich_content handles
-            // scaling to fit both the container width and SVG_MAX_HEIGHT.
-            Some((svg.scene, svg.width, svg.height))
+            let source = Arc::new(svg_str.to_string());
+            Some((svg.scene, svg.width, svg.height, source))
         }
         Err(e) => {
             warn!("SVG parse failed: {}", e);
@@ -352,14 +362,15 @@ pub fn detect_rich_content_typed(
     if let Some(ct) = content_type {
         match ct {
             "image/svg+xml" => {
-                if let Some((scene, width, height)) = try_parse_svg(text, svg_fontdb) {
+                if let Some((scene, width, height, source)) = try_parse_svg(text, svg_fontdb) {
                     return Some(RichContent {
                         kind: RichContentKind::Svg {
                             scene,
                             width,
                             height,
+                            source,
+                            rendered_at_dpi: 1.0,
                         },
-
                     });
                 }
             }
@@ -372,15 +383,23 @@ pub fn detect_rich_content_typed(
                 });
             }
             "text/vnd.abc" => {
-                // Show collapsed summary: "🎵 ABC: Title (Key)"
-                let summary = abc_summary(text);
-                let spans = parse_to_rich_spans(&summary);
+                let result = kaijutsu_abc::parse(text);
+                if result.has_errors() {
+                    // Fall back to summary on parse error
+                    let summary = abc_summary(text);
+                    let spans = parse_to_rich_spans(&summary);
+                    return Some(RichContent {
+                        kind: RichContentKind::Markdown {
+                            spans,
+                            plain_text: summary,
+                        },
+                    });
+                }
                 return Some(RichContent {
-                    kind: RichContentKind::Markdown {
-                        spans,
-                        plain_text: summary,
+                    kind: RichContentKind::Abc {
+                        source: Arc::new(text.to_string()),
+                        tune: Arc::new(result.value),
                     },
-
                 });
             }
             _ => {} // Unknown content types fall through to heuristic detection
@@ -394,12 +413,14 @@ pub fn detect_rich_content_typed(
     }
 
     // Try SVG
-    if let Some((scene, width, height)) = try_parse_svg(text, svg_fontdb) {
+    if let Some((scene, width, height, source)) = try_parse_svg(text, svg_fontdb) {
         return Some(RichContent {
             kind: RichContentKind::Svg {
                 scene,
                 width,
                 height,
+                source,
+                rendered_at_dpi: 1.0,
             },
         });
     }
