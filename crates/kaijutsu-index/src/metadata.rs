@@ -21,6 +21,14 @@ impl MetadataStore {
         let conn =
             Connection::open(&db_path).map_err(|e| IndexError::Database(format!("open: {}", e)))?;
 
+        // WAL mode allows concurrent readers + writer without SQLITE_BUSY on reads.
+        // busy_timeout retries on lock contention instead of failing immediately.
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA busy_timeout=5000;",
+        )
+        .map_err(|e| IndexError::Database(format!("pragmas: {}", e)))?;
+
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS index_entries (
                 context_id BLOB PRIMARY KEY,

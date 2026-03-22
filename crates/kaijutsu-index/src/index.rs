@@ -165,6 +165,15 @@ impl HnswIndex {
             .file_dump(&self.data_dir, "index")
             .map_err(|e| IndexError::Index(format!("save hnsw: {}", e)))?;
 
+        // hnsw_rs flushes BufWriters but doesn't fsync. Under heavy parallel IO
+        // the file metadata may not be stable for a subsequent reload. Sync both.
+        for suffix in &["hnsw.graph", "hnsw.data"] {
+            let path = self.data_dir.join(format!("index.{suffix}"));
+            if let Ok(f) = std::fs::File::open(&path) {
+                let _ = f.sync_all();
+            }
+        }
+
         tracing::debug!(path = %self.data_dir.display(), "saved HNSW index to disk");
         Ok(())
     }
