@@ -531,7 +531,7 @@ pub fn build_role_group_scenes(
 /// Role group borders update their `ImageNode` directly.
 pub fn resize_block_textures(
     mut block_query: Query<
-        (&BlockScene, &mut BlockTexture, &MaterialNode<BlockFxMaterial>),
+        (&BlockScene, &mut BlockTexture, &MaterialNode<BlockFxMaterial>, &mut ImageNode),
         (With<BlockCell>, Without<RoleGroupBorder>),
     >,
     mut role_query: Query<
@@ -544,13 +544,11 @@ pub fn resize_block_textures(
 ) {
     let scale = text_metrics.scale_factor;
 
-    // Block cells: update material texture binding
-    let block_count = block_query.iter().count();
-    let mut skipped = 0u32;
-    let mut resized = 0u32;
-    for (scene, mut texture, mat_node) in block_query.iter_mut() {
+    // Block cells: update material + ImageNode texture bindings.
+    // ImageNode ensures GpuImage is prepared by Bevy's RenderAssetPlugin.
+    // MaterialNode's shader reads from the same texture for post-processing.
+    for (scene, mut texture, mat_node, mut image_node) in block_query.iter_mut() {
         if scene.built_width <= 0.0 || scene.built_height <= 0.0 {
-            skipped += 1;
             continue;
         }
 
@@ -561,30 +559,13 @@ pub fn resize_block_textures(
 
         if texture.width != target_w || texture.height != target_h {
             let new_handle = create_block_texture(&mut images, target_w, target_h);
-            info!(
-                "resize_block_textures: block fx {}x{} mat_handle={:?} tex_handle={:?}",
-                target_w, target_h, mat_node.0.id(), new_handle.id()
-            );
             if let Some(mat) = fx_materials.get_mut(&mat_node.0) {
                 mat.texture = new_handle.clone();
-            } else {
-                warn!("resize_block_textures: material handle not found!");
             }
+            image_node.image = new_handle.clone();
             texture.image = new_handle;
             texture.width = target_w;
             texture.height = target_h;
-            resized += 1;
-        }
-    }
-
-    if block_count > 0 {
-        static LAST_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
-        let key = (block_count as u64) << 32 | (skipped as u64) << 16 | resized as u64;
-        if LAST_LOG.swap(key, std::sync::atomic::Ordering::Relaxed) != key {
-            info!(
-                "resize_block_textures: {} blocks, {} skipped (zero dims), {} resized",
-                block_count, skipped, resized
-            );
         }
     }
 

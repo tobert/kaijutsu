@@ -11,6 +11,7 @@ use crate::cell::{
     BlockCell, BlockCellContainer, BlockCellLayout, BlockId, CellEditor, LayoutGeneration,
     MainCell, RoleGroupBorder, RoleGroupBorderLayout,
 };
+use crate::shaders::BlockFxMaterial;
 
 /// Consolidated resource tracking editor-related singleton entities.
 #[derive(Resource, Default)]
@@ -144,6 +145,7 @@ pub fn spawn_block_cells(
     font_handles: Res<FontHandles>,
     fonts: Res<Assets<VelloFont>>,
     mut scroll_state: ResMut<crate::cell::ConversationScrollState>,
+    mut fx_materials: ResMut<Assets<BlockFxMaterial>>,
 ) {
     let Some(main_ent) = entities.main_cell else {
         return;
@@ -248,7 +250,10 @@ pub fn spawn_block_cells(
 
     for block_id in &current_blocks {
         if !container.contains(block_id) {
-            // Single-phase spawn: BlockCell + BlockScene + BlockTexture + ImageNode.
+            // Single-phase spawn: BlockCell + BlockScene + BlockTexture + ImageNode + MaterialNode.
+            // ImageNode ensures the GpuImage is prepared by Bevy's render asset pipeline.
+            // MaterialNode renders on top with shader effects (glow, animation).
+            let material_handle = fx_materials.add(BlockFxMaterial::default());
             let entity = commands
                 .spawn((
                     BlockCell::new(*block_id),
@@ -260,6 +265,7 @@ pub fn spawn_block_cells(
                         height: 1,
                     },
                     ImageNode::default(),
+                    MaterialNode(material_handle),
                     Node {
                         width: Val::Percent(100.0),
                         ..default()
