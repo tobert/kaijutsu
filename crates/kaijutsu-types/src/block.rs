@@ -465,6 +465,9 @@ pub enum DriftKind {
     /// Git commit recorded as conversation provenance.
     /// Reserved — no live producer after git backend deletion (commit 0ec3210).
     Commit,
+    /// External notification injected into the conversation.
+    /// Used for MCP resource updates, system events, etc.
+    Notification,
 }
 
 impl DriftKind {
@@ -482,6 +485,7 @@ impl DriftKind {
             DriftKind::Merge => "merge",
             DriftKind::Distill => "distill",
             DriftKind::Commit => "commit",
+            DriftKind::Notification => "notification",
         }
     }
 }

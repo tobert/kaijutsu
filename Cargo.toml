@@ -92,7 +92,7 @@ palette = { version = "0.7", default-features = false, features = ["std"] }
 rig-core = "0.30"
 
 # MCP (Model Context Protocol)
-rmcp = { version = "0.15", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+rmcp = { version = "1.2", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 
 # System clipboard
 arboard = { version = "3", features = ["wayland-data-control"] }

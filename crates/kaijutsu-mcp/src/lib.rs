@@ -2197,13 +2197,11 @@ impl KaijutsuMcp {
             }
         }
 
-        Ok(GetPromptResult {
-            description: Some(format!("Analysis of document '{}'", args.document_id)),
-            messages: vec![PromptMessage {
-                role: PromptMessageRole::User,
-                content: rmcp::model::PromptMessageContent::Text { text: content },
-            }],
-        })
+        Ok(GetPromptResult::new(vec![PromptMessage::new_text(
+            PromptMessageRole::User,
+            content,
+        )])
+        .with_description(format!("Analysis of document '{}'", args.document_id)))
     }
 
     /// Search across documents and provide context around matches.
@@ -2297,13 +2295,11 @@ impl KaijutsuMcp {
             content.push_str(&format!("\n**Total matches:** {}\n", total_matches));
         }
 
-        Ok(GetPromptResult {
-            description: Some(format!("Search results for '{}'", args.query)),
-            messages: vec![PromptMessage {
-                role: PromptMessageRole::User,
-                content: rmcp::model::PromptMessageContent::Text { text: content },
-            }],
-        })
+        Ok(GetPromptResult::new(vec![PromptMessage::new_text(
+            PromptMessageRole::User,
+            content,
+        )])
+        .with_description(format!("Search results for '{}'", args.query)))
     }
 
     /// Assist with editing a block by providing context and suggestions.
@@ -2403,13 +2399,11 @@ impl KaijutsuMcp {
             }
         }
 
-        Ok(GetPromptResult {
-            description: Some(format!("Editing assistant for block '{}'", args.block_id)),
-            messages: vec![PromptMessage {
-                role: PromptMessageRole::User,
-                content: rmcp::model::PromptMessageContent::Text { text: content },
-            }],
-        })
+        Ok(GetPromptResult::new(vec![PromptMessage::new_text(
+            PromptMessageRole::User,
+            content,
+        )])
+        .with_description(format!("Editing assistant for block '{}'", args.block_id)))
     }
 }
 
@@ -2497,11 +2491,8 @@ fn apply_server_event(
 #[prompt_handler]
 impl ServerHandler for KaijutsuMcp {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            instructions: Some(
-                "Kaijutsu CRDT kernel MCP server. Provides tools for collaborative document and block editing with CRDT-backed consistency.".into()
-            ),
-            capabilities: ServerCapabilities::builder()
+        ServerInfo::new(
+            ServerCapabilities::builder()
                 .enable_tools()
                 .enable_prompts()
                 .enable_prompts_list_changed()
@@ -2510,8 +2501,7 @@ impl ServerHandler for KaijutsuMcp {
                 .enable_logging()
                 .enable_completions()
                 .build(),
-            ..Default::default()
-        }
+        ).with_instructions("Kaijutsu CRDT kernel MCP server. Provides tools for collaborative document and block editing with CRDT-backed consistency.")
     }
 
     // ========================================================================
@@ -2638,9 +2628,10 @@ impl ServerHandler for KaijutsuMcp {
                 let content =
                     serde_json::to_string_pretty(&docs).unwrap_or_else(|_| "[]".to_string());
 
-                return Ok(ReadResourceResult {
-                    contents: vec![ResourceContents::text(content, uri.clone())],
-                });
+                return Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                    content,
+                    uri.clone(),
+                )]));
             }
 
             if let Some(doc_id_str) = uri.strip_prefix("kaijutsu://docs/") {
@@ -2685,9 +2676,10 @@ impl ServerHandler for KaijutsuMcp {
                 let content =
                     serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
 
-                return Ok(ReadResourceResult {
-                    contents: vec![ResourceContents::text(content, uri.clone())],
-                });
+                return Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                    content,
+                    uri.clone(),
+                )]));
             }
 
             if let Some(rest) = uri.strip_prefix("kaijutsu://blocks/") {
@@ -2723,12 +2715,10 @@ impl ServerHandler for KaijutsuMcp {
                     .get_block_snapshot(&block_id)
                     .ok_or_else(|| McpError::invalid_params("Block not found", None))?;
 
-                return Ok(ReadResourceResult {
-                    contents: vec![ResourceContents::text(
-                        snapshot.content.clone(),
-                        uri.clone(),
-                    )],
-                });
+                return Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                    snapshot.content.clone(),
+                    uri.clone(),
+                )]));
             }
 
             Err(McpError::invalid_params(
@@ -2850,13 +2840,9 @@ impl ServerHandler for KaijutsuMcp {
                 }
             };
 
-            Ok(CompleteResult {
-                completion: CompletionInfo {
-                    values,
-                    total: None,
-                    has_more: Some(false),
-                },
-            })
+            Ok(CompleteResult::new(
+                CompletionInfo::new(values).map_err(|e| McpError::invalid_params(e, None))?,
+            ))
         }
     }
 

@@ -36,7 +36,9 @@
 //! let result = pool.call_tool("git", "git_status", json!({"repo_path": "."})).await?;
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+use kaijutsu_types::ContextId;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -61,7 +63,7 @@ use rmcp::model::{
     CompleteRequestParams, CompleteResult, CreateElicitationRequestParams, CreateElicitationResult,
     ElicitationAction as RmcpElicitationAction, GetPromptRequestParams, GetPromptResult,
     ListRootsResult, LoggingLevel, ProgressNotificationParam, Prompt, PromptArgument, Reference,
-    Root, RootsCapabilities, SetLevelRequestParams, Tool as McpTool,
+    Root, SetLevelRequestParams, Tool as McpTool,
 };
 use rmcp::service::{RequestContext, RunningService, ServiceError};
 use rmcp::transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess};
@@ -286,9 +288,10 @@ impl From<Root> for McpRootInfo {
 
 impl From<McpRootInfo> for Root {
     fn from(info: McpRootInfo) -> Self {
-        Self {
-            uri: info.uri,
-            name: info.name,
+        let root = Root::new(info.uri);
+        match info.name {
+            Some(n) => root.with_name(n),
+            None => root,
         }
     }
 }
@@ -609,12 +612,10 @@ impl KaijutsuClientHandler {
         info.client_info.name = "kaijutsu".into();
         info.client_info.version = env!("CARGO_PKG_VERSION").into();
         // Enable roots capability so servers can request our roots
-        info.capabilities = ClientCapabilities {
-            roots: Some(RootsCapabilities {
-                list_changed: Some(true),
-            }),
-            ..Default::default()
-        };
+        info.capabilities = ClientCapabilities::builder()
+            .enable_roots()
+            .enable_roots_list_changed()
+            .build();
         Self {
             client_info: info,
             server_name: server_name.into(),
@@ -637,12 +638,10 @@ impl KaijutsuClientHandler {
         let mut info = ClientInfo::default();
         info.client_info.name = "kaijutsu".into();
         info.client_info.version = env!("CARGO_PKG_VERSION").into();
-        info.capabilities = ClientCapabilities {
-            roots: Some(RootsCapabilities {
-                list_changed: Some(true),
-            }),
-            ..Default::default()
-        };
+        info.capabilities = ClientCapabilities::builder()
+            .enable_roots()
+            .enable_roots_list_changed()
+            .build();
         Self {
             client_info: info,
             server_name: String::new(),
@@ -823,7 +822,7 @@ impl ClientHandler for KaijutsuClientHandler {
         let roots = self.roots.clone();
         async move {
             let roots_list = roots.read().clone();
-            Ok(ListRootsResult { roots: roots_list })
+            Ok(ListRootsResult::new(roots_list))
         }
     }
 
@@ -946,6 +945,11 @@ pub struct McpServerPool {
     roots: Arc<RwLock<Vec<Root>>>,
     /// Prompt cache, keyed by "server:prompt_name".
     prompt_cache: DashMap<String, McpPromptInfo>,
+    /// Context subscription tracker: "server:uri" → set of subscribing ContextIds.
+    ///
+    /// Used by the resource notification watcher to know which contexts need
+    /// blocks inserted when a subscribed resource changes.
+    context_subscriptions: DashMap<String, HashSet<ContextId>>,
 }
 
 impl Default for McpServerPool {
@@ -995,6 +999,7 @@ impl McpServerPool {
             logging_flows: shared_logging_flow_bus(1024),
             roots: Arc::new(RwLock::new(Vec::new())),
             prompt_cache: DashMap::new(),
+            context_subscriptions: DashMap::new(),
         }
     }
 
@@ -1014,6 +1019,7 @@ impl McpServerPool {
             logging_flows,
             roots: Arc::new(RwLock::new(Vec::new())),
             prompt_cache: DashMap::new(),
+            context_subscriptions: DashMap::new(),
         }
     }
 
@@ -1062,9 +1068,12 @@ impl McpServerPool {
 
     /// Add a root to the list advertised to servers.
     pub async fn add_root(&self, uri: impl Into<String>, name: Option<String>) {
-        let root = Root {
-            uri: uri.into(),
-            name,
+        let root = {
+            let r = Root::new(uri.into());
+            match name {
+                Some(n) => r.with_name(n),
+                None => r,
+            }
         };
         self.roots.write().push(root);
         self.notify_roots_changed().await;
@@ -1310,11 +1319,12 @@ impl McpServerPool {
             "Calling MCP tool"
         );
 
-        let params = CallToolRequestParams {
-            meta: None,
-            name: tool_name.to_string().into(),
-            arguments: arguments.as_object().cloned(),
-            task: None,
+        let params = {
+            let p = CallToolRequestParams::new(tool_name.to_string());
+            match arguments.as_object().cloned() {
+                Some(args) => p.with_arguments(args),
+                None => p,
+            }
         };
 
         let result = server.peer().call_tool(params).await?;
@@ -1445,10 +1455,7 @@ impl McpServerPool {
         debug!(server = %server_name, uri = %uri, "Reading resource from MCP server");
         let result = server
             .peer()
-            .read_resource(rmcp::model::ReadResourceRequestParams {
-                uri: uri.to_string(),
-                meta: None,
-            })
+            .read_resource(rmcp::model::ReadResourceRequestParams::new(uri.to_string()))
             .await?;
 
         // Get the first content (typical case)
@@ -1493,14 +1500,20 @@ impl McpServerPool {
         debug!(server = %server_name, uri = %uri, "Sending MCP resource subscription");
         server
             .peer()
-            .subscribe(rmcp::model::SubscribeRequestParams {
-                uri: uri.to_string(),
-                meta: None,
-            })
+            .subscribe(rmcp::model::SubscribeRequestParams::new(uri.to_string()))
             .await?;
 
         // Update local subscriber count
         self.cache.add_subscriber(server_name, uri);
+
+        // Track which context is subscribing
+        if let Ok(ctx_id) = ContextId::parse(subscriber_id) {
+            let key = ResourceCache::cache_key(server_name, uri);
+            self.context_subscriptions
+                .entry(key)
+                .or_default()
+                .insert(ctx_id);
+        }
 
         // Publish subscription event
         self.resource_flows.publish(ResourceFlow::Subscribed {
@@ -1542,14 +1555,19 @@ impl McpServerPool {
         debug!(server = %server_name, uri = %uri, "Sending MCP resource unsubscription");
         server
             .peer()
-            .unsubscribe(rmcp::model::UnsubscribeRequestParams {
-                uri: uri.to_string(),
-                meta: None,
-            })
+            .unsubscribe(rmcp::model::UnsubscribeRequestParams::new(uri.to_string()))
             .await?;
 
         // Update local subscriber count
         self.cache.remove_subscriber(server_name, uri);
+
+        // Remove context from subscription tracker
+        if let Ok(ctx_id) = ContextId::parse(subscriber_id) {
+            let key = ResourceCache::cache_key(server_name, uri);
+            if let Some(mut contexts) = self.context_subscriptions.get_mut(&key) {
+                contexts.remove(&ctx_id);
+            }
+        }
 
         // Publish unsubscription event
         self.resource_flows.publish(ResourceFlow::Unsubscribed {
@@ -1566,6 +1584,15 @@ impl McpServerPool {
         );
 
         Ok(())
+    }
+
+    /// Get all contexts subscribed to a specific resource.
+    pub fn subscribed_contexts(&self, server: &str, uri: &str) -> HashSet<ContextId> {
+        let key = ResourceCache::cache_key(server, uri);
+        self.context_subscriptions
+            .get(&key)
+            .map(|s| s.clone())
+            .unwrap_or_default()
     }
 
     // =========================================================================
@@ -1637,10 +1664,12 @@ impl McpServerPool {
                 .collect::<serde_json::Map<String, serde_json::Value>>()
         });
 
-        let params = GetPromptRequestParams {
-            meta: None,
-            name: name.to_string(),
-            arguments: args,
+        let params = {
+            let p = GetPromptRequestParams::new(name.to_string());
+            match args {
+                Some(a) => p.with_arguments(a),
+                None => p,
+            }
         };
 
         let result = server.peer().get_prompt(params).await?;
@@ -1685,15 +1714,13 @@ impl McpServerPool {
             "Getting completions from MCP server"
         );
 
-        let params = CompleteRequestParams {
-            meta: None,
-            r#ref: reference,
-            argument: ArgumentInfo {
+        let params = CompleteRequestParams::new(
+            reference,
+            ArgumentInfo {
                 name: argument_name.to_string(),
                 value: argument_value.to_string(),
             },
-            context: None,
-        };
+        );
 
         let result = server.peer().complete(params).await?;
 
@@ -1721,7 +1748,7 @@ impl McpServerPool {
 
         debug!(server = %server_name, level = ?level, "Setting log level on MCP server");
 
-        let params = SetLevelRequestParams { meta: None, level };
+        let params = SetLevelRequestParams::new(level);
         server.peer().set_level(params).await?;
 
         Ok(())
@@ -1779,7 +1806,7 @@ impl McpServerPool {
 // McpToolEngine - ExecutionEngine implementation for MCP tools
 // =============================================================================
 
-use crate::tools::{ExecResult, ExecutionEngine, ToolContext};
+use crate::tools::{ExecResult, ExecutionEngine, ToolContext, ToolInfo};
 
 /// Convert a `CallToolResult` into a string representation.
 ///
@@ -1935,6 +1962,393 @@ impl ExecutionEngine for McpToolEngine {
         // Check if the server is still registered
         self.pool.list_servers().contains(&self.server_name)
     }
+}
+
+// =============================================================================
+// McpResourceEngines - ExecutionEngine implementations for MCP resources
+// =============================================================================
+
+/// Engine that lists MCP resources from all or a specific server.
+///
+/// Registered as a single `mcp_list_resources` tool on the kernel.
+/// Models call it with optional `{"server": "name"}` to discover available resources.
+pub struct McpListResourcesEngine {
+    pool: Arc<McpServerPool>,
+}
+
+impl McpListResourcesEngine {
+    pub fn new(pool: Arc<McpServerPool>) -> Self {
+        Self { pool }
+    }
+}
+
+impl std::fmt::Debug for McpListResourcesEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpListResourcesEngine").finish()
+    }
+}
+
+#[async_trait]
+impl ExecutionEngine for McpListResourcesEngine {
+    fn name(&self) -> &str {
+        "mcp_list_resources"
+    }
+
+    fn description(&self) -> &str {
+        "List available MCP resources from connected servers. Pass {\"server\": \"name\"} to filter by server, or {} to list all."
+    }
+
+    fn schema(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "server": {
+                    "type": "string",
+                    "description": "Optional server name to filter resources. Omit to list from all servers."
+                }
+            }
+        }))
+    }
+
+    #[tracing::instrument(skip(self, code, _ctx), name = "engine.mcp_list_resources")]
+    async fn execute(&self, code: &str, _ctx: &ToolContext) -> anyhow::Result<ExecResult> {
+        let args: serde_json::Value = if code.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(code)?
+        };
+
+        let server_filter = args
+            .get("server")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let servers = match &server_filter {
+            Some(name) => vec![name.clone()],
+            None => self.pool.list_servers(),
+        };
+
+        let mut all_resources = Vec::new();
+        for server_name in &servers {
+            match self.pool.list_resources(server_name).await {
+                Ok(resources) => {
+                    for r in resources {
+                        all_resources.push(serde_json::json!({
+                            "server": server_name,
+                            "uri": r.uri,
+                            "name": r.name,
+                            "description": r.description,
+                            "mime_type": r.mime_type,
+                        }));
+                    }
+                }
+                Err(e) => {
+                    all_resources.push(serde_json::json!({
+                        "server": server_name,
+                        "error": e.to_string(),
+                    }));
+                }
+            }
+        }
+
+        let output = serde_json::to_string_pretty(&all_resources)?;
+        Ok(ExecResult::success(output))
+    }
+
+    async fn is_available(&self) -> bool {
+        !self.pool.list_servers().is_empty()
+    }
+}
+
+/// Engine that reads a specific MCP resource by server name and URI.
+///
+/// Registered as a single `mcp_read_resource` tool on the kernel.
+pub struct McpReadResourceEngine {
+    pool: Arc<McpServerPool>,
+}
+
+impl McpReadResourceEngine {
+    pub fn new(pool: Arc<McpServerPool>) -> Self {
+        Self { pool }
+    }
+}
+
+impl std::fmt::Debug for McpReadResourceEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpReadResourceEngine").finish()
+    }
+}
+
+#[async_trait]
+impl ExecutionEngine for McpReadResourceEngine {
+    fn name(&self) -> &str {
+        "mcp_read_resource"
+    }
+
+    fn description(&self) -> &str {
+        "Read a specific MCP resource. Requires {\"server\": \"name\", \"uri\": \"resource://...\"}."
+    }
+
+    fn schema(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "server": {
+                    "type": "string",
+                    "description": "MCP server name that owns the resource."
+                },
+                "uri": {
+                    "type": "string",
+                    "description": "Resource URI to read."
+                }
+            },
+            "required": ["server", "uri"]
+        }))
+    }
+
+    #[tracing::instrument(skip(self, code, _ctx), name = "engine.mcp_read_resource")]
+    async fn execute(&self, code: &str, _ctx: &ToolContext) -> anyhow::Result<ExecResult> {
+        let args: serde_json::Value = serde_json::from_str(code)
+            .map_err(|e| anyhow::anyhow!("Expected JSON with 'server' and 'uri': {}", e))?;
+
+        let server = args
+            .get("server")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing required 'server' parameter"))?;
+
+        let uri = args
+            .get("uri")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing required 'uri' parameter"))?;
+
+        match self.pool.read_resource(server, uri).await {
+            Ok(contents) => {
+                // Extract text content from ResourceContents
+                let output = match &contents {
+                    rmcp::model::ResourceContents::TextResourceContents { text, .. } => {
+                        text.clone()
+                    }
+                    rmcp::model::ResourceContents::BlobResourceContents { blob, uri, .. } => {
+                        format!("[Binary resource: {} bytes, uri: {}]", blob.len(), uri)
+                    }
+                };
+                Ok(ExecResult::success(output))
+            }
+            Err(e) => Ok(ExecResult::failure(1, e.to_string())),
+        }
+    }
+
+    async fn is_available(&self) -> bool {
+        !self.pool.list_servers().is_empty()
+    }
+}
+
+/// Engine that subscribes to MCP resource updates.
+///
+/// When subscribed, resource change notifications will be inserted as blocks
+/// in the conversation so both the model and user see them.
+pub struct McpSubscribeResourceEngine {
+    pool: Arc<McpServerPool>,
+}
+
+impl McpSubscribeResourceEngine {
+    pub fn new(pool: Arc<McpServerPool>) -> Self {
+        Self { pool }
+    }
+}
+
+impl std::fmt::Debug for McpSubscribeResourceEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpSubscribeResourceEngine").finish()
+    }
+}
+
+#[async_trait]
+impl ExecutionEngine for McpSubscribeResourceEngine {
+    fn name(&self) -> &str {
+        "mcp_subscribe_resource"
+    }
+
+    fn description(&self) -> &str {
+        "Subscribe to updates on an MCP resource. Changes will appear as blocks in the conversation."
+    }
+
+    fn schema(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "server": {
+                    "type": "string",
+                    "description": "MCP server name."
+                },
+                "uri": {
+                    "type": "string",
+                    "description": "Resource URI to subscribe to."
+                }
+            },
+            "required": ["server", "uri"]
+        }))
+    }
+
+    #[tracing::instrument(skip(self, code, ctx), name = "engine.mcp_subscribe_resource")]
+    async fn execute(&self, code: &str, ctx: &ToolContext) -> anyhow::Result<ExecResult> {
+        let args: serde_json::Value = serde_json::from_str(code)
+            .map_err(|e| anyhow::anyhow!("Expected JSON with 'server' and 'uri': {}", e))?;
+
+        let server = args
+            .get("server")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing required 'server' parameter"))?;
+
+        let uri = args
+            .get("uri")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing required 'uri' parameter"))?;
+
+        let subscriber_id = ctx.context_id.to_hex();
+
+        match self
+            .pool
+            .subscribe_resource(server, uri, &subscriber_id)
+            .await
+        {
+            Ok(()) => Ok(ExecResult::success(format!(
+                "Subscribed to {} on server '{}'. Updates will appear as blocks.",
+                uri, server
+            ))),
+            Err(e) => Ok(ExecResult::failure(1, e.to_string())),
+        }
+    }
+
+    async fn is_available(&self) -> bool {
+        !self.pool.list_servers().is_empty()
+    }
+}
+
+/// Engine that unsubscribes from MCP resource updates.
+pub struct McpUnsubscribeResourceEngine {
+    pool: Arc<McpServerPool>,
+}
+
+impl McpUnsubscribeResourceEngine {
+    pub fn new(pool: Arc<McpServerPool>) -> Self {
+        Self { pool }
+    }
+}
+
+impl std::fmt::Debug for McpUnsubscribeResourceEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpUnsubscribeResourceEngine").finish()
+    }
+}
+
+#[async_trait]
+impl ExecutionEngine for McpUnsubscribeResourceEngine {
+    fn name(&self) -> &str {
+        "mcp_unsubscribe_resource"
+    }
+
+    fn description(&self) -> &str {
+        "Unsubscribe from MCP resource updates."
+    }
+
+    fn schema(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "server": {
+                    "type": "string",
+                    "description": "MCP server name."
+                },
+                "uri": {
+                    "type": "string",
+                    "description": "Resource URI to unsubscribe from."
+                }
+            },
+            "required": ["server", "uri"]
+        }))
+    }
+
+    #[tracing::instrument(skip(self, code, ctx), name = "engine.mcp_unsubscribe_resource")]
+    async fn execute(&self, code: &str, ctx: &ToolContext) -> anyhow::Result<ExecResult> {
+        let args: serde_json::Value = serde_json::from_str(code)
+            .map_err(|e| anyhow::anyhow!("Expected JSON with 'server' and 'uri': {}", e))?;
+
+        let server = args
+            .get("server")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing required 'server' parameter"))?;
+
+        let uri = args
+            .get("uri")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing required 'uri' parameter"))?;
+
+        let subscriber_id = ctx.context_id.to_hex();
+
+        match self
+            .pool
+            .unsubscribe_resource(server, uri, &subscriber_id)
+            .await
+        {
+            Ok(()) => Ok(ExecResult::success(format!(
+                "Unsubscribed from {} on server '{}'.",
+                uri, server
+            ))),
+            Err(e) => Ok(ExecResult::failure(1, e.to_string())),
+        }
+    }
+
+    async fn is_available(&self) -> bool {
+        !self.pool.list_servers().is_empty()
+    }
+}
+
+/// Create and register all MCP resource engines on a kernel's tool registry.
+///
+/// Call this once per kernel after the MCP pool is created.
+/// Returns the list of tool names registered.
+pub fn register_mcp_resource_engines(
+    pool: Arc<McpServerPool>,
+) -> Vec<(String, ToolInfo, Arc<dyn ExecutionEngine>)> {
+    vec![
+        (
+            "mcp_list_resources".to_string(),
+            ToolInfo::new(
+                "mcp_list_resources",
+                "List available MCP resources from connected servers",
+                "mcp",
+            ),
+            Arc::new(McpListResourcesEngine::new(pool.clone())) as Arc<dyn ExecutionEngine>,
+        ),
+        (
+            "mcp_read_resource".to_string(),
+            ToolInfo::new(
+                "mcp_read_resource",
+                "Read a specific MCP resource by server and URI",
+                "mcp",
+            ),
+            Arc::new(McpReadResourceEngine::new(pool.clone())) as Arc<dyn ExecutionEngine>,
+        ),
+        (
+            "mcp_subscribe_resource".to_string(),
+            ToolInfo::new(
+                "mcp_subscribe_resource",
+                "Subscribe to MCP resource updates (changes appear as blocks)",
+                "mcp",
+            ),
+            Arc::new(McpSubscribeResourceEngine::new(pool.clone())) as Arc<dyn ExecutionEngine>,
+        ),
+        (
+            "mcp_unsubscribe_resource".to_string(),
+            ToolInfo::new(
+                "mcp_unsubscribe_resource",
+                "Unsubscribe from MCP resource updates",
+                "mcp",
+            ),
+            Arc::new(McpUnsubscribeResourceEngine::new(pool)) as Arc<dyn ExecutionEngine>,
+        ),
+    ]
 }
 
 #[cfg(test)]

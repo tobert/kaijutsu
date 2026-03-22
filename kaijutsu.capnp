@@ -108,11 +108,12 @@ struct BlockEventFilter {
 
 # How a drift block arrived from another context.
 enum DriftKind {
-  push @0;      # User manually pushed content
-  pull @1;      # User pulled/requested content
-  merge @2;     # Context merge (fork coming home)
-  distill @3;   # LLM-summarized before transfer
-  commit @4;    # Git commit recorded as conversation provenance
+  push @0;          # User manually pushed content
+  pull @1;          # User pulled/requested content
+  merge @2;         # Context merge (fork coming home)
+  distill @3;       # LLM-summarized before transfer
+  commit @4;        # Git commit recorded as conversation provenance
+  notification @5;  # External notification (MCP resource updates, system events)
 }
 
 # Flat block snapshot — all fields present, some unused depending on kind.

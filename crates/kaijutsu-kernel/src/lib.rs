@@ -98,6 +98,7 @@ pub use mcp_pool::{
     McpTransport,
     ResourceCache,
     extract_tool_result_text,
+    register_mcp_resource_engines,
 };
 pub use rhai_engine::RhaiEngine;
 pub use state::KernelState;

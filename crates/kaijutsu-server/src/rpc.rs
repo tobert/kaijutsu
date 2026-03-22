@@ -63,6 +63,7 @@ use kaijutsu_kernel::{
     McpToolEngine,
     McpTransport,
     ReadEngine,
+    register_mcp_resource_engines,
     // Rhai scripting
     RhaiEngine,
     RigProvider,
@@ -757,6 +758,82 @@ async fn initialize_kernel_mcp(
     futures::future::join_all(futs).await;
 }
 
+/// Spawn a background task that watches for MCP resource update notifications
+/// and inserts drift blocks (DriftKind::Notification) into subscribing contexts.
+///
+/// When a model subscribes to an MCP resource via `mcp_subscribe_resource`, and that
+/// resource later changes, this watcher reads the fresh content and inserts it as a
+/// Drift/Notification block in the conversation. The model sees it on its next turn,
+/// and the user sees it inline in the conversation.
+fn spawn_resource_notification_watcher(
+    pool: Arc<McpServerPool>,
+    documents: SharedBlockStore,
+) {
+    use kaijutsu_kernel::ResourceFlow;
+
+    let mut sub = pool.resource_flows().subscribe("resource.updated");
+    tokio::spawn(async move {
+        while let Some(msg) = sub.recv().await {
+            if let ResourceFlow::Updated { server, uri, .. } = &msg.payload {
+                let contexts = pool.subscribed_contexts(server, uri);
+                if contexts.is_empty() {
+                    continue;
+                }
+
+                // Read fresh content from the server
+                let content = match pool.read_resource(server, uri).await {
+                    Ok(contents) => {
+                        // Use serde to extract text — ResourceContents is complex
+                        serde_json::to_string_pretty(&contents)
+                            .unwrap_or_else(|_| "[unreadable resource]".into())
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "Failed to read updated resource {}:{} — {}",
+                            server,
+                            uri,
+                            e
+                        );
+                        continue;
+                    }
+                };
+
+                let notification_text = format!(
+                    "[MCP resource updated: {} on server '{}']\n{}",
+                    uri, server, content
+                );
+
+                // Insert a Notification drift block into each subscribing context
+                for ctx_id in contexts {
+                    if let Err(e) = documents.insert_drift_block(
+                        ctx_id,
+                        None, // parent
+                        None, // after (append)
+                        &notification_text,
+                        ctx_id, // source = self (external event)
+                        Some(format!("mcp:{}", server)),
+                        kaijutsu_crdt::DriftKind::Notification,
+                    ) {
+                        log::warn!(
+                            "Failed to insert resource notification block for {}: {}",
+                            ctx_id.short(),
+                            e
+                        );
+                    } else {
+                        log::debug!(
+                            "Inserted resource notification for {}:{} into context {}",
+                            server,
+                            uri,
+                            ctx_id.short()
+                        );
+                    }
+                }
+            }
+        }
+        log::debug!("Resource notification watcher exiting");
+    });
+}
+
 #[derive(Clone)]
 pub struct CommandEntry {
     pub id: u64,
@@ -1017,6 +1094,16 @@ pub async fn create_shared_kernel(
 
     // Initialize MCP servers from mcp.rhai config
     initialize_kernel_mcp(&kernel_arc, &config_backend, mcp_pool).await;
+
+    // Register MCP resource tools (list, read, subscribe, unsubscribe)
+    for (_name, info, engine) in register_mcp_resource_engines(mcp_pool.clone()) {
+        kernel_arc
+            .register_tool_with_engine(info, engine)
+            .await;
+    }
+
+    // Spawn background watcher: MCP resource updates → drift blocks
+    spawn_resource_notification_watcher(mcp_pool.clone(), documents.clone());
 
     // Initialize semantic index if embedding model is configured
     let semantic_index = if let Some(emb_config) = embedding_config {
@@ -6630,6 +6717,9 @@ fn capnp_drift_kind_to_crdt(
         crate::kaijutsu_capnp::DriftKind::Merge => Some(kaijutsu_crdt::DriftKind::Merge),
         crate::kaijutsu_capnp::DriftKind::Distill => Some(kaijutsu_crdt::DriftKind::Distill),
         crate::kaijutsu_capnp::DriftKind::Commit => Some(kaijutsu_crdt::DriftKind::Commit),
+        crate::kaijutsu_capnp::DriftKind::Notification => {
+            Some(kaijutsu_crdt::DriftKind::Notification)
+        }
     }
 }
 
@@ -6641,6 +6731,9 @@ fn drift_kind_to_capnp(dk: kaijutsu_crdt::DriftKind) -> crate::kaijutsu_capnp::D
         kaijutsu_crdt::DriftKind::Merge => crate::kaijutsu_capnp::DriftKind::Merge,
         kaijutsu_crdt::DriftKind::Distill => crate::kaijutsu_capnp::DriftKind::Distill,
         kaijutsu_crdt::DriftKind::Commit => crate::kaijutsu_capnp::DriftKind::Commit,
+        kaijutsu_crdt::DriftKind::Notification => {
+            crate::kaijutsu_capnp::DriftKind::Notification
+        }
     }
 }
 
