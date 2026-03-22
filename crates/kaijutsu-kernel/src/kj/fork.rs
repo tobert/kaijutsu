@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use kaijutsu_types::{ConsentMode, ContextId, EdgeKind, ForkKind};
+use kaijutsu_types::{ConsentMode, ContentType, ContextId, EdgeKind, ForkKind, ToolFilter};
 
 use crate::kernel_db::{ContextEdgeRow, ContextRow, ContextShellRow};
 
@@ -67,7 +67,7 @@ impl KjDispatcher {
 
     pub(crate) async fn dispatch_fork(&self, argv: &[String], caller: &KjCaller) -> KjResult {
         if has_flag(argv, &["help", "--help", "-h"]) {
-            return KjResult::ok_ephemeral(self.fork_help(), "text/markdown");
+            return KjResult::ok_ephemeral(self.fork_help(), ContentType::Markdown);
         }
 
         if has_flag(argv, &["--shallow"]) {
@@ -85,6 +85,42 @@ impl KjDispatcher {
 
     fn fork_help(&self) -> String {
         include_str!("../../docs/help/kj-fork.md").to_string()
+    }
+
+    /// Apply MCP fork mode exclusions to a newly forked context.
+    ///
+    /// Servers with `McpForkMode::Exclude` have their tools denied via ToolFilter.
+    /// Called after drift.register_fork() so the context handle exists.
+    async fn apply_fork_mcp_exclusions(&self, new_id: ContextId) {
+        let Some(pool) = self.mcp_pool() else {
+            return;
+        };
+
+        let excluded = pool.excluded_tools_for_fork();
+        if excluded.is_empty() {
+            return;
+        }
+
+        let filter = ToolFilter::DenyList(excluded);
+        let mut drift = self.drift_router().write().await;
+        if let Err(e) = drift.configure_tools(new_id, Some(filter.clone())) {
+            tracing::warn!(
+                "Failed to apply MCP exclusions to forked context {}: {}",
+                new_id.short(),
+                e
+            );
+            return;
+        }
+
+        // Persist to KernelDb
+        let db = self.kernel_db().lock();
+        if let Err(e) = db.update_tool_filter(new_id, &Some(filter)) {
+            tracing::warn!(
+                "Failed to persist tool filter for forked context {}: {}",
+                new_id.short(),
+                e
+            );
+        }
     }
 
     async fn fork_full(&self, argv: &[String], caller: &KjCaller) -> KjResult {
@@ -228,6 +264,8 @@ impl KjDispatcher {
         {
             return KjResult::Err(format!("kj fork: failed to inject fork note: {e}"));
         }
+
+        self.apply_fork_mcp_exclusions(new_id).await;
 
         let short = new_id.short();
         let display = label.as_deref().unwrap_or(&short);
@@ -387,6 +425,8 @@ impl KjDispatcher {
                 "kj fork --shallow: failed to inject fork note: {e}"
             ));
         }
+
+        self.apply_fork_mcp_exclusions(new_id).await;
 
         let short = new_id.short();
         let display = label.as_deref().unwrap_or(&short);
@@ -556,6 +596,8 @@ impl KjDispatcher {
                 }
             }
         }
+
+        self.apply_fork_mcp_exclusions(new_id).await;
 
         let short = new_id.short();
         let display = label.as_deref().unwrap_or(&short);
@@ -769,6 +811,8 @@ impl KjDispatcher {
                 }
             }
         }
+
+        self.apply_fork_mcp_exclusions(new_root_id).await;
 
         KjResult::Switch(
             new_root_id,

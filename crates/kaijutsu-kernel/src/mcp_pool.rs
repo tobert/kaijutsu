@@ -950,6 +950,8 @@ pub struct McpServerPool {
     /// Used by the resource notification watcher to know which contexts need
     /// blocks inserted when a subscribed resource changes.
     context_subscriptions: DashMap<String, HashSet<ContextId>>,
+    /// Server registrations for fork mode queries.
+    registrations: parking_lot::RwLock<HashMap<String, McpRegistration>>,
 }
 
 impl Default for McpServerPool {
@@ -1000,6 +1002,7 @@ impl McpServerPool {
             roots: Arc::new(RwLock::new(Vec::new())),
             prompt_cache: DashMap::new(),
             context_subscriptions: DashMap::new(),
+            registrations: parking_lot::RwLock::new(HashMap::new()),
         }
     }
 
@@ -1020,6 +1023,7 @@ impl McpServerPool {
             roots: Arc::new(RwLock::new(Vec::new())),
             prompt_cache: DashMap::new(),
             context_subscriptions: DashMap::new(),
+            registrations: parking_lot::RwLock::new(HashMap::new()),
         }
     }
 
@@ -1195,6 +1199,22 @@ impl McpServerPool {
             server_version,
             tools: tools.clone(),
         };
+
+        // Store registration metadata for fork mode queries
+        let tool_names: Vec<String> = info
+            .tools
+            .iter()
+            .map(|t| format!("{}__{}", name, t.name))
+            .collect();
+        self.registrations.write().insert(
+            name.clone(),
+            McpRegistration {
+                server_name: name.clone(),
+                fork_mode: config.fork_mode.clone(),
+                tool_names,
+                config: config.clone(),
+            },
+        );
 
         // Store the connected server
         let connected = ConnectedServer {
@@ -1593,6 +1613,35 @@ impl McpServerPool {
             .get(&key)
             .map(|s| s.clone())
             .unwrap_or_default()
+    }
+
+    /// Get all server registrations (for fork mode queries).
+    pub fn list_registrations(&self) -> Vec<McpRegistration> {
+        self.registrations.read().values().cloned().collect()
+    }
+
+    /// Get tool names that should be excluded from forked contexts.
+    ///
+    /// Returns qualified tool names (e.g., "debugger__breakpoint") for servers
+    /// configured with `McpForkMode::Exclude`. Use with `ToolFilter::DenyList`.
+    pub fn excluded_tools_for_fork(&self) -> HashSet<String> {
+        let regs = self.registrations.read();
+        let mut excluded = HashSet::new();
+        for reg in regs.values() {
+            match reg.fork_mode {
+                McpForkMode::Exclude => {
+                    excluded.extend(reg.tool_names.iter().cloned());
+                }
+                McpForkMode::Instance => {
+                    warn!(
+                        server = %reg.server_name,
+                        "McpForkMode::Instance not yet implemented, treating as Share"
+                    );
+                }
+                McpForkMode::Share => {}
+            }
+        }
+        excluded
     }
 
     /// Unsubscribe a context from all MCP resources it's subscribed to.
@@ -2526,6 +2575,62 @@ mod tests {
         let ctx = ContextId::new();
         // Should be a no-op, not panic
         pool.unsubscribe_context(ctx).await;
+    }
+
+    #[test]
+    fn test_excluded_tools_for_fork() {
+        let pool = McpServerPool::new();
+
+        // Simulate registrations with different fork modes
+        {
+            let mut regs = pool.registrations.write();
+            regs.insert(
+                "shared-server".to_string(),
+                McpRegistration {
+                    server_name: "shared-server".to_string(),
+                    fork_mode: McpForkMode::Share,
+                    tool_names: vec!["shared-server__tool_a".to_string()],
+                    config: McpServerConfig::default(),
+                },
+            );
+            regs.insert(
+                "excluded-server".to_string(),
+                McpRegistration {
+                    server_name: "excluded-server".to_string(),
+                    fork_mode: McpForkMode::Exclude,
+                    tool_names: vec![
+                        "excluded-server__tool_x".to_string(),
+                        "excluded-server__tool_y".to_string(),
+                    ],
+                    config: McpServerConfig::default(),
+                },
+            );
+        }
+
+        let excluded = pool.excluded_tools_for_fork();
+        assert_eq!(excluded.len(), 2);
+        assert!(excluded.contains("excluded-server__tool_x"));
+        assert!(excluded.contains("excluded-server__tool_y"));
+        // Shared server tools should NOT be excluded
+        assert!(!excluded.contains("shared-server__tool_a"));
+    }
+
+    #[test]
+    fn test_excluded_tools_empty_when_all_shared() {
+        let pool = McpServerPool::new();
+        {
+            let mut regs = pool.registrations.write();
+            regs.insert(
+                "server".to_string(),
+                McpRegistration {
+                    server_name: "server".to_string(),
+                    fork_mode: McpForkMode::Share,
+                    tool_names: vec!["server__tool".to_string()],
+                    config: McpServerConfig::default(),
+                },
+            );
+        }
+        assert!(pool.excluded_tools_for_fork().is_empty());
     }
 
     #[tokio::test]
