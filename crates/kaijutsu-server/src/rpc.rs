@@ -24,7 +24,7 @@ use crate::embedded_kaish::EmbeddedKaish;
 use crate::interrupt::ContextInterruptState;
 use crate::kaijutsu_capnp::*;
 
-use kaijutsu_crdt::{BlockKind, Role, Status};
+use kaijutsu_crdt::{BlockKind, ContentType, Role, Status};
 use kaijutsu_kernel::kernel_db::{ContextRow, KernelDb};
 use kaijutsu_kernel::{
     AgentActivityEvent,
@@ -1205,6 +1205,7 @@ pub async fn create_shared_kernel(
         kernel_db_arc.clone(),
         id,
         kernel_arc.clone(),
+        Some(mcp_pool.clone()),
     ));
 
     let shared = SharedKernelState {
@@ -1776,6 +1777,7 @@ impl kernel::Server for KernelImpl {
                     block.kind,
                     &block.content,
                     Status::Done,
+                    ContentType::Plain,
                     Some(user_agent_id),
                 ) {
                     return Promise::err(capnp::Error::failed(e.to_string()));
@@ -2089,6 +2091,7 @@ impl kernel::Server for KernelImpl {
                         BlockKind::Text,
                         &content,
                         Status::Done,
+                        ContentType::Plain,
                         Some(user_agent_id),
                     )
                     .map_err(|e| {
@@ -3608,6 +3611,7 @@ impl kernel::Server for KernelImpl {
                         block_snapshot.kind,
                         block_snapshot.content,
                         Status::Done,
+                        block_snapshot.content_type,
                         Some(user_agent_id),
                     )
                     .map_err(|e| capnp::Error::failed(format!("Failed to insert block: {}", e)))?;
@@ -4628,6 +4632,7 @@ impl kernel::Server for KernelImpl {
                             BlockKind::Text,
                             &text,
                             Status::Done,
+                            ContentType::Plain,
                             Some(user_agent_id),
                         )
                         .map_err(|e| {
@@ -5830,14 +5835,17 @@ async fn execute_shell_command(
                     log::error!("Failed to set output data: {}", e);
                 }
 
-                if result.content_type.is_some()
-                    && let Err(e) = documents_clone.set_content_type(
-                        context_id,
-                        &output_block_id_clone,
-                        result.content_type,
-                    )
-                {
-                    log::error!("Failed to set content_type: {}", e);
+                if let Some(ref ct_str) = result.content_type {
+                    let ct = ContentType::from_mime(ct_str);
+                    if ct != ContentType::Plain {
+                        if let Err(e) = documents_clone.set_content_type(
+                            context_id,
+                            &output_block_id_clone,
+                            ct,
+                        ) {
+                            log::error!("Failed to set content_type: {}", e);
+                        }
+                    }
                 }
 
                 // Read baggage: mark blocks ephemeral if tool signaled it
@@ -6005,6 +6013,7 @@ async fn process_llm_stream(
                 BlockKind::Text,
                 "⚠️ Maximum tool iterations reached",
                 Status::Done,
+                ContentType::Plain,
                 Some(PrincipalId::system()),
             );
             break;
@@ -6076,6 +6085,7 @@ async fn process_llm_stream(
                             BlockKind::Text,
                             format!("❌ Error: {}", e),
                             Status::Done,
+                            ContentType::Plain,
                             Some(PrincipalId::system()),
                         );
                         return;
@@ -6133,6 +6143,7 @@ async fn process_llm_stream(
                         BlockKind::Thinking,
                         "",
                         Status::Running,
+                        ContentType::Plain,
                         Some(PrincipalId::system()),
                     ) {
                         Ok(block_id) => {
@@ -6172,6 +6183,7 @@ async fn process_llm_stream(
                         BlockKind::Text,
                         "",
                         Status::Running,
+                        ContentType::Plain,
                         Some(PrincipalId::system()),
                     ) {
                         Ok(block_id) => {
@@ -6269,6 +6281,7 @@ async fn process_llm_stream(
                             BlockKind::Text,
                             "⛔ Interrupted",
                             Status::Done,
+                            ContentType::Plain,
                             Some(PrincipalId::system()),
                         );
                         // Exit the agentic loop; cleanup runs below.
@@ -6292,6 +6305,7 @@ async fn process_llm_stream(
                         BlockKind::Text,
                         format!("❌ Error: {}", err),
                         Status::Error,
+                        ContentType::Plain,
                         Some(PrincipalId::system()),
                     );
                     return;
@@ -6667,8 +6681,8 @@ fn set_block_snapshot(
     }
 
     // Set content_type hint (MIME type)
-    if let Some(ref ct) = block.content_type {
-        builder.set_content_type(ct);
+    if block.content_type != ContentType::Plain {
+        builder.set_content_type(block.content_type.as_mime());
     }
 
     // Set ephemeral flag
@@ -7062,9 +7076,10 @@ fn parse_block_snapshot(
                 .ok()
                 .and_then(|s| s.to_str().ok())
                 .filter(|s| !s.is_empty())
-                .map(|s| s.to_owned())
+                .map(|s| ContentType::from_mime(s))
+                .unwrap_or(ContentType::Plain)
         } else {
-            None
+            ContentType::Plain
         },
         order_key: None,
         source_context: if reader.has_source_context() {
@@ -7096,6 +7111,7 @@ fn parse_block_snapshot(
         ephemeral_at: 0,
         compacted_at: 0,
         tool_meta_at: 0,
+        content_type_at: 0,
     })
 }
 

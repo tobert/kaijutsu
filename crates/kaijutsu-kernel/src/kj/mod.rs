@@ -19,12 +19,13 @@ pub mod workspace;
 
 use std::sync::Arc;
 
-use kaijutsu_types::{ContextId, KernelId, PrincipalId, SessionId};
+use kaijutsu_types::{ContentType, ContextId, KernelId, PrincipalId, SessionId};
 
 use crate::block_store::SharedBlockStore;
 use crate::drift::{DISTILLATION_SYSTEM_PROMPT, SharedDriftRouter, build_distillation_prompt};
 use crate::kernel::Kernel;
 use crate::kernel_db::KernelDb;
+use crate::mcp_pool::McpServerPool;
 
 // ============================================================================
 // KjCaller — per-invocation identity
@@ -53,7 +54,7 @@ pub enum KjResult {
     /// Success — exit 0, stdout content.
     Ok {
         message: String,
-        content_type: Option<String>,
+        content_type: ContentType,
         /// When true, the output is for humans only — excluded from LLM context.
         ephemeral: bool,
     },
@@ -96,25 +97,25 @@ impl KjResult {
     pub fn ok(msg: impl Into<String>) -> Self {
         KjResult::Ok {
             message: msg.into(),
-            content_type: None,
+            content_type: ContentType::Plain,
             ephemeral: false,
         }
     }
 
     /// Convenience: create an Ok result with a content type hint.
-    pub fn ok_typed(msg: impl Into<String>, ct: impl Into<String>) -> Self {
+    pub fn ok_typed(msg: impl Into<String>, ct: ContentType) -> Self {
         KjResult::Ok {
             message: msg.into(),
-            content_type: Some(ct.into()),
+            content_type: ct,
             ephemeral: false,
         }
     }
 
     /// Convenience: create an ephemeral Ok result (excluded from LLM hydration).
-    pub fn ok_ephemeral(msg: impl Into<String>, ct: impl Into<String>) -> Self {
+    pub fn ok_ephemeral(msg: impl Into<String>, ct: ContentType) -> Self {
         KjResult::Ok {
             message: msg.into(),
-            content_type: Some(ct.into()),
+            content_type: ct,
             ephemeral: true,
         }
     }
@@ -134,6 +135,7 @@ pub struct KjDispatcher {
     kernel_db: Arc<parking_lot::Mutex<KernelDb>>,
     kernel_id: KernelId,
     kernel: Arc<Kernel>,
+    mcp_pool: Option<Arc<McpServerPool>>,
 }
 
 impl KjDispatcher {
@@ -143,6 +145,7 @@ impl KjDispatcher {
         kernel_db: Arc<parking_lot::Mutex<KernelDb>>,
         kernel_id: KernelId,
         kernel: Arc<Kernel>,
+        mcp_pool: Option<Arc<McpServerPool>>,
     ) -> Self {
         Self {
             drift,
@@ -150,6 +153,7 @@ impl KjDispatcher {
             kernel_db,
             kernel_id,
             kernel,
+            mcp_pool,
         }
     }
 
@@ -167,7 +171,7 @@ impl KjDispatcher {
             "drift" => self.dispatch_drift(&argv[1..], caller).await,
             "preset" => self.dispatch_preset(&argv[1..], caller),
             "workspace" | "ws" => self.dispatch_workspace(&argv[1..], caller),
-            "help" | "--help" | "-h" => KjResult::ok_ephemeral(self.help(), "text/markdown"),
+            "help" | "--help" | "-h" => KjResult::ok_ephemeral(self.help(), ContentType::Markdown),
             other => KjResult::Err(format!(
                 "kj: unknown command '{}'\n\n{}",
                 other,
@@ -199,6 +203,10 @@ impl KjDispatcher {
 
     pub(crate) fn kernel(&self) -> &Arc<Kernel> {
         &self.kernel
+    }
+
+    pub(crate) fn mcp_pool(&self) -> Option<&Arc<McpServerPool>> {
+        self.mcp_pool.as_ref()
     }
 
     /// Summarize a context's blocks via LLM.
@@ -272,7 +280,7 @@ pub(crate) mod test_helpers {
                 .unwrap();
         }
         let kernel = Arc::new(Kernel::new("test").await);
-        KjDispatcher::new(drift, blocks, kernel_db, kernel_id, kernel)
+        KjDispatcher::new(drift, blocks, kernel_db, kernel_id, kernel, None)
     }
 
     /// Create a KjCaller with fresh IDs for testing.

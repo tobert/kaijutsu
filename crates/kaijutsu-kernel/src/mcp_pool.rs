@@ -1595,6 +1595,65 @@ impl McpServerPool {
             .unwrap_or_default()
     }
 
+    /// Unsubscribe a context from all MCP resources it's subscribed to.
+    ///
+    /// Called when a context is archived or deleted. Removes the context from
+    /// the tracking map and sends `unsubscribe()` to the MCP server when no
+    /// other contexts remain subscribed to that resource.
+    pub async fn unsubscribe_context(&self, context_id: ContextId) {
+        // Collect keys where this context is subscribed
+        let mut to_unsubscribe: Vec<(String, String)> = Vec::new(); // (server, uri)
+        let mut fully_removed: Vec<String> = Vec::new(); // cache keys with no remaining subscribers
+
+        for mut entry in self.context_subscriptions.iter_mut() {
+            if entry.value_mut().remove(&context_id) {
+                // Parse "server:uri" key
+                if let Some((server, uri)) = entry.key().split_once(':') {
+                    if entry.value().is_empty() {
+                        to_unsubscribe.push((server.to_string(), uri.to_string()));
+                        fully_removed.push(entry.key().clone());
+                    }
+                }
+            }
+        }
+
+        // Clean up empty entries
+        for key in &fully_removed {
+            self.context_subscriptions.remove(key);
+        }
+
+        // Send unsubscribe to MCP servers for resources with no remaining subscribers
+        for (server, uri) in &to_unsubscribe {
+            self.cache.remove_subscriber(server, uri);
+
+            let server_arc = match self.servers.read().get(server).cloned() {
+                Some(s) => s,
+                None => continue,
+            };
+            let server_lock = server_arc.lock().await;
+            if let Err(e) = server_lock
+                .peer()
+                .unsubscribe(rmcp::model::UnsubscribeRequestParams::new(uri.as_str()))
+                .await
+            {
+                warn!(
+                    server = %server,
+                    uri = %uri,
+                    error = %e,
+                    "Failed to send MCP unsubscribe during context cleanup"
+                );
+            }
+        }
+
+        if !to_unsubscribe.is_empty() {
+            info!(
+                context = %context_id.short(),
+                resources = to_unsubscribe.len(),
+                "Cleaned up MCP subscriptions for context"
+            );
+        }
+    }
+
     // =========================================================================
     // Prompt Operations
     // =========================================================================
@@ -2420,6 +2479,53 @@ mod tests {
         let pool = McpServerPool::new();
         let result = pool.get_server_info("nonexistent").await;
         assert!(matches!(result, Err(McpPoolError::ServerNotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn test_unsubscribe_context() {
+        let pool = McpServerPool::new();
+        let ctx_a = ContextId::new();
+        let ctx_b = ContextId::new();
+
+        // Simulate subscriptions (no real MCP server, just the tracking map)
+        let key = ResourceCache::cache_key("test-server", "test://resource");
+        pool.context_subscriptions
+            .entry(key.clone())
+            .or_default()
+            .insert(ctx_a);
+        pool.context_subscriptions
+            .entry(key.clone())
+            .or_default()
+            .insert(ctx_b);
+
+        assert_eq!(
+            pool.subscribed_contexts("test-server", "test://resource")
+                .len(),
+            2
+        );
+
+        // Unsubscribe ctx_a — ctx_b should remain
+        pool.unsubscribe_context(ctx_a).await;
+        let remaining = pool.subscribed_contexts("test-server", "test://resource");
+        assert_eq!(remaining.len(), 1);
+        assert!(remaining.contains(&ctx_b));
+
+        // Unsubscribe ctx_b — entry should be fully cleaned up
+        pool.unsubscribe_context(ctx_b).await;
+        assert!(
+            pool.subscribed_contexts("test-server", "test://resource")
+                .is_empty()
+        );
+        // The key itself should be removed from the map
+        assert!(!pool.context_subscriptions.contains_key(&key));
+    }
+
+    #[tokio::test]
+    async fn test_unsubscribe_context_no_subscriptions() {
+        let pool = McpServerPool::new();
+        let ctx = ContextId::new();
+        // Should be a no-op, not panic
+        pool.unsubscribe_context(ctx).await;
     }
 
     #[tokio::test]

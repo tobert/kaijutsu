@@ -1,6 +1,6 @@
 //! Context subcommands: list, info, switch, create, set, log, move, archive, remove, retag.
 
-use kaijutsu_types::{ConsentMode, ContextId, EdgeKind};
+use kaijutsu_types::{ConsentMode, ContentType, ContextId, EdgeKind};
 
 use crate::kernel_db::{ContextEdgeRow, ContextRow, ContextShellRow};
 
@@ -30,7 +30,7 @@ impl KjDispatcher {
             "remove" | "rm" => self.context_remove(argv, caller).await,
             "retag" => self.context_retag(argv, caller).await,
             "help" | "--help" | "-h" => {
-                KjResult::ok_ephemeral(self.context_help(), "text/markdown")
+                KjResult::ok_ephemeral(self.context_help(), ContentType::Markdown)
             }
             other => KjResult::Err(format!(
                 "kj context: unknown subcommand '{}'\n\n{}",
@@ -609,16 +609,25 @@ impl KjDispatcher {
         }
 
         // Archive the target + recursive children
-        let db = self.kernel_db().lock();
-        let subtree = db.subtree_snapshot(target_id).unwrap_or_default();
-        let mut archived = 0;
-        for (row, _depth) in &subtree {
-            if db.archive_context(row.context_id).unwrap_or(false) {
-                archived += 1;
+        let archived_ids: Vec<ContextId>;
+        {
+            let db = self.kernel_db().lock();
+            let subtree = db.subtree_snapshot(target_id).unwrap_or_default();
+            archived_ids = subtree
+                .iter()
+                .filter(|(row, _)| db.archive_context(row.context_id).unwrap_or(false))
+                .map(|(row, _)| row.context_id)
+                .collect();
+        }
+
+        // Clean up MCP subscriptions for archived contexts
+        if let Some(pool) = self.mcp_pool() {
+            for ctx_id in &archived_ids {
+                pool.unsubscribe_context(*ctx_id).await;
             }
         }
 
-        KjResult::ok(format!("archived {} context(s)", archived))
+        KjResult::ok(format!("archived {} context(s)", archived_ids.len()))
     }
 
     /// `kj context remove <ctx>` — permanently delete a context (latched).
@@ -675,6 +684,11 @@ impl KjDispatcher {
                     block_count, children_count
                 ),
             };
+        }
+
+        // Clean up MCP subscriptions before deletion
+        if let Some(pool) = self.mcp_pool() {
+            pool.unsubscribe_context(target_id).await;
         }
 
         // Delete from DB (CASCADE deletes edges)
