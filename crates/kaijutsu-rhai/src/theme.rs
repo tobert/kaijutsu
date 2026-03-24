@@ -175,6 +175,10 @@ pub struct ThemeData {
     pub block_border_corner_radius: f32,
     pub block_border_glow_radius: f32,
     pub block_border_glow_intensity: f32,
+    /// Text glow halo radius in pixels (0 = disabled).
+    pub text_glow_radius: f32,
+    /// Text glow halo color (hex, independent of border color).
+    pub text_glow_color: String,
     pub block_border_padding: f32,
     pub block_spacing: f32,
 
@@ -296,8 +300,10 @@ impl Default for ThemeData {
             block_border_drift: "#00aaff80".into(),
             block_border_thickness: 1.5,
             block_border_corner_radius: 4.0,
-            block_border_glow_radius: 0.15,
-            block_border_glow_intensity: 0.6,
+            block_border_glow_radius: 6.0,
+            block_border_glow_intensity: 0.25,
+            text_glow_radius: 2.5,
+            text_glow_color: "#bfd1f259".into(), // soft cool white, 35% alpha
             block_border_padding: 0.4,
             block_spacing: 12.0,
 
@@ -561,6 +567,8 @@ pub fn parse_theme_data_from_scope(scope: &Scope) -> ThemeData {
     float!(block_border_corner_radius);
     float!(block_border_glow_radius);
     float!(block_border_glow_intensity);
+    float!(text_glow_radius);
+    color!(text_glow_color);
     float!(block_border_padding);
     float!(block_spacing);
 

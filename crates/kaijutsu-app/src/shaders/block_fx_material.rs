@@ -35,6 +35,14 @@ pub struct BlockFxMaterial {
     /// [glow_radius, glow_intensity, animation_mode, corner_radius]
     #[uniform(3)]
     pub fx_params: Vec4,
+
+    /// Text glow color (RGBA, linear color space).
+    #[uniform(4)]
+    pub text_glow_color: Vec4,
+
+    /// Text glow parameters: [radius_px, 0, 0, 0]. radius=0 disables.
+    #[uniform(5)]
+    pub text_glow_params: Vec4,
 }
 
 impl Default for BlockFxMaterial {
@@ -44,6 +52,8 @@ impl Default for BlockFxMaterial {
             glow_color: Vec4::ZERO,
             // glow_radius=0 → shader fast path (pure passthrough)
             fx_params: Vec4::ZERO,
+            text_glow_color: Vec4::ZERO,
+            text_glow_params: Vec4::ZERO,
         }
     }
 }

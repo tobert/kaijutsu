@@ -12,6 +12,7 @@ pub use block_fx_material::BlockFxMaterial;
 
 use crate::cell::block_border::{BlockBorderStyle, BorderAnimation};
 use crate::cell::BlockCell;
+use crate::ui::theme::Theme;
 
 /// Plugin that registers shader effect materials and sync systems.
 pub struct ShaderFxPlugin;
@@ -23,17 +24,23 @@ impl Plugin for ShaderFxPlugin {
     }
 }
 
-/// Sync `BlockBorderStyle` → `BlockFxMaterial` parameters.
+/// Sync `BlockBorderStyle` + `Theme` → `BlockFxMaterial` parameters.
 ///
-/// Maps border color, animation mode, and corner radius from the Vello
-/// fieldset styling to the shader's glow uniforms.
+/// Maps border color, animation mode, corner radius, and text glow from
+/// the theme to the shader's uniforms.
 fn sync_block_fx(
     query: Query<
         (&MaterialNode<BlockFxMaterial>, Option<&BlockBorderStyle>),
         With<BlockCell>,
     >,
     mut fx_materials: ResMut<Assets<BlockFxMaterial>>,
+    theme: Res<Theme>,
 ) {
+    // Text glow from theme (same for all blocks)
+    let tg_srgba = theme.text_glow_color.to_srgba();
+    let target_tg_color = Vec4::new(tg_srgba.red, tg_srgba.green, tg_srgba.blue, tg_srgba.alpha);
+    let target_tg_params = Vec4::new(theme.text_glow_radius, 0.0, 0.0, 0.0);
+
     for (mat_node, border) in query.iter() {
         let Some(mat) = fx_materials.get_mut(&mat_node.0) else {
             continue;
@@ -49,22 +56,33 @@ fn sync_block_fx(
                 BorderAnimation::Chase => 3.0,
             };
             let target_params = Vec4::new(
-                6.0, // glow_radius (pixels of falloff)
-                0.25, // glow_intensity
+                theme.block_border_glow_radius,
+                theme.block_border_glow_intensity,
                 anim_mode,
                 style.corner_radius,
             );
 
             // Only mutate if changed (avoids unnecessary GPU re-binds)
-            if mat.glow_color != target_glow || mat.fx_params != target_params {
+            if mat.glow_color != target_glow
+                || mat.fx_params != target_params
+                || mat.text_glow_color != target_tg_color
+                || mat.text_glow_params != target_tg_params
+            {
                 mat.glow_color = target_glow;
                 mat.fx_params = target_params;
+                mat.text_glow_color = target_tg_color;
+                mat.text_glow_params = target_tg_params;
             }
         } else {
-            // No border → disable effects
-            if mat.fx_params != Vec4::ZERO {
+            // No border → disable border effects, keep text glow
+            let needs_update = mat.fx_params != Vec4::ZERO
+                || mat.text_glow_color != target_tg_color
+                || mat.text_glow_params != target_tg_params;
+            if needs_update {
                 mat.glow_color = Vec4::ZERO;
                 mat.fx_params = Vec4::ZERO;
+                mat.text_glow_color = target_tg_color;
+                mat.text_glow_params = target_tg_params;
             }
         }
     }

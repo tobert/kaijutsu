@@ -327,10 +327,14 @@ pub struct Theme {
     pub block_border_thickness: f32,
     /// Corner radius in pixels
     pub block_border_corner_radius: f32,
-    /// Glow spread radius (0.0-1.0)
+    /// Border glow spread radius (pixels of exponential falloff)
     pub block_border_glow_radius: f32,
-    /// Glow intensity (0.0-1.0)
+    /// Border glow peak brightness multiplier
     pub block_border_glow_intensity: f32,
+    /// Text glow halo radius in pixels (0 = disabled)
+    pub text_glow_radius: f32,
+    /// Text glow halo color (independent of border color)
+    pub text_glow_color: Color,
     /// Multiplier against cell_font_size for border inner padding
     pub block_border_padding: f32,
     /// Vertical spacing between blocks (pixels)
@@ -539,8 +543,10 @@ impl Default for Theme {
             block_border_drift: Color::srgba(0.00, 0.67, 1.00, 0.5),     // #00aaff blue
             block_border_thickness: 1.5,
             block_border_corner_radius: 4.0,
-            block_border_glow_radius: 0.15,
-            block_border_glow_intensity: 0.6,
+            block_border_glow_radius: 6.0,
+            block_border_glow_intensity: 0.25,
+            text_glow_radius: 2.5,
+            text_glow_color: Color::srgba(0.75, 0.82, 0.95, 0.35),
             block_border_padding: 0.4,
             block_spacing: 12.0,
 
@@ -703,6 +709,8 @@ impl From<kaijutsu_rhai::theme::ThemeData> for Theme {
         theme.block_border_corner_radius = td.block_border_corner_radius;
         theme.block_border_glow_radius = td.block_border_glow_radius;
         theme.block_border_glow_intensity = td.block_border_glow_intensity;
+        theme.text_glow_radius = td.text_glow_radius;
+        theme.text_glow_color = hex_to_color(&td.text_glow_color);
         theme.block_border_padding = td.block_border_padding;
         theme.block_spacing = td.block_spacing;
 

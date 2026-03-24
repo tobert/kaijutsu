@@ -43,6 +43,7 @@
 //   block_border_user, block_border_assistant
 //   block_border_thickness, block_border_corner_radius
 //   block_border_glow_radius, block_border_glow_intensity, block_border_padding
+//   text_glow_radius, text_glow_color
 //
 //   // Constellation
 //   constellation_base_radius, constellation_ring_spacing
