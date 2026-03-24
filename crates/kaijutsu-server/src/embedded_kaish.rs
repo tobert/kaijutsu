@@ -296,4 +296,103 @@ mod tests {
         let actual = cwd.canonicalize().unwrap_or(cwd.clone());
         assert_eq!(actual, expected, "cwd should be project root");
     }
+
+    /// Regression test: when a context has a persisted cwd in KernelDb,
+    /// creating an EmbeddedKaish for that context should restore it.
+    ///
+    /// Before the fix, cwd defaulted to $HOME regardless of what was
+    /// persisted — apply_context_config only ran on `kj context switch`,
+    /// not on initial session creation.
+    #[tokio::test]
+    async fn test_persisted_cwd_restored_on_creation() {
+        use kaijutsu_kernel::kernel_db::{ContextRow, ContextShellRow, KernelDb};
+        use kaijutsu_types::{ConsentMode, KernelId, now_millis};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let persisted_cwd = tmp.path().to_path_buf();
+
+        // Set up KernelDb with a context that has a persisted cwd
+        let kernel_id = KernelId::new();
+        let context_id = ContextId::new();
+        let principal = PrincipalId::system();
+        let db = KernelDb::in_memory().unwrap();
+
+        let ws_id = db
+            .get_or_create_default_workspace(kernel_id, principal)
+            .unwrap();
+
+        db.insert_context_with_document(
+            &ContextRow {
+                context_id,
+                kernel_id,
+                label: Some("test-restore".into()),
+                provider: None,
+                model: None,
+                system_prompt: None,
+                tool_filter: None,
+                consent_mode: ConsentMode::default(),
+                forked_from: None,
+                fork_kind: None,
+                created_by: principal,
+                created_at: now_millis() as i64,
+                archived_at: None,
+                workspace_id: None,
+                preset_id: None,
+            },
+            ws_id,
+        )
+        .unwrap();
+
+        db.upsert_context_shell(&ContextShellRow {
+            context_id,
+            cwd: Some(persisted_cwd.to_string_lossy().into_owned()),
+            init_script: None,
+            updated_at: now_millis() as i64,
+        })
+        .unwrap();
+
+        // Verify it's really in the DB
+        let shell = db.get_context_shell(context_id).unwrap().unwrap();
+        assert_eq!(
+            shell.cwd.as_deref(),
+            Some(persisted_cwd.to_str().unwrap()),
+            "precondition: cwd should be in DB"
+        );
+
+        let _kernel_db = Arc::new(parking_lot::Mutex::new(db));
+
+        // Create EmbeddedKaish the same way rpc.rs does: no project_root,
+        // relying on the persisted context_shell.cwd to be restored.
+        let blocks = shared_block_store(principal);
+        let kernel = Arc::new(KaijutsuKernel::new("test-restore").await);
+
+        let kaish = EmbeddedKaish::with_identity(
+            "test-restore",
+            blocks,
+            kernel,
+            None, // no project_root — same as SSH connection path
+            principal,
+            context_id,
+            SessionId::new(),
+            kernel_id,
+            |_, _| {},
+        )
+        .unwrap();
+
+        // BUG: without the fix, this will be $HOME instead of the persisted cwd
+        let actual_cwd = kaish.cwd().await;
+        let actual = actual_cwd
+            .canonicalize()
+            .unwrap_or_else(|_| actual_cwd.clone());
+        let expected = persisted_cwd
+            .canonicalize()
+            .unwrap_or_else(|_| persisted_cwd.clone());
+
+        assert_eq!(
+            actual, expected,
+            "cwd should be restored from context_shell on creation, \
+             got {:?} (expected {:?})",
+            actual_cwd, persisted_cwd,
+        );
+    }
 }
