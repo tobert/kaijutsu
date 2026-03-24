@@ -123,6 +123,11 @@ pub struct BlockRenderPlugin;
 
 impl Plugin for BlockRenderPlugin {
     fn build(&self, app: &mut App) {
+        // Conservative fallback — finish() will overwrite with the real GPU limit.
+        app.insert_resource(GpuTextureLimits {
+            max_texture_dim: FALLBACK_MAX_TEXTURE_DIM,
+        });
+
         // Initialize MSDF atlas in main world (needs Assets<Image>)
         app.add_systems(Startup, init_msdf_atlas);
 
@@ -172,6 +177,29 @@ impl Plugin for BlockRenderPlugin {
                 ),
             );
     }
+
+    fn finish(&self, app: &mut App) {
+        // Query the actual GPU texture dimension limit from the render device.
+        // RenderDevice isn't available during build(), only after renderer init.
+        let max_dim = app
+            .get_sub_app(RenderApp)
+            .and_then(|render_app| {
+                render_app
+                    .world()
+                    .get_resource::<RenderDevice>()
+                    .map(|d| d.limits().max_texture_dimension_2d)
+            })
+            .unwrap_or(FALLBACK_MAX_TEXTURE_DIM);
+
+        info!(
+            "GPU max_texture_dimension_2d: {} (fallback: {})",
+            max_dim, FALLBACK_MAX_TEXTURE_DIM
+        );
+
+        app.insert_resource(GpuTextureLimits {
+            max_texture_dim: max_dim,
+        });
+    }
 }
 
 /// Initialize the MSDF atlas resource (requires Assets<Image>).
@@ -199,9 +227,17 @@ fn init_msdf_renderer(
 // TEXTURE HELPERS
 // ============================================================================
 
-/// Maximum texture dimension (pixels). Most GPUs support 16384, but some
-/// older/mobile GPUs cap at 8192. Use the conservative limit.
-const MAX_TEXTURE_DIM: u32 = 8192;
+/// Fallback max texture dimension when GPU limits aren't available yet.
+const FALLBACK_MAX_TEXTURE_DIM: u32 = 8192;
+
+/// Runtime GPU texture dimension limit, queried from the actual device.
+///
+/// Populated in `BlockRenderPlugin::finish()` from `RenderDevice::limits()`.
+/// Falls back to `FALLBACK_MAX_TEXTURE_DIM` if the render device isn't available.
+#[derive(Resource, Clone, Copy)]
+pub struct GpuTextureLimits {
+    pub max_texture_dim: u32,
+}
 
 /// Create a render-target texture with the required format and usage flags.
 pub fn create_block_texture(images: &mut Assets<Image>, w: u32, h: u32) -> Handle<Image> {
@@ -367,9 +403,8 @@ pub fn build_block_scenes(
                 );
                 let fallback_brush = bevy_color_to_brush(theme.block_assistant);
 
-                // Collect MSDF glyphs from Parley layout
+                // MSDF renders text; Vello scene only gets borders
                 if let Some(ref mut atlas) = atlas {
-                    // Register font data for generator
                     for line in layout.lines() {
                         for item in line.items() {
                             if let bevy_vello::parley::PositionedLayoutItem::GlyphRun(gr) = item {
@@ -384,16 +419,17 @@ pub fn build_block_scenes(
                     msdf_glyphs.version = block_scene.scene_version.wrapping_add(1);
                     msdf_glyphs.rainbow = is_rainbow;
                     *render_method = BlockRenderMethod::Msdf;
+                } else {
+                    // No atlas — Vello renders text directly
+                    crate::text::rich::render_layout_with_brushes(
+                        &mut scene,
+                        &layout,
+                        &span_brushes,
+                        &fallback_brush,
+                        text_offset,
+                    );
+                    *render_method = BlockRenderMethod::Vello;
                 }
-
-                // Vello scene still used for borders; also serves as fallback
-                crate::text::rich::render_layout_with_brushes(
-                    &mut scene,
-                    &layout,
-                    &span_brushes,
-                    &fallback_brush,
-                    text_offset,
-                );
             }
             Some(RichContentKind::Sparkline(data)) => {
                 *render_method = BlockRenderMethod::Vello;
@@ -495,7 +531,6 @@ pub fn build_block_scenes(
                     crate::text::rich::build_output_span_brushes(layout, &theme);
                 let fallback_brush = bevy_color_to_brush(theme.block_tool_result);
 
-                // Collect MSDF glyphs for output blocks too
                 if let Some(ref mut atlas) = atlas {
                     for line in parley_layout.lines() {
                         for item in line.items() {
@@ -511,15 +546,16 @@ pub fn build_block_scenes(
                     msdf_glyphs.version = block_scene.scene_version.wrapping_add(1);
                     msdf_glyphs.rainbow = is_rainbow;
                     *render_method = BlockRenderMethod::Msdf;
+                } else {
+                    crate::text::rich::render_layout_with_brushes(
+                        &mut scene,
+                        &parley_layout,
+                        &span_brushes,
+                        &fallback_brush,
+                        text_offset,
+                    );
+                    *render_method = BlockRenderMethod::Vello;
                 }
-
-                crate::text::rich::render_layout_with_brushes(
-                    &mut scene,
-                    &parley_layout,
-                    &span_brushes,
-                    &fallback_brush,
-                    text_offset,
-                );
             }
             None => {
                 // Plain text block
@@ -531,7 +567,6 @@ pub fn build_block_scenes(
                 );
                 content_height = layout.height();
 
-                // Collect MSDF glyphs for plain text
                 if let Some(ref mut atlas) = atlas {
                     for line in layout.lines() {
                         for item in line.items() {
@@ -547,15 +582,16 @@ pub fn build_block_scenes(
                     msdf_glyphs.version = block_scene.scene_version.wrapping_add(1);
                     msdf_glyphs.rainbow = is_rainbow;
                     *render_method = BlockRenderMethod::Msdf;
+                } else {
+                    crate::text::rich::render_layout_with_brushes(
+                        &mut scene,
+                        &layout,
+                        &[],
+                        &text_brush,
+                        text_offset,
+                    );
+                    *render_method = BlockRenderMethod::Vello;
                 }
-
-                crate::text::rich::render_layout_with_brushes(
-                    &mut scene,
-                    &layout,
-                    &[],
-                    &text_brush,
-                    text_offset,
-                );
             }
         }
 
@@ -662,10 +698,12 @@ pub fn resize_block_textures(
         (With<RoleGroupBorder>, Without<BlockCell>),
     >,
     text_metrics: Res<TextMetrics>,
+    gpu_limits: Res<GpuTextureLimits>,
     mut images: ResMut<Assets<Image>>,
     mut fx_materials: ResMut<Assets<BlockFxMaterial>>,
 ) {
     let scale = text_metrics.scale_factor;
+    let max_dim = gpu_limits.max_texture_dim;
 
     // Block cells: update material + ImageNode texture bindings.
     // ImageNode ensures GpuImage is prepared by Bevy's RenderAssetPlugin.
@@ -677,8 +715,8 @@ pub fn resize_block_textures(
 
         let target_w = (scene.built_width * scale).ceil() as u32;
         let target_h = (scene.built_height * scale).ceil() as u32;
-        let target_w = target_w.clamp(1, MAX_TEXTURE_DIM);
-        let target_h = target_h.clamp(1, MAX_TEXTURE_DIM);
+        let target_w = target_w.clamp(1, max_dim);
+        let target_h = target_h.clamp(1, max_dim);
 
         if texture.width != target_w || texture.height != target_h {
             let new_handle = create_block_texture(&mut images, target_w, target_h);
@@ -700,8 +738,8 @@ pub fn resize_block_textures(
 
         let target_w = (scene.built_width * scale).ceil() as u32;
         let target_h = (scene.built_height * scale).ceil() as u32;
-        let target_w = target_w.clamp(1, MAX_TEXTURE_DIM);
-        let target_h = target_h.clamp(1, MAX_TEXTURE_DIM);
+        let target_w = target_w.clamp(1, max_dim);
+        let target_h = target_h.clamp(1, max_dim);
 
         if texture.width != target_w || texture.height != target_h {
             let new_handle = create_block_texture(&mut images, target_w, target_h);
@@ -723,14 +761,28 @@ pub fn resize_block_textures(
 /// version to determine which scenes need GPU re-rendering.
 pub fn extract_block_scenes(
     mut extracted: ResMut<ExtractedBlockScenes>,
-    query: Extract<Query<(&BlockScene, &BlockTexture)>>,
+    query: Extract<Query<(
+        &BlockScene,
+        &BlockTexture,
+        Option<&BlockRenderMethod>,
+        Option<&crate::cell::block_border::BlockBorderStyle>,
+    )>>,
 ) {
     extracted.items.clear();
 
-    for (scene, texture) in query.iter() {
+    for (scene, texture, render_method, border) in query.iter() {
         if scene.scene_version == 0 {
             continue;
         }
+
+        // MSDF blocks without borders don't need Vello at all —
+        // the MSDF render pass clears and draws text directly.
+        let is_msdf = render_method == Some(&BlockRenderMethod::Msdf);
+        let has_border = border.is_some();
+        if is_msdf && !has_border {
+            continue;
+        }
+
         let asset_id = texture.image.id();
         let last = extracted.last_rendered.get(&asset_id).copied().unwrap_or(0);
         if scene.scene_version > last {
@@ -791,7 +843,7 @@ pub fn render_block_textures(
         // Scale the Vello scene to match physical texture dimensions.
         // This handles both:
         // - High-DPI (texture is larger than logical scene due to scale_factor)
-        // - MAX_TEXTURE_DIM clamping (texture is smaller than logical scene)
+        // - max_dim clamping (texture is smaller than logical scene)
         // Without scaling, Vello content (borders, SVG) would be misaligned
         // with MSDF text which renders in NDC and inherently fills the texture.
         let sx = item.width as f64 / item.built_width.max(1.0) as f64;
@@ -884,6 +936,8 @@ pub fn render_msdf_block_textures(
             gamma_correction: render_params.gamma_correction,
         };
 
+        // Clear if no Vello content (no border); composite if Vello drew borders first
+        let clear = !item.has_vello_content;
         msdf_renderer.render_to_texture(
             &device,
             &queue,
@@ -893,7 +947,7 @@ pub fn render_msdf_block_textures(
             &item.image_handle,
             &vertices,
             &uniforms,
-            false, // Don't clear — Vello border already rendered
+            clear,
         );
 
         msdf_data
@@ -916,6 +970,8 @@ struct ExtractedMsdfBlockItem {
     built_height: f32,
     version: u64,
     rainbow: bool,
+    /// Whether Vello rendered borders first (false = MSDF must clear).
+    has_vello_content: bool,
 }
 
 /// Resource holding extracted MSDF block data.
@@ -962,12 +1018,13 @@ fn extract_msdf_blocks(
             &BlockRenderMethod,
             &BlockScene,
             &BlockTexture,
+            Option<&crate::cell::block_border::BlockBorderStyle>,
         )>,
     >,
 ) {
     extracted.items.clear();
 
-    for (msdf_glyphs, render_method, scene, texture) in query.iter() {
+    for (msdf_glyphs, render_method, scene, texture, border) in query.iter() {
         if *render_method != BlockRenderMethod::Msdf {
             continue;
         }
@@ -987,6 +1044,7 @@ fn extract_msdf_blocks(
                 built_height: scene.built_height,
                 version: msdf_glyphs.version,
                 rainbow: msdf_glyphs.rainbow,
+                has_vello_content: border.is_some(),
             });
         }
     }
