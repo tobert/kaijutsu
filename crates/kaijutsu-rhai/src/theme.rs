@@ -147,6 +147,20 @@ pub struct ThemeData {
     /// Font family for sans-serif text (SVG generic family fallback).
     pub font_sans: String,
 
+    // MSDF text rendering quality
+    /// Hinting strength (0.0 = off, 1.0 = full). Default 0.8.
+    pub msdf_hint_amount: f32,
+    /// Stem darkening (0.0 = off, ~0.15 = ClearType-like). Default 0.15.
+    pub msdf_stem_darkening: f32,
+    /// Horizontal stroke AA scale (1.0-1.3). Default 1.1.
+    pub msdf_horz_scale: f32,
+    /// Vertical stroke AA scale (0.5-0.8). Default 0.6.
+    pub msdf_vert_scale: f32,
+    /// SDF threshold (0.45-0.55). Default 0.5.
+    pub msdf_text_bias: f32,
+    /// Alpha gamma correction. Default 0.85.
+    pub msdf_gamma_correction: f32,
+
     // Constellation
     pub constellation_base_radius: f32,
     pub constellation_ring_spacing: f32,
@@ -261,6 +275,14 @@ impl Default for ThemeData {
             font_mono: "Cascadia Code NF".into(),
             font_serif: "Noto Serif".into(),
             font_sans: "Noto Sans CJK JP".into(),
+
+            // MSDF text rendering quality
+            msdf_hint_amount: 0.8,
+            msdf_stem_darkening: 0.15,
+            msdf_horz_scale: 1.1,
+            msdf_vert_scale: 0.6,
+            msdf_text_bias: 0.5,
+            msdf_gamma_correction: 0.85,
 
             // Constellation
             constellation_base_radius: 500.0,
@@ -516,6 +538,14 @@ pub fn parse_theme_data_from_scope(scope: &Scope) -> ThemeData {
     if let Some(v) = get_string(scope, "font_sans") {
         td.font_sans = v;
     }
+
+    // MSDF text rendering quality
+    float!(msdf_hint_amount);
+    float!(msdf_stem_darkening);
+    float!(msdf_horz_scale);
+    float!(msdf_vert_scale);
+    float!(msdf_text_bias);
+    float!(msdf_gamma_correction);
 
     // Constellation
     float!(constellation_base_radius);

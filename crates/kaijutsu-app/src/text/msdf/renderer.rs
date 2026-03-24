@@ -34,6 +34,8 @@ pub struct MsdfVertex {
     pub color: [u8; 4],
     /// Semantic importance (0.0 = faded, 0.5 = normal, 1.0 = bold).
     pub importance: f32,
+    /// Per-vertex effect flags. Bit 0: rainbow color cycling.
+    pub flags: u32,
 }
 
 /// GPU uniforms for per-block MSDF rendering.
@@ -152,6 +154,12 @@ impl MsdfBlockRenderer {
                     offset: 20,
                     shader_location: 3,
                 },
+                // flags: u32
+                VertexAttribute {
+                    format: VertexFormat::Uint32,
+                    offset: 24,
+                    shader_location: 4,
+                },
             ],
         };
 
@@ -207,11 +215,13 @@ impl MsdfBlockRenderer {
     /// Converts positioned glyphs to NDC quads using atlas region data.
     /// `tex_width`/`tex_height` are in logical (pre-scale) pixels matching
     /// the coordinate space of `PositionedGlyph`.
+    /// `rainbow` sets the per-vertex rainbow flag for color cycling.
     pub fn build_vertices(
         glyphs: &[PositionedGlyph],
         atlas: &ExtractedMsdfAtlas,
         tex_width: f32,
         tex_height: f32,
+        rainbow: bool,
     ) -> Vec<MsdfVertex> {
         let mut vertices = Vec::with_capacity(glyphs.len() * 6);
 
@@ -240,14 +250,15 @@ impl MsdfBlockRenderer {
 
             let color = glyph.color;
             let importance = glyph.importance;
+            let flags = if rainbow { 1u32 } else { 0u32 };
 
             // Two triangles per quad
-            vertices.push(MsdfVertex { position: [x0, y0], uv: [u0, v0], color, importance });
-            vertices.push(MsdfVertex { position: [x1, y0], uv: [u1, v0], color, importance });
-            vertices.push(MsdfVertex { position: [x0, y1], uv: [u0, v1], color, importance });
-            vertices.push(MsdfVertex { position: [x1, y0], uv: [u1, v0], color, importance });
-            vertices.push(MsdfVertex { position: [x1, y1], uv: [u1, v1], color, importance });
-            vertices.push(MsdfVertex { position: [x0, y1], uv: [u0, v1], color, importance });
+            vertices.push(MsdfVertex { position: [x0, y0], uv: [u0, v0], color, importance, flags });
+            vertices.push(MsdfVertex { position: [x1, y0], uv: [u1, v0], color, importance, flags });
+            vertices.push(MsdfVertex { position: [x0, y1], uv: [u0, v1], color, importance, flags });
+            vertices.push(MsdfVertex { position: [x1, y0], uv: [u1, v0], color, importance, flags });
+            vertices.push(MsdfVertex { position: [x1, y1], uv: [u1, v1], color, importance, flags });
+            vertices.push(MsdfVertex { position: [x0, y1], uv: [u0, v1], color, importance, flags });
         }
 
         vertices

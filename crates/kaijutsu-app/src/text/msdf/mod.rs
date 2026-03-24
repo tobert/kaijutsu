@@ -67,6 +67,7 @@ impl FontDataMap {
 pub struct MsdfBlockGlyphs {
     pub glyphs: Vec<PositionedGlyph>,
     pub version: u64,
+    pub rainbow: bool,
 }
 
 /// Which renderer handles a block's text content.

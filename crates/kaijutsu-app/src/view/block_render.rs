@@ -148,10 +148,16 @@ impl Plugin for BlockRenderPlugin {
             .init_resource::<ExtractedBlockScenes>()
             .init_resource::<ExtractedMsdfAtlas>()
             .init_resource::<ExtractedMsdfBlockData>()
+            .init_resource::<ExtractedMsdfRenderParams>()
             .add_systems(Startup, init_msdf_renderer)
             .add_systems(
                 ExtractSchedule,
-                (extract_block_scenes, extract_msdf_atlas, extract_msdf_blocks),
+                (
+                    extract_block_scenes,
+                    extract_msdf_atlas,
+                    extract_msdf_blocks,
+                    extract_msdf_render_params,
+                ),
             )
             .add_systems(
                 Render,
@@ -376,6 +382,7 @@ pub fn build_block_scenes(
                     );
                     msdf_glyphs.glyphs = glyphs;
                     msdf_glyphs.version = block_scene.scene_version.wrapping_add(1);
+                    msdf_glyphs.rainbow = is_rainbow;
                     *render_method = BlockRenderMethod::Msdf;
                 }
 
@@ -502,6 +509,7 @@ pub fn build_block_scenes(
                     );
                     msdf_glyphs.glyphs = glyphs;
                     msdf_glyphs.version = block_scene.scene_version.wrapping_add(1);
+                    msdf_glyphs.rainbow = is_rainbow;
                     *render_method = BlockRenderMethod::Msdf;
                 }
 
@@ -537,6 +545,7 @@ pub fn build_block_scenes(
                     );
                     msdf_glyphs.glyphs = glyphs;
                     msdf_glyphs.version = block_scene.scene_version.wrapping_add(1);
+                    msdf_glyphs.rainbow = is_rainbow;
                     *render_method = BlockRenderMethod::Msdf;
                 }
 
@@ -830,6 +839,7 @@ pub fn render_msdf_block_textures(
     msdf_renderer: Option<Res<MsdfBlockRenderer>>,
     msdf_atlas: Res<ExtractedMsdfAtlas>,
     mut msdf_data: ResMut<ExtractedMsdfBlockData>,
+    render_params: Res<ExtractedMsdfRenderParams>,
     device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
     gpu_images: Res<RenderAssets<GpuImage>>,
@@ -851,6 +861,7 @@ pub fn render_msdf_block_textures(
             &msdf_atlas,
             item.built_width,
             item.built_height,
+            item.rainbow,
         );
 
         if vertices.is_empty() {
@@ -860,11 +871,17 @@ pub fn render_msdf_block_textures(
         let uniforms = MsdfBlockUniforms {
             resolution: [item.width as f32, item.height as f32],
             msdf_range: msdf_atlas.msdf_range,
+            time: render_params.time,
             sdf_texel: [
                 1.0 / msdf_atlas.width as f32,
                 1.0 / msdf_atlas.height as f32,
             ],
-            ..default()
+            hint_amount: render_params.hint_amount,
+            stem_darkening: render_params.stem_darkening,
+            horz_scale: render_params.horz_scale,
+            vert_scale: render_params.vert_scale,
+            text_bias: render_params.text_bias,
+            gamma_correction: render_params.gamma_correction,
         };
 
         msdf_renderer.render_to_texture(
@@ -898,6 +915,7 @@ struct ExtractedMsdfBlockItem {
     built_width: f32,
     built_height: f32,
     version: u64,
+    rainbow: bool,
 }
 
 /// Resource holding extracted MSDF block data.
@@ -905,6 +923,18 @@ struct ExtractedMsdfBlockItem {
 pub struct ExtractedMsdfBlockData {
     items: Vec<ExtractedMsdfBlockItem>,
     last_rendered: HashMap<AssetId<Image>, u64>,
+}
+
+/// Extracted MSDF rendering parameters (from Theme + Time).
+#[derive(Resource, Default, Clone)]
+pub struct ExtractedMsdfRenderParams {
+    pub hint_amount: f32,
+    pub stem_darkening: f32,
+    pub horz_scale: f32,
+    pub vert_scale: f32,
+    pub text_bias: f32,
+    pub gamma_correction: f32,
+    pub time: f32,
 }
 
 /// Extract MSDF atlas data to the render world.
@@ -956,7 +986,23 @@ fn extract_msdf_blocks(
                 built_width: scene.built_width,
                 built_height: scene.built_height,
                 version: msdf_glyphs.version,
+                rainbow: msdf_glyphs.rainbow,
             });
         }
     }
+}
+
+/// Extract MSDF rendering params (theme + time) to the render world.
+fn extract_msdf_render_params(
+    mut extracted: ResMut<ExtractedMsdfRenderParams>,
+    theme: Extract<Res<Theme>>,
+    time: Extract<Res<Time>>,
+) {
+    extracted.hint_amount = theme.msdf_hint_amount;
+    extracted.stem_darkening = theme.msdf_stem_darkening;
+    extracted.horz_scale = theme.msdf_horz_scale;
+    extracted.vert_scale = theme.msdf_vert_scale;
+    extracted.text_bias = theme.msdf_text_bias;
+    extracted.gamma_correction = theme.msdf_gamma_correction;
+    extracted.time = time.elapsed_secs();
 }

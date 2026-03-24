@@ -265,6 +265,22 @@ pub struct Theme {
     pub font_sans: String,
 
     // ═══════════════════════════════════════════════════════════════════════
+    // MSDF Text Rendering Quality
+    // ═══════════════════════════════════════════════════════════════════════
+    /// Hinting strength (0.0 = off, 1.0 = full).
+    pub msdf_hint_amount: f32,
+    /// Stem darkening (0.0 = off, ~0.15 = ClearType-like).
+    pub msdf_stem_darkening: f32,
+    /// Horizontal stroke AA scale (1.0-1.3).
+    pub msdf_horz_scale: f32,
+    /// Vertical stroke AA scale (0.5-0.8).
+    pub msdf_vert_scale: f32,
+    /// SDF threshold (0.45-0.55).
+    pub msdf_text_bias: f32,
+    /// Alpha gamma correction.
+    pub msdf_gamma_correction: f32,
+
+    // ═══════════════════════════════════════════════════════════════════════
     // Constellation Configuration
     // ═══════════════════════════════════════════════════════════════════════
     /// Base radius for radial tree root ring (pixels, 2D fallback layout)
@@ -489,6 +505,13 @@ impl Default for Theme {
             // Font configuration
             font_rainbow: true,
             font_mono: "Cascadia Code NF".into(),
+            // MSDF text rendering quality
+            msdf_hint_amount: 0.8,
+            msdf_stem_darkening: 0.15,
+            msdf_horz_scale: 1.1,
+            msdf_vert_scale: 0.6,
+            msdf_text_bias: 0.5,
+            msdf_gamma_correction: 0.85,
             font_serif: "Noto Serif".into(),
             font_sans: "Noto Sans CJK JP".into(),
 
@@ -657,6 +680,14 @@ impl From<kaijutsu_rhai::theme::ThemeData> for Theme {
         theme.font_mono = td.font_mono;
         theme.font_serif = td.font_serif;
         theme.font_sans = td.font_sans;
+
+        // MSDF text rendering quality
+        theme.msdf_hint_amount = td.msdf_hint_amount;
+        theme.msdf_stem_darkening = td.msdf_stem_darkening;
+        theme.msdf_horz_scale = td.msdf_horz_scale;
+        theme.msdf_vert_scale = td.msdf_vert_scale;
+        theme.msdf_text_bias = td.msdf_text_bias;
+        theme.msdf_gamma_correction = td.msdf_gamma_correction;
 
         // Constellation
         theme.constellation_base_radius = td.constellation_base_radius;

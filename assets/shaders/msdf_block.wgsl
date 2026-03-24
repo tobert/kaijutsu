@@ -2,7 +2,7 @@
 //
 // Renders MSDF glyph quads to per-block textures.
 // Supports shader-based hinting, stem darkening, directional AA,
-// and gamma correction for high-quality text at any size.
+// gamma correction, and rainbow color cycling.
 
 struct Uniforms {
     resolution: vec2<f32>,
@@ -26,6 +26,7 @@ struct VertexInput {
     @location(1) uv: vec2<f32>,        // atlas UV
     @location(2) color: vec4<f32>,     // per-glyph RGBA (unorm)
     @location(3) importance: f32,      // semantic weight
+    @location(4) flags: u32,           // bit 0: rainbow
 }
 
 struct VertexOutput {
@@ -33,6 +34,8 @@ struct VertexOutput {
     @location(0) uv: vec2<f32>,
     @location(1) color: vec4<f32>,
     @location(2) importance: f32,
+    @location(3) screen_pos: vec2<f32>,
+    @location(4) @interpolate(flat) flags: u32,
 }
 
 // ============================================================================
@@ -46,6 +49,9 @@ fn vertex(in: VertexInput) -> VertexOutput {
     out.uv = in.uv;
     out.color = in.color;
     out.importance = in.importance;
+    // Screen position for rainbow effect (NDC [-1,1] → pixel coords)
+    out.screen_pos = (in.position + 1.0) * 0.5 * uniforms.resolution;
+    out.flags = in.flags;
     return out;
 }
 
@@ -124,13 +130,53 @@ fn msdf_alpha_hinted(uv: vec2<f32>, bias: f32, importance: f32) -> f32 {
 }
 
 // ============================================================================
+// COLOR EFFECTS
+// ============================================================================
+
+/// HSV to RGB conversion for rainbow effect.
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> vec3<f32> {
+    let c = v * s;
+    let x = c * (1.0 - abs(fract(h * 6.0) * 2.0 - 1.0));
+    let m = v - c;
+
+    var rgb: vec3<f32>;
+    let h6 = h * 6.0;
+    if h6 < 1.0 {
+        rgb = vec3<f32>(c, x, 0.0);
+    } else if h6 < 2.0 {
+        rgb = vec3<f32>(x, c, 0.0);
+    } else if h6 < 3.0 {
+        rgb = vec3<f32>(0.0, c, x);
+    } else if h6 < 4.0 {
+        rgb = vec3<f32>(0.0, x, c);
+    } else if h6 < 5.0 {
+        rgb = vec3<f32>(x, 0.0, c);
+    } else {
+        rgb = vec3<f32>(c, 0.0, x);
+    }
+
+    return rgb + m;
+}
+
+/// Generate rainbow color based on screen position and time.
+fn rainbow_color(screen_x: f32, time: f32) -> vec3<f32> {
+    let hue = fract(screen_x * 0.002 + time * 0.3);
+    return hsv_to_rgb(hue, 0.8, 1.0);
+}
+
+// ============================================================================
 // FRAGMENT SHADER
 // ============================================================================
 
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let text_alpha = msdf_alpha_hinted(in.uv, uniforms.text_bias, in.importance);
-    let text_color = in.color.rgb;
+
+    // Determine text color — rainbow from per-vertex flags
+    var text_color = in.color.rgb;
+    if (in.flags & 1u) != 0u {
+        text_color = rainbow_color(in.screen_pos.x, uniforms.time);
+    }
 
     // Premultiplied alpha output
     let final_alpha = text_alpha * in.color.a;
