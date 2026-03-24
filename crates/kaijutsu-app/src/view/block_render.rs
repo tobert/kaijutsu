@@ -62,8 +62,6 @@ pub struct BlockScene {
     pub text: String,
     /// Text color (set by sync_block_cell_buffers).
     pub color: Color,
-    /// Atlas version when this scene was last built (for glyph arrival detection).
-    pub last_atlas_version: u64,
 }
 
 impl Default for BlockScene {
@@ -77,7 +75,6 @@ impl Default for BlockScene {
             built_height: 0.0,
             text: String::new(),
             color: Color::WHITE,
-            last_atlas_version: 0,
         }
     }
 }
@@ -232,6 +229,18 @@ const FALLBACK_MAX_TEXTURE_DIM: u32 = 8192;
 ///
 /// Populated in `BlockRenderPlugin::finish()` from `RenderDevice::limits()`.
 /// Falls back to `FALLBACK_MAX_TEXTURE_DIM` if the render device isn't available.
+///
+/// # Tall block limitation
+///
+/// Each block renders to a single GPU texture. When a block's pixel height
+/// exceeds this limit (e.g. large `find` output, `cat` of a long file),
+/// the texture is clamped and `render_block_textures` applies a compensating
+/// `Affine::scale_non_uniform` so text displays at correct scale — but with
+/// reduced Y resolution. At 2x HiDPI the threshold halves.
+///
+/// The proper fix is **tiled rendering**: render only the visible portion of
+/// tall blocks into a viewport-sized texture, with shader UV remapping.
+/// See tech_debt.md item 4 for the full design assessment (~1-2 day lift).
 #[derive(Resource, Clone, Copy)]
 pub struct GpuTextureLimits {
     pub max_texture_dim: u32,
@@ -326,10 +335,7 @@ pub fn build_block_scenes(
         let width_changed = (block_scene.built_width - width).abs() > 1.0;
         let is_rainbow = effects.is_some_and(|e| e.rainbow);
         let has_animation = border.is_some_and(|b| b.animation != BorderAnimation::None);
-        let atlas_version = atlas.as_ref().map(|a| a.version).unwrap_or(0);
-        let atlas_changed = block_scene.last_atlas_version != atlas_version;
-        let needs_rebuild =
-            version_changed || width_changed || is_rainbow || has_animation || atlas_changed;
+        let needs_rebuild = version_changed || width_changed || is_rainbow || has_animation;
 
         if !needs_rebuild {
             continue;
@@ -626,7 +632,6 @@ pub fn build_block_scenes(
         block_scene.built_height = total_height;
         block_scene.last_built_version = block_scene.content_version;
         block_scene.scene_version = block_scene.scene_version.wrapping_add(1);
-        block_scene.last_atlas_version = atlas_version;
     }
 }
 
@@ -936,7 +941,7 @@ pub fn render_msdf_block_textures(
 
         // Clear if no Vello content (no border); composite if Vello drew borders first
         let clear = !item.has_vello_content;
-        msdf_renderer.render_to_texture(
+        let rendered = msdf_renderer.render_to_texture(
             &device,
             &queue,
             &pipeline_cache,
@@ -948,9 +953,18 @@ pub fn render_msdf_block_textures(
             clear,
         );
 
-        msdf_data
-            .last_rendered
-            .insert(item.image_handle.id(), item.version);
+        if rendered {
+            msdf_data
+                .last_rendered
+                .insert(item.image_handle.id(), item.version);
+        } else {
+            warn!(
+                "MSDF render skipped: {}x{} built={:.0}x{:.0} glyphs={} verts={}",
+                item.width, item.height,
+                item.built_width, item.built_height,
+                item.glyphs.len(), vertices.len(),
+            );
+        }
     }
 }
 

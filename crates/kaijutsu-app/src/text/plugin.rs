@@ -46,6 +46,7 @@ fn poll_msdf_generator(
     mut atlas: Option<ResMut<super::msdf::MsdfAtlas>>,
     mut images: ResMut<Assets<Image>>,
     font_data_map: Res<FontDataMap>,
+    mut msdf_blocks: Query<&mut super::msdf::MsdfBlockGlyphs>,
 ) {
     let Some(ref mut atlas) = atlas else {
         return;
@@ -75,6 +76,15 @@ fn poll_msdf_generator(
             after,
             atlas.version,
         );
+
+        // Bump version on all MSDF blocks so the render world re-extracts them.
+        // This is cheaper than a full rebuild — no Parley re-layout, no texture resize,
+        // just a re-render with the now-complete atlas.
+        for mut glyphs in msdf_blocks.iter_mut() {
+            if !glyphs.glyphs.is_empty() {
+                glyphs.version = glyphs.version.wrapping_add(1);
+            }
+        }
     }
 
     // Sync atlas pixels to GPU texture
