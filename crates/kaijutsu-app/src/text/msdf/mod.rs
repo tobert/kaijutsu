@@ -57,6 +57,11 @@ impl FontDataMap {
     pub fn get(&self, id: &FontId) -> Option<&Arc<Vec<u8>>> {
         self.data.get(id)
     }
+
+    /// Number of registered fonts.
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
 }
 
 /// Per-block MSDF glyph data.

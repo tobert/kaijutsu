@@ -154,7 +154,6 @@ impl Plugin for BlockRenderPlugin {
             .init_resource::<ExtractedMsdfAtlas>()
             .init_resource::<ExtractedMsdfBlockData>()
             .init_resource::<ExtractedMsdfRenderParams>()
-            .add_systems(Startup, init_msdf_renderer)
             .add_systems(
                 ExtractSchedule,
                 (
@@ -199,6 +198,19 @@ impl Plugin for BlockRenderPlugin {
         app.insert_resource(GpuTextureLimits {
             max_texture_dim: max_dim,
         });
+
+        // Initialize MSDF renderer in the render world (needs RenderDevice + PipelineCache).
+        if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+            let renderer = {
+                let world = render_app.world();
+                let device = world.resource::<RenderDevice>();
+                let pipeline_cache = world.resource::<PipelineCache>();
+                let asset_server = world.resource::<AssetServer>();
+                MsdfBlockRenderer::init(device, pipeline_cache, asset_server)
+            };
+            render_app.insert_resource(renderer);
+            info!("Initialized MSDF block renderer in render world");
+        }
     }
 }
 
@@ -207,20 +219,6 @@ fn init_msdf_atlas(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     let atlas = crate::text::msdf::MsdfAtlas::new(&mut images, 1024, 1024);
     commands.insert_resource(atlas);
     info!("Initialized MSDF atlas (1024x1024)");
-}
-
-/// Initialize the MSDF renderer in the render world.
-///
-/// Must run after the render app is initialized with a device.
-fn init_msdf_renderer(
-    mut commands: Commands,
-    device: Res<RenderDevice>,
-    pipeline_cache: Res<PipelineCache>,
-    asset_server: Res<AssetServer>,
-) {
-    let renderer = MsdfBlockRenderer::init(&device, &pipeline_cache, &asset_server);
-    commands.insert_resource(renderer);
-    info!("Initialized MSDF block renderer");
 }
 
 // ============================================================================

@@ -53,11 +53,29 @@ fn poll_msdf_generator(
 
     // Queue any pending glyph requests
     if !atlas.pending.is_empty() {
+        let pending_count = atlas.pending.len();
         generator.queue_pending(atlas, &font_data_map);
+        if pending_count > 0 {
+            trace!(
+                "MSDF generator: queued {} pending glyphs, {} font(s) registered",
+                pending_count,
+                font_data_map.len(),
+            );
+        }
     }
 
     // Poll completed generation tasks
+    let before = atlas.regions.len();
     generator.poll_completed(atlas);
+    let after = atlas.regions.len();
+    if after > before {
+        info!(
+            "MSDF atlas: {} new glyphs, {} total, version {}",
+            after - before,
+            after,
+            atlas.version,
+        );
+    }
 
     // Sync atlas pixels to GPU texture
     atlas.sync_to_gpu(&mut images);
