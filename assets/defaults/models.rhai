@@ -60,9 +60,9 @@ let providers = #{
     // Ollama (Local)
     // No API key required - connects to local server
     ollama: #{
-        enabled: false,
+        enabled: true,
         base_url: "http://localhost:11434",
-        default_model: "qwen2.5-coder:7b",
+        default_model: "qwen3.5:9b-bf16",
         // Local models may not handle all tools safely - be selective
         default_tools: #{ type: "deny", tools: ["bash", "shell"] },
     },
@@ -87,9 +87,10 @@ let model_aliases = #{
     "smart": #{ provider: "anthropic", model: "claude-opus-4-5-20251101" },
     "best": #{ provider: "anthropic", model: "claude-opus-4-5-20251101" },
 
-    // Local models (when ollama is enabled)
-    "local": #{ provider: "ollama", model: "qwen2.5-coder:7b" },
-    "offline": #{ provider: "ollama", model: "qwen2.5-coder:7b" },
+    // Local models (ollama)
+    "local": #{ provider: "ollama", model: "qwen3.5:9b-bf16" },
+    "offline": #{ provider: "ollama", model: "qwen3.5:9b-bf16" },
+    "local-big": #{ provider: "ollama", model: "qwen3.5:35b-a3b" },
 };
 
 // ============================================================================
