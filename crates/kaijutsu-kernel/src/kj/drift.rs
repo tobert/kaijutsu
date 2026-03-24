@@ -1,7 +1,7 @@
 //! Drift subcommands: push, flush, queue, cancel.
 
 use kaijutsu_crdt::DriftKind;
-use kaijutsu_types::EdgeKind;
+use kaijutsu_types::{ContentType, EdgeKind};
 
 use super::format::format_drift_queue;
 use super::refs;
@@ -21,7 +21,7 @@ impl KjDispatcher {
             "queue" | "q" => self.drift_queue().await,
             "cancel" => self.drift_cancel(argv).await,
             "history" => self.drift_history(argv, caller),
-            "help" | "--help" | "-h" => KjResult::ok_ephemeral(self.drift_help(), "text/markdown"),
+            "help" | "--help" | "-h" => KjResult::ok_ephemeral(self.drift_help(), ContentType::Markdown),
             other => KjResult::Err(format!(
                 "kj drift: unknown subcommand '{}'\n\n{}",
                 other,

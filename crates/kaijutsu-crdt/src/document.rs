@@ -16,8 +16,8 @@ use diamond_types_extended::{
 
 use crate::content::order_midpoint;
 use crate::{
-    BlockId, BlockKind, BlockSnapshot, ContextId, CrdtError, MAX_DAG_DEPTH, PrincipalId, Result,
-    Role, Status, ToolKind,
+    BlockId, BlockKind, BlockSnapshot, ContentType, ContextId, CrdtError, MAX_DAG_DEPTH,
+    PrincipalId, Result, Role, Status, ToolKind,
 };
 
 // =========================================================================
@@ -430,8 +430,9 @@ impl BlockDocument {
             source_model,
             drift_kind,
             file_path: None,    // Legacy document doesn't track file_path
-            content_type: None, // Legacy document predates content_type
-            order_key: None,    // Legacy document uses DTE-backed ordering
+            content_type: ContentType::Plain, // Legacy document predates content_type
+            content_type_at: 0,               // Legacy document predates content_type
+            order_key: None,                  // Legacy document uses DTE-backed ordering
             updated_at: 0,      // Legacy document predates Lamport propagation
             status_at: 0,
             collapsed_at: 0,

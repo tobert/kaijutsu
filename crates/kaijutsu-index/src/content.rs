@@ -61,7 +61,7 @@ pub fn extract_context_content(blocks: &[BlockSnapshot], max_chars: usize) -> (S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kaijutsu_types::{BlockId, ContextId, PrincipalId, Status};
+    use kaijutsu_types::{BlockId, ContentType, ContextId, PrincipalId, Status};
 
     fn test_block(role: Role, kind: BlockKind, content: &str) -> BlockSnapshot {
         let ctx = ContextId::new();
@@ -93,7 +93,7 @@ mod tests {
             file_path: None,
             tool_use_id: None,
             output: None,
-            content_type: None,
+            content_type: ContentType::Plain,
             order_key: None,
             updated_at: 0,
             status_at: 0,
@@ -101,6 +101,7 @@ mod tests {
             ephemeral_at: 0,
             compacted_at: 0,
             tool_meta_at: 0,
+            content_type_at: 0,
         }
     }
 

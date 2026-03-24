@@ -16,7 +16,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::Mutex as TokioMutex;
 
-use kaijutsu_crdt::{BlockKind, ContextId, PrincipalId, Role, Status, ToolKind};
+use kaijutsu_crdt::{BlockKind, ContentType, ContextId, PrincipalId, Role, Status, ToolKind};
 use kaijutsu_kernel::SharedBlockStore;
 
 use crate::RemoteState;
@@ -299,6 +299,7 @@ impl HookListener {
             BlockKind::Text,
             content,
             Status::Done,
+            ContentType::Plain,
             Some(PrincipalId::system()),
         ) {
             tracing::warn!("Hook insert_block error: {e}");

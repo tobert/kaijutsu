@@ -20,7 +20,7 @@ use parking_lot::RwLock;
 use kaijutsu_crdt::block_store::{
     BlockStore as CrdtBlockStore, ForkBlockFilter, StoreSnapshot, SyncPayload,
 };
-use kaijutsu_crdt::{BlockId, BlockKind, BlockSnapshot, Role, Status, ToolKind};
+use kaijutsu_crdt::{BlockId, BlockKind, BlockSnapshot, ContentType, Role, Status, ToolKind};
 use kaijutsu_types::BlockFilter;
 use kaijutsu_types::{ContextId, DocKind, KernelId, PrincipalId, WorkspaceId};
 
@@ -648,9 +648,10 @@ impl BlockStore {
         kind: BlockKind,
         content: impl Into<String>,
         status: Status,
+        content_type: ContentType,
     ) -> BlockStoreResult<BlockId> {
         self.insert_block_as(
-            context_id, parent_id, after, role, kind, content, status, None,
+            context_id, parent_id, after, role, kind, content, status, content_type, None,
         )
     }
 
@@ -667,6 +668,7 @@ impl BlockStore {
         kind: BlockKind,
         content: impl Into<String>,
         status: Status,
+        content_type: ContentType,
         agent_id: Option<PrincipalId>,
     ) -> BlockStoreResult<BlockId> {
         let after_id = after.cloned();
@@ -686,7 +688,7 @@ impl BlockStore {
 
             let block_id = entry
                 .doc
-                .insert_block(parent_id, after, role, kind, content, status)?;
+                .insert_block(parent_id, after, role, kind, content, status, content_type)?;
             let snapshot = entry
                 .doc
                 .get_block_snapshot(&block_id)
@@ -1058,18 +1060,26 @@ impl BlockStore {
         Ok(())
     }
 
-    /// Set the content_type hint on a block (e.g., "text/markdown", "image/svg+xml").
+    /// Set the content_type hint on a block (e.g., Markdown, Svg, Abc).
     pub fn set_content_type(
         &self,
         context_id: ContextId,
         block_id: &BlockId,
-        content_type: Option<String>,
+        content_type: ContentType,
     ) -> BlockStoreResult<()> {
         let mut entry = self
             .get_mut(context_id)
             .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
         entry.doc.set_content_type(block_id, content_type)?;
         entry.touch(self.agent_id());
+        drop(entry);
+
+        self.emit(BlockFlow::MetadataChanged {
+            context_id,
+            block_id: *block_id,
+            source: OpSource::Local,
+        });
+
         Ok(())
     }
 
@@ -2007,6 +2017,7 @@ mod tests {
                 BlockKind::Text,
                 "hello world",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         assert_eq!(store.get_content(ctx).unwrap(), "hello world");
@@ -2039,6 +2050,7 @@ mod tests {
                 BlockKind::Thinking,
                 "Let me think...",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -2052,6 +2064,7 @@ mod tests {
                 BlockKind::Text,
                 "Here's my answer",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -2088,6 +2101,7 @@ mod tests {
                 BlockKind::Text,
                 "fn main() {}",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -2155,6 +2169,7 @@ mod tests {
                 BlockKind::Thinking,
                 "thinking...",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         store
@@ -2166,6 +2181,7 @@ mod tests {
                 BlockKind::Text,
                 "response",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -2212,6 +2228,7 @@ mod tests {
                 BlockKind::ToolCall,
                 "{}",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -2258,6 +2275,7 @@ mod tests {
                         BlockKind::Text,
                         &text,
                         Status::Done,
+                        ContentType::Plain,
                     );
                 }
             });
@@ -2319,6 +2337,7 @@ mod tests {
                         BlockKind::Text,
                         &text,
                         Status::Done,
+                        ContentType::Plain,
                     );
                 }
             });
@@ -2361,6 +2380,7 @@ mod tests {
                 BlockKind::Text,
                 "initial content",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -2444,6 +2464,7 @@ mod tests {
                 BlockKind::Text,
                 "Hello from server",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -2534,6 +2555,7 @@ mod tests {
                     BlockKind::Text,
                     format!("Message {}", i),
                     Status::Done,
+                    ContentType::Plain,
                 )
                 .unwrap();
 
@@ -2578,6 +2600,7 @@ mod tests {
                 BlockKind::Text,
                 "",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         let _ = sub.try_recv(); // drain insert event
@@ -2639,6 +2662,7 @@ mod tests {
                 BlockKind::Text,
                 "hello from remote",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -2693,6 +2717,7 @@ mod tests {
                 BlockKind::Text,
                 "initial",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -2761,6 +2786,7 @@ mod tests {
                 BlockKind::Text,
                 "",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         store.set_status(ctx, &block_id, Status::Running).unwrap();

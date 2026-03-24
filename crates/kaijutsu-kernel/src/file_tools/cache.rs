@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use kaijutsu_crdt::{BlockId, BlockKind, ContextId, Role, Status};
+use kaijutsu_crdt::{BlockId, BlockKind, ContentType, ContextId, Role, Status};
 use parking_lot::RwLock;
 
 use crate::block_store::SharedBlockStore;
@@ -97,6 +97,7 @@ impl FileDocumentCache {
                     BlockKind::Text,
                     text,
                     Status::Done,
+                    ContentType::Plain,
                 )
                 .map_err(|e| format!("failed to insert block for {}: {}", path, e))?,
             Err(_) => {
@@ -338,6 +339,7 @@ impl FileDocumentCache {
                 BlockKind::Text,
                 content,
                 Status::Done,
+                ContentType::Plain,
             )
             .map_err(|e| format!("failed to insert block for {}: {}", path, e))?;
 

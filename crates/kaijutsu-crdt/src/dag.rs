@@ -270,7 +270,7 @@ impl<'a> Iterator for BfsIterator<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BlockKind, ContextId, PrincipalId, Role, Status};
+    use crate::{BlockKind, ContentType, ContextId, PrincipalId, Role, Status};
 
     fn test_doc() -> BlockDocument {
         BlockDocument::new(ContextId::new(), PrincipalId::new())
@@ -438,7 +438,8 @@ mod tests {
             source_model: None,
             drift_kind: None,
             file_path: None,
-            content_type: None,
+            content_type: ContentType::Plain,
+            content_type_at: 0,
             order_key: None,
             updated_at: 0,
             status_at: 0,
@@ -470,7 +471,8 @@ mod tests {
             source_model: None,
             drift_kind: None,
             file_path: None,
-            content_type: None,
+            content_type: ContentType::Plain,
+            content_type_at: 0,
             order_key: None,
             updated_at: 0,
             status_at: 0,

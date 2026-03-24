@@ -7,7 +7,7 @@
 
 use diamond_types_extended::{AgentId, Document, Frontier, SerializedOpsOwned, Uuid};
 
-use crate::{BlockHeader, BlockId, BlockSnapshot, PrincipalId, Status};
+use crate::{BlockHeader, BlockId, BlockSnapshot, ContentType, PrincipalId, Status};
 
 /// Value-based tiebreaker for per-field LWW merge.
 ///
@@ -105,7 +105,6 @@ pub struct BlockContent {
     source_model: Option<String>,
     drift_kind: Option<crate::DriftKind>,
     file_path: Option<String>,
-    content_type: Option<String>,
 
     /// Whether this block is collapsed (only meaningful for Thinking blocks).
     collapsed: bool,
@@ -143,7 +142,6 @@ impl BlockContent {
             source_model: None,
             drift_kind: None,
             file_path: None,
-            content_type: None,
             collapsed: false,
             ephemeral: false,
             deleted: false,
@@ -189,7 +187,6 @@ impl BlockContent {
         block.source_model = snap.source_model.clone();
         block.drift_kind = snap.drift_kind;
         block.file_path = snap.file_path.clone();
-        block.content_type = snap.content_type.clone();
         block.collapsed = snap.collapsed;
         block.ephemeral = snap.ephemeral;
         block
@@ -228,7 +225,6 @@ impl BlockContent {
             source_model: snap.source_model.clone(),
             drift_kind: snap.drift_kind,
             file_path: snap.file_path.clone(),
-            content_type: snap.content_type.clone(),
             collapsed: snap.collapsed,
             ephemeral: snap.ephemeral,
             deleted: false,
@@ -380,12 +376,14 @@ impl BlockContent {
         self.tool_use_id = id;
     }
 
-    pub fn content_type(&self) -> Option<&str> {
-        self.content_type.as_deref()
+    pub fn content_type(&self) -> ContentType {
+        self.header.content_type
     }
 
-    pub fn set_content_type(&mut self, ct: Option<String>) {
-        self.content_type = ct;
+    pub fn set_content_type(&mut self, ct: ContentType, lamport_ts: u64) {
+        self.header.content_type = ct;
+        self.header.content_type_at = lamport_ts;
+        self.header.updated_at = self.header.max_field_ts();
     }
 
     pub fn ephemeral(&self) -> bool {
@@ -454,7 +452,7 @@ impl BlockContent {
             source_model: self.source_model.clone(),
             drift_kind: self.drift_kind,
             file_path: self.file_path.clone(),
-            content_type: self.content_type.clone(),
+            content_type: self.header.content_type,
             order_key: Some(self.order_key.clone()),
             updated_at: self.header.updated_at,
             status_at: self.header.status_at,
@@ -462,6 +460,7 @@ impl BlockContent {
             ephemeral_at: self.header.ephemeral_at,
             compacted_at: self.header.compacted_at,
             tool_meta_at: self.header.tool_meta_at,
+            content_type_at: self.header.content_type_at,
         }
     }
 
@@ -528,6 +527,17 @@ impl BlockContent {
             self.header.exit_code = remote.exit_code;
             self.header.is_error = remote.is_error;
             self.header.tool_meta_at = remote.tool_meta_at;
+        }
+
+        // content_type
+        if field_wins(
+            remote.content_type_at,
+            self.header.content_type_at,
+            &remote.content_type,
+            &self.header.content_type,
+        ) {
+            self.header.content_type = remote.content_type;
+            self.header.content_type_at = remote.content_type_at;
         }
 
         // Recompute aggregate timestamp

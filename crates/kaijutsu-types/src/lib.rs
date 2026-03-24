@@ -58,7 +58,8 @@ pub use kaish_types::output::{EntryType as OutputEntryType, OutputData, OutputNo
 // Re-export primary types at crate root for convenience.
 pub use block::{
     BlockEventFilter, BlockFilter, BlockFlowKind, BlockHeader, BlockId, BlockKind, BlockQuery,
-    BlockSnapshot, BlockSnapshotBuilder, DriftKind, MAX_DAG_DEPTH, Role, Status, ToolKind,
+    BlockSnapshot, BlockSnapshotBuilder, ContentType, DriftKind, MAX_DAG_DEPTH, Role, Status,
+    ToolKind,
 };
 pub use compaction::CompactionBoundary;
 pub use context::{Context, fork_lineage};

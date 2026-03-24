@@ -77,7 +77,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
 use kaijutsu_client::{ActorHandle, ServerEvent, SshConfig, SyncManager, connect_ssh, spawn_actor};
-use kaijutsu_crdt::{BlockId, ContextId, ConversationDAG, PrincipalId, Status};
+use kaijutsu_crdt::{BlockId, ContentType, ContextId, ConversationDAG, PrincipalId, Status};
 use kaijutsu_kernel::block_store::DocumentKind as DocKind;
 use kaijutsu_kernel::{SharedBlockStore, shared_block_flow_bus, shared_block_store};
 
@@ -837,6 +837,7 @@ impl KaijutsuMcp {
             kind,
             &content,
             Status::Done,
+            ContentType::Plain,
             Some(self.session_principal),
         ) {
             Ok(block_id) => {
@@ -3329,7 +3330,7 @@ mod tests {
     // SyncPayload (postcard-serialized) ops, matching the real sync protocol.
     // =========================================================================
 
-    use kaijutsu_crdt::{BlockId, BlockKind, BlockSnapshot, ContextId, PrincipalId, Role, Status};
+    use kaijutsu_crdt::{BlockId, BlockKind, BlockSnapshot, ContentType, ContextId, PrincipalId, Role, Status};
     use std::collections::HashMap;
 
     /// Helper: create a synced client/server pair with one block ("Hello from server").
@@ -3359,6 +3360,7 @@ mod tests {
                 BlockKind::Text,
                 "Hello from server",
                 Status::Done,
+                ContentType::Plain,
             )
             .expect("insert block on server");
 
@@ -3408,6 +3410,7 @@ mod tests {
                 BlockKind::Text,
                 "New block from server",
                 Status::Done,
+                ContentType::Plain,
             )
             .expect("insert");
         let ops_bytes = server_ops_bytes(&server, ctx_id, &pre_frontier);
@@ -3554,6 +3557,7 @@ mod tests {
                 BlockKind::Text,
                 "Should not appear",
                 Status::Done,
+                ContentType::Plain,
             )
             .expect("insert");
         let ops_bytes = server_ops_bytes(&server, ctx_id, &pre_frontier);
@@ -3602,6 +3606,7 @@ mod tests {
                 BlockKind::Text,
                 "Version bump test",
                 Status::Done,
+                ContentType::Plain,
             )
             .expect("insert");
         let ops_bytes = server_ops_bytes(&server, ctx_id, &pre_frontier);
@@ -3647,6 +3652,7 @@ mod tests {
                     BlockKind::Text,
                     &format!("Block {i}"),
                     Status::Done,
+                    ContentType::Plain,
                 )
                 .expect("insert");
             let ops = server_ops_bytes(&server, ctx_id, &pre);
@@ -3852,6 +3858,7 @@ mod tests {
                 BlockKind::Text,
                 "Post-reset block",
                 Status::Done,
+                ContentType::Plain,
             )
             .expect("insert");
         let ops_bytes = server_ops_bytes(&server, ctx_id, &pre_frontier);

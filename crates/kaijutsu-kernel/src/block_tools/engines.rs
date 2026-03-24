@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::block_store::SharedBlockStore;
 use crate::tools::{ExecResult, ExecutionEngine, ToolContext};
-use kaijutsu_crdt::{BlockId, BlockKind, Role, Status};
+use kaijutsu_crdt::{BlockId, BlockKind, ContentType, Role, Status};
 use kaijutsu_types::ContextId;
 
 use super::error::{EditError, Result};
@@ -290,6 +290,7 @@ impl BlockCreateEngine {
                 kind,
                 &content,
                 Status::Done,
+                ContentType::Plain,
                 Some(ctx.principal_id),
             )
             .map_err(|e| EditError::StoreError(e.to_string()))?;
@@ -1565,6 +1566,7 @@ mod tests {
                 BlockKind::Text,
                 "hello",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -1595,6 +1597,7 @@ mod tests {
                 BlockKind::Text,
                 "line1\nline3\n",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -1626,6 +1629,7 @@ mod tests {
                 BlockKind::Text,
                 "hello\nworld\n",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -1662,6 +1666,7 @@ mod tests {
                 BlockKind::Text,
                 "fn main() {\n    println!(\"Hi\");\n}",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -1688,6 +1693,7 @@ mod tests {
                 BlockKind::Text,
                 "apple\nbanana\napricot\ncherry\n",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -1717,6 +1723,7 @@ mod tests {
                 BlockKind::Text,
                 "user message",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         store
@@ -1728,6 +1735,7 @@ mod tests {
                 BlockKind::Thinking,
                 "thinking...",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -1753,6 +1761,7 @@ mod tests {
                 BlockKind::Text,
                 "user message",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         store
@@ -1764,6 +1773,7 @@ mod tests {
                 BlockKind::Thinking,
                 "thinking...",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -1789,6 +1799,7 @@ mod tests {
                 BlockKind::ToolCall,
                 "{}",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -1826,6 +1837,7 @@ mod tests {
                 BlockKind::Text,
                 "hello world\nfoo bar\nbaz",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         store
@@ -1837,6 +1849,7 @@ mod tests {
                 BlockKind::Text,
                 "hello rust\nfoo qux",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         store
@@ -1848,6 +1861,7 @@ mod tests {
                 BlockKind::Text,
                 "hello python\nbar baz",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -1908,6 +1922,7 @@ mod tests {
                 BlockKind::Text,
                 "aaa\nbbb\nccc\n",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         let engine = BlockEditEngine::new(store.clone());

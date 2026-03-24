@@ -16,7 +16,7 @@ use vello::peniko::{Brush, Fill};
 
 use std::sync::Arc;
 
-use kaijutsu_types::{OutputData, OutputEntryType};
+use kaijutsu_types::{ContentType, OutputData, OutputEntryType};
 
 use super::components::bevy_color_to_brush;
 use super::markdown::{MarkdownColors, RichSpan, parse_to_rich_spans};
@@ -338,72 +338,70 @@ fn extract_fenced_block<'a>(text: &'a str, lang: &str) -> Option<&'a str> {
 /// declared type directly. Falls back to sniffing when `content_type` is `None`.
 #[allow(dead_code)]
 pub fn detect_rich_content(text: &str, _version: u64) -> Option<RichContent> {
-    detect_rich_content_typed(text, 0, None, None)
+    detect_rich_content_typed(text, 0, ContentType::Plain, None)
 }
 
-/// Detect rich content with an optional content type hint.
+/// Detect rich content with a content type hint.
 ///
-/// When `content_type` is `Some`, the declared type takes priority over sniffing:
-/// - `"image/svg+xml"` → parse as SVG directly
-/// - `"text/markdown"` → parse as markdown directly
-/// - Other types → fall through to heuristic detection
+/// When `content_type` is a specific variant, the declared type takes priority over sniffing:
+/// - `ContentType::Svg` → parse as SVG directly
+/// - `ContentType::Markdown` → parse as markdown directly
+/// - `ContentType::Abc` → parse as ABC notation directly
+/// - `ContentType::Plain` → fall through to heuristic detection
 ///
-/// When `content_type` is `None`, tries sparkline, then SVG, then markdown.
+/// With `ContentType::Plain`, tries sparkline, then SVG, then markdown heuristics.
 ///
 /// `svg_fontdb` provides fonts for SVG `<text>` rendering. Pass `None` if
 /// the resource isn't available (text elements will be dropped).
 pub fn detect_rich_content_typed(
     text: &str,
     _version: u64,
-    content_type: Option<&str>,
+    content_type: ContentType,
     svg_fontdb: Option<&super::SvgFontDb>,
 ) -> Option<RichContent> {
     // If content type is declared, use it directly
-    if let Some(ct) = content_type {
-        match ct {
-            "image/svg+xml" => {
-                if let Some((scene, width, height, source)) = try_parse_svg(text, svg_fontdb) {
-                    return Some(RichContent {
-                        kind: RichContentKind::Svg {
-                            scene,
-                            width,
-                            height,
-                            source,
-                            rendered_at_dpi: 1.0,
-                        },
-                    });
-                }
-            }
-            "text/markdown" => {
-                let spans = parse_to_rich_spans(text);
-                let plain_text: String = spans.iter().map(|s| s.text.as_str()).collect();
+    match content_type {
+        ContentType::Svg => {
+            if let Some((scene, width, height, source)) = try_parse_svg(text, svg_fontdb) {
                 return Some(RichContent {
-                    kind: RichContentKind::Markdown { spans, plain_text },
-
-                });
-            }
-            "text/vnd.abc" => {
-                let result = kaijutsu_abc::parse(text);
-                if result.has_errors() {
-                    // Fall back to summary on parse error
-                    let summary = abc_summary(text);
-                    let spans = parse_to_rich_spans(&summary);
-                    return Some(RichContent {
-                        kind: RichContentKind::Markdown {
-                            spans,
-                            plain_text: summary,
-                        },
-                    });
-                }
-                return Some(RichContent {
-                    kind: RichContentKind::Abc {
-                        source: Arc::new(text.to_string()),
-                        tune: Arc::new(result.value),
+                    kind: RichContentKind::Svg {
+                        scene,
+                        width,
+                        height,
+                        source,
+                        rendered_at_dpi: 1.0,
                     },
                 });
             }
-            _ => {} // Unknown content types fall through to heuristic detection
         }
+        ContentType::Markdown => {
+            let spans = parse_to_rich_spans(text);
+            let plain_text: String = spans.iter().map(|s| s.text.as_str()).collect();
+            return Some(RichContent {
+                kind: RichContentKind::Markdown { spans, plain_text },
+            });
+        }
+        ContentType::Abc => {
+            let result = kaijutsu_abc::parse(text);
+            if result.has_errors() {
+                // Fall back to summary on parse error
+                let summary = abc_summary(text);
+                let spans = parse_to_rich_spans(&summary);
+                return Some(RichContent {
+                    kind: RichContentKind::Markdown {
+                        spans,
+                        plain_text: summary,
+                    },
+                });
+            }
+            return Some(RichContent {
+                kind: RichContentKind::Abc {
+                    source: Arc::new(text.to_string()),
+                    tune: Arc::new(result.value),
+                },
+            });
+        }
+        ContentType::Plain => {} // Fall through to heuristic detection
     }
     // Try sparkline first — more specific pattern
     if let Some(data) = try_parse_sparkline(text) {

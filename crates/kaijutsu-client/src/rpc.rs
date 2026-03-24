@@ -6,8 +6,8 @@ use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
 use futures::AsyncReadExt;
 use kaijutsu_crdt::{ContextId, KernelId};
 use kaijutsu_types::{
-    BlockFilter, BlockId, BlockKind, BlockQuery, BlockSnapshot, BlockSnapshotBuilder, DriftKind,
-    PrincipalId, Role, Status, ToolKind,
+    BlockFilter, BlockId, BlockKind, BlockQuery, BlockSnapshot, BlockSnapshotBuilder, ContentType,
+    DriftKind, PrincipalId, Role, Status, ToolKind,
 };
 use russh::ChannelStream;
 use russh::client::Msg;
@@ -966,6 +966,7 @@ impl KernelHandle {
                 crate::kaijutsu_capnp::DriftKind::Merge => DriftKind::Merge,
                 crate::kaijutsu_capnp::DriftKind::Distill => DriftKind::Distill,
                 crate::kaijutsu_capnp::DriftKind::Commit => DriftKind::Commit,
+                crate::kaijutsu_capnp::DriftKind::Notification => DriftKind::Notification,
             };
             result.push(StagedDriftInfo {
                 id: entry.get_id(),
@@ -1977,6 +1978,7 @@ pub(crate) fn parse_block_snapshot(
             crate::kaijutsu_capnp::DriftKind::Merge => DriftKind::Merge,
             crate::kaijutsu_capnp::DriftKind::Distill => DriftKind::Distill,
             crate::kaijutsu_capnp::DriftKind::Commit => DriftKind::Commit,
+            crate::kaijutsu_capnp::DriftKind::Notification => DriftKind::Notification,
         };
         builder = builder.drift_kind(drift_kind);
     }
@@ -2017,7 +2019,7 @@ pub(crate) fn parse_block_snapshot(
         && let Ok(s) = ct.to_str()
         && !s.is_empty()
     {
-        builder = builder.content_type(s);
+        builder = builder.content_type(ContentType::from_mime(s));
     }
 
     // Ephemeral flag (human-only, excluded from LLM hydration)

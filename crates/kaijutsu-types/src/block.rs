@@ -151,6 +151,8 @@ pub struct BlockHeader {
     pub exit_code: Option<i32>,
     /// Whether this is an error result.
     pub is_error: bool,
+    /// Content type for rendering (LWW via `content_type_at`).
+    pub content_type: ContentType,
 
     // ── Per-field LWW timestamps ────────────────────────────────────────
     // Each mutable field group has its own Lamport timestamp for independent
@@ -165,6 +167,8 @@ pub struct BlockHeader {
     pub compacted_at: u64,
     /// Lamport timestamp for `tool_kind`, `exit_code`, `is_error` fields.
     pub tool_meta_at: u64,
+    /// Lamport timestamp for `content_type` field.
+    pub content_type_at: u64,
 }
 
 impl BlockHeader {
@@ -184,11 +188,13 @@ impl BlockHeader {
             tool_kind: snap.tool_kind,
             exit_code: snap.exit_code,
             is_error: snap.is_error,
+            content_type: snap.content_type,
             status_at: snap.status_at,
             collapsed_at: snap.collapsed_at,
             ephemeral_at: snap.ephemeral_at,
             compacted_at: snap.compacted_at,
             tool_meta_at: snap.tool_meta_at,
+            content_type_at: snap.content_type_at,
         }
     }
 
@@ -199,6 +205,7 @@ impl BlockHeader {
             .max(self.ephemeral_at)
             .max(self.compacted_at)
             .max(self.tool_meta_at)
+            .max(self.content_type_at)
     }
 
     /// Check if this is a root block (no parent).
@@ -266,6 +273,53 @@ impl Role {
 impl std::fmt::Display for Role {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.as_str())
+    }
+}
+
+/// Content type for block rendering.
+///
+/// Discriminant order matters for LWW tiebreaking (same pattern as `Status`).
+/// When two peers write at the same Lamport timestamp, the greater value wins.
+/// `Abc > Svg > Markdown > Plain` — richer types win ties.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentType {
+    /// No explicit type — heuristic detection still runs.
+    #[default]
+    Plain,
+    /// text/markdown
+    Markdown,
+    /// image/svg+xml
+    Svg,
+    /// text/vnd.abc
+    Abc,
+}
+
+impl ContentType {
+    /// Convert from a MIME type string.
+    pub fn from_mime(mime: &str) -> Self {
+        match mime {
+            "text/markdown" => ContentType::Markdown,
+            "image/svg+xml" => ContentType::Svg,
+            "text/vnd.abc" => ContentType::Abc,
+            _ => ContentType::Plain,
+        }
+    }
+
+    /// Convert to a MIME type string.
+    pub fn as_mime(&self) -> &'static str {
+        match self {
+            ContentType::Plain => "text/plain",
+            ContentType::Markdown => "text/markdown",
+            ContentType::Svg => "image/svg+xml",
+            ContentType::Abc => "text/vnd.abc",
+        }
+    }
+}
+
+impl std::fmt::Display for ContentType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_mime())
     }
 }
 
@@ -587,11 +641,10 @@ pub struct BlockSnapshot {
     pub file_path: Option<String>,
 
     // Content type hint
-    /// MIME content type (e.g., "text/markdown", "image/svg+xml").
-    /// When set, consumers can skip heuristic detection and use the declared type directly.
-    /// Producers that know what they're generating should set this at creation time.
+    /// Content type for rendering. When not `Plain`, consumers skip heuristic
+    /// detection and use the declared type directly.
     #[serde(default)]
-    pub content_type: Option<String>,
+    pub content_type: ContentType,
 
     // Ordering
     /// Fractional index for sibling ordering (base-62 lexicographic).
@@ -623,6 +676,9 @@ pub struct BlockSnapshot {
     /// Lamport timestamp for `tool_kind`, `exit_code`, `is_error` fields.
     #[serde(default)]
     pub tool_meta_at: u64,
+    /// Lamport timestamp for `content_type` field.
+    #[serde(default)]
+    pub content_type_at: u64,
 }
 
 impl BlockSnapshot {
@@ -665,7 +721,7 @@ impl BlockSnapshot {
             source_model: None,
             drift_kind: None,
             file_path: None,
-            content_type: None,
+            content_type: ContentType::Plain,
             order_key: None,
             updated_at: 0,
             status_at: 0,
@@ -673,6 +729,7 @@ impl BlockSnapshot {
             ephemeral_at: 0,
             compacted_at: 0,
             tool_meta_at: 0,
+            content_type_at: 0,
         }
     }
 
@@ -705,7 +762,7 @@ impl BlockSnapshot {
             source_model: None,
             drift_kind: None,
             file_path: None,
-            content_type: None,
+            content_type: ContentType::Plain,
             order_key: None,
             updated_at: 0,
             status_at: 0,
@@ -713,6 +770,7 @@ impl BlockSnapshot {
             ephemeral_at: 0,
             compacted_at: 0,
             tool_meta_at: 0,
+            content_type_at: 0,
         }
     }
 
@@ -757,7 +815,7 @@ impl BlockSnapshot {
             source_model: None,
             drift_kind: None,
             file_path: None,
-            content_type: None,
+            content_type: ContentType::Plain,
             order_key: None,
             updated_at: 0,
             status_at: 0,
@@ -765,6 +823,7 @@ impl BlockSnapshot {
             ephemeral_at: 0,
             compacted_at: 0,
             tool_meta_at: 0,
+            content_type_at: 0,
         }
     }
 
@@ -809,7 +868,7 @@ impl BlockSnapshot {
             source_model: None,
             drift_kind: None,
             file_path: None,
-            content_type: None,
+            content_type: ContentType::Plain,
             order_key: None,
             updated_at: 0,
             status_at: 0,
@@ -817,6 +876,7 @@ impl BlockSnapshot {
             ephemeral_at: 0,
             compacted_at: 0,
             tool_meta_at: 0,
+            content_type_at: 0,
         }
     }
 
@@ -865,7 +925,7 @@ impl BlockSnapshot {
             source_model: None,
             drift_kind: None,
             file_path: None,
-            content_type: None,
+            content_type: ContentType::Plain,
             order_key: None,
             updated_at: 0,
             status_at: 0,
@@ -873,6 +933,7 @@ impl BlockSnapshot {
             ephemeral_at: 0,
             compacted_at: 0,
             tool_meta_at: 0,
+            content_type_at: 0,
         }
     }
 
@@ -912,7 +973,7 @@ impl BlockSnapshot {
             source_model,
             drift_kind: Some(drift_kind),
             file_path: None,
-            content_type: None,
+            content_type: ContentType::Plain,
             order_key: None,
             updated_at: 0,
             status_at: 0,
@@ -920,6 +981,7 @@ impl BlockSnapshot {
             ephemeral_at: 0,
             compacted_at: 0,
             tool_meta_at: 0,
+            content_type_at: 0,
         }
     }
 
@@ -957,7 +1019,7 @@ impl BlockSnapshot {
             source_model: None,
             drift_kind: None,
             file_path: Some(file_path.into()),
-            content_type: None,
+            content_type: ContentType::Plain,
             order_key: None,
             updated_at: 0,
             status_at: 0,
@@ -965,6 +1027,7 @@ impl BlockSnapshot {
             ephemeral_at: 0,
             compacted_at: 0,
             tool_meta_at: 0,
+            content_type_at: 0,
         }
     }
 
@@ -1070,7 +1133,7 @@ impl BlockSnapshotBuilder {
                 source_model: None,
                 drift_kind: None,
                 file_path: None,
-                content_type: None,
+                content_type: ContentType::Plain,
                 order_key: None,
                 updated_at: 0,
                 status_at: 0,
@@ -1078,6 +1141,7 @@ impl BlockSnapshotBuilder {
                 ephemeral_at: 0,
                 compacted_at: 0,
                 tool_meta_at: 0,
+                content_type_at: 0,
             },
         }
     }
@@ -1175,8 +1239,8 @@ impl BlockSnapshotBuilder {
         self
     }
 
-    pub fn content_type(mut self, ct: impl Into<String>) -> Self {
-        self.snap.content_type = Some(ct.into());
+    pub fn content_type(mut self, ct: ContentType) -> Self {
+        self.snap.content_type = ct;
         self
     }
 

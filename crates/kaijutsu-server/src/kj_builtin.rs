@@ -22,7 +22,7 @@ use kaish_kernel::{ExecContext, Tool};
 
 use kaijutsu_kernel::kj::{KjCaller, KjDispatcher, KjResult};
 #[allow(unused_imports)]
-use kaijutsu_types::{ContextId, PrincipalId, SessionId};
+use kaijutsu_types::{ContentType, ContextId, PrincipalId, SessionId};
 
 use crate::kaish_backend::SharedContextId;
 
@@ -430,7 +430,11 @@ impl Tool for KjBuiltin {
                 ephemeral,
             } => {
                 let mut result = ExecResult::success(message);
-                result.content_type = content_type;
+                result.content_type = if content_type != ContentType::Plain {
+                    Some(content_type.as_mime().to_string())
+                } else {
+                    None
+                };
                 if ephemeral {
                     result
                         .baggage

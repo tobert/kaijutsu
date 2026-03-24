@@ -1,6 +1,6 @@
 //! Workspace subcommands: list, show, create, add, bind, remove.
 
-use kaijutsu_types::WorkspaceId;
+use kaijutsu_types::{ContentType, WorkspaceId};
 
 use crate::kernel_db::{WorkspacePathRow, WorkspaceRow};
 
@@ -21,7 +21,7 @@ impl KjDispatcher {
             "bind" => self.workspace_bind(argv, caller),
             "remove" | "rm" => self.workspace_remove(argv, caller),
             "help" | "--help" | "-h" => {
-                KjResult::ok_ephemeral(self.workspace_help(), "text/markdown")
+                KjResult::ok_ephemeral(self.workspace_help(), ContentType::Markdown)
             }
             other => KjResult::Err(format!(
                 "kj workspace: unknown subcommand '{}'\n\n{}",

@@ -370,14 +370,14 @@ let providers = #{
     ollama: #{
         enabled: false,
         base_url: "http://localhost:11434",
-        default_model: "qwen2.5-coder:7b",
+        default_model: "qwen3.5:9b-bf16",
     },
 };
 
 let model_aliases = #{
     "fast": #{ provider: "anthropic", model: "claude-haiku-4-5-20251001" },
     "smart": #{ provider: "anthropic", model: "claude-opus-4-5-20251101" },
-    "local": #{ provider: "ollama", model: "qwen2.5-coder:7b" },
+    "local": #{ provider: "ollama", model: "qwen3.5:9b-bf16" },
 };
 "#;
 
@@ -426,7 +426,7 @@ let providers = #{
     ollama: #{
         enabled: false,
         base_url: "http://localhost:11434",
-        default_model: "qwen2.5-coder:7b",
+        default_model: "qwen3.5:9b-bf16",
         default_tools: #{
             type: "deny",
             tools: ["shell", "bash"],

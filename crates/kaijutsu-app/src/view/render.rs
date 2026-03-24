@@ -138,7 +138,7 @@ pub fn sync_block_cell_buffers(
             );
         // ToolResult blocks with an explicit content_type (e.g. text/markdown from `kj help`)
         let is_typed_result =
-            block.kind == kaijutsu_crdt::BlockKind::ToolResult && block.content_type.is_some();
+            block.kind == kaijutsu_crdt::BlockKind::ToolResult && block.content_type != kaijutsu_crdt::ContentType::Plain;
         // Rich content for ToolResult blocks with structured OutputData
         let is_output_candidate = block.kind == kaijutsu_crdt::BlockKind::ToolResult
             && block.output.is_some()
@@ -149,7 +149,7 @@ pub fn sync_block_cell_buffers(
             && let Some(rich) = crate::text::rich::detect_rich_content_typed(
                 &text,
                 doc_version,
-                block.content_type.as_deref(),
+                block.content_type,
                 Some(&svg_fontdb),
             )
         {
@@ -173,7 +173,7 @@ pub fn sync_block_cell_buffers(
             && let Some(rich) = crate::text::rich::detect_rich_content_typed(
                 &text,
                 doc_version,
-                block.content_type.as_deref(),
+                block.content_type,
                 Some(&svg_fontdb),
             )
         {

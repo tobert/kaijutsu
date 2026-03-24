@@ -1,6 +1,6 @@
 //! Preset subcommands: list, show, save, remove.
 
-use kaijutsu_types::PresetId;
+use kaijutsu_types::{ContentType, PresetId};
 
 use crate::kernel_db::PresetRow;
 
@@ -18,7 +18,7 @@ impl KjDispatcher {
             "show" => self.preset_show(argv),
             "save" => self.preset_save(argv, caller),
             "remove" | "rm" => self.preset_remove(argv, caller),
-            "help" | "--help" | "-h" => KjResult::ok_ephemeral(self.preset_help(), "text/markdown"),
+            "help" | "--help" | "-h" => KjResult::ok_ephemeral(self.preset_help(), ContentType::Markdown),
             other => KjResult::Err(format!(
                 "kj preset: unknown subcommand '{}'\n\n{}",
                 other,

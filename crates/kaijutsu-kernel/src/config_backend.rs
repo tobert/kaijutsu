@@ -37,7 +37,7 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use parking_lot::RwLock;
 use tokio::sync::mpsc;
 
-use kaijutsu_crdt::{BlockId, BlockKind, ContextId, Role, Status};
+use kaijutsu_crdt::{BlockId, BlockKind, ContentType, ContextId, Role, Status};
 
 use crate::block_store::SharedBlockStore;
 use crate::flows::{ConfigFlow, ConfigSource, OpSource, SharedConfigFlowBus};
@@ -331,6 +331,7 @@ impl ConfigCrdtBackend {
                 BlockKind::Text,
                 &content,
                 Status::Done,
+                ContentType::Plain,
             )
             .map_err(|e| ConfigError::Crdt(e.to_string()))?;
 
@@ -403,6 +404,7 @@ impl ConfigCrdtBackend {
                     BlockKind::Text,
                     &content,
                     Status::Done,
+                    ContentType::Plain,
                 )
                 .map_err(|e| ConfigError::Crdt(e.to_string()))?;
         }
@@ -460,6 +462,7 @@ impl ConfigCrdtBackend {
                     BlockKind::Text,
                     &default_content,
                     Status::Done,
+                    ContentType::Plain,
                 )
                 .map_err(|e| ConfigError::Crdt(e.to_string()))?;
         }
@@ -750,6 +753,7 @@ impl ConfigCrdtBackend {
                             BlockKind::Text,
                             &content,
                             Status::Done,
+                            ContentType::Plain,
                         )
                         .map_err(|e| ConfigError::Crdt(e.to_string()))?;
                 }

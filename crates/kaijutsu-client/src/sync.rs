@@ -571,7 +571,7 @@ impl SyncManager {
 mod tests {
     use super::*;
     use kaijutsu_crdt::block_store::BlockStore as CrdtBlockStore;
-    use kaijutsu_types::{BlockKind, PrincipalId, Role, Status};
+    use kaijutsu_types::{BlockKind, ContentType, PrincipalId, Role, Status};
 
     fn test_context_id() -> ContextId {
         ContextId::new()
@@ -596,6 +596,7 @@ mod tests {
                 BlockKind::Text,
                 "Hello from server",
                 Status::Done,
+                ContentType::Plain,
             )
             .expect("insert block");
         store
@@ -670,6 +671,7 @@ mod tests {
                 BlockKind::Text,
                 "Response from model",
                 Status::Done,
+                ContentType::Plain,
             )
             .expect("insert block");
         let block = server.get_block_snapshot(&block_id).expect("block exists");
@@ -783,6 +785,7 @@ mod tests {
                 BlockKind::Text,
                 "New content",
                 Status::Done,
+                ContentType::Plain,
             )
             .expect("insert block");
         let new_block = server
@@ -840,6 +843,7 @@ mod tests {
                 BlockKind::Text,
                 "Recovery content",
                 Status::Done,
+                ContentType::Plain,
             )
             .expect("insert block");
         let full_snap = snapshot_bytes(&server);
@@ -940,7 +944,7 @@ mod tests {
 
         // Server creates a streaming block and appends text
         let block_id = server
-            .insert_block(None, None, Role::Model, BlockKind::Text, "", Status::Done)
+            .insert_block(None, None, Role::Model, BlockKind::Text, "", Status::Done, ContentType::Plain)
             .expect("insert block");
 
         let chunks = ["Hello", ", ", "world", "!"];
@@ -1005,6 +1009,7 @@ mod tests {
                 BlockKind::Text,
                 "After error",
                 Status::Done,
+                ContentType::Plain,
             )
             .expect("insert block");
         let full_snap = snapshot_bytes(&server);
@@ -1138,6 +1143,7 @@ mod tests {
                 BlockKind::Text,
                 "Client content",
                 Status::Done,
+                ContentType::Plain,
             )
             .expect("insert client block");
 
@@ -1152,6 +1158,7 @@ mod tests {
                 BlockKind::Text,
                 "New content",
                 Status::Done,
+                ContentType::Plain,
             )
             .expect("insert block");
         let new_block = server
@@ -1182,6 +1189,7 @@ mod tests {
                 BlockKind::Text,
                 "Client content",
                 Status::Done,
+                ContentType::Plain,
             )
             .expect("insert client block");
 
@@ -1197,6 +1205,7 @@ mod tests {
                 BlockKind::Text,
                 "Buffered content",
                 Status::Done,
+                ContentType::Plain,
             )
             .expect("insert block");
         let _new_block = server
@@ -1235,7 +1244,7 @@ mod tests {
 
         let server_frontier_before = server.frontier();
         let block_id = server
-            .insert_block(None, None, Role::Model, BlockKind::Text, "", Status::Done)
+            .insert_block(None, None, Role::Model, BlockKind::Text, "", Status::Done, ContentType::Plain)
             .expect("insert block");
         let block_frontier = server.frontier();
 
@@ -1307,6 +1316,7 @@ mod tests {
                 BlockKind::Text,
                 "Valid block",
                 Status::Done,
+                ContentType::Plain,
             )
             .expect("insert block");
         let valid_block_ops = sync_payload_bytes(&server, &frontier_before);

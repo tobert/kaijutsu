@@ -207,7 +207,7 @@ pub struct BatcherStats {
 mod tests {
     use super::*;
     use crate::block_store::shared_block_store;
-    use kaijutsu_crdt::{BlockKind, PrincipalId, Role, Status};
+    use kaijutsu_crdt::{BlockKind, ContentType, PrincipalId, Role, Status};
     use kaijutsu_types::DocKind as DocumentKind;
 
     fn test_context_id() -> ContextId {
@@ -238,6 +238,7 @@ mod tests {
                 BlockKind::Text,
                 "",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -270,6 +271,7 @@ mod tests {
                 BlockKind::Text,
                 "",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -307,6 +309,7 @@ mod tests {
                 BlockKind::Text,
                 "",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         let block2 = cells
@@ -318,6 +321,7 @@ mod tests {
                 BlockKind::Text,
                 "",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -368,6 +372,7 @@ mod tests {
                 BlockKind::Text,
                 "",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 

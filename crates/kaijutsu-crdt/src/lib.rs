@@ -32,7 +32,8 @@ mod ops;
 // Re-export types from kaijutsu-types
 pub use kaijutsu_types::{
     BlockFilter, BlockHeader, BlockId, BlockKind, BlockQuery, BlockSnapshot, BlockSnapshotBuilder,
-    ContextId, DriftKind, KernelId, MAX_DAG_DEPTH, OutputData, OutputEntryType, OutputNode,
+    ContentType, ContextId, DriftKind, KernelId, MAX_DAG_DEPTH, OutputData, OutputEntryType,
+    OutputNode,
     PrefixError, PrefixResolvable, PrincipalId, Role, SessionId, Status, ToolKind,
     resolve_context_prefix,
 };
@@ -295,6 +296,7 @@ mod tests {
                 BlockKind::Text,
                 "Hello, world!",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         assert_eq!(store.full_text(), "Hello, world!");
@@ -318,6 +320,7 @@ mod tests {
                 BlockKind::Text,
                 "First",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         let id2 = store
@@ -328,6 +331,7 @@ mod tests {
                 BlockKind::Text,
                 "Second",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         let _id3 = store
@@ -338,6 +342,7 @@ mod tests {
                 BlockKind::Text,
                 "Third",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 

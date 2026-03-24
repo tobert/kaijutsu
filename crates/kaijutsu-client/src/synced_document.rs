@@ -433,7 +433,7 @@ impl SyncedDocument {
 mod tests {
     use super::*;
     use kaijutsu_crdt::block_store::BlockStore as CrdtBlockStore;
-    use kaijutsu_types::{BlockKind, Role, Status};
+    use kaijutsu_types::{BlockKind, ContentType, Role, Status};
     use std::collections::HashMap;
 
     fn test_context_id() -> ContextId {
@@ -454,6 +454,7 @@ mod tests {
                 BlockKind::Text,
                 "Hello from server",
                 Status::Done,
+                ContentType::Plain,
             )
             .expect("insert block");
         store
@@ -515,6 +516,7 @@ mod tests {
                 BlockKind::Text,
                 "Response",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         let block = server.get_block_snapshot(&block_id).unwrap();
@@ -593,6 +595,7 @@ mod tests {
                 BlockKind::Text,
                 "Hello!",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -670,6 +673,7 @@ mod tests {
                 BlockKind::Text,
                 "Hello",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         let b2 = server
@@ -680,6 +684,7 @@ mod tests {
                 BlockKind::Text,
                 "Hi there",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         let b3 = server
@@ -690,6 +695,7 @@ mod tests {
                 BlockKind::ToolCall,
                 "search",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -714,6 +720,7 @@ mod tests {
                 BlockKind::ToolResult,
                 "found it",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         let _ = b4;
@@ -766,6 +773,7 @@ mod tests {
                 BlockKind::ToolCall,
                 "ls -l",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -779,6 +787,7 @@ mod tests {
                 BlockKind::ToolResult,
                 "",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         let out_block = server.get_block_snapshot(&out_id).unwrap();
@@ -794,6 +803,7 @@ mod tests {
                 BlockKind::ToolCall,
                 "ls -l",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
             snapshot_bytes(&s)
@@ -848,6 +858,7 @@ mod tests {
                 BlockKind::ToolCall,
                 "ls",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -860,6 +871,7 @@ mod tests {
                 BlockKind::ToolResult,
                 "",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         let out_block = server.get_block_snapshot(&out_id).unwrap();
@@ -875,6 +887,7 @@ mod tests {
                 BlockKind::ToolCall,
                 "ls",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
             snapshot_bytes(&s)
@@ -984,6 +997,7 @@ mod tests {
                 BlockKind::Text,
                 "Response",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         let ops = sync_payload_bytes(&server2, &frontier_before);

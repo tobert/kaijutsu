@@ -539,7 +539,7 @@ impl RigProvider {
             ],
             Self::Gemini(_) => vec!["gemini-2.0-flash", "gemini-2.0-pro", "gemini-1.5-pro"],
             Self::OpenAI(_) => vec!["gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo"],
-            Self::Ollama(_) => vec!["qwen2.5-coder:7b", "llama3.2", "codellama"],
+            Self::Ollama(_) => vec!["qwen3.5:9b-bf16", "qwen3.5:35b-a3b"],
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(_) => vec!["mock-model"],
         }

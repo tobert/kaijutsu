@@ -22,7 +22,7 @@
 use crate::block_store::SharedBlockStore;
 use crate::tools::{ExecResult, ExecutionEngine, ToolContext};
 use async_trait::async_trait;
-use kaijutsu_crdt::{BlockKind, Role, Status};
+use kaijutsu_crdt::{BlockKind, ContentType, Role, Status};
 use kaijutsu_types::ContextId;
 use kaijutsu_types::DocKind;
 use rhai::{Dynamic, Engine, Scope};
@@ -201,6 +201,7 @@ impl RhaiEngine {
                     BlockKind::Text,
                     &content,
                     Status::Done,
+                    ContentType::Plain,
                 ) {
                     Ok(_) => {
                         debug!("Rhai: set_content({}, {} chars)", cell_id, content.len());
@@ -304,6 +305,7 @@ impl RhaiEngine {
                         BlockKind::Text,
                         &content,
                         Status::Done,
+                        ContentType::Plain,
                     ),
                     "thinking" => store_insert.insert_block(
                         ctx,
@@ -313,6 +315,7 @@ impl RhaiEngine {
                         BlockKind::Thinking,
                         &content,
                         Status::Done,
+                        ContentType::Plain,
                     ),
                     "tool_use" | "tool_call" => {
                         // Parse content as JSON, or use as tool name
@@ -337,6 +340,7 @@ impl RhaiEngine {
                                 BlockKind::Text,
                                 &content,
                                 Status::Done,
+                                ContentType::Plain,
                             )
                         }
                     }
@@ -348,6 +352,7 @@ impl RhaiEngine {
                         BlockKind::Text,
                         &content,
                         Status::Done,
+                        ContentType::Plain,
                     ),
                 };
 
@@ -552,13 +557,9 @@ impl RhaiEngine {
                 BlockKind::Text,
                 &abc_text,
                 Status::Done,
+                ContentType::Abc,
             ) {
                 Ok(abc_id) => {
-                    if let Some(mut entry) = abc_store.get_mut(context_id) {
-                        let _ = entry
-                            .doc
-                            .set_content_type(&abc_id, Some("text/vnd.abc".into()));
-                    }
                     let key = abc_id.to_key();
                     info!(
                         "Rhai: abc_block inserted {} ({} bytes)",
@@ -590,14 +591,9 @@ impl RhaiEngine {
                 BlockKind::Text,
                 &content,
                 Status::Done,
+                ContentType::Svg,
             ) {
                 Ok(id) => {
-                    // Tag the block with SVG content type so the app skips heuristic detection
-                    if let Some(mut entry) = block_store.get_mut(context_id) {
-                        let _ = entry
-                            .doc
-                            .set_content_type(&id, Some("image/svg+xml".into()));
-                    }
                     let key = id.to_key();
                     info!("Rhai: svg_block inserted {} ({} bytes)", key, content.len());
                     key

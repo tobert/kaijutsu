@@ -10,8 +10,8 @@ use diamond_types_extended::Frontier;
 
 use crate::content::{BlockContent, order_midpoint};
 use crate::{
-    BlockHeader, BlockId, BlockKind, BlockSnapshot, ContextId, CrdtError, DriftKind, MAX_DAG_DEPTH,
-    PrincipalId, Result, Role, Status, ToolKind,
+    BlockHeader, BlockId, BlockKind, BlockSnapshot, ContentType, ContextId, CrdtError, DriftKind,
+    MAX_DAG_DEPTH, PrincipalId, Result, Role, Status, ToolKind,
 };
 
 /// Filter criteria for selective block inclusion during fork.
@@ -346,6 +346,7 @@ impl BlockStore {
         kind: BlockKind,
         content: impl Into<String>,
         status: Status,
+        content_type: ContentType,
     ) -> Result<BlockId> {
         let id = self.new_block_id();
         let content_str = content.into();
@@ -383,6 +384,8 @@ impl BlockStore {
             ephemeral_at: ts,
             compacted_at: ts,
             tool_meta_at: ts,
+            content_type,
+            content_type_at: ts,
         };
 
         let block = BlockContent::with_content(header, &content_str, self.agent_id, order_key);
@@ -439,6 +442,8 @@ impl BlockStore {
             ephemeral_at: ts,
             compacted_at: ts,
             tool_meta_at: ts,
+            content_type: ContentType::Plain,
+            content_type_at: ts,
         };
 
         let mut block = BlockContent::with_content(header, &input_json, self.agent_id, order_key);
@@ -498,6 +503,8 @@ impl BlockStore {
             ephemeral_at: ts,
             compacted_at: ts,
             tool_meta_at: ts,
+            content_type: ContentType::Plain,
+            content_type_at: ts,
         };
 
         let mut block =
@@ -710,13 +717,14 @@ impl BlockStore {
         Ok(())
     }
 
-    /// Set the content_type hint on a block (e.g., "image/svg+xml", "text/markdown").
-    pub fn set_content_type(&mut self, id: &BlockId, content_type: Option<String>) -> Result<()> {
+    /// Set the content type on a block using LWW semantics.
+    pub fn set_content_type(&mut self, id: &BlockId, content_type: ContentType) -> Result<()> {
+        let ts = self.tick();
         let block = self
             .blocks
             .get_mut(id)
             .ok_or(CrdtError::BlockNotFound(*id))?;
-        block.set_content_type(content_type);
+        block.set_content_type(content_type, ts);
         self.version += 1;
         Ok(())
     }
@@ -1160,6 +1168,7 @@ mod tests {
                 BlockKind::Text,
                 "Hello!",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         let id2 = store
@@ -1170,6 +1179,7 @@ mod tests {
                 BlockKind::Text,
                 "Hi!",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -1195,6 +1205,7 @@ mod tests {
                 BlockKind::Text,
                 "Hello",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -1219,6 +1230,7 @@ mod tests {
                 BlockKind::Text,
                 "First",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         let id2 = store
@@ -1229,6 +1241,7 @@ mod tests {
                 BlockKind::Text,
                 "Second",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         let id3 = store
@@ -1239,6 +1252,7 @@ mod tests {
                 BlockKind::Text,
                 "Third",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -1258,6 +1272,7 @@ mod tests {
                 BlockKind::Text,
                 "First",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         let id2 = store
@@ -1268,6 +1283,7 @@ mod tests {
                 BlockKind::Text,
                 "Before First",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -1286,6 +1302,7 @@ mod tests {
                 BlockKind::ToolCall,
                 "{}",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -1310,6 +1327,7 @@ mod tests {
                 BlockKind::Thinking,
                 "Thinking...",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -1331,6 +1349,7 @@ mod tests {
                 BlockKind::ToolCall,
                 "{}",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -1427,6 +1446,7 @@ mod tests {
                 BlockKind::Text,
                 "First",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         let id2 = store
@@ -1437,6 +1457,7 @@ mod tests {
                 BlockKind::Text,
                 "Second",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         let _id3 = store
@@ -1447,6 +1468,7 @@ mod tests {
                 BlockKind::Text,
                 "Third",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -1464,7 +1486,7 @@ mod tests {
         let mut store = test_store();
 
         let a = store
-            .insert_block(None, None, Role::User, BlockKind::Text, "A", Status::Done)
+            .insert_block(None, None, Role::User, BlockKind::Text, "A", Status::Done, ContentType::Plain)
             .unwrap();
         let b = store
             .insert_block(
@@ -1474,6 +1496,7 @@ mod tests {
                 BlockKind::Text,
                 "B",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         let c = store
@@ -1484,6 +1507,7 @@ mod tests {
                 BlockKind::Text,
                 "C",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -1511,6 +1535,7 @@ mod tests {
                 BlockKind::Text,
                 "Question",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         let child1 = store
@@ -1521,6 +1546,7 @@ mod tests {
                 BlockKind::Thinking,
                 "Thinking...",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         let child2 = store
@@ -1531,6 +1557,7 @@ mod tests {
                 BlockKind::Text,
                 "Answer",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -1561,6 +1588,7 @@ mod tests {
                 BlockKind::Thinking,
                 "Thinking...",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         store
@@ -1571,6 +1599,7 @@ mod tests {
                 BlockKind::Text,
                 "Response",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -1626,6 +1655,7 @@ mod tests {
                 BlockKind::Text,
                 "Hello Claude!",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         let _model_response = original
@@ -1636,6 +1666,7 @@ mod tests {
                 BlockKind::Text,
                 "Hi Amy!",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -1688,6 +1719,7 @@ mod tests {
                 BlockKind::Text,
                 "First",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         let _last = store
@@ -1698,6 +1730,7 @@ mod tests {
                 BlockKind::Text,
                 "Last",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -1710,6 +1743,7 @@ mod tests {
                     BlockKind::Text,
                     &format!("Middle-{i}"),
                     Status::Done,
+                    ContentType::Plain,
                 )
                 .unwrap();
         }
@@ -1735,6 +1769,7 @@ mod tests {
                 BlockKind::Text,
                 "Hello from store1",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -1761,6 +1796,7 @@ mod tests {
                 BlockKind::Text,
                 "Hello",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -1778,6 +1814,7 @@ mod tests {
                 BlockKind::Text,
                 "World",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -1812,6 +1849,7 @@ mod tests {
                 BlockKind::Text,
                 "First",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -1829,6 +1867,7 @@ mod tests {
                 BlockKind::Text,
                 "Second",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -1884,6 +1923,7 @@ mod tests {
                 BlockKind::ToolCall,
                 "{}",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -1925,6 +1965,7 @@ mod tests {
                 BlockKind::Thinking,
                 "Thinking...",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -1961,6 +2002,7 @@ mod tests {
                 BlockKind::Text,
                 "Keep",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         let id2 = store1
@@ -1971,6 +2013,7 @@ mod tests {
                 BlockKind::Text,
                 "Delete me",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -2017,6 +2060,7 @@ mod tests {
                 BlockKind::Text,
                 "First",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         let id2 = store1
@@ -2027,6 +2071,7 @@ mod tests {
                 BlockKind::Text,
                 "Second",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         let _id3 = store1
@@ -2037,6 +2082,7 @@ mod tests {
                 BlockKind::Text,
                 "Third",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -2075,6 +2121,7 @@ mod tests {
                 BlockKind::Text,
                 "Hello",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -2102,6 +2149,7 @@ mod tests {
                 BlockKind::Text,
                 "Hello",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         for _ in 0..10 {
@@ -2138,6 +2186,7 @@ mod tests {
                 BlockKind::Text,
                 "Hello",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -2163,7 +2212,7 @@ mod tests {
 
         // Store1 inserts A, B
         let a = store1
-            .insert_block(None, None, Role::User, BlockKind::Text, "A", Status::Done)
+            .insert_block(None, None, Role::User, BlockKind::Text, "A", Status::Done, ContentType::Plain)
             .unwrap();
         let _b = store1
             .insert_block(
@@ -2173,12 +2222,13 @@ mod tests {
                 BlockKind::Text,
                 "B",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
         // Store2 inserts C, D (independently)
         let c = store2
-            .insert_block(None, None, Role::User, BlockKind::Text, "C", Status::Done)
+            .insert_block(None, None, Role::User, BlockKind::Text, "C", Status::Done, ContentType::Plain)
             .unwrap();
         let _d = store2
             .insert_block(
@@ -2188,6 +2238,7 @@ mod tests {
                 BlockKind::Text,
                 "D",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -2242,7 +2293,7 @@ mod tests {
         let mut store2 = BlockStore::new(ctx, PrincipalId::new());
 
         let id = store1
-            .insert_block(None, None, Role::Model, BlockKind::Text, "", Status::Done)
+            .insert_block(None, None, Role::Model, BlockKind::Text, "", Status::Done, ContentType::Plain)
             .unwrap();
 
         // Sync to store2
@@ -2274,6 +2325,7 @@ mod tests {
                 BlockKind::Text,
                 "Hello",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -2308,6 +2360,7 @@ mod tests {
                 BlockKind::Text,
                 "Hello",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         let b2 = store
@@ -2318,6 +2371,7 @@ mod tests {
                 BlockKind::Text,
                 "Let me check...",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         let b3 = store
@@ -2328,6 +2382,7 @@ mod tests {
                 BlockKind::ToolCall,
                 "search",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         let b4 = store
@@ -2338,6 +2393,7 @@ mod tests {
                 BlockKind::ToolResult,
                 "results here",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         let b5 = store
@@ -2348,6 +2404,7 @@ mod tests {
                 BlockKind::Text,
                 "Based on the results...",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -2388,6 +2445,7 @@ mod tests {
                 BlockKind::Text,
                 "hello",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         let _b2 = store
@@ -2398,6 +2456,7 @@ mod tests {
                 BlockKind::Text,
                 "world",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -2421,6 +2480,7 @@ mod tests {
                 BlockKind::Text,
                 "hello",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         let _b2 = store
@@ -2431,6 +2491,7 @@ mod tests {
                 BlockKind::Thinking,
                 "hmm",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         let _b3 = store
@@ -2441,6 +2502,7 @@ mod tests {
                 BlockKind::Text,
                 "response",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -2466,6 +2528,7 @@ mod tests {
                 BlockKind::Text,
                 "hello",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         let _b2 = store
@@ -2476,6 +2539,7 @@ mod tests {
                 BlockKind::ToolResult,
                 "result",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         let _b3 = store
@@ -2486,6 +2550,7 @@ mod tests {
                 BlockKind::Text,
                 "response",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -2515,6 +2580,7 @@ mod tests {
                 BlockKind::Text,
                 "old message",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         let _b2 = store
@@ -2525,6 +2591,7 @@ mod tests {
                 BlockKind::Text,
                 "summary",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -2572,6 +2639,7 @@ mod tests {
                 BlockKind::Text,
                 "msg 1",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         let b2 = store
@@ -2582,6 +2650,7 @@ mod tests {
                 BlockKind::Text,
                 "msg 2",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         let b3 = store
@@ -2592,6 +2661,7 @@ mod tests {
                 BlockKind::Text,
                 "msg 3",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         let _b4 = store
@@ -2602,6 +2672,7 @@ mod tests {
                 BlockKind::Text,
                 "msg 4",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -2627,6 +2698,7 @@ mod tests {
                 BlockKind::Text,
                 "keep me",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         let b2 = store
@@ -2637,6 +2709,7 @@ mod tests {
                 BlockKind::Text,
                 "exclude me",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         let _b3 = store
@@ -2647,6 +2720,7 @@ mod tests {
                 BlockKind::Text,
                 "also keep",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -2672,6 +2746,7 @@ mod tests {
                 BlockKind::Text,
                 "question",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         let _b2 = store
@@ -2682,6 +2757,7 @@ mod tests {
                 BlockKind::Thinking,
                 "thinking...",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         let _b3 = store
@@ -2692,6 +2768,7 @@ mod tests {
                 BlockKind::ToolResult,
                 "tool output",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
         let _b4 = store
@@ -2702,6 +2779,7 @@ mod tests {
                 BlockKind::Text,
                 "answer",
                 Status::Done,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -2734,7 +2812,7 @@ mod tests {
 
         // Create a block in store1 and sync it to store2 (initial sync)
         let id = store1
-            .insert_block(None, None, Role::Model, BlockKind::Text, "", Status::Done)
+            .insert_block(None, None, Role::Model, BlockKind::Text, "", Status::Done, ContentType::Plain)
             .unwrap();
         let payload = store1.ops_since(&HashMap::new());
         store2.merge_ops(payload).unwrap();
@@ -2818,6 +2896,8 @@ mod tests {
             ephemeral_at: 0,
             compacted_at: 0,
             tool_meta_at: 0,
+            content_type: ContentType::Plain,
+            content_type_at: 0,
         };
         let b1 = BlockContent::with_content(h1, "early", agent, "V".to_string());
         store.blocks.insert(id1, b1);
@@ -2843,6 +2923,8 @@ mod tests {
             ephemeral_at: 0,
             compacted_at: 0,
             tool_meta_at: 0,
+            content_type: ContentType::Plain,
+            content_type_at: 0,
         };
         let b2 = BlockContent::with_content(h2, "mid", agent, "W".to_string());
         store.blocks.insert(id2, b2);
@@ -2868,6 +2950,8 @@ mod tests {
             ephemeral_at: 0,
             compacted_at: 0,
             tool_meta_at: 0,
+            content_type: ContentType::Plain,
+            content_type_at: 0,
         };
         let b3 = BlockContent::with_content(h3, "late", agent, "X".to_string());
         store.blocks.insert(id3, b3);
@@ -2931,6 +3015,8 @@ mod tests {
             ephemeral_at: 0,
             compacted_at: 0,
             tool_meta_at: 0,
+            content_type: ContentType::Plain,
+            content_type_at: 0,
         };
         store.blocks.insert(
             id1,
@@ -2958,6 +3044,8 @@ mod tests {
             ephemeral_at: 0,
             compacted_at: 0,
             tool_meta_at: 0,
+            content_type: ContentType::Plain,
+            content_type_at: 0,
         };
         store.blocks.insert(
             id2,
@@ -2998,6 +3086,7 @@ mod tests {
                 BlockKind::Text,
                 "test",
                 Status::Running,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -3060,6 +3149,7 @@ mod tests {
                 BlockKind::Text,
                 "test",
                 Status::Running,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -3111,6 +3201,7 @@ mod tests {
                 BlockKind::Text,
                 "test",
                 Status::Running,
+                ContentType::Plain,
             )
             .unwrap();
 
@@ -3156,6 +3247,7 @@ mod tests {
                 BlockKind::Text,
                 "test",
                 Status::Pending,
+                ContentType::Plain,
             )
             .unwrap();
 
