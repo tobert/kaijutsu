@@ -284,14 +284,17 @@ impl MsdfBlockRenderer {
         }
 
         let Some(pipeline) = pipeline_cache.get_render_pipeline(self.pipeline) else {
-            return false; // Pipeline still compiling
+            warn_once!("MSDF pipeline not ready (state: {:?})", pipeline_cache.get_render_pipeline_state(self.pipeline));
+            return false;
         };
 
         let Some(target_gpu) = gpu_images.get(target_image) else {
+            warn_once!("MSDF target GpuImage not ready");
             return false;
         };
 
         let Some(atlas_gpu) = gpu_images.get(atlas_image) else {
+            warn_once!("MSDF atlas GpuImage not ready");
             return false;
         };
 

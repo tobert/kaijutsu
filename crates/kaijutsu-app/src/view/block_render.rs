@@ -177,7 +177,7 @@ impl Plugin for BlockRenderPlugin {
     fn finish(&self, app: &mut App) {
         // Query the actual GPU texture dimension limit from the render device.
         // RenderDevice isn't available during build(), only after renderer init.
-        let max_dim = app
+        let gpu_max = app
             .get_sub_app(RenderApp)
             .and_then(|render_app| {
                 render_app
@@ -187,9 +187,13 @@ impl Plugin for BlockRenderPlugin {
             })
             .unwrap_or(FALLBACK_MAX_TEXTURE_DIM);
 
+        // Cap at Vello's internal tile limit — the GPU may support larger
+        // textures but Vello's coarse workgroup dispatch can't handle them.
+        let max_dim = gpu_max.min(VELLO_MAX_TEXTURE_DIM);
+
         info!(
-            "GPU max_texture_dimension_2d: {} (fallback: {})",
-            max_dim, FALLBACK_MAX_TEXTURE_DIM
+            "Block texture limit: {} (GPU: {}, Vello cap: {})",
+            max_dim, gpu_max, VELLO_MAX_TEXTURE_DIM,
         );
 
         app.insert_resource(GpuTextureLimits {
@@ -224,6 +228,14 @@ fn init_msdf_atlas(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
 
 /// Fallback max texture dimension when GPU limits aren't available yet.
 const FALLBACK_MAX_TEXTURE_DIM: u32 = 8192;
+
+/// Vello's tile-based renderer has an internal limit: the product of coarse
+/// workgroup counts (≈ ceil(w/256) * ceil(h/256)) must not exceed 256.
+/// For a typical block width of ~1280px that's ceil(1280/256)=5 horizontal tiles,
+/// leaving 256/5 ≈ 51 vertical tiles → 51*256 ≈ 13056px max height.
+/// Use 8192 as a safe Vello ceiling that works for any reasonable width.
+/// See <https://github.com/linebender/vello/issues/680>.
+const VELLO_MAX_TEXTURE_DIM: u32 = 8192;
 
 /// Runtime GPU texture dimension limit, queried from the actual device.
 ///
@@ -773,16 +785,14 @@ pub fn extract_block_scenes(
 ) {
     extracted.items.clear();
 
-    for (scene, texture, render_method, border) in query.iter() {
+    for (scene, texture, render_method, _border) in query.iter() {
         if scene.scene_version == 0 {
             continue;
         }
 
-        // MSDF blocks without borders don't need Vello at all —
-        // the MSDF render pass clears and draws text directly.
-        let is_msdf = render_method == Some(&BlockRenderMethod::Msdf);
-        let has_border = border.is_some();
-        if is_msdf && !has_border {
+        // MSDF blocks skip Vello entirely — text is rendered by the MSDF pass.
+        // Borders will be replaced by shader-drawn borders later; borderless for now.
+        if render_method == Some(&BlockRenderMethod::Msdf) {
             continue;
         }
 
@@ -958,11 +968,19 @@ pub fn render_msdf_block_textures(
                 .last_rendered
                 .insert(item.image_handle.id(), item.version);
         } else {
+            let pipe_ok = pipeline_cache
+                .get_render_pipeline(msdf_renderer.pipeline)
+                .is_some();
+            let pipe_state = pipeline_cache
+                .get_render_pipeline_state(msdf_renderer.pipeline);
+            let target_ok = gpu_images.get(&item.image_handle).is_some();
+            let atlas_ok = gpu_images.get(&msdf_atlas.texture).is_some();
             warn!(
-                "MSDF render skipped: {}x{} built={:.0}x{:.0} glyphs={} verts={}",
+                "MSDF render skipped: {}x{} glyphs={} verts={} pipeline={} ({:?}) target_gpu={} atlas_gpu={}",
                 item.width, item.height,
-                item.built_width, item.built_height,
                 item.glyphs.len(), vertices.len(),
+                pipe_ok, pipe_state,
+                target_ok, atlas_ok,
             );
         }
     }
@@ -1036,7 +1054,7 @@ fn extract_msdf_blocks(
 ) {
     extracted.items.clear();
 
-    for (msdf_glyphs, render_method, scene, texture, border) in query.iter() {
+    for (msdf_glyphs, render_method, scene, texture, _border) in query.iter() {
         if *render_method != BlockRenderMethod::Msdf {
             continue;
         }
@@ -1056,7 +1074,7 @@ fn extract_msdf_blocks(
                 built_height: scene.built_height,
                 version: msdf_glyphs.version,
                 rainbow: msdf_glyphs.rainbow,
-                has_vello_content: border.is_some(),
+                has_vello_content: false, // Vello skipped for MSDF blocks; shader borders later
             });
         }
     }
