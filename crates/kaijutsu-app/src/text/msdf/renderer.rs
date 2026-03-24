@@ -252,13 +252,15 @@ impl MsdfBlockRenderer {
             let importance = glyph.importance;
             let flags = if rainbow { 1u32 } else { 0u32 };
 
-            // Two triangles per quad
-            vertices.push(MsdfVertex { position: [x0, y0], uv: [u0, v0], color, importance, flags });
-            vertices.push(MsdfVertex { position: [x1, y0], uv: [u1, v0], color, importance, flags });
-            vertices.push(MsdfVertex { position: [x0, y1], uv: [u0, v1], color, importance, flags });
-            vertices.push(MsdfVertex { position: [x1, y0], uv: [u1, v0], color, importance, flags });
-            vertices.push(MsdfVertex { position: [x1, y1], uv: [u1, v1], color, importance, flags });
-            vertices.push(MsdfVertex { position: [x0, y1], uv: [u0, v1], color, importance, flags });
+            // Two triangles per quad.
+            // V coordinates flipped: msdfgen bitmaps have Y=0 at bottom,
+            // GPU textures have Y=0 at top. Top-left position gets v1 (bottom UV).
+            vertices.push(MsdfVertex { position: [x0, y0], uv: [u0, v1], color, importance, flags });
+            vertices.push(MsdfVertex { position: [x1, y0], uv: [u1, v1], color, importance, flags });
+            vertices.push(MsdfVertex { position: [x0, y1], uv: [u0, v0], color, importance, flags });
+            vertices.push(MsdfVertex { position: [x1, y0], uv: [u1, v1], color, importance, flags });
+            vertices.push(MsdfVertex { position: [x1, y1], uv: [u1, v0], color, importance, flags });
+            vertices.push(MsdfVertex { position: [x0, y1], uv: [u0, v0], color, importance, flags });
         }
 
         vertices
