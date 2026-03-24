@@ -1,6 +1,7 @@
-//! Text rendering plugin for Bevy using Vello.
+//! Text rendering plugin for Bevy using Vello + MSDF.
 //!
-//! Replaces the MSDF pipeline with bevy_vello for vector text rendering.
+//! Vello handles vector content (SVG, sparkline, ABC, borders).
+//! MSDF handles text (plain, markdown, output) for shader-quality rendering.
 
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
@@ -8,14 +9,15 @@ use bevy_vello::VelloPlugin;
 use bevy_vello::integrations::text::VelloFontAxes;
 use bevy_vello::prelude::*;
 
+use super::msdf::{FontDataMap, MsdfGenerator};
 use super::resources::{FontHandles, SvgFontDb, TextMetrics};
 
-/// Plugin that enables Vello text rendering in Bevy.
+/// Plugin that enables Vello + MSDF text rendering.
 ///
-/// Replaces `TextRenderPlugin` (MSDF). Sets up:
-/// - VelloPlugin (renderer)
-/// - Font loading
-/// - DPI-aware text metrics
+/// Sets up:
+/// - VelloPlugin (vector renderer for SVG, borders, etc.)
+/// - MSDF atlas, generator, and font data map
+/// - Font loading and DPI-aware text metrics
 pub struct KjTextPlugin;
 
 impl Plugin for KjTextPlugin {
@@ -24,17 +26,41 @@ impl Plugin for KjTextPlugin {
             .init_resource::<FontHandles>()
             .init_resource::<TextMetrics>()
             .init_resource::<SvgFontDb>()
+            .insert_resource(MsdfGenerator::new())
+            .init_resource::<FontDataMap>()
             .add_systems(Startup, (load_fonts, load_svg_fontdb))
             .add_systems(
                 Update,
                 (
                     sync_text_metrics_from_window,
                     update_text_metrics_from_font,
-                    // Rainbow text and rich content rendering are now handled
-                    // by build_block_scenes in BlockRenderPlugin.
+                    poll_msdf_generator,
                 ),
             );
     }
+}
+
+/// Poll the MSDF generator for completed glyphs and sync atlas to GPU.
+fn poll_msdf_generator(
+    mut generator: ResMut<MsdfGenerator>,
+    mut atlas: Option<ResMut<super::msdf::MsdfAtlas>>,
+    mut images: ResMut<Assets<Image>>,
+    font_data_map: Res<FontDataMap>,
+) {
+    let Some(ref mut atlas) = atlas else {
+        return;
+    };
+
+    // Queue any pending glyph requests
+    if !atlas.pending.is_empty() {
+        generator.queue_pending(atlas, &font_data_map);
+    }
+
+    // Poll completed generation tasks
+    generator.poll_completed(atlas);
+
+    // Sync atlas pixels to GPU texture
+    atlas.sync_to_gpu(&mut images);
 }
 
 /// Load bundled fonts into VelloFont asset handles.

@@ -20,10 +20,13 @@ bevy_brp_extras.workspace = true  # includes RemotePlugin
 bevy_tweening = { git = "https://github.com/djeedai/bevy_tweening", branch = "main" }  # Smooth animations
 avian2d = "0.5"
 
-# Text rendering (Vello-based)
+# Text rendering (Vello-based + MSDF)
 bevy_vello = { path = "/home/atobey/src/wt/pr6", features = ["text", "svg", "picking"] }
 pulldown-cmark.workspace = true
 bytemuck = { version = "1.21", features = ["derive"] }
+msdfgen = { path = "/home/atobey/src/msdfgen-rs", default-features = false, features = ["ttf-parser"] }
+ttf-parser = "0.19"  # Must match msdfgen's ttf-parser for FontExt impl
+rect_packer = "0.2"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

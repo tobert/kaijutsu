@@ -264,6 +264,8 @@ pub fn spawn_block_cells(
                         width: 1,
                         height: 1,
                     },
+                    crate::text::msdf::MsdfBlockGlyphs::default(),
+                    crate::text::msdf::BlockRenderMethod::default(),
                     ImageNode::default(),
                     MaterialNode(material_handle),
                     Node {

@@ -1,7 +1,8 @@
-//! Per-block Vello texture rendering.
+//! Per-block texture rendering (Vello + MSDF).
 //!
-//! Each conversation block renders its own `vello::Scene` to a per-block texture.
-//! Block cells use `MaterialNode<BlockFxMaterial>` for hybrid Vello+shader effects.
+//! Each conversation block renders its own texture. Text blocks use MSDF
+//! (shader-quality text), while SVG/sparkline/ABC use Vello (vector rasterizer).
+//! Block cells use `MaterialNode<BlockFxMaterial>` for hybrid effects.
 //! Role group borders use plain `ImageNode`. Bevy's UI system handles scroll,
 //! clip, z-order. `BackgroundColor` works again. No coordinate space mismatches.
 
@@ -11,7 +12,7 @@ use bevy::prelude::*;
 use bevy::render::{
     Extract, ExtractSchedule, Render, RenderApp, RenderSystems,
     render_asset::RenderAssets,
-    render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages},
+    render_resource::{Extent3d, PipelineCache, TextureDimension, TextureFormat, TextureUsages},
     renderer::{RenderDevice, RenderQueue},
     texture::GpuImage,
 };
@@ -23,6 +24,11 @@ use vello::peniko::Fill;
 use crate::cell::block_border::{BlockBorderStyle, BorderAnimation};
 use crate::cell::{BlockCell, RoleGroupBorder};
 use crate::shaders::BlockFxMaterial;
+use crate::text::msdf::{
+    BlockRenderMethod, FontDataMap, MsdfBlockGlyphs,
+    collect_msdf_glyphs,
+    renderer::{ExtractedMsdfAtlas, MsdfBlockRenderer, MsdfBlockUniforms},
+};
 use crate::text::rich::{RichContent, RichContentKind, SVG_MAX_HEIGHT};
 use crate::text::{
     FontHandles, KjTextEffects, TextMetrics, bevy_color_to_brush,
@@ -56,6 +62,8 @@ pub struct BlockScene {
     pub text: String,
     /// Text color (set by sync_block_cell_buffers).
     pub color: Color,
+    /// Atlas version when this scene was last built (for glyph arrival detection).
+    pub last_atlas_version: u64,
 }
 
 impl Default for BlockScene {
@@ -69,6 +77,7 @@ impl Default for BlockScene {
             built_height: 0.0,
             text: String::new(),
             color: Color::WHITE,
+            last_atlas_version: 0,
         }
     }
 }
@@ -91,6 +100,10 @@ struct ExtractedBlockSceneItem {
     image_handle: Handle<Image>,
     width: u32,
     height: u32,
+    /// Logical width the scene was built at (before scale/clamp).
+    built_width: f32,
+    /// Logical height the scene was built at (before scale/clamp).
+    built_height: f32,
     version: u64,
 }
 
@@ -110,6 +123,9 @@ pub struct BlockRenderPlugin;
 
 impl Plugin for BlockRenderPlugin {
     fn build(&self, app: &mut App) {
+        // Initialize MSDF atlas in main world (needs Assets<Image>)
+        app.add_systems(Startup, init_msdf_atlas);
+
         // Main world: build scenes and resize textures in PostUpdate
         // after Taffy layout so ComputedNode.size() is available.
         app.add_systems(
@@ -130,14 +146,47 @@ impl Plugin for BlockRenderPlugin {
 
         render_app
             .init_resource::<ExtractedBlockScenes>()
-            .add_systems(ExtractSchedule, extract_block_scenes)
+            .init_resource::<ExtractedMsdfAtlas>()
+            .init_resource::<ExtractedMsdfBlockData>()
+            .add_systems(Startup, init_msdf_renderer)
+            .add_systems(
+                ExtractSchedule,
+                (extract_block_scenes, extract_msdf_atlas, extract_msdf_blocks),
+            )
             .add_systems(
                 Render,
-                render_block_textures
-                    .in_set(RenderSystems::Render)
-                    .run_if(|scenes: Res<ExtractedBlockScenes>| !scenes.items.is_empty()),
+                (
+                    render_block_textures
+                        .in_set(RenderSystems::Render)
+                        .run_if(|scenes: Res<ExtractedBlockScenes>| !scenes.items.is_empty()),
+                    render_msdf_block_textures
+                        .in_set(RenderSystems::Render)
+                        .after(render_block_textures)
+                        .run_if(|msdf: Res<ExtractedMsdfBlockData>| !msdf.items.is_empty()),
+                ),
             );
     }
+}
+
+/// Initialize the MSDF atlas resource (requires Assets<Image>).
+fn init_msdf_atlas(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
+    let atlas = crate::text::msdf::MsdfAtlas::new(&mut images, 1024, 1024);
+    commands.insert_resource(atlas);
+    info!("Initialized MSDF atlas (1024x1024)");
+}
+
+/// Initialize the MSDF renderer in the render world.
+///
+/// Must run after the render app is initialized with a device.
+fn init_msdf_renderer(
+    mut commands: Commands,
+    device: Res<RenderDevice>,
+    pipeline_cache: Res<PipelineCache>,
+    asset_server: Res<AssetServer>,
+) {
+    let renderer = MsdfBlockRenderer::init(&device, &pipeline_cache, &asset_server);
+    commands.insert_resource(renderer);
+    info!("Initialized MSDF block renderer");
 }
 
 // ============================================================================
@@ -164,7 +213,8 @@ pub fn create_block_texture(images: &mut Assets<Image>, w: u32, h: u32) -> Handl
     );
     image.texture_descriptor.usage = TextureUsages::TEXTURE_BINDING
         | TextureUsages::COPY_DST
-        | TextureUsages::STORAGE_BINDING;
+        | TextureUsages::STORAGE_BINDING
+        | TextureUsages::RENDER_ATTACHMENT;
     images.add(image)
 }
 
@@ -187,6 +237,8 @@ pub fn build_block_scenes(
             Option<&BlockBorderStyle>,
             &Visibility,
             Option<&KjTextEffects>,
+            &mut MsdfBlockGlyphs,
+            &mut BlockRenderMethod,
         ),
     >,
     fonts: Res<Assets<VelloFont>>,
@@ -194,6 +246,8 @@ pub fn build_block_scenes(
     theme: Res<Theme>,
     text_metrics: Res<TextMetrics>,
     time: Res<Time>,
+    mut atlas: Option<ResMut<crate::text::msdf::MsdfAtlas>>,
+    mut font_data_map: ResMut<FontDataMap>,
 ) {
     let font = fonts.get(&font_handles.mono);
 
@@ -212,8 +266,10 @@ pub fn build_block_scenes(
     // Rainbow phase (cycles 0→1 over ~4 seconds)
     let rainbow_phase = (time.elapsed_secs() * 0.25) % 1.0;
 
-    for (_block_cell, mut block_scene, computed, mut node, rich, border, vis, effects) in
-        block_cells.iter_mut()
+    for (
+        _block_cell, mut block_scene, computed, mut node, rich, border, vis, effects,
+        mut msdf_glyphs, mut render_method,
+    ) in block_cells.iter_mut()
     {
         // Skip hidden blocks
         if *vis == Visibility::Hidden {
@@ -230,7 +286,10 @@ pub fn build_block_scenes(
         let width_changed = (block_scene.built_width - width).abs() > 1.0;
         let is_rainbow = effects.is_some_and(|e| e.rainbow);
         let has_animation = border.is_some_and(|b| b.animation != BorderAnimation::None);
-        let needs_rebuild = version_changed || width_changed || is_rainbow || has_animation;
+        let atlas_version = atlas.as_ref().map(|a| a.version).unwrap_or(0);
+        let atlas_changed = block_scene.last_atlas_version != atlas_version;
+        let needs_rebuild =
+            version_changed || width_changed || is_rainbow || has_animation || atlas_changed;
 
         if !needs_rebuild {
             continue;
@@ -301,6 +360,26 @@ pub fn build_block_scenes(
                     &md_colors,
                 );
                 let fallback_brush = bevy_color_to_brush(theme.block_assistant);
+
+                // Collect MSDF glyphs from Parley layout
+                if let Some(ref mut atlas) = atlas {
+                    // Register font data for generator
+                    for line in layout.lines() {
+                        for item in line.items() {
+                            if let bevy_vello::parley::PositionedLayoutItem::GlyphRun(gr) = item {
+                                font_data_map.register(gr.run().font());
+                            }
+                        }
+                    }
+                    let glyphs = collect_msdf_glyphs(
+                        &layout, &span_brushes, &fallback_brush, text_offset, atlas,
+                    );
+                    msdf_glyphs.glyphs = glyphs;
+                    msdf_glyphs.version = block_scene.scene_version.wrapping_add(1);
+                    *render_method = BlockRenderMethod::Msdf;
+                }
+
+                // Vello scene still used for borders; also serves as fallback
                 crate::text::rich::render_layout_with_brushes(
                     &mut scene,
                     &layout,
@@ -310,12 +389,12 @@ pub fn build_block_scenes(
                 );
             }
             Some(RichContentKind::Sparkline(data)) => {
+                *render_method = BlockRenderMethod::Vello;
                 let w = content_width as f64;
                 let h = theme.sparkline_height as f64;
                 content_height = theme.sparkline_height;
                 if w > 0.0 && h > 0.0 {
                     let paths = build_sparkline_paths(data, w, h, 4.0);
-                    // Offset sparkline into content area
                     let mut sub_scene = vello::Scene::new();
                     render_sparkline_scene(&mut sub_scene, &paths, &sparkline_colors);
                     scene.append(&sub_scene, Some(Affine::translate(text_offset)));
@@ -327,17 +406,16 @@ pub fn build_block_scenes(
                 height: svg_h,
                 ..
             }) => {
+                *render_method = BlockRenderMethod::Vello;
                 if *svg_w <= 0.0 {
                     content_height = 0.0;
                 } else {
-                    // Scale to fill content width, constrain to max height
                     let w_scale = content_width / svg_w;
                     let h_scale = SVG_MAX_HEIGHT / svg_h;
                     let scale = w_scale.min(h_scale) as f64;
                     let scaled_h = *svg_h as f64 * scale;
                     content_height = scaled_h as f32;
 
-                    // Clip to content area and transform
                     let clip_rect = vello::kurbo::Rect::new(
                         pad_left as f64,
                         pad_top as f64,
@@ -358,6 +436,7 @@ pub fn build_block_scenes(
                 }
             }
             Some(RichContentKind::Abc { tune, .. }) => {
+                *render_method = BlockRenderMethod::Vello;
                 let default_opts = kaijutsu_abc::engrave::EngravingOptions::default();
                 let elements =
                     kaijutsu_abc::engrave::layout::engrave(tune, &default_opts);
@@ -372,7 +451,6 @@ pub fn build_block_scenes(
                         &text_metrics,
                     );
 
-                // Scale to fill content_width, cap at SVG_MAX_HEIGHT
                 let w_scale = content_width as f64 / intrinsic_w;
                 let h_scale = SVG_MAX_HEIGHT as f64 / intrinsic_h;
                 let scale = w_scale.min(h_scale);
@@ -409,6 +487,24 @@ pub fn build_block_scenes(
                 let span_brushes =
                     crate::text::rich::build_output_span_brushes(layout, &theme);
                 let fallback_brush = bevy_color_to_brush(theme.block_tool_result);
+
+                // Collect MSDF glyphs for output blocks too
+                if let Some(ref mut atlas) = atlas {
+                    for line in parley_layout.lines() {
+                        for item in line.items() {
+                            if let bevy_vello::parley::PositionedLayoutItem::GlyphRun(gr) = item {
+                                font_data_map.register(gr.run().font());
+                            }
+                        }
+                    }
+                    let glyphs = collect_msdf_glyphs(
+                        &parley_layout, &span_brushes, &fallback_brush, text_offset, atlas,
+                    );
+                    msdf_glyphs.glyphs = glyphs;
+                    msdf_glyphs.version = block_scene.scene_version.wrapping_add(1);
+                    *render_method = BlockRenderMethod::Msdf;
+                }
+
                 crate::text::rich::render_layout_with_brushes(
                     &mut scene,
                     &parley_layout,
@@ -426,6 +522,23 @@ pub fn build_block_scenes(
                     max_advance,
                 );
                 content_height = layout.height();
+
+                // Collect MSDF glyphs for plain text
+                if let Some(ref mut atlas) = atlas {
+                    for line in layout.lines() {
+                        for item in line.items() {
+                            if let bevy_vello::parley::PositionedLayoutItem::GlyphRun(gr) = item {
+                                font_data_map.register(gr.run().font());
+                            }
+                        }
+                    }
+                    let glyphs = collect_msdf_glyphs(
+                        &layout, &[], &text_brush, text_offset, atlas,
+                    );
+                    msdf_glyphs.glyphs = glyphs;
+                    msdf_glyphs.version = block_scene.scene_version.wrapping_add(1);
+                    *render_method = BlockRenderMethod::Msdf;
+                }
 
                 crate::text::rich::render_layout_with_brushes(
                     &mut scene,
@@ -470,6 +583,7 @@ pub fn build_block_scenes(
         block_scene.built_height = total_height;
         block_scene.last_built_version = block_scene.content_version;
         block_scene.scene_version = block_scene.scene_version.wrapping_add(1);
+        block_scene.last_atlas_version = atlas_version;
     }
 }
 
@@ -616,6 +730,8 @@ pub fn extract_block_scenes(
                 image_handle: texture.image.clone(),
                 width: texture.width,
                 height: texture.height,
+                built_width: scene.built_width,
+                built_height: scene.built_height,
                 version: scene.scene_version,
             });
         }
@@ -663,10 +779,35 @@ pub fn render_block_textures(
             antialiasing_method: render_settings.antialiasing,
         };
 
+        // Scale the Vello scene to match physical texture dimensions.
+        // This handles both:
+        // - High-DPI (texture is larger than logical scene due to scale_factor)
+        // - MAX_TEXTURE_DIM clamping (texture is smaller than logical scene)
+        // Without scaling, Vello content (borders, SVG) would be misaligned
+        // with MSDF text which renders in NDC and inherently fills the texture.
+        let sx = item.width as f64 / item.built_width.max(1.0) as f64;
+        let sy = item.height as f64 / item.built_height.max(1.0) as f64;
+        let needs_scale = (sx - 1.0).abs() > 0.001 || (sy - 1.0).abs() > 0.001;
+
+        let fitted_scene;
+        let scene_to_render = if needs_scale {
+            fitted_scene = {
+                let mut s = vello::Scene::new();
+                s.append(
+                    &item.scene,
+                    Some(Affine::scale_non_uniform(sx, sy)),
+                );
+                s
+            };
+            &fitted_scene
+        } else {
+            &item.scene
+        };
+
         if let Err(e) = vello_renderer.render_to_texture(
             device.wgpu_device(),
             &queue,
-            &item.scene,
+            scene_to_render,
             &gpu_image.texture_view,
             &params,
         ) {
@@ -678,5 +819,144 @@ pub fn render_block_textures(
         extracted
             .last_rendered
             .insert(item.image_handle.id(), item.version);
+    }
+}
+
+/// Render MSDF text glyphs to per-block textures.
+///
+/// Runs after Vello rendering so borders are already present in the texture.
+/// MSDF text is composited on top with premultiplied alpha blending.
+pub fn render_msdf_block_textures(
+    msdf_renderer: Option<Res<MsdfBlockRenderer>>,
+    msdf_atlas: Res<ExtractedMsdfAtlas>,
+    mut msdf_data: ResMut<ExtractedMsdfBlockData>,
+    device: Res<RenderDevice>,
+    queue: Res<RenderQueue>,
+    gpu_images: Res<RenderAssets<GpuImage>>,
+    pipeline_cache: Res<PipelineCache>,
+) {
+    let Some(msdf_renderer) = msdf_renderer else {
+        return;
+    };
+
+    let items: Vec<_> = msdf_data.items.drain(..).collect();
+
+    for item in items {
+        if item.glyphs.is_empty() {
+            continue;
+        }
+
+        let vertices = MsdfBlockRenderer::build_vertices(
+            &item.glyphs,
+            &msdf_atlas,
+            item.built_width,
+            item.built_height,
+        );
+
+        if vertices.is_empty() {
+            continue;
+        }
+
+        let uniforms = MsdfBlockUniforms {
+            resolution: [item.width as f32, item.height as f32],
+            msdf_range: msdf_atlas.msdf_range,
+            sdf_texel: [
+                1.0 / msdf_atlas.width as f32,
+                1.0 / msdf_atlas.height as f32,
+            ],
+            ..default()
+        };
+
+        msdf_renderer.render_to_texture(
+            &device,
+            &queue,
+            &pipeline_cache,
+            &gpu_images,
+            &msdf_atlas.texture,
+            &item.image_handle,
+            &vertices,
+            &uniforms,
+            false, // Don't clear — Vello border already rendered
+        );
+
+        msdf_data
+            .last_rendered
+            .insert(item.image_handle.id(), item.version);
+    }
+}
+
+// ============================================================================
+// MSDF EXTRACTION
+// ============================================================================
+
+/// Extracted MSDF block data for the render world.
+struct ExtractedMsdfBlockItem {
+    glyphs: Vec<crate::text::msdf::PositionedGlyph>,
+    image_handle: Handle<Image>,
+    width: u32,
+    height: u32,
+    built_width: f32,
+    built_height: f32,
+    version: u64,
+}
+
+/// Resource holding extracted MSDF block data.
+#[derive(Resource, Default)]
+pub struct ExtractedMsdfBlockData {
+    items: Vec<ExtractedMsdfBlockItem>,
+    last_rendered: HashMap<AssetId<Image>, u64>,
+}
+
+/// Extract MSDF atlas data to the render world.
+fn extract_msdf_atlas(
+    mut extracted: ResMut<ExtractedMsdfAtlas>,
+    atlas: Extract<Option<Res<crate::text::msdf::MsdfAtlas>>>,
+) {
+    let Some(atlas) = atlas.as_ref() else {
+        return;
+    };
+
+    extracted.regions = atlas.regions.clone();
+    extracted.texture = atlas.texture.clone();
+    extracted.width = atlas.width;
+    extracted.height = atlas.height;
+    extracted.msdf_range = atlas.msdf_range;
+}
+
+/// Extract dirty MSDF blocks from the main world.
+fn extract_msdf_blocks(
+    mut extracted: ResMut<ExtractedMsdfBlockData>,
+    query: Extract<
+        Query<(
+            &MsdfBlockGlyphs,
+            &BlockRenderMethod,
+            &BlockScene,
+            &BlockTexture,
+        )>,
+    >,
+) {
+    extracted.items.clear();
+
+    for (msdf_glyphs, render_method, scene, texture) in query.iter() {
+        if *render_method != BlockRenderMethod::Msdf {
+            continue;
+        }
+        if msdf_glyphs.glyphs.is_empty() || msdf_glyphs.version == 0 {
+            continue;
+        }
+
+        let asset_id = texture.image.id();
+        let last = extracted.last_rendered.get(&asset_id).copied().unwrap_or(0);
+        if msdf_glyphs.version > last {
+            extracted.items.push(ExtractedMsdfBlockItem {
+                glyphs: msdf_glyphs.glyphs.clone(),
+                image_handle: texture.image.clone(),
+                width: texture.width,
+                height: texture.height,
+                built_width: scene.built_width,
+                built_height: scene.built_height,
+                version: msdf_glyphs.version,
+            });
+        }
     }
 }

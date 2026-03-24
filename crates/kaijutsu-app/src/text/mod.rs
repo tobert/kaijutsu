@@ -6,6 +6,7 @@
 pub mod abc;
 pub mod components;
 pub mod markdown;
+pub mod msdf;
 mod plugin;
 mod resources;
 pub mod rich;
