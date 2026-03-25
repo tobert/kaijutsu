@@ -1,27 +1,26 @@
-//! Input overlay — animated floating command palette.
+//! Input overlay — MSDF-rendered floating command palette.
 //!
 //! The InputOverlay is the sole compose surface, rendered as a floating
 //! command palette (rofi/dmenu style) with:
 //! - Centered positioning (~60% width, near top-third)
-//! - UiVelloScene-rendered background (avoids BackgroundColor/Vello conflict)
-//! - Animated borders (Chase/Breathe effects)
-//! - Summon animation (fade-in + subtle scale)
-//! - Optional glow effect
+//! - MSDF text rendering (GPU-native hinting, directional AA)
+//! - Shader-rendered borders + cursor beam via BlockFxMaterial
+//! - Summon animation (fade-in via visibility)
 
 use bevy::prelude::*;
 use bevy::ui::ComputedNode;
-use bevy_vello::integrations::text::{OverflowWrap, VelloFontAxes};
 use bevy_vello::parley;
-use bevy_vello::prelude::{UiVelloScene, UiVelloText, VelloFont, VelloTextAnchor};
-use bevy_vello::vello;
-use vello::kurbo::{Affine, BezPath, Point, RoundedRect, Shape, Stroke};
-use vello::peniko::Fill;
+use bevy_vello::prelude::{VelloFont, VelloTextAlign, VelloTextStyle};
 
-use crate::cell::{InputOverlay, InputOverlayMarker};
+use crate::cell::block_border::{BlockBorderStyle, BorderAnimation, BorderKind, BorderPadding};
+use crate::cell::{InputOverlay, InputOverlayMarker, MsdfOverlayText};
 use crate::input::FocusArea;
-use crate::text::{FontHandles, KjText, KjTextEffects, TextMetrics, bevy_color_to_brush};
+use crate::shaders::BlockFxMaterial;
+use crate::text::msdf::{BlockRenderMethod, FontDataMap, MsdfBlockGlyphs, collect_msdf_glyphs};
+use crate::text::{FontHandles, TextMetrics, bevy_color_to_brush};
 use crate::ui::theme::Theme;
-use crate::view::fieldset::apply_alpha;
+use crate::view::block_render::{BlockScene, BlockTexture};
+use crate::view::components::OverlayCursorGeometry;
 
 // ============================================================================
 // COMPONENTS
@@ -80,17 +79,14 @@ pub struct OverlaySummonState {
 // SPAWN SYSTEM
 // ============================================================================
 
-/// Spawn the singleton InputOverlay entity (root-level, absolute positioned).
-///
-/// Starts hidden (Visibility::Hidden). Shown/hidden by `sync_overlay_visibility`
-/// based on FocusArea::Compose. Uses UiVelloScene for background rendering
-/// to avoid the BackgroundColor/Vello compositing conflict.
+/// Spawn the InputOverlay entity with two children:
+/// 1. MSDF text surface (BlockScene + BlockFxMaterial for shader borders)
+/// 2. Cursor overlay (UiVelloScene for beam drawing)
 pub fn spawn_input_overlay(
     mut commands: Commands,
     existing: Query<Entity, With<InputOverlayMarker>>,
     theme: Res<Theme>,
-    font_handles: Res<FontHandles>,
-    text_metrics: Res<TextMetrics>,
+    mut fx_materials: ResMut<Assets<BlockFxMaterial>>,
 ) {
     if !existing.is_empty() {
         return;
@@ -106,48 +102,60 @@ pub fn spawn_input_overlay(
         animation: OverlayAnimation::Breathe,
     };
 
-    commands.spawn((
-        InputOverlayMarker,
-        InputOverlay::default(),
-        style,
-        KjText,
-        KjTextEffects { rainbow: true },
-        UiVelloText {
-            value: "[chat] shell | ".to_string(),
-            style: bevy_vello::prelude::VelloTextStyle {
-                font: font_handles.mono.clone(),
-                brush: bevy_color_to_brush(theme.fg_dim),
-                font_size: text_metrics.cell_font_size,
-                font_axes: VelloFontAxes {
-                    weight: Some(200.0),
+    let material_handle = fx_materials.add(BlockFxMaterial::default());
+
+    let parent_node = Node {
+        position_type: PositionType::Absolute,
+        top: Val::Percent(15.0),
+        left: Val::Percent(20.0),
+        right: Val::Percent(20.0),
+        min_height: Val::Px(48.0),
+        max_width: Val::Px(800.0),
+        ..default()
+    };
+
+    commands
+        .spawn((InputOverlayMarker, InputOverlay::default(), style, parent_node, Visibility::Hidden))
+        .insert(ZIndex(crate::constants::ZLayer::MODAL))
+        .with_children(|parent| {
+            // Child 1: MSDF text surface with shader borders
+            parent.spawn((
+                MsdfOverlayText,
+                BlockScene::default(),
+                BlockTexture {
+                    image: Handle::default(),
+                    width: 1,
+                    height: 1,
+                },
+                MsdfBlockGlyphs::default(),
+                BlockRenderMethod::Msdf,
+                ImageNode::default(),
+                MaterialNode(material_handle),
+                BlockBorderStyle {
+                    kind: BorderKind::Full,
+                    color: theme.compose_palette_border,
+                    thickness: 2.0,
+                    corner_radius: 8.0,
+                    padding: BorderPadding {
+                        top: 16.0,
+                        bottom: 16.0,
+                        left: 16.0,
+                        right: 16.0,
+                    },
+                    animation: BorderAnimation::Breathe,
+                    top_label: None,
+                    bottom_label: None,
+                },
+                OverlayCursorGeometry::default(),
+                Node {
+                    width: Val::Percent(100.0),
                     ..default()
                 },
-                overflow_wrap: OverflowWrap::BreakWord,
-                ..default()
-            },
-            ..default()
-        },
-        // Override default Center anchor — text starts at content-box top-left
-        VelloTextAnchor::TopLeft,
-        // Scene for background/border rendering (avoids BackgroundColor conflict)
-        UiVelloScene::default(),
-        Node {
-            position_type: PositionType::Absolute,
-            top: Val::Percent(15.0),
-            left: Val::Percent(20.0),
-            right: Val::Percent(20.0),
-            min_height: Val::Px(48.0),
-            max_width: Val::Px(800.0),
-            padding: UiRect::all(Val::Px(16.0)),
-            border: UiRect::all(Val::Px(2.0)),
-            border_radius: BorderRadius::all(Val::Px(8.0)),
-            ..default()
-        },
-        BorderColor::all(Color::NONE), // Visual border via Vello scene, not Bevy BorderColor
-        Visibility::Hidden,
-        ZIndex(crate::constants::ZLayer::MODAL),
-    ));
-    info!("Spawned InputOverlay entity");
+            ));
+
+        });
+
+    info!("Spawned InputOverlay entity (MSDF child)");
 }
 
 // ============================================================================
@@ -186,14 +194,10 @@ pub fn animate_summon(time: Res<Time>, mut summon: ResMut<OverlaySummonState>) {
 }
 
 /// Show/hide the InputOverlay entity based on summon progress.
-///
-/// Uses summon.progress to gate visibility so the overlay remains visible
-/// during the dismiss animation.
 pub fn sync_overlay_visibility(
     summon: Res<OverlaySummonState>,
     mut overlay_query: Query<&mut Visibility, With<InputOverlayMarker>>,
 ) {
-    // Only update when summon state changes
     if !summon.is_changed() {
         return;
     }
@@ -207,469 +211,176 @@ pub fn sync_overlay_visibility(
 }
 
 // ============================================================================
-// BUFFER SYNC SYSTEMS
+// MSDF GLYPH BUILDING (PostUpdate, after Layout)
 // ============================================================================
 
-/// Sync InputOverlay text to its UiVelloText.
-pub fn sync_input_overlay_buffer(
-    theme: Res<Theme>,
-    mut overlay_query: Query<(&InputOverlay, &mut UiVelloText), Changed<InputOverlay>>,
-) {
-    for (overlay, mut vello_text) in overlay_query.iter_mut() {
-        let display = overlay.display_text();
-        let new_brush = if overlay.is_empty() {
-            bevy_color_to_brush(theme.fg_dim)
-        } else if overlay.is_shell() {
-            let validation = crate::kaish::validate(&overlay.text);
-            if !validation.valid && !validation.incomplete {
-                bevy_color_to_brush(theme.block_tool_error)
-            } else {
-                bevy_color_to_brush(theme.block_user)
-            }
-        } else {
-            bevy_color_to_brush(theme.block_user)
-        };
-
-        if vello_text.style.brush != new_brush {
-            vello_text.style.brush = new_brush;
-        }
-        if vello_text.value != display {
-            vello_text.value = display;
-        }
-    }
-}
-
-/// Keep InputOverlay's `max_advance` in sync with its content-box width.
+/// Build MSDF glyphs for the overlay text surface.
 ///
-/// Uses content_box().width() (not border-box size) so Parley wraps text at the
-/// correct boundary — text renders at content-box origin, so the wrap width must
-/// match. Runs on `Changed<ComputedNode>` to handle window resizes.
-pub fn sync_overlay_max_advance(
-    mut overlay_query: Query<
-        (&mut UiVelloText, &ComputedNode),
-        (With<InputOverlayMarker>, Changed<ComputedNode>),
+/// Runs in PostUpdate after UiSystems::Layout so ComputedNode is available.
+/// Replaces the old sync_input_overlay_buffer + sync_overlay_max_advance.
+pub fn build_overlay_glyphs(
+    parents: Query<(&InputOverlay, &Children), With<InputOverlayMarker>>,
+    mut msdf_children: Query<
+        (
+            &mut BlockScene,
+            &mut MsdfBlockGlyphs,
+            &BlockBorderStyle,
+            &ComputedNode,
+            &mut Node,
+            &mut OverlayCursorGeometry,
+        ),
+        With<MsdfOverlayText>,
     >,
+    fonts: Res<Assets<VelloFont>>,
+    font_handles: Res<FontHandles>,
+    theme: Res<Theme>,
+    text_metrics: Res<TextMetrics>,
+    mut atlas: Option<ResMut<crate::text::msdf::MsdfAtlas>>,
+    mut font_data_map: ResMut<FontDataMap>,
 ) {
-    for (mut vello_text, computed_node) in overlay_query.iter_mut() {
-        let width = computed_node.content_box().width();
-        if width > 0.0 {
-            let new_advance = Some(width);
-            if vello_text.max_advance != new_advance {
-                vello_text.max_advance = new_advance;
+    let Some(font) = fonts.get(&font_handles.mono) else {
+        return;
+    };
+
+    for (overlay, children) in parents.iter() {
+        for child in children.iter() {
+            let Ok((
+                mut block_scene,
+                mut msdf_glyphs,
+                border_style,
+                computed,
+                mut node,
+                mut cursor_geom,
+            )) = msdf_children.get_mut(child)
+            else {
+                continue;
+            };
+
+            let width = computed.size().x;
+            if width <= 0.0 {
+                continue;
             }
+
+            // Check if rebuild needed (text changed or width changed)
+            let display = overlay.display_text();
+            let width_changed = (block_scene.built_width - width).abs() > 1.0;
+            let text_changed = block_scene.text != display;
+
+            if !text_changed && !width_changed {
+                continue;
+            }
+
+            // Determine text color
+            let text_color = if overlay.is_empty() {
+                theme.fg_dim
+            } else if overlay.is_shell() {
+                let validation = crate::kaish::validate(&overlay.text);
+                if !validation.valid && !validation.incomplete {
+                    theme.block_tool_error
+                } else {
+                    theme.block_user
+                }
+            } else {
+                theme.block_user
+            };
+
+            let text_brush = bevy_color_to_brush(text_color);
+
+            // Compute content area (inside border padding)
+            let pad = &border_style.padding;
+            let content_width = (width - pad.left - pad.right).max(0.0);
+            let max_advance = if content_width > 0.0 {
+                Some(content_width)
+            } else {
+                None
+            };
+
+            // Build text style
+            let style = VelloTextStyle {
+                font: font_handles.mono.clone(),
+                brush: text_brush,
+                font_size: text_metrics.cell_font_size,
+                font_axes: bevy_vello::integrations::text::VelloFontAxes {
+                    weight: Some(200.0),
+                    ..default()
+                },
+                ..default()
+            };
+
+            // Run Parley layout
+            let layout = font.layout(&display, &style, VelloTextAlign::Left, max_advance);
+            let content_height = layout.height();
+
+            let text_offset = (pad.left as f64, pad.top as f64);
+
+            // Collect MSDF glyphs
+            if let Some(ref mut atlas) = atlas {
+                for line in layout.lines() {
+                    for item in line.items() {
+                        if let bevy_vello::parley::PositionedLayoutItem::GlyphRun(gr) = item {
+                            font_data_map.register(gr.run().font());
+                        }
+                    }
+                }
+                let glyphs =
+                    collect_msdf_glyphs(&layout, &[], &style.brush, text_offset, atlas);
+                msdf_glyphs.glyphs = glyphs;
+                msdf_glyphs.version = msdf_glyphs.version.wrapping_add(1);
+                msdf_glyphs.rainbow = false;
+            }
+
+            // Set scene dimensions (content + padding)
+            let total_height = content_height + pad.top + pad.bottom;
+            block_scene.built_width = width;
+            block_scene.built_height = total_height;
+            block_scene.text = display.clone();
+            block_scene.color = text_color;
+            block_scene.content_version = block_scene.content_version.wrapping_add(1);
+            block_scene.last_built_version = block_scene.content_version;
+            block_scene.scene_version = block_scene.scene_version.wrapping_add(1);
+
+            // Set explicit height on the node
+            node.height = Val::Px(total_height);
+
+            // Compute cursor geometry from Parley layout
+            let cursor_byte_offset = overlay.display_cursor_offset();
+            let cursor = parley::editing::Cursor::from_byte_index(
+                &layout,
+                cursor_byte_offset,
+                parley::layout::Affinity::Upstream,
+            );
+            let geom = cursor.geometry(&layout, 2.0);
+            cursor_geom.x = text_offset.0 + geom.x0;
+            cursor_geom.y = text_offset.1 + geom.y0;
+            cursor_geom.height = geom.y1 - geom.y0;
         }
     }
 }
 
-/// Sync OverlayStyle from theme when theme changes.
+// ============================================================================
+// THEME SYNC
+// ============================================================================
+
+/// Sync OverlayStyle + BlockBorderStyle from theme when theme changes.
 pub fn sync_overlay_style_to_theme(
     theme: Res<Theme>,
-    mut overlay_query: Query<&mut OverlayStyle, With<InputOverlayMarker>>,
+    mut overlay_query: Query<(&mut OverlayStyle, &Children), With<InputOverlayMarker>>,
+    mut border_query: Query<&mut BlockBorderStyle, With<MsdfOverlayText>>,
 ) {
     if !theme.is_changed() {
         return;
     }
-    for mut style in overlay_query.iter_mut() {
+    for (mut style, children) in overlay_query.iter_mut() {
         style.bg_color = theme.compose_bg.with_alpha(0.95);
         style.border_color = theme.compose_palette_border;
         style.glow_radius = theme.compose_palette_glow_radius;
         style.glow_intensity = theme.compose_palette_glow_intensity;
-    }
-}
 
-// ============================================================================
-// SCENE RENDERING (PostUpdate)
-// ============================================================================
-
-/// Rebuild overlay scene in PostUpdate (after Layout).
-///
-/// This renders the background, glow, animated border, and cursor using Vello,
-/// avoiding the BackgroundColor/Vello compositing conflict.
-pub fn update_overlay_scene(
-    summon: Res<OverlaySummonState>,
-    focus_area: Res<FocusArea>,
-    time: Res<Time>,
-    text_metrics: Res<TextMetrics>,
-    font_handles: Res<FontHandles>,
-    fonts: Res<Assets<VelloFont>>,
-    theme: Res<Theme>,
-    mut query: Query<
-        (
-            &OverlayStyle,
-            &InputOverlay,
-            &UiVelloText,
-            &ComputedNode,
-            &mut UiVelloScene,
-        ),
-        With<InputOverlayMarker>,
-    >,
-) {
-    // Only show cursor when in compose mode
-    let show_cursor = matches!(*focus_area, FocusArea::Compose);
-
-    for (style, overlay, vello_text, computed, mut vello_scene) in query.iter_mut() {
-        let size = computed.size();
-        if size.x < 1.0 || size.y < 1.0 {
-            continue;
-        }
-
-        // Content-box inset: scene draws at border-box origin, text renders at
-        // content-box origin. This offset bridges the two coordinate systems.
-        let cb = computed.content_box();
-        let pad_x = (cb.min.x + size.x / 2.0) as f64;
-        let pad_y = (cb.min.y + size.y / 2.0) as f64;
-
-        let display_str = overlay.display_text();
-        let cursor_byte_offset = overlay.display_cursor_offset();
-
-        // Collect emergency (character) break positions from text layout.
-        // These are lines where BreakWord split a word mid-character — the
-        // border warps outward at these y-positions to signal the split.
-        let mut break_warps: Vec<(f64, f64)> = Vec::new(); // (y, height)
-        let layout = fonts.get(&font_handles.mono).map(|font| {
-            let layout = font.layout(
-                &display_str,
-                &vello_text.style,
-                vello_text.text_align,
-                vello_text.max_advance,
-            );
-            for line in layout.lines() {
-                if matches!(line.break_reason(), parley::layout::BreakReason::Emergency) {
-                    let metrics = line.metrics();
-                    let line_top = pad_y + metrics.baseline as f64 - metrics.ascent as f64;
-                    let line_h = (metrics.ascent + metrics.descent) as f64;
-                    // Use 40% of line height, centered on the line — keeps arcs
-                    // compact and prevents consecutive warps from overlapping.
-                    let warp_h = line_h * 0.4;
-                    let warp_y = line_top + (line_h - warp_h) / 2.0;
-                    break_warps.push((warp_y, warp_h));
-                }
+        // Sync border style on MSDF child
+        for child in children.iter() {
+            if let Ok(mut border) = border_query.get_mut(child) {
+                border.color = theme.compose_palette_border;
             }
-            layout
-        });
-
-        // Build panel scene with warped border at character-break positions
-        let mut scene = vello::Scene::new();
-        build_overlay_panel(
-            &mut scene,
-            size.x as f64,
-            size.y as f64,
-            style,
-            time.elapsed_secs(),
-            summon.progress,
-            &break_warps,
-        );
-
-        // Draw cursor
-        if show_cursor && summon.progress > 0.0 {
-            if let Some(layout) = &layout {
-                let cursor = parley::editing::Cursor::from_byte_index(
-                    layout,
-                    cursor_byte_offset,
-                    parley::layout::Affinity::Upstream,
-                );
-                let geom = cursor.geometry(layout, 2.0);
-
-                draw_cursor_beam(
-                    &mut scene,
-                    pad_x + geom.x0,
-                    pad_y + geom.y0,
-                    geom.y1 - geom.y0,
-                    theme.cursor_insert,
-                    summon.progress,
-                    time.elapsed_secs(),
-                );
-            } else {
-                // Font not loaded yet — approximate with metrics
-                let line_height = text_metrics.cell_line_height as f64;
-                let char_width = text_metrics.cell_char_width as f64;
-                let col = display_str[..cursor_byte_offset.min(display_str.len())]
-                    .chars()
-                    .count();
-
-                draw_cursor_beam(
-                    &mut scene,
-                    pad_x + col as f64 * char_width,
-                    pad_y,
-                    line_height,
-                    theme.cursor_insert,
-                    summon.progress,
-                    time.elapsed_secs(),
-                );
-            }
-        }
-
-        *vello_scene = UiVelloScene::from(scene);
-    }
-}
-
-// ============================================================================
-// SCENE BUILDING
-// ============================================================================
-
-/// Build the command palette panel scene.
-///
-/// Draws:
-/// 1. Multi-pass glow (if enabled)
-/// 2. Filled background (semi-transparent)
-/// 3. Border stroke (warped at character-break positions)
-/// 4. Animation overlay (chase/breathe)
-///
-/// `break_warps` contains (y, height) pairs for lines where BreakWord split
-/// a word mid-character. The right border edge bulges outward at these
-/// positions to visually signal the forced break.
-fn build_overlay_panel(
-    scene: &mut vello::Scene,
-    width: f64,
-    height: f64,
-    style: &OverlayStyle,
-    time: f32,
-    summon_progress: f32,
-    break_warps: &[(f64, f64)],
-) {
-    let alpha = summon_progress * animation_alpha(&style.animation, time);
-
-    // 1. Draw glow (multi-pass blur approximation)
-    if style.glow_radius > 0.0 && style.glow_intensity > 0.0 {
-        draw_glow(
-            scene,
-            width,
-            height,
-            style.corner_radius as f64,
-            style.border_color,
-            style.glow_radius,
-            style.glow_intensity * alpha,
-        );
-    }
-
-    // 2. Draw filled background (semi-transparent)
-    let bg_brush = apply_alpha(&bevy_color_to_brush(style.bg_color), alpha * 0.95);
-    let rect = RoundedRect::new(0.0, 0.0, width, height, style.corner_radius as f64);
-    scene.fill(Fill::NonZero, Affine::IDENTITY, &bg_brush, None, &rect);
-
-    // 3. Draw border stroke — warped right edge if there are character breaks
-    let border_brush = apply_alpha(&bevy_color_to_brush(style.border_color), alpha);
-    let half_t = style.border_thickness as f64 / 2.0;
-    let stroke = Stroke::new(style.border_thickness as f64);
-
-    if break_warps.is_empty() {
-        // Simple rounded rect when no character breaks
-        let border_rect = RoundedRect::new(
-            half_t,
-            half_t,
-            width - half_t,
-            height - half_t,
-            style.corner_radius as f64,
-        );
-        scene.stroke(&stroke, Affine::IDENTITY, &border_brush, None, &border_rect);
-    } else {
-        let path = build_warped_border(
-            width,
-            height,
-            half_t,
-            style.corner_radius as f64,
-            break_warps,
-        );
-        scene.stroke(&stroke, Affine::IDENTITY, &border_brush, None, &path);
-    }
-
-    // 4. Chase animation overlay (if active)
-    if matches!(style.animation, OverlayAnimation::Chase) {
-        draw_chase_overlay(scene, width, height, style, time, alpha);
-    }
-}
-
-/// Build a border path with outward bumps on the right edge at character-break
-/// positions. The border is a rounded rect except the right side, which gets
-/// smooth cubic bulges where BreakWord forced a mid-word split.
-fn build_warped_border(
-    width: f64,
-    height: f64,
-    half_t: f64,
-    corner_radius: f64,
-    break_warps: &[(f64, f64)],
-) -> BezPath {
-    let r = corner_radius
-        .min((width - 2.0 * half_t) / 2.0)
-        .min((height - 2.0 * half_t) / 2.0);
-    let bulge = 6.0; // How far the border bulges outward
-
-    let left = half_t;
-    let right = width - half_t;
-    let top = half_t;
-    let bottom = height - half_t;
-
-    let mut path = BezPath::new();
-
-    // Start at top-left after corner
-    path.move_to(Point::new(left + r, top));
-
-    // Top edge → top-right corner
-    path.line_to(Point::new(right - r, top));
-    quarter_arc(&mut path, Point::new(right - r, top + r), r, 270.0);
-
-    // Right edge — straight segments with bulges at break positions
-    // Sort warps by y and walk down the right edge
-    let mut sorted_warps: Vec<(f64, f64)> = break_warps.to_vec();
-    sorted_warps.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-
-    let mut cursor_y = top + r;
-    for &(warp_y, warp_h) in &sorted_warps {
-        // Clamp warp to border bounds
-        let wy = warp_y.max(top + r).min(bottom - r);
-        let wh = warp_h.min(bottom - r - wy);
-        if wh < 2.0 || wy < cursor_y {
-            continue;
-        }
-
-        // Straight segment down to the warp start
-        if wy > cursor_y + 0.5 {
-            path.line_to(Point::new(right, wy));
-        }
-
-        // Smooth outward bulge: cubic bezier with control points pushed right
-        path.curve_to(
-            Point::new(right + bulge, wy + wh * 0.15),
-            Point::new(right + bulge, wy + wh * 0.85),
-            Point::new(right, wy + wh),
-        );
-        cursor_y = wy + wh;
-    }
-
-    // Finish right edge down to bottom-right corner
-    if bottom - r > cursor_y + 0.5 {
-        path.line_to(Point::new(right, bottom - r));
-    }
-
-    // Bottom-right corner
-    quarter_arc(&mut path, Point::new(right - r, bottom - r), r, 0.0);
-
-    // Bottom edge → bottom-left corner
-    path.line_to(Point::new(left + r, bottom));
-    quarter_arc(&mut path, Point::new(left + r, bottom - r), r, 90.0);
-
-    // Left edge → top-left corner
-    path.line_to(Point::new(left, top + r));
-    quarter_arc(&mut path, Point::new(left + r, top + r), r, 180.0);
-
-    path.close_path();
-    path
-}
-
-/// Approximate a 90-degree circular arc using a single cubic bezier.
-/// `center` is the arc center, `start_angle` is in degrees (0 = right, 90 = down).
-fn quarter_arc(path: &mut BezPath, center: Point, r: f64, start_angle_deg: f64) {
-    // Magic number for cubic approximation of quarter circle
-    let k = 0.5522847498;
-    let a = start_angle_deg.to_radians();
-    let cos_a = a.cos();
-    let sin_a = a.sin();
-    let cos_b = (a + std::f64::consts::FRAC_PI_2).cos();
-    let sin_b = (a + std::f64::consts::FRAC_PI_2).sin();
-
-    let p0 = Point::new(center.x + r * cos_a, center.y + r * sin_a);
-    let p3 = Point::new(center.x + r * cos_b, center.y + r * sin_b);
-    let p1 = Point::new(p0.x - r * k * sin_a, p0.y + r * k * cos_a);
-    let p2 = Point::new(p3.x + r * k * sin_b, p3.y - r * k * cos_b);
-
-    path.curve_to(p1, p2, p3);
-}
-
-/// Draw glow effect using multi-pass blur approximation.
-fn draw_glow(
-    scene: &mut vello::Scene,
-    width: f64,
-    height: f64,
-    corner_radius: f64,
-    color: Color,
-    radius: f32,
-    intensity: f32,
-) {
-    let passes = 4;
-    for i in 0..passes {
-        let offset = (i + 1) as f64 * (radius as f64 / passes as f64);
-        let a = intensity * (1.0 - i as f32 / passes as f32);
-        let brush = apply_alpha(&bevy_color_to_brush(color), a);
-        let rect = RoundedRect::new(
-            -offset,
-            -offset,
-            width + offset,
-            height + offset,
-            corner_radius + offset * 0.5,
-        );
-        let stroke = Stroke::new(2.0);
-        scene.stroke(&stroke, Affine::IDENTITY, &brush, None, &rect);
-    }
-}
-
-/// Draw chase animation overlay (bright segment traveling along border).
-fn draw_chase_overlay(
-    scene: &mut vello::Scene,
-    width: f64,
-    height: f64,
-    style: &OverlayStyle,
-    time: f32,
-    alpha: f32,
-) {
-    let half_t = style.border_thickness as f64 / 2.0;
-    let rect = RoundedRect::new(
-        half_t,
-        half_t,
-        width - half_t,
-        height - half_t,
-        style.corner_radius as f64,
-    );
-    let perimeter = rect.perimeter(0.1);
-
-    // Chase segment: ~15% of perimeter, traveling at constant speed
-    let chase_len = perimeter * 0.15;
-    let position = (time as f64 * 2.0) % perimeter;
-
-    // Bright version of the border color
-    let srgba = style.border_color.to_srgba();
-    let bright = Color::srgba(
-        (srgba.red * 1.5).min(1.0),
-        (srgba.green * 1.5).min(1.0),
-        (srgba.blue * 1.5).min(1.0),
-        (srgba.alpha * 1.8).min(1.0) * alpha,
-    );
-    let brush = bevy_color_to_brush(bright);
-
-    // Use dashed stroke to create a single bright segment
-    let stroke = Stroke::new(style.border_thickness as f64 * 1.5)
-        .with_caps(vello::kurbo::Cap::Round)
-        .with_dashes(position, [chase_len, perimeter - chase_len]);
-
-    scene.stroke(&stroke, Affine::IDENTITY, &brush, None, &rect);
-}
-
-/// Draw a simple cursor beam (vertical line).
-fn draw_cursor_beam(
-    scene: &mut vello::Scene,
-    x: f64,
-    y: f64,
-    height: f64,
-    color: bevy::math::Vec4,
-    alpha: f32,
-    _time: f32, // Reserved for future blink animation
-) {
-    let beam_width = 2.0;
-    let beam_color = Color::srgba(color.x, color.y, color.z, color.w * alpha);
-    let brush = bevy_color_to_brush(beam_color);
-
-    let rect = vello::kurbo::Rect::new(x, y, x + beam_width, y + height);
-    scene.fill(Fill::NonZero, Affine::IDENTITY, &brush, None, &rect);
-}
-
-/// Compute animation alpha multiplier.
-fn animation_alpha(animation: &OverlayAnimation, time: f32) -> f32 {
-    match animation {
-        OverlayAnimation::None => 1.0,
-        OverlayAnimation::Chase => 1.0, // chase uses overlay, base alpha stays 1.0
-        OverlayAnimation::Breathe => {
-            let base = 0.85;
-            let amplitude = 0.15;
-            base + amplitude * (time * 1.5).sin()
         }
     }
 }

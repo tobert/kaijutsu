@@ -1,9 +1,7 @@
-//! Block FX material — hybrid Vello + shader post-processing.
+//! Block FX material — MSDF + shader post-processing.
 //!
-//! `BlockFxMaterial` is a `UiMaterial` that displays the Vello-rendered block
-//! texture and adds GPU-native effects (edge glow, animation). The Vello
-//! fieldset borders provide the structural geometry; this shader adds the
-//! soft visual layer that Vello can't do (SDF glow falloff, per-pixel animation).
+//! `BlockFxMaterial` is a `UiMaterial` that displays the MSDF-rendered block
+//! texture and adds GPU-native effects (SDF border glow, animation, cursor beam).
 
 use bevy::prelude::*;
 use bevy::render::render_resource::AsBindGroup;
@@ -11,18 +9,16 @@ use bevy::shader::ShaderRef;
 
 /// Post-processing material for conversation block textures.
 ///
-/// Binds the Vello-rendered texture (text + fieldset borders) and adds
-/// SDF-based edge glow with animation.
-///
 /// # Uniforms
 ///
-/// - `texture` / `sampler`: The Vello-rendered block texture.
-/// - `glow_color`: RGBA color for the glow effect (linear color space).
+/// - `texture` / `sampler`: The MSDF-rendered block texture.
+/// - `glow_color`: RGBA color for the border glow effect (linear).
 /// - `fx_params`: `[glow_radius, glow_intensity, animation_mode, corner_radius]`
-///   - `glow_radius`: Pixel width of glow falloff (0 = disabled, fast path).
-///   - `glow_intensity`: Peak brightness multiplier.
-///   - `animation_mode`: 0=none, 1=breathe, 2=pulse, 3=chase.
-///   - `corner_radius`: Rounded rect corner radius for SDF alignment.
+/// - `text_glow_color`: RGBA color for text halo.
+/// - `text_glow_params`: `[radius_px, 0, 0, 0]`
+/// - `cursor_params`: `[x_uv, y_uv, width_uv, height_uv]` — cursor beam rect in UV space.
+///   All zero = no cursor. Color comes from `cursor_color`.
+/// - `cursor_color`: RGBA color for the cursor beam (linear).
 #[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
 pub struct BlockFxMaterial {
     #[texture(0)]
@@ -43,6 +39,14 @@ pub struct BlockFxMaterial {
     /// Text glow parameters: [radius_px, 0, 0, 0]. radius=0 disables.
     #[uniform(5)]
     pub text_glow_params: Vec4,
+
+    /// Cursor beam rect in UV space: [x, y, width, height]. All zero = disabled.
+    #[uniform(6)]
+    pub cursor_params: Vec4,
+
+    /// Cursor beam color (RGBA, linear color space).
+    #[uniform(7)]
+    pub cursor_color: Vec4,
 }
 
 impl Default for BlockFxMaterial {
@@ -50,10 +54,11 @@ impl Default for BlockFxMaterial {
         Self {
             texture: Handle::default(),
             glow_color: Vec4::ZERO,
-            // glow_radius=0 → shader fast path (pure passthrough)
             fx_params: Vec4::ZERO,
             text_glow_color: Vec4::ZERO,
             text_glow_params: Vec4::ZERO,
+            cursor_params: Vec4::ZERO,
+            cursor_color: Vec4::ZERO,
         }
     }
 }

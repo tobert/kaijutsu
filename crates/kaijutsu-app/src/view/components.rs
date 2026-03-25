@@ -483,8 +483,25 @@ impl InputOverlay {
 
 /// Marker for the input overlay entity.
 #[derive(Component)]
-#[allow(dead_code)] // Phase 3: spawned by overlay system
 pub struct InputOverlayMarker;
+
+/// Marker for the MSDF text surface child of InputOverlay.
+#[derive(Component)]
+pub struct MsdfOverlayText;
+
+/// Cached cursor position computed during glyph layout.
+///
+/// Written by `build_overlay_glyphs`, read by `update_overlay_cursor`.
+/// Avoids re-running Parley layout in the cursor rendering system.
+#[derive(Component, Default)]
+pub struct OverlayCursorGeometry {
+    /// Cursor X position in content-box pixels (includes border padding).
+    pub x: f64,
+    /// Cursor Y position (top of beam) in content-box pixels.
+    pub y: f64,
+    /// Cursor beam height in pixels.
+    pub height: f64,
+}
 
 /// Marker for the main conversation view cell.
 ///

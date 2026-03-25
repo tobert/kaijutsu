@@ -554,8 +554,8 @@ impl Default for Theme {
             compose_border: Color::srgb(0.231, 0.259, 0.380), // #3b4261 matches border
             compose_bg: Color::srgb(0.102, 0.106, 0.149),     // #1a1b26 matches bg
             compose_palette_border: Color::srgb(0.478, 0.635, 0.969), // #7aa2f7 accent blue
-            compose_palette_glow_radius: 6.0,
-            compose_palette_glow_intensity: 0.25,
+            compose_palette_glow_radius: 10.0,
+            compose_palette_glow_intensity: 0.6,
 
             // Modal backdrop — semi-transparent dark overlay
             modal_backdrop: Color::srgba(0.0, 0.0, 0.0, 0.6),

@@ -137,7 +137,8 @@ impl Plugin for BlockRenderPlugin {
                 build_role_group_scenes.after(bevy::ui::UiSystems::Layout),
                 resize_block_textures
                     .after(build_block_scenes)
-                    .after(build_role_group_scenes),
+                    .after(build_role_group_scenes)
+                    .after(crate::view::overlay::build_overlay_glyphs),
             ),
         );
 
@@ -706,7 +707,10 @@ pub fn build_role_group_scenes(
 pub fn resize_block_textures(
     mut block_query: Query<
         (&BlockScene, &mut BlockTexture, &MaterialNode<BlockFxMaterial>, &mut ImageNode),
-        (With<BlockCell>, Without<RoleGroupBorder>),
+        (
+            Or<(With<BlockCell>, With<crate::view::components::MsdfOverlayText>)>,
+            Without<RoleGroupBorder>,
+        ),
     >,
     mut role_query: Query<
         (&BlockScene, &mut BlockTexture, &mut ImageNode),

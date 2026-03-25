@@ -136,8 +136,6 @@ impl Plugin for CellPlugin {
                 // Input overlay
                 view_overlay::update_summon_animation,
                 view_overlay::sync_overlay_visibility.after(view_overlay::update_summon_animation),
-                view_overlay::sync_input_overlay_buffer,
-                view_overlay::sync_overlay_max_advance,
                 view_overlay::sync_overlay_style_to_theme,
                 // Highlighting
                 view_render::highlight_focused_block.after(view_render::sync_block_cell_buffers),
@@ -181,7 +179,7 @@ impl Plugin for CellPlugin {
             PostUpdate,
             (
                 view_render::readback_block_heights.after(bevy::ui::UiSystems::Layout),
-                view_overlay::update_overlay_scene.after(bevy::ui::UiSystems::Layout),
+                view_overlay::build_overlay_glyphs.after(bevy::ui::UiSystems::Layout),
             ),
         );
     }
