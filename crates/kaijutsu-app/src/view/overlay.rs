@@ -111,12 +111,15 @@ pub fn spawn_input_overlay(
         right: Val::Percent(20.0),
         min_height: Val::Px(48.0),
         max_width: Val::Px(800.0),
+        overflow: Overflow::clip(),
+        border_radius: BorderRadius::all(Val::Px(style.corner_radius)),
         ..default()
     };
 
     commands
-        .spawn((InputOverlayMarker, InputOverlay::default(), style, parent_node, Visibility::Hidden))
+        .spawn((InputOverlayMarker, InputOverlay::default(), style.clone(), parent_node, Visibility::Hidden))
         .insert(ZIndex(crate::constants::ZLayer::MODAL))
+        .insert(BackgroundColor(style.bg_color))
         .with_children(|parent| {
             // Child 1: MSDF text surface with shader borders
             parent.spawn((
@@ -364,17 +367,22 @@ pub fn build_overlay_glyphs(
 /// Sync OverlayStyle + BlockBorderStyle from theme when theme changes.
 pub fn sync_overlay_style_to_theme(
     theme: Res<Theme>,
-    mut overlay_query: Query<(&mut OverlayStyle, &Children), With<InputOverlayMarker>>,
+    mut overlay_query: Query<
+        (&mut OverlayStyle, &mut BackgroundColor, &Children),
+        With<InputOverlayMarker>,
+    >,
     mut border_query: Query<&mut BlockBorderStyle, With<MsdfOverlayText>>,
 ) {
     if !theme.is_changed() {
         return;
     }
-    for (mut style, children) in overlay_query.iter_mut() {
-        style.bg_color = theme.compose_bg.with_alpha(0.95);
+    for (mut style, mut bg, children) in overlay_query.iter_mut() {
+        let new_bg = theme.compose_bg.with_alpha(0.95);
+        style.bg_color = new_bg;
         style.border_color = theme.compose_palette_border;
         style.glow_radius = theme.compose_palette_glow_radius;
         style.glow_intensity = theme.compose_palette_glow_intensity;
+        *bg = BackgroundColor(new_bg);
 
         // Sync border style on MSDF child
         for child in children.iter() {
