@@ -399,3 +399,18 @@ pub struct SearchMatch {
     pub before: Vec<String>,
     pub after: Vec<String>,
 }
+
+/// Invoke another agent's capability through the kernel.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct InvokeAgentRequest {
+    /// Agent nick to invoke (e.g., "kaijutsu-app")
+    #[schemars(description = "Agent nick to invoke (e.g., \"kaijutsu-app\")")]
+    pub nick: String,
+    /// Action to perform (e.g., "switch_context", "active_context")
+    #[schemars(description = "Action to perform (e.g., \"switch_context\", \"active_context\")")]
+    pub action: String,
+    /// JSON parameters for the action
+    #[schemars(description = "JSON parameters for the action (e.g., {\"context_id\": \"019d1631\"})")]
+    #[serde(default)]
+    pub params: serde_json::Value,
+}

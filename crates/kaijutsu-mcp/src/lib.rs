@@ -1928,6 +1928,32 @@ impl KaijutsuMcp {
     }
 
     // ========================================================================
+    // Agent Invocation
+    // ========================================================================
+
+    #[tool(
+        description = "Invoke another agent's capability through the kernel. Agents register with the kernel (e.g., kaijutsu-app registers as an agent with actions like 'switch_context' and 'active_context'). Params and result are JSON. Requires --connect.",
+        annotations(
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    #[tracing::instrument(skip(self, req), name = "mcp.invoke_agent")]
+    async fn invoke_agent(&self, Parameters(req): Parameters<InvokeAgentRequest>) -> String {
+        let actor = match self.actor() {
+            Some(a) => a,
+            None => return "Error: invoke_agent requires --connect".to_string(),
+        };
+
+        let params = serde_json::to_vec(&req.params).unwrap_or_default();
+        match actor.invoke_agent(&req.nick, &req.action, &params).await {
+            Ok(result) => String::from_utf8_lossy(&result).to_string(),
+            Err(e) => format!("Error: {e}"),
+        }
+    }
+
+    // ========================================================================
     // Input Document Tools (CRDT compose scratchpad)
     // ========================================================================
 
