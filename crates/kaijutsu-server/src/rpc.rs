@@ -33,6 +33,8 @@ use kaijutsu_kernel::{
     AgentConfig,
     AgentInfo,
     AgentStatus,
+    InvokeRequest,
+    InvokeResponse,
     // Block tools
     BlockAppendEngine,
     BlockCreateEngine,
@@ -3256,7 +3258,8 @@ impl kernel::Server for KernelImpl {
         params: kernel::AttachAgentParams,
         mut results: kernel::AttachAgentResults,
     ) -> Promise<(), capnp::Error> {
-        let config_reader = pry!(pry!(params.get()).get_config());
+        let params_reader = pry!(params.get());
+        let config_reader = pry!(params_reader.get_config());
 
         // Extract config fields
         let nick = pry!(config_reader.get_nick())
@@ -3289,20 +3292,60 @@ impl kernel::Server for KernelImpl {
             .collect();
 
         let config = AgentConfig {
-            nick,
+            nick: nick.clone(),
             instance,
             provider,
             model_id,
             capabilities,
         };
 
+        // Extract optional AgentCommands callback for reverse invocation
+        let commands_callback = params_reader.get_commands().ok();
+
         let kernel_arc = self.kernel.kernel.clone();
 
         let span = tracing::info_span!("rpc", method = "attach_agent");
         Promise::from_future(
             async move {
+                // Create invoke channel if callback provided
+                let invoke_sender = if let Some(callback) = commands_callback {
+                    let (tx, mut rx) =
+                        tokio::sync::mpsc::channel::<InvokeRequest>(32);
+                    let nick_for_task = nick.clone();
+
+                    // Bridge task: recv InvokeRequest from channel, call capnp callback
+                    tokio::task::spawn_local(async move {
+                        while let Some(request) = rx.recv().await {
+                            let mut req = callback.invoke_request();
+                            {
+                                let mut p = req.get();
+                                p.set_action(&request.action);
+                                p.set_params(&request.params);
+                            }
+                            let result = match req.send().promise.await {
+                                Ok(response) => {
+                                    match response.get().and_then(|r| r.get_result()) {
+                                        Ok(data) => Ok(data.to_vec()),
+                                        Err(e) => Err(format!("capnp read error: {e}")),
+                                    }
+                                }
+                                Err(e) => Err(format!("RPC error: {e}")),
+                            };
+                            let _ = request.reply.send(InvokeResponse { result });
+                        }
+                        log::debug!(
+                            "Agent invoke bridge for '{}' ended",
+                            nick_for_task
+                        );
+                    });
+
+                    Some(tx)
+                } else {
+                    None
+                };
+
                 let agent_info = kernel_arc
-                    .attach_agent(config)
+                    .attach_agent(config, invoke_sender)
                     .await
                     .map_err(|e| capnp::Error::failed(format!("failed to attach agent: {}", e)))?;
 
@@ -3403,41 +3446,51 @@ impl kernel::Server for KernelImpl {
     ) -> Promise<(), capnp::Error> {
         let params_reader = pry!(params.get());
         let nick = pry!(pry!(params_reader.get_nick()).to_str()).to_owned();
-        let block_id_reader = pry!(params_reader.get_block_id());
         let action = pry!(pry!(params_reader.get_action()).to_str()).to_owned();
-
-        // Parse block ID
-        let block_id = pry!(parse_block_id_from_reader(&block_id_reader));
+        let invoke_params = pry!(params_reader.get_params()).to_vec();
 
         let kernel_arc = self.kernel.kernel.clone();
 
         let span = tracing::info_span!("rpc", method = "invoke_agent");
         Promise::from_future(
             async move {
-                // Generate a request ID for tracking
-                let request_id = uuid::Uuid::new_v4().to_string();
-
-                // Emit a started event
+                // Emit started event
                 kernel_arc
                     .emit_agent_event(AgentActivityEvent::Started {
                         agent: nick.clone(),
-                        block_id: block_id.to_string(),
+                        block_id: String::new(),
                         action: action.clone(),
                     })
                     .await;
 
-                // TODO: Actually invoke the agent's capability here
-                // For now, just emit a completed event
-                kernel_arc
-                    .emit_agent_event(AgentActivityEvent::Completed {
-                        agent: nick.clone(),
-                        block_id: block_id.to_string(),
-                        success: true,
-                    })
+                // Dispatch to the target agent via its registered channel
+                let result = kernel_arc
+                    .invoke_agent(&nick, &action, invoke_params)
                     .await;
 
-                results.get().set_request_id(&request_id);
-                Ok(())
+                match result {
+                    Ok(data) => {
+                        kernel_arc
+                            .emit_agent_event(AgentActivityEvent::Completed {
+                                agent: nick,
+                                block_id: String::new(),
+                                success: true,
+                            })
+                            .await;
+                        results.get().set_result(&data);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        kernel_arc
+                            .emit_agent_event(AgentActivityEvent::Completed {
+                                agent: nick,
+                                block_id: String::new(),
+                                success: false,
+                            })
+                            .await;
+                        Err(capnp::Error::failed(format!("invoke_agent: {e}")))
+                    }
+                }
             }
             .instrument(span),
         )

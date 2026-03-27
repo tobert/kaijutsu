@@ -1299,6 +1299,91 @@ impl KernelHandle {
     }
 
     // =========================================================================
+    // Agent Invocation
+    // =========================================================================
+
+    /// Attach as an agent with a commands callback.
+    ///
+    /// Creates an `AgentCommands` capnp server backed by an mpsc channel.
+    /// Returns the channel receiver so the caller can process invocations.
+    #[tracing::instrument(skip(self, config), name = "rpc_client.attach_agent")]
+    pub async fn attach_agent(
+        &self,
+        config: &crate::actor::AgentConfig,
+    ) -> Result<
+        (
+            crate::actor::AgentAttachResult,
+            tokio::sync::mpsc::Receiver<crate::actor::AgentInvocation>,
+        ),
+        RpcError,
+    > {
+        use crate::kaijutsu_capnp::AgentCapability as CapEnum;
+
+        let (inv_tx, inv_rx) = tokio::sync::mpsc::channel(32);
+
+        // Create capnp server for the callback
+        let commands_impl = AgentCommandsImpl { tx: inv_tx };
+        let commands_client: crate::kaijutsu_capnp::agent_commands::Client =
+            capnp_rpc::new_client(commands_impl);
+
+        let mut request = self.kernel.attach_agent_request();
+        {
+            let mut cfg = request.get().init_config();
+            cfg.set_nick(&config.nick);
+            cfg.set_instance(&config.instance);
+            cfg.set_provider(&config.provider);
+            cfg.set_model_id(&config.model_id);
+
+            let mut caps = cfg.reborrow().init_capabilities(config.capabilities.len() as u32);
+            for (i, c) in config.capabilities.iter().enumerate() {
+                let cap = match c.as_str() {
+                    "spell_check" => CapEnum::SpellCheck,
+                    "grammar" => CapEnum::Grammar,
+                    "format" => CapEnum::Format,
+                    "review" => CapEnum::Review,
+                    "generate" => CapEnum::Generate,
+                    "refactor" => CapEnum::Refactor,
+                    "explain" => CapEnum::Explain,
+                    "translate" => CapEnum::Translate,
+                    "summarize" => CapEnum::Summarize,
+                    _ => CapEnum::Custom,
+                };
+                caps.set(i as u32, cap);
+            }
+
+            request.get().set_commands(commands_client);
+        }
+
+        let response = request.send().promise.await?;
+        let info = response.get()?.get_info()?;
+        let result = crate::actor::AgentAttachResult {
+            nick: info.get_nick()?.to_string()?,
+            instance: info.get_instance()?.to_string()?,
+        };
+
+        Ok((result, inv_rx))
+    }
+
+    /// Invoke another agent through the kernel.
+    #[tracing::instrument(skip(self, params), name = "rpc_client.invoke_agent")]
+    pub async fn invoke_agent(
+        &self,
+        nick: &str,
+        action: &str,
+        params: &[u8],
+    ) -> Result<Vec<u8>, RpcError> {
+        let mut request = self.kernel.invoke_agent_request();
+        {
+            let mut p = request.get();
+            p.set_nick(nick);
+            p.set_action(action);
+            p.set_params(params);
+        }
+        let response = request.send().promise.await?;
+        Ok(response.get()?.get_result()?.to_vec())
+    }
+
+    // =========================================================================
     // Shell Variable Introspection
     // =========================================================================
 
@@ -2384,5 +2469,57 @@ mod tests {
         let parsed = roundtrip_snapshot(&snap);
 
         assert_eq!(parsed.tool_kind, Some(ToolKind::Mcp));
+    }
+}
+
+// ============================================================================
+// AgentCommands capnp server (client-side callback)
+// ============================================================================
+
+/// Implements the `AgentCommands` Cap'n Proto interface on the client side.
+///
+/// Lives in `spawn_local` (is `!Send`). Forwards invocations to the caller
+/// via an mpsc channel so they can be processed on any thread.
+struct AgentCommandsImpl {
+    tx: tokio::sync::mpsc::Sender<crate::actor::AgentInvocation>,
+}
+
+impl crate::kaijutsu_capnp::agent_commands::Server for AgentCommandsImpl {
+    async fn invoke(
+        self: capnp::capability::Rc<Self>,
+        params: crate::kaijutsu_capnp::agent_commands::InvokeParams,
+        mut results: crate::kaijutsu_capnp::agent_commands::InvokeResults,
+    ) -> Result<(), capnp::Error> {
+        let action = params
+            .get()?
+            .get_action()?
+            .to_str()
+            .unwrap_or_default()
+            .to_string();
+        let invoke_params = params.get()?.get_params()?.to_vec();
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let invocation = crate::actor::AgentInvocation {
+            action,
+            params: invoke_params,
+            reply: reply_tx,
+        };
+
+        self.tx
+            .send(invocation)
+            .await
+            .map_err(|_| capnp::Error::failed("agent handler disconnected".into()))?;
+
+        let response = reply_rx
+            .await
+            .map_err(|_| capnp::Error::failed("agent handler dropped reply".into()))?;
+
+        match response {
+            Ok(data) => {
+                results.get().set_result(&data);
+                Ok(())
+            }
+            Err(e) => Err(capnp::Error::failed(e)),
+        }
     }
 }

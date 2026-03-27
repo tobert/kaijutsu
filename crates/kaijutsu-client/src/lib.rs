@@ -17,7 +17,9 @@ pub mod kaijutsu_capnp {
     include!(concat!(env!("OUT_DIR"), "/kaijutsu_capnp.rs"));
 }
 
-pub use actor::{ActorError, ActorHandle, spawn_actor};
+pub use actor::{
+    ActorError, ActorHandle, AgentAttachResult, AgentConfig, AgentInvocation, spawn_actor,
+};
 pub use rpc::{
     ClientToolFilter, Completion, CompletionKind, ConsentMode, ContextInfo, ContextMembership,
     HistoryEntry, Identity, InputState, KernelConfig, KernelHandle, KernelInfo, LlmConfigInfo,

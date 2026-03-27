@@ -289,6 +289,46 @@ enum RpcCommand {
         instance: String,
         reply: oneshot::Sender<Result<ContextId, ActorError>>,
     },
+
+    // ── Agents ──────────────────────────────────────────────────────────
+    AttachAgent {
+        config: AgentConfig,
+        reply: oneshot::Sender<
+            Result<(AgentAttachResult, mpsc::Receiver<AgentInvocation>), ActorError>,
+        >,
+    },
+    InvokeAgent {
+        nick: String,
+        action: String,
+        params: Vec<u8>,
+        reply: oneshot::Sender<Result<Vec<u8>, ActorError>>,
+    },
+}
+
+// ── Client-side agent types ─────────────────────────────────────────────
+
+/// Configuration for attaching as an agent to the kernel.
+#[derive(Debug, Clone)]
+pub struct AgentConfig {
+    pub nick: String,
+    pub instance: String,
+    pub provider: String,
+    pub model_id: String,
+    pub capabilities: Vec<String>,
+}
+
+/// Result from a successful agent attachment.
+#[derive(Debug, Clone)]
+pub struct AgentAttachResult {
+    pub nick: String,
+    pub instance: String,
+}
+
+/// An invocation received from the kernel via the AgentCommands callback.
+pub struct AgentInvocation {
+    pub action: String,
+    pub params: Vec<u8>,
+    pub reply: oneshot::Sender<Result<Vec<u8>, String>>,
 }
 
 impl RpcCommand {
@@ -425,6 +465,12 @@ impl RpcCommand {
                 let _ = reply.send(Err(err));
             }
             Self::JoinContext { reply, .. } => {
+                let _ = reply.send(Err(err));
+            }
+            Self::AttachAgent { reply, .. } => {
+                let _ = reply.send(Err(err));
+            }
+            Self::InvokeAgent { reply, .. } => {
                 let _ = reply.send(Err(err));
             }
         }
@@ -1047,6 +1093,38 @@ impl ActorHandle {
     #[tracing::instrument(skip(self))]
     pub async fn list_kernels(&self) -> Result<Vec<KernelInfo>, ActorError> {
         self.send(|reply| RpcCommand::ListKernels { reply }).await
+    }
+
+    // ── Agents ──────────────────────────────────────────────────────────
+
+    /// Attach this client as an agent to the kernel.
+    ///
+    /// Returns the attach result and a receiver for incoming invocations.
+    /// The receiver yields `AgentInvocation`s — respond via the oneshot reply.
+    #[tracing::instrument(skip(self, config))]
+    pub async fn attach_agent(
+        &self,
+        config: AgentConfig,
+    ) -> Result<(AgentAttachResult, mpsc::Receiver<AgentInvocation>), ActorError> {
+        self.send(|reply| RpcCommand::AttachAgent { config, reply })
+            .await
+    }
+
+    /// Invoke another agent's capability through the kernel.
+    #[tracing::instrument(skip(self, params))]
+    pub async fn invoke_agent(
+        &self,
+        nick: &str,
+        action: &str,
+        params: &[u8],
+    ) -> Result<Vec<u8>, ActorError> {
+        self.send(|reply| RpcCommand::InvokeAgent {
+            nick: nick.to_string(),
+            action: action.to_string(),
+            params: params.to_vec(),
+            reply,
+        })
+        .await
     }
 }
 
@@ -1701,6 +1779,20 @@ async fn dispatch_command(
             let _ = reply.send(Err(ActorError::Rpc(
                 "inline command in kernel dispatch".into(),
             )));
+        }
+
+        // ── Agents ──────────────────────────────────────────────
+        RpcCommand::AttachAgent { config, reply } => {
+            let result = kernel.attach_agent(&config).await;
+            let _ = reply.send(result.map_err(|e| ActorError::Rpc(e.to_string())));
+        }
+        RpcCommand::InvokeAgent {
+            nick,
+            action,
+            params,
+            reply,
+        } => {
+            rpc_call!(kernel, reply, err_tx, k, k.invoke_agent(&nick, &action, &params));
         }
     }
 }
