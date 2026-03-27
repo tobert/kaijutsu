@@ -2,25 +2,24 @@
 
 use bevy::prelude::*;
 use std::sync::Mutex;
-use tokio::sync::mpsc;
 
 use super::registry::{AgentActivityMessage, AgentRegistry};
 use super::systems;
 
 /// Channel for async agent invocation handler → Bevy systems.
 ///
-/// Same pattern as `RpcResultChannel`: unbounded mpsc with `Mutex<Receiver>`
-/// polled each frame. Invocations arrive from the kernel via the
-/// `AgentCommands` callback and are dispatched by `poll_agent_invocations`.
+/// Uses `std::sync::mpsc` (not tokio) because the sender lives inside a
+/// capnp server dispatch on a tokio LocalSet, while the receiver is polled
+/// by a Bevy system. `std::sync::mpsc::Sender` works from any thread/executor.
 #[derive(Resource)]
 pub struct AgentInvocationChannel {
-    pub tx: mpsc::UnboundedSender<kaijutsu_client::AgentInvocation>,
-    pub rx: Mutex<mpsc::UnboundedReceiver<kaijutsu_client::AgentInvocation>>,
+    pub tx: std::sync::mpsc::Sender<kaijutsu_client::AgentInvocation>,
+    pub rx: Mutex<std::sync::mpsc::Receiver<kaijutsu_client::AgentInvocation>>,
 }
 
 impl AgentInvocationChannel {
     pub fn new() -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = std::sync::mpsc::channel();
         Self {
             tx,
             rx: Mutex::new(rx),

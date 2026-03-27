@@ -293,9 +293,8 @@ enum RpcCommand {
     // ── Agents ──────────────────────────────────────────────────────────
     AttachAgent {
         config: AgentConfig,
-        reply: oneshot::Sender<
-            Result<(AgentAttachResult, mpsc::Receiver<AgentInvocation>), ActorError>,
-        >,
+        invocation_tx: std::sync::mpsc::Sender<AgentInvocation>,
+        reply: oneshot::Sender<Result<AgentAttachResult, ActorError>>,
     },
     InvokeAgent {
         nick: String,
@@ -1099,15 +1098,20 @@ impl ActorHandle {
 
     /// Attach this client as an agent to the kernel.
     ///
-    /// Returns the attach result and a receiver for incoming invocations.
-    /// The receiver yields `AgentInvocation`s — respond via the oneshot reply.
-    #[tracing::instrument(skip(self, config))]
+    /// Invocations from the kernel are sent to `invocation_tx`. The receiver
+    /// can be polled from any executor (uses `std::sync::mpsc`).
+    #[tracing::instrument(skip(self, config, invocation_tx))]
     pub async fn attach_agent(
         &self,
         config: AgentConfig,
-    ) -> Result<(AgentAttachResult, mpsc::Receiver<AgentInvocation>), ActorError> {
-        self.send(|reply| RpcCommand::AttachAgent { config, reply })
-            .await
+        invocation_tx: std::sync::mpsc::Sender<AgentInvocation>,
+    ) -> Result<AgentAttachResult, ActorError> {
+        self.send(|reply| RpcCommand::AttachAgent {
+            config,
+            invocation_tx,
+            reply,
+        })
+        .await
     }
 
     /// Invoke another agent's capability through the kernel.
@@ -1782,8 +1786,12 @@ async fn dispatch_command(
         }
 
         // ── Agents ──────────────────────────────────────────────
-        RpcCommand::AttachAgent { config, reply } => {
-            let result = kernel.attach_agent(&config).await;
+        RpcCommand::AttachAgent {
+            config,
+            invocation_tx,
+            reply,
+        } => {
+            let result = kernel.attach_agent(&config, invocation_tx).await;
             let _ = reply.send(result.map_err(|e| ActorError::Rpc(e.to_string())));
         }
         RpcCommand::InvokeAgent {

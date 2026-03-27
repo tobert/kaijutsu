@@ -107,7 +107,7 @@ pub fn poll_agent_invocations(
     drift: Res<DriftState>,
     mut switch_writer: MessageWriter<ContextSwitchRequested>,
 ) {
-    let Ok(mut rx) = channel.rx.lock() else {
+    let Ok(rx) = channel.rx.lock() else {
         return;
     };
     while let Ok(invocation) = rx.try_recv() {

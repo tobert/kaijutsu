@@ -233,33 +233,35 @@ fn poll_bootstrap_results(
                             }
                         };
 
-                        // 1b. Register as an agent so the kernel can invoke us
-                        let h2 = h.clone();
-                        let inv_tx2 = inv_tx;
-                        tokio::spawn(async move {
-                            let config = kaijutsu_client::AgentConfig {
-                                nick: "kaijutsu-app".to_string(),
-                                instance: "ui".to_string(),
-                                provider: "local".to_string(),
-                                model_id: "bevy".to_string(),
-                                capabilities: vec!["custom".to_string()],
-                            };
-                            match h2.attach_agent(config).await {
-                                Ok((_info, mut rx)) => {
-                                    log::info!("App registered as agent: kaijutsu-app");
-                                    // Forward invocations to Bevy channel
-                                    while let Some(invocation) = rx.recv().await {
-                                        if inv_tx2.send(invocation).is_err() {
-                                            break; // Bevy channel closed
+                        // 1b. Register as an agent so the kernel can invoke us.
+                        // The invocation_tx sender goes into the capnp callback;
+                        // invocations arrive directly in AgentInvocationChannel.
+                        {
+                            let h2 = h.clone();
+                            let inv_tx2 = inv_tx;
+                            bevy::tasks::IoTaskPool::get()
+                                .spawn(async move {
+                                    let config = kaijutsu_client::AgentConfig {
+                                        nick: "kaijutsu-app".to_string(),
+                                        instance: "ui".to_string(),
+                                        provider: "local".to_string(),
+                                        model_id: "bevy".to_string(),
+                                        capabilities: vec!["custom".to_string()],
+                                    };
+                                    match h2.attach_agent(config, inv_tx2).await {
+                                        Ok(info) => {
+                                            log::info!(
+                                                "App registered as agent: {}",
+                                                info.nick
+                                            );
+                                        }
+                                        Err(e) => {
+                                            log::warn!("Failed to register as agent: {e}");
                                         }
                                     }
-                                    log::debug!("Agent invocation forwarder ended");
-                                }
-                                Err(e) => {
-                                    log::warn!("Failed to register as agent: {e}");
-                                }
-                            }
-                        });
+                                })
+                                .detach();
+                        }
 
                         // 2. If we joined a specific context, fetch its state
                         if let Some(ctx_id) = ctx_id {

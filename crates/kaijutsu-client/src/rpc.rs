@@ -1306,23 +1306,21 @@ impl KernelHandle {
     ///
     /// Creates an `AgentCommands` capnp server backed by an mpsc channel.
     /// Returns the channel receiver so the caller can process invocations.
-    #[tracing::instrument(skip(self, config), name = "rpc_client.attach_agent")]
+    /// Attach as an agent with a commands callback.
+    ///
+    /// The `invocation_tx` sender receives incoming invocations from the
+    /// kernel. Use `std::sync::mpsc` so the receiver can be polled from
+    /// any executor (including Bevy's non-tokio task pool).
+    #[tracing::instrument(skip(self, config, invocation_tx), name = "rpc_client.attach_agent")]
     pub async fn attach_agent(
         &self,
         config: &crate::actor::AgentConfig,
-    ) -> Result<
-        (
-            crate::actor::AgentAttachResult,
-            tokio::sync::mpsc::Receiver<crate::actor::AgentInvocation>,
-        ),
-        RpcError,
-    > {
+        invocation_tx: std::sync::mpsc::Sender<crate::actor::AgentInvocation>,
+    ) -> Result<crate::actor::AgentAttachResult, RpcError> {
         use crate::kaijutsu_capnp::AgentCapability as CapEnum;
 
-        let (inv_tx, inv_rx) = tokio::sync::mpsc::channel(32);
-
         // Create capnp server for the callback
-        let commands_impl = AgentCommandsImpl { tx: inv_tx };
+        let commands_impl = AgentCommandsImpl { tx: invocation_tx };
         let commands_client: crate::kaijutsu_capnp::agent_commands::Client =
             capnp_rpc::new_client(commands_impl);
 
@@ -1361,7 +1359,7 @@ impl KernelHandle {
             instance: info.get_instance()?.to_string()?,
         };
 
-        Ok((result, inv_rx))
+        Ok(result)
     }
 
     /// Invoke another agent through the kernel.
@@ -2481,7 +2479,7 @@ mod tests {
 /// Lives in `spawn_local` (is `!Send`). Forwards invocations to the caller
 /// via an mpsc channel so they can be processed on any thread.
 struct AgentCommandsImpl {
-    tx: tokio::sync::mpsc::Sender<crate::actor::AgentInvocation>,
+    tx: std::sync::mpsc::Sender<crate::actor::AgentInvocation>,
 }
 
 impl crate::kaijutsu_capnp::agent_commands::Server for AgentCommandsImpl {
@@ -2505,11 +2503,12 @@ impl crate::kaijutsu_capnp::agent_commands::Server for AgentCommandsImpl {
             reply: reply_tx,
         };
 
+        // std::sync::mpsc::Sender::send is non-blocking and works from any executor
         self.tx
             .send(invocation)
-            .await
             .map_err(|_| capnp::Error::failed("agent handler disconnected".into()))?;
 
+        // Await the reply (this runs on a tokio LocalSet, so oneshot works)
         let response = reply_rx
             .await
             .map_err(|_| capnp::Error::failed("agent handler dropped reply".into()))?;
