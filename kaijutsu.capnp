@@ -648,6 +648,13 @@ interface AgentEvents {
   onActivity @0 (event :AgentActivityEvent);
 }
 
+# Callback for receiving agent invocations (reverse RPC).
+# Registered via attachAgent; the kernel calls back to dispatch work.
+# Same pattern as MCP sampling: server holds callback to client.
+interface AgentCommands {
+  invoke @0 (action :Text, params :Data) -> (result :Data);
+}
+
 # ============================================================================
 # MCP (Model Context Protocol) Types
 # ============================================================================
@@ -910,8 +917,9 @@ interface Kernel {
   # ============================================================================
   # Agents are autonomous participants that can edit content alongside humans.
 
-  # Attach an agent to this kernel
-  attachAgent @44 (config :AgentConfig) -> (info :AgentInfo);
+  # Attach an agent to this kernel.
+  # The optional `commands` callback enables kernel → agent invocation.
+  attachAgent @44 (config :AgentConfig, commands :AgentCommands) -> (info :AgentInfo);
 
   # List all attached agents on this kernel
   listAgents @45 () -> (agents :List(AgentInfo));
@@ -922,8 +930,8 @@ interface Kernel {
   # Update agent capabilities
   setAgentCapabilities @47 (nick :Text, capabilities :List(AgentCapability));
 
-  # Invoke an agent on a specific block (e.g., spell-check focused content)
-  invokeAgent @48 (nick :Text, blockId :BlockId, action :Text) -> (requestId :Text);
+  # Invoke an agent's capability. Params and result are JSON bytes.
+  invokeAgent @48 (nick :Text, action :Text, params :Data) -> (result :Data);
 
   # Subscribe to agent activity events
   subscribeAgentEvents @49 (callback :AgentEvents);

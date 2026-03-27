@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crate::agents::{
     AgentActivityEvent, AgentCapability, AgentConfig, AgentError, AgentInfo, AgentRegistry,
-    AgentStatus,
+    AgentStatus, InvokeRequest,
 };
 use crate::control::ConsentMode;
 use crate::drift::{SharedDriftRouter, shared_drift_router};
@@ -389,9 +389,49 @@ impl Kernel {
 
     /// Attach an agent to this kernel.
     ///
-    /// The agent will be able to participate in editing alongside users.
-    pub async fn attach_agent(&self, config: AgentConfig) -> Result<AgentInfo, AgentError> {
-        self.agents.write().await.attach(config)
+    /// The optional `invoke_sender` enables kernel → agent invocation.
+    pub async fn attach_agent(
+        &self,
+        config: AgentConfig,
+        invoke_sender: Option<tokio::sync::mpsc::Sender<InvokeRequest>>,
+    ) -> Result<AgentInfo, AgentError> {
+        self.agents.write().await.attach(config, invoke_sender)
+    }
+
+    /// Invoke an agent's capability by nick.
+    ///
+    /// Dispatches the request to the agent's registered channel and awaits
+    /// the response. Returns an error if the agent is not found or disconnected.
+    pub async fn invoke_agent(
+        &self,
+        nick: &str,
+        action: &str,
+        params: Vec<u8>,
+    ) -> Result<Vec<u8>, AgentError> {
+        let sender = {
+            let registry = self.agents.read().await;
+            registry
+                .get_invoke_sender(nick)
+                .ok_or_else(|| AgentError::NotFound(nick.to_string()))?
+        };
+        // RwLock released before the async send
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let request = InvokeRequest {
+            action: action.to_string(),
+            params,
+            reply: reply_tx,
+        };
+
+        sender.send(request).await.map_err(|_| {
+            AgentError::NotFound(format!("{} (disconnected)", nick))
+        })?;
+
+        let response = reply_rx.await.map_err(|_| {
+            AgentError::NotFound(format!("{} (handler dropped)", nick))
+        })?;
+
+        response.result.map_err(AgentError::InvocationFailed)
     }
 
     /// Detach an agent from this kernel.

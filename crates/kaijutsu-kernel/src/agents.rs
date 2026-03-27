@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 /// Agent capabilities - what actions an agent can perform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -230,10 +230,33 @@ pub enum AgentActivityEvent {
     },
 }
 
+// ── Agent Invocation ────────────────────────────────────────────────────────
+
+/// A request to invoke an agent's capability, dispatched via channel.
+pub struct InvokeRequest {
+    /// The action to perform (e.g., "switch_context", "active_context").
+    pub action: String,
+    /// JSON-encoded parameters.
+    pub params: Vec<u8>,
+    /// Oneshot channel for the response.
+    pub reply: oneshot::Sender<InvokeResponse>,
+}
+
+/// Response from an agent invocation.
+#[derive(Debug)]
+pub struct InvokeResponse {
+    /// JSON-encoded result, or error message.
+    pub result: Result<Vec<u8>, String>,
+}
+
+// ── Agent Registry ─────────────────────────────────────────────────────────
+
 /// Registry for tracking attached agents.
 pub struct AgentRegistry {
     /// Attached agents by nick.
     agents: HashMap<String, AgentInfo>,
+    /// Channel senders for agent invocation — stored separately so AgentInfo stays Clone.
+    invoke_senders: HashMap<String, mpsc::Sender<InvokeRequest>>,
     /// Event broadcast channel.
     events: broadcast::Sender<AgentActivityEvent>,
 }
@@ -250,27 +273,42 @@ impl AgentRegistry {
         let (events, _) = broadcast::channel(256);
         Self {
             agents: HashMap::new(),
+            invoke_senders: HashMap::new(),
             events,
         }
     }
 
     /// Attach an agent to this registry.
     ///
+    /// The optional `invoke_sender` enables kernel → agent invocation.
     /// Returns the AgentInfo if successful, or an error if the nick is already taken.
-    pub fn attach(&mut self, config: AgentConfig) -> Result<AgentInfo, AgentError> {
+    pub fn attach(
+        &mut self,
+        config: AgentConfig,
+        invoke_sender: Option<mpsc::Sender<InvokeRequest>>,
+    ) -> Result<AgentInfo, AgentError> {
         if self.agents.contains_key(&config.nick) {
             return Err(AgentError::NickTaken(config.nick));
         }
 
         let info = AgentInfo::from_config(config);
         let nick = info.nick.clone();
-        self.agents.insert(nick, info.clone());
+        self.agents.insert(nick.clone(), info.clone());
+        if let Some(sender) = invoke_sender {
+            self.invoke_senders.insert(nick, sender);
+        }
         Ok(info)
     }
 
     /// Detach an agent from this registry.
     pub fn detach(&mut self, nick: &str) -> Option<AgentInfo> {
+        self.invoke_senders.remove(nick);
         self.agents.remove(nick)
+    }
+
+    /// Get the invoke sender for an agent (if it registered one).
+    pub fn get_invoke_sender(&self, nick: &str) -> Option<mpsc::Sender<InvokeRequest>> {
+        self.invoke_senders.get(nick).cloned()
     }
 
     /// Get an agent by nick.
@@ -357,6 +395,9 @@ pub enum AgentError {
     /// Agent not found.
     #[error("agent not found: {0}")]
     NotFound(String),
+    /// Invocation failed.
+    #[error("agent invocation failed: {0}")]
+    InvocationFailed(String),
 }
 
 /// Shared agent registry (Arc-wrapped for async access).
@@ -383,14 +424,14 @@ mod tests {
             capabilities: vec![AgentCapability::SpellCheck, AgentCapability::Grammar],
         };
 
-        let info = registry.attach(config.clone()).unwrap();
+        let info = registry.attach(config.clone(), None).unwrap();
         assert_eq!(info.nick, "spell-check");
         assert!(info.has_capability(AgentCapability::SpellCheck));
         assert!(info.has_capability(AgentCapability::Grammar));
         assert!(!info.has_capability(AgentCapability::Review));
 
         // Can't attach same nick twice
-        assert!(registry.attach(config).is_err());
+        assert!(registry.attach(config, None).is_err());
 
         // Detach
         let detached = registry.detach("spell-check");
@@ -403,23 +444,29 @@ mod tests {
         let mut registry = AgentRegistry::new();
 
         registry
-            .attach(AgentConfig {
-                nick: "spell".to_string(),
-                instance: "quick".to_string(),
-                provider: "local".to_string(),
-                model_id: "tiny".to_string(),
-                capabilities: vec![AgentCapability::SpellCheck],
-            })
+            .attach(
+                AgentConfig {
+                    nick: "spell".to_string(),
+                    instance: "quick".to_string(),
+                    provider: "local".to_string(),
+                    model_id: "tiny".to_string(),
+                    capabilities: vec![AgentCapability::SpellCheck],
+                },
+                None,
+            )
             .unwrap();
 
         registry
-            .attach(AgentConfig {
-                nick: "reviewer".to_string(),
-                instance: "deep".to_string(),
-                provider: "anthropic".to_string(),
-                model_id: "claude-3-opus".to_string(),
-                capabilities: vec![AgentCapability::Review, AgentCapability::Refactor],
-            })
+            .attach(
+                AgentConfig {
+                    nick: "reviewer".to_string(),
+                    instance: "deep".to_string(),
+                    provider: "anthropic".to_string(),
+                    model_id: "claude-3-opus".to_string(),
+                    capabilities: vec![AgentCapability::Review, AgentCapability::Refactor],
+                },
+                None,
+            )
             .unwrap();
 
         let spell_agents = registry.with_capability(AgentCapability::SpellCheck);
@@ -429,5 +476,113 @@ mod tests {
         let review_agents = registry.with_capability(AgentCapability::Review);
         assert_eq!(review_agents.len(), 1);
         assert_eq!(review_agents[0].nick, "reviewer");
+    }
+
+    #[test]
+    fn test_attach_with_invoke_sender() {
+        let mut registry = AgentRegistry::new();
+        let (tx, _rx) = mpsc::channel(32);
+
+        let config = AgentConfig {
+            nick: "app".to_string(),
+            instance: "ui".to_string(),
+            provider: "local".to_string(),
+            model_id: "bevy".to_string(),
+            capabilities: vec![AgentCapability::Custom],
+        };
+
+        registry.attach(config, Some(tx)).unwrap();
+        assert!(registry.get_invoke_sender("app").is_some());
+        assert!(registry.get_invoke_sender("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_detach_cleans_sender() {
+        let mut registry = AgentRegistry::new();
+        let (tx, _rx) = mpsc::channel(32);
+
+        let config = AgentConfig {
+            nick: "app".to_string(),
+            instance: "ui".to_string(),
+            provider: "local".to_string(),
+            model_id: "bevy".to_string(),
+            capabilities: vec![AgentCapability::Custom],
+        };
+
+        registry.attach(config, Some(tx)).unwrap();
+        assert!(registry.get_invoke_sender("app").is_some());
+
+        registry.detach("app");
+        assert!(registry.get_invoke_sender("app").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_invoke_roundtrip() {
+        let mut registry = AgentRegistry::new();
+        let (tx, mut rx) = mpsc::channel(32);
+
+        let config = AgentConfig {
+            nick: "echo".to_string(),
+            instance: "test".to_string(),
+            provider: "local".to_string(),
+            model_id: "test".to_string(),
+            capabilities: vec![AgentCapability::Custom],
+        };
+        registry.attach(config, Some(tx)).unwrap();
+
+        // Spawn handler that echoes back the action
+        tokio::spawn(async move {
+            while let Some(req) = rx.recv().await {
+                let response = format!("echo: {}", req.action);
+                let _ = req.reply.send(InvokeResponse {
+                    result: Ok(response.into_bytes()),
+                });
+            }
+        });
+
+        // Invoke
+        let sender = registry.get_invoke_sender("echo").unwrap();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        sender
+            .send(InvokeRequest {
+                action: "hello".to_string(),
+                params: vec![],
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+
+        let response = reply_rx.await.unwrap();
+        assert_eq!(response.result.unwrap(), b"echo: hello");
+    }
+
+    #[tokio::test]
+    async fn test_invoke_disconnected() {
+        let mut registry = AgentRegistry::new();
+        let (tx, rx) = mpsc::channel(32);
+
+        let config = AgentConfig {
+            nick: "gone".to_string(),
+            instance: "test".to_string(),
+            provider: "local".to_string(),
+            model_id: "test".to_string(),
+            capabilities: vec![AgentCapability::Custom],
+        };
+        registry.attach(config, Some(tx)).unwrap();
+
+        // Drop the receiver to simulate disconnection
+        drop(rx);
+
+        let sender = registry.get_invoke_sender("gone").unwrap();
+        let (reply_tx, _reply_rx) = oneshot::channel();
+        let result = sender
+            .send(InvokeRequest {
+                action: "test".to_string(),
+                params: vec![],
+                reply: reply_tx,
+            })
+            .await;
+
+        assert!(result.is_err()); // channel closed
     }
 }

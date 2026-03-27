@@ -33,7 +33,7 @@ pub mod vfs;
 
 pub use agents::{
     AgentActivityEvent, AgentCapability, AgentConfig, AgentError, AgentInfo, AgentRegistry,
-    AgentStatus, SharedAgentRegistry, shared_agent_registry,
+    AgentStatus, InvokeRequest, InvokeResponse, SharedAgentRegistry, shared_agent_registry,
 };
 pub use block_store::DocumentKind;
 pub use block_store::{
