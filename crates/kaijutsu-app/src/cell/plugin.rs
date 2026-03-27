@@ -30,7 +30,7 @@ pub enum CellPhase {
 
 use super::block_border;
 use crate::ui::tiling_reconciler::TilingPhase;
-use crate::view::overlay::{OverlayAnimation, OverlayStyle, OverlaySummonState};
+use crate::view::overlay::{OverlayStyle, OverlaySummonState};
 use crate::view::{
     BlockCellContainer, BlockCellLayout, ContextSwitchRequested, ConversationContainer,
     ConversationScrollState, DocumentCache, EditorEntities, FocusTarget, LayoutGeneration,
@@ -64,8 +64,7 @@ impl Plugin for CellPlugin {
             .register_type::<BlockCellLayout>()
             .register_type::<RoleGroupBorderLayout>()
             .register_type::<block_border::BlockBorderStyle>()
-            .register_type::<OverlayStyle>()
-            .register_type::<OverlayAnimation>();
+            .register_type::<OverlayStyle>();
 
         // Configure SystemSet execution order
         app.configure_sets(

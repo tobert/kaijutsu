@@ -125,10 +125,6 @@ impl MsdfGenerator {
         }
     }
 
-    /// Check if there are pending tasks.
-    pub fn has_pending(&self) -> bool {
-        !self.tasks.is_empty()
-    }
 }
 
 /// Generate MSDF for a single glyph.

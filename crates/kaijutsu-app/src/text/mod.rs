@@ -12,7 +12,7 @@ mod resources;
 pub mod rich;
 pub mod sparkline;
 
-pub use components::{KjText, KjTextEffects, bevy_color_to_brush, vello_style};
+pub use components::{KjTextEffects, bevy_color_to_brush, vello_style};
 pub use plugin::KjTextPlugin;
 pub use resources::{FontHandles, SvgFontDb, TextMetrics};
 pub use rich::RichContent;

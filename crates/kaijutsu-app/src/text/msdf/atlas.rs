@@ -76,9 +76,6 @@ pub struct MsdfAtlas {
 impl MsdfAtlas {
     /// Default MSDF range (distance field extent in pixels).
     pub const DEFAULT_RANGE: f32 = 4.0;
-    /// Default pixels per em for MSDF generation.
-    pub const DEFAULT_PX_PER_EM: f64 = 64.0;
-
     /// Create a new atlas with the given initial dimensions.
     pub fn new(images: &mut Assets<Image>, width: u32, height: u32) -> Self {
         let pixels = vec![0u8; (width * height * 4) as usize];
@@ -119,11 +116,6 @@ impl MsdfAtlas {
             msdf_range: Self::DEFAULT_RANGE,
             version: 1,
         }
-    }
-
-    /// Get the atlas region for a glyph, or None if not present.
-    pub fn get(&self, key: GlyphKey) -> Option<&AtlasRegion> {
-        self.regions.get(&key)
     }
 
     /// Check if a glyph is present in the atlas.
@@ -191,96 +183,6 @@ impl MsdfAtlas {
         self.insert(key, PLACEHOLDER_SIZE, PLACEHOLDER_SIZE, 0.0, 0.0, &data)
     }
 
-    /// Grow the atlas to accommodate more glyphs.
-    pub fn grow(&mut self, images: &mut Assets<Image>) -> bool {
-        let new_width = self.width * 2;
-        let new_height = self.height * 2;
-
-        if new_width > 8192 || new_height > 8192 {
-            warn!("MSDF atlas cannot grow beyond 8192x8192");
-            return false;
-        }
-
-        info!(
-            "Growing MSDF atlas from {}x{} to {}x{}",
-            self.width, self.height, new_width, new_height
-        );
-
-        let mut new_pixels = vec![0u8; (new_width * new_height * 4) as usize];
-
-        // Recreate packer with new dimensions
-        let padding = (Self::DEFAULT_RANGE as i32) + 2;
-        let packer_config = PackerConfig {
-            width: new_width as i32,
-            height: new_height as i32,
-            border_padding: padding,
-            rectangle_padding: padding,
-        };
-        self.packer = Packer::new(packer_config);
-
-        // Re-pack existing regions: copy directly from old pixels to new pixels.
-        // This avoids overlapping copy corruption that would happen with copy_within.
-        let old_regions: Vec<(GlyphKey, AtlasRegion)> = self.regions.drain().collect();
-        for (key, old_region) in old_regions {
-            if let Some(new_rect) =
-                self.packer
-                    .pack(old_region.width as i32, old_region.height as i32, false)
-            {
-                let new_x = new_rect.x as u32;
-                let new_y = new_rect.y as u32;
-
-                for row in 0..old_region.height {
-                    let src_offset = ((old_region.y + row) * self.width * 4
-                        + old_region.x * 4)
-                        as usize;
-                    let dst_offset =
-                        ((new_y + row) * new_width * 4 + new_x * 4) as usize;
-                    let row_bytes = (old_region.width * 4) as usize;
-                    new_pixels[dst_offset..dst_offset + row_bytes]
-                        .copy_from_slice(&self.pixels[src_offset..src_offset + row_bytes]);
-                }
-
-                self.regions.insert(
-                    key,
-                    AtlasRegion {
-                        x: new_x,
-                        y: new_y,
-                        width: old_region.width,
-                        height: old_region.height,
-                        anchor_x: old_region.anchor_x,
-                        anchor_y: old_region.anchor_y,
-                    },
-                );
-            } else {
-                warn!("Failed to re-pack glyph during atlas growth — glyph lost");
-            }
-        }
-
-        self.pixels = new_pixels;
-        self.width = new_width;
-        self.height = new_height;
-
-        // Update the texture
-        let image = Image::new(
-            Extent3d {
-                width: new_width,
-                height: new_height,
-                depth_or_array_layers: 1,
-            },
-            TextureDimension::D2,
-            self.pixels.clone(),
-            TextureFormat::Rgba8Unorm,
-            default(),
-        );
-
-        if let Some(img) = images.get_mut(&self.texture) {
-            *img = image;
-        }
-
-        self.dirty = true;
-        true
-    }
-
     /// Sync the CPU pixel data to the GPU texture.
     pub fn sync_to_gpu(&mut self, images: &mut Assets<Image>) {
         if !self.dirty {
@@ -294,26 +196,6 @@ impl MsdfAtlas {
         self.dirty = false;
     }
 
-    /// Get current atlas dimensions.
-    pub fn texture_size(&self) -> (u32, u32) {
-        (self.width, self.height)
-    }
-
-    /// Dump the atlas texture to a raw RGBA file for debugging.
-    #[cfg(debug_assertions)]
-    pub fn dump_to_file(&self, path: &std::path::Path) -> std::io::Result<(u32, u32)> {
-        use std::io::Write;
-        let mut file = std::fs::File::create(path)?;
-        file.write_all(&self.pixels)?;
-        info!(
-            "Dumped MSDF atlas ({}x{}, {} glyphs) to {:?}",
-            self.width,
-            self.height,
-            self.regions.len(),
-            path
-        );
-        Ok((self.width, self.height))
-    }
 }
 
 #[cfg(test)]

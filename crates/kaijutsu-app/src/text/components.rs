@@ -7,13 +7,6 @@ use bevy::prelude::*;
 use bevy_vello::integrations::text::VelloFontAxes;
 use bevy_vello::prelude::*;
 
-/// Marker component for block-level text entities (conversation blocks, role headers).
-///
-/// Used by screen transitions to hide/show cell text that isn't parented
-/// under the conversation root.
-#[derive(Component, Default)]
-pub struct KjText;
-
 /// Rainbow color cycling effect marker.
 ///
 /// When present, the text brush uses a gradient instead of a solid color.

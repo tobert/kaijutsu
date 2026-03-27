@@ -27,41 +27,24 @@ use crate::view::components::OverlayCursorGeometry;
 // ============================================================================
 
 /// Style for the command palette overlay.
+///
+/// Only stores values consumed directly by the parent entity's Bevy UI
+/// components. Border/glow styling lives on the child's `BlockBorderStyle`
+/// and is read by the shader system from `Theme` directly.
 #[derive(Component, Reflect, Clone)]
 #[reflect(Component)]
 pub struct OverlayStyle {
     pub bg_color: Color,
-    pub border_color: Color,
-    pub border_thickness: f32,
     pub corner_radius: f32,
-    pub glow_radius: f32,
-    pub glow_intensity: f32,
-    pub animation: OverlayAnimation,
 }
 
 impl Default for OverlayStyle {
     fn default() -> Self {
         Self {
             bg_color: Color::srgba(0.102, 0.106, 0.149, 0.95),
-            border_color: Color::srgb(0.478, 0.635, 0.969),
-            border_thickness: 2.0,
             corner_radius: 8.0,
-            glow_radius: 6.0,
-            glow_intensity: 0.25,
-            animation: OverlayAnimation::Breathe,
         }
     }
-}
-
-/// Animation style for the overlay border.
-#[derive(Default, Clone, Copy, PartialEq, Eq, Reflect, Debug)]
-pub enum OverlayAnimation {
-    #[default]
-    None,
-    /// Subtle alpha oscillation
-    Breathe,
-    /// Running light around border
-    Chase,
 }
 
 /// Summon animation state.
@@ -79,9 +62,10 @@ pub struct OverlaySummonState {
 // SPAWN SYSTEM
 // ============================================================================
 
-/// Spawn the InputOverlay entity with two children:
-/// 1. MSDF text surface (BlockScene + BlockFxMaterial for shader borders)
-/// 2. Cursor overlay (UiVelloScene for beam drawing)
+/// Spawn the InputOverlay entity with one MSDF text child.
+///
+/// The child holds the `BlockScene` + `BlockFxMaterial` for MSDF text,
+/// shader-drawn borders, and cursor beam rendering.
 pub fn spawn_input_overlay(
     mut commands: Commands,
     existing: Query<Entity, With<InputOverlayMarker>>,
@@ -94,12 +78,7 @@ pub fn spawn_input_overlay(
 
     let style = OverlayStyle {
         bg_color: theme.compose_bg.with_alpha(0.95),
-        border_color: theme.compose_palette_border,
-        border_thickness: 2.0,
         corner_radius: 8.0,
-        glow_radius: theme.compose_palette_glow_radius,
-        glow_intensity: theme.compose_palette_glow_intensity,
-        animation: OverlayAnimation::Breathe,
     };
 
     let material_handle = fx_materials.add(BlockFxMaterial::default());
@@ -336,7 +315,7 @@ pub fn build_overlay_glyphs(
             let total_height = content_height + pad.top + pad.bottom;
             block_scene.built_width = width;
             block_scene.built_height = total_height;
-            block_scene.text = display.clone();
+            block_scene.text = display;
             block_scene.color = text_color;
             block_scene.content_version = block_scene.content_version.wrapping_add(1);
             block_scene.last_built_version = block_scene.content_version;
@@ -379,9 +358,6 @@ pub fn sync_overlay_style_to_theme(
     for (mut style, mut bg, children) in overlay_query.iter_mut() {
         let new_bg = theme.compose_bg.with_alpha(0.95);
         style.bg_color = new_bg;
-        style.border_color = theme.compose_palette_border;
-        style.glow_radius = theme.compose_palette_glow_radius;
-        style.glow_intensity = theme.compose_palette_glow_intensity;
         *bg = BackgroundColor(new_bg);
 
         // Sync border style on MSDF child

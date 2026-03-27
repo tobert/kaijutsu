@@ -112,10 +112,12 @@ fn sync_block_fx(
                     mat.cursor_color = Vec4::new(c.x, c.y, c.z, c.w);
                 } else {
                     mat.cursor_params = Vec4::ZERO;
+                    mat.cursor_color = Vec4::ZERO;
                 }
             }
         } else {
             mat.cursor_params = Vec4::ZERO;
+            mat.cursor_color = Vec4::ZERO;
         }
     }
 }

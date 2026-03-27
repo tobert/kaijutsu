@@ -321,7 +321,6 @@ impl InputMode {
 /// summon → orient (mode ring) → act → gone.
 #[derive(Component, Reflect, Default)]
 #[reflect(Component)]
-#[allow(dead_code)] // Phase 3: fields read by overlay systems
 pub struct InputOverlay {
     /// Current text content.
     pub text: String,
@@ -336,7 +335,6 @@ pub struct InputOverlay {
     pub target_context: Option<ContextId>,
 }
 
-#[allow(dead_code)] // Phase 3: used by overlay input systems
 impl InputOverlay {
     /// Get the selected range (ordered start..end), or None if no selection.
     pub fn selection_range(&self) -> Option<std::ops::Range<usize>> {
@@ -439,13 +437,6 @@ impl InputOverlay {
                 .map(|(i, _)| self.cursor + i)
                 .unwrap_or(self.text.len());
         }
-    }
-
-    /// Clear and return the text (for submission).
-    pub fn take(&mut self) -> String {
-        self.cursor = 0;
-        self.selection_anchor = None;
-        std::mem::take(&mut self.text)
     }
 
     /// Check if the overlay is empty.

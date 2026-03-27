@@ -291,7 +291,6 @@ pub fn create_block_texture(images: &mut Assets<Image>, w: u32, h: u32) -> Handl
 pub fn build_block_scenes(
     mut block_cells: Query<
         (
-            &BlockCell,
             &mut BlockScene,
             &ComputedNode,
             &mut Node,
@@ -302,6 +301,7 @@ pub fn build_block_scenes(
             &mut MsdfBlockGlyphs,
             &mut BlockRenderMethod,
         ),
+        With<BlockCell>,
     >,
     fonts: Res<Assets<VelloFont>>,
     font_handles: Res<FontHandles>,
@@ -329,7 +329,7 @@ pub fn build_block_scenes(
     let rainbow_phase = (time.elapsed_secs() * 0.25) % 1.0;
 
     for (
-        _block_cell, mut block_scene, computed, mut node, rich, border, vis, effects,
+        mut block_scene, computed, mut node, rich, border, vis, effects,
         mut msdf_glyphs, mut render_method,
     ) in block_cells.iter_mut()
     {
@@ -436,16 +436,6 @@ pub fn build_block_scenes(
                     msdf_glyphs.version = block_scene.scene_version.wrapping_add(1);
                     msdf_glyphs.rainbow = is_rainbow;
                     *render_method = BlockRenderMethod::Msdf;
-                } else {
-                    // No atlas — Vello renders text directly
-                    crate::text::rich::render_layout_with_brushes(
-                        &mut scene,
-                        &layout,
-                        &span_brushes,
-                        &fallback_brush,
-                        text_offset,
-                    );
-                    *render_method = BlockRenderMethod::Vello;
                 }
             }
             Some(RichContentKind::Sparkline(data)) => {
@@ -563,15 +553,6 @@ pub fn build_block_scenes(
                     msdf_glyphs.version = block_scene.scene_version.wrapping_add(1);
                     msdf_glyphs.rainbow = is_rainbow;
                     *render_method = BlockRenderMethod::Msdf;
-                } else {
-                    crate::text::rich::render_layout_with_brushes(
-                        &mut scene,
-                        &parley_layout,
-                        &span_brushes,
-                        &fallback_brush,
-                        text_offset,
-                    );
-                    *render_method = BlockRenderMethod::Vello;
                 }
             }
             None => {
@@ -599,15 +580,6 @@ pub fn build_block_scenes(
                     msdf_glyphs.version = block_scene.scene_version.wrapping_add(1);
                     msdf_glyphs.rainbow = is_rainbow;
                     *render_method = BlockRenderMethod::Msdf;
-                } else {
-                    crate::text::rich::render_layout_with_brushes(
-                        &mut scene,
-                        &layout,
-                        &[],
-                        &text_brush,
-                        text_offset,
-                    );
-                    *render_method = BlockRenderMethod::Vello;
                 }
             }
         }
@@ -651,7 +623,7 @@ pub fn build_block_scenes(
 /// Build vello scenes for role group border entities.
 pub fn build_role_group_scenes(
     mut role_borders: Query<
-        (&RoleGroupBorder, &mut BlockScene, &ComputedNode, &mut Node),
+        (&RoleGroupBorder, &mut BlockScene, &ComputedNode),
         Changed<ComputedNode>,
     >,
     fonts: Res<Assets<VelloFont>>,
@@ -660,7 +632,7 @@ pub fn build_role_group_scenes(
 ) {
     let font = fonts.get(&font_handles.mono);
 
-    for (border, mut block_scene, computed, _node) in role_borders.iter_mut() {
+    for (border, mut block_scene, computed) in role_borders.iter_mut() {
         let size = computed.size();
         if size.x < 1.0 {
             continue;
@@ -784,12 +756,11 @@ pub fn extract_block_scenes(
         &BlockScene,
         &BlockTexture,
         Option<&BlockRenderMethod>,
-        Option<&crate::cell::block_border::BlockBorderStyle>,
     )>>,
 ) {
     extracted.items.clear();
 
-    for (scene, texture, render_method, _border) in query.iter() {
+    for (scene, texture, render_method) in query.iter() {
         if scene.scene_version == 0 {
             continue;
         }
@@ -1052,13 +1023,12 @@ fn extract_msdf_blocks(
             &BlockRenderMethod,
             &BlockScene,
             &BlockTexture,
-            Option<&crate::cell::block_border::BlockBorderStyle>,
         )>,
     >,
 ) {
     extracted.items.clear();
 
-    for (msdf_glyphs, render_method, scene, texture, _border) in query.iter() {
+    for (msdf_glyphs, render_method, scene, texture) in query.iter() {
         if *render_method != BlockRenderMethod::Msdf {
             continue;
         }
