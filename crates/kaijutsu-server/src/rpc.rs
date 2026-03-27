@@ -63,7 +63,7 @@ use kaijutsu_kernel::{
     McpToolEngine,
     McpTransport,
     ReadEngine,
-    register_mcp_resource_engines,
+    register_mcp_prompt_engines, register_mcp_resource_engines,
     // Rhai scripting
     RhaiEngine,
     RigProvider,
@@ -1097,6 +1097,13 @@ pub async fn create_shared_kernel(
 
     // Register MCP resource tools (list, read, subscribe, unsubscribe)
     for (_name, info, engine) in register_mcp_resource_engines(mcp_pool.clone()) {
+        kernel_arc
+            .register_tool_with_engine(info, engine)
+            .await;
+    }
+
+    // Register MCP prompt tools (list, get)
+    for (_name, info, engine) in register_mcp_prompt_engines(mcp_pool.clone()) {
         kernel_arc
             .register_tool_with_engine(info, engine)
             .await;

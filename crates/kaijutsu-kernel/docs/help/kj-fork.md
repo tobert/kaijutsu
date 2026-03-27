@@ -14,6 +14,8 @@ Creates a new context from the current one. The new context gets its own convers
 - `--name`, `-n` — Label for the forked context
 - `--model`, `-m` — Override model (format: `provider/model`). Inherits from parent if omitted.
 - `--prompt` — Inject a note into the fork as a drift block
+- `--mcp-prompt` — Inject an MCP prompt (format: `server/name`). Use with `--arg key=value`.
+- `--arg`, `-a` — Argument for `--mcp-prompt` (repeatable, format: `key=value`)
 - `--preset` — Apply a preset's settings after forking
 - `--pwd` — Override the working directory on the fork
 - `--depth` — Block limit for `--shallow` (default: 50)
@@ -35,6 +37,9 @@ kj fork --shallow --depth 20 --name quick-check
 
 # Fork from a preset template
 kj fork --name review --preset code-review
+
+# Fork with an MCP prompt injected
+kj fork --name analysis --mcp-prompt myserver/code_review --arg language=rust
 
 # When done, merge findings back
 kj drift merge

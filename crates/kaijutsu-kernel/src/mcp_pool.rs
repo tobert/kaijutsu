@@ -62,8 +62,9 @@ use rmcp::model::{
     ArgumentInfo, CallToolRequestParams, CallToolResult, ClientCapabilities, ClientInfo,
     CompleteRequestParams, CompleteResult, CreateElicitationRequestParams, CreateElicitationResult,
     ElicitationAction as RmcpElicitationAction, GetPromptRequestParams, GetPromptResult,
-    ListRootsResult, LoggingLevel, ProgressNotificationParam, Prompt, PromptArgument, Reference,
-    Root, SetLevelRequestParams, Tool as McpTool,
+    ListRootsResult, LoggingLevel, ProgressNotificationParam, Prompt, PromptArgument,
+    PromptMessage, PromptMessageContent, Reference, Root, SetLevelRequestParams,
+    Tool as McpTool,
 };
 use rmcp::service::{RequestContext, RunningService, ServiceError};
 use rmcp::transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess};
@@ -587,6 +588,8 @@ pub struct KaijutsuClientHandler {
     pending_elicitations: Arc<DashMap<String, PendingElicitation>>,
     /// Roots advertised to servers.
     roots: Arc<RwLock<Vec<Root>>>,
+    /// Shared prompt cache for invalidation on list_changed notifications.
+    prompt_cache: Arc<DashMap<String, McpPromptInfo>>,
 }
 
 impl std::fmt::Debug for KaijutsuClientHandler {
@@ -607,6 +610,7 @@ impl KaijutsuClientHandler {
         elicitation_flows: SharedElicitationFlowBus,
         logging_flows: SharedLoggingFlowBus,
         roots: Arc<RwLock<Vec<Root>>>,
+        prompt_cache: Arc<DashMap<String, McpPromptInfo>>,
     ) -> Self {
         let mut info = ClientInfo::default();
         info.client_info.name = "kaijutsu".into();
@@ -626,6 +630,7 @@ impl KaijutsuClientHandler {
             logging_flows,
             pending_elicitations: Arc::new(DashMap::new()),
             roots,
+            prompt_cache,
         }
     }
 
@@ -652,6 +657,7 @@ impl KaijutsuClientHandler {
             logging_flows: shared_logging_flow_bus(256),
             pending_elicitations: Arc::new(DashMap::new()),
             roots: Arc::new(RwLock::new(Vec::new())),
+            prompt_cache: Arc::new(DashMap::new()),
         }
     }
 
@@ -815,6 +821,25 @@ impl ClientHandler for KaijutsuClientHandler {
         }
     }
 
+    fn on_prompt_list_changed(
+        &self,
+        _context: rmcp::service::NotificationContext<RoleClient>,
+    ) -> impl std::future::Future<Output = ()> + Send + '_ {
+        let server_name = self.server_name.clone();
+        let prompt_cache = self.prompt_cache.clone();
+
+        async move {
+            info!(
+                server = %server_name,
+                "MCP prompt list changed notification"
+            );
+
+            // Invalidate cached prompts for this server to force re-fetch.
+            let prefix = format!("{}:", server_name);
+            prompt_cache.retain(|k, _| !k.starts_with(&prefix));
+        }
+    }
+
     fn list_roots(
         &self,
         _ctx: RequestContext<RoleClient>,
@@ -944,7 +969,7 @@ pub struct McpServerPool {
     /// Roots advertised to all connected servers.
     roots: Arc<RwLock<Vec<Root>>>,
     /// Prompt cache, keyed by "server:prompt_name".
-    prompt_cache: DashMap<String, McpPromptInfo>,
+    prompt_cache: Arc<DashMap<String, McpPromptInfo>>,
     /// Context subscription tracker: "server:uri" → set of subscribing ContextIds.
     ///
     /// Used by the resource notification watcher to know which contexts need
@@ -1000,7 +1025,7 @@ impl McpServerPool {
             elicitation_flows: shared_elicitation_flow_bus(16),
             logging_flows: shared_logging_flow_bus(1024),
             roots: Arc::new(RwLock::new(Vec::new())),
-            prompt_cache: DashMap::new(),
+            prompt_cache: Arc::new(DashMap::new()),
             context_subscriptions: DashMap::new(),
             registrations: parking_lot::RwLock::new(HashMap::new()),
         }
@@ -1021,7 +1046,7 @@ impl McpServerPool {
             elicitation_flows,
             logging_flows,
             roots: Arc::new(RwLock::new(Vec::new())),
-            prompt_cache: DashMap::new(),
+            prompt_cache: Arc::new(DashMap::new()),
             context_subscriptions: DashMap::new(),
             registrations: parking_lot::RwLock::new(HashMap::new()),
         }
@@ -1134,6 +1159,7 @@ impl McpServerPool {
             self.elicitation_flows.clone(),
             self.logging_flows.clone(),
             self.roots.clone(),
+            self.prompt_cache.clone(),
         );
 
         // Connect based on transport type
@@ -2455,6 +2481,268 @@ pub fn register_mcp_resource_engines(
                 "mcp",
             ),
             Arc::new(McpUnsubscribeResourceEngine::new(pool)) as Arc<dyn ExecutionEngine>,
+        ),
+    ]
+}
+
+// =============================================================================
+// Prompt Serialization
+// =============================================================================
+
+/// Serialize MCP prompt messages into human-readable text.
+///
+/// Each message becomes `[role]: content`, joined by double newlines.
+/// Image content is represented as a placeholder; resource links show the URI.
+pub fn serialize_prompt_messages(messages: &[PromptMessage]) -> String {
+    messages
+        .iter()
+        .map(|msg| {
+            let role = format!("{:?}", msg.role).to_lowercase();
+            let content = match &msg.content {
+                PromptMessageContent::Text { text } => text.clone(),
+                PromptMessageContent::Image { image } => {
+                    format!("[image: {}]", image.mime_type)
+                }
+                PromptMessageContent::Resource { resource } => {
+                    // EmbeddedResource derefs to RawEmbeddedResource via Annotated<T>
+                    let uri = match &resource.resource {
+                        rmcp::model::ResourceContents::TextResourceContents { uri, .. } => uri,
+                        rmcp::model::ResourceContents::BlobResourceContents { uri, .. } => uri,
+                    };
+                    format!("[embedded resource: {}]", uri)
+                }
+                PromptMessageContent::ResourceLink { link } => {
+                    format!("[resource: {}]", link.uri)
+                }
+            };
+            format!("[{}]: {}", role, content)
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+// =============================================================================
+// MCP Prompt Engines (model-facing tools)
+// =============================================================================
+
+/// Engine that lists available MCP prompts from connected servers.
+///
+/// Registered as `mcp_list_prompts` tool on the kernel.
+pub struct McpListPromptsEngine {
+    pool: Arc<McpServerPool>,
+}
+
+impl McpListPromptsEngine {
+    pub fn new(pool: Arc<McpServerPool>) -> Self {
+        Self { pool }
+    }
+}
+
+impl std::fmt::Debug for McpListPromptsEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpListPromptsEngine").finish()
+    }
+}
+
+#[async_trait]
+impl ExecutionEngine for McpListPromptsEngine {
+    fn name(&self) -> &str {
+        "mcp_list_prompts"
+    }
+
+    fn description(&self) -> &str {
+        "List available MCP prompts from connected servers. Pass {\"server\": \"name\"} to filter by server, or {} to list all."
+    }
+
+    fn schema(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "server": {
+                    "type": "string",
+                    "description": "Optional server name to filter prompts. Omit to list from all servers."
+                }
+            }
+        }))
+    }
+
+    #[tracing::instrument(skip(self, code, _ctx), name = "engine.mcp_list_prompts")]
+    async fn execute(&self, code: &str, _ctx: &ToolContext) -> anyhow::Result<ExecResult> {
+        let args: serde_json::Value = if code.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(code)?
+        };
+
+        let server_filter = args
+            .get("server")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let servers = match &server_filter {
+            Some(name) => vec![name.clone()],
+            None => self.pool.list_servers(),
+        };
+
+        let mut all_prompts = Vec::new();
+        for server_name in &servers {
+            match self.pool.list_prompts(server_name).await {
+                Ok(prompts) => {
+                    for p in prompts {
+                        all_prompts.push(serde_json::json!({
+                            "server": server_name,
+                            "name": p.name,
+                            "title": p.title,
+                            "description": p.description,
+                            "arguments": p.arguments.iter().map(|a| serde_json::json!({
+                                "name": a.name,
+                                "description": a.description,
+                                "required": a.required,
+                            })).collect::<Vec<_>>(),
+                        }));
+                    }
+                }
+                Err(e) => {
+                    all_prompts.push(serde_json::json!({
+                        "server": server_name,
+                        "error": e.to_string(),
+                    }));
+                }
+            }
+        }
+
+        let output = serde_json::to_string_pretty(&all_prompts)?;
+        Ok(ExecResult::success(output))
+    }
+
+    async fn is_available(&self) -> bool {
+        !self.pool.list_servers().is_empty()
+    }
+}
+
+/// Engine that gets a specific MCP prompt with arguments substituted.
+///
+/// Registered as `mcp_get_prompt` tool on the kernel.
+pub struct McpGetPromptEngine {
+    pool: Arc<McpServerPool>,
+}
+
+impl McpGetPromptEngine {
+    pub fn new(pool: Arc<McpServerPool>) -> Self {
+        Self { pool }
+    }
+}
+
+impl std::fmt::Debug for McpGetPromptEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpGetPromptEngine").finish()
+    }
+}
+
+#[async_trait]
+impl ExecutionEngine for McpGetPromptEngine {
+    fn name(&self) -> &str {
+        "mcp_get_prompt"
+    }
+
+    fn description(&self) -> &str {
+        "Get a specific MCP prompt by server and name, with optional arguments. Returns the rendered prompt messages."
+    }
+
+    fn schema(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "server": {
+                    "type": "string",
+                    "description": "Server name"
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Prompt name"
+                },
+                "arguments": {
+                    "type": "object",
+                    "description": "Optional key-value arguments for the prompt",
+                    "additionalProperties": { "type": "string" }
+                }
+            },
+            "required": ["server", "name"]
+        }))
+    }
+
+    #[tracing::instrument(skip(self, code, _ctx), name = "engine.mcp_get_prompt")]
+    async fn execute(&self, code: &str, _ctx: &ToolContext) -> anyhow::Result<ExecResult> {
+        let args: serde_json::Value = serde_json::from_str(code)?;
+
+        let server = args
+            .get("server")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("missing required 'server' parameter"))?;
+
+        let name = args
+            .get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("missing required 'name' parameter"))?;
+
+        let arguments: Option<std::collections::HashMap<String, String>> = args
+            .get("arguments")
+            .and_then(|v| v.as_object())
+            .map(|obj| {
+                obj.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            });
+
+        match self.pool.get_prompt(server, name, arguments).await {
+            Ok(result) => {
+                let mut output = String::new();
+                if let Some(desc) = &result.description {
+                    output.push_str(desc);
+                    output.push_str("\n\n---\n\n");
+                }
+                output.push_str(&serialize_prompt_messages(&result.messages));
+                Ok(ExecResult::success(output))
+            }
+            Err(e) => Ok(ExecResult::failure(
+                1,
+                format!(
+                    "Failed to get prompt '{}' from '{}': {}",
+                    name, server, e
+                ),
+            )),
+        }
+    }
+
+    async fn is_available(&self) -> bool {
+        !self.pool.list_servers().is_empty()
+    }
+}
+
+/// Create and register all MCP prompt engines on a kernel's tool registry.
+///
+/// Call this once per kernel after the MCP pool is created.
+pub fn register_mcp_prompt_engines(
+    pool: Arc<McpServerPool>,
+) -> Vec<(String, ToolInfo, Arc<dyn ExecutionEngine>)> {
+    vec![
+        (
+            "mcp_list_prompts".to_string(),
+            ToolInfo::new(
+                "mcp_list_prompts",
+                "List available MCP prompts from connected servers",
+                "mcp",
+            ),
+            Arc::new(McpListPromptsEngine::new(pool.clone())) as Arc<dyn ExecutionEngine>,
+        ),
+        (
+            "mcp_get_prompt".to_string(),
+            ToolInfo::new(
+                "mcp_get_prompt",
+                "Get a specific MCP prompt with arguments rendered",
+                "mcp",
+            ),
+            Arc::new(McpGetPromptEngine::new(pool)) as Arc<dyn ExecutionEngine>,
         ),
     ]
 }

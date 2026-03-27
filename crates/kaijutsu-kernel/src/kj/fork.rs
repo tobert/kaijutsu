@@ -6,7 +6,7 @@ use kaijutsu_types::{ConsentMode, ContentType, ContextId, EdgeKind, ForkKind, To
 
 use crate::kernel_db::{ContextEdgeRow, ContextRow, ContextShellRow};
 
-use super::parse::{extract_named_arg, has_flag, parse_model_spec};
+use super::parse::{extract_all_named_args, extract_named_arg, has_flag, parse_model_spec};
 use super::{KjCaller, KjDispatcher, KjResult};
 
 /// Resolved provider+model for a fork.
@@ -129,6 +129,10 @@ impl KjDispatcher {
 
         // Parse --prompt
         let prompt = extract_named_arg(argv, &["--prompt"]);
+
+        // Parse --mcp-prompt server/name and --arg key=value pairs
+        let mcp_prompt = extract_named_arg(argv, &["--mcp-prompt"]);
+        let mcp_args = extract_all_named_args(argv, &["--arg", "-a"]);
 
         // Parse --preset
         let preset_label = extract_named_arg(argv, &["--preset"]);
@@ -265,6 +269,13 @@ impl KjDispatcher {
             return KjResult::Err(format!("kj fork: failed to inject fork note: {e}"));
         }
 
+        // If --mcp-prompt given, get prompt from MCP server and inject
+        if let Some(ref spec) = mcp_prompt
+            && let Err(e) = self.inject_mcp_prompt(new_id, caller, spec, &mcp_args).await
+        {
+            return KjResult::Err(format!("kj fork: {e}"));
+        }
+
         self.apply_fork_mcp_exclusions(new_id).await;
 
         let short = new_id.short();
@@ -278,6 +289,8 @@ impl KjDispatcher {
     async fn fork_shallow(&self, argv: &[String], caller: &KjCaller) -> KjResult {
         let label = extract_named_arg(argv, &["--name", "-n"]);
         let prompt = extract_named_arg(argv, &["--prompt"]);
+        let mcp_prompt = extract_named_arg(argv, &["--mcp-prompt"]);
+        let mcp_args = extract_all_named_args(argv, &["--arg", "-a"]);
         let preset_label = extract_named_arg(argv, &["--preset"]);
         let pwd_override = extract_named_arg(argv, &["--pwd"]);
         let depth: usize = extract_named_arg(argv, &["--depth"])
@@ -426,6 +439,12 @@ impl KjDispatcher {
             ));
         }
 
+        if let Some(ref spec) = mcp_prompt
+            && let Err(e) = self.inject_mcp_prompt(new_id, caller, spec, &mcp_args).await
+        {
+            return KjResult::Err(format!("kj fork --shallow: {e}"));
+        }
+
         self.apply_fork_mcp_exclusions(new_id).await;
 
         let short = new_id.short();
@@ -444,6 +463,8 @@ impl KjDispatcher {
     async fn fork_compact(&self, argv: &[String], caller: &KjCaller) -> KjResult {
         let label = extract_named_arg(argv, &["--name", "-n"]);
         let prompt = extract_named_arg(argv, &["--prompt"]);
+        let mcp_prompt = extract_named_arg(argv, &["--mcp-prompt"]);
+        let mcp_args = extract_all_named_args(argv, &["--arg", "-a"]);
         let pwd_override = extract_named_arg(argv, &["--pwd"]);
 
         let source_id = caller.context_id;
@@ -494,6 +515,12 @@ impl KjDispatcher {
             && let Err(e) = self.inject_fork_note(new_id, caller, &note)
         {
             tracing::warn!("failed to inject fork note: {e}");
+        }
+
+        if let Some(ref spec) = mcp_prompt
+            && let Err(e) = self.inject_mcp_prompt(new_id, caller, spec, &mcp_args).await
+        {
+            return KjResult::Err(format!("kj fork --compact: {e}"));
         }
 
         // Write-through: KernelDb then DriftRouter
@@ -887,6 +914,68 @@ impl KjDispatcher {
                 caller.context_id,
                 None,
                 DriftKind::Push,
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Get an MCP prompt and inject it as a drift block into the forked context.
+    ///
+    /// `spec` is "server/prompt_name", `arg_values` are "key=value" strings.
+    async fn inject_mcp_prompt(
+        &self,
+        target_id: ContextId,
+        caller: &KjCaller,
+        spec: &str,
+        arg_values: &[String],
+    ) -> Result<(), String> {
+        use kaijutsu_crdt::DriftKind;
+
+        let pool = self
+            .mcp_pool()
+            .ok_or_else(|| "no MCP pool available".to_string())?;
+
+        let (server, name) = spec
+            .split_once('/')
+            .ok_or_else(|| format!("--mcp-prompt must be server/name, got '{spec}'"))?;
+
+        if server.is_empty() || name.is_empty() {
+            return Err(format!("--mcp-prompt must be server/name, got '{spec}'"));
+        }
+
+        // Parse --arg key=value pairs
+        let arguments: Option<HashMap<String, String>> = if arg_values.is_empty() {
+            None
+        } else {
+            let mut map = HashMap::new();
+            for kv in arg_values {
+                let (k, v) = kv
+                    .split_once('=')
+                    .ok_or_else(|| format!("--arg must be key=value, got '{kv}'"))?;
+                map.insert(k.to_string(), v.to_string());
+            }
+            Some(map)
+        };
+
+        let result = pool
+            .get_prompt(server, name, arguments)
+            .await
+            .map_err(|e| format!("failed to get prompt '{server}/{name}': {e}"))?;
+
+        let content = crate::mcp_pool::serialize_prompt_messages(&result.messages);
+        let header = format!("[MCP prompt: {}/{}]\n\n", server, name);
+        let full_content = format!("{}{}", header, content);
+
+        let after = self.block_store().last_block_id(target_id);
+        self.block_store()
+            .insert_drift_block(
+                target_id,
+                None,
+                after.as_ref(),
+                &full_content,
+                caller.context_id,
+                Some(format!("mcp:{}", server)),
+                DriftKind::Notification,
             )
             .map(|_| ())
             .map_err(|e| e.to_string())

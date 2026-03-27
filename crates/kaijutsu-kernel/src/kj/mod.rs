@@ -14,6 +14,7 @@ pub mod fork;
 pub mod format;
 pub mod parse;
 pub mod preset;
+pub mod prompt;
 pub mod refs;
 pub mod workspace;
 
@@ -169,6 +170,7 @@ impl KjDispatcher {
             "context" | "ctx" => self.dispatch_context(&argv[1..], caller).await,
             "fork" => self.dispatch_fork(&argv[1..], caller).await,
             "drift" => self.dispatch_drift(&argv[1..], caller).await,
+            "prompt" => self.dispatch_prompt(&argv[1..], caller).await,
             "preset" => self.dispatch_preset(&argv[1..], caller),
             "workspace" | "ws" => self.dispatch_workspace(&argv[1..], caller),
             "help" | "--help" | "-h" => KjResult::ok_ephemeral(self.help(), ContentType::Markdown),

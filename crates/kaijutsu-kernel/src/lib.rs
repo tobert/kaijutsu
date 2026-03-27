@@ -98,7 +98,7 @@ pub use mcp_pool::{
     McpTransport,
     ResourceCache,
     extract_tool_result_text,
-    register_mcp_resource_engines,
+    register_mcp_prompt_engines, register_mcp_resource_engines, serialize_prompt_messages,
 };
 pub use rhai_engine::RhaiEngine;
 pub use state::KernelState;

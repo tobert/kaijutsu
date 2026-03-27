@@ -47,6 +47,7 @@ kj drift merge
 context (ctx)   list, info, switch, create, set, log, move, archive, remove, retag
 fork            Fork current context (--shallow, --compact, --as)
 drift           push, pull, merge, flush, queue, cancel, history
+prompt          list, show, inject — MCP prompt discovery and injection
 preset          list, show, save, remove
 workspace (ws)  list, show, create, add, bind, remove
 synth           all, <ctx>, status — semantic indexing + keyword synthesis
