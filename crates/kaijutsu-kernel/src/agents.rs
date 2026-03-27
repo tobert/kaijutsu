@@ -281,14 +281,19 @@ impl AgentRegistry {
     /// Attach an agent to this registry.
     ///
     /// The optional `invoke_sender` enables kernel → agent invocation.
-    /// Returns the AgentInfo if successful, or an error if the nick is already taken.
+    /// If the nick already exists, replaces the old registration (the old
+    /// invoke channel is dropped, closing the previous bridge task).
     pub fn attach(
         &mut self,
         config: AgentConfig,
         invoke_sender: Option<mpsc::Sender<InvokeRequest>>,
     ) -> Result<AgentInfo, AgentError> {
         if self.agents.contains_key(&config.nick) {
-            return Err(AgentError::NickTaken(config.nick));
+            tracing::info!(
+                nick = %config.nick,
+                "Agent re-attaching (replacing previous registration)",
+            );
+            self.invoke_senders.remove(&config.nick);
         }
 
         let info = AgentInfo::from_config(config);
@@ -430,8 +435,10 @@ mod tests {
         assert!(info.has_capability(AgentCapability::Grammar));
         assert!(!info.has_capability(AgentCapability::Review));
 
-        // Can't attach same nick twice
-        assert!(registry.attach(config, None).is_err());
+        // Re-attaching same nick replaces the old registration
+        let info2 = registry.attach(config, None).unwrap();
+        assert_eq!(info2.nick, "spell-check");
+        assert_eq!(registry.count(), 1);
 
         // Detach
         let detached = registry.detach("spell-check");
