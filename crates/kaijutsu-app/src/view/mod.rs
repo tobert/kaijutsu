@@ -10,6 +10,7 @@
 //! - `render` — buffer sync (text → UiVelloText), layout readback
 
 pub mod block_render;
+pub mod brp_methods;
 pub mod components;
 pub mod cursor;
 pub mod document;

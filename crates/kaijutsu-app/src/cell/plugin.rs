@@ -1,6 +1,7 @@
 //! Cell plugin for Bevy.
 
 use bevy::prelude::*;
+use bevy_remote::{RemoteMethodSystemId, RemoteMethods};
 
 // ============================================================================
 // SYSTEM SETS - Execution Phases
@@ -65,6 +66,23 @@ impl Plugin for CellPlugin {
             .register_type::<RoleGroupBorderLayout>()
             .register_type::<block_border::BlockBorderStyle>()
             .register_type::<OverlayStyle>();
+
+        // Register custom BRP methods for context navigation
+        use crate::view::brp_methods;
+        let switch_id = app.register_system(brp_methods::handle_switch_context);
+        let active_id = app.register_system(brp_methods::handle_active_context);
+        app.world_mut()
+            .resource_mut::<RemoteMethods>()
+            .insert(
+                brp_methods::SWITCH_CONTEXT_METHOD,
+                RemoteMethodSystemId::Instant(switch_id),
+            );
+        app.world_mut()
+            .resource_mut::<RemoteMethods>()
+            .insert(
+                brp_methods::ACTIVE_CONTEXT_METHOD,
+                RemoteMethodSystemId::Instant(active_id),
+            );
 
         // Configure SystemSet execution order
         app.configure_sets(

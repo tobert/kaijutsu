@@ -17,6 +17,7 @@ logos = "0.16"  # For Token::lexer trait
 
 bevy = { version = "0.18", features = ["default", "bevy_ui_debug"] }
 bevy_brp_extras.workspace = true  # includes RemotePlugin
+bevy_remote.workspace = true
 bevy_tweening = { git = "https://github.com/djeedai/bevy_tweening", branch = "main" }  # Smooth animations
 avian2d = "0.5"
 
