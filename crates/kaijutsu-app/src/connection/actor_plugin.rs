@@ -191,6 +191,7 @@ fn poll_bootstrap_results(
     mut commands: Commands,
     channel: Res<BootstrapChannel>,
     result_channel: Res<RpcResultChannel>,
+    invocation_channel: Res<crate::agents::AgentInvocationChannel>,
 ) {
     let Ok(mut rx) = channel.rx.lock() else {
         return;
@@ -216,6 +217,7 @@ fn poll_bootstrap_results(
                 // Otherwise just get identity + populate constellation from list_contexts().
                 let h = handle.clone();
                 let tx = result_channel.sender();
+                let inv_tx = invocation_channel.tx.clone();
                 let ctx_id = context_id;
                 bevy::tasks::IoTaskPool::get()
                     .spawn(async move {
@@ -230,6 +232,34 @@ fn poll_bootstrap_results(
                                 return;
                             }
                         };
+
+                        // 1b. Register as an agent so the kernel can invoke us
+                        let h2 = h.clone();
+                        let inv_tx2 = inv_tx;
+                        tokio::spawn(async move {
+                            let config = kaijutsu_client::AgentConfig {
+                                nick: "kaijutsu-app".to_string(),
+                                instance: "ui".to_string(),
+                                provider: "local".to_string(),
+                                model_id: "bevy".to_string(),
+                                capabilities: vec!["custom".to_string()],
+                            };
+                            match h2.attach_agent(config).await {
+                                Ok((_info, mut rx)) => {
+                                    log::info!("App registered as agent: kaijutsu-app");
+                                    // Forward invocations to Bevy channel
+                                    while let Some(invocation) = rx.recv().await {
+                                        if inv_tx2.send(invocation).is_err() {
+                                            break; // Bevy channel closed
+                                        }
+                                    }
+                                    log::debug!("Agent invocation forwarder ended");
+                                }
+                                Err(e) => {
+                                    log::warn!("Failed to register as agent: {e}");
+                                }
+                            }
+                        });
 
                         // 2. If we joined a specific context, fetch its state
                         if let Some(ctx_id) = ctx_id {

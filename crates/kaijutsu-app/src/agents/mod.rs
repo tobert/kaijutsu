@@ -25,6 +25,6 @@ mod systems;
 
 #[allow(unused_imports)]
 pub use components::*;
-pub use plugin::AgentsPlugin;
+pub use plugin::{AgentInvocationChannel, AgentsPlugin};
 #[allow(unused_imports)]
 pub use registry::*;
