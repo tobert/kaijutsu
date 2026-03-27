@@ -282,12 +282,12 @@ impl SyncedDocument {
                 if *context_id != self.context_id {
                     return SyncEffect::Ignored;
                 }
-                if let Err(e) = self.doc.set_status(block_id, *status) {
+                if let Err(e) = self.sync.apply_status_change(&mut self.doc, block_id, *status) {
                     warn!("SyncedDocument: set_status error: {e}");
                 }
                 // Apply piggybacked output data (output is not DTE-tracked)
                 if let Some(output_data) = output
-                    && let Err(e) = self.doc.set_output(block_id, Some(output_data.clone()))
+                    && let Err(e) = self.sync.apply_output_change(&mut self.doc, block_id, Some(output_data.clone()))
                 {
                     warn!("SyncedDocument: set_output error: {e}");
                 }
@@ -303,7 +303,7 @@ impl SyncedDocument {
                 if *context_id != self.context_id {
                     return SyncEffect::Ignored;
                 }
-                if let Err(e) = self.doc.delete_block(block_id) {
+                if let Err(e) = self.sync.apply_delete(&mut self.doc, block_id) {
                     warn!("SyncedDocument: delete_block error: {e}");
                 }
                 // Clean up any pending events for a deleted block
@@ -321,7 +321,7 @@ impl SyncedDocument {
                 if *context_id != self.context_id {
                     return SyncEffect::Ignored;
                 }
-                if let Err(e) = self.doc.set_collapsed(block_id, *collapsed) {
+                if let Err(e) = self.sync.apply_collapsed_change(&mut self.doc, block_id, *collapsed) {
                     warn!("SyncedDocument: set_collapsed error: {e}");
                 }
                 SyncEffect::Updated {
@@ -337,7 +337,7 @@ impl SyncedDocument {
                 if *context_id != self.context_id {
                     return SyncEffect::Ignored;
                 }
-                if let Err(e) = self.doc.move_block(block_id, after_id.as_ref()) {
+                if let Err(e) = self.sync.apply_move(&mut self.doc, block_id, after_id.as_ref()) {
                     warn!("SyncedDocument: move_block error: {e}");
                 }
                 SyncEffect::Updated {

@@ -23,7 +23,7 @@ use std::collections::HashMap;
 
 use kaijutsu_crdt::block_store::{BlockStore as CrdtBlockStore, StoreSnapshot, SyncPayload};
 use kaijutsu_crdt::{ContextId, Frontier};
-use kaijutsu_types::{BlockId, BlockSnapshot};
+use kaijutsu_types::{BlockId, BlockSnapshot, OutputData, Status};
 use thiserror::Error;
 use tracing::{error, info, trace, warn};
 
@@ -560,6 +560,74 @@ impl SyncManager {
                 Err(SyncError::Merge(e.to_string()))
             }
         }
+    }
+
+    // =========================================================================
+    // Metadata mutations — version-bumping wrappers around CrdtBlockStore
+    // =========================================================================
+
+    /// Set block status (Running → Done, etc.).
+    pub fn apply_status_change(
+        &mut self,
+        doc: &mut CrdtBlockStore,
+        block_id: &BlockId,
+        status: Status,
+    ) -> Result<(), SyncError> {
+        doc.set_status(block_id, status)
+            .map_err(|e| SyncError::Merge(e.to_string()))?;
+        self.version = self.version.wrapping_add(1);
+        Ok(())
+    }
+
+    /// Set structured output data on a block.
+    pub fn apply_output_change(
+        &mut self,
+        doc: &mut CrdtBlockStore,
+        block_id: &BlockId,
+        output: Option<OutputData>,
+    ) -> Result<(), SyncError> {
+        doc.set_output(block_id, output)
+            .map_err(|e| SyncError::Merge(e.to_string()))?;
+        self.version = self.version.wrapping_add(1);
+        Ok(())
+    }
+
+    /// Delete a block (tombstone).
+    pub fn apply_delete(
+        &mut self,
+        doc: &mut CrdtBlockStore,
+        block_id: &BlockId,
+    ) -> Result<(), SyncError> {
+        doc.delete_block(block_id)
+            .map_err(|e| SyncError::Merge(e.to_string()))?;
+        self.version = self.version.wrapping_add(1);
+        Ok(())
+    }
+
+    /// Set collapsed state of a thinking block.
+    pub fn apply_collapsed_change(
+        &mut self,
+        doc: &mut CrdtBlockStore,
+        block_id: &BlockId,
+        collapsed: bool,
+    ) -> Result<(), SyncError> {
+        doc.set_collapsed(block_id, collapsed)
+            .map_err(|e| SyncError::Merge(e.to_string()))?;
+        self.version = self.version.wrapping_add(1);
+        Ok(())
+    }
+
+    /// Move a block to a new position (after `after_id`, or to front if None).
+    pub fn apply_move(
+        &mut self,
+        doc: &mut CrdtBlockStore,
+        block_id: &BlockId,
+        after_id: Option<&BlockId>,
+    ) -> Result<(), SyncError> {
+        doc.move_block(block_id, after_id)
+            .map_err(|e| SyncError::Merge(e.to_string()))?;
+        self.version = self.version.wrapping_add(1);
+        Ok(())
     }
 }
 
