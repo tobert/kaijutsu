@@ -397,10 +397,16 @@ pub enum AgentError {
     /// The nick is already taken by another agent.
     #[error("agent nick already taken: {0}")]
     NickTaken(String),
-    /// Agent not found.
+    /// Agent not found in the registry.
     #[error("agent not found: {0}")]
     NotFound(String),
-    /// Invocation failed.
+    /// Agent channel closed or reply sender dropped.
+    #[error("agent disconnected: {0}")]
+    Disconnected(String),
+    /// Agent did not reply within the deadline.
+    #[error("agent invocation timed out: {0}")]
+    Timeout(String),
+    /// Agent returned an error from its handler.
     #[error("agent invocation failed: {0}")]
     InvocationFailed(String),
 }

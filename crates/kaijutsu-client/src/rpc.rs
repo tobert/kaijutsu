@@ -2508,10 +2508,20 @@ impl crate::kaijutsu_capnp::agent_commands::Server for AgentCommandsImpl {
             .send(invocation)
             .map_err(|_| capnp::Error::failed("agent handler disconnected".into()))?;
 
-        // Await the reply (this runs on a tokio LocalSet, so oneshot works)
-        let response = reply_rx
-            .await
-            .map_err(|_| capnp::Error::failed("agent handler dropped reply".into()))?;
+        // Await the reply with timeout — prevents indefinite hang if the app
+        // stalls or crashes. 15s is generous for a frame-rate-driven poll loop.
+        let response = tokio::time::timeout(
+            crate::constants::AGENT_INVOCATION_TIMEOUT,
+            reply_rx,
+        )
+        .await
+        .map_err(|_| {
+            capnp::Error::failed(format!(
+                "agent invocation timed out after {}s waiting for app dispatch",
+                crate::constants::AGENT_INVOCATION_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(|_| capnp::Error::failed("agent handler dropped reply".into()))?;
 
         match response {
             Ok(data) => {

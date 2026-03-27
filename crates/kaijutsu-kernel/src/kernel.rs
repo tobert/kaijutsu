@@ -10,6 +10,7 @@
 use async_trait::async_trait;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -401,13 +402,17 @@ impl Kernel {
     /// Invoke an agent's capability by nick.
     ///
     /// Dispatches the request to the agent's registered channel and awaits
-    /// the response. Returns an error if the agent is not found or disconnected.
+    /// the response. The kernel-side timeout (30s) is a safety net — the
+    /// client-side timeout (15s) should fire first, producing a clean
+    /// `Disconnected` rather than `Timeout`.
     pub async fn invoke_agent(
         &self,
         nick: &str,
         action: &str,
         params: Vec<u8>,
     ) -> Result<Vec<u8>, AgentError> {
+        const AGENT_INVOKE_TIMEOUT: Duration = Duration::from_secs(30);
+
         let sender = {
             let registry = self.agents.read().await;
             registry
@@ -424,12 +429,21 @@ impl Kernel {
         };
 
         sender.send(request).await.map_err(|_| {
-            AgentError::NotFound(format!("{} (disconnected)", nick))
+            AgentError::Disconnected(format!("{}: channel closed", nick))
         })?;
 
-        let response = reply_rx.await.map_err(|_| {
-            AgentError::NotFound(format!("{} (handler dropped)", nick))
-        })?;
+        let response = tokio::time::timeout(AGENT_INVOKE_TIMEOUT, reply_rx)
+            .await
+            .map_err(|_| {
+                AgentError::Timeout(format!(
+                    "{}: no reply after {}s",
+                    nick,
+                    AGENT_INVOKE_TIMEOUT.as_secs()
+                ))
+            })?
+            .map_err(|_| {
+                AgentError::Disconnected(format!("{}: handler dropped reply", nick))
+            })?;
 
         response.result.map_err(AgentError::InvocationFailed)
     }

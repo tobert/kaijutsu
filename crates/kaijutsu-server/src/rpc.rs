@@ -2272,18 +2272,17 @@ impl kernel::Server for KernelImpl {
             };
             let created_by = connection.borrow().principal.id;
 
-            // Read LLM defaults so new contexts start with a model set
+            // Read LLM defaults so new contexts start with a model set.
+            // If no provider is configured, don't silently inject a hardcoded model —
+            // let both be None so the user gets a clear error when they try to use LLM.
             let (default_provider, default_model) = {
                 let registry = kernel.kernel.llm().read().await;
-                (
-                    registry.default_provider_name().map(|s| s.to_string()),
-                    Some(
-                        registry
-                            .default_model()
-                            .unwrap_or(kaijutsu_kernel::DEFAULT_MODEL)
-                            .to_string(),
-                    ),
-                )
+                let provider = registry.default_provider_name().map(|s| s.to_string());
+                let model = registry.default_model().map(|s| s.to_string());
+                if provider.is_none() && model.is_none() {
+                    log::warn!("No LLM provider configured — new context will have no model set");
+                }
+                (provider, model)
             };
 
             // Write-through: KernelDb first, then DriftRouter
@@ -3299,7 +3298,9 @@ impl kernel::Server for KernelImpl {
             capabilities,
         };
 
-        // Extract optional AgentCommands callback for reverse invocation
+        // Extract optional AgentCommands callback for reverse invocation.
+        // get_commands() returns Err for null/missing capability pointers —
+        // this is the standard capnp pattern for optional capabilities.
         let commands_callback = params_reader.get_commands().ok();
 
         let kernel_arc = self.kernel.kernel.clone();
@@ -3331,7 +3332,12 @@ impl kernel::Server for KernelImpl {
                                 }
                                 Err(e) => Err(format!("RPC error: {e}")),
                             };
-                            let _ = request.reply.send(InvokeResponse { result });
+                            if request.reply.send(InvokeResponse { result }).is_err() {
+                                tracing::debug!(
+                                    nick = %nick_for_task,
+                                    "Agent invoke reply dropped (caller likely timed out)",
+                                );
+                            }
                         }
                         log::debug!(
                             "Agent invoke bridge for '{}' ended",
@@ -3458,7 +3464,7 @@ impl kernel::Server for KernelImpl {
                 kernel_arc
                     .emit_agent_event(AgentActivityEvent::Started {
                         agent: nick.clone(),
-                        block_id: String::new(),
+                        block_id: String::new(), // TODO: thread block_id through invoke_agent RPC
                         action: action.clone(),
                     })
                     .await;
@@ -3473,7 +3479,7 @@ impl kernel::Server for KernelImpl {
                         kernel_arc
                             .emit_agent_event(AgentActivityEvent::Completed {
                                 agent: nick,
-                                block_id: String::new(),
+                                block_id: String::new(), // TODO: thread block_id through invoke_agent RPC
                                 success: true,
                             })
                             .await;
@@ -3484,7 +3490,7 @@ impl kernel::Server for KernelImpl {
                         kernel_arc
                             .emit_agent_event(AgentActivityEvent::Completed {
                                 agent: nick,
-                                block_id: String::new(),
+                                block_id: String::new(), // TODO: thread block_id through invoke_agent RPC
                                 success: false,
                             })
                             .await;

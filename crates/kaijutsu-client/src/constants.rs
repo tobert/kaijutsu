@@ -23,3 +23,11 @@ pub const SSH_KEEPALIVE_MAX: usize = 3;
 /// Prevents the actor from hanging indefinitely on SYN blackholes or stalled
 /// servers. 10 seconds is generous for a local SSH connection.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Timeout for agent invocation dispatch on the client side.
+///
+/// After receiving an invocation via Cap'n Proto callback, this is how long
+/// we wait for the Bevy `poll_agent_invocations` system to pick it up and
+/// reply. Must be shorter than the kernel-side timeout (30s) so the client
+/// fires first, giving the kernel a clean `Disconnected` instead of `Timeout`.
+pub const AGENT_INVOCATION_TIMEOUT: Duration = Duration::from_secs(15);

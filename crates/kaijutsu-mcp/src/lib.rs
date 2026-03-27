@@ -1946,7 +1946,10 @@ impl KaijutsuMcp {
             None => return "Error: invoke_agent requires --connect".to_string(),
         };
 
-        let params = serde_json::to_vec(&req.params).unwrap_or_default();
+        let params = match serde_json::to_vec(&req.params) {
+            Ok(v) => v,
+            Err(e) => return format!("Error: failed to serialize params: {e}"),
+        };
         match actor.invoke_agent(&req.nick, &req.action, &params).await {
             Ok(result) => String::from_utf8_lossy(&result).to_string(),
             Err(e) => format!("Error: {e}"),

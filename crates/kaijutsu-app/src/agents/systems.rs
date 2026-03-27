@@ -107,8 +107,12 @@ pub fn poll_agent_invocations(
     drift: Res<DriftState>,
     mut switch_writer: MessageWriter<ContextSwitchRequested>,
 ) {
-    let Ok(rx) = channel.rx.lock() else {
-        return;
+    let rx = match channel.rx.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            warn!("Agent invocation channel mutex was poisoned, recovering");
+            poisoned.into_inner()
+        }
     };
     while let Ok(invocation) = rx.try_recv() {
         let result = dispatch_agent_action(
