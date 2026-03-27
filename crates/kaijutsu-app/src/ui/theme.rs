@@ -362,6 +362,22 @@ pub struct Theme {
     // ═══════════════════════════════════════════════════════════════════════
     pub block_border_user: Color,
     pub block_border_assistant: Color,
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Layout spacing constants
+    // ═══════════════════════════════════════════════════════════════════════
+    /// Horizontal indentation per nesting level (pixels)
+    pub indent_width: f32,
+    /// Height reserved for role group divider lines (pixels)
+    pub role_header_height: f32,
+    /// Spacing below role group divider (pixels)
+    pub role_header_spacing: f32,
+    /// Font size for border labels (tool name, status text)
+    pub label_font_size: f32,
+    /// Horizontal inset from block edge where labels start (pixels)
+    pub label_inset: f32,
+    /// Horizontal padding around label text (pixels)
+    pub label_pad: f32,
 }
 
 impl Default for Theme {
@@ -547,7 +563,7 @@ impl Default for Theme {
             block_border_glow_intensity: 0.25,
             text_glow_radius: 2.5,
             text_glow_color: Color::srgba(0.75, 0.82, 0.95, 0.35),
-            block_border_padding: 0.4,
+            block_border_padding: 0.6,
             block_spacing: 12.0,
 
             // Compose block
@@ -563,6 +579,14 @@ impl Default for Theme {
             // User/assistant text borders — transparent (opt-in)
             block_border_user: Color::srgba(0.0, 0.0, 0.0, 0.0),
             block_border_assistant: Color::srgba(0.0, 0.0, 0.0, 0.0),
+
+            // Layout spacing
+            indent_width: 24.0,
+            role_header_height: 20.0,
+            role_header_spacing: 4.0,
+            label_font_size: 11.0,
+            label_inset: 12.0,
+            label_pad: 6.0,
         }
     }
 }
@@ -724,6 +748,14 @@ impl From<kaijutsu_rhai::theme::ThemeData> for Theme {
         // User/assistant text borders
         theme.block_border_user = hex_to_color(&td.block_border_user);
         theme.block_border_assistant = hex_to_color(&td.block_border_assistant);
+
+        // Layout spacing
+        theme.indent_width = td.indent_width;
+        theme.role_header_height = td.role_header_height;
+        theme.role_header_spacing = td.role_header_spacing;
+        theme.label_font_size = td.label_font_size;
+        theme.label_inset = td.label_inset;
+        theme.label_pad = td.label_pad;
 
         theme
     }

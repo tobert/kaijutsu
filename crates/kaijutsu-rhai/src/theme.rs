@@ -192,6 +192,14 @@ pub struct ThemeData {
     // User/assistant text borders
     pub block_border_user: String,
     pub block_border_assistant: String,
+
+    // Layout spacing
+    pub indent_width: f32,
+    pub role_header_height: f32,
+    pub role_header_spacing: f32,
+    pub label_font_size: f32,
+    pub label_inset: f32,
+    pub label_pad: f32,
 }
 
 impl Default for ThemeData {
@@ -304,7 +312,7 @@ impl Default for ThemeData {
             block_border_glow_intensity: 0.25,
             text_glow_radius: 2.5,
             text_glow_color: "#bfd1f259".into(), // soft cool white, 35% alpha
-            block_border_padding: 0.4,
+            block_border_padding: 0.6,
             block_spacing: 12.0,
 
             // Compose
@@ -317,6 +325,14 @@ impl Default for ThemeData {
             // User/assistant borders (transparent = disabled)
             block_border_user: "#00000000".into(),
             block_border_assistant: "#00000000".into(),
+
+            // Layout spacing
+            indent_width: 24.0,
+            role_header_height: 20.0,
+            role_header_spacing: 4.0,
+            label_font_size: 11.0,
+            label_inset: 12.0,
+            label_pad: 6.0,
         }
     }
 }
@@ -582,6 +598,14 @@ pub fn parse_theme_data_from_scope(scope: &Scope) -> ThemeData {
     // User/assistant text borders
     color!(block_border_user);
     color!(block_border_assistant);
+
+    // Layout spacing
+    float!(indent_width);
+    float!(role_header_height);
+    float!(role_header_spacing);
+    float!(label_font_size);
+    float!(label_inset);
+    float!(label_pad);
 
     td
 }

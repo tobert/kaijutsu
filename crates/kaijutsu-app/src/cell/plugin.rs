@@ -65,6 +65,7 @@ impl Plugin for CellPlugin {
             .register_type::<BlockCellLayout>()
             .register_type::<RoleGroupBorderLayout>()
             .register_type::<block_border::BlockBorderStyle>()
+            .register_type::<block_border::BorderLabelMetrics>()
             .register_type::<OverlayStyle>();
 
         // Register custom BRP methods for context navigation

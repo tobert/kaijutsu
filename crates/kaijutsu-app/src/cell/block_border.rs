@@ -61,6 +61,23 @@ impl Default for BorderPadding {
     }
 }
 
+/// Measured label gap positions (pixel coordinates within the block texture).
+///
+/// Computed during `build_block_scenes()` where font metrics are available.
+/// Read by `sync_block_fx()` to populate the `label_gaps` shader uniform.
+#[derive(Component, Debug, Clone, Copy, Default, PartialEq, Reflect)]
+#[reflect(Component)]
+pub struct BorderLabelMetrics {
+    /// Top label gap: horizontal start (px from left edge of node).
+    pub top_gap_x0: f32,
+    /// Top label gap: horizontal end (px from left edge of node).
+    pub top_gap_x1: f32,
+    /// Bottom label gap: horizontal start (px from left edge of node).
+    pub bottom_gap_x0: f32,
+    /// Bottom label gap: horizontal end (px from left edge of node).
+    pub bottom_gap_x1: f32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Reflect, Default)]
 pub enum BorderKind {
     /// Complete rectangle border.
@@ -205,13 +222,14 @@ fn compute_border_style(
 ) -> Option<BlockBorderStyle> {
     use kaijutsu_crdt::Status;
 
-    // Padding scales with font size: block_border_padding is a multiplier
+    // Padding scales with font size: block_border_padding is a multiplier.
+    // This defines the clearance between the border stroke and text content.
     let base = theme.block_border_padding * font_size;
     let padding = BorderPadding {
-        top: base * 0.5,
-        bottom: base * 0.375,
-        left: base * 0.75,
-        right: base * 0.75,
+        top: base * 0.75,
+        bottom: base * 0.6,
+        left: base,
+        right: base,
     };
 
     match block.kind {

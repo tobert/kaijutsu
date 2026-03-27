@@ -25,16 +25,20 @@ use crate::text::FontHandles;
 use crate::ui::timeline::TimelineVisibility;
 
 // ============================================================================
-// LAYOUT CONSTANTS
+// LAYOUT CONSTANTS (legacy — migrated to Theme, kept for non-theme-aware code paths)
 // ============================================================================
 
 /// Horizontal indentation per nesting level (for nested tool results, etc.)
+/// **Prefer `theme.indent_width`** in systems that have `Res<Theme>`.
+#[allow(dead_code)] // Legacy constant; theme field is the source of truth
 pub(crate) const INDENT_WIDTH: f32 = 24.0;
 
 /// Height reserved for role transition headers (e.g., "User", "Assistant").
+/// **Prefer `theme.role_header_height`** in systems that have `Res<Theme>`.
 pub(crate) const ROLE_HEADER_HEIGHT: f32 = 20.0;
 
 /// Spacing between role header and block content.
+/// **Prefer `theme.role_header_spacing`** in systems that have `Res<Theme>`.
 pub(crate) const ROLE_HEADER_SPACING: f32 = 4.0;
 
 // ============================================================================

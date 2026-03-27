@@ -21,7 +21,7 @@ use bevy_vello::vello;
 use vello::kurbo::Affine;
 use vello::peniko::Fill;
 
-use crate::cell::block_border::{BlockBorderStyle, BorderAnimation};
+use crate::cell::block_border::{BlockBorderStyle, BorderAnimation, BorderLabelMetrics};
 use crate::cell::{BlockCell, RoleGroupBorder};
 use crate::shaders::BlockFxMaterial;
 use crate::text::msdf::{
@@ -289,8 +289,10 @@ pub fn create_block_texture(images: &mut Assets<Image>, w: u32, h: u32) -> Handl
 /// Runs in PostUpdate after UiSystems::Layout. For each block with changed
 /// content or width, builds a complete vello scene (text + rich content + border).
 pub fn build_block_scenes(
+    mut commands: Commands,
     mut block_cells: Query<
         (
+            Entity,
             &mut BlockScene,
             &ComputedNode,
             &mut Node,
@@ -329,7 +331,7 @@ pub fn build_block_scenes(
     let rainbow_phase = (time.elapsed_secs() * 0.25) % 1.0;
 
     for (
-        mut block_scene, computed, mut node, rich, border, vis, effects,
+        entity, mut block_scene, computed, mut node, rich, border, vis, effects,
         mut msdf_glyphs, mut render_method,
     ) in block_cells.iter_mut()
     {
@@ -586,24 +588,92 @@ pub fn build_block_scenes(
 
         let total_height = content_height + pad_top + pad_bottom;
 
-        // Add border to the scene
-        if let Some(border_style) = border {
-            let t = if has_animation {
-                time.elapsed_secs()
-            } else {
-                0.0
-            };
-            fieldset::build_fieldset_border(
-                &mut scene,
-                width as f64,
-                total_height as f64,
-                border_style,
-                border_style.top_label.as_deref(),
-                border_style.bottom_label.as_deref(),
-                Some(font),
-                t,
-                theme.bg,
-            );
+        // Collect label glyphs for shader-drawn border labels.
+        // Labels are baked into the MSDF texture at positions in the border padding zone.
+        // This works for both MSDF and Vello blocks — the MSDF pass composites label
+        // glyphs on top of whatever content the block has.
+        {
+            if let (Some(border_style), Some(atlas)) = (border, &mut atlas) {
+                let label_font_size = theme.label_font_size;
+                let label_inset = theme.label_inset;
+                let label_pad = theme.label_pad;
+
+                let label_brush = bevy_color_to_brush(border_style.color);
+                let label_style = VelloTextStyle {
+                    font: font_handles.mono.clone(),
+                    brush: label_brush.clone(),
+                    font_size: label_font_size,
+                    ..default()
+                };
+
+                let mut metrics = BorderLabelMetrics::default();
+
+                if let Some(ref top_text) = border_style.top_label {
+                    let label_layout = font.layout(
+                        top_text,
+                        &label_style,
+                        VelloTextAlign::Left,
+                        None,
+                    );
+                    let label_w = label_layout.width();
+                    let label_h = label_layout.height();
+
+                    // Position: centered vertically on the top content boundary (y = pad_top)
+                    let label_x = label_inset + label_pad;
+                    let label_y = (pad_top - label_h).max(0.0) * 0.5;
+                    let label_offset = (label_x as f64, label_y as f64);
+
+                    for line in label_layout.lines() {
+                        for item in line.items() {
+                            if let bevy_vello::parley::PositionedLayoutItem::GlyphRun(gr) = item {
+                                font_data_map.register(gr.run().font());
+                            }
+                        }
+                    }
+                    let label_glyphs = collect_msdf_glyphs(
+                        &label_layout, &[], &label_brush, label_offset, atlas,
+                    );
+                    msdf_glyphs.glyphs.extend(label_glyphs);
+
+                    metrics.top_gap_x0 = label_inset;
+                    metrics.top_gap_x1 = label_inset + label_pad + label_w + label_pad;
+                }
+
+                if let Some(ref bottom_text) = border_style.bottom_label {
+                    let label_layout = font.layout(
+                        bottom_text,
+                        &label_style,
+                        VelloTextAlign::Left,
+                        None,
+                    );
+                    let label_w = label_layout.width();
+                    let label_h = label_layout.height();
+
+                    // Position: right-aligned, centered on bottom content boundary
+                    let label_x = (width - label_inset - label_pad - label_w).max(0.0);
+                    let label_y = (total_height - pad_bottom * 0.5 - label_h * 0.5).max(0.0);
+                    let label_offset = (label_x as f64, label_y as f64);
+
+                    for line in label_layout.lines() {
+                        for item in line.items() {
+                            if let bevy_vello::parley::PositionedLayoutItem::GlyphRun(gr) = item {
+                                font_data_map.register(gr.run().font());
+                            }
+                        }
+                    }
+                    let label_glyphs = collect_msdf_glyphs(
+                        &label_layout, &[], &label_brush, label_offset, atlas,
+                    );
+                    msdf_glyphs.glyphs.extend(label_glyphs);
+
+                    metrics.bottom_gap_x0 = width - label_inset - label_pad - label_w - label_pad;
+                    metrics.bottom_gap_x1 = width - label_inset;
+                }
+
+                if border_style.top_label.is_some() || border_style.bottom_label.is_some() {
+                    commands.entity(entity).insert(metrics);
+                }
+            }
         }
 
         // Set explicit height on the node
@@ -1029,9 +1099,6 @@ fn extract_msdf_blocks(
     extracted.items.clear();
 
     for (msdf_glyphs, render_method, scene, texture) in query.iter() {
-        if *render_method != BlockRenderMethod::Msdf {
-            continue;
-        }
         if msdf_glyphs.glyphs.is_empty() || msdf_glyphs.version == 0 {
             continue;
         }
@@ -1039,6 +1106,8 @@ fn extract_msdf_blocks(
         let asset_id = texture.image.id();
         let last = extracted.last_rendered.get(&asset_id).copied().unwrap_or(0);
         if msdf_glyphs.version > last {
+            // Vello blocks have content rendered by the Vello pass — MSDF composites on top
+            let has_vello = *render_method == BlockRenderMethod::Vello;
             extracted.items.push(ExtractedMsdfBlockItem {
                 glyphs: msdf_glyphs.glyphs.clone(),
                 image_handle: texture.image.clone(),
@@ -1048,7 +1117,7 @@ fn extract_msdf_blocks(
                 built_height: scene.built_height,
                 version: msdf_glyphs.version,
                 rainbow: msdf_glyphs.rainbow,
-                has_vello_content: false, // Vello skipped for MSDF blocks; shader borders later
+                has_vello_content: has_vello,
             });
         }
     }

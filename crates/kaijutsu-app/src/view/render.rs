@@ -18,7 +18,7 @@ use crate::ui::timeline::TimelineVisibility;
 use crate::view::block_render::BlockScene;
 
 use super::format::{block_color, format_single_block};
-use super::lifecycle::{INDENT_WIDTH, ROLE_HEADER_SPACING};
+// Layout constants now in Theme; lifecycle.rs constants kept for spawn-time defaults.
 
 // ============================================================================
 // BUFFER INIT / SYNC
@@ -329,23 +329,24 @@ pub fn update_block_cell_nodes(
         };
         let target_padding = UiRect::ZERO;
 
-        // Tiny gap for OpenBottom (ToolCall → ToolResult) so the divider line has breathing room
+        // Seamless join for OpenBottom→OpenTop (ToolCall→ToolResult): zero gap so
+        // side edges form continuous vertical lines between the paired blocks.
         let bottom_spacing = if border_style.map(|s| s.kind)
             == Some(crate::cell::block_border::BorderKind::OpenBottom)
         {
-            1.0
+            0.0
         } else {
             theme.block_spacing
         };
-        // Bordered blocks need horizontal margin so the stroke isn't clipped at the node edge.
-        // Use stroke width as the margin — just enough to clear the stroke on each side.
+        // Borders are shader-drawn inside the MSDF texture (no Vello strokes to clip),
+        // but keep a small margin so the shader glow doesn't clip at the node edge.
         let h_margin = if border_style.is_some() {
-            theme.block_border_thickness
+            theme.block_border_glow_radius * 0.5
         } else {
             0.0
         };
         let target_margin = UiRect {
-            left: Val::Px(layout.indent_level as f32 * INDENT_WIDTH + h_margin),
+            left: Val::Px(layout.indent_level as f32 * theme.indent_width + h_margin),
             right: Val::Px(h_margin),
             bottom: Val::Px(bottom_spacing),
             ..default()
@@ -370,7 +371,7 @@ pub fn update_block_cell_nodes(
 
     for entity in &container.role_headers {
         if let Ok(mut node) = role_header_nodes.get_mut(*entity) {
-            let target = UiRect::bottom(Val::Px(ROLE_HEADER_SPACING));
+            let target = UiRect::bottom(Val::Px(theme.role_header_spacing));
             if node.margin != target {
                 node.margin = target;
             }

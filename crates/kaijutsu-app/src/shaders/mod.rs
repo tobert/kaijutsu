@@ -9,7 +9,7 @@ use bevy::prelude::*;
 
 pub use block_fx_material::BlockFxMaterial;
 
-use crate::cell::block_border::{BlockBorderStyle, BorderAnimation};
+use crate::cell::block_border::{BlockBorderStyle, BorderAnimation, BorderKind, BorderLabelMetrics};
 use crate::cell::BlockCell;
 use crate::input::FocusArea;
 use crate::ui::theme::Theme;
@@ -34,6 +34,7 @@ fn sync_block_fx(
         (
             &MaterialNode<BlockFxMaterial>,
             Option<&BlockBorderStyle>,
+            Option<&BorderLabelMetrics>,
             Has<MsdfOverlayText>,
             Option<&OverlayCursorGeometry>,
             Option<&BlockScene>,
@@ -50,7 +51,7 @@ fn sync_block_fx(
 
     let show_cursor = matches!(*focus, FocusArea::Compose);
 
-    for (mat_node, border, is_overlay, cursor_geom, block_scene) in query.iter() {
+    for (mat_node, border, label_metrics, is_overlay, cursor_geom, block_scene) in query.iter() {
         let Some(mat) = fx_materials.get_mut(&mat_node.0) else {
             continue;
         };
@@ -88,11 +89,39 @@ fn sync_block_fx(
             mat.fx_params = target_params;
             mat.text_glow_color = target_tg_color;
             mat.text_glow_params = target_tg_params;
+
+            // Border stroke uniforms
+            let border_kind = match style.kind {
+                BorderKind::Full => 1.0,
+                BorderKind::TopAccent => 2.0,
+                BorderKind::Dashed => 3.0,
+                BorderKind::OpenBottom => 4.0,
+                BorderKind::OpenTop => 5.0,
+            };
+            mat.border_stroke = Vec4::new(style.thickness, border_kind, 0.0, 0.0);
+            mat.border_insets = Vec4::new(
+                style.padding.top,
+                style.padding.bottom,
+                style.padding.left,
+                style.padding.right,
+            );
+            mat.border_color = target_glow;
+
+            // Label gap metrics
+            if let Some(lm) = label_metrics {
+                mat.label_gaps = Vec4::new(lm.top_gap_x0, lm.top_gap_x1, lm.bottom_gap_x0, lm.bottom_gap_x1);
+            } else {
+                mat.label_gaps = Vec4::ZERO;
+            }
         } else {
             mat.glow_color = Vec4::ZERO;
             mat.fx_params = Vec4::ZERO;
             mat.text_glow_color = target_tg_color;
             mat.text_glow_params = target_tg_params;
+            mat.border_stroke = Vec4::ZERO;
+            mat.border_insets = Vec4::ZERO;
+            mat.border_color = Vec4::ZERO;
+            mat.label_gaps = Vec4::ZERO;
         }
 
         // Cursor beam (overlay only)

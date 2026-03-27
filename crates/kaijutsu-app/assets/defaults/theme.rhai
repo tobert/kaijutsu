@@ -75,6 +75,14 @@
 //   ansi_bright_black, ansi_bright_red, ansi_bright_green, ansi_bright_yellow
 //   ansi_bright_blue, ansi_bright_magenta, ansi_bright_cyan, ansi_bright_white
 //
+//   // Layout spacing
+//   indent_width                // Horizontal indent per nesting level (px, default 24)
+//   role_header_height          // Height for role divider lines (px, default 20)
+//   role_header_spacing         // Gap below role dividers (px, default 4)
+//   label_font_size             // Border label font size (px, default 11)
+//   label_inset                 // Label horizontal inset from edge (px, default 12)
+//   label_pad                   // Padding around label text (px, default 6)
+//
 //   // Font effects
 //   font_rainbow                // Enable rainbow text effect (bool)
 
