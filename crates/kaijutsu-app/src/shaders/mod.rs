@@ -98,7 +98,11 @@ fn sync_block_fx(
                 BorderKind::OpenBottom => 4.0,
                 BorderKind::OpenTop => 5.0,
             };
-            mat.border_stroke = Vec4::new(style.thickness, border_kind, 0.0, 0.0);
+            // .z/.w carry label border insets (0 = use default 1px AA inset)
+            let (inset_top, inset_bottom) = label_metrics
+                .map(|lm| (lm.border_inset_top, lm.border_inset_bottom))
+                .unwrap_or((0.0, 0.0));
+            mat.border_stroke = Vec4::new(style.thickness, border_kind, inset_top, inset_bottom);
             mat.border_insets = Vec4::new(
                 style.padding.top,
                 style.padding.bottom,

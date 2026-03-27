@@ -12,8 +12,9 @@
 //   text_glow_params - [radius_px, 0, 0, 0]  (radius=0 disables)
 //   cursor_params    - [x_uv, y_uv, width_uv, height_uv] (all 0 = disabled)
 //   cursor_color     - RGBA color for cursor beam (linear)
-//   border_stroke    - [thickness_px, border_kind, 0, 0]
+//   border_stroke    - [thickness_px, border_kind, label_inset_top, label_inset_bottom]
 //     border_kind: 0=none, 1=full, 2=top_accent, 3=dashed, 4=open_bottom, 5=open_top
+//     label_inset_top/bottom: >0 moves border inward for fieldset/legend labels; 0=default (1px)
 //   border_insets    - [pad_top, pad_bottom, pad_left, pad_right] in pixels
 //   border_color     - RGBA color for border stroke (linear)
 
@@ -116,24 +117,37 @@ fn border_stroke_alpha(
     let pad_left = insets.z;
     let pad_right = insets.w;
 
-    // Border rectangle: slightly inset from node edge for AA clearance
-    let border_inset = 1.0;
-    let border_half = half_size - border_inset;
+    // Border rectangle: inset from node edge.
+    // label_inset_top/bottom move the border further in for fieldset/legend labels.
+    let label_inset_top = border_stroke.z;
+    let label_inset_bottom = border_stroke.w;
+    let inset_top = select(1.0, label_inset_top, label_inset_top > 0.0);
+    let inset_bottom = select(1.0, label_inset_bottom, label_inset_bottom > 0.0);
+    let inset_lr = 1.0;
+    // Asymmetric box: offset center and adjust half-size
+    let center_y = (inset_top - inset_bottom) * 0.5;
+    let border_half = vec2<f32>(
+        half_size.x - inset_lr,
+        half_size.y - (inset_top + inset_bottom) * 0.5,
+    );
 
     let aa = 1.0; // anti-alias width in pixels
+
+    // bp: border-relative point (offset for asymmetric top/bottom insets)
+    let bp = vec2<f32>(p.x, p.y - center_y);
 
     if kind == BK_TOP_ACCENT {
         // Just the top edge: horizontal line near the top of the node
         let line_y = -border_half.y;
         let line_x0 = -border_half.x;
         let line_x1 = border_half.x;
-        let dy = abs(p.y - line_y);
-        let in_x = smoothstep(line_x0 - aa, line_x0, p.x) * (1.0 - smoothstep(line_x1, line_x1 + aa, p.x));
+        let dy = abs(bp.y - line_y);
+        let in_x = smoothstep(line_x0 - aa, line_x0, bp.x) * (1.0 - smoothstep(line_x1, line_x1 + aa, bp.x));
         return (1.0 - smoothstep(thickness * 0.5, thickness * 0.5 + aa, dy)) * in_x;
     }
 
-    // SDF at the border rectangle (node edge minus small inset)
-    let d = sd_rounded_box(p, border_half, corner_r);
+    // SDF at the border rectangle (centered on bp)
+    let d = sd_rounded_box(bp, border_half, corner_r);
 
     // Base stroke: abs(d) < thickness/2 with AA
     var alpha = 1.0 - smoothstep(0.0, aa, abs(d) - thickness * 0.5);
@@ -141,14 +155,14 @@ fn border_stroke_alpha(
     if kind == BK_OPEN_BOTTOM {
         // Suppress bottom edge + bottom corners. Side edges extend to node bottom.
         let bottom_y = border_half.y - corner_r;
-        let bottom_mask = smoothstep(bottom_y, bottom_y + corner_r, p.y);
-        let near_left = abs(p.x - (-border_half.x)) < thickness;
-        let near_right = abs(p.x - border_half.x) < thickness;
+        let bottom_mask = smoothstep(bottom_y, bottom_y + corner_r, bp.y);
+        let near_left = abs(bp.x - (-border_half.x)) < thickness;
+        let near_right = abs(bp.x - border_half.x) < thickness;
         let is_side_edge = select(0.0, 1.0, near_left || near_right);
         // Side edges: draw as straight vertical lines extending to node bottom
-        if is_side_edge > 0.5 && p.y > bottom_y {
+        if is_side_edge > 0.5 && bp.y > bottom_y {
             let side_x = select(border_half.x, -border_half.x, near_left);
-            let side_d = abs(p.x - side_x);
+            let side_d = abs(bp.x - side_x);
             alpha = 1.0 - smoothstep(0.0, aa, side_d - thickness * 0.5);
         } else {
             alpha *= (1.0 - bottom_mask);
@@ -156,23 +170,23 @@ fn border_stroke_alpha(
     } else if kind == BK_OPEN_TOP {
         // Suppress top edge + top corners. Side edges extend to node top.
         let top_y = -border_half.y + corner_r;
-        let top_mask = smoothstep(top_y, top_y - corner_r, p.y);
-        let near_left = abs(p.x - (-border_half.x)) < thickness;
-        let near_right = abs(p.x - border_half.x) < thickness;
+        let top_mask = smoothstep(top_y, top_y - corner_r, bp.y);
+        let near_left = abs(bp.x - (-border_half.x)) < thickness;
+        let near_right = abs(bp.x - border_half.x) < thickness;
         let is_side_edge = select(0.0, 1.0, near_left || near_right);
-        if is_side_edge > 0.5 && p.y < top_y {
+        if is_side_edge > 0.5 && bp.y < top_y {
             let side_x = select(border_half.x, -border_half.x, near_left);
-            let side_d = abs(p.x - side_x);
+            let side_d = abs(bp.x - side_x);
             alpha = 1.0 - smoothstep(0.0, aa, side_d - thickness * 0.5);
         } else {
             alpha *= (1.0 - top_mask);
         }
         // Horizontal divider line at the top of this block
         let divider_y = -border_half.y;
-        let div_d = abs(p.y - divider_y);
+        let div_d = abs(bp.y - divider_y);
         let div_x0 = -border_half.x;
         let div_x1 = border_half.x;
-        let in_x = smoothstep(div_x0 - aa, div_x0, p.x) * (1.0 - smoothstep(div_x1, div_x1 + aa, p.x));
+        let in_x = smoothstep(div_x0 - aa, div_x0, bp.x) * (1.0 - smoothstep(div_x1, div_x1 + aa, bp.x));
         let div_alpha = (1.0 - smoothstep(thickness * 0.5, thickness * 0.5 + aa, div_d)) * in_x;
         alpha = max(alpha, div_alpha);
     } else if kind == BK_DASHED {
@@ -180,18 +194,18 @@ fn border_stroke_alpha(
         let perim = 2.0 * (border_half.x + border_half.y);
         // Approximate perimeter position: project to nearest edge
         var t = 0.0;
-        if p.y <= -border_half.y + aa {
+        if bp.y <= -border_half.y + aa {
             // Top edge (left to right)
-            t = (p.x + border_half.x) / perim;
-        } else if p.x >= border_half.x - aa {
+            t = (bp.x + border_half.x) / perim;
+        } else if bp.x >= border_half.x - aa {
             // Right edge (top to bottom)
-            t = (border_half.x * 2.0 + p.y + border_half.y) / perim;
-        } else if p.y >= border_half.y - aa {
+            t = (border_half.x * 2.0 + bp.y + border_half.y) / perim;
+        } else if bp.y >= border_half.y - aa {
             // Bottom edge (right to left)
-            t = (border_half.x * 2.0 + border_half.y * 2.0 + border_half.x - p.x) / perim;
+            t = (border_half.x * 2.0 + border_half.y * 2.0 + border_half.x - bp.x) / perim;
         } else {
             // Left edge (bottom to top)
-            t = 1.0 - (p.y + border_half.y) / perim;
+            t = 1.0 - (bp.y + border_half.y) / perim;
         }
         let dash_count = 40.0; // number of dash+gap pairs around perimeter
         let dash_duty = 0.6;   // fraction of each period that is "on"
@@ -259,21 +273,24 @@ fn fragment(in: UiVertexOutput) -> @location(0) vec4<f32> {
     if has_border {
         var stroke_a = border_stroke_alpha(p, half_size, border_insets, b_thickness, corner_r, b_kind) * anim;
 
-        // Label gap masking: suppress stroke where label text sits
+        // Label gap masking: suppress stroke where label text sits.
+        // Use label insets (border moved inward for legend-style labels).
         let px_x = p.x + half_size.x; // Convert from centered coords to left-origin
-        let pad_top = border_insets.x;
-        let pad_bottom = border_insets.y;
+        let li_top = border_stroke.z;
+        let li_bottom = border_stroke.w;
+        let eff_inset_top = select(1.0, li_top, li_top > 0.0);
+        let eff_inset_bottom = select(1.0, li_bottom, li_bottom > 0.0);
 
         // Top label gap
         if label_gaps.x > 0.0 || label_gaps.y > 0.0 {
-            let near_top = p.y < -half_size.y + pad_top + b_thickness;
+            let near_top = p.y < -half_size.y + eff_inset_top + b_thickness;
             if near_top && px_x >= label_gaps.x && px_x <= label_gaps.y {
                 stroke_a = 0.0;
             }
         }
         // Bottom label gap
         if label_gaps.z > 0.0 || label_gaps.w > 0.0 {
-            let near_bottom = p.y > half_size.y - pad_bottom - b_thickness;
+            let near_bottom = p.y > half_size.y - eff_inset_bottom - b_thickness;
             if near_bottom && px_x >= label_gaps.z && px_x <= label_gaps.w {
                 stroke_a = 0.0;
             }
@@ -294,12 +311,16 @@ fn fragment(in: UiVertexOutput) -> @location(0) vec4<f32> {
     // --- Chase through label glyphs: brighten label text as the chase wave passes ---
     if chase_bright > 0.0 && has_border {
         let px_x = p.x + half_size.x;
+        let cli_top = border_stroke.z;
+        let cli_bottom = border_stroke.w;
+        let chase_inset_top = select(1.0, cli_top, cli_top > 0.0);
+        let chase_inset_bottom = select(1.0, cli_bottom, cli_bottom > 0.0);
         let in_top_gap = (label_gaps.x > 0.0 || label_gaps.y > 0.0)
             && px_x >= label_gaps.x && px_x <= label_gaps.y
-            && p.y < -half_size.y + border_insets.x + b_thickness * 2.0;
+            && p.y < -half_size.y + chase_inset_top + b_thickness * 2.0;
         let in_bottom_gap = (label_gaps.z > 0.0 || label_gaps.w > 0.0)
             && px_x >= label_gaps.z && px_x <= label_gaps.w
-            && p.y > half_size.y - border_insets.y - b_thickness * 2.0;
+            && p.y > half_size.y - chase_inset_bottom - b_thickness * 2.0;
         if (in_top_gap || in_bottom_gap) && tex.a > 0.0 {
             // Boost label glyph brightness with the chase wave
             let boost = chase_bright * 0.8;

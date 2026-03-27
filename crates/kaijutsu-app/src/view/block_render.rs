@@ -618,9 +618,19 @@ pub fn build_block_scenes(
                     let label_w = label_layout.width();
                     let label_h = label_layout.height();
 
-                    // Position: centered vertically on the top content boundary (y = pad_top)
+                    // Fieldset/legend: move the border inward so the label
+                    // straddles it. The inset = ascent/2 + AA clearance puts the
+                    // stroke center at exactly ascent/2 from the top edge.
+                    let ascent = label_layout
+                        .lines()
+                        .next()
+                        .map(|l| l.metrics().ascent)
+                        .unwrap_or(label_h);
+                    let inset = (ascent * 0.5 + 1.0).max(2.0);
+                    metrics.border_inset_top = inset;
+                    // Stroke center is at `inset` from top edge → label_y centers on it
                     let label_x = label_inset + label_pad;
-                    let label_y = (pad_top - label_h).max(0.0) * 0.5;
+                    let label_y = (inset - ascent * 0.5).max(0.0);
                     let label_offset = (label_x as f64, label_y as f64);
 
                     for line in label_layout.lines() {
@@ -649,9 +659,17 @@ pub fn build_block_scenes(
                     let label_w = label_layout.width();
                     let label_h = label_layout.height();
 
-                    // Position: right-aligned, centered on bottom content boundary
+                    // Fieldset/legend: move the bottom border inward too.
+                    let ascent = label_layout
+                        .lines()
+                        .next()
+                        .map(|l| l.metrics().ascent)
+                        .unwrap_or(label_h);
+                    let inset = (ascent * 0.5 + 1.0).max(2.0);
+                    metrics.border_inset_bottom = inset;
+                    // Stroke center at `total_height - inset`
                     let label_x = (width - label_inset - label_pad - label_w).max(0.0);
-                    let label_y = (total_height - pad_bottom * 0.5 - label_h * 0.5).max(0.0);
+                    let label_y = (total_height - inset - ascent * 0.5).max(0.0);
                     let label_offset = (label_x as f64, label_y as f64);
 
                     for line in label_layout.lines() {

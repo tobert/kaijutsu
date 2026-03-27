@@ -76,6 +76,11 @@ pub struct BorderLabelMetrics {
     pub bottom_gap_x0: f32,
     /// Bottom label gap: horizontal end (px from left edge of node).
     pub bottom_gap_x1: f32,
+    /// Border inset from top edge (px). Moves border stroke inward so
+    /// the label can straddle it fieldset/legend-style. 0 = default (1px AA inset).
+    pub border_inset_top: f32,
+    /// Border inset from bottom edge (px). 0 = default (1px AA inset).
+    pub border_inset_bottom: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Reflect, Default)]
@@ -152,10 +157,13 @@ pub fn determine_block_border_style(
     let blocks_vec = editor.blocks();
     let blocks: std::collections::HashMap<_, _> = blocks_vec.iter().map(|b| (b.id, b)).collect();
 
-    // Build set of tool_call_ids that have a ToolResult
+    // Build set of tool_call_ids that have a *visible* ToolResult.
+    // Empty success results render no border, so the call should not
+    // use OpenBottom to connect to an invisible block.
     let has_result: std::collections::HashSet<_> = blocks_vec
         .iter()
         .filter(|b| b.kind == BlockKind::ToolResult)
+        .filter(|b| !b.content.trim().is_empty() || b.output.is_some() || b.is_error)
         .filter_map(|b| b.tool_call_id)
         .collect();
 
@@ -238,14 +246,10 @@ fn compute_border_style(
                 Status::Running | Status::Pending => {
                     (BorderAnimation::Chase, theme.block_border_tool_call)
                 }
-                _ => {
-                    // Unified boxes (with result below) keep higher opacity for visible sides
-                    let alpha = if has_result { 0.85 } else { 0.7 };
-                    (
-                        BorderAnimation::None,
-                        theme.block_border_tool_call.with_alpha(alpha),
-                    )
-                }
+                _ => (
+                    BorderAnimation::None,
+                    theme.block_border_tool_call.with_alpha(0.85),
+                ),
             };
 
             // Top label: "COMMAND @username" for shell, "TOOL CALL model" for others
@@ -274,7 +278,7 @@ fn compute_border_style(
                 match block.status {
                     Status::Running => Some("running".to_string()),
                     Status::Pending => Some("pending".to_string()),
-                    Status::Done => None,
+                    Status::Done => Some("done".to_string()),
                     Status::Error => Some("error".to_string()),
                 }
             };
