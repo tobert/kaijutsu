@@ -559,8 +559,8 @@ impl Default for Theme {
             block_border_drift: Color::srgba(0.00, 0.67, 1.00, 0.5),     // #00aaff blue
             block_border_thickness: 1.5,
             block_border_corner_radius: 4.0,
-            block_border_glow_radius: 6.0,
-            block_border_glow_intensity: 0.25,
+            block_border_glow_radius: 10.0,
+            block_border_glow_intensity: 0.5,
             text_glow_radius: 2.5,
             text_glow_color: Color::srgba(0.75, 0.82, 0.95, 0.35),
             block_border_padding: 0.6,

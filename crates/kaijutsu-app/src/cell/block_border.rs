@@ -341,7 +341,7 @@ fn compute_border_style(
                 corner_radius: theme.block_border_corner_radius,
                 padding: BorderPadding {
                     top: if has_paired_call {
-                        base * 0.25
+                        base * 0.5
                     } else {
                         padding.top
                     },
