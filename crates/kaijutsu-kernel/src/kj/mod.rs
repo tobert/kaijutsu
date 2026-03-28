@@ -16,6 +16,7 @@ pub mod parse;
 pub mod preset;
 pub mod prompt;
 pub mod refs;
+pub mod stage;
 pub mod workspace;
 
 use std::sync::Arc;
@@ -169,6 +170,7 @@ impl KjDispatcher {
         match argv[0].as_str() {
             "context" | "ctx" => self.dispatch_context(&argv[1..], caller).await,
             "fork" => self.dispatch_fork(&argv[1..], caller).await,
+            "stage" => self.dispatch_stage(&argv[1..], caller).await,
             "drift" => self.dispatch_drift(&argv[1..], caller).await,
             "prompt" => self.dispatch_prompt(&argv[1..], caller).await,
             "preset" => self.dispatch_preset(&argv[1..], caller),

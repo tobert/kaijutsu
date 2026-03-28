@@ -11,6 +11,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::RwLock as TokioRwLock;
@@ -5261,6 +5262,154 @@ impl kernel::Server for KernelImpl {
 
         Promise::ok(())
     }
+
+    fn set_context_state(
+        self: Rc<Self>,
+        params: kernel::SetContextStateParams,
+        mut results: kernel::SetContextStateResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let _trace_guard = extract_rpc_trace(p.get_trace(), "set_context_state").entered();
+        let context_id_bytes = pry!(p.get_context_id());
+        let context_id = pry!(
+            ContextId::try_from_slice(context_id_bytes)
+                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
+        );
+        let state_str = pry!(pry!(p.get_state()).to_str());
+        let new_state = match kaijutsu_types::ContextState::from_str(state_str) {
+            Ok(s) => s,
+            Err(_) => {
+                results.get().set_success(false);
+                results.get().set_error(&format!("unknown state '{state_str}'"));
+                return Promise::ok(());
+            }
+        };
+
+        // Validate transition: only Staging → Live allowed in v1
+        let drift_router = self.kernel.kernel.drift().clone();
+        {
+            let drift = match drift_router.try_read() {
+                Ok(d) => d,
+                Err(_) => {
+                    results.get().set_success(false);
+                    results.get().set_error("drift router busy");
+                    return Promise::ok(());
+                }
+            };
+            if let Some(current) = drift.context_state(context_id) {
+                use kaijutsu_types::ContextState::*;
+                match (current, new_state) {
+                    (Staging, Live) => {} // allowed
+                    (same, target) if same == target => {
+                        results.get().set_success(true);
+                        return Promise::ok(());
+                    }
+                    (from, to) => {
+                        results.get().set_success(false);
+                        results
+                            .get()
+                            .set_error(&format!("transition {from} → {to} not allowed"));
+                        return Promise::ok(());
+                    }
+                }
+            } else {
+                results.get().set_success(false);
+                results.get().set_error("context not found in drift router");
+                return Promise::ok(());
+            }
+        }
+
+        // Update DriftRouter
+        {
+            let mut drift = match drift_router.try_write() {
+                Ok(d) => d,
+                Err(_) => {
+                    results.get().set_success(false);
+                    results.get().set_error("drift router busy (write)");
+                    return Promise::ok(());
+                }
+            };
+            if let Err(e) = drift.set_state(context_id, new_state) {
+                results.get().set_success(false);
+                results.get().set_error(&e.to_string());
+                return Promise::ok(());
+            }
+        }
+
+        // Update KernelDb
+        {
+            let db = self.kernel.kernel_db.lock();
+            if let Err(e) = db.update_context_state(context_id, new_state) {
+                log::error!("set_context_state: KernelDb update failed: {e}");
+                // DriftRouter was already updated — log but don't fail
+            }
+        }
+
+        log::info!(
+            "set_context_state: context={} state={}",
+            context_id.short(),
+            new_state
+        );
+        results.get().set_success(true);
+        Promise::ok(())
+    }
+
+    fn set_block_excluded(
+        self: Rc<Self>,
+        params: kernel::SetBlockExcludedParams,
+        mut results: kernel::SetBlockExcludedResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let _trace_guard = extract_rpc_trace(p.get_trace(), "set_block_excluded").entered();
+        let context_id_bytes = pry!(p.get_context_id());
+        let context_id = pry!(
+            ContextId::try_from_slice(context_id_bytes)
+                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
+        );
+        let block_id_reader = pry!(p.get_block_id());
+        let block_id = pry!(parse_block_id_from_reader(&block_id_reader));
+        let excluded = p.get_excluded();
+
+        // Enforce: excluded toggling only allowed in Staging state
+        {
+            let drift = match self.kernel.kernel.drift().try_read() {
+                Ok(d) => d,
+                Err(_) => {
+                    return Promise::err(capnp::Error::failed("drift router busy".into()));
+                }
+            };
+            match drift.context_state(context_id) {
+                Some(kaijutsu_types::ContextState::Staging) => {} // allowed
+                Some(state) => {
+                    return Promise::err(capnp::Error::failed(format!(
+                        "cannot toggle excluded in {state} state (only staging)"
+                    )));
+                }
+                None => {
+                    return Promise::err(capnp::Error::failed(
+                        "context not found".into(),
+                    ));
+                }
+            }
+        }
+
+        if let Err(e) = self
+            .kernel
+            .documents
+            .set_excluded(context_id, &block_id, excluded)
+        {
+            return Promise::err(capnp::Error::failed(e.to_string()));
+        }
+
+        let new_version = self
+            .kernel
+            .documents
+            .get(context_id)
+            .map(|entry| entry.version())
+            .unwrap_or(0);
+        results.get().set_new_version(new_version);
+        Promise::ok(())
+    }
 }
 
 // ============================================================================
@@ -5637,6 +5786,26 @@ async fn spawn_llm_for_prompt(
     // Read per-context model + tool filter from DriftRouter (quick read, release lock)
     let (ctx_model, ctx_provider_name, ctx_tool_filter) = {
         let drift = kernel_arc.drift().read().await;
+        // Guard: block LLM invocation while context is in Staging state
+        if let Some(h) = drift.get(context_id) {
+            if h.state == kaijutsu_types::ContextState::Staging {
+                // Insert an ephemeral system block explaining why the prompt was rejected
+                let _ = documents.insert_block_as(
+                    context_id,
+                    None,
+                    Some(after_block_id),
+                    kaijutsu_crdt::Role::System,
+                    kaijutsu_crdt::BlockKind::Text,
+                    "Context is in staging mode. Use `kj stage commit` to go live.",
+                    kaijutsu_crdt::Status::Done,
+                    kaijutsu_crdt::ContentType::Plain,
+                    Some(PrincipalId::system()),
+                ).and_then(|bid| documents.set_ephemeral(context_id, &bid, true));
+                return Err(capnp::Error::failed(
+                    "context is in staging mode — commit to enable LLM prompts".into(),
+                ));
+            }
+        }
         match drift.get(context_id) {
             Some(h) => (h.model.clone(), h.provider.clone(), h.tool_filter.clone()),
             None => (None, None, None),

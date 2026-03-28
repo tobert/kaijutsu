@@ -140,6 +140,9 @@ impl KjDispatcher {
         // Parse --pwd (override cwd on forked context)
         let pwd_override = extract_named_arg(argv, &["--pwd"]);
 
+        // Parse --stage (liminal state: user curates blocks before LLM invocation)
+        let staging = has_flag(argv, &["--stage", "--staging"]);
+
         let source_id = caller.context_id;
         let new_id = ContextId::new();
         let kernel_id = self.kernel_id();
@@ -175,7 +178,11 @@ impl KjDispatcher {
                 system_prompt: None,
                 tool_filter: None,
                 consent_mode: ConsentMode::Collaborative,
-                context_state: ContextState::Live,
+                context_state: if staging {
+                    ContextState::Staging
+                } else {
+                    ContextState::Live
+                },
                 created_at: kaijutsu_types::now_millis() as i64,
                 created_by: caller.principal_id,
                 forked_from: Some(source_id),
@@ -236,6 +243,12 @@ impl KjDispatcher {
                 drift.register_fork(new_id, label.as_deref(), source_id, caller.principal_id)
             {
                 return KjResult::Err(format!("kj fork: parent context not in router: {e}"));
+            }
+            // Set staging state if --stage flag was given
+            if staging {
+                if let Err(e) = drift.set_state(new_id, ContextState::Staging) {
+                    return KjResult::Err(format!("kj fork: failed to set staging state: {e}"));
+                }
             }
             // If --model was explicit, override the inherited model
             if resolved.explicit {
@@ -298,6 +311,7 @@ impl KjDispatcher {
             ForkKind::Full,
             block_count,
             source_label.as_deref(),
+            staging,
         ) {
             tracing::warn!("kj fork: failed to inject fork marker: {e}");
         }
@@ -317,6 +331,7 @@ impl KjDispatcher {
         let mcp_args = extract_all_named_args(argv, &["--arg", "-a"]);
         let preset_label = extract_named_arg(argv, &["--preset"]);
         let pwd_override = extract_named_arg(argv, &["--pwd"]);
+        let staging = has_flag(argv, &["--stage", "--staging"]);
         let depth: usize = extract_named_arg(argv, &["--depth"])
             .and_then(|d| d.parse().ok())
             .unwrap_or(50);
@@ -365,7 +380,7 @@ impl KjDispatcher {
                 system_prompt: None,
                 tool_filter: None,
                 consent_mode: ConsentMode::Collaborative,
-                context_state: ContextState::Live,
+                context_state: if staging { ContextState::Staging } else { ContextState::Live },
                 created_at: kaijutsu_types::now_millis() as i64,
                 created_by: caller.principal_id,
                 forked_from: Some(source_id),
@@ -429,6 +444,11 @@ impl KjDispatcher {
                     "kj fork --shallow: parent context not in router: {e}"
                 ));
             }
+            if staging {
+                if let Err(e) = drift.set_state(new_id, ContextState::Staging) {
+                    return KjResult::Err(format!("kj fork --shallow: failed to set staging state: {e}"));
+                }
+            }
             if resolved.explicit {
                 match (&resolved.provider, &resolved.model) {
                     (Some(p), Some(m)) => {
@@ -490,6 +510,7 @@ impl KjDispatcher {
             ForkKind::Shallow,
             block_count,
             source_label.as_deref(),
+            staging,
         ) {
             tracing::warn!("kj fork --shallow: failed to inject fork marker: {e}");
         }
@@ -513,6 +534,7 @@ impl KjDispatcher {
         let mcp_prompt = extract_named_arg(argv, &["--mcp-prompt"]);
         let mcp_args = extract_all_named_args(argv, &["--arg", "-a"]);
         let pwd_override = extract_named_arg(argv, &["--pwd"]);
+        let staging = has_flag(argv, &["--stage", "--staging"]);
 
         let source_id = caller.context_id;
         let new_id = ContextId::new();
@@ -589,7 +611,7 @@ impl KjDispatcher {
                 system_prompt: None,
                 tool_filter: None,
                 consent_mode: ConsentMode::Collaborative,
-                context_state: ContextState::Live,
+                context_state: if staging { ContextState::Staging } else { ContextState::Live },
                 created_at: kaijutsu_types::now_millis() as i64,
                 created_by: caller.principal_id,
                 forked_from: Some(source_id),
@@ -653,6 +675,11 @@ impl KjDispatcher {
                     "kj fork --compact: parent context not in router: {e}"
                 ));
             }
+            if staging {
+                if let Err(e) = drift.set_state(new_id, ContextState::Staging) {
+                    return KjResult::Err(format!("kj fork --compact: failed to set staging state: {e}"));
+                }
+            }
             if resolved.explicit {
                 match (&resolved.provider, &resolved.model) {
                     (Some(p), Some(m)) => {
@@ -692,6 +719,7 @@ impl KjDispatcher {
             ForkKind::Compact,
             block_count,
             source_label.as_deref(),
+            staging,
         ) {
             tracing::warn!("kj fork --compact: failed to inject fork marker: {e}");
         }
@@ -721,6 +749,7 @@ impl KjDispatcher {
                 );
             }
         };
+        let staging = has_flag(argv, &["--stage", "--staging"]);
 
         let kernel_id = self.kernel_id();
 
@@ -800,7 +829,7 @@ impl KjDispatcher {
                     system_prompt: row.system_prompt.clone(),
                     tool_filter: row.tool_filter.clone(),
                     consent_mode: row.consent_mode,
-                    context_state: ContextState::Live,
+                    context_state: if staging { ContextState::Staging } else { ContextState::Live },
                     created_at: kaijutsu_types::now_millis() as i64,
                     created_by: caller.principal_id,
                     forked_from: new_forked_from,
@@ -907,6 +936,11 @@ impl KjDispatcher {
                 } else {
                     drift.register(new_id, label, None, caller.principal_id);
                 }
+                if staging {
+                    if let Err(e) = drift.set_state(new_id, ContextState::Staging) {
+                        return KjResult::Err(format!("kj fork --as: failed to set staging state: {e}"));
+                    }
+                }
             }
         }
 
@@ -918,6 +952,7 @@ impl KjDispatcher {
             ForkKind::Subtree,
             template_nodes.len(),
             Some(&template_ref),
+            staging,
         ) {
             tracing::warn!("kj fork --as: failed to inject fork marker: {e}");
         }
@@ -1011,6 +1046,7 @@ impl KjDispatcher {
         fork_kind: ForkKind,
         block_count: usize,
         source_label: Option<&str>,
+        staging: bool,
     ) -> Result<(), String> {
         use kaijutsu_crdt::DriftKind;
 
@@ -1041,6 +1077,13 @@ impl KjDispatcher {
         self.block_store()
             .set_ephemeral(target_id, &block_id, true)
             .map_err(|e| e.to_string())?;
+
+        // In staging mode, fork marker starts excluded (user opts in)
+        if staging {
+            self.block_store()
+                .set_excluded(target_id, &block_id, true)
+                .map_err(|e| e.to_string())?;
+        }
 
         Ok(())
     }

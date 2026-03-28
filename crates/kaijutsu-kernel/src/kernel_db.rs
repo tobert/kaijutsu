@@ -1129,6 +1129,19 @@ impl KernelDb {
         Ok(updated > 0)
     }
 
+    /// Update the lifecycle state of a context.
+    pub fn update_context_state(
+        &self,
+        id: ContextId,
+        state: ContextState,
+    ) -> KernelDbResult<bool> {
+        let updated = self.conn.execute(
+            "UPDATE contexts SET context_state = ?1 WHERE context_id = ?2",
+            params![state.as_str(), blob_param(id.as_bytes())],
+        )?;
+        Ok(updated > 0)
+    }
+
     /// List active (non-archived) contexts for a kernel.
     pub fn list_active_contexts(&self, kernel_id: KernelId) -> KernelDbResult<Vec<ContextRow>> {
         let mut stmt = self.conn.prepare(
