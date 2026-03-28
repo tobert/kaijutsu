@@ -1030,6 +1030,7 @@ pub async fn create_shared_kernel(
                     system_prompt: None,
                     tool_filter: None,
                     consent_mode: kaijutsu_kernel::control::ConsentMode::Collaborative,
+                    context_state: kaijutsu_types::ContextState::Live,
                     created_at: kaijutsu_types::now_millis() as i64,
                     created_by: PrincipalId::system(),
                     forked_from: None,
@@ -1827,6 +1828,14 @@ impl kernel::Server for KernelImpl {
                 // Move operation not yet implemented in BlockStore
                 log::warn!("MoveBlock operation not yet implemented");
             }
+            Which::SetExcluded(group) => {
+                let id_reader = pry!(group.get_id());
+                let block_id = pry!(parse_block_id_from_reader(&id_reader));
+                let excluded = group.get_excluded();
+                if let Err(e) = documents.set_excluded(context_id, &block_id, excluded) {
+                    return Promise::err(capnp::Error::failed(e.to_string()));
+                }
+            }
         };
 
         // Return the new version
@@ -2191,6 +2200,8 @@ impl kernel::Server for KernelImpl {
                     c.set_created_at(ctx.created_at);
                     c.set_trace_id(&ctx.trace_id);
 
+                    c.set_context_state(ctx.state.as_str());
+
                     // Supplement with KernelDb metadata
                     if let Some(row) = db_map.get(&ctx.id) {
                         c.set_fork_kind(row.fork_kind.as_ref().map(|fk| fk.as_str()).unwrap_or(""));
@@ -2297,6 +2308,7 @@ impl kernel::Server for KernelImpl {
                     system_prompt: None,
                     tool_filter: None,
                     consent_mode: kaijutsu_kernel::control::ConsentMode::Collaborative,
+                    context_state: kaijutsu_types::ContextState::Live,
                     created_at: kaijutsu_types::now_millis() as i64,
                     created_by,
                     forked_from: parent_ctx,
@@ -6753,6 +6765,7 @@ fn set_block_snapshot(
 
     // Set ephemeral flag
     builder.set_ephemeral(block.ephemeral);
+    builder.set_excluded(block.excluded);
 
     // Set drift-specific fields if present
     if let Some(ref ctx) = block.source_context {
@@ -7097,6 +7110,7 @@ fn parse_block_snapshot(
         collapsed: reader.get_collapsed(),
         compacted: false,
         ephemeral: reader.get_ephemeral(),
+        excluded: reader.get_excluded(),
         created_at: reader.get_created_at(),
         tool_kind: if reader.get_has_tool_kind() {
             capnp_tool_kind_to_crdt(reader.get_tool_kind().ok())
@@ -7177,6 +7191,7 @@ fn parse_block_snapshot(
         status_at: 0,
         collapsed_at: 0,
         ephemeral_at: 0,
+        excluded_at: 0,
         compacted_at: 0,
         tool_meta_at: 0,
         content_type_at: 0,

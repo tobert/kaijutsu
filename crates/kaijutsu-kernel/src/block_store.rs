@@ -1060,6 +1060,29 @@ impl BlockStore {
         Ok(())
     }
 
+    /// Set the excluded flag on a block (user-curated exclusion during staging).
+    pub fn set_excluded(
+        &self,
+        context_id: ContextId,
+        block_id: &BlockId,
+        excluded: bool,
+    ) -> BlockStoreResult<()> {
+        let mut entry = self
+            .get_mut(context_id)
+            .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+        entry.doc.set_excluded(block_id, excluded)?;
+        entry.touch(self.agent_id());
+        drop(entry);
+
+        self.emit(BlockFlow::MetadataChanged {
+            context_id,
+            block_id: *block_id,
+            source: OpSource::Local,
+        });
+
+        Ok(())
+    }
+
     /// Set the content_type hint on a block (e.g., Markdown, Svg, Abc).
     pub fn set_content_type(
         &self,

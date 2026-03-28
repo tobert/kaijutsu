@@ -238,7 +238,7 @@ pub fn format_drift_queue(items: &[crate::drift::StagedDrift]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kaijutsu_types::{ConsentMode, PrincipalId};
+    use kaijutsu_types::{ConsentMode, ContextState, PrincipalId};
 
     fn make_row(label: Option<&str>, id: ContextId) -> ContextRow {
         ContextRow {
@@ -250,6 +250,7 @@ mod tests {
             system_prompt: None,
             tool_filter: None,
             consent_mode: ConsentMode::Collaborative,
+            context_state: ContextState::Live,
             created_at: kaijutsu_types::now_millis() as i64,
             created_by: PrincipalId::new(),
             forked_from: None,

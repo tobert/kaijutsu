@@ -63,7 +63,7 @@ pub use block::{
 };
 pub use compaction::CompactionBoundary;
 pub use context::{Context, fork_lineage};
-pub use enums::{ConsentMode, DocKind, EdgeKind, ForkKind, ToolFilter};
+pub use enums::{ConsentMode, ContextState, DocKind, EdgeKind, ForkKind, ToolFilter};
 pub use ids::{ContextId, KernelId, PresetId, PrincipalId, SessionId, WorkspaceId};
 pub use ids::{PrefixError, PrefixResolvable, resolve_context_prefix, resolve_prefix};
 pub use kernel::Kernel;

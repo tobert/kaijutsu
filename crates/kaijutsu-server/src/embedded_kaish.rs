@@ -306,7 +306,7 @@ mod tests {
     #[tokio::test]
     async fn test_persisted_cwd_restored_on_creation() {
         use kaijutsu_kernel::kernel_db::{ContextRow, ContextShellRow, KernelDb};
-        use kaijutsu_types::{ConsentMode, KernelId, now_millis};
+        use kaijutsu_types::{ConsentMode, ContextState, KernelId, now_millis};
 
         let tmp = tempfile::tempdir().unwrap();
         let persisted_cwd = tmp.path().to_path_buf();
@@ -331,6 +331,7 @@ mod tests {
                 system_prompt: None,
                 tool_filter: None,
                 consent_mode: ConsentMode::default(),
+                context_state: ContextState::Live,
                 forked_from: None,
                 fork_kind: None,
                 created_by: principal,

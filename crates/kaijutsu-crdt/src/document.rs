@@ -417,6 +417,7 @@ impl BlockDocument {
             collapsed,
             compacted,
             ephemeral: false, // Legacy document predates ephemeral
+            excluded: false,  // Legacy document predates excluded
             created_at,
             tool_kind,
             tool_name,
@@ -437,6 +438,7 @@ impl BlockDocument {
             status_at: 0,
             collapsed_at: 0,
             ephemeral_at: 0,
+            excluded_at: 0,
             compacted_at: 0,
             tool_meta_at: 0,
         })

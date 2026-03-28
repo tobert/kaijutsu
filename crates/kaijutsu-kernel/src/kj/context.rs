@@ -1,6 +1,6 @@
 //! Context subcommands: list, info, switch, create, set, log, move, archive, remove, retag.
 
-use kaijutsu_types::{ConsentMode, ContentType, ContextId, EdgeKind};
+use kaijutsu_types::{ConsentMode, ContentType, ContextId, ContextState, EdgeKind};
 
 use crate::kernel_db::{ContextEdgeRow, ContextRow, ContextShellRow};
 
@@ -225,6 +225,7 @@ impl KjDispatcher {
                 system_prompt: None,
                 tool_filter: None,
                 consent_mode: ConsentMode::Collaborative,
+                context_state: ContextState::Live,
                 created_at: kaijutsu_types::now_millis() as i64,
                 created_by: caller.principal_id,
                 forked_from: parent_id,

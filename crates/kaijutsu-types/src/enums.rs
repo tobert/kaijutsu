@@ -110,6 +110,45 @@ impl fmt::Display for ConsentMode {
 }
 
 // ============================================================================
+// ContextState — lifecycle phase of a context
+// ============================================================================
+
+/// Lifecycle phase of a context.
+///
+/// Controls what operations are permitted. `Staging` contexts allow block
+/// curation (toggling `excluded`) but block LLM invocation. `Live` contexts
+/// are the normal operating mode. `Archived` is reserved for future use
+/// (the `archived_at` timestamp on `ContextRow` remains authoritative).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default, EnumString)]
+#[serde(rename_all = "lowercase")]
+#[strum(ascii_case_insensitive)]
+pub enum ContextState {
+    /// Normal operating state — LLM calls enabled, blocks read-only.
+    #[default]
+    Live,
+    /// Post-fork curation — user can toggle excluded, LLM blocked.
+    Staging,
+    /// Frozen (future-proofing).
+    Archived,
+}
+
+impl ContextState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Staging => "staging",
+            Self::Archived => "archived",
+        }
+    }
+}
+
+impl fmt::Display for ContextState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+// ============================================================================
 // ToolFilter — per-context tool availability
 // ============================================================================
 
@@ -387,6 +426,67 @@ mod tests {
             let bytes = postcard::to_stdvec(&mode).unwrap();
             let parsed: ConsentMode = postcard::from_bytes(&bytes).unwrap();
             assert_eq!(mode, parsed);
+        }
+    }
+
+    // ── ContextState ────────────────────────────────────────────────────
+
+    #[test]
+    fn context_state_default() {
+        assert_eq!(ContextState::default(), ContextState::Live);
+    }
+
+    #[test]
+    fn context_state_as_str_roundtrip() {
+        for state in [
+            ContextState::Live,
+            ContextState::Staging,
+            ContextState::Archived,
+        ] {
+            let s = state.as_str();
+            let parsed = ContextState::from_str(s).unwrap();
+            assert_eq!(state, parsed);
+        }
+    }
+
+    #[test]
+    fn context_state_case_insensitive() {
+        assert_eq!(
+            ContextState::from_str("LIVE").unwrap(),
+            ContextState::Live
+        );
+        assert_eq!(
+            ContextState::from_str("Staging").unwrap(),
+            ContextState::Staging
+        );
+    }
+
+    #[test]
+    fn context_state_display() {
+        assert_eq!(format!("{}", ContextState::Live), "live");
+        assert_eq!(format!("{}", ContextState::Staging), "staging");
+        assert_eq!(format!("{}", ContextState::Archived), "archived");
+    }
+
+    #[test]
+    fn context_state_serde_roundtrip() {
+        let state = ContextState::Staging;
+        let json = serde_json::to_string(&state).unwrap();
+        assert_eq!(json, "\"staging\"");
+        let parsed: ContextState = serde_json::from_str(&json).unwrap();
+        assert_eq!(state, parsed);
+    }
+
+    #[test]
+    fn context_state_postcard_roundtrip() {
+        for state in [
+            ContextState::Live,
+            ContextState::Staging,
+            ContextState::Archived,
+        ] {
+            let bytes = postcard::to_stdvec(&state).unwrap();
+            let parsed: ContextState = postcard::from_bytes(&bytes).unwrap();
+            assert_eq!(state, parsed);
         }
     }
 

@@ -13,8 +13,8 @@ use rusqlite::{Connection, Result as SqliteResult, params};
 use tracing::{info, warn};
 
 use kaijutsu_types::{
-    ConsentMode, ContextId, DocKind, EdgeKind, ForkKind, KernelId, PresetId, PrincipalId,
-    ToolFilter, WorkspaceId,
+    ConsentMode, ContextId, ContextState, DocKind, EdgeKind, ForkKind, KernelId, PresetId,
+    PrincipalId, ToolFilter, WorkspaceId,
 };
 
 // ============================================================================
@@ -66,6 +66,7 @@ pub struct ContextRow {
     pub system_prompt: Option<String>,
     pub tool_filter: Option<ToolFilter>,
     pub consent_mode: ConsentMode,
+    pub context_state: ContextState,
     pub created_at: i64,
     pub created_by: PrincipalId,
     pub forked_from: Option<ContextId>,
@@ -257,6 +258,7 @@ CREATE TABLE IF NOT EXISTS contexts (
     system_prompt TEXT,
     tool_filter  TEXT,
     consent_mode TEXT NOT NULL DEFAULT 'collaborative',
+    context_state TEXT NOT NULL DEFAULT 'live',
     created_at   INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
     created_by   BLOB NOT NULL,
     forked_from  BLOB REFERENCES contexts(context_id) ON DELETE SET NULL,
@@ -459,6 +461,14 @@ fn consent_mode_from_sql(s: &str) -> ConsentMode {
     ConsentMode::from_str(s).unwrap_or_else(|_| {
         warn!(mode = %s, "unknown ConsentMode in DB, defaulting to Collaborative");
         ConsentMode::Collaborative
+    })
+}
+
+/// Parse ContextState from TEXT column.
+fn context_state_from_sql(s: &str) -> ContextState {
+    ContextState::from_str(s).unwrap_or_else(|_| {
+        warn!(state = %s, "unknown ContextState in DB, defaulting to Live");
+        ContextState::Live
     })
 }
 
@@ -950,14 +960,14 @@ impl KernelDb {
             .execute(
                 "INSERT INTO contexts (
                 context_id, kernel_id, label, provider, model,
-                system_prompt, tool_filter, consent_mode, created_at,
-                created_by, forked_from, fork_kind, archived_at,
-                workspace_id, preset_id
+                system_prompt, tool_filter, consent_mode, context_state,
+                created_at, created_by, forked_from, fork_kind,
+                archived_at, workspace_id, preset_id
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5,
                 ?6, ?7, ?8, ?9,
                 ?10, ?11, ?12, ?13,
-                ?14, ?15
+                ?14, ?15, ?16
             )",
                 params![
                     blob_param(row.context_id.as_bytes()),
@@ -968,6 +978,7 @@ impl KernelDb {
                     row.system_prompt,
                     tool_filter_to_sql(&row.tool_filter),
                     row.consent_mode.as_str(),
+                    row.context_state.as_str(),
                     row.created_at,
                     blob_param(row.created_by.as_bytes()),
                     row.forked_from.as_ref().map(|id| id.as_bytes().to_vec()),
@@ -991,9 +1002,9 @@ impl KernelDb {
     pub fn get_context(&self, id: ContextId) -> KernelDbResult<Option<ContextRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT context_id, kernel_id, label, provider, model,
-                    system_prompt, tool_filter, consent_mode, created_at,
-                    created_by, forked_from, fork_kind, archived_at,
-                    workspace_id, preset_id
+                    system_prompt, tool_filter, consent_mode, context_state,
+                    created_at, created_by, forked_from, fork_kind,
+                    archived_at, workspace_id, preset_id
              FROM contexts WHERE context_id = ?1",
         )?;
 
@@ -1122,9 +1133,9 @@ impl KernelDb {
     pub fn list_active_contexts(&self, kernel_id: KernelId) -> KernelDbResult<Vec<ContextRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT context_id, kernel_id, label, provider, model,
-                    system_prompt, tool_filter, consent_mode, created_at,
-                    created_by, forked_from, fork_kind, archived_at,
-                    workspace_id, preset_id
+                    system_prompt, tool_filter, consent_mode, context_state,
+                    created_at, created_by, forked_from, fork_kind,
+                    archived_at, workspace_id, preset_id
              FROM contexts
              WHERE kernel_id = ?1 AND archived_at IS NULL
              ORDER BY created_at",
@@ -1140,9 +1151,9 @@ impl KernelDb {
     pub fn list_all_contexts(&self, kernel_id: KernelId) -> KernelDbResult<Vec<ContextRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT context_id, kernel_id, label, provider, model,
-                    system_prompt, tool_filter, consent_mode, created_at,
-                    created_by, forked_from, fork_kind, archived_at,
-                    workspace_id, preset_id
+                    system_prompt, tool_filter, consent_mode, context_state,
+                    created_at, created_by, forked_from, fork_kind,
+                    archived_at, workspace_id, preset_id
              FROM contexts
              WHERE kernel_id = ?1
              ORDER BY created_at",
@@ -1180,9 +1191,9 @@ impl KernelDb {
     pub fn structural_parents(&self, id: ContextId) -> KernelDbResult<Vec<ContextRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT c.context_id, c.kernel_id, c.label, c.provider, c.model,
-                    c.system_prompt, c.tool_filter, c.consent_mode, c.created_at,
-                    c.created_by, c.forked_from, c.fork_kind, c.archived_at,
-                    c.workspace_id, c.preset_id
+                    c.system_prompt, c.tool_filter, c.consent_mode, c.context_state,
+                    c.created_at, c.created_by, c.forked_from, c.fork_kind,
+                    c.archived_at, c.workspace_id, c.preset_id
              FROM contexts c
              JOIN context_edges e ON e.source_id = c.context_id
              WHERE e.target_id = ?1 AND e.kind = 'structural'",
@@ -1198,9 +1209,9 @@ impl KernelDb {
     pub fn structural_children(&self, id: ContextId) -> KernelDbResult<Vec<ContextRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT c.context_id, c.kernel_id, c.label, c.provider, c.model,
-                    c.system_prompt, c.tool_filter, c.consent_mode, c.created_at,
-                    c.created_by, c.forked_from, c.fork_kind, c.archived_at,
-                    c.workspace_id, c.preset_id
+                    c.system_prompt, c.tool_filter, c.consent_mode, c.context_state,
+                    c.created_at, c.created_by, c.forked_from, c.fork_kind,
+                    c.archived_at, c.workspace_id, c.preset_id
              FROM contexts c
              JOIN context_edges e ON e.target_id = c.context_id
              WHERE e.source_id = ?1 AND e.kind = 'structural'
@@ -1236,9 +1247,9 @@ impl KernelDb {
                 JOIN contexts c2 ON c2.context_id = e.target_id AND c2.archived_at IS NULL
             )
             SELECT c.context_id, c.kernel_id, c.label, c.provider, c.model,
-                   c.system_prompt, c.tool_filter, c.consent_mode, c.created_at,
-                   c.created_by, c.forked_from, c.fork_kind, c.archived_at,
-                   c.workspace_id, c.preset_id,
+                   c.system_prompt, c.tool_filter, c.consent_mode, c.context_state,
+                   c.created_at, c.created_by, c.forked_from, c.fork_kind,
+                   c.archived_at, c.workspace_id, c.preset_id,
                    dag.depth
             FROM dag
             JOIN contexts c ON c.context_id = dag.ctx_id
@@ -1247,7 +1258,7 @@ impl KernelDb {
 
         let rows = stmt.query_map(params![blob_param(kernel_id.as_bytes())], |row| {
             let ctx = row_to_context_row(row)?;
-            let depth: i64 = row.get(15)?;
+            let depth: i64 = row.get(16)?;
             Ok((ctx, depth))
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
@@ -1266,9 +1277,9 @@ impl KernelDb {
                 WHERE c.forked_from IS NOT NULL
             )
             SELECT c.context_id, c.kernel_id, c.label, c.provider, c.model,
-                   c.system_prompt, c.tool_filter, c.consent_mode, c.created_at,
-                   c.created_by, c.forked_from, c.fork_kind, c.archived_at,
-                   c.workspace_id, c.preset_id,
+                   c.system_prompt, c.tool_filter, c.consent_mode, c.context_state,
+                   c.created_at, c.created_by, c.forked_from, c.fork_kind,
+                   c.archived_at, c.workspace_id, c.preset_id,
                    lineage.depth
             FROM lineage
             JOIN contexts c ON c.context_id = lineage.ctx_id
@@ -1277,7 +1288,7 @@ impl KernelDb {
 
         let rows = stmt.query_map(params![blob_param(context_id.as_bytes())], |row| {
             let ctx = row_to_context_row(row)?;
-            let depth: i64 = row.get(15)?;
+            let depth: i64 = row.get(16)?;
             Ok((ctx, depth))
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
@@ -1295,9 +1306,9 @@ impl KernelDb {
                 JOIN context_edges e ON e.source_id = subtree.ctx_id AND e.kind = 'structural'
             )
             SELECT c.context_id, c.kernel_id, c.label, c.provider, c.model,
-                   c.system_prompt, c.tool_filter, c.consent_mode, c.created_at,
-                   c.created_by, c.forked_from, c.fork_kind, c.archived_at,
-                   c.workspace_id, c.preset_id,
+                   c.system_prompt, c.tool_filter, c.consent_mode, c.context_state,
+                   c.created_at, c.created_by, c.forked_from, c.fork_kind,
+                   c.archived_at, c.workspace_id, c.preset_id,
                    subtree.depth
             FROM subtree
             JOIN contexts c ON c.context_id = subtree.ctx_id
@@ -1306,7 +1317,7 @@ impl KernelDb {
 
         let rows = stmt.query_map(params![blob_param(root_id.as_bytes())], |row| {
             let ctx = row_to_context_row(row)?;
-            let depth: i64 = row.get(15)?;
+            let depth: i64 = row.get(16)?;
             Ok((ctx, depth))
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
@@ -2028,9 +2039,9 @@ impl KernelDb {
     ) -> KernelDbResult<Option<ContextRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT context_id, kernel_id, label, provider, model,
-                    system_prompt, tool_filter, consent_mode, created_at,
-                    created_by, forked_from, fork_kind, archived_at,
-                    workspace_id, preset_id
+                    system_prompt, tool_filter, consent_mode, context_state,
+                    created_at, created_by, forked_from, fork_kind,
+                    archived_at, workspace_id, preset_id
              FROM contexts WHERE kernel_id = ?1 AND label = ?2",
         )?;
 
@@ -2063,7 +2074,8 @@ fn row_to_document_row(row: &rusqlite::Row<'_>) -> SqliteResult<DocumentRow> {
 
 fn row_to_context_row(row: &rusqlite::Row<'_>) -> SqliteResult<ContextRow> {
     let consent_str: String = row.get(7)?;
-    let fork_kind_str: Option<String> = row.get(11)?;
+    let state_str: String = row.get(8)?;
+    let fork_kind_str: Option<String> = row.get(12)?;
     let tool_filter_str: Option<String> = row.get(6)?;
 
     Ok(ContextRow {
@@ -2075,13 +2087,14 @@ fn row_to_context_row(row: &rusqlite::Row<'_>) -> SqliteResult<ContextRow> {
         system_prompt: row.get(5)?,
         tool_filter: tool_filter_from_sql(tool_filter_str),
         consent_mode: consent_mode_from_sql(&consent_str),
-        created_at: row.get(8)?,
-        created_by: read_principal_id(row, 9)?,
-        forked_from: read_opt_context_id(row, 10)?,
+        context_state: context_state_from_sql(&state_str),
+        created_at: row.get(9)?,
+        created_by: read_principal_id(row, 10)?,
+        forked_from: read_opt_context_id(row, 11)?,
         fork_kind: fork_kind_from_sql(fork_kind_str),
-        archived_at: row.get(12)?,
-        workspace_id: read_opt_workspace_id(row, 13)?,
-        preset_id: read_opt_preset_id(row, 14)?,
+        archived_at: row.get(13)?,
+        workspace_id: read_opt_workspace_id(row, 14)?,
+        preset_id: read_opt_preset_id(row, 15)?,
     })
 }
 
@@ -2143,6 +2156,7 @@ fn make_context_row(kernel_id: KernelId, label: Option<&str>) -> ContextRow {
         system_prompt: None,
         tool_filter: None,
         consent_mode: ConsentMode::default(),
+        context_state: ContextState::Live,
         created_at: now_millis() as i64,
         created_by: PrincipalId::new(),
         forked_from: None,
@@ -2810,6 +2824,7 @@ mod tests {
             system_prompt: None,
             tool_filter: Some(ToolFilter::All),
             consent_mode: ConsentMode::Autonomous,
+            context_state: ContextState::Live,
             created_at: now,
             created_by: creator,
             forked_from: Some(parent),
@@ -2847,6 +2862,7 @@ mod tests {
             system_prompt: Some("You are helpful.".into()),
             tool_filter: Some(ToolFilter::DenyList(["dangerous".to_string()].into())),
             consent_mode: ConsentMode::Collaborative,
+            context_state: ContextState::Live,
             created_at: 1000,
             created_by: creator,
             forked_from: None,
@@ -2870,6 +2886,7 @@ mod tests {
                 ["read".to_string(), "write".to_string()].into(),
             )),
             consent_mode: ConsentMode::Autonomous,
+            context_state: ContextState::Live,
             created_at: 2000,
             created_by: creator,
             forked_from: Some(parent_id),
@@ -2954,6 +2971,7 @@ mod tests {
             system_prompt: None,
             tool_filter: None,
             consent_mode: ConsentMode::default(),
+            context_state: ContextState::Live,
             created_at: now_millis() as i64,
             created_by: PrincipalId::new(),
             forked_from: None,

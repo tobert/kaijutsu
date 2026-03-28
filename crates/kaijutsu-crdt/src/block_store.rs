@@ -374,6 +374,7 @@ impl BlockStore {
             compacted: false,
             collapsed: false,
             ephemeral: false,
+            excluded: false,
             created_at: now_millis(),
             updated_at: ts,
             tool_kind: None,
@@ -382,6 +383,7 @@ impl BlockStore {
             status_at: ts,
             collapsed_at: ts,
             ephemeral_at: ts,
+            excluded_at: ts,
             compacted_at: ts,
             tool_meta_at: ts,
             content_type,
@@ -432,6 +434,7 @@ impl BlockStore {
             compacted: false,
             collapsed: false,
             ephemeral: false,
+            excluded: false,
             created_at: now,
             updated_at: ts,
             tool_kind,
@@ -440,6 +443,7 @@ impl BlockStore {
             status_at: ts,
             collapsed_at: ts,
             ephemeral_at: ts,
+            excluded_at: ts,
             compacted_at: ts,
             tool_meta_at: ts,
             content_type: ContentType::Plain,
@@ -493,6 +497,7 @@ impl BlockStore {
             compacted: false,
             collapsed: false,
             ephemeral: false,
+            excluded: false,
             created_at: now,
             updated_at: ts,
             tool_kind,
@@ -501,6 +506,7 @@ impl BlockStore {
             status_at: ts,
             collapsed_at: ts,
             ephemeral_at: ts,
+            excluded_at: ts,
             compacted_at: ts,
             tool_meta_at: ts,
             content_type: ContentType::Plain,
@@ -737,6 +743,18 @@ impl BlockStore {
             .get_mut(id)
             .ok_or(CrdtError::BlockNotFound(*id))?;
         block.set_ephemeral(ephemeral, ts);
+        self.version += 1;
+        Ok(())
+    }
+
+    /// Set the excluded flag on a block (user-curated exclusion during staging).
+    pub fn set_excluded(&mut self, id: &BlockId, excluded: bool) -> Result<()> {
+        let ts = self.tick();
+        let block = self
+            .blocks
+            .get_mut(id)
+            .ok_or(CrdtError::BlockNotFound(*id))?;
+        block.set_excluded(excluded, ts);
         self.version += 1;
         Ok(())
     }
@@ -2886,6 +2904,7 @@ mod tests {
             compacted: false,
             collapsed: false,
             ephemeral: false,
+            excluded: false,
             created_at: ts_early,
             updated_at: 0,
             tool_kind: None,
@@ -2894,6 +2913,7 @@ mod tests {
             status_at: 0,
             collapsed_at: 0,
             ephemeral_at: 0,
+            excluded_at: 0,
             compacted_at: 0,
             tool_meta_at: 0,
             content_type: ContentType::Plain,
@@ -2913,6 +2933,7 @@ mod tests {
             compacted: false,
             collapsed: false,
             ephemeral: false,
+            excluded: false,
             created_at: ts_mid,
             updated_at: 0,
             tool_kind: None,
@@ -2921,6 +2942,7 @@ mod tests {
             status_at: 0,
             collapsed_at: 0,
             ephemeral_at: 0,
+            excluded_at: 0,
             compacted_at: 0,
             tool_meta_at: 0,
             content_type: ContentType::Plain,
@@ -2940,6 +2962,7 @@ mod tests {
             compacted: false,
             collapsed: false,
             ephemeral: false,
+            excluded: false,
             created_at: ts_late,
             updated_at: 0,
             tool_kind: None,
@@ -2948,6 +2971,7 @@ mod tests {
             status_at: 0,
             collapsed_at: 0,
             ephemeral_at: 0,
+            excluded_at: 0,
             compacted_at: 0,
             tool_meta_at: 0,
             content_type: ContentType::Plain,
@@ -3005,6 +3029,7 @@ mod tests {
             compacted: false,
             collapsed: false,
             ephemeral: false,
+            excluded: false,
             created_at: ts_early,
             updated_at: 0,
             tool_kind: None,
@@ -3013,6 +3038,7 @@ mod tests {
             status_at: 0,
             collapsed_at: 0,
             ephemeral_at: 0,
+            excluded_at: 0,
             compacted_at: 0,
             tool_meta_at: 0,
             content_type: ContentType::Plain,
@@ -3034,6 +3060,7 @@ mod tests {
             compacted: false,
             collapsed: false,
             ephemeral: false,
+            excluded: false,
             created_at: ts_late,
             updated_at: 0,
             tool_kind: None,
@@ -3042,6 +3069,7 @@ mod tests {
             status_at: 0,
             collapsed_at: 0,
             ephemeral_at: 0,
+            excluded_at: 0,
             compacted_at: 0,
             tool_meta_at: 0,
             content_type: ContentType::Plain,

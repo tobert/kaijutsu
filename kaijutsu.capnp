@@ -171,6 +171,10 @@ struct BlockSnapshot {
   # Ephemeral blocks are displayed but excluded from LLM hydration.
   # Use for human-only output (help text, status info) that wastes model context.
   ephemeral @25 :Bool;
+
+  # User-curated exclusion — block is omitted from hydration.
+  # Unlike ephemeral (system-managed), toggled by the user during staging.
+  excluded @26 :Bool;
 }
 
 # Operations on block documents
@@ -204,6 +208,11 @@ struct BlockDocOp {
     moveBlock :group {
       id @11 :BlockId;
       afterId @12 :BlockId;
+    }
+    # Toggle user-curated excluded flag (staging only)
+    setExcluded :group {
+      id @13 :BlockId;
+      excluded @14 :Bool;
     }
   }
 }
@@ -273,6 +282,9 @@ interface BlockEvents {
 
   # Session control events (server → client)
   onContextSwitched @9 (contextId :Data);
+
+  # Block excluded flag changed (staging curation)
+  onBlockExcludedChanged @10 (contextId :Data, blockId :BlockId, excluded :Bool);
 }
 
 # ============================================================================
@@ -306,6 +318,7 @@ struct ContextHandleInfo {
   archivedAt @8 :UInt64;          # 0 = active, else Unix millis when archived
   keywords @9 :List(Text);        # Synthesis keywords (empty if not yet synthesized)
   topBlockPreview @10 :Text;      # Preview of most representative block (empty if none)
+  contextState @11 :Text;         # "live"/"staging"/"archived" (default "live")
 }
 
 struct PresetInfo {
@@ -1114,6 +1127,12 @@ interface Kernel {
   # Clear the input document for a context (discard draft).
   # Emits InputCleared so all clients can reset their compose state.
   clearInput @90 (contextId :Data, trace :TraceContext) -> ();
+
+  # Set lifecycle state for a context (e.g., Staging → Live).
+  setContextState @91 (contextId :Data, state :Text, trace :TraceContext) -> (success :Bool, error :Text);
+
+  # Set the excluded flag on a block (staging curation).
+  setBlockExcluded @92 (contextId :Data, blockId :BlockId, excluded :Bool, trace :TraceContext) -> (newVersion :UInt64);
 }
 
 # ============================================================================

@@ -425,6 +425,7 @@ mod tests {
             collapsed: false,
             compacted: false,
             ephemeral: false,
+            excluded: false,
             created_at: 0,
             tool_kind: None,
             tool_name: None,
@@ -445,6 +446,7 @@ mod tests {
             status_at: 0,
             collapsed_at: 0,
             ephemeral_at: 0,
+            excluded_at: 0,
             compacted_at: 0,
             tool_meta_at: 0,
         };
@@ -458,6 +460,7 @@ mod tests {
             collapsed: false,
             compacted: false,
             ephemeral: false,
+            excluded: false,
             created_at: 0,
             tool_kind: None,
             tool_name: None,
@@ -478,6 +481,7 @@ mod tests {
             status_at: 0,
             collapsed_at: 0,
             ephemeral_at: 0,
+            excluded_at: 0,
             compacted_at: 0,
             tool_meta_at: 0,
         };

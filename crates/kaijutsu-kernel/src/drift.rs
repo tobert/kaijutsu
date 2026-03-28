@@ -32,7 +32,7 @@ use tokio::sync::RwLock;
 use kaijutsu_crdt::{
     BlockKind, BlockSnapshot, ContextId, DriftKind, PrefixError, Role, resolve_context_prefix,
 };
-use kaijutsu_types::PrincipalId;
+use kaijutsu_types::{ContextState, PrincipalId};
 
 use crate::llm::config::ToolFilter;
 
@@ -81,6 +81,8 @@ pub struct ContextHandle {
     /// When set, merged with the kernel's tool config at resolution time.
     /// Context filters can restrict (not relax) the kernel's tool set.
     pub tool_filter: Option<ToolFilter>,
+    /// Lifecycle state — controls what operations are permitted.
+    pub state: ContextState,
 }
 
 impl ContextHandle {
@@ -195,6 +197,7 @@ impl DriftRouter {
             created_at: kaijutsu_types::now_millis(),
             trace_id: uuid::Uuid::new_v4().into_bytes(),
             tool_filter: None,
+            state: ContextState::Live,
         };
 
         self.contexts.insert(id, handle);
@@ -237,6 +240,7 @@ impl DriftRouter {
             created_at: kaijutsu_types::now_millis(),
             trace_id: uuid::Uuid::new_v4().into_bytes(),
             tool_filter: parent_tool_filter,
+            state: ContextState::Live,
         };
 
         self.contexts.insert(id, handle);
@@ -358,6 +362,25 @@ impl DriftRouter {
             .get_mut(&id)
             .ok_or_else(|| DriftError::UnknownContext(id.short()))?;
         handle.pwd = pwd;
+        Ok(())
+    }
+
+    /// Get the lifecycle state of a context.
+    pub fn context_state(&self, id: ContextId) -> Option<ContextState> {
+        self.contexts.get(&id).map(|h| h.state)
+    }
+
+    /// Set the lifecycle state of a context (e.g., Staging → Live).
+    pub fn set_state(
+        &mut self,
+        id: ContextId,
+        state: ContextState,
+    ) -> Result<(), DriftError> {
+        let handle = self
+            .contexts
+            .get_mut(&id)
+            .ok_or_else(|| DriftError::UnknownContext(id.short()))?;
+        handle.state = state;
         Ok(())
     }
 

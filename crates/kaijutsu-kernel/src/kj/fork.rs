@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use kaijutsu_types::{ConsentMode, ContentType, ContextId, EdgeKind, ForkKind, ToolFilter};
+use kaijutsu_types::{ConsentMode, ContentType, ContextId, ContextState, EdgeKind, ForkKind, ToolFilter};
 
 use crate::kernel_db::{ContextEdgeRow, ContextRow, ContextShellRow};
 
@@ -175,6 +175,7 @@ impl KjDispatcher {
                 system_prompt: None,
                 tool_filter: None,
                 consent_mode: ConsentMode::Collaborative,
+                context_state: ContextState::Live,
                 created_at: kaijutsu_types::now_millis() as i64,
                 created_by: caller.principal_id,
                 forked_from: Some(source_id),
@@ -364,6 +365,7 @@ impl KjDispatcher {
                 system_prompt: None,
                 tool_filter: None,
                 consent_mode: ConsentMode::Collaborative,
+                context_state: ContextState::Live,
                 created_at: kaijutsu_types::now_millis() as i64,
                 created_by: caller.principal_id,
                 forked_from: Some(source_id),
@@ -587,6 +589,7 @@ impl KjDispatcher {
                 system_prompt: None,
                 tool_filter: None,
                 consent_mode: ConsentMode::Collaborative,
+                context_state: ContextState::Live,
                 created_at: kaijutsu_types::now_millis() as i64,
                 created_by: caller.principal_id,
                 forked_from: Some(source_id),
@@ -797,6 +800,7 @@ impl KjDispatcher {
                     system_prompt: row.system_prompt.clone(),
                     tool_filter: row.tool_filter.clone(),
                     consent_mode: row.consent_mode,
+                    context_state: ContextState::Live,
                     created_at: kaijutsu_types::now_millis() as i64,
                     created_by: caller.principal_id,
                     forked_from: new_forked_from,

@@ -112,6 +112,9 @@ pub struct BlockContent {
     /// Ephemeral blocks are displayed but excluded from LLM hydration.
     ephemeral: bool,
 
+    /// User-curated exclusion — toggled during staging.
+    excluded: bool,
+
     /// Whether this block has been deleted (tombstone).
     deleted: bool,
 }
@@ -144,6 +147,7 @@ impl BlockContent {
             file_path: None,
             collapsed: false,
             ephemeral: false,
+            excluded: false,
             deleted: false,
         }
     }
@@ -189,6 +193,7 @@ impl BlockContent {
         block.file_path = snap.file_path.clone();
         block.collapsed = snap.collapsed;
         block.ephemeral = snap.ephemeral;
+        block.excluded = snap.excluded;
         block
     }
 
@@ -227,6 +232,7 @@ impl BlockContent {
             file_path: snap.file_path.clone(),
             collapsed: snap.collapsed,
             ephemeral: snap.ephemeral,
+            excluded: snap.excluded,
             deleted: false,
         }
     }
@@ -397,6 +403,17 @@ impl BlockContent {
         self.header.updated_at = self.header.max_field_ts();
     }
 
+    pub fn excluded(&self) -> bool {
+        self.excluded
+    }
+
+    pub fn set_excluded(&mut self, val: bool, lamport_ts: u64) {
+        self.excluded = val;
+        self.header.excluded = val;
+        self.header.excluded_at = lamport_ts;
+        self.header.updated_at = self.header.max_field_ts();
+    }
+
     // ── Sync ────────────────────────────────────────────────────────────
 
     /// Get operations since a frontier (per-block sync).
@@ -439,6 +456,7 @@ impl BlockContent {
             collapsed: self.collapsed,
             compacted: self.header.compacted,
             ephemeral: self.ephemeral,
+            excluded: self.excluded,
             created_at: self.header.created_at,
             tool_kind: self.header.tool_kind,
             tool_name: self.tool_name.clone(),
@@ -458,6 +476,7 @@ impl BlockContent {
             status_at: self.header.status_at,
             collapsed_at: self.header.collapsed_at,
             ephemeral_at: self.header.ephemeral_at,
+            excluded_at: self.header.excluded_at,
             compacted_at: self.header.compacted_at,
             tool_meta_at: self.header.tool_meta_at,
             content_type_at: self.header.content_type_at,
@@ -503,6 +522,18 @@ impl BlockContent {
             self.header.ephemeral = remote.ephemeral;
             self.ephemeral = remote.ephemeral;
             self.header.ephemeral_at = remote.ephemeral_at;
+        }
+
+        // excluded
+        if field_wins(
+            remote.excluded_at,
+            self.header.excluded_at,
+            &remote.excluded,
+            &self.header.excluded,
+        ) {
+            self.header.excluded = remote.excluded;
+            self.excluded = remote.excluded;
+            self.header.excluded_at = remote.excluded_at;
         }
 
         // compacted

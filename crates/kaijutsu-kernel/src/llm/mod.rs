@@ -1000,6 +1000,9 @@ pub fn hydrate_from_blocks(blocks: &[kaijutsu_types::BlockSnapshot]) -> Vec<Mess
         if block.ephemeral {
             continue;
         }
+        if block.excluded {
+            continue;
+        }
         if matches!(block.kind, BlockKind::Thinking | BlockKind::File) {
             continue;
         }
@@ -1449,6 +1452,33 @@ mod tests {
             assert_eq!(msgs[1].as_text(), Some("Hi"));
             assert_eq!(msgs[2].role, Role::User); // drift becomes user message
             assert!(msgs[2].as_text().unwrap().contains("drift content"));
+        }
+
+        #[test]
+        fn skips_excluded_blocks() {
+            let c = ctx();
+            let u = user();
+            let m = model();
+
+            let blocks = vec![
+                BlockSnapshot::text(BlockId::new(c, u, 0), None, BlockRole::User, "Hello"),
+                {
+                    let mut b = BlockSnapshot::text(
+                        BlockId::new(c, m, 0),
+                        None,
+                        BlockRole::Model,
+                        "excluded reply",
+                    );
+                    b.excluded = true;
+                    b
+                },
+                BlockSnapshot::text(BlockId::new(c, m, 1), None, BlockRole::Model, "kept reply"),
+            ];
+
+            let msgs = hydrate_from_blocks(&blocks);
+            assert_eq!(msgs.len(), 2);
+            assert_eq!(msgs[0].as_text(), Some("Hello"));
+            assert_eq!(msgs[1].as_text(), Some("kept reply"));
         }
 
         #[test]

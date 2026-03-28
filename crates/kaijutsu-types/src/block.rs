@@ -140,6 +140,10 @@ pub struct BlockHeader {
     pub collapsed: bool,
     /// Ephemeral blocks are displayed but excluded from LLM hydration.
     pub ephemeral: bool,
+    /// User-curated exclusion — block is omitted from hydration.
+    /// Unlike `ephemeral` (system-managed), this is toggled by the user
+    /// during staging to shape the conversation before LLM invocation.
+    pub excluded: bool,
     pub created_at: u64,
     /// Aggregate Lamport timestamp — `max(all per-field timestamps)`.
     /// Used for clock advancement in `merge_ops()`.
@@ -163,6 +167,8 @@ pub struct BlockHeader {
     pub collapsed_at: u64,
     /// Lamport timestamp for `ephemeral` field.
     pub ephemeral_at: u64,
+    /// Lamport timestamp for `excluded` field.
+    pub excluded_at: u64,
     /// Lamport timestamp for `compacted` field.
     pub compacted_at: u64,
     /// Lamport timestamp for `tool_kind`, `exit_code`, `is_error` fields.
@@ -183,6 +189,7 @@ impl BlockHeader {
             compacted: snap.compacted,
             collapsed: snap.collapsed,
             ephemeral: snap.ephemeral,
+            excluded: snap.excluded,
             created_at: snap.created_at,
             updated_at: snap.updated_at,
             tool_kind: snap.tool_kind,
@@ -192,6 +199,7 @@ impl BlockHeader {
             status_at: snap.status_at,
             collapsed_at: snap.collapsed_at,
             ephemeral_at: snap.ephemeral_at,
+            excluded_at: snap.excluded_at,
             compacted_at: snap.compacted_at,
             tool_meta_at: snap.tool_meta_at,
             content_type_at: snap.content_type_at,
@@ -203,6 +211,7 @@ impl BlockHeader {
         self.status_at
             .max(self.collapsed_at)
             .max(self.ephemeral_at)
+            .max(self.excluded_at)
             .max(self.compacted_at)
             .max(self.tool_meta_at)
             .max(self.content_type_at)
@@ -593,6 +602,11 @@ pub struct BlockSnapshot {
     /// Use for human-only output (help text, status info) that wastes model context.
     #[serde(default)]
     pub ephemeral: bool,
+    /// User-curated exclusion — block is omitted from hydration.
+    /// Unlike `ephemeral` (system-managed), this is toggled by the user
+    /// during staging to shape the conversation before LLM invocation.
+    #[serde(default)]
+    pub excluded: bool,
     /// Timestamp when block was created (Unix millis).
     pub created_at: u64,
 
@@ -674,6 +688,9 @@ pub struct BlockSnapshot {
     /// Lamport timestamp for `ephemeral` field.
     #[serde(default)]
     pub ephemeral_at: u64,
+    /// Lamport timestamp for `excluded` field.
+    #[serde(default)]
+    pub excluded_at: u64,
     /// Lamport timestamp for `compacted` field.
     #[serde(default)]
     pub compacted_at: u64,
@@ -712,6 +729,7 @@ impl BlockSnapshot {
             collapsed: false,
             compacted: false,
             ephemeral: false,
+            excluded: false,
             created_at: crate::now_millis(),
             tool_kind: None,
             tool_name: None,
@@ -731,6 +749,7 @@ impl BlockSnapshot {
             status_at: 0,
             collapsed_at: 0,
             ephemeral_at: 0,
+            excluded_at: 0,
             compacted_at: 0,
             tool_meta_at: 0,
             content_type_at: 0,
@@ -753,6 +772,7 @@ impl BlockSnapshot {
             collapsed: false,
             compacted: false,
             ephemeral: false,
+            excluded: false,
             created_at: crate::now_millis(),
             tool_kind: None,
             tool_name: None,
@@ -772,6 +792,7 @@ impl BlockSnapshot {
             status_at: 0,
             collapsed_at: 0,
             ephemeral_at: 0,
+            excluded_at: 0,
             compacted_at: 0,
             tool_meta_at: 0,
             content_type_at: 0,
@@ -806,6 +827,7 @@ impl BlockSnapshot {
             collapsed: false,
             compacted: false,
             ephemeral: false,
+            excluded: false,
             created_at: crate::now_millis(),
             tool_kind: Some(tool_kind),
             tool_name: Some(tool_name.into()),
@@ -825,6 +847,7 @@ impl BlockSnapshot {
             status_at: 0,
             collapsed_at: 0,
             ephemeral_at: 0,
+            excluded_at: 0,
             compacted_at: 0,
             tool_meta_at: 0,
             content_type_at: 0,
@@ -859,6 +882,7 @@ impl BlockSnapshot {
             collapsed: false,
             compacted: false,
             ephemeral: false,
+            excluded: false,
             created_at: crate::now_millis(),
             tool_kind: Some(tool_kind),
             tool_name: None,
@@ -878,6 +902,7 @@ impl BlockSnapshot {
             status_at: 0,
             collapsed_at: 0,
             ephemeral_at: 0,
+            excluded_at: 0,
             compacted_at: 0,
             tool_meta_at: 0,
             content_type_at: 0,
@@ -916,6 +941,7 @@ impl BlockSnapshot {
             collapsed: false,
             compacted: false,
             ephemeral: false,
+            excluded: false,
             created_at: crate::now_millis(),
             tool_kind: Some(tool_kind),
             tool_name: None,
@@ -935,6 +961,7 @@ impl BlockSnapshot {
             status_at: 0,
             collapsed_at: 0,
             ephemeral_at: 0,
+            excluded_at: 0,
             compacted_at: 0,
             tool_meta_at: 0,
             content_type_at: 0,
@@ -964,6 +991,7 @@ impl BlockSnapshot {
             collapsed: false,
             compacted: false,
             ephemeral: false,
+            excluded: false,
             created_at: crate::now_millis(),
             tool_kind: None,
             tool_name: None,
@@ -983,6 +1011,7 @@ impl BlockSnapshot {
             status_at: 0,
             collapsed_at: 0,
             ephemeral_at: 0,
+            excluded_at: 0,
             compacted_at: 0,
             tool_meta_at: 0,
             content_type_at: 0,
@@ -1010,6 +1039,7 @@ impl BlockSnapshot {
             collapsed: false,
             compacted: false,
             ephemeral: false,
+            excluded: false,
             created_at: crate::now_millis(),
             tool_kind: None,
             tool_name: None,
@@ -1029,6 +1059,7 @@ impl BlockSnapshot {
             status_at: 0,
             collapsed_at: 0,
             ephemeral_at: 0,
+            excluded_at: 0,
             compacted_at: 0,
             tool_meta_at: 0,
             content_type_at: 0,
@@ -1124,6 +1155,7 @@ impl BlockSnapshotBuilder {
                 collapsed: false,
                 compacted: false,
                 ephemeral: false,
+                excluded: false,
                 created_at: crate::now_millis(),
                 tool_kind: None,
                 tool_name: None,
@@ -1143,6 +1175,7 @@ impl BlockSnapshotBuilder {
                 status_at: 0,
                 collapsed_at: 0,
                 ephemeral_at: 0,
+                excluded_at: 0,
                 compacted_at: 0,
                 tool_meta_at: 0,
                 content_type_at: 0,
@@ -1177,6 +1210,11 @@ impl BlockSnapshotBuilder {
 
     pub fn compacted(mut self, compacted: bool) -> Self {
         self.snap.compacted = compacted;
+        self
+    }
+
+    pub fn excluded(mut self, excluded: bool) -> Self {
+        self.snap.excluded = excluded;
         self
     }
 
