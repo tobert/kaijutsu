@@ -193,12 +193,21 @@ pub fn default_bindings() -> Vec<Binding> {
         "Activate focused block",
     ));
 
-    // Escape — multi-press cancel (soft → hard → hard+clear)
+    // Escape — unfocus (Compose→Conversation, etc.)
     b.push(Binding::key(
         KeyCode::Escape,
         InputContext::Navigation,
+        Action::Unfocus,
+        "Unfocus / pop view",
+    ));
+
+    // Ctrl+C — multi-press interrupt (soft → hard → hard+clear)
+    b.push(Binding::key_mod(
+        KeyCode::KeyC,
+        Modifiers::CTRL,
+        InputContext::Navigation,
         Action::InterruptContext { immediate: false },
-        "Interrupt / pop view",
+        "Interrupt context",
     ));
 
     // Collapse toggle (Tab on thinking block — currently reuses Tab, but dispatch priority
@@ -327,144 +336,18 @@ pub fn default_bindings() -> Vec<Binding> {
     ));
 
     // ====================================================================
-    // TextInput (compose area or block editing focused)
+    // TextInput (compose area — owned by VimMachine)
     // ====================================================================
-
-    b.push(Binding::key(
-        KeyCode::Enter,
-        InputContext::TextInput,
-        Action::Submit,
-        "Submit",
-    ));
-    b.push(Binding::key_mod(
-        KeyCode::Enter,
-        Modifiers::SHIFT,
-        InputContext::TextInput,
-        Action::InsertNewline,
-        "Insert newline",
-    ));
-    b.push(Binding::key(
-        KeyCode::Escape,
-        InputContext::TextInput,
-        Action::InterruptContext { immediate: false },
-        "Interrupt / return to navigation",
-    ));
-    b.push(Binding::key(
-        KeyCode::Tab,
-        InputContext::TextInput,
-        Action::CycleModeRing,
-        "Cycle mode ring",
-    ));
-    b.push(Binding::key(
-        KeyCode::Backspace,
-        InputContext::TextInput,
-        Action::Backspace,
-        "Backspace",
-    ));
-    b.push(Binding::key(
-        KeyCode::Delete,
-        InputContext::TextInput,
-        Action::Delete,
-        "Delete",
-    ));
-
-    // Cursor movement
-    b.push(Binding::key(
-        KeyCode::ArrowLeft,
-        InputContext::TextInput,
-        Action::CursorLeft,
-        "Cursor left",
-    ));
-    b.push(Binding::key(
-        KeyCode::ArrowRight,
-        InputContext::TextInput,
-        Action::CursorRight,
-        "Cursor right",
-    ));
-    b.push(Binding::key(
-        KeyCode::ArrowUp,
-        InputContext::TextInput,
-        Action::CursorUp,
-        "Cursor up",
-    ));
-    b.push(Binding::key(
-        KeyCode::ArrowDown,
-        InputContext::TextInput,
-        Action::CursorDown,
-        "Cursor down",
-    ));
-    b.push(Binding::key(
-        KeyCode::Home,
-        InputContext::TextInput,
-        Action::CursorHome,
-        "Start of line",
-    ));
-    b.push(Binding::key(
-        KeyCode::End,
-        InputContext::TextInput,
-        Action::CursorEnd,
-        "End of line",
-    ));
-
-    // Word movement
-    b.push(Binding::key_mod(
-        KeyCode::ArrowLeft,
-        Modifiers::CTRL,
-        InputContext::TextInput,
-        Action::CursorWordLeft,
-        "Word left",
-    ));
-    b.push(Binding::key_mod(
-        KeyCode::ArrowRight,
-        Modifiers::CTRL,
-        InputContext::TextInput,
-        Action::CursorWordRight,
-        "Word right",
-    ));
-
-    // Clipboard + undo
-    b.push(Binding::key_mod(
-        KeyCode::KeyA,
-        Modifiers::CTRL,
-        InputContext::TextInput,
-        Action::SelectAll,
-        "Select all",
-    ));
-    b.push(Binding::key_mod(
-        KeyCode::KeyC,
-        Modifiers::CTRL,
-        InputContext::TextInput,
-        Action::Copy,
-        "Copy",
-    ));
-    b.push(Binding::key_mod(
-        KeyCode::KeyX,
-        Modifiers::CTRL,
-        InputContext::TextInput,
-        Action::Cut,
-        "Cut",
-    ));
-    b.push(Binding::key_mod(
-        KeyCode::KeyV,
-        Modifiers::CTRL,
-        InputContext::TextInput,
-        Action::Paste,
-        "Paste",
-    ));
-    b.push(Binding::key_mod(
-        KeyCode::KeyZ,
-        Modifiers::CTRL,
-        InputContext::TextInput,
-        Action::Undo,
-        "Undo",
-    ));
-    b.push(Binding::key_mod(
-        KeyCode::KeyZ,
-        Modifiers::CTRL_SHIFT,
-        InputContext::TextInput,
-        Action::Redo,
-        "Redo",
-    ));
+    // All TextInput keyboard bindings are handled by the VimMachine
+    // (vim_dispatch_compose system). Ctrl+C for interrupt is handled
+    // directly in that system before keys reach the VimMachine.
+    //
+    // No flat bindings needed here — the VimMachine handles:
+    //   Insert mode: character typing, Backspace, Delete, arrow keys
+    //   Normal mode: motions (hjkl, w/b/e, etc.), operators (d, c, y)
+    //   Submit: Enter (via submit_on_enter)
+    //   Mode ring: Tab (via custom binding, Phase 2+)
+    //   Escape: Normal mode ↔ Insert mode, or dismiss compose
 
     // ====================================================================
     // Dialog (modal dialog open)

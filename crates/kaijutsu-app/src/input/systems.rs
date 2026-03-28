@@ -118,18 +118,17 @@ pub fn handle_unfocus(
     }
 }
 
-/// Handle InterruptContext action — multi-press Escape cancel.
+/// Handle InterruptContext action — multi-press Ctrl+C interrupt.
 ///
 /// Press count determines escalation:
 /// - 1st press: soft interrupt (stop agentic loop after current tool turn)
 /// - 2nd press: hard interrupt (abort LLM stream + kill kaish jobs)
 /// - 3rd press: hard interrupt + clear compose buffer
 ///
-/// Also transitions focus from Compose → Conversation (mirrors old Unfocus behavior).
-pub fn handle_escape(
+/// Does NOT change focus — that's handle_unfocus's job (Escape key).
+pub fn handle_interrupt(
     mut actions: MessageReader<ActionFired>,
-    mut escape_state: ResMut<crate::input::escape::EscapeState>,
-    mut focus: ResMut<FocusArea>,
+    mut interrupt_state: ResMut<crate::input::interrupt::InterruptState>,
     mut overlay: Query<&mut crate::cell::InputOverlay>,
     mut doc_cache: ResMut<crate::cell::DocumentCache>,
     actor: Option<Res<crate::connection::RpcActor>>,
@@ -140,7 +139,7 @@ pub fn handle_escape(
             _ => continue,
         };
 
-        let count = escape_state.press();
+        let count = interrupt_state.press();
 
         // Escalate based on press count
         let effective_immediate = count >= 2;
@@ -191,12 +190,7 @@ pub fn handle_escape(
                         .detach();
                 }
             }
-            escape_state.reset();
-        }
-
-        // Always transition Compose → Conversation (mirrors old Unfocus behavior)
-        if matches!(focus.as_ref(), FocusArea::Compose) {
-            *focus = FocusArea::Conversation;
+            interrupt_state.reset();
         }
     }
 }

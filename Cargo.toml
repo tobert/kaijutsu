@@ -94,6 +94,11 @@ rig-core = "0.30"
 # MCP (Model Context Protocol)
 rmcp = { version = "1.2", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 
+# Vi-modal editing (keystroke → semantic action state machine)
+modalkit = { path = "../research/modalkit/crates/modalkit" }
+editor-types = { path = "../research/modalkit/crates/editor-types" }
+crossterm = "0.28.1"
+
 # System clipboard
 arboard = { version = "3", features = ["wayland-data-control"] }
 

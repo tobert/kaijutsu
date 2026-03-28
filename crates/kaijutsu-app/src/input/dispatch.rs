@@ -37,7 +37,7 @@ pub fn dispatch_input(
     input_map: Res<InputMap>,
     active_contexts: Res<ActiveInputContexts>,
     mut action_writer: MessageWriter<ActionFired>,
-    mut text_writer: MessageWriter<TextInputReceived>,
+    _text_writer: MessageWriter<TextInputReceived>,
     mut analog_input: ResMut<AnalogInput>,
 ) {
     // --- Mouse wheel → ScrollDelta ---
@@ -52,8 +52,19 @@ pub fn dispatch_input(
     }
 
     // --- Keyboard ---
+    // When TextInput context is active, keyboard events are handled by
+    // vim_dispatch_compose (the VimMachine). We still process keyboard
+    // events here for non-TextInput contexts (Navigation, Constellation, etc.).
+    let vim_owns_keyboard = active_contexts.contains(InputContext::TextInput);
+
     for event in keyboard.read() {
         if !event.state.is_pressed() {
+            continue;
+        }
+
+        // Skip keyboard events when VimMachine owns input (compose focused).
+        // The vim dispatch system reads from the same MessageReader.
+        if vim_owns_keyboard {
             continue;
         }
 
@@ -68,16 +79,6 @@ pub fn dispatch_input(
                 action_writer.write(ActionFired(action));
             }
             continue;
-        }
-
-        // 2. No match in TextInput context → emit text
-        if active_contexts.contains(InputContext::TextInput)
-            && let Some(ref text) = event.text
-        {
-            let s = text.as_str();
-            if !s.is_empty() && s.chars().all(|c| !c.is_control()) {
-                text_writer.write(TextInputReceived(s.to_string()));
-            }
         }
     }
 

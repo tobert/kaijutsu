@@ -181,7 +181,7 @@ pub enum Action {
     /// - 2nd press: hard interrupt (abort LLM stream + kill jobs)
     /// - 3rd press: hard interrupt + clear compose buffer
     ///
-    /// `immediate` is the starting mode from the binding. The `handle_escape`
+    /// `immediate` is the starting mode from the binding. The `handle_interrupt`
     /// system escalates based on press count.
     InterruptContext { immediate: bool },
 }

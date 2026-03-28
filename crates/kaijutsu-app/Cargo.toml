@@ -45,6 +45,9 @@ kaijutsu-telemetry = { workspace = true }
 thiserror.workspace = true
 
 arboard.workspace = true
+modalkit.workspace = true
+editor-types.workspace = true
+crossterm.workspace = true
 
 tokio.workspace = true
 tokio-util.workspace = true

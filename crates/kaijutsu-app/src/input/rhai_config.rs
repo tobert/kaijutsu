@@ -427,7 +427,7 @@ fn parse_action(s: &str) -> Result<Action, String> {
         "Quit" => Ok(Action::Quit),
         "Screenshot" => Ok(Action::Screenshot),
         "DebugToggle" => Ok(Action::DebugToggle),
-        // InterruptContext defaults immediate=false — press count escalates in handle_escape
+        // InterruptContext defaults immediate=false — press count escalates in handle_interrupt
         "InterruptContext" => Ok(Action::InterruptContext { immediate: false }),
         _ => Err(format!("unknown action '{s}'")),
     }

@@ -35,12 +35,13 @@ pub mod binding;
 pub mod context;
 pub mod defaults;
 pub mod dispatch;
-pub mod escape;
+pub mod interrupt;
 pub mod events;
 pub mod focus;
 pub mod map;
 pub mod rhai_config;
 pub mod systems;
+pub mod vim;
 
 // Re-export core types for ergonomic use.
 // FocusArea is consumed by cell, dock, timeline, conversation, frame_assembly.
@@ -110,7 +111,8 @@ impl Plugin for InputPlugin {
             .init_resource::<map::InputMap>()
             .init_resource::<context::ActiveInputContexts>()
             .init_resource::<events::AnalogInput>()
-            .init_resource::<escape::EscapeState>();
+            .init_resource::<interrupt::InterruptState>()
+            .insert_resource(vim::VimMachineResource::new());
 
         // Register types for BRP reflection
         app.register_type::<focus::FocusArea>()
@@ -144,9 +146,15 @@ impl Plugin for InputPlugin {
         );
 
         // Dispatch phase: raw input → ActionFired/TextInputReceived
+        // vim_dispatch_compose runs when compose is focused (VimMachine owns keyboard).
+        // dispatch_input handles everything else (Navigation, Constellation, gamepad, mouse).
         app.add_systems(
             Update,
-            dispatch::dispatch_input.in_set(InputPhase::Dispatch),
+            (
+                dispatch::dispatch_input,
+                vim::dispatch::vim_dispatch_compose.run_if(focus::in_compose),
+            )
+                .in_set(InputPhase::Dispatch),
         );
 
         // Handle phase: consume ActionFired for focus management + domain actions
@@ -157,7 +165,7 @@ impl Plugin for InputPlugin {
                 systems::handle_focus_cycle,
                 systems::handle_focus_compose,
                 systems::handle_unfocus,
-                systems::handle_escape,
+                systems::handle_interrupt,
                 systems::handle_toggle_constellation,
                 // App-level actions (global)
                 systems::handle_quit,

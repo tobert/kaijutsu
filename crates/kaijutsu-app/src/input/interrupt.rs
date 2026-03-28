@@ -1,7 +1,7 @@
-//! Multi-press Escape state machine.
+//! Multi-press interrupt state machine.
 //!
-//! Tracks rapid Escape presses to implement a graduated "oh no" cancel button.
-//! The `EscapeState` resource is checked by `handle_escape` each time an
+//! Tracks rapid Ctrl+C presses to implement a graduated cancel gesture.
+//! The `InterruptState` resource is checked by `handle_interrupt` each time an
 //! `Action::InterruptContext` fires.
 //!
 //! # Press counts
@@ -15,18 +15,18 @@
 
 use bevy::prelude::*;
 
-/// Time window for counting consecutive Escape presses (milliseconds).
+/// Time window for counting consecutive interrupt presses (milliseconds).
 const WINDOW_MS: u128 = 500;
 
-/// Per-session state for the multi-press Escape gesture.
+/// Per-session state for the multi-press interrupt gesture.
 #[derive(Resource, Default)]
-pub struct EscapeState {
+pub struct InterruptState {
     count: u8,
     last_press: Option<std::time::Instant>,
 }
 
-impl EscapeState {
-    /// Record a new Escape press and return the current count (1, 2, or 3).
+impl InterruptState {
+    /// Record a new interrupt press and return the current count (1, 2, or 3).
     ///
     /// If the previous press was more than `WINDOW_MS` ago, the count resets to 1.
     pub fn press(&mut self) -> u8 {
