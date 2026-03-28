@@ -213,6 +213,9 @@ pub fn vim_dispatch_compose(
 
         vim.machine.input_key(tkey);
 
+        // Update vim mode display on overlay
+        overlay.vim_mode = vim.machine.show_mode();
+
         // Drain all produced actions
         while let Some((mk_action, ctx)) = vim.machine.pop() {
             translate_action(

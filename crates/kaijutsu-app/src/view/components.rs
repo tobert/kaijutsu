@@ -330,6 +330,9 @@ pub struct InputOverlay {
     pub selection_anchor: Option<usize>,
     /// Current input mode (chat vs shell).
     pub mode: InputMode,
+    /// Vim mode display string (e.g. "-- INSERT --", None = Normal).
+    /// Updated by vim_dispatch_compose each frame.
+    pub vim_mode: Option<String>,
     /// Target context for this input (None = use active context).
     #[reflect(ignore)]
     pub target_context: Option<ContextId>,
@@ -449,26 +452,33 @@ impl InputOverlay {
         matches!(self.mode, InputMode::Shell)
     }
 
-    /// Build the display text with mode ring prefix.
+    /// Build the display text with vim mode + mode ring prefix.
     pub fn display_text(&self) -> String {
-        let mode_indicator = match self.mode {
-            InputMode::Chat => "[chat] shell",
-            InputMode::Shell => "chat [shell]",
-        };
+        let prefix = self.display_prefix();
         if self.text.is_empty() {
-            format!("{} │ ", mode_indicator)
+            format!("{} │ ", prefix)
         } else {
-            format!("{} │ {}", mode_indicator, self.text)
+            format!("{} │ {}", prefix, self.text)
         }
     }
 
     /// Byte offset of the cursor within display_text (accounting for prefix).
     pub fn display_cursor_offset(&self) -> usize {
-        let prefix_len = match self.mode {
-            InputMode::Chat => "[chat] shell │ ".len(),
-            InputMode::Shell => "chat [shell] │ ".len(),
+        let prefix = self.display_prefix();
+        // +3 for " │ "
+        prefix.len() + 3 + self.cursor
+    }
+
+    /// Build the prefix string: vim mode + chat/shell indicator.
+    fn display_prefix(&self) -> String {
+        let mode_ring = match self.mode {
+            InputMode::Chat => "[chat] shell",
+            InputMode::Shell => "chat [shell]",
         };
-        prefix_len + self.cursor
+        match &self.vim_mode {
+            Some(vim) => format!("{} {}", vim, mode_ring),
+            None => format!("NORMAL {}", mode_ring),
+        }
     }
 }
 

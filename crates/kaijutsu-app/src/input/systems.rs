@@ -51,6 +51,7 @@ pub fn handle_focus_compose(
     mut focus: ResMut<FocusArea>,
     mut overlay: Query<&mut crate::cell::InputOverlay>,
     doc_cache: Res<crate::cell::DocumentCache>,
+    mut vim: ResMut<crate::input::vim::VimMachineResource>,
 ) {
     for ActionFired(action) in actions.read() {
         let mode = match action {
@@ -77,6 +78,21 @@ pub fn handle_focus_compose(
                         overlay.cursor = overlay.text.len();
                     }
                 }
+
+                // Vim mode transition:
+                // - Empty overlay: enter Insert mode (ready to type immediately)
+                // - Draft text: stay in Normal mode (user reviews before editing)
+                use modalkit::keybindings::BindingMachine;
+                if overlay.text.is_empty() {
+                    // Synthesize 'i' keypress to enter Insert mode
+                    use modalkit::crossterm::event::KeyCode;
+                    vim.machine.input_key(KeyCode::Char('i').into());
+                    // Drain the action (the 'i' key just changes mode, no action to handle)
+                    while vim.machine.pop().is_some() {}
+                } else {
+                    vim.machine.reset_mode(); // ensure Normal
+                }
+                overlay.vim_mode = vim.machine.show_mode();
             }
         }
     }
@@ -93,6 +109,7 @@ pub fn handle_unfocus(
     mut focus: ResMut<FocusArea>,
     screen: Res<State<crate::ui::screen::Screen>>,
     mut next_screen: ResMut<NextState<crate::ui::screen::Screen>>,
+    mut vim: ResMut<crate::input::vim::VimMachineResource>,
 ) {
     use crate::ui::screen::Screen;
     for ActionFired(action) in actions.read() {
@@ -113,6 +130,9 @@ pub fn handle_unfocus(
 
         // 3. Normal focus transitions
         if matches!(focus.as_ref(), FocusArea::Compose) {
+            // Reset vim to Normal mode when leaving compose
+            use modalkit::keybindings::BindingMachine;
+            vim.machine.reset_mode();
             *focus = FocusArea::Conversation;
         }
     }
