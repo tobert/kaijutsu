@@ -414,3 +414,22 @@ pub struct InvokeAgentRequest {
     #[serde(default)]
     pub params: serde_json::Value,
 }
+
+/// Toggle the excluded flag on a block (staging curation).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct BlockExcludeRequest {
+    /// Block ID to toggle (format: context_id:agent_id:seq, or suffix match)
+    #[schemars(description = "Block ID to toggle (full key or suffix match)")]
+    pub block_id: String,
+    /// Set excluded=true (omit from hydration) or false (include)
+    #[schemars(description = "true to exclude the block, false to include it")]
+    pub excluded: bool,
+}
+
+/// Commit a staging context to Live state.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct StageCommitRequest {
+    /// Context ID to commit (prefix or full ID). Defaults to current context.
+    #[schemars(description = "Context ID to commit (prefix or full). Defaults to current context.")]
+    pub context_id: Option<String>,
+}

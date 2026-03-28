@@ -1283,6 +1283,98 @@ impl KaijutsuMcp {
     }
 
     // ========================================================================
+    // Staging Tools
+    // ========================================================================
+
+    #[tool(
+        description = "Toggle the excluded flag on a block during staging curation. Excluded blocks are omitted from LLM hydration. Only works when the context is in Staging state (created via `kj fork --stage`).",
+        annotations(
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    #[tracing::instrument(skip(self, req), name = "mcp.block_exclude")]
+    async fn block_exclude(&self, Parameters(req): Parameters<BlockExcludeRequest>) -> String {
+        let (context_id, block_id) = match find_block(self.store(), &req.block_id) {
+            Some(r) => r,
+            None => return format!("Error: block '{}' not found", req.block_id),
+        };
+
+        match self
+            .store()
+            .set_excluded(context_id, &block_id, req.excluded)
+        {
+            Ok(()) => {
+                let version = self
+                    .store()
+                    .get(context_id)
+                    .map(|e| e.version())
+                    .unwrap_or(0);
+
+                let verb = if req.excluded {
+                    "excluded"
+                } else {
+                    "included"
+                };
+
+                let mut result = serde_json::json!({
+                    "success": true,
+                    "action": verb,
+                    "block_id": req.block_id,
+                    "version": version
+                })
+                .to_string();
+
+                if let Some(warn) = self.push_after_mutation().await {
+                    result.push_str(&format!("\n\nWarning: {warn}"));
+                }
+
+                result
+            }
+            Err(e) => format!("Error: {}", e),
+        }
+    }
+
+    #[tool(
+        description = "Commit a staging context to Live state, enabling LLM prompts. The context must be in Staging state (created via `kj fork --stage`). Uses the current context if no context_id is given.",
+        annotations(
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    #[tracing::instrument(skip(self, _req), name = "mcp.stage_commit")]
+    async fn stage_commit(&self, Parameters(_req): Parameters<StageCommitRequest>) -> String {
+        let actor = match self.actor() {
+            Some(a) => a,
+            None => return "Error: no remote connection (local mode)".to_string(),
+        };
+
+        // Get the current context ID from the actor
+        let (context_id, _label) = match actor.get_context_id().await {
+            Ok(pair) => pair,
+            Err(e) => return format!("Error getting context: {e}"),
+        };
+
+        // Delegate to kj stage commit via shell execution
+        match actor
+            .shell_execute("kj stage commit", context_id, false)
+            .await
+        {
+            Ok(_block_id) => {
+                serde_json::json!({
+                    "success": true,
+                    "context_id": context_id.short(),
+                    "message": "stage commit dispatched"
+                })
+                .to_string()
+            }
+            Err(e) => format!("Error: {e}"),
+        }
+    }
+
+    // ========================================================================
     // Search Tools
     // ========================================================================
 
