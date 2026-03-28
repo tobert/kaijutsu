@@ -114,6 +114,7 @@ enum DriftKind {
   distill @3;       # LLM-summarized before transfer
   commit @4;        # Git commit recorded as conversation provenance
   notification @5;  # External notification (MCP resource updates, system events)
+  fork @6;          # Fork marker (ephemeral, summarizes the fork operation)
 }
 
 # Flat block snapshot — all fields present, some unused depending on kind.

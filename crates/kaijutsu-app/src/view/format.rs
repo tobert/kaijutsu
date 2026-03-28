@@ -47,6 +47,7 @@ pub fn block_color(block: &BlockSnapshot, theme: &Theme) -> bevy::prelude::Color
             Some(DriftKind::Merge) => theme.block_drift_merge,
             Some(DriftKind::Commit) => theme.block_drift_commit,
             Some(DriftKind::Notification) => theme.block_drift_pull,
+            Some(DriftKind::Fork) => theme.block_drift_merge,
             None => theme.fg_dim,
         },
     }
@@ -105,6 +106,9 @@ fn format_drift_block(block: &BlockSnapshot, local_ctx: Option<ContextId>) -> St
         Some(DriftKind::Notification) => {
             let preview = block.content.lines().next().unwrap_or("");
             format!("\u{1f514} {}  {}", ctx_label, preview)
+        }
+        Some(DriftKind::Fork) => {
+            format!("\u{2442} {}\n{}", ctx_label, block.content)
         }
         None => {
             format!(

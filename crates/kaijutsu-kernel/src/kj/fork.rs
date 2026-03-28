@@ -278,6 +278,29 @@ impl KjDispatcher {
 
         self.apply_fork_mcp_exclusions(new_id).await;
 
+        // Fork marker: get source label + block count for the summary
+        let source_label = {
+            let db = self.kernel_db().lock();
+            db.get_context(source_id)
+                .ok()
+                .flatten()
+                .and_then(|r| r.label)
+        };
+        let block_count = self
+            .block_store()
+            .block_snapshots(new_id)
+            .map(|b| b.len())
+            .unwrap_or(0);
+        if let Err(e) = self.inject_fork_marker(
+            new_id,
+            source_id,
+            ForkKind::Full,
+            block_count,
+            source_label.as_deref(),
+        ) {
+            tracing::warn!("kj fork: failed to inject fork marker: {e}");
+        }
+
         let short = new_id.short();
         let display = label.as_deref().unwrap_or(&short);
         KjResult::Switch(
@@ -446,6 +469,28 @@ impl KjDispatcher {
         }
 
         self.apply_fork_mcp_exclusions(new_id).await;
+
+        let source_label = {
+            let db = self.kernel_db().lock();
+            db.get_context(source_id)
+                .ok()
+                .flatten()
+                .and_then(|r| r.label)
+        };
+        let block_count = self
+            .block_store()
+            .block_snapshots(new_id)
+            .map(|b| b.len())
+            .unwrap_or(0);
+        if let Err(e) = self.inject_fork_marker(
+            new_id,
+            source_id,
+            ForkKind::Shallow,
+            block_count,
+            source_label.as_deref(),
+        ) {
+            tracing::warn!("kj fork --shallow: failed to inject fork marker: {e}");
+        }
 
         let short = new_id.short();
         let display = label.as_deref().unwrap_or(&short);
@@ -625,6 +670,28 @@ impl KjDispatcher {
         }
 
         self.apply_fork_mcp_exclusions(new_id).await;
+
+        let source_label = {
+            let db = self.kernel_db().lock();
+            db.get_context(source_id)
+                .ok()
+                .flatten()
+                .and_then(|r| r.label)
+        };
+        let block_count = self
+            .block_store()
+            .block_snapshots(new_id)
+            .map(|b| b.len())
+            .unwrap_or(0);
+        if let Err(e) = self.inject_fork_marker(
+            new_id,
+            source_id,
+            ForkKind::Compact,
+            block_count,
+            source_label.as_deref(),
+        ) {
+            tracing::warn!("kj fork --compact: failed to inject fork marker: {e}");
+        }
 
         let short = new_id.short();
         let display = label.as_deref().unwrap_or(&short);
@@ -841,6 +908,16 @@ impl KjDispatcher {
 
         self.apply_fork_mcp_exclusions(new_root_id).await;
 
+        if let Err(e) = self.inject_fork_marker(
+            new_root_id,
+            caller.context_id,
+            ForkKind::Subtree,
+            template_nodes.len(),
+            Some(&template_ref),
+        ) {
+            tracing::warn!("kj fork --as: failed to inject fork marker: {e}");
+        }
+
         KjResult::Switch(
             new_root_id,
             format!(
@@ -917,6 +994,51 @@ impl KjDispatcher {
             )
             .map(|_| ())
             .map_err(|e| e.to_string())
+    }
+
+    /// Insert an ephemeral fork marker block at the end of the forked document.
+    ///
+    /// The marker summarizes the fork operation (source, kind, block count) and is
+    /// excluded from LLM hydration so it doesn't waste model context.
+    fn inject_fork_marker(
+        &self,
+        target_id: ContextId,
+        source_id: ContextId,
+        fork_kind: ForkKind,
+        block_count: usize,
+        source_label: Option<&str>,
+    ) -> Result<(), String> {
+        use kaijutsu_crdt::DriftKind;
+
+        let source_short = source_id.short();
+        let source_display = source_label.unwrap_or(&source_short);
+        let content = format!(
+            "forked from '{}' ({}) — {} copy, {} blocks",
+            source_display,
+            source_short,
+            fork_kind.as_str(),
+            block_count,
+        );
+
+        let after = self.block_store().last_block_id(target_id);
+        let block_id = self
+            .block_store()
+            .insert_drift_block(
+                target_id,
+                None,
+                after.as_ref(),
+                &content,
+                source_id,
+                None,
+                DriftKind::Fork,
+            )
+            .map_err(|e| e.to_string())?;
+
+        self.block_store()
+            .set_ephemeral(target_id, &block_id, true)
+            .map_err(|e| e.to_string())?;
+
+        Ok(())
     }
 
     /// Get an MCP prompt and inject it as a drift block into the forked context.

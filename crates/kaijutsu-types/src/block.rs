@@ -522,6 +522,9 @@ pub enum DriftKind {
     /// External notification injected into the conversation.
     /// Used for MCP resource updates, system events, etc.
     Notification,
+    /// Fork marker — ephemeral block summarizing the fork operation.
+    /// Inserted at the boundary between copied content and new content.
+    Fork,
 }
 
 impl DriftKind {
@@ -540,6 +543,7 @@ impl DriftKind {
             DriftKind::Distill => "distill",
             DriftKind::Commit => "commit",
             DriftKind::Notification => "notification",
+            DriftKind::Fork => "fork",
         }
     }
 }

@@ -6800,6 +6800,7 @@ fn capnp_drift_kind_to_crdt(
         crate::kaijutsu_capnp::DriftKind::Notification => {
             Some(kaijutsu_crdt::DriftKind::Notification)
         }
+        crate::kaijutsu_capnp::DriftKind::Fork => Some(kaijutsu_crdt::DriftKind::Fork),
     }
 }
 
@@ -6814,6 +6815,7 @@ fn drift_kind_to_capnp(dk: kaijutsu_crdt::DriftKind) -> crate::kaijutsu_capnp::D
         kaijutsu_crdt::DriftKind::Notification => {
             crate::kaijutsu_capnp::DriftKind::Notification
         }
+        kaijutsu_crdt::DriftKind::Fork => crate::kaijutsu_capnp::DriftKind::Fork,
     }
 }
 

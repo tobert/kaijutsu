@@ -967,6 +967,7 @@ impl KernelHandle {
                 crate::kaijutsu_capnp::DriftKind::Distill => DriftKind::Distill,
                 crate::kaijutsu_capnp::DriftKind::Commit => DriftKind::Commit,
                 crate::kaijutsu_capnp::DriftKind::Notification => DriftKind::Notification,
+                crate::kaijutsu_capnp::DriftKind::Fork => DriftKind::Fork,
             };
             result.push(StagedDriftInfo {
                 id: entry.get_id(),
@@ -2062,6 +2063,7 @@ pub(crate) fn parse_block_snapshot(
             crate::kaijutsu_capnp::DriftKind::Distill => DriftKind::Distill,
             crate::kaijutsu_capnp::DriftKind::Commit => DriftKind::Commit,
             crate::kaijutsu_capnp::DriftKind::Notification => DriftKind::Notification,
+            crate::kaijutsu_capnp::DriftKind::Fork => DriftKind::Fork,
         };
         builder = builder.drift_kind(drift_kind);
     }

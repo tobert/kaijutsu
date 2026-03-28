@@ -373,11 +373,15 @@ fn compute_border_style(
             }
         }
         BlockKind::Drift => match block.drift_kind {
-            Some(DriftKind::Pull) | Some(DriftKind::Distill) | Some(DriftKind::Merge) => {
+            Some(DriftKind::Pull)
+            | Some(DriftKind::Distill)
+            | Some(DriftKind::Merge)
+            | Some(DriftKind::Fork) => {
                 let drift_label = match block.drift_kind {
                     Some(DriftKind::Pull) => "drift: pull",
                     Some(DriftKind::Distill) => "drift: distill",
                     Some(DriftKind::Merge) => "drift: merge",
+                    Some(DriftKind::Fork) => "fork",
                     _ => "drift",
                 };
                 Some(BlockBorderStyle {
