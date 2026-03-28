@@ -168,7 +168,7 @@ pub fn engrave(tune: &Tune, options: &EngravingOptions) -> Vec<EngravingElement>
     // 5. Walk voice elements
     // Only handle first voice for v1
     if let Some(voice) = tune.voices.first() {
-        let _unit_length = tune.header.unit_length.unwrap_or_default();
+        let unit_length = tune.header.unit_length.unwrap_or_default();
         let unit_width = sp * 2.5; // Base width for one unit duration
 
         for element in &voice.elements {
@@ -184,6 +184,7 @@ pub fn engrave(tune: &Tune, options: &EngravingOptions) -> Vec<EngravingElement>
                         sp,
                         scale,
                         unit_width,
+                        &unit_length,
                         span,
                     );
                 }
@@ -195,7 +196,7 @@ pub fn engrave(tune: &Tune, options: &EngravingOptions) -> Vec<EngravingElement>
                     for note in &chord.notes {
                         let pos = note_to_staff_position(&note.pitch, note.octave);
                         let y = staff_top + pos * sp;
-                        let cp = notehead_codepoint(&chord.duration);
+                        let cp = notehead_codepoint(&chord.duration, &unit_length);
                         elements.push(EngravingElement::Glyph {
                             codepoint: cp,
                             x: cursor_x,
@@ -207,9 +208,7 @@ pub fn engrave(tune: &Tune, options: &EngravingOptions) -> Vec<EngravingElement>
                     }
 
                     // Stem on the chord (use highest and lowest notes)
-                    if chord.duration.denominator > 0
-                        && !(chord.duration.numerator >= 4 && chord.duration.denominator == 1)
-                    {
+                    if absolute_ratio(&chord.duration, &unit_length) < 1.0 {
                         // Not a whole note: draw stem
                         if let (Some(first), Some(last)) = (chord.notes.first(), chord.notes.last())
                         {
@@ -220,7 +219,7 @@ pub fn engrave(tune: &Tune, options: &EngravingOptions) -> Vec<EngravingElement>
                             } else {
                                 (bot_pos, top_pos)
                             };
-                            let cp = notehead_codepoint(&chord.duration);
+                            let cp = notehead_codepoint(&chord.duration, &unit_length);
                             let nw = font.glyph_advance(cp).unwrap_or(500.0) * scale;
                             // Use average position to decide stem direction
                             let avg_pos = (stem_top + stem_bot) / 2.0;
@@ -245,7 +244,7 @@ pub fn engrave(tune: &Tune, options: &EngravingOptions) -> Vec<EngravingElement>
                 }
                 Element::Rest(rest) => {
                     let span = (0usize, 0usize);
-                    let cp = rest_codepoint(&rest.duration);
+                    let cp = rest_codepoint(&rest.duration, &unit_length);
                     // Rest centered on the staff
                     let y = staff_top + 2.0 * sp;
                     elements.push(EngravingElement::Glyph {
@@ -285,7 +284,7 @@ pub fn engrave(tune: &Tune, options: &EngravingOptions) -> Vec<EngravingElement>
                             let scaled_width = orig_width * scale_factor;
                             let pos = note_to_staff_position(&note.pitch, note.octave);
                             let y = staff_top + pos * sp;
-                            let cp = notehead_codepoint(&note.duration);
+                            let cp = notehead_codepoint(&note.duration, &unit_length);
                             elements.push(EngravingElement::Glyph {
                                 codepoint: cp,
                                 x: cursor_x,
@@ -302,6 +301,7 @@ pub fn engrave(tune: &Tune, options: &EngravingOptions) -> Vec<EngravingElement>
                                 sp,
                                 scale,
                                 &note.duration,
+                                &unit_length,
                                 span,
                             );
                             cursor_x += scaled_width;
@@ -352,6 +352,7 @@ fn emit_note(
     sp: f64,
     scale: f64,
     unit_width: f64,
+    unit: &UnitLength,
     span: SourceSpan,
 ) -> f64 {
     let pos = note_to_staff_position(&note.pitch, note.octave);
@@ -374,7 +375,7 @@ fn emit_note(
     }
 
     // Notehead
-    let cp = notehead_codepoint(&note.duration);
+    let cp = notehead_codepoint(&note.duration, unit);
     elements.push(EngravingElement::Glyph {
         codepoint: cp,
         x: cursor_x,
@@ -395,6 +396,7 @@ fn emit_note(
         sp,
         scale,
         &note.duration,
+        unit,
         span,
     );
 
@@ -407,6 +409,7 @@ fn emit_note(
         sp,
         scale,
         &note.duration,
+        unit,
         span,
     );
 
@@ -414,29 +417,32 @@ fn emit_note(
     cursor_x + dur_width
 }
 
-fn notehead_codepoint(duration: &Duration) -> u32 {
-    // whole note: numerator >= 4 and denominator == 1 (i.e. 4/1 = whole, but in ABC
-    // duration is relative to unit length). For simplicity:
-    // Duration 4/1 or more → whole; 2/1 → half; else filled
-    let ratio = duration.numerator as f64 / duration.denominator as f64;
-    if ratio >= 4.0 {
+/// Compute absolute duration in whole notes: (note_dur * unit_length).
+fn absolute_ratio(duration: &Duration, unit: &UnitLength) -> f64 {
+    (duration.numerator as f64 * unit.numerator as f64)
+        / (duration.denominator as f64 * unit.denominator as f64)
+}
+
+fn notehead_codepoint(duration: &Duration, unit: &UnitLength) -> u32 {
+    let abs = absolute_ratio(duration, unit);
+    if abs >= 1.0 {
         0xE0A2 // whole
-    } else if ratio >= 2.0 {
+    } else if abs >= 0.5 {
         0xE0A3 // half
     } else {
         0xE0A4 // quarter/filled
     }
 }
 
-fn rest_codepoint(duration: &Duration) -> u32 {
-    let ratio = duration.numerator as f64 / duration.denominator as f64;
-    if ratio >= 4.0 {
+fn rest_codepoint(duration: &Duration, unit: &UnitLength) -> u32 {
+    let abs = absolute_ratio(duration, unit);
+    if abs >= 1.0 {
         0xE4E3 // whole rest
-    } else if ratio >= 2.0 {
+    } else if abs >= 0.5 {
         0xE4E4 // half rest
-    } else if ratio >= 1.0 {
+    } else if abs >= 0.25 {
         0xE4E5 // quarter rest
-    } else if ratio >= 0.5 {
+    } else if abs >= 0.125 {
         0xE4E6 // eighth rest
     } else {
         0xE4E7 // sixteenth rest
@@ -506,15 +512,16 @@ fn emit_stem(
     sp: f64,
     scale: f64,
     duration: &Duration,
+    unit: &UnitLength,
     span: SourceSpan,
 ) {
-    let ratio = duration.numerator as f64 / duration.denominator as f64;
-    if ratio >= 4.0 {
+    let abs = absolute_ratio(duration, unit);
+    if abs >= 1.0 {
         return; // Whole notes have no stem
     }
 
     let font = font_cache();
-    let cp = notehead_codepoint(duration);
+    let cp = notehead_codepoint(duration, unit);
     let notehead_width = font.glyph_advance(cp).unwrap_or(500.0) * scale;
 
     // Stem direction: notes on or above middle line get stems down, below get stems up
@@ -554,19 +561,20 @@ fn emit_flag(
     sp: f64,
     scale: f64,
     duration: &Duration,
+    unit: &UnitLength,
     span: SourceSpan,
 ) {
-    let ratio = duration.numerator as f64 / duration.denominator as f64;
+    let abs = absolute_ratio(duration, unit);
 
-    let flag_cp = if ratio <= 0.25 {
-        // 16th note
+    let flag_cp = if abs <= 0.0625 {
+        // 16th note (1/16 of a whole)
         if pos <= 2.0 {
             Some(0xE243u32) // 16th down
         } else {
             Some(0xE242u32) // 16th up
         }
-    } else if ratio <= 0.5 {
-        // 8th note
+    } else if abs <= 0.125 {
+        // 8th note (1/8 of a whole)
         if pos <= 2.0 {
             Some(0xE241u32) // 8th down
         } else {
@@ -578,7 +586,7 @@ fn emit_flag(
 
     if let Some(cp) = flag_cp {
         let font = font_cache();
-        let notehead_cp = notehead_codepoint(duration);
+        let notehead_cp = notehead_codepoint(duration, unit);
         let notehead_width = font.glyph_advance(notehead_cp).unwrap_or(500.0) * scale;
 
         let stem_length = sp * 3.5;
@@ -688,6 +696,161 @@ mod tests {
             (pos - 4.0).abs() < 0.01,
             "E4 should be at position 4.0, got {}",
             pos
+        );
+    }
+
+    // --- Notehead codepoint tests ---
+    // SMuFL codepoints:
+    const WHOLE_NOTEHEAD: u32 = 0xE0A2;
+    const HALF_NOTEHEAD: u32 = 0xE0A3;
+    const FILLED_NOTEHEAD: u32 = 0xE0A4;
+
+    /// Helper: extract all notehead glyph codepoints from engraved output.
+    fn notehead_codepoints(elements: &[EngravingElement]) -> Vec<u32> {
+        elements
+            .iter()
+            .filter_map(|e| match e {
+                EngravingElement::Glyph { codepoint, .. }
+                    if [WHOLE_NOTEHEAD, HALF_NOTEHEAD, FILLED_NOTEHEAD].contains(codepoint) =>
+                {
+                    Some(*codepoint)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Helper: check whether any flag glyphs (8th/16th) are present.
+    fn has_flag_glyphs(elements: &[EngravingElement]) -> bool {
+        elements.iter().any(|e| matches!(e,
+            EngravingElement::Glyph { codepoint, .. }
+                if (0xE240..=0xE243).contains(codepoint)
+        ))
+    }
+
+    /// With L:1/8, bare notes (C D E) are eighth notes → filled noteheads + flags.
+    #[test]
+    fn eighth_notes_get_filled_noteheads() {
+        let abc = "X:1\nT:Test\nM:4/4\nL:1/8\nK:C\nC D E\n";
+        let tune = crate::parse(abc).value;
+        let elements = engrave(&tune, &EngravingOptions::default());
+        let heads = notehead_codepoints(&elements);
+        assert_eq!(heads.len(), 3, "expected 3 noteheads, got {}", heads.len());
+        for (i, &cp) in heads.iter().enumerate() {
+            assert_eq!(
+                cp, FILLED_NOTEHEAD,
+                "note {} should be filled (eighth note), got 0x{:04X}",
+                i, cp
+            );
+        }
+        assert!(
+            has_flag_glyphs(&elements),
+            "eighth notes should have flag glyphs"
+        );
+    }
+
+    /// With L:1/8, C2 is a quarter note → filled notehead, no flag.
+    #[test]
+    fn quarter_note_gets_filled_notehead() {
+        let abc = "X:1\nT:Test\nM:4/4\nL:1/8\nK:C\nC2\n";
+        let tune = crate::parse(abc).value;
+        let elements = engrave(&tune, &EngravingOptions::default());
+        let heads = notehead_codepoints(&elements);
+        assert_eq!(heads.len(), 1, "expected 1 notehead, got {}", heads.len());
+        assert_eq!(
+            heads[0], FILLED_NOTEHEAD,
+            "quarter note (L:1/8, C2) should be filled, got 0x{:04X}",
+            heads[0]
+        );
+        assert!(
+            !has_flag_glyphs(&elements),
+            "quarter notes should NOT have flag glyphs"
+        );
+    }
+
+    /// With L:1/8, C4 is a half note → half (hollow) notehead.
+    #[test]
+    fn half_note_gets_half_notehead() {
+        let abc = "X:1\nT:Test\nM:4/4\nL:1/8\nK:C\nC4\n";
+        let tune = crate::parse(abc).value;
+        let elements = engrave(&tune, &EngravingOptions::default());
+        let heads = notehead_codepoints(&elements);
+        assert_eq!(heads.len(), 1, "expected 1 notehead, got {}", heads.len());
+        assert_eq!(
+            heads[0], HALF_NOTEHEAD,
+            "half note (L:1/8, C4) should be half notehead, got 0x{:04X}",
+            heads[0]
+        );
+    }
+
+    /// With L:1/8, C8 is a whole note → whole notehead.
+    #[test]
+    fn whole_note_gets_whole_notehead() {
+        let abc = "X:1\nT:Test\nM:4/4\nL:1/8\nK:C\nC8\n";
+        let tune = crate::parse(abc).value;
+        let elements = engrave(&tune, &EngravingOptions::default());
+        let heads = notehead_codepoints(&elements);
+        assert_eq!(heads.len(), 1, "expected 1 notehead, got {}", heads.len());
+        assert_eq!(
+            heads[0], WHOLE_NOTEHEAD,
+            "whole note (L:1/8, C8) should be whole notehead, got 0x{:04X}",
+            heads[0]
+        );
+    }
+
+    /// With L:1/4, bare C is a quarter note → filled notehead.
+    #[test]
+    fn quarter_note_with_l14() {
+        let abc = "X:1\nT:Test\nM:4/4\nL:1/4\nK:C\nC\n";
+        let tune = crate::parse(abc).value;
+        let elements = engrave(&tune, &EngravingOptions::default());
+        let heads = notehead_codepoints(&elements);
+        assert_eq!(heads.len(), 1);
+        assert_eq!(
+            heads[0], FILLED_NOTEHEAD,
+            "quarter note (L:1/4, C) should be filled, got 0x{:04X}",
+            heads[0]
+        );
+    }
+
+    /// With L:1/4, C2 is a half note → half notehead.
+    #[test]
+    fn half_note_with_l14() {
+        let abc = "X:1\nT:Test\nM:4/4\nL:1/4\nK:C\nC2\n";
+        let tune = crate::parse(abc).value;
+        let elements = engrave(&tune, &EngravingOptions::default());
+        let heads = notehead_codepoints(&elements);
+        assert_eq!(heads.len(), 1);
+        assert_eq!(
+            heads[0], HALF_NOTEHEAD,
+            "half note (L:1/4, C2) should be half notehead, got 0x{:04X}",
+            heads[0]
+        );
+    }
+
+    /// Rest glyphs should also respect unit length.
+    /// With L:1/8, z2 is a quarter rest (0xE4E5).
+    #[test]
+    fn quarter_rest_with_l18() {
+        let abc = "X:1\nT:Test\nM:4/4\nL:1/8\nK:C\nz2\n";
+        let tune = crate::parse(abc).value;
+        let elements = engrave(&tune, &EngravingOptions::default());
+        let rest_cps: Vec<u32> = elements
+            .iter()
+            .filter_map(|e| match e {
+                EngravingElement::Glyph { codepoint, .. }
+                    if (0xE4E3..=0xE4E7).contains(codepoint) =>
+                {
+                    Some(*codepoint)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rest_cps.len(), 1, "expected 1 rest glyph");
+        assert_eq!(
+            rest_cps[0], 0xE4E5,
+            "quarter rest (L:1/8, z2) should be 0xE4E5, got 0x{:04X}",
+            rest_cps[0]
         );
     }
 }
