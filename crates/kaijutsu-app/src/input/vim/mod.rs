@@ -5,6 +5,8 @@
 
 pub mod dispatch;
 pub mod keyconv;
+pub mod motion;
+pub mod textutil;
 
 use std::fmt;
 

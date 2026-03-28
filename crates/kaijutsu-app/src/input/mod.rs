@@ -112,7 +112,8 @@ impl Plugin for InputPlugin {
             .init_resource::<context::ActiveInputContexts>()
             .init_resource::<events::AnalogInput>()
             .init_resource::<interrupt::InterruptState>()
-            .insert_resource(vim::VimMachineResource::new());
+            .insert_resource(vim::VimMachineResource::new())
+            .init_resource::<vim::dispatch::VimMotionState>();
 
         // Register types for BRP reflection
         app.register_type::<focus::FocusArea>()
