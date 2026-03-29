@@ -651,6 +651,105 @@ impl RhaiEngine {
         });
     }
 
+    /// Warn if the source contains `"...${...}..."` — a double-quoted string
+    /// with interpolation syntax that Rhai treats as literal text.
+    /// Models frequently write this expecting template behavior but get silent
+    /// wrong output. Returns a warning string to prepend to output, or empty.
+    fn check_silent_interpolation(code: &str) -> String {
+        // Match ${...} inside double-quoted strings (not backtick strings).
+        // Simple heuristic: find "${" that isn't preceded by a backtick opener.
+        // We scan for "...${...}..." patterns.
+        let mut warnings = Vec::new();
+        let mut in_double_quote = false;
+        let mut in_backtick = false;
+        let chars: Vec<char> = code.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            match chars[i] {
+                '\\' if in_double_quote || in_backtick => {
+                    i += 1; // skip escaped char
+                }
+                '"' if !in_backtick => {
+                    in_double_quote = !in_double_quote;
+                }
+                '`' if !in_double_quote => {
+                    in_backtick = !in_backtick;
+                }
+                '$' if in_double_quote
+                    && i + 1 < chars.len()
+                    && chars[i + 1] == '{' =>
+                {
+                    warnings.push(
+                        "WARNING: \"...${expr}...\" does NOT interpolate in Rhai. \
+                         The ${...} is literal text. Use backtick strings instead: \
+                         `...${expr}...`\n",
+                    );
+                    break; // one warning is enough
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        warnings.concat()
+    }
+
+    /// Append contextual hints to Rhai error messages.
+    ///
+    /// Models frequently hit the same few errors — type mismatches on math
+    /// functions, unknown variables, bad syntax from other languages.  Raw Rhai
+    /// errors are technically correct but don't guide the model toward the fix.
+    /// These hints are only revealed on failure, keeping the happy-path tool
+    /// description lean.
+    fn enrich_error(error_msg: &str, code: &str) -> String {
+        let mut hints: Vec<&str> = Vec::new();
+
+        // "Function not found: sin (i64)" — float function called with integer
+        if error_msg.contains("Function not found:") && error_msg.contains("(i64") {
+            hints.push(
+                "Hint: math/color functions require float arguments. \
+                 Write 1.0 instead of 1. For integer variables, use to_float(n).",
+            );
+        }
+        // "Function not found: foo (...)" — general unknown function
+        else if error_msg.contains("Function not found:") {
+            hints.push(
+                "Hint: use list_kernel_tools or check the stdlib catalog in the \
+                 tool schema. print() and svg() are available; backtick strings \
+                 support ${expr} interpolation.",
+            );
+        }
+
+        // Variable not found
+        if error_msg.contains("Variable not found:") {
+            hints.push(
+                "Hint: variables persist across calls within the same context. \
+                 Check spelling, or define the variable before use.",
+            );
+        }
+
+        // Syntax errors suggesting other-language habits
+        if error_msg.contains("Syntax error:") {
+            if code.contains("f\"") || code.contains("f'") {
+                hints.push(
+                    "Hint: Rhai has no f-strings. Use backtick strings for \
+                     interpolation: `value is ${x}`. Or use + for concatenation.",
+                );
+            }
+            if code.contains("#{") && error_msg.contains("Expecting") {
+                hints.push(
+                    "Hint: Rhai map literal syntax is #{ key: value, ... }. \
+                     Keys are identifiers or quoted strings.",
+                );
+            }
+        }
+
+        if hints.is_empty() {
+            error_msg.to_string()
+        } else {
+            format!("{}\n\n{}", error_msg, hints.join("\n"))
+        }
+    }
+
     /// Execute a script synchronously (called from spawn_blocking).
     ///
     /// Takes the scope out of the map for the duration of execution so we don't
@@ -670,6 +769,9 @@ impl RhaiEngine {
             context_id,
             extra_registrar,
         );
+
+        // Check for silent-interpolation footgun before execution
+        let interp_warning = Self::check_silent_interpolation(code);
 
         // Take scope out of the map (or create a new one)
         let mut scope = scopes
@@ -702,7 +804,14 @@ impl RhaiEngine {
                 };
 
                 debug!("Rhai execution success: {}", output);
-                ExecResult::success(output)
+                // Prepend interpolation warning to successful output so the
+                // model sees it even though execution "succeeded"
+                if interp_warning.is_empty() {
+                    ExecResult::success(output)
+                } else {
+                    warn!("Rhai: silent interpolation detected in source");
+                    ExecResult::success(format!("{interp_warning}{output}"))
+                }
             }
             Err(e) => {
                 // Still capture any partial output
@@ -711,7 +820,8 @@ impl RhaiEngine {
                 let error_msg = format!("{}", e);
                 warn!("Rhai execution error: {}", error_msg);
 
-                let mut result = ExecResult::failure(1, error_msg);
+                let enriched = Self::enrich_error(&error_msg, code);
+                let mut result = ExecResult::failure(1, enriched);
                 if !captured_print.is_empty() || svg.is_some() {
                     let partial = match svg {
                         Some(s) => format!("{captured_print}{s}"),
@@ -750,10 +860,19 @@ impl ExecutionEngine for RhaiEngine {
     }
 
     fn description(&self) -> &str {
-        "Rhai scripting engine with persistent per-context state. \
-         Key functions: svg_block(svg_string) — inserts SVG as a visible block; \
-         abc_block(abc_string) — inserts ABC music notation as sheet music. \
-         Stdlib: math (sin, cos, lerp, clamp, PI, sqrt, etc.), \
+        "Rhai scripting engine with persistent per-context state.\n\
+         \n\
+         SYNTAX ESSENTIALS:\n\
+         - Strings: \"hello\" (no interpolation) or `hello ${expr}` (backtick = interpolation)\n\
+         - Floats: math functions require f64 — write 1.0 not 1. Use to_float(n) for int vars\n\
+         - Maps: #{ key: \"value\" }  Arrays: [1, 2, 3]\n\
+         - String concat: \"hello\" + \" \" + x (+ auto-converts to string)\n\
+         \n\
+         KEY FUNCTIONS:\n\
+         - svg_block(svg_string) — inserts SVG as a visible block\n\
+         - abc_block(abc_string) — inserts ABC music notation as sheet music\n\
+         \n\
+         STDLIB: math (sin, cos, lerp, clamp, PI, sqrt, etc.), \
          color (hex, oklch, hsl, rgb, color_mix, color_lighten, hue_shift, etc.), \
          format (xml_escape, fmt_f, to_float, to_int), \
          output (svg(), print()). Variables persist across calls."
@@ -905,7 +1024,18 @@ impl ExecutionEngine for RhaiEngine {
             "properties": {
                 "code": {
                     "type": "string",
-                    "description": "Rhai script to execute. State (variables, functions) persists across calls within the same context. Use svg_block(svg_string) to insert SVG as a visible block, or abc_block(abc_string) to insert ABC music notation as sheet music.",
+                    "description": concat!(
+                        "Rhai script to execute. State persists across calls within the same context.\n",
+                        "\n",
+                        "IMPORTANT — common pitfalls:\n",
+                        "• Strings: \"hello\" has NO interpolation. Use backticks for templates: `value is ${x}`\n",
+                        "• Floats: math functions take f64. Write sin(1.0) not sin(1). Use to_float(n) for int variables.\n",
+                        "• Concat: \"x=\" + x works (+ auto-converts). Prefer this or backtick interpolation.\n",
+                        "• Maps: #{ key: \"value\" }  Arrays: [1, 2, 3]\n",
+                        "\n",
+                        "Key functions: svg_block(svg) inserts visible SVG, abc_block(abc) inserts sheet music.\n",
+                        "See stdlib catalog below for math, color, and format functions.",
+                    ),
                 },
             },
             "required": ["code"],
@@ -1252,5 +1382,149 @@ mod tests {
             result.stderr
         );
         assert_eq!(result.stdout, "42");
+    }
+
+    // ========================================================================
+    // Error enrichment tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_error_hint_integer_to_float_function() {
+        let store = shared_block_store(PrincipalId::new());
+        let engine = RhaiEngine::new(store);
+
+        // sin(1) passes i64 but sin expects f64
+        let result = engine.execute("sin(1)", &ToolContext::test()).await.unwrap();
+        assert!(!result.success);
+        assert!(
+            result.stderr.contains("to_float"),
+            "error should hint about to_float, got: {}",
+            result.stderr
+        );
+        assert!(
+            result.stderr.contains("1.0"),
+            "error should suggest float literal syntax, got: {}",
+            result.stderr
+        );
+    }
+
+    #[tokio::test]
+    async fn test_error_hint_unknown_function() {
+        let store = shared_block_store(PrincipalId::new());
+        let engine = RhaiEngine::new(store);
+
+        let result = engine
+            .execute("nonexistent(1.0)", &ToolContext::test())
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result.stderr.contains("Hint:"),
+            "error should include a hint, got: {}",
+            result.stderr
+        );
+    }
+
+    #[tokio::test]
+    async fn test_error_hint_variable_not_found() {
+        let store = shared_block_store(PrincipalId::new());
+        let engine = RhaiEngine::new(store);
+
+        let result = engine
+            .execute("let y = undefined_var + 1;", &ToolContext::test())
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result.stderr.contains("persist across calls"),
+            "error should hint about variable persistence, got: {}",
+            result.stderr
+        );
+    }
+
+    #[tokio::test]
+    async fn test_error_hint_fstring_syntax() {
+        let store = shared_block_store(PrincipalId::new());
+        let engine = RhaiEngine::new(store);
+
+        // Python-style f-string: f"value is {x}"
+        let result = engine
+            .execute(r#"let x = 42; f"value is {x}""#, &ToolContext::test())
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result.stderr.contains("backtick"),
+            "error should suggest backtick strings, got: {}",
+            result.stderr
+        );
+    }
+
+    #[tokio::test]
+    async fn test_silent_interpolation_warning() {
+        let store = shared_block_store(PrincipalId::new());
+        let engine = RhaiEngine::new(store);
+
+        // "${x}" in double quotes silently produces literal "${x}"
+        let result = engine
+            .execute(r#"let x = 42; "value is ${x}""#, &ToolContext::test())
+            .await
+            .unwrap();
+        // Execution succeeds but output should carry a warning
+        assert!(result.success);
+        assert!(
+            result.stdout.contains("WARNING"),
+            "should warn about silent interpolation, got: {}",
+            result.stdout
+        );
+        assert!(
+            result.stdout.contains("backtick"),
+            "warning should suggest backtick strings, got: {}",
+            result.stdout
+        );
+    }
+
+    #[tokio::test]
+    async fn test_no_warning_for_backtick_interpolation() {
+        let store = shared_block_store(PrincipalId::new());
+        let engine = RhaiEngine::new(store);
+
+        // Backtick interpolation is correct — no warning
+        let result = engine
+            .execute(r#"let x = 42; `value is ${x}`"#, &ToolContext::test())
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert_eq!(
+            result.stdout, "value is 42",
+            "backtick interpolation should work without warnings"
+        );
+    }
+
+    #[test]
+    fn test_check_silent_interpolation_detects_double_quote() {
+        let warning = RhaiEngine::check_silent_interpolation(r#"let s = "hello ${x} world";"#);
+        assert!(!warning.is_empty(), "should detect ${{}} in double quotes");
+    }
+
+    #[test]
+    fn test_check_silent_interpolation_ignores_backtick() {
+        let warning = RhaiEngine::check_silent_interpolation(r#"let s = `hello ${x} world`;"#);
+        assert!(warning.is_empty(), "should not warn about backtick strings");
+    }
+
+    #[test]
+    fn test_check_silent_interpolation_ignores_plain_strings() {
+        let warning = RhaiEngine::check_silent_interpolation(r#"let s = "hello world";"#);
+        assert!(warning.is_empty(), "should not warn about normal strings");
+    }
+
+    #[test]
+    fn test_enrich_error_no_hint_for_generic_errors() {
+        let enriched = RhaiEngine::enrich_error("Some random error (line 1)", "let x = 1;");
+        assert!(
+            !enriched.contains("Hint:"),
+            "generic errors should not get hints"
+        );
     }
 }
