@@ -556,6 +556,25 @@ impl KernelDb {
         Ok(())
     }
 
+    /// Idempotent column migrations for existing databases.
+    ///
+    /// `CREATE TABLE IF NOT EXISTS` won't add columns to an existing table,
+    /// so new columns must be added via ALTER TABLE. Each migration checks
+    /// whether the column already exists before altering.
+    fn run_migrations(conn: &Connection) -> KernelDbResult<()> {
+        // 2026-03-27: add context_state column (ContextState enum)
+        let has_context_state: bool = conn
+            .prepare("SELECT context_state FROM contexts LIMIT 0")
+            .is_ok();
+        if !has_context_state {
+            info!("Migration: adding context_state column to contexts table");
+            conn.execute_batch(
+                "ALTER TABLE contexts ADD COLUMN context_state TEXT NOT NULL DEFAULT 'live';",
+            )?;
+        }
+        Ok(())
+    }
+
     /// Open or create at the given path.
     pub fn open<P: AsRef<Path>>(path: P) -> KernelDbResult<Self> {
         if let Some(parent) = path.as_ref().parent() {
@@ -565,6 +584,7 @@ impl KernelDb {
         Self::init_connection(&conn)?;
         // Create workspaces/presets before contexts (FK refs).
         conn.execute_batch(SCHEMA)?;
+        Self::run_migrations(&conn)?;
         Ok(Self { conn })
     }
 
