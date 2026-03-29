@@ -266,6 +266,49 @@ impl MsdfBlockRenderer {
         vertices
     }
 
+    /// Clear a block texture to transparent (no glyphs to render).
+    ///
+    /// Used when glyphs transition from non-empty to empty — the render pass
+    /// must still clear the texture to remove stale glyph pixels.
+    pub fn clear_texture(
+        &self,
+        device: &RenderDevice,
+        queue: &RenderQueue,
+        gpu_images: &RenderAssets<GpuImage>,
+        target_image: &Handle<Image>,
+    ) -> bool {
+        let Some(target_gpu) = gpu_images.get(target_image) else {
+            warn_once!("MSDF clear: target GpuImage not ready");
+            return false;
+        };
+
+        let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("msdf_block_clear_encoder"),
+        });
+
+        {
+            encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("msdf_block_clear_pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &target_gpu.texture_view,
+                    resolve_target: None,
+                    ops: Operations {
+                        load: LoadOp::Clear(Default::default()),
+                        store: StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            // Pass drops immediately — no draw call needed, just clear.
+        }
+
+        queue.submit([encoder.finish()]);
+        true
+    }
+
     /// Render MSDF glyphs to a block texture via a render pass.
     pub fn render_to_texture(
         &self,

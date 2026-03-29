@@ -981,6 +981,16 @@ pub fn render_msdf_block_textures(
 
     for item in items {
         if item.glyphs.is_empty() {
+            // Glyphs went from non-empty to empty — clear stale pixels.
+            let cleared = msdf_renderer.clear_texture(
+                &device,
+                &queue,
+                &gpu_images,
+                &item.image_handle,
+            );
+            if cleared {
+                msdf_data.last_rendered.insert(item.image_handle.id(), item.version);
+            }
             continue;
         }
 
@@ -1117,27 +1127,25 @@ fn extract_msdf_blocks(
     extracted.items.clear();
 
     for (msdf_glyphs, render_method, scene, texture) in query.iter() {
-        if msdf_glyphs.glyphs.is_empty() || msdf_glyphs.version == 0 {
+        let asset_id = texture.image.id();
+        let last = extracted.last_rendered.get(&asset_id).copied().unwrap_or(0);
+        if !should_extract_msdf_block(msdf_glyphs.version, msdf_glyphs.glyphs.is_empty(), last) {
             continue;
         }
 
-        let asset_id = texture.image.id();
-        let last = extracted.last_rendered.get(&asset_id).copied().unwrap_or(0);
-        if msdf_glyphs.version > last {
-            // Vello blocks have content rendered by the Vello pass — MSDF composites on top
-            let has_vello = *render_method == BlockRenderMethod::Vello;
-            extracted.items.push(ExtractedMsdfBlockItem {
-                glyphs: msdf_glyphs.glyphs.clone(),
-                image_handle: texture.image.clone(),
-                width: texture.width,
-                height: texture.height,
-                built_width: scene.built_width,
-                built_height: scene.built_height,
-                version: msdf_glyphs.version,
-                rainbow: msdf_glyphs.rainbow,
-                has_vello_content: has_vello,
-            });
-        }
+        // Vello blocks have content rendered by the Vello pass — MSDF composites on top
+        let has_vello = *render_method == BlockRenderMethod::Vello;
+        extracted.items.push(ExtractedMsdfBlockItem {
+            glyphs: msdf_glyphs.glyphs.clone(),
+            image_handle: texture.image.clone(),
+            width: texture.width,
+            height: texture.height,
+            built_width: scene.built_width,
+            built_height: scene.built_height,
+            version: msdf_glyphs.version,
+            rainbow: msdf_glyphs.rainbow,
+            has_vello_content: has_vello,
+        });
     }
 }
 
@@ -1154,4 +1162,57 @@ fn extract_msdf_render_params(
     extracted.text_bias = theme.msdf_text_bias;
     extracted.gamma_correction = theme.msdf_gamma_correction;
     extracted.time = time.elapsed_secs();
+}
+
+/// Returns true if an MSDF block should be extracted for rendering this frame.
+///
+/// A block needs extraction when its version has advanced past what was last rendered.
+/// This includes blocks whose glyphs became empty — they still need a clear pass to
+/// remove stale texture content. Version 0 means the block was never initialized.
+fn should_extract_msdf_block(version: u64, _glyphs_empty: bool, last_rendered: u64) -> bool {
+    if version == 0 {
+        return false;
+    }
+    version > last_rendered
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- should_extract_msdf_block -----------------------------------------
+
+    #[test]
+    fn extract_normal_glyphs_with_advanced_version() {
+        // Standard case: non-empty glyphs, version ahead of last render.
+        assert!(should_extract_msdf_block(3, false, 2));
+    }
+
+    #[test]
+    fn skip_when_version_zero() {
+        // Initial state — never had glyphs, nothing to render or clear.
+        assert!(!should_extract_msdf_block(0, true, 0));
+        assert!(!should_extract_msdf_block(0, false, 0));
+    }
+
+    #[test]
+    fn skip_when_already_rendered() {
+        // Version matches last_rendered — no work needed.
+        assert!(!should_extract_msdf_block(5, false, 5));
+    }
+
+    #[test]
+    fn extract_empty_glyphs_when_version_advanced() {
+        // THE BUG: text was "aaa", user backspaced to empty.
+        // Version advanced (text changed) but glyphs are now empty.
+        // Must still extract so the render pass can clear stale glyph pixels.
+        assert!(should_extract_msdf_block(6, true, 3));
+    }
+
+    #[test]
+    fn skip_empty_glyphs_already_cleared() {
+        // Empty glyphs at a version we already rendered (cleared).
+        // No need to re-clear.
+        assert!(!should_extract_msdf_block(6, true, 6));
+    }
 }
