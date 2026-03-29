@@ -140,9 +140,20 @@ pub struct Theme {
     // Mode colors (vim-style, for mode indicator)
     // ═══════════════════════════════════════════════════════════════════════
     pub mode_normal: Color,
+    pub mode_insert: Color,
     pub mode_chat: Color,
     pub mode_shell: Color,
     pub mode_visual: Color,
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Mode labels (dock HUD text, Rhai-scriptable)
+    // ═══════════════════════════════════════════════════════════════════════
+    pub mode_label_normal: String,
+    pub mode_label_insert: String,
+    pub mode_label_visual: String,
+    pub mode_label_shell: String,
+    pub mode_label_constellation: String,
+    pub mode_label_input: String,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Cursor colors (shader Vec4: [r, g, b, a])
@@ -416,9 +427,18 @@ impl Default for Theme {
 
             // Mode colors (vim-style)
             mode_normal: Color::srgb(0.478, 0.635, 0.969), // #7aa2f7 blue
+            mode_insert: Color::srgb(0.620, 0.808, 0.416), // #9ece6a green
             mode_chat: Color::srgb(0.620, 0.808, 0.416),   // #9ece6a green
             mode_shell: Color::srgb(0.878, 0.686, 0.404),  // #e0af68 amber
             mode_visual: Color::srgb(0.733, 0.604, 0.969), // #bb9af7 purple
+
+            // Mode labels (dock HUD, Rhai-scriptable)
+            mode_label_normal: "NORMAL".into(),
+            mode_label_insert: "INSERT".into(),
+            mode_label_visual: "VISUAL".into(),
+            mode_label_shell: "SHELL".into(),
+            mode_label_constellation: "CONSTELLATION".into(),
+            mode_label_input: "INPUT".into(),
 
             // Cursor colors
             cursor_normal: Vec4::new(0.478, 0.635, 0.969, 0.8), // #7aa2f7 blue
@@ -634,9 +654,18 @@ impl From<kaijutsu_rhai::theme::ThemeData> for Theme {
 
         // Mode colors
         theme.mode_normal = hex_to_color(&td.mode_normal);
+        theme.mode_insert = hex_to_color(&td.mode_insert);
         theme.mode_chat = hex_to_color(&td.mode_chat);
         theme.mode_shell = hex_to_color(&td.mode_shell);
         theme.mode_visual = hex_to_color(&td.mode_visual);
+
+        // Mode labels
+        theme.mode_label_normal = td.mode_label_normal;
+        theme.mode_label_insert = td.mode_label_insert;
+        theme.mode_label_visual = td.mode_label_visual;
+        theme.mode_label_shell = td.mode_label_shell;
+        theme.mode_label_constellation = td.mode_label_constellation;
+        theme.mode_label_input = td.mode_label_input;
 
         // Cursor colors
         theme.cursor_normal = Vec4::from(td.cursor_normal);

@@ -673,29 +673,47 @@ pub fn handle_dock_click(
 // DATA-GATHERING SYSTEMS (write to DockState)
 // ============================================================================
 
-/// Update mode widget text when FocusArea or Screen changes.
+/// Update mode widget text from vim state + focus area + screen.
+///
+/// When the user is in a text-editing surface (Compose/Dialog), shows the vim
+/// editing mode (NORMAL/INSERT/VISUAL). Otherwise shows the app-level mode.
+/// All labels are Rhai-scriptable via `mode_label_*` theme variables.
 pub fn update_mode(
     focus_area: Res<FocusArea>,
     screen: Res<State<crate::ui::screen::Screen>>,
     theme: Res<Theme>,
     mut dock: ResMut<DockState>,
+    overlay_q: Query<&crate::view::components::InputOverlay>,
 ) {
-    if !focus_area.is_changed() && !screen.is_changed() {
-        return;
-    }
-
     use crate::ui::screen::Screen;
-    let (color, name) = match screen.get() {
-        Screen::Constellation => (theme.mode_visual, "CONSTELLATION"),
+
+    // Resolve vim mode from the active overlay (if any).
+    let vim_mode = overlay_q.iter().next().and_then(|o| o.vim_mode.clone());
+
+    let (color, label) = match screen.get() {
+        Screen::Constellation => (theme.mode_visual, &theme.mode_label_constellation),
         Screen::Conversation => match focus_area.as_ref() {
-            FocusArea::Compose => (theme.mode_chat, "INPUT"),
-            FocusArea::Conversation => (theme.mode_normal, focus_area.name()),
-            FocusArea::Dialog => (theme.mode_shell, focus_area.name()),
+            FocusArea::Compose | FocusArea::Dialog => {
+                vim_mode_to_dock(&vim_mode, &theme)
+            }
+            FocusArea::Conversation => (theme.mode_normal, &theme.mode_label_normal),
         },
     };
 
-    dock.mode.text = name.to_string();
-    dock.mode.color = color;
+    if dock.mode.text != *label || dock.mode.color != color {
+        dock.mode.text = label.clone();
+        dock.mode.color = color;
+    }
+}
+
+/// Map a vim mode string from modalkit to a dock (color, label) pair.
+fn vim_mode_to_dock<'a>(vim_mode: &Option<String>, theme: &'a Theme) -> (Color, &'a String) {
+    match vim_mode.as_deref() {
+        Some(s) if s.contains("INSERT") => (theme.mode_insert, &theme.mode_label_insert),
+        Some(s) if s.contains("VISUAL") => (theme.mode_visual, &theme.mode_label_visual),
+        Some(s) if s.contains("REPLACE") => (theme.mode_insert, &theme.mode_label_insert),
+        _ => (theme.mode_normal, &theme.mode_label_normal),
+    }
 }
 
 /// Update connection widget when RpcConnectionState changes.

@@ -257,18 +257,14 @@ pub fn build_shell_dock_glyphs(
                 continue;
             }
 
-            // Shell dock display: "$ " prefix + text
-            let vim_prefix = match &overlay.vim_mode {
-                Some(vim) => format!("{} ", vim),
-                None => String::new(),
-            };
+            // Shell dock display: "$ " prefix + text (mode is in the dock HUD)
             let display = if overlay.is_empty() {
-                format!("{}$ ", vim_prefix)
+                "$ ".to_string()
             } else {
-                format!("{}$ {}", vim_prefix, overlay.text)
+                format!("$ {}", overlay.text)
             };
 
-            let cursor_byte_offset = vim_prefix.len() + 2 + overlay.cursor; // "$ " = 2 bytes
+            let cursor_byte_offset = 2 + overlay.cursor; // "$ " = 2 bytes
 
             let width_changed = (block_scene.built_width - width).abs() > 1.0;
             let text_changed = block_scene.text != display;

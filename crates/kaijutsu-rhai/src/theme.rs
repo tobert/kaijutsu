@@ -82,9 +82,18 @@ pub struct ThemeData {
 
     // Mode colors
     pub mode_normal: String,
+    pub mode_insert: String,
     pub mode_chat: String,
     pub mode_shell: String,
     pub mode_visual: String,
+
+    // Mode labels (dock HUD text, scriptable)
+    pub mode_label_normal: String,
+    pub mode_label_insert: String,
+    pub mode_label_visual: String,
+    pub mode_label_shell: String,
+    pub mode_label_constellation: String,
+    pub mode_label_input: String,
 
     // Cursor colors
     pub cursor_normal: [f32; 4],
@@ -226,9 +235,18 @@ impl Default for ThemeData {
 
             // Mode colors
             mode_normal: "#7aa2f7".into(),
+            mode_insert: "#9ece6a".into(),
             mode_chat: "#9ece6a".into(),
             mode_shell: "#e0af68".into(),
             mode_visual: "#bb9af7".into(),
+
+            // Mode labels
+            mode_label_normal: "NORMAL".into(),
+            mode_label_insert: "INSERT".into(),
+            mode_label_visual: "VISUAL".into(),
+            mode_label_shell: "SHELL".into(),
+            mode_label_constellation: "CONSTELLATION".into(),
+            mode_label_input: "INPUT".into(),
 
             // Cursor colors
             cursor_normal: [0.478, 0.635, 0.969, 0.8],
@@ -464,7 +482,8 @@ pub fn parse_theme_data_from_scope(scope: &Scope) -> ThemeData {
 
     // Mode colors
     color!(mode_normal);
-    // Support both mode_chat and mode_insert (legacy)
+    color!(mode_insert);
+    // Support both mode_chat and mode_insert (legacy: mode_insert sets mode_chat)
     if let Some(c) =
         get_color_hex(scope, "mode_chat").or_else(|| get_color_hex(scope, "mode_insert"))
     {
@@ -472,6 +491,21 @@ pub fn parse_theme_data_from_scope(scope: &Scope) -> ThemeData {
     }
     color!(mode_shell);
     color!(mode_visual);
+
+    // Mode labels (dock HUD text)
+    macro_rules! string {
+        ($field:ident) => {
+            if let Some(v) = get_string(scope, stringify!($field)) {
+                td.$field = v;
+            }
+        };
+    }
+    string!(mode_label_normal);
+    string!(mode_label_insert);
+    string!(mode_label_visual);
+    string!(mode_label_shell);
+    string!(mode_label_constellation);
+    string!(mode_label_input);
 
     // Cursor colors
     vec4!(cursor_normal);

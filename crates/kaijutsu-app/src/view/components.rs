@@ -452,32 +452,14 @@ impl InputOverlay {
         matches!(self.mode, InputMode::Shell)
     }
 
-    /// Build the display text with vim mode + mode ring prefix.
-    pub fn display_text(&self) -> String {
-        let prefix = self.display_prefix();
-        if self.text.is_empty() {
-            format!("{} │ ", prefix)
-        } else {
-            format!("{} │ {}", prefix, self.text)
-        }
+    /// Build the display text (raw input, no mode prefix — mode is in the dock).
+    pub fn display_text(&self) -> &str {
+        &self.text
     }
 
-    /// Byte offset of the cursor within display_text (accounting for prefix).
+    /// Byte offset of the cursor within display_text.
     pub fn display_cursor_offset(&self) -> usize {
-        let prefix = self.display_prefix();
-        // " │ " — U+2502 is 3 UTF-8 bytes, so separator is 5 bytes total
-        prefix.len() + " │ ".len() + self.cursor
-    }
-
-    /// Build the prefix string: vim mode only.
-    ///
-    /// Chat/shell distinction is spatial (floating overlay vs bottom dock),
-    /// so no mode label needed.
-    fn display_prefix(&self) -> String {
-        match &self.vim_mode {
-            Some(vim) => vim.clone(),
-            None => "NORMAL".to_string(),
-        }
+        self.cursor
     }
 }
 

@@ -300,7 +300,7 @@ pub fn build_overlay_glyphs(
             };
 
             // Run Parley layout
-            let layout = font.layout(&display, &style, VelloTextAlign::Left, max_advance);
+            let layout = font.layout(display, &style, VelloTextAlign::Left, max_advance);
             let content_height = layout.height();
 
             let text_offset = (pad.left as f64, pad.top as f64);
@@ -326,7 +326,7 @@ pub fn build_overlay_glyphs(
                 let total_height = content_height + pad.top + pad.bottom;
                 block_scene.built_width = width;
                 block_scene.built_height = total_height;
-                block_scene.text = display;
+                block_scene.text = display.to_string();
                 block_scene.color = text_color;
                 block_scene.content_version = block_scene.content_version.wrapping_add(1);
                 block_scene.last_built_version = block_scene.content_version;
