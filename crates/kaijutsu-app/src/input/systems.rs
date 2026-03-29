@@ -86,6 +86,9 @@ pub fn handle_focus_compose(
             // operator-pending or visual state from a previous focus session.
             use modalkit::keybindings::BindingMachine;
             vim.machine.reset_mode();
+            // Drain actions queued by mode transition (enter-hook fires
+            // CursorClose + motion-back + Checkpoint when leaving Insert).
+            while vim.machine.pop().is_some() {}
 
             // Vim mode transition:
             // - Empty overlay: enter Insert mode (ready to type immediately)
@@ -94,7 +97,6 @@ pub fn handle_focus_compose(
                 // Synthesize 'i' keypress to enter Insert mode
                 use modalkit::crossterm::event::KeyCode;
                 vim.machine.input_key(KeyCode::Char('i').into());
-                // Drain the action (the 'i' key just changes mode, no action to handle)
                 while vim.machine.pop().is_some() {}
             }
             overlay.vim_mode = vim.machine.show_mode();
@@ -134,6 +136,7 @@ pub fn handle_toggle_surface(
         // Reset vim state for the newly active surface.
         use modalkit::keybindings::BindingMachine;
         vim.machine.reset_mode();
+        while vim.machine.pop().is_some() {}
 
         // Get the overlay for the newly active surface
         let overlay = if surface.is_shell() {

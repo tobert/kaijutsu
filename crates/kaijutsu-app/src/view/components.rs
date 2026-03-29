@@ -465,8 +465,8 @@ impl InputOverlay {
     /// Byte offset of the cursor within display_text (accounting for prefix).
     pub fn display_cursor_offset(&self) -> usize {
         let prefix = self.display_prefix();
-        // +3 for " │ "
-        prefix.len() + 3 + self.cursor
+        // " │ " — U+2502 is 3 UTF-8 bytes, so separator is 5 bytes total
+        prefix.len() + " │ ".len() + self.cursor
     }
 
     /// Build the prefix string: vim mode only.
