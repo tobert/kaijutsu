@@ -172,16 +172,24 @@ fn apply_insert(
     }
 }
 
-/// In Normal mode, cursor must be ON a character (0..text.len()), not past end.
+/// In Normal mode, cursor must be ON a printable character, not past end
+/// or on a newline (which belongs to the next line's boundary).
 /// In Insert mode, cursor can be at text.len() (appending position).
 /// Call after any mutation to enforce the invariant based on current vim mode.
 fn clamp_normal_cursor(overlay: &mut crate::cell::InputOverlay) {
-    // vim_mode == None means Normal mode (show_mode() returns None for Normal)
-    if overlay.vim_mode.is_none()
-        && !overlay.text.is_empty()
-        && overlay.cursor >= overlay.text.len()
-    {
+    if overlay.vim_mode.is_some() || overlay.text.is_empty() {
+        return;
+    }
+    // Can't be past end of text
+    if overlay.cursor >= overlay.text.len() {
         overlay.cursor = textutil::prev_char_boundary(&overlay.text, overlay.text.len());
+    }
+    // Can't rest on a newline in Normal mode — back up to last char on line
+    if overlay.cursor < overlay.text.len()
+        && overlay.text.as_bytes()[overlay.cursor] == b'\n'
+        && overlay.cursor > 0
+    {
+        overlay.cursor = textutil::prev_char_boundary(&overlay.text, overlay.cursor);
     }
 }
 
