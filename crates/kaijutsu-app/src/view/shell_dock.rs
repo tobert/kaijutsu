@@ -1,19 +1,16 @@
-//! Input overlay — MSDF-rendered floating command palette.
+//! Shell dock — bottom-anchored kaish input surface.
 //!
-//! The InputOverlay is the sole compose surface, rendered as a floating
-//! command palette (rofi/dmenu style) with:
-//! - Centered positioning (~60% width, near top-third)
-//! - MSDF text rendering (GPU-native hinting, directional AA)
-//! - Shader-rendered borders + cursor beam via BlockFxMaterial
-//! - Summon animation (fade-in via visibility)
+//! Spatially separated from the floating chat overlay. Appears when
+//! `ActiveSurface::Shell` + `FocusArea::Compose`, collapses otherwise.
+//! Uses the same MSDF text + shader border rendering as the chat overlay.
 
 use bevy::prelude::*;
 use bevy::ui::ComputedNode;
-use bevy_vello::parley;
 use bevy_vello::prelude::{VelloFont, VelloTextAlign, VelloTextStyle};
 
 use crate::cell::block_border::{BlockBorderStyle, BorderAnimation, BorderKind, BorderPadding};
-use crate::cell::{InputOverlay, InputOverlayMarker, MsdfOverlayText};
+use crate::cell::InputOverlay;
+use crate::input::focus::ActiveSurface;
 use crate::input::FocusArea;
 use crate::shaders::BlockFxMaterial;
 use crate::text::msdf::{BlockRenderMethod, FontDataMap, MsdfBlockGlyphs, collect_msdf_glyphs};
@@ -21,40 +18,25 @@ use crate::text::{FontHandles, TextMetrics, bevy_color_to_brush};
 use crate::ui::theme::Theme;
 use crate::view::block_render::{BlockScene, BlockTexture};
 use crate::view::components::OverlayCursorGeometry;
+use crate::view::overlay::OverlayStyle;
 
 // ============================================================================
 // COMPONENTS
 // ============================================================================
 
-/// Style for the command palette overlay.
-///
-/// Only stores values consumed directly by the parent entity's Bevy UI
-/// components. Border/glow styling lives on the child's `BlockBorderStyle`
-/// and is read by the shader system from `Theme` directly.
-#[derive(Component, Reflect, Clone)]
-#[reflect(Component)]
-pub struct OverlayStyle {
-    pub bg_color: Color,
-    pub corner_radius: f32,
-}
+/// Marker for the shell dock input entity.
+#[derive(Component)]
+pub struct ShellDockMarker;
 
-impl Default for OverlayStyle {
-    fn default() -> Self {
-        Self {
-            bg_color: Color::srgba(0.102, 0.106, 0.149, 0.95),
-            corner_radius: 8.0,
-        }
-    }
-}
+/// Marker for the MSDF text surface child of the shell dock.
+#[derive(Component)]
+pub struct MsdfShellDockText;
 
-/// Summon animation state.
+/// Summon animation state for the shell dock.
 #[derive(Resource, Default)]
-pub struct OverlaySummonState {
-    /// Animation progress: 0.0 = hidden, 1.0 = fully visible
+pub struct ShellDockSummonState {
     pub progress: f32,
-    /// Target visibility state
     pub target_visible: bool,
-    /// Whether animation is in progress
     pub animating: bool,
 }
 
@@ -62,47 +44,57 @@ pub struct OverlaySummonState {
 // SPAWN SYSTEM
 // ============================================================================
 
-/// Spawn the InputOverlay entity with one MSDF text child.
-///
-/// The child holds the `BlockScene` + `BlockFxMaterial` for MSDF text,
-/// shader-drawn borders, and cursor beam rendering.
-pub fn spawn_input_overlay(
+/// Spawn the shell dock input entity as a child of TilingRoot,
+/// inserted before the SouthDock.
+pub fn spawn_shell_dock(
     mut commands: Commands,
-    existing: Query<Entity, With<InputOverlayMarker>>,
+    existing: Query<Entity, With<ShellDockMarker>>,
     theme: Res<Theme>,
     mut fx_materials: ResMut<Assets<BlockFxMaterial>>,
+    tiling_root: Query<(Entity, &Children), With<crate::ui::tiling_reconciler::TilingRoot>>,
+    south_dock: Query<Entity, With<crate::ui::dock::SouthDock>>,
 ) {
     if !existing.is_empty() {
         return;
     }
 
+    let Ok((root, root_children)) = tiling_root.single() else {
+        return;
+    };
+
     let style = OverlayStyle {
-        bg_color: theme.compose_bg.with_alpha(0.95),
-        corner_radius: 8.0,
+        bg_color: theme.compose_bg.with_alpha(0.92),
+        corner_radius: 0.0, // Dock-style: no rounded corners
     };
 
     let material_handle = fx_materials.add(BlockFxMaterial::default());
 
+    // Starts collapsed (display: None, height: 0)
     let parent_node = Node {
-        position_type: PositionType::Absolute,
-        top: Val::Percent(15.0),
-        left: Val::Percent(20.0),
-        right: Val::Percent(20.0),
-        min_height: Val::Px(48.0),
-        max_width: Val::Px(800.0),
+        width: Val::Percent(100.0),
+        min_height: Val::Px(0.0),
+        display: Display::None,
         overflow: Overflow::clip(),
-        border_radius: BorderRadius::all(Val::Px(style.corner_radius)),
+        border: UiRect::top(Val::Px(1.0)),
         ..default()
     };
 
-    commands
-        .spawn((InputOverlayMarker, InputOverlay::default(), style.clone(), parent_node, Visibility::Hidden))
-        .insert(ZIndex(crate::constants::ZLayer::MODAL))
+    let mut shell_overlay = InputOverlay::default();
+    shell_overlay.mode = crate::view::components::InputMode::Shell;
+
+    let shell_entity = commands
+        .spawn((
+            ShellDockMarker,
+            shell_overlay,
+            style.clone(),
+            parent_node,
+            Visibility::Hidden,
+        ))
         .insert(BackgroundColor(style.bg_color))
+        .insert(BorderColor::all(theme.border))
         .with_children(|parent| {
-            // Child 1: MSDF text surface with shader borders
             parent.spawn((
-                MsdfOverlayText,
+                MsdfShellDockText,
                 BlockScene::default(),
                 BlockTexture {
                     image: Handle::default(),
@@ -114,17 +106,17 @@ pub fn spawn_input_overlay(
                 ImageNode::default(),
                 MaterialNode(material_handle),
                 BlockBorderStyle {
-                    kind: BorderKind::Full,
+                    kind: BorderKind::TopAccent,
                     color: theme.compose_palette_border,
                     thickness: 2.0,
-                    corner_radius: 8.0,
+                    corner_radius: 0.0,
                     padding: BorderPadding {
-                        top: 16.0,
-                        bottom: 16.0,
+                        top: 8.0,
+                        bottom: 8.0,
                         left: 16.0,
                         right: 16.0,
                     },
-                    animation: BorderAnimation::Breathe,
+                    animation: BorderAnimation::None,
                     top_label: None,
                     bottom_label: None,
                 },
@@ -134,40 +126,51 @@ pub fn spawn_input_overlay(
                     ..default()
                 },
             ));
+        })
+        .id();
 
-        });
+    // Insert before SouthDock. Find SouthDock's index in root children.
+    if let Ok(south) = south_dock.single() {
+        if let Some(idx) = root_children.iter().position(|c| c == south) {
+            commands
+                .entity(root)
+                .insert_children(idx, &[shell_entity]);
+        } else {
+            // Fallback: just add as child (will be after SouthDock)
+            commands.entity(root).add_child(shell_entity);
+        }
+    } else {
+        commands.entity(root).add_child(shell_entity);
+    }
 
-    info!("Spawned InputOverlay entity (MSDF child)");
+    info!("Spawned ShellDock entity (MSDF child)");
 }
 
 // ============================================================================
-// ANIMATION SYSTEMS
+// VISIBILITY / ANIMATION SYSTEMS
 // ============================================================================
 
-/// Update summon animation state when focus or surface changes.
-///
-/// Only shows the floating chat overlay when `ActiveSurface::Chat` + `FocusArea::Compose`.
-/// Shell surface uses the bottom dock instead.
-pub fn update_summon_animation(
+/// Update shell dock summon state when focus or surface changes.
+pub fn update_shell_dock_summon(
     focus: Res<FocusArea>,
-    surface: Res<crate::input::focus::ActiveSurface>,
-    mut summon: ResMut<OverlaySummonState>,
+    surface: Res<ActiveSurface>,
+    mut summon: ResMut<ShellDockSummonState>,
 ) {
-    let should_show = matches!(*focus, FocusArea::Compose) && !surface.is_shell();
+    let should_show = matches!(*focus, FocusArea::Compose) && surface.is_shell();
     if summon.target_visible != should_show {
         summon.target_visible = should_show;
         summon.animating = true;
     }
 }
 
-/// Interpolate summon progress (fade in/out).
-pub fn animate_summon(time: Res<Time>, mut summon: ResMut<OverlaySummonState>) {
+/// Interpolate shell dock summon progress.
+pub fn animate_shell_dock_summon(time: Res<Time>, mut summon: ResMut<ShellDockSummonState>) {
     if !summon.animating {
         return;
     }
 
     let target = if summon.target_visible { 1.0 } else { 0.0 };
-    let speed = 8.0; // ~125ms animation
+    let speed = 10.0; // Slightly faster than chat overlay
     let delta = time.delta_secs() * speed;
 
     if summon.progress < target {
@@ -182,20 +185,24 @@ pub fn animate_summon(time: Res<Time>, mut summon: ResMut<OverlaySummonState>) {
     }
 }
 
-/// Show/hide the InputOverlay entity based on summon progress.
-pub fn sync_overlay_visibility(
-    summon: Res<OverlaySummonState>,
-    mut overlay_query: Query<&mut Visibility, With<InputOverlayMarker>>,
+/// Show/hide the shell dock entity + adjust display/height based on summon progress.
+pub fn sync_shell_dock_visibility(
+    summon: Res<ShellDockSummonState>,
+    mut shell_query: Query<(&mut Visibility, &mut Node), With<ShellDockMarker>>,
 ) {
     if !summon.is_changed() {
         return;
     }
-    for mut vis in overlay_query.iter_mut() {
-        *vis = if summon.progress > 0.0 {
-            Visibility::Inherited
+    for (mut vis, mut node) in shell_query.iter_mut() {
+        if summon.progress > 0.0 {
+            *vis = Visibility::Inherited;
+            node.display = Display::Flex;
+            node.min_height = Val::Px(40.0);
         } else {
-            Visibility::Hidden
-        };
+            *vis = Visibility::Hidden;
+            node.display = Display::None;
+            node.min_height = Val::Px(0.0);
+        }
     }
 }
 
@@ -203,12 +210,12 @@ pub fn sync_overlay_visibility(
 // MSDF GLYPH BUILDING (PostUpdate, after Layout)
 // ============================================================================
 
-/// Build MSDF glyphs for the overlay text surface.
+/// Build MSDF glyphs for the shell dock text surface.
 ///
-/// Runs in PostUpdate after UiSystems::Layout so ComputedNode is available.
-/// Replaces the old sync_input_overlay_buffer + sync_overlay_max_advance.
-pub fn build_overlay_glyphs(
-    parents: Query<(&InputOverlay, &Children), With<InputOverlayMarker>>,
+/// Mirrors `build_overlay_glyphs` from overlay.rs but targets ShellDockMarker
+/// and uses a `$ ` prompt prefix instead of the mode ring.
+pub fn build_shell_dock_glyphs(
+    parents: Query<(&InputOverlay, &Children), With<ShellDockMarker>>,
     mut msdf_children: Query<
         (
             &mut BlockScene,
@@ -218,7 +225,7 @@ pub fn build_overlay_glyphs(
             &mut Node,
             &mut OverlayCursorGeometry,
         ),
-        With<MsdfOverlayText>,
+        With<MsdfShellDockText>,
     >,
     fonts: Res<Assets<VelloFont>>,
     font_handles: Res<FontHandles>,
@@ -250,8 +257,19 @@ pub fn build_overlay_glyphs(
                 continue;
             }
 
-            // Check if rebuild needed (text changed or width changed)
-            let display = overlay.display_text();
+            // Shell dock display: "$ " prefix + text
+            let vim_prefix = match &overlay.vim_mode {
+                Some(vim) => format!("{} ", vim),
+                None => String::new(),
+            };
+            let display = if overlay.is_empty() {
+                format!("{}$ ", vim_prefix)
+            } else {
+                format!("{}$ {}", vim_prefix, overlay.text)
+            };
+
+            let cursor_byte_offset = vim_prefix.len() + 2 + overlay.cursor; // "$ " = 2 bytes
+
             let width_changed = (block_scene.built_width - width).abs() > 1.0;
             let text_changed = block_scene.text != display;
 
@@ -259,23 +277,20 @@ pub fn build_overlay_glyphs(
                 continue;
             }
 
-            // Determine text color
+            // Determine text color — kaish syntax validation
             let text_color = if overlay.is_empty() {
                 theme.fg_dim
-            } else if overlay.is_shell() {
+            } else {
                 let validation = crate::kaish::validate(&overlay.text);
                 if !validation.valid && !validation.incomplete {
                     theme.block_tool_error
                 } else {
                     theme.block_user
                 }
-            } else {
-                theme.block_user
             };
 
             let text_brush = bevy_color_to_brush(text_color);
 
-            // Compute content area (inside border padding)
             let pad = &border_style.padding;
             let content_width = (width - pad.left - pad.right).max(0.0);
             let max_advance = if content_width > 0.0 {
@@ -284,7 +299,6 @@ pub fn build_overlay_glyphs(
                 None
             };
 
-            // Build text style
             let style = VelloTextStyle {
                 font: font_handles.mono.clone(),
                 brush: text_brush,
@@ -296,13 +310,11 @@ pub fn build_overlay_glyphs(
                 ..default()
             };
 
-            // Run Parley layout
             let layout = font.layout(&display, &style, VelloTextAlign::Left, max_advance);
             let content_height = layout.height();
 
             let text_offset = (pad.left as f64, pad.top as f64);
 
-            // Collect MSDF glyphs
             if let Some(ref mut atlas) = atlas {
                 for line in layout.lines() {
                     for item in line.items() {
@@ -318,7 +330,6 @@ pub fn build_overlay_glyphs(
                 msdf_glyphs.rainbow = false;
             }
 
-            // Set scene dimensions (content + padding)
             let total_height = content_height + pad.top + pad.bottom;
             block_scene.built_width = width;
             block_scene.built_height = total_height;
@@ -328,15 +339,13 @@ pub fn build_overlay_glyphs(
             block_scene.last_built_version = block_scene.content_version;
             block_scene.scene_version = block_scene.scene_version.wrapping_add(1);
 
-            // Set explicit height on the node
             node.height = Val::Px(total_height);
 
-            // Compute cursor geometry from Parley layout
-            let cursor_byte_offset = overlay.display_cursor_offset();
-            let cursor = parley::editing::Cursor::from_byte_index(
+            // Cursor geometry
+            let cursor = bevy_vello::parley::editing::Cursor::from_byte_index(
                 &layout,
                 cursor_byte_offset,
-                parley::layout::Affinity::Upstream,
+                bevy_vello::parley::layout::Affinity::Upstream,
             );
             let geom = cursor.geometry(&layout, 2.0);
             cursor_geom.x = text_offset.0 + geom.x0;
@@ -346,28 +355,24 @@ pub fn build_overlay_glyphs(
     }
 }
 
-// ============================================================================
-// THEME SYNC
-// ============================================================================
-
-/// Sync OverlayStyle + BlockBorderStyle from theme when theme changes.
-pub fn sync_overlay_style_to_theme(
+/// Sync shell dock style from theme when theme changes.
+pub fn sync_shell_dock_style_to_theme(
     theme: Res<Theme>,
-    mut overlay_query: Query<
-        (&mut OverlayStyle, &mut BackgroundColor, &Children),
-        With<InputOverlayMarker>,
+    mut dock_query: Query<
+        (&mut OverlayStyle, &mut BackgroundColor, &mut BorderColor, &Children),
+        With<ShellDockMarker>,
     >,
-    mut border_query: Query<&mut BlockBorderStyle, With<MsdfOverlayText>>,
+    mut border_query: Query<&mut BlockBorderStyle, With<MsdfShellDockText>>,
 ) {
     if !theme.is_changed() {
         return;
     }
-    for (mut style, mut bg, children) in overlay_query.iter_mut() {
-        let new_bg = theme.compose_bg.with_alpha(0.95);
+    for (mut style, mut bg, mut border_color, children) in dock_query.iter_mut() {
+        let new_bg = theme.compose_bg.with_alpha(0.92);
         style.bg_color = new_bg;
         *bg = BackgroundColor(new_bg);
+        *border_color = BorderColor::all(theme.border);
 
-        // Sync border style on MSDF child
         for child in children.iter() {
             if let Ok(mut border) = border_query.get_mut(child) {
                 border.color = theme.compose_palette_border;

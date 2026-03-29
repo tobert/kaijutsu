@@ -215,7 +215,7 @@ pub fn handle_block_events(
 pub fn handle_input_doc_events(
     mut server_events: MessageReader<ServerEventMessage>,
     mut doc_cache: ResMut<crate::cell::DocumentCache>,
-    mut overlay: Query<&mut crate::cell::InputOverlay>,
+    mut overlay: Query<&mut crate::cell::InputOverlay, With<crate::cell::InputOverlayMarker>>,
     mut scroll_state: ResMut<ConversationScrollState>,
     mut focus: ResMut<crate::input::focus::FocusArea>,
     session_agent: Res<crate::cell::SessionAgent>,

@@ -46,54 +46,110 @@ pub fn handle_focus_cycle(mut actions: MessageReader<ActionFired>, mut focus: Re
 // ============================================================================
 
 /// Handle FocusCompose action (i/Space in Navigation → jump to compose).
+///
+/// Only handles chat surface summoning. Shell surface is activated via
+/// `handle_toggle_surface` (Ctrl+Z).
 pub fn handle_focus_compose(
     mut actions: MessageReader<ActionFired>,
     mut focus: ResMut<FocusArea>,
-    mut overlay: Query<&mut crate::cell::InputOverlay>,
+    mut surface: ResMut<super::focus::ActiveSurface>,
+    mut overlay: Query<&mut crate::cell::InputOverlay, With<crate::cell::InputOverlayMarker>>,
     doc_cache: Res<crate::cell::DocumentCache>,
     mut vim: ResMut<crate::input::vim::VimMachineResource>,
 ) {
     for ActionFired(action) in actions.read() {
-        let mode = match action {
-            Action::FocusCompose | Action::SummonChat => Some(crate::cell::InputMode::Chat),
-            Action::SummonShell => Some(crate::cell::InputMode::Shell),
-            _ => None,
-        };
-        if let Some(mode) = mode {
-            *focus = FocusArea::Compose;
-            // Set the overlay mode and restore text from CRDT if available
-            if let Ok(mut overlay) = overlay.single_mut() {
-                overlay.mode = mode;
-                // Restore draft from CRDT InputDocEntry if overlay is empty
-                // and no clear is pending (submit/escape×3 in flight).
-                if overlay.text.is_empty()
-                    && let Some(ctx_id) = doc_cache.active_id()
-                    && let Some(cached) = doc_cache.get(ctx_id)
-                    && !cached.input_pending_clear
-                    && let Some(ref input) = cached.input
-                {
-                    let crdt_text = input.text();
-                    if !crdt_text.is_empty() {
-                        overlay.text = crdt_text;
-                        overlay.cursor = overlay.text.len();
-                    }
-                }
+        if !matches!(action, Action::FocusCompose | Action::SummonChat) {
+            continue;
+        }
+        *focus = FocusArea::Compose;
+        *surface = super::focus::ActiveSurface::Chat;
 
-                // Vim mode transition:
-                // - Empty overlay: enter Insert mode (ready to type immediately)
-                // - Draft text: stay in Normal mode (user reviews before editing)
-                use modalkit::keybindings::BindingMachine;
-                if overlay.text.is_empty() {
-                    // Synthesize 'i' keypress to enter Insert mode
-                    use modalkit::crossterm::event::KeyCode;
-                    vim.machine.input_key(KeyCode::Char('i').into());
-                    // Drain the action (the 'i' key just changes mode, no action to handle)
-                    while vim.machine.pop().is_some() {}
-                } else {
-                    vim.machine.reset_mode(); // ensure Normal
+        // Set the overlay mode and restore text from CRDT if available
+        if let Ok(mut overlay) = overlay.single_mut() {
+            overlay.mode = crate::cell::InputMode::Chat;
+            // Restore draft from CRDT InputDocEntry if overlay is empty
+            // and no clear is pending (submit/escape×3 in flight).
+            if overlay.text.is_empty()
+                && let Some(ctx_id) = doc_cache.active_id()
+                && let Some(cached) = doc_cache.get(ctx_id)
+                && !cached.input_pending_clear
+                && let Some(ref input) = cached.input
+            {
+                let crdt_text = input.text();
+                if !crdt_text.is_empty() {
+                    overlay.text = crdt_text;
+                    overlay.cursor = overlay.text.len();
                 }
-                overlay.vim_mode = vim.machine.show_mode();
             }
+
+            // Always reset vim state to Normal first — clears any stale
+            // operator-pending or visual state from a previous focus session.
+            use modalkit::keybindings::BindingMachine;
+            vim.machine.reset_mode();
+
+            // Vim mode transition:
+            // - Empty overlay: enter Insert mode (ready to type immediately)
+            // - Draft text: stay in Normal mode (user reviews before editing)
+            if overlay.text.is_empty() {
+                // Synthesize 'i' keypress to enter Insert mode
+                use modalkit::crossterm::event::KeyCode;
+                vim.machine.input_key(KeyCode::Char('i').into());
+                // Drain the action (the 'i' key just changes mode, no action to handle)
+                while vim.machine.pop().is_some() {}
+            }
+            overlay.vim_mode = vim.machine.show_mode();
+        }
+    }
+}
+
+/// Handle ToggleSurface action (Ctrl+Z — symmetric chat ↔ shell toggle).
+///
+/// Toggles ActiveSurface and sets FocusArea::Compose to summon the
+/// appropriate surface. Each surface maintains its own draft text.
+pub fn handle_toggle_surface(
+    mut actions: MessageReader<ActionFired>,
+    mut focus: ResMut<FocusArea>,
+    mut surface: ResMut<super::focus::ActiveSurface>,
+    mut vim: ResMut<crate::input::vim::VimMachineResource>,
+    mut chat_overlay: Query<
+        &mut crate::cell::InputOverlay,
+        With<crate::cell::InputOverlayMarker>,
+    >,
+    mut shell_overlay: Query<
+        &mut crate::cell::InputOverlay,
+        (
+            With<crate::view::shell_dock::ShellDockMarker>,
+            Without<crate::cell::InputOverlayMarker>,
+        ),
+    >,
+) {
+    for ActionFired(action) in actions.read() {
+        if !matches!(action, Action::ToggleSurface) {
+            continue;
+        }
+
+        surface.toggle();
+        *focus = FocusArea::Compose;
+
+        // Reset vim state for the newly active surface.
+        use modalkit::keybindings::BindingMachine;
+        vim.machine.reset_mode();
+
+        // Get the overlay for the newly active surface
+        let overlay = if surface.is_shell() {
+            shell_overlay.single_mut().ok()
+        } else {
+            chat_overlay.single_mut().ok()
+        };
+
+        if let Some(mut overlay) = overlay {
+            // Enter Insert mode if overlay is empty
+            if overlay.text.is_empty() {
+                use modalkit::crossterm::event::KeyCode;
+                vim.machine.input_key(KeyCode::Char('i').into());
+                while vim.machine.pop().is_some() {}
+            }
+            overlay.vim_mode = vim.machine.show_mode();
         }
     }
 }
@@ -107,6 +163,7 @@ pub fn handle_focus_compose(
 pub fn handle_unfocus(
     mut actions: MessageReader<ActionFired>,
     mut focus: ResMut<FocusArea>,
+    mut surface: ResMut<super::focus::ActiveSurface>,
     screen: Res<State<crate::ui::screen::Screen>>,
     mut next_screen: ResMut<NextState<crate::ui::screen::Screen>>,
     mut vim: ResMut<crate::input::vim::VimMachineResource>,
@@ -134,6 +191,11 @@ pub fn handle_unfocus(
             use modalkit::keybindings::BindingMachine;
             vim.machine.reset_mode();
             *focus = FocusArea::Conversation;
+
+            // If escaping from shell surface, return to chat as default
+            if surface.is_shell() {
+                *surface = super::focus::ActiveSurface::Chat;
+            }
         }
     }
 }
@@ -149,7 +211,18 @@ pub fn handle_unfocus(
 pub fn handle_interrupt(
     mut actions: MessageReader<ActionFired>,
     mut interrupt_state: ResMut<crate::input::interrupt::InterruptState>,
-    mut overlay: Query<&mut crate::cell::InputOverlay>,
+    mut chat_overlay: Query<
+        &mut crate::cell::InputOverlay,
+        With<crate::cell::InputOverlayMarker>,
+    >,
+    mut shell_overlay: Query<
+        &mut crate::cell::InputOverlay,
+        (
+            With<crate::view::shell_dock::ShellDockMarker>,
+            Without<crate::cell::InputOverlayMarker>,
+        ),
+    >,
+    surface: Res<super::focus::ActiveSurface>,
     mut doc_cache: ResMut<crate::cell::DocumentCache>,
     actor: Option<Res<crate::connection::RpcActor>>,
 ) {
@@ -188,7 +261,12 @@ pub fn handle_interrupt(
 
         // 3rd press: clear compose buffer + tell kernel to clear input doc
         if count >= 3 {
-            if let Ok(mut ov) = overlay.single_mut() {
+            let ov = if surface.is_shell() {
+                shell_overlay.single_mut().ok()
+            } else {
+                chat_overlay.single_mut().ok()
+            };
+            if let Some(mut ov) = ov {
                 ov.text.clear();
                 ov.cursor = 0;
                 ov.selection_anchor = None;
@@ -517,6 +595,63 @@ pub fn handle_collapse_toggle(
     }
 }
 
+/// Handle ToggleBlockExcluded action — x in Navigation.
+///
+/// Toggles the excluded flag on the focused block via set_block_excluded RPC.
+pub fn handle_toggle_block_excluded(
+    mut actions: MessageReader<ActionFired>,
+    focus: Res<FocusTarget>,
+    cells: Query<&CellEditor>,
+    entities: Res<EditorEntities>,
+    actor: Option<Res<crate::connection::RpcActor>>,
+    doc_cache: Res<crate::cell::DocumentCache>,
+) {
+    for ActionFired(action) in actions.read() {
+        if !matches!(action, Action::ToggleBlockExcluded) {
+            continue;
+        }
+
+        let Some(ref block_id) = focus.block_id else {
+            continue;
+        };
+
+        let Some(main_ent) = entities.main_cell else {
+            continue;
+        };
+
+        let Ok(editor) = cells.get(main_ent) else {
+            continue;
+        };
+
+        // Find the block's current excluded state
+        let blocks = editor.blocks();
+        let Some(block) = blocks.iter().find(|b| &b.id == block_id) else {
+            continue;
+        };
+        let new_excluded = !block.excluded;
+        let bid = *block_id;
+
+        // Fire RPC to toggle exclusion
+        if let (Some(actor), Some(ctx_id)) = (&actor, doc_cache.active_id()) {
+            let handle = actor.handle.clone();
+            bevy::tasks::IoTaskPool::get()
+                .spawn(async move {
+                    match handle.set_block_excluded(ctx_id, &bid, new_excluded).await {
+                        Ok(_) => {
+                            log::info!(
+                                "set_block_excluded: block={:?} excluded={}",
+                                bid,
+                                new_excluded
+                            );
+                        }
+                        Err(e) => log::warn!("set_block_excluded failed: {e}"),
+                    }
+                })
+                .detach();
+        }
+    }
+}
+
 // ============================================================================
 // TILING PANE MANAGEMENT
 // ============================================================================
@@ -696,77 +831,119 @@ pub fn handle_constellation_nav(
 /// Handle text input in the input overlay (Compose area).
 ///
 /// Consumes TextInputReceived for character insertion and ActionFired for
-/// editing actions (Submit, Backspace, Delete, cursor movement, CycleModeRing).
-/// Uses `InputOverlay.mode` to determine shell vs chat routing on Submit.
+/// editing actions (Submit, Backspace, Delete, cursor movement).
+/// Uses `ActiveSurface` to determine shell vs chat routing on Submit.
 ///
 /// Dual-writes to CRDT input document via `edit_input` RPC for persistence.
 /// Submit uses `submit_input` RPC — overlay cleared only on `InputCleared`.
 pub fn handle_compose_input(
     mut text_events: MessageReader<super::events::TextInputReceived>,
     mut actions: MessageReader<ActionFired>,
-    mut overlay: Query<&mut crate::cell::InputOverlay>,
+    mut chat_overlay: Query<
+        &mut crate::cell::InputOverlay,
+        With<crate::cell::InputOverlayMarker>,
+    >,
+    mut shell_overlay: Query<
+        &mut crate::cell::InputOverlay,
+        (
+            With<crate::view::shell_dock::ShellDockMarker>,
+            Without<crate::cell::InputOverlayMarker>,
+        ),
+    >,
     mut clipboard: Option<ResMut<super::SystemClipboard>>,
     actor: Option<Res<crate::connection::RpcActor>>,
     mut doc_cache: ResMut<crate::cell::DocumentCache>,
     mut focus: ResMut<FocusArea>,
+    surface: Res<super::focus::ActiveSurface>,
 ) {
-    let Ok(mut overlay) = overlay.single_mut() else {
-        return;
+    let mut overlay = if surface.is_shell() {
+        match shell_overlay.single_mut() {
+            Ok(o) => o,
+            Err(_) => return,
+        }
+    } else {
+        match chat_overlay.single_mut() {
+            Ok(o) => o,
+            Err(_) => return,
+        }
     };
 
     let ctx_id = doc_cache.active_id();
+
+    let is_shell = surface.is_shell();
 
     // Handle text insertion
     for super::events::TextInputReceived(text) in text_events.read() {
         let pos_before = overlay.cursor;
         overlay.insert(text);
 
-        if let (Some(actor), Some(ctx)) = (&actor, ctx_id) {
-            let handle = actor.handle.clone();
-            let insert_text = text.clone();
-            let pos = pos_before as u64;
-            bevy::tasks::IoTaskPool::get()
-                .spawn(async move {
-                    if let Err(e) = handle.edit_input(ctx, pos, &insert_text, 0).await {
-                        log::warn!("edit_input (insert) failed: {e}");
-                    }
-                })
-                .detach();
+        // Only dual-write to CRDT for chat input. Shell input is local-only.
+        if !is_shell {
+            if let (Some(actor), Some(ctx)) = (&actor, ctx_id) {
+                let handle = actor.handle.clone();
+                let insert_text = text.clone();
+                let pos = pos_before as u64;
+                bevy::tasks::IoTaskPool::get()
+                    .spawn(async move {
+                        if let Err(e) = handle.edit_input(ctx, pos, &insert_text, 0).await {
+                            log::warn!("edit_input (insert) failed: {e}");
+                        }
+                    })
+                    .detach();
+            }
         }
     }
 
     // Handle editing actions
     for ActionFired(action) in actions.read() {
         match action {
-            Action::CycleModeRing => {
-                overlay.mode = overlay.mode.next();
-                info!("Input mode: {:?}", overlay.mode);
-            }
             Action::Submit => {
                 if !overlay.is_empty()
                     && let (Some(actor), Some(ctx)) = (&actor, ctx_id)
                 {
                     let handle = actor.handle.clone();
-                    let is_shell = overlay.is_shell();
-                    bevy::tasks::IoTaskPool::get()
-                        .spawn(async move {
-                            match handle.submit_input(ctx, is_shell).await {
-                                Ok(result) => {
-                                    log::info!("submit_input ok: {:?}", result.block_id)
-                                }
-                                Err(e) => log::error!("submit_input failed: {e}"),
-                            }
-                        })
-                        .detach();
-                    // Clear overlay optimistically. The server's InputCleared
-                    // confirms via re-fetch (see handle_input_doc_events).
-                    overlay.text.clear();
-                    overlay.cursor = 0;
-                    overlay.selection_anchor = None;
 
-                    // Suppress late TextOps until InputCleared re-fetch
-                    if let Some(cached) = doc_cache.get_mut(ctx) {
-                        cached.input_pending_clear = true;
+                    if is_shell {
+                        // Shell: call shell_execute directly with local text
+                        let code = overlay.text.clone();
+                        bevy::tasks::IoTaskPool::get()
+                            .spawn(async move {
+                                match handle.shell_execute(&code, ctx, true).await {
+                                    Ok(block_id) => {
+                                        log::info!("shell_execute ok: {:?}", block_id)
+                                    }
+                                    Err(e) => log::error!("shell_execute failed: {e}"),
+                                }
+                            })
+                            .detach();
+
+                        // Clear shell overlay locally (no CRDT involvement)
+                        overlay.text.clear();
+                        overlay.cursor = 0;
+                        overlay.selection_anchor = None;
+                    } else {
+                        // Chat: submit via CRDT → submit_input RPC
+                        bevy::tasks::IoTaskPool::get()
+                            .spawn(async move {
+                                match handle.submit_input(ctx, false).await {
+                                    Ok(result) => {
+                                        log::info!("submit_input ok: {:?}", result.block_id)
+                                    }
+                                    Err(e) => log::error!("submit_input failed: {e}"),
+                                }
+                            })
+                            .detach();
+
+                        // Clear overlay optimistically. The server's InputCleared
+                        // confirms via re-fetch (see handle_input_doc_events).
+                        overlay.text.clear();
+                        overlay.cursor = 0;
+                        overlay.selection_anchor = None;
+
+                        // Suppress late TextOps until InputCleared re-fetch
+                        if let Some(cached) = doc_cache.get_mut(ctx) {
+                            cached.input_pending_clear = true;
+                        }
                     }
 
                     // Dismiss overlay by transitioning focus
@@ -778,7 +955,7 @@ pub fn handle_compose_input(
                 let pos_before = overlay.cursor;
                 overlay.insert("\n");
 
-                if let (Some(actor), Some(ctx)) = (&actor, ctx_id) {
+                if !is_shell && let (Some(actor), Some(ctx)) = (&actor, ctx_id) {
                     let handle = actor.handle.clone();
                     let pos = pos_before as u64;
                     bevy::tasks::IoTaskPool::get()
@@ -808,7 +985,8 @@ pub fn handle_compose_input(
 
                 overlay.backspace();
 
-                if del_len > 0
+                if !is_shell
+                    && del_len > 0
                     && let (Some(actor), Some(ctx)) = (&actor, ctx_id)
                 {
                     let handle = actor.handle.clone();
@@ -841,7 +1019,8 @@ pub fn handle_compose_input(
 
                 overlay.delete();
 
-                if del_len > 0
+                if !is_shell
+                    && del_len > 0
                     && let (Some(actor), Some(ctx)) = (&actor, ctx_id)
                 {
                     let handle = actor.handle.clone();
@@ -880,17 +1059,21 @@ pub fn handle_compose_input(
                     } else {
                         overlay.delete_selection();
 
-                        if let (Some(actor), Some(ctx)) = (&actor, ctx_id) {
-                            let handle = actor.handle.clone();
-                            let pos = del_pos as u64;
-                            let delete = del_len as u64;
-                            bevy::tasks::IoTaskPool::get()
-                                .spawn(async move {
-                                    if let Err(e) = handle.edit_input(ctx, pos, "", delete).await {
-                                        log::warn!("edit_input (cut) failed: {e}");
-                                    }
-                                })
-                                .detach();
+                        if !is_shell {
+                            if let (Some(actor), Some(ctx)) = (&actor, ctx_id) {
+                                let handle = actor.handle.clone();
+                                let pos = del_pos as u64;
+                                let delete = del_len as u64;
+                                bevy::tasks::IoTaskPool::get()
+                                    .spawn(async move {
+                                        if let Err(e) =
+                                            handle.edit_input(ctx, pos, "", delete).await
+                                        {
+                                            log::warn!("edit_input (cut) failed: {e}");
+                                        }
+                                    })
+                                    .detach();
+                            }
                         }
                     }
                 }
@@ -909,20 +1092,24 @@ pub fn handle_compose_input(
 
                             overlay.insert(&text);
 
-                            if let (Some(actor), Some(ctx)) = (&actor, ctx_id) {
-                                let handle = actor.handle.clone();
-                                let pos = pos_before as u64;
-                                let delete = del_len as u64;
-                                let insert_text = text.clone();
-                                bevy::tasks::IoTaskPool::get()
-                                    .spawn(async move {
-                                        if let Err(e) =
-                                            handle.edit_input(ctx, pos, &insert_text, delete).await
-                                        {
-                                            log::warn!("edit_input (paste) failed: {e}");
-                                        }
-                                    })
-                                    .detach();
+                            if !is_shell {
+                                if let (Some(actor), Some(ctx)) = (&actor, ctx_id) {
+                                    let handle = actor.handle.clone();
+                                    let pos = pos_before as u64;
+                                    let delete = del_len as u64;
+                                    let insert_text = text.clone();
+                                    bevy::tasks::IoTaskPool::get()
+                                        .spawn(async move {
+                                            if let Err(e) =
+                                                handle
+                                                    .edit_input(ctx, pos, &insert_text, delete)
+                                                    .await
+                                            {
+                                                log::warn!("edit_input (paste) failed: {e}");
+                                            }
+                                        })
+                                        .detach();
+                                }
                             }
                         }
                         Err(e) => warn!("Paste failed: {e}"),

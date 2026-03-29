@@ -32,8 +32,6 @@ use modalkit::prelude::CommandType;
 pub enum KaijutsuAction {
     /// Submit the compose buffer (Enter in Normal mode).
     Submit,
-    /// Cycle the mode ring (chat ↔ shell).
-    CycleModeRing,
     /// Dismiss the compose overlay and return to conversation.
     DismissCompose,
 }

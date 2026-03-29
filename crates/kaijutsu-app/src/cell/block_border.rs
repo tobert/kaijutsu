@@ -240,7 +240,7 @@ fn compute_border_style(
         right: base,
     };
 
-    match block.kind {
+    let mut result = match block.kind {
         BlockKind::ToolCall => {
             let (animation, color) = match block.status {
                 Status::Running | Status::Pending => {
@@ -419,6 +419,21 @@ fn compute_border_style(
         }
         // File, Drift Push/Commit — no border
         _ => None,
+    };
+
+    // Post-process: dim excluded blocks and increase right padding for gutter indicator
+    if block.excluded {
+        if let Some(ref mut style) = result {
+            // Dim the border color to indicate exclusion
+            let dimmed = style.color.with_alpha(style.color.alpha() * 0.35);
+            style.color = dimmed;
+            // Add right padding for the gutter indicator area
+            style.padding.right = (style.padding.right).max(base * 2.0);
+            // Override animation — excluded blocks shouldn't animate
+            style.animation = BorderAnimation::None;
+        }
     }
+
+    result
 }
 

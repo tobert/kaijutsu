@@ -36,10 +36,11 @@ fn sync_block_fx(
             Option<&BlockBorderStyle>,
             Option<&BorderLabelMetrics>,
             Has<MsdfOverlayText>,
+            Has<crate::view::shell_dock::MsdfShellDockText>,
             Option<&OverlayCursorGeometry>,
             Option<&BlockScene>,
         ),
-        Or<(With<BlockCell>, With<MsdfOverlayText>)>,
+        Or<(With<BlockCell>, With<MsdfOverlayText>, With<crate::view::shell_dock::MsdfShellDockText>)>,
     >,
     mut fx_materials: ResMut<Assets<BlockFxMaterial>>,
     theme: Res<Theme>,
@@ -51,7 +52,8 @@ fn sync_block_fx(
 
     let show_cursor = matches!(*focus, FocusArea::Compose);
 
-    for (mat_node, border, label_metrics, is_overlay, cursor_geom, block_scene) in query.iter() {
+    for (mat_node, border, label_metrics, is_chat_overlay, is_shell_dock, cursor_geom, block_scene) in query.iter() {
+        let is_overlay = is_chat_overlay || is_shell_dock;
         let Some(mat) = fx_materials.get_mut(&mat_node.0) else {
             continue;
         };

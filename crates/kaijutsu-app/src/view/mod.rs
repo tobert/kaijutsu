@@ -19,6 +19,7 @@ pub mod format;
 pub mod lifecycle;
 pub mod overlay;
 pub mod render;
+pub mod shell_dock;
 pub mod scroll;
 pub mod submit;
 pub mod sync;

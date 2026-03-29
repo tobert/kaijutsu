@@ -366,6 +366,30 @@ impl KernelHandle {
         parse_block_id(&block_id)
     }
 
+    /// Toggle block exclusion from conversation hydration.
+    ///
+    /// Excluded blocks are displayed but omitted from LLM context.
+    #[tracing::instrument(skip(self), name = "rpc_client.set_block_excluded")]
+    pub async fn set_block_excluded(
+        &self,
+        context_id: ContextId,
+        block_id: &BlockId,
+        excluded: bool,
+    ) -> Result<u64, RpcError> {
+        let mut request = self.kernel.set_block_excluded_request();
+        request.get().set_context_id(context_id.as_bytes());
+        set_block_id_builder(&mut request.get().init_block_id(), block_id);
+        request.get().set_excluded(excluded);
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        let response = request.send().promise.await?;
+        Ok(response.get()?.get_new_version())
+    }
+
     /// Interrupt an execution
     #[tracing::instrument(skip(self), name = "rpc_client.interrupt")]
     pub async fn interrupt(&self, exec_id: u64) -> Result<(), RpcError> {

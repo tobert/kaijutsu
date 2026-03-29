@@ -768,7 +768,7 @@ pub fn resize_block_textures(
     mut block_query: Query<
         (&BlockScene, &mut BlockTexture, &MaterialNode<BlockFxMaterial>, &mut ImageNode),
         (
-            Or<(With<BlockCell>, With<crate::view::components::MsdfOverlayText>)>,
+            Or<(With<BlockCell>, With<crate::view::components::MsdfOverlayText>, With<crate::view::shell_dock::MsdfShellDockText>)>,
             Without<RoleGroupBorder>,
         ),
     >,

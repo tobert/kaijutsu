@@ -122,6 +122,12 @@ enum RpcCommand {
         user_initiated: bool,
         reply: oneshot::Sender<Result<BlockId, ActorError>>,
     },
+    SetBlockExcluded {
+        context_id: ContextId,
+        block_id: BlockId,
+        excluded: bool,
+        reply: oneshot::Sender<Result<u64, ActorError>>,
+    },
     Interrupt {
         exec_id: u64,
         reply: oneshot::Sender<Result<(), ActorError>>,
@@ -365,6 +371,9 @@ impl RpcCommand {
                 let _ = reply.send(Err(err));
             }
             Self::ShellExecute { reply, .. } => {
+                let _ = reply.send(Err(err));
+            }
+            Self::SetBlockExcluded { reply, .. } => {
                 let _ = reply.send(Err(err));
             }
             Self::Interrupt { reply, .. } => {
@@ -695,6 +704,24 @@ impl ActorHandle {
             code: code.into(),
             context_id,
             user_initiated,
+            reply,
+        })
+        .await
+    }
+
+    /// Toggle block exclusion from conversation hydration.
+    #[tracing::instrument(skip(self))]
+    pub async fn set_block_excluded(
+        &self,
+        context_id: ContextId,
+        block_id: &BlockId,
+        excluded: bool,
+    ) -> Result<u64, ActorError> {
+        let bid = *block_id;
+        self.send(|reply| RpcCommand::SetBlockExcluded {
+            context_id,
+            block_id: bid,
+            excluded,
             reply,
         })
         .await
@@ -1534,6 +1561,20 @@ async fn dispatch_command(
                 err_tx,
                 k,
                 k.shell_execute(&code, context_id, user_initiated)
+            );
+        }
+        RpcCommand::SetBlockExcluded {
+            context_id,
+            block_id,
+            excluded,
+            reply,
+        } => {
+            rpc_call!(
+                kernel,
+                reply,
+                err_tx,
+                k,
+                k.set_block_excluded(context_id, &block_id, excluded)
             );
         }
         RpcCommand::Interrupt { exec_id, reply } => {

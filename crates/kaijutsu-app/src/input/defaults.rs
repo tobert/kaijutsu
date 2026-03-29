@@ -151,6 +151,12 @@ pub fn default_bindings() -> Vec<Binding> {
         "Expand block",
     ));
     b.push(Binding::key(
+        KeyCode::KeyX,
+        InputContext::Navigation,
+        Action::ToggleBlockExcluded,
+        "Toggle block excluded",
+    ));
+    b.push(Binding::key(
         KeyCode::Tab,
         InputContext::Navigation,
         Action::CycleFocusForward,
@@ -178,11 +184,11 @@ pub fn default_bindings() -> Vec<Binding> {
         "Summon chat input",
     ));
     b.push(Binding::key_mod(
-        KeyCode::Semicolon,
-        Modifiers::SHIFT,
+        KeyCode::KeyZ,
+        Modifiers::CTRL,
         InputContext::Navigation,
-        Action::SummonShell,
-        "Summon shell input",
+        Action::ToggleSurface,
+        "Toggle shell/chat surface",
     ));
 
     // Activate (Enter on focused block → edit, or generic "do the thing")

@@ -5370,7 +5370,7 @@ impl kernel::Server for KernelImpl {
         let block_id = pry!(parse_block_id_from_reader(&block_id_reader));
         let excluded = p.get_excluded();
 
-        // Enforce: excluded toggling only allowed in Staging state
+        // Enforce: excluded toggling allowed in Live or Staging state
         {
             let drift = match self.kernel.kernel.drift().try_read() {
                 Ok(d) => d,
@@ -5379,10 +5379,11 @@ impl kernel::Server for KernelImpl {
                 }
             };
             match drift.context_state(context_id) {
-                Some(kaijutsu_types::ContextState::Staging) => {} // allowed
+                Some(kaijutsu_types::ContextState::Live)
+                | Some(kaijutsu_types::ContextState::Staging) => {} // allowed
                 Some(state) => {
                     return Promise::err(capnp::Error::failed(format!(
-                        "cannot toggle excluded in {state} state (only staging)"
+                        "cannot toggle excluded in {state} state (only live/staging)"
                     )));
                 }
                 None => {
@@ -6021,6 +6022,17 @@ async fn execute_shell_command(
     // Mark output block as Running — clients poll this to detect completion
     if let Err(e) = documents.set_status(context_id, &output_block_id, Status::Running) {
         log::warn!("Failed to set output block to Running: {}", e);
+    }
+
+    // User-initiated shell blocks are excluded from conversation by default.
+    // Users can toggle inclusion via the block gutter controls.
+    if user_initiated {
+        if let Err(e) = documents.set_excluded(context_id, &command_block_id, true) {
+            log::warn!("Failed to set shell command block excluded: {}", e);
+        }
+        if let Err(e) = documents.set_excluded(context_id, &output_block_id, true) {
+            log::warn!("Failed to set shell output block excluded: {}", e);
+        }
     }
 
     // Spawn execution in background

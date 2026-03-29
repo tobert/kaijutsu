@@ -101,3 +101,47 @@ impl FocusArea {
         }
     }
 }
+
+// ============================================================================
+// ACTIVE SURFACE — which input surface has focus within Compose
+// ============================================================================
+
+/// Which input surface is active when `FocusArea::Compose`.
+///
+/// Chat and Shell are spatially separated: Chat uses a floating overlay,
+/// Shell uses a bottom-dock input row. Ctrl+Z toggles between them.
+#[derive(Resource, Clone, Default, PartialEq, Debug, Reflect)]
+#[reflect(Resource)]
+pub enum ActiveSurface {
+    /// Floating compose overlay — input goes to AI conversation.
+    #[default]
+    Chat,
+    /// Bottom-dock shell input — input goes to kaish context shell.
+    Shell,
+}
+
+impl ActiveSurface {
+    /// Symmetric toggle between Chat and Shell.
+    pub fn toggle(&mut self) {
+        *self = match self {
+            Self::Chat => Self::Shell,
+            Self::Shell => Self::Chat,
+        };
+    }
+
+    pub fn is_shell(&self) -> bool {
+        matches!(self, Self::Shell)
+    }
+}
+
+/// System run condition: ActiveSurface is Shell.
+#[allow(dead_code)] // Used by Phase 2 shell dock systems
+pub fn on_shell_surface(surface: Res<ActiveSurface>) -> bool {
+    surface.is_shell()
+}
+
+/// System run condition: ActiveSurface is Chat.
+#[allow(dead_code)] // Used by Phase 2 shell dock systems
+pub fn on_chat_surface(surface: Res<ActiveSurface>) -> bool {
+    !surface.is_shell()
+}

@@ -52,7 +52,7 @@ pub use action::Action;
 pub use context::InputContext;
 #[allow(unused_imports)]
 pub use events::{ActionFired, TextInputReceived};
-pub use focus::FocusArea;
+pub use focus::{ActiveSurface, FocusArea};
 #[allow(unused_imports)]
 pub use map::InputMap;
 
@@ -108,6 +108,7 @@ impl Plugin for InputPlugin {
         // Register resources
         app.init_resource::<focus::FocusArea>()
             .init_resource::<focus::FocusStack>()
+            .init_resource::<focus::ActiveSurface>()
             .init_resource::<map::InputMap>()
             .init_resource::<context::ActiveInputContexts>()
             .init_resource::<events::AnalogInput>()
@@ -118,6 +119,7 @@ impl Plugin for InputPlugin {
         // Register types for BRP reflection
         app.register_type::<focus::FocusArea>()
             .register_type::<focus::FocusStack>()
+            .register_type::<focus::ActiveSurface>()
             .register_type::<map::InputMap>()
             .register_type::<context::ActiveInputContexts>()
             .register_type::<context::InputContext>()
@@ -165,6 +167,7 @@ impl Plugin for InputPlugin {
                 // Focus management (global)
                 systems::handle_focus_cycle,
                 systems::handle_focus_compose,
+                systems::handle_toggle_surface,
                 systems::handle_unfocus,
                 systems::handle_interrupt,
                 systems::handle_toggle_constellation,
@@ -178,6 +181,7 @@ impl Plugin for InputPlugin {
                 systems::handle_navigate_blocks.run_if(focus::in_conversation),
                 systems::handle_expand_block.run_if(focus::in_conversation),
                 systems::handle_collapse_toggle.run_if(focus::in_conversation),
+                systems::handle_toggle_block_excluded.run_if(focus::in_conversation),
                 // Constellation context (gated by Screen state, not FocusArea)
                 systems::handle_constellation_nav
                     .run_if(in_state(crate::ui::screen::Screen::Constellation)),

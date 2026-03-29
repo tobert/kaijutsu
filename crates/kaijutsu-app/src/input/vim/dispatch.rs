@@ -100,12 +100,15 @@ fn resolve_target_range(
 }
 
 /// Apply a text deletion to the overlay and fire the CRDT sync RPC.
+///
+/// `skip_crdt`: true for shell surface (local-only, no CRDT sync).
 fn apply_delete(
     overlay: &mut crate::cell::InputOverlay,
     start: usize,
     end: usize,
     actor: &Option<Res<crate::connection::RpcActor>>,
     doc_cache: &crate::cell::DocumentCache,
+    skip_crdt: bool,
 ) {
     let del_len = end - start;
     if del_len == 0 {
@@ -115,34 +118,35 @@ fn apply_delete(
     // Update local overlay
     overlay.text.drain(start..end);
     overlay.cursor = start.min(overlay.text.len());
-    // In Normal mode, cursor shouldn't be past last char
-    if !overlay.text.is_empty() && overlay.cursor >= overlay.text.len() {
-        overlay.cursor = textutil::prev_char_boundary(&overlay.text, overlay.text.len());
-    }
     overlay.selection_anchor = None;
 
-    // Fire CRDT sync
-    if let (Some(actor), Some(ctx_id)) = (actor, doc_cache.active_id()) {
-        let handle = actor.handle.clone();
-        let pos = start as u64;
-        let delete = del_len as u64;
-        bevy::tasks::IoTaskPool::get()
-            .spawn(async move {
-                if let Err(e) = handle.edit_input(ctx_id, pos, "", delete).await {
-                    log::warn!("edit_input (vim delete) failed: {e}");
-                }
-            })
-            .detach();
+    // Fire CRDT sync (chat only)
+    if !skip_crdt {
+        if let (Some(actor), Some(ctx_id)) = (actor, doc_cache.active_id()) {
+            let handle = actor.handle.clone();
+            let pos = start as u64;
+            let delete = del_len as u64;
+            bevy::tasks::IoTaskPool::get()
+                .spawn(async move {
+                    if let Err(e) = handle.edit_input(ctx_id, pos, "", delete).await {
+                        log::warn!("edit_input (vim delete) failed: {e}");
+                    }
+                })
+                .detach();
+        }
     }
 }
 
 /// Apply a text insertion to the overlay and fire the CRDT sync RPC.
+///
+/// `skip_crdt`: true for shell surface (local-only, no CRDT sync).
 fn apply_insert(
     overlay: &mut crate::cell::InputOverlay,
     pos: usize,
     text_to_insert: &str,
     actor: &Option<Res<crate::connection::RpcActor>>,
     doc_cache: &crate::cell::DocumentCache,
+    skip_crdt: bool,
 ) {
     if text_to_insert.is_empty() {
         return;
@@ -152,17 +156,32 @@ fn apply_insert(
     overlay.cursor = pos + text_to_insert.len();
     overlay.selection_anchor = None;
 
-    if let (Some(actor), Some(ctx_id)) = (actor, doc_cache.active_id()) {
-        let handle = actor.handle.clone();
-        let p = pos as u64;
-        let insert = text_to_insert.to_string();
-        bevy::tasks::IoTaskPool::get()
-            .spawn(async move {
-                if let Err(e) = handle.edit_input(ctx_id, p, &insert, 0).await {
-                    log::warn!("edit_input (vim insert) failed: {e}");
-                }
-            })
-            .detach();
+    if !skip_crdt {
+        if let (Some(actor), Some(ctx_id)) = (actor, doc_cache.active_id()) {
+            let handle = actor.handle.clone();
+            let p = pos as u64;
+            let insert = text_to_insert.to_string();
+            bevy::tasks::IoTaskPool::get()
+                .spawn(async move {
+                    if let Err(e) = handle.edit_input(ctx_id, p, &insert, 0).await {
+                        log::warn!("edit_input (vim insert) failed: {e}");
+                    }
+                })
+                .detach();
+        }
+    }
+}
+
+/// In Normal mode, cursor must be ON a character (0..text.len()), not past end.
+/// In Insert mode, cursor can be at text.len() (appending position).
+/// Call after any mutation to enforce the invariant based on current vim mode.
+fn clamp_normal_cursor(overlay: &mut crate::cell::InputOverlay) {
+    // vim_mode == None means Normal mode (show_mode() returns None for Normal)
+    if overlay.vim_mode.is_none()
+        && !overlay.text.is_empty()
+        && overlay.cursor >= overlay.text.len()
+    {
+        overlay.cursor = textutil::prev_char_boundary(&overlay.text, overlay.text.len());
     }
 }
 
@@ -170,19 +189,40 @@ fn apply_insert(
 /// when the compose overlay is focused.
 ///
 /// Run condition: `in_compose()` — only active when FocusArea::Compose.
+/// Routes keyboard to the correct overlay (chat or shell) based on ActiveSurface.
 pub fn vim_dispatch_compose(
     mut keyboard: MessageReader<KeyboardInput>,
     keys: Res<ButtonInput<KeyCode>>,
     mut vim: ResMut<VimMachineResource>,
     mut motion_state: ResMut<VimMotionState>,
-    mut overlay: Query<&mut crate::cell::InputOverlay>,
+    mut chat_overlay: Query<
+        &mut crate::cell::InputOverlay,
+        With<crate::cell::InputOverlayMarker>,
+    >,
+    mut shell_overlay: Query<
+        &mut crate::cell::InputOverlay,
+        (
+            With<crate::view::shell_dock::ShellDockMarker>,
+            Without<crate::cell::InputOverlayMarker>,
+        ),
+    >,
+    surface: Res<crate::input::focus::ActiveSurface>,
     actor: Option<Res<crate::connection::RpcActor>>,
     doc_cache: Res<crate::cell::DocumentCache>,
     mut action_writer: MessageWriter<ActionFired>,
     mut text_writer: MessageWriter<TextInputReceived>,
 ) {
-    let Ok(mut overlay) = overlay.single_mut() else {
-        return;
+    // Select the active overlay based on ActiveSurface
+    let mut overlay = if surface.is_shell() {
+        match shell_overlay.single_mut() {
+            Ok(o) => o,
+            Err(_) => return,
+        }
+    } else {
+        match chat_overlay.single_mut() {
+            Ok(o) => o,
+            Err(_) => return,
+        }
     };
 
     for event in keyboard.read() {
@@ -190,12 +230,18 @@ pub fn vim_dispatch_compose(
             continue;
         }
 
+        let ctrl = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
+
         // Ctrl+C bypasses VimMachine — interrupt must always work
         // regardless of vim state (operator-pending, visual, etc.).
-        if (keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight))
-            && event.key_code == KeyCode::KeyC
-        {
+        if ctrl && event.key_code == KeyCode::KeyC {
             action_writer.write(ActionFired(Action::InterruptContext { immediate: false }));
+            continue;
+        }
+
+        // Ctrl+Z bypasses VimMachine — toggle between chat and shell surface.
+        if ctrl && event.key_code == KeyCode::KeyZ {
+            action_writer.write(ActionFired(Action::ToggleSurface));
             continue;
         }
 
@@ -227,8 +273,12 @@ pub fn vim_dispatch_compose(
                 &doc_cache,
                 &mut action_writer,
                 &mut text_writer,
+                surface.is_shell(),
             );
         }
+
+        // Enforce cursor invariant after all mutations for this keystroke.
+        clamp_normal_cursor(&mut overlay);
     }
 }
 
@@ -242,6 +292,7 @@ fn translate_action(
     doc_cache: &crate::cell::DocumentCache,
     action_writer: &mut MessageWriter<ActionFired>,
     text_writer: &mut MessageWriter<TextInputReceived>,
+    skip_crdt: bool,
 ) {
     match action {
         // --- Insert mode: character typing ---
@@ -288,7 +339,7 @@ fn translate_action(
                 } else {
                     format!("{}\n", paste_text)
                 };
-                apply_insert(overlay, pos, &text, actor, doc_cache);
+                apply_insert(overlay, pos, &text, actor, doc_cache, skip_crdt);
             } else {
                 // Charwise paste: insert after cursor (p) or at cursor (P)
                 use editor_types::prelude::PasteStyle;
@@ -302,7 +353,7 @@ fn translate_action(
                     }
                     _ => overlay.cursor,
                 };
-                apply_insert(overlay, pos, &paste_text, actor, doc_cache);
+                apply_insert(overlay, pos, &paste_text, actor, doc_cache, skip_crdt);
             }
         }
 
@@ -338,7 +389,7 @@ fn translate_action(
                         // Yank deleted text to unnamed register
                         motion_state.register = overlay.text[start..end].to_string();
                         motion_state.register_linewise = linewise;
-                        apply_delete(overlay, start, end, actor, doc_cache);
+                        apply_delete(overlay, start, end, actor, doc_cache, skip_crdt);
                     }
                 }
 
@@ -374,9 +425,6 @@ fn translate_action(
             KaijutsuAction::Submit => {
                 action_writer.write(ActionFired(Action::Submit));
             }
-            KaijutsuAction::CycleModeRing => {
-                action_writer.write(ActionFired(Action::CycleModeRing));
-            }
             KaijutsuAction::DismissCompose => {
                 action_writer.write(ActionFired(Action::Unfocus));
             }
@@ -394,5 +442,146 @@ fn translate_action(
         _ => {
             log::trace!("vim: unhandled action: {:?}", action);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use editor_types::context::EditContextBuilder;
+    use editor_types::prelude::{Count, MoveDir1D, MoveType, RangeType};
+
+    fn ctx() -> EditContext {
+        EditContextBuilder::default().build()
+    }
+
+    fn state() -> VimMotionState {
+        VimMotionState::default()
+    }
+
+    // ── Motion targets ──
+    //
+    // BUG: resolve_target_range always extends end via next_char_boundary,
+    // treating all motions as inclusive. Vim's w/b/h/l are exclusive — dw
+    // should delete [cursor, target), not [cursor, target]. This causes
+    // dw/dh to delete one char too many. Needs exclusive/inclusive info
+    // from EditContext.target_shape or the motion type.
+
+    #[test]
+    fn motion_forward_word() {
+        let text = "hello world";
+        let (start, end, linewise) =
+            resolve_target_range(text, 0, &EditTarget::Motion(
+                MoveType::WordBegin(editor_types::prelude::WordStyle::Little, MoveDir1D::Next),
+                Count::Contextual,
+            ), &ctx(), &state()).unwrap();
+        assert_eq!(start, 0);
+        // Motion lands at 6 ('w'), next_char_boundary → 7. Inclusive bug:
+        // vim's dw (exclusive) should give end=6, deleting "hello ".
+        assert_eq!(end, 7);
+        assert!(!linewise);
+    }
+
+    #[test]
+    fn motion_backward_char() {
+        let text = "hello";
+        let (start, end, linewise) =
+            resolve_target_range(text, 3, &EditTarget::Motion(
+                MoveType::Column(MoveDir1D::Previous, false),
+                Count::Contextual,
+            ), &ctx(), &state()).unwrap();
+        // h: target=2, cursor=3 → (start=2, end=3), extended to 4.
+        // Same inclusive bug: dh should delete [2,3) = 1 char.
+        assert_eq!(start, 2);
+        assert_eq!(end, 4);
+        assert!(!linewise);
+    }
+
+    // ── Line range (dd) ──
+
+    #[test]
+    fn dd_first_line() {
+        let text = "hello\nworld\nfoo";
+        let (start, end, linewise) =
+            resolve_target_range(text, 2, &EditTarget::Range(
+                RangeType::Line, true, Count::Contextual,
+            ), &ctx(), &state()).unwrap();
+        assert_eq!(start, 0);
+        assert_eq!(end, 6); // includes the \n
+        assert!(linewise);
+    }
+
+    #[test]
+    fn dd_middle_line() {
+        let text = "hello\nworld\nfoo";
+        let (start, end, linewise) =
+            resolve_target_range(text, 8, &EditTarget::Range(
+                RangeType::Line, true, Count::Contextual,
+            ), &ctx(), &state()).unwrap();
+        assert_eq!(start, 6);
+        assert_eq!(end, 12); // includes the \n after "world"
+        assert!(linewise);
+    }
+
+    #[test]
+    fn dd_last_line_no_trailing_newline() {
+        let text = "hello\nworld";
+        let (start, end, linewise) =
+            resolve_target_range(text, 8, &EditTarget::Range(
+                RangeType::Line, true, Count::Contextual,
+            ), &ctx(), &state()).unwrap();
+        // Last line with no trailing \n — eats preceding \n
+        assert_eq!(start, 5); // the \n before "world"
+        assert_eq!(end, 11); // end of text
+        assert!(linewise);
+    }
+
+    #[test]
+    fn dd_single_line_no_newline() {
+        let text = "hello";
+        let (start, end, linewise) =
+            resolve_target_range(text, 2, &EditTarget::Range(
+                RangeType::Line, true, Count::Contextual,
+            ), &ctx(), &state()).unwrap();
+        // Only line, no newlines at all
+        assert_eq!(start, 0);
+        assert_eq!(end, 5);
+        assert!(linewise);
+    }
+
+    // ── CurrentPosition (x) ──
+
+    #[test]
+    fn x_mid_text() {
+        let text = "hello";
+        let (start, end, linewise) =
+            resolve_target_range(text, 2, &EditTarget::CurrentPosition, &ctx(), &state()).unwrap();
+        assert_eq!(start, 2);
+        assert_eq!(end, 3); // one char
+        assert!(!linewise);
+    }
+
+    #[test]
+    fn x_at_end() {
+        let text = "hello";
+        // cursor past end — x does nothing
+        let result = resolve_target_range(text, 5, &EditTarget::CurrentPosition, &ctx(), &state());
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn x_utf8() {
+        let text = "café"; // é is 2 bytes (bytes 3-4)
+        let (start, end, linewise) =
+            resolve_target_range(text, 3, &EditTarget::CurrentPosition, &ctx(), &state()).unwrap();
+        assert_eq!(start, 3);
+        assert_eq!(end, 5); // é is 2 bytes
+        assert!(!linewise);
+    }
+
+    #[test]
+    fn x_empty_text() {
+        let result = resolve_target_range("", 0, &EditTarget::CurrentPosition, &ctx(), &state());
+        assert!(result.is_none());
     }
 }

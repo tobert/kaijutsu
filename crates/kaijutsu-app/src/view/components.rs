@@ -469,15 +469,14 @@ impl InputOverlay {
         prefix.len() + 3 + self.cursor
     }
 
-    /// Build the prefix string: vim mode + chat/shell indicator.
+    /// Build the prefix string: vim mode only.
+    ///
+    /// Chat/shell distinction is spatial (floating overlay vs bottom dock),
+    /// so no mode label needed.
     fn display_prefix(&self) -> String {
-        let mode_ring = match self.mode {
-            InputMode::Chat => "[chat] shell",
-            InputMode::Shell => "chat [shell]",
-        };
         match &self.vim_mode {
-            Some(vim) => format!("{} {}", vim, mode_ring),
-            None => format!("NORMAL {}", mode_ring),
+            Some(vim) => vim.clone(),
+            None => "NORMAL".to_string(),
         }
     }
 }
