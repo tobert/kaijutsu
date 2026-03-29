@@ -249,13 +249,9 @@ pub fn vim_dispatch_compose(
             continue;
         };
 
-        // Filter key repeats for non-insert modes to prevent accidental
-        // double-fires (same rationale as the flat dispatch system).
-        // In insert mode, key repeat is fine (holding backspace, typing).
-        if event.repeat && vim.machine.show_mode().is_none() {
-            // show_mode() returns None in Normal mode
-            continue;
-        }
+        // Allow key repeats in all vim modes — holding h/j/k/l to scrub
+        // is fundamental to vim muscle memory, and modalkit handles repeat
+        // semantics (operator-pending won't re-fire on repeat).
 
         vim.machine.input_key(tkey);
 

@@ -501,6 +501,9 @@ pub struct OverlayCursorGeometry {
     pub y: f64,
     /// Cursor beam height in pixels.
     pub height: f64,
+    /// Last cursor byte offset used for geometry — lets the glyph system
+    /// detect cursor-only changes without re-running Parley layout.
+    pub last_cursor_offset: usize,
 }
 
 /// Marker for the main conversation view cell.

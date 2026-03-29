@@ -272,8 +272,9 @@ pub fn build_shell_dock_glyphs(
 
             let width_changed = (block_scene.built_width - width).abs() > 1.0;
             let text_changed = block_scene.text != display;
+            let cursor_changed = cursor_geom.last_cursor_offset != cursor_byte_offset;
 
-            if !text_changed && !width_changed {
+            if !text_changed && !width_changed && !cursor_changed {
                 continue;
             }
 
@@ -315,33 +316,36 @@ pub fn build_shell_dock_glyphs(
 
             let text_offset = (pad.left as f64, pad.top as f64);
 
-            if let Some(ref mut atlas) = atlas {
-                for line in layout.lines() {
-                    for item in line.items() {
-                        if let bevy_vello::parley::PositionedLayoutItem::GlyphRun(gr) = item {
-                            font_data_map.register(gr.run().font());
+            // Only rebuild glyphs when text or width changed (not cursor-only)
+            if text_changed || width_changed {
+                if let Some(ref mut atlas) = atlas {
+                    for line in layout.lines() {
+                        for item in line.items() {
+                            if let bevy_vello::parley::PositionedLayoutItem::GlyphRun(gr) = item {
+                                font_data_map.register(gr.run().font());
+                            }
                         }
                     }
+                    let glyphs =
+                        collect_msdf_glyphs(&layout, &[], &style.brush, text_offset, atlas);
+                    msdf_glyphs.glyphs = glyphs;
+                    msdf_glyphs.version = msdf_glyphs.version.wrapping_add(1);
+                    msdf_glyphs.rainbow = false;
                 }
-                let glyphs =
-                    collect_msdf_glyphs(&layout, &[], &style.brush, text_offset, atlas);
-                msdf_glyphs.glyphs = glyphs;
-                msdf_glyphs.version = msdf_glyphs.version.wrapping_add(1);
-                msdf_glyphs.rainbow = false;
+
+                let total_height = content_height + pad.top + pad.bottom;
+                block_scene.built_width = width;
+                block_scene.built_height = total_height;
+                block_scene.text = display;
+                block_scene.color = text_color;
+                block_scene.content_version = block_scene.content_version.wrapping_add(1);
+                block_scene.last_built_version = block_scene.content_version;
+                block_scene.scene_version = block_scene.scene_version.wrapping_add(1);
+
+                node.height = Val::Px(total_height);
             }
 
-            let total_height = content_height + pad.top + pad.bottom;
-            block_scene.built_width = width;
-            block_scene.built_height = total_height;
-            block_scene.text = display;
-            block_scene.color = text_color;
-            block_scene.content_version = block_scene.content_version.wrapping_add(1);
-            block_scene.last_built_version = block_scene.content_version;
-            block_scene.scene_version = block_scene.scene_version.wrapping_add(1);
-
-            node.height = Val::Px(total_height);
-
-            // Cursor geometry
+            // Always recompute cursor geometry when anything changed
             let cursor = bevy_vello::parley::editing::Cursor::from_byte_index(
                 &layout,
                 cursor_byte_offset,
@@ -351,6 +355,7 @@ pub fn build_shell_dock_glyphs(
             cursor_geom.x = text_offset.0 + geom.x0;
             cursor_geom.y = text_offset.1 + geom.y0;
             cursor_geom.height = geom.y1 - geom.y0;
+            cursor_geom.last_cursor_offset = cursor_byte_offset;
         }
     }
 }
