@@ -137,17 +137,21 @@ pub enum RpcResultMessage {
 // ============================================================================
 
 /// Replaces `ConnectionBridgePlugin` with ActorHandle-based architecture.
-pub struct ActorPlugin;
+pub struct ActorPlugin {
+    pub ssh_config: SshConfig,
+}
 
 impl Plugin for ActorPlugin {
     fn build(&self, app: &mut App) {
         // Spawn the bootstrap thread
         let bootstrap_channel = bootstrap::spawn_bootstrap_thread();
 
+        let ssh_config = self.ssh_config.clone();
+
         // Initial connection — no context joined. Constellation populates from
         // list_contexts(); user picks or creates a context explicitly.
         let _ = bootstrap_channel.tx.send(BootstrapCommand::SpawnActor {
-            config: SshConfig::default(),
+            config: ssh_config.clone(),
             kernel_id: KernelId::nil(),
             context_id: None,
             instance: "bevy-client".to_string(),
@@ -156,7 +160,10 @@ impl Plugin for ActorPlugin {
         // Register resources
         app.insert_resource(bootstrap_channel)
             .insert_resource(RpcResultChannel::new())
-            .init_resource::<RpcConnectionState>()
+            .insert_resource(RpcConnectionState {
+                ssh_config,
+                ..Default::default()
+            })
             .init_resource::<SyncGeneration>();
 
         // Register messages

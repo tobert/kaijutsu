@@ -49,6 +49,7 @@ modalkit.workspace = true
 editor-types.workspace = true
 crossterm.workspace = true
 
+clap.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 futures.workspace = true

@@ -16,7 +16,26 @@
 use bevy::picking::mesh_picking::{MeshPickingPlugin, MeshPickingSettings};
 use bevy::prelude::*;
 use bevy_brp_extras::BrpExtrasPlugin;
+use clap::Parser;
+use kaijutsu_client::SshConfig;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
+
+/// 会術 Kaijutsu — collaborative workspace
+#[derive(Parser, Debug)]
+#[command(name = "kaijutsu", version)]
+struct Cli {
+    /// Server host to connect to
+    #[arg(long, default_value = kaijutsu_client::constants::DEFAULT_SSH_HOST)]
+    host: String,
+
+    /// Server SSH port
+    #[arg(long, default_value_t = kaijutsu_client::constants::DEFAULT_SSH_PORT)]
+    port: u16,
+
+    /// Skip SSH known_hosts verification (TOFU)
+    #[arg(long)]
+    insecure: bool,
+}
 
 mod agents;
 mod cell;
@@ -35,6 +54,15 @@ mod view;
 pub use kaijutsu_client::kaijutsu_capnp;
 
 fn main() {
+    let cli = Cli::parse();
+
+    let ssh_config = SshConfig {
+        host: cli.host,
+        port: cli.port,
+        insecure: cli.insecure,
+        ..SshConfig::default()
+    };
+
     // Set up file logging
     let log_dir = std::env::var("KAIJUTSU_LOG_DIR").unwrap_or_else(|_| "/tmp".to_string());
     let file_appender = tracing_appender::rolling::never(&log_dir, "kaijutsu-app.log");
@@ -109,7 +137,7 @@ fn main() {
         // Shader effects
         .add_plugins(shaders::ShaderFxPlugin)
         // Connection plugin (spawns background thread)
-        .add_plugins(connection::ActorPlugin)
+        .add_plugins(connection::ActorPlugin { ssh_config })
         // App screen state management
         .add_plugins(ui::state::AppScreenPlugin)
         // Screen state machine (Constellation/Conversation/ForkForm transitions)
@@ -118,6 +146,8 @@ fn main() {
         .add_plugins(commands::CommandsPlugin)
         // Constellation - context navigation as visual node graph
         .add_plugins(ui::constellation::ConstellationPlugin)
+        // Conversation Stack — 3D cascading card view
+        .add_plugins(ui::card_stack::CardStackPlugin)
         // Tiling WM — layout tree, reconciler, and widget update systems
         .add_plugins(ui::tiling::TilingPlugin)
         .add_plugins(ui::tiling_reconciler::TilingReconcilerPlugin)

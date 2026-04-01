@@ -54,6 +54,9 @@ futures = "0.3"
 # SSH
 russh = "0.56"
 
+# CLI
+clap = { version = "4", features = ["derive"] }
+
 # Utilities
 log = "0.4"
 env_logger = "0.11"

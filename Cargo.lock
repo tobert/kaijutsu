@@ -5636,6 +5636,7 @@ dependencies = [
  "bytemuck",
  "capnp",
  "capnp-rpc",
+ "clap",
  "crossbeam-channel",
  "crossterm",
  "dirs 5.0.1",
