@@ -1,9 +1,7 @@
 # 会術 Kaijutsu
 
-*"The Art of Meeting"*
-
-Kaijutsu is an agent system with a graphical UI that manages contexts in a directed
-acyclic graph (DAG). The DAG supports `fork` and `drift` operations that simplify
+Kaijutsu is an cybernetic AI agent system with a graphical UI that manages contexts in a
+directed acyclic graph (DAG). The DAG supports `fork` and `drift` operations that simplify
 breaking down work as a context develops, and then merging the results, while keeping
 provenance intact.
 
