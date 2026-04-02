@@ -6,12 +6,12 @@
 //! - LOD degradation (blur → abstract → outline as distance increases)
 
 use bevy::prelude::*;
-use bevy::render::render_resource::{AsBindGroup, ShaderType};
+use bevy::render::render_resource::AsBindGroup;
 use bevy::shader::ShaderRef;
 
 /// Packed uniform data for the card shader.
 /// All parameters in a single struct at binding 2.
-#[derive(Clone, Copy, Debug, Default, bevy::render::render_resource::ShaderType)]
+#[derive(Clone, Copy, Debug, Default, bevy::render::render_resource::ShaderType, Reflect)]
 pub struct StackCardUniforms {
     pub card_params: Vec4,
     pub glow_color: Vec4,

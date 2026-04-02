@@ -20,6 +20,7 @@ pub mod sync;
 
 use bevy::prelude::*;
 
+use crate::ui::card_stack::material::StackCardMaterial;
 use crate::ui::screen::Screen;
 
 pub use camera::StackCameraTag;
@@ -35,6 +36,9 @@ impl Plugin for CardStackPlugin {
         app.init_resource::<CardStackState>()
             .init_resource::<CardStackLayout>();
 
+        // Material registration
+        app.add_plugins(MaterialPlugin::<StackCardMaterial>::default());
+
         // Type registration for BRP inspection
         app.register_type::<CardStackState>()
             .register_type::<CardStackLayout>()
@@ -48,6 +52,11 @@ impl Plugin for CardStackPlugin {
             (
                 camera::spawn_stack_camera,
                 sync::sync_stack_cards,
+                |mut state: ResMut<CardStackState>| {
+                    // Sync current_focus to avoid starting from index 0 on enter
+                    state.current_focus = state.focused_index as f32;
+                    state.last_focus = state.current_focus;
+                },
             )
                 .chain(),
         );
@@ -64,6 +73,7 @@ impl Plugin for CardStackPlugin {
             Update,
             (
                 sync::sync_stack_cards,
+                layout::interpolate_stack_focus,
                 layout::compute_card_layout,
             )
                 .chain()

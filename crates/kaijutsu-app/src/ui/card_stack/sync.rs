@@ -12,6 +12,7 @@ use kaijutsu_crdt::Role;
 use crate::cell::{BlockCell, BlockCellContainer, BlockId, CellEditor, MainCell};
 use crate::view::block_render::{BlockScene, BlockTexture};
 use crate::ui::card_stack::layout::{CardLod, CardStackState};
+use crate::ui::card_stack::material::{StackCardMaterial, StackCardUniforms};
 
 /// Marker on a card parent entity (one per role-group).
 #[derive(Component, Reflect, Debug)]
@@ -70,7 +71,7 @@ pub fn sync_stack_cards(
     existing_cards: Query<(Entity, &StackCard)>,
     root_q: Query<Entity, With<CardStackRoot>>,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut materials: ResMut<Assets<StackCardMaterial>>,
     mut stack_state: ResMut<CardStackState>,
 ) {
     let Ok(editor) = editor_q.single() else {
@@ -130,35 +131,25 @@ pub fn sync_stack_cards(
 
         // Spawn a child quad for each block
         for (block_idx, block_id) in group.block_ids.iter().enumerate() {
-            let texture_handle = container
+            let texture_data = container
                 .and_then(|c| c.get_entity(block_id))
-                .and_then(|ent| block_q.get(ent).ok())
-                .map(|(_, tex, _)| tex.image.clone());
-
-            let (built_w, built_h) = container
-                .and_then(|c| c.get_entity(block_id))
-                .and_then(|ent| block_q.get(ent).ok())
-                .map(|(_, _, scene)| (scene.built_width, scene.built_height))
-                .unwrap_or((400.0, 40.0));
-
-            // StandardMaterial with the block texture or a fallback color
-            let mat = if let Some(tex) = texture_handle {
-                materials.add(StandardMaterial {
-                    base_color_texture: Some(tex),
-                    base_color: Color::WHITE,
-                    unlit: true, // block textures are pre-lit
-                    alpha_mode: AlphaMode::Blend,
-                    ..default()
-                })
-            } else {
-                // Fallback: solid role-colored card
-                materials.add(StandardMaterial {
-                    base_color: glow_color,
-                    unlit: true,
-                    alpha_mode: AlphaMode::Blend,
-                    ..default()
-                })
+                .and_then(|ent| block_q.get(ent).ok());
+            
+            let Some((_, tex, scene)) = texture_data else {
+                continue; // Skip blocks without textures (they might be still rendering)
             };
+
+            let texture_handle = tex.image.clone();
+            let (built_w, built_h) = (scene.built_width, scene.built_height);
+
+            let mat = materials.add(StackCardMaterial {
+                texture: texture_handle,
+                uniforms: StackCardUniforms {
+                    card_params: Vec4::new(1.0, 0.0, 0.0, 0.0),
+                    glow_color: glow_color.to_linear().to_vec4(),
+                    glow_params: Vec4::new(0.5, 0.0, 0.0, 0.0), // 0.5 glow intensity
+                },
+            });
 
             let aspect = if built_w > 0.0 { built_h / built_w } else { 0.1 };
             let quad_width = 1.0;
