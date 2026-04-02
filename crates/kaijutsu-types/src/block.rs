@@ -1406,6 +1406,7 @@ pub enum BlockFlowKind {
     Deleted,
     StatusChanged,
     CollapsedChanged,
+    ExcludedChanged,
     Moved,
     SyncReset,
     OutputChanged,

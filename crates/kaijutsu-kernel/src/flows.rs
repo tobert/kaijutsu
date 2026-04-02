@@ -179,6 +179,7 @@ impl FlowTopics for BlockFlow {
         "block.deleted",
         "block.status",
         "block.collapsed",
+        "block.excluded",
         "block.moved",
         "block.sync_reset",
         "block.output",
@@ -316,6 +317,19 @@ pub enum BlockFlow {
         source: OpSource,
     },
 
+    /// Block excluded state changed (for fork curation).
+    ExcludedChanged {
+        /// The context ID.
+        context_id: ContextId,
+        /// The block whose excluded state changed.
+        block_id: BlockId,
+        /// New excluded state.
+        excluded: bool,
+        /// Origin of this operation (Local or Remote).
+        #[serde(default)]
+        source: OpSource,
+    },
+
     /// Block was moved to a new position.
     Moved {
         /// The context ID.
@@ -377,6 +391,7 @@ impl BlockFlow {
             Self::Deleted { .. } => "block.deleted",
             Self::StatusChanged { .. } => "block.status",
             Self::CollapsedChanged { .. } => "block.collapsed",
+            Self::ExcludedChanged { .. } => "block.excluded",
             Self::Moved { .. } => "block.moved",
             Self::SyncReset { .. } => "block.sync_reset",
             Self::OutputChanged { .. } => "block.output",
@@ -393,6 +408,7 @@ impl BlockFlow {
             | Self::Deleted { context_id, .. }
             | Self::StatusChanged { context_id, .. }
             | Self::CollapsedChanged { context_id, .. }
+            | Self::ExcludedChanged { context_id, .. }
             | Self::Moved { context_id, .. }
             | Self::SyncReset { context_id, .. }
             | Self::OutputChanged { context_id, .. }
@@ -409,6 +425,7 @@ impl BlockFlow {
             | Self::Deleted { block_id, .. }
             | Self::StatusChanged { block_id, .. }
             | Self::CollapsedChanged { block_id, .. }
+            | Self::ExcludedChanged { block_id, .. }
             | Self::Moved { block_id, .. }
             | Self::OutputChanged { block_id, .. }
             | Self::MetadataChanged { block_id, .. } => Some(block_id),
@@ -432,6 +449,7 @@ impl BlockFlow {
             | Self::Deleted { source, .. }
             | Self::StatusChanged { source, .. }
             | Self::CollapsedChanged { source, .. }
+            | Self::ExcludedChanged { source, .. }
             | Self::Moved { source, .. }
             | Self::OutputChanged { source, .. }
             | Self::MetadataChanged { source, .. } => *source,
@@ -457,6 +475,7 @@ impl BlockFlow {
             Self::Deleted { .. } => BlockFlowKind::Deleted,
             Self::StatusChanged { .. } => BlockFlowKind::StatusChanged,
             Self::CollapsedChanged { .. } => BlockFlowKind::CollapsedChanged,
+            Self::ExcludedChanged { .. } => BlockFlowKind::ExcludedChanged,
             Self::Moved { .. } => BlockFlowKind::Moved,
             Self::SyncReset { .. } => BlockFlowKind::SyncReset,
             Self::OutputChanged { .. } => BlockFlowKind::OutputChanged,

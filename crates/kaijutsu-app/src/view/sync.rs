@@ -172,6 +172,7 @@ pub fn handle_block_events(
             | ServerEvent::BlockStatusChanged { context_id, .. }
             | ServerEvent::BlockDeleted { context_id, .. }
             | ServerEvent::BlockCollapsedChanged { context_id, .. }
+            | ServerEvent::BlockExcludedChanged { context_id, .. }
             | ServerEvent::BlockMoved { context_id, .. }
             | ServerEvent::SyncReset { context_id, .. } => Some(*context_id),
             _ => None,

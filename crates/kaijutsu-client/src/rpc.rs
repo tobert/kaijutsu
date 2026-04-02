@@ -1749,6 +1749,9 @@ fn set_block_event_filter_builder(
                     kaijutsu_types::BlockFlowKind::CollapsedChanged => {
                         crate::kaijutsu_capnp::BlockFlowKind::CollapsedChanged
                     }
+                    kaijutsu_types::BlockFlowKind::ExcludedChanged => {
+                        crate::kaijutsu_capnp::BlockFlowKind::ExcludedChanged
+                    }
                     kaijutsu_types::BlockFlowKind::Moved => {
                         crate::kaijutsu_capnp::BlockFlowKind::Moved
                     }

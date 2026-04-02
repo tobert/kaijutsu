@@ -617,6 +617,19 @@ impl SyncManager {
         Ok(())
     }
 
+    /// Set excluded state of a block.
+    pub fn apply_excluded_change(
+        &mut self,
+        doc: &mut CrdtBlockStore,
+        block_id: &BlockId,
+        excluded: bool,
+    ) -> Result<(), SyncError> {
+        doc.set_excluded(block_id, excluded)
+            .map_err(|e| SyncError::Merge(e.to_string()))?;
+        self.version = self.version.wrapping_add(1);
+        Ok(())
+    }
+
     /// Move a block to a new position (after `after_id`, or to front if None).
     pub fn apply_move(
         &mut self,

@@ -1927,6 +1927,16 @@ impl kernel::Server for KernelImpl {
                                     }
                                     req.send().promise.await.is_ok()
                                 }
+                                BlockFlow::ExcludedChanged { context_id, ref block_id, excluded, .. } => {
+                                    let mut req = callback.on_block_excluded_changed_request();
+                                    {
+                                        let mut params = req.get();
+                                        params.set_context_id(context_id.as_bytes());
+                                        set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
+                                        params.set_excluded(excluded);
+                                    }
+                                    req.send().promise.await.is_ok()
+                                }
                                 BlockFlow::Moved { context_id, ref block_id, ref after_id, .. } => {
                                     let mut req = callback.on_block_moved_request();
                                     {
@@ -5011,6 +5021,7 @@ impl kernel::Server for KernelImpl {
                     kaijutsu_types::BlockFlowKind::Deleted => "block.deleted",
                     kaijutsu_types::BlockFlowKind::StatusChanged => "block.status",
                     kaijutsu_types::BlockFlowKind::CollapsedChanged => "block.collapsed",
+                    kaijutsu_types::BlockFlowKind::ExcludedChanged => "block.excluded",
                     kaijutsu_types::BlockFlowKind::Moved => "block.moved",
                     kaijutsu_types::BlockFlowKind::SyncReset => "block.sync_reset",
                     kaijutsu_types::BlockFlowKind::OutputChanged => "block.output",
@@ -5093,6 +5104,16 @@ impl kernel::Server for KernelImpl {
                                         params.set_context_id(context_id.as_bytes());
                                         set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
                                         params.set_collapsed(collapsed);
+                                    }
+                                    req.send().promise.await.is_ok()
+                                }
+                                BlockFlow::ExcludedChanged { context_id, ref block_id, excluded, .. } => {
+                                    let mut req = callback.on_block_excluded_changed_request();
+                                    {
+                                        let mut params = req.get();
+                                        params.set_context_id(context_id.as_bytes());
+                                        set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
+                                        params.set_excluded(excluded);
                                     }
                                     req.send().promise.await.is_ok()
                                 }
@@ -7159,6 +7180,9 @@ fn parse_block_event_filter(
                             }
                             crate::kaijutsu_capnp::BlockFlowKind::CollapsedChanged => {
                                 kaijutsu_types::BlockFlowKind::CollapsedChanged
+                            }
+                            crate::kaijutsu_capnp::BlockFlowKind::ExcludedChanged => {
+                                kaijutsu_types::BlockFlowKind::ExcludedChanged
                             }
                             crate::kaijutsu_capnp::BlockFlowKind::Moved => {
                                 kaijutsu_types::BlockFlowKind::Moved

@@ -82,6 +82,7 @@ impl SyncedDocument {
             | ServerEvent::BlockStatusChanged { block_id, .. }
             | ServerEvent::BlockDeleted { block_id, .. }
             | ServerEvent::BlockCollapsedChanged { block_id, .. }
+            | ServerEvent::BlockExcludedChanged { block_id, .. }
             | ServerEvent::BlockMoved { block_id, .. } => Some(*block_id),
             _ => None,
         }
@@ -95,6 +96,7 @@ impl SyncedDocument {
             | ServerEvent::BlockStatusChanged { context_id, .. }
             | ServerEvent::BlockDeleted { context_id, .. }
             | ServerEvent::BlockCollapsedChanged { context_id, .. }
+            | ServerEvent::BlockExcludedChanged { context_id, .. }
             | ServerEvent::BlockMoved { context_id, .. }
             | ServerEvent::SyncReset { context_id, .. }
             | ServerEvent::InputTextOps { context_id, .. }
@@ -198,6 +200,7 @@ impl SyncedDocument {
     /// - `BlockStatusChanged` → direct doc mutation (buffered if block unknown)
     /// - `BlockDeleted` → direct doc mutation
     /// - `BlockCollapsedChanged` → direct doc mutation (buffered if block unknown)
+    /// - `BlockExcludedChanged` → direct doc mutation (buffered if block unknown)
     /// - `BlockMoved` → direct doc mutation (buffered if block unknown)
     /// - `SyncReset` → returns `NeedsResync`, clears pending buffer
     /// - Resource events → `Ignored`
@@ -323,6 +326,22 @@ impl SyncedDocument {
                 }
                 if let Err(e) = self.sync.apply_collapsed_change(&mut self.doc, block_id, *collapsed) {
                     warn!("SyncedDocument: set_collapsed error: {e}");
+                }
+                SyncEffect::Updated {
+                    block_count: self.doc.block_count(),
+                }
+            }
+
+            ServerEvent::BlockExcludedChanged {
+                context_id,
+                block_id,
+                excluded,
+            } => {
+                if *context_id != self.context_id {
+                    return SyncEffect::Ignored;
+                }
+                if let Err(e) = self.sync.apply_excluded_change(&mut self.doc, block_id, *excluded) {
+                    warn!("SyncedDocument: set_excluded error: {e}");
                 }
                 SyncEffect::Updated {
                     block_count: self.doc.block_count(),

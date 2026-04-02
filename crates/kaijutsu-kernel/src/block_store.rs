@@ -1074,9 +1074,10 @@ impl BlockStore {
         entry.touch(self.agent_id());
         drop(entry);
 
-        self.emit(BlockFlow::MetadataChanged {
+        self.emit(BlockFlow::ExcludedChanged {
             context_id,
             block_id: *block_id,
+            excluded,
             source: OpSource::Local,
         });
 
