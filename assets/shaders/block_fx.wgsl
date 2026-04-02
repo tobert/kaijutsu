@@ -9,7 +9,8 @@
 //   fx_params        - [glow_radius, glow_intensity, animation_mode, corner_radius]
 //     animation_mode: 0=none, 1=breathe, 2=pulse, 3=chase
 //   text_glow_color  - Color for text halo (RGBA linear)
-//   text_glow_params - [radius_px, 0, 0, 0]  (radius=0 disables)
+//   text_glow_params - [radius_px, excluded_flag, 0, 0]
+//     radius=0 disables glow; excluded_flag: 0=included, 1=excluded (gutter indicator)
 //   cursor_params    - [x_uv, y_uv, width_uv, height_uv] (all 0 = disabled)
 //   cursor_color     - RGBA color for cursor beam (linear)
 //   border_stroke    - [thickness_px, border_kind, label_inset_top, label_inset_bottom]
@@ -229,11 +230,6 @@ fn fragment(in: UiVertexOutput) -> @location(0) vec4<f32> {
     let b_thickness = border_stroke.x;
     let b_kind = border_stroke.y;
     let has_border = b_kind > 0.0;
-
-    // Fast path: no effects — pure texture passthrough
-    if glow_radius <= 0.0 && tg_radius <= 0.0 && !has_cursor && !has_border {
-        return tex;
-    }
 
     let half_size = in.size * 0.5;
     let p = (in.uv - 0.5) * in.size;

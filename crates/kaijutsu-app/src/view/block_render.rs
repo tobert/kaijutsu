@@ -21,7 +21,7 @@ use bevy_vello::vello;
 use vello::kurbo::Affine;
 use vello::peniko::Fill;
 
-use crate::cell::block_border::{BlockBorderStyle, BorderAnimation, BorderLabelMetrics};
+use crate::cell::block_border::{BlockBorderStyle, BlockExcludedState, BorderAnimation, BorderLabelMetrics};
 use crate::cell::{BlockCell, RoleGroupBorder};
 use crate::shaders::BlockFxMaterial;
 use crate::text::msdf::{
@@ -302,6 +302,7 @@ pub fn build_block_scenes(
             Option<&KjTextEffects>,
             &mut MsdfBlockGlyphs,
             &mut BlockRenderMethod,
+            Option<&BlockExcludedState>,
         ),
         With<BlockCell>,
     >,
@@ -332,7 +333,7 @@ pub fn build_block_scenes(
 
     for (
         entity, mut block_scene, computed, mut node, rich, border, vis, effects,
-        mut msdf_glyphs, mut render_method,
+        mut msdf_glyphs, mut render_method, excluded_state,
     ) in block_cells.iter_mut()
     {
         // Skip hidden blocks
@@ -692,6 +693,48 @@ pub fn build_block_scenes(
                     commands.entity(entity).insert(metrics);
                 }
             }
+        }
+
+        // Gutter checkbox: ☑ (included) or ☐ (excluded) in right padding zone.
+        // Rendered as an MSDF glyph so it's crisp at any size.
+        if let Some(ref mut atlas) = atlas {
+            let is_excluded = excluded_state.is_some_and(|e| e.0);
+            let checkbox = if is_excluded { "☐" } else { "☑" };
+            let cb_font_size = theme.label_font_size;
+            let cb_alpha = if is_excluded { 0.5 } else { 0.3 };
+            let cb_color = border
+                .map(|b| b.color.with_alpha(cb_alpha))
+                .unwrap_or(Color::srgba(0.5, 0.55, 0.65, cb_alpha));
+            let cb_brush = bevy_color_to_brush(cb_color);
+            let cb_style = VelloTextStyle {
+                font: font_handles.mono.clone(),
+                brush: cb_brush.clone(),
+                font_size: cb_font_size,
+                ..default()
+            };
+            let cb_layout = font.layout(
+                checkbox,
+                &cb_style,
+                VelloTextAlign::Left,
+                None,
+            );
+            let cb_w = cb_layout.width();
+            let cb_h = cb_layout.height();
+            // Position: right edge, vertically centered
+            let cb_x = (width - cb_w - 4.0).max(0.0);
+            let cb_y = ((total_height - cb_h) * 0.5).max(0.0);
+            let cb_offset = (cb_x as f64, cb_y as f64);
+            for line in cb_layout.lines() {
+                for item in line.items() {
+                    if let bevy_vello::parley::PositionedLayoutItem::GlyphRun(gr) = item {
+                        font_data_map.register(gr.run().font());
+                    }
+                }
+            }
+            let cb_glyphs = collect_msdf_glyphs(
+                &cb_layout, &[], &cb_brush, cb_offset, atlas,
+            );
+            msdf_glyphs.glyphs.extend(cb_glyphs);
         }
 
         // Set explicit height on the node

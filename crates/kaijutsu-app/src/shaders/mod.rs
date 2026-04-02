@@ -9,7 +9,9 @@ use bevy::prelude::*;
 
 pub use block_fx_material::BlockFxMaterial;
 
-use crate::cell::block_border::{BlockBorderStyle, BorderAnimation, BorderKind, BorderLabelMetrics};
+use crate::cell::block_border::{
+    BlockBorderStyle, BlockExcludedState, BorderAnimation, BorderKind, BorderLabelMetrics,
+};
 use crate::cell::BlockCell;
 use crate::input::FocusArea;
 use crate::ui::theme::Theme;
@@ -39,6 +41,7 @@ fn sync_block_fx(
             Has<crate::view::shell_dock::MsdfShellDockText>,
             Option<&OverlayCursorGeometry>,
             Option<&BlockScene>,
+            Option<&BlockExcludedState>,
         ),
         Or<(With<BlockCell>, With<MsdfOverlayText>, With<crate::view::shell_dock::MsdfShellDockText>)>,
     >,
@@ -48,11 +51,12 @@ fn sync_block_fx(
 ) {
     let tg_srgba = theme.text_glow_color.to_srgba();
     let target_tg_color = Vec4::new(tg_srgba.red, tg_srgba.green, tg_srgba.blue, tg_srgba.alpha);
-    let target_tg_params = Vec4::new(theme.text_glow_radius, 0.0, 0.0, 0.0);
+    // .y is packed per-block below (excluded_flag)
+    let tg_radius = theme.text_glow_radius;
 
     let show_cursor = matches!(*focus, FocusArea::Compose);
 
-    for (mat_node, border, label_metrics, is_chat_overlay, is_shell_dock, cursor_geom, block_scene) in query.iter() {
+    for (mat_node, border, label_metrics, is_chat_overlay, is_shell_dock, cursor_geom, block_scene, excluded_state) in query.iter() {
         let is_overlay = is_chat_overlay || is_shell_dock;
         let Some(mat) = fx_materials.get_mut(&mat_node.0) else {
             continue;
@@ -90,7 +94,9 @@ fn sync_block_fx(
             mat.glow_color = target_glow;
             mat.fx_params = target_params;
             mat.text_glow_color = target_tg_color;
-            mat.text_glow_params = target_tg_params;
+            // .y = excluded flag for gutter indicator
+            let excluded_flag = excluded_state.map_or(0.0, |e| if e.0 { 1.0 } else { 0.0 });
+            mat.text_glow_params = Vec4::new(tg_radius, excluded_flag, 0.0, 0.0);
 
             // Border stroke uniforms
             let border_kind = match style.kind {
@@ -123,7 +129,8 @@ fn sync_block_fx(
             mat.glow_color = Vec4::ZERO;
             mat.fx_params = Vec4::ZERO;
             mat.text_glow_color = target_tg_color;
-            mat.text_glow_params = target_tg_params;
+            let excluded_flag = excluded_state.map_or(0.0, |e| if e.0 { 1.0 } else { 0.0 });
+            mat.text_glow_params = Vec4::new(tg_radius, excluded_flag, 0.0, 0.0);
             mat.border_stroke = Vec4::ZERO;
             mat.border_insets = Vec4::ZERO;
             mat.border_color = Vec4::ZERO;

@@ -42,7 +42,8 @@ pub struct BlockFxMaterial {
     #[uniform(4)]
     pub text_glow_color: Vec4,
 
-    /// Text glow parameters: [radius_px, 0, 0, 0]. radius=0 disables.
+    /// Text glow parameters: [radius_px, excluded_flag, 0, 0].
+    /// radius=0 disables glow. excluded_flag: 0.0=included, 1.0=excluded.
     #[uniform(5)]
     pub text_glow_params: Vec4,
 

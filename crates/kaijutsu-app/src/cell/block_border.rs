@@ -111,6 +111,14 @@ pub enum BorderAnimation {
     Breathe,
 }
 
+/// Per-block excluded state, propagated to ECS for shader-driven gutter indicator.
+///
+/// The `block_fx.wgsl` shader draws a small SDF circle in the right gutter zone:
+/// filled dot when included, hollow ring + strikethrough when excluded.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Reflect, Default)]
+#[reflect(Component)]
+pub struct BlockExcludedState(pub bool);
+
 // ============================================================================
 // SYSTEMS
 // ============================================================================
@@ -129,7 +137,7 @@ pub fn determine_block_border_style(
     entities: Res<EditorEntities>,
     main_cells: Query<&CellEditor, With<MainCell>>,
     containers: Query<&BlockCellContainer>,
-    block_cells: Query<(Entity, &BlockCell, Option<&BlockBorderStyle>)>,
+    block_cells: Query<(Entity, &BlockCell, Option<&BlockBorderStyle>, Option<&BlockExcludedState>)>,
     theme: Res<Theme>,
     text_metrics: Res<TextMetrics>,
     layout_gen: Res<super::components::LayoutGeneration>,
@@ -182,7 +190,8 @@ pub fn determine_block_border_style(
     };
 
     for &entity in container.block_cells.values() {
-        let Ok((ent, block_cell, existing_style)) = block_cells.get(entity) else {
+        let Ok((ent, block_cell, existing_style, existing_excluded)) = block_cells.get(entity)
+        else {
             continue;
         };
 
@@ -193,6 +202,12 @@ pub fn determine_block_border_style(
             }
             continue;
         };
+
+        // Propagate excluded state to ECS for the gutter indicator shader
+        let new_excluded = BlockExcludedState(block.excluded);
+        if existing_excluded != Some(&new_excluded) {
+            commands.entity(ent).insert(new_excluded);
+        }
 
         let has_result_below = has_result.contains(&block.id);
         let new_style = compute_border_style(
@@ -237,7 +252,8 @@ fn compute_border_style(
         top: base * 0.75,
         bottom: base * 0.6,
         left: base,
-        right: base,
+        // Extra right padding reserves space for the gutter inclusion indicator
+        right: base * 1.5,
     };
 
     let mut result = match block.kind {
@@ -421,14 +437,12 @@ fn compute_border_style(
         _ => None,
     };
 
-    // Post-process: dim excluded blocks and increase right padding for gutter indicator
+    // Post-process: dim excluded blocks (gutter indicator is shader-driven)
     if block.excluded {
         if let Some(ref mut style) = result {
             // Dim the border color to indicate exclusion
             let dimmed = style.color.with_alpha(style.color.alpha() * 0.35);
             style.color = dimmed;
-            // Add right padding for the gutter indicator area
-            style.padding.right = (style.padding.right).max(base * 2.0);
             // Override animation — excluded blocks shouldn't animate
             style.animation = BorderAnimation::None;
         }
