@@ -364,7 +364,9 @@ pub fn handle_toggle_constellation(
 
         match screen.get() {
             Screen::Constellation => next_screen.set(Screen::Conversation),
-            Screen::Conversation => next_screen.set(Screen::Constellation),
+            Screen::Conversation | Screen::ConversationStack => {
+                next_screen.set(Screen::Constellation);
+            }
         }
     }
 }
@@ -546,6 +548,45 @@ pub fn handle_expand_block(mut actions: MessageReader<ActionFired>) {
     for ActionFired(action) in actions.read() {
         if matches!(action, Action::ExpandBlock) {
             info!("ExpandBlock action received (view removed)");
+        }
+    }
+}
+
+/// Handle ToggleStackView action — switch between Conversation and ConversationStack.
+pub fn handle_toggle_stack_view(
+    mut actions: MessageReader<ActionFired>,
+    screen: Res<State<crate::ui::screen::Screen>>,
+    mut next_screen: ResMut<NextState<crate::ui::screen::Screen>>,
+) {
+    use crate::ui::screen::Screen;
+    for ActionFired(action) in actions.read() {
+        if !matches!(action, Action::ToggleStackView) {
+            continue;
+        }
+        match screen.get() {
+            Screen::Conversation => next_screen.set(Screen::ConversationStack),
+            Screen::ConversationStack => next_screen.set(Screen::Conversation),
+            _ => {} // ignore from constellation
+        }
+    }
+}
+
+/// Handle j/k navigation within the card stack view.
+pub fn handle_stack_navigation(
+    mut actions: MessageReader<ActionFired>,
+    mut stack_state: ResMut<crate::ui::card_stack::CardStackState>,
+) {
+    for ActionFired(action) in actions.read() {
+        match action {
+            Action::FocusNextBlock => stack_state.focus_next(),
+            Action::FocusPrevBlock => stack_state.focus_prev(),
+            Action::FocusFirstBlock => stack_state.focus_first(),
+            Action::FocusLastBlock => stack_state.focus_last(),
+            Action::Unfocus => {
+                // Escape in stack → go back to conversation list
+                // Handled by handle_toggle_stack_view or handle_unfocus
+            }
+            _ => {}
         }
     }
 }

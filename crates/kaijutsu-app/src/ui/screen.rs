@@ -32,6 +32,8 @@ pub enum Screen {
     Constellation,
     /// Chat/shell conversation view.
     Conversation,
+    /// 3D cascading card stack view of conversation history.
+    ConversationStack,
 }
 
 /// Plugin that registers the Screen state and its transition systems.
@@ -65,6 +67,19 @@ impl Plugin for ScreenPlugin {
                 set_focus_conversation,
             ),
         );
+
+        // ── ConversationStack ──
+        app.add_systems(
+            OnEnter(Screen::ConversationStack),
+            (
+                hide_conversation_root,
+                hide_constellation_container,
+                hide_cell_text,
+                set_focus_conversation, // reuse Navigation input context
+            ),
+        );
+        // ConversationStack OnExit: card_stack plugin handles its own entity cleanup.
+        // Conversation or Constellation OnEnter will show the right things.
 
         // ── Continuous ──
         // Hide newly-added text entities that appear while not in conversation

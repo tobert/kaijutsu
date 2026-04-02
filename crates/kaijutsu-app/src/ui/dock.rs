@@ -692,6 +692,7 @@ pub fn update_mode(
 
     let (color, label) = match screen.get() {
         Screen::Constellation => (theme.mode_visual, &theme.mode_label_constellation),
+        Screen::ConversationStack => (theme.mode_visual, &theme.mode_label_constellation), // TODO: stack-specific label
         Screen::Conversation => match focus_area.as_ref() {
             FocusArea::Compose | FocusArea::Dialog => {
                 vim_mode_to_dock(&vim_mode, &theme)
@@ -837,6 +838,9 @@ pub fn update_hints(
     let hints = match screen.get() {
         Screen::Constellation => {
             "Enter: switch \u{2502} m: model \u{2502} n: new \u{2502} Tab: compose \u{2502} Esc: back"
+        }
+        Screen::ConversationStack => {
+            "j/k: navigate \u{2502} Esc: back \u{2502} v: list view \u{2502} `: constellation"
         }
         Screen::Conversation => match focus_area.as_ref() {
             FocusArea::Compose => {

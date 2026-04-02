@@ -171,6 +171,9 @@ impl Plugin for InputPlugin {
                 systems::handle_unfocus,
                 systems::handle_interrupt,
                 systems::handle_toggle_constellation,
+                systems::handle_toggle_stack_view,
+                systems::handle_stack_navigation
+                    .run_if(in_state(crate::ui::screen::Screen::ConversationStack)),
                 // App-level actions (global)
                 systems::handle_quit,
                 systems::handle_debug_toggle,

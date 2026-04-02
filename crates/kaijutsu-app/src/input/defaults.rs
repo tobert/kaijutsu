@@ -151,6 +151,12 @@ pub fn default_bindings() -> Vec<Binding> {
         "Expand block",
     ));
     b.push(Binding::key(
+        KeyCode::KeyV,
+        InputContext::Navigation,
+        Action::ToggleStackView,
+        "Toggle stack view",
+    ));
+    b.push(Binding::key(
         KeyCode::KeyX,
         InputContext::Navigation,
         Action::ToggleBlockExcluded,

@@ -49,6 +49,8 @@ pub enum Action {
     FocusLastBlock,
     /// f — expand focused block to full-screen reader
     ExpandBlock,
+    /// v — toggle between conversation list and 3D card stack view
+    ToggleStackView,
     /// Tab on thinking block — toggle collapse
     CollapseToggle,
 

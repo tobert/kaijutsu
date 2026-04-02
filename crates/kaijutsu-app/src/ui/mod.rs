@@ -1,3 +1,4 @@
+pub mod card_stack;
 pub mod constellation;
 pub mod debug;
 pub mod dock;
