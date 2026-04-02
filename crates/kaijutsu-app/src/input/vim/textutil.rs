@@ -136,7 +136,7 @@ enum CharClass {
 }
 
 fn classify(ch: char, style: WordStyle) -> CharClass {
-    if ch.is_ascii_whitespace() || ch == '\n' {
+    if ch.is_ascii_whitespace() {
         CharClass::Whitespace
     } else if style == WordStyle::Big {
         // Big word: everything non-whitespace is one class
