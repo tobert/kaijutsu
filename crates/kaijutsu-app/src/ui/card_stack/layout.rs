@@ -112,6 +112,41 @@ impl Default for CardStackLayout {
     }
 }
 
+/// Animation phase for the stack view entry transition.
+#[derive(Resource, Reflect, Debug, Clone, Copy, PartialEq)]
+#[reflect(Resource)]
+pub enum StackAnimPhase {
+    /// Cards are spreading out from a collapsed point.
+    Entering { progress: f32 },
+    /// Normal operation.
+    Active,
+}
+
+impl Default for StackAnimPhase {
+    fn default() -> Self {
+        Self::Active
+    }
+}
+
+fn ease_out_cubic(t: f32) -> f32 {
+    1.0 - (1.0 - t).powi(3)
+}
+
+/// System: advance the entry animation timer.
+pub fn tick_stack_anim(
+    mut phase: ResMut<StackAnimPhase>,
+    time: Res<Time>,
+) {
+    let dt = time.delta_secs();
+    let speed = 3.3; // ~0.3s for full transition
+    if let StackAnimPhase::Entering { ref mut progress } = *phase {
+        *progress = (*progress + dt * speed).min(1.0);
+        if *progress >= 1.0 {
+            *phase = StackAnimPhase::Active;
+        }
+    }
+}
+
 /// System: interpolate current_focus toward focused_index.
 pub fn interpolate_stack_focus(
     mut state: ResMut<CardStackState>,
@@ -140,6 +175,7 @@ pub fn interpolate_stack_focus(
 pub fn compute_card_layout(
     state: Res<CardStackState>,
     params: Res<CardStackLayout>,
+    anim_phase: Res<StackAnimPhase>,
     mut cards: Query<(
         Entity,
         &StackCard,
@@ -152,6 +188,10 @@ pub fn compute_card_layout(
     mut materials: ResMut<Assets<StackCardMaterial>>,
 ) {
     let focus = state.current_focus;
+    let anim_t = match *anim_phase {
+        StackAnimPhase::Entering { progress } => ease_out_cubic(progress),
+        StackAnimPhase::Active => 1.0,
+    };
 
     for (card_entity, card, mut transform, mut lod, mut vis) in cards.iter_mut() {
         let idx = card.card_index as f32;
@@ -187,36 +227,47 @@ pub fn compute_card_layout(
             distance * 0.4
         };
 
+        // Smooth focus blend: 1.0 at exact focus, 0.0 at distance >= 0.5
+        let focus_blend = (1.0 - abs_dist * 2.0).clamp(0.0, 1.0);
+
         transform.translation = Vec3::new(
             params.cascade_offset.x * step,
             params.cascade_offset.y * step,
-            params.focused_z + params.cascade_offset.z * step,
+            params.focused_z + params.cascade_offset.z * step + focus_blend * 5.0,
         );
 
         // Add a "lean" based on scroll velocity and a "tilt" based on distance
         let velocity_lean = state.scroll_velocity * 0.02;
         let distance_tilt = distance * 0.05;
-        
+
         transform.rotation = Quat::from_rotation_y(params.cascade_rotation * step + velocity_lean)
             * Quat::from_rotation_z(velocity_lean * 0.5)
             * Quat::from_rotation_x(distance_tilt.min(0.2));
 
         let scale_factor = params.cascade_scale.powf(abs_dist);
-        transform.scale = Vec3::splat(params.card_width * scale_factor);
+        let target_scale = params.card_width * scale_factor * (1.0 + focus_blend * 0.03);
+        transform.scale = Vec3::splat(target_scale * anim_t.max(0.01));
 
-        // Update child quad material alpha for LOD fade
-        // For smooth focus, we calculate opacity from fractional distance
+        // Entry animation: lerp from collapse point toward computed position
+        if anim_t < 1.0 {
+            let collapse = Vec3::new(0.0, 0.0, params.focused_z);
+            transform.translation = collapse.lerp(transform.translation, anim_t);
+        }
+
+        // Update child quad material alpha and glow for LOD fade + focus highlight
         let opacity = if abs_dist < 1.0 {
             1.0
         } else {
             new_lod.opacity().max(0.1)
-        };
+        } * anim_t;
+        let glow_intensity = 0.5 + focus_blend * 0.4;
 
         if let Ok(children) = children_q.get(card_entity) {
             for child in children.iter() {
                 if let Ok(mat_handle) = mat_handle_q.get(child) {
                     if let Some(mat) = materials.get_mut(&mat_handle.0) {
                         mat.uniforms.card_params.x = opacity;
+                        mat.uniforms.glow_params.x = glow_intensity;
                     }
                 }
             }

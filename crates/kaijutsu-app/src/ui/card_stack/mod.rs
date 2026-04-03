@@ -10,12 +10,12 @@
 //! Each block within a card is its own child quad mesh, sharing the block's
 //! existing RTT texture handle via StandardMaterial (unlit).
 //!
-//! Custom StackCardMaterial with LOD + holographic glow is deferred until
-//! the AsBindGroup shader binding issue is resolved.
+//! Custom StackCardMaterial provides per-card opacity and role-colored
+//! edge glow via `stack_card.wgsl`.
 
 pub mod camera;
 pub mod layout;
-pub mod material; // deferred — custom shader needs debugging
+pub mod material;
 pub mod sync;
 
 use bevy::prelude::*;
@@ -24,7 +24,7 @@ use crate::ui::card_stack::material::StackCardMaterial;
 use crate::ui::screen::Screen;
 
 pub use camera::StackCameraTag;
-pub use layout::{CardLod, CardStackLayout, CardStackState};
+pub use layout::{CardLod, CardStackLayout, CardStackState, StackAnimPhase};
 pub use sync::StackCard;
 
 /// Plugin for the Conversation Stack 3D view.
@@ -34,7 +34,8 @@ impl Plugin for CardStackPlugin {
     fn build(&self, app: &mut App) {
         // Resources
         app.init_resource::<CardStackState>()
-            .init_resource::<CardStackLayout>();
+            .init_resource::<CardStackLayout>()
+            .init_resource::<StackAnimPhase>();
 
         // Material registration
         app.add_plugins(MaterialPlugin::<StackCardMaterial>::default());
@@ -44,7 +45,8 @@ impl Plugin for CardStackPlugin {
             .register_type::<CardStackLayout>()
             .register_type::<CardLod>()
             .register_type::<StackCard>()
-            .register_type::<StackCameraTag>();
+            .register_type::<StackCameraTag>()
+            .register_type::<StackAnimPhase>();
 
         // Screen transitions
         app.add_systems(
@@ -52,10 +54,11 @@ impl Plugin for CardStackPlugin {
             (
                 camera::spawn_stack_camera,
                 sync::sync_stack_cards,
-                |mut state: ResMut<CardStackState>| {
+                |mut state: ResMut<CardStackState>, mut anim: ResMut<StackAnimPhase>| {
                     // Sync current_focus to avoid starting from index 0 on enter
                     state.current_focus = state.focused_index as f32;
                     state.last_focus = state.current_focus;
+                    *anim = StackAnimPhase::Entering { progress: 0.0 };
                 },
             )
                 .chain(),
@@ -73,6 +76,7 @@ impl Plugin for CardStackPlugin {
             Update,
             (
                 sync::sync_stack_cards,
+                layout::tick_stack_anim,
                 layout::interpolate_stack_focus,
                 layout::compute_card_layout,
             )

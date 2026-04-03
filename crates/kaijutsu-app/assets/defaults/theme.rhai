@@ -36,7 +36,8 @@
 //   error, warning, success     // Semantic status colors
 //   mode_normal, mode_insert, mode_chat, mode_shell, mode_visual  // Mode indicator colors
 //   mode_label_normal, mode_label_insert, mode_label_visual       // Dock HUD label text
-//   mode_label_shell, mode_label_constellation, mode_label_input  // (Rhai-scriptable)
+//   mode_label_shell, mode_label_constellation, mode_label_stack  // (Rhai-scriptable)
+//   mode_label_input
 //   cursor_normal, cursor_insert, cursor_visual      // Cursor colors (Vec4)
 //
 //   // Block borders

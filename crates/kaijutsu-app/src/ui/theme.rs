@@ -153,6 +153,7 @@ pub struct Theme {
     pub mode_label_visual: String,
     pub mode_label_shell: String,
     pub mode_label_constellation: String,
+    pub mode_label_stack: String,
     pub mode_label_input: String,
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -438,6 +439,7 @@ impl Default for Theme {
             mode_label_visual: "VISUAL".into(),
             mode_label_shell: "SHELL".into(),
             mode_label_constellation: "CONSTELLATION".into(),
+            mode_label_stack: "STACK".into(),
             mode_label_input: "INPUT".into(),
 
             // Cursor colors
@@ -665,6 +667,7 @@ impl From<kaijutsu_rhai::theme::ThemeData> for Theme {
         theme.mode_label_visual = td.mode_label_visual;
         theme.mode_label_shell = td.mode_label_shell;
         theme.mode_label_constellation = td.mode_label_constellation;
+        theme.mode_label_stack = td.mode_label_stack;
         theme.mode_label_input = td.mode_label_input;
 
         // Cursor colors

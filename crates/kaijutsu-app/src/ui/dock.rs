@@ -692,7 +692,7 @@ pub fn update_mode(
 
     let (color, label) = match screen.get() {
         Screen::Constellation => (theme.mode_visual, &theme.mode_label_constellation),
-        Screen::ConversationStack => (theme.mode_visual, &theme.mode_label_constellation), // TODO: stack-specific label
+        Screen::ConversationStack => (theme.mode_visual, &theme.mode_label_stack),
         Screen::Conversation => match focus_area.as_ref() {
             FocusArea::Compose | FocusArea::Dialog => {
                 vim_mode_to_dock(&vim_mode, &theme)

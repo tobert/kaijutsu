@@ -93,6 +93,7 @@ pub struct ThemeData {
     pub mode_label_visual: String,
     pub mode_label_shell: String,
     pub mode_label_constellation: String,
+    pub mode_label_stack: String,
     pub mode_label_input: String,
 
     // Cursor colors
@@ -246,6 +247,7 @@ impl Default for ThemeData {
             mode_label_visual: "VISUAL".into(),
             mode_label_shell: "SHELL".into(),
             mode_label_constellation: "CONSTELLATION".into(),
+            mode_label_stack: "STACK".into(),
             mode_label_input: "INPUT".into(),
 
             // Cursor colors
@@ -505,6 +507,7 @@ pub fn parse_theme_data_from_scope(scope: &Scope) -> ThemeData {
     string!(mode_label_visual);
     string!(mode_label_shell);
     string!(mode_label_constellation);
+    string!(mode_label_stack);
     string!(mode_label_input);
 
     // Cursor colors
