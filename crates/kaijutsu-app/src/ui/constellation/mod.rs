@@ -93,6 +93,7 @@ impl Plugin for ConstellationPlugin {
                     apply_radial_gravity,
                     update_center_exclusion_radius,
                     sync_physics_to_constellation,
+                    auto_fit_camera,
                     interpolate_camera,
                 )
                     .chain(),
@@ -148,6 +149,9 @@ pub struct ConstellationCamera {
     pub target_zoom: f32,
     /// Interpolation speed (higher = snappier)
     pub speed: f32,
+    /// When true, auto-fit recalculates zoom to show all nodes.
+    /// Set on view entry and topology changes; cleared after processing.
+    pub auto_fit_requested: bool,
 }
 
 impl Default for ConstellationCamera {
@@ -158,15 +162,16 @@ impl Default for ConstellationCamera {
             target_offset: Vec2::ZERO,
             target_zoom: 1.0,
             speed: 8.0,
+            auto_fit_requested: true,
         }
     }
 }
 
 impl ConstellationCamera {
-    /// Reset camera to default view
+    /// Reset camera to default view (centers on focus, auto-fits zoom)
     pub fn reset(&mut self) {
         self.target_offset = Vec2::ZERO;
-        self.target_zoom = 1.0;
+        self.auto_fit_requested = true;
     }
 }
 
@@ -549,8 +554,12 @@ fn pause_constellation_physics(mut physics_time: ResMut<Time<Physics>>) {
     physics_time.pause();
 }
 
-fn unpause_constellation_physics(mut physics_time: ResMut<Time<Physics>>) {
+fn unpause_constellation_physics(
+    mut physics_time: ResMut<Time<Physics>>,
+    mut camera: ResMut<ConstellationCamera>,
+) {
     physics_time.unpause();
+    camera.auto_fit_requested = true;
 }
 
 // ── Physics entity sync ──
@@ -735,6 +744,11 @@ fn update_constellation_graph(
     let topology_changed = n != *prev_node_count;
 
     if focus_changed || topology_changed {
+        // Auto-fit camera when topology changes (new nodes added/removed)
+        if topology_changed {
+            camera.auto_fit_requested = true;
+        }
+
         // Rebuild ring order (tree-ordered cycling for keyboard nav)
         if topology_changed || cached_ring.len() != n {
             *cached_ring = build_ring_order(&constellation);
@@ -957,6 +971,65 @@ fn build_ring_order(constellation: &Constellation) -> Vec<usize> {
     }
 
     order
+}
+
+/// Auto-fit camera zoom to show all constellation nodes with margin.
+///
+/// Only runs when `auto_fit_requested` is set (view entry, topology change,
+/// or camera reset). Computes the node bounding box in simulation space and
+/// derives a zoom level that fits within 80% of the viewport.
+fn auto_fit_camera(
+    constellation: Res<Constellation>,
+    mut camera: ResMut<ConstellationCamera>,
+    container_q: Query<&ComputedNode, With<ConstellationContainer>>,
+    screen: Res<State<crate::ui::screen::Screen>>,
+) {
+    if !camera.auto_fit_requested {
+        return;
+    }
+    if !matches!(screen.get(), crate::ui::screen::Screen::Constellation) {
+        return;
+    }
+    let Ok(computed) = container_q.single() else {
+        return;
+    };
+    let viewport = computed.size();
+    if viewport.x < 1.0 || viewport.y < 1.0 {
+        return;
+    }
+    if constellation.nodes.is_empty() {
+        camera.auto_fit_requested = false;
+        return;
+    }
+
+    // Bounding box of all node positions (simulation space)
+    let mut min_pos = Vec2::splat(f32::MAX);
+    let mut max_pos = Vec2::splat(f32::MIN);
+    for node in &constellation.nodes {
+        min_pos = min_pos.min(node.position);
+        max_pos = max_pos.max(node.position);
+    }
+
+    let sim_extent = max_pos - min_pos;
+
+    // Margin for card sizes + padding (simulation-space units)
+    let margin = 150.0;
+    let padded_w = sim_extent.x + margin * 2.0;
+    let padded_h = sim_extent.y + margin * 2.0;
+
+    // Use 80% of viewport to leave room for legend/detail panels
+    let usable_w = viewport.x * 0.80;
+    let usable_h = viewport.y * 0.80;
+
+    let fit_zoom = (usable_w / padded_w).min(usable_h / padded_h);
+    // Only zoom out to fit — don't zoom in past 1.5x
+    camera.target_zoom = fit_zoom.min(1.5);
+    camera.auto_fit_requested = false;
+
+    info!(
+        "Constellation auto-fit: sim {:.0}x{:.0}, viewport {:.0}x{:.0}, zoom {:.2}",
+        sim_extent.x, sim_extent.y, viewport.x, viewport.y, camera.target_zoom,
+    );
 }
 
 /// Smoothly interpolate camera offset and zoom toward targets.

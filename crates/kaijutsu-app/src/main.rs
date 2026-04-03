@@ -15,6 +15,7 @@
 
 use bevy::picking::mesh_picking::{MeshPickingPlugin, MeshPickingSettings};
 use bevy::prelude::*;
+use bevy::window::{Monitor, MonitorSelection, PrimaryMonitor, PrimaryWindow, WindowPosition};
 use bevy_brp_extras::BrpExtrasPlugin;
 use clap::Parser;
 use kaijutsu_client::SshConfig;
@@ -100,10 +101,11 @@ fn main() {
                     primary_window: Some(Window {
                         title: "会術 Kaijutsu".into(),
                         resolution: (
-                            constants::DEFAULT_WINDOW_WIDTH,
-                            constants::DEFAULT_WINDOW_HEIGHT,
+                            constants::INITIAL_WINDOW_WIDTH,
+                            constants::INITIAL_WINDOW_HEIGHT,
                         )
                             .into(),
+                        position: WindowPosition::Centered(MonitorSelection::Primary),
                         ..default()
                     }),
                     ..default()
@@ -165,6 +167,8 @@ fn main() {
             Startup,
             (setup_camera, setup_ui, ui::debug::setup_debug_overlay).chain(),
         )
+        // Adapt window to monitor on first frame (Monitor not available at Startup)
+        .add_systems(Update, adapt_window_to_monitor)
         // Update
         // NOTE: handle_debug_toggle, handle_screenshot, handle_quit
         // migrated to input::systems — they consume ActionFired now
@@ -183,6 +187,43 @@ fn setup_camera(mut commands: Commands, theme: Res<ui::theme::Theme>) {
         },
         bevy_vello::render::VelloView,
     ));
+}
+
+/// Resize window to fit the primary monitor on the first frame.
+///
+/// Bevy's `Monitor` entities aren't populated at `Startup` (winit hasn't pumped
+/// events yet), so this runs in `Update` with a `Local<bool>` guard. Computes
+/// 75%×80% of the monitor's logical resolution and resizes the window.
+fn adapt_window_to_monitor(
+    mut window_q: Query<&mut Window, With<PrimaryWindow>>,
+    monitor_q: Query<&Monitor, With<PrimaryMonitor>>,
+    mut done: Local<bool>,
+) {
+    if *done {
+        return;
+    }
+    let Ok(monitor) = monitor_q.single() else {
+        return;
+    };
+    let Ok(mut window) = window_q.single_mut() else {
+        return;
+    };
+
+    let logical_w = monitor.physical_width as f32 / monitor.scale_factor as f32;
+    let logical_h = monitor.physical_height as f32 / monitor.scale_factor as f32;
+
+    let w = logical_w * constants::WINDOW_WIDTH_FRACTION;
+    let h = logical_h * constants::WINDOW_HEIGHT_FRACTION;
+
+    info!(
+        "Adapting window to monitor: {}x{} physical, {:.0}x scale → {:.0}x{:.0} logical → {:.0}x{:.0} window",
+        monitor.physical_width, monitor.physical_height, monitor.scale_factor,
+        logical_w, logical_h, w, h,
+    );
+
+    window.resolution.set(w, h);
+    window.position.center(MonitorSelection::Primary);
+    *done = true;
 }
 
 /// Set up the structural UI skeleton.

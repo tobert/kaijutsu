@@ -2,9 +2,14 @@
 //!
 //! Centralizes hardcoded values for easier configuration and documentation.
 
-/// Default window dimensions.
-pub const DEFAULT_WINDOW_WIDTH: u32 = 1280;
-pub const DEFAULT_WINDOW_HEIGHT: u32 = 800;
+/// Initial window dimensions (safe default before monitor info is available).
+/// The `adapt_window_to_monitor` system resizes to fit the actual display.
+pub const INITIAL_WINDOW_WIDTH: u32 = 960;
+pub const INITIAL_WINDOW_HEIGHT: u32 = 600;
+
+/// Fraction of monitor's logical size for the adapted window.
+pub const WINDOW_WIDTH_FRACTION: f32 = 0.75;
+pub const WINDOW_HEIGHT_FRACTION: f32 = 0.80;
 
 // ============================================================================
 // Z-INDEX LAYERS
