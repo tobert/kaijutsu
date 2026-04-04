@@ -98,6 +98,8 @@ pub struct CardStackLayout {
     // ── Reading mode ──
     /// Z-position of the expanded reading card.
     pub reading_card_z: f32,
+    /// Y-offset to raise the reading card above center (room for strip below).
+    pub reading_card_y: f32,
     /// Viewport fill fraction for the reading card (0.0–1.0, default 0.92).
     pub reading_card_fill: f32,
     /// Scroll step per j/k press in reading mode (world units).
@@ -129,6 +131,7 @@ impl Default for CardStackLayout {
             smooth_speed: 10.0,
             // Reading mode
             reading_card_z: 30.0,
+            reading_card_y: 10.0,
             reading_card_fill: 0.92,
             reading_scroll_step: 15.0,
             strip_y: -50.0,
@@ -486,7 +489,7 @@ pub fn compute_card_layout(
                 if card_idx == source_idx {
                     // This card rises to expanded reading position
                     (
-                        Vec3::new(0.0, transition.scroll_offset, params.reading_card_z),
+                        Vec3::new(0.0, params.reading_card_y + transition.scroll_offset, params.reading_card_z),
                         Quat::IDENTITY,
                         reading_scale,
                         1.0_f32,
