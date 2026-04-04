@@ -130,11 +130,14 @@ pub fn sync_stack_cards(
         commands.entity(root).add_child(card_entity);
 
         // Spawn a child quad for each block
+        // Track bottom edge of last placed block for tight stacking
+        let mut y_cursor = 0.0_f32;
+
         for (block_idx, block_id) in group.block_ids.iter().enumerate() {
             let texture_data = container
                 .and_then(|c| c.get_entity(block_id))
                 .and_then(|ent| block_q.get(ent).ok());
-            
+
             let Some((_, tex, scene)) = texture_data else {
                 continue; // Skip blocks without textures (they might be still rendering)
             };
@@ -154,7 +157,16 @@ pub fn sync_stack_cards(
             let aspect = if built_w > 0.0 { built_h / built_w } else { 0.1 };
             let quad_width = 1.0;
             let quad_height = quad_width * aspect;
-            let y_offset = -(block_idx as f32) * quad_height;
+
+            // Stack tightly: first block at y=0, each subsequent touches the one above
+            let y_offset = if block_idx == 0 {
+                y_cursor = -quad_height / 2.0;
+                0.0
+            } else {
+                let center = y_cursor - quad_height / 2.0;
+                y_cursor = center - quad_height / 2.0;
+                center
+            };
 
             let quad_entity = commands
                 .spawn((
