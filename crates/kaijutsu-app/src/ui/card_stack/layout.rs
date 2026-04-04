@@ -375,15 +375,19 @@ pub fn compute_card_layout(
     let rt = transition.progress;
     let source_idx = transition.source_index;
 
-    // Compute viewport-fit reading scale from camera geometry
-    let reading_scale = {
-        let camera_z = camera_q.iter().next().map(|t| t.translation().z).unwrap_or(180.0);
-        let aspect = windows.iter().next().map(|w| w.width() / w.height()).unwrap_or(1.6);
-        let fov = std::f32::consts::FRAC_PI_4;
-        let dist = camera_z - params.reading_card_z;
-        let half_h = dist * (fov / 2.0).tan();
-        2.0 * half_h * aspect * params.reading_card_fill
-    };
+    // Compute viewport-fit reading scale and clip plane from camera geometry
+    let camera_z = camera_q.iter().next().map(|t| t.translation().z).unwrap_or(180.0);
+    let camera_y = camera_q.iter().next().map(|t| t.translation().y).unwrap_or(20.0);
+    let aspect = windows.iter().next().map(|w| w.width() / w.height()).unwrap_or(1.6);
+    let fov = std::f32::consts::FRAC_PI_4;
+    let dist_card = camera_z - params.reading_card_z;
+    let half_h = dist_card * (fov / 2.0).tan();
+    let reading_scale = 2.0 * half_h * aspect * params.reading_card_fill;
+
+    // Clip plane: project strip top from strip_z to reading_card_z plane
+    let strip_top_world = params.strip_y + params.card_width * params.strip_scale * 0.5;
+    let dist_strip = camera_z - params.strip_z;
+    let reading_clip_y = camera_y + (strip_top_world - camera_y) * (dist_card / dist_strip);
 
     for (card_entity, card, mut transform, mut lod, mut vis) in cards.iter_mut() {
         let idx = card.card_index as f32;
@@ -479,6 +483,7 @@ pub fn compute_card_layout(
                 browse_opacity,
                 browse_lod_f,
                 browse_glow,
+                f32::MIN, // no clip in browse mode
                 &children_q,
                 &mat_handle_q,
                 &mut materials,
@@ -525,11 +530,19 @@ pub fn compute_card_layout(
             let glow = browse_glow + (read_glow - browse_glow) * eased;
             let lod_f = browse_lod_f + (read_lod_f - browse_lod_f) * eased;
 
+            // Clip reading card below strip; no clip for strip cards
+            let clip = if card_idx == source_idx {
+                reading_clip_y
+            } else {
+                f32::MIN
+            };
+
             update_card_materials(
                 card_entity,
                 opacity,
                 lod_f,
                 glow,
+                clip,
                 &children_q,
                 &mat_handle_q,
                 &mut materials,
@@ -564,11 +577,13 @@ pub fn compute_card_layout(
 }
 
 /// Helper: update child quad StackCardMaterial uniforms.
+/// `clip_y`: world-space Y below which fragments are discarded (f32::MIN = no clip).
 fn update_card_materials(
     card_entity: Entity,
     opacity: f32,
     lod_factor: f32,
     glow_intensity: f32,
+    clip_y: f32,
     children_q: &Query<&Children>,
     mat_handle_q: &Query<&MeshMaterial3d<StackCardMaterial>>,
     materials: &mut Assets<StackCardMaterial>,
@@ -579,6 +594,7 @@ fn update_card_materials(
                 if let Some(mat) = materials.get_mut(&mat_handle.0) {
                     mat.uniforms.card_params.x = opacity;
                     mat.uniforms.card_params.y = lod_factor;
+                    mat.uniforms.card_params.w = clip_y;
                     mat.uniforms.glow_params.x = glow_intensity;
                 }
             }

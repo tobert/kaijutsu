@@ -14,7 +14,7 @@
 @group(#{MATERIAL_BIND_GROUP}) @binding(1) var card_sampler: sampler;
 
 struct StackCardUniforms {
-    card_params: vec4<f32>,     // [opacity, lod_factor, unused, unused]
+    card_params: vec4<f32>,     // [opacity, lod_factor, render_mode, clip_y]
     glow_color: vec4<f32>,      // [r, g, b, a] role color
     glow_params: vec4<f32>,     // [glow_intensity, unused, unused, unused]
 };
@@ -181,9 +181,15 @@ fn fragment(
     let opacity = uniforms.card_params.x;
     let lod_factor = uniforms.card_params.y;
     let render_mode = uniforms.card_params.z;
+    let clip_y = uniforms.card_params.w;
     let glow_color = uniforms.glow_color;
     let glow_intensity = uniforms.glow_params.x;
     let time = globals.time;
+
+    // Clip fragments below the strip area (reading mode)
+    if in.world_position.y < clip_y {
+        discard;
+    }
 
     // Gap sparkle mode — animated twinkle placeholder
     if render_mode > 0.5 {
