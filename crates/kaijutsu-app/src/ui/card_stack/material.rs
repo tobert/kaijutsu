@@ -40,9 +40,9 @@ impl Default for StackCardMaterial {
         Self {
             texture: Handle::default(),
             uniforms: StackCardUniforms {
-                card_params: Vec4::new(1.0, 0.0, 0.0, 0.0),
+                card_params: Vec4::new(1.0, 0.0, 0.0, -10000.0),
                 glow_color: Vec4::ZERO,
-                glow_params: Vec4::ZERO,
+                glow_params: Vec4::new(0.0, 10000.0, 0.0, 0.0),
             },
         }
     }

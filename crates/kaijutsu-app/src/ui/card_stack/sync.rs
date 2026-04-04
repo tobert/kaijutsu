@@ -150,7 +150,7 @@ pub fn sync_stack_cards(
                 uniforms: StackCardUniforms {
                     card_params: Vec4::new(1.0, 0.0, 0.0, 0.0),
                     glow_color: glow_color.to_linear().to_vec4(),
-                    glow_params: Vec4::new(0.5, 0.0, 0.0, 0.0), // 0.5 glow intensity
+                    glow_params: Vec4::new(0.5, 10000.0, 0.0, 0.0), // glow_intensity, clip_top
                 },
             });
 

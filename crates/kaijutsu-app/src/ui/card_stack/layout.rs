@@ -294,7 +294,7 @@ pub fn manage_gap_marker(
                 // z = 1.0 → gap sparkle render mode
                 card_params: Vec4::new(0.0, 0.0, 1.0, 0.0),
                 glow_color: glow_color.to_linear().to_vec4(),
-                glow_params: Vec4::new(0.8, 0.0, 0.0, 0.0),
+                glow_params: Vec4::new(0.8, 10000.0, 0.0, 0.0),
             },
         });
 
@@ -384,10 +384,17 @@ pub fn compute_card_layout(
     let half_h = dist_card * (fov / 2.0).tan();
     let reading_scale = 2.0 * half_h * aspect * params.reading_card_fill;
 
-    // Clip plane: project strip top from strip_z to reading_card_z plane
+    // Bottom clip: project strip top from strip_z to reading_card_z plane
     let strip_top_world = params.strip_y + params.card_width * params.strip_scale * 0.5;
     let dist_strip = camera_z - params.strip_z;
-    let reading_clip_y = camera_y + (strip_top_world - camera_y) * (dist_card / dist_strip);
+    let reading_clip_bottom = camera_y + (strip_top_world - camera_y) * (dist_card / dist_strip);
+
+    // Top clip: viewport top at card z minus header reserve (~6% of viewport height)
+    let look_at_y = -5.0_f32; // camera look-at target y (from camera.rs)
+    let look_at_z = 0.0_f32;
+    let vp_center_y = camera_y + (look_at_y - camera_y) * (dist_card / (camera_z - look_at_z));
+    let vp_height = 2.0 * half_h;
+    let reading_clip_top = vp_center_y + half_h - vp_height * 0.06;
 
     for (card_entity, card, mut transform, mut lod, mut vis) in cards.iter_mut() {
         let idx = card.card_index as f32;
@@ -483,7 +490,7 @@ pub fn compute_card_layout(
                 browse_opacity,
                 browse_lod_f,
                 browse_glow,
-                f32::MIN, // no clip in browse mode
+                (-10000.0, 10000.0), // no clip in browse mode
                 &children_q,
                 &mat_handle_q,
                 &mut materials,
@@ -530,11 +537,11 @@ pub fn compute_card_layout(
             let glow = browse_glow + (read_glow - browse_glow) * eased;
             let lod_f = browse_lod_f + (read_lod_f - browse_lod_f) * eased;
 
-            // Clip reading card below strip; no clip for strip cards
+            // Clip reading card between header and strip; no clip for strip cards
             let clip = if card_idx == source_idx {
-                reading_clip_y
+                (reading_clip_bottom, reading_clip_top)
             } else {
-                f32::MIN
+                (-10000.0, 10000.0)
             };
 
             update_card_materials(
@@ -577,13 +584,13 @@ pub fn compute_card_layout(
 }
 
 /// Helper: update child quad StackCardMaterial uniforms.
-/// `clip_y`: world-space Y below which fragments are discarded (f32::MIN = no clip).
+/// `clip`: (bottom, top) world-space Y clip planes. -10000.0/MAX = no clip.
 fn update_card_materials(
     card_entity: Entity,
     opacity: f32,
     lod_factor: f32,
     glow_intensity: f32,
-    clip_y: f32,
+    clip: (f32, f32),
     children_q: &Query<&Children>,
     mat_handle_q: &Query<&MeshMaterial3d<StackCardMaterial>>,
     materials: &mut Assets<StackCardMaterial>,
@@ -594,8 +601,9 @@ fn update_card_materials(
                 if let Some(mat) = materials.get_mut(&mat_handle.0) {
                     mat.uniforms.card_params.x = opacity;
                     mat.uniforms.card_params.y = lod_factor;
-                    mat.uniforms.card_params.w = clip_y;
+                    mat.uniforms.card_params.w = clip.0;
                     mat.uniforms.glow_params.x = glow_intensity;
+                    mat.uniforms.glow_params.y = clip.1;
                 }
             }
         }
