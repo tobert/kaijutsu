@@ -16,6 +16,7 @@
 use bevy::picking::mesh_picking::{MeshPickingPlugin, MeshPickingSettings};
 use bevy::prelude::*;
 use bevy::window::{Monitor, MonitorSelection, PrimaryMonitor, PrimaryWindow, WindowPosition};
+use bevy::winit::{UpdateMode, WinitSettings};
 use bevy_brp_extras::BrpExtrasPlugin;
 use clap::Parser;
 use kaijutsu_client::SshConfig;
@@ -162,6 +163,12 @@ fn main() {
         .add_plugins(bevy_tweening::TweeningPlugin)
         // Resources - theme loaded from ~/.config/kaijutsu/theme.rhai
         .insert_resource(theme)
+        // Power management — sleep between events instead of spinning every vsync tick.
+        // Input events (keyboard, mouse, window) wake immediately with zero added latency.
+        .insert_resource(WinitSettings {
+            focused_mode: UpdateMode::reactive(std::time::Duration::from_millis(100)), // 10Hz idle
+            unfocused_mode: UpdateMode::reactive_low_power(std::time::Duration::from_millis(500)), // 2Hz background
+        })
         // Startup
         .add_systems(
             Startup,

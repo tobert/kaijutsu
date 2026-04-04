@@ -413,6 +413,8 @@ pub struct ExtractedMsdfAtlas {
     pub width: u32,
     pub height: u32,
     pub msdf_range: f32,
+    /// Matches `MsdfAtlas::version` — skip re-extraction when unchanged.
+    pub version: u64,
 }
 
 impl Default for ExtractedMsdfAtlas {
@@ -423,6 +425,7 @@ impl Default for ExtractedMsdfAtlas {
             width: 1024,
             height: 1024,
             msdf_range: MsdfAtlas::DEFAULT_RANGE,
+            version: 0,
         }
     }
 }

@@ -5,6 +5,7 @@
 
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
+use bevy::winit::{EventLoopProxyWrapper, WinitUserEvent};
 use bevy_vello::VelloPlugin;
 use bevy_vello::integrations::text::VelloFontAxes;
 use bevy_vello::prelude::*;
@@ -47,6 +48,7 @@ fn poll_msdf_generator(
     mut images: ResMut<Assets<Image>>,
     font_data_map: Res<FontDataMap>,
     mut msdf_blocks: Query<&mut super::msdf::MsdfBlockGlyphs>,
+    event_loop_proxy: Res<EventLoopProxyWrapper>,
 ) {
     let Some(ref mut atlas) = atlas else {
         return;
@@ -85,6 +87,9 @@ fn poll_msdf_generator(
                 glyphs.version = glyphs.version.wrapping_add(1);
             }
         }
+
+        // Wake the event loop so the re-render happens immediately (reactive mode).
+        let _ = event_loop_proxy.send_event(WinitUserEvent::WakeUp);
     }
 
     // Sync atlas pixels to GPU texture

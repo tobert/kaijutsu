@@ -346,12 +346,18 @@ pub fn build_block_scenes(
             continue;
         }
 
-        // Check if rebuild is needed
+        // Check if rebuild is needed.
+        // Rainbow/animation effects are shader-driven (globals.time / uniforms.time)
+        // and don't need CPU-side scene rebuilds AFTER the first build. But we must
+        // rebuild once when the flag first becomes true so msdf_glyphs.rainbow is set.
         let version_changed = block_scene.content_version != block_scene.last_built_version;
         let width_changed = (block_scene.built_width - width).abs() > 1.0;
         let is_rainbow = effects.is_some_and(|e| e.rainbow);
         let has_animation = border.is_some_and(|b| b.animation != BorderAnimation::None);
-        let needs_rebuild = version_changed || width_changed || is_rainbow || has_animation;
+        let never_built = block_scene.last_built_version == 0;
+        let needs_rebuild = version_changed
+            || width_changed
+            || (never_built && (is_rainbow || has_animation));
 
         if !needs_rebuild {
             continue;
@@ -1148,6 +1154,11 @@ fn extract_msdf_atlas(
         return;
     };
 
+    if extracted.version == atlas.version {
+        return;
+    }
+
+    extracted.version = atlas.version;
     extracted.regions = atlas.regions.clone();
     extracted.texture = atlas.texture.clone();
     extracted.width = atlas.width;

@@ -11,6 +11,7 @@
 use std::sync::Mutex;
 
 use bevy::prelude::*;
+use bevy::winit::{EventLoopProxyWrapper, WinitUserEvent};
 use kaijutsu_client::{ActorHandle, ContextMembership, Identity, KernelInfo, SshConfig};
 use kaijutsu_types::{ContextId, KernelId};
 use tokio::sync::{broadcast, mpsc};
@@ -199,11 +200,14 @@ fn poll_bootstrap_results(
     channel: Res<BootstrapChannel>,
     result_channel: Res<RpcResultChannel>,
     invocation_channel: Res<crate::agents::AgentInvocationChannel>,
+    event_loop_proxy: Res<EventLoopProxyWrapper>,
 ) {
     let Ok(mut rx) = channel.rx.lock() else {
         return;
     };
+    let mut received_any = false;
     while let Ok(result) = rx.try_recv() {
+        received_any = true;
         match result {
             bootstrap::BootstrapResult::ActorReady {
                 handle,
@@ -319,6 +323,9 @@ fn poll_bootstrap_results(
             }
         }
     }
+    if received_any {
+        let _ = event_loop_proxy.send_event(WinitUserEvent::WakeUp);
+    }
 }
 
 /// Drain server events from ActorHandle's broadcast channel.
@@ -330,6 +337,7 @@ fn poll_server_events(
     mut events: MessageWriter<ServerEventMessage>,
     mut sync_gen: ResMut<SyncGeneration>,
     mut receiver: Local<Option<broadcast::Receiver<kaijutsu_client::ServerEvent>>>,
+    event_loop_proxy: Res<EventLoopProxyWrapper>,
 ) {
     let Some(actor) = actor else { return };
 
@@ -345,9 +353,11 @@ fn poll_server_events(
     let Some(rx) = receiver.as_mut() else { return };
 
     // Drain all available events
+    let mut received_any = false;
     loop {
         match rx.try_recv() {
             Ok(event) => {
+                received_any = true;
                 events.write(ServerEventMessage(event));
             }
             Err(broadcast::error::TryRecvError::Lagged(n)) => {
@@ -363,6 +373,12 @@ fn poll_server_events(
             }
         }
     }
+
+    // Wake the event loop so the next tick runs immediately (reactive mode).
+    // Without this, incoming bursts (context join) stall for up to 100ms per batch.
+    if received_any {
+        let _ = event_loop_proxy.send_event(WinitUserEvent::WakeUp);
+    }
 }
 
 /// Drain connection status events from ActorHandle's broadcast channel.
@@ -374,6 +390,7 @@ fn poll_connection_status(
     actor: Option<Res<RpcActor>>,
     mut events: MessageWriter<ConnectionStatusMessage>,
     mut receiver: Local<Option<broadcast::Receiver<kaijutsu_client::ConnectionStatus>>>,
+    event_loop_proxy: Res<EventLoopProxyWrapper>,
 ) {
     let Some(actor) = actor else { return };
 
@@ -384,9 +401,11 @@ fn poll_connection_status(
 
     let Some(rx) = receiver.as_mut() else { return };
 
+    let mut received_any = false;
     loop {
         match rx.try_recv() {
             Ok(status) => {
+                received_any = true;
                 events.write(ConnectionStatusMessage(status));
             }
             Err(broadcast::error::TryRecvError::Lagged(n)) => {
@@ -407,15 +426,28 @@ fn poll_connection_status(
             }
         }
     }
+
+    if received_any {
+        let _ = event_loop_proxy.send_event(WinitUserEvent::WakeUp);
+    }
 }
 
 /// Drain results from async RPC tasks and write them as Bevy messages.
-fn poll_rpc_results(channel: Res<RpcResultChannel>, mut events: MessageWriter<RpcResultMessage>) {
+fn poll_rpc_results(
+    channel: Res<RpcResultChannel>,
+    mut events: MessageWriter<RpcResultMessage>,
+    event_loop_proxy: Res<EventLoopProxyWrapper>,
+) {
     let Ok(mut rx) = channel.rx.lock() else {
         return;
     };
+    let mut received_any = false;
     while let Ok(result) = rx.try_recv() {
+        received_any = true;
         events.write(result);
+    }
+    if received_any {
+        let _ = event_loop_proxy.send_event(WinitUserEvent::WakeUp);
     }
 }
 
