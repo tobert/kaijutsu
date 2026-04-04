@@ -581,6 +581,8 @@ pub fn handle_stack_navigation(
     mut stack_state: ResMut<crate::ui::card_stack::CardStackState>,
     mut view_mode: ResMut<crate::ui::card_stack::StackViewMode>,
     mut next_screen: ResMut<NextState<crate::ui::screen::Screen>>,
+    mut reading_tx: ResMut<crate::ui::card_stack::ReadingTransition>,
+    params: Res<crate::ui::card_stack::CardStackLayout>,
 ) {
     use crate::ui::card_stack::StackViewMode;
 
@@ -592,6 +594,9 @@ pub fn handle_stack_navigation(
             Action::FocusPrevBlock if is_browse => stack_state.focus_prev(),
             Action::FocusFirstBlock if is_browse => stack_state.focus_first(),
             Action::FocusLastBlock if is_browse => stack_state.focus_last(),
+            // Scroll in reading mode
+            Action::FocusNextBlock => reading_tx.scroll_offset += params.reading_scroll_step,
+            Action::FocusPrevBlock => reading_tx.scroll_offset -= params.reading_scroll_step,
             Action::Activate => {
                 if is_browse && stack_state.card_count > 0 {
                     *view_mode = StackViewMode::Reading {

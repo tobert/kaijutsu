@@ -72,6 +72,7 @@ impl Plugin for CardStackPlugin {
                     *view_mode = StackViewMode::Browse;
                     reading_tx.progress = 0.0;
                     reading_tx.target = 0.0;
+                    reading_tx.scroll_offset = 0.0;
                 },
             )
                 .chain(),
@@ -86,6 +87,7 @@ impl Plugin for CardStackPlugin {
                     *view_mode = StackViewMode::Browse;
                     reading_tx.progress = 0.0;
                     reading_tx.target = 0.0;
+                    reading_tx.scroll_offset = 0.0;
                 },
             ),
         );

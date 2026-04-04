@@ -98,8 +98,10 @@ pub struct CardStackLayout {
     // ── Reading mode ──
     /// Z-position of the expanded reading card.
     pub reading_card_z: f32,
-    /// Scale multiplier for the reading card (relative to card_width).
-    pub reading_card_scale: f32,
+    /// Viewport fill fraction for the reading card (0.0–1.0, default 0.92).
+    pub reading_card_fill: f32,
+    /// Scroll step per j/k press in reading mode (world units).
+    pub reading_scroll_step: f32,
     /// Y-position of the compressed strip.
     pub strip_y: f32,
     /// Z-position of the compressed strip.
@@ -127,7 +129,8 @@ impl Default for CardStackLayout {
             smooth_speed: 10.0,
             // Reading mode
             reading_card_z: 30.0,
-            reading_card_scale: 1.1,
+            reading_card_fill: 0.92,
+            reading_scroll_step: 15.0,
             strip_y: -50.0,
             strip_z: -10.0,
             strip_spacing: 1.2,
@@ -183,6 +186,8 @@ pub struct ReadingTransition {
     /// Which card index is (or was) pulled out for reading.
     /// Retained during exit animation so the gap marker animates out.
     pub source_index: usize,
+    /// Vertical scroll offset in world units (positive = scrolled down).
+    pub scroll_offset: f32,
 }
 
 impl Default for ReadingTransition {
@@ -191,6 +196,7 @@ impl Default for ReadingTransition {
             progress: 0.0,
             target: 0.0,
             source_index: 0,
+            scroll_offset: 0.0,
         }
     }
 }
@@ -235,6 +241,7 @@ pub fn tick_reading_transition(
     match *view_mode {
         StackViewMode::Browse => {
             transition.target = 0.0;
+            transition.scroll_offset = 0.0;
         }
         StackViewMode::Reading { source_index } => {
             transition.target = 1.0;
@@ -354,6 +361,8 @@ pub fn compute_card_layout(
         (&mut Transform, &MeshMaterial3d<StackCardMaterial>),
         (With<GapMarker>, Without<StackCard>),
     >,
+    camera_q: Query<&GlobalTransform, With<super::camera::StackCameraTag>>,
+    windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
 ) {
     let focus = state.current_focus;
     let anim_t = match *anim_phase {
@@ -362,6 +371,16 @@ pub fn compute_card_layout(
     };
     let rt = transition.progress;
     let source_idx = transition.source_index;
+
+    // Compute viewport-fit reading scale from camera geometry
+    let reading_scale = {
+        let camera_z = camera_q.iter().next().map(|t| t.translation().z).unwrap_or(180.0);
+        let aspect = windows.iter().next().map(|w| w.width() / w.height()).unwrap_or(1.6);
+        let fov = std::f32::consts::FRAC_PI_4;
+        let dist = camera_z - params.reading_card_z;
+        let half_h = dist * (fov / 2.0).tan();
+        2.0 * half_h * aspect * params.reading_card_fill
+    };
 
     for (card_entity, card, mut transform, mut lod, mut vis) in cards.iter_mut() {
         let idx = card.card_index as f32;
@@ -463,13 +482,13 @@ pub fn compute_card_layout(
             );
         } else {
             // ── Blend toward reading layout ──
-            let (read_pos, read_rot, read_scale, read_opacity, read_glow, read_lod_f) =
+            let (read_pos, read_rot, read_scale_val, read_opacity, read_glow, read_lod_f) =
                 if card_idx == source_idx {
                     // This card rises to expanded reading position
                     (
-                        Vec3::new(0.0, 0.0, params.reading_card_z),
+                        Vec3::new(0.0, transition.scroll_offset, params.reading_card_z),
                         Quat::IDENTITY,
-                        params.card_width * params.reading_card_scale,
+                        reading_scale,
                         1.0_f32,
                         0.9_f32,
                         0.0_f32,
@@ -497,7 +516,7 @@ pub fn compute_card_layout(
             transform.translation = browse_pos.lerp(read_pos, eased);
             transform.rotation = browse_rot.slerp(read_rot, eased);
             transform.scale =
-                Vec3::splat(browse_scale + (read_scale - browse_scale) * eased);
+                Vec3::splat(browse_scale + (read_scale_val - browse_scale) * eased);
 
             let opacity = browse_opacity + (read_opacity - browse_opacity) * eased;
             let glow = browse_glow + (read_glow - browse_glow) * eased;
