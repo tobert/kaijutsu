@@ -571,21 +571,42 @@ pub fn handle_toggle_stack_view(
     }
 }
 
-/// Handle j/k navigation within the card stack view.
+/// Handle navigation within the card stack view.
+///
+/// Browse mode: j/k navigate, Enter enters reading mode.
+/// Reading mode: j/k blocked (future: modalkit), Escape exits to browse.
+/// Browse + Escape: exits stack view entirely → Conversation screen.
 pub fn handle_stack_navigation(
     mut actions: MessageReader<ActionFired>,
     mut stack_state: ResMut<crate::ui::card_stack::CardStackState>,
+    mut view_mode: ResMut<crate::ui::card_stack::StackViewMode>,
+    mut next_screen: ResMut<NextState<crate::ui::screen::Screen>>,
 ) {
+    use crate::ui::card_stack::StackViewMode;
+
     for ActionFired(action) in actions.read() {
+        let is_browse = matches!(*view_mode, StackViewMode::Browse);
+
         match action {
-            Action::FocusNextBlock => stack_state.focus_next(),
-            Action::FocusPrevBlock => stack_state.focus_prev(),
-            Action::FocusFirstBlock => stack_state.focus_first(),
-            Action::FocusLastBlock => stack_state.focus_last(),
-            Action::Unfocus => {
-                // Escape in stack → go back to conversation list
-                // Handled by handle_toggle_stack_view or handle_unfocus
+            Action::FocusNextBlock if is_browse => stack_state.focus_next(),
+            Action::FocusPrevBlock if is_browse => stack_state.focus_prev(),
+            Action::FocusFirstBlock if is_browse => stack_state.focus_first(),
+            Action::FocusLastBlock if is_browse => stack_state.focus_last(),
+            Action::Activate => {
+                if is_browse && stack_state.card_count > 0 {
+                    *view_mode = StackViewMode::Reading {
+                        source_index: stack_state.focused_index,
+                    };
+                }
             }
+            Action::Unfocus => match *view_mode {
+                StackViewMode::Reading { .. } => {
+                    *view_mode = StackViewMode::Browse;
+                }
+                StackViewMode::Browse => {
+                    next_screen.set(crate::ui::screen::Screen::Conversation);
+                }
+            },
             _ => {}
         }
     }

@@ -24,7 +24,10 @@ use crate::ui::card_stack::material::StackCardMaterial;
 use crate::ui::screen::Screen;
 
 pub use camera::StackCameraTag;
-pub use layout::{CardLod, CardStackLayout, CardStackState, StackAnimPhase};
+pub use layout::{
+    CardLod, CardStackLayout, CardStackState, GapMarker, ReadingTransition, StackAnimPhase,
+    StackViewMode,
+};
 pub use sync::StackCard;
 
 /// Plugin for the Conversation Stack 3D view.
@@ -35,7 +38,9 @@ impl Plugin for CardStackPlugin {
         // Resources
         app.init_resource::<CardStackState>()
             .init_resource::<CardStackLayout>()
-            .init_resource::<StackAnimPhase>();
+            .init_resource::<StackAnimPhase>()
+            .init_resource::<StackViewMode>()
+            .init_resource::<ReadingTransition>();
 
         // Material registration
         app.add_plugins(MaterialPlugin::<StackCardMaterial>::default());
@@ -46,7 +51,10 @@ impl Plugin for CardStackPlugin {
             .register_type::<CardLod>()
             .register_type::<StackCard>()
             .register_type::<StackCameraTag>()
-            .register_type::<StackAnimPhase>();
+            .register_type::<StackAnimPhase>()
+            .register_type::<StackViewMode>()
+            .register_type::<ReadingTransition>()
+            .register_type::<GapMarker>();
 
         // Screen transitions
         app.add_systems(
@@ -54,11 +62,16 @@ impl Plugin for CardStackPlugin {
             (
                 camera::spawn_stack_camera,
                 sync::sync_stack_cards,
-                |mut state: ResMut<CardStackState>, mut anim: ResMut<StackAnimPhase>| {
-                    // Sync current_focus to avoid starting from index 0 on enter
+                |mut state: ResMut<CardStackState>,
+                 mut anim: ResMut<StackAnimPhase>,
+                 mut view_mode: ResMut<StackViewMode>,
+                 mut reading_tx: ResMut<ReadingTransition>| {
                     state.current_focus = state.focused_index as f32;
                     state.last_focus = state.current_focus;
                     *anim = StackAnimPhase::Entering { progress: 0.0 };
+                    *view_mode = StackViewMode::Browse;
+                    reading_tx.progress = 0.0;
+                    reading_tx.target = 0.0;
                 },
             )
                 .chain(),
@@ -68,6 +81,12 @@ impl Plugin for CardStackPlugin {
             (
                 camera::despawn_stack_camera,
                 sync::despawn_all_cards,
+                |mut view_mode: ResMut<StackViewMode>,
+                 mut reading_tx: ResMut<ReadingTransition>| {
+                    *view_mode = StackViewMode::Browse;
+                    reading_tx.progress = 0.0;
+                    reading_tx.target = 0.0;
+                },
             ),
         );
 
@@ -78,6 +97,8 @@ impl Plugin for CardStackPlugin {
                 sync::sync_stack_cards,
                 layout::tick_stack_anim,
                 layout::interpolate_stack_focus,
+                layout::tick_reading_transition,
+                layout::manage_gap_marker,
                 layout::compute_card_layout,
             )
                 .chain()

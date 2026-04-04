@@ -128,6 +128,49 @@ fn back_face_pattern(uv: vec2<f32>, glow_color: vec4<f32>) -> vec4<f32> {
     return vec4<f32>(color, 0.95);
 }
 
+// ── Gap Sparkle ────────────────────────────────────────────────────
+// Animated twinkle dots inside a card-shaped outline.
+// Marks where the reading card was pulled from the strip.
+
+fn gap_sparkle(uv: vec2<f32>, glow_color: vec3<f32>, time: f32, opacity: f32) -> vec4<f32> {
+    // SDF card outline
+    let p = uv - 0.5;
+    let half = vec2<f32>(0.48, 0.48);
+    let corner = 0.02;
+    let q = abs(p) - half + corner;
+    let d = min(max(q.x, q.y), 0.0) + length(max(q, vec2<f32>(0.0))) - corner;
+
+    // Thin glowing outline
+    let outline = exp(-abs(d) / 0.012) * 0.35;
+
+    // Sparkle grid — 5x5 cells, each with a twinkling dot
+    let grid_size = 5.0;
+    let cell = floor(uv * grid_size);
+    let cell_uv = fract(uv * grid_size) - 0.5;
+
+    // Pseudo-random per-cell values
+    let h1 = fract(sin(dot(cell, vec2<f32>(127.1, 311.7))) * 43758.5453);
+    let h2 = fract(sin(dot(cell, vec2<f32>(269.5, 183.3))) * 43758.5453);
+
+    // Sharp twinkle: sin^4 with per-cell phase and speed
+    let phase = h1 * 6.283 + time * (1.5 + h2 * 3.0);
+    let brightness = pow(max(sin(phase), 0.0), 4.0);
+
+    // Jittered sparkle position within cell
+    let jitter = vec2<f32>(h1 - 0.5, h2 - 0.5) * 0.5;
+    let dist = length(cell_uv - jitter);
+    let point = smoothstep(0.18, 0.0, dist) * brightness;
+
+    // Mask: only sparkle inside the card area
+    let inside = smoothstep(0.005, -0.005, d);
+    let sparkle = point * inside;
+
+    let color = glow_color * (outline + sparkle * 1.2);
+    let a = (outline * 0.5 + sparkle * 0.9) * opacity;
+
+    return vec4<f32>(color, a);
+}
+
 // ── Main Fragment ───────────────────────────────────────────────────
 
 @fragment
@@ -137,9 +180,15 @@ fn fragment(
 ) -> @location(0) vec4<f32> {
     let opacity = uniforms.card_params.x;
     let lod_factor = uniforms.card_params.y;
+    let render_mode = uniforms.card_params.z;
     let glow_color = uniforms.glow_color;
     let glow_intensity = uniforms.glow_params.x;
     let time = globals.time;
+
+    // Gap sparkle mode — animated twinkle placeholder
+    if render_mode > 0.5 {
+        return gap_sparkle(in.uv, glow_color.rgb, time, opacity);
+    }
 
     // Back face: dark grid with role-colored edge tint
     if !is_front {

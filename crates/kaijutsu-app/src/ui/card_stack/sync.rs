@@ -186,7 +186,7 @@ pub fn despawn_all_cards(
 }
 
 /// Map role → Color (linear, for StandardMaterial base_color).
-fn role_glow_linear(role: Role) -> Color {
+pub(crate) fn role_glow_linear(role: Role) -> Color {
     match role {
         Role::User => Color::srgb(0.2, 0.85, 0.95),
         Role::Model => Color::srgb(0.65, 0.35, 1.0),
