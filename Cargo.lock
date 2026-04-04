@@ -5630,6 +5630,7 @@ dependencies = [
  "avian2d",
  "bevy",
  "bevy_brp_extras",
+ "bevy_mesh",
  "bevy_remote",
  "bevy_tweening",
  "bevy_vello",

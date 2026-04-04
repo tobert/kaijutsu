@@ -74,6 +74,7 @@ shellexpand = "3"
 # Bevy Remote Protocol (debugging)
 bevy_remote = "0.18"
 bevy_brp_extras = "0.18"
+bevy_mesh = "0.18"
 
 # Geometry primitives (transitive dep via vello — zero new compiled code)
 kurbo = "0.13"

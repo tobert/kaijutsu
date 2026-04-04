@@ -6,7 +6,11 @@
 //! - LOD degradation (blur → abstract → outline as distance increases)
 
 use bevy::prelude::*;
-use bevy::render::render_resource::AsBindGroup;
+use bevy::pbr::{MaterialPipeline, MaterialPipelineKey};
+use bevy_mesh::MeshVertexBufferLayoutRef;
+use bevy::render::render_resource::{
+    AsBindGroup, RenderPipelineDescriptor, SpecializedMeshPipelineError,
+};
 use bevy::shader::ShaderRef;
 
 /// Packed uniform data for the card shader.
@@ -51,5 +55,16 @@ impl Material for StackCardMaterial {
 
     fn alpha_mode(&self) -> AlphaMode {
         AlphaMode::Blend
+    }
+
+    fn specialize(
+        _pipeline: &MaterialPipeline,
+        descriptor: &mut RenderPipelineDescriptor,
+        _layout: &MeshVertexBufferLayoutRef,
+        _key: MaterialPipelineKey<Self>,
+    ) -> Result<(), SpecializedMeshPipelineError> {
+        // Disable face culling so back faces render with their own pattern.
+        descriptor.primitive.cull_mode = None;
+        Ok(())
     }
 }

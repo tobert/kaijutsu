@@ -132,6 +132,11 @@ fn ease_out_cubic(t: f32) -> f32 {
     1.0 - (1.0 - t).powi(3)
 }
 
+fn smoothstep_f32(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
 /// System: advance the entry animation timer.
 pub fn tick_stack_anim(
     mut phase: ResMut<StackAnimPhase>,
@@ -254,19 +259,21 @@ pub fn compute_card_layout(
             transform.translation = collapse.lerp(transform.translation, anim_t);
         }
 
-        // Update child quad material alpha and glow for LOD fade + focus highlight
+        // Update child quad material alpha, LOD, and glow for focus highlight
         let opacity = if abs_dist < 1.0 {
             1.0
         } else {
             new_lod.opacity().max(0.1)
         } * anim_t;
         let glow_intensity = 0.5 + focus_blend * 0.4;
+        let lod_factor = smoothstep_f32(0.5, 8.0, abs_dist);
 
         if let Ok(children) = children_q.get(card_entity) {
             for child in children.iter() {
                 if let Ok(mat_handle) = mat_handle_q.get(child) {
                     if let Some(mat) = materials.get_mut(&mat_handle.0) {
                         mat.uniforms.card_params.x = opacity;
+                        mat.uniforms.card_params.y = lod_factor;
                         mat.uniforms.glow_params.x = glow_intensity;
                     }
                 }

@@ -24,13 +24,13 @@ perspective, navigation works, clean round-trip to Conversation view.
 
 - [x] **AsBindGroup working** — packed `StackCardUniforms` struct at binding(2)
       with texture(0)/sampler(1). `stack_card.wgsl` renders edge glow + opacity.
-- [ ] **LOD text degradation** — blur → colored bars → dim outline as cards
-      recede. Extend the fragment shader.
-- [ ] **Holographic edge glow enhancement** — SDF-based chromatic-shifted glow,
-      time-animated shimmer. Current edge glow is basic smoothstep.
+- [x] **LOD text degradation** — 9-tap blur → colored bars driven by
+      `lod_factor = smoothstep(0.5, 8.0, abs_dist)` in `card_params.y`.
+- [x] **Holographic edge glow enhancement** — SDF rounded-box distance,
+      chromatic aberration along edge normal, `globals.time`-animated shimmer.
       Role-colored (cyan/violet/amber).
-- [ ] **Back face** — dark with faint wireframe edge when card rotation shows
-      the back.
+- [x] **Back face** — dark grid (20x) with role-colored edge tint.
+      `specialize()` sets `cull_mode = None` for double-sided rendering.
 
 ## Interaction
 
