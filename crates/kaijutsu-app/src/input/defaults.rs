@@ -233,14 +233,6 @@ pub fn default_bindings() -> Vec<Binding> {
         "Toggle collapse",
     ));
 
-    // Quit (bare 'q' in navigation)
-    b.push(Binding::key(
-        KeyCode::KeyQ,
-        InputContext::Navigation,
-        Action::Quit,
-        "Quit",
-    ));
-
     // Scroll
     b.push(Binding::key_mod(
         KeyCode::KeyD,
