@@ -62,9 +62,9 @@ let providers = #{
     ollama: #{
         enabled: true,
         base_url: "http://localhost:11434",
-        default_model: "qwen3.5:9b-bf16",
-        // Local models may not handle all tools safely - be selective
-        default_tools: #{ type: "deny", tools: ["bash", "shell"] },
+        default_model: "gemma4:31b",
+        default_tools: #{ type: "all" },
+        // default_tools: #{ type: "deny", tools: ["bash", "shell"] },
     },
 
 };
@@ -88,9 +88,11 @@ let model_aliases = #{
     "best": #{ provider: "anthropic", model: "claude-opus-4-5-20251101" },
 
     // Local models (ollama)
-    "local": #{ provider: "ollama", model: "qwen3.5:9b-bf16" },
-    "offline": #{ provider: "ollama", model: "qwen3.5:9b-bf16" },
-    "local-big": #{ provider: "ollama", model: "qwen3.5:35b-a3b" },
+    "local": #{ provider: "ollama", model: "gemma4:31b" },
+    "offline": #{ provider: "ollama", model: "gemma4:31b" },
+    "local-vision": #{ provider: "ollama", model: "gemma4:31b" },
+    "local-fast": #{ provider: "ollama", model: "qwen3.5:9b-bf16" },
+    "local-moe": #{ provider: "ollama", model: "qwen3.5:35b-a3b" },
 };
 
 // ============================================================================
