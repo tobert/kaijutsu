@@ -14,29 +14,27 @@
 //! context list
 //! ```
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use kaijutsu_types::ContextId;
+use kaijutsu_types::{ContextId, SessionId};
 use tokio::sync::RwLock;
 
 use kaijutsu_kernel::drift::SharedDriftRouter;
 use kaijutsu_kernel::tools::{ExecResult, ExecutionEngine};
 
 // ============================================================================
-// Shell Context State - per-connection "current context" tracking
+// Shell Context State - per-session "current context" tracking
 // ============================================================================
 
-/// Per-connection state tracking which context the shell is currently in.
-///
-/// All context listing, label resolution, and metadata live in the kernel's
-/// DriftRouter. This struct only tracks which context is "active" for this
-/// particular shell session.
-pub type CurrentContext = Arc<RwLock<Option<ContextId>>>;
+/// Per-session current-context map. Each SSH session gets independent state
+/// so that one session switching context doesn't affect others.
+pub type SessionContextMap = Arc<RwLock<HashMap<SessionId, ContextId>>>;
 
-/// Create a new current-context tracker.
-pub fn current_context() -> CurrentContext {
-    Arc::new(RwLock::new(None))
+/// Create a new session-context map.
+pub fn session_context_map() -> SessionContextMap {
+    Arc::new(RwLock::new(HashMap::new()))
 }
 
 // ============================================================================
@@ -51,16 +49,20 @@ pub fn current_context() -> CurrentContext {
 /// - `context current` - Show current context
 pub struct ContextEngine {
     drift: SharedDriftRouter,
-    current: CurrentContext,
+    sessions: SessionContextMap,
 }
 
 impl ContextEngine {
-    /// Create a new context engine.
-    pub fn new(drift: SharedDriftRouter, current: CurrentContext) -> Self {
-        Self { drift, current }
+    /// Create a new context engine with per-session state tracking.
+    pub fn new(drift: SharedDriftRouter, sessions: SessionContextMap) -> Self {
+        Self { drift, sessions }
     }
 
-    async fn execute_inner(&self, args: Vec<String>) -> Result<String, String> {
+    async fn execute_inner(
+        &self,
+        args: Vec<String>,
+        session_id: SessionId,
+    ) -> Result<String, String> {
         if args.is_empty() {
             return self.show_help();
         }
@@ -80,7 +82,7 @@ impl ContextEngine {
                             .unwrap_or("(unlabeled)");
                         let label_owned = label.to_string();
                         drop(router);
-                        *self.current.write().await = Some(ctx_id);
+                        self.sessions.write().await.insert(session_id, ctx_id);
                         Ok(format!("Switched to context '{}'", label_owned))
                     }
                     Err(e) => Err(format!("Failed to resolve context '{}': {}", query, e)),
@@ -88,7 +90,7 @@ impl ContextEngine {
             }
             "list" | "ls" => {
                 let router = self.drift.read().await;
-                let current_id = *self.current.read().await;
+                let current_id = self.sessions.read().await.get(&session_id).copied();
                 let contexts = router.list_contexts();
 
                 let mut output = String::new();
@@ -108,7 +110,7 @@ impl ContextEngine {
                 Ok(output)
             }
             "current" | "show" => {
-                let current_id = *self.current.read().await;
+                let current_id = self.sessions.read().await.get(&session_id).copied();
                 match current_id {
                     Some(id) => {
                         let router = self.drift.read().await;
@@ -122,7 +124,7 @@ impl ContextEngine {
                 }
             }
             "leave" => {
-                let old = self.current.write().await.take();
+                let old = self.sessions.write().await.remove(&session_id);
                 match old {
                     Some(id) => {
                         let router = self.drift.read().await;
@@ -192,7 +194,7 @@ impl ExecutionEngine for ContextEngine {
     async fn execute(
         &self,
         params: &str,
-        _ctx: &kaijutsu_kernel::ToolContext,
+        ctx: &kaijutsu_kernel::ToolContext,
     ) -> anyhow::Result<ExecResult> {
         // Parse the JSON params
         let parsed: serde_json::Value = match serde_json::from_str(params) {
@@ -213,7 +215,7 @@ impl ExecutionEngine for ContextEngine {
             })
             .unwrap_or_default();
 
-        match self.execute_inner(args).await {
+        match self.execute_inner(args, ctx.session_id).await {
             Ok(output) => Ok(ExecResult::success(output)),
             Err(e) => Ok(ExecResult::failure(1, e)),
         }
@@ -240,8 +242,8 @@ mod tests {
             kaijutsu_types::PrincipalId::system(),
         );
 
-        let current = current_context();
-        let engine = ContextEngine::new(drift, current);
+        let sessions = session_context_map();
+        let engine = ContextEngine::new(drift, sessions);
 
         let result = engine
             .execute(
@@ -265,26 +267,30 @@ mod tests {
             kaijutsu_types::PrincipalId::system(),
         );
 
-        let current = current_context();
-        let engine = ContextEngine::new(drift, current.clone());
+        let sessions = session_context_map();
+        let engine = ContextEngine::new(drift, sessions.clone());
 
+        let tool_ctx = kaijutsu_kernel::ToolContext::test();
         let result = engine
             .execute(
                 r#"{"_positional": ["switch", "planning"]}"#,
-                &kaijutsu_kernel::ToolContext::test(),
+                &tool_ctx,
             )
             .await
             .unwrap();
         assert!(result.success);
         assert!(result.stdout.contains("planning"));
-        assert_eq!(*current.read().await, Some(ctx_id));
+        assert_eq!(
+            sessions.read().await.get(&tool_ctx.session_id).copied(),
+            Some(ctx_id),
+        );
     }
 
     #[tokio::test]
     async fn test_context_engine_help() {
         let drift = shared_drift_router();
-        let current = current_context();
-        let engine = ContextEngine::new(drift, current);
+        let sessions = session_context_map();
+        let engine = ContextEngine::new(drift, sessions);
 
         let result = engine
             .execute(
@@ -295,5 +301,80 @@ mod tests {
             .unwrap();
         assert!(result.success);
         assert!(result.stdout.contains("USAGE"));
+    }
+
+    /// Regression: sessions must have independent current-context tracking.
+    /// Previously a single Arc was shared across all sessions, so one
+    /// session's switch contaminated every other session.
+    #[tokio::test]
+    async fn test_sessions_have_independent_current_context() {
+        let drift = shared_drift_router();
+        let id_alpha = ContextId::new();
+        let id_beta = ContextId::new();
+
+        {
+            let mut d = drift.write().await;
+            d.register(
+                id_alpha,
+                Some("alpha"),
+                None,
+                kaijutsu_types::PrincipalId::new(),
+            );
+            d.register(
+                id_beta,
+                Some("beta"),
+                None,
+                kaijutsu_types::PrincipalId::new(),
+            );
+        }
+
+        // Both engines share the same SessionContextMap (as in production),
+        // but each session uses a different SessionId via ToolContext.
+        let sessions = session_context_map();
+        let engine = ContextEngine::new(drift.clone(), sessions.clone());
+
+        let session_a = SessionId::new();
+        let ctx_a = kaijutsu_kernel::ToolContext {
+            session_id: session_a,
+            ..kaijutsu_kernel::ToolContext::test()
+        };
+        let session_b = SessionId::new();
+        let ctx_b = kaijutsu_kernel::ToolContext {
+            session_id: session_b,
+            ..kaijutsu_kernel::ToolContext::test()
+        };
+
+        // Session A switches to alpha
+        let result = engine
+            .execute(
+                r#"{"_positional": ["switch", "alpha"]}"#,
+                &ctx_a,
+            )
+            .await
+            .unwrap();
+        assert!(result.success, "Session A switch failed: {}", result.stderr);
+
+        // Session B switches to beta
+        let result = engine
+            .execute(
+                r#"{"_positional": ["switch", "beta"]}"#,
+                &ctx_b,
+            )
+            .await
+            .unwrap();
+        assert!(result.success, "Session B switch failed: {}", result.stderr);
+
+        // Session A's current context should still be alpha.
+        let map = sessions.read().await;
+        assert_eq!(
+            map.get(&session_a).copied(),
+            Some(id_alpha),
+            "Session A's context should still be alpha after Session B switched",
+        );
+        assert_eq!(
+            map.get(&session_b).copied(),
+            Some(id_beta),
+            "Session B's context should be beta",
+        );
     }
 }

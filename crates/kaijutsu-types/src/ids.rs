@@ -230,13 +230,20 @@ pub fn resolve_prefix<'a, T: PrefixResolvable>(
 ) -> Result<T, PrefixError> {
     let entries: Vec<(T, Option<&str>)> = items.collect();
 
-    // 1. Exact label match
-    for &(id, label) in &entries {
-        if let Some(l) = label
-            && l == query
-        {
-            return Ok(id);
+    // 1. Exact label match (must be unique — ambiguous if multiple)
+    let exact: Vec<_> = entries
+        .iter()
+        .filter_map(|&(id, label)| label.filter(|l| *l == query).map(|l| (id, l)))
+        .collect();
+    match exact.len() {
+        1 => return Ok(exact[0].0),
+        n if n > 1 => {
+            return Err(PrefixError::Ambiguous {
+                prefix: query.to_string(),
+                candidates: exact.iter().map(|(_, l)| l.to_string()).collect(),
+            });
         }
+        _ => {}
     }
 
     // 2. Unique label prefix match

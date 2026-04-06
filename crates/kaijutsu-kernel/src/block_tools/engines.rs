@@ -1538,6 +1538,103 @@ mod tests {
         (store, ctx, tool_ctx)
     }
 
+    /// April-showers issue #1: block_append and block_edit skip auto_save
+    /// ("high frequency during streaming"). Mutations made outside LLM
+    /// streaming (e.g. user tool calls) are never persisted unless something
+    /// else calls save_snapshot.
+    #[tokio::test]
+    async fn test_block_append_persists_to_db() {
+        use crate::kernel_db::{DocumentRow, KernelDb};
+        use kaijutsu_types::{KernelId, now_millis};
+        use std::sync::Arc;
+
+        let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+        let creator = PrincipalId::system();
+        let kernel_id = KernelId::new();
+
+        let ws_id = {
+            let db_guard = db.lock();
+            db_guard
+                .get_or_create_default_workspace(kernel_id, creator)
+                .unwrap()
+        };
+
+        let store = crate::block_store::shared_block_store_with_db(
+            db.clone(),
+            kernel_id,
+            ws_id,
+            creator,
+        );
+
+        let ctx = test_context_id();
+        {
+            let db_guard = db.lock();
+            db_guard
+                .insert_document(&DocumentRow {
+                    document_id: ctx,
+                    kernel_id,
+                    workspace_id: ws_id,
+                    doc_kind: DocumentKind::Code,
+                    language: None,
+                    path: None,
+                    created_at: now_millis() as i64,
+                    created_by: creator,
+                })
+                .unwrap();
+        }
+
+        store
+            .create_document(ctx, DocumentKind::Code, None)
+            .unwrap();
+        let tool_ctx = ToolContext {
+            context_id: ctx,
+            ..ToolContext::test()
+        };
+
+        // Create a block (this DOES auto_save via insert_block_as)
+        let engine = BlockCreateEngine::new(store.clone());
+        let params = r#"{"role": "user", "kind": "text", "content": "hello"}"#;
+        let result = engine.execute(params, &tool_ctx).await.unwrap();
+        assert!(result.success);
+
+        // Verify creation was persisted
+        {
+            let db_guard = db.lock();
+            let snapshot = db_guard.get_snapshot(ctx).unwrap().unwrap();
+            assert!(
+                snapshot.content.contains("hello"),
+                "block_create should persist (it calls auto_save)"
+            );
+        }
+
+        // Append via block_append engine
+        let response: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
+        let block_key = response["block_id"].as_str().unwrap();
+
+        let append_engine = BlockAppendEngine::new(store.clone());
+        let append_params = format!(r#"{{"block_id": "{}", "text": " world"}}"#, block_key);
+        let append_result = append_engine.execute(&append_params, &tool_ctx).await.unwrap();
+        assert!(
+            append_result.success,
+            "append failed: {}",
+            append_result.stderr
+        );
+
+        // In-memory store has the append
+        assert_eq!(store.get_content(ctx).unwrap(), "hello world");
+
+        // append_text_as skips auto_save (high-frequency streaming path),
+        // so callers must flush explicitly when the turn completes.
+        store.save_snapshot(ctx).unwrap();
+        let db_guard = db.lock();
+        let snapshot = db_guard.get_snapshot(ctx).unwrap().unwrap();
+        assert_eq!(
+            snapshot.content, "hello world",
+            "block_append should persist to DB, but snapshot still has: {:?}",
+            snapshot.content,
+        );
+    }
+
     #[tokio::test]
     async fn test_block_create() {
         let (store, _ctx, tool_ctx) = setup_test_store();

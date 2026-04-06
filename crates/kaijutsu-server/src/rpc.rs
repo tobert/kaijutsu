@@ -134,7 +134,7 @@ async fn register_block_tools(
     documents: SharedBlockStore,
     workspace_guard: Option<kaijutsu_kernel::file_tools::WorkspaceGuard>,
 ) {
-    let current = crate::context_engine::current_context();
+    let sessions = crate::context_engine::session_context_map();
     kernel
         .register_tool_with_engine(
             ToolInfo::new(
@@ -142,7 +142,7 @@ async fn register_block_tools(
                 "Manage conversation contexts (switch, list)",
                 "kernel",
             ),
-            Arc::new(ContextEngine::new(kernel.drift().clone(), current)),
+            Arc::new(ContextEngine::new(kernel.drift().clone(), sessions)),
         )
         .await;
 
@@ -1372,7 +1372,7 @@ impl kernel::Server for KernelImpl {
                         let kj_disp = kernel.kj_dispatcher.clone();
                         let kj_principal = conn.principal.id;
                         let kj_session = conn.session_id;
-                        match EmbeddedKaish::with_identity(
+                        match EmbeddedKaish::with_identity_and_db(
                             &format!(
                                 "{}-{}-{}",
                                 kernel.name,
@@ -1386,6 +1386,7 @@ impl kernel::Server for KernelImpl {
                             context_id,
                             conn.session_id,
                             kernel.id,
+                            Some(&kernel.kernel_db),
                             |shared_ctx, tools| {
                                 let block_source: Arc<dyn kaijutsu_index::BlockSource> =
                                     Arc::new(BlockStoreSource(kernel.documents.clone()));
@@ -5943,7 +5944,7 @@ async fn execute_shell_command(
             let kj_disp = kernel.kj_dispatcher.clone();
             let kj_principal = conn.principal.id;
             let kj_session = conn.session_id;
-            match EmbeddedKaish::with_identity(
+            match EmbeddedKaish::with_identity_and_db(
                 &format!(
                     "{}-{}-{}",
                     kernel.name,
@@ -5957,6 +5958,7 @@ async fn execute_shell_command(
                 conn.require_context()?,
                 conn.session_id,
                 kernel.id,
+                Some(&kernel.kernel_db),
                 |shared_ctx, tools| {
                     let block_source: Arc<dyn kaijutsu_index::BlockSource> =
                         Arc::new(BlockStoreSource(kernel.documents.clone()));

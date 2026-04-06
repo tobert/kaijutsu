@@ -1211,4 +1211,38 @@ mod tests {
         assert!(router.get(id).is_none());
         assert!(router.resolve_context("ephemeral").is_err());
     }
+
+    /// April-showers issue #2: DriftRouter label_to_id is a flat HashMap
+    /// with no principal scoping. When two principals register contexts with
+    /// the same label, the second silently clobbers the first — making the
+    /// first user's context unreachable by label.
+    #[test]
+    fn test_duplicate_label_across_principals_is_ambiguous() {
+        let mut router = DriftRouter::new();
+        let pid_a = PrincipalId::new();
+        let pid_b = PrincipalId::new();
+        let id_a = ContextId::new();
+        let id_b = ContextId::new();
+
+        // User A registers "notes"
+        router.register(id_a, Some("notes"), None, pid_a);
+        assert_eq!(router.resolve_context("notes").unwrap(), id_a);
+
+        // User B registers "notes" — should not silently clobber User A's
+        router.register(id_b, Some("notes"), None, pid_b);
+
+        // Both contexts still exist in the router
+        assert!(router.get(id_a).is_some(), "User A's context must still exist");
+        assert!(router.get(id_b).is_some(), "User B's context must still exist");
+
+        // Resolving an ambiguous label should be an error (or scoped),
+        // not silently return the last-registered context.
+        let result = router.resolve_context("notes");
+        assert!(
+            result.is_err(),
+            "Duplicate labels from different principals should be ambiguous, \
+             but got Ok({:?}) — User A's context is silently unreachable",
+            result.unwrap(),
+        );
+    }
 }

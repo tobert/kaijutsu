@@ -36,6 +36,7 @@ use kaish_kernel::{Kernel as KaishKernel, KernelBackend, KernelConfig as KaishCo
 
 use kaijutsu_kernel::Kernel as KaijutsuKernel;
 use kaijutsu_kernel::block_store::SharedBlockStore;
+use kaijutsu_kernel::kernel_db::KernelDb;
 use kaijutsu_types::{ContextId, KernelId, PrincipalId, SessionId};
 
 use crate::docs_filesystem::KaijutsuFilesystem;
@@ -100,6 +101,34 @@ impl EmbeddedKaish {
         kernel_id: KernelId,
         configure_tools: impl FnOnce(SharedContextId, &mut kaish_kernel::ToolRegistry),
     ) -> Result<Self> {
+        Self::with_identity_and_db(
+            name,
+            blocks,
+            kernel,
+            project_root,
+            principal_id,
+            context_id,
+            session_id,
+            kernel_id,
+            None,
+            configure_tools,
+        )
+    }
+
+    /// Like `with_identity`, but accepts a `KernelDb` to restore persisted
+    /// session state (cwd) on creation.
+    pub fn with_identity_and_db(
+        name: &str,
+        blocks: SharedBlockStore,
+        kernel: Arc<KaijutsuKernel>,
+        project_root: Option<PathBuf>,
+        principal_id: PrincipalId,
+        context_id: ContextId,
+        session_id: SessionId,
+        kernel_id: KernelId,
+        kernel_db: Option<&Arc<parking_lot::Mutex<KernelDb>>>,
+        configure_tools: impl FnOnce(SharedContextId, &mut kaish_kernel::ToolRegistry),
+    ) -> Result<Self> {
         let shared_context_id: SharedContextId = Arc::new(RwLock::new(context_id));
         let input_fs = Arc::new(InputFilesystem::new(
             blocks.clone(),
@@ -127,11 +156,25 @@ impl EmbeddedKaish {
         //
         // `project_root` sets the cwd to a specific project directory (used by
         // MCP sessions that operate on a particular repo). When None, cwd
-        // defaults to $HOME via `KaishConfig::named()`.
-        let config = match project_root {
+        // defaults to $HOME via `KaishConfig::named()`, then we check the DB
+        // for a persisted cwd from a previous session.
+        let mut config = match project_root {
             Some(root) => KaishConfig::mcp_with_root(root),
             None => KaishConfig::named(name),
         };
+
+        // Restore persisted cwd from context_shell if available.
+        if let Some(db) = kernel_db {
+            let db_guard = db.lock();
+            if let Ok(Some(shell)) = db_guard.get_context_shell(context_id) {
+                if let Some(cwd) = shell.cwd {
+                    let path = PathBuf::from(&cwd);
+                    if path.is_dir() {
+                        config.cwd = path;
+                    }
+                }
+            }
+        }
 
         let ctx_for_tools = shared_context_id.clone();
         let kaish_kernel = KaishKernel::with_backend(
@@ -360,14 +403,14 @@ mod tests {
             "precondition: cwd should be in DB"
         );
 
-        let _kernel_db = Arc::new(parking_lot::Mutex::new(db));
+        let kernel_db = Arc::new(parking_lot::Mutex::new(db));
 
         // Create EmbeddedKaish the same way rpc.rs does: no project_root,
         // relying on the persisted context_shell.cwd to be restored.
         let blocks = shared_block_store(principal);
         let kernel = Arc::new(KaijutsuKernel::new("test-restore").await);
 
-        let kaish = EmbeddedKaish::with_identity(
+        let kaish = EmbeddedKaish::with_identity_and_db(
             "test-restore",
             blocks,
             kernel,
@@ -376,6 +419,7 @@ mod tests {
             context_id,
             SessionId::new(),
             kernel_id,
+            Some(&kernel_db),
             |_, _| {},
         )
         .unwrap();

@@ -1698,9 +1698,9 @@ mod tests {
         let _s2 = bus.subscribe("block.status");
         assert_eq!(bus.subscriber_count(), 2);
 
-        // Wildcard creates one subscription per matching topic (9 for block.*)
+        // Wildcard creates one subscription per matching topic (10 for block.*)
         let _s3 = bus.subscribe("block.*");
-        assert_eq!(bus.subscriber_count(), 2 + 9);
+        assert_eq!(bus.subscriber_count(), 2 + 10);
     }
 
     /// Subscribe to a pattern that matches no topics.
