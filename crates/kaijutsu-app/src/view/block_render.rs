@@ -593,7 +593,13 @@ pub fn build_block_scenes(
             }
         }
 
-        let total_height = content_height + pad_top + pad_bottom;
+        // Round to physical pixel boundary so built_height matches what Taffy
+        // renders. Width already comes from ComputedNode (post-Taffy), but height
+        // is computed by us — without rounding, the MSDF texture NDC has a
+        // different aspect ratio than the displayed node, causing subtle vertical
+        // stretch on HiDPI displays.
+        let scale = text_metrics.scale_factor;
+        let total_height = ((content_height + pad_top + pad_bottom) * scale).round() / scale;
 
         // Collect label glyphs for shader-drawn border labels.
         // Labels are baked into the MSDF texture at positions in the border padding zone.

@@ -329,7 +329,9 @@ pub fn build_shell_dock_glyphs(
                     msdf_glyphs.rainbow = false;
                 }
 
-                let total_height = content_height + pad.top + pad.bottom;
+                // Round to physical pixel boundary — see block_render.rs comment.
+                let scale = text_metrics.scale_factor;
+                let total_height = ((content_height + pad.top + pad.bottom) * scale).round() / scale;
                 block_scene.built_width = width;
                 block_scene.built_height = total_height;
                 block_scene.text = display;
