@@ -933,8 +933,8 @@ impl KjDispatcher {
                             "kj fork --as: parent context not in router: {e}"
                         ));
                     }
-                } else {
-                    drift.register(new_id, label, None, caller.principal_id);
+                } else if let Err(e) = drift.register(new_id, label, None, caller.principal_id) {
+                    return KjResult::Err(format!("kj fork --as: {e}"));
                 }
                 if staging {
                     if let Err(e) = drift.set_state(new_id, ContextState::Staging) {

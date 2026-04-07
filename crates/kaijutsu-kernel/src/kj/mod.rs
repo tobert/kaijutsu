@@ -371,7 +371,7 @@ pub(crate) mod test_helpers {
         // Register in DriftRouter
         {
             let mut drift = dispatcher.drift_router().write().await;
-            drift.register(id, label, forked_from, created_by);
+            drift.register(id, label, forked_from, created_by).unwrap();
         }
 
         id

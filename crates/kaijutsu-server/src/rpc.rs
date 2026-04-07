@@ -133,8 +133,8 @@ async fn register_block_tools(
     kernel: &Arc<Kernel>,
     documents: SharedBlockStore,
     workspace_guard: Option<kaijutsu_kernel::file_tools::WorkspaceGuard>,
+    session_contexts: crate::context_engine::SessionContextMap,
 ) {
-    let sessions = crate::context_engine::session_context_map();
     kernel
         .register_tool_with_engine(
             ToolInfo::new(
@@ -142,7 +142,7 @@ async fn register_block_tools(
                 "Manage conversation contexts (switch, list)",
                 "kernel",
             ),
-            Arc::new(ContextEngine::new(kernel.drift().clone(), sessions)),
+            Arc::new(ContextEngine::new(kernel.drift().clone(), session_contexts)),
         )
         .await;
 
@@ -381,6 +381,8 @@ pub struct SharedKernelState {
     pub interrupt_generation: AtomicU64,
     /// kj command dispatcher — shared across all connections.
     pub kj_dispatcher: Arc<kaijutsu_kernel::KjDispatcher>,
+    /// Per-session current-context tracking for the `context` shell command.
+    pub session_contexts: crate::context_engine::SessionContextMap,
 }
 
 pub type SharedKernel = Arc<SharedKernelState>;
@@ -1000,7 +1002,8 @@ pub async fn create_shared_kernel(
     let workspace_guard = Some(kaijutsu_kernel::file_tools::WorkspaceGuard::new(
         kernel_db_arc.clone(),
     ));
-    register_block_tools(&kernel_arc, documents.clone(), workspace_guard).await;
+    let session_contexts = crate::context_engine::session_context_map();
+    register_block_tools(&kernel_arc, documents.clone(), workspace_guard, session_contexts.clone()).await;
 
     // Recover contexts: KernelDb is the primary source, with BlockStore discovery as fallback.
     let all_contexts = {
@@ -1072,12 +1075,19 @@ pub async fn create_shared_kernel(
     if !all_contexts.is_empty() {
         let mut drift = kernel_arc.drift().write().await;
         for row in &all_contexts {
-            drift.register(
+            if let Err(e) = drift.register(
                 row.context_id,
                 row.label.as_deref(),
                 row.forked_from,
                 row.created_by,
-            );
+            ) {
+                log::warn!(
+                    "Skipping context {} recovery: {}",
+                    row.context_id.short(),
+                    e
+                );
+                continue;
+            }
             if let (Some(provider), Some(model)) = (&row.provider, &row.model) {
                 let _ = drift.configure_llm(row.context_id, provider, model);
             }
@@ -1232,6 +1242,7 @@ pub async fn create_shared_kernel(
         context_interrupts: Arc::new(TokioRwLock::new(HashMap::new())),
         interrupt_generation: AtomicU64::new(0),
         kj_dispatcher,
+        session_contexts,
     };
 
     Ok(Arc::new(shared))
@@ -2343,7 +2354,12 @@ impl kernel::Server for KernelImpl {
 
             {
                 let mut drift = kernel.kernel.drift().write().await;
-                drift.register(context_id, label_ref, parent_ctx, created_by);
+                if let Err(e) = drift.register(context_id, label_ref, parent_ctx, created_by) {
+                    drop(drift);
+                    return Err(capnp::Error::failed(format!(
+                        "label conflict: {e}"
+                    )));
+                }
                 if let (Some(p), Some(m)) = (&default_provider, &default_model) {
                     let _ = drift.configure_llm(context_id, p, m);
                 }

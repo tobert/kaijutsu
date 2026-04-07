@@ -438,6 +438,8 @@ async fn run_rpc(
     let (reader, writer) = futures::AsyncReadExt::split(stream);
 
     let connection = Rc::new(RefCell::new(ConnectionState::new(principal.clone())));
+    let session_id = connection.borrow().session_id;
+    let session_contexts = registry.kernel.session_contexts.clone();
     let world = WorldImpl::new(registry, connection);
     let client: kaijutsu_capnp::world::Client = capnp_rpc::new_client(world);
 
@@ -457,6 +459,8 @@ async fn run_rpc(
     if let Err(e) = rpc_system.await {
         log::error!("RPC system error for {}: {}", principal.username, e);
     }
+    // Clean up per-session context tracking to prevent unbounded map growth.
+    session_contexts.write().await.remove(&session_id);
     log::info!("RPC session ended for {}", principal.username);
 }
 

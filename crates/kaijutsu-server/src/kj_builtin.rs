@@ -74,6 +74,26 @@ impl KjBuiltin {
             .expect("context_id lock poisoned") = id;
     }
 
+    /// Persist the current context's cwd to KernelDb so it survives session
+    /// reconnects and context switches.
+    fn save_context_cwd(&self, context_id: ContextId, ctx: &ExecContext) {
+        let db = self.dispatcher.kernel_db().lock();
+        if let Err(e) = db.upsert_context_shell(
+            &kaijutsu_kernel::kernel_db::ContextShellRow {
+                context_id,
+                cwd: Some(ctx.cwd.to_string_lossy().into_owned()),
+                init_script: None,
+                updated_at: kaijutsu_types::now_millis() as i64,
+            },
+        ) {
+            tracing::warn!(
+                context = %context_id.to_hex(),
+                error = %e,
+                "failed to persist context cwd"
+            );
+        }
+    }
+
     /// Load context shell config (cwd + env vars) from KernelDb and apply to ExecContext.
     fn apply_context_config(&self, context_id: ContextId, ctx: &mut ExecContext) {
         let db = self.dispatcher.kernel_db().lock();
@@ -444,6 +464,10 @@ impl Tool for KjBuiltin {
             }
             KjResult::Err(msg) => ExecResult::failure(1, msg),
             KjResult::Switch(new_id, msg) => {
+                // Persist outgoing context's cwd so it survives the switch
+                let old_id = self.current_context_id();
+                self.save_context_cwd(old_id, ctx);
+
                 // Side-effect: update the shared context ID
                 self.set_context_id(new_id);
 

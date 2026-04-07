@@ -240,7 +240,7 @@ mod tests {
             Some("default"),
             None,
             kaijutsu_types::PrincipalId::system(),
-        );
+        ).unwrap();
 
         let sessions = session_context_map();
         let engine = ContextEngine::new(drift, sessions);
@@ -265,7 +265,7 @@ mod tests {
             Some("planning"),
             None,
             kaijutsu_types::PrincipalId::system(),
-        );
+        ).unwrap();
 
         let sessions = session_context_map();
         let engine = ContextEngine::new(drift, sessions.clone());
@@ -319,13 +319,13 @@ mod tests {
                 Some("alpha"),
                 None,
                 kaijutsu_types::PrincipalId::new(),
-            );
+            ).unwrap();
             d.register(
                 id_beta,
                 Some("beta"),
                 None,
                 kaijutsu_types::PrincipalId::new(),
-            );
+            ).unwrap();
         }
 
         // Both engines share the same SessionContextMap (as in production),

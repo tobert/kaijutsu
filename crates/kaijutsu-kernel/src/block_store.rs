@@ -452,6 +452,7 @@ impl BlockStore {
             sync_generation: AtomicU64::new(0),
         };
         self.documents.insert(new_id, entry);
+        self.auto_save(new_id);
 
         Ok(())
     }
@@ -529,6 +530,7 @@ impl BlockStore {
             sync_generation: AtomicU64::new(0),
         };
         self.documents.insert(new_id, entry);
+        self.auto_save(new_id);
 
         Ok(())
     }
@@ -598,6 +600,7 @@ impl BlockStore {
             sync_generation: AtomicU64::new(0),
         };
         self.documents.insert(new_id, entry);
+        self.auto_save(new_id);
 
         Ok(())
     }
@@ -1051,6 +1054,7 @@ impl BlockStore {
         entry.touch(self.agent_id());
         drop(entry);
 
+        self.auto_save(context_id);
         self.emit(BlockFlow::MetadataChanged {
             context_id,
             block_id: *block_id,
@@ -1074,6 +1078,7 @@ impl BlockStore {
         entry.touch(self.agent_id());
         drop(entry);
 
+        self.auto_save(context_id);
         self.emit(BlockFlow::ExcludedChanged {
             context_id,
             block_id: *block_id,
@@ -1098,6 +1103,7 @@ impl BlockStore {
         entry.touch(self.agent_id());
         drop(entry);
 
+        self.auto_save(context_id);
         self.emit(BlockFlow::MetadataChanged {
             context_id,
             block_id: *block_id,
@@ -1121,6 +1127,7 @@ impl BlockStore {
         entry.touch(agent_id);
         drop(entry);
 
+        self.auto_save(context_id);
         self.emit(BlockFlow::OutputChanged {
             context_id,
             block_id: *block_id,
@@ -1146,6 +1153,7 @@ impl BlockStore {
         entry.touch(agent_id);
         drop(entry);
 
+        self.auto_save(context_id);
         self.emit(BlockFlow::MetadataChanged {
             context_id,
             block_id: *block_id,

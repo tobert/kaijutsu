@@ -257,7 +257,9 @@ impl KjDispatcher {
         // Register in DriftRouter
         {
             let mut drift = self.drift_router().write().await;
-            drift.register(new_id, Some(label), parent_id, caller.principal_id);
+            if let Err(e) = drift.register(new_id, Some(label), parent_id, caller.principal_id) {
+                return KjResult::Err(format!("kj context create: {e}"));
+            }
         }
 
         KjResult::ok(format!("created context '{}' ({})", label, new_id.short()))
