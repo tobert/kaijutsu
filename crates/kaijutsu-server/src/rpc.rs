@@ -1374,10 +1374,11 @@ impl kernel::Server for KernelImpl {
         Promise::from_future(
             async move {
                 // Get or create embedded kaish executor with real connection identity
-                let kaish = {
+                let (kaish, newly_created) = {
                     let mut conn = connection.borrow_mut();
+                    let was_none = conn.kaish.is_none();
 
-                    if conn.kaish.is_none() {
+                    if was_none {
                         log::info!("Creating embedded kaish for kernel {}", kernel.id.to_hex());
                         let context_id = conn.require_context()?;
                         let kj_disp = kernel.kj_dispatcher.clone();
@@ -1424,8 +1425,14 @@ impl kernel::Server for KernelImpl {
                         }
                     }
 
-                    conn.kaish.as_ref().unwrap().clone()
+                    (conn.kaish.as_ref().unwrap().clone(), was_none)
                 };
+
+                // Apply persisted env vars and init_script on first creation.
+                if newly_created {
+                    let ctx_id = kaish.context_id();
+                    kaish.apply_context_config(&kernel.kernel_db, ctx_id).await;
+                }
 
                 // Execute code via embedded kaish (routes through CRDT backend)
                 let _exec_result = match kaish.execute(&code).await {
@@ -1477,9 +1484,31 @@ impl kernel::Server for KernelImpl {
         mut results: kernel::CompleteResults,
     ) -> Promise<(), capnp::Error> {
         let p = pry!(params.get());
-        let _span = extract_rpc_trace(p.get_trace(), "complete").entered();
-        results.get().init_completions(0);
-        Promise::ok(())
+        let _span = extract_rpc_trace(p.get_trace(), "complete");
+        let partial = pry!(pry!(p.get_partial()).to_str()).to_owned();
+        let cursor = p.get_cursor() as usize;
+        let kernel_arc = self.kernel.kernel.clone();
+
+        Promise::from_future(async move {
+            let _guard = _span.entered();
+            let mut completions = Vec::new();
+
+            // Get completions from the rhai engine (registered as "rhai" tool).
+            if let Some(engine) = kernel_arc.get_engine("rhai").await {
+                completions.extend(engine.complete(&partial, cursor).await);
+            }
+
+            let builder = results.get();
+            let mut list = builder.init_completions(completions.len() as u32);
+            for (i, text) in completions.iter().enumerate() {
+                let mut entry = list.reborrow().get(i as u32);
+                entry.set_text(text);
+                entry.set_display_text(text);
+                entry.set_kind(CompletionKind::Keyword);
+            }
+
+            Ok(())
+        })
     }
 
     fn subscribe_output(
@@ -5952,10 +5981,11 @@ async fn execute_shell_command(
     connection: &Rc<RefCell<ConnectionState>>,
 ) -> Result<kaijutsu_crdt::BlockId, capnp::Error> {
     // Get or create embedded kaish executor with real connection identity
-    let kaish = {
+    let (kaish, newly_created) = {
         let mut conn = connection.borrow_mut();
+        let was_none = conn.kaish.is_none();
 
-        if conn.kaish.is_none() {
+        if was_none {
             log::info!("Creating embedded kaish for kernel {}", kernel.id.to_hex());
             let kj_disp = kernel.kj_dispatcher.clone();
             let kj_principal = conn.principal.id;
@@ -6001,8 +6031,14 @@ async fn execute_shell_command(
             }
         }
 
-        conn.kaish.as_ref().unwrap().clone()
+        (conn.kaish.as_ref().unwrap().clone(), was_none)
     };
+
+    // Apply persisted env vars and init_script on first creation.
+    if newly_created {
+        let ctx_id = kaish.context_id();
+        kaish.apply_context_config(&kernel.kernel_db, ctx_id).await;
+    }
 
     let documents = kernel.documents.clone();
     let kernel_arc = kernel.kernel.clone();

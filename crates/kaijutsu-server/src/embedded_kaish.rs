@@ -262,6 +262,57 @@ impl EmbeddedKaish {
     pub fn cancel(&self) {
         self.kernel.cancel();
     }
+
+    /// Apply persisted context configuration (env vars + init_script).
+    ///
+    /// Reads `context_env` and `context_shell.init_script` from the database
+    /// and applies them to the kaish kernel. Should be called once after
+    /// creation for sessions that have persisted configuration.
+    pub async fn apply_context_config(
+        &self,
+        db: &parking_lot::Mutex<KernelDb>,
+        context_id: ContextId,
+    ) {
+        let (env_vars, init_script) = {
+            let db_guard = db.lock();
+            let env = db_guard.get_context_env(context_id).unwrap_or_default();
+            let script = db_guard
+                .get_context_shell(context_id)
+                .ok()
+                .flatten()
+                .and_then(|s| s.init_script);
+            (env, script)
+        };
+
+        // Export env vars so they propagate to child processes.
+        for var in &env_vars {
+            // Shell-escape value to avoid injection.
+            let escaped = var.value.replace('\'', "'\\''");
+            if let Err(e) = self
+                .kernel
+                .execute(&format!("export {}='{}'", var.key, escaped))
+                .await
+            {
+                tracing::warn!(
+                    key = %var.key,
+                    error = %e,
+                    "failed to apply context env var",
+                );
+            }
+        }
+
+        // Execute init_script if present.
+        if let Some(script) = init_script {
+            if !script.is_empty() {
+                if let Err(e) = self.kernel.execute(&script).await {
+                    tracing::warn!(
+                        error = %e,
+                        "failed to execute context init_script",
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -338,6 +389,167 @@ mod tests {
             .unwrap_or_else(|_| tmp.path().to_path_buf());
         let actual = cwd.canonicalize().unwrap_or(cwd.clone());
         assert_eq!(actual, expected, "cwd should be project root");
+    }
+
+    /// Context env vars stored in KernelDb should be available after
+    /// apply_context_config is called on a freshly-created EmbeddedKaish.
+    #[tokio::test]
+    async fn test_context_env_applied_on_creation() {
+        use kaijutsu_kernel::kernel_db::{ContextRow, KernelDb};
+        use kaijutsu_types::{ConsentMode, ContextState, KernelId, now_millis};
+
+        let kernel_id = KernelId::new();
+        let context_id = ContextId::new();
+        let principal = PrincipalId::system();
+        let db = KernelDb::in_memory().unwrap();
+
+        let ws_id = db
+            .get_or_create_default_workspace(kernel_id, principal)
+            .unwrap();
+
+        db.insert_context_with_document(
+            &ContextRow {
+                context_id,
+                kernel_id,
+                label: Some("test-env".into()),
+                provider: None,
+                model: None,
+                system_prompt: None,
+                tool_filter: None,
+                consent_mode: ConsentMode::default(),
+                context_state: ContextState::Live,
+                forked_from: None,
+                fork_kind: None,
+                created_by: principal,
+                created_at: now_millis() as i64,
+                archived_at: None,
+                workspace_id: None,
+                preset_id: None,
+            },
+            ws_id,
+        )
+        .unwrap();
+
+        // Store env vars in DB.
+        db.set_context_env(context_id, "KJ_TEST_FOO", "bar_value")
+            .unwrap();
+        db.set_context_env(context_id, "KJ_TEST_NUM", "42")
+            .unwrap();
+
+        let kernel_db = Arc::new(parking_lot::Mutex::new(db));
+        let blocks = shared_block_store(principal);
+        let kernel = Arc::new(KaijutsuKernel::new("test-env").await);
+
+        let kaish = EmbeddedKaish::with_identity_and_db(
+            "test-env",
+            blocks,
+            kernel,
+            None,
+            principal,
+            context_id,
+            SessionId::new(),
+            kernel_id,
+            Some(&kernel_db),
+            |_, _| {},
+        )
+        .unwrap();
+
+        // Apply context config (env vars + init_script).
+        kaish.apply_context_config(&kernel_db, context_id).await;
+
+        // Verify env vars are accessible via kaish execution.
+        let result = kaish.execute("echo $KJ_TEST_FOO").await.unwrap();
+        assert_eq!(
+            result.text_out().trim(),
+            "bar_value",
+            "KJ_TEST_FOO should be set from context_env",
+        );
+
+        let result = kaish.execute("echo $KJ_TEST_NUM").await.unwrap();
+        assert_eq!(
+            result.text_out().trim(),
+            "42",
+            "KJ_TEST_NUM should be set from context_env",
+        );
+    }
+
+    /// init_script stored in context_shell should be executed after
+    /// apply_context_config is called on a freshly-created EmbeddedKaish.
+    #[tokio::test]
+    async fn test_init_script_applied_on_creation() {
+        use kaijutsu_kernel::kernel_db::{ContextRow, ContextShellRow, KernelDb};
+        use kaijutsu_types::{ConsentMode, ContextState, KernelId, now_millis};
+
+        let kernel_id = KernelId::new();
+        let context_id = ContextId::new();
+        let principal = PrincipalId::system();
+        let db = KernelDb::in_memory().unwrap();
+
+        let ws_id = db
+            .get_or_create_default_workspace(kernel_id, principal)
+            .unwrap();
+
+        db.insert_context_with_document(
+            &ContextRow {
+                context_id,
+                kernel_id,
+                label: Some("test-init".into()),
+                provider: None,
+                model: None,
+                system_prompt: None,
+                tool_filter: None,
+                consent_mode: ConsentMode::default(),
+                context_state: ContextState::Live,
+                forked_from: None,
+                fork_kind: None,
+                created_by: principal,
+                created_at: now_millis() as i64,
+                archived_at: None,
+                workspace_id: None,
+                preset_id: None,
+            },
+            ws_id,
+        )
+        .unwrap();
+
+        // Store init_script that sets a variable.
+        // Note: kaish requires quoting values like "yes" (ambiguous boolean).
+        db.upsert_context_shell(&ContextShellRow {
+            context_id,
+            cwd: None,
+            init_script: Some("export INIT_RAN=\"activated\"".into()),
+            updated_at: now_millis() as i64,
+        })
+        .unwrap();
+
+        let kernel_db = Arc::new(parking_lot::Mutex::new(db));
+        let blocks = shared_block_store(principal);
+        let kernel = Arc::new(KaijutsuKernel::new("test-init").await);
+
+        let kaish = EmbeddedKaish::with_identity_and_db(
+            "test-init",
+            blocks,
+            kernel,
+            None,
+            principal,
+            context_id,
+            SessionId::new(),
+            kernel_id,
+            Some(&kernel_db),
+            |_, _| {},
+        )
+        .unwrap();
+
+        // Apply context config.
+        kaish.apply_context_config(&kernel_db, context_id).await;
+
+        // Verify init_script was executed.
+        let result = kaish.execute("echo $INIT_RAN").await.unwrap();
+        assert_eq!(
+            result.text_out().trim(),
+            "activated",
+            "init_script should have set INIT_RAN=activated",
+        );
     }
 
     /// Regression test: when a context has a persisted cwd in KernelDb,

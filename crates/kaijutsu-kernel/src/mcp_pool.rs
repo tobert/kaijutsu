@@ -543,7 +543,6 @@ impl ResourceCache {
 /// A connected MCP server with its running service.
 struct ConnectedServer {
     /// The configuration used to start this server (for reconnection).
-    #[allow(dead_code)]
     config: McpServerConfig,
     /// The running service (holds the peer for making requests).
     service: RunningService<RoleClient, KaijutsuClientHandler>,
@@ -977,6 +976,9 @@ pub struct McpServerPool {
     context_subscriptions: DashMap<String, HashSet<ContextId>>,
     /// Server registrations for fork mode queries.
     registrations: parking_lot::RwLock<HashMap<String, McpRegistration>>,
+    /// Cooldown tracker: prevents reconnect storms by enforcing a minimum
+    /// interval between reconnect attempts per server.
+    last_reconnect: parking_lot::Mutex<HashMap<String, Instant>>,
 }
 
 impl Default for McpServerPool {
@@ -1028,6 +1030,7 @@ impl McpServerPool {
             prompt_cache: Arc::new(DashMap::new()),
             context_subscriptions: DashMap::new(),
             registrations: parking_lot::RwLock::new(HashMap::new()),
+            last_reconnect: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -1049,6 +1052,7 @@ impl McpServerPool {
             prompt_cache: Arc::new(DashMap::new()),
             context_subscriptions: DashMap::new(),
             registrations: parking_lot::RwLock::new(HashMap::new()),
+            last_reconnect: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -1272,6 +1276,58 @@ impl McpServerPool {
         Ok(())
     }
 
+    /// Minimum interval between reconnect attempts for the same server.
+    const RECONNECT_COOLDOWN: Duration = Duration::from_secs(5);
+
+    /// Reconnect a crashed MCP server using its stored configuration.
+    ///
+    /// Drops the old connection, spawns a fresh subprocess, re-discovers
+    /// tools, and replaces the pool entry. Returns the new server info.
+    pub async fn reconnect(&self, name: &str) -> Result<McpServerInfo, McpPoolError> {
+        // Cooldown check: prevent reconnect storms.
+        {
+            let mut tracker = self.last_reconnect.lock();
+            if let Some(last) = tracker.get(name) {
+                if last.elapsed() < Self::RECONNECT_COOLDOWN {
+                    return Err(McpPoolError::InitError(format!(
+                        "reconnect cooldown for '{}' ({:.1}s remaining)",
+                        name,
+                        (Self::RECONNECT_COOLDOWN - last.elapsed()).as_secs_f64(),
+                    )));
+                }
+            }
+            tracker.insert(name.to_string(), Instant::now());
+        }
+
+        // Extract config from the old connected server before dropping it.
+        let config = {
+            let old = self
+                .servers
+                .write()
+                .remove(name)
+                .ok_or_else(|| McpPoolError::ServerNotFound(name.to_string()))?;
+            let server = old.lock().await;
+            server.config.clone()
+        };
+
+        info!(name = %name, "Reconnecting MCP server");
+
+        // Re-register using the stored config. The registration metadata
+        // is already in self.registrations from the original register() call,
+        // but register() will update it. We removed the server from self.servers
+        // above so the "already exists" check won't fire.
+        match self.register(config).await {
+            Ok(info) => {
+                info!(name = %name, "MCP server reconnected successfully");
+                Ok(info)
+            }
+            Err(e) => {
+                warn!(name = %name, error = %e, "MCP server reconnection failed");
+                Err(e)
+            }
+        }
+    }
+
     /// List all registered servers.
     pub fn list_servers(&self) -> Vec<String> {
         self.servers.read().keys().cloned().collect()
@@ -1341,6 +1397,31 @@ impl McpServerPool {
         server_name: &str,
         tool_name: &str,
         arguments: JsonValue,
+    ) -> Result<CallToolResult, McpPoolError> {
+        match self
+            .call_tool_inner(server_name, tool_name, &arguments)
+            .await
+        {
+            Ok(result) => Ok(result),
+            Err(McpPoolError::ServiceError(ref _e)) => {
+                warn!(
+                    server = %server_name,
+                    tool = %tool_name,
+                    "MCP tool call failed with transport error, attempting reconnect",
+                );
+                self.reconnect(server_name).await?;
+                self.call_tool_inner(server_name, tool_name, &arguments)
+                    .await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn call_tool_inner(
+        &self,
+        server_name: &str,
+        tool_name: &str,
+        arguments: &JsonValue,
     ) -> Result<CallToolResult, McpPoolError> {
         let server_arc = self
             .servers

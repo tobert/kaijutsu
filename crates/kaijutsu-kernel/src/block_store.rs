@@ -1300,6 +1300,7 @@ impl BlockStore {
         for event in events {
             self.emit(event);
         }
+        self.auto_save(context_id);
         Ok(version)
     }
 
@@ -2836,5 +2837,100 @@ mod tests {
         let snap = entry.doc.get_block_snapshot(&block_id).unwrap();
         assert_eq!(snap.content, streaming_text);
         assert_eq!(snap.status, Status::Done);
+    }
+
+    /// Prove that merge_ops persists merged content to the database.
+    ///
+    /// This simulates the push_ops RPC flow: a remote client builds a
+    /// SyncPayload from its local mutations and the server merges it.
+    /// The server's DB must contain the merged content afterward.
+    #[test]
+    fn test_merge_ops_persists_to_db() {
+        use crate::kernel_db::{DocumentRow, KernelDb};
+        use kaijutsu_types::{KernelId, now_millis};
+
+        let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+        let creator = PrincipalId::system();
+        let kernel_id = KernelId::new();
+
+        let ws_id = {
+            let db_guard = db.lock();
+            db_guard
+                .get_or_create_default_workspace(kernel_id, creator)
+                .unwrap()
+        };
+
+        // "Server" store — DB-backed, will receive merged ops.
+        let server_store = BlockStore::with_db(db.clone(), kernel_id, ws_id, creator);
+        let ctx = ContextId::new();
+        {
+            let db_guard = db.lock();
+            db_guard
+                .insert_document(&DocumentRow {
+                    document_id: ctx,
+                    kernel_id,
+                    workspace_id: ws_id,
+                    doc_kind: DocumentKind::Conversation,
+                    language: None,
+                    path: None,
+                    created_at: now_millis() as i64,
+                    created_by: creator,
+                })
+                .unwrap();
+        }
+        server_store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+
+        // "Client" store — no DB, generates mutations.
+        let client_store = BlockStore::new(creator);
+        client_store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+
+        // Client inserts a block with content.
+        let empty_frontier = HashMap::new();
+        client_store
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "merge_ops persistence test",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+
+        // Build sync payload from client (all ops since empty frontier).
+        let payload = client_store.ops_since(ctx, &empty_frontier).unwrap();
+        assert!(!payload.new_blocks.is_empty(), "payload should contain the new block");
+
+        // Server merges the payload — this is the code path under test.
+        let version = server_store.merge_ops(ctx, payload).unwrap();
+        assert!(version > 0);
+
+        // In-memory content should have the merged block.
+        let content = server_store.get_content(ctx).unwrap();
+        assert!(
+            content.contains("merge_ops persistence test"),
+            "in-memory content after merge_ops should contain the block, got: {:?}",
+            content,
+        );
+
+        // DB should also have the merged content (no explicit save_snapshot call).
+        let db_guard = db.lock();
+        let snapshot = db_guard.get_snapshot(ctx).unwrap();
+        assert!(
+            snapshot.is_some(),
+            "merge_ops should auto_save — DB snapshot must exist",
+        );
+        let snapshot = snapshot.unwrap();
+        assert!(
+            snapshot.content.contains("merge_ops persistence test"),
+            "DB snapshot after merge_ops should contain merged content, got: {:?}",
+            snapshot.content,
+        );
     }
 }
