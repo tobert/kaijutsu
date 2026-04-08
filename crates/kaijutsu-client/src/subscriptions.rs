@@ -15,7 +15,7 @@ use kaijutsu_crdt::{ContextId, KernelId};
 use kaijutsu_types::{BlockId, BlockSnapshot};
 use tokio::sync::broadcast;
 
-use crate::kaijutsu_capnp::{block_events, resource_events};
+use crate::kaijutsu_capnp::{block_events, kernel_output, resource_events};
 use crate::rpc::{parse_block_id, parse_block_snapshot};
 
 // ============================================================================
@@ -622,6 +622,82 @@ impl resource_events::Server for ResourceEventsForwarder {
         let event = ServerEvent::ResourceListChanged { server };
         if self.event_tx.send(event).is_err() {
             tracing::warn!("Event channel closed, dropping ResourceListChanged event");
+        }
+        Promise::ok(())
+    }
+}
+
+// ============================================================================
+// Kernel Output Events
+// ============================================================================
+
+/// Events from an `execute()` RPC: stdout, stderr, and exit code.
+#[derive(Clone, Debug)]
+pub enum OutputEvent {
+    Stdout { exec_id: u64, text: String },
+    Stderr { exec_id: u64, text: String },
+    ExitCode { exec_id: u64, code: i32 },
+}
+
+/// Implements Cap'n Proto `KernelOutput::Server`, forwarding each output event
+/// into an mpsc channel for consumption by tests and actors.
+pub(crate) struct KernelOutputForwarder {
+    pub tx: tokio::sync::mpsc::UnboundedSender<OutputEvent>,
+}
+
+#[allow(refining_impl_trait)]
+impl kernel_output::Server for KernelOutputForwarder {
+    fn on_output(
+        self: Rc<Self>,
+        params: kernel_output::OnOutputParams,
+        _results: kernel_output::OnOutputResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = match params.get() {
+            Ok(p) => p,
+            Err(e) => return Promise::err(e),
+        };
+
+        let event_reader = match params.get_event() {
+            Ok(e) => e,
+            Err(e) => return Promise::err(e),
+        };
+
+        let exec_id = event_reader.get_exec_id();
+
+        let output_event = match event_reader.get_event() {
+            Ok(inner) => match inner.which() {
+                Ok(crate::kaijutsu_capnp::output_event::Stdout(text)) => {
+                    match text {
+                        Ok(t) => match t.to_str() {
+                            Ok(s) => OutputEvent::Stdout { exec_id, text: s.to_owned() },
+                            Err(e) => return Promise::err(capnp::Error::failed(e.to_string())),
+                        },
+                        Err(e) => return Promise::err(e),
+                    }
+                }
+                Ok(crate::kaijutsu_capnp::output_event::Stderr(text)) => {
+                    match text {
+                        Ok(t) => match t.to_str() {
+                            Ok(s) => OutputEvent::Stderr { exec_id, text: s.to_owned() },
+                            Err(e) => return Promise::err(capnp::Error::failed(e.to_string())),
+                        },
+                        Err(e) => return Promise::err(e),
+                    }
+                }
+                Ok(crate::kaijutsu_capnp::output_event::ExitCode(code)) => {
+                    OutputEvent::ExitCode { exec_id, code }
+                }
+                Ok(crate::kaijutsu_capnp::output_event::Structured(_)) => {
+                    // Structured output not yet used — ignore silently.
+                    return Promise::ok(());
+                }
+                Err(e) => return Promise::err(e.into()),
+            },
+            Err(e) => return Promise::err(e),
+        };
+
+        if self.tx.send(output_event).is_err() {
+            tracing::warn!("Output channel closed, dropping output event");
         }
         Promise::ok(())
     }

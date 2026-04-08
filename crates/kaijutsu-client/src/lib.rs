@@ -28,7 +28,7 @@ pub use rpc::{
     ToolSchema, VersionSnapshot,
 };
 pub use ssh::{KeySource, SshChannels, SshClient, SshConfig, SshError};
-pub use subscriptions::{ConnectionStatus, ServerEvent, SyncGeneration};
+pub use subscriptions::{ConnectionStatus, OutputEvent, ServerEvent, SyncGeneration};
 pub use sync::{SkipReason, SyncError, SyncManager, SyncResult};
 pub use synced_document::{SyncEffect, SyncedDocument};
 pub use synced_input::SyncedInput;

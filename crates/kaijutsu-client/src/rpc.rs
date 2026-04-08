@@ -390,6 +390,26 @@ impl KernelHandle {
         Ok(response.get()?.get_new_version())
     }
 
+    /// Subscribe to output events from `execute()` RPCs.
+    ///
+    /// Returns an unbounded receiver that yields stdout, stderr, and exit code
+    /// events tagged with their exec_id. The subscription is persistent for
+    /// the lifetime of the RPC connection.
+    #[tracing::instrument(skip(self), name = "rpc_client.subscribe_output")]
+    pub async fn subscribe_output(
+        &self,
+    ) -> Result<tokio::sync::mpsc::UnboundedReceiver<crate::subscriptions::OutputEvent>, RpcError>
+    {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let forwarder = crate::subscriptions::KernelOutputForwarder { tx };
+        let callback: crate::kaijutsu_capnp::kernel_output::Client =
+            capnp_rpc::new_client(forwarder);
+        let mut request = self.kernel.subscribe_output_request();
+        request.get().set_callback(callback);
+        request.send().promise.await?;
+        Ok(rx)
+    }
+
     /// Interrupt an execution
     #[tracing::instrument(skip(self), name = "rpc_client.interrupt")]
     pub async fn interrupt(&self, exec_id: u64) -> Result<(), RpcError> {

@@ -154,3 +154,229 @@ fn test_create_context_unique_ids() {
         assert_ne!(id1, id2, "Each created context should have a unique ID");
     });
 }
+
+// ============================================================================
+// Async Execute Tests
+// ============================================================================
+
+/// Helper: attach kernel, create context, join it. Returns KernelHandle.
+async fn setup_execute_context(
+    addr: std::net::SocketAddr,
+) -> (kaijutsu_client::RpcClient, kaijutsu_client::KernelHandle) {
+    let client = connect_client(addr).await;
+    let (kernel, _) = client.attach_kernel().await.unwrap();
+    let ctx_id = kernel.create_context("exec-test").await.unwrap();
+    kernel.join_context(ctx_id, "test-exec").await.unwrap();
+    (client, kernel)
+}
+
+#[test]
+fn test_execute_returns_immediately() {
+    run_local(async {
+        let addr = start_server().await;
+        let (_client, kernel) = setup_execute_context(addr).await;
+
+        // Subscribe to output first.
+        let mut rx = kernel.subscribe_output().await.unwrap();
+
+        // Execute a command that sleeps 2 seconds.
+        let start = std::time::Instant::now();
+        let exec_id = kernel.execute("sleep 2").await.unwrap();
+        let elapsed = start.elapsed();
+
+        // The RPC should return immediately (well under 2s).
+        assert!(exec_id > 0, "exec_id should be positive");
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "execute() should return immediately, took {:?}",
+            elapsed
+        );
+
+        // Wait for exit code event to confirm completion.
+        let exit_event = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            wait_for_exit_code(&mut rx, exec_id),
+        )
+        .await
+        .expect("timed out waiting for exit code");
+        assert_eq!(exit_event, 0, "sleep 2 should exit with code 0");
+    });
+}
+
+#[test]
+fn test_execute_output_events() {
+    run_local(async {
+        let addr = start_server().await;
+        let (_client, kernel) = setup_execute_context(addr).await;
+
+        let mut rx = kernel.subscribe_output().await.unwrap();
+
+        // Run a command that produces stdout.
+        let exec_id = kernel.execute("echo hello").await.unwrap();
+
+        // Collect all events for this exec_id.
+        let events = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            collect_output_events(&mut rx, exec_id),
+        )
+        .await
+        .expect("timed out waiting for output events");
+
+        let stdout: String = events
+            .iter()
+            .filter_map(|e| match e {
+                kaijutsu_client::OutputEvent::Stdout { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            stdout.contains("hello"),
+            "stdout should contain 'hello', got: {:?}",
+            stdout
+        );
+
+        let exit_code = events
+            .iter()
+            .find_map(|e| match e {
+                kaijutsu_client::OutputEvent::ExitCode { code, .. } => Some(*code),
+                _ => None,
+            })
+            .expect("should have exit code event");
+        assert_eq!(exit_code, 0);
+
+        // Run a failing command.
+        let exec_id2 = kernel.execute("false").await.unwrap();
+        let events2 = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            collect_output_events(&mut rx, exec_id2),
+        )
+        .await
+        .expect("timed out waiting for failing command events");
+
+        let exit_code2 = events2
+            .iter()
+            .find_map(|e| match e {
+                kaijutsu_client::OutputEvent::ExitCode { code, .. } => Some(*code),
+                _ => None,
+            })
+            .expect("should have exit code event for failing command");
+        assert_ne!(exit_code2, 0, "false should exit non-zero");
+    });
+}
+
+#[test]
+fn test_interrupt_cancels_execution() {
+    run_local(async {
+        let addr = start_server().await;
+        let (_client, kernel) = setup_execute_context(addr).await;
+
+        let mut rx = kernel.subscribe_output().await.unwrap();
+
+        // Start a long-running command.
+        let exec_id = kernel.execute("sleep 60").await.unwrap();
+
+        // Give it a moment to start, then interrupt.
+        tokio::task::yield_now().await;
+        kernel.interrupt(exec_id).await.unwrap();
+
+        // Should get an exit code event (non-zero).
+        let exit_code = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            wait_for_exit_code(&mut rx, exec_id),
+        )
+        .await
+        .expect("timed out waiting for interrupted exit code");
+        assert_ne!(exit_code, 0, "interrupted command should exit non-zero");
+
+        // Verify the kernel is not broken — next execute should work.
+        let exec_id2 = kernel.execute("echo ok").await.unwrap();
+        let exit_code2 = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            wait_for_exit_code(&mut rx, exec_id2),
+        )
+        .await
+        .expect("timed out waiting for post-interrupt command");
+        assert_eq!(exit_code2, 0, "post-interrupt command should succeed");
+    });
+}
+
+#[test]
+fn test_concurrent_execute_rejected() {
+    run_local(async {
+        let addr = start_server().await;
+        let (_client, kernel) = setup_execute_context(addr).await;
+
+        let mut rx = kernel.subscribe_output().await.unwrap();
+
+        // Start a long-running command.
+        let exec_id = kernel.execute("sleep 5").await.unwrap();
+
+        // Yield to let the background task start.
+        tokio::task::yield_now().await;
+
+        // Second execute should fail while first is running.
+        let result = kernel.execute("echo hi").await;
+        assert!(
+            result.is_err(),
+            "concurrent execute should be rejected while one is running"
+        );
+
+        // Clean up: interrupt the first command.
+        kernel.interrupt(exec_id).await.unwrap();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            wait_for_exit_code(&mut rx, exec_id),
+        )
+        .await;
+    });
+}
+
+// ============================================================================
+// Test Helpers
+// ============================================================================
+
+/// Wait for an ExitCode event for the given exec_id, discarding other events.
+async fn wait_for_exit_code(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<kaijutsu_client::OutputEvent>,
+    exec_id: u64,
+) -> i32 {
+    loop {
+        match rx.recv().await {
+            Some(kaijutsu_client::OutputEvent::ExitCode { exec_id: id, code }) if id == exec_id => {
+                return code;
+            }
+            Some(_) => continue,
+            None => panic!("output channel closed before exit code received"),
+        }
+    }
+}
+
+/// Collect all output events for the given exec_id until ExitCode is received.
+async fn collect_output_events(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<kaijutsu_client::OutputEvent>,
+    exec_id: u64,
+) -> Vec<kaijutsu_client::OutputEvent> {
+    let mut events = Vec::new();
+    loop {
+        match rx.recv().await {
+            Some(event) => {
+                let is_exit = matches!(
+                    &event,
+                    kaijutsu_client::OutputEvent::ExitCode { exec_id: id, .. } if *id == exec_id
+                );
+                let matches_id = match &event {
+                    kaijutsu_client::OutputEvent::Stdout { exec_id: id, .. } => *id == exec_id,
+                    kaijutsu_client::OutputEvent::Stderr { exec_id: id, .. } => *id == exec_id,
+                    kaijutsu_client::OutputEvent::ExitCode { exec_id: id, .. } => *id == exec_id,
+                };
+                if matches_id {
+                    events.push(event);
+                }
+                if is_exit {
+                    return events;
+                }
+            }
+            None => panic!("output channel closed before exit code received"),
+        }
+    }
+}

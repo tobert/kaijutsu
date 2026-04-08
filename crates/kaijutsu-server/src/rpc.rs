@@ -15,6 +15,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::RwLock as TokioRwLock;
+use tokio_util::sync::CancellationToken;
 // tokio::sync::Mutex used inside ConversationCache for per-context locking
 
 use capnp::capability::Promise;
@@ -434,6 +435,11 @@ pub struct ServerRegistry {
     pub mcp_pool: Arc<McpServerPool>,
 }
 
+/// A background execution tracked by exec_id.
+struct RunningExecution {
+    cancel: CancellationToken,
+}
+
 /// Per-connection state. Lives in each connection's LocalSet.
 pub struct ConnectionState {
     pub principal: Principal,
@@ -442,6 +448,10 @@ pub struct ConnectionState {
     pub kaish: Option<Rc<EmbeddedKaish>>,
     pub command_history: Vec<CommandEntry>,
     next_exec_id: AtomicU64,
+    /// Currently running executions, keyed by exec_id.
+    running_executions: HashMap<u64, RunningExecution>,
+    /// Output subscribers registered via subscribe_output().
+    output_subscribers: Vec<kernel_output::Client>,
 }
 
 impl ConnectionState {
@@ -453,6 +463,8 @@ impl ConnectionState {
             kaish: None,
             command_history: Vec::new(),
             next_exec_id: AtomicU64::new(1),
+            running_executions: HashMap::new(),
+            output_subscribers: Vec::new(),
         }
     }
 
@@ -465,6 +477,33 @@ impl ConnectionState {
 
     fn next_exec_id(&self) -> u64 {
         self.next_exec_id.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Register a new execution, returning the cancellation token.
+    fn register_execution(&mut self, exec_id: u64) -> CancellationToken {
+        let token = CancellationToken::new();
+        self.running_executions.insert(
+            exec_id,
+            RunningExecution {
+                cancel: token.clone(),
+            },
+        );
+        token
+    }
+
+    /// Remove a completed execution from tracking.
+    fn complete_execution(&mut self, exec_id: u64) {
+        self.running_executions.remove(&exec_id);
+    }
+
+    /// Check if any execution is currently in-flight.
+    fn has_running_execution(&self) -> bool {
+        !self.running_executions.is_empty()
+    }
+
+    /// Register an output subscriber callback.
+    fn add_output_subscriber(&mut self, client: kernel_output::Client) {
+        self.output_subscribers.push(client);
     }
 }
 
@@ -844,6 +883,89 @@ pub struct CommandEntry {
     pub id: u64,
     pub code: String,
     pub timestamp: u64,
+}
+
+// ============================================================================
+// Execute Output Dispatch
+// ============================================================================
+
+/// Dispatch stdout/stderr/exitCode events to all registered output subscribers.
+///
+/// Sends up to 3 `KernelOutputEvent` messages per execution:
+/// - stdout (if non-empty)
+/// - stderr (if non-empty)
+/// - exitCode (always — signals completion)
+///
+/// Removes subscribers whose RPC calls fail (capability revoked / client disconnected).
+async fn dispatch_output_events(
+    exec_id: u64,
+    result: &kaish_kernel::interpreter::ExecResult,
+    connection: &Rc<RefCell<ConnectionState>>,
+) {
+    // Clone subscribers out to avoid holding RefCell borrow across await points.
+    let subscribers: Vec<kernel_output::Client> = {
+        connection.borrow().output_subscribers.clone()
+    };
+
+    if subscribers.is_empty() {
+        return;
+    }
+
+    let mut failed_indices = Vec::new();
+
+    for (i, subscriber) in subscribers.iter().enumerate() {
+        let mut ok = true;
+
+        // stdout
+        let stdout = result.text_out();
+        if ok && !stdout.is_empty() {
+            let mut req = subscriber.on_output_request();
+            {
+                let mut event = req.get().init_event();
+                event.set_exec_id(exec_id);
+                event.init_event().set_stdout(&stdout);
+            }
+            ok = req.send().promise.await.is_ok();
+        }
+
+        // stderr
+        if ok && !result.err.is_empty() {
+            let mut req = subscriber.on_output_request();
+            {
+                let mut event = req.get().init_event();
+                event.set_exec_id(exec_id);
+                event.init_event().set_stderr(&result.err);
+            }
+            ok = req.send().promise.await.is_ok();
+        }
+
+        // exitCode (always — signals completion)
+        if ok {
+            let mut req = subscriber.on_output_request();
+            {
+                let mut event = req.get().init_event();
+                event.set_exec_id(exec_id);
+                event.init_event().set_exit_code(result.code as i32);
+            }
+            if req.send().promise.await.is_err() {
+                ok = false;
+            }
+        }
+
+        if !ok {
+            failed_indices.push(i);
+        }
+    }
+
+    // Remove failed subscribers (iterate in reverse to preserve indices).
+    if !failed_indices.is_empty() {
+        let mut conn = connection.borrow_mut();
+        for &i in failed_indices.iter().rev() {
+            if i < conn.output_subscribers.len() {
+                conn.output_subscribers.swap_remove(i);
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -1369,7 +1491,7 @@ impl kernel::Server for KernelImpl {
         let kernel = self.kernel.clone();
         let connection = self.connection.clone();
 
-        // Use Promise::from_future for async execution
+        // Non-blocking execute: return exec_id immediately, spawn execution in background.
 
         Promise::from_future(
             async move {
@@ -1434,33 +1556,67 @@ impl kernel::Server for KernelImpl {
                     kaish.apply_context_config(&kernel.kernel_db, ctx_id).await;
                 }
 
-                // Execute code via embedded kaish (routes through CRDT backend)
-                let _exec_result = match kaish.execute(&code).await {
-                    Ok(result) => result,
-                    Err(e) => {
-                        log::error!("kaish execute error: {}", e);
-                        kaish_kernel::interpreter::ExecResult::failure(1, e.to_string())
-                    }
-                };
-
-                // Record in state and build response
+                // Reject concurrent executions — kaish kernel is serial.
                 {
+                    let conn = connection.borrow();
+                    if conn.has_running_execution() {
+                        return Err(capnp::Error::failed(
+                            "execution already in progress".into(),
+                        ));
+                    }
+                }
+
+                // Allocate exec_id and register the execution before spawning.
+                let (exec_id, cancel_token) = {
                     let mut conn = connection.borrow_mut();
-                    let exec_id = conn.next_exec_id();
+                    let id = conn.next_exec_id();
+                    let token = conn.register_execution(id);
+
                     let timestamp = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .expect("system clock before UNIX epoch")
                         .as_secs();
 
-                    // Record command history
                     conn.command_history.push(CommandEntry {
-                        id: exec_id,
+                        id,
                         code: code.clone(),
                         timestamp,
                     });
 
-                    results.get().set_exec_id(exec_id);
-                }
+                    (id, token)
+                };
+
+                // Return exec_id to the caller immediately.
+                results.get().set_exec_id(exec_id);
+
+                // Spawn background execution — Rc<EmbeddedKaish> is fine on LocalSet.
+                let connection_bg = connection.clone();
+                tokio::task::spawn_local(async move {
+                    // Yield so the RPC response is sent before we start executing.
+                    tokio::task::yield_now().await;
+
+                    let exec_result = tokio::select! {
+                        result = kaish.execute(&code) => {
+                            match result {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    log::error!("kaish execute error: {}", e);
+                                    kaish_kernel::interpreter::ExecResult::failure(1, e.to_string())
+                                }
+                            }
+                        }
+                        _ = cancel_token.cancelled() => {
+                            kaish.cancel();
+                            kaish_kernel::interpreter::ExecResult::failure(130, "interrupted")
+                        }
+                    };
+
+                    // Dispatch output events to all subscribers.
+                    dispatch_output_events(exec_id, &exec_result, &connection_bg).await;
+
+                    // Clean up execution tracking.
+                    connection_bg.borrow_mut().complete_execution(exec_id);
+                });
 
                 Ok(())
             }
@@ -1475,6 +1631,14 @@ impl kernel::Server for KernelImpl {
     ) -> Promise<(), capnp::Error> {
         let p = pry!(params.get());
         let _span = extract_rpc_trace(p.get_trace(), "interrupt").entered();
+        let exec_id = p.get_exec_id();
+
+        let conn = self.connection.borrow();
+        if let Some(running) = conn.running_executions.get(&exec_id) {
+            log::info!("Interrupting execution {}", exec_id);
+            running.cancel.cancel();
+        }
+        // Silently ignore unknown exec_ids (may have already completed).
         Promise::ok(())
     }
 
@@ -1513,9 +1677,13 @@ impl kernel::Server for KernelImpl {
 
     fn subscribe_output(
         self: Rc<Self>,
-        _params: kernel::SubscribeOutputParams,
+        params: kernel::SubscribeOutputParams,
         _results: kernel::SubscribeOutputResults,
     ) -> Promise<(), capnp::Error> {
+        let _span = tracing::info_span!("rpc", method = "subscribe_output").entered();
+        let callback = pry!(pry!(params.get()).get_callback());
+        self.connection.borrow_mut().add_output_subscriber(callback);
+        log::debug!("Output subscriber registered");
         Promise::ok(())
     }
 
