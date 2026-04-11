@@ -1135,16 +1135,14 @@ pub async fn create_shared_kernel(
     register_block_tools(&kernel_arc, documents.clone(), workspace_guard, session_contexts.clone()).await;
 
     // Recover contexts: KernelDb is the primary source, with BlockStore discovery as fallback.
-    let all_contexts = {
+    // A failure to read the DB here means we cannot know which contexts should be recovered —
+    // refuse to start rather than silently coming up with zero contexts.
+    let all_contexts: Vec<ContextRow> = {
         let db = kernel_db_arc.lock();
         // Step 1: Load active contexts from KernelDb
-        let db_contexts = match db.list_active_contexts(id) {
-            Ok(rows) => rows,
-            Err(e) => {
-                log::warn!("Failed to load contexts from KernelDb: {}", e);
-                Vec::new()
-            }
-        };
+        let db_contexts = db.list_active_contexts(id).map_err(|e| {
+            capnp::Error::failed(format!("Failed to load contexts from KernelDb: {}", e))
+        })?;
         let db_ids: std::collections::HashSet<ContextId> =
             db_contexts.iter().map(|r| r.context_id).collect();
 
@@ -1191,13 +1189,9 @@ pub async fn create_shared_kernel(
         }
 
         // Step 3: Re-read all active contexts (lock dropped after this block)
-        match db.list_active_contexts(id) {
-            Ok(rows) => rows,
-            Err(e) => {
-                log::warn!("Failed to re-read contexts from KernelDb: {}", e);
-                Vec::new()
-            }
-        }
+        db.list_active_contexts(id).map_err(|e| {
+            capnp::Error::failed(format!("Failed to re-read contexts from KernelDb: {}", e))
+        })?
     }; // db lock dropped here — safe to await below
 
     // Register recovered contexts into DriftRouter
@@ -2526,7 +2520,10 @@ impl kernel::Server for KernelImpl {
                 (provider, model)
             };
 
-            // Write-through: KernelDb first, then DriftRouter
+            // Write-through: KernelDb first, then DriftRouter. Both steps must
+            // succeed or we roll in-memory state back — we never want a ghost
+            // that is live in memory but missing from the DB (lost on restart)
+            // nor a DB row without a drift entry.
             {
                 let db = kernel.kernel_db.lock();
                 let row = ContextRow {
@@ -2551,11 +2548,13 @@ impl kernel::Server for KernelImpl {
                     .get_or_create_default_workspace(row.kernel_id, row.created_by)
                     .unwrap_or_else(|_| kaijutsu_types::WorkspaceId::new());
                 if let Err(e) = db.insert_context_with_document(&row, default_ws) {
-                    log::warn!(
+                    drop(db);
+                    let _ = kernel.documents.delete_document(context_id);
+                    return Err(capnp::Error::failed(format!(
                         "KernelDb insert_context failed for {}: {}",
                         context_id.short(),
                         e
-                    );
+                    )));
                 }
             }
 
@@ -2563,6 +2562,8 @@ impl kernel::Server for KernelImpl {
                 let mut drift = kernel.kernel.drift().write().await;
                 if let Err(e) = drift.register(context_id, label_ref, parent_ctx, created_by) {
                     drop(drift);
+                    let _ = kernel.kernel_db.lock().delete_context(context_id);
+                    let _ = kernel.documents.delete_document(context_id);
                     return Err(capnp::Error::failed(format!(
                         "label conflict: {e}"
                     )));

@@ -124,6 +124,40 @@ fn test_create_context_joinable() {
 }
 
 #[test]
+fn test_create_context_invalid_label_is_hard_error() {
+    // Regression for "ghost contexts" bug: KernelDb rejects labels containing ':'
+    // via validate_label(). Before the fix, rpc.rs logged a warn and continued
+    // to register the context in DriftRouter, leaving a ghost that was live in
+    // memory but missing from the KernelDb (and thus lost on restart).
+    //
+    // The fix must (1) return Err from create_context when KernelDb insert fails
+    // and (2) not leak the context into DriftRouter.
+    run_local(async {
+        let addr = start_server().await;
+        let client = connect_client(addr).await;
+
+        let (kernel, _kernel_id) = client.attach_kernel().await.unwrap();
+
+        let before = kernel.list_contexts().await.unwrap();
+        let before_count = before.len();
+
+        let result = kernel.create_context("bad:label").await;
+        assert!(
+            result.is_err(),
+            "create_context with ':' in label must return Err (got {:?})",
+            result
+        );
+
+        let after = kernel.list_contexts().await.unwrap();
+        assert_eq!(
+            after.len(),
+            before_count,
+            "no ghost context should be registered after a failed create"
+        );
+    });
+}
+
+#[test]
 fn test_join_nonexistent_context_fails() {
     run_local(async {
         let addr = start_server().await;
