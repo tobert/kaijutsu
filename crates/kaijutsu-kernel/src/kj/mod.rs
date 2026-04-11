@@ -412,3 +412,98 @@ pub(crate) mod test_helpers {
         id
     }
 }
+
+#[cfg(test)]
+mod unjoined_context_tests {
+    //! Regression tests for the "no active context joined" guards.
+    //!
+    //! These tests exist to catch future refactors that remove either the
+    //! dispatcher early-return in `dispatch()` or the per-leaf `require_context()`
+    //! guards in `fork.rs` / `stage.rs` / `drift.rs` / `prompt.rs`. Without them,
+    //! a caller with `context_id: None` would panic inside the kernel instead
+    //! of receiving a friendly error.
+
+    use super::test_helpers::*;
+    use super::*;
+
+    fn s(v: &str) -> String {
+        v.to_string()
+    }
+
+    /// A caller with no joined context — the state the kernel sees when the
+    /// shell dispatches `kj <cmd>` before the user has run `kj context switch`.
+    fn unjoined_caller() -> KjCaller {
+        KjCaller {
+            principal_id: PrincipalId::new(),
+            context_id: None,
+            session_id: SessionId::new(),
+            confirmed: false,
+        }
+    }
+
+    fn assert_unjoined_error(result: &KjResult, cmd: &str) {
+        match result {
+            KjResult::Err(msg) => assert!(
+                msg.contains("no active context joined"),
+                "{cmd}: expected friendly unjoined error, got: {msg}"
+            ),
+            other => panic!("{cmd}: expected KjResult::Err, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn require_context_returns_friendly_err() {
+        let caller = unjoined_caller();
+        let err = caller.require_context().unwrap_err();
+        assert_unjoined_error(&err, "require_context");
+    }
+
+    #[tokio::test]
+    async fn fork_without_context_errors_friendly() {
+        let d = test_dispatcher().await;
+        let caller = unjoined_caller();
+        let result = d
+            .dispatch(&[s("fork"), s("--name"), s("foo")], &caller)
+            .await;
+        assert_unjoined_error(&result, "kj fork");
+    }
+
+    #[tokio::test]
+    async fn stage_status_without_context_errors_friendly() {
+        let d = test_dispatcher().await;
+        let caller = unjoined_caller();
+        let result = d.dispatch(&[s("stage"), s("status")], &caller).await;
+        assert_unjoined_error(&result, "kj stage status");
+    }
+
+    #[tokio::test]
+    async fn drift_push_without_context_errors_friendly() {
+        let d = test_dispatcher().await;
+        let caller = unjoined_caller();
+        let result = d
+            .dispatch(&[s("drift"), s("push"), s("some-target"), s("body")], &caller)
+            .await;
+        assert_unjoined_error(&result, "kj drift push");
+    }
+
+    #[tokio::test]
+    async fn prompt_inject_without_context_errors_friendly() {
+        let d = test_dispatcher().await;
+        let caller = unjoined_caller();
+        let result = d
+            .dispatch(&[s("prompt"), s("inject"), s("server/name")], &caller)
+            .await;
+        assert_unjoined_error(&result, "kj prompt inject");
+    }
+
+    #[tokio::test]
+    async fn help_without_context_still_works() {
+        let d = test_dispatcher().await;
+        let caller = unjoined_caller();
+        let result = d.dispatch(&[s("help")], &caller).await;
+        assert!(
+            matches!(result, KjResult::Ok { .. }),
+            "kj help should succeed without a joined context, got {result:?}"
+        );
+    }
+}
