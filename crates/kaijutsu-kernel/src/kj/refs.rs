@@ -144,7 +144,7 @@ mod tests {
         let ctx_id = ContextId::new();
         let caller = KjCaller {
             principal_id: kaijutsu_types::PrincipalId::new(),
-            context_id: ctx_id,
+            context_id: Some(ctx_id),
             session_id: kaijutsu_types::SessionId::new(),
             confirmed: false,
         };
@@ -184,7 +184,7 @@ mod tests {
 
         let caller = KjCaller {
             principal_id: principal,
-            context_id: ctx_id,
+            context_id: Some(ctx_id),
             session_id: kaijutsu_types::SessionId::new(),
             confirmed: false,
         };
@@ -279,7 +279,7 @@ mod tests {
 
         let caller = KjCaller {
             principal_id: principal,
-            context_id: child_id,
+            context_id: Some(child_id),
             session_id: kaijutsu_types::SessionId::new(),
             confirmed: false,
         };

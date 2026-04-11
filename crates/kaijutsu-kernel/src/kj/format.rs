@@ -278,7 +278,7 @@ mod tests {
             make_row(Some("alt"), other),
         ];
 
-        let output = format_context_table(&rows, current);
+        let output = format_context_table(&rows, Some(current));
         assert!(output.contains("* "));
         assert!(output.contains("default"));
         assert!(output.contains("alt"));
@@ -286,7 +286,7 @@ mod tests {
 
     #[test]
     fn table_empty() {
-        let output = format_context_table(&[], ContextId::new());
+        let output = format_context_table(&[], Some(ContextId::new()));
         assert_eq!(output, "(no contexts)");
     }
 

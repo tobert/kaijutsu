@@ -1133,7 +1133,7 @@ mod tests {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let parent = register_context(&d, Some("parent"), None, principal).await;
-        let target = register_context(&d, Some("victim"), Some(parent), principal).await;
+        let _target = register_context(&d, Some("victim"), Some(parent), principal).await;
 
         let c = caller_with_context(parent);
         let result = d
