@@ -6394,9 +6394,13 @@ async fn execute_shell_command(
                     log::error!("Failed to set command block status: {}", e);
                 }
 
-                // Detect context switch (kj fork, kj context switch)
-                let new_context_id = kaish.context_id().unwrap_or_else(ContextId::nil);
-                if new_context_id != context_id {
+                // Detect context switch (kj fork, kj context switch).
+                // If the kaish session has no active context (e.g. post-leave),
+                // we suppress the event rather than publish a nil sentinel —
+                // subscribers keep their last known good context.
+                if let Some(new_context_id) = kaish.context_id()
+                    && new_context_id != context_id
+                {
                     log::info!(
                         "shell_execute: context switched {} → {}",
                         context_id,
