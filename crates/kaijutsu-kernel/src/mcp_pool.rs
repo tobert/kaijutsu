@@ -49,7 +49,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use thiserror::Error;
 use tokio::process::Command;
-use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::flows::{
@@ -541,13 +540,20 @@ impl ResourceCache {
 }
 
 /// A connected MCP server with its running service.
+///
+/// Shared via `Arc<ConnectedServer>` with no outer Mutex — rmcp's
+/// `Peer<RoleClient>` takes `&self` on every RPC (`call_tool`,
+/// `list_all_tools`, etc.), so concurrent requests to the same server
+/// run in parallel over the underlying transport. Only `tools` needs
+/// interior mutability, for `refresh_tools`, so it lives behind its own
+/// cheap `RwLock`.
 struct ConnectedServer {
     /// The configuration used to start this server (for reconnection).
     config: McpServerConfig,
     /// The running service (holds the peer for making requests).
     service: RunningService<RoleClient, KaijutsuClientHandler>,
-    /// Cached list of tools.
-    tools: Vec<McpToolInfo>,
+    /// Cached list of tools. Swapped wholesale by `refresh_tools`.
+    tools: RwLock<Vec<McpToolInfo>>,
 }
 
 impl ConnectedServer {
@@ -954,7 +960,7 @@ impl ClientHandler for KaijutsuClientHandler {
 /// Thread-safe and can be shared across multiple kernels via `Arc`.
 pub struct McpServerPool {
     /// Connected servers, keyed by name.
-    servers: RwLock<HashMap<String, Arc<Mutex<ConnectedServer>>>>,
+    servers: RwLock<HashMap<String, Arc<ConnectedServer>>>,
     /// Shared resource cache for all MCP servers.
     cache: Arc<ResourceCache>,
     /// Flow bus for resource events.
@@ -1132,7 +1138,7 @@ impl McpServerPool {
         let server_names: Vec<String> = self.servers.read().keys().cloned().collect();
         for name in server_names {
             if let Some(server_arc) = self.servers.read().get(&name).cloned() {
-                let server = server_arc.lock().await;
+                let server = &*server_arc;
                 if let Err(e) = server.peer().notify_roots_list_changed().await {
                     warn!(server = %name, error = %e, "Failed to notify server of roots change");
                 }
@@ -1250,12 +1256,12 @@ impl McpServerPool {
         let connected = ConnectedServer {
             config,
             service,
-            tools,
+            tools: RwLock::new(tools),
         };
 
         self.servers
             .write()
-            .insert(name, Arc::new(Mutex::new(connected)));
+            .insert(name, Arc::new(connected));
 
         Ok(info)
     }
@@ -1306,8 +1312,7 @@ impl McpServerPool {
                 .write()
                 .remove(name)
                 .ok_or_else(|| McpPoolError::ServerNotFound(name.to_string()))?;
-            let server = old.lock().await;
-            server.config.clone()
+            old.config.clone()
         };
 
         info!(name = %name, "Reconnecting MCP server");
@@ -1342,7 +1347,7 @@ impl McpServerPool {
             .cloned()
             .ok_or_else(|| McpPoolError::ServerNotFound(name.to_string()))?;
 
-        let server = server_arc.lock().await;
+        let server = &*server_arc;
         let peer_info = server.service.peer().peer_info();
 
         Ok(McpServerInfo {
@@ -1359,7 +1364,7 @@ impl McpServerPool {
                 .as_ref()
                 .map(|i| i.server_info.version.clone())
                 .unwrap_or_default(),
-            tools: server.tools.clone(),
+            tools: server.tools.read().clone(),
         })
     }
 
@@ -1373,8 +1378,7 @@ impl McpServerPool {
 
         for name in server_names {
             if let Some(server_arc) = self.servers.read().get(&name).cloned() {
-                let server = server_arc.lock().await;
-                for tool in &server.tools {
+                for tool in server_arc.tools.read().iter() {
                     let qualified_name = format!("{}__{}", name, tool.name);
                     all_tools.push((qualified_name, tool.clone()));
                 }
@@ -1430,10 +1434,10 @@ impl McpServerPool {
             .cloned()
             .ok_or_else(|| McpPoolError::ServerNotFound(server_name.to_string()))?;
 
-        let server = server_arc.lock().await;
+        let server = &*server_arc;
 
         // Verify tool exists
-        if !server.tools.iter().any(|t| t.name == tool_name) {
+        if !server.tools.read().iter().any(|t| t.name == tool_name) {
             return Err(McpPoolError::ToolNotFound {
                 server: server_name.to_string(),
                 tool: tool_name.to_string(),
@@ -1485,12 +1489,10 @@ impl McpServerPool {
             .cloned()
             .ok_or_else(|| McpPoolError::ServerNotFound(server_name.to_string()))?;
 
-        let mut server = server_arc.lock().await;
-
-        let tools_result = server.peer().list_all_tools().await?;
+        let tools_result = server_arc.peer().list_all_tools().await?;
         let tools: Vec<McpToolInfo> = tools_result.into_iter().map(McpToolInfo::from).collect();
 
-        server.tools = tools.clone();
+        *server_arc.tools.write() = tools.clone();
 
         Ok(tools)
     }
@@ -1521,7 +1523,7 @@ impl McpServerPool {
             .cloned()
             .ok_or_else(|| McpPoolError::ServerNotFound(server_name.to_string()))?;
 
-        let server = server_arc.lock().await;
+        let server = &*server_arc;
 
         debug!(server = %server_name, "Fetching resources from MCP server");
         let result = server.peer().list_all_resources().await?;
@@ -1577,7 +1579,7 @@ impl McpServerPool {
             .cloned()
             .ok_or_else(|| McpPoolError::ServerNotFound(server_name.to_string()))?;
 
-        let server = server_arc.lock().await;
+        let server = &*server_arc;
 
         debug!(server = %server_name, uri = %uri, "Reading resource from MCP server");
         let result = server
@@ -1621,7 +1623,7 @@ impl McpServerPool {
             .cloned()
             .ok_or_else(|| McpPoolError::ServerNotFound(server_name.to_string()))?;
 
-        let server = server_arc.lock().await;
+        let server = &*server_arc;
 
         // Send subscription request to the MCP server
         debug!(server = %server_name, uri = %uri, "Sending MCP resource subscription");
@@ -1676,7 +1678,7 @@ impl McpServerPool {
             .cloned()
             .ok_or_else(|| McpPoolError::ServerNotFound(server_name.to_string()))?;
 
-        let server = server_arc.lock().await;
+        let server = &*server_arc;
 
         // Send unsubscribe request to the MCP server
         debug!(server = %server_name, uri = %uri, "Sending MCP resource unsubscription");
@@ -1786,8 +1788,7 @@ impl McpServerPool {
                 Some(s) => s,
                 None => continue,
             };
-            let server_lock = server_arc.lock().await;
-            if let Err(e) = server_lock
+            if let Err(e) = server_arc
                 .peer()
                 .unsubscribe(rmcp::model::UnsubscribeRequestParams::new(uri.as_str()))
                 .await
@@ -1828,7 +1829,7 @@ impl McpServerPool {
             .cloned()
             .ok_or_else(|| McpPoolError::ServerNotFound(server_name.to_string()))?;
 
-        let server = server_arc.lock().await;
+        let server = &*server_arc;
 
         debug!(server = %server_name, "Fetching prompts from MCP server");
         let result = server.peer().list_all_prompts().await?;
@@ -1868,7 +1869,7 @@ impl McpServerPool {
             .cloned()
             .ok_or_else(|| McpPoolError::ServerNotFound(server_name.to_string()))?;
 
-        let server = server_arc.lock().await;
+        let server = &*server_arc;
 
         debug!(server = %server_name, prompt = %name, "Getting prompt from MCP server");
 
@@ -1920,7 +1921,7 @@ impl McpServerPool {
             .cloned()
             .ok_or_else(|| McpPoolError::ServerNotFound(server_name.to_string()))?;
 
-        let server = server_arc.lock().await;
+        let server = &*server_arc;
 
         debug!(
             server = %server_name,
@@ -1959,7 +1960,7 @@ impl McpServerPool {
             .cloned()
             .ok_or_else(|| McpPoolError::ServerNotFound(server_name.to_string()))?;
 
-        let server = server_arc.lock().await;
+        let server = &*server_arc;
 
         debug!(server = %server_name, level = ?level, "Setting log level on MCP server");
 
@@ -1984,20 +1985,15 @@ impl McpServerPool {
         let servers = self.servers.read();
 
         for (_name, server_arc) in servers.iter() {
-            // Try to acquire the lock without blocking
-            if let Ok(server) = server_arc.try_lock() {
-                let handler = server.service.service();
-                // Check if this handler owns the request
-                if let Some((_, pending)) = handler.pending_elicitations().remove(request_id) {
-                    // Found it! Send the response
-                    let sent = pending.response_tx.send(response).is_ok();
-                    if sent {
-                        info!(request_id = %request_id, "Elicitation response sent successfully");
-                    } else {
-                        warn!(request_id = %request_id, "Elicitation response channel closed");
-                    }
-                    return sent;
+            let handler = server_arc.service.service();
+            if let Some((_, pending)) = handler.pending_elicitations().remove(request_id) {
+                let sent = pending.response_tx.send(response).is_ok();
+                if sent {
+                    info!(request_id = %request_id, "Elicitation response sent successfully");
+                } else {
+                    warn!(request_id = %request_id, "Elicitation response channel closed");
                 }
+                return sent;
             }
         }
 
@@ -2831,6 +2827,18 @@ pub fn register_mcp_prompt_engines(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Compile-time regression for the Mutex removal: ConnectedServer must be
+    // Send + Sync so Arc<ConnectedServer> can be shared across tasks without
+    // an outer lock. Re-introducing a !Sync field (raw cell, unsynchronized
+    // RefCell, etc.) would break this and surface here rather than in a
+    // runtime data race.
+    #[allow(dead_code)]
+    fn _assert_connected_server_shareable() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<ConnectedServer>();
+        assert_send_sync::<Arc<ConnectedServer>>();
+    }
 
     use rmcp::model::{CallToolResult, Content};
 
