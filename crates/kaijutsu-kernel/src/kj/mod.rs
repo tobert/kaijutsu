@@ -211,8 +211,6 @@ impl KjDispatcher {
             "stage" => self.dispatch_stage(&argv[1..], caller).await,
             "drift" => self.dispatch_drift(&argv[1..], caller).await,
             "prompt" => self.dispatch_prompt(&argv[1..], caller).await,
-            "preset" => self.dispatch_preset(&argv[1..], caller),
-            "workspace" | "ws" => self.dispatch_workspace(&argv[1..], caller),
             other => KjResult::Err(format!(
                 "kj: unknown command '{}'\n\n{}",
                 other,

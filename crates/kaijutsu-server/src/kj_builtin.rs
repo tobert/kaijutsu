@@ -64,7 +64,6 @@ impl KjBuiltin {
         self.session_contexts.current(&self.session_id)
     }
 
-
     fn set_context_id(&self, id: ContextId) {
         self.session_contexts.insert(self.session_id, id);
     }
@@ -72,9 +71,6 @@ impl KjBuiltin {
     /// Persist the current context's cwd to KernelDb so it survives session
     /// reconnects and context switches.
     fn save_context_cwd(&self, context_id: ContextId, ctx: &ExecContext) {
-        if context_id.is_nil() {
-            return;
-        }
         let db = self.dispatcher.kernel_db().lock();
         if let Err(e) = db.upsert_context_shell(
             &kaijutsu_kernel::kernel_db::ContextShellRow {
@@ -94,9 +90,6 @@ impl KjBuiltin {
 
     /// Load context shell config (cwd + env vars) from KernelDb and apply to ExecContext.
     fn apply_context_config(&self, context_id: ContextId, ctx: &mut ExecContext) {
-        if context_id.is_nil() {
-            return;
-        }
         let db = self.dispatcher.kernel_db().lock();
 
         // Apply cwd
