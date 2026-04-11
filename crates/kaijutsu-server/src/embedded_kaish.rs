@@ -27,7 +27,7 @@
 //! with tool dispatch routed through the kernel's tool registry.
 
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use anyhow::Result;
 
@@ -41,8 +41,9 @@ use kaijutsu_types::{ContextId, KernelId, PrincipalId, SessionId};
 
 use crate::docs_filesystem::KaijutsuFilesystem;
 use crate::input_filesystem::InputFilesystem;
-use crate::kaish_backend::{KaijutsuBackend, SharedContextId};
+use crate::kaish_backend::KaijutsuBackend;
 use crate::mount_backend::MountBackend;
+use crate::context_engine::{SessionContextExt, SessionContextMap};
 
 /// Embedded kaish executor backed by CRDT blocks.
 ///
@@ -53,9 +54,9 @@ pub struct EmbeddedKaish {
     kernel: KaishKernel,
     /// Kernel name/id.
     name: String,
-    /// Shared mutable context ID — updated when the connection switches context.
-    /// The same `Arc` is held by `KaijutsuBackend`, so updates propagate to tool calls.
-    context_id: SharedContextId,
+    /// Global session map for context tracking.
+    session_contexts: SessionContextMap,
+    session_id: SessionId,
 }
 
 impl EmbeddedKaish {
@@ -78,18 +79,18 @@ impl EmbeddedKaish {
             ContextId::new(),
             SessionId::new(),
             KernelId::new(),
-            |_, _| {},
+            crate::context_engine::session_context_map(),
+            |_, _, _| {},
         )
     }
 
     /// Create an embedded kaish executor with explicit identity fields.
     ///
     /// Identity flows through to `ToolContext` for drift/whoami engines.
-    /// The `context_id` is wrapped in `Arc<RwLock>` so that context switches
-    /// (via `set_context_id`) propagate to all tool calls without rebuilding.
+    /// The `context_id` is tracked via the shared `SessionContextMap`.
     ///
-    /// The `configure_tools` callback receives the `SharedContextId` so callers
-    /// can register tools (like KjBuiltin) that need the shared context reference.
+    /// The `configure_tools` callback receives the map and session ID so callers
+    /// can register tools (like KjBuiltin) that need context awareness.
     pub fn with_identity(
         name: &str,
         blocks: SharedBlockStore,
@@ -99,7 +100,8 @@ impl EmbeddedKaish {
         context_id: ContextId,
         session_id: SessionId,
         kernel_id: KernelId,
-        configure_tools: impl FnOnce(SharedContextId, &mut kaish_kernel::ToolRegistry),
+        session_contexts: SessionContextMap,
+        configure_tools: impl FnOnce(SessionContextMap, SessionId, &mut kaish_kernel::ToolRegistry),
     ) -> Result<Self> {
         Self::with_identity_and_db(
             name,
@@ -111,6 +113,7 @@ impl EmbeddedKaish {
             session_id,
             kernel_id,
             None,
+            session_contexts,
             configure_tools,
         )
     }
@@ -127,18 +130,22 @@ impl EmbeddedKaish {
         session_id: SessionId,
         kernel_id: KernelId,
         kernel_db: Option<&Arc<parking_lot::Mutex<KernelDb>>>,
-        configure_tools: impl FnOnce(SharedContextId, &mut kaish_kernel::ToolRegistry),
+        session_contexts: SessionContextMap,
+        configure_tools: impl FnOnce(SessionContextMap, SessionId, &mut kaish_kernel::ToolRegistry),
     ) -> Result<Self> {
-        let shared_context_id: SharedContextId = Arc::new(RwLock::new(context_id));
+        // Initialize session map entry if missing
+        session_contexts.entry(session_id).or_insert(context_id);
+
         let input_fs = Arc::new(InputFilesystem::new(
             blocks.clone(),
-            shared_context_id.clone(),
+            session_contexts.clone(),
+            session_id,
         ));
         let docs_backend = Arc::new(KaijutsuBackend::new(
             blocks,
             kernel.clone(),
             principal_id,
-            shared_context_id.clone(),
+            session_contexts.clone(),
             session_id,
             kernel_id,
         ));
@@ -176,7 +183,8 @@ impl EmbeddedKaish {
             }
         }
 
-        let ctx_for_tools = shared_context_id.clone();
+        let ctx_for_tools = session_contexts.clone();
+        let sid_for_tools = session_id;
         let kaish_kernel = KaishKernel::with_backend(
             mount_backend,
             config,
@@ -185,14 +193,15 @@ impl EmbeddedKaish {
                 vfs.mount_arc("/v/input", input_fs);
             },
             |tools| {
-                configure_tools(ctx_for_tools, tools);
+                configure_tools(ctx_for_tools, sid_for_tools, tools);
             },
         )?;
 
         Ok(Self {
             kernel: kaish_kernel,
             name: name.to_string(),
-            context_id: shared_context_id,
+            session_contexts,
+            session_id,
         })
     }
 
@@ -228,14 +237,14 @@ impl EmbeddedKaish {
 
     /// Update the context ID (e.g., after a context switch).
     ///
-    /// Propagates to `KaijutsuBackend` via the shared `Arc<RwLock>`.
+    /// Propagates to `KaijutsuBackend` via the shared map.
     pub fn set_context_id(&self, id: ContextId) {
-        *self.context_id.write().expect("context_id lock poisoned") = id;
+        self.session_contexts.insert(self.session_id, id);
     }
 
-    /// Read the current context ID.
-    pub fn context_id(&self) -> ContextId {
-        *self.context_id.read().expect("context_id lock poisoned")
+    /// Read the current context ID. Returns None if none active.
+    pub fn context_id(&self) -> Option<ContextId> {
+        self.session_contexts.current(&self.session_id)
     }
 
     /// Get current working directory.
@@ -440,6 +449,8 @@ mod tests {
         let blocks = shared_block_store(principal);
         let kernel = Arc::new(KaijutsuKernel::new("test-env").await);
 
+        let sid = SessionId::new();
+        let session_contexts = crate::context_engine::session_context_map();
         let kaish = EmbeddedKaish::with_identity_and_db(
             "test-env",
             blocks,
@@ -447,10 +458,11 @@ mod tests {
             None,
             principal,
             context_id,
-            SessionId::new(),
+            sid,
             kernel_id,
             Some(&kernel_db),
-            |_, _| {},
+            session_contexts,
+            |_, _, _| {},
         )
         .unwrap();
 
@@ -526,6 +538,8 @@ mod tests {
         let blocks = shared_block_store(principal);
         let kernel = Arc::new(KaijutsuKernel::new("test-init").await);
 
+        let sid = SessionId::new();
+        let session_contexts = crate::context_engine::session_context_map();
         let kaish = EmbeddedKaish::with_identity_and_db(
             "test-init",
             blocks,
@@ -533,10 +547,11 @@ mod tests {
             None,
             principal,
             context_id,
-            SessionId::new(),
+            sid,
             kernel_id,
             Some(&kernel_db),
-            |_, _| {},
+            session_contexts,
+            |_, _, _| {},
         )
         .unwrap();
 
@@ -622,6 +637,8 @@ mod tests {
         let blocks = shared_block_store(principal);
         let kernel = Arc::new(KaijutsuKernel::new("test-restore").await);
 
+        let sid = SessionId::new();
+        let session_contexts = crate::context_engine::session_context_map();
         let kaish = EmbeddedKaish::with_identity_and_db(
             "test-restore",
             blocks,
@@ -629,10 +646,11 @@ mod tests {
             None, // no project_root — same as SSH connection path
             principal,
             context_id,
-            SessionId::new(),
+            sid,
             kernel_id,
             Some(&kernel_db),
-            |_, _| {},
+            session_contexts,
+            |_, _, _| {},
         )
         .unwrap();
 

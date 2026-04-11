@@ -24,7 +24,7 @@ use kaijutsu_kernel::kj::{KjCaller, KjDispatcher, KjResult};
 #[allow(unused_imports)]
 use kaijutsu_types::{ContentType, ContextId, PrincipalId, SessionId};
 
-use crate::kaish_backend::SharedContextId;
+use crate::context_engine::{SessionContextExt, SessionContextMap};
 
 /// kaish builtin tool for the `kj` command.
 ///
@@ -32,7 +32,7 @@ use crate::kaish_backend::SharedContextId;
 /// `KjBuiltin` with the shared dispatcher and per-connection identity fields.
 pub struct KjBuiltin {
     dispatcher: Arc<KjDispatcher>,
-    shared_context_id: SharedContextId,
+    session_contexts: SessionContextMap,
     principal_id: PrincipalId,
     session_id: SessionId,
     /// Semantic index for synthesis commands. None if embedding model not configured.
@@ -44,7 +44,7 @@ pub struct KjBuiltin {
 impl KjBuiltin {
     pub fn new(
         dispatcher: Arc<KjDispatcher>,
-        shared_context_id: SharedContextId,
+        session_contexts: SessionContextMap,
         principal_id: PrincipalId,
         session_id: SessionId,
         semantic_index: Option<Arc<kaijutsu_index::SemanticIndex>>,
@@ -52,7 +52,7 @@ impl KjBuiltin {
     ) -> Self {
         Self {
             dispatcher,
-            shared_context_id,
+            session_contexts,
             principal_id,
             session_id,
             semantic_index,
@@ -60,23 +60,21 @@ impl KjBuiltin {
         }
     }
 
-    fn current_context_id(&self) -> ContextId {
-        *self
-            .shared_context_id
-            .read()
-            .expect("context_id lock poisoned")
+    fn current_context_id(&self) -> Option<ContextId> {
+        self.session_contexts.current(&self.session_id)
     }
 
+
     fn set_context_id(&self, id: ContextId) {
-        *self
-            .shared_context_id
-            .write()
-            .expect("context_id lock poisoned") = id;
+        self.session_contexts.insert(self.session_id, id);
     }
 
     /// Persist the current context's cwd to KernelDb so it survives session
     /// reconnects and context switches.
     fn save_context_cwd(&self, context_id: ContextId, ctx: &ExecContext) {
+        if context_id.is_nil() {
+            return;
+        }
         let db = self.dispatcher.kernel_db().lock();
         if let Err(e) = db.upsert_context_shell(
             &kaijutsu_kernel::kernel_db::ContextShellRow {
@@ -96,6 +94,9 @@ impl KjBuiltin {
 
     /// Load context shell config (cwd + env vars) from KernelDb and apply to ExecContext.
     fn apply_context_config(&self, context_id: ContextId, ctx: &mut ExecContext) {
+        if context_id.is_nil() {
+            return;
+        }
         let db = self.dispatcher.kernel_db().lock();
 
         // Apply cwd
@@ -465,8 +466,9 @@ impl Tool for KjBuiltin {
             KjResult::Err(msg) => ExecResult::failure(1, msg),
             KjResult::Switch(new_id, msg) => {
                 // Persist outgoing context's cwd so it survives the switch
-                let old_id = self.current_context_id();
-                self.save_context_cwd(old_id, ctx);
+                if let Some(old_id) = self.current_context_id() {
+                    self.save_context_cwd(old_id, ctx);
+                }
 
                 // Side-effect: update the shared context ID
                 self.set_context_id(new_id);

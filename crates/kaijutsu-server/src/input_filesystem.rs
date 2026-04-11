@@ -11,16 +11,13 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 
 use kaijutsu_kernel::block_store::SharedBlockStore;
-use kaijutsu_types::ContextId;
+use crate::context_engine::{SessionContextExt, SessionContextMap};
+use kaijutsu_types::{ContextId, SessionId};
 use kaish_kernel::vfs::{DirEntry, DirEntryKind, Filesystem};
-
-/// Shared mutable context ID (same type as kaish_backend::SharedContextId).
-type SharedContextId = Arc<RwLock<ContextId>>;
 
 /// Virtual filesystem exposing the input document at `/v/input`.
 ///
@@ -29,18 +26,29 @@ type SharedContextId = Arc<RwLock<ContextId>>;
 /// and other paths return NotFound.
 pub struct InputFilesystem {
     blocks: SharedBlockStore,
-    context_id: SharedContextId,
+    session_contexts: SessionContextMap,
+    session_id: SessionId,
 }
 
 impl InputFilesystem {
     /// Create a new input filesystem.
-    pub fn new(blocks: SharedBlockStore, context_id: SharedContextId) -> Self {
-        Self { blocks, context_id }
+    pub fn new(
+        blocks: SharedBlockStore,
+        session_contexts: SessionContextMap,
+        session_id: SessionId,
+    ) -> Self {
+        Self {
+            blocks,
+            session_contexts,
+            session_id,
+        }
     }
 
     /// Read the current context ID.
-    fn current_context(&self) -> ContextId {
-        *self.context_id.read().expect("context_id lock poisoned")
+    fn current_context(&self) -> io::Result<ContextId> {
+        self.session_contexts
+            .current(&self.session_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no active context joined"))
     }
 }
 
@@ -51,13 +59,10 @@ impl Filesystem for InputFilesystem {
         let normalized = path_str.trim_start_matches('/').trim_end_matches('/');
 
         if !normalized.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("/v/input has no subpaths (got: {})", path_str),
-            ));
+            return Err(io::Error::new(io::ErrorKind::NotFound, "not found"));
         }
 
-        let ctx = self.current_context();
+        let ctx = self.current_context()?;
 
         // Ensure the input doc exists (idempotent)
         self.blocks
@@ -81,7 +86,7 @@ impl Filesystem for InputFilesystem {
             ));
         }
 
-        let ctx = self.current_context();
+        let ctx = self.current_context()?;
         let new_text = String::from_utf8(data.to_vec()).map_err(|e| {
             io::Error::new(io::ErrorKind::InvalidData, format!("invalid UTF-8: {}", e))
         })?;
@@ -91,9 +96,8 @@ impl Filesystem for InputFilesystem {
             .create_input_doc(ctx)
             .map_err(io::Error::other)?;
 
-        // Clear existing content first, then write new text
-        let _ = self.blocks.clear_input(ctx);
-
+        // Default behavior for write is overwrite
+        self.blocks.clear_input(ctx).map_err(io::Error::other)?;
         if !new_text.is_empty() {
             self.blocks
                 .edit_input(ctx, 0, &new_text, 0)
@@ -132,7 +136,7 @@ impl Filesystem for InputFilesystem {
             ));
         }
 
-        let ctx = self.current_context();
+        let ctx = self.current_context()?;
 
         // Get text length for size, or 0 if no input doc
         let size = self
@@ -170,7 +174,7 @@ impl Filesystem for InputFilesystem {
         }
 
         // "Removing" the input file clears its content
-        let ctx = self.current_context();
+        let ctx = self.current_context()?;
         self.blocks.clear_input(ctx).map_err(io::Error::other)?;
         Ok(())
     }
@@ -182,8 +186,11 @@ impl Filesystem for InputFilesystem {
     async fn exists(&self, path: &Path) -> bool {
         let path_str = path.to_string_lossy();
         let normalized = path_str.trim_start_matches('/').trim_end_matches('/');
-        // The root file always "exists"
-        normalized.is_empty()
+        // The root file only "exists" if we have an active context
+        if !normalized.is_empty() {
+            return false;
+        }
+        self.current_context().is_ok()
     }
 
     fn real_path(&self, _path: &Path) -> Option<PathBuf> {
@@ -199,9 +206,11 @@ mod tests {
 
     fn test_fs() -> (InputFilesystem, ContextId) {
         let ctx = ContextId::new();
+        let sid = SessionId::new();
         let blocks = shared_block_store(PrincipalId::system());
-        let shared_ctx = Arc::new(RwLock::new(ctx));
-        (InputFilesystem::new(blocks, shared_ctx), ctx)
+        let session_contexts = crate::context_engine::session_context_map();
+        session_contexts.insert(sid, ctx);
+        (InputFilesystem::new(blocks, session_contexts, sid), ctx)
     }
 
     #[tokio::test]

@@ -115,16 +115,41 @@ Surgically decompose `rpc.rs` into `rpc/kernel.rs`, `rpc/world.rs`, etc. Move lo
 
 **`complete()` resolved (April 7, 2026).** Wired to `RhaiEngine::complete()` — returns completions for 40+ rhai scripting functions.
 
-**`interrupt()` and `subscribe_output()` remain stubs.** These require an async execute redesign: `execute()` currently blocks until command completion, so there's no way for the client to get an `execId` to interrupt or to stream output. Planned fix: make `execute()` non-blocking (return execId immediately), implement `subscribe_output()` for streaming, then `interrupt(execId)` becomes meaningful.
+**`interrupt()` and `subscribe_output()` resolved (April 8, 2026).** `execute()` is now non-blocking and returns an `execId` immediately. Background tasks handle execution and dispatch output to subscribers via `dispatch_output_events`. `interrupt(execId)` cancels the corresponding background task.
+
+---
+
+## 6. Post-Implementation Audit (April 9, 2026)
+
+Following the implementation of the items above, a secondary audit identified several remaining "ghosts" and synchronization issues.
+
+### Critical: Context State Desynchronization
+There is a "split-brain" problem between the RPC layer and the Shell layer:
+- **RPC Layer**: Tracks `current_context_id` in `ConnectionState`.
+- **Shell Layer**: Tracks `current_context_id` in `SessionContextMap` (used by `ContextEngine`).
+- **The Issue**: Calling `kj context switch` updates the Shell map but **not** the ConnectionState. RPC calls like `execute` or `apply_block_op` will continue using the old context while the shell thinks it has moved. They must be unified into a single source of truth.
+
+### Incomplete Migrations & Stubs
+- **`MoveBlock` is dead code**: While `kaijutsu.capnp` defines it and `kaijutsu-crdt` implements it, the `kaijutsu-kernel` wrapper lacks the method. `rpc.rs` currently logs a `warn!` stub.
+- **`EditBlockText` Deprecation**: This RPC remains as a stub. It should be removed from the schema now that `pushOps` (CRDT) is the standard.
+- **Ack Versions**: `apply_block_op` does not correctly set the `ackVersion` in its results (it remains 0), making it harder for clients to track sync state.
+
+### Durability & Error Handling
+- **Ghost Contexts**: `create_context` logs a warning but returns `Ok` even if `KernelDb` insertion fails. This creates non-persistent contexts that disappear on restart.
+- **Streaming Durability**: `execute_shell_command` only saves a final snapshot *after* the entire loop finishes. A crash during a long-running tool execution (e.g., a complex agent loop) loses all intermediate progress.
 
 ---
 
 ## Summary of Action Items
-1. ~~**Harden Persistence:** Trigger auto-saves on block mutations.~~ Largely resolved (April 6). `merge_ops` auto_save added (April 7). Streaming paths (append/edit) use explicit flush by design.
-2. ~~**Session Isolation:** Scope `CurrentContext` and `DriftRouter` labels.~~ Resolved (April 6). Per-session context map, label uniqueness enforcement, cwd persistence on switch.
-3. **Refactor rpc.rs:** Begin breaking down the 8k-line file. (Deferred — not causing development friction yet.)
-4. **Pool Database:** Move away from a single `Mutex` for `KernelDb`. (Deferred — not a bottleneck yet.)
-5. ~~**Restore env/init_script on session creation.**~~ Resolved (April 7). `EmbeddedKaish::apply_context_config()` called after creation.
-6. ~~**MCP Reconnection.**~~ Resolved (April 7). `reconnect()` + retry-on-ServiceError in `call_tool()`.
-7. ~~**`complete()` RPC.**~~ Resolved (April 7). Wired to RhaiEngine.
-8. **Async execute redesign:** Make `execute()` non-blocking, implement `subscribe_output()` and `interrupt(execId)`. (Planned — largest remaining item.)
+1. ~~**Harden Persistence.**~~ (April 6).
+2. ~~**Session Isolation.**~~ (April 6).
+3. **Refactor `rpc.rs`**: Begin breaking down the 8k-line file.
+4. **Pool Database**: Move away from a single `Mutex` for `KernelDb`.
+5. ~~**Restore env/init_script on session creation.**~~ (April 7).
+6. ~~**MCP Reconnection.**~~ (April 7).
+7. ~~**`complete()` RPC.**~~ (April 7).
+8. ~~**Async execute redesign.**~~ (April 8).
+9. ~~**Unify Context Identity.**~~ (April 10). Refactored `ConnectionState` and `EmbeddedKaish` to use a shared `DashMap` for context tracking. Added `kj context current` command to verify synchronization.
+10. **Implement `MoveBlock`**: Expose CRDT logic through the `Kernel` and wire to RPC.
+11. **Hard-fail on Persistence Errors**: Ensure `KernelDb` failures in RPCs return `Promise::err`.
+12. **Intermediate Checkpoints**: Trigger `auto_save` after each tool result is appended in the agentic loop.

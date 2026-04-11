@@ -47,7 +47,7 @@ impl KjDispatcher {
     fn require_staging(&self, caller: &KjCaller) -> Result<(), KjResult> {
         let state = {
             let drift = self.drift_router().blocking_read();
-            drift.context_state(caller.context_id)
+            drift.context_state(caller.context_id.unwrap())
         };
         match state {
             Some(ContextState::Staging) => Ok(()),
@@ -65,7 +65,7 @@ impl KjDispatcher {
             return result;
         }
 
-        let context_id = caller.context_id;
+        let context_id = caller.context_id.unwrap();
 
         // Transition DriftRouter
         {
@@ -90,7 +90,7 @@ impl KjDispatcher {
     }
 
     fn stage_status(&self, caller: &KjCaller) -> KjResult {
-        let context_id = caller.context_id;
+        let context_id = caller.context_id.unwrap();
 
         let state = {
             let drift = self.drift_router().blocking_read();
@@ -156,7 +156,7 @@ impl KjDispatcher {
             return KjResult::Err("kj stage: missing block ID".to_string());
         }
 
-        let context_id = caller.context_id;
+        let context_id = caller.context_id.unwrap();
         let block_key = &argv[0];
 
         // Find the block by suffix match on the key

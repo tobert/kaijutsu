@@ -444,7 +444,8 @@ struct RunningExecution {
 pub struct ConnectionState {
     pub principal: Principal,
     pub session_id: SessionId,
-    pub current_context_id: Option<ContextId>,
+    /// Global session map for context tracking.
+    pub session_contexts: crate::context_engine::SessionContextMap,
     pub kaish: Option<Rc<EmbeddedKaish>>,
     pub command_history: Vec<CommandEntry>,
     next_exec_id: AtomicU64,
@@ -455,11 +456,14 @@ pub struct ConnectionState {
 }
 
 impl ConnectionState {
-    pub fn new(principal: Principal) -> Self {
+    pub fn new(
+        principal: Principal,
+        session_contexts: crate::context_engine::SessionContextMap,
+    ) -> Self {
         Self {
             principal,
             session_id: SessionId::new(),
-            current_context_id: None,
+            session_contexts,
             kaish: None,
             command_history: Vec::new(),
             next_exec_id: AtomicU64::new(1),
@@ -470,9 +474,12 @@ impl ConnectionState {
 
     /// Get the connection's active context, or error if none joined.
     pub fn require_context(&self) -> Result<ContextId, capnp::Error> {
-        self.current_context_id.ok_or_else(|| {
-            capnp::Error::failed("no context joined — call joinContext first".into())
-        })
+        self.session_contexts
+            .get(&self.session_id)
+            .map(|r| *r)
+            .ok_or_else(|| {
+                capnp::Error::failed("no context joined — call joinContext first".into())
+            })
     }
 
     fn next_exec_id(&self) -> u64 {
@@ -1505,7 +1512,7 @@ impl kernel::Server for KernelImpl {
                         let context_id = conn.require_context()?;
                         let kj_disp = kernel.kj_dispatcher.clone();
                         let kj_principal = conn.principal.id;
-                        let kj_session = conn.session_id;
+                        let session_contexts = conn.session_contexts.clone();
                         match EmbeddedKaish::with_identity_and_db(
                             &format!(
                                 "{}-{}-{}",
@@ -1521,14 +1528,15 @@ impl kernel::Server for KernelImpl {
                             conn.session_id,
                             kernel.id,
                             Some(&kernel.kernel_db),
-                            |shared_ctx, tools| {
+                            session_contexts.clone(),
+                            |map, sid, tools| {
                                 let block_source: Arc<dyn kaijutsu_index::BlockSource> =
                                     Arc::new(BlockStoreSource(kernel.documents.clone()));
                                 tools.register(crate::kj_builtin::KjBuiltin::new(
                                     kj_disp,
-                                    shared_ctx,
+                                    map,
                                     kj_principal,
-                                    kj_session,
+                                    sid,
                                     kernel.semantic_index.clone(),
                                     block_source,
                                 ));
@@ -1552,8 +1560,9 @@ impl kernel::Server for KernelImpl {
 
                 // Apply persisted env vars and init_script on first creation.
                 if newly_created {
-                    let ctx_id = kaish.context_id();
-                    kaish.apply_context_config(&kernel.kernel_db, ctx_id).await;
+                    if let Some(ctx_id) = kaish.context_id() {
+                        kaish.apply_context_config(&kernel.kernel_db, ctx_id).await;
+                    }
                 }
 
                 // Reject concurrent executions — kaish kernel is serial.
@@ -2464,7 +2473,8 @@ impl kernel::Server for KernelImpl {
         let kernel = self.kernel.clone();
         let connection = self.connection.clone();
 
-        let parent_ctx = connection.borrow().current_context_id;
+        let session_id = connection.borrow().session_id;
+        let parent_ctx = connection.borrow().session_contexts.get(&session_id).map(|r| *r);
 
         log::info!(
             "create_context: label='{}' kernel='{}'",
@@ -2640,8 +2650,9 @@ impl kernel::Server for KernelImpl {
                         kaijutsu_telemetry::context_root_span(&trace_id, "join_context").entered();
                 }
 
-                // Update connection's active context
-                connection.borrow_mut().current_context_id = Some(context_id);
+                // Update connection's active context in the global map
+                let session_id = connection.borrow().session_id;
+                connection.borrow().session_contexts.insert(session_id, context_id);
 
                 // Return the context_id
                 results.get().set_context_id(context_id.as_bytes());
@@ -6157,7 +6168,7 @@ async fn execute_shell_command(
             log::info!("Creating embedded kaish for kernel {}", kernel.id.to_hex());
             let kj_disp = kernel.kj_dispatcher.clone();
             let kj_principal = conn.principal.id;
-            let kj_session = conn.session_id;
+            let session_contexts = conn.session_contexts.clone();
             match EmbeddedKaish::with_identity_and_db(
                 &format!(
                     "{}-{}-{}",
@@ -6173,14 +6184,15 @@ async fn execute_shell_command(
                 conn.session_id,
                 kernel.id,
                 Some(&kernel.kernel_db),
-                |shared_ctx, tools| {
+                session_contexts.clone(),
+                |map, sid, tools| {
                     let block_source: Arc<dyn kaijutsu_index::BlockSource> =
                         Arc::new(BlockStoreSource(kernel.documents.clone()));
                     tools.register(crate::kj_builtin::KjBuiltin::new(
                         kj_disp,
-                        shared_ctx,
+                        map,
                         kj_principal,
-                        kj_session,
+                        sid,
                         kernel.semantic_index.clone(),
                         block_source,
                     ));
@@ -6204,8 +6216,9 @@ async fn execute_shell_command(
 
     // Apply persisted env vars and init_script on first creation.
     if newly_created {
-        let ctx_id = kaish.context_id();
-        kaish.apply_context_config(&kernel.kernel_db, ctx_id).await;
+        if let Some(ctx_id) = kaish.context_id() {
+            kaish.apply_context_config(&kernel.kernel_db, ctx_id).await;
+        }
     }
 
     let documents = kernel.documents.clone();
@@ -6382,7 +6395,7 @@ async fn execute_shell_command(
                 }
 
                 // Detect context switch (kj fork, kj context switch)
-                let new_context_id = kaish.context_id();
+                let new_context_id = kaish.context_id().unwrap_or_else(ContextId::nil);
                 if new_context_id != context_id {
                     log::info!(
                         "shell_execute: context switched {} → {}",

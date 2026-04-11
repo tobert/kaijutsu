@@ -58,10 +58,12 @@ impl KjDispatcher {
             }
         };
 
+        let context_id = caller.context_id.unwrap();
+
         // Determine content and drift kind
         let (content, drift_kind) = if summarize {
             // LLM-distill the caller's context
-            match self.summarize(caller.context_id, None).await {
+            match self.summarize(context_id, None).await {
                 Ok(s) => (s, DriftKind::Distill),
                 Err(e) => return KjResult::Err(format!("kj drift push --summarize: {e}")),
             }
@@ -83,14 +85,14 @@ impl KjDispatcher {
         // Get source model for provenance
         let source_model = {
             let router = self.drift_router().read().await;
-            router.get(caller.context_id).and_then(|h| h.model.clone())
+            router.get(context_id).and_then(|h| h.model.clone())
         };
 
         // Stage the drift
         let staged_id = {
             let mut router = self.drift_router().write().await;
             match router.stage(
-                caller.context_id,
+                context_id,
                 target_id,
                 content,
                 source_model,
@@ -124,7 +126,9 @@ impl KjDispatcher {
             }
         };
 
-        if source_id == caller.context_id {
+        let context_id = caller.context_id.unwrap();
+
+        if source_id == context_id {
             return KjResult::Err("kj drift pull: cannot pull from self".to_string());
         }
 
@@ -146,9 +150,10 @@ impl KjDispatcher {
             let router = self.drift_router().read().await;
             router.get(source_id).and_then(|h| h.model.clone())
         };
-        let after = self.block_store().last_block_id(caller.context_id);
+        let after = self.block_store().last_block_id(caller.context_id.unwrap());
+
         if let Err(e) = self.block_store().insert_drift_block(
-            caller.context_id,
+            context_id,
             None,
             after.as_ref(),
             &summary,
@@ -165,7 +170,7 @@ impl KjDispatcher {
             let edge = crate::kernel_db::ContextEdgeRow {
                 edge_id: uuid::Uuid::now_v7(),
                 source_id,
-                target_id: caller.context_id,
+                target_id: context_id,
                 kind: EdgeKind::Drift,
                 metadata: Some("pull".to_string()),
                 created_at: kaijutsu_types::now_millis() as i64,
@@ -190,6 +195,8 @@ impl KjDispatcher {
     }
 
     async fn drift_merge(&self, argv: &[String], caller: &KjCaller) -> KjResult {
+        let context_id = caller.context_id.unwrap();
+
         // kj drift merge [ctx]
         // Default target = caller's forked_from parent
         let target_id = if let Some(target_query) = argv.get(1) {
@@ -206,7 +213,7 @@ impl KjDispatcher {
         } else {
             // Default: forked_from parent
             let db = self.kernel_db().lock();
-            let row = match db.get_context(caller.context_id) {
+            let row = match db.get_context(context_id) {
                 Ok(Some(r)) => r,
                 Ok(None) => {
                     return KjResult::Err(
@@ -221,12 +228,12 @@ impl KjDispatcher {
             }
         };
 
-        if target_id == caller.context_id {
+        if target_id == context_id {
             return KjResult::Err("kj drift merge: cannot merge into self".to_string());
         }
 
         // Summarize caller's context
-        let summary = match self.summarize(caller.context_id, None).await {
+        let summary = match self.summarize(context_id, None).await {
             Ok(s) => s,
             Err(e) => return KjResult::Err(format!("kj drift merge: {e}")),
         };
@@ -234,7 +241,7 @@ impl KjDispatcher {
         // Insert drift block into the TARGET (parent) context
         let source_model = {
             let router = self.drift_router().read().await;
-            router.get(caller.context_id).and_then(|h| h.model.clone())
+            router.get(context_id).and_then(|h| h.model.clone())
         };
         let after = self.block_store().last_block_id(target_id);
         if let Err(e) = self.block_store().insert_drift_block(
@@ -242,7 +249,7 @@ impl KjDispatcher {
             None,
             after.as_ref(),
             &summary,
-            caller.context_id,
+            context_id,
             source_model,
             DriftKind::Merge,
         ) {
@@ -254,7 +261,7 @@ impl KjDispatcher {
             let db = self.kernel_db().lock();
             let edge = crate::kernel_db::ContextEdgeRow {
                 edge_id: uuid::Uuid::now_v7(),
-                source_id: caller.context_id,
+                source_id: context_id,
                 target_id,
                 kind: EdgeKind::Drift,
                 metadata: Some("merge".to_string()),
@@ -291,7 +298,7 @@ impl KjDispatcher {
     async fn drift_flush(&self, caller: &KjCaller) -> KjResult {
         let staged = {
             let mut router = self.drift_router().write().await;
-            router.drain(Some(caller.context_id))
+            router.drain(caller.context_id)
         };
 
         if staged.is_empty() {

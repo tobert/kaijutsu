@@ -20,6 +20,7 @@ impl KjDispatcher {
         match argv[0].as_str() {
             "list" | "ls" => self.context_list(argv, caller).await,
             "info" => self.context_info(argv, caller),
+            "current" | "show" => self.context_current(argv, caller).await,
             "switch" | "sw" => self.context_switch(argv, caller).await,
             "create" | "new" => self.context_create(argv, caller).await,
             "set" => self.context_set(argv, caller).await,
@@ -95,7 +96,7 @@ impl KjDispatcher {
             .map(|edges| edges.len())
             .unwrap_or(0);
 
-        let is_current = target_id == caller.context_id;
+        let is_current = Some(target_id) == caller.context_id;
         let mut info = format_context_info(&row, children_count, drift_from + drift_to, is_current);
 
         // Shell config
@@ -139,6 +140,24 @@ impl KjDispatcher {
         KjResult::ok(info)
     }
 
+    async fn context_current(&self, _argv: &[String], caller: &KjCaller) -> KjResult {
+        let Some(ctx_id) = caller.context_id else {
+            return KjResult::ok("No active context joined. Use 'kj context switch' to join one.");
+        };
+
+        let router = self.drift_router().read().await;
+        let label = router
+            .get(ctx_id)
+            .and_then(|h| h.label.clone())
+            .unwrap_or_else(|| "(unlabeled)".into());
+
+        KjResult::ok(format!(
+            "Current context: {} [{}]",
+            label,
+            ctx_id.to_hex()
+        ))
+    }
+
     async fn context_switch(&self, argv: &[String], caller: &KjCaller) -> KjResult {
         let query = match argv.get(1) {
             Some(q) => q.as_str(),
@@ -159,7 +178,7 @@ impl KjDispatcher {
 
         match resolved {
             Ok(target_id) => {
-                if target_id == caller.context_id {
+                if Some(target_id) == caller.context_id {
                     return KjResult::ok("already in that context".to_string());
                 }
                 // Get label for display
@@ -184,24 +203,19 @@ impl KjDispatcher {
         };
 
         // Find --parent flag
-        let parent_id = if let Some(idx) = argv.iter().position(|a| a == "--parent" || a == "-p") {
-            let parent_ref = match argv.get(idx + 1) {
-                Some(r) => r.as_str(),
-                None => {
-                    return KjResult::Err(
-                        "kj context create: --parent requires a context reference".to_string(),
-                    );
-                }
+        let parent_id = {
+            let parent_ref = if let Some(idx) = argv.iter().position(|a| a == "--parent" || a == "-p") {
+                argv.get(idx + 1).map(|s| s.as_str())
+            } else {
+                None
             };
+
             let db = self.kernel_db().lock();
-            match super::refs::resolve_context_arg(Some(parent_ref), caller, &db, self.kernel_id())
-            {
+            match super::refs::resolve_context_arg(parent_ref, caller, &db, self.kernel_id()) {
                 Ok(id) => Some(id),
+                Err(_) if parent_ref.is_none() => None, // Default to root if no current context
                 Err(e) => return KjResult::Err(format!("kj context create: {e}")),
             }
-        } else {
-            // Default parent: current context
-            Some(caller.context_id)
         };
 
         let new_id = ContextId::new();
@@ -661,7 +675,7 @@ impl KjDispatcher {
             (target_id, label)
         };
 
-        if target_id == caller.context_id {
+        if Some(target_id) == caller.context_id {
             return KjResult::Err(
                 "kj context remove: cannot remove the current context".to_string(),
             );

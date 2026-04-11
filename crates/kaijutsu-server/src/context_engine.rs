@@ -14,12 +14,11 @@
 //! context list
 //! ```
 
-use std::collections::HashMap;
+use dashmap::DashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use kaijutsu_types::{ContextId, SessionId};
-use tokio::sync::RwLock;
 
 use kaijutsu_kernel::drift::SharedDriftRouter;
 use kaijutsu_kernel::tools::{ExecResult, ExecutionEngine};
@@ -30,11 +29,25 @@ use kaijutsu_kernel::tools::{ExecResult, ExecutionEngine};
 
 /// Per-session current-context map. Each SSH session gets independent state
 /// so that one session switching context doesn't affect others.
-pub type SessionContextMap = Arc<RwLock<HashMap<SessionId, ContextId>>>;
+///
+/// Uses DashMap for synchronous, concurrent access.
+pub type SessionContextMap = Arc<DashMap<SessionId, ContextId>>;
+
+/// Extension trait for SessionContextMap to provide convenient accessors.
+pub trait SessionContextExt {
+    /// Get the current context for a session.
+    fn current(&self, session_id: &SessionId) -> Option<ContextId>;
+}
+
+impl SessionContextExt for SessionContextMap {
+    fn current(&self, session_id: &SessionId) -> Option<ContextId> {
+        self.get(session_id).map(|r| *r)
+    }
+}
 
 /// Create a new session-context map.
 pub fn session_context_map() -> SessionContextMap {
-    Arc::new(RwLock::new(HashMap::new()))
+    Arc::new(DashMap::new())
 }
 
 // ============================================================================
@@ -82,7 +95,7 @@ impl ContextEngine {
                             .unwrap_or("(unlabeled)");
                         let label_owned = label.to_string();
                         drop(router);
-                        self.sessions.write().await.insert(session_id, ctx_id);
+                        self.sessions.insert(session_id, ctx_id);
                         Ok(format!("Switched to context '{}'", label_owned))
                     }
                     Err(e) => Err(format!("Failed to resolve context '{}': {}", query, e)),
@@ -90,7 +103,7 @@ impl ContextEngine {
             }
             "list" | "ls" => {
                 let router = self.drift.read().await;
-                let current_id = self.sessions.read().await.get(&session_id).copied();
+                let current_id = self.sessions.get(&session_id).map(|r| *r);
                 let contexts = router.list_contexts();
 
                 let mut output = String::new();
@@ -110,7 +123,7 @@ impl ContextEngine {
                 Ok(output)
             }
             "current" | "show" => {
-                let current_id = self.sessions.read().await.get(&session_id).copied();
+                let current_id = self.sessions.get(&session_id).map(|r| *r);
                 match current_id {
                     Some(id) => {
                         let router = self.drift.read().await;
@@ -124,7 +137,7 @@ impl ContextEngine {
                 }
             }
             "leave" => {
-                let old = self.sessions.write().await.remove(&session_id);
+                let old = self.sessions.remove(&session_id).map(|(_, v)| v);
                 match old {
                     Some(id) => {
                         let router = self.drift.read().await;
@@ -281,7 +294,7 @@ mod tests {
         assert!(result.success);
         assert!(result.stdout.contains("planning"));
         assert_eq!(
-            sessions.read().await.get(&tool_ctx.session_id).copied(),
+            sessions.get(&tool_ctx.session_id).map(|r| *r),
             Some(ctx_id),
         );
     }
@@ -365,14 +378,13 @@ mod tests {
         assert!(result.success, "Session B switch failed: {}", result.stderr);
 
         // Session A's current context should still be alpha.
-        let map = sessions.read().await;
         assert_eq!(
-            map.get(&session_a).copied(),
+            sessions.get(&session_a).map(|r| *r),
             Some(id_alpha),
             "Session A's context should still be alpha after Session B switched",
         );
         assert_eq!(
-            map.get(&session_b).copied(),
+            sessions.get(&session_b).map(|r| *r),
             Some(id_beta),
             "Session B's context should be beta",
         );

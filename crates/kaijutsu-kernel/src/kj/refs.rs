@@ -47,9 +47,13 @@ pub fn resolve_context_ref(
     kernel_id: kaijutsu_types::KernelId,
 ) -> Result<ContextId, String> {
     match ctx_ref {
-        ContextRef::Current => Ok(caller.context_id),
+        ContextRef::Current => caller
+            .context_id
+            .ok_or_else(|| "no active context joined".to_string()),
         ContextRef::Parent(depth) => {
-            let mut current = caller.context_id;
+            let mut current = caller
+                .context_id
+                .ok_or_else(|| "no active context joined".to_string())?;
             for i in 0..*depth {
                 let row = db
                     .get_context(current)

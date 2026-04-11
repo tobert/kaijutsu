@@ -143,7 +143,7 @@ impl KjDispatcher {
         // Parse --stage (liminal state: user curates blocks before LLM invocation)
         let staging = has_flag(argv, &["--stage", "--staging"]);
 
-        let source_id = caller.context_id;
+        let source_id = caller.context_id.unwrap();
         let new_id = ContextId::new();
         let kernel_id = self.kernel_id();
 
@@ -336,7 +336,7 @@ impl KjDispatcher {
             .and_then(|d| d.parse().ok())
             .unwrap_or(50);
 
-        let source_id = caller.context_id;
+        let source_id = caller.context_id.unwrap();
         let new_id = ContextId::new();
         let kernel_id = self.kernel_id();
 
@@ -536,7 +536,7 @@ impl KjDispatcher {
         let pwd_override = extract_named_arg(argv, &["--pwd"]);
         let staging = has_flag(argv, &["--stage", "--staging"]);
 
-        let source_id = caller.context_id;
+        let source_id = caller.context_id.unwrap();
         let new_id = ContextId::new();
         let kernel_id = self.kernel_id();
 
@@ -818,7 +818,7 @@ impl KjDispatcher {
                 let new_forked_from = row
                     .forked_from
                     .and_then(|fid| id_map.get(&fid).copied())
-                    .or(Some(caller.context_id));
+                    .or(caller.context_id);
 
                 let new_row = ContextRow {
                     context_id: new_id,
@@ -900,7 +900,7 @@ impl KjDispatcher {
             // Edge from caller's context to the new root
             let root_edge = ContextEdgeRow {
                 edge_id: uuid::Uuid::now_v7(),
-                source_id: caller.context_id,
+                source_id: caller.context_id.unwrap(),
                 target_id: new_root_id,
                 kind: EdgeKind::Structural,
                 metadata: None,
@@ -925,7 +925,7 @@ impl KjDispatcher {
                 let forked_from = row
                     .forked_from
                     .and_then(|fid| id_map.get(&fid).copied())
-                    .or(Some(caller.context_id));
+                    .or(caller.context_id);
                 if let Some(parent) = forked_from {
                     if let Err(e) = drift.register_fork(new_id, label, parent, caller.principal_id)
                     {
@@ -948,7 +948,7 @@ impl KjDispatcher {
 
         if let Err(e) = self.inject_fork_marker(
             new_root_id,
-            caller.context_id,
+            caller.context_id.unwrap(),
             ForkKind::Subtree,
             template_nodes.len(),
             Some(&template_ref),
@@ -1027,7 +1027,7 @@ impl KjDispatcher {
                 None,
                 after.as_ref(),
                 note,
-                caller.context_id,
+                caller.context_id.unwrap(),
                 None,
                 DriftKind::Push,
             )
@@ -1142,7 +1142,7 @@ impl KjDispatcher {
                 None,
                 after.as_ref(),
                 &full_content,
-                caller.context_id,
+                caller.context_id.unwrap(),
                 Some(format!("mcp:{}", server)),
                 DriftKind::Notification,
             )

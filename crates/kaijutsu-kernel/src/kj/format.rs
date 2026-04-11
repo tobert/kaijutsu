@@ -7,7 +7,7 @@ use crate::kernel_db::ContextRow;
 /// Format a context list as a flat table.
 ///
 /// Marks the current context with `*`.
-pub fn format_context_table(contexts: &[ContextRow], current: ContextId) -> String {
+pub fn format_context_table(contexts: &[ContextRow], current: Option<ContextId>) -> String {
     if contexts.is_empty() {
         return "(no contexts)".to_string();
     }
@@ -15,7 +15,11 @@ pub fn format_context_table(contexts: &[ContextRow], current: ContextId) -> Stri
     let mut lines = Vec::new();
 
     for ctx in contexts {
-        let marker = if ctx.context_id == current { "*" } else { " " };
+        let marker = if Some(ctx.context_id) == current {
+            "*"
+        } else {
+            " "
+        };
         let label = ctx.label.as_deref().unwrap_or("-");
         let model = format_model(&ctx.provider, &ctx.model);
         let id_short = ctx.context_id.short();
@@ -28,7 +32,7 @@ pub fn format_context_table(contexts: &[ContextRow], current: ContextId) -> Stri
 /// Format context DAG results as an indented tree.
 ///
 /// `dag` is a list of (ContextRow, depth) from the recursive CTE.
-pub fn format_context_tree(dag: &[(ContextRow, i64)], current: ContextId) -> String {
+pub fn format_context_tree(dag: &[(ContextRow, i64)], current: Option<ContextId>) -> String {
     if dag.is_empty() {
         return "(no contexts)".to_string();
     }
@@ -37,7 +41,11 @@ pub fn format_context_tree(dag: &[(ContextRow, i64)], current: ContextId) -> Str
 
     for (ctx, depth) in dag {
         let indent = "  ".repeat(*depth as usize);
-        let marker = if ctx.context_id == current { "*" } else { " " };
+        let marker = if Some(ctx.context_id) == current {
+            "*"
+        } else {
+            " "
+        };
         let label = ctx.label.as_deref().unwrap_or("-");
         let model = format_model(&ctx.provider, &ctx.model);
         let id_short = ctx.context_id.short();
@@ -127,14 +135,14 @@ fn format_timestamp(millis: i64) -> String {
 /// Format fork lineage chain for `kj context log`.
 ///
 /// Shows the chain from the starting context up to the root, with depth markers.
-pub fn format_fork_lineage(lineage: &[(ContextRow, i64)], current: ContextId) -> String {
+pub fn format_fork_lineage(lineage: &[(ContextRow, i64)], current: Option<ContextId>) -> String {
     if lineage.is_empty() {
         return "(no lineage)".to_string();
     }
 
     let mut lines = Vec::new();
     for (ctx, depth) in lineage {
-        let marker = if ctx.context_id == current { "*" } else { " " };
+        let marker = if Some(ctx.context_id) == current { "*" } else { " " };
         let label = ctx.label.as_deref().unwrap_or("-");
         let model = format_model(&ctx.provider, &ctx.model);
         let id_short = ctx.context_id.short();

@@ -193,13 +193,13 @@ impl KjDispatcher {
 
         // Inject as drift block
         use kaijutsu_crdt::DriftKind;
-        let after = self.block_store().last_block_id(caller.context_id);
+        let after = self.block_store().last_block_id(caller.context_id.unwrap());
         match self.block_store().insert_drift_block(
-            caller.context_id,
+            caller.context_id.unwrap(),
             None,
             after.as_ref(),
             &full_content,
-            caller.context_id,
+            caller.context_id.unwrap(),
             Some(format!("mcp:{}", server)),
             DriftKind::Notification,
         ) {

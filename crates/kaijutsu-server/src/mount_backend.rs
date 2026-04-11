@@ -516,12 +516,15 @@ mod tests {
     async fn test_mount_backend() -> MountBackend {
         let blocks = shared_block_store(PrincipalId::system());
         let kernel = Arc::new(KaijutsuKernel::new("test-mount").await);
+        let sid = kaijutsu_types::SessionId::new();
+        let session_contexts = crate::context_engine::session_context_map();
+        session_contexts.insert(sid, kaijutsu_types::ContextId::new());
         let docs = Arc::new(KaijutsuBackend::new(
             blocks,
             kernel,
             PrincipalId::system(),
-            Arc::new(std::sync::RwLock::new(kaijutsu_types::ContextId::new())),
-            kaijutsu_types::SessionId::new(),
+            session_contexts,
+            sid,
             kaijutsu_types::KernelId::new(),
         ));
 

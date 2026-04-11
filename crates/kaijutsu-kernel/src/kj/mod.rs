@@ -40,7 +40,7 @@ use crate::mcp_pool::McpServerPool;
 #[derive(Debug, Clone)]
 pub struct KjCaller {
     pub principal_id: PrincipalId,
-    pub context_id: ContextId,
+    pub context_id: Option<ContextId>,
     pub session_id: SessionId,
     /// True when the caller has verified a latch nonce (destructive op confirmed).
     pub confirmed: bool,
@@ -167,15 +167,36 @@ impl KjDispatcher {
             return KjResult::Err(self.help());
         }
 
-        match argv[0].as_str() {
-            "context" | "ctx" => self.dispatch_context(&argv[1..], caller).await,
+        let cmd = argv[0].as_str();
+
+        // Commands that don't strictly require an active context
+        if cmd == "help" || cmd == "--help" || cmd == "-h" {
+            return KjResult::ok_ephemeral(self.help(), ContentType::Markdown);
+        }
+
+        // Most context/workspace/preset subcommands work without an active context
+        if cmd == "context" || cmd == "ctx" {
+            return self.dispatch_context(&argv[1..], caller).await;
+        }
+        if cmd == "workspace" || cmd == "ws" {
+            return self.dispatch_workspace(&argv[1..], caller);
+        }
+        if cmd == "preset" {
+            return self.dispatch_preset(&argv[1..], caller);
+        }
+
+        // Everything else requires an active context
+        if caller.context_id.is_none() {
+            return KjResult::Err("no active context joined. Use 'kj context switch <label>' to join one.".to_string());
+        }
+
+        match cmd {
             "fork" => self.dispatch_fork(&argv[1..], caller).await,
             "stage" => self.dispatch_stage(&argv[1..], caller).await,
             "drift" => self.dispatch_drift(&argv[1..], caller).await,
             "prompt" => self.dispatch_prompt(&argv[1..], caller).await,
             "preset" => self.dispatch_preset(&argv[1..], caller),
             "workspace" | "ws" => self.dispatch_workspace(&argv[1..], caller),
-            "help" | "--help" | "-h" => KjResult::ok_ephemeral(self.help(), ContentType::Markdown),
             other => KjResult::Err(format!(
                 "kj: unknown command '{}'\n\n{}",
                 other,
@@ -291,7 +312,7 @@ pub(crate) mod test_helpers {
     pub fn test_caller() -> KjCaller {
         KjCaller {
             principal_id: PrincipalId::new(),
-            context_id: ContextId::new(),
+            context_id: Some(ContextId::new()),
             session_id: SessionId::new(),
             confirmed: false,
         }
@@ -301,7 +322,7 @@ pub(crate) mod test_helpers {
     pub fn caller_with_context(context_id: ContextId) -> KjCaller {
         KjCaller {
             principal_id: PrincipalId::new(),
-            context_id,
+            context_id: Some(context_id),
             session_id: SessionId::new(),
             confirmed: false,
         }
@@ -311,7 +332,7 @@ pub(crate) mod test_helpers {
     pub fn confirmed_caller(context_id: ContextId) -> KjCaller {
         KjCaller {
             principal_id: PrincipalId::new(),
-            context_id,
+            context_id: Some(context_id),
             session_id: SessionId::new(),
             confirmed: true,
         }
