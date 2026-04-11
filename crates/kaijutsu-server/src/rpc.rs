@@ -7051,6 +7051,17 @@ async fn process_llm_stream(
         // Add user message with tool results
         messages.push(LlmMessage::tool_results(tool_results));
 
+        // Checkpoint: persist tool results before re-prompting. A crash during
+        // the next model call would otherwise lose the whole round's tool work
+        // (the only other save_snapshot is at the very end of the loop).
+        if let Err(e) = documents.save_snapshot(context_id) {
+            log::warn!(
+                "Intermediate checkpoint failed for context {}: {}",
+                context_id,
+                e
+            );
+        }
+
         // Loop continues - re-prompt with tool results
     }
 
