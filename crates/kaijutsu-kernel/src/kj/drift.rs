@@ -58,7 +58,10 @@ impl KjDispatcher {
             }
         };
 
-        let context_id = caller.context_id.unwrap();
+        let context_id = match caller.require_context() {
+            Ok(id) => id,
+            Err(e) => return e,
+        };
 
         // Determine content and drift kind
         let (content, drift_kind) = if summarize {
@@ -126,7 +129,10 @@ impl KjDispatcher {
             }
         };
 
-        let context_id = caller.context_id.unwrap();
+        let context_id = match caller.require_context() {
+            Ok(id) => id,
+            Err(e) => return e,
+        };
 
         if source_id == context_id {
             return KjResult::Err("kj drift pull: cannot pull from self".to_string());
@@ -150,7 +156,7 @@ impl KjDispatcher {
             let router = self.drift_router().read().await;
             router.get(source_id).and_then(|h| h.model.clone())
         };
-        let after = self.block_store().last_block_id(caller.context_id.unwrap());
+        let after = self.block_store().last_block_id(context_id);
 
         if let Err(e) = self.block_store().insert_drift_block(
             context_id,
@@ -195,7 +201,10 @@ impl KjDispatcher {
     }
 
     async fn drift_merge(&self, argv: &[String], caller: &KjCaller) -> KjResult {
-        let context_id = caller.context_id.unwrap();
+        let context_id = match caller.require_context() {
+            Ok(id) => id,
+            Err(e) => return e,
+        };
 
         // kj drift merge [ctx]
         // Default target = caller's forked_from parent

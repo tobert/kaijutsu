@@ -143,7 +143,10 @@ impl KjDispatcher {
         // Parse --stage (liminal state: user curates blocks before LLM invocation)
         let staging = has_flag(argv, &["--stage", "--staging"]);
 
-        let source_id = caller.context_id.unwrap();
+        let source_id = match caller.require_context() {
+            Ok(id) => id,
+            Err(e) => return e,
+        };
         let new_id = ContextId::new();
         let kernel_id = self.kernel_id();
 
@@ -278,14 +281,14 @@ impl KjDispatcher {
 
         // If --prompt given, inject a Drift block
         if let Some(note) = prompt
-            && let Err(e) = self.inject_fork_note(new_id, caller, &note)
+            && let Err(e) = self.inject_fork_note(new_id, source_id, &note)
         {
             return KjResult::Err(format!("kj fork: failed to inject fork note: {e}"));
         }
 
         // If --mcp-prompt given, get prompt from MCP server and inject
         if let Some(ref spec) = mcp_prompt
-            && let Err(e) = self.inject_mcp_prompt(new_id, caller, spec, &mcp_args).await
+            && let Err(e) = self.inject_mcp_prompt(new_id, source_id, spec, &mcp_args).await
         {
             return KjResult::Err(format!("kj fork: {e}"));
         }
@@ -336,7 +339,10 @@ impl KjDispatcher {
             .and_then(|d| d.parse().ok())
             .unwrap_or(50);
 
-        let source_id = caller.context_id.unwrap();
+        let source_id = match caller.require_context() {
+            Ok(id) => id,
+            Err(e) => return e,
+        };
         let new_id = ContextId::new();
         let kernel_id = self.kernel_id();
 
@@ -477,7 +483,7 @@ impl KjDispatcher {
         }
 
         if let Some(note) = prompt
-            && let Err(e) = self.inject_fork_note(new_id, caller, &note)
+            && let Err(e) = self.inject_fork_note(new_id, source_id, &note)
         {
             return KjResult::Err(format!(
                 "kj fork --shallow: failed to inject fork note: {e}"
@@ -485,7 +491,7 @@ impl KjDispatcher {
         }
 
         if let Some(ref spec) = mcp_prompt
-            && let Err(e) = self.inject_mcp_prompt(new_id, caller, spec, &mcp_args).await
+            && let Err(e) = self.inject_mcp_prompt(new_id, source_id, spec, &mcp_args).await
         {
             return KjResult::Err(format!("kj fork --shallow: {e}"));
         }
@@ -536,7 +542,10 @@ impl KjDispatcher {
         let pwd_override = extract_named_arg(argv, &["--pwd"]);
         let staging = has_flag(argv, &["--stage", "--staging"]);
 
-        let source_id = caller.context_id.unwrap();
+        let source_id = match caller.require_context() {
+            Ok(id) => id,
+            Err(e) => return e,
+        };
         let new_id = ContextId::new();
         let kernel_id = self.kernel_id();
 
@@ -581,13 +590,13 @@ impl KjDispatcher {
 
         // If --prompt given, inject a fork note after the summary
         if let Some(note) = prompt
-            && let Err(e) = self.inject_fork_note(new_id, caller, &note)
+            && let Err(e) = self.inject_fork_note(new_id, source_id, &note)
         {
             tracing::warn!("failed to inject fork note: {e}");
         }
 
         if let Some(ref spec) = mcp_prompt
-            && let Err(e) = self.inject_mcp_prompt(new_id, caller, spec, &mcp_args).await
+            && let Err(e) = self.inject_mcp_prompt(new_id, source_id, spec, &mcp_args).await
         {
             return KjResult::Err(format!("kj fork --compact: {e}"));
         }
@@ -751,6 +760,11 @@ impl KjDispatcher {
         };
         let staging = has_flag(argv, &["--stage", "--staging"]);
 
+        let source_id = match caller.require_context() {
+            Ok(id) => id,
+            Err(e) => return e,
+        };
+
         let kernel_id = self.kernel_id();
 
         // Resolve template root
@@ -900,7 +914,7 @@ impl KjDispatcher {
             // Edge from caller's context to the new root
             let root_edge = ContextEdgeRow {
                 edge_id: uuid::Uuid::now_v7(),
-                source_id: caller.context_id.unwrap(),
+                source_id,
                 target_id: new_root_id,
                 kind: EdgeKind::Structural,
                 metadata: None,
@@ -948,7 +962,7 @@ impl KjDispatcher {
 
         if let Err(e) = self.inject_fork_marker(
             new_root_id,
-            caller.context_id.unwrap(),
+            source_id,
             ForkKind::Subtree,
             template_nodes.len(),
             Some(&template_ref),
@@ -1015,7 +1029,7 @@ impl KjDispatcher {
     fn inject_fork_note(
         &self,
         target_id: ContextId,
-        caller: &KjCaller,
+        source_id: ContextId,
         note: &str,
     ) -> Result<(), String> {
         use kaijutsu_crdt::DriftKind;
@@ -1027,7 +1041,7 @@ impl KjDispatcher {
                 None,
                 after.as_ref(),
                 note,
-                caller.context_id.unwrap(),
+                source_id,
                 None,
                 DriftKind::Push,
             )
@@ -1094,7 +1108,7 @@ impl KjDispatcher {
     async fn inject_mcp_prompt(
         &self,
         target_id: ContextId,
-        caller: &KjCaller,
+        source_id: ContextId,
         spec: &str,
         arg_values: &[String],
     ) -> Result<(), String> {
@@ -1142,7 +1156,7 @@ impl KjDispatcher {
                 None,
                 after.as_ref(),
                 &full_content,
-                caller.context_id.unwrap(),
+                source_id,
                 Some(format!("mcp:{}", server)),
                 DriftKind::Notification,
             )

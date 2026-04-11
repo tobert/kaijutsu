@@ -46,6 +46,22 @@ pub struct KjCaller {
     pub confirmed: bool,
 }
 
+impl KjCaller {
+    /// Return the active context or a friendly `KjResult::Err` for subcommands that
+    /// cannot operate without one. Use with `?` inside any dispatch leaf that reads
+    /// `context_id` — the dispatcher's early-return in `dispatch()` normally catches
+    /// this case for non-context subcommands, but per-leaf guards document the
+    /// invariant and keep the type-system honest.
+    pub(crate) fn require_context(&self) -> Result<ContextId, KjResult> {
+        self.context_id.ok_or_else(|| {
+            KjResult::Err(
+                "no active context joined. Use 'kj context switch <label>' to join one."
+                    .to_string(),
+            )
+        })
+    }
+}
+
 // ============================================================================
 // KjResult — command output
 // ============================================================================

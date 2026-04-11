@@ -141,6 +141,11 @@ impl KjDispatcher {
 
     /// Get a prompt and inject its content as a drift block into the current context.
     async fn prompt_inject(&self, argv: &[String], caller: &KjCaller) -> KjResult {
+        let context_id = match caller.require_context() {
+            Ok(id) => id,
+            Err(e) => return e,
+        };
+
         let pool = match self.mcp_pool() {
             Some(p) => p,
             None => return KjResult::Err("kj prompt: no MCP pool available".to_string()),
@@ -193,13 +198,13 @@ impl KjDispatcher {
 
         // Inject as drift block
         use kaijutsu_crdt::DriftKind;
-        let after = self.block_store().last_block_id(caller.context_id.unwrap());
+        let after = self.block_store().last_block_id(context_id);
         match self.block_store().insert_drift_block(
-            caller.context_id.unwrap(),
+            context_id,
             None,
             after.as_ref(),
             &full_content,
-            caller.context_id.unwrap(),
+            context_id,
             Some(format!("mcp:{}", server)),
             DriftKind::Notification,
         ) {

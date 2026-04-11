@@ -3,24 +3,31 @@
 //! Manages the liminal staging state during fork curation.
 //! Blocks can be toggled in/out before the conversation goes live.
 
-use kaijutsu_types::{ContentType, ContextState};
+use kaijutsu_types::{ContentType, ContextId, ContextState};
 
 use super::{KjCaller, KjDispatcher, KjResult};
 
 impl KjDispatcher {
     pub(crate) async fn dispatch_stage(&self, argv: &[String], caller: &KjCaller) -> KjResult {
+        // Help doesn't need a context, dispatch it before the guard.
+        if matches!(argv.first().map(|s| s.as_str()), Some("help" | "--help" | "-h")) {
+            return KjResult::ok_ephemeral(self.stage_help(), ContentType::Markdown);
+        }
+
+        let context_id = match caller.require_context() {
+            Ok(id) => id,
+            Err(e) => return e,
+        };
+
         if argv.is_empty() {
-            return self.stage_status(caller);
+            return self.stage_status(context_id);
         }
 
         match argv[0].as_str() {
-            "commit" | "go" => self.stage_commit(caller).await,
-            "status" | "st" => self.stage_status(caller),
-            "include" | "in" => self.stage_include(&argv[1..], caller),
-            "exclude" | "ex" => self.stage_exclude(&argv[1..], caller),
-            "help" | "--help" | "-h" => {
-                KjResult::ok_ephemeral(self.stage_help(), ContentType::Markdown)
-            }
+            "commit" | "go" => self.stage_commit(context_id).await,
+            "status" | "st" => self.stage_status(context_id),
+            "include" | "in" => self.stage_include(&argv[1..], context_id),
+            "exclude" | "ex" => self.stage_exclude(&argv[1..], context_id),
             other => KjResult::Err(format!(
                 "kj stage: unknown subcommand '{}'\n\n{}",
                 other,
@@ -44,10 +51,10 @@ impl KjDispatcher {
         .join("\n")
     }
 
-    fn require_staging(&self, caller: &KjCaller) -> Result<(), KjResult> {
+    fn require_staging(&self, context_id: ContextId) -> Result<(), KjResult> {
         let state = {
             let drift = self.drift_router().blocking_read();
-            drift.context_state(caller.context_id.unwrap())
+            drift.context_state(context_id)
         };
         match state {
             Some(ContextState::Staging) => Ok(()),
@@ -60,12 +67,10 @@ impl KjDispatcher {
         }
     }
 
-    async fn stage_commit(&self, caller: &KjCaller) -> KjResult {
-        if let Err(result) = self.require_staging(caller) {
+    async fn stage_commit(&self, context_id: ContextId) -> KjResult {
+        if let Err(result) = self.require_staging(context_id) {
             return result;
         }
-
-        let context_id = caller.context_id.unwrap();
 
         // Transition DriftRouter
         {
@@ -89,9 +94,7 @@ impl KjDispatcher {
         ))
     }
 
-    fn stage_status(&self, caller: &KjCaller) -> KjResult {
-        let context_id = caller.context_id.unwrap();
-
+    fn stage_status(&self, context_id: ContextId) -> KjResult {
         let state = {
             let drift = self.drift_router().blocking_read();
             drift
@@ -137,26 +140,25 @@ impl KjDispatcher {
         KjResult::ok_ephemeral(lines.join("\n"), ContentType::Markdown)
     }
 
-    fn stage_include(&self, argv: &[String], caller: &KjCaller) -> KjResult {
-        if let Err(result) = self.require_staging(caller) {
+    fn stage_include(&self, argv: &[String], context_id: ContextId) -> KjResult {
+        if let Err(result) = self.require_staging(context_id) {
             return result;
         }
-        self.stage_toggle(argv, caller, false)
+        self.stage_toggle(argv, context_id, false)
     }
 
-    fn stage_exclude(&self, argv: &[String], caller: &KjCaller) -> KjResult {
-        if let Err(result) = self.require_staging(caller) {
+    fn stage_exclude(&self, argv: &[String], context_id: ContextId) -> KjResult {
+        if let Err(result) = self.require_staging(context_id) {
             return result;
         }
-        self.stage_toggle(argv, caller, true)
+        self.stage_toggle(argv, context_id, true)
     }
 
-    fn stage_toggle(&self, argv: &[String], caller: &KjCaller, excluded: bool) -> KjResult {
+    fn stage_toggle(&self, argv: &[String], context_id: ContextId, excluded: bool) -> KjResult {
         if argv.is_empty() {
             return KjResult::Err("kj stage: missing block ID".to_string());
         }
 
-        let context_id = caller.context_id.unwrap();
         let block_key = &argv[0];
 
         // Find the block by suffix match on the key
