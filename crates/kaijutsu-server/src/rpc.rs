@@ -5548,14 +5548,13 @@ impl kernel::Server for KernelImpl {
             return Promise::err(capnp::Error::failed(e.to_string()));
         }
 
-        let new_version = self
-            .kernel
-            .documents
-            .get(context_id)
-            .map(|entry| entry.version())
-            .unwrap_or(0);
-        results.get().set_new_version(new_version);
-        Promise::ok(())
+        match self.kernel.documents.version(context_id) {
+            Ok(ack) => {
+                results.get().set_ack_version(ack);
+                Promise::ok(())
+            }
+            Err(e) => Promise::err(capnp::Error::failed(e.to_string())),
+        }
     }
 }
 

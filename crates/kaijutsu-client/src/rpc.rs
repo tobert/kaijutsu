@@ -387,7 +387,7 @@ impl KernelHandle {
             trace.set_tracestate(&tracestate);
         }
         let response = request.send().promise.await?;
-        Ok(response.get()?.get_new_version())
+        Ok(response.get()?.get_ack_version())
     }
 
     /// Subscribe to output events from `execute()` RPCs.

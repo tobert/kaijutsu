@@ -1095,7 +1095,7 @@ interface Kernel {
   setContextState @91 (contextId :Data, state :Text, trace :TraceContext) -> (success :Bool, error :Text);
 
   # Set the excluded flag on a block (staging curation).
-  setBlockExcluded @92 (contextId :Data, blockId :BlockId, excluded :Bool, trace :TraceContext) -> (newVersion :UInt64);
+  setBlockExcluded @92 (contextId :Data, blockId :BlockId, excluded :Bool, trace :TraceContext) -> (ackVersion :UInt64);
 }
 
 # ============================================================================

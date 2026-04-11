@@ -350,6 +350,17 @@ impl BlockStore {
         self.documents.get(&context_id)
     }
 
+    /// Current CRDT version for a context, or `DocumentNotFound` if the
+    /// context is not resident. Prefer this over `get(..).map(|e| e.version())`
+    /// when a missing document should be an error rather than silently
+    /// collapsing to 0 — RPC acknowledgements, for example.
+    pub fn version(&self, context_id: ContextId) -> BlockStoreResult<u64> {
+        self.documents
+            .get(&context_id)
+            .map(|entry| entry.version())
+            .ok_or(BlockStoreError::DocumentNotFound(context_id))
+    }
+
     /// Get a document for writing.
     pub fn get_mut(
         &self,
@@ -2029,6 +2040,59 @@ mod tests {
 
     fn test_agent() -> PrincipalId {
         PrincipalId::new()
+    }
+
+    #[test]
+    fn test_version_errors_on_missing_context() {
+        // Regression for silent-0 acks: BlockStore::version must surface an
+        // error for a missing context, not collapse to 0 the way the old
+        // `get(ctx).map(|e| e.version()).unwrap_or(0)` pattern did.
+        let store = BlockStore::new(test_agent());
+        let missing = ContextId::new();
+        match store.version(missing) {
+            Err(BlockStoreError::DocumentNotFound(id)) => assert_eq!(id, missing),
+            other => panic!("expected DocumentNotFound, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_version_monotonic_across_mutations() {
+        // After creation, version starts at a baseline; each block insert
+        // bumps it. Used by RPC acks so clients can track sync state.
+        let store = BlockStore::new(test_agent());
+        let ctx = ContextId::new();
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+        let v0 = store.version(ctx).unwrap();
+        store
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "first",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+        let v1 = store.version(ctx).unwrap();
+        assert!(v1 > v0, "version should advance after insert (v0={}, v1={})", v0, v1);
+        store
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "second",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+        let v2 = store.version(ctx).unwrap();
+        assert!(v2 > v1, "version should advance again (v1={}, v2={})", v1, v2);
     }
 
     #[test]
