@@ -178,46 +178,6 @@ struct BlockSnapshot {
   excluded @26 :Bool;
 }
 
-# Operations on block documents
-struct BlockDocOp {
-  union {
-    # Insert a new block (afterId absent = insert at start)
-    insertBlock :group {
-      block @0 :BlockSnapshot;
-      afterId @1 :BlockId;
-    }
-    # Delete a block
-    deleteBlock @2 :BlockId;
-    # Edit text within a block (Thinking/Text only)
-    editBlockText :group {
-      id @3 :BlockId;
-      pos @4 :UInt64;
-      insert @5 :Text;
-      delete @6 :UInt64;
-    }
-    # Toggle collapsed state (Thinking only)
-    setCollapsed :group {
-      id @7 :BlockId;
-      collapsed @8 :Bool;
-    }
-    # Update block status
-    setStatus :group {
-      id @9 :BlockId;
-      status @10 :Status;
-    }
-    # Move block to new position (afterId absent = move to start)
-    moveBlock :group {
-      id @11 :BlockId;
-      afterId @12 :BlockId;
-    }
-    # Toggle user-curated excluded flag (staging only)
-    setExcluded :group {
-      id @13 :BlockId;
-      excluded @14 :Bool;
-    }
-  }
-}
-
 # Full context state — blocks + CRDT oplog for sync
 struct ContextState {
   contextId @0 :Data;   # 16-byte ContextId (UUIDv7)
@@ -861,7 +821,9 @@ interface Kernel {
   getToolSchemas @11 (trace :TraceContext) -> (schemas :List(ToolSchema));
 
   # Block-based CRDT operations
-  applyBlockOp @12 (contextId :Data, op :BlockDocOp, trace :TraceContext) -> (newVersion :UInt64);
+  # Slot @12 was `applyBlockOp` — removed when blocks moved to CRDT sync via
+  # pushOps. Cap'n Proto disallows ordinal holes, so @12 remains as a no-op.
+  removedApplyBlockOp @12 () -> ();
   subscribeBlocks @13 (callback :BlockEvents);
   getContextState @14 (contextId :Data, trace :TraceContext) -> (state :ContextState);
 

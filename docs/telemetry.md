@@ -59,7 +59,7 @@ the server extracts it via `extract_rpc_trace()`.
 | Drift engines | `drift.{op}` | `drift.push` | 100% |
 | MCP tools | `mcp.{tool}` | `mcp.block_read` | 10% (default) |
 | LLM | Auto-named with `llm.*` fields | `prompt{llm.model, llm.provider}` | 100% |
-| CRDT sync | `sync.{op}` | `sync.apply_block_op` | 1% |
+| CRDT sync | `sync.{op}` | `sync.push_ops` | 1% |
 
 ### Server RPC (59 methods)
 
@@ -85,8 +85,6 @@ Sync methods use `span.entered()` guards.
 | Config | `get_config`, `list_configs`, `reload_config`, `reset_config` |
 | Subscriptions | `subscribe_blocks`, `subscribe_agent_events`, `subscribe_mcp_resources`, `subscribe_mcp_elicitations` |
 | Other | `set_attribution`, `get_command_history` |
-
-**Special case:** `apply_block_op` uses span name `sync.apply_block_op` (1% sampling).
 
 **Not instrumented:** VFS filesystem methods (~15 in `impl vfs::Server`) — high volume, low debugging value. Trivial stubs (`whoami`, `get_info`, `interrupt`, `complete`, `detach`).
 

@@ -488,8 +488,9 @@ impl KernelHandle {
     // Block-based CRDT sync methods
     // =========================================================================
 
-    // NOTE: apply_block_op was removed - the unified CRDT model uses SerializedOps
-    // for replication. See BlockDocument::ops_since() and apply_ops() in kaijutsu-crdt.
+    // Blocks sync via pushOps (SerializedOps). The former apply_block_op RPC
+    // was removed on both client and server; its wire slot (@12) is retained
+    // as a no-op placeholder. See BlockDocument::ops_since() and apply_ops().
 
     /// Push CRDT operations to the server for bidirectional sync.
     ///
