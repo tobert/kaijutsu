@@ -44,7 +44,7 @@ use kaish_kernel::{
     BackendError, BackendResult, KernelBackend, PatchOp, ReadRange, ToolInfo, ToolResult, WriteMode,
 };
 
-use crate::context_engine::SessionContextMap;
+use crate::context_engine::{SessionContextExt, SessionContextMap};
 
 /// Backend that routes kaish operations to kaijutsu's CRDT block store.
 ///
@@ -643,9 +643,7 @@ impl KernelBackend for KaijutsuBackend {
         // context_id is read from the session map so context switches propagate.
         let context_id = self
             .session_contexts
-            .get(&self.session_id)
-            .map(|r| *r)
-            .filter(|id| !id.is_nil())
+            .current(&self.session_id)
             .ok_or_else(|| BackendError::Io("no active context joined".to_string()))?;
         let tool_ctx = kaijutsu_kernel::ToolContext::new(
             self.principal_id,
