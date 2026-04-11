@@ -4,7 +4,6 @@
 //! the DocumentCache to the MainCell's CellEditor for rendering.
 
 use bevy::prelude::*;
-use kaijutsu_types::KernelId;
 
 use crate::cell::{
     CachedDocument, CellEditor, ConversationScrollState, EditorEntities, LayoutGeneration,
@@ -390,18 +389,37 @@ pub fn handle_context_switch(
     for event in switch_events.read() {
         let ctx_id = event.context_id;
 
+        // A nil ContextId reaching this system means something upstream
+        // (kernel, RPC, or subscription layer) leaked a sentinel. Reject
+        // it loudly — the cache-miss branch below would otherwise spawn
+        // an actor to join nil and produce a useless round-trip failure.
+        if ctx_id.is_nil() {
+            warn!("handle_context_switch: refusing to switch to nil ContextId");
+            continue;
+        }
+
         if !doc_cache.contains(ctx_id) {
             if pending_switch.0 == Some(ctx_id) {
                 continue;
             }
+
+            // Cache-miss requires a real KernelId to spawn an actor against.
+            // If there's no attached kernel, skip with a warning rather than
+            // falling back to KernelId::nil — the spawn would fail downstream
+            // anyway and the sentinel would leak into the BootstrapChannel.
+            let Some(kernel_id) = conn_state.kernel_id else {
+                warn!(
+                    "handle_context_switch: cache miss for {} but no kernel attached; skipping",
+                    ctx_id
+                );
+                continue;
+            };
 
             info!(
                 "Context switch: cache miss for {}, spawning actor to join",
                 ctx_id
             );
             pending_switch.0 = Some(ctx_id);
-
-            let kernel_id = conn_state.kernel_id.unwrap_or_else(KernelId::nil);
 
             let instance = uuid::Uuid::new_v4().to_string();
             let _ = bootstrap

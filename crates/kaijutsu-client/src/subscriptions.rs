@@ -548,6 +548,17 @@ impl block_events::Server for BlockEventsForwarder {
             Err(e) => return Promise::err(e),
         };
 
+        // Reject nil at the wire boundary — nothing downstream should ever
+        // treat ContextId::nil as a real context, and accepting it here would
+        // send the app on a useless cache-miss → spawn-actor → fail-join
+        // round-trip. Fail loud instead of silently.
+        if context_id.is_nil() {
+            tracing::error!("server sent ContextSwitched with nil context_id — rejecting");
+            return Promise::err(capnp::Error::failed(
+                "server sent nil context_id in ContextSwitched".into(),
+            ));
+        }
+
         let event = ServerEvent::ContextSwitched { context_id };
         if self.event_tx.send(event).is_err() {
             tracing::warn!("Event channel closed, dropping ContextSwitched event");
