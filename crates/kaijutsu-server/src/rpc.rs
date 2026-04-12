@@ -649,8 +649,8 @@ async fn create_config_backend(
     ));
 
     // Load base theme config
-    if let Err(e) = backend.ensure_config("theme.rhai").await {
-        log::warn!("Failed to load theme.rhai: {}", e);
+    if let Err(e) = backend.ensure_config("theme.toml").await {
+        log::warn!("Failed to load theme.toml: {}", e);
     }
 
     // Start the file watcher
@@ -677,57 +677,63 @@ async fn initialize_kernel_models(
     kernel: &Arc<Kernel>,
     config_backend: &Arc<ConfigCrdtBackend>,
 ) -> Option<kaijutsu_kernel::EmbeddingModelConfig> {
-    // Ensure models.rhai is loaded (falls back to llm.rhai alias in get_default_content)
-    if let Err(e) = config_backend.ensure_config("models.rhai").await {
-        log::warn!("Failed to load models.rhai: {}", e);
-        return None;
-    }
-
-    // Get the content
-    let script = match config_backend.get_content("models.rhai") {
-        Ok(content) => content,
-        Err(e) => {
-            log::warn!("Failed to read models.rhai content: {}", e);
-            return None;
+    // Try TOML first, fall back to legacy .rhai
+    let (config_name, content) = if config_backend.ensure_config("models.toml").await.is_ok() {
+        match config_backend.get_content("models.toml") {
+            Ok(c) => ("models.toml", c),
+            Err(_) => return None,
         }
+    } else if config_backend.ensure_config("models.rhai").await.is_ok() {
+        match config_backend.get_content("models.rhai") {
+            Ok(c) => ("models.rhai", c),
+            Err(_) => return None,
+        }
+    } else {
+        log::warn!("Failed to load models config");
+        return None;
     };
 
-    // Parse full models config (LLM + embedding)
-    match kaijutsu_kernel::load_models_config(&script) {
+    // Parse with appropriate parser
+    let parse_result = if config_name.ends_with(".toml") {
+        kaijutsu_kernel::llm::toml_config::load_models_config_toml(&content)
+    } else {
+        kaijutsu_kernel::load_models_config(&content)
+    };
+
+    match parse_result {
         Ok(models_config) => {
             let registry = kaijutsu_kernel::initialize_llm_registry(&models_config.llm);
             *kernel.llm().write().await = registry;
-            log::info!("Initialized kernel LLM registry from models.rhai");
+            log::info!("Initialized kernel LLM registry from {}", config_name);
             models_config.embedding
         }
         Err(e) => {
-            log::warn!(
-                "Failed to parse models.rhai from CRDT: {}, reloading from disk",
-                e
-            );
-            // CRDT snapshot is corrupted — reload from disk and retry
-            if let Err(reload_err) = config_backend.reload_from_disk("models.rhai").await {
-                log::error!("Failed to reload models.rhai from disk: {}", reload_err);
+            log::warn!("Failed to parse {}: {}, reloading from disk", config_name, e);
+            if let Err(reload_err) = config_backend.reload_from_disk(config_name).await {
+                log::error!("Failed to reload {} from disk: {}", config_name, reload_err);
                 return None;
             }
-            let script = match config_backend.get_content("models.rhai") {
-                Ok(content) => content,
+            let content = match config_backend.get_content(config_name) {
+                Ok(c) => c,
                 Err(e) => {
-                    log::error!("Failed to read reloaded models.rhai: {}", e);
+                    log::error!("Failed to read reloaded {}: {}", config_name, e);
                     return None;
                 }
             };
-            match kaijutsu_kernel::load_models_config(&script) {
+            let parse_result = if config_name.ends_with(".toml") {
+                kaijutsu_kernel::llm::toml_config::load_models_config_toml(&content)
+            } else {
+                kaijutsu_kernel::load_models_config(&content)
+            };
+            match parse_result {
                 Ok(models_config) => {
                     let registry = kaijutsu_kernel::initialize_llm_registry(&models_config.llm);
                     *kernel.llm().write().await = registry;
-                    log::info!(
-                        "Initialized kernel LLM registry from models.rhai (reloaded from disk)"
-                    );
+                    log::info!("Initialized kernel LLM registry from {} (reloaded)", config_name);
                     models_config.embedding
                 }
                 Err(e) => {
-                    log::error!("Failed to parse models.rhai even after reload: {}", e);
+                    log::error!("Failed to parse {} even after reload: {}", config_name, e);
                     None
                 }
             }
@@ -735,32 +741,52 @@ async fn initialize_kernel_models(
     }
 }
 
-/// Initialize MCP servers from kernel's `mcp.rhai` config.
+/// Initialize MCP servers from kernel's config.
 ///
-/// Loads `mcp.rhai` from the config CRDT, parses server definitions,
-/// and registers them concurrently in the MCP pool.
+/// Loads MCP config from TOML (primary) or .rhai (legacy), parses server
+/// definitions, and registers them concurrently in the MCP pool.
 async fn initialize_kernel_mcp(
     kernel: &Arc<Kernel>,
     config_backend: &Arc<ConfigCrdtBackend>,
     mcp_pool: &Arc<McpServerPool>,
 ) {
-    if let Err(e) = config_backend.ensure_config("mcp.rhai").await {
-        log::warn!("Failed to load mcp.rhai: {}", e);
-        return;
-    }
-    let script = match config_backend.get_content("mcp.rhai") {
-        Ok(content) => content,
-        Err(e) => {
-            log::warn!("Failed to read mcp.rhai content: {}", e);
-            return;
+    // Try TOML first, fall back to legacy .rhai
+    let (config_name, content) = if config_backend.ensure_config("mcp.toml").await.is_ok() {
+        match config_backend.get_content("mcp.toml") {
+            Ok(c) => ("mcp.toml", c),
+            Err(e) => {
+                log::warn!("Failed to read mcp.toml content: {}", e);
+                return;
+            }
         }
+    } else if config_backend.ensure_config("mcp.rhai").await.is_ok() {
+        match config_backend.get_content("mcp.rhai") {
+            Ok(c) => ("mcp.rhai", c),
+            Err(e) => {
+                log::warn!("Failed to read mcp.rhai content: {}", e);
+                return;
+            }
+        }
+    } else {
+        log::warn!("Failed to load MCP config");
+        return;
     };
 
-    let config = match kaijutsu_kernel::load_mcp_config(&script) {
-        Ok(c) => c,
-        Err(e) => {
-            log::warn!("Failed to parse mcp.rhai: {}", e);
-            return;
+    let config = if config_name.ends_with(".toml") {
+        match kaijutsu_kernel::mcp_config::load_mcp_config_toml(&content) {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("Failed to parse {}: {}", config_name, e);
+                return;
+            }
+        }
+    } else {
+        match kaijutsu_kernel::load_mcp_config(&content) {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("Failed to parse {}: {}", config_name, e);
+                return;
+            }
         }
     };
 
@@ -768,11 +794,11 @@ async fn initialize_kernel_mcp(
         return;
     }
 
-    // Check which servers are already pre-initialized in the shared pool
     let already_registered = mcp_pool.list_servers();
 
     log::info!(
-        "Registering MCP servers from mcp.rhai ({} configured, {} already in pool)",
+        "Registering MCP servers from {} ({} configured, {} already in pool)",
+        config_name,
         config.servers.len(),
         already_registered.len(),
     );

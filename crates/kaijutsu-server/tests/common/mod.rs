@@ -40,7 +40,7 @@ pub async fn start_server() -> SocketAddr {
     addr
 }
 
-/// Start a server whose ephemeral config dir contains a `models.rhai` with a mock provider.
+/// Start a server whose ephemeral config dir contains a `models.toml` with a mock provider.
 ///
 /// This makes `initialize_kernel_models()` register a "mock" provider so that
 /// `KjDispatcher.summarize()` and other LLM-dependent paths work in tests.
@@ -50,24 +50,19 @@ pub async fn start_server_with_mock_llm() -> SocketAddr {
 
     let config = SshServerConfig::ephemeral(addr.port());
 
-    // Write a models.rhai that uses the mock provider into the ephemeral config dir
+    // Write a models.toml that uses the mock provider into the ephemeral config dir
     if let Some(ref config_dir) = config.config_dir {
-        let models_rhai = r#"
-let config = #{
-    default_provider: "mock",
-    providers: [
-        #{
-            provider_type: "mock",
-            enabled: true,
-            default_model: "mock-model",
-        },
-    ],
-    model_aliases: #{},
-};
-config
+        let models_toml = r#"
+default_provider = "mock"
+
+[providers.mock]
+enabled = true
+default_model = "mock-model"
+
+[model_aliases]
 "#;
-        std::fs::write(config_dir.join("models.rhai"), models_rhai)
-            .expect("failed to write models.rhai to ephemeral config dir");
+        std::fs::write(config_dir.join("models.toml"), models_toml)
+            .expect("failed to write models.toml to ephemeral config dir");
     }
 
     tokio::task::spawn_local(async move {

@@ -55,17 +55,17 @@ fn config_context_id(path: &str) -> ContextId {
     ContextId::from_bytes(*uuid.as_bytes())
 }
 
-/// Embedded default theme content.
-pub const DEFAULT_THEME: &str = include_str!("../../../assets/defaults/theme.rhai");
+/// Embedded default theme content (TOML).
+pub const DEFAULT_THEME: &str = include_str!("../../../assets/defaults/theme.toml");
 
-/// Embedded default models configuration (LLM providers + embedding).
-pub const DEFAULT_MODELS_CONFIG: &str = include_str!("../../../assets/defaults/models.rhai");
+/// Embedded default models configuration (LLM providers + embedding, TOML).
+pub const DEFAULT_MODELS_CONFIG: &str = include_str!("../../../assets/defaults/models.toml");
 
 /// Alias for backwards compatibility.
 pub const DEFAULT_LLM_CONFIG: &str = DEFAULT_MODELS_CONFIG;
 
-/// Embedded default MCP server configuration.
-pub const DEFAULT_MCP_CONFIG: &str = include_str!("../../../assets/defaults/mcp.rhai");
+/// Embedded default MCP server configuration (TOML).
+pub const DEFAULT_MCP_CONFIG: &str = include_str!("../../../assets/defaults/mcp.toml");
 
 /// Embedded default system prompt.
 pub const DEFAULT_SYSTEM_PROMPT: &str = include_str!("../../../assets/defaults/system.md");
@@ -349,9 +349,15 @@ impl ConfigCrdtBackend {
     /// Get default content for a config path.
     fn get_default_content(&self, path: &str) -> Option<String> {
         match path {
+            // TOML configs (primary)
+            "theme.toml" => Some(DEFAULT_THEME.to_string()),
+            "models.toml" => Some(DEFAULT_MODELS_CONFIG.to_string()),
+            "mcp.toml" => Some(DEFAULT_MCP_CONFIG.to_string()),
+            // Legacy .rhai names — serve TOML defaults during transition
             "theme.rhai" => Some(DEFAULT_THEME.to_string()),
             "models.rhai" | "llm.rhai" => Some(DEFAULT_MODELS_CONFIG.to_string()),
             "mcp.rhai" => Some(DEFAULT_MCP_CONFIG.to_string()),
+            // Non-config files
             "system.md" => Some(DEFAULT_SYSTEM_PROMPT.to_string()),
             _ => None,
         }
@@ -503,23 +509,23 @@ impl ConfigCrdtBackend {
         Ok(block.content.clone())
     }
 
-    /// Validate config content (Rhai syntax check).
+    /// Validate config content syntax.
     pub fn validate(&self, path: &str, content: &str) -> ValidationResult {
-        if path.ends_with(".rhai") {
-            // Parse Rhai to check syntax
+        if path.ends_with(".toml") {
+            // Parse TOML to check syntax
+            match toml::from_str::<toml::Value>(content) {
+                Ok(_) => ValidationResult::ok(),
+                Err(e) => ValidationResult::error(format!("TOML syntax error: {}", e)),
+            }
+        } else if path.ends_with(".rhai") {
+            // Legacy: parse Rhai to check syntax (transition period)
             let engine = rhai::Engine::new();
             match engine.compile(content) {
                 Ok(_) => ValidationResult::ok(),
                 Err(e) => ValidationResult::error(format!("Rhai syntax error: {}", e)),
             }
-        } else if path.ends_with(".ron") {
-            // Parse RON to check syntax
-            match ron::from_str::<ron::Value>(content) {
-                Ok(_) => ValidationResult::ok(),
-                Err(e) => ValidationResult::error(format!("RON syntax error: {}", e)),
-            }
         } else {
-            // Unknown format, accept anything
+            // Unknown format (e.g. .md), accept anything
             ValidationResult::ok()
         }
     }
@@ -617,8 +623,11 @@ impl ConfigCrdtBackend {
                             if let Ok(rel_path) = path.strip_prefix(&config_root) {
                                 let path_str = rel_path.to_string_lossy().to_string();
 
-                                // Only watch .rhai and .ron files
-                                if path_str.ends_with(".rhai") || path_str.ends_with(".ron") {
+                                // Watch config files
+                                if path_str.ends_with(".toml")
+                                    || path_str.ends_with(".rhai")
+                                    || path_str.ends_with(".md")
+                                {
                                     let _ = tx.try_send(ConfigFileChange {
                                         path: path_str,
                                         kind,
@@ -789,25 +798,16 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let backend = ConfigCrdtBackend::new(blocks.clone(), temp_dir.path().to_path_buf());
 
-        // theme.rhai should be created from default
-        let result = backend.ensure_config("theme.rhai").await;
-        println!("ensure_config result: {:?}", result);
+        let result = backend.ensure_config("theme.toml").await;
         let source = result.unwrap();
         assert_eq!(source, ConfigSource::Default);
 
-        // Check if document was created
-        let ctx = backend.context_id("theme.rhai");
-        println!("context_id: {}", ctx.to_hex());
-        println!("documents exist: {}", blocks.contains(ctx));
-
         // Should now be in CRDT
-        let content_result = backend.get_content("theme.rhai");
-        println!("get_content result: {:?}", content_result);
-        let content = content_result.unwrap();
+        let content = backend.get_content("theme.toml").unwrap();
         assert!(!content.is_empty());
 
         // File should exist on disk
-        assert!(temp_dir.path().join("theme.rhai").exists());
+        assert!(temp_dir.path().join("theme.toml").exists());
     }
 
     #[tokio::test]
@@ -816,18 +816,17 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let backend = ConfigCrdtBackend::new(blocks, temp_dir.path().to_path_buf());
 
-        // Create initial config
-        backend.ensure_config("theme.rhai").await.unwrap();
+        backend.ensure_config("theme.toml").await.unwrap();
 
         // Modify the disk file directly
-        let disk_path = temp_dir.path().join("theme.rhai");
-        std::fs::write(&disk_path, "let custom_value = 42;").unwrap();
+        let disk_path = temp_dir.path().join("theme.toml");
+        std::fs::write(&disk_path, "custom_key = 42").unwrap();
 
         // Reload should pick up the change
-        backend.reload_from_disk("theme.rhai").await.unwrap();
+        backend.reload_from_disk("theme.toml").await.unwrap();
 
-        let content = backend.get_content("theme.rhai").unwrap();
-        assert!(content.contains("custom_value"));
+        let content = backend.get_content("theme.toml").unwrap();
+        assert!(content.contains("custom_key"));
     }
 
     #[tokio::test]
@@ -836,58 +835,75 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let backend = ConfigCrdtBackend::new(blocks, temp_dir.path().to_path_buf());
 
-        // Create config and modify it
-        backend.ensure_config("theme.rhai").await.unwrap();
+        backend.ensure_config("theme.toml").await.unwrap();
 
-        // Get original default content
         let original = DEFAULT_THEME.to_string();
 
-        // Reset
-        backend.reset_to_default("theme.rhai").await.unwrap();
+        backend.reset_to_default("theme.toml").await.unwrap();
 
-        let content = backend.get_content("theme.rhai").unwrap();
+        let content = backend.get_content("theme.toml").unwrap();
         assert_eq!(content, original);
     }
 
     #[test]
-    fn test_validation_rhai() {
+    fn test_validation_toml() {
         let blocks = shared_block_store(PrincipalId::system());
         let temp_dir = tempfile::TempDir::new().unwrap();
         let backend = ConfigCrdtBackend::new(blocks, temp_dir.path().to_path_buf());
 
-        // Valid Rhai
-        let result = backend.validate("theme.rhai", "let x = 42;");
+        // Valid TOML
+        let result = backend.validate("theme.toml", "bg = \"#1a1b26\"");
         assert!(result.valid);
 
-        // Invalid Rhai
-        let result = backend.validate("theme.rhai", "let x = ");
+        // Invalid TOML
+        let result = backend.validate("theme.toml", "[invalid");
         assert!(!result.valid);
         assert!(result.error.is_some());
     }
 
     #[test]
+    fn test_validation_rhai_legacy() {
+        let blocks = shared_block_store(PrincipalId::system());
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let backend = ConfigCrdtBackend::new(blocks, temp_dir.path().to_path_buf());
+
+        // Rhai validation still works during transition
+        let result = backend.validate("theme.rhai", "let x = 42;");
+        assert!(result.valid);
+
+        let result = backend.validate("theme.rhai", "let x = ");
+        assert!(!result.valid);
+    }
+
+    #[test]
     fn test_context_id_deterministic() {
-        // Same path always produces the same ContextId
-        let id1 = config_context_id("theme.rhai");
-        let id2 = config_context_id("theme.rhai");
+        let id1 = config_context_id("theme.toml");
+        let id2 = config_context_id("theme.toml");
         assert_eq!(id1, id2);
 
-        // Different paths produce different ContextIds
-        let id3 = config_context_id("llm.rhai");
+        let id3 = config_context_id("models.toml");
         assert_ne!(id1, id3);
     }
 
     #[test]
     fn test_default_theme_loaded() {
-        // Verify the include_str! loaded actual content
-        assert!(
-            !DEFAULT_THEME.is_empty(),
-            "DEFAULT_THEME should not be empty"
-        );
-        assert!(
-            DEFAULT_THEME.contains("let"),
-            "DEFAULT_THEME should contain Rhai code"
-        );
-        println!("DEFAULT_THEME length: {}", DEFAULT_THEME.len());
+        assert!(!DEFAULT_THEME.is_empty());
+        // Now TOML, should contain typical TOML syntax
+        assert!(DEFAULT_THEME.contains("bg = "));
+    }
+
+    #[test]
+    fn test_legacy_rhai_names_serve_toml_defaults() {
+        let blocks = shared_block_store(PrincipalId::system());
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let backend = ConfigCrdtBackend::new(blocks, temp_dir.path().to_path_buf());
+
+        // Legacy .rhai names should still return content (TOML defaults)
+        let theme = backend.get_default_content("theme.rhai");
+        assert!(theme.is_some());
+        assert!(theme.unwrap().contains("bg = "));
+
+        let models = backend.get_default_content("models.rhai");
+        assert!(models.is_some());
     }
 }
