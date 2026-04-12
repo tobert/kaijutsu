@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use base64::Engine as _;
 use futures::stream;
 use tracing::info;
 
@@ -63,16 +64,18 @@ impl ImageBackend for GeminiBackend {
             match &content.raw {
                 rmcp::model::RawContent::Image(img) => {
                     // img.data is base64-encoded
-                    let decoded = base64_decode(&img.data).map_err(|()| {
-                        ImageError::Decode("invalid base64 in image content".into())
-                    })?;
+                    let decoded = base64::engine::general_purpose::STANDARD
+                        .decode(&img.data)
+                        .map_err(|e| ImageError::Decode(format!("invalid base64: {}", e)))?;
                     image_bytes = Some(decoded);
                     mime = img.mime_type.clone();
                     break;
                 }
                 rmcp::model::RawContent::Text(text) => {
                     // Some MCP servers return base64 in a text content block
-                    if let Ok(decoded) = base64_decode(&text.text) {
+                    if let Ok(decoded) = base64::engine::general_purpose::STANDARD
+                        .decode(&text.text)
+                    {
                         image_bytes = Some(decoded);
                         break;
                     }
@@ -98,42 +101,3 @@ impl ImageBackend for GeminiBackend {
     }
 }
 
-const fn build_b64_table() -> [i8; 256] {
-    let mut table = [-1_i8; 256];
-    let b64 = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut i = 0;
-    while i < 64 {
-        table[b64[i] as usize] = i as i8;
-        i += 1;
-    }
-    table
-}
-
-const B64_TABLE: [i8; 256] = build_b64_table();
-
-fn base64_decode(input: &str) -> Result<Vec<u8>, ()> {
-    let mut out = Vec::with_capacity(input.len() * 3 / 4);
-    let mut buf: u32 = 0;
-    let mut bits: u32 = 0;
-
-    for byte in input.bytes() {
-        if byte.is_ascii_whitespace() {
-            continue;
-        }
-        if byte == b'=' {
-            break;
-        }
-        let val = B64_TABLE[byte as usize];
-        if val < 0 {
-            return Err(());
-        }
-        buf = (buf << 6) | val as u32;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((buf >> bits) as u8);
-            buf &= (1 << bits) - 1;
-        }
-    }
-    Ok(out)
-}
