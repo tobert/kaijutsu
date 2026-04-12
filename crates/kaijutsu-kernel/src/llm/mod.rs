@@ -990,6 +990,10 @@ pub fn hydrate_from_blocks(blocks: &[kaijutsu_types::BlockSnapshot]) -> Vec<Mess
         }
     }
 
+    // Build index for parent lookups (Error block fold-into-parent logic).
+    let blocks_by_id: std::collections::HashMap<kaijutsu_types::BlockId, &kaijutsu_types::BlockSnapshot> =
+        blocks.iter().map(|b| (b.id, b)).collect();
+
     let mut state = HydrationState::new();
 
     for block in blocks {
@@ -1009,13 +1013,17 @@ pub fn hydrate_from_blocks(blocks: &[kaijutsu_types::BlockSnapshot]) -> Vec<Mess
         if block.role == BlockRole::Asset {
             continue;
         }
-        // Skip System blocks unless they're Drift (cross-context transfer content)
-        if block.role == BlockRole::System && block.kind != BlockKind::Drift {
+        // Skip System blocks unless they're Drift or Error
+        if block.role == BlockRole::System
+            && block.kind != BlockKind::Drift
+            && block.kind != BlockKind::Error
+        {
             continue;
         }
         if block.content.is_empty()
             && block.kind != BlockKind::ToolCall
             && block.kind != BlockKind::ToolResult
+            && block.kind != BlockKind::Error
         {
             continue;
         }
@@ -1119,6 +1127,33 @@ pub fn hydrate_from_blocks(blocks: &[kaijutsu_types::BlockSnapshot]) -> Vec<Mess
                 );
                 state.flush_all();
                 state.messages.push(Message::user(&prefixed));
+            }
+            (_, BlockKind::Error) => {
+                // Error blocks: fold into parent ToolResult content if possible,
+                // otherwise emit as standalone user message.
+                let envelope = kaijutsu_types::format_error_for_llm(block);
+
+                let parent_is_tool_result = block
+                    .parent_id
+                    .and_then(|pid| blocks_by_id.get(&pid))
+                    .is_some_and(|parent| parent.kind == BlockKind::ToolResult);
+
+                if parent_is_tool_result {
+                    // Fold into the last pending tool_result if it's still buffered
+                    if let Some(ContentBlock::ToolResult { content, .. }) =
+                        state.tool_results.last_mut()
+                    {
+                        content.push_str("\n\n");
+                        content.push_str(&envelope);
+                    } else {
+                        // Parent's tool_result already flushed — emit standalone
+                        state.flush_all();
+                        state.messages.push(Message::user(envelope));
+                    }
+                } else {
+                    state.flush_all();
+                    state.messages.push(Message::user(envelope));
+                }
             }
             _ => {
                 // Skip unexpected role/kind combinations
@@ -2343,6 +2378,171 @@ mod tests {
             assert_eq!(msgs.len(), 2);
             assert_eq!(msgs[0].as_text(), Some("Hello"));
             assert_eq!(msgs[1].as_text(), Some("Hi!"));
+        }
+
+        // ── Error block hydration ──────────────────────────────────────
+
+        fn test_error_payload() -> kaijutsu_types::ErrorPayload {
+            kaijutsu_types::ErrorPayload {
+                category: kaijutsu_types::ErrorCategory::Tool,
+                severity: kaijutsu_types::ErrorSeverity::Error,
+                code: Some("tool.timeout".into()),
+                detail: Some("Shell command timed out after 30s".into()),
+                span: None,
+                source_kind: Some(kaijutsu_types::BlockKind::ToolResult),
+            }
+        }
+
+        #[test]
+        fn test_hydrate_error_block_standalone_becomes_user_message() {
+            let c = ctx();
+            let u = user();
+            let m = model();
+
+            let blocks = vec![
+                BlockSnapshot::text(BlockId::new(c, u, 0), None, BlockRole::User, "Hello"),
+                BlockSnapshot::text(BlockId::new(c, m, 0), None, BlockRole::Model, "Hi"),
+                BlockSnapshot::error_for(
+                    BlockId::new(c, PrincipalId::system(), 0),
+                    BlockId::new(c, m, 0), // parent is a Text block, not ToolResult
+                    test_error_payload(),
+                    "tool error: timeout",
+                ),
+            ];
+
+            let msgs = hydrate_from_blocks(&blocks);
+            assert_eq!(msgs.len(), 3);
+            assert_eq!(msgs[0].role, Role::User);
+            assert_eq!(msgs[1].role, Role::Assistant);
+            // Error block becomes a user message with XML envelope
+            assert_eq!(msgs[2].role, Role::User);
+            let text = msgs[2].as_text().expect("should be text");
+            assert!(text.contains("<error"));
+            assert!(text.contains("category=\"tool\""));
+            assert!(text.contains("Shell command timed out"));
+        }
+
+        #[test]
+        fn test_hydrate_error_block_folds_into_tool_result() {
+            let c = ctx();
+            let u = user();
+            let m = model();
+            let s = system();
+
+            let tool_call_id = BlockId::new(c, m, 1);
+            let tool_result_id = BlockId::new(c, s, 0);
+
+            let blocks = vec![
+                BlockSnapshot::text(BlockId::new(c, u, 0), None, BlockRole::User, "Run it"),
+                BlockSnapshot::tool_call(
+                    tool_call_id,
+                    None,
+                    ToolKind::Shell,
+                    "shell",
+                    serde_json::json!({"code": "sleep 999"}),
+                    BlockRole::Model,
+                    Some("toolu_01".into()),
+                ),
+                BlockSnapshot::tool_result(
+                    tool_result_id,
+                    tool_call_id,
+                    ToolKind::Shell,
+                    "Error: timed out",
+                    true,
+                    Some(124),
+                    Some("toolu_01".into()),
+                ),
+                BlockSnapshot::error_for(
+                    BlockId::new(c, s, 1),
+                    tool_result_id, // parent is the ToolResult
+                    test_error_payload(),
+                    "tool error: timeout",
+                ),
+            ];
+
+            let msgs = hydrate_from_blocks(&blocks);
+            // Should be: user, assistant+tool_use, user+tool_result (with error folded in)
+            assert_eq!(msgs.len(), 3);
+
+            // The tool result message should contain the error envelope
+            let result_msg = &msgs[2];
+            assert_eq!(result_msg.role, Role::User);
+            if let MessageContent::Blocks(blocks) = &result_msg.content {
+                let tool_result = blocks
+                    .iter()
+                    .find_map(|b| {
+                        if let ContentBlock::ToolResult { content, .. } = b {
+                            Some(content.as_str())
+                        } else {
+                            None
+                        }
+                    })
+                    .expect("should have a tool result");
+                assert!(
+                    tool_result.contains("<error"),
+                    "error should be folded into tool result content"
+                );
+                assert!(tool_result.contains("Error: timed out"));
+            } else {
+                panic!("expected blocks content");
+            }
+        }
+
+        #[test]
+        fn test_hydrate_error_block_ephemeral_excluded() {
+            let c = ctx();
+            let u = user();
+            let m = model();
+
+            let mut error_block = BlockSnapshot::error_for(
+                BlockId::new(c, PrincipalId::system(), 0),
+                BlockId::new(c, m, 0),
+                test_error_payload(),
+                "should not appear",
+            );
+            error_block.ephemeral = true;
+
+            let blocks = vec![
+                BlockSnapshot::text(BlockId::new(c, u, 0), None, BlockRole::User, "Hello"),
+                BlockSnapshot::text(BlockId::new(c, m, 0), None, BlockRole::Model, "Hi"),
+                error_block,
+            ];
+
+            let msgs = hydrate_from_blocks(&blocks);
+            assert_eq!(msgs.len(), 2); // ephemeral error excluded
+        }
+
+        #[test]
+        fn test_hydrate_error_block_detail_truncated() {
+            let c = ctx();
+            let u = user();
+            let m = model();
+
+            let long_detail = "x".repeat(5000);
+            let payload = kaijutsu_types::ErrorPayload {
+                category: kaijutsu_types::ErrorCategory::Kernel,
+                severity: kaijutsu_types::ErrorSeverity::Fatal,
+                code: None,
+                detail: Some(long_detail),
+                span: None,
+                source_kind: None,
+            };
+
+            let blocks = vec![
+                BlockSnapshot::text(BlockId::new(c, u, 0), None, BlockRole::User, "Hello"),
+                BlockSnapshot::text(BlockId::new(c, m, 0), None, BlockRole::Model, "Hi"),
+                BlockSnapshot::error_for(
+                    BlockId::new(c, PrincipalId::system(), 0),
+                    BlockId::new(c, m, 0),
+                    payload,
+                    "kernel error",
+                ),
+            ];
+
+            let msgs = hydrate_from_blocks(&blocks);
+            let error_text = msgs[2].as_text().expect("should be text");
+            assert!(error_text.contains("...[truncated]"));
+            assert!(error_text.len() < 3000);
         }
     }
 }

@@ -2320,6 +2320,55 @@ impl BlockStore {
 
         Ok(block_id)
     }
+
+    /// Insert an error block attached to a parent.
+    ///
+    /// Wraps `CrdtBlockStore::insert_error_block()` with FlowBus emission,
+    /// journal, and frontier tracking.
+    pub fn insert_error_block_as(
+        &self,
+        context_id: ContextId,
+        parent_id: &BlockId,
+        payload: &kaijutsu_types::ErrorPayload,
+        summary: impl Into<String>,
+        agent_id: Option<PrincipalId>,
+    ) -> BlockStoreResult<BlockId> {
+        let (block_id, snapshot, ops, ops_bytes) = {
+            let mut entry = self
+                .get_mut(context_id)
+                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+            let effective_agent = agent_id.unwrap_or_else(|| self.agent_id());
+            entry.doc.set_agent_id(effective_agent);
+
+            let frontier_before = entry.doc.frontier();
+
+            let block_id =
+                entry
+                    .doc
+                    .insert_error_block(parent_id, Some(parent_id), payload, summary)?;
+            let snapshot = entry
+                .doc
+                .get_block_snapshot(&block_id)
+                .ok_or(BlockStoreError::BlockNotFoundAfterInsert)?;
+
+            let ops = entry.doc.ops_since(&frontier_before);
+            let ops_bytes = postcard::to_allocvec(&ops)
+                .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
+            entry.touch(effective_agent);
+            (block_id, snapshot, ops, ops_bytes)
+        };
+        self.journal_op(context_id, ops)?;
+
+        self.emit(BlockFlow::Inserted {
+            context_id,
+            block: Arc::new(snapshot),
+            after_id: Some(*parent_id),
+            ops: Arc::from(ops_bytes),
+            source: OpSource::Local,
+        });
+
+        Ok(block_id)
+    }
 }
 
 /// BFS from `root_id` collecting all descendant block IDs up to `max_depth` levels.

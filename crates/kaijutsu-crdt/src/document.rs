@@ -834,6 +834,42 @@ impl BlockDocument {
         Ok(id)
     }
 
+    /// Insert an error block attached to a parent.
+    ///
+    /// `summary` populates the block's `content` (the one-liner shown in the
+    /// collapsed stub). The full structured payload is stored in CRDT facet keys.
+    pub fn insert_error_block(
+        &mut self,
+        parent_id: &BlockId,
+        after: Option<&BlockId>,
+        payload: &kaijutsu_types::ErrorPayload,
+        summary: impl Into<String>,
+    ) -> Result<BlockId> {
+        let id = self.new_block_id();
+        self.insert_block_with_id(
+            id,
+            Some(parent_id),
+            after,
+            Role::System,
+            BlockKind::Error,
+            summary.into(),
+            Status::Error,
+            None,  // tool_kind
+            None,  // tool_name
+            None,  // tool_input
+            None,  // tool_call_id
+            None,  // exit_code
+            false, // is_error
+            false, // compacted
+            None,  // output
+            None,  // source_context
+            None,  // source_model
+            None,  // drift_kind
+            Some(payload),
+        )?;
+        Ok(id)
+    }
+
     /// Insert a block from a complete snapshot (for remote sync).
     ///
     /// This is used when receiving blocks from the server via block events.

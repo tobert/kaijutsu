@@ -589,6 +589,34 @@ impl BlockStore {
         Ok(id)
     }
 
+    /// Insert an error block attached to a parent.
+    pub fn insert_error_block(
+        &mut self,
+        parent_id: &BlockId,
+        after: Option<&BlockId>,
+        payload: &kaijutsu_types::ErrorPayload,
+        summary: impl Into<String>,
+    ) -> Result<BlockId> {
+        let id = self.new_block_id();
+
+        if !self.blocks.contains_key(parent_id) || self.blocks[parent_id].is_deleted() {
+            return Err(CrdtError::InvalidReference(*parent_id));
+        }
+        if let Some(after_id) = after
+            && (!self.blocks.contains_key(after_id) || self.blocks[after_id].is_deleted())
+        {
+            return Err(CrdtError::InvalidReference(*after_id));
+        }
+
+        let order_key = self.calc_order_key(after);
+        let snap =
+            BlockSnapshot::error_for(id, *parent_id, payload.clone(), summary);
+        let block = BlockContent::from_snapshot(&snap, self.agent_id, order_key);
+        self.blocks.insert(id, block);
+        self.version += 1;
+        Ok(id)
+    }
+
     /// Insert a block from a complete snapshot (for remote sync / restore).
     pub fn insert_from_snapshot(
         &mut self,
