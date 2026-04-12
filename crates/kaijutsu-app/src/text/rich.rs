@@ -312,8 +312,15 @@ fn try_parse_svg(
             Some((svg.scene, svg.width, svg.height, source))
         }
         Err(e) => {
-            warn!("SVG parse failed: {}", e);
-            None
+            // Kernel-side usvg validation should have caught this already.
+            // A divergence here is a bug (version mismatch or mid-stream snapshot).
+            #[cfg(debug_assertions)]
+            panic!("SVG re-parse failed after kernel validation: {e}");
+            #[cfg(not(debug_assertions))]
+            {
+                warn!("SVG client re-parse failed (kernel should have caught this): {e}");
+                None
+            }
         }
     }
 }
@@ -387,18 +394,10 @@ pub fn detect_rich_content_typed(
             });
         }
         ContentType::Abc => {
+            // Always render whatever the generous parser returned.
+            // Errors are attached as child Error blocks by the kernel
+            // and rendered via the ErrorChildIndex stacking path.
             let result = kaijutsu_abc::parse(text);
-            if result.has_errors() {
-                // Fall back to summary on parse error
-                let summary = abc_summary(text);
-                let spans = parse_to_rich_spans(&summary);
-                return Some(RichContent {
-                    kind: RichContentKind::Markdown {
-                        spans,
-                        plain_text: summary,
-                    },
-                });
-            }
             return Some(RichContent {
                 kind: RichContentKind::Abc {
                     source: Arc::new(text.to_string()),
@@ -454,34 +453,5 @@ pub fn detect_rich_content_typed(
     })
 }
 
-/// Extract a compact summary from raw ABC notation text.
-/// Parses T: and K: header fields without a full ABC parser dependency.
-fn abc_summary(abc: &str) -> String {
-    let mut title = None;
-    let mut key = None;
-
-    for line in abc.lines() {
-        let trimmed = line.trim();
-        if trimmed.len() >= 2 && trimmed.as_bytes()[1] == b':' {
-            match trimmed.as_bytes()[0] {
-                b'T' => {
-                    if title.is_none() {
-                        title = Some(trimmed[2..].trim());
-                    }
-                }
-                b'K' => {
-                    key = Some(trimmed[2..].trim());
-                    break; // K: is always last header field
-                }
-                _ => {}
-            }
-        }
-    }
-
-    match (title, key) {
-        (Some(t), Some(k)) => format!("**ABC: {} ({})**", t, k),
-        (Some(t), None) => format!("**ABC: {}**", t),
-        (None, Some(k)) => format!("**ABC ({})**", k),
-        (None, None) => "**ABC notation**".to_string(),
-    }
-}
+// abc_summary() removed — ABC parse errors are now handled as structured
+// Error child blocks by the kernel, not as fallback markdown summaries.

@@ -1210,6 +1210,19 @@ impl BlockStore {
             source: OpSource::Local,
         });
 
+        // Validate content when a block transitions to Done with a rich content type.
+        // This is the primary hook for kernel-side ABC/SVG validation — it runs once
+        // when streaming completes, not on every keystroke.
+        if status == Status::Done {
+            let content_type = self
+                .get(context_id)
+                .and_then(|e| e.doc.get_block_snapshot(block_id))
+                .map(|s| s.content_type);
+            if matches!(content_type, Some(ContentType::Abc) | Some(ContentType::Svg)) {
+                let _ = self.validate_content_and_attach_errors(context_id, block_id);
+            }
+        }
+
         Ok(())
     }
 
@@ -2321,6 +2334,98 @@ impl BlockStore {
         Ok(block_id)
     }
 
+    /// Validate content and attach/update Error child blocks.
+    ///
+    /// Called when a block's status transitions to Done and its content_type
+    /// is Abc or Svg. Runs the appropriate parser, compares results against
+    /// existing Error children, and inserts/compacts to stay in sync.
+    pub fn validate_content_and_attach_errors(
+        &self,
+        context_id: ContextId,
+        block_id: &BlockId,
+    ) -> BlockStoreResult<()> {
+        // Read the block snapshot
+        let snap = {
+            let entry = self
+                .get(context_id)
+                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+            entry
+                .doc
+                .get_block_snapshot(block_id)
+                .ok_or_else(|| BlockStoreError::BlockNotFoundAfterInsert)?
+        };
+
+        let new_errors = match snap.content_type {
+            ContentType::Abc => validate_abc(&snap.content),
+            ContentType::Svg => validate_svg(&snap.content),
+            _ => return Ok(()),
+        };
+
+        // Get existing Error children of this block
+        let existing_errors: Vec<BlockSnapshot> = {
+            let entry = self
+                .get(context_id)
+                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+            entry
+                .doc
+                .blocks_ordered()
+                .into_iter()
+                .filter(|b| {
+                    b.kind == BlockKind::Error
+                        && b.parent_id == Some(*block_id)
+                        && !b.compacted
+                })
+                .collect()
+        };
+
+        // Dedup: compare new errors against existing by (code, line, message)
+        let existing_keys: HashSet<(Option<&str>, u32, &str)> = existing_errors
+            .iter()
+            .filter_map(|b| {
+                b.error.as_ref().map(|e| {
+                    let line = e.span.as_ref().map(|s| s.line).unwrap_or(0);
+                    (e.code.as_deref(), line, b.content.as_str())
+                })
+            })
+            .collect();
+
+        let new_keys: HashSet<(Option<&str>, u32, &str)> = new_errors
+            .iter()
+            .map(|(payload, summary)| {
+                let line = payload.span.as_ref().map(|s| s.line).unwrap_or(0);
+                (payload.code.as_deref(), line, summary.as_str())
+            })
+            .collect();
+
+        // Delete stale errors (present in existing, absent in new)
+        for existing in &existing_errors {
+            if let Some(ref e) = existing.error {
+                let line = e.span.as_ref().map(|s| s.line).unwrap_or(0);
+                let key = (e.code.as_deref(), line, existing.content.as_str());
+                if !new_keys.contains(&key) {
+                    let _ = self.delete_block(context_id, &existing.id);
+                }
+            }
+        }
+
+        // Insert new errors (present in new, absent in existing)
+        for (payload, summary) in &new_errors {
+            let line = payload.span.as_ref().map(|s| s.line).unwrap_or(0);
+            let key = (payload.code.as_deref(), line, summary.as_str());
+            if !existing_keys.contains(&key) {
+                let _ = self.insert_error_block_as(
+                    context_id,
+                    block_id,
+                    payload,
+                    summary.clone(),
+                    Some(PrincipalId::system()),
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     /// Insert an error block attached to a parent.
     ///
     /// Wraps `CrdtBlockStore::insert_error_block()` with FlowBus emission,
@@ -2373,6 +2478,86 @@ impl BlockStore {
 
 /// BFS from `root_id` collecting all descendant block IDs up to `max_depth` levels.
 /// Depth 0 = unlimited. The root itself is included in the result set.
+/// Validate ABC notation content, returning ErrorPayloads for each diagnostic.
+fn validate_abc(content: &str) -> Vec<(kaijutsu_types::ErrorPayload, String)> {
+    let result = kaijutsu_abc::parse(content);
+    result
+        .feedback
+        .into_iter()
+        .filter(|f| {
+            matches!(
+                f.level,
+                kaijutsu_abc::feedback::FeedbackLevel::Error
+                    | kaijutsu_abc::feedback::FeedbackLevel::Warning
+            )
+        })
+        .map(|f| {
+            let severity = match f.level {
+                kaijutsu_abc::feedback::FeedbackLevel::Error => {
+                    kaijutsu_types::ErrorSeverity::Error
+                }
+                _ => kaijutsu_types::ErrorSeverity::Warning,
+            };
+            let summary = if let Some(ref suggestion) = f.suggestion {
+                format!("{} (hint: {})", f.message, suggestion)
+            } else {
+                f.message.clone()
+            };
+            let payload = kaijutsu_types::ErrorPayload {
+                category: kaijutsu_types::ErrorCategory::Parse,
+                severity,
+                code: None,
+                detail: Some(f.message),
+                span: Some(kaijutsu_types::ErrorSpan {
+                    line: f.line as u32,
+                    column: f.column as u32,
+                    length: f
+                        .span
+                        .map(|(start, end)| (end - start) as u32)
+                        .unwrap_or(0),
+                }),
+                source_kind: Some(BlockKind::Text),
+            };
+            (payload, summary)
+        })
+        .collect()
+}
+
+/// Validate SVG content via usvg, returning ErrorPayloads on failure.
+fn validate_svg(content: &str) -> Vec<(kaijutsu_types::ErrorPayload, String)> {
+    // Wrap in catch_unwind to prevent parser panics from killing the kernel
+    let result = std::panic::catch_unwind(|| {
+        usvg::Tree::from_str(content, &usvg::Options::default())
+    });
+    match result {
+        Ok(Ok(_)) => vec![],
+        Ok(Err(e)) => {
+            let summary = format!("SVG parse error: {}", e);
+            let payload = kaijutsu_types::ErrorPayload {
+                category: kaijutsu_types::ErrorCategory::Parse,
+                severity: kaijutsu_types::ErrorSeverity::Error,
+                code: None,
+                detail: Some(e.to_string()),
+                span: None,
+                source_kind: Some(BlockKind::Text),
+            };
+            vec![(payload, summary)]
+        }
+        Err(_panic) => {
+            let summary = "SVG validator panicked (malformed input)".to_string();
+            let payload = kaijutsu_types::ErrorPayload {
+                category: kaijutsu_types::ErrorCategory::Kernel,
+                severity: kaijutsu_types::ErrorSeverity::Fatal,
+                code: Some("svg.validator_panic".into()),
+                detail: Some("usvg::Tree::from_str panicked — the SVG content is likely severely malformed".into()),
+                span: None,
+                source_kind: Some(BlockKind::Text),
+            };
+            vec![(payload, summary)]
+        }
+    }
+}
+
 fn compute_descendants(
     doc: &CrdtBlockStore,
     root_id: &BlockId,
