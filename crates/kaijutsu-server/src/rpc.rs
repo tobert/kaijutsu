@@ -1,9 +1,60 @@
-//! Cap'n Proto RPC server implementation
+//! Cap'n Proto RPC server implementation.
 //!
-//! Implements World and Kernel capabilities.
-//! One shared kernel is created at server startup (`SharedKernel`),
+//! One shared kernel is created at server startup ([`create_shared_kernel`]),
 //! shared across all SSH connections via `Arc`. Per-connection state
-//! (principal, kaish, command history) lives in `ConnectionState`.
+//! (principal, kaish, command history) lives in [`ConnectionState`]. The
+//! primary RPC surface is [`KernelImpl`], which implements the capnp
+//! `kernel::Server` trait.
+//!
+//! # Why this file is large
+//!
+//! This file is intentionally kept as a single module rather than decomposed
+//! into a `rpc/` directory of per-domain submodules. The `kernel::Server`
+//! trait impl is ~6k lines on its own and must be contiguous — a capnp
+//! constraint — so a mechanical split would produce one thin file of
+//! delegating trait methods plus one-file-per-subject of inherent `impl`
+//! blocks, doubling surface area without gaining real modularity. File-size
+//! ergonomics matter less in an AI-assisted workflow where grep, LSP, and
+//! the editor's outline view handle navigation. Parallel work resolves
+//! cleanly per-hunk: moving methods into separate files doesn't reduce
+//! merge conflict surface, it just reshuffles it.
+//!
+//! If a specific chunk of code grows its own identity (the LLM agentic
+//! loop is the obvious example — see [`crate::llm_stream`]), extract it.
+//! Don't decompose the file just to have smaller files.
+//!
+//! # Navigation
+//!
+//! Section banners use `// ========` and are grep-able with `rg '^// ='`.
+//! Top-level sections, in order:
+//!
+//! - **Server State** — [`ConnectionState`], [`ConversationCache`],
+//!   [`SharedKernelState`], execution tracking helpers.
+//! - **Execute Output Dispatch** — background fan-out of `execute()`
+//!   output events to subscribers.
+//! - **Semantic Index Integration** — `BlockSource` adapter for kaijutsu-index.
+//! - **Shared Kernel Creation** — [`create_shared_kernel`] (server startup).
+//! - **World Implementation** — [`WorldImpl`] (top-level capability).
+//! - **Kernel Implementation** — [`KernelImpl`], the main trait impl. Its
+//!   internal subsections group ~80 RPC methods: lifecycle/info, shell
+//!   execution (`execute`/`interrupt`/`complete`), VFS, tools, block CRDT
+//!   ops, prompt/LLM, context ops, MCP, shell execution (kaish), shell
+//!   state, blob placeholders, MCP resources, agent attachment, timeline
+//!   navigation, config, drift, LLM configuration, tool filter
+//!   configuration, per-context tool filter, shell variable introspection,
+//!   input document operations, context interrupt.
+//! - **Shell Value Conversion Helpers** — kaish `Value` ↔ Cap'n Proto.
+//! - **OutputData Build Helpers** — structured command output builders.
+//! - **Agent Helper Functions** — `AgentInfo` / `AgentCapability` converters.
+//! - **Cap'n Proto ↔ Rust Type Helpers** — tool filter (de)serialization.
+//! - **Shell Execution Dispatch** — [`execute_shell_command`], shared by
+//!   the `shell_execute` RPC and `submit_input`.
+//! - **Utility Functions** — block ID / filter / status converters.
+//! - **VFS Implementation** — [`VfsImpl`] (filesystem capability).
+//! - **Synthesis** — Rhai-driven keyword extraction.
+//!
+//! LLM streaming (`process_llm_stream` and its agentic loop) lives in
+//! [`crate::llm_stream`], not in this file.
 
 #![allow(refining_impl_trait)]
 
@@ -5790,9 +5841,13 @@ fn serialize_tool_filter_to_capnp(
     }
 }
 
-// LLM streaming + agentic loop moved to crate::llm_stream
+// ============================================================================
+// Shell Execution Dispatch
+// ============================================================================
+//
+// LLM streaming + agentic loop moved to `crate::llm_stream`
 // (build_tool_definitions, spawn_llm_for_prompt, tool_kind_for_category,
-// process_llm_stream all live there now).
+// process_llm_stream all live there).
 
 /// Create kaish, insert ToolCall + ToolResult blocks, spawn execution.
 ///
