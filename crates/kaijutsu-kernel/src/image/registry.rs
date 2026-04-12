@@ -29,7 +29,10 @@ impl ImageBackendRegistry {
     }
 
     /// Get a backend by name, or the default if name is None.
-    pub fn get(&self, name: Option<&str>) -> Result<&Arc<dyn ImageBackend>, ImageError> {
+    ///
+    /// Returns a cloned `Arc` so callers can drop any lock on the registry
+    /// before awaiting long-running generation calls.
+    pub fn get(&self, name: Option<&str>) -> Result<Arc<dyn ImageBackend>, ImageError> {
         let key = name
             .map(|n| n.to_string())
             .or_else(|| self.default.clone())
@@ -37,17 +40,8 @@ impl ImageBackendRegistry {
 
         self.backends
             .get(&key)
+            .cloned()
             .ok_or_else(|| ImageError::NotAvailable(format!("backend '{}' not found", key)))
-    }
-
-    /// Generate an image using the specified (or default) backend.
-    pub async fn generate(
-        &self,
-        prompt: &str,
-        opts: ImageGenOpts,
-    ) -> Result<ImageStream, ImageError> {
-        let backend = self.get(opts.backend.as_deref())?;
-        backend.generate(prompt, opts).await
     }
 
     pub fn is_empty(&self) -> bool {

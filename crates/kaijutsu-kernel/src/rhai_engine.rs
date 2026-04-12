@@ -1900,11 +1900,14 @@ async fn run_image_generation(
     use kaijutsu_cas::ContentStore;
     use kaijutsu_types::Status;
 
-    // Resolve the backend and start generation
-    let mut stream = {
+    // Resolve the backend and drop the lock BEFORE starting generation.
+    // Holding the RwLock across the generate() await would block all concurrent
+    // registry access for the duration of the API call.
+    let backend = {
         let registry = backends.read().await;
-        registry.generate(prompt, crate::image::ImageGenOpts::default()).await?
+        registry.get(None)?.clone()
     };
+    let mut stream = backend.generate(prompt, crate::image::ImageGenOpts::default()).await?;
 
     // Stream chunks into CAS staging
     let mut staging = cas

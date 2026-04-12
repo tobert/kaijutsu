@@ -98,30 +98,36 @@ impl ImageBackend for GeminiBackend {
     }
 }
 
-fn base64_decode(input: &str) -> Result<Vec<u8>, ()> {
-    // Simple base64 decode — strip whitespace, decode.
-    let cleaned: String = input.chars().filter(|c| !c.is_whitespace()).collect();
-    // Use a minimal inline decoder rather than adding a base64 dep.
-    // The data_encoding crate or base64 crate would be better but this
-    // avoids a new dependency. If we hit edge cases, swap for base64 crate.
-    decode_base64_bytes(cleaned.as_bytes())
+const fn build_b64_table() -> [i8; 256] {
+    let mut table = [-1_i8; 256];
+    let b64 = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut i = 0;
+    while i < 64 {
+        table[b64[i] as usize] = i as i8;
+        i += 1;
+    }
+    table
 }
 
-fn decode_base64_bytes(input: &[u8]) -> Result<Vec<u8>, ()> {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const B64_TABLE: [i8; 256] = build_b64_table();
+
+fn base64_decode(input: &str) -> Result<Vec<u8>, ()> {
     let mut out = Vec::with_capacity(input.len() * 3 / 4);
     let mut buf: u32 = 0;
     let mut bits: u32 = 0;
 
-    for &byte in input {
-        let val = if byte == b'=' {
+    for byte in input.bytes() {
+        if byte.is_ascii_whitespace() {
+            continue;
+        }
+        if byte == b'=' {
             break;
-        } else if let Some(pos) = TABLE.iter().position(|&b| b == byte) {
-            pos as u32
-        } else {
+        }
+        let val = B64_TABLE[byte as usize];
+        if val < 0 {
             return Err(());
-        };
-        buf = (buf << 6) | val;
+        }
+        buf = (buf << 6) | val as u32;
         bits += 6;
         if bits >= 8 {
             bits -= 8;
