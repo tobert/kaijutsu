@@ -72,6 +72,10 @@ pub type BlockStoreResult<T> = Result<T, BlockStoreError>;
 /// Thread-safe database handle (unified KernelDb).
 pub type DbHandle = Arc<parking_lot::Mutex<KernelDb>>;
 
+/// Compaction thresholds for the block document oplog.
+const COMPACTION_OP_THRESHOLD: u64 = 500;
+const COMPACTION_BYTE_THRESHOLD: u64 = 1_048_576; // 1 MiB
+
 /// Entry for a document in the store.
 pub struct DocumentEntry {
     /// Per-block CRDT store (each block owns its own DTE Document).
@@ -86,6 +90,12 @@ pub struct DocumentEntry {
     last_agent: RwLock<PrincipalId>,
     /// Sync generation — bumped on reset to force client re-sync.
     sync_generation: AtomicU64,
+    /// Next oplog sequence number (monotonic per document).
+    next_journal_seq: AtomicU64,
+    /// Ops appended since last compaction (for trigger check).
+    uncompacted_count: AtomicU64,
+    /// Bytes appended since last compaction (for trigger check).
+    uncompacted_bytes: AtomicU64,
 }
 
 impl DocumentEntry {
@@ -103,26 +113,36 @@ impl DocumentEntry {
             version: AtomicU64::new(0),
             last_agent: RwLock::new(agent_id),
             sync_generation: AtomicU64::new(0),
+            next_journal_seq: AtomicU64::new(0),
+            uncompacted_count: AtomicU64::new(0),
+            uncompacted_bytes: AtomicU64::new(0),
         }
     }
 
     /// Create a document entry from a store snapshot.
+    /// Create from a snapshot, optionally seeding the journal seq from an oplog.
     fn from_store_snapshot(
         snapshot: StoreSnapshot,
         kind: DocKind,
         language: Option<String>,
         agent_id: PrincipalId,
-    ) -> Self {
-        let store = CrdtBlockStore::from_snapshot(snapshot, agent_id);
+        journal_seq: u64,
+        uncompacted_count: u64,
+        uncompacted_bytes: u64,
+    ) -> BlockStoreResult<Self> {
+        let store = CrdtBlockStore::from_snapshot(snapshot, agent_id)?;
         let version = store.version();
-        Self {
+        Ok(Self {
             doc: store,
             kind,
             language,
             version: AtomicU64::new(version),
             last_agent: RwLock::new(agent_id),
             sync_generation: AtomicU64::new(0),
-        }
+            next_journal_seq: AtomicU64::new(journal_seq),
+            uncompacted_count: AtomicU64::new(uncompacted_count),
+            uncompacted_bytes: AtomicU64::new(uncompacted_bytes),
+        })
     }
 
     /// Get the current version.
@@ -158,6 +178,8 @@ pub struct BlockStore {
     documents: DashMap<ContextId, DocumentEntry>,
     /// Per-context input documents (compose scratchpads).
     input_docs: DashMap<ContextId, InputDocEntry>,
+    /// Per-input-doc journal sequence counters.
+    input_journal_seqs: DashMap<ContextId, AtomicU64>,
     /// Database for persistence (unified KernelDb).
     db: Option<DbHandle>,
     /// Kernel ID for document rows.
@@ -178,6 +200,7 @@ impl BlockStore {
         Self {
             documents: DashMap::new(),
             input_docs: DashMap::new(),
+            input_journal_seqs: DashMap::new(),
             db: None,
             kernel_id: None,
             default_workspace_id: None,
@@ -192,6 +215,7 @@ impl BlockStore {
         Self {
             documents: DashMap::new(),
             input_docs: DashMap::new(),
+            input_journal_seqs: DashMap::new(),
             db: None,
             kernel_id: None,
             default_workspace_id: None,
@@ -211,6 +235,7 @@ impl BlockStore {
         Self {
             documents: DashMap::new(),
             input_docs: DashMap::new(),
+            input_journal_seqs: DashMap::new(),
             db: Some(db),
             kernel_id: Some(kernel_id),
             default_workspace_id: Some(default_workspace_id),
@@ -231,6 +256,7 @@ impl BlockStore {
         Self {
             documents: DashMap::new(),
             input_docs: DashMap::new(),
+            input_journal_seqs: DashMap::new(),
             db: Some(db),
             kernel_id: Some(kernel_id),
             default_workspace_id: Some(default_workspace_id),
@@ -336,7 +362,7 @@ impl BlockStore {
             .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
 
         let agent_id = self.agent_id();
-        let entry = DocumentEntry::from_store_snapshot(snapshot, kind, language, agent_id);
+        let entry = DocumentEntry::from_store_snapshot(snapshot, kind, language, agent_id, 0, 0, 0)?;
         self.documents.insert(context_id, entry);
 
         Ok(())
@@ -461,9 +487,12 @@ impl BlockStore {
             version: AtomicU64::new(version),
             last_agent: RwLock::new(agent_id),
             sync_generation: AtomicU64::new(0),
+            next_journal_seq: AtomicU64::new(0),
+            uncompacted_count: AtomicU64::new(0),
+            uncompacted_bytes: AtomicU64::new(0),
         };
         self.documents.insert(new_id, entry);
-        self.auto_save(new_id);
+        self.write_initial_snapshot(new_id)?;
 
         Ok(())
     }
@@ -539,9 +568,12 @@ impl BlockStore {
             version: AtomicU64::new(version),
             last_agent: RwLock::new(agent_id),
             sync_generation: AtomicU64::new(0),
+            next_journal_seq: AtomicU64::new(0),
+            uncompacted_count: AtomicU64::new(0),
+            uncompacted_bytes: AtomicU64::new(0),
         };
         self.documents.insert(new_id, entry);
-        self.auto_save(new_id);
+        self.write_initial_snapshot(new_id)?;
 
         Ok(())
     }
@@ -609,9 +641,12 @@ impl BlockStore {
             version: AtomicU64::new(version),
             last_agent: RwLock::new(agent_id),
             sync_generation: AtomicU64::new(0),
+            next_journal_seq: AtomicU64::new(0),
+            uncompacted_count: AtomicU64::new(0),
+            uncompacted_bytes: AtomicU64::new(0),
         };
         self.documents.insert(new_id, entry);
-        self.auto_save(new_id);
+        self.write_initial_snapshot(new_id)?;
 
         Ok(())
     }
@@ -631,14 +666,113 @@ impl BlockStore {
     // Block Operations
     // =========================================================================
 
-    /// Auto-save snapshot if database is configured.
-    /// Logs warnings on failure but doesn't propagate errors.
-    fn auto_save(&self, context_id: ContextId) {
-        if self.db.is_some()
-            && let Err(e) = self.save_snapshot(context_id)
+    /// Journal an op to the append-only oplog.
+    ///
+    /// Serializes the SyncPayload, appends it to the `oplog` table, and
+    /// triggers compaction if the uncompacted count or bytes exceed thresholds.
+    fn journal_op(
+        &self,
+        context_id: ContextId,
+        payload: SyncPayload,
+    ) -> BlockStoreResult<()> {
+        let Some(db) = self.db.as_ref() else {
+            return Ok(());
+        };
+
+        let payload_bytes = postcard::to_allocvec(&payload)
+            .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
+        let payload_len = payload_bytes.len() as u64;
+
+        let (seq, count, bytes) = {
+            let entry = self
+                .get(context_id)
+                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+            let seq = entry.next_journal_seq.fetch_add(1, Ordering::SeqCst) + 1;
+            let count = entry.uncompacted_count.fetch_add(1, Ordering::SeqCst) + 1;
+            let bytes = entry
+                .uncompacted_bytes
+                .fetch_add(payload_len, Ordering::SeqCst)
+                + payload_len;
+            (seq, count, bytes)
+        };
+
         {
-            tracing::warn!(context_id = %context_id.to_hex(), error = %e, "Failed to auto-save snapshot");
+            let db_guard = db.lock();
+            db_guard
+                .append_op(context_id, seq as i64, &payload_bytes)
+                .map_err(|e| BlockStoreError::Db(e.to_string()))?;
         }
+
+        if count >= COMPACTION_OP_THRESHOLD || bytes >= COMPACTION_BYTE_THRESHOLD {
+            self.compact_document(context_id)?;
+        }
+        Ok(())
+    }
+
+    /// Run compaction: snapshot the current state and truncate the oplog.
+    fn compact_document(&self, context_id: ContextId) -> BlockStoreResult<()> {
+        let Some(db) = self.db.as_ref() else {
+            return Ok(());
+        };
+
+        let (snapshot_bytes, content, version, max_seq) = {
+            let entry = self
+                .get(context_id)
+                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+            let snapshot = entry.doc.snapshot();
+            let content = entry.content();
+            let version = entry.version() as i64;
+            let max_seq = entry.next_journal_seq.load(Ordering::SeqCst);
+            let snapshot_bytes = postcard::to_allocvec(&snapshot)
+                .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
+            (snapshot_bytes, content, version, max_seq)
+        };
+
+        {
+            let mut db_guard = db.lock();
+            db_guard
+                .write_snapshot_and_truncate(
+                    context_id,
+                    max_seq as i64,
+                    version,
+                    &snapshot_bytes,
+                    &content,
+                )
+                .map_err(|e| BlockStoreError::Db(e.to_string()))?;
+        }
+
+        if let Some(entry) = self.get(context_id) {
+            entry.uncompacted_count.store(0, Ordering::SeqCst);
+            entry.uncompacted_bytes.store(0, Ordering::SeqCst);
+        }
+
+        Ok(())
+    }
+
+    /// Write an initial snapshot for a newly forked document (no oplog).
+    fn write_initial_snapshot(&self, context_id: ContextId) -> BlockStoreResult<()> {
+        let Some(db) = self.db.as_ref() else {
+            return Ok(());
+        };
+
+        let entry = self
+            .get(context_id)
+            .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+        let snapshot = entry.doc.snapshot();
+        let content = entry.content();
+        let version = entry.version() as i64;
+
+        let snapshot_bytes = postcard::to_allocvec(&snapshot)
+            .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
+
+        drop(entry);
+
+        let mut db_guard = db.lock();
+        db_guard
+            .write_snapshot_and_truncate(context_id, 0, version, &snapshot_bytes, &content)
+            .map_err(|e| BlockStoreError::Db(e.to_string()))?;
+
+        Ok(())
     }
 
     /// Insert a block into a document.
@@ -686,7 +820,7 @@ impl BlockStore {
         agent_id: Option<PrincipalId>,
     ) -> BlockStoreResult<BlockId> {
         let after_id = after.cloned();
-        let (block_id, snapshot, ops) = {
+        let (block_id, snapshot, ops, ops_bytes) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
@@ -713,16 +847,16 @@ impl BlockStore {
             let ops_bytes = postcard::to_allocvec(&ops)
                 .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
             entry.touch(effective_agent);
-            (block_id, snapshot, ops_bytes)
+            (block_id, snapshot, ops, ops_bytes)
         };
-        self.auto_save(context_id);
+        self.journal_op(context_id, ops)?;
 
         // Emit flow event with creation ops
         self.emit(BlockFlow::Inserted {
             context_id,
             block: Arc::new(snapshot),
             after_id,
-            ops: Arc::from(ops),
+            ops: Arc::from(ops_bytes),
             source: OpSource::Local,
         });
 
@@ -764,7 +898,7 @@ impl BlockStore {
         role: Option<Role>,
     ) -> BlockStoreResult<BlockId> {
         let after_id = after.cloned();
-        let (block_id, snapshot, ops) = {
+        let (block_id, snapshot, ops, ops_bytes) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
@@ -793,16 +927,16 @@ impl BlockStore {
             let ops_bytes = postcard::to_allocvec(&ops)
                 .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
             entry.touch(effective_agent);
-            (block_id, snapshot, ops_bytes)
+            (block_id, snapshot, ops, ops_bytes)
         };
-        self.auto_save(context_id);
+        self.journal_op(context_id, ops)?;
 
         // Emit flow event with creation ops
         self.emit(BlockFlow::Inserted {
             context_id,
             block: Arc::new(snapshot),
             after_id,
-            ops: Arc::from(ops),
+            ops: Arc::from(ops_bytes),
             source: OpSource::Local,
         });
 
@@ -850,7 +984,7 @@ impl BlockStore {
         tool_use_id: Option<String>,
     ) -> BlockStoreResult<BlockId> {
         let after_id = after.cloned();
-        let (block_id, snapshot, ops) = {
+        let (block_id, snapshot, ops, ops_bytes) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
@@ -884,16 +1018,16 @@ impl BlockStore {
             let ops_bytes = postcard::to_allocvec(&ops)
                 .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
             entry.touch(effective_agent);
-            (block_id, snapshot, ops_bytes)
+            (block_id, snapshot, ops, ops_bytes)
         };
-        self.auto_save(context_id);
+        self.journal_op(context_id, ops)?;
 
         // Emit flow event with creation ops
         self.emit(BlockFlow::Inserted {
             context_id,
             block: Arc::new(snapshot),
             after_id,
-            ops: Arc::from(ops),
+            ops: Arc::from(ops_bytes),
             source: OpSource::Local,
         });
 
@@ -922,7 +1056,7 @@ impl BlockStore {
         agent_id: Option<PrincipalId>,
     ) -> BlockStoreResult<BlockId> {
         let after_id = after.cloned();
-        let (block_id, final_snapshot, ops) = {
+        let (block_id, final_snapshot, ops, ops_bytes) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
@@ -941,15 +1075,15 @@ impl BlockStore {
             let ops_bytes = postcard::to_allocvec(&ops)
                 .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
             entry.touch(effective_agent);
-            (block_id, final_snapshot, ops_bytes)
+            (block_id, final_snapshot, ops, ops_bytes)
         };
-        self.auto_save(context_id);
+        self.journal_op(context_id, ops)?;
 
         self.emit(BlockFlow::Inserted {
             context_id,
             block: Arc::new(final_snapshot),
             after_id,
-            ops: Arc::from(ops),
+            ops: Arc::from(ops_bytes),
             source: OpSource::Local,
         });
 
@@ -963,15 +1097,17 @@ impl BlockStore {
         block_id: &BlockId,
         status: Status,
     ) -> BlockStoreResult<()> {
-        {
+        let ops = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
             let agent_id = self.agent_id();
+            let frontier_before = entry.doc.frontier();
             entry.doc.set_status(block_id, status)?;
             entry.touch(agent_id);
-        }
-        self.auto_save(context_id);
+            entry.doc.ops_since(&frontier_before)
+        };
+        self.journal_op(context_id, ops)?;
 
         // Emit flow event
         // Include output data if present — output is a struct field that can't
@@ -994,9 +1130,6 @@ impl BlockStore {
     }
 
     /// Edit text within a block.
-    ///
-    /// Note: Does not auto-save to avoid excessive I/O during streaming.
-    /// Call `save_snapshot()` explicitly when editing is complete.
     pub fn edit_text(
         &self,
         context_id: ContextId,
@@ -1018,7 +1151,7 @@ impl BlockStore {
         delete: usize,
         agent_id: Option<PrincipalId>,
     ) -> BlockStoreResult<()> {
-        let ops = {
+        let (ops, ops_bytes) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
@@ -1030,27 +1163,23 @@ impl BlockStore {
             entry.touch(effective_agent);
             // Get ops since frontier (the edit we just applied)
             let ops = entry.doc.ops_since(&frontier);
-            postcard::to_allocvec(&ops)
-                .map_err(|e| BlockStoreError::Serialization(e.to_string()))?
+            let ops_bytes = postcard::to_allocvec(&ops)
+                .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
+            (ops, ops_bytes)
         };
-        // Note: No auto-save for text edits (high frequency during streaming)
+        self.journal_op(context_id, ops)?;
 
         // Emit CRDT ops for proper sync
         self.emit(BlockFlow::TextOps {
             context_id,
             block_id: *block_id,
-            ops: Arc::from(ops),
+            ops: Arc::from(ops_bytes),
             source: OpSource::Local,
         });
 
         Ok(())
     }
 
-    /// Set structured output data on a block.
-    ///
-    /// Output data provides formatting information (tables, trees) for richer output.
-    /// Emits `OutputChanged` flow event. Also piggybacked on `StatusChanged` for
-    /// wire compat — see `set_status`.
     /// Set the ephemeral flag on a block (excluded from LLM hydration).
     pub fn set_ephemeral(
         &self,
@@ -1058,14 +1187,16 @@ impl BlockStore {
         block_id: &BlockId,
         ephemeral: bool,
     ) -> BlockStoreResult<()> {
-        let mut entry = self
-            .get_mut(context_id)
-            .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
-        entry.doc.set_ephemeral(block_id, ephemeral)?;
-        entry.touch(self.agent_id());
-        drop(entry);
-
-        self.auto_save(context_id);
+        let ops = {
+            let mut entry = self
+                .get_mut(context_id)
+                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+            let frontier_before = entry.doc.frontier();
+            entry.doc.set_ephemeral(block_id, ephemeral)?;
+            entry.touch(self.agent_id());
+            entry.doc.ops_since(&frontier_before)
+        };
+        self.journal_op(context_id, ops)?;
         self.emit(BlockFlow::MetadataChanged {
             context_id,
             block_id: *block_id,
@@ -1082,14 +1213,16 @@ impl BlockStore {
         block_id: &BlockId,
         excluded: bool,
     ) -> BlockStoreResult<()> {
-        let mut entry = self
-            .get_mut(context_id)
-            .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
-        entry.doc.set_excluded(block_id, excluded)?;
-        entry.touch(self.agent_id());
-        drop(entry);
-
-        self.auto_save(context_id);
+        let ops = {
+            let mut entry = self
+                .get_mut(context_id)
+                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+            let frontier_before = entry.doc.frontier();
+            entry.doc.set_excluded(block_id, excluded)?;
+            entry.touch(self.agent_id());
+            entry.doc.ops_since(&frontier_before)
+        };
+        self.journal_op(context_id, ops)?;
         self.emit(BlockFlow::ExcludedChanged {
             context_id,
             block_id: *block_id,
@@ -1107,14 +1240,16 @@ impl BlockStore {
         block_id: &BlockId,
         content_type: ContentType,
     ) -> BlockStoreResult<()> {
-        let mut entry = self
-            .get_mut(context_id)
-            .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
-        entry.doc.set_content_type(block_id, content_type)?;
-        entry.touch(self.agent_id());
-        drop(entry);
-
-        self.auto_save(context_id);
+        let ops = {
+            let mut entry = self
+                .get_mut(context_id)
+                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+            let frontier_before = entry.doc.frontier();
+            entry.doc.set_content_type(block_id, content_type)?;
+            entry.touch(self.agent_id());
+            entry.doc.ops_since(&frontier_before)
+        };
+        self.journal_op(context_id, ops)?;
         self.emit(BlockFlow::MetadataChanged {
             context_id,
             block_id: *block_id,
@@ -1124,21 +1259,28 @@ impl BlockStore {
         Ok(())
     }
 
+    /// Set structured output data on a block.
+    ///
+    /// Output data provides formatting information (tables, trees) for richer output.
+    /// Emits `OutputChanged` flow event. Also piggybacked on `StatusChanged` for
+    /// wire compat — see `set_status`.
     pub fn set_output(
         &self,
         context_id: ContextId,
         block_id: &BlockId,
         output: Option<&kaijutsu_types::OutputData>,
     ) -> BlockStoreResult<()> {
-        let mut entry = self
-            .get_mut(context_id)
-            .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
-        let agent_id = self.agent_id();
-        entry.doc.set_output(block_id, output.cloned())?;
-        entry.touch(agent_id);
-        drop(entry);
-
-        self.auto_save(context_id);
+        let ops = {
+            let mut entry = self
+                .get_mut(context_id)
+                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+            let agent_id = self.agent_id();
+            let frontier_before = entry.doc.frontier();
+            entry.doc.set_output(block_id, output.cloned())?;
+            entry.touch(agent_id);
+            entry.doc.ops_since(&frontier_before)
+        };
+        self.journal_op(context_id, ops)?;
         self.emit(BlockFlow::OutputChanged {
             context_id,
             block_id: *block_id,
@@ -1156,15 +1298,17 @@ impl BlockStore {
         block_id: &BlockId,
         tool_use_id: Option<String>,
     ) -> BlockStoreResult<()> {
-        let mut entry = self
-            .get_mut(context_id)
-            .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
-        let agent_id = self.agent_id();
-        entry.doc.set_tool_use_id(block_id, tool_use_id)?;
-        entry.touch(agent_id);
-        drop(entry);
-
-        self.auto_save(context_id);
+        let ops = {
+            let mut entry = self
+                .get_mut(context_id)
+                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+            let agent_id = self.agent_id();
+            let frontier_before = entry.doc.frontier();
+            entry.doc.set_tool_use_id(block_id, tool_use_id)?;
+            entry.touch(agent_id);
+            entry.doc.ops_since(&frontier_before)
+        };
+        self.journal_op(context_id, ops)?;
         self.emit(BlockFlow::MetadataChanged {
             context_id,
             block_id: *block_id,
@@ -1175,9 +1319,6 @@ impl BlockStore {
     }
 
     /// Append text to a block.
-    ///
-    /// Note: Does not auto-save to avoid excessive I/O during streaming.
-    /// Call `save_snapshot()` explicitly when streaming is complete.
     pub fn append_text(
         &self,
         context_id: ContextId,
@@ -1195,7 +1336,7 @@ impl BlockStore {
         text: &str,
         agent_id: Option<PrincipalId>,
     ) -> BlockStoreResult<()> {
-        let ops = {
+        let (ops, ops_bytes) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
@@ -1207,16 +1348,17 @@ impl BlockStore {
             entry.touch(effective_agent);
             // Get ops since frontier (the append we just applied)
             let ops = entry.doc.ops_since(&frontier);
-            postcard::to_allocvec(&ops)
-                .map_err(|e| BlockStoreError::Serialization(e.to_string()))?
+            let ops_bytes = postcard::to_allocvec(&ops)
+                .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
+            (ops, ops_bytes)
         };
-        // Note: No auto-save for text appends (high frequency during streaming)
+        self.journal_op(context_id, ops)?;
 
         // Emit CRDT ops for proper sync
         self.emit(BlockFlow::TextOps {
             context_id,
             block_id: *block_id,
-            ops: Arc::from(ops),
+            ops: Arc::from(ops_bytes),
             source: OpSource::Local,
         });
 
@@ -1230,15 +1372,17 @@ impl BlockStore {
         block_id: &BlockId,
         collapsed: bool,
     ) -> BlockStoreResult<()> {
-        {
+        let ops = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
             let agent_id = self.agent_id();
+            let frontier_before = entry.doc.frontier();
             entry.doc.set_collapsed(block_id, collapsed)?;
             entry.touch(agent_id);
-        }
-        self.auto_save(context_id);
+            entry.doc.ops_since(&frontier_before)
+        };
+        self.journal_op(context_id, ops)?;
 
         // Emit flow event
         self.emit(BlockFlow::CollapsedChanged {
@@ -1253,15 +1397,17 @@ impl BlockStore {
 
     /// Delete a block from a document.
     pub fn delete_block(&self, context_id: ContextId, block_id: &BlockId) -> BlockStoreResult<()> {
-        {
+        let ops = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
             let agent_id = self.agent_id();
+            let frontier_before = entry.doc.frontier();
             entry.doc.delete_block(block_id)?;
             entry.touch(agent_id);
-        }
-        self.auto_save(context_id);
+            entry.doc.ops_since(&frontier_before)
+        };
+        self.journal_op(context_id, ops)?;
 
         // Emit flow event
         self.emit(BlockFlow::Deleted {
@@ -1291,7 +1437,7 @@ impl BlockStore {
 
     /// Merge a sync payload into a document.
     pub fn merge_ops(&self, context_id: ContextId, payload: SyncPayload) -> BlockStoreResult<u64> {
-        let (version, events) = {
+        let (version, events, ops) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
@@ -1301,17 +1447,19 @@ impl BlockStore {
             let version = entry.doc.version();
             entry.version.store(version, Ordering::SeqCst);
             let after = entry.doc.blocks_ordered();
+            let ops = entry.doc.ops_since(&frontier_before);
             let ops_bytes =
-                postcard::to_allocvec(&entry.doc.ops_since(&frontier_before)).unwrap_or_default();
+                postcard::to_allocvec(&ops).unwrap_or_default();
             (
                 version,
                 Self::diff_block_events(context_id, &before, &after, ops_bytes),
+                ops,
             )
         };
         for event in events {
             self.emit(event);
         }
-        self.auto_save(context_id);
+        self.journal_op(context_id, ops)?;
         Ok(version)
     }
 
@@ -1533,57 +1681,110 @@ impl BlockStore {
 
     /// Load documents from database on startup.
     ///
-    /// For each document, loads both metadata and content from the snapshot table.
-    /// The `oplog_bytes` column stores postcard-encoded StoreSnapshot.
+    /// For each document, loads the latest compaction snapshot (if any) then
+    /// replays oplog entries written after that snapshot.
     pub fn load_from_db(&self) -> BlockStoreResult<()> {
-        let db = self
-            .db
-            .as_ref()
-            .ok_or(BlockStoreError::NoDatabaseConfigured)?;
+        let Some(db) = self.db.as_ref() else {
+            return Ok(());
+        };
         let db_guard = db.lock();
-
         let kernel_id = self
             .kernel_id
             .ok_or_else(|| BlockStoreError::Db("no kernel_id configured".into()))?;
-        let documents = db_guard
+        let docs = db_guard
             .list_documents(kernel_id)
             .map_err(|e| BlockStoreError::Db(e.to_string()))?;
-
         let agent_id = self.agent_id();
-        for doc in documents {
+
+        for doc in docs {
             let context_id = doc.document_id;
 
-            // Try to load snapshot for this document
-            let entry = if let Ok(Some(snapshot_record)) = db_guard.get_snapshot(context_id) {
-                if let Some(oplog_bytes) = snapshot_record.oplog_bytes {
-                    match postcard::from_bytes::<StoreSnapshot>(&oplog_bytes) {
+            // Load base snapshot if available
+            let (mut crdt_store, base_seq) = match db_guard.load_latest_snapshot(context_id) {
+                Ok(Some(snap_row)) => {
+                    match postcard::from_bytes::<StoreSnapshot>(&snap_row.state) {
                         Ok(store_snapshot) => {
                             tracing::debug!(
                                 document_id = %context_id.to_hex(),
                                 blocks = store_snapshot.blocks.len(),
-                                "Restored document from store snapshot"
+                                snap_seq = snap_row.seq,
+                                "Restored document from snapshot"
                             );
-                            DocumentEntry::from_store_snapshot(
-                                store_snapshot,
-                                doc.doc_kind,
-                                doc.language.clone(),
-                                agent_id,
-                            )
+                            match CrdtBlockStore::from_snapshot(store_snapshot, agent_id) {
+                                Ok(store) => (store, snap_row.seq),
+                                Err(e) => {
+                                    tracing::error!(document_id = %context_id.to_hex(), error = %e, "Failed to restore snapshot, skipping");
+                                    continue;
+                                }
+                            }
                         }
                         Err(e) => {
+                            tracing::error!(document_id = %context_id.to_hex(), error = %e, "Failed to deserialize snapshot, skipping");
+                            continue;
+                        }
+                    }
+                }
+                Ok(None) => (CrdtBlockStore::new(context_id, agent_id), 0),
+                Err(e) => {
+                    tracing::error!(document_id = %context_id.to_hex(), error = %e, "Failed to load snapshot, skipping");
+                    continue;
+                }
+            };
+
+            // Replay oplog entries since the snapshot
+            let oplog_entries = db_guard
+                .load_oplog_since(context_id, base_seq)
+                .map_err(|e| BlockStoreError::Db(e.to_string()))?;
+
+            let mut max_seq = base_seq;
+            let mut total_bytes: u64 = 0;
+            for (seq, payload_bytes) in &oplog_entries {
+                max_seq = max_seq.max(*seq);
+                total_bytes += payload_bytes.len() as u64;
+                match postcard::from_bytes::<SyncPayload>(payload_bytes) {
+                    Ok(payload) => {
+                        if let Err(e) = crdt_store.merge_ops(payload) {
                             tracing::error!(
                                 document_id = %context_id.to_hex(),
+                                seq = seq,
                                 error = %e,
-                                "Failed to deserialize store snapshot, skipping (wipe DB to recover)"
+                                "Failed to replay oplog entry, skipping document"
                             );
                             continue;
                         }
                     }
-                } else {
-                    DocumentEntry::new(context_id, doc.doc_kind, doc.language.clone(), agent_id)
+                    Err(e) => {
+                        tracing::error!(
+                            document_id = %context_id.to_hex(),
+                            seq = seq,
+                            error = %e,
+                            "Failed to deserialize oplog entry, skipping document"
+                        );
+                        continue;
+                    }
                 }
-            } else {
-                DocumentEntry::new(context_id, doc.doc_kind, doc.language.clone(), agent_id)
+            }
+
+            if !oplog_entries.is_empty() {
+                tracing::debug!(
+                    document_id = %context_id.to_hex(),
+                    replayed = oplog_entries.len(),
+                    max_seq = max_seq,
+                    "Replayed oplog entries"
+                );
+            }
+
+            let version = crdt_store.version();
+            let entry = DocumentEntry {
+                doc: crdt_store,
+                kind: doc.doc_kind,
+                language: doc.language.clone(),
+                version: AtomicU64::new(version),
+                last_agent: RwLock::new(agent_id),
+                sync_generation: AtomicU64::new(0),
+                next_journal_seq: AtomicU64::new(max_seq as u64),
+                uncompacted_count: AtomicU64::new(oplog_entries.len() as u64),
+                uncompacted_bytes: AtomicU64::new(total_bytes),
             };
 
             self.documents.insert(context_id, entry);
@@ -1598,14 +1799,19 @@ impl BlockStore {
     /// present or not found in the database. This is an explicit hydration
     /// path — not called automatically on `get()`.
     pub fn load_one_from_db(&self, context_id: ContextId) -> BlockStoreResult<bool> {
-        if self.documents.contains_key(&context_id) {
-            return Ok(false); // already loaded
-        }
+        use dashmap::mapref::entry::Entry;
 
         let db = self
             .db
             .as_ref()
             .ok_or(BlockStoreError::NoDatabaseConfigured)?;
+
+        // Use entry() for atomicity — only proceed if the slot is vacant.
+        let vacant = match self.documents.entry(context_id) {
+            Entry::Occupied(_) => return Ok(false), // already loaded
+            Entry::Vacant(v) => v,
+        };
+
         let db_guard = db.lock();
 
         let doc = db_guard
@@ -1617,65 +1823,97 @@ impl BlockStore {
         };
 
         let agent_id = self.agent_id();
-        let entry = if let Ok(Some(snapshot_record)) = db_guard.get_snapshot(context_id) {
-            if let Some(oplog_bytes) = snapshot_record.oplog_bytes {
-                match postcard::from_bytes::<StoreSnapshot>(&oplog_bytes) {
+
+        // Load base snapshot if available
+        let (mut crdt_store, base_seq) = match db_guard.load_latest_snapshot(context_id) {
+            Ok(Some(snap_row)) => {
+                match postcard::from_bytes::<StoreSnapshot>(&snap_row.state) {
                     Ok(store_snapshot) => {
                         tracing::debug!(
                             document_id = %context_id.to_hex(),
                             blocks = store_snapshot.blocks.len(),
-                            "Hydrated document from DB"
+                            snap_seq = snap_row.seq,
+                            "Hydrated document from snapshot"
                         );
-                        DocumentEntry::from_store_snapshot(
-                            store_snapshot,
-                            doc.doc_kind,
-                            doc.language.clone(),
-                            agent_id,
-                        )
+                        match CrdtBlockStore::from_snapshot(store_snapshot, agent_id) {
+                            Ok(store) => (store, snap_row.seq),
+                            Err(e) => {
+                                tracing::warn!(document_id = %context_id.to_hex(), error = %e, "Failed to restore snapshot");
+                                return Ok(false);
+                            }
+                        }
                     }
                     Err(e) => {
                         tracing::warn!(document_id = %context_id.to_hex(), error = %e, "Failed to deserialize snapshot");
                         return Ok(false);
                     }
                 }
-            } else {
+            }
+            Ok(None) => (CrdtBlockStore::new(context_id, agent_id), 0),
+            Err(e) => {
+                tracing::warn!(document_id = %context_id.to_hex(), error = %e, "Failed to load snapshot");
                 return Ok(false);
             }
-        } else {
-            return Ok(false);
         };
 
-        self.documents.insert(context_id, entry);
-        Ok(true)
-    }
-
-    /// Save a document's content to the database as a snapshot.
-    ///
-    /// Stores the StoreSnapshot as postcard binary in the `oplog_bytes` column.
-    pub fn save_snapshot(&self, context_id: ContextId) -> BlockStoreResult<()> {
-        let db = self
-            .db
-            .as_ref()
-            .ok_or(BlockStoreError::NoDatabaseConfigured)?;
-
-        let entry = self
-            .get(context_id)
-            .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
-        let snapshot = entry.doc.snapshot();
-        let version = entry.version() as i64;
-        let content = entry.content();
-
-        let snapshot_bytes = postcard::to_allocvec(&snapshot)
-            .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
-
-        drop(entry); // Release the read lock before acquiring DB lock
-
-        let db_guard = db.lock();
-        db_guard
-            .save_snapshot(context_id, version, &content, Some(&snapshot_bytes))
+        // Replay oplog entries since the snapshot
+        let oplog_entries = db_guard
+            .load_oplog_since(context_id, base_seq)
             .map_err(|e| BlockStoreError::Db(e.to_string()))?;
 
-        Ok(())
+        let mut max_seq = base_seq;
+        let mut total_bytes: u64 = 0;
+        for (seq, payload_bytes) in &oplog_entries {
+            max_seq = max_seq.max(*seq);
+            total_bytes += payload_bytes.len() as u64;
+            match postcard::from_bytes::<SyncPayload>(payload_bytes) {
+                Ok(payload) => {
+                    if let Err(e) = crdt_store.merge_ops(payload) {
+                        tracing::warn!(
+                            document_id = %context_id.to_hex(),
+                            seq = seq,
+                            error = %e,
+                            "Failed to replay oplog entry"
+                        );
+                        return Ok(false);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        document_id = %context_id.to_hex(),
+                        seq = seq,
+                        error = %e,
+                        "Failed to deserialize oplog entry"
+                    );
+                    return Ok(false);
+                }
+            }
+        }
+
+        if !oplog_entries.is_empty() {
+            tracing::debug!(
+                document_id = %context_id.to_hex(),
+                replayed = oplog_entries.len(),
+                max_seq = max_seq,
+                "Replayed oplog entries"
+            );
+        }
+
+        let version = crdt_store.version();
+        let entry = DocumentEntry {
+            doc: crdt_store,
+            kind: doc.doc_kind,
+            language: doc.language.clone(),
+            version: AtomicU64::new(version),
+            last_agent: RwLock::new(agent_id),
+            sync_generation: AtomicU64::new(0),
+            next_journal_seq: AtomicU64::new(max_seq as u64),
+            uncompacted_count: AtomicU64::new(oplog_entries.len() as u64),
+            uncompacted_bytes: AtomicU64::new(total_bytes),
+        };
+
+        vacant.insert(entry);
+        Ok(true)
     }
 
     // =========================================================================
@@ -1702,6 +1940,7 @@ impl BlockStore {
     /// Create an input document for a context.
     ///
     /// Idempotent — returns Ok if the input doc already exists.
+    /// The input doc is persisted to DB lazily when the first edit is journaled.
     pub fn create_input_doc(&self, context_id: ContextId) -> BlockStoreResult<()> {
         use dashmap::mapref::entry::Entry;
 
@@ -1710,13 +1949,6 @@ impl BlockStore {
             Entry::Vacant(vacant) => {
                 let agent_id = self.agent_id();
                 let entry = InputDocEntry::new(agent_id);
-
-                // Persist if we have a DB
-                if let Some(db) = &self.db {
-                    let db_guard = db.lock();
-                    let _ = db_guard.create_input_doc(context_id);
-                }
-
                 vacant.insert(entry);
                 Ok(())
             }
@@ -1741,6 +1973,20 @@ impl BlockStore {
         let ops = entry
             .edit_text(pos, insert, delete)
             .map_err(BlockStoreError::Serialization)?;
+        drop(entry);
+
+        // Journal the input op
+        if let Some(db) = &self.db {
+            let seq_entry = self
+                .input_journal_seqs
+                .entry(context_id)
+                .or_insert_with(|| AtomicU64::new(0));
+            let seq = seq_entry.fetch_add(1, Ordering::SeqCst) + 1;
+            let db_guard = db.lock();
+            db_guard
+                .append_input_op(context_id, seq as i64, &ops)
+                .map_err(|e| BlockStoreError::Db(e.to_string()))?;
+        }
 
         self.emit_input(InputDocFlow::TextOps {
             context_id,
@@ -1805,13 +2051,29 @@ impl BlockStore {
             .merge_ops(ops_bytes)
             .map_err(BlockStoreError::Serialization)?;
 
+        let version = entry.version();
+        drop(entry);
+
+        // Journal the merged input op
+        if let Some(db) = &self.db {
+            let seq_entry = self
+                .input_journal_seqs
+                .entry(context_id)
+                .or_insert_with(|| AtomicU64::new(0));
+            let seq = seq_entry.fetch_add(1, Ordering::SeqCst) + 1;
+            let db_guard = db.lock();
+            db_guard
+                .append_input_op(context_id, seq as i64, ops_bytes)
+                .map_err(|e| BlockStoreError::Db(e.to_string()))?;
+        }
+
         self.emit_input(InputDocFlow::TextOps {
             context_id,
             ops: Arc::from(ops_bytes.to_vec()),
             source: crate::flows::OpSource::Remote,
         });
 
-        Ok(entry.version())
+        Ok(version)
     }
 
     /// Clear the input document for a context.
@@ -1823,76 +2085,106 @@ impl BlockStore {
             .get_mut(&context_id)
             .ok_or(BlockStoreError::InputDocNotFound(context_id))?;
 
-        let (text, _ops) = entry.clear().map_err(BlockStoreError::Serialization)?;
+        let (text, ops) = entry.clear().map_err(BlockStoreError::Serialization)?;
+        drop(entry);
 
         self.emit_input(InputDocFlow::Cleared { context_id });
 
-        // Persist cleared state
-        if let Some(db) = &self.db {
-            let db_guard = db.lock();
-            let _ = db_guard.clear_input_doc(context_id);
+        // Journal the clear op
+        if !ops.is_empty() {
+            if let Some(db) = &self.db {
+                let seq_entry = self
+                    .input_journal_seqs
+                    .entry(context_id)
+                    .or_insert_with(|| AtomicU64::new(0));
+                let seq = seq_entry.fetch_add(1, Ordering::SeqCst) + 1;
+                let db_guard = db.lock();
+                db_guard
+                    .append_input_op(context_id, seq as i64, &ops)
+                    .map_err(|e| BlockStoreError::Db(e.to_string()))?;
+            }
         }
 
         Ok(text)
     }
 
-    /// Save the current input document state to the database.
-    pub fn save_input_snapshot(&self, context_id: ContextId) -> BlockStoreResult<()> {
-        let db = self
-            .db
-            .as_ref()
-            .ok_or(BlockStoreError::NoDatabaseConfigured)?;
-
-        let entry = self
-            .input_docs
-            .get(&context_id)
-            .ok_or(BlockStoreError::InputDocNotFound(context_id))?;
-
-        let text = entry.get_text();
-        let ops_bytes = entry.all_ops().map_err(BlockStoreError::Serialization)?;
-        let version = entry.version() as i64;
-        drop(entry);
-
-        let db_guard = db.lock();
-        db_guard
-            .upsert_input_doc(context_id, &text, Some(&ops_bytes), version)
-            .map_err(|e| BlockStoreError::Db(e.to_string()))?;
-
-        Ok(())
-    }
-
     /// Load input documents from database on startup.
+    ///
+    /// Restores each input doc from its latest snapshot (if any) then replays
+    /// oplog entries written after that snapshot.
     pub fn load_input_docs_from_db(&self) -> BlockStoreResult<()> {
         let db = self
             .db
             .as_ref()
             .ok_or(BlockStoreError::NoDatabaseConfigured)?;
         let db_guard = db.lock();
+        let kernel_id = self
+            .kernel_id
+            .ok_or_else(|| BlockStoreError::Db("no kernel_id configured".into()))?;
 
-        let rows = db_guard
-            .list_input_docs()
+        let doc_ids = db_guard
+            .list_input_doc_ids(kernel_id)
             .map_err(|e| BlockStoreError::Db(e.to_string()))?;
-        drop(db_guard);
 
         let agent_id = self.agent_id();
 
-        for (context_id, oplog_bytes) in rows {
-            let entry = if let Some(ops_bytes) = oplog_bytes {
-                match InputDocEntry::from_ops(&ops_bytes, agent_id) {
-                    Ok(entry) => {
-                        tracing::debug!(context_id = %context_id.to_hex(), text_len = entry.get_text().len(), "Restored input doc from oplog");
-                        entry
+        for context_id in doc_ids {
+            // Load base snapshot if available
+            let (mut input_entry, base_seq) =
+                match db_guard.load_latest_input_snapshot(context_id) {
+                    Ok(Some(snap_row)) => {
+                        match InputDocEntry::from_ops(&snap_row.state, agent_id) {
+                            Ok(entry) => {
+                                tracing::debug!(
+                                    context_id = %context_id.to_hex(),
+                                    snap_seq = snap_row.seq,
+                                    "Restored input doc from snapshot"
+                                );
+                                (entry, snap_row.seq)
+                            }
+                            Err(e) => {
+                                tracing::warn!(context_id = %context_id.to_hex(), error = %e, "Failed to restore input snapshot, creating empty");
+                                (InputDocEntry::new(agent_id), 0)
+                            }
+                        }
                     }
+                    Ok(None) => (InputDocEntry::new(agent_id), 0),
                     Err(e) => {
-                        tracing::warn!(context_id = %context_id.to_hex(), error = %e, "Failed to restore input doc, creating empty");
-                        InputDocEntry::new(agent_id)
+                        tracing::warn!(context_id = %context_id.to_hex(), error = %e, "Failed to load input snapshot, creating empty");
+                        (InputDocEntry::new(agent_id), 0)
                     }
-                }
-            } else {
-                InputDocEntry::new(agent_id)
-            };
+                };
 
-            self.input_docs.insert(context_id, entry);
+            // Replay oplog entries since the snapshot
+            let oplog_entries = db_guard
+                .load_input_oplog_since(context_id, base_seq)
+                .map_err(|e| BlockStoreError::Db(e.to_string()))?;
+
+            let mut max_seq = base_seq;
+            for (seq, payload_bytes) in &oplog_entries {
+                max_seq = max_seq.max(*seq);
+                if let Err(e) = input_entry.merge_ops(payload_bytes) {
+                    tracing::warn!(
+                        context_id = %context_id.to_hex(),
+                        seq = seq,
+                        error = %e,
+                        "Failed to replay input oplog entry, skipping"
+                    );
+                }
+            }
+
+            if !oplog_entries.is_empty() {
+                tracing::debug!(
+                    context_id = %context_id.to_hex(),
+                    replayed = oplog_entries.len(),
+                    text_len = input_entry.get_text().len(),
+                    "Replayed input oplog entries"
+                );
+            }
+
+            self.input_docs.insert(context_id, input_entry);
+            self.input_journal_seqs
+                .insert(context_id, AtomicU64::new(max_seq as u64));
         }
 
         Ok(())
@@ -1937,7 +2229,7 @@ impl BlockStore {
         agent_id: Option<PrincipalId>,
     ) -> BlockStoreResult<BlockId> {
         let after_id = after.cloned();
-        let (block_id, snapshot, ops) = {
+        let (block_id, snapshot, ops, ops_bytes) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
@@ -1963,15 +2255,15 @@ impl BlockStore {
             let ops_bytes = postcard::to_allocvec(&ops)
                 .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
             entry.touch(effective_agent);
-            (block_id, snapshot, ops_bytes)
+            (block_id, snapshot, ops, ops_bytes)
         };
-        self.auto_save(context_id);
+        self.journal_op(context_id, ops)?;
 
         self.emit(BlockFlow::Inserted {
             context_id,
             block: Arc::new(snapshot),
             after_id,
-            ops: Arc::from(ops),
+            ops: Arc::from(ops_bytes),
             source: OpSource::Local,
         });
 
@@ -2548,7 +2840,7 @@ mod tests {
 
         // Client syncs from snapshot
         let snapshot = store.get(ctx).unwrap().doc.snapshot();
-        let mut client = CrdtBlockStore::from_snapshot(snapshot, PrincipalId::new());
+        let mut client = CrdtBlockStore::from_snapshot(snapshot, PrincipalId::new()).unwrap();
         assert_eq!(client.block_count(), 0);
 
         // Server inserts a block
@@ -2599,7 +2891,7 @@ mod tests {
             .unwrap();
 
         let snapshot = store.get(ctx).unwrap().doc.snapshot();
-        let mut client = CrdtBlockStore::from_snapshot(snapshot, PrincipalId::new());
+        let mut client = CrdtBlockStore::from_snapshot(snapshot, PrincipalId::new()).unwrap();
 
         let block_id = store
             .insert_tool_call(
@@ -2640,7 +2932,7 @@ mod tests {
             .unwrap();
 
         let snapshot = store.get(ctx).unwrap().doc.snapshot();
-        let mut client = CrdtBlockStore::from_snapshot(snapshot, PrincipalId::new());
+        let mut client = CrdtBlockStore::from_snapshot(snapshot, PrincipalId::new()).unwrap();
 
         for i in 0..5 {
             let _ = store
@@ -2983,18 +3275,25 @@ mod tests {
             content,
         );
 
-        // DB should also have the merged content (no explicit save_snapshot call).
+        // DB should have oplog entries from journal_op.
         let db_guard = db.lock();
-        let snapshot = db_guard.get_snapshot(ctx).unwrap();
+        let oplog_entries = db_guard.load_oplog_since(ctx, 0).unwrap();
         assert!(
-            snapshot.is_some(),
-            "merge_ops should auto_save — DB snapshot must exist",
+            !oplog_entries.is_empty(),
+            "merge_ops should journal ops to the oplog",
         );
-        let snapshot = snapshot.unwrap();
+
+        // Verify the oplog can be replayed to reconstruct the merged content.
+        let mut replay_store = CrdtBlockStore::new(ctx, creator);
+        for (_seq, payload_bytes) in &oplog_entries {
+            let payload: SyncPayload = postcard::from_bytes(payload_bytes).unwrap();
+            replay_store.merge_ops(payload).unwrap();
+        }
+        let replayed_content = replay_store.full_text();
         assert!(
-            snapshot.content.contains("merge_ops persistence test"),
-            "DB snapshot after merge_ops should contain merged content, got: {:?}",
-            snapshot.content,
+            replayed_content.contains("merge_ops persistence test"),
+            "Replayed oplog should produce merged content, got: {:?}",
+            replayed_content,
         );
     }
 }

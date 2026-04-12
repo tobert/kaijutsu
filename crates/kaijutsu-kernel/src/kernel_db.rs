@@ -140,13 +140,24 @@ pub struct DocumentRow {
     pub created_by: PrincipalId,
 }
 
-/// A snapshot row — serialized CRDT state.
+/// A doc_snapshots row — compaction checkpoint.
 #[derive(Debug, Clone)]
-pub struct SnapshotRow {
+pub struct DocSnapshotRow {
     pub document_id: ContextId,
+    pub seq: i64,
     pub version: i64,
+    pub state: Vec<u8>,
     pub content: String,
-    pub oplog_bytes: Option<Vec<u8>>,
+    pub created_at: i64,
+}
+
+/// An input_doc_snapshots row — compaction checkpoint for input docs.
+#[derive(Debug, Clone)]
+pub struct InputDocSnapshotRow {
+    pub document_id: ContextId,
+    pub seq: i64,
+    pub state: Vec<u8>,
+    pub content: String,
     pub created_at: i64,
 }
 
@@ -288,24 +299,45 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_structural_unique
 CREATE INDEX IF NOT EXISTS idx_edges_source ON context_edges(source_id);
 CREATE INDEX IF NOT EXISTS idx_edges_target ON context_edges(target_id);
 
--- ── Snapshots ───────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS snapshots (
-    document_id BLOB NOT NULL PRIMARY KEY
-        REFERENCES documents(document_id) ON DELETE CASCADE,
+-- ── Op-Log Persistence ──────────────────────────────────────────
+-- Append-only journal: each mutation writes one row with the delta.
+CREATE TABLE IF NOT EXISTS oplog (
+    document_id BLOB    NOT NULL,
+    seq         INTEGER NOT NULL,
+    payload     BLOB    NOT NULL,
+    created_at  INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
+    PRIMARY KEY (document_id, seq),
+    FOREIGN KEY (document_id) REFERENCES documents(document_id) ON DELETE CASCADE
+) WITHOUT ROWID;
+
+-- Compaction checkpoints: latest snapshot per document.
+CREATE TABLE IF NOT EXISTS doc_snapshots (
+    document_id BLOB    NOT NULL PRIMARY KEY,
+    seq         INTEGER NOT NULL,
     version     INTEGER NOT NULL,
-    content     TEXT NOT NULL,
-    oplog_bytes BLOB,
-    created_at  INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER))
+    state       BLOB    NOT NULL,
+    content     TEXT    NOT NULL,
+    created_at  INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
+    FOREIGN KEY (document_id) REFERENCES documents(document_id) ON DELETE CASCADE
 );
 
--- ── Input Documents ─────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS input_docs (
-    document_id BLOB NOT NULL PRIMARY KEY
-        REFERENCES documents(document_id) ON DELETE CASCADE,
-    content     TEXT NOT NULL DEFAULT '',
-    oplog_bytes BLOB,
-    version     INTEGER NOT NULL DEFAULT 0,
-    updated_at  INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER))
+-- ── Input Document Op-Log ───────────────────────────────────────
+CREATE TABLE IF NOT EXISTS input_oplog (
+    document_id BLOB    NOT NULL,
+    seq         INTEGER NOT NULL,
+    payload     BLOB    NOT NULL,
+    created_at  INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
+    PRIMARY KEY (document_id, seq),
+    FOREIGN KEY (document_id) REFERENCES documents(document_id) ON DELETE CASCADE
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS input_doc_snapshots (
+    document_id BLOB    NOT NULL PRIMARY KEY,
+    seq         INTEGER NOT NULL,
+    state       BLOB    NOT NULL,
+    content     TEXT    NOT NULL,
+    created_at  INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
+    FOREIGN KEY (document_id) REFERENCES documents(document_id) ON DELETE CASCADE
 );
 
 -- ── Context Shell / Env ─────────────────────────────────────────
@@ -839,43 +871,147 @@ impl KernelDb {
     }
 
     // ========================================================================
-    // Snapshots
+    // Op-Log Persistence
     // ========================================================================
 
-    /// Save (upsert) a snapshot for a document.
-    pub fn save_snapshot(
+    /// Append an op to the journal for a document.
+    pub fn append_op(
         &self,
         document_id: ContextId,
-        version: i64,
-        content: &str,
-        oplog_bytes: Option<&[u8]>,
+        seq: i64,
+        payload: &[u8],
     ) -> KernelDbResult<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO snapshots (document_id, version, content, oplog_bytes)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![
-                blob_param(document_id.as_bytes()),
-                version,
-                content,
-                oplog_bytes,
-            ],
+            "INSERT INTO oplog (document_id, seq, payload) VALUES (?1, ?2, ?3)",
+            params![blob_param(document_id.as_bytes()), seq, payload],
         )?;
         Ok(())
     }
 
-    /// Get the snapshot for a document.
-    pub fn get_snapshot(&self, document_id: ContextId) -> KernelDbResult<Option<SnapshotRow>> {
+    /// Load oplog entries after a given seq (for replay after snapshot restore).
+    pub fn load_oplog_since(
+        &self,
+        document_id: ContextId,
+        after_seq: i64,
+    ) -> KernelDbResult<Vec<(i64, Vec<u8>)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT document_id, version, content, oplog_bytes, created_at
-             FROM snapshots WHERE document_id = ?1",
+            "SELECT seq, payload FROM oplog
+             WHERE document_id = ?1 AND seq > ?2
+             ORDER BY seq",
+        )?;
+        let rows = stmt.query_map(
+            params![blob_param(document_id.as_bytes()), after_seq],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
+    }
+
+    /// Load the latest compaction snapshot for a document.
+    pub fn load_latest_snapshot(
+        &self,
+        document_id: ContextId,
+    ) -> KernelDbResult<Option<DocSnapshotRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT document_id, seq, version, state, content, created_at
+             FROM doc_snapshots WHERE document_id = ?1",
         )?;
         let mut rows = stmt.query(params![blob_param(document_id.as_bytes())])?;
         if let Some(row) = rows.next()? {
-            Ok(Some(SnapshotRow {
+            Ok(Some(DocSnapshotRow {
                 document_id: read_context_id(row, 0)?,
-                version: row.get(1)?,
-                content: row.get(2)?,
-                oplog_bytes: row.get(3)?,
+                seq: row.get(1)?,
+                version: row.get(2)?,
+                state: row.get(3)?,
+                content: row.get(4)?,
+                created_at: row.get(5)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Write a compaction snapshot and truncate the oplog up to that seq.
+    /// Must be called with exclusive access (the Mutex guarantees this).
+    pub fn write_snapshot_and_truncate(
+        &mut self,
+        document_id: ContextId,
+        seq: i64,
+        version: i64,
+        state: &[u8],
+        content: &str,
+    ) -> KernelDbResult<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT OR REPLACE INTO doc_snapshots (document_id, seq, version, state, content)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                blob_param(document_id.as_bytes()),
+                seq,
+                version,
+                state,
+                content,
+            ],
+        )?;
+        tx.execute(
+            "DELETE FROM oplog WHERE document_id = ?1 AND seq <= ?2",
+            params![blob_param(document_id.as_bytes()), seq],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    // ========================================================================
+    // Input Document Op-Log
+    // ========================================================================
+
+    /// Append an input doc op to the journal.
+    pub fn append_input_op(
+        &self,
+        document_id: ContextId,
+        seq: i64,
+        payload: &[u8],
+    ) -> KernelDbResult<()> {
+        self.conn.execute(
+            "INSERT INTO input_oplog (document_id, seq, payload) VALUES (?1, ?2, ?3)",
+            params![blob_param(document_id.as_bytes()), seq, payload],
+        )?;
+        Ok(())
+    }
+
+    /// Load input oplog entries after a given seq.
+    pub fn load_input_oplog_since(
+        &self,
+        document_id: ContextId,
+        after_seq: i64,
+    ) -> KernelDbResult<Vec<(i64, Vec<u8>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT seq, payload FROM input_oplog
+             WHERE document_id = ?1 AND seq > ?2
+             ORDER BY seq",
+        )?;
+        let rows = stmt.query_map(
+            params![blob_param(document_id.as_bytes()), after_seq],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
+    }
+
+    /// Load the latest input doc compaction snapshot.
+    pub fn load_latest_input_snapshot(
+        &self,
+        document_id: ContextId,
+    ) -> KernelDbResult<Option<InputDocSnapshotRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT document_id, seq, state, content, created_at
+             FROM input_doc_snapshots WHERE document_id = ?1",
+        )?;
+        let mut rows = stmt.query(params![blob_param(document_id.as_bytes())])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(InputDocSnapshotRow {
+                document_id: read_context_id(row, 0)?,
+                seq: row.get(1)?,
+                state: row.get(2)?,
+                content: row.get(3)?,
                 created_at: row.get(4)?,
             }))
         } else {
@@ -883,61 +1019,48 @@ impl KernelDb {
         }
     }
 
-    // ========================================================================
-    // Input Documents
-    // ========================================================================
-
-    /// Create or update an input document.
-    pub fn upsert_input_doc(
-        &self,
+    /// Write an input doc compaction snapshot and truncate its oplog.
+    pub fn write_input_snapshot_and_truncate(
+        &mut self,
         document_id: ContextId,
+        seq: i64,
+        state: &[u8],
         content: &str,
-        oplog_bytes: Option<&[u8]>,
-        version: i64,
     ) -> KernelDbResult<()> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO input_docs (document_id, content, oplog_bytes, version, updated_at)
-             VALUES (?1, ?2, ?3, ?4, CAST((unixepoch('subsec') * 1000) AS INTEGER))",
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT OR REPLACE INTO input_doc_snapshots (document_id, seq, state, content)
+             VALUES (?1, ?2, ?3, ?4)",
             params![
                 blob_param(document_id.as_bytes()),
+                seq,
+                state,
                 content,
-                oplog_bytes,
-                version,
             ],
         )?;
-        Ok(())
-    }
-
-    /// Create an empty input document (idempotent).
-    pub fn create_input_doc(&self, document_id: ContextId) -> KernelDbResult<()> {
-        self.conn.execute(
-            "INSERT OR IGNORE INTO input_docs (document_id, content, version) VALUES (?1, '', 0)",
-            params![blob_param(document_id.as_bytes())],
+        tx.execute(
+            "DELETE FROM input_oplog WHERE document_id = ?1 AND seq <= ?2",
+            params![blob_param(document_id.as_bytes()), seq],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
-    /// Clear an input document's content.
-    pub fn clear_input_doc(&self, document_id: ContextId) -> KernelDbResult<()> {
-        self.conn.execute(
-            "UPDATE input_docs SET content = '', oplog_bytes = NULL, version = version + 1,
-             updated_at = CAST((unixepoch('subsec') * 1000) AS INTEGER)
-             WHERE document_id = ?1",
-            params![blob_param(document_id.as_bytes())],
+    /// List document IDs that have input oplog entries or snapshots.
+    pub fn list_input_doc_ids(
+        &self,
+        kernel_id: KernelId,
+    ) -> KernelDbResult<Vec<ContextId>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT d.document_id FROM documents d
+             WHERE d.kernel_id = ?1
+               AND (EXISTS (SELECT 1 FROM input_oplog o WHERE o.document_id = d.document_id)
+                 OR EXISTS (SELECT 1 FROM input_doc_snapshots s WHERE s.document_id = d.document_id))",
         )?;
-        Ok(())
-    }
-
-    /// Load all input documents (document_id BLOB + oplog_bytes).
-    pub fn list_input_docs(&self) -> KernelDbResult<Vec<(ContextId, Option<Vec<u8>>)>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT document_id, oplog_bytes FROM input_docs")?;
-        let rows = stmt.query_map([], |row| {
-            let doc_id = read_context_id(row, 0)?;
-            let oplog_bytes: Option<Vec<u8>> = row.get(1)?;
-            Ok((doc_id, oplog_bytes))
-        })?;
+        let rows = stmt.query_map(
+            params![blob_param(kernel_id.as_bytes())],
+            |row| read_context_id(row, 0),
+        )?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
     }
 

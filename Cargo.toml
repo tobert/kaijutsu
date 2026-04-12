@@ -13,6 +13,7 @@ members = [
     "crates/kaijutsu-index",
     "crates/kaijutsu-rhai",
     "crates/kaijutsu-abc",
+    "crates/kaijutsu-cas",
 ]
 
 [workspace.package]
@@ -24,6 +25,9 @@ repository = "https://github.com/atobey/kaijutsu"
 [workspace.dependencies]
 # ABC music notation parser and engraver
 kaijutsu-abc = { path = "crates/kaijutsu-abc" }
+
+# Kaijutsu CAS (content-addressed storage — leaf crate, no internal deps)
+kaijutsu-cas = { path = "crates/kaijutsu-cas" }
 
 # Kaijutsu types (shared identity + block types — leaf crate, no internal deps)
 kaijutsu-types = { path = "crates/kaijutsu-types" }

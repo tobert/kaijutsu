@@ -1,0 +1,18 @@
+[package]
+name = "kaijutsu-cas"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Content Addressable Storage for Kaijutsu"
+
+[dependencies]
+blake3 = "1"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

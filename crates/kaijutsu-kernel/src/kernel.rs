@@ -8,11 +8,13 @@
 //! - Control plane (consent mode)
 
 use async_trait::async_trait;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use uuid::Uuid;
+
+use kaijutsu_cas::FileStore;
 
 use crate::agents::{
     AgentActivityEvent, AgentCapability, AgentConfig, AgentError, AgentInfo, AgentRegistry,
@@ -53,6 +55,8 @@ pub struct Kernel {
     block_flows: SharedBlockFlowBus,
     /// DriftRouter for cross-context communication.
     drift: SharedDriftRouter,
+    /// Content-addressed store for binary blobs (images, etc.).
+    cas: Arc<FileStore>,
 }
 
 impl std::fmt::Debug for Kernel {
@@ -71,9 +75,28 @@ impl std::fmt::Debug for Kernel {
 /// Default capacity for the block flow bus.
 const DEFAULT_FLOW_CAPACITY: usize = 1024;
 
+fn default_data_dir() -> PathBuf {
+    kaish_kernel::xdg_data_home()
+        .join("kaijutsu")
+        .join("kernel")
+}
+
 impl Kernel {
+    /// Resolve the CAS base path from a data_dir.
+    fn cas_for_data_dir(data_dir: Option<&Path>) -> Arc<FileStore> {
+        let cas_path = match data_dir {
+            Some(dir) => dir.join("cas"),
+            None => default_data_dir().join("cas"),
+        };
+        Arc::new(FileStore::at_path(cas_path))
+    }
+
     /// Create a new kernel with the given name.
-    pub async fn new(name: impl Into<String>) -> Self {
+    ///
+    /// `data_dir` is the kernel's on-disk data directory. Pass `None` to use
+    /// the XDG default (`~/.local/share/kaijutsu/kernel`). CAS lives at
+    /// `{data_dir}/cas/` and creates directories lazily on first write.
+    pub async fn new(name: impl Into<String>, data_dir: Option<&Path>) -> Self {
         let name = name.into();
         let vfs = Arc::new(MountTable::new());
 
@@ -87,6 +110,7 @@ impl Kernel {
             consent_mode: RwLock::new(ConsentMode::default()),
             block_flows: shared_block_flow_bus(DEFAULT_FLOW_CAPACITY),
             drift: shared_drift_router(),
+            cas: Self::cas_for_data_dir(data_dir),
         }
     }
 
@@ -94,7 +118,11 @@ impl Kernel {
     ///
     /// Use this when you need to share the flow bus with other components
     /// (like BlockStore) before creating the kernel.
-    pub async fn with_flows(name: impl Into<String>, block_flows: SharedBlockFlowBus) -> Self {
+    pub async fn with_flows(
+        name: impl Into<String>,
+        block_flows: SharedBlockFlowBus,
+        data_dir: Option<&Path>,
+    ) -> Self {
         let name = name.into();
         let vfs = Arc::new(MountTable::new());
 
@@ -108,6 +136,7 @@ impl Kernel {
             consent_mode: RwLock::new(ConsentMode::default()),
             block_flows,
             drift: shared_drift_router(),
+            cas: Self::cas_for_data_dir(data_dir),
         }
     }
 
@@ -119,6 +148,11 @@ impl Kernel {
     /// Get the drift router.
     pub fn drift(&self) -> &SharedDriftRouter {
         &self.drift
+    }
+
+    /// Get the content-addressed store.
+    pub fn cas(&self) -> &Arc<FileStore> {
+        &self.cas
     }
 
     // ========================================================================
@@ -636,13 +670,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_kernel_creation() {
-        let kernel = Kernel::new("test").await;
+        let kernel = Kernel::new("test", None).await;
         assert_eq!(kernel.name().await, "test");
     }
 
     #[tokio::test]
     async fn test_variables() {
-        let kernel = Kernel::new("test").await;
+        let kernel = Kernel::new("test", None).await;
 
         kernel.set_var("FOO", "bar").await;
         assert_eq!(kernel.get_var("FOO").await, Some("bar".to_string()));
@@ -653,7 +687,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_history() {
-        let kernel = Kernel::new("test").await;
+        let kernel = Kernel::new("test", None).await;
 
         kernel.add_history("echo hello").await;
         kernel.add_history("ls -la").await;
@@ -665,7 +699,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_tools() {
-        let kernel = Kernel::new("test").await;
+        let kernel = Kernel::new("test", None).await;
 
         kernel
             .register_tool_with_engine(
@@ -682,7 +716,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_llm_provider() {
-        let kernel = Kernel::new("test").await;
+        let kernel = Kernel::new("test", None).await;
 
         // Register a provider (uses fake key, won't actually call API)
         let provider = Arc::new(RigProvider::Anthropic(
@@ -698,7 +732,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_llm_no_provider() {
-        let kernel = Kernel::new("test").await;
+        let kernel = Kernel::new("test", None).await;
 
         // Should fail gracefully without provider
         let result = kernel.llm().read().await.prompt("Hello").await;

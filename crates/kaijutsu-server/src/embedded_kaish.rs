@@ -332,7 +332,7 @@ mod tests {
     #[tokio::test]
     async fn test_embedded_kaish_creation() {
         let blocks = shared_block_store(kaijutsu_types::PrincipalId::system());
-        let kernel = Arc::new(KaijutsuKernel::new("test-agent").await);
+        let kernel = Arc::new(KaijutsuKernel::new("test-agent", None).await);
 
         let kaish = EmbeddedKaish::new("test-kernel", blocks, kernel, None);
         assert!(kaish.is_ok());
@@ -344,7 +344,7 @@ mod tests {
     #[tokio::test]
     async fn test_embedded_kaish_variables() {
         let blocks = shared_block_store(kaijutsu_types::PrincipalId::system());
-        let kernel = Arc::new(KaijutsuKernel::new("test-vars").await);
+        let kernel = Arc::new(KaijutsuKernel::new("test-vars", None).await);
         let kaish = EmbeddedKaish::new("test-vars", blocks, kernel, None).unwrap();
 
         // Set and get a variable
@@ -363,7 +363,7 @@ mod tests {
     #[tokio::test]
     async fn test_named_config_cwd_is_home() {
         let blocks = shared_block_store(kaijutsu_types::PrincipalId::system());
-        let kernel = Arc::new(KaijutsuKernel::new("test-cwd-home").await);
+        let kernel = Arc::new(KaijutsuKernel::new("test-cwd-home", None).await);
         let kaish = EmbeddedKaish::new("test-cwd-home", blocks, kernel, None).unwrap();
 
         let cwd = kaish.cwd().await;
@@ -381,7 +381,7 @@ mod tests {
     async fn test_mcp_config_cwd_is_project_root() {
         let tmp = tempfile::tempdir().unwrap();
         let blocks = shared_block_store(kaijutsu_types::PrincipalId::system());
-        let kernel = Arc::new(KaijutsuKernel::new("test-cwd-project").await);
+        let kernel = Arc::new(KaijutsuKernel::new("test-cwd-project", None).await);
         let kaish = EmbeddedKaish::new(
             "test-cwd-project",
             blocks,
@@ -447,7 +447,7 @@ mod tests {
 
         let kernel_db = Arc::new(parking_lot::Mutex::new(db));
         let blocks = shared_block_store(principal);
-        let kernel = Arc::new(KaijutsuKernel::new("test-env").await);
+        let kernel = Arc::new(KaijutsuKernel::new("test-env", None).await);
 
         let sid = SessionId::new();
         let session_contexts = crate::context_engine::session_context_map();
@@ -536,7 +536,7 @@ mod tests {
 
         let kernel_db = Arc::new(parking_lot::Mutex::new(db));
         let blocks = shared_block_store(principal);
-        let kernel = Arc::new(KaijutsuKernel::new("test-init").await);
+        let kernel = Arc::new(KaijutsuKernel::new("test-init", None).await);
 
         let sid = SessionId::new();
         let session_contexts = crate::context_engine::session_context_map();
@@ -635,7 +635,7 @@ mod tests {
         // Create EmbeddedKaish the same way rpc.rs does: no project_root,
         // relying on the persisted context_shell.cwd to be restored.
         let blocks = shared_block_store(principal);
-        let kernel = Arc::new(KaijutsuKernel::new("test-restore").await);
+        let kernel = Arc::new(KaijutsuKernel::new("test-restore", None).await);
 
         let sid = SessionId::new();
         let session_contexts = crate::context_engine::session_context_map();

@@ -1538,10 +1538,7 @@ mod tests {
         (store, ctx, tool_ctx)
     }
 
-    /// April-showers issue #1: block_append and block_edit skip auto_save
-    /// ("high frequency during streaming"). Mutations made outside LLM
-    /// streaming (e.g. user tool calls) are never persisted unless something
-    /// else calls save_snapshot.
+    /// Verify that block_create and block_append both journal ops to the oplog.
     #[tokio::test]
     async fn test_block_append_persists_to_db() {
         use crate::kernel_db::{DocumentRow, KernelDb};
@@ -1597,13 +1594,13 @@ mod tests {
         let result = engine.execute(params, &tool_ctx).await.unwrap();
         assert!(result.success);
 
-        // Verify creation was persisted
+        // Verify creation was persisted (journal_op writes to oplog)
         {
             let db_guard = db.lock();
-            let snapshot = db_guard.get_snapshot(ctx).unwrap().unwrap();
+            let entries = db_guard.load_oplog_since(ctx, 0).unwrap();
             assert!(
-                snapshot.content.contains("hello"),
-                "block_create should persist (it calls auto_save)"
+                !entries.is_empty(),
+                "block_create should journal ops to the oplog"
             );
         }
 
@@ -1623,15 +1620,13 @@ mod tests {
         // In-memory store has the append
         assert_eq!(store.get_content(ctx).unwrap(), "hello world");
 
-        // append_text_as skips auto_save (high-frequency streaming path),
-        // so callers must flush explicitly when the turn completes.
-        store.save_snapshot(ctx).unwrap();
+        // append_text_as now journals each op, so the oplog should have more entries.
         let db_guard = db.lock();
-        let snapshot = db_guard.get_snapshot(ctx).unwrap().unwrap();
-        assert_eq!(
-            snapshot.content, "hello world",
-            "block_append should persist to DB, but snapshot still has: {:?}",
-            snapshot.content,
+        let entries = db_guard.load_oplog_since(ctx, 0).unwrap();
+        assert!(
+            entries.len() >= 2,
+            "block_append should journal ops to the oplog, got {} entries",
+            entries.len(),
         );
     }
 

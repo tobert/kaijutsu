@@ -138,7 +138,7 @@ impl TestFs {
 /// Mounts the test fixture into the kernel's VFS so `ls`, `cat`, etc. resolve
 /// against the tempdir, not the host system.
 async fn setup_shell_e2e(fs: &TestFs, project_root: Option<std::path::PathBuf>) -> EmbeddedKaish {
-    let kernel = Arc::new(Kernel::new("e2e-shell").await);
+    let kernel = Arc::new(Kernel::new("e2e-shell", None).await);
     let documents = shared_block_store(PrincipalId::system());
 
     documents

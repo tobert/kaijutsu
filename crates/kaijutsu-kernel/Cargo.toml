@@ -21,6 +21,7 @@ regex = "1"
 diamond-types-extended.workspace = true
 kaijutsu-crdt = { path = "../kaijutsu-crdt" }
 kaijutsu-types = { path = "../kaijutsu-types" }
+kaijutsu-cas = { path = "../kaijutsu-cas" }
 
 # Concurrency
 dashmap = "6"
@@ -50,6 +51,7 @@ rig-core.workspace = true
 
 # File pattern matching (gitignore + globstar support)
 kaish-glob = { workspace = true }
+kaish-kernel = { workspace = true }
 
 # Path expansion
 shellexpand.workspace = true

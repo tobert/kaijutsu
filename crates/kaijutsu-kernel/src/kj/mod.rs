@@ -318,7 +318,7 @@ pub(crate) mod test_helpers {
             db.get_or_create_default_workspace(kernel_id, PrincipalId::system())
                 .unwrap();
         }
-        let kernel = Arc::new(Kernel::new("test").await);
+        let kernel = Arc::new(Kernel::new("test", None).await);
         KjDispatcher::new(drift, blocks, kernel_db, kernel_id, kernel, None)
     }
 

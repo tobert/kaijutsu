@@ -163,8 +163,9 @@ pub use flows::{
 };
 pub use input_doc::InputDocEntry;
 pub use kernel_db::{
-    ContextEdgeRow, ContextEnvRow, ContextRow, ContextShellRow, DocumentRow, KernelDb,
-    KernelDbError, KernelDbResult, PresetRow, SnapshotRow, WorkspacePathRow, WorkspaceRow,
+    ContextEdgeRow, ContextEnvRow, ContextRow, ContextShellRow, DocSnapshotRow, DocumentRow,
+    InputDocSnapshotRow, KernelDb, KernelDbError, KernelDbResult, PresetRow, WorkspacePathRow,
+    WorkspaceRow,
 };
 pub use kj::{KjCaller, KjDispatcher, KjResult};
 pub use rmcp::model::ResourceContents as McpResourceContents;

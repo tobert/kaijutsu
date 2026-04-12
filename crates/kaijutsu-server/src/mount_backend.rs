@@ -515,7 +515,7 @@ mod tests {
     /// Create a test MountBackend with a MemoryBackend mounted at /tmp.
     async fn test_mount_backend() -> MountBackend {
         let blocks = shared_block_store(PrincipalId::system());
-        let kernel = Arc::new(KaijutsuKernel::new("test-mount").await);
+        let kernel = Arc::new(KaijutsuKernel::new("test-mount", None).await);
         let sid = kaijutsu_types::SessionId::new();
         let session_contexts = crate::context_engine::session_context_map();
         session_contexts.insert(sid, kaijutsu_types::ContextId::new());

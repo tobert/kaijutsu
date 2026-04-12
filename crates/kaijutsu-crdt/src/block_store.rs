@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use diamond_types_extended::Frontier;
+use diamond_types_extended::{Frontier, SerializedOpsOwned};
 
 use crate::content::{BlockContent, order_midpoint};
 use crate::{
@@ -1081,28 +1081,72 @@ impl BlockStore {
     // =========================================================================
 
     /// Create a snapshot of the entire store.
+    ///
+    /// Includes full per-block DTE history (ops from root) so that recovery
+    /// from a snapshot followed by incremental oplog replay can merge
+    /// correctly. Without the history, restored blocks have fresh DTE
+    /// Documents whose frontiers don't match journaled ops.
     pub fn snapshot(&self) -> StoreSnapshot {
+        let ids = self.block_ids_ordered();
+        let mut blocks = Vec::with_capacity(ids.len());
+        let mut block_history = Vec::with_capacity(ids.len());
+
+        for id in ids {
+            if let Some(block) = self.blocks.get(&id) {
+                blocks.push(block.snapshot());
+                block_history.push(block.root_ops());
+            }
+        }
+
         StoreSnapshot {
             context_id: self.context_id,
-            blocks: self.blocks_ordered(),
+            blocks,
+            block_history,
         }
     }
 
-    /// Restore from a snapshot.
-    pub fn from_snapshot(snapshot: StoreSnapshot, agent_id: PrincipalId) -> Self {
+    /// Restore from a snapshot, preserving full DTE causal history.
+    ///
+    /// Each block is rebuilt with `from_snapshot_for_sync` (bare DTE Document)
+    /// and then its saved DTE ops are merged in. This preserves the causal
+    /// graph so subsequent oplog replay can merge incremental ops.
+    pub fn from_snapshot(snapshot: StoreSnapshot, agent_id: PrincipalId) -> Result<Self> {
         let mut store = Self::new(snapshot.context_id, agent_id);
-        for (order_seq, block_snap) in snapshot.blocks.iter().enumerate() {
+
+        for (order_seq, (block_snap, history)) in snapshot
+            .blocks
+            .iter()
+            .zip(snapshot.block_history.iter())
+            .enumerate()
+        {
             if block_snap.id.agent_id == agent_id {
                 store.next_seq = store.next_seq.max(block_snap.id.seq + 1);
             }
 
             let fallback_key = format!("{:020}", order_seq);
 
-            let content = BlockContent::from_snapshot(block_snap, agent_id, fallback_key);
-            store.blocks.insert(block_snap.id, content);
+            if history.is_empty() {
+                let content =
+                    BlockContent::from_snapshot(block_snap, agent_id, fallback_key);
+                store.blocks.insert(block_snap.id, content);
+            } else {
+                let mut content =
+                    BlockContent::from_snapshot_for_sync(block_snap, agent_id, fallback_key);
+                content.merge_ops(history.clone())?;
+                store.blocks.insert(block_snap.id, content);
+            }
         }
 
-        store
+        // Seed lamport clock from the max header timestamp so local
+        // metadata mutations produce monotonically higher timestamps.
+        store.lamport_clock = snapshot
+            .blocks
+            .iter()
+            .map(|b| b.updated_at)
+            .max()
+            .unwrap_or(0);
+
+        Ok(store)
     }
 }
 
@@ -1119,12 +1163,22 @@ fn now_millis() -> u64 {
 // =========================================================================
 
 /// Snapshot of a block store (serializable).
+///
+/// BREAKING: the `block_history` field was added as part of the oplog
+/// persistence migration. Old serialized snapshots will fail to deserialize.
+/// Delete existing databases when upgrading.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct StoreSnapshot {
     /// Context ID.
     pub context_id: ContextId,
     /// Blocks in order.
     pub blocks: Vec<BlockSnapshot>,
+    /// Full per-block DTE ops from root, parallel to `blocks`.
+    ///
+    /// Required for round-trip-correct replay: after restoring from a
+    /// snapshot, incremental oplog entries reference DTE frontiers that
+    /// only exist if the per-block DTE history is preserved.
+    pub block_history: Vec<SerializedOpsOwned>,
 }
 
 /// Per-block sync payload.
@@ -1622,7 +1676,7 @@ mod tests {
             .unwrap();
 
         let snapshot = store.snapshot();
-        let restored = BlockStore::from_snapshot(snapshot.clone(), PrincipalId::new());
+        let restored = BlockStore::from_snapshot(snapshot.clone(), PrincipalId::new()).unwrap();
 
         assert_eq!(restored.block_count(), store.block_count());
         assert_eq!(restored.full_text(), store.full_text());
@@ -1653,7 +1707,7 @@ mod tests {
 
         // Round-trip through StoreSnapshot
         let store_snapshot = store.snapshot();
-        let restored = BlockStore::from_snapshot(store_snapshot, PrincipalId::new());
+        let restored = BlockStore::from_snapshot(store_snapshot, PrincipalId::new()).unwrap();
 
         let restored_snap = restored.get_block_snapshot(&tc_id).unwrap();
         assert_eq!(restored_snap.tool_use_id, Some("toolu_01ABC".to_string()));

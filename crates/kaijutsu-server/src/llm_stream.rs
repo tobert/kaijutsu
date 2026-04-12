@@ -820,16 +820,7 @@ async fn process_llm_stream(
         // Add user message with tool results
         messages.push(LlmMessage::tool_results(tool_results));
 
-        // Checkpoint: persist tool results before re-prompting. A crash during
-        // the next model call would otherwise lose the whole round's tool work
-        // (the only other save_snapshot is at the very end of the loop).
-        if let Err(e) = documents.save_snapshot(context_id) {
-            log::warn!(
-                "Intermediate checkpoint failed for context {}: {}",
-                context_id,
-                e
-            );
-        }
+        // Each mutation is now journaled via journal_op — no explicit checkpoint needed.
 
         // Loop continues - re-prompt with tool results
     }
@@ -842,10 +833,7 @@ async fn process_llm_stream(
         context_id
     );
 
-    // Save final state after streaming completes
-    if let Err(e) = documents.save_snapshot(context_id) {
-        log::warn!("Failed to save snapshot for cell {}: {}", context_id, e);
-    }
+    // Each mutation is now journaled via journal_op — no explicit save needed.
 
     // Clean up interrupt state — only remove if our generation still matches.
     // A newer stream may have replaced our entry; removing it would be a bug.

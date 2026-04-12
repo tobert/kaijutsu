@@ -115,6 +115,9 @@ pub struct BlockContent {
     /// User-curated exclusion — toggled during staging.
     excluded: bool,
 
+    /// Structured error payload (for error blocks).
+    error: Option<kaijutsu_types::ErrorPayload>,
+
     /// Whether this block has been deleted (tombstone).
     deleted: bool,
 }
@@ -145,6 +148,7 @@ impl BlockContent {
             source_model: None,
             drift_kind: None,
             file_path: None,
+            error: None,
             collapsed: false,
             ephemeral: false,
             excluded: false,
@@ -191,6 +195,7 @@ impl BlockContent {
         block.source_model = snap.source_model.clone();
         block.drift_kind = snap.drift_kind;
         block.file_path = snap.file_path.clone();
+        block.error = snap.error.clone();
         block.collapsed = snap.collapsed;
         block.ephemeral = snap.ephemeral;
         block.excluded = snap.excluded;
@@ -230,6 +235,7 @@ impl BlockContent {
             source_model: snap.source_model.clone(),
             drift_kind: snap.drift_kind,
             file_path: snap.file_path.clone(),
+            error: snap.error.clone(),
             collapsed: snap.collapsed,
             ephemeral: snap.ephemeral,
             excluded: snap.excluded,
@@ -421,6 +427,11 @@ impl BlockContent {
         self.doc.ops_since_owned(frontier)
     }
 
+    /// Get full DTE ops from the root frontier (for persistence snapshots).
+    pub fn root_ops(&self) -> SerializedOpsOwned {
+        self.doc.ops_since_owned(&Frontier::root())
+    }
+
     /// Merge remote operations into this block's content.
     pub fn merge_ops(&mut self, ops: SerializedOpsOwned) -> crate::Result<()> {
         let result =
@@ -470,6 +481,7 @@ impl BlockContent {
             source_model: self.source_model.clone(),
             drift_kind: self.drift_kind,
             file_path: self.file_path.clone(),
+            error: self.error.clone(),
             content_type: self.header.content_type,
             order_key: Some(self.order_key.clone()),
             updated_at: self.header.updated_at,

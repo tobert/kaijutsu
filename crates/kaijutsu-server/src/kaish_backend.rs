@@ -971,7 +971,7 @@ mod tests {
     async fn test_path_resolution() {
         let ctx_id = ContextId::new();
         let blocks = shared_block_store(PrincipalId::system());
-        let kernel = Arc::new(KaijutsuKernel::new("test").await);
+        let kernel = Arc::new(KaijutsuKernel::new("test", None).await);
         let sid = SessionId::new();
         let session_contexts = crate::context_engine::session_context_map();
         session_contexts.insert(sid, ctx_id);

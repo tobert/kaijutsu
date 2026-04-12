@@ -350,7 +350,13 @@ pub fn sync_main_cell_to_conversation(
 
     let agent_id = editor.store.agent_id();
     let store_snap = cached.synced.snapshot();
-    editor.store = kaijutsu_crdt::BlockStore::from_snapshot(store_snap, agent_id);
+    editor.store = match kaijutsu_crdt::BlockStore::from_snapshot(store_snap, agent_id) {
+        Ok(store) => store,
+        Err(e) => {
+            tracing::error!("Failed to restore snapshot for sync: {e}");
+            return;
+        }
+    };
     editor.store.set_version(sync_version);
 
     if let Some(last_block) = editor.blocks().last() {

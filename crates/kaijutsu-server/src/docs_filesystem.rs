@@ -139,7 +139,7 @@ mod tests {
     #[tokio::test]
     async fn test_docs_filesystem_read_only() {
         let blocks = shared_block_store(PrincipalId::system());
-        let kernel = Arc::new(KaijutsuKernel::new("test-docs-fs").await);
+        let kernel = Arc::new(KaijutsuKernel::new("test-docs-fs", None).await);
         let sid = kaijutsu_types::SessionId::new();
         let session_contexts = crate::context_engine::session_context_map();
         session_contexts.insert(sid, kaijutsu_types::ContextId::new());
@@ -158,7 +158,7 @@ mod tests {
     #[tokio::test]
     async fn test_docs_filesystem_real_path() {
         let blocks = shared_block_store(PrincipalId::system());
-        let kernel = Arc::new(KaijutsuKernel::new("test-docs-fs-rp").await);
+        let kernel = Arc::new(KaijutsuKernel::new("test-docs-fs-rp", None).await);
         let sid = kaijutsu_types::SessionId::new();
         let session_contexts = crate::context_engine::session_context_map();
         session_contexts.insert(sid, kaijutsu_types::ContextId::new());
@@ -177,7 +177,7 @@ mod tests {
     #[tokio::test]
     async fn test_docs_filesystem_list_root() {
         let blocks = shared_block_store(PrincipalId::system());
-        let kernel = Arc::new(KaijutsuKernel::new("test-docs-fs-list").await);
+        let kernel = Arc::new(KaijutsuKernel::new("test-docs-fs-list", None).await);
         let sid = kaijutsu_types::SessionId::new();
         let session_contexts = crate::context_engine::session_context_map();
         session_contexts.insert(sid, kaijutsu_types::ContextId::new());

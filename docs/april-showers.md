@@ -91,6 +91,11 @@ Heavy use of `Mutex` and `RwLock` on large structures inhibits concurrency.
 - Investigate `rmcp` concurrency to remove the per-server `Mutex`.
 - Migrate `KernelDb` to a connection pool (e.g., `r2d2` or `sqlx`) to allow concurrent reads.
 
+### Resolution (April 11, 2026)
+
+- **McpServerPool per-server Mutex removed** (`1c37cef`). `rmcp`'s `RunningService` is internally `Send + Sync` and supports concurrent `call_tool` requests; the wrapping `Mutex<ConnectedServer>` was pure serialization overhead. Pool entries now hold the service directly, so MCP calls from different tool invocations no longer block each other.
+- **KernelDb pooling still open.** Block store / kernel DB remains `Arc<parking_lot::Mutex<KernelDb>>` (`block_store.rs:73`).
+
 ---
 
 ## 4. "God Object" Bloat
@@ -102,6 +107,12 @@ Heavy use of `Mutex` and `RwLock` on large structures inhibits concurrency.
 
 ### Recommendation
 Surgically decompose `rpc.rs` into `rpc/kernel.rs`, `rpc/world.rs`, etc. Move logic from `rpc.rs` into domain-specific services in `kaijutsu-kernel`.
+
+### Resolution (April 11, 2026) — Won't Do (with extraction)
+
+- **LLM agentic loop extracted** to `crate::llm_stream` (`89c743f`). This was the one chunk that had grown its own identity — streaming state, tool dispatch, message construction — and made sense as a sibling module.
+- **Rest of `rpc.rs` stays as one file** (`6e4382d`). The top-of-file doc comment now records the decision and its rationale: capnp method dispatch wants contiguity, mechanical splits gain little real modularity, and AI-assisted navigation makes file size much less of a friction point than it used to be. Future extractions should follow the same "extract when a chunk grows its own identity" trigger rather than splitting by line count.
+- `rpc.rs` is now ~7,020 lines (down from ~7,901). `kernel_db.rs` (~3,615) and `block_store.rs` (~3,000) are unchanged and not currently scheduled for decomposition.
 
 ---
 
@@ -130,26 +141,34 @@ There is a "split-brain" problem between the RPC layer and the Shell layer:
 - **The Issue**: Calling `kj context switch` updates the Shell map but **not** the ConnectionState. RPC calls like `execute` or `apply_block_op` will continue using the old context while the shell thinks it has moved. They must be unified into a single source of truth.
 
 ### Incomplete Migrations & Stubs
-- **`MoveBlock` is dead code**: While `kaijutsu.capnp` defines it and `kaijutsu-crdt` implements it, the `kaijutsu-kernel` wrapper lacks the method. `rpc.rs` currently logs a `warn!` stub.
-- **`EditBlockText` Deprecation**: This RPC remains as a stub. It should be removed from the schema now that `pushOps` (CRDT) is the standard.
-- **Ack Versions**: `apply_block_op` does not correctly set the `ackVersion` in its results (it remains 0), making it harder for clients to track sync state.
+- **`MoveBlock` is dead code**: While `kaijutsu.capnp` defines it and `kaijutsu-crdt` implements it, the `kaijutsu-kernel` wrapper lacks the method. `rpc.rs` currently logs a `warn!` stub. **Still open** as of April 11.
+- **`EditBlockText` Deprecation**: ~~This RPC remains as a stub.~~ **Resolved (April 11, `3489281`).** Both `applyBlockOp` and the `BlockDocOp` schema type were removed entirely; clients use `pushOps` exclusively.
+- **Ack Versions**: ~~`apply_block_op` does not correctly set the `ackVersion`~~ **Resolved (April 11, `285d0e1`).** `setBlockExcluded` and the remaining metadata RPCs now return the real post-mutation version from the CRDT document so clients can track sync state correctly.
 
 ### Durability & Error Handling
-- **Ghost Contexts**: `create_context` logs a warning but returns `Ok` even if `KernelDb` insertion fails. This creates non-persistent contexts that disappear on restart.
-- **Streaming Durability**: `execute_shell_command` only saves a final snapshot *after* the entire loop finishes. A crash during a long-running tool execution (e.g., a complex agent loop) loses all intermediate progress.
+- **Ghost Contexts**: ~~`create_context` logs a warning but returns `Ok` even if `KernelDb` insertion fails.~~ **Resolved (April 11, `8a020dd`).** `create_context` now propagates KernelDb insert failures as RPC errors. The in-memory state is rolled back so a failed insert leaves no orphan.
+- **Streaming Durability**: ~~`execute_shell_command` only saves a final snapshot *after* the entire loop finishes.~~ **Partially resolved (April 11, `91191d6`).** The agentic loop now checkpoints after each tool round, so a crash mid-loop loses at most the current tool's output rather than the entire turn. Within-tool streaming (e.g., a single long LLM response) is still only persisted at turn end — a dirty-flag flusher (see §1 Remaining) would close that gap.
 
 ---
 
 ## Summary of Action Items
 1. ~~**Harden Persistence.**~~ (April 6).
 2. ~~**Session Isolation.**~~ (April 6).
-3. **Refactor `rpc.rs`**: Begin breaking down the 8k-line file.
+3. ~~**Refactor `rpc.rs`.**~~ (April 11). LLM loop extracted to `llm_stream`; rest stays as one file by design (`6e4382d`).
 4. **Pool Database**: Move away from a single `Mutex` for `KernelDb`.
 5. ~~**Restore env/init_script on session creation.**~~ (April 7).
 6. ~~**MCP Reconnection.**~~ (April 7).
 7. ~~**`complete()` RPC.**~~ (April 7).
 8. ~~**Async execute redesign.**~~ (April 8).
 9. ~~**Unify Context Identity.**~~ (April 10). Refactored `ConnectionState` and `EmbeddedKaish` to use a shared `DashMap` for context tracking. Added `kj context current` command to verify synchronization.
-10. **Implement `MoveBlock`**: Expose CRDT logic through the `Kernel` and wire to RPC.
-11. **Hard-fail on Persistence Errors**: Ensure `KernelDb` failures in RPCs return `Promise::err`.
-12. **Intermediate Checkpoints**: Trigger `auto_save` after each tool result is appended in the agentic loop.
+10. **Implement `MoveBlock`**: Expose CRDT logic through the `Kernel` and wire to RPC. Still open.
+11. ~~**Hard-fail on Persistence Errors**~~ (April 11, `8a020dd`).
+12. ~~**Intermediate Checkpoints**~~ (April 11, `91191d6`).
+13. ~~**Drop McpServerPool per-server Mutex**~~ (April 11, `1c37cef`).
+14. ~~**Return real `ackVersion` from metadata RPCs**~~ (April 11, `285d0e1`).
+15. ~~**Remove dead `applyBlockOp` / `BlockDocOp`**~~ (April 11, `3489281`).
+
+### Still Open
+- **Item 4**: `KernelDb` connection pool.
+- **Item 10**: `MoveBlock` kernel + RPC wiring.
+- **§1 Remaining**: Optional dirty-flag + background flusher for within-turn streaming durability.
