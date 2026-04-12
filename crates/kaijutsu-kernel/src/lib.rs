@@ -40,8 +40,9 @@ pub use block_store::{
     BlockStore, BlockStoreError, BlockStoreResult, DbHandle, SharedBlockStore, shared_block_store,
 };
 pub use block_tools::{
-    BlockAppendEngine, BlockCreateEngine, BlockEditEngine, BlockListEngine, BlockReadEngine,
-    BlockSearchEngine, BlockSpliceEngine, BlockStatusEngine, EditOp, KernelSearchEngine,
+    AbcBlockEngine, BlockAppendEngine, BlockCreateEngine, BlockEditEngine, BlockListEngine,
+    BlockReadEngine, BlockSearchEngine, BlockSpliceEngine, BlockStatusEngine, EditOp,
+    ImgBlockEngine, ImgBlockFromPathEngine, KernelSearchEngine, SvgBlockEngine,
 };
 pub use config_backend::{
     ConfigCrdtBackend, ConfigWatcherHandle, DEFAULT_SYSTEM_PROMPT, ValidationResult,

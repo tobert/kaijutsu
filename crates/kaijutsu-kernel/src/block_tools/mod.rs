@@ -42,10 +42,14 @@
 //! ```
 
 pub mod batch;
+pub mod content_engines;
 pub mod cursor;
 pub mod engines;
 pub mod error;
 pub mod translate;
+
+// Re-export content-type block engines
+pub use content_engines::{AbcBlockEngine, ImgBlockEngine, ImgBlockFromPathEngine, SvgBlockEngine};
 
 // Re-export engine types
 pub use engines::{

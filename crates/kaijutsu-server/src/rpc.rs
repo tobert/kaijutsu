@@ -263,6 +263,54 @@ async fn register_block_tools(
         )
         .await;
 
+    // Content-type block creators (generative art, music, images)
+    kernel
+        .register_tool_with_engine(
+            ToolInfo::new(
+                "svg_block",
+                "Append an SVG block to the current context",
+                "block",
+            ),
+            Arc::new(kaijutsu_kernel::SvgBlockEngine::new(documents.clone())),
+        )
+        .await;
+
+    kernel
+        .register_tool_with_engine(
+            ToolInfo::new(
+                "abc_block",
+                "Append an ABC music notation block (validated)",
+                "block",
+            ),
+            Arc::new(kaijutsu_kernel::AbcBlockEngine::new(documents.clone())),
+        )
+        .await;
+
+    kernel
+        .register_tool_with_engine(
+            ToolInfo::new(
+                "img_block",
+                "Append an image block from a CAS hash",
+                "block",
+            ),
+            Arc::new(kaijutsu_kernel::ImgBlockEngine::new(documents.clone())),
+        )
+        .await;
+
+    kernel
+        .register_tool_with_engine(
+            ToolInfo::new(
+                "img_block_from_path",
+                "Read an image file, store in CAS, and append an image block",
+                "block",
+            ),
+            Arc::new(kaijutsu_kernel::ImgBlockFromPathEngine::new(
+                documents.clone(),
+                kernel.cas().clone(),
+            )),
+        )
+        .await;
+
     kernel
         .register_tool_with_engine(
             ToolInfo::new(
