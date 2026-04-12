@@ -798,15 +798,17 @@ fn update_constellation_graph(
 /// Apply radial gravity via ConstantForce — pulls all nodes toward origin.
 /// Focused node gets stronger pull and passes through the center exclusion zone.
 fn apply_radial_gravity(
+    mut commands: Commands,
     constellation: Res<Constellation>,
     mut forces: Query<(
+        Entity,
         &PhysicsNode,
         &Transform,
         &mut ConstantForce,
-        &mut CollisionLayers,
+        &CollisionLayers,
     )>,
 ) {
-    for (phys_node, transform, mut force, mut layers) in &mut forces {
+    for (entity, phys_node, transform, mut force, layers) in &mut forces {
         let pos = transform.translation.truncate();
         let is_focused = constellation.focus_id == Some(phys_node.context_id);
         let k = if is_focused {
@@ -826,7 +828,7 @@ fn apply_radial_gravity(
             )
         };
         if *layers != desired {
-            *layers = desired;
+            commands.entity(entity).insert(desired);
         }
     }
 }

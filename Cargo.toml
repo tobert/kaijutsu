@@ -131,4 +131,4 @@ tracing-opentelemetry = "0.32"
 tempfile = "3"
 
 # Config
-ron = "0.9"
+ron = "0.12"

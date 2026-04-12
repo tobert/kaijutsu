@@ -8,7 +8,7 @@ description = "ABC music notation parser, engraver, and MIDI generator"
 winnow = "0.6"
 serde = { workspace = true }
 thiserror = { workspace = true }
-skrifa = "0.40"
+skrifa = "0.42"
 kurbo.workspace = true
 
 [dev-dependencies]
