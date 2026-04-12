@@ -11,6 +11,7 @@ pub mod input_filesystem;
 pub mod interrupt;
 pub mod kaish_backend;
 pub mod kj_builtin;
+pub mod llm_stream;
 pub mod mount_backend;
 pub mod rpc;
 pub mod ssh;
