@@ -53,6 +53,8 @@ pub struct RhaiEngine {
     scopes: Arc<Mutex<HashMap<ContextId, Scope<'static>>>>,
     /// Optional extension point for registering extra functions (e.g. synthesis).
     extra_registrar: Option<ExtraRegistrar>,
+    /// Content-addressed store for binary blob functions.
+    cas: Option<Arc<kaijutsu_cas::FileStore>>,
 }
 
 impl RhaiEngine {
@@ -63,7 +65,14 @@ impl RhaiEngine {
             interrupted: Arc::new(AtomicBool::new(false)),
             scopes: Arc::new(Mutex::new(HashMap::new())),
             extra_registrar: None,
+            cas: None,
         }
+    }
+
+    /// Attach a CAS for `cas_put_bytes`, `cas_exists`, `cas_remove` Rhai functions.
+    pub fn with_cas(mut self, cas: Arc<kaijutsu_cas::FileStore>) -> Self {
+        self.cas = Some(cas);
+        self
     }
 
     /// Register additional functions on the Rhai engine (builder pattern).
@@ -82,6 +91,7 @@ impl RhaiEngine {
         interrupted: Arc<AtomicBool>,
         context_id: ContextId,
         extra_registrar: Option<&ExtraRegistrar>,
+        cas: Option<&Arc<kaijutsu_cas::FileStore>>,
     ) -> (Engine, kaijutsu_rhai::OutputCollector) {
         let mut engine = Engine::new();
 
@@ -108,6 +118,11 @@ impl RhaiEngine {
 
         // Register utility functions
         Self::register_utility_functions(&mut engine, interrupted);
+
+        // CAS functions (when a content store is available)
+        if let Some(cas) = cas {
+            Self::register_cas_functions(&mut engine, cas.clone());
+        }
 
         // Server-injected functions (synthesis, etc.)
         if let Some(registrar) = extra_registrar {
@@ -651,6 +666,67 @@ impl RhaiEngine {
         });
     }
 
+    /// Register content-addressed storage functions.
+    fn register_cas_functions(engine: &mut Engine, cas: Arc<kaijutsu_cas::FileStore>) {
+        use kaijutsu_cas::ContentStore;
+
+        let cas_put = cas.clone();
+        engine.register_fn(
+            "cas_put_bytes",
+            move |data: rhai::Blob, mime: String| -> String {
+                match cas_put.store(&data, &mime) {
+                    Ok(hash) => hash.to_string(),
+                    Err(e) => {
+                        warn!("Rhai: cas_put_bytes error: {}", e);
+                        String::new()
+                    }
+                }
+            },
+        );
+
+        let cas_get = cas.clone();
+        engine.register_fn("cas_get_bytes", move |hash_str: String| -> rhai::Blob {
+            let Ok(hash) = hash_str.parse::<kaijutsu_cas::ContentHash>() else {
+                warn!("Rhai: cas_get_bytes invalid hash: {}", hash_str);
+                return rhai::Blob::new();
+            };
+            match cas_get.retrieve(&hash) {
+                Ok(Some(data)) => data,
+                Ok(None) => {
+                    warn!("Rhai: cas_get_bytes not found: {}", hash_str);
+                    rhai::Blob::new()
+                }
+                Err(e) => {
+                    warn!("Rhai: cas_get_bytes error: {}", e);
+                    rhai::Blob::new()
+                }
+            }
+        });
+
+        let cas_exists = cas.clone();
+        engine.register_fn("cas_exists", move |hash_str: String| -> bool {
+            let Ok(hash) = hash_str.parse::<kaijutsu_cas::ContentHash>() else {
+                return false;
+            };
+            cas_exists.exists(&hash)
+        });
+
+        let cas_rm = cas;
+        engine.register_fn("cas_remove", move |hash_str: String| -> bool {
+            let Ok(hash) = hash_str.parse::<kaijutsu_cas::ContentHash>() else {
+                warn!("Rhai: cas_remove invalid hash: {}", hash_str);
+                return false;
+            };
+            match cas_rm.remove(&hash) {
+                Ok(removed) => removed,
+                Err(e) => {
+                    warn!("Rhai: cas_remove error: {}", e);
+                    false
+                }
+            }
+        });
+    }
+
     /// Warn if the source contains `"...${...}..."` — a double-quoted string
     /// with interpolation syntax that Rhai treats as literal text.
     /// Models frequently write this expecting template behavior but get silent
@@ -762,12 +838,14 @@ impl RhaiEngine {
         scopes: &Mutex<HashMap<ContextId, Scope<'static>>>,
         context_id: ContextId,
         extra_registrar: Option<&ExtraRegistrar>,
+        cas: Option<&Arc<kaijutsu_cas::FileStore>>,
     ) -> ExecResult {
         let (engine, collector) = Self::create_engine(
             block_store.clone(),
             interrupted,
             context_id,
             extra_registrar,
+            cas,
         );
 
         // Check for silent-interpolation footgun before execution
@@ -899,6 +977,7 @@ impl ExecutionEngine for RhaiEngine {
         let scopes = Arc::clone(&self.scopes);
         let context_id = ctx.context_id;
         let extra_registrar = self.extra_registrar.clone();
+        let cas = self.cas.clone();
 
         // Execute in spawn_blocking for async safety
         let result = tokio::task::spawn_blocking(move || {
@@ -909,6 +988,7 @@ impl ExecutionEngine for RhaiEngine {
                 &scopes,
                 context_id,
                 extra_registrar.as_ref(),
+                cas.as_ref(),
             )
         })
         .await?;
@@ -940,6 +1020,11 @@ impl ExecutionEngine for RhaiEngine {
             // Context-aware
             "svg_block",
             "abc_block",
+            // CAS
+            "cas_put_bytes",
+            "cas_get_bytes",
+            "cas_exists",
+            "cas_remove",
             // Utility
             "println",
             "log",
@@ -1043,6 +1128,10 @@ impl ExecutionEngine for RhaiEngine {
             "context_functions": [
                 { "name": "svg_block", "sig": "svg_block(content: string) -> string", "doc": "Insert SVG content as a block in the current conversation. Returns block ID." },
                 { "name": "abc_block", "sig": "abc_block(content: string) -> string", "doc": "Insert ABC music notation as a block in the current conversation, rendered as sheet music. Returns block ID." },
+                { "name": "cas_put_bytes", "sig": "cas_put_bytes(data: blob, mime: string) -> string", "doc": "Store bytes in CAS, returns content hash." },
+                { "name": "cas_get_bytes", "sig": "cas_get_bytes(hash: string) -> blob", "doc": "Retrieve bytes from CAS by hash. Returns empty blob if not found." },
+                { "name": "cas_exists", "sig": "cas_exists(hash: string) -> bool", "doc": "Check if a hash exists in CAS." },
+                { "name": "cas_remove", "sig": "cas_remove(hash: string) -> bool", "doc": "Remove an object from CAS. Returns true if it existed." },
             ],
             "stdlib": catalog["functions"],
         }))

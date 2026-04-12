@@ -8,6 +8,7 @@
 //! All commands go through `KjDispatcher`, which holds Arc refs to shared
 //! kernel state and is constructed once per server.
 
+pub mod cas;
 pub mod context;
 pub mod drift;
 pub mod fork;
@@ -199,6 +200,9 @@ impl KjDispatcher {
         }
         if cmd == "preset" {
             return self.dispatch_preset(&argv[1..], caller);
+        }
+        if cmd == "cas" {
+            return self.dispatch_cas(&argv[1..], caller);
         }
 
         // Everything else requires an active context
