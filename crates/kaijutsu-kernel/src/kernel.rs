@@ -57,6 +57,8 @@ pub struct Kernel {
     drift: SharedDriftRouter,
     /// Content-addressed store for binary blobs (images, etc.).
     cas: Arc<FileStore>,
+    /// Image generation backend registry.
+    image_backends: RwLock<crate::image::ImageBackendRegistry>,
 }
 
 impl std::fmt::Debug for Kernel {
@@ -111,6 +113,7 @@ impl Kernel {
             block_flows: shared_block_flow_bus(DEFAULT_FLOW_CAPACITY),
             drift: shared_drift_router(),
             cas: Self::cas_for_data_dir(data_dir),
+            image_backends: RwLock::new(crate::image::ImageBackendRegistry::new()),
         }
     }
 
@@ -137,6 +140,7 @@ impl Kernel {
             block_flows,
             drift: shared_drift_router(),
             cas: Self::cas_for_data_dir(data_dir),
+            image_backends: RwLock::new(crate::image::ImageBackendRegistry::new()),
         }
     }
 
@@ -153,6 +157,11 @@ impl Kernel {
     /// Get the content-addressed store.
     pub fn cas(&self) -> &Arc<FileStore> {
         &self.cas
+    }
+
+    /// Get the image backend registry.
+    pub fn image_backends(&self) -> &RwLock<crate::image::ImageBackendRegistry> {
+        &self.image_backends
     }
 
     // ========================================================================

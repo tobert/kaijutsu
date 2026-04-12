@@ -55,6 +55,8 @@ pub struct RhaiEngine {
     extra_registrar: Option<ExtraRegistrar>,
     /// Content-addressed store for binary blob functions.
     cas: Option<Arc<kaijutsu_cas::FileStore>>,
+    /// Image generation backend registry (shared with Kernel).
+    image_backends: Option<Arc<tokio::sync::RwLock<crate::image::ImageBackendRegistry>>>,
 }
 
 impl RhaiEngine {
@@ -66,12 +68,22 @@ impl RhaiEngine {
             scopes: Arc::new(Mutex::new(HashMap::new())),
             extra_registrar: None,
             cas: None,
+            image_backends: None,
         }
     }
 
     /// Attach a CAS for `cas_put_bytes`, `cas_exists`, `cas_remove` Rhai functions.
     pub fn with_cas(mut self, cas: Arc<kaijutsu_cas::FileStore>) -> Self {
         self.cas = Some(cas);
+        self
+    }
+
+    /// Attach image generation backends for `generate_image_block`.
+    pub fn with_image_backends(
+        mut self,
+        backends: Arc<tokio::sync::RwLock<crate::image::ImageBackendRegistry>>,
+    ) -> Self {
+        self.image_backends = Some(backends);
         self
     }
 
@@ -92,6 +104,7 @@ impl RhaiEngine {
         context_id: ContextId,
         extra_registrar: Option<&ExtraRegistrar>,
         cas: Option<&Arc<kaijutsu_cas::FileStore>>,
+        image_backends: Option<&Arc<tokio::sync::RwLock<crate::image::ImageBackendRegistry>>>,
     ) -> (Engine, kaijutsu_rhai::OutputCollector) {
         let mut engine = Engine::new();
 
@@ -113,6 +126,9 @@ impl RhaiEngine {
         // Register block-level CRDT functions
         Self::register_block_functions(&mut engine, block_store.clone());
 
+        // Clone block_store before it's moved into context functions
+        let block_store_for_gen = block_store.clone();
+
         // Register context-aware functions (emit into current context)
         Self::register_context_functions(&mut engine, block_store, context_id, cas);
 
@@ -122,6 +138,17 @@ impl RhaiEngine {
         // CAS functions (when a content store is available)
         if let Some(cas) = cas {
             Self::register_cas_functions(&mut engine, cas.clone());
+        }
+
+        // Image generation (when both CAS and backends are available)
+        if let (Some(cas), Some(backends)) = (cas, image_backends) {
+            Self::register_image_gen_functions(
+                &mut engine,
+                block_store_for_gen,
+                context_id,
+                cas.clone(),
+                backends.clone(),
+            );
         }
 
         // Server-injected functions (synthesis, etc.)
@@ -858,6 +885,106 @@ impl RhaiEngine {
         });
     }
 
+    /// Register image generation functions (generate_image_block).
+    fn register_image_gen_functions(
+        engine: &mut Engine,
+        block_store: SharedBlockStore,
+        context_id: ContextId,
+        cas: Arc<kaijutsu_cas::FileStore>,
+        backends: Arc<tokio::sync::RwLock<crate::image::ImageBackendRegistry>>,
+    ) {
+        use kaijutsu_cas::ContentStore;
+        use kaijutsu_types::{BlockKind, ContentType, Role, Status};
+
+        // generate_image_block(prompt) -> String
+        // Creates a placeholder block in Status::Running, spawns async generation,
+        // returns the block id immediately.
+        let gen_store = block_store.clone();
+        let gen_cas = cas.clone();
+        let gen_backends = backends;
+
+        engine.register_fn(
+            "generate_image_block",
+            move |prompt: String| -> String {
+                // Create placeholder block synchronously
+                let last_block_id = gen_store
+                    .get(context_id)
+                    .and_then(|doc| doc.doc.blocks_ordered().last().map(|b| b.id));
+
+                let block_id = match gen_store.insert_block(
+                    context_id,
+                    None,
+                    last_block_id.as_ref(),
+                    Role::Asset,
+                    BlockKind::Text,
+                    "",
+                    Status::Running,
+                    ContentType::Image,
+                ) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        warn!("Rhai: generate_image_block insert error: {}", e);
+                        return String::new();
+                    }
+                };
+
+                let block_key = block_id.to_key();
+                info!(
+                    block = %block_key,
+                    prompt = %prompt,
+                    "generate_image_block: created Running placeholder"
+                );
+
+                // Spawn async generation task (fire-and-forget)
+                let task_store = gen_store.clone();
+                let task_cas = gen_cas.clone();
+                let task_backends = gen_backends.clone();
+                let task_block_id = block_id;
+                let task_prompt = prompt.clone();
+
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        let result = run_image_generation(
+                            &task_store,
+                            &task_cas,
+                            &task_backends,
+                            context_id,
+                            task_block_id,
+                            &task_prompt,
+                        )
+                        .await;
+
+                        if let Err(e) = result {
+                            tracing::error!(
+                                block = %task_block_id.to_key(),
+                                prompt = %task_prompt,
+                                "generate_image_block failed: {}",
+                                e
+                            );
+                            // Write error into block content and set Status::Error
+                            let error_msg = format!("Image generation failed: {}", e);
+                            if let Err(e2) = task_store.edit_text(
+                                context_id,
+                                &task_block_id,
+                                0,
+                                &error_msg,
+                                0,
+                            ) {
+                                tracing::error!("failed to write error to block: {}", e2);
+                            }
+                            task_store.set_status(context_id, &task_block_id, Status::Error);
+                        }
+                    });
+                } else {
+                    warn!("generate_image_block: no tokio runtime, cannot spawn generation");
+                    gen_store.set_status(context_id, &block_id, Status::Error);
+                }
+
+                block_key
+            },
+        );
+    }
+
     /// Warn if the source contains `"...${...}..."` — a double-quoted string
     /// with interpolation syntax that Rhai treats as literal text.
     /// Models frequently write this expecting template behavior but get silent
@@ -970,6 +1097,7 @@ impl RhaiEngine {
         context_id: ContextId,
         extra_registrar: Option<&ExtraRegistrar>,
         cas: Option<&Arc<kaijutsu_cas::FileStore>>,
+        image_backends: Option<&Arc<tokio::sync::RwLock<crate::image::ImageBackendRegistry>>>,
     ) -> ExecResult {
         let (engine, collector) = Self::create_engine(
             block_store.clone(),
@@ -977,6 +1105,7 @@ impl RhaiEngine {
             context_id,
             extra_registrar,
             cas,
+            image_backends,
         );
 
         // Check for silent-interpolation footgun before execution
@@ -1109,6 +1238,7 @@ impl ExecutionEngine for RhaiEngine {
         let context_id = ctx.context_id;
         let extra_registrar = self.extra_registrar.clone();
         let cas = self.cas.clone();
+        let image_backends = self.image_backends.clone();
 
         // Execute in spawn_blocking for async safety
         let result = tokio::task::spawn_blocking(move || {
@@ -1120,6 +1250,7 @@ impl ExecutionEngine for RhaiEngine {
                 context_id,
                 extra_registrar.as_ref(),
                 cas.as_ref(),
+                image_backends.as_ref(),
             )
         })
         .await?;
@@ -1754,4 +1885,63 @@ mod tests {
             "generic errors should not get hints"
         );
     }
+}
+
+/// Async helper: run image generation, stream into CAS, update the block.
+async fn run_image_generation(
+    block_store: &crate::block_store::SharedBlockStore,
+    cas: &kaijutsu_cas::FileStore,
+    backends: &tokio::sync::RwLock<crate::image::ImageBackendRegistry>,
+    context_id: kaijutsu_types::ContextId,
+    block_id: kaijutsu_crdt::BlockId,
+    prompt: &str,
+) -> Result<(), crate::image::ImageError> {
+    use futures::StreamExt;
+    use kaijutsu_cas::ContentStore;
+    use kaijutsu_types::Status;
+
+    // Resolve the backend and start generation
+    let mut stream = {
+        let registry = backends.read().await;
+        registry.generate(prompt, crate::image::ImageGenOpts::default()).await?
+    };
+
+    // Stream chunks into CAS staging
+    let mut staging = cas
+        .create_staging()
+        .map_err(|e| crate::image::ImageError::Storage(e.to_string()))?;
+
+    let mime = stream.mime.clone();
+
+    while let Some(chunk_result) = stream.chunks.next().await {
+        let chunk = chunk_result?;
+        staging
+            .write(&chunk)
+            .map_err(|e| crate::image::ImageError::Storage(e.to_string()))?;
+    }
+
+    staging
+        .flush()
+        .map_err(|e| crate::image::ImageError::Storage(e.to_string()))?;
+
+    // Seal the staging chunk into CAS
+    let seal_result = cas
+        .seal(&staging, &mime)
+        .map_err(|e| crate::image::ImageError::Storage(e.to_string()))?;
+
+    let hash_str = seal_result.content_hash.to_string();
+    tracing::info!(
+        block = %block_id.to_key(),
+        hash = %hash_str,
+        size = seal_result.size_bytes,
+        "generate_image_block: sealed into CAS"
+    );
+
+    // Update the block: content = hash, status = Done
+    if let Err(e) = block_store.edit_text(context_id, &block_id, 0, &hash_str, 0) {
+        tracing::error!("generate_image_block: failed to update content: {}", e);
+    }
+    block_store.set_status(context_id, &block_id, Status::Done);
+
+    Ok(())
 }

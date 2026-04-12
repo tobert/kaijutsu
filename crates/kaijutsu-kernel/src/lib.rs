@@ -14,6 +14,7 @@
 pub mod agents;
 pub mod block_store;
 pub mod block_tools;
+pub mod image;
 pub mod config_backend;
 pub mod control;
 pub mod drift;
