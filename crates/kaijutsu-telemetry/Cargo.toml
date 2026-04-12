@@ -5,12 +5,12 @@ edition.workspace = true
 description = "OpenTelemetry integration for kaijutsu — tracing layer, W3C context propagation, and sampling"
 
 [dependencies]
-tracing = "0.1"
+tracing = { workspace = true }
 tracing-core = "0.1"
 tracing-subscriber = { version = "0.3", features = ["registry"] }
 
-opentelemetry = { workspace = true }
-opentelemetry_sdk = { workspace = true }
-opentelemetry-otlp = { workspace = true }
-tracing-opentelemetry = { workspace = true }
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-otlp.workspace = true
+tracing-opentelemetry.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread"] }

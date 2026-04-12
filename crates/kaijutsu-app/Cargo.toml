@@ -5,21 +5,22 @@ edition.workspace = true
 description = "Bevy GUI client for kaijutsu"
 
 [dependencies]
-kaijutsu-abc = { workspace = true }
-kaijutsu-crdt = { path = "../kaijutsu-crdt" }
-kaijutsu-client = { path = "../kaijutsu-client" }
-kaijutsu-kernel = { path = "../kaijutsu-kernel" }
-kaijutsu-types = { path = "../kaijutsu-types" }
+kaijutsu-abc.workspace = true
+kaijutsu-crdt.workspace = true
+kaijutsu-client.workspace = true
+kaijutsu-kernel.workspace = true
+kaijutsu-types.workspace = true
+kaijutsu-telemetry.workspace = true
 
 # kaish (for syntax validation)
 kaish-kernel.workspace = true
-logos = "0.16"  # For Token::lexer trait
+logos = "0.16"
 
 bevy = { version = "0.18", features = ["default", "bevy_ui_debug"] }
-bevy_brp_extras.workspace = true  # includes RemotePlugin
+bevy_brp_extras.workspace = true
 bevy_mesh.workspace = true
 bevy_remote.workspace = true
-bevy_tweening = { git = "https://github.com/djeedai/bevy_tweening", branch = "main" }  # Smooth animations
+bevy_tweening = { git = "https://github.com/djeedai/bevy_tweening", branch = "main" }
 avian2d = "0.5"
 
 # Text rendering (Vello-based + MSDF)
@@ -27,49 +28,43 @@ bevy_vello = { path = "/home/atobey/src/wt/pr6", features = ["text", "svg", "pic
 pulldown-cmark.workspace = true
 bytemuck = { version = "1.21", features = ["derive"] }
 msdfgen = { path = "/home/atobey/src/msdfgen-rs", default-features = false, features = ["ttf-parser"] }
-ttf-parser = "0.19"  # Must match msdfgen's ttf-parser for FontExt impl
+ttf-parser = "0.19"
 rect_packer = "0.2"
 
 # Serialization
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-postcard = { version = "1.1", features = ["alloc"] }
-ron = "0.8"
+serde = { workspace = true }
+serde_json = { workspace = true }
+postcard = { workspace = true, features = ["alloc"] }
 
-# Logging + Telemetry
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-appender = "0.2"
-kaijutsu-telemetry = { workspace = true }
+# Tracing
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
 
-# Error handling
 thiserror.workspace = true
-
 arboard.workspace = true
 modalkit.workspace = true
 editor-types.workspace = true
 crossterm.workspace = true
-
 clap.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 futures.workspace = true
 log.workspace = true
 whoami.workspace = true
-indexmap = "2"
-uuid = { version = "1.0", features = ["v4"] }
-dirs = "5.0"
-hostname = "0.3"
+indexmap = { workspace = true }
+uuid = { workspace = true }
+dirs = { workspace = true }
+hostname = { workspace = true }
 
-# Cap'n Proto (for block events callback)
+# Cap'n Proto
 capnp.workspace = true
 capnp-rpc.workspace = true
 
-# Scripting (for theme system)
+# Scripting
 rhai.workspace = true
 kaijutsu-rhai.workspace = true
 
 [dev-dependencies]
-# Image handling for GPU tests
 image = "0.25"
 crossbeam-channel = "0.5"

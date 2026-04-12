@@ -1,15 +1,15 @@
 [package]
 name = "kaijutsu-abc"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 description = "ABC music notation parser, engraver, and MIDI generator"
 
 [dependencies]
 winnow = "0.6"
-serde = { version = "1", features = ["derive"] }
-thiserror = "2"
+serde = { workspace = true }
+thiserror = { workspace = true }
 skrifa = "0.40"
-kurbo = { workspace = true }
+kurbo.workspace = true
 
 [dev-dependencies]
 pretty_assertions = "1"

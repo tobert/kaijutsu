@@ -16,17 +16,17 @@ log.workspace = true
 thiserror.workspace = true
 whoami.workspace = true
 home = "0.5"
-serde_json = "1"
-postcard = { version = "1", features = ["use-std"] }
-tracing = "0.1"
-kaijutsu-telemetry = { workspace = true }
+serde_json = { workspace = true }
+postcard = { workspace = true }
+tracing = { workspace = true }
+kaijutsu-telemetry.workspace = true
 
-# CRDT engine (for SyncedInput — wraps DTE Document directly)
+# CRDT engine
 diamond-types-extended.workspace = true
 
 # Shared CRDT types
-kaijutsu-crdt = { path = "../kaijutsu-crdt" }
-kaijutsu-types = { path = "../kaijutsu-types" }
+kaijutsu-crdt.workspace = true
+kaijutsu-types.workspace = true
 
 [build-dependencies]
 capnpc.workspace = true

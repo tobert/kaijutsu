@@ -721,12 +721,6 @@ checksum = "9e1b586273c5702936fe7b7d6896644d8be71e6314cfe09d3167c95f712589e8"
 
 [[package]]
 name = "base64"
-version = "0.21.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d297deb1925b89f2ccc13d7635fa0714f12c87adce1c75356b39ca9b7178567"
-
-[[package]]
-name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
@@ -3428,15 +3422,6 @@ dependencies = [
 
 [[package]]
 name = "dirs"
-version = "5.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44c45a9d03d6676652bcb5e724c7e988de1acad23a711b5217ab9cbecbec2225"
-dependencies = [
- "dirs-sys 0.4.1",
-]
-
-[[package]]
-name = "dirs"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3e8aa94d75141228480295a7d0e7feb620b1a5ad9f12bc40be62411e38cce4e"
@@ -5616,7 +5601,7 @@ dependencies = [
 name = "kaijutsu-agent-tools"
 version = "0.1.0"
 dependencies = [
- "dirs 6.0.0",
+ "dirs",
  "serde",
  "serde_json",
  "tracing",
@@ -5640,7 +5625,7 @@ dependencies = [
  "clap",
  "crossbeam-channel",
  "crossterm",
- "dirs 5.0.1",
+ "dirs",
  "editor-types",
  "futures",
  "hostname",
@@ -5662,7 +5647,6 @@ dependencies = [
  "pulldown-cmark",
  "rect_packer",
  "rhai",
- "ron 0.8.1",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -5796,7 +5780,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "dirs 6.0.0",
+ "dirs",
  "futures",
  "kaijutsu-agent-tools",
  "kaijutsu-client",
@@ -8909,18 +8893,6 @@ dependencies = [
 
 [[package]]
 name = "ron"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b91f7eff05f748767f183df4320a63d6936e9c6107d97c9e6bdd9784f4289c94"
-dependencies = [
- "base64 0.21.7",
- "bitflags 2.10.0",
- "serde",
- "serde_derive",
-]
-
-[[package]]
-name = "ron"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63f3aa105dea217ef30d89581b65a4d527a19afc95ef5750be3890e8d3c5b837"
@@ -9505,7 +9477,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b1fdf65dd6331831494dd616b30351c38e96e45921a27745cf98490458b90bb"
 dependencies = [
- "dirs 6.0.0",
+ "dirs",
 ]
 
 [[package]]

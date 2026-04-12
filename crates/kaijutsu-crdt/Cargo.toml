@@ -7,21 +7,13 @@ repository.workspace = true
 description = "Block-based CRDT document model for Kaijutsu"
 
 [dependencies]
-# Shared identity + block types (typed UUIDs, BlockSnapshot, etc.)
-kaijutsu-types = { path = "../kaijutsu-types" }
-
-# Unified CRDT library with Map/Set/Register/Text support
-# Provides all CRDT types needed for block document model
+kaijutsu-types.workspace = true
 diamond-types-extended.workspace = true
-
-# Serialization
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-postcard = { version = "1", features = ["use-std"] }
-
-# Utilities
-thiserror = "2"
-tracing = "0.1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+postcard = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
-rand = "0.8"
+rand = { workspace = true }

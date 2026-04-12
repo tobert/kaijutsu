@@ -5,13 +5,11 @@ edition.workspace = true
 description = "SSH + Cap'n Proto server for kaijutsu"
 
 [dependencies]
-# Kaijutsu kernel (VFS + state + control plane)
 kaijutsu-kernel.workspace = true
 kaijutsu-crdt.workspace = true
 kaijutsu-types.workspace = true
 kaijutsu-index = { path = "../kaijutsu-index" }
-
-# Kaish execution engine (spawned as subprocess, connected via IPC)
+kaijutsu-telemetry.workspace = true
 kaish-kernel.workspace = true
 
 capnp.workspace = true
@@ -27,32 +25,29 @@ anyhow.workspace = true
 shellexpand.workspace = true
 async-trait.workspace = true
 rand.workspace = true
-uuid = { version = "1.0", features = ["v4"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-postcard = { version = "1", features = ["use-std"] }
-parking_lot = "0.12"
-dashmap = "6"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-kaijutsu-telemetry = { workspace = true }
+uuid = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+postcard = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
-# Rhai (for synthesis scripts)
+# Scripting
 rhai.workspace = true
 kaijutsu-rhai.workspace = true
 
 # Hostname detection
-hostname = "0.3"
-
-# No separate russh-keys needed - russh 0.56 includes keys module
+hostname = { workspace = true }
 
 [build-dependencies]
 capnpc.workspace = true
 
 [dev-dependencies]
-kaijutsu-client = { path = "../kaijutsu-client" }
-kaijutsu-kernel = { path = "../kaijutsu-kernel", features = ["test-mock"] }
-kaijutsu-types = { path = "../kaijutsu-types" }
+kaijutsu-client.workspace = true
+kaijutsu-kernel = { workspace = true, features = ["test-mock"] }
+kaijutsu-types.workspace = true
 futures.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-tempfile = "3"
+tempfile = { workspace = true }

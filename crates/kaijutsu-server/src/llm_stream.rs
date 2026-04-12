@@ -721,32 +721,60 @@ async fn process_llm_stream(
                     )
                     .await;
 
-                    let (result_content, is_error) = match result {
+                    let (result_content, is_error, error_payload) = match result {
                         Err(_elapsed) => {
                             log::error!(
                                 "Tool {} timed out after {}s",
                                 tool_name,
                                 TOOL_TIMEOUT_SECS
                             );
+                            let payload = kaijutsu_types::ErrorPayload {
+                                category: kaijutsu_types::ErrorCategory::Tool,
+                                severity: kaijutsu_types::ErrorSeverity::Error,
+                                code: Some("tool.timeout".into()),
+                                detail: Some(format!(
+                                    "Tool '{}' timed out after {}s",
+                                    tool_name, TOOL_TIMEOUT_SECS
+                                )),
+                                span: None,
+                                source_kind: Some(kaijutsu_types::BlockKind::ToolResult),
+                            };
                             (
                                 format!(
                                     "Error: tool '{}' timed out after {}s",
                                     tool_name, TOOL_TIMEOUT_SECS
                                 ),
                                 true,
+                                Some(payload),
                             )
                         }
                         Ok(Ok(r)) if r.success => {
                             log::debug!("Tool {} succeeded: {}", tool_name, r.stdout);
-                            (r.stdout, false)
+                            (r.stdout, false, None)
                         }
                         Ok(Ok(r)) => {
                             log::warn!("Tool {} failed: {}", tool_name, r.stderr);
-                            (format!("Error: {}", r.stderr), true)
+                            let payload = kaijutsu_types::ErrorPayload {
+                                category: kaijutsu_types::ErrorCategory::Tool,
+                                severity: kaijutsu_types::ErrorSeverity::Error,
+                                code: None,
+                                detail: Some(r.stderr.clone()),
+                                span: None,
+                                source_kind: Some(kaijutsu_types::BlockKind::ToolResult),
+                            };
+                            (format!("Error: {}", r.stderr), true, Some(payload))
                         }
                         Ok(Err(e)) => {
                             log::error!("Tool {} execution error: {}", tool_name, e);
-                            (format!("Execution error: {}", e), true)
+                            let payload = kaijutsu_types::ErrorPayload {
+                                category: kaijutsu_types::ErrorCategory::Tool,
+                                severity: kaijutsu_types::ErrorSeverity::Error,
+                                code: None,
+                                detail: Some(e.to_string()),
+                                span: None,
+                                source_kind: Some(kaijutsu_types::BlockKind::ToolResult),
+                            };
+                            (format!("Execution error: {}", e), true, Some(payload))
                         }
                     };
 
@@ -780,6 +808,25 @@ async fn process_llm_stream(
                             Status::Done
                         };
                         let _ = documents.set_status(context_id, tcb_id, final_status);
+                    }
+
+                    // Step 6b: Emit structured Error child block if tool failed
+                    if let (Some(rb_id), Some(payload)) =
+                        (&result_block_id, &error_payload)
+                    {
+                        if let Err(e) = documents.insert_error_block_as(
+                            context_id,
+                            rb_id,
+                            payload,
+                            payload.summary_line(),
+                            Some(PrincipalId::system()),
+                        ) {
+                            log::warn!(
+                                "Failed to insert error block for tool {}: {}",
+                                tool_name,
+                                e
+                            );
+                        }
                     }
 
                     // Step 7: Return for conversation history

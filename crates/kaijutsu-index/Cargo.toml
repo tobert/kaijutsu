@@ -5,7 +5,7 @@ edition.workspace = true
 description = "Semantic vector indexing for kaijutsu contexts"
 
 [dependencies]
-kaijutsu-types = { path = "../kaijutsu-types" }
+kaijutsu-types.workspace = true
 
 # ONNX inference + tokenizer
 ort = { version = "2.0.0-rc.11", features = ["download-binaries"] }
@@ -22,22 +22,22 @@ ndarray = "0.17"
 # Metadata store
 rusqlite.workspace = true
 
-# Async (for watcher)
+# Async
 tokio = { version = "1", features = ["sync", "time", "rt"] }
 
 # Serialization
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 # Logging
-tracing = "0.1"
+tracing = { workspace = true }
 
 # Error handling
-thiserror = "2"
+thiserror = { workspace = true }
 
 # Content hashing
 sha2 = "0.10"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-tempfile = "3"
+tempfile = { workspace = true }

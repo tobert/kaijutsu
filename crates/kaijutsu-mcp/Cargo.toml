@@ -11,35 +11,32 @@ name = "kaijutsu-mcp"
 path = "src/main.rs"
 
 [dependencies]
-# Workspace dependencies
-kaijutsu-kernel = { workspace = true }
-kaijutsu-crdt = { workspace = true }
-kaijutsu-client = { workspace = true }
-kaijutsu-agent-tools = { workspace = true }
-tokio = { workspace = true }
-futures = { workspace = true }
-anyhow = { workspace = true }
-whoami = { workspace = true }
-
-# CLI
-clap = { version = "4", features = ["derive"] }
+kaijutsu-kernel.workspace = true
+kaijutsu-crdt.workspace = true
+kaijutsu-client.workspace = true
+kaijutsu-agent-tools.workspace = true
+kaijutsu-telemetry.workspace = true
+tokio.workspace = true
+futures.workspace = true
+anyhow.workspace = true
+whoami.workspace = true
+clap.workspace = true
 
 # MCP server
 rmcp = { workspace = true, features = ["server", "macros", "transport-io"] }
 
 # Serialization
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-postcard = { version = "1", features = ["use-std"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+postcard = { workspace = true }
 schemars = { version = "1.0", features = ["chrono04"] }
 
 # XDG paths
-dirs = "6"
+dirs = { workspace = true }
 
-# Logging + Telemetry
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-kaijutsu-telemetry = { workspace = true }
+# Tracing
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
-# Regex for search
-regex = "1"
+# Search
+regex = { workspace = true }

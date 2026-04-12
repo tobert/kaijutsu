@@ -23,23 +23,16 @@ license = "MIT"
 repository = "https://github.com/atobey/kaijutsu"
 
 [workspace.dependencies]
-# ABC music notation parser and engraver
+# Internal crates
 kaijutsu-abc = { path = "crates/kaijutsu-abc" }
-
-# Kaijutsu CAS (content-addressed storage — leaf crate, no internal deps)
 kaijutsu-cas = { path = "crates/kaijutsu-cas" }
-
-# Kaijutsu types (shared identity + block types — leaf crate, no internal deps)
 kaijutsu-types = { path = "crates/kaijutsu-types" }
-
-# Kaijutsu CRDT (block-based document model)
 kaijutsu-crdt = { path = "crates/kaijutsu-crdt" }
-
-# Kaijutsu kernel (core VFS + state)
 kaijutsu-kernel = { path = "crates/kaijutsu-kernel" }
-
-# Kaijutsu RPC client
 kaijutsu-client = { path = "crates/kaijutsu-client" }
+kaijutsu-rhai = { path = "crates/kaijutsu-rhai" }
+kaijutsu-telemetry = { path = "crates/kaijutsu-telemetry" }
+kaijutsu-agent-tools = { path = "crates/kaijutsu-agent-tools" }
 
 # Kaish (execution engine + client) — local path until next release
 kaish-kernel = { path = "../kaish/crates/kaish-kernel" }
@@ -61,18 +54,34 @@ russh = "0.56"
 # CLI
 clap = { version = "4", features = ["derive"] }
 
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+postcard = { version = "1", features = ["use-std"] }
+
 # Utilities
 log = "0.4"
 env_logger = "0.11"
 thiserror = "2"
 anyhow = "1"
 whoami = "1.5"
+uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
+strum = { version = "0.26", features = ["derive"] }
+regex = "1"
+dirs = "6"
+hostname = "0.3"
+dunce = "1"
+indexmap = "2"
 
-# Testing
+# Async utilities
 async-trait = "0.1"
 
-# Utilities
-rand = "0.8"  # must match russh's dependency
+# Concurrency
+dashmap = "6"
+parking_lot = "0.12"
+
+# RNG — pinned to 0.8 by diamond-types-extended (jumprope)
+rand = "0.8"
 shellexpand = "3"
 
 # Bevy Remote Protocol (debugging)
@@ -84,7 +93,7 @@ bevy_mesh = "0.18"
 kurbo = "0.13"
 
 # Text rendering
-cosmic-text = "0.16"
+cosmic-text = "0.16"   # pinned by Bevy 0.18
 pulldown-cmark = "0.12"
 
 # CRDT + Persistence
@@ -93,7 +102,6 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 
 # Scripting
 rhai = { version = "1.21", features = ["sync"] }
-kaijutsu-rhai = { path = "crates/kaijutsu-rhai" }
 palette = { version = "0.7", default-features = false, features = ["std"] }
 
 # LLM providers - unified via rig-core
@@ -105,19 +113,22 @@ rmcp = { version = "1.2", features = ["client", "transport-child-process", "tran
 # Vi-modal editing (keystroke → semantic action state machine)
 modalkit = { path = "../research/modalkit/crates/modalkit" }
 editor-types = { path = "../research/modalkit/crates/editor-types" }
-crossterm = "0.28.1"
+crossterm = "0.28.1"  # pinned by modalkit
 
 # System clipboard
 arboard = { version = "3", features = ["wayland-data-control"] }
 
-# Kaijutsu telemetry
-kaijutsu-telemetry = { path = "crates/kaijutsu-telemetry" }
-
-# Agent detection
-kaijutsu-agent-tools = { path = "crates/kaijutsu-agent-tools" }
-
-# OpenTelemetry
+# Tracing + OpenTelemetry
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
 opentelemetry = "0.30"
 opentelemetry_sdk = { version = "0.30", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.30", default-features = false, features = ["grpc-tonic", "trace"] }
 tracing-opentelemetry = "0.31"
+
+# Testing
+tempfile = "3"
+
+# Config
+ron = "0.9"
