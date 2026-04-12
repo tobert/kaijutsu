@@ -173,17 +173,17 @@ impl SshServer {
         Self { config }
     }
 
-    /// Spawn a background task to pre-initialize MCP servers from mcp.rhai.
+    /// Spawn a background task to pre-initialize MCP servers from mcp.toml.
     ///
     /// This runs concurrently with the SSH accept loop so server startup
     /// isn't blocked by slow MCP servers (e.g. streamable_http with no listener).
     fn start_mcp_initialization(pool: Arc<McpServerPool>, config_dir: Option<PathBuf>) {
         let config_path = config_dir
             .unwrap_or_else(|| kaish_kernel::xdg_config_home().join("kaijutsu"))
-            .join("mcp.rhai");
+            .join("mcp.toml");
 
         tokio::spawn(async move {
-            let script = match tokio::fs::read_to_string(&config_path).await {
+            let content = match tokio::fs::read_to_string(&config_path).await {
                 Ok(s) => s,
                 Err(e) => {
                     if e.kind() != std::io::ErrorKind::NotFound {
@@ -193,10 +193,10 @@ impl SshServer {
                 }
             };
 
-            let config = match kaijutsu_kernel::load_mcp_config(&script) {
+            let config = match kaijutsu_kernel::load_mcp_config_toml(&content) {
                 Ok(c) => c,
                 Err(e) => {
-                    log::warn!("Failed to parse mcp.rhai: {}", e);
+                    log::warn!("Failed to parse mcp.toml: {}", e);
                     return;
                 }
             };

@@ -27,7 +27,6 @@ pub mod kj;
 pub mod llm;
 pub mod mcp_config;
 pub mod mcp_pool;
-pub mod rhai_engine;
 pub mod state;
 pub mod tools;
 pub mod vfs;
@@ -80,10 +79,10 @@ pub use llm::{
     // Hydration
     hydrate_from_blocks,
     initialize_llm_registry,
-    load_llm_config,
-    load_models_config,
+    load_llm_config_toml,
+    load_models_config_toml,
 };
-pub use mcp_config::{McpConfig, load_mcp_config};
+pub use mcp_config::{McpConfig, load_mcp_config_toml};
 pub use mcp_pool::{
     // Resource types
     CachedResource,
@@ -101,7 +100,6 @@ pub use mcp_pool::{
     extract_tool_result_text,
     register_mcp_prompt_engines, register_mcp_resource_engines, serialize_prompt_messages,
 };
-pub use rhai_engine::RhaiEngine;
 pub use state::KernelState;
 pub use tools::{EngineArgs, ExecResult, ExecutionEngine, ToolContext, ToolInfo, ToolRegistry};
 pub use vfs::{

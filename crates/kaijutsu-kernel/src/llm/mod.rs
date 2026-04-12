@@ -33,15 +33,14 @@
 //! CRDT block operations.
 
 pub mod config;
-pub mod rhai_config;
 pub mod toml_config;
 pub mod stream;
 
 // Re-export key types
 pub use config::{ProviderConfig, ToolConfig, ToolFilter};
-pub use rhai_config::{
+pub use toml_config::{
     EmbeddingModelConfig, LlmConfig, ModelAlias, ModelsConfig, initialize_llm_registry,
-    load_llm_config, load_models_config,
+    load_llm_config_toml, load_models_config_toml,
 };
 pub use stream::{LlmStream, RigStreamAdapter, StreamEvent, StreamRequest, StreamingBlockType};
 
@@ -574,7 +573,7 @@ pub struct LlmRegistry {
     providers: HashMap<String, Arc<RigProvider>>,
     default_provider: Option<String>,
     default_model: Option<String>,
-    model_aliases: HashMap<String, rhai_config::ModelAlias>,
+    model_aliases: HashMap<String, toml_config::ModelAlias>,
     provider_configs: Option<Vec<ProviderConfig>>,
 }
 
@@ -667,7 +666,7 @@ impl LlmRegistry {
     }
 
     /// Set model aliases.
-    pub fn set_model_aliases(&mut self, aliases: HashMap<String, rhai_config::ModelAlias>) {
+    pub fn set_model_aliases(&mut self, aliases: HashMap<String, toml_config::ModelAlias>) {
         self.model_aliases = aliases;
     }
 
@@ -1304,7 +1303,7 @@ mod tests {
         let mut aliases = HashMap::new();
         aliases.insert(
             "fast".to_string(),
-            rhai_config::ModelAlias {
+            toml_config::ModelAlias {
                 provider: "anthropic".to_string(),
                 model: "claude-haiku-4-5-20251001".to_string(),
             },

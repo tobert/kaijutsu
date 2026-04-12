@@ -16,7 +16,6 @@ pub mod mount_backend;
 pub mod rpc;
 pub mod ssh;
 pub mod synthesis;
-pub mod synthesis_rhai;
 
 // Generated Cap'n Proto code
 pub mod kaijutsu_capnp {

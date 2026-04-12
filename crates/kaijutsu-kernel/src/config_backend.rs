@@ -349,15 +349,9 @@ impl ConfigCrdtBackend {
     /// Get default content for a config path.
     fn get_default_content(&self, path: &str) -> Option<String> {
         match path {
-            // TOML configs (primary)
             "theme.toml" => Some(DEFAULT_THEME.to_string()),
             "models.toml" => Some(DEFAULT_MODELS_CONFIG.to_string()),
             "mcp.toml" => Some(DEFAULT_MCP_CONFIG.to_string()),
-            // Legacy .rhai names — serve TOML defaults during transition
-            "theme.rhai" => Some(DEFAULT_THEME.to_string()),
-            "models.rhai" | "llm.rhai" => Some(DEFAULT_MODELS_CONFIG.to_string()),
-            "mcp.rhai" => Some(DEFAULT_MCP_CONFIG.to_string()),
-            // Non-config files
             "system.md" => Some(DEFAULT_SYSTEM_PROMPT.to_string()),
             _ => None,
         }
@@ -512,17 +506,9 @@ impl ConfigCrdtBackend {
     /// Validate config content syntax.
     pub fn validate(&self, path: &str, content: &str) -> ValidationResult {
         if path.ends_with(".toml") {
-            // Parse TOML to check syntax
             match toml::from_str::<toml::Value>(content) {
                 Ok(_) => ValidationResult::ok(),
                 Err(e) => ValidationResult::error(format!("TOML syntax error: {}", e)),
-            }
-        } else if path.ends_with(".rhai") {
-            // Legacy: parse Rhai to check syntax (transition period)
-            let engine = rhai::Engine::new();
-            match engine.compile(content) {
-                Ok(_) => ValidationResult::ok(),
-                Err(e) => ValidationResult::error(format!("Rhai syntax error: {}", e)),
             }
         } else {
             // Unknown format (e.g. .md), accept anything
@@ -625,7 +611,6 @@ impl ConfigCrdtBackend {
 
                                 // Watch config files
                                 if path_str.ends_with(".toml")
-                                    || path_str.ends_with(".rhai")
                                     || path_str.ends_with(".md")
                                 {
                                     let _ = tx.try_send(ConfigFileChange {
@@ -862,20 +847,6 @@ mod tests {
     }
 
     #[test]
-    fn test_validation_rhai_legacy() {
-        let blocks = shared_block_store(PrincipalId::system());
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let backend = ConfigCrdtBackend::new(blocks, temp_dir.path().to_path_buf());
-
-        // Rhai validation still works during transition
-        let result = backend.validate("theme.rhai", "let x = 42;");
-        assert!(result.valid);
-
-        let result = backend.validate("theme.rhai", "let x = ");
-        assert!(!result.valid);
-    }
-
-    #[test]
     fn test_context_id_deterministic() {
         let id1 = config_context_id("theme.toml");
         let id2 = config_context_id("theme.toml");
@@ -892,18 +863,4 @@ mod tests {
         assert!(DEFAULT_THEME.contains("bg = "));
     }
 
-    #[test]
-    fn test_legacy_rhai_names_serve_toml_defaults() {
-        let blocks = shared_block_store(PrincipalId::system());
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let backend = ConfigCrdtBackend::new(blocks, temp_dir.path().to_path_buf());
-
-        // Legacy .rhai names should still return content (TOML defaults)
-        let theme = backend.get_default_content("theme.rhai");
-        assert!(theme.is_some());
-        assert!(theme.unwrap().contains("bg = "));
-
-        let models = backend.get_default_content("models.rhai");
-        assert!(models.is_some());
-    }
 }

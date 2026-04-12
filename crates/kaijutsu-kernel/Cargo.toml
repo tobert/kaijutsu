@@ -39,9 +39,6 @@ notify = "7"
 # Config parsing
 toml = { workspace = true }
 
-# Scripting
-rhai.workspace = true
-kaijutsu-rhai.workspace = true
 
 # ABC music notation
 kaijutsu-abc.workspace = true

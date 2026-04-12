@@ -135,7 +135,7 @@ impl KjBuiltin {
         let Some(ref idx) = self.semantic_index else {
             return ExecResult::failure(
                 1,
-                "semantic index not configured (check embedding model in models.rhai)".to_string(),
+                "semantic index not configured (check embedding model in models.toml)".to_string(),
             );
         };
 
@@ -178,7 +178,7 @@ impl KjBuiltin {
                     .map_err(|e| format!("index: {e}"))?;
 
                 let synth =
-                    crate::synthesis_rhai::run_synthesis(ctx_id, idx.embedder_arc(), block_source);
+                    crate::synthesis::run_synthesis(ctx_id, idx.embedder_arc(), block_source);
 
                 Ok::<Option<(bool, Option<kaijutsu_index::synthesis::SynthesisResult>)>, String>(
                     Some((was_indexed, synth)),
@@ -224,7 +224,7 @@ impl KjBuiltin {
         let Some(ref idx) = self.semantic_index else {
             return ExecResult::failure(
                 1,
-                "semantic index not configured (check embedding model in models.rhai)".to_string(),
+                "semantic index not configured (check embedding model in models.toml)".to_string(),
             );
         };
 
@@ -252,7 +252,7 @@ impl KjBuiltin {
                 .map_err(|e| format!("index: {e}"))?;
 
             let synth =
-                crate::synthesis_rhai::run_synthesis(ctx_id, idx.embedder_arc(), block_source);
+                crate::synthesis::run_synthesis(ctx_id, idx.embedder_arc(), block_source);
 
             if let Some(ref s) = synth {
                 idx.synthesis_cache().insert(ctx_id, s.clone());
@@ -298,7 +298,7 @@ impl KjBuiltin {
     fn synth_status(&self) -> ExecResult {
         let Some(ref idx) = self.semantic_index else {
             return ExecResult::success(
-                "semantic index: not configured\n(set embedding model in models.rhai)".to_string(),
+                "semantic index: not configured\n(set embedding model in models.toml)".to_string(),
             );
         };
 

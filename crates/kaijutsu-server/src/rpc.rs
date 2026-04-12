@@ -120,8 +120,6 @@ use kaijutsu_kernel::{
     McpTransport,
     ReadEngine,
     register_mcp_prompt_engines, register_mcp_resource_engines,
-    // Rhai scripting
-    RhaiEngine,
     SharedBlockFlowBus,
     SharedBlockStore,
     SharedConfigFlowBus,
@@ -346,7 +344,7 @@ async fn register_block_tools(
         .await;
 
     // Rhai scripting is registered later (after semantic index init) so synthesis
-    // functions can be injected. See the register_rhai_engine() call after
+    // functions can be injected. See the tool registration call after
     // initialize_kernel_models().
 }
 
@@ -670,70 +668,55 @@ async fn create_config_backend(
 
 /// Initialize a kernel's LLM registry from its config backend.
 ///
-/// Loads `models.rhai` from the config CRDT, parses it, and populates
+/// Loads `models.toml` from the config CRDT, parses it, and populates
 /// the kernel's `LlmRegistry` with providers and aliases. Returns the
 /// embedding config if present (for semantic index initialization).
 async fn initialize_kernel_models(
     kernel: &Arc<Kernel>,
     config_backend: &Arc<ConfigCrdtBackend>,
 ) -> Option<kaijutsu_kernel::EmbeddingModelConfig> {
-    // Try TOML first, fall back to legacy .rhai
-    let (config_name, content) = if config_backend.ensure_config("models.toml").await.is_ok() {
-        match config_backend.get_content("models.toml") {
-            Ok(c) => ("models.toml", c),
-            Err(_) => return None,
-        }
-    } else if config_backend.ensure_config("models.rhai").await.is_ok() {
-        match config_backend.get_content("models.rhai") {
-            Ok(c) => ("models.rhai", c),
-            Err(_) => return None,
-        }
-    } else {
-        log::warn!("Failed to load models config");
+    if let Err(e) = config_backend.ensure_config("models.toml").await {
+        log::warn!("Failed to load models.toml: {}", e);
         return None;
+    }
+
+    let content = match config_backend.get_content("models.toml") {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("Failed to read models.toml: {}", e);
+            return None;
+        }
     };
 
-    // Parse with appropriate parser
-    let parse_result = if config_name.ends_with(".toml") {
-        kaijutsu_kernel::llm::toml_config::load_models_config_toml(&content)
-    } else {
-        kaijutsu_kernel::load_models_config(&content)
-    };
-
-    match parse_result {
+    match kaijutsu_kernel::load_models_config_toml(&content) {
         Ok(models_config) => {
             let registry = kaijutsu_kernel::initialize_llm_registry(&models_config.llm);
             *kernel.llm().write().await = registry;
-            log::info!("Initialized kernel LLM registry from {}", config_name);
+            log::info!("Initialized kernel LLM registry from models.toml");
             models_config.embedding
         }
         Err(e) => {
-            log::warn!("Failed to parse {}: {}, reloading from disk", config_name, e);
-            if let Err(reload_err) = config_backend.reload_from_disk(config_name).await {
-                log::error!("Failed to reload {} from disk: {}", config_name, reload_err);
+            log::warn!("Failed to parse models.toml: {}, reloading from disk", e);
+            if let Err(reload_err) = config_backend.reload_from_disk("models.toml").await {
+                log::error!("Failed to reload models.toml from disk: {}", reload_err);
                 return None;
             }
-            let content = match config_backend.get_content(config_name) {
+            let content = match config_backend.get_content("models.toml") {
                 Ok(c) => c,
                 Err(e) => {
-                    log::error!("Failed to read reloaded {}: {}", config_name, e);
+                    log::error!("Failed to read reloaded models.toml: {}", e);
                     return None;
                 }
             };
-            let parse_result = if config_name.ends_with(".toml") {
-                kaijutsu_kernel::llm::toml_config::load_models_config_toml(&content)
-            } else {
-                kaijutsu_kernel::load_models_config(&content)
-            };
-            match parse_result {
+            match kaijutsu_kernel::load_models_config_toml(&content) {
                 Ok(models_config) => {
                     let registry = kaijutsu_kernel::initialize_llm_registry(&models_config.llm);
                     *kernel.llm().write().await = registry;
-                    log::info!("Initialized kernel LLM registry from {} (reloaded)", config_name);
+                    log::info!("Initialized kernel LLM registry from models.toml (reloaded)");
                     models_config.embedding
                 }
                 Err(e) => {
-                    log::error!("Failed to parse {} even after reload: {}", config_name, e);
+                    log::error!("Failed to parse models.toml even after reload: {}", e);
                     None
                 }
             }
@@ -741,52 +724,29 @@ async fn initialize_kernel_models(
     }
 }
 
-/// Initialize MCP servers from kernel's config.
-///
-/// Loads MCP config from TOML (primary) or .rhai (legacy), parses server
-/// definitions, and registers them concurrently in the MCP pool.
+/// Initialize MCP servers from kernel's `mcp.toml` config.
 async fn initialize_kernel_mcp(
     kernel: &Arc<Kernel>,
     config_backend: &Arc<ConfigCrdtBackend>,
     mcp_pool: &Arc<McpServerPool>,
 ) {
-    // Try TOML first, fall back to legacy .rhai
-    let (config_name, content) = if config_backend.ensure_config("mcp.toml").await.is_ok() {
-        match config_backend.get_content("mcp.toml") {
-            Ok(c) => ("mcp.toml", c),
-            Err(e) => {
-                log::warn!("Failed to read mcp.toml content: {}", e);
-                return;
-            }
-        }
-    } else if config_backend.ensure_config("mcp.rhai").await.is_ok() {
-        match config_backend.get_content("mcp.rhai") {
-            Ok(c) => ("mcp.rhai", c),
-            Err(e) => {
-                log::warn!("Failed to read mcp.rhai content: {}", e);
-                return;
-            }
-        }
-    } else {
-        log::warn!("Failed to load MCP config");
+    if let Err(e) = config_backend.ensure_config("mcp.toml").await {
+        log::warn!("Failed to load mcp.toml: {}", e);
         return;
+    }
+    let content = match config_backend.get_content("mcp.toml") {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("Failed to read mcp.toml: {}", e);
+            return;
+        }
     };
 
-    let config = if config_name.ends_with(".toml") {
-        match kaijutsu_kernel::mcp_config::load_mcp_config_toml(&content) {
-            Ok(c) => c,
-            Err(e) => {
-                log::warn!("Failed to parse {}: {}", config_name, e);
-                return;
-            }
-        }
-    } else {
-        match kaijutsu_kernel::load_mcp_config(&content) {
-            Ok(c) => c,
-            Err(e) => {
-                log::warn!("Failed to parse {}: {}", config_name, e);
-                return;
-            }
+    let config = match kaijutsu_kernel::mcp_config::load_mcp_config_toml(&content) {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("Failed to parse mcp.toml: {}", e);
+            return;
         }
     };
 
@@ -797,8 +757,7 @@ async fn initialize_kernel_mcp(
     let already_registered = mcp_pool.list_servers();
 
     log::info!(
-        "Registering MCP servers from {} ({} configured, {} already in pool)",
-        config_name,
+        "Registering MCP servers from mcp.toml ({} configured, {} already in pool)",
         config.servers.len(),
         already_registered.len(),
     );
@@ -1302,10 +1261,10 @@ pub async fn create_shared_kernel(
         }
     }
 
-    // Initialize LLM registry + embedding config from models.rhai
+    // Initialize LLM registry + embedding config from models.toml
     let embedding_config = initialize_kernel_models(&kernel_arc, &config_backend).await;
 
-    // Initialize MCP servers from mcp.rhai config
+    // Initialize MCP servers from mcp.toml config
     initialize_kernel_mcp(&kernel_arc, &config_backend, mcp_pool).await;
 
     // Register MCP resource tools (list, read, subscribe, unsubscribe)
@@ -1393,30 +1352,6 @@ pub async fn create_shared_kernel(
     } else {
         None
     };
-
-    // ── Rhai scripting (registered after semantic index so synthesis fns are available) ──
-    {
-        let rhai_engine = if let Some(ref idx) = semantic_index {
-            let embedder = idx.embedder_arc();
-            let bs: Arc<dyn kaijutsu_index::BlockSource> =
-                Arc::new(BlockStoreSource(documents.clone()));
-            RhaiEngine::new(documents.clone()).with_extra_registrar(Arc::new(move |eng| {
-                crate::synthesis_rhai::register_synthesis_fns(eng, embedder.clone(), bs.clone());
-            }))
-        } else {
-            RhaiEngine::new(documents.clone())
-        };
-        kernel_arc
-            .register_tool_with_engine(
-                ToolInfo::new(
-                    "rhai",
-                    "Execute Rhai scripts with persistent per-context state",
-                    "kernel",
-                ),
-                Arc::new(rhai_engine),
-            )
-            .await;
-    }
 
     // Create kj dispatcher — shared across all connections
     let kj_dispatcher = Arc::new(kaijutsu_kernel::KjDispatcher::new(
@@ -1734,12 +1669,9 @@ impl kernel::Server for KernelImpl {
 
         Promise::from_future(async move {
             let _guard = _span.entered();
-            let mut completions = Vec::new();
+            let completions: Vec<String> = Vec::new();
 
-            // Get completions from the rhai engine (registered as "rhai" tool).
-            if let Some(engine) = kernel_arc.get_engine("rhai").await {
-                completions.extend(engine.complete(&partial, cursor).await);
-            }
+            // TODO: kaish completions can be added here when available
 
             let builder = results.get();
             let mut list = builder.init_completions(completions.len() as u32);

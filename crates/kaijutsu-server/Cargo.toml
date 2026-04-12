@@ -35,10 +35,6 @@ dashmap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
-# Scripting
-rhai.workspace = true
-kaijutsu-rhai.workspace = true
-
 # Hostname detection
 hostname = { workspace = true }
 

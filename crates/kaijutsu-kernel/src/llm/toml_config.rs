@@ -1,16 +1,120 @@
 //! TOML-driven LLM configuration.
 //!
-//! Parses `models.toml` into the same `ModelsConfig` / `LlmConfig` types
-//! used by the Rhai parser, enabling a gradual migration.
+//! Defines the canonical config types (`LlmConfig`, `ModelsConfig`, etc.)
+//! and parses `models.toml` into them.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::config::{ProviderConfig, ToolFilter};
-use super::{LlmError, LlmResult};
-use super::rhai_config::{EmbeddingModelConfig, LlmConfig, ModelAlias, ModelsConfig};
+use super::{LlmError, LlmRegistry, LlmResult, RigProvider};
+
+// ---------------------------------------------------------------------------
+// Canonical config types (moved from rhai_config.rs)
+// ---------------------------------------------------------------------------
+
+/// Structured LLM configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmConfig {
+    /// Name of the default provider (must be present in `providers`).
+    pub default_provider: String,
+    /// Provider configurations keyed by name.
+    pub providers: Vec<ProviderConfig>,
+    /// Short names that resolve to a specific provider + model.
+    pub model_aliases: HashMap<String, ModelAlias>,
+}
+
+/// A model alias maps a short name to a specific provider and model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelAlias {
+    pub provider: String,
+    pub model: String,
+}
+
+/// Full models configuration (LLM + embedding).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelsConfig {
+    /// LLM provider settings.
+    pub llm: LlmConfig,
+    /// Embedding model settings (for semantic indexing).
+    pub embedding: Option<EmbeddingModelConfig>,
+}
+
+/// Configuration for a local ONNX embedding model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingModelConfig {
+    /// Whether embedding is enabled.
+    pub enabled: bool,
+    /// Directory containing model.onnx + tokenizer.json.
+    pub model_dir: PathBuf,
+    /// Output embedding dimensions (e.g. 384 for bge-small).
+    pub dimensions: usize,
+    /// Maximum input tokens (truncated beyond this).
+    pub max_tokens: usize,
+}
+
+/// Build an `LlmRegistry` from a parsed `LlmConfig`.
+pub fn initialize_llm_registry(config: &LlmConfig) -> LlmRegistry {
+    let mut registry = LlmRegistry::new();
+
+    for provider_config in &config.providers {
+        if !provider_config.enabled {
+            tracing::debug!(
+                provider = %provider_config.provider_type,
+                "skipping disabled provider"
+            );
+            continue;
+        }
+
+        match RigProvider::from_config(provider_config) {
+            Ok(provider) => {
+                let name = provider_config.provider_type.clone();
+                tracing::info!(provider = %name, "registered LLM provider");
+                registry.register(&name, Arc::new(provider));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    provider = %provider_config.provider_type,
+                    error = %e,
+                    "failed to initialize provider (missing API key?)"
+                );
+            }
+        }
+    }
+
+    // Set default provider
+    if registry.set_default(&config.default_provider) {
+        if let Some(pc) = config
+            .providers
+            .iter()
+            .find(|p| p.provider_type == config.default_provider)
+            && let Some(ref model) = pc.default_model
+        {
+            registry.set_default_model(model);
+        }
+        tracing::info!(provider = %config.default_provider, "set default LLM provider");
+    } else {
+        let available: Vec<_> = registry.list().iter().map(|s| s.to_string()).collect();
+        if let Some(first) = available.first() {
+            registry.set_default(first);
+            tracing::warn!(
+                requested = %config.default_provider,
+                fallback = %first,
+                "default provider unavailable, using fallback"
+            );
+        } else {
+            tracing::warn!("no LLM providers available");
+        }
+    }
+
+    registry.set_model_aliases(config.model_aliases.clone());
+    registry.set_provider_configs(config.providers.clone());
+
+    registry
+}
 
 // ---------------------------------------------------------------------------
 // Intermediate serde structs (TOML shape → internal types)
@@ -337,45 +441,11 @@ model_dir = "/tmp/model"
     }
 
     #[test]
-    fn test_parity_with_rhai_defaults() {
-        // Load the same config from both formats and verify structural equivalence
-        let rhai_script = include_str!("../../../../assets/defaults/models.rhai");
-        let rhai_config = super::super::rhai_config::load_models_config(rhai_script).unwrap();
-        let toml_config = load_models_config_toml(DEFAULT_TOML).unwrap();
-
-        // Same default provider
-        assert_eq!(
-            rhai_config.llm.default_provider,
-            toml_config.llm.default_provider
-        );
-
-        // Same number of providers
-        assert_eq!(
-            rhai_config.llm.providers.len(),
-            toml_config.llm.providers.len()
-        );
-
-        // Same model aliases (by key)
-        assert_eq!(
-            rhai_config.llm.model_aliases.len(),
-            toml_config.llm.model_aliases.len()
-        );
-        for (key, rhai_alias) in &rhai_config.llm.model_aliases {
-            let toml_alias = toml_config
-                .llm
-                .model_aliases
-                .get(key)
-                .unwrap_or_else(|| panic!("missing alias: {key}"));
-            assert_eq!(rhai_alias.provider, toml_alias.provider, "alias {key}");
-            assert_eq!(rhai_alias.model, toml_alias.model, "alias {key}");
-        }
-
-        // Both have embedding
-        assert!(rhai_config.embedding.is_some());
-        assert!(toml_config.embedding.is_some());
-        let rhai_emb = rhai_config.embedding.unwrap();
-        let toml_emb = toml_config.embedding.unwrap();
-        assert_eq!(rhai_emb.dimensions, toml_emb.dimensions);
-        assert_eq!(rhai_emb.max_tokens, toml_emb.max_tokens);
+    fn test_initialize_registry_skips_disabled() {
+        let config = load_models_config_toml(DEFAULT_TOML).unwrap();
+        let registry = initialize_llm_registry(&config.llm);
+        // Disabled providers (gemini, openai) should not be registered
+        assert!(registry.get("gemini").is_none());
+        assert!(registry.get("openai").is_none());
     }
 }
