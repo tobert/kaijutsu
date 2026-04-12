@@ -433,6 +433,46 @@ fn compute_border_style(
                 bottom_label: None,
             })
         }
+        BlockKind::Error => {
+            let (color, animation, border_kind) =
+                match block.error.as_ref().map(|e| e.severity) {
+                    Some(kaijutsu_types::ErrorSeverity::Warning) => (
+                        theme.block_border_error_warning,
+                        BorderAnimation::None,
+                        BorderKind::Dashed,
+                    ),
+                    Some(kaijutsu_types::ErrorSeverity::Fatal) => (
+                        theme.block_border_error_fatal,
+                        BorderAnimation::Pulse,
+                        BorderKind::Full,
+                    ),
+                    _ => (
+                        theme.block_border_error,
+                        BorderAnimation::Pulse,
+                        BorderKind::Full,
+                    ),
+                };
+            let severity_label = block
+                .error
+                .as_ref()
+                .map(|e| e.severity.as_str())
+                .unwrap_or("error");
+            let category_label = block
+                .error
+                .as_ref()
+                .map(|e| e.category.as_str())
+                .unwrap_or("error");
+            Some(BlockBorderStyle {
+                kind: border_kind,
+                color,
+                thickness: theme.block_border_thickness,
+                corner_radius: theme.block_border_corner_radius,
+                padding,
+                animation,
+                top_label: Some(format!("{} {}", category_label, severity_label)),
+                bottom_label: None,
+            })
+        }
         // File, Drift Push/Commit — no border
         _ => None,
     };

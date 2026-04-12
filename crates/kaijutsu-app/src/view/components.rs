@@ -671,6 +671,80 @@ impl LayoutGeneration {
 }
 
 // ============================================================================
+// ERROR CHILD INDEX
+// ============================================================================
+
+/// Index mapping parent block IDs to their Error-kind children.
+///
+/// Rebuilt every time `LayoutGeneration` bumps. The renderer uses this to
+/// decide whether a parent block should collapse to a stub with errors
+/// stacked below it.
+#[derive(Resource, Default)]
+pub struct ErrorChildIndex {
+    pub by_parent: std::collections::HashMap<BlockId, Vec<BlockId>>,
+    generation: u64,
+}
+
+impl ErrorChildIndex {
+    /// Check if this block has any Error children.
+    pub fn has_errors(&self, block_id: &BlockId) -> bool {
+        self.by_parent.contains_key(block_id)
+    }
+
+    /// Get Error children of a block (empty slice if none).
+    pub fn children(&self, block_id: &BlockId) -> &[BlockId] {
+        self.by_parent
+            .get(block_id)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+}
+
+/// Rebuild the `ErrorChildIndex` when blocks change.
+pub fn build_error_child_index(
+    mut idx: ResMut<ErrorChildIndex>,
+    main_cells: Query<&CellEditor, With<MainCell>>,
+    layout_gen: Res<LayoutGeneration>,
+) {
+    if idx.generation == layout_gen.0 {
+        return;
+    }
+    idx.generation = layout_gen.0;
+    idx.by_parent.clear();
+    let Ok(editor) = main_cells.single() else {
+        return;
+    };
+    for block in editor.blocks() {
+        if block.kind == BlockKind::Error {
+            if let Some(parent) = block.parent_id {
+                idx.by_parent.entry(parent).or_default().push(block.id);
+            }
+        }
+    }
+}
+
+/// Local-only UI state: which parent blocks have been expanded by the user
+/// to show full content alongside their error children.
+///
+/// Not persisted, not in CRDT — purely per-viewer.
+#[derive(Resource, Default)]
+pub struct ExpandedErrorParents {
+    pub expanded: std::collections::HashSet<BlockId>,
+}
+
+impl ExpandedErrorParents {
+    pub fn is_expanded(&self, id: &BlockId) -> bool {
+        self.expanded.contains(id)
+    }
+
+    pub fn toggle(&mut self, id: BlockId) {
+        if !self.expanded.remove(&id) {
+            self.expanded.insert(id);
+        }
+    }
+}
+
+// ============================================================================
 // BLOCK-ORIENTED UI COMPONENTS
 // ============================================================================
 //

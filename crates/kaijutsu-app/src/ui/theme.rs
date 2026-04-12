@@ -121,6 +121,14 @@ pub struct Theme {
     pub block_tool_result: Color,
     /// Tool error block text color (red)
     pub block_tool_error: Color,
+    /// Error block text color — warning severity (amber)
+    pub block_error_warning: Color,
+    /// Error block text color — error severity (red, aliases block_tool_error)
+    pub block_error_severity: Color,
+    /// Error block text color — fatal severity (dark red)
+    pub block_error_fatal: Color,
+    /// Error block stub accent color (collapsed parent header strip)
+    pub block_error_accent: Color,
     /// Drift push block text color (cyan — conversational)
     pub block_drift_push: Color,
     /// Drift pull/distill block text color (blue — substantive)
@@ -331,6 +339,10 @@ pub struct Theme {
     pub block_border_tool_result: Color,
     /// Error border color (red, default from block_tool_error)
     pub block_border_error: Color,
+    /// Warning-severity error border color (amber, dashed)
+    pub block_border_error_warning: Color,
+    /// Fatal-severity error border color (dark red)
+    pub block_border_error_fatal: Color,
     /// Thinking border color (dim gray, default from block_thinking)
     pub block_border_thinking: Color,
     /// Drift border color (blue, default from block_drift_pull)
@@ -416,6 +428,10 @@ impl Default for Theme {
             block_tool_call: Color::srgb(0.878, 0.686, 0.404), // #e0af68 amber
             block_tool_result: Color::srgb(0.620, 0.808, 0.416), // #9ece6a green
             block_tool_error: Color::srgb(0.969, 0.463, 0.557), // #f7768e red
+            block_error_warning: Color::srgb(0.878, 0.686, 0.404), // #e0af68 amber
+            block_error_severity: Color::srgb(0.969, 0.463, 0.557), // #f7768e red (same as block_tool_error)
+            block_error_fatal: Color::srgb(0.769, 0.118, 0.227), // #c41e3a dark red
+            block_error_accent: Color::srgba(0.969, 0.463, 0.557, 0.5), // #f7768e red, half alpha
             block_drift_push: Color::srgb(0.490, 0.812, 1.00), // #7dcfff cyan
             block_drift_pull: Color::srgb(0.478, 0.635, 0.969), // #7aa2f7 blue
             block_drift_merge: Color::srgb(0.733, 0.604, 0.969), // #bb9af7 purple
@@ -577,6 +593,8 @@ impl Default for Theme {
             block_border_tool_call: Color::srgba(1.00, 0.67, 0.00, 0.6), // #ffaa00 amber
             block_border_tool_result: Color::srgba(0.00, 1.00, 0.53, 0.4), // #00ff88 green
             block_border_error: Color::srgba(1.00, 0.13, 0.38, 0.8),     // #ff2060 red
+            block_border_error_warning: Color::srgba(0.878, 0.686, 0.404, 0.7), // #e0af68 amber
+            block_border_error_fatal: Color::srgba(0.769, 0.118, 0.227, 0.9),   // #c41e3a dark red
             block_border_thinking: Color::srgba(0.38, 0.50, 0.63, 0.3),  // #6080a0 muted
             block_border_drift: Color::srgba(0.00, 0.67, 1.00, 0.5),     // #00aaff blue
             block_border_thickness: 1.5,

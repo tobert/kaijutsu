@@ -107,7 +107,9 @@ impl Plugin for CellPlugin {
             .init_resource::<PendingContextSwitch>()
             .init_resource::<EditorEntities>()
             .init_resource::<OverlaySummonState>()
-            .init_resource::<ShellDockSummonState>();
+            .init_resource::<ShellDockSummonState>()
+            .init_resource::<crate::view::components::ErrorChildIndex>()
+            .init_resource::<crate::view::components::ExpandedErrorParents>();
 
         // ====================================================================
         // CellPhase::Sync — server events, document sync, prompt submission
@@ -166,9 +168,12 @@ impl Plugin for CellPlugin {
                 view_shell_dock::sync_shell_dock_style_to_theme,
                 // Highlighting
                 view_render::highlight_focused_block.after(view_render::sync_block_cell_buffers),
+                // Error child index (must run before block border style)
+                crate::view::components::build_error_child_index
+                    .after(view_render::sync_block_cell_buffers),
                 // Block border style
                 block_border::determine_block_border_style
-                    .after(view_render::sync_block_cell_buffers),
+                    .after(crate::view::components::build_error_child_index),
                 ApplyDeferred.after(block_border::determine_block_border_style),
             )
                 .in_set(CellPhase::Buffer),

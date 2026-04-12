@@ -41,6 +41,13 @@ pub fn block_color(block: &BlockSnapshot, theme: &Theme) -> bevy::prelude::Color
                 theme.block_tool_result
             }
         }
+        BlockKind::Error => {
+            match block.error.as_ref().map(|e| e.severity) {
+                Some(kaijutsu_types::ErrorSeverity::Warning) => theme.block_error_warning,
+                Some(kaijutsu_types::ErrorSeverity::Fatal) => theme.block_error_fatal,
+                _ => theme.block_error_severity,
+            }
+        }
         BlockKind::Drift => match block.drift_kind {
             Some(DriftKind::Push) => theme.block_drift_push,
             Some(DriftKind::Pull) | Some(DriftKind::Distill) => theme.block_drift_pull,
@@ -653,6 +660,18 @@ fn format_block_inner(block: &BlockSnapshot, local_ctx: Option<ContextId>) -> St
             format!("{}\n{}", path, block.content)
         }
         BlockKind::Drift => format_drift_block(block, local_ctx),
+        BlockKind::Error => {
+            // Show summary (content), optionally with detail
+            if let Some(ref payload) = block.error {
+                if let Some(ref detail) = payload.detail {
+                    format!("{}\n{}", block.content, detail)
+                } else {
+                    block.content.clone()
+                }
+            } else {
+                block.content.clone()
+            }
+        }
     }
 }
 

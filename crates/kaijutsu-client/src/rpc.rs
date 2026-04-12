@@ -2469,6 +2469,7 @@ mod tests {
             BlockKind::ToolResult => crate::kaijutsu_capnp::BlockKind::ToolResult,
             BlockKind::Drift => crate::kaijutsu_capnp::BlockKind::Drift,
             BlockKind::File => crate::kaijutsu_capnp::BlockKind::File,
+            BlockKind::Error => crate::kaijutsu_capnp::BlockKind::Error,
         });
 
         // Set role

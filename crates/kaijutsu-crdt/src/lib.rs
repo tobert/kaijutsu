@@ -32,8 +32,8 @@ mod ops;
 // Re-export types from kaijutsu-types
 pub use kaijutsu_types::{
     BlockFilter, BlockHeader, BlockId, BlockKind, BlockQuery, BlockSnapshot, BlockSnapshotBuilder,
-    ContentType, ContextId, DriftKind, KernelId, MAX_DAG_DEPTH, OutputData, OutputEntryType,
-    OutputNode,
+    ContentType, ContextId, DriftKind, ErrorCategory, ErrorPayload, ErrorSeverity, ErrorSpan,
+    KernelId, MAX_DAG_DEPTH, OutputData, OutputEntryType, OutputNode,
     PrefixError, PrefixResolvable, PrincipalId, Role, SessionId, Status, ToolKind,
     resolve_context_prefix,
 };
