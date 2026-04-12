@@ -1588,7 +1588,7 @@ mod tests {
             ..ToolContext::test()
         };
 
-        // Create a block (this DOES auto_save via insert_block_as)
+        // Create a block (this journals ops via insert_block_as)
         let engine = BlockCreateEngine::new(store.clone());
         let params = r#"{"role": "user", "kind": "text", "content": "hello"}"#;
         let result = engine.execute(params, &tool_ctx).await.unwrap();
