@@ -305,6 +305,8 @@ impl StreamRequest {
             additional_params: None,
             tool_choice: None,
             documents: vec![],
+            model: None,
+            output_schema: None,
         };
 
         // Add thinking params if enabled (Anthropic-specific)
@@ -530,8 +532,13 @@ impl LlmStream for RigStreamAdapter {
                                     // Tool call deltas are partial updates, we handle complete tool calls
                                 }
                                 StreamedAssistantContent::Reasoning(reasoning) => {
-                                    if !reasoning.reasoning.is_empty() {
-                                        let text = reasoning.reasoning.join("");
+                                    if !reasoning.content.is_empty() {
+                                        let text: String = reasoning.content.iter().filter_map(|c| {
+                                            match c {
+                                                rig::message::ReasoningContent::Text { text, .. } => Some(text.as_str()),
+                                                _ => None,
+                                            }
+                                        }).collect();
                                         if !text.is_empty() {
                                             // Check for block transition: was Text, now Thinking
                                             if self.current_block == Some(StreamingBlockType::Text) {

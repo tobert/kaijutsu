@@ -105,7 +105,7 @@ rhai = { version = "1.24", features = ["sync"] }
 palette = { version = "0.7", default-features = false, features = ["std"] }
 
 # LLM providers - unified via rig-core
-rig-core = "0.30"
+rig-core = "0.34"
 
 # MCP (Model Context Protocol)
 rmcp = { version = "1.4", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
