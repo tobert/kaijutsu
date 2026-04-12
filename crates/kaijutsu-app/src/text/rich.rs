@@ -312,15 +312,12 @@ fn try_parse_svg(
             Some((svg.scene, svg.width, svg.height, source))
         }
         Err(e) => {
-            // Kernel-side usvg validation should have caught this already.
-            // A divergence here is a bug (version mismatch or mid-stream snapshot).
-            #[cfg(debug_assertions)]
-            panic!("SVG re-parse failed after kernel validation: {e}");
-            #[cfg(not(debug_assertions))]
-            {
-                warn!("SVG client re-parse failed (kernel should have caught this): {e}");
-                None
-            }
+            // During streaming (Status::Running), incomplete SVG is expected to
+            // fail parsing — just return None and let the block render as text.
+            // After Status::Done, the kernel should have already validated and
+            // attached Error children; a parse failure here is a real divergence.
+            warn!("SVG parse failed (may be mid-stream): {e}");
+            None
         }
     }
 }

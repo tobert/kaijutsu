@@ -1160,14 +1160,41 @@ pub fn hydrate_from_blocks(blocks: &[kaijutsu_types::BlockSnapshot]) -> Vec<Mess
                     .is_some_and(|parent| parent.kind == BlockKind::ToolResult);
 
                 if parent_is_tool_result {
-                    // Fold into the last pending tool_result if it's still buffered
-                    if let Some(ContentBlock::ToolResult { content, .. }) =
-                        state.tool_results.last_mut()
-                    {
-                        content.push_str("\n\n");
-                        content.push_str(&envelope);
+                    // Find the matching tool_result by parent's tool_use_id
+                    let parent_tool_use_id = block
+                        .parent_id
+                        .and_then(|pid| blocks_by_id.get(&pid))
+                        .and_then(|p| p.tool_use_id.as_deref());
+
+                    let folded = if let Some(target_id) = parent_tool_use_id {
+                        state
+                            .tool_results
+                            .iter_mut()
+                            .find_map(|tr| {
+                                if let ContentBlock::ToolResult {
+                                    tool_use_id,
+                                    content,
+                                    ..
+                                } = tr
+                                {
+                                    if tool_use_id == target_id {
+                                        content.push_str("\n\n");
+                                        content.push_str(&envelope);
+                                        Some(())
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            })
+                            .is_some()
                     } else {
-                        // Parent's tool_result already flushed — emit standalone
+                        false
+                    };
+
+                    if !folded {
+                        // Parent's tool_result already flushed or not found — standalone
                         state.flush_all();
                         state.messages.push(Message::user(envelope));
                     }

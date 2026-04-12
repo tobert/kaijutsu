@@ -498,7 +498,7 @@ pub fn format_error_for_llm(block: &BlockSnapshot) -> String {
     }
 
     let body = if let Some(ref detail) = payload.detail {
-        if detail.len() > ERROR_DETAIL_HYDRATION_BUDGET {
+        if detail.chars().count() > ERROR_DETAIL_HYDRATION_BUDGET {
             let truncated: String = detail.chars().take(ERROR_DETAIL_HYDRATION_BUDGET).collect();
             format!("{}\n...[truncated]", truncated)
         } else {
