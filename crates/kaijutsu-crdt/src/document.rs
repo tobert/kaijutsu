@@ -2915,4 +2915,84 @@ mod tests {
         let snap2 = doc.get_block_snapshot(&id2).unwrap();
         assert_eq!(snap2.content, "Still streaming");
     }
+
+    #[test]
+    fn test_error_block_crdt_roundtrip() {
+        let mut doc = test_doc();
+
+        // Insert a parent text block
+        let parent_id = doc
+            .insert_block(None, None, Role::User, BlockKind::Text, "hello", Status::Done)
+            .unwrap();
+
+        // Build an error block snapshot and insert via insert_from_snapshot
+        let error_id = doc.new_block_id();
+        let payload = kaijutsu_types::ErrorPayload {
+            category: kaijutsu_types::ErrorCategory::Parse,
+            severity: kaijutsu_types::ErrorSeverity::Warning,
+            code: Some("abc.missing_meter".into()),
+            detail: Some("Missing M: field at line 3".into()),
+            span: Some(kaijutsu_types::ErrorSpan {
+                line: 3,
+                column: 1,
+                length: 0,
+            }),
+            source_kind: Some(BlockKind::Text),
+        };
+        let snap = BlockSnapshot::error_for(
+            error_id,
+            parent_id,
+            payload.clone(),
+            "parse error (abc.missing_meter): Missing M: field at line 3",
+        );
+        doc.insert_from_snapshot(snap, Some(&parent_id)).unwrap();
+
+        // Read it back and verify all fields survive the CRDT round-trip
+        let read = doc.get_block_snapshot(&error_id).unwrap();
+        assert_eq!(read.kind, BlockKind::Error);
+        assert_eq!(read.role, Role::System);
+        assert_eq!(read.status, Status::Error);
+        assert_eq!(read.parent_id, Some(parent_id));
+        assert!(read.content.contains("abc.missing_meter"));
+
+        let ep = read.error.expect("error payload should survive CRDT round-trip");
+        assert_eq!(ep.category, kaijutsu_types::ErrorCategory::Parse);
+        assert_eq!(ep.severity, kaijutsu_types::ErrorSeverity::Warning);
+        assert_eq!(ep.code.as_deref(), Some("abc.missing_meter"));
+        assert_eq!(ep.detail.as_deref(), Some("Missing M: field at line 3"));
+        let span = ep.span.expect("span should survive");
+        assert_eq!(span.line, 3);
+        assert_eq!(span.column, 1);
+        assert_eq!(span.length, 0);
+        assert_eq!(ep.source_kind, Some(BlockKind::Text));
+    }
+
+    #[test]
+    fn test_error_block_crdt_roundtrip_minimal() {
+        let mut doc = test_doc();
+        let parent_id = doc
+            .insert_block(None, None, Role::Model, BlockKind::Text, "hi", Status::Done)
+            .unwrap();
+
+        let error_id = doc.new_block_id();
+        let payload = kaijutsu_types::ErrorPayload {
+            category: kaijutsu_types::ErrorCategory::Stream,
+            severity: kaijutsu_types::ErrorSeverity::Fatal,
+            code: None,
+            detail: None,
+            span: None,
+            source_kind: None,
+        };
+        let snap = BlockSnapshot::error_for(error_id, parent_id, payload, "stream error");
+        doc.insert_from_snapshot(snap, Some(&parent_id)).unwrap();
+
+        let read = doc.get_block_snapshot(&error_id).unwrap();
+        let ep = read.error.expect("minimal payload should survive");
+        assert_eq!(ep.category, kaijutsu_types::ErrorCategory::Stream);
+        assert_eq!(ep.severity, kaijutsu_types::ErrorSeverity::Fatal);
+        assert!(ep.code.is_none());
+        assert!(ep.detail.is_none());
+        assert!(ep.span.is_none());
+        assert!(ep.source_kind.is_none());
+    }
 }

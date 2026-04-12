@@ -469,7 +469,8 @@ impl ErrorPayload {
     }
 }
 
-/// Maximum bytes of `ErrorPayload.detail` included in LLM hydration.
+/// Maximum chars of `ErrorPayload.detail` included in LLM hydration.
+/// Measured in Unicode scalar values, not bytes.
 pub const ERROR_DETAIL_HYDRATION_BUDGET: usize = 2048;
 
 /// Format an Error block for inclusion in LLM context.
@@ -822,7 +823,10 @@ pub struct BlockSnapshot {
     /// Exit code from tool execution (for ToolResult blocks).
     #[serde(default)]
     pub exit_code: Option<i32>,
-    /// Whether this is an error result (for ToolResult blocks).
+    /// Whether this ToolResult reports a failure (non-zero exit, MCP is_error).
+    /// Distinct from `BlockKind::Error`, which is a structured error block
+    /// attached as a child. This flag is legacy — new producers should also
+    /// emit a child Error block with full diagnostics.
     #[serde(default)]
     pub is_error: bool,
     /// Structured output data for richer formatting (tables, trees).
