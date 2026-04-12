@@ -366,15 +366,22 @@ async fn process_llm_stream(
                             attempt,
                             e
                         );
-                        let _ = documents.insert_block_as(
+                        let payload = kaijutsu_types::ErrorPayload {
+                            category: kaijutsu_types::ErrorCategory::Stream,
+                            severity: kaijutsu_types::ErrorSeverity::Error,
+                            code: None,
+                            detail: Some(format!(
+                                "Failed after {} attempts: {}",
+                                attempt, e
+                            )),
+                            span: None,
+                            source_kind: None,
+                        };
+                        let _ = documents.insert_error_block_as(
                             context_id,
-                            None,
-                            Some(&last_block_id),
-                            Role::Model,
-                            BlockKind::Text,
-                            format!("❌ Error: {}", e),
-                            Status::Done,
-                            ContentType::Plain,
+                            &last_block_id,
+                            &payload,
+                            payload.summary_line(),
                             Some(PrincipalId::system()),
                         );
                         return;
@@ -586,15 +593,19 @@ async fn process_llm_stream(
 
                 StreamEvent::Error(err) => {
                     log::error!("LLM stream error: {}", err);
-                    let _ = documents.insert_block_as(
+                    let payload = kaijutsu_types::ErrorPayload {
+                        category: kaijutsu_types::ErrorCategory::Stream,
+                        severity: kaijutsu_types::ErrorSeverity::Error,
+                        code: None,
+                        detail: Some(err.clone()),
+                        span: None,
+                        source_kind: None,
+                    };
+                    let _ = documents.insert_error_block_as(
                         context_id,
-                        None,
-                        Some(&last_block_id),
-                        Role::Model,
-                        BlockKind::Text,
-                        format!("❌ Error: {}", err),
-                        Status::Error,
-                        ContentType::Plain,
+                        &last_block_id,
+                        &payload,
+                        payload.summary_line(),
                         Some(PrincipalId::system()),
                     );
                     return;

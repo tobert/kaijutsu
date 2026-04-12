@@ -109,7 +109,8 @@ impl Plugin for CellPlugin {
             .init_resource::<OverlaySummonState>()
             .init_resource::<ShellDockSummonState>()
             .init_resource::<crate::view::components::ErrorChildIndex>()
-            .init_resource::<crate::view::components::ExpandedErrorParents>();
+            .init_resource::<crate::view::components::ExpandedErrorParents>()
+            .init_resource::<crate::view::components::GlobalErrorQueue>();
 
         // ====================================================================
         // CellPhase::Sync — server events, document sync, prompt submission

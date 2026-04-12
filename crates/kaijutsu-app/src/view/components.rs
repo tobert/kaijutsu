@@ -745,6 +745,46 @@ impl ExpandedErrorParents {
 }
 
 // ============================================================================
+// GLOBAL ERROR QUEUE (context-free RPC errors)
+// ============================================================================
+
+/// Transient error queue for context-free failures (e.g., create_context
+/// failure, kernel attach failure). These can't be CRDT-synced because
+/// there's no context to sync them into.
+///
+/// The dock HUD renders these as toasts that auto-dismiss.
+#[derive(Resource, Default)]
+pub struct GlobalErrorQueue {
+    pub entries: std::collections::VecDeque<GlobalError>,
+}
+
+/// A single transient error entry for dock HUD display.
+pub struct GlobalError {
+    pub operation: String,
+    pub message: String,
+    pub created_at: f64,
+}
+
+impl GlobalErrorQueue {
+    pub fn push(&mut self, operation: impl Into<String>, message: impl Into<String>, time: f64) {
+        self.entries.push_back(GlobalError {
+            operation: operation.into(),
+            message: message.into(),
+            created_at: time,
+        });
+        // Keep at most 5 visible errors
+        while self.entries.len() > 5 {
+            self.entries.pop_front();
+        }
+    }
+
+    /// Remove errors older than `max_age_secs`.
+    pub fn gc(&mut self, now: f64, max_age_secs: f64) {
+        self.entries.retain(|e| now - e.created_at < max_age_secs);
+    }
+}
+
+// ============================================================================
 // BLOCK-ORIENTED UI COMPONENTS
 // ============================================================================
 //

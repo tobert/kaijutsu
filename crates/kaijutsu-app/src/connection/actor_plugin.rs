@@ -456,6 +456,8 @@ fn update_connection_state(
     mut state: ResMut<RpcConnectionState>,
     mut status_events: MessageReader<ConnectionStatusMessage>,
     mut result_events: MessageReader<RpcResultMessage>,
+    mut error_queue: ResMut<crate::view::components::GlobalErrorQueue>,
+    time: Res<Time>,
 ) {
     for ConnectionStatusMessage(status) in status_events.read() {
         match status {
@@ -500,7 +502,14 @@ fn update_connection_state(
                     state.connected = true;
                 }
             }
+            RpcResultMessage::RpcError { operation, error } => {
+                log::warn!("RPC error ({operation}): {error}");
+                error_queue.push(operation, error, time.elapsed_secs_f64());
+            }
             _ => {}
         }
     }
+
+    // GC old errors (auto-dismiss after 10s)
+    error_queue.gc(time.elapsed_secs_f64(), 10.0);
 }

@@ -313,6 +313,25 @@ impl From<rig_completion::CompletionError> for LlmError {
     }
 }
 
+impl kaijutsu_types::IntoErrorPayload for LlmError {
+    fn into_error_payload(self) -> kaijutsu_types::ErrorPayload {
+        use kaijutsu_types::{ErrorCategory, ErrorPayload, ErrorSeverity};
+        let severity = match &self {
+            LlmError::Unavailable(_) => ErrorSeverity::Fatal,
+            LlmError::RateLimited(_) => ErrorSeverity::Warning,
+            _ => ErrorSeverity::Error,
+        };
+        ErrorPayload {
+            category: ErrorCategory::Stream,
+            severity,
+            code: None,
+            detail: Some(self.to_string()),
+            span: None,
+            source_kind: None,
+        }
+    }
+}
+
 /// Result type for LLM operations.
 pub type LlmResult<T> = Result<T, LlmError>;
 
@@ -470,6 +489,8 @@ impl RigProvider {
             additional_params: None,
             tool_choice: None,
             documents: vec![],
+            model: None,
+            output_schema: None,
         };
 
         // Helper to extract text from OneOrMany<AssistantContent>
