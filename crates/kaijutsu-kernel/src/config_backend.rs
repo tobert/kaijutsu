@@ -1,6 +1,6 @@
 //! ConfigCrdtBackend: CRDT-backed configuration files.
 //!
-//! This backend manages config files (theme.rhai, layouts/*.ron)
+//! This backend manages config files (theme.toml, models.toml, mcp.toml)
 //! as CRDT documents for collaborative editing. The CRDT is the source of truth;
 //! disk files exist for external editors and backup.
 //!
@@ -9,7 +9,7 @@
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────┐
 //! │                    CRDT (source of truth)                   │
-//! │        agents, Claude, kaish, rhai all edit here            │
+//! │          agents, Claude, kaish all edit here                │
 //! └───────────────────────┬─────────────────────────────────────┘
 //!                         │
 //!           ┌─────────────┴─────────────┐
@@ -19,14 +19,14 @@
 //!           ▼                           ▼
 //! ┌─────────────────────────────────────────────────────────────┐
 //! │                 Disk files (for external editing)           │
-//! │              ~/.config/kaijutsu/theme.rhai etc.             │
+//! │              ~/.config/kaijutsu/theme.toml etc.             │
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
 //!
 //! # Document Naming
 //!
 //! Config documents are keyed by deterministic `ContextId`s derived from config
-//! paths via UUIDv5 (e.g., `"theme.rhai"` -> stable ContextId). These are not
+//! paths via UUIDv5 (e.g., `"theme.toml"` -> stable ContextId). These are not
 //! real contexts but use the same storage infrastructure.
 
 use std::path::{Path, PathBuf};

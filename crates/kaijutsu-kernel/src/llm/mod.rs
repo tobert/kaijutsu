@@ -370,7 +370,7 @@ impl std::fmt::Debug for RigProvider {
 impl RigProvider {
     /// Create a provider from configuration.
     // TODO(dedup): provider type strings "anthropic"/"gemini"/"openai" hardcoded here,
-    // in config.rs, rhai_config.rs — consider constants or an enum
+    // in config.rs, toml_config.rs — consider constants or an enum
     pub fn from_config(config: &ProviderConfig) -> LlmResult<Self> {
         match config.provider_type.as_str() {
             "anthropic" => {

@@ -11,7 +11,6 @@ members = [
     "crates/kaijutsu-telemetry",
     "crates/kaijutsu-agent-tools",
     "crates/kaijutsu-index",
-    "crates/kaijutsu-rhai",
     "crates/kaijutsu-abc",
     "crates/kaijutsu-cas",
 ]
@@ -30,7 +29,6 @@ kaijutsu-types = { path = "crates/kaijutsu-types" }
 kaijutsu-crdt = { path = "crates/kaijutsu-crdt" }
 kaijutsu-kernel = { path = "crates/kaijutsu-kernel" }
 kaijutsu-client = { path = "crates/kaijutsu-client" }
-kaijutsu-rhai = { path = "crates/kaijutsu-rhai" }
 kaijutsu-telemetry = { path = "crates/kaijutsu-telemetry" }
 kaijutsu-agent-tools = { path = "crates/kaijutsu-agent-tools" }
 
@@ -99,10 +97,6 @@ pulldown-cmark = "0.13"
 # CRDT + Persistence
 diamond-types-extended = "0.2"
 rusqlite = { version = "0.39", features = ["bundled"] }
-
-# Scripting
-rhai = { version = "1.24", features = ["sync"] }
-palette = { version = "0.7", default-features = false, features = ["std"] }
 
 # Configuration
 toml = "0.8"

@@ -1148,7 +1148,7 @@ impl std::fmt::Display for ConfigSource {
 pub enum ConfigFlow {
     /// A config file was loaded (at startup or on demand).
     Loaded {
-        /// Relative path within config directory (e.g., "theme.rhai").
+        /// Relative path within config directory (e.g., "theme.toml").
         path: String,
         /// Where the config was loaded from.
         source: ConfigSource,
@@ -1858,12 +1858,12 @@ mod tests {
         let mut changed_sub = bus.subscribe("config.changed");
 
         bus.publish(ConfigFlow::Loaded {
-            path: "theme.rhai".into(),
+            path: "theme.toml".into(),
             source: ConfigSource::Disk,
             content: "{}".into(),
         });
         bus.publish(ConfigFlow::Changed {
-            path: "theme.rhai".into(),
+            path: "theme.toml".into(),
             ops: Arc::from(vec![]),
             source: OpSource::Local,
         });

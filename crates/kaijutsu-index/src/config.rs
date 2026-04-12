@@ -29,7 +29,7 @@ pub struct IndexConfig {
 impl IndexConfig {
     /// Create an index config from kernel embedding settings.
     ///
-    /// `model_dir` and `dimensions`/`max_tokens` come from models.rhai.
+    /// `model_dir` and `dimensions`/`max_tokens` come from models.toml.
     /// `kernel_data_dir` is typically `~/.local/share/kaijutsu/kernels/{id}/`.
     pub fn new(
         model_dir: PathBuf,

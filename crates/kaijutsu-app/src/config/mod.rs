@@ -9,7 +9,7 @@ use std::path::Path;
 
 use crate::input::binding::Binding;
 use crate::input::defaults::default_bindings;
-use crate::input::rhai_config::{bindings_to_toml, parse_bindings_toml};
+use crate::input::bindings_config::{bindings_to_toml, parse_bindings_toml};
 use crate::ui::theme::Theme;
 
 /// Combined output of app-side config loading.

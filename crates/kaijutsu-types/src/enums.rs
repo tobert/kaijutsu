@@ -241,7 +241,7 @@ pub enum DocKind {
     /// Static markdown/text.
     #[strum(serialize = "text", serialize = "markdown")]
     Text,
-    /// Configuration file (theme.rhai, models.rhai).
+    /// Configuration file (theme.toml, models.toml).
     #[strum(serialize = "config")]
     Config,
 }

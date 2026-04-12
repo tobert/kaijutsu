@@ -20,7 +20,7 @@ pub struct InputMap {
 impl Default for InputMap {
     fn default() -> Self {
         Self {
-            bindings: super::rhai_config::load_bindings(),
+            bindings: super::bindings_config::load_bindings(),
         }
     }
 }

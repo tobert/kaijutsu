@@ -1,7 +1,7 @@
 //! Theme system for Kaijutsu
 //!
-//! Provides a scriptable theming system via Rhai. The built-in default
-//! is the Kaijutsu theme; users can override any field via `theme.rhai`.
+//! Theming system backed by TOML. The built-in default is the Kaijutsu
+//! theme; users can override any field via `theme.toml`.
 
 use bevy::math::Vec4;
 use bevy::prelude::*;
@@ -925,7 +925,7 @@ impl ConfigFileStatus {
 #[allow(dead_code)] // Scaffolding for Phase 3 live-reload
 #[derive(Resource, Default)]
 pub struct ConfigStatus {
-    /// Status of the base theme (theme.rhai).
+    /// Status of the base theme (theme.toml).
     pub theme: ConfigFileStatus,
     /// Whether live reload is enabled (Phase 3+).
     pub live_reload_enabled: bool,

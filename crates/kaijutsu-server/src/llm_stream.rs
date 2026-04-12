@@ -142,7 +142,7 @@ pub(crate) async fn spawn_llm_for_prompt(
                     .ok_or_else(|| {
                         log::error!("No LLM provider configured");
                         capnp::Error::failed(
-                            "No LLM provider configured (check models.rhai)".into(),
+                            "No LLM provider configured (check models.toml)".into(),
                         )
                     })?;
                 (provider, name, max_tokens)
@@ -151,7 +151,7 @@ pub(crate) async fn spawn_llm_for_prompt(
                 // No model anywhere — kernel default
                 let p = registry.default_provider().ok_or_else(|| {
                     log::error!("No LLM provider configured");
-                    capnp::Error::failed("No LLM provider configured (check models.rhai)".into())
+                    capnp::Error::failed("No LLM provider configured (check models.toml)".into())
                 })?;
                 let m = registry
                     .default_model()

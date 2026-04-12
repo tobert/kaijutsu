@@ -161,7 +161,7 @@ fn main() {
         .add_plugins(ui::timeline::TimelinePlugin)
         // Animation tweening for smooth mode transitions
         .add_plugins(bevy_tweening::TweeningPlugin)
-        // Resources - theme loaded from ~/.config/kaijutsu/theme.rhai
+        // Resources - theme loaded from ~/.config/kaijutsu/theme.toml
         .insert_resource(theme)
         // Power management — sleep between events instead of spinning every vsync tick.
         // Input events (keyboard, mouse, window) wake immediately with zero added latency.

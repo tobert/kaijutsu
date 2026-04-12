@@ -122,7 +122,7 @@ impl SshServerConfig {
     ///
     /// Uses in-memory auth database and allows anonymous connections.
     pub fn ephemeral(port: u16) -> Self {
-        // Use a fresh tempdir so no real configs (mcp.rhai etc.) are loaded.
+        // Use a fresh tempdir so no real configs (mcp.toml etc.) are loaded.
         // Include PID + timestamp to avoid stale data from PID reuse.
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

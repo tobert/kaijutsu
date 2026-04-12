@@ -13,7 +13,7 @@ use super::config::{ProviderConfig, ToolFilter};
 use super::{LlmError, LlmRegistry, LlmResult, RigProvider};
 
 // ---------------------------------------------------------------------------
-// Canonical config types (moved from rhai_config.rs)
+// Canonical config types
 // ---------------------------------------------------------------------------
 
 /// Structured LLM configuration.

@@ -39,7 +39,7 @@ pub mod interrupt;
 pub mod events;
 pub mod focus;
 pub mod map;
-pub mod rhai_config;
+pub mod bindings_config;
 pub mod systems;
 pub mod vim;
 
@@ -88,7 +88,7 @@ pub struct InputPlugin;
 
 impl Plugin for InputPlugin {
     fn build(&self, app: &mut App) {
-        // Write default config files (bindings.rhai + theme.rhai) if not present
+        // Write default config files (bindings.toml + theme.toml) if not present
         crate::config::write_default_configs_if_missing();
 
         // Register messages
