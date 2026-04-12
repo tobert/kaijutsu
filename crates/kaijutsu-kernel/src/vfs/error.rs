@@ -123,6 +123,29 @@ impl VfsError {
     }
 }
 
+impl kaijutsu_types::IntoErrorPayload for VfsError {
+    fn into_error_payload(self) -> kaijutsu_types::ErrorPayload {
+        use kaijutsu_types::{ErrorCategory, ErrorPayload, ErrorSeverity};
+        let severity = match &self {
+            VfsError::PathEscapesRoot(_) => ErrorSeverity::Fatal,
+            VfsError::InvalidPath(_) => ErrorSeverity::Error,
+            _ => ErrorSeverity::Error,
+        };
+        let category = match &self {
+            VfsError::InvalidPath(_) | VfsError::PathEscapesRoot(_) => ErrorCategory::Validation,
+            _ => ErrorCategory::Tool,
+        };
+        ErrorPayload {
+            category,
+            severity,
+            code: None,
+            detail: Some(self.to_string()),
+            span: None,
+            source_kind: None,
+        }
+    }
+}
+
 /// Convert VfsError to std::io::Error for compatibility.
 impl From<VfsError> for io::Error {
     fn from(e: VfsError) -> Self {

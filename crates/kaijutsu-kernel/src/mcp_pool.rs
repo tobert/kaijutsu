@@ -98,6 +98,20 @@ pub enum McpPoolError {
     Disconnected(String),
 }
 
+impl kaijutsu_types::IntoErrorPayload for McpPoolError {
+    fn into_error_payload(self) -> kaijutsu_types::ErrorPayload {
+        use kaijutsu_types::{ErrorCategory, ErrorPayload, ErrorSeverity};
+        ErrorPayload {
+            category: ErrorCategory::Tool,
+            severity: ErrorSeverity::Error,
+            code: None,
+            detail: Some(self.to_string()),
+            span: None,
+            source_kind: None,
+        }
+    }
+}
+
 /// Transport type for MCP server connections.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

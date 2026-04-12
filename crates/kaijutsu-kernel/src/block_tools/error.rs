@@ -92,6 +92,34 @@ impl EditError {
     }
 }
 
+impl kaijutsu_types::IntoErrorPayload for EditError {
+    fn into_error_payload(self) -> kaijutsu_types::ErrorPayload {
+        use kaijutsu_types::{ErrorCategory, ErrorPayload, ErrorSeverity, ErrorSpan};
+        let detail = self.to_string();
+        let span = match &self {
+            EditError::LineOutOfRange { requested, .. } => Some(ErrorSpan {
+                line: *requested,
+                column: 0,
+                length: 0,
+            }),
+            EditError::ContentMismatch { start_line, .. } => Some(ErrorSpan {
+                line: *start_line,
+                column: 0,
+                length: 0,
+            }),
+            _ => None,
+        };
+        ErrorPayload {
+            category: ErrorCategory::Tool,
+            severity: ErrorSeverity::Error,
+            code: None,
+            detail: Some(detail),
+            span,
+            source_kind: None,
+        }
+    }
+}
+
 /// Result type for block operations.
 pub type Result<T> = std::result::Result<T, EditError>;
 
