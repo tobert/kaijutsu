@@ -49,7 +49,7 @@ tokio-util = { version = "0.7", features = ["compat"] }
 futures = "0.3"
 
 # SSH
-russh = "0.56"
+russh = "0.60"
 
 # CLI
 clap = { version = "4", features = ["derive"] }

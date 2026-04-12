@@ -12,6 +12,7 @@ tokio-util.workspace = true
 futures.workspace = true
 russh.workspace = true
 rand.workspace = true
+rand_v10 = { package = "rand", version = "0.10" }
 log.workspace = true
 thiserror.workspace = true
 whoami.workspace = true

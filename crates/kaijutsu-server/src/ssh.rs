@@ -49,7 +49,7 @@ impl KeySource {
         match self {
             KeySource::Persistent(path) => load_or_generate_host_key(path),
             KeySource::Ephemeral => {
-                PrivateKey::random(&mut rand::thread_rng(), russh::keys::Algorithm::Ed25519)
+                PrivateKey::random(&mut rand_v10::rng(), russh::keys::Algorithm::Ed25519)
                     .map_err(std::io::Error::other)
             }
         }
@@ -73,7 +73,7 @@ pub fn load_or_generate_host_key(path: &Path) -> Result<PrivateKey, std::io::Err
             fs::create_dir_all(parent)?;
         }
 
-        let key = PrivateKey::random(&mut rand::thread_rng(), russh::keys::Algorithm::Ed25519)
+        let key = PrivateKey::random(&mut rand_v10::rng(), russh::keys::Algorithm::Ed25519)
             .map_err(std::io::Error::other)?;
 
         // Save in OpenSSH format

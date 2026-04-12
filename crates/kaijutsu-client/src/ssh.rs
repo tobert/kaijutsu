@@ -41,7 +41,7 @@ pub enum KeySource {
 impl KeySource {
     /// Generate an ephemeral Ed25519 key in memory (useful for tests)
     pub fn ephemeral() -> Self {
-        let key = PrivateKey::random(&mut rand::thread_rng(), Algorithm::Ed25519)
+        let key = PrivateKey::random(&mut rand_v10::rng(), Algorithm::Ed25519)
             .expect("Failed to generate ephemeral key");
         Self::InMemory(Arc::new(key))
     }
@@ -275,7 +275,7 @@ impl SshClient {
         log::info!("Found {} keys in SSH agent", keys.len());
 
         for key in &keys {
-            log::debug!("Trying key: {}", key.fingerprint(HashAlg::Sha256));
+            log::debug!("Trying key: {}", key.public_key().fingerprint(HashAlg::Sha256));
 
             let hash_alg = session
                 .best_supported_rsa_hash()
@@ -287,7 +287,7 @@ impl SshClient {
             let result = session
                 .authenticate_publickey_with(
                     &self.config.username,
-                    key.clone(),
+                    key.public_key().into_owned().into(),
                     hash_alg,
                     &mut agent,
                 )
@@ -298,7 +298,7 @@ impl SshClient {
                     log::info!(
                         "Authenticated as {} with key {}",
                         self.config.username,
-                        key.fingerprint(HashAlg::Sha256)
+                        key.public_key().fingerprint(HashAlg::Sha256)
                     );
                     return Ok(());
                 }
