@@ -1358,7 +1358,7 @@ pub async fn create_shared_kernel(
                                 let idx_clone = synth_idx.clone();
                                 let blocks_clone = synth_blocks.clone();
                                 tokio::task::spawn_blocking(move || {
-                                    crate::synthesis_rhai::run_synthesis_and_cache(
+                                    crate::synthesis::run_synthesis_and_cache(
                                         ctx_id,
                                         idx_clone.embedder_arc(),
                                         blocks_clone,
