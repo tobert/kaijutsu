@@ -1098,10 +1098,19 @@ impl BlockStore {
             }
         }
 
+        // Preserve tombstones so deletions propagate to peers after compaction.
+        let deleted_blocks: Vec<BlockId> = self
+            .blocks
+            .iter()
+            .filter(|(_, b)| b.is_deleted())
+            .map(|(id, _)| *id)
+            .collect();
+
         StoreSnapshot {
             context_id: self.context_id,
             blocks,
             block_history,
+            deleted_blocks,
         }
     }
 
@@ -1134,6 +1143,17 @@ impl BlockStore {
                     BlockContent::from_snapshot_for_sync(block_snap, agent_id, fallback_key);
                 content.merge_ops(history.clone())?;
                 store.blocks.insert(block_snap.id, content);
+            }
+        }
+
+        // Restore tombstones so deletions propagate to peers after compaction.
+        for id in &snapshot.deleted_blocks {
+            if !store.blocks.contains_key(id) {
+                let snap = crate::BlockSnapshotBuilder::new(*id, crate::BlockKind::Text)
+                    .build();
+                let mut block = BlockContent::from_snapshot(&snap, agent_id, "Z".to_string());
+                block.mark_deleted(0);
+                store.blocks.insert(*id, block);
             }
         }
 
@@ -1179,6 +1199,9 @@ pub struct StoreSnapshot {
     /// snapshot, incremental oplog entries reference DTE frontiers that
     /// only exist if the per-block DTE history is preserved.
     pub block_history: Vec<SerializedOpsOwned>,
+    /// IDs of deleted blocks (tombstones) so deletions survive compaction.
+    #[serde(default)]
+    pub deleted_blocks: Vec<BlockId>,
 }
 
 /// Per-block sync payload.

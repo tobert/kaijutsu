@@ -38,8 +38,16 @@ if let Err(e) = documents.save_snapshot(context_id) {
 
 - **`merge_ops` now calls `auto_save`.** This is in the active push_ops RPC path (client mutation → push_ops → merge_ops). Without it, server-side persistence of CRDT-synced content was entirely missing. Test: `test_merge_ops_persists_to_db`.
 
-### Remaining
-- A "dirty flag + background flusher" pattern is still worth considering for crash resilience during streaming, but the explicit flush contract is workable for now.
+### Further Resolution (April 12, 2026) — Op-Log Persistence
+
+**Fully resolved.** The entire persistence model was replaced:
+
+- **Snapshot-per-mutation → append-only oplog.** Every `BlockStore` mutation now journals a `SyncPayload` delta (constant size) to an `oplog` table. Streaming appends persist per-token at O(1) cost, closing the durability hole. The old `save_snapshot` / `auto_save` / `snapshots` table are deleted.
+- **Count + byte compaction.** After 500 ops or 1 MiB of journal payload, the store snapshots to `doc_snapshots` and truncates the oplog in a single transaction. Recovery replays the oplog on top of the latest snapshot.
+- **DTE causal history preserved through snapshots.** `StoreSnapshot` now includes full per-block DTE ops from root (`block_history`), fixing a round-trip issue where incremental oplog entries would fail to merge against a snapshot-restored document with no shared DTE frontier.
+- **Lamport clock seeded on restore** from max header `updated_at`, fixing a latent bug where metadata mutations after restore could produce stale-looking timestamps.
+- **Input docs** use the same oplog model (`input_oplog` + `input_doc_snapshots`).
+- **16 new tests** covering crash-recovery (drop → reload → verify), per-mutation journal correctness, compaction trigger/preservation, mixed local+remote ops, block ordering, Lamport clock seeding, input doc independence, and fork snapshot semantics.
 
 ---
 
@@ -168,7 +176,8 @@ There is a "split-brain" problem between the RPC layer and the Shell layer:
 14. ~~**Return real `ackVersion` from metadata RPCs**~~ (April 11, `285d0e1`).
 15. ~~**Remove dead `applyBlockOp` / `BlockDocOp`**~~ (April 11, `3489281`).
 
+16. ~~**Op-log persistence**~~ (April 12). Replaced snapshot-per-mutation with append-only oplog + count/byte compaction. 16 new tests. See §1 Further Resolution.
+
 ### Still Open
 - **Item 4**: `KernelDb` connection pool.
 - **Item 10**: `MoveBlock` kernel + RPC wiring.
-- **§1 Remaining**: Optional dirty-flag + background flusher for within-turn streaming durability.

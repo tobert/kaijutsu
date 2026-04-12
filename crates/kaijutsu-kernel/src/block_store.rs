@@ -76,6 +76,9 @@ pub type DbHandle = Arc<parking_lot::Mutex<KernelDb>>;
 const COMPACTION_OP_THRESHOLD: u64 = 500;
 const COMPACTION_BYTE_THRESHOLD: u64 = 1_048_576; // 1 MiB
 
+/// Compaction threshold for input document oplog (lower — scratchpads are small).
+const INPUT_COMPACTION_OP_THRESHOLD: u64 = 200;
+
 /// Entry for a document in the store.
 pub struct DocumentEntry {
     /// Per-block CRDT store (each block owns its own DTE Document).
@@ -180,6 +183,8 @@ pub struct BlockStore {
     input_docs: DashMap<ContextId, InputDocEntry>,
     /// Per-input-doc journal sequence counters.
     input_journal_seqs: DashMap<ContextId, AtomicU64>,
+    /// Per-input-doc uncompacted op counts (for compaction trigger).
+    input_uncompacted: DashMap<ContextId, AtomicU64>,
     /// Database for persistence (unified KernelDb).
     db: Option<DbHandle>,
     /// Kernel ID for document rows.
@@ -201,6 +206,7 @@ impl BlockStore {
             documents: DashMap::new(),
             input_docs: DashMap::new(),
             input_journal_seqs: DashMap::new(),
+            input_uncompacted: DashMap::new(),
             db: None,
             kernel_id: None,
             default_workspace_id: None,
@@ -216,6 +222,7 @@ impl BlockStore {
             documents: DashMap::new(),
             input_docs: DashMap::new(),
             input_journal_seqs: DashMap::new(),
+            input_uncompacted: DashMap::new(),
             db: None,
             kernel_id: None,
             default_workspace_id: None,
@@ -236,6 +243,7 @@ impl BlockStore {
             documents: DashMap::new(),
             input_docs: DashMap::new(),
             input_journal_seqs: DashMap::new(),
+            input_uncompacted: DashMap::new(),
             db: Some(db),
             kernel_id: Some(kernel_id),
             default_workspace_id: Some(default_workspace_id),
@@ -257,6 +265,7 @@ impl BlockStore {
             documents: DashMap::new(),
             input_docs: DashMap::new(),
             input_journal_seqs: DashMap::new(),
+            input_uncompacted: DashMap::new(),
             db: Some(db),
             kernel_id: Some(kernel_id),
             default_workspace_id: Some(default_workspace_id),
@@ -771,6 +780,81 @@ impl BlockStore {
         db_guard
             .write_snapshot_and_truncate(context_id, 0, version, &snapshot_bytes, &content)
             .map_err(|e| BlockStoreError::Db(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Journal an input doc op and trigger compaction if needed.
+    fn journal_and_maybe_compact_input(
+        &self,
+        context_id: ContextId,
+        ops: &[u8],
+    ) -> BlockStoreResult<()> {
+        let Some(db) = &self.db else {
+            return Ok(());
+        };
+
+        let seq_entry = self
+            .input_journal_seqs
+            .entry(context_id)
+            .or_insert_with(|| AtomicU64::new(0));
+        let seq = seq_entry.fetch_add(1, Ordering::SeqCst) + 1;
+
+        let count_entry = self
+            .input_uncompacted
+            .entry(context_id)
+            .or_insert_with(|| AtomicU64::new(0));
+        let count = count_entry.fetch_add(1, Ordering::SeqCst) + 1;
+
+        {
+            let db_guard = db.lock();
+            db_guard
+                .append_input_op(context_id, seq as i64, ops)
+                .map_err(|e| BlockStoreError::Db(e.to_string()))?;
+        }
+
+        if count >= INPUT_COMPACTION_OP_THRESHOLD {
+            self.compact_input_doc(context_id)?;
+        }
+        Ok(())
+    }
+
+    /// Compact an input document: snapshot + truncate oplog.
+    fn compact_input_doc(&self, context_id: ContextId) -> BlockStoreResult<()> {
+        let Some(db) = &self.db else {
+            return Ok(());
+        };
+
+        let (state_bytes, content, max_seq) = {
+            let entry = self
+                .input_docs
+                .get(&context_id)
+                .ok_or(BlockStoreError::InputDocNotFound(context_id))?;
+            let state_bytes = entry.all_ops().map_err(BlockStoreError::Serialization)?;
+            let content = entry.get_text();
+            let max_seq = self
+                .input_journal_seqs
+                .get(&context_id)
+                .map(|s| s.load(Ordering::SeqCst))
+                .unwrap_or(0);
+            (state_bytes, content, max_seq)
+        };
+
+        {
+            let mut db_guard = db.lock();
+            db_guard
+                .write_input_snapshot_and_truncate(
+                    context_id,
+                    max_seq as i64,
+                    &state_bytes,
+                    &content,
+                )
+                .map_err(|e| BlockStoreError::Db(e.to_string()))?;
+        }
+
+        if let Some(count) = self.input_uncompacted.get(&context_id) {
+            count.store(0, Ordering::SeqCst);
+        }
 
         Ok(())
     }
@@ -1748,9 +1832,9 @@ impl BlockStore {
                                 document_id = %context_id.to_hex(),
                                 seq = seq,
                                 error = %e,
-                                "Failed to replay oplog entry, skipping document"
+                                "Failed to replay oplog entry, halting replay"
                             );
-                            continue;
+                            break;
                         }
                     }
                     Err(e) => {
@@ -1758,9 +1842,9 @@ impl BlockStore {
                             document_id = %context_id.to_hex(),
                             seq = seq,
                             error = %e,
-                            "Failed to deserialize oplog entry, skipping document"
+                            "Failed to deserialize oplog entry, halting replay"
                         );
-                        continue;
+                        break;
                     }
                 }
             }
@@ -1975,18 +2059,7 @@ impl BlockStore {
             .map_err(BlockStoreError::Serialization)?;
         drop(entry);
 
-        // Journal the input op
-        if let Some(db) = &self.db {
-            let seq_entry = self
-                .input_journal_seqs
-                .entry(context_id)
-                .or_insert_with(|| AtomicU64::new(0));
-            let seq = seq_entry.fetch_add(1, Ordering::SeqCst) + 1;
-            let db_guard = db.lock();
-            db_guard
-                .append_input_op(context_id, seq as i64, &ops)
-                .map_err(|e| BlockStoreError::Db(e.to_string()))?;
-        }
+        self.journal_and_maybe_compact_input(context_id, &ops)?;
 
         self.emit_input(InputDocFlow::TextOps {
             context_id,
@@ -2054,18 +2127,7 @@ impl BlockStore {
         let version = entry.version();
         drop(entry);
 
-        // Journal the merged input op
-        if let Some(db) = &self.db {
-            let seq_entry = self
-                .input_journal_seqs
-                .entry(context_id)
-                .or_insert_with(|| AtomicU64::new(0));
-            let seq = seq_entry.fetch_add(1, Ordering::SeqCst) + 1;
-            let db_guard = db.lock();
-            db_guard
-                .append_input_op(context_id, seq as i64, ops_bytes)
-                .map_err(|e| BlockStoreError::Db(e.to_string()))?;
-        }
+        self.journal_and_maybe_compact_input(context_id, ops_bytes)?;
 
         self.emit_input(InputDocFlow::TextOps {
             context_id,
@@ -2090,19 +2152,8 @@ impl BlockStore {
 
         self.emit_input(InputDocFlow::Cleared { context_id });
 
-        // Journal the clear op
         if !ops.is_empty() {
-            if let Some(db) = &self.db {
-                let seq_entry = self
-                    .input_journal_seqs
-                    .entry(context_id)
-                    .or_insert_with(|| AtomicU64::new(0));
-                let seq = seq_entry.fetch_add(1, Ordering::SeqCst) + 1;
-                let db_guard = db.lock();
-                db_guard
-                    .append_input_op(context_id, seq as i64, &ops)
-                    .map_err(|e| BlockStoreError::Db(e.to_string()))?;
-            }
+            self.journal_and_maybe_compact_input(context_id, &ops)?;
         }
 
         Ok(text)
@@ -3294,6 +3345,689 @@ mod tests {
             replayed_content.contains("merge_ops persistence test"),
             "Replayed oplog should produce merged content, got: {:?}",
             replayed_content,
+        );
+    }
+
+    // ========================================================================
+    // OPLOG PERSISTENCE TESTS — drop-and-reload, per-mutation journal, compaction
+    // ========================================================================
+
+    /// Helper: unique KernelId for test isolation.
+    fn test_kernel_id() -> KernelId {
+        KernelId::new()
+    }
+
+    /// Create a DB-backed store backed by an on-disk SQLite file inside `dir`.
+    /// Returns (db_handle, block_store, context_id, kernel_id, workspace_id).
+    fn fresh_db_store(
+        dir: &std::path::Path,
+    ) -> (DbHandle, BlockStore, ContextId, KernelId, WorkspaceId) {
+        let db_path = dir.join("test.db");
+        let db = Arc::new(parking_lot::Mutex::new(
+            KernelDb::open(&db_path).expect("open DB"),
+        ));
+        let creator = PrincipalId::system();
+        let kernel_id = test_kernel_id();
+
+        let ws_id = {
+            let db_guard = db.lock();
+            db_guard
+                .get_or_create_default_workspace(kernel_id, creator)
+                .expect("create workspace")
+        };
+
+        let store = BlockStore::with_db(db.clone(), kernel_id, ws_id, creator);
+        let ctx = ContextId::new();
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .expect("create document");
+
+        (db, store, ctx, kernel_id, ws_id)
+    }
+
+    /// Drop the store, create a new one from the same DB, call load_from_db.
+    fn drop_and_reload(
+        db: DbHandle,
+        kernel_id: KernelId,
+        ws_id: WorkspaceId,
+    ) -> BlockStore {
+        let creator = PrincipalId::system();
+        let store2 = BlockStore::with_db(db, kernel_id, ws_id, creator);
+        store2.load_from_db().expect("load_from_db");
+        store2
+    }
+
+    // ====================================================================
+    // 1. Crash-Recovery: drop + reload
+    // ====================================================================
+
+    #[test]
+    fn test_drop_reload_simple() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, store, ctx, kid, ws) = fresh_db_store(dir.path());
+
+        store
+            .insert_block(
+                ctx, None, None, Role::User, BlockKind::Text,
+                "hello world", Status::Done, ContentType::Plain,
+            )
+            .unwrap();
+
+        drop(store); // destroy in-memory state
+
+        let store2 = drop_and_reload(db, kid, ws);
+        let content = store2.get_content(ctx).unwrap();
+        assert_eq!(content, "hello world", "content should survive drop+reload");
+    }
+
+    #[test]
+    fn test_drop_reload_after_append_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, store, ctx, kid, ws) = fresh_db_store(dir.path());
+
+        let block_id = store
+            .insert_block(
+                ctx, None, None, Role::User, BlockKind::Text,
+                "", Status::Done, ContentType::Plain,
+            )
+            .unwrap();
+
+        let expected: String = (0..100).map(|i| (b'a' + (i % 26)) as char).collect();
+        for ch in expected.chars() {
+            store.append_text(ctx, &block_id, &ch.to_string()).unwrap();
+        }
+
+        let content_before = store.get_content(ctx).unwrap();
+        assert_eq!(content_before, expected);
+
+        drop(store);
+
+        let store2 = drop_and_reload(db, kid, ws);
+        let content_after = store2.get_content(ctx).unwrap();
+        assert_eq!(
+            content_after, expected,
+            "100 single-char appends should survive drop+reload"
+        );
+    }
+
+    #[test]
+    fn test_drop_reload_after_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, store, ctx, kid, ws) = fresh_db_store(dir.path());
+
+        let block_id = store
+            .insert_block(
+                ctx, None, None, Role::User, BlockKind::Text,
+                "", Status::Done, ContentType::Plain,
+            )
+            .unwrap();
+
+        // 500 appends (+ 1 insert = 501 journal entries) should trigger compaction
+        for i in 0..500 {
+            let ch = (b'a' + (i % 26) as u8) as char;
+            store.append_text(ctx, &block_id, &ch.to_string()).unwrap();
+        }
+
+        // Verify compaction happened: snapshot row should exist
+        {
+            let db_guard = db.lock();
+            let snap = db_guard.load_latest_snapshot(ctx).unwrap();
+            assert!(snap.is_some(), "compaction should have written a snapshot after 501 ops");
+        }
+
+        // Do 50 more appends after compaction
+        for i in 0..50 {
+            let ch = (b'A' + (i % 26) as u8) as char;
+            store.append_text(ctx, &block_id, &ch.to_string()).unwrap();
+        }
+
+        let content_before = store.get_content(ctx).unwrap();
+        assert_eq!(content_before.len(), 550);
+
+        drop(store);
+
+        let store2 = drop_and_reload(db, kid, ws);
+        let content_after = store2.get_content(ctx).unwrap();
+        assert_eq!(
+            content_after, content_before,
+            "all 550 chars should survive compaction + drop + reload"
+        );
+    }
+
+    // ====================================================================
+    // 2. Per-Mutation Journal Verification
+    // ====================================================================
+
+    #[test]
+    fn test_journal_row_per_insert_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, store, ctx, _kid, _ws) = fresh_db_store(dir.path());
+
+        store
+            .insert_block(
+                ctx, None, None, Role::User, BlockKind::Text,
+                "first", Status::Done, ContentType::Plain,
+            )
+            .unwrap();
+        store
+            .insert_block(
+                ctx, None, None, Role::User, BlockKind::Text,
+                "second", Status::Done, ContentType::Plain,
+            )
+            .unwrap();
+
+        let db_guard = db.lock();
+        let entries = db_guard.load_oplog_since(ctx, 0).unwrap();
+        assert_eq!(entries.len(), 2, "should have 2 oplog rows for 2 inserts");
+
+        for (i, (_seq, payload_bytes)) in entries.iter().enumerate() {
+            let payload: SyncPayload = postcard::from_bytes(payload_bytes)
+                .unwrap_or_else(|e| panic!("deserialize oplog entry {}: {}", i, e));
+            assert!(
+                !payload.new_blocks.is_empty(),
+                "insert oplog entry {} should have new_blocks",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_journal_row_per_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, store, ctx, _kid, _ws) = fresh_db_store(dir.path());
+
+        let block_id = store
+            .insert_block(
+                ctx, None, None, Role::User, BlockKind::Text,
+                "", Status::Done, ContentType::Plain,
+            )
+            .unwrap();
+
+        for i in 0..5 {
+            let ch = (b'a' + i) as char;
+            store.append_text(ctx, &block_id, &ch.to_string()).unwrap();
+        }
+
+        let db_guard = db.lock();
+        let entries = db_guard.load_oplog_since(ctx, 0).unwrap();
+        assert_eq!(
+            entries.len(),
+            6,
+            "1 insert + 5 appends = 6 oplog rows, got {}",
+            entries.len()
+        );
+    }
+
+    #[test]
+    fn test_journal_row_per_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, store, ctx, _kid, _ws) = fresh_db_store(dir.path());
+
+        let block_id = store
+            .insert_block(
+                ctx, None, None, Role::User, BlockKind::Text,
+                "hello", Status::Done, ContentType::Plain,
+            )
+            .unwrap();
+
+        // Replace "hello" → "helloX" (insert at pos 5, delete 0)
+        store.edit_text(ctx, &block_id, 5, "X", 0).unwrap();
+
+        let db_guard = db.lock();
+        let entries = db_guard.load_oplog_since(ctx, 0).unwrap();
+        assert_eq!(
+            entries.len(),
+            2,
+            "1 insert + 1 edit = 2 oplog rows, got {}",
+            entries.len()
+        );
+    }
+
+    #[test]
+    fn test_journal_row_per_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, store, ctx, _kid, _ws) = fresh_db_store(dir.path());
+
+        let block_id = store
+            .insert_block(
+                ctx, None, None, Role::Model, BlockKind::Text,
+                "thinking", Status::Running, ContentType::Plain,
+            )
+            .unwrap();
+
+        store.set_status(ctx, &block_id, Status::Done).unwrap();
+
+        let db_guard = db.lock();
+        let entries = db_guard.load_oplog_since(ctx, 0).unwrap();
+        assert_eq!(
+            entries.len(),
+            2,
+            "1 insert + 1 set_status = 2 oplog rows, got {}",
+            entries.len()
+        );
+
+        // Decode the second entry and verify it has updated_headers
+        let (_seq, payload_bytes) = &entries[1];
+        let payload: SyncPayload = postcard::from_bytes(payload_bytes).unwrap();
+        assert!(
+            !payload.updated_headers.is_empty(),
+            "set_status oplog entry should have updated_headers"
+        );
+    }
+
+    #[test]
+    fn test_journal_row_per_merge_ops() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, store, ctx, _kid, _ws) = fresh_db_store(dir.path());
+
+        // Create a second (non-DB) store and insert a block in it
+        let client = BlockStore::new(PrincipalId::system());
+        client
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+        client
+            .insert_block(
+                ctx, None, None, Role::User, BlockKind::Text,
+                "from remote", Status::Done, ContentType::Plain,
+            )
+            .unwrap();
+
+        let payload = client.ops_since(ctx, &HashMap::new()).unwrap();
+        store.merge_ops(ctx, payload).unwrap();
+
+        let db_guard = db.lock();
+        let entries = db_guard.load_oplog_since(ctx, 0).unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "merge_ops should produce 1 oplog row, got {}",
+            entries.len()
+        );
+    }
+
+    // ====================================================================
+    // 3. Compaction
+    // ====================================================================
+
+    #[test]
+    fn test_compaction_trigger_at_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, store, ctx, _kid, _ws) = fresh_db_store(dir.path());
+
+        let block_id = store
+            .insert_block(
+                ctx, None, None, Role::User, BlockKind::Text,
+                "", Status::Done, ContentType::Plain,
+            )
+            .unwrap();
+
+        // 500 more appends → total 501 journal entries (insert + 500 appends)
+        // This exceeds COMPACTION_OP_THRESHOLD (500).
+        for i in 0..500 {
+            let ch = (b'a' + (i % 26) as u8) as char;
+            store.append_text(ctx, &block_id, &ch.to_string()).unwrap();
+        }
+
+        let db_guard = db.lock();
+
+        // Snapshot should exist
+        let snap = db_guard.load_latest_snapshot(ctx).unwrap();
+        assert!(snap.is_some(), "snapshot should exist after compaction");
+        let snap = snap.unwrap();
+
+        // Remaining oplog entries should be only those written after compaction
+        let remaining = db_guard.load_oplog_since(ctx, 0).unwrap();
+        assert!(
+            remaining.len() < 10,
+            "oplog should be truncated after compaction, got {} entries",
+            remaining.len()
+        );
+
+        // All remaining entries should have seq > snap.seq
+        for (seq, _) in &remaining {
+            assert!(
+                *seq > snap.seq,
+                "remaining oplog entry seq {} should be > snapshot seq {}",
+                seq,
+                snap.seq
+            );
+        }
+    }
+
+    #[test]
+    fn test_compaction_preserves_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, store, ctx, kid, ws) = fresh_db_store(dir.path());
+
+        let block_id = store
+            .insert_block(
+                ctx, None, None, Role::User, BlockKind::Text,
+                "", Status::Done, ContentType::Plain,
+            )
+            .unwrap();
+
+        // 600 appends — triggers compaction (601 total > 500 threshold)
+        let expected: String = (0..600).map(|i| (b'a' + (i % 26) as u8) as char).collect();
+        for ch in expected.chars() {
+            store.append_text(ctx, &block_id, &ch.to_string()).unwrap();
+        }
+
+        let content_before = store.get_content(ctx).unwrap();
+        assert_eq!(content_before, expected);
+
+        drop(store);
+
+        let store2 = drop_and_reload(db, kid, ws);
+        let content_after = store2.get_content(ctx).unwrap();
+        assert_eq!(
+            content_after, expected,
+            "compacted + post-compaction ops should all survive reload"
+        );
+    }
+
+    // ====================================================================
+    // 4. Mixed Operations
+    // ====================================================================
+
+    #[test]
+    fn test_mixed_local_and_remote_ops() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, store_a, ctx, kid, ws) = fresh_db_store(dir.path());
+
+        // A inserts a block locally
+        store_a
+            .insert_block(
+                ctx, None, None, Role::User, BlockKind::Text,
+                "local-1", Status::Done, ContentType::Plain,
+            )
+            .unwrap();
+
+        // B (no DB) inserts a block
+        let store_b = BlockStore::new(PrincipalId::new());
+        store_b
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+        store_b
+            .insert_block(
+                ctx, None, None, Role::User, BlockKind::Text,
+                "remote-b", Status::Done, ContentType::Plain,
+            )
+            .unwrap();
+
+        // Merge B's ops into A
+        let payload = store_b.ops_since(ctx, &HashMap::new()).unwrap();
+        store_a.merge_ops(ctx, payload).unwrap();
+
+        // A inserts another block locally
+        store_a
+            .insert_block(
+                ctx, None, None, Role::User, BlockKind::Text,
+                "local-2", Status::Done, ContentType::Plain,
+            )
+            .unwrap();
+
+        let content_before = store_a.get_content(ctx).unwrap();
+        assert!(content_before.contains("local-1"));
+        assert!(content_before.contains("remote-b"));
+        assert!(content_before.contains("local-2"));
+
+        drop(store_a);
+
+        let store2 = drop_and_reload(db, kid, ws);
+        let content_after = store2.get_content(ctx).unwrap();
+        assert!(
+            content_after.contains("local-1"),
+            "local-1 missing after reload: {:?}",
+            content_after
+        );
+        assert!(
+            content_after.contains("remote-b"),
+            "remote-b missing after reload: {:?}",
+            content_after
+        );
+        assert!(
+            content_after.contains("local-2"),
+            "local-2 missing after reload: {:?}",
+            content_after
+        );
+
+        let blocks = store2.block_snapshots(ctx).unwrap();
+        assert_eq!(blocks.len(), 3, "should have 3 blocks after reload");
+    }
+
+    #[test]
+    fn test_block_order_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, store, ctx, kid, ws) = fresh_db_store(dir.path());
+
+        // Insert 5 blocks, recording the order
+        let mut ids = Vec::new();
+        let mut prev: Option<BlockId> = None;
+        for i in 0..5 {
+            let bid = store
+                .insert_block(
+                    ctx,
+                    None,
+                    prev.as_ref(),
+                    Role::User,
+                    BlockKind::Text,
+                    format!("block-{}", i),
+                    Status::Done,
+                    ContentType::Plain,
+                )
+                .unwrap();
+            ids.push(bid);
+            prev = Some(bid);
+        }
+
+        let order_before: Vec<BlockId> = store
+            .block_snapshots(ctx)
+            .unwrap()
+            .iter()
+            .map(|s| s.id)
+            .collect();
+
+        drop(store);
+
+        let store2 = drop_and_reload(db, kid, ws);
+        let order_after: Vec<BlockId> = store2
+            .block_snapshots(ctx)
+            .unwrap()
+            .iter()
+            .map(|s| s.id)
+            .collect();
+
+        assert_eq!(
+            order_before, order_after,
+            "block order should be preserved across drop+reload"
+        );
+
+        // Verify content order too
+        let blocks = store2.block_snapshots(ctx).unwrap();
+        for (i, snap) in blocks.iter().enumerate() {
+            assert_eq!(
+                snap.content,
+                format!("block-{}", i),
+                "block {} content mismatch",
+                i
+            );
+        }
+    }
+
+    // ====================================================================
+    // 5. Lamport Clock
+    // ====================================================================
+
+    #[test]
+    fn test_lamport_clock_seeded_after_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, store, ctx, kid, ws) = fresh_db_store(dir.path());
+
+        let block_id = store
+            .insert_block(
+                ctx, None, None, Role::Model, BlockKind::Text,
+                "test", Status::Running, ContentType::Plain,
+            )
+            .unwrap();
+
+        store.set_status(ctx, &block_id, Status::Pending).unwrap();
+
+        let status_at_before = {
+            let entry = store.get(ctx).unwrap();
+            let snap = entry.doc.get_block_snapshot(&block_id).unwrap();
+            snap.status_at
+        };
+        assert!(status_at_before > 0, "status_at should be nonzero after set_status");
+
+        drop(store);
+
+        let store2 = drop_and_reload(db, kid, ws);
+
+        // Now set_status again — the Lamport clock should have been seeded
+        // from the restored state, so the new timestamp must be strictly greater.
+        store2.set_status(ctx, &block_id, Status::Done).unwrap();
+
+        let status_at_after = {
+            let entry = store2.get(ctx).unwrap();
+            let snap = entry.doc.get_block_snapshot(&block_id).unwrap();
+            snap.status_at
+        };
+
+        assert!(
+            status_at_after > status_at_before,
+            "Lamport clock after reload should advance: before={}, after={}",
+            status_at_before,
+            status_at_after
+        );
+    }
+
+    // ====================================================================
+    // 6. Input Documents
+    // ====================================================================
+
+    #[test]
+    fn test_input_oplog_independent() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, store, ctx, _kid, _ws) = fresh_db_store(dir.path());
+
+        store.create_input_doc(ctx).unwrap();
+
+        // 5 block operations
+        let block_id = store
+            .insert_block(
+                ctx, None, None, Role::User, BlockKind::Text,
+                "a", Status::Done, ContentType::Plain,
+            )
+            .unwrap();
+        for _ in 0..4 {
+            store.append_text(ctx, &block_id, "x").unwrap();
+        }
+
+        // 5 input edits
+        for i in 0..5 {
+            let ch = (b'A' + i) as char;
+            store
+                .edit_input(ctx, i as usize, &ch.to_string(), 0)
+                .unwrap();
+        }
+
+        let db_guard = db.lock();
+        let oplog_entries = db_guard.load_oplog_since(ctx, 0).unwrap();
+        let input_entries = db_guard.load_input_oplog_since(ctx, 0).unwrap();
+
+        assert_eq!(
+            oplog_entries.len(),
+            5,
+            "block oplog should have 5 rows (1 insert + 4 appends), got {}",
+            oplog_entries.len()
+        );
+        assert_eq!(
+            input_entries.len(),
+            5,
+            "input oplog should have 5 rows, got {}",
+            input_entries.len()
+        );
+    }
+
+    #[test]
+    fn test_input_drop_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, store, ctx, kid, ws) = fresh_db_store(dir.path());
+
+        store.create_input_doc(ctx).unwrap();
+
+        // 100 single-char edits
+        let expected: String = (0..100).map(|i| (b'a' + (i % 26)) as char).collect();
+        for (i, ch) in expected.chars().enumerate() {
+            store
+                .edit_input(ctx, i, &ch.to_string(), 0)
+                .unwrap();
+        }
+
+        let text_before = store.get_input_text(ctx).unwrap();
+        assert_eq!(text_before, expected);
+
+        drop(store);
+
+        let store2 = drop_and_reload(db, kid, ws);
+        store2.load_input_docs_from_db().unwrap();
+        let text_after = store2.get_input_text(ctx).unwrap();
+        assert_eq!(
+            text_after, expected,
+            "input doc should survive drop+reload"
+        );
+    }
+
+    // ====================================================================
+    // 7. Forks
+    // ====================================================================
+
+    #[test]
+    fn test_fork_creates_clean_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, store, ctx, _kid, _ws) = fresh_db_store(dir.path());
+
+        store
+            .insert_block(
+                ctx, None, None, Role::User, BlockKind::Text,
+                "original block 1", Status::Done, ContentType::Plain,
+            )
+            .unwrap();
+        store
+            .insert_block(
+                ctx, None, None, Role::Model, BlockKind::Text,
+                "original block 2", Status::Done, ContentType::Plain,
+            )
+            .unwrap();
+
+        let fork_id = ContextId::new();
+        store.fork_document(ctx, fork_id).unwrap();
+
+        let db_guard = db.lock();
+
+        // Fork should have a snapshot
+        let snap = db_guard.load_latest_snapshot(fork_id).unwrap();
+        assert!(snap.is_some(), "forked doc should have a snapshot");
+
+        // Fork should have NO oplog entries
+        let oplog = db_guard.load_oplog_since(fork_id, 0).unwrap();
+        assert!(
+            oplog.is_empty(),
+            "forked doc should have empty oplog, got {} entries",
+            oplog.len()
+        );
+
+        // Verify the snapshot contains the right content
+        let snap = snap.unwrap();
+        assert!(
+            snap.content.contains("original block 1"),
+            "fork snapshot content missing block 1: {:?}",
+            snap.content
+        );
+        assert!(
+            snap.content.contains("original block 2"),
+            "fork snapshot content missing block 2: {:?}",
+            snap.content
         );
     }
 }
