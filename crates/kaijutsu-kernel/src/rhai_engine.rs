@@ -114,7 +114,7 @@ impl RhaiEngine {
         Self::register_block_functions(&mut engine, block_store.clone());
 
         // Register context-aware functions (emit into current context)
-        Self::register_context_functions(&mut engine, block_store, context_id);
+        Self::register_context_functions(&mut engine, block_store, context_id, cas);
 
         // Register utility functions
         Self::register_utility_functions(&mut engine, interrupted);
@@ -546,10 +546,14 @@ impl RhaiEngine {
         engine: &mut Engine,
         block_store: SharedBlockStore,
         context_id: ContextId,
+        cas: Option<&Arc<kaijutsu_cas::FileStore>>,
     ) {
+        // Clone block_store for each closure that needs it before any moves.
+        let abc_store = block_store.clone();
+        let img_store_base = block_store.clone();
+
         // abc_block(abc_text) -> String
         // Parses ABC notation, inserts a single text/vnd.abc block (rendered natively by the app).
-        let abc_store = block_store.clone();
         engine.register_fn("abc_block", move |abc_text: String| -> String {
             // Validate parse
             let result = kaijutsu_abc::parse(&abc_text);
@@ -619,6 +623,133 @@ impl RhaiEngine {
                 }
             }
         });
+
+        // img_block(hash) -> String
+        // Display an image already in CAS. Block content is the hex hash.
+        if let Some(cas) = cas {
+            use kaijutsu_cas::ContentStore;
+
+            let img_store = img_store_base.clone();
+            engine.register_fn("img_block", move |hash_str: String| -> String {
+                if hash_str.parse::<kaijutsu_cas::ContentHash>().is_err() {
+                    warn!("Rhai: img_block invalid hash: {}", hash_str);
+                    return String::new();
+                }
+                let last_block_id = img_store
+                    .get(context_id)
+                    .and_then(|doc| doc.doc.blocks_ordered().last().map(|b| b.id));
+
+                match img_store.insert_block(
+                    context_id,
+                    None,
+                    last_block_id.as_ref(),
+                    Role::Asset,
+                    BlockKind::Text,
+                    &hash_str,
+                    Status::Done,
+                    ContentType::Image,
+                ) {
+                    Ok(id) => {
+                        let key = id.to_key();
+                        info!("Rhai: img_block inserted {} (hash={})", key, hash_str);
+                        key
+                    }
+                    Err(e) => {
+                        warn!("Rhai: img_block error: {}", e);
+                        String::new()
+                    }
+                }
+            });
+
+            // img_block_from_path(path) -> String
+            // Read a file, store in CAS, insert an image block.
+            let path_store = img_store_base.clone();
+            let path_cas = cas.clone();
+            engine.register_fn("img_block_from_path", move |path: String| -> String {
+                let data = match std::fs::read(&path) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        warn!("Rhai: img_block_from_path read error: {}: {}", path, e);
+                        return String::new();
+                    }
+                };
+                let mime = crate::kj::cas::mime_from_extension(&path);
+                let hash = match path_cas.store(&data, mime) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        warn!("Rhai: img_block_from_path CAS error: {}", e);
+                        return String::new();
+                    }
+                };
+                let hash_str = hash.to_string();
+                let last_block_id = path_store
+                    .get(context_id)
+                    .and_then(|doc| doc.doc.blocks_ordered().last().map(|b| b.id));
+
+                match path_store.insert_block(
+                    context_id,
+                    None,
+                    last_block_id.as_ref(),
+                    Role::Asset,
+                    BlockKind::Text,
+                    &hash_str,
+                    Status::Done,
+                    ContentType::Image,
+                ) {
+                    Ok(id) => {
+                        let key = id.to_key();
+                        info!("Rhai: img_block_from_path inserted {} (hash={})", key, hash_str);
+                        key
+                    }
+                    Err(e) => {
+                        warn!("Rhai: img_block_from_path error: {}", e);
+                        String::new()
+                    }
+                }
+            });
+
+            // img_block_from_bytes(blob, mime) -> String
+            // Store raw bytes in CAS and insert an image block.
+            let bytes_store = img_store_base;
+            let bytes_cas = cas.clone();
+            engine.register_fn(
+                "img_block_from_bytes",
+                move |data: rhai::Blob, mime: String| -> String {
+                    let hash = match bytes_cas.store(&data, &mime) {
+                        Ok(h) => h,
+                        Err(e) => {
+                            warn!("Rhai: img_block_from_bytes CAS error: {}", e);
+                            return String::new();
+                        }
+                    };
+                    let hash_str = hash.to_string();
+                    let last_block_id = bytes_store
+                        .get(context_id)
+                        .and_then(|doc| doc.doc.blocks_ordered().last().map(|b| b.id));
+
+                    match bytes_store.insert_block(
+                        context_id,
+                        None,
+                        last_block_id.as_ref(),
+                        Role::Asset,
+                        BlockKind::Text,
+                        &hash_str,
+                        Status::Done,
+                        ContentType::Image,
+                    ) {
+                        Ok(id) => {
+                            let key = id.to_key();
+                            info!("Rhai: img_block_from_bytes inserted {} (hash={})", key, hash_str);
+                            key
+                        }
+                        Err(e) => {
+                            warn!("Rhai: img_block_from_bytes error: {}", e);
+                            String::new()
+                        }
+                    }
+                },
+            );
+        }
     }
 
     /// Register utility functions.
@@ -1020,6 +1151,10 @@ impl ExecutionEngine for RhaiEngine {
             // Context-aware
             "svg_block",
             "abc_block",
+            // Image blocks
+            "img_block",
+            "img_block_from_path",
+            "img_block_from_bytes",
             // CAS
             "cas_put_bytes",
             "cas_get_bytes",
@@ -1128,6 +1263,9 @@ impl ExecutionEngine for RhaiEngine {
             "context_functions": [
                 { "name": "svg_block", "sig": "svg_block(content: string) -> string", "doc": "Insert SVG content as a block in the current conversation. Returns block ID." },
                 { "name": "abc_block", "sig": "abc_block(content: string) -> string", "doc": "Insert ABC music notation as a block in the current conversation, rendered as sheet music. Returns block ID." },
+                { "name": "img_block", "sig": "img_block(hash: string) -> string", "doc": "Insert an image block referencing a CAS hash. Returns block ID." },
+                { "name": "img_block_from_path", "sig": "img_block_from_path(path: string) -> string", "doc": "Read a file, store in CAS, insert as image block. Returns block ID." },
+                { "name": "img_block_from_bytes", "sig": "img_block_from_bytes(data: blob, mime: string) -> string", "doc": "Store bytes in CAS, insert as image block. Returns block ID." },
                 { "name": "cas_put_bytes", "sig": "cas_put_bytes(data: blob, mime: string) -> string", "doc": "Store bytes in CAS, returns content hash." },
                 { "name": "cas_get_bytes", "sig": "cas_get_bytes(hash: string) -> blob", "doc": "Retrieve bytes from CAS by hash. Returns empty blob if not found." },
                 { "name": "cas_exists", "sig": "cas_exists(hash: string) -> bool", "doc": "Check if a hash exists in CAS." },

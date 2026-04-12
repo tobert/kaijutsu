@@ -218,7 +218,7 @@ impl KjDispatcher {
     }
 }
 
-fn mime_from_extension(path: &str) -> &'static str {
+pub(crate) fn mime_from_extension(path: &str) -> &'static str {
     let lower = path.to_lowercase();
     if lower.ends_with(".png") {
         "image/png"

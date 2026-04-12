@@ -83,6 +83,11 @@ pub enum RichContentKind {
         /// Whitespace-padded measurement text (same as UiVelloText.value).
         plain_text: String,
     },
+    /// Raster image stored in CAS by hash. The block text is the 32-char hex hash.
+    /// Actual decoding happens in the render pass where Bevy Commands are available.
+    Image {
+        hash: String,
+    },
 }
 
 /// Build a `Vec<SpanBrush>` from parsed spans + theme colors.
@@ -400,6 +405,14 @@ pub fn detect_rich_content_typed(
                     tune: Arc::new(result.value),
                 },
             });
+        }
+        ContentType::Image => {
+            let hash = text.trim().to_string();
+            if hash.len() == 32 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Some(RichContent {
+                    kind: RichContentKind::Image { hash },
+                });
+            }
         }
         ContentType::Plain => {} // Fall through to heuristic detection
     }

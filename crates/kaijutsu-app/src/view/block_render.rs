@@ -564,6 +564,41 @@ pub fn build_block_scenes(
                     *render_method = BlockRenderMethod::Msdf;
                 }
             }
+            Some(RichContentKind::Image { hash }) => {
+                *render_method = BlockRenderMethod::Vello;
+                // Placeholder: dark rectangle with hash label.
+                // Full CAS→decode→ImageNode pipeline requires RpcCommand::CasRead
+                // and async image loading, which lands in a follow-up.
+                let placeholder_h = 120.0_f32;
+                content_height = placeholder_h;
+
+                let rect = vello::kurbo::Rect::new(
+                    pad_left as f64,
+                    pad_top as f64,
+                    (pad_left + content_width) as f64,
+                    (pad_top + placeholder_h) as f64,
+                );
+                scene.fill(
+                    Fill::NonZero,
+                    Affine::IDENTITY,
+                    vello::peniko::Color::new([0.2, 0.2, 0.25, 1.0]),
+                    None,
+                    &rect,
+                );
+
+                let label = format!("[image: {}]", &hash[..8.min(hash.len())]);
+                let label_layout =
+                    font.layout(&label, &style, VelloTextAlign::Left, max_advance);
+                let label_y = pad_top + placeholder_h / 2.0 - label_layout.height() / 2.0;
+                let label_brush = bevy_color_to_brush(theme.block_tool_result);
+                crate::text::rich::render_layout_with_brushes(
+                    &mut scene,
+                    &label_layout,
+                    &[],
+                    &label_brush,
+                    (pad_left as f64, label_y as f64),
+                );
+            }
             None => {
                 // Plain text block
                 let layout = font.layout(
