@@ -635,17 +635,36 @@ impl Default for Theme {
 // ThemeData → Theme conversion
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Parse a hex string into a Bevy `Color`. Returns `Color::BLACK` on failure.
+/// Parse a hex string (`#rrggbb` or `#rrggbbaa`) into a Bevy `Color`.
+/// Returns `Color::BLACK` on failure.
 fn hex_to_color(s: &str) -> Color {
-    match kaijutsu_rhai::parse_hex(s) {
-        Some(c) => {
-            if c.alpha >= 1.0 {
-                Color::srgb(c.red, c.green, c.blue)
-            } else {
-                Color::srgba(c.red, c.green, c.blue, c.alpha)
+    let hex = s.trim_start_matches('#');
+    let parse = |start: usize, end: usize| -> Option<f32> {
+        u8::from_str_radix(&hex[start..end], 16)
+            .ok()
+            .map(|v| v as f32 / 255.0)
+    };
+    match hex.len() {
+        6 => {
+            let r = parse(0, 2);
+            let g = parse(2, 4);
+            let b = parse(4, 6);
+            match (r, g, b) {
+                (Some(r), Some(g), Some(b)) => Color::srgb(r, g, b),
+                _ => Color::BLACK,
             }
         }
-        None => Color::BLACK,
+        8 => {
+            let r = parse(0, 2);
+            let g = parse(2, 4);
+            let b = parse(4, 6);
+            let a = parse(6, 8);
+            match (r, g, b, a) {
+                (Some(r), Some(g), Some(b), Some(a)) => Color::srgba(r, g, b, a),
+                _ => Color::BLACK,
+            }
+        }
+        _ => Color::BLACK,
     }
 }
 

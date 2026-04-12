@@ -1,31 +1,28 @@
-//! Rhai-based bindings loader for Kaijutsu.
+//! Bindings configuration for Kaijutsu.
 //!
-//! Loads key bindings from `~/.config/kaijutsu/bindings.rhai` at startup.
+//! Loads key bindings from `~/.config/kaijutsu/bindings.toml` at startup.
 //! Falls back to `default_bindings()` if the file doesn't exist or has errors.
-//! Hot-reloads when the file changes (polls mtime every 2 seconds).
 //!
-//! ## Rhai API
+//! ## TOML format
 //!
-//! ```rhai
-//! // Simple key binding
-//! binding("KeyJ", "Navigation", "FocusNextBlock", "Next block")
+//! ```toml
+//! [[bindings]]
+//! key = "KeyJ"
+//! context = "Navigation"
+//! action = "FocusNextBlock"
+//! label = "Next block"
 //!
-//! // Key + modifiers
-//! binding_mod("KeyD", "CTRL", "Navigation", "HalfPageDown", "Half page down")
-//!
-//! // Gamepad button
-//! gamepad("South", "Navigation", "Activate", "Activate")
-//!
-//! // Start from defaults and customize
-//! let b = default_bindings();
-//! b = b.filter(|x| !(x["key"] == "KeyQ" && x["context"] == "Navigation"));
-//! b.push(binding("KeyQ", "Navigation", "Quit", "Quit"));
-//! b
+//! [[bindings]]
+//! key = "KeyD"
+//! modifiers = "CTRL"
+//! context = "Navigation"
+//! action = "HalfPageDown"
+//! label = "Half page down"
 //! ```
 
 use bevy::input::gamepad::GamepadButton;
 use bevy::prelude::*;
-use rhai::{Array, Dynamic, Engine, Map};
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use super::action::Action;
@@ -34,12 +31,37 @@ use super::context::InputContext;
 use super::defaults::default_bindings;
 
 // ============================================================================
+// TOML binding entry
+// ============================================================================
+
+/// A single binding entry as it appears in bindings.toml.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BindingEntry {
+    pub key: String,
+    #[serde(default)]
+    pub modifiers: String,
+    pub context: String,
+    pub action: String,
+    #[serde(default)]
+    pub gamepad: bool,
+    #[serde(default)]
+    pub label: String,
+}
+
+/// Top-level bindings.toml structure.
+#[derive(Debug, Deserialize)]
+struct BindingsToml {
+    #[serde(default)]
+    bindings: Vec<BindingEntry>,
+}
+
+// ============================================================================
 // FILE PATH
 // ============================================================================
 
-/// Get the bindings config file path (~/.config/kaijutsu/bindings.rhai).
+/// Get the bindings config file path (~/.config/kaijutsu/bindings.toml).
 pub fn bindings_file_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|p| p.join("kaijutsu").join("bindings.rhai"))
+    dirs::config_dir().map(|p| p.join("kaijutsu").join("bindings.toml"))
 }
 
 // ============================================================================
@@ -60,7 +82,7 @@ pub fn load_bindings() -> Vec<Binding> {
         return default_bindings();
     }
 
-    let script = match std::fs::read_to_string(&path) {
+    let content = match std::fs::read_to_string(&path) {
         Ok(s) => {
             info!("Loaded bindings from {:?}", path);
             s
@@ -71,7 +93,7 @@ pub fn load_bindings() -> Vec<Binding> {
         }
     };
 
-    match parse_bindings_script(&script) {
+    match parse_bindings_toml(&content) {
         Ok(bindings) => bindings,
         Err(e) => {
             warn!("Failed to parse bindings: {}", e);
@@ -81,151 +103,63 @@ pub fn load_bindings() -> Vec<Binding> {
     }
 }
 
-/// Parse a bindings script string into a Vec<Binding>.
-pub fn parse_bindings_script(script: &str) -> Result<Vec<Binding>, String> {
-    let engine = build_engine();
-    let result: Dynamic = engine
-        .eval::<Dynamic>(script)
-        .map_err(|e| format!("Rhai eval error: {e}"))?;
-    parse_bindings_from_dynamic(result)
-}
+/// Parse a TOML string into a Vec<Binding>.
+pub fn parse_bindings_toml(content: &str) -> Result<Vec<Binding>, String> {
+    let parsed: BindingsToml =
+        toml::from_str(content).map_err(|e| format!("TOML parse error: {e}"))?;
 
-/// Parse bindings from a Rhai Dynamic return value.
-///
-/// Used by the shared config engine to extract bindings from a bindings script's
-/// return value without requiring a separate engine instance.
-pub fn parse_bindings_from_dynamic(result: Dynamic) -> Result<Vec<Binding>, String> {
-    let arr = result
-        .try_cast::<Array>()
-        .ok_or_else(|| "bindings.rhai must return an array".to_string())?;
-
-    let mut bindings = Vec::with_capacity(arr.len());
-    for item in arr {
-        let map = item
-            .try_cast::<Map>()
-            .ok_or_else(|| "each binding must be a map".to_string())?;
-        match binding_from_map(map) {
+    let mut bindings = Vec::with_capacity(parsed.bindings.len());
+    for entry in parsed.bindings {
+        match binding_from_entry(&entry) {
             Ok(b) => bindings.push(b),
             Err(e) => warn!("Skipping invalid binding: {}", e),
         }
     }
 
-    info!("Parsed {} bindings from script", bindings.len());
+    info!("Parsed {} bindings from TOML", bindings.len());
     Ok(bindings)
 }
 
-// ============================================================================
-// RHAI ENGINE SETUP
-// ============================================================================
-
-/// Register binding helper functions on a Rhai engine.
-///
-/// Exposes `binding()`, `binding_mod()`, `gamepad()`, and `default_bindings()`
-/// to scripts. Called by both the local `build_engine()` and the shared
-/// `config::build_app_engine()` so the same helpers are available in all scripts.
-pub fn register_binding_fns(engine: &mut Engine, defaults: Vec<Binding>) {
-    // Register `default_bindings()` → Array of maps (the Rust defaults)
-    engine.register_fn("default_bindings", move || -> Array {
-        defaults
-            .iter()
-            .map(binding_to_map)
-            .map(Dynamic::from)
-            .collect()
-    });
-
-    // Register `binding(key, context, action, label)` → Map
-    engine.register_fn(
-        "binding",
-        |key: &str, context: &str, action: &str, label: &str| -> Map {
-            let mut m = Map::new();
-            m.insert("key".into(), Dynamic::from(key.to_string()));
-            m.insert("modifiers".into(), Dynamic::from(String::new()));
-            m.insert("context".into(), Dynamic::from(context.to_string()));
-            m.insert("action".into(), Dynamic::from(action.to_string()));
-            m.insert("gamepad".into(), Dynamic::from(false));
-            m.insert("label".into(), Dynamic::from(label.to_string()));
-            m
-        },
-    );
-
-    // Register `binding_mod(key, mods, context, action, label)` → Map
-    engine.register_fn(
-        "binding_mod",
-        |key: &str, mods: &str, context: &str, action: &str, label: &str| -> Map {
-            let mut m = Map::new();
-            m.insert("key".into(), Dynamic::from(key.to_string()));
-            m.insert("modifiers".into(), Dynamic::from(mods.to_string()));
-            m.insert("context".into(), Dynamic::from(context.to_string()));
-            m.insert("action".into(), Dynamic::from(action.to_string()));
-            m.insert("gamepad".into(), Dynamic::from(false));
-            m.insert("label".into(), Dynamic::from(label.to_string()));
-            m
-        },
-    );
-
-    // Register `gamepad(button, context, action, label)` → Map
-    engine.register_fn(
-        "gamepad",
-        |button: &str, context: &str, action: &str, label: &str| -> Map {
-            let mut m = Map::new();
-            m.insert("key".into(), Dynamic::from(button.to_string()));
-            m.insert("modifiers".into(), Dynamic::from(String::new()));
-            m.insert("context".into(), Dynamic::from(context.to_string()));
-            m.insert("action".into(), Dynamic::from(action.to_string()));
-            m.insert("gamepad".into(), Dynamic::from(true));
-            m.insert("label".into(), Dynamic::from(label.to_string()));
-            m
-        },
-    );
+/// Serialize bindings to TOML format (for writing defaults or app-managed config).
+pub fn bindings_to_toml(bindings: &[Binding]) -> String {
+    let entries: Vec<BindingEntry> = bindings.iter().map(binding_to_entry).collect();
+    let toml_struct = BindingsTomlOut { bindings: entries };
+    toml::to_string_pretty(&toml_struct).unwrap_or_default()
 }
 
-fn build_engine() -> Engine {
-    let mut engine = Engine::new();
-    register_binding_fns(&mut engine, default_bindings());
-    engine
+#[derive(Serialize)]
+struct BindingsTomlOut {
+    bindings: Vec<BindingEntry>,
 }
 
 // ============================================================================
-// SERIALIZATION: Binding ↔ Rhai Map
+// SERIALIZATION: Binding ↔ BindingEntry
 // ============================================================================
 
-fn binding_to_map(b: &Binding) -> Map {
-    let mut m = Map::new();
+fn binding_to_entry(b: &Binding) -> BindingEntry {
     let (key_str, is_gamepad) = match &b.source {
         super::binding::InputSource::Key(k) => (format!("{:?}", k), false),
         super::binding::InputSource::GamepadButton(btn) => (format!("{:?}", btn), true),
     };
-    m.insert("key".into(), Dynamic::from(key_str));
-    m.insert(
-        "modifiers".into(),
-        Dynamic::from(modifiers_to_str(&b.modifiers)),
-    );
-    m.insert("context".into(), Dynamic::from(context_to_str(b.context)));
-    m.insert("action".into(), Dynamic::from(action_to_str(&b.action)));
-    m.insert("gamepad".into(), Dynamic::from(is_gamepad));
-    m.insert("label".into(), Dynamic::from(b.description.clone()));
-    m
+    BindingEntry {
+        key: key_str,
+        modifiers: modifiers_to_str(&b.modifiers),
+        context: context_to_str(b.context),
+        action: action_to_str(&b.action),
+        gamepad: is_gamepad,
+        label: b.description.clone(),
+    }
 }
 
-fn binding_from_map(m: Map) -> Result<Binding, String> {
-    let key_str = get_str(&m, "key")?;
-    let mods_str = get_str(&m, "modifiers").unwrap_or_default();
-    let ctx_str = get_str(&m, "context")?;
-    let action_str = get_str(&m, "action")?;
-    let is_gamepad = m
-        .get("gamepad")
-        .and_then(|v| v.as_bool().ok())
-        .unwrap_or(false);
-    let label = get_str(&m, "label").unwrap_or_default();
+fn binding_from_entry(e: &BindingEntry) -> Result<Binding, String> {
+    let context = parse_context(&e.context)?;
+    let action = parse_action(&e.action)?;
+    let modifiers = parse_modifiers(&e.modifiers);
 
-    let context = parse_context(&ctx_str)?;
-    let action = parse_action(&action_str)?;
-    let modifiers = parse_modifiers(&mods_str);
-
-    let source = if is_gamepad {
-        super::binding::InputSource::GamepadButton(parse_gamepad_button(&key_str)?)
+    let source = if e.gamepad {
+        super::binding::InputSource::GamepadButton(parse_gamepad_button(&e.key)?)
     } else {
-        super::binding::InputSource::Key(parse_key_code(&key_str)?)
+        super::binding::InputSource::Key(parse_key_code(&e.key)?)
     };
 
     Ok(Binding {
@@ -233,17 +167,13 @@ fn binding_from_map(m: Map) -> Result<Binding, String> {
         modifiers,
         context,
         action,
-        description: label,
+        description: e.label.clone(),
     })
 }
 
-fn get_str(m: &Map, key: &str) -> Result<String, String> {
-    m.get(key)
-        .ok_or_else(|| format!("missing field '{key}'"))?
-        .clone()
-        .try_cast::<String>()
-        .ok_or_else(|| format!("field '{key}' must be a string"))
-}
+// ============================================================================
+// STRING ↔ ENUM CONVERSIONS (Rhai-independent)
+// ============================================================================
 
 fn modifiers_to_str(m: &Modifiers) -> String {
     let mut parts = Vec::new();
@@ -273,7 +203,7 @@ fn parse_modifiers(s: &str) -> Modifiers {
             "SHIFT" => m.shift = true,
             "ALT" => m.alt = true,
             "SUPER" => m.super_key = true,
-            other => warn!("Unknown modifier '{other}' in bindings.rhai"),
+            other => warn!("Unknown modifier '{other}' in bindings"),
         }
     }
     m
@@ -429,14 +359,12 @@ fn parse_action(s: &str) -> Result<Action, String> {
         "Quit" => Ok(Action::Quit),
         "Screenshot" => Ok(Action::Screenshot),
         "DebugToggle" => Ok(Action::DebugToggle),
-        // InterruptContext defaults immediate=false — press count escalates in handle_interrupt
         "InterruptContext" => Ok(Action::InterruptContext { immediate: false }),
         _ => Err(format!("unknown action '{s}'")),
     }
 }
 
 fn parse_key_code(s: &str) -> Result<KeyCode, String> {
-    // Map string names to KeyCode variants
     match s {
         "KeyA" => Ok(KeyCode::KeyA),
         "KeyB" => Ok(KeyCode::KeyB),
@@ -532,12 +460,3 @@ fn parse_gamepad_button(s: &str) -> Result<GamepadButton, String> {
         _ => Err(format!("unknown gamepad button '{s}'")),
     }
 }
-
-// TODO: live bindings reload should come through the kernel VFS, not the
-//   filesystem directly. When bindings are editable inside Kaijutsu, the
-//   config lives at e.g. /docs/config/bindings in the CRDT store. Changes
-//   flow through the kernel and trigger a reload event — or the file is
-//   exposed via v9fs/fuse so all edits are kernel-mediated anyway.
-//   The XDG file is write-only from Kaijutsu's perspective (persistence +
-//   re-hydration on next launch). Default config writing is handled by
-//   crate::config::write_default_configs_if_missing().

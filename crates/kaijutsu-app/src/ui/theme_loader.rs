@@ -1,48 +1,28 @@
-//! Rhai-based theme loader for Kaijutsu
+//! TOML-based theme loader for Kaijutsu.
 //!
-//! Loads theme configuration from `~/.config/kaijutsu/theme.rhai` using the
-//! Rhai scripting language. Falls back to `Theme::default()` on any error.
+//! Loads theme configuration from `~/.config/kaijutsu/theme.toml`.
+//! Falls back to `Theme::default()` on any error.
 //!
-//! Theme parsing routes through `kaijutsu_rhai::theme::ThemeData` for
-//! framework-agnostic extraction, then converts to Bevy `Theme` via
-//! `From<ThemeData>`.
-//!
-//! ## Rhai API
-//!
-//! Functions available in theme scripts (via kaijutsu-rhai stdlib):
-//! - `hex("#rrggbb")` → `"#rrggbb"` (validates and normalizes)
-//! - `hexa("#rrggbb", alpha)` → `"#rrggbbaa"`
-//! - `oklch(l, c, h)` → `"#rrggbb"` (perceptually uniform)
-//! - `hsl(h, s, l)` → `"#rrggbb"`
-//! - `color_mix(hex1, hex2, t)` → `"#rrggbb"` (Oklab interpolation)
-//! - `color_lighten(hex, amount)` / `color_darken(hex, amount)`
-//! - `hue_shift(hex, degrees)`
-//! - plus all math functions (sin, cos, lerp, clamp, etc.)
-//!
-//! Example theme.rhai:
-//! ```rhai
-//! let bg = hex("#1a1b26");
-//! let fg = hex("#e5e5e5");
-//! let accent = oklch(0.7, 0.15, 260.0);
-//! ```
+//! Theme values are plain hex strings and numbers — no computed colors.
+//! Users who want procedural themes can generate TOML with external tools.
 
 use bevy::prelude::*;
-use rhai::{Engine, Scope};
+use kaijutsu_types::theme::ThemeData;
 use std::path::PathBuf;
 
 use super::theme::Theme;
 
-/// Get the theme file path (~/.config/kaijutsu/theme.rhai).
-#[allow(dead_code)] // Kept as convenience wrapper; loading now goes through config::load_app_config
+/// Get the theme file path (~/.config/kaijutsu/theme.toml).
+#[allow(dead_code)]
 pub fn theme_file_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|p| p.join("kaijutsu").join("theme.rhai"))
+    dirs::config_dir().map(|p| p.join("kaijutsu").join("theme.toml"))
 }
 
 /// Load theme from the user's config file.
 ///
-/// Loads from `~/.config/kaijutsu/theme.rhai`. Falls back to `Theme::default()`
+/// Loads from `~/.config/kaijutsu/theme.toml`. Falls back to `Theme::default()`
 /// if the file doesn't exist or has errors.
-#[allow(dead_code)] // Kept as convenience wrapper; loading now goes through config::load_app_config
+#[allow(dead_code)]
 pub fn load_theme() -> Theme {
     let Some(base_path) = theme_file_path() else {
         info!("No config directory available, using default theme");
@@ -54,7 +34,7 @@ pub fn load_theme() -> Theme {
         return Theme::default();
     }
 
-    let script = match std::fs::read_to_string(&base_path) {
+    let content = match std::fs::read_to_string(&base_path) {
         Ok(s) => {
             info!("Loaded theme from {:?}", base_path);
             s
@@ -65,7 +45,7 @@ pub fn load_theme() -> Theme {
         }
     };
 
-    match parse_theme_script(&script) {
+    match parse_theme_toml(&content) {
         Ok(theme) => theme,
         Err(e) => {
             warn!("Failed to parse theme: {}", e);
@@ -75,57 +55,28 @@ pub fn load_theme() -> Theme {
     }
 }
 
-/// Load theme from a script string.
-///
-/// Used for loading from CRDT content or testing.
-#[allow(dead_code)] // For future CRDT-based live reload
-pub fn load_theme_from_script(script: &str) -> Result<Theme, String> {
-    parse_theme_script(script)
+/// Load theme from a TOML content string.
+#[allow(dead_code)]
+pub fn load_theme_from_toml(content: &str) -> Result<Theme, String> {
+    parse_theme_toml(content)
 }
 
-/// Load and parse a theme file.
-#[allow(dead_code)] // For future file-based reload
-fn load_theme_from_file(path: &PathBuf) -> Result<Theme, String> {
-    let script =
-        std::fs::read_to_string(path).map_err(|e| format!("Failed to read file: {}", e))?;
-
-    parse_theme_script(&script)
-}
-
-/// Extract theme variables from a pre-populated Rhai scope.
-///
-/// Routes through `kaijutsu_rhai::theme::ThemeData` for framework-agnostic parsing,
-/// then converts to Bevy `Theme` via `From<ThemeData>`.
-pub fn parse_theme_from_scope(scope: &Scope) -> Theme {
-    let theme_data = kaijutsu_rhai::theme::parse_theme_data_from_scope(scope);
-    Theme::from(theme_data)
-}
-
-/// Parse a theme script and build a Theme struct.
-fn parse_theme_script(script: &str) -> Result<Theme, String> {
-    let mut engine = Engine::new();
-    kaijutsu_rhai::register_stdlib(&mut engine);
-    let mut scope = Scope::new();
-
-    engine
-        .run_with_scope(&mut scope, script)
-        .map_err(|e| format!("Rhai parse error: {}", e))?;
-
-    Ok(parse_theme_from_scope(&scope))
+/// Parse a TOML string into a Theme.
+pub fn parse_theme_toml(content: &str) -> Result<Theme, String> {
+    let theme_data: ThemeData =
+        toml::from_str(content).map_err(|e| format!("TOML parse error: {e}"))?;
+    Ok(Theme::from(theme_data))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_simple_script() {
-        let script = r##"
-            let bg = hex("#1a1b26");
-            let fg = hex("#e5e5e5");
-        "##;
+    const DEFAULT_THEME_TOML: &str = include_str!("../../../../assets/defaults/theme.toml");
 
-        let theme = parse_theme_script(script).unwrap();
+    #[test]
+    fn test_default_theme_toml_parses() {
+        let theme = parse_theme_toml(DEFAULT_THEME_TOML).unwrap();
         // bg should be close to #1a1b26
         let srgba = theme.bg.to_srgba();
         assert!((srgba.red - 0.102).abs() < 0.01);
@@ -133,37 +84,19 @@ mod tests {
 
     #[test]
     fn test_font_rainbow_param() {
-        let script = r##"
-            let font_rainbow = true;
-        "##;
+        // Default is true
+        let td: ThemeData = toml::from_str(DEFAULT_THEME_TOML).unwrap();
+        assert!(td.font_rainbow);
 
-        let theme = parse_theme_script(script).unwrap();
-        assert!(theme.font_rainbow);
+        // Override to false
+        let modified = DEFAULT_THEME_TOML.replace("font_rainbow = true", "font_rainbow = false");
+        let theme = parse_theme_toml(&modified).unwrap();
+        assert!(!theme.font_rainbow);
     }
 
     #[test]
-    fn test_oklch_in_theme_script() {
-        let script = r#"
-            let accent = oklch(0.7, 0.15, 260.0);
-        "#;
-
-        let theme = parse_theme_script(script).unwrap();
-        // Should have a valid color (not default)
-        let srgba = theme.accent.to_srgba();
-        // oklch(0.7, 0.15, 260) is a blue-ish color
-        assert!(srgba.blue > srgba.red);
-    }
-
-    #[test]
-    fn test_color_mix_in_theme_script() {
-        let script = r##"
-            let bg = color_mix("#000000", "#ffffff", 0.5);
-        "##;
-
-        let theme = parse_theme_script(script).unwrap();
-        // 50% mix of black and white should be near gray
-        let srgba = theme.bg.to_srgba();
-        // In Oklab space, the midpoint may not be exactly 0.5 in sRGB
-        assert!(srgba.red > 0.2 && srgba.red < 0.8);
+    fn test_invalid_toml_returns_error() {
+        let result = parse_theme_toml("[invalid");
+        assert!(result.is_err());
     }
 }

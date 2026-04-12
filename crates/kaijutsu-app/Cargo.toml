@@ -61,10 +61,6 @@ hostname = { workspace = true }
 capnp.workspace = true
 capnp-rpc.workspace = true
 
-# Scripting
-rhai.workspace = true
-kaijutsu-rhai.workspace = true
-
 # Configuration
 toml = { workspace = true }
 
