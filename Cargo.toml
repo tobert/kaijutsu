@@ -94,21 +94,21 @@ kurbo = "0.13"
 
 # Text rendering
 cosmic-text = "0.16"   # pinned by Bevy 0.18
-pulldown-cmark = "0.12"
+pulldown-cmark = "0.13"
 
 # CRDT + Persistence
-diamond-types-extended = { path = "../diamond-types-extended" }
+diamond-types-extended = "0.2"
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 # Scripting
-rhai = { version = "1.21", features = ["sync"] }
+rhai = { version = "1.24", features = ["sync"] }
 palette = { version = "0.7", default-features = false, features = ["std"] }
 
 # LLM providers - unified via rig-core
 rig-core = "0.30"
 
 # MCP (Model Context Protocol)
-rmcp = { version = "1.2", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+rmcp = { version = "1.4", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 
 # Vi-modal editing (keystroke → semantic action state machine)
 modalkit = { path = "../research/modalkit/crates/modalkit" }
@@ -122,10 +122,10 @@ arboard = { version = "3", features = ["wayland-data-control"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
-opentelemetry = "0.30"
-opentelemetry_sdk = { version = "0.30", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.30", default-features = false, features = ["grpc-tonic", "trace"] }
-tracing-opentelemetry = "0.31"
+opentelemetry = "0.31"
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["grpc-tonic", "trace"] }
+tracing-opentelemetry = "0.32"
 
 # Testing
 tempfile = "3"

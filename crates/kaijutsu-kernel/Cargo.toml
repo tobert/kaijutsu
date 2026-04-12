@@ -65,6 +65,9 @@ async-broadcast = "0.7"
 # MCP
 rmcp.workspace = true
 
+# Base64 (transitive dep via rmcp/rig — zero new compiled code)
+base64 = "0.22"
+
 [features]
 test-mock = []
 

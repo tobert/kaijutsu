@@ -137,7 +137,7 @@ pub(crate) fn extract_trace_context_impl(traceparent: &str, tracestate: &str) ->
 
     // Return a tracing span linked to the extracted OTel context
     let span = tracing::info_span!("rpc.request");
-    span.set_parent(cx);
+    let _ = span.set_parent(cx);
     span
 }
 
@@ -169,7 +169,7 @@ pub(crate) fn context_root_span_impl(trace_id: &[u8; 16], name: &'static str) ->
     );
     let cx = Context::current().with_remote_span_context(span_context);
     let span = tracing::info_span!("context", method = name);
-    span.set_parent(cx);
+    let _ = span.set_parent(cx);
     span
 }
 

@@ -936,6 +936,7 @@ impl ClientHandler for KaijutsuClientHandler {
                     Ok(CreateElicitationResult {
                         action,
                         content: response.content,
+                        meta: Default::default(),
                     })
                 }
                 Ok(Err(_)) => {
@@ -949,6 +950,7 @@ impl ClientHandler for KaijutsuClientHandler {
                     Ok(CreateElicitationResult {
                         action: RmcpElicitationAction::Decline,
                         content: None,
+                        meta: Default::default(),
                     })
                 }
                 Err(_) => {
@@ -962,6 +964,7 @@ impl ClientHandler for KaijutsuClientHandler {
                     Ok(CreateElicitationResult {
                         action: RmcpElicitationAction::Decline,
                         content: None,
+                        meta: Default::default(),
                     })
                 }
             }
