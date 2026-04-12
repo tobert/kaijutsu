@@ -38,6 +38,7 @@ notify = "7"
 
 # Config parsing
 ron = { workspace = true }
+toml = { workspace = true }
 
 # Scripting
 rhai.workspace = true

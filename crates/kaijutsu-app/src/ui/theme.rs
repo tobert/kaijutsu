@@ -649,8 +649,8 @@ fn hex_to_color(s: &str) -> Color {
     }
 }
 
-impl From<kaijutsu_rhai::theme::ThemeData> for Theme {
-    fn from(td: kaijutsu_rhai::theme::ThemeData) -> Self {
+impl From<kaijutsu_types::theme::ThemeData> for Theme {
+    fn from(td: kaijutsu_types::theme::ThemeData) -> Self {
         let mut theme = Theme::default();
 
         // Base UI

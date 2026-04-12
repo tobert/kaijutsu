@@ -34,6 +34,7 @@
 
 pub mod config;
 pub mod rhai_config;
+pub mod toml_config;
 pub mod stream;
 
 // Re-export key types

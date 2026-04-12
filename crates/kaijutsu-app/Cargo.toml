@@ -65,6 +65,9 @@ capnp-rpc.workspace = true
 rhai.workspace = true
 kaijutsu-rhai.workspace = true
 
+# Configuration
+toml = { workspace = true }
+
 [dev-dependencies]
 image = "0.25"
 crossbeam-channel = "0.5"

@@ -1,0 +1,163 @@
+# Kaijutsu Default Theme — Tokyo Night
+#
+# Colors are hex strings: "#rrggbb" or "#rrggbbaa" (with alpha).
+# Edit this file to customize colors, fonts, and effects.
+
+# Base UI
+bg = "#1a1b26"
+panel_bg = "#1a1b26f2"
+fg = "#c0caf5"
+fg_dim = "#565f89"
+accent = "#7aa2f7"
+accent2 = "#9ece6a"
+border = "#3b4261"
+selection_bg = "#7aa2f74d"
+
+# Row type colors (conversation left borders)
+row_tool = "#bb9af7"
+row_result = "#e0af68"
+
+# Semantic colors
+error = "#f7768e"
+warning = "#e0af68"
+success = "#9ece6a"
+
+# Mode colors (vim-style indicator text)
+mode_normal = "#7aa2f7"
+mode_insert = "#9ece6a"
+mode_chat = "#9ece6a"
+mode_shell = "#e0af68"
+mode_visual = "#bb9af7"
+
+# Mode labels (dock HUD text)
+mode_label_normal = "NORMAL"
+mode_label_insert = "INSERT"
+mode_label_visual = "VISUAL"
+mode_label_shell = "SHELL"
+mode_label_constellation = "CONSTELLATION"
+mode_label_stack = "STACK"
+mode_label_input = "INPUT"
+
+# Cursor colors [r, g, b, a]
+cursor_normal = [0.478, 0.635, 0.969, 0.8]
+cursor_insert = [0.620, 0.808, 0.416, 0.9]
+cursor_visual = [0.733, 0.604, 0.969, 0.7]
+
+# Frame structure
+frame_corner_size = 16.0
+frame_edge_thickness = 2.0
+frame_content_padding = 12.0
+
+# Frame colors
+frame_base = "#1a1b26f2"
+frame_focused = "#7aa2f726"
+frame_insert = "#9ece6a1f"
+frame_visual = "#bb9af71f"
+frame_unfocused = "#1a1b26cc"
+frame_edge = "#3b426199"
+
+# Frame shader params [intensity, _, _, _]
+frame_params_base = [0.0, 0.0, 0.0, 0.0]
+frame_params_focused = [0.3, 0.0, 0.0, 0.0]
+frame_params_unfocused = [0.0, 0.0, 0.0, 0.0]
+
+# Edge dimming [r, g, b, a] multipliers
+frame_edge_dim_unfocused = [0.5, 0.5, 0.5, 0.6]
+frame_edge_dim_focused = [1.0, 1.0, 1.0, 1.0]
+
+# Shader effects — glow
+effect_glow_radius = 4.0
+effect_glow_intensity = 0.3
+effect_glow_falloff = 2.0
+
+# Shader effects — sheen (subtle shine)
+effect_sheen_speed = 0.5
+effect_sheen_sparkle_threshold = 0.95
+
+# Shader effects — breathing (subtle pulse)
+effect_breathe_speed = 1.0
+effect_breathe_amplitude = 0.05
+
+# Shader effects — chasing border
+effect_chase_speed = 2.0
+effect_chase_width = 0.15
+effect_chase_glow_radius = 8.0
+effect_chase_glow_intensity = 0.5
+effect_chase_color_cycle = 0.0
+
+# Input area
+input_minimized_height = 48.0
+input_docked_height = 200.0
+input_overlay_width_pct = 0.6
+input_backdrop_color = "#1a1b26d9"
+
+# Font configuration
+font_rainbow = true
+font_mono = "Cascadia Code NF"
+font_serif = "Noto Serif"
+font_sans = "Noto Sans CJK JP"
+
+# MSDF text rendering quality
+msdf_hint_amount = 0.8
+msdf_stem_darkening = 0.15
+msdf_horz_scale = 1.1
+msdf_vert_scale = 0.6
+msdf_text_bias = 0.5
+msdf_gamma_correction = 0.85
+
+# Constellation view
+constellation_base_radius = 500.0
+constellation_ring_spacing = 550.0
+
+# Block borders
+block_border_tool_call = "#ffaa0099"
+block_border_tool_result = "#00ff8866"
+block_border_error = "#ff2060cc"
+block_border_thinking = "#6080a04d"
+block_border_drift = "#00aaff80"
+block_border_thickness = 1.5
+block_border_corner_radius = 4.0
+block_border_glow_radius = 6.0
+block_border_glow_intensity = 0.25
+text_glow_radius = 2.5
+text_glow_color = "#bfd1f259"
+block_border_padding = 0.6
+block_spacing = 12.0
+
+# Compose block (input area)
+compose_border = "#3b4261"
+compose_bg = "#1a1b26"
+
+# Modal overlays
+modal_backdrop = "#00000099"
+
+# User/assistant text block borders (transparent = disabled)
+block_border_user = "#00000000"
+block_border_assistant = "#00000000"
+
+# Layout spacing
+indent_width = 24.0
+role_header_height = 20.0
+role_header_spacing = 4.0
+label_font_size = 11.0
+label_inset = 12.0
+label_pad = 6.0
+
+# ANSI terminal colors (table must come after all flat keys)
+[ansi]
+black = "#15161e"
+red = "#f7768e"
+green = "#9ece6a"
+yellow = "#e0af68"
+blue = "#7aa2f7"
+magenta = "#bb9af7"
+cyan = "#7dcfff"
+white = "#a9b1d6"
+bright_black = "#414868"
+bright_red = "#f7768e"
+bright_green = "#9ece6a"
+bright_yellow = "#e0af68"
+bright_blue = "#7aa2f7"
+bright_magenta = "#bb9af7"
+bright_cyan = "#7dcfff"
+bright_white = "#c0caf5"

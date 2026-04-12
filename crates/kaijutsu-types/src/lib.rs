@@ -52,6 +52,7 @@ pub mod ids;
 pub mod kernel;
 pub mod principal;
 pub mod session;
+pub mod theme;
 
 // Re-export kaish output types for structured tool results.
 pub use kaish_types::output::{EntryType as OutputEntryType, OutputData, OutputNode};

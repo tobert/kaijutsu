@@ -104,6 +104,9 @@ rusqlite = { version = "0.39", features = ["bundled"] }
 rhai = { version = "1.24", features = ["sync"] }
 palette = { version = "0.7", default-features = false, features = ["std"] }
 
+# Configuration
+toml = "0.8"
+
 # LLM providers - unified via rig-core
 rig-core = "0.34"
 

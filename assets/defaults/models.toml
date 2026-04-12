@@ -1,0 +1,105 @@
+# Kaijutsu Model Configuration
+#
+# Defines available LLM providers, model aliases, and embedding settings.
+# API keys are read from environment variables, never stored here.
+#
+# Provider fields:
+#   enabled         - Whether this provider is available
+#   api_key_env     - Environment variable containing the API key
+#   base_url        - Optional custom endpoint (for local/proxy servers)
+#   default_model   - Model to use when not specified
+#   max_output_tokens - Maximum response tokens (optional)
+#   default_tools   - Tool filter: { type = "all" } | { type = "allow", tools = [...] } | { type = "deny", tools = [...] }
+
+# Which provider to use by default (must be enabled below)
+default_provider = "anthropic"
+
+# ============================================================================
+# Provider Configurations
+# ============================================================================
+
+[providers.anthropic]
+enabled = true
+api_key_env = "ANTHROPIC_API_KEY"
+default_model = "claude-haiku-4-5-20251001"
+max_output_tokens = 8192
+
+[providers.anthropic.default_tools]
+type = "all"
+
+[providers.gemini]
+enabled = false
+api_key_env = "GEMINI_API_KEY"
+default_model = "gemini-2.0-flash"
+max_output_tokens = 16384
+
+[providers.gemini.default_tools]
+type = "all"
+
+[providers.openai]
+enabled = false
+api_key_env = "OPENAI_API_KEY"
+default_model = "gpt-4o"
+max_output_tokens = 16384
+
+[providers.openai.default_tools]
+type = "all"
+
+[providers.ollama]
+enabled = true
+base_url = "http://localhost:11434"
+default_model = "gemma4:31b"
+
+[providers.ollama.default_tools]
+type = "all"
+
+# ============================================================================
+# Model Aliases (Optional)
+# ============================================================================
+# Short names for commonly used model configurations
+
+[model_aliases]
+fast     = { provider = "anthropic", model = "claude-haiku-4-5-20251001" }
+cheap    = { provider = "anthropic", model = "claude-haiku-4-5-20251001" }
+balanced = { provider = "anthropic", model = "claude-sonnet-4-20250514" }
+default  = { provider = "anthropic", model = "claude-sonnet-4-20250514" }
+smart    = { provider = "anthropic", model = "claude-opus-4-5-20251101" }
+best     = { provider = "anthropic", model = "claude-opus-4-5-20251101" }
+local       = { provider = "ollama", model = "gemma4:31b" }
+offline     = { provider = "ollama", model = "gemma4:31b" }
+local-vision = { provider = "ollama", model = "gemma4:31b" }
+local-fast  = { provider = "ollama", model = "qwen3.5:9b-bf16" }
+local-moe   = { provider = "ollama", model = "qwen3.5:35b-a3b" }
+
+# ============================================================================
+# Streaming Configuration
+# ============================================================================
+
+[streaming]
+enabled = true
+buffer_size = 1024
+timeout_ms = 120000
+
+# ============================================================================
+# Rate Limiting (Optional)
+# ============================================================================
+
+[rate_limits]
+requests_per_minute = 0        # 0 = unlimited
+tokens_per_minute = 0          # 0 = unlimited
+min_request_interval_ms = 0    # 0 = no cooldown
+
+# ============================================================================
+# Embedding Model (Semantic Indexing)
+# ============================================================================
+# Local ONNX embedding model for constellation clustering, drift discovery,
+# and semantic search across contexts.
+#
+# Model dir should contain model.onnx + tokenizer.json
+# Download: https://huggingface.co/Qdrant/bge-small-en-v1.5-onnx-Q
+
+[embedding]
+enabled = true
+model_dir = "~/.local/share/kaijutsu/models/bge-small-en-v1.5"
+dimensions = 384
+max_tokens = 512
