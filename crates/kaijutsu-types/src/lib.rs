@@ -47,6 +47,7 @@ pub mod block;
 pub mod compaction;
 pub mod context;
 pub mod enums;
+pub mod error_block;
 pub mod ids;
 pub mod kernel;
 pub mod principal;
@@ -58,9 +59,11 @@ pub use kaish_types::output::{EntryType as OutputEntryType, OutputData, OutputNo
 // Re-export primary types at crate root for convenience.
 pub use block::{
     BlockEventFilter, BlockFilter, BlockFlowKind, BlockHeader, BlockId, BlockKind, BlockQuery,
-    BlockSnapshot, BlockSnapshotBuilder, ContentType, DriftKind, MAX_DAG_DEPTH, Role, Status,
-    ToolKind,
+    BlockSnapshot, BlockSnapshotBuilder, ContentType, DriftKind, ErrorCategory, ErrorPayload,
+    ErrorSeverity, ErrorSpan, MAX_DAG_DEPTH, Role, Status, ToolKind, ERROR_DETAIL_HYDRATION_BUDGET,
+    format_error_for_llm,
 };
+pub use error_block::IntoErrorPayload;
 pub use compaction::CompactionBoundary;
 pub use context::{Context, fork_lineage};
 pub use enums::{ConsentMode, ContextState, DocKind, EdgeKind, ForkKind, ToolFilter};

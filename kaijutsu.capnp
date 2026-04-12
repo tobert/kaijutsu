@@ -66,6 +66,7 @@ enum BlockKind {
   toolResult @3;
   drift @4;
   file @5;
+  error @6;
 }
 
 # Which execution engine handled a tool call/result.
@@ -176,6 +177,42 @@ struct BlockSnapshot {
   # User-curated exclusion — block is omitted from hydration.
   # Unlike ephemeral (system-managed), toggled by the user during staging.
   excluded @26 :Bool;
+
+  # Error-specific fields (Error blocks)
+  errorPayload @27 :ErrorPayload;
+  hasErrorPayload @28 :Bool;
+}
+
+# What system produced the error.
+enum ErrorCategory {
+  tool @0;
+  stream @1;
+  rpc @2;
+  render @3;
+  parse @4;
+  validation @5;
+  kernel @6;
+}
+
+# How severe the error is.
+enum ErrorSeverity {
+  warning @0;
+  error @1;
+  fatal @2;
+}
+
+# Structured error payload for Error blocks.
+struct ErrorPayload {
+  category @0 :ErrorCategory;
+  severity @1 :ErrorSeverity;
+  code @2 :Text;              # Stable machine-readable ID (empty = None)
+  detail @3 :Text;            # Full diagnostic text (empty = None)
+  hasSpan @4 :Bool;
+  spanLine @5 :UInt32;
+  spanColumn @6 :UInt32;
+  spanLength @7 :UInt32;
+  hasSourceKind @8 :Bool;
+  sourceKind @9 :BlockKind;
 }
 
 # Full context state — blocks + CRDT oplog for sync

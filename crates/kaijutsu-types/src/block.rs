@@ -289,7 +289,11 @@ impl std::fmt::Display for Role {
 ///
 /// Discriminant order matters for LWW tiebreaking (same pattern as `Status`).
 /// When two peers write at the same Lamport timestamp, the greater value wins.
-/// `Abc > Svg > Markdown > Plain` — richer types win ties.
+/// `Image > Abc > Svg > Markdown > Plain` — richer types win ties.
+///
+/// For `Image`, the block's text content is a CAS hash (32 hex chars), not the
+/// image bytes. The real MIME type lives in CAS sidecar metadata; `as_mime()`
+/// returns a generic fallback (`"image/png"`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContentType {
@@ -302,6 +306,8 @@ pub enum ContentType {
     Svg,
     /// text/vnd.abc
     Abc,
+    /// Raster image (PNG, JPEG, WebP, etc.) stored in CAS by hash.
+    Image,
 }
 
 impl ContentType {
@@ -311,17 +317,24 @@ impl ContentType {
             "text/markdown" => ContentType::Markdown,
             "image/svg+xml" => ContentType::Svg,
             "text/vnd.abc" => ContentType::Abc,
+            "image/png" | "image/jpeg" | "image/webp" | "image/gif" | "image/avif" => {
+                ContentType::Image
+            }
             _ => ContentType::Plain,
         }
     }
 
     /// Convert to a MIME type string.
+    ///
+    /// For `Image`, this returns a generic fallback. The real MIME type
+    /// lives in CAS sidecar metadata keyed by the content hash.
     pub fn as_mime(&self) -> &'static str {
         match self {
             ContentType::Plain => "text/plain",
             ContentType::Markdown => "text/markdown",
             ContentType::Svg => "image/svg+xml",
             ContentType::Abc => "text/vnd.abc",
+            ContentType::Image => "image/png",
         }
     }
 }
@@ -330,6 +343,171 @@ impl std::fmt::Display for ContentType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.as_mime())
     }
+}
+
+// ============================================================================
+// Error Payload Types
+// ============================================================================
+
+/// What system produced the error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorCategory {
+    /// Tool execution failure (shell, MCP, builtin).
+    Tool,
+    /// LLM stream error (API, network, rate limit).
+    Stream,
+    /// RPC / connection error between client and kernel.
+    Rpc,
+    /// Content rendering failure (SVG, ABC at render time).
+    Render,
+    /// Content parsing / validation failure (ABC notation, SVG structure).
+    Parse,
+    /// Input validation failure (bad parameters, out-of-range).
+    Validation,
+    /// Internal kernel error (CRDT corruption, panic recovery).
+    Kernel,
+}
+
+impl ErrorCategory {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ErrorCategory::Tool => "tool",
+            ErrorCategory::Stream => "stream",
+            ErrorCategory::Rpc => "rpc",
+            ErrorCategory::Render => "render",
+            ErrorCategory::Parse => "parse",
+            ErrorCategory::Validation => "validation",
+            ErrorCategory::Kernel => "kernel",
+        }
+    }
+}
+
+impl std::fmt::Display for ErrorCategory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// How severe the error is. Discriminant order matters for LWW tiebreaking:
+/// `Fatal > Error > Warning` ensures the worst severity wins ties.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorSeverity {
+    /// Non-fatal diagnostic (ABC parser warnings, non-fatal SVG oddities).
+    Warning,
+    /// Operation failed but is retryable or non-critical.
+    Error,
+    /// Operation cannot be retried without intervention.
+    Fatal,
+}
+
+impl ErrorSeverity {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ErrorSeverity::Warning => "warning",
+            ErrorSeverity::Error => "error",
+            ErrorSeverity::Fatal => "fatal",
+        }
+    }
+}
+
+impl std::fmt::Display for ErrorSeverity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// Source location for parse/render errors (ABC line/column, SVG element).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ErrorSpan {
+    pub line: u32,
+    pub column: u32,
+    pub length: u32,
+}
+
+/// Structured error payload attached to `BlockKind::Error` blocks.
+///
+/// `BlockSnapshot.content` carries the human-readable summary (displayed in
+/// the collapsed stub). `ErrorPayload.detail` carries the expandable body
+/// with full diagnostic context.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ErrorPayload {
+    pub category: ErrorCategory,
+    pub severity: ErrorSeverity,
+    /// Stable machine-readable error code (e.g., "abc.missing_meter").
+    #[serde(default)]
+    pub code: Option<String>,
+    /// Full diagnostic detail (expandable in UI, truncated for LLM hydration).
+    #[serde(default)]
+    pub detail: Option<String>,
+    /// Source location in the parent block's content.
+    #[serde(default)]
+    pub span: Option<ErrorSpan>,
+    /// Kind of the parent block that failed (for context in the UI).
+    #[serde(default)]
+    pub source_kind: Option<BlockKind>,
+}
+
+impl ErrorPayload {
+    /// Build a one-line summary from the payload fields.
+    /// Used to populate `BlockSnapshot.content` when the producer doesn't
+    /// supply an explicit summary string.
+    pub fn summary_line(&self) -> String {
+        if let Some(ref detail) = self.detail {
+            let first_line = detail.lines().next().unwrap_or("");
+            if let Some(ref code) = self.code {
+                format!("{} error ({}): {}", self.category, code, first_line)
+            } else {
+                format!("{} error: {}", self.category, first_line)
+            }
+        } else if let Some(ref code) = self.code {
+            format!("{} error ({})", self.category, code)
+        } else {
+            format!("{} error", self.category)
+        }
+    }
+}
+
+/// Maximum bytes of `ErrorPayload.detail` included in LLM hydration.
+pub const ERROR_DETAIL_HYDRATION_BUDGET: usize = 2048;
+
+/// Format an Error block for inclusion in LLM context.
+///
+/// Produces an XML-ish envelope that models can parse but won't confuse
+/// with user content. Truncates `detail` to `ERROR_DETAIL_HYDRATION_BUDGET`.
+pub fn format_error_for_llm(block: &BlockSnapshot) -> String {
+    let payload = match &block.error {
+        Some(p) => p,
+        None => return block.content.clone(),
+    };
+
+    let mut attrs = format!(
+        "category=\"{}\" severity=\"{}\"",
+        payload.category, payload.severity,
+    );
+    if let Some(ref code) = payload.code {
+        attrs.push_str(&format!(" code=\"{}\"", code));
+    }
+    if let Some(ref span) = payload.span {
+        attrs.push_str(&format!(
+            " line=\"{}\" column=\"{}\"",
+            span.line, span.column
+        ));
+    }
+
+    let body = if let Some(ref detail) = payload.detail {
+        if detail.len() > ERROR_DETAIL_HYDRATION_BUDGET {
+            let truncated: String = detail.chars().take(ERROR_DETAIL_HYDRATION_BUDGET).collect();
+            format!("{}\n...[truncated]", truncated)
+        } else {
+            detail.clone()
+        }
+    } else {
+        block.content.clone()
+    };
+
+    format!("<error {}>\n{}\n</error>", attrs, body)
 }
 
 /// Execution status for blocks (CRDT-synced).
@@ -395,6 +573,7 @@ impl std::fmt::Display for Status {
 /// Deliberately small. Mechanism metadata lives in companion enums:
 /// - `ToolKind` on ToolCall/ToolResult — which execution engine
 /// - `DriftKind` on Drift — how content transferred
+/// - `ErrorPayload` on Error — category, severity, diagnostics
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default, EnumString)]
 #[serde(rename_all = "lowercase")]
 #[strum(ascii_case_insensitive)]
@@ -425,6 +604,12 @@ pub enum BlockKind {
     #[serde(rename = "file")]
     #[strum(serialize = "file")]
     File,
+    /// Structured error attached to a parent block.
+    /// `content` carries the human-readable summary; `ErrorPayload` carries
+    /// structured diagnostics (category, severity, span, detail).
+    #[serde(rename = "error")]
+    #[strum(serialize = "error")]
+    Error,
 }
 
 impl BlockKind {
@@ -443,6 +628,7 @@ impl BlockKind {
             BlockKind::ToolResult => "tool_result",
             BlockKind::Drift => "drift",
             BlockKind::File => "file",
+            BlockKind::Error => "error",
         }
     }
 
@@ -459,6 +645,11 @@ impl BlockKind {
     /// Check if this is a file block.
     pub fn is_file(&self) -> bool {
         matches!(self, BlockKind::File)
+    }
+
+    /// Check if this is an error block.
+    pub fn is_error(&self) -> bool {
+        matches!(self, BlockKind::Error)
     }
 }
 
@@ -658,6 +849,11 @@ pub struct BlockSnapshot {
     #[serde(default)]
     pub file_path: Option<String>,
 
+    // Error-specific fields (Error)
+    /// Structured error payload. Present only when `kind == BlockKind::Error`.
+    #[serde(default)]
+    pub error: Option<ErrorPayload>,
+
     // Content type hint
     /// Content type for rendering. When not `Plain`, consumers skip heuristic
     /// detection and use the declared type directly.
@@ -743,6 +939,7 @@ impl BlockSnapshot {
             source_model: None,
             drift_kind: None,
             file_path: None,
+            error: None,
             content_type: ContentType::Plain,
             order_key: None,
             updated_at: 0,
@@ -786,6 +983,7 @@ impl BlockSnapshot {
             source_model: None,
             drift_kind: None,
             file_path: None,
+            error: None,
             content_type: ContentType::Plain,
             order_key: None,
             updated_at: 0,
@@ -841,6 +1039,7 @@ impl BlockSnapshot {
             source_model: None,
             drift_kind: None,
             file_path: None,
+            error: None,
             content_type: ContentType::Plain,
             order_key: None,
             updated_at: 0,
@@ -896,6 +1095,7 @@ impl BlockSnapshot {
             source_model: None,
             drift_kind: None,
             file_path: None,
+            error: None,
             content_type: ContentType::Plain,
             order_key: None,
             updated_at: 0,
@@ -955,6 +1155,7 @@ impl BlockSnapshot {
             source_model: None,
             drift_kind: None,
             file_path: None,
+            error: None,
             content_type: ContentType::Plain,
             order_key: None,
             updated_at: 0,
@@ -1005,6 +1206,7 @@ impl BlockSnapshot {
             source_model,
             drift_kind: Some(drift_kind),
             file_path: None,
+            error: None,
             content_type: ContentType::Plain,
             order_key: None,
             updated_at: 0,
@@ -1053,6 +1255,101 @@ impl BlockSnapshot {
             source_model: None,
             drift_kind: None,
             file_path: Some(file_path.into()),
+            error: None,
+            content_type: ContentType::Plain,
+            order_key: None,
+            updated_at: 0,
+            status_at: 0,
+            collapsed_at: 0,
+            ephemeral_at: 0,
+            excluded_at: 0,
+            compacted_at: 0,
+            tool_meta_at: 0,
+            content_type_at: 0,
+        }
+    }
+
+    /// Create an error block attached to a parent.
+    pub fn error_for(
+        id: BlockId,
+        parent_id: BlockId,
+        payload: ErrorPayload,
+        summary: impl Into<String>,
+    ) -> Self {
+        assert!(
+            parent_id.context_id == id.context_id,
+            "parent_id must be in same context as error block"
+        );
+        Self {
+            id,
+            parent_id: Some(parent_id),
+            role: Role::System,
+            status: Status::Error,
+            kind: BlockKind::Error,
+            content: summary.into(),
+            collapsed: false,
+            compacted: false,
+            ephemeral: false,
+            excluded: false,
+            created_at: crate::now_millis(),
+            tool_kind: None,
+            tool_name: None,
+            tool_input: None,
+            tool_use_id: None,
+            tool_call_id: None,
+            exit_code: None,
+            is_error: false,
+            output: None,
+            source_context: None,
+            source_model: None,
+            drift_kind: None,
+            file_path: None,
+            error: Some(payload),
+            content_type: ContentType::Plain,
+            order_key: None,
+            updated_at: 0,
+            status_at: 0,
+            collapsed_at: 0,
+            ephemeral_at: 0,
+            excluded_at: 0,
+            compacted_at: 0,
+            tool_meta_at: 0,
+            content_type_at: 0,
+        }
+    }
+
+    /// Create a root error block (no parent). For context-free failures
+    /// like RPC errors during context creation.
+    pub fn system_error(
+        id: BlockId,
+        payload: ErrorPayload,
+        summary: impl Into<String>,
+    ) -> Self {
+        Self {
+            id,
+            parent_id: None,
+            role: Role::System,
+            status: Status::Error,
+            kind: BlockKind::Error,
+            content: summary.into(),
+            collapsed: false,
+            compacted: false,
+            ephemeral: false,
+            excluded: false,
+            created_at: crate::now_millis(),
+            tool_kind: None,
+            tool_name: None,
+            tool_input: None,
+            tool_use_id: None,
+            tool_call_id: None,
+            exit_code: None,
+            is_error: false,
+            output: None,
+            source_context: None,
+            source_model: None,
+            drift_kind: None,
+            file_path: None,
+            error: Some(payload),
             content_type: ContentType::Plain,
             order_key: None,
             updated_at: 0,
@@ -1112,6 +1409,7 @@ impl BlockSnapshot {
             && self.source_model == other.source_model
             && self.drift_kind == other.drift_kind
             && self.file_path == other.file_path
+            && self.error == other.error
             && self.content_type == other.content_type
             && self.order_key == other.order_key
     }
@@ -1169,6 +1467,7 @@ impl BlockSnapshotBuilder {
                 source_model: None,
                 drift_kind: None,
                 file_path: None,
+                error: None,
                 content_type: ContentType::Plain,
                 order_key: None,
                 updated_at: 0,
@@ -1293,6 +1592,14 @@ impl BlockSnapshotBuilder {
 
     pub fn order_key(mut self, key: impl Into<String>) -> Self {
         self.snap.order_key = Some(key.into());
+        self
+    }
+
+    pub fn error_payload(mut self, payload: ErrorPayload) -> Self {
+        self.snap.error = Some(payload);
+        self.snap.kind = BlockKind::Error;
+        self.snap.status = Status::Error;
+        self.snap.role = Role::System;
         self
     }
 
@@ -2993,5 +3300,299 @@ mod tests {
         // User text block — fails role constraint
         let user_block = BlockSnapshot::text(BlockId::new(ctx, agent, 1), None, Role::User, "hi");
         assert!(!f.matches(&user_block));
+    }
+
+    // ── BlockKind::Error ───────────────────────────────────────────────
+
+    #[test]
+    fn test_block_kind_error_parses() {
+        assert_eq!(BlockKind::from_str("error"), Some(BlockKind::Error));
+        assert_eq!(BlockKind::from_str("ERROR"), Some(BlockKind::Error));
+        assert_eq!(BlockKind::Error.as_str(), "error");
+        assert!(BlockKind::Error.is_error());
+        assert!(!BlockKind::Text.is_error());
+    }
+
+    #[test]
+    fn test_block_kind_error_serde_roundtrip() {
+        let json = serde_json::to_string(&BlockKind::Error).unwrap();
+        assert_eq!(json, "\"error\"");
+        let parsed: BlockKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, BlockKind::Error);
+    }
+
+    // ── ErrorPayload ───────────────────────────────────────────────────
+
+    fn test_payload() -> ErrorPayload {
+        ErrorPayload {
+            category: ErrorCategory::Tool,
+            severity: ErrorSeverity::Error,
+            code: Some("tool.timeout".into()),
+            detail: Some("Shell command timed out after 30s".into()),
+            span: None,
+            source_kind: Some(BlockKind::ToolResult),
+        }
+    }
+
+    fn test_parse_payload() -> ErrorPayload {
+        ErrorPayload {
+            category: ErrorCategory::Parse,
+            severity: ErrorSeverity::Warning,
+            code: Some("abc.missing_meter".into()),
+            detail: Some("Missing M: field — add M:4/4 after the title".into()),
+            span: Some(ErrorSpan {
+                line: 3,
+                column: 1,
+                length: 0,
+            }),
+            source_kind: Some(BlockKind::Text),
+        }
+    }
+
+    #[test]
+    fn test_error_payload_serde_json_roundtrip() {
+        let payload = test_payload();
+        let json = serde_json::to_string(&payload).unwrap();
+        let parsed: ErrorPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(payload, parsed);
+    }
+
+    #[test]
+    fn test_error_payload_postcard_roundtrip() {
+        let payload = test_payload();
+        let bytes = postcard::to_stdvec(&payload).unwrap();
+        let parsed: ErrorPayload = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(payload, parsed);
+    }
+
+    #[test]
+    fn test_error_payload_with_span_roundtrip() {
+        let payload = test_parse_payload();
+        let json = serde_json::to_string(&payload).unwrap();
+        let parsed: ErrorPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(payload, parsed);
+    }
+
+    #[test]
+    fn test_error_severity_ordering() {
+        assert!(ErrorSeverity::Warning < ErrorSeverity::Error);
+        assert!(ErrorSeverity::Error < ErrorSeverity::Fatal);
+    }
+
+    #[test]
+    fn test_error_payload_summary_line_with_code_and_detail() {
+        let payload = test_payload();
+        let summary = payload.summary_line();
+        assert!(summary.contains("tool"));
+        assert!(summary.contains("tool.timeout"));
+        assert!(summary.contains("Shell command timed out"));
+    }
+
+    #[test]
+    fn test_error_payload_summary_line_no_detail() {
+        let payload = ErrorPayload {
+            category: ErrorCategory::Kernel,
+            severity: ErrorSeverity::Fatal,
+            code: Some("crdt.corruption".into()),
+            detail: None,
+            span: None,
+            source_kind: None,
+        };
+        let summary = payload.summary_line();
+        assert_eq!(summary, "kernel error (crdt.corruption)");
+    }
+
+    #[test]
+    fn test_error_payload_summary_line_no_code_no_detail() {
+        let payload = ErrorPayload {
+            category: ErrorCategory::Stream,
+            severity: ErrorSeverity::Error,
+            code: None,
+            detail: None,
+            span: None,
+            source_kind: None,
+        };
+        assert_eq!(payload.summary_line(), "stream error");
+    }
+
+    // ── BlockSnapshot::error_for ────────────────────────────────────────
+
+    #[test]
+    fn test_error_for_constructor_sets_fields() {
+        let ctx = test_context();
+        let agent = test_agent();
+        let parent_id = BlockId::new(ctx, agent, 1);
+        let id = BlockId::new(ctx, PrincipalId::system(), 2);
+        let payload = test_payload();
+        let snap = BlockSnapshot::error_for(id, parent_id, payload.clone(), "timeout!");
+
+        assert_eq!(snap.id, id);
+        assert_eq!(snap.parent_id, Some(parent_id));
+        assert_eq!(snap.role, Role::System);
+        assert_eq!(snap.status, Status::Error);
+        assert_eq!(snap.kind, BlockKind::Error);
+        assert_eq!(snap.content, "timeout!");
+        assert_eq!(snap.error, Some(payload));
+        assert!(!snap.ephemeral);
+        assert!(!snap.excluded);
+    }
+
+    #[test]
+    fn test_system_error_constructor_no_parent() {
+        let ctx = test_context();
+        let id = BlockId::new(ctx, PrincipalId::system(), 1);
+        let payload = test_payload();
+        let snap = BlockSnapshot::system_error(id, payload.clone(), "rpc failed");
+
+        assert!(snap.parent_id.is_none());
+        assert_eq!(snap.kind, BlockKind::Error);
+        assert_eq!(snap.role, Role::System);
+        assert_eq!(snap.error, Some(payload));
+    }
+
+    #[test]
+    fn test_text_constructor_has_no_error_payload() {
+        let ctx = test_context();
+        let snap = BlockSnapshot::text(
+            BlockId::new(ctx, test_agent(), 1),
+            None,
+            Role::User,
+            "hello",
+        );
+        assert!(snap.error.is_none());
+    }
+
+    #[test]
+    fn test_error_block_snapshot_json_roundtrip() {
+        let ctx = test_context();
+        let agent = test_agent();
+        let parent_id = BlockId::new(ctx, agent, 1);
+        let id = BlockId::new(ctx, PrincipalId::system(), 2);
+        let snap = BlockSnapshot::error_for(id, parent_id, test_parse_payload(), "bad abc");
+
+        let json = serde_json::to_string(&snap).unwrap();
+        let parsed: BlockSnapshot = serde_json::from_str(&json).unwrap();
+        assert!(parsed.content_eq(&snap));
+        assert_eq!(parsed.error, snap.error);
+    }
+
+    #[test]
+    fn test_error_block_snapshot_postcard_roundtrip() {
+        let ctx = test_context();
+        let agent = test_agent();
+        let parent_id = BlockId::new(ctx, agent, 1);
+        let id = BlockId::new(ctx, PrincipalId::system(), 2);
+        let snap = BlockSnapshot::error_for(id, parent_id, test_payload(), "timeout");
+
+        let bytes = postcard::to_stdvec(&snap).unwrap();
+        let parsed: BlockSnapshot = postcard::from_bytes(&bytes).unwrap();
+        assert!(parsed.content_eq(&snap));
+        assert_eq!(parsed.error, snap.error);
+    }
+
+    #[test]
+    fn test_error_block_content_eq_includes_error_field() {
+        let ctx = test_context();
+        let agent = test_agent();
+        let parent_id = BlockId::new(ctx, agent, 1);
+        let id = BlockId::new(ctx, PrincipalId::system(), 2);
+        let snap1 = BlockSnapshot::error_for(id, parent_id, test_payload(), "err");
+        let snap2 = BlockSnapshot::error_for(id, parent_id, test_parse_payload(), "err");
+        assert!(!snap1.content_eq(&snap2));
+    }
+
+    #[test]
+    fn test_builder_error_payload() {
+        let ctx = test_context();
+        let id = BlockId::new(ctx, test_agent(), 1);
+        let payload = test_payload();
+        let snap = BlockSnapshotBuilder::new(id, BlockKind::Text)
+            .content("something broke")
+            .error_payload(payload.clone())
+            .build();
+
+        assert_eq!(snap.kind, BlockKind::Error);
+        assert_eq!(snap.status, Status::Error);
+        assert_eq!(snap.role, Role::System);
+        assert_eq!(snap.error, Some(payload));
+    }
+
+    // ── format_error_for_llm ───────────────────────────────────────────
+
+    #[test]
+    fn test_format_error_for_llm_envelope_shape() {
+        let ctx = test_context();
+        let agent = test_agent();
+        let parent_id = BlockId::new(ctx, agent, 1);
+        let id = BlockId::new(ctx, PrincipalId::system(), 2);
+        let snap = BlockSnapshot::error_for(id, parent_id, test_parse_payload(), "bad abc");
+
+        let formatted = format_error_for_llm(&snap);
+        assert!(formatted.starts_with("<error "));
+        assert!(formatted.ends_with("</error>"));
+        assert!(formatted.contains("category=\"parse\""));
+        assert!(formatted.contains("severity=\"warning\""));
+        assert!(formatted.contains("code=\"abc.missing_meter\""));
+        assert!(formatted.contains("line=\"3\""));
+        assert!(formatted.contains("column=\"1\""));
+        assert!(formatted.contains("Missing M: field"));
+    }
+
+    #[test]
+    fn test_format_error_for_llm_truncates_long_detail() {
+        let ctx = test_context();
+        let agent = test_agent();
+        let parent_id = BlockId::new(ctx, agent, 1);
+        let id = BlockId::new(ctx, PrincipalId::system(), 2);
+        let long_detail = "x".repeat(5000);
+        let payload = ErrorPayload {
+            category: ErrorCategory::Tool,
+            severity: ErrorSeverity::Error,
+            code: None,
+            detail: Some(long_detail),
+            span: None,
+            source_kind: None,
+        };
+        let snap = BlockSnapshot::error_for(id, parent_id, payload, "big error");
+
+        let formatted = format_error_for_llm(&snap);
+        assert!(formatted.contains("...[truncated]"));
+        assert!(formatted.len() < 3000);
+    }
+
+    #[test]
+    fn test_format_error_for_llm_no_payload_returns_content() {
+        let ctx = test_context();
+        let snap = BlockSnapshot::text(
+            BlockId::new(ctx, test_agent(), 1),
+            None,
+            Role::System,
+            "fallback content",
+        );
+        assert_eq!(format_error_for_llm(&snap), "fallback content");
+    }
+
+    // ── BlockFilter includes Error kind ────────────────────────────────
+
+    #[test]
+    fn test_block_filter_matches_error_kind() {
+        let f = BlockFilter {
+            kinds: vec![BlockKind::Error],
+            ..Default::default()
+        };
+        let ctx = test_context();
+        let agent = test_agent();
+        let parent_id = BlockId::new(ctx, agent, 1);
+        let id = BlockId::new(ctx, PrincipalId::system(), 2);
+        let error_block = BlockSnapshot::error_for(id, parent_id, test_payload(), "err");
+        assert!(f.matches(&error_block));
+
+        let text_block = BlockSnapshot::text(
+            BlockId::new(ctx, agent, 3),
+            None,
+            Role::User,
+            "hello",
+        );
+        assert!(!f.matches(&text_block));
     }
 }

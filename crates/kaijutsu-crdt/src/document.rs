@@ -59,6 +59,16 @@ const KEY_SOURCE_CONTEXT: &str = "source_context";
 const KEY_SOURCE_MODEL: &str = "source_model";
 const KEY_DRIFT_KIND: &str = "drift_kind";
 
+// Error-specific fields
+const KEY_ERROR_CATEGORY: &str = "error_category";
+const KEY_ERROR_SEVERITY: &str = "error_severity";
+const KEY_ERROR_CODE: &str = "error_code";
+const KEY_ERROR_DETAIL: &str = "error_detail";
+const KEY_ERROR_SPAN_LINE: &str = "error_span_line";
+const KEY_ERROR_SPAN_COLUMN: &str = "error_span_column";
+const KEY_ERROR_SPAN_LENGTH: &str = "error_span_length";
+const KEY_ERROR_SOURCE_KIND: &str = "error_source_kind";
+
 /// Block document backed by diamond-types-extended Document.
 ///
 /// # Single-Writer-Per-Replica Model
@@ -407,6 +417,67 @@ impl BlockDocument {
             .and_then(|v| v.as_str().map(|s| s.to_string()))
             .and_then(|s| crate::DriftKind::from_str(&s));
 
+        // Error-specific fields — reconstruct ErrorPayload if category is present
+        let error = block_map
+            .get(KEY_ERROR_CATEGORY)
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .and_then(|cat_str| {
+                let category = match cat_str.as_str() {
+                    "tool" => kaijutsu_types::ErrorCategory::Tool,
+                    "stream" => kaijutsu_types::ErrorCategory::Stream,
+                    "rpc" => kaijutsu_types::ErrorCategory::Rpc,
+                    "render" => kaijutsu_types::ErrorCategory::Render,
+                    "parse" => kaijutsu_types::ErrorCategory::Parse,
+                    "validation" => kaijutsu_types::ErrorCategory::Validation,
+                    "kernel" => kaijutsu_types::ErrorCategory::Kernel,
+                    _ => return None,
+                };
+                let severity = block_map
+                    .get(KEY_ERROR_SEVERITY)
+                    .and_then(|v| v.as_str().map(|s| s.to_string()))
+                    .and_then(|s| match s.as_str() {
+                        "warning" => Some(kaijutsu_types::ErrorSeverity::Warning),
+                        "error" => Some(kaijutsu_types::ErrorSeverity::Error),
+                        "fatal" => Some(kaijutsu_types::ErrorSeverity::Fatal),
+                        _ => None,
+                    })
+                    .unwrap_or(kaijutsu_types::ErrorSeverity::Error);
+                let code = block_map
+                    .get(KEY_ERROR_CODE)
+                    .and_then(|v| v.as_str().map(|s| s.to_string()))
+                    .filter(|s| !s.is_empty());
+                let detail = block_map
+                    .get(KEY_ERROR_DETAIL)
+                    .and_then(|v| v.as_str().map(|s| s.to_string()))
+                    .filter(|s| !s.is_empty());
+                let span = block_map
+                    .get(KEY_ERROR_SPAN_LINE)
+                    .and_then(|v| v.as_int())
+                    .map(|line| kaijutsu_types::ErrorSpan {
+                        line: line as u32,
+                        column: block_map
+                            .get(KEY_ERROR_SPAN_COLUMN)
+                            .and_then(|v| v.as_int())
+                            .unwrap_or(0) as u32,
+                        length: block_map
+                            .get(KEY_ERROR_SPAN_LENGTH)
+                            .and_then(|v| v.as_int())
+                            .unwrap_or(0) as u32,
+                    });
+                let source_kind = block_map
+                    .get(KEY_ERROR_SOURCE_KIND)
+                    .and_then(|v| v.as_str().map(|s| s.to_string()))
+                    .and_then(|s| BlockKind::from_str(&s));
+                Some(kaijutsu_types::ErrorPayload {
+                    category,
+                    severity,
+                    code,
+                    detail,
+                    span,
+                    source_kind,
+                })
+            });
+
         Some(BlockSnapshot {
             id: *id,
             parent_id,
@@ -431,6 +502,7 @@ impl BlockDocument {
             source_model,
             drift_kind,
             file_path: None,    // Legacy document doesn't track file_path
+            error,
             content_type: ContentType::Plain, // Legacy document predates content_type
             content_type_at: 0,               // Legacy document predates content_type
             order_key: None,                  // Legacy document uses DTE-backed ordering
@@ -636,6 +708,7 @@ impl BlockDocument {
             None,  // source_context
             None,  // source_model
             None,  // drift_kind
+            None,  // error_payload
         )?;
 
         Ok(id)
@@ -674,6 +747,7 @@ impl BlockDocument {
             None,  // source_context
             None,  // source_model
             None,  // drift_kind
+            None,  // error_payload
         )?;
 
         Ok(id)
@@ -713,6 +787,7 @@ impl BlockDocument {
             None,  // source_context
             None,  // source_model
             None,  // drift_kind
+            None,  // error_payload
         )?;
 
         Ok(id)
@@ -753,6 +828,7 @@ impl BlockDocument {
             Some(source_context),
             source_model,
             Some(drift_kind),
+            None, // error_payload
         )?;
 
         Ok(id)
@@ -797,6 +873,7 @@ impl BlockDocument {
             snapshot.source_context,
             snapshot.source_model,
             snapshot.drift_kind,
+            snapshot.error.as_ref(),
         )?;
 
         Ok(block_id)
@@ -824,6 +901,7 @@ impl BlockDocument {
         source_context: Option<ContextId>,
         source_model: Option<String>,
         drift_kind: Option<crate::DriftKind>,
+        error_payload: Option<&kaijutsu_types::ErrorPayload>,
     ) -> Result<()> {
         let block_key = id.to_key();
 
@@ -934,6 +1012,26 @@ impl BlockDocument {
                 }
                 if let Some(ref dk) = drift_kind {
                     block_map.set(KEY_DRIFT_KIND, dk.as_str());
+                }
+
+                // Error-specific fields
+                if let Some(ref ep) = error_payload {
+                    block_map.set(KEY_ERROR_CATEGORY, ep.category.as_str());
+                    block_map.set(KEY_ERROR_SEVERITY, ep.severity.as_str());
+                    if let Some(ref code) = ep.code {
+                        block_map.set(KEY_ERROR_CODE, code.as_str());
+                    }
+                    if let Some(ref detail) = ep.detail {
+                        block_map.set(KEY_ERROR_DETAIL, detail.as_str());
+                    }
+                    if let Some(ref span) = ep.span {
+                        block_map.set(KEY_ERROR_SPAN_LINE, span.line as i64);
+                        block_map.set(KEY_ERROR_SPAN_COLUMN, span.column as i64);
+                        block_map.set(KEY_ERROR_SPAN_LENGTH, span.length as i64);
+                    }
+                    if let Some(sk) = ep.source_kind {
+                        block_map.set(KEY_ERROR_SOURCE_KIND, sk.as_str());
+                    }
                 }
 
                 (text_id, tool_input_id)
@@ -1345,6 +1443,7 @@ impl BlockDocument {
                 block.source_context,
                 block.source_model,
                 block.drift_kind,
+                block.error.as_ref(),
             );
 
             last_id = Some(new_id);
@@ -1488,6 +1587,7 @@ impl BlockDocument {
                     block_snap.source_context,
                     block_snap.source_model.clone(),
                     block_snap.drift_kind,
+                    block_snap.error.as_ref(),
                 )
                 .is_ok()
             {

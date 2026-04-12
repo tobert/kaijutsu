@@ -602,6 +602,7 @@ pub fn build_distillation_prompt(
             BlockKind::ToolResult => " (tool result)",
             BlockKind::Drift => " (drift)",
             BlockKind::File => " (file)",
+            BlockKind::Error => " (error)",
             BlockKind::Text => "",
         };
 

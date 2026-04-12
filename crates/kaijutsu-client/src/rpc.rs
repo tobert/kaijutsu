@@ -7,7 +7,8 @@ use futures::AsyncReadExt;
 use kaijutsu_crdt::{ContextId, KernelId};
 use kaijutsu_types::{
     BlockFilter, BlockId, BlockKind, BlockQuery, BlockSnapshot, BlockSnapshotBuilder, ContentType,
-    DriftKind, PrincipalId, Role, Status, ToolKind,
+    DriftKind, ErrorCategory, ErrorPayload, ErrorSeverity, ErrorSpan, PrincipalId, Role, Status,
+    ToolKind,
 };
 use russh::ChannelStream;
 use russh::client::Msg;
@@ -1681,6 +1682,7 @@ fn set_block_filter_builder(
                     BlockKind::ToolResult => crate::kaijutsu_capnp::BlockKind::ToolResult,
                     BlockKind::Drift => crate::kaijutsu_capnp::BlockKind::Drift,
                     BlockKind::File => crate::kaijutsu_capnp::BlockKind::File,
+                    BlockKind::Error => crate::kaijutsu_capnp::BlockKind::Error,
                 },
             );
         }
@@ -1808,6 +1810,7 @@ fn set_block_event_filter_builder(
                     BlockKind::ToolResult => crate::kaijutsu_capnp::BlockKind::ToolResult,
                     BlockKind::Drift => crate::kaijutsu_capnp::BlockKind::Drift,
                     BlockKind::File => crate::kaijutsu_capnp::BlockKind::File,
+                    BlockKind::Error => crate::kaijutsu_capnp::BlockKind::Error,
                 },
             );
         }
@@ -2008,7 +2011,7 @@ pub(crate) fn parse_block_snapshot(
     // Parse block ID
     let id = parse_block_id(&reader.get_id()?)?;
 
-    // Parse kind (6 variants)
+    // Parse kind (7 variants)
     let kind = match reader.get_kind()? {
         crate::kaijutsu_capnp::BlockKind::Text => BlockKind::Text,
         crate::kaijutsu_capnp::BlockKind::Thinking => BlockKind::Thinking,
@@ -2016,6 +2019,7 @@ pub(crate) fn parse_block_snapshot(
         crate::kaijutsu_capnp::BlockKind::ToolResult => BlockKind::ToolResult,
         crate::kaijutsu_capnp::BlockKind::Drift => BlockKind::Drift,
         crate::kaijutsu_capnp::BlockKind::File => BlockKind::File,
+        crate::kaijutsu_capnp::BlockKind::Error => BlockKind::Error,
     };
 
     let mut builder = BlockSnapshotBuilder::new(id, kind);
@@ -2158,6 +2162,64 @@ pub(crate) fn parse_block_snapshot(
     // Ephemeral flag (human-only, excluded from LLM hydration)
     if reader.get_ephemeral() {
         builder = builder.ephemeral(true);
+    }
+
+    // Error payload (for Error blocks)
+    if reader.get_has_error_payload()
+        && let Ok(ep) = reader.get_error_payload()
+    {
+        let category = match ep.get_category()? {
+            crate::kaijutsu_capnp::ErrorCategory::Tool => ErrorCategory::Tool,
+            crate::kaijutsu_capnp::ErrorCategory::Stream => ErrorCategory::Stream,
+            crate::kaijutsu_capnp::ErrorCategory::Rpc => ErrorCategory::Rpc,
+            crate::kaijutsu_capnp::ErrorCategory::Render => ErrorCategory::Render,
+            crate::kaijutsu_capnp::ErrorCategory::Parse => ErrorCategory::Parse,
+            crate::kaijutsu_capnp::ErrorCategory::Validation => ErrorCategory::Validation,
+            crate::kaijutsu_capnp::ErrorCategory::Kernel => ErrorCategory::Kernel,
+        };
+        let severity = match ep.get_severity()? {
+            crate::kaijutsu_capnp::ErrorSeverity::Warning => ErrorSeverity::Warning,
+            crate::kaijutsu_capnp::ErrorSeverity::Error => ErrorSeverity::Error,
+            crate::kaijutsu_capnp::ErrorSeverity::Fatal => ErrorSeverity::Fatal,
+        };
+        let code = ep.get_code().ok()
+            .and_then(|s| s.to_str().ok())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        let detail = ep.get_detail().ok()
+            .and_then(|s| s.to_str().ok())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        let span = if ep.get_has_span() {
+            Some(ErrorSpan {
+                line: ep.get_span_line(),
+                column: ep.get_span_column(),
+                length: ep.get_span_length(),
+            })
+        } else {
+            None
+        };
+        let source_kind = if ep.get_has_source_kind() {
+            ep.get_source_kind().ok().map(|sk| match sk {
+                crate::kaijutsu_capnp::BlockKind::Text => BlockKind::Text,
+                crate::kaijutsu_capnp::BlockKind::Thinking => BlockKind::Thinking,
+                crate::kaijutsu_capnp::BlockKind::ToolCall => BlockKind::ToolCall,
+                crate::kaijutsu_capnp::BlockKind::ToolResult => BlockKind::ToolResult,
+                crate::kaijutsu_capnp::BlockKind::Drift => BlockKind::Drift,
+                crate::kaijutsu_capnp::BlockKind::File => BlockKind::File,
+                crate::kaijutsu_capnp::BlockKind::Error => BlockKind::Error,
+            })
+        } else {
+            None
+        };
+        builder = builder.error_payload(ErrorPayload {
+            category,
+            severity,
+            code,
+            detail,
+            span,
+            source_kind,
+        });
     }
 
     Ok(builder.build())

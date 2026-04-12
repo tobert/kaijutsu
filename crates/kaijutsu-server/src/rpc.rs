@@ -1130,7 +1130,7 @@ pub async fn create_shared_kernel(
     let id_str = id.to_hex();
 
     // Create the kaijutsu kernel with shared FlowBus
-    let kernel = Kernel::with_flows(&id_str, block_flows.clone()).await;
+    let kernel = Kernel::with_flows(&id_str, block_flows.clone(), Some(&resolved_data_dir)).await;
 
     // Read-only root — whole system visible (ls /usr/bin, cargo, etc.)
     kernel.mount("/", LocalBackend::read_only("/")).await;
@@ -6218,6 +6218,7 @@ fn set_block_snapshot(
         kaijutsu_crdt::BlockKind::ToolResult => crate::kaijutsu_capnp::BlockKind::ToolResult,
         kaijutsu_crdt::BlockKind::Drift => crate::kaijutsu_capnp::BlockKind::Drift,
         kaijutsu_crdt::BlockKind::File => crate::kaijutsu_capnp::BlockKind::File,
+        kaijutsu_crdt::BlockKind::Error => crate::kaijutsu_capnp::BlockKind::Error,
     });
 
     // Set basic fields (no author — derived from id.agent_id)
@@ -6283,6 +6284,66 @@ fn set_block_snapshot(
         builder.set_has_drift_kind(true);
         builder.set_drift_kind(drift_kind_to_capnp(dk));
     }
+
+    // Set error payload if present
+    if let Some(ref payload) = block.error {
+        builder.set_has_error_payload(true);
+        let mut ep = builder.reborrow().init_error_payload();
+        ep.set_category(error_category_to_capnp(payload.category));
+        ep.set_severity(error_severity_to_capnp(payload.severity));
+        if let Some(ref code) = payload.code {
+            ep.set_code(code);
+        }
+        if let Some(ref detail) = payload.detail {
+            ep.set_detail(detail);
+        }
+        if let Some(ref span) = payload.span {
+            ep.set_has_span(true);
+            ep.set_span_line(span.line);
+            ep.set_span_column(span.column);
+            ep.set_span_length(span.length);
+        }
+        if let Some(sk) = payload.source_kind {
+            ep.set_has_source_kind(true);
+            ep.set_source_kind(match sk {
+                kaijutsu_crdt::BlockKind::Text => crate::kaijutsu_capnp::BlockKind::Text,
+                kaijutsu_crdt::BlockKind::Thinking => crate::kaijutsu_capnp::BlockKind::Thinking,
+                kaijutsu_crdt::BlockKind::ToolCall => crate::kaijutsu_capnp::BlockKind::ToolCall,
+                kaijutsu_crdt::BlockKind::ToolResult => crate::kaijutsu_capnp::BlockKind::ToolResult,
+                kaijutsu_crdt::BlockKind::Drift => crate::kaijutsu_capnp::BlockKind::Drift,
+                kaijutsu_crdt::BlockKind::File => crate::kaijutsu_capnp::BlockKind::File,
+                kaijutsu_crdt::BlockKind::Error => crate::kaijutsu_capnp::BlockKind::Error,
+            });
+        }
+    }
+}
+
+/// Convert a CRDT ErrorCategory to Cap'n Proto.
+fn error_category_to_capnp(
+    cat: kaijutsu_crdt::ErrorCategory,
+) -> crate::kaijutsu_capnp::ErrorCategory {
+    match cat {
+        kaijutsu_crdt::ErrorCategory::Tool => crate::kaijutsu_capnp::ErrorCategory::Tool,
+        kaijutsu_crdt::ErrorCategory::Stream => crate::kaijutsu_capnp::ErrorCategory::Stream,
+        kaijutsu_crdt::ErrorCategory::Rpc => crate::kaijutsu_capnp::ErrorCategory::Rpc,
+        kaijutsu_crdt::ErrorCategory::Render => crate::kaijutsu_capnp::ErrorCategory::Render,
+        kaijutsu_crdt::ErrorCategory::Parse => crate::kaijutsu_capnp::ErrorCategory::Parse,
+        kaijutsu_crdt::ErrorCategory::Validation => {
+            crate::kaijutsu_capnp::ErrorCategory::Validation
+        }
+        kaijutsu_crdt::ErrorCategory::Kernel => crate::kaijutsu_capnp::ErrorCategory::Kernel,
+    }
+}
+
+/// Convert a CRDT ErrorSeverity to Cap'n Proto.
+fn error_severity_to_capnp(
+    sev: kaijutsu_crdt::ErrorSeverity,
+) -> crate::kaijutsu_capnp::ErrorSeverity {
+    match sev {
+        kaijutsu_crdt::ErrorSeverity::Warning => crate::kaijutsu_capnp::ErrorSeverity::Warning,
+        kaijutsu_crdt::ErrorSeverity::Error => crate::kaijutsu_capnp::ErrorSeverity::Error,
+        kaijutsu_crdt::ErrorSeverity::Fatal => crate::kaijutsu_capnp::ErrorSeverity::Fatal,
+    }
 }
 
 /// Convert a CRDT ToolKind to Cap'n Proto ToolKind.
@@ -6345,6 +6406,7 @@ fn parse_block_filter(
                 crate::kaijutsu_capnp::BlockKind::ToolResult => BlockKind::ToolResult,
                 crate::kaijutsu_capnp::BlockKind::Drift => BlockKind::Drift,
                 crate::kaijutsu_capnp::BlockKind::File => BlockKind::File,
+                crate::kaijutsu_capnp::BlockKind::Error => BlockKind::Error,
             });
         }
         if kinds.is_empty() {
@@ -6496,6 +6558,7 @@ fn parse_block_event_filter(
                             crate::kaijutsu_capnp::BlockKind::ToolResult => BlockKind::ToolResult,
                             crate::kaijutsu_capnp::BlockKind::Drift => BlockKind::Drift,
                             crate::kaijutsu_capnp::BlockKind::File => BlockKind::File,
+                            crate::kaijutsu_capnp::BlockKind::Error => BlockKind::Error,
                         })
                     })
                     .collect()
