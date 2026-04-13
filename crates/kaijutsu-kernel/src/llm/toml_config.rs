@@ -57,7 +57,12 @@ pub struct EmbeddingModelConfig {
 }
 
 /// Build an `LlmRegistry` from a parsed `LlmConfig`.
-pub fn initialize_llm_registry(config: &LlmConfig) -> LlmRegistry {
+///
+/// Returns an error if `config.default_provider` does not name a provider
+/// that was successfully registered (either unknown name, or registration
+/// failed, e.g. missing API key). Silent fallback to some other provider
+/// would hide the misconfiguration.
+pub fn initialize_llm_registry(config: &LlmConfig) -> LlmResult<LlmRegistry> {
     let mut registry = LlmRegistry::new();
 
     for provider_config in &config.providers {
@@ -85,35 +90,28 @@ pub fn initialize_llm_registry(config: &LlmConfig) -> LlmRegistry {
         }
     }
 
-    // Set default provider
-    if registry.set_default(&config.default_provider) {
-        if let Some(pc) = config
-            .providers
-            .iter()
-            .find(|p| p.provider_type == config.default_provider)
-            && let Some(ref model) = pc.default_model
-        {
-            registry.set_default_model(model);
-        }
-        tracing::info!(provider = %config.default_provider, "set default LLM provider");
-    } else {
-        let available: Vec<_> = registry.list().iter().map(|s| s.to_string()).collect();
-        if let Some(first) = available.first() {
-            registry.set_default(first);
-            tracing::warn!(
-                requested = %config.default_provider,
-                fallback = %first,
-                "default provider unavailable, using fallback"
-            );
-        } else {
-            tracing::warn!("no LLM providers available");
-        }
+    if !registry.set_default(&config.default_provider) {
+        let available: Vec<String> = registry.list().iter().map(|s| s.to_string()).collect();
+        return Err(LlmError::InvalidRequest(format!(
+            "default_provider '{}' is not registered; available providers: {:?}",
+            config.default_provider, available
+        )));
     }
+
+    if let Some(pc) = config
+        .providers
+        .iter()
+        .find(|p| p.provider_type == config.default_provider)
+        && let Some(ref model) = pc.default_model
+    {
+        registry.set_default_model(model);
+    }
+    tracing::info!(provider = %config.default_provider, "set default LLM provider");
 
     registry.set_model_aliases(config.model_aliases.clone());
     registry.set_provider_configs(config.providers.clone());
 
-    registry
+    Ok(registry)
 }
 
 // ---------------------------------------------------------------------------
@@ -233,7 +231,7 @@ pub fn load_models_config_toml(content: &str) -> LlmResult<ModelsConfig> {
     let raw: ModelsToml = toml::from_str(content)
         .map_err(|e| LlmError::InvalidRequest(format!("models.toml parse error: {e}")))?;
 
-    let llm = convert_llm_config(&raw);
+    let llm = convert_llm_config(&raw)?;
     let embedding = convert_embedding(&raw.embedding);
 
     Ok(ModelsConfig { llm, embedding })
@@ -244,46 +242,55 @@ pub fn load_llm_config_toml(content: &str) -> LlmResult<LlmConfig> {
     let raw: ModelsToml = toml::from_str(content)
         .map_err(|e| LlmError::InvalidRequest(format!("models.toml parse error: {e}")))?;
 
-    Ok(convert_llm_config(&raw))
+    convert_llm_config(&raw)
 }
 
 // ---------------------------------------------------------------------------
 // Conversion helpers
 // ---------------------------------------------------------------------------
 
-fn convert_llm_config(raw: &ModelsToml) -> LlmConfig {
-    let providers: Vec<ProviderConfig> = raw
-        .providers
-        .iter()
-        .map(|(name, p)| {
-            let mut config = ProviderConfig::new(name);
-            config.enabled = p.enabled;
-            config.api_key_env = p.api_key_env.clone();
-            config.base_url = p.base_url.clone();
-            config.default_model = p.default_model.clone();
-            config.max_output_tokens = p.max_output_tokens;
-            config.default_tools = p
-                .default_tools
-                .as_ref()
-                .map(convert_tool_filter)
-                .unwrap_or(ToolFilter::All);
-            config
-        })
-        .collect();
+fn convert_llm_config(raw: &ModelsToml) -> LlmResult<LlmConfig> {
+    let mut providers: Vec<ProviderConfig> = Vec::with_capacity(raw.providers.len());
+    for (name, p) in &raw.providers {
+        let mut config = ProviderConfig::new(name);
+        config.enabled = p.enabled;
+        config.api_key_env = p.api_key_env.clone();
+        config.base_url = p.base_url.clone();
+        config.default_model = p.default_model.clone();
+        config.max_output_tokens = p.max_output_tokens;
+        // Absent default_tools deliberately defaults to AllowList(empty) — a
+        // provider that does not opt in to a tool policy exposes no tools.
+        // This is the strict choice: forgetting to specify a filter must not
+        // silently grant full tool access.
+        config.default_tools = match p.default_tools.as_ref() {
+            Some(tf) => convert_tool_filter(name, tf)?,
+            None => ToolFilter::allow(Vec::<String>::new()),
+        };
+        providers.push(config);
+    }
 
-    LlmConfig {
+    Ok(LlmConfig {
         default_provider: raw.default_provider.clone(),
         providers,
         model_aliases: raw.model_aliases.clone(),
+    })
+}
+
+fn convert_tool_filter(provider_name: &str, tf: &ToolFilterToml) -> LlmResult<ToolFilter> {
+    match tf.filter_type.as_str() {
+        "all" => Ok(ToolFilter::All),
+        "allow" => Ok(ToolFilter::allow(tf.tools.clone())),
+        "deny" => Ok(ToolFilter::deny(tf.tools.clone())),
+        other => Ok(other_err(provider_name, other)?),
     }
 }
 
-fn convert_tool_filter(tf: &ToolFilterToml) -> ToolFilter {
-    match tf.filter_type.as_str() {
-        "allow" => ToolFilter::allow(tf.tools.clone()),
-        "deny" => ToolFilter::deny(tf.tools.clone()),
-        _ => ToolFilter::All,
-    }
+#[cold]
+fn other_err(provider_name: &str, filter_type: &str) -> LlmResult<ToolFilter> {
+    Err(LlmError::InvalidRequest(format!(
+        "provider '{provider_name}': unknown tool filter type '{filter_type}' \
+         (expected 'all', 'allow', or 'deny')"
+    )))
 }
 
 fn convert_embedding(raw: &Option<EmbeddingToml>) -> Option<EmbeddingModelConfig> {
@@ -323,7 +330,9 @@ mod tests {
         assert!(!config.llm.model_aliases.is_empty());
 
         // Embedding config should be present and enabled
-        let emb = config.embedding.expect("embedding section should be present");
+        let emb = config
+            .embedding
+            .expect("embedding section should be present");
         assert!(emb.enabled);
         assert_eq!(emb.dimensions, 384);
         assert_eq!(emb.max_tokens, 512);
@@ -442,10 +451,116 @@ model_dir = "/tmp/model"
 
     #[test]
     fn test_initialize_registry_skips_disabled() {
+        // Only works if the ANTHROPIC_API_KEY env var is present (default
+        // provider is "anthropic"). Skip if not set — this is a smoke test
+        // for the disabled-provider filtering logic, not for registry
+        // initialization error paths.
+        if std::env::var("ANTHROPIC_API_KEY").is_err() {
+            return;
+        }
         let config = load_models_config_toml(DEFAULT_TOML).unwrap();
-        let registry = initialize_llm_registry(&config.llm);
+        let registry = initialize_llm_registry(&config.llm).unwrap();
         // Disabled providers (gemini, openai) should not be registered
         assert!(registry.get("gemini").is_none());
         assert!(registry.get("openai").is_none());
+    }
+
+    #[test]
+    fn test_initialize_registry_errors_on_unknown_default_provider() {
+        let toml = r#"
+default_provider = "nonexistent"
+
+[providers.ollama]
+enabled = true
+base_url = "http://localhost:11434"
+default_model = "llama3"
+
+[providers.ollama.default_tools]
+type = "all"
+
+[model_aliases]
+"#;
+        let config = load_llm_config_toml(toml).unwrap();
+        let err = initialize_llm_registry(&config).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("nonexistent"),
+            "error should name the missing provider: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_tool_filter_all_explicit() {
+        let toml = r#"
+default_provider = "test"
+
+[providers.test]
+enabled = false
+
+[providers.test.default_tools]
+type = "all"
+
+[model_aliases]
+"#;
+        let config = load_llm_config_toml(toml).unwrap();
+        let test = config
+            .providers
+            .iter()
+            .find(|p| p.provider_type == "test")
+            .unwrap();
+        assert_eq!(test.default_tools, ToolFilter::All);
+    }
+
+    #[test]
+    fn test_tool_filter_absent_is_empty_allowlist() {
+        // Absent default_tools must NOT silently grant full access.
+        let toml = r#"
+default_provider = "test"
+
+[providers.test]
+enabled = false
+
+[model_aliases]
+"#;
+        let config = load_llm_config_toml(toml).unwrap();
+        let test = config
+            .providers
+            .iter()
+            .find(|p| p.provider_type == "test")
+            .unwrap();
+        assert_eq!(
+            test.default_tools,
+            ToolFilter::allow(Vec::<String>::new()),
+            "absent default_tools should be empty AllowList (deny-all)"
+        );
+        assert!(
+            !test.default_tools.allows("bash"),
+            "empty AllowList must deny every tool"
+        );
+    }
+
+    #[test]
+    fn test_tool_filter_unknown_type_errors() {
+        let toml = r#"
+default_provider = "test"
+
+[providers.test]
+enabled = false
+
+[providers.test.default_tools]
+type = "bogus"
+
+[model_aliases]
+"#;
+        let err = load_llm_config_toml(toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bogus"),
+            "error should name the offending filter type: {msg}"
+        );
+        assert!(
+            msg.contains("test"),
+            "error should name the offending provider: {msg}"
+        );
     }
 }

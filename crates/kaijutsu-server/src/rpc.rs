@@ -87,8 +87,6 @@ use kaijutsu_kernel::{
     AgentConfig,
     AgentInfo,
     AgentStatus,
-    InvokeRequest,
-    InvokeResponse,
     // Block tools
     BlockAppendEngine,
     BlockCreateEngine,
@@ -109,6 +107,8 @@ use kaijutsu_kernel::{
     GlobEngine,
     GrepEngine,
     InputDocFlow,
+    InvokeRequest,
+    InvokeResponse,
     Kernel,
     KernelSearchEngine,
     LlmMessage,
@@ -119,7 +119,6 @@ use kaijutsu_kernel::{
     McpToolEngine,
     McpTransport,
     ReadEngine,
-    register_mcp_prompt_engines, register_mcp_resource_engines,
     SharedBlockFlowBus,
     SharedBlockStore,
     SharedConfigFlowBus,
@@ -132,6 +131,8 @@ use kaijutsu_kernel::{
     WriteEngine,
     block_store::BlockStore,
     extract_tool_result_text,
+    register_mcp_prompt_engines,
+    register_mcp_resource_engines,
     shared_block_flow_bus,
     shared_config_flow_bus,
     shared_input_doc_flow_bus,
@@ -737,12 +738,17 @@ async fn initialize_kernel_models(
     };
 
     match kaijutsu_kernel::load_models_config_toml(&content) {
-        Ok(models_config) => {
-            let registry = kaijutsu_kernel::initialize_llm_registry(&models_config.llm);
-            *kernel.llm().write().await = registry;
-            log::info!("Initialized kernel LLM registry from models.toml");
-            models_config.embedding
-        }
+        Ok(models_config) => match kaijutsu_kernel::initialize_llm_registry(&models_config.llm) {
+            Ok(registry) => {
+                *kernel.llm().write().await = registry;
+                log::info!("Initialized kernel LLM registry from models.toml");
+                models_config.embedding
+            }
+            Err(e) => {
+                log::error!("Failed to initialize LLM registry: {}", e);
+                None
+            }
+        },
         Err(e) => {
             log::warn!("Failed to parse models.toml: {}, reloading from disk", e);
             if let Err(reload_err) = config_backend.reload_from_disk("models.toml").await {
@@ -758,10 +764,19 @@ async fn initialize_kernel_models(
             };
             match kaijutsu_kernel::load_models_config_toml(&content) {
                 Ok(models_config) => {
-                    let registry = kaijutsu_kernel::initialize_llm_registry(&models_config.llm);
-                    *kernel.llm().write().await = registry;
-                    log::info!("Initialized kernel LLM registry from models.toml (reloaded)");
-                    models_config.embedding
+                    match kaijutsu_kernel::initialize_llm_registry(&models_config.llm) {
+                        Ok(registry) => {
+                            *kernel.llm().write().await = registry;
+                            log::info!(
+                                "Initialized kernel LLM registry from models.toml (reloaded)"
+                            );
+                            models_config.embedding
+                        }
+                        Err(e) => {
+                            log::error!("Failed to initialize LLM registry after reload: {}", e);
+                            None
+                        }
+                    }
                 }
                 Err(e) => {
                     log::error!("Failed to parse models.toml even after reload: {}", e);
@@ -899,10 +914,7 @@ async fn initialize_kernel_mcp(
 /// resource later changes, this watcher reads the fresh content and inserts it as a
 /// Drift/Notification block in the conversation. The model sees it on its next turn,
 /// and the user sees it inline in the conversation.
-fn spawn_resource_notification_watcher(
-    pool: Arc<McpServerPool>,
-    documents: SharedBlockStore,
-) {
+fn spawn_resource_notification_watcher(pool: Arc<McpServerPool>, documents: SharedBlockStore) {
     use kaijutsu_kernel::ResourceFlow;
 
     let mut sub = pool.resource_flows().subscribe("resource.updated");
@@ -922,12 +934,7 @@ fn spawn_resource_notification_watcher(
                             .unwrap_or_else(|_| "[unreadable resource]".into())
                     }
                     Err(e) => {
-                        log::warn!(
-                            "Failed to read updated resource {}:{} — {}",
-                            server,
-                            uri,
-                            e
-                        );
+                        log::warn!("Failed to read updated resource {}:{} — {}", server, uri, e);
                         continue;
                     }
                 };
@@ -993,9 +1000,8 @@ async fn dispatch_output_events(
     connection: &Rc<RefCell<ConnectionState>>,
 ) {
     // Clone subscribers out to avoid holding RefCell borrow across await points.
-    let subscribers: Vec<kernel_output::Client> = {
-        connection.borrow().output_subscribers.clone()
-    };
+    let subscribers: Vec<kernel_output::Client> =
+        { connection.borrow().output_subscribers.clone() };
 
     if subscribers.is_empty() {
         return;
@@ -1215,7 +1221,13 @@ pub async fn create_shared_kernel(
         kernel_db_arc.clone(),
     ));
     let session_contexts = crate::context_engine::session_context_map();
-    register_block_tools(&kernel_arc, documents.clone(), workspace_guard, session_contexts.clone()).await;
+    register_block_tools(
+        &kernel_arc,
+        documents.clone(),
+        workspace_guard,
+        session_contexts.clone(),
+    )
+    .await;
 
     // Recover contexts: KernelDb is the primary source, with BlockStore discovery as fallback.
     // A failure to read the DB here means we cannot know which contexts should be recovered —
@@ -1317,16 +1329,12 @@ pub async fn create_shared_kernel(
 
     // Register MCP resource tools (list, read, subscribe, unsubscribe)
     for (_name, info, engine) in register_mcp_resource_engines(mcp_pool.clone()) {
-        kernel_arc
-            .register_tool_with_engine(info, engine)
-            .await;
+        kernel_arc.register_tool_with_engine(info, engine).await;
     }
 
     // Register MCP prompt tools (list, get)
     for (_name, info, engine) in register_mcp_prompt_engines(mcp_pool.clone()) {
-        kernel_arc
-            .register_tool_with_engine(info, engine)
-            .await;
+        kernel_arc.register_tool_with_engine(info, engine).await;
     }
 
     // Spawn background watcher: MCP resource updates → drift blocks
@@ -1622,9 +1630,7 @@ impl kernel::Server for KernelImpl {
                 {
                     let conn = connection.borrow();
                     if conn.has_running_execution() {
-                        return Err(capnp::Error::failed(
-                            "execution already in progress".into(),
-                        ));
+                        return Err(capnp::Error::failed("execution already in progress".into()));
                     }
                 }
 
@@ -2423,7 +2429,11 @@ impl kernel::Server for KernelImpl {
         let connection = self.connection.clone();
 
         let session_id = connection.borrow().session_id;
-        let parent_ctx = connection.borrow().session_contexts.get(&session_id).map(|r| *r);
+        let parent_ctx = connection
+            .borrow()
+            .session_contexts
+            .get(&session_id)
+            .map(|r| *r);
 
         log::info!(
             "create_context: label='{}' kernel='{}'",
@@ -2519,9 +2529,7 @@ impl kernel::Server for KernelImpl {
                     drop(drift);
                     let _ = kernel.kernel_db.lock().delete_context(context_id);
                     let _ = kernel.documents.delete_document(context_id);
-                    return Err(capnp::Error::failed(format!(
-                        "label conflict: {e}"
-                    )));
+                    return Err(capnp::Error::failed(format!("label conflict: {e}")));
                 }
                 if let (Some(p), Some(m)) = (&default_provider, &default_model) {
                     let _ = drift.configure_llm(context_id, p, m);
@@ -2608,7 +2616,10 @@ impl kernel::Server for KernelImpl {
 
                 // Update connection's active context in the global map
                 let session_id = connection.borrow().session_id;
-                connection.borrow().session_contexts.insert(session_id, context_id);
+                connection
+                    .borrow()
+                    .session_contexts
+                    .insert(session_id, context_id);
 
                 // Return the context_id
                 results.get().set_context_id(context_id.as_bytes());
@@ -3514,8 +3525,7 @@ impl kernel::Server for KernelImpl {
             async move {
                 // Create invoke channel if callback provided
                 let invoke_sender = if let Some(callback) = commands_callback {
-                    let (tx, mut rx) =
-                        tokio::sync::mpsc::channel::<InvokeRequest>(32);
+                    let (tx, mut rx) = tokio::sync::mpsc::channel::<InvokeRequest>(32);
                     let nick_for_task = nick.clone();
 
                     // Bridge task: recv InvokeRequest from channel, call capnp callback
@@ -3528,12 +3538,10 @@ impl kernel::Server for KernelImpl {
                                 p.set_params(&request.params);
                             }
                             let result = match req.send().promise.await {
-                                Ok(response) => {
-                                    match response.get().and_then(|r| r.get_result()) {
-                                        Ok(data) => Ok(data.to_vec()),
-                                        Err(e) => Err(format!("capnp read error: {e}")),
-                                    }
-                                }
+                                Ok(response) => match response.get().and_then(|r| r.get_result()) {
+                                    Ok(data) => Ok(data.to_vec()),
+                                    Err(e) => Err(format!("capnp read error: {e}")),
+                                },
                                 Err(e) => Err(format!("RPC error: {e}")),
                             };
                             if request.reply.send(InvokeResponse { result }).is_err() {
@@ -3543,10 +3551,7 @@ impl kernel::Server for KernelImpl {
                                 );
                             }
                         }
-                        log::debug!(
-                            "Agent invoke bridge for '{}' ended",
-                            nick_for_task
-                        );
+                        log::debug!("Agent invoke bridge for '{}' ended", nick_for_task);
                     });
 
                     Some(tx)
@@ -3674,9 +3679,7 @@ impl kernel::Server for KernelImpl {
                     .await;
 
                 // Dispatch to the target agent via its registered channel
-                let result = kernel_arc
-                    .invoke_agent(&nick, &action, invoke_params)
-                    .await;
+                let result = kernel_arc.invoke_agent(&nick, &action, invoke_params).await;
 
                 match result {
                     Ok(data) => {
@@ -5482,7 +5485,9 @@ impl kernel::Server for KernelImpl {
             Ok(s) => s,
             Err(_) => {
                 results.get().set_success(false);
-                results.get().set_error(&format!("unknown state '{state_str}'"));
+                results
+                    .get()
+                    .set_error(&format!("unknown state '{state_str}'"));
                 return Promise::ok(());
             }
         };
@@ -5589,9 +5594,7 @@ impl kernel::Server for KernelImpl {
                     )));
                 }
                 None => {
-                    return Promise::err(capnp::Error::failed(
-                        "context not found".into(),
-                    ));
+                    return Promise::err(capnp::Error::failed("context not found".into()));
                 }
             }
         }
@@ -6061,11 +6064,9 @@ async fn execute_shell_command(
                 if let Some(ref ct_str) = result.content_type {
                     let ct = ContentType::from_mime(ct_str);
                     if ct != ContentType::Plain {
-                        if let Err(e) = documents_clone.set_content_type(
-                            context_id,
-                            &output_block_id_clone,
-                            ct,
-                        ) {
+                        if let Err(e) =
+                            documents_clone.set_content_type(context_id, &output_block_id_clone, ct)
+                        {
                             log::error!("Failed to set content_type: {}", e);
                         }
                     }
@@ -6148,7 +6149,6 @@ async fn execute_shell_command(
 
     Ok(command_block_id)
 }
-
 
 // ============================================================================
 // Utility Functions
@@ -6315,7 +6315,9 @@ fn set_block_snapshot(
                 kaijutsu_crdt::BlockKind::Text => crate::kaijutsu_capnp::BlockKind::Text,
                 kaijutsu_crdt::BlockKind::Thinking => crate::kaijutsu_capnp::BlockKind::Thinking,
                 kaijutsu_crdt::BlockKind::ToolCall => crate::kaijutsu_capnp::BlockKind::ToolCall,
-                kaijutsu_crdt::BlockKind::ToolResult => crate::kaijutsu_capnp::BlockKind::ToolResult,
+                kaijutsu_crdt::BlockKind::ToolResult => {
+                    crate::kaijutsu_capnp::BlockKind::ToolResult
+                }
                 kaijutsu_crdt::BlockKind::Drift => crate::kaijutsu_capnp::BlockKind::Drift,
                 kaijutsu_crdt::BlockKind::File => crate::kaijutsu_capnp::BlockKind::File,
                 kaijutsu_crdt::BlockKind::Error => crate::kaijutsu_capnp::BlockKind::Error,
@@ -6369,9 +6371,7 @@ fn drift_kind_to_capnp(dk: kaijutsu_crdt::DriftKind) -> crate::kaijutsu_capnp::D
         kaijutsu_crdt::DriftKind::Merge => crate::kaijutsu_capnp::DriftKind::Merge,
         kaijutsu_crdt::DriftKind::Distill => crate::kaijutsu_capnp::DriftKind::Distill,
         kaijutsu_crdt::DriftKind::Commit => crate::kaijutsu_capnp::DriftKind::Commit,
-        kaijutsu_crdt::DriftKind::Notification => {
-            crate::kaijutsu_capnp::DriftKind::Notification
-        }
+        kaijutsu_crdt::DriftKind::Notification => crate::kaijutsu_capnp::DriftKind::Notification,
         kaijutsu_crdt::DriftKind::Fork => crate::kaijutsu_capnp::DriftKind::Fork,
     }
 }
