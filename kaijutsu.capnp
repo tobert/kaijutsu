@@ -968,7 +968,7 @@ interface Kernel {
   # ============================================================================
   # Configuration (Config as CRDT)
   # ============================================================================
-  # Config files (theme.rhai) are managed as CRDT documents.
+  # Config files (theme.toml, bindings.toml, models.toml, etc.) are managed as CRDT documents.
 
   # List loaded config documents
   listConfigs @53 () -> (configs :List(Text));

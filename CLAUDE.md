@@ -24,7 +24,6 @@ kaijutsu/
 │   ├── kaijutsu-client/      # RPC client, ActorHandle (Send+Sync)
 │   ├── kaijutsu-app/         # Bevy GUI
 │   ├── kaijutsu-abc/         # ABC music notation
-│   ├── kaijutsu-rhai/        # Rhai scripting integration
 │   ├── kaijutsu-mcp/         # MCP server (rmcp)
 │   ├── kaijutsu-index/       # Semantic vector indexing (ONNX + HNSW)
 │   └── kaijutsu-telemetry/   # OpenTelemetry (W3C context propagation)

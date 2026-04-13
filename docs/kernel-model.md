@@ -22,7 +22,7 @@
 | Fork/Thread (RPC) | ✅ Implemented (`rpc.rs:988-1218`) |
 | Block tools | ✅ Extensive (9 tools, 104KB implementation) |
 | Context membership | ✅ ContextMembership (context_name, kernel_id, nick, instance) |
-| LLM integration | ✅ Per-kernel LLM via `llm.rhai` config (Anthropic, OpenAI, Gemini) |
+| LLM integration | ✅ Per-kernel LLM via `models.toml` config (Anthropic, OpenAI, Gemini) |
 | FlowBus | ✅ Pub/sub for block, resource, config, progress, elicitation events |
 | Drift | ✅ Cross-context communication with LLM distillation |
 | Agents | ✅ AgentRegistry with capabilities, status, activity events |
@@ -82,7 +82,7 @@
 | Tools (block tools, etc.) | **kaijutsu-kernel** | ToolRegistry + ExecutionEngine trait |
 | Drift (cross-context) | **kaijutsu-kernel** | DriftRouter (shared via Arc across fork/thread) |
 | MCP connections | **kaijutsu-kernel** | McpServerPool (shared across kernels) |
-| LLM integration | **kaijutsu-kernel** | LlmRegistry (per-kernel via `llm.rhai`) |
+| LLM integration | **kaijutsu-kernel** | LlmRegistry (per-kernel via `models.toml`) |
 | Agents | **kaijutsu-kernel** | AgentRegistry (capabilities, status, events) |
 | Shell execution | **kaijutsu-server** | EmbeddedKaish or KaishProcess |
 | Block I/O for kaish | **kaijutsu-server** | KaijutsuBackend (maps files to CRDT blocks) |

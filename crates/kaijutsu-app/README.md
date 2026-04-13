@@ -47,18 +47,19 @@ resolution-independent crisp edges at any scale.
 
 ### Quality Parameters
 
-Font rendering quality is tunable via `~/.config/kaijutsu/theme.rhai` with hot-reload:
+Font rendering quality is tunable via `~/.config/kaijutsu/theme.toml` with hot-reload.
+See `assets/defaults/theme.toml` for the full schema. The relevant fields:
 
-```rhai
-// Core quality (high impact)
-let font_stem_darkening = 0.15;  // 0.0-0.5, thickens thin strokes
-let font_hint_amount = 0.8;      // 0.0-1.0, stroke direction sharpening
-let font_taa_enabled = true;     // temporal anti-aliasing
+```toml
+# Core quality (high impact)
+font_stem_darkening = 0.15   # 0.0-0.5, thickens thin strokes
+font_hint_amount    = 0.8    # 0.0-1.0, stroke direction sharpening
+font_taa_enabled    = true   # temporal anti-aliasing
 
-// Fine-tuning
-let font_horz_scale = 1.1;       // vertical stroke AA width
-let font_vert_scale = 0.6;       // horizontal stroke AA width
-let font_text_bias = 0.5;        // SDF threshold (thickness)
+# Fine-tuning
+font_horz_scale = 1.1        # vertical stroke AA width
+font_vert_scale = 0.6        # horizontal stroke AA width
+font_text_bias  = 0.5        # SDF threshold (thickness)
 ```
 
 ### Fonts
