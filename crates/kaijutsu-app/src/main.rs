@@ -91,9 +91,13 @@ fn main() {
         log_dir
     );
 
-    // Load theme and bindings from ~/.config/kaijutsu/ (or use defaults)
+    // Load theme and bindings from ~/.config/kaijutsu/ (or use defaults).
+    // Errors (bad TOML, unknown action/key tokens) are already logged and
+    // collected into app_config.errors, which is inserted as a resource
+    // below so a startup system can surface them via GlobalErrorQueue.
     let app_config = config::load_app_config();
     let theme = app_config.theme;
+    let startup_errors = config::StartupConfigErrors(app_config.errors);
 
     App::new()
         .add_plugins(
@@ -163,6 +167,8 @@ fn main() {
         .add_plugins(bevy_tweening::TweeningPlugin)
         // Resources - theme loaded from ~/.config/kaijutsu/theme.toml
         .insert_resource(theme)
+        // Startup config errors (drained into GlobalErrorQueue on first frame)
+        .insert_resource(startup_errors)
         // Power management — sleep between events instead of spinning every vsync tick.
         // Input events (keyboard, mouse, window) wake immediately with zero added latency.
         .insert_resource(WinitSettings {
@@ -174,6 +180,8 @@ fn main() {
             Startup,
             (setup_camera, setup_ui, ui::debug::setup_debug_overlay).chain(),
         )
+        // Drain config-load errors into the dock error HUD on first frame
+        .add_systems(Update, config::drain_startup_errors)
         // Adapt window to monitor on first frame (Monitor not available at Startup)
         .add_systems(Update, adapt_window_to_monitor)
         // Update
@@ -224,8 +232,13 @@ fn adapt_window_to_monitor(
 
     info!(
         "Adapting window to monitor: {}x{} physical, {:.0}x scale → {:.0}x{:.0} logical → {:.0}x{:.0} window",
-        monitor.physical_width, monitor.physical_height, monitor.scale_factor,
-        logical_w, logical_h, w, h,
+        monitor.physical_width,
+        monitor.physical_height,
+        monitor.scale_factor,
+        logical_w,
+        logical_h,
+        w,
+        h,
     );
 
     window.resolution.set(w, h);

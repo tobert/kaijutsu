@@ -19,8 +19,23 @@ pub struct InputMap {
 
 impl Default for InputMap {
     fn default() -> Self {
-        Self {
-            bindings: super::bindings_config::load_bindings(),
-        }
+        // Default impl can't return Result; errors are already loudly logged
+        // and surfaced via StartupConfigErrors in crate::config::load_app_config.
+        // This path is hit only when InputMap is init'd via `init_resource`
+        // before load_app_config has run — we prefer default bindings over
+        // a crash so the app can still boot.
+        let bindings = match super::bindings_config::load_bindings() {
+            Ok(loaded) => {
+                for err in &loaded.entry_errors {
+                    warn!("bindings.toml: {err}");
+                }
+                loaded.bindings
+            }
+            Err(e) => {
+                error!("{e}; falling back to default bindings");
+                super::defaults::default_bindings()
+            }
+        };
+        Self { bindings }
     }
 }
