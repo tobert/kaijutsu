@@ -63,7 +63,16 @@ futures = { workspace = true }
 async-broadcast = "0.7"
 
 # MCP
-rmcp.workspace = true
+rmcp = { workspace = true, features = ["server", "macros"] }
+
+# JSON schema derivation for tool Params structs (Phase 1 tool redesign)
+schemars = { version = "1.0", features = ["chrono04"] }
+
+# CancellationToken for tool-call cancellation plumbing
+tokio-util = { version = "0.7" }
+
+# Telemetry — W3C trace context injection into CallContext
+kaijutsu-telemetry.workspace = true
 
 # Base64 (transitive dep via rmcp/rig — zero new compiled code)
 base64 = "0.22"

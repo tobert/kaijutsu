@@ -25,6 +25,7 @@ pub mod kernel;
 pub mod kernel_db;
 pub mod kj;
 pub mod llm;
+pub mod mcp;
 pub mod mcp_config;
 pub mod mcp_pool;
 pub mod state;

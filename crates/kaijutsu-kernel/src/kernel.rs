@@ -25,6 +25,7 @@ use crate::drift::{SharedDriftRouter, shared_drift_router};
 use crate::flows::{SharedBlockFlowBus, shared_block_flow_bus};
 use crate::llm::config::{ToolConfig, ToolFilter};
 use crate::llm::{LlmRegistry, RigProvider};
+use crate::mcp::Broker;
 use crate::state::KernelState;
 use crate::tools::{ExecResult, ExecutionEngine, ToolContext, ToolInfo, ToolRegistry};
 use crate::vfs::{DirEntry, FileAttr, MountTable, SetAttr, StatFs, VfsOps, VfsResult};
@@ -59,6 +60,9 @@ pub struct Kernel {
     cas: Arc<FileStore>,
     /// Image generation backend registry.
     image_backends: RwLock<crate::image::ImageBackendRegistry>,
+    /// MCP-centric tool broker (Phase 1; sits alongside the old `tools`
+    /// registry until M4 swaps call sites).
+    broker: Arc<Broker>,
 }
 
 impl std::fmt::Debug for Kernel {
@@ -114,6 +118,7 @@ impl Kernel {
             drift: shared_drift_router(),
             cas: Self::cas_for_data_dir(data_dir),
             image_backends: RwLock::new(crate::image::ImageBackendRegistry::new()),
+            broker: Arc::new(Broker::new()),
         }
     }
 
@@ -141,7 +146,13 @@ impl Kernel {
             drift: shared_drift_router(),
             cas: Self::cas_for_data_dir(data_dir),
             image_backends: RwLock::new(crate::image::ImageBackendRegistry::new()),
+            broker: Arc::new(Broker::new()),
         }
+    }
+
+    /// Get the MCP tool broker (Phase 1).
+    pub fn broker(&self) -> &Arc<Broker> {
+        &self.broker
     }
 
     /// Get the block flows bus.
