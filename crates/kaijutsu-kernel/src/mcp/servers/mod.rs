@@ -14,9 +14,11 @@
 
 pub mod adapter;
 pub mod block;
+pub mod external;
 pub mod file;
 pub mod kernel_info;
 
 pub use block::BlockToolsServer;
+pub use external::ExternalMcpServer;
 pub use file::FileToolsServer;
 pub use kernel_info::KernelInfoServer;
