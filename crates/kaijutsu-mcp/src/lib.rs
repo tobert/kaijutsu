@@ -1691,7 +1691,7 @@ impl KaijutsuMcp {
     }
 
     // ========================================================================
-    // Kaish Execution (via ActorHandle → ToolRegistry)
+    // Kaish Execution (via ActorHandle → broker dispatch)
     // ========================================================================
 
     #[tool(

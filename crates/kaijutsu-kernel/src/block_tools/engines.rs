@@ -1,7 +1,8 @@
-//! ExecutionEngine implementations for block tools.
+//! Block-tool engines.
 //!
-//! Each tool implements the ExecutionEngine trait for integration with
-//! the kernel's tool system.
+//! Each engine struct owns `SharedBlockStore` state and exposes an inherent
+//! `execute(params_json, &ExecContext)` method. `mcp::servers::BlockToolsServer`
+//! wraps these engines and exposes them through `Broker::call_tool`.
 
 use regex::Regex;
 use schemars::JsonSchema;

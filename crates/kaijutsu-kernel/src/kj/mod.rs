@@ -34,7 +34,7 @@ use crate::kernel_db::KernelDb;
 
 /// Per-invocation caller identity.
 ///
-/// Constructed from ExecContext/ToolContext at call time — NOT stored on KjDispatcher.
+/// Constructed from an `ExecContext` at call time — NOT stored on KjDispatcher.
 /// The `.` context reference resolves to `context_id`.
 #[derive(Debug, Clone)]
 pub struct KjCaller {

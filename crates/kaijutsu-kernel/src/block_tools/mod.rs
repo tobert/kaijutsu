@@ -26,7 +26,8 @@
 //!                      ▼
 //! ┌─────────────────────────────────────────┐
 //! │         Block Tool Engines              │
-//! │   (ExecutionEngine implementations)     │
+//! │   (inherent methods invoked by the      │
+//! │    mcp::servers::BlockToolsServer)      │
 //! └────────────────────┬────────────────────┘
 //!                      │ Line operations
 //!                      ▼

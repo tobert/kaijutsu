@@ -1,10 +1,9 @@
-//! MCP-centric tool system (Phase 1 of the redesign).
+//! MCP-centric tool system.
 //!
-//! See `docs/tool-system-redesign.md` for the source of truth. This module is
-//! the replacement for `tools::ExecutionEngine`, `tools::ToolRegistry`,
-//! `block_tools::engines::*`, `file_tools::*`, and `mcp_pool::McpToolEngine`.
-//! During Phase 1 the old modules still live alongside; call sites switch in
-//! M4, deletions happen in M5.
+//! See `docs/tool-system-redesign.md` for the source of truth. As of Phase 1
+//! M5 this module is the sole kernel tool-dispatch path — every tool, builtin
+//! or external, speaks `McpServerLike` and every call goes through the
+//! `Broker`. The legacy `tools.rs` / `mcp_pool.rs` / MCP FlowBuses are gone.
 
 pub mod binding;
 pub mod broker;

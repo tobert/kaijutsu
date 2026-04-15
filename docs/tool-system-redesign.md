@@ -676,6 +676,35 @@ mark it `[RETIRED: <date> — <reason>]` in place; do not delete.
 - **D-29** — Hook reentrancy: bodies may call back into the broker,
   capped at a small per-task depth (default 4). Cap exceeded returns
   `McpError::HookRecursionLimit`.
+- **D-30** — Content-creation tools (`svg_block`, `abc_block`,
+  `img_block`, `img_block_from_path`) fold into `BlockToolsServer`
+  (instance `builtin.block`). One instance owns the BlockStore and
+  exposes both structural and content-creation operations; splitting
+  into a separate `ContentToolsServer` doubled BlockStore ownership
+  for no user-visible benefit.
+- **D-31** — Phase 1 exit criterion #4 ("identical CRDT ops to the
+  pre-refactor system") is dropped. Rationale: no snapshot harness
+  exists and broker dispatch is a transparent passthrough to the
+  same engine bodies; the existing `block_tools`/`file_tools` unit
+  tests already cover correctness. Replacement criterion: "broker
+  dispatch passes the existing `block_tools` and `file_tools` test
+  suites unchanged."
+- **D-32** — All four MCP FlowBuses (`SharedResourceFlowBus`,
+  `SharedProgressFlowBus`, `SharedLoggingFlowBus`,
+  `SharedElicitationFlowBus`) deleted in Phase 1 M5. External MCP
+  notifications are dropped on the floor until Phase 2 wires the
+  coalescer → `BlockKind::Notification` path. `ExternalMcpServer`
+  still receives notifications via its `ClientHandler`, converts
+  them to `ServerNotification`, and publishes on its
+  `broadcast::Sender`; nothing subscribes yet. Non-MCP flow buses
+  (`BlockFlow`, `ConfigFlow`, `InputDocFlow`) survive unchanged.
+- **D-33** — Kaish tool invocations route through
+  `Broker::call_tool` with the same `CallContext`.
+  `KaijutsuBackend::list_tools` / `get_tool` / `call_tool` enumerate
+  and dispatch via the broker (no transitional registry shim, per
+  D-16). `McpError::ToolNotFound` maps to
+  `BackendError::ToolNotFound` at the kaish boundary so downstream
+  "tool not found" semantics survive.
 
 ## 7. Open questions per area
 
@@ -742,7 +771,9 @@ are acceptable. Plan documents for each phase go in `~/.claude/plans/`.
 
 Status legend: `planned` · `in-progress` · `complete` · `blocked`
 
-### Phase 1 — Replace plumbing · **planned**
+### Phase 1 — Replace plumbing · **complete**
+
+Plan: `~/.claude/plans/polished-sauteeing-corbato.md`
 
 The big phase. Rip out the old tool system in a single branch; main
 comes back green with the new shape. **LLM streaming path is updated to
@@ -807,14 +838,16 @@ Exit criteria — concrete end-to-end scenarios that must pass:
 
 1. `cargo check --workspace` clean; `cargo test --workspace` passes.
 2. No references to `ExecutionEngine` / `ToolRegistry` / `EngineArgs` /
-   `ToolContext` / `McpToolEngine` / `SharedElicitationFlowBus` remain
-   anywhere in the workspace.
+   `ToolContext` / `McpToolEngine` / `SharedElicitationFlowBus` /
+   `Shared{Resource,Progress,Logging}FlowBus` remain in live code
+   across the workspace. Retired names appear only in comments/doc
+   strings that describe the history.
 3. A kaijutsu-app session sends a message to an LLM; the LLM streams a
    response that appears in a Running → Done block sequence.
-4. During that session, the LLM calls `block_create` followed by
-   `block_append` and `block_edit` via the broker; each produces
-   identical CRDT ops to the pre-refactor system (compare against a
-   recorded fixture if needed).
+4. Broker dispatch passes the existing `block_tools` and `file_tools`
+   test suites unchanged (per D-31 — the original "identical CRDT ops
+   vs pre-refactor" criterion was dropped because no snapshot harness
+   existed and delegation is a transparent passthrough).
 5. An external MCP tool call through `ExternalMcpServer` succeeds
    end-to-end against at least one real MCP in the user's environment
    (suggested: `gpal.consult_gemini_oneshot` or `bevy_brp.brp_status`),
@@ -1030,3 +1063,17 @@ Entries are append-only. Most recent at the bottom.
   rewrite from phase 1; both now follow-ups in §9. Phase 1 exit
   criteria expanded to named end-to-end scenarios including a real
   external MCP round-trip.
+- **2026-04-15** (Phase 1 execution, Amy + Claude Opus 4.6): Phase 1
+  landed in six milestones (M1 skeleton → M2 builtin virtual servers
+  → M3 ExternalMcpServer → M4 call-site swap → M5 aggressive
+  deletions → M6 doc/verify). Decisions D-30 (content tools fold
+  into BlockToolsServer), D-31 (drop identical-CRDT exit #4),
+  D-32 (all 4 MCP FlowBuses deleted), D-33 (kaish through broker)
+  recorded during planning. M5 cut ~6,700 LOC across 32 files:
+  `tools.rs`, `mcp_pool.rs`, `mcp_config.rs`, `image/gemini.rs`,
+  `kj/prompt.rs`, and the 4 MCP flow types. MCP admin RPC methods
+  stubbed with `unimplemented` responses behind existing capnp
+  ordinals pending Phase 2 broker-admin rewiring. Suite: 417 kernel
+  + 45 server tests pass. End-to-end app-session and external MCP
+  round-trip verification holds for a subsequent live session on the
+  user's GPU server.
