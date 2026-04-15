@@ -2,10 +2,9 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use serde::Deserialize;
 
-use crate::tools::{ExecResult, ExecutionEngine, ToolContext};
+use crate::execution::{ExecContext, ExecResult};
 
 use super::cache::FileDocumentCache;
 use super::guard::WorkspaceGuard;
@@ -25,43 +24,17 @@ impl WriteEngine {
         self.guard = Some(guard);
         self
     }
-}
 
-#[derive(Deserialize)]
-struct WriteParams {
-    path: String,
-    content: String,
-}
-
-#[async_trait]
-impl ExecutionEngine for WriteEngine {
-    fn name(&self) -> &str {
-        "write"
-    }
-
-    fn description(&self) -> &str {
+    pub fn description(&self) -> &str {
         "Write or create a file with the given content"
     }
 
-    fn schema(&self) -> Option<serde_json::Value> {
-        Some(serde_json::json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "File path to write"
-                },
-                "content": {
-                    "type": "string",
-                    "description": "Full file content to write"
-                }
-            },
-            "required": ["path", "content"]
-        }))
-    }
-
     #[tracing::instrument(skip(self, params, ctx), name = "engine.write")]
-    async fn execute(&self, params: &str, ctx: &ToolContext) -> anyhow::Result<ExecResult> {
+    pub async fn execute(
+        &self,
+        params: &str,
+        ctx: &ExecContext,
+    ) -> anyhow::Result<ExecResult> {
         let p: WriteParams = match serde_json::from_str(params) {
             Ok(v) => v,
             Err(e) => return Ok(ExecResult::failure(1, format!("Invalid params: {}", e))),
@@ -85,8 +58,10 @@ impl ExecutionEngine for WriteEngine {
             Err(e) => Ok(ExecResult::failure(1, e)),
         }
     }
+}
 
-    async fn is_available(&self) -> bool {
-        true
-    }
+#[derive(Deserialize)]
+struct WriteParams {
+    path: String,
+    content: String,
 }

@@ -17,14 +17,14 @@ use tokio_util::sync::CancellationToken;
 use crate::file_tools::{
     EditEngine, FileDocumentCache, GlobEngine, GrepEngine, ReadEngine, WorkspaceGuard, WriteEngine,
 };
-use crate::tools::ExecutionEngine;
+
 use crate::vfs::MountTable;
 
 use super::super::context::CallContext;
 use super::super::error::{McpError, McpResult};
 use super::super::server_like::{McpServerLike, ServerNotification};
 use super::super::types::{InstanceId, KernelCallParams, KernelTool, KernelToolResult};
-use super::adapter::{from_exec_result, to_tool_context};
+use super::adapter::{from_exec_result, to_exec_context};
 
 // ── Typed Params (schemars-derived) ────────────────────────────────────────
 
@@ -181,7 +181,7 @@ impl McpServerLike for FileToolsServer {
         ctx: &CallContext,
         _cancel: CancellationToken,
     ) -> McpResult<KernelToolResult> {
-        let tool_ctx = to_tool_context(ctx);
+        let tool_ctx = to_exec_context(ctx);
         let args_json = params.arguments.to_string();
 
         let exec = match params.tool.as_str() {

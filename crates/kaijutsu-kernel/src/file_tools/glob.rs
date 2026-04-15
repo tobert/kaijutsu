@@ -2,11 +2,10 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use kaish_glob::{FileWalker, GlobPath, WalkOptions};
 use serde::Deserialize;
 
-use crate::tools::{ExecResult, ExecutionEngine, ToolContext};
+use crate::execution::{ExecContext, ExecResult};
 use crate::vfs::MountTable;
 
 use super::guard::WorkspaceGuard;
@@ -27,43 +26,17 @@ impl GlobEngine {
         self.guard = Some(guard);
         self
     }
-}
 
-#[derive(Deserialize)]
-struct GlobParams {
-    pattern: String,
-    path: Option<String>,
-}
-
-#[async_trait]
-impl ExecutionEngine for GlobEngine {
-    fn name(&self) -> &str {
-        "glob"
-    }
-
-    fn description(&self) -> &str {
+    pub fn description(&self) -> &str {
         "Find files matching a glob pattern (supports **, gitignore)"
     }
 
-    fn schema(&self) -> Option<serde_json::Value> {
-        Some(serde_json::json!({
-            "type": "object",
-            "properties": {
-                "pattern": {
-                    "type": "string",
-                    "description": "Glob pattern (e.g., '**/*.rs', 'src/**/*.ts'). Supports *, ?, **, {a,b}, [abc]."
-                },
-                "path": {
-                    "type": "string",
-                    "description": "Root directory to search from (default: project root)"
-                }
-            },
-            "required": ["pattern"]
-        }))
-    }
-
     #[tracing::instrument(skip(self, params, ctx), name = "engine.glob")]
-    async fn execute(&self, params: &str, ctx: &ToolContext) -> anyhow::Result<ExecResult> {
+    pub async fn execute(
+        &self,
+        params: &str,
+        ctx: &ExecContext,
+    ) -> anyhow::Result<ExecResult> {
         let p: GlobParams = match serde_json::from_str(params) {
             Ok(v) => v,
             Err(e) => return Ok(ExecResult::failure(1, format!("Invalid params: {}", e))),
@@ -123,8 +96,10 @@ impl ExecutionEngine for GlobEngine {
             Err(e) => Ok(ExecResult::failure(1, format!("Glob walk failed: {}", e))),
         }
     }
+}
 
-    async fn is_available(&self) -> bool {
-        true
-    }
+#[derive(Deserialize)]
+struct GlobParams {
+    pattern: String,
+    path: Option<String>,
 }

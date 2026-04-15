@@ -20,7 +20,6 @@ use russh::{Channel, ChannelId};
 use tokio::net::TcpListener;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
-use kaijutsu_kernel::McpServerPool;
 use kaijutsu_types::Principal;
 
 use crate::auth_db::AuthDb;
@@ -173,80 +172,6 @@ impl SshServer {
         Self { config }
     }
 
-    /// Spawn a background task to pre-initialize MCP servers from mcp.toml.
-    ///
-    /// This runs concurrently with the SSH accept loop so server startup
-    /// isn't blocked by slow MCP servers (e.g. streamable_http with no listener).
-    fn start_mcp_initialization(pool: Arc<McpServerPool>, config_dir: Option<PathBuf>) {
-        let config_path = config_dir
-            .unwrap_or_else(|| kaish_kernel::xdg_config_home().join("kaijutsu"))
-            .join("mcp.toml");
-
-        tokio::spawn(async move {
-            let content = match tokio::fs::read_to_string(&config_path).await {
-                Ok(s) => s,
-                Err(e) => {
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        log::warn!("Failed to read {}: {}", config_path.display(), e);
-                    }
-                    return;
-                }
-            };
-
-            let config = match kaijutsu_kernel::load_mcp_config_toml(&content) {
-                Ok(c) => c,
-                Err(e) => {
-                    log::warn!("Failed to parse mcp.toml: {}", e);
-                    return;
-                }
-            };
-
-            if config.servers.is_empty() {
-                return;
-            }
-
-            log::info!(
-                "Pre-initializing {} MCP servers from {}",
-                config.servers.len(),
-                config_path.display(),
-            );
-
-            let timeout = std::time::Duration::from_secs(5);
-            let futs: Vec<_> = config
-                .servers
-                .into_iter()
-                .map(|server_config| {
-                    let pool = pool.clone();
-                    let name = server_config.name.clone();
-                    async move {
-                        match tokio::time::timeout(timeout, pool.register(server_config)).await {
-                            Ok(Ok(info)) => {
-                                log::info!(
-                                    "MCP server '{}' pre-initialized ({} tools)",
-                                    name,
-                                    info.tools.len(),
-                                );
-                            }
-                            Ok(Err(e)) => {
-                                log::warn!("MCP server '{}' failed to pre-initialize: {}", name, e);
-                            }
-                            Err(_) => {
-                                log::warn!(
-                                    "MCP server '{}' timed out during pre-initialization ({}s)",
-                                    name,
-                                    timeout.as_secs(),
-                                );
-                            }
-                        }
-                    }
-                })
-                .collect();
-
-            futures::future::join_all(futs).await;
-            log::info!("MCP pre-initialization complete");
-        });
-    }
-
     /// Run the SSH server, binding to the configured address.
     pub async fn run(&self) -> Result<(), std::io::Error> {
         let socket = TcpListener::bind(self.config.bind_addr).await?;
@@ -301,15 +226,13 @@ impl SshServer {
             log::warn!("Anonymous mode enabled - unknown keys will be auto-registered");
         }
 
-        // Create shared MCP server pool and pre-initialize from config.
-        // This avoids blocking kernel creation on slow MCP servers.
-        let mcp_pool = Arc::new(McpServerPool::new());
-        Self::start_mcp_initialization(mcp_pool.clone(), self.config.config_dir.clone());
+        // External MCP pool pre-init removed in Phase 1 M5; a Phase 2
+        // replacement will run ExternalMcpServer startup from mcp.toml
+        // via the broker.
 
         // Create the shared kernel at server startup — 会の場所 (the meeting place).
         // All connections share this single kernel.
         let shared_kernel = crate::rpc::create_shared_kernel(
-            &mcp_pool,
             self.config.config_dir.as_deref(),
             self.config.data_dir.as_deref(),
         )
@@ -318,7 +241,6 @@ impl SshServer {
 
         let registry = Arc::new(ServerRegistry {
             kernel: shared_kernel,
-            mcp_pool,
         });
 
         log::info!("Shared kernel created: {}", registry.kernel.name);

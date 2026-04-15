@@ -37,11 +37,9 @@ async fn build_tool_definitions(
     principal_id: PrincipalId,
     context_filter: Option<&ToolFilter>,
 ) -> Vec<ToolDefinition> {
-    let kernel_config = kernel.tool_config().await;
-    let effective_filter = match context_filter {
-        Some(ctx_filter) => kernel_config.filter.merge(ctx_filter),
-        None => kernel_config.filter.clone(),
-    };
+    // Phase 1 M5: kernel-scoped tool_config was removed; the context filter
+    // (when present) is the only gate. `All` is the effective default.
+    let effective_filter = context_filter.cloned().unwrap_or(ToolFilter::All);
 
     let visible = kernel
         .list_tool_defs_via_broker(context_id, principal_id)
@@ -69,7 +67,7 @@ pub(crate) async fn spawn_llm_for_prompt(
     content: &str,
     model: Option<&str>,
     after_block_id: &kaijutsu_crdt::BlockId,
-    tool_ctx: kaijutsu_kernel::ToolContext,
+    tool_ctx: kaijutsu_kernel::ExecContext,
     user_agent_id: PrincipalId,
 ) -> Result<(), capnp::Error> {
     let documents = kernel.documents.clone();
@@ -232,7 +230,7 @@ async fn process_llm_stream(
     conversation_cache: Arc<ConversationCache>,
     // TODO: use for per-user attribution on model-generated blocks
     _user_agent_id: PrincipalId,
-    tool_ctx: kaijutsu_kernel::ToolContext,
+    tool_ctx: kaijutsu_kernel::ExecContext,
     interrupt: Arc<ContextInterruptState>,
     interrupt_generation: u64,
     context_interrupts: Arc<TokioRwLock<HashMap<ContextId, Arc<ContextInterruptState>>>>,
@@ -517,14 +515,10 @@ async fn process_llm_stream(
                 }
 
                 StreamEvent::ToolUse { id, name, input } => {
-                    // Resolve tool_kind from registry category
-                    let tool_kind = {
-                        let registry = kernel.tools().read().await;
-                        registry
-                            .get(&name)
-                            .map(|info| tool_kind_for_category(&info.category))
-                            .unwrap_or(TypesToolKind::Builtin)
-                    };
+                    // Tool kind no longer tracked by a registry category after
+                    // Phase 1 M5 — default to Builtin. Phase 2+ can enrich via
+                    // broker instance metadata when we have a reason.
+                    let tool_kind = TypesToolKind::Builtin;
 
                     // Store for later execution
                     tool_calls.push((id.clone(), name.clone(), input.clone(), tool_kind));

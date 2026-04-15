@@ -3,13 +3,12 @@
 //! Each tool implements the ExecutionEngine trait for integration with
 //! the kernel's tool system.
 
-use async_trait::async_trait;
 use regex::Regex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::block_store::SharedBlockStore;
-use crate::tools::{ExecResult, ExecutionEngine, ToolContext};
+use crate::execution::{ExecContext, ExecResult};
 use kaijutsu_crdt::{BlockId, BlockKind, ContentType, Role, Status};
 use kaijutsu_types::ContextId;
 
@@ -259,7 +258,7 @@ impl BlockCreateEngine {
     fn execute_inner(
         &self,
         params: BlockCreateParams,
-        ctx: &ToolContext,
+        ctx: &ExecContext,
     ) -> Result<serde_json::Value> {
         let role = parse_role(&params.role)?;
         let kind = parse_kind(&params.kind)?;
@@ -309,22 +308,14 @@ impl BlockCreateEngine {
     }
 }
 
-#[async_trait]
-impl ExecutionEngine for BlockCreateEngine {
-    fn name(&self) -> &str {
-        "block_create"
-    }
 
-    fn description(&self) -> &str {
+impl BlockCreateEngine {
+    pub fn description(&self) -> &str {
         "Create a new block with role, kind, and optional content"
     }
 
-    fn schema(&self) -> Option<serde_json::Value> {
-        Some(Self::schema())
-    }
-
     #[tracing::instrument(skip(self, params, ctx), name = "engine.block_create")]
-    async fn execute(&self, params: &str, ctx: &ToolContext) -> anyhow::Result<ExecResult> {
+    pub async fn execute(&self, params: &str, ctx: &ExecContext) -> anyhow::Result<ExecResult> {
         let params: BlockCreateParams = match serde_json::from_str(params) {
             Ok(p) => p,
             Err(e) => {
@@ -338,9 +329,6 @@ impl ExecutionEngine for BlockCreateEngine {
         }
     }
 
-    async fn is_available(&self) -> bool {
-        true
-    }
 }
 
 // ============================================================================
@@ -379,7 +367,7 @@ impl BlockAppendEngine {
     fn execute_inner(
         &self,
         params: BlockAppendParams,
-        ctx: &ToolContext,
+        ctx: &ExecContext,
     ) -> Result<serde_json::Value> {
         let (context_id, block_id) = find_block(&self.documents, &params.block_id)?;
 
@@ -399,22 +387,14 @@ impl BlockAppendEngine {
     }
 }
 
-#[async_trait]
-impl ExecutionEngine for BlockAppendEngine {
-    fn name(&self) -> &str {
-        "block_append"
-    }
 
-    fn description(&self) -> &str {
+impl BlockAppendEngine {
+    pub fn description(&self) -> &str {
         "Append text to a block (optimized for streaming)"
     }
 
-    fn schema(&self) -> Option<serde_json::Value> {
-        Some(Self::schema())
-    }
-
     #[tracing::instrument(skip(self, params, ctx), name = "engine.block_append")]
-    async fn execute(&self, params: &str, ctx: &ToolContext) -> anyhow::Result<ExecResult> {
+    pub async fn execute(&self, params: &str, ctx: &ExecContext) -> anyhow::Result<ExecResult> {
         let params: BlockAppendParams = match serde_json::from_str(params) {
             Ok(p) => p,
             Err(e) => {
@@ -428,9 +408,6 @@ impl ExecutionEngine for BlockAppendEngine {
         }
     }
 
-    async fn is_available(&self) -> bool {
-        true
-    }
 }
 
 // ============================================================================
@@ -502,7 +479,7 @@ impl BlockEditEngine {
     fn execute_inner(
         &self,
         params: BlockEditParams,
-        ctx: &ToolContext,
+        ctx: &ExecContext,
     ) -> Result<serde_json::Value> {
         let (context_id, block_id) = find_block(&self.documents, &params.block_id)?;
 
@@ -556,7 +533,7 @@ impl BlockEditEngine {
         context_id: ContextId,
         block_id: &BlockId,
         op: EditOp,
-        ctx: &ToolContext,
+        ctx: &ExecContext,
     ) -> Result<()> {
         // Get current content
         let content = {
@@ -647,22 +624,14 @@ impl BlockEditEngine {
     }
 }
 
-#[async_trait]
-impl ExecutionEngine for BlockEditEngine {
-    fn name(&self) -> &str {
-        "block_edit"
-    }
 
-    fn description(&self) -> &str {
+impl BlockEditEngine {
+    pub fn description(&self) -> &str {
         "Line-based block editing with atomic operations and CAS validation"
     }
 
-    fn schema(&self) -> Option<serde_json::Value> {
-        Some(Self::schema())
-    }
-
     #[tracing::instrument(skip(self, params, ctx), name = "engine.block_edit")]
-    async fn execute(&self, params: &str, ctx: &ToolContext) -> anyhow::Result<ExecResult> {
+    pub async fn execute(&self, params: &str, ctx: &ExecContext) -> anyhow::Result<ExecResult> {
         let params: BlockEditParams = match serde_json::from_str(params) {
             Ok(p) => p,
             Err(e) => {
@@ -676,9 +645,6 @@ impl ExecutionEngine for BlockEditEngine {
         }
     }
 
-    async fn is_available(&self) -> bool {
-        true
-    }
 }
 
 // ============================================================================
@@ -727,7 +693,7 @@ impl BlockSpliceEngine {
     fn execute_inner(
         &self,
         params: BlockSpliceParams,
-        ctx: &ToolContext,
+        ctx: &ExecContext,
     ) -> Result<serde_json::Value> {
         let (context_id, block_id) = find_block(&self.documents, &params.block_id)?;
 
@@ -756,22 +722,14 @@ impl BlockSpliceEngine {
     }
 }
 
-#[async_trait]
-impl ExecutionEngine for BlockSpliceEngine {
-    fn name(&self) -> &str {
-        "block_splice"
-    }
 
-    fn description(&self) -> &str {
+impl BlockSpliceEngine {
+    pub fn description(&self) -> &str {
         "Character-based editing (for programmatic tools)"
     }
 
-    fn schema(&self) -> Option<serde_json::Value> {
-        Some(Self::schema())
-    }
-
     #[tracing::instrument(skip(self, params, ctx), name = "engine.block_splice")]
-    async fn execute(&self, params: &str, ctx: &ToolContext) -> anyhow::Result<ExecResult> {
+    pub async fn execute(&self, params: &str, ctx: &ExecContext) -> anyhow::Result<ExecResult> {
         let params: BlockSpliceParams = match serde_json::from_str(params) {
             Ok(p) => p,
             Err(e) => {
@@ -785,9 +743,6 @@ impl ExecutionEngine for BlockSpliceEngine {
         }
     }
 
-    async fn is_available(&self) -> bool {
-        true
-    }
 }
 
 // ============================================================================
@@ -878,22 +833,14 @@ impl BlockReadEngine {
     }
 }
 
-#[async_trait]
-impl ExecutionEngine for BlockReadEngine {
-    fn name(&self) -> &str {
-        "block_read"
-    }
 
-    fn description(&self) -> &str {
+impl BlockReadEngine {
+    pub fn description(&self) -> &str {
         "Read block content with optional line numbers and range"
     }
 
-    fn schema(&self) -> Option<serde_json::Value> {
-        Some(Self::schema())
-    }
-
     #[tracing::instrument(skip(self, params, _ctx), name = "engine.block_read")]
-    async fn execute(&self, params: &str, _ctx: &ToolContext) -> anyhow::Result<ExecResult> {
+    pub async fn execute(&self, params: &str, _ctx: &ExecContext) -> anyhow::Result<ExecResult> {
         let params: BlockReadParams = match serde_json::from_str(params) {
             Ok(p) => p,
             Err(e) => {
@@ -907,9 +854,6 @@ impl ExecutionEngine for BlockReadEngine {
         }
     }
 
-    async fn is_available(&self) -> bool {
-        true
-    }
 }
 
 // ============================================================================
@@ -1024,22 +968,14 @@ impl BlockSearchEngine {
     }
 }
 
-#[async_trait]
-impl ExecutionEngine for BlockSearchEngine {
-    fn name(&self) -> &str {
-        "block_search"
-    }
 
-    fn description(&self) -> &str {
+impl BlockSearchEngine {
+    pub fn description(&self) -> &str {
         "Search within a block using regex or literal patterns"
     }
 
-    fn schema(&self) -> Option<serde_json::Value> {
-        Some(Self::schema())
-    }
-
     #[tracing::instrument(skip(self, params, _ctx), name = "engine.block_search")]
-    async fn execute(&self, params: &str, _ctx: &ToolContext) -> anyhow::Result<ExecResult> {
+    pub async fn execute(&self, params: &str, _ctx: &ExecContext) -> anyhow::Result<ExecResult> {
         let params: BlockSearchParams = match serde_json::from_str(params) {
             Ok(p) => p,
             Err(e) => {
@@ -1053,9 +989,6 @@ impl ExecutionEngine for BlockSearchEngine {
         }
     }
 
-    async fn is_available(&self) -> bool {
-        true
-    }
 }
 
 // ============================================================================
@@ -1175,22 +1108,14 @@ impl BlockListEngine {
     }
 }
 
-#[async_trait]
-impl ExecutionEngine for BlockListEngine {
-    fn name(&self) -> &str {
-        "block_list"
-    }
 
-    fn description(&self) -> &str {
+impl BlockListEngine {
+    pub fn description(&self) -> &str {
         "List blocks with optional filters"
     }
 
-    fn schema(&self) -> Option<serde_json::Value> {
-        Some(Self::schema())
-    }
-
     #[tracing::instrument(skip(self, params, _ctx), name = "engine.block_list")]
-    async fn execute(&self, params: &str, _ctx: &ToolContext) -> anyhow::Result<ExecResult> {
+    pub async fn execute(&self, params: &str, _ctx: &ExecContext) -> anyhow::Result<ExecResult> {
         let params: BlockListParams = match serde_json::from_str(params) {
             Ok(p) => p,
             Err(e) => {
@@ -1204,9 +1129,6 @@ impl ExecutionEngine for BlockListEngine {
         }
     }
 
-    async fn is_available(&self) -> bool {
-        true
-    }
 }
 
 // ============================================================================
@@ -1262,22 +1184,14 @@ impl BlockStatusEngine {
     }
 }
 
-#[async_trait]
-impl ExecutionEngine for BlockStatusEngine {
-    fn name(&self) -> &str {
-        "block_status"
-    }
 
-    fn description(&self) -> &str {
+impl BlockStatusEngine {
+    pub fn description(&self) -> &str {
         "Set block status (pending, running, done, error, cancelled)"
     }
 
-    fn schema(&self) -> Option<serde_json::Value> {
-        Some(Self::schema())
-    }
-
     #[tracing::instrument(skip(self, params, _ctx), name = "engine.block_status")]
-    async fn execute(&self, params: &str, _ctx: &ToolContext) -> anyhow::Result<ExecResult> {
+    pub async fn execute(&self, params: &str, _ctx: &ExecContext) -> anyhow::Result<ExecResult> {
         let params: BlockStatusParams = match serde_json::from_str(params) {
             Ok(p) => p,
             Err(e) => {
@@ -1291,9 +1205,6 @@ impl ExecutionEngine for BlockStatusEngine {
         }
     }
 
-    async fn is_available(&self) -> bool {
-        true
-    }
 }
 
 // ============================================================================
@@ -1391,7 +1302,7 @@ impl KernelSearchEngine {
     fn execute_inner(
         &self,
         params: KernelSearchParams,
-        ctx: &ToolContext,
+        ctx: &ExecContext,
     ) -> Result<serde_json::Value> {
         let regex =
             Regex::new(&params.query).map_err(|e| EditError::InvalidRegex(e.to_string()))?;
@@ -1480,22 +1391,14 @@ impl KernelSearchEngine {
     }
 }
 
-#[async_trait]
-impl ExecutionEngine for KernelSearchEngine {
-    fn name(&self) -> &str {
-        "kernel_search"
-    }
 
-    fn description(&self) -> &str {
+impl KernelSearchEngine {
+    pub fn description(&self) -> &str {
         "Search across all blocks using regex, with filters and context"
     }
 
-    fn schema(&self) -> Option<serde_json::Value> {
-        Some(Self::schema())
-    }
-
     #[tracing::instrument(skip(self, params, ctx), name = "engine.kernel_search")]
-    async fn execute(&self, params: &str, ctx: &ToolContext) -> anyhow::Result<ExecResult> {
+    pub async fn execute(&self, params: &str, ctx: &ExecContext) -> anyhow::Result<ExecResult> {
         let params: KernelSearchParams = match serde_json::from_str(params) {
             Ok(p) => p,
             Err(e) => {
@@ -1509,9 +1412,6 @@ impl ExecutionEngine for KernelSearchEngine {
         }
     }
 
-    async fn is_available(&self) -> bool {
-        true
-    }
 }
 
 #[cfg(test)]
@@ -1526,15 +1426,15 @@ mod tests {
         ContextId::new()
     }
 
-    fn setup_test_store() -> (SharedBlockStore, ContextId, ToolContext) {
+    fn setup_test_store() -> (SharedBlockStore, ContextId, ExecContext) {
         let store = shared_block_store(PrincipalId::new());
         let ctx = test_context_id();
         store
             .create_document(ctx, DocumentKind::Code, Some("rust".into()))
             .unwrap();
-        let tool_ctx = ToolContext {
+        let tool_ctx = ExecContext {
             context_id: ctx,
-            ..ToolContext::test()
+            ..ExecContext::test()
         };
         (store, ctx, tool_ctx)
     }
@@ -1584,9 +1484,9 @@ mod tests {
         store
             .create_document(ctx, DocumentKind::Code, None)
             .unwrap();
-        let tool_ctx = ToolContext {
+        let tool_ctx = ExecContext {
             context_id: ctx,
-            ..ToolContext::test()
+            ..ExecContext::test()
         };
 
         // Create a block (this journals ops via insert_block_as)
@@ -1765,7 +1665,7 @@ mod tests {
 
         let engine = BlockReadEngine::new(store.clone());
         let params = format!(r#"{{"block_id": "{}"}}"#, block_id.to_key());
-        let result = engine.execute(&params, &ToolContext::test()).await.unwrap();
+        let result = engine.execute(&params, &ExecContext::test()).await.unwrap();
 
         assert!(result.success, "read failed: {}", result.stderr);
         let response: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
@@ -1795,7 +1695,7 @@ mod tests {
             r#"{{"block_id": "{}", "query": "ap", "context_lines": 1}}"#,
             block_id.to_key()
         );
-        let result = engine.execute(&params, &ToolContext::test()).await.unwrap();
+        let result = engine.execute(&params, &ExecContext::test()).await.unwrap();
 
         assert!(result.success, "search failed: {}", result.stderr);
         let response: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
@@ -1834,7 +1734,7 @@ mod tests {
 
         let engine = BlockListEngine::new(store.clone());
         let params = r#"{}"#;
-        let result = engine.execute(params, &ToolContext::test()).await.unwrap();
+        let result = engine.execute(params, &ExecContext::test()).await.unwrap();
 
         assert!(result.success);
         let response: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
@@ -1872,7 +1772,7 @@ mod tests {
 
         let engine = BlockListEngine::new(store.clone());
         let params = r#"{"kind": "thinking"}"#;
-        let result = engine.execute(params, &ToolContext::test()).await.unwrap();
+        let result = engine.execute(params, &ExecContext::test()).await.unwrap();
 
         assert!(result.success);
         let response: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
@@ -1901,7 +1801,7 @@ mod tests {
             r#"{{"block_id": "{}", "status": "running"}}"#,
             block_id.to_key()
         );
-        let result = engine.execute(&params, &ToolContext::test()).await.unwrap();
+        let result = engine.execute(&params, &ExecContext::test()).await.unwrap();
 
         assert!(result.success, "status update failed: {}", result.stderr);
 

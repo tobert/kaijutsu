@@ -23,7 +23,6 @@ pub mod kaijutsu_capnp {
 }
 
 pub use auth_db::{AuthDb, SshKeyRecord};
-pub use context_engine::ContextEngine;
 pub use docs_filesystem::KaijutsuFilesystem;
 pub use embedded_kaish::EmbeddedKaish;
 pub use input_filesystem::InputFilesystem;

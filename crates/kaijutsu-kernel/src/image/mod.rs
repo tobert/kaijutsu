@@ -6,9 +6,7 @@
 //! result, and flips the block to `Status::Done`.
 
 pub mod backend;
-pub mod gemini;
 pub mod registry;
 
 pub use backend::{ImageBackend, ImageError, ImageGenOpts, ImageStream};
-pub use gemini::GeminiBackend;
 pub use registry::ImageBackendRegistry;

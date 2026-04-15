@@ -23,12 +23,11 @@ use crate::agents::{
 };
 use crate::control::ConsentMode;
 use crate::drift::{SharedDriftRouter, shared_drift_router};
+use crate::execution::{ExecContext, ExecResult};
 use crate::flows::{SharedBlockFlowBus, shared_block_flow_bus};
-use crate::llm::config::{ToolConfig, ToolFilter};
 use crate::llm::{LlmRegistry, RigProvider};
 use crate::mcp::Broker;
 use crate::state::KernelState;
-use crate::tools::{ExecResult, ExecutionEngine, ToolContext, ToolInfo, ToolRegistry};
 use crate::vfs::{DirEntry, FileAttr, MountTable, SetAttr, StatFs, VfsOps, VfsResult};
 
 /// The Kernel: fundamental primitive of kaijutsu.
@@ -43,10 +42,6 @@ pub struct Kernel {
     vfs: Arc<MountTable>,
     /// Kernel state (behind RwLock for interior mutability).
     state: RwLock<KernelState>,
-    /// Tool registry (behind RwLock for interior mutability).
-    tools: RwLock<ToolRegistry>,
-    /// Tool configuration (filter for which tools are available).
-    tool_config: RwLock<ToolConfig>,
     /// LLM provider registry (behind RwLock for interior mutability).
     llm: RwLock<LlmRegistry>,
     /// Agent registry (behind RwLock for interior mutability).
@@ -110,8 +105,6 @@ impl Kernel {
         Self {
             vfs,
             state: RwLock::new(KernelState::new(&name)),
-            tools: RwLock::new(ToolRegistry::new()),
-            tool_config: RwLock::new(ToolConfig::all()),
             llm: RwLock::new(LlmRegistry::new()),
             agents: RwLock::new(AgentRegistry::new()),
             consent_mode: RwLock::new(ConsentMode::default()),
@@ -138,8 +131,6 @@ impl Kernel {
         Self {
             vfs,
             state: RwLock::new(KernelState::new(&name)),
-            tools: RwLock::new(ToolRegistry::new()),
-            tool_config: RwLock::new(ToolConfig::all()),
             llm: RwLock::new(LlmRegistry::new()),
             agents: RwLock::new(AgentRegistry::new()),
             consent_mode: RwLock::new(ConsentMode::default()),
@@ -156,11 +147,14 @@ impl Kernel {
         &self.broker
     }
 
-    /// Dispatch a tool call through the broker using the legacy
-    /// `ToolContext` call-site shape. Phase 1 shim so existing callers in
-    /// `kaijutsu-server` and `kaijutsu-mcp` can swap off `execute_with`
-    /// without rewriting the surrounding error handling. Removed at M5 when
-    /// callers move to `CallContext`/`KernelCallParams` natively.
+    /// Dispatch a tool call through the broker using the internal
+    /// `ExecContext` call-site shape.
+    ///
+    /// This is the shim kaijutsu-server / kaijutsu-mcp call from the legacy
+    /// dispatch sites; it resolves the tool through the context's
+    /// `ContextToolBinding`, executes via the broker, and flattens the
+    /// `KernelToolResult` back into an `ExecResult` so the surrounding
+    /// agentic-loop error handling keeps working without further rewriting.
     ///
     /// Resolves `tool_name` through the context's `ContextToolBinding`,
     /// auto-populating the binding on first call with all registered
@@ -169,8 +163,8 @@ impl Kernel {
         &self,
         tool_name: &str,
         params_json: &str,
-        tool_ctx: &crate::tools::ToolContext,
-    ) -> Result<crate::tools::ExecResult, crate::mcp::McpError> {
+        tool_ctx: &ExecContext,
+    ) -> Result<ExecResult, crate::mcp::McpError> {
         use crate::mcp::{
             CallContext, ContextToolBinding, InstanceId, KernelCallParams, McpError, ToolContent,
             TraceContext,
@@ -253,9 +247,9 @@ impl Kernel {
             text = serde_json::to_string_pretty(s).unwrap_or_default();
         }
         if result.is_error {
-            Ok(crate::tools::ExecResult::failure(1, text))
+            Ok(ExecResult::failure(1, text))
         } else {
-            Ok(crate::tools::ExecResult::success(text))
+            Ok(ExecResult::success(text))
         }
     }
 
@@ -517,110 +511,6 @@ impl Kernel {
     }
 
     // ========================================================================
-    // Tools
-    // ========================================================================
-
-    /// Register a tool.
-    pub async fn register_tool(&self, info: ToolInfo) {
-        self.tools.write().await.register(info);
-    }
-
-    /// Register a tool with an execution engine.
-    pub async fn register_tool_with_engine(
-        &self,
-        info: ToolInfo,
-        engine: Arc<dyn ExecutionEngine>,
-    ) {
-        self.tools.write().await.register_with_engine(info, engine);
-    }
-
-    /// Get the tools registry (for RPC access).
-    pub fn tools(&self) -> &RwLock<ToolRegistry> {
-        &self.tools
-    }
-
-    /// List available tools.
-    pub async fn list_tools(&self) -> Vec<ToolInfo> {
-        self.tools
-            .read()
-            .await
-            .list()
-            .into_iter()
-            .cloned()
-            .collect()
-    }
-
-    /// List tools that have registered engines.
-    pub async fn list_with_engines(&self) -> Vec<ToolInfo> {
-        self.tools
-            .read()
-            .await
-            .list_with_engines()
-            .into_iter()
-            .cloned()
-            .collect()
-    }
-
-    /// Get a tool's info by name.
-    pub async fn get_tool(&self, name: &str) -> Option<ToolInfo> {
-        self.tools.read().await.get(name).cloned()
-    }
-
-    /// Get an engine by name (returns it if registered).
-    pub async fn get_engine(&self, name: &str) -> Option<Arc<dyn ExecutionEngine>> {
-        self.tools.read().await.get_engine(name)
-    }
-
-    /// Set the default execution engine.
-    pub async fn set_default_engine(&self, name: &str) {
-        self.tools.write().await.set_default_engine(name);
-    }
-
-    /// Execute code using the default engine.
-    pub async fn execute(&self, code: &str, ctx: &ToolContext) -> anyhow::Result<ExecResult> {
-        // Record in history
-        let history_id = self.add_history(code).await;
-
-        // Execute
-        let result = self.tools.read().await.execute(code, ctx).await?;
-
-        // Update history with result
-        self.state.write().await.set_history_result(
-            history_id,
-            format!("{}{}", result.stdout, result.stderr),
-            result.exit_code,
-        );
-
-        Ok(result)
-    }
-
-    /// Execute code using a specific engine.
-    pub async fn execute_with(
-        &self,
-        engine_name: &str,
-        code: &str,
-        ctx: &ToolContext,
-    ) -> anyhow::Result<ExecResult> {
-        let engine = self
-            .tools
-            .read()
-            .await
-            .get_engine(engine_name)
-            .ok_or_else(|| anyhow::anyhow!("engine not found: {}", engine_name))?;
-
-        let history_id = self.add_history(code).await;
-        let result = engine.execute(code, ctx).await?;
-
-        self.state.write().await.set_history_result(
-            history_id,
-            format!("{}{}", result.stdout, result.stderr),
-            result.exit_code,
-        );
-
-        Ok(result)
-    }
-
-    // ========================================================================
     // LLM Providers
     // ========================================================================
 
@@ -817,24 +707,6 @@ impl Kernel {
         self.agents.read().await.count()
     }
 
-    // ========================================================================
-    // Tool Configuration
-    // ========================================================================
-
-    /// Get the tool configuration.
-    pub async fn tool_config(&self) -> ToolConfig {
-        self.tool_config.read().await.clone()
-    }
-
-    /// Set the tool filter for this kernel.
-    pub async fn set_tool_filter(&self, filter: ToolFilter) {
-        *self.tool_config.write().await = ToolConfig::new(filter);
-    }
-
-    /// Check if a tool is allowed by the current configuration.
-    pub async fn tool_allowed(&self, tool_name: &str) -> bool {
-        self.tool_config.read().await.allows(tool_name)
-    }
 }
 
 // Delegate VfsOps to the mount table
@@ -912,7 +784,6 @@ impl VfsOps for Kernel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::NoopEngine;
 
     #[tokio::test]
     async fn test_kernel_creation() {
@@ -941,23 +812,6 @@ mod tests {
         let history = kernel.recent_history(10).await;
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].command, "echo hello");
-    }
-
-    #[tokio::test]
-    async fn test_tools() {
-        let kernel = Kernel::new("test", None).await;
-
-        kernel
-            .register_tool_with_engine(
-                ToolInfo::new("noop", "Noop engine", "test"),
-                Arc::new(NoopEngine),
-            )
-            .await;
-        kernel.set_default_engine("noop").await;
-
-        let result = kernel.execute("hello", &ToolContext::test()).await.unwrap();
-        assert!(result.success);
-        assert!(result.stdout.contains("hello"));
     }
 
     #[tokio::test]

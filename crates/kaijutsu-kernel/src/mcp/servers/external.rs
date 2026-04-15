@@ -24,7 +24,7 @@ use tokio::process::Command;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-use crate::mcp_pool::{McpServerConfig, McpTransport};
+use std::collections::HashMap;
 
 use super::super::context::CallContext;
 use super::super::error::{McpError, McpResult};
@@ -35,6 +35,28 @@ use super::super::types::{
 
 /// `_meta` namespace per §5.4.
 const META_NAMESPACE: &str = "io.kaijutsu.v1";
+
+/// Transport kind for external MCP connections. Replaces the type that used
+/// to live in the removed `mcp_pool` module.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum McpTransport {
+    #[default]
+    Stdio,
+    StreamableHttp,
+}
+
+/// Connection config for an external MCP server. Superset of what
+/// `rmcp::serve_client` needs; broker config loading populates this.
+#[derive(Clone, Debug, Default)]
+pub struct McpServerConfig {
+    pub name: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: HashMap<String, String>,
+    pub cwd: Option<String>,
+    pub transport: McpTransport,
+    pub url: Option<String>,
+}
 
 /// Minimal `ClientHandler` that translates rmcp notifications onto a
 /// broadcast channel of `ServerNotification`. Phase 1 subscribers: none

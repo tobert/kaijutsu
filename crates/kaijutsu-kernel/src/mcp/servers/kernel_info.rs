@@ -11,13 +11,13 @@ use tokio_util::sync::CancellationToken;
 
 use crate::drift::DriftRouter;
 use crate::file_tools::WhoamiEngine;
-use crate::tools::ExecutionEngine;
+
 
 use super::super::context::CallContext;
 use super::super::error::{McpError, McpResult};
 use super::super::server_like::{McpServerLike, ServerNotification};
 use super::super::types::{InstanceId, KernelCallParams, KernelTool, KernelToolResult};
-use super::adapter::{from_exec_result, to_tool_context};
+use super::adapter::{from_exec_result, to_exec_context};
 
 /// `whoami` takes no parameters. Empty struct derives an object schema with
 /// no properties — matches the legacy hand-written schema.
@@ -80,7 +80,7 @@ impl McpServerLike for KernelInfoServer {
         let _: WhoamiParams =
             serde_json::from_value(params.arguments.clone()).map_err(McpError::InvalidParams)?;
 
-        let tool_ctx = to_tool_context(ctx);
+        let tool_ctx = to_exec_context(ctx);
         let exec = self
             .whoami
             .execute("", &tool_ctx)

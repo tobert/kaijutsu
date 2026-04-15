@@ -72,7 +72,6 @@ use tokio_util::sync::CancellationToken;
 use capnp::capability::Promise;
 use capnp_rpc::pry;
 
-use crate::context_engine::ContextEngine;
 use crate::embedded_kaish::EmbeddedKaish;
 use crate::interrupt::ContextInterruptState;
 use crate::kaijutsu_capnp::*;
@@ -87,52 +86,27 @@ use kaijutsu_kernel::{
     AgentConfig,
     AgentInfo,
     AgentStatus,
-    // Block tools
-    BlockAppendEngine,
-    BlockCreateEngine,
-    BlockEditEngine,
     // FlowBus
     BlockFlow,
-    BlockListEngine,
-    BlockReadEngine,
-    BlockSearchEngine,
-    BlockSpliceEngine,
-    BlockStatusEngine,
     // Config
     ConfigCrdtBackend,
     ConfigWatcherHandle,
-    EditEngine,
-    // File tools
+    // File tools (workspace guard helper type only — engines go through broker)
     FileDocumentCache,
-    GlobEngine,
-    GrepEngine,
     InputDocFlow,
     InvokeRequest,
     InvokeResponse,
     Kernel,
-    KernelSearchEngine,
     LlmMessage,
     LocalBackend,
-    McpServerConfig,
-    // MCP
-    McpServerPool,
-    McpToolEngine,
-    McpTransport,
-    ReadEngine,
     SharedBlockFlowBus,
     SharedBlockStore,
     SharedConfigFlowBus,
     SharedInputDocFlowBus,
-    // Tool filtering
+    // Tool filtering (wire type, binding translation)
     ToolFilter,
-    ToolInfo,
     VfsOps,
-    WhoamiEngine,
-    WriteEngine,
     block_store::BlockStore,
-    extract_tool_result_text,
-    register_mcp_prompt_engines,
-    register_mcp_resource_engines,
     shared_block_flow_bus,
     shared_config_flow_bus,
     shared_input_doc_flow_bus,
@@ -176,226 +150,6 @@ fn extract_rpc_trace(
 // ============================================================================
 // Server State
 // ============================================================================
-
-/// Register block tools with a kernel.
-/// Tools with engines are automatically available via the ToolFilter system.
-async fn register_block_tools(
-    kernel: &Arc<Kernel>,
-    documents: SharedBlockStore,
-    workspace_guard: Option<kaijutsu_kernel::file_tools::WorkspaceGuard>,
-    session_contexts: crate::context_engine::SessionContextMap,
-) {
-    kernel
-        .register_tool_with_engine(
-            ToolInfo::new(
-                "context",
-                "Manage conversation contexts (switch, list)",
-                "kernel",
-            ),
-            Arc::new(ContextEngine::new(kernel.drift().clone(), session_contexts)),
-        )
-        .await;
-
-    kernel
-        .register_tool_with_engine(
-            ToolInfo::new(
-                "block_create",
-                "Create a new block with role, kind, content",
-                "block",
-            ),
-            Arc::new(BlockCreateEngine::new(documents.clone())),
-        )
-        .await;
-
-    kernel
-        .register_tool_with_engine(
-            ToolInfo::new("block_append", "Append text to a block", "block"),
-            Arc::new(BlockAppendEngine::new(documents.clone())),
-        )
-        .await;
-
-    kernel
-        .register_tool_with_engine(
-            ToolInfo::new(
-                "block_edit",
-                "Line-based editing with atomic ops and CAS validation",
-                "block",
-            ),
-            Arc::new(BlockEditEngine::new(documents.clone())),
-        )
-        .await;
-
-    kernel
-        .register_tool_with_engine(
-            ToolInfo::new("block_splice", "Character-based splice editing", "block"),
-            Arc::new(BlockSpliceEngine::new(documents.clone())),
-        )
-        .await;
-
-    kernel
-        .register_tool_with_engine(
-            ToolInfo::new(
-                "block_read",
-                "Read block content with optional line numbers",
-                "block",
-            ),
-            Arc::new(BlockReadEngine::new(documents.clone())),
-        )
-        .await;
-
-    kernel
-        .register_tool_with_engine(
-            ToolInfo::new("block_search", "Search within a block using regex", "block"),
-            Arc::new(BlockSearchEngine::new(documents.clone())),
-        )
-        .await;
-
-    kernel
-        .register_tool_with_engine(
-            ToolInfo::new("block_list", "List blocks with optional filters", "block"),
-            Arc::new(BlockListEngine::new(documents.clone())),
-        )
-        .await;
-
-    kernel
-        .register_tool_with_engine(
-            ToolInfo::new("block_status", "Set block status", "block"),
-            Arc::new(BlockStatusEngine::new(documents.clone())),
-        )
-        .await;
-
-    // Content-type block creators (generative art, music, images)
-    kernel
-        .register_tool_with_engine(
-            ToolInfo::new(
-                "svg_block",
-                "Append an SVG block to the current context",
-                "block",
-            ),
-            Arc::new(kaijutsu_kernel::SvgBlockEngine::new(documents.clone())),
-        )
-        .await;
-
-    kernel
-        .register_tool_with_engine(
-            ToolInfo::new(
-                "abc_block",
-                "Append an ABC music notation block (validated)",
-                "block",
-            ),
-            Arc::new(kaijutsu_kernel::AbcBlockEngine::new(documents.clone())),
-        )
-        .await;
-
-    kernel
-        .register_tool_with_engine(
-            ToolInfo::new(
-                "img_block",
-                "Append an image block from a CAS hash",
-                "block",
-            ),
-            Arc::new(kaijutsu_kernel::ImgBlockEngine::new(documents.clone())),
-        )
-        .await;
-
-    kernel
-        .register_tool_with_engine(
-            ToolInfo::new(
-                "img_block_from_path",
-                "Read an image file, store in CAS, and append an image block",
-                "block",
-            ),
-            Arc::new(kaijutsu_kernel::ImgBlockFromPathEngine::new(
-                documents.clone(),
-                kernel.cas().clone(),
-            )),
-        )
-        .await;
-
-    kernel
-        .register_tool_with_engine(
-            ToolInfo::new(
-                "kernel_search",
-                "Search across blocks using regex",
-                "kernel",
-            ),
-            Arc::new(KernelSearchEngine::new(documents.clone())),
-        )
-        .await;
-
-    // ── File tools (CRDT-backed) ──
-    // default_root removed from glob/grep — engines now read cwd from ToolContext at call time
-    let file_cache = Arc::new(FileDocumentCache::new(
-        documents.clone(),
-        kernel.vfs().clone(),
-    ));
-    let g = &workspace_guard; // borrow for closures below
-    kernel
-        .register_tool_with_engine(
-            ToolInfo::new(
-                "read",
-                "Read file content with optional line numbers",
-                "file",
-            ),
-            Arc::new(match g {
-                Some(g) => ReadEngine::new(file_cache.clone()).with_guard(g.clone()),
-                None => ReadEngine::new(file_cache.clone()),
-            }),
-        )
-        .await;
-    kernel
-        .register_tool_with_engine(
-            ToolInfo::new("edit", "Edit a file by exact string replacement", "file"),
-            Arc::new(match g {
-                Some(g) => EditEngine::new(file_cache.clone()).with_guard(g.clone()),
-                None => EditEngine::new(file_cache.clone()),
-            }),
-        )
-        .await;
-    kernel
-        .register_tool_with_engine(
-            ToolInfo::new(
-                "write",
-                "Write or create a file with the given content",
-                "file",
-            ),
-            Arc::new(match g {
-                Some(g) => WriteEngine::new(file_cache.clone()).with_guard(g.clone()),
-                None => WriteEngine::new(file_cache.clone()),
-            }),
-        )
-        .await;
-    kernel
-        .register_tool_with_engine(
-            ToolInfo::new("glob", "Find files matching a glob pattern", "file"),
-            Arc::new(match g {
-                Some(g) => GlobEngine::new(kernel.vfs().clone()).with_guard(g.clone()),
-                None => GlobEngine::new(kernel.vfs().clone()),
-            }),
-        )
-        .await;
-    kernel
-        .register_tool_with_engine(
-            ToolInfo::new("grep", "Search file content with regex", "file"),
-            Arc::new(match g {
-                Some(g) => {
-                    GrepEngine::new(file_cache.clone(), kernel.vfs().clone()).with_guard(g.clone())
-                }
-                None => GrepEngine::new(file_cache.clone(), kernel.vfs().clone()),
-            }),
-        )
-        .await;
-    kernel
-        .register_tool_with_engine(
-            ToolInfo::new("whoami", "Show current context identity", "drift"),
-            Arc::new(WhoamiEngine::new(kernel.drift().clone())),
-        )
-        .await;
-
-    // Rhai scripting is registered later (after semantic index init) so synthesis
-    // functions can be injected. See the tool registration call after
-    // initialize_kernel_models().
-}
 
 /// Per-context LLM conversation cache with per-context locking and LRU eviction.
 ///
@@ -529,7 +283,6 @@ impl SharedKernelState {
 /// Server-wide state. Shared via Arc across all SSH connections.
 pub struct ServerRegistry {
     pub kernel: SharedKernel,
-    pub mcp_pool: Arc<McpServerPool>,
 }
 
 /// A background execution tracked by exec_id.
@@ -787,193 +540,6 @@ async fn initialize_kernel_models(
     }
 }
 
-/// Initialize MCP servers from kernel's `mcp.toml` config.
-async fn initialize_kernel_mcp(
-    kernel: &Arc<Kernel>,
-    config_backend: &Arc<ConfigCrdtBackend>,
-    mcp_pool: &Arc<McpServerPool>,
-) {
-    if let Err(e) = config_backend.ensure_config("mcp.toml").await {
-        log::warn!("Failed to load mcp.toml: {}", e);
-        return;
-    }
-    let content = match config_backend.get_content("mcp.toml") {
-        Ok(c) => c,
-        Err(e) => {
-            log::warn!("Failed to read mcp.toml: {}", e);
-            return;
-        }
-    };
-
-    let config = match kaijutsu_kernel::mcp_config::load_mcp_config_toml(&content) {
-        Ok(c) => c,
-        Err(e) => {
-            log::warn!("Failed to parse mcp.toml: {}", e);
-            return;
-        }
-    };
-
-    if config.servers.is_empty() {
-        return;
-    }
-
-    let already_registered = mcp_pool.list_servers();
-
-    log::info!(
-        "Registering MCP servers from mcp.toml ({} configured, {} already in pool)",
-        config.servers.len(),
-        already_registered.len(),
-    );
-
-    // For servers already in the pool (pre-initialized at server startup),
-    // just register their tools with this kernel. For new servers, do full
-    // registration including process spawn.
-    let timeout = std::time::Duration::from_secs(5);
-    let futs: Vec<_> = config
-        .servers
-        .into_iter()
-        .map(|server_config| {
-            let pool = mcp_pool.clone();
-            let kernel = kernel.clone();
-            let name = server_config.name.clone();
-            let is_pre_registered = already_registered.contains(&name);
-            async move {
-                if is_pre_registered {
-                    // Server already running — just get its info and register tools
-                    match pool.get_server_info(&name).await {
-                        Ok(info) => {
-                            let tools =
-                                McpToolEngine::from_server_tools(pool.clone(), &name, &info.tools);
-                            for (qualified_name, engine) in tools {
-                                let desc = engine.description().to_string();
-                                kernel
-                                    .register_tool_with_engine(
-                                        ToolInfo::new(&qualified_name, &desc, "mcp"),
-                                        engine,
-                                    )
-                                    .await;
-                            }
-                            log::info!(
-                                "MCP server '{}' tools registered from pool ({} tools)",
-                                name,
-                                info.tools.len()
-                            );
-                        }
-                        Err(e) => {
-                            log::warn!(
-                                "MCP server '{}' in pool but get_server_info failed: {}",
-                                name,
-                                e
-                            );
-                        }
-                    }
-                } else {
-                    // Server not in pool yet — full registration with timeout
-                    match tokio::time::timeout(timeout, pool.register(server_config)).await {
-                        Ok(Ok(info)) => {
-                            let tools =
-                                McpToolEngine::from_server_tools(pool.clone(), &name, &info.tools);
-                            for (qualified_name, engine) in tools {
-                                let desc = engine.description().to_string();
-                                kernel
-                                    .register_tool_with_engine(
-                                        ToolInfo::new(&qualified_name, &desc, "mcp"),
-                                        engine,
-                                    )
-                                    .await;
-                            }
-                            log::info!(
-                                "MCP server '{}' registered ({} tools)",
-                                name,
-                                info.tools.len()
-                            );
-                        }
-                        Ok(Err(e)) => {
-                            log::warn!("MCP server '{}' failed to register: {}", name, e);
-                        }
-                        Err(_) => {
-                            log::warn!(
-                                "MCP server '{}' timed out during registration ({}s)",
-                                name,
-                                timeout.as_secs()
-                            );
-                        }
-                    }
-                }
-            }
-        })
-        .collect();
-
-    futures::future::join_all(futs).await;
-}
-
-/// Spawn a background task that watches for MCP resource update notifications
-/// and inserts drift blocks (DriftKind::Notification) into subscribing contexts.
-///
-/// When a model subscribes to an MCP resource via `mcp_subscribe_resource`, and that
-/// resource later changes, this watcher reads the fresh content and inserts it as a
-/// Drift/Notification block in the conversation. The model sees it on its next turn,
-/// and the user sees it inline in the conversation.
-fn spawn_resource_notification_watcher(pool: Arc<McpServerPool>, documents: SharedBlockStore) {
-    use kaijutsu_kernel::ResourceFlow;
-
-    let mut sub = pool.resource_flows().subscribe("resource.updated");
-    tokio::spawn(async move {
-        while let Some(msg) = sub.recv().await {
-            if let ResourceFlow::Updated { server, uri, .. } = &msg.payload {
-                let contexts = pool.subscribed_contexts(server, uri);
-                if contexts.is_empty() {
-                    continue;
-                }
-
-                // Read fresh content from the server
-                let content = match pool.read_resource(server, uri).await {
-                    Ok(contents) => {
-                        // Use serde to extract text — ResourceContents is complex
-                        serde_json::to_string_pretty(&contents)
-                            .unwrap_or_else(|_| "[unreadable resource]".into())
-                    }
-                    Err(e) => {
-                        log::warn!("Failed to read updated resource {}:{} — {}", server, uri, e);
-                        continue;
-                    }
-                };
-
-                let notification_text = format!(
-                    "[MCP resource updated: {} on server '{}']\n{}",
-                    uri, server, content
-                );
-
-                // Insert a Notification drift block into each subscribing context
-                for ctx_id in contexts {
-                    if let Err(e) = documents.insert_drift_block(
-                        ctx_id,
-                        None, // parent
-                        None, // after (append)
-                        &notification_text,
-                        ctx_id, // source = self (external event)
-                        Some(format!("mcp:{}", server)),
-                        kaijutsu_crdt::DriftKind::Notification,
-                    ) {
-                        log::warn!(
-                            "Failed to insert resource notification block for {}: {}",
-                            ctx_id.short(),
-                            e
-                        );
-                    } else {
-                        log::debug!(
-                            "Inserted resource notification for {}:{} into context {}",
-                            server,
-                            uri,
-                            ctx_id.short()
-                        );
-                    }
-                }
-            }
-        }
-        log::debug!("Resource notification watcher exiting");
-    });
-}
 
 #[derive(Clone)]
 pub struct CommandEntry {
@@ -1120,7 +686,6 @@ impl kaijutsu_index::StatusReceiver for FlowBusStatusReceiver {
 /// persistence, default context, config backend, block tools, LLM, and MCP.
 /// The returned `SharedKernel` is shared across all connections via `Arc`.
 pub async fn create_shared_kernel(
-    mcp_pool: &Arc<McpServerPool>,
     config_dir: Option<&Path>,
     data_dir: Option<&Path>,
 ) -> Result<SharedKernel, capnp::Error> {
@@ -1215,19 +780,11 @@ pub async fn create_shared_kernel(
     let (config_backend, config_watcher) =
         create_config_backend(documents.clone(), config_flows, config_dir).await;
 
-    // Register block tools (including context engine + drift)
     let kernel_arc = Arc::new(kernel);
     let workspace_guard = Some(kaijutsu_kernel::file_tools::WorkspaceGuard::new(
         kernel_db_arc.clone(),
     ));
     let session_contexts = crate::context_engine::session_context_map();
-    register_block_tools(
-        &kernel_arc,
-        documents.clone(),
-        workspace_guard.clone(),
-        session_contexts.clone(),
-    )
-    .await;
 
     // Phase 1 M4: register virtual MCP servers on the broker so
     // dispatch_tool_via_broker has something to route to. This runs
@@ -1345,21 +902,8 @@ pub async fn create_shared_kernel(
     // Initialize LLM registry + embedding config from models.toml
     let embedding_config = initialize_kernel_models(&kernel_arc, &config_backend).await;
 
-    // Initialize MCP servers from mcp.toml config
-    initialize_kernel_mcp(&kernel_arc, &config_backend, mcp_pool).await;
-
-    // Register MCP resource tools (list, read, subscribe, unsubscribe)
-    for (_name, info, engine) in register_mcp_resource_engines(mcp_pool.clone()) {
-        kernel_arc.register_tool_with_engine(info, engine).await;
-    }
-
-    // Register MCP prompt tools (list, get)
-    for (_name, info, engine) in register_mcp_prompt_engines(mcp_pool.clone()) {
-        kernel_arc.register_tool_with_engine(info, engine).await;
-    }
-
-    // Spawn background watcher: MCP resource updates → drift blocks
-    spawn_resource_notification_watcher(mcp_pool.clone(), documents.clone());
+    // External MCP admin (register_mcp / list_mcp / etc.) is offline
+    // until Phase 2 wires it onto the broker.
 
     // Initialize semantic index if embedding model is configured
     let semantic_index = if let Some(emb_config) = embedding_config {
@@ -1437,7 +981,6 @@ pub async fn create_shared_kernel(
         kernel_db_arc.clone(),
         id,
         kernel_arc.clone(),
-        Some(mcp_pool.clone()),
     ));
 
     let shared = SharedKernelState {
@@ -1519,7 +1062,6 @@ impl world::Server for WorldImpl {
         let kernel_impl = KernelImpl::new(
             kernel.clone(),
             self.connection.clone(),
-            self.registry.mcp_pool.clone(),
         );
         results.get().set_kernel(capnp_rpc::new_client(kernel_impl));
         results.get().set_kernel_id(kernel.id.as_bytes());
@@ -1534,20 +1076,14 @@ impl world::Server for WorldImpl {
 struct KernelImpl {
     kernel: SharedKernel,
     connection: Rc<RefCell<ConnectionState>>,
-    mcp_pool: Arc<McpServerPool>,
 }
 
 impl KernelImpl {
     fn new(
         kernel: SharedKernel,
         connection: Rc<RefCell<ConnectionState>>,
-        mcp_pool: Arc<McpServerPool>,
     ) -> Self {
-        Self {
-            kernel,
-            connection,
-            mcp_pool,
-        }
+        Self { kernel, connection }
     }
 }
 
@@ -1948,7 +1484,7 @@ impl kernel::Server for KernelImpl {
                     None => std::path::PathBuf::from("/"),
                 };
 
-                let tool_ctx = kaijutsu_kernel::ToolContext::new(
+                let tool_ctx = kaijutsu_kernel::ExecContext::new(
                     principal_id,
                     context_id,
                     cwd,
@@ -1956,13 +1492,8 @@ impl kernel::Server for KernelImpl {
                     kernel_id,
                 );
 
-                // Check if tool is allowed by kernel + context tool filters
-                if !kernel_arc.tool_allowed(&tool_name).await {
-                    result.set_success(false);
-                    result.set_error(format!("Tool filtered out by kernel config: {}", tool_name));
-                    return Ok(());
-                }
-                // Per-context tool filter (restricts further, can't relax kernel filter)
+                // Kernel-scoped tool filter removed in Phase 1 M5; only the
+                // per-context filter remains as a visibility gate.
                 if let Some(ctx_filter) = kernel_arc
                     .drift()
                     .read()
@@ -2279,7 +1810,7 @@ impl kernel::Server for KernelImpl {
                     Some(k) => k.cwd().await,
                     None => std::path::PathBuf::from("/"),
                 };
-                let tool_ctx = kaijutsu_kernel::ToolContext::new(
+                let tool_ctx = kaijutsu_kernel::ExecContext::new(
                     user_agent_id,
                     context_id,
                     cwd,
@@ -2650,178 +2181,32 @@ impl kernel::Server for KernelImpl {
         )
     }
 
-    // ========================================================================
-    // MCP (Model Context Protocol) methods
-    // ========================================================================
+    // =========================================================================
+    // MCP (legacy — removed in Phase 1 M5)
+    // =========================================================================
+    //
+    // The RPC methods below kept their capnp ordinals so wire compatibility is
+    // preserved, but return `Unimplemented` until Phase 2 rewires external MCP
+    // administration through the broker.
 
     fn register_mcp(
         self: Rc<Self>,
-        params: kernel::RegisterMcpParams,
-        mut results: kernel::RegisterMcpResults,
+        _params: kernel::RegisterMcpParams,
+        _results: kernel::RegisterMcpResults,
     ) -> Promise<(), capnp::Error> {
-        let config_reader = pry!(pry!(params.get()).get_config());
-        let name = pry!(pry!(config_reader.get_name()).to_str()).to_owned();
-        let command = pry!(pry!(config_reader.get_command()).to_str()).to_owned();
-
-        // Get arguments
-        let args: Vec<String> = if config_reader.has_args() {
-            pry!(config_reader.get_args())
-                .iter()
-                .filter_map(|a| a.ok().and_then(|s| s.to_str().ok()).map(|s| s.to_owned()))
-                .collect()
-        } else {
-            Vec::new()
-        };
-
-        // Get environment variables
-        let mut env = std::collections::HashMap::new();
-        if config_reader.has_env() {
-            for env_var in pry!(config_reader.get_env()).iter() {
-                if let (Ok(key_reader), Ok(value_reader)) = (env_var.get_key(), env_var.get_value())
-                    && let (Ok(key), Ok(value)) = (key_reader.to_str(), value_reader.to_str())
-                {
-                    env.insert(key.to_owned(), value.to_owned());
-                }
-            }
-        }
-
-        // Get working directory
-        let cwd = if config_reader.has_cwd() {
-            let cwd_reader = pry!(config_reader.get_cwd());
-            if let Ok(cwd_str) = cwd_reader.to_str() {
-                if cwd_str.is_empty() {
-                    None
-                } else {
-                    Some(cwd_str.to_owned())
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        // Get transport type (default: stdio)
-        let transport = if config_reader.has_transport() {
-            match pry!(config_reader.get_transport()).to_str() {
-                Ok("stdio") | Ok("") => McpTransport::Stdio,
-                Ok("streamable_http") => McpTransport::StreamableHttp,
-                Ok(other) => {
-                    log::warn!(
-                        "Unknown MCP transport '{}' for '{}', defaulting to stdio",
-                        other,
-                        name
-                    );
-                    McpTransport::Stdio
-                }
-                Err(_) => McpTransport::Stdio,
-            }
-        } else {
-            McpTransport::Stdio
-        };
-
-        // Get URL (for streamable HTTP transport)
-        let url = if config_reader.has_url() {
-            let url_reader = pry!(config_reader.get_url());
-            if let Ok(url_str) = url_reader.to_str() {
-                if url_str.is_empty() {
-                    None
-                } else {
-                    Some(url_str.to_owned())
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        let config = McpServerConfig {
-            name: name.clone(),
-            command,
-            args,
-            env,
-            cwd,
-            transport,
-            url,
-            fork_mode: Default::default(),
-        };
-
-        let mcp_pool = self.mcp_pool.clone();
-        let kernel_arc = self.kernel.kernel.clone();
-
-        let span = tracing::info_span!("rpc", method = "register_mcp");
-        Promise::from_future(
-            async move {
-                let info = mcp_pool.register(config).await.map_err(|e| {
-                    capnp::Error::failed(format!("Failed to register MCP server: {}", e))
-                })?;
-
-                // Register MCP tools with the kernel
-                // Tools with engines are automatically available via ToolFilter
-                {
-                    let tools =
-                        McpToolEngine::from_server_tools(mcp_pool.clone(), &name, &info.tools);
-                    for (qualified_name, engine) in tools {
-                        let desc = engine.description().to_string();
-                        kernel_arc
-                            .register_tool_with_engine(
-                                ToolInfo::new(&qualified_name, &desc, "mcp"),
-                                engine,
-                            )
-                            .await;
-                    }
-                }
-
-                // Build the result
-                let mut info_builder = results.get().init_info();
-                info_builder.set_name(&info.name);
-                info_builder.set_protocol_version(&info.protocol_version);
-                info_builder.set_server_name(&info.server_name);
-                info_builder.set_server_version(&info.server_version);
-
-                let mut tools_builder = info_builder.init_tools(info.tools.len() as u32);
-                for (i, tool) in info.tools.iter().enumerate() {
-                    let mut tool_builder = tools_builder.reborrow().get(i as u32);
-                    tool_builder.set_name(&tool.name);
-                    tool_builder.set_description(tool.description.clone().unwrap_or_default());
-                    tool_builder.set_input_schema(tool.input_schema.to_string());
-                }
-
-                Ok(())
-            }
-            .instrument(span),
-        )
+        Promise::err(capnp::Error::unimplemented(
+            "register_mcp: external MCP admin is offline until Phase 2".into(),
+        ))
     }
 
     fn unregister_mcp(
         self: Rc<Self>,
-        params: kernel::UnregisterMcpParams,
+        _params: kernel::UnregisterMcpParams,
         _results: kernel::UnregisterMcpResults,
     ) -> Promise<(), capnp::Error> {
-        let name = pry!(pry!(pry!(params.get()).get_name()).to_str()).to_owned();
-        let mcp_pool = self.mcp_pool.clone();
-        let kernel_arc = self.kernel.kernel.clone();
-
-        let span = tracing::info_span!("rpc", method = "unregister_mcp");
-        Promise::from_future(
-            async move {
-                // Remove engines for MCP tools before unregistering the server
-                if let Ok(info) = mcp_pool.get_server_info(&name).await {
-                    let mut registry = kernel_arc.tools().write().await;
-                    for tool in &info.tools {
-                        let qualified_name = format!("{}:{}", name, tool.name);
-                        registry.remove_engine(&qualified_name);
-                    }
-                }
-
-                mcp_pool.unregister(&name).await.map_err(|e| {
-                    capnp::Error::failed(format!("Failed to unregister MCP server: {}", e))
-                })?;
-                Ok(())
-            }
-            .instrument(span),
-        )
+        Promise::err(capnp::Error::unimplemented(
+            "unregister_mcp: external MCP admin is offline until Phase 2".into(),
+        ))
     }
 
     fn list_mcp_servers(
@@ -2829,96 +2214,19 @@ impl kernel::Server for KernelImpl {
         _params: kernel::ListMcpServersParams,
         mut results: kernel::ListMcpServersResults,
     ) -> Promise<(), capnp::Error> {
-        let mcp_pool = self.mcp_pool.clone();
-
-        let span = tracing::info_span!("rpc", method = "list_mcp_servers");
-        Promise::from_future(
-            async move {
-                let server_names = mcp_pool.list_servers();
-                let mut servers_info = Vec::new();
-
-                for name in server_names {
-                    if let Ok(info) = mcp_pool.get_server_info(&name).await {
-                        servers_info.push(info);
-                    }
-                }
-
-                // Build the result
-                let mut servers_builder = results.get().init_servers(servers_info.len() as u32);
-                for (i, info) in servers_info.iter().enumerate() {
-                    let mut server_builder = servers_builder.reborrow().get(i as u32);
-                    server_builder.set_name(&info.name);
-                    server_builder.set_protocol_version(&info.protocol_version);
-                    server_builder.set_server_name(&info.server_name);
-                    server_builder.set_server_version(&info.server_version);
-
-                    let mut tools_builder = server_builder.init_tools(info.tools.len() as u32);
-                    for (j, tool) in info.tools.iter().enumerate() {
-                        let mut tool_builder = tools_builder.reborrow().get(j as u32);
-                        tool_builder.set_name(&tool.name);
-                        tool_builder.set_description(tool.description.clone().unwrap_or_default());
-                        tool_builder.set_input_schema(tool.input_schema.to_string());
-                    }
-                }
-
-                Ok(())
-            }
-            .instrument(span),
-        )
+        // Empty list — no servers registered until Phase 2.
+        results.get().init_servers(0);
+        Promise::ok(())
     }
 
     fn call_mcp_tool(
         self: Rc<Self>,
-        params: kernel::CallMcpToolParams,
-        mut results: kernel::CallMcpToolResults,
+        _params: kernel::CallMcpToolParams,
+        _results: kernel::CallMcpToolResults,
     ) -> Promise<(), capnp::Error> {
-        let p = pry!(params.get());
-        let trace_span = extract_rpc_trace(p.get_trace(), "call_mcp_tool");
-        let call_reader = pry!(p.get_call());
-        let server = pry!(pry!(call_reader.get_server()).to_str()).to_owned();
-        let tool = pry!(pry!(call_reader.get_tool()).to_str()).to_owned();
-        let arguments_str = pry!(pry!(call_reader.get_arguments()).to_str()).to_owned();
-
-        // Parse JSON arguments
-        let arguments: serde_json::Value = if arguments_str.is_empty() {
-            serde_json::json!({})
-        } else {
-            match serde_json::from_str(&arguments_str) {
-                Ok(v) => v,
-                Err(e) => {
-                    let mut result_builder = results.get().init_result();
-                    result_builder.set_is_error(true);
-                    result_builder.set_content(format!("Invalid JSON arguments: {}", e));
-                    return Promise::ok(());
-                }
-            }
-        };
-
-        let mcp_pool = self.mcp_pool.clone();
-
-        Promise::from_future(
-            async move {
-                let mcp_result = mcp_pool.call_tool(&server, &tool, arguments).await;
-
-                let mut result_builder = results.get().init_result();
-                match mcp_result {
-                    Ok(r) => {
-                        let is_error = r.is_error.unwrap_or(false);
-                        result_builder.set_is_error(is_error);
-
-                        let content = extract_tool_result_text(&r);
-                        result_builder.set_content(&content);
-                    }
-                    Err(e) => {
-                        result_builder.set_is_error(true);
-                        result_builder.set_content(e.to_string());
-                    }
-                }
-
-                Ok(())
-            }
-            .instrument(trace_span),
-        )
+        Promise::err(capnp::Error::unimplemented(
+            "call_mcp_tool: external MCP tool calls go through Broker in Phase 2".into(),
+        ))
     }
 
     // =========================================================================
@@ -3188,298 +2496,41 @@ impl kernel::Server for KernelImpl {
     }
 
     // =========================================================================
-    // MCP Resource Operations
+    // MCP Resource Operations (legacy — removed in Phase 1 M5)
     // =========================================================================
 
     fn list_mcp_resources(
         self: Rc<Self>,
-        params: kernel::ListMcpResourcesParams,
+        _params: kernel::ListMcpResourcesParams,
         mut results: kernel::ListMcpResourcesResults,
     ) -> Promise<(), capnp::Error> {
-        let params_reader = pry!(params.get());
-        let server = pry!(pry!(params_reader.get_server()).to_str()).to_owned();
-        log::debug!("list_mcp_resources: server={}", server);
-
-        let mcp_pool = self.mcp_pool.clone();
-
-        let span = extract_rpc_trace(params_reader.get_trace(), "list_mcp_resources");
-        Promise::from_future(
-            async move {
-                match mcp_pool.list_resources(&server).await {
-                    Ok(resources) => {
-                        let mut list = results.get().init_resources(resources.len() as u32);
-                        for (i, res) in resources.iter().enumerate() {
-                            let mut builder = list.reborrow().get(i as u32);
-                            builder.set_uri(&res.uri);
-                            builder.set_name(res.name.as_deref().unwrap_or(""));
-                            builder.set_has_description(res.description.is_some());
-                            if let Some(desc) = &res.description {
-                                builder.set_description(desc);
-                            }
-                            builder.set_has_mime_type(res.mime_type.is_some());
-                            if let Some(mime) = &res.mime_type {
-                                builder.set_mime_type(mime);
-                            }
-                        }
-                        Ok(())
-                    }
-                    Err(e) => Err(capnp::Error::failed(format!(
-                        "failed to list resources: {}",
-                        e
-                    ))),
-                }
-            }
-            .instrument(span),
-        )
+        results.get().init_resources(0);
+        Promise::ok(())
     }
 
     fn read_mcp_resource(
         self: Rc<Self>,
-        params: kernel::ReadMcpResourceParams,
-        mut results: kernel::ReadMcpResourceResults,
+        _params: kernel::ReadMcpResourceParams,
+        _results: kernel::ReadMcpResourceResults,
     ) -> Promise<(), capnp::Error> {
-        let params_reader = pry!(params.get());
-        let server = pry!(pry!(params_reader.get_server()).to_str()).to_owned();
-        let uri = pry!(pry!(params_reader.get_uri()).to_str()).to_owned();
-        log::debug!("read_mcp_resource: server={}, uri={}", server, uri);
-
-        let mcp_pool = self.mcp_pool.clone();
-
-        let span = extract_rpc_trace(params_reader.get_trace(), "read_mcp_resource");
-        Promise::from_future(
-            async move {
-                match mcp_pool.read_resource(&server, &uri).await {
-                    Ok(contents) => {
-                        results.get().set_has_contents(true);
-                        let mut contents_builder = results.get().init_contents();
-                        contents_builder.set_uri(&uri);
-
-                        match contents {
-                            kaijutsu_kernel::McpResourceContents::TextResourceContents {
-                                mime_type,
-                                text,
-                                ..
-                            } => {
-                                contents_builder.set_has_mime_type(mime_type.is_some());
-                                if let Some(mime) = &mime_type {
-                                    contents_builder.set_mime_type(mime);
-                                }
-                                contents_builder.set_text(&text);
-                            }
-                            kaijutsu_kernel::McpResourceContents::BlobResourceContents {
-                                mime_type,
-                                blob,
-                                ..
-                            } => {
-                                contents_builder.set_has_mime_type(mime_type.is_some());
-                                if let Some(mime) = &mime_type {
-                                    contents_builder.set_mime_type(mime);
-                                }
-                                // blob is base64-encoded string in rmcp, store as-is
-                                // (clients will need to decode)
-                                contents_builder.set_blob(blob.as_bytes());
-                            }
-                        }
-                        Ok(())
-                    }
-                    Err(e) => {
-                        results.get().set_has_contents(false);
-                        Err(capnp::Error::failed(format!(
-                            "failed to read resource: {}",
-                            e
-                        )))
-                    }
-                }
-            }
-            .instrument(span),
-        )
+        Promise::err(capnp::Error::unimplemented(
+            "read_mcp_resource: offline until Phase 3 resource wiring".into(),
+        ))
     }
 
     fn subscribe_mcp_resources(
         self: Rc<Self>,
-        params: kernel::SubscribeMcpResourcesParams,
+        _params: kernel::SubscribeMcpResourcesParams,
         _results: kernel::SubscribeMcpResourcesResults,
     ) -> Promise<(), capnp::Error> {
-        let _span = tracing::info_span!("rpc", method = "subscribe_mcp_resources").entered();
-        let callback = pry!(pry!(params.get()).get_callback());
-
-        let mcp_pool = self.mcp_pool.clone();
-        let kernel_id = self.kernel.id;
-
-        // Get the resource flow bus from the MCP pool
-        let resource_flows = mcp_pool.resource_flows().clone();
-
-        // Spawn a bridge task that forwards ResourceFlow events to the callback
-        // Use spawn_local because Cap'n Proto callbacks are not Send
-        tokio::task::spawn_local(async move {
-            let mut sub = resource_flows.subscribe("resource.*");
-            log::debug!("Started ResourceFlow subscription for kernel {}", kernel_id);
-
-            while let Some(msg) = sub.recv().await {
-                let success = match msg.payload {
-                    kaijutsu_kernel::ResourceFlow::Updated {
-                        ref server,
-                        ref uri,
-                        ..
-                    } => {
-                        // Notify-then-fetch pattern: we only send the notification.
-                        // Content is not included; clients should call readMcpResource().
-                        let mut req = callback.on_resource_updated_request();
-                        {
-                            let mut params = req.get();
-                            params.set_server(server);
-                            params.set_uri(uri);
-                            params.set_has_contents(false);
-                        }
-                        req.send().promise.await.is_ok()
-                    }
-                    kaijutsu_kernel::ResourceFlow::ListChanged { ref server, .. } => {
-                        // Notify-then-fetch pattern: we only send the notification.
-                        // Resource list is not included; clients should call listMcpResources().
-                        let mut req = callback.on_resource_list_changed_request();
-                        {
-                            let mut params = req.get();
-                            params.set_server(server);
-                            params.set_has_resources(false);
-                        }
-                        req.send().promise.await.is_ok()
-                    }
-                    // Subscribed/Unsubscribed are internal events, no need to forward
-                    kaijutsu_kernel::ResourceFlow::Subscribed { .. }
-                    | kaijutsu_kernel::ResourceFlow::Unsubscribed { .. } => true,
-                };
-
-                // If callback fails (client disconnected), stop the bridge task
-                if !success {
-                    log::debug!(
-                        "ResourceFlow bridge task for kernel {} stopping: callback failed",
-                        kernel_id
-                    );
-                    break;
-                }
-            }
-
-            log::debug!("ResourceFlow bridge task for kernel {} ended", kernel_id);
-        });
-
         Promise::ok(())
     }
 
     fn subscribe_mcp_elicitations(
         self: Rc<Self>,
-        params: kernel::SubscribeMcpElicitationsParams,
+        _params: kernel::SubscribeMcpElicitationsParams,
         _results: kernel::SubscribeMcpElicitationsResults,
     ) -> Promise<(), capnp::Error> {
-        let _span = tracing::info_span!("rpc", method = "subscribe_mcp_elicitations").entered();
-        let callback = pry!(pry!(params.get()).get_callback());
-
-        let mcp_pool = self.mcp_pool.clone();
-        let kernel_id = self.kernel.id;
-
-        // Get the elicitation flow bus from the MCP pool
-        let elicitation_flows = mcp_pool.elicitation_flows().clone();
-
-        // Spawn a bridge task that handles elicitation request/response cycle
-        // Use spawn_local because Cap'n Proto callbacks are not Send
-        tokio::task::spawn_local(async move {
-            let mut sub = elicitation_flows.subscribe("elicitation.*");
-            log::debug!(
-                "Started ElicitationFlow subscription for kernel {}",
-                kernel_id
-            );
-
-            while let Some(msg) = sub.recv().await {
-                match msg.payload {
-                    kaijutsu_kernel::ElicitationFlow::Request {
-                        ref request_id,
-                        ref server,
-                        ref message,
-                        ref schema,
-                    } => {
-                        // Forward the request to the client callback and await response
-                        let mut req = callback.on_request_request();
-                        {
-                            let mut request_builder = req.get().init_request();
-                            request_builder.set_request_id(request_id);
-                            request_builder.set_server(server);
-                            request_builder.set_message(message);
-                            if let Some(s) = schema {
-                                request_builder.set_schema(s.to_string());
-                                request_builder.set_has_schema(true);
-                            } else {
-                                request_builder.set_has_schema(false);
-                            }
-                        }
-
-                        // Await the client's response
-                        let response = match req.send().promise.await {
-                            Ok(result) => {
-                                match result.get() {
-                                    Ok(reader) => {
-                                        // Parse response, defaulting to decline on any error
-                                        if let Ok(response_reader) = reader.get_response() {
-                                            // Parse the action string
-                                            let action_str = response_reader
-                                                .get_action()
-                                                .ok()
-                                                .and_then(|r| r.to_str().ok())
-                                                .unwrap_or("decline");
-                                            let action = action_str.parse().unwrap_or(
-                                                kaijutsu_kernel::ElicitationAction::Decline,
-                                            );
-
-                                            // Parse the content if present
-                                            let content = if response_reader.get_has_content() {
-                                                response_reader
-                                                    .get_content()
-                                                    .ok()
-                                                    .and_then(|s| s.to_str().ok())
-                                                    .and_then(|s| serde_json::from_str(s).ok())
-                                            } else {
-                                                None
-                                            };
-
-                                            kaijutsu_kernel::ElicitationResponse { action, content }
-                                        } else {
-                                            // Parse error, decline
-                                            kaijutsu_kernel::ElicitationResponse {
-                                                action: kaijutsu_kernel::ElicitationAction::Decline,
-                                                content: None,
-                                            }
-                                        }
-                                    }
-                                    Err(_) => {
-                                        // Capnp error, decline
-                                        kaijutsu_kernel::ElicitationResponse {
-                                            action: kaijutsu_kernel::ElicitationAction::Decline,
-                                            content: None,
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                // Network/callback error, decline
-                                log::warn!(
-                                    "Elicitation callback failed for kernel {}: {}",
-                                    kernel_id,
-                                    e
-                                );
-                                kaijutsu_kernel::ElicitationResponse {
-                                    action: kaijutsu_kernel::ElicitationAction::Decline,
-                                    content: None,
-                                }
-                            }
-                        };
-
-                        // Route the response back to the MCP server
-                        mcp_pool.respond_to_elicitation(request_id, response);
-                    }
-                }
-            }
-
-            log::debug!("ElicitationFlow bridge task for kernel {} ended", kernel_id);
-        });
-
         Promise::ok(())
     }
 
@@ -4406,34 +3457,13 @@ impl kernel::Server for KernelImpl {
         _params: kernel::GetToolFilterParams,
         mut results: kernel::GetToolFilterResults,
     ) -> Promise<(), capnp::Error> {
-        let kernel_arc = self.kernel.kernel.clone();
-
+        let _ = self.kernel.kernel.clone();
         let span = tracing::info_span!("rpc", method = "get_tool_filter");
         Promise::from_future(
             async move {
-                let tool_config = kernel_arc.tool_config().await;
-                let mut filter = results.get().init_filter();
-
-                match &tool_config.filter {
-                    ToolFilter::All => {
-                        filter.set_all(());
-                    }
-                    ToolFilter::AllowList(tools) => {
-                        let tools_vec: Vec<&str> = tools.iter().map(|s| s.as_str()).collect();
-                        let mut list = filter.init_allow_list(tools_vec.len() as u32);
-                        for (i, tool) in tools_vec.iter().enumerate() {
-                            list.set(i as u32, tool);
-                        }
-                    }
-                    ToolFilter::DenyList(tools) => {
-                        let tools_vec: Vec<&str> = tools.iter().map(|s| s.as_str()).collect();
-                        let mut list = filter.init_deny_list(tools_vec.len() as u32);
-                        for (i, tool) in tools_vec.iter().enumerate() {
-                            list.set(i as u32, tool);
-                        }
-                    }
-                }
-
+                // Kernel-scoped filter removed in Phase 1 M5; always report
+                // `All` so existing clients see the permissive default.
+                results.get().init_filter().set_all(());
                 Ok(())
             }
             .instrument(span),
@@ -4442,45 +3472,15 @@ impl kernel::Server for KernelImpl {
 
     fn set_tool_filter(
         self: Rc<Self>,
-        params: kernel::SetToolFilterParams,
+        _params: kernel::SetToolFilterParams,
         mut results: kernel::SetToolFilterResults,
     ) -> Promise<(), capnp::Error> {
-        let filter_reader = pry!(pry!(params.get()).get_filter());
-        let filter = match pry!(filter_reader.which()) {
-            tool_filter_config::All(()) => ToolFilter::All,
-            tool_filter_config::AllowList(list) => {
-                let list = pry!(list);
-                let mut tools = std::collections::HashSet::new();
-                for i in 0..list.len() {
-                    let name = pry!(pry!(list.get(i)).to_str());
-                    tools.insert(name.to_string());
-                }
-                ToolFilter::AllowList(tools)
-            }
-            tool_filter_config::DenyList(list) => {
-                let list = pry!(list);
-                let mut tools = std::collections::HashSet::new();
-                for i in 0..list.len() {
-                    let name = pry!(pry!(list.get(i)).to_str());
-                    tools.insert(name.to_string());
-                }
-                ToolFilter::DenyList(tools)
-            }
-        };
-
-        let kernel_arc = self.kernel.kernel.clone();
-
-        let span = tracing::info_span!("rpc", method = "set_tool_filter");
-        Promise::from_future(
-            async move {
-                kernel_arc.set_tool_filter(filter).await;
-                results.get().set_success(true);
-                results.get().set_error("");
-                log::info!("Tool filter updated for kernel");
-                Ok(())
-            }
-            .instrument(span),
-        )
+        // Kernel-scoped filter removed in Phase 1 M5. Accept the call for
+        // wire compat but no-op the state change; Phase 2 will reroute
+        // through broker ContextToolBinding updates.
+        results.get().set_success(true);
+        results.get().set_error("kernel-scoped tool filter removed in Phase 1 M5 — no-op");
+        Promise::ok(())
     }
 
     // ========================================================================
@@ -4906,7 +3906,7 @@ impl kernel::Server for KernelImpl {
                         Some(k) => k.cwd().await,
                         None => std::path::PathBuf::from("/"),
                     };
-                    let tool_ctx = kaijutsu_kernel::ToolContext::new(
+                    let tool_ctx = kaijutsu_kernel::ExecContext::new(
                         user_agent_id,
                         context_id,
                         cwd,

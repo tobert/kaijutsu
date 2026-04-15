@@ -2,11 +2,10 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use kaish_glob::{FileWalker, GlobPath, WalkOptions};
 use serde::Deserialize;
 
-use crate::tools::{ExecResult, ExecutionEngine, ToolContext};
+use crate::execution::{ExecContext, ExecResult};
 use crate::vfs::{MountTable, VfsOps};
 
 use super::cache::FileDocumentCache;
@@ -49,43 +48,17 @@ const MAX_MATCHES: usize = 200;
 /// Maximum file size to search (skip very large files).
 const MAX_FILE_SIZE: usize = 1_000_000;
 
-#[async_trait]
-impl ExecutionEngine for GrepEngine {
-    fn name(&self) -> &str {
-        "grep"
-    }
-
-    fn description(&self) -> &str {
+impl GrepEngine {
+    pub fn description(&self) -> &str {
         "Search file content with regex, CRDT-aware (sees uncommitted edits)"
     }
 
-    fn schema(&self) -> Option<serde_json::Value> {
-        Some(serde_json::json!({
-            "type": "object",
-            "properties": {
-                "pattern": {
-                    "type": "string",
-                    "description": "Regex pattern to search for"
-                },
-                "path": {
-                    "type": "string",
-                    "description": "Directory to search in (default: project root)"
-                },
-                "glob": {
-                    "type": "string",
-                    "description": "File glob filter (e.g., '*.rs', '**/*.py')"
-                },
-                "context_lines": {
-                    "type": "integer",
-                    "description": "Number of context lines before/after each match (default: 0)"
-                }
-            },
-            "required": ["pattern"]
-        }))
-    }
-
     #[tracing::instrument(skip(self, params, ctx), name = "engine.grep")]
-    async fn execute(&self, params: &str, ctx: &ToolContext) -> anyhow::Result<ExecResult> {
+    pub async fn execute(
+        &self,
+        params: &str,
+        ctx: &ExecContext,
+    ) -> anyhow::Result<ExecResult> {
         let p: GrepParams = match serde_json::from_str(params) {
             Ok(v) => v,
             Err(e) => return Ok(ExecResult::failure(1, format!("Invalid params: {}", e))),
@@ -220,9 +193,5 @@ impl ExecutionEngine for GrepEngine {
                 truncated
             )))
         }
-    }
-
-    async fn is_available(&self) -> bool {
-        true
     }
 }

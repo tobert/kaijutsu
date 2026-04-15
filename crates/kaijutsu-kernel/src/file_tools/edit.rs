@@ -2,10 +2,9 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use serde::Deserialize;
 
-use crate::tools::{ExecResult, ExecutionEngine, ToolContext};
+use crate::execution::{ExecContext, ExecResult};
 
 use super::cache::FileDocumentCache;
 use super::guard::WorkspaceGuard;
@@ -36,44 +35,17 @@ struct EditParams {
     replace_all: bool,
 }
 
-#[async_trait]
-impl ExecutionEngine for EditEngine {
-    fn name(&self) -> &str {
-        "edit"
-    }
-
-    fn description(&self) -> &str {
+impl EditEngine {
+    pub fn description(&self) -> &str {
         "Edit a file by exact string replacement"
     }
 
-    fn schema(&self) -> Option<serde_json::Value> {
-        Some(serde_json::json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "File path to edit"
-                },
-                "old_string": {
-                    "type": "string",
-                    "description": "Exact string to find and replace"
-                },
-                "new_string": {
-                    "type": "string",
-                    "description": "Replacement text"
-                },
-                "replace_all": {
-                    "type": "boolean",
-                    "description": "Replace all occurrences (default: false)",
-                    "default": false
-                }
-            },
-            "required": ["path", "old_string", "new_string"]
-        }))
-    }
-
     #[tracing::instrument(skip(self, params, ctx), name = "engine.edit")]
-    async fn execute(&self, params: &str, ctx: &ToolContext) -> anyhow::Result<ExecResult> {
+    pub async fn execute(
+        &self,
+        params: &str,
+        ctx: &ExecContext,
+    ) -> anyhow::Result<ExecResult> {
         let p: EditParams = match serde_json::from_str(params) {
             Ok(v) => v,
             Err(e) => return Ok(ExecResult::failure(1, format!("Invalid params: {}", e))),
@@ -159,10 +131,6 @@ impl ExecutionEngine for EditEngine {
             p.path,
             context
         )))
-    }
-
-    async fn is_available(&self) -> bool {
-        true
     }
 }
 

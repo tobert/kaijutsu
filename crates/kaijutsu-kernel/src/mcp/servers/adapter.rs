@@ -1,21 +1,23 @@
-//! Adapters between the new MCP types and the legacy `tools::{ExecResult,
-//! ToolContext}` shape. Lives only while M2 delegation wrappers exist; deleted
-//! with the old engines at M5.
+//! Adapters between MCP broker types and the internal engine call shape.
 //!
-//! Naming: `to_*` is new → old; `from_*` is old → new.
+//! Virtual MCP servers hold engine structs (e.g. `BlockCreateEngine`) and
+//! delegate to their inherent `execute(params_json, &ExecContext)` methods.
+//! This module bridges `CallContext` → `ExecContext` (adding the `cwd`
+//! default) and `ExecResult` → `KernelToolResult` (collapsing onto the D-28
+//! `is_error` channel).
 
 use std::path::PathBuf;
 
-use crate::tools::{ExecResult, ToolContext};
+use crate::execution::{ExecContext, ExecResult};
 
 use super::super::context::CallContext;
 use super::super::types::{KernelToolResult, ToolContent};
 
-/// Build a legacy `ToolContext` from a `CallContext`. `cwd` falls back to `/`
-/// when `CallContext::cwd` is `None` — the existing engines require a path.
-pub fn to_tool_context(ctx: &CallContext) -> ToolContext {
+/// Build an `ExecContext` from a `CallContext`. `cwd` falls back to `/` when
+/// `CallContext::cwd` is `None` — engines expect a concrete path.
+pub fn to_exec_context(ctx: &CallContext) -> ExecContext {
     let cwd = ctx.cwd.clone().unwrap_or_else(|| PathBuf::from("/"));
-    ToolContext::new(
+    ExecContext::new(
         ctx.principal_id,
         ctx.context_id,
         cwd,
@@ -24,9 +26,8 @@ pub fn to_tool_context(ctx: &CallContext) -> ToolContext {
     )
 }
 
-/// Translate a legacy `ExecResult` to a `KernelToolResult`. The old engines
-/// signal failure via `success = false` with `stderr` populated; we surface
-/// that on the MCP surface via `is_error` per D-28.
+/// Translate an engine `ExecResult` to a `KernelToolResult`. `success = false`
+/// with `stderr` populated becomes `is_error = true` per D-28.
 pub fn from_exec_result(result: ExecResult) -> KernelToolResult {
     if result.success {
         KernelToolResult {
@@ -35,8 +36,6 @@ pub fn from_exec_result(result: ExecResult) -> KernelToolResult {
             structured: None,
         }
     } else {
-        // Prefer stderr; fall back to stdout if stderr is empty (some engines
-        // populate stdout on failure with a structured error body).
         let body = if !result.stderr.is_empty() {
             result.stderr
         } else {

@@ -34,9 +34,26 @@ use serde_json::Value as JsonValue;
 use kaijutsu_crdt::BlockId;
 use kaijutsu_kernel::Kernel as KaijutsuKernel;
 use kaijutsu_kernel::block_store::SharedBlockStore;
-use kaijutsu_kernel::tools::{ExecResult, ToolInfo as KaijutsuToolInfo};
+use kaijutsu_kernel::ExecResult;
 use kaijutsu_types::DocKind;
 use kaijutsu_types::{ContextId, KernelId, PrincipalId, SessionId};
+
+/// Minimal name/description tuple for converting a broker-visible tool into
+/// kaish's `ToolInfo`. The full tool metadata lives on `KernelTool`; this
+/// local shape is just what `convert_tool_info` consumes.
+struct KaijutsuToolInfo {
+    name: String,
+    description: String,
+}
+
+impl KaijutsuToolInfo {
+    fn new(name: impl Into<String>, description: impl Into<String>, _category: &str) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+        }
+    }
+}
 
 use kaish_kernel::tools::{ExecContext, ParamSchema, ToolArgs, ToolSchema};
 use kaish_kernel::vfs::{DirEntry, MountInfo};
@@ -639,7 +656,7 @@ impl KernelBackend for KaijutsuBackend {
             .session_contexts
             .current(&self.session_id)
             .ok_or_else(|| BackendError::Io("no active context joined".to_string()))?;
-        let tool_ctx = kaijutsu_kernel::ToolContext::new(
+        let tool_ctx = kaijutsu_kernel::ExecContext::new(
             self.principal_id,
             context_id,
             ctx.cwd.clone(),
@@ -667,7 +684,7 @@ impl KernelBackend for KaijutsuBackend {
         let tools = self.kernel.list_all_registered_tools().await;
         let mut infos = Vec::with_capacity(tools.len());
         for (name, _instance, schema, description) in tools {
-            let info = kaijutsu_kernel::ToolInfo::new(
+            let info = KaijutsuToolInfo::new(
                 &name,
                 description.clone().unwrap_or_default(),
                 "mcp",
@@ -681,7 +698,7 @@ impl KernelBackend for KaijutsuBackend {
         let tools = self.kernel.list_all_registered_tools().await;
         for (tool_name, _instance, schema, description) in tools {
             if tool_name == name {
-                let info = kaijutsu_kernel::ToolInfo::new(
+                let info = KaijutsuToolInfo::new(
                     &tool_name,
                     description.unwrap_or_default(),
                     "mcp",

@@ -8,15 +8,14 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use kaijutsu_cas::{ContentHash, ContentStore, FileStore};
 use kaijutsu_crdt::{BlockKind, ContentType, Role, Status};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::block_store::SharedBlockStore;
+use crate::execution::{ExecContext, ExecResult};
 use crate::kj::cas::mime_from_extension;
-use crate::tools::{ExecResult, ExecutionEngine, ToolContext};
 
 // ============================================================================
 // Shared helper
@@ -25,7 +24,7 @@ use crate::tools::{ExecResult, ExecutionEngine, ToolContext};
 /// Append a block at the end of the current context and return its key.
 fn append_block(
     documents: &SharedBlockStore,
-    ctx: &ToolContext,
+    ctx: &ExecContext,
     role: Role,
     content: &str,
     content_type: ContentType,
@@ -92,21 +91,13 @@ impl SvgBlockEngine {
     }
 }
 
-#[async_trait]
-impl ExecutionEngine for SvgBlockEngine {
-    fn name(&self) -> &str {
-        "svg_block"
-    }
 
-    fn description(&self) -> &str {
+impl SvgBlockEngine {
+    pub fn description(&self) -> &str {
         "Append an SVG block to the current context. Renders as vector graphics inline."
     }
 
-    fn schema(&self) -> Option<serde_json::Value> {
-        Some(Self::schema())
-    }
-
-    async fn execute(&self, params: &str, ctx: &ToolContext) -> anyhow::Result<ExecResult> {
+    pub async fn execute(&self, params: &str, ctx: &ExecContext) -> anyhow::Result<ExecResult> {
         let params: SvgBlockParams = match serde_json::from_str(params) {
             Ok(p) => p,
             Err(e) => return Ok(ExecResult::failure(1, format!("Invalid parameters: {e}"))),
@@ -126,9 +117,6 @@ impl ExecutionEngine for SvgBlockEngine {
         }
     }
 
-    async fn is_available(&self) -> bool {
-        true
-    }
 }
 
 // ============================================================================
@@ -165,21 +153,13 @@ impl AbcBlockEngine {
     }
 }
 
-#[async_trait]
-impl ExecutionEngine for AbcBlockEngine {
-    fn name(&self) -> &str {
-        "abc_block"
-    }
 
-    fn description(&self) -> &str {
+impl AbcBlockEngine {
+    pub fn description(&self) -> &str {
         "Append an ABC music notation block. Validates parse; renders as sheet music inline."
     }
 
-    fn schema(&self) -> Option<serde_json::Value> {
-        Some(Self::schema())
-    }
-
-    async fn execute(&self, params: &str, ctx: &ToolContext) -> anyhow::Result<ExecResult> {
+    pub async fn execute(&self, params: &str, ctx: &ExecContext) -> anyhow::Result<ExecResult> {
         let params: AbcBlockParams = match serde_json::from_str(params) {
             Ok(p) => p,
             Err(e) => return Ok(ExecResult::failure(1, format!("Invalid parameters: {e}"))),
@@ -210,9 +190,6 @@ impl ExecutionEngine for AbcBlockEngine {
         }
     }
 
-    async fn is_available(&self) -> bool {
-        true
-    }
 }
 
 // ============================================================================
@@ -249,21 +226,13 @@ impl ImgBlockEngine {
     }
 }
 
-#[async_trait]
-impl ExecutionEngine for ImgBlockEngine {
-    fn name(&self) -> &str {
-        "img_block"
-    }
 
-    fn description(&self) -> &str {
+impl ImgBlockEngine {
+    pub fn description(&self) -> &str {
         "Append an image block referencing content already in the CAS by hash."
     }
 
-    fn schema(&self) -> Option<serde_json::Value> {
-        Some(Self::schema())
-    }
-
-    async fn execute(&self, params: &str, ctx: &ToolContext) -> anyhow::Result<ExecResult> {
+    pub async fn execute(&self, params: &str, ctx: &ExecContext) -> anyhow::Result<ExecResult> {
         let params: ImgBlockParams = match serde_json::from_str(params) {
             Ok(p) => p,
             Err(e) => return Ok(ExecResult::failure(1, format!("Invalid parameters: {e}"))),
@@ -288,9 +257,6 @@ impl ExecutionEngine for ImgBlockEngine {
         }
     }
 
-    async fn is_available(&self) -> bool {
-        true
-    }
 }
 
 // ============================================================================
@@ -328,21 +294,13 @@ impl ImgBlockFromPathEngine {
     }
 }
 
-#[async_trait]
-impl ExecutionEngine for ImgBlockFromPathEngine {
-    fn name(&self) -> &str {
-        "img_block_from_path"
-    }
 
-    fn description(&self) -> &str {
+impl ImgBlockFromPathEngine {
+    pub fn description(&self) -> &str {
         "Read an image file, store it in the CAS, and append an image block."
     }
 
-    fn schema(&self) -> Option<serde_json::Value> {
-        Some(Self::schema())
-    }
-
-    async fn execute(&self, params: &str, ctx: &ToolContext) -> anyhow::Result<ExecResult> {
+    pub async fn execute(&self, params: &str, ctx: &ExecContext) -> anyhow::Result<ExecResult> {
         let params: ImgBlockFromPathParams = match serde_json::from_str(params) {
             Ok(p) => p,
             Err(e) => return Ok(ExecResult::failure(1, format!("Invalid parameters: {e}"))),
@@ -380,9 +338,6 @@ impl ExecutionEngine for ImgBlockFromPathEngine {
         }
     }
 
-    async fn is_available(&self) -> bool {
-        true
-    }
 }
 
 // ============================================================================
@@ -396,8 +351,8 @@ mod tests {
     use kaijutsu_types::{ContextId, KernelId, PrincipalId, SessionId};
     use std::path::PathBuf;
 
-    fn test_ctx(context_id: ContextId) -> ToolContext {
-        ToolContext {
+    fn test_ctx(context_id: ContextId) -> ExecContext {
+        ExecContext {
             principal_id: PrincipalId::system(),
             context_id,
             cwd: PathBuf::from("/"),

@@ -637,12 +637,8 @@ impl KjDispatcher {
                 .collect();
         }
 
-        // Clean up MCP subscriptions for archived contexts
-        if let Some(pool) = self.mcp_pool() {
-            for ctx_id in &archived_ids {
-                pool.unsubscribe_context(*ctx_id).await;
-            }
-        }
+        // MCP subscription cleanup removed alongside the legacy MCP pool
+        // in Phase 1 M5. Phase 2 will re-introduce via broker + coalescer.
 
         KjResult::ok(format!("archived {} context(s)", archived_ids.len()))
     }
@@ -703,10 +699,8 @@ impl KjDispatcher {
             };
         }
 
-        // Clean up MCP subscriptions before deletion
-        if let Some(pool) = self.mcp_pool() {
-            pool.unsubscribe_context(target_id).await;
-        }
+        // MCP subscription cleanup removed alongside the legacy MCP pool
+        // in Phase 1 M5.
 
         // Delete from DB (CASCADE deletes edges)
         {

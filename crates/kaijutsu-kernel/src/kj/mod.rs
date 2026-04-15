@@ -15,7 +15,6 @@ pub mod fork;
 pub mod format;
 pub mod parse;
 pub mod preset;
-pub mod prompt;
 pub mod refs;
 pub mod stage;
 pub mod workspace;
@@ -28,7 +27,6 @@ use crate::block_store::SharedBlockStore;
 use crate::drift::{DISTILLATION_SYSTEM_PROMPT, SharedDriftRouter, build_distillation_prompt};
 use crate::kernel::Kernel;
 use crate::kernel_db::KernelDb;
-use crate::mcp_pool::McpServerPool;
 
 // ============================================================================
 // KjCaller — per-invocation identity
@@ -154,7 +152,6 @@ pub struct KjDispatcher {
     kernel_db: Arc<parking_lot::Mutex<KernelDb>>,
     kernel_id: KernelId,
     kernel: Arc<Kernel>,
-    mcp_pool: Option<Arc<McpServerPool>>,
 }
 
 impl KjDispatcher {
@@ -164,7 +161,6 @@ impl KjDispatcher {
         kernel_db: Arc<parking_lot::Mutex<KernelDb>>,
         kernel_id: KernelId,
         kernel: Arc<Kernel>,
-        mcp_pool: Option<Arc<McpServerPool>>,
     ) -> Self {
         Self {
             drift,
@@ -172,7 +168,6 @@ impl KjDispatcher {
             kernel_db,
             kernel_id,
             kernel,
-            mcp_pool,
         }
     }
 
@@ -214,7 +209,6 @@ impl KjDispatcher {
             "fork" => self.dispatch_fork(&argv[1..], caller).await,
             "stage" => self.dispatch_stage(&argv[1..], caller).await,
             "drift" => self.dispatch_drift(&argv[1..], caller).await,
-            "prompt" => self.dispatch_prompt(&argv[1..], caller).await,
             other => KjResult::Err(format!(
                 "kj: unknown command '{}'\n\n{}",
                 other,
@@ -246,10 +240,6 @@ impl KjDispatcher {
 
     pub(crate) fn kernel(&self) -> &Arc<Kernel> {
         &self.kernel
-    }
-
-    pub(crate) fn mcp_pool(&self) -> Option<&Arc<McpServerPool>> {
-        self.mcp_pool.as_ref()
     }
 
     /// Summarize a context's blocks via LLM.
@@ -323,7 +313,7 @@ pub(crate) mod test_helpers {
                 .unwrap();
         }
         let kernel = Arc::new(Kernel::new("test", None).await);
-        KjDispatcher::new(drift, blocks, kernel_db, kernel_id, kernel, None)
+        KjDispatcher::new(drift, blocks, kernel_db, kernel_id, kernel)
     }
 
     /// Create a KjCaller with fresh IDs for testing.
@@ -488,16 +478,6 @@ mod unjoined_context_tests {
             .dispatch(&[s("drift"), s("push"), s("some-target"), s("body")], &caller)
             .await;
         assert_unjoined_error(&result, "kj drift push");
-    }
-
-    #[tokio::test]
-    async fn prompt_inject_without_context_errors_friendly() {
-        let d = test_dispatcher().await;
-        let caller = unjoined_caller();
-        let result = d
-            .dispatch(&[s("prompt"), s("inject"), s("server/name")], &caller)
-            .await;
-        assert_unjoined_error(&result, "kj prompt inject");
     }
 
     #[tokio::test]

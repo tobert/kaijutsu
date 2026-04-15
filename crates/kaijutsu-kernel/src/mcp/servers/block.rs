@@ -27,13 +27,13 @@ use crate::block_tools::{
 use crate::block_tools::content_engines::{
     AbcBlockParams, ImgBlockFromPathParams, ImgBlockParams, SvgBlockParams,
 };
-use crate::tools::ExecutionEngine;
+
 
 use super::super::context::CallContext;
 use super::super::error::{McpError, McpResult};
 use super::super::server_like::{McpServerLike, ServerNotification};
 use super::super::types::{InstanceId, KernelCallParams, KernelTool, KernelToolResult};
-use super::adapter::{from_exec_result, to_tool_context};
+use super::adapter::{from_exec_result, to_exec_context};
 
 pub struct BlockToolsServer {
     instance_id: InstanceId,
@@ -124,7 +124,7 @@ impl McpServerLike for BlockToolsServer {
         ctx: &CallContext,
         _cancel: CancellationToken,
     ) -> McpResult<KernelToolResult> {
-        let tool_ctx = to_tool_context(ctx);
+        let tool_ctx = to_exec_context(ctx);
         let args_json = params.arguments.to_string();
 
         let exec = match params.tool.as_str() {

@@ -18,6 +18,7 @@ pub mod image;
 pub mod config_backend;
 pub mod control;
 pub mod drift;
+pub mod execution;
 pub mod file_tools;
 pub mod flows;
 pub mod input_doc;
@@ -26,10 +27,7 @@ pub mod kernel_db;
 pub mod kj;
 pub mod llm;
 pub mod mcp;
-pub mod mcp_config;
-pub mod mcp_pool;
 pub mod state;
-pub mod tools;
 pub mod vfs;
 
 pub use agents::{
@@ -84,26 +82,8 @@ pub use llm::{
     load_llm_config_toml,
     load_models_config_toml,
 };
-pub use mcp_config::{McpConfig, load_mcp_config_toml};
-pub use mcp_pool::{
-    // Resource types
-    CachedResource,
-    McpForkMode,
-    McpPoolError,
-    McpRegistration,
-    McpResourceInfo,
-    McpServerConfig,
-    McpServerInfo,
-    McpServerPool,
-    McpToolEngine,
-    McpToolInfo,
-    McpTransport,
-    ResourceCache,
-    extract_tool_result_text,
-    register_mcp_prompt_engines, register_mcp_resource_engines, serialize_prompt_messages,
-};
+pub use execution::{ExecContext, ExecResult};
 pub use state::KernelState;
-pub use tools::{EngineArgs, ExecResult, ExecutionEngine, ToolContext, ToolInfo, ToolRegistry};
 pub use vfs::{
     DirEntry, FileAttr, FileType, MountTable, SetAttr, StatFs, VfsError, VfsOps, VfsResult,
     backends::{LocalBackend, MemoryBackend},
@@ -124,43 +104,26 @@ pub use file_tools::{
     EditEngine, FileDocumentCache, GlobEngine, GrepEngine, ReadEngine, WhoamiEngine, WriteEngine,
 };
 
-// Re-export rmcp types needed for resource handling
+// Non-MCP flow buses (block / config / input-doc). The MCP-specific buses
+// (Resource / Progress / Logging / Elicitation) were removed in Phase 1 M5
+// per D-32; external MCP notifications now ride the ServerNotification
+// broadcast on each ExternalMcpServer.
 pub use flows::{
     BlockFlow,
-    // Config flow types
     ConfigFlow,
     ConfigSource,
-    ElicitationAction,
-    // Elicitation flow types
-    ElicitationFlow,
-    ElicitationResponse,
     FlowBus,
     FlowMessage,
     HasSubject,
-    // Input doc flow types
     InputDocFlow,
-    // Logging flow types
-    LoggingFlow,
     OpSource,
-    // Progress flow types
-    ProgressFlow,
-    // Resource flow types
-    ResourceFlow,
     SharedBlockFlowBus,
     SharedConfigFlowBus,
-    SharedElicitationFlowBus,
     SharedInputDocFlowBus,
-    SharedLoggingFlowBus,
-    SharedProgressFlowBus,
-    SharedResourceFlowBus,
     Subscription,
     shared_block_flow_bus,
     shared_config_flow_bus,
-    shared_elicitation_flow_bus,
     shared_input_doc_flow_bus,
-    shared_logging_flow_bus,
-    shared_progress_flow_bus,
-    shared_resource_flow_bus,
 };
 pub use input_doc::InputDocEntry;
 pub use kernel_db::{
@@ -169,4 +132,3 @@ pub use kernel_db::{
     WorkspaceRow,
 };
 pub use kj::{KjCaller, KjDispatcher, KjResult};
-pub use rmcp::model::ResourceContents as McpResourceContents;

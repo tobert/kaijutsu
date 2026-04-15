@@ -7,7 +7,7 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 
 use crate::kernel_db::{KernelDb, KernelDbError};
-use crate::tools::{ExecResult, ToolContext};
+use crate::execution::{ExecContext, ExecResult};
 
 /// Shared workspace permission checker for file tool engines.
 #[derive(Clone)]
@@ -22,7 +22,7 @@ impl WorkspaceGuard {
 
     /// Check if a read operation is allowed on this path for the caller's context.
     /// Returns Ok(()) if allowed, or an ExecResult::failure if denied.
-    pub fn check_read(&self, ctx: &ToolContext, path: &str) -> Result<(), ExecResult> {
+    pub fn check_read(&self, ctx: &ExecContext, path: &str) -> Result<(), ExecResult> {
         let db = self.db.lock();
         match db.check_workspace_path(ctx.context_id, path) {
             Ok(None) => Ok(()),    // unbound context — no restriction
@@ -40,7 +40,7 @@ impl WorkspaceGuard {
 
     /// Check if a write operation is allowed on this path for the caller's context.
     /// Returns Ok(()) if allowed, or an ExecResult::failure if denied.
-    pub fn check_write(&self, ctx: &ToolContext, path: &str) -> Result<(), ExecResult> {
+    pub fn check_write(&self, ctx: &ExecContext, path: &str) -> Result<(), ExecResult> {
         let db = self.db.lock();
         match db.check_workspace_path(ctx.context_id, path) {
             Ok(None) => Ok(()),        // unbound context — no restriction
