@@ -25,38 +25,35 @@ use kaijutsu_types::{ContextId, PrincipalId};
 use crate::interrupt::ContextInterruptState;
 use crate::rpc::{ConversationCache, SharedKernelState};
 
-/// Build tool definitions from tools with engines, filtered by kernel + context tool config.
+/// Build tool definitions visible to the LLM in this context.
 ///
-/// When `context_filter` is provided, it is merged with the kernel's tool filter
-/// (context can restrict, not relax). When None, only kernel filter applies.
+/// Phase 1 path (M4): enumerate via the broker's `ContextToolBinding`; apply
+/// the legacy `ToolFilter` merge (kernel + context, kernel-first) as a
+/// post-filter so existing configs keep working until M5 retires
+/// `ToolFilter`.
 async fn build_tool_definitions(
     kernel: &Arc<Kernel>,
+    context_id: ContextId,
+    principal_id: PrincipalId,
     context_filter: Option<&ToolFilter>,
 ) -> Vec<ToolDefinition> {
-    let registry = kernel.tools().read().await;
     let kernel_config = kernel.tool_config().await;
-
-    // Merge kernel + context filters (context restricts, doesn't relax)
     let effective_filter = match context_filter {
         Some(ctx_filter) => kernel_config.filter.merge(ctx_filter),
         None => kernel_config.filter.clone(),
     };
 
-    // Get tools with engines, filtered by the merged filter
-    let available = registry.list_with_engines();
+    let visible = kernel
+        .list_tool_defs_via_broker(context_id, principal_id)
+        .await;
 
-    available
+    visible
         .into_iter()
-        .filter(|info| effective_filter.allows(&info.name))
-        .filter_map(|info| {
-            // Only include tools that provide a schema — models can't use tools
-            // without knowing the expected parameters
-            let input_schema = registry.get_engine(&info.name).and_then(|e| e.schema())?;
-            Some(ToolDefinition {
-                name: info.name.clone(),
-                description: info.description.clone(),
-                input_schema,
-            })
+        .filter(|(name, _, _)| effective_filter.allows(name))
+        .map(|(name, schema, description)| ToolDefinition {
+            name,
+            description: description.unwrap_or_default(),
+            input_schema: schema,
         })
         .collect()
 }
@@ -163,7 +160,13 @@ pub(crate) async fn spawn_llm_for_prompt(
     };
 
     // Build tool definitions from equipped tools, filtered by kernel + context config
-    let tools = build_tool_definitions(&kernel_arc, ctx_tool_filter.as_ref()).await;
+    let tools = build_tool_definitions(
+        &kernel_arc,
+        context_id,
+        user_agent_id,
+        ctx_tool_filter.as_ref(),
+    )
+    .await;
 
     log::info!(
         "Spawning LLM stream: context={}, model={}",
@@ -723,12 +726,13 @@ async fn process_llm_stream(
                     // Step 3: Let BlockInserted flush to clients before text ops
                     tokio::task::yield_now().await;
 
-                    // Step 4: Execute tool with timeout to prevent hung tools from
-                    // blocking the entire agentic loop indefinitely.
+                    // Step 4: Execute tool via the Phase 1 broker. Outer
+                    // timeout is belt-and-suspenders alongside the broker's
+                    // per-instance InstancePolicy cap.
                     const TOOL_TIMEOUT_SECS: u64 = 120;
                     let result = tokio::time::timeout(
                         std::time::Duration::from_secs(TOOL_TIMEOUT_SECS),
-                        kernel.execute_with(&tool_name, &params, &tool_ctx),
+                        kernel.dispatch_tool_via_broker(&tool_name, &params, &tool_ctx),
                     )
                     .await;
 

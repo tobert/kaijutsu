@@ -8,6 +8,7 @@
 //! - Control plane (consent mode)
 
 use async_trait::async_trait;
+use kaijutsu_types::PrincipalId;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -153,6 +154,185 @@ impl Kernel {
     /// Get the MCP tool broker (Phase 1).
     pub fn broker(&self) -> &Arc<Broker> {
         &self.broker
+    }
+
+    /// Dispatch a tool call through the broker using the legacy
+    /// `ToolContext` call-site shape. Phase 1 shim so existing callers in
+    /// `kaijutsu-server` and `kaijutsu-mcp` can swap off `execute_with`
+    /// without rewriting the surrounding error handling. Removed at M5 when
+    /// callers move to `CallContext`/`KernelCallParams` natively.
+    ///
+    /// Resolves `tool_name` through the context's `ContextToolBinding`,
+    /// auto-populating the binding on first call with all registered
+    /// instances.
+    pub async fn dispatch_tool_via_broker(
+        &self,
+        tool_name: &str,
+        params_json: &str,
+        tool_ctx: &crate::tools::ToolContext,
+    ) -> Result<crate::tools::ExecResult, crate::mcp::McpError> {
+        use crate::mcp::{
+            CallContext, ContextToolBinding, InstanceId, KernelCallParams, McpError, ToolContent,
+            TraceContext,
+        };
+        use tokio_util::sync::CancellationToken;
+
+        // Ensure a binding exists for this context. First-touch, populate
+        // with every registered instance so the LLM sees everything.
+        let broker = self.broker.clone();
+        let binding = match broker.binding(&tool_ctx.context_id).await {
+            Some(b) if !b.allowed_instances.is_empty() => b,
+            _ => {
+                let instances = broker.list_instances().await;
+                let binding = ContextToolBinding::with_instances(instances);
+                broker.set_binding(tool_ctx.context_id, binding).await;
+                // Kick the resolver so `name_map` populates.
+                let seed_ctx = CallContext::new(
+                    tool_ctx.principal_id,
+                    tool_ctx.context_id,
+                    tool_ctx.session_id,
+                    tool_ctx.kernel_id,
+                );
+                let _ = broker
+                    .list_visible_tools(tool_ctx.context_id, &seed_ctx)
+                    .await?;
+                broker
+                    .binding(&tool_ctx.context_id)
+                    .await
+                    .unwrap_or_default()
+            }
+        };
+
+        let (instance, tool) = binding.resolve(tool_name).cloned().ok_or_else(|| {
+            McpError::ToolNotFound {
+                instance: InstanceId::new(""),
+                tool: tool_name.to_string(),
+            }
+        })?;
+
+        let arguments: serde_json::Value = if params_json.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(params_json).map_err(McpError::InvalidParams)?
+        };
+
+        let call_ctx = CallContext::new(
+            tool_ctx.principal_id,
+            tool_ctx.context_id,
+            tool_ctx.session_id,
+            tool_ctx.kernel_id,
+        )
+        .with_cwd(tool_ctx.cwd.clone())
+        .with_trace(TraceContext::from_current_span());
+
+        let result = broker
+            .call_tool(
+                KernelCallParams {
+                    instance,
+                    tool,
+                    arguments,
+                },
+                &call_ctx,
+                CancellationToken::new(),
+            )
+            .await?;
+
+        // Flatten KernelToolResult → ExecResult. Preserve the is_error →
+        // success=false convention so the existing llm_stream result arm
+        // keeps working without modification.
+        let mut text = String::new();
+        for c in &result.content {
+            match c {
+                ToolContent::Text(s) => text.push_str(s),
+                ToolContent::Json(v) => text.push_str(&v.to_string()),
+            }
+        }
+        if let Some(s) = &result.structured
+            && text.is_empty()
+        {
+            text = serde_json::to_string_pretty(s).unwrap_or_default();
+        }
+        if result.is_error {
+            Ok(crate::tools::ExecResult::failure(1, text))
+        } else {
+            Ok(crate::tools::ExecResult::success(text))
+        }
+    }
+
+    /// Enumerate every tool currently registered on the broker, without
+    /// binding filtering. Returns `(tool_name, instance, schema,
+    /// description)` quadruples. Used by admin/introspection paths (kaish
+    /// CLI, capnp `get_tool_schemas`) that want the global surface.
+    pub async fn list_all_registered_tools(
+        &self,
+    ) -> Vec<(String, crate::mcp::InstanceId, serde_json::Value, Option<String>)> {
+        use crate::mcp::CallContext;
+        let broker = self.broker.clone();
+        let ctx = CallContext::new(
+            PrincipalId::system(),
+            kaijutsu_types::ContextId::new(),
+            kaijutsu_types::SessionId::new(),
+            kaijutsu_types::KernelId::new(),
+        );
+        let mut out = Vec::new();
+        for instance in broker.list_instances().await {
+            // Snapshot the server Arc to avoid holding the registry lock
+            // across the list_tools await.
+            let server = {
+                let instances_guard = broker.instances_snapshot().await;
+                instances_guard.get(&instance).cloned()
+            };
+            if let Some(server) = server
+                && let Ok(tools) = server.list_tools(&ctx).await
+            {
+                for kt in tools {
+                    out.push((
+                        kt.name.clone(),
+                        kt.instance.clone(),
+                        kt.input_schema,
+                        kt.description,
+                    ));
+                }
+            }
+        }
+        out
+    }
+
+    /// List tool definitions visible to a context via the broker.
+    /// Auto-populates the binding on first call. Returns `(name, schema,
+    /// description)` triples suitable for LLM tool-definition construction.
+    pub async fn list_tool_defs_via_broker(
+        &self,
+        context_id: kaijutsu_types::ContextId,
+        principal_id: PrincipalId,
+    ) -> Vec<(String, serde_json::Value, Option<String>)> {
+        use crate::mcp::{CallContext, ContextToolBinding};
+
+        let broker = self.broker.clone();
+        if broker
+            .binding(&context_id)
+            .await
+            .map(|b| b.allowed_instances.is_empty())
+            .unwrap_or(true)
+        {
+            let instances = broker.list_instances().await;
+            broker
+                .set_binding(context_id, ContextToolBinding::with_instances(instances))
+                .await;
+        }
+        let ctx = CallContext::new(
+            principal_id,
+            context_id,
+            kaijutsu_types::SessionId::new(),
+            kaijutsu_types::KernelId::new(),
+        );
+        match broker.list_visible_tools(context_id, &ctx).await {
+            Ok(visible) => visible
+                .into_iter()
+                .map(|(visible_name, kt)| (visible_name, kt.input_schema, kt.description))
+                .collect(),
+            Err(_) => Vec::new(),
+        }
     }
 
     /// Register the Phase 1 builtin virtual MCP servers

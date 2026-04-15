@@ -632,12 +632,6 @@ impl KernelBackend for KaijutsuBackend {
         let params_str =
             serde_json::to_string(&params_json).map_err(|e| BackendError::Io(e.to_string()))?;
 
-        let engine = self
-            .kernel
-            .get_engine(name)
-            .await
-            .ok_or_else(|| BackendError::ToolNotFound(name.to_string()))?;
-
         // Bridge kaish ExecContext → kaijutsu ToolContext.
         // Uses kaish's cwd so file-relative operations (glob, grep) scope correctly.
         // context_id is read from the session map so context switches propagate.
@@ -653,37 +647,49 @@ impl KernelBackend for KaijutsuBackend {
             self.kernel_id,
         );
 
-        let result = engine
-            .execute(&params_str, &tool_ctx)
+        // Phase 1 M4: dispatch through the MCP broker.
+        let result = self
+            .kernel
+            .dispatch_tool_via_broker(name, &params_str, &tool_ctx)
             .await
-            .map_err(|e| BackendError::Io(e.to_string()))?;
+            .map_err(|e| match e {
+                kaijutsu_kernel::mcp::McpError::ToolNotFound { tool, .. } => {
+                    BackendError::ToolNotFound(tool)
+                }
+                other => BackendError::Io(other.to_string()),
+            })?;
 
         Ok(Self::convert_exec_result(result))
     }
 
     async fn list_tools(&self) -> BackendResult<Vec<ToolInfo>> {
-        let tools = self.kernel.list_with_engines().await;
+        // Phase 1 M4: enumerate through the broker's registered servers.
+        let tools = self.kernel.list_all_registered_tools().await;
         let mut infos = Vec::with_capacity(tools.len());
-        for t in &tools {
-            let engine_schema = self
-                .kernel
-                .get_engine(&t.name)
-                .await
-                .and_then(|e| e.schema());
-            infos.push(Self::convert_tool_info(t, engine_schema));
+        for (name, _instance, schema, description) in tools {
+            let info = kaijutsu_kernel::ToolInfo::new(
+                &name,
+                description.clone().unwrap_or_default(),
+                "mcp",
+            );
+            infos.push(Self::convert_tool_info(&info, Some(schema)));
         }
         Ok(infos)
     }
 
     async fn get_tool(&self, name: &str) -> BackendResult<Option<ToolInfo>> {
-        let tool = self.kernel.get_tool(name).await;
-        match tool {
-            Some(t) => {
-                let engine_schema = self.kernel.get_engine(name).await.and_then(|e| e.schema());
-                Ok(Some(Self::convert_tool_info(&t, engine_schema)))
+        let tools = self.kernel.list_all_registered_tools().await;
+        for (tool_name, _instance, schema, description) in tools {
+            if tool_name == name {
+                let info = kaijutsu_kernel::ToolInfo::new(
+                    &tool_name,
+                    description.unwrap_or_default(),
+                    "mcp",
+                );
+                return Ok(Some(Self::convert_tool_info(&info, Some(schema))));
             }
-            None => Ok(None),
         }
+        Ok(None)
     }
 
     // =========================================================================

@@ -1224,10 +1224,31 @@ pub async fn create_shared_kernel(
     register_block_tools(
         &kernel_arc,
         documents.clone(),
-        workspace_guard,
+        workspace_guard.clone(),
         session_contexts.clone(),
     )
     .await;
+
+    // Phase 1 M4: register virtual MCP servers on the broker so
+    // dispatch_tool_via_broker has something to route to. This runs
+    // alongside the legacy registry until M5 deletes it.
+    let file_cache_for_broker = Arc::new(kaijutsu_kernel::file_tools::FileDocumentCache::new(
+        documents.clone(),
+        kernel_arc.vfs().clone(),
+    ));
+    if let Err(e) = kernel_arc
+        .register_builtin_mcp_servers(
+            documents.clone(),
+            file_cache_for_broker,
+            workspace_guard,
+        )
+        .await
+    {
+        return Err(capnp::Error::failed(format!(
+            "Failed to register builtin MCP servers on broker: {}",
+            e
+        )));
+    }
 
     // Recover contexts: KernelDb is the primary source, with BlockStore discovery as fallback.
     // A failure to read the DB here means we cannot know which contexts should be recovered —
@@ -1958,25 +1979,21 @@ impl kernel::Server for KernelImpl {
                     return Ok(());
                 }
 
-                // Get the engine for this tool
-                let engine = kernel_arc.tools().read().await.get_engine(&tool_name);
-                match engine {
-                    Some(engine) => match engine.execute(&tool_params, &tool_ctx).await {
-                        Ok(exec_result) => {
-                            result.set_success(exec_result.success);
-                            result.set_output(&exec_result.stdout);
-                            if !exec_result.stderr.is_empty() {
-                                result.set_error(&exec_result.stderr);
-                            }
+                // Dispatch through the Phase 1 broker (M4).
+                match kernel_arc
+                    .dispatch_tool_via_broker(&tool_name, &tool_params, &tool_ctx)
+                    .await
+                {
+                    Ok(exec_result) => {
+                        result.set_success(exec_result.success);
+                        result.set_output(&exec_result.stdout);
+                        if !exec_result.stderr.is_empty() {
+                            result.set_error(&exec_result.stderr);
                         }
-                        Err(e) => {
-                            result.set_success(false);
-                            result.set_error(e.to_string());
-                        }
-                    },
-                    None => {
+                    }
+                    Err(e) => {
                         result.set_success(false);
-                        result.set_error(format!("No engine registered for tool: {}", tool_name));
+                        result.set_error(e.to_string());
                     }
                 }
                 Ok(())
@@ -1991,25 +2008,28 @@ impl kernel::Server for KernelImpl {
         mut results: kernel::GetToolSchemasResults,
     ) -> Promise<(), capnp::Error> {
         let kernel_arc = self.kernel.kernel.clone();
+        let (principal_id, context_id) = {
+            let conn = self.connection.borrow();
+            // Fall back to a throwaway ContextId when the connection has no
+            // active context — the broker will auto-populate a binding for
+            // that ephemeral id.
+            let ctx = conn.require_context().unwrap_or_else(|_| ContextId::new());
+            (conn.principal.id, ctx)
+        };
 
         let span = extract_rpc_trace(pry!(params.get()).get_trace(), "get_tool_schemas");
         Promise::from_future(
             async move {
-                let registry = kernel_arc.tools().read().await;
-                let tools = registry.list_with_engines();
-                let mut builder = results.get().init_schemas(tools.len() as u32);
-                for (i, tool) in tools.iter().enumerate() {
+                let visible = kernel_arc
+                    .list_tool_defs_via_broker(context_id, principal_id)
+                    .await;
+                let mut builder = results.get().init_schemas(visible.len() as u32);
+                for (i, (name, schema, description)) in visible.iter().enumerate() {
                     let mut s = builder.reborrow().get(i as u32);
-                    s.set_name(&tool.name);
-                    s.set_description(&tool.description);
-                    s.set_category(&tool.category);
-                    // Get schema from the engine if available
-                    let schema = registry
-                        .get_engine(&tool.name)
-                        .and_then(|e| e.schema())
-                        .map(|v| v.to_string())
-                        .unwrap_or_else(|| "{}".to_string());
-                    s.set_input_schema(&schema);
+                    s.set_name(name);
+                    s.set_description(description.as_deref().unwrap_or(""));
+                    s.set_category("mcp");
+                    s.set_input_schema(&schema.to_string());
                 }
                 Ok(())
             }

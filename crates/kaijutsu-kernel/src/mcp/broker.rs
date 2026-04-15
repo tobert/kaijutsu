@@ -112,6 +112,12 @@ impl Broker {
             .collect()
     }
 
+    /// Clone of the instance registry for callers that want to call
+    /// `list_tools` on each server without holding the broker's RwLock.
+    pub async fn instances_snapshot(&self) -> HashMap<InstanceId, Arc<dyn McpServerLike>> {
+        self.instances.read().await.clone()
+    }
+
     /// Replace a context's binding wholesale. Sticky resolutions on the
     /// incoming binding are preserved as-is; the broker does not recompute.
     pub async fn set_binding(&self, context_id: ContextId, binding: ContextToolBinding) {
