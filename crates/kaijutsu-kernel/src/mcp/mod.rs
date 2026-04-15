@@ -14,6 +14,7 @@ pub mod error;
 pub mod hook_table;
 pub mod policy;
 pub mod server_like;
+pub mod servers;
 pub mod types;
 
 pub use binding::{ContextToolBinding, ResolvedName};

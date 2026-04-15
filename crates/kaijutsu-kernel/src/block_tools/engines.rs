@@ -5,6 +5,7 @@
 
 use async_trait::async_trait;
 use regex::Regex;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::block_store::SharedBlockStore;
@@ -23,7 +24,7 @@ use super::translate::{
 // ============================================================================
 
 /// Edit operation on a block.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum EditOp {
     /// Insert text before a line.
@@ -42,7 +43,7 @@ pub enum EditOp {
 }
 
 /// Parameters for block_create tool.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct BlockCreateParams {
     /// Parent block ID for DAG relationship (None for root).
     pub parent_id: Option<String>,
@@ -59,21 +60,21 @@ pub struct BlockCreateParams {
 }
 
 /// Parameters for block_append tool.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct BlockAppendParams {
     pub block_id: String,
     pub text: String,
 }
 
 /// Parameters for block_edit tool.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct BlockEditParams {
     pub block_id: String,
     pub operations: Vec<EditOp>,
 }
 
 /// Parameters for block_splice tool.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct BlockSpliceParams {
     pub block_id: String,
     pub offset: usize,
@@ -83,7 +84,7 @@ pub struct BlockSpliceParams {
 }
 
 /// Parameters for block_read tool.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct BlockReadParams {
     pub block_id: String,
     /// Whether to include line numbers (default: true).
@@ -99,7 +100,7 @@ fn default_true() -> bool {
 }
 
 /// Parameters for block_search tool.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct BlockSearchParams {
     pub block_id: String,
     /// Regex or literal query.
@@ -121,7 +122,7 @@ fn default_max_matches() -> u32 {
 }
 
 /// Parameters for block_list tool.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct BlockListParams {
     /// Filter by parent block ID.
     #[serde(default)]
@@ -145,7 +146,7 @@ fn default_depth() -> u32 {
 }
 
 /// Parameters for block_status tool.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct BlockStatusParams {
     pub block_id: String,
     pub status: String,
@@ -1300,7 +1301,7 @@ impl ExecutionEngine for BlockStatusEngine {
 // ============================================================================
 
 /// Parameters for kernel_search.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct KernelSearchParams {
     /// Regex pattern to search for.
     pub query: String,

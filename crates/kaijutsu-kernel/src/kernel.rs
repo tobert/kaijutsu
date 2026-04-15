@@ -155,6 +155,52 @@ impl Kernel {
         &self.broker
     }
 
+    /// Register the Phase 1 builtin virtual MCP servers
+    /// (`BlockToolsServer`, `FileToolsServer`, `KernelInfoServer`) on the
+    /// broker.
+    ///
+    /// Callers pass the `SharedBlockStore` + `FileDocumentCache` they already
+    /// have (the kernel does not own a `BlockStore`). Safe to call multiple
+    /// times — subsequent calls replace the previous registrations.
+    ///
+    /// Registered under: `builtin.block`, `builtin.file`, `builtin.kernel_info`.
+    pub async fn register_builtin_mcp_servers(
+        &self,
+        documents: crate::block_store::SharedBlockStore,
+        file_cache: Arc<crate::file_tools::FileDocumentCache>,
+        workspace_guard: Option<crate::file_tools::WorkspaceGuard>,
+    ) -> crate::mcp::McpResult<()> {
+        use crate::mcp::servers::{BlockToolsServer, FileToolsServer, KernelInfoServer};
+        use crate::mcp::InstancePolicy;
+
+        self.broker
+            .register(
+                Arc::new(BlockToolsServer::new(documents, self.cas.clone())),
+                InstancePolicy::default(),
+            )
+            .await?;
+
+        self.broker
+            .register(
+                Arc::new(FileToolsServer::new(
+                    file_cache,
+                    self.vfs.clone(),
+                    workspace_guard,
+                )),
+                InstancePolicy::default(),
+            )
+            .await?;
+
+        self.broker
+            .register(
+                Arc::new(KernelInfoServer::new(self.drift.clone())),
+                InstancePolicy::default(),
+            )
+            .await?;
+
+        Ok(())
+    }
+
     /// Get the block flows bus.
     pub fn block_flows(&self) -> &SharedBlockFlowBus {
         &self.block_flows

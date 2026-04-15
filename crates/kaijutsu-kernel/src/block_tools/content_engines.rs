@@ -11,6 +11,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use kaijutsu_cas::{ContentHash, ContentStore, FileStore};
 use kaijutsu_crdt::{BlockKind, ContentType, Role, Status};
+use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::block_store::SharedBlockStore;
@@ -61,10 +62,10 @@ fn result_json(key: &str) -> String {
 // svg_block
 // ============================================================================
 
-#[derive(Debug, Deserialize)]
-struct SvgBlockParams {
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SvgBlockParams {
     /// SVG content (`<svg>...</svg>`).
-    content: String,
+    pub content: String,
 }
 
 /// Insert an SVG block at the end of the current context.
@@ -134,10 +135,10 @@ impl ExecutionEngine for SvgBlockEngine {
 // abc_block
 // ============================================================================
 
-#[derive(Debug, Deserialize)]
-struct AbcBlockParams {
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AbcBlockParams {
     /// ABC music notation text.
-    content: String,
+    pub content: String,
 }
 
 /// Insert an ABC music notation block. Validates parse before inserting.
@@ -218,10 +219,10 @@ impl ExecutionEngine for AbcBlockEngine {
 // img_block (via existing CAS hash)
 // ============================================================================
 
-#[derive(Debug, Deserialize)]
-struct ImgBlockParams {
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ImgBlockParams {
     /// Hex-encoded CAS hash of an image already stored in the CAS.
-    hash: String,
+    pub hash: String,
 }
 
 /// Insert an image block referencing content already in the CAS.
@@ -296,10 +297,10 @@ impl ExecutionEngine for ImgBlockEngine {
 // img_block_from_path (read file → CAS → block)
 // ============================================================================
 
-#[derive(Debug, Deserialize)]
-struct ImgBlockFromPathParams {
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ImgBlockFromPathParams {
     /// Filesystem path to an image file.
-    path: String,
+    pub path: String,
 }
 
 /// Read an image from disk, store it in the CAS, and append an image block.
