@@ -750,6 +750,51 @@ mark it `[RETIRED: <date> — <reason>]` in place; do not delete.
   `NotificationKind::Coalesced` summary block. Timers are tracked per
   `(InstanceId, NotifKind)` and aborted on `unregister` so no orphan
   Coalesced blocks fire after teardown (R2 mitigation).
+- **D-40** — **Coalescer key extended to `(InstanceId, NotifKind,
+  Option<String>)`** (Phase 3). The `Option<String>` is the resource URI
+  for `ResourceUpdated`; `None` for all other kinds. Per-URI windows track
+  independently so two URIs on the same instance don't coalesce into each
+  other. `ObserveOutcome` shape is unchanged. Implementation: composite
+  `CoalesceKey { instance, kind, uri }` replaces the 2-tuple HashMap key.
+  Test path: `mcp::coalescer::tests::uri_windows_are_independent` +
+  `uri_none_and_some_are_independent`.
+- **D-41** — **Subscription trigger is an explicit admin MCP tool**, not
+  auto-on-read (Phase 3). New virtual server `BuiltinResourcesServer`
+  (instance `builtin.resources`) exposes `list` / `read` / `subscribe` /
+  `unsubscribe` tools delegating to `Broker::*`. Read stays side-effect-
+  free (it emits a root block but does not subscribe). Holds
+  `Weak<Broker>` to avoid the Arc cycle (broker owns the instance Arc).
+  Registered via `register_silently` at kernel bootstrap. Test path:
+  `servers::resources_builtin::tests::builtin_resources_server_subscribe_roundtrip`.
+- **D-42** — **`ResourcePayload` is dual-content from day one**, mirroring
+  rmcp's `ResourceContents`: `text: Option<String>` + `blob_base64:
+  Option<String>` (exactly one populated per read). Binary bodies stay
+  base64-encoded end-to-end to avoid encode/decode forks between CRDT,
+  RPC, and LLM hydration paths. Resolves §7 Resources (d).
+- **D-43** — **On `ResourceUpdated` flush, broker re-reads the URI and
+  emits a fresh child `BlockKind::Resource` block parented to the initial
+  read**. MCP `resources/updated` carries no contents; re-read gives the
+  LLM the current state directly. On re-read failure, emit a single
+  `BlockKind::Notification { kind: Log, level: Warn }` under the same
+  parent — never a fake Resource block with empty contents. Test path:
+  `mcp::broker::tests::failed_reread_emits_log_not_resource`.
+- **D-44** — **Subscription lifecycle is bound to `ContextToolBinding`**.
+  Broker holds `Mutex<HashMap<ContextId, HashSet<(InstanceId, String)>>>`.
+  `clear_binding` / `unregister` walk matching entries and call
+  `server.unsubscribe` on each. CRDT replay of a hibernated context does
+  **not** re-subscribe (live side effect); past child Resource blocks
+  replay as-is. Test path:
+  `mcp::broker::tests::clear_binding_unsubscribes_all_uris` +
+  `unregister_unsubscribes_bound_contexts`.
+- **D-45** — **Per-kind coalescer policy override:
+  `NotifKind::ResourceUpdated` uses `max_in_window = 0`**. Every update
+  inside a window folds into the flush-emitted summary; there are zero
+  pass-throughs. Matches §8 Phase 3 exit criterion #3 literally ("one
+  coalesced child block per window, not one per update"). Implementation:
+  `CoalescePolicy::per_kind_override: HashMap<NotifKind, usize>` with the
+  default constructor inserting `ResourceUpdated => 0`. Log /
+  PromptsChanged keep the default cap of 20. Test path:
+  `mcp::coalescer::tests::resource_updated_has_no_pass_throughs`.
 
 ## 7. Open questions per area
 
@@ -772,14 +817,20 @@ note here.
 ### Resources
 - Subscription lifetime when a context drops — broker unsubscribes, yes;
   what about suspended/hibernated contexts? Do we persist subscriptions
-  or require re-subscribe on resume?
+  or require re-subscribe on resume? [RESOLVED: D-44 — subscriptions are
+  live side effects; CRDT replay never re-subscribes, re-entry must
+  re-issue via `builtin.resources.subscribe`]
 - Resource content-type → block rendering: who owns the mapping? First
   cut can be naive (mime → existing BlockKind) but eventually wants the
-  block content abstraction from §9.
+  block content abstraction from §9. [PARTIAL: D-42 — payload holds both
+  `text` and `blob_base64` with mime hint; naive rendering (truncated text
+  or `[binary: N bytes]`) lands in Phase 3; richer mime→render is deferred
+  to the block content abstraction in §9]
 - Subscription replay semantics: subscription is a *side effect* tied
   to the live context, not replayed with CRDT ops. Child blocks produced
   by prior updates are CRDT data and do replay. Formalize this before
-  phase 3.
+  phase 3. [RESOLVED: D-44 — formalized exactly as stated; subscriptions
+  die with binding drop, child blocks replay]
 
 ### Hooks
 - Evaluation order across phases when multiple hooks match: strictly
@@ -927,7 +978,9 @@ Exit criteria:
 - A burst of `Log` notifications within the coalescer window produces
   one summary block, not N individual blocks.
 
-### Phase 3 — Resources · **planned**
+### Phase 3 — Resources · **code complete, runner verification pending**
+
+Plan: `~/.claude/plans/we-re-going-to-circle-precious-yeti.md`
 
 `BlockKind::Resource` variant. `read_resource` on first access produces
 a resource block. Subscription updates thread as child blocks under the
@@ -1200,3 +1253,103 @@ Entries are append-only. Most recent at the bottom.
   the integration file. No live code references to deleted names
   remain; comment-only historical references preserved in
   `mcp/mod.rs` and `servers/external.rs` per doc-line-843 allowance.
+- **2026-04-16** (Phase 3 execution — M1–M4 + M6, Amy + Claude Opus 4.7):
+  Phase 3 code landed in four milestones plus doc closure. M1: `BlockKind::
+  Resource` + `ResourcePayload` rolled out end-to-end (kaijutsu-types
+  variant + payload + dual text/blob shape per D-42,
+  `format_resource_for_llm` with `RESOURCE_CONTENT_HYDRATION_BUDGET = 2048`
+  per D-34, CRDT `insert_resource_block` + kernel `insert_resource_block_as`
+  with `Option<&BlockId>` parent primitive, capnp `BlockKind::resource @8`
+  + `ResourcePayload` struct + `BlockSnapshot.resourcePayload @31 /
+  hasResourcePayload @32`, client+server RPC converters, app theme
+  `block_resource` + renderer + border, LLM hydrator `(_, BlockKind::
+  Resource)` arm + System-role / empty-content carve-out updates).
+  M2: `McpServerLike` gained four resource methods with
+  `Err(McpError::Unsupported)` defaults; `KernelResource` / `KernelResourceList`
+  / `KernelResourceContents` / `KernelReadResource` newtypes at the broker
+  API boundary (D-10); `ExternalMcpServer` delegates via rmcp 1.4.0 `Peer`
+  (`list_all_resources`, `read_resource`, `subscribe`, `unsubscribe`) with
+  `UnsupportedMethod`→`McpError::Unsupported` special-cased (R8);
+  coalescer key extended to `CoalesceKey { instance, kind, uri }` per
+  D-40 plus `CoalescePolicy::per_kind_override` with
+  `ResourceUpdated => 0` per D-45; `schedule_flush` + `FlushKey` updated
+  to carry `Option<String>` URI. M3: broker gained `list_resources` /
+  `read_resource` / `subscribe` / `unsubscribe` dispatch methods plus
+  `subscriptions: Mutex<HashMap<ContextId, HashSet<(InstanceId, String)>>>`
+  and `resource_parents: Mutex<HashMap<(ContextId, InstanceId, String),
+  BlockId>>` state; `clear_binding` and `unregister` walk the subscription
+  table and call `server.unsubscribe` best-effort on every entry (D-44);
+  pump replaces the Phase 2 drop arm with
+  `observe → schedule_resource_flush → handle_resource_flush`, which
+  re-reads per subscribed context and emits a child `BlockKind::Resource`
+  block threaded under the original (D-43). Re-read failure emits a
+  single `BlockKind::Notification { kind: Log, level: Warn }` under the
+  same parent, never a fake Resource block. `BuiltinResourcesServer`
+  (instance `builtin.resources`, D-41) exposes `list` / `read` /
+  `subscribe` / `unsubscribe` MCP tools; holds `Weak<Broker>` to avoid
+  the Arc cycle; registered via `register_silently` in
+  `Kernel::register_builtin_mcp_servers` alongside the three Phase 1
+  builtins. `CallContext::system_for_context(ContextId)` helper added for
+  broker-internal teardown calls. M4: `resource_updated_threads_child_block_and_llm_sees_it`
+  in `tests/broker_e2e.rs` exercises read → subscribe → 25-event burst →
+  exactly one coalesced child block → `<resource>` envelope in
+  `hydrate_from_blocks` output → `clear_binding` unsubscribes cleanly —
+  stitches every Phase 3 decision (D-40, D-41, D-42, D-43, D-44, D-45)
+  through production APIs only. Decisions D-40..D-45 recorded.
+
+  Suite adds, organized by the question each test answers:
+  - **"Do the types round-trip?"** 14 tests in
+    `kaijutsu-types::block::tests` (kind parse + serde + `is_resource`
+    helper, payload summary for text and blob variants,
+    `resource_block` constructor, child-under-parent constructor variant,
+    `text` constructor preserves None default, `content_eq` field
+    inclusion, JSON + postcard roundtrips on payload and full snapshot,
+    builder `.resource_payload()` arm, `format_resource_for_llm`
+    envelope / truncation / blob marker / no-payload fallback).
+  - **"Is the wire format symmetric?"** 2 tests in
+    `kaijutsu-client::rpc::tests` (full text-variant roundtrip with every
+    optional field populated, blob-variant minimal roundtrip exercising
+    each `has_*` flag discipline).
+  - **"Does the coalescer key extension hold?"** 3 tests in
+    `mcp::coalescer::tests` (`uri_windows_are_independent`,
+    `uri_none_and_some_are_independent`,
+    `resource_updated_has_no_pass_throughs` — locks D-40 per-URI
+    independence and D-45 zero-pass-through contract).
+  - **"Does the trait default to Unsupported?"** 1 test in
+    `mcp::broker::tests` on a bare `BareServer` fake — all four resource
+    methods must return `Err(McpError::Unsupported)` via trait defaults.
+  - **"Does the broker route resource operations correctly?"** 8 tests
+    in `mcp::broker::tests` — `read_resource_emits_block_in_context`
+    (exit #1), `resource_updated_emits_child_block_under_parent` (exit #2),
+    `resource_updated_burst_coalesces_to_one_child` (exit #3),
+    `two_uris_coalesce_independently` (D-40),
+    `clear_binding_unsubscribes_all_uris` (exit #4),
+    `unregister_unsubscribes_bound_contexts` (D-44 via unregister path),
+    `failed_reread_emits_log_not_resource` (D-43 failure path),
+    `resource_updated_without_subscription_emits_nothing` (renamed from
+    the Phase 2 drop-test; locks "subscription is the trigger, not the
+    notification" contract).
+  - **"Does the admin server round-trip through the broker?"** 2 tests
+    in `mcp::servers::resources_builtin::tests`
+    (`builtin_resources_server_subscribe_roundtrip` exercises
+    `builtin.resources.subscribe` → `Broker::subscribe` → mock server
+    sees the URI → `clear_binding` unsubscribes;
+    `builtin_resources_server_unknown_tool_errors` for the
+    `ToolNotFound` dispatch).
+  - **"Does the full chain work end-to-end without the app?"** 1 test
+    in `kaijutsu-kernel/tests/broker_e2e.rs`:
+    `resource_updated_threads_child_block_and_llm_sees_it`. Uses only
+    production APIs (`Broker::read_resource`, `Broker::subscribe`,
+    `SharedBlockStore::query_blocks`, `hydrate_from_blocks`), so if this
+    test passes the kernel-side Phase 3 story is real.
+
+  Workspace totals: 1381 tests passing across all crates (baseline was
+  ~1341 after Phase 2 closure; net +40 Phase 3 tests, excluding the
+  `resource_updated_is_dropped_in_phase_2` test that was renamed in
+  place). The long-standing `kaijutsu-index::test_neighbors` /
+  `test_save_and_load` flakes remain unfixed (see
+  `memory/tech_debt.md`). Runner verification (M5, exit scenarios
+  against a live kaijutsu-runner on the GPU server) pending — tracked
+  in §8 Phase 3 status. Wire format changed (capnp @31/@32 ordinals,
+  new `resource @8` BlockKind variant); per D-16 no migration path —
+  persisted contexts from Phase 2 need rebuilding.
