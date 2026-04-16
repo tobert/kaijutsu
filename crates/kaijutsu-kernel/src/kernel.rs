@@ -344,7 +344,9 @@ impl Kernel {
         file_cache: Arc<crate::file_tools::FileDocumentCache>,
         workspace_guard: Option<crate::file_tools::WorkspaceGuard>,
     ) -> crate::mcp::McpResult<()> {
-        use crate::mcp::servers::{BlockToolsServer, FileToolsServer, KernelInfoServer};
+        use crate::mcp::servers::{
+            BlockToolsServer, BuiltinResourcesServer, FileToolsServer, KernelInfoServer,
+        };
         use crate::mcp::InstancePolicy;
 
         // Wire the block store into the broker so Phase 2 notification
@@ -374,6 +376,15 @@ impl Kernel {
         self.broker
             .register_silently(
                 Arc::new(KernelInfoServer::new(self.drift.clone())),
+                InstancePolicy::default(),
+            )
+            .await?;
+
+        // Phase 3 (D-41): builtin.resources admin server. Weak<Broker> avoids
+        // the Arc cycle (broker owns the instance arc, instance refers back).
+        self.broker
+            .register_silently(
+                Arc::new(BuiltinResourcesServer::new(Arc::downgrade(&self.broker))),
                 InstancePolicy::default(),
             )
             .await?;

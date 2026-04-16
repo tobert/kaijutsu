@@ -5246,6 +5246,7 @@ fn set_block_snapshot(
         kaijutsu_crdt::BlockKind::File => crate::kaijutsu_capnp::BlockKind::File,
         kaijutsu_crdt::BlockKind::Error => crate::kaijutsu_capnp::BlockKind::Error,
         kaijutsu_crdt::BlockKind::Notification => crate::kaijutsu_capnp::BlockKind::Notification,
+        kaijutsu_crdt::BlockKind::Resource => crate::kaijutsu_capnp::BlockKind::Resource,
     });
 
     // Set basic fields (no author — derived from id.agent_id)
@@ -5345,6 +5346,9 @@ fn set_block_snapshot(
                 kaijutsu_crdt::BlockKind::Notification => {
                     crate::kaijutsu_capnp::BlockKind::Notification
                 }
+                kaijutsu_crdt::BlockKind::Resource => {
+                    crate::kaijutsu_capnp::BlockKind::Resource
+                }
             });
         }
     }
@@ -5388,6 +5392,35 @@ fn set_block_snapshot(
         }
         if let Some(ref detail) = payload.detail {
             np.set_detail(detail);
+        }
+    }
+
+    // Set resource payload if present (Phase 3 — D-42).
+    if let Some(ref payload) = block.resource {
+        builder.set_has_resource_payload(true);
+        let mut rp = builder.reborrow().init_resource_payload();
+        rp.set_instance(&payload.instance);
+        rp.set_uri(&payload.uri);
+        if let Some(ref mime) = payload.mime_type {
+            rp.set_has_mime_type(true);
+            rp.set_mime_type(mime);
+        }
+        if let Some(size) = payload.size {
+            rp.set_has_size(true);
+            rp.set_size(size);
+        }
+        if let Some(ref text) = payload.text {
+            rp.set_has_text(true);
+            rp.set_text(text);
+        }
+        if let Some(ref blob) = payload.blob_base64 {
+            rp.set_has_blob(true);
+            rp.set_blob_base64(blob);
+        }
+        if let Some(ref parent) = payload.parent_resource_block_id {
+            rp.set_has_parent_resource_block_id(true);
+            let mut pid = rp.reborrow().init_parent_resource_block_id();
+            set_block_id_builder(&mut pid, parent);
         }
     }
 }
@@ -5480,6 +5513,7 @@ fn parse_block_filter(
                 crate::kaijutsu_capnp::BlockKind::File => BlockKind::File,
                 crate::kaijutsu_capnp::BlockKind::Error => BlockKind::Error,
                 crate::kaijutsu_capnp::BlockKind::Notification => BlockKind::Notification,
+                crate::kaijutsu_capnp::BlockKind::Resource => BlockKind::Resource,
             });
         }
         if kinds.is_empty() {
@@ -5633,6 +5667,7 @@ fn parse_block_event_filter(
                             crate::kaijutsu_capnp::BlockKind::File => BlockKind::File,
                             crate::kaijutsu_capnp::BlockKind::Error => BlockKind::Error,
                             crate::kaijutsu_capnp::BlockKind::Notification => BlockKind::Notification,
+                            crate::kaijutsu_capnp::BlockKind::Resource => BlockKind::Resource,
                         })
                     })
                     .collect()

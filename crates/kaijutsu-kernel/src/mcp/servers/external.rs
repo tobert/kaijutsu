@@ -15,7 +15,8 @@ use async_trait::async_trait;
 use parking_lot::RwLock as PlRwLock;
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, ClientCapabilities, ClientInfo, Content, LoggingLevel,
-    LoggingMessageNotificationParam, Meta, ProgressNotificationParam,
+    LoggingMessageNotificationParam, Meta, ProgressNotificationParam, ReadResourceRequestParams,
+    ResourceContents, SubscribeRequestParams, UnsubscribeRequestParams,
 };
 use rmcp::service::{NotificationContext, RunningService};
 use rmcp::transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess};
@@ -30,7 +31,9 @@ use super::super::context::CallContext;
 use super::super::error::{McpError, McpResult};
 use super::super::server_like::{McpServerLike, ServerNotification};
 use super::super::types::{
-    Health, InstanceId, KernelCallParams, KernelTool, KernelToolResult, LogLevel, ToolContent,
+    Health, InstanceId, KernelCallParams, KernelReadResource, KernelResource,
+    KernelResourceContents, KernelResourceList, KernelTool, KernelToolResult, LogLevel,
+    ToolContent,
 };
 
 /// `_meta` namespace per §5.4.
@@ -310,6 +313,18 @@ impl ExternalMcpServer {
         Ok(())
     }
 
+    fn instance_down_error(&self) -> McpError {
+        let reason = self
+            .down_reason
+            .read()
+            .clone()
+            .unwrap_or_else(|| "service not initialized".to_string());
+        McpError::InstanceDown {
+            instance: self.instance_id.clone(),
+            reason,
+        }
+    }
+
     fn build_meta(&self, ctx: &CallContext) -> Meta {
         // Meta is a newtype over JsonObject; populate the three kaijutsu
         // fields per §5.4.
@@ -332,6 +347,36 @@ impl ExternalMcpServer {
             );
         }
         Meta(obj)
+    }
+}
+
+/// Map an `rmcp::ServiceError` into `McpError`. `METHOD_NOT_FOUND` on the wire
+/// means the server does not implement that capability — surface as
+/// `McpError::Unsupported` without marking the instance down (R8). Every
+/// other transport / protocol error flips the instance to `Down` via
+/// `mark_down` (passed as a closure so we don't need `&self` here).
+fn map_rmcp_service_error(
+    err: rmcp::service::ServiceError,
+    instance: &InstanceId,
+    mark_down: impl FnOnce(String),
+) -> McpError {
+    use rmcp::service::ServiceError;
+    match err {
+        ServiceError::McpError(e) if e.code.0 == -32601 => {
+            // METHOD_NOT_FOUND — capability simply not advertised.
+            McpError::Unsupported
+        }
+        ServiceError::McpError(e) => {
+            // Protocol-level error from the server (e.g. invalid params).
+            // Do NOT mark down — the transport is fine, the request was bad.
+            let _ = instance;
+            McpError::Protocol(e.to_string())
+        }
+        other => {
+            let msg = other.to_string();
+            mark_down(msg.clone());
+            McpError::Protocol(msg)
+        }
     }
 }
 
@@ -411,6 +456,121 @@ impl McpServerLike for ExternalMcpServer {
         })?;
 
         Ok(translate_result(result))
+    }
+
+    async fn list_resources(&self, _ctx: &CallContext) -> McpResult<KernelResourceList> {
+        if self.down.load(Ordering::Relaxed) {
+            return Err(self.instance_down_error());
+        }
+        let peer = {
+            let guard = self.service.read();
+            match guard.as_ref() {
+                Some(s) => s.peer().clone(),
+                None => return Err(self.instance_down_error()),
+            }
+        };
+        let resources = peer.list_all_resources().await.map_err(|e| {
+            map_rmcp_service_error(e, &self.instance_id, |reason| {
+                self.mark_down(reason);
+            })
+        })?;
+        let mapped = resources
+            .into_iter()
+            .map(|r| KernelResource {
+                instance: self.instance_id.clone(),
+                uri: r.raw.uri.clone(),
+                name: r.raw.name.clone(),
+                description: r.raw.description.clone(),
+                mime_type: r.raw.mime_type.clone(),
+                size: r.raw.size.map(|s| s as u64),
+            })
+            .collect();
+        Ok(KernelResourceList { resources: mapped })
+    }
+
+    async fn read_resource(
+        &self,
+        uri: &str,
+        ctx: &CallContext,
+    ) -> McpResult<KernelReadResource> {
+        if self.down.load(Ordering::Relaxed) {
+            return Err(self.instance_down_error());
+        }
+        let peer = {
+            let guard = self.service.read();
+            match guard.as_ref() {
+                Some(s) => s.peer().clone(),
+                None => return Err(self.instance_down_error()),
+            }
+        };
+        let mut params = ReadResourceRequestParams::new(uri);
+        params.meta = Some(self.build_meta(ctx));
+        let result = peer.read_resource(params).await.map_err(|e| {
+            map_rmcp_service_error(e, &self.instance_id, |reason| {
+                self.mark_down(reason);
+            })
+        })?;
+        let contents = result
+            .contents
+            .into_iter()
+            .map(|c| match c {
+                ResourceContents::TextResourceContents {
+                    uri, mime_type, text, ..
+                } => KernelResourceContents::Text {
+                    uri,
+                    mime_type,
+                    text,
+                },
+                ResourceContents::BlobResourceContents {
+                    uri, mime_type, blob, ..
+                } => KernelResourceContents::Blob {
+                    uri,
+                    mime_type,
+                    blob_base64: blob,
+                },
+            })
+            .collect();
+        Ok(KernelReadResource { contents })
+    }
+
+    async fn subscribe(&self, uri: &str, _ctx: &CallContext) -> McpResult<()> {
+        if self.down.load(Ordering::Relaxed) {
+            return Err(self.instance_down_error());
+        }
+        let peer = {
+            let guard = self.service.read();
+            match guard.as_ref() {
+                Some(s) => s.peer().clone(),
+                None => return Err(self.instance_down_error()),
+            }
+        };
+        let params = SubscribeRequestParams::new(uri);
+        peer.subscribe(params).await.map_err(|e| {
+            map_rmcp_service_error(e, &self.instance_id, |reason| {
+                self.mark_down(reason);
+            })
+        })?;
+        Ok(())
+    }
+
+    async fn unsubscribe(&self, uri: &str, _ctx: &CallContext) -> McpResult<()> {
+        if self.down.load(Ordering::Relaxed) {
+            return Err(self.instance_down_error());
+        }
+        let peer = {
+            let guard = self.service.read();
+            match guard.as_ref() {
+                Some(s) => s.peer().clone(),
+                None => return Err(self.instance_down_error()),
+            }
+        };
+        let params = UnsubscribeRequestParams::new(uri);
+        peer.unsubscribe(params).await.map_err(|e| {
+            map_rmcp_service_error(e, &self.instance_id, |reason| {
+                self.mark_down(reason);
+            })
+        })?;
+        Ok(())
     }
 
     fn notifications(&self) -> broadcast::Receiver<ServerNotification> {

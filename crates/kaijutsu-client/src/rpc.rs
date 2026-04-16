@@ -1684,6 +1684,7 @@ fn set_block_filter_builder(
                     BlockKind::File => crate::kaijutsu_capnp::BlockKind::File,
                     BlockKind::Error => crate::kaijutsu_capnp::BlockKind::Error,
                     BlockKind::Notification => crate::kaijutsu_capnp::BlockKind::Notification,
+                    BlockKind::Resource => crate::kaijutsu_capnp::BlockKind::Resource,
                 },
             );
         }
@@ -1813,6 +1814,7 @@ fn set_block_event_filter_builder(
                     BlockKind::File => crate::kaijutsu_capnp::BlockKind::File,
                     BlockKind::Error => crate::kaijutsu_capnp::BlockKind::Error,
                     BlockKind::Notification => crate::kaijutsu_capnp::BlockKind::Notification,
+                    BlockKind::Resource => crate::kaijutsu_capnp::BlockKind::Resource,
                 },
             );
         }
@@ -2013,7 +2015,7 @@ pub(crate) fn parse_block_snapshot(
     // Parse block ID
     let id = parse_block_id(&reader.get_id()?)?;
 
-    // Parse kind (8 variants)
+    // Parse kind (9 variants)
     let kind = match reader.get_kind()? {
         crate::kaijutsu_capnp::BlockKind::Text => BlockKind::Text,
         crate::kaijutsu_capnp::BlockKind::Thinking => BlockKind::Thinking,
@@ -2023,6 +2025,7 @@ pub(crate) fn parse_block_snapshot(
         crate::kaijutsu_capnp::BlockKind::File => BlockKind::File,
         crate::kaijutsu_capnp::BlockKind::Error => BlockKind::Error,
         crate::kaijutsu_capnp::BlockKind::Notification => BlockKind::Notification,
+        crate::kaijutsu_capnp::BlockKind::Resource => BlockKind::Resource,
     };
 
     let mut builder = BlockSnapshotBuilder::new(id, kind);
@@ -2212,6 +2215,7 @@ pub(crate) fn parse_block_snapshot(
                 crate::kaijutsu_capnp::BlockKind::File => BlockKind::File,
                 crate::kaijutsu_capnp::BlockKind::Error => BlockKind::Error,
                 crate::kaijutsu_capnp::BlockKind::Notification => BlockKind::Notification,
+                crate::kaijutsu_capnp::BlockKind::Resource => BlockKind::Resource,
             })
         } else {
             None
@@ -2282,6 +2286,61 @@ pub(crate) fn parse_block_snapshot(
             tool,
             count,
             detail,
+        });
+    }
+
+    // Resource payload (for Resource blocks)
+    if reader.get_has_resource_payload()
+        && let Ok(rp) = reader.get_resource_payload()
+    {
+        let instance = rp.get_instance().ok()
+            .and_then(|s| s.to_str().ok())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let uri = rp.get_uri().ok()
+            .and_then(|s| s.to_str().ok())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let mime_type = if rp.get_has_mime_type() {
+            rp.get_mime_type().ok()
+                .and_then(|s| s.to_str().ok())
+                .map(|s| s.to_string())
+        } else {
+            None
+        };
+        let size = if rp.get_has_size() {
+            Some(rp.get_size())
+        } else {
+            None
+        };
+        let text = if rp.get_has_text() {
+            rp.get_text().ok()
+                .and_then(|s| s.to_str().ok())
+                .map(|s| s.to_string())
+        } else {
+            None
+        };
+        let blob_base64 = if rp.get_has_blob() {
+            rp.get_blob_base64().ok()
+                .and_then(|s| s.to_str().ok())
+                .map(|s| s.to_string())
+        } else {
+            None
+        };
+        let parent_resource_block_id = if rp.get_has_parent_resource_block_id() {
+            rp.get_parent_resource_block_id().ok()
+                .and_then(|r| parse_block_id(&r).ok())
+        } else {
+            None
+        };
+        builder = builder.resource_payload(kaijutsu_types::ResourcePayload {
+            instance,
+            uri,
+            mime_type,
+            size,
+            text,
+            blob_base64,
+            parent_resource_block_id,
         });
     }
 
@@ -2534,6 +2593,7 @@ mod tests {
             BlockKind::File => crate::kaijutsu_capnp::BlockKind::File,
             BlockKind::Error => crate::kaijutsu_capnp::BlockKind::Error,
             BlockKind::Notification => crate::kaijutsu_capnp::BlockKind::Notification,
+            BlockKind::Resource => crate::kaijutsu_capnp::BlockKind::Resource,
         });
 
         // Set role
@@ -2612,6 +2672,37 @@ mod tests {
             }
             if let Some(ref detail) = payload.detail {
                 np.set_detail(detail);
+            }
+        }
+
+        // Set resource payload if present (Phase 3 — D-42).
+        if let Some(ref payload) = snap.resource {
+            builder.set_has_resource_payload(true);
+            let mut rp = builder.reborrow().init_resource_payload();
+            rp.set_instance(&payload.instance);
+            rp.set_uri(&payload.uri);
+            if let Some(ref mime) = payload.mime_type {
+                rp.set_has_mime_type(true);
+                rp.set_mime_type(mime);
+            }
+            if let Some(size) = payload.size {
+                rp.set_has_size(true);
+                rp.set_size(size);
+            }
+            if let Some(ref text) = payload.text {
+                rp.set_has_text(true);
+                rp.set_text(text);
+            }
+            if let Some(ref blob) = payload.blob_base64 {
+                rp.set_has_blob(true);
+                rp.set_blob_base64(blob);
+            }
+            if let Some(ref parent) = payload.parent_resource_block_id {
+                rp.set_has_parent_resource_block_id(true);
+                let mut pid = rp.reborrow().init_parent_resource_block_id();
+                pid.set_context_id(parent.context_id.as_bytes());
+                pid.set_agent_id(parent.agent_id.as_bytes());
+                pid.set_seq(parent.seq);
             }
         }
 
@@ -2810,6 +2901,68 @@ mod tests {
                 kind,
             );
         }
+    }
+
+    #[test]
+    fn test_resource_payload_capnp_roundtrip_text_full() {
+        // Full text-variant ResourcePayload with every optional field set.
+        let id = notif_ctx_id();
+        let parent_id = BlockId {
+            context_id: id.context_id,
+            agent_id: id.agent_id,
+            seq: 42,
+        };
+        let payload = kaijutsu_types::ResourcePayload {
+            instance: "gpal".into(),
+            uri: "file:///tmp/note.md".into(),
+            mime_type: Some("text/markdown".into()),
+            size: Some(1337),
+            text: Some("# hello\nworld".into()),
+            blob_base64: None,
+            parent_resource_block_id: Some(parent_id),
+        };
+        let snap = BlockSnapshotBuilder::new(id, BlockKind::Text)
+            .role(Role::System)
+            .content("[gpal] file:///tmp/note.md (text/markdown)")
+            .resource_payload(payload.clone())
+            .build();
+
+        let parsed = roundtrip_snapshot(&snap);
+
+        assert_eq!(parsed.kind, BlockKind::Resource);
+        assert_eq!(parsed.resource, Some(payload));
+    }
+
+    #[test]
+    fn test_resource_payload_capnp_roundtrip_blob_minimal() {
+        // Blob variant with the minimum that still distinguishes it from
+        // text (hasBlob=true, hasText=false). Locks the has_* flag discipline
+        // for the text/blob exclusion contract.
+        let id = notif_ctx_id();
+        let payload = kaijutsu_types::ResourcePayload {
+            instance: "bevy_brp".into(),
+            uri: "screen://capture/0".into(),
+            mime_type: None,
+            size: None,
+            text: None,
+            blob_base64: Some("AAAA".into()),
+            parent_resource_block_id: None,
+        };
+        let snap = BlockSnapshotBuilder::new(id, BlockKind::Text)
+            .role(Role::System)
+            .resource_payload(payload.clone())
+            .build();
+
+        let parsed = roundtrip_snapshot(&snap);
+
+        let parsed_payload = parsed.resource.expect("resource must survive");
+        assert_eq!(parsed_payload.instance, "bevy_brp");
+        assert_eq!(parsed_payload.uri, "screen://capture/0");
+        assert_eq!(parsed_payload.mime_type, None, "has_mime_type=false must yield None");
+        assert_eq!(parsed_payload.size, None, "has_size=false must yield None");
+        assert_eq!(parsed_payload.text, None, "has_text=false must yield None");
+        assert_eq!(parsed_payload.blob_base64, Some("AAAA".into()));
+        assert_eq!(parsed_payload.parent_resource_block_id, None);
     }
 
     #[test]

@@ -28,6 +28,7 @@ pub use hook_table::{
 pub use policy::InstancePolicy;
 pub use server_like::{McpServerLike, ServerNotification};
 pub use types::{
-    ElicitationRequest, Health, InstanceId, KernelCallParams, KernelNotification, KernelTool,
+    ElicitationRequest, Health, InstanceId, KernelCallParams, KernelNotification,
+    KernelReadResource, KernelResource, KernelResourceContents, KernelResourceList, KernelTool,
     KernelToolResult, LogLevel, NotifKind, ToolContent,
 };

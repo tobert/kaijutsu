@@ -121,6 +121,9 @@ pub struct BlockContent {
     /// Structured notification payload (for notification blocks).
     notification: Option<kaijutsu_types::NotificationPayload>,
 
+    /// Structured resource payload (for resource blocks).
+    resource: Option<kaijutsu_types::ResourcePayload>,
+
     /// Whether this block has been deleted (tombstone).
     deleted: bool,
 }
@@ -153,6 +156,7 @@ impl BlockContent {
             file_path: None,
             error: None,
             notification: None,
+            resource: None,
             collapsed: false,
             ephemeral: false,
             excluded: false,
@@ -201,6 +205,7 @@ impl BlockContent {
         block.file_path = snap.file_path.clone();
         block.error = snap.error.clone();
         block.notification = snap.notification.clone();
+        block.resource = snap.resource.clone();
         block.collapsed = snap.collapsed;
         block.ephemeral = snap.ephemeral;
         block.excluded = snap.excluded;
@@ -242,6 +247,7 @@ impl BlockContent {
             file_path: snap.file_path.clone(),
             error: snap.error.clone(),
             notification: snap.notification.clone(),
+            resource: snap.resource.clone(),
             collapsed: snap.collapsed,
             ephemeral: snap.ephemeral,
             excluded: snap.excluded,
@@ -489,6 +495,7 @@ impl BlockContent {
             file_path: self.file_path.clone(),
             error: self.error.clone(),
             notification: self.notification.clone(),
+            resource: self.resource.clone(),
             content_type: self.header.content_type,
             order_key: Some(self.order_key.clone()),
             updated_at: self.header.updated_at,

@@ -139,6 +139,8 @@ pub struct Theme {
     pub block_drift_commit: Color,
     /// Notification block text color (muted cyan — broker tool/log events)
     pub block_notification: Color,
+    /// Resource block text color (muted teal — MCP resource read-through)
+    pub block_resource: Color,
     // ═══════════════════════════════════════════════════════════════════════
     // Semantic colors
     // ═══════════════════════════════════════════════════════════════════════
@@ -439,6 +441,7 @@ impl Default for Theme {
             block_drift_merge: Color::srgb(0.733, 0.604, 0.969), // #bb9af7 purple
             block_drift_commit: Color::srgb(0.620, 0.808, 0.416), // #9ece6a green
             block_notification: Color::srgb(0.490, 0.694, 0.753), // #7db1c0 muted cyan
+            block_resource: Color::srgb(0.447, 0.757, 0.667), // #72c1aa muted teal
 
             // Semantic
             error: Color::srgb(0.969, 0.463, 0.557), // #f7768e

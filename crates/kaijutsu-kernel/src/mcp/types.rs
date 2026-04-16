@@ -96,6 +96,46 @@ pub enum ToolContent {
     Json(serde_json::Value),
 }
 
+/// Broker-level view of a single MCP resource advertised by a server (Phase 3).
+#[derive(Clone, Debug)]
+pub struct KernelResource {
+    pub instance: InstanceId,
+    pub uri: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub mime_type: Option<String>,
+    pub size: Option<u64>,
+}
+
+/// Result of `list_resources`.
+#[derive(Clone, Debug, Default)]
+pub struct KernelResourceList {
+    pub resources: Vec<KernelResource>,
+}
+
+/// One content chunk returned by `read_resource`. Mirrors rmcp's
+/// `ResourceContents` split: text vs binary.
+#[derive(Clone, Debug)]
+pub enum KernelResourceContents {
+    Text {
+        uri: String,
+        mime_type: Option<String>,
+        text: String,
+    },
+    Blob {
+        uri: String,
+        mime_type: Option<String>,
+        /// Base64-encoded bytes, kept as string to match rmcp wire shape.
+        blob_base64: String,
+    },
+}
+
+/// Result of `read_resource`. A single URI may return multiple content chunks.
+#[derive(Clone, Debug, Default)]
+pub struct KernelReadResource {
+    pub contents: Vec<KernelResourceContents>,
+}
+
 /// Health reported by an `McpServerLike` implementation.
 #[derive(Clone, Debug)]
 pub enum Health {

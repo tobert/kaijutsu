@@ -55,12 +55,13 @@ enum Status {
   error @3;
 }
 
-# Block content type — 8 variants covering what a block *is*.
+# Block content type — 9 variants covering what a block *is*.
 # Mechanism metadata lives in companion enums:
 # - ToolKind on ToolCall/ToolResult: which execution engine (Shell, Mcp, Builtin)
 # - DriftKind on Drift: how content transferred (Push, Pull, Merge, Distill, Commit)
 # - ErrorPayload on Error: structured diagnostics
 # - NotificationPayload on Notification: broker-emitted tool/log events
+# - ResourcePayload on Resource: MCP resource contents
 enum BlockKind {
   text @0;
   thinking @1;
@@ -70,6 +71,7 @@ enum BlockKind {
   file @5;
   error @6;
   notification @7;
+  resource @8;
 }
 
 # Which execution engine handled a tool call/result.
@@ -188,6 +190,10 @@ struct BlockSnapshot {
   # Notification-specific fields (Notification blocks)
   notificationPayload @29 :NotificationPayload;
   hasNotificationPayload @30 :Bool;
+
+  # Resource-specific fields (Resource blocks)
+  resourcePayload @31 :ResourcePayload;
+  hasResourcePayload @32 :Bool;
 }
 
 # What system produced the error.
@@ -250,6 +256,24 @@ struct NotificationPayload {
   hasCount @5 :Bool;            # True iff `count` applies (Coalesced)
   count @6 :UInt32;
   detail @7 :Text;              # Expandable body — empty = None
+}
+
+# Structured resource payload for Resource blocks (Phase 3 — D-42).
+# Exactly one of `text`/`blobBase64` is populated per read, signaled by the
+# corresponding `has*` flag. Binary bodies stay base64-encoded end-to-end.
+struct ResourcePayload {
+  instance @0 :Text;                  # MCP instance id (never empty)
+  uri @1 :Text;
+  mimeType @2 :Text;                  # empty unless hasMimeType
+  hasMimeType @3 :Bool;
+  size @4 :UInt64;                    # 0 unless hasSize
+  hasSize @5 :Bool;
+  text @6 :Text;                      # empty unless hasText
+  hasText @7 :Bool;
+  blobBase64 @8 :Text;                # empty unless hasBlob
+  hasBlob @9 :Bool;
+  hasParentResourceBlockId @10 :Bool;
+  parentResourceBlockId @11 :BlockId;
 }
 
 # Full context state — blocks + CRDT oplog for sync

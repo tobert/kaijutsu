@@ -49,6 +49,7 @@ pub fn block_color(block: &BlockSnapshot, theme: &Theme) -> bevy::prelude::Color
             }
         }
         BlockKind::Notification => theme.block_notification,
+        BlockKind::Resource => theme.block_resource,
         BlockKind::Drift => match block.drift_kind {
             Some(DriftKind::Push) => theme.block_drift_push,
             Some(DriftKind::Pull) | Some(DriftKind::Distill) => theme.block_drift_pull,
@@ -677,6 +678,27 @@ fn format_block_inner(block: &BlockSnapshot, local_ctx: Option<ContextId>) -> St
             if let Some(ref payload) = block.notification {
                 if let Some(ref detail) = payload.detail {
                     format!("{}\n{}", block.content, detail)
+                } else {
+                    block.content.clone()
+                }
+            } else {
+                block.content.clone()
+            }
+        }
+        BlockKind::Resource => {
+            if let Some(ref payload) = block.resource {
+                if let Some(ref text) = payload.text {
+                    // Preview up to ~1 KB inline; truncation is a UI concern,
+                    // LLM hydration uses RESOURCE_CONTENT_HYDRATION_BUDGET instead.
+                    if text.chars().count() > 1024 {
+                        let head: String = text.chars().take(1024).collect();
+                        format!("{}\n{}\n...[truncated]", block.content, head)
+                    } else {
+                        format!("{}\n{}", block.content, text)
+                    }
+                } else if let Some(ref blob) = payload.blob_base64 {
+                    let bytes = blob.len().saturating_mul(3) / 4;
+                    format!("{}\n[binary: {} bytes]", block.content, bytes)
                 } else {
                     block.content.clone()
                 }

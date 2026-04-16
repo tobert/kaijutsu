@@ -106,6 +106,7 @@ mod tests {
             content_type_at: 0,
             error: None,
             notification: None,
+            resource: None,
         }
     }
 

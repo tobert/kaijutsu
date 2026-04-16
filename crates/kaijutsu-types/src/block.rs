@@ -699,6 +699,112 @@ pub fn format_notification_for_llm(block: &BlockSnapshot) -> String {
     format!("<notification {}>\n{}\n</notification>", attrs, body)
 }
 
+// ============================================================================
+// Resource Payload Types (Phase 3 — D-42)
+// ============================================================================
+
+/// Structured resource payload attached to `BlockKind::Resource` blocks.
+///
+/// Mirrors rmcp's `ResourceContents` split: exactly one of `text` or
+/// `blob_base64` is populated per read (a resource is either text or bytes).
+/// Binary bodies stay base64-encoded end-to-end to avoid encode/decode forks
+/// between the CRDT, RPC, and LLM hydration paths.
+///
+/// `parent_resource_block_id` is `None` for the initial read and `Some(parent)`
+/// for subscription-update children emitted by the broker when
+/// `ServerNotification::ResourceUpdated` flushes (D-43).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourcePayload {
+    /// MCP instance id that owns the resource (`builtin.<name>` or external
+    /// config key).
+    pub instance: String,
+    pub uri: String,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub size: Option<u64>,
+    /// Text body — exactly one of `text`/`blob_base64` populated per read.
+    #[serde(default)]
+    pub text: Option<String>,
+    /// Base64-encoded blob body — kept as string to match rmcp wire shape.
+    #[serde(default)]
+    pub blob_base64: Option<String>,
+    /// When populated, this block is a subscription-update child under the
+    /// named parent resource block. `None` = initial read, root block.
+    #[serde(default)]
+    pub parent_resource_block_id: Option<BlockId>,
+}
+
+impl ResourcePayload {
+    /// Build a one-line summary from the payload fields.
+    /// Used to populate `BlockSnapshot.content` when the producer doesn't
+    /// supply an explicit summary string.
+    pub fn summary_line(&self) -> String {
+        let mime_hint = match &self.mime_type {
+            Some(m) => format!(" ({})", m),
+            None => String::new(),
+        };
+        let marker = if self.blob_base64.is_some() {
+            " [binary]"
+        } else {
+            ""
+        };
+        format!("[{}] {}{}{}", self.instance, self.uri, mime_hint, marker)
+    }
+}
+
+/// Maximum chars of `ResourcePayload.text` included in LLM hydration.
+/// Larger than the notification budget (512) because resources *are* the data
+/// the LLM was asked about — truncating them too aggressively defeats the
+/// point of reading them. Measured in Unicode scalar values, not bytes.
+pub const RESOURCE_CONTENT_HYDRATION_BUDGET: usize = 2048;
+
+/// Format a Resource block for inclusion in LLM context (D-34, D-43).
+///
+/// Produces an XML envelope:
+/// ```text
+/// <resource instance="..." uri="..." mime="...">
+/// <body, truncated to RESOURCE_CONTENT_HYDRATION_BUDGET>
+/// </resource>
+/// ```
+/// For blob bodies, the body is substituted as `[binary: N bytes]`.
+pub fn format_resource_for_llm(block: &BlockSnapshot) -> String {
+    let payload = match &block.resource {
+        Some(p) => p,
+        None => return block.content.clone(),
+    };
+
+    let mut attrs = format!(
+        "instance=\"{}\" uri=\"{}\"",
+        payload.instance, payload.uri,
+    );
+    if let Some(ref mime) = payload.mime_type {
+        attrs.push_str(&format!(" mime=\"{}\"", mime));
+    }
+
+    let body = if let Some(ref text) = payload.text {
+        if text.chars().count() > RESOURCE_CONTENT_HYDRATION_BUDGET {
+            let truncated: String = text
+                .chars()
+                .take(RESOURCE_CONTENT_HYDRATION_BUDGET)
+                .collect();
+            format!("{}\n...[truncated]", truncated)
+        } else {
+            text.clone()
+        }
+    } else if let Some(ref blob) = payload.blob_base64 {
+        // rmcp blobs are base64 on the wire; approximate byte size from
+        // encoded length (4 base64 chars encode 3 bytes, minus padding).
+        let encoded = blob.len();
+        let bytes = encoded.saturating_mul(3) / 4;
+        format!("[binary: {} bytes]", bytes)
+    } else {
+        block.content.clone()
+    };
+
+    format!("<resource {}>\n{}\n</resource>", attrs, body)
+}
+
 /// Execution status for blocks (CRDT-synced).
 ///
 /// Discriminant order matters for LWW tiebreaking: when two peers write at the
@@ -764,6 +870,7 @@ impl std::fmt::Display for Status {
 /// - `DriftKind` on Drift — how content transferred
 /// - `ErrorPayload` on Error — category, severity, diagnostics
 /// - `NotificationPayload` on Notification — broker-emitted tool/log events
+/// - `ResourcePayload` on Resource — MCP resource contents
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default, EnumString)]
 #[serde(rename_all = "lowercase")]
 #[strum(ascii_case_insensitive)]
@@ -807,6 +914,14 @@ pub enum BlockKind {
     #[serde(rename = "notification")]
     #[strum(serialize = "notification")]
     Notification,
+    /// MCP resource read through the kernel. `content` carries a one-line
+    /// summary; `ResourcePayload` carries the structured body (text or
+    /// base64 blob) plus `instance`, `uri`, `mime_type`. Initial reads are
+    /// root blocks; subscription-update children are parented to the initial
+    /// read via `parent_resource_block_id` (D-43). Visible to the LLM (D-34).
+    #[serde(rename = "resource")]
+    #[strum(serialize = "resource")]
+    Resource,
 }
 
 impl BlockKind {
@@ -827,6 +942,7 @@ impl BlockKind {
             BlockKind::File => "file",
             BlockKind::Error => "error",
             BlockKind::Notification => "notification",
+            BlockKind::Resource => "resource",
         }
     }
 
@@ -853,6 +969,11 @@ impl BlockKind {
     /// Check if this is a notification block.
     pub fn is_notification(&self) -> bool {
         matches!(self, BlockKind::Notification)
+    }
+
+    /// Check if this is a resource block.
+    pub fn is_resource(&self) -> bool {
+        matches!(self, BlockKind::Resource)
     }
 }
 
@@ -1066,6 +1187,12 @@ pub struct BlockSnapshot {
     #[serde(default)]
     pub notification: Option<NotificationPayload>,
 
+    // Resource-specific fields (Resource)
+    /// Structured resource payload. Present only when
+    /// `kind == BlockKind::Resource`.
+    #[serde(default)]
+    pub resource: Option<ResourcePayload>,
+
     // Content type hint
     /// Content type for rendering. When not `Plain`, consumers skip heuristic
     /// detection and use the declared type directly.
@@ -1153,6 +1280,7 @@ impl BlockSnapshot {
             file_path: None,
             error: None,
             notification: None,
+            resource: None,
             content_type: ContentType::Plain,
             order_key: None,
             updated_at: 0,
@@ -1198,6 +1326,7 @@ impl BlockSnapshot {
             file_path: None,
             error: None,
             notification: None,
+            resource: None,
             content_type: ContentType::Plain,
             order_key: None,
             updated_at: 0,
@@ -1255,6 +1384,7 @@ impl BlockSnapshot {
             file_path: None,
             error: None,
             notification: None,
+            resource: None,
             content_type: ContentType::Plain,
             order_key: None,
             updated_at: 0,
@@ -1312,6 +1442,7 @@ impl BlockSnapshot {
             file_path: None,
             error: None,
             notification: None,
+            resource: None,
             content_type: ContentType::Plain,
             order_key: None,
             updated_at: 0,
@@ -1373,6 +1504,7 @@ impl BlockSnapshot {
             file_path: None,
             error: None,
             notification: None,
+            resource: None,
             content_type: ContentType::Plain,
             order_key: None,
             updated_at: 0,
@@ -1425,6 +1557,7 @@ impl BlockSnapshot {
             file_path: None,
             error: None,
             notification: None,
+            resource: None,
             content_type: ContentType::Plain,
             order_key: None,
             updated_at: 0,
@@ -1475,6 +1608,7 @@ impl BlockSnapshot {
             file_path: Some(file_path.into()),
             error: None,
             notification: None,
+            resource: None,
             content_type: ContentType::Plain,
             order_key: None,
             updated_at: 0,
@@ -1525,6 +1659,7 @@ impl BlockSnapshot {
             file_path: None,
             error: Some(payload),
             notification: None,
+            resource: None,
             content_type: ContentType::Plain,
             order_key: None,
             updated_at: 0,
@@ -1571,6 +1706,65 @@ impl BlockSnapshot {
             file_path: None,
             error: Some(payload),
             notification: None,
+            resource: None,
+            content_type: ContentType::Plain,
+            order_key: None,
+            updated_at: 0,
+            status_at: 0,
+            collapsed_at: 0,
+            ephemeral_at: 0,
+            excluded_at: 0,
+            compacted_at: 0,
+            tool_meta_at: 0,
+            content_type_at: 0,
+        }
+    }
+
+    /// Create a resource block (MCP resource read-through).
+    ///
+    /// `parent_id` is `None` for the initial read (root block) and
+    /// `Some(original_resource_block_id)` for subscription-update children
+    /// emitted by the broker when `ServerNotification::ResourceUpdated`
+    /// flushes. The caller is responsible for setting
+    /// `payload.parent_resource_block_id` to match `parent_id` for child
+    /// blocks — they should agree.
+    pub fn resource_block(
+        id: BlockId,
+        parent_id: Option<BlockId>,
+        payload: ResourcePayload,
+        summary: impl Into<String>,
+    ) -> Self {
+        assert!(
+            parent_id.is_none_or(|p| p.context_id == id.context_id),
+            "parent_id must be in same context as resource block"
+        );
+        Self {
+            id,
+            parent_id,
+            role: Role::System,
+            status: Status::Done,
+            kind: BlockKind::Resource,
+            content: summary.into(),
+            collapsed: false,
+            compacted: false,
+            ephemeral: false,
+            excluded: false,
+            created_at: crate::now_millis(),
+            tool_kind: None,
+            tool_name: None,
+            tool_input: None,
+            tool_use_id: None,
+            tool_call_id: None,
+            exit_code: None,
+            is_error: false,
+            output: None,
+            source_context: None,
+            source_model: None,
+            drift_kind: None,
+            file_path: None,
+            error: None,
+            notification: None,
+            resource: Some(payload),
             content_type: ContentType::Plain,
             order_key: None,
             updated_at: 0,
@@ -1626,6 +1820,7 @@ impl BlockSnapshot {
             file_path: None,
             error: None,
             notification: Some(payload),
+            resource: None,
             content_type: ContentType::Plain,
             order_key: None,
             updated_at: 0,
@@ -1687,6 +1882,7 @@ impl BlockSnapshot {
             && self.file_path == other.file_path
             && self.error == other.error
             && self.notification == other.notification
+            && self.resource == other.resource
             && self.content_type == other.content_type
             && self.order_key == other.order_key
     }
@@ -1746,6 +1942,7 @@ impl BlockSnapshotBuilder {
                 file_path: None,
                 error: None,
                 notification: None,
+                resource: None,
                 content_type: ContentType::Plain,
                 order_key: None,
                 updated_at: 0,
@@ -1884,6 +2081,13 @@ impl BlockSnapshotBuilder {
     pub fn notification_payload(mut self, payload: NotificationPayload) -> Self {
         self.snap.notification = Some(payload);
         self.snap.kind = BlockKind::Notification;
+        self.snap.role = Role::System;
+        self
+    }
+
+    pub fn resource_payload(mut self, payload: ResourcePayload) -> Self {
+        self.snap.resource = Some(payload);
+        self.snap.kind = BlockKind::Resource;
         self.snap.role = Role::System;
         self
     }
@@ -4101,5 +4305,231 @@ mod tests {
         assert_eq!(j, "\"tool_added\"");
         let j = serde_json::to_string(&NotificationKind::PromptsChanged).unwrap();
         assert_eq!(j, "\"prompts_changed\"");
+    }
+
+    // ── BlockKind::Resource + ResourcePayload (Phase 3) ────────────────
+
+    fn text_resource_payload() -> ResourcePayload {
+        ResourcePayload {
+            instance: "gpal".into(),
+            uri: "file:///tmp/note.md".into(),
+            mime_type: Some("text/markdown".into()),
+            size: Some(128),
+            text: Some("# hello\nworld".into()),
+            blob_base64: None,
+            parent_resource_block_id: None,
+        }
+    }
+
+    fn blob_resource_payload() -> ResourcePayload {
+        ResourcePayload {
+            instance: "bevy_brp".into(),
+            uri: "screen://capture/0".into(),
+            mime_type: Some("image/png".into()),
+            size: Some(2048),
+            text: None,
+            // 4 base64 chars encode 3 bytes; 2732 chars ≈ 2049 bytes
+            blob_base64: Some("A".repeat(2732)),
+            parent_resource_block_id: None,
+        }
+    }
+
+    #[test]
+    fn test_block_kind_resource_parses() {
+        assert_eq!(
+            BlockKind::from_str("resource"),
+            Some(BlockKind::Resource),
+        );
+        assert_eq!(
+            BlockKind::from_str("RESOURCE"),
+            Some(BlockKind::Resource),
+        );
+        assert_eq!(BlockKind::Resource.as_str(), "resource");
+        assert!(BlockKind::Resource.is_resource());
+        assert!(!BlockKind::Text.is_resource());
+    }
+
+    #[test]
+    fn test_block_kind_resource_serde_roundtrip() {
+        let json = serde_json::to_string(&BlockKind::Resource).unwrap();
+        assert_eq!(json, "\"resource\"");
+        let parsed: BlockKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, BlockKind::Resource);
+    }
+
+    #[test]
+    fn test_resource_payload_summary_line_text() {
+        let p = text_resource_payload();
+        let s = p.summary_line();
+        assert!(s.contains("gpal"));
+        assert!(s.contains("file:///tmp/note.md"));
+        assert!(s.contains("text/markdown"));
+        assert!(!s.contains("[binary]"));
+    }
+
+    #[test]
+    fn test_resource_payload_summary_line_blob() {
+        let p = blob_resource_payload();
+        let s = p.summary_line();
+        assert!(s.contains("screen://capture/0"));
+        assert!(s.contains("image/png"));
+        assert!(s.contains("[binary]"));
+    }
+
+    #[test]
+    fn test_resource_block_constructor_sets_fields() {
+        let ctx = test_context();
+        let id = BlockId::new(ctx, PrincipalId::system(), 1);
+        let payload = text_resource_payload();
+        let snap =
+            BlockSnapshot::resource_block(id, None, payload.clone(), "gpal/note");
+
+        assert_eq!(snap.kind, BlockKind::Resource);
+        assert_eq!(snap.role, Role::System);
+        assert_eq!(snap.status, Status::Done);
+        assert_eq!(snap.resource, Some(payload));
+        assert!(snap.parent_id.is_none());
+    }
+
+    #[test]
+    fn test_resource_block_child_under_parent() {
+        let ctx = test_context();
+        let parent_id = BlockId::new(ctx, PrincipalId::system(), 1);
+        let child_id = BlockId::new(ctx, PrincipalId::system(), 2);
+        let mut payload = text_resource_payload();
+        payload.parent_resource_block_id = Some(parent_id);
+        let snap =
+            BlockSnapshot::resource_block(child_id, Some(parent_id), payload.clone(), "update");
+        assert_eq!(snap.parent_id, Some(parent_id));
+        assert_eq!(
+            snap.resource.as_ref().unwrap().parent_resource_block_id,
+            Some(parent_id),
+        );
+    }
+
+    #[test]
+    fn test_text_constructor_has_no_resource_payload() {
+        let ctx = test_context();
+        let snap = BlockSnapshot::text(
+            BlockId::new(ctx, test_agent(), 1),
+            None,
+            Role::User,
+            "hello",
+        );
+        assert!(snap.resource.is_none());
+    }
+
+    #[test]
+    fn test_resource_block_content_eq_includes_resource_field() {
+        let ctx = test_context();
+        let id = BlockId::new(ctx, PrincipalId::system(), 1);
+        let snap_a =
+            BlockSnapshot::resource_block(id, None, text_resource_payload(), "a");
+        let mut payload_b = text_resource_payload();
+        payload_b.uri = "file:///other".into();
+        let snap_b = BlockSnapshot::resource_block(id, None, payload_b, "a");
+        assert!(!snap_a.content_eq(&snap_b));
+    }
+
+    #[test]
+    fn test_resource_payload_json_roundtrip() {
+        let p = text_resource_payload();
+        let json = serde_json::to_string(&p).unwrap();
+        let parsed: ResourcePayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(p, parsed);
+    }
+
+    #[test]
+    fn test_resource_payload_postcard_roundtrip() {
+        let p = blob_resource_payload();
+        let bytes = postcard::to_stdvec(&p).unwrap();
+        let parsed: ResourcePayload = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(p, parsed);
+    }
+
+    #[test]
+    fn test_resource_block_snapshot_json_roundtrip() {
+        let ctx = test_context();
+        let id = BlockId::new(ctx, PrincipalId::system(), 1);
+        let snap =
+            BlockSnapshot::resource_block(id, None, text_resource_payload(), "gpal/note");
+        let json = serde_json::to_string(&snap).unwrap();
+        let parsed: BlockSnapshot = serde_json::from_str(&json).unwrap();
+        assert!(parsed.content_eq(&snap));
+        assert_eq!(parsed.resource, snap.resource);
+    }
+
+    #[test]
+    fn test_builder_resource_payload() {
+        let ctx = test_context();
+        let id = BlockId::new(ctx, test_agent(), 1);
+        let payload = text_resource_payload();
+        let snap = BlockSnapshotBuilder::new(id, BlockKind::Text)
+            .content("summary")
+            .resource_payload(payload.clone())
+            .build();
+        assert_eq!(snap.kind, BlockKind::Resource);
+        assert_eq!(snap.role, Role::System);
+        assert_eq!(snap.resource, Some(payload));
+    }
+
+    #[test]
+    fn format_resource_for_llm_text_envelope() {
+        let ctx = test_context();
+        let id = BlockId::new(ctx, PrincipalId::system(), 1);
+        let snap =
+            BlockSnapshot::resource_block(id, None, text_resource_payload(), "gpal/note");
+        let formatted = format_resource_for_llm(&snap);
+        assert!(formatted.starts_with("<resource "));
+        assert!(formatted.ends_with("</resource>"));
+        assert!(formatted.contains("instance=\"gpal\""));
+        assert!(formatted.contains("uri=\"file:///tmp/note.md\""));
+        assert!(formatted.contains("mime=\"text/markdown\""));
+        assert!(formatted.contains("# hello"));
+    }
+
+    #[test]
+    fn format_resource_for_llm_truncates_over_budget() {
+        let ctx = test_context();
+        let id = BlockId::new(ctx, PrincipalId::system(), 1);
+        let long = "x".repeat(RESOURCE_CONTENT_HYDRATION_BUDGET + 1024);
+        let payload = ResourcePayload {
+            instance: "gpal".into(),
+            uri: "file:///giant.txt".into(),
+            mime_type: Some("text/plain".into()),
+            size: Some(9999),
+            text: Some(long),
+            blob_base64: None,
+            parent_resource_block_id: None,
+        };
+        let snap = BlockSnapshot::resource_block(id, None, payload, "giant");
+        let formatted = format_resource_for_llm(&snap);
+        assert!(formatted.contains("...[truncated]"));
+        // Envelope is bounded close to the budget, not the full long body
+        assert!(formatted.chars().count() < RESOURCE_CONTENT_HYDRATION_BUDGET + 512);
+    }
+
+    #[test]
+    fn format_resource_for_llm_blob_substitutes_marker() {
+        let ctx = test_context();
+        let id = BlockId::new(ctx, PrincipalId::system(), 1);
+        let snap =
+            BlockSnapshot::resource_block(id, None, blob_resource_payload(), "screenshot");
+        let formatted = format_resource_for_llm(&snap);
+        assert!(formatted.contains("[binary:"));
+        // Never leaks the base64 blob body into the LLM context
+        assert!(!formatted.contains("AAAAAAAAAAAAAAAA"));
+    }
+
+    #[test]
+    fn format_resource_for_llm_no_payload_returns_content() {
+        let ctx = test_context();
+        let snap = BlockSnapshot::text(
+            BlockId::new(ctx, test_agent(), 1),
+            None,
+            Role::System,
+            "fallback content",
+        );
+        assert_eq!(format_resource_for_llm(&snap), "fallback content");
     }
 }

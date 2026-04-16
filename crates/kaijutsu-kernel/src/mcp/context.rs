@@ -101,4 +101,17 @@ impl CallContext {
             KernelId::new(),
         )
     }
+
+    /// System-principal context for a specific `ContextId` (Phase 3 M3).
+    /// Used by `Broker::clear_binding` / `unregister` / resource-flush re-reads
+    /// where the teardown path needs to address a specific context but there
+    /// is no live user principal to attribute to.
+    pub fn system_for_context(context_id: ContextId) -> Self {
+        Self::new(
+            PrincipalId::system(),
+            context_id,
+            SessionId::new(),
+            KernelId::new(),
+        )
+    }
 }

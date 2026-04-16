@@ -21,7 +21,8 @@ use kaijutsu_kernel::file_tools::FileDocumentCache;
 use kaijutsu_kernel::kernel_db::{DocumentRow, KernelDb};
 use kaijutsu_kernel::llm::hydrate_from_blocks;
 use kaijutsu_kernel::mcp::{
-    CallContext, ContextToolBinding, InstanceId, InstancePolicy, KernelCallParams, KernelTool,
+    CallContext, ContextToolBinding, InstanceId, InstancePolicy, KernelCallParams,
+    KernelReadResource, KernelResource, KernelResourceContents, KernelResourceList, KernelTool,
     KernelToolResult, McpError, McpResult, McpServerLike, ServerNotification,
 };
 use kaijutsu_kernel::Kernel;
@@ -234,15 +235,24 @@ struct LocalMock {
         dyn Fn(KernelCallParams) -> BoxFuture<'static, McpResult<KernelToolResult>> + Send + Sync,
     >,
     notif_tx: broadcast::Sender<ServerNotification>,
+    /// Resources advertised by `list_resources` (Phase 3).
+    resources: std::sync::Mutex<Vec<KernelResource>>,
+    /// URI → contents map returned by `read_resource`.
+    resource_contents: std::sync::Mutex<std::collections::HashMap<String, KernelResourceContents>>,
+    /// URIs this mock considers currently subscribed.
+    subscribed: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl LocalMock {
     fn new(id: &str) -> Self {
-        let (notif_tx, _) = broadcast::channel(4);
+        let (notif_tx, _) = broadcast::channel(64);
         Self {
             id: InstanceId::new(id),
             on_call: Arc::new(|_p| Box::pin(async { Ok(KernelToolResult::text("ok")) })),
             notif_tx,
+            resources: std::sync::Mutex::new(Vec::new()),
+            resource_contents: std::sync::Mutex::new(std::collections::HashMap::new()),
+            subscribed: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -253,6 +263,34 @@ impl LocalMock {
     {
         self.on_call = Arc::new(move |p| Box::pin(f(p)));
         self
+    }
+
+    fn with_text_resource(self, uri: &str, text: &str) -> Self {
+        self.resources.lock().unwrap().push(KernelResource {
+            instance: self.id.clone(),
+            uri: uri.to_string(),
+            name: uri.to_string(),
+            description: None,
+            mime_type: Some("text/plain".to_string()),
+            size: Some(text.len() as u64),
+        });
+        self.resource_contents.lock().unwrap().insert(
+            uri.to_string(),
+            KernelResourceContents::Text {
+                uri: uri.to_string(),
+                mime_type: Some("text/plain".to_string()),
+                text: text.to_string(),
+            },
+        );
+        self
+    }
+
+    fn sender(&self) -> broadcast::Sender<ServerNotification> {
+        self.notif_tx.clone()
+    }
+
+    fn is_subscribed(&self, uri: &str) -> bool {
+        self.subscribed.lock().unwrap().contains(uri)
     }
 }
 
@@ -282,6 +320,33 @@ impl McpServerLike for LocalMock {
 
     fn notifications(&self) -> broadcast::Receiver<ServerNotification> {
         self.notif_tx.subscribe()
+    }
+
+    async fn list_resources(&self, _ctx: &CallContext) -> McpResult<KernelResourceList> {
+        Ok(KernelResourceList {
+            resources: self.resources.lock().unwrap().clone(),
+        })
+    }
+
+    async fn read_resource(
+        &self,
+        uri: &str,
+        _ctx: &CallContext,
+    ) -> McpResult<KernelReadResource> {
+        match self.resource_contents.lock().unwrap().get(uri).cloned() {
+            Some(c) => Ok(KernelReadResource { contents: vec![c] }),
+            None => Err(McpError::Protocol(format!("no such uri: {uri}"))),
+        }
+    }
+
+    async fn subscribe(&self, uri: &str, _ctx: &CallContext) -> McpResult<()> {
+        self.subscribed.lock().unwrap().insert(uri.to_string());
+        Ok(())
+    }
+
+    async fn unsubscribe(&self, uri: &str, _ctx: &CallContext) -> McpResult<()> {
+        self.subscribed.lock().unwrap().remove(uri);
+        Ok(())
     }
 }
 
@@ -431,6 +496,146 @@ async fn server_notification_reaches_llm_hydrator() {
     assert!(text.contains("instance=\"test.hydrator\""));
     assert!(text.contains("kind=\"tool_added\""));
     assert!(text.contains("tool=\"fail\""));
+}
+
+/// Phase 3 M4 end-to-end: `Broker::read_resource` + `Broker::subscribe`
+/// + pump `ResourceUpdated` burst → coalesced child block under the root
+/// resource block → LLM hydrator sees the `<resource>` XML envelope →
+/// `clear_binding` unsubscribes cleanly.
+///
+/// Mirrors the Phase 2 `server_notification_reaches_llm_hydrator` pattern
+/// but exercises every Phase 3 decision in one test:
+///
+///   read_resource → root BlockKind::Resource (exit #1, D-41 read path)
+///     └─► subscribe + push 25 ResourceUpdated events
+///           └─► coalescer (D-45: max_in_window=0) + per-URI key (D-40)
+///                 └─► schedule_resource_flush fires exactly once
+///                       └─► re-read + insert_resource_block_as with parent
+///                             └─► child BlockKind::Resource (exit #2, #3, D-43)
+///     └─► clear_binding
+///           └─► broker walks subscriptions, calls server.unsubscribe (exit #4, D-44)
+///     └─► hydrate_from_blocks
+///           └─► user message with `<resource instance="…" uri="…">` envelope (D-34)
+#[tokio::test]
+async fn resource_updated_threads_child_block_and_llm_sees_it() {
+    let fx = setup().await;
+
+    let mock_id = InstanceId::new("test.resource");
+    let binding = ContextToolBinding::with_instances(vec![mock_id.clone()]);
+    fx.kernel.broker().set_binding(fx.ctx_id, binding).await;
+
+    let mock = Arc::new(LocalMock::new(mock_id.as_str()).with_text_resource(
+        "file:///note.md",
+        "initial body",
+    ));
+    let tx = mock.sender();
+    let mock_handle = mock.clone();
+    fx.kernel
+        .broker()
+        .register_silently(mock, InstancePolicy::default())
+        .await
+        .expect("register should succeed");
+
+    let mut call_ctx = CallContext::new(
+        fx.exec_ctx.principal_id,
+        fx.ctx_id,
+        SessionId::new(),
+        KernelId::new(),
+    );
+    call_ctx.cwd = Some("/".into());
+
+    // Exit #1: initial read emits a root Resource block in the context.
+    let read_result = fx
+        .kernel
+        .broker()
+        .read_resource(&mock_id, "file:///note.md", &call_ctx)
+        .await
+        .expect("read_resource");
+    assert_eq!(read_result.contents.len(), 1);
+
+    let root_blocks = fx
+        .store
+        .query_blocks(
+            fx.ctx_id,
+            &BlockFilter {
+                kinds: vec![BlockKind::Resource],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(root_blocks.len(), 1, "expected one root resource block");
+    let root_id = root_blocks[0].id;
+    assert!(root_blocks[0].parent_id.is_none());
+
+    // Subscribe, then push a burst of updates. D-45 routes every event into
+    // the flush window; D-40 keeps the URI window isolated.
+    fx.kernel
+        .broker()
+        .subscribe(&mock_id, "file:///note.md", &call_ctx)
+        .await
+        .expect("subscribe");
+    assert!(mock_handle.is_subscribed("file:///note.md"));
+
+    for _ in 0..25 {
+        tx.send(ServerNotification::ResourceUpdated {
+            uri: "file:///note.md".to_string(),
+        })
+        .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    // Exits #2 + #3: the burst must produce exactly one additional child
+    // resource block parented to the root.
+    let all_resource_blocks = fx
+        .store
+        .query_blocks(
+            fx.ctx_id,
+            &BlockFilter {
+                kinds: vec![BlockKind::Resource],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        all_resource_blocks.len(),
+        2,
+        "expected root + exactly one coalesced child; got {all_resource_blocks:?}",
+    );
+    let child = all_resource_blocks
+        .iter()
+        .find(|b| b.parent_id == Some(root_id))
+        .expect("child block must exist under root");
+    assert_eq!(
+        child.resource.as_ref().unwrap().parent_resource_block_id,
+        Some(root_id),
+    );
+
+    // D-34: the LLM hydrator must surface both the root and child as
+    // `<resource>` envelope user messages.
+    let all_blocks = fx
+        .store
+        .query_blocks(fx.ctx_id, &BlockFilter::default())
+        .unwrap();
+    let msgs = hydrate_from_blocks(&all_blocks);
+    let resource_envelopes: Vec<&str> = msgs
+        .iter()
+        .filter_map(|m| m.as_text())
+        .filter(|t| t.contains("<resource ") && t.contains("</resource>"))
+        .collect();
+    assert!(
+        resource_envelopes.len() >= 2,
+        "expected at least one envelope per Resource block; got {resource_envelopes:?}",
+    );
+    let joined = resource_envelopes.join("\n");
+    assert!(joined.contains("instance=\"test.resource\""));
+    assert!(joined.contains("uri=\"file:///note.md\""));
+
+    // Exit #4: clear_binding must unsubscribe cleanly on the server side.
+    fx.kernel.broker().clear_binding(&fx.ctx_id).await;
+    assert!(
+        !mock_handle.is_subscribed("file:///note.md"),
+        "clear_binding must tear down live subscriptions",
+    );
 }
 
 // Silence unused-import / Duration warnings if future edits remove the

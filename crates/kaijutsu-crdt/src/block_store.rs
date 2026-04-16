@@ -655,6 +655,45 @@ impl BlockStore {
         Ok(id)
     }
 
+    /// Insert a resource block (MCP resource read-through — Phase 3, D-43).
+    ///
+    /// `parent_id` is `None` for the initial read (root block) and `Some(root)`
+    /// for subscription-update children emitted by the broker on
+    /// `ServerNotification::ResourceUpdated` flush. Callers are responsible for
+    /// keeping `payload.parent_resource_block_id` in sync with `parent_id`.
+    pub fn insert_resource_block(
+        &mut self,
+        parent_id: Option<&BlockId>,
+        after: Option<&BlockId>,
+        payload: &kaijutsu_types::ResourcePayload,
+        summary: impl Into<String>,
+    ) -> Result<BlockId> {
+        let id = self.new_block_id();
+
+        if let Some(after_id) = after
+            && (!self.blocks.contains_key(after_id) || self.blocks[after_id].is_deleted())
+        {
+            return Err(CrdtError::InvalidReference(*after_id));
+        }
+        if let Some(pid) = parent_id
+            && (!self.blocks.contains_key(pid) || self.blocks[pid].is_deleted())
+        {
+            return Err(CrdtError::InvalidReference(*pid));
+        }
+
+        let order_key = self.calc_order_key(after);
+        let snap = BlockSnapshot::resource_block(
+            id,
+            parent_id.copied(),
+            payload.clone(),
+            summary,
+        );
+        let block = BlockContent::from_snapshot(&snap, self.agent_id, order_key);
+        self.blocks.insert(id, block);
+        self.version += 1;
+        Ok(id)
+    }
+
     /// Insert a block from a complete snapshot (for remote sync / restore).
     pub fn insert_from_snapshot(
         &mut self,

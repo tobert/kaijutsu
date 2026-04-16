@@ -504,6 +504,7 @@ impl BlockDocument {
             file_path: None,    // Legacy document doesn't track file_path
             error,
             notification: None, // Legacy document predates notification blocks
+            resource: None,     // Legacy document predates resource blocks
             content_type: ContentType::Plain, // Legacy document predates content_type
             content_type_at: 0,               // Legacy document predates content_type
             order_key: None,                  // Legacy document uses DTE-backed ordering

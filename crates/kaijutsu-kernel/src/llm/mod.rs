@@ -1034,11 +1034,12 @@ pub fn hydrate_from_blocks(blocks: &[kaijutsu_types::BlockSnapshot]) -> Vec<Mess
         if block.role == BlockRole::Asset {
             continue;
         }
-        // Skip System blocks unless they're Drift, Error, or Notification (D-34)
+        // Skip System blocks unless they're Drift, Error, Notification, or Resource (D-34)
         if block.role == BlockRole::System
             && block.kind != BlockKind::Drift
             && block.kind != BlockKind::Error
             && block.kind != BlockKind::Notification
+            && block.kind != BlockKind::Resource
         {
             continue;
         }
@@ -1047,6 +1048,7 @@ pub fn hydrate_from_blocks(blocks: &[kaijutsu_types::BlockSnapshot]) -> Vec<Mess
             && block.kind != BlockKind::ToolResult
             && block.kind != BlockKind::Error
             && block.kind != BlockKind::Notification
+            && block.kind != BlockKind::Resource
         {
             continue;
         }
@@ -1209,6 +1211,15 @@ pub fn hydrate_from_blocks(blocks: &[kaijutsu_types::BlockSnapshot]) -> Vec<Mess
                 // Notification blocks (D-34): surface broker tool/log events to the
                 // LLM as a user message so the model sees tool-world changes.
                 let envelope = kaijutsu_types::format_notification_for_llm(block);
+                state.flush_all();
+                state.messages.push(Message::user(envelope));
+            }
+            (_, BlockKind::Resource) => {
+                // Resource blocks (D-34, D-43): surface MCP resource contents to
+                // the LLM as a user message with an XML envelope so the model sees
+                // the read-through body (truncated per
+                // RESOURCE_CONTENT_HYDRATION_BUDGET).
+                let envelope = kaijutsu_types::format_resource_for_llm(block);
                 state.flush_all();
                 state.messages.push(Message::user(envelope));
             }

@@ -604,6 +604,7 @@ pub fn build_distillation_prompt(
             BlockKind::File => " (file)",
             BlockKind::Error => " (error)",
             BlockKind::Notification => " (notification)",
+            BlockKind::Resource => " (resource)",
             BlockKind::Text => "",
         };
 

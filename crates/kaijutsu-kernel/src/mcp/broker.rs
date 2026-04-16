@@ -15,7 +15,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use kaijutsu_types::{ContextId, NotificationPayload};
+use std::collections::HashSet;
+
+use kaijutsu_types::{BlockId, ContextId, NotificationPayload, ResourcePayload};
 use tokio::sync::{Mutex, RwLock, Semaphore, broadcast};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -28,15 +30,17 @@ use super::hook_table::HookTables;
 use super::policy::InstancePolicy;
 use super::server_like::{McpServerLike, ServerNotification};
 use super::types::{
-    InstanceId, KernelCallParams, KernelNotification, KernelTool, KernelToolResult, LogLevel,
-    NotifKind,
+    InstanceId, KernelCallParams, KernelNotification, KernelReadResource, KernelResourceContents,
+    KernelResourceList, KernelTool, KernelToolResult, LogLevel, NotifKind,
 };
 use crate::block_store::SharedBlockStore;
 
 /// Default notification channel capacity.
 const NOTIF_CAPACITY: usize = 256;
 
-type FlushKey = (InstanceId, NotifKind);
+/// Flush-timer key. `uri` is `Some(...)` for `NotifKind::ResourceUpdated`
+/// (per-URI coalescing, D-40); `None` for Log / PromptsChanged.
+type FlushKey = (InstanceId, NotifKind, Option<String>);
 
 pub struct Broker {
     instances: RwLock<HashMap<InstanceId, Arc<dyn McpServerLike>>>,
@@ -61,6 +65,14 @@ pub struct Broker {
     /// Last-seen tool list per instance, used to diff ToolsChanged into
     /// per-tool ToolAdded/ToolRemoved emissions (D-35).
     tool_snapshots: Mutex<HashMap<InstanceId, Vec<KernelTool>>>,
+    /// Phase 3 (D-44): live resource subscriptions tied to `ContextToolBinding`.
+    /// `clear_binding` / `unregister` walk this table and call
+    /// `server.unsubscribe` on each matching entry.
+    subscriptions: Mutex<HashMap<ContextId, HashSet<(InstanceId, String)>>>,
+    /// Phase 3 (D-43): parent block id for each subscribed resource. Used
+    /// when `ResourceUpdated` fires: the re-read emits a child resource
+    /// block threaded under the initial read.
+    resource_parents: Mutex<HashMap<(ContextId, InstanceId, String), BlockId>>,
 }
 
 impl Default for Broker {
@@ -90,6 +102,8 @@ impl Broker {
             pump_handles: Mutex::new(HashMap::new()),
             flush_timers: Mutex::new(HashMap::new()),
             tool_snapshots: Mutex::new(HashMap::new()),
+            subscriptions: Mutex::new(HashMap::new()),
+            resource_parents: Mutex::new(HashMap::new()),
         }
     }
 
@@ -188,6 +202,54 @@ impl Broker {
         Ok(())
     }
 
+    /// Walk `subscriptions` and call `server.unsubscribe` on every entry
+    /// that points at `instance` (Phase 3 M3). Tolerates errors — the server
+    /// may already be down. Also drops matching rows from `resource_parents`.
+    async fn teardown_subscriptions_for_instance(
+        self: &Arc<Self>,
+        instance: &InstanceId,
+        server: Option<&Arc<dyn McpServerLike>>,
+    ) {
+        // Collect (context_id, uri) pairs we need to tear down, then drop
+        // the lock before awaiting on the server.
+        let to_teardown: Vec<(ContextId, String)> = {
+            let mut subs = self.subscriptions.lock().await;
+            let mut hits = Vec::new();
+            for (ctx, set) in subs.iter_mut() {
+                let matching: Vec<String> = set
+                    .iter()
+                    .filter(|(i, _)| i == instance)
+                    .map(|(_, uri)| uri.clone())
+                    .collect();
+                for uri in &matching {
+                    hits.push((*ctx, uri.clone()));
+                }
+                set.retain(|(i, _)| i != instance);
+            }
+            subs.retain(|_, set| !set.is_empty());
+            hits
+        };
+        // Drop parent-block entries regardless of whether unsubscribe succeeds.
+        self.resource_parents
+            .lock()
+            .await
+            .retain(|(_, i, _), _| i != instance);
+        if let Some(server) = server {
+            for (ctx_id, uri) in to_teardown {
+                let sys = CallContext::system_for_context(ctx_id);
+                if let Err(e) = server.unsubscribe(&uri, &sys).await {
+                    tracing::debug!(
+                        context_id = %ctx_id,
+                        instance = %instance,
+                        uri = %uri,
+                        error = ?e,
+                        "unsubscribe during unregister failed (best-effort)",
+                    );
+                }
+            }
+        }
+    }
+
     pub async fn unregister(self: &Arc<Self>, id: &InstanceId) -> McpResult<()> {
         // Abort the pump first so no new events slip through during teardown.
         if let Some(handle) = self.pump_handles.lock().await.remove(id) {
@@ -199,7 +261,7 @@ impl Broker {
             .lock()
             .await
             .keys()
-            .filter(|(i, _)| i == id)
+            .filter(|(i, _, _)| i == id)
             .cloned()
             .collect();
         for key in flush_keys {
@@ -211,6 +273,14 @@ impl Broker {
         // Pull the last-seen tool snapshot so we can emit per-tool
         // ToolRemoved events (D-35).
         let removed_tools = self.tool_snapshots.lock().await.remove(id).unwrap_or_default();
+
+        // Tear down any live subscriptions that point at this instance before
+        // the server arc is dropped (Phase 3 M3, D-44). Done while the server
+        // is still reachable in `self.instances` so the server can process
+        // the unsubscribe calls.
+        let server_arc = self.instances.read().await.get(id).cloned();
+        self.teardown_subscriptions_for_instance(id, server_arc.as_ref())
+            .await;
 
         self.instances.write().await.remove(id);
         self.policies.write().await.remove(id);
@@ -253,7 +323,34 @@ impl Broker {
         self.bindings.write().await.insert(context_id, binding);
     }
 
+    /// Drop a binding. D-44: walk any live subscriptions for this context
+    /// and best-effort unsubscribe on each server. Subscription drops are
+    /// not replayed by CRDT — they are a live side effect.
     pub async fn clear_binding(&self, context_id: &ContextId) {
+        // Drain the subscription set for this context.
+        let pending = self.subscriptions.lock().await.remove(context_id);
+        if let Some(set) = pending {
+            let system_ctx = CallContext::system_for_context(*context_id);
+            for (instance, uri) in set {
+                let server = self.instances.read().await.get(&instance).cloned();
+                if let Some(server) = server
+                    && let Err(e) = server.unsubscribe(&uri, &system_ctx).await
+                {
+                    tracing::debug!(
+                        context_id = %context_id,
+                        instance = %instance,
+                        uri = %uri,
+                        error = ?e,
+                        "unsubscribe during clear_binding failed (best-effort)",
+                    );
+                }
+            }
+        }
+        // Drop any parent-block entries for this context.
+        self.resource_parents
+            .lock()
+            .await
+            .retain(|(ctx, _, _), _| ctx != context_id);
         self.bindings.write().await.remove(context_id);
     }
 
@@ -419,6 +516,126 @@ impl Broker {
         Ok(result)
     }
 
+    // ── Resource dispatch (Phase 3 M3) ─────────────────────────────────
+
+    /// Resolve a live instance by id, returning `InstanceNotFound` otherwise.
+    async fn resolve_instance(
+        &self,
+        instance: &InstanceId,
+    ) -> McpResult<Arc<dyn McpServerLike>> {
+        self.instances
+            .read()
+            .await
+            .get(instance)
+            .cloned()
+            .ok_or_else(|| McpError::InstanceNotFound(instance.clone()))
+    }
+
+    /// List resources advertised by `instance`.
+    pub async fn list_resources(
+        &self,
+        instance: &InstanceId,
+        ctx: &CallContext,
+    ) -> McpResult<KernelResourceList> {
+        let server = self.resolve_instance(instance).await?;
+        server.list_resources(ctx).await
+    }
+
+    /// Read a single resource by URI and emit a root `BlockKind::Resource`
+    /// block into the calling context (exit #1). Records the new block id in
+    /// `resource_parents` so a future `ResourceUpdated` flush can emit child
+    /// blocks parented to this one (D-43).
+    pub async fn read_resource(
+        &self,
+        instance: &InstanceId,
+        uri: &str,
+        ctx: &CallContext,
+    ) -> McpResult<KernelReadResource> {
+        let server = self.resolve_instance(instance).await?;
+        let result = server.read_resource(uri, ctx).await?;
+
+        // Emit a root Resource block for the read. Only the first content
+        // chunk drives the block payload; additional chunks are rare (rmcp's
+        // `ReadResourceResult.contents` is Vec-shaped). If a server returns
+        // zero chunks, synthesize an empty text body so the block still
+        // surfaces.
+        if let Some(docs) = self.documents.read().await.clone() {
+            let payload = resource_payload_from_contents(
+                instance,
+                uri,
+                result.contents.first(),
+                None,
+            );
+            let summary = payload.summary_line();
+            match docs.insert_resource_block_as(
+                ctx.context_id,
+                None,
+                &payload,
+                summary,
+                Some(kaijutsu_types::PrincipalId::system()),
+            ) {
+                Ok(block_id) => {
+                    self.resource_parents.lock().await.insert(
+                        (ctx.context_id, instance.clone(), uri.to_string()),
+                        block_id,
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        context_id = %ctx.context_id,
+                        instance = %instance,
+                        uri = %uri,
+                        error = ?e,
+                        "failed to emit root resource block",
+                    );
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    /// Subscribe this context to `uri` updates on `instance`. Idempotent at
+    /// the caller layer: the HashSet dedupes repeated calls, but the
+    /// underlying server call runs on every invocation (servers that track
+    /// their own idempotency will no-op).
+    pub async fn subscribe(
+        &self,
+        instance: &InstanceId,
+        uri: &str,
+        ctx: &CallContext,
+    ) -> McpResult<()> {
+        let server = self.resolve_instance(instance).await?;
+        server.subscribe(uri, ctx).await?;
+        self.subscriptions
+            .lock()
+            .await
+            .entry(ctx.context_id)
+            .or_default()
+            .insert((instance.clone(), uri.to_string()));
+        Ok(())
+    }
+
+    /// Tear down a previously-created subscription. Idempotent: a second
+    /// call with the same (instance, uri) is a no-op on the broker's table
+    /// and delegates to the server (which may also no-op).
+    pub async fn unsubscribe(
+        &self,
+        instance: &InstanceId,
+        uri: &str,
+        ctx: &CallContext,
+    ) -> McpResult<()> {
+        let server = self.resolve_instance(instance).await?;
+        server.unsubscribe(uri, ctx).await?;
+        if let Some(set) = self.subscriptions.lock().await.get_mut(&ctx.context_id) {
+            set.remove(&(instance.clone(), uri.to_string()));
+        }
+        self.resource_parents
+            .lock()
+            .await
+            .remove(&(ctx.context_id, instance.clone(), uri.to_string()));
+        Ok(())
+    }
+
     /// Accessor for the (empty in Phase 1) hook tables.
     pub fn hooks(&self) -> &RwLock<HookTables> {
         &self.hooks
@@ -466,15 +683,18 @@ impl Broker {
         }
     }
 
-    /// Schedule a `flush` timer for `(instance, kind)` if none is pending.
-    /// When the timer elapses, it calls `coalescer.flush()` and emits a
-    /// single Coalesced summary notification block per bound context.
+    /// Schedule a `flush` timer for `(instance, kind, uri)` if none is
+    /// pending. When the timer elapses, it calls `coalescer.flush()` and
+    /// emits a single Coalesced summary notification block per bound context.
+    /// `uri` is `Some(...)` for `NotifKind::ResourceUpdated` (D-40); `None`
+    /// for Log / PromptsChanged.
     async fn schedule_flush(
         self: &Arc<Self>,
         instance: InstanceId,
         kind: NotifKind,
+        uri: Option<String>,
     ) {
-        let key = (instance.clone(), kind);
+        let key = (instance.clone(), kind, uri.clone());
         let mut timers = self.flush_timers.lock().await;
         if timers.contains_key(&key) {
             return;
@@ -482,9 +702,14 @@ impl Broker {
         let window = self.coalescer.policy().window;
         let broker = Arc::clone(self);
         let instance_for_task = instance.clone();
+        let uri_for_task = uri.clone();
         let handle = tokio::spawn(async move {
             tokio::time::sleep(window).await;
-            if let Some(count) = broker.coalescer.flush(&instance_for_task, kind) {
+            if let Some(count) = broker.coalescer.flush(
+                &instance_for_task,
+                kind,
+                uri_for_task.as_deref(),
+            ) {
                 let payload = NotificationPayload {
                     instance: instance_for_task.as_str().to_string(),
                     kind: kaijutsu_types::NotificationKind::Coalesced,
@@ -495,7 +720,54 @@ impl Broker {
                 };
                 broker.emit_for_bindings(&instance_for_task, payload).await;
             }
-            broker.flush_timers.lock().await.remove(&(instance_for_task, kind));
+            broker
+                .flush_timers
+                .lock()
+                .await
+                .remove(&(instance_for_task, kind, uri_for_task));
+        });
+        timers.insert(key, handle);
+    }
+
+    /// Schedule a window-flush timer for `ResourceUpdated` on `(instance, uri)`
+    /// (Phase 3 M3, D-43). When the window elapses, the broker re-reads the
+    /// URI once and emits a child `BlockKind::Resource` block per subscribed
+    /// context. `Broker::coalescer::flush` is called for bookkeeping (clears
+    /// the window); the coalesced count is unused because the re-read result
+    /// itself stands in for the "N updates happened" signal.
+    async fn schedule_resource_flush(
+        self: &Arc<Self>,
+        instance: InstanceId,
+        uri: String,
+    ) {
+        let key = (
+            instance.clone(),
+            NotifKind::ResourceUpdated,
+            Some(uri.clone()),
+        );
+        let mut timers = self.flush_timers.lock().await;
+        if timers.contains_key(&key) {
+            return;
+        }
+        let window = self.coalescer.policy().window;
+        let broker = Arc::clone(self);
+        let instance_for_task = instance.clone();
+        let uri_for_task = uri.clone();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(window).await;
+            // Clear the coalescer window; the return value (count) is only
+            // interesting for telemetry — the re-read itself is what we emit.
+            let _ = broker.coalescer.flush(
+                &instance_for_task,
+                NotifKind::ResourceUpdated,
+                Some(uri_for_task.as_str()),
+            );
+            handle_resource_flush(&broker, &instance_for_task, &uri_for_task).await;
+            broker.flush_timers.lock().await.remove(&(
+                instance_for_task,
+                NotifKind::ResourceUpdated,
+                Some(uri_for_task),
+            ));
         });
         timers.insert(key, handle);
     }
@@ -514,7 +786,7 @@ async fn pump_loop(
                 handle_tools_changed(&broker, &id).await;
             }
             Ok(ServerNotification::Log { level, message, tool }) => {
-                match broker.coalescer.observe(&id, NotifKind::Log) {
+                match broker.coalescer.observe(&id, NotifKind::Log, None) {
                     ObserveOutcome::PassThrough => {
                         let payload = NotificationPayload {
                             instance: id.as_str().to_string(),
@@ -527,7 +799,9 @@ async fn pump_loop(
                         broker.emit_for_bindings(&id, payload).await;
                     }
                     ObserveOutcome::StartWindow => {
-                        broker.schedule_flush(id.clone(), NotifKind::Log).await;
+                        broker
+                            .schedule_flush(id.clone(), NotifKind::Log, None)
+                            .await;
                     }
                     ObserveOutcome::Coalesced { .. } => {
                         // Already counted inside the coalescer; timer pending.
@@ -535,7 +809,10 @@ async fn pump_loop(
                 }
             }
             Ok(ServerNotification::PromptsChanged) => {
-                match broker.coalescer.observe(&id, NotifKind::PromptsChanged) {
+                match broker
+                    .coalescer
+                    .observe(&id, NotifKind::PromptsChanged, None)
+                {
                     ObserveOutcome::PassThrough => {
                         let payload = NotificationPayload {
                             instance: id.as_str().to_string(),
@@ -549,14 +826,35 @@ async fn pump_loop(
                     }
                     ObserveOutcome::StartWindow => {
                         broker
-                            .schedule_flush(id.clone(), NotifKind::PromptsChanged)
+                            .schedule_flush(id.clone(), NotifKind::PromptsChanged, None)
                             .await;
                     }
                     ObserveOutcome::Coalesced { .. } => {}
                 }
             }
-            Ok(ServerNotification::ResourceUpdated { .. }) => {
-                // Phase 3: routed into BlockKind::Resource; dropped in Phase 2.
+            Ok(ServerNotification::ResourceUpdated { uri }) => {
+                // D-45: default policy sets max_in_window=0 for ResourceUpdated,
+                // so the first event always returns StartWindow. PassThrough
+                // is unreachable under the default policy; if a custom policy
+                // raises the cap we just re-read synchronously the same way.
+                match broker.coalescer.observe(
+                    &id,
+                    NotifKind::ResourceUpdated,
+                    Some(uri.as_str()),
+                ) {
+                    ObserveOutcome::PassThrough => {
+                        handle_resource_flush(&broker, &id, &uri).await;
+                    }
+                    ObserveOutcome::StartWindow => {
+                        broker
+                            .schedule_resource_flush(id.clone(), uri.clone())
+                            .await;
+                    }
+                    ObserveOutcome::Coalesced { .. } => {
+                        // Already counted; the pending flush timer will fire
+                        // one re-read per (instance, uri) window.
+                    }
+                }
             }
             Ok(ServerNotification::Elicitation(_)) => {
                 // Reserved per D-25; no live handling yet.
@@ -605,6 +903,145 @@ async fn handle_tools_changed(broker: &Arc<Broker>, id: &InstanceId) {
             detail: None,
         };
         broker.emit_for_bindings(id, payload).await;
+    }
+}
+
+/// D-43 flush body: re-read the URI on behalf of every subscribed context
+/// and emit a child `BlockKind::Resource` block under the original read. On
+/// re-read failure, emit a single `Log { level: Warn }` notification under
+/// the same parent instead of a fake Resource block.
+async fn handle_resource_flush(broker: &Arc<Broker>, id: &InstanceId, uri: &str) {
+    let server = match broker.instances.read().await.get(id).cloned() {
+        Some(s) => s,
+        None => return,
+    };
+    // Snapshot the (context, parent_block) pairs we need to emit into.
+    let targets: Vec<(ContextId, BlockId)> = {
+        let parents = broker.resource_parents.lock().await;
+        let subs = broker.subscriptions.lock().await;
+        subs.iter()
+            .filter_map(|(ctx_id, set)| {
+                if set.contains(&(id.clone(), uri.to_string())) {
+                    parents
+                        .get(&(*ctx_id, id.clone(), uri.to_string()))
+                        .copied()
+                        .map(|b| (*ctx_id, b))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+    if targets.is_empty() {
+        return;
+    }
+    let docs = match broker.documents.read().await.clone() {
+        Some(d) => d,
+        None => return,
+    };
+
+    for (ctx_id, parent_block) in targets {
+        let sys = CallContext::system_for_context(ctx_id);
+        match server.read_resource(uri, &sys).await {
+            Ok(result) => {
+                let payload = resource_payload_from_contents(
+                    id,
+                    uri,
+                    result.contents.first(),
+                    Some(parent_block),
+                );
+                let summary = payload.summary_line();
+                if let Err(e) = docs.insert_resource_block_as(
+                    ctx_id,
+                    Some(&parent_block),
+                    &payload,
+                    summary,
+                    Some(kaijutsu_types::PrincipalId::system()),
+                ) {
+                    tracing::warn!(
+                        context_id = %ctx_id,
+                        instance = %id,
+                        uri = %uri,
+                        error = ?e,
+                        "failed to emit child resource block",
+                    );
+                }
+            }
+            Err(e) => {
+                // D-43 failure path: emit a Log notification child under the
+                // same parent so the failure is visible, never a fake
+                // Resource block with empty contents.
+                let payload = NotificationPayload {
+                    instance: id.as_str().to_string(),
+                    kind: kaijutsu_types::NotificationKind::Log,
+                    level: Some(kaijutsu_types::LogLevel::Warn),
+                    tool: None,
+                    count: None,
+                    detail: Some(format!("re-read of {} failed: {:?}", uri, e)),
+                };
+                let summary = payload.summary_line();
+                if let Err(ee) = docs.insert_notification_block_as(
+                    ctx_id,
+                    Some(&parent_block),
+                    &payload,
+                    summary,
+                    Some(kaijutsu_types::PrincipalId::system()),
+                ) {
+                    tracing::warn!(
+                        context_id = %ctx_id,
+                        instance = %id,
+                        uri = %uri,
+                        error = ?ee,
+                        "failed to emit fallback Log notification",
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Build a `ResourcePayload` from the first `KernelResourceContents` chunk
+/// of a `read_resource` result. Missing contents → empty-text payload so the
+/// block still surfaces.
+fn resource_payload_from_contents(
+    instance: &InstanceId,
+    uri: &str,
+    chunk: Option<&KernelResourceContents>,
+    parent_resource_block_id: Option<BlockId>,
+) -> ResourcePayload {
+    match chunk {
+        Some(KernelResourceContents::Text { mime_type, text, .. }) => ResourcePayload {
+            instance: instance.as_str().to_string(),
+            uri: uri.to_string(),
+            mime_type: mime_type.clone(),
+            size: Some(text.len() as u64),
+            text: Some(text.clone()),
+            blob_base64: None,
+            parent_resource_block_id,
+        },
+        Some(KernelResourceContents::Blob {
+            mime_type, blob_base64, ..
+        }) => {
+            let bytes = blob_base64.len().saturating_mul(3) / 4;
+            ResourcePayload {
+                instance: instance.as_str().to_string(),
+                uri: uri.to_string(),
+                mime_type: mime_type.clone(),
+                size: Some(bytes as u64),
+                text: None,
+                blob_base64: Some(blob_base64.clone()),
+                parent_resource_block_id,
+            }
+        }
+        None => ResourcePayload {
+            instance: instance.as_str().to_string(),
+            uri: uri.to_string(),
+            mime_type: None,
+            size: Some(0),
+            text: Some(String::new()),
+            blob_base64: None,
+            parent_resource_block_id,
+        },
     }
 }
 
@@ -769,6 +1206,68 @@ mod tests {
             tool: tool.to_string(),
             arguments: json!({}),
         }
+    }
+
+    // ── Phase 3 M2: trait defaults for resource methods ───────────────
+
+    /// A minimal `McpServerLike` that does NOT override the resource
+    /// methods. Used to prove the trait default returns `Unsupported`.
+    struct BareServer {
+        id: InstanceId,
+        notif_tx: broadcast::Sender<ServerNotification>,
+    }
+
+    impl BareServer {
+        fn new(id: &str) -> Self {
+            let (notif_tx, _) = broadcast::channel(8);
+            Self {
+                id: InstanceId::new(id),
+                notif_tx,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl McpServerLike for BareServer {
+        fn instance_id(&self) -> &InstanceId {
+            &self.id
+        }
+        async fn list_tools(&self, _ctx: &CallContext) -> McpResult<Vec<KernelTool>> {
+            Ok(vec![])
+        }
+        async fn call_tool(
+            &self,
+            _params: KernelCallParams,
+            _ctx: &CallContext,
+            _cancel: CancellationToken,
+        ) -> McpResult<KernelToolResult> {
+            Ok(KernelToolResult::default())
+        }
+        fn notifications(&self) -> broadcast::Receiver<ServerNotification> {
+            self.notif_tx.subscribe()
+        }
+    }
+
+    #[tokio::test]
+    async fn default_resource_methods_return_unsupported() {
+        let s = BareServer::new("bare");
+        let ctx = CallContext::test();
+        assert!(matches!(
+            s.list_resources(&ctx).await,
+            Err(McpError::Unsupported)
+        ));
+        assert!(matches!(
+            s.read_resource("file:///x", &ctx).await,
+            Err(McpError::Unsupported)
+        ));
+        assert!(matches!(
+            s.subscribe("file:///x", &ctx).await,
+            Err(McpError::Unsupported)
+        ));
+        assert!(matches!(
+            s.unsubscribe("file:///x", &ctx).await,
+            Err(McpError::Unsupported)
+        ));
     }
 
     #[tokio::test]
@@ -1189,12 +1688,15 @@ mod tests {
                     window: Duration::from_millis(100),
                     max_in_window: 20,
                     hard_drop_after: None,
+                    per_kind_override: HashMap::new(),
                 })),
                 notif_tx,
                 documents: RwLock::new(None),
                 pump_handles: Mutex::new(HashMap::new()),
                 flush_timers: Mutex::new(HashMap::new()),
                 tool_snapshots: Mutex::new(HashMap::new()),
+                subscriptions: Mutex::new(HashMap::new()),
+                resource_parents: Mutex::new(HashMap::new()),
             }
         });
         let store = shared_block_store(PrincipalId::system());
@@ -1303,10 +1805,12 @@ mod tests {
         );
     }
 
-    /// ResourceUpdated is dropped in Phase 2 (Phase 3 routes it to
-    /// `BlockKind::Resource`).
     #[tokio::test]
-    async fn resource_updated_is_dropped_in_phase_2() {
+    /// Phase 3 (D-44): ResourceUpdated without a live subscription emits
+    /// nothing. The flush body walks `subscriptions`, finds no matching
+    /// `(ctx, instance, uri)` entry, and returns silently. Locks the
+    /// "subscription is the trigger, not the notification" contract.
+    async fn resource_updated_without_subscription_emits_nothing() {
         let (broker, store, ctx) = wired_broker().await;
         bind(&broker, ctx, "svc").await;
         let server = Arc::new(MockServer::new("svc").with_tool("t"));
@@ -1321,10 +1825,18 @@ mod tests {
                 uri: "file:///whatever".into(),
             });
         }
-        sleep(Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(700)).await;
         assert!(
             notifications_in(&store, ctx).is_empty(),
-            "ResourceUpdated should be silently dropped in Phase 2"
+            "no Notification blocks — no subscription exists",
+        );
+        let filter = BlockFilter {
+            kinds: vec![kaijutsu_types::BlockKind::Resource],
+            ..Default::default()
+        };
+        assert!(
+            store.query_blocks(ctx, &filter).unwrap().is_empty(),
+            "no Resource blocks either — no subscription exists",
         );
     }
 
@@ -1344,12 +1856,15 @@ mod tests {
                     window: Duration::from_millis(500),
                     max_in_window: 2,
                     hard_drop_after: None,
+                    per_kind_override: HashMap::new(),
                 })),
                 notif_tx,
                 documents: RwLock::new(None),
                 pump_handles: Mutex::new(HashMap::new()),
                 flush_timers: Mutex::new(HashMap::new()),
                 tool_snapshots: Mutex::new(HashMap::new()),
+                subscriptions: Mutex::new(HashMap::new()),
+                resource_parents: Mutex::new(HashMap::new()),
             }
         });
         let store = shared_block_store(PrincipalId::system());
@@ -1394,6 +1909,464 @@ mod tests {
         assert_eq!(
             coalesced, 0,
             "unregister should have aborted the flush timer; got {coalesced} orphan Coalesced blocks in {notifs:?}"
+        );
+    }
+
+    // ── Phase 3 M3: resource dispatch + subscription lifecycle ───────
+
+    use crate::mcp::KernelResource;
+    use crate::mcp::KernelResourceContents;
+    use crate::mcp::KernelResourceList;
+    use crate::mcp::KernelReadResource;
+    use std::collections::HashSet as StdHashSet;
+
+    /// Test fake that implements the resource surface on top of `MockServer`.
+    /// Tests push resources/contents into interior-mutable fields; the server
+    /// returns them on read. `read_fails` makes `read_resource` return an
+    /// error to exercise the D-43 failure path.
+    struct ResourceMock {
+        id: InstanceId,
+        resources: std::sync::Mutex<Vec<KernelResource>>,
+        contents: std::sync::Mutex<
+            std::collections::HashMap<String, KernelResourceContents>,
+        >,
+        subscribed: std::sync::Mutex<StdHashSet<String>>,
+        unsubscribed: std::sync::Mutex<Vec<String>>,
+        read_fails: std::sync::Mutex<bool>,
+        notif_tx: broadcast::Sender<ServerNotification>,
+    }
+
+    impl ResourceMock {
+        fn new(id: &str) -> Self {
+            let (notif_tx, _) = broadcast::channel(64);
+            Self {
+                id: InstanceId::new(id),
+                resources: std::sync::Mutex::new(Vec::new()),
+                contents: std::sync::Mutex::new(std::collections::HashMap::new()),
+                subscribed: std::sync::Mutex::new(StdHashSet::new()),
+                unsubscribed: std::sync::Mutex::new(Vec::new()),
+                read_fails: std::sync::Mutex::new(false),
+                notif_tx,
+            }
+        }
+
+        fn with_text_resource(self, uri: &str, text: &str) -> Self {
+            self.resources.lock().unwrap().push(KernelResource {
+                instance: self.id.clone(),
+                uri: uri.to_string(),
+                name: uri.to_string(),
+                description: None,
+                mime_type: Some("text/plain".to_string()),
+                size: Some(text.len() as u64),
+            });
+            self.contents.lock().unwrap().insert(
+                uri.to_string(),
+                KernelResourceContents::Text {
+                    uri: uri.to_string(),
+                    mime_type: Some("text/plain".to_string()),
+                    text: text.to_string(),
+                },
+            );
+            self
+        }
+
+        fn sender(&self) -> broadcast::Sender<ServerNotification> {
+            self.notif_tx.clone()
+        }
+
+        fn make_read_fail(&self, v: bool) {
+            *self.read_fails.lock().unwrap() = v;
+        }
+
+        fn was_subscribed(&self, uri: &str) -> bool {
+            self.subscribed.lock().unwrap().contains(uri)
+        }
+
+        fn unsubscribed_uris(&self) -> Vec<String> {
+            self.unsubscribed.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl McpServerLike for ResourceMock {
+        fn instance_id(&self) -> &InstanceId {
+            &self.id
+        }
+        async fn list_tools(&self, _ctx: &CallContext) -> McpResult<Vec<KernelTool>> {
+            Ok(vec![])
+        }
+        async fn call_tool(
+            &self,
+            _params: KernelCallParams,
+            _ctx: &CallContext,
+            _cancel: CancellationToken,
+        ) -> McpResult<KernelToolResult> {
+            Ok(KernelToolResult::default())
+        }
+        fn notifications(&self) -> broadcast::Receiver<ServerNotification> {
+            self.notif_tx.subscribe()
+        }
+        async fn list_resources(&self, _ctx: &CallContext) -> McpResult<KernelResourceList> {
+            Ok(KernelResourceList {
+                resources: self.resources.lock().unwrap().clone(),
+            })
+        }
+        async fn read_resource(
+            &self,
+            uri: &str,
+            _ctx: &CallContext,
+        ) -> McpResult<KernelReadResource> {
+            if *self.read_fails.lock().unwrap() {
+                return Err(McpError::Protocol("simulated re-read failure".to_string()));
+            }
+            match self.contents.lock().unwrap().get(uri).cloned() {
+                Some(c) => Ok(KernelReadResource { contents: vec![c] }),
+                None => Err(McpError::Protocol(format!("no such uri: {uri}"))),
+            }
+        }
+        async fn subscribe(&self, uri: &str, _ctx: &CallContext) -> McpResult<()> {
+            self.subscribed.lock().unwrap().insert(uri.to_string());
+            Ok(())
+        }
+        async fn unsubscribe(&self, uri: &str, _ctx: &CallContext) -> McpResult<()> {
+            self.subscribed.lock().unwrap().remove(uri);
+            self.unsubscribed.lock().unwrap().push(uri.to_string());
+            Ok(())
+        }
+    }
+
+    fn resource_blocks_in(
+        store: &SharedBlockStore,
+        ctx: ContextId,
+    ) -> Vec<kaijutsu_types::BlockSnapshot> {
+        let filter = BlockFilter {
+            kinds: vec![kaijutsu_types::BlockKind::Resource],
+            ..Default::default()
+        };
+        store.query_blocks(ctx, &filter).unwrap_or_default()
+    }
+
+    /// Exit criterion #1: read_resource emits a root BlockKind::Resource block.
+    #[tokio::test]
+    async fn read_resource_emits_block_in_context() {
+        let (broker, store, ctx) = wired_broker().await;
+        bind(&broker, ctx, "res").await;
+        let server = Arc::new(ResourceMock::new("res").with_text_resource("file:///a", "hi"));
+        broker
+            .register(server, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        let mut call_ctx = CallContext::test();
+        call_ctx.context_id = ctx;
+        let result = broker
+            .read_resource(&InstanceId::new("res"), "file:///a", &call_ctx)
+            .await
+            .unwrap();
+        assert_eq!(result.contents.len(), 1);
+
+        let blocks = resource_blocks_in(&store, ctx);
+        assert_eq!(blocks.len(), 1, "expected exactly one Resource block");
+        let payload = blocks[0].resource.as_ref().unwrap();
+        assert_eq!(payload.uri, "file:///a");
+        assert_eq!(payload.instance, "res");
+        assert_eq!(payload.text.as_deref(), Some("hi"));
+        assert!(blocks[0].parent_id.is_none(), "root read has no parent");
+    }
+
+    /// Exit criterion #2: ResourceUpdated produces a child block under the root.
+    #[tokio::test]
+    async fn resource_updated_emits_child_block_under_parent() {
+        let (broker, store, ctx) = wired_broker().await;
+        bind(&broker, ctx, "res").await;
+        let server = Arc::new(
+            ResourceMock::new("res").with_text_resource("file:///a", "initial"),
+        );
+        let tx = server.sender();
+        broker
+            .register(server, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        let mut call_ctx = CallContext::test();
+        call_ctx.context_id = ctx;
+        broker
+            .read_resource(&InstanceId::new("res"), "file:///a", &call_ctx)
+            .await
+            .unwrap();
+        broker
+            .subscribe(&InstanceId::new("res"), "file:///a", &call_ctx)
+            .await
+            .unwrap();
+
+        // Fire a single ResourceUpdated; default policy (D-45) opens a window
+        // immediately. Wait past the window for the flush timer + re-read.
+        tx.send(ServerNotification::ResourceUpdated {
+            uri: "file:///a".to_string(),
+        })
+        .unwrap();
+        sleep(Duration::from_millis(700)).await;
+
+        let blocks = resource_blocks_in(&store, ctx);
+        assert_eq!(
+            blocks.len(),
+            2,
+            "expected root + one child Resource block; got {blocks:?}"
+        );
+        let root = blocks.iter().find(|b| b.parent_id.is_none()).unwrap();
+        let child = blocks.iter().find(|b| b.parent_id.is_some()).unwrap();
+        assert_eq!(child.parent_id, Some(root.id));
+        assert_eq!(
+            child.resource.as_ref().unwrap().parent_resource_block_id,
+            Some(root.id),
+        );
+    }
+
+    /// Exit criterion #3: a burst collapses to exactly one child block per window (D-45).
+    #[tokio::test]
+    async fn resource_updated_burst_coalesces_to_one_child() {
+        let (broker, store, ctx) = wired_broker().await;
+        bind(&broker, ctx, "res").await;
+        let server = Arc::new(
+            ResourceMock::new("res").with_text_resource("file:///a", "initial"),
+        );
+        let tx = server.sender();
+        broker
+            .register(server, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        let mut call_ctx = CallContext::test();
+        call_ctx.context_id = ctx;
+        broker
+            .read_resource(&InstanceId::new("res"), "file:///a", &call_ctx)
+            .await
+            .unwrap();
+        broker
+            .subscribe(&InstanceId::new("res"), "file:///a", &call_ctx)
+            .await
+            .unwrap();
+
+        // Fire 25 updates within ~50ms (well under the 500ms default window).
+        for _ in 0..25 {
+            tx.send(ServerNotification::ResourceUpdated {
+                uri: "file:///a".to_string(),
+            })
+            .unwrap();
+        }
+        sleep(Duration::from_millis(700)).await;
+
+        let blocks = resource_blocks_in(&store, ctx);
+        // 1 root + 1 flush-emitted child = 2 total.
+        assert_eq!(
+            blocks.len(),
+            2,
+            "expected root + exactly one child from burst; got {blocks:?}"
+        );
+    }
+
+    /// D-40: per-URI windows track independently — two URIs produce two children.
+    #[tokio::test]
+    async fn two_uris_coalesce_independently() {
+        let (broker, store, ctx) = wired_broker().await;
+        bind(&broker, ctx, "res").await;
+        let server = Arc::new(
+            ResourceMock::new("res")
+                .with_text_resource("file:///a", "A")
+                .with_text_resource("file:///b", "B"),
+        );
+        let tx = server.sender();
+        broker
+            .register(server, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        let mut call_ctx = CallContext::test();
+        call_ctx.context_id = ctx;
+        broker
+            .read_resource(&InstanceId::new("res"), "file:///a", &call_ctx)
+            .await
+            .unwrap();
+        broker
+            .read_resource(&InstanceId::new("res"), "file:///b", &call_ctx)
+            .await
+            .unwrap();
+        broker
+            .subscribe(&InstanceId::new("res"), "file:///a", &call_ctx)
+            .await
+            .unwrap();
+        broker
+            .subscribe(&InstanceId::new("res"), "file:///b", &call_ctx)
+            .await
+            .unwrap();
+
+        for _ in 0..5 {
+            tx.send(ServerNotification::ResourceUpdated {
+                uri: "file:///a".to_string(),
+            })
+            .unwrap();
+            tx.send(ServerNotification::ResourceUpdated {
+                uri: "file:///b".to_string(),
+            })
+            .unwrap();
+        }
+        sleep(Duration::from_millis(700)).await;
+
+        let blocks = resource_blocks_in(&store, ctx);
+        // 2 roots + 2 flush-emitted children (one per URI) = 4 total.
+        assert_eq!(blocks.len(), 4, "expected 2 roots + 2 children");
+        let children: Vec<_> = blocks.iter().filter(|b| b.parent_id.is_some()).collect();
+        assert_eq!(children.len(), 2);
+        let child_uris: StdHashSet<String> = children
+            .iter()
+            .map(|b| b.resource.as_ref().unwrap().uri.clone())
+            .collect();
+        assert!(child_uris.contains("file:///a"));
+        assert!(child_uris.contains("file:///b"));
+    }
+
+    /// Exit criterion #4: clear_binding unsubscribes every live URI cleanly.
+    #[tokio::test]
+    async fn clear_binding_unsubscribes_all_uris() {
+        let (broker, _store, ctx) = wired_broker().await;
+        bind(&broker, ctx, "res").await;
+        let server = Arc::new(
+            ResourceMock::new("res")
+                .with_text_resource("file:///a", "A")
+                .with_text_resource("file:///b", "B")
+                .with_text_resource("file:///c", "C"),
+        );
+        let server_handle = server.clone();
+        broker
+            .register(server, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        let mut call_ctx = CallContext::test();
+        call_ctx.context_id = ctx;
+        for uri in ["file:///a", "file:///b", "file:///c"] {
+            broker
+                .subscribe(&InstanceId::new("res"), uri, &call_ctx)
+                .await
+                .unwrap();
+        }
+        assert!(server_handle.was_subscribed("file:///a"));
+        assert!(server_handle.was_subscribed("file:///b"));
+        assert!(server_handle.was_subscribed("file:///c"));
+
+        broker.clear_binding(&ctx).await;
+
+        assert!(!server_handle.was_subscribed("file:///a"));
+        assert!(!server_handle.was_subscribed("file:///b"));
+        assert!(!server_handle.was_subscribed("file:///c"));
+        let unsubs = server_handle.unsubscribed_uris();
+        assert_eq!(unsubs.len(), 3, "each uri unsubscribed once");
+    }
+
+    /// R2 / D-44: unregister tears down subscriptions even if clear_binding
+    /// was never called.
+    #[tokio::test]
+    async fn unregister_unsubscribes_bound_contexts() {
+        let (broker, _store, ctx) = wired_broker().await;
+        bind(&broker, ctx, "res").await;
+        let server = Arc::new(
+            ResourceMock::new("res").with_text_resource("file:///x", "X"),
+        );
+        let server_handle = server.clone();
+        broker
+            .register(server, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        let mut call_ctx = CallContext::test();
+        call_ctx.context_id = ctx;
+        broker
+            .subscribe(&InstanceId::new("res"), "file:///x", &call_ctx)
+            .await
+            .unwrap();
+        assert!(server_handle.was_subscribed("file:///x"));
+
+        broker.unregister(&InstanceId::new("res")).await.unwrap();
+
+        assert!(!server_handle.was_subscribed("file:///x"));
+        // The subscription table must no longer carry this entry.
+        let subs = broker.subscriptions.lock().await;
+        assert!(
+            subs.get(&ctx).map(|s| s.is_empty()).unwrap_or(true),
+            "subscriptions should be empty for ctx after unregister"
+        );
+    }
+
+    /// D-43 failure path: a failing re-read emits a Log notification under
+    /// the parent Resource block, not a fake Resource block.
+    #[tokio::test]
+    async fn failed_reread_emits_log_not_resource() {
+        let (broker, store, ctx) = wired_broker().await;
+        bind(&broker, ctx, "res").await;
+        let server = Arc::new(
+            ResourceMock::new("res").with_text_resource("file:///a", "initial"),
+        );
+        let server_handle = server.clone();
+        let tx = server.sender();
+        broker
+            .register(server, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        let mut call_ctx = CallContext::test();
+        call_ctx.context_id = ctx;
+        broker
+            .read_resource(&InstanceId::new("res"), "file:///a", &call_ctx)
+            .await
+            .unwrap();
+        broker
+            .subscribe(&InstanceId::new("res"), "file:///a", &call_ctx)
+            .await
+            .unwrap();
+
+        // Flip the mock to fail re-reads, then trigger an update.
+        server_handle.make_read_fail(true);
+        tx.send(ServerNotification::ResourceUpdated {
+            uri: "file:///a".to_string(),
+        })
+        .unwrap();
+        sleep(Duration::from_millis(700)).await;
+
+        let resource_blocks = resource_blocks_in(&store, ctx);
+        assert_eq!(
+            resource_blocks.len(),
+            1,
+            "only the initial read; no fake Resource child on failure",
+        );
+        let root = resource_blocks[0].id;
+
+        // The failure must surface as a Log notification under the parent.
+        let notifs = notifications_in(&store, ctx);
+        let log_children: Vec<_> = notifs
+            .iter()
+            .filter(|n| n.kind == kaijutsu_types::NotificationKind::Log)
+            .collect();
+        assert_eq!(
+            log_children.len(),
+            1,
+            "expected one Warn Log notification; got {notifs:?}",
+        );
+        assert_eq!(log_children[0].level, Some(kaijutsu_types::LogLevel::Warn));
+        // Confirm the Log block's parent_id is the original Resource root.
+        let filter = BlockFilter {
+            kinds: vec![kaijutsu_types::BlockKind::Notification],
+            ..Default::default()
+        };
+        let blocks = store.query_blocks(ctx, &filter).unwrap();
+        assert!(
+            blocks
+                .iter()
+                .any(|b| b.parent_id == Some(root)
+                    && b.notification
+                        .as_ref()
+                        .map(|p| p.kind == kaijutsu_types::NotificationKind::Log)
+                        .unwrap_or(false)),
+            "Log notification must be threaded under the Resource root",
         );
     }
 }

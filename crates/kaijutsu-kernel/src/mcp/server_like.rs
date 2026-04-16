@@ -9,10 +9,10 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use super::context::CallContext;
-use super::error::McpResult;
+use super::error::{McpError, McpResult};
 use super::types::{
-    ElicitationRequest, Health, InstanceId, KernelCallParams, KernelTool, KernelToolResult,
-    LogLevel,
+    ElicitationRequest, Health, InstanceId, KernelCallParams, KernelReadResource, KernelResourceList,
+    KernelTool, KernelToolResult, LogLevel,
 };
 
 /// Fan-out notification from a server instance.
@@ -58,6 +58,33 @@ pub trait McpServerLike: Send + Sync + 'static {
     /// does NOT guarantee anything subscribes; in Phase 1 the broker creates
     /// these receivers but nothing reads them (D-32).
     fn notifications(&self) -> broadcast::Receiver<ServerNotification>;
+
+    /// List resources this server advertises (Phase 3). Default is
+    /// `Unsupported`; servers that expose resources override.
+    async fn list_resources(&self, _ctx: &CallContext) -> McpResult<KernelResourceList> {
+        Err(McpError::Unsupported)
+    }
+
+    /// Read a single resource by URI (Phase 3).
+    async fn read_resource(
+        &self,
+        _uri: &str,
+        _ctx: &CallContext,
+    ) -> McpResult<KernelReadResource> {
+        Err(McpError::Unsupported)
+    }
+
+    /// Subscribe to update notifications for a resource URI (Phase 3).
+    /// Idempotent at the caller's layer; the broker tracks per-context
+    /// subscription state and calls `unsubscribe` on binding drop (D-44).
+    async fn subscribe(&self, _uri: &str, _ctx: &CallContext) -> McpResult<()> {
+        Err(McpError::Unsupported)
+    }
+
+    /// Tear down a subscription previously created via `subscribe`.
+    async fn unsubscribe(&self, _uri: &str, _ctx: &CallContext) -> McpResult<()> {
+        Err(McpError::Unsupported)
+    }
 
     async fn health(&self) -> Health {
         Health::Ready
