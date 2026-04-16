@@ -25,8 +25,9 @@ use tokio_util::sync::CancellationToken;
 use super::binding::{ContextToolBinding, ResolvedName};
 use super::coalescer::{NotificationCoalescer, ObserveOutcome};
 use super::context::CallContext;
-use super::error::{McpError, McpResult, PolicyError};
-use super::hook_table::HookTables;
+use super::error::{HookId, McpError, McpResult, PolicyError};
+use super::hook_table::{HookAction, HookBody, HookPhase, HookTables};
+use super::hooks_builtin::BuiltinHookRegistry;
 use super::policy::InstancePolicy;
 use super::server_like::{McpServerLike, ServerNotification};
 use super::types::{
@@ -37,6 +38,59 @@ use crate::block_store::SharedBlockStore;
 
 /// Default notification channel capacity.
 const NOTIF_CAPACITY: usize = 256;
+
+/// Max `HookAction::Invoke` depth per tokio task (§4.3, D-29, D-47).
+/// The counter lives in a task-local `Cell<u32>`; `enter_hook_depth`
+/// increments on entry, a drop guard decrements on exit (surviving panic
+/// unwind). Recursion that would exceed this cap returns
+/// `McpError::HookRecursionLimit`.
+pub(crate) const MAX_HOOK_DEPTH: u32 = 4;
+
+tokio::task_local! {
+    static HOOK_DEPTH: std::cell::Cell<u32>;
+}
+
+#[cfg(test)]
+pub(crate) static HOOK_DEPTH_OVERRIDE: std::sync::OnceLock<u32> =
+    std::sync::OnceLock::new();
+
+fn max_hook_depth() -> u32 {
+    #[cfg(test)]
+    {
+        HOOK_DEPTH_OVERRIDE.get().copied().unwrap_or(MAX_HOOK_DEPTH)
+    }
+    #[cfg(not(test))]
+    {
+        MAX_HOOK_DEPTH
+    }
+}
+
+struct HookDepthGuard;
+impl Drop for HookDepthGuard {
+    fn drop(&mut self) {
+        // `try_with` returns Err outside the scope; safe to ignore in that
+        // case (the guard has outlived its scope — impossible via the
+        // public API, but robust against future refactors).
+        let _ = HOOK_DEPTH.try_with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+/// Increment the per-task hook depth counter. Returns a guard that
+/// decrements on drop (including panic unwind). `McpError::HookRecursionLimit`
+/// if the increment would exceed the cap.
+fn enter_hook_depth() -> McpResult<HookDepthGuard> {
+    let current = HOOK_DEPTH.try_with(|d| d.get()).unwrap_or(0);
+    let next = current.saturating_add(1);
+    if next > max_hook_depth() {
+        return Err(McpError::HookRecursionLimit { depth: next });
+    }
+    // Best-effort: if the scope isn't installed (caller bypassed
+    // `call_tool`), the guard won't have anything to decrement — acceptable
+    // because the only path that increments is the call_tool → evaluate_phase
+    // → Invoke arm, and call_tool installs the scope.
+    let _ = HOOK_DEPTH.try_with(|d| d.set(next));
+    Ok(HookDepthGuard)
+}
 
 /// Flush-timer key. `uri` is `Some(...)` for `NotifKind::ResourceUpdated`
 /// (per-URI coalescing, D-40); `None` for Log / PromptsChanged.
@@ -73,6 +127,10 @@ pub struct Broker {
     /// when `ResourceUpdated` fires: the re-read emits a child resource
     /// block threaded under the initial read.
     resource_parents: Mutex<HashMap<(ContextId, InstanceId, String), BlockId>>,
+    /// Phase 4 (D-50): named builtin hook registry. Admin RPC looks up hook
+    /// bodies by name so the wire never carries `Arc<dyn Hook>`. Frozen
+    /// after construction.
+    builtin_hooks: BuiltinHookRegistry,
 }
 
 impl Default for Broker {
@@ -104,11 +162,18 @@ impl Broker {
             tool_snapshots: Mutex::new(HashMap::new()),
             subscriptions: Mutex::new(HashMap::new()),
             resource_parents: Mutex::new(HashMap::new()),
+            builtin_hooks: BuiltinHookRegistry::new(),
         }
     }
 
     pub fn coalescer(&self) -> &Arc<NotificationCoalescer> {
         &self.coalescer
+    }
+
+    /// Named builtin hook factories (D-50). The admin surface
+    /// (`BuiltinHooksServer`) looks hooks up here by string name.
+    pub fn builtin_hooks(&self) -> &BuiltinHookRegistry {
+        &self.builtin_hooks
     }
 
     pub fn notifications(&self) -> broadcast::Receiver<KernelNotification> {
@@ -437,8 +502,34 @@ impl Broker {
         Ok(out)
     }
 
-    /// The one tool-call pipeline. Phase 1 skips hook evaluation (tables
-    /// empty) and has no notification emission.
+    /// The one tool-call pipeline. Phase 4 wires hook evaluation at three
+    /// pinch points: `PreCall` before the server call, `PostCall` on success,
+    /// `OnError` on failure. ShortCircuit in any phase bypasses the server
+    /// (or converts an error to a success in OnError). Deny terminates with
+    /// `McpError::Denied { by_hook }`.
+    ///
+    /// Outer wrapper installs the per-task `HOOK_DEPTH` scope on first
+    /// entry, reuses it on recursive re-entry from hook bodies so the depth
+    /// counter survives `broker.call_tool(...)` calls from inside an
+    /// `Invoke` body (D-47).
+    pub async fn call_tool(
+        &self,
+        params: KernelCallParams,
+        ctx: &CallContext,
+        cancel: CancellationToken,
+    ) -> McpResult<KernelToolResult> {
+        if HOOK_DEPTH.try_with(|_| ()).is_ok() {
+            self.call_tool_inner(params, ctx, cancel).await
+        } else {
+            HOOK_DEPTH
+                .scope(
+                    std::cell::Cell::new(0),
+                    self.call_tool_inner(params, ctx, cancel),
+                )
+                .await
+        }
+    }
+
     #[tracing::instrument(
         name = "broker.call_tool",
         skip(self, ctx, cancel),
@@ -449,7 +540,7 @@ impl Broker {
             principal.id = %ctx.principal_id,
         )
     )]
-    pub async fn call_tool(
+    async fn call_tool_inner(
         &self,
         params: KernelCallParams,
         ctx: &CallContext,
@@ -490,8 +581,38 @@ impl Broker {
             None => None,
         };
 
+        // PreCall — may short-circuit the call entirely, or deny it outright.
+        match self.evaluate_phase(HookPhase::PreCall, &params, ctx).await? {
+            PhaseOutcome::Continue => {}
+            PhaseOutcome::ShortCircuit { hook_id, result } => {
+                emit_short_circuit_attribution(HookPhase::PreCall, &hook_id);
+                // PostCall still runs on short-circuit per §4.3 evaluation law
+                // — it observes that a (synthetic) result was produced.
+                // Result can itself short-circuit or deny.
+                return match self
+                    .evaluate_phase(HookPhase::PostCall, &params, ctx)
+                    .await?
+                {
+                    PhaseOutcome::Continue => Ok(result),
+                    PhaseOutcome::ShortCircuit { hook_id, result: r2 } => {
+                        emit_short_circuit_attribution(HookPhase::PostCall, &hook_id);
+                        Ok(r2)
+                    }
+                    PhaseOutcome::Deny { hook_id, reason } => {
+                        emit_deny_attribution(HookPhase::PostCall, &hook_id, &reason);
+                        Err(McpError::Denied { by_hook: hook_id })
+                    }
+                };
+            }
+            PhaseOutcome::Deny { hook_id, reason } => {
+                emit_deny_attribution(HookPhase::PreCall, &hook_id, &reason);
+                return Err(McpError::Denied { by_hook: hook_id });
+            }
+        }
+
         let instance_for_timeout = params.instance.clone();
         let timeout_ms = policy.call_timeout.as_millis() as u64;
+        let call_params_for_hooks = params.clone();
         let call_fut = async {
             let span = tracing::info_span!(
                 "server.call_tool",
@@ -502,27 +623,223 @@ impl Broker {
             server.call_tool(params, ctx, cancel).await
         };
 
-        let result = tokio::time::timeout(policy.call_timeout, call_fut)
+        let call_result = tokio::time::timeout(policy.call_timeout, call_fut)
             .await
             .map_err(|_| {
                 McpError::Policy(PolicyError::Timeout {
                     instance: instance_for_timeout.clone(),
                     timeout_ms,
                 })
-            })??;
+            });
 
-        // Crude result-size check — sum textual content. Structured payloads
-        // are JSON; serialized len is the size proxy.
-        let size = estimate_result_size(&result);
-        if size > policy.max_result_bytes {
-            return Err(McpError::Policy(PolicyError::ResultTooLarge {
-                instance: instance_for_timeout,
-                size,
-                max: policy.max_result_bytes,
-            }));
+        match call_result {
+            Ok(Ok(result)) => {
+                // Size check — pathological output must not OOM the kernel
+                // regardless of hook posture. Treat as an error path so
+                // OnError hooks get a chance to observe / convert.
+                let size = estimate_result_size(&result);
+                if size > policy.max_result_bytes {
+                    let err = McpError::Policy(PolicyError::ResultTooLarge {
+                        instance: instance_for_timeout,
+                        size,
+                        max: policy.max_result_bytes,
+                    });
+                    return self
+                        .run_on_error_then_err(&call_params_for_hooks, ctx, err)
+                        .await;
+                }
+                match self
+                    .evaluate_phase(HookPhase::PostCall, &call_params_for_hooks, ctx)
+                    .await?
+                {
+                    PhaseOutcome::Continue => Ok(result),
+                    PhaseOutcome::ShortCircuit { hook_id, result: r2 } => {
+                        emit_short_circuit_attribution(HookPhase::PostCall, &hook_id);
+                        Ok(r2)
+                    }
+                    PhaseOutcome::Deny { hook_id, reason } => {
+                        emit_deny_attribution(HookPhase::PostCall, &hook_id, &reason);
+                        Err(McpError::Denied { by_hook: hook_id })
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                self.run_on_error_then_err(&call_params_for_hooks, ctx, e)
+                    .await
+            }
+            Err(timeout_err) => {
+                self.run_on_error_then_err(&call_params_for_hooks, ctx, timeout_err)
+                    .await
+            }
         }
+    }
 
-        Ok(result)
+    /// Run `OnError` and return either a short-circuited success (converting
+    /// the error) or the original error. `Deny` on the error path still
+    /// returns `McpError::Denied { by_hook }` — a denial overrides the
+    /// original error in the attribution channel.
+    async fn run_on_error_then_err(
+        &self,
+        params: &KernelCallParams,
+        ctx: &CallContext,
+        err: McpError,
+    ) -> McpResult<KernelToolResult> {
+        match self.evaluate_phase(HookPhase::OnError, params, ctx).await {
+            Ok(PhaseOutcome::Continue) => Err(err),
+            Ok(PhaseOutcome::ShortCircuit { hook_id, result }) => {
+                emit_short_circuit_attribution(HookPhase::OnError, &hook_id);
+                Ok(result)
+            }
+            Ok(PhaseOutcome::Deny { hook_id, reason }) => {
+                emit_deny_attribution(HookPhase::OnError, &hook_id, &reason);
+                Err(McpError::Denied { by_hook: hook_id })
+            }
+            Err(eval_err) => {
+                tracing::warn!(
+                    error = ?eval_err,
+                    "on_error evaluation failed; returning original error",
+                );
+                Err(err)
+            }
+        }
+    }
+
+    /// Evaluate one hook phase against a call site. Snapshots the matching
+    /// entries under a short read-lock on `hooks`, drops the guard before any
+    /// awaits, then walks matches in priority order (ascending, insertion-
+    /// tiebreak) applying each action. Terminal actions (`ShortCircuit`,
+    /// `Deny`) stop the walk; `Log`, `Invoke-Ok` continue. `Invoke-Err`
+    /// terminates the phase as `Deny` with the hook's error text as reason.
+    ///
+    /// Carve-out: calls on `builtin.hooks` are never hook-evaluated. A user
+    /// who registers a PreCall Deny matching `*` would otherwise lock
+    /// themselves out of `hook_remove` — the admin surface needs to remain
+    /// callable so recovery without a kernel restart is possible. All other
+    /// builtin instances go through the pipeline normally.
+    async fn evaluate_phase(
+        &self,
+        phase: HookPhase,
+        params: &KernelCallParams,
+        ctx: &CallContext,
+    ) -> McpResult<PhaseOutcome> {
+        if params.instance.as_str() == "builtin.hooks" {
+            return Ok(PhaseOutcome::Continue);
+        }
+        // Snapshot matching entries + their indices so the sort is stable
+        // across priority ties (the HashTable::entries Vec is the
+        // authoritative insertion order).
+        let snapshot: Vec<(usize, super::hook_table::HookEntry)> = {
+            let guard = self.hooks.read().await;
+            let table = match phase {
+                HookPhase::PreCall => &guard.pre_call,
+                HookPhase::PostCall => &guard.post_call,
+                HookPhase::OnError => &guard.on_error,
+                HookPhase::OnNotification => &guard.on_notification,
+            };
+            table
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| hook_matches(e, params, ctx))
+                .map(|(i, e)| (i, e.clone()))
+                .collect()
+        };
+        if snapshot.is_empty() {
+            return Ok(PhaseOutcome::Continue);
+        }
+        let mut ordered = snapshot;
+        ordered.sort_by_key(|(idx, e)| (e.priority, *idx));
+
+        for (_idx, entry) in ordered {
+            match entry.action {
+                HookAction::Log(spec) => {
+                    // LogSpec::level is a tracing::Level; dispatch via
+                    // static match since tracing::event! needs a const
+                    // Level.
+                    match spec.level {
+                        tracing::Level::TRACE => tracing::event!(
+                            target: "kaijutsu::hooks",
+                            tracing::Level::TRACE,
+                            hook_id = %entry.id,
+                            phase = ?phase,
+                            instance = %params.instance,
+                            tool = %params.tool,
+                            "{}",
+                            spec.target,
+                        ),
+                        tracing::Level::DEBUG => tracing::event!(
+                            target: "kaijutsu::hooks",
+                            tracing::Level::DEBUG,
+                            hook_id = %entry.id,
+                            phase = ?phase,
+                            instance = %params.instance,
+                            tool = %params.tool,
+                            "{}",
+                            spec.target,
+                        ),
+                        tracing::Level::INFO => tracing::event!(
+                            target: "kaijutsu::hooks",
+                            tracing::Level::INFO,
+                            hook_id = %entry.id,
+                            phase = ?phase,
+                            instance = %params.instance,
+                            tool = %params.tool,
+                            "{}",
+                            spec.target,
+                        ),
+                        tracing::Level::WARN => tracing::event!(
+                            target: "kaijutsu::hooks",
+                            tracing::Level::WARN,
+                            hook_id = %entry.id,
+                            phase = ?phase,
+                            instance = %params.instance,
+                            tool = %params.tool,
+                            "{}",
+                            spec.target,
+                        ),
+                        tracing::Level::ERROR => tracing::event!(
+                            target: "kaijutsu::hooks",
+                            tracing::Level::ERROR,
+                            hook_id = %entry.id,
+                            phase = ?phase,
+                            instance = %params.instance,
+                            tool = %params.tool,
+                            "{}",
+                            spec.target,
+                        ),
+                    }
+                }
+                HookAction::Deny(reason) => {
+                    return Ok(PhaseOutcome::Deny {
+                        hook_id: entry.id,
+                        reason,
+                    });
+                }
+                HookAction::ShortCircuit(result) => {
+                    return Ok(PhaseOutcome::ShortCircuit {
+                        hook_id: entry.id,
+                        result,
+                    });
+                }
+                HookAction::Invoke(body) => match body {
+                    HookBody::Builtin { name, hook } => {
+                        // D-29 / D-47: guard against runaway recursion when
+                        // a hook body re-enters `broker.call_tool`.
+                        let _depth_guard = enter_hook_depth()?;
+                        if let Err(e) = hook.invoke(params, ctx).await {
+                            return Ok(PhaseOutcome::Deny {
+                                hook_id: entry.id,
+                                reason: format!(
+                                    "hook body `{name}` returned error: {e}"
+                                ),
+                            });
+                        }
+                    }
+                    HookBody::Kaish(_) => return Err(McpError::Unsupported),
+                },
+            }
+        }
+        Ok(PhaseOutcome::Continue)
     }
 
     // ── Resource dispatch (Phase 3 M3) ─────────────────────────────────
@@ -694,7 +1011,33 @@ impl Broker {
             return;
         }
         let summary = payload.summary_line();
+        let synth_params = build_notification_synth(instance, &payload);
         for ctx in contexts {
+            // OnNotification (§4.3, post-coalesce, D-47-series). Evaluated
+            // once per bound context so `match_context` semantics are honest.
+            let synth_ctx = CallContext::system_for_context(ctx);
+            match self
+                .evaluate_phase(HookPhase::OnNotification, &synth_params, &synth_ctx)
+                .await
+            {
+                Ok(PhaseOutcome::Continue) => {}
+                Ok(PhaseOutcome::ShortCircuit { hook_id, .. }) => {
+                    emit_short_circuit_attribution(HookPhase::OnNotification, &hook_id);
+                    continue;
+                }
+                Ok(PhaseOutcome::Deny { hook_id, reason }) => {
+                    emit_deny_attribution(HookPhase::OnNotification, &hook_id, &reason);
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        context_id = %ctx,
+                        instance = %instance,
+                        error = ?e,
+                        "on_notification evaluation failed; emitting anyway",
+                    );
+                }
+            }
             if let Err(e) = docs.insert_notification_block_as(
                 ctx,
                 None,
@@ -800,6 +1143,98 @@ impl Broker {
         });
         timers.insert(key, handle);
     }
+}
+
+/// Phase-evaluation result (§4.3).
+#[derive(Debug)]
+enum PhaseOutcome {
+    /// No terminal match; proceed to the next stage.
+    Continue,
+    /// A `ShortCircuit` or `Invoke` body produced a synthesized result that
+    /// replaces the would-be server call (or converts an error into success
+    /// in `OnError`).
+    ShortCircuit {
+        hook_id: HookId,
+        result: KernelToolResult,
+    },
+    /// A `Deny` hook matched. `reason` is tracing-only; the LLM-visible
+    /// error is `McpError::Denied { by_hook }` (D-28 channel discipline).
+    Deny { hook_id: HookId, reason: String },
+}
+
+/// Build a synthetic `KernelCallParams` for OnNotification evaluation. Hook
+/// entries match on `(instance, tool)`; notifications have no tool name, so
+/// we use `__notification.<kind>` as the synthetic tool — users filter with
+/// `match_tool: Some("__notification.log")` or similar. The `__` prefix is
+/// the convention for synthetic names; real instances must not advertise
+/// tools in that namespace.
+fn build_notification_synth(
+    instance: &InstanceId,
+    payload: &NotificationPayload,
+) -> KernelCallParams {
+    KernelCallParams {
+        instance: instance.clone(),
+        tool: format!("__notification.{}", payload.kind.as_str()),
+        arguments: serde_json::json!({
+            "kind": payload.kind.as_str(),
+            "count": payload.count,
+            "level": payload.level.map(|l| format!("{l:?}")),
+            "detail": payload.detail.clone(),
+            "tool": payload.tool.clone(),
+        }),
+    }
+}
+
+/// Predicate for a single hook entry against a call site. Pure (no awaits,
+/// no side effects) — callable while holding a read lock.
+fn hook_matches(
+    entry: &super::hook_table::HookEntry,
+    params: &KernelCallParams,
+    ctx: &CallContext,
+) -> bool {
+    if let Some(g) = &entry.match_instance
+        && !kaish_glob::glob_match(&g.0, params.instance.as_str())
+    {
+        return false;
+    }
+    if let Some(g) = &entry.match_tool
+        && !kaish_glob::glob_match(&g.0, &params.tool)
+    {
+        return false;
+    }
+    if let Some(c) = &entry.match_context
+        && *c != ctx.context_id
+    {
+        return false;
+    }
+    if let Some(p) = &entry.match_principal
+        && *p != ctx.principal_id
+    {
+        return false;
+    }
+    true
+}
+
+/// Tracing attribution for a `ShortCircuit` result — D-49. Event, not a new
+/// span, so the parent `broker.call_tool` span remains the correlation
+/// anchor.
+fn emit_short_circuit_attribution(phase: HookPhase, hook_id: &HookId) {
+    tracing::info!(
+        hook_id = %format!("hook:{hook_id}"),
+        phase = ?phase,
+        "hook.short_circuit",
+    );
+}
+
+/// Tracing attribution for a `Deny` result. The inner `reason` is recorded
+/// here; the LLM only sees `McpError::Denied { by_hook }` (D-28).
+fn emit_deny_attribution(phase: HookPhase, hook_id: &HookId, reason: &str) {
+    tracing::info!(
+        hook_id = %format!("hook:{hook_id}"),
+        phase = ?phase,
+        reason = %reason,
+        "hook.deny",
+    );
 }
 
 /// Long-running task per registered instance. Receives `ServerNotification`
@@ -981,7 +1416,47 @@ async fn handle_resource_flush(broker: &Arc<Broker>, id: &InstanceId, uri: &str)
     match server.read_resource(uri, &sys).await {
         Ok(result) => {
             let chunk = result.contents.first();
+            // OnNotification synth for the success path. Per-context Deny /
+            // ShortCircuit skips emission for that one context.
+            let success_synth = KernelCallParams {
+                instance: id.clone(),
+                tool: "__notification.resource_updated".to_string(),
+                arguments: serde_json::json!({
+                    "uri": uri,
+                }),
+            };
             for (ctx_id, parent_block) in targets {
+                let synth_ctx = CallContext::system_for_context(ctx_id);
+                match broker
+                    .evaluate_phase(HookPhase::OnNotification, &success_synth, &synth_ctx)
+                    .await
+                {
+                    Ok(PhaseOutcome::Continue) => {}
+                    Ok(PhaseOutcome::ShortCircuit { hook_id, .. }) => {
+                        emit_short_circuit_attribution(
+                            HookPhase::OnNotification,
+                            &hook_id,
+                        );
+                        continue;
+                    }
+                    Ok(PhaseOutcome::Deny { hook_id, reason }) => {
+                        emit_deny_attribution(
+                            HookPhase::OnNotification,
+                            &hook_id,
+                            &reason,
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            context_id = %ctx_id,
+                            instance = %id,
+                            uri = %uri,
+                            error = ?e,
+                            "on_notification evaluation failed; emitting anyway",
+                        );
+                    }
+                }
                 let payload =
                     resource_payload_from_contents(id, uri, chunk, Some(parent_block));
                 let summary = payload.summary_line();
@@ -1006,7 +1481,47 @@ async fn handle_resource_flush(broker: &Arc<Broker>, id: &InstanceId, uri: &str)
             // D-43 failure path: one Log notification per subscriber,
             // parented under their own root Resource block.
             let detail = format!("re-read of {} failed: {:?}", uri, e);
+            let fail_synth = KernelCallParams {
+                instance: id.clone(),
+                tool: "__notification.log".to_string(),
+                arguments: serde_json::json!({
+                    "kind": "log",
+                    "level": "warn",
+                    "detail": detail.clone(),
+                }),
+            };
             for (ctx_id, parent_block) in targets {
+                let synth_ctx = CallContext::system_for_context(ctx_id);
+                match broker
+                    .evaluate_phase(HookPhase::OnNotification, &fail_synth, &synth_ctx)
+                    .await
+                {
+                    Ok(PhaseOutcome::Continue) => {}
+                    Ok(PhaseOutcome::ShortCircuit { hook_id, .. }) => {
+                        emit_short_circuit_attribution(
+                            HookPhase::OnNotification,
+                            &hook_id,
+                        );
+                        continue;
+                    }
+                    Ok(PhaseOutcome::Deny { hook_id, reason }) => {
+                        emit_deny_attribution(
+                            HookPhase::OnNotification,
+                            &hook_id,
+                            &reason,
+                        );
+                        continue;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            context_id = %ctx_id,
+                            instance = %id,
+                            uri = %uri,
+                            error = ?err,
+                            "on_notification evaluation failed; emitting anyway",
+                        );
+                    }
+                }
                 let payload = NotificationPayload {
                     instance: id.as_str().to_string(),
                     kind: kaijutsu_types::NotificationKind::Log,
@@ -1733,6 +2248,7 @@ mod tests {
                 tool_snapshots: Mutex::new(HashMap::new()),
                 subscriptions: Mutex::new(HashMap::new()),
                 resource_parents: Mutex::new(HashMap::new()),
+                builtin_hooks: BuiltinHookRegistry::new(),
             }
         });
         let store = shared_block_store(PrincipalId::system());
@@ -1901,6 +2417,7 @@ mod tests {
                 tool_snapshots: Mutex::new(HashMap::new()),
                 subscriptions: Mutex::new(HashMap::new()),
                 resource_parents: Mutex::new(HashMap::new()),
+                builtin_hooks: BuiltinHookRegistry::new(),
             }
         });
         let store = shared_block_store(PrincipalId::system());
@@ -2596,5 +3113,1061 @@ mod tests {
                 "each subscriber gets root + one child from the fan-out; ctx={ctx:?}",
             );
         }
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // Phase 4 (M1) — hook evaluation wiring
+    // ═════════════════════════════════════════════════════════════════════
+
+    use super::super::hook_table::{
+        GlobPattern, HookAction, HookBody, HookEntry, Hook, LogSpec,
+    };
+    use crate::mcp::error::HookId;
+
+    fn hook_id(s: &str) -> HookId {
+        HookId(s.to_string())
+    }
+
+    fn log_hook(id: &str, tool_glob: &str, level: tracing::Level) -> HookEntry {
+        HookEntry {
+            id: hook_id(id),
+            match_instance: None,
+            match_tool: Some(GlobPattern(tool_glob.to_string())),
+            match_context: None,
+            match_principal: None,
+            action: HookAction::Log(LogSpec {
+                target: format!("audit {id}"),
+                level,
+            }),
+            priority: 0,
+        }
+    }
+
+    /// Exit #2: a PreCall Deny blocks a call end-to-end — the server is
+    /// never invoked and the caller sees `McpError::Denied { by_hook }`.
+    #[tokio::test]
+    async fn pre_call_deny_blocks_call() {
+        let broker = Arc::new(Broker::new());
+        let server_invoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = server_invoked.clone();
+        let server = Arc::new(
+            MockServer::new("guarded")
+                .with_tool("do")
+                .on_call(move |_p| {
+                    let f = flag.clone();
+                    async move {
+                        f.store(true, std::sync::atomic::Ordering::SeqCst);
+                        Ok(KernelToolResult::text("server ran"))
+                    }
+                }),
+        );
+        broker
+            .register_silently(server, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        broker.hooks().write().await.pre_call.entries.push(HookEntry {
+            id: hook_id("deny-all"),
+            match_instance: None,
+            match_tool: Some(GlobPattern("*".into())),
+            match_context: None,
+            match_principal: None,
+            action: HookAction::Deny("not today".into()),
+            priority: 0,
+        });
+
+        let err = broker
+            .call_tool(
+                params("guarded", "do"),
+                &CallContext::test(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, McpError::Denied { ref by_hook } if by_hook.0 == "deny-all"),
+            "expected Denied(by_hook=deny-all), got {err:?}",
+        );
+        assert!(
+            !server_invoked.load(std::sync::atomic::Ordering::SeqCst),
+            "server must not have been invoked after a PreCall Deny",
+        );
+    }
+
+    /// Exit #3 (positive companion) + locks ShortCircuit bypass: PreCall
+    /// ShortCircuit must replace the server call with the hook's result
+    /// without invoking the server.
+    #[tokio::test]
+    async fn pre_call_shortcircuit_skips_server() {
+        let broker = Arc::new(Broker::new());
+        let server_invoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = server_invoked.clone();
+        let server = Arc::new(
+            MockServer::new("bypassed")
+                .with_tool("do")
+                .on_call(move |_p| {
+                    let f = flag.clone();
+                    async move {
+                        f.store(true, std::sync::atomic::Ordering::SeqCst);
+                        Ok(KernelToolResult::text("server ran"))
+                    }
+                }),
+        );
+        broker
+            .register_silently(server, InstancePolicy::default())
+            .await
+            .unwrap();
+        broker.hooks().write().await.pre_call.entries.push(HookEntry {
+            id: hook_id("sc"),
+            match_instance: None,
+            match_tool: Some(GlobPattern("*".into())),
+            match_context: None,
+            match_principal: None,
+            action: HookAction::ShortCircuit(KernelToolResult::text("from hook")),
+            priority: 0,
+        });
+
+        let result = broker
+            .call_tool(
+                params("bypassed", "do"),
+                &CallContext::test(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        match result.content.first() {
+            Some(ToolContent::Text(s)) => assert_eq!(s, "from hook"),
+            other => panic!("expected text 'from hook', got {other:?}"),
+        }
+        assert!(
+            !server_invoked.load(std::sync::atomic::Ordering::SeqCst),
+            "server must not be invoked when PreCall ShortCircuits",
+        );
+    }
+
+    /// Locks the "PostCall fires after success" half of §4.3. Uses an
+    /// `Invoke` Hook body to count fires — simplest reliable counter.
+    #[tokio::test]
+    async fn post_call_fires_after_success() {
+        #[derive(Clone)]
+        struct Counter(Arc<std::sync::atomic::AtomicUsize>);
+        #[async_trait]
+        impl Hook for Counter {
+            async fn invoke(
+                &self,
+                _params: &KernelCallParams,
+                _ctx: &CallContext,
+            ) -> McpResult<()> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let broker = Arc::new(Broker::new());
+        let server = Arc::new(MockServer::new("s").with_tool("t"));
+        broker
+            .register_silently(server, InstancePolicy::default())
+            .await
+            .unwrap();
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hook: Arc<dyn Hook> = Arc::new(Counter(counter.clone()));
+        broker.hooks().write().await.post_call.entries.push(HookEntry {
+            id: hook_id("count"),
+            match_instance: None,
+            match_tool: None,
+            match_context: None,
+            match_principal: None,
+            action: HookAction::Invoke(HookBody::Builtin {
+                name: "test.count".into(),
+                hook,
+            }),
+            priority: 0,
+        });
+
+        broker
+            .call_tool(
+                params("s", "t"),
+                &CallContext::test(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "PostCall must fire exactly once after a successful call",
+        );
+    }
+
+    /// OnError fires when the server errors; PostCall does NOT. Uses two
+    /// counters on two phases to distinguish.
+    #[tokio::test]
+    async fn on_error_fires_on_server_error_not_post_call() {
+        #[derive(Clone)]
+        struct Counter(Arc<std::sync::atomic::AtomicUsize>);
+        #[async_trait]
+        impl Hook for Counter {
+            async fn invoke(
+                &self,
+                _params: &KernelCallParams,
+                _ctx: &CallContext,
+            ) -> McpResult<()> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let broker = Arc::new(Broker::new());
+        let server = Arc::new(
+            MockServer::new("sad")
+                .with_tool("fail")
+                .on_call(|p| async move {
+                    Err(McpError::ToolNotFound {
+                        instance: InstanceId::new("sad"),
+                        tool: p.tool,
+                    })
+                }),
+        );
+        broker
+            .register_silently(server, InstancePolicy::default())
+            .await
+            .unwrap();
+        let on_err = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let post = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        broker.hooks().write().await.on_error.entries.push(HookEntry {
+            id: hook_id("err-count"),
+            match_instance: None,
+            match_tool: None,
+            match_context: None,
+            match_principal: None,
+            action: HookAction::Invoke(HookBody::Builtin {
+                name: "test.on_err_count".into(),
+                hook: Arc::new(Counter(on_err.clone())),
+            }),
+            priority: 0,
+        });
+        broker.hooks().write().await.post_call.entries.push(HookEntry {
+            id: hook_id("post-count"),
+            match_instance: None,
+            match_tool: None,
+            match_context: None,
+            match_principal: None,
+            action: HookAction::Invoke(HookBody::Builtin {
+                name: "test.post_count".into(),
+                hook: Arc::new(Counter(post.clone())),
+            }),
+            priority: 0,
+        });
+
+        let err = broker
+            .call_tool(
+                params("sad", "fail"),
+                &CallContext::test(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, McpError::ToolNotFound { .. }));
+        assert_eq!(on_err.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(post.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// §4.3 evaluation law: OnError ShortCircuit converts an error into a
+    /// success result. The LLM sees `Ok(KernelToolResult)`; the original
+    /// error is attribution-only in tracing.
+    #[tokio::test]
+    async fn on_error_shortcircuit_converts_error_to_success() {
+        let broker = Arc::new(Broker::new());
+        let server = Arc::new(
+            MockServer::new("sad")
+                .with_tool("fail")
+                .on_call(|_p| async {
+                    Err(McpError::Protocol("boom".into()))
+                }),
+        );
+        broker
+            .register_silently(server, InstancePolicy::default())
+            .await
+            .unwrap();
+        broker.hooks().write().await.on_error.entries.push(HookEntry {
+            id: hook_id("rescue"),
+            match_instance: None,
+            match_tool: None,
+            match_context: None,
+            match_principal: None,
+            action: HookAction::ShortCircuit(KernelToolResult::text("rescued")),
+            priority: 0,
+        });
+
+        let result = broker
+            .call_tool(
+                params("sad", "fail"),
+                &CallContext::test(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        match result.content.first() {
+            Some(ToolContent::Text(s)) => assert_eq!(s, "rescued"),
+            other => panic!("expected rescue text, got {other:?}"),
+        }
+    }
+
+    /// D-46: `match_instance` and `match_tool` use `kaish_glob::glob_match`
+    /// so `*`/`?` wildcards work without pre-compilation.
+    #[tokio::test]
+    async fn hook_match_instance_and_tool_globs() {
+        let broker = Arc::new(Broker::new());
+        let server = Arc::new(
+            MockServer::new("glob.test")
+                .with_tool("foo")
+                .with_tool("bar"),
+        );
+        broker
+            .register_silently(server, InstancePolicy::default())
+            .await
+            .unwrap();
+        broker.hooks().write().await.pre_call.entries.push(HookEntry {
+            id: hook_id("foo-only"),
+            match_instance: Some(GlobPattern("glob.*".into())),
+            match_tool: Some(GlobPattern("foo".into())),
+            match_context: None,
+            match_principal: None,
+            action: HookAction::Deny("foo is forbidden".into()),
+            priority: 0,
+        });
+
+        let foo_err = broker
+            .call_tool(
+                params("glob.test", "foo"),
+                &CallContext::test(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(foo_err, McpError::Denied { ref by_hook } if by_hook.0 == "foo-only"),
+            "glob.test/foo should match; got {foo_err:?}"
+        );
+
+        let bar_ok = broker
+            .call_tool(
+                params("glob.test", "bar"),
+                &CallContext::test(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!bar_ok.is_error, "bar should not match the hook");
+    }
+
+    /// D-46: `match_context` / `match_principal` use equality, not globs.
+    #[tokio::test]
+    async fn hook_match_context_and_principal_filters() {
+        let broker = Arc::new(Broker::new());
+        let server = Arc::new(MockServer::new("svc").with_tool("t"));
+        broker
+            .register_silently(server, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        let target_ctx = ContextId::new();
+        broker.hooks().write().await.pre_call.entries.push(HookEntry {
+            id: hook_id("ctx-only"),
+            match_instance: None,
+            match_tool: None,
+            match_context: Some(target_ctx),
+            match_principal: None,
+            action: HookAction::Deny("wrong ctx".into()),
+            priority: 0,
+        });
+
+        let mut matching = CallContext::test();
+        matching.context_id = target_ctx;
+        let err = broker
+            .call_tool(params("svc", "t"), &matching, CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, McpError::Denied { .. }));
+
+        let other = CallContext::test();
+        let ok = broker
+            .call_tool(params("svc", "t"), &other, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(!ok.is_error);
+    }
+
+    /// §4.3 evaluation law: priority ascending, insertion-order tiebreak.
+    /// Higher-priority Deny fires before lower-priority Deny.
+    #[tokio::test]
+    async fn hook_priority_and_insertion_order_is_deterministic() {
+        let broker = Arc::new(Broker::new());
+        let server = Arc::new(MockServer::new("svc").with_tool("t"));
+        broker
+            .register_silently(server, InstancePolicy::default())
+            .await
+            .unwrap();
+        // Push lower-priority Deny first (priority=0); higher-priority
+        // should still win because priority=-1 evaluates first (ascending).
+        {
+            let mut hooks = broker.hooks().write().await;
+            hooks.pre_call.entries.push(HookEntry {
+                id: hook_id("low"),
+                match_instance: None,
+                match_tool: None,
+                match_context: None,
+                match_principal: None,
+                action: HookAction::Deny("low-pri".into()),
+                priority: 0,
+            });
+            hooks.pre_call.entries.push(HookEntry {
+                id: hook_id("high"),
+                match_instance: None,
+                match_tool: None,
+                match_context: None,
+                match_principal: None,
+                action: HookAction::Deny("high-pri".into()),
+                priority: -1, // evaluates first because priority ascending
+            });
+        }
+        let err = broker
+            .call_tool(
+                params("svc", "t"),
+                &CallContext::test(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, McpError::Denied { ref by_hook } if by_hook.0 == "high"),
+            "priority=-1 must fire before priority=0; got {err:?}",
+        );
+    }
+
+    /// D-48: `HookAction::Log` emits a `tracing::event!` and does NOT write a
+    /// Notification block.
+    #[tokio::test]
+    async fn log_hook_emits_tracing_event_not_block() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let events = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let collector = LogCaptureLayer(events.clone());
+        let subscriber = tracing_subscriber::registry().with(collector);
+        // `set_default` on a current_thread tokio runtime installs the
+        // subscriber as the thread-local default for the remainder of the
+        // test. Safer than `with_default` + block_in_place, which requires
+        // the multi-threaded flavor.
+        let _sub_guard = tracing::subscriber::set_default(subscriber);
+
+        let (broker, store, ctx) = wired_broker().await;
+        bind(&broker, ctx, "svc").await;
+        let server = Arc::new(MockServer::new("svc").with_tool("t"));
+        broker
+            .register_silently(server, InstancePolicy::default())
+            .await
+            .unwrap();
+        broker
+            .hooks()
+            .write()
+            .await
+            .pre_call
+            .entries
+            .push(log_hook("log-hook", "*", tracing::Level::INFO));
+
+        broker
+            .call_tool(
+                params("svc", "t"),
+                &CallContext::test(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let recorded = events.lock().unwrap().clone();
+        assert!(
+            recorded.iter().any(|s| s.contains("hook_id=log-hook")),
+            "expected tracing event mentioning hook_id=log-hook; got {recorded:?}",
+        );
+        let blocks = notifications_in(&store, ctx);
+        assert!(
+            blocks.is_empty(),
+            "Log hooks must NOT emit Notification blocks; found {blocks:?}",
+        );
+    }
+
+    /// D-49: `ShortCircuit` emits a `hook.short_circuit` tracing event with
+    /// `hook_id = "hook:<id>"`. Exit criterion #3.
+    #[tokio::test]
+    async fn short_circuit_emits_attribution_event() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let events = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let collector = LogCaptureLayer(events.clone());
+        let subscriber = tracing_subscriber::registry().with(collector);
+        let _sub_guard = tracing::subscriber::set_default(subscriber);
+
+        let broker = Arc::new(Broker::new());
+        let server = Arc::new(MockServer::new("s").with_tool("t"));
+        broker
+            .register_silently(server, InstancePolicy::default())
+            .await
+            .unwrap();
+        broker.hooks().write().await.pre_call.entries.push(HookEntry {
+            id: hook_id("sc-attr"),
+            match_instance: None,
+            match_tool: None,
+            match_context: None,
+            match_principal: None,
+            action: HookAction::ShortCircuit(KernelToolResult::text("sc")),
+            priority: 0,
+        });
+
+        broker
+            .call_tool(
+                params("s", "t"),
+                &CallContext::test(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let recorded = events.lock().unwrap().clone();
+        assert!(
+            recorded.iter().any(|s| {
+                s.contains("hook.short_circuit") && s.contains("hook:sc-attr")
+            }),
+            "expected hook.short_circuit event with hook:sc-attr; got {recorded:?}",
+        );
+    }
+
+    // Minimal tracing Layer that stringifies events so tests can grep their
+    // field bag.
+    struct LogCaptureLayer(Arc<std::sync::Mutex<Vec<String>>>);
+    impl<S> tracing_subscriber::Layer<S> for LogCaptureLayer
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut s = String::new();
+            let mut visitor = StringVisitor(&mut s);
+            event.record(&mut visitor);
+            // Include the event "name" / message so we can match on
+            // `hook.short_circuit`, `hook.deny`, etc.
+            let full = format!("{}: {}", event.metadata().name(), s);
+            self.0.lock().unwrap().push(full);
+        }
+    }
+
+    struct StringVisitor<'a>(&'a mut String);
+    impl tracing::field::Visit for StringVisitor<'_> {
+        fn record_debug(
+            &mut self,
+            field: &tracing::field::Field,
+            value: &dyn std::fmt::Debug,
+        ) {
+            use std::fmt::Write;
+            let _ = write!(self.0, "{}={:?} ", field.name(), value);
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            use std::fmt::Write;
+            let _ = write!(self.0, "{}={} ", field.name(), value);
+        }
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // Phase 4 (M2) — OnNotification post-coalesce wiring
+    // ═════════════════════════════════════════════════════════════════════
+
+    /// OnNotification fires once per emitted block. A PassThrough Log block
+    /// (from below the coalescer cap) should fire the hook exactly once for
+    /// the one bound context.
+    #[tokio::test]
+    async fn on_notification_fires_for_log_passthrough() {
+        #[derive(Clone)]
+        struct Counter(Arc<std::sync::atomic::AtomicUsize>);
+        #[async_trait]
+        impl Hook for Counter {
+            async fn invoke(
+                &self,
+                _params: &KernelCallParams,
+                _ctx: &CallContext,
+            ) -> McpResult<()> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let (broker, _store, ctx) = wired_broker().await;
+        bind(&broker, ctx, "svc").await;
+        let server = Arc::new(MockServer::new("svc").with_tool("t"));
+        let tx = server.sender();
+        broker
+            .register_silently(server, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        broker
+            .hooks()
+            .write()
+            .await
+            .on_notification
+            .entries
+            .push(HookEntry {
+                id: hook_id("notif-count"),
+                match_instance: None,
+                match_tool: None,
+                match_context: None,
+                match_principal: None,
+                action: HookAction::Invoke(HookBody::Builtin {
+                    name: "test.notif_count".into(),
+                    hook: Arc::new(Counter(n.clone())),
+                }),
+                priority: 0,
+            });
+
+        let _ = tx.send(ServerNotification::Log {
+            level: LogLevel::Info,
+            message: "hi".into(),
+            tool: None,
+        });
+        sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            n.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "OnNotification must fire exactly once per PassThrough Log block",
+        );
+    }
+
+    /// Locks the post-coalesce semantic: a 25-event Log burst with cap=5
+    /// produces 5 PassThrough blocks + 1 Coalesced summary = 6 emissions.
+    /// OnNotification fires once per emission → 6 hook fires.
+    #[tokio::test]
+    async fn on_notification_fires_once_per_emission_in_burst() {
+        #[derive(Clone)]
+        struct Counter(Arc<std::sync::atomic::AtomicUsize>);
+        #[async_trait]
+        impl Hook for Counter {
+            async fn invoke(
+                &self,
+                _params: &KernelCallParams,
+                _ctx: &CallContext,
+            ) -> McpResult<()> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let broker = Arc::new({
+            let (notif_tx, _) = broadcast::channel(NOTIF_CAPACITY);
+            Broker {
+                instances: RwLock::new(HashMap::new()),
+                bindings: RwLock::new(HashMap::new()),
+                policies: RwLock::new(HashMap::new()),
+                semaphores: RwLock::new(HashMap::new()),
+                hooks: RwLock::new(HookTables::default()),
+                coalescer: Arc::new(NotificationCoalescer::new(CoalescePolicy {
+                    window: Duration::from_millis(100),
+                    max_in_window: 5,
+                    hard_drop_after: None,
+                    per_kind_override: HashMap::new(),
+                })),
+                notif_tx,
+                documents: RwLock::new(None),
+                pump_handles: Mutex::new(HashMap::new()),
+                flush_timers: Mutex::new(HashMap::new()),
+                tool_snapshots: Mutex::new(HashMap::new()),
+                subscriptions: Mutex::new(HashMap::new()),
+                resource_parents: Mutex::new(HashMap::new()),
+                builtin_hooks: BuiltinHookRegistry::new(),
+            }
+        });
+        let store = shared_block_store(PrincipalId::system());
+        let ctx = ContextId::new();
+        store
+            .create_document(ctx, DocumentKind::Code, Some("rust".into()))
+            .unwrap();
+        broker.set_documents(store.clone()).await;
+        bind(&broker, ctx, "chatty").await;
+        let server = Arc::new(MockServer::new("chatty").with_tool("t"));
+        let tx = server.sender();
+        broker
+            .register_silently(server, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        broker
+            .hooks()
+            .write()
+            .await
+            .on_notification
+            .entries
+            .push(HookEntry {
+                id: hook_id("burst-count"),
+                match_instance: None,
+                match_tool: None,
+                match_context: None,
+                match_principal: None,
+                action: HookAction::Invoke(HookBody::Builtin {
+                    name: "test.burst_count".into(),
+                    hook: Arc::new(Counter(n.clone())),
+                }),
+                priority: 0,
+            });
+
+        for i in 0..25 {
+            let _ = tx.send(ServerNotification::Log {
+                level: LogLevel::Info,
+                message: format!("m{i}"),
+                tool: None,
+            });
+        }
+        sleep(Duration::from_millis(250)).await;
+
+        let fires = n.load(std::sync::atomic::Ordering::SeqCst);
+        // 5 pass-through Logs + 1 Coalesced summary = 6 emissions = 6 hook fires.
+        assert_eq!(
+            fires, 6,
+            "OnNotification must fire once per emitted block (5 passthrough + 1 coalesced); got {fires}",
+        );
+    }
+
+    /// A `Deny` OnNotification hook skips the emission for that context —
+    /// no Notification block lands.
+    #[tokio::test]
+    async fn on_notification_deny_skips_emission() {
+        let (broker, store, ctx) = wired_broker().await;
+        bind(&broker, ctx, "svc").await;
+        let server = Arc::new(MockServer::new("svc").with_tool("t"));
+        let tx = server.sender();
+        broker
+            .register_silently(server, InstancePolicy::default())
+            .await
+            .unwrap();
+        broker
+            .hooks()
+            .write()
+            .await
+            .on_notification
+            .entries
+            .push(HookEntry {
+                id: hook_id("mute"),
+                match_instance: None,
+                match_tool: Some(GlobPattern("__notification.*".into())),
+                match_context: None,
+                match_principal: None,
+                action: HookAction::Deny("muted".into()),
+                priority: 0,
+            });
+
+        let _ = tx.send(ServerNotification::Log {
+            level: LogLevel::Info,
+            message: "silenced".into(),
+            tool: None,
+        });
+        sleep(Duration::from_millis(150)).await;
+
+        assert!(
+            notifications_in(&store, ctx).is_empty(),
+            "Deny OnNotification must skip emission",
+        );
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // Phase 4 (M5) — reentrancy cap
+    // ═════════════════════════════════════════════════════════════════════
+
+    /// Exit #5: a reentrant hook that recurses past `MAX_HOOK_DEPTH`
+    /// returns `McpError::HookRecursionLimit`. Uses `HOOK_DEPTH_OVERRIDE`
+    /// to keep the cap small (2) so we can hit it in a few hops.
+    #[tokio::test]
+    async fn reentrant_hook_exceeds_depth_cap() {
+        // Cap at 2 for this test so we can hit it cheaply.
+        let _ = HOOK_DEPTH_OVERRIDE.set(2);
+
+        struct Reentering(std::sync::OnceLock<std::sync::Weak<Broker>>);
+        #[async_trait]
+        impl Hook for Reentering {
+            async fn invoke(
+                &self,
+                params: &KernelCallParams,
+                ctx: &CallContext,
+            ) -> McpResult<()> {
+                let broker = self.0.get().unwrap().upgrade().unwrap();
+                broker
+                    .call_tool(params.clone(), ctx, CancellationToken::new())
+                    .await
+                    .map(|_| ())
+            }
+        }
+
+        let broker = Arc::new(Broker::new());
+        let server = Arc::new(MockServer::new("svc").with_tool("t"));
+        broker
+            .register_silently(server, InstancePolicy::default())
+            .await
+            .unwrap();
+        let hook = Arc::new(Reentering(std::sync::OnceLock::new()));
+        hook.0.set(Arc::downgrade(&broker)).unwrap();
+        broker.hooks().write().await.pre_call.entries.push(HookEntry {
+            id: hook_id("recur"),
+            match_instance: None,
+            match_tool: Some(GlobPattern("t".into())),
+            match_context: None,
+            match_principal: None,
+            action: HookAction::Invoke(HookBody::Builtin {
+                name: "test.reentering".into(),
+                hook: hook as Arc<dyn Hook>,
+            }),
+            priority: 0,
+        });
+
+        let err = broker
+            .call_tool(
+                params("svc", "t"),
+                &CallContext::test(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+
+        // The inner recursion hits HookRecursionLimit; the middle Invoke
+        // converts it to a Deny (per evaluate_phase semantics). The outer
+        // caller sees McpError::Denied.
+        assert!(
+            matches!(err, McpError::Denied { ref by_hook } if by_hook.0 == "recur"),
+            "expected recursion to surface as Denied(by_hook=recur); got {err:?}",
+        );
+    }
+
+    /// Positive control: a single-level reentry under the cap completes
+    /// `Ok`.
+    #[tokio::test]
+    async fn reentrant_hook_under_cap_succeeds() {
+        // Only run once per cap; cannot unset a OnceLock in tests without
+        // tricks. Use the default cap (4) — one level of recursion is well
+        // under.
+        struct OneHop(std::sync::OnceLock<std::sync::Weak<Broker>>, InstanceId);
+        #[async_trait]
+        impl Hook for OneHop {
+            async fn invoke(
+                &self,
+                _params: &KernelCallParams,
+                ctx: &CallContext,
+            ) -> McpResult<()> {
+                let broker = self.0.get().unwrap().upgrade().unwrap();
+                // Call the sibling tool on a different instance (so the hook
+                // itself doesn't re-match and infinite-loop).
+                broker
+                    .call_tool(
+                        KernelCallParams {
+                            instance: self.1.clone(),
+                            tool: "other".into(),
+                            arguments: serde_json::json!({}),
+                        },
+                        ctx,
+                        CancellationToken::new(),
+                    )
+                    .await
+                    .map(|_| ())
+            }
+        }
+
+        let broker = Arc::new(Broker::new());
+        let svc = Arc::new(MockServer::new("svc").with_tool("t"));
+        let other = Arc::new(MockServer::new("other").with_tool("other"));
+        broker
+            .register_silently(svc, InstancePolicy::default())
+            .await
+            .unwrap();
+        broker
+            .register_silently(other, InstancePolicy::default())
+            .await
+            .unwrap();
+        let hook = Arc::new(OneHop(
+            std::sync::OnceLock::new(),
+            InstanceId::new("other"),
+        ));
+        hook.0.set(Arc::downgrade(&broker)).unwrap();
+        broker.hooks().write().await.pre_call.entries.push(HookEntry {
+            id: hook_id("one-hop"),
+            match_instance: Some(GlobPattern("svc".into())),
+            match_tool: Some(GlobPattern("t".into())),
+            match_context: None,
+            match_principal: None,
+            action: HookAction::Invoke(HookBody::Builtin {
+                name: "test.one_hop".into(),
+                hook: hook as Arc<dyn Hook>,
+            }),
+            priority: 0,
+        });
+
+        let result = broker
+            .call_tool(
+                params("svc", "t"),
+                &CallContext::test(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+    }
+
+    /// The HOOK_DEPTH counter must reset across independent top-level
+    /// `call_tool` invocations. If the first call hits the cap and then a
+    /// second call with the same cap cannot proceed, we've leaked the
+    /// counter across tasks.
+    #[tokio::test]
+    async fn hook_depth_resets_across_calls() {
+        let broker = Arc::new(Broker::new());
+        let svc = Arc::new(MockServer::new("svc").with_tool("t"));
+        broker
+            .register_silently(svc, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        // No hook → no depth bump. Two back-to-back calls both succeed.
+        for _ in 0..2 {
+            broker
+                .call_tool(
+                    params("svc", "t"),
+                    &CallContext::test(),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    /// A panic inside a hook body must not leak the depth counter. After
+    /// the panic, subsequent calls still work at depth 0.
+    #[tokio::test]
+    async fn panicking_hook_body_does_not_leak_depth() {
+        struct Panicker;
+        #[async_trait]
+        impl Hook for Panicker {
+            async fn invoke(
+                &self,
+                _params: &KernelCallParams,
+                _ctx: &CallContext,
+            ) -> McpResult<()> {
+                panic!("simulated hook body panic");
+            }
+        }
+
+        let broker = Arc::new(Broker::new());
+        let svc = Arc::new(MockServer::new("svc").with_tool("t"));
+        broker
+            .register_silently(svc, InstancePolicy::default())
+            .await
+            .unwrap();
+        broker.hooks().write().await.pre_call.entries.push(HookEntry {
+            id: hook_id("panicker"),
+            match_instance: None,
+            match_tool: Some(GlobPattern("t".into())),
+            match_context: None,
+            match_principal: None,
+            action: HookAction::Invoke(HookBody::Builtin {
+                name: "test.panicker".into(),
+                hook: Arc::new(Panicker),
+            }),
+            priority: 0,
+        });
+
+        let broker2 = broker.clone();
+        let panic_result = tokio::spawn(async move {
+            broker2
+                .call_tool(
+                    params("svc", "t"),
+                    &CallContext::test(),
+                    CancellationToken::new(),
+                )
+                .await
+        })
+        .await;
+        assert!(
+            panic_result.is_err(),
+            "expected task to panic from hook body; got {panic_result:?}"
+        );
+
+        // Remove the panicking hook so subsequent calls aren't blocked.
+        broker.hooks().write().await.pre_call.entries.clear();
+
+        // If the drop guard did its job, the counter is back to 0 and the
+        // next call succeeds without hitting HookRecursionLimit.
+        broker
+            .call_tool(
+                params("svc", "t"),
+                &CallContext::test(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Resource-flush emission also goes through OnNotification. A
+    /// ShortCircuit hook on the resource_updated synth skips that subscriber
+    /// — no child Resource block lands under that context's parent.
+    #[tokio::test]
+    async fn on_notification_fires_for_resource_flush_success_path() {
+        let (broker, store, ctx) = wired_broker().await;
+        bind(&broker, ctx, "res").await;
+        let server = Arc::new(
+            ResourceMock::new("res").with_text_resource("file:///a", "initial"),
+        );
+        let tx = server.sender();
+        broker
+            .register(server, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        let mut call_ctx = CallContext::test();
+        call_ctx.context_id = ctx;
+        broker
+            .subscribe(&InstanceId::new("res"), "file:///a", &call_ctx)
+            .await
+            .unwrap();
+        let root_blocks_before = resource_blocks_in(&store, ctx).len();
+        assert_eq!(
+            root_blocks_before, 1,
+            "subscribe auto-reads, producing the root block",
+        );
+
+        // Short-circuit the resource-update synth so the flush does not emit
+        // a child.
+        broker
+            .hooks()
+            .write()
+            .await
+            .on_notification
+            .entries
+            .push(HookEntry {
+                id: hook_id("no-res-updates"),
+                match_instance: None,
+                match_tool: Some(GlobPattern("__notification.resource_updated".into())),
+                match_context: None,
+                match_principal: None,
+                action: HookAction::ShortCircuit(KernelToolResult::text("swallowed")),
+                priority: 0,
+            });
+
+        for _ in 0..5 {
+            let _ = tx.send(ServerNotification::ResourceUpdated {
+                uri: "file:///a".into(),
+            });
+        }
+        sleep(Duration::from_millis(700)).await;
+
+        let after = resource_blocks_in(&store, ctx).len();
+        assert_eq!(
+            after, root_blocks_before,
+            "ShortCircuit OnNotification must prevent the child resource block",
+        );
     }
 }

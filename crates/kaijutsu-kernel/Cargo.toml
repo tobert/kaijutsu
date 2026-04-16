@@ -86,3 +86,4 @@ rustix = { version = "0.38", features = ["fs"] }
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tempfile = { workspace = true }
+tracing-subscriber = { workspace = true }

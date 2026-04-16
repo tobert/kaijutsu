@@ -16,11 +16,13 @@ pub mod adapter;
 pub mod block;
 pub mod external;
 pub mod file;
+pub mod hooks_builtin;
 pub mod kernel_info;
 pub mod resources_builtin;
 
 pub use block::BlockToolsServer;
 pub use external::ExternalMcpServer;
 pub use file::FileToolsServer;
+pub use hooks_builtin::BuiltinHooksServer;
 pub use kernel_info::KernelInfoServer;
 pub use resources_builtin::BuiltinResourcesServer;

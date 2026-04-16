@@ -345,7 +345,8 @@ impl Kernel {
         workspace_guard: Option<crate::file_tools::WorkspaceGuard>,
     ) -> crate::mcp::McpResult<()> {
         use crate::mcp::servers::{
-            BlockToolsServer, BuiltinResourcesServer, FileToolsServer, KernelInfoServer,
+            BlockToolsServer, BuiltinHooksServer, BuiltinResourcesServer, FileToolsServer,
+            KernelInfoServer,
         };
         use crate::mcp::InstancePolicy;
 
@@ -385,6 +386,16 @@ impl Kernel {
         self.broker
             .register_silently(
                 Arc::new(BuiltinResourcesServer::new(Arc::downgrade(&self.broker))),
+                InstancePolicy::default(),
+            )
+            .await?;
+
+        // Phase 4: builtin.hooks admin server. Same Weak<Broker> pattern.
+        // Exposes hook_add / hook_remove / hook_list / hook_inspect so
+        // every admin path (LLM / kaish / kj CLI) speaks MCP (D-14).
+        self.broker
+            .register_silently(
+                Arc::new(BuiltinHooksServer::new(Arc::downgrade(&self.broker))),
                 InstancePolicy::default(),
             )
             .await?;

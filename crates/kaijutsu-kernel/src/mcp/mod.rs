@@ -11,6 +11,7 @@ pub mod coalescer;
 pub mod context;
 pub mod error;
 pub mod hook_table;
+pub mod hooks_builtin;
 pub mod policy;
 pub mod server_like;
 pub mod servers;
@@ -25,6 +26,7 @@ pub use hook_table::{
     GlobPattern, Hook, HookAction, HookBody, HookEntry, HookPhase, HookTable, HookTables, LogSpec,
     ScriptRef,
 };
+pub use hooks_builtin::{BuiltinHookRegistry, NoOpHook, TracingAuditHook};
 pub use policy::InstancePolicy;
 pub use server_like::{McpServerLike, ServerNotification};
 pub use types::{
