@@ -55,10 +55,12 @@ enum Status {
   error @3;
 }
 
-# Block content type — 6 variants covering what a block *is*.
+# Block content type — 8 variants covering what a block *is*.
 # Mechanism metadata lives in companion enums:
 # - ToolKind on ToolCall/ToolResult: which execution engine (Shell, Mcp, Builtin)
 # - DriftKind on Drift: how content transferred (Push, Pull, Merge, Distill, Commit)
+# - ErrorPayload on Error: structured diagnostics
+# - NotificationPayload on Notification: broker-emitted tool/log events
 enum BlockKind {
   text @0;
   thinking @1;
@@ -67,6 +69,7 @@ enum BlockKind {
   drift @4;
   file @5;
   error @6;
+  notification @7;
 }
 
 # Which execution engine handled a tool call/result.
@@ -181,6 +184,10 @@ struct BlockSnapshot {
   # Error-specific fields (Error blocks)
   errorPayload @27 :ErrorPayload;
   hasErrorPayload @28 :Bool;
+
+  # Notification-specific fields (Notification blocks)
+  notificationPayload @29 :NotificationPayload;
+  hasNotificationPayload @30 :Bool;
 }
 
 # What system produced the error.
@@ -213,6 +220,36 @@ struct ErrorPayload {
   spanLength @7 :UInt32;
   hasSourceKind @8 :Bool;
   sourceKind @9 :BlockKind;
+}
+
+# What a notification is about.
+enum NotificationKind {
+  toolAdded @0;
+  toolRemoved @1;
+  log @2;
+  promptsChanged @3;
+  coalesced @4;
+}
+
+# Severity for Log notifications. Kept in sync with kaijutsu-types::LogLevel.
+enum LogLevel {
+  trace @0;
+  debug @1;
+  info @2;
+  warn @3;
+  error @4;
+}
+
+# Structured notification payload for Notification blocks.
+struct NotificationPayload {
+  instance @0 :Text;            # MCP instance id (never empty)
+  kind @1 :NotificationKind;
+  hasLevel @2 :Bool;            # True iff `level` applies (Log events)
+  level @3 :LogLevel;
+  tool @4 :Text;                # ToolAdded/Removed — empty = None
+  hasCount @5 :Bool;            # True iff `count` applies (Coalesced)
+  count @6 :UInt32;
+  detail @7 :Text;              # Expandable body — empty = None
 }
 
 # Full context state — blocks + CRDT oplog for sync

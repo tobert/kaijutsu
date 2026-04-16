@@ -705,6 +705,51 @@ mark it `[RETIRED: <date> — <reason>]` in place; do not delete.
   D-16). `McpError::ToolNotFound` maps to
   `BackendError::ToolNotFound` at the kaish boundary so downstream
   "tool not found" semantics survive.
+- **D-34** — Notification blocks are **LLM-visible**. The LLM hydrator
+  in `crates/kaijutsu-kernel/src/llm/mod.rs` gets a
+  `BlockKind::Notification` arm that routes through
+  `format_notification_for_llm` (XML envelope with
+  `<notification instance="..." kind="..." level="..."> summary + detail
+  </notification>`). Truncation budget 512 chars
+  (`NOTIFICATION_DETAIL_HYDRATION_BUDGET`). Rationale: the
+  conversation-as-record model applies to tool changes too; the user
+  chose fidelity over token savings. Resolves the "separate log buffer?"
+  open question in §7 (Notifications) against a dedicated buffer.
+- **D-35** — `ServerNotification::ToolsChanged` is diffed **per-tool**.
+  The broker holds `Mutex<HashMap<InstanceId, Vec<KernelTool>>>` of
+  last-seen tools and diffs against `list_tools(&CallContext::system())`
+  on each ToolsChanged (and on register/unregister), emitting one
+  `NotificationKind::ToolAdded` or `ToolRemoved` per delta. Implements
+  the Phase 2 deliverable literally: "ToolsChanged → tool_added /
+  tool_removed notifications" (§8).
+- **D-36** — `NotificationPayload` is wired **all the way to the app**
+  over capnp in Phase 2 (not deferred to Phase 3). Mirrors the
+  `ErrorPayload` precedent: `NotificationPayload` struct in
+  `kaijutsu.capnp`, `notificationPayload @29` /
+  `hasNotificationPayload @30` on the capnp `BlockSnapshot`, converters
+  in `kaijutsu-client/src/rpc.rs` and `kaijutsu-server/src/rpc.rs`.
+  Structured metadata reaches the renderer so per-kind styling (color
+  keys, potential icons, tool links) is available without a Phase 3
+  follow-up.
+- **D-37** — `Broker::set_documents(SharedBlockStore)` setter (not
+  constructor injection). Called from
+  `Kernel::register_builtin_mcp_servers` at bootstrap. `Broker::new()` +
+  `Default` stay workable for tests that don't need emission; emission
+  is a no-op when `documents` is unset. Keeps the broker constructor
+  flexible and the test fixtures minimal.
+- **D-38** — `Broker::register_silently()` variant used at kernel
+  bootstrap to suppress synthetic `ToolAdded` notifications for the
+  three builtin MCP servers. Runtime `register`/`unregister` call the
+  emitting variants. Prevents every kernel restart from accumulating
+  bootstrap noise when a persistent context happens to exist.
+- **D-39** — Coalescer flush via **per-key oneshot timer**.
+  `NotificationCoalescer::observe()` returns
+  `ObserveOutcome { PassThrough | StartWindow | Coalesced{so_far} }`.
+  On `StartWindow`, the broker pump spawns a `sleep(window)` task that
+  calls `flush(instance, kind)` and emits a single
+  `NotificationKind::Coalesced` summary block. Timers are tracked per
+  `(InstanceId, NotifKind)` and aborted on `unregister` so no orphan
+  Coalesced blocks fire after teardown (R2 mitigation).
 
 ## 7. Open questions per area
 
@@ -722,7 +767,7 @@ note here.
 - Coalescer policy defaults (window, max-in-window) — do we need
   per-kind tuning or is one default enough for v1?
 - Should `Log` notifications default to `BlockKind::Notification` or a
-  separate log buffer?
+  separate log buffer? [RESOLVED: D-34 — LLM-visible Notification blocks]
 
 ### Resources
 - Subscription lifetime when a context drops — broker unsubscribes, yes;
@@ -859,7 +904,10 @@ Exit criteria — concrete end-to-end scenarios that must pass:
 8. A pathological input (tool returning > `max_result_bytes`) produces
    `McpError::Policy` rather than unbounded allocation.
 
-### Phase 2 — Notifications · **planned**
+### Phase 2 — Notifications · **code complete, runner verification pending**
+
+Plan: `~/.claude/plans/phase2-tool-notifications.md`
+
 
 `BlockKind::Notification` variant added. Broker subscribes to per-server
 notification streams, aggregates, coalesces via `NotificationCoalescer`
@@ -1077,6 +1125,28 @@ Entries are append-only. Most recent at the bottom.
   + 45 server tests pass. End-to-end app-session and external MCP
   round-trip verification holds for a subsequent live session on the
   user's GPU server.
+- **2026-04-16** (Phase 2 execution — M1–M4 + M6, Amy + Claude Opus 4.7):
+  Phase 2 code landed across four milestones. M1: `BlockKind::Notification`
+  + `NotificationPayload` rolled out end-to-end (kaijutsu-types, CRDT,
+  capnp @29/@30 + NotificationKind/LogLevel enums, client+server RPC
+  converters, app theme+format, LLM hydrator arm per D-34). M2: coalescer
+  rewritten around `ObserveOutcome { PassThrough | StartWindow | Coalesced
+  { so_far } }` with `flush()` returning the collapsed count (D-39). M3:
+  broker pump per registered instance subscribes to
+  `ServerNotification` streams; synthesizes per-tool `ToolAdded`/
+  `ToolRemoved` diffs on register/unregister (D-35); `set_documents`
+  setter threads `SharedBlockStore` in at bootstrap (D-37);
+  `register_silently` suppresses the three builtin bootstrap ToolAdded
+  events (D-38); flush timer tracked per `(InstanceId, NotifKind)` and
+  aborted on unregister. M4: `late_registration_visible_next_turn` test
+  locks "no cache" behavior — `build_tool_definitions` enumerates fresh
+  via `list_tool_defs_via_broker` each call. Decisions D-34..D-39
+  recorded. Suite adds: 8 coalescer tests, 7 broker M3 tests (covering
+  exit #1, #3, #4, D-35, D-38, D-39/R2, and ResourceUpdated-drop), 1
+  broker_e2e test (exit #2). Workspace tests green excluding the
+  long-standing `kaijutsu-index::test_neighbors` flake. Runner
+  verification (M5, exit scenarios against a live kaijutsu-runner on the
+  GPU server) pending — tracked in §8 Phase 2 status.
 - **2026-04-16** (Phase 1 closure, Amy + Claude Opus 4.6): Post-phase
   review caught that `cargo test --workspace` failed to compile —
   `crates/kaijutsu-server/tests/e2e_dispatch.rs` still imported the

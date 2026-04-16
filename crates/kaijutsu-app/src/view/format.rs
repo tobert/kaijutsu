@@ -48,6 +48,7 @@ pub fn block_color(block: &BlockSnapshot, theme: &Theme) -> bevy::prelude::Color
                 _ => theme.block_error_severity,
             }
         }
+        BlockKind::Notification => theme.block_notification,
         BlockKind::Drift => match block.drift_kind {
             Some(DriftKind::Push) => theme.block_drift_push,
             Some(DriftKind::Pull) | Some(DriftKind::Distill) => theme.block_drift_pull,
@@ -663,6 +664,17 @@ fn format_block_inner(block: &BlockSnapshot, local_ctx: Option<ContextId>) -> St
         BlockKind::Error => {
             // Show summary (content), optionally with detail
             if let Some(ref payload) = block.error {
+                if let Some(ref detail) = payload.detail {
+                    format!("{}\n{}", block.content, detail)
+                } else {
+                    block.content.clone()
+                }
+            } else {
+                block.content.clone()
+            }
+        }
+        BlockKind::Notification => {
+            if let Some(ref payload) = block.notification {
                 if let Some(ref detail) = payload.detail {
                     format!("{}\n{}", block.content, detail)
                 } else {

@@ -1034,10 +1034,11 @@ pub fn hydrate_from_blocks(blocks: &[kaijutsu_types::BlockSnapshot]) -> Vec<Mess
         if block.role == BlockRole::Asset {
             continue;
         }
-        // Skip System blocks unless they're Drift or Error
+        // Skip System blocks unless they're Drift, Error, or Notification (D-34)
         if block.role == BlockRole::System
             && block.kind != BlockKind::Drift
             && block.kind != BlockKind::Error
+            && block.kind != BlockKind::Notification
         {
             continue;
         }
@@ -1045,6 +1046,7 @@ pub fn hydrate_from_blocks(blocks: &[kaijutsu_types::BlockSnapshot]) -> Vec<Mess
             && block.kind != BlockKind::ToolCall
             && block.kind != BlockKind::ToolResult
             && block.kind != BlockKind::Error
+            && block.kind != BlockKind::Notification
         {
             continue;
         }
@@ -1202,6 +1204,13 @@ pub fn hydrate_from_blocks(blocks: &[kaijutsu_types::BlockSnapshot]) -> Vec<Mess
                     state.flush_all();
                     state.messages.push(Message::user(envelope));
                 }
+            }
+            (_, BlockKind::Notification) => {
+                // Notification blocks (D-34): surface broker tool/log events to the
+                // LLM as a user message so the model sees tool-world changes.
+                let envelope = kaijutsu_types::format_notification_for_llm(block);
+                state.flush_all();
+                state.messages.push(Message::user(envelope));
             }
             _ => {
                 // Skip unexpected role/kind combinations
@@ -2591,6 +2600,119 @@ mod tests {
             let error_text = msgs[2].as_text().expect("should be text");
             assert!(error_text.contains("...[truncated]"));
             assert!(error_text.len() < 3000);
+        }
+
+        // ── Phase 2: Notification block hydration (D-34) ──────────────────
+        //
+        // These tests verify the full arm for `BlockKind::Notification`, not
+        // just the formatter. `format_notification_for_llm` is unit-tested in
+        // `kaijutsu-types` — this layer locks that the hydrator (a) passes
+        // Notification blocks through its System-role and empty-content
+        // filters, (b) emits them as user messages so the LLM reads them
+        // alongside normal conversation, and (c) flushes pending assistant
+        // state before the notification so turn boundaries stay coherent.
+        //
+        // Without these tests, a future refactor of the filter cascade
+        // (e.g. adding a new `ephemeral_notifications` flag) could silently
+        // drop Notification blocks from LLM context and only the app UI
+        // would know.
+
+        fn notif_payload(
+            instance: &str,
+            kind: kaijutsu_types::NotificationKind,
+        ) -> kaijutsu_types::NotificationPayload {
+            kaijutsu_types::NotificationPayload {
+                instance: instance.into(),
+                kind,
+                level: None,
+                tool: Some("example_tool".into()),
+                count: None,
+                detail: None,
+            }
+        }
+
+        #[test]
+        fn notification_block_hydrates_as_user_message_with_xml_envelope() {
+            let c = ctx();
+            let s = system();
+            let block = BlockSnapshot::notification_block(
+                BlockId::new(c, s, 0),
+                None,
+                notif_payload("gpal", kaijutsu_types::NotificationKind::ToolAdded),
+                "[gpal] tool added: example_tool",
+            );
+            let msgs = hydrate_from_blocks(&[block]);
+            assert_eq!(msgs.len(), 1, "expected one user message for one notification");
+            assert_eq!(msgs[0].role, Role::User);
+            let text = msgs[0].as_text().expect("notification should hydrate as text");
+            // Envelope produced by format_notification_for_llm.
+            assert!(
+                text.starts_with("<notification "),
+                "expected XML envelope, got {text:?}"
+            );
+            assert!(text.contains("instance=\"gpal\""));
+            assert!(text.contains("kind=\"tool_added\""));
+            assert!(text.contains("tool=\"example_tool\""));
+            assert!(text.ends_with("</notification>"));
+        }
+
+        #[test]
+        fn notification_block_flushes_pending_assistant_text() {
+            // Regression guard: a notification arriving mid-turn must not
+            // be folded into a pending assistant reply. `flush_all()` inside
+            // the Notification arm is what enforces this.
+            let c = ctx();
+            let u = user();
+            let m = model();
+            let s = system();
+            let blocks = vec![
+                BlockSnapshot::text(BlockId::new(c, u, 0), None, BlockRole::User, "hi"),
+                BlockSnapshot::text(BlockId::new(c, m, 0), None, BlockRole::Model, "mid"),
+                BlockSnapshot::notification_block(
+                    BlockId::new(c, s, 0),
+                    None,
+                    notif_payload("svc", kaijutsu_types::NotificationKind::ToolRemoved),
+                    "[svc] tool removed: example_tool",
+                ),
+                BlockSnapshot::text(BlockId::new(c, m, 1), None, BlockRole::Model, "after"),
+            ];
+            let msgs = hydrate_from_blocks(&blocks);
+            assert_eq!(
+                msgs.len(),
+                4,
+                "user → assistant(mid) → user(notification) → assistant(after)"
+            );
+            assert_eq!(msgs[0].role, Role::User);
+            assert_eq!(msgs[1].role, Role::Assistant);
+            assert_eq!(msgs[1].as_text(), Some("mid"));
+            assert_eq!(msgs[2].role, Role::User);
+            assert!(msgs[2]
+                .as_text()
+                .expect("notification text")
+                .contains("kind=\"tool_removed\""));
+            assert_eq!(msgs[3].role, Role::Assistant);
+            assert_eq!(msgs[3].as_text(), Some("after"));
+        }
+
+        #[test]
+        fn notification_block_survives_system_role_filter() {
+            // Notification blocks are authored by System principal
+            // (`BlockSnapshot::notification_block` forces Role::System).
+            // The hydrator's System-role filter skips Role::System blocks
+            // unless kind is Drift, Error, or Notification. This test locks
+            // that carve-out so a Notification block reaches the match arm
+            // instead of being silently dropped.
+            let c = ctx();
+            let s = system();
+            let block = BlockSnapshot::notification_block(
+                BlockId::new(c, s, 0),
+                None,
+                notif_payload("gpal", kaijutsu_types::NotificationKind::Log),
+                "[gpal] info: heartbeat",
+            );
+            assert_eq!(block.role, BlockRole::System, "sanity: role is System");
+            let msgs = hydrate_from_blocks(&[block]);
+            assert_eq!(msgs.len(), 1, "System-role Notification must not be filtered out");
         }
     }
 }

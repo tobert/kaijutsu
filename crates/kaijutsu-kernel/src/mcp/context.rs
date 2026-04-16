@@ -89,4 +89,16 @@ impl CallContext {
             KernelId::new(),
         )
     }
+
+    /// System-principal context used for broker-internal calls (e.g., the
+    /// pump's `list_tools()` on ToolsChanged diff). No cwd; filesystem tools
+    /// must reject.
+    pub fn system() -> Self {
+        Self::new(
+            PrincipalId::system(),
+            ContextId::new(),
+            SessionId::new(),
+            KernelId::new(),
+        )
+    }
 }

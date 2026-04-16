@@ -347,15 +347,21 @@ impl Kernel {
         use crate::mcp::servers::{BlockToolsServer, FileToolsServer, KernelInfoServer};
         use crate::mcp::InstancePolicy;
 
+        // Wire the block store into the broker so Phase 2 notification
+        // emission can reach bound contexts (D-37). Done before registering
+        // so the initial tool snapshots are captured but `register_silently`
+        // suppresses the bootstrap ToolAdded noise (D-38).
+        self.broker.set_documents(documents.clone()).await;
+
         self.broker
-            .register(
+            .register_silently(
                 Arc::new(BlockToolsServer::new(documents, self.cas.clone())),
                 InstancePolicy::default(),
             )
             .await?;
 
         self.broker
-            .register(
+            .register_silently(
                 Arc::new(FileToolsServer::new(
                     file_cache,
                     self.vfs.clone(),
@@ -366,7 +372,7 @@ impl Kernel {
             .await?;
 
         self.broker
-            .register(
+            .register_silently(
                 Arc::new(KernelInfoServer::new(self.drift.clone())),
                 InstancePolicy::default(),
             )

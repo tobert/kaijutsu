@@ -5245,6 +5245,7 @@ fn set_block_snapshot(
         kaijutsu_crdt::BlockKind::Drift => crate::kaijutsu_capnp::BlockKind::Drift,
         kaijutsu_crdt::BlockKind::File => crate::kaijutsu_capnp::BlockKind::File,
         kaijutsu_crdt::BlockKind::Error => crate::kaijutsu_capnp::BlockKind::Error,
+        kaijutsu_crdt::BlockKind::Notification => crate::kaijutsu_capnp::BlockKind::Notification,
     });
 
     // Set basic fields (no author — derived from id.agent_id)
@@ -5341,7 +5342,52 @@ fn set_block_snapshot(
                 kaijutsu_crdt::BlockKind::Drift => crate::kaijutsu_capnp::BlockKind::Drift,
                 kaijutsu_crdt::BlockKind::File => crate::kaijutsu_capnp::BlockKind::File,
                 kaijutsu_crdt::BlockKind::Error => crate::kaijutsu_capnp::BlockKind::Error,
+                kaijutsu_crdt::BlockKind::Notification => {
+                    crate::kaijutsu_capnp::BlockKind::Notification
+                }
             });
+        }
+    }
+
+    // Set notification payload if present
+    if let Some(ref payload) = block.notification {
+        builder.set_has_notification_payload(true);
+        let mut np = builder.reborrow().init_notification_payload();
+        np.set_instance(&payload.instance);
+        np.set_kind(match payload.kind {
+            kaijutsu_crdt::NotificationKind::ToolAdded => {
+                crate::kaijutsu_capnp::NotificationKind::ToolAdded
+            }
+            kaijutsu_crdt::NotificationKind::ToolRemoved => {
+                crate::kaijutsu_capnp::NotificationKind::ToolRemoved
+            }
+            kaijutsu_crdt::NotificationKind::Log => crate::kaijutsu_capnp::NotificationKind::Log,
+            kaijutsu_crdt::NotificationKind::PromptsChanged => {
+                crate::kaijutsu_capnp::NotificationKind::PromptsChanged
+            }
+            kaijutsu_crdt::NotificationKind::Coalesced => {
+                crate::kaijutsu_capnp::NotificationKind::Coalesced
+            }
+        });
+        if let Some(level) = payload.level {
+            np.set_has_level(true);
+            np.set_level(match level {
+                kaijutsu_crdt::LogLevel::Trace => crate::kaijutsu_capnp::LogLevel::Trace,
+                kaijutsu_crdt::LogLevel::Debug => crate::kaijutsu_capnp::LogLevel::Debug,
+                kaijutsu_crdt::LogLevel::Info => crate::kaijutsu_capnp::LogLevel::Info,
+                kaijutsu_crdt::LogLevel::Warn => crate::kaijutsu_capnp::LogLevel::Warn,
+                kaijutsu_crdt::LogLevel::Error => crate::kaijutsu_capnp::LogLevel::Error,
+            });
+        }
+        if let Some(ref tool) = payload.tool {
+            np.set_tool(tool);
+        }
+        if let Some(count) = payload.count {
+            np.set_has_count(true);
+            np.set_count(count as u32);
+        }
+        if let Some(ref detail) = payload.detail {
+            np.set_detail(detail);
         }
     }
 }
@@ -5433,6 +5479,7 @@ fn parse_block_filter(
                 crate::kaijutsu_capnp::BlockKind::Drift => BlockKind::Drift,
                 crate::kaijutsu_capnp::BlockKind::File => BlockKind::File,
                 crate::kaijutsu_capnp::BlockKind::Error => BlockKind::Error,
+                crate::kaijutsu_capnp::BlockKind::Notification => BlockKind::Notification,
             });
         }
         if kinds.is_empty() {
@@ -5585,6 +5632,7 @@ fn parse_block_event_filter(
                             crate::kaijutsu_capnp::BlockKind::Drift => BlockKind::Drift,
                             crate::kaijutsu_capnp::BlockKind::File => BlockKind::File,
                             crate::kaijutsu_capnp::BlockKind::Error => BlockKind::Error,
+                            crate::kaijutsu_capnp::BlockKind::Notification => BlockKind::Notification,
                         })
                     })
                     .collect()

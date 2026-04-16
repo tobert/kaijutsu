@@ -19,12 +19,16 @@ use kaijutsu_kernel::block_store::{DocumentKind, SharedBlockStore, shared_block_
 use kaijutsu_kernel::execution::ExecContext;
 use kaijutsu_kernel::file_tools::FileDocumentCache;
 use kaijutsu_kernel::kernel_db::{DocumentRow, KernelDb};
+use kaijutsu_kernel::llm::hydrate_from_blocks;
 use kaijutsu_kernel::mcp::{
     CallContext, ContextToolBinding, InstanceId, InstancePolicy, KernelCallParams, KernelTool,
     KernelToolResult, McpError, McpResult, McpServerLike, ServerNotification,
 };
 use kaijutsu_kernel::Kernel;
-use kaijutsu_types::{now_millis, ContextId, KernelId, PrincipalId, SessionId};
+use kaijutsu_types::{
+    now_millis, BlockFilter, BlockKind, ContextId, KernelId, NotificationKind, PrincipalId,
+    SessionId,
+};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
@@ -32,6 +36,7 @@ struct Fixture {
     kernel: Arc<Kernel>,
     ctx_id: ContextId,
     exec_ctx: ExecContext,
+    store: SharedBlockStore,
     _tmp: tempfile::TempDir,
 }
 
@@ -67,7 +72,7 @@ async fn setup() -> Fixture {
 
     let file_cache = Arc::new(FileDocumentCache::new(store.clone(), kernel.vfs().clone()));
     kernel
-        .register_builtin_mcp_servers(store, file_cache, None)
+        .register_builtin_mcp_servers(store.clone(), file_cache, None)
         .await
         .expect("register_builtin_mcp_servers");
 
@@ -83,6 +88,7 @@ async fn setup() -> Fixture {
         kernel,
         ctx_id,
         exec_ctx,
+        store,
         _tmp: tmp,
     }
 }
@@ -277,6 +283,154 @@ impl McpServerLike for LocalMock {
     fn notifications(&self) -> broadcast::Receiver<ServerNotification> {
         self.notif_tx.subscribe()
     }
+}
+
+/// Phase 2 (M4) — exit criterion #2: a tool registered at runtime appears
+/// in `list_tool_defs_via_broker` on the next call, without any caching
+/// between calls. `build_tool_definitions` (in `llm_stream.rs`) calls this
+/// fresh on every LLM spawn, so this test locks the "no stale list" path.
+#[tokio::test]
+async fn late_registration_visible_next_turn() {
+    let fx = setup().await;
+
+    // Turn 1: enumerate tools. Auto-populates the context binding with the
+    // three builtins. `block_create` is one of the builtin surfaces.
+    let defs_before = fx
+        .kernel
+        .list_tool_defs_via_broker(fx.ctx_id, fx.exec_ctx.principal_id)
+        .await;
+    let names_before: Vec<&str> = defs_before.iter().map(|(n, _, _)| n.as_str()).collect();
+    assert!(
+        names_before.contains(&"block_create"),
+        "expected builtin 'block_create' before late registration, got {names_before:?}",
+    );
+    assert!(
+        !names_before.contains(&"fail"),
+        "LocalMock should not be visible before its registration, got {names_before:?}",
+    );
+
+    // Register a new MCP instance at runtime. Its tool is named "fail"
+    // (LocalMock::list_tools).
+    let mock = Arc::new(LocalMock::new("test.late"));
+    fx.kernel
+        .broker()
+        .register(mock, InstancePolicy::default())
+        .await
+        .expect("runtime register should succeed");
+
+    // Clear the binding so the next call auto-populates with the full
+    // instance list — simulates the admin-hatch path that reconciles
+    // bindings when a new MCP is registered.
+    fx.kernel.broker().clear_binding(&fx.ctx_id).await;
+
+    // Turn 2: `list_tool_defs_via_broker` must NOT return a cached list —
+    // it queries the broker fresh, sees the newly-registered instance, and
+    // surfaces its tools. This is what the LLM sees on its next turn.
+    let defs_after = fx
+        .kernel
+        .list_tool_defs_via_broker(fx.ctx_id, fx.exec_ctx.principal_id)
+        .await;
+    let names_after: Vec<&str> = defs_after.iter().map(|(n, _, _)| n.as_str()).collect();
+    assert!(
+        names_after.contains(&"fail"),
+        "expected late-registered 'fail' tool in next-turn list, got {names_after:?}",
+    );
+    assert!(
+        names_after.contains(&"block_create"),
+        "builtin tools must still be present after late registration, got {names_after:?}",
+    );
+}
+
+/// Phase 2 end-to-end: `ServerNotification` → Notification block in context
+/// → LLM hydrator sees the XML envelope.
+///
+/// This is the only test that stitches the full chain together without
+/// needing the Bevy app:
+///
+///   register(MCP instance)
+///     └─► broker.emit_for_bindings
+///           └─► SharedBlockStore::insert_notification_block_as
+///                 └─► BlockKind::Notification row in the CRDT
+///                       └─► store.query_blocks(ctx, kind=Notification)
+///                             └─► hydrate_from_blocks
+///                                   └─► `<notification …>` in a user message
+///
+/// Unit tests at each layer cover the layer in isolation; this one locks
+/// the composition so that a filter change in the hydrator, a mis-wired
+/// binding in the broker, or a schema miss in the CRDT cannot silently
+/// break the LLM-visible story (D-34) while every unit test still passes.
+///
+/// Effective because it uses only production APIs — no mock hydrator, no
+/// mock broker, no backdoor into CRDT internals. If this test passes, the
+/// kernel's side of the Phase 2 story is real; only the app rendering
+/// remains to verify (M5).
+#[tokio::test]
+async fn server_notification_reaches_llm_hydrator() {
+    let fx = setup().await;
+
+    // Pre-bind the context to the instance we're about to register. The
+    // broker walks existing bindings at emit time; a context with no
+    // binding would skip the notification silently, which is correct
+    // behavior — so the test has to bind first for the emission to land.
+    let mock_id = InstanceId::new("test.hydrator");
+    let binding = ContextToolBinding::with_instances(vec![mock_id.clone()]);
+    fx.kernel.broker().set_binding(fx.ctx_id, binding).await;
+
+    // Runtime-register an MCP instance → broker emits a `ToolAdded`
+    // notification block into every bound context (exit criterion #1).
+    let mock = Arc::new(LocalMock::new(mock_id.as_str()));
+    fx.kernel
+        .broker()
+        .register(mock, InstancePolicy::default())
+        .await
+        .expect("runtime register should succeed");
+
+    // Fetch notification blocks via the production query path the app
+    // uses. `LocalMock::list_tools` advertises one tool named "fail".
+    let notif_blocks = fx
+        .store
+        .query_blocks(
+            fx.ctx_id,
+            &BlockFilter {
+                kinds: vec![BlockKind::Notification],
+                ..Default::default()
+            },
+        )
+        .expect("query_blocks");
+    assert_eq!(
+        notif_blocks.len(),
+        1,
+        "expected exactly one ToolAdded notification block, got {:?}",
+        notif_blocks
+    );
+    let payload = notif_blocks[0]
+        .notification
+        .as_ref()
+        .expect("notification payload must survive CRDT storage");
+    assert_eq!(payload.kind, NotificationKind::ToolAdded);
+    assert_eq!(payload.instance, "test.hydrator");
+    assert_eq!(payload.tool.as_deref(), Some("fail"));
+
+    // Feed the full block stream through the LLM hydrator — the same
+    // function `build_tool_definitions` feeds on every LLM spawn. The
+    // notification must surface as a user message with the XML envelope.
+    let all_blocks = fx
+        .store
+        .query_blocks(fx.ctx_id, &BlockFilter::default())
+        .expect("query_blocks all");
+    let msgs = hydrate_from_blocks(&all_blocks);
+    let envelope_msg = msgs.iter().find(|m| {
+        m.as_text()
+            .map(|t| t.contains("<notification ") && t.contains("</notification>"))
+            .unwrap_or(false)
+    });
+    let text = envelope_msg
+        .expect("at least one LLM message must carry the notification envelope")
+        .as_text()
+        .expect("envelope message is text");
+    assert!(text.contains("instance=\"test.hydrator\""));
+    assert!(text.contains("kind=\"tool_added\""));
+    assert!(text.contains("tool=\"fail\""));
 }
 
 // Silence unused-import / Duration warnings if future edits remove the

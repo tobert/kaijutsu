@@ -33,9 +33,9 @@ mod ops;
 pub use kaijutsu_types::{
     BlockFilter, BlockHeader, BlockId, BlockKind, BlockQuery, BlockSnapshot, BlockSnapshotBuilder,
     ContentType, ContextId, DriftKind, ErrorCategory, ErrorPayload, ErrorSeverity, ErrorSpan,
-    KernelId, MAX_DAG_DEPTH, OutputData, OutputEntryType, OutputNode,
-    PrefixError, PrefixResolvable, PrincipalId, Role, SessionId, Status, ToolKind,
-    resolve_context_prefix,
+    KernelId, LogLevel, MAX_DAG_DEPTH, NotificationKind, NotificationPayload, OutputData,
+    OutputEntryType, OutputNode, PrefixError, PrefixResolvable, PrincipalId, Role, SessionId,
+    Status, ToolKind, resolve_context_prefix,
 };
 
 // New architecture

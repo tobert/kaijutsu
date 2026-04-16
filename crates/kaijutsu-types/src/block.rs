@@ -511,6 +511,194 @@ pub fn format_error_for_llm(block: &BlockSnapshot) -> String {
     format!("<error {}>\n{}\n</error>", attrs, body)
 }
 
+// ============================================================================
+// Notification Payload Types
+// ============================================================================
+
+/// Logging severity on `BlockKind::Notification` blocks. Mirrors the kernel's
+/// `mcp::types::LogLevel`; kept as a parallel type here so `kaijutsu-types`
+/// stays free of MCP dependencies. The kernel converts at the emission site.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default, EnumString,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(ascii_case_insensitive)]
+pub enum LogLevel {
+    Trace,
+    Debug,
+    #[default]
+    Info,
+    Warn,
+    Error,
+}
+
+impl LogLevel {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LogLevel::Trace => "trace",
+            LogLevel::Debug => "debug",
+            LogLevel::Info => "info",
+            LogLevel::Warn => "warn",
+            LogLevel::Error => "error",
+        }
+    }
+}
+
+impl std::fmt::Display for LogLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// What the notification is about.
+///
+/// `Coalesced` is a summary block emitted by the broker when a burst of
+/// same-key notifications exceeds the coalescer window (§5.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, EnumString)]
+#[serde(rename_all = "snake_case")]
+#[strum(ascii_case_insensitive)]
+pub enum NotificationKind {
+    ToolAdded,
+    ToolRemoved,
+    Log,
+    PromptsChanged,
+    Coalesced,
+}
+
+impl NotificationKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            NotificationKind::ToolAdded => "tool_added",
+            NotificationKind::ToolRemoved => "tool_removed",
+            NotificationKind::Log => "log",
+            NotificationKind::PromptsChanged => "prompts_changed",
+            NotificationKind::Coalesced => "coalesced",
+        }
+    }
+}
+
+impl std::fmt::Display for NotificationKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// Structured notification payload attached to `BlockKind::Notification` blocks.
+///
+/// The emitting broker populates `instance` (the MCP server identifier),
+/// `kind` (what happened), and kind-specific fields (`tool` for ToolAdded/Removed,
+/// `level` + `detail` for Log, `count` for Coalesced).
+///
+/// `BlockSnapshot.content` carries the one-line summary; `detail` carries the
+/// expandable body, truncated in LLM hydration.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationPayload {
+    /// MCP instance id that emitted the event (`builtin.<name>` or external
+    /// config key).
+    pub instance: String,
+    pub kind: NotificationKind,
+    /// Severity for `Log` notifications. `None` for structural events.
+    #[serde(default)]
+    pub level: Option<LogLevel>,
+    /// Tool name for `ToolAdded` / `ToolRemoved`.
+    #[serde(default)]
+    pub tool: Option<String>,
+    /// Collapsed count for `Coalesced` summaries.
+    #[serde(default)]
+    pub count: Option<usize>,
+    /// Expandable body — log message, coalesced-kind hint, etc.
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+impl NotificationPayload {
+    /// Build a one-line summary from the payload fields.
+    /// Used to populate `BlockSnapshot.content` when the producer doesn't
+    /// supply an explicit summary string.
+    pub fn summary_line(&self) -> String {
+        match self.kind {
+            NotificationKind::ToolAdded => match &self.tool {
+                Some(t) => format!("[{}] tool added: {}", self.instance, t),
+                None => format!("[{}] tool added", self.instance),
+            },
+            NotificationKind::ToolRemoved => match &self.tool {
+                Some(t) => format!("[{}] tool removed: {}", self.instance, t),
+                None => format!("[{}] tool removed", self.instance),
+            },
+            NotificationKind::Log => {
+                let level = self
+                    .level
+                    .map(|l| l.as_str())
+                    .unwrap_or("info");
+                let head = self
+                    .detail
+                    .as_deref()
+                    .and_then(|d| d.lines().next())
+                    .unwrap_or("");
+                if head.is_empty() {
+                    format!("[{}] {}", self.instance, level)
+                } else {
+                    format!("[{}] {}: {}", self.instance, level, head)
+                }
+            }
+            NotificationKind::PromptsChanged => {
+                format!("[{}] prompts changed", self.instance)
+            }
+            NotificationKind::Coalesced => {
+                let count = self.count.unwrap_or(0);
+                let kind_hint = self.detail.as_deref().unwrap_or("event");
+                format!("[{}] coalesced: {} further {} events", self.instance, count, kind_hint)
+            }
+        }
+    }
+}
+
+/// Maximum chars of `NotificationPayload.detail` included in LLM hydration.
+/// Measured in Unicode scalar values, not bytes. Smaller than the error budget
+/// because notifications are more frequent and rarely need full fidelity.
+pub const NOTIFICATION_DETAIL_HYDRATION_BUDGET: usize = 512;
+
+/// Format a Notification block for inclusion in LLM context (D-34).
+///
+/// Produces an XML-ish envelope; truncates `detail` to
+/// `NOTIFICATION_DETAIL_HYDRATION_BUDGET`.
+pub fn format_notification_for_llm(block: &BlockSnapshot) -> String {
+    let payload = match &block.notification {
+        Some(p) => p,
+        None => return block.content.clone(),
+    };
+
+    let mut attrs = format!(
+        "instance=\"{}\" kind=\"{}\"",
+        payload.instance, payload.kind,
+    );
+    if let Some(level) = payload.level {
+        attrs.push_str(&format!(" level=\"{}\"", level));
+    }
+    if let Some(ref tool) = payload.tool {
+        attrs.push_str(&format!(" tool=\"{}\"", tool));
+    }
+    if let Some(count) = payload.count {
+        attrs.push_str(&format!(" count=\"{}\"", count));
+    }
+
+    let body = if let Some(ref detail) = payload.detail {
+        if detail.chars().count() > NOTIFICATION_DETAIL_HYDRATION_BUDGET {
+            let truncated: String = detail
+                .chars()
+                .take(NOTIFICATION_DETAIL_HYDRATION_BUDGET)
+                .collect();
+            format!("{}\n...[truncated]", truncated)
+        } else {
+            detail.clone()
+        }
+    } else {
+        block.content.clone()
+    };
+
+    format!("<notification {}>\n{}\n</notification>", attrs, body)
+}
+
 /// Execution status for blocks (CRDT-synced).
 ///
 /// Discriminant order matters for LWW tiebreaking: when two peers write at the
@@ -575,6 +763,7 @@ impl std::fmt::Display for Status {
 /// - `ToolKind` on ToolCall/ToolResult — which execution engine
 /// - `DriftKind` on Drift — how content transferred
 /// - `ErrorPayload` on Error — category, severity, diagnostics
+/// - `NotificationPayload` on Notification — broker-emitted tool/log events
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default, EnumString)]
 #[serde(rename_all = "lowercase")]
 #[strum(ascii_case_insensitive)]
@@ -611,6 +800,13 @@ pub enum BlockKind {
     #[serde(rename = "error")]
     #[strum(serialize = "error")]
     Error,
+    /// Broker-emitted notification about a tool source (ToolAdded, ToolRemoved,
+    /// Log, PromptsChanged, Coalesced). `content` carries the summary line;
+    /// `NotificationPayload` carries structured metadata (instance, kind,
+    /// level, tool, count, detail). Visible to the LLM (D-34).
+    #[serde(rename = "notification")]
+    #[strum(serialize = "notification")]
+    Notification,
 }
 
 impl BlockKind {
@@ -630,6 +826,7 @@ impl BlockKind {
             BlockKind::Drift => "drift",
             BlockKind::File => "file",
             BlockKind::Error => "error",
+            BlockKind::Notification => "notification",
         }
     }
 
@@ -651,6 +848,11 @@ impl BlockKind {
     /// Check if this is an error block.
     pub fn is_error(&self) -> bool {
         matches!(self, BlockKind::Error)
+    }
+
+    /// Check if this is a notification block.
+    pub fn is_notification(&self) -> bool {
+        matches!(self, BlockKind::Notification)
     }
 }
 
@@ -858,6 +1060,12 @@ pub struct BlockSnapshot {
     #[serde(default)]
     pub error: Option<ErrorPayload>,
 
+    // Notification-specific fields (Notification)
+    /// Structured notification payload. Present only when
+    /// `kind == BlockKind::Notification`.
+    #[serde(default)]
+    pub notification: Option<NotificationPayload>,
+
     // Content type hint
     /// Content type for rendering. When not `Plain`, consumers skip heuristic
     /// detection and use the declared type directly.
@@ -944,6 +1152,7 @@ impl BlockSnapshot {
             drift_kind: None,
             file_path: None,
             error: None,
+            notification: None,
             content_type: ContentType::Plain,
             order_key: None,
             updated_at: 0,
@@ -988,6 +1197,7 @@ impl BlockSnapshot {
             drift_kind: None,
             file_path: None,
             error: None,
+            notification: None,
             content_type: ContentType::Plain,
             order_key: None,
             updated_at: 0,
@@ -1044,6 +1254,7 @@ impl BlockSnapshot {
             drift_kind: None,
             file_path: None,
             error: None,
+            notification: None,
             content_type: ContentType::Plain,
             order_key: None,
             updated_at: 0,
@@ -1100,6 +1311,7 @@ impl BlockSnapshot {
             drift_kind: None,
             file_path: None,
             error: None,
+            notification: None,
             content_type: ContentType::Plain,
             order_key: None,
             updated_at: 0,
@@ -1160,6 +1372,7 @@ impl BlockSnapshot {
             drift_kind: None,
             file_path: None,
             error: None,
+            notification: None,
             content_type: ContentType::Plain,
             order_key: None,
             updated_at: 0,
@@ -1211,6 +1424,7 @@ impl BlockSnapshot {
             drift_kind: Some(drift_kind),
             file_path: None,
             error: None,
+            notification: None,
             content_type: ContentType::Plain,
             order_key: None,
             updated_at: 0,
@@ -1260,6 +1474,7 @@ impl BlockSnapshot {
             drift_kind: None,
             file_path: Some(file_path.into()),
             error: None,
+            notification: None,
             content_type: ContentType::Plain,
             order_key: None,
             updated_at: 0,
@@ -1309,6 +1524,7 @@ impl BlockSnapshot {
             drift_kind: None,
             file_path: None,
             error: Some(payload),
+            notification: None,
             content_type: ContentType::Plain,
             order_key: None,
             updated_at: 0,
@@ -1354,6 +1570,62 @@ impl BlockSnapshot {
             drift_kind: None,
             file_path: None,
             error: Some(payload),
+            notification: None,
+            content_type: ContentType::Plain,
+            order_key: None,
+            updated_at: 0,
+            status_at: 0,
+            collapsed_at: 0,
+            ephemeral_at: 0,
+            excluded_at: 0,
+            compacted_at: 0,
+            tool_meta_at: 0,
+            content_type_at: 0,
+        }
+    }
+
+    /// Create a notification block (broker-emitted event).
+    ///
+    /// `parent_id` is typically `None` — notifications are root-level events
+    /// tied to a context by their `context_id`, not to a specific parent block.
+    /// The caller may supply a parent when the notification is about a specific
+    /// block (e.g. a tool-use that failed).
+    pub fn notification_block(
+        id: BlockId,
+        parent_id: Option<BlockId>,
+        payload: NotificationPayload,
+        summary: impl Into<String>,
+    ) -> Self {
+        assert!(
+            parent_id.is_none_or(|p| p.context_id == id.context_id),
+            "parent_id must be in same context as notification block"
+        );
+        Self {
+            id,
+            parent_id,
+            role: Role::System,
+            status: Status::Done,
+            kind: BlockKind::Notification,
+            content: summary.into(),
+            collapsed: false,
+            compacted: false,
+            ephemeral: false,
+            excluded: false,
+            created_at: crate::now_millis(),
+            tool_kind: None,
+            tool_name: None,
+            tool_input: None,
+            tool_use_id: None,
+            tool_call_id: None,
+            exit_code: None,
+            is_error: false,
+            output: None,
+            source_context: None,
+            source_model: None,
+            drift_kind: None,
+            file_path: None,
+            error: None,
+            notification: Some(payload),
             content_type: ContentType::Plain,
             order_key: None,
             updated_at: 0,
@@ -1414,6 +1686,7 @@ impl BlockSnapshot {
             && self.drift_kind == other.drift_kind
             && self.file_path == other.file_path
             && self.error == other.error
+            && self.notification == other.notification
             && self.content_type == other.content_type
             && self.order_key == other.order_key
     }
@@ -1472,6 +1745,7 @@ impl BlockSnapshotBuilder {
                 drift_kind: None,
                 file_path: None,
                 error: None,
+                notification: None,
                 content_type: ContentType::Plain,
                 order_key: None,
                 updated_at: 0,
@@ -1603,6 +1877,13 @@ impl BlockSnapshotBuilder {
         self.snap.error = Some(payload);
         self.snap.kind = BlockKind::Error;
         self.snap.status = Status::Error;
+        self.snap.role = Role::System;
+        self
+    }
+
+    pub fn notification_payload(mut self, payload: NotificationPayload) -> Self {
+        self.snap.notification = Some(payload);
+        self.snap.kind = BlockKind::Notification;
         self.snap.role = Role::System;
         self
     }
@@ -3598,5 +3879,227 @@ mod tests {
             "hello",
         );
         assert!(!f.matches(&text_block));
+    }
+
+    // ── BlockKind::Notification + NotificationPayload ──────────────────
+
+    #[test]
+    fn test_block_kind_notification_parses() {
+        assert_eq!(
+            BlockKind::from_str("notification"),
+            Some(BlockKind::Notification)
+        );
+        assert_eq!(
+            BlockKind::from_str("NOTIFICATION"),
+            Some(BlockKind::Notification)
+        );
+        assert_eq!(BlockKind::Notification.as_str(), "notification");
+        assert!(BlockKind::Notification.is_notification());
+        assert!(!BlockKind::Text.is_notification());
+    }
+
+    #[test]
+    fn test_block_kind_notification_serde_roundtrip() {
+        let json = serde_json::to_string(&BlockKind::Notification).unwrap();
+        assert_eq!(json, "\"notification\"");
+        let parsed: BlockKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, BlockKind::Notification);
+    }
+
+    fn test_notification_payload() -> NotificationPayload {
+        NotificationPayload {
+            instance: "builtin.block".into(),
+            kind: NotificationKind::ToolAdded,
+            level: None,
+            tool: Some("block_create".into()),
+            count: None,
+            detail: None,
+        }
+    }
+
+    #[test]
+    fn test_notification_payload_summary_line_tool_added() {
+        let p = test_notification_payload();
+        assert_eq!(
+            p.summary_line(),
+            "[builtin.block] tool added: block_create"
+        );
+    }
+
+    #[test]
+    fn test_notification_payload_summary_line_log_with_detail() {
+        let p = NotificationPayload {
+            instance: "gpal".into(),
+            kind: NotificationKind::Log,
+            level: Some(LogLevel::Warn),
+            tool: None,
+            count: None,
+            detail: Some("retrying after 503\nnext delay 2s".into()),
+        };
+        assert_eq!(
+            p.summary_line(),
+            "[gpal] warn: retrying after 503"
+        );
+    }
+
+    #[test]
+    fn test_notification_payload_summary_line_coalesced() {
+        let p = NotificationPayload {
+            instance: "gpal".into(),
+            kind: NotificationKind::Coalesced,
+            level: None,
+            tool: None,
+            count: Some(12),
+            detail: Some("log".into()),
+        };
+        let s = p.summary_line();
+        assert!(s.contains("12"));
+        assert!(s.contains("log"));
+        assert!(s.contains("gpal"));
+    }
+
+    #[test]
+    fn test_notification_payload_postcard_roundtrip() {
+        let p = test_notification_payload();
+        let bytes = postcard::to_stdvec(&p).unwrap();
+        let parsed: NotificationPayload = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(p, parsed);
+    }
+
+    #[test]
+    fn test_notification_block_constructor_sets_fields() {
+        let ctx = test_context();
+        let id = BlockId::new(ctx, PrincipalId::system(), 1);
+        let payload = test_notification_payload();
+        let snap =
+            BlockSnapshot::notification_block(id, None, payload.clone(), "tool added: block_create");
+
+        assert_eq!(snap.kind, BlockKind::Notification);
+        assert_eq!(snap.role, Role::System);
+        assert_eq!(snap.status, Status::Done);
+        assert_eq!(snap.notification, Some(payload));
+        assert!(snap.parent_id.is_none());
+    }
+
+    #[test]
+    fn test_text_constructor_has_no_notification_payload() {
+        let ctx = test_context();
+        let snap = BlockSnapshot::text(
+            BlockId::new(ctx, test_agent(), 1),
+            None,
+            Role::User,
+            "hello",
+        );
+        assert!(snap.notification.is_none());
+    }
+
+    #[test]
+    fn test_notification_block_snapshot_json_roundtrip() {
+        let ctx = test_context();
+        let id = BlockId::new(ctx, PrincipalId::system(), 1);
+        let snap = BlockSnapshot::notification_block(
+            id,
+            None,
+            test_notification_payload(),
+            "tool added",
+        );
+        let json = serde_json::to_string(&snap).unwrap();
+        let parsed: BlockSnapshot = serde_json::from_str(&json).unwrap();
+        assert!(parsed.content_eq(&snap));
+        assert_eq!(parsed.notification, snap.notification);
+    }
+
+    #[test]
+    fn test_notification_block_content_eq_includes_notification_field() {
+        let ctx = test_context();
+        let id = BlockId::new(ctx, PrincipalId::system(), 1);
+        let snap1 =
+            BlockSnapshot::notification_block(id, None, test_notification_payload(), "a");
+        let snap2 = BlockSnapshot::notification_block(
+            id,
+            None,
+            NotificationPayload {
+                kind: NotificationKind::ToolRemoved,
+                ..test_notification_payload()
+            },
+            "a",
+        );
+        assert!(!snap1.content_eq(&snap2));
+    }
+
+    #[test]
+    fn test_builder_notification_payload() {
+        let ctx = test_context();
+        let id = BlockId::new(ctx, test_agent(), 1);
+        let payload = test_notification_payload();
+        let snap = BlockSnapshotBuilder::new(id, BlockKind::Text)
+            .content("tool added")
+            .notification_payload(payload.clone())
+            .build();
+        assert_eq!(snap.kind, BlockKind::Notification);
+        assert_eq!(snap.role, Role::System);
+        assert_eq!(snap.notification, Some(payload));
+    }
+
+    #[test]
+    fn format_notification_for_llm_envelope_shape() {
+        let ctx = test_context();
+        let id = BlockId::new(ctx, PrincipalId::system(), 1);
+        let payload = NotificationPayload {
+            instance: "gpal".into(),
+            kind: NotificationKind::Log,
+            level: Some(LogLevel::Warn),
+            tool: None,
+            count: None,
+            detail: Some("upstream timeout".into()),
+        };
+        let snap =
+            BlockSnapshot::notification_block(id, None, payload, "warn");
+        let formatted = format_notification_for_llm(&snap);
+        assert!(formatted.starts_with("<notification "));
+        assert!(formatted.ends_with("</notification>"));
+        assert!(formatted.contains("instance=\"gpal\""));
+        assert!(formatted.contains("kind=\"log\""));
+        assert!(formatted.contains("level=\"warn\""));
+        assert!(formatted.contains("upstream timeout"));
+    }
+
+    #[test]
+    fn format_notification_for_llm_truncates_over_budget() {
+        let ctx = test_context();
+        let id = BlockId::new(ctx, PrincipalId::system(), 1);
+        let long = "x".repeat(NOTIFICATION_DETAIL_HYDRATION_BUDGET + 500);
+        let payload = NotificationPayload {
+            instance: "gpal".into(),
+            kind: NotificationKind::Log,
+            level: Some(LogLevel::Error),
+            tool: None,
+            count: None,
+            detail: Some(long),
+        };
+        let snap =
+            BlockSnapshot::notification_block(id, None, payload, "giant log");
+        let formatted = format_notification_for_llm(&snap);
+        assert!(formatted.contains("...[truncated]"));
+    }
+
+    #[test]
+    fn format_notification_for_llm_no_payload_returns_content() {
+        let ctx = test_context();
+        let snap = BlockSnapshot::text(
+            BlockId::new(ctx, test_agent(), 1),
+            None,
+            Role::System,
+            "fallback content",
+        );
+        assert_eq!(format_notification_for_llm(&snap), "fallback content");
+    }
+
+    #[test]
+    fn test_notification_kind_serde_snake_case() {
+        let j = serde_json::to_string(&NotificationKind::ToolAdded).unwrap();
+        assert_eq!(j, "\"tool_added\"");
+        let j = serde_json::to_string(&NotificationKind::PromptsChanged).unwrap();
+        assert_eq!(j, "\"prompts_changed\"");
     }
 }

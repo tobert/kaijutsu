@@ -617,6 +617,44 @@ impl BlockStore {
         Ok(id)
     }
 
+    /// Insert a notification block (broker-emitted tool/log event).
+    ///
+    /// `parent_id` is typically `None` — notifications are root-level events.
+    /// Callers may pass a parent when the notification is about a specific
+    /// block (e.g. a failed tool call).
+    pub fn insert_notification_block(
+        &mut self,
+        parent_id: Option<&BlockId>,
+        after: Option<&BlockId>,
+        payload: &kaijutsu_types::NotificationPayload,
+        summary: impl Into<String>,
+    ) -> Result<BlockId> {
+        let id = self.new_block_id();
+
+        if let Some(after_id) = after
+            && (!self.blocks.contains_key(after_id) || self.blocks[after_id].is_deleted())
+        {
+            return Err(CrdtError::InvalidReference(*after_id));
+        }
+        if let Some(pid) = parent_id
+            && (!self.blocks.contains_key(pid) || self.blocks[pid].is_deleted())
+        {
+            return Err(CrdtError::InvalidReference(*pid));
+        }
+
+        let order_key = self.calc_order_key(after);
+        let snap = BlockSnapshot::notification_block(
+            id,
+            parent_id.copied(),
+            payload.clone(),
+            summary,
+        );
+        let block = BlockContent::from_snapshot(&snap, self.agent_id, order_key);
+        self.blocks.insert(id, block);
+        self.version += 1;
+        Ok(id)
+    }
+
     /// Insert a block from a complete snapshot (for remote sync / restore).
     pub fn insert_from_snapshot(
         &mut self,

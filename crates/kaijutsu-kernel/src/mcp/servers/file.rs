@@ -268,7 +268,7 @@ mod tests {
         let cache = Arc::new(FileDocumentCache::new(store, vfs.clone()));
 
         let server = Arc::new(FileToolsServer::new(cache, vfs, None));
-        let broker = Broker::new();
+        let broker = Arc::new(Broker::new());
         broker
             .register(server, InstancePolicy::default())
             .await

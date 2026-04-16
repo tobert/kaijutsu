@@ -1683,6 +1683,7 @@ fn set_block_filter_builder(
                     BlockKind::Drift => crate::kaijutsu_capnp::BlockKind::Drift,
                     BlockKind::File => crate::kaijutsu_capnp::BlockKind::File,
                     BlockKind::Error => crate::kaijutsu_capnp::BlockKind::Error,
+                    BlockKind::Notification => crate::kaijutsu_capnp::BlockKind::Notification,
                 },
             );
         }
@@ -1811,6 +1812,7 @@ fn set_block_event_filter_builder(
                     BlockKind::Drift => crate::kaijutsu_capnp::BlockKind::Drift,
                     BlockKind::File => crate::kaijutsu_capnp::BlockKind::File,
                     BlockKind::Error => crate::kaijutsu_capnp::BlockKind::Error,
+                    BlockKind::Notification => crate::kaijutsu_capnp::BlockKind::Notification,
                 },
             );
         }
@@ -2011,7 +2013,7 @@ pub(crate) fn parse_block_snapshot(
     // Parse block ID
     let id = parse_block_id(&reader.get_id()?)?;
 
-    // Parse kind (7 variants)
+    // Parse kind (8 variants)
     let kind = match reader.get_kind()? {
         crate::kaijutsu_capnp::BlockKind::Text => BlockKind::Text,
         crate::kaijutsu_capnp::BlockKind::Thinking => BlockKind::Thinking,
@@ -2020,6 +2022,7 @@ pub(crate) fn parse_block_snapshot(
         crate::kaijutsu_capnp::BlockKind::Drift => BlockKind::Drift,
         crate::kaijutsu_capnp::BlockKind::File => BlockKind::File,
         crate::kaijutsu_capnp::BlockKind::Error => BlockKind::Error,
+        crate::kaijutsu_capnp::BlockKind::Notification => BlockKind::Notification,
     };
 
     let mut builder = BlockSnapshotBuilder::new(id, kind);
@@ -2208,6 +2211,7 @@ pub(crate) fn parse_block_snapshot(
                 crate::kaijutsu_capnp::BlockKind::Drift => BlockKind::Drift,
                 crate::kaijutsu_capnp::BlockKind::File => BlockKind::File,
                 crate::kaijutsu_capnp::BlockKind::Error => BlockKind::Error,
+                crate::kaijutsu_capnp::BlockKind::Notification => BlockKind::Notification,
             })
         } else {
             None
@@ -2219,6 +2223,65 @@ pub(crate) fn parse_block_snapshot(
             detail,
             span,
             source_kind,
+        });
+    }
+
+    // Notification payload (for Notification blocks)
+    if reader.get_has_notification_payload()
+        && let Ok(np) = reader.get_notification_payload()
+    {
+        let instance = np.get_instance().ok()
+            .and_then(|s| s.to_str().ok())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let kind = match np.get_kind()? {
+            crate::kaijutsu_capnp::NotificationKind::ToolAdded => {
+                kaijutsu_types::NotificationKind::ToolAdded
+            }
+            crate::kaijutsu_capnp::NotificationKind::ToolRemoved => {
+                kaijutsu_types::NotificationKind::ToolRemoved
+            }
+            crate::kaijutsu_capnp::NotificationKind::Log => {
+                kaijutsu_types::NotificationKind::Log
+            }
+            crate::kaijutsu_capnp::NotificationKind::PromptsChanged => {
+                kaijutsu_types::NotificationKind::PromptsChanged
+            }
+            crate::kaijutsu_capnp::NotificationKind::Coalesced => {
+                kaijutsu_types::NotificationKind::Coalesced
+            }
+        };
+        let level = if np.get_has_level() {
+            np.get_level().ok().map(|l| match l {
+                crate::kaijutsu_capnp::LogLevel::Trace => kaijutsu_types::LogLevel::Trace,
+                crate::kaijutsu_capnp::LogLevel::Debug => kaijutsu_types::LogLevel::Debug,
+                crate::kaijutsu_capnp::LogLevel::Info => kaijutsu_types::LogLevel::Info,
+                crate::kaijutsu_capnp::LogLevel::Warn => kaijutsu_types::LogLevel::Warn,
+                crate::kaijutsu_capnp::LogLevel::Error => kaijutsu_types::LogLevel::Error,
+            })
+        } else {
+            None
+        };
+        let tool = np.get_tool().ok()
+            .and_then(|s| s.to_str().ok())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        let count = if np.get_has_count() {
+            Some(np.get_count() as usize)
+        } else {
+            None
+        };
+        let detail = np.get_detail().ok()
+            .and_then(|s| s.to_str().ok())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        builder = builder.notification_payload(kaijutsu_types::NotificationPayload {
+            instance,
+            kind,
+            level,
+            tool,
+            count,
+            detail,
         });
     }
 
@@ -2470,6 +2533,7 @@ mod tests {
             BlockKind::Drift => crate::kaijutsu_capnp::BlockKind::Drift,
             BlockKind::File => crate::kaijutsu_capnp::BlockKind::File,
             BlockKind::Error => crate::kaijutsu_capnp::BlockKind::Error,
+            BlockKind::Notification => crate::kaijutsu_capnp::BlockKind::Notification,
         });
 
         // Set role
@@ -2505,6 +2569,50 @@ mod tests {
                 ToolKind::Mcp => crate::kaijutsu_capnp::ToolKind::Mcp,
                 ToolKind::Builtin => crate::kaijutsu_capnp::ToolKind::Builtin,
             });
+        }
+
+        // Set notification payload if present (D-36).
+        if let Some(ref payload) = snap.notification {
+            builder.set_has_notification_payload(true);
+            let mut np = builder.reborrow().init_notification_payload();
+            np.set_instance(&payload.instance);
+            np.set_kind(match payload.kind {
+                kaijutsu_types::NotificationKind::ToolAdded => {
+                    crate::kaijutsu_capnp::NotificationKind::ToolAdded
+                }
+                kaijutsu_types::NotificationKind::ToolRemoved => {
+                    crate::kaijutsu_capnp::NotificationKind::ToolRemoved
+                }
+                kaijutsu_types::NotificationKind::Log => {
+                    crate::kaijutsu_capnp::NotificationKind::Log
+                }
+                kaijutsu_types::NotificationKind::PromptsChanged => {
+                    crate::kaijutsu_capnp::NotificationKind::PromptsChanged
+                }
+                kaijutsu_types::NotificationKind::Coalesced => {
+                    crate::kaijutsu_capnp::NotificationKind::Coalesced
+                }
+            });
+            if let Some(level) = payload.level {
+                np.set_has_level(true);
+                np.set_level(match level {
+                    kaijutsu_types::LogLevel::Trace => crate::kaijutsu_capnp::LogLevel::Trace,
+                    kaijutsu_types::LogLevel::Debug => crate::kaijutsu_capnp::LogLevel::Debug,
+                    kaijutsu_types::LogLevel::Info => crate::kaijutsu_capnp::LogLevel::Info,
+                    kaijutsu_types::LogLevel::Warn => crate::kaijutsu_capnp::LogLevel::Warn,
+                    kaijutsu_types::LogLevel::Error => crate::kaijutsu_capnp::LogLevel::Error,
+                });
+            }
+            if let Some(ref tool) = payload.tool {
+                np.set_tool(tool);
+            }
+            if let Some(count) = payload.count {
+                np.set_has_count(true);
+                np.set_count(count as u32);
+            }
+            if let Some(ref detail) = payload.detail {
+                np.set_detail(detail);
+            }
         }
 
         // Parse back
@@ -2580,6 +2688,162 @@ mod tests {
         let parsed = roundtrip_snapshot(&snap);
 
         assert_eq!(parsed.tool_kind, Some(ToolKind::Mcp));
+    }
+
+    // ── Phase 2: NotificationPayload capnp roundtrip (D-36) ───────────────
+    //
+    // Capnp wire maps use two fragile patterns for optional fields:
+    //   (a) explicit `has_<field>` flags paired with a value slot
+    //       (level, count) — forgetting the flag-setter on encode silently
+    //       drops the value; forgetting the flag-check on decode reads
+    //       whatever garbage was in the slot.
+    //   (b) empty-string sentinels for Option<String> (tool, detail) —
+    //       the encoder omits a None, the decoder filters "" back to None.
+    //
+    // A pure-Rust unit test can't catch either failure. These roundtrips
+    // encode into a capnp builder, re-read through `parse_block_snapshot`,
+    // and compare the payload structurally. Coverage split across three
+    // tests so a failure pinpoints which axis broke (kind variants, flag
+    // pairs, or None-sentinel handling) instead of failing one fat assert.
+    //
+    // `roundtrip_snapshot` was extended above to include the notification
+    // encoder branch; these tests exercise that branch + the decoder in
+    // `parse_block_snapshot`.
+
+    fn notif_ctx_id() -> BlockId {
+        BlockId {
+            context_id: ContextId::new(),
+            agent_id: PrincipalId::system(),
+            seq: 42,
+        }
+    }
+
+    #[test]
+    fn test_notification_payload_capnp_roundtrip_full() {
+        // Exercise every field populated at once — the "happy path" for a
+        // Log notification (most populated kind).
+        let id = notif_ctx_id();
+        let payload = kaijutsu_types::NotificationPayload {
+            instance: "gpal".into(),
+            kind: kaijutsu_types::NotificationKind::Log,
+            level: Some(kaijutsu_types::LogLevel::Warn),
+            tool: Some("consult_gemini".into()),
+            count: Some(3),
+            detail: Some("upstream timeout; retrying".into()),
+        };
+        let snap = BlockSnapshotBuilder::new(id, BlockKind::Text)
+            .role(Role::System)
+            .content("[gpal] warn: upstream timeout; retrying")
+            .notification_payload(payload.clone())
+            .build();
+
+        let parsed = roundtrip_snapshot(&snap);
+
+        assert_eq!(parsed.kind, BlockKind::Notification);
+        assert_eq!(parsed.notification, Some(payload));
+    }
+
+    #[test]
+    fn test_notification_payload_capnp_roundtrip_minimal() {
+        // Minimal payload: only `instance` + `kind` populated. This locks
+        // the `has_*` flag / empty-string-sentinel discipline: a None on
+        // encode must round-trip back to None, not Some("") or Some(0).
+        let id = notif_ctx_id();
+        let payload = kaijutsu_types::NotificationPayload {
+            instance: "builtin.block".into(),
+            kind: kaijutsu_types::NotificationKind::PromptsChanged,
+            level: None,
+            tool: None,
+            count: None,
+            detail: None,
+        };
+        let snap = BlockSnapshotBuilder::new(id, BlockKind::Text)
+            .role(Role::System)
+            .notification_payload(payload.clone())
+            .build();
+
+        let parsed = roundtrip_snapshot(&snap);
+
+        let parsed_payload = parsed.notification.expect("notification must survive");
+        assert_eq!(parsed_payload.instance, "builtin.block");
+        assert_eq!(
+            parsed_payload.kind,
+            kaijutsu_types::NotificationKind::PromptsChanged
+        );
+        assert_eq!(parsed_payload.level, None, "has_level=false must yield None");
+        assert_eq!(parsed_payload.tool, None, "empty tool must yield None");
+        assert_eq!(parsed_payload.count, None, "has_count=false must yield None");
+        assert_eq!(parsed_payload.detail, None, "empty detail must yield None");
+    }
+
+    #[test]
+    fn test_notification_payload_capnp_roundtrip_all_kind_variants() {
+        // One test per NotificationKind variant — catches a mis-ordered
+        // capnp enum ordinal (e.g. `toolAdded @1; toolRemoved @0` swap)
+        // which would silently alias ToolAdded ↔ ToolRemoved on the wire.
+        let id = notif_ctx_id();
+        let kinds = [
+            kaijutsu_types::NotificationKind::ToolAdded,
+            kaijutsu_types::NotificationKind::ToolRemoved,
+            kaijutsu_types::NotificationKind::Log,
+            kaijutsu_types::NotificationKind::PromptsChanged,
+            kaijutsu_types::NotificationKind::Coalesced,
+        ];
+        for kind in kinds {
+            let payload = kaijutsu_types::NotificationPayload {
+                instance: "svc".into(),
+                kind,
+                level: None,
+                tool: None,
+                count: None,
+                detail: None,
+            };
+            let snap = BlockSnapshotBuilder::new(id, BlockKind::Text)
+                .role(Role::System)
+                .notification_payload(payload.clone())
+                .build();
+            let parsed = roundtrip_snapshot(&snap);
+            assert_eq!(
+                parsed.notification.map(|p| p.kind),
+                Some(kind),
+                "NotificationKind::{:?} did not roundtrip through capnp",
+                kind,
+            );
+        }
+    }
+
+    #[test]
+    fn test_notification_payload_capnp_roundtrip_all_log_levels() {
+        // Same ordinal-aliasing risk for LogLevel. One test per variant.
+        let id = notif_ctx_id();
+        let levels = [
+            kaijutsu_types::LogLevel::Trace,
+            kaijutsu_types::LogLevel::Debug,
+            kaijutsu_types::LogLevel::Info,
+            kaijutsu_types::LogLevel::Warn,
+            kaijutsu_types::LogLevel::Error,
+        ];
+        for level in levels {
+            let payload = kaijutsu_types::NotificationPayload {
+                instance: "svc".into(),
+                kind: kaijutsu_types::NotificationKind::Log,
+                level: Some(level),
+                tool: None,
+                count: None,
+                detail: Some("m".into()),
+            };
+            let snap = BlockSnapshotBuilder::new(id, BlockKind::Text)
+                .role(Role::System)
+                .notification_payload(payload.clone())
+                .build();
+            let parsed = roundtrip_snapshot(&snap);
+            assert_eq!(
+                parsed.notification.and_then(|p| p.level),
+                Some(level),
+                "LogLevel::{:?} did not roundtrip through capnp",
+                level,
+            );
+        }
     }
 }
 

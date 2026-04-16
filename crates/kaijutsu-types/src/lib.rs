@@ -61,8 +61,9 @@ pub use kaish_types::output::{EntryType as OutputEntryType, OutputData, OutputNo
 pub use block::{
     BlockEventFilter, BlockFilter, BlockFlowKind, BlockHeader, BlockId, BlockKind, BlockQuery,
     BlockSnapshot, BlockSnapshotBuilder, ContentType, DriftKind, ErrorCategory, ErrorPayload,
-    ErrorSeverity, ErrorSpan, MAX_DAG_DEPTH, Role, Status, ToolKind, ERROR_DETAIL_HYDRATION_BUDGET,
-    format_error_for_llm,
+    ErrorSeverity, ErrorSpan, LogLevel, MAX_DAG_DEPTH, NotificationKind, NotificationPayload,
+    Role, Status, ToolKind, ERROR_DETAIL_HYDRATION_BUDGET, NOTIFICATION_DETAIL_HYDRATION_BUDGET,
+    format_error_for_llm, format_notification_for_llm,
 };
 pub use error_block::IntoErrorPayload;
 pub use compaction::CompactionBoundary;

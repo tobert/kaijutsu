@@ -104,7 +104,7 @@ mod tests {
     async fn whoami_reaches_broker() {
         let drift = shared_drift_router();
         let server = Arc::new(KernelInfoServer::new(drift));
-        let broker = Broker::new();
+        let broker = Arc::new(Broker::new());
         broker
             .register(server.clone(), InstancePolicy::default())
             .await
@@ -135,7 +135,7 @@ mod tests {
     async fn whoami_rejects_unknown_tool() {
         let drift = shared_drift_router();
         let server = Arc::new(KernelInfoServer::new(drift));
-        let broker = Broker::new();
+        let broker = Arc::new(Broker::new());
         broker
             .register(server, InstancePolicy::default())
             .await

@@ -105,6 +105,7 @@ mod tests {
             tool_meta_at: 0,
             content_type_at: 0,
             error: None,
+            notification: None,
         }
     }
 
