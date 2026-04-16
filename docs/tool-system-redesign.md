@@ -6,8 +6,8 @@ This document is the source of truth for reworking the kaijutsu-kernel tool
 system around MCP as the uniform interface. It is intended to be read by
 future planners and executors at the start of each phase.
 
-> **For future planners and executors:** read the whole document before
-> proposing or executing work. See [§10 Working with this document](#10-working-with-this-document)
+> **For future planners :** read the whole document first.
+> See [§10 Working with this document](#10-working-with-this-document)
 > for the update protocol. If a proposed change would alter a decision
 > recorded in [§6 Decisions](#6-decisions-locked), STOP and surface it to
 > the user — do not quietly rewrite direction. Decisions use stable
@@ -1077,3 +1077,22 @@ Entries are append-only. Most recent at the bottom.
   + 45 server tests pass. End-to-end app-session and external MCP
   round-trip verification holds for a subsequent live session on the
   user's GPU server.
+- **2026-04-16** (Phase 1 closure, Amy + Claude Opus 4.6): Post-phase
+  review caught that `cargo test --workspace` failed to compile —
+  `crates/kaijutsu-server/tests/e2e_dispatch.rs` still imported the
+  deleted `kaijutsu_kernel::tools::EngineArgs`. The M6 commit had
+  only run `cargo test --lib`, hiding integration-test failures.
+  Fix: trimmed 5 Tier-0 `EngineArgs::to_argv` tests from
+  `e2e_dispatch.rs`; kept 4 Tier-3 shell-dispatch tests. Broker-layer
+  invariants had zero direct tests — added 19 new tests (6 in
+  `broker.rs`, 4 in `binding.rs`, 5 in `coalescer.rs`, 4 in new
+  integration file `crates/kaijutsu-kernel/tests/broker_e2e.rs`)
+  covering D-20 sticky resolution, D-27 policy enforcement (timeout /
+  concurrency / size cap — the last closes exit criterion #8), D-06
+  tool-removed, D-28 is_error→`ExecResult::failure` mapping, §5.3
+  ToolsChanged never-coalesces rule. Suite now: 432 kernel lib +
+  4 broker_e2e + 45 server tests. A closure-driven
+  `MockServer: McpServerLike` fake lives test-only in `broker.rs` and
+  the integration file. No live code references to deleted names
+  remain; comment-only historical references preserved in
+  `mcp/mod.rs` and `servers/external.rs` per doc-line-843 allowance.

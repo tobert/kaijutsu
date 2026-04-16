@@ -1,88 +1,14 @@
-//! End-to-end integration tests for kaish→engine dispatch paths.
+//! End-to-end integration tests for shell dispatch through `EmbeddedKaish`.
 //!
-//! # Tiers
-//!
-//! - **Tier 0:** EngineArgs unit tests — JSON→argv reconstruction in isolation
-//! - **Tier 3:** Shell command e2e through EmbeddedKaish
+//! Exercises the kaish → kernel shell path with a tempdir-backed VFS so
+//! `ls`, `cat`, `echo` etc. resolve deterministically regardless of host.
+
 use std::sync::Arc;
 
 use kaijutsu_crdt::{ContextId, PrincipalId};
-use kaijutsu_kernel::tools::EngineArgs;
 use kaijutsu_kernel::{Kernel, LocalBackend, shared_block_store};
 use kaijutsu_server::EmbeddedKaish;
 use kaijutsu_types::DocKind;
-
-// ============================================================================
-// Tier 0: EngineArgs unit tests (kaish-style JSON → argv reconstruction)
-// ============================================================================
-
-#[test]
-fn engine_args_kaish_commit_m_reconstructs_correctly() {
-    // kaish splits `git commit -m "add hello"` into:
-    //   positional: ["commit", "add hello"], flags: {"m"}
-    let json = serde_json::json!({
-        "_positional": ["commit", "add hello"],
-        "m": true
-    });
-    let argv = EngineArgs::from_json(&json).to_argv();
-
-    // to_argv() should reconstruct: ["commit", "-m", "add hello"]
-    assert_eq!(argv[0], "commit");
-    assert!(
-        argv.contains(&"-m".to_string()),
-        "missing -m flag in {:?}",
-        argv
-    );
-    assert!(
-        argv.contains(&"add hello".to_string()),
-        "missing message in {:?}",
-        argv
-    );
-}
-
-#[test]
-fn engine_args_kaish_diff_cached_reconstructs_correctly() {
-    // kaish splits `git diff --cached` into:
-    //   positional: ["diff"], flags: {"cached"}
-    let json = serde_json::json!({
-        "_positional": ["diff"],
-        "cached": true
-    });
-    let argv = EngineArgs::from_json(&json).to_argv();
-    assert_eq!(argv, vec!["diff", "--cached"]);
-}
-
-#[test]
-fn engine_args_kaish_log_numeric_flag_reconstructs_correctly() {
-    // kaish splits `git log -5` into:
-    //   positional: ["log"], flags: {"5"}
-    let json = serde_json::json!({
-        "_positional": ["log"],
-        "5": true
-    });
-    let argv = EngineArgs::from_json(&json).to_argv();
-    assert_eq!(argv, vec!["log", "-5"]);
-}
-
-#[test]
-fn engine_args_llm_passthrough_unchanged() {
-    // LLMs put everything in _positional — no flags/named
-    let json = serde_json::json!({"_positional": ["commit", "-m", "hello world"]});
-    let argv = EngineArgs::from_json(&json).to_argv();
-    assert_eq!(argv, vec!["commit", "-m", "hello world"]);
-}
-
-#[test]
-fn engine_args_numeric_positional_coerced() {
-    // `drift cancel 1` — kaish may send 1 as JSON number
-    let json = serde_json::json!({"_positional": ["cancel", 1]});
-    let argv = EngineArgs::from_json(&json).to_argv();
-    assert_eq!(argv, vec!["cancel", "1"]);
-}
-
-// ============================================================================
-// Shell command e2e through EmbeddedKaish
-// ============================================================================
 
 /// Test filesystem fixture rooted in a tempdir.
 ///

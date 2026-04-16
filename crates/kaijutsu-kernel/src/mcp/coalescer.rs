@@ -88,3 +88,82 @@ impl NotificationCoalescer {
         &self.default_policy
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::thread;
+
+    use super::*;
+
+    fn policy(window_ms: u64, max_in_window: usize) -> CoalescePolicy {
+        CoalescePolicy {
+            window: Duration::from_millis(window_ms),
+            max_in_window,
+            hard_drop_after: None,
+        }
+    }
+
+    #[test]
+    fn observe_passes_through_within_cap() {
+        let c = NotificationCoalescer::new(policy(500, 3));
+        let inst = InstanceId::new("a");
+        assert!(c.observe(&inst, NotifKind::Log));
+        assert!(c.observe(&inst, NotifKind::Log));
+        assert!(c.observe(&inst, NotifKind::Log));
+    }
+
+    #[test]
+    fn observe_coalesces_beyond_cap() {
+        let c = NotificationCoalescer::new(policy(500, 3));
+        let inst = InstanceId::new("a");
+        assert!(c.observe(&inst, NotifKind::Log));
+        assert!(c.observe(&inst, NotifKind::Log));
+        assert!(c.observe(&inst, NotifKind::Log));
+        assert!(
+            !c.observe(&inst, NotifKind::Log),
+            "fourth Log within window should coalesce"
+        );
+    }
+
+    #[test]
+    fn independent_keys_do_not_interfere() {
+        let c = NotificationCoalescer::new(policy(500, 3));
+        let a = InstanceId::new("a");
+        let b = InstanceId::new("b");
+
+        for _ in 0..3 {
+            assert!(c.observe(&a, NotifKind::Log));
+        }
+        // b's window is fresh.
+        assert!(c.observe(&b, NotifKind::Log));
+        // Different kind for a is also fresh.
+        assert!(c.observe(&a, NotifKind::ResourceUpdated));
+    }
+
+    #[test]
+    fn tools_changed_never_coalesces() {
+        // §5.3 rule: ToolsChanged must always pass through. Phase 2 relies on
+        // this so tool-list-dirty events never get dropped.
+        let c = NotificationCoalescer::new(policy(500, 1));
+        let inst = InstanceId::new("a");
+        for _ in 0..10 {
+            assert!(
+                c.observe(&inst, NotifKind::ToolsChanged),
+                "ToolsChanged was coalesced (§5.3 violation)"
+            );
+        }
+    }
+
+    #[test]
+    fn window_resets_after_elapsed() {
+        let c = NotificationCoalescer::new(policy(20, 1));
+        let inst = InstanceId::new("a");
+        assert!(c.observe(&inst, NotifKind::Log));
+        assert!(!c.observe(&inst, NotifKind::Log));
+        thread::sleep(Duration::from_millis(30));
+        assert!(
+            c.observe(&inst, NotifKind::Log),
+            "window did not reset after elapsed duration"
+        );
+    }
+}
