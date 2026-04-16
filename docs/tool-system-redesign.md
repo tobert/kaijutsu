@@ -908,7 +908,6 @@ Exit criteria — concrete end-to-end scenarios that must pass:
 
 Plan: `~/.claude/plans/phase2-tool-notifications.md`
 
-
 `BlockKind::Notification` variant added. Broker subscribes to per-server
 notification streams, aggregates, coalesces via `NotificationCoalescer`
 (§5.3), tags with `instance_id`, and emits:
@@ -1127,26 +1126,61 @@ Entries are append-only. Most recent at the bottom.
   user's GPU server.
 - **2026-04-16** (Phase 2 execution — M1–M4 + M6, Amy + Claude Opus 4.7):
   Phase 2 code landed across four milestones. M1: `BlockKind::Notification`
-  + `NotificationPayload` rolled out end-to-end (kaijutsu-types, CRDT,
-  capnp @29/@30 + NotificationKind/LogLevel enums, client+server RPC
-  converters, app theme+format, LLM hydrator arm per D-34). M2: coalescer
-  rewritten around `ObserveOutcome { PassThrough | StartWindow | Coalesced
-  { so_far } }` with `flush()` returning the collapsed count (D-39). M3:
-  broker pump per registered instance subscribes to
-  `ServerNotification` streams; synthesizes per-tool `ToolAdded`/
-  `ToolRemoved` diffs on register/unregister (D-35); `set_documents`
-  setter threads `SharedBlockStore` in at bootstrap (D-37);
-  `register_silently` suppresses the three builtin bootstrap ToolAdded
-  events (D-38); flush timer tracked per `(InstanceId, NotifKind)` and
-  aborted on unregister. M4: `late_registration_visible_next_turn` test
-  locks "no cache" behavior — `build_tool_definitions` enumerates fresh
-  via `list_tool_defs_via_broker` each call. Decisions D-34..D-39
-  recorded. Suite adds: 8 coalescer tests, 7 broker M3 tests (covering
-  exit #1, #3, #4, D-35, D-38, D-39/R2, and ResourceUpdated-drop), 1
-  broker_e2e test (exit #2). Workspace tests green excluding the
-  long-standing `kaijutsu-index::test_neighbors` flake. Runner
-  verification (M5, exit scenarios against a live kaijutsu-runner on the
-  GPU server) pending — tracked in §8 Phase 2 status.
+  + `NotificationPayload` rolled out end-to-end (kaijutsu-types, CRDT
+  including new `insert_notification_block_as` primitive on
+  `SharedBlockStore`, capnp @29/@30 + NotificationKind/LogLevel enums,
+  client+server RPC converters, app theme+format, LLM hydrator arm per
+  D-34). M2: coalescer rewritten around `ObserveOutcome { PassThrough |
+  StartWindow | Coalesced { so_far } }` with `flush()` returning the
+  collapsed count (D-39). M3: broker pump per registered instance
+  subscribes to `ServerNotification` streams; synthesizes per-tool
+  `ToolAdded`/`ToolRemoved` diffs on register/unregister (D-35);
+  `set_documents` setter threads `SharedBlockStore` in at bootstrap
+  (D-37); `register_silently` suppresses the three builtin bootstrap
+  ToolAdded events (D-38); flush timer tracked per
+  `(InstanceId, NotifKind)` and aborted on unregister. M4:
+  `late_registration_visible_next_turn` test locks "no cache" behavior —
+  `build_tool_definitions` enumerates fresh via
+  `list_tool_defs_via_broker` each call. Decisions D-34..D-39 recorded.
+
+  Suite adds, organized by the question each test answers:
+  - **"Do the types round-trip?"** 15 block/payload tests in
+    `kaijutsu-types::block::tests` (kind parse + serde, payload summary
+    lines across kinds, JSON + postcard roundtrips, `content_eq` field
+    inclusion, `text` constructor leaves notification None, builder
+    notification arm, `format_notification_for_llm` envelope + truncation
+    + no-payload fallback, `NotificationKind` snake_case serde).
+  - **"Does the coalescer shape work?"** 8 tests in
+    `mcp::coalescer::tests` (passthrough within cap, `StartWindow` at
+    N+1, `Coalesced { so_far }` monotonic, ToolsChanged never coalesces,
+    window reset after elapsed, `flush` returns count and clears window,
+    `flush` on passthrough-only returns None, flush on untouched key
+    returns None).
+  - **"Does the broker emit the right blocks?"** 7 tests in
+    `mcp::broker::tests` covering exit criteria #1 / #3 / #4, D-35 per-
+    tool diff, D-38 silent register, D-39 / R2 flush-timer abort on
+    unregister, and ResourceUpdated being silently dropped in Phase 2.
+  - **"Does the hydrator actually surface the block to the LLM?"** 3
+    tests in `llm::tests::hydration` exercising the `BlockKind::
+    Notification` arm through `hydrate_from_blocks` (not just the
+    formatter): XML envelope shape, mid-turn flush discipline, System-
+    role filter carve-out.
+  - **"Is the wire format symmetric?"** 4 capnp roundtrip tests in
+    `kaijutsu-client::rpc::tests`: full populated payload, minimal
+    (`has_*`-flag / empty-string-sentinel discipline), every
+    `NotificationKind` variant (catches ordinal aliasing), every
+    `LogLevel` variant.
+  - **"Does the full chain work end-to-end without the app?"** 2 tests
+    in `kaijutsu-kernel/tests/broker_e2e.rs`:
+    `late_registration_visible_next_turn` (exit #2) and
+    `server_notification_reaches_llm_hydrator` — stitches register →
+    CRDT → `query_blocks` → `hydrate_from_blocks` using only production
+    APIs, so a shaky app UI cannot hide kernel-side regressions.
+
+  Workspace tests green excluding the long-standing
+  `kaijutsu-index::test_neighbors` flake. Runner verification (M5, exit
+  scenarios against a live kaijutsu-runner on the GPU server) pending —
+  tracked in §8 Phase 2 status.
 - **2026-04-16** (Phase 1 closure, Amy + Claude Opus 4.6): Post-phase
   review caught that `cargo test --workspace` failed to compile —
   `crates/kaijutsu-server/tests/e2e_dispatch.rs` still imported the
