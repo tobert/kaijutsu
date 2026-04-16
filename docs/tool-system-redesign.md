@@ -1353,3 +1353,49 @@ Entries are append-only. Most recent at the bottom.
   in §8 Phase 3 status. Wire format changed (capnp @31/@32 ordinals,
   new `resource @8` BlockKind variant); per D-16 no migration path —
   persisted contexts from Phase 2 need rebuilding.
+- **2026-04-16** (Phase 3 pre-commit review, Amy + Claude Opus 4.7):
+  Pre-commit peer review (Gemini 3.1 Pro + validator agent against
+  broker.rs / coalescer.rs / resources_builtin.rs) caught three bugs
+  in M3, fixed before landing:
+  1. **`unregister` subscription-leak race.** `unregister` called
+     `teardown_subscriptions_for_instance` *before*
+     `self.instances.write().remove(id)`. A concurrent `subscribe` that
+     slipped between teardown collecting its list and the instance
+     removal recorded a row pointing at a vanished instance. Fix:
+     remove from `instances` first (so new subscribes fail
+     `InstanceNotFound`); then teardown using the taken Arc; then a
+     defensive second sweep catches any subscribe that was already past
+     `resolve_instance` when we removed the instance. Regression test:
+     `broker::tests::subscribe_after_unregister_errors_and_leaves_no_row`.
+  2. **Silent subscribe without prior read.** `Broker::subscribe`
+     recorded the subscription in `self.subscriptions` but left
+     `resource_parents` empty unless `read_resource` had run first.
+     `handle_resource_flush` then silently filtered every update out
+     via `parents.get(...).map(...)` returning `None`. The LLM saw
+     "subscribed" success and zero updates — contradicts "no silent
+     fallbacks" (CLAUDE.md, D-15). Fix: `Broker::subscribe` auto-reads
+     when `resource_parents` has no entry for `(ctx, instance, uri)`,
+     establishing a parent before registering the subscription.
+     Regression test:
+     `broker::tests::subscribe_without_prior_read_delivers_updates`.
+  3. **N+1 reads on resource flush.** `handle_resource_flush` called
+     `server.read_resource(uri, &sys).await` inside the per-context
+     loop. N subscribers on the same URI produced N reads per flush —
+     N-amplified external pressure, plus potential content divergence
+     across subscribers if the resource changed mid-fanout. Fix: single
+     read outside the loop, fan the fresh payload out to all targets;
+     failure path emits one Log per subscriber under each parent.
+     Attribution switches from `CallContext::system_for_context(ctx_id)`
+     (per-subscriber) to `CallContext::system()` (broker-internal).
+     Regression test:
+     `broker::tests::flush_reads_once_for_all_subscribers`.
+
+  `ResourceMock` gained a `read_count: AtomicUsize` to assert fan-out
+  in the N+1 regression test. Kernel suite after fixes: 461 lib + 7
+  broker_e2e (net +3 over the phase 3 feature commit). Phase 2
+  `register_silently_suppresses_synthetic_tool_added` and the Phase 3
+  tests all continue to pass. Gemini also flagged two lower-priority
+  issues left as follow-ups: (a) `clear_binding` TOCTOU on instance
+  re-lookup (best-effort teardown already tolerates mis-routes), and
+  (b) `register` overwrite leaks the old pump `JoinHandle` instead of
+  aborting — both tracked in `memory/tech_debt.md`.

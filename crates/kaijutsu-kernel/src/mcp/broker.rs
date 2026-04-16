@@ -274,17 +274,26 @@ impl Broker {
         // ToolRemoved events (D-35).
         let removed_tools = self.tool_snapshots.lock().await.remove(id).unwrap_or_default();
 
-        // Tear down any live subscriptions that point at this instance before
-        // the server arc is dropped (Phase 3 M3, D-44). Done while the server
-        // is still reachable in `self.instances` so the server can process
-        // the unsubscribe calls.
-        let server_arc = self.instances.read().await.get(id).cloned();
-        self.teardown_subscriptions_for_instance(id, server_arc.as_ref())
-            .await;
-
-        self.instances.write().await.remove(id);
+        // Remove from `instances` FIRST so any concurrent `subscribe()` that
+        // has not yet reached `resolve_instance` fails fast with
+        // `InstanceNotFound`. Only then tear down subscriptions using the
+        // Arc we took out. Running teardown before the remove left a race
+        // window where a concurrent subscribe could: (1) resolve the
+        // instance, (2) call `server.subscribe`, and (3) write to
+        // `self.subscriptions` AFTER our teardown swept the table, leaving
+        // a stale row pointing at a removed instance.
+        let server_arc = self.instances.write().await.remove(id);
         self.policies.write().await.remove(id);
         self.semaphores.write().await.remove(id);
+        self.teardown_subscriptions_for_instance(id, server_arc.as_ref())
+            .await;
+        // Defensive second sweep: any `subscribe()` that was already past
+        // `resolve_instance` before our remove may have just now finished
+        // its `server.subscribe` await and landed its row after the first
+        // sweep. Sweep once more to clean those up. Bounded by the
+        // in-flight subscribe count at the moment of remove.
+        self.teardown_subscriptions_for_instance(id, server_arc.as_ref())
+            .await;
 
         for tool in removed_tools {
             let payload = NotificationPayload {
@@ -598,6 +607,14 @@ impl Broker {
     /// the caller layer: the HashSet dedupes repeated calls, but the
     /// underlying server call runs on every invocation (servers that track
     /// their own idempotency will no-op).
+    ///
+    /// If no root Resource block exists for `(context_id, instance, uri)`
+    /// yet (i.e. the caller did not first call `read_resource`), we do a
+    /// read here so `handle_resource_flush` has a parent to thread child
+    /// blocks under. Without this, subscribe-before-read was a silent trap:
+    /// `self.subscriptions` would have the entry, but `resource_parents`
+    /// would not, and every update would be filtered out in
+    /// `handle_resource_flush`.
     pub async fn subscribe(
         &self,
         instance: &InstanceId,
@@ -605,6 +622,18 @@ impl Broker {
         ctx: &CallContext,
     ) -> McpResult<()> {
         let server = self.resolve_instance(instance).await?;
+
+        let has_parent = {
+            self.resource_parents.lock().await.contains_key(&(
+                ctx.context_id,
+                instance.clone(),
+                uri.to_string(),
+            ))
+        };
+        if !has_parent {
+            self.read_resource(instance, uri, ctx).await?;
+        }
+
         server.subscribe(uri, ctx).await?;
         self.subscriptions
             .lock()
@@ -906,10 +935,15 @@ async fn handle_tools_changed(broker: &Arc<Broker>, id: &InstanceId) {
     }
 }
 
-/// D-43 flush body: re-read the URI on behalf of every subscribed context
-/// and emit a child `BlockKind::Resource` block under the original read. On
-/// re-read failure, emit a single `Log { level: Warn }` notification under
-/// the same parent instead of a fake Resource block.
+/// D-43 flush body: re-read the URI **once** and fan the fresh payload out
+/// to every subscribed context as a child `BlockKind::Resource` block under
+/// that context's original root read. On re-read failure, emit a `Log
+/// { level: Warn }` notification under each parent instead of a fake
+/// Resource block.
+///
+/// One read for N subscribers, not N — otherwise bursty resources get
+/// N-amplified against the external server and subscribers can observe
+/// divergent content if the resource updates mid-fanout.
 async fn handle_resource_flush(broker: &Arc<Broker>, id: &InstanceId, uri: &str) {
     let server = match broker.instances.read().await.get(id).cloned() {
         Some(s) => s,
@@ -940,16 +974,16 @@ async fn handle_resource_flush(broker: &Arc<Broker>, id: &InstanceId, uri: &str)
         None => return,
     };
 
-    for (ctx_id, parent_block) in targets {
-        let sys = CallContext::system_for_context(ctx_id);
-        match server.read_resource(uri, &sys).await {
-            Ok(result) => {
-                let payload = resource_payload_from_contents(
-                    id,
-                    uri,
-                    result.contents.first(),
-                    Some(parent_block),
-                );
+    // Single read — broker-internal attribution. Per-context trace
+    // divergence is acceptable here since the flush is not caused by any
+    // one subscriber.
+    let sys = CallContext::system();
+    match server.read_resource(uri, &sys).await {
+        Ok(result) => {
+            let chunk = result.contents.first();
+            for (ctx_id, parent_block) in targets {
+                let payload =
+                    resource_payload_from_contents(id, uri, chunk, Some(parent_block));
                 let summary = payload.summary_line();
                 if let Err(e) = docs.insert_resource_block_as(
                     ctx_id,
@@ -967,17 +1001,19 @@ async fn handle_resource_flush(broker: &Arc<Broker>, id: &InstanceId, uri: &str)
                     );
                 }
             }
-            Err(e) => {
-                // D-43 failure path: emit a Log notification child under the
-                // same parent so the failure is visible, never a fake
-                // Resource block with empty contents.
+        }
+        Err(e) => {
+            // D-43 failure path: one Log notification per subscriber,
+            // parented under their own root Resource block.
+            let detail = format!("re-read of {} failed: {:?}", uri, e);
+            for (ctx_id, parent_block) in targets {
                 let payload = NotificationPayload {
                     instance: id.as_str().to_string(),
                     kind: kaijutsu_types::NotificationKind::Log,
                     level: Some(kaijutsu_types::LogLevel::Warn),
                     tool: None,
                     count: None,
-                    detail: Some(format!("re-read of {} failed: {:?}", uri, e)),
+                    detail: Some(detail.clone()),
                 };
                 let summary = payload.summary_line();
                 if let Err(ee) = docs.insert_notification_block_as(
@@ -1933,6 +1969,9 @@ mod tests {
         subscribed: std::sync::Mutex<StdHashSet<String>>,
         unsubscribed: std::sync::Mutex<Vec<String>>,
         read_fails: std::sync::Mutex<bool>,
+        /// Incremented every time `read_resource` is called. Used by the
+        /// N+1-reads regression test to assert flush-side fan-out.
+        read_count: std::sync::atomic::AtomicUsize,
         notif_tx: broadcast::Sender<ServerNotification>,
     }
 
@@ -1946,8 +1985,13 @@ mod tests {
                 subscribed: std::sync::Mutex::new(StdHashSet::new()),
                 unsubscribed: std::sync::Mutex::new(Vec::new()),
                 read_fails: std::sync::Mutex::new(false),
+                read_count: std::sync::atomic::AtomicUsize::new(0),
                 notif_tx,
             }
+        }
+
+        fn read_count(&self) -> usize {
+            self.read_count.load(std::sync::atomic::Ordering::SeqCst)
         }
 
         fn with_text_resource(self, uri: &str, text: &str) -> Self {
@@ -2016,6 +2060,8 @@ mod tests {
             uri: &str,
             _ctx: &CallContext,
         ) -> McpResult<KernelReadResource> {
+            self.read_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if *self.read_fails.lock().unwrap() {
                 return Err(McpError::Protocol("simulated re-read failure".to_string()));
             }
@@ -2368,5 +2414,187 @@ mod tests {
                         .unwrap_or(false)),
             "Log notification must be threaded under the Resource root",
         );
+    }
+
+    // ── Phase 3 post-review bugfixes ────────────────────────────────────
+
+    /// Bug #1 (unregister subscription-leak race): after `unregister`, the
+    /// broker's view of `instances` must not carry the removed id, and a
+    /// subsequent `subscribe` for that id must error with `InstanceNotFound`
+    /// — not silently record a row pointing at a vanished server. Locks the
+    /// invariant that `unregister` removes from `self.instances` BEFORE the
+    /// subscription teardown sweep so new subscribe calls fail fast.
+    #[tokio::test]
+    async fn subscribe_after_unregister_errors_and_leaves_no_row() {
+        let (broker, _store, ctx) = wired_broker().await;
+        bind(&broker, ctx, "res").await;
+        let server = Arc::new(
+            ResourceMock::new("res").with_text_resource("file:///a", "A"),
+        );
+        broker
+            .register(server, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        broker.unregister(&InstanceId::new("res")).await.unwrap();
+
+        let mut call_ctx = CallContext::test();
+        call_ctx.context_id = ctx;
+        let err = broker
+            .subscribe(&InstanceId::new("res"), "file:///a", &call_ctx)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, McpError::InstanceNotFound(_)),
+            "subscribe after unregister must fail fast, got {err:?}"
+        );
+
+        let subs = broker.subscriptions.lock().await;
+        let stale: Vec<_> = subs
+            .values()
+            .flat_map(|set| set.iter().filter(|(i, _)| i.as_str() == "res"))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "failed subscribe must not record a row, found {stale:?}",
+        );
+    }
+
+    /// Bug #2 (silent-subscribe trap): calling `subscribe` without first
+    /// calling `read_resource` used to record the subscription but leave
+    /// `resource_parents` empty, so every `ResourceUpdated` was filtered out
+    /// in `handle_resource_flush` — the LLM saw "subscribed" success and
+    /// zero updates. The fix auto-reads inside `subscribe` to establish a
+    /// root parent. This test locks both halves of the fix: the root block
+    /// appears on subscribe, and subsequent updates thread under it.
+    #[tokio::test]
+    async fn subscribe_without_prior_read_delivers_updates() {
+        let (broker, store, ctx) = wired_broker().await;
+        bind(&broker, ctx, "res").await;
+        let server = Arc::new(
+            ResourceMock::new("res").with_text_resource("file:///a", "initial"),
+        );
+        let tx = server.sender();
+        broker
+            .register(server, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        let mut call_ctx = CallContext::test();
+        call_ctx.context_id = ctx;
+        // Skip read_resource — call subscribe directly.
+        broker
+            .subscribe(&InstanceId::new("res"), "file:///a", &call_ctx)
+            .await
+            .unwrap();
+
+        // The auto-read must have emitted a root Resource block.
+        let blocks = resource_blocks_in(&store, ctx);
+        assert_eq!(
+            blocks.len(),
+            1,
+            "subscribe must auto-emit a root block when no prior read existed",
+        );
+        assert!(blocks[0].parent_id.is_none());
+
+        // Push an update. Pre-fix this was silently filtered out.
+        tx.send(ServerNotification::ResourceUpdated {
+            uri: "file:///a".to_string(),
+        })
+        .unwrap();
+        sleep(Duration::from_millis(700)).await;
+
+        let blocks = resource_blocks_in(&store, ctx);
+        assert_eq!(
+            blocks.len(),
+            2,
+            "expected root + one child after the update; pre-fix this was 1 (silent drop)",
+        );
+        let child = blocks
+            .iter()
+            .find(|b| b.parent_id.is_some())
+            .expect("child block must exist under root");
+        assert!(child.resource.as_ref().unwrap().text.is_some());
+    }
+
+    /// Bug #3 (N+1 reads on flush): multiple contexts subscribed to the
+    /// same `(instance, uri)` must share a single re-read on window flush —
+    /// not one read per subscriber. The old code looped over targets and
+    /// called `server.read_resource` inside the loop. This test registers
+    /// two contexts, each subscribed (one each → 2 initial auto-reads),
+    /// then pushes one update burst and asserts the post-flush read
+    /// counter went up by exactly one (fan-out), not two.
+    #[tokio::test]
+    async fn flush_reads_once_for_all_subscribers() {
+        let broker = Arc::new(Broker::new());
+        let store = shared_block_store(PrincipalId::system());
+        let ctx_a = ContextId::new();
+        let ctx_b = ContextId::new();
+        store
+            .create_document(ctx_a, DocumentKind::Code, Some("rust".into()))
+            .unwrap();
+        store
+            .create_document(ctx_b, DocumentKind::Code, Some("rust".into()))
+            .unwrap();
+        broker.set_documents(store.clone()).await;
+        for ctx in [ctx_a, ctx_b] {
+            broker
+                .set_binding(
+                    ctx,
+                    ContextToolBinding::with_instances(vec![InstanceId::new("res")]),
+                )
+                .await;
+        }
+
+        let server = Arc::new(
+            ResourceMock::new("res").with_text_resource("file:///a", "initial"),
+        );
+        let server_handle = server.clone();
+        let tx = server.sender();
+        broker
+            .register_silently(server, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        for ctx in [ctx_a, ctx_b] {
+            let mut call_ctx = CallContext::test();
+            call_ctx.context_id = ctx;
+            broker
+                .subscribe(&InstanceId::new("res"), "file:///a", &call_ctx)
+                .await
+                .unwrap();
+        }
+        let reads_before_flush = server_handle.read_count();
+        assert_eq!(
+            reads_before_flush, 2,
+            "each context's subscribe auto-reads once, expected 2",
+        );
+
+        // One burst; the flush path must read the URI once for both
+        // subscribers, not once per subscriber.
+        for _ in 0..5 {
+            tx.send(ServerNotification::ResourceUpdated {
+                uri: "file:///a".to_string(),
+            })
+            .unwrap();
+        }
+        sleep(Duration::from_millis(700)).await;
+
+        let flushed_reads = server_handle.read_count() - reads_before_flush;
+        assert_eq!(
+            flushed_reads, 1,
+            "flush must do one read for N subscribers; got {flushed_reads}",
+        );
+
+        // Both contexts must have received a child block under their own
+        // root, from the single read.
+        for ctx in [ctx_a, ctx_b] {
+            let blocks = resource_blocks_in(&store, ctx);
+            assert_eq!(
+                blocks.len(),
+                2,
+                "each subscriber gets root + one child from the fan-out; ctx={ctx:?}",
+            );
+        }
     }
 }
