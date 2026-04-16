@@ -795,6 +795,68 @@ mark it `[RETIRED: <date> — <reason>]` in place; do not delete.
   default constructor inserting `ResourceUpdated => 0`. Log /
   PromptsChanged keep the default cap of 20. Test path:
   `mcp::coalescer::tests::resource_updated_has_no_pass_throughs`.
+- **D-46** — **Hook match predicate uses `kaish_glob::glob_match` on
+  instance/tool and equality on `ContextId`/`PrincipalId`.**
+  `GlobPattern` stays a `String` newtype (no pre-compilation); the
+  kernel already depends on `kaish-glob` so no new dep is added. Rejects
+  a handwritten `*`/`?` matcher for consistency with every other glob
+  site in the repo. `match_context` / `match_principal` use equality,
+  not globs (ID types aren't strings).
+  Test path: `mcp::broker::tests::hook_match_instance_and_tool_globs`
+  + `hook_match_context_and_principal_filters`.
+- **D-47** — **Reentrancy cap via `tokio::task_local!` depth counter,
+  capped at `MAX_HOOK_DEPTH = 4` (§4.3, D-29).** A `HookDepthGuard`
+  decrements on drop so the counter survives panic unwind; the cap is
+  checked before increment. Exceed returns
+  `McpError::HookRecursionLimit { depth: MAX + 1 }`. Outer `call_tool`
+  installs the scope on first entry and reuses it on recursive re-entry
+  from Invoke bodies. Test-only `HOOK_DEPTH_OVERRIDE` (`OnceLock<u32>`)
+  lets fixtures drive the cap with smaller numbers.
+  Test path: `mcp::broker::tests::reentrant_hook_exceeds_depth_cap` +
+  positive-control `reentrant_hook_under_cap_succeeds` +
+  `hook_depth_resets_across_calls` + drop-guard pin
+  `panicking_hook_body_does_not_leak_depth`.
+- **D-48** — **`HookAction::Log` emits `tracing::event!`, not a
+  block.** LLM-visible audit is achieved by an `Invoke` body that
+  writes a block explicitly; the builtin `Log` variant is observability
+  only. Matches the "user chooses visibility explicitly" stance
+  already used for resource re-reads (D-43).
+  Test path: `mcp::broker::tests::log_hook_emits_tracing_event_not_block`
+  (uses `tracing::subscriber::set_default` to capture the event).
+- **D-49** — **`ShortCircuit` is tracing-attributed via a
+  `hook.short_circuit` span event carrying `hook_id = "hook:<id>"`.**
+  Event, not a new span, so the parent `broker.call_tool` span remains
+  the correlation anchor. The returned `KernelToolResult` is untouched
+  — attribution lives in traces, not in the result shape, so the LLM
+  doesn't see a synthetic instance name in its result history. Exit
+  criterion #3 asserts the event fires with the expected `hook_id`.
+  Test path: `mcp::broker::tests::short_circuit_emits_attribution_event`.
+- **D-50** — **Named builtin hook registry; admin wire never ships
+  `Arc<dyn Hook>`.** A `BuiltinHookRegistry` maps `&'static str` →
+  factory `fn() -> Arc<dyn Hook>`. `hook_add` admin RPC takes a tagged
+  JSON `action` where `BuiltinInvoke` carries a `name: String`
+  referenced against the registry; unknown names reject. Phase 4 ships
+  `tracing_audit` + `no_op`. Kaish bodies reject at add time with
+  `McpError::Unsupported`. `HookBody::Builtin` carries `{ name, hook }`
+  so `hook_inspect` can surface the builtin name without reflecting on
+  `Arc<dyn Hook>`; `HookAction::Deny(String)` carries a tracing-only
+  reason (outer pipe returns `McpError::Denied { by_hook }` regardless
+  per D-28).
+  Test path: `mcp::servers::hooks_builtin::tests::hook_add_unknown_builtin_rejects`
+  + `hook_add_kaish_rejects` +
+  `admin_round_trip_with_builtin_log_hook`.
+- **D-51** — **`builtin.hooks` is carved out of hook evaluation.**
+  Calls with `params.instance == "builtin.hooks"` bypass
+  `evaluate_phase` entirely. Without this, a user who registers a
+  PreCall `Deny(match_tool="*")` would lock themselves out of
+  `hook_remove` and have no recovery short of a kernel restart. Other
+  builtin instances (`builtin.block`, `builtin.file`, `builtin.resources`,
+  `builtin.kernel_info`) remain subject to hooks — users may legitimately
+  want to audit or gate those. The carve-out is a recovery-path safety
+  valve, not a general admin-immunity policy.
+  Test path: implicit — the `admin_round_trip_with_builtin_log_hook`
+  test registers Deny hooks then still succeeds in issuing `hook_list`
+  and `hook_remove`, which would fail without the carve-out.
 
 ## 7. Open questions per area
 
@@ -835,11 +897,14 @@ note here.
 ### Hooks
 - Evaluation order across phases when multiple hooks match: strictly
   priority-sorted, or grouped by some other axis?
+  [RESOLVED: D-46 / §4.3 — priority ascending + insertion-order tiebreak.]
 - Kaish hook envelope format — full request/result JSON? Subset? How do
   we serialize `CallContext` for the hook script?
 - Hook-group atomicity: should a `PreCall` hook be able to guarantee a
   matching `PostCall` hook runs (transactional pairing for audit
   logging)? If yes, introduce `HookGroup` before phase 4.
+  [DEFERRED: 2026-04-16 — Phase 4 ships independent phase evaluation
+  per §4.3; revisit if an audit-compliance caller actually needs it.]
 
 ### Streaming (deferred to follow-up)
 - Async-drop strategy for `StreamingBlockHandle` — explicit close +
@@ -996,7 +1061,9 @@ Exit criteria:
 - Context drop unsubscribes cleanly (no orphaned subscriptions in the
   broker).
 
-### Phase 4 — Hooks + admin · **planned**
+### Phase 4 — Hooks + admin · **code complete, runner verification pending**
+
+Plan: `~/.claude/plans/let-s-discuss-the-open-twinkly-beaver.md`
 
 Match-action tables as specified in §4.3. All four phases wired
 (`PreCall` / `PostCall` / `OnError` / `OnNotification`). Empty tables
@@ -1399,3 +1466,83 @@ Entries are append-only. Most recent at the bottom.
   re-lookup (best-effort teardown already tolerates mis-routes), and
   (b) `register` overwrite leaks the old pump `JoinHandle` instead of
   aborting — both tracked in `memory/tech_debt.md`.
+- **2026-04-16** (Phase 4 execution — M1–M5 + M6, Amy + Claude Opus 4.7):
+  Phase 4 code landed across five milestones plus doc closure. M1:
+  `Broker::evaluate_phase` helper + `hook_matches` predicate wired into
+  `Broker::call_tool` at three pinch points — PreCall before the server
+  call, PostCall on `Ok`, OnError on `Err` (with a helper
+  `run_on_error_then_err` that converts OnError ShortCircuit into a
+  success result, per §4.3 evaluation law). `PhaseOutcome { Continue |
+  ShortCircuit | Deny }` keeps the evaluator's return shape small.
+  `HookBody::Builtin` refactored to `{ name: String, hook: Arc<dyn Hook> }`
+  so admin inspection can surface the builtin name; `HookAction::Deny`
+  refactored from `McpError` (not Clone) to `String` reason (tracing-only,
+  broker unconditionally returns `McpError::Denied { by_hook }` per D-28).
+  M2: OnNotification fires post-coalesce — one hook evaluation per
+  emitted block via `build_notification_synth` producing
+  `tool = "__notification.<kind>"` and an argument bag of
+  `{kind, count, level, detail, tool}`. Wired into both
+  `emit_for_bindings` (Log / PromptsChanged / ToolAdded / ToolRemoved /
+  Coalesced) and `handle_resource_flush` (resource_updated success +
+  D-43 log failure). M3: `crates/kaijutsu-kernel/src/mcp/hooks_builtin.rs`
+  ships `BuiltinHookRegistry` mapping `&'static str` to
+  `fn() -> Arc<dyn Hook>` factories; seeds `tracing_audit` (emits a
+  TRACE event per invocation) and `no_op` (positive/negative test
+  controls). Broker gains `builtin_hooks: BuiltinHookRegistry` field
+  + accessor. M4: `crates/kaijutsu-kernel/src/mcp/servers/hooks_builtin.rs`
+  is the admin MCP server at `builtin.hooks`; four tools delegate to
+  `Broker::hooks()` / `builtin_hooks()`. `HookActionWire` tagged enum
+  keeps `Arc<dyn Hook>` off the wire (D-50); `Kaish` rejects at add
+  time; `hook_list` redacts body detail, `hook_inspect` returns it.
+  Bootstrap registers via `register_silently` alongside the three
+  Phase 1 builtins and Phase 3's `builtin.resources`. M5: `tokio::task_local!
+  HOOK_DEPTH: Cell<u32>` + `HookDepthGuard` with `Drop`. `Broker::call_tool`
+  splits into outer wrapper + `call_tool_inner`; outer installs the
+  scope on first entry and reuses it on recursive re-entry so depth
+  survives `broker.call_tool(...)` from inside an Invoke body. Default
+  cap `MAX_HOOK_DEPTH = 4`; test-only `HOOK_DEPTH_OVERRIDE: OnceLock<u32>`
+  lets fixtures drive the cap with smaller numbers. Decisions D-46..D-51
+  recorded. D-51 is an emergent safety valve: `builtin.hooks` calls bypass
+  hook evaluation entirely so a user can't lock themselves out of
+  `hook_remove` with a `PreCall Deny *` hook.
+
+  Suite adds, organized by the question each test answers:
+  - **"Does PreCall / PostCall / OnError wiring work?"** 9 tests in
+    `mcp::broker::tests` (`pre_call_deny_blocks_call`,
+    `pre_call_shortcircuit_skips_server`, `post_call_fires_after_success`,
+    `on_error_fires_on_server_error_not_post_call`,
+    `on_error_shortcircuit_converts_error_to_success`,
+    `hook_match_instance_and_tool_globs`,
+    `hook_match_context_and_principal_filters`,
+    `hook_priority_and_insertion_order_is_deterministic`,
+    `log_hook_emits_tracing_event_not_block`,
+    `short_circuit_emits_attribution_event`). Exit criteria #2 + #3.
+  - **"Does OnNotification fire post-coalesce?"** 4 tests in
+    `mcp::broker::tests` (`on_notification_fires_for_log_passthrough`,
+    `on_notification_fires_once_per_emission_in_burst` — 5 passthrough +
+    1 coalesced summary = 6 fires, `on_notification_deny_skips_emission`,
+    `on_notification_fires_for_resource_flush_success_path`).
+  - **"Does the builtin registry behave?"** 5 tests in
+    `mcp::hooks_builtin::tests` (`registry_lists_known_names`,
+    `registry_builds_tracing_audit`, `registry_builds_no_op`,
+    `registry_unknown_name_returns_none`,
+    `tracing_audit_emits_trace_event`). Exit criterion #1.
+  - **"Does the admin surface round-trip?"** 5 tests in
+    `mcp::servers::hooks_builtin::tests`
+    (`admin_round_trip_with_builtin_log_hook` — exit criterion #4,
+    `hook_add_unknown_builtin_rejects`, `hook_add_kaish_rejects`,
+    `hook_list_filters_by_phase`, `hook_inspect_returns_body_detail`,
+    `hook_remove_missing_is_not_an_error`).
+  - **"Does the reentrancy cap enforce and self-heal?"** 4 tests in
+    `mcp::broker::tests` (`reentrant_hook_exceeds_depth_cap` — exit
+    criterion #5, `reentrant_hook_under_cap_succeeds`,
+    `hook_depth_resets_across_calls`,
+    `panicking_hook_body_does_not_leak_depth`).
+
+  Workspace totals: 490 kernel lib + 7 broker_e2e (net +29 Phase 4
+  tests vs the Phase 3 closure baseline). The long-standing
+  `kaijutsu-index` flakes remain unfixed (tech_debt item 7).
+  `HookAction::Deny` shape changed from `McpError` to `String`; this is
+  the only visible API break vs the Phase 1 stub. Runner verification
+  (exit criteria #1–#4 against a live `kaijutsu-runner` on the GPU
+  server) pending — tracked in §8 Phase 4 status.
