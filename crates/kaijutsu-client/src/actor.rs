@@ -24,7 +24,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::Instrument;
 
 use crate::rpc::{
-    ClientToolFilter, Completion, ContextInfo, HistoryEntry, Identity, InputState, KernelInfo,
+    Completion, ContextInfo, HistoryEntry, Identity, InputState, KernelInfo,
     LlmConfigInfo, McpResource, McpResourceContents, McpToolResult, ShellValue, StagedDriftInfo,
     SubmitResult, SyncState, ToolResult, ToolSchema, VersionSnapshot,
 };
@@ -237,22 +237,7 @@ enum RpcCommand {
     },
 
     // ── Tool Filter ──────────────────────────────────────────────────────
-    GetToolFilter {
-        reply: oneshot::Sender<Result<ClientToolFilter, ActorError>>,
-    },
-    SetToolFilter {
-        filter: ClientToolFilter,
-        reply: oneshot::Sender<Result<bool, ActorError>>,
-    },
-    GetContextToolFilter {
-        context_id: ContextId,
-        reply: oneshot::Sender<Result<Option<ClientToolFilter>, ActorError>>,
-    },
-    SetContextToolFilter {
-        context_id: ContextId,
-        filter: ClientToolFilter,
-        reply: oneshot::Sender<Result<bool, ActorError>>,
-    },
+    // Phase 5 D-54: retired. See `builtin.bindings` MCP tools server-side.
 
     // ── Timeline ─────────────────────────────────────────────────────────
     CherryPickBlock {
@@ -437,18 +422,6 @@ impl RpcCommand {
                 let _ = reply.send(Err(err));
             }
             Self::SetDefaultModel { reply, .. } => {
-                let _ = reply.send(Err(err));
-            }
-            Self::GetToolFilter { reply, .. } => {
-                let _ = reply.send(Err(err));
-            }
-            Self::SetToolFilter { reply, .. } => {
-                let _ = reply.send(Err(err));
-            }
-            Self::GetContextToolFilter { reply, .. } => {
-                let _ = reply.send(Err(err));
-            }
-            Self::SetContextToolFilter { reply, .. } => {
                 let _ = reply.send(Err(err));
             }
             Self::CherryPickBlock { reply, .. } => {
@@ -984,44 +957,7 @@ impl ActorHandle {
     }
 
     // ── Tool Filter ──────────────────────────────────────────────────────
-
-    /// Get current tool filter configuration.
-    #[tracing::instrument(skip(self))]
-    pub async fn get_tool_filter(&self) -> Result<ClientToolFilter, ActorError> {
-        self.send(|reply| RpcCommand::GetToolFilter { reply }).await
-    }
-
-    /// Set tool filter configuration.
-    #[tracing::instrument(skip(self, filter))]
-    pub async fn set_tool_filter(&self, filter: ClientToolFilter) -> Result<bool, ActorError> {
-        self.send(|reply| RpcCommand::SetToolFilter { filter, reply })
-            .await
-    }
-
-    /// Get per-context tool filter (None = inherits kernel default).
-    #[tracing::instrument(skip(self))]
-    pub async fn get_context_tool_filter(
-        &self,
-        context_id: ContextId,
-    ) -> Result<Option<ClientToolFilter>, ActorError> {
-        self.send(|reply| RpcCommand::GetContextToolFilter { context_id, reply })
-            .await
-    }
-
-    /// Set per-context tool filter.
-    #[tracing::instrument(skip(self, filter))]
-    pub async fn set_context_tool_filter(
-        &self,
-        context_id: ContextId,
-        filter: ClientToolFilter,
-    ) -> Result<bool, ActorError> {
-        self.send(|reply| RpcCommand::SetContextToolFilter {
-            context_id,
-            filter,
-            reply,
-        })
-        .await
-    }
+    // Phase 5 D-54: retired. See `builtin.bindings` MCP tools server-side.
 
     // ── Timeline ─────────────────────────────────────────────────────────
 
@@ -1729,34 +1665,7 @@ async fn dispatch_command(
         }
 
         // ── Tool Filter ──────────────────────────────────────────
-        RpcCommand::GetToolFilter { reply } => {
-            rpc_call!(kernel, reply, err_tx, k, k.get_tool_filter());
-        }
-        RpcCommand::SetToolFilter { filter, reply } => {
-            rpc_call!(kernel, reply, err_tx, k, k.set_tool_filter(&filter));
-        }
-        RpcCommand::GetContextToolFilter { context_id, reply } => {
-            rpc_call!(
-                kernel,
-                reply,
-                err_tx,
-                k,
-                k.get_context_tool_filter(context_id)
-            );
-        }
-        RpcCommand::SetContextToolFilter {
-            context_id,
-            filter,
-            reply,
-        } => {
-            rpc_call!(
-                kernel,
-                reply,
-                err_tx,
-                k,
-                k.set_context_tool_filter(context_id, &filter)
-            );
-        }
+        // Phase 5 D-54: retired. See `builtin.bindings` MCP tools.
 
         // ── Timeline ─────────────────────────────────────────────
         RpcCommand::CherryPickBlock {

@@ -857,6 +857,88 @@ mark it `[RETIRED: <date> — <reason>]` in place; do not delete.
   Test path: implicit — the `admin_round_trip_with_builtin_log_hook`
   test registers Deny hooks then still succeeds in issuing `hook_list`
   and `hook_remove`, which would fail without the carve-out.
+  [REVIEW 2026-04-17: candidate for retirement — kernel restart is
+  the accepted escape hatch and D-53 establishes the no-carve-out
+  precedent for `builtin.bindings`. Not re-opened in Phase 5;
+  retirement tracked as a §9 follow-up.]
+- **D-52** — **Phase 5 reframed from "tool search + late injection" to
+  "per-context binding management + persistence."** Phase 1 plumbed
+  `ContextToolBinding` but no operator-facing surface curates it;
+  every context first-touch-populates with all registered instances
+  (`kernel.rs::dispatch_tool_via_broker` / `list_tool_defs_via_broker`).
+  Search is UX sugar on top of a curation surface that doesn't exist;
+  shipping search first is unanchored. Tool search moved to §9.
+  Origin: review conversation 2026-04-17 where the user pointed out
+  that "search should be about making that configuration easy" and
+  that operational pressure is on curation, not discovery.
+- **D-53** — **`builtin.bindings` has no hook-evaluation carve-out.**
+  A user who locks themselves out of `bind` / `unbind` with an
+  overbroad `PreCall Deny(*)` hook recovers by restarting the kernel
+  (hooks are in-memory). Carve-out complexity isn't worth a restart
+  we'd accept elsewhere. D-51's identical carve-out on `builtin.hooks`
+  is now a candidate for retirement (§9 follow-up); not re-opened
+  here. Consistency target: every admin MCP server is subject to
+  hook evaluation; kernel restart is the universal escape hatch.
+- **D-54** — **Bindings persisted via `KernelDb`; legacy `ToolFilter`
+  retired.** Phase 5 adds a `context_bindings` (or equivalent)
+  table/shape in `kernel_db.rs` storing `allowed_instances` **and**
+  the sticky `name_map` per `ContextId`; first-touch loads from DB,
+  fallback to "bind all registered" only when no row exists. The
+  legacy `tool_filter` column + `ToolFilter` enum + post-filter in
+  `llm_stream.rs::build_tool_definitions` (the one annotated
+  "until M5 retires `ToolFilter`") are deleted. Rationale:
+  `ContextToolBinding` already expresses allow-list semantics at the
+  instance granularity operators actually care about; per-tool deny
+  is a hook (D-07) not a filter. DB wipe acceptable per D-16.
+- **D-55** — **`kj://kernel/tools` resource on `builtin.bindings`.**
+  Discovery surface ("what's available to bind?") is a `BlockKind::
+  Resource` read, not a search query — consistent with Phase 3's
+  stance that long-form state lives in resources. Subscribable, so
+  `register` / `unregister` / MCP-restart (unregister → re-register)
+  flow into child Resource blocks via the D-43 coalescer path. The
+  payload is instance-grouped (since `bind` operates on instances)
+  with per-tool detail under each instance and a `bound: bool` flag
+  relative to the calling context so the LLM can tell at read time
+  what's already visible versus what a `bind` would add.
+
+  **Namespace:** `kj://kernel/*` is reserved for binding-agnostic
+  kernel-wide views (honest about what's installed regardless of the
+  calling context's binding or ListTools hooks). `kj://context/*` is
+  reserved for per-calling-context views that honor the binding and
+  filters. Phase 5 ships only `kj://kernel/tools`; a future
+  `kj://context/tools` ("what can I actually call right now, post-
+  binding, post-ListTools") is a deliberate follow-up — reading both
+  and diffing at runtime is the intended shape for "what would
+  binding X give me that I don't already have" queries.
+- **D-56** — **`HookPhase::ListTools` added in Phase 5 for tool-level
+  visibility filtering.** `ContextToolBinding` is instance-level
+  (binding an instance pulls in *all* its tools); without a per-tool
+  filter, an operator can't have "`builtin.file` bound but `file_write`
+  hidden" — the common persona case (e.g. read-only "planner" or
+  "explorer" that want filesystem read without write). Rather than
+  re-adding `denied_tools: HashSet<String>` to the binding (which
+  would duplicate hook matching), reuse the Phase 4 match-action
+  table by adding a new phase. Semantics:
+  - Matches on raw `(instance_id, original_tool_name)` — **not** the
+    sticky visible name (D-20). Hooks stay stable across resolution.
+  - Only `Deny(reason)` and `Log` are admitted as actions;
+    `ShortCircuit` and `Invoke` have no coherent list-filter
+    semantics (reject at `hook_add` time with `McpError::Unsupported`).
+  - `ListTools Deny` = **hidden AND uncallable through this binding**.
+    The filter runs inside `Broker::list_visible_tools` before sticky
+    resolution; denied tools never enter `name_map`, so a direct
+    `call_tool` with the denied name returns
+    `McpError::ToolNotFound`. From the binding's perspective the
+    tool effectively does not exist.
+  - Applies to `list_visible_tools` only, **not** `Broker::list_tools`
+    nor the `kj://kernel/tools` Resource (D-55). Discovery is
+    binding-agnostic and must be honest about what the kernel hosts;
+    personas shape visibility *within* a binding, not kernel-wide.
+  Rationale for adding a phase instead of a binding field: hooks
+  already carry `match_instance` / `match_tool` globs plus
+  `match_context` / `match_principal` equality — all of which are
+  useful for persona definitions. Duplicating that machinery on
+  `ContextToolBinding` would be waste.
 
 ## 7. Open questions per area
 
@@ -869,6 +951,25 @@ note here.
 ### Broker / identity
 - What does a stale tool reference look like across a CRDT replay? Are
   notifications idempotent on replay?
+
+### Bindings (Phase 5)
+- Persistence schema: single `context_bindings` table
+  `(context_id, allowed_instances, name_map, updated_at)` with JSON
+  columns, or normalized rows per `(context_id, visible_name,
+  instance_id, original_tool_name)`? JSON is simpler; normalized is
+  queryable. Lean: JSON for v1, migrate if we ever need per-tool
+  queries.
+- When a persisted `allowed_instances` entry refers to an instance no
+  longer registered (e.g. external MCP removed from kernel config
+  between restarts): silently drop on load, emit a startup-log
+  Notification, or surface as a stale-binding Resource? No silent
+  fallbacks (CLAUDE.md) argues for at least the log.
+- `set_binding` vs `bind`/`unbind` emission semantics: does the
+  wholesale setter fire per-instance diffs (computed by comparing
+  old-vs-new `allowed_instances`), or does it only fire a single
+  ToolsChanged and let the pump diff against `list_tools`? Lean:
+  compute the diff in `set_binding` and fire per-instance ToolsChanged
+  so the existing pump does the rest.
 
 ### Notifications
 - Coalescer policy defaults (window, max-in-window) — do we need
@@ -1085,20 +1186,97 @@ Exit criteria:
 - Reentrant hook that exceeds depth cap returns
   `McpError::HookRecursionLimit` (D-29).
 
-### Phase 5 — Tool search + late injection · **planned**
+### Phase 5 — Per-context binding management + persistence · **code complete, runner verification pending**
 
-`builtin.tool_search` server that indexes available tools by metadata
-(name, description, tags, capabilities) and returns matching
-`(instance_id, tool_name)` pairs. Context bindings gain a late-injection
-path: add an instance to the binding mid-session, notification fires,
-LLM picks up on next turn.
+`builtin.bindings` admin MCP server exposes per-context tool curation
+— the capability Phase 1 plumbed but never surfaced. Every context
+today first-touch-populates with *every* registered instance
+(`kernel.rs::dispatch_tool_via_broker` / `list_tool_defs_via_broker`);
+operators have no ergonomic way to say "this context gets
+`builtin.file` + `builtin.block` only." Phase 5 fixes that, makes the
+resulting binding durable across kernel restart, and wires binding
+mutation into the existing per-tool diff pump (D-35) so late injection
+is visible on the next LLM turn with no new notification machinery.
+
+Tool search — the original Phase 5 scope — moves to §9 as a follow-up.
+Rationale: per-context curation is load-bearing (it's the point of
+bindings); search is UX sugar on top and only earns its keep once the
+curation surface exists.
+
+Deliverables:
+- `builtin.bindings` virtual MCP server (instance `builtin.bindings`):
+  - Tools: `bind(instance_id)`, `unbind(instance_id)`, `show` (current
+    binding for calling context).
+  - Resource: `kj://kernel/tools` — per-instance listing of every
+    kernel-registered instance with its tools and a `bound: bool`
+    flag relative to the calling context. Subscribable; MCP-restart
+    (unregister → re-register) and ordinary register/unregister
+    surface as child Resource blocks via the Phase 3 coalescer (D-43).
+  - Holds `Weak<Broker>` like `BuiltinResourcesServer` (D-41).
+  - **No hook-evaluation carve-out.** Kernel restart is the escape
+    hatch (hooks are in-memory), same recovery story as `builtin.hooks`
+    deserves. D-51's carve-out on `builtin.hooks` is under separate
+    review — not in scope here (§9 follow-up).
+- Binding mutation triggers ToolsChanged. `Broker::bind`,
+  `Broker::unbind`, and the existing `Broker::set_binding` run the
+  per-context diff pump so `tool_added` / `tool_removed` notifications
+  fire. Today only register/unregister fire diffs; this extends the
+  machinery to binding changes without a new notification kind.
+- **Persistent bindings via `KernelDb`.** Bindings (including the
+  sticky `name_map` so LLM-visible names survive restart) persist
+  alongside context metadata. First-touch loads from DB; only when a
+  context has never been bound does the kernel fall back to "bind all
+  registered instances." Legacy `tool_filter` column is dropped (DB
+  wipe acceptable per D-16).
+- **Retire `ToolFilter`.** The `llm_stream.rs::build_tool_definitions`
+  post-filter and the `ToolFilter` enum across kaijutsu-types,
+  kernel_db, kj, drift, and RPC are deleted. `ContextToolBinding`
+  subsumes allow-list semantics at instance granularity; per-tool
+  deny becomes a hook (D-07), not a filter. The TODO on
+  `llm_stream.rs:33` ("until M5 retires `ToolFilter`") was always
+  anticipating this phase.
+- Sticky `name_map` test under live mutation and restart: `unbind →
+  rebind` (MCP-restart analog) and DB-round-trip preserve the names
+  the LLM has already seen.
+- **`HookPhase::ListTools`** for tool-level visibility filtering
+  within a binding (D-56). Extends `HookTables` with a fourth phase;
+  `Broker::list_visible_tools` evaluates it before sticky resolution
+  and strips matching tools from the candidate set. `builtin.hooks`
+  admin server picks up `ListTools` as a fourth `phase` value with no
+  new action types (only `Deny` / `Log`; `ShortCircuit` / `Invoke`
+  reject at add time). Precursor for the persona feature
+  (planner/coder/explorer/sound engineer archetypes — §9) which
+  bundles binding + ListTools hooks into named personas.
 
 Exit criteria:
-- Tool search returns useful results against the builtin corpus.
-- Late-injection changes a live context's tool list and the LLM sees
-  the new tools on the next turn.
-- Sticky resolution (D-20) preserves previously-seen names across the
-  binding mutation.
+1. Mid-session `bind(instance)` / `unbind(instance)` changes a live
+   context's tool list; LLM sees `tool_added` / `tool_removed` blocks
+   on the next turn (existing Phase 2 machinery; exercised
+   end-to-end).
+2. Sticky resolution (D-20) preserves previously-seen names across
+   `unbind → rebind` within a single session, and across kernel
+   restart.
+3. Bindings survive kernel restart — a context curated to
+   `builtin.file` only comes back curated after a kernel restart
+   (workspace wipe acceptable; only the curation must persist across
+   process restart).
+4. `kj://kernel/tools` resource read returns every kernel instance
+   with per-tool detail and per-calling-context `bound` flag; a
+   `register` / `unregister` produces a subscription update that
+   threads as a child block under the original read.
+5. `ToolFilter` / `tool_filter` are gone from live code across the
+   workspace. Retired names appear only in comments/doc strings that
+   describe history (same allowance as D-16 exit wording).
+6. An MCP-restart flow round-trip: `unbind(external.gpal)` →
+   `bind(external.gpal)` after a simulated restart preserves the
+   LLM-visible tool names (sticky test in production path).
+7. A `ListTools Deny(match_instance="builtin.file",
+   match_tool="file_write")` hook on a bound context hides
+   `file_write` from `list_visible_tools`, causes a direct
+   `call_tool("file_write", ...)` from that context to return
+   `McpError::ToolNotFound`, and leaves `kj://kernel/tools`
+   still showing `file_write` as present on the `builtin.file`
+   instance (D-56: binding view is filtered; discovery is honest).
 
 ### Phase 6+ — Follow-ups (deferred)
 
@@ -1110,6 +1288,31 @@ These are not part of the five phases, but the refactor should produce a
 shape that makes them easy. Record decisions here that would constrain
 the current work.
 
+- **Personas (binding + filter bundles).** Named archetypes that
+  package a `ContextToolBinding` with a set of `ListTools` hooks
+  (D-56) into a single "apply persona X to context Y" operation.
+  Examples the user has described: `planner` (mostly read-only
+  discovery + analysis), `coder` (editing tools), `explorer` (read
+  + git), `sound engineer` (sound tools, no editing). Not designed
+  yet; Phase 5's `ListTools` hook phase is the mechanism this will
+  compose on top of. Likely surface: a `builtin.personas` admin
+  server with `list` / `apply` / `define` tools and a `kj://personas`
+  resource. Persistence probably alongside bindings in `KernelDb`.
+- **Tool search across instances.** `builtin.tool_search` with
+  keyword/substring scoring over `(name, description, tags)` as a v1;
+  `kaijutsu-index` (ONNX + HNSW) vector search as a v2 once the
+  long-standing flake (tech_debt item 7) is addressed. Use case: LLM
+  discovers a tool not bound to the calling context and asks the
+  operator (or itself via `builtin.bindings.bind`) to pull in the
+  owning instance. Moved out of Phase 5 because per-context binding
+  management is the prerequisite — search without the curation surface
+  is unanchored UX.
+- **D-51 carve-out retirement for `builtin.hooks`.** The carve-out
+  was justified by "no escape hatch short of kernel restart"; kernel
+  restart is in fact the accepted escape hatch (hooks are in-memory).
+  Simpler, safer model: no carve-out, same recovery. Phase 5 sets
+  the precedent (no carve-out for `builtin.bindings`); retiring D-51
+  is a small follow-up cleanup.
 - **`StreamingBlockHandle` implementation.** Build when the first
   streaming caller arrives (likely the LLM streaming rewrite). Resolve
   async-drop strategy and append granularity at implementation time
@@ -1546,3 +1749,141 @@ Entries are append-only. Most recent at the bottom.
   the only visible API break vs the Phase 1 stub. Runner verification
   (exit criteria #1–#4 against a live `kaijutsu-runner` on the GPU
   server) pending — tracked in §8 Phase 4 status.
+- **2026-04-17** (Phase 5 pre-plan reframe, Amy + Claude Opus 4.7):
+  Phase 5 scope reshaped after reviewing what Phase 1 actually shipped
+  versus what the doc's original Phase 5 assumed. Finding:
+  `ContextToolBinding` is plumbed end-to-end and tested, but no
+  operator/LLM-facing surface curates it — every context first-touch-
+  populates with all registered instances, so per-context tool
+  curation (the original motivation) is invisible. `ToolFilter` is
+  semi-alive (post-filters in `llm_stream.rs::build_tool_definitions`
+  with a TODO comment that literally says "until M5 retires
+  `ToolFilter`"). Decision: drop tool search to §9, refocus Phase 5 on
+  **per-context binding management + persistence**. Deliverables:
+  `builtin.bindings` admin MCP server with `bind`/`unbind`/`show`
+  tools and a `kj://kernel/tools` Resource (D-55), binding
+  mutation extended to the per-tool diff pump (D-35 reuse, no new
+  notification types), persistent bindings via `KernelDb` with
+  `ToolFilter` retired workspace-wide, and sticky `name_map` survival
+  across kernel restart + MCP restart. No hook-evaluation carve-out
+  (D-53) — kernel restart is the universal escape hatch, consistent
+  with the hook-server recovery story; D-51 is flagged for retirement
+  review as a §9 follow-up. Decisions D-52..D-55 recorded. Phase 5
+  exit criteria rewritten (6 criteria, all end-to-end scenarios
+  through production APIs). No code changes this turn.
+  Extended same turn after discussing per-tool filter semantics:
+  added D-56 (`HookPhase::ListTools` for tool-level visibility
+  filtering within a binding) and Phase 5 exit criterion #7.
+  Motivation is the forthcoming persona feature — planner / coder /
+  explorer / sound engineer archetypes that need "`builtin.file`
+  bound but `file_write` hidden"-style filtering. Personas
+  themselves moved to §9 as a follow-up that composes on top of
+  bindings + ListTools.
+- **2026-04-17** (Phase 5 execution — M1–M5 + M6, Amy + Claude Opus 4.7):
+  Phase 5 code landed across five milestones plus doc closure. Plan:
+  `~/.claude/plans/binary-roaming-unicorn.md`. M1: `HookPhase::ListTools`
+  variant + `HookTables::list_tools` field + evaluator arm; `parse_phase`
+  / `phase_to_str` / `phase_table_mut` / `hook_list` / `hook_inspect`
+  all extended; `validate_action_for_phase` in `hooks_builtin` rejects
+  `BuiltinInvoke` / `ShortCircuit` / `Kaish` for `ListTools` at add
+  time. **Normalized** `KernelDb` schema per `feedback_sql_schema.md` —
+  three tables: `context_bindings` (parent row + updated_at),
+  `context_binding_instances` (ordered allow list, `(context_id,
+  instance_id)` PK + `order_idx` for Vec semantics + index on
+  `instance_id` for ops queries), `context_binding_names`
+  (sticky `(visible, instance, original)` map). Transactional
+  upsert / join-based get / cascade delete.
+  M2: `Broker::set_binding` rewritten to diff old-vs-new
+  `(instance, tool_name)` pairs via `binding_visible_tool_pairs`
+  (uses cached `tool_snapshots`), write, persist (R1 mitigation —
+  identical pair sets emit nothing); `bind(ctx, instance)` +
+  `unbind(ctx, &instance)` as thin wrappers; `binding()` hydrates
+  from DB on cache miss; `emit_for_bindings` refactored with shared
+  `emit_into_context` helper + new `emit_for_context` that skips
+  binding filter for mutation-specific emission;
+  `apply_list_tools_filter` inside `list_visible_tools` walks
+  `list_tools` hook entries and strips `Deny`-matched tools BEFORE
+  sticky resolution (D-56 — denied tools never enter `name_map`, so
+  they're uncallable as a side effect); `persist_binding` via
+  `DbHandle` setter following D-37 precedent.
+  M3: `BuiltinBindingsServer` at `builtin.bindings` with `bind` /
+  `unbind` / `show` tools plus `kj://kernel/tools` resource
+  (instance-grouped JSON payload with per-calling-context `bound`
+  flag). Bridge task in `Kernel::register_builtin_mcp_servers`
+  forwards kernel-level `KernelNotification::ToolsChanged` (newly
+  published from `register_inner` / `unregister`) to the bindings
+  server's `notif_tx` as `ServerNotification::ResourceUpdated`, so
+  subscribers see updates via the Phase 3 coalescer pipeline. No
+  hook-evaluation carve-out — D-53 verified by the
+  `bindings_server_subject_to_hooks` unit test.
+  M4: `ToolFilter` retirement across the workspace. Deleted: the
+  enum in `kaijutsu-types::enums` + re-exports; `llm/config.rs`
+  `default_tools` field, `ToolConfig` type, and `ToolFilter`
+  re-export; `llm/toml_config.rs` `ToolFilterToml` + conversion (TOML
+  `[providers.*.default_tools]` blocks now parse-ignore for
+  backwards compat); `drift.rs` `tool_filter` field + `configure_tools`;
+  `llm_stream.rs::build_tool_definitions` post-filter (the "until M5
+  retires ToolFilter" TODO); `kj/parse.rs::parse_tool_filter_spec` +
+  tests; `kj/context.rs` `--tool-filter` CLI flag; `kj/preset.rs`
+  `--tool-filter` and `tool_filter` display; `kj/fork.rs` preset
+  tool_filter copying; `kernel_db.rs` `tool_filter` columns on both
+  `contexts` and `presets`, all INSERT/SELECT/UPDATE references
+  including renumbered placeholders, `tool_filter_to_sql` /
+  `tool_filter_from_sql` helpers, `update_tool_filter` method, row
+  reader column-index realignment; client `ClientToolFilter` enum +
+  4 RPC methods + actor `RpcCommand` variants + handle delegations;
+  server `tool_filter: None` stubs + 4 RPC impl methods + 2 capnp
+  helpers; capnp ordinals @69/@70/@85/@86 stubbed as
+  `...Removed @N () -> ();` (wire break per D-16). Workspace
+  `cargo check` + `grep -rn 'ToolFilter'` on live code both clean.
+  M5: 3 new `broker_e2e.rs` tests covering DB-round-trip scenarios
+  the unit-level M2 tests couldn't reach: `binding_persists_across_
+  kernel_restart` (exit #3 — drop kernel A with curated binding,
+  stand up kernel B against same DB, binding hydrates),
+  `list_tools_deny_hides_and_blocks_but_keeps_discovery_honest`
+  (exit #7 — three-way D-56 invariant: list omits, name_map empty,
+  `kj://kernel/tools` still honest), `kernel_tools_resource_end_to_
+  end` (exit #4 — all six builtins appear, per-calling-context
+  `bound` flag). Setup extended with `setup_with_db` that threads
+  a `DbHandle` via `broker.set_db()` and inserts a matching
+  `ContextRow` for the context-bindings FK.
+
+  Suite adds, organized by the question each test answers:
+  - **"Do the types + schema compile and roundtrip?"** 5 tests in
+    `kernel_db::tests` (`context_binding_roundtrip_preserves_order_and_
+    sticky_names`, `context_binding_get_absent_returns_none`,
+    `context_binding_upsert_replaces_wholesale`,
+    `context_binding_delete_returns_whether_existed`,
+    `context_binding_cascades_on_context_delete`); 2 tests in
+    `servers::hooks_builtin::tests` (`hook_add_list_tools_rejects_
+    invoke_and_shortcircuit`, `hook_add_list_tools_accepts_deny_and_log`).
+  - **"Does the broker mutation + filter shape work?"** 7 tests in
+    `mcp::broker::tests` — `bind_emits_tool_added_for_newly_visible_tools`,
+    `unbind_emits_tool_removed`,
+    `set_binding_diff_fires_per_added_and_removed_instance`,
+    `set_binding_no_emission_when_pairs_unchanged` (R1 guard),
+    `list_tools_deny_strips_tool_from_visible_set`,
+    `list_tools_deny_makes_tool_uncallable_via_this_binding`,
+    `list_tools_log_does_not_strip`.
+  - **"Does the admin server round-trip?"** 7 tests in
+    `servers::bindings_builtin::tests` (`bindings_admin_bind_roundtrip`,
+    `bindings_admin_unbind_roundtrip`,
+    `bindings_admin_show_without_binding_returns_empty`,
+    `kernel_tools_resource_read_returns_all_instances`,
+    `kernel_tools_resource_bound_flag_reflects_context`,
+    `bindings_server_subject_to_hooks` (D-53 confirm),
+    `read_resource_rejects_unknown_uri`).
+  - **"Does the full chain work end-to-end without the app?"** 3 tests
+    in `broker_e2e.rs` (listed above).
+
+  Workspace totals: 499 kernel lib (from pre-M4 511, net -12 from
+  `ToolFilter` test removals) + 10 broker_e2e (from 7, net +3) + 45
+  server + 54 client + 228 types + other crates. All workspace tests
+  pass; long-standing `kaijutsu-index` flakes remain unfixed (tech_debt
+  item 7). Wire format broken (capnp @69/@70/@85/@86 stub rename +
+  `ToolFilterConfig` now unused); DB schema broken (tool_filter
+  columns gone); both acceptable per D-16. Memory recorded:
+  `feedback_sql_schema.md` ("prefer normalized SQL schemas over JSON
+  blob columns"). Runner verification (exit criteria #1–#7 against a
+  live `kaijutsu-runner` on the GPU server) pending — tracked in §8
+  Phase 5 status.

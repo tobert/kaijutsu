@@ -37,7 +37,7 @@ pub mod toml_config;
 pub mod stream;
 
 // Re-export key types
-pub use config::{ProviderConfig, ToolConfig, ToolFilter};
+pub use config::ProviderConfig;
 pub use toml_config::{
     EmbeddingModelConfig, LlmConfig, ModelAlias, ModelsConfig, initialize_llm_registry,
     load_llm_config_toml, load_models_config_toml,

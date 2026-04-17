@@ -128,6 +128,7 @@ fn parse_phase(s: &str) -> McpResult<HookPhase> {
         "post_call" => Ok(HookPhase::PostCall),
         "on_error" => Ok(HookPhase::OnError),
         "on_notification" => Ok(HookPhase::OnNotification),
+        "list_tools" => Ok(HookPhase::ListTools),
         other => Err(McpError::Protocol(format!(
             "unknown hook phase: {other:?}"
         ))),
@@ -140,7 +141,28 @@ fn phase_to_str(phase: HookPhase) -> &'static str {
         HookPhase::PostCall => "post_call",
         HookPhase::OnError => "on_error",
         HookPhase::OnNotification => "on_notification",
+        HookPhase::ListTools => "list_tools",
     }
+}
+
+/// Reject action shapes that have no coherent semantics in the given phase.
+///
+/// D-56: `ListTools` is a list-filter phase. `ShortCircuit` (what would it
+/// return in place of a list?) and `Invoke` (bodies can't rewrite lists)
+/// are rejected at add time so the caller sees the failure immediately
+/// rather than at first list-tools evaluation. `Kaish` is rejected
+/// unconditionally by `build_hook_action` anyway; called out here for
+/// completeness.
+fn validate_action_for_phase(phase: HookPhase, action: &HookActionWire) -> McpResult<()> {
+    if phase == HookPhase::ListTools {
+        match action {
+            HookActionWire::BuiltinInvoke { .. }
+            | HookActionWire::ShortCircuit { .. }
+            | HookActionWire::Kaish { .. } => return Err(McpError::Unsupported),
+            HookActionWire::Deny { .. } | HookActionWire::Log { .. } => {}
+        }
+    }
+    Ok(())
 }
 
 fn parse_tracing_level(s: &str) -> McpResult<tracing::Level> {
@@ -324,6 +346,7 @@ impl McpServerLike for BuiltinHooksServer {
                     serde_json::from_value(params.arguments.clone())
                         .map_err(McpError::InvalidParams)?;
                 let phase = parse_phase(&p.phase)?;
+                validate_action_for_phase(phase, &p.action)?;
                 let match_context = p
                     .match_context
                     .as_deref()
@@ -408,6 +431,7 @@ impl McpServerLike for BuiltinHooksServer {
                     (HookPhase::PostCall, &hooks.post_call),
                     (HookPhase::OnError, &hooks.on_error),
                     (HookPhase::OnNotification, &hooks.on_notification),
+                    (HookPhase::ListTools, &hooks.list_tools),
                 ] {
                     if filter_phase.is_some() && filter_phase != Some(phase) {
                         continue;
@@ -434,6 +458,7 @@ impl McpServerLike for BuiltinHooksServer {
                     (HookPhase::PostCall, &hooks.post_call),
                     (HookPhase::OnError, &hooks.on_error),
                     (HookPhase::OnNotification, &hooks.on_notification),
+                    (HookPhase::ListTools, &hooks.list_tools),
                 ] {
                     if let Some(entry) = table.entries.iter().find(|e| e.id.0 == p.hook_id)
                     {
@@ -472,6 +497,7 @@ fn phase_table_mut(
         HookPhase::PostCall => &mut hooks.post_call,
         HookPhase::OnError => &mut hooks.on_error,
         HookPhase::OnNotification => &mut hooks.on_notification,
+        HookPhase::ListTools => &mut hooks.list_tools,
     }
 }
 
@@ -636,6 +662,82 @@ mod tests {
             matches!(err, McpError::ToolNotFound { ref tool, .. } if tool.contains("no_such_hook")),
             "expected ToolNotFound(no_such_hook), got {err:?}"
         );
+    }
+
+    /// D-56: the `list_tools` phase only admits `Deny` and `Log` actions.
+    /// `ShortCircuit` and `BuiltinInvoke` have no coherent list-filter
+    /// semantics; reject at add time rather than surprising the caller on
+    /// first list-tools evaluation.
+    #[tokio::test]
+    async fn hook_add_list_tools_rejects_invoke_and_shortcircuit() {
+        let broker = Arc::new(Broker::new());
+        let server = Arc::new(BuiltinHooksServer::new(Arc::downgrade(&broker)));
+        broker
+            .register(server, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        for action in [
+            serde_json::json!({ "type": "builtin_invoke", "name": "tracing_audit" }),
+            serde_json::json!({ "type": "short_circuit", "result_text": "nope" }),
+        ] {
+            let err = broker
+                .call_tool(
+                    call_params(
+                        "hook_add",
+                        serde_json::json!({
+                            "phase": "list_tools",
+                            "action": action,
+                        }),
+                    ),
+                    &CallContext::test(),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, McpError::Unsupported),
+                "list_tools should reject action; got {err:?}",
+            );
+        }
+    }
+
+    /// D-56: `Deny` and `Log` are the admitted actions for `list_tools`.
+    /// Positive control for the rejection test above — without this we
+    /// can't distinguish "rejection works" from "list_tools phase broken."
+    #[tokio::test]
+    async fn hook_add_list_tools_accepts_deny_and_log() {
+        let broker = Arc::new(Broker::new());
+        let server = Arc::new(BuiltinHooksServer::new(Arc::downgrade(&broker)));
+        broker
+            .register(server, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        for action in [
+            serde_json::json!({ "type": "deny", "reason": "no writes" }),
+            serde_json::json!({ "type": "log", "level": "info" }),
+        ] {
+            broker
+                .call_tool(
+                    call_params(
+                        "hook_add",
+                        serde_json::json!({
+                            "phase": "list_tools",
+                            "action": action,
+                        }),
+                    ),
+                    &CallContext::test(),
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("list_tools + Deny/Log must be accepted");
+        }
+
+        // Confirm the entries landed in the list_tools table specifically.
+        let hooks = broker.hooks().read().await;
+        assert_eq!(hooks.list_tools.entries.len(), 2);
+        assert!(hooks.pre_call.entries.is_empty());
     }
 
     /// D-50: `Kaish` bodies are rejected at add time with `Unsupported`.

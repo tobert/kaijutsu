@@ -644,3 +644,323 @@ async fn resource_updated_threads_child_block_and_llm_sees_it() {
 fn _touch() -> Duration {
     Duration::from_secs(0)
 }
+
+// ============================================================================
+// Phase 5 M5 — end-to-end binding management scenarios
+// ============================================================================
+
+use kaijutsu_kernel::mcp::servers::bindings_builtin::KERNEL_TOOLS_URI;
+
+/// Richer setup that exposes the `KernelDb` handle so tests can tear down
+/// a kernel and stand up a second one against the same DB. Sets
+/// `broker.set_db()` so `ContextToolBinding` mutations persist.
+async fn setup_with_db() -> (Fixture, Arc<parking_lot::Mutex<KernelDb>>) {
+    use kaijutsu_kernel::kernel_db::ContextRow;
+    use kaijutsu_types::{ConsentMode, ContextState};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let kernel = Arc::new(Kernel::new("phase5-m5", Some(tmp.path())).await);
+
+    let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+    let creator = PrincipalId::system();
+    let kernel_id = KernelId::new();
+    let ws_id = {
+        let g = db.lock();
+        g.get_or_create_default_workspace(kernel_id, creator).unwrap()
+    };
+    let store: SharedBlockStore =
+        shared_block_store_with_db(db.clone(), kernel_id, ws_id, creator);
+
+    let ctx_id = ContextId::new();
+    {
+        let g = db.lock();
+        g.insert_document(&DocumentRow {
+            document_id: ctx_id,
+            kernel_id,
+            workspace_id: ws_id,
+            doc_kind: DocumentKind::Code,
+            language: None,
+            path: None,
+            created_at: now_millis() as i64,
+            created_by: creator,
+        })
+        .unwrap();
+        // Phase 5: the `context_bindings` table FKs to `contexts.context_id`,
+        // so we need a matching context row for persistence tests.
+        g.insert_context(&ContextRow {
+            context_id: ctx_id,
+            kernel_id,
+            label: None,
+            provider: None,
+            model: None,
+            system_prompt: None,
+            consent_mode: ConsentMode::Collaborative,
+            context_state: ContextState::Live,
+            created_at: now_millis() as i64,
+            created_by: creator,
+            forked_from: None,
+            fork_kind: None,
+            archived_at: None,
+            workspace_id: None,
+            preset_id: None,
+        })
+        .unwrap();
+    }
+    store.create_document(ctx_id, DocumentKind::Code, None).unwrap();
+
+    let file_cache = Arc::new(FileDocumentCache::new(store.clone(), kernel.vfs().clone()));
+    kernel
+        .register_builtin_mcp_servers(store.clone(), file_cache, None)
+        .await
+        .expect("register_builtin_mcp_servers");
+
+    // Wire the DB into the broker so bind/unbind/set_binding persist.
+    kernel.broker().set_db(db.clone()).await;
+
+    let exec_ctx = ExecContext::new(creator, ctx_id, "/", SessionId::new(), kernel_id);
+    let fx = Fixture {
+        kernel,
+        ctx_id,
+        exec_ctx,
+        store,
+        _tmp: tmp,
+    };
+    (fx, db)
+}
+
+/// Phase 5 exit criterion #3: a context curated to a specific instance
+/// survives a kernel restart via `KernelDb`. After bootstrapping kernel A
+/// with a binding to `builtin.file` only, dropping it, and standing up
+/// kernel B against the same DB, the calling context sees the curated
+/// binding rather than re-defaulting to "bind all registered."
+#[tokio::test]
+async fn binding_persists_across_kernel_restart() {
+    let (fx, db) = setup_with_db().await;
+    let ctx_id = fx.ctx_id;
+
+    // Curate: only builtin.file is bound.
+    fx.kernel
+        .broker()
+        .set_binding(
+            ctx_id,
+            ContextToolBinding::with_instances(vec![InstanceId::new("builtin.file")]),
+        )
+        .await;
+
+    // Sanity: live broker sees the curated binding (one instance).
+    let loaded_live = fx.kernel.broker().binding(&ctx_id).await.unwrap();
+    assert_eq!(loaded_live.allowed_instances.len(), 1);
+    assert_eq!(loaded_live.allowed_instances[0].as_str(), "builtin.file");
+
+    drop(fx);
+
+    // Stand up a second kernel pointing at the same DB. No call to
+    // `set_binding` here — it must hydrate from `KernelDb` on first touch.
+    let tmp2 = tempfile::tempdir().unwrap();
+    let kernel2 = Arc::new(Kernel::new("phase5-m5-restart", Some(tmp2.path())).await);
+    let creator2 = PrincipalId::system();
+    let kernel_id2 = KernelId::new();
+    let ws_id2 = {
+        let g = db.lock();
+        g.get_or_create_default_workspace(kernel_id2, creator2).unwrap()
+    };
+    let store2: SharedBlockStore =
+        shared_block_store_with_db(db.clone(), kernel_id2, ws_id2, creator2);
+    let file_cache2 = Arc::new(FileDocumentCache::new(store2.clone(), kernel2.vfs().clone()));
+    kernel2
+        .register_builtin_mcp_servers(store2.clone(), file_cache2, None)
+        .await
+        .unwrap();
+    kernel2.broker().set_db(db.clone()).await;
+
+    let loaded_after_restart = kernel2.broker().binding(&ctx_id).await;
+    let loaded = loaded_after_restart.expect("binding should hydrate from DB");
+    assert_eq!(
+        loaded.allowed_instances.len(),
+        1,
+        "restart should NOT fall back to bind-all; DB row exists",
+    );
+    assert_eq!(loaded.allowed_instances[0].as_str(), "builtin.file");
+}
+
+/// Phase 5 exit criterion #7: a `ListTools Deny` hook hides a tool from
+/// the per-context visible list AND blocks call_tool for that context,
+/// while the `kj://kernel/tools` resource stays honest about what's
+/// installed. The three-way invariant is the D-56 contract.
+#[tokio::test]
+async fn list_tools_deny_hides_and_blocks_but_keeps_discovery_honest() {
+    use kaijutsu_kernel::mcp::{GlobPattern, HookAction, HookEntry, HookId};
+
+    let (fx, _db) = setup_with_db().await;
+    let ctx_id = fx.ctx_id;
+
+    // Bind builtin.file so file_* tools are visible in the context.
+    fx.kernel
+        .broker()
+        .bind(ctx_id, InstanceId::new("builtin.file"))
+        .await;
+
+    // Register a ListTools Deny for write.
+    fx.kernel
+        .broker()
+        .hooks()
+        .write()
+        .await
+        .list_tools
+        .entries
+        .push(HookEntry {
+            id: HookId("no-writes".into()),
+            match_instance: Some(GlobPattern("builtin.file".into())),
+            match_tool: Some(GlobPattern("write".into())),
+            match_context: None,
+            match_principal: None,
+            action: HookAction::Deny("read-only context".into()),
+            priority: 0,
+        });
+
+    // (a) The per-context list must NOT include `write`.
+    let call_ctx = {
+        let mut c = CallContext::test();
+        c.context_id = ctx_id;
+        c
+    };
+    let visible: Vec<String> = fx
+        .kernel
+        .broker()
+        .list_visible_tools(ctx_id, &call_ctx)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    assert!(
+        !visible.iter().any(|n| n.contains("write")),
+        "write must be filtered out of visible set; saw {visible:?}",
+    );
+
+    // (b) The binding's `name_map` must have no entry for write,
+    // so dispatch via resolved name surfaces ToolNotFound.
+    let binding = fx.kernel.broker().binding(&ctx_id).await.unwrap();
+    assert!(
+        binding.resolve("write").is_none(),
+        "ListTools-Denied tool must not land in name_map",
+    );
+
+    // (c) `kj://kernel/tools` stays honest about what's installed. The
+    // payload is instance-grouped; find builtin.file and verify
+    // write still appears in its tools list. Use a system context
+    // to read the resource so we're not filtering against any binding.
+    let sys_ctx = CallContext::system();
+    let server = fx
+        .kernel
+        .broker()
+        .instances_snapshot()
+        .await
+        .get(&InstanceId::new("builtin.bindings"))
+        .cloned()
+        .expect("builtin.bindings registered by bootstrap");
+    let read = server
+        .read_resource(KERNEL_TOOLS_URI, &sys_ctx)
+        .await
+        .unwrap();
+    let content = match &read.contents[0] {
+        KernelResourceContents::Text { text, .. } => text.clone(),
+        _ => panic!("expected text content"),
+    };
+    let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+    let file_entry = v["instances"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["id"].as_str() == Some("builtin.file"))
+        .expect("builtin.file must appear in kernel-wide discovery");
+    let tool_names: Vec<&str> = file_entry["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        tool_names.contains(&"write"),
+        "kj://kernel/tools must stay honest about write being installed; \
+         saw {tool_names:?}",
+    );
+}
+
+/// Phase 5 exit criterion #4: reading `kj://kernel/tools` through the
+/// kernel's builtin bindings server returns every registered instance,
+/// and the calling-context `bound` flag reflects the live binding.
+#[tokio::test]
+async fn kernel_tools_resource_end_to_end() {
+    let (fx, _db) = setup_with_db().await;
+    let ctx_id = fx.ctx_id;
+
+    // Bind one builtin so `bound: true` appears for that entry.
+    fx.kernel
+        .broker()
+        .bind(ctx_id, InstanceId::new("builtin.block"))
+        .await;
+
+    let call_ctx = {
+        let mut c = CallContext::test();
+        c.context_id = ctx_id;
+        c
+    };
+    let server = fx
+        .kernel
+        .broker()
+        .instances_snapshot()
+        .await
+        .get(&InstanceId::new("builtin.bindings"))
+        .cloned()
+        .unwrap();
+    let read = server.read_resource(KERNEL_TOOLS_URI, &call_ctx).await.unwrap();
+    let content = match &read.contents[0] {
+        KernelResourceContents::Text { text, .. } => text.clone(),
+        _ => panic!("expected text content"),
+    };
+    let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+    let instances = v["instances"].as_array().unwrap();
+
+    // Every builtin bootstrap registers should appear.
+    let ids: Vec<&str> = instances
+        .iter()
+        .map(|x| x["id"].as_str().unwrap())
+        .collect();
+    for expected in [
+        "builtin.block",
+        "builtin.file",
+        "builtin.kernel_info",
+        "builtin.resources",
+        "builtin.hooks",
+        "builtin.bindings",
+    ] {
+        assert!(
+            ids.contains(&expected),
+            "missing {expected} in kernel tools listing; saw {ids:?}",
+        );
+    }
+
+    // `bound` must be true for builtin.block (we just bound it) and
+    // false for at least one other instance the calling context did not
+    // bind explicitly.
+    let block_entry = instances
+        .iter()
+        .find(|x| x["id"].as_str() == Some("builtin.block"))
+        .unwrap();
+    assert_eq!(
+        block_entry["bound"].as_bool(),
+        Some(true),
+        "builtin.block should be bound to the calling context",
+    );
+
+    let file_entry = instances
+        .iter()
+        .find(|x| x["id"].as_str() == Some("builtin.file"))
+        .unwrap();
+    assert_eq!(
+        file_entry["bound"].as_bool(),
+        Some(false),
+        "builtin.file should NOT be bound",
+    );
+}

@@ -21,8 +21,8 @@ pub use actor::{
     ActorError, ActorHandle, AgentAttachResult, AgentConfig, AgentInvocation, spawn_actor,
 };
 pub use rpc::{
-    ClientToolFilter, Completion, CompletionKind, ConsentMode, ContextInfo, ContextMembership,
-    HistoryEntry, Identity, InputState, KernelConfig, KernelHandle, KernelInfo, LlmConfigInfo,
+    Completion, CompletionKind, ConsentMode, ContextInfo, ContextMembership, HistoryEntry,
+    Identity, InputState, KernelConfig, KernelHandle, KernelInfo, LlmConfigInfo,
     LlmProviderInfo, McpResource, McpResourceContents, McpToolResult, MountSpec, PresetInfo,
     RpcClient, RpcError, ShellValue, StagedDriftInfo, SubmitResult, SyncState, ToolResult,
     ToolSchema, VersionSnapshot,

@@ -1,12 +1,11 @@
-//! LLM provider configuration and tool filtering.
+//! LLM provider configuration.
 //!
-//! This module provides configuration types for multi-provider LLM support
-//! and per-context tool filtering.
+//! Tool filtering was retired in Phase 5 D-54; per-context tool visibility
+//! is now expressed via `ContextToolBinding` + `HookPhase::ListTools`. The
+//! per-provider `default_tools` field and the `ToolConfig` type that fed
+//! into it are gone.
 
 use serde::{Deserialize, Serialize};
-
-// ToolFilter definition lives in kaijutsu-types; re-export for backward compat.
-pub use kaijutsu_types::ToolFilter;
 
 /// Configuration for an LLM provider.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,10 +36,6 @@ pub struct ProviderConfig {
     /// Maximum output tokens for this provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u64>,
-
-    /// Default tool filter for this provider.
-    #[serde(default)]
-    pub default_tools: ToolFilter,
 }
 
 fn default_true() -> bool {
@@ -58,7 +53,6 @@ impl ProviderConfig {
             base_url: None,
             default_model: None,
             max_output_tokens: None,
-            default_tools: ToolFilter::All,
         }
     }
 
@@ -86,12 +80,6 @@ impl ProviderConfig {
         self
     }
 
-    /// Set default tool filter.
-    pub fn with_tool_filter(mut self, filter: ToolFilter) -> Self {
-        self.default_tools = filter;
-        self
-    }
-
     /// Resolve API key from config or environment.
     pub fn resolve_api_key(&self) -> Option<String> {
         // Direct key takes precedence
@@ -115,96 +103,9 @@ impl ProviderConfig {
     }
 }
 
-/// Tool configuration for a kernel/context.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ToolConfig {
-    /// Filter determining which tools are available.
-    pub filter: ToolFilter,
-}
-
-impl ToolConfig {
-    /// Create a new tool config with the given filter.
-    pub fn new(filter: ToolFilter) -> Self {
-        Self { filter }
-    }
-
-    /// Create a config allowing all tools.
-    pub fn all() -> Self {
-        Self {
-            filter: ToolFilter::All,
-        }
-    }
-
-    /// Check if a tool is allowed.
-    pub fn allows(&self, tool_name: &str) -> bool {
-        self.filter.allows(tool_name)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_tool_filter_all() {
-        let filter = ToolFilter::All;
-        assert!(filter.allows("anything"));
-        assert!(filter.allows("bash"));
-        assert!(filter.allows("read"));
-    }
-
-    #[test]
-    fn test_tool_filter_allow_list() {
-        let filter = ToolFilter::allow(["bash", "read", "write"]);
-        assert!(filter.allows("bash"));
-        assert!(filter.allows("read"));
-        assert!(!filter.allows("edit"));
-        assert!(!filter.allows("unknown"));
-    }
-
-    #[test]
-    fn test_tool_filter_deny_list() {
-        let filter = ToolFilter::deny(["bash", "dangerous_tool"]);
-        assert!(!filter.allows("bash"));
-        assert!(!filter.allows("dangerous_tool"));
-        assert!(filter.allows("read"));
-        assert!(filter.allows("write"));
-    }
-
-    #[test]
-    fn test_tool_filter_merge() {
-        // All + AllowList = AllowList
-        let all = ToolFilter::All;
-        let allow = ToolFilter::allow(["bash", "read"]);
-        assert_eq!(all.merge(&allow), allow);
-
-        // AllowList + AllowList = intersection
-        let allow1 = ToolFilter::allow(["bash", "read", "write"]);
-        let allow2 = ToolFilter::allow(["read", "write", "edit"]);
-        let merged = allow1.merge(&allow2);
-        match merged {
-            ToolFilter::AllowList(set) => {
-                assert!(set.contains("read"));
-                assert!(set.contains("write"));
-                assert!(!set.contains("bash"));
-                assert!(!set.contains("edit"));
-            }
-            _ => panic!("Expected AllowList"),
-        }
-
-        // AllowList + DenyList = allow list minus denied
-        let allow = ToolFilter::allow(["bash", "read", "write"]);
-        let deny = ToolFilter::deny(["bash"]);
-        let merged = allow.merge(&deny);
-        match merged {
-            ToolFilter::AllowList(set) => {
-                assert!(!set.contains("bash"));
-                assert!(set.contains("read"));
-                assert!(set.contains("write"));
-            }
-            _ => panic!("Expected AllowList"),
-        }
-    }
 
     #[test]
     fn test_provider_config_resolve_key() {

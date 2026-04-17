@@ -18,7 +18,7 @@ use tokio::sync::RwLock as TokioRwLock;
 use kaijutsu_crdt::{BlockKind, ContentType, Role, Status};
 use kaijutsu_kernel::llm::stream::{LlmStream, StreamEvent, StreamRequest};
 use kaijutsu_kernel::llm::{ContentBlock, ToolDefinition};
-use kaijutsu_kernel::{Kernel, LlmMessage, RigProvider, SharedBlockStore, ToolFilter};
+use kaijutsu_kernel::{Kernel, LlmMessage, RigProvider, SharedBlockStore};
 use kaijutsu_types::ToolKind as TypesToolKind;
 use kaijutsu_types::{ContextId, PrincipalId};
 
@@ -27,27 +27,20 @@ use crate::rpc::{ConversationCache, SharedKernelState};
 
 /// Build tool definitions visible to the LLM in this context.
 ///
-/// Phase 1 path (M4): enumerate via the broker's `ContextToolBinding`; apply
-/// the legacy `ToolFilter` merge (kernel + context, kernel-first) as a
-/// post-filter so existing configs keep working until M5 retires
-/// `ToolFilter`.
+/// Phase 5 M4: `ToolFilter` retired (D-54). Per-context tool curation is
+/// expressed by the `ContextToolBinding`'s `allowed_instances` and by
+/// `HookPhase::ListTools` hooks (D-56) — both applied inside
+/// `Broker::list_visible_tools` via `list_tool_defs_via_broker`. This
+/// function now pass-throughs the broker output unmodified.
 async fn build_tool_definitions(
     kernel: &Arc<Kernel>,
     context_id: ContextId,
     principal_id: PrincipalId,
-    context_filter: Option<&ToolFilter>,
 ) -> Vec<ToolDefinition> {
-    // Phase 1 M5: kernel-scoped tool_config was removed; the context filter
-    // (when present) is the only gate. `All` is the effective default.
-    let effective_filter = context_filter.cloned().unwrap_or(ToolFilter::All);
-
-    let visible = kernel
+    kernel
         .list_tool_defs_via_broker(context_id, principal_id)
-        .await;
-
-    visible
+        .await
         .into_iter()
-        .filter(|(name, _, _)| effective_filter.allows(name))
         .map(|(name, schema, description)| ToolDefinition {
             name,
             description: description.unwrap_or_default(),
@@ -90,8 +83,8 @@ pub(crate) async fn spawn_llm_for_prompt(
             .unwrap_or_else(|_| kaijutsu_kernel::DEFAULT_SYSTEM_PROMPT.to_string())
     };
 
-    // Read per-context model + tool filter from DriftRouter (quick read, release lock)
-    let (ctx_model, ctx_provider_name, ctx_tool_filter) = {
+    // Read per-context model from DriftRouter (quick read, release lock)
+    let (ctx_model, ctx_provider_name) = {
         let drift = kernel_arc.drift().read().await;
         // Guard: block LLM invocation while context is in Staging state
         if let Some(h) = drift.get(context_id) {
@@ -114,8 +107,8 @@ pub(crate) async fn spawn_llm_for_prompt(
             }
         }
         match drift.get(context_id) {
-            Some(h) => (h.model.clone(), h.provider.clone(), h.tool_filter.clone()),
-            None => (None, None, None),
+            Some(h) => (h.model.clone(), h.provider.clone()),
+            None => (None, None),
         }
     };
 
@@ -157,14 +150,9 @@ pub(crate) async fn spawn_llm_for_prompt(
         }
     };
 
-    // Build tool definitions from equipped tools, filtered by kernel + context config
-    let tools = build_tool_definitions(
-        &kernel_arc,
-        context_id,
-        user_agent_id,
-        ctx_tool_filter.as_ref(),
-    )
-    .await;
+    // Build tool definitions via the broker (binding + ListTools filter do
+    // the curation — D-54 retired the legacy post-filter).
+    let tools = build_tool_definitions(&kernel_arc, context_id, user_agent_id).await;
 
     log::info!(
         "Spawning LLM stream: context={}, model={}",

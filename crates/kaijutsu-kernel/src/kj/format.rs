@@ -256,7 +256,6 @@ mod tests {
             provider: Some("anthropic".to_string()),
             model: Some("claude-opus-4-6".to_string()),
             system_prompt: None,
-            tool_filter: None,
             consent_mode: ConsentMode::Collaborative,
             context_state: ContextState::Live,
             created_at: kaijutsu_types::now_millis() as i64,

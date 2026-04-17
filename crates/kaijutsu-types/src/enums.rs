@@ -4,7 +4,6 @@
 //! so both the persistence layer (`KernelDb`) and the runtime (`DriftRouter`,
 //! `Kernel`) can use them without circular deps.
 
-use std::collections::HashSet;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -149,70 +148,11 @@ impl fmt::Display for ContextState {
 }
 
 // ============================================================================
-// ToolFilter — per-context tool availability
+// ToolFilter — retired in Phase 5 (D-54).
+// `ContextToolBinding` + `HookPhase::ListTools` subsume allow/deny semantics
+// at the instance+tool granularity operators actually care about. See
+// `docs/tool-system-redesign.md` §8 Phase 5 for the replacement.
 // ============================================================================
-
-/// Filter for which tools are available in a context.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "type", content = "tools")]
-pub enum ToolFilter {
-    /// All registered tools are available.
-    #[default]
-    All,
-
-    /// Only these specific tools are available.
-    AllowList(HashSet<String>),
-
-    /// All tools except these are available.
-    DenyList(HashSet<String>),
-}
-
-impl ToolFilter {
-    /// Create an allow list filter.
-    pub fn allow<I, S>(tools: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        Self::AllowList(tools.into_iter().map(Into::into).collect())
-    }
-
-    /// Create a deny list filter.
-    pub fn deny<I, S>(tools: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        Self::DenyList(tools.into_iter().map(Into::into).collect())
-    }
-
-    /// Check if a tool is allowed by this filter.
-    pub fn allows(&self, tool_name: &str) -> bool {
-        match self {
-            Self::All => true,
-            Self::AllowList(allowed) => allowed.contains(tool_name),
-            Self::DenyList(denied) => !denied.contains(tool_name),
-        }
-    }
-
-    /// Merge with another filter (intersection of allowed tools).
-    pub fn merge(&self, other: &Self) -> Self {
-        match (self, other) {
-            (Self::All, other) => other.clone(),
-            (this, Self::All) => this.clone(),
-            (Self::AllowList(a), Self::AllowList(b)) => {
-                Self::AllowList(a.intersection(b).cloned().collect())
-            }
-            (Self::DenyList(a), Self::DenyList(b)) => Self::DenyList(a.union(b).cloned().collect()),
-            (Self::AllowList(allowed), Self::DenyList(denied)) => {
-                Self::AllowList(allowed.difference(denied).cloned().collect())
-            }
-            (Self::DenyList(denied), Self::AllowList(allowed)) => {
-                Self::AllowList(allowed.difference(denied).cloned().collect())
-            }
-        }
-    }
-}
 
 // ============================================================================
 // DocKind — type of document content
@@ -490,71 +430,7 @@ mod tests {
         }
     }
 
-    // ── ToolFilter ──────────────────────────────────────────────────────
-
-    #[test]
-    fn tool_filter_default_is_all() {
-        assert_eq!(ToolFilter::default(), ToolFilter::All);
-    }
-
-    #[test]
-    fn tool_filter_all_allows_everything() {
-        let filter = ToolFilter::All;
-        assert!(filter.allows("anything"));
-        assert!(filter.allows("bash"));
-    }
-
-    #[test]
-    fn tool_filter_allow_list() {
-        let filter = ToolFilter::allow(["bash", "read", "write"]);
-        assert!(filter.allows("bash"));
-        assert!(filter.allows("read"));
-        assert!(!filter.allows("edit"));
-    }
-
-    #[test]
-    fn tool_filter_deny_list() {
-        let filter = ToolFilter::deny(["bash", "dangerous"]);
-        assert!(!filter.allows("bash"));
-        assert!(filter.allows("read"));
-    }
-
-    #[test]
-    fn tool_filter_merge() {
-        let all = ToolFilter::All;
-        let allow = ToolFilter::allow(["bash", "read"]);
-        assert_eq!(all.merge(&allow), allow);
-
-        let a1 = ToolFilter::allow(["bash", "read", "write"]);
-        let a2 = ToolFilter::allow(["read", "write", "edit"]);
-        let merged = a1.merge(&a2);
-        match merged {
-            ToolFilter::AllowList(set) => {
-                assert!(set.contains("read"));
-                assert!(set.contains("write"));
-                assert!(!set.contains("bash"));
-                assert!(!set.contains("edit"));
-            }
-            _ => panic!("expected AllowList"),
-        }
-    }
-
-    #[test]
-    fn tool_filter_serde_roundtrip() {
-        let filter = ToolFilter::allow(["bash", "read"]);
-        let json = serde_json::to_string(&filter).unwrap();
-        let parsed: ToolFilter = serde_json::from_str(&json).unwrap();
-        assert_eq!(filter, parsed);
-
-        let all = ToolFilter::All;
-        let json = serde_json::to_string(&all).unwrap();
-        let parsed: ToolFilter = serde_json::from_str(&json).unwrap();
-        assert_eq!(all, parsed);
-    }
-
-    // NOTE: ToolFilter uses HashSet which doesn't support postcard (positional format).
-    // Wire serialization uses JSON (TEXT column in SQLite, JSON on Cap'n Proto).
-    // Postcard roundtrip is intentionally not tested for ToolFilter.
+    // ── ToolFilter retired in Phase 5 (D-54) — tests removed. ─────────────
 
     // ── DocKind ────────────────────────────────────────────────────────
 

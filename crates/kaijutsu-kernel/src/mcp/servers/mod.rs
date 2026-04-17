@@ -13,6 +13,7 @@
 //! truth until M5 deletes the old engines and inlines the bodies here.
 
 pub mod adapter;
+pub mod bindings_builtin;
 pub mod block;
 pub mod external;
 pub mod file;
@@ -20,6 +21,7 @@ pub mod hooks_builtin;
 pub mod kernel_info;
 pub mod resources_builtin;
 
+pub use bindings_builtin::BuiltinBindingsServer;
 pub use block::BlockToolsServer;
 pub use external::ExternalMcpServer;
 pub use file::FileToolsServer;

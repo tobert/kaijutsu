@@ -1093,11 +1093,11 @@ interface Kernel {
   # Tool Filter Configuration
   # ============================================================================
 
-  # Get current tool filter configuration
-  getToolFilter @69 () -> (filter :ToolFilterConfig);
-
-  # Set tool filter configuration
-  setToolFilter @70 (filter :ToolFilterConfig) -> (success :Bool, error :Text);
+  # Phase 5 D-54: tool filter retired. `ContextToolBinding` +
+  # `HookPhase::ListTools` subsume allow/deny semantics. Ordinals kept for
+  # schema compatibility; methods are no-ops.
+  getToolFilterRemoved @69 () -> ();
+  setToolFilterRemoved @70 () -> ();
 
   # ============================================================================
   # Shell Variable Introspection (kaish scope)
@@ -1167,11 +1167,10 @@ interface Kernel {
   # Per-Context Tool Filter
   # ============================================================================
 
-  # Set tool filter for a specific context (restricts, doesn't relax kernel filter).
-  setContextToolFilter @85 (contextId :Data, filter :ToolFilterConfig, trace :TraceContext) -> (success :Bool, error :Text);
-
-  # Get the per-context tool filter (None = inherit kernel default).
-  getContextToolFilter @86 (contextId :Data, trace :TraceContext) -> (filter :ToolFilterConfig, hasFilter :Bool);
+  # Phase 5 D-54: retired. See `builtin.bindings` MCP tools for the
+  # replacement. Ordinals kept for schema compatibility.
+  setContextToolFilterRemoved @85 () -> ();
+  getContextToolFilterRemoved @86 () -> ();
 
   # Removed: use `kj fork` instead. Ordinal kept for schema compatibility.
   forkFilteredRemoved @87 () -> ();

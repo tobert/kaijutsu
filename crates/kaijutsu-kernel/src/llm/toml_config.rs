@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use super::config::{ProviderConfig, ToolFilter};
+use super::config::ProviderConfig;
 use super::{LlmError, LlmRegistry, LlmResult, RigProvider};
 
 // ---------------------------------------------------------------------------
@@ -162,22 +162,15 @@ struct ProviderToml {
     #[serde(default)]
     max_output_tokens: Option<u64>,
 
+    /// Phase 5 D-54: retired. Deserialized and ignored for backwards
+    /// compatibility with existing models.toml files that still carry a
+    /// `[providers.X.default_tools]` block. New configs should omit it.
     #[serde(default)]
-    default_tools: Option<ToolFilterToml>,
+    default_tools: Option<toml::Value>,
 }
 
 fn default_true() -> bool {
     true
-}
-
-/// Tool filter as it appears in TOML.
-#[derive(Deserialize)]
-struct ToolFilterToml {
-    #[serde(rename = "type")]
-    filter_type: String,
-
-    #[serde(default)]
-    tools: Vec<String>,
 }
 
 /// Streaming config (preserved for future use, not currently mapped).
@@ -258,14 +251,10 @@ fn convert_llm_config(raw: &ModelsToml) -> LlmResult<LlmConfig> {
         config.base_url = p.base_url.clone();
         config.default_model = p.default_model.clone();
         config.max_output_tokens = p.max_output_tokens;
-        // Absent default_tools deliberately defaults to AllowList(empty) — a
-        // provider that does not opt in to a tool policy exposes no tools.
-        // This is the strict choice: forgetting to specify a filter must not
-        // silently grant full tool access.
-        config.default_tools = match p.default_tools.as_ref() {
-            Some(tf) => convert_tool_filter(name, tf)?,
-            None => ToolFilter::allow(Vec::<String>::new()),
-        };
+        // Phase 5 D-54: any `default_tools` block in TOML is silently
+        // dropped; tool visibility is now managed by the broker's
+        // `ContextToolBinding` + `HookPhase::ListTools`.
+        let _ = &p.default_tools;
         providers.push(config);
     }
 
@@ -274,23 +263,6 @@ fn convert_llm_config(raw: &ModelsToml) -> LlmResult<LlmConfig> {
         providers,
         model_aliases: raw.model_aliases.clone(),
     })
-}
-
-fn convert_tool_filter(provider_name: &str, tf: &ToolFilterToml) -> LlmResult<ToolFilter> {
-    match tf.filter_type.as_str() {
-        "all" => Ok(ToolFilter::All),
-        "allow" => Ok(ToolFilter::allow(tf.tools.clone())),
-        "deny" => Ok(ToolFilter::deny(tf.tools.clone())),
-        other => Ok(other_err(provider_name, other)?),
-    }
-}
-
-#[cold]
-fn other_err(provider_name: &str, filter_type: &str) -> LlmResult<ToolFilter> {
-    Err(LlmError::InvalidRequest(format!(
-        "provider '{provider_name}': unknown tool filter type '{filter_type}' \
-         (expected 'all', 'allow', or 'deny')"
-    )))
 }
 
 fn convert_embedding(raw: &Option<EmbeddingToml>) -> Option<EmbeddingModelConfig> {
@@ -356,7 +328,6 @@ mod tests {
             Some("claude-haiku-4-5-20251001")
         );
         assert_eq!(anthropic.max_output_tokens, Some(8192));
-        assert_eq!(anthropic.default_tools, ToolFilter::All);
 
         let gemini = config
             .llm
@@ -379,7 +350,10 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_filter_deny() {
+    fn test_tool_filter_blocks_are_ignored() {
+        // Phase 5 D-54: legacy [providers.*.default_tools] blocks are
+        // deserialized and silently dropped so existing configs keep
+        // parsing.
         let toml = r#"
 default_provider = "test"
 
@@ -398,30 +372,8 @@ tools = ["shell", "bash"]
             .iter()
             .find(|p| p.provider_type == "test")
             .unwrap();
-        assert_eq!(test.default_tools, ToolFilter::deny(["shell", "bash"]));
-    }
-
-    #[test]
-    fn test_tool_filter_allow() {
-        let toml = r#"
-default_provider = "test"
-
-[providers.test]
-enabled = false
-
-[providers.test.default_tools]
-type = "allow"
-tools = ["read", "write"]
-
-[model_aliases]
-"#;
-        let config = load_llm_config_toml(toml).unwrap();
-        let test = config
-            .providers
-            .iter()
-            .find(|p| p.provider_type == "test")
-            .unwrap();
-        assert_eq!(test.default_tools, ToolFilter::allow(["read", "write"]));
+        assert_eq!(test.provider_type, "test");
+        assert!(test.enabled);
     }
 
     #[test]
@@ -489,78 +441,4 @@ type = "all"
         );
     }
 
-    #[test]
-    fn test_tool_filter_all_explicit() {
-        let toml = r#"
-default_provider = "test"
-
-[providers.test]
-enabled = false
-
-[providers.test.default_tools]
-type = "all"
-
-[model_aliases]
-"#;
-        let config = load_llm_config_toml(toml).unwrap();
-        let test = config
-            .providers
-            .iter()
-            .find(|p| p.provider_type == "test")
-            .unwrap();
-        assert_eq!(test.default_tools, ToolFilter::All);
-    }
-
-    #[test]
-    fn test_tool_filter_absent_is_empty_allowlist() {
-        // Absent default_tools must NOT silently grant full access.
-        let toml = r#"
-default_provider = "test"
-
-[providers.test]
-enabled = false
-
-[model_aliases]
-"#;
-        let config = load_llm_config_toml(toml).unwrap();
-        let test = config
-            .providers
-            .iter()
-            .find(|p| p.provider_type == "test")
-            .unwrap();
-        assert_eq!(
-            test.default_tools,
-            ToolFilter::allow(Vec::<String>::new()),
-            "absent default_tools should be empty AllowList (deny-all)"
-        );
-        assert!(
-            !test.default_tools.allows("bash"),
-            "empty AllowList must deny every tool"
-        );
-    }
-
-    #[test]
-    fn test_tool_filter_unknown_type_errors() {
-        let toml = r#"
-default_provider = "test"
-
-[providers.test]
-enabled = false
-
-[providers.test.default_tools]
-type = "bogus"
-
-[model_aliases]
-"#;
-        let err = load_llm_config_toml(toml).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("bogus"),
-            "error should name the offending filter type: {msg}"
-        );
-        assert!(
-            msg.contains("test"),
-            "error should name the offending provider: {msg}"
-        );
-    }
 }

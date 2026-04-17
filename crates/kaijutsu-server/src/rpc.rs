@@ -103,8 +103,6 @@ use kaijutsu_kernel::{
     SharedBlockStore,
     SharedConfigFlowBus,
     SharedInputDocFlowBus,
-    // Tool filtering (wire type, binding translation)
-    ToolFilter,
     VfsOps,
     block_store::BlockStore,
     shared_block_flow_bus,
@@ -832,7 +830,6 @@ pub async fn create_shared_kernel(
                     provider: None,
                     model: None,
                     system_prompt: None,
-                    tool_filter: None,
                     consent_mode: kaijutsu_kernel::control::ConsentMode::Collaborative,
                     context_state: kaijutsu_types::ContextState::Live,
                     created_at: kaijutsu_types::now_millis() as i64,
@@ -886,9 +883,6 @@ pub async fn create_shared_kernel(
             }
             if let (Some(provider), Some(model)) = (&row.provider, &row.model) {
                 let _ = drift.configure_llm(row.context_id, provider, model);
-            }
-            if row.tool_filter.is_some() {
-                let _ = drift.configure_tools(row.context_id, row.tool_filter.clone());
             }
             log::info!(
                 "Recovered context {} (label={:?}, provider={:?}) from KernelDb",
@@ -1492,23 +1486,10 @@ impl kernel::Server for KernelImpl {
                     kernel_id,
                 );
 
-                // Kernel-scoped tool filter removed in Phase 1 M5; only the
-                // per-context filter remains as a visibility gate.
-                if let Some(ctx_filter) = kernel_arc
-                    .drift()
-                    .read()
-                    .await
-                    .get(context_id)
-                    .and_then(|h| h.tool_filter.as_ref())
-                    && !ctx_filter.allows(&tool_name)
-                {
-                    result.set_success(false);
-                    result.set_error(format!(
-                        "Tool filtered out by context config: {}",
-                        tool_name
-                    ));
-                    return Ok(());
-                }
+                // Phase 5 D-54: tool filter retired. Visibility is now
+                // enforced by the broker's `ContextToolBinding` +
+                // `HookPhase::ListTools` inside `list_visible_tools` and
+                // `dispatch_tool_via_broker`.
 
                 // Dispatch through the Phase 1 broker (M4).
                 match kernel_arc
@@ -2049,7 +2030,6 @@ impl kernel::Server for KernelImpl {
                     provider: default_provider.clone(),
                     model: default_model.clone(),
                     system_prompt: None,
-                    tool_filter: None,
                     consent_mode: kaijutsu_kernel::control::ConsentMode::Collaborative,
                     context_state: kaijutsu_types::ContextState::Live,
                     created_at: kaijutsu_types::now_millis() as i64,
@@ -3448,132 +3428,10 @@ impl kernel::Server for KernelImpl {
         )
     }
 
-    // ========================================================================
-    // Tool Filter Configuration (Phase 5)
-    // ========================================================================
-
-    fn get_tool_filter(
-        self: Rc<Self>,
-        _params: kernel::GetToolFilterParams,
-        mut results: kernel::GetToolFilterResults,
-    ) -> Promise<(), capnp::Error> {
-        let _ = self.kernel.kernel.clone();
-        let span = tracing::info_span!("rpc", method = "get_tool_filter");
-        Promise::from_future(
-            async move {
-                // Kernel-scoped filter removed in Phase 1 M5; always report
-                // `All` so existing clients see the permissive default.
-                results.get().init_filter().set_all(());
-                Ok(())
-            }
-            .instrument(span),
-        )
-    }
-
-    fn set_tool_filter(
-        self: Rc<Self>,
-        _params: kernel::SetToolFilterParams,
-        mut results: kernel::SetToolFilterResults,
-    ) -> Promise<(), capnp::Error> {
-        // Kernel-scoped filter removed in Phase 1 M5. Accept the call for
-        // wire compat but no-op the state change; Phase 2 will reroute
-        // through broker ContextToolBinding updates.
-        results.get().set_success(true);
-        results.get().set_error("kernel-scoped tool filter removed in Phase 1 M5 — no-op");
-        Promise::ok(())
-    }
-
-    // ========================================================================
-    // Per-Context Tool Filter
-    // ========================================================================
-
-    fn set_context_tool_filter(
-        self: Rc<Self>,
-        params: kernel::SetContextToolFilterParams,
-        mut results: kernel::SetContextToolFilterResults,
-    ) -> Promise<(), capnp::Error> {
-        let params_reader = pry!(params.get());
-        let context_id_bytes = pry!(params_reader.get_context_id());
-        let context_id = pry!(
-            ContextId::try_from_slice(context_id_bytes)
-                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
-        );
-
-        let filter_reader = pry!(params_reader.get_filter());
-        let filter = pry!(parse_tool_filter_from_capnp(filter_reader));
-
-        let kernel_arc = self.kernel.kernel.clone();
-        let shared_kernel = self.kernel.clone();
-
-        let span = extract_rpc_trace(params_reader.get_trace(), "set_context_tool_filter");
-        Promise::from_future(
-            async move {
-                // Write-through: KernelDb first
-                {
-                    let db = shared_kernel.kernel_db.lock();
-                    if let Err(e) = db.update_tool_filter(context_id, &Some(filter.clone())) {
-                        log::warn!(
-                            "KernelDb update_tool_filter failed for {}: {}",
-                            context_id.short(),
-                            e
-                        );
-                    }
-                }
-
-                let mut drift = kernel_arc.drift().write().await;
-                match drift.configure_tools(context_id, Some(filter)) {
-                    Ok(()) => {
-                        results.get().set_success(true);
-                        results.get().set_error("");
-                        log::info!("Context tool filter updated: {}", context_id);
-                    }
-                    Err(e) => {
-                        results.get().set_success(false);
-                        results.get().set_error(e.to_string());
-                    }
-                }
-                Ok(())
-            }
-            .instrument(span),
-        )
-    }
-
-    fn get_context_tool_filter(
-        self: Rc<Self>,
-        params: kernel::GetContextToolFilterParams,
-        mut results: kernel::GetContextToolFilterResults,
-    ) -> Promise<(), capnp::Error> {
-        let params_reader = pry!(params.get());
-        let context_id_bytes = pry!(params_reader.get_context_id());
-        let context_id = pry!(
-            ContextId::try_from_slice(context_id_bytes)
-                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
-        );
-
-        let kernel_arc = self.kernel.kernel.clone();
-
-        let span = extract_rpc_trace(params_reader.get_trace(), "get_context_tool_filter");
-        Promise::from_future(
-            async move {
-                let drift = kernel_arc.drift().read().await;
-                let handle = drift.get(context_id);
-
-                let mut res = results.get();
-                match handle.and_then(|h| h.tool_filter.as_ref()) {
-                    Some(filter) => {
-                        res.set_has_filter(true);
-                        serialize_tool_filter_to_capnp(filter, res.init_filter());
-                    }
-                    None => {
-                        res.set_has_filter(false);
-                        res.init_filter().set_all(());
-                    }
-                }
-                Ok(())
-            }
-            .instrument(span),
-        )
-    }
+    // Phase 5 D-54: get/setToolFilter and get/setContextToolFilter retired.
+    // Capnp ordinals 69/70/85/86 renamed to `...Removed` stubs; the
+    // generated trait's default `unimplemented` impls cover them.
+    // See `builtin.bindings` MCP tools for the replacement.
 
     // forkFiltered removed — consolidated to kj fork
 
@@ -4812,61 +4670,6 @@ fn agent_status_to_capnp(status: AgentStatus) -> CapnpAgentStatus {
         AgentStatus::Ready => CapnpAgentStatus::Ready,
         AgentStatus::Busy => CapnpAgentStatus::Busy,
         AgentStatus::Offline => CapnpAgentStatus::Offline,
-    }
-}
-
-// ============================================================================
-// Cap'n Proto ↔ Rust Type Helpers
-// ============================================================================
-
-/// Parse a ToolFilter from a Cap'n Proto ToolFilterConfig reader.
-fn parse_tool_filter_from_capnp(
-    reader: tool_filter_config::Reader<'_>,
-) -> Result<ToolFilter, capnp::Error> {
-    match reader.which()? {
-        tool_filter_config::All(()) => Ok(ToolFilter::All),
-        tool_filter_config::AllowList(list) => {
-            let list = list?;
-            let mut tools = std::collections::HashSet::new();
-            for i in 0..list.len() {
-                let name = list.get(i)?.to_str()?;
-                tools.insert(name.to_string());
-            }
-            Ok(ToolFilter::AllowList(tools))
-        }
-        tool_filter_config::DenyList(list) => {
-            let list = list?;
-            let mut tools = std::collections::HashSet::new();
-            for i in 0..list.len() {
-                let name = list.get(i)?.to_str()?;
-                tools.insert(name.to_string());
-            }
-            Ok(ToolFilter::DenyList(tools))
-        }
-    }
-}
-
-/// Serialize a ToolFilter into a Cap'n Proto ToolFilterConfig builder.
-fn serialize_tool_filter_to_capnp(
-    filter: &ToolFilter,
-    mut builder: tool_filter_config::Builder<'_>,
-) {
-    match filter {
-        ToolFilter::All => builder.set_all(()),
-        ToolFilter::AllowList(tools) => {
-            let tools_vec: Vec<&str> = tools.iter().map(|s| s.as_str()).collect();
-            let mut list = builder.init_allow_list(tools_vec.len() as u32);
-            for (i, tool) in tools_vec.iter().enumerate() {
-                list.set(i as u32, tool);
-            }
-        }
-        ToolFilter::DenyList(tools) => {
-            let tools_vec: Vec<&str> = tools.iter().map(|s| s.as_str()).collect();
-            let mut list = builder.init_deny_list(tools_vec.len() as u32);
-            for (i, tool) in tools_vec.iter().enumerate() {
-                list.set(i as u32, tool);
-            }
-        }
     }
 }
 

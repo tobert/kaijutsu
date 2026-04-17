@@ -71,10 +71,8 @@ pub use llm::{
     // Streaming
     StreamEvent,
     StreamRequest,
-    ToolConfig,
     // Tool definitions
     ToolDefinition as LlmToolDefinition,
-    ToolFilter,
     Usage as LlmUsage,
     // Hydration
     hydrate_from_blocks,

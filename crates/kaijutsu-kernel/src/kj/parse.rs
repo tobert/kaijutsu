@@ -1,9 +1,5 @@
 //! Shared argument parsing helpers for kj commands.
 
-use std::collections::HashSet;
-
-use kaijutsu_types::ToolFilter;
-
 /// Extract a named argument value from argv (e.g., `--name foo`).
 ///
 /// Checks multiple flag variants and returns the value immediately following.
@@ -76,45 +72,6 @@ pub fn parse_model_spec(spec: &str) -> (Option<String>, Option<String>) {
     }
 }
 
-/// Parse a tool filter spec string.
-///
-/// Formats:
-/// - `"all"` → `ToolFilter::All`
-/// - `"allow:glob,grep,read"` → `ToolFilter::AllowList(["glob", "grep", "read"])`
-/// - `"deny:bash"` → `ToolFilter::DenyList(["bash"])`
-pub fn parse_tool_filter_spec(spec: &str) -> Result<ToolFilter, String> {
-    let spec = spec.trim();
-    if spec.eq_ignore_ascii_case("all") {
-        return Ok(ToolFilter::All);
-    }
-    if let Some(list) = spec.strip_prefix("allow:") {
-        let tools: HashSet<String> = list
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        if tools.is_empty() {
-            return Err("allow list must contain at least one tool".to_string());
-        }
-        return Ok(ToolFilter::AllowList(tools));
-    }
-    if let Some(list) = spec.strip_prefix("deny:") {
-        let tools: HashSet<String> = list
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        if tools.is_empty() {
-            return Err("deny list must contain at least one tool".to_string());
-        }
-        return Ok(ToolFilter::DenyList(tools));
-    }
-    Err(format!(
-        "invalid tool filter spec '{}' — use 'all', 'allow:tool1,tool2', or 'deny:tool1,tool2'",
-        spec
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,38 +134,4 @@ mod tests {
         assert_eq!(m, None);
     }
 
-    #[test]
-    fn parse_tool_filter_all() {
-        assert!(matches!(parse_tool_filter_spec("all"), Ok(ToolFilter::All)));
-        assert!(matches!(parse_tool_filter_spec("ALL"), Ok(ToolFilter::All)));
-    }
-
-    #[test]
-    fn parse_tool_filter_allow() {
-        match parse_tool_filter_spec("allow:glob,grep,read") {
-            Ok(ToolFilter::AllowList(tools)) => {
-                assert!(tools.contains("glob"));
-                assert!(tools.contains("grep"));
-                assert!(tools.contains("read"));
-                assert_eq!(tools.len(), 3);
-            }
-            other => panic!("expected AllowList, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn parse_tool_filter_deny() {
-        match parse_tool_filter_spec("deny:bash") {
-            Ok(ToolFilter::DenyList(tools)) => {
-                assert!(tools.contains("bash"));
-                assert_eq!(tools.len(), 1);
-            }
-            other => panic!("expected DenyList, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn parse_tool_filter_invalid() {
-        assert!(parse_tool_filter_spec("foobar").is_err());
-    }
 }

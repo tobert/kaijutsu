@@ -7,7 +7,7 @@ use crate::kernel_db::{ContextEdgeRow, ContextRow, ContextShellRow};
 use super::format::{
     format_context_info, format_context_table, format_context_tree, format_fork_lineage,
 };
-use super::parse::{extract_named_arg, parse_model_spec, parse_tool_filter_spec};
+use super::parse::{extract_named_arg, parse_model_spec};
 use super::refs::{parse_context_ref, resolve_context_ref};
 use super::{KjCaller, KjDispatcher, KjResult};
 
@@ -237,7 +237,6 @@ impl KjDispatcher {
                 provider: None,
                 model: None,
                 system_prompt: None,
-                tool_filter: None,
                 consent_mode: ConsentMode::Collaborative,
                 context_state: ContextState::Live,
                 created_at: kaijutsu_types::now_millis() as i64,
@@ -290,7 +289,6 @@ impl KjDispatcher {
             .map(|s| s.as_str());
         let model_spec = extract_named_arg(argv, &["--model", "-m"]);
         let system_prompt = extract_named_arg(argv, &["--system-prompt"]);
-        let tool_filter_spec = extract_named_arg(argv, &["--tool-filter"]);
         let consent_spec = extract_named_arg(argv, &["--consent"]);
         let cwd_spec = extract_named_arg(argv, &["--cwd"]);
         let env_spec = extract_named_arg(argv, &["--env"]);
@@ -311,7 +309,7 @@ impl KjDispatcher {
         };
 
         // Resolve target + apply DB changes (lock scope)
-        let (target_id, changes, tool_filter_for_drift, model_for_drift) = {
+        let (target_id, changes, model_for_drift) = {
             let db = self.kernel_db().lock();
 
             let target_id =
@@ -321,7 +319,6 @@ impl KjDispatcher {
                 };
 
             let mut changes = Vec::new();
-            let mut tool_filter_for_drift = None;
             let mut model_for_drift: Option<(String, String)> = None;
 
             // Update model (already validated above)
@@ -334,15 +331,6 @@ impl KjDispatcher {
                     model_for_drift = Some((p, m));
                 }
             }
-
-            // Parse tool filter
-            let tool_filter = match tool_filter_spec {
-                Some(ref spec) => match parse_tool_filter_spec(spec) {
-                    Ok(tf) => Some(tf),
-                    Err(e) => return KjResult::Err(format!("kj context set: {e}")),
-                },
-                None => None,
-            };
 
             // Parse consent mode
             let consent_mode = match consent_spec {
@@ -359,7 +347,7 @@ impl KjDispatcher {
             };
 
             // Apply settings
-            if system_prompt.is_some() || tool_filter.is_some() || consent_mode.is_some() {
+            if system_prompt.is_some() || consent_mode.is_some() {
                 let current = match db.get_context(target_id) {
                     Ok(Some(row)) => row,
                     Ok(None) => {
@@ -371,26 +359,14 @@ impl KjDispatcher {
                 let new_prompt = system_prompt
                     .as_deref()
                     .or(current.system_prompt.as_deref());
-                let new_filter = if tool_filter.is_some() {
-                    &tool_filter
-                } else {
-                    &current.tool_filter
-                };
                 let new_consent = consent_mode.unwrap_or(current.consent_mode);
 
-                if let Err(e) = db.update_settings(target_id, new_prompt, new_filter, new_consent) {
+                if let Err(e) = db.update_settings(target_id, new_prompt, new_consent) {
                     return KjResult::Err(format!("kj context set: {e}"));
                 }
 
                 if system_prompt.is_some() {
                     changes.push("system-prompt".to_string());
-                }
-                if tool_filter.is_some() {
-                    changes.push(format!(
-                        "tool-filter={}",
-                        tool_filter_spec.as_deref().unwrap_or("?")
-                    ));
-                    tool_filter_for_drift = tool_filter;
                 }
                 if consent_mode.is_some() {
                     changes.push(format!(
@@ -429,19 +405,14 @@ impl KjDispatcher {
                 }
             }
 
-            (target_id, changes, tool_filter_for_drift, model_for_drift)
+            (target_id, changes, model_for_drift)
         };
         // db lock released here
 
         // Update DriftRouter (async, no db lock held)
-        if model_for_drift.is_some() || tool_filter_for_drift.is_some() {
+        if let Some((p, m)) = model_for_drift {
             let mut drift = self.drift_router().write().await;
-            if let Some((ref p, ref m)) = model_for_drift {
-                let _ = drift.configure_llm(target_id, p, m);
-            }
-            if let Some(tf) = tool_filter_for_drift {
-                let _ = drift.configure_tools(target_id, Some(tf));
-            }
+            let _ = drift.configure_llm(target_id, &p, &m);
         }
 
         if changes.is_empty() {

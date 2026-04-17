@@ -14,8 +14,11 @@ use tracing::{info, warn};
 
 use kaijutsu_types::{
     ConsentMode, ContextId, ContextState, DocKind, EdgeKind, ForkKind, KernelId, PresetId,
-    PrincipalId, ToolFilter, WorkspaceId,
+    PrincipalId, WorkspaceId,
 };
+
+use crate::mcp::binding::ContextToolBinding;
+use crate::mcp::types::InstanceId;
 
 // ============================================================================
 // Error type
@@ -64,7 +67,6 @@ pub struct ContextRow {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub system_prompt: Option<String>,
-    pub tool_filter: Option<ToolFilter>,
     pub consent_mode: ConsentMode,
     pub context_state: ContextState,
     pub created_at: i64,
@@ -100,7 +102,6 @@ pub struct PresetRow {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub system_prompt: Option<String>,
-    pub tool_filter: Option<ToolFilter>,
     pub consent_mode: ConsentMode,
     pub created_at: i64,
     pub created_by: PrincipalId,
@@ -230,7 +231,6 @@ CREATE TABLE IF NOT EXISTS presets (
     provider     TEXT,
     model        TEXT,
     system_prompt TEXT,
-    tool_filter  TEXT,
     consent_mode TEXT NOT NULL DEFAULT 'collaborative',
     created_at   INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
     created_by   BLOB NOT NULL
@@ -267,7 +267,6 @@ CREATE TABLE IF NOT EXISTS contexts (
     provider     TEXT,
     model        TEXT,
     system_prompt TEXT,
-    tool_filter  TEXT,
     consent_mode TEXT NOT NULL DEFAULT 'collaborative',
     context_state TEXT NOT NULL DEFAULT 'live',
     created_at   INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
@@ -347,6 +346,41 @@ CREATE TABLE IF NOT EXISTS context_shell (
     init_script TEXT,
     updated_at  INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER))
 );
+
+-- ── Context Tool Bindings (Phase 5, D-54) ───────────────────────
+-- Per-context instance visibility + sticky name resolution, persisted so
+-- curation survives kernel restart. First-touch loads from this set of
+-- tables; fall-back to "bind all registered" only when the parent row is
+-- absent. Normalized per feedback_sql_schema.md: the Rust struct
+-- ContextToolBinding reconstructs by joining.
+CREATE TABLE IF NOT EXISTS context_bindings (
+    context_id BLOB    NOT NULL PRIMARY KEY REFERENCES contexts(context_id) ON DELETE CASCADE,
+    updated_at INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER))
+);
+
+-- Ordered list of allowed instances (Vec<InstanceId>). order_idx preserves
+-- the tiebreak semantic for Auto-mode resolution (D-20 / §4.2).
+CREATE TABLE IF NOT EXISTS context_binding_instances (
+    context_id  BLOB    NOT NULL REFERENCES context_bindings(context_id) ON DELETE CASCADE,
+    instance_id TEXT    NOT NULL,
+    order_idx   INTEGER NOT NULL,
+    PRIMARY KEY (context_id, instance_id)
+);
+CREATE INDEX IF NOT EXISTS idx_binding_instances_lookup
+    ON context_binding_instances(instance_id);
+
+-- Sticky name resolution map (HashMap<visible_name, (instance, tool)>).
+-- visible_name is the LLM-observable name; (instance_id, original_tool) is
+-- the resolved target. Preserving this across restart is exit criterion #2.
+CREATE TABLE IF NOT EXISTS context_binding_names (
+    context_id    BLOB NOT NULL REFERENCES context_bindings(context_id) ON DELETE CASCADE,
+    visible_name  TEXT NOT NULL,
+    instance_id   TEXT NOT NULL,
+    original_tool TEXT NOT NULL,
+    PRIMARY KEY (context_id, visible_name)
+);
+CREATE INDEX IF NOT EXISTS idx_binding_names_target
+    ON context_binding_names(context_id, instance_id, original_tool);
 
 CREATE TABLE IF NOT EXISTS context_env (
     context_id BLOB NOT NULL REFERENCES contexts(context_id) ON DELETE CASCADE,
@@ -475,17 +509,6 @@ fn read_edge_id(row: &rusqlite::Row<'_>, idx: usize) -> SqliteResult<uuid::Uuid>
             "invalid UUID bytes".into(),
         ))
     }
-}
-
-/// Serialize ToolFilter to JSON TEXT for SQLite.
-fn tool_filter_to_sql(tf: &Option<ToolFilter>) -> Option<String> {
-    tf.as_ref()
-        .map(|f| serde_json::to_string(f).unwrap_or_default())
-}
-
-/// Deserialize ToolFilter from JSON TEXT.
-fn tool_filter_from_sql(s: Option<String>) -> Option<ToolFilter> {
-    s.and_then(|json| serde_json::from_str(&json).ok())
 }
 
 /// Parse ConsentMode from TEXT column.
@@ -1103,14 +1126,14 @@ impl KernelDb {
             .execute(
                 "INSERT INTO contexts (
                 context_id, kernel_id, label, provider, model,
-                system_prompt, tool_filter, consent_mode, context_state,
+                system_prompt, consent_mode, context_state,
                 created_at, created_by, forked_from, fork_kind,
                 archived_at, workspace_id, preset_id
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5,
                 ?6, ?7, ?8, ?9,
-                ?10, ?11, ?12, ?13,
-                ?14, ?15, ?16
+                ?10, ?11, ?12,
+                ?13, ?14, ?15
             )",
                 params![
                     blob_param(row.context_id.as_bytes()),
@@ -1119,7 +1142,6 @@ impl KernelDb {
                     row.provider,
                     row.model,
                     row.system_prompt,
-                    tool_filter_to_sql(&row.tool_filter),
                     row.consent_mode.as_str(),
                     row.context_state.as_str(),
                     row.created_at,
@@ -1145,7 +1167,7 @@ impl KernelDb {
     pub fn get_context(&self, id: ContextId) -> KernelDbResult<Option<ContextRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT context_id, kernel_id, label, provider, model,
-                    system_prompt, tool_filter, consent_mode, context_state,
+                    system_prompt, consent_mode, context_state,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id
              FROM contexts WHERE context_id = ?1",
@@ -1207,34 +1229,16 @@ impl KernelDb {
         &self,
         id: ContextId,
         system_prompt: Option<&str>,
-        tool_filter: &Option<ToolFilter>,
         consent_mode: ConsentMode,
     ) -> KernelDbResult<()> {
         let updated = self.conn.execute(
-            "UPDATE contexts SET system_prompt = ?1, tool_filter = ?2, consent_mode = ?3
-             WHERE context_id = ?4",
+            "UPDATE contexts SET system_prompt = ?1, consent_mode = ?2
+             WHERE context_id = ?3",
             params![
                 system_prompt,
-                tool_filter_to_sql(tool_filter),
                 consent_mode.as_str(),
                 blob_param(id.as_bytes()),
             ],
-        )?;
-        if updated == 0 {
-            return Err(KernelDbError::NotFound(format!("context {}", id.short())));
-        }
-        Ok(())
-    }
-
-    /// Update a context's tool filter.
-    pub fn update_tool_filter(
-        &self,
-        id: ContextId,
-        tool_filter: &Option<ToolFilter>,
-    ) -> KernelDbResult<()> {
-        let updated = self.conn.execute(
-            "UPDATE contexts SET tool_filter = ?1 WHERE context_id = ?2",
-            params![tool_filter_to_sql(tool_filter), blob_param(id.as_bytes()),],
         )?;
         if updated == 0 {
             return Err(KernelDbError::NotFound(format!("context {}", id.short())));
@@ -1289,7 +1293,7 @@ impl KernelDb {
     pub fn list_active_contexts(&self, kernel_id: KernelId) -> KernelDbResult<Vec<ContextRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT context_id, kernel_id, label, provider, model,
-                    system_prompt, tool_filter, consent_mode, context_state,
+                    system_prompt, consent_mode, context_state,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id
              FROM contexts
@@ -1307,7 +1311,7 @@ impl KernelDb {
     pub fn list_all_contexts(&self, kernel_id: KernelId) -> KernelDbResult<Vec<ContextRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT context_id, kernel_id, label, provider, model,
-                    system_prompt, tool_filter, consent_mode, context_state,
+                    system_prompt, consent_mode, context_state,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id
              FROM contexts
@@ -1347,7 +1351,7 @@ impl KernelDb {
     pub fn structural_parents(&self, id: ContextId) -> KernelDbResult<Vec<ContextRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT c.context_id, c.kernel_id, c.label, c.provider, c.model,
-                    c.system_prompt, c.tool_filter, c.consent_mode, c.context_state,
+                    c.system_prompt, c.consent_mode, c.context_state,
                     c.created_at, c.created_by, c.forked_from, c.fork_kind,
                     c.archived_at, c.workspace_id, c.preset_id
              FROM contexts c
@@ -1365,7 +1369,7 @@ impl KernelDb {
     pub fn structural_children(&self, id: ContextId) -> KernelDbResult<Vec<ContextRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT c.context_id, c.kernel_id, c.label, c.provider, c.model,
-                    c.system_prompt, c.tool_filter, c.consent_mode, c.context_state,
+                    c.system_prompt, c.consent_mode, c.context_state,
                     c.created_at, c.created_by, c.forked_from, c.fork_kind,
                     c.archived_at, c.workspace_id, c.preset_id
              FROM contexts c
@@ -1403,7 +1407,7 @@ impl KernelDb {
                 JOIN contexts c2 ON c2.context_id = e.target_id AND c2.archived_at IS NULL
             )
             SELECT c.context_id, c.kernel_id, c.label, c.provider, c.model,
-                   c.system_prompt, c.tool_filter, c.consent_mode, c.context_state,
+                   c.system_prompt, c.consent_mode, c.context_state,
                    c.created_at, c.created_by, c.forked_from, c.fork_kind,
                    c.archived_at, c.workspace_id, c.preset_id,
                    dag.depth
@@ -1414,7 +1418,7 @@ impl KernelDb {
 
         let rows = stmt.query_map(params![blob_param(kernel_id.as_bytes())], |row| {
             let ctx = row_to_context_row(row)?;
-            let depth: i64 = row.get(16)?;
+            let depth: i64 = row.get(15)?;
             Ok((ctx, depth))
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
@@ -1433,7 +1437,7 @@ impl KernelDb {
                 WHERE c.forked_from IS NOT NULL
             )
             SELECT c.context_id, c.kernel_id, c.label, c.provider, c.model,
-                   c.system_prompt, c.tool_filter, c.consent_mode, c.context_state,
+                   c.system_prompt, c.consent_mode, c.context_state,
                    c.created_at, c.created_by, c.forked_from, c.fork_kind,
                    c.archived_at, c.workspace_id, c.preset_id,
                    lineage.depth
@@ -1444,7 +1448,7 @@ impl KernelDb {
 
         let rows = stmt.query_map(params![blob_param(context_id.as_bytes())], |row| {
             let ctx = row_to_context_row(row)?;
-            let depth: i64 = row.get(16)?;
+            let depth: i64 = row.get(15)?;
             Ok((ctx, depth))
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
@@ -1462,7 +1466,7 @@ impl KernelDb {
                 JOIN context_edges e ON e.source_id = subtree.ctx_id AND e.kind = 'structural'
             )
             SELECT c.context_id, c.kernel_id, c.label, c.provider, c.model,
-                   c.system_prompt, c.tool_filter, c.consent_mode, c.context_state,
+                   c.system_prompt, c.consent_mode, c.context_state,
                    c.created_at, c.created_by, c.forked_from, c.fork_kind,
                    c.archived_at, c.workspace_id, c.preset_id,
                    subtree.depth
@@ -1473,7 +1477,7 @@ impl KernelDb {
 
         let rows = stmt.query_map(params![blob_param(root_id.as_bytes())], |row| {
             let ctx = row_to_context_row(row)?;
-            let depth: i64 = row.get(16)?;
+            let depth: i64 = row.get(15)?;
             Ok((ctx, depth))
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
@@ -1641,8 +1645,8 @@ impl KernelDb {
             .execute(
                 "INSERT INTO presets (
                 preset_id, kernel_id, label, description, provider, model,
-                system_prompt, tool_filter, consent_mode, created_at, created_by
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                system_prompt, consent_mode, created_at, created_by
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     blob_param(row.preset_id.as_bytes()),
                     blob_param(row.kernel_id.as_bytes()),
@@ -1651,7 +1655,6 @@ impl KernelDb {
                     row.provider,
                     row.model,
                     row.system_prompt,
-                    tool_filter_to_sql(&row.tool_filter),
                     row.consent_mode.as_str(),
                     row.created_at,
                     blob_param(row.created_by.as_bytes()),
@@ -1667,7 +1670,7 @@ impl KernelDb {
     pub fn get_preset(&self, id: PresetId) -> KernelDbResult<Option<PresetRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT preset_id, kernel_id, label, description, provider, model,
-                    system_prompt, tool_filter, consent_mode, created_at, created_by
+                    system_prompt, consent_mode, created_at, created_by
              FROM presets WHERE preset_id = ?1",
         )?;
 
@@ -1687,7 +1690,7 @@ impl KernelDb {
     ) -> KernelDbResult<Option<PresetRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT preset_id, kernel_id, label, description, provider, model,
-                    system_prompt, tool_filter, consent_mode, created_at, created_by
+                    system_prompt, consent_mode, created_at, created_by
              FROM presets WHERE kernel_id = ?1 AND label = ?2",
         )?;
 
@@ -1703,7 +1706,7 @@ impl KernelDb {
     pub fn list_presets(&self, kernel_id: KernelId) -> KernelDbResult<Vec<PresetRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT preset_id, kernel_id, label, description, provider, model,
-                    system_prompt, tool_filter, consent_mode, created_at, created_by
+                    system_prompt, consent_mode, created_at, created_by
              FROM presets WHERE kernel_id = ?1
              ORDER BY label",
         )?;
@@ -1723,15 +1726,14 @@ impl KernelDb {
             .execute(
                 "UPDATE presets SET
                 label = ?1, description = ?2, provider = ?3, model = ?4,
-                system_prompt = ?5, tool_filter = ?6, consent_mode = ?7
-             WHERE preset_id = ?8",
+                system_prompt = ?5, consent_mode = ?6
+             WHERE preset_id = ?7",
                 params![
                     row.label,
                     row.description,
                     row.provider,
                     row.model,
                     row.system_prompt,
-                    tool_filter_to_sql(&row.tool_filter),
                     row.consent_mode.as_str(),
                     blob_param(row.preset_id.as_bytes()),
                 ],
@@ -1986,6 +1988,137 @@ impl KernelDb {
     }
 
     // ========================================================================
+    // Context Tool Bindings (Phase 5, D-54)
+    // ========================================================================
+
+    /// Upsert a full `ContextToolBinding` for `context_id`.
+    ///
+    /// Transactional: bumps the parent row's `updated_at`, then wholesale
+    /// replaces the child `context_binding_instances` / `context_binding_names`
+    /// rows. Callers treat the binding as the unit of write. This matches the
+    /// in-memory model (`Broker::set_binding` is also wholesale) and keeps
+    /// restoration trivial (read parent → read children → fold).
+    pub fn upsert_context_binding(
+        &mut self,
+        context_id: ContextId,
+        binding: &ContextToolBinding,
+    ) -> KernelDbResult<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO context_bindings (context_id, updated_at)
+             VALUES (?1, ?2)
+             ON CONFLICT(context_id) DO UPDATE SET updated_at = excluded.updated_at",
+            params![blob_param(context_id.as_bytes()), now_millis()],
+        )?;
+        tx.execute(
+            "DELETE FROM context_binding_instances WHERE context_id = ?1",
+            params![blob_param(context_id.as_bytes())],
+        )?;
+        tx.execute(
+            "DELETE FROM context_binding_names WHERE context_id = ?1",
+            params![blob_param(context_id.as_bytes())],
+        )?;
+        for (idx, instance) in binding.allowed_instances.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO context_binding_instances (context_id, instance_id, order_idx)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    blob_param(context_id.as_bytes()),
+                    instance.as_str(),
+                    idx as i64,
+                ],
+            )?;
+        }
+        for (visible_name, (instance, tool)) in &binding.name_map {
+            tx.execute(
+                "INSERT INTO context_binding_names
+                     (context_id, visible_name, instance_id, original_tool)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    blob_param(context_id.as_bytes()),
+                    visible_name,
+                    instance.as_str(),
+                    tool,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Load a `ContextToolBinding` for `context_id`, or `None` if the context
+    /// has never been bound. Callers fall back to "bind all registered"
+    /// (first-touch auto-populate) when this returns `None`.
+    pub fn get_context_binding(
+        &self,
+        context_id: ContextId,
+    ) -> KernelDbResult<Option<ContextToolBinding>> {
+        let exists: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM context_bindings WHERE context_id = ?1",
+                params![blob_param(context_id.as_bytes())],
+                |row| row.get(0),
+            )
+            .ok();
+        if exists.is_none() {
+            return Ok(None);
+        }
+
+        let mut allowed_instances: Vec<InstanceId> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT instance_id FROM context_binding_instances
+                 WHERE context_id = ?1
+                 ORDER BY order_idx ASC",
+            )?;
+            let rows = stmt.query_map(params![blob_param(context_id.as_bytes())], |row| {
+                let s: String = row.get(0)?;
+                Ok(InstanceId::new(s))
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            out
+        };
+        allowed_instances.shrink_to_fit();
+
+        let mut name_map = std::collections::HashMap::new();
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT visible_name, instance_id, original_tool
+                 FROM context_binding_names
+                 WHERE context_id = ?1",
+            )?;
+            let rows = stmt.query_map(params![blob_param(context_id.as_bytes())], |row| {
+                let visible: String = row.get(0)?;
+                let inst: String = row.get(1)?;
+                let tool: String = row.get(2)?;
+                Ok((visible, (InstanceId::new(inst), tool)))
+            })?;
+            for r in rows {
+                let (visible, pair) = r?;
+                name_map.insert(visible, pair);
+            }
+        }
+
+        Ok(Some(ContextToolBinding {
+            allowed_instances,
+            name_map,
+        }))
+    }
+
+    /// Delete the full binding for a context (cascades to instances + names).
+    /// Returns true if a parent row existed.
+    pub fn delete_context_binding(&self, context_id: ContextId) -> KernelDbResult<bool> {
+        let rows = self.conn.execute(
+            "DELETE FROM context_bindings WHERE context_id = ?1",
+            params![blob_param(context_id.as_bytes())],
+        )?;
+        Ok(rows > 0)
+    }
+
+    // ========================================================================
     // Context Environment Variables
     // ========================================================================
 
@@ -2195,7 +2328,7 @@ impl KernelDb {
     ) -> KernelDbResult<Option<ContextRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT context_id, kernel_id, label, provider, model,
-                    system_prompt, tool_filter, consent_mode, context_state,
+                    system_prompt, consent_mode, context_state,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id
              FROM contexts WHERE kernel_id = ?1 AND label = ?2",
@@ -2229,10 +2362,9 @@ fn row_to_document_row(row: &rusqlite::Row<'_>) -> SqliteResult<DocumentRow> {
 }
 
 fn row_to_context_row(row: &rusqlite::Row<'_>) -> SqliteResult<ContextRow> {
-    let consent_str: String = row.get(7)?;
-    let state_str: String = row.get(8)?;
-    let fork_kind_str: Option<String> = row.get(12)?;
-    let tool_filter_str: Option<String> = row.get(6)?;
+    let consent_str: String = row.get(6)?;
+    let state_str: String = row.get(7)?;
+    let fork_kind_str: Option<String> = row.get(11)?;
 
     Ok(ContextRow {
         context_id: read_context_id(row, 0)?,
@@ -2241,16 +2373,15 @@ fn row_to_context_row(row: &rusqlite::Row<'_>) -> SqliteResult<ContextRow> {
         provider: row.get(3)?,
         model: row.get(4)?,
         system_prompt: row.get(5)?,
-        tool_filter: tool_filter_from_sql(tool_filter_str),
         consent_mode: consent_mode_from_sql(&consent_str),
         context_state: context_state_from_sql(&state_str),
-        created_at: row.get(9)?,
-        created_by: read_principal_id(row, 10)?,
-        forked_from: read_opt_context_id(row, 11)?,
+        created_at: row.get(8)?,
+        created_by: read_principal_id(row, 9)?,
+        forked_from: read_opt_context_id(row, 10)?,
         fork_kind: fork_kind_from_sql(fork_kind_str),
-        archived_at: row.get(13)?,
-        workspace_id: read_opt_workspace_id(row, 14)?,
-        preset_id: read_opt_preset_id(row, 15)?,
+        archived_at: row.get(12)?,
+        workspace_id: read_opt_workspace_id(row, 13)?,
+        preset_id: read_opt_preset_id(row, 14)?,
     })
 }
 
@@ -2267,8 +2398,7 @@ fn row_to_edge_row(row: &rusqlite::Row<'_>) -> SqliteResult<ContextEdgeRow> {
 }
 
 fn row_to_preset_row(row: &rusqlite::Row<'_>) -> SqliteResult<PresetRow> {
-    let consent_str: String = row.get(8)?;
-    let tool_filter_str: Option<String> = row.get(7)?;
+    let consent_str: String = row.get(7)?;
 
     Ok(PresetRow {
         preset_id: read_preset_id(row, 0)?,
@@ -2278,10 +2408,9 @@ fn row_to_preset_row(row: &rusqlite::Row<'_>) -> SqliteResult<PresetRow> {
         provider: row.get(4)?,
         model: row.get(5)?,
         system_prompt: row.get(6)?,
-        tool_filter: tool_filter_from_sql(tool_filter_str),
         consent_mode: consent_mode_from_sql(&consent_str),
-        created_at: row.get(9)?,
-        created_by: read_principal_id(row, 10)?,
+        created_at: row.get(8)?,
+        created_by: read_principal_id(row, 9)?,
     })
 }
 
@@ -2310,7 +2439,6 @@ fn make_context_row(kernel_id: KernelId, label: Option<&str>) -> ContextRow {
         provider: None,
         model: None,
         system_prompt: None,
-        tool_filter: None,
         consent_mode: ConsentMode::default(),
         context_state: ContextState::Live,
         created_at: now_millis() as i64,
@@ -2627,7 +2755,6 @@ mod tests {
             provider: Some("anthropic".into()),
             model: Some("claude-opus-4-6".into()),
             system_prompt: None,
-            tool_filter: None,
             consent_mode: ConsentMode::Autonomous,
             created_at: now,
             created_by: creator,
@@ -2978,7 +3105,6 @@ mod tests {
             provider: Some("anthropic".into()),
             model: Some("opus".into()),
             system_prompt: None,
-            tool_filter: Some(ToolFilter::All),
             consent_mode: ConsentMode::Autonomous,
             context_state: ContextState::Live,
             created_at: now,
@@ -3016,7 +3142,6 @@ mod tests {
             provider: Some("anthropic".into()),
             model: Some("claude-opus-4-6".into()),
             system_prompt: Some("You are helpful.".into()),
-            tool_filter: Some(ToolFilter::DenyList(["dangerous".to_string()].into())),
             consent_mode: ConsentMode::Collaborative,
             context_state: ContextState::Live,
             created_at: 1000,
@@ -3038,9 +3163,6 @@ mod tests {
             provider: Some("google".into()),
             model: Some("gemini-2.0-flash".into()),
             system_prompt: Some("Be concise.".into()),
-            tool_filter: Some(ToolFilter::AllowList(
-                ["read".to_string(), "write".to_string()].into(),
-            )),
             consent_mode: ConsentMode::Autonomous,
             context_state: ContextState::Live,
             created_at: 2000,
@@ -3061,9 +3183,6 @@ mod tests {
         assert_eq!(recovered.provider, Some("google".into()));
         assert_eq!(recovered.model, Some("gemini-2.0-flash".into()));
         assert_eq!(recovered.system_prompt, Some("Be concise.".into()));
-        assert!(
-            matches!(recovered.tool_filter, Some(ToolFilter::AllowList(ref s)) if s.len() == 2)
-        );
         assert_eq!(recovered.consent_mode, ConsentMode::Autonomous);
         assert_eq!(recovered.created_at, 2000);
         assert_eq!(recovered.created_by, creator);
@@ -3081,12 +3200,6 @@ mod tests {
         let ctx = recovered.to_context();
         assert_eq!(ctx.forked_from, Some(parent_id));
         assert_eq!(ctx.created_by, creator);
-
-        // Verify update_tool_filter roundtrip
-        let new_filter = Some(ToolFilter::All);
-        db.update_tool_filter(child_id, &new_filter).unwrap();
-        let updated = db.get_context(child_id).unwrap().unwrap();
-        assert_eq!(updated.tool_filter, Some(ToolFilter::All));
 
         // Verify update_model roundtrip
         db.update_model(child_id, Some("deepseek"), Some("deepseek-r1"))
@@ -3125,7 +3238,6 @@ mod tests {
             provider: None,
             model: None,
             system_prompt: None,
-            tool_filter: None,
             consent_mode: ConsentMode::default(),
             context_state: ContextState::Live,
             created_at: now_millis() as i64,
@@ -3252,6 +3364,170 @@ mod tests {
         // Delete context → shell row should cascade
         db.delete_context(ctx.context_id).unwrap();
         assert!(db.get_context_shell(ctx.context_id).unwrap().is_none());
+    }
+
+    // ── 23b. Context tool bindings CRUD (Phase 5, D-54) ──────────────
+    //
+    // Normalized schema: parent `context_bindings` + `_instances` (ordered)
+    // + `_names` (sticky map). The get path reconstructs `ContextToolBinding`
+    // by joining; the upsert path writes all three tables transactionally.
+
+    fn binding_with(
+        instances: &[&str],
+        names: &[(&str, &str, &str)], // (visible, instance, original)
+    ) -> ContextToolBinding {
+        let mut b = ContextToolBinding::new();
+        b.allowed_instances = instances.iter().map(|s| InstanceId::new(*s)).collect();
+        for (visible, inst, tool) in names {
+            b.name_map
+                .insert((*visible).into(), (InstanceId::new(*inst), (*tool).into()));
+        }
+        b
+    }
+
+    #[test]
+    fn context_binding_roundtrip_preserves_order_and_sticky_names() {
+        let mut db = KernelDb::in_memory().unwrap();
+        let (kid, ws_id) = setup_test_db(&db);
+        let ctx = make_context_row(kid, Some("binding-roundtrip"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+
+        let original = binding_with(
+            &["builtin.block", "builtin.file", "external.gpal"],
+            &[
+                ("read", "builtin.file", "file_read"),
+                ("write", "builtin.file", "file_write"),
+                ("consult", "external.gpal", "consult_gemini"),
+            ],
+        );
+        db.upsert_context_binding(ctx.context_id, &original).unwrap();
+
+        let loaded = db
+            .get_context_binding(ctx.context_id)
+            .unwrap()
+            .expect("binding should exist after upsert");
+
+        // Order of `allowed_instances` must survive the roundtrip (D-20:
+        // order is the tiebreaker for Auto resolution).
+        assert_eq!(loaded.allowed_instances.len(), 3);
+        assert_eq!(loaded.allowed_instances[0].as_str(), "builtin.block");
+        assert_eq!(loaded.allowed_instances[1].as_str(), "builtin.file");
+        assert_eq!(loaded.allowed_instances[2].as_str(), "external.gpal");
+
+        // Name map content must match exactly — sticky resolution is the
+        // whole point of persisting name_map across restart.
+        assert_eq!(loaded.name_map.len(), 3);
+        assert_eq!(
+            loaded.name_map.get("read").unwrap(),
+            &(InstanceId::new("builtin.file"), "file_read".into())
+        );
+        assert_eq!(
+            loaded.name_map.get("consult").unwrap(),
+            &(InstanceId::new("external.gpal"), "consult_gemini".into())
+        );
+    }
+
+    #[test]
+    fn context_binding_get_absent_returns_none() {
+        let db = KernelDb::in_memory().unwrap();
+        // No context, no upsert: get must return None so the broker can
+        // fall back to "bind all registered" on first touch.
+        assert!(db.get_context_binding(ContextId::new()).unwrap().is_none());
+    }
+
+    #[test]
+    fn context_binding_upsert_replaces_wholesale() {
+        // Phase 5 writes bindings as whole units; a second upsert must
+        // wholly replace the children, not accumulate. Regression guard
+        // against "leftover rows from a previous binding leak through."
+        let mut db = KernelDb::in_memory().unwrap();
+        let (kid, ws_id) = setup_test_db(&db);
+        let ctx = make_context_row(kid, Some("binding-replace"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+
+        let first = binding_with(
+            &["builtin.block", "builtin.file"],
+            &[("read", "builtin.file", "file_read")],
+        );
+        db.upsert_context_binding(ctx.context_id, &first).unwrap();
+
+        let second = binding_with(
+            &["external.gpal"],
+            &[("consult", "external.gpal", "consult_gemini")],
+        );
+        db.upsert_context_binding(ctx.context_id, &second).unwrap();
+
+        let loaded = db.get_context_binding(ctx.context_id).unwrap().unwrap();
+        assert_eq!(loaded.allowed_instances.len(), 1, "stale instances leaked");
+        assert_eq!(loaded.allowed_instances[0].as_str(), "external.gpal");
+        assert_eq!(loaded.name_map.len(), 1, "stale name_map entries leaked");
+        assert!(loaded.name_map.contains_key("consult"));
+        assert!(!loaded.name_map.contains_key("read"));
+    }
+
+    #[test]
+    fn context_binding_delete_returns_whether_existed() {
+        let mut db = KernelDb::in_memory().unwrap();
+        let (kid, ws_id) = setup_test_db(&db);
+        let ctx = make_context_row(kid, Some("binding-delete"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+
+        // Delete of absent row returns false.
+        assert!(!db.delete_context_binding(ctx.context_id).unwrap());
+
+        db.upsert_context_binding(
+            ctx.context_id,
+            &binding_with(&["builtin.file"], &[]),
+        )
+        .unwrap();
+
+        // Delete of present row returns true and clears children via CASCADE.
+        assert!(db.delete_context_binding(ctx.context_id).unwrap());
+        assert!(db.get_context_binding(ctx.context_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn context_binding_cascades_on_context_delete() {
+        // Parent context gone → all three binding tables cascade-clear.
+        // Guards against orphaned rows in binding_instances / binding_names.
+        let mut db = KernelDb::in_memory().unwrap();
+        let (kid, ws_id) = setup_test_db(&db);
+        let ctx = make_context_row(kid, Some("binding-cascade"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+
+        db.upsert_context_binding(
+            ctx.context_id,
+            &binding_with(
+                &["builtin.file", "builtin.block"],
+                &[("read", "builtin.file", "file_read")],
+            ),
+        )
+        .unwrap();
+        assert!(db.get_context_binding(ctx.context_id).unwrap().is_some());
+
+        db.delete_context(ctx.context_id).unwrap();
+        assert!(db.get_context_binding(ctx.context_id).unwrap().is_none());
+
+        // Children rows must also be gone (belt-and-suspenders on the
+        // CASCADE — a future FK misstep would be caught here).
+        let inst_rows: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM context_binding_instances WHERE context_id = ?1",
+                params![blob_param(ctx.context_id.as_bytes())],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(inst_rows, 0);
+        let name_rows: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM context_binding_names WHERE context_id = ?1",
+                params![blob_param(ctx.context_id.as_bytes())],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(name_rows, 0);
     }
 
     // ── 24. Context env CRUD ──────────────────────────────────────────

@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use kaijutsu_types::{ConsentMode, ContentType, ContextId, ContextState, EdgeKind, ForkKind, ToolFilter};
+use kaijutsu_types::{ConsentMode, ContentType, ContextId, ContextState, EdgeKind, ForkKind};
 
 use crate::kernel_db::{ContextEdgeRow, ContextRow, ContextShellRow};
 
@@ -149,7 +149,6 @@ impl KjDispatcher {
                 provider: resolved.provider.clone(),
                 model: resolved.model.clone(),
                 system_prompt: None,
-                tool_filter: None,
                 consent_mode: ConsentMode::Collaborative,
                 context_state: if staging {
                     ContextState::Staging
@@ -345,7 +344,6 @@ impl KjDispatcher {
                 provider: resolved.provider.clone(),
                 model: resolved.model.clone(),
                 system_prompt: None,
-                tool_filter: None,
                 consent_mode: ConsentMode::Collaborative,
                 context_state: if staging { ContextState::Staging } else { ContextState::Live },
                 created_at: kaijutsu_types::now_millis() as i64,
@@ -565,7 +563,6 @@ impl KjDispatcher {
                 provider: resolved.provider.clone(),
                 model: resolved.model.clone(),
                 system_prompt: None,
-                tool_filter: None,
                 consent_mode: ConsentMode::Collaborative,
                 context_state: if staging { ContextState::Staging } else { ContextState::Live },
                 created_at: kaijutsu_types::now_millis() as i64,
@@ -788,7 +785,6 @@ impl KjDispatcher {
                     provider: row.provider.clone(),
                     model: row.model.clone(),
                     system_prompt: row.system_prompt.clone(),
-                    tool_filter: row.tool_filter.clone(),
                     consent_mode: row.consent_mode,
                     context_state: if staging { ContextState::Staging } else { ContextState::Live },
                     created_at: kaijutsu_types::now_millis() as i64,
@@ -953,7 +949,6 @@ impl KjDispatcher {
             db.update_settings(
                 context_id,
                 preset.system_prompt.as_deref(),
-                &preset.tool_filter,
                 preset.consent_mode,
             )
             .map_err(|e| e.to_string())?;
@@ -964,9 +959,6 @@ impl KjDispatcher {
             let mut drift = self.drift_router().write().await;
             if let (Some(p), Some(m)) = (&preset.provider, &preset.model) {
                 let _ = drift.configure_llm(context_id, p, m);
-            }
-            if preset.tool_filter.is_some() {
-                let _ = drift.configure_tools(context_id, preset.tool_filter.clone());
             }
         }
 

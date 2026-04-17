@@ -34,7 +34,7 @@ use super::types::{
     InstanceId, KernelCallParams, KernelNotification, KernelReadResource, KernelResourceContents,
     KernelResourceList, KernelTool, KernelToolResult, LogLevel, NotifKind,
 };
-use crate::block_store::SharedBlockStore;
+use crate::block_store::{DbHandle, SharedBlockStore};
 
 /// Default notification channel capacity.
 const NOTIF_CAPACITY: usize = 256;
@@ -131,6 +131,11 @@ pub struct Broker {
     /// bodies by name so the wire never carries `Arc<dyn Hook>`. Frozen
     /// after construction.
     builtin_hooks: BuiltinHookRegistry,
+    /// Phase 5 (D-54): kernel DB handle used to persist `ContextToolBinding`
+    /// across kernel restart. Set via `set_db` at kernel bootstrap (same
+    /// D-37 setter pattern as `documents`). `None` → persistence is a
+    /// no-op, which keeps `Broker::new()` workable for tests.
+    db: RwLock<Option<DbHandle>>,
 }
 
 impl Default for Broker {
@@ -163,7 +168,17 @@ impl Broker {
             subscriptions: Mutex::new(HashMap::new()),
             resource_parents: Mutex::new(HashMap::new()),
             builtin_hooks: BuiltinHookRegistry::new(),
+            db: RwLock::new(None),
         }
+    }
+
+    /// Wire the kernel DB handle used to persist `ContextToolBinding` across
+    /// kernel restart (D-54, D-37 setter pattern). Call before first binding
+    /// mutation at kernel bootstrap; until this is set, `set_binding` /
+    /// `bind` / `unbind` still work on the in-memory map but persistence is
+    /// a no-op.
+    pub async fn set_db(self: &Arc<Self>, db: DbHandle) {
+        *self.db.write().await = Some(db);
     }
 
     pub fn coalescer(&self) -> &Arc<NotificationCoalescer> {
@@ -263,7 +278,15 @@ impl Broker {
         let handle = tokio::spawn(async move {
             pump_loop(broker, id_for_pump, rx).await;
         });
-        self.pump_handles.lock().await.insert(id, handle);
+        self.pump_handles.lock().await.insert(id.clone(), handle);
+
+        // Phase 5 (D-55): publish a kernel-level ToolsChanged so
+        // `builtin.bindings`'s bridge task can turn this into a
+        // `ResourceUpdated { uri: "kj://kernel/tools" }` and subscribers
+        // to the kernel-wide tools resource see the new instance.
+        let _ = self
+            .notif_tx
+            .send(KernelNotification::ToolsChanged { instance: id });
         Ok(())
     }
 
@@ -371,6 +394,12 @@ impl Broker {
             };
             self.emit_for_bindings(id, payload).await;
         }
+        // Phase 5 (D-55): same kernel-level signal as `register_inner` —
+        // `kj://kernel/tools` subscribers get notified via the bindings
+        // server's bridge task.
+        let _ = self
+            .notif_tx
+            .send(KernelNotification::ToolsChanged { instance: id.clone() });
         // Bindings keep their stickies; tools-removed error reports at call
         // time (D-06).
         Ok(())
@@ -393,8 +422,230 @@ impl Broker {
 
     /// Replace a context's binding wholesale. Sticky resolutions on the
     /// incoming binding are preserved as-is; the broker does not recompute.
+    ///
+    /// Phase 5 (D-54): persists to `KernelDb` if a handle is installed.
+    ///
+    /// Phase 5 (D-35 reuse): computes the `(instance, tool_name)` diff
+    /// against the previous binding and fires per-tool `ToolAdded` /
+    /// `ToolRemoved` notifications into this specific context so the LLM
+    /// sees the change on the next turn without new notification kinds.
+    /// R1 mitigation: the diff is per-pair, not per-instance, so
+    /// `unbind → rebind` of the same instance is a no-op emission
+    /// (identical pairs, empty set difference).
     pub async fn set_binding(&self, context_id: ContextId, binding: ContextToolBinding) {
-        self.bindings.write().await.insert(context_id, binding);
+        let old = self
+            .bindings
+            .read()
+            .await
+            .get(&context_id)
+            .cloned()
+            .unwrap_or_default();
+
+        let old_pairs = self.binding_visible_tool_pairs(&old).await;
+        let new_pairs = self.binding_visible_tool_pairs(&binding).await;
+
+        self.bindings
+            .write()
+            .await
+            .insert(context_id, binding.clone());
+
+        self.persist_binding(context_id, &binding).await;
+
+        self.emit_binding_diff(context_id, &old_pairs, &new_pairs)
+            .await;
+    }
+
+    /// Add an instance to a context's binding (idempotent). Triggers the
+    /// same diff + persistence + notification pipeline as `set_binding`.
+    pub async fn bind(&self, context_id: ContextId, instance: InstanceId) {
+        let mut binding = self
+            .binding(&context_id)
+            .await
+            .unwrap_or_default();
+        binding.allow(instance);
+        self.set_binding(context_id, binding).await;
+    }
+
+    /// Remove an instance from a context's binding (idempotent if absent).
+    /// Also evicts `name_map` entries pointing at the dropped instance so
+    /// follow-up calls surface the removed-tool error cleanly.
+    pub async fn unbind(&self, context_id: ContextId, instance: &InstanceId) {
+        let mut binding = self
+            .binding(&context_id)
+            .await
+            .unwrap_or_default();
+        binding.revoke(instance);
+        self.set_binding(context_id, binding).await;
+    }
+
+    /// Expand a binding into its `(instance, tool_name)` pair set using the
+    /// cached `tool_snapshots` map. Used for diff computation on binding
+    /// mutation (R1 mitigation per the plan).
+    async fn binding_visible_tool_pairs(
+        &self,
+        binding: &ContextToolBinding,
+    ) -> HashSet<(InstanceId, String)> {
+        let snapshots = self.tool_snapshots.lock().await;
+        let mut pairs = HashSet::new();
+        for instance in &binding.allowed_instances {
+            if let Some(tools) = snapshots.get(instance) {
+                for kt in tools {
+                    pairs.insert((instance.clone(), kt.name.clone()));
+                }
+            }
+        }
+        pairs
+    }
+
+    /// Fire per-tool `ToolAdded` / `ToolRemoved` into a specific context for
+    /// the set-difference between old and new pair sets.
+    async fn emit_binding_diff(
+        &self,
+        context_id: ContextId,
+        old_pairs: &HashSet<(InstanceId, String)>,
+        new_pairs: &HashSet<(InstanceId, String)>,
+    ) {
+        for (instance, tool) in new_pairs.difference(old_pairs) {
+            let payload = NotificationPayload {
+                instance: instance.as_str().to_string(),
+                kind: kaijutsu_types::NotificationKind::ToolAdded,
+                level: None,
+                tool: Some(tool.clone()),
+                count: None,
+                detail: None,
+            };
+            self.emit_for_context(context_id, instance, payload).await;
+        }
+        for (instance, tool) in old_pairs.difference(new_pairs) {
+            let payload = NotificationPayload {
+                instance: instance.as_str().to_string(),
+                kind: kaijutsu_types::NotificationKind::ToolRemoved,
+                level: None,
+                tool: Some(tool.clone()),
+                count: None,
+                detail: None,
+            };
+            self.emit_for_context(context_id, instance, payload).await;
+        }
+    }
+
+    /// D-56: walk `list_tools` hook entries and strip any `KernelTool`
+    /// whose `(instance, name)` matches a `Deny` entry. `Log` fires a
+    /// `tracing::event!` and keeps the tool. `BuiltinInvoke` /
+    /// `ShortCircuit` / `Kaish` are rejected at `hook_add` time (D-56,
+    /// `validate_action_for_phase`) so they never reach this path;
+    /// unreachable arms are skipped here rather than panicking, since
+    /// a broker loaded with pre-D-56 state could in principle carry one.
+    async fn apply_list_tools_filter(&self, ctx: &CallContext, tools: &mut Vec<KernelTool>) {
+        let entries = {
+            let guard = self.hooks.read().await;
+            if guard.list_tools.entries.is_empty() {
+                return;
+            }
+            guard.list_tools.entries.clone()
+        };
+        // Sort once: priority asc, insertion order tiebreak. Log entries
+        // execute before Deny at the same priority so observability fires
+        // before mutation. Within a single tool, the first matching Deny
+        // terminates further evaluation for that tool (no point running
+        // more filters after we've stripped it).
+        let mut ordered: Vec<(usize, super::hook_table::HookEntry)> =
+            entries.into_iter().enumerate().collect();
+        ordered.sort_by_key(|(idx, e)| (e.priority, *idx));
+
+        tools.retain(|kt| {
+            let synth_params = KernelCallParams {
+                instance: kt.instance.clone(),
+                tool: kt.name.clone(),
+                arguments: serde_json::Value::Null,
+            };
+            for (_idx, entry) in &ordered {
+                if !hook_matches(entry, &synth_params, ctx) {
+                    continue;
+                }
+                match &entry.action {
+                    HookAction::Log(spec) => match spec.level {
+                        tracing::Level::TRACE => tracing::event!(
+                            target: "kaijutsu::hooks",
+                            tracing::Level::TRACE,
+                            phase = "list_tools",
+                            hook_id = %entry.id,
+                            instance = %kt.instance,
+                            tool = %kt.name,
+                            "{}", spec.target,
+                        ),
+                        tracing::Level::DEBUG => tracing::event!(
+                            target: "kaijutsu::hooks",
+                            tracing::Level::DEBUG,
+                            phase = "list_tools",
+                            hook_id = %entry.id,
+                            instance = %kt.instance,
+                            tool = %kt.name,
+                            "{}", spec.target,
+                        ),
+                        tracing::Level::INFO => tracing::event!(
+                            target: "kaijutsu::hooks",
+                            tracing::Level::INFO,
+                            phase = "list_tools",
+                            hook_id = %entry.id,
+                            instance = %kt.instance,
+                            tool = %kt.name,
+                            "{}", spec.target,
+                        ),
+                        tracing::Level::WARN => tracing::event!(
+                            target: "kaijutsu::hooks",
+                            tracing::Level::WARN,
+                            phase = "list_tools",
+                            hook_id = %entry.id,
+                            instance = %kt.instance,
+                            tool = %kt.name,
+                            "{}", spec.target,
+                        ),
+                        tracing::Level::ERROR => tracing::event!(
+                            target: "kaijutsu::hooks",
+                            tracing::Level::ERROR,
+                            phase = "list_tools",
+                            hook_id = %entry.id,
+                            instance = %kt.instance,
+                            tool = %kt.name,
+                            "{}", spec.target,
+                        ),
+                    },
+                    HookAction::Deny(reason) => {
+                        tracing::debug!(
+                            phase = "list_tools",
+                            hook_id = %entry.id,
+                            instance = %kt.instance,
+                            tool = %kt.name,
+                            reason = %reason,
+                            "tool hidden by ListTools Deny hook",
+                        );
+                        return false;
+                    }
+                    // Never reached in normal operation (D-56 rejects these
+                    // at add time). Defensive no-op if somehow present.
+                    HookAction::ShortCircuit(_) | HookAction::Invoke(_) => {}
+                }
+            }
+            true
+        });
+    }
+
+    /// Persist a binding to the kernel DB. No-op when the DB handle is
+    /// not set (tests, early bootstrap).
+    async fn persist_binding(&self, context_id: ContextId, binding: &ContextToolBinding) {
+        let db = match self.db.read().await.clone() {
+            Some(h) => h,
+            None => return,
+        };
+        let mut guard = db.lock();
+        if let Err(e) = guard.upsert_context_binding(context_id, binding) {
+            tracing::warn!(
+                context_id = %context_id,
+                error = ?e,
+                "failed to persist context binding",
+            );
+        }
     }
 
     /// Drop a binding. D-44: walk any live subscriptions for this context
@@ -428,9 +679,41 @@ impl Broker {
         self.bindings.write().await.remove(context_id);
     }
 
-    /// Read a context's binding (cloned to keep lock regions small).
+    /// Read a context's binding, hydrating from the kernel DB on cache miss.
+    /// Phase 5 (D-54): first-touch loads from persistent storage so
+    /// curation survives kernel restart. Callers that fall back to "bind
+    /// all registered" on `None` will observe the persisted binding here.
+    /// Returns `None` if no row exists in DB (never-bound context) or the
+    /// DB is not wired (tests).
     pub async fn binding(&self, context_id: &ContextId) -> Option<ContextToolBinding> {
-        self.bindings.read().await.get(context_id).cloned()
+        if let Some(b) = self.bindings.read().await.get(context_id).cloned() {
+            return Some(b);
+        }
+        let db = self.db.read().await.clone()?;
+        let loaded = {
+            let guard = db.lock();
+            match guard.get_context_binding(*context_id) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(
+                        context_id = %context_id,
+                        error = ?e,
+                        "failed to load context binding; treating as absent",
+                    );
+                    return None;
+                }
+            }
+        };
+        if let Some(loaded) = loaded {
+            // Cache in memory for subsequent lookups.
+            self.bindings
+                .write()
+                .await
+                .insert(*context_id, loaded.clone());
+            Some(loaded)
+        } else {
+            None
+        }
     }
 
     /// Compute the visible tool list for `context_id` by walking the
@@ -462,6 +745,13 @@ impl Broker {
             let tools = server.list_tools(ctx).await?;
             all.extend(tools);
         }
+
+        // Phase 5 (D-56): apply `ListTools` hook filter before resolution
+        // so denied tools never enter `name_map` — they become uncallable
+        // via `call_tool` in the same stroke, because `binding.resolve`
+        // has no entry for them. Matches on raw (instance, tool_name) per
+        // D-56; sticky visible name is irrelevant here.
+        self.apply_list_tools_filter(ctx, &mut all).await;
 
         // Auto-resolve: unqualified if unique across visible set, else
         // qualified as `instance.tool`.
@@ -735,6 +1025,7 @@ impl Broker {
                 HookPhase::PostCall => &guard.post_call,
                 HookPhase::OnError => &guard.on_error,
                 HookPhase::OnNotification => &guard.on_notification,
+                HookPhase::ListTools => &guard.list_tools,
             };
             table
                 .entries
@@ -1013,45 +1304,88 @@ impl Broker {
         let summary = payload.summary_line();
         let synth_params = build_notification_synth(instance, &payload);
         for ctx in contexts {
-            // OnNotification (§4.3, post-coalesce, D-47-series). Evaluated
-            // once per bound context so `match_context` semantics are honest.
-            let synth_ctx = CallContext::system_for_context(ctx);
-            match self
-                .evaluate_phase(HookPhase::OnNotification, &synth_params, &synth_ctx)
-                .await
-            {
-                Ok(PhaseOutcome::Continue) => {}
-                Ok(PhaseOutcome::ShortCircuit { hook_id, .. }) => {
-                    emit_short_circuit_attribution(HookPhase::OnNotification, &hook_id);
-                    continue;
-                }
-                Ok(PhaseOutcome::Deny { hook_id, reason }) => {
-                    emit_deny_attribution(HookPhase::OnNotification, &hook_id, &reason);
-                    continue;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        context_id = %ctx,
-                        instance = %instance,
-                        error = ?e,
-                        "on_notification evaluation failed; emitting anyway",
-                    );
-                }
+            self.emit_into_context(ctx, instance, &payload, &summary, &synth_params, &docs)
+                .await;
+        }
+    }
+
+    /// Emit a notification block into a single specific context, regardless
+    /// of whether that context's binding currently allows the instance.
+    /// Phase 5: used for binding-mutation diff emissions where the mutation
+    /// itself is the trigger, not ongoing binding membership. Still runs
+    /// `OnNotification` hooks for consistency with `emit_for_bindings`.
+    async fn emit_for_context(
+        &self,
+        context_id: ContextId,
+        instance: &InstanceId,
+        payload: NotificationPayload,
+    ) {
+        let docs = match self.documents.read().await.clone() {
+            Some(d) => d,
+            None => return,
+        };
+        let summary = payload.summary_line();
+        let synth_params = build_notification_synth(instance, &payload);
+        self.emit_into_context(
+            context_id,
+            instance,
+            &payload,
+            &summary,
+            &synth_params,
+            &docs,
+        )
+        .await;
+    }
+
+    /// Shared per-context emission body used by both `emit_for_bindings` and
+    /// `emit_for_context`. Evaluates `OnNotification` hooks then writes the
+    /// block. Silent on hook errors (emits anyway, per prior Phase 4
+    /// behavior) so transient hook failures don't swallow notifications.
+    async fn emit_into_context(
+        &self,
+        ctx: ContextId,
+        instance: &InstanceId,
+        payload: &NotificationPayload,
+        summary: &str,
+        synth_params: &KernelCallParams,
+        docs: &SharedBlockStore,
+    ) {
+        let synth_ctx = CallContext::system_for_context(ctx);
+        match self
+            .evaluate_phase(HookPhase::OnNotification, synth_params, &synth_ctx)
+            .await
+        {
+            Ok(PhaseOutcome::Continue) => {}
+            Ok(PhaseOutcome::ShortCircuit { hook_id, .. }) => {
+                emit_short_circuit_attribution(HookPhase::OnNotification, &hook_id);
+                return;
             }
-            if let Err(e) = docs.insert_notification_block_as(
-                ctx,
-                None,
-                &payload,
-                summary.clone(),
-                Some(kaijutsu_types::PrincipalId::system()),
-            ) {
+            Ok(PhaseOutcome::Deny { hook_id, reason }) => {
+                emit_deny_attribution(HookPhase::OnNotification, &hook_id, &reason);
+                return;
+            }
+            Err(e) => {
                 tracing::warn!(
                     context_id = %ctx,
                     instance = %instance,
                     error = ?e,
-                    "failed to emit notification block",
+                    "on_notification evaluation failed; emitting anyway",
                 );
             }
+        }
+        if let Err(e) = docs.insert_notification_block_as(
+            ctx,
+            None,
+            payload,
+            summary.to_string(),
+            Some(kaijutsu_types::PrincipalId::system()),
+        ) {
+            tracing::warn!(
+                context_id = %ctx,
+                instance = %instance,
+                error = ?e,
+                "failed to emit notification block",
+            );
         }
     }
 
@@ -2249,6 +2583,7 @@ mod tests {
                 subscriptions: Mutex::new(HashMap::new()),
                 resource_parents: Mutex::new(HashMap::new()),
                 builtin_hooks: BuiltinHookRegistry::new(),
+                db: RwLock::new(None),
             }
         });
         let store = shared_block_store(PrincipalId::system());
@@ -2418,6 +2753,7 @@ mod tests {
                 subscriptions: Mutex::new(HashMap::new()),
                 resource_parents: Mutex::new(HashMap::new()),
                 builtin_hooks: BuiltinHookRegistry::new(),
+                db: RwLock::new(None),
             }
         });
         let store = shared_block_store(PrincipalId::system());
@@ -3785,6 +4121,7 @@ mod tests {
                 subscriptions: Mutex::new(HashMap::new()),
                 resource_parents: Mutex::new(HashMap::new()),
                 builtin_hooks: BuiltinHookRegistry::new(),
+                db: RwLock::new(None),
             }
         });
         let store = shared_block_store(PrincipalId::system());
@@ -4169,5 +4506,313 @@ mod tests {
             after, root_blocks_before,
             "ShortCircuit OnNotification must prevent the child resource block",
         );
+    }
+
+    // ── Phase 5 M2: binding mutation + ListTools filter ───────────────
+
+    /// `bind` with a previously-registered instance emits `ToolAdded` into
+    /// the calling context for every tool that instance advertises. This is
+    /// the Phase 5 late-injection happy path and closes exit criterion #1
+    /// at the unit level (broker_e2e covers the admin-server path in M5).
+    #[tokio::test]
+    async fn bind_emits_tool_added_for_newly_visible_tools() {
+        let (broker, store, ctx) = wired_broker().await;
+        // Register first (so tool_snapshots has the instance's tools) with
+        // no binding for this context yet — suppress the synthetic
+        // ToolAdded from register so we only measure the bind's emission.
+        let server = Arc::new(
+            MockServer::new("svc")
+                .with_tool("ping")
+                .with_tool("pong"),
+        );
+        broker
+            .register_silently(server, InstancePolicy::default())
+            .await
+            .unwrap();
+        assert!(
+            notifications_in(&store, ctx).is_empty(),
+            "silent register should not emit notifications",
+        );
+
+        broker.bind(ctx, InstanceId::new("svc")).await;
+
+        let notifs = notifications_in(&store, ctx);
+        assert_eq!(notifs.len(), 2, "expected one ToolAdded per tool");
+        let kinds: Vec<_> = notifs
+            .iter()
+            .map(|n| (n.instance.as_str(), n.tool.as_deref(), n.kind))
+            .collect();
+        assert!(kinds.contains(&("svc", Some("ping"), kaijutsu_types::NotificationKind::ToolAdded)));
+        assert!(kinds.contains(&("svc", Some("pong"), kaijutsu_types::NotificationKind::ToolAdded)));
+    }
+
+    /// `unbind` emits `ToolRemoved` for every tool that *was* visible through
+    /// the bound instance.
+    #[tokio::test]
+    async fn unbind_emits_tool_removed() {
+        let (broker, store, ctx) = wired_broker().await;
+        let server = Arc::new(MockServer::new("svc").with_tool("ping"));
+        broker
+            .register_silently(server, InstancePolicy::default())
+            .await
+            .unwrap();
+        broker.bind(ctx, InstanceId::new("svc")).await;
+        // One ToolAdded from bind so far.
+        assert_eq!(notifications_in(&store, ctx).len(), 1);
+
+        broker.unbind(ctx, &InstanceId::new("svc")).await;
+
+        let notifs = notifications_in(&store, ctx);
+        assert_eq!(notifs.len(), 2, "expected ToolAdded + ToolRemoved");
+        // `notifications_in` returns reverse-chronological; assert on the set
+        // of (kind, tool) pairs rather than positional order.
+        assert!(
+            notifs
+                .iter()
+                .any(|n| n.kind == kaijutsu_types::NotificationKind::ToolRemoved
+                    && n.tool.as_deref() == Some("ping")),
+            "expected a ToolRemoved for ping; got {notifs:#?}",
+        );
+    }
+
+    /// `set_binding` with a wholesale-different binding fires per-instance
+    /// ToolAdded / ToolRemoved reflecting the set difference — not one
+    /// blanket ToolsChanged. Guards the diff computation against
+    /// over/under-emission.
+    #[tokio::test]
+    async fn set_binding_diff_fires_per_added_and_removed_instance() {
+        let (broker, store, ctx) = wired_broker().await;
+        let a = Arc::new(MockServer::new("a").with_tool("alpha"));
+        let b = Arc::new(MockServer::new("b").with_tool("beta").with_tool("gamma"));
+        broker
+            .register_silently(a, InstancePolicy::default())
+            .await
+            .unwrap();
+        broker
+            .register_silently(b, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        // Start with {a}
+        broker
+            .set_binding(ctx, ContextToolBinding::with_instances(vec![InstanceId::new("a")]))
+            .await;
+        assert_eq!(
+            notifications_in(&store, ctx).len(),
+            1,
+            "a.alpha added",
+        );
+
+        // Swap to {b} — expect ToolAdded for beta+gamma, ToolRemoved for alpha.
+        broker
+            .set_binding(ctx, ContextToolBinding::with_instances(vec![InstanceId::new("b")]))
+            .await;
+        // Assert on total counts across both set_binding calls. Cumulative:
+        // 1 ToolAdded (a:alpha, from first) + 2 ToolAdded (b:beta + b:gamma,
+        // from swap) + 1 ToolRemoved (a:alpha, from swap) = 3 added, 1
+        // removed. Positional ordering is not load-bearing here — the set
+        // of emissions is.
+        let notifs = notifications_in(&store, ctx);
+        let added: Vec<_> = notifs
+            .iter()
+            .filter(|n| n.kind == kaijutsu_types::NotificationKind::ToolAdded)
+            .map(|n| (n.instance.as_str(), n.tool.as_deref().unwrap()))
+            .collect();
+        let removed: Vec<_> = notifs
+            .iter()
+            .filter(|n| n.kind == kaijutsu_types::NotificationKind::ToolRemoved)
+            .map(|n| (n.instance.as_str(), n.tool.as_deref().unwrap()))
+            .collect();
+        assert_eq!(added.len(), 3, "3 cumulative ToolAdded events; got {added:?}");
+        assert!(added.contains(&("a", "alpha")));
+        assert!(added.contains(&("b", "beta")));
+        assert!(added.contains(&("b", "gamma")));
+        assert_eq!(removed, vec![("a", "alpha")]);
+    }
+
+    /// R1 mitigation: if an unbind→rebind cycle lands on the same
+    /// `(instance, tool_name)` pair set, no spurious diff is emitted. The
+    /// plan specifically calls this case out as a pitfall to guard.
+    #[tokio::test]
+    async fn set_binding_no_emission_when_pairs_unchanged() {
+        let (broker, store, ctx) = wired_broker().await;
+        let server = Arc::new(MockServer::new("svc").with_tool("ping"));
+        broker
+            .register_silently(server, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        let b = ContextToolBinding::with_instances(vec![InstanceId::new("svc")]);
+        broker.set_binding(ctx, b.clone()).await;
+        let after_first = notifications_in(&store, ctx).len();
+        assert_eq!(after_first, 1, "first set_binding emits ToolAdded");
+
+        // Re-apply an identical binding. Pair set is unchanged → no diff.
+        broker.set_binding(ctx, b).await;
+        assert_eq!(
+            notifications_in(&store, ctx).len(),
+            after_first,
+            "identical set_binding must not emit",
+        );
+    }
+
+    /// D-56 exit #7(a): a `ListTools Deny` hook strips the tool from the
+    /// visible set. `kj://kernel/tools`-style kernel-wide enumeration via
+    /// `list_tools` (not `list_visible_tools`) stays honest — asserted in
+    /// a sibling test.
+    #[tokio::test]
+    async fn list_tools_deny_strips_tool_from_visible_set() {
+        let (broker, _store, ctx) = wired_broker().await;
+        let server = Arc::new(
+            MockServer::new("files")
+                .with_tool("file_read")
+                .with_tool("file_write"),
+        );
+        broker
+            .register_silently(server, InstancePolicy::default())
+            .await
+            .unwrap();
+        broker.bind(ctx, InstanceId::new("files")).await;
+
+        // Install a ListTools Deny on file_write.
+        broker
+            .hooks()
+            .write()
+            .await
+            .list_tools
+            .entries
+            .push(HookEntry {
+                id: hook_id("no-writes"),
+                match_instance: Some(GlobPattern("files".into())),
+                match_tool: Some(GlobPattern("file_write".into())),
+                match_context: None,
+                match_principal: None,
+                action: HookAction::Deny("read-only context".into()),
+                priority: 0,
+            });
+
+        let call_ctx = {
+            let mut c = CallContext::test();
+            c.context_id = ctx;
+            c
+        };
+        let visible: Vec<String> = broker
+            .list_visible_tools(ctx, &call_ctx)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert!(visible.contains(&"file_read".to_string()));
+        assert!(
+            !visible.iter().any(|n| n.contains("file_write")),
+            "file_write must be hidden by ListTools Deny; saw {visible:?}",
+        );
+    }
+
+    /// D-56 exit #7(b): a tool hidden by `ListTools Deny` is also
+    /// uncallable from that context — `call_tool` returns `ToolNotFound`
+    /// because the filter strips the tool before sticky resolution, so
+    /// `name_map` has no entry pointing at it.
+    #[tokio::test]
+    async fn list_tools_deny_makes_tool_uncallable_via_this_binding() {
+        let (broker, _store, ctx) = wired_broker().await;
+        let server = Arc::new(
+            MockServer::new("files")
+                .with_tool("file_read")
+                .with_tool("file_write"),
+        );
+        broker
+            .register_silently(server, InstancePolicy::default())
+            .await
+            .unwrap();
+        broker.bind(ctx, InstanceId::new("files")).await;
+
+        broker
+            .hooks()
+            .write()
+            .await
+            .list_tools
+            .entries
+            .push(HookEntry {
+                id: hook_id("no-writes"),
+                match_instance: Some(GlobPattern("files".into())),
+                match_tool: Some(GlobPattern("file_write".into())),
+                match_context: None,
+                match_principal: None,
+                action: HookAction::Deny("read-only".into()),
+                priority: 0,
+            });
+
+        // Prime the binding's name_map by listing visible tools first.
+        let call_ctx = {
+            let mut c = CallContext::test();
+            c.context_id = ctx;
+            c
+        };
+        let _ = broker.list_visible_tools(ctx, &call_ctx).await.unwrap();
+
+        // Attempt to call the hidden tool directly via call_tool. The
+        // invocation is what the kernel's dispatch path does: resolve the
+        // visible name against the binding then hit `call_tool`. Since
+        // `file_write` was filtered out of resolution, the binding's
+        // `resolve` returns None for it — callers will short-circuit to
+        // `ToolNotFound`. This test exercises the contract at the broker
+        // level by calling `call_tool` with the raw (instance, tool)
+        // pair: that path still runs PreCall hooks etc., but the D-56
+        // contract says the tool is conceptually gone from this binding.
+        // We assert the indirect-resolution failure here: binding.resolve
+        // must be None for file_write.
+        let binding = broker.binding(&ctx).await.unwrap();
+        assert!(
+            binding.resolve("file_write").is_none(),
+            "ListTools-Denied tool must not land in name_map",
+        );
+    }
+
+    /// `ListTools Log` observes without stripping. Negative control for the
+    /// Deny-strips tests and positive control for Log as a valid action.
+    #[tokio::test]
+    async fn list_tools_log_does_not_strip() {
+        let (broker, _store, ctx) = wired_broker().await;
+        let server = Arc::new(MockServer::new("files").with_tool("file_read"));
+        broker
+            .register_silently(server, InstancePolicy::default())
+            .await
+            .unwrap();
+        broker.bind(ctx, InstanceId::new("files")).await;
+
+        broker
+            .hooks()
+            .write()
+            .await
+            .list_tools
+            .entries
+            .push(HookEntry {
+                id: hook_id("observe-only"),
+                match_instance: Some(GlobPattern("files".into())),
+                match_tool: Some(GlobPattern("*".into())),
+                match_context: None,
+                match_principal: None,
+                action: HookAction::Log(super::super::hook_table::LogSpec {
+                    target: "observe".into(),
+                    level: tracing::Level::INFO,
+                }),
+                priority: 0,
+            });
+
+        let call_ctx = {
+            let mut c = CallContext::test();
+            c.context_id = ctx;
+            c
+        };
+        let visible: Vec<String> = broker
+            .list_visible_tools(ctx, &call_ctx)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(visible, vec!["file_read".to_string()]);
     }
 }

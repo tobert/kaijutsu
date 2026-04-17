@@ -9,12 +9,14 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 use super::types::InstanceId;
 
 /// Resolved tool name → (instance, original tool name).
 pub type ResolvedName = (InstanceId, String);
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ContextToolBinding {
     /// Instance visibility; order is a tiebreaker for name resolution (§4.2).
     pub allowed_instances: Vec<InstanceId>,

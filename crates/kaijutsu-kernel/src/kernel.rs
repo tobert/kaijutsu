@@ -345,10 +345,12 @@ impl Kernel {
         workspace_guard: Option<crate::file_tools::WorkspaceGuard>,
     ) -> crate::mcp::McpResult<()> {
         use crate::mcp::servers::{
-            BlockToolsServer, BuiltinHooksServer, BuiltinResourcesServer, FileToolsServer,
-            KernelInfoServer,
+            BlockToolsServer, BuiltinBindingsServer, BuiltinHooksServer, BuiltinResourcesServer,
+            FileToolsServer, KernelInfoServer,
         };
-        use crate::mcp::InstancePolicy;
+        use crate::mcp::servers::bindings_builtin::KERNEL_TOOLS_URI;
+        use crate::mcp::{InstancePolicy, KernelNotification};
+        use crate::mcp::server_like::ServerNotification;
 
         // Wire the block store into the broker so Phase 2 notification
         // emission can reach bound contexts (D-37). Done before registering
@@ -398,6 +400,40 @@ impl Kernel {
                 Arc::new(BuiltinHooksServer::new(Arc::downgrade(&self.broker))),
                 InstancePolicy::default(),
             )
+            .await?;
+
+        // Phase 5 (D-55): builtin.bindings admin server + kj://kernel/tools
+        // resource. The bridge task subscribes to kernel-level ToolsChanged
+        // events (fired by `register_inner`/`unregister`) and forwards them
+        // to the bindings server's notif channel as `ResourceUpdated`, so
+        // subscribers to `kj://kernel/tools` see a child Resource block via
+        // the Phase 3 coalescer pipeline. Subscribe BEFORE the bindings
+        // server registers so no ToolsChanged event from its own
+        // registration is lost; the bridge task is spawned immediately so
+        // the receiver drains the broadcast channel as events arrive.
+        let bindings_server = Arc::new(BuiltinBindingsServer::new(Arc::downgrade(&self.broker)));
+        let bridge_rx = self.broker.notifications();
+        let bridge_tx = bindings_server.resource_update_sender();
+        tokio::spawn(async move {
+            let mut rx = bridge_rx;
+            loop {
+                match rx.recv().await {
+                    Ok(KernelNotification::ToolsChanged { .. }) => {
+                        // Drop-on-no-subscribers is fine: if nobody has read
+                        // kj://kernel/tools, there's no resource parent to
+                        // thread a child under.
+                        let _ = bridge_tx.send(ServerNotification::ResourceUpdated {
+                            uri: KERNEL_TOOLS_URI.to_string(),
+                        });
+                    }
+                    Ok(_) => {} // other KernelNotification variants irrelevant
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                }
+            }
+        });
+        self.broker
+            .register_silently(bindings_server, InstancePolicy::default())
             .await?;
 
         Ok(())

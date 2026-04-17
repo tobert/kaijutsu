@@ -45,6 +45,11 @@ pub enum HookPhase {
     PostCall,
     OnError,
     OnNotification,
+    /// Filter the per-context tool list returned by
+    /// `Broker::list_visible_tools`. `Deny` strips matching tools; `Log`
+    /// observes and continues. `ShortCircuit` / `Invoke` have no coherent
+    /// list-filter semantics and are rejected at `hook_add` time (D-56).
+    ListTools,
 }
 
 /// Opaque glob pattern. Phase 1 keeps it a plain string; actual matching is
@@ -124,6 +129,8 @@ pub struct HookTables {
     pub post_call: HookTable,
     pub on_error: HookTable,
     pub on_notification: HookTable,
+    /// Phase 5 (D-56): list-time filter on `Broker::list_visible_tools`.
+    pub list_tools: HookTable,
 }
 
 /// Builtin hook body trait. Phase 4 wires evaluation.

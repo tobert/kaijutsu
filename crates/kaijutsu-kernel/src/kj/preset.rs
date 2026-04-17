@@ -4,7 +4,7 @@ use kaijutsu_types::{ContentType, PresetId};
 
 use crate::kernel_db::PresetRow;
 
-use super::parse::{extract_named_arg, parse_model_spec, parse_tool_filter_spec};
+use super::parse::{extract_named_arg, parse_model_spec};
 use super::{KjCaller, KjDispatcher, KjResult};
 
 impl KjDispatcher {
@@ -80,9 +80,6 @@ impl KjDispatcher {
                 };
                 lines.push(format!("Model: {model}"));
                 lines.push(format!("Consent: {:?}", p.consent_mode));
-                if let Some(ref tf) = p.tool_filter {
-                    lines.push(format!("Tools: {:?}", tf));
-                }
                 if let Some(ref sp) = p.system_prompt {
                     let preview = if sp.len() > 80 {
                         format!("{}...", &sp[..77])
@@ -107,7 +104,6 @@ impl KjDispatcher {
 
         let model_spec = extract_named_arg(argv, &["--model", "-m"]);
         let system_prompt = extract_named_arg(argv, &["--system-prompt"]);
-        let tool_filter_spec = extract_named_arg(argv, &["--tool-filter"]);
         let consent_spec = extract_named_arg(argv, &["--consent"]);
         let desc = extract_named_arg(argv, &["--desc", "--description"]);
 
@@ -115,14 +111,6 @@ impl KjDispatcher {
             .as_deref()
             .map(parse_model_spec)
             .unwrap_or((None, None));
-
-        let tool_filter = match tool_filter_spec {
-            Some(ref spec) => match parse_tool_filter_spec(spec) {
-                Ok(tf) => Some(tf),
-                Err(e) => return KjResult::Err(format!("kj preset save: {e}")),
-            },
-            None => None,
-        };
 
         let consent_mode = match consent_spec {
             Some(ref spec) => match spec.parse::<kaijutsu_types::ConsentMode>() {
@@ -148,7 +136,6 @@ impl KjDispatcher {
                     provider: provider.or(existing.provider),
                     model: model.or(existing.model),
                     system_prompt: system_prompt.or(existing.system_prompt),
-                    tool_filter: tool_filter.or(existing.tool_filter),
                     consent_mode,
                     created_at: existing.created_at,
                     created_by: existing.created_by,
@@ -167,7 +154,6 @@ impl KjDispatcher {
                     provider,
                     model,
                     system_prompt,
-                    tool_filter,
                     consent_mode,
                     created_at: kaijutsu_types::now_millis() as i64,
                     created_by: caller.principal_id,
