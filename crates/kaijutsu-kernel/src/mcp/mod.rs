@@ -10,6 +10,7 @@ pub mod broker;
 pub mod coalescer;
 pub mod context;
 pub mod error;
+pub mod hook_persist;
 pub mod hook_table;
 pub mod hooks_builtin;
 pub mod policy;

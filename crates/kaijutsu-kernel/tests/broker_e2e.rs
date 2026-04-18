@@ -964,3 +964,117 @@ async fn kernel_tools_resource_end_to_end() {
         "builtin.file should NOT be bound",
     );
 }
+
+/// Hook persistence end-to-end. Proves the full path:
+///   admin `hook_add` → `broker.persist_hook_insert` → SQLite
+///   → drop kernel → new kernel `set_db` → `hydrate_hooks_from_db`
+///   → `evaluate_phase` → `Denied { by_hook }`.
+///
+/// Uses a real admin call (not direct `HookTables` poke) on the first
+/// kernel so the entire M3 persist path is exercised; uses a real tool
+/// call on `builtin.block` on the second kernel so the entire M2
+/// hydrate path is exercised. No code-level shortcuts through the
+/// in-memory table.
+#[tokio::test]
+async fn hooks_persist_across_kernel_restart() {
+    let (fx, db) = setup_with_db().await;
+    let sys = CallContext::system();
+
+    // --- Kernel A: install a PreCall Deny on builtin.block via admin. ---
+    let add = fx
+        .kernel
+        .broker()
+        .call_tool(
+            KernelCallParams {
+                instance: InstanceId::new("builtin.hooks"),
+                tool: "hook_add".into(),
+                arguments: serde_json::json!({
+                    "phase": "pre_call",
+                    "match_instance": "builtin.block",
+                    "hook_id": "no-block-tools",
+                    "action": { "type": "deny", "reason": "persisted across restart" },
+                }),
+            },
+            &sys,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("hook_add admin call must succeed in kernel A");
+    assert!(!add.is_error);
+
+    // Kernel A: the hook is live — a builtin.block call is Denied.
+    let err_a = fx
+        .kernel
+        .broker()
+        .call_tool(
+            KernelCallParams {
+                instance: InstanceId::new("builtin.block"),
+                tool: "block_list".into(),
+                arguments: serde_json::json!({}),
+            },
+            &sys,
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("PreCall Deny should block the call");
+    assert!(
+        matches!(&err_a, McpError::Denied { by_hook } if by_hook.0 == "no-block-tools"),
+        "kernel A should Deny with by_hook=no-block-tools, got {err_a:?}",
+    );
+
+    // Sanity: the DB has the persisted row before we tear down.
+    let rows_pre = db.lock().load_all_hooks().unwrap();
+    assert_eq!(rows_pre.len(), 1);
+    assert_eq!(rows_pre[0].hook_id, "no-block-tools");
+    assert_eq!(rows_pre[0].action_kind, "deny");
+
+    // --- Drop kernel A. Hooks are in-memory; only the DB survives. ---
+    drop(fx);
+
+    // --- Kernel B: fresh kernel, same DB. ---
+    let tmp2 = tempfile::tempdir().unwrap();
+    let kernel2 = Arc::new(Kernel::new("hook-persist-restart", Some(tmp2.path())).await);
+    let creator2 = PrincipalId::system();
+    let kernel_id2 = KernelId::new();
+    let ws_id2 = {
+        let g = db.lock();
+        g.get_or_create_default_workspace(kernel_id2, creator2).unwrap()
+    };
+    let store2: SharedBlockStore =
+        shared_block_store_with_db(db.clone(), kernel_id2, ws_id2, creator2);
+    let file_cache2 = Arc::new(FileDocumentCache::new(store2.clone(), kernel2.vfs().clone()));
+    kernel2
+        .register_builtin_mcp_servers(store2.clone(), file_cache2, None)
+        .await
+        .unwrap();
+    // set_db is the hydrate trigger. Before this call the HookTables
+    // are empty; after, the persisted Deny is back in place.
+    kernel2.broker().set_db(db.clone()).await;
+
+    // Kernel B: same Deny fires on the same instance. No new hook_add
+    // was issued — if this passes, the hook came back from the DB.
+    let err_b = kernel2
+        .broker()
+        .call_tool(
+            KernelCallParams {
+                instance: InstanceId::new("builtin.block"),
+                tool: "block_list".into(),
+                arguments: serde_json::json!({}),
+            },
+            &sys,
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("hook should have survived restart");
+    assert!(
+        matches!(&err_b, McpError::Denied { by_hook } if by_hook.0 == "no-block-tools"),
+        "kernel B should Deny with by_hook=no-block-tools after hydrate, got {err_b:?}",
+    );
+
+    // Belt-and-braces: the pre_call table on kernel B has exactly the
+    // persisted entry (not a drift of the live in-memory count vs the
+    // DB) — if a future regression double-loaded we'd see 2 here.
+    let hooks = kernel2.broker().hooks().read().await;
+    assert_eq!(hooks.pre_call.entries.len(), 1);
+    assert_eq!(hooks.pre_call.entries[0].id.0, "no-block-tools");
+}

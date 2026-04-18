@@ -92,6 +92,30 @@ impl ContextRow {
     }
 }
 
+/// A persisted hook entry. Flat shape so the rusqlite row readers map
+/// directly; the broker reconstructs the live `HookEntry` (including
+/// resolving `action_builtin_name` against `BuiltinHookRegistry`) at
+/// hydrate time. `insertion_idx` is not exposed — the DB manages it
+/// internally so load order within a phase matches insertion order.
+#[derive(Debug, Clone)]
+pub struct HookRow {
+    pub hook_id: String,
+    pub phase: String,
+    pub priority: i32,
+    pub match_instance: Option<String>,
+    pub match_tool: Option<String>,
+    pub match_context: Option<ContextId>,
+    pub match_principal: Option<PrincipalId>,
+    pub action_kind: String,
+    pub action_builtin_name: Option<String>,
+    pub action_kaish_script_id: Option<String>,
+    pub action_result_text: Option<String>,
+    pub action_is_error: Option<bool>,
+    pub action_deny_reason: Option<String>,
+    pub action_log_target: Option<String>,
+    pub action_log_level: Option<String>,
+}
+
 /// A preset template row.
 #[derive(Debug, Clone)]
 pub struct PresetRow {
@@ -389,6 +413,39 @@ CREATE TABLE IF NOT EXISTS context_env (
     PRIMARY KEY (context_id, key)
 );
 CREATE INDEX IF NOT EXISTS idx_ctx_env ON context_env(context_id);
+
+-- ── Hooks (hook persistence follow-up) ──────────────────────────
+-- Global match-action hook entries. One row per entry; load ordered by
+-- (phase, priority ASC, insertion_idx ASC) so HookTables.entries Vec is
+-- reconstructed in insertion order. `insertion_idx` is a monotonic
+-- counter per phase computed inside the INSERT statement so callers
+-- don't have to track it. `action_kind` is the tagged-union
+-- discriminator matching HookActionWire; variant-specific columns are
+-- nullable and set only for the matching kind. Not FK-linked — hooks
+-- are global, not per-context.
+CREATE TABLE IF NOT EXISTS hooks (
+    hook_id                TEXT    NOT NULL PRIMARY KEY,
+    phase                  TEXT    NOT NULL,
+    priority               INTEGER NOT NULL,
+    insertion_idx          INTEGER NOT NULL,
+    match_instance         TEXT,
+    match_tool             TEXT,
+    match_context          BLOB,
+    match_principal        TEXT,
+    action_kind            TEXT    NOT NULL,
+    action_builtin_name    TEXT,
+    action_kaish_script_id TEXT,
+    action_result_text     TEXT,
+    action_is_error        INTEGER,
+    action_deny_reason     TEXT,
+    action_log_target      TEXT,
+    action_log_level       TEXT,
+    updated_at             INTEGER NOT NULL
+        DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
+    UNIQUE (phase, insertion_idx)
+);
+CREATE INDEX IF NOT EXISTS idx_hooks_phase_priority
+    ON hooks(phase, priority, insertion_idx);
 "#;
 
 // ============================================================================
@@ -2119,6 +2176,136 @@ impl KernelDb {
     }
 
     // ========================================================================
+    // Hook Persistence
+    // ========================================================================
+
+    /// Persist one hook entry. `insertion_idx` is computed inside the
+    /// INSERT as `MAX(insertion_idx) WHERE phase = ... + 1` so callers
+    /// don't have to track it; load order within a phase uses that same
+    /// column for tiebreak after `priority`. Fails with the SQLite
+    /// UNIQUE-violation if `hook_id` already exists — callers should
+    /// `delete_hook` first for replace semantics.
+    pub fn insert_hook(&self, row: &HookRow) -> KernelDbResult<()> {
+        let is_error: Option<i64> = row.action_is_error.map(|b| if b { 1 } else { 0 });
+        let match_context_bytes: Option<Vec<u8>> =
+            row.match_context.map(|c| c.as_bytes().to_vec());
+        let match_principal_str: Option<String> =
+            row.match_principal.map(|p| p.to_string());
+        self.conn.execute(
+            "INSERT INTO hooks (
+                hook_id, phase, priority, insertion_idx,
+                match_instance, match_tool, match_context, match_principal,
+                action_kind,
+                action_builtin_name, action_kaish_script_id,
+                action_result_text, action_is_error,
+                action_deny_reason,
+                action_log_target, action_log_level
+             ) VALUES (
+                ?1, ?2, ?3,
+                (SELECT COALESCE(MAX(insertion_idx), -1) + 1 FROM hooks WHERE phase = ?2),
+                ?4, ?5, ?6, ?7,
+                ?8,
+                ?9, ?10,
+                ?11, ?12,
+                ?13,
+                ?14, ?15
+             )",
+            params![
+                row.hook_id,
+                row.phase,
+                row.priority,
+                row.match_instance,
+                row.match_tool,
+                match_context_bytes,
+                match_principal_str,
+                row.action_kind,
+                row.action_builtin_name,
+                row.action_kaish_script_id,
+                row.action_result_text,
+                is_error,
+                row.action_deny_reason,
+                row.action_log_target,
+                row.action_log_level,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Delete a hook by id. Returns true if a row existed.
+    pub fn delete_hook(&self, hook_id: &str) -> KernelDbResult<bool> {
+        let rows = self
+            .conn
+            .execute("DELETE FROM hooks WHERE hook_id = ?1", params![hook_id])?;
+        Ok(rows > 0)
+    }
+
+    /// Load every persisted hook row, ordered by
+    /// `(phase ASC, priority ASC, insertion_idx ASC)`. The broker walks
+    /// these in order and pushes each onto the matching `HookTable`,
+    /// reconstructing the Vec insertion order from before the restart.
+    pub fn load_all_hooks(&self) -> KernelDbResult<Vec<HookRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT hook_id, phase, priority,
+                    match_instance, match_tool, match_context, match_principal,
+                    action_kind,
+                    action_builtin_name, action_kaish_script_id,
+                    action_result_text, action_is_error,
+                    action_deny_reason,
+                    action_log_target, action_log_level
+             FROM hooks
+             ORDER BY phase ASC, priority ASC, insertion_idx ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let match_context_bytes: Option<Vec<u8>> = row.get(5)?;
+            let match_context = match match_context_bytes {
+                Some(bytes) => Some(ContextId::try_from_slice(&bytes).ok_or_else(|| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        5,
+                        rusqlite::types::Type::Blob,
+                        "invalid ContextId bytes in hooks.match_context".into(),
+                    )
+                })?),
+                None => None,
+            };
+            let match_principal_str: Option<String> = row.get(6)?;
+            let match_principal = match match_principal_str {
+                Some(s) => Some(PrincipalId::parse(&s).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        6,
+                        rusqlite::types::Type::Text,
+                        format!("invalid PrincipalId in hooks.match_principal: {e}").into(),
+                    )
+                })?),
+                None => None,
+            };
+            let is_error_int: Option<i64> = row.get(11)?;
+            let action_is_error = is_error_int.map(|i| i != 0);
+            Ok(HookRow {
+                hook_id: row.get(0)?,
+                phase: row.get(1)?,
+                priority: row.get(2)?,
+                match_instance: row.get(3)?,
+                match_tool: row.get(4)?,
+                match_context,
+                match_principal,
+                action_kind: row.get(7)?,
+                action_builtin_name: row.get(8)?,
+                action_kaish_script_id: row.get(9)?,
+                action_result_text: row.get(10)?,
+                action_is_error,
+                action_deny_reason: row.get(12)?,
+                action_log_target: row.get(13)?,
+                action_log_level: row.get(14)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    // ========================================================================
     // Context Environment Variables
     // ========================================================================
 
@@ -3528,6 +3715,231 @@ mod tests {
             )
             .unwrap();
         assert_eq!(name_rows, 0);
+    }
+
+    // ── 23b. Hook persistence (hook persistence follow-up) ────────────
+    //
+    // Hooks are global (not per-context), so these tests don't need a
+    // context row at all. Insert writes one row per entry with the DB
+    // computing `insertion_idx` internally; load returns rows ordered
+    // by `(phase, priority, insertion_idx)` so the broker can rebuild
+    // `HookTable.entries` in the same Vec order as before restart.
+
+    fn minimal_hook_row(id: &str, phase: &str, priority: i32) -> HookRow {
+        HookRow {
+            hook_id: id.into(),
+            phase: phase.into(),
+            priority,
+            match_instance: None,
+            match_tool: None,
+            match_context: None,
+            match_principal: None,
+            action_kind: "log".into(),
+            action_builtin_name: None,
+            action_kaish_script_id: None,
+            action_result_text: None,
+            action_is_error: None,
+            action_deny_reason: None,
+            action_log_target: Some("kaijutsu::hooks".into()),
+            action_log_level: Some("info".into()),
+        }
+    }
+
+    #[test]
+    fn hook_insert_roundtrip_preserves_all_action_variants() {
+        // One insert per action_kind. Round-trip must preserve every
+        // variant-specific column and every match field so the broker's
+        // reconstruction loses no information.
+        let db = KernelDb::in_memory().unwrap();
+
+        // Builtin-invoke with full match fields.
+        let ctx_id = ContextId::new();
+        let principal = PrincipalId::new();
+        let builtin = HookRow {
+            hook_id: "h-builtin".into(),
+            phase: "pre_call".into(),
+            priority: 10,
+            match_instance: Some("builtin.*".into()),
+            match_tool: Some("file_*".into()),
+            match_context: Some(ctx_id),
+            match_principal: Some(principal),
+            action_kind: "builtin_invoke".into(),
+            action_builtin_name: Some("tracing_audit".into()),
+            action_kaish_script_id: None,
+            action_result_text: None,
+            action_is_error: None,
+            action_deny_reason: None,
+            action_log_target: None,
+            action_log_level: None,
+        };
+        db.insert_hook(&builtin).unwrap();
+
+        // ShortCircuit with is_error=true and no matches.
+        let sc = HookRow {
+            hook_id: "h-sc".into(),
+            phase: "post_call".into(),
+            priority: 0,
+            match_instance: None,
+            match_tool: None,
+            match_context: None,
+            match_principal: None,
+            action_kind: "shortcircuit".into(),
+            action_builtin_name: None,
+            action_kaish_script_id: None,
+            action_result_text: Some("synthetic".into()),
+            action_is_error: Some(true),
+            action_deny_reason: None,
+            action_log_target: None,
+            action_log_level: None,
+        };
+        db.insert_hook(&sc).unwrap();
+
+        // Deny.
+        let deny = HookRow {
+            hook_id: "h-deny".into(),
+            phase: "pre_call".into(),
+            priority: -5,
+            match_instance: Some("builtin.file".into()),
+            match_tool: None,
+            match_context: None,
+            match_principal: None,
+            action_kind: "deny".into(),
+            action_builtin_name: None,
+            action_kaish_script_id: None,
+            action_result_text: None,
+            action_is_error: None,
+            action_deny_reason: Some("no writes".into()),
+            action_log_target: None,
+            action_log_level: None,
+        };
+        db.insert_hook(&deny).unwrap();
+
+        // Log.
+        let log = minimal_hook_row("h-log", "on_notification", 0);
+        db.insert_hook(&log).unwrap();
+
+        // Kaish (reserved; rejected at admin time, but the row shape
+        // must still round-trip so a manually-inserted row hydrates
+        // predictably and the skip-with-warn path works).
+        let kaish = HookRow {
+            hook_id: "h-kaish".into(),
+            phase: "list_tools".into(),
+            priority: 0,
+            match_instance: None,
+            match_tool: None,
+            match_context: None,
+            match_principal: None,
+            action_kind: "kaish_invoke".into(),
+            action_builtin_name: None,
+            action_kaish_script_id: Some("script-42".into()),
+            action_result_text: None,
+            action_is_error: None,
+            action_deny_reason: None,
+            action_log_target: None,
+            action_log_level: None,
+        };
+        db.insert_hook(&kaish).unwrap();
+
+        let loaded = db.load_all_hooks().unwrap();
+        assert_eq!(loaded.len(), 5);
+
+        let by_id: std::collections::HashMap<String, HookRow> = loaded
+            .into_iter()
+            .map(|r| (r.hook_id.clone(), r))
+            .collect();
+
+        let b = by_id.get("h-builtin").unwrap();
+        assert_eq!(b.phase, "pre_call");
+        assert_eq!(b.priority, 10);
+        assert_eq!(b.match_instance.as_deref(), Some("builtin.*"));
+        assert_eq!(b.match_tool.as_deref(), Some("file_*"));
+        assert_eq!(b.match_context, Some(ctx_id));
+        assert_eq!(b.match_principal, Some(principal));
+        assert_eq!(b.action_kind, "builtin_invoke");
+        assert_eq!(b.action_builtin_name.as_deref(), Some("tracing_audit"));
+
+        let s = by_id.get("h-sc").unwrap();
+        assert_eq!(s.action_kind, "shortcircuit");
+        assert_eq!(s.action_result_text.as_deref(), Some("synthetic"));
+        assert_eq!(s.action_is_error, Some(true));
+
+        let d = by_id.get("h-deny").unwrap();
+        assert_eq!(d.action_kind, "deny");
+        assert_eq!(d.action_deny_reason.as_deref(), Some("no writes"));
+        assert_eq!(d.priority, -5);
+
+        let l = by_id.get("h-log").unwrap();
+        assert_eq!(l.action_kind, "log");
+        assert_eq!(l.action_log_level.as_deref(), Some("info"));
+
+        let k = by_id.get("h-kaish").unwrap();
+        assert_eq!(k.action_kind, "kaish_invoke");
+        assert_eq!(k.action_kaish_script_id.as_deref(), Some("script-42"));
+    }
+
+    #[test]
+    fn hook_delete_returns_whether_existed() {
+        let db = KernelDb::in_memory().unwrap();
+        // Delete of absent id is false (idempotent cleanup).
+        assert!(!db.delete_hook("nope").unwrap());
+
+        db.insert_hook(&minimal_hook_row("keep", "pre_call", 0))
+            .unwrap();
+        assert!(db.delete_hook("keep").unwrap());
+        // Second delete of same id is false.
+        assert!(!db.delete_hook("keep").unwrap());
+    }
+
+    #[test]
+    fn load_all_hooks_orders_by_phase_priority_then_insertion_idx() {
+        // Tests the evaluation-law tiebreak (§4.3): priority ascending,
+        // insertion-order tiebreak. Insert three hooks in pre_call with
+        // identical priority; load must return them in insertion order.
+        // Cross-phase, ordering within each phase must be preserved.
+        let db = KernelDb::in_memory().unwrap();
+        db.insert_hook(&minimal_hook_row("a", "pre_call", 5))
+            .unwrap();
+        db.insert_hook(&minimal_hook_row("b", "pre_call", 5))
+            .unwrap();
+        db.insert_hook(&minimal_hook_row("c", "pre_call", 1))
+            .unwrap();
+        db.insert_hook(&minimal_hook_row("x", "post_call", 0))
+            .unwrap();
+        db.insert_hook(&minimal_hook_row("y", "post_call", 0))
+            .unwrap();
+
+        let loaded = db.load_all_hooks().unwrap();
+        let pre: Vec<&str> = loaded
+            .iter()
+            .filter(|r| r.phase == "pre_call")
+            .map(|r| r.hook_id.as_str())
+            .collect();
+        // Priority 1 first, then priority 5 with insertion order (a, b).
+        assert_eq!(pre, vec!["c", "a", "b"]);
+
+        let post: Vec<&str> = loaded
+            .iter()
+            .filter(|r| r.phase == "post_call")
+            .map(|r| r.hook_id.as_str())
+            .collect();
+        assert_eq!(post, vec!["x", "y"]);
+    }
+
+    #[test]
+    fn hook_insert_same_id_errors() {
+        // Primary-key collision is a load-bearing signal: the broker
+        // should call `delete_hook` first for replace semantics rather
+        // than relying on an implicit upsert. Lock that contract in.
+        let db = KernelDb::in_memory().unwrap();
+        db.insert_hook(&minimal_hook_row("dup", "pre_call", 0))
+            .unwrap();
+        let err = db
+            .insert_hook(&minimal_hook_row("dup", "pre_call", 0))
+            .unwrap_err();
+        match err {
+            KernelDbError::Db(_) => {}
+            other => panic!("expected DB error on PK collision, got {other:?}"),
+        }
     }
 
     // ── 24. Context env CRUD ──────────────────────────────────────────

@@ -857,10 +857,16 @@ mark it `[RETIRED: <date> — <reason>]` in place; do not delete.
   Test path: implicit — the `admin_round_trip_with_builtin_log_hook`
   test registers Deny hooks then still succeeds in issuing `hook_list`
   and `hook_remove`, which would fail without the carve-out.
-  [REVIEW 2026-04-17: candidate for retirement — kernel restart is
-  the accepted escape hatch and D-53 establishes the no-carve-out
-  precedent for `builtin.bindings`. Not re-opened in Phase 5;
-  retirement tracked as a §9 follow-up.]
+  [RETIRED: 2026-04-17 — hook persistence makes sqlite surgery + restart
+  the recovery path; admin servers uniform under hook evaluation per
+  D-53. Carve-out in `Broker::evaluate_phase` deleted. Replacement test:
+  `mcp::servers::hooks_builtin::tests::hooks_admin_is_subject_to_hooks`
+  asserts a PreCall `Deny(*)` actually blocks `hook_list` on
+  `builtin.hooks` (symmetric to Phase 5's
+  `bindings_server_subject_to_hooks`). The pre-existing
+  `admin_round_trip_with_builtin_log_hook` — which the original note
+  described as relying on the carve-out — was in fact self-protecting
+  (Log action, no Deny) and passes unchanged after retirement.]
 - **D-52** — **Phase 5 reframed from "tool search + late injection" to
   "per-context binding management + persistence."** Phase 1 plumbed
   `ContextToolBinding` but no operator-facing surface curates it;
@@ -1307,12 +1313,35 @@ the current work.
   owning instance. Moved out of Phase 5 because per-context binding
   management is the prerequisite — search without the curation surface
   is unanchored UX.
-- **D-51 carve-out retirement for `builtin.hooks`.** The carve-out
-  was justified by "no escape hatch short of kernel restart"; kernel
+- **D-51 carve-out retirement for `builtin.hooks`.** *[SHIPPED
+  2026-04-17 alongside hook persistence below.]* The carve-out was
+  justified by "no escape hatch short of kernel restart"; kernel
   restart is in fact the accepted escape hatch (hooks are in-memory).
-  Simpler, safer model: no carve-out, same recovery. Phase 5 sets
-  the precedent (no carve-out for `builtin.bindings`); retiring D-51
-  is a small follow-up cleanup.
+  Simpler, safer model: no carve-out, same recovery. Phase 5 set
+  the precedent (no carve-out for `builtin.bindings`); retirement is
+  codified in D-51's retirement marker (§6). The real stance the
+  retirement codifies: *admin recovery is out-of-band*. Today that's
+  restart or `sqlite3 kernel.db "DELETE FROM hooks WHERE ..."`; the
+  kernel process doesn't guard itself against its own admin
+  configuration — the operator has a shell, and that's enough.
+- **Hook persistence.** *[SHIPPED 2026-04-17. Plan:
+  `~/.claude/plans/delightful-bubbling-crab.md`.]* `HookTables`
+  previously lived in-memory only; kernel restart wiped every
+  registered hook. Persistence now gives hooks the same durability
+  story bindings got in Phase 5. Normalized `hooks` table in
+  `KernelDb` mirrors `HookEntry` fields with the `HookActionWire`
+  variant discriminator as a column and variant-specific nullable
+  columns (per `feedback_sql_schema.md`, no JSON blobs). `Broker::
+  set_db` eagerly hydrates at bootstrap via `row_to_entry` in
+  `mcp/hook_persist.rs`; stale-reference rows (unknown builtin name,
+  kaish body, shape violation) `tracing::warn!` + skip rather than
+  brick the kernel. `hook_add` / `hook_remove` in the admin server
+  call `persist_hook_insert` / `persist_hook_delete` after the
+  in-memory mutation. Shipped with D-51 retirement so "admin servers
+  are not special" holds before and after. End-to-end test:
+  `hooks_persist_across_kernel_restart` in `broker_e2e.rs` — install
+  a Deny via admin, drop kernel, stand up a new kernel against the
+  same DB, verify the hook still fires.
 - **`StreamingBlockHandle` implementation.** Build when the first
   streaming caller arrives (likely the LLM streaming rewrite). Resolve
   async-drop strategy and append granularity at implementation time
@@ -1887,3 +1916,70 @@ Entries are append-only. Most recent at the bottom.
   blob columns"). Runner verification (exit criteria #1–#7 against a
   live `kaijutsu-runner` on the GPU server) pending — tracked in §8
   Phase 5 status.
+- **2026-04-17** (doc update, Amy + Claude Opus 4.7): Added hook
+  persistence as a §9 follow-up, paired with the existing D-51
+  carve-out retirement bullet. Conversation clarified that "admin
+  recovery is out-of-band" is the real stance — kernel restart today
+  because hooks are in-memory, sqlite surgery + restart if hooks are
+  ever persisted — so the "no carve-out" posture holds in either
+  world. Verified current state: no `hooks` table exists in
+  `kernel_db.rs` (tables are kernel / workspaces / workspace_paths /
+  presets / documents / contexts / context_edges / oplog /
+  doc_snapshots / input_oplog / input_doc_snapshots / context_shell /
+  context_bindings (+ \_instances / \_names) / context_env). No code
+  changes this turn.
+- **2026-04-17** (hook persistence + D-51 retirement execution, Amy +
+  Claude Opus 4.7): Shipped hook persistence and retired the D-51
+  carve-out in a single pass. Plan:
+  `~/.claude/plans/delightful-bubbling-crab.md`. Six milestones: M1
+  schema + DB methods (normalized `hooks` table with `insertion_idx`
+  managed internally via `MAX(insertion_idx) + 1` inside the INSERT;
+  `insert_hook` / `delete_hook` / `load_all_hooks` on `KernelDb`);
+  M2 broker wiring (new `mcp/hook_persist.rs` module owns the
+  `HookEntry`↔`HookRow` conversion with a `RowParseError` taxonomy;
+  `Broker::set_db` now eagerly hydrates; `persist_hook_insert` /
+  `persist_hook_delete` added); M3 admin server writes persist after
+  each in-memory mutation; M4 deleted the `params.instance ==
+  "builtin.hooks"` short-circuit in `evaluate_phase`; M5 end-to-end
+  `hooks_persist_across_kernel_restart` test in `broker_e2e.rs`
+  stitches admin → persist → SQLite → drop kernel → new kernel →
+  hydrate → hook fires; M6 doc closure. Also fixed a latent bug in
+  `hook_remove`: the admin handler only walked four phase tables,
+  skipping `list_tools` — now walks all five.
+
+  Suite adds, organized by the question each test answers:
+  - **"Do the DB methods round-trip?"** 4 tests in
+    `kernel_db::tests` (`hook_insert_roundtrip_preserves_all_action_variants`,
+    `hook_delete_returns_whether_existed`,
+    `load_all_hooks_orders_by_phase_priority_then_insertion_idx`,
+    `hook_insert_same_id_errors`).
+  - **"Does the conversion layer work?"** 4 tests in
+    `mcp::hook_persist::tests` (`builtin_invoke_round_trip`,
+    `unknown_builtin_fails_to_reconstruct`,
+    `shortcircuit_round_trip`, `kaish_row_returns_unsupported`).
+  - **"Does the broker wire up correctly?"** 4 tests in
+    `mcp::broker::tests` (`hooks_hydrate_on_set_db`,
+    `persist_hook_insert_writes_row`, `persist_hook_delete_removes_row`,
+    `hydrate_skips_unknown_builtin_and_keeps_valid_rows`).
+  - **"Is the admin surface subject to hooks post-retirement?"**
+    1 test in `mcp::servers::hooks_builtin::tests`
+    (`hooks_admin_is_subject_to_hooks`) — installs a PreCall
+    `Deny(*)` directly on the broker, then asserts a `hook_list`
+    admin call returns `McpError::Denied` with the expected
+    `by_hook` id. Symmetric to Phase 5's
+    `bindings_server_subject_to_hooks`.
+  - **"Does the full chain work end-to-end?"** 1 test in
+    `tests/broker_e2e.rs` (`hooks_persist_across_kernel_restart`):
+    admin `hook_add` on kernel A registers a PreCall Deny on
+    `builtin.block`, verify `block_list` is Denied, drop kernel A,
+    stand up kernel B against same DB, verify `block_list` still
+    Denied with the same `by_hook` id — the persisted row
+    round-tripped through `set_db`-time hydration.
+
+  Workspace totals: 512 kernel lib + 11 broker_e2e + 45 server + 54
+  client + 228 types + others. All workspace tests pass; long-standing
+  `kaijutsu-index` flakes remain unfixed (tech_debt item 7). DB schema
+  extended (new `hooks` table via `CREATE TABLE IF NOT EXISTS` —
+  forward-compatible for existing Phase 5 DBs; no migration needed).
+  No wire format changes. D-51 marked `[RETIRED: 2026-04-17]` in §6
+  with pointer to the replacement test.

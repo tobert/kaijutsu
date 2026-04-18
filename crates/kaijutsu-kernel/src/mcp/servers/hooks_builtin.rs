@@ -385,8 +385,14 @@ impl McpServerLike for BuiltinHooksServer {
                 {
                     let mut hooks = broker.hooks().write().await;
                     let table = phase_table_mut(&mut hooks, phase);
-                    table.entries.push(entry);
+                    table.entries.push(entry.clone());
                 }
+                // Best-effort persist to the kernel DB. No-op when the
+                // broker has no DB handle wired (tests, early bootstrap);
+                // failure warns but does not bubble — the in-memory
+                // push is authoritative for the rest of this kernel's
+                // lifetime.
+                broker.persist_hook_insert(phase, &entry).await;
                 let json = serde_json::json!({ "hook_id": id });
                 Ok(KernelToolResult {
                     is_error: false,
@@ -410,8 +416,14 @@ impl McpServerLike for BuiltinHooksServer {
                     any_removed |= drop_id(&mut hooks.post_call, &p.hook_id);
                     any_removed |= drop_id(&mut hooks.on_error, &p.hook_id);
                     any_removed |= drop_id(&mut hooks.on_notification, &p.hook_id);
+                    any_removed |= drop_id(&mut hooks.list_tools, &p.hook_id);
                     any_removed
                 };
+                // Mirror the delete into the DB regardless of whether
+                // an in-memory entry existed: callers may retry
+                // `hook_remove` after a partial failure, and the DB is
+                // the authoritative store for post-restart state.
+                broker.persist_hook_delete(&p.hook_id).await;
                 let json = serde_json::json!({ "removed": removed });
                 Ok(KernelToolResult {
                     is_error: false,
@@ -919,6 +931,54 @@ mod tests {
             .and_then(|v| v.as_str())
             .unwrap();
         assert_eq!(rt, "from hook");
+    }
+
+    /// D-51 retired: `builtin.hooks` is subject to hook evaluation like
+    /// every other instance. Symmetric to
+    /// `bindings_server_subject_to_hooks` (Phase 5). Recovery from a
+    /// self-inflicted lockout is out-of-band (edit the persisted row,
+    /// restart) — the kernel does not self-guard.
+    #[tokio::test]
+    async fn hooks_admin_is_subject_to_hooks() {
+        use super::super::super::hook_table::{GlobPattern, HookAction, HookEntry};
+        let broker = Arc::new(Broker::new());
+        let server = Arc::new(BuiltinHooksServer::new(Arc::downgrade(&broker)));
+        broker
+            .register(server, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        // Install a PreCall Deny(*) directly on the broker's HookTables,
+        // bypassing the admin surface. This simulates the user-locked-out
+        // state before retirement would have been recoverable only via
+        // the carve-out. After retirement, `hook_list` on `builtin.hooks`
+        // must return `McpError::Denied`.
+        {
+            let mut hooks = broker.hooks().write().await;
+            hooks.pre_call.entries.push(HookEntry {
+                id: HookId("lockout".into()),
+                match_instance: Some(GlobPattern("*".into())),
+                match_tool: None,
+                match_context: None,
+                match_principal: None,
+                action: HookAction::Deny("locked out".into()),
+                priority: 0,
+            });
+            drop(hooks);
+        }
+
+        let err = broker
+            .call_tool(
+                call_params("hook_list", serde_json::json!({})),
+                &CallContext::test(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, McpError::Denied { by_hook } if by_hook.0 == "lockout"),
+            "expected Denied(lockout) after D-51 retirement, got {err:?}",
+        );
     }
 
     /// `hook_remove` on an unknown id returns `{ removed: false }` — no

@@ -26,7 +26,7 @@ use super::binding::{ContextToolBinding, ResolvedName};
 use super::coalescer::{NotificationCoalescer, ObserveOutcome};
 use super::context::CallContext;
 use super::error::{HookId, McpError, McpResult, PolicyError};
-use super::hook_table::{HookAction, HookBody, HookPhase, HookTables};
+use super::hook_table::{HookAction, HookBody, HookEntry, HookPhase, HookTables};
 use super::hooks_builtin::BuiltinHookRegistry;
 use super::policy::InstancePolicy;
 use super::server_like::{McpServerLike, ServerNotification};
@@ -172,13 +172,116 @@ impl Broker {
         }
     }
 
-    /// Wire the kernel DB handle used to persist `ContextToolBinding` across
-    /// kernel restart (D-54, D-37 setter pattern). Call before first binding
-    /// mutation at kernel bootstrap; until this is set, `set_binding` /
-    /// `bind` / `unbind` still work on the in-memory map but persistence is
-    /// a no-op.
+    /// Wire the kernel DB handle used to persist `ContextToolBinding` and
+    /// `HookTables` across kernel restart (D-54, D-37 setter pattern, hook
+    /// persistence follow-up). Call before first binding/hook mutation at
+    /// kernel bootstrap; until this is set, mutation still works on the
+    /// in-memory maps but persistence is a no-op.
+    ///
+    /// Hooks are eagerly hydrated from the DB at wire-time since the
+    /// tables are global (not per-context sharded) and small. Unknown
+    /// `action_builtin_name` rows or shape violations `tracing::warn!` +
+    /// skip rather than crash — sqlite surgery is the intended recovery
+    /// path for bad rows.
     pub async fn set_db(self: &Arc<Self>, db: DbHandle) {
-        *self.db.write().await = Some(db);
+        *self.db.write().await = Some(db.clone());
+        self.hydrate_hooks_from_db(&db).await;
+    }
+
+    /// Load every persisted hook row and reconstruct `HookTables` in
+    /// place. Called from `set_db` at bootstrap. Rows whose action
+    /// shape can't be reified (unknown builtin name, invalid enum
+    /// field, kaish body) are logged at WARN and skipped individually —
+    /// one bad row must not brick the whole hook table.
+    async fn hydrate_hooks_from_db(self: &Arc<Self>, db: &DbHandle) {
+        let rows = {
+            let guard = db.lock();
+            match guard.load_all_hooks() {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(
+                        error = ?e,
+                        "failed to load hooks from DB; hook tables remain empty",
+                    );
+                    return;
+                }
+            }
+        };
+        if rows.is_empty() {
+            return;
+        }
+        let mut hooks = self.hooks.write().await;
+        let mut loaded = 0usize;
+        let mut skipped = 0usize;
+        for row in rows {
+            match super::hook_persist::row_to_entry(&row, &self.builtin_hooks) {
+                Ok((phase, entry)) => {
+                    let table = match phase {
+                        HookPhase::PreCall => &mut hooks.pre_call,
+                        HookPhase::PostCall => &mut hooks.post_call,
+                        HookPhase::OnError => &mut hooks.on_error,
+                        HookPhase::OnNotification => &mut hooks.on_notification,
+                        HookPhase::ListTools => &mut hooks.list_tools,
+                    };
+                    table.entries.push(entry);
+                    loaded += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        hook_id = %row.hook_id,
+                        phase = %row.phase,
+                        action_kind = %row.action_kind,
+                        reason = %e,
+                        "skipping persisted hook row",
+                    );
+                    skipped += 1;
+                }
+            }
+        }
+        tracing::debug!(
+            loaded,
+            skipped,
+            "hydrated hook tables from DB",
+        );
+    }
+
+    /// Persist one hook entry to the DB after `hook_add`. Best-effort:
+    /// failure warns but does not bubble up so the in-memory push
+    /// remains authoritative for the rest of the kernel's lifetime
+    /// (operator retries via `hook_add` after fixing the DB problem).
+    pub async fn persist_hook_insert(&self, phase: HookPhase, entry: &HookEntry) {
+        let db = match self.db.read().await.clone() {
+            Some(h) => h,
+            None => return,
+        };
+        let row = super::hook_persist::entry_to_row(phase, entry);
+        let guard = db.lock();
+        if let Err(e) = guard.insert_hook(&row) {
+            tracing::warn!(
+                hook_id = %entry.id,
+                phase = ?phase,
+                error = ?e,
+                "failed to persist hook insert",
+            );
+        }
+    }
+
+    /// Drop a hook from the DB after `hook_remove`. Best-effort mirror
+    /// of `persist_hook_insert`; idempotent (delete of an unknown id
+    /// is a non-error).
+    pub async fn persist_hook_delete(&self, hook_id: &str) {
+        let db = match self.db.read().await.clone() {
+            Some(h) => h,
+            None => return,
+        };
+        let guard = db.lock();
+        if let Err(e) = guard.delete_hook(hook_id) {
+            tracing::warn!(
+                hook_id = hook_id,
+                error = ?e,
+                "failed to persist hook delete",
+            );
+        }
     }
 
     pub fn coalescer(&self) -> &Arc<NotificationCoalescer> {
@@ -1001,20 +1104,18 @@ impl Broker {
     /// `Deny`) stop the walk; `Log`, `Invoke-Ok` continue. `Invoke-Err`
     /// terminates the phase as `Deny` with the hook's error text as reason.
     ///
-    /// Carve-out: calls on `builtin.hooks` are never hook-evaluated. A user
-    /// who registers a PreCall Deny matching `*` would otherwise lock
-    /// themselves out of `hook_remove` — the admin surface needs to remain
-    /// callable so recovery without a kernel restart is possible. All other
-    /// builtin instances go through the pipeline normally.
+    /// D-51 retired: admin MCP servers (`builtin.hooks`, `builtin.bindings`)
+    /// are subject to hook evaluation like every other instance. An
+    /// operator who locks themselves out with an overbroad Deny recovers
+    /// by editing the persisted hook row out of the DB (`sqlite3
+    /// kernel.db "DELETE FROM hooks WHERE ..."`) and restarting. Kernel
+    /// recovery is out-of-band; the broker doesn't self-guard.
     async fn evaluate_phase(
         &self,
         phase: HookPhase,
         params: &KernelCallParams,
         ctx: &CallContext,
     ) -> McpResult<PhaseOutcome> {
-        if params.instance.as_str() == "builtin.hooks" {
-            return Ok(PhaseOutcome::Continue);
-        }
         // Snapshot matching entries + their indices so the sort is stable
         // across priority ties (the HashTable::entries Vec is the
         // authoritative insertion order).
@@ -4814,5 +4915,217 @@ mod tests {
             .map(|(name, _)| name)
             .collect();
         assert_eq!(visible, vec!["file_read".to_string()]);
+    }
+
+    // ── Hook persistence (M2) ────────────────────────────────────────
+    //
+    // These tests exercise the round-trip: in-memory HookTables →
+    // `persist_hook_insert` → SQLite → `set_db` → hydrate → HookTables.
+    // The M5 e2e test stitches this through the admin handler; these
+    // tests isolate each direction.
+
+    fn hook_db() -> DbHandle {
+        use crate::kernel_db::KernelDb;
+        Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()))
+    }
+
+    fn log_entry(id: &str, match_tool: Option<&str>) -> super::HookEntry {
+        super::HookEntry {
+            id: super::HookId(id.into()),
+            match_instance: None,
+            match_tool: match_tool.map(|s| super::super::hook_table::GlobPattern(s.into())),
+            match_context: None,
+            match_principal: None,
+            action: super::HookAction::Log(super::super::hook_table::LogSpec {
+                target: "kaijutsu::hooks::test".into(),
+                level: tracing::Level::INFO,
+            }),
+            priority: 0,
+        }
+    }
+
+    /// `set_db` eagerly loads hook rows into `HookTables` in
+    /// priority/insertion order — the hydrate half of the persistence
+    /// loop. Guards against "restart silently drops hooks."
+    #[tokio::test]
+    async fn hooks_hydrate_on_set_db() {
+        use crate::kernel_db::HookRow;
+        let db = hook_db();
+
+        // Seed the DB directly. Two pre_call hooks at different priorities
+        // plus a post_call hook — hydrate must fan them into the right
+        // tables and order pre_call by priority ASC.
+        {
+            let guard = db.lock();
+            for row in [
+                HookRow {
+                    hook_id: "pc-high".into(),
+                    phase: "pre_call".into(),
+                    priority: 10,
+                    match_instance: None,
+                    match_tool: None,
+                    match_context: None,
+                    match_principal: None,
+                    action_kind: "log".into(),
+                    action_builtin_name: None,
+                    action_kaish_script_id: None,
+                    action_result_text: None,
+                    action_is_error: None,
+                    action_deny_reason: None,
+                    action_log_target: Some("x".into()),
+                    action_log_level: Some("info".into()),
+                },
+                HookRow {
+                    hook_id: "pc-low".into(),
+                    phase: "pre_call".into(),
+                    priority: 0,
+                    match_instance: None,
+                    match_tool: None,
+                    match_context: None,
+                    match_principal: None,
+                    action_kind: "log".into(),
+                    action_builtin_name: None,
+                    action_kaish_script_id: None,
+                    action_result_text: None,
+                    action_is_error: None,
+                    action_deny_reason: None,
+                    action_log_target: Some("x".into()),
+                    action_log_level: Some("info".into()),
+                },
+                HookRow {
+                    hook_id: "post".into(),
+                    phase: "post_call".into(),
+                    priority: 0,
+                    match_instance: None,
+                    match_tool: None,
+                    match_context: None,
+                    match_principal: None,
+                    action_kind: "log".into(),
+                    action_builtin_name: None,
+                    action_kaish_script_id: None,
+                    action_result_text: None,
+                    action_is_error: None,
+                    action_deny_reason: None,
+                    action_log_target: Some("x".into()),
+                    action_log_level: Some("info".into()),
+                },
+            ] {
+                guard.insert_hook(&row).unwrap();
+            }
+        }
+
+        let broker = Arc::new(Broker::new());
+        broker.set_db(db).await;
+
+        let hooks = broker.hooks().read().await;
+        // pre_call ordered by priority ASC: pc-low (0) then pc-high (10).
+        let pre_ids: Vec<&str> = hooks.pre_call.entries.iter().map(|e| e.id.0.as_str()).collect();
+        assert_eq!(pre_ids, vec!["pc-low", "pc-high"]);
+        // post_call has exactly the one hook.
+        let post_ids: Vec<&str> = hooks.post_call.entries.iter().map(|e| e.id.0.as_str()).collect();
+        assert_eq!(post_ids, vec!["post"]);
+        // Other tables are empty.
+        assert!(hooks.on_error.entries.is_empty());
+        assert!(hooks.on_notification.entries.is_empty());
+        assert!(hooks.list_tools.entries.is_empty());
+    }
+
+    /// `persist_hook_insert` writes a row that `load_all_hooks` returns.
+    /// The persist half of the loop; exercise without the admin handler
+    /// so failure points are obvious.
+    #[tokio::test]
+    async fn persist_hook_insert_writes_row() {
+        let db = hook_db();
+        let broker = Arc::new(Broker::new());
+        broker.set_db(db.clone()).await;
+
+        let entry = log_entry("h1", Some("file_*"));
+        broker.persist_hook_insert(HookPhase::PreCall, &entry).await;
+
+        let rows = db.lock().load_all_hooks().unwrap();
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!(r.hook_id, "h1");
+        assert_eq!(r.phase, "pre_call");
+        assert_eq!(r.match_tool.as_deref(), Some("file_*"));
+        assert_eq!(r.action_kind, "log");
+    }
+
+    /// `persist_hook_delete` removes the row written by insert.
+    #[tokio::test]
+    async fn persist_hook_delete_removes_row() {
+        let db = hook_db();
+        let broker = Arc::new(Broker::new());
+        broker.set_db(db.clone()).await;
+
+        broker
+            .persist_hook_insert(HookPhase::PreCall, &log_entry("h-del", None))
+            .await;
+        assert_eq!(db.lock().load_all_hooks().unwrap().len(), 1);
+
+        broker.persist_hook_delete("h-del").await;
+        assert_eq!(db.lock().load_all_hooks().unwrap().len(), 0);
+
+        // Idempotent — deleting again is fine.
+        broker.persist_hook_delete("h-del").await;
+    }
+
+    /// A row with an `action_builtin_name` not in the registry is
+    /// skipped at hydrate time with a warn — the kernel must not brick
+    /// on a single bad row (stale builtin rename, manual SQL typo). The
+    /// surrounding valid rows still load.
+    #[tokio::test]
+    async fn hydrate_skips_unknown_builtin_and_keeps_valid_rows() {
+        use crate::kernel_db::HookRow;
+        let db = hook_db();
+        {
+            let guard = db.lock();
+            guard
+                .insert_hook(&HookRow {
+                    hook_id: "bad".into(),
+                    phase: "pre_call".into(),
+                    priority: 0,
+                    match_instance: None,
+                    match_tool: None,
+                    match_context: None,
+                    match_principal: None,
+                    action_kind: "builtin_invoke".into(),
+                    action_builtin_name: Some("no_such_builtin".into()),
+                    action_kaish_script_id: None,
+                    action_result_text: None,
+                    action_is_error: None,
+                    action_deny_reason: None,
+                    action_log_target: None,
+                    action_log_level: None,
+                })
+                .unwrap();
+            guard
+                .insert_hook(&HookRow {
+                    hook_id: "good".into(),
+                    phase: "pre_call".into(),
+                    priority: 0,
+                    match_instance: None,
+                    match_tool: None,
+                    match_context: None,
+                    match_principal: None,
+                    action_kind: "log".into(),
+                    action_builtin_name: None,
+                    action_kaish_script_id: None,
+                    action_result_text: None,
+                    action_is_error: None,
+                    action_deny_reason: None,
+                    action_log_target: Some("x".into()),
+                    action_log_level: Some("info".into()),
+                })
+                .unwrap();
+        }
+
+        let broker = Arc::new(Broker::new());
+        broker.set_db(db).await;
+
+        let hooks = broker.hooks().read().await;
+        let ids: Vec<&str> = hooks.pre_call.entries.iter().map(|e| e.id.0.as_str()).collect();
+        // The bad row is silently skipped (warn logged); the good row loaded.
+        assert_eq!(ids, vec!["good"]);
     }
 }
