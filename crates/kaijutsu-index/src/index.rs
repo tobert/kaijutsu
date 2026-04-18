@@ -46,11 +46,14 @@ impl HnswIndex {
                     let hnsw_io: &'static HnswIo = Box::leak(hnsw_io_box);
 
                     // Rebuild embeddings cache from HNSW's persisted vectors.
-                    // Layer 0 contains all points — iterate to populate the cache
-                    // so get_embedding() and get_all_embeddings() work after reload.
+                    // hnsw_rs stores each point in exactly one layer (its randomly
+                    // assigned level), not in every layer ≤ level. Iterating layer 0
+                    // alone silently drops any point that landed at level > 0, which
+                    // corrupts get_embedding()/get_all_embeddings() after reload.
+                    // PointIndexation::into_iter walks every layer.
                     let mut embeddings: Vec<Option<Vec<f32>>> = Vec::new();
                     let pi = loaded.get_point_indexation();
-                    for point in pi.get_layer_iterator(0) {
+                    for point in pi.into_iter() {
                         let slot = point.get_origin_id();
                         let v = point.get_v();
                         if slot >= embeddings.len() {
@@ -276,5 +279,46 @@ mod tests {
 
         let all = index.get_all_embeddings().unwrap();
         assert_eq!(all.len(), 2);
+    }
+
+    /// Regression: hnsw_rs assigns each point to exactly one layer via a random
+    /// exponential distribution. With max_nb_connection=8, P(level > 0) per point
+    /// is 1/8. With 100 points, P(every point stays at level 0) ≈ 1.5e-6, so at
+    /// least one higher-layer point is effectively guaranteed. The reload path
+    /// must iterate all layers to rebuild the cache — iterating layer 0 alone
+    /// drops any slot that landed at level > 0.
+    #[test]
+    fn test_reload_preserves_all_slots_across_layers() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(dir.path());
+
+        const N: u32 = 100;
+
+        {
+            let mut index = HnswIndex::new(&config).unwrap();
+            for slot in 0..N {
+                let mut v = vec![0.0f32; 4];
+                v[(slot as usize) % 4] = 1.0 + (slot as f32) * 0.01;
+                let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                for x in &mut v {
+                    *x /= norm;
+                }
+                index.insert(slot, &v).unwrap();
+            }
+            index.save().unwrap();
+        }
+
+        let index = HnswIndex::new(&config).unwrap();
+        let all = index.get_all_embeddings().unwrap();
+        assert_eq!(
+            all.len() as u32,
+            N,
+            "reload must preserve every slot regardless of assigned layer"
+        );
+        for slot in 0..N {
+            index
+                .get_embedding(slot)
+                .unwrap_or_else(|_| panic!("slot {} missing after reload", slot));
+        }
     }
 }
