@@ -1103,6 +1103,24 @@ pub fn hydrate_from_blocks(blocks: &[kaijutsu_types::BlockSnapshot]) -> Vec<Mess
                     input,
                 });
             }
+            (BlockRole::Tool, BlockKind::Text) => {
+                // Tool-authored rich content (svg_block / abc_block).
+                // Surface as a user message envelope so the model can read
+                // back its own output on the next turn (A1). Plain text from
+                // tools stays skipped — only typed content (Svg/Abc) is
+                // worth round-tripping.
+                use kaijutsu_types::ContentType;
+                match block.content_type {
+                    ContentType::Svg | ContentType::Abc => {
+                        let envelope = kaijutsu_types::format_tool_content_for_llm(block);
+                        state.flush_all();
+                        state.messages.push(Message::user(envelope));
+                    }
+                    _ => {
+                        // Skip — no rich content to surface.
+                    }
+                }
+            }
             (BlockRole::Tool, BlockKind::ToolResult) => {
                 let user_code = block
                     .tool_call_id
@@ -2724,6 +2742,103 @@ mod tests {
             assert_eq!(block.role, BlockRole::System, "sanity: role is System");
             let msgs = hydrate_from_blocks(&[block]);
             assert_eq!(msgs.len(), 1, "System-role Notification must not be filtered out");
+        }
+
+        // ── (Tool, Text) content-typed blocks (svg_block / abc_block, A1) ──
+
+        #[test]
+        fn tool_text_svg_block_hydrates_with_envelope() {
+            let c = ctx();
+            let m = model();
+            let svg = "<svg viewBox='0 0 10 10'><circle cx='5' cy='5' r='3'/></svg>";
+            let block = kaijutsu_types::BlockSnapshotBuilder::new(
+                BlockId::new(c, m, 0),
+                kaijutsu_types::BlockKind::Text,
+            )
+            .role(BlockRole::Tool)
+            .content(svg)
+            .content_type(kaijutsu_types::ContentType::Svg)
+            .build();
+
+            let msgs = hydrate_from_blocks(&[block]);
+            assert_eq!(msgs.len(), 1, "(Tool, Text, Svg) block must hydrate");
+            assert_eq!(msgs[0].role, Role::User);
+            let text = msgs[0].as_text().expect("envelope is text");
+            assert!(text.contains("svg"), "envelope mentions svg, got: {text}");
+            assert!(
+                text.contains(svg),
+                "envelope includes svg source, got: {text}"
+            );
+        }
+
+        #[test]
+        fn tool_text_abc_block_hydrates_with_envelope() {
+            let c = ctx();
+            let m = model();
+            let abc = "X:1\nT:Test\nK:C\nCDEF GABc";
+            let block = kaijutsu_types::BlockSnapshotBuilder::new(
+                BlockId::new(c, m, 0),
+                kaijutsu_types::BlockKind::Text,
+            )
+            .role(BlockRole::Tool)
+            .content(abc)
+            .content_type(kaijutsu_types::ContentType::Abc)
+            .build();
+
+            let msgs = hydrate_from_blocks(&[block]);
+            assert_eq!(msgs.len(), 1, "(Tool, Text, Abc) block must hydrate");
+            assert_eq!(msgs[0].role, Role::User);
+            let text = msgs[0].as_text().expect("envelope is text");
+            assert!(text.contains("abc"), "envelope mentions abc, got: {text}");
+            assert!(
+                text.contains("CDEF GABc"),
+                "envelope includes abc source, got: {text}"
+            );
+        }
+
+        #[test]
+        fn tool_text_plain_still_skipped() {
+            // Tool-role text blocks without a rich content_type are noise (not
+            // produced by any current engine); skip them so we don't surface
+            // arbitrary tool-authored prose to the model on every turn.
+            let c = ctx();
+            let m = model();
+            let block = kaijutsu_types::BlockSnapshotBuilder::new(
+                BlockId::new(c, m, 0),
+                kaijutsu_types::BlockKind::Text,
+            )
+            .role(BlockRole::Tool)
+            .content("internal noise")
+            .build();
+
+            let msgs = hydrate_from_blocks(&[block]);
+            assert!(
+                msgs.is_empty(),
+                "(Tool, Text, Plain) must remain skipped, got {msgs:?}"
+            );
+        }
+
+        #[test]
+        fn tool_text_long_svg_truncates() {
+            let c = ctx();
+            let m = model();
+            let huge: String = "x".repeat(kaijutsu_types::TOOL_CONTENT_HYDRATION_BUDGET + 100);
+            let block = kaijutsu_types::BlockSnapshotBuilder::new(
+                BlockId::new(c, m, 0),
+                kaijutsu_types::BlockKind::Text,
+            )
+            .role(BlockRole::Tool)
+            .content(&huge)
+            .content_type(kaijutsu_types::ContentType::Svg)
+            .build();
+
+            let msgs = hydrate_from_blocks(&[block]);
+            assert_eq!(msgs.len(), 1);
+            let text = msgs[0].as_text().unwrap();
+            assert!(
+                text.contains("[truncated]"),
+                "long body must show truncation marker"
+            );
         }
     }
 }

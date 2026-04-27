@@ -6055,7 +6055,7 @@ dependencies = [
 
 [[package]]
 name = "kaish-glob"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "thiserror 2.0.18",
@@ -6063,7 +6063,7 @@ dependencies = [
 
 [[package]]
 name = "kaish-kernel"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "ariadne",
@@ -6099,7 +6099,7 @@ dependencies = [
 
 [[package]]
 name = "kaish-types"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "serde",
  "serde_json",

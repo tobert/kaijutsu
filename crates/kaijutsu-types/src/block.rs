@@ -699,6 +699,41 @@ pub fn format_notification_for_llm(block: &BlockSnapshot) -> String {
     format!("<notification {}>\n{}\n</notification>", attrs, body)
 }
 
+/// Maximum chars of a `(Role::Tool, BlockKind::Text)` block's content included
+/// in LLM hydration. Tool-authored rich content (SVG, ABC) is the model's own
+/// recent output, so the budget is generous — but unbounded markup is a
+/// context-window foot-gun. Counted in Unicode scalar values, not bytes.
+pub const TOOL_CONTENT_HYDRATION_BUDGET: usize = 4096;
+
+/// Format a `(Role::Tool, BlockKind::Text)` block (svg_block / abc_block /
+/// other content-typed tool output) for inclusion in LLM context.
+///
+/// Produces an XML envelope so the model can read back its own rich output:
+/// ```text
+/// <tool_output content_type="svg" block="bX-Y">
+/// <svg ...>...</svg>
+/// </tool_output>
+/// ```
+/// Body is truncated to `TOOL_CONTENT_HYDRATION_BUDGET` chars.
+pub fn format_tool_content_for_llm(block: &BlockSnapshot) -> String {
+    let kind = block.content_type.as_mime();
+    let block_key = block.id.to_key();
+    let body = if block.content.chars().count() > TOOL_CONTENT_HYDRATION_BUDGET {
+        let truncated: String = block
+            .content
+            .chars()
+            .take(TOOL_CONTENT_HYDRATION_BUDGET)
+            .collect();
+        format!("{}\n...[truncated]", truncated)
+    } else {
+        block.content.clone()
+    };
+    format!(
+        "<tool_output content_type=\"{}\" block=\"{}\">\n{}\n</tool_output>",
+        kind, block_key, body
+    )
+}
+
 // ============================================================================
 // Resource Payload Types (Phase 3 — D-42)
 // ============================================================================

@@ -14,12 +14,6 @@ The hydration loop in `crates/kaijutsu-kernel/src/llm/mod.rs` (around
 `hydrate_from_blocks`, ~line 1020) is the highest-leverage surface for
 agent embodiment. Several known gaps:
 
-- **(Tool, Text) blocks fall through to `_ => {}`** — `svg_block` /
-  `abc_block` / `img_block` insert `BlockKind::Text` with `Role::Tool` and
-  `ContentType::Svg`/`Abc`. The model can't read back its own rich output;
-  it draws once and the next turn is blind to it. Round-trip as
-  provider-appropriate content (raw source for text-only providers; raster
-  + source for vision-capable).
 - **`Role::Asset` is unconditionally skipped** (`llm/mod.rs:1034`). User
   pasted screenshots via `writeBlob` + `img_block_from_path` are invisible
   to vision-capable models. CAS storage and rendering already exist; only

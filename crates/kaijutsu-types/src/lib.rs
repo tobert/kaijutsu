@@ -64,7 +64,8 @@ pub use block::{
     ErrorSeverity, ErrorSpan, LogLevel, MAX_DAG_DEPTH, NotificationKind, NotificationPayload,
     ResourcePayload, Role, Status, ToolKind, ERROR_DETAIL_HYDRATION_BUDGET,
     NOTIFICATION_DETAIL_HYDRATION_BUDGET, RESOURCE_CONTENT_HYDRATION_BUDGET,
-    format_error_for_llm, format_notification_for_llm, format_resource_for_llm,
+    TOOL_CONTENT_HYDRATION_BUDGET, format_error_for_llm, format_notification_for_llm,
+    format_resource_for_llm, format_tool_content_for_llm,
 };
 pub use error_block::IntoErrorPayload;
 pub use compaction::CompactionBoundary;
