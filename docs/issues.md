@@ -50,8 +50,6 @@ following are explicit follow-ups that did not ship:
   `kaijutsu-server/src/llm_stream.rs::process_llm_stream` onto
   `StreamingBlockHandle` plus an outer orchestrator that mints sibling
   blocks for thinking/text/tool_call boundaries.
-- **MCP elicitation live handling.** Variant reserved (D-25); needs UI
-  affordance and response-path design.
 - **Block content abstraction.** Blocks as containers for multiple
   content artifacts; prerequisite for richer resource-subscription
   rendering.

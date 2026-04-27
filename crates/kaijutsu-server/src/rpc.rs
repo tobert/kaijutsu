@@ -301,6 +301,12 @@ pub struct ConnectionState {
     running_executions: HashMap<u64, RunningExecution>,
     /// Output subscribers registered via subscribe_output().
     output_subscribers: Vec<kernel_output::Client>,
+    /// Elicitation subscribers (M3-D6). The connection registers a
+    /// callback via `subscribeMcpElicitations`; the kernel-side path
+    /// calls `onRequest` on the first registered client when an MCP
+    /// server emits `ServerNotification::Elicitation` (emitter wiring
+    /// follows in the streaming effort).
+    elicitation_subscribers: Vec<crate::kaijutsu_capnp::elicitation_events::Client>,
 }
 
 impl ConnectionState {
@@ -317,6 +323,7 @@ impl ConnectionState {
             next_exec_id: AtomicU64::new(1),
             running_executions: HashMap::new(),
             output_subscribers: Vec::new(),
+            elicitation_subscribers: Vec::new(),
         }
     }
 
@@ -359,6 +366,24 @@ impl ConnectionState {
     /// Register an output subscriber callback.
     fn add_output_subscriber(&mut self, client: kernel_output::Client) {
         self.output_subscribers.push(client);
+    }
+
+    /// Register an MCP elicitation callback (M3-D6).
+    pub fn add_elicitation_subscriber(
+        &mut self,
+        client: crate::kaijutsu_capnp::elicitation_events::Client,
+    ) {
+        self.elicitation_subscribers.push(client);
+    }
+
+    /// Snapshot the current set of elicitation subscribers — caller can
+    /// invoke `onRequest` on each. Returns an empty Vec when nobody has
+    /// subscribed; in that case the broker should fall back to a
+    /// "decline" response so MCP servers don't block forever.
+    pub fn elicitation_subscribers(
+        &self,
+    ) -> Vec<crate::kaijutsu_capnp::elicitation_events::Client> {
+        self.elicitation_subscribers.clone()
     }
 }
 
@@ -2510,9 +2535,13 @@ impl kernel::Server for KernelImpl {
 
     fn subscribe_mcp_elicitations(
         self: Rc<Self>,
-        _params: kernel::SubscribeMcpElicitationsParams,
+        params: kernel::SubscribeMcpElicitationsParams,
         _results: kernel::SubscribeMcpElicitationsResults,
     ) -> Promise<(), capnp::Error> {
+        let callback = pry!(pry!(params.get()).get_callback());
+        self.connection
+            .borrow_mut()
+            .add_elicitation_subscriber(callback);
         Promise::ok(())
     }
 
