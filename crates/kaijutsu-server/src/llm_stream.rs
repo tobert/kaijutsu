@@ -20,7 +20,7 @@ use kaijutsu_kernel::llm::stream::{LlmStream, StreamEvent, StreamRequest};
 use kaijutsu_kernel::llm::{ContentBlock, ToolDefinition};
 use kaijutsu_kernel::{Kernel, LlmMessage, RigProvider, SharedBlockStore};
 use kaijutsu_types::ToolKind as TypesToolKind;
-use kaijutsu_types::{ContextId, PrincipalId};
+use kaijutsu_types::{ConsentMode, ContextId, PrincipalId};
 
 use crate::interrupt::ContextInterruptState;
 use crate::rpc::{ConversationCache, SharedKernelState};
@@ -216,6 +216,38 @@ pub(crate) async fn spawn_llm_for_prompt(
     Ok(())
 }
 
+/// Agentic-loop iteration cap by consent mode (M1-A6).
+///
+/// Collaborative caps at 2 iterations: the model can emit an initial
+/// tool-use response and one synthesis turn after seeing the tool result.
+/// That keeps the human in the loop for chained tool work — they can
+/// prompt "continue" to extend. Autonomous keeps the original 20-iteration
+/// guard against runaways.
+const COLLABORATIVE_MAX_ITERATIONS: u32 = 2;
+const AUTONOMOUS_MAX_ITERATIONS: u32 = 20;
+
+fn iteration_cap_for_consent(mode: ConsentMode) -> u32 {
+    match mode {
+        ConsentMode::Collaborative => COLLABORATIVE_MAX_ITERATIONS,
+        ConsentMode::Autonomous => AUTONOMOUS_MAX_ITERATIONS,
+    }
+}
+
+#[cfg(test)]
+mod consent_tests {
+    use super::*;
+
+    #[test]
+    fn collaborative_caps_at_two_iterations() {
+        assert_eq!(iteration_cap_for_consent(ConsentMode::Collaborative), 2);
+    }
+
+    #[test]
+    fn autonomous_caps_at_twenty_iterations() {
+        assert_eq!(iteration_cap_for_consent(ConsentMode::Autonomous), 20);
+    }
+}
+
 /// Map a tool's registry category to the appropriate `ToolKind`.
 ///
 /// Categories in use: "kernel", "block", "drift", "file", "mcp".
@@ -304,9 +336,12 @@ async fn process_llm_stream(
         context_id
     );
 
-    // Track total iterations to prevent infinite loops
-    let max_iterations = 20;
-    let mut iteration = 0;
+    // Track total iterations to prevent infinite loops. The cap is consent-
+    // aware (M1-A6): in Collaborative mode the loop yields after one
+    // tool round-trip + synthesis so the human stays in the loop; in
+    // Autonomous mode the model can chain up to AUTONOMOUS_MAX_ITERATIONS.
+    let max_iterations = iteration_cap_for_consent(kernel.consent_mode().await);
+    let mut iteration: u32 = 0;
     // Max retries for transient LLM provider failures (network blips, rate limits)
     const MAX_LLM_RETRIES: u32 = 2;
 
@@ -317,9 +352,23 @@ async fn process_llm_stream(
     loop {
         iteration += 1;
         if iteration > max_iterations {
+            // Consent-aware halt message (M1-A6): in Collaborative mode the
+            // cap is intentional, not a runaway. Tell the user how to
+            // resume rather than just signaling an alarm.
+            let consent = kernel.consent_mode().await;
+            let halt_msg = match consent {
+                ConsentMode::Collaborative => format!(
+                    "Paused after {max_iterations} agentic iteration(s) (consent: collaborative). \
+                     Send a follow-up to continue, or switch to autonomous to extend chains."
+                ),
+                ConsentMode::Autonomous => format!(
+                    "⚠️ Maximum tool iterations reached ({max_iterations})."
+                ),
+            };
             log::warn!(
-                "Agentic loop hit max iterations ({}), stopping",
-                max_iterations
+                "Agentic loop hit max iterations ({}, consent={}), stopping",
+                max_iterations,
+                consent,
             );
             let _ = documents.insert_block_as(
                 context_id,
@@ -327,7 +376,7 @@ async fn process_llm_stream(
                 Some(&last_block_id),
                 Role::Model,
                 BlockKind::Text,
-                "⚠️ Maximum tool iterations reached",
+                &halt_msg,
                 Status::Done,
                 ContentType::Plain,
                 Some(PrincipalId::system()),
