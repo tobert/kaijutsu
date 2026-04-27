@@ -1330,6 +1330,33 @@ impl BlockStore {
         Ok(())
     }
 
+    /// Set the compacted flag on a block (auto-compaction marks older blocks
+    /// as superseded by a Drift summary so the hydrator skips them, M1-A5).
+    pub fn set_compacted(
+        &self,
+        context_id: ContextId,
+        block_id: &BlockId,
+        compacted: bool,
+    ) -> BlockStoreResult<()> {
+        let ops = {
+            let mut entry = self
+                .get_mut(context_id)
+                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+            let frontier_before = entry.doc.frontier();
+            entry.doc.set_compacted(block_id, compacted)?;
+            entry.touch(self.agent_id());
+            entry.doc.ops_since(&frontier_before)
+        };
+        self.journal_op(context_id, ops)?;
+        self.emit(BlockFlow::MetadataChanged {
+            context_id,
+            block_id: *block_id,
+            source: OpSource::Local,
+        });
+
+        Ok(())
+    }
+
     /// Set the content_type hint on a block (e.g., Markdown, Svg, Abc).
     pub fn set_content_type(
         &self,

@@ -67,6 +67,7 @@ pub(crate) async fn spawn_llm_for_prompt(
     let kernel_arc = kernel.kernel.clone();
     let config_backend = kernel.config_backend.clone();
     let conversation_cache = kernel.conversation_cache.clone();
+    let kj_dispatcher = kernel.kj_dispatcher.clone();
     // Create a fresh interrupt state for this prompt (replaces any previous entry).
     // The generation counter prevents the race where stream A's cleanup removes
     // stream B's interrupt state.
@@ -155,6 +156,17 @@ pub(crate) async fn spawn_llm_for_prompt(
             }
         }
     };
+
+    // Compaction pressure (M1-A5): if the context's live block count is over
+    // threshold, summarize the older half into a Drift block and mark the
+    // originals compacted so the hydrator skips them. Logs but does not
+    // fail the prompt on summarization errors — better to ship a too-long
+    // history than to refuse the user's request.
+    match kj_dispatcher.auto_compact_if_needed(context_id).await {
+        Ok(true) => log::info!("Auto-compacted context {context_id} before prompt"),
+        Ok(false) => {}
+        Err(e) => log::warn!("Auto-compaction failed for {context_id}: {e}"),
+    }
 
     // Build tool definitions via the broker (binding + ListTools filter do
     // the curation — D-54 retired the legacy post-filter).

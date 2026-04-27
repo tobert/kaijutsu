@@ -432,6 +432,16 @@ impl BlockContent {
         self.header.updated_at = self.header.max_field_ts();
     }
 
+    pub fn compacted(&self) -> bool {
+        self.header.compacted
+    }
+
+    pub fn set_compacted(&mut self, val: bool, lamport_ts: u64) {
+        self.header.compacted = val;
+        self.header.compacted_at = lamport_ts;
+        self.header.updated_at = self.header.max_field_ts();
+    }
+
     // ── Sync ────────────────────────────────────────────────────────────
 
     /// Get operations since a frontier (per-block sync).

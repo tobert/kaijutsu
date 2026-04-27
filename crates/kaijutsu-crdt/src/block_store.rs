@@ -864,6 +864,20 @@ impl BlockStore {
         Ok(())
     }
 
+    /// Set the compacted flag on a block. Used by auto-compaction to mark
+    /// older blocks as superseded by a Drift summary so the hydrator skips
+    /// them when reconstructing LLM history (M1-A5).
+    pub fn set_compacted(&mut self, id: &BlockId, compacted: bool) -> Result<()> {
+        let ts = self.tick();
+        let block = self
+            .blocks
+            .get_mut(id)
+            .ok_or(CrdtError::BlockNotFound(*id))?;
+        block.set_compacted(compacted, ts);
+        self.version += 1;
+        Ok(())
+    }
+
     /// Move a block to a new position.
     pub fn move_block(&mut self, id: &BlockId, after: Option<&BlockId>) -> Result<()> {
         if !self.blocks.contains_key(id) || self.blocks[id].is_deleted() {
@@ -1514,6 +1528,29 @@ mod tests {
 
         store.set_status(&id, Status::Error).unwrap();
         assert_eq!(store.get_block_snapshot(&id).unwrap().status, Status::Error);
+    }
+
+    #[test]
+    fn test_set_compacted_toggles_flag() {
+        let mut store = test_store();
+        let id = store
+            .insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "old turn",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+        assert!(!store.get_block_snapshot(&id).unwrap().compacted);
+
+        store.set_compacted(&id, true).unwrap();
+        assert!(store.get_block_snapshot(&id).unwrap().compacted);
+
+        store.set_compacted(&id, false).unwrap();
+        assert!(!store.get_block_snapshot(&id).unwrap().compacted);
     }
 
     #[test]

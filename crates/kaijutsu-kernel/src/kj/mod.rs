@@ -9,6 +9,7 @@
 //! kernel state and is constructed once per server.
 
 pub mod cas;
+pub mod compact;
 pub mod context;
 pub mod drift;
 pub mod fork;
