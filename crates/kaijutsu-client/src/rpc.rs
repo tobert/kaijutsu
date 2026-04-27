@@ -391,6 +391,38 @@ impl KernelHandle {
         Ok(response.get()?.get_ack_version())
     }
 
+    /// Move a block to a new position. `after` is the block id to land
+    /// after; `None` parks the block at the document beginning. Returns
+    /// the resulting context version (ack).
+    #[tracing::instrument(skip(self), name = "rpc_client.move_block")]
+    pub async fn move_block(
+        &self,
+        context_id: ContextId,
+        block_id: &BlockId,
+        after: Option<&BlockId>,
+    ) -> Result<u64, RpcError> {
+        let mut request = self.kernel.move_block_request();
+        request.get().set_context_id(context_id.as_bytes());
+        set_block_id_builder(&mut request.get().init_block_id(), block_id);
+        match after {
+            Some(a) => {
+                request.get().set_has_after(true);
+                set_block_id_builder(&mut request.get().init_after(), a);
+            }
+            None => {
+                request.get().set_has_after(false);
+            }
+        }
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        let response = request.send().promise.await?;
+        Ok(response.get()?.get_ack_version())
+    }
+
     /// Subscribe to output events from `execute()` RPCs.
     ///
     /// Returns an unbounded receiver that yields stdout, stderr, and exit code

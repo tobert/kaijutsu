@@ -4493,6 +4493,44 @@ impl kernel::Server for KernelImpl {
             Err(e) => Promise::err(capnp::Error::failed(e.to_string())),
         }
     }
+
+    fn move_block(
+        self: Rc<Self>,
+        params: kernel::MoveBlockParams,
+        mut results: kernel::MoveBlockResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let _trace_guard = extract_rpc_trace(p.get_trace(), "move_block").entered();
+        let context_id_bytes = pry!(p.get_context_id());
+        let context_id = pry!(
+            ContextId::try_from_slice(context_id_bytes)
+                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
+        );
+        let block_id_reader = pry!(p.get_block_id());
+        let block_id = pry!(parse_block_id_from_reader(&block_id_reader));
+        let after_id = if p.get_has_after() {
+            let after_reader = pry!(p.get_after());
+            Some(pry!(parse_block_id_from_reader(&after_reader)))
+        } else {
+            None
+        };
+
+        if let Err(e) = self
+            .kernel
+            .documents
+            .move_block(context_id, &block_id, after_id.as_ref())
+        {
+            return Promise::err(capnp::Error::failed(e.to_string()));
+        }
+
+        match self.kernel.documents.version(context_id) {
+            Ok(ack) => {
+                results.get().set_ack_version(ack);
+                Promise::ok(())
+            }
+            Err(e) => Promise::err(capnp::Error::failed(e.to_string())),
+        }
+    }
 }
 
 // ============================================================================

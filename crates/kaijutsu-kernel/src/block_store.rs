@@ -1330,6 +1330,37 @@ impl BlockStore {
         Ok(())
     }
 
+    /// Move a block to a new position.
+    ///
+    /// `after` is the block to land after, or `None` to land at the beginning.
+    /// Wraps the CRDT primitive (kaijutsu-crdt move_block) with FlowBus
+    /// emission (`BlockFlow::Moved`) and journaling so peers receive ops.
+    pub fn move_block(
+        &self,
+        context_id: ContextId,
+        block_id: &BlockId,
+        after: Option<&BlockId>,
+    ) -> BlockStoreResult<()> {
+        let after_id = after.cloned();
+        let ops = {
+            let mut entry = self
+                .get_mut(context_id)
+                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+            let frontier_before = entry.doc.frontier();
+            entry.doc.move_block(block_id, after)?;
+            entry.touch(self.agent_id());
+            entry.doc.ops_since(&frontier_before)
+        };
+        self.journal_op(context_id, ops)?;
+        self.emit(BlockFlow::Moved {
+            context_id,
+            block_id: *block_id,
+            after_id,
+            source: OpSource::Local,
+        });
+        Ok(())
+    }
+
     /// Set the compacted flag on a block (auto-compaction marks older blocks
     /// as superseded by a Drift summary so the hydrator skips them, M1-A5).
     pub fn set_compacted(
@@ -2801,6 +2832,72 @@ mod tests {
             .unwrap();
         let v2 = store.version(ctx).unwrap();
         assert!(v2 > v1, "version should advance again (v1={}, v2={})", v1, v2);
+    }
+
+    #[test]
+    fn test_move_block_reorders_and_emits_flow() {
+        // Move primitive at the kernel block-store layer (M2-B1):
+        // CRDT layer already implements `move_block`; verify the wrapper
+        // updates ordering, bumps the version, and journals an op.
+        let store = BlockStore::new(test_agent());
+        let ctx = ContextId::new();
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+        let a = store
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "A",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+        let b = store
+            .insert_block(
+                ctx,
+                None,
+                Some(&a),
+                Role::User,
+                BlockKind::Text,
+                "B",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+        let c = store
+            .insert_block(
+                ctx,
+                None,
+                Some(&b),
+                Role::User,
+                BlockKind::Text,
+                "C",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+
+        let v_before = store.version(ctx).unwrap();
+        // Move c to the front (no `after` → beginning of the doc).
+        store.move_block(ctx, &c, None).unwrap();
+        let v_after = store.version(ctx).unwrap();
+        assert!(v_after > v_before, "version should advance after move");
+
+        let order: Vec<_> = store
+            .block_snapshots(ctx)
+            .unwrap()
+            .into_iter()
+            .map(|b| b.id)
+            .collect();
+        assert_eq!(
+            order,
+            vec![c, a, b],
+            "moved block should appear at the beginning"
+        );
     }
 
     #[test]

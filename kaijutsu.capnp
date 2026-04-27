@@ -1193,6 +1193,13 @@ interface Kernel {
 
   # Set the excluded flag on a block (staging curation).
   setBlockExcluded @92 (contextId :Data, blockId :BlockId, excluded :Bool, trace :TraceContext) -> (ackVersion :UInt64);
+
+  # Move a block to a new position. When `hasAfter` is true, `after` is
+  # the block to land after; otherwise the block is parked at the
+  # beginning of the document. Mirrors the `has_parent_id` idiom used
+  # elsewhere in the schema. CRDT + kernel impls exist; this is the
+  # protocol seam (M2-B1).
+  moveBlock @93 (contextId :Data, blockId :BlockId, hasAfter :Bool, after :BlockId, trace :TraceContext) -> (ackVersion :UInt64);
 }
 
 # ============================================================================

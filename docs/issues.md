@@ -76,9 +76,6 @@ following are explicit follow-ups that did not ship:
 - **`KernelDb` connection pool.** Currently `Arc<parking_lot::Mutex<KernelDb>>`
   in `block_store.rs:73`. Every RPC reads/writes through one lock. Migrate
   to `r2d2` / `sqlx` for concurrent reads.
-- **`MoveBlock` kernel + RPC.** `kaijutsu.capnp` defines `MoveBlock` and
-  `kaijutsu-crdt` implements it; `kaijutsu-kernel` lacks the method and
-  `rpc.rs` logs a `warn!` stub.
 - **TextOps sequence number.** Detect out-of-order text operations.
   Requires capnp schema change + client protocol update.
 - **Dead-letter queue RPC.** Inspect / replay failed tool executions.
