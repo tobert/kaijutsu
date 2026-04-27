@@ -63,9 +63,6 @@ following are explicit follow-ups that did not ship:
   request/result, run script, parse return.
 - **MCP `progress` → `StreamingBlockHandle` bridge.** External streaming
   tools wired the same way virtual tools will be.
-- **Cancellation propagation.** LLM cancel → in-flight tool calls via
-  `CancellationToken`. Needs wiring across all call sites and a cancel
-  path into the streaming handle.
 - **MCP output buffering.** Sliding-window buffer with backpressure for
   chatty external servers; couples with `InstancePolicy::max_result_bytes`.
 - **Real resource-limit enforcement.** Admin surface for `InstancePolicy`,

@@ -1006,6 +1006,7 @@ impl Broker {
         let instance_for_timeout = params.instance.clone();
         let timeout_ms = policy.call_timeout.as_millis() as u64;
         let call_params_for_hooks = params.clone();
+        let cancel_for_call = cancel.clone();
         let call_fut = async {
             let span = tracing::info_span!(
                 "server.call_tool",
@@ -1013,17 +1014,23 @@ impl Broker {
                 tool = %params.tool,
             );
             let _enter = span.enter();
-            server.call_tool(params, ctx, cancel).await
+            server.call_tool(params, ctx, cancel_for_call).await
         };
 
-        let call_result = tokio::time::timeout(policy.call_timeout, call_fut)
-            .await
-            .map_err(|_| {
-                McpError::Policy(PolicyError::Timeout {
+        // Race the call against (a) the per-instance timeout and (b) an
+        // externally-supplied cancellation (M2-B5). Without (b) a hard
+        // interrupt would wait the full call_timeout for builtin servers
+        // that don't observe the token themselves.
+        let call_result: Result<McpResult<KernelToolResult>, McpError> = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(McpError::Cancelled),
+            r = tokio::time::timeout(policy.call_timeout, call_fut) => {
+                r.map_err(|_| McpError::Policy(PolicyError::Timeout {
                     instance: instance_for_timeout.clone(),
                     timeout_ms,
-                })
-            });
+                }))
+            }
+        };
 
         match call_result {
             Ok(Ok(result)) => {
@@ -2366,6 +2373,57 @@ mod tests {
                 McpError::Policy(PolicyError::ConcurrencyCap { max: 1, .. })
             ),
             "expected Policy(ConcurrencyCap{{max:1}}), got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_aborts_in_flight_call() {
+        // M2-B5: cancelling the supplied token should abort the broker
+        // call within bounded time (well below the policy timeout). Without
+        // this the user waits the full call_timeout for builtin servers
+        // that don't observe the token themselves.
+        let broker = Arc::new(Broker::new());
+        let server = Arc::new(
+            MockServer::new("napper")
+                .with_tool("sleep")
+                .on_call(|_p| async {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    Ok(KernelToolResult::text("done"))
+                }),
+        );
+        broker
+            .register(
+                server,
+                InstancePolicy {
+                    call_timeout: Duration::from_secs(60),
+                    max_result_bytes: 1024,
+                    max_concurrency: 4,
+                },
+            )
+            .await
+            .unwrap();
+
+        let cancel = CancellationToken::new();
+        let cancel2 = cancel.clone();
+        // Cancel after 50ms.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancel2.cancel();
+        });
+
+        let start = std::time::Instant::now();
+        let err = broker
+            .call_tool(params("napper", "sleep"), &CallContext::test(), cancel)
+            .await
+            .unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(err, McpError::Cancelled),
+            "expected Cancelled, got {err:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "cancel should land well under 500ms, took {elapsed:?}"
         );
     }
 

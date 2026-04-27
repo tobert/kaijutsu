@@ -165,11 +165,32 @@ impl Kernel {
         params_json: &str,
         tool_ctx: &ExecContext,
     ) -> Result<ExecResult, crate::mcp::McpError> {
+        use tokio_util::sync::CancellationToken;
+        // Default path: no propagated cancellation. Callers that need it
+        // (LLM streaming) call `dispatch_tool_via_broker_with_cancel`.
+        self.dispatch_tool_via_broker_with_cancel(
+            tool_name,
+            params_json,
+            tool_ctx,
+            CancellationToken::new(),
+        )
+        .await
+    }
+
+    /// Same as `dispatch_tool_via_broker` but threads an externally-managed
+    /// `CancellationToken` into the broker call (M2-B5). Cancelling the token
+    /// causes the in-flight broker call to abort within a bounded time.
+    pub async fn dispatch_tool_via_broker_with_cancel(
+        &self,
+        tool_name: &str,
+        params_json: &str,
+        tool_ctx: &ExecContext,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<ExecResult, crate::mcp::McpError> {
         use crate::mcp::{
             CallContext, ContextToolBinding, InstanceId, KernelCallParams, McpError, ToolContent,
             TraceContext,
         };
-        use tokio_util::sync::CancellationToken;
 
         // Ensure a binding exists for this context. First-touch, populate
         // with every registered instance so the LLM sees everything.
@@ -227,7 +248,7 @@ impl Kernel {
                     arguments,
                 },
                 &call_ctx,
-                CancellationToken::new(),
+                cancel,
             )
             .await?;
 

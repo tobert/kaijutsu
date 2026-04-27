@@ -735,6 +735,7 @@ async fn process_llm_stream(
                 let kernel = kernel.clone();
                 let documents = documents.clone();
                 let tool_ctx = tool_ctx.clone();
+                let interrupt = interrupt.clone();
                 // Option<Option<BlockId>>: None = not in map (shouldn't happen),
                 // Some(None) = insertion failed, Some(Some(id)) = normal
                 let tool_call_entry = tool_call_blocks.get(&tool_use_id).cloned();
@@ -806,11 +807,19 @@ async fn process_llm_stream(
 
                     // Step 4: Execute tool via the Phase 1 broker. Outer
                     // timeout is belt-and-suspenders alongside the broker's
-                    // per-instance InstancePolicy cap.
+                    // per-instance InstancePolicy cap. interrupt.cancel
+                    // (M2-B5) flows through to the broker so a hard
+                    // interrupt aborts in-flight work — without this the
+                    // user waits the full 120s timeout.
                     const TOOL_TIMEOUT_SECS: u64 = 120;
                     let result = tokio::time::timeout(
                         std::time::Duration::from_secs(TOOL_TIMEOUT_SECS),
-                        kernel.dispatch_tool_via_broker(&tool_name, &params, &tool_ctx),
+                        kernel.dispatch_tool_via_broker_with_cancel(
+                            &tool_name,
+                            &params,
+                            &tool_ctx,
+                            interrupt.cancel.clone(),
+                        ),
                     )
                     .await;
 
