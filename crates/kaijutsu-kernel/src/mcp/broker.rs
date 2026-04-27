@@ -517,6 +517,38 @@ impl Broker {
             .collect()
     }
 
+    /// Snapshot a registered instance's current `InstancePolicy`. Returns
+    /// `None` when the instance hasn't been registered (M3-D5).
+    pub async fn policy_of(&self, instance: &InstanceId) -> Option<InstancePolicy> {
+        self.policies.read().await.get(instance).cloned()
+    }
+
+    /// Update `call_timeout` and `max_result_bytes` for a registered
+    /// instance (M3-D5). `max_concurrency` is intentionally not mutable
+    /// here — resizing the semaphore mid-flight would race in-flight
+    /// permits; that knob is set at registration time only.
+    ///
+    /// Returns `Ok(())` on update, `Err(InstanceNotFound)` when the
+    /// instance isn't registered.
+    pub async fn update_policy(
+        &self,
+        instance: &InstanceId,
+        call_timeout: Option<std::time::Duration>,
+        max_result_bytes: Option<usize>,
+    ) -> McpResult<()> {
+        let mut policies = self.policies.write().await;
+        let policy = policies
+            .get_mut(instance)
+            .ok_or_else(|| McpError::InstanceNotFound(instance.clone()))?;
+        if let Some(t) = call_timeout {
+            policy.call_timeout = t;
+        }
+        if let Some(b) = max_result_bytes {
+            policy.max_result_bytes = b;
+        }
+        Ok(())
+    }
+
     /// Clone of the instance registry for callers that want to call
     /// `list_tools` on each server without holding the broker's RwLock.
     pub async fn instances_snapshot(&self) -> HashMap<InstanceId, Arc<dyn McpServerLike>> {

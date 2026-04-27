@@ -466,6 +466,14 @@ impl Kernel {
             .register_silently(tool_search_server, InstancePolicy::default())
             .await?;
 
+        // M3-D5: builtin.policy — get/set per-instance InstancePolicy.
+        let policy_server = Arc::new(
+            crate::mcp::servers::BuiltinPolicyServer::new(Arc::downgrade(&self.broker)),
+        );
+        self.broker
+            .register_silently(policy_server, InstancePolicy::default())
+            .await?;
+
         Ok(())
     }
 

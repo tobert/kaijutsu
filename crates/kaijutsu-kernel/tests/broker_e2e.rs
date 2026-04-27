@@ -200,6 +200,67 @@ async fn tool_search_returns_scored_matches() {
 }
 
 #[tokio::test]
+async fn policy_show_and_set_round_trip() {
+    // M3-D5: builtin.policy exposes get/set for InstancePolicy. Show
+    // returns the current policy; set mutates call_timeout_ms /
+    // max_result_bytes in place; subsequent show reflects the change.
+    let fx = setup().await;
+    // Seed binding so builtin.policy is visible.
+    let _ = fx
+        .kernel
+        .list_tool_defs_via_broker(fx.ctx_id, fx.exec_ctx.principal_id)
+        .await;
+
+    // Show: builtin.kernel_info should have the default policy.
+    let show = fx
+        .kernel
+        .dispatch_tool_via_broker(
+            "policy_show",
+            &serde_json::json!({"instance": "builtin.kernel_info"}).to_string(),
+            &fx.exec_ctx,
+        )
+        .await
+        .expect("show");
+    assert!(show.success);
+    let payload: serde_json::Value = serde_json::from_str(&show.stdout).expect("json");
+    let timeout = payload["call_timeout_ms"].as_u64().expect("timeout_ms");
+    assert!(timeout > 0, "default timeout should be non-zero");
+
+    // Set a new timeout and verify it round-trips.
+    let new_timeout: u64 = 7777;
+    let set = fx
+        .kernel
+        .dispatch_tool_via_broker(
+            "policy_set",
+            &serde_json::json!({
+                "instance": "builtin.kernel_info",
+                "call_timeout_ms": new_timeout
+            })
+            .to_string(),
+            &fx.exec_ctx,
+        )
+        .await
+        .expect("set");
+    assert!(set.success, "policy_set failed: {}", set.stderr);
+    let updated: serde_json::Value = serde_json::from_str(&set.stdout).expect("json");
+    assert_eq!(updated["call_timeout_ms"].as_u64(), Some(new_timeout));
+    assert_eq!(updated["updated"].as_bool(), Some(true));
+
+    // Subsequent show reflects the change.
+    let show2 = fx
+        .kernel
+        .dispatch_tool_via_broker(
+            "policy_show",
+            &serde_json::json!({"instance": "builtin.kernel_info"}).to_string(),
+            &fx.exec_ctx,
+        )
+        .await
+        .expect("show2");
+    let payload2: serde_json::Value = serde_json::from_str(&show2.stdout).expect("json");
+    assert_eq!(payload2["call_timeout_ms"].as_u64(), Some(new_timeout));
+}
+
+#[tokio::test]
 async fn unknown_tool_name_surfaces_tool_not_found() {
     let fx = setup().await;
 

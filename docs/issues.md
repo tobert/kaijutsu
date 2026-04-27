@@ -57,8 +57,9 @@ following are explicit follow-ups that did not ship:
   request/result, run script, parse return.
 - **MCP `progress` → `StreamingBlockHandle` bridge.** External streaming
   tools wired the same way virtual tools will be.
-- **Real resource-limit enforcement.** Admin surface for `InstancePolicy`,
-  per-principal budgets, fair queuing.
+- **Per-principal budgets + fair queuing.** Adjacent to the now-shipped
+  `builtin.policy` get/set surface; per-principal accounting is the
+  next layer up.
 
 ## Persistence & sync
 
