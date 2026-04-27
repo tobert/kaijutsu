@@ -19,16 +19,18 @@ kaijutsu/
 ├── crates/
 │   ├── kaijutsu-types/       # READ FIRST
 │   ├── kaijutsu-crdt/        # BlockStore, BlockDocument (re-exports types)
-│   ├── kaijutsu-kernel/      # Kernel, VFS, tools, LLM, drift, kj builtin
+│   ├── kaijutsu-kernel/      # Kernel, VFS, MCP broker, LLM, drift, kj builtin
 │   ├── kaijutsu-server/      # SSH server, EmbeddedKaish, KaijutsuBackend
 │   ├── kaijutsu-client/      # RPC client, ActorHandle (Send+Sync)
 │   ├── kaijutsu-app/         # Bevy GUI
 │   ├── kaijutsu-abc/         # ABC music notation
 │   ├── kaijutsu-mcp/         # MCP server (rmcp)
+│   ├── kaijutsu-cas/         # Content-addressed store (blob persistence)
+│   ├── kaijutsu-agent-tools/ # Agent session detection (Claude Code, etc.)
 │   ├── kaijutsu-index/       # Semantic vector indexing (ONNX + HNSW)
 │   └── kaijutsu-telemetry/   # OpenTelemetry (W3C context propagation)
 ├── kaijutsu.capnp            # Wire protocol schema
-└── docs/                     # kernel-model.md, design-notes.md, etc.
+└── docs/                     # design-notes.md, telemetry.md, issues.md, etc.
 ```
 
 ## Autonomous Development Loop

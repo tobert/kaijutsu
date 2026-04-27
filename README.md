@@ -1,6 +1,6 @@
 # 会術 Kaijutsu
 
-Kaijutsu is an cybernetic AI agent system with a graphical UI that manages contexts in a
+Kaijutsu is a cybernetic AI agent system with a graphical UI that manages contexts in a
 directed acyclic graph (DAG). The DAG supports `fork` and `drift` operations that simplify
 breaking down work as a context develops, and then merging the results, while keeping
 provenance intact.
@@ -32,7 +32,7 @@ patches.
 
 ```bash
 # First time: add your SSH key
-cargo run -p kaijutsu-server -- add-key ~/.ssh/id_ed25519.pub --nick amy --admin
+cargo run -p kaijutsu-server -- add-key ~/.ssh/id_ed25519.pub --nick amy
 
 # Terminal 1: Server
 cargo run -p kaijutsu-server
@@ -43,12 +43,18 @@ cargo run -p kaijutsu-app
 
 ## Crates
 
+### kaijutsu-types
+
+The relational foundation: typed IDs, principals, credentials, blocks, kernels,
+and context metadata. Pure leaf crate with no internal kaijutsu dependencies —
+read this first when learning the codebase.
+
 ### kaijutsu-kernel
 
-The kernel wraps up your filesystem, models, MCPs, and contexts in a remove server
-over ssh. It provides its own VFS, a tool registry, an LLM registry, an agent registry,
-a drift router, and a pub/sub FlowBus. Contexts can be forked any time, at which point
-the context can be edited and even switch models and tools.
+The kernel wraps up your filesystem, models, MCPs, and contexts in a remote server
+over ssh. It provides its own VFS, an MCP broker for tool dispatch, an LLM registry,
+an agent registry, a drift router, and a pub/sub FlowBus. Contexts can be forked
+any time, at which point the context can be edited and even switch models and tools.
 
 ### kaijutsu-crdt
 
@@ -59,21 +65,45 @@ participants (models, humans, scripts) edit concurrently.
 
 ### kaijutsu-server
 
-SSH + Cap'n Proto RPC server (87 Kernel methods + 4 World methods). Handles
-authentication via SQLite-backed public keys, runs EmbeddedKaish for shell
-command execution, and routes file I/O through CRDT blocks via KaijutsuBackend.
+SSH + Cap'n Proto RPC server. Handles authentication via SQLite-backed public
+keys, runs EmbeddedKaish for shell command execution, and routes file I/O
+through CRDT blocks via KaijutsuBackend.
 
 ### kaijutsu-client
 
-RPC client library. `ActorHandle` provides a Send+Sync interface with 34 methods,
-broadcast subscriptions for server events and connection status, and automatic
+RPC client library. `ActorHandle` provides a Send+Sync interface, broadcast
+subscriptions for server events and connection status, and automatic
 reconnection that re-registers subscriptions.
+
+### kaijutsu-cas
+
+Content-addressed blob store. Hash, stage, and seal binary content (images,
+audio, attachments) by content hash, with metadata and references that point
+into blocks.
+
+### kaijutsu-agent-tools
+
+Detects which AI coding tool (Claude Code, Gemini CLI, etc.) is hosting the
+current process, by walking parent processes and reading session metadata.
+Used to correlate kaijutsu sessions with their host agent.
+
+### kaijutsu-abc
+
+Parser and MIDI generator for ABC music notation. Produces a structured AST
+plus SMF format 0 MIDI bytes. Used by `abc_block` so models can compose music
+that renders as both standard staff notation and audio.
+
+### kaijutsu-index
+
+Semantic vector indexing — local ONNX embeddings, HNSW nearest-neighbor
+search, and density-based clustering. No external API calls; runs fully
+offline.
 
 ### kaijutsu-mcp
 
 [MCP server][mcp] exposing the CRDT kernel to Claude Code, Gemini CLI, opencode,
-and other MCP clients. 25 tools across documents, blocks, drift, execution, and
-identity. Can run standalone (in-memory) or connected to kaijutsu-server.
+and other MCP clients. Can run standalone (in-memory) or connected to
+kaijutsu-server.
 
 ```bash
 cargo run -p kaijutsu-mcp
@@ -104,15 +134,15 @@ text rendering, theming, and the UI architecture.
 
 | Doc | Purpose |
 |-----|---------|
-| [docs/kernel-model.md](docs/kernel-model.md) | **Authoritative kernel model — start here** |
-| [docs/drift.md](docs/drift.md) | Cross-context communication design |
-| [docs/block-tools.md](docs/block-tools.md) | CRDT block interface |
-| [docs/diamond-types-fork.md](docs/diamond-types-fork.md) | Why we forked diamond-types |
+| [docs/design-notes.md](docs/design-notes.md) | Origin, terminology, design explorations |
 | [docs/telemetry.md](docs/telemetry.md) | OpenTelemetry integration |
-| [docs/design-notes.md](docs/design-notes.md) | Collected design explorations |
+| [docs/abc-reference.md](docs/abc-reference.md) | ABC music notation reference |
+| [docs/issues.md](docs/issues.md) | Live work items not yet in code |
 
 ## Forked Dependencies
 
 | Fork | Why |
 |------|-----|
-| [diamond-types-extended](https://github.com/tobert/diamond-types-extended) | Completes Map/Set/Register types alongside Text CRDT |
+| [diamond-types-extended][dte] | Completes Map/Set/Register types alongside Text CRDT |
+
+[dte]: https://github.com/tobert/diamond-types-extended
