@@ -1034,19 +1034,14 @@ impl Broker {
 
         match call_result {
             Ok(Ok(result)) => {
-                // Size check — pathological output must not OOM the kernel
-                // regardless of hook posture. Treat as an error path so
-                // OnError hooks get a chance to observe / convert.
+                // Size check — pathological output must not OOM the kernel.
+                // M3-D4: instead of erroring, truncate the result text in
+                // place with an explicit footer so the model still sees
+                // useful prefix data plus a clear note about what was cut.
+                let mut result = result;
                 let size = estimate_result_size(&result);
                 if size > policy.max_result_bytes {
-                    let err = McpError::Policy(PolicyError::ResultTooLarge {
-                        instance: instance_for_timeout,
-                        size,
-                        max: policy.max_result_bytes,
-                    });
-                    return self
-                        .run_on_error_then_err(&call_params_for_hooks, ctx, err)
-                        .await;
+                    truncate_result_to_budget(&mut result, policy.max_result_bytes, size);
                 }
                 match self
                     .evaluate_phase(HookPhase::PostCall, &call_params_for_hooks, ctx)
@@ -2089,6 +2084,59 @@ fn estimate_result_size(result: &KernelToolResult) -> usize {
     total
 }
 
+/// Truncate a tool result so its serialized size fits inside `budget`,
+/// replacing tail content with a "[truncated N bytes]" footer (M3-D4).
+///
+/// Strategy: drop `structured`, walk `content` in order, keep whole
+/// items that fit. The first item that would overflow is byte-truncated
+/// to fill the remaining budget minus footer length. Subsequent items
+/// are dropped. A final Text item carries the footer.
+fn truncate_result_to_budget(result: &mut KernelToolResult, budget: usize, original_size: usize) {
+    use super::types::ToolContent;
+    let dropped = original_size.saturating_sub(budget);
+    let footer = format!("\n\n[truncated {} bytes — output exceeded max_result_bytes]", dropped);
+    // Reserve room for the footer; if the budget is smaller than the
+    // footer itself, drop everything except the footer.
+    let footer_len = footer.len();
+    let body_budget = budget.saturating_sub(footer_len);
+
+    // Discard structured payload — it's an indivisible blob and easier
+    // for the model to lose entirely than partially.
+    result.structured = None;
+
+    let mut kept: Vec<ToolContent> = Vec::new();
+    let mut used = 0usize;
+    let original = std::mem::take(&mut result.content);
+    for item in original {
+        let item_text = match &item {
+            ToolContent::Text(s) => s.clone(),
+            ToolContent::Json(v) => v.to_string(),
+        };
+        let item_len = item_text.len();
+        if used + item_len <= body_budget {
+            kept.push(item);
+            used += item_len;
+            continue;
+        }
+        // Partial fit — slice item_text on a UTF-8 char boundary so we
+        // never produce invalid UTF-8 mid-truncation.
+        let remaining = body_budget.saturating_sub(used);
+        if remaining > 0 {
+            let mut cut = remaining.min(item_text.len());
+            while cut > 0 && !item_text.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            if cut > 0 {
+                kept.push(ToolContent::Text(item_text[..cut].to_string()));
+            }
+        }
+        break;
+    }
+
+    kept.push(ToolContent::Text(footer));
+    result.content = kept;
+}
+
 #[cfg(test)]
 mod tests {
     use std::future::Future;
@@ -2468,43 +2516,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn policy_result_too_large_fires() {
+    async fn policy_result_too_large_truncates() {
+        // M3-D4: oversized results truncate in place with a footer
+        // instead of erroring. The model gets useful prefix data plus a
+        // clear note about how much was cut.
         let broker = Arc::new(Broker::new());
         let server = Arc::new(
             MockServer::new("chatty")
                 .with_tool("say")
-                .on_call(|_p| async { Ok(KernelToolResult::text("x".repeat(64))) }),
+                .on_call(|_p| async { Ok(KernelToolResult::text("x".repeat(200))) }),
         );
         broker
             .register(
                 server,
                 InstancePolicy {
                     call_timeout: Duration::from_secs(5),
-                    max_result_bytes: 32,
+                    max_result_bytes: 64,
                     max_concurrency: 4,
                 },
             )
             .await
             .unwrap();
 
-        let err = broker
+        let result = broker
             .call_tool(
                 params("chatty", "say"),
                 &CallContext::test(),
                 CancellationToken::new(),
             )
             .await
-            .unwrap_err();
+            .expect("oversized result should still succeed (truncated)");
+
+        use crate::mcp::ToolContent;
+        let combined: String = result
+            .content
+            .iter()
+            .map(|c| match c {
+                ToolContent::Text(s) => s.clone(),
+                ToolContent::Json(v) => v.to_string(),
+            })
+            .collect();
         assert!(
-            matches!(
-                err,
-                McpError::Policy(PolicyError::ResultTooLarge {
-                    size: 64,
-                    max: 32,
-                    ..
-                })
-            ),
-            "expected Policy(ResultTooLarge{{size:64,max:32}}), got {err:?}"
+            combined.contains("[truncated"),
+            "truncation footer missing, got: {combined:?}"
+        );
+        assert!(
+            combined.starts_with("xxx"),
+            "prefix preserved before footer, got: {combined:?}"
+        );
+        assert!(
+            !result.is_error,
+            "truncation must not flip is_error — model still gets data"
         );
     }
 

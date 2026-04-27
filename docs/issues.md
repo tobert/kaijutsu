@@ -63,8 +63,6 @@ following are explicit follow-ups that did not ship:
   request/result, run script, parse return.
 - **MCP `progress` → `StreamingBlockHandle` bridge.** External streaming
   tools wired the same way virtual tools will be.
-- **MCP output buffering.** Sliding-window buffer with backpressure for
-  chatty external servers; couples with `InstancePolicy::max_result_bytes`.
 - **Real resource-limit enforcement.** Admin surface for `InstancePolicy`,
   per-principal budgets, fair queuing.
 
