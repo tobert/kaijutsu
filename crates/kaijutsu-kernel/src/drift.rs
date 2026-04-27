@@ -498,6 +498,27 @@ impl DriftRouter {
         std::mem::take(&mut self.dead_letter)
     }
 
+    /// Read-only snapshot of the dead-letter queue (M2-B4).
+    ///
+    /// Non-consuming — pairs with `replay_dead_letter` for clients that
+    /// want to inspect failed drifts and selectively requeue.
+    pub fn dead_letters(&self) -> &[StagedDrift] {
+        &self.dead_letter
+    }
+
+    /// Move a dead-letter item back into the staging queue by id (M2-B4).
+    ///
+    /// Resets `retry_count` to 0 so the requeued item gets a full set of
+    /// retry attempts. Returns the requeued drift on success, or `None` if
+    /// no dead-letter entry has the given id.
+    pub fn replay_dead_letter(&mut self, id: u64) -> Option<StagedDrift> {
+        let pos = self.dead_letter.iter().position(|d| d.id == id)?;
+        let mut item = self.dead_letter.remove(pos);
+        item.retry_count = 0;
+        self.staging.push(item.clone());
+        Some(item)
+    }
+
     /// Get or create the ContextId for the "lost+found" context.
     ///
     /// Lazily creates and registers the context on first call. The caller is
@@ -837,6 +858,46 @@ mod tests {
         let drained = router.drain(None);
         assert_eq!(drained.len(), 2);
         assert!(router.queue().is_empty());
+    }
+
+    #[test]
+    fn test_dead_letters_inspect_and_replay() {
+        // M2-B4: dead_letters() reads non-consuming; replay_dead_letter
+        // re-queues a single item by id (resetting retry count).
+        let mut router = DriftRouter::new();
+        let src = ContextId::new();
+        let tgt = ContextId::new();
+        router
+            .register(src, Some("src"), None, PrincipalId::system())
+            .unwrap();
+        router
+            .register(tgt, Some("tgt"), None, PrincipalId::system())
+            .unwrap();
+        router
+            .stage(src, tgt, "fail".into(), None, DriftKind::Push)
+            .unwrap();
+        // Cycle drain→requeue MAX_DRIFT_RETRIES+1 times so the per-item
+        // retry_count actually crosses the threshold.
+        for _ in 0..=(MAX_DRIFT_RETRIES as usize) {
+            let drained = router.drain(None);
+            router.requeue(drained);
+        }
+
+        let dl = router.dead_letters();
+        assert_eq!(dl.len(), 1, "one item in DLQ, got {}", dl.len());
+        let id = dl[0].id;
+        // Inspect is non-consuming.
+        assert_eq!(router.dead_letters().len(), 1);
+
+        // Replay extracts it.
+        let replayed = router.replay_dead_letter(id).expect("replay returns drift");
+        assert_eq!(replayed.id, id);
+        assert_eq!(replayed.retry_count, 0, "retry_count reset on replay");
+        assert!(router.dead_letters().is_empty());
+        assert_eq!(router.queue().len(), 1, "replayed back into staging");
+
+        // Replay of a missing id is a no-op.
+        assert!(router.replay_dead_letter(99_999).is_none());
     }
 
     #[test]

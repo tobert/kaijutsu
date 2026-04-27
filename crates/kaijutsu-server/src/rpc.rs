@@ -4498,6 +4498,58 @@ impl kernel::Server for KernelImpl {
         }
     }
 
+    fn list_dead_letters(
+        self: Rc<Self>,
+        params: kernel::ListDeadLettersParams,
+        mut results: kernel::ListDeadLettersResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let _trace_guard = extract_rpc_trace(p.get_trace(), "list_dead_letters").entered();
+        let kernel = self.kernel.kernel.clone();
+        Promise::from_future(async move {
+            let drift = kernel.drift().read().await;
+            let items = drift.dead_letters().to_vec();
+            drop(drift);
+            let count = items.len() as u32;
+            let mut out = results.get().init_items(count);
+            for (i, dl) in items.iter().enumerate() {
+                let mut row = out.reborrow().get(i as u32);
+                row.set_id(dl.id);
+                row.set_source_ctx(dl.source_ctx.as_bytes());
+                row.set_target_ctx(dl.target_ctx.as_bytes());
+                row.set_content(&dl.content);
+                if let Some(ref m) = dl.source_model {
+                    row.set_source_model(m);
+                    row.set_has_source_model(true);
+                } else {
+                    row.set_source_model("");
+                    row.set_has_source_model(false);
+                }
+                row.set_drift_kind(dl.drift_kind.as_str());
+                row.set_created_at(dl.created_at);
+                row.set_retry_count(dl.retry_count);
+            }
+            Ok(())
+        })
+    }
+
+    fn replay_dead_letter(
+        self: Rc<Self>,
+        params: kernel::ReplayDeadLetterParams,
+        mut results: kernel::ReplayDeadLetterResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let _trace_guard = extract_rpc_trace(p.get_trace(), "replay_dead_letter").entered();
+        let id = p.get_id();
+        let kernel = self.kernel.kernel.clone();
+        Promise::from_future(async move {
+            let mut drift = kernel.drift().write().await;
+            let replayed = drift.replay_dead_letter(id).is_some();
+            results.get().set_replayed(replayed);
+            Ok(())
+        })
+    }
+
     fn context_leave(
         self: Rc<Self>,
         params: kernel::ContextLeaveParams,

@@ -1210,6 +1210,31 @@ interface Kernel {
   # Idempotent: returns true if the session held a binding to that
   # context, false otherwise.
   contextLeave @94 (contextId :Data, trace :TraceContext) -> (left :Bool);
+
+  # Inspect the drift router's dead-letter queue (M2-B4). Non-consuming
+  # — pairs with replayDeadLetter. Drifts land here when MAX_DRIFT_RETRIES
+  # is exceeded or the target context unregisters before delivery.
+  listDeadLetters @95 (trace :TraceContext) -> (items :List(DeadLetter));
+
+  # Replay a dead-letter item by id: extract from DLQ, reset retry count,
+  # push back to the staging queue for another flush attempt. Returns
+  # `replayed = false` when the id isn't present (already drained or
+  # never queued).
+  replayDeadLetter @96 (id :UInt64, trace :TraceContext) -> (replayed :Bool);
+}
+
+# A staged drift that exceeded its retry budget or whose target dropped
+# out of the drift router. Mirrors `kaijutsu_kernel::drift::StagedDrift`.
+struct DeadLetter {
+  id @0 :UInt64;
+  sourceCtx @1 :Data;
+  targetCtx @2 :Data;
+  content @3 :Text;
+  sourceModel @4 :Text;       # empty when not known
+  hasSourceModel @5 :Bool;
+  driftKind @6 :Text;
+  createdAt @7 :UInt64;
+  retryCount @8 :UInt32;
 }
 
 # ============================================================================

@@ -76,8 +76,6 @@ following are explicit follow-ups that did not ship:
 - **`KernelDb` connection pool.** Currently `Arc<parking_lot::Mutex<KernelDb>>`
   in `block_store.rs:73`. Every RPC reads/writes through one lock. Migrate
   to `r2d2` / `sqlx` for concurrent reads.
-- **Dead-letter queue RPC.** Inspect / replay failed tool executions.
-  Requires new capnp method.
 - **Config CRDT ops.** Config backend needs DTE integration so changes
   replicate across peers.
 - **CRDT `order_index` BTreeMap.** `blocks_ordered()` is O(N log N).
