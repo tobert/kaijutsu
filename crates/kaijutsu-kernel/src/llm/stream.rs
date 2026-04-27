@@ -298,6 +298,14 @@ impl StreamRequest {
                                             input.clone(),
                                         ))
                                     }
+                                    super::ContentBlock::Reasoning { text, signature } => {
+                                        Some(AssistantContent::Reasoning(
+                                            rig::message::Reasoning::new_with_signature(
+                                                text,
+                                                signature.clone(),
+                                            ),
+                                        ))
+                                    }
                                     _ => None,
                                 })
                                 .collect();
@@ -742,6 +750,87 @@ mod tests {
             saw_marker,
             "missing data must surface as text marker, got {user:?}"
         );
+    }
+
+    #[test]
+    fn reasoning_block_converts_to_rig_assistant_reasoning() {
+        use super::super::{ContentBlock, Message, MessageContent, Role};
+        use rig::message::{AssistantContent, Message as RigMessage};
+
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: MessageContent::Blocks(vec![
+                ContentBlock::Reasoning {
+                    text: "let me think about this".to_string(),
+                    signature: Some("anthropic-sig-xyz".to_string()),
+                },
+                ContentBlock::Text {
+                    text: "okay, here's my answer".to_string(),
+                },
+            ]),
+        }];
+
+        let req = StreamRequest::new("claude-haiku-4-5", messages).to_rig_request();
+        let history: Vec<_> = req.chat_history.into_iter().collect();
+        let assistant = match history.first().expect("one assistant msg") {
+            RigMessage::Assistant { content, .. } => content.iter().collect::<Vec<_>>(),
+            other => panic!("expected Assistant, got {other:?}"),
+        };
+        assert!(
+            assistant
+                .iter()
+                .any(|c| matches!(c, AssistantContent::Reasoning(_))),
+            "Reasoning content block must surface as AssistantContent::Reasoning, got {assistant:?}"
+        );
+        assert!(
+            assistant
+                .iter()
+                .any(|c| matches!(c, AssistantContent::Text(_))),
+            "text content block must coexist with reasoning, got {assistant:?}"
+        );
+    }
+
+    #[test]
+    fn with_reasoning_helper_drops_empty_text() {
+        use super::super::{Message, MessageContent};
+
+        let msg = Message::with_reasoning_text_and_tool_uses(
+            Some(("".to_string(), None)),
+            None,
+            vec![],
+        );
+        match msg.content {
+            MessageContent::Blocks(blocks) => assert!(
+                blocks.is_empty(),
+                "empty reasoning text should not produce a content block"
+            ),
+            _ => panic!("expected Blocks"),
+        }
+    }
+
+    #[test]
+    fn with_reasoning_helper_includes_text_and_tool_uses() {
+        use super::super::{ContentBlock, Message, MessageContent};
+
+        let tool_use = ContentBlock::ToolUse {
+            id: "toolu_1".to_string(),
+            name: "read_file".to_string(),
+            input: serde_json::json!({"path": "/etc/hosts"}),
+        };
+        let msg = Message::with_reasoning_text_and_tool_uses(
+            Some(("thinking".to_string(), Some("sig".to_string()))),
+            Some("ok".to_string()),
+            vec![tool_use],
+        );
+        match msg.content {
+            MessageContent::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 3);
+                assert!(matches!(blocks[0], ContentBlock::Reasoning { .. }));
+                assert!(matches!(blocks[1], ContentBlock::Text { .. }));
+                assert!(matches!(blocks[2], ContentBlock::ToolUse { .. }));
+            }
+            _ => panic!("expected Blocks"),
+        }
     }
 
     #[test]

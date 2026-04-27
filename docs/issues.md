@@ -14,9 +14,6 @@ The hydration loop in `crates/kaijutsu-kernel/src/llm/mod.rs` (around
 `hydrate_from_blocks`, ~line 1020) is the highest-leverage surface for
 agent embodiment. Several known gaps:
 
-- **Thinking is unconditionally skipped** (`llm/mod.rs:1031`). Cross-turn
-  reasoning continuity is lost. At minimum preserve thinking across
-  tool-use iterations within a single `process_llm_stream` call.
 - **System prompt has no situational awareness** —
   `assets/defaults/system.md` is loaded verbatim. No context name, peers,
   active surface, drift state, or available tools. Assemble per-call;

@@ -397,6 +397,11 @@ async fn process_llm_stream(
         > = std::collections::HashMap::new();
         // Collect text output for conversation history
         let mut assistant_text = String::new();
+        // Collect thinking output for in-call continuity (A3). Reset per
+        // iteration so it represents *this* turn's reasoning, not prior
+        // turns'. Cross-turn continuity stays out of scope — the hydrator
+        // continues to skip Thinking blocks in CRDT history per design.
+        let mut assistant_thinking = String::new();
 
         log::debug!("Entering stream event loop");
         let mut stream_cancelled = false;
@@ -447,6 +452,10 @@ async fn process_llm_stream(
                 }
 
                 StreamEvent::ThinkingDelta(text) => {
+                    // In-call thinking continuity (A3): accumulate alongside
+                    // the CRDT block so the next agentic-loop iteration can
+                    // include reasoning in the assistant message.
+                    assistant_thinking.push_str(&text);
                     if let Some(ref block_id) = current_block_id
                         && let Err(e) = documents.append_text_as(
                             context_id,
@@ -858,13 +867,17 @@ async fn process_llm_stream(
             }
         }
 
-        // Add assistant message with tool uses to conversation
-        messages.push(LlmMessage::with_tool_uses(
-            if assistant_text.is_empty() {
-                None
-            } else {
-                Some(assistant_text)
-            },
+        // Add assistant message with tool uses to conversation. Preserve
+        // accumulated thinking (A3) so multi-step tool turns keep the
+        // model's chain-of-thought intact within this `process_llm_stream`
+        // invocation. Signature is `None` until extended thinking is
+        // wired through the rig adapter.
+        let reasoning = (!assistant_thinking.is_empty())
+            .then(|| (std::mem::take(&mut assistant_thinking), None));
+        let text = (!assistant_text.is_empty()).then(|| std::mem::take(&mut assistant_text));
+        messages.push(LlmMessage::with_reasoning_text_and_tool_uses(
+            reasoning,
+            text,
             assistant_tool_uses,
         ));
 

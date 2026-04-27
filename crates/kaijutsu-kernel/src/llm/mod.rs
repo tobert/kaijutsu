@@ -109,6 +109,14 @@ pub enum ContentBlock {
         media_type: String,
         data_base64: Option<String>,
     },
+    /// Assistant reasoning preserved across tool-use iterations within a
+    /// single agentic-loop turn (A3). Signature is provider-specific
+    /// (Anthropic extended-thinking requires it for cross-tool-use turns);
+    /// `None` is fine when extended thinking is not enabled.
+    Reasoning {
+        text: String,
+        signature: Option<String>,
+    },
 }
 
 /// Message content - either simple text or structured blocks.
@@ -156,7 +164,27 @@ impl Message {
 
     /// Create an assistant message with tool uses.
     pub fn with_tool_uses(text: Option<String>, tool_uses: Vec<ContentBlock>) -> Self {
+        Self::with_reasoning_text_and_tool_uses(None, text, tool_uses)
+    }
+
+    /// Create an assistant message with optional reasoning, text, and tool
+    /// uses. Used by the agentic-loop driver to preserve thinking across
+    /// tool-use iterations (A3). Reasoning blocks are emitted *before* text
+    /// and tool uses so providers see the reasoning chain in order.
+    pub fn with_reasoning_text_and_tool_uses(
+        reasoning: Option<(String, Option<String>)>,
+        text: Option<String>,
+        tool_uses: Vec<ContentBlock>,
+    ) -> Self {
         let mut blocks = Vec::new();
+        if let Some((reasoning_text, signature)) = reasoning
+            && !reasoning_text.is_empty()
+        {
+            blocks.push(ContentBlock::Reasoning {
+                text: reasoning_text,
+                signature,
+            });
+        }
         if let Some(t) = text {
             blocks.push(ContentBlock::Text { text: t });
         }
@@ -1361,6 +1389,23 @@ mod tests {
                 assert_eq!(blocks.len(), 1);
             }
             _ => panic!("Expected blocks"),
+        }
+    }
+
+    #[test]
+    fn content_block_reasoning_serde_roundtrip() {
+        let block = ContentBlock::Reasoning {
+            text: "let me work through this".to_string(),
+            signature: Some("provider-sig-xyz".to_string()),
+        };
+        let json = serde_json::to_string(&block).unwrap();
+        let back: ContentBlock = serde_json::from_str(&json).unwrap();
+        match back {
+            ContentBlock::Reasoning { text, signature } => {
+                assert_eq!(text, "let me work through this");
+                assert_eq!(signature.as_deref(), Some("provider-sig-xyz"));
+            }
+            other => panic!("expected Reasoning, got {other:?}"),
         }
     }
 
