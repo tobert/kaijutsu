@@ -8,12 +8,6 @@ makes the work concrete. When an item ships, delete the entry.
 
 ---
 
-## LLM hydration / agent embodiment
-
-The hydration loop in `crates/kaijutsu-kernel/src/llm/mod.rs` (around
-`hydrate_from_blocks`, ~line 1020) is the highest-leverage surface for
-agent embodiment. Several known gaps:
-
 ## User presence (novel surface)
 
 The compose input is a shared CRDT document (`editInput @75`,
