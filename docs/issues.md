@@ -162,9 +162,6 @@ Holographic shader trio + entry animation shipped. Open:
   translate to VFS mounts on join.
 - **kj CLI binary.** Standalone `kj` for headless scripting; thin
   adapter over `KjDispatcher`.
-- **Scratch / self context.** A default per-user context for staging
-  drift or notes (DM-yourself pattern). Just a context with a well-known
-  label — no schema work needed.
 - **Distill model selection.** `formation_edges`-style `auto_distill`
   defaults to the source context's model (potentially Opus). Add a
   `distill_model` knob so cheap models can do summarization.

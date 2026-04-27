@@ -23,6 +23,7 @@ impl KjDispatcher {
             "current" | "show" => self.context_current(argv, caller).await,
             "switch" | "sw" => self.context_switch(argv, caller).await,
             "create" | "new" => self.context_create(argv, caller).await,
+            "scratch" | "self" => self.context_scratch(caller).await,
             "set" => self.context_set(argv, caller).await,
             "unset" => self.context_unset(argv, caller),
             "log" => self.context_log(argv, caller),
@@ -276,6 +277,68 @@ impl KjDispatcher {
         }
 
         KjResult::ok(format!("created context '{}' ({})", label, new_id.short()))
+    }
+
+    /// `kj context scratch` — get-or-create the well-known "scratch"
+    /// context (the DM-yourself pattern, M5-F7). Idempotent: returns
+    /// the existing context if labeled "scratch" already exists.
+    async fn context_scratch(&self, caller: &KjCaller) -> KjResult {
+        const SCRATCH_LABEL: &str = "scratch";
+        let kernel_id = self.kernel_id();
+
+        // Resolve the label first; if found, return its id.
+        {
+            let db = self.kernel_db().lock();
+            if let Ok(id) = db.resolve_context(kernel_id, SCRATCH_LABEL) {
+                return KjResult::ok(format!(
+                    "scratch context exists: {} ({})",
+                    SCRATCH_LABEL,
+                    id.short()
+                ));
+            }
+        }
+
+        // Otherwise create it.
+        let new_id = ContextId::new();
+        {
+            let db = self.kernel_db().lock();
+            let default_ws =
+                match db.get_or_create_default_workspace(kernel_id, caller.principal_id) {
+                    Ok(id) => id,
+                    Err(e) => return KjResult::Err(format!("kj context scratch: {e}")),
+                };
+            let row = ContextRow {
+                context_id: new_id,
+                kernel_id,
+                label: Some(SCRATCH_LABEL.to_string()),
+                provider: None,
+                model: None,
+                system_prompt: None,
+                consent_mode: ConsentMode::Collaborative,
+                context_state: ContextState::Live,
+                created_at: kaijutsu_types::now_millis() as i64,
+                created_by: caller.principal_id,
+                forked_from: None,
+                fork_kind: None,
+                archived_at: None,
+                workspace_id: None,
+                preset_id: None,
+            };
+            if let Err(e) = db.insert_context_with_document(&row, default_ws) {
+                return KjResult::Err(format!("kj context scratch: {e}"));
+            }
+        }
+        {
+            let mut drift = self.drift_router().write().await;
+            if let Err(e) = drift.register(new_id, Some(SCRATCH_LABEL), None, caller.principal_id) {
+                return KjResult::Err(format!("kj context scratch: {e}"));
+            }
+        }
+        KjResult::ok(format!(
+            "created scratch context: {} ({})",
+            SCRATCH_LABEL,
+            new_id.short()
+        ))
     }
 
     /// `kj context set <ctx> [--model p/m] [--system-prompt text] [--tool-filter spec] [--consent mode] [--cwd path] [--env KEY=VALUE]`
@@ -855,6 +918,32 @@ mod tests {
         assert!(result.is_ok());
         let msg = result.message();
         assert!(msg.contains("myctx *"), "output: {msg}");
+    }
+
+    #[tokio::test]
+    async fn context_scratch_creates_then_idempotent() {
+        // M5-F7: `kj context scratch` creates the well-known "scratch"
+        // context the first time and is a read on subsequent calls.
+        let d = test_dispatcher().await;
+        let c = test_caller();
+
+        let first = d.dispatch(&[s("context"), s("scratch")], &c).await;
+        assert!(first.is_ok(), "first call failed: {}", first.message());
+        assert!(
+            first.message().contains("created scratch"),
+            "first call should report creation, got: {}",
+            first.message()
+        );
+
+        // Second call must not re-create — db.resolve_context("scratch")
+        // returns the existing id.
+        let second = d.dispatch(&[s("context"), s("scratch")], &c).await;
+        assert!(second.is_ok(), "second call failed: {}", second.message());
+        assert!(
+            second.message().contains("scratch context exists"),
+            "second call should report existing, got: {}",
+            second.message()
+        );
     }
 
     #[tokio::test]
