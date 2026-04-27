@@ -226,7 +226,7 @@ pub fn handle_input_doc_events(
 
     for ServerEventMessage(event) in server_events.read() {
         match event {
-            ServerEvent::InputTextOps { context_id, ops } => {
+            ServerEvent::InputTextOps { context_id, ops, .. } => {
                 if let Some(cached) = doc_cache.get_mut(*context_id) {
                     // Suppress late TextOps during pending clear — they carry
                     // stale inserts from before the server's clear_input.

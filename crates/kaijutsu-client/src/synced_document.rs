@@ -1000,6 +1000,7 @@ mod tests {
             context_id: ctx,
             block_id: BlockId::new(ctx, PrincipalId::new(), 999),
             ops: vec![0xFF, 0xFE, 0xFD],
+            seq_num: 0,
         };
         let effect = sd.apply_event(&corrupt_event);
         // Should still return Updated (error is logged but doesn't crash)

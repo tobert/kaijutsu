@@ -332,11 +332,14 @@ interface BlockEvents {
   onBlockCollapsed @2 (contextId :Data, blockId :BlockId, collapsed :Bool);
   onBlockMoved @3 (contextId :Data, blockId :BlockId, afterId :BlockId, hasAfterId :Bool);
   onBlockStatusChanged @4 (contextId :Data, blockId :BlockId, status :Status, outputData :OutputData);
-  onBlockTextOps @5 (contextId :Data, blockId :BlockId, ops :Data);
+  # `seqNum` is a per-context monotonic counter (M2-B2). Clients use it
+  # to detect dropped events when the broadcast channel overflows; on a
+  # gap, re-fetch via `getContextSync` / `getInputState`.
+  onBlockTextOps @5 (contextId :Data, blockId :BlockId, ops :Data, seqNum :UInt64);
   onSyncReset @6 (contextId :Data, generation :UInt64);
 
   # Input document events (compose scratchpad)
-  onInputTextOps @7 (contextId :Data, ops :Data);
+  onInputTextOps @7 (contextId :Data, ops :Data, seqNum :UInt64);
   onInputCleared @8 (contextId :Data);
 
   # Session control events (server → client)

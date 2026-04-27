@@ -3607,6 +3607,7 @@ mod tests {
                 context_id: ctx_id,
                 block_id,
                 ops: ops_bytes,
+                seq_num: 0,
             },
         );
 
@@ -3821,6 +3822,7 @@ mod tests {
                 context_id: ctx_id,
                 block_id: last_block_id,
                 ops,
+                seq_num: 0,
             },
         );
 
@@ -3917,6 +3919,7 @@ mod tests {
                 context_id: ctx_id,
                 block_id,
                 ops: vec![0xBA, 0xAD, 0xF0, 0x0D],
+                seq_num: 0,
             },
         );
 

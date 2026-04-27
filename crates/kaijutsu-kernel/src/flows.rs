@@ -253,6 +253,11 @@ pub enum BlockFlow {
         /// Origin of this operation (Local or Remote).
         #[serde(default)]
         source: OpSource,
+        /// Per-context monotonic sequence number (M2-B2). Lets clients
+        /// detect dropped events when the broadcast channel overflows;
+        /// CRDT data is never lost — only the realtime notification.
+        #[serde(default)]
+        seq_num: u64,
     },
 
     /// A block was deleted.
@@ -509,11 +514,6 @@ use std::collections::HashMap;
 /// Overflow: receivers use `set_overflow(true)` so the oldest message is silently
 /// dropped when a receiver falls behind. The sender never blocks.
 ///
-/// TODO: Add a monotonic sequence number to `BlockFlow::TextOps` so clients
-/// can detect gaps when the server-side bridge subscription overflows. On gap
-/// detection the client should re-fetch `ops_since()` to recover missed text
-/// ops and display complete block content. The CRDT data is never lost — only
-/// the realtime notification is missed.
 pub struct FlowBus<T: Clone + Send + 'static> {
     /// Per-topic senders.
     topics: HashMap<&'static str, async_broadcast::Sender<FlowMessage<T>>>,
@@ -992,6 +992,10 @@ pub enum InputDocFlow {
         ops: Arc<[u8]>,
         /// Origin of this operation.
         source: OpSource,
+        /// Per-context monotonic sequence number (M2-B2). Mirrors the
+        /// same gap-detection idiom on `BlockFlow::TextOps`.
+        #[serde(default)]
+        seq_num: u64,
     },
 
     /// The input document was cleared (after submit).
@@ -1202,6 +1206,7 @@ mod tests {
                 block_id: id,
                 ops: Arc::from(vec![1u8, 2, 3]),
                 source: OpSource::Local,
+                seq_num: 0,
             });
         }
 
@@ -1245,6 +1250,7 @@ mod tests {
             block_id: id,
             ops: Arc::from(vec![1u8]),
             source: OpSource::Local,
+            seq_num: 0,
         });
         bus.publish(BlockFlow::Deleted {
             context_id: ctx,
@@ -1299,6 +1305,7 @@ mod tests {
                 block_id: id,
                 ops: Arc::from(vec![0u8]),
                 source: OpSource::Local,
+                seq_num: 0,
             });
         }
 
@@ -1499,6 +1506,7 @@ mod tests {
             context_id: ctx,
             ops: Arc::from(vec![1u8]),
             source: OpSource::Local,
+            seq_num: 0,
         });
         bus.publish(InputDocFlow::Cleared { context_id: ctx });
 

@@ -185,6 +185,11 @@ pub struct BlockStore {
     input_journal_seqs: DashMap<ContextId, AtomicU64>,
     /// Per-input-doc uncompacted op counts (for compaction trigger).
     input_uncompacted: DashMap<ContextId, AtomicU64>,
+    /// Per-context monotonic seq for `BlockFlow::TextOps` (M2-B2).
+    /// Allocated on first emit; lets clients detect overflow gaps.
+    block_text_seqs: DashMap<ContextId, AtomicU64>,
+    /// Per-context monotonic seq for `InputDocFlow::TextOps` (M2-B2).
+    input_text_seqs: DashMap<ContextId, AtomicU64>,
     /// Database for persistence (unified KernelDb).
     db: Option<DbHandle>,
     /// Kernel ID for document rows.
@@ -207,6 +212,8 @@ impl BlockStore {
             input_docs: DashMap::new(),
             input_journal_seqs: DashMap::new(),
             input_uncompacted: DashMap::new(),
+            block_text_seqs: DashMap::new(),
+            input_text_seqs: DashMap::new(),
             db: None,
             kernel_id: None,
             default_workspace_id: None,
@@ -223,6 +230,8 @@ impl BlockStore {
             input_docs: DashMap::new(),
             input_journal_seqs: DashMap::new(),
             input_uncompacted: DashMap::new(),
+            block_text_seqs: DashMap::new(),
+            input_text_seqs: DashMap::new(),
             db: None,
             kernel_id: None,
             default_workspace_id: None,
@@ -244,6 +253,8 @@ impl BlockStore {
             input_docs: DashMap::new(),
             input_journal_seqs: DashMap::new(),
             input_uncompacted: DashMap::new(),
+            block_text_seqs: DashMap::new(),
+            input_text_seqs: DashMap::new(),
             db: Some(db),
             kernel_id: Some(kernel_id),
             default_workspace_id: Some(default_workspace_id),
@@ -266,6 +277,8 @@ impl BlockStore {
             input_docs: DashMap::new(),
             input_journal_seqs: DashMap::new(),
             input_uncompacted: DashMap::new(),
+            block_text_seqs: DashMap::new(),
+            input_text_seqs: DashMap::new(),
             db: Some(db),
             kernel_id: Some(kernel_id),
             default_workspace_id: Some(default_workspace_id),
@@ -290,6 +303,27 @@ impl BlockStore {
         if let Some(bus) = &self.block_flows {
             bus.publish(flow);
         }
+    }
+
+    /// Allocate the next monotonic seq number for `BlockFlow::TextOps` in
+    /// the given context. Per-context (not per-block) — gap detection is
+    /// at context granularity, which is enough to trigger an `ops_since`
+    /// re-fetch when the broadcast channel overflows.
+    fn next_block_text_seq(&self, context_id: ContextId) -> u64 {
+        let counter = self
+            .block_text_seqs
+            .entry(context_id)
+            .or_insert_with(|| AtomicU64::new(0));
+        counter.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Same as `next_block_text_seq` but for input-doc text ops.
+    fn next_input_text_seq(&self, context_id: ContextId) -> u64 {
+        let counter = self
+            .input_text_seqs
+            .entry(context_id)
+            .or_insert_with(|| AtomicU64::new(0));
+        counter.fetch_add(1, Ordering::SeqCst)
     }
 
     /// Get the current agent ID.
@@ -1267,11 +1301,13 @@ impl BlockStore {
         self.journal_op(context_id, ops)?;
 
         // Emit CRDT ops for proper sync
+        let seq_num = self.next_block_text_seq(context_id);
         self.emit(BlockFlow::TextOps {
             context_id,
             block_id: *block_id,
             ops: Arc::from(ops_bytes),
             source: OpSource::Local,
+            seq_num,
         });
 
         Ok(())
@@ -1510,11 +1546,13 @@ impl BlockStore {
         self.journal_op(context_id, ops)?;
 
         // Emit CRDT ops for proper sync
+        let seq_num = self.next_block_text_seq(context_id);
         self.emit(BlockFlow::TextOps {
             context_id,
             block_id: *block_id,
             ops: Arc::from(ops_bytes),
             source: OpSource::Local,
+            seq_num,
         });
 
         Ok(())
@@ -1607,7 +1645,7 @@ impl BlockStore {
                 postcard::to_allocvec(&ops).unwrap_or_default();
             (
                 version,
-                Self::diff_block_events(context_id, &before, &after, ops_bytes),
+                self.diff_block_events(context_id, &before, &after, ops_bytes),
                 ops,
             )
         };
@@ -1624,6 +1662,7 @@ impl BlockStore {
     /// collapsed changes, and text changes. All events carry `OpSource::Remote`
     /// and share the same ops blob (CRDT dedup handles multiple merges).
     fn diff_block_events(
+        &self,
         context_id: ContextId,
         before: &[BlockSnapshot],
         after: &[BlockSnapshot],
@@ -1691,6 +1730,7 @@ impl BlockStore {
                         block_id: snap.id,
                         ops: ops.clone(),
                         source: OpSource::Remote,
+                        seq_num: self.next_block_text_seq(context_id),
                     });
                 }
             }
@@ -2132,10 +2172,12 @@ impl BlockStore {
 
         self.journal_and_maybe_compact_input(context_id, &ops)?;
 
+        let seq_num = self.next_input_text_seq(context_id);
         self.emit_input(InputDocFlow::TextOps {
             context_id,
             ops: Arc::from(ops.clone()),
             source: crate::flows::OpSource::Local,
+            seq_num,
         });
 
         Ok(ops)
@@ -2200,10 +2242,12 @@ impl BlockStore {
 
         self.journal_and_maybe_compact_input(context_id, ops_bytes)?;
 
+        let seq_num = self.next_input_text_seq(context_id);
         self.emit_input(InputDocFlow::TextOps {
             context_id,
             ops: Arc::from(ops_bytes.to_vec()),
             source: crate::flows::OpSource::Remote,
+            seq_num,
         });
 
         Ok(version)
@@ -2832,6 +2876,36 @@ mod tests {
             .unwrap();
         let v2 = store.version(ctx).unwrap();
         assert!(v2 > v1, "version should advance again (v1={}, v2={})", v1, v2);
+    }
+
+    #[test]
+    fn test_text_ops_seq_monotonic_per_context() {
+        // M2-B2: each emitted TextOps event carries a per-context monotonic
+        // seq so clients can detect dropped broadcasts.
+        let store = BlockStore::new(test_agent());
+        let ctx = ContextId::new();
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+        let s0 = store.next_block_text_seq(ctx);
+        let s1 = store.next_block_text_seq(ctx);
+        let s2 = store.next_block_text_seq(ctx);
+        assert_eq!(s0, 0);
+        assert_eq!(s1, 1);
+        assert_eq!(s2, 2);
+
+        // Different context starts at 0 again.
+        let other = ContextId::new();
+        store
+            .create_document(other, DocumentKind::Conversation, None)
+            .unwrap();
+        assert_eq!(store.next_block_text_seq(other), 0);
+
+        // Input text seq is its own counter.
+        let i0 = store.next_input_text_seq(ctx);
+        let i1 = store.next_input_text_seq(ctx);
+        assert_eq!(i0, 0);
+        assert_eq!(i1, 1);
     }
 
     #[test]

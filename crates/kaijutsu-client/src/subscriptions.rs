@@ -39,6 +39,10 @@ pub enum ServerEvent {
         context_id: ContextId,
         block_id: BlockId,
         ops: Vec<u8>,
+        /// Per-context monotonic seq (M2-B2). Consumers can detect gaps
+        /// by tracking the last-seen seq per context and triggering an
+        /// `ops_since` re-fetch when the next seq is non-consecutive.
+        seq_num: u64,
     },
     /// A block's execution status changed (Pending → Running → Done/Error).
     BlockStatusChanged {
@@ -77,7 +81,12 @@ pub enum ServerEvent {
         generation: u64,
     },
     /// CRDT text operations applied to a context's input document.
-    InputTextOps { context_id: ContextId, ops: Vec<u8> },
+    InputTextOps {
+        context_id: ContextId,
+        ops: Vec<u8>,
+        /// Per-context monotonic seq (M2-B2).
+        seq_num: u64,
+    },
     /// A context's input document was cleared (after submit).
     InputCleared { context_id: ContextId },
     /// An MCP resource's content was updated.
@@ -434,10 +443,12 @@ impl block_events::Server for BlockEventsForwarder {
             Err(e) => return Promise::err(e),
         };
 
+        let seq_num = params.get_seq_num();
         let event = ServerEvent::BlockTextOps {
             context_id,
             block_id,
             ops,
+            seq_num,
         };
         if self.event_tx.send(event).is_err() {
             tracing::warn!("Event channel closed, dropping BlockTextOps event");
@@ -498,7 +509,12 @@ impl block_events::Server for BlockEventsForwarder {
             Err(e) => return Promise::err(e),
         };
 
-        let event = ServerEvent::InputTextOps { context_id, ops };
+        let seq_num = params.get_seq_num();
+        let event = ServerEvent::InputTextOps {
+            context_id,
+            ops,
+            seq_num,
+        };
         if self.event_tx.send(event).is_err() {
             tracing::warn!("Event channel closed, dropping InputTextOps event");
         }

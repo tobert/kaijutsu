@@ -1655,13 +1655,14 @@ impl kernel::Server for KernelImpl {
                                     }
                                     req.send().promise.await.is_ok()
                                 }
-                                BlockFlow::TextOps { context_id, ref block_id, ref ops, .. } => {
+                                BlockFlow::TextOps { context_id, ref block_id, ref ops, seq_num, .. } => {
                                     let mut req = callback.on_block_text_ops_request();
                                     {
                                         let mut params = req.get();
                                         params.set_context_id(context_id.as_bytes());
                                         set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
                                         params.set_ops(ops);
+                                        params.set_seq_num(seq_num);
                                     }
                                     req.send().promise.await.is_ok()
                                 }
@@ -1694,12 +1695,13 @@ impl kernel::Server for KernelImpl {
                             }
                         } => {
                             match msg.payload {
-                                InputDocFlow::TextOps { context_id, ref ops, .. } => {
+                                InputDocFlow::TextOps { context_id, ref ops, seq_num, .. } => {
                                     let mut req = callback.on_input_text_ops_request();
                                     {
                                         let mut params = req.get();
                                         params.set_context_id(context_id.as_bytes());
                                         params.set_ops(ops);
+                                        params.set_seq_num(seq_num);
                                     }
                                     req.send().promise.await.is_ok()
                                 }
@@ -4192,13 +4194,14 @@ impl kernel::Server for KernelImpl {
                                     }
                                     req.send().promise.await.is_ok()
                                 }
-                                BlockFlow::TextOps { context_id, ref block_id, ref ops, .. } => {
+                                BlockFlow::TextOps { context_id, ref block_id, ref ops, seq_num, .. } => {
                                     let mut req = callback.on_block_text_ops_request();
                                     {
                                         let mut params = req.get();
                                         params.set_context_id(context_id.as_bytes());
                                         set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
                                         params.set_ops(ops);
+                                        params.set_seq_num(seq_num);
                                     }
                                     req.send().promise.await.is_ok()
                                 }
@@ -4231,12 +4234,13 @@ impl kernel::Server for KernelImpl {
                             }
                         } => {
                             match msg.payload {
-                                InputDocFlow::TextOps { context_id, ref ops, .. } => {
+                                InputDocFlow::TextOps { context_id, ref ops, seq_num, .. } => {
                                     let mut req = callback.on_input_text_ops_request();
                                     {
                                         let mut params = req.get();
                                         params.set_context_id(context_id.as_bytes());
                                         params.set_ops(ops);
+                                        params.set_seq_num(seq_num);
                                     }
                                     req.send().promise.await.is_ok()
                                 }
