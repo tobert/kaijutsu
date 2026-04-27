@@ -166,8 +166,4 @@ Holographic shader trio + entry animation shipped. Open:
   defaults to the source context's model (potentially Opus). Add a
   `distill_model` knob so cheap models can do summarization.
 
-## Tests
-
-- **MCP remote-mode tests.** SSH-connected MCP code paths have no
-  integration coverage. Valuable but large scope.
 

@@ -2228,12 +2228,56 @@ impl kernel::Server for KernelImpl {
 
     fn call_mcp_tool(
         self: Rc<Self>,
-        _params: kernel::CallMcpToolParams,
-        _results: kernel::CallMcpToolResults,
+        params: kernel::CallMcpToolParams,
+        mut results: kernel::CallMcpToolResults,
     ) -> Promise<(), capnp::Error> {
-        Promise::err(capnp::Error::unimplemented(
-            "call_mcp_tool: external MCP tool calls go through Broker in Phase 2".into(),
-        ))
+        // M6-G3: route MCP tool calls through the Phase 1 broker so the
+        // SSH wire can exercise the same dispatch surface in-process and
+        // remote tests use. Tool names are resolved via the calling
+        // context's binding; a fresh binding seed is auto-populated by
+        // dispatch_tool_via_broker on first touch.
+        let p = pry!(params.get());
+        let _trace_guard = extract_rpc_trace(p.get_trace(), "call_mcp_tool").entered();
+        let call = pry!(p.get_call());
+        // Schema names the field `server` for legacy reasons; the tool
+        // routing today only uses tool name (the broker's binding picks
+        // the instance), so we ignore `server` and trust the binding.
+        let _server = pry!(pry!(call.get_server()).to_str()).to_owned();
+        let tool_name = pry!(pry!(call.get_tool()).to_str()).to_owned();
+        let arguments = pry!(pry!(call.get_arguments()).to_str()).to_owned();
+
+        let connection = self.connection.clone();
+        let kernel = self.kernel.clone();
+        Promise::from_future(async move {
+            let session_id = connection.borrow().session_id;
+            let principal_id = connection.borrow().principal.id;
+            let context_id = connection
+                .borrow()
+                .session_contexts
+                .get(&session_id)
+                .map(|r| *r)
+                .ok_or_else(|| {
+                    capnp::Error::failed(
+                        "no context joined — call joinContext first".into(),
+                    )
+                })?;
+            let exec_ctx = kaijutsu_kernel::ExecContext {
+                principal_id,
+                context_id,
+                cwd: std::path::PathBuf::from("/"),
+                session_id,
+                kernel_id: kernel.id,
+            };
+            let exec = kernel
+                .kernel
+                .dispatch_tool_via_broker(&tool_name, &arguments, &exec_ctx)
+                .await
+                .map_err(|e| capnp::Error::failed(e.to_string()))?;
+            let mut out = results.get().init_result();
+            out.set_content(&exec.stdout);
+            out.set_is_error(!exec.success);
+            Ok(())
+        })
     }
 
     // =========================================================================

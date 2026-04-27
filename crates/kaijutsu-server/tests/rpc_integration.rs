@@ -190,6 +190,85 @@ fn test_create_context_unique_ids() {
 }
 
 // ============================================================================
+// MCP Remote-Mode Tests (M6-G3)
+// ============================================================================
+
+#[test]
+fn test_call_mcp_tool_dispatches_builtin_over_ssh() {
+    // SSH-connected dispatch through call_mcp_tool. Exercises the full
+    // wire: client → SSH channel → capnp → rpc.rs → broker → builtin
+    // server → result back. Uses `whoami` (KernelInfoServer) — no LLM
+    // configured, no external state, deterministic shape.
+    run_local(async {
+        let addr = start_server().await;
+        let client = connect_client(addr).await;
+
+        let (kernel, _kernel_id) = client.attach_kernel().await.unwrap();
+        let ctx_id = kernel.create_context("mcp-remote-test").await.unwrap();
+        kernel.join_context(ctx_id, "test-mcp").await.unwrap();
+
+        let result = kernel
+            .call_mcp_tool("builtin.kernel_info", "whoami", &serde_json::json!({}))
+            .await
+            .expect("call_mcp_tool over SSH");
+        assert!(
+            !result.is_error,
+            "whoami should not be an error: content={}",
+            result.content
+        );
+        assert!(
+            !result.content.is_empty(),
+            "whoami should return non-empty content"
+        );
+    });
+}
+
+#[test]
+fn test_call_mcp_tool_unknown_tool_errors() {
+    // Unknown tool name surfaces over the wire as an Err, not a silent
+    // success. Locks in the error-propagation path through the SSH +
+    // capnp + broker stack.
+    run_local(async {
+        let addr = start_server().await;
+        let client = connect_client(addr).await;
+
+        let (kernel, _kernel_id) = client.attach_kernel().await.unwrap();
+        let ctx_id = kernel.create_context("mcp-remote-error").await.unwrap();
+        kernel.join_context(ctx_id, "test-mcp").await.unwrap();
+
+        let result = kernel
+            .call_mcp_tool("builtin.kernel_info", "no_such_tool", &serde_json::json!({}))
+            .await;
+        assert!(
+            result.is_err(),
+            "unknown tool should surface as Err over SSH, got: {result:?}"
+        );
+    });
+}
+
+#[test]
+fn test_call_mcp_tool_requires_joined_context() {
+    // Without a joined context, call_mcp_tool errors instead of falling
+    // back to a default — the dispatch path needs context_id to resolve
+    // the binding.
+    run_local(async {
+        let addr = start_server().await;
+        let client = connect_client(addr).await;
+
+        let (kernel, _kernel_id) = client.attach_kernel().await.unwrap();
+        // No join_context call.
+
+        let result = kernel
+            .call_mcp_tool("builtin.kernel_info", "whoami", &serde_json::json!({}))
+            .await;
+        assert!(
+            result.is_err(),
+            "call_mcp_tool without joined context should error, got: {result:?}"
+        );
+    });
+}
+
+// ============================================================================
 // Async Execute Tests
 // ============================================================================
 
