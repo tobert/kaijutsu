@@ -261,6 +261,83 @@ async fn policy_show_and_set_round_trip() {
 }
 
 #[tokio::test]
+async fn personas_list_define_apply_round_trip() {
+    // M3-D1: builtin.personas exposes list/define/apply. Defining a
+    // persona, applying it, then listing the calling context's tools
+    // should reflect the new binding.
+    let fx = setup().await;
+    // Seed binding so builtin.personas is visible.
+    let _ = fx
+        .kernel
+        .list_tool_defs_via_broker(fx.ctx_id, fx.exec_ctx.principal_id)
+        .await;
+
+    // Default seeded archetypes are visible from list.
+    let list = fx
+        .kernel
+        .dispatch_tool_via_broker("personas_list", "{}", &fx.exec_ctx)
+        .await
+        .expect("list");
+    let payload: serde_json::Value = serde_json::from_str(&list.stdout).expect("json");
+    let names: Vec<&str> = payload["personas"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter_map(|p| p["name"].as_str())
+        .collect();
+    for expected in ["coder", "explorer", "planner"] {
+        assert!(
+            names.contains(&expected),
+            "default persona {expected} missing, got: {names:?}"
+        );
+    }
+
+    // Define a custom persona.
+    let define = fx
+        .kernel
+        .dispatch_tool_via_broker(
+            "personas_define",
+            &serde_json::json!({
+                "name": "minimal",
+                "instances": ["builtin.kernel_info"],
+                "description": "Test persona — kernel info only."
+            })
+            .to_string(),
+            &fx.exec_ctx,
+        )
+        .await
+        .expect("define");
+    assert!(define.success, "define failed: {}", define.stderr);
+
+    // Apply it. Subsequent visible-tool list should be a strict subset.
+    let apply = fx
+        .kernel
+        .dispatch_tool_via_broker(
+            "personas_apply",
+            &serde_json::json!({"name": "minimal"}).to_string(),
+            &fx.exec_ctx,
+        )
+        .await
+        .expect("apply");
+    assert!(apply.success, "apply failed: {}", apply.stderr);
+
+    let visible_after = fx
+        .kernel
+        .list_tool_defs_via_broker(fx.ctx_id, fx.exec_ctx.principal_id)
+        .await;
+    let names_after: Vec<&str> = visible_after.iter().map(|(n, _, _)| n.as_str()).collect();
+    // Only kernel_info tools (whoami) should remain — block_create etc. dropped.
+    assert!(
+        names_after.contains(&"whoami"),
+        "expected whoami, got {names_after:?}"
+    );
+    assert!(
+        !names_after.contains(&"block_create"),
+        "minimal persona should drop block tools, got {names_after:?}"
+    );
+}
+
+#[tokio::test]
 async fn unknown_tool_name_surfaces_tool_not_found() {
     let fx = setup().await;
 

@@ -474,6 +474,14 @@ impl Kernel {
             .register_silently(policy_server, InstancePolicy::default())
             .await?;
 
+        // M3-D1: builtin.personas — named binding archetypes.
+        let personas_server = Arc::new(
+            crate::mcp::servers::BuiltinPersonasServer::new(Arc::downgrade(&self.broker)),
+        );
+        self.broker
+            .register_silently(personas_server, InstancePolicy::default())
+            .await?;
+
         Ok(())
     }
 

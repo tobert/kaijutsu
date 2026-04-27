@@ -37,11 +37,12 @@ tool-system redesign doc.
 The MCP-centric kernel landed in five phases plus hook persistence; the
 following are explicit follow-ups that did not ship:
 
-- **Personas.** Bundle a `ContextToolBinding` with `ListTools` hooks into
-  named archetypes (`planner`, `coder`, `explorer`, `sound engineer`).
-  Phase 5's `HookPhase::ListTools` is the mechanism this composes on.
-  Likely surface: `builtin.personas` admin server with `list` / `apply` /
-  `define`; persistence alongside bindings in `KernelDb`.
+- **Persona ListTools-hook bundles + persistence.** v1 of
+  `builtin.personas` ships binding-only archetypes (planner / coder /
+  explorer / sound engineer); `apply` swaps the calling context's
+  `ContextToolBinding`. Adding `HookPhase::ListTools` hook bundles to
+  the persona shape and persisting personas in `KernelDb` (alongside
+  bindings, D-54) are the remaining work.
 - **`StreamingBlockHandle` implementation.** Single-block streaming
   primitive. Build when the first caller arrives (likely the LLM
   streaming rewrite). Resolve async-drop strategy and append granularity
