@@ -4498,6 +4498,36 @@ impl kernel::Server for KernelImpl {
         }
     }
 
+    fn context_leave(
+        self: Rc<Self>,
+        params: kernel::ContextLeaveParams,
+        mut results: kernel::ContextLeaveResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let _trace_guard = extract_rpc_trace(p.get_trace(), "context_leave").entered();
+        let context_id_bytes = pry!(p.get_context_id());
+        let context_id = pry!(
+            ContextId::try_from_slice(context_id_bytes)
+                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
+        );
+
+        let connection = self.connection.clone();
+        let session_id = connection.borrow().session_id;
+        // Drop the binding only if it points at the context we're leaving —
+        // never silently leave a different context the session also held.
+        let mut left = false;
+        let map = connection.borrow().session_contexts.clone();
+        map.remove_if(&session_id, |_, ctx| {
+            let matches = *ctx == context_id;
+            if matches {
+                left = true;
+            }
+            matches
+        });
+        results.get().set_left(left);
+        Promise::ok(())
+    }
+
     fn move_block(
         self: Rc<Self>,
         params: kernel::MoveBlockParams,

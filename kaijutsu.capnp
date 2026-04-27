@@ -1203,6 +1203,13 @@ interface Kernel {
   # elsewhere in the schema. CRDT + kernel impls exist; this is the
   # protocol seam (M2-B1).
   moveBlock @93 (contextId :Data, blockId :BlockId, hasAfter :Bool, after :BlockId, trace :TraceContext) -> (ackVersion :UInt64);
+
+  # Drop this session's binding to a context. Used by the constellation
+  # archive flow so the drift router can mark the context Archived
+  # without an active session re-resurrecting it on the next op (M2-B3).
+  # Idempotent: returns true if the session held a binding to that
+  # context, false otherwise.
+  contextLeave @94 (contextId :Data, trace :TraceContext) -> (left :Bool);
 }
 
 # ============================================================================

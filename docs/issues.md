@@ -141,16 +141,6 @@ Holographic shader trio + entry animation shipped. Open:
 - **Role group borders** are still Vello — should be shader-drawn like
   block borders.
 
-## Constellation
-
-- **Archive-while-joined re-sync.** `kj context archive {focus}` runs
-  *inside* the focused context (`shell_execute(cmd, focus_id, …)` in
-  `input/systems.rs::handle_constellation_nav`). The drift router sees
-  the active session and repairs the archive. Fix: run the command from
-  a different context, or have the client send `context_leave` first, or
-  add a server-side guard that force-leaves active sessions before
-  archiving.
-
 ## Text rendering (MSDF / 次)
 
 - **TAA temporal super-resolution (deferred).** Per-block history

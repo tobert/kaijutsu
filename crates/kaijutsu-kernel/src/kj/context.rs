@@ -608,6 +608,17 @@ impl KjDispatcher {
                 .collect();
         }
 
+        // Sync the in-memory drift router with the on-disk state (M2-B3).
+        // Without this the drift router still has the contexts as Live, and
+        // any active session can write a drift op that resurrects them — the
+        // archive-while-joined bug from the constellation flow.
+        {
+            let mut drift = self.drift_router().write().await;
+            for id in &archived_ids {
+                let _ = drift.set_state(*id, ContextState::Archived);
+            }
+        }
+
         // MCP subscription cleanup removed alongside the legacy MCP pool
         // in Phase 1 M5. Phase 2 will re-introduce via broker + coalescer.
 
@@ -1091,6 +1102,39 @@ mod tests {
         let db = d.kernel_db().lock();
         let row = db.get_context(target).unwrap().unwrap();
         assert!(row.archived_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn context_archive_flips_drift_router_state() {
+        // M2-B3: archive must mark the in-memory drift router state as
+        // Archived so an active session can't resurrect the context with
+        // the next op (the constellation archive-while-joined bug).
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let parent = register_context(&d, Some("parent"), None, principal).await;
+        let target = register_context(&d, Some("target"), Some(parent), principal).await;
+
+        // Sanity: target is Live in drift router pre-archive.
+        {
+            let router = d.drift_router().read().await;
+            let h = router.get(target).expect("target registered");
+            assert_eq!(h.state, kaijutsu_types::ContextState::Live);
+        }
+
+        let c = confirmed_caller(parent);
+        let result = d
+            .dispatch(&[s("context"), s("archive"), s("target")], &c)
+            .await;
+        assert!(result.is_ok(), "archive failed: {}", result.message());
+
+        // Drift router state must reflect archive.
+        let router = d.drift_router().read().await;
+        let h = router.get(target).expect("still registered");
+        assert_eq!(
+            h.state,
+            kaijutsu_types::ContextState::Archived,
+            "drift router state should be Archived post-archive"
+        );
     }
 
     #[tokio::test]
