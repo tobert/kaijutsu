@@ -235,7 +235,14 @@ async fn process_llm_stream(
     // hydrated messages include it — no explicit push needed.
     match documents.block_snapshots(context_id) {
         Ok(blocks) => {
-            let hydrated = kaijutsu_kernel::hydrate_from_blocks(&blocks);
+            let mut hydrated = kaijutsu_kernel::hydrate_from_blocks(&blocks);
+            // Resolve any (Asset, Text, Image) blocks against CAS so vision-
+            // capable providers receive the actual bytes. Unresolved hashes
+            // fall back to a text marker via to_rig_request — never panic.
+            kaijutsu_kernel::resolve_image_blocks_from_cas(
+                &mut hydrated,
+                kernel.cas().as_ref(),
+            );
             log::info!(
                 "Hydrated {} messages from {} blocks for context {}",
                 hydrated.len(),

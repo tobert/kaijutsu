@@ -245,6 +245,31 @@ impl StreamRequest {
                                             content.clone(),
                                         )),
                                     )),
+                                    super::ContentBlock::Image {
+                                        hash,
+                                        media_type,
+                                        data_base64,
+                                    } => {
+                                        use rig::message::MimeType;
+                                        let mime = rig::message::ImageMediaType::from_mime_type(
+                                            media_type,
+                                        );
+                                        match (data_base64.as_deref(), mime) {
+                                            (Some(data), Some(mime)) => {
+                                                Some(UserContent::image_base64(
+                                                    data,
+                                                    Some(mime),
+                                                    None,
+                                                ))
+                                            }
+                                            // Resolution failed or unknown mime — fall back to a
+                                            // text marker so the model at least knows an image
+                                            // existed at this position in the conversation.
+                                            _ => Some(UserContent::text(format!(
+                                                "[image hash={hash} mime={media_type} unavailable]"
+                                            ))),
+                                        }
+                                    }
                                     _ => None,
                                 })
                                 .collect();
@@ -661,6 +686,62 @@ mod tests {
         );
         assert!(StreamEvent::Error("oops".into()).is_terminal());
         assert!(!StreamEvent::TextStart.is_terminal());
+    }
+
+    #[test]
+    fn image_block_with_data_converts_to_rig_image() {
+        use super::super::{ContentBlock, Message, MessageContent, Role};
+        use rig::message::{Message as RigMessage, UserContent};
+
+        let messages = vec![Message {
+            role: Role::User,
+            content: MessageContent::Blocks(vec![ContentBlock::Image {
+                hash: "abc123".to_string(),
+                media_type: "image/png".to_string(),
+                data_base64: Some("AAAA".to_string()),
+            }]),
+        }];
+
+        let req = StreamRequest::new("claude-haiku-4-5", messages).to_rig_request();
+        let history: Vec<_> = req.chat_history.into_iter().collect();
+        let user = match history.first().expect("one user msg") {
+            RigMessage::User { content } => content.iter().collect::<Vec<_>>(),
+            other => panic!("expected User, got {other:?}"),
+        };
+        assert!(
+            user.iter().any(|c| matches!(c, UserContent::Image(_))),
+            "image_base64 with valid mime must surface as UserContent::Image, got {user:?}"
+        );
+    }
+
+    #[test]
+    fn image_block_without_data_falls_back_to_text_marker() {
+        use super::super::{ContentBlock, Message, MessageContent, Role};
+        use rig::message::{Message as RigMessage, UserContent};
+
+        let messages = vec![Message {
+            role: Role::User,
+            content: MessageContent::Blocks(vec![ContentBlock::Image {
+                hash: "abc123".to_string(),
+                media_type: "image/png".to_string(),
+                data_base64: None,
+            }]),
+        }];
+
+        let req = StreamRequest::new("claude-haiku-4-5", messages).to_rig_request();
+        let history: Vec<_> = req.chat_history.into_iter().collect();
+        let user = match history.first().expect("one user msg") {
+            RigMessage::User { content } => content.iter().collect::<Vec<_>>(),
+            other => panic!("expected User, got {other:?}"),
+        };
+        let saw_marker = user.iter().any(|c| match c {
+            UserContent::Text(t) => t.text.contains("abc123") && t.text.contains("unavailable"),
+            _ => false,
+        });
+        assert!(
+            saw_marker,
+            "missing data must surface as text marker, got {user:?}"
+        );
     }
 
     #[test]

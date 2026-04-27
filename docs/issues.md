@@ -14,10 +14,6 @@ The hydration loop in `crates/kaijutsu-kernel/src/llm/mod.rs` (around
 `hydrate_from_blocks`, ~line 1020) is the highest-leverage surface for
 agent embodiment. Several known gaps:
 
-- **`Role::Asset` is unconditionally skipped** (`llm/mod.rs:1034`). User
-  pasted screenshots via `writeBlob` + `img_block_from_path` are invisible
-  to vision-capable models. CAS storage and rendering already exist; only
-  the hydration arm is missing.
 - **Thinking is unconditionally skipped** (`llm/mod.rs:1031`). Cross-turn
   reasoning continuity is lost. At minimum preserve thinking across
   tool-use iterations within a single `process_llm_stream` call.

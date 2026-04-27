@@ -76,6 +76,7 @@ pub use llm::{
     Usage as LlmUsage,
     // Hydration
     hydrate_from_blocks,
+    resolve_image_blocks_from_cas,
     initialize_llm_registry,
     load_llm_config_toml,
     load_models_config_toml,

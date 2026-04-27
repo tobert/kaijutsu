@@ -97,6 +97,18 @@ pub enum ContentBlock {
         content: String,
         is_error: bool,
     },
+    /// Image content referenced by CAS hash.
+    ///
+    /// `data_base64` is `None` immediately after hydration — the hydrator
+    /// is a pure function of `BlockSnapshot` and has no CAS access. The
+    /// server-side path resolves the hash and fills `data_base64` before
+    /// the request hits the LLM provider. Conversion to rig falls back to a
+    /// text marker when resolution failed.
+    Image {
+        hash: String,
+        media_type: String,
+        data_base64: Option<String>,
+    },
 }
 
 /// Message content - either simple text or structured blocks.
@@ -742,6 +754,59 @@ impl LlmRegistry {
 // Hydration: BlockSnapshot[] → Message[]
 // ============================================================================
 
+/// Resolve `ContentBlock::Image` placeholders against a content store.
+///
+/// The hydrator emits image blocks with `data_base64: None` because it has no
+/// CAS access. Callers (typically the LLM stream pipeline) invoke this
+/// helper to fill the data before passing messages to the provider. Unknown
+/// hashes and CAS errors are tolerated: the block stays unfilled, and
+/// rig-conversion falls back to a text marker so the model knows an image
+/// existed at that turn.
+pub fn resolve_image_blocks_from_cas(
+    messages: &mut [Message],
+    cas: &dyn kaijutsu_cas::ContentStore,
+) {
+    use base64::Engine;
+    use kaijutsu_cas::ContentHash;
+
+    for msg in messages.iter_mut() {
+        let MessageContent::Blocks(blocks) = &mut msg.content else {
+            continue;
+        };
+        for block in blocks.iter_mut() {
+            let ContentBlock::Image {
+                hash,
+                media_type,
+                data_base64,
+            } = block
+            else {
+                continue;
+            };
+            if data_base64.is_some() {
+                continue;
+            }
+            let parsed = match ContentHash::from_str_checked(hash) {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+            // Prefer CAS-recorded mime over the hydrator's defaulted one;
+            // CAS sidecar metadata reflects what was actually stored.
+            if let Ok(Some(reference)) = cas.inspect(&parsed) {
+                *media_type = reference.mime_type;
+            }
+            match cas.retrieve(&parsed) {
+                Ok(Some(bytes)) => {
+                    let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                    *data_base64 = Some(encoded);
+                }
+                _ => {
+                    // Stay unresolved — rig-conversion emits a text marker.
+                }
+            }
+        }
+    }
+}
+
 /// Reconstruct LLM conversation history from stored blocks.
 ///
 /// Walks blocks in order and produces the `Message` sequence expected by the
@@ -1031,9 +1096,6 @@ pub fn hydrate_from_blocks(blocks: &[kaijutsu_types::BlockSnapshot]) -> Vec<Mess
         if matches!(block.kind, BlockKind::Thinking | BlockKind::File) {
             continue;
         }
-        if block.role == BlockRole::Asset {
-            continue;
-        }
         // Skip System blocks unless they're Drift, Error, Notification, or Resource (D-34)
         if block.role == BlockRole::System
             && block.kind != BlockKind::Drift
@@ -1102,6 +1164,25 @@ pub fn hydrate_from_blocks(blocks: &[kaijutsu_types::BlockSnapshot]) -> Vec<Mess
                     name,
                     input,
                 });
+            }
+            (BlockRole::Asset, BlockKind::Text) => {
+                // img_block / img_block_from_path — Asset role, content_type
+                // Image, content holds the CAS hash. Surface to vision-capable
+                // models as an Image content block; the server-side path
+                // resolves the hash to bytes before the request goes out.
+                use kaijutsu_types::ContentType;
+                if block.content_type == ContentType::Image {
+                    state.flush_all();
+                    state.messages.push(Message {
+                        role: Role::User,
+                        content: MessageContent::Blocks(vec![ContentBlock::Image {
+                            hash: block.content.clone(),
+                            media_type: ContentType::Image.as_mime().to_string(),
+                            data_base64: None,
+                        }]),
+                    });
+                }
+                // Other Asset content types stay skipped (no current producer).
             }
             (BlockRole::Tool, BlockKind::Text) => {
                 // Tool-authored rich content (svg_block / abc_block).
@@ -2815,6 +2896,136 @@ mod tests {
             assert!(
                 msgs.is_empty(),
                 "(Tool, Text, Plain) must remain skipped, got {msgs:?}"
+            );
+        }
+
+        // ── Role::Asset image hydration (A2) ──
+
+        #[test]
+        fn asset_image_block_hydrates_as_image_content_block() {
+            let c = ctx();
+            let m = model();
+            // img_block / img_block_from_path produce (Asset, Text, Image)
+            // blocks where `content` holds the CAS hash.
+            let block = kaijutsu_types::BlockSnapshotBuilder::new(
+                BlockId::new(c, m, 0),
+                kaijutsu_types::BlockKind::Text,
+            )
+            .role(BlockRole::Asset)
+            .content("abcdef0123456789")
+            .content_type(kaijutsu_types::ContentType::Image)
+            .build();
+
+            let msgs = hydrate_from_blocks(&[block]);
+            assert_eq!(msgs.len(), 1, "Asset image block must hydrate");
+            assert_eq!(msgs[0].role, Role::User);
+            match &msgs[0].content {
+                MessageContent::Blocks(blocks) => {
+                    assert_eq!(blocks.len(), 1);
+                    match &blocks[0] {
+                        ContentBlock::Image {
+                            hash,
+                            media_type,
+                            data_base64,
+                        } => {
+                            assert_eq!(hash, "abcdef0123456789");
+                            assert!(
+                                media_type.starts_with("image/"),
+                                "media_type should look like a MIME image type, got: {media_type}"
+                            );
+                            assert!(
+                                data_base64.is_none(),
+                                "hydrator emits hash only; CAS resolution happens later"
+                            );
+                        }
+                        other => panic!("Expected ContentBlock::Image, got {other:?}"),
+                    }
+                }
+                other => panic!("Expected Blocks, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn resolve_image_blocks_fills_data_from_cas() {
+            use kaijutsu_cas::{ContentStore, FileStore};
+            let tmp = tempfile::tempdir().unwrap();
+            let cas = FileStore::at_path(tmp.path());
+            // 1x1 transparent PNG to keep the fixture small but legitimate.
+            let png_bytes: &[u8] = &[
+                0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+                0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+                0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78,
+                0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+                0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+            ];
+            let hash = cas.store(png_bytes, "image/png").unwrap();
+            let mut messages = vec![Message {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![ContentBlock::Image {
+                    hash: hash.to_string(),
+                    media_type: "image/png".to_string(),
+                    data_base64: None,
+                }]),
+            }];
+            resolve_image_blocks_from_cas(&mut messages, &cas);
+            match &messages[0].content {
+                MessageContent::Blocks(blocks) => match &blocks[0] {
+                    ContentBlock::Image { data_base64, .. } => {
+                        assert!(
+                            data_base64.is_some(),
+                            "data_base64 must be filled after resolve"
+                        );
+                    }
+                    _ => panic!("expected Image"),
+                },
+                _ => panic!("expected Blocks"),
+            }
+        }
+
+        #[test]
+        fn resolve_image_blocks_tolerates_missing_hash() {
+            use kaijutsu_cas::{ContentStore, FileStore};
+            let tmp = tempfile::tempdir().unwrap();
+            let cas = FileStore::at_path(tmp.path());
+            let mut messages = vec![Message {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![ContentBlock::Image {
+                    hash: "0".repeat(64),
+                    media_type: "image/png".to_string(),
+                    data_base64: None,
+                }]),
+            }];
+            // Should not panic, should leave block unresolved.
+            resolve_image_blocks_from_cas(&mut messages, &cas);
+            match &messages[0].content {
+                MessageContent::Blocks(blocks) => match &blocks[0] {
+                    ContentBlock::Image { data_base64, .. } => {
+                        assert!(data_base64.is_none(), "missing hash stays unresolved");
+                    }
+                    _ => panic!(),
+                },
+                _ => panic!(),
+            }
+        }
+
+        #[test]
+        fn asset_text_plain_still_skipped() {
+            // Asset role with non-Image content_type is not produced by any
+            // current engine; skip to avoid surfacing arbitrary asset prose.
+            let c = ctx();
+            let m = model();
+            let block = kaijutsu_types::BlockSnapshotBuilder::new(
+                BlockId::new(c, m, 0),
+                kaijutsu_types::BlockKind::Text,
+            )
+            .role(BlockRole::Asset)
+            .content("plain asset text")
+            .build();
+
+            let msgs = hydrate_from_blocks(&[block]);
+            assert!(
+                msgs.is_empty(),
+                "(Asset, Text, Plain) must remain skipped, got {msgs:?}"
             );
         }
 
