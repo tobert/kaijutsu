@@ -35,9 +35,11 @@
 pub mod config;
 pub mod toml_config;
 pub mod stream;
+pub mod system_prompt;
 
 // Re-export key types
 pub use config::ProviderConfig;
+pub use system_prompt::{SituationalContext, build_system_prompt};
 pub use toml_config::{
     EmbeddingModelConfig, LlmConfig, ModelAlias, ModelsConfig, initialize_llm_registry,
     load_llm_config_toml, load_models_config_toml,

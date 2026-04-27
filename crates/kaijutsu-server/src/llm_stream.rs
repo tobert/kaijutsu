@@ -83,8 +83,9 @@ pub(crate) async fn spawn_llm_for_prompt(
             .unwrap_or_else(|_| kaijutsu_kernel::DEFAULT_SYSTEM_PROMPT.to_string())
     };
 
-    // Read per-context model from DriftRouter (quick read, release lock)
-    let (ctx_model, ctx_provider_name) = {
+    // Read per-context model from DriftRouter (quick read, release lock).
+    // Capture label/state alongside for the situational system-prompt addendum.
+    let (ctx_model, ctx_provider_name, ctx_label, ctx_state) = {
         let drift = kernel_arc.drift().read().await;
         // Guard: block LLM invocation while context is in Staging state
         if let Some(h) = drift.get(context_id) {
@@ -107,8 +108,13 @@ pub(crate) async fn spawn_llm_for_prompt(
             }
         }
         match drift.get(context_id) {
-            Some(h) => (h.model.clone(), h.provider.clone()),
-            None => (None, None),
+            Some(h) => (
+                h.model.clone(),
+                h.provider.clone(),
+                h.label.clone(),
+                Some(h.state),
+            ),
+            None => (None, None, None, None),
         }
     };
 
@@ -153,6 +159,19 @@ pub(crate) async fn spawn_llm_for_prompt(
     // Build tool definitions via the broker (binding + ListTools filter do
     // the curation — D-54 retired the legacy post-filter).
     let tools = build_tool_definitions(&kernel_arc, context_id, user_agent_id).await;
+
+    // Assemble situational system-prompt addendum (A4): static base + per-call
+    // facts so the model has context name, lifecycle state, and current tool
+    // inventory without losing the static stance set in assets/defaults/system.md.
+    let situational = kaijutsu_kernel::SituationalContext {
+        context_id: Some(context_id),
+        context_label: ctx_label,
+        context_state: ctx_state,
+        provider: ctx_provider_name.clone(),
+        model: Some(model_name.clone()),
+        tool_names: tools.iter().map(|t| t.name.clone()).collect(),
+    };
+    let system_prompt = kaijutsu_kernel::build_system_prompt(&system_prompt, &situational);
 
     log::info!(
         "Spawning LLM stream: context={}, model={}",

@@ -14,10 +14,6 @@ The hydration loop in `crates/kaijutsu-kernel/src/llm/mod.rs` (around
 `hydrate_from_blocks`, ~line 1020) is the highest-leverage surface for
 agent embodiment. Several known gaps:
 
-- **System prompt has no situational awareness** —
-  `assets/defaults/system.md` is loaded verbatim. No context name, peers,
-  active surface, drift state, or available tools. Assemble per-call;
-  keep the static base, wrap with dynamic facts.
 - **No compaction pressure.** Every turn ships full history. Drift is the
   right primitive: at threshold, summarize N older blocks into a drift
   block, mark originals `compacted=true`.

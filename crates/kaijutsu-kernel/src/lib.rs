@@ -77,6 +77,9 @@ pub use llm::{
     // Hydration
     hydrate_from_blocks,
     resolve_image_blocks_from_cas,
+    // System prompt assembly
+    SituationalContext,
+    build_system_prompt,
     initialize_llm_registry,
     load_llm_config_toml,
     load_models_config_toml,
