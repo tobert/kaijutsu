@@ -457,6 +457,15 @@ impl Kernel {
             .register_silently(bindings_server, InstancePolicy::default())
             .await?;
 
+        // M3-D2: builtin.tool_search — keyword search across the calling
+        // context's visible tools. Holds Weak<Broker> to avoid cycles.
+        let tool_search_server = Arc::new(
+            crate::mcp::servers::BuiltinToolSearchServer::new(Arc::downgrade(&self.broker)),
+        );
+        self.broker
+            .register_silently(tool_search_server, InstancePolicy::default())
+            .await?;
+
         Ok(())
     }
 

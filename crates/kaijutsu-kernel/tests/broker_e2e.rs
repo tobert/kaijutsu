@@ -156,6 +156,50 @@ async fn list_visible_tools_surfaces_expected_names() {
 }
 
 #[tokio::test]
+async fn tool_search_returns_scored_matches() {
+    // M3-D2: tool_search runs against the calling context's visible
+    // tools and returns highest-scoring matches in JSON.
+    let fx = setup().await;
+
+    // Seed the binding so every builtin (including builtin.tool_search)
+    // is visible.
+    let _ = fx
+        .kernel
+        .list_tool_defs_via_broker(fx.ctx_id, fx.exec_ctx.principal_id)
+        .await;
+
+    let exec = fx
+        .kernel
+        .dispatch_tool_via_broker(
+            "tool_search",
+            &serde_json::json!({"query": "block"}).to_string(),
+            &fx.exec_ctx,
+        )
+        .await
+        .expect("dispatch");
+    assert!(exec.success, "tool_search should succeed: {}", exec.stderr);
+
+    let payload: serde_json::Value =
+        serde_json::from_str(&exec.stdout).expect("structured output is JSON");
+    let matches = payload
+        .get("matches")
+        .and_then(|m| m.as_array())
+        .expect("matches array");
+    assert!(!matches.is_empty(), "expected at least one match for 'block'");
+    // First entry has the highest score (block_* tools have 'block' in
+    // the name, so name-match scoring should put them on top).
+    let first = matches.first().unwrap();
+    assert!(
+        first
+            .get("name")
+            .and_then(|n| n.as_str())
+            .unwrap_or("")
+            .contains("block"),
+        "top match should contain 'block' in name, got: {first:?}"
+    );
+}
+
+#[tokio::test]
 async fn unknown_tool_name_surfaces_tool_not_found() {
     let fx = setup().await;
 

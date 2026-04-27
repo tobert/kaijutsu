@@ -42,10 +42,6 @@ following are explicit follow-ups that did not ship:
   Phase 5's `HookPhase::ListTools` is the mechanism this composes on.
   Likely surface: `builtin.personas` admin server with `list` / `apply` /
   `define`; persistence alongside bindings in `KernelDb`.
-- **Tool search across instances.** `builtin.tool_search` with
-  keyword/substring scoring over `(name, description, tags)` for v1;
-  `kaijutsu-index` (ONNX + HNSW) vector search for v2 once the index
-  flake is fixed.
 - **`StreamingBlockHandle` implementation.** Single-block streaming
   primitive. Build when the first caller arrives (likely the LLM
   streaming rewrite). Resolve async-drop strategy and append granularity
