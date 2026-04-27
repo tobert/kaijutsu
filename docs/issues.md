@@ -156,7 +156,8 @@ Holographic shader trio + entry animation shipped. Open:
   yet implemented.
 - **Compact quality.** `kj fork --compact` uses a generic
   `DISTILLATION_SYSTEM_PROMPT`. Consider preset-level or context-level
-  summary-style control.
+  summary-style control. (`--distill-model` knob ships now per M5-F5;
+  custom distillation prompts are the remaining shape.)
 - **Workspace auto-mounts at context join.** How workspace paths
   translate to VFS mounts on join.
 - **kj CLI binary.** Standalone `kj` for headless scripting; thin

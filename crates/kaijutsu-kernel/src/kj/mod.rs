@@ -253,6 +253,19 @@ impl KjDispatcher {
         context_id: ContextId,
         directed_prompt: Option<&str>,
     ) -> Result<String, String> {
+        self.summarize_with_model(context_id, directed_prompt, None).await
+    }
+
+    /// Same as [`summarize`] but with an explicit model override (M5-F5).
+    /// Use a cheaper model for distillation than the source context's
+    /// chat model — `kj fork --compact --distill-model haiku` style.
+    /// Pass `None` to inherit from the source context (existing behavior).
+    pub(crate) async fn summarize_with_model(
+        &self,
+        context_id: ContextId,
+        directed_prompt: Option<&str>,
+        distill_model: Option<&str>,
+    ) -> Result<String, String> {
         let blocks = self
             .blocks
             .block_snapshots(context_id)
@@ -263,13 +276,18 @@ impl KjDispatcher {
 
         let user_prompt = build_distillation_prompt(&blocks, directed_prompt);
 
-        let model_name = {
+        // Resolution order: explicit override > source context's model >
+        // registry default.
+        let inherited = {
             let router = self.drift.read().await;
             router.get(context_id).and_then(|h| h.model.clone())
         };
+        let chosen = distill_model
+            .map(|s| s.to_string())
+            .or(inherited);
         let registry = self.kernel.llm().read().await;
 
-        let (provider, model) = match &model_name {
+        let (provider, model) = match &chosen {
             Some(m) => registry
                 .resolve_model(m)
                 .ok_or_else(|| format!("model '{}' not found in registry", m))?,

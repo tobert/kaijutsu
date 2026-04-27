@@ -492,6 +492,11 @@ impl KjDispatcher {
         let prompt = extract_named_arg(argv, &["--prompt"]);
         let pwd_override = extract_named_arg(argv, &["--pwd"]);
         let staging = has_flag(argv, &["--stage", "--staging"]);
+        // M5-F5: optional cheaper model for the distillation step.
+        // Distillation is a one-shot summary — using Opus to summarize for
+        // a Haiku follow-up is wasteful. Fall through to the source
+        // context's chat model when not specified.
+        let distill_model = extract_named_arg(argv, &["--distill-model"]);
 
         let source_id = match caller.require_context() {
             Ok(id) => id,
@@ -506,8 +511,11 @@ impl KjDispatcher {
             Err(e) => return KjResult::Err(format!("kj fork --compact: {e}")),
         };
 
-        // Summarize source context via LLM
-        let summary = match self.summarize(source_id, None).await {
+        // Summarize source context via LLM (use --distill-model when set).
+        let summary = match self
+            .summarize_with_model(source_id, None, distill_model.as_deref())
+            .await
+        {
             Ok(s) => s,
             Err(e) => return KjResult::Err(format!("kj fork --compact: {e}")),
         };

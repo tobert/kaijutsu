@@ -13,6 +13,7 @@ Creates a new context from the current one. The new context gets its own convers
 
 - `--name`, `-n` — Label for the forked context
 - `--model`, `-m` — Override model (format: `provider/model`). Inherits from parent if omitted.
+- `--distill-model` — Override model used for `--compact` summarization. Cheap-model knob: use Haiku to summarize for an Opus follow-up. Inherits from parent if omitted.
 - `--prompt` — Inject a note into the fork as a drift block
 - `--mcp-prompt` — Inject an MCP prompt (format: `server/name`). Use with `--arg key=value`.
 - `--arg`, `-a` — Argument for `--mcp-prompt` (repeatable, format: `key=value`)
