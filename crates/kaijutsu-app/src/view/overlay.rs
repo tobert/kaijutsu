@@ -257,8 +257,17 @@ pub fn build_overlay_glyphs(
             let width_changed = (block_scene.built_width - width).abs() > 1.0;
             let text_changed = block_scene.text != display;
             let cursor_changed = cursor_geom.last_cursor_offset != cursor_byte_offset;
+            let new_kind = crate::input::vim::mode_kind(overlay.vim_mode.as_deref());
+            let kind_changed = cursor_geom.kind != new_kind;
+            let new_anchor = overlay.selection_anchor;
+            let anchor_changed = cursor_geom.last_selection_anchor != new_anchor;
 
-            if !text_changed && !width_changed && !cursor_changed {
+            if !text_changed
+                && !width_changed
+                && !cursor_changed
+                && !kind_changed
+                && !anchor_changed
+            {
                 continue;
             }
 
@@ -349,6 +358,50 @@ pub fn build_overlay_glyphs(
             cursor_geom.y = text_offset.1 + geom.y0;
             cursor_geom.height = geom.y1 - geom.y0;
             cursor_geom.last_cursor_offset = cursor_byte_offset;
+            cursor_geom.kind = new_kind;
+            cursor_geom.last_selection_anchor = new_anchor;
+
+            // Selection geometry — only when in Visual mode with a selection.
+            // Single-line scope only: multi-line selections fall back to no
+            // rect (and rely on the cursor itself to indicate position).
+            let visual_with_selection = matches!(
+                new_kind,
+                crate::input::vim::CursorKind::Hidden,
+            ) && new_anchor.is_some();
+
+            if visual_with_selection {
+                let anchor_byte = new_anchor.unwrap();
+                let anchor_cursor = parley::editing::Cursor::from_byte_index(
+                    &layout,
+                    anchor_byte,
+                    parley::layout::Affinity::Upstream,
+                );
+                let anchor_geom = anchor_cursor.geometry(&layout, 2.0);
+
+                // Same line if y-extents align (within 0.5 px).
+                let same_line = (anchor_geom.y0 - geom.y0).abs() < 0.5;
+                if same_line {
+                    let x_left = anchor_geom.x0.min(geom.x0);
+                    let x_right = anchor_geom.x0.max(geom.x0);
+                    cursor_geom.selection_x = text_offset.0 + x_left;
+                    cursor_geom.selection_y = text_offset.1 + geom.y0;
+                    cursor_geom.selection_width = (x_right - x_left).max(0.0);
+                    cursor_geom.selection_height = geom.y1 - geom.y0;
+                } else {
+                    log::trace!(
+                        "vim: visual selection spans lines; multi-line highlight not yet rendered"
+                    );
+                    cursor_geom.selection_x = 0.0;
+                    cursor_geom.selection_y = 0.0;
+                    cursor_geom.selection_width = 0.0;
+                    cursor_geom.selection_height = 0.0;
+                }
+            } else {
+                cursor_geom.selection_x = 0.0;
+                cursor_geom.selection_y = 0.0;
+                cursor_geom.selection_width = 0.0;
+                cursor_geom.selection_height = 0.0;
+            }
         }
     }
 }

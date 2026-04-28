@@ -137,29 +137,60 @@ fn sync_block_fx(
             mat.label_gaps = Vec4::ZERO;
         }
 
-        // Cursor beam (overlay only)
+        // Cursor (overlay only) — width and color depend on vim mode.
         if is_overlay && show_cursor {
             if let (Some(geom), Some(scene)) = (cursor_geom, block_scene) {
                 if geom.height > 0.0 && scene.built_width > 0.0 && scene.built_height > 0.0 {
-                    let beam_width = 2.0;
-                    // Convert pixel coords → UV [0,1]
-                    let cx = geom.x as f32 / scene.built_width;
-                    let cy = geom.y as f32 / scene.built_height;
-                    let cw = beam_width / scene.built_width;
-                    let ch = geom.height as f32 / scene.built_height;
+                    use crate::input::vim::CursorKind;
+                    // Block-cursor width: a fraction of line height. Mono
+                    // fonts cluster around ~0.55× height; this is close
+                    // enough without re-querying parley for cluster advance.
+                    let block_width = (geom.height as f32 * 0.55).max(2.0);
+                    let (px_width, color) = match geom.kind {
+                        CursorKind::Beam => (2.0_f32, theme.cursor_insert),
+                        CursorKind::Block => (block_width, theme.cursor_normal),
+                        // Hidden — selection rect renders instead. Width=0
+                        // skips the shader's cursor composite.
+                        CursorKind::Hidden => (0.0, Vec4::ZERO),
+                    };
 
-                    mat.cursor_params = Vec4::new(cx, cy, cw, ch);
+                    if px_width > 0.0 {
+                        let cx = geom.x as f32 / scene.built_width;
+                        let cy = geom.y as f32 / scene.built_height;
+                        let cw = px_width / scene.built_width;
+                        let ch = geom.height as f32 / scene.built_height;
+                        mat.cursor_params = Vec4::new(cx, cy, cw, ch);
+                        mat.cursor_color = Vec4::new(color.x, color.y, color.z, color.w);
+                    } else {
+                        mat.cursor_params = Vec4::ZERO;
+                        mat.cursor_color = Vec4::ZERO;
+                    }
 
-                    let c = theme.cursor_insert;
-                    mat.cursor_color = Vec4::new(c.x, c.y, c.z, c.w);
+                    // Selection rect (Visual mode) — pixel rect → UV.
+                    if geom.selection_width > 0.0 && geom.selection_height > 0.0 {
+                        let sx = geom.selection_x as f32 / scene.built_width;
+                        let sy = geom.selection_y as f32 / scene.built_height;
+                        let sw = geom.selection_width as f32 / scene.built_width;
+                        let sh = geom.selection_height as f32 / scene.built_height;
+                        mat.selection_params = Vec4::new(sx, sy, sw, sh);
+                        let s = theme.selection_bg.to_srgba();
+                        mat.selection_color = Vec4::new(s.red, s.green, s.blue, s.alpha);
+                    } else {
+                        mat.selection_params = Vec4::ZERO;
+                        mat.selection_color = Vec4::ZERO;
+                    }
                 } else {
                     mat.cursor_params = Vec4::ZERO;
                     mat.cursor_color = Vec4::ZERO;
+                    mat.selection_params = Vec4::ZERO;
+                    mat.selection_color = Vec4::ZERO;
                 }
             }
         } else {
             mat.cursor_params = Vec4::ZERO;
             mat.cursor_color = Vec4::ZERO;
+            mat.selection_params = Vec4::ZERO;
+            mat.selection_color = Vec4::ZERO;
         }
     }
 }

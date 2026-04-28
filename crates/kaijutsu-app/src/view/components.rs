@@ -486,6 +486,18 @@ pub struct OverlayCursorGeometry {
     /// Last cursor byte offset used for geometry — lets the glyph system
     /// detect cursor-only changes without re-running Parley layout.
     pub last_cursor_offset: usize,
+    /// Cursor shape kind, derived from the parent overlay's `vim_mode`.
+    pub kind: crate::input::vim::CursorKind,
+    /// Visual-mode selection rect (content-box pixels). Width=0 means
+    /// no selection. Single-line scope; multi-line falls back to no
+    /// rect for now.
+    pub selection_x: f64,
+    pub selection_y: f64,
+    pub selection_width: f64,
+    pub selection_height: f64,
+    /// Anchor byte offset used to compute the selection rect — lets the
+    /// glyph system detect anchor-only changes without re-running layout.
+    pub last_selection_anchor: Option<usize>,
 }
 
 /// Marker for the main conversation view cell.

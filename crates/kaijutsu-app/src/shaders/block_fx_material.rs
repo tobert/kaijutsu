@@ -74,6 +74,15 @@ pub struct BlockFxMaterial {
     /// Both x0 and x1 zero = no gap.
     #[uniform(11)]
     pub label_gaps: Vec4,
+
+    /// Selection rect in UV space: [x, y, width, height]. All zero (or w=0)
+    /// disables the selection composite. Used for vim Visual mode highlight.
+    #[uniform(12)]
+    pub selection_params: Vec4,
+
+    /// Selection background color (RGBA, linear color space).
+    #[uniform(13)]
+    pub selection_color: Vec4,
 }
 
 impl Default for BlockFxMaterial {
@@ -90,6 +99,8 @@ impl Default for BlockFxMaterial {
             border_insets: Vec4::ZERO,
             border_color: Vec4::ZERO,
             label_gaps: Vec4::ZERO,
+            selection_params: Vec4::ZERO,
+            selection_color: Vec4::ZERO,
         }
     }
 }

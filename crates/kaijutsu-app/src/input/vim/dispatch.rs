@@ -56,8 +56,9 @@ fn resolve_target_range(
             } else {
                 (cursor, result.cursor)
             };
-            // Charwise — include the char at end position
-            let end = if end < text.len() {
+            // Inclusive motions (e/$/g_) consume the char at the destination;
+            // exclusive motions (w/b/h/l/0/^) stop short of it.
+            let end = if motion::is_inclusive(move_type) && end < text.len() {
                 textutil::next_char_boundary(text, end)
             } else {
                 end
@@ -465,38 +466,96 @@ mod tests {
 
     // ── Motion targets ──
     //
-    // BUG: resolve_target_range always extends end via next_char_boundary,
-    // treating all motions as inclusive. Vim's w/b/h/l are exclusive — dw
-    // should delete [cursor, target), not [cursor, target]. This causes
-    // dw/dh to delete one char too many. Needs exclusive/inclusive info
-    // from EditContext.target_shape or the motion type.
+    // Inclusivity comes from the MoveType variant via motion::is_inclusive:
+    // w/b/h/l/0/^ are exclusive (don't include the destination char);
+    // e/$/g_ are inclusive. EditContext.target_shape doesn't carry this.
 
     #[test]
-    fn motion_forward_word() {
+    fn motion_forward_word_dw() {
         let text = "hello world";
         let (start, end, linewise) =
             resolve_target_range(text, 0, &EditTarget::Motion(
                 MoveType::WordBegin(editor_types::prelude::WordStyle::Little, MoveDir1D::Next),
                 Count::Contextual,
             ), &ctx(), &state()).unwrap();
+        // dw on "hello world" from cursor 0: w lands at 6 ('w'), exclusive
+        // → end=6, deletes "hello ".
         assert_eq!(start, 0);
-        // Motion lands at 6 ('w'), next_char_boundary → 7. Inclusive bug:
-        // vim's dw (exclusive) should give end=6, deleting "hello ".
-        assert_eq!(end, 7);
+        assert_eq!(end, 6);
         assert!(!linewise);
     }
 
     #[test]
-    fn motion_backward_char() {
+    fn motion_backward_char_dh() {
         let text = "hello";
         let (start, end, linewise) =
             resolve_target_range(text, 3, &EditTarget::Motion(
                 MoveType::Column(MoveDir1D::Previous, false),
                 Count::Contextual,
             ), &ctx(), &state()).unwrap();
-        // h: target=2, cursor=3 → (start=2, end=3), extended to 4.
-        // Same inclusive bug: dh should delete [2,3) = 1 char.
+        // dh on "hello" from cursor 3 ('l'): h lands at 2, exclusive → end=3,
+        // deletes the second 'l' only.
         assert_eq!(start, 2);
+        assert_eq!(end, 3);
+        assert!(!linewise);
+    }
+
+    #[test]
+    fn motion_forward_char_dl() {
+        let text = "hello";
+        let (start, end, linewise) =
+            resolve_target_range(text, 1, &EditTarget::Motion(
+                MoveType::Column(MoveDir1D::Next, false),
+                Count::Contextual,
+            ), &ctx(), &state()).unwrap();
+        // dl on "hello" from cursor 1 ('e'): l lands at 2 ('l'), exclusive →
+        // end=2, deletes 'e' only.
+        assert_eq!(start, 1);
+        assert_eq!(end, 2);
+        assert!(!linewise);
+    }
+
+    #[test]
+    fn motion_word_end_de_inclusive() {
+        let text = "hello world";
+        let (start, end, linewise) =
+            resolve_target_range(text, 0, &EditTarget::Motion(
+                MoveType::WordEnd(editor_types::prelude::WordStyle::Little, MoveDir1D::Next),
+                Count::Contextual,
+            ), &ctx(), &state()).unwrap();
+        // de on "hello world" from cursor 0: e lands at 4 ('o'), inclusive →
+        // end=5, deletes "hello".
+        assert_eq!(start, 0);
+        assert_eq!(end, 5);
+        assert!(!linewise);
+    }
+
+    #[test]
+    fn motion_dollar_d_dollar_inclusive() {
+        let text = "hello\nworld";
+        let (start, end, linewise) =
+            resolve_target_range(text, 1, &EditTarget::Motion(
+                MoveType::LinePos(editor_types::prelude::MovePosition::End),
+                Count::Contextual,
+            ), &ctx(), &state()).unwrap();
+        // d$ on "hello\nworld" from cursor 1 ('e'): $ lands at 4 ('o'),
+        // inclusive → end=5, deletes "ello".
+        assert_eq!(start, 1);
+        assert_eq!(end, 5);
+        assert!(!linewise);
+    }
+
+    #[test]
+    fn motion_zero_d_zero_exclusive() {
+        let text = "  hello";
+        let (start, end, linewise) =
+            resolve_target_range(text, 4, &EditTarget::Motion(
+                MoveType::LinePos(editor_types::prelude::MovePosition::Beginning),
+                Count::Contextual,
+            ), &ctx(), &state()).unwrap();
+        // d0 on "  hello" from cursor 4 ('l'): 0 lands at 0, exclusive →
+        // end=4, deletes "  he".
+        assert_eq!(start, 0);
         assert_eq!(end, 4);
         assert!(!linewise);
     }
@@ -587,5 +646,146 @@ mod tests {
     fn x_empty_text() {
         let result = resolve_target_range("", 0, &EditTarget::CurrentPosition, &ctx(), &state());
         assert!(result.is_none());
+    }
+
+    // ── Backspace in Insert mode ──
+    //
+    // Verify what modalkit emits when Backspace is pressed in Insert mode.
+    // This is the verification test called out in docs/issues.md:136-137.
+    // If the emitted action is `EditAction::Delete` with a `Column(Previous)`
+    // motion target, the existing Delete arm in `translate_action` (combined
+    // with the exclusive-motion fix) handles it correctly.
+
+    use modalkit::crossterm::event::{KeyCode as CtKeyCode, KeyEvent, KeyModifiers};
+    use modalkit::editing::store::Store;
+    use modalkit::env::vim::keybindings::{VimBindings, VimMachine};
+    use modalkit::key::TerminalKey;
+    use modalkit::keybindings::{BindingMachine, InputBindings};
+    use editor_types::Action as MkAction;
+    use editor_types::EditorAction;
+    use crate::input::vim::{KaijutsuInfo, KaijutsuStore};
+
+    fn make_machine() -> (VimMachine<TerminalKey, KaijutsuInfo>, Store<KaijutsuInfo>) {
+        let mut machine = VimMachine::<TerminalKey, KaijutsuInfo>::empty();
+        VimBindings::default().submit_on_enter().setup(&mut machine);
+        let store = Store::new(KaijutsuStore);
+        (machine, store)
+    }
+
+    fn key(code: CtKeyCode) -> TerminalKey {
+        TerminalKey::from(KeyEvent::new(code, KeyModifiers::empty()))
+    }
+
+    /// Drain all actions the VimMachine has buffered into a Vec.
+    fn drain_actions(
+        machine: &mut VimMachine<TerminalKey, KaijutsuInfo>,
+    ) -> Vec<MkAction<KaijutsuInfo>> {
+        let mut out = Vec::new();
+        while let Some((action, _ctx)) = machine.pop() {
+            out.push(action);
+        }
+        out
+    }
+
+    #[test]
+    fn backspace_insert_mode_emits_delete() {
+        let (mut machine, _store) = make_machine();
+
+        // Enter Insert mode with `i`.
+        machine.input_key(key(CtKeyCode::Char('i')));
+        let _ = drain_actions(&mut machine);
+        assert_eq!(
+            machine.show_mode().as_deref(),
+            Some("-- INSERT --"),
+            "expected INSERT mode after pressing 'i'"
+        );
+
+        // Press Backspace.
+        machine.input_key(key(CtKeyCode::Backspace));
+        let actions = drain_actions(&mut machine);
+
+        // Modalkit should produce at least one Editor action containing a
+        // delete (either an Edit(Delete, Motion) or an InsertText delete
+        // variant). Confirm something edit-related came out so we can wire
+        // it through translate_action — pin the exact variant once we know
+        // what modalkit produces.
+        let saw_editor = actions.iter().any(|a| matches!(a, MkAction::Editor(_)));
+        assert!(
+            saw_editor,
+            "Backspace in Insert mode produced no editor action; \
+             actions = {:#?}",
+            actions
+        );
+    }
+
+    #[test]
+    fn backspace_insert_mode_action_shape() {
+        // Pin the exact shape of the emitted action so future modalkit
+        // changes don't silently break Insert-mode Backspace.
+        let (mut machine, _store) = make_machine();
+        machine.input_key(key(CtKeyCode::Char('i')));
+        let _ = drain_actions(&mut machine);
+        machine.input_key(key(CtKeyCode::Backspace));
+        let actions = drain_actions(&mut machine);
+
+        // Find the editor action — print debug for diagnostics if shape changes.
+        let editor_action = actions
+            .iter()
+            .find_map(|a| match a {
+                MkAction::Editor(e) => Some(e),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no editor action; got {:#?}", actions));
+
+        // We expect Edit(EditAction::Delete, EditTarget::Motion(Column(Previous), _))
+        // — the standard "delete one char to the left" shape. If modalkit
+        // emits something else (e.g. an InsertText delete variant), this
+        // assertion fails and we add a new translate_action arm.
+        match editor_action {
+            EditorAction::Edit(op_spec, target) => {
+                let is_column_prev = matches!(
+                    target,
+                    EditTarget::Motion(MoveType::Column(MoveDir1D::Previous, _), _)
+                );
+                assert!(
+                    is_column_prev,
+                    "expected Edit(_, Motion(Column(Previous, _), _)); got Edit(_, {:?})",
+                    target
+                );
+
+                // The op spec must resolve to Delete — that's what makes
+                // translate_action's Delete arm handle it correctly.
+                let resolved: EditAction = ctx().resolve(op_spec);
+                assert!(
+                    matches!(resolved, EditAction::Delete),
+                    "expected op to resolve to EditAction::Delete; got {:?}",
+                    resolved
+                );
+            }
+            other => {
+                panic!(
+                    "expected EditorAction::Edit(...); got {:?}\nfull actions = {:#?}",
+                    other, actions
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn backspace_range_is_one_char() {
+        // End-to-end of the data flow inside resolve_target_range: given
+        // the action shape modalkit emits for Insert-mode Backspace, the
+        // resolved range should be exactly one char before the cursor.
+        // This is the property that makes Backspace work post-Item-1.
+        let text = "hello";
+        let target = EditTarget::Motion(
+            MoveType::Column(MoveDir1D::Previous, false),
+            Count::Contextual,
+        );
+        let (start, end, linewise) =
+            resolve_target_range(text, 3, &target, &ctx(), &state()).unwrap();
+        assert_eq!(start, 2);
+        assert_eq!(end, 3);
+        assert!(!linewise);
     }
 }

@@ -36,6 +36,8 @@
 @group(1) @binding(9) var<uniform> border_insets: vec4<f32>;
 @group(1) @binding(10) var<uniform> border_color: vec4<f32>;
 @group(1) @binding(11) var<uniform> label_gaps: vec4<f32>;
+@group(1) @binding(12) var<uniform> selection_params: vec4<f32>;
+@group(1) @binding(13) var<uniform> selection_color: vec4<f32>;
 
 // Border kind constants
 const BK_NONE: f32 = 0.0;
@@ -323,6 +325,22 @@ fn fragment(in: UiVertexOutput) -> @location(0) vec4<f32> {
             result = vec4<f32>(
                 result.rgb + result.rgb * boost,
                 result.a,
+            );
+        }
+    }
+
+    // --- Visual-mode selection rect (composited UNDER cursor, OVER text) ---
+    // Translucent background — text shows through, cursor still draws on top.
+    if selection_params.z > 0.0 && selection_params.w > 0.0 {
+        let sx = selection_params.x;
+        let sy = selection_params.y;
+        let sw = selection_params.z;
+        let sh = selection_params.w;
+        if in.uv.x >= sx && in.uv.x <= sx + sw && in.uv.y >= sy && in.uv.y <= sy + sh {
+            let sa = selection_color.a;
+            result = vec4<f32>(
+                result.rgb * (1.0 - sa) + selection_color.rgb * sa,
+                result.a * (1.0 - sa) + sa,
             );
         }
     }

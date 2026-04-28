@@ -242,6 +242,45 @@ fn convert_word_style(style: &MkWordStyle) -> WordStyle {
     }
 }
 
+/// Whether a motion's end position should be included in operator-pending ranges.
+///
+/// Vim distinguishes exclusive motions (`w`, `b`, `h`, `l`, `0`, `^`) — the char
+/// AT the destination is NOT consumed — from inclusive motions (`e`, `$`, `g_`,
+/// `f<x>`) where it IS. `dw` deletes [cursor, w-target); `de` deletes
+/// [cursor, e-target].
+///
+/// Unmapped variants default to inclusive — matches the pre-classification
+/// behavior of `resolve_target_range`, so adding new motions doesn't silently
+/// regress.
+pub fn is_inclusive(move_type: &MoveType) -> bool {
+    match move_type {
+        // Exclusive — endpoint is NOT consumed.
+        MoveType::Column(_, _) => false,
+        MoveType::WordBegin(_, _) => false,
+        MoveType::LinePos(MovePosition::Beginning) => false,
+        MoveType::FirstWord(_) => false,
+
+        // Inclusive — endpoint IS consumed.
+        MoveType::WordEnd(_, _) => true,
+        MoveType::LinePos(MovePosition::End) => true,
+        MoveType::FinalNonBlank(_) => true,
+
+        // Linewise / buffer-line motions — currently routed through the
+        // charwise extend path. Keep today's inclusive treatment until proper
+        // linewise handling lands for `dj` / `dgg` / `dG`.
+        MoveType::Line(_) => true,
+        MoveType::BufferPos(_) => true,
+        MoveType::BufferLineOffset => true,
+
+        // Default: inclusive (preserves pre-fix behavior for any MoveType we
+        // haven't classified yet — won't silently break unfamiliar motions).
+        _ => {
+            log::trace!("vim: is_inclusive default-inclusive for {:?}", move_type);
+            true
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -618,5 +657,45 @@ mod tests {
         let mt = MoveType::WordEnd(MkWordStyle::Little, MoveDir1D::Previous);
         let r = resolve("hello", 2, &mt, &Count::Contextual, &ctx(), &motion_ctx());
         assert_eq!(r.cursor, 2); // unchanged
+    }
+
+    // ── is_inclusive classification ──
+
+    #[test]
+    fn inclusive_word_begin_is_exclusive() {
+        let mt = MoveType::WordBegin(MkWordStyle::Little, MoveDir1D::Next);
+        assert!(!is_inclusive(&mt));
+    }
+
+    #[test]
+    fn inclusive_column_is_exclusive() {
+        assert!(!is_inclusive(&MoveType::Column(MoveDir1D::Next, false)));
+        assert!(!is_inclusive(&MoveType::Column(MoveDir1D::Previous, false)));
+    }
+
+    #[test]
+    fn inclusive_zero_is_exclusive() {
+        assert!(!is_inclusive(&MoveType::LinePos(MovePosition::Beginning)));
+    }
+
+    #[test]
+    fn inclusive_caret_is_exclusive() {
+        assert!(!is_inclusive(&MoveType::FirstWord(MoveDir1D::Next)));
+    }
+
+    #[test]
+    fn inclusive_word_end_is_inclusive() {
+        let mt = MoveType::WordEnd(MkWordStyle::Little, MoveDir1D::Next);
+        assert!(is_inclusive(&mt));
+    }
+
+    #[test]
+    fn inclusive_dollar_is_inclusive() {
+        assert!(is_inclusive(&MoveType::LinePos(MovePosition::End)));
+    }
+
+    #[test]
+    fn inclusive_g_underscore_is_inclusive() {
+        assert!(is_inclusive(&MoveType::FinalNonBlank(MoveDir1D::Next)));
     }
 }
