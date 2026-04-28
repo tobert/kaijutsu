@@ -300,12 +300,13 @@ async fn process_llm_stream(
         Ok(blocks) => {
             let mut hydrated = kaijutsu_kernel::hydrate_from_blocks(&blocks);
             // Resolve any (Asset, Text, Image) blocks against CAS so vision-
-            // capable providers receive the actual bytes. Unresolved hashes
-            // fall back to a text marker via to_rig_request — never panic.
-            kaijutsu_kernel::resolve_image_blocks_from_cas(
-                &mut hydrated,
-                kernel.cas().as_ref(),
-            );
+            // capable providers receive the actual bytes. CAS reads are
+            // blocking std::fs; the resolver delegates each to
+            // spawn_blocking so the runtime stays responsive on stacks of
+            // images. Unresolved hashes fall back to a text marker via
+            // to_rig_request — never panic.
+            let cas: std::sync::Arc<dyn kaijutsu_kernel::ContentStore> = kernel.cas().clone();
+            kaijutsu_kernel::resolve_image_blocks_from_cas(&mut hydrated, cas).await;
             log::info!(
                 "Hydrated {} messages from {} blocks for context {}",
                 hydrated.len(),
@@ -340,7 +341,10 @@ async fn process_llm_stream(
     // aware (M1-A6): in Collaborative mode the loop yields after one
     // tool round-trip + synthesis so the human stays in the loop; in
     // Autonomous mode the model can chain up to AUTONOMOUS_MAX_ITERATIONS.
-    let max_iterations = iteration_cap_for_consent(kernel.consent_mode().await);
+    // Read consent once per stream so the cap and any halt message stay
+    // coherent if the operator toggles consent mid-flight.
+    let consent = kernel.consent_mode().await;
+    let max_iterations = iteration_cap_for_consent(consent);
     let mut iteration: u32 = 0;
     // Max retries for transient LLM provider failures (network blips, rate limits)
     const MAX_LLM_RETRIES: u32 = 2;
@@ -355,7 +359,6 @@ async fn process_llm_stream(
             // Consent-aware halt message (M1-A6): in Collaborative mode the
             // cap is intentional, not a runaway. Tell the user how to
             // resume rather than just signaling an alarm.
-            let consent = kernel.consent_mode().await;
             let halt_msg = match consent {
                 ConsentMode::Collaborative => format!(
                     "Paused after {max_iterations} agentic iteration(s) (consent: collaborative). \

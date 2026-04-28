@@ -134,3 +134,8 @@ pub use kernel_db::{
     WorkspaceRow,
 };
 pub use kj::{KjCaller, KjDispatcher, KjResult};
+
+// Re-export the CAS trait so downstream crates (kaijutsu-server) can
+// pass `kernel.cas()` into helpers like `resolve_image_blocks_from_cas`
+// without taking a direct dependency on `kaijutsu-cas`.
+pub use kaijutsu_cas::ContentStore;

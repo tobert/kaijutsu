@@ -56,6 +56,51 @@ following are explicit follow-ups that did not ship:
   `builtin.policy` get/set surface; per-principal accounting is the
   next layer up.
 
+## LLM providers
+
+- **Extended-thinking signature plumbing.** `ContentBlock::Reasoning`
+  preserves in-call thinking across tool-use iterations (A3, shipped in
+  fe6934f) but `signature` is hard-coded to `None` because the rig
+  adapter flattens streamed reasoning to delta text and drops the
+  provider signature. Safe today — extended thinking isn't enabled on
+  any production path. If/when it is, Anthropic will reject any
+  Reasoning block that follows a tool_use without a valid signature.
+  Wire signatures through `RigStreamAdapter` (capture from
+  `StreamedAssistantContent::Reasoning` and surface on
+  `StreamEvent::ThinkingEnd`), accumulate alongside `assistant_thinking`
+  in `llm_stream.rs`, and pass through `with_reasoning_text_and_tool_uses`.
+- **Cross-turn thinking continuity.** `hydrate_from_blocks` skips
+  `BlockKind::Thinking` entirely (`llm/mod.rs:843`), so reasoning never
+  re-enters the conversation between separate `process_llm_stream`
+  calls. Out of scope per the original A3 framing; revisit if extended
+  thinking lands and the stale-reasoning cost is worth the token spend.
+- **Reconsider `rig` as the provider abstraction.** Extended-thinking
+  signature plumbing (above), image fallback semantics, reasoning
+  round-trip, and truncation-vs-error handling all push against rig's
+  current model. We may be hitting the wall where a thin
+  provider-specific layer earns its keep over a generic adapter. Worth
+  periodic review.
+- **Memoize CAS image base64 in `ConversationCache`.**
+  `resolve_image_blocks_from_cas` reads + base64-encodes every image's
+  bytes per prompt. The spawn_blocking fix took the runtime stall out;
+  next is caching by `(context_id, hash)` so a 20-image conversation
+  doesn't re-encode every screenshot every turn.
+- **`personas_define` instance-id validation.** Define-time check
+  against `broker.instances_snapshot()` so a typo doesn't silently
+  apply with no tools (the auto-injection guard catches the worst case
+  but a stricter check earlier would be friendlier).
+- **`xml_escape` allocates per attribute.**
+  `crates/kaijutsu-kernel/src/llm/system_prompt.rs:140` does four
+  chained `.replace()` calls per attribute string, allocating a new
+  `String` each. Single-pass char loop would halve allocation pressure
+  on the per-prompt path. Cleanup, not a hotspot.
+- **`McpToolCall.legacyServer @0` capnp cleanup.** Field renamed to
+  `legacyServer` and ignored on both sides; the only thing keeping it
+  in the schema is capnp's contiguous-ordinal rule. Drop it (and
+  renumber `tool`/`arguments`) in a coordinated wire-schema bump,
+  bundled with any other deprecated-field removals so we eat the
+  break once.
+
 ## Persistence & sync
 
 - **`KernelDb` connection pool.** Currently `Arc<parking_lot::Mutex<KernelDb>>`

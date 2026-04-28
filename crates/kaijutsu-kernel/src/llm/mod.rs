@@ -792,9 +792,14 @@ impl LlmRegistry {
 /// hashes and CAS errors are tolerated: the block stays unfilled, and
 /// rig-conversion falls back to a text marker so the model knows an image
 /// existed at that turn.
-pub fn resolve_image_blocks_from_cas(
+///
+/// CAS reads use blocking `std::fs` (see `kaijutsu_cas::FileStore`), so each
+/// image is read on a `spawn_blocking` worker — keeps the tokio runtime
+/// responsive when a long-history conversation re-encodes many images per
+/// prompt.
+pub async fn resolve_image_blocks_from_cas(
     messages: &mut [Message],
-    cas: &dyn kaijutsu_cas::ContentStore,
+    cas: std::sync::Arc<dyn kaijutsu_cas::ContentStore>,
 ) {
     use base64::Engine;
     use kaijutsu_cas::ContentHash;
@@ -819,20 +824,31 @@ pub fn resolve_image_blocks_from_cas(
                 Ok(h) => h,
                 Err(_) => continue,
             };
+            // Both inspect (sidecar mime) and retrieve (object bytes) are
+            // blocking std::fs reads — bundle them into one spawn_blocking
+            // so the runtime stays responsive even for stacks of images.
+            let cas_for_task = cas.clone();
+            let parsed_for_task = parsed;
+            let join = tokio::task::spawn_blocking(move || {
+                let inspected = cas_for_task.inspect(&parsed_for_task).ok().flatten();
+                let bytes = cas_for_task.retrieve(&parsed_for_task).ok().flatten();
+                (inspected, bytes)
+            })
+            .await;
+            let (inspected, bytes) = match join {
+                Ok(pair) => pair,
+                Err(_) => continue, // worker panicked; leave block unresolved
+            };
             // Prefer CAS-recorded mime over the hydrator's defaulted one;
             // CAS sidecar metadata reflects what was actually stored.
-            if let Ok(Some(reference)) = cas.inspect(&parsed) {
+            if let Some(reference) = inspected {
                 *media_type = reference.mime_type;
             }
-            match cas.retrieve(&parsed) {
-                Ok(Some(bytes)) => {
-                    let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                    *data_base64 = Some(encoded);
-                }
-                _ => {
-                    // Stay unresolved — rig-conversion emits a text marker.
-                }
+            if let Some(bytes) = bytes {
+                let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                *data_base64 = Some(encoded);
             }
+            // Otherwise stay unresolved — rig-conversion emits a text marker.
         }
     }
 }
@@ -2992,11 +3008,12 @@ mod tests {
             }
         }
 
-        #[test]
-        fn resolve_image_blocks_fills_data_from_cas() {
+        #[tokio::test]
+        async fn resolve_image_blocks_fills_data_from_cas() {
             use kaijutsu_cas::{ContentStore, FileStore};
             let tmp = tempfile::tempdir().unwrap();
-            let cas = FileStore::at_path(tmp.path());
+            let cas: std::sync::Arc<dyn ContentStore> =
+                std::sync::Arc::new(FileStore::at_path(tmp.path()));
             // 1x1 transparent PNG to keep the fixture small but legitimate.
             let png_bytes: &[u8] = &[
                 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
@@ -3014,7 +3031,7 @@ mod tests {
                     data_base64: None,
                 }]),
             }];
-            resolve_image_blocks_from_cas(&mut messages, &cas);
+            resolve_image_blocks_from_cas(&mut messages, cas).await;
             match &messages[0].content {
                 MessageContent::Blocks(blocks) => match &blocks[0] {
                     ContentBlock::Image { data_base64, .. } => {
@@ -3029,11 +3046,12 @@ mod tests {
             }
         }
 
-        #[test]
-        fn resolve_image_blocks_tolerates_missing_hash() {
+        #[tokio::test]
+        async fn resolve_image_blocks_tolerates_missing_hash() {
             use kaijutsu_cas::{ContentStore, FileStore};
             let tmp = tempfile::tempdir().unwrap();
-            let cas = FileStore::at_path(tmp.path());
+            let cas: std::sync::Arc<dyn ContentStore> =
+                std::sync::Arc::new(FileStore::at_path(tmp.path()));
             let mut messages = vec![Message {
                 role: Role::User,
                 content: MessageContent::Blocks(vec![ContentBlock::Image {
@@ -3043,7 +3061,7 @@ mod tests {
                 }]),
             }];
             // Should not panic, should leave block unresolved.
-            resolve_image_blocks_from_cas(&mut messages, &cas);
+            resolve_image_blocks_from_cas(&mut messages, cas).await;
             match &messages[0].content {
                 MessageContent::Blocks(blocks) => match &blocks[0] {
                     ContentBlock::Image { data_base64, .. } => {
