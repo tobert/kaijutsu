@@ -208,7 +208,7 @@ fn test_call_mcp_tool_dispatches_builtin_over_ssh() {
         kernel.join_context(ctx_id, "test-mcp").await.unwrap();
 
         let result = kernel
-            .call_mcp_tool("builtin.kernel_info", "whoami", &serde_json::json!({}))
+            .call_mcp_tool("whoami", &serde_json::json!({}))
             .await
             .expect("call_mcp_tool over SSH");
         assert!(
@@ -237,7 +237,7 @@ fn test_call_mcp_tool_unknown_tool_errors() {
         kernel.join_context(ctx_id, "test-mcp").await.unwrap();
 
         let result = kernel
-            .call_mcp_tool("builtin.kernel_info", "no_such_tool", &serde_json::json!({}))
+            .call_mcp_tool("no_such_tool", &serde_json::json!({}))
             .await;
         assert!(
             result.is_err(),
@@ -259,7 +259,7 @@ fn test_call_mcp_tool_requires_joined_context() {
         // No join_context call.
 
         let result = kernel
-            .call_mcp_tool("builtin.kernel_info", "whoami", &serde_json::json!({}))
+            .call_mcp_tool("whoami", &serde_json::json!({}))
             .await;
         assert!(
             result.is_err(),

@@ -765,7 +765,11 @@ struct McpToolInfo {
 }
 
 struct McpToolCall {
-  server @0 :Text;            # Server name (e.g., "git")
+  # DEPRECATED. The broker resolves tool → instance via the calling
+  # context's binding; passing a server name here is not load-bearing.
+  # Field reserved at @0 because capnp ordinals must be contiguous;
+  # remove via a coordinated wire-schema bump (see docs/issues.md).
+  legacyServer @0 :Text;
   tool @1 :Text;              # Tool name (e.g., "git_status")
   arguments @2 :Text;         # JSON-encoded arguments
 }

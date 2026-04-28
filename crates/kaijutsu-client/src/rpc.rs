@@ -743,20 +743,20 @@ impl KernelHandle {
         Ok(result)
     }
 
-    /// Call an MCP tool
+    /// Call an MCP tool.
     ///
-    /// Invokes a tool on a registered MCP server and returns the result.
+    /// Tool name is resolved against the calling context's binding —
+    /// there is no longer a `server` parameter (the schema's `legacyServer`
+    /// field is deprecated and ignored by the kernel).
     #[tracing::instrument(skip(self, arguments), name = "rpc_client.call_mcp_tool")]
     pub async fn call_mcp_tool(
         &self,
-        server: &str,
         tool: &str,
         arguments: &serde_json::Value,
     ) -> Result<McpToolResult, RpcError> {
         let mut request = self.kernel.call_mcp_tool_request();
         {
             let mut call = request.get().init_call();
-            call.set_server(server);
             call.set_tool(tool);
             call.set_arguments(
                 &serde_json::to_string(arguments).map_err(|e| {

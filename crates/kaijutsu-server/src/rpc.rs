@@ -2239,10 +2239,10 @@ impl kernel::Server for KernelImpl {
         let p = pry!(params.get());
         let _trace_guard = extract_rpc_trace(p.get_trace(), "call_mcp_tool").entered();
         let call = pry!(p.get_call());
-        // Schema names the field `server` for legacy reasons; the tool
-        // routing today only uses tool name (the broker's binding picks
-        // the instance), so we ignore `server` and trust the binding.
-        let _server = pry!(pry!(call.get_server()).to_str()).to_owned();
+        // `legacyServer` is deprecated and intentionally not read — the
+        // broker's binding owns tool → instance resolution. Removing the
+        // field outright would force a contiguity-driven capnp renumber;
+        // tracked in docs/issues.md for a coordinated wire bump.
         let tool_name = pry!(pry!(call.get_tool()).to_str()).to_owned();
         let arguments = pry!(pry!(call.get_arguments()).to_str()).to_owned();
 

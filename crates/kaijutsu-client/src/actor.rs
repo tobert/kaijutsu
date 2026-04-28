@@ -193,7 +193,6 @@ enum RpcCommand {
         reply: oneshot::Sender<Result<Vec<ToolSchema>, ActorError>>,
     },
     CallMcpTool {
-        server: String,
         tool: String,
         arguments: serde_json::Value,
         reply: oneshot::Sender<Result<McpToolResult, ActorError>>,
@@ -846,16 +845,16 @@ impl ActorHandle {
             .await
     }
 
-    /// Call an MCP tool.
+    /// Call an MCP tool. Tool name is resolved by the calling context's
+    /// binding — the server-name parameter that previously rode along
+    /// here was never load-bearing and has been dropped.
     #[tracing::instrument(skip(self, arguments))]
     pub async fn call_mcp_tool(
         &self,
-        server: &str,
         tool: &str,
         arguments: &serde_json::Value,
     ) -> Result<McpToolResult, ActorError> {
         self.send(|reply| RpcCommand::CallMcpTool {
-            server: server.into(),
             tool: tool.into(),
             arguments: arguments.clone(),
             reply,
@@ -1593,7 +1592,6 @@ async fn dispatch_command(
             rpc_call!(kernel, reply, err_tx, k, k.get_tool_schemas());
         }
         RpcCommand::CallMcpTool {
-            server,
             tool,
             arguments,
             reply,
@@ -1603,7 +1601,7 @@ async fn dispatch_command(
                 reply,
                 err_tx,
                 k,
-                k.call_mcp_tool(&server, &tool, &arguments)
+                k.call_mcp_tool(&tool, &arguments)
             );
         }
 
