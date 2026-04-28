@@ -326,7 +326,9 @@ async fn personas_list_define_apply_round_trip() {
         .list_tool_defs_via_broker(fx.ctx_id, fx.exec_ctx.principal_id)
         .await;
     let names_after: Vec<&str> = visible_after.iter().map(|(n, _, _)| n.as_str()).collect();
-    // Only kernel_info tools (whoami) should remain — block_create etc. dropped.
+    // kernel_info's `whoami` is the persona's own contribution. Block
+    // tools (block_create etc.) must drop. `personas_apply` is auto-
+    // injected so the model never paints itself into a corner.
     assert!(
         names_after.contains(&"whoami"),
         "expected whoami, got {names_after:?}"
@@ -334,6 +336,100 @@ async fn personas_list_define_apply_round_trip() {
     assert!(
         !names_after.contains(&"block_create"),
         "minimal persona should drop block tools, got {names_after:?}"
+    );
+    assert!(
+        names_after.contains(&"personas_apply"),
+        "personas_apply must stay callable post-apply, got {names_after:?}"
+    );
+    assert!(
+        names_after.contains(&"tool_search"),
+        "tool_search must stay callable post-apply, got {names_after:?}"
+    );
+}
+
+#[tokio::test]
+async fn seeded_personas_keep_personas_callable() {
+    // Regression for the "personas_apply is a one-way trapdoor" bug:
+    // each shipped seed must produce a binding from which personas_apply
+    // and tool_search are still callable. Earlier the seeds had empty
+    // instances, which zeroed out the entire tool surface — including
+    // personas_apply itself.
+    for persona in ["planner", "coder", "explorer"] {
+        let fx = setup().await;
+        // Seed the binding so builtin.personas is visible to start.
+        let _ = fx
+            .kernel
+            .list_tool_defs_via_broker(fx.ctx_id, fx.exec_ctx.principal_id)
+            .await;
+
+        let apply = fx
+            .kernel
+            .dispatch_tool_via_broker(
+                "personas_apply",
+                &serde_json::json!({ "name": persona }).to_string(),
+                &fx.exec_ctx,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("apply {persona} dispatch failed: {e:?}"));
+        assert!(
+            apply.success,
+            "apply {persona} reported failure: {}",
+            apply.stderr
+        );
+
+        // Visible tools after apply must still include personas_apply and
+        // tool_search regardless of the persona's literal instance list.
+        let visible = fx
+            .kernel
+            .list_tool_defs_via_broker(fx.ctx_id, fx.exec_ctx.principal_id)
+            .await;
+        let names: Vec<&str> = visible.iter().map(|(n, _, _)| n.as_str()).collect();
+        assert!(
+            names.contains(&"personas_apply"),
+            "{persona}: personas_apply missing post-apply, got {names:?}"
+        );
+        assert!(
+            names.contains(&"tool_search"),
+            "{persona}: tool_search missing post-apply, got {names:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn personas_apply_rejects_empty_instances() {
+    // A user-defined persona with no instances must error on apply
+    // rather than installing a binding of just the auto-injected guards
+    // — that would silently produce a meaningless tool surface.
+    let fx = setup().await;
+    let _ = fx
+        .kernel
+        .list_tool_defs_via_broker(fx.ctx_id, fx.exec_ctx.principal_id)
+        .await;
+
+    let define = fx
+        .kernel
+        .dispatch_tool_via_broker(
+            "personas_define",
+            &serde_json::json!({"name": "blank", "instances": []}).to_string(),
+            &fx.exec_ctx,
+        )
+        .await
+        .expect("define");
+    assert!(define.success, "define failed: {}", define.stderr);
+
+    let err = fx
+        .kernel
+        .dispatch_tool_via_broker(
+            "personas_apply",
+            &serde_json::json!({"name": "blank"}).to_string(),
+            &fx.exec_ctx,
+        )
+        .await
+        .expect_err("apply must reject empty-instances persona");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("no instances") || msg.contains("personas_define"),
+        "expected error to mention empty instances / personas_define, got: {msg}"
     );
 }
 

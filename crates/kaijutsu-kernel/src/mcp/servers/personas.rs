@@ -76,28 +76,51 @@ impl BuiltinPersonasServer {
             personas: Arc::new(DashMap::new()),
             notif_tx,
         };
-        // Seed the four archetypes the plan calls out so they're visible
-        // immediately. Empty `instances` means "no tool curation" — apply
-        // is still useful for the named identity even if the binding is
-        // open-ended; users override via `personas_define`.
-        for (name, desc) in [
-            ("planner", "High-level planning + drift; no execution surface."),
+        // Seed three archetypes with concrete builtin instance bundles.
+        // `personas_apply` auto-injects `builtin.personas` and
+        // `builtin.tool_search` regardless of the persona definition, so
+        // the seeds list only the topical tools — switch + search is
+        // implicit. Sound-engineer-style archetypes that depend on
+        // external servers (gpal, pawlsa) are left for users to
+        // `personas_define`; they aren't seeded because the relevant
+        // instances may not be registered.
+        let seeds: &[(&str, &str, &[&str])] = &[
+            (
+                "planner",
+                "High-level planning. Block manipulation + tool discovery.",
+                &[
+                    super::block::BlockToolsServer::INSTANCE,
+                    super::kernel_info::KernelInfoServer::INSTANCE,
+                ],
+            ),
             (
                 "coder",
-                "Block + file tools, broker hooks. Default writing surface.",
+                "Default writing surface: blocks, files, hooks.",
+                &[
+                    super::block::BlockToolsServer::INSTANCE,
+                    super::file::FileToolsServer::INSTANCE,
+                    super::hooks_builtin::BuiltinHooksServer::INSTANCE,
+                    super::kernel_info::KernelInfoServer::INSTANCE,
+                ],
             ),
-            ("explorer", "Read-mostly: file reads, semantic search."),
             (
-                "sound engineer",
-                "Audio + image generation focus (gpal, pawlsa, image_gen).",
+                "explorer",
+                "Read-mostly: file reads, blocks, MCP resources.",
+                &[
+                    super::file::FileToolsServer::INSTANCE,
+                    super::block::BlockToolsServer::INSTANCE,
+                    super::resources_builtin::BuiltinResourcesServer::INSTANCE,
+                    super::kernel_info::KernelInfoServer::INSTANCE,
+                ],
             ),
-        ] {
+        ];
+        for (name, desc, instances) in seeds {
             server.personas.insert(
                 name.to_string(),
                 Persona {
                     name: name.to_string(),
                     description: Some(desc.to_string()),
-                    instances: Vec::new(),
+                    instances: instances.iter().map(|s| InstanceId::new(*s)).collect(),
                 },
             );
         }
@@ -128,8 +151,7 @@ impl McpServerLike for BuiltinPersonasServer {
                 name: "personas_list".to_string(),
                 description: Some(
                     "Enumerate registered personas (planner / coder / \
-                     explorer / sound engineer ship by default; users \
-                     can `personas_define` more)."
+                     explorer ship by default; users can `personas_define` more)."
                         .to_string(),
                 ),
                 input_schema: serde_json::to_value(list_schema)
@@ -140,8 +162,11 @@ impl McpServerLike for BuiltinPersonasServer {
                 name: "personas_apply".to_string(),
                 description: Some(
                     "Set the calling context's tool binding to a persona's \
-                     instance list. Subsequent list/dispatch sees only \
-                     those instances' tools."
+                     instance list. The applied binding always includes \
+                     `builtin.personas` and `builtin.tool_search` so the \
+                     model can switch personas and discover tools — every \
+                     other instance is the persona's literal definition. \
+                     Errors when the persona's instance list is empty."
                         .to_string(),
                 ),
                 input_schema: serde_json::to_value(apply_schema)
@@ -203,15 +228,40 @@ impl McpServerLike for BuiltinPersonasServer {
                         "no persona named {:?} (use personas_list to see available)",
                         parsed.name
                     )))?;
+                // Reject apply when the persona's user-defined instance list
+                // is empty — auto-injecting personas + tool_search would
+                // produce a binding with two tools and no real surface,
+                // which is not what the user asked for. Point them at
+                // personas_define.
+                if persona.instances.is_empty() {
+                    return Err(McpError::Protocol(format!(
+                        "persona {:?} has no instances — use personas_define \
+                         to populate it before applying",
+                        parsed.name
+                    )));
+                }
+                // Auto-inject personas + tool_search so the model can
+                // always switch personas and discover what it has, even
+                // when the persona definition omits them. Dedup against
+                // the persona's own list to keep ordering stable.
+                let mut instances: Vec<InstanceId> = persona.instances.clone();
+                for required in [
+                    InstanceId::new(Self::INSTANCE),
+                    InstanceId::new(super::tool_search::BuiltinToolSearchServer::INSTANCE),
+                ] {
+                    if !instances.contains(&required) {
+                        instances.push(required);
+                    }
+                }
                 let broker = self.broker()?;
-                let binding = ContextToolBinding::with_instances(persona.instances.clone());
+                let binding = ContextToolBinding::with_instances(instances.clone());
                 broker.set_binding(ctx.context_id, binding).await;
                 Ok(KernelToolResult {
                     is_error: false,
                     content: vec![],
                     structured: Some(serde_json::json!({
                         "applied": parsed.name,
-                        "instances": persona.instances.iter().map(|i| i.as_str()).collect::<Vec<_>>(),
+                        "instances": instances.iter().map(|i| i.as_str()).collect::<Vec<_>>(),
                     })),
                 })
             }
