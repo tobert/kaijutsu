@@ -31,7 +31,7 @@ use crate::rpc::{
 use crate::subscriptions::{
     BlockEventsForwarder, ConnectionStatus, ResourceEventsForwarder, ServerEvent,
 };
-use crate::{KernelHandle, RpcClient, SshConfig, connect_ssh};
+use crate::{ConnectError, KernelHandle, RpcClient, SshConfig, connect_ssh};
 
 /// Channel capacity — when 32 commands are in-flight, callers block on send.
 const CHANNEL_CAPACITY: usize = 32;
@@ -1146,6 +1146,11 @@ struct RpcActor {
     /// When the next reconnect attempt is allowed (exponential backoff).
     /// None = no cooldown, reconnect immediately.
     next_reconnect_at: Option<tokio::time::Instant>,
+    /// Sticky error from a permanent SSH auth failure (no agent, no keys,
+    /// key rejected, host key mismatch). When set, ensure_connected
+    /// short-circuits without retrying so we stop spamming the SSH server
+    /// and the UI can surface the cause.
+    permanent_failure: Option<String>,
 }
 
 /// Held by the actor when connected.
@@ -1176,6 +1181,7 @@ impl RpcActor {
             status_tx,
             reconnect_attempts: 0,
             next_reconnect_at: None,
+            permanent_failure: None,
         }
     }
 
@@ -1187,6 +1193,14 @@ impl RpcActor {
     async fn ensure_connected(&mut self) -> Result<(), ActorError> {
         if self.connection.is_some() {
             return Ok(());
+        }
+
+        // Permanent SSH failure (no agent, no keys, key rejected, host key
+        // mismatch) — halt the reconnect loop. The error was already
+        // broadcast when first detected; subsequent callers see the same
+        // sticky message via ConnectionLost.
+        if let Some(msg) = &self.permanent_failure {
+            return Err(ActorError::ConnectionLost(msg.clone()));
         }
 
         // Check backoff cooldown — reject immediately if we're in a cooldown period
@@ -1264,11 +1278,20 @@ impl RpcActor {
 
     /// Inner connect logic (separated so try_connect can wrap with timeout).
     async fn try_connect_inner(&mut self) -> Result<(), ActorError> {
-        let client = connect_ssh(self.config.clone()).await.map_err(|e| {
-            let msg = format!("SSH: {e}");
-            let _ = self.status_tx.send(ConnectionStatus::Error(msg.clone()));
-            ActorError::ConnectionLost(msg)
-        })?;
+        let client = match connect_ssh(self.config.clone()).await {
+            Ok(c) => c,
+            Err(e) => {
+                let msg = format!("SSH: {e}");
+                if let ConnectError::Ssh(ssh_err) = &e
+                    && ssh_err.is_permanent()
+                {
+                    log::warn!("Permanent SSH failure, halting reconnect loop: {msg}");
+                    self.permanent_failure = Some(msg.clone());
+                }
+                let _ = self.status_tx.send(ConnectionStatus::Error(msg.clone()));
+                return Err(ActorError::ConnectionLost(msg));
+            }
+        };
 
         let (kernel, server_kernel_id) = client.attach_kernel().await.map_err(|e| {
             let msg = format!("attach_kernel: {e}");

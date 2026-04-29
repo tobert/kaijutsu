@@ -47,6 +47,10 @@ pub struct RpcConnectionState {
     pub kernel_id: Option<KernelId>,
     /// Context ID from server's join_context (server-authoritative)
     pub context_id: Option<ContextId>,
+    /// Last error message from the actor (cleared on successful connect).
+    /// Survives across Reconnecting events so the dock can surface the
+    /// underlying cause (e.g. SSH agent missing) instead of just spinning.
+    pub last_error: Option<String>,
 }
 
 /// Channel for async tasks to send results back to Bevy systems.
@@ -469,6 +473,7 @@ fn update_connection_state(
                 state.reconnect_attempt = 0;
                 state.kernel_id = Some(*kernel_id);
                 state.context_id = *context_id;
+                state.last_error = None;
             }
             kaijutsu_client::ConnectionStatus::Disconnected => {
                 state.connected = false;
@@ -478,9 +483,12 @@ fn update_connection_state(
             kaijutsu_client::ConnectionStatus::Reconnecting { attempt } => {
                 state.connected = false;
                 state.reconnect_attempt = *attempt;
+                // Intentionally leave last_error in place — the cause
+                // outlives a single Reconnecting tick.
             }
-            kaijutsu_client::ConnectionStatus::Error(_) => {
+            kaijutsu_client::ConnectionStatus::Error(msg) => {
                 state.connected = false;
+                state.last_error = Some(msg.clone());
             }
         }
     }

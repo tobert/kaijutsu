@@ -717,6 +717,29 @@ fn vim_mode_to_dock<'a>(vim_mode: &Option<String>, theme: &'a Theme) -> (Color, 
     }
 }
 
+/// Map a connection error string to a short, user-facing label.
+///
+/// We considered putting a structured kind on `ConnectionStatus::Error`
+/// instead of substring-matching, but the error already flows through
+/// thiserror Display impls we own (kaijutsu-client SshError) so the strings
+/// are stable. Substring detection here keeps the change localized; if more
+/// callers need this classification later, promote to an enum on the broadcast.
+pub(crate) fn classify_connection_error(msg: &str) -> Option<&'static str> {
+    if msg.contains("SSH_AUTH_SOCK") {
+        Some("\u{26a0} no SSH agent (set SSH_AUTH_SOCK)")
+    } else if msg.contains("No SSH keys available") {
+        Some("\u{26a0} SSH agent has no keys")
+    } else if msg.contains("Key rejected") || msg.contains("No keys accepted") {
+        Some("\u{26a0} SSH key rejected by server")
+    } else if msg.contains("HOST KEY CHANGED") || msg.contains("Host key verification failed") {
+        Some("\u{26a0} SSH host key mismatch")
+    } else if msg.contains("Failed to load key") {
+        Some("\u{26a0} SSH key load failed")
+    } else {
+        None
+    }
+}
+
 /// Update connection widget when RpcConnectionState changes.
 pub fn update_connection(
     conn_state: Res<RpcConnectionState>,
@@ -734,6 +757,12 @@ pub fn update_connection(
             .map(|i| format!("\u{2713} @{}", i.username))
             .unwrap_or_else(|| "\u{2713} Connected".to_string());
         (status, theme.success)
+    } else if let Some(label) = conn_state
+        .last_error
+        .as_deref()
+        .and_then(classify_connection_error)
+    {
+        (label.to_string(), theme.error)
     } else if conn_state.reconnect_attempt > 0 {
         (
             format!(
@@ -743,11 +772,80 @@ pub fn update_connection(
             theme.warning,
         )
     } else {
-        ("\u{26a1} Disconnected".to_string(), theme.error)
+        ("\u{26a0} Disconnected".to_string(), theme.error)
     };
 
     dock.connection.text = text;
     dock.connection.color = color;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::classify_connection_error;
+
+    #[test]
+    fn agent_missing_classified() {
+        let msg = "SSH: SSH error: SSH agent error: Environment variable \
+                   `SSH_AUTH_SOCK` not found";
+        assert_eq!(
+            classify_connection_error(msg),
+            Some("\u{26a0} no SSH agent (set SSH_AUTH_SOCK)")
+        );
+    }
+
+    #[test]
+    fn no_keys_classified() {
+        let msg = "SSH: SSH error: No SSH keys available in agent";
+        assert_eq!(
+            classify_connection_error(msg),
+            Some("\u{26a0} SSH agent has no keys")
+        );
+    }
+
+    #[test]
+    fn key_rejected_classified() {
+        let msg = "SSH: SSH error: Auth failed: Key rejected by server";
+        assert_eq!(
+            classify_connection_error(msg),
+            Some("\u{26a0} SSH key rejected by server")
+        );
+    }
+
+    #[test]
+    fn host_key_mismatch_classified() {
+        let msg = "SSH: SSH error: HOST KEY CHANGED for localhost:2222! ...";
+        assert_eq!(
+            classify_connection_error(msg),
+            Some("\u{26a0} SSH host key mismatch")
+        );
+    }
+
+    #[test]
+    fn key_load_failed_classified() {
+        let msg = "SSH: SSH error: Failed to load key: /home/x/.ssh/id_rsa: bad passphrase";
+        assert_eq!(
+            classify_connection_error(msg),
+            Some("\u{26a0} SSH key load failed")
+        );
+    }
+
+    #[test]
+    fn transient_unclassified() {
+        // Network-style errors stay unclassified — they fall back to the
+        // generic Reconnecting label which is appropriate.
+        assert_eq!(
+            classify_connection_error("SSH: SSH error: Connection failed: connection refused"),
+            None
+        );
+        assert_eq!(
+            classify_connection_error("connect timeout (10s)"),
+            None
+        );
+        assert_eq!(
+            classify_connection_error("reconnect backoff (attempt 3, 4.0s remaining)"),
+            None
+        );
+    }
 }
 
 /// Update contexts widget when DriftState or DocumentCache changes.

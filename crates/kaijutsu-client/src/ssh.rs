@@ -418,3 +418,70 @@ impl From<russh::Error> for SshError {
         SshError::ConnectionFailed(e.to_string())
     }
 }
+
+impl SshError {
+    /// Errors that won't get better by retrying (no agent, no keys, server
+    /// rejected our key, host key mismatch). Callers use this to halt the
+    /// reconnect loop and surface a sticky error to the user instead of
+    /// burning CPU on attempts that will never succeed.
+    pub fn is_permanent(&self) -> bool {
+        matches!(
+            self,
+            SshError::AgentFailed(_)
+                | SshError::NoKeysAvailable
+                | SshError::AuthFailed(_)
+                | SshError::KeyLoadFailed(_)
+                | SshError::HostKeyMismatch { .. }
+                | SshError::HostKeyVerificationFailed(_)
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_missing_is_permanent() {
+        let e = SshError::AgentFailed("Environment variable `SSH_AUTH_SOCK` not found".into());
+        assert!(e.is_permanent());
+    }
+
+    #[test]
+    fn no_keys_is_permanent() {
+        assert!(SshError::NoKeysAvailable.is_permanent());
+    }
+
+    #[test]
+    fn key_rejected_is_permanent() {
+        assert!(SshError::AuthFailed("Key rejected by server".into()).is_permanent());
+    }
+
+    #[test]
+    fn host_key_mismatch_is_permanent() {
+        let e = SshError::HostKeyMismatch {
+            host: "localhost".into(),
+            port: 2222,
+            fingerprint: "SHA256:abc".into(),
+            known_hosts_path: "~/.ssh/known_hosts".into(),
+            line: 1,
+        };
+        assert!(e.is_permanent());
+    }
+
+    #[test]
+    fn connection_refused_is_transient() {
+        let e = SshError::ConnectionFailed("Connection refused".into());
+        assert!(!e.is_permanent());
+    }
+
+    #[test]
+    fn channel_failure_is_transient() {
+        assert!(!SshError::ChannelFailed("rpc: closed".into()).is_permanent());
+    }
+
+    #[test]
+    fn disconnected_is_transient() {
+        assert!(!SshError::Disconnected.is_permanent());
+    }
+}
