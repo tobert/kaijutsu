@@ -32,6 +32,35 @@ use crate::rpc::{ConversationCache, SharedKernelState};
 /// `HookPhase::ListTools` hooks (D-56) — both applied inside
 /// `Broker::list_visible_tools` via `list_tool_defs_via_broker`. This
 /// function now pass-throughs the broker output unmodified.
+/// Surface a configuration / pre-stream failure as a visible error block so the
+/// user gets feedback in the conversation, not just a capnp error returned to
+/// the (typically silent) RPC client. Anchored after the user's message block.
+fn insert_pre_stream_error_block(
+    documents: &SharedBlockStore,
+    context_id: ContextId,
+    after_block_id: &kaijutsu_crdt::BlockId,
+    detail: &str,
+) {
+    let payload = kaijutsu_types::ErrorPayload {
+        category: kaijutsu_types::ErrorCategory::Stream,
+        severity: kaijutsu_types::ErrorSeverity::Error,
+        code: None,
+        detail: Some(detail.to_string()),
+        span: None,
+        source_kind: None,
+    };
+    let summary = payload.summary_line();
+    if let Err(e) = documents.insert_error_block_as(
+        context_id,
+        after_block_id,
+        &payload,
+        summary,
+        Some(PrincipalId::system()),
+    ) {
+        log::warn!("Failed to insert pre-stream error block: {}", e);
+    }
+}
+
 async fn build_tool_definitions(
     kernel: &Arc<Kernel>,
     context_id: ContextId,
@@ -121,39 +150,37 @@ pub(crate) async fn spawn_llm_for_prompt(
 
     // Resolve provider + model from LLM registry
     // Priority: explicit param > per-context (DriftRouter) > kernel default
-    let (provider, model_name, max_output_tokens) = {
+    let provider_resolution: Result<(Arc<RigProvider>, String, u64), &'static str> = {
         let registry = kernel_arc.llm().read().await;
         let max_tokens = registry.max_output_tokens();
 
         let effective_model = model.map(|m| m.to_string()).or(ctx_model);
 
         match effective_model {
-            Some(name) => {
-                // Prefer per-context provider, then resolve via registry
-                let provider = ctx_provider_name
-                    .as_deref()
-                    .and_then(|pn| registry.get(pn))
-                    .or_else(|| registry.default_provider())
-                    .ok_or_else(|| {
-                        log::error!("No LLM provider configured");
-                        capnp::Error::failed(
-                            "No LLM provider configured (check models.toml)".into(),
-                        )
-                    })?;
-                (provider, name, max_tokens)
-            }
-            None => {
-                // No model anywhere — kernel default
-                let p = registry.default_provider().ok_or_else(|| {
-                    log::error!("No LLM provider configured");
-                    capnp::Error::failed("No LLM provider configured (check models.toml)".into())
-                })?;
-                let m = registry
-                    .default_model()
-                    .unwrap_or(kaijutsu_kernel::DEFAULT_MODEL)
-                    .to_string();
-                (p, m, max_tokens)
-            }
+            Some(name) => ctx_provider_name
+                .as_deref()
+                .and_then(|pn| registry.get(pn))
+                .or_else(|| registry.default_provider())
+                .map(|p| (p, name, max_tokens))
+                .ok_or("No LLM provider configured (check models.toml)"),
+            None => match registry.default_provider() {
+                Some(p) => {
+                    let m = registry
+                        .default_model()
+                        .unwrap_or(kaijutsu_kernel::DEFAULT_MODEL)
+                        .to_string();
+                    Ok((p, m, max_tokens))
+                }
+                None => Err("No LLM provider configured (check models.toml)"),
+            },
+        }
+    };
+    let (provider, model_name, max_output_tokens) = match provider_resolution {
+        Ok(v) => v,
+        Err(detail) => {
+            log::error!("No LLM provider configured");
+            insert_pre_stream_error_block(&documents, context_id, after_block_id, detail);
+            return Err(capnp::Error::failed(detail.into()));
         }
     };
 

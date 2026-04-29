@@ -36,6 +36,29 @@ use super::types::{
 };
 use crate::block_store::{DbHandle, SharedBlockStore};
 
+/// Coerce a candidate visible tool name into the alphabet Anthropic accepts
+/// for `tools[].custom.name`: `^[a-zA-Z0-9_-]{1,128}$`. Replaces any other
+/// character with `_` and truncates to 128 chars. Anthropic is the strictest
+/// of our providers — cleaning once here keeps the broker's `name_map` the
+/// canonical visible-name table without per-provider rewriting.
+fn clean_visible_tool_name(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if cleaned.len() > 128 {
+        cleaned.chars().take(128).collect()
+    } else {
+        cleaned
+    }
+}
+
 /// Default notification channel capacity.
 const NOTIF_CAPACITY: usize = 256;
 
@@ -889,18 +912,24 @@ impl Broker {
         self.apply_list_tools_filter(ctx, &mut all).await;
 
         // Auto-resolve: unqualified if unique across visible set, else
-        // qualified as `instance.tool`.
+        // qualified as `instance__tool`. Names are cleaned so each visible
+        // name matches `^[a-zA-Z0-9_-]{1,128}$` — Anthropic's tool-name
+        // pattern, the strictest of our providers. Anthropic rejects any
+        // request containing a non-conforming tool name, so an uncleaned
+        // name like `builtin.block.create` (instance `builtin.block`
+        // contains `.`) fails the request server-side with no per-tool fallback.
         let mut counts: HashMap<&str, usize> = HashMap::new();
         for kt in &all {
             *counts.entry(kt.name.as_str()).or_insert(0) += 1;
         }
         let mut resolutions: Vec<(ResolvedName, String)> = Vec::new();
         for kt in &all {
-            let visible = if counts.get(kt.name.as_str()).copied().unwrap_or(0) > 1 {
-                format!("{}.{}", kt.instance.as_str(), kt.name)
+            let raw = if counts.get(kt.name.as_str()).copied().unwrap_or(0) > 1 {
+                format!("{}__{}", kt.instance.as_str(), kt.name)
             } else {
                 kt.name.clone()
             };
+            let visible = clean_visible_tool_name(&raw);
             resolutions.push(((kt.instance.clone(), kt.name.clone()), visible));
         }
 
@@ -2182,6 +2211,41 @@ mod tests {
     use crate::mcp::{
         CallContext, KernelToolResult, McpError, PolicyError, ServerNotification, ToolContent,
     };
+
+    #[test]
+    fn clean_visible_tool_name_matches_anthropic_pattern() {
+        // Builtin instance form `builtin.block` collides with Anthropic's
+        // `^[a-zA-Z0-9_-]{1,128}$` once qualified with a tool name.
+        assert_eq!(
+            clean_visible_tool_name("builtin.block__create"),
+            "builtin_block__create"
+        );
+        // Other punctuation that MCP / kj kj-style names occasionally carry.
+        assert_eq!(
+            clean_visible_tool_name("kj:tool/sub"),
+            "kj_tool_sub"
+        );
+        // Already-clean names are pass-through.
+        assert_eq!(clean_visible_tool_name("file_read"), "file_read");
+        assert_eq!(clean_visible_tool_name("brp-status"), "brp-status");
+        // Truncates to 128.
+        let long = "a".repeat(200);
+        assert_eq!(clean_visible_tool_name(&long).len(), 128);
+        // Verify the regex contract directly so future tweaks don't drift.
+        let pat = regex::Regex::new(r"^[a-zA-Z0-9_-]{1,128}$").unwrap();
+        for raw in [
+            "builtin.block.create",
+            "kj:tool/sub",
+            "weird name!!",
+            "ünïcødë",
+        ] {
+            let cleaned = clean_visible_tool_name(raw);
+            assert!(
+                pat.is_match(&cleaned),
+                "cleaned name {cleaned:?} from {raw:?} fails Anthropic regex"
+            );
+        }
+    }
 
     /// Closure-driven `McpServerLike` fake. Tests build an instance with
     /// `MockServer::new(id).with_tool(...).on_call(|p| async { ... })`.
