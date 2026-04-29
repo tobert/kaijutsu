@@ -200,6 +200,106 @@ async fn tool_search_returns_scored_matches() {
 }
 
 #[tokio::test]
+async fn tool_search_no_match_returns_empty() {
+    // A query that nothing matches should return success with an empty
+    // matches array — not an error, not a missing field.
+    let fx = setup().await;
+    let _ = fx
+        .kernel
+        .list_tool_defs_via_broker(fx.ctx_id, fx.exec_ctx.principal_id)
+        .await;
+
+    let exec = fx
+        .kernel
+        .dispatch_tool_via_broker(
+            "tool_search",
+            &serde_json::json!({"query": "xyzzy_no_such_tool"}).to_string(),
+            &fx.exec_ctx,
+        )
+        .await
+        .expect("dispatch");
+    assert!(exec.success, "tool_search should succeed: {}", exec.stderr);
+
+    let payload: serde_json::Value =
+        serde_json::from_str(&exec.stdout).expect("structured output is JSON");
+    let matches = payload
+        .get("matches")
+        .and_then(|m| m.as_array())
+        .expect("matches array present even when empty");
+    assert!(
+        matches.is_empty(),
+        "expected empty matches for unmatched query, got: {matches:?}"
+    );
+    assert_eq!(
+        payload.get("query").and_then(|q| q.as_str()),
+        Some("xyzzy_no_such_tool"),
+        "query echo should preserve the original (untrimmed/uncased) input"
+    );
+}
+
+#[tokio::test]
+async fn tool_search_tiebreak_is_alphabetical() {
+    // When multiple tools share a score, results sort by resolved name
+    // ascending. Query "hook_" matches the four hook_* tools by name
+    // only (their descriptions say "hook entry", not "hook_"), so all
+    // four score 3 — a clean four-way tie.
+    let fx = setup().await;
+    let _ = fx
+        .kernel
+        .list_tool_defs_via_broker(fx.ctx_id, fx.exec_ctx.principal_id)
+        .await;
+
+    let exec = fx
+        .kernel
+        .dispatch_tool_via_broker(
+            "tool_search",
+            &serde_json::json!({"query": "hook_"}).to_string(),
+            &fx.exec_ctx,
+        )
+        .await
+        .expect("dispatch");
+    assert!(exec.success, "tool_search should succeed: {}", exec.stderr);
+
+    let payload: serde_json::Value =
+        serde_json::from_str(&exec.stdout).expect("structured output is JSON");
+    let matches = payload
+        .get("matches")
+        .and_then(|m| m.as_array())
+        .expect("matches array");
+
+    // Pull out just the hook_* names in the order returned. Other tools
+    // could plausibly match (e.g. if a description contains "hook_"),
+    // so filter rather than asserting exact length.
+    let hook_names: Vec<&str> = matches
+        .iter()
+        .filter_map(|m| m.get("name").and_then(|n| n.as_str()))
+        .filter(|n| n.starts_with("hook_"))
+        .collect();
+    assert_eq!(
+        hook_names,
+        vec!["hook_add", "hook_inspect", "hook_list", "hook_remove"],
+        "tied scores should sort alphabetically by resolved name"
+    );
+
+    // And every hook_* entry should have the same score (3 — name match,
+    // no description match), confirming the tie is real.
+    let hook_scores: Vec<u64> = matches
+        .iter()
+        .filter(|m| {
+            m.get("name")
+                .and_then(|n| n.as_str())
+                .map(|n| n.starts_with("hook_"))
+                .unwrap_or(false)
+        })
+        .filter_map(|m| m.get("score").and_then(|s| s.as_u64()))
+        .collect();
+    assert!(
+        hook_scores.iter().all(|&s| s == 3),
+        "expected all hook_* matches to score 3 (name only), got: {hook_scores:?}"
+    );
+}
+
+#[tokio::test]
 async fn policy_show_and_set_round_trip() {
     // M3-D5: builtin.policy exposes get/set for InstancePolicy. Show
     // returns the current policy; set mutates call_timeout_ms /
