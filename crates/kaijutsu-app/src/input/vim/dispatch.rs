@@ -204,6 +204,7 @@ pub fn vim_dispatch_compose(
     keys: Res<ButtonInput<KeyCode>>,
     mut vim: ResMut<VimMachineResource>,
     mut motion_state: ResMut<VimMotionState>,
+    mut esc_state: ResMut<super::dismiss::EscapeDismissState>,
     mut chat_overlay: Query<
         &mut crate::cell::InputOverlay,
         With<crate::cell::InputOverlayMarker>,
@@ -258,6 +259,13 @@ pub fn vim_dispatch_compose(
             continue;
         };
 
+        // Any non-Escape keypress breaks a pending double-Escape gesture so
+        // that `Esc, x, Esc` doesn't dismiss the buffer.
+        let is_escape = matches!(event.key_code, KeyCode::Escape);
+        if !is_escape {
+            esc_state.reset();
+        }
+
         // Allow key repeats in all vim modes — holding h/j/k/l to scrub
         // is fundamental to vim muscle memory, and modalkit handles repeat
         // semantics (operator-pending won't re-fire on repeat).
@@ -284,6 +292,16 @@ pub fn vim_dispatch_compose(
 
         // Enforce cursor invariant after all mutations for this keystroke.
         clamp_normal_cursor(&mut overlay);
+
+        // Double-Escape dismiss: after the VimMachine has settled (so
+        // Insert→Normal already happened on the first tap), check whether
+        // a second Esc within the window has landed in Normal mode.
+        if is_escape {
+            let in_normal = vim.machine.show_mode().is_none();
+            if super::dismiss::should_dismiss_after_escape(&mut esc_state, in_normal) {
+                action_writer.write(ActionFired(Action::Unfocus));
+            }
+        }
     }
 }
 

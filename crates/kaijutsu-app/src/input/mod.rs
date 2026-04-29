@@ -114,7 +114,8 @@ impl Plugin for InputPlugin {
             .init_resource::<events::AnalogInput>()
             .init_resource::<interrupt::InterruptState>()
             .insert_resource(vim::VimMachineResource::new())
-            .init_resource::<vim::dispatch::VimMotionState>();
+            .init_resource::<vim::dispatch::VimMotionState>()
+            .init_resource::<vim::dismiss::EscapeDismissState>();
 
         // Register types for BRP reflection
         app.register_type::<focus::FocusArea>()

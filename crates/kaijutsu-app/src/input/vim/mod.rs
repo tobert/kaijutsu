@@ -3,6 +3,7 @@
 //! Wraps modalkit's VimMachine as a Bevy Resource and provides the dispatch
 //! system that routes compose keyboard input through the vim state machine.
 
+pub mod dismiss;
 pub mod dispatch;
 pub mod keyconv;
 pub mod motion;

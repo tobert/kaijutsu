@@ -942,7 +942,7 @@ pub fn update_hints(
         }
         Screen::Conversation => match focus_area.as_ref() {
             FocusArea::Compose => {
-                "Enter: submit \u{2502} Shift+Enter: newline \u{2502} Ctrl+Z: shell \u{2502} Esc: dismiss"
+                "Enter: submit \u{2502} Shift+Enter: newline \u{2502} Ctrl+Z: shell \u{2502} Esc Esc: dismiss"
             }
             FocusArea::Conversation => {
                 "i: chat \u{2502} Ctrl+Z: shell \u{2502} j/k: navigate \u{2502} f: expand \u{2502} `: constellation \u{2502} Alt+hjkl: pane"
