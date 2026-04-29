@@ -1,108 +1,18 @@
-//! Agent systems for Bevy.
+//! Peer systems for Bevy.
 
-use super::components::*;
-use super::plugin::AgentInvocationChannel;
-use super::registry::*;
+use super::plugin::PeerInvocationChannel;
 use bevy::prelude::*;
 
 use crate::ui::drift::DriftState;
 use crate::view::components::ContextSwitchRequested;
 use crate::view::document::DocumentCache;
 
-// Agent key triggers removed — will be redesigned with Action bindings.
-
-/// Handle incoming agent activity messages.
+/// Poll the peer invocation channel and dispatch actions.
 ///
-/// Updates the registry and spawns/updates indicators.
-pub fn handle_agent_activity(
-    mut reader: MessageReader<AgentActivityMessage>,
-    mut registry: ResMut<AgentRegistry>,
-) {
-    for event in reader.read() {
-        match event {
-            AgentActivityMessage::Started {
-                nick,
-                block_id,
-                action,
-            } => {
-                info!("Agent {} started {} on block {}", nick, action, block_id);
-                if let Some(agent) = registry.agents.get_mut(nick) {
-                    agent.status = AgentStatus::Busy;
-                    registry.version += 1;
-                }
-            }
-            AgentActivityMessage::Progress {
-                nick,
-                block_id,
-                message,
-                percent,
-            } => {
-                debug!(
-                    "Agent {} progress on {}: {} ({:.0}%)",
-                    nick,
-                    block_id,
-                    message,
-                    percent * 100.0
-                );
-            }
-            AgentActivityMessage::Completed {
-                nick,
-                block_id,
-                success,
-            } => {
-                info!(
-                    "Agent {} {} on block {}",
-                    nick,
-                    if *success { "completed" } else { "failed" },
-                    block_id
-                );
-                if let Some(agent) = registry.agents.get_mut(nick) {
-                    agent.status = AgentStatus::Ready;
-                    registry.version += 1;
-                }
-            }
-            AgentActivityMessage::CursorMoved {
-                nick,
-                block_id,
-                offset,
-            } => {
-                debug!("Agent {} cursor at {}:{}", nick, block_id, offset);
-            }
-        }
-    }
-}
-
-/// Sync agent badges in the UI.
-///
-/// Creates/updates/removes badge entities based on registry state.
-/// Phase 3: badge spawning not yet implemented, deregistered from Update schedule.
-#[allow(dead_code)]
-pub fn sync_agent_badges(
-    registry: Res<AgentRegistry>,
-    mut commands: Commands,
-    existing_badges: Query<(Entity, &AgentBadge)>,
-) {
-    if !registry.is_changed() {
-        return;
-    }
-
-    // Remove badges for agents that no longer exist
-    for (entity, badge) in existing_badges.iter() {
-        if registry.get(&badge.nick).is_none() {
-            commands.entity(entity).despawn();
-        }
-    }
-
-    // TODO: Create badges for new agents
-    // This would involve spawning UI entities with AgentBadge components
-}
-
-/// Poll the agent invocation channel and dispatch actions.
-///
-/// Invocations arrive from the kernel via `AgentCommands` callback →
+/// Invocations arrive from the kernel via `PeerCommands` callback →
 /// mpsc channel → this system. Each invocation carries a oneshot reply.
-pub fn poll_agent_invocations(
-    channel: Res<AgentInvocationChannel>,
+pub fn poll_peer_invocations(
+    channel: Res<PeerInvocationChannel>,
     doc_cache: Res<DocumentCache>,
     drift: Res<DriftState>,
     mut switch_writer: MessageWriter<ContextSwitchRequested>,
@@ -110,12 +20,12 @@ pub fn poll_agent_invocations(
     let rx = match channel.rx.lock() {
         Ok(guard) => guard,
         Err(poisoned) => {
-            warn!("Agent invocation channel mutex was poisoned, recovering");
+            warn!("Peer invocation channel mutex was poisoned, recovering");
             poisoned.into_inner()
         }
     };
     while let Ok(invocation) = rx.try_recv() {
-        let result = dispatch_agent_action(
+        let result = dispatch_peer_action(
             &invocation.action,
             &invocation.params,
             &doc_cache,
@@ -126,7 +36,7 @@ pub fn poll_agent_invocations(
     }
 }
 
-fn dispatch_agent_action(
+fn dispatch_peer_action(
     action: &str,
     params: &[u8],
     doc_cache: &DocumentCache,
@@ -142,7 +52,6 @@ fn dispatch_agent_action(
             let p: Params =
                 serde_json::from_slice(params).map_err(|e| format!("invalid params: {e}"))?;
 
-            // Reuse same resolution logic as brp_methods.rs
             let ctx_id = kaijutsu_types::ContextId::parse(&p.context_id)
                 .or_else(|_| {
                     let items = drift.contexts.iter().map(|c| {

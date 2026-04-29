@@ -280,13 +280,13 @@ enum RpcCommand {
         reply: oneshot::Sender<Result<ContextId, ActorError>>,
     },
 
-    // ── Agents ──────────────────────────────────────────────────────────
-    AttachAgent {
-        config: AgentConfig,
-        invocation_tx: std::sync::mpsc::Sender<AgentInvocation>,
-        reply: oneshot::Sender<Result<AgentAttachResult, ActorError>>,
+    // ── Peers (drift navigation transport) ──────────────────────────────
+    AttachPeer {
+        config: PeerConfig,
+        invocation_tx: std::sync::mpsc::Sender<PeerInvocation>,
+        reply: oneshot::Sender<Result<PeerAttachResult, ActorError>>,
     },
-    InvokeAgent {
+    InvokePeer {
         nick: String,
         action: String,
         params: Vec<u8>,
@@ -294,27 +294,22 @@ enum RpcCommand {
     },
 }
 
-// ── Client-side agent types ─────────────────────────────────────────────
+// ── Client-side peer types ──────────────────────────────────────────────
 
-/// Configuration for attaching as an agent to the kernel.
+/// Configuration for attaching as a peer to the kernel.
 #[derive(Debug, Clone)]
-pub struct AgentConfig {
+pub struct PeerConfig {
     pub nick: String,
-    pub instance: String,
-    pub provider: String,
-    pub model_id: String,
-    pub capabilities: Vec<String>,
 }
 
-/// Result from a successful agent attachment.
+/// Result from a successful peer attachment.
 #[derive(Debug, Clone)]
-pub struct AgentAttachResult {
+pub struct PeerAttachResult {
     pub nick: String,
-    pub instance: String,
 }
 
-/// An invocation received from the kernel via the AgentCommands callback.
-pub struct AgentInvocation {
+/// An invocation received from the kernel via the PeerCommands callback.
+pub struct PeerInvocation {
     pub action: String,
     pub params: Vec<u8>,
     pub reply: oneshot::Sender<Result<Vec<u8>, String>>,
@@ -447,10 +442,10 @@ impl RpcCommand {
             Self::JoinContext { reply, .. } => {
                 let _ = reply.send(Err(err));
             }
-            Self::AttachAgent { reply, .. } => {
+            Self::AttachPeer { reply, .. } => {
                 let _ = reply.send(Err(err));
             }
-            Self::InvokeAgent { reply, .. } => {
+            Self::InvokePeer { reply, .. } => {
                 let _ = reply.send(Err(err));
             }
         }
@@ -1058,17 +1053,17 @@ impl ActorHandle {
 
     // ── Agents ──────────────────────────────────────────────────────────
 
-    /// Attach this client as an agent to the kernel.
+    /// Attach this client as a peer to the kernel.
     ///
     /// Invocations from the kernel are sent to `invocation_tx`. The receiver
     /// can be polled from any executor (uses `std::sync::mpsc`).
     #[tracing::instrument(skip(self, config, invocation_tx))]
-    pub async fn attach_agent(
+    pub async fn attach_peer(
         &self,
-        config: AgentConfig,
-        invocation_tx: std::sync::mpsc::Sender<AgentInvocation>,
-    ) -> Result<AgentAttachResult, ActorError> {
-        self.send(|reply| RpcCommand::AttachAgent {
+        config: PeerConfig,
+        invocation_tx: std::sync::mpsc::Sender<PeerInvocation>,
+    ) -> Result<PeerAttachResult, ActorError> {
+        self.send(|reply| RpcCommand::AttachPeer {
             config,
             invocation_tx,
             reply,
@@ -1076,15 +1071,15 @@ impl ActorHandle {
         .await
     }
 
-    /// Invoke another agent's capability through the kernel.
+    /// Invoke another peer through the kernel.
     #[tracing::instrument(skip(self, params))]
-    pub async fn invoke_agent(
+    pub async fn invoke_peer(
         &self,
         nick: &str,
         action: &str,
         params: &[u8],
     ) -> Result<Vec<u8>, ActorError> {
-        self.send(|reply| RpcCommand::InvokeAgent {
+        self.send(|reply| RpcCommand::InvokePeer {
             nick: nick.to_string(),
             action: action.to_string(),
             params: params.to_vec(),
@@ -1756,22 +1751,22 @@ async fn dispatch_command(
             )));
         }
 
-        // ── Agents ──────────────────────────────────────────────
-        RpcCommand::AttachAgent {
+        // ── Peers ───────────────────────────────────────────────
+        RpcCommand::AttachPeer {
             config,
             invocation_tx,
             reply,
         } => {
-            let result = kernel.attach_agent(&config, invocation_tx).await;
+            let result = kernel.attach_peer(&config, invocation_tx).await;
             let _ = reply.send(result.map_err(|e| ActorError::Rpc(e.to_string())));
         }
-        RpcCommand::InvokeAgent {
+        RpcCommand::InvokePeer {
             nick,
             action,
             params,
             reply,
         } => {
-            rpc_call!(kernel, reply, err_tx, k, k.invoke_agent(&nick, &action, &params));
+            rpc_call!(kernel, reply, err_tx, k, k.invoke_peer(&nick, &action, &params));
         }
     }
 }

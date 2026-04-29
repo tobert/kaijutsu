@@ -1,30 +1,12 @@
-//! Agent module for collaborative editing.
+//! Client-side peer transport.
 //!
-//! This module provides the client-side infrastructure for agent attachment:
-//! - Tracking attached agents and their capabilities
-//! - Visual indicators for agent presence and activity
-//! - Key bindings for invoking agent capabilities
-//!
-//! # Architecture
-//!
-//! Agents are tracked via the server's agent registry. The client:
-//! 1. Receives agent events via RPC subscription
-//! 2. Updates local state (AgentRegistry resource)
-//! 3. Renders indicators in the UI
-//!
-//! # Key Bindings (Processing Chain Triggers)
-//!
-//! - `Ctrl+S`: Invoke spell-check agent on focused block
-//! - `Ctrl+R`: Invoke review agent on focused block
-//! - `Ctrl+G`: Invoke generate agent on focused block
+//! Receives invocations from the kernel via the `PeerCommands` callback and
+//! dispatches them via Bevy systems. The app registers itself as a peer
+//! (`nick = "kaijutsu-app"`) on connect; other agents can then call into the
+//! app — most notably `switch_context` and `active_context` for drift
+//! navigation.
 
-mod components;
 mod plugin;
-mod registry;
 mod systems;
 
-#[allow(unused_imports)]
-pub use components::*;
-pub use plugin::{AgentInvocationChannel, AgentsPlugin};
-#[allow(unused_imports)]
-pub use registry::*;
+pub use plugin::{PeerInvocationChannel, PeersPlugin};

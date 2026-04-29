@@ -203,7 +203,7 @@ fn poll_bootstrap_results(
     mut commands: Commands,
     channel: Res<BootstrapChannel>,
     result_channel: Res<RpcResultChannel>,
-    invocation_channel: Res<crate::agents::AgentInvocationChannel>,
+    invocation_channel: Res<crate::peers::PeerInvocationChannel>,
     event_loop_proxy: Res<EventLoopProxyWrapper>,
 ) {
     let Ok(mut rx) = channel.rx.lock() else {
@@ -248,30 +248,26 @@ fn poll_bootstrap_results(
                             }
                         };
 
-                        // 1b. Register as an agent so the kernel can invoke us.
+                        // 1b. Register as a peer so the kernel can invoke us.
                         // The invocation_tx sender goes into the capnp callback;
-                        // invocations arrive directly in AgentInvocationChannel.
+                        // invocations arrive directly in PeerInvocationChannel.
                         {
                             let h2 = h.clone();
                             let inv_tx2 = inv_tx;
                             bevy::tasks::IoTaskPool::get()
                                 .spawn(async move {
-                                    let config = kaijutsu_client::AgentConfig {
+                                    let config = kaijutsu_client::PeerConfig {
                                         nick: "kaijutsu-app".to_string(),
-                                        instance: "ui".to_string(),
-                                        provider: "local".to_string(),
-                                        model_id: "bevy".to_string(),
-                                        capabilities: vec!["custom".to_string()],
                                     };
-                                    match h2.attach_agent(config, inv_tx2).await {
+                                    match h2.attach_peer(config, inv_tx2).await {
                                         Ok(info) => {
                                             log::info!(
-                                                "App registered as agent: {}",
+                                                "App registered as peer: {}",
                                                 info.nick
                                             );
                                         }
                                         Err(e) => {
-                                            log::warn!("Failed to register as agent: {e}");
+                                            log::warn!("Failed to register as peer: {e}");
                                         }
                                     }
                                 })

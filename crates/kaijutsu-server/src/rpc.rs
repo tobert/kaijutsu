@@ -39,13 +39,13 @@
 //!   internal subsections group ~80 RPC methods: lifecycle/info, shell
 //!   execution (`execute`/`interrupt`/`complete`), VFS, tools, block CRDT
 //!   ops, prompt/LLM, context ops, MCP, shell execution (kaish), shell
-//!   state, blob placeholders, MCP resources, agent attachment, timeline
+//!   state, blob placeholders, MCP resources, peer attachment, timeline
 //!   navigation, config, drift, LLM configuration, tool filter
 //!   configuration, per-context tool filter, shell variable introspection,
 //!   input document operations, context interrupt.
 //! - **Shell Value Conversion Helpers** — kaish `Value` ↔ Cap'n Proto.
 //! - **OutputData Build Helpers** — structured command output builders.
-//! - **Agent Helper Functions** — `AgentInfo` / `AgentCapability` converters.
+//! - **Peer Helper Functions** — `PeerInfo` capnp converters.
 //! - **Cap'n Proto ↔ Rust Type Helpers** — tool filter (de)serialization.
 //! - **Shell Execution Dispatch** — [`execute_shell_command`], shared by
 //!   the `shell_execute` RPC and `submit_input`.
@@ -80,12 +80,6 @@ use crate::llm_stream::spawn_llm_for_prompt;
 use kaijutsu_crdt::{BlockKind, ContentType, Role, Status};
 use kaijutsu_kernel::kernel_db::{ContextRow, KernelDb};
 use kaijutsu_kernel::{
-    AgentActivityEvent,
-    // Agents
-    AgentCapability,
-    AgentConfig,
-    AgentInfo,
-    AgentStatus,
     // FlowBus
     BlockFlow,
     // Config
@@ -99,6 +93,9 @@ use kaijutsu_kernel::{
     Kernel,
     LlmMessage,
     LocalBackend,
+    // Peers (drift navigation transport)
+    PeerConfig,
+    PeerInfo,
     SharedBlockFlowBus,
     SharedBlockStore,
     SharedConfigFlowBus,
@@ -2590,63 +2587,32 @@ impl kernel::Server for KernelImpl {
     }
 
     // ========================================================================
-    // Agent Attachment (Phase 2: Collaborative Canvas)
+    // Peer Registry (drift navigation transport)
     // ========================================================================
 
-    fn attach_agent(
+    fn attach_peer(
         self: Rc<Self>,
-        params: kernel::AttachAgentParams,
-        mut results: kernel::AttachAgentResults,
+        params: kernel::AttachPeerParams,
+        mut results: kernel::AttachPeerResults,
     ) -> Promise<(), capnp::Error> {
         let params_reader = pry!(params.get());
         let config_reader = pry!(params_reader.get_config());
 
-        // Extract config fields
         let nick = pry!(config_reader.get_nick())
             .to_str()
             .unwrap_or("unknown")
             .to_owned();
-        let instance = pry!(config_reader.get_instance())
-            .to_str()
-            .unwrap_or("default")
-            .to_owned();
-        let provider = pry!(config_reader.get_provider())
-            .to_str()
-            .unwrap_or("unknown")
-            .to_owned();
-        let model_id = pry!(config_reader.get_model_id())
-            .to_str()
-            .unwrap_or("unknown")
-            .to_owned();
 
-        // Extract capabilities
-        let caps_reader = pry!(config_reader.get_capabilities());
-        let capabilities: Vec<AgentCapability> = (0..caps_reader.len())
-            .filter_map(|i| {
-                caps_reader
-                    .get(i)
-                    .map(capnp_to_agent_capability)
-                    .ok()
-                    .flatten()
-            })
-            .collect();
+        let config = PeerConfig { nick: nick.clone() };
 
-        let config = AgentConfig {
-            nick: nick.clone(),
-            instance,
-            provider,
-            model_id,
-            capabilities,
-        };
-
-        // Extract optional AgentCommands callback for reverse invocation.
+        // Extract optional PeerCommands callback for reverse invocation.
         // get_commands() returns Err for null/missing capability pointers —
         // this is the standard capnp pattern for optional capabilities.
         let commands_callback = params_reader.get_commands().ok();
 
         let kernel_arc = self.kernel.kernel.clone();
 
-        let span = tracing::info_span!("rpc", method = "attach_agent");
+        let span = tracing::info_span!("rpc", method = "attach_peer");
         Promise::from_future(
             async move {
                 // Create invoke channel if callback provided
@@ -2673,11 +2639,11 @@ impl kernel::Server for KernelImpl {
                             if request.reply.send(InvokeResponse { result }).is_err() {
                                 tracing::debug!(
                                     nick = %nick_for_task,
-                                    "Agent invoke reply dropped (caller likely timed out)",
+                                    "Peer invoke reply dropped (caller likely timed out)",
                                 );
                             }
                         }
-                        log::debug!("Agent invoke bridge for '{}' ended", nick_for_task);
+                        log::debug!("Peer invoke bridge for '{}' ended", nick_for_task);
                     });
 
                     Some(tx)
@@ -2685,14 +2651,13 @@ impl kernel::Server for KernelImpl {
                     None
                 };
 
-                let agent_info = kernel_arc
-                    .attach_agent(config, invoke_sender)
+                let peer_info = kernel_arc
+                    .attach_peer(config, invoke_sender)
                     .await
-                    .map_err(|e| capnp::Error::failed(format!("failed to attach agent: {}", e)))?;
+                    .map_err(|e| capnp::Error::failed(format!("failed to attach peer: {}", e)))?;
 
-                // Build response
                 let mut info = results.get().init_info();
-                set_agent_info(&mut info, &agent_info);
+                set_peer_info(&mut info, &peer_info);
 
                 Ok(())
             }
@@ -2700,22 +2665,22 @@ impl kernel::Server for KernelImpl {
         )
     }
 
-    fn list_agents(
+    fn list_peers(
         self: Rc<Self>,
-        _params: kernel::ListAgentsParams,
-        mut results: kernel::ListAgentsResults,
+        _params: kernel::ListPeersParams,
+        mut results: kernel::ListPeersResults,
     ) -> Promise<(), capnp::Error> {
         let kernel_arc = self.kernel.kernel.clone();
 
-        let span = tracing::info_span!("rpc", method = "list_agents");
+        let span = tracing::info_span!("rpc", method = "list_peers");
         Promise::from_future(
             async move {
-                let agents = kernel_arc.list_agents().await;
+                let peers = kernel_arc.list_peers().await;
 
-                let mut list = results.get().init_agents(agents.len() as u32);
-                for (i, agent) in agents.iter().enumerate() {
-                    let mut a = list.reborrow().get(i as u32);
-                    set_agent_info(&mut a, agent);
+                let mut list = results.get().init_peers(peers.len() as u32);
+                for (i, peer) in peers.iter().enumerate() {
+                    let mut p = list.reborrow().get(i as u32);
+                    set_peer_info(&mut p, peer);
                 }
 
                 Ok(())
@@ -2724,66 +2689,29 @@ impl kernel::Server for KernelImpl {
         )
     }
 
-    fn detach_agent(
+    fn detach_peer(
         self: Rc<Self>,
-        params: kernel::DetachAgentParams,
-        _results: kernel::DetachAgentResults,
+        params: kernel::DetachPeerParams,
+        _results: kernel::DetachPeerResults,
     ) -> Promise<(), capnp::Error> {
         let nick = pry!(pry!(pry!(params.get()).get_nick()).to_str()).to_owned();
 
         let kernel_arc = self.kernel.kernel.clone();
 
-        let span = tracing::info_span!("rpc", method = "detach_agent");
+        let span = tracing::info_span!("rpc", method = "detach_peer");
         Promise::from_future(
             async move {
-                kernel_arc.detach_agent(&nick).await;
+                kernel_arc.detach_peer(&nick).await;
                 Ok(())
             }
             .instrument(span),
         )
     }
 
-    fn set_agent_capabilities(
+    fn invoke_peer(
         self: Rc<Self>,
-        params: kernel::SetAgentCapabilitiesParams,
-        _results: kernel::SetAgentCapabilitiesResults,
-    ) -> Promise<(), capnp::Error> {
-        let params_reader = pry!(params.get());
-        let nick = pry!(pry!(params_reader.get_nick()).to_str()).to_owned();
-        let caps_reader = pry!(params_reader.get_capabilities());
-
-        let capabilities: Vec<AgentCapability> = (0..caps_reader.len())
-            .filter_map(|i| {
-                caps_reader
-                    .get(i)
-                    .map(capnp_to_agent_capability)
-                    .ok()
-                    .flatten()
-            })
-            .collect();
-
-        let kernel_arc = self.kernel.kernel.clone();
-
-        let span = tracing::info_span!("rpc", method = "set_agent_capabilities");
-        Promise::from_future(
-            async move {
-                kernel_arc
-                    .set_agent_capabilities(&nick, capabilities)
-                    .await
-                    .map_err(|e| {
-                        capnp::Error::failed(format!("failed to set capabilities: {}", e))
-                    })?;
-
-                Ok(())
-            }
-            .instrument(span),
-        )
-    }
-
-    fn invoke_agent(
-        self: Rc<Self>,
-        params: kernel::InvokeAgentParams,
-        mut results: kernel::InvokeAgentResults,
+        params: kernel::InvokePeerParams,
+        mut results: kernel::InvokePeerResults,
     ) -> Promise<(), capnp::Error> {
         let params_reader = pry!(params.get());
         let nick = pry!(pry!(params_reader.get_nick()).to_str()).to_owned();
@@ -2792,146 +2720,20 @@ impl kernel::Server for KernelImpl {
 
         let kernel_arc = self.kernel.kernel.clone();
 
-        let span = tracing::info_span!("rpc", method = "invoke_agent");
+        let span = tracing::info_span!("rpc", method = "invoke_peer");
         Promise::from_future(
             async move {
-                // Emit started event
-                kernel_arc
-                    .emit_agent_event(AgentActivityEvent::Started {
-                        agent: nick.clone(),
-                        block_id: String::new(), // TODO: thread block_id through invoke_agent RPC
-                        action: action.clone(),
-                    })
-                    .await;
-
-                // Dispatch to the target agent via its registered channel
-                let result = kernel_arc.invoke_agent(&nick, &action, invoke_params).await;
-
+                let result = kernel_arc.invoke_peer(&nick, &action, invoke_params).await;
                 match result {
                     Ok(data) => {
-                        kernel_arc
-                            .emit_agent_event(AgentActivityEvent::Completed {
-                                agent: nick,
-                                block_id: String::new(), // TODO: thread block_id through invoke_agent RPC
-                                success: true,
-                            })
-                            .await;
                         results.get().set_result(&data);
                         Ok(())
                     }
-                    Err(e) => {
-                        kernel_arc
-                            .emit_agent_event(AgentActivityEvent::Completed {
-                                agent: nick,
-                                block_id: String::new(), // TODO: thread block_id through invoke_agent RPC
-                                success: false,
-                            })
-                            .await;
-                        Err(capnp::Error::failed(format!("invoke_agent: {e}")))
-                    }
+                    Err(e) => Err(capnp::Error::failed(format!("invoke_peer: {e}"))),
                 }
             }
             .instrument(span),
         )
-    }
-
-    fn subscribe_agent_events(
-        self: Rc<Self>,
-        params: kernel::SubscribeAgentEventsParams,
-        _results: kernel::SubscribeAgentEventsResults,
-    ) -> Promise<(), capnp::Error> {
-        let _span = tracing::info_span!("rpc", method = "subscribe_agent_events").entered();
-        let callback = pry!(pry!(params.get()).get_callback());
-
-        let kernel_arc = self.kernel.kernel.clone();
-        let kernel_id = self.kernel.id;
-
-        // Spawn a bridge task that forwards AgentActivityEvent to the callback
-        tokio::task::spawn_local(async move {
-            let mut receiver = kernel_arc.subscribe_agent_events().await;
-
-            log::debug!("Started agent event subscription for kernel {}", kernel_id);
-
-            while let Ok(event) = receiver.recv().await {
-                let success = match &event {
-                    AgentActivityEvent::Started {
-                        agent,
-                        block_id: _,
-                        action,
-                    } => {
-                        let mut req = callback.on_activity_request();
-                        {
-                            let mut params = req.get().init_event();
-                            params.set_agent(agent);
-                            let mut started = params.init_started();
-                            // Parse block_id string back to components - simplified for now
-                            started.reborrow().init_block_id();
-                            started.set_action(action);
-                        }
-                        req.send().promise.await.is_ok()
-                    }
-                    AgentActivityEvent::Progress {
-                        agent,
-                        block_id: _,
-                        message,
-                        percent,
-                    } => {
-                        let mut req = callback.on_activity_request();
-                        {
-                            let mut params = req.get().init_event();
-                            params.set_agent(agent);
-                            let mut progress = params.init_progress();
-                            progress.reborrow().init_block_id();
-                            progress.set_message(message);
-                            progress.set_percent(*percent);
-                        }
-                        req.send().promise.await.is_ok()
-                    }
-                    AgentActivityEvent::Completed {
-                        agent,
-                        block_id: _,
-                        success: ok,
-                    } => {
-                        let mut req = callback.on_activity_request();
-                        {
-                            let mut params = req.get().init_event();
-                            params.set_agent(agent);
-                            let mut completed = params.init_completed();
-                            completed.reborrow().init_block_id();
-                            completed.set_success(*ok);
-                        }
-                        req.send().promise.await.is_ok()
-                    }
-                    AgentActivityEvent::CursorMoved {
-                        agent,
-                        block_id: _,
-                        offset,
-                    } => {
-                        let mut req = callback.on_activity_request();
-                        {
-                            let mut params = req.get().init_event();
-                            params.set_agent(agent);
-                            let mut cursor = params.init_cursor_moved();
-                            cursor.reborrow().init_block_id();
-                            cursor.set_offset(*offset);
-                        }
-                        req.send().promise.await.is_ok()
-                    }
-                };
-
-                if !success {
-                    log::debug!(
-                        "Agent event bridge task for kernel {} stopping: callback failed",
-                        kernel_id
-                    );
-                    break;
-                }
-            }
-
-            log::debug!("Agent event bridge task for kernel {} ended", kernel_id);
-        });
-
-        Promise::ok(())
     }
 
     // ========================================================================
@@ -4800,74 +4602,13 @@ fn build_output_data(
 }
 
 // ============================================================================
-// Agent Helper Functions
+// Peer Helper Functions
 // ============================================================================
 
-use crate::kaijutsu_capnp::{
-    AgentCapability as CapnpAgentCapability, AgentStatus as CapnpAgentStatus,
-};
-
-/// Convert capnp AgentCapability to kernel AgentCapability.
-fn capnp_to_agent_capability(cap: CapnpAgentCapability) -> Option<AgentCapability> {
-    match cap {
-        CapnpAgentCapability::SpellCheck => Some(AgentCapability::SpellCheck),
-        CapnpAgentCapability::Grammar => Some(AgentCapability::Grammar),
-        CapnpAgentCapability::Format => Some(AgentCapability::Format),
-        CapnpAgentCapability::Review => Some(AgentCapability::Review),
-        CapnpAgentCapability::Generate => Some(AgentCapability::Generate),
-        CapnpAgentCapability::Refactor => Some(AgentCapability::Refactor),
-        CapnpAgentCapability::Explain => Some(AgentCapability::Explain),
-        CapnpAgentCapability::Translate => Some(AgentCapability::Translate),
-        CapnpAgentCapability::Summarize => Some(AgentCapability::Summarize),
-        CapnpAgentCapability::Custom => Some(AgentCapability::Custom),
-    }
-}
-
-/// Set AgentInfo fields on a Cap'n Proto builder.
-fn set_agent_info(builder: &mut agent_info::Builder, info: &AgentInfo) {
+/// Set PeerInfo fields on a Cap'n Proto builder.
+fn set_peer_info(builder: &mut peer_info::Builder, info: &PeerInfo) {
     builder.set_nick(&info.nick);
-    builder.set_instance(&info.instance);
-    builder.set_provider(&info.provider);
-    builder.set_model_id(&info.model_id);
-
-    // Set capabilities
-    let caps_len = info.capabilities.len() as u32;
-    let mut caps = builder.reborrow().init_capabilities(caps_len);
-    for (i, cap) in info.capabilities.iter().enumerate() {
-        caps.set(i as u32, agent_capability_to_capnp(*cap));
-    }
-
-    // Set status
-    builder.set_status(agent_status_to_capnp(info.status));
-
-    // Set timestamps
     builder.set_attached_at(info.attached_at);
-    builder.set_last_activity(info.last_activity);
-}
-
-/// Convert kernel AgentCapability to capnp.
-fn agent_capability_to_capnp(cap: AgentCapability) -> CapnpAgentCapability {
-    match cap {
-        AgentCapability::SpellCheck => CapnpAgentCapability::SpellCheck,
-        AgentCapability::Grammar => CapnpAgentCapability::Grammar,
-        AgentCapability::Format => CapnpAgentCapability::Format,
-        AgentCapability::Review => CapnpAgentCapability::Review,
-        AgentCapability::Generate => CapnpAgentCapability::Generate,
-        AgentCapability::Refactor => CapnpAgentCapability::Refactor,
-        AgentCapability::Explain => CapnpAgentCapability::Explain,
-        AgentCapability::Translate => CapnpAgentCapability::Translate,
-        AgentCapability::Summarize => CapnpAgentCapability::Summarize,
-        AgentCapability::Custom => CapnpAgentCapability::Custom,
-    }
-}
-
-/// Convert kernel AgentStatus to capnp.
-fn agent_status_to_capnp(status: AgentStatus) -> CapnpAgentStatus {
-    match status {
-        AgentStatus::Ready => CapnpAgentStatus::Ready,
-        AgentStatus::Busy => CapnpAgentStatus::Busy,
-        AgentStatus::Offline => CapnpAgentStatus::Offline,
-    }
 }
 
 // ============================================================================

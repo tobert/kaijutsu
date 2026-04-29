@@ -44,8 +44,6 @@ use bevy::prelude::*;
 use kaijutsu_client::ContextMembership;
 use kaijutsu_types::ContextId;
 
-use crate::agents::AgentActivityMessage;
-
 pub use create_dialog::create_or_fork_context;
 
 // Render module provides visual systems (used by the plugin internally)
@@ -84,7 +82,6 @@ impl Plugin for ConstellationPlugin {
                 Update,
                 (
                     track_context_events,
-                    track_agent_activity,
                     // Input handling in input::systems (toggle_constellation + constellation_nav)
                     handle_node_click,
                     sync_physics_entities,
@@ -418,61 +415,6 @@ fn track_context_events(
                 }
             }
             _ => {}
-        }
-    }
-}
-
-/// Track agent activity events to update node visual state.
-///
-/// When agents start/complete work, update the corresponding node's
-/// ActivityState to provide visual feedback in the constellation.
-fn track_agent_activity(
-    mut constellation: ResMut<Constellation>,
-    mut events: MessageReader<AgentActivityMessage>,
-    time: Res<Time>,
-) {
-    let now = time.elapsed_secs_f64();
-    for event in events.read() {
-        match event {
-            AgentActivityMessage::Started {
-                nick,
-                action,
-                block_id,
-            } => {
-                info!("Agent {} started: {}", nick, action);
-                if let Some(node) = constellation.node_by_block_id_mut(block_id) {
-                    node.activity = ActivityState::Streaming;
-                    node.last_activity_time = now;
-                }
-            }
-            AgentActivityMessage::Progress { block_id, .. } => {
-                if let Some(node) = constellation.node_by_block_id_mut(block_id) {
-                    if node.activity != ActivityState::Streaming {
-                        node.activity = ActivityState::Streaming;
-                    }
-                    node.last_activity_time = now;
-                }
-            }
-            AgentActivityMessage::Completed {
-                block_id, success, ..
-            } => {
-                if let Some(node) = constellation.node_by_block_id_mut(block_id) {
-                    node.activity = if *success {
-                        ActivityState::Completed
-                    } else {
-                        ActivityState::Error
-                    };
-                    node.last_activity_time = now;
-                }
-            }
-            AgentActivityMessage::CursorMoved { block_id, .. } => {
-                if let Some(node) = constellation.node_by_block_id_mut(block_id) {
-                    if node.activity == ActivityState::Idle {
-                        node.activity = ActivityState::Active;
-                    }
-                    node.last_activity_time = now;
-                }
-            }
         }
     }
 }

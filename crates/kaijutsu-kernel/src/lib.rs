@@ -11,7 +11,6 @@
 //! - Can be forked (heavy copy, isolated) or threaded (light, shared VFS)
 //! - Has a DriftRouter for cross-context communication (shared across fork/thread)
 
-pub mod agents;
 pub mod block_store;
 pub mod block_tools;
 pub mod image;
@@ -27,12 +26,13 @@ pub mod kernel_db;
 pub mod kj;
 pub mod llm;
 pub mod mcp;
+pub mod peers;
 pub mod state;
 pub mod vfs;
 
-pub use agents::{
-    AgentActivityEvent, AgentCapability, AgentConfig, AgentError, AgentInfo, AgentRegistry,
-    AgentStatus, InvokeRequest, InvokeResponse, SharedAgentRegistry, shared_agent_registry,
+pub use peers::{
+    InvokeRequest, InvokeResponse, PeerConfig, PeerError, PeerInfo, PeerRegistry,
+    SharedPeerRegistry, shared_peer_registry,
 };
 pub use block_store::DocumentKind;
 pub use block_store::{

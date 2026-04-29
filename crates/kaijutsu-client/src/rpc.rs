@@ -512,7 +512,7 @@ impl KernelHandle {
     /// Detach from the kernel
     #[tracing::instrument(skip(self), name = "rpc_client.detach")]
     pub async fn detach(self) -> Result<(), RpcError> {
-        let request = self.kernel.detach_agent_request();
+        let request = self.kernel.detach_peer_request();
         request.send().promise.await?;
         Ok(())
     }
@@ -1215,78 +1215,50 @@ impl KernelHandle {
     }
 
     // =========================================================================
-    // Agent Invocation
+    // Peer Invocation
     // =========================================================================
 
-    /// Attach as an agent with a commands callback.
-    ///
-    /// Creates an `AgentCommands` capnp server backed by an mpsc channel.
-    /// Returns the channel receiver so the caller can process invocations.
-    /// Attach as an agent with a commands callback.
+    /// Attach as a peer with a commands callback.
     ///
     /// The `invocation_tx` sender receives incoming invocations from the
     /// kernel. Use `std::sync::mpsc` so the receiver can be polled from
     /// any executor (including Bevy's non-tokio task pool).
-    #[tracing::instrument(skip(self, config, invocation_tx), name = "rpc_client.attach_agent")]
-    pub async fn attach_agent(
+    #[tracing::instrument(skip(self, config, invocation_tx), name = "rpc_client.attach_peer")]
+    pub async fn attach_peer(
         &self,
-        config: &crate::actor::AgentConfig,
-        invocation_tx: std::sync::mpsc::Sender<crate::actor::AgentInvocation>,
-    ) -> Result<crate::actor::AgentAttachResult, RpcError> {
-        use crate::kaijutsu_capnp::AgentCapability as CapEnum;
-
+        config: &crate::actor::PeerConfig,
+        invocation_tx: std::sync::mpsc::Sender<crate::actor::PeerInvocation>,
+    ) -> Result<crate::actor::PeerAttachResult, RpcError> {
         // Create capnp server for the callback
-        let commands_impl = AgentCommandsImpl { tx: invocation_tx };
-        let commands_client: crate::kaijutsu_capnp::agent_commands::Client =
+        let commands_impl = PeerCommandsImpl { tx: invocation_tx };
+        let commands_client: crate::kaijutsu_capnp::peer_commands::Client =
             capnp_rpc::new_client(commands_impl);
 
-        let mut request = self.kernel.attach_agent_request();
+        let mut request = self.kernel.attach_peer_request();
         {
             let mut cfg = request.get().init_config();
             cfg.set_nick(&config.nick);
-            cfg.set_instance(&config.instance);
-            cfg.set_provider(&config.provider);
-            cfg.set_model_id(&config.model_id);
-
-            let mut caps = cfg.reborrow().init_capabilities(config.capabilities.len() as u32);
-            for (i, c) in config.capabilities.iter().enumerate() {
-                let cap = match c.as_str() {
-                    "spell_check" => CapEnum::SpellCheck,
-                    "grammar" => CapEnum::Grammar,
-                    "format" => CapEnum::Format,
-                    "review" => CapEnum::Review,
-                    "generate" => CapEnum::Generate,
-                    "refactor" => CapEnum::Refactor,
-                    "explain" => CapEnum::Explain,
-                    "translate" => CapEnum::Translate,
-                    "summarize" => CapEnum::Summarize,
-                    _ => CapEnum::Custom,
-                };
-                caps.set(i as u32, cap);
-            }
-
             request.get().set_commands(commands_client);
         }
 
         let response = request.send().promise.await?;
         let info = response.get()?.get_info()?;
-        let result = crate::actor::AgentAttachResult {
+        let result = crate::actor::PeerAttachResult {
             nick: info.get_nick()?.to_string()?,
-            instance: info.get_instance()?.to_string()?,
         };
 
         Ok(result)
     }
 
-    /// Invoke another agent through the kernel.
-    #[tracing::instrument(skip(self, params), name = "rpc_client.invoke_agent")]
-    pub async fn invoke_agent(
+    /// Invoke another peer through the kernel.
+    #[tracing::instrument(skip(self, params), name = "rpc_client.invoke_peer")]
+    pub async fn invoke_peer(
         &self,
         nick: &str,
         action: &str,
         params: &[u8],
     ) -> Result<Vec<u8>, RpcError> {
-        let mut request = self.kernel.invoke_agent_request();
+        let mut request = self.kernel.invoke_peer_request();
         {
             let mut p = request.get();
             p.set_nick(nick);
@@ -1755,7 +1727,11 @@ pub(crate) fn parse_output_data(
     for i in 0..root_reader.len() {
         root.push(parse_output_node(root_reader.get(i))?);
     }
-    Ok(kaijutsu_types::OutputData { headers, root })
+    Ok(kaijutsu_types::OutputData {
+        headers,
+        root,
+        rich_json: None,
+    })
 }
 
 fn parse_context_id(data: &[u8]) -> Result<ContextId, RpcError> {
@@ -2859,22 +2835,22 @@ mod tests {
 }
 
 // ============================================================================
-// AgentCommands capnp server (client-side callback)
+// PeerCommands capnp server (client-side callback)
 // ============================================================================
 
-/// Implements the `AgentCommands` Cap'n Proto interface on the client side.
+/// Implements the `PeerCommands` Cap'n Proto interface on the client side.
 ///
 /// Lives in `spawn_local` (is `!Send`). Forwards invocations to the caller
 /// via an mpsc channel so they can be processed on any thread.
-struct AgentCommandsImpl {
-    tx: std::sync::mpsc::Sender<crate::actor::AgentInvocation>,
+struct PeerCommandsImpl {
+    tx: std::sync::mpsc::Sender<crate::actor::PeerInvocation>,
 }
 
-impl crate::kaijutsu_capnp::agent_commands::Server for AgentCommandsImpl {
+impl crate::kaijutsu_capnp::peer_commands::Server for PeerCommandsImpl {
     async fn invoke(
         self: capnp::capability::Rc<Self>,
-        params: crate::kaijutsu_capnp::agent_commands::InvokeParams,
-        mut results: crate::kaijutsu_capnp::agent_commands::InvokeResults,
+        params: crate::kaijutsu_capnp::peer_commands::InvokeParams,
+        mut results: crate::kaijutsu_capnp::peer_commands::InvokeResults,
     ) -> Result<(), capnp::Error> {
         let action = params
             .get()?
@@ -2885,7 +2861,7 @@ impl crate::kaijutsu_capnp::agent_commands::Server for AgentCommandsImpl {
         let invoke_params = params.get()?.get_params()?.to_vec();
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        let invocation = crate::actor::AgentInvocation {
+        let invocation = crate::actor::PeerInvocation {
             action,
             params: invoke_params,
             reply: reply_tx,
@@ -2894,22 +2870,22 @@ impl crate::kaijutsu_capnp::agent_commands::Server for AgentCommandsImpl {
         // std::sync::mpsc::Sender::send is non-blocking and works from any executor
         self.tx
             .send(invocation)
-            .map_err(|_| capnp::Error::failed("agent handler disconnected".into()))?;
+            .map_err(|_| capnp::Error::failed("peer handler disconnected".into()))?;
 
         // Await the reply with timeout — prevents indefinite hang if the app
         // stalls or crashes. 15s is generous for a frame-rate-driven poll loop.
         let response = tokio::time::timeout(
-            crate::constants::AGENT_INVOCATION_TIMEOUT,
+            crate::constants::PEER_INVOCATION_TIMEOUT,
             reply_rx,
         )
         .await
         .map_err(|_| {
             capnp::Error::failed(format!(
-                "agent invocation timed out after {}s waiting for app dispatch",
-                crate::constants::AGENT_INVOCATION_TIMEOUT.as_secs()
+                "peer invocation timed out after {}s waiting for app dispatch",
+                crate::constants::PEER_INVOCATION_TIMEOUT.as_secs()
             ))
         })?
-        .map_err(|_| capnp::Error::failed("agent handler dropped reply".into()))?;
+        .map_err(|_| capnp::Error::failed("peer handler dropped reply".into()))?;
 
         match response {
             Ok(data) => {

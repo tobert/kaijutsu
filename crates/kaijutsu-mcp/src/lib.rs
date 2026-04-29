@@ -2020,29 +2020,29 @@ impl KaijutsuMcp {
     }
 
     // ========================================================================
-    // Agent Invocation
+    // Peer Invocation (drift navigation)
     // ========================================================================
 
     #[tool(
-        description = "Invoke another agent's capability through the kernel. Agents register with the kernel (e.g., kaijutsu-app registers as an agent with actions like 'switch_context' and 'active_context'). Params and result are JSON. Requires --connect.",
+        description = "Invoke a peer through the kernel. Peers are named RPC participants attached to the kernel (e.g., kaijutsu-app registers as a peer and exposes actions like 'switch_context' and 'active_context' for drift navigation). Params and result are JSON. Requires --connect.",
         annotations(
             destructive_hint = false,
             idempotent_hint = false,
             open_world_hint = true
         )
     )]
-    #[tracing::instrument(skip(self, req), name = "mcp.invoke_agent")]
-    async fn invoke_agent(&self, Parameters(req): Parameters<InvokeAgentRequest>) -> String {
+    #[tracing::instrument(skip(self, req), name = "mcp.invoke_peer")]
+    async fn invoke_peer(&self, Parameters(req): Parameters<InvokePeerRequest>) -> String {
         let actor = match self.actor() {
             Some(a) => a,
-            None => return "Error: invoke_agent requires --connect".to_string(),
+            None => return "Error: invoke_peer requires --connect".to_string(),
         };
 
         let params = match serde_json::to_vec(&req.params) {
             Ok(v) => v,
             Err(e) => return format!("Error: failed to serialize params: {e}"),
         };
-        match actor.invoke_agent(&req.nick, &req.action, &params).await {
+        match actor.invoke_peer(&req.nick, &req.action, &params).await {
             Ok(result) => String::from_utf8_lossy(&result).to_string(),
             Err(e) => format!("Error: {e}"),
         }

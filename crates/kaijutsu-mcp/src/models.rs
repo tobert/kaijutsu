@@ -400,11 +400,11 @@ pub struct SearchMatch {
     pub after: Vec<String>,
 }
 
-/// Invoke another agent's capability through the kernel.
+/// Invoke a peer through the kernel.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct InvokeAgentRequest {
-    /// Agent nick to invoke (e.g., "kaijutsu-app")
-    #[schemars(description = "Agent nick to invoke (e.g., \"kaijutsu-app\")")]
+pub struct InvokePeerRequest {
+    /// Peer nick to invoke (e.g., "kaijutsu-app")
+    #[schemars(description = "Peer nick to invoke (e.g., \"kaijutsu-app\")")]
     pub nick: String,
     /// Action to perform (e.g., "switch_context", "active_context")
     #[schemars(description = "Action to perform (e.g., \"switch_context\", \"active_context\")")]

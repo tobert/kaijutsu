@@ -81,9 +81,9 @@ Sync methods use `span.entered()` guards.
 | VFS | `mount`, `unmount`, `list_mounts` |
 | Shell vars | `get_shell_var`, `set_shell_var`, `list_shell_vars`, `get_cwd`, `set_cwd` |
 | Blobs | `read_blob`, `write_blob`, `delete_blob`, `list_blobs` |
-| Agents | `attach_agent`, `detach_agent`, `list_agents`, `set_agent_capabilities`, `invoke_agent` |
+| Peers | `attach_peer`, `detach_peer`, `list_peers`, `invoke_peer` |
 | Config | `get_config`, `list_configs`, `reload_config`, `reset_config` |
-| Subscriptions | `subscribe_blocks`, `subscribe_agent_events`, `subscribe_mcp_resources`, `subscribe_mcp_elicitations` |
+| Subscriptions | `subscribe_blocks`, `subscribe_mcp_resources`, `subscribe_mcp_elicitations` |
 | Other | `set_attribution`, `get_command_history` |
 
 **Not instrumented:** VFS filesystem methods (~15 in `impl vfs::Server`) — high volume, low debugging value. Trivial stubs (`whoami`, `get_info`, `interrupt`, `complete`, `detach`).

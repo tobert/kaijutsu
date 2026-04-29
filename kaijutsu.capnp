@@ -650,84 +650,24 @@ struct StatFs {
 }
 
 # ============================================================================
-# Agent Types
+# Peer Types
 # ============================================================================
 
-# Configuration for attaching an agent
-struct AgentConfig {
-  nick @0 :Text;              # Display name: "spell-check", "claude-review"
-  instance @1 :Text;          # Instance ID: "quick", "deep", "haiku"
-  provider @2 :Text;          # LLM provider: "anthropic", "openai", "local"
-  modelId @3 :Text;           # Model: "claude-3-haiku", "gpt-4-mini"
-  capabilities @4 :List(AgentCapability);  # What this agent can do
+# Configuration for attaching a peer.
+struct PeerConfig {
+  nick @0 :Text;              # Stable address (e.g. "kaijutsu-app")
 }
 
-# Information about an attached agent
-struct AgentInfo {
-  nick @0 :Text;              # Display name
-  instance @1 :Text;          # Instance ID
-  provider @2 :Text;          # LLM provider
-  modelId @3 :Text;           # Model
-  capabilities @4 :List(AgentCapability);  # What this agent can do
-  status @5 :AgentStatus;     # Current agent status
-  attachedAt @6 :UInt64;      # Unix timestamp ms
-  lastActivity @7 :UInt64;    # Unix timestamp ms
+# Information about an attached peer.
+struct PeerInfo {
+  nick @0 :Text;
+  attachedAt @1 :UInt64;      # Unix timestamp ms
 }
 
-# Agent capabilities — what actions an agent can perform
-enum AgentCapability {
-  spellCheck @0;              # Quick spell-checking
-  grammar @1;                 # Grammar correction
-  format @2;                  # Code/text formatting
-  review @3;                  # Code/content review (slower, thoughtful)
-  generate @4;                # Content generation
-  refactor @5;                # Code refactoring suggestions
-  explain @6;                 # Explain selected content
-  translate @7;               # Translation to other languages
-  summarize @8;               # Summarize long content
-  custom @9;                  # Custom capability (specified via action string)
-}
-
-# Agent status
-enum AgentStatus {
-  ready @0;                   # Available to handle requests
-  busy @1;                    # Currently processing a request
-  offline @2;                 # Not currently responding
-}
-
-# Agent activity event
-struct AgentActivityEvent {
-  agent @0 :Text;             # Agent nick
-  union {
-    started :group {          # Agent started working on content
-      blockId @1 :BlockId;
-      action @2 :Text;
-    }
-    progress :group {         # Agent is making progress
-      blockId @3 :BlockId;
-      message @4 :Text;
-      percent @5 :Float32;    # 0.0 to 1.0
-    }
-    completed :group {        # Agent finished
-      blockId @6 :BlockId;
-      success @7 :Bool;
-    }
-    cursorMoved :group {      # Agent cursor position changed
-      blockId @8 :BlockId;
-      offset @9 :UInt64;
-    }
-  }
-}
-
-# Callback for receiving agent activity events
-interface AgentEvents {
-  onActivity @0 (event :AgentActivityEvent);
-}
-
-# Callback for receiving agent invocations (reverse RPC).
-# Registered via attachAgent; the kernel calls back to dispatch work.
+# Callback for receiving peer invocations (reverse RPC).
+# Registered via attachPeer; the kernel calls back to dispatch work.
 # Same pattern as MCP sampling: server holds callback to client.
-interface AgentCommands {
+interface PeerCommands {
   invoke @0 (action :Text, params :Data) -> (result :Data);
 }
 
@@ -995,28 +935,32 @@ interface Kernel {
   cancelMcpRequest @43 (server :Text, requestId :Text);
 
   # ============================================================================
-  # Agent Attachment
+  # Peer Registry (drift navigation transport)
   # ============================================================================
-  # Agents are autonomous participants that can edit content alongside humans.
+  # Peers are named RPC participants (the Bevy app, MCP servers, future
+  # clients) that the kernel can dispatch invocations to. The transport is
+  # how MCP-driven agents tell the app to switch contexts, etc.
 
-  # Attach an agent to this kernel.
-  # The optional `commands` callback enables kernel → agent invocation.
-  attachAgent @44 (config :AgentConfig, commands :AgentCommands) -> (info :AgentInfo);
+  # Attach a peer to this kernel.
+  # `commands` is the callback the kernel uses to invoke this peer.
+  attachPeer @44 (config :PeerConfig, commands :PeerCommands) -> (info :PeerInfo);
 
-  # List all attached agents on this kernel
-  listAgents @45 () -> (agents :List(AgentInfo));
+  # List all attached peers on this kernel.
+  listPeers @45 () -> (peers :List(PeerInfo));
 
-  # Detach an agent from this kernel
-  detachAgent @46 (nick :Text);
+  # Detach a peer from this kernel.
+  detachPeer @46 (nick :Text);
 
-  # Update agent capabilities
-  setAgentCapabilities @47 (nick :Text, capabilities :List(AgentCapability));
+  # Slot @47 was `setAgentCapabilities` — removed with the canvas. Cap'n Proto
+  # disallows ordinal holes, so @47 remains as a no-op.
+  removedSetAgentCapabilities @47 () -> ();
 
-  # Invoke an agent's capability. Params and result are JSON bytes.
-  invokeAgent @48 (nick :Text, action :Text, params :Data) -> (result :Data);
+  # Invoke a peer. Params and result are JSON bytes.
+  invokePeer @48 (nick :Text, action :Text, params :Data) -> (result :Data);
 
-  # Subscribe to agent activity events
-  subscribeAgentEvents @49 (callback :AgentEvents);
+  # Slot @49 was `subscribeAgentEvents` — removed with the canvas. Cap'n Proto
+  # disallows ordinal holes, so @49 remains as a no-op.
+  removedSubscribeAgentEvents @49 () -> ();
 
   # ============================================================================
   # Timeline Navigation (Fork-First Temporal Model)

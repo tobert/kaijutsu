@@ -39,7 +39,6 @@ struct Cli {
     insecure: bool,
 }
 
-mod agents;
 mod cell;
 mod commands;
 mod config;
@@ -47,6 +46,7 @@ mod connection;
 mod constants;
 mod input;
 mod kaish;
+mod peers;
 mod shaders;
 mod text;
 mod ui;
@@ -139,8 +139,8 @@ fn main() {
         .add_plugins(cell::CellPlugin)
         // Per-block Vello texture rendering
         .add_plugins(view::block_render::BlockRenderPlugin)
-        // Agent attachment and collaboration
-        .add_plugins(agents::AgentsPlugin)
+        // Peer transport (drift navigation: kernel → app invocations)
+        .add_plugins(peers::PeersPlugin)
         // Shader effects
         .add_plugins(shaders::ShaderFxPlugin)
         // Connection plugin (spawns background thread)

@@ -17,10 +17,7 @@ use uuid::Uuid;
 
 use kaijutsu_cas::FileStore;
 
-use crate::agents::{
-    AgentActivityEvent, AgentCapability, AgentConfig, AgentError, AgentInfo, AgentRegistry,
-    AgentStatus, InvokeRequest,
-};
+use crate::peers::{InvokeRequest, PeerConfig, PeerError, PeerInfo, PeerRegistry};
 use crate::control::ConsentMode;
 use crate::drift::{SharedDriftRouter, shared_drift_router};
 use crate::execution::{ExecContext, ExecResult};
@@ -44,8 +41,8 @@ pub struct Kernel {
     state: RwLock<KernelState>,
     /// LLM provider registry (behind RwLock for interior mutability).
     llm: RwLock<LlmRegistry>,
-    /// Agent registry (behind RwLock for interior mutability).
-    agents: RwLock<AgentRegistry>,
+    /// Peer registry (behind RwLock for interior mutability).
+    peers: RwLock<PeerRegistry>,
     /// Consent mode (collaborative vs autonomous).
     consent_mode: RwLock<ConsentMode>,
     /// FlowBus for block events.
@@ -106,7 +103,7 @@ impl Kernel {
             vfs,
             state: RwLock::new(KernelState::new(&name)),
             llm: RwLock::new(LlmRegistry::new()),
-            agents: RwLock::new(AgentRegistry::new()),
+            peers: RwLock::new(PeerRegistry::new()),
             consent_mode: RwLock::new(ConsentMode::default()),
             block_flows: shared_block_flow_bus(DEFAULT_FLOW_CAPACITY),
             drift: shared_drift_router(),
@@ -132,7 +129,7 @@ impl Kernel {
             vfs,
             state: RwLock::new(KernelState::new(&name)),
             llm: RwLock::new(LlmRegistry::new()),
-            agents: RwLock::new(AgentRegistry::new()),
+            peers: RwLock::new(PeerRegistry::new()),
             consent_mode: RwLock::new(ConsentMode::default()),
             block_flows,
             drift: shared_drift_router(),
@@ -665,39 +662,39 @@ impl Kernel {
     }
 
     // ========================================================================
-    // Agents
+    // Peers (drift navigation transport)
     // ========================================================================
 
-    /// Attach an agent to this kernel.
+    /// Attach a peer to this kernel.
     ///
-    /// The optional `invoke_sender` enables kernel → agent invocation.
-    pub async fn attach_agent(
+    /// The optional `invoke_sender` enables kernel → peer invocation.
+    pub async fn attach_peer(
         &self,
-        config: AgentConfig,
+        config: PeerConfig,
         invoke_sender: Option<tokio::sync::mpsc::Sender<InvokeRequest>>,
-    ) -> Result<AgentInfo, AgentError> {
-        self.agents.write().await.attach(config, invoke_sender)
+    ) -> Result<PeerInfo, PeerError> {
+        self.peers.write().await.attach(config, invoke_sender)
     }
 
-    /// Invoke an agent's capability by nick.
+    /// Invoke a peer by nick.
     ///
-    /// Dispatches the request to the agent's registered channel and awaits
+    /// Dispatches the request to the peer's registered channel and awaits
     /// the response. The kernel-side timeout (30s) is a safety net — the
     /// client-side timeout (15s) should fire first, producing a clean
     /// `Disconnected` rather than `Timeout`.
-    pub async fn invoke_agent(
+    pub async fn invoke_peer(
         &self,
         nick: &str,
         action: &str,
         params: Vec<u8>,
-    ) -> Result<Vec<u8>, AgentError> {
-        const AGENT_INVOKE_TIMEOUT: Duration = Duration::from_secs(30);
+    ) -> Result<Vec<u8>, PeerError> {
+        const PEER_INVOKE_TIMEOUT: Duration = Duration::from_secs(30);
 
         let sender = {
-            let registry = self.agents.read().await;
+            let registry = self.peers.read().await;
             registry
                 .get_invoke_sender(nick)
-                .ok_or_else(|| AgentError::NotFound(nick.to_string()))?
+                .ok_or_else(|| PeerError::NotFound(nick.to_string()))?
         };
         // RwLock released before the async send
 
@@ -708,39 +705,38 @@ impl Kernel {
             reply: reply_tx,
         };
 
-        sender.send(request).await.map_err(|_| {
-            AgentError::Disconnected(format!("{}: channel closed", nick))
-        })?;
+        sender
+            .send(request)
+            .await
+            .map_err(|_| PeerError::Disconnected(format!("{}: channel closed", nick)))?;
 
-        let response = tokio::time::timeout(AGENT_INVOKE_TIMEOUT, reply_rx)
+        let response = tokio::time::timeout(PEER_INVOKE_TIMEOUT, reply_rx)
             .await
             .map_err(|_| {
-                AgentError::Timeout(format!(
+                PeerError::Timeout(format!(
                     "{}: no reply after {}s",
                     nick,
-                    AGENT_INVOKE_TIMEOUT.as_secs()
+                    PEER_INVOKE_TIMEOUT.as_secs()
                 ))
             })?
-            .map_err(|_| {
-                AgentError::Disconnected(format!("{}: handler dropped reply", nick))
-            })?;
+            .map_err(|_| PeerError::Disconnected(format!("{}: handler dropped reply", nick)))?;
 
-        response.result.map_err(AgentError::InvocationFailed)
+        response.result.map_err(PeerError::InvocationFailed)
     }
 
-    /// Detach an agent from this kernel.
-    pub async fn detach_agent(&self, nick: &str) -> Option<AgentInfo> {
-        self.agents.write().await.detach(nick)
+    /// Detach a peer from this kernel.
+    pub async fn detach_peer(&self, nick: &str) -> Option<PeerInfo> {
+        self.peers.write().await.detach(nick)
     }
 
-    /// Get information about an attached agent.
-    pub async fn get_agent(&self, nick: &str) -> Option<AgentInfo> {
-        self.agents.read().await.get(nick).cloned()
+    /// Get information about an attached peer.
+    pub async fn get_peer(&self, nick: &str) -> Option<PeerInfo> {
+        self.peers.read().await.get(nick).cloned()
     }
 
-    /// List all attached agents.
-    pub async fn list_agents(&self) -> Vec<AgentInfo> {
-        self.agents
+    /// List all attached peers.
+    pub async fn list_peers(&self) -> Vec<PeerInfo> {
+        self.peers
             .read()
             .await
             .list()
@@ -749,74 +745,15 @@ impl Kernel {
             .collect()
     }
 
-    /// Get agents with a specific capability.
-    pub async fn agents_with_capability(&self, cap: AgentCapability) -> Vec<AgentInfo> {
-        self.agents
-            .read()
-            .await
-            .with_capability(cap)
-            .into_iter()
-            .cloned()
-            .collect()
+    /// Get the peer registry (for direct access).
+    pub fn peers(&self) -> &RwLock<PeerRegistry> {
+        &self.peers
     }
 
-    /// Update an agent's capabilities.
-    pub async fn set_agent_capabilities(
-        &self,
-        nick: &str,
-        capabilities: Vec<AgentCapability>,
-    ) -> Result<(), AgentError> {
-        self.agents
-            .write()
-            .await
-            .set_capabilities(nick, capabilities)
+    /// Count of attached peers.
+    pub async fn peer_count(&self) -> usize {
+        self.peers.read().await.count()
     }
-
-    /// Update an agent's status.
-    pub async fn set_agent_status(
-        &self,
-        nick: &str,
-        status: AgentStatus,
-    ) -> Result<(), AgentError> {
-        self.agents.write().await.set_status(nick, status)
-    }
-
-    /// Subscribe to agent activity events.
-    pub async fn subscribe_agent_events(
-        &self,
-    ) -> tokio::sync::broadcast::Receiver<AgentActivityEvent> {
-        self.agents.read().await.subscribe()
-    }
-
-    /// Emit an agent activity event.
-    pub async fn emit_agent_event(&self, event: AgentActivityEvent) {
-        // Extract agent nick for updating last_activity
-        let agent_nick = match &event {
-            AgentActivityEvent::Started { agent, .. } => agent.clone(),
-            AgentActivityEvent::Progress { agent, .. } => agent.clone(),
-            AgentActivityEvent::Completed { agent, .. } => agent.clone(),
-            AgentActivityEvent::CursorMoved { agent, .. } => agent.clone(),
-        };
-
-        // Update last_activity
-        if let Some(agent) = self.agents.write().await.get_mut(&agent_nick) {
-            agent.touch();
-        }
-
-        // Emit the event
-        self.agents.read().await.emit(event);
-    }
-
-    /// Get the agent registry (for direct access).
-    pub fn agents(&self) -> &RwLock<AgentRegistry> {
-        &self.agents
-    }
-
-    /// Count of attached agents.
-    pub async fn agent_count(&self) -> usize {
-        self.agents.read().await.count()
-    }
-
 }
 
 // Delegate VfsOps to the mount table
