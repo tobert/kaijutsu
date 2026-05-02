@@ -15,7 +15,7 @@
 
 use super::error::HookId;
 use super::hook_table::{
-    GlobPattern, HookAction, HookBody, HookEntry, HookPhase, LogSpec, ScriptRef,
+    GlobPattern, HookAction, HookBody, HookEntry, HookPhase, LogSpec,
 };
 use super::hooks_builtin::BuiltinHookRegistry;
 use super::types::{KernelToolResult, ToolContent};
@@ -91,7 +91,7 @@ pub fn entry_to_row(phase: HookPhase, entry: &HookEntry) -> HookRow {
         match_principal,
         action_kind: String::new(),
         action_builtin_name: None,
-        action_kaish_script_id: None,
+        action_kaish_body: None,
         action_result_text: None,
         action_is_error: None,
         action_deny_reason: None,
@@ -104,9 +104,9 @@ pub fn entry_to_row(phase: HookPhase, entry: &HookEntry) -> HookRow {
             row.action_kind = ACTION_BUILTIN_INVOKE.into();
             row.action_builtin_name = Some(name.clone());
         }
-        HookAction::Invoke(HookBody::Kaish(script)) => {
+        HookAction::Invoke(HookBody::Kaish(body)) => {
             row.action_kind = ACTION_KAISH_INVOKE.into();
-            row.action_kaish_script_id = Some(script.id.clone());
+            row.action_kaish_body = Some(body.clone());
         }
         HookAction::ShortCircuit(result) => {
             row.action_kind = ACTION_SHORT_CIRCUIT.into();
@@ -174,7 +174,7 @@ impl std::fmt::Display for RowParseError {
                 write!(f, "builtin hook name {s:?} not in registry")
             }
             RowParseError::MissingKaishBody => {
-                f.write_str("kaish_invoke row missing action_kaish_script_id")
+                f.write_str("kaish_invoke row missing action_kaish_body")
             }
             RowParseError::MissingShortCircuitText => {
                 f.write_str("shortcircuit without result_text")
@@ -209,14 +209,11 @@ pub fn row_to_entry(
             HookAction::Invoke(HookBody::Builtin { name, hook })
         }
         ACTION_KAISH_INVOKE => {
-            // The persisted column is `action_kaish_script_id` for
-            // historical reasons; today it holds the inline kaish body.
-            // A separate script-storage table is a follow-up.
-            let script_id = row
-                .action_kaish_script_id
+            let body = row
+                .action_kaish_body
                 .clone()
                 .ok_or(RowParseError::MissingKaishBody)?;
-            HookAction::Invoke(HookBody::Kaish(ScriptRef { id: script_id }))
+            HookAction::Invoke(HookBody::Kaish(body))
         }
         ACTION_SHORT_CIRCUIT => {
             let result_text = row
@@ -250,13 +247,6 @@ pub fn row_to_entry(
             HookAction::Log(LogSpec { target, level })
         }
         other => return Err(RowParseError::UnknownActionKind(other.to_string())),
-    };
-
-    // Defensive: surface the `_script_id` value even when we skip, so
-    // the warn-level log can name it. The kaish variant above returns
-    // early; this branch is unreachable for Kaish.
-    let _ = ScriptRef {
-        id: String::new(),
     };
 
     let entry = HookEntry {
@@ -325,7 +315,7 @@ mod tests {
             match_principal: None,
             action_kind: ACTION_BUILTIN_INVOKE.into(),
             action_builtin_name: Some("removed_hook_name".into()),
-            action_kaish_script_id: None,
+            action_kaish_body: None,
             action_result_text: None,
             action_is_error: None,
             action_deny_reason: None,
@@ -382,7 +372,7 @@ mod tests {
             match_principal: None,
             action_kind: ACTION_KAISH_INVOKE.into(),
             action_builtin_name: None,
-            action_kaish_script_id: Some("echo hi".into()),
+            action_kaish_body: Some("echo hi".into()),
             action_result_text: None,
             action_is_error: None,
             action_deny_reason: None,
@@ -391,7 +381,7 @@ mod tests {
         };
         let (_phase, entry) = row_to_entry(&row, &registry).expect("kaish row reconstructs");
         match entry.action {
-            HookAction::Invoke(HookBody::Kaish(s)) => assert_eq!(s.id, "echo hi"),
+            HookAction::Invoke(HookBody::Kaish(body)) => assert_eq!(body, "echo hi"),
             other => panic!("expected Invoke(Kaish), got {other:?}"),
         }
     }
@@ -409,7 +399,7 @@ mod tests {
             match_principal: None,
             action_kind: ACTION_KAISH_INVOKE.into(),
             action_builtin_name: None,
-            action_kaish_script_id: None,
+            action_kaish_body: None,
             action_result_text: None,
             action_is_error: None,
             action_deny_reason: None,

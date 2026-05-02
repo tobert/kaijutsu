@@ -25,7 +25,6 @@ pub use context::{CallContext, TraceContext};
 pub use error::{CoalescerError, HookId, McpError, McpResult, PolicyError};
 pub use hook_table::{
     GlobPattern, Hook, HookAction, HookBody, HookEntry, HookPhase, HookTable, HookTables, LogSpec,
-    ScriptRef,
 };
 pub use hooks_builtin::{BuiltinHookRegistry, NoOpHook, TracingAuditHook};
 pub use policy::InstancePolicy;

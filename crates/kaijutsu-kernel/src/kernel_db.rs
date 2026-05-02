@@ -109,7 +109,7 @@ pub struct HookRow {
     pub match_principal: Option<PrincipalId>,
     pub action_kind: String,
     pub action_builtin_name: Option<String>,
-    pub action_kaish_script_id: Option<String>,
+    pub action_kaish_body: Option<String>,
     pub action_result_text: Option<String>,
     pub action_is_error: Option<bool>,
     pub action_deny_reason: Option<String>,
@@ -456,7 +456,7 @@ CREATE TABLE IF NOT EXISTS hooks (
     match_principal        TEXT,
     action_kind            TEXT    NOT NULL,
     action_builtin_name    TEXT,
-    action_kaish_script_id TEXT,
+    action_kaish_body TEXT,
     action_result_text     TEXT,
     action_is_error        INTEGER,
     action_deny_reason     TEXT,
@@ -739,6 +739,19 @@ impl KernelDb {
             info!("Migration: adding context_type column to contexts table");
             conn.execute_batch(
                 "ALTER TABLE contexts ADD COLUMN context_type TEXT NOT NULL DEFAULT 'default';",
+            )?;
+        }
+        // 2026-05-02: rename hooks.action_kaish_script_id → action_kaish_body
+        // The column always held the kaish source body (the original
+        // "script_id" name presumed a script registry that never landed).
+        // SQLite ≥ 3.25 supports `ALTER TABLE ... RENAME COLUMN`.
+        let has_kaish_body: bool = conn
+            .prepare("SELECT action_kaish_body FROM hooks LIMIT 0")
+            .is_ok();
+        if !has_kaish_body {
+            info!("Migration: renaming hooks.action_kaish_script_id → action_kaish_body");
+            conn.execute_batch(
+                "ALTER TABLE hooks RENAME COLUMN action_kaish_script_id TO action_kaish_body;",
             )?;
         }
         Ok(())
@@ -2366,7 +2379,7 @@ impl KernelDb {
                 hook_id, phase, priority, insertion_idx,
                 match_instance, match_tool, match_context, match_principal,
                 action_kind,
-                action_builtin_name, action_kaish_script_id,
+                action_builtin_name, action_kaish_body,
                 action_result_text, action_is_error,
                 action_deny_reason,
                 action_log_target, action_log_level
@@ -2390,7 +2403,7 @@ impl KernelDb {
                 match_principal_str,
                 row.action_kind,
                 row.action_builtin_name,
-                row.action_kaish_script_id,
+                row.action_kaish_body,
                 row.action_result_text,
                 is_error,
                 row.action_deny_reason,
@@ -2418,7 +2431,7 @@ impl KernelDb {
             "SELECT hook_id, phase, priority,
                     match_instance, match_tool, match_context, match_principal,
                     action_kind,
-                    action_builtin_name, action_kaish_script_id,
+                    action_builtin_name, action_kaish_body,
                     action_result_text, action_is_error,
                     action_deny_reason,
                     action_log_target, action_log_level
@@ -2460,7 +2473,7 @@ impl KernelDb {
                 match_principal,
                 action_kind: row.get(7)?,
                 action_builtin_name: row.get(8)?,
-                action_kaish_script_id: row.get(9)?,
+                action_kaish_body: row.get(9)?,
                 action_result_text: row.get(10)?,
                 action_is_error,
                 action_deny_reason: row.get(12)?,
@@ -3927,7 +3940,7 @@ mod tests {
             match_principal: None,
             action_kind: "log".into(),
             action_builtin_name: None,
-            action_kaish_script_id: None,
+            action_kaish_body: None,
             action_result_text: None,
             action_is_error: None,
             action_deny_reason: None,
@@ -3956,7 +3969,7 @@ mod tests {
             match_principal: Some(principal),
             action_kind: "builtin_invoke".into(),
             action_builtin_name: Some("tracing_audit".into()),
-            action_kaish_script_id: None,
+            action_kaish_body: None,
             action_result_text: None,
             action_is_error: None,
             action_deny_reason: None,
@@ -3976,7 +3989,7 @@ mod tests {
             match_principal: None,
             action_kind: "shortcircuit".into(),
             action_builtin_name: None,
-            action_kaish_script_id: None,
+            action_kaish_body: None,
             action_result_text: Some("synthetic".into()),
             action_is_error: Some(true),
             action_deny_reason: None,
@@ -3996,7 +4009,7 @@ mod tests {
             match_principal: None,
             action_kind: "deny".into(),
             action_builtin_name: None,
-            action_kaish_script_id: None,
+            action_kaish_body: None,
             action_result_text: None,
             action_is_error: None,
             action_deny_reason: Some("no writes".into()),
@@ -4022,7 +4035,7 @@ mod tests {
             match_principal: None,
             action_kind: "kaish_invoke".into(),
             action_builtin_name: None,
-            action_kaish_script_id: Some("script-42".into()),
+            action_kaish_body: Some("script-42".into()),
             action_result_text: None,
             action_is_error: None,
             action_deny_reason: None,
@@ -4065,7 +4078,7 @@ mod tests {
 
         let k = by_id.get("h-kaish").unwrap();
         assert_eq!(k.action_kind, "kaish_invoke");
-        assert_eq!(k.action_kaish_script_id.as_deref(), Some("script-42"));
+        assert_eq!(k.action_kaish_body.as_deref(), Some("script-42"));
     }
 
     #[test]

@@ -1333,7 +1333,7 @@ impl Broker {
     async fn run_kaish_hook(
         &self,
         phase: HookPhase,
-        script: &crate::mcp::hook_table::ScriptRef,
+        body: &str,
         params: &super::types::KernelCallParams,
         ctx: &CallContext,
     ) -> Result<(), String> {
@@ -1414,7 +1414,7 @@ impl Broker {
             kaish_kernel::ast::Value::String(args_json),
         );
 
-        match kaish.execute_with_vars(&script.id, vars).await {
+        match kaish.execute_with_vars(body, vars).await {
             Ok(exec) if exec.code == 0 => Ok(()),
             Ok(exec) => {
                 let stderr_tail: String = exec.err.chars().take(512).collect();
@@ -4859,9 +4859,7 @@ mod tests {
             match_tool: Some(GlobPattern("t".into())),
             match_context: None,
             match_principal: None,
-            action: HookAction::Invoke(HookBody::Kaish(crate::mcp::hook_table::ScriptRef {
-                id: "exit 0".into(),
-            })),
+            action: HookAction::Invoke(HookBody::Kaish("exit 0".into())),
             priority: 0,
         });
 
@@ -4883,9 +4881,7 @@ mod tests {
             match_tool: Some(GlobPattern("t".into())),
             match_context: None,
             match_principal: None,
-            action: HookAction::Invoke(HookBody::Kaish(crate::mcp::hook_table::ScriptRef {
-                id: "exit 1".into(),
-            })),
+            action: HookAction::Invoke(HookBody::Kaish("exit 1".into())),
             priority: 0,
         });
 
@@ -5388,7 +5384,7 @@ mod tests {
                     match_principal: None,
                     action_kind: "log".into(),
                     action_builtin_name: None,
-                    action_kaish_script_id: None,
+                    action_kaish_body: None,
                     action_result_text: None,
                     action_is_error: None,
                     action_deny_reason: None,
@@ -5405,7 +5401,7 @@ mod tests {
                     match_principal: None,
                     action_kind: "log".into(),
                     action_builtin_name: None,
-                    action_kaish_script_id: None,
+                    action_kaish_body: None,
                     action_result_text: None,
                     action_is_error: None,
                     action_deny_reason: None,
@@ -5422,7 +5418,7 @@ mod tests {
                     match_principal: None,
                     action_kind: "log".into(),
                     action_builtin_name: None,
-                    action_kaish_script_id: None,
+                    action_kaish_body: None,
                     action_result_text: None,
                     action_is_error: None,
                     action_deny_reason: None,
@@ -5511,7 +5507,7 @@ mod tests {
                     match_principal: None,
                     action_kind: "builtin_invoke".into(),
                     action_builtin_name: Some("no_such_builtin".into()),
-                    action_kaish_script_id: None,
+                    action_kaish_body: None,
                     action_result_text: None,
                     action_is_error: None,
                     action_deny_reason: None,
@@ -5530,7 +5526,7 @@ mod tests {
                     match_principal: None,
                     action_kind: "log".into(),
                     action_builtin_name: None,
-                    action_kaish_script_id: None,
+                    action_kaish_body: None,
                     action_result_text: None,
                     action_is_error: None,
                     action_deny_reason: None,

@@ -26,11 +26,9 @@
 //! and a spawned task starts fresh — losing the depth guard opens a
 //! reentrancy path around the cap.
 //!
-//! `HookBody::Kaish` ships 2026-05-02 (post-runtime-hoist). The
-//! `ScriptRef.id` field carries the inline kaish source body — the
-//! schema column is still named `action_kaish_script_id` for
-//! historical reasons. Renaming the field and adding a separate
-//! script-storage table is a follow-up. Evaluation requires
+//! `HookBody::Kaish(body)` ships 2026-05-02 (post-runtime-hoist).
+//! The body is inline kaish source; persisted in
+//! `hooks.action_kaish_body` (TEXT). Evaluation requires
 //! `Broker::set_kernel`; without that wired, kaish hooks return Deny.
 //! `ListTools` phase still rejects kaish at `hook_add` (no coherent
 //! list-filter semantics).
@@ -68,22 +66,20 @@ pub struct LogSpec {
     pub level: tracing::Level,
 }
 
-/// Reference to a kaish script. Body implementation deferred (§9).
-#[derive(Clone, Debug)]
-pub struct ScriptRef {
-    pub id: String,
-}
-
-/// Hook body: either a builtin function or a kaish script (deferred).
+/// Hook body: either a builtin function or an inline kaish script.
 ///
 /// `Builtin.name` is the registry key the body was built from (or any other
 /// opaque tag for ad-hoc bodies). It travels with the body so the admin
 /// surface and tracing events can report which builtin is firing without
 /// reflecting on `Arc<dyn Hook>`.
+///
+/// `Kaish(body)` carries the script source directly. A separate script-
+/// storage table for shared/reusable bodies is a future follow-up; today
+/// each hook owns its own copy.
 #[derive(Clone)]
 pub enum HookBody {
     Builtin { name: String, hook: Arc<dyn Hook> },
-    Kaish(ScriptRef),
+    Kaish(String),
 }
 
 impl std::fmt::Debug for HookBody {
@@ -92,7 +88,10 @@ impl std::fmt::Debug for HookBody {
             HookBody::Builtin { name, .. } => {
                 f.debug_tuple("Builtin").field(name).finish()
             }
-            HookBody::Kaish(s) => f.debug_tuple("Kaish").field(&s.id).finish(),
+            HookBody::Kaish(body) => {
+                let preview: String = body.chars().take(32).collect();
+                f.debug_tuple("Kaish").field(&preview).finish()
+            }
         }
     }
 }

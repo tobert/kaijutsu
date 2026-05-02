@@ -44,8 +44,10 @@ use kaijutsu_types::{ContextId, PrincipalId};
 pub enum HookActionWire {
     /// Resolve a named builtin hook body from the broker registry.
     BuiltinInvoke { name: String },
-    /// Reserved. `hook_add` rejects with `McpError::Unsupported` (D-50).
-    Kaish { script_id: String },
+    /// Inline kaish source body. Persisted in `hooks.action_kaish_body`.
+    /// Evaluated at fire time via `EmbeddedKaish::execute_with_vars`.
+    /// Exit 0 → phase continues; non-zero → `PhaseOutcome::Deny`.
+    Kaish { body: String },
     /// Return a synthetic result in lieu of calling the server.
     ShortCircuit {
         result_text: String,
@@ -206,15 +208,7 @@ fn build_hook_action(
                 })?;
             HookAction::Invoke(HookBody::Builtin { name, hook })
         }
-        HookActionWire::Kaish { script_id } => {
-            // The wire field is named `script_id` for historical reasons;
-            // for now we treat it as the inline kaish source body. A proper
-            // script-storage table is a follow-up; today's hooks carry their
-            // body in the field directly.
-            HookAction::Invoke(HookBody::Kaish(super::super::hook_table::ScriptRef {
-                id: script_id,
-            }))
-        }
+        HookActionWire::Kaish { body } => HookAction::Invoke(HookBody::Kaish(body)),
         HookActionWire::ShortCircuit {
             result_text,
             is_error,
@@ -240,8 +234,13 @@ fn entry_summary_json(phase: HookPhase, entry: &HookEntry, full: bool) -> serde_
         HookAction::Invoke(HookBody::Builtin { name, .. }) => {
             serde_json::json!({ "type": "builtin_invoke", "name": name })
         }
-        HookAction::Invoke(HookBody::Kaish(script)) => {
-            serde_json::json!({ "type": "kaish", "script_id": script.id })
+        HookAction::Invoke(HookBody::Kaish(body)) => {
+            let preview: String = if full {
+                body.clone()
+            } else {
+                body.chars().take(64).collect()
+            };
+            serde_json::json!({ "type": "kaish", "body": preview })
         }
         HookAction::ShortCircuit(r) if full => serde_json::json!({
             "type": "short_circuit",
@@ -778,7 +777,7 @@ mod tests {
                         "phase": "pre_call",
                         "action": {
                             "type": "kaish",
-                            "script_id": "exit 0",
+                            "body": "exit 0",
                         },
                     }),
                 ),
@@ -813,7 +812,7 @@ mod tests {
                         "phase": "list_tools",
                         "action": {
                             "type": "kaish",
-                            "script_id": "exit 0",
+                            "body": "exit 0",
                         },
                     }),
                 ),
