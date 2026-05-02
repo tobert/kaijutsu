@@ -206,10 +206,14 @@ fn build_hook_action(
                 })?;
             HookAction::Invoke(HookBody::Builtin { name, hook })
         }
-        HookActionWire::Kaish { .. } => {
-            // D-50: Kaish bodies deferred. Reject at add time so the caller
-            // sees the failure immediately, not at first match.
-            return Err(McpError::Unsupported);
+        HookActionWire::Kaish { script_id } => {
+            // The wire field is named `script_id` for historical reasons;
+            // for now we treat it as the inline kaish source body. A proper
+            // script-storage table is a follow-up; today's hooks carry their
+            // body in the field directly.
+            HookAction::Invoke(HookBody::Kaish(super::super::hook_table::ScriptRef {
+                id: script_id,
+            }))
         }
         HookActionWire::ShortCircuit {
             result_text,
@@ -752,9 +756,48 @@ mod tests {
         assert!(hooks.pre_call.entries.is_empty());
     }
 
-    /// D-50: `Kaish` bodies are rejected at add time with `Unsupported`.
+    /// Kaish bodies install successfully — `script_id` carries the inline
+    /// kaish source. (Schema column is named `action_kaish_script_id` for
+    /// historical reasons; today it holds the body itself.) Evaluation
+    /// requires `Broker::set_kernel`; without that wired, fire-time
+    /// returns a kaish-cannot-run error which the broker maps to Deny.
     #[tokio::test]
-    async fn hook_add_kaish_rejects() {
+    async fn hook_add_kaish_installs() {
+        let broker = Arc::new(Broker::new());
+        let server = Arc::new(BuiltinHooksServer::new(Arc::downgrade(&broker)));
+        broker
+            .register(server, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        let res = broker
+            .call_tool(
+                call_params(
+                    "hook_add",
+                    serde_json::json!({
+                        "phase": "pre_call",
+                        "action": {
+                            "type": "kaish",
+                            "script_id": "exit 0",
+                        },
+                    }),
+                ),
+                &CallContext::test(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("hook_add should accept kaish bodies");
+        assert!(!res.is_error, "hook_add reported failure: {res:?}");
+
+        let hooks = broker.hooks().read().await;
+        assert_eq!(hooks.pre_call.entries.len(), 1);
+    }
+
+    /// `ListTools` phase still rejects Kaish — list-filter bodies have no
+    /// coherent execution semantics (D-56 keeps this rejection alongside
+    /// `Invoke`/`ShortCircuit`).
+    #[tokio::test]
+    async fn hook_add_kaish_rejected_for_list_tools() {
         let broker = Arc::new(Broker::new());
         let server = Arc::new(BuiltinHooksServer::new(Arc::downgrade(&broker)));
         broker
@@ -767,10 +810,10 @@ mod tests {
                 call_params(
                     "hook_add",
                     serde_json::json!({
-                        "phase": "pre_call",
+                        "phase": "list_tools",
                         "action": {
                             "type": "kaish",
-                            "script_id": "some-script",
+                            "script_id": "exit 0",
                         },
                     }),
                 ),
@@ -781,7 +824,7 @@ mod tests {
             .unwrap_err();
         assert!(
             matches!(err, McpError::Unsupported),
-            "expected Unsupported, got {err:?}"
+            "expected Unsupported for list_tools+kaish, got {err:?}"
         );
     }
 

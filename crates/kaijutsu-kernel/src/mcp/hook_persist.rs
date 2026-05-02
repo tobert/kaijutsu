@@ -150,10 +150,9 @@ pub enum RowParseError {
     /// know — either a previously-registered builtin has been removed
     /// or a typo was inserted directly via SQL.
     UnknownBuiltin(String),
-    /// `action_kind = "kaish_invoke"` — admin surface rejects these at
-    /// add time (D-50) but the persisted-shape is defensive: if a row
-    /// somehow carries kaish, skip with a warn rather than crash.
-    KaishNotSupported,
+    /// `action_kind = "kaish_invoke"` row without a body column —
+    /// shape invariant violated.
+    MissingKaishBody,
     /// `action_kind = "shortcircuit"` without a result_text; shape
     /// invariant violated.
     MissingShortCircuitText,
@@ -174,8 +173,8 @@ impl std::fmt::Display for RowParseError {
             RowParseError::UnknownBuiltin(s) => {
                 write!(f, "builtin hook name {s:?} not in registry")
             }
-            RowParseError::KaishNotSupported => {
-                f.write_str("kaish bodies not supported (D-50)")
+            RowParseError::MissingKaishBody => {
+                f.write_str("kaish_invoke row missing action_kaish_script_id")
             }
             RowParseError::MissingShortCircuitText => {
                 f.write_str("shortcircuit without result_text")
@@ -210,14 +209,14 @@ pub fn row_to_entry(
             HookAction::Invoke(HookBody::Builtin { name, hook })
         }
         ACTION_KAISH_INVOKE => {
-            // D-50: kaish bodies are reserved but not runnable. A row
-            // with kaish_invoke is not actionable — skip with a warn
-            // at the call site.
-            let _script_id = row
+            // The persisted column is `action_kaish_script_id` for
+            // historical reasons; today it holds the inline kaish body.
+            // A separate script-storage table is a follow-up.
+            let script_id = row
                 .action_kaish_script_id
                 .clone()
-                .unwrap_or_default();
-            return Err(RowParseError::KaishNotSupported);
+                .ok_or(RowParseError::MissingKaishBody)?;
+            HookAction::Invoke(HookBody::Kaish(ScriptRef { id: script_id }))
         }
         ACTION_SHORT_CIRCUIT => {
             let result_text = row
@@ -368,9 +367,10 @@ mod tests {
     }
 
     #[test]
-    fn kaish_row_returns_unsupported() {
-        // D-50: kaish rows fail to reconstruct with a typed error so
-        // the broker warn-skips rather than panicking.
+    fn kaish_row_round_trip() {
+        // Kaish rows now reconstruct into a runnable HookBody::Kaish.
+        // The persisted column carries the inline body (per the
+        // documented wart in `build_hook_action`).
         let registry = BuiltinHookRegistry::new();
         let row = HookRow {
             hook_id: "k".into(),
@@ -382,7 +382,34 @@ mod tests {
             match_principal: None,
             action_kind: ACTION_KAISH_INVOKE.into(),
             action_builtin_name: None,
-            action_kaish_script_id: Some("any".into()),
+            action_kaish_script_id: Some("echo hi".into()),
+            action_result_text: None,
+            action_is_error: None,
+            action_deny_reason: None,
+            action_log_target: None,
+            action_log_level: None,
+        };
+        let (_phase, entry) = row_to_entry(&row, &registry).expect("kaish row reconstructs");
+        match entry.action {
+            HookAction::Invoke(HookBody::Kaish(s)) => assert_eq!(s.id, "echo hi"),
+            other => panic!("expected Invoke(Kaish), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kaish_row_missing_body_errors() {
+        let registry = BuiltinHookRegistry::new();
+        let row = HookRow {
+            hook_id: "k".into(),
+            phase: "pre_call".into(),
+            priority: 0,
+            match_instance: None,
+            match_tool: None,
+            match_context: None,
+            match_principal: None,
+            action_kind: ACTION_KAISH_INVOKE.into(),
+            action_builtin_name: None,
+            action_kaish_script_id: None,
             action_result_text: None,
             action_is_error: None,
             action_deny_reason: None,
@@ -391,7 +418,7 @@ mod tests {
         };
         assert!(matches!(
             row_to_entry(&row, &registry),
-            Err(RowParseError::KaishNotSupported)
+            Err(RowParseError::MissingKaishBody)
         ));
     }
 }

@@ -13,7 +13,7 @@
 //! handling (§9, D-25), tool search / late injection (Phase 5).
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use std::collections::HashSet;
 
@@ -159,6 +159,11 @@ pub struct Broker {
     /// D-37 setter pattern as `documents`). `None` → persistence is a
     /// no-op, which keeps `Broker::new()` workable for tests.
     db: RwLock<Option<DbHandle>>,
+    /// Weak handle to the owning kernel — used to construct `EmbeddedKaish`
+    /// when firing `HookBody::Kaish`. `Weak` because `Kernel` owns this
+    /// `Broker` (`Arc<Broker>`); a strong ref would leak. Set via
+    /// `set_kernel` at bootstrap; `None` → kaish hooks return Unsupported.
+    kernel: RwLock<Option<Weak<crate::Kernel>>>,
 }
 
 impl Default for Broker {
@@ -192,7 +197,15 @@ impl Broker {
             resource_parents: Mutex::new(HashMap::new()),
             builtin_hooks: BuiltinHookRegistry::new(),
             db: RwLock::new(None),
+            kernel: RwLock::new(None),
         }
+    }
+
+    /// Wire a `Weak<Kernel>` so `HookBody::Kaish` evaluation can construct
+    /// an `EmbeddedKaish`. Called at kernel bootstrap. Stored as `Weak`
+    /// to avoid the `Kernel`/`Broker` cycle (Kernel holds `Arc<Broker>`).
+    pub async fn set_kernel(&self, kernel: &Arc<crate::Kernel>) {
+        *self.kernel.write().await = Some(Arc::downgrade(kernel));
     }
 
     /// Wire the kernel DB handle used to persist `ContextToolBinding` and
@@ -1290,11 +1303,129 @@ impl Broker {
                             });
                         }
                     }
-                    HookBody::Kaish(_) => return Err(McpError::Unsupported),
+                    HookBody::Kaish(script) => {
+                        let _depth_guard = enter_hook_depth()?;
+                        match self.run_kaish_hook(phase, &script, params, ctx).await {
+                            Ok(()) => {}
+                            Err(reason) => {
+                                return Ok(PhaseOutcome::Deny {
+                                    hook_id: entry.id,
+                                    reason,
+                                });
+                            }
+                        }
+                    }
                 },
             }
         }
         Ok(PhaseOutcome::Continue)
+    }
+
+    /// Run a `HookBody::Kaish` body. The script's `id` field is treated
+    /// as the inline kaish source (per the wart documented in
+    /// `hooks_builtin::build_hook_action`). Returns `Ok(())` on exit 0,
+    /// `Err(reason)` otherwise — the caller maps `Err` to
+    /// `PhaseOutcome::Deny` so kaish hooks cleanly veto a tool call.
+    ///
+    /// The script sees: `KJ_HOOK_PHASE`, `KJ_HOOK_INSTANCE`,
+    /// `KJ_HOOK_TOOL`, `KJ_PRINCIPAL`, `KJ_CONTEXT`, `KJ_TOOL_ARGS`
+    /// (JSON of the call params).
+    async fn run_kaish_hook(
+        &self,
+        phase: HookPhase,
+        script: &crate::mcp::hook_table::ScriptRef,
+        params: &super::types::KernelCallParams,
+        ctx: &CallContext,
+    ) -> Result<(), String> {
+        use crate::runtime::context_engine::session_context_map;
+        use crate::runtime::embedded_kaish::EmbeddedKaish;
+        use std::collections::HashMap;
+
+        let kernel = match self.kernel.read().await.as_ref().and_then(|w| w.upgrade()) {
+            Some(k) => k,
+            None => {
+                return Err(
+                    "kaish hook requires Broker::set_kernel; not wired".to_string()
+                );
+            }
+        };
+        let docs = match self.documents.read().await.clone() {
+            Some(d) => d,
+            None => {
+                return Err(
+                    "kaish hook requires Broker::set_documents; not wired".to_string()
+                );
+            }
+        };
+
+        let session_id = kaijutsu_types::SessionId::new();
+        let session_contexts = session_context_map();
+        session_contexts.insert(session_id, ctx.context_id);
+
+        let configure_tools = |_, _, _: &mut kaish_kernel::ToolRegistry| {};
+        let kaish = EmbeddedKaish::with_identity(
+            "hook",
+            docs,
+            kernel,
+            None,
+            ctx.principal_id,
+            ctx.context_id,
+            session_id,
+            ctx.kernel_id,
+            session_contexts,
+            configure_tools,
+        )
+        .map_err(|e| format!("kaish hook init failed: {e}"))?;
+
+        let phase_str = match phase {
+            HookPhase::PreCall => "pre_call",
+            HookPhase::PostCall => "post_call",
+            HookPhase::OnError => "on_error",
+            HookPhase::OnNotification => "on_notification",
+            HookPhase::ListTools => "list_tools",
+        };
+
+        let args_json = serde_json::to_string(&params.arguments)
+            .unwrap_or_else(|_| "{}".to_string());
+
+        let mut vars: HashMap<String, kaish_kernel::ast::Value> = HashMap::new();
+        vars.insert(
+            "KJ_HOOK_PHASE".into(),
+            kaish_kernel::ast::Value::String(phase_str.to_string()),
+        );
+        vars.insert(
+            "KJ_HOOK_INSTANCE".into(),
+            kaish_kernel::ast::Value::String(params.instance.0.clone()),
+        );
+        vars.insert(
+            "KJ_HOOK_TOOL".into(),
+            kaish_kernel::ast::Value::String(params.tool.clone()),
+        );
+        vars.insert(
+            "KJ_PRINCIPAL".into(),
+            kaish_kernel::ast::Value::String(ctx.principal_id.to_hex()),
+        );
+        vars.insert(
+            "KJ_CONTEXT".into(),
+            kaish_kernel::ast::Value::String(ctx.context_id.to_hex()),
+        );
+        vars.insert(
+            "KJ_TOOL_ARGS".into(),
+            kaish_kernel::ast::Value::String(args_json),
+        );
+
+        match kaish.execute_with_vars(&script.id, vars).await {
+            Ok(exec) if exec.code == 0 => Ok(()),
+            Ok(exec) => {
+                let stderr_tail: String = exec.err.chars().take(512).collect();
+                Err(format!(
+                    "kaish hook exit {}: {}",
+                    exec.code,
+                    stderr_tail.trim()
+                ))
+            }
+            Err(e) => Err(format!("kaish hook exec error: {e}")),
+        }
     }
 
     // ── Resource dispatch (Phase 3 M3) ─────────────────────────────────
@@ -2900,6 +3031,7 @@ mod tests {
                 subscriptions: Mutex::new(HashMap::new()),
                 resource_parents: Mutex::new(HashMap::new()),
                 builtin_hooks: BuiltinHookRegistry::new(),
+                kernel: RwLock::new(None),
                 db: RwLock::new(None),
             }
         });
@@ -3070,6 +3202,7 @@ mod tests {
                 subscriptions: Mutex::new(HashMap::new()),
                 resource_parents: Mutex::new(HashMap::new()),
                 builtin_hooks: BuiltinHookRegistry::new(),
+                kernel: RwLock::new(None),
                 db: RwLock::new(None),
             }
         });
@@ -4438,6 +4571,7 @@ mod tests {
                 subscriptions: Mutex::new(HashMap::new()),
                 resource_parents: Mutex::new(HashMap::new()),
                 builtin_hooks: BuiltinHookRegistry::new(),
+                kernel: RwLock::new(None),
                 db: RwLock::new(None),
             }
         });
@@ -4697,6 +4831,76 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    /// A `HookBody::Kaish` pre_call hook that exits 0 lets the call
+    /// proceed; one that exits non-zero produces `McpError::Denied`.
+    /// Exercises end-to-end: kernel + broker wired, kaish hook fires,
+    /// exit code → outcome.
+    #[tokio::test]
+    async fn kaish_pre_call_hook_allows_and_denies() {
+        let broker = Arc::new(Broker::new());
+        let kernel = Arc::new(crate::Kernel::new("kaish-hook-test", None).await);
+        let store = crate::block_store::shared_block_store(PrincipalId::system());
+
+        broker.set_documents(store.clone()).await;
+        broker.set_kernel(&kernel).await;
+
+        let svc = Arc::new(MockServer::new("svc").with_tool("t"));
+        broker
+            .register_silently(svc, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        // Allow path: exit 0 → call proceeds.
+        broker.hooks().write().await.pre_call.entries.push(HookEntry {
+            id: hook_id("kaish-allow"),
+            match_instance: None,
+            match_tool: Some(GlobPattern("t".into())),
+            match_context: None,
+            match_principal: None,
+            action: HookAction::Invoke(HookBody::Kaish(crate::mcp::hook_table::ScriptRef {
+                id: "exit 0".into(),
+            })),
+            priority: 0,
+        });
+
+        let result = broker
+            .call_tool(
+                params("svc", "t"),
+                &CallContext::test(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("kaish exit 0 hook must allow the call");
+        assert!(!result.is_error);
+
+        // Deny path: replace with exit 1 → broker returns Denied.
+        broker.hooks().write().await.pre_call.entries.clear();
+        broker.hooks().write().await.pre_call.entries.push(HookEntry {
+            id: hook_id("kaish-deny"),
+            match_instance: None,
+            match_tool: Some(GlobPattern("t".into())),
+            match_context: None,
+            match_principal: None,
+            action: HookAction::Invoke(HookBody::Kaish(crate::mcp::hook_table::ScriptRef {
+                id: "exit 1".into(),
+            })),
+            priority: 0,
+        });
+
+        let err = broker
+            .call_tool(
+                params("svc", "t"),
+                &CallContext::test(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("kaish exit 1 hook must deny");
+        assert!(
+            matches!(err, McpError::Denied { .. }),
+            "expected Denied, got {err:?}"
+        );
     }
 
     /// A panic inside a hook body must not leak the depth counter. After

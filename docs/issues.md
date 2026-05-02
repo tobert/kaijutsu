@@ -54,8 +54,14 @@ following are explicit follow-ups that did not ship:
 - **Block content abstraction.** Blocks as containers for multiple
   content artifacts; prerequisite for richer resource-subscription
   rendering.
-- **Kaish-backed hooks.** Fill in `HookBody::Kaish`: serialize
-  request/result, run script, parse return.
+- **Kaish-backed hook follow-ups.** `HookBody::Kaish` ships (2026-05-02);
+  `script_id` carries the inline body (wart — the schema column is
+  named `action_kaish_script_id`). Follow-ups: rename the wire field
+  to `body`, introduce a `hook_scripts` table for shared script
+  storage, register `kj` builtin inside hook kaish sessions (currently
+  no tools registered — same Arc<KjDispatcher> blocker as rc hunk #1),
+  surface PostCall/OnError/OnNotification result/error JSON via
+  additional overlay vars.
 - **MCP `progress` → `StreamingBlockHandle` bridge.** External streaming
   tools wired the same way virtual tools will be.
 - **Per-principal budgets + fair queuing.** Adjacent to the now-shipped

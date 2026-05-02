@@ -827,6 +827,12 @@ pub async fn create_shared_kernel(
         )));
     }
 
+    // Wire the kernel into the broker so HookBody::Kaish can construct
+    // an EmbeddedKaish at fire time. Stored as Weak; setter must be called
+    // after the kernel is wrapped in Arc (here) but before any kaish hook
+    // can fire.
+    kernel_arc.broker().set_kernel(&kernel_arc).await;
+
     // Recover contexts: KernelDb is the primary source, with BlockStore discovery as fallback.
     // A failure to read the DB here means we cannot know which contexts should be recovered —
     // refuse to start rather than silently coming up with zero contexts.

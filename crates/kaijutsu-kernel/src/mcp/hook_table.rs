@@ -26,9 +26,14 @@
 //! and a spawned task starts fresh — losing the depth guard opens a
 //! reentrancy path around the cap.
 //!
-//! `HookBody::Kaish` is reserved per D-07 / D-08; admin server rejects
-//! it at `hook_add` time with `McpError::Unsupported`. Implementation
-//! is a §9 follow-up.
+//! `HookBody::Kaish` ships 2026-05-02 (post-runtime-hoist). The
+//! `ScriptRef.id` field carries the inline kaish source body — the
+//! schema column is still named `action_kaish_script_id` for
+//! historical reasons. Renaming the field and adding a separate
+//! script-storage table is a follow-up. Evaluation requires
+//! `Broker::set_kernel`; without that wired, kaish hooks return Deny.
+//! `ListTools` phase still rejects kaish at `hook_add` (no coherent
+//! list-filter semantics).
 
 use std::sync::Arc;
 
