@@ -4,18 +4,10 @@
 
 pub mod auth_db;
 pub mod constants;
-pub mod context_engine;
-pub mod docs_filesystem;
-pub mod embedded_kaish;
-pub mod input_filesystem;
 pub mod interrupt;
-pub mod kaish_backend;
-pub mod kj_builtin;
 pub mod llm_stream;
-pub mod mount_backend;
 pub mod rpc;
 pub mod ssh;
-pub mod synthesis;
 
 // Generated Cap'n Proto code
 pub mod kaijutsu_capnp {
@@ -23,11 +15,11 @@ pub mod kaijutsu_capnp {
 }
 
 pub use auth_db::{AuthDb, SshKeyRecord};
-pub use docs_filesystem::KaijutsuFilesystem;
-pub use embedded_kaish::EmbeddedKaish;
-pub use input_filesystem::InputFilesystem;
+pub use kaijutsu_kernel::runtime::docs_filesystem::KaijutsuFilesystem;
+pub use kaijutsu_kernel::runtime::embedded_kaish::EmbeddedKaish;
+pub use kaijutsu_kernel::runtime::input_filesystem::InputFilesystem;
+pub use kaijutsu_kernel::runtime::kaish_backend::KaijutsuBackend;
+pub use kaijutsu_kernel::runtime::mount_backend::MountBackend;
 pub use kaijutsu_kernel::{ContextHandle, DriftError, DriftRouter, StagedDrift};
-pub use kaish_backend::KaijutsuBackend;
-pub use mount_backend::MountBackend;
 pub use rpc::{ConnectionState, ServerRegistry, SharedKernel, SharedKernelState, WorldImpl};
 pub use ssh::{KeySource, SshServer, SshServerConfig};

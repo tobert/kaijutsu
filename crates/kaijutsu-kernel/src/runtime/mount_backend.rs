@@ -24,9 +24,9 @@ use kaish_kernel::{
     BackendError, BackendResult, KernelBackend, PatchOp, ReadRange, ToolInfo, ToolResult, WriteMode,
 };
 
-use kaijutsu_kernel::vfs::{FileType, MountTable, VfsError, VfsOps};
+use crate::vfs::{FileType, MountTable, VfsError, VfsOps};
 
-use crate::kaish_backend::KaijutsuBackend;
+use super::kaish_backend::KaijutsuBackend;
 
 /// Routes file operations through kaijutsu's `MountTable` and tool
 /// calls through the CRDT backends.
@@ -69,7 +69,7 @@ fn vfs_to_backend(err: VfsError) -> BackendError {
 }
 
 /// Convert a kaijutsu `FileAttr` to a kaish `DirEntry`.
-fn file_attr_to_dir_entry(name: &str, attr: &kaijutsu_kernel::vfs::FileAttr) -> DirEntry {
+fn file_attr_to_dir_entry(name: &str, attr: &crate::vfs::FileAttr) -> DirEntry {
     let kind = match attr.kind {
         FileType::File => DirEntryKind::File,
         FileType::Directory => DirEntryKind::Directory,
@@ -86,7 +86,7 @@ fn file_attr_to_dir_entry(name: &str, attr: &kaijutsu_kernel::vfs::FileAttr) -> 
 }
 
 /// Convert a kaijutsu `DirEntry` to a kaish `DirEntry`.
-fn kj_dir_entry_to_kaish(entry: &kaijutsu_kernel::vfs::DirEntry) -> DirEntry {
+fn kj_dir_entry_to_kaish(entry: &crate::vfs::DirEntry) -> DirEntry {
     let kind = match entry.kind {
         FileType::File => DirEntryKind::File,
         FileType::Directory => DirEntryKind::Directory,
@@ -507,9 +507,9 @@ impl MountBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kaijutsu_kernel::Kernel as KaijutsuKernel;
-    use kaijutsu_kernel::block_store::shared_block_store;
-    use kaijutsu_kernel::vfs::backends::MemoryBackend;
+    use crate::Kernel as KaijutsuKernel;
+    use crate::block_store::shared_block_store;
+    use crate::vfs::backends::MemoryBackend;
     use kaijutsu_types::PrincipalId;
 
     /// Create a test MountBackend with a MemoryBackend mounted at /tmp.
@@ -517,7 +517,7 @@ mod tests {
         let blocks = shared_block_store(PrincipalId::system());
         let kernel = Arc::new(KaijutsuKernel::new("test-mount", None).await);
         let sid = kaijutsu_types::SessionId::new();
-        let session_contexts = crate::context_engine::session_context_map();
+        let session_contexts = crate::runtime::context_engine::session_context_map();
         session_contexts.insert(sid, kaijutsu_types::ContextId::new());
         let docs = Arc::new(KaijutsuBackend::new(
             blocks,

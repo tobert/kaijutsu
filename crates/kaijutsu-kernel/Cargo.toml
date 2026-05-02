@@ -53,6 +53,9 @@ rig-core.workspace = true
 kaish-glob.workspace = true
 kaish-kernel.workspace = true
 
+# Semantic vector index (used by runtime/synthesis + kj_builtin)
+kaijutsu-index = { path = "../kaijutsu-index" }
+
 # Path expansion
 shellexpand.workspace = true
 

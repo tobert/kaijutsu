@@ -20,11 +20,11 @@ use kaish_kernel::interpreter::ExecResult;
 use kaish_kernel::tools::{ParamSchema, ToolArgs, ToolSchema};
 use kaish_kernel::{ExecContext, Tool};
 
-use kaijutsu_kernel::kj::{KjCaller, KjDispatcher, KjResult};
+use crate::kj::{KjCaller, KjDispatcher, KjResult};
 #[allow(unused_imports)]
 use kaijutsu_types::{ContentType, ContextId, PrincipalId, SessionId};
 
-use crate::context_engine::{SessionContextExt, SessionContextMap};
+use super::context_engine::{SessionContextExt, SessionContextMap};
 
 /// kaish builtin tool for the `kj` command.
 ///
@@ -73,7 +73,7 @@ impl KjBuiltin {
     fn save_context_cwd(&self, context_id: ContextId, ctx: &ExecContext) {
         let db = self.dispatcher.kernel_db().lock();
         if let Err(e) = db.upsert_context_shell(
-            &kaijutsu_kernel::kernel_db::ContextShellRow {
+            &crate::kernel_db::ContextShellRow {
                 context_id,
                 cwd: Some(ctx.cwd.to_string_lossy().into_owned()),
                 init_script: None,
@@ -178,7 +178,7 @@ impl KjBuiltin {
                     .map_err(|e| format!("index: {e}"))?;
 
                 let synth =
-                    crate::synthesis::run_synthesis(ctx_id, idx.embedder_arc(), block_source);
+                    super::synthesis::run_synthesis(ctx_id, idx.embedder_arc(), block_source);
 
                 Ok::<Option<(bool, Option<kaijutsu_index::synthesis::SynthesisResult>)>, String>(
                     Some((was_indexed, synth)),
@@ -229,11 +229,11 @@ impl KjBuiltin {
         };
 
         // Resolve context reference
-        let parsed = kaijutsu_kernel::kj::refs::parse_context_ref(ctx_ref);
+        let parsed = crate::kj::refs::parse_context_ref(ctx_ref);
         let kernel_id = self.dispatcher.kernel_id();
         let ctx_id = {
             let db = self.dispatcher.kernel_db().lock();
-            match kaijutsu_kernel::kj::refs::resolve_context_ref(&parsed, caller, &db, kernel_id) {
+            match crate::kj::refs::resolve_context_ref(&parsed, caller, &db, kernel_id) {
                 Ok(id) => id,
                 Err(e) => return ExecResult::failure(1, e),
             }
@@ -252,7 +252,7 @@ impl KjBuiltin {
                 .map_err(|e| format!("index: {e}"))?;
 
             let synth =
-                crate::synthesis::run_synthesis(ctx_id, idx.embedder_arc(), block_source);
+                super::synthesis::run_synthesis(ctx_id, idx.embedder_arc(), block_source);
 
             if let Some(ref s) = synth {
                 idx.synthesis_cache().insert(ctx_id, s.clone());
@@ -409,14 +409,15 @@ impl Tool for KjBuiltin {
         }
 
         // Extract --confirm <nonce> before dispatch
-        let confirm_nonce = kaijutsu_kernel::kj::parse::extract_named_arg(&argv, &["--confirm"]);
-        kaijutsu_kernel::kj::parse::strip_named_arg(&mut argv, &["--confirm"]);
+        let confirm_nonce = crate::kj::parse::extract_named_arg(&argv, &["--confirm"]);
+        crate::kj::parse::strip_named_arg(&mut argv, &["--confirm"]);
 
         let mut caller = KjCaller {
             principal_id: self.principal_id,
             context_id: self.current_context_id(),
             session_id: self.session_id,
             confirmed: false,
+            rc_depth: 0,
         };
 
         // If --confirm provided, verify nonce BEFORE dispatching

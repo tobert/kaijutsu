@@ -32,9 +32,9 @@ use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 
 use kaijutsu_crdt::BlockId;
-use kaijutsu_kernel::Kernel as KaijutsuKernel;
-use kaijutsu_kernel::block_store::SharedBlockStore;
-use kaijutsu_kernel::ExecResult;
+use crate::Kernel as KaijutsuKernel;
+use crate::block_store::SharedBlockStore;
+use crate::ExecResult;
 use kaijutsu_types::DocKind;
 use kaijutsu_types::{ContextId, KernelId, PrincipalId, SessionId};
 
@@ -61,7 +61,7 @@ use kaish_kernel::{
     BackendError, BackendResult, KernelBackend, PatchOp, ReadRange, ToolInfo, ToolResult, WriteMode,
 };
 
-use crate::context_engine::{SessionContextExt, SessionContextMap};
+use super::context_engine::{SessionContextExt, SessionContextMap};
 
 /// Backend that routes kaish operations to kaijutsu's CRDT block store.
 ///
@@ -656,7 +656,7 @@ impl KernelBackend for KaijutsuBackend {
             .session_contexts
             .current(&self.session_id)
             .ok_or_else(|| BackendError::Io("no active context joined".to_string()))?;
-        let tool_ctx = kaijutsu_kernel::ExecContext::new(
+        let tool_ctx = crate::ExecContext::new(
             self.principal_id,
             context_id,
             ctx.cwd.clone(),
@@ -670,7 +670,7 @@ impl KernelBackend for KaijutsuBackend {
             .dispatch_tool_via_broker(name, &params_str, &tool_ctx)
             .await
             .map_err(|e| match e {
-                kaijutsu_kernel::mcp::McpError::ToolNotFound { tool, .. } => {
+                crate::mcp::McpError::ToolNotFound { tool, .. } => {
                     BackendError::ToolNotFound(tool)
                 }
                 other => BackendError::Io(other.to_string()),
@@ -987,7 +987,7 @@ fn json_to_kaish_value(json: JsonValue) -> kaish_kernel::ast::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kaijutsu_kernel::block_store::shared_block_store;
+    use crate::block_store::shared_block_store;
     use kaijutsu_types::PrincipalId;
 
     #[tokio::test]
@@ -996,7 +996,7 @@ mod tests {
         let blocks = shared_block_store(PrincipalId::system());
         let kernel = Arc::new(KaijutsuKernel::new("test", None).await);
         let sid = SessionId::new();
-        let session_contexts = crate::context_engine::session_context_map();
+        let session_contexts = crate::runtime::context_engine::session_context_map();
         session_contexts.insert(sid, ctx_id);
         let backend = KaijutsuBackend::new(
             blocks,

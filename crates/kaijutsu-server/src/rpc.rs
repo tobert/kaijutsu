@@ -72,7 +72,7 @@ use tokio_util::sync::CancellationToken;
 use capnp::capability::Promise;
 use capnp_rpc::pry;
 
-use crate::embedded_kaish::EmbeddedKaish;
+use kaijutsu_kernel::runtime::embedded_kaish::EmbeddedKaish;
 use crate::interrupt::ContextInterruptState;
 use crate::kaijutsu_capnp::*;
 use crate::llm_stream::spawn_llm_for_prompt;
@@ -229,7 +229,7 @@ pub struct SharedKernelState {
     /// kj command dispatcher — shared across all connections.
     pub kj_dispatcher: Arc<kaijutsu_kernel::KjDispatcher>,
     /// Per-session current-context tracking for the `context` shell command.
-    pub session_contexts: crate::context_engine::SessionContextMap,
+    pub session_contexts: kaijutsu_kernel::runtime::context_engine::SessionContextMap,
 }
 
 pub type SharedKernel = Arc<SharedKernelState>;
@@ -290,7 +290,7 @@ pub struct ConnectionState {
     pub principal: Principal,
     pub session_id: SessionId,
     /// Global session map for context tracking.
-    pub session_contexts: crate::context_engine::SessionContextMap,
+    pub session_contexts: kaijutsu_kernel::runtime::context_engine::SessionContextMap,
     pub kaish: Option<Rc<EmbeddedKaish>>,
     pub command_history: Vec<CommandEntry>,
     next_exec_id: AtomicU64,
@@ -309,7 +309,7 @@ pub struct ConnectionState {
 impl ConnectionState {
     pub fn new(
         principal: Principal,
-        session_contexts: crate::context_engine::SessionContextMap,
+        session_contexts: kaijutsu_kernel::runtime::context_engine::SessionContextMap,
     ) -> Self {
         Self {
             principal,
@@ -804,7 +804,7 @@ pub async fn create_shared_kernel(
     let workspace_guard = Some(kaijutsu_kernel::file_tools::WorkspaceGuard::new(
         kernel_db_arc.clone(),
     ));
-    let session_contexts = crate::context_engine::session_context_map();
+    let session_contexts = kaijutsu_kernel::runtime::context_engine::session_context_map();
 
     // Phase 1 M4: register virtual MCP servers on the broker so
     // dispatch_tool_via_broker has something to route to. This runs
@@ -854,6 +854,7 @@ pub async fn create_shared_kernel(
                     system_prompt: None,
                     consent_mode: kaijutsu_kernel::control::ConsentMode::Collaborative,
                     context_state: kaijutsu_types::ContextState::Live,
+                    context_type: "default".to_string(),
                     created_at: kaijutsu_types::now_millis() as i64,
                     created_by: PrincipalId::system(),
                     forked_from: None,
@@ -954,7 +955,7 @@ pub async fn create_shared_kernel(
                                 let idx_clone = synth_idx.clone();
                                 let blocks_clone = synth_blocks.clone();
                                 tokio::task::spawn_blocking(move || {
-                                    crate::synthesis::run_synthesis_and_cache(
+                                    kaijutsu_kernel::runtime::synthesis::run_synthesis_and_cache(
                                         ctx_id,
                                         idx_clone.embedder_arc(),
                                         blocks_clone,
@@ -1166,7 +1167,7 @@ impl kernel::Server for KernelImpl {
                             |map, sid, tools| {
                                 let block_source: Arc<dyn kaijutsu_index::BlockSource> =
                                     Arc::new(BlockStoreSource(kernel.documents.clone()));
-                                tools.register(crate::kj_builtin::KjBuiltin::new(
+                                tools.register(kaijutsu_kernel::runtime::kj_builtin::KjBuiltin::new(
                                     kj_disp,
                                     map,
                                     kj_principal,
@@ -2056,6 +2057,7 @@ impl kernel::Server for KernelImpl {
                     system_prompt: None,
                     consent_mode: kaijutsu_kernel::control::ConsentMode::Collaborative,
                     context_state: kaijutsu_types::ContextState::Live,
+                    context_type: "default".to_string(),
                     created_at: kaijutsu_types::now_millis() as i64,
                     created_by,
                     forked_from: parent_ctx,
@@ -4660,7 +4662,7 @@ async fn execute_shell_command(
                 |map, sid, tools| {
                     let block_source: Arc<dyn kaijutsu_index::BlockSource> =
                         Arc::new(BlockStoreSource(kernel.documents.clone()));
-                    tools.register(crate::kj_builtin::KjBuiltin::new(
+                    tools.register(kaijutsu_kernel::runtime::kj_builtin::KjBuiltin::new(
                         kj_disp,
                         map,
                         kj_principal,

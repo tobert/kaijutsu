@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 
-use kaijutsu_kernel::block_store::SharedBlockStore;
-use crate::context_engine::{SessionContextExt, SessionContextMap};
+use crate::block_store::SharedBlockStore;
+use super::context_engine::{SessionContextExt, SessionContextMap};
 use kaijutsu_types::{ContextId, SessionId};
 use kaish_kernel::vfs::{DirEntry, DirEntryKind, Filesystem};
 
@@ -201,14 +201,14 @@ impl Filesystem for InputFilesystem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kaijutsu_kernel::block_store::shared_block_store;
+    use crate::block_store::shared_block_store;
     use kaijutsu_types::PrincipalId;
 
     fn test_fs() -> (InputFilesystem, ContextId) {
         let ctx = ContextId::new();
         let sid = SessionId::new();
         let blocks = shared_block_store(PrincipalId::system());
-        let session_contexts = crate::context_engine::session_context_map();
+        let session_contexts = crate::runtime::context_engine::session_context_map();
         session_contexts.insert(sid, ctx);
         (InputFilesystem::new(blocks, session_contexts, sid), ctx)
     }

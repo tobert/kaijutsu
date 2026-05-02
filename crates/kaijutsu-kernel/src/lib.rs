@@ -27,6 +27,7 @@ pub mod kj;
 pub mod llm;
 pub mod mcp;
 pub mod peers;
+pub mod runtime;
 pub mod state;
 pub mod vfs;
 

@@ -34,16 +34,16 @@ use anyhow::Result;
 use kaish_kernel::interpreter::ExecResult;
 use kaish_kernel::{Kernel as KaishKernel, KernelBackend, KernelConfig as KaishConfig};
 
-use kaijutsu_kernel::Kernel as KaijutsuKernel;
-use kaijutsu_kernel::block_store::SharedBlockStore;
-use kaijutsu_kernel::kernel_db::KernelDb;
+use crate::Kernel as KaijutsuKernel;
+use crate::block_store::SharedBlockStore;
+use crate::kernel_db::KernelDb;
 use kaijutsu_types::{ContextId, KernelId, PrincipalId, SessionId};
 
-use crate::docs_filesystem::KaijutsuFilesystem;
-use crate::input_filesystem::InputFilesystem;
-use crate::kaish_backend::KaijutsuBackend;
-use crate::mount_backend::MountBackend;
-use crate::context_engine::{SessionContextExt, SessionContextMap};
+use super::docs_filesystem::KaijutsuFilesystem;
+use super::input_filesystem::InputFilesystem;
+use super::kaish_backend::KaijutsuBackend;
+use super::mount_backend::MountBackend;
+use super::context_engine::{SessionContextExt, SessionContextMap};
 
 /// Embedded kaish executor backed by CRDT blocks.
 ///
@@ -79,7 +79,7 @@ impl EmbeddedKaish {
             ContextId::new(),
             SessionId::new(),
             KernelId::new(),
-            crate::context_engine::session_context_map(),
+            crate::runtime::context_engine::session_context_map(),
             |_, _, _| {},
         )
     }
@@ -210,6 +210,19 @@ impl EmbeddedKaish {
         self.kernel.execute(code).await
     }
 
+    /// Execute kaish code with overlay variables exported into a transient
+    /// scope frame. The frame is popped on return; vars introduced by the
+    /// overlay disappear unless the script unset them. Used by the rc
+    /// lifecycle runner to plumb `KJ_CONTEXT`, `KJ_VERB`, etc. into the
+    /// script without touching persistent context env state.
+    pub async fn execute_with_vars(
+        &self,
+        code: &str,
+        vars: std::collections::HashMap<String, kaish_kernel::ast::Value>,
+    ) -> Result<ExecResult> {
+        self.kernel.execute_with_vars(code, vars).await
+    }
+
     /// Get a variable value.
     pub async fn get_var(&self, name: &str) -> Option<kaish_kernel::ast::Value> {
         self.kernel.get_var(name).await
@@ -327,7 +340,7 @@ impl EmbeddedKaish {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kaijutsu_kernel::block_store::shared_block_store;
+    use crate::block_store::shared_block_store;
 
     #[tokio::test]
     async fn test_embedded_kaish_creation() {
@@ -404,7 +417,7 @@ mod tests {
     /// apply_context_config is called on a freshly-created EmbeddedKaish.
     #[tokio::test]
     async fn test_context_env_applied_on_creation() {
-        use kaijutsu_kernel::kernel_db::{ContextRow, KernelDb};
+        use crate::kernel_db::{ContextRow, KernelDb};
         use kaijutsu_types::{ConsentMode, ContextState, KernelId, now_millis};
 
         let kernel_id = KernelId::new();
@@ -429,6 +442,7 @@ mod tests {
                 forked_from: None,
                 fork_kind: None,
                 created_by: principal,
+                context_type: "default".to_string(),
                 created_at: now_millis() as i64,
                 archived_at: None,
                 workspace_id: None,
@@ -449,7 +463,7 @@ mod tests {
         let kernel = Arc::new(KaijutsuKernel::new("test-env", None).await);
 
         let sid = SessionId::new();
-        let session_contexts = crate::context_engine::session_context_map();
+        let session_contexts = crate::runtime::context_engine::session_context_map();
         let kaish = EmbeddedKaish::with_identity_and_db(
             "test-env",
             blocks,
@@ -488,7 +502,7 @@ mod tests {
     /// apply_context_config is called on a freshly-created EmbeddedKaish.
     #[tokio::test]
     async fn test_init_script_applied_on_creation() {
-        use kaijutsu_kernel::kernel_db::{ContextRow, ContextShellRow, KernelDb};
+        use crate::kernel_db::{ContextRow, ContextShellRow, KernelDb};
         use kaijutsu_types::{ConsentMode, ContextState, KernelId, now_millis};
 
         let kernel_id = KernelId::new();
@@ -513,6 +527,7 @@ mod tests {
                 forked_from: None,
                 fork_kind: None,
                 created_by: principal,
+                context_type: "default".to_string(),
                 created_at: now_millis() as i64,
                 archived_at: None,
                 workspace_id: None,
@@ -537,7 +552,7 @@ mod tests {
         let kernel = Arc::new(KaijutsuKernel::new("test-init", None).await);
 
         let sid = SessionId::new();
-        let session_contexts = crate::context_engine::session_context_map();
+        let session_contexts = crate::runtime::context_engine::session_context_map();
         let kaish = EmbeddedKaish::with_identity_and_db(
             "test-init",
             blocks,
@@ -573,7 +588,7 @@ mod tests {
     /// not on initial session creation.
     #[tokio::test]
     async fn test_persisted_cwd_restored_on_creation() {
-        use kaijutsu_kernel::kernel_db::{ContextRow, ContextShellRow, KernelDb};
+        use crate::kernel_db::{ContextRow, ContextShellRow, KernelDb};
         use kaijutsu_types::{ConsentMode, ContextState, KernelId, now_millis};
 
         let tmp = tempfile::tempdir().unwrap();
@@ -602,6 +617,7 @@ mod tests {
                 forked_from: None,
                 fork_kind: None,
                 created_by: principal,
+                context_type: "default".to_string(),
                 created_at: now_millis() as i64,
                 archived_at: None,
                 workspace_id: None,
@@ -635,7 +651,7 @@ mod tests {
         let kernel = Arc::new(KaijutsuKernel::new("test-restore", None).await);
 
         let sid = SessionId::new();
-        let session_contexts = crate::context_engine::session_context_map();
+        let session_contexts = crate::runtime::context_engine::session_context_map();
         let kaish = EmbeddedKaish::with_identity_and_db(
             "test-restore",
             blocks,

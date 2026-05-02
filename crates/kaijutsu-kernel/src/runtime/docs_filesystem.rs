@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use kaish_kernel::vfs::{DirEntry, Filesystem};
 use kaish_kernel::{BackendError, KernelBackend};
 
-use crate::kaish_backend::KaijutsuBackend;
+use super::kaish_backend::KaijutsuBackend;
 
 /// Adapts `KaijutsuBackend` to the kaish `Filesystem` trait.
 ///
@@ -132,8 +132,8 @@ impl Filesystem for KaijutsuFilesystem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kaijutsu_kernel::Kernel as KaijutsuKernel;
-    use kaijutsu_kernel::block_store::shared_block_store;
+    use crate::Kernel as KaijutsuKernel;
+    use crate::block_store::shared_block_store;
     use kaijutsu_types::PrincipalId;
 
     #[tokio::test]
@@ -141,7 +141,7 @@ mod tests {
         let blocks = shared_block_store(PrincipalId::system());
         let kernel = Arc::new(KaijutsuKernel::new("test-docs-fs", None).await);
         let sid = kaijutsu_types::SessionId::new();
-        let session_contexts = crate::context_engine::session_context_map();
+        let session_contexts = crate::runtime::context_engine::session_context_map();
         session_contexts.insert(sid, kaijutsu_types::ContextId::new());
         let backend = Arc::new(KaijutsuBackend::new(
             blocks,
@@ -160,7 +160,7 @@ mod tests {
         let blocks = shared_block_store(PrincipalId::system());
         let kernel = Arc::new(KaijutsuKernel::new("test-docs-fs-rp", None).await);
         let sid = kaijutsu_types::SessionId::new();
-        let session_contexts = crate::context_engine::session_context_map();
+        let session_contexts = crate::runtime::context_engine::session_context_map();
         session_contexts.insert(sid, kaijutsu_types::ContextId::new());
         let backend = Arc::new(KaijutsuBackend::new(
             blocks,
@@ -179,7 +179,7 @@ mod tests {
         let blocks = shared_block_store(PrincipalId::system());
         let kernel = Arc::new(KaijutsuKernel::new("test-docs-fs-list", None).await);
         let sid = kaijutsu_types::SessionId::new();
-        let session_contexts = crate::context_engine::session_context_map();
+        let session_contexts = crate::runtime::context_engine::session_context_map();
         session_contexts.insert(sid, kaijutsu_types::ContextId::new());
         let backend = Arc::new(KaijutsuBackend::new(
             blocks,
