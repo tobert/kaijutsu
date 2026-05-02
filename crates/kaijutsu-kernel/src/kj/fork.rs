@@ -155,6 +155,7 @@ impl KjDispatcher {
                 } else {
                     ContextState::Live
                 },
+                context_type: "default".to_string(),
                 created_at: kaijutsu_types::now_millis() as i64,
                 created_by: caller.principal_id,
                 forked_from: Some(source_id),
@@ -281,6 +282,20 @@ impl KjDispatcher {
             tracing::warn!("kj fork: failed to inject fork marker: {e}");
         }
 
+        // Inherit parent's context_type so the new context's fork-side
+        // rc scripts dispatch correctly. Done post-commit because the
+        // original ContextRow construction defaulted to "default".
+        inherit_parent_context_type(self, new_id, source_id);
+
+        // Run rc fork-lifecycle scripts. Failures surface as Error
+        // blocks in the new context — they don't abort the fork.
+        if let Err(e) = self
+            .run_rc_lifecycle("fork", new_id, Some(source_id), Some(ForkKind::Full), caller)
+            .await
+        {
+            tracing::warn!("rc fork lifecycle: {e}");
+        }
+
         let short = new_id.short();
         let display = label.as_deref().unwrap_or(&short);
         KjResult::Switch(
@@ -346,6 +361,7 @@ impl KjDispatcher {
                 system_prompt: None,
                 consent_mode: ConsentMode::Collaborative,
                 context_state: if staging { ContextState::Staging } else { ContextState::Live },
+                context_type: "default".to_string(),
                 created_at: kaijutsu_types::now_millis() as i64,
                 created_by: caller.principal_id,
                 forked_from: Some(source_id),
@@ -474,6 +490,20 @@ impl KjDispatcher {
             tracing::warn!("kj fork --shallow: failed to inject fork marker: {e}");
         }
 
+        inherit_parent_context_type(self, new_id, source_id);
+        if let Err(e) = self
+            .run_rc_lifecycle(
+                "fork",
+                new_id,
+                Some(source_id),
+                Some(ForkKind::Shallow),
+                caller,
+            )
+            .await
+        {
+            tracing::warn!("rc fork lifecycle (shallow): {e}");
+        }
+
         let short = new_id.short();
         let display = label.as_deref().unwrap_or(&short);
         KjResult::Switch(
@@ -573,6 +603,7 @@ impl KjDispatcher {
                 system_prompt: None,
                 consent_mode: ConsentMode::Collaborative,
                 context_state: if staging { ContextState::Staging } else { ContextState::Live },
+                context_type: "default".to_string(),
                 created_at: kaijutsu_types::now_millis() as i64,
                 created_by: caller.principal_id,
                 forked_from: Some(source_id),
@@ -685,6 +716,20 @@ impl KjDispatcher {
             tracing::warn!("kj fork --compact: failed to inject fork marker: {e}");
         }
 
+        inherit_parent_context_type(self, new_id, source_id);
+        if let Err(e) = self
+            .run_rc_lifecycle(
+                "fork",
+                new_id,
+                Some(source_id),
+                Some(ForkKind::Compact),
+                caller,
+            )
+            .await
+        {
+            tracing::warn!("rc fork lifecycle (compact): {e}");
+        }
+
         let short = new_id.short();
         let display = label.as_deref().unwrap_or(&short);
         KjResult::Switch(
@@ -795,6 +840,7 @@ impl KjDispatcher {
                     system_prompt: row.system_prompt.clone(),
                     consent_mode: row.consent_mode,
                     context_state: if staging { ContextState::Staging } else { ContextState::Live },
+                    context_type: "default".to_string(),
                     created_at: kaijutsu_types::now_millis() as i64,
                     created_by: caller.principal_id,
                     forked_from: new_forked_from,
@@ -920,6 +966,20 @@ impl KjDispatcher {
             staging,
         ) {
             tracing::warn!("kj fork --as: failed to inject fork marker: {e}");
+        }
+
+        inherit_parent_context_type(self, new_root_id, source_id);
+        if let Err(e) = self
+            .run_rc_lifecycle(
+                "fork",
+                new_root_id,
+                Some(source_id),
+                Some(ForkKind::Subtree),
+                caller,
+            )
+            .await
+        {
+            tracing::warn!("rc fork lifecycle (subtree): {e}");
         }
 
         KjResult::Switch(
@@ -1049,6 +1109,50 @@ impl KjDispatcher {
         Ok(())
     }
 
+}
+
+/// Copy the parent's `context_type` onto the freshly-forked child so the
+/// child's fork-side rc lifecycle dispatches against the parent's type.
+/// All four fork variants commit their child with `context_type='default'`
+/// at insert time, so this is a post-commit fixup.
+///
+/// On any error (parent missing, update fails) we leave the child as
+/// 'default' and log — failure here would corrupt fewer guarantees than
+/// aborting a successful fork.
+fn inherit_parent_context_type(
+    dispatcher: &KjDispatcher,
+    child_id: ContextId,
+    parent_id: ContextId,
+) {
+    let parent_type = {
+        let db = dispatcher.kernel_db().lock();
+        match db.get_context(parent_id) {
+            Ok(Some(row)) => row.context_type,
+            Ok(None) => {
+                tracing::warn!(
+                    "rc fork: parent context {} not found; child {} stays 'default'",
+                    parent_id.short(),
+                    child_id.short()
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::warn!("rc fork: cannot read parent context_type: {e}");
+                return;
+            }
+        }
+    };
+    if parent_type == "default" {
+        return; // already the default
+    }
+    let db = dispatcher.kernel_db().lock();
+    if let Err(e) = db.update_context_type(child_id, &parent_type) {
+        tracing::warn!(
+            "rc fork: failed to set context_type='{}' on child {}: {e}",
+            parent_type,
+            child_id.short()
+        );
+    }
 }
 
 #[cfg(test)]

@@ -197,7 +197,7 @@ impl KjDispatcher {
     }
 
     async fn context_create(&self, argv: &[String], caller: &KjCaller) -> KjResult {
-        // Parse args: kj context create <label> [--parent <ctx>]
+        // Parse args: kj context create <label> [--parent <ctx>] [--type <type>]
         let label = match argv.get(1) {
             Some(l) => l.as_str(),
             None => return KjResult::Err("kj context create: requires a label".to_string()),
@@ -218,6 +218,12 @@ impl KjDispatcher {
                 Err(e) => return KjResult::Err(format!("kj context create: {e}")),
             }
         };
+
+        // --type <context_type> selects which rc scripts run for this
+        // context. Default is "default" — runs scripts under
+        // /etc/rc/default/<verb>/.
+        let context_type = super::parse::extract_named_arg(argv, &["--type"])
+            .unwrap_or_else(|| "default".to_string());
 
         let new_id = ContextId::new();
         let kernel_id = self.kernel_id();
@@ -240,6 +246,7 @@ impl KjDispatcher {
                 system_prompt: None,
                 consent_mode: ConsentMode::Collaborative,
                 context_state: ContextState::Live,
+                context_type,
                 created_at: kaijutsu_types::now_millis() as i64,
                 created_by: caller.principal_id,
                 forked_from: parent_id,
@@ -274,6 +281,15 @@ impl KjDispatcher {
             if let Err(e) = drift.register(new_id, Some(label), parent_id, caller.principal_id) {
                 return KjResult::Err(format!("kj context create: {e}"));
             }
+        }
+
+        // Run rc create-lifecycle scripts. Failures surface as Error
+        // blocks in the new context — they don't abort context creation.
+        if let Err(e) = self
+            .run_rc_lifecycle("create", new_id, parent_id, None, caller)
+            .await
+        {
+            tracing::warn!("rc create lifecycle: {e}");
         }
 
         KjResult::ok(format!("created context '{}' ({})", label, new_id.short()))
@@ -316,6 +332,7 @@ impl KjDispatcher {
                 system_prompt: None,
                 consent_mode: ConsentMode::Collaborative,
                 context_state: ContextState::Live,
+                context_type: "default".to_string(),
                 created_at: kaijutsu_types::now_millis() as i64,
                 created_by: caller.principal_id,
                 forked_from: None,
@@ -355,6 +372,7 @@ impl KjDispatcher {
         let consent_spec = extract_named_arg(argv, &["--consent"]);
         let cwd_spec = extract_named_arg(argv, &["--cwd"]);
         let env_spec = extract_named_arg(argv, &["--env"]);
+        let type_spec = extract_named_arg(argv, &["--type"]);
 
         // Validate provider against LlmRegistry BEFORE taking DB lock
         let parsed_model = match model_spec {
@@ -466,6 +484,14 @@ impl KjDispatcher {
                         "kj context set: --env requires KEY=VALUE format".to_string(),
                     );
                 }
+            }
+
+            // Update context_type (rc dispatch selector)
+            if let Some(ref t) = type_spec {
+                if let Err(e) = db.update_context_type(target_id, t) {
+                    return KjResult::Err(format!("kj context set: {e}"));
+                }
+                changes.push(format!("type={t}"));
             }
 
             (target_id, changes, model_for_drift)

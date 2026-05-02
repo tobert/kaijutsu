@@ -69,6 +69,7 @@ pub struct ContextRow {
     pub system_prompt: Option<String>,
     pub consent_mode: ConsentMode,
     pub context_state: ContextState,
+    pub context_type: String,
     pub created_at: i64,
     pub created_by: PrincipalId,
     pub forked_from: Option<ContextId>,
@@ -114,6 +115,26 @@ pub struct HookRow {
     pub action_deny_reason: Option<String>,
     pub action_log_target: Option<String>,
     pub action_log_level: Option<String>,
+}
+
+/// A run-control (rc) script row.
+///
+/// Lifecycle scripts at `/etc/rc/<context_type>/<verb>/SXX-name.{kai,md}`.
+/// Run when the corresponding lifecycle moment fires for a context whose
+/// `context_type` matches. `.kai` files execute via kaish; `.md` files
+/// become blocks. Sort order is lexical on `(sort_key, name)`.
+#[derive(Debug, Clone)]
+pub struct RcScriptRow {
+    pub kernel_id: KernelId,
+    pub context_type: String,
+    pub verb: String,       // "create" | "fork" | "attach" | "drift"
+    pub sort_key: String,   // e.g. "S05", "S010"
+    pub name: String,
+    pub extension: String,  // "kai" | "md"
+    pub content: String,
+    pub path: String,       // canonical /etc/rc/<type>/<verb>/<sort_key>-<name>.<ext>
+    pub created_at: i64,
+    pub created_by: PrincipalId,
 }
 
 /// A preset template row.
@@ -293,6 +314,7 @@ CREATE TABLE IF NOT EXISTS contexts (
     system_prompt TEXT,
     consent_mode TEXT NOT NULL DEFAULT 'collaborative',
     context_state TEXT NOT NULL DEFAULT 'live',
+    context_type TEXT NOT NULL DEFAULT 'default',
     created_at   INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
     created_by   BLOB NOT NULL,
     forked_from  BLOB REFERENCES contexts(context_id) ON DELETE SET NULL,
@@ -446,6 +468,31 @@ CREATE TABLE IF NOT EXISTS hooks (
 );
 CREATE INDEX IF NOT EXISTS idx_hooks_phase_priority
     ON hooks(phase, priority, insertion_idx);
+
+-- ── Run-Control (rc) scripts ──────────────────────────────────────
+-- Lifecycle scripts at /etc/rc/<context_type>/<verb>/SXX-name.{kai,md}.
+-- Run at context.create / fork / attach / drift moments. `.kai` files
+-- execute via kaish_kernel::Kernel::execute_with_vars; `.md` files are
+-- inserted as blocks. Scripts are ordered lexically by sort_key, then
+-- name. Per-kernel scoping (kernel_id in PK) — not per-context.
+CREATE TABLE IF NOT EXISTS rc_scripts (
+    kernel_id    BLOB    NOT NULL,
+    context_type TEXT    NOT NULL,
+    verb         TEXT    NOT NULL,
+    sort_key     TEXT    NOT NULL,
+    name         TEXT    NOT NULL,
+    extension    TEXT    NOT NULL,
+    content      TEXT    NOT NULL,
+    path         TEXT    NOT NULL,
+    created_at   INTEGER NOT NULL
+        DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
+    created_by   BLOB    NOT NULL,
+    PRIMARY KEY (kernel_id, context_type, verb, sort_key, name)
+);
+CREATE INDEX IF NOT EXISTS idx_rc_scripts_lookup
+    ON rc_scripts (kernel_id, context_type, verb, sort_key, name);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_rc_scripts_path
+    ON rc_scripts (kernel_id, path);
 "#;
 
 // ============================================================================
@@ -682,6 +729,16 @@ impl KernelDb {
             info!("Migration: adding context_state column to contexts table");
             conn.execute_batch(
                 "ALTER TABLE contexts ADD COLUMN context_state TEXT NOT NULL DEFAULT 'live';",
+            )?;
+        }
+        // 2026-05-02: add context_type column for rc lifecycle dispatch
+        let has_context_type: bool = conn
+            .prepare("SELECT context_type FROM contexts LIMIT 0")
+            .is_ok();
+        if !has_context_type {
+            info!("Migration: adding context_type column to contexts table");
+            conn.execute_batch(
+                "ALTER TABLE contexts ADD COLUMN context_type TEXT NOT NULL DEFAULT 'default';",
             )?;
         }
         Ok(())
@@ -1183,14 +1240,14 @@ impl KernelDb {
             .execute(
                 "INSERT INTO contexts (
                 context_id, kernel_id, label, provider, model,
-                system_prompt, consent_mode, context_state,
+                system_prompt, consent_mode, context_state, context_type,
                 created_at, created_by, forked_from, fork_kind,
                 archived_at, workspace_id, preset_id
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5,
-                ?6, ?7, ?8, ?9,
-                ?10, ?11, ?12,
-                ?13, ?14, ?15
+                ?6, ?7, ?8, ?9, ?10,
+                ?11, ?12, ?13,
+                ?14, ?15, ?16
             )",
                 params![
                     blob_param(row.context_id.as_bytes()),
@@ -1201,6 +1258,7 @@ impl KernelDb {
                     row.system_prompt,
                     row.consent_mode.as_str(),
                     row.context_state.as_str(),
+                    row.context_type,
                     row.created_at,
                     blob_param(row.created_by.as_bytes()),
                     row.forked_from.as_ref().map(|id| id.as_bytes().to_vec()),
@@ -1224,7 +1282,7 @@ impl KernelDb {
     pub fn get_context(&self, id: ContextId) -> KernelDbResult<Option<ContextRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT context_id, kernel_id, label, provider, model,
-                    system_prompt, consent_mode, context_state,
+                    system_prompt, consent_mode, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id
              FROM contexts WHERE context_id = ?1",
@@ -1303,6 +1361,20 @@ impl KernelDb {
         Ok(())
     }
 
+    /// Update a context's `context_type` — selects which rc lifecycle
+    /// scripts run for this context's create / fork / attach / drift
+    /// moments.
+    pub fn update_context_type(&self, id: ContextId, context_type: &str) -> KernelDbResult<()> {
+        let updated = self.conn.execute(
+            "UPDATE contexts SET context_type = ?1 WHERE context_id = ?2",
+            params![context_type, blob_param(id.as_bytes())],
+        )?;
+        if updated == 0 {
+            return Err(KernelDbError::NotFound(format!("context {}", id.short())));
+        }
+        Ok(())
+    }
+
     /// Update a context's workspace assignment.
     pub fn update_workspace(
         &self,
@@ -1350,7 +1422,7 @@ impl KernelDb {
     pub fn list_active_contexts(&self, kernel_id: KernelId) -> KernelDbResult<Vec<ContextRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT context_id, kernel_id, label, provider, model,
-                    system_prompt, consent_mode, context_state,
+                    system_prompt, consent_mode, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id
              FROM contexts
@@ -1368,7 +1440,7 @@ impl KernelDb {
     pub fn list_all_contexts(&self, kernel_id: KernelId) -> KernelDbResult<Vec<ContextRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT context_id, kernel_id, label, provider, model,
-                    system_prompt, consent_mode, context_state,
+                    system_prompt, consent_mode, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id
              FROM contexts
@@ -1408,7 +1480,7 @@ impl KernelDb {
     pub fn structural_parents(&self, id: ContextId) -> KernelDbResult<Vec<ContextRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT c.context_id, c.kernel_id, c.label, c.provider, c.model,
-                    c.system_prompt, c.consent_mode, c.context_state,
+                    c.system_prompt, c.consent_mode, c.context_state, c.context_type,
                     c.created_at, c.created_by, c.forked_from, c.fork_kind,
                     c.archived_at, c.workspace_id, c.preset_id
              FROM contexts c
@@ -1426,7 +1498,7 @@ impl KernelDb {
     pub fn structural_children(&self, id: ContextId) -> KernelDbResult<Vec<ContextRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT c.context_id, c.kernel_id, c.label, c.provider, c.model,
-                    c.system_prompt, c.consent_mode, c.context_state,
+                    c.system_prompt, c.consent_mode, c.context_state, c.context_type,
                     c.created_at, c.created_by, c.forked_from, c.fork_kind,
                     c.archived_at, c.workspace_id, c.preset_id
              FROM contexts c
@@ -1464,7 +1536,7 @@ impl KernelDb {
                 JOIN contexts c2 ON c2.context_id = e.target_id AND c2.archived_at IS NULL
             )
             SELECT c.context_id, c.kernel_id, c.label, c.provider, c.model,
-                   c.system_prompt, c.consent_mode, c.context_state,
+                   c.system_prompt, c.consent_mode, c.context_state, c.context_type,
                    c.created_at, c.created_by, c.forked_from, c.fork_kind,
                    c.archived_at, c.workspace_id, c.preset_id,
                    dag.depth
@@ -1475,7 +1547,7 @@ impl KernelDb {
 
         let rows = stmt.query_map(params![blob_param(kernel_id.as_bytes())], |row| {
             let ctx = row_to_context_row(row)?;
-            let depth: i64 = row.get(15)?;
+            let depth: i64 = row.get(16)?;
             Ok((ctx, depth))
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
@@ -1494,7 +1566,7 @@ impl KernelDb {
                 WHERE c.forked_from IS NOT NULL
             )
             SELECT c.context_id, c.kernel_id, c.label, c.provider, c.model,
-                   c.system_prompt, c.consent_mode, c.context_state,
+                   c.system_prompt, c.consent_mode, c.context_state, c.context_type,
                    c.created_at, c.created_by, c.forked_from, c.fork_kind,
                    c.archived_at, c.workspace_id, c.preset_id,
                    lineage.depth
@@ -1505,7 +1577,7 @@ impl KernelDb {
 
         let rows = stmt.query_map(params![blob_param(context_id.as_bytes())], |row| {
             let ctx = row_to_context_row(row)?;
-            let depth: i64 = row.get(15)?;
+            let depth: i64 = row.get(16)?;
             Ok((ctx, depth))
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
@@ -1523,7 +1595,7 @@ impl KernelDb {
                 JOIN context_edges e ON e.source_id = subtree.ctx_id AND e.kind = 'structural'
             )
             SELECT c.context_id, c.kernel_id, c.label, c.provider, c.model,
-                   c.system_prompt, c.consent_mode, c.context_state,
+                   c.system_prompt, c.consent_mode, c.context_state, c.context_type,
                    c.created_at, c.created_by, c.forked_from, c.fork_kind,
                    c.archived_at, c.workspace_id, c.preset_id,
                    subtree.depth
@@ -1534,7 +1606,7 @@ impl KernelDb {
 
         let rows = stmt.query_map(params![blob_param(root_id.as_bytes())], |row| {
             let ctx = row_to_context_row(row)?;
-            let depth: i64 = row.get(15)?;
+            let depth: i64 = row.get(16)?;
             Ok((ctx, depth))
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
@@ -1810,6 +1882,104 @@ impl KernelDb {
         let deleted = self.conn.execute(
             "DELETE FROM presets WHERE preset_id = ?1",
             params![blob_param(id.as_bytes())],
+        )?;
+        Ok(deleted > 0)
+    }
+
+    // ========================================================================
+    // Run-control (rc) scripts
+    // ========================================================================
+
+    /// Insert a new rc script. Path collisions return a unique-violation
+    /// error mapped to `KernelDbError::AlreadyExists`.
+    pub fn insert_rc_script(&self, row: &RcScriptRow) -> KernelDbResult<()> {
+        self.conn
+            .execute(
+                "INSERT INTO rc_scripts (
+                    kernel_id, context_type, verb, sort_key, name,
+                    extension, content, path, created_at, created_by
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    blob_param(row.kernel_id.as_bytes()),
+                    row.context_type,
+                    row.verb,
+                    row.sort_key,
+                    row.name,
+                    row.extension,
+                    row.content,
+                    row.path,
+                    row.created_at,
+                    blob_param(row.created_by.as_bytes()),
+                ],
+            )
+            .map_err(|e| map_unique_violation(e, format!("rc script '{}' already exists", row.path)))?;
+        Ok(())
+    }
+
+    /// Look up a single rc script by canonical path.
+    pub fn get_rc_script(
+        &self,
+        kernel_id: KernelId,
+        path: &str,
+    ) -> KernelDbResult<Option<RcScriptRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT kernel_id, context_type, verb, sort_key, name,
+                    extension, content, path, created_at, created_by
+             FROM rc_scripts
+             WHERE kernel_id = ?1 AND path = ?2",
+        )?;
+        let mut rows = stmt.query(params![blob_param(kernel_id.as_bytes()), path])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row_to_rc_script_row(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// List rc scripts for a (context_type, verb) ordered by (sort_key,
+    /// name). Empty result is not an error — most contexts have no scripts
+    /// for any given verb.
+    pub fn list_rc_scripts(
+        &self,
+        kernel_id: KernelId,
+        context_type: &str,
+        verb: &str,
+    ) -> KernelDbResult<Vec<RcScriptRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT kernel_id, context_type, verb, sort_key, name,
+                    extension, content, path, created_at, created_by
+             FROM rc_scripts
+             WHERE kernel_id = ?1 AND context_type = ?2 AND verb = ?3
+             ORDER BY sort_key ASC, name ASC",
+        )?;
+        let rows = stmt.query_map(
+            params![blob_param(kernel_id.as_bytes()), context_type, verb],
+            row_to_rc_script_row,
+        )?;
+        Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
+    }
+
+    /// List every rc script for a kernel (admin / `kj rc list`).
+    pub fn list_rc_scripts_all(&self, kernel_id: KernelId) -> KernelDbResult<Vec<RcScriptRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT kernel_id, context_type, verb, sort_key, name,
+                    extension, content, path, created_at, created_by
+             FROM rc_scripts
+             WHERE kernel_id = ?1
+             ORDER BY context_type ASC, verb ASC, sort_key ASC, name ASC",
+        )?;
+        let rows = stmt.query_map(
+            params![blob_param(kernel_id.as_bytes())],
+            row_to_rc_script_row,
+        )?;
+        Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
+    }
+
+    /// Delete an rc script by path. Returns true if it existed.
+    pub fn delete_rc_script(&self, kernel_id: KernelId, path: &str) -> KernelDbResult<bool> {
+        let deleted = self.conn.execute(
+            "DELETE FROM rc_scripts WHERE kernel_id = ?1 AND path = ?2",
+            params![blob_param(kernel_id.as_bytes()), path],
         )?;
         Ok(deleted > 0)
     }
@@ -2515,7 +2685,7 @@ impl KernelDb {
     ) -> KernelDbResult<Option<ContextRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT context_id, kernel_id, label, provider, model,
-                    system_prompt, consent_mode, context_state,
+                    system_prompt, consent_mode, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id
              FROM contexts WHERE kernel_id = ?1 AND label = ?2",
@@ -2551,7 +2721,7 @@ fn row_to_document_row(row: &rusqlite::Row<'_>) -> SqliteResult<DocumentRow> {
 fn row_to_context_row(row: &rusqlite::Row<'_>) -> SqliteResult<ContextRow> {
     let consent_str: String = row.get(6)?;
     let state_str: String = row.get(7)?;
-    let fork_kind_str: Option<String> = row.get(11)?;
+    let fork_kind_str: Option<String> = row.get(12)?;
 
     Ok(ContextRow {
         context_id: read_context_id(row, 0)?,
@@ -2562,13 +2732,14 @@ fn row_to_context_row(row: &rusqlite::Row<'_>) -> SqliteResult<ContextRow> {
         system_prompt: row.get(5)?,
         consent_mode: consent_mode_from_sql(&consent_str),
         context_state: context_state_from_sql(&state_str),
-        created_at: row.get(8)?,
-        created_by: read_principal_id(row, 9)?,
-        forked_from: read_opt_context_id(row, 10)?,
+        context_type: row.get(8)?,
+        created_at: row.get(9)?,
+        created_by: read_principal_id(row, 10)?,
+        forked_from: read_opt_context_id(row, 11)?,
         fork_kind: fork_kind_from_sql(fork_kind_str),
-        archived_at: row.get(12)?,
-        workspace_id: read_opt_workspace_id(row, 13)?,
-        preset_id: read_opt_preset_id(row, 14)?,
+        archived_at: row.get(13)?,
+        workspace_id: read_opt_workspace_id(row, 14)?,
+        preset_id: read_opt_preset_id(row, 15)?,
     })
 }
 
@@ -2601,6 +2772,21 @@ fn row_to_preset_row(row: &rusqlite::Row<'_>) -> SqliteResult<PresetRow> {
     })
 }
 
+fn row_to_rc_script_row(row: &rusqlite::Row<'_>) -> SqliteResult<RcScriptRow> {
+    Ok(RcScriptRow {
+        kernel_id: read_kernel_id(row, 0)?,
+        context_type: row.get(1)?,
+        verb: row.get(2)?,
+        sort_key: row.get(3)?,
+        name: row.get(4)?,
+        extension: row.get(5)?,
+        content: row.get(6)?,
+        path: row.get(7)?,
+        created_at: row.get(8)?,
+        created_by: read_principal_id(row, 9)?,
+    })
+}
+
 fn row_to_workspace_row(row: &rusqlite::Row<'_>) -> SqliteResult<WorkspaceRow> {
     Ok(WorkspaceRow {
         workspace_id: read_workspace_id(row, 0)?,
@@ -2628,6 +2814,7 @@ fn make_context_row(kernel_id: KernelId, label: Option<&str>) -> ContextRow {
         system_prompt: None,
         consent_mode: ConsentMode::default(),
         context_state: ContextState::Live,
+        context_type: "default".to_string(),
         created_at: now_millis() as i64,
         created_by: PrincipalId::new(),
         forked_from: None,
@@ -3294,6 +3481,7 @@ mod tests {
             system_prompt: None,
             consent_mode: ConsentMode::Autonomous,
             context_state: ContextState::Live,
+            context_type: "default".to_string(),
             created_at: now,
             created_by: creator,
             forked_from: Some(parent),
@@ -3331,6 +3519,7 @@ mod tests {
             system_prompt: Some("You are helpful.".into()),
             consent_mode: ConsentMode::Collaborative,
             context_state: ContextState::Live,
+            context_type: "default".to_string(),
             created_at: 1000,
             created_by: creator,
             forked_from: None,
@@ -3352,6 +3541,7 @@ mod tests {
             system_prompt: Some("Be concise.".into()),
             consent_mode: ConsentMode::Autonomous,
             context_state: ContextState::Live,
+            context_type: "default".to_string(),
             created_at: 2000,
             created_by: creator,
             forked_from: Some(parent_id),
@@ -3427,6 +3617,7 @@ mod tests {
             system_prompt: None,
             consent_mode: ConsentMode::default(),
             context_state: ContextState::Live,
+            context_type: "default".to_string(),
             created_at: now_millis() as i64,
             created_by: PrincipalId::new(),
             forked_from: None,

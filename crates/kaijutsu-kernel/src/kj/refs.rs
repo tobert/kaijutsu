@@ -147,6 +147,7 @@ mod tests {
             context_id: Some(ctx_id),
             session_id: kaijutsu_types::SessionId::new(),
             confirmed: false,
+            rc_depth: 0,
         };
 
         let result = resolve_context_ref(&ContextRef::Current, &caller, &db, kid);
@@ -170,6 +171,7 @@ mod tests {
             system_prompt: None,
             consent_mode: kaijutsu_types::ConsentMode::Collaborative,
             context_state: kaijutsu_types::ContextState::Live,
+            context_type: "default".to_string(),
             created_at: kaijutsu_types::now_millis() as i64,
             created_by: principal,
             forked_from: None,
@@ -186,6 +188,7 @@ mod tests {
             context_id: Some(ctx_id),
             session_id: kaijutsu_types::SessionId::new(),
             confirmed: false,
+            rc_depth: 0,
         };
 
         let result = resolve_context_ref(&ContextRef::Parent(1), &caller, &db, kid);
@@ -215,6 +218,7 @@ mod tests {
                 system_prompt: None,
                 consent_mode: kaijutsu_types::ConsentMode::Collaborative,
                 context_state: kaijutsu_types::ContextState::Live,
+                context_type: "default".to_string(),
                 created_at: 1000,
                 created_by: principal,
                 forked_from: None,
@@ -238,6 +242,7 @@ mod tests {
                 system_prompt: None,
                 consent_mode: kaijutsu_types::ConsentMode::Collaborative,
                 context_state: kaijutsu_types::ContextState::Live,
+                context_type: "default".to_string(),
                 created_at: 2000,
                 created_by: principal,
                 forked_from: Some(grandparent_id),
@@ -261,6 +266,7 @@ mod tests {
                 system_prompt: None,
                 consent_mode: kaijutsu_types::ConsentMode::Collaborative,
                 context_state: kaijutsu_types::ContextState::Live,
+                context_type: "default".to_string(),
                 created_at: 3000,
                 created_by: principal,
                 forked_from: Some(parent_id),
@@ -278,6 +284,7 @@ mod tests {
             context_id: Some(child_id),
             session_id: kaijutsu_types::SessionId::new(),
             confirmed: false,
+            rc_depth: 0,
         };
 
         // .parent → parent_id

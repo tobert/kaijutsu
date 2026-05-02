@@ -16,6 +16,8 @@ pub mod fork;
 pub mod format;
 pub mod parse;
 pub mod preset;
+pub mod rc;
+pub mod lifecycle;
 pub mod refs;
 pub mod stage;
 pub mod workspace;
@@ -44,6 +46,11 @@ pub struct KjCaller {
     pub session_id: SessionId,
     /// True when the caller has verified a latch nonce (destructive op confirmed).
     pub confirmed: bool,
+    /// Recursion depth from rc lifecycle dispatch. The rc runner increments
+    /// this before invoking nested kj from a script, so an rc-driven
+    /// `kj context create` runs at depth 1, etc. Capped at MAX_RC_DEPTH to
+    /// prevent runaway recursion (see `kj/lifecycle.rs`).
+    pub rc_depth: u8,
 }
 
 impl KjCaller {
@@ -200,6 +207,9 @@ impl KjDispatcher {
         if cmd == "cas" {
             return self.dispatch_cas(&argv[1..], caller);
         }
+        if cmd == "rc" {
+            return self.dispatch_rc(&argv[1..], caller);
+        }
 
         // Everything else requires an active context
         if caller.context_id.is_none() {
@@ -342,6 +352,7 @@ pub(crate) mod test_helpers {
             context_id: Some(ContextId::new()),
             session_id: SessionId::new(),
             confirmed: false,
+            rc_depth: 0,
         }
     }
 
@@ -352,6 +363,7 @@ pub(crate) mod test_helpers {
             context_id: Some(context_id),
             session_id: SessionId::new(),
             confirmed: false,
+            rc_depth: 0,
         }
     }
 
@@ -362,6 +374,7 @@ pub(crate) mod test_helpers {
             context_id: Some(context_id),
             session_id: SessionId::new(),
             confirmed: true,
+            rc_depth: 0,
         }
     }
 
@@ -404,6 +417,7 @@ pub(crate) mod test_helpers {
                 system_prompt: None,
                 consent_mode: kaijutsu_types::ConsentMode::Collaborative,
                 context_state: kaijutsu_types::ContextState::Live,
+                context_type: "default".to_string(),
                 created_at: kaijutsu_types::now_millis() as i64,
                 created_by,
                 forked_from,
@@ -450,6 +464,7 @@ mod unjoined_context_tests {
             context_id: None,
             session_id: SessionId::new(),
             confirmed: false,
+            rc_depth: 0,
         }
     }
 

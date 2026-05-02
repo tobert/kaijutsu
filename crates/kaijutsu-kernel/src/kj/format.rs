@@ -258,6 +258,7 @@ mod tests {
             system_prompt: None,
             consent_mode: ConsentMode::Collaborative,
             context_state: ContextState::Live,
+            context_type: "default".to_string(),
             created_at: kaijutsu_types::now_millis() as i64,
             created_by: PrincipalId::new(),
             forked_from: None,
