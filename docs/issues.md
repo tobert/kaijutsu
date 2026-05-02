@@ -31,12 +31,18 @@ tool-system redesign doc.
 The MCP-centric kernel landed in five phases plus hook persistence; the
 following are explicit follow-ups that did not ship:
 
-- **Persona ListTools-hook bundles + persistence.** v1 of
-  `builtin.personas` ships binding-only archetypes (planner / coder /
-  explorer / sound engineer); `apply` swaps the calling context's
-  `ContextToolBinding`. Adding `HookPhase::ListTools` hook bundles to
-  the persona shape and persisting personas in `KernelDb` (alongside
-  bindings, D-54) are the remaining work.
+- **Context lifecycle (rc) system.** Replaces the v1
+  `builtin.personas` MCP server (yanked 2026-05-02). Scripts at
+  `/etc/rc/<context_type>/<verb>/SXX-name.{kai,md}` run at
+  context lifecycle moments (`create`, `fork`, with `attach` and
+  `drift` reserved). `.md` becomes a block; `.kai` runs via
+  `kaish_kernel::Kernel::execute_with_vars`. Stored in KernelDb.
+  Admin via `kj rc add | list | rm`. Scripts decide their own
+  applicability via `kj` introspection. See
+  [`personas-evolution.md`](personas-evolution.md) for the design
+  motivation. Open follow-ups: `attach`/`drift` lifecycle wiring,
+  per-script time budgets, capnp surface for `context_type`,
+  CRDT-VFS bridge for collaborative script editing.
 - **`StreamingBlockHandle` implementation.** Single-block streaming
   primitive. Build when the first caller arrives (likely the LLM
   streaming rewrite). Resolve async-drop strategy and append granularity
@@ -85,10 +91,6 @@ following are explicit follow-ups that did not ship:
   bytes per prompt. The spawn_blocking fix took the runtime stall out;
   next is caching by `(context_id, hash)` so a 20-image conversation
   doesn't re-encode every screenshot every turn.
-- **`personas_define` instance-id validation.** Define-time check
-  against `broker.instances_snapshot()` so a typo doesn't silently
-  apply with no tools (the auto-injection guard catches the worst case
-  but a stricter check earlier would be friendlier).
 - **`xml_escape` allocates per attribute.**
   `crates/kaijutsu-kernel/src/llm/system_prompt.rs:140` does four
   chained `.replace()` calls per attribute string, allocating a new
