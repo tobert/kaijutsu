@@ -1005,6 +1005,16 @@ pub async fn create_shared_kernel(
         id,
         kernel_arc.clone(),
     ));
+    // Stash a Weak<Self> on the dispatcher so internal paths (rc
+    // lifecycle, kaish hook bodies) can construct KjBuiltin without
+    // threading an Arc through every method.
+    kj_dispatcher.set_self_arc();
+    // Wire the dispatcher into the broker so HookBody::Kaish can
+    // register `kj` as a tool inside hook kaish sessions.
+    kernel_arc
+        .broker()
+        .set_kj_dispatcher(&kj_dispatcher)
+        .await;
 
     let shared = SharedKernelState {
         id,

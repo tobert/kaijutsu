@@ -160,6 +160,11 @@ pub struct KjDispatcher {
     kernel_db: Arc<parking_lot::Mutex<KernelDb>>,
     kernel_id: KernelId,
     kernel: Arc<Kernel>,
+    /// Self-Weak so internal paths (rc lifecycle, hook kaish) can hand
+    /// an `Arc<KjDispatcher>` to `KjBuiltin::new` without forcing every
+    /// call site to thread an Arc through. Set via `set_self_arc` after
+    /// `Arc::new(KjDispatcher::new(...))`.
+    weak_self: parking_lot::RwLock<Option<std::sync::Weak<KjDispatcher>>>,
 }
 
 impl KjDispatcher {
@@ -176,7 +181,21 @@ impl KjDispatcher {
             kernel_db,
             kernel_id,
             kernel,
+            weak_self: parking_lot::RwLock::new(None),
         }
+    }
+
+    /// Wire a `Weak<Self>` so internal paths can construct `KjBuiltin`
+    /// (which needs `Arc<KjDispatcher>`). Call once after `Arc::new`.
+    pub fn set_self_arc(self: &Arc<Self>) {
+        *self.weak_self.write() = Some(Arc::downgrade(self));
+    }
+
+    /// Upgrade the stored `Weak<Self>` to `Arc<Self>`. Returns `None`
+    /// if `set_self_arc` was never called (e.g. tests that build a bare
+    /// dispatcher without wrapping it).
+    pub fn self_arc(&self) -> Option<Arc<Self>> {
+        self.weak_self.read().as_ref().and_then(|w| w.upgrade())
     }
 
     /// Dispatch a parsed argv to the appropriate subcommand.

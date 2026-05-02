@@ -21,15 +21,13 @@
 //! its caller). When depth exceeds `MAX_RC_DEPTH`, the script is skipped
 //! and an error block is inserted in its place.
 //!
-//! ## Hunk #1 limitation
+//! ## `kj` from inside rc kaish (shipped 2026-05-02)
 //!
-//! `kj` is not callable from inside rc kaish scripts in this hunk —
-//! registering the `KjBuiltin` tool requires `Arc<KjDispatcher>` which
-//! the dispatcher itself doesn't currently hold a reference to. Scripts
-//! can run kaish builtins (echo, conditionals, env vars, external
-//! commands) but cannot introspect/mutate the kernel. Tracked in
-//! `docs/issues.md`; follow-up will add a `Weak<Self>` or move
-//! construction so an Arc handle is available.
+//! `KjDispatcher` stores a `Weak<Self>` (set via `set_self_arc` after
+//! `Arc::new`); `run_kai_script` upgrades it and registers `KjBuiltin`
+//! into the rc session's tool registry. Test dispatchers that don't
+//! call `set_self_arc` still run scripts — they just don't get `kj`
+//! in scope.
 
 use std::collections::HashMap;
 
@@ -217,8 +215,25 @@ async fn run_kai_script(
     let blocks = dispatcher.block_store().clone();
     let kernel = dispatcher.kernel().clone();
 
-    // No tools registered for hunk #1 — see module docs.
-    let configure_tools = |_, _, _: &mut kaish_kernel::ToolRegistry| {};
+    // Register `kj` so scripts can introspect/mutate the new context.
+    // Falls back to no tools if `set_self_arc` was never called (test
+    // dispatchers may not bother, in which case scripts get the bare
+    // kaish surface only — same as hunk #1).
+    let dispatcher_arc = dispatcher.self_arc();
+    let configure_tools = move |scm: crate::runtime::context_engine::SessionContextMap,
+                                sid: kaijutsu_types::SessionId,
+                                tools: &mut kaish_kernel::ToolRegistry| {
+        if let Some(d) = dispatcher_arc {
+            tools.register(crate::runtime::kj_builtin::KjBuiltin::new(
+                d,
+                scm,
+                principal,
+                sid,
+                None,
+                std::sync::Arc::new(NoopBlockSource),
+            ));
+        }
+    };
 
     let kaish = match EmbeddedKaish::with_identity(
         "rc",
@@ -365,6 +380,20 @@ fn insert_rc_failure_block(
     }
 }
 
+/// Stub `BlockSource` for `KjBuiltin`'s synthesis wiring. rc and hook
+/// kaish sessions don't need semantic search; passing a real source
+/// would require kaijutsu-index plumbing that doesn't belong here.
+pub(crate) struct NoopBlockSource;
+
+impl kaijutsu_index::BlockSource for NoopBlockSource {
+    fn block_snapshots(
+        &self,
+        _ctx: kaijutsu_types::ContextId,
+    ) -> Result<Vec<kaijutsu_types::BlockSnapshot>, String> {
+        Ok(Vec::new())
+    }
+}
+
 fn log_unwired_verb_once(verb: &str) {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::OnceLock;
@@ -494,9 +523,6 @@ mod tests {
     #[tokio::test]
     async fn rc_create_kai_runs_script() {
         let d = test_dispatcher().await;
-        // Trivial kaish that just exits 0. Scripts using kaish builtins
-        // exercise the execute_with_vars path without needing the kj
-        // tool registration that hunk #1 defers.
         install_script(
             &d,
             "/etc/rc/test/create/S00-noop.kai",
@@ -518,6 +544,43 @@ mod tests {
         assert!(
             !kinds.contains(&kaijutsu_types::BlockKind::Error),
             "successful .kai should not insert error block, got kinds: {kinds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rc_kai_can_call_kj() {
+        // .kai scripts get `kj` registered when the dispatcher's
+        // self-Arc is wired. Without `set_self_arc`, the test
+        // dispatcher's scripts still run but can't reach kj.
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
+
+        // Script asserts overlay vars are populated and that `kj` is
+        // callable. Exit 0 → no error block; non-zero → error block.
+        install_script(
+            &d,
+            "/etc/rc/test/create/S00-introspect.kai",
+            "test",
+            "create",
+            "S00",
+            "introspect",
+            "kai",
+            "test -n \"$KJ_CONTEXT\" && test -n \"$KJ_VERB\" && kj context list",
+        );
+        let caller = unjoined_caller();
+        let result = d
+            .dispatch(
+                &argv(&["context", "create", "ctx-kj", "--type", "test"]),
+                &caller,
+            )
+            .await;
+        assert!(result.is_ok(), "create failed: {}", result.message());
+
+        let new_id = lookup_context_id(&d, "ctx-kj");
+        let kinds = block_kinds_in(&d, new_id);
+        assert!(
+            !kinds.contains(&kaijutsu_types::BlockKind::Error),
+            ".kai with kj invocation must exit 0 — got error block; kinds: {kinds:?}"
         );
     }
 

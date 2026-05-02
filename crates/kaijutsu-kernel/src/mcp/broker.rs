@@ -164,6 +164,11 @@ pub struct Broker {
     /// `Broker` (`Arc<Broker>`); a strong ref would leak. Set via
     /// `set_kernel` at bootstrap; `None` → kaish hooks return Unsupported.
     kernel: RwLock<Option<Weak<crate::Kernel>>>,
+    /// Weak handle to `KjDispatcher` so kaish hook bodies can register
+    /// the `kj` tool (which needs `Arc<KjDispatcher>`). Set via
+    /// `set_kj_dispatcher` at bootstrap; `None` → hook scripts run
+    /// without `kj` in their tool registry.
+    kj_dispatcher: RwLock<Option<Weak<crate::kj::KjDispatcher>>>,
 }
 
 impl Default for Broker {
@@ -198,6 +203,7 @@ impl Broker {
             builtin_hooks: BuiltinHookRegistry::new(),
             db: RwLock::new(None),
             kernel: RwLock::new(None),
+            kj_dispatcher: RwLock::new(None),
         }
     }
 
@@ -206,6 +212,12 @@ impl Broker {
     /// to avoid the `Kernel`/`Broker` cycle (Kernel holds `Arc<Broker>`).
     pub async fn set_kernel(&self, kernel: &Arc<crate::Kernel>) {
         *self.kernel.write().await = Some(Arc::downgrade(kernel));
+    }
+
+    /// Wire a `Weak<KjDispatcher>` so kaish hook bodies can call the
+    /// `kj` tool. Called at server bootstrap after `Arc::new(KjDispatcher::new(...))`.
+    pub async fn set_kj_dispatcher(&self, dispatcher: &Arc<crate::kj::KjDispatcher>) {
+        *self.kj_dispatcher.write().await = Some(Arc::downgrade(dispatcher));
     }
 
     /// Wire the kernel DB handle used to persist `ContextToolBinding` and
@@ -1362,7 +1374,30 @@ impl Broker {
         let session_contexts = session_context_map();
         session_contexts.insert(session_id, ctx.context_id);
 
-        let configure_tools = |_, _, _: &mut kaish_kernel::ToolRegistry| {};
+        // Register `kj` if the dispatcher is wired so hook scripts can
+        // introspect the calling context. Falls back to no tools if
+        // `set_kj_dispatcher` was never called.
+        let kj = self
+            .kj_dispatcher
+            .read()
+            .await
+            .as_ref()
+            .and_then(|w| w.upgrade());
+        let principal = ctx.principal_id;
+        let configure_tools = move |scm: crate::runtime::context_engine::SessionContextMap,
+                                    sid: kaijutsu_types::SessionId,
+                                    tools: &mut kaish_kernel::ToolRegistry| {
+            if let Some(d) = kj {
+                tools.register(crate::runtime::kj_builtin::KjBuiltin::new(
+                    d,
+                    scm,
+                    principal,
+                    sid,
+                    None,
+                    Arc::new(crate::kj::lifecycle::NoopBlockSource),
+                ));
+            }
+        };
         let kaish = EmbeddedKaish::with_identity(
             "hook",
             docs,
@@ -3032,6 +3067,7 @@ mod tests {
                 resource_parents: Mutex::new(HashMap::new()),
                 builtin_hooks: BuiltinHookRegistry::new(),
                 kernel: RwLock::new(None),
+                kj_dispatcher: RwLock::new(None),
                 db: RwLock::new(None),
             }
         });
@@ -3203,6 +3239,7 @@ mod tests {
                 resource_parents: Mutex::new(HashMap::new()),
                 builtin_hooks: BuiltinHookRegistry::new(),
                 kernel: RwLock::new(None),
+                kj_dispatcher: RwLock::new(None),
                 db: RwLock::new(None),
             }
         });
@@ -4572,6 +4609,7 @@ mod tests {
                 resource_parents: Mutex::new(HashMap::new()),
                 builtin_hooks: BuiltinHookRegistry::new(),
                 kernel: RwLock::new(None),
+                kj_dispatcher: RwLock::new(None),
                 db: RwLock::new(None),
             }
         });
@@ -4897,6 +4935,74 @@ mod tests {
             matches!(err, McpError::Denied { .. }),
             "expected Denied, got {err:?}"
         );
+    }
+
+    /// `kj` is callable from inside a kaish hook body once
+    /// `set_kj_dispatcher` is wired. The script invokes `kj context list`
+    /// — exits 0 only if the kj builtin is registered in the hook
+    /// session's tool registry. Also asserts overlay env vars are
+    /// non-empty.
+    #[tokio::test]
+    async fn kaish_hook_can_call_kj() {
+        use crate::block_store::shared_block_store;
+        use crate::drift::shared_drift_router;
+        use crate::kernel_db::KernelDb;
+        use crate::kj::KjDispatcher;
+
+        let kernel = Arc::new(crate::Kernel::new("kaish-hook-kj-test", None).await);
+        let store = shared_block_store(PrincipalId::system());
+        let kernel_db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+        let kernel_id = kaijutsu_types::KernelId::new();
+        {
+            let db = kernel_db.lock();
+            db.get_or_create_default_workspace(kernel_id, PrincipalId::system())
+                .unwrap();
+        }
+        let drift = shared_drift_router();
+        let kj_dispatcher = Arc::new(KjDispatcher::new(
+            drift,
+            store.clone(),
+            kernel_db,
+            kernel_id,
+            kernel.clone(),
+        ));
+        kj_dispatcher.set_self_arc();
+
+        let broker = kernel.broker().clone();
+        broker.set_documents(store).await;
+        broker.set_kernel(&kernel).await;
+        broker.set_kj_dispatcher(&kj_dispatcher).await;
+
+        let svc = Arc::new(MockServer::new("svc").with_tool("t"));
+        broker
+            .register_silently(svc, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        // The hook body invokes `kj` AND inspects an overlay env var.
+        // Fails with non-zero exit (and thus a Deny outcome) if either
+        // the var is missing or `kj` isn't callable.
+        let body = "test -n \"$KJ_HOOK_TOOL\" && test -n \"$KJ_HOOK_PHASE\" && kj context list";
+
+        broker.hooks().write().await.pre_call.entries.push(HookEntry {
+            id: hook_id("kaish-kj"),
+            match_instance: None,
+            match_tool: Some(GlobPattern("t".into())),
+            match_context: None,
+            match_principal: None,
+            action: HookAction::Invoke(HookBody::Kaish(body.into())),
+            priority: 0,
+        });
+
+        let result = broker
+            .call_tool(
+                params("svc", "t"),
+                &CallContext::test(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("hook with kj invocation should succeed");
+        assert!(!result.is_error);
     }
 
     /// A panic inside a hook body must not leak the depth counter. After

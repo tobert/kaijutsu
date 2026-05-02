@@ -55,13 +55,12 @@ following are explicit follow-ups that did not ship:
   content artifacts; prerequisite for richer resource-subscription
   rendering.
 - **Kaish-backed hook follow-ups.** `HookBody::Kaish` ships (2026-05-02);
-  `script_id` carries the inline body (wart — the schema column is
-  named `action_kaish_script_id`). Follow-ups: rename the wire field
-  to `body`, introduce a `hook_scripts` table for shared script
-  storage, register `kj` builtin inside hook kaish sessions (currently
-  no tools registered — same Arc<KjDispatcher> blocker as rc hunk #1),
-  surface PostCall/OnError/OnNotification result/error JSON via
-  additional overlay vars.
+  wire field + schema column + runtime type all named `body` after the
+  rename. `kj` is callable from hook kaish bodies via
+  `Broker::set_kj_dispatcher`. Open: introduce a `hook_scripts` table
+  for shared script storage (today each hook owns its body); surface
+  PostCall/OnError/OnNotification result/error JSON via additional
+  overlay vars.
 - **MCP `progress` → `StreamingBlockHandle` bridge.** External streaming
   tools wired the same way virtual tools will be.
 - **Per-principal budgets + fair queuing.** Adjacent to the now-shipped
