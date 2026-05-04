@@ -286,7 +286,7 @@ impl KjDispatcher {
         // Run rc create-lifecycle scripts. Failures surface as Error
         // blocks in the new context — they don't abort context creation.
         if let Err(e) = self
-            .run_rc_lifecycle("create", new_id, parent_id, None, caller)
+            .run_rc_lifecycle("create", new_id, parent_id, None, None, caller)
             .await
         {
             tracing::warn!("rc create lifecycle: {e}");

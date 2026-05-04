@@ -164,7 +164,7 @@ impl KjDispatcher {
             after.as_ref(),
             &summary,
             source_id,
-            source_model,
+            source_model.clone(),
             DriftKind::Pull,
         ) {
             return KjResult::Err(format!("kj drift pull: failed to insert drift block: {e}"));
@@ -184,6 +184,25 @@ impl KjDispatcher {
             if let Err(e) = db.insert_edge(&edge) {
                 tracing::warn!("failed to insert pull drift edge: {e}");
             }
+        }
+
+        if let Err(e) = self
+            .run_rc_lifecycle(
+                super::lifecycle::VERB_DRIFT,
+                context_id,
+                None,
+                None,
+                Some(super::lifecycle::DriftInfo {
+                    kind: DriftKind::Pull,
+                    source_ctx: source_id,
+                    target_ctx: context_id,
+                    source_model,
+                }),
+                caller,
+            )
+            .await
+        {
+            tracing::warn!("rc drift lifecycle (pull): {e}");
         }
 
         // Preview: first ~200 chars
@@ -259,7 +278,7 @@ impl KjDispatcher {
             after.as_ref(),
             &summary,
             context_id,
-            source_model,
+            source_model.clone(),
             DriftKind::Merge,
         ) {
             return KjResult::Err(format!("kj drift merge: failed to insert drift block: {e}"));
@@ -279,6 +298,25 @@ impl KjDispatcher {
             if let Err(e) = db.insert_edge(&edge) {
                 tracing::warn!("failed to insert merge drift edge: {e}");
             }
+        }
+
+        if let Err(e) = self
+            .run_rc_lifecycle(
+                super::lifecycle::VERB_DRIFT,
+                target_id,
+                None,
+                None,
+                Some(super::lifecycle::DriftInfo {
+                    kind: DriftKind::Merge,
+                    source_ctx: context_id,
+                    target_ctx: target_id,
+                    source_model,
+                }),
+                caller,
+            )
+            .await
+        {
+            tracing::warn!("rc drift lifecycle (merge): {e}");
         }
 
         // Preview: first ~200 chars
@@ -329,7 +367,31 @@ impl KjDispatcher {
                 drift.source_model.clone(),
                 drift.drift_kind,
             ) {
-                Ok(_) => injected += 1,
+                Ok(_) => {
+                    injected += 1;
+                    if let Err(e) = self
+                        .run_rc_lifecycle(
+                            super::lifecycle::VERB_DRIFT,
+                            drift.target_ctx,
+                            None,
+                            None,
+                            Some(super::lifecycle::DriftInfo {
+                                kind: drift.drift_kind,
+                                source_ctx: drift.source_ctx,
+                                target_ctx: drift.target_ctx,
+                                source_model: drift.source_model.clone(),
+                            }),
+                            caller,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            "rc drift lifecycle (flush) {} → {}: {e}",
+                            drift.source_ctx.short(),
+                            drift.target_ctx.short()
+                        );
+                    }
+                }
                 Err(e) => {
                     tracing::warn!(
                         "drift flush failed: {} → {}: {e}",

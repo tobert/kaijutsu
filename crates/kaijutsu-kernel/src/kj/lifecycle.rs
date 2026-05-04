@@ -32,12 +32,22 @@
 use std::collections::HashMap;
 
 use kaijutsu_types::{
-    BlockKind, ContentType, ContextId, ForkKind, PrincipalId, Role, Status,
+    BlockKind, ContentType, ContextId, DriftKind, ForkKind, PrincipalId, Role, Status,
 };
 
 use crate::kernel_db::RcScriptRow;
 
 use super::{KjCaller, KjDispatcher};
+
+/// Per-drift metadata surfaced to rc scripts via `KJ_DRIFT_INFO`. Built by
+/// drift call sites and passed into `run_rc_lifecycle` as `drift_info`.
+#[derive(Clone, Debug)]
+pub struct DriftInfo {
+    pub kind: DriftKind,
+    pub source_ctx: ContextId,
+    pub target_ctx: ContextId,
+    pub source_model: Option<String>,
+}
 
 /// Hard cap on rc-driven recursion depth. A script that hits this limit
 /// produces an error block and is skipped — its lifecycle does NOT run.
@@ -52,7 +62,7 @@ pub const VERB_ATTACH: &str = "attach";
 pub const VERB_DRIFT: &str = "drift";
 
 fn verb_is_wired(verb: &str) -> bool {
-    matches!(verb, VERB_CREATE | VERB_FORK)
+    matches!(verb, VERB_CREATE | VERB_FORK | VERB_DRIFT)
 }
 
 impl KjDispatcher {
@@ -64,6 +74,7 @@ impl KjDispatcher {
         new_id: ContextId,
         parent_id: Option<ContextId>,
         fork_kind: Option<ForkKind>,
+        drift_info: Option<DriftInfo>,
         caller: &KjCaller,
     ) -> Result<(), String> {
         if !verb_is_wired(verb) {
@@ -136,6 +147,7 @@ impl KjDispatcher {
                         new_id,
                         parent_id,
                         fork_kind,
+                        drift_info.as_ref(),
                         verb,
                         script,
                         child_depth,
@@ -198,6 +210,7 @@ async fn run_kai_script(
     new_id: ContextId,
     parent_id: Option<ContextId>,
     fork_kind: Option<ForkKind>,
+    drift_info: Option<&DriftInfo>,
     verb: &str,
     script: &RcScriptRow,
     child_depth: u8,
@@ -288,6 +301,18 @@ async fn run_kai_script(
         });
         vars.insert(
             "KJ_FORK_INFO".into(),
+            kaish_kernel::ast::Value::String(json.to_string()),
+        );
+    }
+    if let Some(di) = drift_info {
+        let json = serde_json::json!({
+            "kind": di.kind.as_str(),
+            "source": di.source_ctx.to_hex(),
+            "target": di.target_ctx.to_hex(),
+            "source_model": di.source_model,
+        });
+        vars.insert(
+            "KJ_DRIFT_INFO".into(),
             kaish_kernel::ast::Value::String(json.to_string()),
         );
     }
@@ -398,10 +423,8 @@ fn log_unwired_verb_once(verb: &str) {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::OnceLock;
     static ATTACH_LOGGED: OnceLock<AtomicBool> = OnceLock::new();
-    static DRIFT_LOGGED: OnceLock<AtomicBool> = OnceLock::new();
     let flag = match verb {
         VERB_ATTACH => ATTACH_LOGGED.get_or_init(|| AtomicBool::new(false)),
-        VERB_DRIFT => DRIFT_LOGGED.get_or_init(|| AtomicBool::new(false)),
         _ => return,
     };
     if !flag.swap(true, Ordering::Relaxed) {
@@ -657,27 +680,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rc_attach_drift_install_but_no_op() {
+    async fn rc_attach_install_but_no_op() {
         let d = test_dispatcher().await;
-        // Reserved verbs install successfully and dispatch as no-op.
+        // attach is reserved — installs succeed but dispatch is a no-op.
         install_script(
             &d,
-            "/etc/rc/test/drift/S00-noop.md",
+            "/etc/rc/test/attach/S00-noop.md",
             "test",
-            "drift",
+            "attach",
             "S00",
             "noop",
             "md",
-            "drift-script-content",
+            "attach-script-content",
         );
-        // Direct lifecycle invocation with a fake context — should noop.
         let dummy_id = ContextId::new();
         let caller = unjoined_caller();
-        let res = d.run_rc_lifecycle("drift", dummy_id, None, None, &caller).await;
-        assert!(res.is_ok(), "drift verb should no-op, got: {res:?}");
+        let res = d
+            .run_rc_lifecycle("attach", dummy_id, None, None, None, &caller)
+            .await;
+        assert!(res.is_ok(), "attach verb should no-op, got: {res:?}");
         assert!(
             block_kinds_in(&d, dummy_id).is_empty(),
-            "drift no-op should not touch the context"
+            "attach no-op should not touch the context"
         );
     }
 
@@ -716,6 +740,337 @@ mod tests {
         assert!(
             !contents.iter().any(|c| c.contains("would-run")),
             "guarded run must not insert .md block, got: {contents:?}"
+        );
+    }
+
+    /// Set a registered context's type to `t` so rc dispatch finds scripts
+    /// under `/etc/rc/<t>/...`. `register_context` defaults to "default".
+    fn set_context_type(d: &KjDispatcher, ctx: ContextId, t: &str) {
+        let db = d.kernel_db().lock();
+        db.update_context_type(ctx, t).expect("update_context_type");
+    }
+
+    /// Count blocks whose content contains `needle`.
+    fn count_blocks_containing(d: &KjDispatcher, ctx: ContextId, needle: &str) -> usize {
+        block_contents_in(d, ctx)
+            .iter()
+            .filter(|c| c.contains(needle))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn rc_drift_pull_inserts_drift_then_runs_script() {
+        let d = test_dispatcher().await;
+        // .kai script asserts overlay vars look right for a Pull drift.
+        // No `kj` calls — so set_self_arc is unnecessary.
+        install_script(
+            &d,
+            "/etc/rc/test/drift/S00-introspect.kai",
+            "test",
+            "drift",
+            "S00",
+            "introspect",
+            "kai",
+            r#"
+test -n "$KJ_VERB" || exit 1
+test -n "$KJ_CONTEXT" || exit 2
+test -n "$KJ_DRIFT_INFO" || exit 3
+case "$KJ_VERB" in
+  drift) ;;
+  *) exit 4 ;;
+esac
+case "$KJ_DRIFT_INFO" in
+  *'"kind":"pull"'*) ;;
+  *) exit 5 ;;
+esac
+"#,
+        );
+
+        let principal = PrincipalId::new();
+        let dst = register_context(&d, Some("dst"), None, principal).await;
+        set_context_type(&d, dst, "test");
+        let src = register_context(&d, Some("src"), None, principal).await;
+
+        let caller = caller_with_context(dst);
+        let res = d
+            .run_rc_lifecycle(
+                "drift",
+                dst,
+                None,
+                None,
+                Some(DriftInfo {
+                    kind: DriftKind::Pull,
+                    source_ctx: src,
+                    target_ctx: dst,
+                    source_model: Some("claude-opus-4-7".into()),
+                }),
+                &caller,
+            )
+            .await;
+        assert!(res.is_ok(), "drift rc errored: {res:?}");
+
+        let kinds = block_kinds_in(&d, dst);
+        assert!(
+            !kinds.contains(&BlockKind::Error),
+            ".kai overlay-var assertions failed; kinds: {kinds:?}, contents: {:?}",
+            block_contents_in(&d, dst),
+        );
+    }
+
+    #[tokio::test]
+    async fn rc_drift_merge_runs_with_target_overlay() {
+        let d = test_dispatcher().await;
+        install_script(
+            &d,
+            "/etc/rc/test/drift/S00-introspect.kai",
+            "test",
+            "drift",
+            "S00",
+            "introspect",
+            "kai",
+            r#"
+test -n "$KJ_VERB" || exit 1
+case "$KJ_VERB" in
+  drift) ;;
+  *) exit 2 ;;
+esac
+case "$KJ_DRIFT_INFO" in
+  *'"kind":"merge"'*) ;;
+  *) exit 3 ;;
+esac
+"#,
+        );
+
+        let principal = PrincipalId::new();
+        let parent = register_context(&d, Some("parent"), None, principal).await;
+        set_context_type(&d, parent, "test");
+        let child = register_context(&d, Some("child"), Some(parent), principal).await;
+
+        let caller = caller_with_context(child);
+        let res = d
+            .run_rc_lifecycle(
+                "drift",
+                parent,
+                None,
+                None,
+                Some(DriftInfo {
+                    kind: DriftKind::Merge,
+                    source_ctx: child,
+                    target_ctx: parent,
+                    source_model: None,
+                }),
+                &caller,
+            )
+            .await;
+        assert!(res.is_ok(), "drift rc errored: {res:?}");
+
+        let kinds = block_kinds_in(&d, parent);
+        assert!(
+            !kinds.contains(&BlockKind::Error),
+            "merge .kai assertions failed; kinds: {kinds:?}, contents: {:?}",
+            block_contents_in(&d, parent),
+        );
+    }
+
+    #[tokio::test]
+    async fn rc_drift_flush_fires_per_item() {
+        let d = test_dispatcher().await;
+        install_script(
+            &d,
+            "/etc/rc/test/drift/S00-marker.md",
+            "test",
+            "drift",
+            "S00",
+            "marker",
+            "md",
+            "DRIFT-MARKER",
+        );
+
+        let principal = PrincipalId::new();
+        let src = register_context(&d, Some("src"), None, principal).await;
+        let dst = register_context(&d, Some("dst"), None, principal).await;
+        set_context_type(&d, dst, "test");
+        // Flush requires a BlockStore document for the destination.
+        d.block_store()
+            .create_document(dst, crate::DocumentKind::Conversation, None)
+            .unwrap();
+
+        let caller = caller_with_context(src);
+        for content in ["one", "two", "three"] {
+            let r = d
+                .dispatch(
+                    &argv(&["drift", "push", "dst", content]),
+                    &caller,
+                )
+                .await;
+            assert!(r.is_ok(), "push '{content}' failed: {}", r.message());
+        }
+
+        let r = d.dispatch(&argv(&["drift", "flush"]), &caller).await;
+        assert!(r.is_ok(), "flush failed: {}", r.message());
+        assert!(
+            r.message().contains("flushed 3 drift"),
+            "expected all 3 flushed, got: {}",
+            r.message()
+        );
+
+        let marker_count = count_blocks_containing(&d, dst, "DRIFT-MARKER");
+        assert_eq!(
+            marker_count, 3,
+            "expected 3 marker blocks, contents: {:?}",
+            block_contents_in(&d, dst)
+        );
+    }
+
+    #[tokio::test]
+    async fn rc_drift_script_failure_inserts_error_continues_flush() {
+        let d = test_dispatcher().await;
+        install_script(
+            &d,
+            "/etc/rc/test/drift/S00-fail.kai",
+            "test",
+            "drift",
+            "S00",
+            "fail",
+            "kai",
+            "exit 17",
+        );
+        install_script(
+            &d,
+            "/etc/rc/test/drift/S10-after.md",
+            "test",
+            "drift",
+            "S10",
+            "after",
+            "md",
+            "AFTER-MARKER",
+        );
+
+        let principal = PrincipalId::new();
+        let src = register_context(&d, Some("src"), None, principal).await;
+        let dst = register_context(&d, Some("dst"), None, principal).await;
+        set_context_type(&d, dst, "test");
+        d.block_store()
+            .create_document(dst, crate::DocumentKind::Conversation, None)
+            .unwrap();
+
+        let caller = caller_with_context(src);
+        for content in ["one", "two"] {
+            d.dispatch(&argv(&["drift", "push", "dst", content]), &caller)
+                .await;
+        }
+
+        let r = d.dispatch(&argv(&["drift", "flush"]), &caller).await;
+        assert!(r.is_ok(), "flush failed: {}", r.message());
+        assert!(
+            r.message().contains("flushed 2 drift"),
+            "expected both items reported injected (drift block landed; rc \
+             failure does not block delivery), got: {}",
+            r.message()
+        );
+
+        let kinds = block_kinds_in(&d, dst);
+        let error_count = kinds
+            .iter()
+            .filter(|k| **k == BlockKind::Error)
+            .count();
+        assert_eq!(error_count, 2, "expected 1 Error per item; kinds: {kinds:?}");
+        let after_count = count_blocks_containing(&d, dst, "AFTER-MARKER");
+        assert_eq!(
+            after_count, 2,
+            "S10 must run after S00 fails per-item; contents: {:?}",
+            block_contents_in(&d, dst)
+        );
+    }
+
+    #[tokio::test]
+    async fn rc_drift_compact_fork_does_not_double_fire() {
+        let d = test_dispatcher().await;
+        install_script(
+            &d,
+            "/etc/rc/test/fork/S00-fork.md",
+            "test",
+            "fork",
+            "S00",
+            "fork-marker",
+            "md",
+            "FORK-MARKER",
+        );
+        install_script(
+            &d,
+            "/etc/rc/test/drift/S00-drift.md",
+            "test",
+            "drift",
+            "S00",
+            "drift-marker",
+            "md",
+            "DRIFT-MARKER",
+        );
+
+        let caller = unjoined_caller();
+        let r = d
+            .dispatch(
+                &argv(&["context", "create", "parent", "--type", "test"]),
+                &caller,
+            )
+            .await;
+        assert!(r.is_ok(), "create parent failed: {}", r.message());
+        let parent_id = lookup_context_id(&d, "parent");
+
+        // `kj context create` writes the KernelDb context+document but
+        // doesn't seed a BlockStore document unless the rc create
+        // lifecycle inserted blocks. With no `create` script for
+        // `test`, the BlockStore doc isn't created — seed it explicitly
+        // so insert_block_as has somewhere to land.
+        d.block_store()
+            .create_document(parent_id, crate::DocumentKind::Conversation, None)
+            .unwrap();
+
+        // Insert a block so --compact has something to distill (otherwise
+        // the distillation path errors out before reaching rc).
+        d.block_store()
+            .insert_block_as(
+                parent_id,
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "seed content for compact-fork distillation".to_string(),
+                Status::Done,
+                ContentType::Plain,
+                Some(PrincipalId::system()),
+            )
+            .unwrap();
+
+        let fork_caller = caller_with_context(parent_id);
+        let r = d
+            .dispatch(
+                &argv(&["fork", "--name", "child", "--compact"]),
+                &fork_caller,
+            )
+            .await;
+        // Compact may fail in tests if no LLM is wired; if so, the rc
+        // call doesn't fire and the test premise is moot. Skip cleanly.
+        if !r.is_ok() {
+            eprintln!(
+                "skipping compact-fork rc check — fork --compact unavailable in test: {}",
+                r.message()
+            );
+            return;
+        }
+
+        let child_id = lookup_context_id(&d, "child");
+        let fork_marker = count_blocks_containing(&d, child_id, "FORK-MARKER");
+        let drift_marker = count_blocks_containing(&d, child_id, "DRIFT-MARKER");
+        assert!(
+            fork_marker >= 1,
+            "child should have FORK-MARKER from fork rc, got contents: {:?}",
+            block_contents_in(&d, child_id)
+        );
+        assert_eq!(
+            drift_marker, 0,
+            "compact-fork must NOT fire drift rc on the new context; got {drift_marker} marker(s) in: {:?}",
+            block_contents_in(&d, child_id)
         );
     }
 

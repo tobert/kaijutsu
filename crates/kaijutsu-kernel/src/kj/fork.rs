@@ -290,7 +290,7 @@ impl KjDispatcher {
         // Run rc fork-lifecycle scripts. Failures surface as Error
         // blocks in the new context — they don't abort the fork.
         if let Err(e) = self
-            .run_rc_lifecycle("fork", new_id, Some(source_id), Some(ForkKind::Full), caller)
+            .run_rc_lifecycle("fork", new_id, Some(source_id), Some(ForkKind::Full), None, caller)
             .await
         {
             tracing::warn!("rc fork lifecycle: {e}");
@@ -497,6 +497,7 @@ impl KjDispatcher {
                 new_id,
                 Some(source_id),
                 Some(ForkKind::Shallow),
+                None,
                 caller,
             )
             .await
@@ -723,6 +724,7 @@ impl KjDispatcher {
                 new_id,
                 Some(source_id),
                 Some(ForkKind::Compact),
+                None,
                 caller,
             )
             .await
@@ -975,6 +977,7 @@ impl KjDispatcher {
                 new_root_id,
                 Some(source_id),
                 Some(ForkKind::Subtree),
+                None,
                 caller,
             )
             .await
