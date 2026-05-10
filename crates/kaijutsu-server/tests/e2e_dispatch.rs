@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use kaijutsu_crdt::{ContextId, PrincipalId};
 use kaijutsu_kernel::{Kernel, LocalBackend, shared_block_store};
+use kaish_kernel::ExecuteOptions;
 use kaijutsu_server::EmbeddedKaish;
 use kaijutsu_types::DocKind;
 
@@ -92,7 +93,10 @@ async fn test_ls_through_embedded_kaish() {
     let fs = TestFs::new();
     let kaish = setup_shell_e2e(&fs, None).await;
     let result = kaish
-        .execute(&format!("ls {}", fs.project.display()))
+        .execute_with_options(
+            &format!("ls {}", fs.project.display()),
+            ExecuteOptions::default(),
+        )
         .await
         .unwrap();
 
@@ -111,7 +115,10 @@ async fn test_ls_tmp() {
     std::fs::write(fs.root.join("tmp/scratch.txt"), "temp\n").unwrap();
 
     let kaish = setup_shell_e2e(&fs, None).await;
-    let result = kaish.execute("ls /tmp").await.unwrap();
+    let result = kaish
+        .execute_with_options("ls /tmp", ExecuteOptions::default())
+        .await
+        .unwrap();
 
     assert_eq!(result.code, 0, "ls /tmp failed: {}", result.err);
     assert!(
@@ -126,9 +133,18 @@ async fn test_rapid_shell_commands() {
     let fs = TestFs::new();
     let kaish = setup_shell_e2e(&fs, None).await;
 
-    let r1 = kaish.execute("echo a").await.unwrap();
-    let r2 = kaish.execute("echo b").await.unwrap();
-    let r3 = kaish.execute("echo c").await.unwrap();
+    let r1 = kaish
+        .execute_with_options("echo a", ExecuteOptions::default())
+        .await
+        .unwrap();
+    let r2 = kaish
+        .execute_with_options("echo b", ExecuteOptions::default())
+        .await
+        .unwrap();
+    let r3 = kaish
+        .execute_with_options("echo c", ExecuteOptions::default())
+        .await
+        .unwrap();
 
     assert_eq!(r1.code, 0, "echo a failed: {}", r1.err);
     assert_eq!(r2.code, 0, "echo b failed: {}", r2.err);
@@ -143,7 +159,10 @@ async fn test_rapid_shell_commands() {
 async fn test_shell_command_with_project_root() {
     let fs = TestFs::new();
     let kaish = setup_shell_e2e(&fs, Some(fs.project.clone())).await;
-    let result = kaish.execute("ls").await.unwrap();
+    let result = kaish
+        .execute_with_options("ls", ExecuteOptions::default())
+        .await
+        .unwrap();
 
     assert_eq!(result.code, 0, "ls failed: {}", result.err);
     assert!(

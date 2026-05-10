@@ -3,7 +3,8 @@
 //! Fires at context lifecycle moments (`create`, `fork`; `attach` and
 //! `drift` reserved). Looks up scripts at `/etc/rc/<context_type>/<verb>/`,
 //! runs them in lexical sort order. `.md` scripts become blocks; `.kai`
-//! scripts execute via `kaish_kernel::Kernel::execute_with_vars`.
+//! scripts execute via `kaish_kernel::Kernel::execute_with_options` with the
+//! kernel's `TimeoutPolicy::rc_script_timeout` applied per call.
 //!
 //! ## Failure semantics
 //!
@@ -317,7 +318,10 @@ async fn run_kai_script(
         );
     }
 
-    match kaish.execute_with_vars(&script.content, vars).await {
+    let opts = kaish_kernel::ExecuteOptions::new()
+        .with_vars(vars)
+        .with_timeout(kaish.timeouts().rc_script_timeout);
+    match kaish.execute_with_options(&script.content, opts).await {
         Ok(exec) if exec.code == 0 => {}
         Ok(exec) => {
             let stdout = exec.text_out().into_owned();
@@ -567,6 +571,93 @@ mod tests {
         assert!(
             !kinds.contains(&kaijutsu_types::BlockKind::Error),
             "successful .kai should not insert error block, got kinds: {kinds:?}"
+        );
+    }
+
+    /// End-to-end: a slow rc `.kai` script must time out, terminate any
+    /// running child, and land a failure block — without hanging the
+    /// `context create` RPC reply. Exercises the full chain:
+    ///   `kaijutsu_types::TimeoutPolicy`
+    ///     → `Kernel::timeouts()`
+    ///     → `EmbeddedKaish::with_identity` (kaish KernelConfig::request_timeout)
+    ///     → `run_kai_script` (per-call ExecuteOptions::with_timeout)
+    ///     → `kaish::Kernel::execute_with_options` (124 + wait_or_kill)
+    ///     → `insert_rc_failure_block`.
+    #[tokio::test]
+    async fn rc_kai_script_timeout_inserts_failure_block() {
+        let policy = kaijutsu_types::TimeoutPolicy {
+            rc_script_timeout: std::time::Duration::from_millis(150),
+            ..Default::default()
+        };
+        let d = test_dispatcher_with_timeouts(policy).await;
+
+        // Sleep well past the 150ms bound so the timeout MUST fire. The
+        // kaish `sleep` builtin honors `ctx.cancel`, so the timer-induced
+        // cancel surfaces as exit 130; the kernel then maps the elapsed
+        // timeout to exit 124 with a "timed out" message in stderr.
+        install_script(
+            &d,
+            "/etc/rc/test/create/S00-slow.kai",
+            "test",
+            "create",
+            "S00",
+            "slow",
+            "kai",
+            "sleep 10",
+        );
+
+        let caller = unjoined_caller();
+        let started = std::time::Instant::now();
+        let result = d
+            .dispatch(
+                &argv(&["context", "create", "ctx-slow", "--type", "test"]),
+                &caller,
+            )
+            .await;
+        let elapsed = started.elapsed();
+
+        // Context creation succeeded (rc failures don't block creation —
+        // the new context is "alive but degraded" per the SysV-style
+        // semantics documented in lifecycle.rs).
+        assert!(
+            result.is_ok(),
+            "context create should succeed even when rc script times out: {}",
+            result.message()
+        );
+
+        // Did NOT block 10 seconds waiting for sleep — the timeout cut in.
+        // Generous upper bound to absorb CI jitter; the actual budget is ~150ms.
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "rc timeout must not block context create: elapsed={:?}",
+            elapsed
+        );
+
+        // The new context now carries an Error block describing the timeout.
+        let new_id = lookup_context_id(&d, "ctx-slow");
+        let snapshots = d
+            .block_store()
+            .block_snapshots(new_id)
+            .expect("block_snapshots");
+        let error_blocks: Vec<_> = snapshots
+            .iter()
+            .filter(|b| b.kind == kaijutsu_types::BlockKind::Error)
+            .collect();
+        assert_eq!(
+            error_blocks.len(),
+            1,
+            "expected exactly one error block, got {}: kinds={:?}",
+            error_blocks.len(),
+            snapshots.iter().map(|b| b.kind).collect::<Vec<_>>()
+        );
+        let body = &error_blocks[0].content;
+        assert!(
+            body.contains("S00-slow.kai") || body.contains("slow"),
+            "error block should reference the failing script path: {body}"
+        );
+        assert!(
+            body.to_lowercase().contains("timed out") || body.contains("124"),
+            "error block should mention timeout (exit 124 or 'timed out'): {body}"
         );
     }
 

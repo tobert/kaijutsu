@@ -1254,7 +1254,7 @@ impl kernel::Server for KernelImpl {
                     tokio::task::yield_now().await;
 
                     let exec_result = tokio::select! {
-                        result = kaish.execute(&code) => {
+                        result = kaish.execute_with_options(&code, kaish_kernel::ExecuteOptions::default()) => {
                             match result {
                                 Ok(r) => r,
                                 Err(e) => {
@@ -4751,7 +4751,10 @@ async fn execute_shell_command(
             "shell_execute: executing code via EmbeddedKaish: {:?}",
             code
         );
-        match kaish.execute(&code).await {
+        match kaish
+            .execute_with_options(&code, kaish_kernel::ExecuteOptions::default())
+            .await
+        {
             Ok(result) => {
                 log::info!(
                     "shell_execute: kaish returned code={} original_code={:?} did_spill={} out_len={} err_len={}",

@@ -348,6 +348,15 @@ pub(crate) mod test_helpers {
     ///
     /// Must be called from an async context (e.g., `#[tokio::test]`).
     pub async fn test_dispatcher() -> KjDispatcher {
+        test_dispatcher_with_timeouts(kaijutsu_types::TimeoutPolicy::default()).await
+    }
+
+    /// Variant of `test_dispatcher` that installs a custom `TimeoutPolicy`
+    /// before the kernel is wrapped in `Arc`. Used by tests that need
+    /// per-call bounds (rc, hooks) tighter than the production defaults.
+    pub async fn test_dispatcher_with_timeouts(
+        policy: kaijutsu_types::TimeoutPolicy,
+    ) -> KjDispatcher {
         let drift = shared_drift_router();
         let blocks = shared_block_store(PrincipalId::system());
         let kernel_db = Arc::new(parking_lot::Mutex::new(
@@ -360,7 +369,7 @@ pub(crate) mod test_helpers {
             db.get_or_create_default_workspace(kernel_id, PrincipalId::system())
                 .unwrap();
         }
-        let kernel = Arc::new(Kernel::new("test", None).await);
+        let kernel = Arc::new(Kernel::new("test", None).await.with_timeouts(policy));
         KjDispatcher::new(drift, blocks, kernel_db, kernel_id, kernel)
     }
 

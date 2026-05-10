@@ -515,13 +515,33 @@ async fn process_llm_stream(
 
         log::debug!("Entering stream event loop");
         let mut stream_cancelled = false;
+        // Two-layer timeout: total wall-clock cap on the entire completion,
+        // and a per-chunk idle guard for providers that open the connection
+        // but stop sending tokens.
+        let idle_timeout = kernel.timeouts().llm_idle_timeout;
+        let request_timeout = kernel.timeouts().llm_request_timeout;
+        let total_deadline =
+            tokio::time::sleep(request_timeout);
+        tokio::pin!(total_deadline);
         'stream: loop {
             // After cancel: only poll the stream (not the cancel signal) so rig
             // can flush its pending block-close + Done events before we stop.
+            // Idle guard still applies — a hung post-cancel drain shouldn't
+            // pin the loop forever.
             let event = if stream_cancelled {
-                match stream.next_event().await {
-                    Some(ev) => ev,
-                    None => break 'stream,
+                match tokio::time::timeout(idle_timeout, stream.next_event()).await {
+                    Ok(Some(ev)) => ev,
+                    Ok(None) => break 'stream,
+                    Err(_) => {
+                        log::warn!(
+                            "LLM stream idle for {:?} during post-cancel drain ({})",
+                            idle_timeout, context_id
+                        );
+                        StreamEvent::Error(format!(
+                            "LLM stream idle for {:?} (post-cancel)",
+                            idle_timeout
+                        ))
+                    }
                 }
             } else {
                 tokio::select! {
@@ -531,10 +551,30 @@ async fn process_llm_stream(
                         stream_cancelled = true;
                         continue 'stream;  // drain one Done event for confirmation
                     }
-                    maybe_event = stream.next_event() => {
-                        match maybe_event {
-                            Some(ev) => ev,
-                            None => break 'stream,
+                    _ = &mut total_deadline => {
+                        log::warn!(
+                            "LLM stream exceeded total request timeout {:?} ({})",
+                            request_timeout, context_id
+                        );
+                        stream.cancel();
+                        StreamEvent::Error(format!(
+                            "LLM request timed out after {:?}", request_timeout
+                        ))
+                    }
+                    r = tokio::time::timeout(idle_timeout, stream.next_event()) => {
+                        match r {
+                            Ok(Some(ev)) => ev,
+                            Ok(None) => break 'stream,
+                            Err(_) => {
+                                log::warn!(
+                                    "LLM stream idle for {:?} ({})",
+                                    idle_timeout, context_id
+                                );
+                                stream.cancel();
+                                StreamEvent::Error(format!(
+                                    "LLM stream idle for {:?}", idle_timeout
+                                ))
+                            }
                         }
                     }
                 }

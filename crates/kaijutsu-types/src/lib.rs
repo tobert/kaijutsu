@@ -53,6 +53,7 @@ pub mod kernel;
 pub mod principal;
 pub mod session;
 pub mod theme;
+pub mod timeout;
 
 // Re-export kaish output types for structured tool results.
 pub use kaish_types::output::{EntryType as OutputEntryType, OutputData, OutputNode};
@@ -76,6 +77,7 @@ pub use ids::{PrefixError, PrefixResolvable, resolve_context_prefix, resolve_pre
 pub use kernel::Kernel;
 pub use principal::{Credential, CredentialKind, Principal};
 pub use session::Session;
+pub use timeout::TimeoutPolicy;
 
 /// Current time as Unix milliseconds. Canonical source — used by constructors
 /// throughout the crate and by downstream crates (drift, kernel_db, rpc).

@@ -32,7 +32,9 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use kaish_kernel::interpreter::ExecResult;
-use kaish_kernel::{Kernel as KaishKernel, KernelBackend, KernelConfig as KaishConfig};
+use kaish_kernel::{
+    ExecuteOptions, Kernel as KaishKernel, KernelBackend, KernelConfig as KaishConfig,
+};
 
 use crate::Kernel as KaijutsuKernel;
 use crate::block_store::SharedBlockStore;
@@ -57,6 +59,11 @@ pub struct EmbeddedKaish {
     /// Global session map for context tracking.
     session_contexts: SessionContextMap,
     session_id: SessionId,
+    /// Snapshot of the kaijutsu kernel's `TimeoutPolicy` at construction.
+    /// Read by `apply_context_config` for the init-script bound; read by
+    /// the wrapper accessor `timeouts()` for callers that build their own
+    /// `ExecuteOptions` (e.g. `KjDispatcher::run_kai_script`).
+    timeouts: kaijutsu_types::TimeoutPolicy,
 }
 
 impl EmbeddedKaish {
@@ -170,6 +177,11 @@ impl EmbeddedKaish {
             None => KaishConfig::named(name),
         };
 
+        // Apply kernel-wide kaish-script default timeout. Per-call sites
+        // (rc lifecycle, hook bodies, init scripts) can override via
+        // `ExecuteOptions::with_timeout` for stricter per-context bounds.
+        config.request_timeout = Some(kernel.timeouts().kaish_request_timeout);
+
         // Restore persisted cwd from context_shell if available.
         if let Some(db) = kernel_db {
             let db_guard = db.lock();
@@ -185,6 +197,7 @@ impl EmbeddedKaish {
 
         let ctx_for_tools = session_contexts.clone();
         let sid_for_tools = session_id;
+        let timeouts = kernel.timeouts().clone();
         let kaish_kernel = KaishKernel::with_backend(
             mount_backend,
             config,
@@ -202,25 +215,23 @@ impl EmbeddedKaish {
             name: name.to_string(),
             session_contexts,
             session_id,
+            timeouts,
         })
     }
 
-    /// Execute kaish code and return the result.
-    pub async fn execute(&self, code: &str) -> Result<ExecResult> {
-        self.kernel.execute(code).await
-    }
-
-    /// Execute kaish code with overlay variables exported into a transient
-    /// scope frame. The frame is popped on return; vars introduced by the
-    /// overlay disappear unless the script unset them. Used by the rc
-    /// lifecycle runner to plumb `KJ_CONTEXT`, `KJ_VERB`, etc. into the
-    /// script without touching persistent context env state.
-    pub async fn execute_with_vars(
+    /// Execute kaish code with the given options.
+    ///
+    /// Single canonical entry point: `ExecuteOptions` carries the per-call
+    /// vars overlay, timeout, and external cancellation token. With no
+    /// options (`ExecuteOptions::default()`), the kaish kernel falls back to
+    /// the kernel-wide `request_timeout` set by this factory from
+    /// `Kernel::timeouts().kaish_request_timeout`.
+    pub async fn execute_with_options(
         &self,
         code: &str,
-        vars: std::collections::HashMap<String, kaish_kernel::ast::Value>,
+        opts: ExecuteOptions,
     ) -> Result<ExecResult> {
-        self.kernel.execute_with_vars(code, vars).await
+        self.kernel.execute_with_options(code, opts, None).await
     }
 
     /// Get a variable value.
@@ -246,6 +257,13 @@ impl EmbeddedKaish {
     /// Get the kernel name.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Snapshot of the kaijutsu kernel's `TimeoutPolicy` taken at this
+    /// `EmbeddedKaish`'s construction. Callers that build per-call
+    /// `ExecuteOptions` (rc lifecycle, hook bodies) read their bound from here.
+    pub fn timeouts(&self) -> &kaijutsu_types::TimeoutPolicy {
+        &self.timeouts
     }
 
     /// Update the context ID (e.g., after a context switch).
@@ -306,13 +324,16 @@ impl EmbeddedKaish {
             (env, script)
         };
 
-        // Export env vars so they propagate to child processes.
+        // Export env vars so they propagate to child processes. Uses the
+        // kernel-wide kaish default timeout — exports are tiny, no override.
         for var in &env_vars {
             // Shell-escape value to avoid injection.
             let escaped = var.value.replace('\'', "'\\''");
             if let Err(e) = self
-                .kernel
-                .execute(&format!("export {}='{}'", var.key, escaped))
+                .execute_with_options(
+                    &format!("export {}='{}'", var.key, escaped),
+                    ExecuteOptions::default(),
+                )
                 .await
             {
                 tracing::warn!(
@@ -323,10 +344,14 @@ impl EmbeddedKaish {
             }
         }
 
-        // Execute init_script if present.
+        // Execute init_script if present, bounded by `init_script_timeout`.
+        // Init scripts are supposed to be quick; a wedged one shouldn't hang
+        // session bring-up.
         if let Some(script) = init_script {
             if !script.is_empty() {
-                if let Err(e) = self.kernel.execute(&script).await {
+                let opts = ExecuteOptions::new()
+                    .with_timeout(self.timeouts.init_script_timeout);
+                if let Err(e) = self.execute_with_options(&script, opts).await {
                     tracing::warn!(
                         error = %e,
                         "failed to execute context init_script",
@@ -483,14 +508,20 @@ mod tests {
         kaish.apply_context_config(&kernel_db, context_id).await;
 
         // Verify env vars are accessible via kaish execution.
-        let result = kaish.execute("echo $KJ_TEST_FOO").await.unwrap();
+        let result = kaish
+            .execute_with_options("echo $KJ_TEST_FOO", ExecuteOptions::default())
+            .await
+            .unwrap();
         assert_eq!(
             result.text_out().trim(),
             "bar_value",
             "KJ_TEST_FOO should be set from context_env",
         );
 
-        let result = kaish.execute("echo $KJ_TEST_NUM").await.unwrap();
+        let result = kaish
+            .execute_with_options("echo $KJ_TEST_NUM", ExecuteOptions::default())
+            .await
+            .unwrap();
         assert_eq!(
             result.text_out().trim(),
             "42",
@@ -572,7 +603,10 @@ mod tests {
         kaish.apply_context_config(&kernel_db, context_id).await;
 
         // Verify init_script was executed.
-        let result = kaish.execute("echo $INIT_RAN").await.unwrap();
+        let result = kaish
+            .execute_with_options("echo $INIT_RAN", ExecuteOptions::default())
+            .await
+            .unwrap();
         assert_eq!(
             result.text_out().trim(),
             "activated",

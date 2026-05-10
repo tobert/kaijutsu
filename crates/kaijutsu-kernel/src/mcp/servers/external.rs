@@ -189,44 +189,64 @@ impl ExternalMcpServer {
     /// Connect to an external MCP server per the given config. `instance_id`
     /// is used as the broker registration key; for existing `mcp_config.rs`
     /// entries it's typically `config.name`.
-    pub async fn connect(config: McpServerConfig, instance_id: InstanceId) -> McpResult<Self> {
+    ///
+    /// `connect_timeout` bounds the entire spawn + handshake + initial
+    /// `list_tools` round-trip. A wedged child server returns
+    /// `McpError::Protocol("connect timeout: …")` rather than hanging the
+    /// broker init path. Callers should source this from
+    /// `kernel.timeouts().mcp_connect_timeout`.
+    pub async fn connect(
+        config: McpServerConfig,
+        instance_id: InstanceId,
+        connect_timeout: std::time::Duration,
+    ) -> McpResult<Self> {
         let (notif_tx, _) = broadcast::channel(256);
         let handler = BrokerClientHandler::new(notif_tx.clone());
 
-        let service = match config.transport {
-            McpTransport::Stdio => {
-                let mut cmd = Command::new(&config.command);
-                cmd.args(&config.args);
-                propagate_host_env(&mut cmd);
-                for (key, value) in &config.env {
-                    cmd.env(key, value);
+        let init = async {
+            let service = match config.transport {
+                McpTransport::Stdio => {
+                    let mut cmd = Command::new(&config.command);
+                    cmd.args(&config.args);
+                    propagate_host_env(&mut cmd);
+                    for (key, value) in &config.env {
+                        cmd.env(key, value);
+                    }
+                    if let Some(cwd) = &config.cwd {
+                        cmd.current_dir(cwd);
+                    }
+                    let transport = TokioChildProcess::new(cmd.configure(|_| {}))
+                        .map_err(|e| McpError::Protocol(format!("spawn: {e}")))?;
+                    rmcp::serve_client(handler, transport)
+                        .await
+                        .map_err(|e| McpError::Protocol(format!("init: {e}")))?
                 }
-                if let Some(cwd) = &config.cwd {
-                    cmd.current_dir(cwd);
+                McpTransport::StreamableHttp => {
+                    let url = config.url.as_deref().ok_or_else(|| {
+                        McpError::Protocol("StreamableHttp transport requires url".to_string())
+                    })?;
+                    let transport = StreamableHttpClientTransport::from_uri(url);
+                    rmcp::serve_client(handler, transport)
+                        .await
+                        .map_err(|e| McpError::Protocol(format!("init: {e}")))?
                 }
-                let transport = TokioChildProcess::new(cmd.configure(|_| {}))
-                    .map_err(|e| McpError::Protocol(format!("spawn: {e}")))?;
-                rmcp::serve_client(handler, transport)
-                    .await
-                    .map_err(|e| McpError::Protocol(format!("init: {e}")))?
-            }
-            McpTransport::StreamableHttp => {
-                let url = config.url.as_deref().ok_or_else(|| {
-                    McpError::Protocol("StreamableHttp transport requires url".to_string())
-                })?;
-                let transport = StreamableHttpClientTransport::from_uri(url);
-                rmcp::serve_client(handler, transport)
-                    .await
-                    .map_err(|e| McpError::Protocol(format!("init: {e}")))?
-            }
+            };
+            let tools = service
+                .peer()
+                .list_all_tools()
+                .await
+                .map_err(|e| McpError::Protocol(format!("list_tools: {e}")))?;
+            McpResult::Ok((service, tools))
         };
 
-        // Discover tools.
-        let tools = service
-            .peer()
-            .list_all_tools()
+        let (service, tools) = tokio::time::timeout(connect_timeout, init)
             .await
-            .map_err(|e| McpError::Protocol(format!("list_tools: {e}")))?;
+            .map_err(|_| {
+                McpError::Protocol(format!(
+                    "connect timeout: spawn+handshake+list_tools exceeded {:?}",
+                    connect_timeout
+                ))
+            })??;
 
         let kernel_tools: Vec<KernelTool> = tools
             .into_iter()
@@ -256,46 +276,57 @@ impl ExternalMcpServer {
 
     /// Tear down the current service and spin up a fresh one. Intended for
     /// post-failure recovery; Phase 1 does not invoke this automatically.
-    pub async fn reconnect(&self) -> McpResult<()> {
+    /// Bounded by `connect_timeout` like `connect()`.
+    pub async fn reconnect(&self, connect_timeout: std::time::Duration) -> McpResult<()> {
         // Drop the old service first so the subprocess fully exits.
         let _ = self.service.write().take();
 
         let handler = BrokerClientHandler::new(self.notif_tx.clone());
-        let new_service = match self.config.transport {
-            McpTransport::Stdio => {
-                let mut cmd = Command::new(&self.config.command);
-                cmd.args(&self.config.args);
-                propagate_host_env(&mut cmd);
-                for (k, v) in &self.config.env {
-                    cmd.env(k, v);
+        let init = async {
+            let new_service = match self.config.transport {
+                McpTransport::Stdio => {
+                    let mut cmd = Command::new(&self.config.command);
+                    cmd.args(&self.config.args);
+                    propagate_host_env(&mut cmd);
+                    for (k, v) in &self.config.env {
+                        cmd.env(k, v);
+                    }
+                    if let Some(cwd) = &self.config.cwd {
+                        cmd.current_dir(cwd);
+                    }
+                    let transport = TokioChildProcess::new(cmd.configure(|_| {}))
+                        .map_err(|e| McpError::Protocol(format!("spawn: {e}")))?;
+                    rmcp::serve_client(handler, transport)
+                        .await
+                        .map_err(|e| McpError::Protocol(format!("init: {e}")))?
                 }
-                if let Some(cwd) = &self.config.cwd {
-                    cmd.current_dir(cwd);
+                McpTransport::StreamableHttp => {
+                    let url = self.config.url.as_deref().ok_or_else(|| {
+                        McpError::Protocol("StreamableHttp transport requires url".to_string())
+                    })?;
+                    let transport = StreamableHttpClientTransport::from_uri(url);
+                    rmcp::serve_client(handler, transport)
+                        .await
+                        .map_err(|e| McpError::Protocol(format!("init: {e}")))?
                 }
-                let transport = TokioChildProcess::new(cmd.configure(|_| {}))
-                    .map_err(|e| McpError::Protocol(format!("spawn: {e}")))?;
-                rmcp::serve_client(handler, transport)
-                    .await
-                    .map_err(|e| McpError::Protocol(format!("init: {e}")))?
-            }
-            McpTransport::StreamableHttp => {
-                let url = self.config.url.as_deref().ok_or_else(|| {
-                    McpError::Protocol("StreamableHttp transport requires url".to_string())
-                })?;
-                let transport = StreamableHttpClientTransport::from_uri(url);
-                rmcp::serve_client(handler, transport)
-                    .await
-                    .map_err(|e| McpError::Protocol(format!("init: {e}")))?
-            }
+            };
+            // Refresh tool cache — list_changed may have fired during the outage.
+            let tools = new_service
+                .peer()
+                .list_all_tools()
+                .await
+                .map_err(|e| McpError::Protocol(format!("list_tools: {e}")))?;
+            McpResult::Ok((new_service, tools))
         };
 
-        // Refresh tool cache — list_changed may have fired during the
-        // outage.
-        let tools = new_service
-            .peer()
-            .list_all_tools()
+        let (new_service, tools) = tokio::time::timeout(connect_timeout, init)
             .await
-            .map_err(|e| McpError::Protocol(format!("list_tools: {e}")))?;
+            .map_err(|_| {
+                McpError::Protocol(format!(
+                    "reconnect timeout: spawn+handshake+list_tools exceeded {:?}",
+                    connect_timeout
+                ))
+            })??;
         let kernel_tools: Vec<KernelTool> = tools
             .into_iter()
             .map(|t| KernelTool {

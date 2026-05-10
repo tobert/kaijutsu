@@ -56,6 +56,10 @@ pub struct Kernel {
     /// MCP-centric tool broker (Phase 1; sits alongside the old `tools`
     /// registry until M4 swaps call sites).
     broker: Arc<Broker>,
+    /// Kernel-wide timeout policy: kaish-script bounds, LLM streaming,
+    /// MCP connect/handshake. Per-instance MCP `call_timeout` overrides live
+    /// on `InstancePolicy`.
+    timeouts: kaijutsu_types::TimeoutPolicy,
 }
 
 impl std::fmt::Debug for Kernel {
@@ -110,6 +114,7 @@ impl Kernel {
             cas: Self::cas_for_data_dir(data_dir),
             image_backends: RwLock::new(crate::image::ImageBackendRegistry::new()),
             broker: Arc::new(Broker::new()),
+            timeouts: kaijutsu_types::TimeoutPolicy::default(),
         }
     }
 
@@ -136,12 +141,33 @@ impl Kernel {
             cas: Self::cas_for_data_dir(data_dir),
             image_backends: RwLock::new(crate::image::ImageBackendRegistry::new()),
             broker: Arc::new(Broker::new()),
+            timeouts: kaijutsu_types::TimeoutPolicy::default(),
         }
     }
 
     /// Get the MCP tool broker (Phase 1).
     pub fn broker(&self) -> &Arc<Broker> {
         &self.broker
+    }
+
+    /// Kernel-wide timeout policy. Read-only today; future revisions will
+    /// load this from the config CRDT and expose RPC mutation via the kj CLI.
+    pub fn timeouts(&self) -> &kaijutsu_types::TimeoutPolicy {
+        &self.timeouts
+    }
+
+    /// Builder-style override for the kernel-wide timeout policy. **Must be
+    /// called pre-`Arc::new`** — consumes `self` so the type system rejects
+    /// post-wrap mutation (production code holds `Arc<Kernel>` and can't get
+    /// `&mut`, so a setter method would be unreachable in practice and
+    /// misleading to future maintainers).
+    ///
+    /// Used today by `KjDispatcher::test_dispatcher_with_timeouts`; once the
+    /// config CRDT lands, the load path will use the same construction
+    /// shape.
+    pub fn with_timeouts(mut self, policy: kaijutsu_types::TimeoutPolicy) -> Self {
+        self.timeouts = policy;
+        self
     }
 
     /// Dispatch a tool call through the broker using the internal

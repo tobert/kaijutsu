@@ -1449,7 +1449,10 @@ impl Broker {
             kaish_kernel::ast::Value::String(args_json),
         );
 
-        match kaish.execute_with_vars(body, vars).await {
+        let opts = kaish_kernel::ExecuteOptions::new()
+            .with_vars(vars)
+            .with_timeout(kaish.timeouts().hook_body_timeout);
+        match kaish.execute_with_options(body, opts).await {
             Ok(exec) if exec.code == 0 => Ok(()),
             Ok(exec) => {
                 let stderr_tail: String = exec.err.chars().take(512).collect();

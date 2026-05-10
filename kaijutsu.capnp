@@ -408,6 +408,19 @@ struct KernelConfig {
   consentMode @2 :ConsentMode;
 }
 
+# Kernel-wide timeout policy. Mirrors `kaijutsu_types::TimeoutPolicy`.
+# Wire form is millis (UInt64); Rust side uses `Duration`.
+struct TimeoutPolicy {
+  kaishRequestTimeoutMs @0 :UInt64;
+  rcScriptTimeoutMs @1 :UInt64;
+  hookBodyTimeoutMs @2 :UInt64;
+  initScriptTimeoutMs @3 :UInt64;
+  llmRequestTimeoutMs @4 :UInt64;
+  llmIdleTimeoutMs @5 :UInt64;
+  mcpConnectTimeoutMs @6 :UInt64;
+  mcpCallTimeoutDefaultMs @7 :UInt64;
+}
+
 struct MountSpec {
   path @0 :Text;           # e.g. "/mnt/kaijutsu"
   source @1 :Text;         # e.g. "~/src/kaijutsu" or "kernel://other"
