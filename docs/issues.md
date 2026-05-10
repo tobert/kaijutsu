@@ -96,17 +96,6 @@ following are explicit follow-ups that did not ship:
   bytes per prompt. The spawn_blocking fix took the runtime stall out;
   next is caching by `(context_id, hash)` so a 20-image conversation
   doesn't re-encode every screenshot every turn.
-- **`xml_escape` allocates per attribute.**
-  `crates/kaijutsu-kernel/src/llm/system_prompt.rs:140` does four
-  chained `.replace()` calls per attribute string, allocating a new
-  `String` each. Single-pass char loop would halve allocation pressure
-  on the per-prompt path. Cleanup, not a hotspot.
-- **`McpToolCall.legacyServer @0` capnp cleanup.** Field renamed to
-  `legacyServer` and ignored on both sides; the only thing keeping it
-  in the schema is capnp's contiguous-ordinal rule. Drop it (and
-  renumber `tool`/`arguments`) in a coordinated wire-schema bump,
-  bundled with any other deprecated-field removals so we eat the
-  break once.
 
 ## Persistence & sync
 
@@ -178,8 +167,6 @@ Holographic shader trio + entry animation shipped. Open:
   model-response as one "exchange" card or collapsible tool-call groups.
 - **Ambient environment.** Particle field / star-field; post-process
   bloom for edge glow.
-- **Role group borders** are still Vello — should be shader-drawn like
-  block borders.
 
 ## Text rendering (MSDF / 次)
 

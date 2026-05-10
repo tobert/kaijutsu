@@ -2254,10 +2254,6 @@ impl kernel::Server for KernelImpl {
         let p = pry!(params.get());
         let _trace_guard = extract_rpc_trace(p.get_trace(), "call_mcp_tool").entered();
         let call = pry!(p.get_call());
-        // `legacyServer` is deprecated and intentionally not read — the
-        // broker's binding owns tool → instance resolution. Removing the
-        // field outright would force a contiguity-driven capnp renumber;
-        // tracked in docs/issues.md for a coordinated wire bump.
         let tool_name = pry!(pry!(call.get_tool()).to_str()).to_owned();
         let arguments = pry!(pry!(call.get_arguments()).to_str()).to_owned();
 
@@ -3113,28 +3109,6 @@ impl kernel::Server for KernelImpl {
         )
     }
 
-    // REMOVED pre-1.0: use shell_execute("kj drift push ...") instead
-    fn drift_push(
-        self: Rc<Self>,
-        _params: kernel::DriftPushParams,
-        _results: kernel::DriftPushResults,
-    ) -> Promise<(), capnp::Error> {
-        Promise::err(capnp::Error::failed(
-            "driftPush removed — use shell_execute(\"kj drift push <ctx> <content>\")".into(),
-        ))
-    }
-
-    // REMOVED pre-1.0: use shell_execute("kj drift flush") instead
-    fn drift_flush(
-        self: Rc<Self>,
-        _params: kernel::DriftFlushParams,
-        _results: kernel::DriftFlushResults,
-    ) -> Promise<(), capnp::Error> {
-        Promise::err(capnp::Error::failed(
-            "driftFlush removed — use shell_execute(\"kj drift flush\")".into(),
-        ))
-    }
-
     fn drift_queue(
         self: Rc<Self>,
         _params: kernel::DriftQueueParams,
@@ -3184,28 +3158,6 @@ impl kernel::Server for KernelImpl {
             }
             .instrument(span),
         )
-    }
-
-    // REMOVED pre-1.0: use shell_execute("kj drift pull ...") instead
-    fn drift_pull(
-        self: Rc<Self>,
-        _params: kernel::DriftPullParams,
-        _results: kernel::DriftPullResults,
-    ) -> Promise<(), capnp::Error> {
-        Promise::err(capnp::Error::failed(
-            "driftPull removed — use shell_execute(\"kj drift pull <ctx> [prompt]\")".into(),
-        ))
-    }
-
-    // REMOVED pre-1.0: use shell_execute("kj drift merge ...") instead
-    fn drift_merge(
-        self: Rc<Self>,
-        _params: kernel::DriftMergeParams,
-        _results: kernel::DriftMergeResults,
-    ) -> Promise<(), capnp::Error> {
-        Promise::err(capnp::Error::failed(
-            "driftMerge removed — use shell_execute(\"kj drift merge [ctx]\")".into(),
-        ))
     }
 
     // listAllContexts was removed — listContexts now reads from kernel's drift router

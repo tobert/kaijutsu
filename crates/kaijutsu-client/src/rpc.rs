@@ -521,9 +521,8 @@ impl KernelHandle {
     // Block-based CRDT sync methods
     // =========================================================================
 
-    // Blocks sync via pushOps (SerializedOps). The former apply_block_op RPC
-    // was removed on both client and server; its wire slot (@12) is retained
-    // as a no-op placeholder. See BlockDocument::ops_since() and apply_ops().
+    // Blocks sync via pushOps (SerializedOps). See BlockDocument::ops_since()
+    // and apply_ops().
 
     /// Push CRDT operations to the server for bidirectional sync.
     ///
@@ -745,9 +744,7 @@ impl KernelHandle {
 
     /// Call an MCP tool.
     ///
-    /// Tool name is resolved against the calling context's binding —
-    /// there is no longer a `server` parameter (the schema's `legacyServer`
-    /// field is deprecated and ignored by the kernel).
+    /// Tool name is resolved against the calling context's binding.
     #[tracing::instrument(skip(self, arguments), name = "rpc_client.call_mcp_tool")]
     pub async fn call_mcp_tool(
         &self,
@@ -1154,9 +1151,6 @@ impl KernelHandle {
         }
         Ok(result.get_success())
     }
-
-    // Phase 5 D-54: get/setToolFilter + get/setContextToolFilter retired.
-    // Replaced by `builtin.bindings` MCP tools on the server side.
 
     // =========================================================================
     // Context Interrupt

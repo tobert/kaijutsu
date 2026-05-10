@@ -8,7 +8,7 @@
 //! ```text
 //!   ActorHandle (Send+Sync)    bounded(32)   RpcActor (spawn_local, !Send)
 //!   ┌─────────────────────┐  ────────────▶  ┌──────────────────────────────┐
-//!   │ .drift_push()       │                 │ ensure_connected() [serial]  │
+//!   │ .call_mcp_tool()    │                 │ ensure_connected() [serial]  │
 //!   │ .execute_tool()     │  ◀────────────  │ dispatch_command [concurrent]│
 //!   │ .push_ops()         │    oneshot      │ auto-reconnect on error      │
 //!   └─────────────────────┘                 └──────────────────────────────┘
