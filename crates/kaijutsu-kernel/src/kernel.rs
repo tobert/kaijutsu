@@ -405,7 +405,7 @@ impl Kernel {
         self.broker
             .register_silently(
                 Arc::new(BlockToolsServer::new(documents, self.cas.clone())),
-                InstancePolicy::default(),
+                InstancePolicy::for_kernel(self),
             )
             .await?;
 
@@ -416,14 +416,14 @@ impl Kernel {
                     self.vfs.clone(),
                     workspace_guard,
                 )),
-                InstancePolicy::default(),
+                InstancePolicy::for_kernel(self),
             )
             .await?;
 
         self.broker
             .register_silently(
                 Arc::new(KernelInfoServer::new(self.drift.clone())),
-                InstancePolicy::default(),
+                InstancePolicy::for_kernel(self),
             )
             .await?;
 
@@ -432,7 +432,7 @@ impl Kernel {
         self.broker
             .register_silently(
                 Arc::new(BuiltinResourcesServer::new(Arc::downgrade(&self.broker))),
-                InstancePolicy::default(),
+                InstancePolicy::for_kernel(self),
             )
             .await?;
 
@@ -442,7 +442,7 @@ impl Kernel {
         self.broker
             .register_silently(
                 Arc::new(BuiltinHooksServer::new(Arc::downgrade(&self.broker))),
-                InstancePolicy::default(),
+                InstancePolicy::for_kernel(self),
             )
             .await?;
 
@@ -477,7 +477,7 @@ impl Kernel {
             }
         });
         self.broker
-            .register_silently(bindings_server, InstancePolicy::default())
+            .register_silently(bindings_server, InstancePolicy::for_kernel(self))
             .await?;
 
         // M3-D2: builtin.tool_search — keyword search across the calling
@@ -486,7 +486,7 @@ impl Kernel {
             crate::mcp::servers::BuiltinToolSearchServer::new(Arc::downgrade(&self.broker)),
         );
         self.broker
-            .register_silently(tool_search_server, InstancePolicy::default())
+            .register_silently(tool_search_server, InstancePolicy::for_kernel(self))
             .await?;
 
         // M3-D5: builtin.policy — get/set per-instance InstancePolicy.
@@ -494,7 +494,7 @@ impl Kernel {
             crate::mcp::servers::BuiltinPolicyServer::new(Arc::downgrade(&self.broker)),
         );
         self.broker
-            .register_silently(policy_server, InstancePolicy::default())
+            .register_silently(policy_server, InstancePolicy::for_kernel(self))
             .await?;
 
         Ok(())

@@ -3,10 +3,19 @@
 //! Phase 1 ships trivial defaults enough to keep the kernel from OOMing on
 //! pathological input. A real policy admin surface is a follow-up (§9).
 //!
-//! `Default` reads `call_timeout` from `TimeoutPolicy::mcp_call_timeout_default`
-//! so the kernel-wide policy can move the floor without per-instance fixups.
-//! The `policy_admin` MCP server can still override per-instance after
-//! registration.
+//! ## `Default` is for tests only
+//!
+//! `Default` carries hard-coded constants that are *not* linked to
+//! `kaijutsu_types::TimeoutPolicy`. Production registration must use
+//! [`InstancePolicy::for_kernel`], which sources `call_timeout` from the
+//! kernel's `TimeoutPolicy::mcp_call_timeout_default`. Keeping them
+//! decoupled means a kernel with a non-default `TimeoutPolicy` (e.g.,
+//! loaded from config CRDT) registers builtin servers with the *kernel's*
+//! timeout rather than the `Default` constant — closing the silent-link
+//! footgun called out in plan `lovely-hopping-pearl.md`.
+//!
+//! Per-instance overrides via the `policy_admin` MCP server keep working
+//! either way.
 
 use std::time::Duration;
 
@@ -19,23 +28,25 @@ pub struct InstancePolicy {
 }
 
 impl Default for InstancePolicy {
+    /// **Test-only.** Production callers should use
+    /// [`InstancePolicy::for_kernel`] so `call_timeout` reflects the
+    /// kernel's `TimeoutPolicy`.
     fn default() -> Self {
-        // Pulls the call_timeout default from the kernel-wide TimeoutPolicy
-        // so a single config change moves the floor for newly-registered
-        // instances. Existing registered instances are unaffected — those
-        // are mutated via the `policy_admin` MCP server.
-        //
-        // **Coupling to keep an eye on:** this `Default` calls
-        // `TimeoutPolicy::default` directly, so the two `Default` impls are
-        // linked silently. Architectural follow-up (see plan
-        // `lovely-hopping-pearl.md`): drop `Default` on `InstancePolicy` for
-        // production and have the broker seed `call_timeout` at register-time
-        // from `kernel.timeouts().mcp_call_timeout_default`. Tests can keep a
-        // local helper. Until that lands, keep the two defaults in sync if
-        // either moves.
-        let tp = kaijutsu_types::TimeoutPolicy::default();
         Self {
-            call_timeout: tp.mcp_call_timeout_default,
+            call_timeout: Duration::from_secs(120),
+            max_result_bytes: 64 * 1024 * 1024,
+            max_concurrency: 16,
+        }
+    }
+}
+
+impl InstancePolicy {
+    /// Production constructor. Sources `call_timeout` from the kernel's
+    /// `TimeoutPolicy::mcp_call_timeout_default` so kernel-wide policy
+    /// drives newly-registered instances without per-call-site fixups.
+    pub fn for_kernel(kernel: &crate::Kernel) -> Self {
+        Self {
+            call_timeout: kernel.timeouts().mcp_call_timeout_default,
             max_result_bytes: 64 * 1024 * 1024,
             max_concurrency: 16,
         }
