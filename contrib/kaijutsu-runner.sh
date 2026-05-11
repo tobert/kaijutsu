@@ -67,7 +67,7 @@ CARGO_PROFILE_FLAG=""
 if [[ -z "${SCRIPT_WRAPPER:-}" ]]; then
     export SCRIPT_WRAPPER=1
     echo "📜 Wrapping in script(1) → $TYPESCRIPT"
-    exec script -f -q "$TYPESCRIPT" -c "$0 $*"
+    exec script -f -q -c "$0 $*" "$TYPESCRIPT"
 fi
 
 WATCH_PID=""
