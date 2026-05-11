@@ -35,6 +35,28 @@ pub struct VimMotionState {
     pub register_linewise: bool,
 }
 
+/// Resolve a contiguous range of lines `[start_line, end_line]` to a byte
+/// range suitable for linewise deletion / yank.
+///
+/// Returns `(start, end, true)` where the trailing newline is consumed when
+/// present, and the preceding newline is consumed instead for the last line
+/// of a buffer without a trailing newline (so `dd` on the last line doesn't
+/// leave an orphan blank).
+fn line_range_bytes(text: &str, start_line: usize, end_line: usize) -> (usize, usize, bool) {
+    let start = textutil::line_start(text, start_line);
+    let end = textutil::line_end(text, end_line);
+    if end < text.len() && text.as_bytes().get(end) == Some(&b'\n') {
+        (start, end + 1, true)
+    } else if start > 0 {
+        // Last line, no trailing \n — eat the preceding \n instead.
+        let adjusted_start = textutil::prev_char_boundary(text, start);
+        (adjusted_start, end, true)
+    } else {
+        // Whole buffer is a single line with no trailing newline.
+        (start, end, true)
+    }
+}
+
 /// Resolve an EditTarget to a byte range (start, end) in the overlay text.
 /// Returns None if the target can't be resolved.
 fn resolve_target_range(
@@ -51,6 +73,17 @@ fn resolve_target_range(
                 desired_col: motion_state.desired_col,
             };
             let result = motion::resolve_motion(text, cursor, move_type, count, ctx, &motion_ctx);
+
+            // Linewise motions (j/k/gg/G) expand to whole lines instead of
+            // using the charwise inclusive/exclusive endpoint.
+            if motion::is_linewise(move_type) {
+                let cur_line = textutil::line_of(text, cursor);
+                let target_line = textutil::line_of(text, result.cursor);
+                let (start_line, end_line) =
+                    (cur_line.min(target_line), cur_line.max(target_line));
+                return Some(line_range_bytes(text, start_line, end_line));
+            }
+
             let (start, end) = if result.cursor < cursor {
                 (result.cursor, cursor)
             } else {
@@ -68,21 +101,9 @@ fn resolve_target_range(
         EditTarget::Range(RangeType::Line, _inclusive, count) => {
             let n: usize = ctx.resolve(count);
             let cur_line = textutil::line_of(text, cursor);
-            let end_line = (cur_line + n.max(1) - 1).min(textutil::line_count(text).saturating_sub(1));
-            let start = textutil::line_start(text, cur_line);
-            let end = textutil::line_end(text, end_line);
-            // Include the trailing newline if there is one
-            let end = if end < text.len() && text.as_bytes().get(end) == Some(&b'\n') {
-                end + 1
-            } else if start > 0 && start <= text.len() {
-                // Last line with no trailing newline — eat the preceding newline instead
-                // so that dd on the last line doesn't leave a trailing blank
-                let adjusted_start = textutil::prev_char_boundary(text, start);
-                return Some((adjusted_start, end, true));
-            } else {
-                end
-            };
-            Some((start, end, true))
+            let end_line =
+                (cur_line + n.max(1) - 1).min(textutil::line_count(text).saturating_sub(1));
+            Some(line_range_bytes(text, cur_line, end_line))
         }
         EditTarget::CurrentPosition => {
             // x — delete char at cursor
@@ -621,6 +642,120 @@ mod tests {
         // Only line, no newlines at all
         assert_eq!(start, 0);
         assert_eq!(end, 5);
+        assert!(linewise);
+    }
+
+    // ── Linewise motion (dj/dk/dgg/dG) ──
+
+    #[test]
+    fn dj_deletes_two_lines() {
+        let text = "alpha\nbeta\ngamma";
+        // cursor at start of alpha (line 0). dj deletes lines 0-1.
+        let (start, end, linewise) = resolve_target_range(
+            text,
+            0,
+            &EditTarget::Motion(MoveType::Line(MoveDir1D::Next), Count::Contextual),
+            &ctx(),
+            &state(),
+        )
+        .unwrap();
+        assert_eq!(start, 0);
+        assert_eq!(end, 11); // through the \n after "beta"
+        assert!(linewise);
+    }
+
+    #[test]
+    fn dj_to_last_line_eats_preceding_newline() {
+        let text = "alpha\nbeta";
+        // dj from line 0 spans to last line (no trailing \n) — eats the
+        // preceding \n instead so the whole buffer goes.
+        let (start, end, linewise) = resolve_target_range(
+            text,
+            0,
+            &EditTarget::Motion(MoveType::Line(MoveDir1D::Next), Count::Contextual),
+            &ctx(),
+            &state(),
+        )
+        .unwrap();
+        assert_eq!(start, 0);
+        assert_eq!(end, text.len());
+        assert!(linewise);
+    }
+
+    #[test]
+    fn dk_deletes_two_lines() {
+        let text = "alpha\nbeta\ngamma";
+        // cursor on 'b' in beta (line 1, byte 6). dk deletes lines 0-1.
+        let (start, end, linewise) = resolve_target_range(
+            text,
+            6,
+            &EditTarget::Motion(MoveType::Line(MoveDir1D::Previous), Count::Contextual),
+            &ctx(),
+            &state(),
+        )
+        .unwrap();
+        assert_eq!(start, 0);
+        assert_eq!(end, 11);
+        assert!(linewise);
+    }
+
+    #[test]
+    fn dgg_from_last_line() {
+        let text = "alpha\nbeta\ngamma";
+        // cursor on 'g' in gamma (line 2). dgg deletes lines 0..=2 = all.
+        let (start, end, linewise) = resolve_target_range(
+            text,
+            11,
+            &EditTarget::Motion(
+                MoveType::BufferPos(editor_types::prelude::MovePosition::Beginning),
+                Count::Contextual,
+            ),
+            &ctx(),
+            &state(),
+        )
+        .unwrap();
+        assert_eq!(start, 0);
+        assert_eq!(end, text.len());
+        assert!(linewise);
+    }
+
+    #[test]
+    fn dg_capital_from_first_line() {
+        let text = "alpha\nbeta\ngamma";
+        // cursor on 'a' in alpha (line 0). dG deletes lines 0..=2 = all.
+        let (start, end, linewise) = resolve_target_range(
+            text,
+            0,
+            &EditTarget::Motion(
+                MoveType::BufferPos(editor_types::prelude::MovePosition::End),
+                Count::Contextual,
+            ),
+            &ctx(),
+            &state(),
+        )
+        .unwrap();
+        assert_eq!(start, 0);
+        assert_eq!(end, text.len());
+        assert!(linewise);
+    }
+
+    #[test]
+    fn dgg_middle_to_top() {
+        let text = "alpha\nbeta\ngamma";
+        // cursor on 'b' in beta (line 1). dgg deletes lines 0-1.
+        let (start, end, linewise) = resolve_target_range(
+            text,
+            6,
+            &EditTarget::Motion(
+                MoveType::BufferPos(editor_types::prelude::MovePosition::Beginning),
+                Count::Contextual,
+            ),
+            &ctx(),
+            &state(),
+        )
+        .unwrap();
+        assert_eq!(start, 0);
+        assert_eq!(end, 11);
         assert!(linewise);
     }
 

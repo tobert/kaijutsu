@@ -242,6 +242,18 @@ fn convert_word_style(style: &MkWordStyle) -> WordStyle {
     }
 }
 
+/// Whether a motion operates linewise — operators like `d`/`y` expand its
+/// range to whole lines instead of using the charwise endpoint.
+///
+/// Examples: `dj` deletes the current and next line, not the slice from
+/// cursor to the same column on the next line.
+pub fn is_linewise(move_type: &MoveType) -> bool {
+    matches!(
+        move_type,
+        MoveType::Line(_) | MoveType::BufferPos(_) | MoveType::BufferLineOffset
+    )
+}
+
 /// Whether a motion's end position should be included in operator-pending ranges.
 ///
 /// Vim distinguishes exclusive motions (`w`, `b`, `h`, `l`, `0`, `^`) — the char
@@ -265,12 +277,14 @@ pub fn is_inclusive(move_type: &MoveType) -> bool {
         MoveType::LinePos(MovePosition::End) => true,
         MoveType::FinalNonBlank(_) => true,
 
-        // Linewise / buffer-line motions — currently routed through the
-        // charwise extend path. Keep today's inclusive treatment until proper
-        // linewise handling lands for `dj` / `dgg` / `dG`.
-        MoveType::Line(_) => true,
-        MoveType::BufferPos(_) => true,
-        MoveType::BufferLineOffset => true,
+        // Linewise / buffer-line motions — handled by the linewise branch in
+        // `resolve_target_range`, so the charwise inclusive/exclusive flag is
+        // not consulted. Mark them exclusive defensively: if `is_linewise`
+        // ever misses one, the charwise fallback won't over-eat past the
+        // resolved cursor position.
+        MoveType::Line(_) => false,
+        MoveType::BufferPos(_) => false,
+        MoveType::BufferLineOffset => false,
 
         // Default: inclusive (preserves pre-fix behavior for any MoveType we
         // haven't classified yet — won't silently break unfamiliar motions).
@@ -697,5 +711,32 @@ mod tests {
     #[test]
     fn inclusive_g_underscore_is_inclusive() {
         assert!(is_inclusive(&MoveType::FinalNonBlank(MoveDir1D::Next)));
+    }
+
+    // ── is_linewise classification ──
+
+    #[test]
+    fn linewise_classifies_line() {
+        assert!(is_linewise(&MoveType::Line(MoveDir1D::Next)));
+        assert!(is_linewise(&MoveType::Line(MoveDir1D::Previous)));
+    }
+
+    #[test]
+    fn linewise_classifies_buffer_pos() {
+        assert!(is_linewise(&MoveType::BufferPos(MovePosition::Beginning)));
+        assert!(is_linewise(&MoveType::BufferPos(MovePosition::End)));
+    }
+
+    #[test]
+    fn linewise_classifies_buffer_line_offset() {
+        assert!(is_linewise(&MoveType::BufferLineOffset));
+    }
+
+    #[test]
+    fn linewise_does_not_match_charwise() {
+        assert!(!is_linewise(&MoveType::Column(MoveDir1D::Next, false)));
+        assert!(!is_linewise(&MoveType::WordBegin(MkWordStyle::Little, MoveDir1D::Next)));
+        assert!(!is_linewise(&MoveType::LinePos(MovePosition::End)));
+        assert!(!is_linewise(&MoveType::FinalNonBlank(MoveDir1D::Next)));
     }
 }
