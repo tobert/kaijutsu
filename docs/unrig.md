@@ -208,7 +208,7 @@ took.
 
 - [x] Phase 0 — Contract design
 - [x] Phase 1 — Drop rig
-- [x] Phase 2 — Claude
+- [x] Phase 2 — Claude (incl. 2.5 signature plumbing)
 - [ ] Phase 3 — Gemini
 - [ ] Phase 4 — Local models (deferred)
 
@@ -234,13 +234,17 @@ took.
   typed builder (`build::with_thinking(req, budget_tokens)`) but no
   caller populates it. Open: per-context (DriftRouter), per-provider
   (`models.toml`), or per-call.
-- **Thinking signature plumbing.** *Open, deferred:* Anthropic emits
-  `signature_delta` events alongside `thinking_delta`; Phase 2's state
-  machine drops them at the kaijutsu `StreamEvent::ThinkingEnd`
-  boundary. Wiring the signature through to `ContentBlock::Reasoning`
-  on the assistant message (so it round-trips for cross-turn tool_use)
-  needs a `ThinkingEnd { signature: Option<String> }` carrier shape —
-  small breaking change to the StreamEvent enum and the server's match.
+- **Thinking signature plumbing.** *Resolved in Phase 2.5:*
+  `StreamEvent::ThinkingEnd` became a struct variant carrying
+  `signature: Option<String>`. Claude state machine accumulates
+  `signature_delta` payloads inside the per-block state and emits the
+  combined signature at `content_block_stop`. Server-side
+  `process_llm_stream` captures it into a per-iteration
+  `assistant_thinking_signature` accumulator and threads it into
+  `Message::with_reasoning_text_and_tool_uses`, so the next agentic
+  loop iteration echoes the reasoning chain back to Anthropic with
+  its verifier — required when extended thinking is enabled and
+  `tool_use` is in the same turn.
 - **Ollama vs llama.cpp/candle.** Don't commit yet. Local model phase starts
   with a design conversation, not code.
 - **Embeddings.** rig also gave us embedding clients. What's the current
@@ -291,8 +295,8 @@ took.
   - `stream.rs` — `StateMachine` translates SSE events to kaijutsu
     `StreamEvent`s. Tool input assembled across `input_json_delta`
     partials, emitted atomically on `content_block_stop`. Signature
-    bytes from `signature_delta` are dropped at the boundary (deferred
-    to Phase 2.5; open question in this doc).
+    bytes from `signature_delta` accumulate inside per-block state and
+    emit on `content_block_stop` (see Phase 2.5 entry below).
   - `mod.rs` — `Client` wraps `reqwest::Client` with auth headers in
     `default_headers`. `stream()` POSTs `/v1/messages` and wraps the
     SSE byte stream. `cancel()` fires a `tokio_util::CancellationToken`
@@ -311,3 +315,18 @@ took.
     symbolic variants. Reason: `LlmMessage` doesn't carry `BlockId`
     past hydration.
   - 645 kernel + 15 server unit tests pass (up from 604/15 in Phase 1).
+- **2026-05-11** — Phase 2.5 landed: thinking signature plumbing.
+  `StreamEvent::ThinkingEnd` became a struct variant carrying
+  `signature: Option<String>` (breaking change, small surface — one
+  server match arm + one test). Claude state machine accumulates
+  `signature_delta` payload (defensively, since the wire-event name
+  reserves room to split it across multiple deltas) and emits at
+  `content_block_stop`. Server's `process_llm_stream` gained an
+  `assistant_thinking_signature` per-iteration accumulator that feeds
+  `Message::with_reasoning_text_and_tool_uses`, so reasoning chains
+  round-trip back to Anthropic with their verifier — required for
+  correctness when extended thinking + `tool_use` share a turn.
+  Verified end-to-end: live smoke test against api.anthropic.com
+  ("hi there" → "Hey! 👋 How's it going? What can I help you with?",
+  17 input / 21 output tokens, natural `end_turn`). 646 kernel + 15
+  server unit tests pass.
