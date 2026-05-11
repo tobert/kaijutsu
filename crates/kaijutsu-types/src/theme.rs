@@ -96,6 +96,7 @@ pub struct ThemeData {
     pub cursor_normal: [f32; 4],
     pub cursor_insert: [f32; 4],
     pub cursor_visual: [f32; 4],
+    pub cursor_replace: [f32; 4],
 
     // ANSI palette
     pub ansi: AnsiColorsData,
@@ -250,6 +251,7 @@ impl Default for ThemeData {
             cursor_normal: [0.478, 0.635, 0.969, 0.8],
             cursor_insert: [0.620, 0.808, 0.416, 0.9],
             cursor_visual: [0.733, 0.604, 0.969, 0.7],
+            cursor_replace: [1.000, 0.620, 0.392, 0.85], // #ff9e64 orange
 
             // ANSI
             ansi: AnsiColorsData::default(),

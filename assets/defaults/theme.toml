@@ -42,6 +42,7 @@ mode_label_input = "INPUT"
 cursor_normal = [0.478, 0.635, 0.969, 0.8]
 cursor_insert = [0.620, 0.808, 0.416, 0.9]
 cursor_visual = [0.733, 0.604, 0.969, 0.7]
+cursor_replace = [1.000, 0.620, 0.392, 0.85]
 
 # Frame structure
 frame_corner_size = 16.0

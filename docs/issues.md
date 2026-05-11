@@ -8,6 +8,10 @@ makes the work concrete. When an item ships, delete the entry.
 
 ---
 
+## kj cli
+
+Needs to implement kaish structured data returns.
+
 ## User presence (novel surface)
 
 The compose input is a shared CRDT document (`editInput @75`,
@@ -116,36 +120,6 @@ following are explicit follow-ups that did not ship:
   in later-inserted points' layer-0 neighbour list, silently degrading
   ANN recall. Tests work around it; production code should switch
   libraries, patch upstream, or accept reduced recall.
-
-## Vim modal editing (compose overlay)
-
-State machine and core operators ship in `crates/kaijutsu-app/src/input/vim/`.
-Open work:
-
-- **Multi-line visual selection.** Charwise (`v`) on a single visual line
-  ships now (`OverlayCursorGeometry.selection_*`). When anchor and cursor
-  straddle lines, the highlight is suppressed and only the cursor
-  indicates position. Compute one rect per affected line (or pass an
-  array uniform) for proper multi-line `v` and linewise `V` behavior.
-- **Linewise visual mode (`V`).** Above selection rect doesn't extend
-  full line width — needs explicit linewise rendering.
-- **Block visual mode (`Ctrl+v`).** Column-shaped selection rect.
-- **Undo/redo (`u`, Ctrl+R).** Local undo stack with checkpoints on
-  Normal→Insert→Normal. DTE has causal history but no linear undo.
-- **Text objects** (`iw`, `aw`, `i"`, `a(`, …).
-- **Search** (`/`, `?`, `n`, `N`) — needs UI command bar.
-- **Repeat (`.`)**, **Registers (`"a`)**, **Marks**, **Macros (`q`/`@`)**.
-- **Command mode (`:`)** — useful for `:w`, `:q`, `:s`.
-- **Block editing** — extend modal editing to `CellEditor` (conversation
-  blocks).
-- **Custom kaijutsu bindings on top of `VimBindings`** (Tab, q, …).
-- **Replace mode (`R`).** Currently routes through `mode_kind` as Beam;
-  vim convention is an underline cursor. Add a `CursorKind::Underline`
-  variant once Replace mode lands.
-- **Linewise delete for `dj`/`dgg`/`dG`.** These currently route through
-  the charwise extend path in `resolve_target_range` (preserved as
-  inclusive in `motion::is_inclusive` to avoid a regression). Vim treats
-  them as linewise — `dj` deletes 2 lines.
 
 ## Card-stack view
 

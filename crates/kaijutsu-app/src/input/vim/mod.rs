@@ -145,6 +145,8 @@ pub enum CursorKind {
     Beam,
     /// Normal mode — block cursor that overlays the glyph at cursor.
     Block,
+    /// Replace mode (`R`) — thin underline at glyph baseline.
+    Underline,
     /// Visual mode — cursor hidden; the selection rect renders instead.
     Hidden,
 }
@@ -162,7 +164,9 @@ pub fn mode_kind(mode_str: Option<&str>) -> CursorKind {
         None => CursorKind::Block,
         Some(s) => {
             let trimmed = s.trim().trim_start_matches("--").trim();
-            if trimmed.starts_with("INSERT") || trimmed.starts_with("REPLACE") {
+            if trimmed.starts_with("REPLACE") {
+                CursorKind::Underline
+            } else if trimmed.starts_with("INSERT") {
                 CursorKind::Beam
             } else if trimmed.starts_with("VISUAL") || trimmed.starts_with("SELECT") {
                 CursorKind::Hidden
@@ -197,11 +201,8 @@ mod tests {
     }
 
     #[test]
-    fn mode_kind_replace_is_beam() {
-        // Replace mode isn't shipping yet but the renderer should not
-        // accidentally fall into "Block" here — beam is closer to vim's
-        // underline-cursor convention than block.
-        assert_eq!(mode_kind(Some("-- REPLACE --")), CursorKind::Beam);
+    fn mode_kind_replace_is_underline() {
+        assert_eq!(mode_kind(Some("-- REPLACE --")), CursorKind::Underline);
     }
 
     #[test]

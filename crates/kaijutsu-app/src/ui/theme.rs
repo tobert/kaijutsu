@@ -174,6 +174,7 @@ pub struct Theme {
     pub cursor_normal: Vec4,
     pub cursor_insert: Vec4,
     pub cursor_visual: Vec4,
+    pub cursor_replace: Vec4,
 
     // ═══════════════════════════════════════════════════════════════════════
     // ANSI palette (for terminal/syntax use)
@@ -468,6 +469,7 @@ impl Default for Theme {
             cursor_normal: Vec4::new(0.478, 0.635, 0.969, 0.8), // #7aa2f7 blue
             cursor_insert: Vec4::new(0.620, 0.808, 0.416, 0.9), // #9ece6a green
             cursor_visual: Vec4::new(0.733, 0.604, 0.969, 0.7), // #bb9af7 purple
+            cursor_replace: Vec4::new(1.000, 0.620, 0.392, 0.85), // #ff9e64 orange
 
             // ANSI palette — Tokyo Night
             ansi: AnsiColors {
@@ -717,6 +719,7 @@ impl From<kaijutsu_types::theme::ThemeData> for Theme {
         theme.cursor_normal = Vec4::from(td.cursor_normal);
         theme.cursor_insert = Vec4::from(td.cursor_insert);
         theme.cursor_visual = Vec4::from(td.cursor_visual);
+        theme.cursor_replace = Vec4::from(td.cursor_replace);
 
         // ANSI palette
         theme.ansi.black = hex_to_color(&td.ansi.black);

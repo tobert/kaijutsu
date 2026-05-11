@@ -146,19 +146,30 @@ fn sync_block_fx(
                     // fonts cluster around ~0.55× height; this is close
                     // enough without re-querying parley for cluster advance.
                     let block_width = (geom.height as f32 * 0.55).max(2.0);
-                    let (px_width, color) = match geom.kind {
-                        CursorKind::Beam => (2.0_f32, theme.cursor_insert),
-                        CursorKind::Block => (block_width, theme.cursor_normal),
-                        // Hidden — selection rect renders instead. Width=0
+                    let glyph_h = geom.height as f32;
+                    let (rect_x, rect_y, rect_w, rect_h, color) = match geom.kind {
+                        CursorKind::Beam => {
+                            (geom.x as f32, geom.y as f32, 2.0, glyph_h, theme.cursor_insert)
+                        }
+                        CursorKind::Block => {
+                            (geom.x as f32, geom.y as f32, block_width, glyph_h, theme.cursor_normal)
+                        }
+                        CursorKind::Underline => {
+                            // Thin bar at the glyph baseline — vim Replace.
+                            let bar_h = (glyph_h * 0.12).max(2.0);
+                            let y = geom.y as f32 + glyph_h - bar_h;
+                            (geom.x as f32, y, block_width, bar_h, theme.cursor_replace)
+                        }
+                        // Hidden — selection rect renders instead. Zero rect
                         // skips the shader's cursor composite.
-                        CursorKind::Hidden => (0.0, Vec4::ZERO),
+                        CursorKind::Hidden => (0.0, 0.0, 0.0, 0.0, Vec4::ZERO),
                     };
 
-                    if px_width > 0.0 {
-                        let cx = geom.x as f32 / scene.built_width;
-                        let cy = geom.y as f32 / scene.built_height;
-                        let cw = px_width / scene.built_width;
-                        let ch = geom.height as f32 / scene.built_height;
+                    if rect_w > 0.0 && rect_h > 0.0 {
+                        let cx = rect_x / scene.built_width;
+                        let cy = rect_y / scene.built_height;
+                        let cw = rect_w / scene.built_width;
+                        let ch = rect_h / scene.built_height;
                         mat.cursor_params = Vec4::new(cx, cy, cw, ch);
                         mat.cursor_color = Vec4::new(color.x, color.y, color.z, color.w);
                     } else {
