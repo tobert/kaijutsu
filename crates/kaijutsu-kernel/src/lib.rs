@@ -59,19 +59,19 @@ pub use llm::{
     LlmError,
     LlmRegistry,
     LlmResult,
-    LlmStream,
     Message as LlmMessage,
     ModelAlias,
     ModelsConfig,
     // Configuration
     ProviderConfig,
     ResponseBlock,
-    RigProvider,
-    RigStreamAdapter,
+    // Provider dispatch (replaces rig-shaped RigProvider/RigStreamAdapter)
+    Provider,
+    ProviderStream,
     Role as LlmRole,
     // Streaming
+    BuildOpts,
     StreamEvent,
-    StreamRequest,
     // Tool definitions
     ToolDefinition as LlmToolDefinition,
     Usage as LlmUsage,

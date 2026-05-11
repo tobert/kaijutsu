@@ -1362,9 +1362,9 @@ mod tests {
 
     /// Register a mock LLM provider on the kernel so --model validation passes.
     async fn register_mock_provider(d: &super::super::KjDispatcher) {
-        use crate::llm::{MockClient, RigProvider};
+        use crate::llm::{MockClient, Provider};
         use std::sync::Arc;
-        let mock = Arc::new(RigProvider::Mock(MockClient::new("mock response")));
+        let mock = Arc::new(Provider::Mock(MockClient::new("mock response")));
         let mut registry = d.kernel().llm().write().await;
         registry.register("mock", mock);
     }

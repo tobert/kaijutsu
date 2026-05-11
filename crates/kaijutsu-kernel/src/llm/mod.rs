@@ -1,41 +1,38 @@
 //! LLM provider abstraction for kaijutsu kernels.
 //!
-//! This module provides a unified interface for interacting with various
-//! LLM providers via rig-core (Anthropic, Gemini, OpenAI, Ollama).
-//!
-//! ## Architecture
-//!
-//! Kaijutsu uses a thin adapter layer over rig-core:
+//! Per-provider modules (`claude`, `gemini`) own their native wire shapes
+//! and translate kaijutsu's `Message` / `ContentBlock` into provider
+//! requests. Dispatch is an explicit `match Provider` over a closed-set
+//! enum — adding a provider means a new variant plus a new arm at each
+//! call site. See `docs/unrig.md` for the rationale.
 //!
 //! ```text
-//! ┌─────────────────────────────────────────────────────────────┐
-//! │                    kaijutsu-kernel                          │
-//! │  ┌───────────────┐  ┌───────────────┐  ┌───────────────┐   │
-//! │  │ RigProvider   │  │ StreamEvent   │  │ ToolFilter    │   │
-//! │  │ (unified API) │  │ (CRDT events) │  │ (per-kernel)  │   │
-//! │  └───────┬───────┘  └───────┬───────┘  └───────────────┘   │
-//! │          │                  │                               │
-//! └──────────┼──────────────────┼───────────────────────────────┘
-//!            │                  │
-//!            ▼                  ▼
 //! ┌──────────────────────────────────────────────────────────────┐
-//! │                       rig-core                                │
-//! │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐        │
-//! │  │Anthropic │ │ Gemini   │ │ OpenAI   │ │ Ollama   │        │
-//! │  └──────────┘ └──────────┘ └──────────┘ └──────────┘        │
-//! └──────────────────────────────────────────────────────────────┘
+//! │                       kaijutsu-kernel                         │
+//! │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐   │
+//! │  │  Provider   │  │ StreamEvent │  │ Message / Content   │   │
+//! │  │  (enum)     │  │  (CRDT-out) │  │ Block (kaijutsu)    │   │
+//! │  └──────┬──────┘  └──────┬──────┘  └──────────┬──────────┘   │
+//! │         │                │                    │              │
+//! └─────────┼────────────────┼────────────────────┼──────────────┘
+//!           │                │                    │
+//!           ▼                ▼                    ▼
+//!     ┌──────────────────────────────────────────────────┐
+//!     │  llm/claude/   llm/gemini/   (more later)        │
+//!     │   Client::stream(opts, messages) → StreamEvent…  │
+//!     └──────────────────────────────────────────────────┘
 //! ```
 //!
-//! ## Streaming
-//!
-//! For real-time streaming responses, use the [`stream`] module which provides
-//! a provider-agnostic [`StreamEvent`](stream::StreamEvent) enum that maps to
-//! CRDT block operations.
+//! Phase 1: contract + skeleton. Provider `Client::stream()` returns a
+//! loud "not yet implemented" error. Phase 2 lands Claude; Phase 3
+//! Gemini.
 
+pub mod claude;
 pub mod config;
-pub mod toml_config;
+pub mod gemini;
 pub mod stream;
 pub mod system_prompt;
+pub mod toml_config;
 
 // Re-export key types
 pub use config::ProviderConfig;
@@ -44,11 +41,11 @@ pub use toml_config::{
     EmbeddingModelConfig, LlmConfig, ModelAlias, ModelsConfig, initialize_llm_registry,
     load_llm_config_toml, load_models_config_toml,
 };
-pub use stream::{LlmStream, RigStreamAdapter, StreamEvent, StreamRequest, StreamingBlockType};
+pub use stream::{
+    BuildOpts, CacheTarget, CacheTtl, ClaudeUsageExtra, FinishReason, GeminiUsageExtra,
+    StreamError, StreamEvent, UsageExtra,
+};
 
-use rig::client::{CompletionClient, Nothing};
-use rig::completion::{self as rig_completion};
-use rig::providers::{anthropic, gemini, ollama, openai};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -104,7 +101,7 @@ pub enum ContentBlock {
     /// `data_base64` is `None` immediately after hydration — the hydrator
     /// is a pure function of `BlockSnapshot` and has no CAS access. The
     /// server-side path resolves the hash and fills `data_base64` before
-    /// the request hits the LLM provider. Conversion to rig falls back to a
+    /// the request hits the LLM provider. Provider `build()` falls back to a
     /// text marker when resolution failed.
     Image {
         hash: String,
@@ -217,26 +214,6 @@ pub struct ToolDefinition {
     pub input_schema: serde_json::Value,
 }
 
-impl From<ToolDefinition> for rig_completion::ToolDefinition {
-    fn from(td: ToolDefinition) -> Self {
-        Self {
-            name: td.name,
-            description: td.description,
-            parameters: td.input_schema,
-        }
-    }
-}
-
-impl From<rig_completion::ToolDefinition> for ToolDefinition {
-    fn from(td: rig_completion::ToolDefinition) -> Self {
-        Self {
-            name: td.name,
-            description: td.description,
-            input_schema: td.parameters,
-        }
-    }
-}
-
 /// A block of content in an LLM response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ResponseBlock {
@@ -297,15 +274,6 @@ impl Usage {
     }
 }
 
-impl From<rig_completion::Usage> for Usage {
-    fn from(u: rig_completion::Usage) -> Self {
-        Self {
-            input_tokens: u.input_tokens,
-            output_tokens: u.output_tokens,
-        }
-    }
-}
-
 /// Error type for LLM operations.
 #[derive(Debug, thiserror::Error)]
 pub enum LlmError {
@@ -333,26 +301,9 @@ pub enum LlmError {
     #[error("network error: {0}")]
     NetworkError(String),
 
-    /// Rig completion error.
+    /// Provider-side completion error not covered by the variants above.
     #[error("completion error: {0}")]
     CompletionError(String),
-}
-
-impl From<rig_completion::CompletionError> for LlmError {
-    fn from(e: rig_completion::CompletionError) -> Self {
-        match e {
-            rig_completion::CompletionError::HttpError(e) => LlmError::NetworkError(e.to_string()),
-            rig_completion::CompletionError::JsonError(e) => {
-                LlmError::InvalidRequest(e.to_string())
-            }
-            rig_completion::CompletionError::RequestError(e) => {
-                LlmError::InvalidRequest(e.to_string())
-            }
-            rig_completion::CompletionError::ResponseError(s) => LlmError::ApiError(s),
-            rig_completion::CompletionError::ProviderError(s) => LlmError::ApiError(s),
-            rig_completion::CompletionError::UrlError(e) => LlmError::InvalidRequest(e.to_string()),
-        }
-    }
 }
 
 impl kaijutsu_types::IntoErrorPayload for LlmError {
@@ -377,79 +328,52 @@ impl kaijutsu_types::IntoErrorPayload for LlmError {
 /// Result type for LLM operations.
 pub type LlmResult<T> = Result<T, LlmError>;
 
-/// Unified provider enum wrapping rig-core providers.
+/// Closed-set provider enum.
 ///
-/// This enum provides a consistent interface across all supported providers,
-/// handling provider-specific quirks internally.
-#[derive(Clone)]
-pub enum RigProvider {
-    /// Anthropic Claude models.
-    Anthropic(anthropic::Client),
-    /// Google Gemini models.
+/// Dispatch is an explicit `match` at call sites — adding a provider is a
+/// new variant plus a new arm wherever the enum is matched. The mock
+/// variant exists only under `cfg(test)` / `feature = "test-mock"`; it
+/// returns canned responses on `prompt_with_system` and refuses streaming
+/// (matching the rig-era behavior).
+#[derive(Clone, Debug)]
+pub enum Provider {
+    /// Anthropic Claude (see `llm/claude/`).
+    Claude(claude::Client),
+    /// Google Gemini (see `llm/gemini/`).
     Gemini(gemini::Client),
-    /// OpenAI models (GPT-4, etc.).
-    OpenAI(openai::Client),
-    /// Ollama local models.
-    Ollama(ollama::Client),
-    /// Mock provider for testing — returns canned responses.
+    /// Mock provider for tests.
     #[cfg(any(test, feature = "test-mock"))]
     Mock(MockClient),
 }
 
-impl std::fmt::Debug for RigProvider {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Anthropic(_) => f.debug_tuple("Anthropic").field(&"[client]").finish(),
-            Self::Gemini(_) => f.debug_tuple("Gemini").field(&"[client]").finish(),
-            Self::OpenAI(_) => f.debug_tuple("OpenAI").field(&"[client]").finish(),
-            Self::Ollama(_) => f.debug_tuple("Ollama").field(&"[client]").finish(),
-            #[cfg(any(test, feature = "test-mock"))]
-            Self::Mock(_) => f.debug_tuple("Mock").field(&"[canned]").finish(),
-        }
-    }
-}
-
-impl RigProvider {
+impl Provider {
     /// Create a provider from configuration.
-    // TODO(dedup): provider type strings "anthropic"/"gemini"/"openai" hardcoded here,
-    // in config.rs, toml_config.rs — consider constants or an enum
+    ///
+    /// The `provider_type` string maps to the enum variant. Unknown types
+    /// (including `openai` and `ollama`, which the unrig pass dropped from
+    /// initial scope) return [`LlmError::Unavailable`] rather than silently
+    /// falling back — surfacing the mismatch is the point.
     pub fn from_config(config: &ProviderConfig) -> LlmResult<Self> {
         match config.provider_type.as_str() {
-            "anthropic" => {
+            "anthropic" | "claude" => {
                 let api_key = config
                     .resolve_api_key()
                     .ok_or_else(|| LlmError::AuthError("No API key for Anthropic".into()))?;
-                let client = anthropic::Client::new(&api_key)
-                    .map_err(|e| LlmError::Unavailable(e.to_string()))?;
-                Ok(Self::Anthropic(client))
+                let mut client = claude::Client::new(api_key);
+                if let Some(ref url) = config.base_url {
+                    client = client.with_base_url(url);
+                }
+                Ok(Self::Claude(client))
             }
             "gemini" => {
                 let api_key = config
                     .resolve_api_key()
                     .ok_or_else(|| LlmError::AuthError("No API key for Gemini".into()))?;
-                let client = gemini::Client::new(&api_key)
-                    .map_err(|e| LlmError::Unavailable(e.to_string()))?;
+                let mut client = gemini::Client::new(api_key);
+                if let Some(ref url) = config.base_url {
+                    client = client.with_base_url(url);
+                }
                 Ok(Self::Gemini(client))
-            }
-            "openai" => {
-                let api_key = config
-                    .resolve_api_key()
-                    .ok_or_else(|| LlmError::AuthError("No API key for OpenAI".into()))?;
-                let client = openai::Client::new(&api_key)
-                    .map_err(|e| LlmError::Unavailable(e.to_string()))?;
-                Ok(Self::OpenAI(client))
-            }
-            "ollama" => {
-                let base_url = config
-                    .base_url
-                    .clone()
-                    .unwrap_or_else(|| "http://localhost:11434".into());
-                let client = ollama::Client::builder()
-                    .api_key(Nothing)
-                    .base_url(&base_url)
-                    .build()
-                    .map_err(|e| LlmError::Unavailable(e.to_string()))?;
-                Ok(Self::Ollama(client))
             }
             #[cfg(any(test, feature = "test-mock"))]
             "mock" => {
@@ -462,55 +386,46 @@ impl RigProvider {
                 ))))
             }
             other => Err(LlmError::Unavailable(format!(
-                "Unknown provider type: {}",
-                other
+                "Unknown or unsupported provider type: {other} \
+                 (supported: anthropic, gemini)"
             ))),
         }
     }
 
-    /// Create an Anthropic provider from environment.
+    /// Create a Claude provider from `ANTHROPIC_API_KEY`.
     pub fn anthropic_from_env() -> LlmResult<Self> {
         let config = ProviderConfig::new("anthropic").with_api_key_env("ANTHROPIC_API_KEY");
         Self::from_config(&config)
     }
 
-    /// Create a Gemini provider from environment.
+    /// Create a Gemini provider from `GEMINI_API_KEY`.
     pub fn gemini_from_env() -> LlmResult<Self> {
         let config = ProviderConfig::new("gemini").with_api_key_env("GEMINI_API_KEY");
         Self::from_config(&config)
     }
 
-    /// Create an OpenAI provider from environment.
-    pub fn openai_from_env() -> LlmResult<Self> {
-        let config = ProviderConfig::new("openai").with_api_key_env("OPENAI_API_KEY");
-        Self::from_config(&config)
-    }
-
-    /// Create an Ollama provider (local, no auth needed).
-    pub fn ollama_local() -> LlmResult<Self> {
-        let config = ProviderConfig::new("ollama");
-        Self::from_config(&config)
-    }
-
-    /// Get the provider name.
-    pub fn name(&self) -> &str {
+    /// Stable provider identifier (matches the `provider_type` field used
+    /// in models.toml and the DriftRouter).
+    pub fn name(&self) -> &'static str {
         match self {
-            Self::Anthropic(_) => "anthropic",
+            Self::Claude(_) => "anthropic",
             Self::Gemini(_) => "gemini",
-            Self::OpenAI(_) => "openai",
-            Self::Ollama(_) => "ollama",
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(_) => "mock",
         }
     }
 
-    /// Simple prompt helper - sends a single user message.
+    /// One-shot prompt — sends a single user message.
     #[tracing::instrument(skip(self, prompt), fields(llm.model = %model, llm.provider = self.name()))]
     pub async fn prompt(&self, model: &str, prompt: &str) -> LlmResult<String> {
         self.prompt_with_system(model, None, prompt).await
     }
 
-    /// Prompt with an optional system preamble.
+    /// One-shot prompt with optional system preamble.
+    ///
+    /// Phase 1: real-provider variants return [`LlmError::Unavailable`].
+    /// Mock returns its canned response (used by `KjDispatcher::summarize`
+    /// in tests).
     #[tracing::instrument(skip(self, system, prompt), fields(llm.model = %model, llm.provider = self.name()))]
     pub async fn prompt_with_system(
         &self,
@@ -518,93 +433,77 @@ impl RigProvider {
         system: Option<&str>,
         prompt: &str,
     ) -> LlmResult<String> {
-        use rig::completion::{AssistantContent, CompletionModel};
-        use rig::message::Message as RigMessage;
-
-        let message = RigMessage::user(prompt);
-        let request = rig_completion::CompletionRequest {
-            preamble: system.map(|s| s.to_string()),
-            chat_history: rig::OneOrMany::one(message),
-            tools: vec![],
-            temperature: None,
-            max_tokens: None,
-            additional_params: None,
-            tool_choice: None,
-            documents: vec![],
-            model: None,
-            output_schema: None,
-        };
-
-        // Helper to extract text from OneOrMany<AssistantContent>
-        fn extract_text(choice: rig::OneOrMany<AssistantContent>) -> String {
-            let mut texts = Vec::new();
-            for content in choice.iter() {
-                match content {
-                    AssistantContent::Text(text) => texts.push(text.text.clone()),
-                    other => {
-                        tracing::warn!(
-                            kind = std::any::type_name_of_val(other),
-                            "unexpected non-text content in prompt response (dropped)"
-                        );
-                    }
-                }
-            }
-            texts.join("")
-        }
-
-        let response_text = match self {
-            Self::Anthropic(client) => {
-                let model = client.completion_model(model);
-                let response = model.completion(request).await?;
-                extract_text(response.choice)
-            }
-            Self::Gemini(client) => {
-                let model = client.completion_model(model);
-                let response = model.completion(request).await?;
-                extract_text(response.choice)
-            }
-            Self::OpenAI(client) => {
-                let model = client.completion_model(model);
-                let response = model.completion(request).await?;
-                extract_text(response.choice)
-            }
-            Self::Ollama(client) => {
-                let model = client.completion_model(model);
-                let response = model.completion(request).await?;
-                extract_text(response.choice)
-            }
+        match self {
+            Self::Claude(client) => client.prompt(model, system, prompt).await,
+            Self::Gemini(client) => client.prompt(model, system, prompt).await,
             #[cfg(any(test, feature = "test-mock"))]
-            Self::Mock(mock) => mock.canned_response.clone(),
-        };
-
-        Ok(response_text)
+            Self::Mock(mock) => Ok(mock.canned_response.clone()),
+        }
     }
 
-    /// Create a streaming request.
+    /// Start a streaming completion.
     ///
-    /// Returns a [`RigStreamAdapter`] that converts rig's streaming events
-    /// into provider-agnostic [`StreamEvent`]s.
-    #[tracing::instrument(skip(self, request), fields(llm.provider = self.name()))]
-    pub async fn stream(&self, request: StreamRequest) -> LlmResult<RigStreamAdapter> {
-        RigStreamAdapter::new(self.clone(), request).await
+    /// Phase 1: real-provider variants return [`LlmError::Unavailable`].
+    /// Mock refuses streaming (matching the rig-era behavior — tests use
+    /// Mock for registry/dispatch validation, not streaming).
+    #[tracing::instrument(skip(self, opts, messages), fields(llm.provider = self.name()))]
+    pub async fn stream(
+        &self,
+        opts: BuildOpts,
+        messages: Vec<Message>,
+    ) -> LlmResult<ProviderStream> {
+        match self {
+            Self::Claude(client) => {
+                let stream = client.stream(opts, messages).await?;
+                Ok(ProviderStream::Claude(stream))
+            }
+            Self::Gemini(client) => {
+                let stream = client.stream(opts, messages).await?;
+                Ok(ProviderStream::Gemini(stream))
+            }
+            #[cfg(any(test, feature = "test-mock"))]
+            Self::Mock(_) => Err(LlmError::Unavailable(
+                "mock provider does not support streaming".into(),
+            )),
+        }
+    }
+
+    /// Models this provider exposes by default.
+    pub fn available_models(&self) -> Vec<&'static str> {
+        match self {
+            Self::Claude(c) => c.available_models(),
+            Self::Gemini(c) => c.available_models(),
+            #[cfg(any(test, feature = "test-mock"))]
+            Self::Mock(_) => vec!["mock-model"],
+        }
     }
 }
 
-impl RigProvider {
-    /// List available models for this provider.
-    pub fn available_models(&self) -> Vec<&str> {
+/// Closed-set wrapper over per-provider stream types.
+///
+/// The CRDT block writer in `kaijutsu-server` consumes [`StreamEvent`]s
+/// via [`Self::next_event`] and signals cancellation via [`Self::cancel`].
+/// Each call dispatches with an explicit `match` — no trait object.
+pub enum ProviderStream {
+    Claude(claude::Stream),
+    Gemini(gemini::Stream),
+}
+
+impl ProviderStream {
+    /// Poll for the next stream event. Returns `None` once the stream is
+    /// exhausted (after `Done` or `Error`).
+    pub async fn next_event(&mut self) -> Option<StreamEvent> {
         match self {
-            Self::Anthropic(_) => vec![
-                anthropic::completion::CLAUDE_4_OPUS,
-                anthropic::completion::CLAUDE_4_SONNET,
-                anthropic::completion::CLAUDE_3_5_SONNET,
-                anthropic::completion::CLAUDE_3_5_HAIKU,
-            ],
-            Self::Gemini(_) => vec!["gemini-2.0-flash", "gemini-2.0-pro", "gemini-1.5-pro"],
-            Self::OpenAI(_) => vec!["gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo"],
-            Self::Ollama(_) => vec!["qwen3.5:9b-bf16", "qwen3.5:35b-a3b"],
-            #[cfg(any(test, feature = "test-mock"))]
-            Self::Mock(_) => vec!["mock-model"],
+            Self::Claude(s) => s.next_event().await,
+            Self::Gemini(s) => s.next_event().await,
+        }
+    }
+
+    /// Abort the underlying HTTP stream.
+    pub fn cancel(&self) {
+        match self {
+            Self::Claude(s) => s.cancel(),
+            Self::Gemini(s) => s.cancel(),
         }
     }
 }
@@ -612,7 +511,7 @@ impl RigProvider {
 /// Registry of LLM providers.
 #[derive(Default)]
 pub struct LlmRegistry {
-    providers: HashMap<String, Arc<RigProvider>>,
+    providers: HashMap<String, Arc<Provider>>,
     default_provider: Option<String>,
     default_model: Option<String>,
     model_aliases: HashMap<String, toml_config::ModelAlias>,
@@ -640,12 +539,12 @@ impl LlmRegistry {
     }
 
     /// Register a provider by name.
-    pub fn register(&mut self, name: impl Into<String>, provider: Arc<RigProvider>) {
+    pub fn register(&mut self, name: impl Into<String>, provider: Arc<Provider>) {
         self.providers.insert(name.into(), provider);
     }
 
     /// Get a provider by name.
-    pub fn get(&self, name: &str) -> Option<Arc<RigProvider>> {
+    pub fn get(&self, name: &str) -> Option<Arc<Provider>> {
         self.providers.get(name).cloned()
     }
 
@@ -670,7 +569,7 @@ impl LlmRegistry {
     }
 
     /// Get the default provider.
-    pub fn default_provider(&self) -> Option<Arc<RigProvider>> {
+    pub fn default_provider(&self) -> Option<Arc<Provider>> {
         self.default_provider
             .as_ref()
             .and_then(|name| self.get(name))
@@ -726,7 +625,7 @@ impl LlmRegistry {
     ///
     /// Checks aliases first. If no alias matches, uses the default provider
     /// with the given model name.
-    pub fn resolve_model(&self, model_name: &str) -> Option<(Arc<RigProvider>, String)> {
+    pub fn resolve_model(&self, model_name: &str) -> Option<(Arc<Provider>, String)> {
         if let Some((provider_name, model)) = self.resolve_alias(model_name) {
             self.get(provider_name).map(|p| (p, model.to_string()))
         } else {
@@ -790,8 +689,8 @@ impl LlmRegistry {
 /// CAS access. Callers (typically the LLM stream pipeline) invoke this
 /// helper to fill the data before passing messages to the provider. Unknown
 /// hashes and CAS errors are tolerated: the block stays unfilled, and
-/// rig-conversion falls back to a text marker so the model knows an image
-/// existed at that turn.
+/// the provider's `build()` falls back to a text marker so the model knows
+/// an image existed at that turn.
 ///
 /// CAS reads use blocking `std::fs` (see `kaijutsu_cas::FileStore`), so each
 /// image is read on a `spawn_blocking` worker — keeps the tokio runtime
@@ -848,7 +747,7 @@ pub async fn resolve_image_blocks_from_cas(
                 let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
                 *data_base64 = Some(encoded);
             }
-            // Otherwise stay unresolved — rig-conversion emits a text marker.
+            // Otherwise stay unresolved — provider build() emits a text marker.
         }
     }
 }
@@ -1437,35 +1336,37 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_definition_conversion() {
+    fn test_tool_definition_roundtrip_serde() {
+        // Provider-specific translation now lives in each provider's `build()`;
+        // here we just verify the canonical kaijutsu form round-trips through serde.
         let td = ToolDefinition {
             name: "test_tool".into(),
             description: "A test tool".into(),
             input_schema: serde_json::json!({"type": "object"}),
         };
 
-        let rig_td: rig_completion::ToolDefinition = td.clone().into();
-        assert_eq!(rig_td.name, "test_tool");
-        assert_eq!(rig_td.description, "A test tool");
-
-        let back: ToolDefinition = rig_td.into();
+        let json = serde_json::to_string(&td).unwrap();
+        let back: ToolDefinition = serde_json::from_str(&json).unwrap();
         assert_eq!(back.name, td.name);
+        assert_eq!(back.description, td.description);
     }
 
     #[test]
     fn test_provider_names() {
         assert_eq!(
-            RigProvider::Anthropic(anthropic::Client::new("fake").unwrap()).name(),
+            Provider::Claude(claude::Client::new("fake")).name(),
             "anthropic"
+        );
+        assert_eq!(
+            Provider::Gemini(gemini::Client::new("fake")).name(),
+            "gemini"
         );
     }
 
     #[test]
     fn test_registry_concrete_type() {
         let mut registry = LlmRegistry::new();
-        let provider = Arc::new(RigProvider::Anthropic(
-            anthropic::Client::new("fake").unwrap(),
-        ));
+        let provider = Arc::new(Provider::Claude(claude::Client::new("fake")));
         registry.register("anthropic", provider);
         registry.set_default("anthropic");
 
@@ -1476,9 +1377,7 @@ mod tests {
     #[test]
     fn test_model_alias_resolution() {
         let mut registry = LlmRegistry::new();
-        let provider = Arc::new(RigProvider::Anthropic(
-            anthropic::Client::new("fake").unwrap(),
-        ));
+        let provider = Arc::new(Provider::Claude(claude::Client::new("fake")));
         registry.register("anthropic", provider);
         registry.set_default("anthropic");
 

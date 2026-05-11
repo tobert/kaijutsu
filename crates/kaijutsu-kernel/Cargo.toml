@@ -46,9 +46,6 @@ kaijutsu-abc.workspace = true
 # SVG validation (kernel-side, same version as bevy_vello's dependency)
 usvg = "0.46"
 
-# LLM providers
-rig-core.workspace = true
-
 # File pattern matching
 kaish-glob.workspace = true
 kaish-kernel.workspace = true
@@ -77,8 +74,14 @@ tokio-util = { version = "0.7" }
 # Telemetry — W3C trace context injection into CallContext
 kaijutsu-telemetry.workspace = true
 
-# Base64 (transitive dep via rmcp/rig — zero new compiled code)
+# Base64 (transitive dep via rmcp — zero new compiled code)
 base64 = "0.22"
+
+# Claude provider: HTTP + SSE streaming (Phase 2 unrig).
+# Default features pull rustls + platform verifier (no OpenSSL).
+reqwest = { version = "0.13", features = ["json", "stream"] }
+eventsource-stream = "0.2"
+bytes = "1"
 
 [features]
 test-mock = []

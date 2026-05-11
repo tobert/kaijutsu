@@ -101,9 +101,6 @@ rusqlite = { version = "0.39", features = ["bundled"] }
 # Configuration
 toml = "0.8"
 
-# LLM providers - unified via rig-core
-rig-core = "0.34"
-
 # MCP (Model Context Protocol)
 rmcp = { version = "1.4", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 

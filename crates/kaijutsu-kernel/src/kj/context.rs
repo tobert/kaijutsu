@@ -1066,9 +1066,9 @@ mod tests {
 
         // Register mock provider so validation passes
         {
-            use crate::llm::{MockClient, RigProvider};
+            use crate::llm::{MockClient, Provider};
             use std::sync::Arc;
-            let mock = Arc::new(RigProvider::Mock(MockClient::new("mock")));
+            let mock = Arc::new(Provider::Mock(MockClient::new("mock")));
             let mut registry = d.kernel().llm().write().await;
             registry.register("mock", mock);
         }

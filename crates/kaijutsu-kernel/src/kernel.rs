@@ -22,7 +22,7 @@ use crate::control::ConsentMode;
 use crate::drift::{SharedDriftRouter, shared_drift_router};
 use crate::execution::{ExecContext, ExecResult};
 use crate::flows::{SharedBlockFlowBus, shared_block_flow_bus};
-use crate::llm::{LlmRegistry, RigProvider};
+use crate::llm::{LlmRegistry, Provider};
 use crate::mcp::Broker;
 use crate::state::KernelState;
 use crate::vfs::{DirEntry, FileAttr, MountTable, SetAttr, StatFs, VfsOps, VfsResult};
@@ -640,7 +640,7 @@ impl Kernel {
     // ========================================================================
 
     /// Register an LLM provider.
-    pub async fn register_llm(&self, name: impl Into<String>, provider: Arc<RigProvider>) {
+    pub async fn register_llm(&self, name: impl Into<String>, provider: Arc<Provider>) {
         self.llm.write().await.register(name, provider);
     }
 
@@ -884,9 +884,9 @@ mod tests {
         let kernel = Kernel::new("test", None).await;
 
         // Register a provider (uses fake key, won't actually call API)
-        let provider = Arc::new(RigProvider::Anthropic(
-            rig::providers::anthropic::Client::new("fake-key").unwrap(),
-        ));
+        let provider = Arc::new(Provider::Claude(crate::llm::claude::Client::new(
+            "fake-key",
+        )));
         kernel.register_llm("anthropic", provider).await;
         kernel.set_default_llm("anthropic").await;
 

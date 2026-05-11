@@ -1,6 +1,6 @@
 //! LLM streaming + agentic tool-call loop.
 //!
-//! This module owns the background task that talks to a `RigProvider`, parses
+//! This module owns the background task that talks to a `Provider`, parses
 //! `StreamEvent`s into CRDT blocks, dispatches tool calls, and re-prompts until
 //! the model stops. Extracted from `rpc.rs` so the stream semantics sit in one
 //! file rather than interleaved with the RPC dispatch surface.
@@ -16,9 +16,9 @@ use std::sync::Arc;
 use tokio::sync::RwLock as TokioRwLock;
 
 use kaijutsu_crdt::{BlockKind, ContentType, Role, Status};
-use kaijutsu_kernel::llm::stream::{LlmStream, StreamEvent, StreamRequest};
+use kaijutsu_kernel::llm::stream::{BuildOpts, StreamEvent};
 use kaijutsu_kernel::llm::{ContentBlock, ToolDefinition};
-use kaijutsu_kernel::{Kernel, LlmMessage, RigProvider, SharedBlockStore};
+use kaijutsu_kernel::{Kernel, LlmMessage, Provider, SharedBlockStore};
 use kaijutsu_types::ToolKind as TypesToolKind;
 use kaijutsu_types::{ConsentMode, ContextId, PrincipalId};
 
@@ -150,7 +150,7 @@ pub(crate) async fn spawn_llm_for_prompt(
 
     // Resolve provider + model from LLM registry
     // Priority: explicit param > per-context (DriftRouter) > kernel default
-    let provider_resolution: Result<(Arc<RigProvider>, String, u64), &'static str> = {
+    let provider_resolution: Result<(Arc<Provider>, String, u64), &'static str> = {
         let registry = kernel_arc.llm().read().await;
         let max_tokens = registry.max_output_tokens();
 
@@ -284,7 +284,7 @@ mod consent_tests {
 /// `after_block_id` is the starting point for block ordering — all streaming
 /// blocks will be inserted after this block (typically the user's message).
 async fn process_llm_stream(
-    provider: Arc<RigProvider>,
+    provider: Arc<Provider>,
     documents: SharedBlockStore,
     context_id: ContextId,
     content: String,
@@ -346,6 +346,7 @@ async fn process_llm_stream(
             messages.push(LlmMessage::user(&content));
         }
     }
+    let _ = content; // owned String used only for the hydration-failure fallback path above
 
     log::info!(
         "Sending {} messages for context {}",
@@ -422,8 +423,12 @@ async fn process_llm_stream(
             tools.len()
         );
 
-        // Create streaming request with tools
-        let stream_request = StreamRequest::new(&model_name, messages.clone())
+        // Build shared-knob options. Provider-specific knobs (Claude
+        // cache_control, extended thinking, Gemini grounding) live as
+        // typed builder methods on the provider's native request — applied
+        // inside its `Client::stream()` based on configuration and context
+        // state, not threaded through here.
+        let build_opts = BuildOpts::new(&model_name)
             .with_system(&system_prompt)
             .with_max_tokens(max_output_tokens)
             .with_tools(tools.clone());
@@ -435,7 +440,7 @@ async fn process_llm_stream(
             let mut attempt = 0u32;
             loop {
                 attempt += 1;
-                match provider.stream(stream_request.clone()).await {
+                match provider.stream(build_opts.clone(), messages.clone()).await {
                     Ok(s) => {
                         if attempt > 1 {
                             log::info!("LLM stream started on attempt {}", attempt);
@@ -501,6 +506,12 @@ async fn process_llm_stream(
         // turns'. Cross-turn continuity stays out of scope — the hydrator
         // continues to skip Thinking blocks in CRDT history per design.
         let mut assistant_thinking = String::new();
+        // Provider verification signature for the accumulated thinking
+        // (Anthropic's `signature_delta` payload, surfaced via
+        // ThinkingEnd). Carried alongside the prose into the assistant
+        // message so Anthropic accepts the reasoning chain on the next
+        // tool-use turn.
+        let mut assistant_thinking_signature: Option<String> = None;
 
         log::debug!("Entering stream event loop");
         let mut stream_cancelled = false;
@@ -607,7 +618,18 @@ async fn process_llm_stream(
                     }
                 }
 
-                StreamEvent::ThinkingEnd => {
+                StreamEvent::ThinkingEnd { signature } => {
+                    // Capture the provider's reasoning signature so the
+                    // next agentic-loop iteration can echo the thinking
+                    // back with its verifier (required by Anthropic
+                    // when extended thinking is enabled and tool_use is
+                    // in the same turn). `None` when the provider
+                    // doesn't emit one — leave the accumulator alone.
+                    if let Some(sig) = signature
+                        && !sig.is_empty()
+                    {
+                        assistant_thinking_signature = Some(sig);
+                    }
                     if let Some(ref block_id) = current_block_id {
                         let _ = documents.set_status(context_id, block_id, Status::Done);
                     }
@@ -1018,10 +1040,16 @@ async fn process_llm_stream(
         // Add assistant message with tool uses to conversation. Preserve
         // accumulated thinking (A3) so multi-step tool turns keep the
         // model's chain-of-thought intact within this `process_llm_stream`
-        // invocation. Signature is `None` until extended thinking is
-        // wired through the rig adapter.
-        let reasoning = (!assistant_thinking.is_empty())
-            .then(|| (std::mem::take(&mut assistant_thinking), None));
+        // invocation. Signature comes from the provider via
+        // `StreamEvent::ThinkingEnd.signature` — load-bearing for
+        // Anthropic when extended thinking is enabled and tool_use is
+        // in the same turn.
+        let reasoning = (!assistant_thinking.is_empty()).then(|| {
+            (
+                std::mem::take(&mut assistant_thinking),
+                assistant_thinking_signature.take(),
+            )
+        });
         let text = (!assistant_text.is_empty()).then(|| std::mem::take(&mut assistant_text));
         messages.push(LlmMessage::with_reasoning_text_and_tool_uses(
             reasoning,

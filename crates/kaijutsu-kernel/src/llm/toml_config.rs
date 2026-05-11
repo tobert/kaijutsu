@@ -10,7 +10,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use super::config::ProviderConfig;
-use super::{LlmError, LlmRegistry, LlmResult, RigProvider};
+use super::{LlmError, LlmRegistry, LlmResult, Provider};
 
 // ---------------------------------------------------------------------------
 // Canonical config types
@@ -74,7 +74,7 @@ pub fn initialize_llm_registry(config: &LlmConfig) -> LlmResult<LlmRegistry> {
             continue;
         }
 
-        match RigProvider::from_config(provider_config) {
+        match Provider::from_config(provider_config) {
             Ok(provider) => {
                 let name = provider_config.provider_type.clone();
                 tracing::info!(provider = %name, "registered LLM provider");

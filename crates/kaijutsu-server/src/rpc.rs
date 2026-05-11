@@ -3338,7 +3338,7 @@ impl kernel::Server for KernelImpl {
                 // Validate provider before persisting — never write bad data
                 let config = kaijutsu_kernel::llm::ProviderConfig::new(&provider_name)
                     .with_default_model(&model);
-                match kaijutsu_kernel::llm::RigProvider::from_config(&config) {
+                match kaijutsu_kernel::llm::Provider::from_config(&config) {
                     Ok(new_provider) => {
                         // Provider is valid — now persist
                         {
