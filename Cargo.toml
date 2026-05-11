@@ -108,9 +108,8 @@ rig-core = "0.34"
 rmcp = { version = "1.4", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 
 # Vi-modal editing (keystroke → semantic action state machine)
-modalkit = { path = "../research/modalkit/crates/modalkit" }
-editor-types = { path = "../research/modalkit/crates/editor-types" }
-crossterm = "0.28.1"  # pinned by modalkit
+modalkit = "0.0.25"
+editor-types = "0.0.2"
 
 # System clipboard
 arboard = { version = "3", features = ["wayland-data-control"] }

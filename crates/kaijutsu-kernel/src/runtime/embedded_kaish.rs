@@ -231,7 +231,7 @@ impl EmbeddedKaish {
         code: &str,
         opts: ExecuteOptions,
     ) -> Result<ExecResult> {
-        self.kernel.execute_with_options(code, opts, None).await
+        self.kernel.execute_with_options(code, opts).await
     }
 
     /// Get a variable value.
