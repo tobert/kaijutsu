@@ -235,7 +235,7 @@ mod tests {
     async fn preset_save_and_list() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let ctx = register_context(&d, Some("ctx"), None, principal).await;
+        let ctx = register_context(&d, Some("ctx"), None, principal);
         let c = caller_with_context(ctx);
 
         let result = d
@@ -269,7 +269,7 @@ mod tests {
     async fn preset_save_update() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let ctx = register_context(&d, Some("ctx"), None, principal).await;
+        let ctx = register_context(&d, Some("ctx"), None, principal);
         let c = caller_with_context(ctx);
 
         // Create
@@ -294,7 +294,7 @@ mod tests {
     async fn preset_remove_requires_latch() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let ctx = register_context(&d, Some("ctx"), None, principal).await;
+        let ctx = register_context(&d, Some("ctx"), None, principal);
         let c = caller_with_context(ctx);
 
         d.dispatch(
@@ -313,7 +313,7 @@ mod tests {
     async fn preset_remove_confirmed() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let ctx = register_context(&d, Some("ctx"), None, principal).await;
+        let ctx = register_context(&d, Some("ctx"), None, principal);
         let c = caller_with_context(ctx);
 
         d.dispatch(

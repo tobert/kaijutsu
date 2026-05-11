@@ -6,7 +6,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use tokio::sync::{RwLock, broadcast};
+use parking_lot::RwLock;
+use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use crate::drift::DriftRouter;

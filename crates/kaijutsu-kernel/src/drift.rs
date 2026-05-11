@@ -27,7 +27,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tokio::sync::RwLock;
+use parking_lot::RwLock;
 
 use kaijutsu_crdt::{
     BlockKind, BlockSnapshot, ContextId, DriftKind, PrefixError, Role, resolve_context_prefix,
@@ -1063,46 +1063,39 @@ mod tests {
         assert!(prompt.contains("**Assistant**: Only this should appear."));
     }
 
-    #[tokio::test]
-    async fn test_shared_drift_on_fork() {
+    #[test]
+    fn test_shared_drift_on_fork() {
         // The SharedDriftRouter should be shareable across kernel fork/thread
         let router = shared_drift_router();
 
         // Register from "parent" side
         let parent_id = ContextId::new();
-        {
-            let mut r = router.write().await;
-            r.register(parent_id, Some("main"), None, PrincipalId::system()).unwrap();
-        }
+        router
+            .write()
+            .register(parent_id, Some("main"), None, PrincipalId::system())
+            .unwrap();
 
         // Clone the Arc (simulating what fork/thread does)
         let child_router = Arc::clone(&router);
 
         // Child should see the parent's contexts
-        let child_handle = {
-            let r = child_router.read().await;
-            r.get(parent_id).map(|h| h.label.clone())
-        };
+        let child_handle = child_router.read().get(parent_id).map(|h| h.label.clone());
         assert_eq!(child_handle, Some(Some("main".to_string())));
 
         // Child registers a new context
         let child_id = ContextId::new();
-        {
-            let mut r = child_router.write().await;
-            r.register(
+        child_router
+            .write()
+            .register(
                 child_id,
                 Some("debug-fork"),
                 Some(parent_id),
                 PrincipalId::system(),
-            ).unwrap();
-        }
+            )
+            .unwrap();
 
         // Parent should see the child's context
-        let parent_sees_child = {
-            let r = router.read().await;
-            r.get(child_id).is_some()
-        };
-        assert!(parent_sees_child);
+        assert!(router.read().get(child_id).is_some());
     }
 
     #[test]

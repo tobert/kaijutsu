@@ -51,7 +51,7 @@ impl KjDispatcher {
 
         // Resolve destination
         let target_id = {
-            let router = self.drift_router().read().await;
+            let router = self.drift_router().read();
             match router.resolve_context(dst_query) {
                 Ok(id) => id,
                 Err(e) => return KjResult::Err(format!("kj drift push: {e}")),
@@ -87,13 +87,13 @@ impl KjDispatcher {
 
         // Get source model for provenance
         let source_model = {
-            let router = self.drift_router().read().await;
+            let router = self.drift_router().read();
             router.get(context_id).and_then(|h| h.model.clone())
         };
 
         // Stage the drift
         let staged_id = {
-            let mut router = self.drift_router().write().await;
+            let mut router = self.drift_router().write();
             match router.stage(
                 context_id,
                 target_id,
@@ -153,7 +153,7 @@ impl KjDispatcher {
 
         // Insert drift block in caller's context
         let source_model = {
-            let router = self.drift_router().read().await;
+            let router = self.drift_router().read();
             router.get(source_id).and_then(|h| h.model.clone())
         };
         let after = self.block_store().last_block_id(context_id);
@@ -268,7 +268,7 @@ impl KjDispatcher {
 
         // Insert drift block into the TARGET (parent) context
         let source_model = {
-            let router = self.drift_router().read().await;
+            let router = self.drift_router().read();
             router.get(context_id).and_then(|h| h.model.clone())
         };
         let after = self.block_store().last_block_id(target_id);
@@ -344,7 +344,7 @@ impl KjDispatcher {
 
     async fn drift_flush(&self, caller: &KjCaller) -> KjResult {
         let staged = {
-            let mut router = self.drift_router().write().await;
+            let mut router = self.drift_router().write();
             router.drain(caller.context_id)
         };
 
@@ -406,18 +406,18 @@ impl KjDispatcher {
         // Requeue failures and drain dead letters
         let fail_count = failed.len();
         if !failed.is_empty() {
-            let mut router = self.drift_router().write().await;
+            let mut router = self.drift_router().write();
             router.requeue(failed);
         }
 
         // Drain dead letters (items that exceeded MAX_DRIFT_RETRIES) into lost+found
         let dead = {
-            let mut router = self.drift_router().write().await;
+            let mut router = self.drift_router().write();
             router.drain_dead_letter()
         };
         if !dead.is_empty() {
             let (lf_id, _is_new) = {
-                let mut router = self.drift_router().write().await;
+                let mut router = self.drift_router().write();
                 router.ensure_lost_found()
             };
             // create_document is idempotent (DashMap entry-based)
@@ -464,7 +464,7 @@ impl KjDispatcher {
     }
 
     async fn drift_queue(&self) -> KjResult {
-        let router = self.drift_router().read().await;
+        let router = self.drift_router().read();
         let queue = router.queue();
         KjResult::ok(format_drift_queue(queue))
     }
@@ -508,7 +508,7 @@ impl KjDispatcher {
             }
         };
 
-        let mut router = self.drift_router().write().await;
+        let mut router = self.drift_router().write();
         if router.cancel(id) {
             KjResult::ok(format!("cancelled drift #{}", id))
         } else {
@@ -530,8 +530,8 @@ mod tests {
     async fn drift_push_and_queue() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let src = register_context(&d, Some("src"), None, principal).await;
-        let _dst = register_context(&d, Some("dst"), None, principal).await;
+        let src = register_context(&d, Some("src"), None, principal);
+        let _dst = register_context(&d, Some("dst"), None, principal);
 
         let c = caller_with_context(src);
         let result = d
@@ -551,8 +551,8 @@ mod tests {
     async fn drift_cancel() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let src = register_context(&d, Some("a"), None, principal).await;
-        let _dst = register_context(&d, Some("b"), None, principal).await;
+        let src = register_context(&d, Some("a"), None, principal);
+        let _dst = register_context(&d, Some("b"), None, principal);
 
         let c = caller_with_context(src);
         d.dispatch(&[s("drift"), s("push"), s("b"), s("content")], &c)
@@ -571,7 +571,7 @@ mod tests {
     async fn drift_flush_empty() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let ctx = register_context(&d, Some("lonely"), None, principal).await;
+        let ctx = register_context(&d, Some("lonely"), None, principal);
 
         let c = caller_with_context(ctx);
         let result = d.dispatch(&[s("drift"), s("flush")], &c).await;
@@ -583,8 +583,8 @@ mod tests {
     async fn drift_flush_delivers() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let src = register_context(&d, Some("sender"), None, principal).await;
-        let dst = register_context(&d, Some("receiver"), None, principal).await;
+        let src = register_context(&d, Some("sender"), None, principal);
+        let dst = register_context(&d, Some("receiver"), None, principal);
 
         // Create target document so flush can insert
         d.block_store()
@@ -607,7 +607,7 @@ mod tests {
     async fn drift_history_empty() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let ctx = register_context(&d, Some("ctx"), None, principal).await;
+        let ctx = register_context(&d, Some("ctx"), None, principal);
 
         let c = caller_with_context(ctx);
         let result = d.dispatch(&[s("drift"), s("history")], &c).await;
@@ -652,8 +652,8 @@ mod tests {
     async fn drift_pull_no_blocks_error() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let src = register_context(&d, Some("src-ctx"), None, principal).await;
-        let dst = register_context(&d, Some("dst-ctx"), None, principal).await;
+        let src = register_context(&d, Some("src-ctx"), None, principal);
+        let dst = register_context(&d, Some("dst-ctx"), None, principal);
 
         // Create empty documents
         d.block_store()
@@ -677,7 +677,7 @@ mod tests {
     async fn drift_pull_cannot_pull_from_self() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let ctx = register_context(&d, Some("self-ctx"), None, principal).await;
+        let ctx = register_context(&d, Some("self-ctx"), None, principal);
 
         let c = caller_with_context(ctx);
         let result = d
@@ -695,7 +695,7 @@ mod tests {
     async fn drift_merge_no_parent() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let ctx = register_context(&d, Some("orphan"), None, principal).await;
+        let ctx = register_context(&d, Some("orphan"), None, principal);
 
         let c = caller_with_context(ctx);
         let result = d.dispatch(&[s("drift"), s("merge")], &c).await;
@@ -711,8 +711,8 @@ mod tests {
     async fn drift_merge_no_blocks_error() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let parent = register_context(&d, Some("parent"), None, principal).await;
-        let child = register_context(&d, Some("child"), Some(parent), principal).await;
+        let parent = register_context(&d, Some("parent"), None, principal);
+        let child = register_context(&d, Some("child"), Some(parent), principal);
 
         // Create empty documents
         d.block_store()
@@ -736,8 +736,8 @@ mod tests {
     async fn drift_push_missing_content() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let ctx = register_context(&d, Some("x"), None, principal).await;
-        let _dst = register_context(&d, Some("y"), None, principal).await;
+        let ctx = register_context(&d, Some("x"), None, principal);
+        let _dst = register_context(&d, Some("y"), None, principal);
 
         let c = caller_with_context(ctx);
         let result = d.dispatch(&[s("drift"), s("push"), s("y")], &c).await;
@@ -753,8 +753,8 @@ mod tests {
     async fn drift_push_missing_content_suggests_summarize() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let ctx = register_context(&d, Some("x"), None, principal).await;
-        let _dst = register_context(&d, Some("y"), None, principal).await;
+        let ctx = register_context(&d, Some("x"), None, principal);
+        let _dst = register_context(&d, Some("y"), None, principal);
 
         let c = caller_with_context(ctx);
         let result = d.dispatch(&[s("drift"), s("push"), s("y")], &c).await;
@@ -770,8 +770,8 @@ mod tests {
     async fn drift_push_summarize_empty_context_error() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let ctx = register_context(&d, Some("src"), None, principal).await;
-        let _dst = register_context(&d, Some("dst"), None, principal).await;
+        let ctx = register_context(&d, Some("src"), None, principal);
+        let _dst = register_context(&d, Some("dst"), None, principal);
 
         // Create empty document for source
         d.block_store()
@@ -795,8 +795,8 @@ mod tests {
         // Verify the basic flush path works and requeues on missing document
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let src = register_context(&d, Some("sender"), None, principal).await;
-        let dst_no_doc = register_context(&d, Some("nodoc"), None, principal).await;
+        let src = register_context(&d, Some("sender"), None, principal);
+        let dst_no_doc = register_context(&d, Some("nodoc"), None, principal);
 
         let c = caller_with_context(src);
 

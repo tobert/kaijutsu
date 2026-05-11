@@ -146,7 +146,7 @@ impl KjDispatcher {
             return KjResult::ok("No active context joined. Use 'kj context switch' to join one.");
         };
 
-        let router = self.drift_router().read().await;
+        let router = self.drift_router().read();
         let label = router
             .get(ctx_id)
             .and_then(|h| h.label.clone())
@@ -184,7 +184,7 @@ impl KjDispatcher {
                 }
                 // Get label for display
                 let label = {
-                    let router = self.drift_router().read().await;
+                    let router = self.drift_router().read();
                     router
                         .get(target_id)
                         .and_then(|h| h.label.clone())
@@ -277,7 +277,7 @@ impl KjDispatcher {
 
         // Register in DriftRouter
         {
-            let mut drift = self.drift_router().write().await;
+            let mut drift = self.drift_router().write();
             if let Err(e) = drift.register(new_id, Some(label), parent_id, caller.principal_id) {
                 return KjResult::Err(format!("kj context create: {e}"));
             }
@@ -346,7 +346,7 @@ impl KjDispatcher {
             }
         }
         {
-            let mut drift = self.drift_router().write().await;
+            let mut drift = self.drift_router().write();
             if let Err(e) = drift.register(new_id, Some(SCRATCH_LABEL), None, caller.principal_id) {
                 return KjResult::Err(format!("kj context scratch: {e}"));
             }
@@ -500,7 +500,7 @@ impl KjDispatcher {
 
         // Update DriftRouter (async, no db lock held)
         if let Some((p, m)) = model_for_drift {
-            let mut drift = self.drift_router().write().await;
+            let mut drift = self.drift_router().write();
             let _ = drift.configure_llm(target_id, &p, &m);
         }
 
@@ -702,7 +702,7 @@ impl KjDispatcher {
         // any active session can write a drift op that resurrects them — the
         // archive-while-joined bug from the constellation flow.
         {
-            let mut drift = self.drift_router().write().await;
+            let mut drift = self.drift_router().write();
             for id in &archived_ids {
                 let _ = drift.set_state(*id, ContextState::Archived);
             }
@@ -785,7 +785,7 @@ impl KjDispatcher {
         let _ = self.block_store().delete_document(target_id);
 
         // Unregister from DriftRouter (no db lock held)
-        let mut drift = self.drift_router().write().await;
+        let mut drift = self.drift_router().write();
         drift.unregister(target_id);
 
         KjResult::ok(format!("removed context '{}'", target_label))
@@ -854,7 +854,7 @@ impl KjDispatcher {
         }
 
         // Update DriftRouter labels (no db lock held)
-        let mut drift = self.drift_router().write().await;
+        let mut drift = self.drift_router().write();
         if let Some(ref old) = old_holder {
             let _ = drift.rename(old.context_id, None);
         }
@@ -889,8 +889,8 @@ mod tests {
     async fn context_list_shows_contexts() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let ctx_id = register_context(&d, Some("default"), None, principal).await;
-        let _ = register_context(&d, Some("alt"), None, principal).await;
+        let ctx_id = register_context(&d, Some("default"), None, principal);
+        let _ = register_context(&d, Some("alt"), None, principal);
 
         let c = caller_with_context(ctx_id);
         let result = d.dispatch(&[s("context"), s("list")], &c).await;
@@ -906,10 +906,10 @@ mod tests {
     async fn context_list_tree() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let root = register_context(&d, Some("root"), None, principal).await;
+        let root = register_context(&d, Some("root"), None, principal);
 
         // Add structural edge for child
-        let child = register_context(&d, Some("child"), Some(root), principal).await;
+        let child = register_context(&d, Some("child"), Some(root), principal);
         {
             let db = d.kernel_db().lock();
             db.insert_edge(&ContextEdgeRow {
@@ -937,7 +937,7 @@ mod tests {
     async fn context_info_current() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let ctx_id = register_context(&d, Some("myctx"), None, principal).await;
+        let ctx_id = register_context(&d, Some("myctx"), None, principal);
 
         let c = caller_with_context(ctx_id);
         let result = d.dispatch(&[s("context"), s("info")], &c).await;
@@ -976,8 +976,8 @@ mod tests {
     async fn context_switch_by_label() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let ctx_a = register_context(&d, Some("alpha"), None, principal).await;
-        let _ctx_b = register_context(&d, Some("beta"), None, principal).await;
+        let ctx_a = register_context(&d, Some("alpha"), None, principal);
+        let _ctx_b = register_context(&d, Some("beta"), None, principal);
 
         let c = caller_with_context(ctx_a);
         let result = d
@@ -996,7 +996,7 @@ mod tests {
     async fn context_switch_already_current() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let ctx = register_context(&d, Some("only"), None, principal).await;
+        let ctx = register_context(&d, Some("only"), None, principal);
 
         let c = caller_with_context(ctx);
         let result = d
@@ -1010,7 +1010,7 @@ mod tests {
     async fn context_create_basic() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let parent = register_context(&d, Some("parent"), None, principal).await;
+        let parent = register_context(&d, Some("parent"), None, principal);
 
         let c = caller_with_context(parent);
         let result = d
@@ -1037,7 +1037,7 @@ mod tests {
     async fn context_create_duplicate_label() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let parent = register_context(&d, Some("parent"), None, principal).await;
+        let parent = register_context(&d, Some("parent"), None, principal);
 
         let c = caller_with_context(parent);
         // First create succeeds
@@ -1062,7 +1062,7 @@ mod tests {
     async fn context_set_model() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let ctx = register_context(&d, Some("target"), None, principal).await;
+        let ctx = register_context(&d, Some("target"), None, principal);
 
         // Register mock provider so validation passes
         {
@@ -1094,7 +1094,7 @@ mod tests {
         );
 
         // Verify in DriftRouter
-        let router = d.drift_router().read().await;
+        let router = d.drift_router().read();
         let handle = router.get(ctx).unwrap();
         assert_eq!(handle.provider.as_deref(), Some("mock"));
         assert_eq!(handle.model.as_deref(), Some("test-model"));
@@ -1104,7 +1104,7 @@ mod tests {
     async fn context_set_invalid_provider_errors() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let ctx = register_context(&d, Some("target"), None, principal).await;
+        let ctx = register_context(&d, Some("target"), None, principal);
 
         let c = caller_with_context(ctx);
         let result = d
@@ -1131,8 +1131,8 @@ mod tests {
     async fn context_log_shows_lineage() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let root = register_context(&d, Some("root"), None, principal).await;
-        let child = register_context(&d, Some("child"), Some(root), principal).await;
+        let root = register_context(&d, Some("root"), None, principal);
+        let child = register_context(&d, Some("child"), Some(root), principal);
 
         let c = caller_with_context(child);
         let result = d.dispatch(&[s("context"), s("log")], &c).await;
@@ -1146,9 +1146,9 @@ mod tests {
     async fn context_move_reparent() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let a = register_context(&d, Some("a"), None, principal).await;
-        let b = register_context(&d, Some("b"), None, principal).await;
-        let child = register_context(&d, Some("child"), Some(a), principal).await;
+        let a = register_context(&d, Some("a"), None, principal);
+        let b = register_context(&d, Some("b"), None, principal);
+        let child = register_context(&d, Some("child"), Some(a), principal);
 
         // Insert original structural edge a → child
         {
@@ -1186,7 +1186,7 @@ mod tests {
     async fn context_archive_requires_latch() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let ctx = register_context(&d, Some("doomed"), None, principal).await;
+        let ctx = register_context(&d, Some("doomed"), None, principal);
 
         let c = caller_with_context(ctx);
         let result = d
@@ -1199,8 +1199,8 @@ mod tests {
     async fn context_archive_confirmed() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let parent = register_context(&d, Some("parent"), None, principal).await;
-        let target = register_context(&d, Some("target"), Some(parent), principal).await;
+        let parent = register_context(&d, Some("parent"), None, principal);
+        let target = register_context(&d, Some("target"), Some(parent), principal);
 
         let c = confirmed_caller(parent);
         let result = d
@@ -1226,12 +1226,12 @@ mod tests {
         // the next op (the constellation archive-while-joined bug).
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let parent = register_context(&d, Some("parent"), None, principal).await;
-        let target = register_context(&d, Some("target"), Some(parent), principal).await;
+        let parent = register_context(&d, Some("parent"), None, principal);
+        let target = register_context(&d, Some("target"), Some(parent), principal);
 
         // Sanity: target is Live in drift router pre-archive.
         {
-            let router = d.drift_router().read().await;
+            let router = d.drift_router().read();
             let h = router.get(target).expect("target registered");
             assert_eq!(h.state, kaijutsu_types::ContextState::Live);
         }
@@ -1243,7 +1243,7 @@ mod tests {
         assert!(result.is_ok(), "archive failed: {}", result.message());
 
         // Drift router state must reflect archive.
-        let router = d.drift_router().read().await;
+        let router = d.drift_router().read();
         let h = router.get(target).expect("still registered");
         assert_eq!(
             h.state,
@@ -1256,8 +1256,8 @@ mod tests {
     async fn context_remove_requires_latch() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let parent = register_context(&d, Some("parent"), None, principal).await;
-        let _target = register_context(&d, Some("victim"), Some(parent), principal).await;
+        let parent = register_context(&d, Some("parent"), None, principal);
+        let _target = register_context(&d, Some("victim"), Some(parent), principal);
 
         let c = caller_with_context(parent);
         let result = d
@@ -1270,8 +1270,8 @@ mod tests {
     async fn context_remove_confirmed() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let parent = register_context(&d, Some("parent"), None, principal).await;
-        let target = register_context(&d, Some("target"), Some(parent), principal).await;
+        let parent = register_context(&d, Some("parent"), None, principal);
+        let target = register_context(&d, Some("target"), Some(parent), principal);
 
         let c = confirmed_caller(parent);
         let result = d
@@ -1285,7 +1285,7 @@ mod tests {
 
         // Verify gone from DriftRouter
         drop(db);
-        let router = d.drift_router().read().await;
+        let router = d.drift_router().read();
         assert!(router.get(target).is_none());
     }
 
@@ -1293,7 +1293,7 @@ mod tests {
     async fn context_remove_cannot_remove_current() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let ctx = register_context(&d, Some("current"), None, principal).await;
+        let ctx = register_context(&d, Some("current"), None, principal);
 
         let c = confirmed_caller(ctx);
         let result = d
@@ -1306,7 +1306,7 @@ mod tests {
     async fn context_set_cwd() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let ctx = register_context(&d, Some("target"), None, principal).await;
+        let ctx = register_context(&d, Some("target"), None, principal);
 
         let c = caller_with_context(ctx);
         let result = d
@@ -1331,7 +1331,7 @@ mod tests {
     async fn context_set_env() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let ctx = register_context(&d, Some("target"), None, principal).await;
+        let ctx = register_context(&d, Some("target"), None, principal);
 
         let c = caller_with_context(ctx);
         let result = d
@@ -1364,7 +1364,7 @@ mod tests {
     async fn context_set_env_bad_format() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let ctx = register_context(&d, Some("target"), None, principal).await;
+        let ctx = register_context(&d, Some("target"), None, principal);
 
         let c = caller_with_context(ctx);
         let result = d
@@ -1389,7 +1389,7 @@ mod tests {
     async fn context_unset_env() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let ctx = register_context(&d, Some("target"), None, principal).await;
+        let ctx = register_context(&d, Some("target"), None, principal);
 
         // Set env var first
         {
@@ -1421,7 +1421,7 @@ mod tests {
     async fn context_unset_env_missing() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let ctx = register_context(&d, Some("target"), None, principal).await;
+        let ctx = register_context(&d, Some("target"), None, principal);
 
         let c = caller_with_context(ctx);
         let result = d
@@ -1441,7 +1441,7 @@ mod tests {
     async fn context_info_shows_shell_config() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let ctx = register_context(&d, Some("enriched"), None, principal).await;
+        let ctx = register_context(&d, Some("enriched"), None, principal);
 
         // Set shell config and env
         {

@@ -6,7 +6,7 @@ use kaijutsu_types::{ConsentMode, ContentType, ContextId, ContextState, EdgeKind
 
 use crate::kernel_db::{ContextEdgeRow, ContextRow, ContextShellRow};
 
-use super::parse::{extract_all_named_args, extract_named_arg, has_flag, parse_model_spec};
+use super::parse::{extract_named_arg, has_flag, parse_model_spec};
 use super::{KjCaller, KjDispatcher, KjResult};
 
 /// Resolved provider+model for a fork.
@@ -28,7 +28,7 @@ impl KjDispatcher {
 
         // Read parent's provider+model from DriftRouter (before any mutations)
         let (parent_provider, parent_model) = {
-            let router = self.drift_router().read().await;
+            let router = self.drift_router().read();
             router
                 .get(source_id)
                 .map(|h| (h.provider.clone(), h.model.clone()))
@@ -211,7 +211,7 @@ impl KjDispatcher {
 
         // Register in DriftRouter (inherits parent's model)
         {
-            let mut drift = self.drift_router().write().await;
+            let mut drift = self.drift_router().write();
             if let Err(e) =
                 drift.register_fork(new_id, label.as_deref(), source_id, caller.principal_id)
             {
@@ -417,7 +417,7 @@ impl KjDispatcher {
         }
 
         {
-            let mut drift = self.drift_router().write().await;
+            let mut drift = self.drift_router().write();
             if let Err(e) =
                 drift.register_fork(new_id, label.as_deref(), source_id, caller.principal_id)
             {
@@ -562,7 +562,7 @@ impl KjDispatcher {
         // Seed with distilled summary as a Drift block
         {
             let source_model = {
-                let router = self.drift_router().read().await;
+                let router = self.drift_router().read();
                 router.get(source_id).and_then(|h| h.model.clone())
             };
             if let Err(e) = self.block_store().insert_drift_block(
@@ -660,7 +660,7 @@ impl KjDispatcher {
         }
 
         {
-            let mut drift = self.drift_router().write().await;
+            let mut drift = self.drift_router().write();
             if let Err(e) =
                 drift.register_fork(new_id, label.as_deref(), source_id, caller.principal_id)
             {
@@ -926,7 +926,7 @@ impl KjDispatcher {
 
         // Register all new contexts in DriftRouter
         {
-            let mut drift = self.drift_router().write().await;
+            let mut drift = self.drift_router().write();
             for (row, _depth) in &template_nodes {
                 let new_id = id_map[&row.context_id];
                 let is_root = row.context_id == template_root_id;
@@ -1027,7 +1027,7 @@ impl KjDispatcher {
 
         // Update DriftRouter
         {
-            let mut drift = self.drift_router().write().await;
+            let mut drift = self.drift_router().write();
             if let (Some(p), Some(m)) = (&preset.provider, &preset.model) {
                 let _ = drift.configure_llm(context_id, p, m);
             }
@@ -1171,7 +1171,7 @@ mod tests {
     async fn fork_basic() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let source = register_context(&d, Some("source"), None, principal).await;
+        let source = register_context(&d, Some("source"), None, principal);
 
         // Create a document for the source context
         d.block_store()
@@ -1201,7 +1201,7 @@ mod tests {
     async fn fork_no_name() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let source = register_context(&d, Some("src"), None, principal).await;
+        let source = register_context(&d, Some("src"), None, principal);
         d.block_store()
             .create_document(source, crate::DocumentKind::Conversation, None)
             .unwrap();
@@ -1216,7 +1216,7 @@ mod tests {
     async fn fork_with_prompt() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let source = register_context(&d, Some("src"), None, principal).await;
+        let source = register_context(&d, Some("src"), None, principal);
         d.block_store()
             .create_document(source, crate::DocumentKind::Conversation, None)
             .unwrap();
@@ -1250,7 +1250,7 @@ mod tests {
     async fn fork_compact_empty_source_errors() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let source = register_context(&d, Some("empty-src"), None, principal).await;
+        let source = register_context(&d, Some("empty-src"), None, principal);
 
         // Create empty document
         d.block_store()
@@ -1280,7 +1280,7 @@ mod tests {
     async fn fork_inherits_config() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let source = register_context(&d, Some("src"), None, principal).await;
+        let source = register_context(&d, Some("src"), None, principal);
         d.block_store()
             .create_document(source, crate::DocumentKind::Conversation, None)
             .unwrap();
@@ -1319,7 +1319,7 @@ mod tests {
     async fn fork_pwd_override() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let source = register_context(&d, Some("src"), None, principal).await;
+        let source = register_context(&d, Some("src"), None, principal);
         d.block_store()
             .create_document(source, crate::DocumentKind::Conversation, None)
             .unwrap();
@@ -1376,7 +1376,7 @@ mod tests {
         provider: &str,
         model: &str,
     ) {
-        let mut drift = d.drift_router().write().await;
+        let mut drift = d.drift_router().write();
         let _ = drift.configure_llm(id, provider, model);
     }
 
@@ -1384,7 +1384,7 @@ mod tests {
     async fn fork_inherits_parent_model_in_db() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let source = register_context(&d, Some("parent"), None, principal).await;
+        let source = register_context(&d, Some("parent"), None, principal);
         d.block_store()
             .create_document(source, crate::DocumentKind::Conversation, None)
             .unwrap();
@@ -1419,7 +1419,7 @@ mod tests {
     async fn fork_model_flag_overrides_parent() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let source = register_context(&d, Some("parent"), None, principal).await;
+        let source = register_context(&d, Some("parent"), None, principal);
         d.block_store()
             .create_document(source, crate::DocumentKind::Conversation, None)
             .unwrap();
@@ -1453,7 +1453,7 @@ mod tests {
 
         // And in DriftRouter
         drop(db);
-        let drift = d.drift_router().read().await;
+        let drift = d.drift_router().read();
         let handle = drift
             .get(child.context_id)
             .expect("child should be in DriftRouter");
@@ -1465,7 +1465,7 @@ mod tests {
     async fn fork_invalid_provider_errors() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let source = register_context(&d, Some("parent"), None, principal).await;
+        let source = register_context(&d, Some("parent"), None, principal);
         d.block_store()
             .create_document(source, crate::DocumentKind::Conversation, None)
             .unwrap();
@@ -1506,7 +1506,7 @@ mod tests {
     async fn fork_bare_model_resolves_provider() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let source = register_context(&d, Some("parent"), None, principal).await;
+        let source = register_context(&d, Some("parent"), None, principal);
         d.block_store()
             .create_document(source, crate::DocumentKind::Conversation, None)
             .unwrap();
@@ -1550,7 +1550,7 @@ mod tests {
 
         // And in DriftRouter
         drop(db);
-        let drift = d.drift_router().read().await;
+        let drift = d.drift_router().read();
         let handle = drift
             .get(child.context_id)
             .expect("child should be in DriftRouter");
@@ -1571,7 +1571,7 @@ mod tests {
     async fn fork_returns_switch() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let source = register_context(&d, Some("parent"), None, principal).await;
+        let source = register_context(&d, Some("parent"), None, principal);
         d.block_store()
             .create_document(source, crate::DocumentKind::Conversation, None)
             .unwrap();
@@ -1594,7 +1594,7 @@ mod tests {
     async fn fork_inherits_workspace() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let source = register_context(&d, Some("src"), None, principal).await;
+        let source = register_context(&d, Some("src"), None, principal);
         d.block_store()
             .create_document(source, crate::DocumentKind::Conversation, None)
             .unwrap();

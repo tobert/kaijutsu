@@ -201,6 +201,14 @@ impl KjDispatcher {
     /// Dispatch a parsed argv to the appropriate subcommand.
     ///
     /// Expected argv: `["context", "list", "--tree"]` (no leading "kj").
+    #[tracing::instrument(
+        skip(self, argv, caller),
+        fields(
+            cmd = argv.first().map(|s| s.as_str()).unwrap_or(""),
+            ctx = caller.context_id.map(|c| c.short()).as_deref().unwrap_or("-"),
+            rc_depth = caller.rc_depth,
+        ),
+    )]
     pub async fn dispatch(&self, argv: &[String], caller: &KjCaller) -> KjResult {
         if argv.is_empty() {
             return KjResult::Err(self.help());
@@ -307,10 +315,11 @@ impl KjDispatcher {
 
         // Resolution order: explicit override > source context's model >
         // registry default.
-        let inherited = {
-            let router = self.drift.read().await;
-            router.get(context_id).and_then(|h| h.model.clone())
-        };
+        let inherited = self
+            .drift
+            .read()
+            .get(context_id)
+            .and_then(|h| h.model.clone());
         let chosen = distill_model
             .map(|s| s.to_string())
             .or(inherited);
@@ -407,7 +416,7 @@ pub(crate) mod test_helpers {
     }
 
     /// Register a context in both KernelDb and DriftRouter.
-    pub async fn register_context(
+    pub fn register_context(
         dispatcher: &KjDispatcher,
         label: Option<&str>,
         forked_from: Option<ContextId>,
@@ -458,10 +467,11 @@ pub(crate) mod test_helpers {
         }
 
         // Register in DriftRouter
-        {
-            let mut drift = dispatcher.drift_router().write().await;
-            drift.register(id, label, forked_from, created_by).unwrap();
-        }
+        dispatcher
+            .drift_router()
+            .write()
+            .register(id, label, forked_from, created_by)
+            .unwrap();
 
         id
     }

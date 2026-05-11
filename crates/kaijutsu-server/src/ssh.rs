@@ -351,6 +351,18 @@ impl Drop for ConnectionHandler {
 /// Run Cap'n Proto RPC over an SSH channel stream.
 ///
 /// Creates per-connection state and hands out a capability to the shared kernel.
+///
+/// Wedge defenses (the SSH/RPC connection from 2026-05-10):
+///   * `ConnectionState::Drop` cancels a per-connection token, so any
+///     `spawn_local` background task (FlowBus bridges, peer-invoke bridge)
+///     observes shutdown via `tokio::select!` rather than pinning the LocalSet.
+///   * `session_contexts` cleanup also lives in that Drop — used to live as
+///     an explicit `remove(&session_id)` here, but that line never ran when
+///     `rpc_system.await` got stuck.
+///   * A liveness watchdog (`run_watchdog`) logs at warning level every
+///     `RPC_WATCHDOG_INTERVAL` while the RPC system has not returned. Without
+///     thread injection there is no safe way to force-kill a wedged
+///     `current_thread` runtime from outside; the watchdog is for diagnosis.
 async fn run_rpc(
     stream: russh::ChannelStream<Msg>,
     principal: Principal,
@@ -377,16 +389,79 @@ async fn run_rpc(
     let rpc_system = RpcSystem::new(Box::new(network), Some(client.clone().client));
 
     log::info!(
-        "RPC session started for {} ({})",
+        "RPC session started for {} ({}) session={}",
         principal.username,
-        principal.display_name
+        principal.display_name,
+        session_id.short(),
     );
-    if let Err(e) = rpc_system.await {
-        log::error!("RPC system error for {}: {}", principal.username, e);
+
+    // Concurrent watchdog: logs if rpc_system stops responding. When
+    // rpc_system completes (Ok, Err, or returns from drop), we cancel the
+    // watchdog. If it doesn't complete because the LocalSet wedged, the
+    // watchdog still runs and surfaces the problem in logs.
+    let watchdog_cancel = tokio_util::sync::CancellationToken::new();
+    let watchdog_token = watchdog_cancel.clone();
+    let watchdog_username = principal.username.clone();
+    let watchdog_session = session_id;
+    let watchdog = tokio::task::spawn_local(async move {
+        run_rpc_watchdog(watchdog_token, watchdog_username, watchdog_session).await
+    });
+
+    let rpc_result = rpc_system.await;
+    watchdog_cancel.cancel();
+    let _ = watchdog.await;
+
+    match rpc_result {
+        Ok(()) => log::info!(
+            "RPC session ended cleanly for {} session={}",
+            principal.username,
+            session_id.short(),
+        ),
+        Err(e) => log::error!(
+            "RPC system error for {} session={}: {}",
+            principal.username,
+            session_id.short(),
+            e,
+        ),
     }
-    // Clean up per-session context tracking to prevent unbounded map growth.
-    session_contexts.remove(&session_id);
-    log::info!("RPC session ended for {}", principal.username);
+    // session_contexts cleanup lives in ConnectionState::Drop (RAII) so it
+    // can't be skipped when the future is dropped without completing.
+}
+
+/// Interval between watchdog "still alive" log lines.
+///
+/// Short enough that a wedged session shows up within a minute; long enough
+/// that healthy sessions don't spam.
+const RPC_WATCHDOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Watchdog companion to `run_rpc`. Logs while the RPC system is awaited.
+///
+/// Cancelled by the parent when `rpc_system` returns. If the LocalSet itself
+/// wedges (the failure mode this codebase has hit before), the watchdog
+/// keeps logging because it's on the same LocalSet — that's actually useful:
+/// if the watchdog also goes quiet, the wedge is at the executor level, not
+/// just one task.
+async fn run_rpc_watchdog(
+    cancel: tokio_util::sync::CancellationToken,
+    username: String,
+    session_id: kaijutsu_types::SessionId,
+) {
+    let start = std::time::Instant::now();
+    let mut tick = tokio::time::interval(RPC_WATCHDOG_INTERVAL);
+    tick.tick().await; // first tick fires immediately; drop it
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = tick.tick() => {
+                log::warn!(
+                    "RPC session for {} session={} still active after {:?}",
+                    username,
+                    session_id.short(),
+                    start.elapsed(),
+                );
+            }
+        }
+    }
 }
 
 /// Sanitize a username for use in anonymous mode.
@@ -466,18 +541,61 @@ impl server::Handler for ConnectionHandler {
 
         let stream = channel.into_stream();
         let registry = self.registry.clone();
+        let username_for_thread = principal.username.clone();
+        let session_label = format!(
+            "kjutsu-rpc-{}-{:?}",
+            principal.username,
+            self.peer_addr.as_ref().map(|a| a.port()).unwrap_or(0),
+        );
 
-        // Spawn RPC handler in a separate thread (capnp-rpc requires LocalSet)
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
+        // Spawn RPC handler in a separate thread (capnp-rpc requires LocalSet).
+        //
+        // Named so wedged threads show up identifiably in `ps -T` / `top -H`.
+        // We don't keep the JoinHandle: a wedged current_thread runtime can't
+        // be killed from outside safely. We rely on the per-task watchdog in
+        // `run_rpc` for diagnosability and the conn_cancel + per-callback
+        // timeouts inside `rpc.rs` to prevent the wedge in the first place.
+        // A panic on the RPC thread is logged but does not take down the
+        // server — the default panic hook plus this catch_unwind boundary
+        // contain damage to that one connection.
+        let builder = std::thread::Builder::new().name(session_label.clone());
+        if let Err(e) = builder.spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .expect("Failed to create tokio runtime for RPC");
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    log::error!(
+                        "Failed to build tokio runtime for {}: {}",
+                        username_for_thread, e,
+                    );
+                    return;
+                }
+            };
             let local = tokio::task::LocalSet::new();
-            local.block_on(&rt, async move {
-                run_rpc(stream, principal, registry).await;
-            });
-        });
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                local.block_on(&rt, async move {
+                    run_rpc(stream, principal, registry).await;
+                });
+            }));
+            if let Err(panic) = result {
+                let msg = panic.downcast_ref::<&'static str>().copied()
+                    .or_else(|| panic.downcast_ref::<String>().map(|s| s.as_str()))
+                    .unwrap_or("<non-string panic payload>");
+                log::error!(
+                    "RPC thread for {} panicked: {}",
+                    username_for_thread,
+                    msg,
+                );
+            }
+        }) {
+            log::error!(
+                "Failed to spawn RPC thread {}: {}",
+                session_label, e,
+            );
+            return Ok(false);
+        }
 
         Ok(true)
     }

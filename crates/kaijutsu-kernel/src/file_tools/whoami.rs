@@ -1,8 +1,7 @@
 //! WhoamiEngine — returns current context identity from the drift router.
 
+use parking_lot::RwLock;
 use std::sync::Arc;
-
-use tokio::sync::RwLock;
 
 use crate::drift::DriftRouter;
 use crate::execution::{ExecContext, ExecResult};
@@ -27,7 +26,7 @@ impl WhoamiEngine {
         _params: &str,
         ctx: &ExecContext,
     ) -> anyhow::Result<ExecResult> {
-        let router = self.drift_router.read().await;
+        let router = self.drift_router.read();
 
         let handle = router.get(ctx.context_id);
 

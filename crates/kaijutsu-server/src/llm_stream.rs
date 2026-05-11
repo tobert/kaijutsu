@@ -116,7 +116,7 @@ pub(crate) async fn spawn_llm_for_prompt(
     // Read per-context model from DriftRouter (quick read, release lock).
     // Capture label/state alongside for the situational system-prompt addendum.
     let (ctx_model, ctx_provider_name, ctx_label, ctx_state) = {
-        let drift = kernel_arc.drift().read().await;
+        let drift = kernel_arc.drift().read();
         // Guard: block LLM invocation while context is in Staging state
         if let Some(h) = drift.get(context_id) {
             if h.state == kaijutsu_types::ContextState::Staging {
@@ -272,17 +272,6 @@ mod consent_tests {
     #[test]
     fn autonomous_caps_at_twenty_iterations() {
         assert_eq!(iteration_cap_for_consent(ConsentMode::Autonomous), 20);
-    }
-}
-
-/// Map a tool's registry category to the appropriate `ToolKind`.
-///
-/// Categories in use: "kernel", "block", "drift", "file", "mcp".
-/// Only "mcp" maps to `Mcp`; everything else is `Builtin`.
-fn tool_kind_for_category(category: &str) -> TypesToolKind {
-    match category {
-        "mcp" => TypesToolKind::Mcp,
-        _ => TypesToolKind::Builtin,
     }
 }
 

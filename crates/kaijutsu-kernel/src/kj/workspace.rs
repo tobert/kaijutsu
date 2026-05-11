@@ -326,7 +326,7 @@ mod tests {
     async fn workspace_create_and_list() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let ctx = register_context(&d, Some("ctx"), None, principal).await;
+        let ctx = register_context(&d, Some("ctx"), None, principal);
         let c = caller_with_context(ctx);
 
         let result = d
@@ -357,7 +357,7 @@ mod tests {
     async fn workspace_create_with_paths() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let ctx = register_context(&d, Some("ctx"), None, principal).await;
+        let ctx = register_context(&d, Some("ctx"), None, principal);
         let c = caller_with_context(ctx);
 
         let result = d
@@ -393,7 +393,7 @@ mod tests {
     async fn workspace_add_path() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let ctx = register_context(&d, Some("ctx"), None, principal).await;
+        let ctx = register_context(&d, Some("ctx"), None, principal);
         let c = caller_with_context(ctx);
 
         d.dispatch(&[s("workspace"), s("create"), s("ws3")], &c)
@@ -419,7 +419,7 @@ mod tests {
     async fn workspace_bind_to_context() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let ctx = register_context(&d, Some("ctx"), None, principal).await;
+        let ctx = register_context(&d, Some("ctx"), None, principal);
         let c = caller_with_context(ctx);
 
         d.dispatch(&[s("workspace"), s("create"), s("ws4")], &c)
@@ -438,7 +438,7 @@ mod tests {
     async fn workspace_remove_requires_latch() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let ctx = register_context(&d, Some("ctx"), None, principal).await;
+        let ctx = register_context(&d, Some("ctx"), None, principal);
         let c = caller_with_context(ctx);
 
         d.dispatch(&[s("workspace"), s("create"), s("ws5")], &c)
@@ -454,7 +454,7 @@ mod tests {
     async fn workspace_remove_confirmed() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
-        let ctx = register_context(&d, Some("ctx"), None, principal).await;
+        let ctx = register_context(&d, Some("ctx"), None, principal);
 
         let c = caller_with_context(ctx);
         d.dispatch(&[s("workspace"), s("create"), s("ws6")], &c)

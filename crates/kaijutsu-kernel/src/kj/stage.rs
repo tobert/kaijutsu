@@ -53,7 +53,7 @@ impl KjDispatcher {
 
     fn require_staging(&self, context_id: ContextId) -> Result<(), KjResult> {
         let state = {
-            let drift = self.drift_router().blocking_read();
+            let drift = self.drift_router().read();
             drift.context_state(context_id)
         };
         match state {
@@ -74,7 +74,7 @@ impl KjDispatcher {
 
         // Transition DriftRouter
         {
-            let mut drift = self.drift_router().write().await;
+            let mut drift = self.drift_router().write();
             if let Err(e) = drift.set_state(context_id, ContextState::Live) {
                 return KjResult::Err(format!("kj stage commit: {e}"));
             }
@@ -96,7 +96,7 @@ impl KjDispatcher {
 
     fn stage_status(&self, context_id: ContextId) -> KjResult {
         let state = {
-            let drift = self.drift_router().blocking_read();
+            let drift = self.drift_router().read();
             drift
                 .context_state(context_id)
                 .unwrap_or(ContextState::Live)

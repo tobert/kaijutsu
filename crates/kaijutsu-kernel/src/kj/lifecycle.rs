@@ -69,6 +69,10 @@ fn verb_is_wired(verb: &str) -> bool {
 impl KjDispatcher {
     /// Run rc lifecycle scripts for `(context_type, verb)` against the
     /// **new** context. See module docs for failure semantics.
+    #[tracing::instrument(
+        skip(self, drift_info, caller),
+        fields(verb = %verb, ctx = %new_id.short(), rc_depth = caller.rc_depth),
+    )]
     pub async fn run_rc_lifecycle(
         &self,
         verb: &str,
@@ -878,9 +882,9 @@ esac
         );
 
         let principal = PrincipalId::new();
-        let dst = register_context(&d, Some("dst"), None, principal).await;
+        let dst = register_context(&d, Some("dst"), None, principal);
         set_context_type(&d, dst, "test");
-        let src = register_context(&d, Some("src"), None, principal).await;
+        let src = register_context(&d, Some("src"), None, principal);
 
         let caller = caller_with_context(dst);
         let res = d
@@ -933,9 +937,9 @@ esac
         );
 
         let principal = PrincipalId::new();
-        let parent = register_context(&d, Some("parent"), None, principal).await;
+        let parent = register_context(&d, Some("parent"), None, principal);
         set_context_type(&d, parent, "test");
-        let child = register_context(&d, Some("child"), Some(parent), principal).await;
+        let child = register_context(&d, Some("child"), Some(parent), principal);
 
         let caller = caller_with_context(child);
         let res = d
@@ -978,8 +982,8 @@ esac
         );
 
         let principal = PrincipalId::new();
-        let src = register_context(&d, Some("src"), None, principal).await;
-        let dst = register_context(&d, Some("dst"), None, principal).await;
+        let src = register_context(&d, Some("src"), None, principal);
+        let dst = register_context(&d, Some("dst"), None, principal);
         set_context_type(&d, dst, "test");
         // Flush requires a BlockStore document for the destination.
         d.block_store()
@@ -1038,8 +1042,8 @@ esac
         );
 
         let principal = PrincipalId::new();
-        let src = register_context(&d, Some("src"), None, principal).await;
-        let dst = register_context(&d, Some("dst"), None, principal).await;
+        let src = register_context(&d, Some("src"), None, principal);
+        let dst = register_context(&d, Some("dst"), None, principal);
         set_context_type(&d, dst, "test");
         d.block_store()
             .create_document(dst, crate::DocumentKind::Conversation, None)

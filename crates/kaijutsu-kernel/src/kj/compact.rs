@@ -87,7 +87,7 @@ impl KjDispatcher {
         // Insert Drift block at the boundary so the hydrator sees
         // `[drift, ...recent...]`. Source = self for in-place compaction.
         let source_model = {
-            let drift = self.drift_router().read().await;
+            let drift = self.drift_router().read();
             drift.get(ctx_id).and_then(|h| h.model.clone())
         };
         self.block_store()
