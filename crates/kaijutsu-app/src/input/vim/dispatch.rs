@@ -20,7 +20,7 @@ use modalkit::keybindings::BindingMachine;
 use super::keyconv::bevy_to_terminal_key;
 use super::motion::{self, MotionContext};
 use super::textutil;
-use super::{KaijutsuAction, KaijutsuInfo, VimMachineResource};
+use super::{KaijutsuInfo, VimMachineResource};
 use crate::input::action::Action;
 use crate::input::events::{ActionFired, TextInputReceived};
 
@@ -444,14 +444,8 @@ fn translate_action(
         }
 
         // --- Application-specific actions ---
-        MkAction::Application(app_action) => match app_action {
-            KaijutsuAction::Submit => {
-                action_writer.write(ActionFired(Action::Submit));
-            }
-            KaijutsuAction::DismissCompose => {
-                action_writer.write(ActionFired(Action::Unfocus));
-            }
-        },
+        // KaijutsuAction is an empty enum — modalkit can't construct one.
+        MkAction::Application(app_action) => match *app_action {},
 
         // --- Editor actions not yet handled ---
         MkAction::Editor(_) => {
@@ -675,19 +669,17 @@ mod tests {
     // with the exclusive-motion fix) handles it correctly.
 
     use modalkit::crossterm::event::{KeyCode as CtKeyCode, KeyEvent, KeyModifiers};
-    use modalkit::editing::store::Store;
     use modalkit::env::vim::keybindings::{VimBindings, VimMachine};
     use modalkit::key::TerminalKey;
     use modalkit::keybindings::{BindingMachine, InputBindings};
     use editor_types::Action as MkAction;
     use editor_types::EditorAction;
-    use crate::input::vim::{KaijutsuInfo, KaijutsuStore};
+    use crate::input::vim::KaijutsuInfo;
 
-    fn make_machine() -> (VimMachine<TerminalKey, KaijutsuInfo>, Store<KaijutsuInfo>) {
+    fn make_machine() -> VimMachine<TerminalKey, KaijutsuInfo> {
         let mut machine = VimMachine::<TerminalKey, KaijutsuInfo>::empty();
         VimBindings::default().submit_on_enter().setup(&mut machine);
-        let store = Store::new(KaijutsuStore);
-        (machine, store)
+        machine
     }
 
     fn key(code: CtKeyCode) -> TerminalKey {
@@ -707,7 +699,7 @@ mod tests {
 
     #[test]
     fn backspace_insert_mode_emits_delete() {
-        let (mut machine, _store) = make_machine();
+        let mut machine = make_machine();
 
         // Enter Insert mode with `i`.
         machine.input_key(key(CtKeyCode::Char('i')));
@@ -740,7 +732,7 @@ mod tests {
     fn backspace_insert_mode_action_shape() {
         // Pin the exact shape of the emitted action so future modalkit
         // changes don't silently break Insert-mode Backspace.
-        let (mut machine, _store) = make_machine();
+        let mut machine = make_machine();
         machine.input_key(key(CtKeyCode::Char('i')));
         let _ = drain_actions(&mut machine);
         machine.input_key(key(CtKeyCode::Backspace));

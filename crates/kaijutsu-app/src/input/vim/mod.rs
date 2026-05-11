@@ -18,40 +18,38 @@ use modalkit::editing::application::{
     ApplicationWindowId,
 };
 use modalkit::editing::context::EditContext;
-use modalkit::editing::store::Store;
 use modalkit::env::vim::keybindings::{VimBindings, VimMachine};
 use modalkit::key::TerminalKey;
-use modalkit::keybindings::{BindingMachine, InputBindings, SequenceStatus};
+use modalkit::keybindings::{InputBindings, SequenceStatus};
 use modalkit::prelude::CommandType;
 
 // ---------------------------------------------------------------------------
 // Application-specific types for modalkit
 // ---------------------------------------------------------------------------
 
-/// Actions specific to kaijutsu's compose overlay.
+/// Application-specific actions for kaijutsu's compose overlay.
+///
+/// Empty: our bindings produce only built-in modalkit actions (PromptAction,
+/// EditorAction, etc.) — submit and dismiss are wired via `submit_on_enter()`
+/// and the double-Escape gesture in `dismiss.rs`, not as application actions.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum KaijutsuAction {
-    /// Submit the compose buffer (Enter in Normal mode).
-    Submit,
-    /// Dismiss the compose overlay and return to conversation.
-    DismissCompose,
-}
+pub enum KaijutsuAction {}
 
 impl ApplicationAction for KaijutsuAction {
     fn is_edit_sequence(&self, _ctx: &EditContext) -> SequenceStatus {
-        SequenceStatus::Break
+        match *self {}
     }
 
     fn is_last_action(&self, _ctx: &EditContext) -> SequenceStatus {
-        SequenceStatus::Atom
+        match *self {}
     }
 
     fn is_last_selection(&self, _ctx: &EditContext) -> SequenceStatus {
-        SequenceStatus::Ignore
+        match *self {}
     }
 
     fn is_switchable(&self, _ctx: &EditContext) -> bool {
-        false
+        match *self {}
     }
 }
 
@@ -77,10 +75,11 @@ pub struct KaijutsuWindowId;
 impl ApplicationWindowId for KaijutsuWindowId {}
 
 /// Content identifier for buffers.
+///
+/// Only command-bar buffers exist as distinct ContentIds; the compose buffer
+/// itself lives in the DTE CRDT, not modalkit's store.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum KaijutsuContentId {
-    /// The compose input buffer.
-    Compose,
     /// Command bar buffer (: commands).
     Command(CommandType),
 }
@@ -121,8 +120,6 @@ unsafe impl Sync for VimMachineResource {}
 pub struct VimMachineResource {
     /// The vim keybinding state machine.
     pub machine: VimMachine<TerminalKey, KaijutsuInfo>,
-    /// Global editing store (registers, completions, etc.).
-    pub store: Store<KaijutsuInfo>,
 }
 
 impl VimMachineResource {
@@ -133,16 +130,7 @@ impl VimMachineResource {
     pub fn new() -> Self {
         let mut machine = VimMachine::<TerminalKey, KaijutsuInfo>::empty();
         VimBindings::default().submit_on_enter().setup(&mut machine);
-
-        let store = Store::new(KaijutsuStore);
-
-        VimMachineResource { machine, store }
-    }
-
-    /// Get a human-readable mode string (e.g. "-- INSERT --", "-- VISUAL --").
-    /// Returns None in Normal mode.
-    pub fn mode_display(&self) -> Option<String> {
-        self.machine.show_mode()
+        VimMachineResource { machine }
     }
 }
 
