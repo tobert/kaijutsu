@@ -337,9 +337,22 @@ took.
   4-breakpoint cap and duplicate-target dedupe now live in a
   `plan_cache()` pre-scan; drops produce `tracing::warn!` lines with
   the offending target. 27 build tests pass (15 baseline + 12 new),
-  660 kernel + 15 server unit tests pass. Storage (rc population path)
-  is the next slice — the carrier still defaults to empty until rc
-  scripts wire `kj cache breakpoint add` calls.
+  660 kernel + 15 server unit tests pass.
+- **2026-05-12** — Phase 2.7 landed: end-to-end cache breakpoint
+  populator path. Storage layer (`cache_breakpoints` table in
+  `KernelDb`, normalized per `feedback_sql_schema`), `kj cache
+  {list,add,clear}` subcommand callable from rc scripts via the kj
+  builtin MCP surface, and server-side dispatch
+  (`kaijutsu-server/src/llm_stream.rs`) now reads stored breakpoints
+  and threads them into `BuildOpts.cache_breakpoints`. Storage is
+  liberal — the 4-cap and dedupe stay in the wire layer so populators
+  don't have to second-guess. `kaijutsu-types` did NOT learn
+  `CacheTarget` / `CacheTtl` (still kernel-only); the kj MCP surface
+  takes primitive `--target`/`--index`/`--ttl` strings and reifies at
+  the boundary. 681 kernel + 15 server unit tests pass (added 10 DB
+  tests + 11 kj dispatcher tests). rc-on-create/fork/drift scripts
+  that call `kj cache add` are the next step — design-only for now,
+  no rc scripts ship in the repo.
 - **2026-05-11** — Phase 2.5 landed: thinking signature plumbing.
   `StreamEvent::ThinkingEnd` became a struct variant carrying
   `signature: Option<String>` (breaking change, small surface — one

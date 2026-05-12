@@ -8,6 +8,7 @@
 //! All commands go through `KjDispatcher`, which holds Arc refs to shared
 //! kernel state and is constructed once per server.
 
+pub mod cache;
 pub mod cas;
 pub mod compact;
 pub mod context;
@@ -247,6 +248,7 @@ impl KjDispatcher {
             "fork" => self.dispatch_fork(&argv[1..], caller).await,
             "stage" => self.dispatch_stage(&argv[1..], caller).await,
             "drift" => self.dispatch_drift(&argv[1..], caller).await,
+            "cache" => self.dispatch_cache(&argv[1..], caller),
             other => KjResult::Err(format!(
                 "kj: unknown command '{}'\n\n{}",
                 other,

@@ -44,6 +44,7 @@ kj drift merge
 ## Commands
 
 ```
+cache           list, add, clear — Claude prompt-cache breakpoints
 cas             put, get, ls, info, rm — content-addressed blob storage
 context (ctx)   list, info, switch, create, set, log, move, archive, remove, retag
 fork            Fork current context (--shallow, --compact, --as)

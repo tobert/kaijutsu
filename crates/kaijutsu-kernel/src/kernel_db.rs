@@ -17,6 +17,7 @@ use kaijutsu_types::{
     PrincipalId, WorkspaceId,
 };
 
+use crate::llm::stream::{CacheTarget, CacheTtl};
 use crate::mcp::binding::ContextToolBinding;
 use crate::mcp::types::InstanceId;
 
@@ -493,6 +494,30 @@ CREATE INDEX IF NOT EXISTS idx_rc_scripts_lookup
     ON rc_scripts (kernel_id, context_type, verb, sort_key, name);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_rc_scripts_path
     ON rc_scripts (kernel_id, path);
+
+-- ── Claude cache breakpoints (per-context policy) ───────────────
+-- Populated by rc lifecycle scripts (create/fork/drift) via the
+-- kj cache subcommand. Read at LLM stream build time and threaded
+-- into BuildOpts.cache_breakpoints. Normalized per
+-- feedback_sql_schema.md: one row per breakpoint, ordered by `seq`.
+--   target_kind  ∈ {'tools', 'system', 'message_index'}
+--   target_index NULL unless target_kind = 'message_index'
+--   ttl          ∈ {'ephemeral', 'extended'}
+-- The build layer (claude/build.rs) enforces Anthropic's 4-breakpoint
+-- cap and dedupes; storage stays liberal so populators don't have to
+-- second-guess the wire-layer policy. CASCADE on context delete.
+CREATE TABLE IF NOT EXISTS cache_breakpoints (
+    context_id   BLOB    NOT NULL REFERENCES contexts(context_id) ON DELETE CASCADE,
+    seq          INTEGER NOT NULL,
+    target_kind  TEXT    NOT NULL,
+    target_index INTEGER,
+    ttl          TEXT    NOT NULL,
+    created_at   INTEGER NOT NULL
+        DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
+    PRIMARY KEY (context_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_cache_breakpoints_ctx
+    ON cache_breakpoints(context_id);
 "#;
 
 // ============================================================================
@@ -612,6 +637,45 @@ fn read_edge_id(row: &rusqlite::Row<'_>, idx: usize) -> SqliteResult<uuid::Uuid>
             rusqlite::types::Type::Blob,
             "invalid UUID bytes".into(),
         ))
+    }
+}
+
+/// Wire a [`CacheTarget`] onto the three storage columns:
+/// `(target_kind, target_index, ttl)`. `target_index` is non-null only
+/// for `MessageIndex`. `ttl` is the lowercase variant name.
+fn encode_cache_target(target: &CacheTarget) -> (&'static str, Option<i64>, &'static str) {
+    let (kind, index) = match target {
+        CacheTarget::Tools(_) => ("tools", None),
+        CacheTarget::System(_) => ("system", None),
+        CacheTarget::MessageIndex(i, _) => ("message_index", Some(*i as i64)),
+    };
+    let ttl = match target.ttl() {
+        CacheTtl::Ephemeral => "ephemeral",
+        CacheTtl::Extended => "extended",
+    };
+    (kind, index, ttl)
+}
+
+/// Reverse of [`encode_cache_target`]. Returns `None` when the row carries
+/// an unrecognized `target_kind`, missing `target_index` for
+/// `message_index`, or an unrecognized `ttl` — the caller logs and skips.
+fn decode_cache_target(kind: &str, index: Option<i64>, ttl: &str) -> Option<CacheTarget> {
+    let ttl = match ttl {
+        "ephemeral" => CacheTtl::Ephemeral,
+        "extended" => CacheTtl::Extended,
+        _ => return None,
+    };
+    match kind {
+        "tools" => Some(CacheTarget::Tools(ttl)),
+        "system" => Some(CacheTarget::System(ttl)),
+        "message_index" => {
+            let i = index?;
+            if i < 0 {
+                return None;
+            }
+            Some(CacheTarget::MessageIndex(i as usize, ttl))
+        }
+        _ => None,
     }
 }
 
@@ -2552,6 +2616,96 @@ impl KernelDb {
     }
 
     // ========================================================================
+    // Claude cache breakpoints (per-context policy)
+    // ========================================================================
+
+    /// Append a cache breakpoint for `context_id`. The breakpoint takes the
+    /// next available `seq` slot, preserving declaration order across
+    /// subsequent reads. Storage is liberal — the 4-cap and dedupe live
+    /// in the Claude wire layer (`crate::llm::claude::build::plan_cache`),
+    /// not here, so rc populators can over-spec without storage rejecting
+    /// them.
+    pub fn add_cache_breakpoint(
+        &self,
+        context_id: ContextId,
+        target: &CacheTarget,
+    ) -> KernelDbResult<i64> {
+        let next_seq: i64 = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(MAX(seq), -1) + 1
+                 FROM cache_breakpoints WHERE context_id = ?1",
+                params![blob_param(context_id.as_bytes())],
+                |row| row.get(0),
+            )?;
+        let (kind, index, ttl) = encode_cache_target(target);
+        self.conn.execute(
+            "INSERT INTO cache_breakpoints
+                 (context_id, seq, target_kind, target_index, ttl)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                blob_param(context_id.as_bytes()),
+                next_seq,
+                kind,
+                index,
+                ttl,
+            ],
+        )?;
+        Ok(next_seq)
+    }
+
+    /// Read all cache breakpoints for `context_id`, ordered by insertion
+    /// (`seq` ASC). Rows with an unrecognized `target_kind` or `ttl`
+    /// are skipped with a `tracing::warn!` — storage is forwards-compatible
+    /// with future variants, but Claude's build layer must not see them.
+    pub fn list_cache_breakpoints(
+        &self,
+        context_id: ContextId,
+    ) -> KernelDbResult<Vec<CacheTarget>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT target_kind, target_index, ttl
+             FROM cache_breakpoints
+             WHERE context_id = ?1
+             ORDER BY seq ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![blob_param(context_id.as_bytes())], |row| {
+                let kind: String = row.get(0)?;
+                let index: Option<i64> = row.get(1)?;
+                let ttl: String = row.get(2)?;
+                Ok((kind, index, ttl))
+            })?
+            .collect::<SqliteResult<Vec<_>>>()?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (kind, index, ttl) in rows {
+            match decode_cache_target(&kind, index, &ttl) {
+                Some(t) => out.push(t),
+                None => {
+                    warn!(
+                        context = %context_id.short(),
+                        target_kind = %kind,
+                        target_index = ?index,
+                        ttl = %ttl,
+                        "cache breakpoint row dropped: unrecognized fields"
+                    );
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Delete all cache breakpoints for `context_id`. Returns the row count.
+    /// Used by rc-on-drift scripts that want to clear-then-rebuild after a
+    /// conversation reshape (compact, model swap, doc inject).
+    pub fn clear_cache_breakpoints(&self, context_id: ContextId) -> KernelDbResult<u64> {
+        let deleted = self.conn.execute(
+            "DELETE FROM cache_breakpoints WHERE context_id = ?1",
+            params![blob_param(context_id.as_bytes())],
+        )?;
+        Ok(deleted as u64)
+    }
+
+    // ========================================================================
     // Context Config Fork + Workspace Query
     // ========================================================================
 
@@ -4260,6 +4414,237 @@ mod tests {
         db.delete_context(ctx.context_id).unwrap();
         let vars = db.get_context_env(ctx.context_id).unwrap();
         assert!(vars.is_empty());
+    }
+
+    // ── Claude cache breakpoints ──────────────────────────────────────
+
+    #[test]
+    fn cache_breakpoints_empty_for_unknown_context() {
+        let db = KernelDb::in_memory().unwrap();
+        let bps = db.list_cache_breakpoints(ContextId::new()).unwrap();
+        assert!(bps.is_empty());
+    }
+
+    #[test]
+    fn cache_breakpoints_add_and_list_round_trip_all_variants() {
+        // Round-trip every CacheTarget variant plus both CacheTtl values
+        // — the table schema is right only if every shape survives a
+        // write+read.
+        let db = KernelDb::in_memory().unwrap();
+        let (kid, ws_id) = setup_test_db(&db);
+        let ctx = make_context_row(kid, Some("cache-rt"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+
+        db.add_cache_breakpoint(ctx.context_id, &CacheTarget::Tools(CacheTtl::Extended))
+            .unwrap();
+        db.add_cache_breakpoint(ctx.context_id, &CacheTarget::System(CacheTtl::Ephemeral))
+            .unwrap();
+        db.add_cache_breakpoint(
+            ctx.context_id,
+            &CacheTarget::MessageIndex(7, CacheTtl::Extended),
+        )
+        .unwrap();
+
+        let bps = db.list_cache_breakpoints(ctx.context_id).unwrap();
+        assert_eq!(bps.len(), 3);
+        assert_eq!(bps[0], CacheTarget::Tools(CacheTtl::Extended));
+        assert_eq!(bps[1], CacheTarget::System(CacheTtl::Ephemeral));
+        assert_eq!(bps[2], CacheTarget::MessageIndex(7, CacheTtl::Extended));
+    }
+
+    #[test]
+    fn cache_breakpoints_preserve_declaration_order_via_seq() {
+        // Insertion order must be preserved — populators (rc scripts)
+        // rely on this for the wire-layer's first-write-wins dedupe to
+        // produce predictable results.
+        let db = KernelDb::in_memory().unwrap();
+        let (kid, ws_id) = setup_test_db(&db);
+        let ctx = make_context_row(kid, Some("cache-order"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+
+        let seq0 = db
+            .add_cache_breakpoint(
+                ctx.context_id,
+                &CacheTarget::MessageIndex(0, CacheTtl::Ephemeral),
+            )
+            .unwrap();
+        let seq1 = db
+            .add_cache_breakpoint(
+                ctx.context_id,
+                &CacheTarget::MessageIndex(5, CacheTtl::Ephemeral),
+            )
+            .unwrap();
+        let seq2 = db
+            .add_cache_breakpoint(
+                ctx.context_id,
+                &CacheTarget::MessageIndex(2, CacheTtl::Ephemeral),
+            )
+            .unwrap();
+        assert_eq!(seq0, 0);
+        assert_eq!(seq1, 1);
+        assert_eq!(seq2, 2);
+
+        let bps = db.list_cache_breakpoints(ctx.context_id).unwrap();
+        assert_eq!(
+            bps,
+            vec![
+                CacheTarget::MessageIndex(0, CacheTtl::Ephemeral),
+                CacheTarget::MessageIndex(5, CacheTtl::Ephemeral),
+                CacheTarget::MessageIndex(2, CacheTtl::Ephemeral),
+            ],
+            "list must return breakpoints in insertion order, not sorted by index"
+        );
+    }
+
+    #[test]
+    fn cache_breakpoints_clear_returns_count_and_empties_list() {
+        let db = KernelDb::in_memory().unwrap();
+        let (kid, ws_id) = setup_test_db(&db);
+        let ctx = make_context_row(kid, Some("cache-clear"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+
+        db.add_cache_breakpoint(ctx.context_id, &CacheTarget::Tools(CacheTtl::Ephemeral))
+            .unwrap();
+        db.add_cache_breakpoint(ctx.context_id, &CacheTarget::System(CacheTtl::Ephemeral))
+            .unwrap();
+
+        assert_eq!(db.clear_cache_breakpoints(ctx.context_id).unwrap(), 2);
+        assert!(db.list_cache_breakpoints(ctx.context_id).unwrap().is_empty());
+
+        // Idempotent — clearing again returns 0.
+        assert_eq!(db.clear_cache_breakpoints(ctx.context_id).unwrap(), 0);
+    }
+
+    #[test]
+    fn cache_breakpoints_resume_seq_after_clear() {
+        // After clearing, the next add should start back at seq=0.
+        // This matters for rc-on-drift scripts that clear-then-rebuild
+        // — we don't want sequence numbers to grow unboundedly.
+        let db = KernelDb::in_memory().unwrap();
+        let (kid, ws_id) = setup_test_db(&db);
+        let ctx = make_context_row(kid, Some("cache-resume"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+
+        for _ in 0..3 {
+            db.add_cache_breakpoint(ctx.context_id, &CacheTarget::Tools(CacheTtl::Ephemeral))
+                .unwrap();
+        }
+        db.clear_cache_breakpoints(ctx.context_id).unwrap();
+
+        let new_seq = db
+            .add_cache_breakpoint(ctx.context_id, &CacheTarget::Tools(CacheTtl::Ephemeral))
+            .unwrap();
+        assert_eq!(new_seq, 0, "seq restarts at 0 after a full clear");
+    }
+
+    #[test]
+    fn cache_breakpoints_cascade_delete_on_context() {
+        // Context deletion must remove all of its breakpoints (via the
+        // FK ON DELETE CASCADE through contexts -> documents).
+        let db = KernelDb::in_memory().unwrap();
+        let (kid, ws_id) = setup_test_db(&db);
+        let ctx = make_context_row(kid, Some("cache-cascade"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+
+        db.add_cache_breakpoint(ctx.context_id, &CacheTarget::Tools(CacheTtl::Ephemeral))
+            .unwrap();
+        db.add_cache_breakpoint(
+            ctx.context_id,
+            &CacheTarget::MessageIndex(3, CacheTtl::Extended),
+        )
+        .unwrap();
+
+        db.delete_context(ctx.context_id).unwrap();
+
+        assert!(
+            db.list_cache_breakpoints(ctx.context_id).unwrap().is_empty(),
+            "context delete must cascade to cache_breakpoints"
+        );
+    }
+
+    #[test]
+    fn cache_breakpoints_storage_does_not_enforce_4_cap() {
+        // Storage is liberal — populators may add more than 4. The wire
+        // layer applies the cap. This test pins the policy choice.
+        let db = KernelDb::in_memory().unwrap();
+        let (kid, ws_id) = setup_test_db(&db);
+        let ctx = make_context_row(kid, Some("cache-nocap"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+
+        for i in 0..6 {
+            db.add_cache_breakpoint(
+                ctx.context_id,
+                &CacheTarget::MessageIndex(i, CacheTtl::Ephemeral),
+            )
+            .unwrap();
+        }
+        assert_eq!(db.list_cache_breakpoints(ctx.context_id).unwrap().len(), 6);
+    }
+
+    #[test]
+    fn cache_breakpoints_decode_drops_unrecognized_kind() {
+        // Forwards-compat: an unknown target_kind in the DB (e.g. from a
+        // future schema variant downgraded to this binary) must be
+        // silently skipped, not panic the read path.
+        let db = KernelDb::in_memory().unwrap();
+        let (kid, ws_id) = setup_test_db(&db);
+        let ctx = make_context_row(kid, Some("cache-future"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+
+        // Insert one good row and one row with a kind this binary doesn't know.
+        db.add_cache_breakpoint(ctx.context_id, &CacheTarget::Tools(CacheTtl::Ephemeral))
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO cache_breakpoints
+                     (context_id, seq, target_kind, target_index, ttl)
+                 VALUES (?1, 999, 'image_blocks', 4, 'ephemeral')",
+                params![blob_param(ctx.context_id.as_bytes())],
+            )
+            .unwrap();
+
+        let bps = db.list_cache_breakpoints(ctx.context_id).unwrap();
+        assert_eq!(bps.len(), 1, "unknown kind silently dropped");
+        assert_eq!(bps[0], CacheTarget::Tools(CacheTtl::Ephemeral));
+    }
+
+    #[test]
+    fn cache_breakpoints_decode_drops_unrecognized_ttl() {
+        let db = KernelDb::in_memory().unwrap();
+        let (kid, ws_id) = setup_test_db(&db);
+        let ctx = make_context_row(kid, Some("cache-future-ttl"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+
+        db.conn
+            .execute(
+                "INSERT INTO cache_breakpoints
+                     (context_id, seq, target_kind, target_index, ttl)
+                 VALUES (?1, 0, 'tools', NULL, 'eternal')",
+                params![blob_param(ctx.context_id.as_bytes())],
+            )
+            .unwrap();
+
+        assert!(db.list_cache_breakpoints(ctx.context_id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn cache_breakpoints_message_index_zero_round_trips() {
+        // Edge case the doc explicitly cares about: rc-on-fork drops
+        // MessageIndex(fork_at - 1); when fork_at is 1, that's
+        // MessageIndex(0). Make sure index 0 doesn't get confused with
+        // SQL NULL or default fallback.
+        let db = KernelDb::in_memory().unwrap();
+        let (kid, ws_id) = setup_test_db(&db);
+        let ctx = make_context_row(kid, Some("cache-idx0"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+
+        db.add_cache_breakpoint(
+            ctx.context_id,
+            &CacheTarget::MessageIndex(0, CacheTtl::Extended),
+        )
+        .unwrap();
+        let bps = db.list_cache_breakpoints(ctx.context_id).unwrap();
+        assert_eq!(bps, vec![CacheTarget::MessageIndex(0, CacheTtl::Extended)]);
     }
 
     // ── 25. Workspace paths with read_only ────────────────────────────

@@ -16,7 +16,8 @@ use std::sync::Arc;
 use tokio::sync::RwLock as TokioRwLock;
 
 use kaijutsu_crdt::{BlockKind, ContentType, Role, Status};
-use kaijutsu_kernel::llm::stream::{BuildOpts, StreamEvent};
+use kaijutsu_kernel::kernel_db::KernelDb;
+use kaijutsu_kernel::llm::stream::{BuildOpts, CacheTarget, StreamEvent};
 use kaijutsu_kernel::llm::{ContentBlock, ToolDefinition};
 use kaijutsu_kernel::{Kernel, LlmMessage, Provider, SharedBlockStore};
 use kaijutsu_types::ToolKind as TypesToolKind;
@@ -94,6 +95,7 @@ pub(crate) async fn spawn_llm_for_prompt(
 ) -> Result<(), capnp::Error> {
     let documents = kernel.documents.clone();
     let kernel_arc = kernel.kernel.clone();
+    let kernel_db = kernel.kernel_db.clone();
     let config_backend = kernel.config_backend.clone();
     let conversation_cache = kernel.conversation_cache.clone();
     let kj_dispatcher = kernel.kj_dispatcher.clone();
@@ -228,6 +230,7 @@ pub(crate) async fn spawn_llm_for_prompt(
         content,
         model_name,
         kernel_arc,
+        kernel_db,
         tools,
         after_block_id,
         system_prompt,
@@ -290,6 +293,7 @@ async fn process_llm_stream(
     content: String,
     model_name: String,
     kernel: Arc<Kernel>,
+    kernel_db: Arc<parking_lot::Mutex<KernelDb>>,
     tools: Vec<ToolDefinition>,
     after_block_id: kaijutsu_crdt::BlockId,
     system_prompt: String,
@@ -424,14 +428,34 @@ async fn process_llm_stream(
         );
 
         // Build shared-knob options. Provider-specific knobs (Claude
-        // cache_control, extended thinking, Gemini grounding) live as
-        // typed builder methods on the provider's native request — applied
-        // inside its `Client::stream()` based on configuration and context
-        // state, not threaded through here.
+        // extended thinking, Gemini grounding) live as typed builder
+        // methods on the provider's native request — applied inside
+        // its `Client::stream()` based on configuration and context
+        // state. The cache_breakpoints carrier is the one exception:
+        // it's a Claude-specific policy populated per-context by rc
+        // lifecycle scripts via `kj cache` (see
+        // `project_cache_breakpoint_policy`). A DB read failure here
+        // is non-fatal — we log and proceed without caching, since
+        // prompt caching is an optimization, not a correctness
+        // requirement.
+        let cache_breakpoints: Vec<CacheTarget> = {
+            let db = kernel_db.lock();
+            match db.list_cache_breakpoints(context_id) {
+                Ok(bps) => bps,
+                Err(e) => {
+                    log::warn!(
+                        "Failed to read cache breakpoints for {context_id}: {e} — proceeding without caching"
+                    );
+                    Vec::new()
+                }
+            }
+        };
+
         let build_opts = BuildOpts::new(&model_name)
             .with_system(&system_prompt)
             .with_max_tokens(max_output_tokens)
-            .with_tools(tools.clone());
+            .with_tools(tools.clone())
+            .with_cache_breakpoints(cache_breakpoints);
 
         // Start streaming with exponential backoff retry for transient failures.
         // Retries cover network blips and rate limits before any content is emitted;
