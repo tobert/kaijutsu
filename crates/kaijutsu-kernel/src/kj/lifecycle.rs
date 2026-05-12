@@ -308,6 +308,26 @@ async fn run_kai_script(
             "KJ_FORK_INFO".into(),
             kaish_kernel::ast::Value::String(json.to_string()),
         );
+        // Parent's block count at fork time = the number of blocks
+        // copied into the child (for shallow/full forks; for compact
+        // forks the child has a summary, so this is the
+        // pre-summarization size). rc-on-fork scripts use it to
+        // compute `MessageIndex(KJ_PARENT_BLOCK_COUNT - 1)` for the
+        // fork-point cache breakpoint without parsing JSON. Captured
+        // from the *parent's* BlockStore because the child's count
+        // already includes the fork-marker block injected before
+        // this rc hook fires (see kj/fork.rs:274).
+        if let Some(pid) = parent_id {
+            let count = dispatcher
+                .block_store()
+                .block_snapshots(pid)
+                .map(|b| b.len())
+                .unwrap_or(0);
+            vars.insert(
+                "KJ_PARENT_BLOCK_COUNT".into(),
+                kaish_kernel::ast::Value::String(count.to_string()),
+            );
+        }
     }
     if let Some(di) = drift_info {
         let json = serde_json::json!({
@@ -1166,6 +1186,140 @@ esac
             drift_marker, 0,
             "compact-fork must NOT fire drift rc on the new context; got {drift_marker} marker(s) in: {:?}",
             block_contents_in(&d, child_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn rc_fork_exposes_parent_block_count() {
+        // Verifies KJ_PARENT_BLOCK_COUNT carries the parent's
+        // BlockStore size at fork time — the number rc-on-fork scripts
+        // need to compute the MessageIndex(N - 1) fork-point cache
+        // breakpoint. Captured from the parent's BlockStore (not the
+        // child's) because the child's count already includes the
+        // fork-marker block by the time this rc hook fires.
+        let d = test_dispatcher().await;
+        install_script(
+            &d,
+            "/etc/rc/test/fork/S00-assert-parent-count.kai",
+            "test",
+            "fork",
+            "S00",
+            "assert-parent-count",
+            "kai",
+            // Three explicit assertions, each with a distinct exit code
+            // so a regression points at the right one:
+            //   exit 1 — env var missing
+            //   exit 2 — env var not a positive integer
+            //   exit 3 — env var doesn't match the seeded count of 3
+            r#"
+test -n "$KJ_PARENT_BLOCK_COUNT" || exit 1
+case "$KJ_PARENT_BLOCK_COUNT" in
+  ''|*[!0-9]*) exit 2 ;;
+esac
+case "$KJ_PARENT_BLOCK_COUNT" in
+  3) ;;
+  *) exit 3 ;;
+esac
+"#,
+        );
+
+        // Parent context, typed "test" so the fork hook above fires.
+        let caller = unjoined_caller();
+        let r = d
+            .dispatch(
+                &argv(&["context", "create", "parent", "--type", "test"]),
+                &caller,
+            )
+            .await;
+        assert!(r.is_ok(), "create parent failed: {}", r.message());
+        let parent_id = lookup_context_id(&d, "parent");
+
+        // `kj context create` writes KernelDb but doesn't seed the
+        // BlockStore unless an rc-on-create script does. Seed it
+        // explicitly so we can insert exactly the count we want.
+        d.block_store()
+            .create_document(parent_id, crate::DocumentKind::Conversation, None)
+            .unwrap();
+
+        // Seed exactly 3 blocks. The rc script's case match pins this.
+        for content in ["a", "b", "c"] {
+            d.block_store()
+                .insert_block_as(
+                    parent_id,
+                    None,
+                    None,
+                    Role::User,
+                    BlockKind::Text,
+                    content.to_string(),
+                    Status::Done,
+                    ContentType::Plain,
+                    Some(PrincipalId::system()),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            d.block_store()
+                .block_snapshots(parent_id)
+                .unwrap()
+                .len(),
+            3,
+            "parent must have exactly 3 blocks before fork — drives the rc script's case match"
+        );
+
+        // Fork. Parent's blocks copy into the child, then the fork
+        // marker injects (taking the child's count to >3), then
+        // rc-on-fork runs and reads KJ_PARENT_BLOCK_COUNT.
+        let fork_caller = caller_with_context(parent_id);
+        let r = d
+            .dispatch(&argv(&["fork", "--name", "child"]), &fork_caller)
+            .await;
+        assert!(r.is_ok(), "fork failed: {}", r.message());
+
+        let child_id = lookup_context_id(&d, "child");
+        let kinds = block_kinds_in(&d, child_id);
+        assert!(
+            !kinds.contains(&BlockKind::Error),
+            "rc-on-fork assertions tripped; kinds: {kinds:?}, contents: {:?}",
+            block_contents_in(&d, child_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn rc_create_omits_parent_block_count() {
+        // KJ_PARENT_BLOCK_COUNT is fork-only — rc-on-create has no
+        // parent, so the var must be absent (not "0", not "").
+        let d = test_dispatcher().await;
+        install_script(
+            &d,
+            "/etc/rc/test/create/S00-no-parent-count.kai",
+            "test",
+            "create",
+            "S00",
+            "no-parent-count",
+            "kai",
+            // Exit 99 if the var is set to anything. Empty/unset env
+            // vars in kaish expand to empty string under `$VAR`, so
+            // `test -z` catches both.
+            r#"
+test -z "$KJ_PARENT_BLOCK_COUNT" || exit 99
+"#,
+        );
+
+        let caller = unjoined_caller();
+        let r = d
+            .dispatch(
+                &argv(&["context", "create", "solo", "--type", "test"]),
+                &caller,
+            )
+            .await;
+        assert!(r.is_ok(), "create failed: {}", r.message());
+
+        let id = lookup_context_id(&d, "solo");
+        let kinds = block_kinds_in(&d, id);
+        assert!(
+            !kinds.contains(&BlockKind::Error),
+            "create rc must not see KJ_PARENT_BLOCK_COUNT; kinds: {kinds:?}, contents: {:?}",
+            block_contents_in(&d, id)
         );
     }
 
