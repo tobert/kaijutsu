@@ -252,7 +252,7 @@ struct NotificationPayload {
   kind @1 :NotificationKind;
   hasLevel @2 :Bool;            # True iff `level` applies (Log events)
   level @3 :LogLevel;
-  tool @4 :Text;                # ToolAdded/Removed — empty = None
+  tools @4 :List(Text);         # ToolAdded/Removed — names in the batch (1+); empty otherwise
   hasCount @5 :Bool;            # True iff `count` applies (Coalesced)
   count @6 :UInt32;
   detail @7 :Text;              # Expandable body — empty = None

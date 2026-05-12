@@ -586,8 +586,13 @@ impl std::fmt::Display for NotificationKind {
 /// Structured notification payload attached to `BlockKind::Notification` blocks.
 ///
 /// The emitting broker populates `instance` (the MCP server identifier),
-/// `kind` (what happened), and kind-specific fields (`tool` for ToolAdded/Removed,
+/// `kind` (what happened), and kind-specific fields (`tools` for ToolAdded/Removed,
 /// `level` + `detail` for Log, `count` for Coalesced).
+///
+/// `tools` is always a list (possibly empty). A single ToolAdded/ToolRemoved
+/// event carries one entry; a batched event (e.g. all tools exposed by an
+/// instance at register/bind time) carries many. Consumers walk the list
+/// instead of branching between singular/plural shapes.
 ///
 /// `BlockSnapshot.content` carries the one-line summary; `detail` carries the
 /// expandable body, truncated in LLM hydration.
@@ -600,10 +605,14 @@ pub struct NotificationPayload {
     /// Severity for `Log` notifications. `None` for structural events.
     #[serde(default)]
     pub level: Option<LogLevel>,
-    /// Tool name for `ToolAdded` / `ToolRemoved`.
+    /// Tool names referenced by this event. Empty for `PromptsChanged` and
+    /// for `Log` notifications without an attributed tool. Always at least
+    /// one entry for `ToolAdded` / `ToolRemoved`.
     #[serde(default)]
-    pub tool: Option<String>,
-    /// Collapsed count for `Coalesced` summaries.
+    pub tools: Vec<String>,
+    /// Collapsed count for `Coalesced` summaries. For `ToolAdded` /
+    /// `ToolRemoved`, equals `tools.len()` and is set primarily so external
+    /// readers can see the batch size without inspecting the list.
     #[serde(default)]
     pub count: Option<usize>,
     /// Expandable body — log message, coalesced-kind hint, etc.
@@ -617,14 +626,12 @@ impl NotificationPayload {
     /// supply an explicit summary string.
     pub fn summary_line(&self) -> String {
         match self.kind {
-            NotificationKind::ToolAdded => match &self.tool {
-                Some(t) => format!("[{}] tool added: {}", self.instance, t),
-                None => format!("[{}] tool added", self.instance),
-            },
-            NotificationKind::ToolRemoved => match &self.tool {
-                Some(t) => format!("[{}] tool removed: {}", self.instance, t),
-                None => format!("[{}] tool removed", self.instance),
-            },
+            NotificationKind::ToolAdded => {
+                format!("[{}] {}", self.instance, format_tool_change("added", &self.tools))
+            }
+            NotificationKind::ToolRemoved => {
+                format!("[{}] {}", self.instance, format_tool_change("removed", &self.tools))
+            }
             NotificationKind::Log => {
                 let level = self
                     .level
@@ -653,6 +660,21 @@ impl NotificationPayload {
     }
 }
 
+/// Render the `tools` list for a `ToolAdded` / `ToolRemoved` summary line.
+///
+/// - 0 tools (degenerate — broker should not emit this): `"tools <verb>"`.
+/// - 1 tool: `"tool <verb>: name"`.
+/// - 2–3 tools: `"3 tools <verb>: a, b, c"`.
+/// - >3 tools: `"N tools <verb>: a, b, c, …"` (first 3 names, then ellipsis).
+fn format_tool_change(verb: &str, tools: &[String]) -> String {
+    match tools.len() {
+        0 => format!("tools {}", verb),
+        1 => format!("tool {}: {}", verb, tools[0]),
+        n if n <= 3 => format!("{} tools {}: {}", n, verb, tools.join(", ")),
+        n => format!("{} tools {}: {}, …", n, verb, tools[..3].join(", ")),
+    }
+}
+
 /// Maximum chars of `NotificationPayload.detail` included in LLM hydration.
 /// Measured in Unicode scalar values, not bytes. Smaller than the error budget
 /// because notifications are more frequent and rarely need full fidelity.
@@ -675,8 +697,8 @@ pub fn format_notification_for_llm(block: &BlockSnapshot) -> String {
     if let Some(level) = payload.level {
         attrs.push_str(&format!(" level=\"{}\"", level));
     }
-    if let Some(ref tool) = payload.tool {
-        attrs.push_str(&format!(" tool=\"{}\"", tool));
+    if !payload.tools.is_empty() {
+        attrs.push_str(&format!(" tools=\"{}\"", payload.tools.join(",")));
     }
     if let Some(count) = payload.count {
         attrs.push_str(&format!(" count=\"{}\"", count));
@@ -4150,8 +4172,8 @@ mod tests {
             instance: "builtin.block".into(),
             kind: NotificationKind::ToolAdded,
             level: None,
-            tool: Some("block_create".into()),
-            count: None,
+            tools: vec!["block_create".into()],
+            count: Some(1),
             detail: None,
         }
     }
@@ -4171,7 +4193,7 @@ mod tests {
             instance: "gpal".into(),
             kind: NotificationKind::Log,
             level: Some(LogLevel::Warn),
-            tool: None,
+            tools: Vec::new(),
             count: None,
             detail: Some("retrying after 503\nnext delay 2s".into()),
         };
@@ -4187,7 +4209,7 @@ mod tests {
             instance: "gpal".into(),
             kind: NotificationKind::Coalesced,
             level: None,
-            tool: None,
+            tools: Vec::new(),
             count: Some(12),
             detail: Some("log".into()),
         };
@@ -4288,7 +4310,7 @@ mod tests {
             instance: "gpal".into(),
             kind: NotificationKind::Log,
             level: Some(LogLevel::Warn),
-            tool: None,
+            tools: Vec::new(),
             count: None,
             detail: Some("upstream timeout".into()),
         };
@@ -4312,7 +4334,7 @@ mod tests {
             instance: "gpal".into(),
             kind: NotificationKind::Log,
             level: Some(LogLevel::Error),
-            tool: None,
+            tools: Vec::new(),
             count: None,
             detail: Some(long),
         };

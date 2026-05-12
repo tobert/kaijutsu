@@ -679,7 +679,7 @@ async fn server_notification_reaches_llm_hydrator() {
         .expect("notification payload must survive CRDT storage");
     assert_eq!(payload.kind, NotificationKind::ToolAdded);
     assert_eq!(payload.instance, "test.hydrator");
-    assert_eq!(payload.tool.as_deref(), Some("fail"));
+    assert_eq!(payload.tools, vec!["fail".to_string()]);
 
     // Feed the full block stream through the LLM hydrator — the same
     // function `build_tool_definitions` feeds on every LLM spawn. The
@@ -700,7 +700,7 @@ async fn server_notification_reaches_llm_hydrator() {
         .expect("envelope message is text");
     assert!(text.contains("instance=\"test.hydrator\""));
     assert!(text.contains("kind=\"tool_added\""));
-    assert!(text.contains("tool=\"fail\""));
+    assert!(text.contains("tools=\"fail\""));
 }
 
 /// Phase 3 M4 end-to-end: `Broker::read_resource` + `Broker::subscribe`

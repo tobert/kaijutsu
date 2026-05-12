@@ -2105,10 +2105,15 @@ pub(crate) fn parse_block_snapshot(
         } else {
             None
         };
-        let tool = np.get_tool().ok()
-            .and_then(|s| s.to_str().ok())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string());
+        let tools: Vec<String> = np
+            .get_tools()
+            .ok()
+            .map(|list| {
+                (0..list.len())
+                    .filter_map(|i| list.get(i).ok().and_then(|s| s.to_str().ok()).map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
         let count = if np.get_has_count() {
             Some(np.get_count() as usize)
         } else {
@@ -2122,7 +2127,7 @@ pub(crate) fn parse_block_snapshot(
             instance,
             kind,
             level,
-            tool,
+            tools,
             count,
             detail,
         });
@@ -2491,8 +2496,13 @@ mod tests {
                     kaijutsu_types::LogLevel::Error => crate::kaijutsu_capnp::LogLevel::Error,
                 });
             }
-            if let Some(ref tool) = payload.tool {
-                np.set_tool(tool);
+            if !payload.tools.is_empty() {
+                let mut tools_builder = np
+                    .reborrow()
+                    .init_tools(payload.tools.len() as u32);
+                for (i, name) in payload.tools.iter().enumerate() {
+                    tools_builder.set(i as u32, name);
+                }
             }
             if let Some(count) = payload.count {
                 np.set_has_count(true);
@@ -2646,7 +2656,7 @@ mod tests {
             instance: "gpal".into(),
             kind: kaijutsu_types::NotificationKind::Log,
             level: Some(kaijutsu_types::LogLevel::Warn),
-            tool: Some("consult_gemini".into()),
+            tools: vec!["consult_gemini".into()],
             count: Some(3),
             detail: Some("upstream timeout; retrying".into()),
         };
@@ -2672,7 +2682,7 @@ mod tests {
             instance: "builtin.block".into(),
             kind: kaijutsu_types::NotificationKind::PromptsChanged,
             level: None,
-            tool: None,
+            tools: Vec::new(),
             count: None,
             detail: None,
         };
@@ -2690,7 +2700,10 @@ mod tests {
             kaijutsu_types::NotificationKind::PromptsChanged
         );
         assert_eq!(parsed_payload.level, None, "has_level=false must yield None");
-        assert_eq!(parsed_payload.tool, None, "empty tool must yield None");
+        assert!(
+            parsed_payload.tools.is_empty(),
+            "empty tools list must roundtrip empty"
+        );
         assert_eq!(parsed_payload.count, None, "has_count=false must yield None");
         assert_eq!(parsed_payload.detail, None, "empty detail must yield None");
     }
@@ -2713,7 +2726,7 @@ mod tests {
                 instance: "svc".into(),
                 kind,
                 level: None,
-                tool: None,
+                tools: Vec::new(),
                 count: None,
                 detail: None,
             };
@@ -2809,7 +2822,7 @@ mod tests {
                 instance: "svc".into(),
                 kind: kaijutsu_types::NotificationKind::Log,
                 level: Some(level),
-                tool: None,
+                tools: Vec::new(),
                 count: None,
                 detail: Some("m".into()),
             };

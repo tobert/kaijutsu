@@ -5601,8 +5601,13 @@ fn set_block_snapshot(
                 kaijutsu_crdt::LogLevel::Error => crate::kaijutsu_capnp::LogLevel::Error,
             });
         }
-        if let Some(ref tool) = payload.tool {
-            np.set_tool(tool);
+        if !payload.tools.is_empty() {
+            let mut tools_builder = np
+                .reborrow()
+                .init_tools(payload.tools.len() as u32);
+            for (i, name) in payload.tools.iter().enumerate() {
+                tools_builder.set(i as u32, name);
+            }
         }
         if let Some(count) = payload.count {
             np.set_has_count(true);

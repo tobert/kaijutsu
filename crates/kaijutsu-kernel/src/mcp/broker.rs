@@ -405,20 +405,22 @@ impl Broker {
             .await
             .insert(id.clone(), initial_tools.clone());
 
-        // Emit synthetic ToolAdded blocks for each tool the server exposes,
-        // unless this is a silent registration.
-        if emit_tool_added {
-            for tool in &initial_tools {
-                let payload = NotificationPayload {
-                    instance: id.as_str().to_string(),
-                    kind: kaijutsu_types::NotificationKind::ToolAdded,
-                    level: None,
-                    tool: Some(tool.name.clone()),
-                    count: None,
-                    detail: None,
-                };
-                self.emit_for_bindings(&id, payload).await;
-            }
+        // Emit a single synthetic ToolAdded block listing every tool the
+        // server exposes, unless this is a silent registration. One block
+        // per (instance, batch) keeps the conversation document small when
+        // an instance exposes many tools (D-35 coalesced).
+        if emit_tool_added && !initial_tools.is_empty() {
+            let names: Vec<String> = initial_tools.iter().map(|t| t.name.clone()).collect();
+            let count = names.len();
+            let payload = NotificationPayload {
+                instance: id.as_str().to_string(),
+                kind: kaijutsu_types::NotificationKind::ToolAdded,
+                level: None,
+                tools: names,
+                count: Some(count),
+                detail: None,
+            };
+            self.emit_for_bindings(&id, payload).await;
         }
 
         // Spawn pump subscribed to this server's notification stream. Aborted
@@ -534,13 +536,15 @@ impl Broker {
         self.teardown_subscriptions_for_instance(id, server_arc.as_ref())
             .await;
 
-        for tool in removed_tools {
+        if !removed_tools.is_empty() {
+            let names: Vec<String> = removed_tools.into_iter().map(|t| t.name).collect();
+            let count = names.len();
             let payload = NotificationPayload {
                 instance: id.as_str().to_string(),
                 kind: kaijutsu_types::NotificationKind::ToolRemoved,
                 level: None,
-                tool: Some(tool.name),
-                count: None,
+                tools: names,
+                count: Some(count),
                 detail: None,
             };
             self.emit_for_bindings(id, payload).await;
@@ -680,35 +684,42 @@ impl Broker {
         pairs
     }
 
-    /// Fire per-tool `ToolAdded` / `ToolRemoved` into a specific context for
-    /// the set-difference between old and new pair sets.
+    /// Fire per-instance `ToolAdded` / `ToolRemoved` into a specific context
+    /// for the set-difference between old and new pair sets. Tool names are
+    /// grouped by instance so each instance's diff is one notification block
+    /// — not one block per tool (D-35 coalesced). Tool names within a batch
+    /// are sorted for stable summary lines across runs.
     async fn emit_binding_diff(
         &self,
         context_id: ContextId,
         old_pairs: &HashSet<(InstanceId, String)>,
         new_pairs: &HashSet<(InstanceId, String)>,
     ) {
-        for (instance, tool) in new_pairs.difference(old_pairs) {
+        let added = group_pairs_by_instance(new_pairs.difference(old_pairs));
+        let removed = group_pairs_by_instance(old_pairs.difference(new_pairs));
+        for (instance, tools) in added {
+            let count = tools.len();
             let payload = NotificationPayload {
                 instance: instance.as_str().to_string(),
                 kind: kaijutsu_types::NotificationKind::ToolAdded,
                 level: None,
-                tool: Some(tool.clone()),
-                count: None,
+                tools,
+                count: Some(count),
                 detail: None,
             };
-            self.emit_for_context(context_id, instance, payload).await;
+            self.emit_for_context(context_id, &instance, payload).await;
         }
-        for (instance, tool) in old_pairs.difference(new_pairs) {
+        for (instance, tools) in removed {
+            let count = tools.len();
             let payload = NotificationPayload {
                 instance: instance.as_str().to_string(),
                 kind: kaijutsu_types::NotificationKind::ToolRemoved,
                 level: None,
-                tool: Some(tool.clone()),
-                count: None,
+                tools,
+                count: Some(count),
                 detail: None,
             };
-            self.emit_for_context(context_id, instance, payload).await;
+            self.emit_for_context(context_id, &instance, payload).await;
         }
     }
 
@@ -1753,7 +1764,7 @@ impl Broker {
                     instance: instance_for_task.as_str().to_string(),
                     kind: kaijutsu_types::NotificationKind::Coalesced,
                     level: None,
-                    tool: None,
+                    tools: Vec::new(),
                     count: Some(count),
                     detail: Some(notif_kind_label(kind).to_string()),
                 };
@@ -1835,6 +1846,10 @@ enum PhaseOutcome {
 /// `match_tool: Some("__notification.log")` or similar. The `__` prefix is
 /// the convention for synthetic names; real instances must not advertise
 /// tools in that namespace.
+///
+/// `tools` is surfaced as a JSON array in `arguments` so future
+/// expression-based matchers can fire on specific tool names within a
+/// batched event.
 fn build_notification_synth(
     instance: &InstanceId,
     payload: &NotificationPayload,
@@ -1847,9 +1862,33 @@ fn build_notification_synth(
             "count": payload.count,
             "level": payload.level.map(|l| format!("{l:?}")),
             "detail": payload.detail.clone(),
-            "tool": payload.tool.clone(),
+            "tools": payload.tools.clone(),
         }),
     }
+}
+
+/// Collect `(InstanceId, tool_name)` pairs into a stable
+/// `Vec<(InstanceId, Vec<String>)>`. Within each instance the tool names
+/// are sorted lexicographically; the outer Vec is sorted by instance id.
+/// Stable ordering keeps `summary_line()` deterministic across runs even
+/// though the input came from a `HashSet`.
+fn group_pairs_by_instance<'a, I>(pairs: I) -> Vec<(InstanceId, Vec<String>)>
+where
+    I: IntoIterator<Item = &'a (InstanceId, String)>,
+{
+    let mut by_instance: std::collections::BTreeMap<InstanceId, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for (instance, tool) in pairs {
+        by_instance
+            .entry(instance.clone())
+            .or_default()
+            .push(tool.clone());
+    }
+    let mut out: Vec<(InstanceId, Vec<String>)> = by_instance.into_iter().collect();
+    for (_inst, tools) in out.iter_mut() {
+        tools.sort();
+    }
+    out
 }
 
 /// Predicate for a single hook entry against a call site. Pure (no awaits,
@@ -1923,7 +1962,7 @@ async fn pump_loop(
                             instance: id.as_str().to_string(),
                             kind: kaijutsu_types::NotificationKind::Log,
                             level: Some(log_level_to_types(level)),
-                            tool,
+                            tools: tool.into_iter().collect(),
                             count: None,
                             detail: Some(message),
                         };
@@ -1949,7 +1988,7 @@ async fn pump_loop(
                             instance: id.as_str().to_string(),
                             kind: kaijutsu_types::NotificationKind::PromptsChanged,
                             level: None,
-                            tool: None,
+                            tools: Vec::new(),
                             count: None,
                             detail: None,
                         };
@@ -2013,24 +2052,26 @@ async fn handle_tools_changed(broker: &Arc<Broker>, id: &InstanceId) {
         prev
     };
     let (added, removed) = diff_tools(&old_tools, &new_tools);
-    for name in added {
+    if !added.is_empty() {
+        let count = added.len();
         let payload = NotificationPayload {
             instance: id.as_str().to_string(),
             kind: kaijutsu_types::NotificationKind::ToolAdded,
             level: None,
-            tool: Some(name),
-            count: None,
+            tools: added,
+            count: Some(count),
             detail: None,
         };
         broker.emit_for_bindings(id, payload).await;
     }
-    for name in removed {
+    if !removed.is_empty() {
+        let count = removed.len();
         let payload = NotificationPayload {
             instance: id.as_str().to_string(),
             kind: kaijutsu_types::NotificationKind::ToolRemoved,
             level: None,
-            tool: Some(name),
-            count: None,
+            tools: removed,
+            count: Some(count),
             detail: None,
         };
         broker.emit_for_bindings(id, payload).await;
@@ -2193,7 +2234,7 @@ async fn handle_resource_flush(broker: &Arc<Broker>, id: &InstanceId, uri: &str)
                     instance: id.as_str().to_string(),
                     kind: kaijutsu_types::NotificationKind::Log,
                     level: Some(kaijutsu_types::LogLevel::Warn),
-                    tool: None,
+                    tools: Vec::new(),
                     count: None,
                     detail: Some(detail.clone()),
                 };
@@ -2954,7 +2995,7 @@ mod tests {
             notifs[0].kind,
             kaijutsu_types::NotificationKind::ToolAdded
         );
-        assert_eq!(notifs[0].tool.as_deref(), Some("ping"));
+        assert_eq!(notifs[0].tools, vec!["ping".to_string()]);
         assert_eq!(notifs[0].instance, "svc");
     }
 
@@ -3007,7 +3048,7 @@ mod tests {
         assert!(
             notifs.iter().any(|n| n.kind
                 == kaijutsu_types::NotificationKind::ToolRemoved
-                && n.tool.as_deref() == Some("ping")),
+                && n.tools.iter().any(|t| t == "ping")),
             "expected a ToolRemoved notification for 'ping', got {:?}",
             notifs
         );
@@ -3128,10 +3169,11 @@ mod tests {
         );
     }
 
-    /// D-35: ToolsChanged is diffed per-tool (ToolAdded for new, ToolRemoved
-    /// for gone).
+    /// D-35: ToolsChanged is diffed per-instance (one ToolAdded block per
+    /// instance listing all new tools, one ToolRemoved block per instance
+    /// listing all gone tools).
     #[tokio::test]
-    async fn tools_changed_emits_per_tool_diff() {
+    async fn tools_changed_emits_per_instance_diff() {
         let (broker, store, ctx) = wired_broker().await;
         bind(&broker, ctx, "svc").await;
         let server = Arc::new(
@@ -3164,18 +3206,18 @@ mod tests {
         assert!(
             notifs.iter().any(|n| n.kind
                 == kaijutsu_types::NotificationKind::ToolAdded
-                && n.tool.as_deref() == Some("c")),
-            "expected ToolAdded for 'c', got {notifs:?}"
+                && n.tools.iter().any(|t| t == "c")),
+            "expected ToolAdded listing 'c', got {notifs:?}"
         );
         assert!(
             notifs.iter().any(|n| n.kind
                 == kaijutsu_types::NotificationKind::ToolRemoved
-                && n.tool.as_deref() == Some("b")),
-            "expected ToolRemoved for 'b', got {notifs:?}"
+                && n.tools.iter().any(|t| t == "b")),
+            "expected ToolRemoved listing 'b', got {notifs:?}"
         );
         // 'a' should not show up in either direction (unchanged).
         assert!(
-            !notifs.iter().any(|n| n.tool.as_deref() == Some("a")),
+            !notifs.iter().any(|n| n.tools.iter().any(|t| t == "a")),
             "'a' was unchanged; no diff block expected, got {notifs:?}"
         );
     }
@@ -5136,12 +5178,12 @@ mod tests {
 
     // ── Phase 5 M2: binding mutation + ListTools filter ───────────────
 
-    /// `bind` with a previously-registered instance emits `ToolAdded` into
-    /// the calling context for every tool that instance advertises. This is
-    /// the Phase 5 late-injection happy path and closes exit criterion #1
-    /// at the unit level (broker_e2e covers the admin-server path in M5).
+    /// `bind` with a previously-registered instance emits a single
+    /// `ToolAdded` block into the calling context listing every tool that
+    /// instance advertises. D-35 coalesced: one block per (instance, batch),
+    /// not one block per tool.
     #[tokio::test]
-    async fn bind_emits_tool_added_for_newly_visible_tools() {
+    async fn bind_emits_coalesced_tool_added_for_newly_visible_tools() {
         let (broker, store, ctx) = wired_broker().await;
         // Register first (so tool_snapshots has the instance's tools) with
         // no binding for this context yet — suppress the synthetic
@@ -5163,13 +5205,14 @@ mod tests {
         broker.bind(ctx, InstanceId::new("svc")).await;
 
         let notifs = notifications_in(&store, ctx);
-        assert_eq!(notifs.len(), 2, "expected one ToolAdded per tool");
-        let kinds: Vec<_> = notifs
-            .iter()
-            .map(|n| (n.instance.as_str(), n.tool.as_deref(), n.kind))
-            .collect();
-        assert!(kinds.contains(&("svc", Some("ping"), kaijutsu_types::NotificationKind::ToolAdded)));
-        assert!(kinds.contains(&("svc", Some("pong"), kaijutsu_types::NotificationKind::ToolAdded)));
+        assert_eq!(notifs.len(), 1, "expected one coalesced ToolAdded for the instance");
+        let n = &notifs[0];
+        assert_eq!(n.kind, kaijutsu_types::NotificationKind::ToolAdded);
+        assert_eq!(n.instance, "svc");
+        assert_eq!(n.count, Some(2));
+        let mut tools = n.tools.clone();
+        tools.sort();
+        assert_eq!(tools, vec!["ping".to_string(), "pong".to_string()]);
     }
 
     /// `unbind` emits `ToolRemoved` for every tool that *was* visible through
@@ -5196,8 +5239,8 @@ mod tests {
             notifs
                 .iter()
                 .any(|n| n.kind == kaijutsu_types::NotificationKind::ToolRemoved
-                    && n.tool.as_deref() == Some("ping")),
-            "expected a ToolRemoved for ping; got {notifs:#?}",
+                    && n.tools.iter().any(|t| t == "ping")),
+            "expected a ToolRemoved listing ping; got {notifs:#?}",
         );
     }
 
@@ -5229,31 +5272,40 @@ mod tests {
             "a.alpha added",
         );
 
-        // Swap to {b} — expect ToolAdded for beta+gamma, ToolRemoved for alpha.
+        // Swap to {b} — expect ToolAdded for b (beta+gamma), ToolRemoved for a (alpha).
         broker
             .set_binding(ctx, ContextToolBinding::with_instances(vec![InstanceId::new("b")]))
             .await;
-        // Assert on total counts across both set_binding calls. Cumulative:
-        // 1 ToolAdded (a:alpha, from first) + 2 ToolAdded (b:beta + b:gamma,
-        // from swap) + 1 ToolRemoved (a:alpha, from swap) = 3 added, 1
-        // removed. Positional ordering is not load-bearing here — the set
-        // of emissions is.
+        // Cumulative blocks across both set_binding calls (D-35 coalesced —
+        // one block per instance per mutation, not one block per tool):
+        //   first bind  → 1 ToolAdded(a, [alpha])
+        //   swap to b   → 1 ToolAdded(b, [beta, gamma]) + 1 ToolRemoved(a, [alpha])
+        // So: 2 ToolAdded blocks, 1 ToolRemoved block. Each block's tool
+        // names live in `tools`. Positional ordering across blocks is not
+        // load-bearing here — the set of emissions is.
         let notifs = notifications_in(&store, ctx);
-        let added: Vec<_> = notifs
+        let added: Vec<(&str, Vec<String>)> = notifs
             .iter()
             .filter(|n| n.kind == kaijutsu_types::NotificationKind::ToolAdded)
-            .map(|n| (n.instance.as_str(), n.tool.as_deref().unwrap()))
+            .map(|n| {
+                let mut tools = n.tools.clone();
+                tools.sort();
+                (n.instance.as_str(), tools)
+            })
             .collect();
-        let removed: Vec<_> = notifs
+        let removed: Vec<(&str, Vec<String>)> = notifs
             .iter()
             .filter(|n| n.kind == kaijutsu_types::NotificationKind::ToolRemoved)
-            .map(|n| (n.instance.as_str(), n.tool.as_deref().unwrap()))
+            .map(|n| {
+                let mut tools = n.tools.clone();
+                tools.sort();
+                (n.instance.as_str(), tools)
+            })
             .collect();
-        assert_eq!(added.len(), 3, "3 cumulative ToolAdded events; got {added:?}");
-        assert!(added.contains(&("a", "alpha")));
-        assert!(added.contains(&("b", "beta")));
-        assert!(added.contains(&("b", "gamma")));
-        assert_eq!(removed, vec![("a", "alpha")]);
+        assert_eq!(added.len(), 2, "2 cumulative ToolAdded blocks; got {added:?}");
+        assert!(added.contains(&("a", vec!["alpha".to_string()])));
+        assert!(added.contains(&("b", vec!["beta".to_string(), "gamma".to_string()])));
+        assert_eq!(removed, vec![("a", vec!["alpha".to_string()])]);
     }
 
     /// R1 mitigation: if an unbind→rebind cycle lands on the same

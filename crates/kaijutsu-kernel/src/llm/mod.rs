@@ -2697,8 +2697,8 @@ mod tests {
                 instance: instance.into(),
                 kind,
                 level: None,
-                tool: Some("example_tool".into()),
-                count: None,
+                tools: vec!["example_tool".into()],
+                count: Some(1),
                 detail: None,
             }
         }
@@ -2724,7 +2724,7 @@ mod tests {
             );
             assert!(text.contains("instance=\"gpal\""));
             assert!(text.contains("kind=\"tool_added\""));
-            assert!(text.contains("tool=\"example_tool\""));
+            assert!(text.contains("tools=\"example_tool\""));
             assert!(text.ends_with("</notification>"));
         }
 
