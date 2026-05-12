@@ -1125,7 +1125,10 @@ const BASE_BACKOFF_SECS: f64 = 1.0;
 /// The actual actor that holds !Send Cap'n Proto types.
 struct RpcActor {
     config: SshConfig,
-    kernel_id: KernelId,
+    /// `None` until `attach_kernel` returns the server-authoritative ID; then
+    /// `Some(id)` for the lifetime of the actor. Kept as `Option` so initial
+    /// logs and status events read truthfully as "unknown" rather than nil.
+    kernel_id: Option<KernelId>,
     context_id: Option<ContextId>,
     instance: String,
     /// Live connection state (None = disconnected, will reconnect)
@@ -1157,7 +1160,7 @@ struct ConnectionState {
 impl RpcActor {
     fn new(
         config: SshConfig,
-        kernel_id: KernelId,
+        kernel_id: Option<KernelId>,
         context_id: Option<ContextId>,
         instance: String,
         existing: Option<(RpcClient, KernelHandle)>,
@@ -1219,7 +1222,7 @@ impl RpcActor {
         });
 
         log::info!(
-            "Actor reconnecting to {}:{} kernel={} context={:?} (attempt {})",
+            "Actor reconnecting to {}:{} kernel={:?} context={:?} (attempt {})",
             self.config.host,
             self.config.port,
             self.kernel_id,
@@ -1233,10 +1236,20 @@ impl RpcActor {
             Ok(()) => {
                 self.reconnect_attempts = 0;
                 self.next_reconnect_at = None;
-                let _ = self.status_tx.send(ConnectionStatus::Connected {
-                    kernel_id: self.kernel_id,
-                    context_id: self.joined_context_id,
-                });
+                if let Some(kernel_id) = self.kernel_id {
+                    let _ = self.status_tx.send(ConnectionStatus::Connected {
+                        kernel_id,
+                        context_id: self.joined_context_id,
+                    });
+                } else {
+                    // try_connect_inner sets self.kernel_id from attach_kernel
+                    // before returning Ok. Reaching this branch means that
+                    // invariant was violated — surface as Error rather than
+                    // silently dropping the Connected event.
+                    let msg = "internal: connect succeeded without kernel_id".to_string();
+                    log::error!("{msg}");
+                    let _ = self.status_tx.send(ConnectionStatus::Error(msg));
+                }
                 Ok(())
             }
             Err(e) => {
@@ -1295,7 +1308,7 @@ impl RpcActor {
         })?;
 
         // Store the server-authoritative kernel ID
-        self.kernel_id = server_kernel_id;
+        self.kernel_id = Some(server_kernel_id);
 
         // Join context if one was specified
         let joined_ctx = if let Some(ctx_id) = &self.context_id {
@@ -1800,7 +1813,7 @@ async fn dispatch_command(
 /// must stay on the spawning thread.
 pub fn spawn_actor(
     config: SshConfig,
-    kernel_id: KernelId,
+    kernel_id: Option<KernelId>,
     context_id: Option<ContextId>,
     instance: String,
     existing: Option<(RpcClient, KernelHandle)>,

@@ -155,9 +155,11 @@ impl Plugin for ActorPlugin {
 
         // Initial connection — no context joined. Constellation populates from
         // list_contexts(); user picks or creates a context explicitly.
+        // kernel_id is None: server is authoritative and reveals it during
+        // attach_kernel (see actor.rs `try_connect_inner`).
         let _ = bootstrap_channel.tx.send(BootstrapCommand::SpawnActor {
             config: ssh_config.clone(),
-            kernel_id: KernelId::nil(),
+            kernel_id: None,
             context_id: None,
             instance: "bevy-client".to_string(),
         });
@@ -220,7 +222,7 @@ fn poll_bootstrap_results(
                 context_id,
             } => {
                 log::info!(
-                    "Actor ready (generation {}) kernel={} context={:?}",
+                    "Actor ready (generation {}) kernel={:?} context={:?}",
                     generation,
                     kernel_id,
                     context_id
@@ -274,8 +276,19 @@ fn poll_bootstrap_results(
                                 .detach();
                         }
 
-                        // 2. If we joined a specific context, fetch its state
+                        // 2. If we joined a specific context, fetch its state.
+                        // Invariant: SpawnActor with context_id=Some is only issued
+                        // after the kernel is attached (see sync.rs / create_dialog.rs),
+                        // so kernel_id must be Some here. Skip with a loud warning
+                        // rather than letting a nil sentinel leak into membership.
                         if let Some(ctx_id) = ctx_id {
+                            let Some(kernel_id) = kernel_id else {
+                                log::warn!(
+                                    "ContextJoined path reached without a known kernel_id for ctx={ctx_id}; skipping membership"
+                                );
+                                return;
+                            };
+
                             let initial_sync = match h.get_context_sync(ctx_id).await {
                                 Ok(state) => Some(state),
                                 Err(e) => {

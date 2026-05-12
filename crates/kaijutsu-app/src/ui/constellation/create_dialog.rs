@@ -101,14 +101,21 @@ fn handle_context_created(
 ) {
     for event in events.read() {
         if let RpcResultMessage::ContextCreated(ctx_id) = event {
-            let kernel_id = conn_state
-                .kernel_id
-                .unwrap_or_else(kaijutsu_types::KernelId::nil);
+            // ContextCreated only fires after a successful RPC, which can't
+            // happen pre-attach. If kernel_id is somehow None, skip rather
+            // than leaking a nil sentinel into the bootstrap channel —
+            // mirrors the guard at view/sync.rs:handle_context_switch.
+            let Some(kernel_id) = conn_state.kernel_id else {
+                warn!(
+                    "handle_context_created: no kernel attached; skipping spawn for {ctx_id}"
+                );
+                continue;
+            };
             let instance = Uuid::new_v4().to_string();
             info!("Spawning actor for server-created context: {}", ctx_id);
             let _ = bootstrap.tx.send(BootstrapCommand::SpawnActor {
                 config: conn_state.ssh_config.clone(),
-                kernel_id,
+                kernel_id: Some(kernel_id),
                 context_id: Some(*ctx_id),
                 instance,
             });

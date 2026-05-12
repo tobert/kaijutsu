@@ -275,10 +275,12 @@ impl KaijutsuMcp {
             "Connected to server (no context joined yet)"
         );
 
-        // Spawn actor with no context — it will join via register_session
+        // Spawn actor with no context — it will join via register_session.
+        // kernel_id is already known here because we drove attach_kernel
+        // ourselves above (vs the client which lazy-connects).
         let actor = spawn_actor(
             config,
-            kernel_id_typed,
+            Some(kernel_id_typed),
             None,
             "mcp-server".to_string(),
             Some((client, kernel)),

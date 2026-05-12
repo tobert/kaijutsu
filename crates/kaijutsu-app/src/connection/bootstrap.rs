@@ -20,9 +20,13 @@ use tokio::sync::mpsc;
 #[derive(Debug)]
 pub enum BootstrapCommand {
     /// Spawn a new actor for the given kernel/context.
+    ///
+    /// `kernel_id` is `None` on first connect (the server is authoritative
+    /// and reveals it during `attach_kernel`). Subsequent spawns for the
+    /// same kernel pass `Some(id)` so logs and membership stay coherent.
     SpawnActor {
         config: SshConfig,
-        kernel_id: KernelId,
+        kernel_id: Option<KernelId>,
         context_id: Option<ContextId>,
         instance: String,
     },
@@ -35,7 +39,7 @@ pub enum BootstrapResult {
     ActorReady {
         handle: ActorHandle,
         generation: u64,
-        kernel_id: KernelId,
+        kernel_id: Option<KernelId>,
         context_id: Option<ContextId>,
     },
     /// Spawn failed (e.g. initial SSH connect failure).
@@ -110,7 +114,7 @@ fn bootstrap_thread(
                             let current_gen = generation;
 
                             log::info!(
-                                "Bootstrap: spawning actor generation={} kernel={} context={:?} instance={}",
+                                "Bootstrap: spawning actor generation={} kernel={:?} context={:?} instance={}",
                                 current_gen, kernel_id, context_id, instance
                             );
 

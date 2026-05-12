@@ -432,7 +432,7 @@ pub fn handle_context_switch(
                 .tx
                 .send(crate::connection::BootstrapCommand::SpawnActor {
                     config: conn_state.ssh_config.clone(),
-                    kernel_id,
+                    kernel_id: Some(kernel_id),
                     context_id: Some(ctx_id),
                     instance,
                 });
