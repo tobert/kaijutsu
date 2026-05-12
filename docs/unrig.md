@@ -222,14 +222,26 @@ took.
   when a `CacheTarget::System` breakpoint is set, and keeps the plain
   string form otherwise. Per-segment caching of a multi-block system prompt
   is deferred — no current consumer needs it.
-- **Cache breakpoint policy.** *Shape revised in Phase 2:* the doc's
-  `HashMap<BlockId, CacheBreakpoint>` was unimplementable without
-  `LlmMessage` carrying block identity past hydration. Phase 2 uses
-  `Vec<CacheTarget>` with symbolic variants (`Tools`, `System`,
-  `MessageIndex(usize)`) instead. *Policy:* user-picked **carrier only,
-  no defaults** — `BuildOpts.cache_breakpoints` defaults to empty;
-  nothing applies `cache_control` until a future PR wires a populator
-  (heuristic / drift-router / `models.toml`).
+- **Cache breakpoint policy.** *Shape revised in Phase 2; wire layer
+  completed in Phase 2.6:* the doc's `HashMap<BlockId, CacheBreakpoint>`
+  was unimplementable without `LlmMessage` carrying block identity past
+  hydration. Phase 2 used `Vec<CacheTarget>` with symbolic variants
+  but only honored `Tools` / `System`. Phase 2.6 folded `CacheTtl` into
+  each variant (`Tools(CacheTtl)`, `System(CacheTtl)`,
+  `MessageIndex(usize, CacheTtl)`) and wired `MessageIndex` end-to-end:
+  promotes bare-string message content to the block form, lands
+  `cache_control` on the last cache-eligible block (skipping trailing
+  `Thinking` blocks which lack a `cache_control` wire field), enforces
+  the 4-breakpoint cap with `tracing::warn!` on drops, dedupes
+  `Tools` / `System` / `MessageIndex(i, _)` (first-write-wins). *Policy
+  decision:* breakpoints are populated **per-context via rc lifecycle
+  scripts** (create / fork / drift verbs) — not via a `models.toml`
+  floor. The drift-router can override at call time. A `models.toml`
+  floor was considered and rejected as too coarse for kaijutsu's
+  fork-centric usage shape (forks share a prefix with their parent —
+  fork-time is the natural moment to set `MessageIndex(fork_at - 1)`).
+  See `project_cache_breakpoint_policy` memory and
+  `project_rc_lifecycle` for the rc system itself.
 - **Extended thinking config source.** *Open, deferred:* Phase 2 lays the
   typed builder (`build::with_thinking(req, budget_tokens)`) but no
   caller populates it. Open: per-context (DriftRouter), per-provider
@@ -315,6 +327,19 @@ took.
     symbolic variants. Reason: `LlmMessage` doesn't carry `BlockId`
     past hydration.
   - 645 kernel + 15 server unit tests pass (up from 604/15 in Phase 1).
+- **2026-05-12** — Phase 2.6 landed: cache breakpoint wire layer
+  completed. `CacheTarget` variants now each carry `CacheTtl` so rc
+  populators can pick ephemeral vs extended per breakpoint.
+  `MessageIndex` is wired end-to-end in `claude/build.rs` — promotes
+  bare-string message content to block form, lands `cache_control` on
+  the last cache-eligible content block, walks past trailing
+  `Thinking` blocks, drops out-of-range indices with a warn log. The
+  4-breakpoint cap and duplicate-target dedupe now live in a
+  `plan_cache()` pre-scan; drops produce `tracing::warn!` lines with
+  the offending target. 27 build tests pass (15 baseline + 12 new),
+  660 kernel + 15 server unit tests pass. Storage (rc population path)
+  is the next slice — the carrier still defaults to empty until rc
+  scripts wire `kj cache breakpoint add` calls.
 - **2026-05-11** — Phase 2.5 landed: thinking signature plumbing.
   `StreamEvent::ThinkingEnd` became a struct variant carrying
   `signature: Option<String>` (breaking change, small surface — one

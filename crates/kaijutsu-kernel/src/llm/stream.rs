@@ -188,19 +188,38 @@ impl BuildOpts {
 
 /// Where to place a Claude `cache_control` breakpoint within a request.
 ///
-/// Anthropic allows up to 4 breakpoints per request; providers honor up
-/// to that cap and silently drop the rest. Gemini's `build()` ignores
-/// all variants.
+/// Each variant carries a [`CacheTtl`] so the populator (rc scripts on
+/// create / fork / drift; see [`docs/unrig.md`] and the
+/// `project_cache_breakpoint_policy` memory) can pick ephemeral vs
+/// extended per breakpoint — stable per-session targets (tools, fork
+/// points) want `Extended`; targets that drift with the conversation
+/// want `Ephemeral`.
+///
+/// Anthropic allows up to 4 breakpoints per request; the Claude `build()`
+/// honors them in declaration order, dedupes (`Tools` and `System` each
+/// land at most once; `MessageIndex` dedupes by index), and logs drops
+/// for debuggability. Gemini's `build()` ignores all variants.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CacheTarget {
     /// Cache the tools array (stable across a session — the biggest
     /// single win for agent loops with a fixed toolset).
-    Tools,
+    Tools(CacheTtl),
     /// Cache the system prompt block (stable across a session).
-    System,
+    System(CacheTtl),
     /// Cache through the assistant/user message at this 0-based index
-    /// in the messages array. Useful after a long pasted document.
-    MessageIndex(usize),
+    /// in the messages array. The natural target after a fork (the
+    /// last shared message with the parent) or after a long pasted
+    /// document.
+    MessageIndex(usize, CacheTtl),
+}
+
+impl CacheTarget {
+    /// Extract the TTL associated with this breakpoint.
+    pub fn ttl(&self) -> CacheTtl {
+        match self {
+            Self::Tools(ttl) | Self::System(ttl) | Self::MessageIndex(_, ttl) => *ttl,
+        }
+    }
 }
 
 /// Cache TTL hint. Anthropic offers a default 5-minute ephemeral cache
