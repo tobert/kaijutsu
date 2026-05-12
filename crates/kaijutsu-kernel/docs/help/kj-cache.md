@@ -16,9 +16,10 @@ kj cache clear
 
 - `tools`  — cache the tools array (stable per session)
 - `system` — cache the system prompt block
-- `message` — cache through a specific message (needs `--index <N>`).
-  The natural target after a fork: `--index $((KAI_FORK_AT - 1))`
-  covers the prefix the child shares with its parent.
+- `message` — cache through a specific message (needs `--index <N>`,
+  0-based). The natural target after a fork is the last message
+  shared with the parent; see "rc env vars" below for the current
+  caveat on computing that index.
 
 ## TTLs
 
@@ -33,3 +34,35 @@ Anthropic allows up to 4 breakpoints per request. Storage is liberal —
 `add` always succeeds. The Claude wire layer applies in declaration
 order, dedupes `tools`/`system`/`message[N]`, and drops anything past
 the cap with a `tracing::warn` line.
+
+## rc env vars
+
+rc lifecycle scripts (`/etc/rc/<context_type>/<verb>/SXX-*.kai`)
+receive these variables from the kernel (see
+`kaijutsu-kernel/src/kj/lifecycle.rs`):
+
+- `KJ_CONTEXT`        — hex ID of the context this script runs against
+- `KJ_VERB`           — `create` | `fork` | `drift`
+- `KJ_RC_DEPTH`       — recursion depth (capped at `MAX_RC_DEPTH = 4`)
+- `KJ_PARENT_CONTEXT` — hex ID of parent (fork only)
+- `KJ_FORK_INFO`      — JSON `{"kind": "shallow|compact|full",
+                                 "parent": "<hex>"}` (fork only)
+- `KJ_DRIFT_INFO`     — JSON `{"kind": "...", "source": "<hex>",
+                                 "target": "<hex>",
+                                 "source_model": "..."}` (drift only)
+
+Example rc-on-create script setting durable per-session targets:
+
+```sh
+# /etc/rc/default/create/S20-cache.kai
+kj cache add --target tools  --ttl extended    # fixed toolset → 1h
+kj cache add --target system --ttl ephemeral   # may drift → 5m
+```
+
+**Caveat for rc-on-fork:** computing the right `--index` for the
+shared-prefix case requires knowing the parent's message count at fork
+time. `KJ_FORK_INFO` does not currently carry that count, and no kj
+subcommand exposes it. Tools / System breakpoints are writable
+today; per-message fork-point breakpoints need a small follow-up
+either to `KJ_FORK_INFO` or to add a `kj context blocks` count
+surface. Tracked in `tech_debt_fork_at_index` memory.
