@@ -30,6 +30,7 @@
 pub mod claude;
 pub mod config;
 pub mod gemini;
+pub mod image_cache;
 pub mod stream;
 pub mod system_prompt;
 pub mod toml_config;
@@ -696,11 +697,17 @@ impl LlmRegistry {
 /// image is read on a `spawn_blocking` worker — keeps the tokio runtime
 /// responsive when a long-history conversation re-encodes many images per
 /// prompt.
+///
+/// When `cache` is `Some`, already-resolved hashes skip the disk read and
+/// base64 encode entirely. Hashes are content-addressed, so a global cache
+/// across contexts is correct.
 pub async fn resolve_image_blocks_from_cas(
     messages: &mut [Message],
     cas: std::sync::Arc<dyn kaijutsu_cas::ContentStore>,
+    cache: Option<&image_cache::ImageBase64Cache>,
 ) {
     use base64::Engine;
+    use image_cache::ResolvedImage;
     use kaijutsu_cas::ContentHash;
 
     for msg in messages.iter_mut() {
@@ -723,11 +730,18 @@ pub async fn resolve_image_blocks_from_cas(
                 Ok(h) => h,
                 Err(_) => continue,
             };
+            if let Some(cache) = cache
+                && let Some(hit) = cache.get(&parsed)
+            {
+                *media_type = hit.mime_type;
+                *data_base64 = Some(hit.data_base64);
+                continue;
+            }
             // Both inspect (sidecar mime) and retrieve (object bytes) are
             // blocking std::fs reads — bundle them into one spawn_blocking
             // so the runtime stays responsive even for stacks of images.
             let cas_for_task = cas.clone();
-            let parsed_for_task = parsed;
+            let parsed_for_task = parsed.clone();
             let join = tokio::task::spawn_blocking(move || {
                 let inspected = cas_for_task.inspect(&parsed_for_task).ok().flatten();
                 let bytes = cas_for_task.retrieve(&parsed_for_task).ok().flatten();
@@ -745,6 +759,15 @@ pub async fn resolve_image_blocks_from_cas(
             }
             if let Some(bytes) = bytes {
                 let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                if let Some(cache) = cache {
+                    cache.insert(
+                        parsed,
+                        ResolvedImage {
+                            mime_type: media_type.clone(),
+                            data_base64: encoded.clone(),
+                        },
+                    );
+                }
                 *data_base64 = Some(encoded);
             }
             // Otherwise stay unresolved — provider build() emits a text marker.
@@ -2930,7 +2953,7 @@ mod tests {
                     data_base64: None,
                 }]),
             }];
-            resolve_image_blocks_from_cas(&mut messages, cas).await;
+            resolve_image_blocks_from_cas(&mut messages, cas, None).await;
             match &messages[0].content {
                 MessageContent::Blocks(blocks) => match &blocks[0] {
                     ContentBlock::Image { data_base64, .. } => {
@@ -2960,7 +2983,7 @@ mod tests {
                 }]),
             }];
             // Should not panic, should leave block unresolved.
-            resolve_image_blocks_from_cas(&mut messages, cas).await;
+            resolve_image_blocks_from_cas(&mut messages, cas, None).await;
             match &messages[0].content {
                 MessageContent::Blocks(blocks) => match &blocks[0] {
                     ContentBlock::Image { data_base64, .. } => {
@@ -2969,6 +2992,117 @@ mod tests {
                     _ => panic!(),
                 },
                 _ => panic!(),
+            }
+        }
+
+        /// `ContentStore` wrapper that counts `retrieve` calls so tests can
+        /// assert the cache short-circuits disk reads.
+        struct CountingStore {
+            inner: std::sync::Arc<dyn kaijutsu_cas::ContentStore>,
+            retrieves: std::sync::atomic::AtomicUsize,
+            inspects: std::sync::atomic::AtomicUsize,
+        }
+        impl CountingStore {
+            fn new(inner: std::sync::Arc<dyn kaijutsu_cas::ContentStore>) -> Self {
+                Self {
+                    inner,
+                    retrieves: std::sync::atomic::AtomicUsize::new(0),
+                    inspects: std::sync::atomic::AtomicUsize::new(0),
+                }
+            }
+            fn retrieves(&self) -> usize {
+                self.retrieves.load(std::sync::atomic::Ordering::Relaxed)
+            }
+            fn inspects(&self) -> usize {
+                self.inspects.load(std::sync::atomic::Ordering::Relaxed)
+            }
+        }
+        impl kaijutsu_cas::ContentStore for CountingStore {
+            fn store(
+                &self,
+                data: &[u8],
+                mime_type: &str,
+            ) -> Result<kaijutsu_cas::ContentHash, kaijutsu_cas::StoreError> {
+                self.inner.store(data, mime_type)
+            }
+            fn retrieve(
+                &self,
+                hash: &kaijutsu_cas::ContentHash,
+            ) -> Result<Option<Vec<u8>>, kaijutsu_cas::StoreError> {
+                self.retrieves
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.inner.retrieve(hash)
+            }
+            fn exists(&self, hash: &kaijutsu_cas::ContentHash) -> bool {
+                self.inner.exists(hash)
+            }
+            fn path(&self, hash: &kaijutsu_cas::ContentHash) -> Option<std::path::PathBuf> {
+                self.inner.path(hash)
+            }
+            fn inspect(
+                &self,
+                hash: &kaijutsu_cas::ContentHash,
+            ) -> Result<Option<kaijutsu_cas::CasReference>, kaijutsu_cas::StoreError> {
+                self.inspects
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.inner.inspect(hash)
+            }
+            fn remove(
+                &self,
+                hash: &kaijutsu_cas::ContentHash,
+            ) -> Result<bool, kaijutsu_cas::StoreError> {
+                self.inner.remove(hash)
+            }
+        }
+
+        #[tokio::test]
+        async fn resolve_image_blocks_uses_cache_on_second_call() {
+            use kaijutsu_cas::{ContentStore, FileStore};
+            let tmp = tempfile::tempdir().unwrap();
+            let backing: std::sync::Arc<dyn ContentStore> =
+                std::sync::Arc::new(FileStore::at_path(tmp.path()));
+            let png_bytes: &[u8] = &[
+                0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+                0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+                0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78,
+                0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+                0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+            ];
+            let hash = backing.store(png_bytes, "image/png").unwrap();
+            let counting = std::sync::Arc::new(CountingStore::new(backing));
+            let cas: std::sync::Arc<dyn ContentStore> = counting.clone();
+            let cache = image_cache::ImageBase64Cache::new(8);
+
+            let make_msgs = || {
+                vec![Message {
+                    role: Role::User,
+                    content: MessageContent::Blocks(vec![ContentBlock::Image {
+                        hash: hash.to_string(),
+                        media_type: "image/png".to_string(),
+                        data_base64: None,
+                    }]),
+                }]
+            };
+
+            let mut first = make_msgs();
+            resolve_image_blocks_from_cas(&mut first, cas.clone(), Some(&cache)).await;
+            assert_eq!(counting.retrieves(), 1, "first resolve must read CAS once");
+            assert_eq!(counting.inspects(), 1, "first resolve must inspect once");
+
+            let mut second = make_msgs();
+            resolve_image_blocks_from_cas(&mut second, cas.clone(), Some(&cache)).await;
+            assert_eq!(counting.retrieves(), 1, "cached resolve must skip CAS");
+            assert_eq!(counting.inspects(), 1, "cached resolve must skip inspect");
+
+            match &second[0].content {
+                MessageContent::Blocks(blocks) => match &blocks[0] {
+                    ContentBlock::Image { data_base64, .. } => assert!(
+                        data_base64.is_some(),
+                        "cached resolve must still fill data_base64"
+                    ),
+                    _ => panic!("expected Image"),
+                },
+                _ => panic!("expected Blocks"),
             }
         }
 

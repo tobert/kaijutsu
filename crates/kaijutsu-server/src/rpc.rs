@@ -149,20 +149,39 @@ fn extract_rpc_trace(
 /// Each context gets its own `tokio::sync::Mutex<Vec<LlmMessage>>`, so concurrent
 /// prompts to the same context serialize properly. DashMap provides the outer
 /// concurrent access. LRU eviction keeps memory bounded.
+///
+/// Also owns the per-hash [`ImageBase64Cache`] so resolving the same
+/// screenshot every turn doesn't re-encode bytes. The image cache is keyed
+/// by content hash (global) but shares lifetime with this struct because
+/// both belong to the same LLM-stream subsystem.
 pub struct ConversationCache {
     entries: dashmap::DashMap<ContextId, Arc<tokio::sync::Mutex<Vec<LlmMessage>>>>,
     last_accessed: dashmap::DashMap<ContextId, std::time::Instant>,
     max_contexts: usize,
+    image_cache: Arc<kaijutsu_kernel::llm::image_cache::ImageBase64Cache>,
 }
 
 impl ConversationCache {
     /// Create a new cache with the given capacity.
+    ///
+    /// `max_images` bounds the per-hash image cache; pick a value that covers
+    /// the longest conversation you expect to keep hot (4× max_contexts is
+    /// a defensible default).
     pub fn new(max_contexts: usize) -> Self {
+        let max_images = max_contexts.saturating_mul(4).max(16);
         Self {
             entries: dashmap::DashMap::new(),
             last_accessed: dashmap::DashMap::new(),
             max_contexts,
+            image_cache: Arc::new(kaijutsu_kernel::llm::image_cache::ImageBase64Cache::new(
+                max_images,
+            )),
         }
+    }
+
+    /// Borrow the per-hash image cache shared across contexts.
+    pub fn image_cache(&self) -> &kaijutsu_kernel::llm::image_cache::ImageBase64Cache {
+        &self.image_cache
     }
 
     /// Get or create the per-context lock. Returns an Arc<Mutex> that the caller

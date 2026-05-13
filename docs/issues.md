@@ -38,13 +38,13 @@ following are explicit follow-ups that did not ship:
 - **Context lifecycle (rc) system.** Replaces the v1
   `builtin.personas` MCP server (yanked 2026-05-02). Scripts at
   `/etc/rc/<context_type>/<verb>/SXX-name.{kai,md}` run at
-  context lifecycle moments (`create`, `fork`, with `attach` and
-  `drift` reserved). `.md` becomes a block; `.kai` runs via
+  context lifecycle moments (`create`, `fork`, `drift`, with
+  `attach` reserved). `.md` becomes a block; `.kai` runs via
   `kaish_kernel::Kernel::execute_with_vars`. Stored in KernelDb.
   Admin via `kj rc add | list | rm`. Scripts decide their own
   applicability via `kj` introspection. See
   [`personas-evolution.md`](personas-evolution.md) for the design
-  motivation. Open follow-ups: `attach`/`drift` lifecycle wiring,
+  motivation. Open follow-ups: `attach` lifecycle wiring,
   per-script time budgets, capnp surface for `context_type`,
   CRDT-VFS bridge for collaborative script editing.
 - **`StreamingBlockHandle` implementation.** Single-block streaming
@@ -73,33 +73,12 @@ following are explicit follow-ups that did not ship:
 
 ## LLM providers
 
-- **Extended-thinking signature plumbing.** `ContentBlock::Reasoning`
-  preserves in-call thinking across tool-use iterations (A3, shipped in
-  fe6934f) but `signature` is hard-coded to `None` because the rig
-  adapter flattens streamed reasoning to delta text and drops the
-  provider signature. Safe today — extended thinking isn't enabled on
-  any production path. If/when it is, Anthropic will reject any
-  Reasoning block that follows a tool_use without a valid signature.
-  Wire signatures through `RigStreamAdapter` (capture from
-  `StreamedAssistantContent::Reasoning` and surface on
-  `StreamEvent::ThinkingEnd`), accumulate alongside `assistant_thinking`
-  in `llm_stream.rs`, and pass through `with_reasoning_text_and_tool_uses`.
 - **Cross-turn thinking continuity.** `hydrate_from_blocks` skips
-  `BlockKind::Thinking` entirely (`llm/mod.rs:843`), so reasoning never
-  re-enters the conversation between separate `process_llm_stream`
-  calls. Out of scope per the original A3 framing; revisit if extended
-  thinking lands and the stale-reasoning cost is worth the token spend.
-- **Reconsider `rig` as the provider abstraction.** Extended-thinking
-  signature plumbing (above), image fallback semantics, reasoning
-  round-trip, and truncation-vs-error handling all push against rig's
-  current model. We may be hitting the wall where a thin
-  provider-specific layer earns its keep over a generic adapter. Worth
-  periodic review.
-- **Memoize CAS image base64 in `ConversationCache`.**
-  `resolve_image_blocks_from_cas` reads + base64-encodes every image's
-  bytes per prompt. The spawn_blocking fix took the runtime stall out;
-  next is caching by `(context_id, hash)` so a 20-image conversation
-  doesn't re-encode every screenshot every turn.
+  `BlockKind::Thinking` entirely (`llm/mod.rs:1041`), so reasoning
+  never re-enters the conversation between separate
+  `process_llm_stream` calls. Out of scope per the original A3
+  framing; revisit if extended thinking lands and the stale-reasoning
+  cost is worth the token spend.
 
 ## Persistence & sync
 
@@ -168,8 +147,9 @@ Holographic shader trio + entry animation shipped. Open:
   yet implemented.
 - **Compact quality.** `kj fork --compact` uses a generic
   `DISTILLATION_SYSTEM_PROMPT`. Consider preset-level or context-level
-  summary-style control. (`--distill-model` knob ships now per M5-F5;
-  custom distillation prompts are the remaining shape.)
+  summary-style control. The `--distill-model` knob already lets
+  callers pick a cheap summarizer; custom distillation *prompts* are
+  the remaining shape.
 - **Workspace auto-mounts at context join.** How workspace paths
   translate to VFS mounts on join.
 - **kj CLI binary.** Standalone `kj` for headless scripting; thin

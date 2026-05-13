@@ -325,8 +325,18 @@ async fn process_llm_stream(
             // spawn_blocking so the runtime stays responsive on stacks of
             // images. Unresolved hashes fall back to a text marker via
             // to_rig_request — never panic.
+            //
+            // The per-hash image cache (owned by ConversationCache) skips
+            // disk + base64 work for screenshots already resolved this
+            // session, so a 20-image conversation doesn't re-encode every
+            // turn.
             let cas: std::sync::Arc<dyn kaijutsu_kernel::ContentStore> = kernel.cas().clone();
-            kaijutsu_kernel::resolve_image_blocks_from_cas(&mut hydrated, cas).await;
+            kaijutsu_kernel::resolve_image_blocks_from_cas(
+                &mut hydrated,
+                cas,
+                Some(conversation_cache.image_cache()),
+            )
+            .await;
             log::info!(
                 "Hydrated {} messages from {} blocks for context {}",
                 hydrated.len(),
