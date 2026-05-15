@@ -1,0 +1,24 @@
+# Thin helpers around the kj subcommands the harness uses.
+#
+# kaish does NOT word-split unquoted vars, so we can't build flags in a
+# single variable and pass it through. Helpers below take parsed args and
+# call kj with each flag as its own word.
+
+# parent_block_count CTX — total blocks in CTX (no filter)
+parent_block_count() {
+    kj block count --context "$1"
+}
+
+# block_count_role CTX KIND ROLE — count blocks of a kind+role in CTX
+block_count_role() {
+    kj block count --context "$1" --kind "$2" --role "$3"
+}
+
+# block_list_json CTX [KIND] — JSON dump; for inspection / debugging
+block_list_json() {
+    if [[ -n "$2" ]]; then
+        kj block list --context "$1" --kind "$2" --json
+    else
+        kj block list --context "$1" --json
+    fi
+}

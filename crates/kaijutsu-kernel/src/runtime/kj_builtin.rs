@@ -351,6 +351,14 @@ impl Tool for KjBuiltin {
             .param(ParamSchema::optional("tools", "string", Value::String(String::new()), "Tool filter spec"))
             .param(ParamSchema::optional("confirm", "string", Value::String(String::new()), "Latch confirmation nonce"))
             .param(ParamSchema::optional("as", "string", Value::String(String::new()), "Template context for subtree fork"))
+            // Declared so kaish parses `--context main` / `--kind text` etc. as
+            // named args (consuming the next positional) instead of defaulting
+            // to bool flags. Used by `kj block` subcommands.
+            .param(ParamSchema::optional("context", "string", Value::String(String::new()), "Target context ref (label, hex, .parent)")
+                .with_aliases(["-c"]))
+            .param(ParamSchema::optional("kind", "string", Value::String(String::new()), "Block kind filter"))
+            .param(ParamSchema::optional("role", "string", Value::String(String::new()), "Block role filter"))
+            .param(ParamSchema::optional("status", "string", Value::String(String::new()), "Block status filter"))
             .example("Discover commands", "kj help")
             .example("View context topology", "kj context list --tree")
             .example("Create isolated workspace", "kj fork --name debug-auth")

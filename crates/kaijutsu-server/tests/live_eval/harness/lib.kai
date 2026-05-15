@@ -1,0 +1,51 @@
+# Minimal TAP-ish assertion helpers for the live-eval harness.
+#
+# Output convention (parsed by the Rust runner):
+#   ok N - <description>
+#   not ok N - <description>
+#       detail: <one-line context>
+#
+# Any line starting with "not ok" fails the test. Multi-line detail is
+# avoided so the parser stays trivial.
+
+TAP_N=0
+
+pass() {
+    TAP_N=$((TAP_N + 1))
+    echo "ok $TAP_N - $1"
+}
+
+fail() {
+    TAP_N=$((TAP_N + 1))
+    echo "not ok $TAP_N - $1"
+    if [[ -n "$2" ]]; then
+        echo "    detail: $2"
+    fi
+}
+
+# assert_eq EXPECTED ACTUAL MSG
+assert_eq() {
+    if [[ "$2" = "$1" ]]; then
+        pass "$3"
+    else
+        fail "$3" "expected '$1' got '$2'"
+    fi
+}
+
+# assert_nonempty VALUE MSG
+assert_nonempty() {
+    if [[ -n "$1" ]]; then
+        pass "$2"
+    else
+        fail "$2" "value was empty"
+    fi
+}
+
+# assert_ge ACTUAL MIN MSG  (numeric)
+assert_ge() {
+    if [[ "$1" -ge "$2" ]]; then
+        pass "$3"
+    else
+        fail "$3" "expected >= $2 got '$1'"
+    fi
+}

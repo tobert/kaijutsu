@@ -1,0 +1,54 @@
+# Live-eval scenario: skeleton + one fork + structural assertions on fork.
+#
+# Pre-conditions when this script runs (set up by the Rust runner):
+# - The current context is `main`.
+# - Main has one user Text block (the prompt) and one model Text block
+#   (Haiku's reply). The Rust runner already waited for the model turn
+#   to reach Status::Done before invoking this script.
+# - The model attached to main is claude-haiku-4-5.
+#
+# Side effect to be aware of: this script runs *inside* `main` via
+# shell_execute, so every kj call below emits its own ToolCall/ToolResult
+# blocks into main. Assertions filter on kind=text to ignore them.
+
+# === 1. Sanity: main holds the conversation ===
+
+main_user_text=$(kj block count --context main --kind text --role user)
+assert_eq "1" "$main_user_text" "main has exactly 1 user Text block"
+
+main_model_text=$(kj block count --context main --kind text --role model)
+assert_eq "1" "$main_model_text" "main has exactly 1 model Text block"
+
+# Surface the assistant content so the reviewer can spot-check it.
+echo "--- main: model text blocks ---"
+kj block list --context main --kind text --role model
+echo "--- end ---"
+
+# === 2. Fork main into implementer ===
+
+if kj fork --name implementer; then
+    pass "kj fork --name implementer succeeded"
+else
+    fail "kj fork --name implementer failed"
+fi
+
+# === 3. Fork preserved the conversation ===
+
+imp_user_text=$(kj block count --context implementer --kind text --role user)
+assert_eq "$main_user_text" "$imp_user_text" \
+    "implementer inherited main's user Text block count"
+
+imp_model_text=$(kj block count --context implementer --kind text --role model)
+assert_eq "$main_model_text" "$imp_model_text" \
+    "implementer inherited main's model Text block count"
+
+# Total block count on implementer should be at least as many Text blocks
+# as main had (rc-on-fork may add notification/error blocks; we just need
+# the conversation to survive).
+imp_total=$(kj block count --context implementer)
+assert_ge "$imp_total" "2" \
+    "implementer has at least the 2 conversation blocks from main"
+
+echo "--- implementer: all blocks ---"
+kj block list --context implementer --json
+echo "--- end ---"

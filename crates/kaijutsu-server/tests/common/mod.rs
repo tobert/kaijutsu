@@ -76,6 +76,32 @@ default_model = "mock-model"
     addr
 }
 
+/// Start a server with caller-supplied config + data dir, so the test can
+/// pre-populate `models.toml` and inspect kernel state on the filesystem.
+///
+/// Like `start_server_with_mock_llm`, but the directory is provided
+/// rather than created in `/tmp`. Use for live-eval runs where the
+/// artifact dir should survive on failure.
+#[allow(dead_code)]
+pub async fn start_server_with_state_dir(state_dir: std::path::PathBuf) -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let mut config = SshServerConfig::ephemeral(addr.port());
+    config.config_dir = Some(state_dir.clone());
+    config.data_dir = Some(state_dir);
+
+    tokio::task::spawn_local(async move {
+        let server = SshServer::new(config);
+        if let Err(e) = server.run_on_listener(listener).await {
+            log::error!("Server error: {}", e);
+        }
+    });
+
+    tokio::task::yield_now().await;
+    addr
+}
+
 /// Connect to server with ephemeral key.
 pub async fn connect_client(addr: SocketAddr) -> RpcClient {
     let config = SshConfig {

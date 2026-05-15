@@ -8,6 +8,7 @@
 //! All commands go through `KjDispatcher`, which holds Arc refs to shared
 //! kernel state and is constructed once per server.
 
+pub mod block;
 pub mod cache;
 pub mod cas;
 pub mod compact;
@@ -237,6 +238,11 @@ impl KjDispatcher {
         }
         if cmd == "rc" {
             return self.dispatch_rc(&argv[1..], caller);
+        }
+        // `kj block` operates by --context ref when given one, so it can
+        // run without an active context.
+        if cmd == "block" {
+            return self.dispatch_block(&argv[1..], caller);
         }
 
         // Everything else requires an active context
