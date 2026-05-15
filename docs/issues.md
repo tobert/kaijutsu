@@ -65,8 +65,11 @@ following are explicit follow-ups that did not ship:
   `Broker::set_kj_dispatcher`. PostCall/OnError overlay vars
   (`KJ_TOOL_RESULT`, `KJ_TOOL_ERROR`) ship 2026-05-15;
   OnNotification carries its payload in `KJ_TOOL_ARGS` already.
-  Open: introduce a `hook_scripts` table for shared script storage
-  (today each hook owns its body).
+  Shared `hook_scripts` table ships 2026-05-15: hooks reference
+  bodies by `script_id` via the `kaish_script` action; admin
+  surface (`hook_script_add | update | list | inspect | remove`)
+  on `builtin.hooks`; deletion refuses when any hook still
+  references the script.
 - **MCP `progress` → `StreamingBlockHandle` bridge.** External streaming
   tools wired the same way virtual tools will be.
 - **Per-principal budgets + fair queuing.** Adjacent to the now-shipped

@@ -13,6 +13,8 @@
 //! Phase / tracing-level string conversions are also here so both the
 //! persist path and the admin surface share one source of truth.
 
+use std::collections::HashMap;
+
 use super::error::HookId;
 use super::hook_table::{
     GlobPattern, HookAction, HookBody, HookEntry, HookPhase, LogSpec,
@@ -92,6 +94,7 @@ pub fn entry_to_row(phase: HookPhase, entry: &HookEntry) -> HookRow {
         action_kind: String::new(),
         action_builtin_name: None,
         action_kaish_body: None,
+        action_kaish_script_id: None,
         action_result_text: None,
         action_is_error: None,
         action_deny_reason: None,
@@ -106,7 +109,15 @@ pub fn entry_to_row(phase: HookPhase, entry: &HookEntry) -> HookRow {
         }
         HookAction::Invoke(HookBody::Kaish(body)) => {
             row.action_kind = ACTION_KAISH_INVOKE.into();
-            row.action_kaish_body = Some(body.clone());
+            // Origin tracked on the live entry. Script-backed hooks
+            // persist by id (the body in `HookBody::Kaish` is just the
+            // resolved snapshot used at fire time; the script row is
+            // the source of truth). Inline hooks persist the body.
+            if let Some(script_id) = &entry.kaish_script_id {
+                row.action_kaish_script_id = Some(script_id.clone());
+            } else {
+                row.action_kaish_body = Some(body.clone());
+            }
         }
         HookAction::ShortCircuit(result) => {
             row.action_kind = ACTION_SHORT_CIRCUIT.into();
@@ -150,9 +161,18 @@ pub enum RowParseError {
     /// know — either a previously-registered builtin has been removed
     /// or a typo was inserted directly via SQL.
     UnknownBuiltin(String),
-    /// `action_kind = "kaish_invoke"` row without a body column —
-    /// shape invariant violated.
+    /// `action_kind = "kaish_invoke"` row without either an inline
+    /// body or a script_id reference — shape invariant violated.
     MissingKaishBody,
+    /// `action_kind = "kaish_invoke"` row with BOTH inline body AND
+    /// script_id set. Schema treats them as mutually exclusive; the
+    /// caller should drop one.
+    ConflictingKaishSource,
+    /// `action_kind = "kaish_invoke"` references a `script_id` that
+    /// has no row in `hook_scripts`. Either the script was deleted
+    /// without cleaning up referencing hooks, or the row was inserted
+    /// directly via SQL with a bad reference.
+    UnknownHookScript(String),
     /// `action_kind = "shortcircuit"` without a result_text; shape
     /// invariant violated.
     MissingShortCircuitText,
@@ -174,7 +194,14 @@ impl std::fmt::Display for RowParseError {
                 write!(f, "builtin hook name {s:?} not in registry")
             }
             RowParseError::MissingKaishBody => {
-                f.write_str("kaish_invoke row missing action_kaish_body")
+                f.write_str("kaish_invoke row missing both action_kaish_body and action_kaish_script_id")
+            }
+            RowParseError::ConflictingKaishSource => f.write_str(
+                "kaish_invoke row has both action_kaish_body and action_kaish_script_id; \
+                 they are mutually exclusive",
+            ),
+            RowParseError::UnknownHookScript(s) => {
+                write!(f, "kaish_invoke references unknown script_id {s:?}")
             }
             RowParseError::MissingShortCircuitText => {
                 f.write_str("shortcircuit without result_text")
@@ -193,6 +220,7 @@ impl std::fmt::Display for RowParseError {
 pub fn row_to_entry(
     row: &HookRow,
     registry: &BuiltinHookRegistry,
+    scripts: &HashMap<String, String>,
 ) -> Result<(HookPhase, HookEntry), RowParseError> {
     let phase = parse_phase(&row.phase).ok_or_else(|| RowParseError::UnknownPhase(row.phase.clone()))?;
 
@@ -209,10 +237,15 @@ pub fn row_to_entry(
             HookAction::Invoke(HookBody::Builtin { name, hook })
         }
         ACTION_KAISH_INVOKE => {
-            let body = row
-                .action_kaish_body
-                .clone()
-                .ok_or(RowParseError::MissingKaishBody)?;
+            let body = match (&row.action_kaish_body, &row.action_kaish_script_id) {
+                (Some(body), None) => body.clone(),
+                (None, Some(script_id)) => scripts
+                    .get(script_id)
+                    .cloned()
+                    .ok_or_else(|| RowParseError::UnknownHookScript(script_id.clone()))?,
+                (None, None) => return Err(RowParseError::MissingKaishBody),
+                (Some(_), Some(_)) => return Err(RowParseError::ConflictingKaishSource),
+            };
             HookAction::Invoke(HookBody::Kaish(body))
         }
         ACTION_SHORT_CIRCUIT => {
@@ -254,6 +287,7 @@ pub fn row_to_entry(
         match_instance: row.match_instance.as_ref().map(|s| GlobPattern(s.clone())),
         match_tool: row.match_tool.as_ref().map(|s| GlobPattern(s.clone())),
         match_context: row.match_context,
+        kaish_script_id: row.action_kaish_script_id.clone(),
         match_principal: row.match_principal,
         action,
         priority: row.priority,
@@ -282,12 +316,13 @@ mod tests {
                 hook,
             }),
             priority: 7,
+            kaish_script_id: None,
         };
         let row = entry_to_row(HookPhase::PreCall, &entry);
         assert_eq!(row.action_kind, "builtin_invoke");
         assert_eq!(row.action_builtin_name.as_deref(), Some("tracing_audit"));
 
-        let (phase2, entry2) = row_to_entry(&row, &registry).unwrap();
+        let (phase2, entry2) = row_to_entry(&row, &registry, &HashMap::new()).unwrap();
         assert_eq!(phase2, HookPhase::PreCall);
         assert_eq!(entry2.id.0, "rt-builtin");
         assert_eq!(entry2.priority, 7);
@@ -316,13 +351,14 @@ mod tests {
             action_kind: ACTION_BUILTIN_INVOKE.into(),
             action_builtin_name: Some("removed_hook_name".into()),
             action_kaish_body: None,
+            action_kaish_script_id: None,
             action_result_text: None,
             action_is_error: None,
             action_deny_reason: None,
             action_log_target: None,
             action_log_level: None,
         };
-        let err = row_to_entry(&row, &registry).unwrap_err();
+        let err = row_to_entry(&row, &registry, &HashMap::new()).unwrap_err();
         match err {
             RowParseError::UnknownBuiltin(name) => assert_eq!(name, "removed_hook_name"),
             other => panic!("expected UnknownBuiltin, got {other:?}"),
@@ -344,9 +380,10 @@ mod tests {
                 structured: None,
             }),
             priority: 0,
+            kaish_script_id: None,
         };
         let row = entry_to_row(HookPhase::OnError, &entry);
-        let (_phase, entry2) = row_to_entry(&row, &registry).unwrap();
+        let (_phase, entry2) = row_to_entry(&row, &registry, &HashMap::new()).unwrap();
         match entry2.action {
             HookAction::ShortCircuit(r) => {
                 assert!(r.is_error);
@@ -373,13 +410,14 @@ mod tests {
             action_kind: ACTION_KAISH_INVOKE.into(),
             action_builtin_name: None,
             action_kaish_body: Some("echo hi".into()),
+            action_kaish_script_id: None,
             action_result_text: None,
             action_is_error: None,
             action_deny_reason: None,
             action_log_target: None,
             action_log_level: None,
         };
-        let (_phase, entry) = row_to_entry(&row, &registry).expect("kaish row reconstructs");
+        let (_phase, entry) = row_to_entry(&row, &registry, &HashMap::new()).expect("kaish row reconstructs");
         match entry.action {
             HookAction::Invoke(HookBody::Kaish(body)) => assert_eq!(body, "echo hi"),
             other => panic!("expected Invoke(Kaish), got {other:?}"),
@@ -400,6 +438,7 @@ mod tests {
             action_kind: ACTION_KAISH_INVOKE.into(),
             action_builtin_name: None,
             action_kaish_body: None,
+            action_kaish_script_id: None,
             action_result_text: None,
             action_is_error: None,
             action_deny_reason: None,
@@ -407,8 +446,128 @@ mod tests {
             action_log_level: None,
         };
         assert!(matches!(
-            row_to_entry(&row, &registry),
+            row_to_entry(&row, &registry, &HashMap::new()),
             Err(RowParseError::MissingKaishBody)
         ));
+    }
+
+    #[test]
+    fn kaish_row_with_script_id_resolves_via_resolver() {
+        let registry = BuiltinHookRegistry::new();
+        let row = HookRow {
+            hook_id: "k".into(),
+            phase: "pre_call".into(),
+            priority: 0,
+            match_instance: None,
+            match_tool: None,
+            match_context: None,
+            match_principal: None,
+            action_kind: ACTION_KAISH_INVOKE.into(),
+            action_builtin_name: None,
+            action_kaish_body: None,
+            action_kaish_script_id: Some("audit-1".into()),
+            action_result_text: None,
+            action_is_error: None,
+            action_deny_reason: None,
+            action_log_target: None,
+            action_log_level: None,
+        };
+        let mut scripts = HashMap::new();
+        scripts.insert("audit-1".to_string(), "exit 0".to_string());
+        let (_phase, entry) =
+            row_to_entry(&row, &registry, &scripts).expect("script_id resolves");
+        match entry.action {
+            HookAction::Invoke(HookBody::Kaish(body)) => assert_eq!(body, "exit 0"),
+            other => panic!("expected Invoke(Kaish), got {other:?}"),
+        }
+        assert_eq!(entry.kaish_script_id.as_deref(), Some("audit-1"));
+    }
+
+    #[test]
+    fn kaish_row_with_unknown_script_id_errors() {
+        let registry = BuiltinHookRegistry::new();
+        let row = HookRow {
+            hook_id: "k".into(),
+            phase: "pre_call".into(),
+            priority: 0,
+            match_instance: None,
+            match_tool: None,
+            match_context: None,
+            match_principal: None,
+            action_kind: ACTION_KAISH_INVOKE.into(),
+            action_builtin_name: None,
+            action_kaish_body: None,
+            action_kaish_script_id: Some("missing".into()),
+            action_result_text: None,
+            action_is_error: None,
+            action_deny_reason: None,
+            action_log_target: None,
+            action_log_level: None,
+        };
+        let scripts = HashMap::new();
+        assert!(matches!(
+            row_to_entry(&row, &registry, &scripts),
+            Err(RowParseError::UnknownHookScript(s)) if s == "missing"
+        ));
+    }
+
+    #[test]
+    fn kaish_row_with_both_body_and_script_id_errors() {
+        let registry = BuiltinHookRegistry::new();
+        let row = HookRow {
+            hook_id: "k".into(),
+            phase: "pre_call".into(),
+            priority: 0,
+            match_instance: None,
+            match_tool: None,
+            match_context: None,
+            match_principal: None,
+            action_kind: ACTION_KAISH_INVOKE.into(),
+            action_builtin_name: None,
+            action_kaish_body: Some("inline".into()),
+            action_kaish_script_id: Some("ref".into()),
+            action_result_text: None,
+            action_is_error: None,
+            action_deny_reason: None,
+            action_log_target: None,
+            action_log_level: None,
+        };
+        assert!(matches!(
+            row_to_entry(&row, &registry, &HashMap::new()),
+            Err(RowParseError::ConflictingKaishSource)
+        ));
+    }
+
+    #[test]
+    fn entry_to_row_writes_script_id_when_set() {
+        // Inline-body and script-backed entries persist to mutually
+        // exclusive columns.
+        let inline = HookEntry {
+            id: HookId("inline".into()),
+            match_instance: None,
+            match_tool: None,
+            match_context: None,
+            match_principal: None,
+            action: HookAction::Invoke(HookBody::Kaish("exit 0".into())),
+            priority: 0,
+            kaish_script_id: None,
+        };
+        let row = entry_to_row(HookPhase::PreCall, &inline);
+        assert_eq!(row.action_kaish_body.as_deref(), Some("exit 0"));
+        assert_eq!(row.action_kaish_script_id, None);
+
+        let scripted = HookEntry {
+            id: HookId("scripted".into()),
+            match_instance: None,
+            match_tool: None,
+            match_context: None,
+            match_principal: None,
+            action: HookAction::Invoke(HookBody::Kaish("exit 0".into())),
+            priority: 0,
+            kaish_script_id: Some("shared-script".into()),
+        };
+        let row = entry_to_row(HookPhase::PreCall, &scripted);
+        assert_eq!(row.action_kaish_body, None);
+        assert_eq!(row.action_kaish_script_id.as_deref(), Some("shared-script"));
     }
 }

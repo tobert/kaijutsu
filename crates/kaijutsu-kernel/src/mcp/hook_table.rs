@@ -119,6 +119,12 @@ pub struct HookEntry {
     pub match_principal: Option<PrincipalId>,
     pub action: HookAction,
     pub priority: i32,
+    /// If `action` is a `HookBody::Kaish` body sourced from the
+    /// `hook_scripts` table, the originating `script_id`. Persistence
+    /// reads this to write `hooks.action_kaish_script_id` rather than
+    /// `hooks.action_kaish_body`. `None` means "inline body authored
+    /// at hook_add time" — the existing case.
+    pub kaish_script_id: Option<String>,
 }
 
 #[derive(Default)]

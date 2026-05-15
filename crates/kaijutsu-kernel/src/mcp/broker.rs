@@ -242,9 +242,9 @@ impl Broker {
     /// field, kaish body) are logged at WARN and skipped individually —
     /// one bad row must not brick the whole hook table.
     async fn hydrate_hooks_from_db(self: &Arc<Self>, db: &DbHandle) {
-        let rows = {
+        let (rows, scripts) = {
             let guard = db.lock();
-            match guard.load_all_hooks() {
+            let rows = match guard.load_all_hooks() {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::warn!(
@@ -253,7 +253,21 @@ impl Broker {
                     );
                     return;
                 }
-            }
+            };
+            // Hook scripts are loaded once and passed by reference into
+            // every `row_to_entry` call so script-backed hooks can
+            // resolve `script_id` → body without per-row DB hits.
+            let scripts: std::collections::HashMap<String, String> = guard
+                .list_all_hook_scripts()
+                .map(|v| v.into_iter().map(|s| (s.script_id, s.body)).collect())
+                .unwrap_or_else(|e| {
+                    tracing::warn!(
+                        error = ?e,
+                        "failed to load hook_scripts; script-backed hooks will fail to hydrate",
+                    );
+                    std::collections::HashMap::new()
+                });
+            (rows, scripts)
         };
         if rows.is_empty() {
             return;
@@ -262,7 +276,7 @@ impl Broker {
         let mut loaded = 0usize;
         let mut skipped = 0usize;
         for row in rows {
-            match super::hook_persist::row_to_entry(&row, &self.builtin_hooks) {
+            match super::hook_persist::row_to_entry(&row, &self.builtin_hooks, &scripts) {
                 Ok((phase, entry)) => {
                     let table = match phase {
                         HookPhase::PreCall => &mut hooks.pre_call,
@@ -291,6 +305,100 @@ impl Broker {
             skipped,
             "hydrated hook tables from DB",
         );
+    }
+
+    /// Look up a hook_script body by id, returning `None` if no DB is
+    /// wired or the script doesn't exist. Used by the admin surface to
+    /// resolve `HookActionWire::KaishScript` at hook_add time so the
+    /// resulting `HookBody::Kaish` carries a runnable body even before
+    /// the next hydrate.
+    pub async fn get_hook_script_body(&self, script_id: &str) -> Option<String> {
+        let db = self.db.read().await.clone()?;
+        let guard = db.lock();
+        match guard.get_hook_script(script_id) {
+            Ok(Some(row)) => Some(row.body),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(
+                    script_id = %script_id,
+                    error = ?e,
+                    "failed to load hook_script",
+                );
+                None
+            }
+        }
+    }
+
+    /// Insert a new shared hook script. Returns the `HookScriptRow` as
+    /// stored. Used by the admin surface; live hook entries that already
+    /// reference this id pick up the body on next hydrate.
+    pub async fn insert_hook_script(
+        &self,
+        row: crate::kernel_db::HookScriptRow,
+    ) -> McpResult<crate::kernel_db::HookScriptRow> {
+        let db = self.db.read().await.clone().ok_or_else(|| McpError::InstanceDown {
+            instance: InstanceId::new("builtin.hooks"),
+            reason: "no DB wired; cannot persist hook scripts".to_string(),
+        })?;
+        let guard = db.lock();
+        guard.insert_hook_script(&row).map_err(|e| McpError::Protocol(format!("insert_hook_script: {e}")))?;
+        Ok(row)
+    }
+
+    /// Update an existing script body (and optional description),
+    /// bumping `updated_at`. Returns `false` if the id doesn't exist.
+    /// Live entries built from this script keep the *old* body until
+    /// the kernel re-hydrates; the docstring on `HookEntry.kaish_
+    /// script_id` calls this out.
+    pub async fn update_hook_script(
+        &self,
+        script_id: &str,
+        body: &str,
+        description: Option<&str>,
+    ) -> McpResult<bool> {
+        let db = self.db.read().await.clone().ok_or_else(|| McpError::InstanceDown {
+            instance: InstanceId::new("builtin.hooks"),
+            reason: "no DB wired; cannot update hook scripts".to_string(),
+        })?;
+        let guard = db.lock();
+        guard
+            .update_hook_script(script_id, body, description)
+            .map_err(|e| McpError::Protocol(format!("update_hook_script: {e}")))
+    }
+
+    /// List all shared hook scripts in the DB.
+    pub async fn list_hook_scripts(
+        &self,
+    ) -> McpResult<Vec<crate::kernel_db::HookScriptRow>> {
+        let db = self.db.read().await.clone().ok_or_else(|| McpError::InstanceDown {
+            instance: InstanceId::new("builtin.hooks"),
+            reason: "no DB wired".to_string(),
+        })?;
+        let guard = db.lock();
+        guard.list_all_hook_scripts().map_err(|e| McpError::Protocol(format!("list_hook_scripts: {e}")))
+    }
+
+    /// Delete a shared hook script. Refuses (returns
+    /// `McpError::Protocol`) if any persisted hook still references the
+    /// id — callers must drop the referencing hooks first.
+    pub async fn delete_hook_script(&self, script_id: &str) -> McpResult<bool> {
+        let db = self.db.read().await.clone().ok_or_else(|| McpError::InstanceDown {
+            instance: InstanceId::new("builtin.hooks"),
+            reason: "no DB wired".to_string(),
+        })?;
+        let guard = db.lock();
+        let refs = guard
+            .count_hooks_referencing_script(script_id)
+            .map_err(|e| McpError::Protocol(format!("delete_hook_script: {e}")))?;
+        if refs > 0 {
+            return Err(McpError::Protocol(format!(
+                "hook script '{script_id}' is referenced by {refs} hook(s); \
+                 drop the referencing hooks before deleting"
+            )));
+        }
+        guard
+            .delete_hook_script(script_id)
+            .map_err(|e| McpError::Protocol(format!("delete_hook_script: {e}")))
     }
 
     /// Persist one hook entry to the DB after `hook_add`. Best-effort:
@@ -4166,6 +4274,7 @@ mod tests {
                 level,
             }),
             priority: 0,
+            kaish_script_id: None,
         }
     }
 
@@ -4200,6 +4309,7 @@ mod tests {
             match_principal: None,
             action: HookAction::Deny("not today".into()),
             priority: 0,
+            kaish_script_id: None,
         });
 
         let err = broker
@@ -4251,6 +4361,7 @@ mod tests {
             match_principal: None,
             action: HookAction::ShortCircuit(KernelToolResult::text("from hook")),
             priority: 0,
+            kaish_script_id: None,
         });
 
         let result = broker
@@ -4308,6 +4419,7 @@ mod tests {
                 hook,
             }),
             priority: 0,
+            kaish_script_id: None,
         });
 
         broker
@@ -4371,6 +4483,7 @@ mod tests {
                 hook: Arc::new(Counter(on_err.clone())),
             }),
             priority: 0,
+            kaish_script_id: None,
         });
         broker.hooks().write().await.post_call.entries.push(HookEntry {
             id: hook_id("post-count"),
@@ -4383,6 +4496,7 @@ mod tests {
                 hook: Arc::new(Counter(post.clone())),
             }),
             priority: 0,
+            kaish_script_id: None,
         });
 
         let err = broker
@@ -4423,6 +4537,7 @@ mod tests {
             match_principal: None,
             action: HookAction::ShortCircuit(KernelToolResult::text("rescued")),
             priority: 0,
+            kaish_script_id: None,
         });
 
         let result = broker
@@ -4461,6 +4576,7 @@ mod tests {
             match_principal: None,
             action: HookAction::Deny("foo is forbidden".into()),
             priority: 0,
+            kaish_script_id: None,
         });
 
         let foo_err = broker
@@ -4506,6 +4622,7 @@ mod tests {
             match_principal: None,
             action: HookAction::Deny("wrong ctx".into()),
             priority: 0,
+            kaish_script_id: None,
         });
 
         let mut matching = CallContext::test();
@@ -4546,6 +4663,7 @@ mod tests {
                 match_principal: None,
                 action: HookAction::Deny("low-pri".into()),
                 priority: 0,
+                kaish_script_id: None,
             });
             hooks.pre_call.entries.push(HookEntry {
                 id: hook_id("high"),
@@ -4555,6 +4673,7 @@ mod tests {
                 match_principal: None,
                 action: HookAction::Deny("high-pri".into()),
                 priority: -1, // evaluates first because priority ascending
+                kaish_script_id: None,
             });
         }
         let err = broker
@@ -4647,6 +4766,7 @@ mod tests {
             match_principal: None,
             action: HookAction::ShortCircuit(KernelToolResult::text("sc")),
             priority: 0,
+            kaish_script_id: None,
         });
 
         broker
@@ -4755,6 +4875,7 @@ mod tests {
                     hook: Arc::new(Counter(n.clone())),
                 }),
                 priority: 0,
+                kaish_script_id: None,
             });
 
         let _ = tx.send(ServerNotification::Log {
@@ -4848,6 +4969,7 @@ mod tests {
                     hook: Arc::new(Counter(n.clone())),
                 }),
                 priority: 0,
+                kaish_script_id: None,
             });
 
         for i in 0..25 {
@@ -4893,6 +5015,7 @@ mod tests {
                 match_principal: None,
                 action: HookAction::Deny("muted".into()),
                 priority: 0,
+                kaish_script_id: None,
             });
 
         let _ = tx.send(ServerNotification::Log {
@@ -4955,6 +5078,7 @@ mod tests {
                 hook: hook as Arc<dyn Hook>,
             }),
             priority: 0,
+            kaish_script_id: None,
         });
 
         let err = broker
@@ -5035,6 +5159,7 @@ mod tests {
                 hook: hook as Arc<dyn Hook>,
             }),
             priority: 0,
+            kaish_script_id: None,
         });
 
         let result = broker
@@ -5102,6 +5227,7 @@ mod tests {
             match_principal: None,
             action: HookAction::Invoke(HookBody::Kaish("exit 0".into())),
             priority: 0,
+            kaish_script_id: None,
         });
 
         let result = broker
@@ -5124,6 +5250,7 @@ mod tests {
             match_principal: None,
             action: HookAction::Invoke(HookBody::Kaish("exit 1".into())),
             priority: 0,
+            kaish_script_id: None,
         });
 
         let err = broker
@@ -5195,6 +5322,7 @@ mod tests {
             match_principal: None,
             action: HookAction::Invoke(HookBody::Kaish(body.into())),
             priority: 0,
+            kaish_script_id: None,
         });
 
         let result = broker
@@ -5241,6 +5369,7 @@ mod tests {
                 hook: Arc::new(Panicker),
             }),
             priority: 0,
+            kaish_script_id: None,
         });
 
         let broker2 = broker.clone();
@@ -5318,6 +5447,7 @@ mod tests {
                 match_principal: None,
                 action: HookAction::ShortCircuit(KernelToolResult::text("swallowed")),
                 priority: 0,
+                kaish_script_id: None,
             });
 
         for _ in 0..5 {
@@ -5525,6 +5655,7 @@ mod tests {
                 match_principal: None,
                 action: HookAction::Deny("read-only context".into()),
                 priority: 0,
+                kaish_script_id: None,
             });
 
         let call_ctx = {
@@ -5578,6 +5709,7 @@ mod tests {
                 match_principal: None,
                 action: HookAction::Deny("read-only".into()),
                 priority: 0,
+                kaish_script_id: None,
             });
 
         // Prime the binding's name_map by listing visible tools first.
@@ -5635,6 +5767,7 @@ mod tests {
                     level: tracing::Level::INFO,
                 }),
                 priority: 0,
+                kaish_script_id: None,
             });
 
         let call_ctx = {
@@ -5676,6 +5809,7 @@ mod tests {
                 level: tracing::Level::INFO,
             }),
             priority: 0,
+            kaish_script_id: None,
         }
     }
 
@@ -5704,6 +5838,7 @@ mod tests {
                     action_kind: "log".into(),
                     action_builtin_name: None,
                     action_kaish_body: None,
+                    action_kaish_script_id: None,
                     action_result_text: None,
                     action_is_error: None,
                     action_deny_reason: None,
@@ -5721,6 +5856,7 @@ mod tests {
                     action_kind: "log".into(),
                     action_builtin_name: None,
                     action_kaish_body: None,
+                    action_kaish_script_id: None,
                     action_result_text: None,
                     action_is_error: None,
                     action_deny_reason: None,
@@ -5738,6 +5874,7 @@ mod tests {
                     action_kind: "log".into(),
                     action_builtin_name: None,
                     action_kaish_body: None,
+                    action_kaish_script_id: None,
                     action_result_text: None,
                     action_is_error: None,
                     action_deny_reason: None,
@@ -5827,6 +5964,7 @@ mod tests {
                     action_kind: "builtin_invoke".into(),
                     action_builtin_name: Some("no_such_builtin".into()),
                     action_kaish_body: None,
+                    action_kaish_script_id: None,
                     action_result_text: None,
                     action_is_error: None,
                     action_deny_reason: None,
@@ -5846,6 +5984,7 @@ mod tests {
                     action_kind: "log".into(),
                     action_builtin_name: None,
                     action_kaish_body: None,
+                    action_kaish_script_id: None,
                     action_result_text: None,
                     action_is_error: None,
                     action_deny_reason: None,
@@ -5906,6 +6045,7 @@ mod tests {
             match_principal: None,
             action: HookAction::Invoke(HookBody::Kaish(body.into())),
             priority: 0,
+            kaish_script_id: None,
         });
 
         let result = broker
@@ -5947,6 +6087,7 @@ mod tests {
             match_principal: None,
             action: HookAction::Invoke(HookBody::Kaish(body.into())),
             priority: 0,
+            kaish_script_id: None,
         });
 
         let result = broker
@@ -5988,6 +6129,7 @@ mod tests {
             match_principal: None,
             action: HookAction::Invoke(HookBody::Kaish(body.into())),
             priority: 0,
+            kaish_script_id: None,
         });
 
         let err = broker

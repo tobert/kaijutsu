@@ -48,6 +48,12 @@ pub enum HookActionWire {
     /// Evaluated at fire time via `EmbeddedKaish::execute_with_vars`.
     /// Exit 0 → phase continues; non-zero → `PhaseOutcome::Deny`.
     Kaish { body: String },
+    /// Reference to a stored shared script in the `hook_scripts` table.
+    /// Resolved at hook_add time so the resulting `HookEntry` carries
+    /// a runnable `HookBody::Kaish(body)`; the originating `script_id`
+    /// is preserved on `HookEntry.kaish_script_id` so persistence
+    /// writes `hooks.action_kaish_script_id`.
+    KaishScript { script_id: String },
     /// Return a synthetic result in lieu of calling the server.
     ShortCircuit {
         result_text: String,
@@ -96,6 +102,38 @@ pub struct HookListParams {
 #[serde(deny_unknown_fields)]
 pub struct HookInspectParams {
     pub hook_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HookScriptAddParams {
+    /// Caller-supplied id; else a UUID v4 is generated. Must be unique
+    /// per kernel.
+    pub script_id: Option<String>,
+    /// Inline kaish source body.
+    pub body: String,
+    /// Optional human-readable description (shown in `hook_script_list`).
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HookScriptUpdateParams {
+    pub script_id: String,
+    pub body: String,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HookScriptInspectParams {
+    pub script_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HookScriptRemoveParams {
+    pub script_id: String,
 }
 
 pub struct BuiltinHooksServer {
@@ -160,7 +198,8 @@ fn validate_action_for_phase(phase: HookPhase, action: &HookActionWire) -> McpRe
         match action {
             HookActionWire::BuiltinInvoke { .. }
             | HookActionWire::ShortCircuit { .. }
-            | HookActionWire::Kaish { .. } => return Err(McpError::Unsupported),
+            | HookActionWire::Kaish { .. }
+            | HookActionWire::KaishScript { .. } => return Err(McpError::Unsupported),
             HookActionWire::Deny { .. } | HookActionWire::Log { .. } => {}
         }
     }
@@ -190,13 +229,19 @@ fn level_to_str(level: tracing::Level) -> &'static str {
     }
 }
 
-/// Parse an admin-wire `HookActionWire` into a `HookAction`. Uses the
-/// supplied broker for builtin-name resolution.
-fn build_hook_action(
+/// Parse an admin-wire `HookActionWire` into a `(HookAction,
+/// kaish_script_id)` pair. The second element is `Some(script_id)` when
+/// the wire variant is `KaishScript` so the caller can tag the resulting
+/// `HookEntry` for persistence; `None` for every other variant.
+///
+/// `KaishScript` resolves the script body via the broker so the returned
+/// `HookAction::Invoke(HookBody::Kaish(body))` is runnable immediately —
+/// there's no second resolution at fire time.
+async fn build_hook_action(
     broker: &Arc<Broker>,
     action: HookActionWire,
     instance: &InstanceId,
-) -> McpResult<HookAction> {
+) -> McpResult<(HookAction, Option<String>)> {
     Ok(match action {
         HookActionWire::BuiltinInvoke { name } => {
             let hook = broker
@@ -206,24 +251,46 @@ fn build_hook_action(
                     instance: instance.clone(),
                     tool: format!("builtin:{name}"),
                 })?;
-            HookAction::Invoke(HookBody::Builtin { name, hook })
+            (HookAction::Invoke(HookBody::Builtin { name, hook }), None)
         }
-        HookActionWire::Kaish { body } => HookAction::Invoke(HookBody::Kaish(body)),
+        HookActionWire::Kaish { body } => {
+            (HookAction::Invoke(HookBody::Kaish(body)), None)
+        }
+        HookActionWire::KaishScript { script_id } => {
+            let body = broker
+                .get_hook_script_body(&script_id)
+                .await
+                .ok_or_else(|| {
+                    McpError::Protocol(format!(
+                        "hook script '{script_id}' not found; create it with hook_script_add first"
+                    ))
+                })?;
+            (
+                HookAction::Invoke(HookBody::Kaish(body)),
+                Some(script_id),
+            )
+        }
         HookActionWire::ShortCircuit {
             result_text,
             is_error,
-        } => HookAction::ShortCircuit(KernelToolResult {
-            is_error: is_error.unwrap_or(false),
-            content: vec![ToolContent::Text(result_text)],
-            structured: None,
-        }),
-        HookActionWire::Deny { reason } => HookAction::Deny(reason),
+        } => (
+            HookAction::ShortCircuit(KernelToolResult {
+                is_error: is_error.unwrap_or(false),
+                content: vec![ToolContent::Text(result_text)],
+                structured: None,
+            }),
+            None,
+        ),
+        HookActionWire::Deny { reason } => (HookAction::Deny(reason), None),
         HookActionWire::Log { target, level } => {
             let level = parse_tracing_level(&level)?;
-            HookAction::Log(LogSpec {
-                target: target.unwrap_or_else(|| "kaijutsu::hooks".to_string()),
-                level,
-            })
+            (
+                HookAction::Log(LogSpec {
+                    target: target.unwrap_or_else(|| "kaijutsu::hooks".to_string()),
+                    level,
+                }),
+                None,
+            )
         }
     })
 }
@@ -288,12 +355,26 @@ impl McpServerLike for BuiltinHooksServer {
         let remove_schema = schemars::schema_for!(HookRemoveParams);
         let list_schema = schemars::schema_for!(HookListParams);
         let inspect_schema = schemars::schema_for!(HookInspectParams);
+        let script_add_schema = schemars::schema_for!(HookScriptAddParams);
+        let script_update_schema = schemars::schema_for!(HookScriptUpdateParams);
+        let script_inspect_schema = schemars::schema_for!(HookScriptInspectParams);
+        let script_remove_schema = schemars::schema_for!(HookScriptRemoveParams);
         let add_val = serde_json::to_value(&add_schema).map_err(McpError::InvalidParams)?;
         let remove_val =
             serde_json::to_value(&remove_schema).map_err(McpError::InvalidParams)?;
         let list_val = serde_json::to_value(&list_schema).map_err(McpError::InvalidParams)?;
         let inspect_val =
             serde_json::to_value(&inspect_schema).map_err(McpError::InvalidParams)?;
+        let script_add_val =
+            serde_json::to_value(&script_add_schema).map_err(McpError::InvalidParams)?;
+        let script_update_val =
+            serde_json::to_value(&script_update_schema).map_err(McpError::InvalidParams)?;
+        let script_inspect_val =
+            serde_json::to_value(&script_inspect_schema).map_err(McpError::InvalidParams)?;
+        let script_remove_val =
+            serde_json::to_value(&script_remove_schema).map_err(McpError::InvalidParams)?;
+        // hook_script_list takes no params; advertise an empty object schema.
+        let script_list_val = serde_json::json!({"type": "object", "properties": {}});
         Ok(vec![
             KernelTool {
                 instance: self.instance_id.clone(),
@@ -332,6 +413,58 @@ impl McpServerLike for BuiltinHooksServer {
                         .to_string(),
                 ),
                 input_schema: inspect_val,
+            },
+            KernelTool {
+                instance: self.instance_id.clone(),
+                name: "hook_script_add".to_string(),
+                description: Some(
+                    "Create a shared kaish hook script. Hooks reference \
+                     it by `script_id` via `KaishScript` action; one \
+                     script body, many hooks."
+                        .to_string(),
+                ),
+                input_schema: script_add_val,
+            },
+            KernelTool {
+                instance: self.instance_id.clone(),
+                name: "hook_script_update".to_string(),
+                description: Some(
+                    "Replace the body of a shared script. Updates apply \
+                     to new hook_add calls and to existing entries on \
+                     next kernel hydrate; in-flight entries keep the \
+                     prior body."
+                        .to_string(),
+                ),
+                input_schema: script_update_val,
+            },
+            KernelTool {
+                instance: self.instance_id.clone(),
+                name: "hook_script_list".to_string(),
+                description: Some(
+                    "List shared kaish hook scripts (id + description + \
+                     body length)."
+                        .to_string(),
+                ),
+                input_schema: script_list_val,
+            },
+            KernelTool {
+                instance: self.instance_id.clone(),
+                name: "hook_script_inspect".to_string(),
+                description: Some(
+                    "Return the full body of one shared hook script.".to_string(),
+                ),
+                input_schema: script_inspect_val,
+            },
+            KernelTool {
+                instance: self.instance_id.clone(),
+                name: "hook_script_remove".to_string(),
+                description: Some(
+                    "Delete a shared hook script. Refuses if any hook \
+                     still references it; drop the referencing hooks \
+                     first."
+                        .to_string(),
+                ),
+                input_schema: script_remove_val,
             },
         ])
     }
@@ -372,7 +505,8 @@ impl McpServerLike for BuiltinHooksServer {
                         })
                     })
                     .transpose()?;
-                let action = build_hook_action(&broker, p.action, &self.instance_id)?;
+                let (action, kaish_script_id) =
+                    build_hook_action(&broker, p.action, &self.instance_id).await?;
                 let id = p
                     .hook_id
                     .unwrap_or_else(|| Uuid::new_v4().to_string());
@@ -382,6 +516,7 @@ impl McpServerLike for BuiltinHooksServer {
                     match_tool: p.match_tool.map(GlobPattern),
                     match_context,
                     match_principal,
+                    kaish_script_id,
                     action,
                     priority: p.priority.unwrap_or(0),
                 };
@@ -485,6 +620,104 @@ impl McpServerLike for BuiltinHooksServer {
                     instance: self.instance_id.clone(),
                     tool: format!("hook:{}", p.hook_id),
                 })?;
+                Ok(KernelToolResult {
+                    is_error: false,
+                    content: vec![ToolContent::Json(json.clone())],
+                    structured: Some(json),
+                })
+            }
+            "hook_script_add" => {
+                let p: HookScriptAddParams =
+                    serde_json::from_value(params.arguments.clone())
+                        .map_err(McpError::InvalidParams)?;
+                let script_id = p
+                    .script_id
+                    .unwrap_or_else(|| Uuid::new_v4().to_string());
+                let now = kaijutsu_types::now_millis() as i64;
+                let row = crate::kernel_db::HookScriptRow {
+                    script_id: script_id.clone(),
+                    body: p.body,
+                    description: p.description,
+                    created_at: now,
+                    created_by: PrincipalId::system(),
+                    updated_at: now,
+                };
+                broker.insert_hook_script(row).await?;
+                let json = serde_json::json!({ "script_id": script_id });
+                Ok(KernelToolResult {
+                    is_error: false,
+                    content: vec![ToolContent::Json(json.clone())],
+                    structured: Some(json),
+                })
+            }
+            "hook_script_update" => {
+                let p: HookScriptUpdateParams =
+                    serde_json::from_value(params.arguments.clone())
+                        .map_err(McpError::InvalidParams)?;
+                let updated = broker
+                    .update_hook_script(&p.script_id, &p.body, p.description.as_deref())
+                    .await?;
+                if !updated {
+                    return Err(McpError::ToolNotFound {
+                        instance: self.instance_id.clone(),
+                        tool: format!("hook_script:{}", p.script_id),
+                    });
+                }
+                let json = serde_json::json!({ "updated": true });
+                Ok(KernelToolResult {
+                    is_error: false,
+                    content: vec![ToolContent::Json(json.clone())],
+                    structured: Some(json),
+                })
+            }
+            "hook_script_list" => {
+                let scripts = broker.list_hook_scripts().await?;
+                let out: Vec<serde_json::Value> = scripts
+                    .iter()
+                    .map(|s| {
+                        serde_json::json!({
+                            "script_id": s.script_id,
+                            "description": s.description,
+                            "body_len": s.body.len(),
+                            "created_at": s.created_at,
+                            "updated_at": s.updated_at,
+                        })
+                    })
+                    .collect();
+                let json = serde_json::json!({ "scripts": out });
+                Ok(KernelToolResult {
+                    is_error: false,
+                    content: vec![ToolContent::Json(json.clone())],
+                    structured: Some(json),
+                })
+            }
+            "hook_script_inspect" => {
+                let p: HookScriptInspectParams =
+                    serde_json::from_value(params.arguments.clone())
+                        .map_err(McpError::InvalidParams)?;
+                let body = broker
+                    .get_hook_script_body(&p.script_id)
+                    .await
+                    .ok_or_else(|| McpError::ToolNotFound {
+                        instance: self.instance_id.clone(),
+                        tool: format!("hook_script:{}", p.script_id),
+                    })?;
+                let json = serde_json::json!({
+                    "script_id": p.script_id,
+                    "body": body,
+                });
+                Ok(KernelToolResult {
+                    is_error: false,
+                    content: vec![ToolContent::Json(json.clone())],
+                    structured: Some(json),
+                })
+            }
+            "hook_script_remove" => {
+                let p: HookScriptRemoveParams =
+                    serde_json::from_value(params.arguments.clone())
+                        .map_err(McpError::InvalidParams)?;
+                let removed = broker.delete_hook_script(&p.script_id).await?;
+                let json = serde_json::json!({ "removed": removed });
                 Ok(KernelToolResult {
                     is_error: false,
                     content: vec![ToolContent::Json(json.clone())],
@@ -1003,6 +1236,7 @@ mod tests {
                 match_tool: None,
                 match_context: None,
                 match_principal: None,
+                kaish_script_id: None,
                 action: HookAction::Deny("locked out".into()),
                 priority: 0,
             });
@@ -1052,6 +1286,252 @@ mod tests {
                 .and_then(|v| v.get("removed"))
                 .and_then(|b| b.as_bool()),
             Some(false),
+        );
+    }
+
+    // ── hook_scripts admin flow ────────────────────────────────────
+
+    fn broker_with_db() -> Arc<Broker> {
+        use crate::kernel_db::KernelDb;
+        let broker = Arc::new(Broker::new());
+        let db: crate::block_store::DbHandle =
+            Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+        let broker_clone = broker.clone();
+        // set_db is async; resolve synchronously via a one-shot block_on
+        // — these tests are already inside `tokio::test`, but the
+        // helper itself isn't async. Grafted via `tokio::runtime::Handle`.
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                broker_clone.set_db(db).await;
+            })
+        });
+        broker
+    }
+
+    /// `hook_script_add` → `hook_script_inspect` → `hook_script_list`
+    /// — verify the body round-trips and `body_len` is reported in
+    /// list output.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn hook_script_admin_round_trip() {
+        let broker = broker_with_db();
+        let server = Arc::new(BuiltinHooksServer::new(Arc::downgrade(&broker)));
+        broker
+            .register(server, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        let add = broker
+            .call_tool(
+                call_params(
+                    "hook_script_add",
+                    serde_json::json!({
+                        "script_id": "audit-passthrough",
+                        "body": "echo audited; exit 0",
+                        "description": "Mark every call as audited.",
+                    }),
+                ),
+                &CallContext::test(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("hook_script_add should succeed");
+        assert_eq!(
+            add.structured
+                .as_ref()
+                .and_then(|v| v.get("script_id"))
+                .and_then(|v| v.as_str()),
+            Some("audit-passthrough"),
+        );
+
+        let inspect = broker
+            .call_tool(
+                call_params(
+                    "hook_script_inspect",
+                    serde_json::json!({"script_id": "audit-passthrough"}),
+                ),
+                &CallContext::test(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("hook_script_inspect should succeed");
+        assert_eq!(
+            inspect
+                .structured
+                .as_ref()
+                .and_then(|v| v.get("body"))
+                .and_then(|v| v.as_str()),
+            Some("echo audited; exit 0"),
+        );
+
+        let list = broker
+            .call_tool(
+                call_params("hook_script_list", serde_json::json!({})),
+                &CallContext::test(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let arr = list
+            .structured
+            .as_ref()
+            .and_then(|v| v.get("scripts"))
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0].get("body_len").and_then(|v| v.as_u64()), Some(20));
+    }
+
+    /// `hook_add` with a `kaish_script` action resolves the script body
+    /// at add time and tags the live entry with `kaish_script_id` so
+    /// persistence can write it to `action_kaish_script_id`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn hook_add_kaish_script_resolves_and_tags_entry() {
+        let broker = broker_with_db();
+        let server = Arc::new(BuiltinHooksServer::new(Arc::downgrade(&broker)));
+        broker
+            .register(server, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        broker
+            .call_tool(
+                call_params(
+                    "hook_script_add",
+                    serde_json::json!({
+                        "script_id": "shared-pass",
+                        "body": "exit 0",
+                    }),
+                ),
+                &CallContext::test(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        broker
+            .call_tool(
+                call_params(
+                    "hook_add",
+                    serde_json::json!({
+                        "phase": "pre_call",
+                        "action": {
+                            "type": "kaish_script",
+                            "script_id": "shared-pass",
+                        },
+                    }),
+                ),
+                &CallContext::test(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("hook_add with kaish_script should succeed");
+
+        let hooks = broker.hooks().read().await;
+        let entry = hooks.pre_call.entries.first().expect("entry installed");
+        assert_eq!(entry.kaish_script_id.as_deref(), Some("shared-pass"));
+        match &entry.action {
+            HookAction::Invoke(HookBody::Kaish(body)) => assert_eq!(body, "exit 0"),
+            other => panic!("expected Invoke(Kaish), got {other:?}"),
+        }
+    }
+
+    /// Referencing a script that doesn't exist is a clear error at
+    /// add time (rather than a silent install that fires-then-fails).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn hook_add_kaish_script_unknown_id_fails_fast() {
+        let broker = broker_with_db();
+        let server = Arc::new(BuiltinHooksServer::new(Arc::downgrade(&broker)));
+        broker
+            .register(server, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        let err = broker
+            .call_tool(
+                call_params(
+                    "hook_add",
+                    serde_json::json!({
+                        "phase": "pre_call",
+                        "action": {
+                            "type": "kaish_script",
+                            "script_id": "nope",
+                        },
+                    }),
+                ),
+                &CallContext::test(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, McpError::Protocol(ref msg) if msg.contains("nope")),
+            "expected Protocol error mentioning the script_id, got {err:?}",
+        );
+    }
+
+    /// `hook_script_remove` refuses to delete a script that's still
+    /// referenced by a persisted hook — operators must drop the
+    /// referencing hooks first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn hook_script_remove_refuses_when_referenced() {
+        let broker = broker_with_db();
+        let server = Arc::new(BuiltinHooksServer::new(Arc::downgrade(&broker)));
+        broker
+            .register(server, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        broker
+            .call_tool(
+                call_params(
+                    "hook_script_add",
+                    serde_json::json!({"script_id": "needed", "body": "exit 0"}),
+                ),
+                &CallContext::test(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        broker
+            .call_tool(
+                call_params(
+                    "hook_add",
+                    serde_json::json!({
+                        "phase": "pre_call",
+                        // Scope to a non-admin instance so this hook
+                        // doesn't fire on the `hook_script_remove`
+                        // call below — that admin path is what we're
+                        // testing, and a non-wired kaish body would
+                        // produce a spurious Deny.
+                        "match_instance": "svc",
+                        "action": {
+                            "type": "kaish_script",
+                            "script_id": "needed",
+                        },
+                    }),
+                ),
+                &CallContext::test(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let err = broker
+            .call_tool(
+                call_params(
+                    "hook_script_remove",
+                    serde_json::json!({"script_id": "needed"}),
+                ),
+                &CallContext::test(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, McpError::Protocol(ref msg) if msg.contains("referenced by")),
+            "expected Protocol error explaining the reference count, got {err:?}",
         );
     }
 }

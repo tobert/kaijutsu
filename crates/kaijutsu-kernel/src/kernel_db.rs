@@ -110,12 +110,31 @@ pub struct HookRow {
     pub match_principal: Option<PrincipalId>,
     pub action_kind: String,
     pub action_builtin_name: Option<String>,
+    /// Inline kaish body. Mutually exclusive with `action_kaish_script_id`
+    /// when `action_kind = "kaish_invoke"`.
     pub action_kaish_body: Option<String>,
+    /// Reference into `hook_scripts(script_id)`. Mutually exclusive with
+    /// `action_kaish_body`.
+    pub action_kaish_script_id: Option<String>,
     pub action_result_text: Option<String>,
     pub action_is_error: Option<bool>,
     pub action_deny_reason: Option<String>,
     pub action_log_target: Option<String>,
     pub action_log_level: Option<String>,
+}
+
+/// A shared kaish script body, referenced by zero or more hooks via
+/// `hooks.action_kaish_script_id`. DB-global (matches the `hooks`
+/// table); `script_id` is caller-supplied (defaults to UUIDv4 at the
+/// admin surface) so common scripts can be addressed by stable name.
+#[derive(Debug, Clone)]
+pub struct HookScriptRow {
+    pub script_id: String,
+    pub body: String,
+    pub description: Option<String>,
+    pub created_at: i64,
+    pub created_by: PrincipalId,
+    pub updated_at: i64,
 }
 
 /// A run-control (rc) script row.
@@ -453,28 +472,56 @@ CREATE INDEX IF NOT EXISTS idx_ctx_env ON context_env(context_id);
 -- nullable and set only for the matching kind. Not FK-linked — hooks
 -- are global, not per-context.
 CREATE TABLE IF NOT EXISTS hooks (
-    hook_id                TEXT    NOT NULL PRIMARY KEY,
-    phase                  TEXT    NOT NULL,
-    priority               INTEGER NOT NULL,
-    insertion_idx          INTEGER NOT NULL,
-    match_instance         TEXT,
-    match_tool             TEXT,
-    match_context          BLOB,
-    match_principal        TEXT,
-    action_kind            TEXT    NOT NULL,
-    action_builtin_name    TEXT,
-    action_kaish_body TEXT,
-    action_result_text     TEXT,
-    action_is_error        INTEGER,
-    action_deny_reason     TEXT,
-    action_log_target      TEXT,
-    action_log_level       TEXT,
-    updated_at             INTEGER NOT NULL
+    hook_id                  TEXT    NOT NULL PRIMARY KEY,
+    phase                    TEXT    NOT NULL,
+    priority                 INTEGER NOT NULL,
+    insertion_idx            INTEGER NOT NULL,
+    match_instance           TEXT,
+    match_tool               TEXT,
+    match_context            BLOB,
+    match_principal          TEXT,
+    action_kind              TEXT    NOT NULL,
+    action_builtin_name      TEXT,
+    -- Inline kaish body authored at hook_add time. Mutually
+    -- exclusive with `action_kaish_script_id` — exactly one is set
+    -- when `action_kind = 'kaish_invoke'`.
+    action_kaish_body        TEXT,
+    -- Reference into `hook_scripts(script_id)`. Stored hooks resolve
+    -- the body via JOIN at hydrate time; runtime stores the snapshot
+    -- in HookEntry. Updates to the script require re-hydration to
+    -- propagate.
+    action_kaish_script_id   TEXT,
+    action_result_text       TEXT,
+    action_is_error          INTEGER,
+    action_deny_reason       TEXT,
+    action_log_target        TEXT,
+    action_log_level         TEXT,
+    updated_at               INTEGER NOT NULL
         DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
     UNIQUE (phase, insertion_idx)
 );
 CREATE INDEX IF NOT EXISTS idx_hooks_phase_priority
     ON hooks(phase, priority, insertion_idx);
+CREATE INDEX IF NOT EXISTS idx_hooks_kaish_script_id
+    ON hooks(action_kaish_script_id);
+
+-- ── Hook scripts (DB-global shared kaish bodies) ──────────────
+-- Reusable kaish bodies for hooks. Hooks reference these by
+-- `script_id`; the body is resolved at broker hydrate time. Edits
+-- require re-hydration (kernel restart or future reload op) to
+-- propagate to live entries. DB-global (matches the `hooks` table,
+-- which also has no kernel_id column). Deletion fails if any hook
+-- still references the script.
+CREATE TABLE IF NOT EXISTS hook_scripts (
+    script_id   TEXT    NOT NULL PRIMARY KEY,
+    body        TEXT    NOT NULL,
+    description TEXT,
+    created_at  INTEGER NOT NULL
+        DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
+    created_by  BLOB    NOT NULL,
+    updated_at  INTEGER NOT NULL
+        DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER))
+);
 
 -- ── Run-Control (rc) scripts ──────────────────────────────────────
 -- Lifecycle scripts at /etc/rc/<context_type>/<verb>/SXX-name.{kai,md}.
@@ -837,6 +884,19 @@ impl KernelDb {
             info!("Migration: adding timeout_secs column to rc_scripts table");
             conn.execute_batch(
                 "ALTER TABLE rc_scripts ADD COLUMN timeout_secs INTEGER;",
+            )?;
+        }
+        // 2026-05-15: hook_scripts table + hooks.action_kaish_script_id.
+        // Existing kaish hooks keep their inline `action_kaish_body`;
+        // new ones can opt into shared scripts by setting `action_
+        // kaish_script_id` instead.
+        let has_kaish_script_id: bool = conn
+            .prepare("SELECT action_kaish_script_id FROM hooks LIMIT 0")
+            .is_ok();
+        if !has_kaish_script_id {
+            info!("Migration: adding action_kaish_script_id column to hooks table");
+            conn.execute_batch(
+                "ALTER TABLE hooks ADD COLUMN action_kaish_script_id TEXT;",
             )?;
         }
         Ok(())
@@ -2469,7 +2529,7 @@ impl KernelDb {
                 hook_id, phase, priority, insertion_idx,
                 match_instance, match_tool, match_context, match_principal,
                 action_kind,
-                action_builtin_name, action_kaish_body,
+                action_builtin_name, action_kaish_body, action_kaish_script_id,
                 action_result_text, action_is_error,
                 action_deny_reason,
                 action_log_target, action_log_level
@@ -2478,10 +2538,10 @@ impl KernelDb {
                 (SELECT COALESCE(MAX(insertion_idx), -1) + 1 FROM hooks WHERE phase = ?2),
                 ?4, ?5, ?6, ?7,
                 ?8,
-                ?9, ?10,
-                ?11, ?12,
-                ?13,
-                ?14, ?15
+                ?9, ?10, ?11,
+                ?12, ?13,
+                ?14,
+                ?15, ?16
              )",
             params![
                 row.hook_id,
@@ -2494,6 +2554,7 @@ impl KernelDb {
                 row.action_kind,
                 row.action_builtin_name,
                 row.action_kaish_body,
+                row.action_kaish_script_id,
                 row.action_result_text,
                 is_error,
                 row.action_deny_reason,
@@ -2512,6 +2573,107 @@ impl KernelDb {
         Ok(rows > 0)
     }
 
+    // ========================================================================
+    // Hook scripts (kernel-global shared kaish bodies)
+    // ========================================================================
+
+    /// Insert a new hook script. Duplicate `script_id` returns
+    /// `KernelDbError::AlreadyExists` so callers can distinguish create
+    /// vs update.
+    pub fn insert_hook_script(&self, row: &HookScriptRow) -> KernelDbResult<()> {
+        self.conn
+            .execute(
+                "INSERT INTO hook_scripts (
+                    script_id, body, description,
+                    created_at, created_by, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    row.script_id,
+                    row.body,
+                    row.description,
+                    row.created_at,
+                    blob_param(row.created_by.as_bytes()),
+                    row.updated_at,
+                ],
+            )
+            .map_err(|e| {
+                map_unique_violation(e, format!("hook script '{}' already exists", row.script_id))
+            })?;
+        Ok(())
+    }
+
+    /// Replace the body (and optional description) of an existing
+    /// script, bumping `updated_at`. Returns `Ok(false)` if no row
+    /// exists with the given `script_id`.
+    pub fn update_hook_script(
+        &self,
+        script_id: &str,
+        body: &str,
+        description: Option<&str>,
+    ) -> KernelDbResult<bool> {
+        let now = kaijutsu_types::now_millis() as i64;
+        let rows = self.conn.execute(
+            "UPDATE hook_scripts
+             SET body = ?2, description = ?3, updated_at = ?4
+             WHERE script_id = ?1",
+            params![script_id, body, description, now],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Look up a single script by id.
+    pub fn get_hook_script(&self, script_id: &str) -> KernelDbResult<Option<HookScriptRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT script_id, body, description,
+                    created_at, created_by, updated_at
+             FROM hook_scripts
+             WHERE script_id = ?1",
+        )?;
+        let mut rows = stmt.query(params![script_id])?;
+        if let Some(r) = rows.next()? {
+            Ok(Some(row_to_hook_script_row(r)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Load every hook script in the DB, ordered by `script_id`.
+    /// Used by both the admin surface (`hook_script_list`) and
+    /// `Broker::hydrate_hooks_from_db` (to build the script lookup
+    /// table for resolving `action_kaish_script_id` references).
+    pub fn list_all_hook_scripts(&self) -> KernelDbResult<Vec<HookScriptRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT script_id, body, description,
+                    created_at, created_by, updated_at
+             FROM hook_scripts
+             ORDER BY script_id ASC",
+        )?;
+        let rows = stmt.query_map([], row_to_hook_script_row)?;
+        Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
+    }
+
+    /// Count hooks referencing this script. Callers use this to enforce
+    /// the "fail deletion when referenced" guard rather than cascading.
+    pub fn count_hooks_referencing_script(&self, script_id: &str) -> KernelDbResult<usize> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT COUNT(*) FROM hooks WHERE action_kaish_script_id = ?1")?;
+        let n: i64 = stmt.query_row(params![script_id], |r| r.get(0))?;
+        Ok(n as usize)
+    }
+
+    /// Delete a hook script. Caller must verify
+    /// `count_hooks_referencing_script == 0` first to avoid orphaning
+    /// `hooks.action_kaish_script_id` references — the schema has no FK
+    /// constraint by design (FKs across SQLite ATTACH boundaries hurt;
+    /// the guard lives in the application layer).
+    pub fn delete_hook_script(&self, script_id: &str) -> KernelDbResult<bool> {
+        let rows = self
+            .conn
+            .execute("DELETE FROM hook_scripts WHERE script_id = ?1", params![script_id])?;
+        Ok(rows > 0)
+    }
+
     /// Load every persisted hook row, ordered by
     /// `(phase ASC, priority ASC, insertion_idx ASC)`. The broker walks
     /// these in order and pushes each onto the matching `HookTable`,
@@ -2521,7 +2683,7 @@ impl KernelDb {
             "SELECT hook_id, phase, priority,
                     match_instance, match_tool, match_context, match_principal,
                     action_kind,
-                    action_builtin_name, action_kaish_body,
+                    action_builtin_name, action_kaish_body, action_kaish_script_id,
                     action_result_text, action_is_error,
                     action_deny_reason,
                     action_log_target, action_log_level
@@ -2551,7 +2713,7 @@ impl KernelDb {
                 })?),
                 None => None,
             };
-            let is_error_int: Option<i64> = row.get(11)?;
+            let is_error_int: Option<i64> = row.get(12)?;
             let action_is_error = is_error_int.map(|i| i != 0);
             Ok(HookRow {
                 hook_id: row.get(0)?,
@@ -2564,11 +2726,12 @@ impl KernelDb {
                 action_kind: row.get(7)?,
                 action_builtin_name: row.get(8)?,
                 action_kaish_body: row.get(9)?,
-                action_result_text: row.get(10)?,
+                action_kaish_script_id: row.get(10)?,
+                action_result_text: row.get(11)?,
                 action_is_error,
-                action_deny_reason: row.get(12)?,
-                action_log_target: row.get(13)?,
-                action_log_level: row.get(14)?,
+                action_deny_reason: row.get(13)?,
+                action_log_target: row.get(14)?,
+                action_log_level: row.get(15)?,
             })
         })?;
         let mut out = Vec::new();
@@ -2978,6 +3141,17 @@ fn row_to_rc_script_row(row: &rusqlite::Row<'_>) -> SqliteResult<RcScriptRow> {
         created_at: row.get(8)?,
         created_by: read_principal_id(row, 9)?,
         timeout_secs: row.get(10)?,
+    })
+}
+
+fn row_to_hook_script_row(row: &rusqlite::Row<'_>) -> SqliteResult<HookScriptRow> {
+    Ok(HookScriptRow {
+        script_id: row.get(0)?,
+        body: row.get(1)?,
+        description: row.get(2)?,
+        created_at: row.get(3)?,
+        created_by: read_principal_id(row, 4)?,
+        updated_at: row.get(5)?,
     })
 }
 
@@ -4122,6 +4296,7 @@ mod tests {
             action_kind: "log".into(),
             action_builtin_name: None,
             action_kaish_body: None,
+            action_kaish_script_id: None,
             action_result_text: None,
             action_is_error: None,
             action_deny_reason: None,
@@ -4151,6 +4326,7 @@ mod tests {
             action_kind: "builtin_invoke".into(),
             action_builtin_name: Some("tracing_audit".into()),
             action_kaish_body: None,
+            action_kaish_script_id: None,
             action_result_text: None,
             action_is_error: None,
             action_deny_reason: None,
@@ -4171,6 +4347,7 @@ mod tests {
             action_kind: "shortcircuit".into(),
             action_builtin_name: None,
             action_kaish_body: None,
+            action_kaish_script_id: None,
             action_result_text: Some("synthetic".into()),
             action_is_error: Some(true),
             action_deny_reason: None,
@@ -4191,6 +4368,7 @@ mod tests {
             action_kind: "deny".into(),
             action_builtin_name: None,
             action_kaish_body: None,
+            action_kaish_script_id: None,
             action_result_text: None,
             action_is_error: None,
             action_deny_reason: Some("no writes".into()),
@@ -4217,6 +4395,7 @@ mod tests {
             action_kind: "kaish_invoke".into(),
             action_builtin_name: None,
             action_kaish_body: Some("script-42".into()),
+            action_kaish_script_id: None,
             action_result_text: None,
             action_is_error: None,
             action_deny_reason: None,

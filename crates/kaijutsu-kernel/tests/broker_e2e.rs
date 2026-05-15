@@ -1022,6 +1022,7 @@ async fn list_tools_deny_hides_and_blocks_but_keeps_discovery_honest() {
             match_principal: None,
             action: HookAction::Deny("read-only context".into()),
             priority: 0,
+            kaish_script_id: None,
         });
 
     // (a) The per-context list must NOT include `write`.

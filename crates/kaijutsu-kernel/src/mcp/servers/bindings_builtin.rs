@@ -712,6 +712,7 @@ mod tests {
                 )),
                 match_tool: None,
                 match_context: None,
+                kaish_script_id: None,
                 match_principal: None,
                 action: HookAction::Deny("read-only session".to_string()),
                 priority: 0,
