@@ -7,13 +7,14 @@
 > `kaish_kernel::Kernel::execute_with_vars`. Templates as a separate
 > stored type are dropped; init scripts handle dynamic templating
 > directly. The rc lifecycle wires at `context.create`, the four
-> fork variants, and `drift`. The `attach` verb is reserved with the
-> semantic **`kj attach <ctx>` user action that pulls an existing
-> context into the current session** — not the "driver attaches to
-> resume" reading below, which predates the chosen semantic. See
-> `docs/issues.md` for current rc follow-ups. The body below is
-> retained as design history — it captures the invariants and the
-> reasoning that led to rc.
+> fork variants, `drift`, and `attach`. `attach` semantic:
+> **`kj attach <ctx>` user action that switches the session to an
+> existing context and fires
+> `/etc/rc/<ctx_type>/attach/SXX-*.{kai,md}` on the target** — not
+> the "driver attaches to resume" reading below, which predates the
+> chosen semantic. See `docs/issues.md` for current rc follow-ups.
+> The body below is retained as design history — it captures the
+> invariants and the reasoning that led to rc.
 
 How "personas" work today, where they're heading, and why the
 substrate already gives us most of what they need for free.
@@ -144,7 +145,7 @@ Lifecycle hook points (initial set; expect to refine):
 | --- | --- |
 | `context.create` | A new context is created from scratch. |
 | `context.fork` | A context is forked from another (template or working). |
-| `context.attach` | `kj attach <ctx>` — user pulls an existing context into the current session. (Reserved; not yet wired. See status banner above for the chosen semantic, which differs from this doc's original "driver attaches to resume" reading.) |
+| `context.attach` | `kj attach <ctx>` — user switches the session to an existing context. Wired 2026-05-15. (See status banner above for the chosen semantic, which differs from this doc's original "driver attaches to resume" reading.) |
 
 Init scripts are kaish. The kernel runs them in template-specified
 order, with the new context already created and addressable. A

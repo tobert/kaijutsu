@@ -8,6 +8,7 @@
 //! All commands go through `KjDispatcher`, which holds Arc refs to shared
 //! kernel state and is constructed once per server.
 
+pub mod attach;
 pub mod block;
 pub mod cache;
 pub mod cas;
@@ -243,6 +244,13 @@ impl KjDispatcher {
         // run without an active context.
         if cmd == "block" {
             return self.dispatch_block(&argv[1..], caller);
+        }
+        // `kj attach <ctx>` brings an existing context into the current
+        // session and fires the rc `attach` lifecycle on it. Like
+        // `kj context switch`, the user need not have an active context
+        // to attach to one.
+        if cmd == "attach" {
+            return self.dispatch_attach(&argv[1..], caller).await;
         }
 
         // Everything else requires an active context

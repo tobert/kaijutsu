@@ -63,7 +63,7 @@ pub const VERB_ATTACH: &str = "attach";
 pub const VERB_DRIFT: &str = "drift";
 
 fn verb_is_wired(verb: &str) -> bool {
-    matches!(verb, VERB_CREATE | VERB_FORK | VERB_DRIFT)
+    matches!(verb, VERB_CREATE | VERB_FORK | VERB_DRIFT | VERB_ATTACH)
 }
 
 impl KjDispatcher {
@@ -458,20 +458,11 @@ impl kaijutsu_index::BlockSource for NoopBlockSource {
 }
 
 fn log_unwired_verb_once(verb: &str) {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::OnceLock;
-    static ATTACH_LOGGED: OnceLock<AtomicBool> = OnceLock::new();
-    let flag = match verb {
-        VERB_ATTACH => ATTACH_LOGGED.get_or_init(|| AtomicBool::new(false)),
-        _ => return,
-    };
-    if !flag.swap(true, Ordering::Relaxed) {
-        tracing::info!(
-            target: "kaijutsu::rc",
-            "rc lifecycle verb '{verb}' is reserved but not yet wired; \
-             scripts under /etc/rc/*/{verb}/ will not run"
-        );
-    }
+    // All four verbs (create / fork / drift / attach) are now wired.
+    // Reserved-verb logging stays as a no-op for now so a future
+    // not-yet-wired verb can plug in here without touching the call
+    // site at lifecycle.rs:86.
+    let _ = verb;
 }
 
 #[cfg(test)]
@@ -806,28 +797,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rc_attach_install_but_no_op() {
+    async fn rc_attach_fires_scripts_on_target() {
         let d = test_dispatcher().await;
-        // attach is reserved — installs succeed but dispatch is a no-op.
+        // `.md` script lands its content as a block on the target.
         install_script(
             &d,
-            "/etc/rc/test/attach/S00-noop.md",
+            "/etc/rc/test/attach/S00-banner.md",
             "test",
             "attach",
             "S00",
-            "noop",
+            "banner",
             "md",
-            "attach-script-content",
+            "attach-banner-content",
         );
-        let dummy_id = ContextId::new();
-        let caller = unjoined_caller();
+
+        let principal = PrincipalId::new();
+        let target = register_context(&d, Some("attach-target"), None, principal);
+        set_context_type(&d, target, "test");
+
+        let caller = caller_with_context(target);
         let res = d
-            .run_rc_lifecycle("attach", dummy_id, None, None, None, &caller)
+            .run_rc_lifecycle("attach", target, None, None, None, &caller)
             .await;
-        assert!(res.is_ok(), "attach verb should no-op, got: {res:?}");
+        assert!(res.is_ok(), "attach lifecycle should succeed, got: {res:?}");
+
+        let contents = block_contents_in(&d, target);
         assert!(
-            block_kinds_in(&d, dummy_id).is_empty(),
-            "attach no-op should not touch the context"
+            contents.iter().any(|c| c.contains("attach-banner-content")),
+            "attach .md script must land its content as a block; got: {contents:?}"
         );
     }
 

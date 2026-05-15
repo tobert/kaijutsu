@@ -38,15 +38,17 @@ following are explicit follow-ups that did not ship:
 - **Context lifecycle (rc) system.** Replaces the v1
   `builtin.personas` MCP server (yanked 2026-05-02). Scripts at
   `/etc/rc/<context_type>/<verb>/SXX-name.{kai,md}` run at
-  context lifecycle moments (`create`, `fork`, `drift`, with
-  `attach` reserved). `.md` becomes a block; `.kai` runs via
+  context lifecycle moments (`create`, `fork`, `drift`, `attach`).
+  `.md` becomes a block; `.kai` runs via
   `kaish_kernel::Kernel::execute_with_vars`. Stored in KernelDb.
   Admin via `kj rc add | list | rm`. Scripts decide their own
   applicability via `kj` introspection. See
   [`personas-evolution.md`](personas-evolution.md) for the design
   motivation. Per-script time budgets ship 2026-05-15
-  (`kj rc add --timeout <secs>`). Open follow-ups:
-  `attach` lifecycle wiring, capnp surface for `context_type`,
+  (`kj rc add --timeout <secs>`). The `attach` verb wires
+  2026-05-15 — `kj attach <ctx>` switches the session to the
+  target and fires `/etc/rc/<ctx_type>/attach/SXX-*.{kai,md}`.
+  Open follow-ups: capnp surface for `context_type`,
   CRDT-VFS bridge for collaborative script editing.
 - **`StreamingBlockHandle` implementation.** Single-block streaming
   primitive. Build when the first caller arrives (likely the LLM
