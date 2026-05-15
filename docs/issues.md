@@ -35,20 +35,9 @@ tool-system redesign doc.
 The MCP-centric kernel landed in five phases plus hook persistence; the
 following are explicit follow-ups that did not ship:
 
-- **Context lifecycle (rc) system.** Replaces the v1
-  `builtin.personas` MCP server (yanked 2026-05-02). Scripts at
-  `/etc/rc/<context_type>/<verb>/SXX-name.{kai,md}` run at
-  context lifecycle moments (`create`, `fork`, `drift`, `attach`).
-  `.md` becomes a block; `.kai` runs via
-  `kaish_kernel::Kernel::execute_with_vars`. Stored in KernelDb.
-  Admin via `kj rc add | list | rm`. Scripts decide their own
-  applicability via `kj` introspection.
-  Per-script time budgets ship 2026-05-15
-  (`kj rc add --timeout <secs>`). The `attach` verb wires
-  2026-05-15 — `kj attach <ctx>` switches the session to the
-  target and fires `/etc/rc/<ctx_type>/attach/SXX-*.{kai,md}`.
-  Open follow-ups: capnp surface for `context_type`,
-  CRDT-VFS bridge for collaborative script editing.
+- **rc system follow-ups.** Capnp surface for `context_type` (paused
+  pending rethink); CRDT-VFS bridge for collaborative script editing
+  (speculative).
 - **`StreamingBlockHandle` implementation.** Single-block streaming
   primitive. Build when the first caller arrives (likely the LLM
   streaming rewrite). Resolve async-drop strategy and append granularity
@@ -60,17 +49,6 @@ following are explicit follow-ups that did not ship:
 - **Block content abstraction.** Blocks as containers for multiple
   content artifacts; prerequisite for richer resource-subscription
   rendering.
-- **Kaish-backed hook follow-ups.** `HookBody::Kaish` ships (2026-05-02);
-  wire field + schema column + runtime type all named `body` after the
-  rename. `kj` is callable from hook kaish bodies via
-  `Broker::set_kj_dispatcher`. PostCall/OnError overlay vars
-  (`KJ_TOOL_RESULT`, `KJ_TOOL_ERROR`) ship 2026-05-15;
-  OnNotification carries its payload in `KJ_TOOL_ARGS` already.
-  Shared `hook_scripts` table ships 2026-05-15: hooks reference
-  bodies by `script_id` via the `kaish_script` action; admin
-  surface (`hook_script_add | update | list | inspect | remove`)
-  on `builtin.hooks`; deletion refuses when any hook still
-  references the script.
 - **MCP `progress` → `StreamingBlockHandle` bridge.** External streaming
   tools wired the same way virtual tools will be.
 - **Per-principal budgets + fair queuing.** Adjacent to the now-shipped
