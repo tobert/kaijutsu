@@ -44,8 +44,9 @@ following are explicit follow-ups that did not ship:
   Admin via `kj rc add | list | rm`. Scripts decide their own
   applicability via `kj` introspection. See
   [`personas-evolution.md`](personas-evolution.md) for the design
-  motivation. Open follow-ups: `attach` lifecycle wiring,
-  per-script time budgets, capnp surface for `context_type`,
+  motivation. Per-script time budgets ship 2026-05-15
+  (`kj rc add --timeout <secs>`). Open follow-ups:
+  `attach` lifecycle wiring, capnp surface for `context_type`,
   CRDT-VFS bridge for collaborative script editing.
 - **`StreamingBlockHandle` implementation.** Single-block streaming
   primitive. Build when the first caller arrives (likely the LLM

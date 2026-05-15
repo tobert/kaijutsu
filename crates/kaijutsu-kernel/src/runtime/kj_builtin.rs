@@ -359,6 +359,9 @@ impl Tool for KjBuiltin {
             .param(ParamSchema::optional("kind", "string", Value::String(String::new()), "Block kind filter"))
             .param(ParamSchema::optional("role", "string", Value::String(String::new()), "Block role filter"))
             .param(ParamSchema::optional("status", "string", Value::String(String::new()), "Block status filter"))
+            // `kj rc add --timeout <secs>` — per-script wall-clock budget
+            // for .kai execution; omit to inherit the kernel default.
+            .param(ParamSchema::optional("timeout", "string", Value::String(String::new()), "Per-script wall-clock budget in seconds (kj rc add)"))
             .example("Discover commands", "kj help")
             .example("View context topology", "kj context list --tree")
             .example("Create isolated workspace", "kj fork --name debug-auth")

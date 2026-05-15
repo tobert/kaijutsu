@@ -136,6 +136,12 @@ pub struct RcScriptRow {
     pub path: String,       // canonical /etc/rc/<type>/<verb>/<sort_key>-<name>.<ext>
     pub created_at: i64,
     pub created_by: PrincipalId,
+    /// Per-script wall-clock budget for `.kai` execution, in seconds.
+    /// `None` falls back to `TimeoutPolicy::rc_script_timeout` (the
+    /// kernel-wide default). `.md` scripts ignore this — they don't
+    /// execute. The column is nullable so existing rows hydrate to
+    /// `None` without backfill.
+    pub timeout_secs: Option<u32>,
 }
 
 /// A preset template row.
@@ -488,6 +494,10 @@ CREATE TABLE IF NOT EXISTS rc_scripts (
     created_at   INTEGER NOT NULL
         DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
     created_by   BLOB    NOT NULL,
+    -- Per-script wall-clock budget for .kai execution. NULL falls
+    -- back to TimeoutPolicy::rc_script_timeout (kernel-wide default).
+    -- .md scripts ignore this column.
+    timeout_secs INTEGER,
     PRIMARY KEY (kernel_id, context_type, verb, sort_key, name)
 );
 CREATE INDEX IF NOT EXISTS idx_rc_scripts_lookup
@@ -816,6 +826,17 @@ impl KernelDb {
             info!("Migration: renaming hooks.action_kaish_script_id → action_kaish_body");
             conn.execute_batch(
                 "ALTER TABLE hooks RENAME COLUMN action_kaish_script_id TO action_kaish_body;",
+            )?;
+        }
+        // 2026-05-15: add per-script wall-clock budget for rc_scripts.
+        // NULL = fall back to kernel TimeoutPolicy::rc_script_timeout.
+        let has_timeout_secs: bool = conn
+            .prepare("SELECT timeout_secs FROM rc_scripts LIMIT 0")
+            .is_ok();
+        if !has_timeout_secs {
+            info!("Migration: adding timeout_secs column to rc_scripts table");
+            conn.execute_batch(
+                "ALTER TABLE rc_scripts ADD COLUMN timeout_secs INTEGER;",
             )?;
         }
         Ok(())
@@ -1974,8 +1995,9 @@ impl KernelDb {
             .execute(
                 "INSERT INTO rc_scripts (
                     kernel_id, context_type, verb, sort_key, name,
-                    extension, content, path, created_at, created_by
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    extension, content, path, created_at, created_by,
+                    timeout_secs
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     blob_param(row.kernel_id.as_bytes()),
                     row.context_type,
@@ -1987,6 +2009,7 @@ impl KernelDb {
                     row.path,
                     row.created_at,
                     blob_param(row.created_by.as_bytes()),
+                    row.timeout_secs,
                 ],
             )
             .map_err(|e| map_unique_violation(e, format!("rc script '{}' already exists", row.path)))?;
@@ -2001,7 +2024,8 @@ impl KernelDb {
     ) -> KernelDbResult<Option<RcScriptRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT kernel_id, context_type, verb, sort_key, name,
-                    extension, content, path, created_at, created_by
+                    extension, content, path, created_at, created_by,
+                    timeout_secs
              FROM rc_scripts
              WHERE kernel_id = ?1 AND path = ?2",
         )?;
@@ -2024,7 +2048,8 @@ impl KernelDb {
     ) -> KernelDbResult<Vec<RcScriptRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT kernel_id, context_type, verb, sort_key, name,
-                    extension, content, path, created_at, created_by
+                    extension, content, path, created_at, created_by,
+                    timeout_secs
              FROM rc_scripts
              WHERE kernel_id = ?1 AND context_type = ?2 AND verb = ?3
              ORDER BY sort_key ASC, name ASC",
@@ -2040,7 +2065,8 @@ impl KernelDb {
     pub fn list_rc_scripts_all(&self, kernel_id: KernelId) -> KernelDbResult<Vec<RcScriptRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT kernel_id, context_type, verb, sort_key, name,
-                    extension, content, path, created_at, created_by
+                    extension, content, path, created_at, created_by,
+                    timeout_secs
              FROM rc_scripts
              WHERE kernel_id = ?1
              ORDER BY context_type ASC, verb ASC, sort_key ASC, name ASC",
@@ -2951,6 +2977,7 @@ fn row_to_rc_script_row(row: &rusqlite::Row<'_>) -> SqliteResult<RcScriptRow> {
         path: row.get(7)?,
         created_at: row.get(8)?,
         created_by: read_principal_id(row, 9)?,
+        timeout_secs: row.get(10)?,
     })
 }
 

@@ -342,9 +342,19 @@ async fn run_kai_script(
         );
     }
 
+    // Per-script timeout overrides the kernel-wide default. `None`
+    // (column omitted at install time) keeps the historical behavior:
+    // every script in a lifecycle shares the kernel's
+    // `rc_script_timeout` budget. An explicit `Some(n)` lets a slow
+    // script declare its own headroom without lifting the global
+    // ceiling for unrelated work.
+    let timeout = match script.timeout_secs {
+        Some(n) => std::time::Duration::from_secs(n as u64),
+        None => kaish.timeouts().rc_script_timeout,
+    };
     let opts = kaish_kernel::ExecuteOptions::new()
         .with_vars(vars)
-        .with_timeout(kaish.timeouts().rc_script_timeout);
+        .with_timeout(timeout);
     match kaish.execute_with_options(&script.content, opts).await {
         Ok(exec) if exec.code == 0 => {}
         Ok(exec) => {
@@ -492,6 +502,7 @@ mod tests {
             path: path.into(),
             created_at: kaijutsu_types::now_millis() as i64,
             created_by: PrincipalId::system(),
+            timeout_secs: None,
         };
         let db = dispatcher.kernel_db().lock();
         db.insert_rc_script(&row).expect("install rc script");
@@ -1384,6 +1395,155 @@ test -z "$KJ_PARENT_BLOCK_COUNT" || exit 99
         assert_eq!(
             create_marker_count, 1,
             "fork must not run create-side scripts (would duplicate marker), got: {child_contents:?}"
+        );
+    }
+
+    // ── Per-script wall-clock budgets ─────────────────────────────────
+
+    /// Same shape as `install_script` but with an explicit per-script
+    /// timeout. `None` keeps the current behavior (kernel-default).
+    fn install_script_with_timeout(
+        dispatcher: &KjDispatcher,
+        path: &str,
+        context_type: &str,
+        verb: &str,
+        sort_key: &str,
+        name: &str,
+        ext: &str,
+        content: &str,
+        timeout_secs: Option<u32>,
+    ) {
+        let row = RcScriptRow {
+            kernel_id: dispatcher.kernel_id(),
+            context_type: context_type.into(),
+            verb: verb.into(),
+            sort_key: sort_key.into(),
+            name: name.into(),
+            extension: ext.into(),
+            content: content.into(),
+            path: path.into(),
+            created_at: kaijutsu_types::now_millis() as i64,
+            created_by: PrincipalId::system(),
+            timeout_secs,
+        };
+        let db = dispatcher.kernel_db().lock();
+        db.insert_rc_script(&row).expect("install rc script");
+    }
+
+    /// A per-script timeout SHORTER than the kernel default kills a
+    /// runaway script and produces an error block. Kernel default is the
+    /// 30s production value; the script declares a 1s budget and sleeps
+    /// for 3s — without the override, the script would run to completion
+    /// and the test would erroneously pass.
+    #[tokio::test]
+    async fn rc_per_script_timeout_overrides_kernel_default_shorter() {
+        let d = test_dispatcher().await;
+        install_script_with_timeout(
+            &d,
+            "/etc/rc/test/create/S00-slow.kai",
+            "test",
+            "create",
+            "S00",
+            "slow",
+            "kai",
+            "sleep 3 && echo never-reached",
+            Some(1),
+        );
+
+        let caller = unjoined_caller();
+        let result = d
+            .dispatch(&argv(&["context", "create", "ctx-slow", "--type", "test"]), &caller)
+            .await;
+        assert!(result.is_ok(), "create failed: {}", result.message());
+
+        let new_id = lookup_context_id(&d, "ctx-slow");
+        let kinds = block_kinds_in(&d, new_id);
+        assert!(
+            kinds.contains(&kaijutsu_types::BlockKind::Error),
+            "1s per-script timeout must kill 3s sleep; kinds: {kinds:?}"
+        );
+        let contents = block_contents_in(&d, new_id);
+        assert!(
+            !contents.iter().any(|c| c.contains("never-reached")),
+            "script body must not have completed; contents: {contents:?}"
+        );
+    }
+
+    /// A per-script timeout LONGER than the kernel default lets a slow
+    /// script finish even when the kernel-wide budget would have killed
+    /// it. Pin the kernel's `rc_script_timeout` to 200ms (well below the
+    /// script's 1s sleep) and give the script a 5s override; assert
+    /// success.
+    #[tokio::test]
+    async fn rc_per_script_timeout_overrides_kernel_default_longer() {
+        let mut policy = kaijutsu_types::TimeoutPolicy::default();
+        policy.rc_script_timeout = std::time::Duration::from_millis(200);
+        let d = crate::kj::test_helpers::test_dispatcher_with_timeouts(policy).await;
+
+        install_script_with_timeout(
+            &d,
+            "/etc/rc/test/create/S00-slow.kai",
+            "test",
+            "create",
+            "S00",
+            "slow",
+            "kai",
+            "sleep 1 && echo done-anyway",
+            Some(5),
+        );
+
+        let caller = unjoined_caller();
+        let result = d
+            .dispatch(&argv(&["context", "create", "ctx-slow-ok", "--type", "test"]), &caller)
+            .await;
+        assert!(result.is_ok(), "create failed: {}", result.message());
+
+        let new_id = lookup_context_id(&d, "ctx-slow-ok");
+        let kinds = block_kinds_in(&d, new_id);
+        assert!(
+            !kinds.contains(&kaijutsu_types::BlockKind::Error),
+            "5s per-script override must let 1s sleep complete despite 200ms kernel default; \
+             kinds: {kinds:?}, contents: {:?}",
+            block_contents_in(&d, new_id),
+        );
+    }
+
+    /// Without a per-script override, the kernel-default timeout still
+    /// applies. Same setup as the override test but with `timeout_secs:
+    /// None` — the 200ms kernel default kills the 1s sleep. Pinned so a
+    /// future regression that drops the override branch and falls back
+    /// to "always use kernel default" is still detected (this test would
+    /// pass on broken code; the override-longer test is what catches it).
+    /// Kept here as the symmetric boundary check.
+    #[tokio::test]
+    async fn rc_kernel_default_timeout_kills_script_without_override() {
+        let mut policy = kaijutsu_types::TimeoutPolicy::default();
+        policy.rc_script_timeout = std::time::Duration::from_millis(200);
+        let d = crate::kj::test_helpers::test_dispatcher_with_timeouts(policy).await;
+
+        install_script_with_timeout(
+            &d,
+            "/etc/rc/test/create/S00-slow.kai",
+            "test",
+            "create",
+            "S00",
+            "slow",
+            "kai",
+            "sleep 1 && echo never-reached",
+            None,
+        );
+
+        let caller = unjoined_caller();
+        let result = d
+            .dispatch(&argv(&["context", "create", "ctx-default-kills", "--type", "test"]), &caller)
+            .await;
+        assert!(result.is_ok(), "create failed: {}", result.message());
+
+        let new_id = lookup_context_id(&d, "ctx-default-kills");
+        let kinds = block_kinds_in(&d, new_id);
+        assert!(
+            kinds.contains(&kaijutsu_types::BlockKind::Error),
+            "200ms kernel default must kill 1s sleep without override; kinds: {kinds:?}"
         );
     }
 }

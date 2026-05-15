@@ -91,9 +91,12 @@ encodes everything: `/etc/rc/<context_type>/<verb>/SXX-name.{kai,md}`.
 
 ## Commands
 
-- `kj rc add <path> --content <body>` — install a script
+- `kj rc add <path> --content <body> [--timeout <secs>]` — install a script
 - `kj rc list [--type=...] [--verb=...]` — list installed scripts
 - `kj rc rm <path>` — remove a script
+
+`--timeout` sets a per-script wall-clock budget for `.kai` execution;
+omit to inherit the kernel default. `.md` scripts ignore it.
 
 ## Verbs
 
@@ -151,6 +154,29 @@ kj context create my-plan --type=planner
             }
         };
 
+        // Per-script wall-clock budget. Omit → falls back to the kernel
+        // policy at lifecycle dispatch time; explicit 0 is rejected
+        // (would deadlock the script). `.md` scripts accept the column
+        // but don't execute, so the value is recorded for documentation
+        // even though it has no runtime effect.
+        let timeout_secs = match extract_named_arg(argv, &["--timeout"]) {
+            None => None,
+            Some(s) => match s.parse::<u32>() {
+                Ok(0) => {
+                    return KjResult::Err(
+                        "kj rc add: --timeout must be > 0 (omit to use the kernel default)"
+                            .to_string(),
+                    );
+                }
+                Ok(n) => Some(n),
+                Err(_) => {
+                    return KjResult::Err(format!(
+                        "kj rc add: --timeout must be a positive integer (got '{s}')"
+                    ));
+                }
+            },
+        };
+
         let row = RcScriptRow {
             kernel_id: self.kernel_id(),
             context_type: parts.context_type.clone(),
@@ -162,6 +188,7 @@ kj context create my-plan --type=planner
             path: path.clone(),
             created_at: kaijutsu_types::now_millis() as i64,
             created_by: caller.principal_id,
+            timeout_secs,
         };
 
         let db = self.kernel_db().lock();
@@ -202,7 +229,13 @@ kj context create my-plan --type=planner
 
         let lines: Vec<String> = filtered
             .iter()
-            .map(|s| format!("  {}  ({} bytes)", s.path, s.content.len()))
+            .map(|s| {
+                let timeout = match s.timeout_secs {
+                    Some(n) => format!(", timeout={}s", n),
+                    None => String::new(),
+                };
+                format!("  {}  ({} bytes{})", s.path, s.content.len(), timeout)
+            })
             .collect();
         KjResult::ok(lines.join("\n"))
     }
