@@ -61,10 +61,11 @@ following are explicit follow-ups that did not ship:
 - **Kaish-backed hook follow-ups.** `HookBody::Kaish` ships (2026-05-02);
   wire field + schema column + runtime type all named `body` after the
   rename. `kj` is callable from hook kaish bodies via
-  `Broker::set_kj_dispatcher`. Open: introduce a `hook_scripts` table
-  for shared script storage (today each hook owns its body); surface
-  PostCall/OnError/OnNotification result/error JSON via additional
-  overlay vars.
+  `Broker::set_kj_dispatcher`. PostCall/OnError overlay vars
+  (`KJ_TOOL_RESULT`, `KJ_TOOL_ERROR`) ship 2026-05-15;
+  OnNotification carries its payload in `KJ_TOOL_ARGS` already.
+  Open: introduce a `hook_scripts` table for shared script storage
+  (today each hook owns its body).
 - **MCP `progress` → `StreamingBlockHandle` bridge.** External streaming
   tools wired the same way virtual tools will be.
 - **Per-principal budgets + fair queuing.** Adjacent to the now-shipped

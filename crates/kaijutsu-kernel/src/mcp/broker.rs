@@ -32,7 +32,7 @@ use super::policy::InstancePolicy;
 use super::server_like::{McpServerLike, ServerNotification};
 use super::types::{
     InstanceId, KernelCallParams, KernelNotification, KernelReadResource, KernelResourceContents,
-    KernelResourceList, KernelTool, KernelToolResult, LogLevel, NotifKind,
+    KernelResourceList, KernelTool, KernelToolResult, LogLevel, NotifKind, ToolContent,
 };
 use crate::block_store::{DbHandle, SharedBlockStore};
 
@@ -1072,7 +1072,10 @@ impl Broker {
         };
 
         // PreCall — may short-circuit the call entirely, or deny it outright.
-        match self.evaluate_phase(HookPhase::PreCall, &params, ctx).await? {
+        match self
+            .evaluate_phase(HookPhase::PreCall, &params, ctx, PhasePayload::None)
+            .await?
+        {
             PhaseOutcome::Continue => {}
             PhaseOutcome::ShortCircuit { hook_id, result } => {
                 emit_short_circuit_attribution(HookPhase::PreCall, &hook_id);
@@ -1080,7 +1083,12 @@ impl Broker {
                 // — it observes that a (synthetic) result was produced.
                 // Result can itself short-circuit or deny.
                 return match self
-                    .evaluate_phase(HookPhase::PostCall, &params, ctx)
+                    .evaluate_phase(
+                        HookPhase::PostCall,
+                        &params,
+                        ctx,
+                        PhasePayload::Result(&result),
+                    )
                     .await?
                 {
                     PhaseOutcome::Continue => Ok(result),
@@ -1141,7 +1149,12 @@ impl Broker {
                     truncate_result_to_budget(&mut result, policy.max_result_bytes, size);
                 }
                 match self
-                    .evaluate_phase(HookPhase::PostCall, &call_params_for_hooks, ctx)
+                    .evaluate_phase(
+                        HookPhase::PostCall,
+                        &call_params_for_hooks,
+                        ctx,
+                        PhasePayload::Result(&result),
+                    )
                     .await?
                 {
                     PhaseOutcome::Continue => Ok(result),
@@ -1176,7 +1189,10 @@ impl Broker {
         ctx: &CallContext,
         err: McpError,
     ) -> McpResult<KernelToolResult> {
-        match self.evaluate_phase(HookPhase::OnError, params, ctx).await {
+        match self
+            .evaluate_phase(HookPhase::OnError, params, ctx, PhasePayload::Error(&err))
+            .await
+        {
             Ok(PhaseOutcome::Continue) => Err(err),
             Ok(PhaseOutcome::ShortCircuit { hook_id, result }) => {
                 emit_short_circuit_attribution(HookPhase::OnError, &hook_id);
@@ -1214,6 +1230,7 @@ impl Broker {
         phase: HookPhase,
         params: &KernelCallParams,
         ctx: &CallContext,
+        payload: PhasePayload<'_>,
     ) -> McpResult<PhaseOutcome> {
         // Snapshot matching entries + their indices so the sort is stable
         // across priority ties (the HashTable::entries Vec is the
@@ -1328,7 +1345,10 @@ impl Broker {
                     }
                     HookBody::Kaish(script) => {
                         let _depth_guard = enter_hook_depth()?;
-                        match self.run_kaish_hook(phase, &script, params, ctx).await {
+                        match self
+                            .run_kaish_hook(phase, &script, params, ctx, &payload)
+                            .await
+                        {
                             Ok(()) => {}
                             Err(reason) => {
                                 return Ok(PhaseOutcome::Deny {
@@ -1350,15 +1370,20 @@ impl Broker {
     /// `Err(reason)` otherwise — the caller maps `Err` to
     /// `PhaseOutcome::Deny` so kaish hooks cleanly veto a tool call.
     ///
-    /// The script sees: `KJ_HOOK_PHASE`, `KJ_HOOK_INSTANCE`,
+    /// The script always sees: `KJ_HOOK_PHASE`, `KJ_HOOK_INSTANCE`,
     /// `KJ_HOOK_TOOL`, `KJ_PRINCIPAL`, `KJ_CONTEXT`, `KJ_TOOL_ARGS`
-    /// (JSON of the call params).
+    /// (JSON of the call params). Phase-specific overlays:
+    /// `KJ_TOOL_RESULT` (PostCall — JSON of the produced result, real or
+    /// short-circuited synthetic) and `KJ_TOOL_ERROR` (OnError — JSON of
+    /// the failure that triggered the phase). OnNotification carries its
+    /// payload in `KJ_TOOL_ARGS` already; no extra var is added.
     async fn run_kaish_hook(
         &self,
         phase: HookPhase,
         body: &str,
         params: &super::types::KernelCallParams,
         ctx: &CallContext,
+        payload: &PhasePayload<'_>,
     ) -> Result<(), String> {
         use crate::runtime::context_engine::session_context_map;
         use crate::runtime::embedded_kaish::EmbeddedKaish;
@@ -1459,6 +1484,22 @@ impl Broker {
             "KJ_TOOL_ARGS".into(),
             kaish_kernel::ast::Value::String(args_json),
         );
+
+        match payload {
+            PhasePayload::None => {}
+            PhasePayload::Result(r) => {
+                vars.insert(
+                    "KJ_TOOL_RESULT".into(),
+                    kaish_kernel::ast::Value::String(result_to_hook_json(r)),
+                );
+            }
+            PhasePayload::Error(e) => {
+                vars.insert(
+                    "KJ_TOOL_ERROR".into(),
+                    kaish_kernel::ast::Value::String(error_to_hook_json(e)),
+                );
+            }
+        }
 
         let opts = kaish_kernel::ExecuteOptions::new()
             .with_vars(vars)
@@ -1696,7 +1737,12 @@ impl Broker {
     ) {
         let synth_ctx = CallContext::system_for_context(ctx);
         match self
-            .evaluate_phase(HookPhase::OnNotification, synth_params, &synth_ctx)
+            .evaluate_phase(
+                HookPhase::OnNotification,
+                synth_params,
+                &synth_ctx,
+                PhasePayload::None,
+            )
             .await
         {
             Ok(PhaseOutcome::Continue) => {}
@@ -1838,6 +1884,108 @@ enum PhaseOutcome {
     /// A `Deny` hook matched. `reason` is tracing-only; the LLM-visible
     /// error is `McpError::Denied { by_hook }` (D-28 channel discipline).
     Deny { hook_id: HookId, reason: String },
+}
+
+/// Per-phase payload for hook evaluation. Carries the data a phase observes
+/// *in addition to* the call site (`(instance, tool, args, principal,
+/// context)`) — i.e. the prior call's result for `PostCall` and the prior
+/// failure for `OnError`. `PreCall` and `OnNotification` see no extra
+/// payload (PreCall has no result yet; OnNotification carries its data in
+/// the synthetic call params already).
+#[derive(Default)]
+enum PhasePayload<'a> {
+    #[default]
+    None,
+    /// PostCall: the result the prior server call produced (real or
+    /// short-circuited synthetic). Surfaced as `KJ_TOOL_RESULT` to kaish
+    /// hook bodies.
+    Result(&'a KernelToolResult),
+    /// OnError: the failure the prior call produced. Surfaced as
+    /// `KJ_TOOL_ERROR` to kaish hook bodies.
+    Error(&'a McpError),
+}
+
+/// Stable JSON encoding of a `KernelToolResult` for `KJ_TOOL_RESULT`.
+/// Shape is independent of the internal type — adding a new `ToolContent`
+/// variant requires extending this match, which is the intended choke
+/// point for keeping the hook-visible wire shape stable across refactors.
+fn result_to_hook_json(r: &KernelToolResult) -> String {
+    let content: Vec<serde_json::Value> = r
+        .content
+        .iter()
+        .map(|c| match c {
+            ToolContent::Text(t) => serde_json::json!({"type": "text", "text": t}),
+            ToolContent::Json(v) => serde_json::json!({"type": "json", "json": v}),
+        })
+        .collect();
+    serde_json::json!({
+        "is_error": r.is_error,
+        "content": content,
+        "structured": r.structured,
+    })
+    .to_string()
+}
+
+/// Stable JSON encoding of an `McpError` for `KJ_TOOL_ERROR`. `kind` is the
+/// variant name; `message` is the `Display` rendering; `details` is a
+/// variant-specific structured payload (or `null` for variants without
+/// extra data). New `McpError` variants require extending this match —
+/// the unreachable sentinel would catch a missed variant at compile time
+/// if `McpError` were `#[non_exhaustive]`; it isn't, so keep this in sync
+/// with `error.rs`.
+fn error_to_hook_json(e: &McpError) -> String {
+    let (kind, details) = match e {
+        McpError::Unsupported => ("Unsupported", serde_json::Value::Null),
+        McpError::ToolNotFound { instance, tool } => (
+            "ToolNotFound",
+            serde_json::json!({"instance": instance.as_str(), "tool": tool}),
+        ),
+        McpError::InstanceNotFound(instance) => (
+            "InstanceNotFound",
+            serde_json::json!({"instance": instance.as_str()}),
+        ),
+        McpError::InstanceDown { instance, reason } => (
+            "InstanceDown",
+            serde_json::json!({"instance": instance.as_str(), "reason": reason}),
+        ),
+        McpError::InvalidParams(_) => ("InvalidParams", serde_json::Value::Null),
+        McpError::Protocol(_) => ("Protocol", serde_json::Value::Null),
+        McpError::Io(_) => ("Io", serde_json::Value::Null),
+        McpError::Cancelled => ("Cancelled", serde_json::Value::Null),
+        McpError::Denied { by_hook } => (
+            "Denied",
+            serde_json::json!({"by_hook": by_hook.to_string()}),
+        ),
+        McpError::HookRecursionLimit { depth } => (
+            "HookRecursionLimit",
+            serde_json::json!({"depth": depth}),
+        ),
+        McpError::Coalescer { .. } => ("Coalescer", serde_json::Value::Null),
+        McpError::Policy(p) => match p {
+            PolicyError::Timeout { instance, timeout_ms } => (
+                "Timeout",
+                serde_json::json!({"instance": instance.as_str(), "timeout_ms": timeout_ms}),
+            ),
+            PolicyError::ConcurrencyCap { instance, max } => (
+                "ConcurrencyCap",
+                serde_json::json!({"instance": instance.as_str(), "max": max}),
+            ),
+            PolicyError::ResultTooLarge { instance, size, max } => (
+                "ResultTooLarge",
+                serde_json::json!({
+                    "instance": instance.as_str(),
+                    "size": size,
+                    "max": max,
+                }),
+            ),
+        },
+    };
+    serde_json::json!({
+        "kind": kind,
+        "message": format!("{e}"),
+        "details": details,
+    })
+    .to_string()
 }
 
 /// Build a synthetic `KernelCallParams` for OnNotification evaluation. Hook
@@ -2136,7 +2284,12 @@ async fn handle_resource_flush(broker: &Arc<Broker>, id: &InstanceId, uri: &str)
             for (ctx_id, parent_block) in targets {
                 let synth_ctx = CallContext::system_for_context(ctx_id);
                 match broker
-                    .evaluate_phase(HookPhase::OnNotification, &success_synth, &synth_ctx)
+                    .evaluate_phase(
+                        HookPhase::OnNotification,
+                        &success_synth,
+                        &synth_ctx,
+                        PhasePayload::None,
+                    )
                     .await
                 {
                     Ok(PhaseOutcome::Continue) => {}
@@ -2201,7 +2354,12 @@ async fn handle_resource_flush(broker: &Arc<Broker>, id: &InstanceId, uri: &str)
             for (ctx_id, parent_block) in targets {
                 let synth_ctx = CallContext::system_for_context(ctx_id);
                 match broker
-                    .evaluate_phase(HookPhase::OnNotification, &fail_synth, &synth_ctx)
+                    .evaluate_phase(
+                        HookPhase::OnNotification,
+                        &fail_synth,
+                        &synth_ctx,
+                        PhasePayload::None,
+                    )
                     .await
                 {
                     Ok(PhaseOutcome::Continue) => {}
@@ -5704,5 +5862,145 @@ mod tests {
         let ids: Vec<&str> = hooks.pre_call.entries.iter().map(|e| e.id.0.as_str()).collect();
         // The bad row is silently skipped (warn logged); the good row loaded.
         assert_eq!(ids, vec!["good"]);
+    }
+
+    // ── Phase-specific overlay vars (KJ_TOOL_RESULT / KJ_TOOL_ERROR) ──
+
+    /// Helper: a kernel + broker + store wired together for kaish hook
+    /// tests. Returns `(broker, kernel)` so callers can register tools and
+    /// hooks freely; the kernel is held to prevent the `Weak` inside the
+    /// broker from upgrading to `None` mid-test.
+    async fn wired_kaish_broker(
+        name: &str,
+    ) -> (Arc<Broker>, Arc<crate::Kernel>) {
+        let kernel = Arc::new(crate::Kernel::new(name, None).await);
+        let broker = kernel.broker().clone();
+        let store = crate::block_store::shared_block_store(PrincipalId::system());
+        broker.set_documents(store).await;
+        broker.set_kernel(&kernel).await;
+        (broker, kernel)
+    }
+
+    /// PostCall sees `KJ_TOOL_RESULT` populated with the JSON encoding of
+    /// the produced `KernelToolResult`. The hook body uses kaish `case`
+    /// (per `gotcha_kaish_test_eq.md`) to assert the var contains
+    /// `"is_error":false` for a successful call. Hook exit 0 lets the
+    /// real result through; missing var → exit 1 → broker returns
+    /// `Denied`, which the assertion would catch.
+    #[tokio::test]
+    async fn post_call_hook_sees_tool_result_var_for_success() {
+        let (broker, _kernel) = wired_kaish_broker("post-call-result-success").await;
+
+        let svc = Arc::new(MockServer::new("svc").with_tool("t"));
+        broker
+            .register_silently(svc, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        let body = "case \"$KJ_TOOL_RESULT\" in *'\"is_error\":false'*) exit 0 ;; *) exit 1 ;; esac";
+        broker.hooks().write().await.post_call.entries.push(HookEntry {
+            id: hook_id("post-call-result-check"),
+            match_instance: None,
+            match_tool: Some(GlobPattern("t".into())),
+            match_context: None,
+            match_principal: None,
+            action: HookAction::Invoke(HookBody::Kaish(body.into())),
+            priority: 0,
+        });
+
+        let result = broker
+            .call_tool(
+                params("svc", "t"),
+                &CallContext::test(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("post_call hook should see KJ_TOOL_RESULT and exit 0");
+        assert!(!result.is_error);
+    }
+
+    /// PostCall observes a tool that returned `is_error: true` (a
+    /// successful protocol exchange that the *server* flagged as an
+    /// error). The hook asserts `KJ_TOOL_RESULT` reports the error flag
+    /// — useful for hooks that route on result content rather than on
+    /// the broker's outer `Result`.
+    #[tokio::test]
+    async fn post_call_hook_sees_tool_result_var_for_error_result() {
+        let (broker, _kernel) = wired_kaish_broker("post-call-result-error").await;
+
+        let svc = Arc::new(
+            MockServer::new("svc").with_tool("t").on_call(|_p| async {
+                Ok(KernelToolResult::error_text("synthetic tool failure"))
+            }),
+        );
+        broker
+            .register_silently(svc, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        let body = "case \"$KJ_TOOL_RESULT\" in *'\"is_error\":true'*) exit 0 ;; *) exit 1 ;; esac";
+        broker.hooks().write().await.post_call.entries.push(HookEntry {
+            id: hook_id("post-call-error-check"),
+            match_instance: None,
+            match_tool: Some(GlobPattern("t".into())),
+            match_context: None,
+            match_principal: None,
+            action: HookAction::Invoke(HookBody::Kaish(body.into())),
+            priority: 0,
+        });
+
+        let result = broker
+            .call_tool(
+                params("svc", "t"),
+                &CallContext::test(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("post_call hook should see is_error=true and exit 0");
+        assert!(result.is_error, "tool itself returned an error result");
+    }
+
+    /// OnError sees `KJ_TOOL_ERROR` populated with the JSON encoding of
+    /// the failure. Hook exit 0 → original `McpError` propagates;
+    /// missing var → exit 1 → broker rewraps as `Denied`. The assertion
+    /// distinguishes the two by matching `Protocol(_)` (the original)
+    /// vs `Denied(_)` (the failure mode).
+    #[tokio::test]
+    async fn on_error_hook_sees_tool_error_var() {
+        let (broker, _kernel) = wired_kaish_broker("on-error-error-var").await;
+
+        let svc = Arc::new(
+            MockServer::new("svc").with_tool("t").on_call(|_p| async {
+                Err(McpError::Protocol("synthetic broker error".into()))
+            }),
+        );
+        broker
+            .register_silently(svc, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        let body = "case \"$KJ_TOOL_ERROR\" in *'\"kind\":\"Protocol\"'*) exit 0 ;; *) exit 1 ;; esac";
+        broker.hooks().write().await.on_error.entries.push(HookEntry {
+            id: hook_id("on-error-check"),
+            match_instance: None,
+            match_tool: Some(GlobPattern("t".into())),
+            match_context: None,
+            match_principal: None,
+            action: HookAction::Invoke(HookBody::Kaish(body.into())),
+            priority: 0,
+        });
+
+        let err = broker
+            .call_tool(
+                params("svc", "t"),
+                &CallContext::test(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("server returned Err; broker must surface it");
+        assert!(
+            matches!(err, McpError::Protocol(_)),
+            "expected original Protocol error to propagate (hook saw KJ_TOOL_ERROR and exited 0); got {err:?}",
+        );
     }
 }
