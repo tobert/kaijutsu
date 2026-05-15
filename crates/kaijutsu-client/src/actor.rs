@@ -1125,7 +1125,7 @@ const BASE_BACKOFF_SECS: f64 = 1.0;
 /// The actual actor that holds !Send Cap'n Proto types.
 struct RpcActor {
     config: SshConfig,
-    /// `None` until `attach_kernel` returns the server-authoritative ID; then
+    /// `None` until `bind_kernel` returns the server-authoritative ID; then
     /// `Some(id)` for the lifetime of the actor. Kept as `Option` so initial
     /// logs and status events read truthfully as "unknown" rather than nil.
     kernel_id: Option<KernelId>,
@@ -1242,7 +1242,7 @@ impl RpcActor {
                         context_id: self.joined_context_id,
                     });
                 } else {
-                    // try_connect_inner sets self.kernel_id from attach_kernel
+                    // try_connect_inner sets self.kernel_id from bind_kernel
                     // before returning Ok. Reaching this branch means that
                     // invariant was violated — surface as Error rather than
                     // silently dropping the Connected event.
@@ -1267,7 +1267,7 @@ impl RpcActor {
         }
     }
 
-    /// Attempt SSH connect → attach_kernel → join_context → subscriptions.
+    /// Attempt SSH connect → bind_kernel → join_context → subscriptions.
     ///
     /// The entire sequence is wrapped in a timeout to prevent hanging on
     /// SYN blackholes or stalled servers.
@@ -1301,8 +1301,8 @@ impl RpcActor {
             }
         };
 
-        let (kernel, server_kernel_id) = client.attach_kernel().await.map_err(|e| {
-            let msg = format!("attach_kernel: {e}");
+        let (kernel, server_kernel_id) = client.bind_kernel().await.map_err(|e| {
+            let msg = format!("bind_kernel: {e}");
             let _ = self.status_tx.send(ConnectionStatus::Error(msg.clone()));
             ActorError::Rpc(msg)
         })?;

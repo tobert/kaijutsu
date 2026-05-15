@@ -849,7 +849,7 @@ interface World {
 
   # Kernel management
   listKernels @1 () -> (kernels :List(KernelInfo));
-  attachKernel @2 (trace :TraceContext) -> (kernel :Kernel, kernelId :Data);
+  bindKernel @2 (trace :TraceContext) -> (kernel :Kernel, kernelId :Data);
 }
 
 interface Kernel {

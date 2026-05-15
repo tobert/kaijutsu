@@ -1,13 +1,16 @@
 # Personas, Evolved
 
-> **Status (2026-05-02):** v1 `builtin.personas` was yanked. The
+> **Status (2026-05-15):** v1 `builtin.personas` was yanked. The
 > "Context Templates" direction in this doc was superseded mid-design
 > by the **rc system** — `/etc/rc/<context_type>/<verb>/SXX-name.{kai,md}`
 > with `.md` → block insertion and `.kai` → kaish via
 > `kaish_kernel::Kernel::execute_with_vars`. Templates as a separate
 > stored type are dropped; init scripts handle dynamic templating
-> directly. The rc lifecycle wires at `context.create` and the four
-> fork variants; `attach` and `drift` verbs are reserved. See
+> directly. The rc lifecycle wires at `context.create`, the four
+> fork variants, and `drift`. The `attach` verb is reserved with the
+> semantic **`kj attach <ctx>` user action that pulls an existing
+> context into the current session** — not the "driver attaches to
+> resume" reading below, which predates the chosen semantic. See
 > `docs/issues.md` for current rc follow-ups. The body below is
 > retained as design history — it captures the invariants and the
 > reasoning that led to rc.
@@ -141,7 +144,7 @@ Lifecycle hook points (initial set; expect to refine):
 | --- | --- |
 | `context.create` | A new context is created from scratch. |
 | `context.fork` | A context is forked from another (template or working). |
-| `context.attach` | A driver attaches to an existing context (resume). |
+| `context.attach` | `kj attach <ctx>` — user pulls an existing context into the current session. (Reserved; not yet wired. See status banner above for the chosen semantic, which differs from this doc's original "driver attaches to resume" reading.) |
 
 Init scripts are kaish. The kernel runs them in template-specified
 order, with the new context already created and addressable. A

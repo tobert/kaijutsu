@@ -138,12 +138,14 @@ impl RpcClient {
         Ok(result)
     }
 
-    /// Attach to the server's kernel.
-    ///
-    /// Returns the kernel handle and its ID (assigned by the server).
-    #[tracing::instrument(skip(self), name = "rpc_client.attach_kernel")]
-    pub async fn attach_kernel(&self) -> Result<(KernelHandle, KernelId), RpcError> {
-        let mut request = self.world.attach_kernel_request();
+    /// Bind to the server's kernel — handshake getter that returns the
+    /// shared kernel capability and its server-assigned ID. Despite the
+    /// historical name `attachKernel`, no per-client state is attached;
+    /// this is purely a capability handout. Real attach lifecycle lives
+    /// at the rc-verb layer (`kj attach <ctx>`) and at `attach_peer`.
+    #[tracing::instrument(skip(self), name = "rpc_client.bind_kernel")]
+    pub async fn bind_kernel(&self) -> Result<(KernelHandle, KernelId), RpcError> {
+        let mut request = self.world.bind_kernel_request();
         {
             let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
             let mut trace = request.get().init_trace();
@@ -243,7 +245,7 @@ pub struct MountSpec {
     pub writable: bool,
 }
 
-/// Handle to an attached kernel
+/// Handle to a bound kernel capability returned by `bind_kernel`.
 #[derive(Clone)]
 pub struct KernelHandle {
     kernel: crate::kaijutsu_capnp::kernel::Client,

@@ -9,7 +9,7 @@ fn test_rpc_join_updates_shell() {
     run_local(async {
         let addr = start_server().await;
         let client = connect_client(addr).await;
-        let (kernel, _kernel_id) = client.attach_kernel().await.unwrap();
+        let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
 
         // 1. Create and join a context via RPC
         let ctx_id = kernel.create_context("sync-test").await.unwrap();
@@ -39,7 +39,7 @@ fn test_shell_switch_updates_rpc() {
     run_local(async {
         let addr = start_server().await;
         let client = connect_client(addr).await;
-        let (kernel, _kernel_id) = client.attach_kernel().await.unwrap();
+        let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
 
         // 1. Create two contexts
         let ctx_a = kernel.create_context("alpha").await.unwrap();
@@ -79,13 +79,13 @@ fn test_session_isolation_unified() {
         
         // 1. Connect Client A and join 'alpha'
         let client_a = connect_client(addr).await;
-        let (kernel_a, _) = client_a.attach_kernel().await.unwrap();
+        let (kernel_a, _) = client_a.bind_kernel().await.unwrap();
         let ctx_a = kernel_a.create_context("alpha").await.unwrap();
         kernel_a.join_context(ctx_a, "instance-a").await.unwrap();
 
         // 2. Connect Client B and join 'beta'
         let client_b = connect_client(addr).await;
-        let (kernel_b, _) = client_b.attach_kernel().await.unwrap();
+        let (kernel_b, _) = client_b.bind_kernel().await.unwrap();
         let ctx_b = kernel_b.create_context("beta").await.unwrap();
         kernel_b.join_context(ctx_b, "instance-b").await.unwrap();
 

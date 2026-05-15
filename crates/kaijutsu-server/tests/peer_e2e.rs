@@ -46,7 +46,7 @@ fn test_invoke_peer_round_trip() {
 
         // Client A — registers as a peer under nick "echo".
         let client_a = connect_client(addr).await;
-        let (kernel_a, kernel_id) = client_a.attach_kernel().await.unwrap();
+        let (kernel_a, kernel_id) = client_a.bind_kernel().await.unwrap();
 
         let (tx, rx) = std::sync::mpsc::channel();
         let _handler = spawn_invocation_handler(rx, |action, _params| {
@@ -66,7 +66,7 @@ fn test_invoke_peer_round_trip() {
 
         // Client B — separate connection to the same kernel; calls echo.
         let client_b = connect_client(addr).await;
-        let (kernel_b, kernel_b_id) = client_b.attach_kernel().await.unwrap();
+        let (kernel_b, kernel_b_id) = client_b.bind_kernel().await.unwrap();
         assert_eq!(kernel_b_id, kernel_id, "shared kernel id should match");
 
         let response = kernel_b
@@ -82,7 +82,7 @@ fn test_invoke_unknown_peer_errors_cleanly() {
     run_local(async {
         let addr = start_server().await;
         let client = connect_client(addr).await;
-        let (kernel, _kernel_id) = client.attach_kernel().await.unwrap();
+        let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
 
         let err = kernel
             .invoke_peer("nobody-home", "ping", &[])
@@ -104,7 +104,7 @@ fn test_reattach_replaces_invocation_channel() {
         // Client A registers as "kaijutsu-app" twice. First registration is
         // replaced; only the second handler should see invocations.
         let client_a = connect_client(addr).await;
-        let (kernel_a, kernel_id) = client_a.attach_kernel().await.unwrap();
+        let (kernel_a, kernel_id) = client_a.bind_kernel().await.unwrap();
 
         let (tx_old, rx_old) = std::sync::mpsc::channel();
         let _stale = spawn_invocation_handler(rx_old, |action, _| {
@@ -136,7 +136,7 @@ fn test_reattach_replaces_invocation_channel() {
 
         // Client B invokes; only the live handler should reply.
         let client_b = connect_client(addr).await;
-        let (kernel_b, kernel_b_id) = client_b.attach_kernel().await.unwrap();
+        let (kernel_b, kernel_b_id) = client_b.bind_kernel().await.unwrap();
         assert_eq!(kernel_b_id, kernel_id, "shared kernel id should match");
 
         let response = kernel_b

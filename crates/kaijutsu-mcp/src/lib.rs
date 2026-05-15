@@ -267,7 +267,7 @@ impl KaijutsuMcp {
         tracing::debug!(?config, "Connecting via SSH");
 
         let client = connect_ssh(config.clone()).await?;
-        let (kernel, kernel_id_typed) = client.attach_kernel().await?;
+        let (kernel, kernel_id_typed) = client.bind_kernel().await?;
 
         tracing::info!(
             kernel = %kernel_id_typed,
@@ -276,7 +276,7 @@ impl KaijutsuMcp {
         );
 
         // Spawn actor with no context — it will join via register_session.
-        // kernel_id is already known here because we drove attach_kernel
+        // kernel_id is already known here because we drove bind_kernel
         // ourselves above (vs the client which lazy-connects).
         let actor = spawn_actor(
             config,

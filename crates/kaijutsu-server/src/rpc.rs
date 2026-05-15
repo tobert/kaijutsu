@@ -1151,15 +1151,15 @@ impl world::Server for WorldImpl {
         Promise::ok(())
     }
 
-    fn attach_kernel(
+    fn bind_kernel(
         self: Rc<Self>,
-        params: world::AttachKernelParams,
-        mut results: world::AttachKernelResults,
+        params: world::BindKernelParams,
+        mut results: world::BindKernelResults,
     ) -> Promise<(), capnp::Error> {
         let _params_reader = pry!(params.get());
-        let _span = tracing::info_span!("rpc", method = "attach_kernel").entered();
+        let _span = tracing::info_span!("rpc", method = "bind_kernel").entered();
 
-        // No kernel creation — just hand out the shared kernel
+        // No kernel creation — hand out the shared kernel capability.
         let kernel = self.registry.kernel.clone();
         let kernel_impl = KernelImpl::new(
             kernel.clone(),

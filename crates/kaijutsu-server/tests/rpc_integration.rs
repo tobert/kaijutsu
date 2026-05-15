@@ -30,13 +30,13 @@ fn test_list_kernels_shows_shared_kernel() {
 }
 
 #[test]
-fn test_attach_kernel_creates_kernel() {
+fn test_bind_kernel_creates_kernel() {
     run_local(async {
         let addr = start_server().await;
         let client = connect_client(addr).await;
 
         // Attach to a kernel (server auto-creates)
-        let (kernel, kernel_id) = client.attach_kernel().await.unwrap();
+        let (kernel, kernel_id) = client.bind_kernel().await.unwrap();
         let info = kernel.get_info().await.unwrap();
         assert!(!kernel_id.is_nil());
         assert_eq!(info.id, kernel_id);
@@ -50,7 +50,7 @@ fn test_kernel_appears_in_list() {
         let client = connect_client(addr).await;
 
         // Attach to a kernel
-        let (_kernel, _kernel_id) = client.attach_kernel().await.unwrap();
+        let (_kernel, _kernel_id) = client.bind_kernel().await.unwrap();
 
         // Check it appears in list
         let kernels = client.list_kernels().await.unwrap();
@@ -64,7 +64,7 @@ fn test_create_context_returns_valid_id() {
         let addr = start_server().await;
         let client = connect_client(addr).await;
 
-        let (kernel, _kernel_id) = client.attach_kernel().await.unwrap();
+        let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
         let context_id = kernel.create_context("test-ctx").await.unwrap();
 
         assert!(
@@ -80,7 +80,7 @@ fn test_create_context_appears_in_list() {
         let addr = start_server().await;
         let client = connect_client(addr).await;
 
-        let (kernel, _kernel_id) = client.attach_kernel().await.unwrap();
+        let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
 
         // Count contexts before
         let before = kernel.list_contexts().await.unwrap();
@@ -108,7 +108,7 @@ fn test_create_context_joinable() {
         let addr = start_server().await;
         let client = connect_client(addr).await;
 
-        let (kernel, _kernel_id) = client.attach_kernel().await.unwrap();
+        let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
         let context_id = kernel.create_context("joinable").await.unwrap();
 
         // Should be joinable
@@ -136,7 +136,7 @@ fn test_create_context_invalid_label_is_hard_error() {
         let addr = start_server().await;
         let client = connect_client(addr).await;
 
-        let (kernel, _kernel_id) = client.attach_kernel().await.unwrap();
+        let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
 
         let before = kernel.list_contexts().await.unwrap();
         let before_count = before.len();
@@ -163,7 +163,7 @@ fn test_join_nonexistent_context_fails() {
         let addr = start_server().await;
         let client = connect_client(addr).await;
 
-        let (kernel, _kernel_id) = client.attach_kernel().await.unwrap();
+        let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
 
         // Joining a random context that was never created should fail
         let random_id = kaijutsu_crdt::ContextId::new();
@@ -181,7 +181,7 @@ fn test_create_context_unique_ids() {
         let addr = start_server().await;
         let client = connect_client(addr).await;
 
-        let (kernel, _kernel_id) = client.attach_kernel().await.unwrap();
+        let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
         let id1 = kernel.create_context("ctx-a").await.unwrap();
         let id2 = kernel.create_context("ctx-b").await.unwrap();
 
@@ -203,7 +203,7 @@ fn test_call_mcp_tool_dispatches_builtin_over_ssh() {
         let addr = start_server().await;
         let client = connect_client(addr).await;
 
-        let (kernel, _kernel_id) = client.attach_kernel().await.unwrap();
+        let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
         let ctx_id = kernel.create_context("mcp-remote-test").await.unwrap();
         kernel.join_context(ctx_id, "test-mcp").await.unwrap();
 
@@ -232,7 +232,7 @@ fn test_call_mcp_tool_unknown_tool_errors() {
         let addr = start_server().await;
         let client = connect_client(addr).await;
 
-        let (kernel, _kernel_id) = client.attach_kernel().await.unwrap();
+        let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
         let ctx_id = kernel.create_context("mcp-remote-error").await.unwrap();
         kernel.join_context(ctx_id, "test-mcp").await.unwrap();
 
@@ -255,7 +255,7 @@ fn test_call_mcp_tool_requires_joined_context() {
         let addr = start_server().await;
         let client = connect_client(addr).await;
 
-        let (kernel, _kernel_id) = client.attach_kernel().await.unwrap();
+        let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
         // No join_context call.
 
         let result = kernel
@@ -277,7 +277,7 @@ async fn setup_execute_context(
     addr: std::net::SocketAddr,
 ) -> (kaijutsu_client::RpcClient, kaijutsu_client::KernelHandle) {
     let client = connect_client(addr).await;
-    let (kernel, _) = client.attach_kernel().await.unwrap();
+    let (kernel, _) = client.bind_kernel().await.unwrap();
     let ctx_id = kernel.create_context("exec-test").await.unwrap();
     kernel.join_context(ctx_id, "test-exec").await.unwrap();
     (client, kernel)
@@ -481,7 +481,7 @@ fn test_drift_router_concurrent_access_does_not_wedge() {
         // context then lists. The lock is shared across all of them.
         let make = |label: &'static str| async move {
             let client = connect_client(addr).await;
-            let (kernel, _) = client.attach_kernel().await.unwrap();
+            let (kernel, _) = client.bind_kernel().await.unwrap();
             let ctx = kernel.create_context(label).await.unwrap();
             let listed = kernel.list_contexts().await.unwrap();
             assert!(
@@ -511,7 +511,7 @@ fn test_subscribe_blocks_filtered_cleans_up_on_client_drop() {
         let addr = start_server().await;
         {
             let client = connect_client(addr).await;
-            let (kernel, _) = client.attach_kernel().await.unwrap();
+            let (kernel, _) = client.bind_kernel().await.unwrap();
             let ctx = kernel.create_context("subscribe-cleanup").await.unwrap();
             kernel.join_context(ctx, "drop-test").await.unwrap();
             // Subscribe with no events expected — just register the callback,
@@ -526,7 +526,7 @@ fn test_subscribe_blocks_filtered_cleans_up_on_client_drop() {
         // rather than a hang.
         let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let client = connect_client(addr).await;
-            let (kernel, _) = client.attach_kernel().await.unwrap();
+            let (kernel, _) = client.bind_kernel().await.unwrap();
             kernel.list_contexts().await.unwrap()
         })
         .await;

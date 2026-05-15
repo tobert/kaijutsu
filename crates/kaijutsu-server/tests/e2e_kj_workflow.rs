@@ -97,7 +97,7 @@ fn test_fork_work_drift_merge_e2e() {
         let client = connect_client(addr).await;
 
         // Attach kernel
-        let (kernel, _kernel_id) = client.attach_kernel().await.unwrap();
+        let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
 
         // Create root context "main" and join it
         let main_ctx = kernel.create_context("main").await.unwrap();
@@ -227,7 +227,7 @@ fn test_drift_push_flush_between_siblings_e2e() {
         let addr = start_server_with_mock_llm().await;
         let client = connect_client(addr).await;
 
-        let (kernel, _) = client.attach_kernel().await.unwrap();
+        let (kernel, _) = client.bind_kernel().await.unwrap();
 
         // Create two sibling contexts
         let alpha_id = kernel.create_context("alpha").await.unwrap();
@@ -279,7 +279,7 @@ fn test_two_clients_same_kernel_e2e() {
 
         // Client A creates and works in root context
         let client_a = connect_client(addr).await;
-        let (kernel_a, kernel_id) = client_a.attach_kernel().await.unwrap();
+        let (kernel_a, kernel_id) = client_a.bind_kernel().await.unwrap();
         let root_ctx = kernel_a.create_context("shared-root").await.unwrap();
         kernel_a.join_context(root_ctx, "client-a").await.unwrap();
 
@@ -290,7 +290,7 @@ fn test_two_clients_same_kernel_e2e() {
 
         // Client B connects to same server
         let client_b = connect_client(addr).await;
-        let (kernel_b, kernel_id_b) = client_b.attach_kernel().await.unwrap();
+        let (kernel_b, kernel_id_b) = client_b.bind_kernel().await.unwrap();
         assert_eq!(
             kernel_id, kernel_id_b,
             "both clients should see the same shared kernel"
@@ -325,7 +325,7 @@ fn test_context_list_e2e() {
         let addr = start_server_with_mock_llm().await;
         let client = connect_client(addr).await;
 
-        let (kernel, _) = client.attach_kernel().await.unwrap();
+        let (kernel, _) = client.bind_kernel().await.unwrap();
 
         // Create several contexts
         let ctx_a = kernel.create_context("ctx-alpha").await.unwrap();
@@ -366,7 +366,7 @@ fn test_shell_echo_e2e() {
         let addr = start_server().await;
         let client = connect_client(addr).await;
 
-        let (kernel, _) = client.attach_kernel().await.unwrap();
+        let (kernel, _) = client.bind_kernel().await.unwrap();
         let ctx = kernel.create_context("shell-test").await.unwrap();
         kernel.join_context(ctx, "test").await.unwrap();
 

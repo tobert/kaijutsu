@@ -156,7 +156,7 @@ impl Plugin for ActorPlugin {
         // Initial connection — no context joined. Constellation populates from
         // list_contexts(); user picks or creates a context explicitly.
         // kernel_id is None: server is authoritative and reveals it during
-        // attach_kernel (see actor.rs `try_connect_inner`).
+        // bind_kernel (see actor.rs `try_connect_inner`).
         let _ = bootstrap_channel.tx.send(BootstrapCommand::SpawnActor {
             config: ssh_config.clone(),
             kernel_id: None,
@@ -229,7 +229,7 @@ fn poll_bootstrap_results(
                 );
 
                 // Eagerly connect: fire whoami to trigger ensure_connected
-                // (SSH → attach_kernel → subscriptions → Connected).
+                // (SSH → bind_kernel → subscriptions → Connected).
                 // If a context was specified, fetch its state and emit ContextJoined.
                 // Otherwise just get identity + populate constellation from list_contexts().
                 let h = handle.clone();

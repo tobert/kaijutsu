@@ -22,7 +22,7 @@ pub enum BootstrapCommand {
     /// Spawn a new actor for the given kernel/context.
     ///
     /// `kernel_id` is `None` on first connect (the server is authoritative
-    /// and reveals it during `attach_kernel`). Subsequent spawns for the
+    /// and reveals it during `bind_kernel`). Subsequent spawns for the
     /// same kernel pass `Some(id)` so logs and membership stay coherent.
     SpawnActor {
         config: SshConfig,
