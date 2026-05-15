@@ -49,10 +49,14 @@ pub enum HookActionWire {
     /// Exit 0 → phase continues; non-zero → `PhaseOutcome::Deny`.
     Kaish { body: String },
     /// Reference to a stored shared script in the `hook_scripts` table.
-    /// Resolved at hook_add time so the resulting `HookEntry` carries
-    /// a runnable `HookBody::Kaish(body)`; the originating `script_id`
-    /// is preserved on `HookEntry.kaish_script_id` so persistence
-    /// writes `hooks.action_kaish_script_id`.
+    /// The body is resolved at hook_add time and SNAPSHOTTED into the
+    /// resulting `HookEntry` (`HookBody::Kaish(body)`); the originating
+    /// `script_id` is preserved on `HookEntry.kaish_script_id` as
+    /// provenance. Per
+    /// [[feedback_script_snapshot_on_instantiation]], updates to the
+    /// source script do NOT propagate to existing hooks — to pick up
+    /// new behavior, re-add the hook (which re-snapshots from the
+    /// current script).
     KaishScript { script_id: String },
     /// Return a synthetic result in lieu of calling the server.
     ShortCircuit {
@@ -1467,6 +1471,83 @@ mod tests {
         assert!(
             matches!(err, McpError::Protocol(ref msg) if msg.contains("nope")),
             "expected Protocol error mentioning the script_id, got {err:?}",
+        );
+    }
+
+    /// Snapshot semantics: editing a `hook_script` body after a hook
+    /// has been installed from it does NOT propagate to the live
+    /// entry. The body is captured at hook_add time; updates affect
+    /// only future installs (per
+    /// `feedback_script_snapshot_on_instantiation`). The originating
+    /// `script_id` stays as provenance on the entry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn hook_script_update_does_not_propagate_to_existing_hooks() {
+        let broker = broker_with_db();
+        let server = Arc::new(BuiltinHooksServer::new(Arc::downgrade(&broker)));
+        broker
+            .register(server, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        broker
+            .call_tool(
+                call_params(
+                    "hook_script_add",
+                    serde_json::json!({"script_id": "snap", "body": "exit 0"}),
+                ),
+                &CallContext::test(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        broker
+            .call_tool(
+                call_params(
+                    "hook_add",
+                    serde_json::json!({
+                        "phase": "pre_call",
+                        "match_instance": "svc",
+                        "action": {
+                            "type": "kaish_script",
+                            "script_id": "snap",
+                        },
+                    }),
+                ),
+                &CallContext::test(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        // Mutate the source script — should NOT affect the live entry.
+        broker
+            .call_tool(
+                call_params(
+                    "hook_script_update",
+                    serde_json::json!({"script_id": "snap", "body": "exit 99"}),
+                ),
+                &CallContext::test(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let hooks = broker.hooks().read().await;
+        let entry = hooks.pre_call.entries.first().expect("entry installed");
+        match &entry.action {
+            HookAction::Invoke(HookBody::Kaish(body)) => {
+                assert_eq!(
+                    body, "exit 0",
+                    "snapshot must survive hook_script_update; got {body:?}"
+                );
+            }
+            other => panic!("expected Invoke(Kaish), got {other:?}"),
+        }
+        assert_eq!(
+            entry.kaish_script_id.as_deref(),
+            Some("snap"),
+            "provenance preserved",
         );
     }
 

@@ -242,9 +242,9 @@ impl Broker {
     /// field, kaish body) are logged at WARN and skipped individually —
     /// one bad row must not brick the whole hook table.
     async fn hydrate_hooks_from_db(self: &Arc<Self>, db: &DbHandle) {
-        let (rows, scripts) = {
+        let rows = {
             let guard = db.lock();
-            let rows = match guard.load_all_hooks() {
+            match guard.load_all_hooks() {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::warn!(
@@ -253,30 +253,24 @@ impl Broker {
                     );
                     return;
                 }
-            };
-            // Hook scripts are loaded once and passed by reference into
-            // every `row_to_entry` call so script-backed hooks can
-            // resolve `script_id` → body without per-row DB hits.
-            let scripts: std::collections::HashMap<String, String> = guard
-                .list_all_hook_scripts()
-                .map(|v| v.into_iter().map(|s| (s.script_id, s.body)).collect())
-                .unwrap_or_else(|e| {
-                    tracing::warn!(
-                        error = ?e,
-                        "failed to load hook_scripts; script-backed hooks will fail to hydrate",
-                    );
-                    std::collections::HashMap::new()
-                });
-            (rows, scripts)
+            }
         };
         if rows.is_empty() {
             return;
         }
+        // Snapshot semantics: each kaish hook row carries its own
+        // `action_kaish_body` snapshot taken at install time. We do
+        // NOT re-resolve `action_kaish_script_id` against the current
+        // hook_scripts table here — that would let script edits leak
+        // into existing hooks across restarts, violating
+        // [[feedback_script_snapshot_on_instantiation]]. The script_id
+        // column is read by `row_to_entry` purely as provenance and
+        // surfaced on `HookEntry.kaish_script_id`.
         let mut hooks = self.hooks.write().await;
         let mut loaded = 0usize;
         let mut skipped = 0usize;
         for row in rows {
-            match super::hook_persist::row_to_entry(&row, &self.builtin_hooks, &scripts) {
+            match super::hook_persist::row_to_entry(&row, &self.builtin_hooks) {
                 Ok((phase, entry)) => {
                     let table = match phase {
                         HookPhase::PreCall => &mut hooks.pre_call,

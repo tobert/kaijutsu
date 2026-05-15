@@ -110,11 +110,14 @@ pub struct HookRow {
     pub match_principal: Option<PrincipalId>,
     pub action_kind: String,
     pub action_builtin_name: Option<String>,
-    /// Inline kaish body. Mutually exclusive with `action_kaish_script_id`
-    /// when `action_kind = "kaish_invoke"`.
+    /// Snapshot of the kaish body that fires at evaluation. Always
+    /// set when `action_kind = "kaish_invoke"`. Even hooks installed
+    /// via a shared `hook_scripts` reference snapshot the body here
+    /// at install time per
+    /// `feedback_script_snapshot_on_instantiation`.
     pub action_kaish_body: Option<String>,
-    /// Reference into `hook_scripts(script_id)`. Mutually exclusive with
-    /// `action_kaish_body`.
+    /// Provenance: if installed from a shared script, the originating
+    /// `script_id`. Not re-resolved at hydrate; metadata only.
     pub action_kaish_script_id: Option<String>,
     pub action_result_text: Option<String>,
     pub action_is_error: Option<bool>,
@@ -482,14 +485,15 @@ CREATE TABLE IF NOT EXISTS hooks (
     match_principal          TEXT,
     action_kind              TEXT    NOT NULL,
     action_builtin_name      TEXT,
-    -- Inline kaish body authored at hook_add time. Mutually
-    -- exclusive with `action_kaish_script_id` — exactly one is set
-    -- when `action_kind = 'kaish_invoke'`.
+    -- The kaish body that fires at hook evaluation. ALWAYS set for
+    -- `action_kind = 'kaish_invoke'` rows: even script-backed hooks
+    -- snapshot the body here at install time
+    -- (`feedback_script_snapshot_on_instantiation`).
     action_kaish_body        TEXT,
-    -- Reference into `hook_scripts(script_id)`. Stored hooks resolve
-    -- the body via JOIN at hydrate time; runtime stores the snapshot
-    -- in HookEntry. Updates to the script require re-hydration to
-    -- propagate.
+    -- Provenance: if the hook was installed from a shared script in
+    -- `hook_scripts`, this records the originating `script_id`. Read
+    -- by admin tooling for traceability; NOT re-resolved at hydrate.
+    -- Edits to the source script don't leak into existing hooks.
     action_kaish_script_id   TEXT,
     action_result_text       TEXT,
     action_is_error          INTEGER,

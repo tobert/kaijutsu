@@ -120,10 +120,15 @@ pub struct HookEntry {
     pub action: HookAction,
     pub priority: i32,
     /// If `action` is a `HookBody::Kaish` body sourced from the
-    /// `hook_scripts` table, the originating `script_id`. Persistence
-    /// reads this to write `hooks.action_kaish_script_id` rather than
-    /// `hooks.action_kaish_body`. `None` means "inline body authored
-    /// at hook_add time" — the existing case.
+    /// `hook_scripts` table at install time, the originating
+    /// `script_id` — provenance metadata. The body in `HookBody::Kaish`
+    /// is the snapshot taken at install; subsequent edits to the
+    /// source script do NOT propagate per
+    /// [[feedback_script_snapshot_on_instantiation]]. Persistence
+    /// writes both `hooks.action_kaish_body` (snapshot) and
+    /// `hooks.action_kaish_script_id` (provenance); they are no
+    /// longer mutually exclusive. `None` means "inline body, no
+    /// script provenance" — the original case.
     pub kaish_script_id: Option<String>,
 }
 
