@@ -42,9 +42,8 @@ following are explicit follow-ups that did not ship:
   `.md` becomes a block; `.kai` runs via
   `kaish_kernel::Kernel::execute_with_vars`. Stored in KernelDb.
   Admin via `kj rc add | list | rm`. Scripts decide their own
-  applicability via `kj` introspection. See
-  [`personas-evolution.md`](personas-evolution.md) for the design
-  motivation. Per-script time budgets ship 2026-05-15
+  applicability via `kj` introspection.
+  Per-script time budgets ship 2026-05-15
   (`kj rc add --timeout <secs>`). The `attach` verb wires
   2026-05-15 — `kj attach <ctx>` switches the session to the
   target and fires `/etc/rc/<ctx_type>/attach/SXX-*.{kai,md}`.
