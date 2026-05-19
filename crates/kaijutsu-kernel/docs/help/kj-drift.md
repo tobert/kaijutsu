@@ -29,10 +29,17 @@ push <dst> --summarize   Stage LLM-distilled summary of your context
 pull <src> [prompt]      Pull + LLM-distill from source
 merge [ctx]              Summarize this fork back into parent
 flush                    Deliver all staged drifts
-queue                    Show staging queue
-cancel <id>              Remove staged drift by ID
-history [ctx]            Show drift edges for a context
+queue                    Show staging queue (yields queue u64 ids)
+cancel <queue_id>        Remove staged drift before flush (pre-flush only)
+history [ctx]            Show drift edges for a context (yields edge UUIDs)
+edge rm <uuid>           Remove a post-flush drift edge by UUID
 ```
+
+Two id namespaces:
+- `cancel` takes the **u64 queue id** shown by `queue` (ephemeral, gone
+  after flush).
+- `edge rm` takes the **UUID** shown by `history` (persistent edge in
+  the context DAG; pairs with the iteration handles `history` emits).
 
 ## Multi-Agent Pattern
 

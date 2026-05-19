@@ -21,6 +21,7 @@ impl KjDispatcher {
             "queue" | "q" => self.drift_queue().await,
             "cancel" => self.drift_cancel(argv).await,
             "history" => self.drift_history(argv, caller),
+            "edge" => self.drift_edge(&argv[1..]),
             "help" | "--help" | "-h" => KjResult::ok_ephemeral(self.drift_help(), ContentType::Markdown),
             other => KjResult::Err(format!(
                 "kj drift: unknown subcommand '{}'\n\n{}",
@@ -504,6 +505,53 @@ impl KjDispatcher {
         KjResult::ok_with_data(text, serde_json::Value::Array(ids))
     }
 
+    /// `kj drift edge rm <uuid>` — delete a post-flush drift edge by its
+    /// UUID. The UUIDs come from `kj drift history`'s `.data` array, so
+    /// `for e in $(kj drift history); do kj drift edge rm $e; done`
+    /// round-trips. Distinct from `kj drift cancel` which takes the
+    /// in-memory queue id (u64, pre-flush).
+    fn drift_edge(&self, argv: &[String]) -> KjResult {
+        let sub = argv.first().map(|s| s.as_str()).unwrap_or("");
+        match sub {
+            "rm" | "remove" => {
+                let id_str = match argv.get(1) {
+                    Some(s) => s.as_str(),
+                    None => {
+                        return KjResult::Err(
+                            "kj drift edge rm: requires a drift edge UUID (see `kj drift history`)"
+                                .to_string(),
+                        );
+                    }
+                };
+                let edge_id = match uuid::Uuid::parse_str(id_str) {
+                    Ok(u) => u,
+                    Err(_) => {
+                        return KjResult::Err(format!(
+                            "kj drift edge rm: '{id_str}' is not a valid UUID"
+                        ));
+                    }
+                };
+                let db = self.kernel_db().lock();
+                match db.delete_drift_edge(edge_id) {
+                    Ok(true) => KjResult::ok(format!("removed drift edge {edge_id}")),
+                    Ok(false) => KjResult::Err(format!(
+                        "kj drift edge rm: no drift edge {edge_id} (already removed, \
+                         or wrong kind — only drift edges are eligible)"
+                    )),
+                    Err(e) => KjResult::Err(format!("kj drift edge rm: {e}")),
+                }
+            }
+            // Defer to the canonical `kj drift --help` (rendered from
+            // `docs/help/kj-drift.md`) so there's one source of truth.
+            "" | "help" | "--help" | "-h" => {
+                KjResult::ok_ephemeral(self.drift_help(), ContentType::Markdown)
+            }
+            other => KjResult::Err(format!(
+                "kj drift edge: unknown subcommand '{other}' (try `rm <uuid>`)"
+            )),
+        }
+    }
+
     async fn drift_cancel(&self, argv: &[String]) -> KjResult {
         let id_str = match argv.get(1) {
             Some(s) => s,
@@ -631,6 +679,164 @@ mod tests {
             "msg: {}",
             result.message()
         );
+    }
+
+    /// `kj drift edge rm <uuid>` deletes a single drift edge and pairs
+    /// with the UUIDs that `kj drift history` emits in `.data`. End-to-end:
+    /// insert a drift edge → history surfaces its UUID → edge rm removes
+    /// it → history is empty again.
+    ///
+    /// Note: `drift_flush` injects a Drift *block* into the target context
+    /// but does NOT currently write a row to `context_edges`. That's a
+    /// pre-existing gap (tracked in `docs/issues.md`); this test seeds the
+    /// edge directly to exercise the rm path independently. Once flush is
+    /// fixed to also write the edge, the seed becomes optional.
+    #[tokio::test]
+    async fn drift_edge_rm_round_trip() {
+        use crate::kernel_db::ContextEdgeRow;
+        use crate::kj::KjResult;
+        use kaijutsu_types::EdgeKind;
+
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let src = register_context(&d, Some("src"), None, principal);
+        let dst = register_context(&d, Some("dst"), None, principal);
+
+        let edge_id = uuid::Uuid::now_v7();
+        {
+            let db = d.kernel_db().lock();
+            db.insert_edge(&ContextEdgeRow {
+                edge_id,
+                source_id: src,
+                target_id: dst,
+                kind: EdgeKind::Drift,
+                metadata: None,
+                created_at: kaijutsu_types::now_millis() as i64,
+            })
+            .expect("insert drift edge");
+        }
+
+        let c = caller_with_context(src);
+
+        // History on the source surfaces the edge_id we just inserted.
+        let history = d.dispatch(&[s("drift"), s("history")], &c).await;
+        match history {
+            KjResult::Ok { data: Some(v), .. } => {
+                let ids: Vec<&str> = v
+                    .as_array()
+                    .expect("array")
+                    .iter()
+                    .filter_map(|x| x.as_str())
+                    .collect();
+                assert_eq!(ids.len(), 1, "expected one edge in .data: {ids:?}");
+                assert_eq!(ids[0], edge_id.to_string());
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        };
+
+        // The handle round-trips into `edge rm`.
+        let rm = d
+            .dispatch(
+                &[s("drift"), s("edge"), s("rm"), edge_id.to_string()],
+                &c,
+            )
+            .await;
+        assert!(rm.is_ok(), "edge rm: {}", rm.message());
+        assert!(
+            rm.message().contains(&edge_id.to_string()),
+            "msg should echo the uuid: {}",
+            rm.message()
+        );
+
+        // History is now empty.
+        let again = d.dispatch(&[s("drift"), s("history")], &c).await;
+        assert!(again.message().contains("no drift history"));
+    }
+
+    /// Removing a non-existent edge UUID returns a friendly error (not
+    /// a panic) and doesn't claim success.
+    #[tokio::test]
+    async fn drift_edge_rm_unknown_uuid_errors() {
+        let d = test_dispatcher().await;
+        let c = test_caller();
+        let result = d
+            .dispatch(
+                &[
+                    s("drift"),
+                    s("edge"),
+                    s("rm"),
+                    s("00000000-0000-0000-0000-000000000000"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(!result.is_ok(), "must fail on unknown edge");
+        assert!(
+            result.message().contains("no drift edge"),
+            "msg: {}",
+            result.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn drift_edge_rm_malformed_uuid_errors() {
+        let d = test_dispatcher().await;
+        let c = test_caller();
+        let result = d
+            .dispatch(&[s("drift"), s("edge"), s("rm"), s("not-a-uuid")], &c)
+            .await;
+        assert!(!result.is_ok());
+        assert!(
+            result.message().contains("valid UUID"),
+            "msg: {}",
+            result.message()
+        );
+    }
+
+    /// Structural edges are NOT eligible — `edge rm` only touches drift
+    /// edges so it can't break the context DAG. This test inserts a
+    /// structural edge directly and confirms `edge rm <its-uuid>`
+    /// returns a friendly "not found" rather than silently deleting it.
+    #[tokio::test]
+    async fn drift_edge_rm_refuses_structural() {
+        use crate::kernel_db::ContextEdgeRow;
+        use kaijutsu_types::EdgeKind;
+
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let parent = register_context(&d, Some("parent"), None, principal);
+        let child = register_context(&d, Some("child"), Some(parent), principal);
+
+        let structural_id = uuid::Uuid::now_v7();
+        {
+            let db = d.kernel_db().lock();
+            db.insert_edge(&ContextEdgeRow {
+                edge_id: structural_id,
+                source_id: parent,
+                target_id: child,
+                kind: EdgeKind::Structural,
+                metadata: None,
+                created_at: kaijutsu_types::now_millis() as i64,
+            })
+            .expect("insert structural edge");
+        }
+
+        let c = caller_with_context(parent);
+        let result = d
+            .dispatch(
+                &[s("drift"), s("edge"), s("rm"), structural_id.to_string()],
+                &c,
+            )
+            .await;
+        assert!(!result.is_ok(), "must refuse structural: {}", result.message());
+
+        // And the structural edge is still there.
+        let edges = d
+            .kernel_db()
+            .lock()
+            .edges_from(parent, Some(EdgeKind::Structural))
+            .unwrap();
+        assert_eq!(edges.len(), 1, "structural edge must survive");
     }
 
     #[tokio::test]

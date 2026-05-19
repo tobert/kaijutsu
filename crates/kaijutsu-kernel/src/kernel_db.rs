@@ -2989,6 +2989,21 @@ impl KernelDb {
         Ok(deleted > 0)
     }
 
+    /// Delete a single drift edge by its UUID.
+    ///
+    /// Companion to `kj drift edge rm` — `kj drift history` emits these
+    /// UUIDs as iteration handles. Kind filter pins this to drift edges
+    /// only so a stray `delete_drift_edge` can't accidentally remove a
+    /// structural edge (which would orphan a context's parent link).
+    pub fn delete_drift_edge(&self, edge_id: uuid::Uuid) -> KernelDbResult<bool> {
+        let deleted = self.conn.execute(
+            "DELETE FROM context_edges
+             WHERE edge_id = ?1 AND kind = 'drift'",
+            params![edge_id.as_bytes().as_slice()],
+        )?;
+        Ok(deleted > 0)
+    }
+
     /// Hard-delete a context and all its edges (CASCADE).
     ///
     /// Used by `kj context remove`. This is permanent — use `archive_context`
