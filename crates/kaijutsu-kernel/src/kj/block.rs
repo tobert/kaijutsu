@@ -72,6 +72,16 @@ impl KjDispatcher {
             })
             .collect();
 
+        // Build the for-loop iteration payload: a JSON array of block id
+        // strings. `for b in $(kj block list); do echo $b; done` then walks
+        // each id without needing jq.
+        let id_array: serde_json::Value = serde_json::Value::Array(
+            filtered
+                .iter()
+                .map(|b| serde_json::Value::String(b.id.to_key()))
+                .collect(),
+        );
+
         if json {
             let rows: Vec<BlockListRow> = filtered
                 .iter()
@@ -90,11 +100,11 @@ impl KjDispatcher {
                 "total": snapshots.len(),
                 "blocks": rows,
             });
-            return KjResult::ok(out.to_string());
+            return KjResult::ok_with_data(out.to_string(), id_array);
         }
 
         if filtered.is_empty() {
-            return KjResult::ok("(no blocks)".to_string());
+            return KjResult::ok_with_data("(no blocks)".to_string(), id_array);
         }
         let mut out = String::new();
         for b in &filtered {
@@ -107,7 +117,7 @@ impl KjDispatcher {
                 first_line_trunc(&b.content, 60),
             ));
         }
-        KjResult::ok(out)
+        KjResult::ok_with_data(out, id_array)
     }
 
     fn block_inspect(&self, argv: &[String], _caller: &KjCaller) -> KjResult {
@@ -117,27 +127,26 @@ impl KjDispatcher {
             None => return KjResult::Err("kj block inspect: <block-id> required".into()),
         };
 
-        let parts: Vec<&str> = id_str.split(':').collect();
-        if parts.len() != 3 {
-            return KjResult::Err(format!(
-                "kj block inspect: malformed id '{id_str}' (expected context_id:agent_id:seq)"
-            ));
-        }
-        let ctx_id = match kaijutsu_types::ContextId::parse(parts[0]) {
-            Ok(c) => c,
-            Err(_) => {
+        // Round-trip with the keys `block list` emits: `BlockId::to_key()`
+        // uses `_` (legacy `:` still accepted by from_key). Without this,
+        // `for b in $(kj block list); do kj block inspect $b; done` would
+        // reject every iteration as malformed.
+        let block_id = match kaijutsu_types::BlockId::from_key(&id_str) {
+            Some(id) => id,
+            None => {
                 return KjResult::Err(format!(
-                    "kj block inspect: bad context_id in '{id_str}'"
+                    "kj block inspect: malformed id '{id_str}' (expected context_hex_principal_hex_seq)"
                 ));
             }
         };
+        let ctx_id = block_id.context_id;
 
         let snapshots = match self.blocks.block_snapshots(ctx_id) {
             Ok(s) => s,
             Err(e) => return KjResult::Err(format!("kj block inspect: {e}")),
         };
         let block_count = snapshots.len();
-        let snap = match snapshots.iter().find(|b| b.id.to_key() == id_str) {
+        let snap = match snapshots.iter().find(|b| b.id == block_id) {
             Some(s) => s,
             None => {
                 return KjResult::Err(format!(
@@ -147,22 +156,26 @@ impl KjDispatcher {
             }
         };
 
+        // Single-record inspect: the structured payload is the same JSON
+        // object that `--json` prints, so `kaish-last` exposes the full
+        // record after a plain `kj block inspect <id>`.
+        let record = serde_json::json!({
+            "block_id": id_str,
+            "context_id": ctx_id.to_hex(),
+            "context_block_count": block_count,
+            "role": snap.role.as_str(),
+            "kind": snap.kind.as_str(),
+            "status": snap.status.as_str(),
+            "parent_id": snap.parent_id.map(|id| id.to_key()),
+            "content_length": snap.content.len(),
+            "tool_name": snap.tool_name,
+            "tool_call_id": snap.tool_call_id.map(|id| id.to_key()),
+            "is_error": snap.is_error,
+            "exit_code": snap.exit_code,
+        });
+
         if json {
-            let out = serde_json::json!({
-                "block_id": id_str,
-                "context_id": ctx_id.to_hex(),
-                "context_block_count": block_count,
-                "role": snap.role.as_str(),
-                "kind": snap.kind.as_str(),
-                "status": snap.status.as_str(),
-                "parent_id": snap.parent_id.map(|id| id.to_key()),
-                "content_length": snap.content.len(),
-                "tool_name": snap.tool_name,
-                "tool_call_id": snap.tool_call_id.map(|id| id.to_key()),
-                "is_error": snap.is_error,
-                "exit_code": snap.exit_code,
-            });
-            return KjResult::ok(out.to_string());
+            return KjResult::ok_with_data(record.to_string(), record);
         }
         let parent = snap
             .parent_id
@@ -179,7 +192,7 @@ impl KjDispatcher {
             parent,
             snap.content.len(),
         );
-        KjResult::ok(out)
+        KjResult::ok_with_data(out, record)
     }
 
     fn block_count(&self, argv: &[String], caller: &KjCaller) -> KjResult {
@@ -206,7 +219,7 @@ impl KjDispatcher {
             .iter()
             .filter(|b| kf.map_or(true, |k| b.kind == k) && rf.map_or(true, |r| b.role == r))
             .count();
-        KjResult::ok(n.to_string())
+        KjResult::ok_with_data(n.to_string(), serde_json::json!(n))
     }
 }
 
@@ -239,7 +252,8 @@ Examples:
   kj block list --json
   kj block list --context main --kind text --role model
   kj block count --kind text
-  kj block inspect <ctx>:<agent>:<seq> --json
+  kj block inspect <ctx>_<agent>_<seq> --json
+  for b in $(kj block list); do kj block inspect $b; done
 "
     .to_string()
 }
@@ -368,5 +382,46 @@ mod tests {
             .await;
         assert!(!result.is_ok());
         assert!(result.message().contains("malformed"));
+    }
+
+    /// `kj block list` must populate `KjResult::Ok::data` with a JSON array
+    /// of block-id strings so kaish's command-substitution path can iterate
+    /// in `for b in $(kj block list)`. The text output is independent.
+    #[tokio::test]
+    async fn block_list_emits_structured_data_for_iteration() {
+        use crate::kj::KjResult;
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let c = caller_with_context(ctx);
+
+        let result = d.dispatch(&[s("block"), s("list")], &c).await;
+        match result {
+            KjResult::Ok { data, .. } => {
+                let arr = data
+                    .as_ref()
+                    .and_then(|v| v.as_array())
+                    .expect("empty block list must still emit an array (length 0)");
+                assert_eq!(arr.len(), 0, "no blocks were inserted: {arr:?}");
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn block_count_emits_numeric_data() {
+        use crate::kj::KjResult;
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let c = caller_with_context(ctx);
+
+        let result = d.dispatch(&[s("block"), s("count")], &c).await;
+        match result {
+            KjResult::Ok { data: Some(v), .. } => {
+                assert_eq!(v.as_i64(), Some(0), "expected zero count, got {v}");
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
     }
 }

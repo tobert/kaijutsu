@@ -454,6 +454,7 @@ impl Tool for KjBuiltin {
                 message,
                 content_type,
                 ephemeral,
+                data,
             } => {
                 let mut result = ExecResult::success(message);
                 result.content_type = if content_type != ContentType::Plain {
@@ -465,6 +466,13 @@ impl Tool for KjBuiltin {
                     result
                         .baggage
                         .insert("kaijutsu.ephemeral".into(), "true".into());
+                }
+                // Carry structured payload into the shell's `.data` slot so
+                // `for x in $(kj …)` iterates JSON arrays and `kaish-last`
+                // can read JSON objects. See `KjResult::Ok::data` for the
+                // shape conventions.
+                if let Some(json) = data {
+                    result.data = Some(kaish_kernel::interpreter::json_to_value(json));
                 }
                 result
             }
@@ -521,4 +529,237 @@ fn build_target_scope(argv: &[String]) -> String {
         .find(|s| !s.starts_with('-'))
         .cloned()
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    //! End-to-end coverage that `KjResult::Ok::data` survives the
+    //! kj → KjBuiltin → ExecResult → kaish for-loop pipeline. The
+    //! dispatcher-level tests in `kj/{context,block}.rs` cover the
+    //! `KjResult` half; these tests cover the wiring half — concretely,
+    //! that `for c in $(kj context list); do echo $c; done` walks the
+    //! handles instead of the rendered table.
+    use super::*;
+    use crate::block_store::shared_block_store;
+    use crate::kj::test_helpers::{register_context, test_dispatcher};
+    use crate::runtime::context_engine::session_context_map;
+    use crate::runtime::embedded_kaish::EmbeddedKaish;
+    use kaish_kernel::ExecuteOptions;
+    use kaijutsu_types::SessionId;
+
+    /// Build an `EmbeddedKaish` wired to a `KjBuiltin` rooted at the given
+    /// dispatcher. Mirrors the rc-lifecycle wiring in `kj/lifecycle.rs`
+    /// but without the script-execution scaffolding.
+    async fn embedded_with_kj(
+        dispatcher: Arc<KjDispatcher>,
+        ctx: ContextId,
+    ) -> EmbeddedKaish {
+        let blocks = shared_block_store(PrincipalId::system());
+        let kernel = dispatcher.kernel().clone();
+        let kernel_id = dispatcher.kernel_id();
+        let session_id = SessionId::new();
+        let session_contexts = session_context_map();
+        session_contexts.insert(session_id, ctx);
+
+        let configure_tools = move |scm: SessionContextMap,
+                                    sid: SessionId,
+                                    tools: &mut kaish_kernel::ToolRegistry| {
+            tools.register(KjBuiltin::new(
+                dispatcher,
+                scm,
+                PrincipalId::system(),
+                sid,
+                None,
+                Arc::new(crate::kj::lifecycle::NoopBlockSource),
+            ));
+        };
+
+        EmbeddedKaish::with_identity(
+            "test-kj-data",
+            blocks,
+            kernel,
+            None,
+            PrincipalId::system(),
+            ctx,
+            session_id,
+            kernel_id,
+            session_contexts,
+            configure_tools,
+        )
+        .expect("EmbeddedKaish init")
+    }
+
+    /// The headline guarantee: structured `.data` makes
+    /// `for c in $(kj context list)` iterate per handle. Without the
+    /// wiring this loop would split the rendered table line-by-line and
+    /// the asserted echoes would look very different.
+    #[tokio::test]
+    async fn for_loop_iterates_kj_context_list_handles() {
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+
+        let principal = PrincipalId::new();
+        let alpha = register_context(&dispatcher, Some("alpha"), None, principal);
+        let beta = register_context(&dispatcher, Some("beta"), None, principal);
+
+        let kaish = embedded_with_kj(dispatcher.clone(), alpha).await;
+
+        // The loop body uses `echo` so we can assert on a stable stdout shape.
+        let script = "for c in $(kj context list); do echo \"got=$c\"; done";
+        let res = kaish
+            .execute_with_options(script, ExecuteOptions::default())
+            .await
+            .expect("kaish exec");
+
+        assert!(res.ok(), "for-loop exit code != 0: {:?}", res);
+        let stdout = res.text_out();
+        assert!(
+            stdout.contains("got=alpha"),
+            "expected per-handle echo for 'alpha': {stdout}"
+        );
+        assert!(
+            stdout.contains("got=beta"),
+            "expected per-handle echo for 'beta': {stdout}"
+        );
+        // Negative: the rendered table looks like `* <short>  alpha …`. If
+        // `.data` were missing kaish would split the table per line, and we'd
+        // see lines that begin with the column header rather than just the
+        // handle. Iterations must be exactly two and exactly the labels —
+        // anything else means the fallback path is leaking through.
+        let got_lines: Vec<&str> = stdout
+            .lines()
+            .filter(|l| l.starts_with("got="))
+            .collect();
+        assert_eq!(
+            got_lines.len(),
+            2,
+            "expected 2 iterations, got {}: {got_lines:?}",
+            got_lines.len()
+        );
+        for line in &got_lines {
+            let payload = line.strip_prefix("got=").unwrap();
+            assert!(
+                payload == "alpha" || payload == "beta",
+                "iteration leaked table text in line {line:?}; \
+                 expected exactly a label, got {payload:?}"
+            );
+        }
+        let _ = beta; // touched above; keep the binding live
+    }
+
+    /// The other half of the headline guarantee: the keys `kj block list`
+    /// emits round-trip through `kj block inspect` without manual munging.
+    /// Before fix: `block list` returned `to_key()` (delimiter `_`) but
+    /// `block inspect` parsed `split(':')` and rejected every iteration as
+    /// "malformed id". This test runs the full loop and asserts an inspect
+    /// record came back per block.
+    #[tokio::test]
+    async fn for_loop_block_list_to_inspect_round_trips() {
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+
+        let principal = PrincipalId::new();
+        let ctx = register_context(&dispatcher, Some("inspect-ctx"), None, principal);
+        dispatcher
+            .block_store()
+            .create_document(ctx, kaijutsu_types::DocKind::Conversation, None)
+            .expect("create_document");
+
+        // Two blocks so iteration is non-trivial.
+        let b1 = dispatcher
+            .block_store()
+            .insert_block(
+                ctx,
+                None,
+                None,
+                kaijutsu_types::Role::User,
+                kaijutsu_types::BlockKind::Text,
+                "alpha body",
+                kaijutsu_types::Status::Done,
+                kaijutsu_types::ContentType::Plain,
+            )
+            .expect("insert block 1");
+        let b2 = dispatcher
+            .block_store()
+            .insert_block(
+                ctx,
+                None,
+                None,
+                kaijutsu_types::Role::Model,
+                kaijutsu_types::BlockKind::Text,
+                "beta body",
+                kaijutsu_types::Status::Done,
+                kaijutsu_types::ContentType::Plain,
+            )
+            .expect("insert block 2");
+
+        let kaish = embedded_with_kj(dispatcher, ctx).await;
+
+        let script = "for b in $(kj block list); do echo \"---\"; kj block inspect $b; done";
+        let res = kaish
+            .execute_with_options(script, ExecuteOptions::default())
+            .await
+            .expect("kaish exec");
+        assert!(res.ok(), "round-trip exit != 0: {res:?}");
+
+        let stdout = res.text_out();
+        assert!(
+            !stdout.contains("malformed"),
+            "block inspect rejected an emitted key: {stdout}"
+        );
+        // Each block must show up once in the inspect output (we used
+        // `id:` as the leading line in plain-text inspect render).
+        assert!(
+            stdout.contains(&b1.to_key()),
+            "missing block 1 ({}) in stdout: {stdout}",
+            b1.to_key()
+        );
+        assert!(
+            stdout.contains(&b2.to_key()),
+            "missing block 2 ({}) in stdout: {stdout}",
+            b2.to_key()
+        );
+        // And we should have crossed the `---` separator twice.
+        assert_eq!(
+            stdout.matches("---").count(),
+            2,
+            "expected two iterations, got: {stdout}"
+        );
+    }
+
+    /// `kj block count` returns a scalar (number, not array). It must
+    /// still set `.data` so `kaish-last`-style consumers see the value,
+    /// but the for-loop case won't iterate. This guards the scalar path
+    /// in `KjBuiltin::execute`'s data conversion.
+    #[tokio::test]
+    async fn scalar_data_flows_into_exec_result() {
+        use kaish_kernel::ast::Value;
+
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+
+        let principal = PrincipalId::new();
+        let ctx = {
+            let c = register_context(&dispatcher, Some("solo"), None, principal);
+            dispatcher
+                .block_store()
+                .create_document(c, kaijutsu_types::DocKind::Conversation, None)
+                .expect("create_document");
+            c
+        };
+
+        let kaish = embedded_with_kj(dispatcher, ctx).await;
+
+        let res = kaish
+            .execute_with_options("kj block count", ExecuteOptions::default())
+            .await
+            .expect("kaish exec");
+        assert!(res.ok(), "kj block count exit != 0: {res:?}");
+        assert_eq!(
+            res.data,
+            Some(Value::Int(0)),
+            "expected scalar Int(0) in .data, got {:?}",
+            res.data,
+        );
+    }
 }

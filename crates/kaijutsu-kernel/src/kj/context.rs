@@ -53,12 +53,20 @@ impl KjDispatcher {
         let db = self.kernel_db().lock();
         if tree {
             match db.context_dag(kernel_id) {
-                Ok(dag) => KjResult::ok(format_context_tree(&dag, caller.context_id)),
+                Ok(dag) => {
+                    let text = format_context_tree(&dag, caller.context_id);
+                    let ids = context_handles(dag.iter().map(|(row, _)| row));
+                    KjResult::ok_with_data(text, ids)
+                }
                 Err(e) => KjResult::Err(format!("kj context list: {e}")),
             }
         } else {
             match db.list_active_contexts(kernel_id) {
-                Ok(contexts) => KjResult::ok(format_context_table(&contexts, caller.context_id)),
+                Ok(contexts) => {
+                    let text = format_context_table(&contexts, caller.context_id);
+                    let ids = context_handles(contexts.iter());
+                    KjResult::ok_with_data(text, ids)
+                }
                 Err(e) => KjResult::Err(format!("kj context list: {e}")),
             }
         }
@@ -864,6 +872,27 @@ impl KjDispatcher {
     }
 }
 
+/// Build the iteration payload for `kj context list`: a JSON array of
+/// resolver-friendly handles (label when set, else short context_id hex).
+/// These are exactly the strings other kj subcommands accept as `<ctx>`,
+/// so `for c in $(kj context list); do kj context info $c; done` round-trips.
+fn context_handles<'a, I>(rows: I) -> serde_json::Value
+where
+    I: IntoIterator<Item = &'a ContextRow>,
+{
+    serde_json::Value::Array(
+        rows.into_iter()
+            .map(|row| {
+                let handle = row
+                    .label
+                    .clone()
+                    .unwrap_or_else(|| row.context_id.short().to_string());
+                serde_json::Value::String(handle)
+            })
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use crate::kernel_db::ContextEdgeRow;
@@ -1467,5 +1496,35 @@ mod tests {
         );
         assert!(msg.contains("Env:"), "should show env: {msg}");
         assert!(msg.contains("RUST_LOG=debug"), "should show env var: {msg}");
+    }
+
+    /// `kj context list` must emit a JSON array of resolver-friendly handles
+    /// (labels preferred, short-id fallback) so kaish for-loops iterate them.
+    #[tokio::test]
+    async fn context_list_emits_handle_array() {
+        use crate::kj::KjResult;
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let _alpha = register_context(&d, Some("alpha"), None, principal);
+        let unlabeled = register_context(&d, None, None, principal);
+        let caller = caller_with_context(unlabeled);
+
+        let result = d.dispatch(&[s("context"), s("list")], &caller).await;
+        match result {
+            KjResult::Ok { data: Some(v), .. } => {
+                let arr = v.as_array().expect("data must be a JSON array");
+                let handles: Vec<&str> = arr.iter().filter_map(|x| x.as_str()).collect();
+                assert!(
+                    handles.iter().any(|h| *h == "alpha"),
+                    "labeled context should appear by label: {handles:?}"
+                );
+                assert!(
+                    handles.iter().any(|h| *h == unlabeled.short()),
+                    "unlabeled context should fall back to short id ({}): {handles:?}",
+                    unlabeled.short(),
+                );
+            }
+            other => panic!("expected Ok with array data, got {other:?}"),
+        }
     }
 }

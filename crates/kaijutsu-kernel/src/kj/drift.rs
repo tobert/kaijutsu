@@ -466,7 +466,13 @@ impl KjDispatcher {
     async fn drift_queue(&self) -> KjResult {
         let router = self.drift_router().read();
         let queue = router.queue();
-        KjResult::ok(format_drift_queue(queue))
+        let ids = serde_json::Value::Array(
+            queue
+                .iter()
+                .map(|item| serde_json::Value::String(item.id.to_string()))
+                .collect(),
+        );
+        KjResult::ok_with_data(format_drift_queue(queue), ids)
     }
 
     /// `kj drift history [ctx]` — show drift history (edges) for a context.

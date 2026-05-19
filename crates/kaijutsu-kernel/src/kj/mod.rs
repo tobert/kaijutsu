@@ -85,6 +85,15 @@ pub enum KjResult {
         content_type: ContentType,
         /// When true, the output is for humans only — excluded from LLM context.
         ephemeral: bool,
+        /// Optional structured data routed into `ExecResult.data` so that
+        /// `for x in $(kj …)` iterates the value and `kaish-last` can read
+        /// it. Conventions:
+        /// - List commands: JSON array of identifier strings (block ids,
+        ///   context labels) so naive iteration prints handles.
+        /// - Inspect/info commands: JSON object with the full record.
+        /// Independent of the rendered text — the same call may emit a
+        /// human table and an iteration-friendly array.
+        data: Option<serde_json::Value>,
     },
     /// Error — exit 1, stderr content.
     Err(String),
@@ -127,6 +136,7 @@ impl KjResult {
             message: msg.into(),
             content_type: ContentType::Plain,
             ephemeral: false,
+            data: None,
         }
     }
 
@@ -136,6 +146,7 @@ impl KjResult {
             message: msg.into(),
             content_type: ct,
             ephemeral: false,
+            data: None,
         }
     }
 
@@ -145,6 +156,36 @@ impl KjResult {
             message: msg.into(),
             content_type: ct,
             ephemeral: true,
+            data: None,
+        }
+    }
+
+    /// Plain text result with structured data attached. Use a JSON *array*
+    /// (e.g. of identifier strings) when callers should iterate the result
+    /// in a `for x in $(kj …)` loop — kaish's command-substitution path
+    /// spreads array elements per iteration. Use a JSON object for
+    /// inspect-style single-record results.
+    pub fn ok_with_data(msg: impl Into<String>, data: serde_json::Value) -> Self {
+        KjResult::Ok {
+            message: msg.into(),
+            content_type: ContentType::Plain,
+            ephemeral: false,
+            data: Some(data),
+        }
+    }
+
+    /// Typed-content variant of [`ok_with_data`] for commands that render
+    /// markdown/JSON text alongside their structured payload.
+    pub fn ok_typed_with_data(
+        msg: impl Into<String>,
+        ct: ContentType,
+        data: serde_json::Value,
+    ) -> Self {
+        KjResult::Ok {
+            message: msg.into(),
+            content_type: ct,
+            ephemeral: false,
+            data: Some(data),
         }
     }
 }

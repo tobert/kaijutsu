@@ -8,10 +8,6 @@ makes the work concrete. When an item ships, delete the entry.
 
 ---
 
-## kj cli
-
-Needs to implement kaish structured data returns.
-
 ## User presence (novel surface)
 
 The compose input is a shared CRDT document (`editInput @75`,
@@ -141,5 +137,35 @@ Holographic shader trio + entry animation shipped. Open:
 - **Distill model selection.** `formation_edges`-style `auto_distill`
   defaults to the source context's model (potentially Opus). Add a
   `distill_model` knob so cheap models can do summarization.
+- **Extend structured-data returns.** Initial round covered `kj block
+  list/inspect/count`, `kj context list`, `kj drift queue`. Remaining
+  iteration-friendly callers: `kj preset list` (`kj/preset.rs:34`),
+  `kj workspace list` (`kj/workspace.rs:38`), `kj rc list`
+  (`kj/rc.rs:204`), `kj cache list` (`kj/cache.rs:52`), `kj cas ls`
+  (`kj/cas.rs`), `kj drift history` (`kj/drift.rs:479`), `kj context
+  log` (`kj/context.rs:550`). Inspect-style data on `kj context info`
+  too. Short-hex collision risk for unlabeled-context handles (8 chars
+  → 32 bits) is acceptable at current scale; revisit if the resolver
+  starts returning `Ambiguous`.
+
+## Live eval
+
+Surfaced by `crates/kaijutsu-server/tests/live_eval.rs` (slice 1, commit
+d43df35). See the `project-live-eval` memory for scope.
+
+- **Fork copy scope.** `kj fork` is a full copy of the source: notification
+  blocks from MCP tool registration, in-flight `model/tool_call` +
+  `tool/tool_result` pairs, and the conversation all transfer to the child.
+  Implementer block lists are much noisier than the conversation length
+  suggests. Design question: should fork be selective by default with rc
+  scripts opting blocks in/out, or full-copy with rc-on-fork pruning?
+  Related to cache-breakpoint policy.
+- **russh teardown panic.** After the live-eval test function succeeds, a
+  trailing `russh::channels::io::ChannelCloseOnDrop::drop` panics with
+  "there is no reactor running" — russh tries to `tokio::spawn` from a drop
+  path after the LocalSet runtime has already begun shutting down. Pollutes
+  the test output and confuses casual readers. Either close the SSH client
+  explicitly before exiting `run_local`, or upstream a fix to russh so drop
+  is a no-op when no reactor is available.
 
 

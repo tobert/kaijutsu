@@ -42,11 +42,7 @@ impl KjDispatcher {
         let cas = self.kernel().cas();
 
         match cas.store(&data, mime) {
-            Ok(hash) => KjResult::Ok {
-                message: hash.to_string(),
-                content_type: ContentType::Plain,
-                ephemeral: false,
-            },
+            Ok(hash) => KjResult::ok(hash.to_string()),
             Err(e) => KjResult::Err(format!("kj cas put: {}", e)),
         }
     }
@@ -72,22 +68,17 @@ impl KjDispatcher {
         if argv.len() >= 3 && argv[1] == "--out" {
             match std::fs::write(&argv[2], &data) {
                 Ok(()) => {
-                    return KjResult::Ok {
-                        message: format!("wrote {} bytes to {}", data.len(), argv[2]),
-                        content_type: ContentType::Plain,
-                        ephemeral: true,
-                    }
+                    return KjResult::ok_ephemeral(
+                        format!("wrote {} bytes to {}", data.len(), argv[2]),
+                        ContentType::Plain,
+                    )
                 }
                 Err(e) => return KjResult::Err(format!("kj cas get --out: {}", e)),
             }
         }
 
         // Default: report size (binary data can't meaningfully go to stdout as text)
-        KjResult::Ok {
-            message: format!("{} bytes", data.len()),
-            content_type: ContentType::Plain,
-            ephemeral: true,
-        }
+        KjResult::ok_ephemeral(format!("{} bytes", data.len()), ContentType::Plain)
     }
 
     fn cas_ls(&self) -> KjResult {
@@ -97,13 +88,7 @@ impl KjDispatcher {
         let mut entries = Vec::new();
         let prefix_dirs = match std::fs::read_dir(&objects_dir) {
             Ok(d) => d,
-            Err(_) => {
-                return KjResult::Ok {
-                    message: "(empty)".into(),
-                    content_type: ContentType::Plain,
-                    ephemeral: true,
-                }
-            }
+            Err(_) => return KjResult::ok_ephemeral("(empty)", ContentType::Plain),
         };
 
         for prefix_entry in prefix_dirs.flatten() {
@@ -131,17 +116,9 @@ impl KjDispatcher {
 
         entries.sort();
         if entries.is_empty() {
-            KjResult::Ok {
-                message: "(empty)".into(),
-                content_type: ContentType::Plain,
-                ephemeral: true,
-            }
+            KjResult::ok_ephemeral("(empty)", ContentType::Plain)
         } else {
-            KjResult::Ok {
-                message: entries.join("\n"),
-                content_type: ContentType::Plain,
-                ephemeral: true,
-            }
+            KjResult::ok_ephemeral(entries.join("\n"), ContentType::Plain)
         }
     }
 
@@ -167,11 +144,7 @@ impl KjDispatcher {
                 if let Some(path) = r.local_path {
                     lines.push(format!("path:  {}", path));
                 }
-                KjResult::Ok {
-                    message: lines.join("\n"),
-                    content_type: ContentType::Plain,
-                    ephemeral: true,
-                }
+                KjResult::ok_ephemeral(lines.join("\n"), ContentType::Plain)
             }
             Ok(None) => KjResult::Err(format!("kj cas info: not found: {}", hash)),
             Err(e) => KjResult::Err(format!("kj cas info: {}", e)),
@@ -191,11 +164,7 @@ impl KjDispatcher {
 
         let cas = self.kernel().cas();
         match cas.remove(&hash) {
-            Ok(true) => KjResult::Ok {
-                message: format!("removed {}", hash),
-                content_type: ContentType::Plain,
-                ephemeral: true,
-            },
+            Ok(true) => KjResult::ok_ephemeral(format!("removed {}", hash), ContentType::Plain),
             Ok(false) => KjResult::Err(format!("kj cas rm: not found: {}", hash)),
             Err(e) => KjResult::Err(format!("kj cas rm: {}", e)),
         }
