@@ -370,6 +370,32 @@ impl KjDispatcher {
             ) {
                 Ok(_) => {
                     injected += 1;
+
+                    // Record the drift edge in context_edges so `kj drift
+                    // history` can find it. `drift_kind` and `source_model`
+                    // are recoverable from the inserted block itself, but we
+                    // stash the pre-flush staged id in metadata so post-flush
+                    // queries can trace back to the staging event (the same
+                    // namespace `kj drift cancel` uses).
+                    {
+                        let db = self.kernel_db().lock();
+                        let edge = crate::kernel_db::ContextEdgeRow {
+                            edge_id: uuid::Uuid::now_v7(),
+                            source_id: drift.source_ctx,
+                            target_id: drift.target_ctx,
+                            kind: EdgeKind::Drift,
+                            metadata: Some(format!("{}#{}", drift.drift_kind, drift.id)),
+                            created_at: kaijutsu_types::now_millis() as i64,
+                        };
+                        if let Err(e) = db.insert_edge(&edge) {
+                            tracing::warn!(
+                                "drift flush: failed to insert edge {} → {}: {e}",
+                                drift.source_ctx.short(),
+                                drift.target_ctx.short()
+                            );
+                        }
+                    }
+
                     if let Err(e) = self
                         .run_rc_lifecycle(
                             super::lifecycle::VERB_DRIFT,
@@ -682,68 +708,58 @@ mod tests {
     }
 
     /// `kj drift edge rm <uuid>` deletes a single drift edge and pairs
-    /// with the UUIDs that `kj drift history` emits in `.data`. End-to-end:
-    /// insert a drift edge → history surfaces its UUID → edge rm removes
-    /// it → history is empty again.
-    ///
-    /// Note: `drift_flush` injects a Drift *block* into the target context
-    /// but does NOT currently write a row to `context_edges`. That's a
-    /// pre-existing gap (tracked in `docs/issues.md`); this test seeds the
-    /// edge directly to exercise the rm path independently. Once flush is
-    /// fixed to also write the edge, the seed becomes optional.
+    /// with the UUIDs that `kj drift history` emits in `.data`. Full
+    /// round-trip: push a drift → flush writes both the Drift block and
+    /// the `EdgeKind::Drift` row → history surfaces the UUID → edge rm
+    /// removes it → history is empty again. This is the user-facing path,
+    /// not a hand-seeded edge.
     #[tokio::test]
     async fn drift_edge_rm_round_trip() {
-        use crate::kernel_db::ContextEdgeRow;
         use crate::kj::KjResult;
-        use kaijutsu_types::EdgeKind;
 
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let src = register_context(&d, Some("src"), None, principal);
         let dst = register_context(&d, Some("dst"), None, principal);
 
-        let edge_id = uuid::Uuid::now_v7();
-        {
-            let db = d.kernel_db().lock();
-            db.insert_edge(&ContextEdgeRow {
-                edge_id,
-                source_id: src,
-                target_id: dst,
-                kind: EdgeKind::Drift,
-                metadata: None,
-                created_at: kaijutsu_types::now_millis() as i64,
-            })
-            .expect("insert drift edge");
-        }
+        // Target document must exist for the flush to land.
+        d.block_store()
+            .create_document(dst, crate::DocumentKind::Conversation, None)
+            .unwrap();
 
         let c = caller_with_context(src);
 
-        // History on the source surfaces the edge_id we just inserted.
+        // Push + flush is what writes the edge.
+        let push = d
+            .dispatch(&[s("drift"), s("push"), s("dst"), s("payload")], &c)
+            .await;
+        assert!(push.is_ok(), "push: {}", push.message());
+        let flush = d.dispatch(&[s("drift"), s("flush")], &c).await;
+        assert!(flush.is_ok(), "flush: {}", flush.message());
+
+        // History on the source surfaces the edge written by flush.
         let history = d.dispatch(&[s("drift"), s("history")], &c).await;
-        match history {
+        let edge_id_str = match history {
             KjResult::Ok { data: Some(v), .. } => {
-                let ids: Vec<&str> = v
+                let ids: Vec<String> = v
                     .as_array()
                     .expect("array")
                     .iter()
-                    .filter_map(|x| x.as_str())
+                    .filter_map(|x| x.as_str().map(str::to_string))
                     .collect();
                 assert_eq!(ids.len(), 1, "expected one edge in .data: {ids:?}");
-                assert_eq!(ids[0], edge_id.to_string());
+                ids.into_iter().next().unwrap()
             }
             other => panic!("expected Ok with data, got {other:?}"),
         };
 
         // The handle round-trips into `edge rm`.
         let rm = d
-            .dispatch(
-                &[s("drift"), s("edge"), s("rm"), edge_id.to_string()],
-                &c,
-            )
+            .dispatch(&[s("drift"), s("edge"), s("rm"), edge_id_str.clone()], &c)
             .await;
         assert!(rm.is_ok(), "edge rm: {}", rm.message());
         assert!(
-            rm.message().contains(&edge_id.to_string()),
+            rm.message().contains(&edge_id_str),
             "msg should echo the uuid: {}",
             rm.message()
         );
@@ -751,6 +767,53 @@ mod tests {
         // History is now empty.
         let again = d.dispatch(&[s("drift"), s("history")], &c).await;
         assert!(again.message().contains("no drift history"));
+    }
+
+    /// `drift_flush` must write a `context_edges` row alongside the
+    /// injected Drift block — otherwise `kj drift history`
+    /// (`drift_provenance` + `edges_to`) sees nothing. This test pins the
+    /// flush write site: push one drift, flush, and verify exactly one
+    /// Drift edge exists with the expected source/target/kind and
+    /// metadata stamped with the staged id.
+    #[tokio::test]
+    async fn drift_flush_writes_edge() {
+        use kaijutsu_types::EdgeKind;
+
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let src = register_context(&d, Some("src"), None, principal);
+        let dst = register_context(&d, Some("dst"), None, principal);
+        d.block_store()
+            .create_document(dst, crate::DocumentKind::Conversation, None)
+            .unwrap();
+
+        let c = caller_with_context(src);
+        let push = d
+            .dispatch(&[s("drift"), s("push"), s("dst"), s("finding")], &c)
+            .await;
+        assert!(push.is_ok(), "push: {}", push.message());
+        // First staged drift in a fresh router lands at id=1; we assert
+        // metadata against that below.
+        assert!(push.message().contains("#1"), "push id: {}", push.message());
+
+        let flush = d.dispatch(&[s("drift"), s("flush")], &c).await;
+        assert!(flush.is_ok(), "flush: {}", flush.message());
+
+        let edges = {
+            let db = d.kernel_db().lock();
+            db.drift_provenance(src).expect("drift_provenance")
+        };
+        assert_eq!(edges.len(), 1, "expected one drift edge after flush: {edges:?}");
+        let edge = &edges[0];
+        assert_eq!(edge.source_id, src);
+        assert_eq!(edge.target_id, dst);
+        assert_eq!(edge.kind, EdgeKind::Drift);
+        assert_eq!(
+            edge.metadata.as_deref(),
+            Some("push#1"),
+            "metadata stamps kind + staged id: {:?}",
+            edge.metadata
+        );
     }
 
     /// Removing a non-existent edge UUID returns a friendly error (not

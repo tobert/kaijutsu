@@ -137,16 +137,6 @@ Holographic shader trio + entry animation shipped. Open:
 - **Distill model selection.** `formation_edges`-style `auto_distill`
   defaults to the source context's model (potentially Opus). Add a
   `distill_model` knob so cheap models can do summarization.
-- **drift flush doesn't write context_edges.** `drift_flush`
-  (`kj/drift.rs:346`) inserts a Drift *block* into the target context
-  but never adds an `EdgeKind::Drift` row to `context_edges`. So
-  `kj drift history` (which queries `drift_provenance` + `edges_to`)
-  is empty for any normal user. The schema, the read paths, and the
-  new `drift edge rm` plumbing are all in place — flush just needs to
-  call `insert_edge` after a successful inject. Also: the drift
-  router's `StagedDrift.id` (the `cancel` namespace) could be
-  recorded in the edge metadata so post-flush queries can trace
-  provenance back to the staging event.
 
 ## Live eval
 
