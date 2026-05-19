@@ -137,16 +137,14 @@ Holographic shader trio + entry animation shipped. Open:
 - **Distill model selection.** `formation_edges`-style `auto_distill`
   defaults to the source context's model (potentially Opus). Add a
   `distill_model` knob so cheap models can do summarization.
-- **Extend structured-data returns.** Initial round covered `kj block
-  list/inspect/count`, `kj context list`, `kj drift queue`. Remaining
-  iteration-friendly callers: `kj preset list` (`kj/preset.rs:34`),
-  `kj workspace list` (`kj/workspace.rs:38`), `kj rc list`
-  (`kj/rc.rs:204`), `kj cache list` (`kj/cache.rs:52`), `kj cas ls`
-  (`kj/cas.rs`), `kj drift history` (`kj/drift.rs:479`), `kj context
-  log` (`kj/context.rs:550`). Inspect-style data on `kj context info`
-  too. Short-hex collision risk for unlabeled-context handles (8 chars
-  → 32 bits) is acceptable at current scale; revisit if the resolver
-  starts returning `Ambiguous`.
+- **drift history ↔ drift cancel namespace mismatch.** `kj drift
+  history` emits edge UUIDs (`context_edges.edge_id`, post-flush
+  provenance). `kj drift cancel` parses `u64` queue ids (ephemeral
+  in-memory pre-flush). These are different stores, so the implied
+  round-trip `for e in $(kj drift history); do kj drift cancel $e;
+  done` is meaningless. Either rename `drift cancel` → `drift
+  dequeue`, or add a `drift edge rm <uuid>` companion for post-flush
+  edge removal.
 
 ## Live eval
 

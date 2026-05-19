@@ -188,6 +188,23 @@ impl KjResult {
             data: Some(data),
         }
     }
+
+    /// Ephemeral result with structured data attached. Used for surfaces
+    /// (e.g. `kj cas ls`) where the human text is for the kj prompt only
+    /// — excluded from LLM context — but the data array remains useful
+    /// for kaish iteration.
+    pub fn ok_ephemeral_with_data(
+        msg: impl Into<String>,
+        ct: ContentType,
+        data: serde_json::Value,
+    ) -> Self {
+        KjResult::Ok {
+            message: msg.into(),
+            content_type: ct,
+            ephemeral: true,
+            data: Some(data),
+        }
+    }
 }
 
 // ============================================================================

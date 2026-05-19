@@ -39,8 +39,17 @@ impl KjDispatcher {
         let db = self.kernel_db().lock();
         match db.list_workspaces(self.kernel_id()) {
             Ok(workspaces) => {
+                // Workspace labels are the resolver key (`get_workspace_by_label`)
+                // and are required by the schema, so labels are the canonical
+                // full handle — no truncation.
+                let labels = serde_json::Value::Array(
+                    workspaces
+                        .iter()
+                        .map(|w| serde_json::Value::String(w.label.clone()))
+                        .collect(),
+                );
                 if workspaces.is_empty() {
-                    return KjResult::ok("(no workspaces)".to_string());
+                    return KjResult::ok_with_data("(no workspaces)".to_string(), labels);
                 }
                 let lines: Vec<String> = workspaces
                     .iter()
@@ -53,7 +62,7 @@ impl KjDispatcher {
                         format!("  {}{}", w.label, desc)
                     })
                     .collect();
-                KjResult::ok(lines.join("\n"))
+                KjResult::ok_with_data(lines.join("\n"), labels)
             }
             Err(e) => KjResult::Err(format!("kj workspace list: {e}")),
         }
@@ -301,6 +310,34 @@ mod tests {
         assert!(result.is_ok());
         // __default workspace is auto-created by test_dispatcher
         assert!(result.message().contains("__default"));
+    }
+
+    /// Workspaces emit their labels as the iteration handle.
+    #[tokio::test]
+    async fn workspace_list_emits_label_array() {
+        use crate::kj::KjResult;
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("ctx"), None, principal);
+        let c = caller_with_context(ctx);
+
+        d.dispatch(&[s("workspace"), s("create"), s("alpha-ws")], &c).await;
+        d.dispatch(&[s("workspace"), s("create"), s("beta-ws")], &c).await;
+
+        let result = d.dispatch(&[s("workspace"), s("list")], &c).await;
+        match result {
+            KjResult::Ok { data: Some(v), .. } => {
+                let labels: Vec<&str> = v
+                    .as_array()
+                    .expect("array")
+                    .iter()
+                    .filter_map(|x| x.as_str())
+                    .collect();
+                assert!(labels.contains(&"alpha-ws"), "got: {labels:?}");
+                assert!(labels.contains(&"beta-ws"), "got: {labels:?}");
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
     }
 
     #[tokio::test]

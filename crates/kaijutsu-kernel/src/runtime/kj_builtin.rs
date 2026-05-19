@@ -727,6 +727,54 @@ mod tests {
         );
     }
 
+    /// End-to-end round-trip: emit handles from `kj context list`, feed
+    /// each into `kj context info`. The fix is that unlabeled contexts
+    /// now emit *full hex* (not short prefix), so `kj context info` —
+    /// which resolves via prefix-match in the DB — accepts handles
+    /// emitted by `list` even when no label is set.
+    #[tokio::test]
+    async fn for_loop_context_list_to_info_round_trips_with_full_hex() {
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+
+        let principal = PrincipalId::new();
+        // One labeled, one unlabeled — both must round-trip.
+        let labeled = register_context(&dispatcher, Some("gamma"), None, principal);
+        let unlabeled = register_context(&dispatcher, None, None, principal);
+
+        let kaish = embedded_with_kj(dispatcher, labeled).await;
+
+        let script = "for c in $(kj context list); do echo \"---\"; kj context info $c; done";
+        let res = kaish
+            .execute_with_options(script, ExecuteOptions::default())
+            .await
+            .expect("kaish exec");
+        assert!(res.ok(), "round-trip exit != 0: {res:?}");
+
+        let stdout = res.text_out();
+        // Two contexts → two `---` separators, no `not found` errors.
+        assert!(
+            !stdout.contains("not found"),
+            "context info rejected a handle: {stdout}"
+        );
+        assert_eq!(
+            stdout.matches("---").count(),
+            2,
+            "expected 2 iterations: {stdout}"
+        );
+        // `format_context_info` renders "ID: <short>"; both contexts'
+        // short ids should appear (independent of whether the handle
+        // was the label or the full hex).
+        assert!(
+            stdout.contains(&labeled.short()),
+            "labeled context short id missing: {stdout}"
+        );
+        assert!(
+            stdout.contains(&unlabeled.short()),
+            "unlabeled context short id missing: {stdout}"
+        );
+    }
+
     /// `kj block count` returns a scalar (number, not array). It must
     /// still set `.data` so `kaish-last`-style consumers see the value,
     /// but the for-loop case won't iterate. This guards the scalar path

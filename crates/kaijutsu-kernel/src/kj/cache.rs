@@ -57,14 +57,28 @@ impl KjDispatcher {
 
         let db = self.kernel_db().lock();
         match db.list_cache_breakpoints(context_id) {
-            Ok(bps) if bps.is_empty() => KjResult::ok("(no cache breakpoints)".to_string()),
             Ok(bps) => {
+                // Iteration handle: the target descriptor (e.g. "tools",
+                // "system", "message[42]"). Cache breakpoints have no
+                // standalone id — they're keyed by (context, target).
+                // The text view already exposes the same descriptor.
+                let targets = serde_json::Value::Array(
+                    bps.iter()
+                        .map(|bp| serde_json::Value::String(format_target(bp)))
+                        .collect(),
+                );
+                if bps.is_empty() {
+                    return KjResult::ok_with_data(
+                        "(no cache breakpoints)".to_string(),
+                        targets,
+                    );
+                }
                 let lines: Vec<String> = bps
                     .iter()
                     .enumerate()
                     .map(|(i, bp)| format!("  {i}: {}", format_target(bp)))
                     .collect();
-                KjResult::ok(lines.join("\n"))
+                KjResult::ok_with_data(lines.join("\n"), targets)
             }
             Err(e) => KjResult::Err(format!("kj cache list: {e}")),
         }
@@ -369,6 +383,53 @@ mod tests {
             .await;
         assert!(!result.is_ok());
         assert!(result.message().contains("forever"));
+    }
+
+    /// `kj cache list` emits per-breakpoint target descriptors so a kaish
+    /// loop can iterate them. Cache breakpoints have no standalone id —
+    /// target is the canonical handle.
+    #[tokio::test]
+    async fn cache_list_emits_target_array() {
+        use crate::kj::KjResult;
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("c"), None, principal);
+        let c = caller_with_context(ctx);
+
+        d.dispatch(&[s("cache"), s("add"), s("--target"), s("tools")], &c).await;
+        d.dispatch(
+            &[
+                s("cache"),
+                s("add"),
+                s("--target"),
+                s("message"),
+                s("--index"),
+                s("7"),
+            ],
+            &c,
+        )
+        .await;
+
+        let result = d.dispatch(&[s("cache"), s("list")], &c).await;
+        match result {
+            KjResult::Ok { data: Some(v), .. } => {
+                let targets: Vec<&str> = v
+                    .as_array()
+                    .expect("array")
+                    .iter()
+                    .filter_map(|x| x.as_str())
+                    .collect();
+                assert!(
+                    targets.iter().any(|t| t.starts_with("tools")),
+                    "missing tools entry: {targets:?}"
+                );
+                assert!(
+                    targets.iter().any(|t| t.starts_with("message[7]")),
+                    "missing message[7] entry: {targets:?}"
+                );
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
     }
 
     #[tokio::test]

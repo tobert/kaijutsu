@@ -223,8 +223,19 @@ kj context create my-plan --type=planner
             })
             .collect();
 
+        // Iteration handles: full rc-script paths. Paths are the
+        // resolver key for `kj rc rm` / `kj rc show`, and they're absolute
+        // (`/etc/rc/<type>/<verb>/<sort>-<name>.<ext>`) so there's nothing
+        // to truncate.
+        let paths = serde_json::Value::Array(
+            filtered
+                .iter()
+                .map(|s| serde_json::Value::String(s.path.clone()))
+                .collect(),
+        );
+
         if filtered.is_empty() {
-            return KjResult::ok("(no rc scripts)".to_string());
+            return KjResult::ok_with_data("(no rc scripts)".to_string(), paths);
         }
 
         let lines: Vec<String> = filtered
@@ -237,7 +248,7 @@ kj context create my-plan --type=planner
                 format!("  {}  ({} bytes{})", s.path, s.content.len(), timeout)
             })
             .collect();
-        KjResult::ok(lines.join("\n"))
+        KjResult::ok_with_data(lines.join("\n"), paths)
     }
 
     fn rc_rm(&self, argv: &[String]) -> KjResult {
@@ -314,5 +325,63 @@ mod tests {
         // no-op them until those hooks land.
         assert!(parse_rc_path("/etc/rc/test/attach/S00-foo.md").is_ok());
         assert!(parse_rc_path("/etc/rc/test/drift/S00-foo.kai").is_ok());
+    }
+
+    /// `kj rc list` emits full absolute paths as iteration handles so
+    /// `for s in $(kj rc list); do kj rc rm $s; done` works.
+    #[tokio::test]
+    async fn rc_list_emits_path_array() {
+        use crate::kj::test_helpers::*;
+        use crate::kj::KjResult;
+
+        let d = test_dispatcher().await;
+        let c = test_caller();
+        let s = |v: &str| v.to_string();
+
+        // Install two scripts via the dispatcher (round-trip through
+        // `kj rc add` keeps the test honest about real path validation).
+        d.dispatch(
+            &[
+                s("rc"),
+                s("add"),
+                s("/etc/rc/test/create/S00-noop.kai"),
+                s("--content"),
+                s("true"),
+            ],
+            &c,
+        )
+        .await;
+        d.dispatch(
+            &[
+                s("rc"),
+                s("add"),
+                s("/etc/rc/test/create/S01-second.kai"),
+                s("--content"),
+                s("true"),
+            ],
+            &c,
+        )
+        .await;
+
+        let result = d.dispatch(&[s("rc"), s("list")], &c).await;
+        match result {
+            KjResult::Ok { data: Some(v), .. } => {
+                let paths: Vec<&str> = v
+                    .as_array()
+                    .expect("array")
+                    .iter()
+                    .filter_map(|x| x.as_str())
+                    .collect();
+                assert!(
+                    paths.contains(&"/etc/rc/test/create/S00-noop.kai"),
+                    "missing S00 in: {paths:?}"
+                );
+                assert!(
+                    paths.contains(&"/etc/rc/test/create/S01-second.kai"),
+                    "missing S01 in: {paths:?}"
+                );
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
     }
 }

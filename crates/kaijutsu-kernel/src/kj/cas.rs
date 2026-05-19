@@ -85,12 +85,21 @@ impl KjDispatcher {
         let cas = self.kernel().cas();
         let objects_dir = cas.config().objects_dir();
 
-        let mut entries = Vec::new();
+        let empty_data = serde_json::Value::Array(Vec::new());
         let prefix_dirs = match std::fs::read_dir(&objects_dir) {
             Ok(d) => d,
-            Err(_) => return KjResult::ok_ephemeral("(empty)", ContentType::Plain),
+            Err(_) => {
+                return KjResult::ok_ephemeral_with_data(
+                    "(empty)",
+                    ContentType::Plain,
+                    empty_data,
+                );
+            }
         };
 
+        // Collect (hash, formatted line) pairs so `.data` can carry full
+        // hashes while the text view keeps size/mime columns.
+        let mut rows: Vec<(String, String)> = Vec::new();
         for prefix_entry in prefix_dirs.flatten() {
             if !prefix_entry.path().is_dir() {
                 continue;
@@ -108,18 +117,28 @@ impl KjDispatcher {
                                 (size, "?".into())
                             }
                         };
-                        entries.push(format!("{}  {:>8}  {}", hash, size, mime));
+                        let hash_full = hash.to_string();
+                        let line = format!("{}  {:>8}  {}", hash_full, size, mime);
+                        rows.push((hash_full, line));
                     }
                 }
             }
         }
 
-        entries.sort();
-        if entries.is_empty() {
-            KjResult::ok_ephemeral("(empty)", ContentType::Plain)
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        // Iteration handles: full content hashes. `cas info <hash>` and
+        // `cas get <hash>` both accept the full form.
+        let hashes = serde_json::Value::Array(
+            rows.iter()
+                .map(|(h, _)| serde_json::Value::String(h.clone()))
+                .collect(),
+        );
+        let text = if rows.is_empty() {
+            "(empty)".to_string()
         } else {
-            KjResult::ok_ephemeral(entries.join("\n"), ContentType::Plain)
-        }
+            rows.iter().map(|(_, line)| line.as_str()).collect::<Vec<_>>().join("\n")
+        };
+        KjResult::ok_ephemeral_with_data(text, ContentType::Plain, hashes)
     }
 
     fn cas_info(&self, argv: &[String]) -> KjResult {

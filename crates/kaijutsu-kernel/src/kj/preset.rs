@@ -35,8 +35,18 @@ impl KjDispatcher {
         let db = self.kernel_db().lock();
         match db.list_presets(self.kernel_id()) {
             Ok(presets) => {
+                // Iteration handles: preset labels are the resolver key
+                // (`get_preset_by_label`) and they're required (non-nullable
+                // in the schema), so labels are the canonical full handle —
+                // no truncation occurs here.
+                let labels = serde_json::Value::Array(
+                    presets
+                        .iter()
+                        .map(|p| serde_json::Value::String(p.label.clone()))
+                        .collect(),
+                );
                 if presets.is_empty() {
-                    return KjResult::ok("(no presets)".to_string());
+                    return KjResult::ok_with_data("(no presets)".to_string(), labels);
                 }
                 let lines: Vec<String> = presets
                     .iter()
@@ -54,7 +64,7 @@ impl KjDispatcher {
                         format!("  {:<20} {}{}", p.label, model, desc)
                     })
                     .collect();
-                KjResult::ok(lines.join("\n"))
+                KjResult::ok_with_data(lines.join("\n"), labels)
             }
             Err(e) => KjResult::Err(format!("kj preset list: {e}")),
         }
@@ -218,6 +228,43 @@ mod tests {
         let result = d.dispatch(&[s("preset"), s("list")], &c).await;
         assert!(result.is_ok());
         assert_eq!(result.message(), "(no presets)");
+    }
+
+    /// `kj preset list` populates `.data` with the labels (the resolver
+    /// key) so kaish for-loops iterate by label.
+    #[tokio::test]
+    async fn preset_list_emits_label_array() {
+        use crate::kj::KjResult;
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("ctx"), None, principal);
+        let c = caller_with_context(ctx);
+
+        d.dispatch(
+            &[s("preset"), s("save"), s("fast"), s("--model"), s("a/b")],
+            &c,
+        )
+        .await;
+        d.dispatch(
+            &[s("preset"), s("save"), s("slow"), s("--model"), s("c/d")],
+            &c,
+        )
+        .await;
+
+        let result = d.dispatch(&[s("preset"), s("list")], &c).await;
+        match result {
+            KjResult::Ok { data: Some(v), .. } => {
+                let labels: Vec<&str> = v
+                    .as_array()
+                    .expect("array")
+                    .iter()
+                    .filter_map(|x| x.as_str())
+                    .collect();
+                assert!(labels.contains(&"fast"), "got: {labels:?}");
+                assert!(labels.contains(&"slow"), "got: {labels:?}");
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
     }
 
     #[tokio::test]

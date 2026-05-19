@@ -108,45 +108,67 @@ impl KjDispatcher {
         let is_current = Some(target_id) == caller.context_id;
         let mut info = format_context_info(&row, children_count, drift_from + drift_to, is_current);
 
-        // Shell config
-        if let Ok(Some(shell)) = db.get_context_shell(target_id) {
-            if let Some(cwd) = &shell.cwd {
+        // Shell config — captured into the structured record below as well.
+        let shell = db.get_context_shell(target_id).ok().flatten();
+        if let Some(ref s) = shell {
+            if let Some(cwd) = &s.cwd {
                 info.push_str(&format!("\nCwd:     {cwd}"));
             }
-            if let Some(init) = &shell.init_script {
+            if let Some(init) = &s.init_script {
                 let preview = if init.len() > 60 { &init[..60] } else { init };
                 info.push_str(&format!("\nInit:    {preview}..."));
             }
         }
 
         // Env vars
-        if let Ok(vars) = db.get_context_env(target_id)
-            && !vars.is_empty()
-        {
+        let env_vars = db.get_context_env(target_id).unwrap_or_default();
+        if !env_vars.is_empty() {
             info.push_str("\nEnv:");
-            for v in &vars {
+            for v in &env_vars {
                 info.push_str(&format!("\n  {}={}", v.key, v.value));
             }
         }
 
         // Workspace paths
-        if let Ok(Some(paths)) = db.context_workspace_paths(target_id)
-            && !paths.is_empty()
-        {
-            // Get workspace label
-            let ws_label = row
-                .workspace_id
-                .and_then(|wsid| db.get_workspace(wsid).ok().flatten())
-                .map(|ws| ws.label)
-                .unwrap_or_else(|| "?".into());
+        let workspace_paths = db.context_workspace_paths(target_id).ok().flatten();
+        let workspace_label = row
+            .workspace_id
+            .and_then(|wsid| db.get_workspace(wsid).ok().flatten())
+            .map(|ws| ws.label);
+        if let Some(paths) = workspace_paths.as_ref().filter(|p| !p.is_empty()) {
+            let ws_label = workspace_label.clone().unwrap_or_else(|| "?".into());
             info.push_str(&format!("\nWorkspace: {ws_label}"));
-            for p in &paths {
+            for p in paths {
                 let ro = if p.read_only { " (ro)" } else { "" };
                 info.push_str(&format!("\n  {}{ro}", p.path));
             }
         }
 
-        KjResult::ok(info)
+        // Structured record: full ids and the same fields the text view
+        // surfaces, so `kaish-last` round-trips and per-field jq queries work.
+        let record = serde_json::json!({
+            "context_id": row.context_id.to_hex(),
+            "label": row.label,
+            "provider": row.provider,
+            "model": row.model,
+            "consent_mode": format!("{:?}", row.consent_mode),
+            "context_state": format!("{:?}", row.context_state),
+            "context_type": row.context_type,
+            "forked_from": row.forked_from.map(|id| id.to_hex()),
+            "fork_kind": row.fork_kind.as_ref().map(|k| format!("{k:?}")),
+            "children_count": children_count,
+            "drift_count": drift_from + drift_to,
+            "is_current": is_current,
+            "workspace_id": row.workspace_id.map(|id| id.to_hex()),
+            "workspace_label": workspace_label,
+            "preset_id": row.preset_id.map(|id| id.to_hex()),
+            "cwd": shell.as_ref().and_then(|s| s.cwd.clone()),
+            "env": env_vars.iter()
+                .map(|v| (v.key.clone(), serde_json::Value::String(v.value.clone())))
+                .collect::<serde_json::Map<_, _>>(),
+        });
+
+        KjResult::ok_with_data(info, record)
     }
 
     async fn context_current(&self, _argv: &[String], caller: &KjCaller) -> KjResult {
@@ -558,7 +580,11 @@ impl KjDispatcher {
         };
 
         match db.fork_lineage(target_id) {
-            Ok(lineage) => KjResult::ok(format_fork_lineage(&lineage, caller.context_id)),
+            Ok(lineage) => {
+                let text = format_fork_lineage(&lineage, caller.context_id);
+                let handles = context_handles(lineage.iter().map(|(row, _)| row));
+                KjResult::ok_with_data(text, handles)
+            }
             Err(e) => KjResult::Err(format!("kj context log: {e}")),
         }
     }
@@ -873,9 +899,11 @@ impl KjDispatcher {
 }
 
 /// Build the iteration payload for `kj context list`: a JSON array of
-/// resolver-friendly handles (label when set, else short context_id hex).
-/// These are exactly the strings other kj subcommands accept as `<ctx>`,
-/// so `for c in $(kj context list); do kj context info $c; done` round-trips.
+/// resolver-friendly handles (label when set, else the **full** context_id
+/// hex). These are exactly the strings other kj subcommands accept as
+/// `<ctx>`, so `for c in $(kj context list); do kj context info $c; done`
+/// round-trips. The rule: `.data` carries full ids; text rendering may
+/// truncate to a short prefix for readability.
 fn context_handles<'a, I>(rows: I) -> serde_json::Value
 where
     I: IntoIterator<Item = &'a ContextRow>,
@@ -886,7 +914,7 @@ where
                 let handle = row
                     .label
                     .clone()
-                    .unwrap_or_else(|| row.context_id.short().to_string());
+                    .unwrap_or_else(|| row.context_id.to_hex());
                 serde_json::Value::String(handle)
             })
             .collect(),
@@ -1518,10 +1546,14 @@ mod tests {
                     handles.iter().any(|h| *h == "alpha"),
                     "labeled context should appear by label: {handles:?}"
                 );
+                let full_hex = unlabeled.to_hex();
                 assert!(
-                    handles.iter().any(|h| *h == unlabeled.short()),
-                    "unlabeled context should fall back to short id ({}): {handles:?}",
-                    unlabeled.short(),
+                    handles.iter().any(|h| *h == full_hex),
+                    "unlabeled context should fall back to full hex ({full_hex}): {handles:?}",
+                );
+                assert!(
+                    !handles.iter().any(|h| *h == unlabeled.short()),
+                    "must NOT use short prefix when full hex is required: {handles:?}",
                 );
             }
             other => panic!("expected Ok with array data, got {other:?}"),

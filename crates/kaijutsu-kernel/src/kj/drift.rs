@@ -491,9 +491,17 @@ impl KjDispatcher {
             .edges_to(target_id, Some(kaijutsu_types::EdgeKind::Drift))
             .unwrap_or_default();
 
-        KjResult::ok(super::format::format_drift_history(
-            &outgoing, &incoming, &db,
-        ))
+        let text = super::format::format_drift_history(&outgoing, &incoming, &db);
+
+        // Iteration handle: full edge_id (UUID) for each drift edge,
+        // outgoing first then incoming. Edge IDs are already full strings.
+        let ids: Vec<serde_json::Value> = outgoing
+            .iter()
+            .chain(incoming.iter())
+            .map(|e| serde_json::Value::String(e.edge_id.to_string()))
+            .collect();
+
+        KjResult::ok_with_data(text, serde_json::Value::Array(ids))
     }
 
     async fn drift_cancel(&self, argv: &[String]) -> KjResult {
