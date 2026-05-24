@@ -358,7 +358,7 @@ mod tests {
             cwd: PathBuf::from("/"),
             session_id: SessionId::new(),
             kernel_id: KernelId::new(),
-        }
+                    }
     }
 
     #[tokio::test]

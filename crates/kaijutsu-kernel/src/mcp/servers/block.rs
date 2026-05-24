@@ -217,27 +217,24 @@ mod tests {
     use crate::kernel_db::{DocumentRow, KernelDb};
     use crate::mcp::{Broker, InstancePolicy, ToolContent};
     use kaijutsu_cas::FileStore;
-    use kaijutsu_types::{now_millis, KernelId, PrincipalId};
+    use kaijutsu_types::{now_millis, PrincipalId};
 
     async fn setup() -> (Arc<Broker>, CallContext) {
         let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
         let creator = PrincipalId::system();
-        let kernel_id = KernelId::new();
         let ws_id = {
             let g = db.lock();
-            g.get_or_create_default_workspace(kernel_id, creator).unwrap()
+            g.get_or_create_default_workspace(creator).unwrap()
         };
-        let store = shared_block_store_with_db(db.clone(), kernel_id, ws_id, creator);
+        let store = shared_block_store_with_db(db.clone(), ws_id, creator);
 
         let mut ctx = CallContext::test();
-        ctx.kernel_id = kernel_id;
         ctx.principal_id = creator;
         {
             let g = db.lock();
             g.insert_document(&DocumentRow {
                 document_id: ctx.context_id,
-                kernel_id,
-                workspace_id: ws_id,
+                                workspace_id: ws_id,
                 doc_kind: DocumentKind::Code,
                 language: None,
                 path: None,

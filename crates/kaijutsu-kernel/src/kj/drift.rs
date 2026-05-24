@@ -124,7 +124,7 @@ impl KjDispatcher {
         // Resolve source context
         let source_id = {
             let db = self.kernel_db().lock();
-            match refs::resolve_context_arg(Some(src_query), caller, &db, self.kernel_id()) {
+            match refs::resolve_context_arg(Some(src_query), caller, &db) {
                 Ok(id) => id,
                 Err(e) => return KjResult::Err(format!("kj drift pull: {e}")),
             }
@@ -230,12 +230,7 @@ impl KjDispatcher {
         // Default target = caller's forked_from parent
         let target_id = if let Some(target_query) = argv.get(1) {
             let db = self.kernel_db().lock();
-            match refs::resolve_context_arg(
-                Some(target_query.as_str()),
-                caller,
-                &db,
-                self.kernel_id(),
-            ) {
+            match refs::resolve_context_arg(Some(target_query.as_str()), caller, &db) {
                 Ok(id) => id,
                 Err(e) => return KjResult::Err(format!("kj drift merge: {e}")),
             }
@@ -505,10 +500,9 @@ impl KjDispatcher {
     /// `kj drift history [ctx]` — show drift history (edges) for a context.
     fn drift_history(&self, argv: &[String], caller: &KjCaller) -> KjResult {
         let db = self.kernel_db().lock();
-        let kernel_id = self.kernel_id();
 
         let target_arg = argv.get(1).map(|s| s.as_str());
-        let target_id = match super::refs::resolve_context_arg(target_arg, caller, &db, kernel_id) {
+        let target_id = match super::refs::resolve_context_arg(target_arg, caller, &db) {
             Ok(id) => id,
             Err(e) => return KjResult::Err(format!("kj drift history: {e}")),
         };

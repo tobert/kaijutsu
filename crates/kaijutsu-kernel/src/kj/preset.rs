@@ -33,7 +33,7 @@ impl KjDispatcher {
 
     fn preset_list(&self) -> KjResult {
         let db = self.kernel_db().lock();
-        match db.list_presets(self.kernel_id()) {
+        match db.list_presets() {
             Ok(presets) => {
                 // Iteration handles: preset labels are the resolver key
                 // (`get_preset_by_label`) and they're required (non-nullable
@@ -77,7 +77,7 @@ impl KjDispatcher {
         };
 
         let db = self.kernel_db().lock();
-        match db.get_preset_by_label(self.kernel_id(), label) {
+        match db.get_preset_by_label(label) {
             Ok(Some(p)) => {
                 let mut lines = vec![format!("Preset: {}", p.label)];
                 if let Some(desc) = &p.description {
@@ -133,15 +133,13 @@ impl KjDispatcher {
         };
 
         let db = self.kernel_db().lock();
-        let kernel_id = self.kernel_id();
 
         // Check if preset already exists → update
-        match db.get_preset_by_label(kernel_id, label) {
+        match db.get_preset_by_label(label) {
             Ok(Some(existing)) => {
                 let updated = PresetRow {
                     preset_id: existing.preset_id,
-                    kernel_id,
-                    label: label.to_string(),
+                                        label: label.to_string(),
                     description: desc.or(existing.description),
                     provider: provider.or(existing.provider),
                     model: model.or(existing.model),
@@ -158,8 +156,7 @@ impl KjDispatcher {
             Ok(None) => {
                 let row = PresetRow {
                     preset_id: PresetId::new(),
-                    kernel_id,
-                    label: label.to_string(),
+                                        label: label.to_string(),
                     description: desc,
                     provider,
                     model,
@@ -185,9 +182,8 @@ impl KjDispatcher {
         };
 
         let db = self.kernel_db().lock();
-        let kernel_id = self.kernel_id();
 
-        let preset = match db.get_preset_by_label(kernel_id, label) {
+        let preset = match db.get_preset_by_label(label) {
             Ok(Some(p)) => p,
             Ok(None) => return KjResult::Err(format!("kj preset remove: '{}' not found", label)),
             Err(e) => return KjResult::Err(format!("kj preset remove: {e}")),
@@ -195,7 +191,7 @@ impl KjDispatcher {
 
         if !caller.confirmed {
             let usage_count = db
-                .contexts_using_preset(kernel_id, preset.preset_id)
+                .contexts_using_preset(preset.preset_id)
                 .unwrap_or(0);
             return KjResult::Latch {
                 command: "kj preset remove".to_string(),

@@ -1544,7 +1544,6 @@ impl Broker {
             ctx.principal_id,
             ctx.context_id,
             session_id,
-            ctx.kernel_id,
             session_contexts,
             configure_tools,
         )
@@ -5276,10 +5275,10 @@ mod tests {
         let kernel = Arc::new(crate::Kernel::new("kaish-hook-kj-test", None).await);
         let store = shared_block_store(PrincipalId::system());
         let kernel_db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
-        let kernel_id = kaijutsu_types::KernelId::new();
+        let _kernel_id = kaijutsu_types::KernelId::new();
         {
             let db = kernel_db.lock();
-            db.get_or_create_default_workspace(kernel_id, PrincipalId::system())
+            db.get_or_create_default_workspace(PrincipalId::system())
                 .unwrap();
         }
         let drift = shared_drift_router();
@@ -5287,8 +5286,7 @@ mod tests {
             drift,
             store.clone(),
             kernel_db,
-            kernel_id,
-            kernel.clone(),
+                        kernel.clone(),
         ));
         kj_dispatcher.set_self_arc();
 

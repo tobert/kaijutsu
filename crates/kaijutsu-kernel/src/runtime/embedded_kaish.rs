@@ -39,7 +39,7 @@ use kaish_kernel::{
 use crate::Kernel as KaijutsuKernel;
 use crate::block_store::SharedBlockStore;
 use crate::kernel_db::KernelDb;
-use kaijutsu_types::{ContextId, KernelId, PrincipalId, SessionId};
+use kaijutsu_types::{ContextId, PrincipalId, SessionId};
 
 use super::docs_filesystem::KaijutsuFilesystem;
 use super::input_filesystem::InputFilesystem;
@@ -85,7 +85,6 @@ impl EmbeddedKaish {
             PrincipalId::system(),
             ContextId::new(),
             SessionId::new(),
-            KernelId::new(),
             crate::runtime::context_engine::session_context_map(),
             |_, _, _| {},
         )
@@ -106,8 +105,7 @@ impl EmbeddedKaish {
         principal_id: PrincipalId,
         context_id: ContextId,
         session_id: SessionId,
-        kernel_id: KernelId,
-        session_contexts: SessionContextMap,
+                session_contexts: SessionContextMap,
         configure_tools: impl FnOnce(SessionContextMap, SessionId, &mut kaish_kernel::ToolRegistry),
     ) -> Result<Self> {
         Self::with_identity_and_db(
@@ -118,8 +116,7 @@ impl EmbeddedKaish {
             principal_id,
             context_id,
             session_id,
-            kernel_id,
-            None,
+                        None,
             session_contexts,
             configure_tools,
         )
@@ -135,8 +132,7 @@ impl EmbeddedKaish {
         principal_id: PrincipalId,
         context_id: ContextId,
         session_id: SessionId,
-        kernel_id: KernelId,
-        kernel_db: Option<&Arc<parking_lot::Mutex<KernelDb>>>,
+                kernel_db: Option<&Arc<parking_lot::Mutex<KernelDb>>>,
         session_contexts: SessionContextMap,
         configure_tools: impl FnOnce(SessionContextMap, SessionId, &mut kaish_kernel::ToolRegistry),
     ) -> Result<Self> {
@@ -154,8 +150,7 @@ impl EmbeddedKaish {
             principal_id,
             session_contexts.clone(),
             session_id,
-            kernel_id,
-        ));
+                    ));
         let mount_table = kernel.vfs().clone();
 
         let mount_backend: Arc<dyn KernelBackend> =
@@ -443,22 +438,20 @@ mod tests {
     #[tokio::test]
     async fn test_context_env_applied_on_creation() {
         use crate::kernel_db::{ContextRow, KernelDb};
-        use kaijutsu_types::{ConsentMode, ContextState, KernelId, now_millis};
+        use kaijutsu_types::{ConsentMode, ContextState, now_millis};
 
-        let kernel_id = KernelId::new();
         let context_id = ContextId::new();
         let principal = PrincipalId::system();
         let db = KernelDb::in_memory().unwrap();
 
         let ws_id = db
-            .get_or_create_default_workspace(kernel_id, principal)
+            .get_or_create_default_workspace(principal)
             .unwrap();
 
         db.insert_context_with_document(
             &ContextRow {
                 context_id,
-                kernel_id,
-                label: Some("test-env".into()),
+                                label: Some("test-env".into()),
                 provider: None,
                 model: None,
                 system_prompt: None,
@@ -497,8 +490,7 @@ mod tests {
             principal,
             context_id,
             sid,
-            kernel_id,
-            Some(&kernel_db),
+                        Some(&kernel_db),
             session_contexts,
             |_, _, _| {},
         )
@@ -534,22 +526,20 @@ mod tests {
     #[tokio::test]
     async fn test_init_script_applied_on_creation() {
         use crate::kernel_db::{ContextRow, ContextShellRow, KernelDb};
-        use kaijutsu_types::{ConsentMode, ContextState, KernelId, now_millis};
+        use kaijutsu_types::{ConsentMode, ContextState, now_millis};
 
-        let kernel_id = KernelId::new();
         let context_id = ContextId::new();
         let principal = PrincipalId::system();
         let db = KernelDb::in_memory().unwrap();
 
         let ws_id = db
-            .get_or_create_default_workspace(kernel_id, principal)
+            .get_or_create_default_workspace(principal)
             .unwrap();
 
         db.insert_context_with_document(
             &ContextRow {
                 context_id,
-                kernel_id,
-                label: Some("test-init".into()),
+                                label: Some("test-init".into()),
                 provider: None,
                 model: None,
                 system_prompt: None,
@@ -592,8 +582,7 @@ mod tests {
             principal,
             context_id,
             sid,
-            kernel_id,
-            Some(&kernel_db),
+                        Some(&kernel_db),
             session_contexts,
             |_, _, _| {},
         )
@@ -623,26 +612,24 @@ mod tests {
     #[tokio::test]
     async fn test_persisted_cwd_restored_on_creation() {
         use crate::kernel_db::{ContextRow, ContextShellRow, KernelDb};
-        use kaijutsu_types::{ConsentMode, ContextState, KernelId, now_millis};
+        use kaijutsu_types::{ConsentMode, ContextState, now_millis};
 
         let tmp = tempfile::tempdir().unwrap();
         let persisted_cwd = tmp.path().to_path_buf();
 
         // Set up KernelDb with a context that has a persisted cwd
-        let kernel_id = KernelId::new();
         let context_id = ContextId::new();
         let principal = PrincipalId::system();
         let db = KernelDb::in_memory().unwrap();
 
         let ws_id = db
-            .get_or_create_default_workspace(kernel_id, principal)
+            .get_or_create_default_workspace(principal)
             .unwrap();
 
         db.insert_context_with_document(
             &ContextRow {
                 context_id,
-                kernel_id,
-                label: Some("test-restore".into()),
+                                label: Some("test-restore".into()),
                 provider: None,
                 model: None,
                 system_prompt: None,
@@ -694,8 +681,7 @@ mod tests {
             principal,
             context_id,
             sid,
-            kernel_id,
-            Some(&kernel_db),
+                        Some(&kernel_db),
             session_contexts,
             |_, _, _| {},
         )

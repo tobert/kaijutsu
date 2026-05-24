@@ -480,14 +480,13 @@ fn kernel_data_dir() -> std::path::PathBuf {
 /// Create a BlockStore backed by the shared KernelDb.
 fn create_block_store_with_kernel_db(
     db: Arc<parking_lot::Mutex<KernelDb>>,
-    kernel_id: KernelId,
     default_workspace_id: kaijutsu_types::WorkspaceId,
     agent_id: PrincipalId,
     block_flows: SharedBlockFlowBus,
     input_flows: SharedInputDocFlowBus,
 ) -> Result<SharedBlockStore, String> {
     let mut inner =
-        BlockStore::with_db_and_flows(db, kernel_id, default_workspace_id, agent_id, block_flows);
+        BlockStore::with_db_and_flows(db, default_workspace_id, agent_id, block_flows);
     inner.set_input_flows(input_flows);
     let store = Arc::new(inner);
     store.load_from_db().map_err(|e| {
@@ -807,36 +806,31 @@ pub async fn create_shared_kernel(
         None => kernel_data_dir(),
     };
 
-    // Open KernelDb first — it owns the stable kernel ID
-    let kernel_db = {
-        let db_path = resolved_data_dir.join("kernel.db");
-        match KernelDb::open(&db_path) {
-            Ok(db) => {
-                log::info!("Opened KernelDb at {}", db_path.display());
-                db
-            }
-            Err(e) => {
-                log::error!("Failed to open KernelDb at {}: {}", db_path.display(), e);
-                KernelDb::in_memory().expect("in-memory KernelDb should never fail")
-            }
-        }
-    };
+    // Open KernelDb. Fail loudly if the file is unopenable — silently
+    // falling back to in-memory hides data loss: persisted contexts on disk
+    // become invisible while the server pretends to be a fresh kernel.
+    let db_path = resolved_data_dir.join("kernel.db");
+    let kernel_db = KernelDb::open(&db_path).map_err(|e| {
+        capnp::Error::failed(format!(
+            "Failed to open KernelDb at {}: {}",
+            db_path.display(),
+            e
+        ))
+    })?;
+    log::info!("Opened KernelDb at {}", db_path.display());
 
-    // Get stable kernel ID (persisted across restarts so context rows stay joinable)
-    let id = match kernel_db.get_or_create_kernel_id() {
-        Ok(kid) => {
-            log::info!("Kernel ID: {} (from kernel table)", kid.to_hex());
-            kid
-        }
-        Err(e) => {
-            log::error!("Failed to get/create kernel ID: {}, using ephemeral", e);
-            KernelId::new()
-        }
-    };
+    // KernelId is the kernel's birth certificate — written once on first
+    // DB open, never changes thereafter. Clients use this to detect that
+    // the DB they're talking to is the one they bound to.
+    let id = kernel_db.kernel_id().map_err(|e| {
+        capnp::Error::failed(format!("Failed to read kernel identity: {}", e))
+    })?;
+    log::info!("Kernel ID: {}", id.to_hex());
     let id_str = id.to_hex();
 
     // Create the kaijutsu kernel with shared FlowBus
-    let kernel = Kernel::with_flows(&id_str, block_flows.clone(), Some(&resolved_data_dir)).await;
+    let kernel =
+        Kernel::with_flows(id, &id_str, block_flows.clone(), Some(&resolved_data_dir)).await;
 
     // Read-only root — whole system visible (ls /usr/bin, cargo, etc.)
     kernel.mount("/", LocalBackend::read_only("/")).await;
@@ -862,7 +856,7 @@ pub async fn create_shared_kernel(
     let kernel_db_arc = Arc::new(parking_lot::Mutex::new(kernel_db));
     let default_ws_id = {
         let db = kernel_db_arc.lock();
-        db.get_or_create_default_workspace(id, PrincipalId::system())
+        db.get_or_create_default_workspace(PrincipalId::system())
             .unwrap()
     };
 
@@ -870,7 +864,6 @@ pub async fn create_shared_kernel(
     let block_flows_for_index = block_flows.clone();
     let documents = create_block_store_with_kernel_db(
         kernel_db_arc.clone(),
-        id,
         default_ws_id,
         PrincipalId::system(),
         block_flows,
@@ -921,7 +914,7 @@ pub async fn create_shared_kernel(
     let all_contexts: Vec<ContextRow> = {
         let db = kernel_db_arc.lock();
         // Step 1: Load active contexts from KernelDb
-        let db_contexts = db.list_active_contexts(id).map_err(|e| {
+        let db_contexts = db.list_active_contexts().map_err(|e| {
             capnp::Error::failed(format!("Failed to load contexts from KernelDb: {}", e))
         })?;
         let db_ids: std::collections::HashSet<ContextId> =
@@ -935,8 +928,7 @@ pub async fn create_shared_kernel(
             if !db_ids.contains(&bs_ctx_id) {
                 let row = ContextRow {
                     context_id: bs_ctx_id,
-                    kernel_id: id,
-                    label: None,
+                                        label: None,
                     provider: None,
                     model: None,
                     system_prompt: None,
@@ -952,7 +944,7 @@ pub async fn create_shared_kernel(
                     preset_id: None,
                 };
                 let default_ws = db
-                    .get_or_create_default_workspace(row.kernel_id, row.created_by)
+                    .get_or_create_default_workspace(row.created_by)
                     .unwrap_or_else(|_| kaijutsu_types::WorkspaceId::new());
                 if let Err(e) = db.insert_context_with_document(&row, default_ws) {
                     log::warn!(
@@ -970,7 +962,7 @@ pub async fn create_shared_kernel(
         }
 
         // Step 3: Re-read all active contexts (lock dropped after this block)
-        db.list_active_contexts(id).map_err(|e| {
+        db.list_active_contexts().map_err(|e| {
             capnp::Error::failed(format!("Failed to re-read contexts from KernelDb: {}", e))
         })?
     }; // db lock dropped here — safe to await below
@@ -1084,7 +1076,6 @@ pub async fn create_shared_kernel(
         kernel_arc.drift().clone(),
         documents.clone(),
         kernel_db_arc.clone(),
-        id,
         kernel_arc.clone(),
     ));
     // Stash a Weak<Self> on the dispatcher so internal paths (rc
@@ -1260,7 +1251,6 @@ impl kernel::Server for KernelImpl {
                             conn.principal.id,
                             context_id,
                             conn.session_id,
-                            kernel.id,
                             Some(&kernel.kernel_db),
                             session_contexts.clone(),
                             |map, sid, tools| {
@@ -1564,7 +1554,7 @@ impl kernel::Server for KernelImpl {
         let request_id = pry!(pry!(call.get_request_id()).to_str()).to_owned();
 
         let kernel_arc = self.kernel.kernel.clone();
-        let kernel_id = self.kernel.id;
+        let _kernel_id = self.kernel.id;
 
         // Extract identity and kaish ref for async cwd resolution
         let (principal_id, context_id, session_id, kaish_ref) = {
@@ -1593,7 +1583,7 @@ impl kernel::Server for KernelImpl {
                     context_id,
                     cwd,
                     session_id,
-                    kernel_id,
+                    kernel_arc.id(),
                 );
 
                 // Phase 5 D-54: tool filter retired. Visibility is now
@@ -1711,11 +1701,7 @@ impl kernel::Server for KernelImpl {
                         // Connection torn down — exit immediately rather than
                         // wait for the next event or a callback round-trip.
                         _ = conn_cancel.cancelled() => {
-                            log::debug!(
-                                "FlowBus bridge for kernel {} cancelled with \
-                                 connection",
-                                kernel_id,
-                            );
+                            log::debug!("FlowBus bridge cancelled with connection");
                             break;
                         }
                         Some(msg) = block_sub.recv() => {
@@ -2227,7 +2213,7 @@ impl kernel::Server for KernelImpl {
     ) -> Promise<(), capnp::Error> {
         let kernel_arc = self.kernel.kernel.clone();
         let kernel_db_arc = self.kernel.kernel_db.clone();
-        let kernel_id = self.kernel.id;
+        let _kernel_id = self.kernel.id;
         let semantic_index = self.kernel.semantic_index.clone();
 
         let span = extract_rpc_trace(pry!(params.get()).get_trace(), "list_contexts");
@@ -2236,7 +2222,7 @@ impl kernel::Server for KernelImpl {
                 // Build KernelDb lookup for fork_kind + archived_at (fields not on DriftRouter)
                 let db_map: HashMap<ContextId, ContextRow> = {
                     let db = kernel_db_arc.lock();
-                    match db.list_all_contexts(kernel_id) {
+                    match db.list_all_contexts() {
                         Ok(rows) => rows.into_iter().map(|r| (r.context_id, r)).collect(),
                         Err(_) => HashMap::new(),
                     }
@@ -2372,8 +2358,7 @@ impl kernel::Server for KernelImpl {
                 let db = kernel.kernel_db.lock();
                 let row = ContextRow {
                     context_id,
-                    kernel_id: kernel.id,
-                    label: label_ref.map(|s| s.to_string()),
+                                        label: label_ref.map(|s| s.to_string()),
                     provider: default_provider.clone(),
                     model: default_model.clone(),
                     system_prompt: None,
@@ -2389,7 +2374,7 @@ impl kernel::Server for KernelImpl {
                     preset_id: None,
                 };
                 let default_ws = db
-                    .get_or_create_default_workspace(row.kernel_id, row.created_by)
+                    .get_or_create_default_workspace(row.created_by)
                     .unwrap_or_else(|_| kaijutsu_types::WorkspaceId::new());
                 if let Err(e) = db.insert_context_with_document(&row, default_ws) {
                     drop(db);
@@ -2583,7 +2568,7 @@ impl kernel::Server for KernelImpl {
                 context_id,
                 cwd: std::path::PathBuf::from("/"),
                 session_id,
-                kernel_id: kernel.id,
+                kernel_id: kernel.kernel.id(),
             };
             let exec = kernel
                 .kernel
@@ -4304,11 +4289,7 @@ impl kernel::Server for KernelImpl {
                 loop {
                     let success = tokio::select! {
                         _ = conn_cancel.cancelled() => {
-                            log::debug!(
-                                "Filtered FlowBus bridge for kernel {} cancelled \
-                                 with connection",
-                                kernel_id,
-                            );
+                            log::debug!("Filtered FlowBus bridge cancelled with connection");
                             break;
                         }
                         Some(msg) = block_sub.recv() => {
@@ -4763,11 +4744,11 @@ impl kernel::Server for KernelImpl {
         mut results: kernel::ListPresetsResults,
     ) -> Promise<(), capnp::Error> {
         let _span = extract_rpc_trace(pry!(params.get()).get_trace(), "list_presets");
-        let kernel_id = self.kernel.id;
+        let _kernel_id = self.kernel.id;
 
         let presets = {
             let db = self.kernel.kernel_db.lock();
-            db.list_presets(kernel_id).unwrap_or_default()
+            db.list_presets().unwrap_or_default()
         };
 
         let mut list = results.get().init_presets(presets.len() as u32);
@@ -5237,7 +5218,6 @@ async fn execute_shell_command(
                 conn.principal.id,
                 conn.require_context()?,
                 conn.session_id,
-                kernel.id,
                 Some(&kernel.kernel_db),
                 session_contexts.clone(),
                 |map, sid, tools| {

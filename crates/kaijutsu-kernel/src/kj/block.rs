@@ -45,10 +45,9 @@ impl KjDispatcher {
         let status_arg = extract_named_arg(argv, &["--status"]);
         let ctx_ref = extract_named_arg(argv, &["--context", "-c"]);
 
-        let kernel_id = self.kernel_id();
         let ctx_id = {
             let db = self.kernel_db().lock();
-            match resolve_context_arg(ctx_ref.as_deref(), caller, &db, kernel_id) {
+            match resolve_context_arg(ctx_ref.as_deref(), caller, &db) {
                 Ok(id) => id,
                 Err(e) => return KjResult::Err(format!("kj block list: {e}")),
             }
@@ -200,10 +199,9 @@ impl KjDispatcher {
         let role_arg = extract_named_arg(argv, &["--role"]);
         let ctx_ref = extract_named_arg(argv, &["--context", "-c"]);
 
-        let kernel_id = self.kernel_id();
         let ctx_id = {
             let db = self.kernel_db().lock();
-            match resolve_context_arg(ctx_ref.as_deref(), caller, &db, kernel_id) {
+            match resolve_context_arg(ctx_ref.as_deref(), caller, &db) {
                 Ok(id) => id,
                 Err(e) => return KjResult::Err(format!("kj block count: {e}")),
             }

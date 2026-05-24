@@ -35,6 +35,10 @@ use crate::vfs::{DirEntry, FileAttr, MountTable, SetAttr, StatFs, VfsOps, VfsRes
 /// - Has a consent mode (collaborative vs autonomous)
 /// - Can checkpoint, fork, and thread
 pub struct Kernel {
+    /// Stable kernel identity — set at construction from the KernelDb
+    /// singleton row, immutable thereafter. Used by the wire layer for
+    /// `ping`/`bind_kernel` so clients can detect kernel changes.
+    id: kaijutsu_types::KernelId,
     /// VFS mount table.
     vfs: Arc<MountTable>,
     /// Kernel state (behind RwLock for interior mutability).
@@ -104,6 +108,7 @@ impl Kernel {
         let vfs = Arc::new(MountTable::new());
 
         Self {
+            id: kaijutsu_types::KernelId::new(),
             vfs,
             state: RwLock::new(KernelState::new(&name)),
             llm: RwLock::new(LlmRegistry::new()),
@@ -123,6 +128,7 @@ impl Kernel {
     /// Use this when you need to share the flow bus with other components
     /// (like BlockStore) before creating the kernel.
     pub async fn with_flows(
+        id: kaijutsu_types::KernelId,
         name: impl Into<String>,
         block_flows: SharedBlockFlowBus,
         data_dir: Option<&Path>,
@@ -131,6 +137,7 @@ impl Kernel {
         let vfs = Arc::new(MountTable::new());
 
         Self {
+            id,
             vfs,
             state: RwLock::new(KernelState::new(&name)),
             llm: RwLock::new(LlmRegistry::new()),
@@ -143,6 +150,11 @@ impl Kernel {
             broker: Arc::new(Broker::new()),
             timeouts: kaijutsu_types::TimeoutPolicy::default(),
         }
+    }
+
+    /// Stable kernel identity.
+    pub fn id(&self) -> kaijutsu_types::KernelId {
+        self.id
     }
 
     /// Get the MCP tool broker (Phase 1).
@@ -524,8 +536,11 @@ impl Kernel {
     // Identity
     // ========================================================================
 
-    /// Get the kernel ID.
-    pub async fn id(&self) -> Uuid {
+    /// Get the legacy KernelState UUID. Distinct from `Self::id()`, which is
+    /// the stable wire-level `KernelId`. KernelState is kept around for
+    /// checkpoint/fork bookkeeping; once that surface is retired this can
+    /// collapse onto the singleton id.
+    pub async fn state_id(&self) -> Uuid {
         self.state.read().await.id
     }
 

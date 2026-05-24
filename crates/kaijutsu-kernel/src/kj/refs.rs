@@ -44,7 +44,6 @@ pub fn resolve_context_ref(
     ctx_ref: &ContextRef,
     caller: &KjCaller,
     db: &KernelDb,
-    kernel_id: kaijutsu_types::KernelId,
 ) -> Result<ContextId, String> {
     match ctx_ref {
         ContextRef::Current => caller
@@ -73,9 +72,7 @@ pub fn resolve_context_ref(
             }
             Ok(current)
         }
-        ContextRef::Query(query) => db
-            .resolve_context(kernel_id, query)
-            .map_err(|e| e.to_string()),
+        ContextRef::Query(query) => db.resolve_context(query).map_err(|e| e.to_string()),
     }
 }
 
@@ -84,13 +81,12 @@ pub fn resolve_context_arg(
     arg: Option<&str>,
     caller: &KjCaller,
     db: &KernelDb,
-    kernel_id: kaijutsu_types::KernelId,
 ) -> Result<ContextId, String> {
     let ctx_ref = match arg {
         Some(s) if !s.is_empty() => parse_context_ref(s),
         _ => ContextRef::Current,
     };
-    resolve_context_ref(&ctx_ref, caller, db, kernel_id)
+    resolve_context_ref(&ctx_ref, caller, db)
 }
 
 #[cfg(test)]
@@ -140,7 +136,6 @@ mod tests {
     #[test]
     fn resolve_current() {
         let db = KernelDb::in_memory().unwrap();
-        let kid = kaijutsu_types::KernelId::new();
         let ctx_id = ContextId::new();
         let caller = KjCaller {
             principal_id: kaijutsu_types::PrincipalId::new(),
@@ -150,21 +145,19 @@ mod tests {
             rc_depth: 0,
         };
 
-        let result = resolve_context_ref(&ContextRef::Current, &caller, &db, kid);
+        let result = resolve_context_ref(&ContextRef::Current, &caller, &db);
         assert_eq!(result.unwrap(), ctx_id);
     }
 
     #[test]
     fn resolve_parent_no_parent() {
         let db = KernelDb::in_memory().unwrap();
-        let kid = kaijutsu_types::KernelId::new();
         let ctx_id = ContextId::new();
         let principal = kaijutsu_types::PrincipalId::new();
 
         // Insert context with no parent
         let row = crate::kernel_db::ContextRow {
             context_id: ctx_id,
-            kernel_id: kid,
             label: Some("root".to_string()),
             provider: None,
             model: None,
@@ -180,7 +173,7 @@ mod tests {
             workspace_id: None,
             preset_id: None,
         };
-        let ws_id = db.get_or_create_default_workspace(kid, principal).unwrap();
+        let ws_id = db.get_or_create_default_workspace(principal).unwrap();
         db.insert_context_with_document(&row, ws_id).unwrap();
 
         let caller = KjCaller {
@@ -191,7 +184,7 @@ mod tests {
             rc_depth: 0,
         };
 
-        let result = resolve_context_ref(&ContextRef::Parent(1), &caller, &db, kid);
+        let result = resolve_context_ref(&ContextRef::Parent(1), &caller, &db);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("no parent"));
     }
@@ -199,19 +192,17 @@ mod tests {
     #[test]
     fn resolve_parent_chain() {
         let db = KernelDb::in_memory().unwrap();
-        let kid = kaijutsu_types::KernelId::new();
         let principal = kaijutsu_types::PrincipalId::new();
 
         let grandparent_id = ContextId::new();
         let parent_id = ContextId::new();
         let child_id = ContextId::new();
-        let ws_id = db.get_or_create_default_workspace(kid, principal).unwrap();
+        let ws_id = db.get_or_create_default_workspace(principal).unwrap();
 
         // Insert grandparent
         db.insert_context_with_document(
             &crate::kernel_db::ContextRow {
                 context_id: grandparent_id,
-                kernel_id: kid,
                 label: Some("grandparent".to_string()),
                 provider: None,
                 model: None,
@@ -235,7 +226,6 @@ mod tests {
         db.insert_context_with_document(
             &crate::kernel_db::ContextRow {
                 context_id: parent_id,
-                kernel_id: kid,
                 label: Some("parent".to_string()),
                 provider: None,
                 model: None,
@@ -259,7 +249,6 @@ mod tests {
         db.insert_context_with_document(
             &crate::kernel_db::ContextRow {
                 context_id: child_id,
-                kernel_id: kid,
                 label: Some("child".to_string()),
                 provider: None,
                 model: None,
@@ -288,15 +277,15 @@ mod tests {
         };
 
         // .parent → parent_id
-        let result = resolve_context_ref(&ContextRef::Parent(1), &caller, &db, kid);
+        let result = resolve_context_ref(&ContextRef::Parent(1), &caller, &db);
         assert_eq!(result.unwrap(), parent_id);
 
         // .parent.parent → grandparent_id
-        let result = resolve_context_ref(&ContextRef::Parent(2), &caller, &db, kid);
+        let result = resolve_context_ref(&ContextRef::Parent(2), &caller, &db);
         assert_eq!(result.unwrap(), grandparent_id);
 
         // .parent.parent.parent → error (grandparent has no parent)
-        let result = resolve_context_ref(&ContextRef::Parent(3), &caller, &db, kid);
+        let result = resolve_context_ref(&ContextRef::Parent(3), &caller, &db);
         assert!(result.is_err());
     }
 }

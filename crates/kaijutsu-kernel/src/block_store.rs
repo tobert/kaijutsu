@@ -22,7 +22,7 @@ use kaijutsu_crdt::block_store::{
 };
 use kaijutsu_crdt::{BlockId, BlockKind, BlockSnapshot, ContentType, Role, Status, ToolKind};
 use kaijutsu_types::BlockFilter;
-use kaijutsu_types::{ContextId, DocKind, KernelId, PrincipalId, WorkspaceId};
+use kaijutsu_types::{ContextId, DocKind, PrincipalId, WorkspaceId};
 
 use crate::flows::{BlockFlow, InputDocFlow, OpSource, SharedBlockFlowBus, SharedInputDocFlowBus};
 use crate::input_doc::InputDocEntry;
@@ -193,8 +193,7 @@ pub struct BlockStore {
     /// Database for persistence (unified KernelDb).
     db: Option<DbHandle>,
     /// Kernel ID for document rows.
-    kernel_id: Option<KernelId>,
-    /// Default workspace ID for new documents.
+        /// Default workspace ID for new documents.
     default_workspace_id: Option<WorkspaceId>,
     /// Default agent ID for this store.
     agent_id: RwLock<PrincipalId>,
@@ -215,8 +214,7 @@ impl BlockStore {
             block_text_seqs: DashMap::new(),
             input_text_seqs: DashMap::new(),
             db: None,
-            kernel_id: None,
-            default_workspace_id: None,
+                        default_workspace_id: None,
             agent_id: RwLock::new(agent_id),
             block_flows: None,
             input_flows: None,
@@ -233,8 +231,7 @@ impl BlockStore {
             block_text_seqs: DashMap::new(),
             input_text_seqs: DashMap::new(),
             db: None,
-            kernel_id: None,
-            default_workspace_id: None,
+                        default_workspace_id: None,
             agent_id: RwLock::new(agent_id),
             block_flows: Some(block_flows),
             input_flows: None,
@@ -244,8 +241,7 @@ impl BlockStore {
     /// Create a block store with unified KernelDb persistence.
     pub fn with_db(
         db: DbHandle,
-        kernel_id: KernelId,
-        default_workspace_id: WorkspaceId,
+                default_workspace_id: WorkspaceId,
         agent_id: PrincipalId,
     ) -> Self {
         Self {
@@ -256,8 +252,7 @@ impl BlockStore {
             block_text_seqs: DashMap::new(),
             input_text_seqs: DashMap::new(),
             db: Some(db),
-            kernel_id: Some(kernel_id),
-            default_workspace_id: Some(default_workspace_id),
+                        default_workspace_id: Some(default_workspace_id),
             agent_id: RwLock::new(agent_id),
             block_flows: None,
             input_flows: None,
@@ -267,8 +262,7 @@ impl BlockStore {
     /// Create a block store with unified KernelDb persistence and FlowBus.
     pub fn with_db_and_flows(
         db: DbHandle,
-        kernel_id: KernelId,
-        default_workspace_id: WorkspaceId,
+                default_workspace_id: WorkspaceId,
         agent_id: PrincipalId,
         block_flows: SharedBlockFlowBus,
     ) -> Self {
@@ -280,8 +274,7 @@ impl BlockStore {
             block_text_seqs: DashMap::new(),
             input_text_seqs: DashMap::new(),
             db: Some(db),
-            kernel_id: Some(kernel_id),
-            default_workspace_id: Some(default_workspace_id),
+                        default_workspace_id: Some(default_workspace_id),
             agent_id: RwLock::new(agent_id),
             block_flows: Some(block_flows),
             input_flows: None,
@@ -358,8 +351,7 @@ impl BlockStore {
                     let db_guard = db.lock();
                     let row = DocumentRow {
                         document_id: context_id,
-                        kernel_id: self.kernel_id.unwrap_or_default(),
-                        workspace_id: self.default_workspace_id.unwrap_or_default(),
+                                                workspace_id: self.default_workspace_id.unwrap_or_default(),
                         doc_kind: kind,
                         language: language.clone(),
                         path: None,
@@ -509,8 +501,7 @@ impl BlockStore {
             let db_guard = db.lock();
             let row = DocumentRow {
                 document_id: new_id,
-                kernel_id: self.kernel_id.unwrap_or_default(),
-                workspace_id: self.default_workspace_id.unwrap_or_default(),
+                                workspace_id: self.default_workspace_id.unwrap_or_default(),
                 doc_kind: kind,
                 language: language.clone(),
                 path: None,
@@ -590,8 +581,7 @@ impl BlockStore {
             let db_guard = db.lock();
             let row = DocumentRow {
                 document_id: new_id,
-                kernel_id: self.kernel_id.unwrap_or_default(),
-                workspace_id: self.default_workspace_id.unwrap_or_default(),
+                                workspace_id: self.default_workspace_id.unwrap_or_default(),
                 doc_kind: kind,
                 language: language.clone(),
                 path: None,
@@ -663,8 +653,7 @@ impl BlockStore {
             let db_guard = db.lock();
             let row = DocumentRow {
                 document_id: new_id,
-                kernel_id: self.kernel_id.unwrap_or_default(),
-                workspace_id: self.default_workspace_id.unwrap_or_default(),
+                                workspace_id: self.default_workspace_id.unwrap_or_default(),
                 doc_kind: kind,
                 language: language.clone(),
                 path: None,
@@ -1883,11 +1872,8 @@ impl BlockStore {
             return Ok(());
         };
         let db_guard = db.lock();
-        let kernel_id = self
-            .kernel_id
-            .ok_or_else(|| BlockStoreError::Db("no kernel_id configured".into()))?;
         let docs = db_guard
-            .list_documents(kernel_id)
+            .list_documents()
             .map_err(|e| BlockStoreError::Db(e.to_string()))?;
         let agent_id = self.agent_id();
 
@@ -2284,12 +2270,8 @@ impl BlockStore {
             .as_ref()
             .ok_or(BlockStoreError::NoDatabaseConfigured)?;
         let db_guard = db.lock();
-        let kernel_id = self
-            .kernel_id
-            .ok_or_else(|| BlockStoreError::Db("no kernel_id configured".into()))?;
-
         let doc_ids = db_guard
-            .list_input_doc_ids(kernel_id)
+            .list_input_doc_ids()
             .map_err(|e| BlockStoreError::Db(e.to_string()))?;
 
         let agent_id = self.agent_id();
@@ -2805,14 +2787,12 @@ pub fn shared_block_store(agent_id: PrincipalId) -> SharedBlockStore {
 /// Create a shared block store with database persistence.
 pub fn shared_block_store_with_db(
     db: DbHandle,
-    kernel_id: KernelId,
-    default_workspace_id: WorkspaceId,
+        default_workspace_id: WorkspaceId,
     agent_id: PrincipalId,
 ) -> SharedBlockStore {
     Arc::new(BlockStore::with_db(
         db,
-        kernel_id,
-        default_workspace_id,
+                default_workspace_id,
         agent_id,
     ))
 }
@@ -3790,29 +3770,27 @@ mod tests {
     #[test]
     fn test_merge_ops_persists_to_db() {
         use crate::kernel_db::{DocumentRow, KernelDb};
-        use kaijutsu_types::{KernelId, now_millis};
+        use kaijutsu_types::now_millis;
 
         let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
         let creator = PrincipalId::system();
-        let kernel_id = KernelId::new();
 
         let ws_id = {
             let db_guard = db.lock();
             db_guard
-                .get_or_create_default_workspace(kernel_id, creator)
+                .get_or_create_default_workspace(creator)
                 .unwrap()
         };
 
         // "Server" store — DB-backed, will receive merged ops.
-        let server_store = BlockStore::with_db(db.clone(), kernel_id, ws_id, creator);
+        let server_store = BlockStore::with_db(db.clone(), ws_id, creator);
         let ctx = ContextId::new();
         {
             let db_guard = db.lock();
             db_guard
                 .insert_document(&DocumentRow {
                     document_id: ctx,
-                    kernel_id,
-                    workspace_id: ws_id,
+                                        workspace_id: ws_id,
                     doc_kind: DocumentKind::Conversation,
                     language: None,
                     path: None,
@@ -3889,46 +3867,40 @@ mod tests {
     // ========================================================================
 
     /// Helper: unique KernelId for test isolation.
-    fn test_kernel_id() -> KernelId {
-        KernelId::new()
-    }
-
     /// Create a DB-backed store backed by an on-disk SQLite file inside `dir`.
-    /// Returns (db_handle, block_store, context_id, kernel_id, workspace_id).
+    /// Returns (db_handle, block_store, context_id, workspace_id).
     fn fresh_db_store(
         dir: &std::path::Path,
-    ) -> (DbHandle, BlockStore, ContextId, KernelId, WorkspaceId) {
+    ) -> (DbHandle, BlockStore, ContextId, WorkspaceId) {
         let db_path = dir.join("test.db");
         let db = Arc::new(parking_lot::Mutex::new(
             KernelDb::open(&db_path).expect("open DB"),
         ));
         let creator = PrincipalId::system();
-        let kernel_id = test_kernel_id();
 
         let ws_id = {
             let db_guard = db.lock();
             db_guard
-                .get_or_create_default_workspace(kernel_id, creator)
+                .get_or_create_default_workspace(creator)
                 .expect("create workspace")
         };
 
-        let store = BlockStore::with_db(db.clone(), kernel_id, ws_id, creator);
+        let store = BlockStore::with_db(db.clone(), ws_id, creator);
         let ctx = ContextId::new();
         store
             .create_document(ctx, DocumentKind::Conversation, None)
             .expect("create document");
 
-        (db, store, ctx, kernel_id, ws_id)
+        (db, store, ctx, ws_id)
     }
 
     /// Drop the store, create a new one from the same DB, call load_from_db.
     fn drop_and_reload(
         db: DbHandle,
-        kernel_id: KernelId,
-        ws_id: WorkspaceId,
+                ws_id: WorkspaceId,
     ) -> BlockStore {
         let creator = PrincipalId::system();
-        let store2 = BlockStore::with_db(db, kernel_id, ws_id, creator);
+        let store2 = BlockStore::with_db(db, ws_id, creator);
         store2.load_from_db().expect("load_from_db");
         store2
     }
@@ -3940,7 +3912,7 @@ mod tests {
     #[test]
     fn test_drop_reload_simple() {
         let dir = tempfile::tempdir().unwrap();
-        let (db, store, ctx, kid, ws) = fresh_db_store(dir.path());
+        let (db, store, ctx, ws) = fresh_db_store(dir.path());
 
         store
             .insert_block(
@@ -3951,7 +3923,7 @@ mod tests {
 
         drop(store); // destroy in-memory state
 
-        let store2 = drop_and_reload(db, kid, ws);
+        let store2 = drop_and_reload(db, ws);
         let content = store2.get_content(ctx).unwrap();
         assert_eq!(content, "hello world", "content should survive drop+reload");
     }
@@ -3959,7 +3931,7 @@ mod tests {
     #[test]
     fn test_drop_reload_after_append_chain() {
         let dir = tempfile::tempdir().unwrap();
-        let (db, store, ctx, kid, ws) = fresh_db_store(dir.path());
+        let (db, store, ctx, ws) = fresh_db_store(dir.path());
 
         let block_id = store
             .insert_block(
@@ -3978,7 +3950,7 @@ mod tests {
 
         drop(store);
 
-        let store2 = drop_and_reload(db, kid, ws);
+        let store2 = drop_and_reload(db, ws);
         let content_after = store2.get_content(ctx).unwrap();
         assert_eq!(
             content_after, expected,
@@ -3989,7 +3961,7 @@ mod tests {
     #[test]
     fn test_drop_reload_after_compaction() {
         let dir = tempfile::tempdir().unwrap();
-        let (db, store, ctx, kid, ws) = fresh_db_store(dir.path());
+        let (db, store, ctx, ws) = fresh_db_store(dir.path());
 
         let block_id = store
             .insert_block(
@@ -4022,7 +3994,7 @@ mod tests {
 
         drop(store);
 
-        let store2 = drop_and_reload(db, kid, ws);
+        let store2 = drop_and_reload(db, ws);
         let content_after = store2.get_content(ctx).unwrap();
         assert_eq!(
             content_after, content_before,
@@ -4037,7 +4009,7 @@ mod tests {
     #[test]
     fn test_journal_row_per_insert_block() {
         let dir = tempfile::tempdir().unwrap();
-        let (db, store, ctx, _kid, _ws) = fresh_db_store(dir.path());
+        let (db, store, ctx, _ws) = fresh_db_store(dir.path());
 
         store
             .insert_block(
@@ -4070,7 +4042,7 @@ mod tests {
     #[test]
     fn test_journal_row_per_append() {
         let dir = tempfile::tempdir().unwrap();
-        let (db, store, ctx, _kid, _ws) = fresh_db_store(dir.path());
+        let (db, store, ctx, _ws) = fresh_db_store(dir.path());
 
         let block_id = store
             .insert_block(
@@ -4097,7 +4069,7 @@ mod tests {
     #[test]
     fn test_journal_row_per_edit() {
         let dir = tempfile::tempdir().unwrap();
-        let (db, store, ctx, _kid, _ws) = fresh_db_store(dir.path());
+        let (db, store, ctx, _ws) = fresh_db_store(dir.path());
 
         let block_id = store
             .insert_block(
@@ -4122,7 +4094,7 @@ mod tests {
     #[test]
     fn test_journal_row_per_metadata() {
         let dir = tempfile::tempdir().unwrap();
-        let (db, store, ctx, _kid, _ws) = fresh_db_store(dir.path());
+        let (db, store, ctx, _ws) = fresh_db_store(dir.path());
 
         let block_id = store
             .insert_block(
@@ -4154,7 +4126,7 @@ mod tests {
     #[test]
     fn test_journal_row_per_merge_ops() {
         let dir = tempfile::tempdir().unwrap();
-        let (db, store, ctx, _kid, _ws) = fresh_db_store(dir.path());
+        let (db, store, ctx, _ws) = fresh_db_store(dir.path());
 
         // Create a second (non-DB) store and insert a block in it
         let client = BlockStore::new(PrincipalId::system());
@@ -4188,7 +4160,7 @@ mod tests {
     #[test]
     fn test_compaction_trigger_at_threshold() {
         let dir = tempfile::tempdir().unwrap();
-        let (db, store, ctx, _kid, _ws) = fresh_db_store(dir.path());
+        let (db, store, ctx, _ws) = fresh_db_store(dir.path());
 
         let block_id = store
             .insert_block(
@@ -4233,7 +4205,7 @@ mod tests {
     #[test]
     fn test_compaction_preserves_state() {
         let dir = tempfile::tempdir().unwrap();
-        let (db, store, ctx, kid, ws) = fresh_db_store(dir.path());
+        let (db, store, ctx, ws) = fresh_db_store(dir.path());
 
         let block_id = store
             .insert_block(
@@ -4253,7 +4225,7 @@ mod tests {
 
         drop(store);
 
-        let store2 = drop_and_reload(db, kid, ws);
+        let store2 = drop_and_reload(db, ws);
         let content_after = store2.get_content(ctx).unwrap();
         assert_eq!(
             content_after, expected,
@@ -4268,7 +4240,7 @@ mod tests {
     #[test]
     fn test_mixed_local_and_remote_ops() {
         let dir = tempfile::tempdir().unwrap();
-        let (db, store_a, ctx, kid, ws) = fresh_db_store(dir.path());
+        let (db, store_a, ctx, ws) = fresh_db_store(dir.path());
 
         // A inserts a block locally
         store_a
@@ -4309,7 +4281,7 @@ mod tests {
 
         drop(store_a);
 
-        let store2 = drop_and_reload(db, kid, ws);
+        let store2 = drop_and_reload(db, ws);
         let content_after = store2.get_content(ctx).unwrap();
         assert!(
             content_after.contains("local-1"),
@@ -4334,7 +4306,7 @@ mod tests {
     #[test]
     fn test_block_order_preserved() {
         let dir = tempfile::tempdir().unwrap();
-        let (db, store, ctx, kid, ws) = fresh_db_store(dir.path());
+        let (db, store, ctx, ws) = fresh_db_store(dir.path());
 
         // Insert 5 blocks, recording the order
         let mut ids = Vec::new();
@@ -4365,7 +4337,7 @@ mod tests {
 
         drop(store);
 
-        let store2 = drop_and_reload(db, kid, ws);
+        let store2 = drop_and_reload(db, ws);
         let order_after: Vec<BlockId> = store2
             .block_snapshots(ctx)
             .unwrap()
@@ -4397,7 +4369,7 @@ mod tests {
     #[test]
     fn test_lamport_clock_seeded_after_restore() {
         let dir = tempfile::tempdir().unwrap();
-        let (db, store, ctx, kid, ws) = fresh_db_store(dir.path());
+        let (db, store, ctx, ws) = fresh_db_store(dir.path());
 
         let block_id = store
             .insert_block(
@@ -4417,7 +4389,7 @@ mod tests {
 
         drop(store);
 
-        let store2 = drop_and_reload(db, kid, ws);
+        let store2 = drop_and_reload(db, ws);
 
         // Now set_status again — the Lamport clock should have been seeded
         // from the restored state, so the new timestamp must be strictly greater.
@@ -4444,7 +4416,7 @@ mod tests {
     #[test]
     fn test_input_oplog_independent() {
         let dir = tempfile::tempdir().unwrap();
-        let (db, store, ctx, _kid, _ws) = fresh_db_store(dir.path());
+        let (db, store, ctx, _ws) = fresh_db_store(dir.path());
 
         store.create_input_doc(ctx).unwrap();
 
@@ -4488,7 +4460,7 @@ mod tests {
     #[test]
     fn test_input_drop_reload() {
         let dir = tempfile::tempdir().unwrap();
-        let (db, store, ctx, kid, ws) = fresh_db_store(dir.path());
+        let (db, store, ctx, ws) = fresh_db_store(dir.path());
 
         store.create_input_doc(ctx).unwrap();
 
@@ -4505,7 +4477,7 @@ mod tests {
 
         drop(store);
 
-        let store2 = drop_and_reload(db, kid, ws);
+        let store2 = drop_and_reload(db, ws);
         store2.load_input_docs_from_db().unwrap();
         let text_after = store2.get_input_text(ctx).unwrap();
         assert_eq!(
@@ -4521,7 +4493,7 @@ mod tests {
     #[test]
     fn test_fork_creates_clean_snapshot() {
         let dir = tempfile::tempdir().unwrap();
-        let (db, store, ctx, _kid, _ws) = fresh_db_store(dir.path());
+        let (db, store, ctx, _ws) = fresh_db_store(dir.path());
 
         store
             .insert_block(

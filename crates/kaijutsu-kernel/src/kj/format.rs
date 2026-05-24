@@ -251,8 +251,7 @@ mod tests {
     fn make_row(label: Option<&str>, id: ContextId) -> ContextRow {
         ContextRow {
             context_id: id,
-            kernel_id: kaijutsu_types::KernelId::new(),
-            label: label.map(|s| s.to_string()),
+                        label: label.map(|s| s.to_string()),
             provider: Some("anthropic".to_string()),
             model: Some("claude-opus-4-6".to_string()),
             system_prompt: None,

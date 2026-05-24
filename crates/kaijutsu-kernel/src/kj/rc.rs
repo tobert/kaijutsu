@@ -178,7 +178,6 @@ kj context create my-plan --type=planner
         };
 
         let row = RcScriptRow {
-            kernel_id: self.kernel_id(),
             context_type: parts.context_type.clone(),
             verb: parts.verb.clone(),
             sort_key: parts.sort_key.clone(),
@@ -206,7 +205,7 @@ kj context create my-plan --type=planner
         let verb_filter = extract_named_arg(argv, &["--verb"]);
 
         let db = self.kernel_db().lock();
-        let scripts = match db.list_rc_scripts_all(self.kernel_id()) {
+        let scripts = match db.list_rc_scripts_all() {
             Ok(s) => s,
             Err(e) => return KjResult::Err(format!("kj rc list: {e}")),
         };
@@ -262,7 +261,7 @@ kj context create my-plan --type=planner
         };
 
         let db = self.kernel_db().lock();
-        match db.delete_rc_script(self.kernel_id(), &path) {
+        match db.delete_rc_script(&path) {
             Ok(true) => KjResult::ok(format!("removed rc script '{}'", path)),
             Ok(false) => KjResult::Err(format!("kj rc rm: '{}' not found", path)),
             Err(e) => KjResult::Err(format!("kj rc rm: {e}")),

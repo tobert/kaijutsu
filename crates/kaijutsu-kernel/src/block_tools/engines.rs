@@ -1444,24 +1444,22 @@ mod tests {
     #[tokio::test]
     async fn test_block_append_persists_to_db() {
         use crate::kernel_db::{DocumentRow, KernelDb};
-        use kaijutsu_types::{KernelId, now_millis};
+        use kaijutsu_types::now_millis;
         use std::sync::Arc;
 
         let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
         let creator = PrincipalId::system();
-        let kernel_id = KernelId::new();
 
         let ws_id = {
             let db_guard = db.lock();
             db_guard
-                .get_or_create_default_workspace(kernel_id, creator)
+                .get_or_create_default_workspace(creator)
                 .unwrap()
         };
 
         let store = crate::block_store::shared_block_store_with_db(
             db.clone(),
-            kernel_id,
-            ws_id,
+                        ws_id,
             creator,
         );
 
@@ -1471,8 +1469,7 @@ mod tests {
             db_guard
                 .insert_document(&DocumentRow {
                     document_id: ctx,
-                    kernel_id,
-                    workspace_id: ws_id,
+                                        workspace_id: ws_id,
                     doc_kind: DocumentKind::Code,
                     language: None,
                     path: None,

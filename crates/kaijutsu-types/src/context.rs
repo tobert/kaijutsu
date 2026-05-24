@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{ContextId, KernelId, PrincipalId};
+use crate::ids::{ContextId, PrincipalId};
 
 /// Metadata for a context within a kernel.
 ///
@@ -16,8 +16,6 @@ use crate::ids::{ContextId, KernelId, PrincipalId};
 pub struct Context {
     /// Globally unique context identifier (also serves as document_id).
     pub id: ContextId,
-    /// The kernel this context belongs to.
-    pub kernel_id: KernelId,
     /// Human-friendly label (e.g., "default", "debug-auth"). Mutable.
     pub label: Option<String>,
     /// Fork source context. None for root contexts.
@@ -31,14 +29,12 @@ pub struct Context {
 impl Context {
     /// Create a new context info for a freshly created context.
     pub fn new(
-        kernel_id: KernelId,
         label: Option<String>,
         forked_from: Option<ContextId>,
         created_by: PrincipalId,
     ) -> Self {
         Self {
             id: ContextId::new(),
-            kernel_id,
             label,
             forked_from,
             created_by,
@@ -94,11 +90,9 @@ mod tests {
 
     #[test]
     fn test_context_info_construction() {
-        let kernel = KernelId::new();
         let creator = PrincipalId::new();
-        let info = Context::new(kernel, Some("default".into()), None, creator);
+        let info = Context::new(Some("default".into()), None, creator);
 
-        assert_eq!(info.kernel_id, kernel);
         assert_eq!(info.label, Some("default".to_string()));
         assert!(info.forked_from.is_none());
         assert_eq!(info.created_by, creator);
@@ -108,10 +102,9 @@ mod tests {
 
     #[test]
     fn test_context_info_child() {
-        let kernel = KernelId::new();
         let creator = PrincipalId::new();
         let parent = ContextId::new();
-        let info = Context::new(kernel, Some("debug".into()), Some(parent), creator);
+        let info = Context::new(Some("debug".into()), Some(parent), creator);
 
         assert!(info.is_child());
         assert!(!info.is_root());
@@ -120,28 +113,25 @@ mod tests {
 
     #[test]
     fn test_display_name_prefers_label() {
-        let kernel = KernelId::new();
         let creator = PrincipalId::new();
-        let info = Context::new(kernel, Some("main".into()), None, creator);
+        let info = Context::new(Some("main".into()), None, creator);
         assert_eq!(info.display_name(), "main");
     }
 
     #[test]
     fn test_display_name_falls_back_to_short_hex() {
-        let kernel = KernelId::new();
         let creator = PrincipalId::new();
-        let info = Context::new(kernel, None, None, creator);
+        let info = Context::new(None, None, creator);
         assert_eq!(info.display_name().len(), 8); // short hex
     }
 
     #[test]
     fn test_fork_lineage() {
-        let kernel = KernelId::new();
         let creator = PrincipalId::new();
 
-        let root = Context::new(kernel, Some("root".into()), None, creator);
-        let child = Context::new(kernel, Some("child".into()), Some(root.id), creator);
-        let grandchild = Context::new(kernel, Some("grandchild".into()), Some(child.id), creator);
+        let root = Context::new(Some("root".into()), None, creator);
+        let child = Context::new(Some("child".into()), Some(root.id), creator);
+        let grandchild = Context::new(Some("grandchild".into()), Some(child.id), creator);
 
         let contexts = vec![root.clone(), child.clone(), grandchild.clone()];
         let chain = fork_lineage(&contexts, grandchild.id);
@@ -154,9 +144,8 @@ mod tests {
 
     #[test]
     fn test_fork_lineage_root_only() {
-        let kernel = KernelId::new();
         let creator = PrincipalId::new();
-        let root = Context::new(kernel, None, None, creator);
+        let root = Context::new(None, None, creator);
         let contexts = vec![root.clone()];
         let chain = fork_lineage(&contexts, root.id);
         assert_eq!(chain.len(), 1);
@@ -164,10 +153,9 @@ mod tests {
 
     #[test]
     fn test_fork_lineage_missing_parent() {
-        let kernel = KernelId::new();
         let creator = PrincipalId::new();
         // Child references a parent that doesn't exist in the list
-        let orphan = Context::new(kernel, None, Some(ContextId::new()), creator);
+        let orphan = Context::new(None, Some(ContextId::new()), creator);
         let contexts = vec![orphan.clone()];
         let chain = fork_lineage(&contexts, orphan.id);
         // Stops at the orphan since parent isn't found
@@ -176,9 +164,8 @@ mod tests {
 
     #[test]
     fn test_context_info_serde_roundtrip() {
-        let kernel = KernelId::new();
         let creator = PrincipalId::new();
-        let info = Context::new(kernel, Some("test".into()), None, creator);
+        let info = Context::new(Some("test".into()), None, creator);
         let json = serde_json::to_string(&info).unwrap();
         let parsed: Context = serde_json::from_str(&json).unwrap();
         assert_eq!(info, parsed);
@@ -186,9 +173,8 @@ mod tests {
 
     #[test]
     fn test_context_info_postcard_roundtrip() {
-        let kernel = KernelId::new();
         let creator = PrincipalId::new();
-        let info = Context::new(kernel, Some("test".into()), None, creator);
+        let info = Context::new(Some("test".into()), None, creator);
         let bytes = postcard::to_stdvec(&info).unwrap();
         let parsed: Context = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(info, parsed);
@@ -196,12 +182,11 @@ mod tests {
 
     #[test]
     fn test_fork_lineage_cycle_terminates() {
-        let kernel = KernelId::new();
         let creator = PrincipalId::new();
 
         // Manually construct a cycle: A → B → A
-        let mut a = Context::new(kernel, Some("a".into()), None, creator);
-        let b = Context::new(kernel, Some("b".into()), Some(a.id), creator);
+        let mut a = Context::new(Some("a".into()), None, creator);
+        let b = Context::new(Some("b".into()), Some(a.id), creator);
         // Create the cycle
         a.forked_from = Some(b.id);
 

@@ -63,7 +63,6 @@ pub type KernelDbResult<T> = Result<T, KernelDbError>;
 #[derive(Debug, Clone)]
 pub struct ContextRow {
     pub context_id: ContextId,
-    pub kernel_id: KernelId,
     pub label: Option<String>,
     pub provider: Option<String>,
     pub model: Option<String>,
@@ -85,7 +84,6 @@ impl ContextRow {
     pub fn to_context(&self) -> kaijutsu_types::Context {
         kaijutsu_types::Context {
             id: self.context_id,
-            kernel_id: self.kernel_id,
             label: self.label.clone(),
             forked_from: self.forked_from,
             created_by: self.created_by,
@@ -148,7 +146,6 @@ pub struct HookScriptRow {
 /// become blocks. Sort order is lexical on `(sort_key, name)`.
 #[derive(Debug, Clone)]
 pub struct RcScriptRow {
-    pub kernel_id: KernelId,
     pub context_type: String,
     pub verb: String,       // "create" | "fork" | "attach" | "drift"
     pub sort_key: String,   // e.g. "S05", "S010"
@@ -170,7 +167,6 @@ pub struct RcScriptRow {
 #[derive(Debug, Clone)]
 pub struct PresetRow {
     pub preset_id: PresetId,
-    pub kernel_id: KernelId,
     pub label: String,
     pub description: Option<String>,
     pub provider: Option<String>,
@@ -185,7 +181,6 @@ pub struct PresetRow {
 #[derive(Debug, Clone)]
 pub struct WorkspaceRow {
     pub workspace_id: WorkspaceId,
-    pub kernel_id: KernelId,
     pub label: String,
     pub description: Option<String>,
     pub created_at: i64,
@@ -206,7 +201,6 @@ pub struct WorkspacePathRow {
 #[derive(Debug, Clone)]
 pub struct DocumentRow {
     pub document_id: ContextId,
-    pub kernel_id: KernelId,
     pub workspace_id: WorkspaceId,
     pub doc_kind: DocKind,
     pub language: Option<String>,
@@ -269,24 +263,29 @@ pub struct ContextEdgeRow {
 // ============================================================================
 
 const SCHEMA: &str = r#"
--- ── Kernel Identity ─────────────────────────────────────────────
+-- ── Kernel Identity (singleton) ─────────────────────────────────
+-- One row per database. The `singleton` column + UNIQUE constraint
+-- pins the table to exactly one row; INSERT OR IGNORE on (singleton=1)
+-- makes first-open idempotent. No other table partitions by kernel —
+-- a database is one kernel.
 CREATE TABLE IF NOT EXISTS kernel (
-    kernel_id  BLOB NOT NULL PRIMARY KEY,
+    singleton  INTEGER NOT NULL PRIMARY KEY DEFAULT 1
+        CHECK (singleton = 1),
+    id         BLOB    NOT NULL UNIQUE,
+    founder    BLOB    NOT NULL,
+    label      TEXT,
     created_at INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER))
 );
 
 -- ── Workspaces ──────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS workspaces (
     workspace_id BLOB NOT NULL PRIMARY KEY,
-    kernel_id    BLOB NOT NULL,
-    label        TEXT NOT NULL,
+    label        TEXT NOT NULL UNIQUE,
     description  TEXT,
     created_at   INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
     created_by   BLOB NOT NULL,
     archived_at  INTEGER
 );
-CREATE UNIQUE INDEX IF NOT EXISTS idx_workspaces_label
-    ON workspaces(kernel_id, label);
 
 CREATE TABLE IF NOT EXISTS workspace_paths (
     workspace_id BLOB NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
@@ -299,8 +298,7 @@ CREATE TABLE IF NOT EXISTS workspace_paths (
 -- ── Presets ─────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS presets (
     preset_id    BLOB NOT NULL PRIMARY KEY,
-    kernel_id    BLOB NOT NULL,
-    label        TEXT NOT NULL,
+    label        TEXT NOT NULL UNIQUE,
     description  TEXT,
     provider     TEXT,
     model        TEXT,
@@ -309,13 +307,10 @@ CREATE TABLE IF NOT EXISTS presets (
     created_at   INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
     created_by   BLOB NOT NULL
 );
-CREATE UNIQUE INDEX IF NOT EXISTS idx_presets_label
-    ON presets(kernel_id, label);
 
 -- ── Documents (CRDT content layer) ─────────────────────────────
 CREATE TABLE IF NOT EXISTS documents (
     document_id  BLOB NOT NULL PRIMARY KEY,
-    kernel_id    BLOB NOT NULL,
     workspace_id BLOB NOT NULL REFERENCES workspaces(workspace_id) ON DELETE RESTRICT,
     doc_kind     TEXT NOT NULL DEFAULT 'conversation',
     language     TEXT,
@@ -323,12 +318,10 @@ CREATE TABLE IF NOT EXISTS documents (
     created_at   INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
     created_by   BLOB NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_documents_kernel
-    ON documents(kernel_id);
 CREATE INDEX IF NOT EXISTS idx_documents_workspace
     ON documents(workspace_id);
 CREATE INDEX IF NOT EXISTS idx_documents_kind
-    ON documents(kernel_id, doc_kind);
+    ON documents(doc_kind);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_path
     ON documents(workspace_id, path) WHERE path IS NOT NULL;
 
@@ -336,7 +329,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_path
 CREATE TABLE IF NOT EXISTS contexts (
     context_id   BLOB NOT NULL PRIMARY KEY
         REFERENCES documents(document_id) ON DELETE CASCADE,
-    kernel_id    BLOB NOT NULL,
     label        TEXT,
     provider     TEXT,
     model        TEXT,
@@ -353,9 +345,7 @@ CREATE TABLE IF NOT EXISTS contexts (
     preset_id    BLOB REFERENCES presets(preset_id) ON DELETE SET NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_contexts_label
-    ON contexts(kernel_id, label) WHERE label IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_contexts_kernel
-    ON contexts(kernel_id);
+    ON contexts(label) WHERE label IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_contexts_workspace
     ON contexts(workspace_id) WHERE workspace_id IS NOT NULL;
 
@@ -509,13 +499,12 @@ CREATE INDEX IF NOT EXISTS idx_hooks_phase_priority
 CREATE INDEX IF NOT EXISTS idx_hooks_kaish_script_id
     ON hooks(action_kaish_script_id);
 
--- ── Hook scripts (DB-global shared kaish bodies) ──────────────
+-- ── Hook scripts (shared kaish bodies) ────────────────────────
 -- Reusable kaish bodies for hooks. Hooks reference these by
 -- `script_id`; the body is resolved at broker hydrate time. Edits
 -- require re-hydration (kernel restart or future reload op) to
--- propagate to live entries. DB-global (matches the `hooks` table,
--- which also has no kernel_id column). Deletion fails if any hook
--- still references the script.
+-- propagate to live entries. Deletion fails if any hook still
+-- references the script.
 CREATE TABLE IF NOT EXISTS hook_scripts (
     script_id   TEXT    NOT NULL PRIMARY KEY,
     body        TEXT    NOT NULL,
@@ -532,16 +521,15 @@ CREATE TABLE IF NOT EXISTS hook_scripts (
 -- Run at context.create / fork / attach / drift moments. `.kai` files
 -- execute via kaish_kernel::Kernel::execute_with_vars; `.md` files are
 -- inserted as blocks. Scripts are ordered lexically by sort_key, then
--- name. Per-kernel scoping (kernel_id in PK) — not per-context.
+-- name.
 CREATE TABLE IF NOT EXISTS rc_scripts (
-    kernel_id    BLOB    NOT NULL,
     context_type TEXT    NOT NULL,
     verb         TEXT    NOT NULL,
     sort_key     TEXT    NOT NULL,
     name         TEXT    NOT NULL,
     extension    TEXT    NOT NULL,
     content      TEXT    NOT NULL,
-    path         TEXT    NOT NULL,
+    path         TEXT    NOT NULL UNIQUE,
     created_at   INTEGER NOT NULL
         DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
     created_by   BLOB    NOT NULL,
@@ -549,12 +537,8 @@ CREATE TABLE IF NOT EXISTS rc_scripts (
     -- back to TimeoutPolicy::rc_script_timeout (kernel-wide default).
     -- .md scripts ignore this column.
     timeout_secs INTEGER,
-    PRIMARY KEY (kernel_id, context_type, verb, sort_key, name)
+    PRIMARY KEY (context_type, verb, sort_key, name)
 );
-CREATE INDEX IF NOT EXISTS idx_rc_scripts_lookup
-    ON rc_scripts (kernel_id, context_type, verb, sort_key, name);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_rc_scripts_path
-    ON rc_scripts (kernel_id, path);
 
 -- ── Claude cache breakpoints (per-context policy) ───────────────
 -- Populated by rc lifecycle scripts (create/fork/drift) via the
@@ -612,17 +596,6 @@ fn read_opt_context_id(row: &rusqlite::Row<'_>, idx: usize) -> SqliteResult<Opti
         }),
         None => Ok(None),
     }
-}
-
-fn read_kernel_id(row: &rusqlite::Row<'_>, idx: usize) -> SqliteResult<KernelId> {
-    let bytes: Vec<u8> = row.get(idx)?;
-    KernelId::try_from_slice(&bytes).ok_or_else(|| {
-        rusqlite::Error::FromSqlConversionFailure(
-            idx,
-            rusqlite::types::Type::Blob,
-            "invalid KernelId bytes".into(),
-        )
-    })
 }
 
 fn read_principal_id(row: &rusqlite::Row<'_>, idx: usize) -> SqliteResult<PrincipalId> {
@@ -840,82 +813,18 @@ impl KernelDb {
         Ok(())
     }
 
-    /// Idempotent column migrations for existing databases.
-    ///
-    /// `CREATE TABLE IF NOT EXISTS` won't add columns to an existing table,
-    /// so new columns must be added via ALTER TABLE. Each migration checks
-    /// whether the column already exists before altering.
-    fn run_migrations(conn: &Connection) -> KernelDbResult<()> {
-        // 2026-03-27: add context_state column (ContextState enum)
-        let has_context_state: bool = conn
-            .prepare("SELECT context_state FROM contexts LIMIT 0")
-            .is_ok();
-        if !has_context_state {
-            info!("Migration: adding context_state column to contexts table");
-            conn.execute_batch(
-                "ALTER TABLE contexts ADD COLUMN context_state TEXT NOT NULL DEFAULT 'live';",
-            )?;
-        }
-        // 2026-05-02: add context_type column for rc lifecycle dispatch
-        let has_context_type: bool = conn
-            .prepare("SELECT context_type FROM contexts LIMIT 0")
-            .is_ok();
-        if !has_context_type {
-            info!("Migration: adding context_type column to contexts table");
-            conn.execute_batch(
-                "ALTER TABLE contexts ADD COLUMN context_type TEXT NOT NULL DEFAULT 'default';",
-            )?;
-        }
-        // 2026-05-02: rename hooks.action_kaish_script_id → action_kaish_body
-        // The column always held the kaish source body (the original
-        // "script_id" name presumed a script registry that never landed).
-        // SQLite ≥ 3.25 supports `ALTER TABLE ... RENAME COLUMN`.
-        let has_kaish_body: bool = conn
-            .prepare("SELECT action_kaish_body FROM hooks LIMIT 0")
-            .is_ok();
-        if !has_kaish_body {
-            info!("Migration: renaming hooks.action_kaish_script_id → action_kaish_body");
-            conn.execute_batch(
-                "ALTER TABLE hooks RENAME COLUMN action_kaish_script_id TO action_kaish_body;",
-            )?;
-        }
-        // 2026-05-15: add per-script wall-clock budget for rc_scripts.
-        // NULL = fall back to kernel TimeoutPolicy::rc_script_timeout.
-        let has_timeout_secs: bool = conn
-            .prepare("SELECT timeout_secs FROM rc_scripts LIMIT 0")
-            .is_ok();
-        if !has_timeout_secs {
-            info!("Migration: adding timeout_secs column to rc_scripts table");
-            conn.execute_batch(
-                "ALTER TABLE rc_scripts ADD COLUMN timeout_secs INTEGER;",
-            )?;
-        }
-        // 2026-05-15: hook_scripts table + hooks.action_kaish_script_id.
-        // Existing kaish hooks keep their inline `action_kaish_body`;
-        // new ones can opt into shared scripts by setting `action_
-        // kaish_script_id` instead.
-        let has_kaish_script_id: bool = conn
-            .prepare("SELECT action_kaish_script_id FROM hooks LIMIT 0")
-            .is_ok();
-        if !has_kaish_script_id {
-            info!("Migration: adding action_kaish_script_id column to hooks table");
-            conn.execute_batch(
-                "ALTER TABLE hooks ADD COLUMN action_kaish_script_id TEXT;",
-            )?;
-        }
-        Ok(())
-    }
-
     /// Open or create at the given path.
+    ///
+    /// The DB schema is the single source of truth — there are no
+    /// migrations. Bumping the schema requires wiping the DB.
     pub fn open<P: AsRef<Path>>(path: P) -> KernelDbResult<Self> {
         if let Some(parent) = path.as_ref().parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         let conn = Connection::open(path)?;
         Self::init_connection(&conn)?;
-        // Create workspaces/presets before contexts (FK refs).
         conn.execute_batch(SCHEMA)?;
-        Self::run_migrations(&conn)?;
+        Self::ensure_singleton_kernel(&conn)?;
         Ok(Self { conn })
     }
 
@@ -924,6 +833,7 @@ impl KernelDb {
         let conn = Connection::open_in_memory()?;
         Self::init_connection(&conn)?;
         conn.execute_batch(SCHEMA)?;
+        Self::ensure_singleton_kernel(&conn)?;
         Ok(Self { conn })
     }
 
@@ -931,77 +841,45 @@ impl KernelDb {
     // Kernel identity
     // ========================================================================
 
-    /// Get the persisted kernel ID, or create one if this is the first run.
-    ///
-    /// The kernel table holds a single row. On first open it's empty and we
-    /// insert a fresh KernelId. On subsequent startups we return the existing
-    /// one so that context rows (which reference kernel_id) remain joinable.
-    ///
-    /// **Migration:** If the kernel table is empty but contexts already exist
-    /// (pre-stable-ID era), adopts the most recent context's kernel_id so
-    /// existing context rows remain joinable without data loss.
-    pub fn get_or_create_kernel_id(&self) -> KernelDbResult<KernelId> {
-        let existing: Option<Vec<u8>> = self
-            .conn
-            .query_row("SELECT kernel_id FROM kernel LIMIT 1", [], |row| row.get(0))
-            .ok();
-
-        if let Some(bytes) = existing {
-            if let Some(id) = KernelId::try_from_slice(&bytes) {
-                return Ok(id);
-            }
-            // Corrupt row — fall through to create fresh
-            warn!("Corrupt kernel_id in kernel table, creating fresh");
-        }
-
-        // No kernel row yet. Check if contexts exist from a previous run
-        // (before the kernel table was added) and adopt their kernel_id.
-        let adopted: Option<Vec<u8>> = self
-            .conn
-            .query_row(
-                "SELECT kernel_id FROM contexts ORDER BY created_at DESC LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .ok();
-
-        let id = if let Some(bytes) = adopted {
-            if let Some(kid) = KernelId::try_from_slice(&bytes) {
-                info!("Adopted kernel_id {} from existing contexts", kid.to_hex());
-                kid
-            } else {
-                KernelId::new()
-            }
-        } else {
-            KernelId::new()
-        };
-
-        self.conn.execute(
-            "INSERT INTO kernel (kernel_id) VALUES (?1)",
-            params![blob_param(id.as_bytes())],
+    /// Create the singleton kernel row on first open. Subsequent opens
+    /// are no-ops because the row's `singleton` value is fixed at 1 and
+    /// `INSERT OR IGNORE` short-circuits on the PK conflict.
+    fn ensure_singleton_kernel(conn: &Connection) -> KernelDbResult<()> {
+        let id = KernelId::new();
+        let founder = PrincipalId::system();
+        conn.execute(
+            "INSERT OR IGNORE INTO kernel (singleton, id, founder, label)
+             VALUES (1, ?1, ?2, NULL)",
+            params![blob_param(id.as_bytes()), blob_param(founder.as_bytes())],
         )?;
+        Ok(())
+    }
 
-        // Warn if contexts reference multiple kernel_ids — needs manual cleanup
-        let distinct_count: u32 = self
+    /// The stable kernel ID for this database — written on first open,
+    /// immutable thereafter. Used by the wire `bind_kernel` / `ping`
+    /// handshake so clients can detect when they're talking to a
+    /// different kernel than the one they bound to.
+    pub fn kernel_id(&self) -> KernelDbResult<KernelId> {
+        let bytes: Vec<u8> = self
             .conn
-            .query_row(
-                "SELECT COUNT(DISTINCT kernel_id) FROM contexts",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-        if distinct_count > 1 {
-            warn!(
-                "contexts table has {} distinct kernel_ids — run \
-                 UPDATE contexts SET kernel_id = X'{}' WHERE kernel_id != X'{}' \
-                 to consolidate",
-                distinct_count,
-                id.to_hex(),
-                id.to_hex(),
-            );
-        }
+            .query_row("SELECT id FROM kernel WHERE singleton = 1", [], |row| {
+                row.get(0)
+            })?;
+        KernelId::try_from_slice(&bytes).ok_or_else(|| {
+            KernelDbError::Validation("kernel row holds invalid id bytes".to_string())
+        })
+    }
 
-        Ok(id)
+    /// Set or clear the kernel's human-friendly label.
+    pub fn set_kernel_label(&self, label: Option<&str>) -> KernelDbResult<()> {
+        if let Some(l) = label {
+            validate_label(l)?;
+        }
+        self.conn.execute(
+            "UPDATE kernel SET label = ?1 WHERE singleton = 1",
+            params![label],
+        )?;
+        Ok(())
     }
 
     // ========================================================================
@@ -1012,11 +890,9 @@ impl KernelDb {
     /// Returns the workspace ID.
     pub fn get_or_create_system_workspace(
         &self,
-        kernel_id: KernelId,
         created_by: PrincipalId,
     ) -> KernelDbResult<WorkspaceId> {
         self.get_or_create_builtin_workspace(
-            kernel_id,
             "__system",
             "System configuration documents",
             created_by,
@@ -1027,32 +903,24 @@ impl KernelDb {
     /// Returns the workspace ID.
     pub fn get_or_create_default_workspace(
         &self,
-        kernel_id: KernelId,
         created_by: PrincipalId,
     ) -> KernelDbResult<WorkspaceId> {
-        self.get_or_create_builtin_workspace(
-            kernel_id,
-            "__default",
-            "Default workspace",
-            created_by,
-        )
+        self.get_or_create_builtin_workspace("__default", "Default workspace", created_by)
     }
 
     /// Get or create a built-in workspace by label.
     fn get_or_create_builtin_workspace(
         &self,
-        kernel_id: KernelId,
         label: &str,
         description: &str,
         created_by: PrincipalId,
     ) -> KernelDbResult<WorkspaceId> {
-        if let Some(ws) = self.get_workspace_by_label(kernel_id, label)? {
+        if let Some(ws) = self.get_workspace_by_label(label)? {
             return Ok(ws.workspace_id);
         }
         let ws_id = WorkspaceId::new();
         let row = WorkspaceRow {
             workspace_id: ws_id,
-            kernel_id,
             label: label.to_string(),
             description: Some(description.to_string()),
             created_at: now_millis(),
@@ -1073,12 +941,11 @@ impl KernelDb {
         self.conn
             .execute(
                 "INSERT INTO documents (
-                document_id, kernel_id, workspace_id, doc_kind,
+                document_id, workspace_id, doc_kind,
                 language, path, created_at, created_by
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     blob_param(row.document_id.as_bytes()),
-                    blob_param(row.kernel_id.as_bytes()),
                     blob_param(row.workspace_id.as_bytes()),
                     row.doc_kind.as_str(),
                     row.language,
@@ -1095,12 +962,11 @@ impl KernelDb {
     pub fn insert_document_or_ignore(&self, row: &DocumentRow) -> KernelDbResult<()> {
         self.conn.execute(
             "INSERT OR IGNORE INTO documents (
-                document_id, kernel_id, workspace_id, doc_kind,
+                document_id, workspace_id, doc_kind,
                 language, path, created_at, created_by
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 blob_param(row.document_id.as_bytes()),
-                blob_param(row.kernel_id.as_bytes()),
                 blob_param(row.workspace_id.as_bytes()),
                 row.doc_kind.as_str(),
                 row.language,
@@ -1115,7 +981,7 @@ impl KernelDb {
     /// Get a document by ID.
     pub fn get_document(&self, id: ContextId) -> KernelDbResult<Option<DocumentRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT document_id, kernel_id, workspace_id, doc_kind,
+            "SELECT document_id, workspace_id, doc_kind,
                     language, path, created_at, created_by
              FROM documents WHERE document_id = ?1",
         )?;
@@ -1127,36 +993,27 @@ impl KernelDb {
         }
     }
 
-    /// List all documents for a kernel.
-    pub fn list_documents(&self, kernel_id: KernelId) -> KernelDbResult<Vec<DocumentRow>> {
+    /// List all documents in this kernel.
+    pub fn list_documents(&self) -> KernelDbResult<Vec<DocumentRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT document_id, kernel_id, workspace_id, doc_kind,
+            "SELECT document_id, workspace_id, doc_kind,
                     language, path, created_at, created_by
-             FROM documents WHERE kernel_id = ?1
+             FROM documents
              ORDER BY created_at",
         )?;
-        let rows = stmt.query_map(params![blob_param(kernel_id.as_bytes())], |row| {
-            row_to_document_row(row)
-        })?;
+        let rows = stmt.query_map([], |row| row_to_document_row(row))?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
     }
 
-    /// List documents filtered by kind for a kernel.
-    pub fn list_documents_by_kind(
-        &self,
-        kernel_id: KernelId,
-        kind: DocKind,
-    ) -> KernelDbResult<Vec<DocumentRow>> {
+    /// List documents filtered by kind.
+    pub fn list_documents_by_kind(&self, kind: DocKind) -> KernelDbResult<Vec<DocumentRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT document_id, kernel_id, workspace_id, doc_kind,
+            "SELECT document_id, workspace_id, doc_kind,
                     language, path, created_at, created_by
-             FROM documents WHERE kernel_id = ?1 AND doc_kind = ?2
+             FROM documents WHERE doc_kind = ?1
              ORDER BY created_at",
         )?;
-        let rows = stmt.query_map(
-            params![blob_param(kernel_id.as_bytes()), kind.as_str()],
-            row_to_document_row,
-        )?;
+        let rows = stmt.query_map(params![kind.as_str()], row_to_document_row)?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
     }
 
@@ -1346,20 +1203,13 @@ impl KernelDb {
     }
 
     /// List document IDs that have input oplog entries or snapshots.
-    pub fn list_input_doc_ids(
-        &self,
-        kernel_id: KernelId,
-    ) -> KernelDbResult<Vec<ContextId>> {
+    pub fn list_input_doc_ids(&self) -> KernelDbResult<Vec<ContextId>> {
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT d.document_id FROM documents d
-             WHERE d.kernel_id = ?1
-               AND (EXISTS (SELECT 1 FROM input_oplog o WHERE o.document_id = d.document_id)
-                 OR EXISTS (SELECT 1 FROM input_doc_snapshots s WHERE s.document_id = d.document_id))",
+             WHERE EXISTS (SELECT 1 FROM input_oplog o WHERE o.document_id = d.document_id)
+                OR EXISTS (SELECT 1 FROM input_doc_snapshots s WHERE s.document_id = d.document_id)",
         )?;
-        let rows = stmt.query_map(
-            params![blob_param(kernel_id.as_bytes())],
-            |row| read_context_id(row, 0),
-        )?;
+        let rows = stmt.query_map([], |row| read_context_id(row, 0))?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
     }
 
@@ -1379,7 +1229,6 @@ impl KernelDb {
         let ws_id = row.workspace_id.unwrap_or(default_workspace_id);
         self.insert_document_or_ignore(&DocumentRow {
             document_id: row.context_id,
-            kernel_id: row.kernel_id,
             workspace_id: ws_id,
             doc_kind: DocKind::Conversation,
             language: None,
@@ -1401,19 +1250,18 @@ impl KernelDb {
         self.conn
             .execute(
                 "INSERT INTO contexts (
-                context_id, kernel_id, label, provider, model,
+                context_id, label, provider, model,
                 system_prompt, consent_mode, context_state, context_type,
                 created_at, created_by, forked_from, fork_kind,
                 archived_at, workspace_id, preset_id
             ) VALUES (
-                ?1, ?2, ?3, ?4, ?5,
-                ?6, ?7, ?8, ?9, ?10,
-                ?11, ?12, ?13,
-                ?14, ?15, ?16
+                ?1, ?2, ?3, ?4,
+                ?5, ?6, ?7, ?8, ?9,
+                ?10, ?11, ?12,
+                ?13, ?14, ?15
             )",
                 params![
                     blob_param(row.context_id.as_bytes()),
-                    blob_param(row.kernel_id.as_bytes()),
                     row.label,
                     row.provider,
                     row.model,
@@ -1443,7 +1291,7 @@ impl KernelDb {
     /// Get a context by ID.
     pub fn get_context(&self, id: ContextId) -> KernelDbResult<Option<ContextRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT context_id, kernel_id, label, provider, model,
+            "SELECT context_id, label, provider, model,
                     system_prompt, consent_mode, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id
@@ -1580,49 +1428,44 @@ impl KernelDb {
         Ok(updated > 0)
     }
 
-    /// List active (non-archived) contexts for a kernel.
-    pub fn list_active_contexts(&self, kernel_id: KernelId) -> KernelDbResult<Vec<ContextRow>> {
+    /// List active (non-archived) contexts.
+    pub fn list_active_contexts(&self) -> KernelDbResult<Vec<ContextRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT context_id, kernel_id, label, provider, model,
+            "SELECT context_id, label, provider, model,
                     system_prompt, consent_mode, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id
              FROM contexts
-             WHERE kernel_id = ?1 AND archived_at IS NULL
+             WHERE archived_at IS NULL
              ORDER BY created_at",
         )?;
 
-        let rows = stmt.query_map(params![blob_param(kernel_id.as_bytes())], |row| {
-            row_to_context_row(row)
-        })?;
+        let rows = stmt.query_map([], |row| row_to_context_row(row))?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
     }
 
-    /// List all contexts for a kernel (including archived).
-    pub fn list_all_contexts(&self, kernel_id: KernelId) -> KernelDbResult<Vec<ContextRow>> {
+    /// List all contexts (including archived).
+    pub fn list_all_contexts(&self) -> KernelDbResult<Vec<ContextRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT context_id, kernel_id, label, provider, model,
+            "SELECT context_id, label, provider, model,
                     system_prompt, consent_mode, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id
              FROM contexts
-             WHERE kernel_id = ?1
              ORDER BY created_at",
         )?;
 
-        let rows = stmt.query_map(params![blob_param(kernel_id.as_bytes())], |row| {
-            row_to_context_row(row)
-        })?;
+        let rows = stmt.query_map([], |row| row_to_context_row(row))?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
     }
 
-    /// Resolve a context query string within a kernel.
+    /// Resolve a context query string.
     ///
     /// Supports exact label, label prefix, hex prefix. For tag:prefix syntax
     /// (future), walks lineage via CTE.
-    pub fn resolve_context(&self, kernel_id: KernelId, query: &str) -> KernelDbResult<ContextId> {
-        // Load active contexts for this kernel (set is small, <100)
-        let contexts = self.list_active_contexts(kernel_id)?;
+    pub fn resolve_context(&self, query: &str) -> KernelDbResult<ContextId> {
+        // Load active contexts (set is small, <100)
+        let contexts = self.list_active_contexts()?;
         let items = contexts.iter().map(|c| (c.context_id, c.label.as_deref()));
 
         kaijutsu_types::resolve_prefix(items, query).map_err(|e| match e {
@@ -1641,7 +1484,7 @@ impl KernelDb {
     /// Get structural parents of a context.
     pub fn structural_parents(&self, id: ContextId) -> KernelDbResult<Vec<ContextRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT c.context_id, c.kernel_id, c.label, c.provider, c.model,
+            "SELECT c.context_id, c.label, c.provider, c.model,
                     c.system_prompt, c.consent_mode, c.context_state, c.context_type,
                     c.created_at, c.created_by, c.forked_from, c.fork_kind,
                     c.archived_at, c.workspace_id, c.preset_id
@@ -1659,7 +1502,7 @@ impl KernelDb {
     /// Get active structural children of a context.
     pub fn structural_children(&self, id: ContextId) -> KernelDbResult<Vec<ContextRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT c.context_id, c.kernel_id, c.label, c.provider, c.model,
+            "SELECT c.context_id, c.label, c.provider, c.model,
                     c.system_prompt, c.consent_mode, c.context_state, c.context_type,
                     c.created_at, c.created_by, c.forked_from, c.fork_kind,
                     c.archived_at, c.workspace_id, c.preset_id
@@ -1675,17 +1518,16 @@ impl KernelDb {
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
     }
 
-    /// Walk the full context DAG for a kernel via recursive CTE on structural edges.
+    /// Walk the full context DAG via recursive CTE on structural edges.
     /// Returns `(ContextRow, depth)` pairs.
-    pub fn context_dag(&self, kernel_id: KernelId) -> KernelDbResult<Vec<(ContextRow, i64)>> {
-        // Find roots: contexts in this kernel with no incoming structural edges.
+    pub fn context_dag(&self) -> KernelDbResult<Vec<(ContextRow, i64)>> {
+        // Find roots: contexts with no incoming structural edges.
         let mut stmt = self.conn.prepare(
             "WITH RECURSIVE dag(ctx_id, depth) AS (
-                -- Roots: contexts with no incoming structural edges in this kernel
+                -- Roots: contexts with no incoming structural edges
                 SELECT c.context_id, 0
                 FROM contexts c
-                WHERE c.kernel_id = ?1
-                  AND c.archived_at IS NULL
+                WHERE c.archived_at IS NULL
                   AND NOT EXISTS (
                       SELECT 1 FROM context_edges e
                       WHERE e.target_id = c.context_id AND e.kind = 'structural'
@@ -1697,7 +1539,7 @@ impl KernelDb {
                 JOIN context_edges e ON e.source_id = dag.ctx_id AND e.kind = 'structural'
                 JOIN contexts c2 ON c2.context_id = e.target_id AND c2.archived_at IS NULL
             )
-            SELECT c.context_id, c.kernel_id, c.label, c.provider, c.model,
+            SELECT c.context_id, c.label, c.provider, c.model,
                    c.system_prompt, c.consent_mode, c.context_state, c.context_type,
                    c.created_at, c.created_by, c.forked_from, c.fork_kind,
                    c.archived_at, c.workspace_id, c.preset_id,
@@ -1707,9 +1549,9 @@ impl KernelDb {
             ORDER BY dag.depth, c.created_at",
         )?;
 
-        let rows = stmt.query_map(params![blob_param(kernel_id.as_bytes())], |row| {
+        let rows = stmt.query_map([], |row| {
             let ctx = row_to_context_row(row)?;
-            let depth: i64 = row.get(16)?;
+            let depth: i64 = row.get(15)?;
             Ok((ctx, depth))
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
@@ -1727,7 +1569,7 @@ impl KernelDb {
                 JOIN contexts c ON c.context_id = lineage.ctx_id
                 WHERE c.forked_from IS NOT NULL
             )
-            SELECT c.context_id, c.kernel_id, c.label, c.provider, c.model,
+            SELECT c.context_id, c.label, c.provider, c.model,
                    c.system_prompt, c.consent_mode, c.context_state, c.context_type,
                    c.created_at, c.created_by, c.forked_from, c.fork_kind,
                    c.archived_at, c.workspace_id, c.preset_id,
@@ -1739,7 +1581,7 @@ impl KernelDb {
 
         let rows = stmt.query_map(params![blob_param(context_id.as_bytes())], |row| {
             let ctx = row_to_context_row(row)?;
-            let depth: i64 = row.get(16)?;
+            let depth: i64 = row.get(15)?;
             Ok((ctx, depth))
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
@@ -1756,7 +1598,7 @@ impl KernelDb {
                 FROM subtree
                 JOIN context_edges e ON e.source_id = subtree.ctx_id AND e.kind = 'structural'
             )
-            SELECT c.context_id, c.kernel_id, c.label, c.provider, c.model,
+            SELECT c.context_id, c.label, c.provider, c.model,
                    c.system_prompt, c.consent_mode, c.context_state, c.context_type,
                    c.created_at, c.created_by, c.forked_from, c.fork_kind,
                    c.archived_at, c.workspace_id, c.preset_id,
@@ -1768,7 +1610,7 @@ impl KernelDb {
 
         let rows = stmt.query_map(params![blob_param(root_id.as_bytes())], |row| {
             let ctx = row_to_context_row(row)?;
-            let depth: i64 = row.get(16)?;
+            let depth: i64 = row.get(15)?;
             Ok((ctx, depth))
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
@@ -1935,12 +1777,11 @@ impl KernelDb {
         self.conn
             .execute(
                 "INSERT INTO presets (
-                preset_id, kernel_id, label, description, provider, model,
+                preset_id, label, description, provider, model,
                 system_prompt, consent_mode, created_at, created_by
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     blob_param(row.preset_id.as_bytes()),
-                    blob_param(row.kernel_id.as_bytes()),
                     row.label,
                     row.description,
                     row.provider,
@@ -1960,7 +1801,7 @@ impl KernelDb {
     /// Get a preset by ID.
     pub fn get_preset(&self, id: PresetId) -> KernelDbResult<Option<PresetRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT preset_id, kernel_id, label, description, provider, model,
+            "SELECT preset_id, label, description, provider, model,
                     system_prompt, consent_mode, created_at, created_by
              FROM presets WHERE preset_id = ?1",
         )?;
@@ -1973,19 +1814,15 @@ impl KernelDb {
         }
     }
 
-    /// Get a preset by kernel + label.
-    pub fn get_preset_by_label(
-        &self,
-        kernel_id: KernelId,
-        label: &str,
-    ) -> KernelDbResult<Option<PresetRow>> {
+    /// Get a preset by label.
+    pub fn get_preset_by_label(&self, label: &str) -> KernelDbResult<Option<PresetRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT preset_id, kernel_id, label, description, provider, model,
+            "SELECT preset_id, label, description, provider, model,
                     system_prompt, consent_mode, created_at, created_by
-             FROM presets WHERE kernel_id = ?1 AND label = ?2",
+             FROM presets WHERE label = ?1",
         )?;
 
-        let mut rows = stmt.query(params![blob_param(kernel_id.as_bytes()), label])?;
+        let mut rows = stmt.query(params![label])?;
         if let Some(row) = rows.next()? {
             Ok(Some(row_to_preset_row(row)?))
         } else {
@@ -1993,18 +1830,16 @@ impl KernelDb {
         }
     }
 
-    /// List all presets for a kernel.
-    pub fn list_presets(&self, kernel_id: KernelId) -> KernelDbResult<Vec<PresetRow>> {
+    /// List all presets.
+    pub fn list_presets(&self) -> KernelDbResult<Vec<PresetRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT preset_id, kernel_id, label, description, provider, model,
+            "SELECT preset_id, label, description, provider, model,
                     system_prompt, consent_mode, created_at, created_by
-             FROM presets WHERE kernel_id = ?1
+             FROM presets
              ORDER BY label",
         )?;
 
-        let rows = stmt.query_map(params![blob_param(kernel_id.as_bytes())], |row| {
-            row_to_preset_row(row)
-        })?;
+        let rows = stmt.query_map([], |row| row_to_preset_row(row))?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
     }
 
@@ -2058,12 +1893,11 @@ impl KernelDb {
         self.conn
             .execute(
                 "INSERT INTO rc_scripts (
-                    kernel_id, context_type, verb, sort_key, name,
+                    context_type, verb, sort_key, name,
                     extension, content, path, created_at, created_by,
                     timeout_secs
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
-                    blob_param(row.kernel_id.as_bytes()),
                     row.context_type,
                     row.verb,
                     row.sort_key,
@@ -2081,19 +1915,15 @@ impl KernelDb {
     }
 
     /// Look up a single rc script by canonical path.
-    pub fn get_rc_script(
-        &self,
-        kernel_id: KernelId,
-        path: &str,
-    ) -> KernelDbResult<Option<RcScriptRow>> {
+    pub fn get_rc_script(&self, path: &str) -> KernelDbResult<Option<RcScriptRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT kernel_id, context_type, verb, sort_key, name,
+            "SELECT context_type, verb, sort_key, name,
                     extension, content, path, created_at, created_by,
                     timeout_secs
              FROM rc_scripts
-             WHERE kernel_id = ?1 AND path = ?2",
+             WHERE path = ?1",
         )?;
-        let mut rows = stmt.query(params![blob_param(kernel_id.as_bytes()), path])?;
+        let mut rows = stmt.query(params![path])?;
         if let Some(row) = rows.next()? {
             Ok(Some(row_to_rc_script_row(row)?))
         } else {
@@ -2106,47 +1936,39 @@ impl KernelDb {
     /// for any given verb.
     pub fn list_rc_scripts(
         &self,
-        kernel_id: KernelId,
         context_type: &str,
         verb: &str,
     ) -> KernelDbResult<Vec<RcScriptRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT kernel_id, context_type, verb, sort_key, name,
+            "SELECT context_type, verb, sort_key, name,
                     extension, content, path, created_at, created_by,
                     timeout_secs
              FROM rc_scripts
-             WHERE kernel_id = ?1 AND context_type = ?2 AND verb = ?3
+             WHERE context_type = ?1 AND verb = ?2
              ORDER BY sort_key ASC, name ASC",
         )?;
-        let rows = stmt.query_map(
-            params![blob_param(kernel_id.as_bytes()), context_type, verb],
-            row_to_rc_script_row,
-        )?;
+        let rows = stmt.query_map(params![context_type, verb], row_to_rc_script_row)?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
     }
 
-    /// List every rc script for a kernel (admin / `kj rc list`).
-    pub fn list_rc_scripts_all(&self, kernel_id: KernelId) -> KernelDbResult<Vec<RcScriptRow>> {
+    /// List every rc script (admin / `kj rc list`).
+    pub fn list_rc_scripts_all(&self) -> KernelDbResult<Vec<RcScriptRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT kernel_id, context_type, verb, sort_key, name,
+            "SELECT context_type, verb, sort_key, name,
                     extension, content, path, created_at, created_by,
                     timeout_secs
              FROM rc_scripts
-             WHERE kernel_id = ?1
              ORDER BY context_type ASC, verb ASC, sort_key ASC, name ASC",
         )?;
-        let rows = stmt.query_map(
-            params![blob_param(kernel_id.as_bytes())],
-            row_to_rc_script_row,
-        )?;
+        let rows = stmt.query_map([], row_to_rc_script_row)?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
     }
 
     /// Delete an rc script by path. Returns true if it existed.
-    pub fn delete_rc_script(&self, kernel_id: KernelId, path: &str) -> KernelDbResult<bool> {
+    pub fn delete_rc_script(&self, path: &str) -> KernelDbResult<bool> {
         let deleted = self.conn.execute(
-            "DELETE FROM rc_scripts WHERE kernel_id = ?1 AND path = ?2",
-            params![blob_param(kernel_id.as_bytes()), path],
+            "DELETE FROM rc_scripts WHERE path = ?1",
+            params![path],
         )?;
         Ok(deleted > 0)
     }
@@ -2162,12 +1984,11 @@ impl KernelDb {
         self.conn
             .execute(
                 "INSERT INTO workspaces (
-                workspace_id, kernel_id, label, description, created_at,
+                workspace_id, label, description, created_at,
                 created_by, archived_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     blob_param(row.workspace_id.as_bytes()),
-                    blob_param(row.kernel_id.as_bytes()),
                     row.label,
                     row.description,
                     row.created_at,
@@ -2184,7 +2005,7 @@ impl KernelDb {
     /// Get a workspace by ID.
     pub fn get_workspace(&self, id: WorkspaceId) -> KernelDbResult<Option<WorkspaceRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT workspace_id, kernel_id, label, description, created_at,
+            "SELECT workspace_id, label, description, created_at,
                     created_by, archived_at
              FROM workspaces WHERE workspace_id = ?1",
         )?;
@@ -2197,19 +2018,15 @@ impl KernelDb {
         }
     }
 
-    /// Get a workspace by kernel + label.
-    pub fn get_workspace_by_label(
-        &self,
-        kernel_id: KernelId,
-        label: &str,
-    ) -> KernelDbResult<Option<WorkspaceRow>> {
+    /// Get a workspace by label.
+    pub fn get_workspace_by_label(&self, label: &str) -> KernelDbResult<Option<WorkspaceRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT workspace_id, kernel_id, label, description, created_at,
+            "SELECT workspace_id, label, description, created_at,
                     created_by, archived_at
-             FROM workspaces WHERE kernel_id = ?1 AND label = ?2",
+             FROM workspaces WHERE label = ?1",
         )?;
 
-        let mut rows = stmt.query(params![blob_param(kernel_id.as_bytes()), label])?;
+        let mut rows = stmt.query(params![label])?;
         if let Some(row) = rows.next()? {
             Ok(Some(row_to_workspace_row(row)?))
         } else {
@@ -2217,35 +2034,30 @@ impl KernelDb {
         }
     }
 
-    /// List active (non-archived) workspaces for a kernel.
-    pub fn list_workspaces(&self, kernel_id: KernelId) -> KernelDbResult<Vec<WorkspaceRow>> {
+    /// List active (non-archived) workspaces.
+    pub fn list_workspaces(&self) -> KernelDbResult<Vec<WorkspaceRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT workspace_id, kernel_id, label, description, created_at,
+            "SELECT workspace_id, label, description, created_at,
                     created_by, archived_at
              FROM workspaces
-             WHERE kernel_id = ?1 AND archived_at IS NULL
+             WHERE archived_at IS NULL
              ORDER BY label",
         )?;
 
-        let rows = stmt.query_map(params![blob_param(kernel_id.as_bytes())], |row| {
-            row_to_workspace_row(row)
-        })?;
+        let rows = stmt.query_map([], |row| row_to_workspace_row(row))?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
     }
 
-    /// List all workspaces for a kernel (including archived).
-    pub fn list_all_workspaces(&self, kernel_id: KernelId) -> KernelDbResult<Vec<WorkspaceRow>> {
+    /// List all workspaces (including archived).
+    pub fn list_all_workspaces(&self) -> KernelDbResult<Vec<WorkspaceRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT workspace_id, kernel_id, label, description, created_at,
+            "SELECT workspace_id, label, description, created_at,
                     created_by, archived_at
              FROM workspaces
-             WHERE kernel_id = ?1
              ORDER BY label",
         )?;
 
-        let rows = stmt.query_map(params![blob_param(kernel_id.as_bytes())], |row| {
-            row_to_workspace_row(row)
-        })?;
+        let rows = stmt.query_map([], |row| row_to_workspace_row(row))?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
     }
 
@@ -3017,56 +2829,38 @@ impl KernelDb {
     }
 
     /// Count contexts using a specific preset.
-    pub fn contexts_using_preset(
-        &self,
-        kernel_id: KernelId,
-        preset_id: PresetId,
-    ) -> KernelDbResult<usize> {
+    pub fn contexts_using_preset(&self, preset_id: PresetId) -> KernelDbResult<usize> {
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM contexts
-             WHERE kernel_id = ?1 AND preset_id = ?2 AND archived_at IS NULL",
-            params![
-                blob_param(kernel_id.as_bytes()),
-                blob_param(preset_id.as_bytes())
-            ],
+             WHERE preset_id = ?1 AND archived_at IS NULL",
+            params![blob_param(preset_id.as_bytes())],
             |row| row.get(0),
         )?;
         Ok(count as usize)
     }
 
     /// Count contexts using a specific workspace.
-    pub fn contexts_using_workspace(
-        &self,
-        kernel_id: KernelId,
-        workspace_id: WorkspaceId,
-    ) -> KernelDbResult<usize> {
+    pub fn contexts_using_workspace(&self, workspace_id: WorkspaceId) -> KernelDbResult<usize> {
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM contexts
-             WHERE kernel_id = ?1 AND workspace_id = ?2 AND archived_at IS NULL",
-            params![
-                blob_param(kernel_id.as_bytes()),
-                blob_param(workspace_id.as_bytes())
-            ],
+             WHERE workspace_id = ?1 AND archived_at IS NULL",
+            params![blob_param(workspace_id.as_bytes())],
             |row| row.get(0),
         )?;
         Ok(count as usize)
     }
 
     /// Find the context that currently holds a given label.
-    pub fn find_context_by_label(
-        &self,
-        kernel_id: KernelId,
-        label: &str,
-    ) -> KernelDbResult<Option<ContextRow>> {
+    pub fn find_context_by_label(&self, label: &str) -> KernelDbResult<Option<ContextRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT context_id, kernel_id, label, provider, model,
+            "SELECT context_id, label, provider, model,
                     system_prompt, consent_mode, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id
-             FROM contexts WHERE kernel_id = ?1 AND label = ?2",
+             FROM contexts WHERE label = ?1",
         )?;
 
-        let mut rows = stmt.query(params![blob_param(kernel_id.as_bytes()), label])?;
+        let mut rows = stmt.query(params![label])?;
         if let Some(row) = rows.next()? {
             Ok(Some(row_to_context_row(row)?))
         } else {
@@ -3080,41 +2874,39 @@ impl KernelDb {
 // ============================================================================
 
 fn row_to_document_row(row: &rusqlite::Row<'_>) -> SqliteResult<DocumentRow> {
-    let kind_str: String = row.get(3)?;
+    let kind_str: String = row.get(2)?;
     Ok(DocumentRow {
         document_id: read_context_id(row, 0)?,
-        kernel_id: read_kernel_id(row, 1)?,
-        workspace_id: read_workspace_id(row, 2)?,
+        workspace_id: read_workspace_id(row, 1)?,
         doc_kind: doc_kind_from_sql(&kind_str),
-        language: row.get(4)?,
-        path: row.get(5)?,
-        created_at: row.get(6)?,
-        created_by: read_principal_id(row, 7)?,
+        language: row.get(3)?,
+        path: row.get(4)?,
+        created_at: row.get(5)?,
+        created_by: read_principal_id(row, 6)?,
     })
 }
 
 fn row_to_context_row(row: &rusqlite::Row<'_>) -> SqliteResult<ContextRow> {
-    let consent_str: String = row.get(6)?;
-    let state_str: String = row.get(7)?;
-    let fork_kind_str: Option<String> = row.get(12)?;
+    let consent_str: String = row.get(5)?;
+    let state_str: String = row.get(6)?;
+    let fork_kind_str: Option<String> = row.get(11)?;
 
     Ok(ContextRow {
         context_id: read_context_id(row, 0)?,
-        kernel_id: read_kernel_id(row, 1)?,
-        label: row.get(2)?,
-        provider: row.get(3)?,
-        model: row.get(4)?,
-        system_prompt: row.get(5)?,
+        label: row.get(1)?,
+        provider: row.get(2)?,
+        model: row.get(3)?,
+        system_prompt: row.get(4)?,
         consent_mode: consent_mode_from_sql(&consent_str),
         context_state: context_state_from_sql(&state_str),
-        context_type: row.get(8)?,
-        created_at: row.get(9)?,
-        created_by: read_principal_id(row, 10)?,
-        forked_from: read_opt_context_id(row, 11)?,
+        context_type: row.get(7)?,
+        created_at: row.get(8)?,
+        created_by: read_principal_id(row, 9)?,
+        forked_from: read_opt_context_id(row, 10)?,
         fork_kind: fork_kind_from_sql(fork_kind_str),
-        archived_at: row.get(13)?,
-        workspace_id: read_opt_workspace_id(row, 14)?,
-        preset_id: read_opt_preset_id(row, 15)?,
+        archived_at: row.get(12)?,
+        workspace_id: read_opt_workspace_id(row, 13)?,
+        preset_id: read_opt_preset_id(row, 14)?,
     })
 }
 
@@ -3131,35 +2923,33 @@ fn row_to_edge_row(row: &rusqlite::Row<'_>) -> SqliteResult<ContextEdgeRow> {
 }
 
 fn row_to_preset_row(row: &rusqlite::Row<'_>) -> SqliteResult<PresetRow> {
-    let consent_str: String = row.get(7)?;
+    let consent_str: String = row.get(6)?;
 
     Ok(PresetRow {
         preset_id: read_preset_id(row, 0)?,
-        kernel_id: read_kernel_id(row, 1)?,
-        label: row.get(2)?,
-        description: row.get(3)?,
-        provider: row.get(4)?,
-        model: row.get(5)?,
-        system_prompt: row.get(6)?,
+        label: row.get(1)?,
+        description: row.get(2)?,
+        provider: row.get(3)?,
+        model: row.get(4)?,
+        system_prompt: row.get(5)?,
         consent_mode: consent_mode_from_sql(&consent_str),
-        created_at: row.get(8)?,
-        created_by: read_principal_id(row, 9)?,
+        created_at: row.get(7)?,
+        created_by: read_principal_id(row, 8)?,
     })
 }
 
 fn row_to_rc_script_row(row: &rusqlite::Row<'_>) -> SqliteResult<RcScriptRow> {
     Ok(RcScriptRow {
-        kernel_id: read_kernel_id(row, 0)?,
-        context_type: row.get(1)?,
-        verb: row.get(2)?,
-        sort_key: row.get(3)?,
-        name: row.get(4)?,
-        extension: row.get(5)?,
-        content: row.get(6)?,
-        path: row.get(7)?,
-        created_at: row.get(8)?,
-        created_by: read_principal_id(row, 9)?,
-        timeout_secs: row.get(10)?,
+        context_type: row.get(0)?,
+        verb: row.get(1)?,
+        sort_key: row.get(2)?,
+        name: row.get(3)?,
+        extension: row.get(4)?,
+        content: row.get(5)?,
+        path: row.get(6)?,
+        created_at: row.get(7)?,
+        created_by: read_principal_id(row, 8)?,
+        timeout_secs: row.get(9)?,
     })
 }
 
@@ -3177,12 +2967,11 @@ fn row_to_hook_script_row(row: &rusqlite::Row<'_>) -> SqliteResult<HookScriptRow
 fn row_to_workspace_row(row: &rusqlite::Row<'_>) -> SqliteResult<WorkspaceRow> {
     Ok(WorkspaceRow {
         workspace_id: read_workspace_id(row, 0)?,
-        kernel_id: read_kernel_id(row, 1)?,
-        label: row.get(2)?,
-        description: row.get(3)?,
-        created_at: row.get(4)?,
-        created_by: read_principal_id(row, 5)?,
-        archived_at: row.get(6)?,
+        label: row.get(1)?,
+        description: row.get(2)?,
+        created_at: row.get(3)?,
+        created_by: read_principal_id(row, 4)?,
+        archived_at: row.get(5)?,
     })
 }
 
@@ -3191,10 +2980,9 @@ fn row_to_workspace_row(row: &rusqlite::Row<'_>) -> SqliteResult<WorkspaceRow> {
 // ============================================================================
 
 #[cfg(test)]
-fn make_context_row(kernel_id: KernelId, label: Option<&str>) -> ContextRow {
+fn make_context_row(label: Option<&str>) -> ContextRow {
     ContextRow {
         context_id: ContextId::new(),
-        kernel_id,
         label: label.map(String::from),
         provider: None,
         model: None,
@@ -3218,7 +3006,6 @@ fn make_context_row(kernel_id: KernelId, label: Option<&str>) -> ContextRow {
 fn insert_context_with_doc(db: &KernelDb, row: &ContextRow, ws_id: WorkspaceId) {
     db.insert_document(&DocumentRow {
         document_id: row.context_id,
-        kernel_id: row.kernel_id,
         workspace_id: ws_id,
         doc_kind: DocKind::Conversation,
         language: None,
@@ -3230,13 +3017,11 @@ fn insert_context_with_doc(db: &KernelDb, row: &ContextRow, ws_id: WorkspaceId) 
     db.insert_context(row).unwrap();
 }
 
-/// Set up a test DB with kernel + default workspace. Returns (KernelId, WorkspaceId).
+/// Set up a test DB with the default workspace. Returns its WorkspaceId.
 #[cfg(test)]
-fn setup_test_db(db: &KernelDb) -> (KernelId, WorkspaceId) {
-    let kid = KernelId::new();
-    let creator = PrincipalId::system();
-    let ws_id = db.get_or_create_default_workspace(kid, creator).unwrap();
-    (kid, ws_id)
+fn setup_test_db(db: &KernelDb) -> WorkspaceId {
+    db.get_or_create_default_workspace(PrincipalId::system())
+        .unwrap()
 }
 
 #[cfg(test)]
@@ -3273,8 +3058,8 @@ mod tests {
     #[test]
     fn context_lifecycle() {
         let db = KernelDb::in_memory().unwrap();
-        let (kid, ws_id) = setup_test_db(&db);
-        let row = make_context_row(kid, Some("main"));
+        let ws_id = setup_test_db(&db);
+        let row = make_context_row(Some("main"));
         let cid = row.context_id;
 
         insert_context_with_doc(&db, &row, ws_id);
@@ -3292,11 +3077,11 @@ mod tests {
         assert!(db.archive_context(cid).unwrap());
 
         // list_active excludes
-        let active = db.list_active_contexts(kid).unwrap();
+        let active = db.list_active_contexts().unwrap();
         assert!(active.is_empty());
 
         // list_all includes
-        let all = db.list_all_contexts(kid).unwrap();
+        let all = db.list_all_contexts().unwrap();
         assert_eq!(all.len(), 1);
         assert!(all[0].archived_at.is_some());
     }
@@ -3306,8 +3091,7 @@ mod tests {
     #[test]
     fn label_validation_colon() {
         let db = KernelDb::in_memory().unwrap();
-        let kid = KernelId::new();
-        let row = make_context_row(kid, Some("my:label"));
+        let row = make_context_row(Some("my:label"));
 
         let err = db.insert_context(&row).unwrap_err();
         assert!(matches!(err, KernelDbError::InvalidLabel(_)));
@@ -3318,16 +3102,16 @@ mod tests {
     #[test]
     fn label_uniqueness() {
         let db = KernelDb::in_memory().unwrap();
-        let (kid, ws_id) = setup_test_db(&db);
+        let ws_id = setup_test_db(&db);
 
-        let row1 = make_context_row(kid, Some("shared"));
+        let row1 = make_context_row(Some("shared"));
         insert_context_with_doc(&db, &row1, ws_id);
 
-        // Same kernel, same label → conflict (doc insert ok, context label conflicts)
-        let row2 = make_context_row(kid, Some("shared"));
+        // Same label → conflict (doc insert ok, context label conflicts).
+        // Labels are globally unique within the kernel.
+        let row2 = make_context_row(Some("shared"));
         db.insert_document(&DocumentRow {
             document_id: row2.context_id,
-            kernel_id: kid,
             workspace_id: ws_id,
             doc_kind: DocKind::Conversation,
             language: None,
@@ -3339,17 +3123,9 @@ mod tests {
         let err = db.insert_context(&row2).unwrap_err();
         assert!(matches!(err, KernelDbError::LabelConflict(_)));
 
-        // Different kernel, same label → OK (needs its own workspace)
-        let kid2 = KernelId::new();
-        let ws_id2 = db
-            .get_or_create_default_workspace(kid2, PrincipalId::system())
-            .unwrap();
-        let row3 = make_context_row(kid2, Some("shared"));
-        insert_context_with_doc(&db, &row3, ws_id2);
-
-        // NULL + NULL → OK (multiple)
-        let n1 = make_context_row(kid, None);
-        let n2 = make_context_row(kid, None);
+        // NULL + NULL → OK (multiple unlabeled contexts allowed)
+        let n1 = make_context_row(None);
+        let n2 = make_context_row(None);
         insert_context_with_doc(&db, &n1, ws_id);
         insert_context_with_doc(&db, &n2, ws_id);
     }
@@ -3359,17 +3135,17 @@ mod tests {
     #[test]
     fn fork_lineage_3_deep() {
         let db = KernelDb::in_memory().unwrap();
-        let (kid, ws_id) = setup_test_db(&db);
+        let ws_id = setup_test_db(&db);
 
-        let root = make_context_row(kid, Some("root"));
+        let root = make_context_row(Some("root"));
         insert_context_with_doc(&db, &root, ws_id);
 
-        let mut child = make_context_row(kid, Some("child"));
+        let mut child = make_context_row(Some("child"));
         child.forked_from = Some(root.context_id);
         child.fork_kind = Some(ForkKind::Full);
         insert_context_with_doc(&db, &child, ws_id);
 
-        let mut grandchild = make_context_row(kid, Some("grandchild"));
+        let mut grandchild = make_context_row(Some("grandchild"));
         grandchild.forked_from = Some(child.context_id);
         grandchild.fork_kind = Some(ForkKind::Shallow);
         insert_context_with_doc(&db, &grandchild, ws_id);
@@ -3389,12 +3165,12 @@ mod tests {
     #[test]
     fn subtree_snapshot() {
         let db = KernelDb::in_memory().unwrap();
-        let (kid, ws_id) = setup_test_db(&db);
+        let ws_id = setup_test_db(&db);
 
-        let parent = make_context_row(kid, Some("template"));
+        let parent = make_context_row(Some("template"));
         insert_context_with_doc(&db, &parent, ws_id);
 
-        let c1 = make_context_row(kid, Some("child1"));
+        let c1 = make_context_row(Some("child1"));
         insert_context_with_doc(&db, &c1, ws_id);
         db.insert_edge(&make_edge(
             parent.context_id,
@@ -3403,7 +3179,7 @@ mod tests {
         ))
         .unwrap();
 
-        let c2 = make_context_row(kid, Some("child2"));
+        let c2 = make_context_row(Some("child2"));
         insert_context_with_doc(&db, &c2, ws_id);
         db.insert_edge(&make_edge(
             parent.context_id,
@@ -3424,10 +3200,10 @@ mod tests {
     #[test]
     fn structural_edge_unique() {
         let db = KernelDb::in_memory().unwrap();
-        let (kid, ws_id) = setup_test_db(&db);
+        let ws_id = setup_test_db(&db);
 
-        let a = make_context_row(kid, Some("a"));
-        let b = make_context_row(kid, Some("b"));
+        let a = make_context_row(Some("a"));
+        let b = make_context_row(Some("b"));
         insert_context_with_doc(&db, &a, ws_id);
         insert_context_with_doc(&db, &b, ws_id);
 
@@ -3451,10 +3227,10 @@ mod tests {
     #[test]
     fn drift_edge_allows_dupes() {
         let db = KernelDb::in_memory().unwrap();
-        let (kid, ws_id) = setup_test_db(&db);
+        let ws_id = setup_test_db(&db);
 
-        let a = make_context_row(kid, None);
-        let b = make_context_row(kid, None);
+        let a = make_context_row(None);
+        let b = make_context_row(None);
         insert_context_with_doc(&db, &a, ws_id);
         insert_context_with_doc(&db, &b, ws_id);
 
@@ -3473,10 +3249,10 @@ mod tests {
     #[test]
     fn cycle_detection() {
         let db = KernelDb::in_memory().unwrap();
-        let (kid, ws_id) = setup_test_db(&db);
+        let ws_id = setup_test_db(&db);
 
-        let a = make_context_row(kid, Some("cyc-a"));
-        let b = make_context_row(kid, Some("cyc-b"));
+        let a = make_context_row(Some("cyc-a"));
+        let b = make_context_row(Some("cyc-b"));
         insert_context_with_doc(&db, &a, ws_id);
         insert_context_with_doc(&db, &b, ws_id);
 
@@ -3491,7 +3267,7 @@ mod tests {
         assert!(matches!(err, KernelDbError::CycleDetected));
 
         // Self-loop also detected
-        let c = make_context_row(kid, Some("cyc-c"));
+        let c = make_context_row(Some("cyc-c"));
         insert_context_with_doc(&db, &c, ws_id);
         let err = db
             .insert_edge(&make_edge(c.context_id, c.context_id, EdgeKind::Structural))
@@ -3504,14 +3280,12 @@ mod tests {
     #[test]
     fn preset_lifecycle() {
         let db = KernelDb::in_memory().unwrap();
-        let kid = KernelId::new();
         let creator = PrincipalId::new();
         let now = now_millis() as i64;
 
         let mut preset = PresetRow {
             preset_id: PresetId::new(),
-            kernel_id: kid,
-            label: "opus-research".into(),
+                        label: "opus-research".into(),
             description: Some("Deep research preset".into()),
             provider: Some("anthropic".into()),
             model: Some("claude-opus-4-6".into()),
@@ -3525,7 +3299,7 @@ mod tests {
 
         // Get by label
         let loaded = db
-            .get_preset_by_label(kid, "opus-research")
+            .get_preset_by_label("opus-research")
             .unwrap()
             .unwrap();
         assert_eq!(loaded.model, Some("claude-opus-4-6".into()));
@@ -3546,14 +3320,12 @@ mod tests {
     #[test]
     fn workspace_lifecycle() {
         let db = KernelDb::in_memory().unwrap();
-        let kid = KernelId::new();
         let creator = PrincipalId::new();
         let now = now_millis() as i64;
 
         let ws = WorkspaceRow {
             workspace_id: WorkspaceId::new(),
-            kernel_id: kid,
-            label: "kaijutsu".into(),
+                        label: "kaijutsu".into(),
             description: Some("Main project".into()),
             created_at: now,
             created_by: creator,
@@ -3592,7 +3364,7 @@ mod tests {
 
         // Archive workspace
         assert!(db.archive_workspace(ws.workspace_id).unwrap());
-        let active = db.list_workspaces(kid).unwrap();
+        let active = db.list_workspaces().unwrap();
         assert!(active.is_empty());
     }
 
@@ -3601,14 +3373,12 @@ mod tests {
     #[test]
     fn workspace_soft_delete() {
         let db = KernelDb::in_memory().unwrap();
-        let kid = KernelId::new();
         let creator = PrincipalId::new();
         let now = now_millis() as i64;
 
         let ws = WorkspaceRow {
             workspace_id: WorkspaceId::new(),
-            kernel_id: kid,
-            label: "project".into(),
+                        label: "project".into(),
             description: None,
             created_at: now,
             created_by: creator,
@@ -3617,7 +3387,7 @@ mod tests {
         db.insert_workspace(&ws).unwrap();
 
         // Create context referencing this workspace
-        let mut ctx = make_context_row(kid, Some("ctx-ws"));
+        let mut ctx = make_context_row(Some("ctx-ws"));
         ctx.workspace_id = Some(ws.workspace_id);
         insert_context_with_doc(&db, &ctx, ws.workspace_id);
 
@@ -3638,10 +3408,10 @@ mod tests {
     #[test]
     fn drift_push_creates_edge() {
         let db = KernelDb::in_memory().unwrap();
-        let (kid, ws_id) = setup_test_db(&db);
+        let ws_id = setup_test_db(&db);
 
-        let a = make_context_row(kid, Some("source"));
-        let b = make_context_row(kid, Some("target"));
+        let a = make_context_row(Some("source"));
+        let b = make_context_row(Some("target"));
         insert_context_with_doc(&db, &a, ws_id);
         insert_context_with_doc(&db, &b, ws_id);
 
@@ -3669,14 +3439,14 @@ mod tests {
     #[test]
     fn context_dag_recursive() {
         let db = KernelDb::in_memory().unwrap();
-        let (kid, ws_id) = setup_test_db(&db);
+        let ws_id = setup_test_db(&db);
 
         // Create a 5-node tree: root → [a, b], a → [c, d]
-        let root = make_context_row(kid, Some("root"));
-        let a = make_context_row(kid, Some("a"));
-        let b = make_context_row(kid, Some("b"));
-        let c = make_context_row(kid, Some("c"));
-        let d = make_context_row(kid, Some("d"));
+        let root = make_context_row(Some("root"));
+        let a = make_context_row(Some("a"));
+        let b = make_context_row(Some("b"));
+        let c = make_context_row(Some("c"));
+        let d = make_context_row(Some("d"));
 
         for ctx in [&root, &a, &b, &c, &d] {
             insert_context_with_doc(&db, ctx, ws_id);
@@ -3699,7 +3469,7 @@ mod tests {
         db.insert_edge(&make_edge(a.context_id, d.context_id, EdgeKind::Structural))
             .unwrap();
 
-        let dag = db.context_dag(kid).unwrap();
+        let dag = db.context_dag().unwrap();
         assert_eq!(dag.len(), 5);
 
         // Root at depth 0
@@ -3720,19 +3490,19 @@ mod tests {
     #[test]
     fn tag_resolution() {
         let db = KernelDb::in_memory().unwrap();
-        let (kid, ws_id) = setup_test_db(&db);
+        let ws_id = setup_test_db(&db);
 
-        let ctx1 = make_context_row(kid, Some("opusplan"));
-        let ctx2 = make_context_row(kid, Some("sonnet"));
+        let ctx1 = make_context_row(Some("opusplan"));
+        let ctx2 = make_context_row(Some("sonnet"));
         insert_context_with_doc(&db, &ctx1, ws_id);
         insert_context_with_doc(&db, &ctx2, ws_id);
 
         // Exact label match
-        let resolved = db.resolve_context(kid, "opusplan").unwrap();
+        let resolved = db.resolve_context("opusplan").unwrap();
         assert_eq!(resolved, ctx1.context_id);
 
         // Prefix match
-        let resolved = db.resolve_context(kid, "opus").unwrap();
+        let resolved = db.resolve_context("opus").unwrap();
         assert_eq!(resolved, ctx1.context_id);
     }
 
@@ -3741,26 +3511,26 @@ mod tests {
     #[test]
     fn resolve_context_basic() {
         let db = KernelDb::in_memory().unwrap();
-        let (kid, ws_id) = setup_test_db(&db);
+        let ws_id = setup_test_db(&db);
 
-        let ctx = make_context_row(kid, Some("unique-label"));
+        let ctx = make_context_row(Some("unique-label"));
         insert_context_with_doc(&db, &ctx, ws_id);
 
         // Exact label
-        let r = db.resolve_context(kid, "unique-label").unwrap();
+        let r = db.resolve_context("unique-label").unwrap();
         assert_eq!(r, ctx.context_id);
 
         // Label prefix
-        let r = db.resolve_context(kid, "unique").unwrap();
+        let r = db.resolve_context("unique").unwrap();
         assert_eq!(r, ctx.context_id);
 
         // Hex prefix
         let hex = ctx.context_id.to_hex();
-        let r = db.resolve_context(kid, &hex[..8]).unwrap();
+        let r = db.resolve_context(&hex[..8]).unwrap();
         assert_eq!(r, ctx.context_id);
 
         // Not found
-        let err = db.resolve_context(kid, "nonexistent").unwrap_err();
+        let err = db.resolve_context("nonexistent").unwrap_err();
         assert!(matches!(err, KernelDbError::NotFound(_)));
     }
 
@@ -3769,15 +3539,15 @@ mod tests {
     #[test]
     fn null_labels_coexist() {
         let db = KernelDb::in_memory().unwrap();
-        let (kid, ws_id) = setup_test_db(&db);
+        let ws_id = setup_test_db(&db);
 
         // Insert 5 contexts with NULL label — all succeed
         for _ in 0..5 {
-            let row = make_context_row(kid, None);
+            let row = make_context_row(None);
             insert_context_with_doc(&db, &row, ws_id);
         }
 
-        let all = db.list_all_contexts(kid).unwrap();
+        let all = db.list_all_contexts().unwrap();
         assert_eq!(all.len(), 5);
     }
 
@@ -3786,10 +3556,10 @@ mod tests {
     #[test]
     fn archive_excludes_from_active() {
         let db = KernelDb::in_memory().unwrap();
-        let (kid, ws_id) = setup_test_db(&db);
+        let ws_id = setup_test_db(&db);
 
-        let parent = make_context_row(kid, Some("parent"));
-        let child = make_context_row(kid, Some("child"));
+        let parent = make_context_row(Some("parent"));
+        let child = make_context_row(Some("child"));
         insert_context_with_doc(&db, &parent, ws_id);
         insert_context_with_doc(&db, &child, ws_id);
         db.insert_edge(&make_edge(
@@ -3807,7 +3577,7 @@ mod tests {
         db.archive_context(child.context_id).unwrap();
 
         // list_active excludes
-        let active = db.list_active_contexts(kid).unwrap();
+        let active = db.list_active_contexts().unwrap();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].context_id, parent.context_id);
 
@@ -3821,10 +3591,10 @@ mod tests {
     #[test]
     fn context_edge_cascade() {
         let db = KernelDb::in_memory().unwrap();
-        let (kid, ws_id) = setup_test_db(&db);
+        let ws_id = setup_test_db(&db);
 
-        let a = make_context_row(kid, Some("edge-a"));
-        let b = make_context_row(kid, Some("edge-b"));
+        let a = make_context_row(Some("edge-a"));
+        let b = make_context_row(Some("edge-b"));
         insert_context_with_doc(&db, &a, ws_id);
         insert_context_with_doc(&db, &b, ws_id);
 
@@ -3854,15 +3624,13 @@ mod tests {
 
     #[test]
     fn context_row_to_context() {
-        let kid = KernelId::new();
         let creator = PrincipalId::new();
         let parent = ContextId::new();
         let now = now_millis() as i64;
 
         let row = ContextRow {
             context_id: ContextId::new(),
-            kernel_id: kid,
-            label: Some("test".into()),
+                        label: Some("test".into()),
             provider: Some("anthropic".into()),
             model: Some("opus".into()),
             system_prompt: None,
@@ -3880,7 +3648,6 @@ mod tests {
 
         let ctx = row.to_context();
         assert_eq!(ctx.id, row.context_id);
-        assert_eq!(ctx.kernel_id, kid);
         assert_eq!(ctx.label, Some("test".into()));
         assert_eq!(ctx.forked_from, Some(parent));
         assert_eq!(ctx.created_by, creator);
@@ -3892,15 +3659,14 @@ mod tests {
     #[test]
     fn roundtrip_create_and_recover() {
         let db = KernelDb::in_memory().unwrap();
-        let (kid, ws_id) = setup_test_db(&db);
+        let ws_id = setup_test_db(&db);
         let creator = PrincipalId::new();
         let parent_id = ContextId::new();
 
         // Insert parent first (forked_from FK requires it to exist)
         let parent = ContextRow {
             context_id: parent_id,
-            kernel_id: kid,
-            label: Some("parent".into()),
+                        label: Some("parent".into()),
             provider: Some("anthropic".into()),
             model: Some("claude-opus-4-6".into()),
             system_prompt: Some("You are helpful.".into()),
@@ -3921,8 +3687,7 @@ mod tests {
         let child_id = ContextId::new();
         let child = ContextRow {
             context_id: child_id,
-            kernel_id: kid,
-            label: Some("child-fork".into()),
+                        label: Some("child-fork".into()),
             provider: Some("google".into()),
             model: Some("gemini-2.0-flash".into()),
             system_prompt: Some("Be concise.".into()),
@@ -3942,7 +3707,6 @@ mod tests {
         // Read back and verify all 15 fields
         let recovered = db.get_context(child_id).unwrap().expect("child not found");
         assert_eq!(recovered.context_id, child_id);
-        assert_eq!(recovered.kernel_id, kid);
         assert_eq!(recovered.label, Some("child-fork".into()));
         assert_eq!(recovered.provider, Some("google".into()));
         assert_eq!(recovered.model, Some("gemini-2.0-flash".into()));
@@ -3957,7 +3721,7 @@ mod tests {
         assert!(recovered.preset_id.is_none());
 
         // Verify list_active_contexts returns both
-        let active = db.list_active_contexts(kid).unwrap();
+        let active = db.list_active_contexts().unwrap();
         assert_eq!(active.len(), 2);
 
         // Verify to_context() preserves forked_from
@@ -3978,15 +3742,14 @@ mod tests {
     #[test]
     fn fk_violation_is_validation_error() {
         let db = KernelDb::in_memory().unwrap();
-        let (kid, ws_id) = setup_test_db(&db);
+        let ws_id = setup_test_db(&db);
 
         // Reference a workspace_id that doesn't exist on the context
         let ctx_id = ContextId::new();
         // Insert document with valid workspace first
         db.insert_document(&DocumentRow {
             document_id: ctx_id,
-            kernel_id: kid,
-            workspace_id: ws_id,
+                        workspace_id: ws_id,
             doc_kind: DocKind::Conversation,
             language: None,
             path: None,
@@ -3997,8 +3760,7 @@ mod tests {
 
         let row = ContextRow {
             context_id: ctx_id,
-            kernel_id: kid,
-            label: Some("fk-test".into()),
+                        label: Some("fk-test".into()),
             provider: None,
             model: None,
             system_prompt: None,
@@ -4025,8 +3787,8 @@ mod tests {
     #[test]
     fn context_shell_upsert_and_get() {
         let db = KernelDb::in_memory().unwrap();
-        let (kid, ws_id) = setup_test_db(&db);
-        let ctx = make_context_row(kid, Some("shell-test"));
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("shell-test"));
         insert_context_with_doc(&db, &ctx, ws_id);
 
         // Initially none
@@ -4068,9 +3830,9 @@ mod tests {
     #[test]
     fn context_shell_copy() {
         let db = KernelDb::in_memory().unwrap();
-        let (kid, ws_id) = setup_test_db(&db);
-        let src = make_context_row(kid, Some("src"));
-        let tgt = make_context_row(kid, Some("tgt"));
+        let ws_id = setup_test_db(&db);
+        let src = make_context_row(Some("src"));
+        let tgt = make_context_row(Some("tgt"));
         insert_context_with_doc(&db, &src, ws_id);
         insert_context_with_doc(&db, &tgt, ws_id);
 
@@ -4096,9 +3858,9 @@ mod tests {
     #[test]
     fn context_shell_copy_empty() {
         let db = KernelDb::in_memory().unwrap();
-        let (kid, ws_id) = setup_test_db(&db);
-        let src = make_context_row(kid, Some("src"));
-        let tgt = make_context_row(kid, Some("tgt"));
+        let ws_id = setup_test_db(&db);
+        let src = make_context_row(Some("src"));
+        let tgt = make_context_row(Some("tgt"));
         insert_context_with_doc(&db, &src, ws_id);
         insert_context_with_doc(&db, &tgt, ws_id);
 
@@ -4113,8 +3875,8 @@ mod tests {
     #[test]
     fn context_shell_cascade_delete() {
         let db = KernelDb::in_memory().unwrap();
-        let (kid, ws_id) = setup_test_db(&db);
-        let ctx = make_context_row(kid, Some("cascade"));
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("cascade"));
         insert_context_with_doc(&db, &ctx, ws_id);
 
         db.upsert_context_shell(&ContextShellRow {
@@ -4153,8 +3915,8 @@ mod tests {
     #[test]
     fn context_binding_roundtrip_preserves_order_and_sticky_names() {
         let mut db = KernelDb::in_memory().unwrap();
-        let (kid, ws_id) = setup_test_db(&db);
-        let ctx = make_context_row(kid, Some("binding-roundtrip"));
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("binding-roundtrip"));
         insert_context_with_doc(&db, &ctx, ws_id);
 
         let original = binding_with(
@@ -4206,8 +3968,8 @@ mod tests {
         // wholly replace the children, not accumulate. Regression guard
         // against "leftover rows from a previous binding leak through."
         let mut db = KernelDb::in_memory().unwrap();
-        let (kid, ws_id) = setup_test_db(&db);
-        let ctx = make_context_row(kid, Some("binding-replace"));
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("binding-replace"));
         insert_context_with_doc(&db, &ctx, ws_id);
 
         let first = binding_with(
@@ -4233,8 +3995,8 @@ mod tests {
     #[test]
     fn context_binding_delete_returns_whether_existed() {
         let mut db = KernelDb::in_memory().unwrap();
-        let (kid, ws_id) = setup_test_db(&db);
-        let ctx = make_context_row(kid, Some("binding-delete"));
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("binding-delete"));
         insert_context_with_doc(&db, &ctx, ws_id);
 
         // Delete of absent row returns false.
@@ -4256,8 +4018,8 @@ mod tests {
         // Parent context gone → all three binding tables cascade-clear.
         // Guards against orphaned rows in binding_instances / binding_names.
         let mut db = KernelDb::in_memory().unwrap();
-        let (kid, ws_id) = setup_test_db(&db);
-        let ctx = make_context_row(kid, Some("binding-cascade"));
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("binding-cascade"));
         insert_context_with_doc(&db, &ctx, ws_id);
 
         db.upsert_context_binding(
@@ -4530,8 +4292,8 @@ mod tests {
     #[test]
     fn context_env_set_and_get() {
         let db = KernelDb::in_memory().unwrap();
-        let (kid, ws_id) = setup_test_db(&db);
-        let ctx = make_context_row(kid, Some("env-test"));
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("env-test"));
         insert_context_with_doc(&db, &ctx, ws_id);
 
         // Initially empty
@@ -4555,8 +4317,8 @@ mod tests {
     #[test]
     fn context_env_upsert() {
         let db = KernelDb::in_memory().unwrap();
-        let (kid, ws_id) = setup_test_db(&db);
-        let ctx = make_context_row(kid, Some("env-upsert"));
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("env-upsert"));
         insert_context_with_doc(&db, &ctx, ws_id);
 
         db.set_context_env(ctx.context_id, "RUST_LOG", "debug")
@@ -4579,8 +4341,8 @@ mod tests {
     #[test]
     fn context_env_delete() {
         let db = KernelDb::in_memory().unwrap();
-        let (kid, ws_id) = setup_test_db(&db);
-        let ctx = make_context_row(kid, Some("env-del"));
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("env-del"));
         insert_context_with_doc(&db, &ctx, ws_id);
 
         db.set_context_env(ctx.context_id, "FOO", "bar").unwrap();
@@ -4592,8 +4354,8 @@ mod tests {
     #[test]
     fn context_env_clear() {
         let db = KernelDb::in_memory().unwrap();
-        let (kid, ws_id) = setup_test_db(&db);
-        let ctx = make_context_row(kid, Some("env-clear"));
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("env-clear"));
         insert_context_with_doc(&db, &ctx, ws_id);
 
         db.set_context_env(ctx.context_id, "A", "1").unwrap();
@@ -4607,9 +4369,9 @@ mod tests {
     #[test]
     fn context_env_copy() {
         let db = KernelDb::in_memory().unwrap();
-        let (kid, ws_id) = setup_test_db(&db);
-        let src = make_context_row(kid, Some("env-src"));
-        let tgt = make_context_row(kid, Some("env-tgt"));
+        let ws_id = setup_test_db(&db);
+        let src = make_context_row(Some("env-src"));
+        let tgt = make_context_row(Some("env-tgt"));
         insert_context_with_doc(&db, &src, ws_id);
         insert_context_with_doc(&db, &tgt, ws_id);
 
@@ -4629,8 +4391,8 @@ mod tests {
     #[test]
     fn context_env_cascade_delete() {
         let db = KernelDb::in_memory().unwrap();
-        let (kid, ws_id) = setup_test_db(&db);
-        let ctx = make_context_row(kid, Some("env-cascade"));
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("env-cascade"));
         insert_context_with_doc(&db, &ctx, ws_id);
 
         db.set_context_env(ctx.context_id, "FOO", "bar").unwrap();
@@ -4656,8 +4418,8 @@ mod tests {
         // — the table schema is right only if every shape survives a
         // write+read.
         let db = KernelDb::in_memory().unwrap();
-        let (kid, ws_id) = setup_test_db(&db);
-        let ctx = make_context_row(kid, Some("cache-rt"));
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("cache-rt"));
         insert_context_with_doc(&db, &ctx, ws_id);
 
         db.add_cache_breakpoint(ctx.context_id, &CacheTarget::Tools(CacheTtl::Extended))
@@ -4683,8 +4445,8 @@ mod tests {
         // rely on this for the wire-layer's first-write-wins dedupe to
         // produce predictable results.
         let db = KernelDb::in_memory().unwrap();
-        let (kid, ws_id) = setup_test_db(&db);
-        let ctx = make_context_row(kid, Some("cache-order"));
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("cache-order"));
         insert_context_with_doc(&db, &ctx, ws_id);
 
         let seq0 = db
@@ -4724,8 +4486,8 @@ mod tests {
     #[test]
     fn cache_breakpoints_clear_returns_count_and_empties_list() {
         let db = KernelDb::in_memory().unwrap();
-        let (kid, ws_id) = setup_test_db(&db);
-        let ctx = make_context_row(kid, Some("cache-clear"));
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("cache-clear"));
         insert_context_with_doc(&db, &ctx, ws_id);
 
         db.add_cache_breakpoint(ctx.context_id, &CacheTarget::Tools(CacheTtl::Ephemeral))
@@ -4746,8 +4508,8 @@ mod tests {
         // This matters for rc-on-drift scripts that clear-then-rebuild
         // — we don't want sequence numbers to grow unboundedly.
         let db = KernelDb::in_memory().unwrap();
-        let (kid, ws_id) = setup_test_db(&db);
-        let ctx = make_context_row(kid, Some("cache-resume"));
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("cache-resume"));
         insert_context_with_doc(&db, &ctx, ws_id);
 
         for _ in 0..3 {
@@ -4767,8 +4529,8 @@ mod tests {
         // Context deletion must remove all of its breakpoints (via the
         // FK ON DELETE CASCADE through contexts -> documents).
         let db = KernelDb::in_memory().unwrap();
-        let (kid, ws_id) = setup_test_db(&db);
-        let ctx = make_context_row(kid, Some("cache-cascade"));
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("cache-cascade"));
         insert_context_with_doc(&db, &ctx, ws_id);
 
         db.add_cache_breakpoint(ctx.context_id, &CacheTarget::Tools(CacheTtl::Ephemeral))
@@ -4792,8 +4554,8 @@ mod tests {
         // Storage is liberal — populators may add more than 4. The wire
         // layer applies the cap. This test pins the policy choice.
         let db = KernelDb::in_memory().unwrap();
-        let (kid, ws_id) = setup_test_db(&db);
-        let ctx = make_context_row(kid, Some("cache-nocap"));
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("cache-nocap"));
         insert_context_with_doc(&db, &ctx, ws_id);
 
         for i in 0..6 {
@@ -4812,8 +4574,8 @@ mod tests {
         // future schema variant downgraded to this binary) must be
         // silently skipped, not panic the read path.
         let db = KernelDb::in_memory().unwrap();
-        let (kid, ws_id) = setup_test_db(&db);
-        let ctx = make_context_row(kid, Some("cache-future"));
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("cache-future"));
         insert_context_with_doc(&db, &ctx, ws_id);
 
         // Insert one good row and one row with a kind this binary doesn't know.
@@ -4836,8 +4598,8 @@ mod tests {
     #[test]
     fn cache_breakpoints_decode_drops_unrecognized_ttl() {
         let db = KernelDb::in_memory().unwrap();
-        let (kid, ws_id) = setup_test_db(&db);
-        let ctx = make_context_row(kid, Some("cache-future-ttl"));
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("cache-future-ttl"));
         insert_context_with_doc(&db, &ctx, ws_id);
 
         db.conn
@@ -4859,8 +4621,8 @@ mod tests {
         // MessageIndex(0). Make sure index 0 doesn't get confused with
         // SQL NULL or default fallback.
         let db = KernelDb::in_memory().unwrap();
-        let (kid, ws_id) = setup_test_db(&db);
-        let ctx = make_context_row(kid, Some("cache-idx0"));
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("cache-idx0"));
         insert_context_with_doc(&db, &ctx, ws_id);
 
         db.add_cache_breakpoint(
@@ -4877,14 +4639,12 @@ mod tests {
     #[test]
     fn workspace_path_read_only_roundtrip() {
         let db = KernelDb::in_memory().unwrap();
-        let kid = KernelId::new();
         let creator = PrincipalId::new();
         let now = now_millis() as i64;
 
         let ws = WorkspaceRow {
             workspace_id: WorkspaceId::new(),
-            kernel_id: kid,
-            label: "ro-test".into(),
+                        label: "ro-test".into(),
             description: None,
             created_at: now,
             created_by: creator,
@@ -4921,9 +4681,9 @@ mod tests {
     #[test]
     fn fork_context_config_full() {
         let db = KernelDb::in_memory().unwrap();
-        let (kid, ws_id) = setup_test_db(&db);
-        let src = make_context_row(kid, Some("fork-src"));
-        let tgt = make_context_row(kid, Some("fork-tgt"));
+        let ws_id = setup_test_db(&db);
+        let src = make_context_row(Some("fork-src"));
+        let tgt = make_context_row(Some("fork-tgt"));
         insert_context_with_doc(&db, &src, ws_id);
         insert_context_with_doc(&db, &tgt, ws_id);
 
@@ -4956,9 +4716,9 @@ mod tests {
     #[test]
     fn fork_context_config_empty_source() {
         let db = KernelDb::in_memory().unwrap();
-        let (kid, ws_id) = setup_test_db(&db);
-        let src = make_context_row(kid, Some("empty-src"));
-        let tgt = make_context_row(kid, Some("empty-tgt"));
+        let ws_id = setup_test_db(&db);
+        let src = make_context_row(Some("empty-src"));
+        let tgt = make_context_row(Some("empty-tgt"));
         insert_context_with_doc(&db, &src, ws_id);
         insert_context_with_doc(&db, &tgt, ws_id);
 
@@ -4975,14 +4735,12 @@ mod tests {
     #[test]
     fn context_workspace_paths_bound() {
         let db = KernelDb::in_memory().unwrap();
-        let kid = KernelId::new();
         let creator = PrincipalId::new();
         let now = now_millis() as i64;
 
         let ws = WorkspaceRow {
             workspace_id: WorkspaceId::new(),
-            kernel_id: kid,
-            label: "project".into(),
+                        label: "project".into(),
             description: None,
             created_at: now,
             created_by: creator,
@@ -5006,7 +4764,7 @@ mod tests {
         .unwrap();
 
         // Create context with workspace bound
-        let mut ctx = make_context_row(kid, Some("bound"));
+        let mut ctx = make_context_row(Some("bound"));
         ctx.workspace_id = Some(ws.workspace_id);
         insert_context_with_doc(&db, &ctx, ws.workspace_id);
 
@@ -5018,8 +4776,8 @@ mod tests {
     #[test]
     fn context_workspace_paths_unbound() {
         let db = KernelDb::in_memory().unwrap();
-        let (kid, ws_id) = setup_test_db(&db);
-        let ctx = make_context_row(kid, Some("unbound"));
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("unbound"));
         insert_context_with_doc(&db, &ctx, ws_id);
 
         let paths = db.context_workspace_paths(ctx.context_id).unwrap();
@@ -5029,38 +4787,17 @@ mod tests {
     #[test]
     fn get_or_create_kernel_id_stable_across_calls() {
         let db = KernelDb::in_memory().unwrap();
-        let id1 = db.get_or_create_kernel_id().unwrap();
-        let id2 = db.get_or_create_kernel_id().unwrap();
+        let id1 = db.kernel_id().unwrap();
+        let id2 = db.kernel_id().unwrap();
         assert_eq!(id1, id2, "should return same ID on second call");
     }
 
     #[test]
     fn get_or_create_kernel_id_fresh_on_empty_db() {
         let db = KernelDb::in_memory().unwrap();
-        let id = db.get_or_create_kernel_id().unwrap();
+        let id = db.kernel_id().unwrap();
         // Should be a valid UUIDv7 (non-zero)
         assert_ne!(id.as_bytes(), &[0u8; 16]);
-    }
-
-    #[test]
-    fn get_or_create_kernel_id_adopts_from_existing_contexts() {
-        let db = KernelDb::in_memory().unwrap();
-
-        // Simulate pre-stable-ID era: contexts exist with an old kernel_id
-        let old_kid = KernelId::new();
-        let ws_id = db
-            .get_or_create_default_workspace(old_kid, PrincipalId::system())
-            .unwrap();
-        let ctx = make_context_row(old_kid, Some("legacy"));
-        insert_context_with_doc(&db, &ctx, ws_id);
-
-        // kernel table is empty — should adopt the context's kernel_id
-        let id = db.get_or_create_kernel_id().unwrap();
-        assert_eq!(id, old_kid, "should adopt kernel_id from existing contexts");
-
-        // Subsequent call returns the same
-        let id2 = db.get_or_create_kernel_id().unwrap();
-        assert_eq!(id2, old_kid);
     }
 
     // ── 28. Workspace path permission checking ────────────────────────
@@ -5068,8 +4805,8 @@ mod tests {
     #[test]
     fn check_workspace_path_unbound_context() {
         let db = KernelDb::in_memory().unwrap();
-        let (kid, ws_id) = setup_test_db(&db);
-        let ctx = make_context_row(kid, Some("unbound"));
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("unbound"));
         insert_context_with_doc(&db, &ctx, ws_id);
 
         // Unbound context → None (no restriction)
@@ -5082,14 +4819,12 @@ mod tests {
     #[test]
     fn check_workspace_path_allowed_rw() {
         let db = KernelDb::in_memory().unwrap();
-        let kid = KernelId::new();
         let creator = PrincipalId::new();
         let now = now_millis() as i64;
 
         let ws = WorkspaceRow {
             workspace_id: WorkspaceId::new(),
-            kernel_id: kid,
-            label: "proj".into(),
+                        label: "proj".into(),
             description: None,
             created_at: now,
             created_by: creator,
@@ -5104,7 +4839,7 @@ mod tests {
         })
         .unwrap();
 
-        let mut ctx = make_context_row(kid, Some("bound"));
+        let mut ctx = make_context_row(Some("bound"));
         ctx.workspace_id = Some(ws.workspace_id);
         insert_context_with_doc(&db, &ctx, ws.workspace_id);
 
@@ -5118,14 +4853,12 @@ mod tests {
     #[test]
     fn check_workspace_path_allowed_ro() {
         let db = KernelDb::in_memory().unwrap();
-        let kid = KernelId::new();
         let creator = PrincipalId::new();
         let now = now_millis() as i64;
 
         let ws = WorkspaceRow {
             workspace_id: WorkspaceId::new(),
-            kernel_id: kid,
-            label: "proj".into(),
+                        label: "proj".into(),
             description: None,
             created_at: now,
             created_by: creator,
@@ -5140,7 +4873,7 @@ mod tests {
         })
         .unwrap();
 
-        let mut ctx = make_context_row(kid, Some("bound"));
+        let mut ctx = make_context_row(Some("bound"));
         ctx.workspace_id = Some(ws.workspace_id);
         insert_context_with_doc(&db, &ctx, ws.workspace_id);
 
@@ -5154,14 +4887,12 @@ mod tests {
     #[test]
     fn check_workspace_path_outside_scope() {
         let db = KernelDb::in_memory().unwrap();
-        let kid = KernelId::new();
         let creator = PrincipalId::new();
         let now = now_millis() as i64;
 
         let ws = WorkspaceRow {
             workspace_id: WorkspaceId::new(),
-            kernel_id: kid,
-            label: "proj".into(),
+                        label: "proj".into(),
             description: None,
             created_at: now,
             created_by: creator,
@@ -5176,7 +4907,7 @@ mod tests {
         })
         .unwrap();
 
-        let mut ctx = make_context_row(kid, Some("bound"));
+        let mut ctx = make_context_row(Some("bound"));
         ctx.workspace_id = Some(ws.workspace_id);
         insert_context_with_doc(&db, &ctx, ws.workspace_id);
 
@@ -5190,14 +4921,12 @@ mod tests {
     #[test]
     fn check_workspace_path_longest_prefix() {
         let db = KernelDb::in_memory().unwrap();
-        let kid = KernelId::new();
         let creator = PrincipalId::new();
         let now = now_millis() as i64;
 
         let ws = WorkspaceRow {
             workspace_id: WorkspaceId::new(),
-            kernel_id: kid,
-            label: "proj".into(),
+                        label: "proj".into(),
             description: None,
             created_at: now,
             created_by: creator,
@@ -5219,7 +4948,7 @@ mod tests {
         })
         .unwrap();
 
-        let mut ctx = make_context_row(kid, Some("bound"));
+        let mut ctx = make_context_row(Some("bound"));
         ctx.workspace_id = Some(ws.workspace_id);
         insert_context_with_doc(&db, &ctx, ws.workspace_id);
 

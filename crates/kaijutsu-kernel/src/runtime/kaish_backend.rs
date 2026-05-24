@@ -36,7 +36,7 @@ use crate::Kernel as KaijutsuKernel;
 use crate::block_store::SharedBlockStore;
 use crate::ExecResult;
 use kaijutsu_types::DocKind;
-use kaijutsu_types::{ContextId, KernelId, PrincipalId, SessionId};
+use kaijutsu_types::{ContextId, PrincipalId, SessionId};
 
 /// Minimal name/description tuple for converting a broker-visible tool into
 /// kaish's `ToolInfo`. The full tool metadata lives on `KernelTool`; this
@@ -83,7 +83,6 @@ pub struct KaijutsuBackend {
     /// Shared mutable context tracking map.
     session_contexts: SessionContextMap,
     session_id: SessionId,
-    kernel_id: KernelId,
 }
 
 impl KaijutsuBackend {
@@ -96,7 +95,6 @@ impl KaijutsuBackend {
         principal_id: PrincipalId,
         session_contexts: SessionContextMap,
         session_id: SessionId,
-        kernel_id: KernelId,
     ) -> Self {
         Self {
             blocks,
@@ -104,7 +102,6 @@ impl KaijutsuBackend {
             principal_id,
             session_contexts,
             session_id,
-            kernel_id,
         }
     }
 
@@ -661,7 +658,7 @@ impl KernelBackend for KaijutsuBackend {
             context_id,
             ctx.cwd.clone(),
             self.session_id,
-            self.kernel_id,
+            self.kernel.id(),
         );
 
         // Phase 1 M4: dispatch through the MCP broker.
@@ -1003,9 +1000,7 @@ mod tests {
             kernel,
             PrincipalId::system(),
             session_contexts,
-            sid,
-            KernelId::new(),
-        );
+            sid);
 
 
         // Test root paths

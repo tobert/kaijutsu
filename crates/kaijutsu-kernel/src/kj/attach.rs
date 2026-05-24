@@ -37,7 +37,7 @@ impl KjDispatcher {
         let ctx_ref = parse_context_ref(first);
         let target_id = {
             let db = self.kernel_db().lock();
-            match resolve_context_ref(&ctx_ref, caller, &db, self.kernel_id()) {
+            match resolve_context_ref(&ctx_ref, caller, &db) {
                 Ok(id) => id,
                 Err(e) => return KjResult::Err(format!("kj attach: {e}")),
             }
@@ -130,7 +130,6 @@ mod tests {
 
     fn install_attach_script(d: &KjDispatcher, ctx_type: &str, content: &str, ext: &str) {
         let row = RcScriptRow {
-            kernel_id: d.kernel_id(),
             context_type: ctx_type.into(),
             verb: "attach".into(),
             sort_key: "S00".into(),

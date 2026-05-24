@@ -233,9 +233,12 @@ impl KjDispatcher {
         drift: SharedDriftRouter,
         blocks: SharedBlockStore,
         kernel_db: Arc<parking_lot::Mutex<KernelDb>>,
-        kernel_id: KernelId,
         kernel: Arc<Kernel>,
     ) -> Self {
+        let kernel_id = kernel_db
+            .lock()
+            .kernel_id()
+            .expect("KernelDb singleton row must exist");
         Self {
             drift,
             blocks,
@@ -445,15 +448,14 @@ pub(crate) mod test_helpers {
         let kernel_db = Arc::new(parking_lot::Mutex::new(
             KernelDb::in_memory().expect("in-memory KernelDb"),
         ));
-        let kernel_id = KernelId::new();
         // Create default workspace for test contexts
         {
             let db = kernel_db.lock();
-            db.get_or_create_default_workspace(kernel_id, PrincipalId::system())
+            db.get_or_create_default_workspace(PrincipalId::system())
                 .unwrap();
         }
         let kernel = Arc::new(Kernel::new("test", None).await.with_timeouts(policy));
-        KjDispatcher::new(drift, blocks, kernel_db, kernel_id, kernel)
+        KjDispatcher::new(drift, blocks, kernel_db, kernel)
     }
 
     /// Create a KjCaller with fresh IDs for testing.
@@ -497,19 +499,18 @@ pub(crate) mod test_helpers {
         created_by: PrincipalId,
     ) -> ContextId {
         let id = ContextId::new();
-        let kernel_id = dispatcher.kernel_id();
+        let _kernel_id = dispatcher.kernel_id();
 
         // Insert document + context into KernelDb
         {
             let db = dispatcher.kernel_db().lock();
             let ws_id = db
-                .get_or_create_default_workspace(kernel_id, created_by)
+                .get_or_create_default_workspace(created_by)
                 .unwrap();
 
             // Document row first (contexts FK to documents)
             db.insert_document(&crate::kernel_db::DocumentRow {
                 document_id: id,
-                kernel_id,
                 workspace_id: ws_id,
                 doc_kind: kaijutsu_types::DocKind::Conversation,
                 language: None,
@@ -521,7 +522,6 @@ pub(crate) mod test_helpers {
 
             let row = crate::kernel_db::ContextRow {
                 context_id: id,
-                kernel_id,
                 label: label.map(|s| s.to_string()),
                 provider: None,
                 model: None,

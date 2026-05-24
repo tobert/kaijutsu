@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::backend::{ImageBackend, ImageError, ImageGenOpts, ImageStream};
+use super::backend::{ImageBackend, ImageError};
 
 /// Registry that maps backend names to implementations.
 pub struct ImageBackendRegistry {

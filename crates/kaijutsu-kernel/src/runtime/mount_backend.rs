@@ -525,7 +525,6 @@ mod tests {
             PrincipalId::system(),
             session_contexts,
             sid,
-            kaijutsu_types::KernelId::new(),
         ));
 
         let mount_table = Arc::new(MountTable::new());

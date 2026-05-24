@@ -100,7 +100,7 @@ impl KjDispatcher {
                 Err(e) => return Err(format!("rc lifecycle: {e}")),
             };
             let scripts = db
-                .list_rc_scripts(self.kernel_id(), &ctx_type, verb)
+                .list_rc_scripts(&ctx_type, verb)
                 .map_err(|e| format!("rc lifecycle: list scripts: {e}"))?;
             (ctx_type, scripts)
         };
@@ -226,7 +226,7 @@ async fn run_kai_script(
     use kaijutsu_types::SessionId;
 
     let session_id = SessionId::new();
-    let kernel_id = dispatcher.kernel_id();
+    let _kernel_id = dispatcher.kernel_id();
     let session_contexts = session_context_map();
     session_contexts.insert(session_id, new_id);
 
@@ -261,8 +261,7 @@ async fn run_kai_script(
         principal,
         new_id,
         session_id,
-        kernel_id,
-        session_contexts,
+                session_contexts,
         configure_tools,
     ) {
         Ok(k) => k,
@@ -483,8 +482,7 @@ mod tests {
         content: &str,
     ) {
         let row = RcScriptRow {
-            kernel_id: dispatcher.kernel_id(),
-            context_type: context_type.into(),
+                        context_type: context_type.into(),
             verb: verb.into(),
             sort_key: sort_key.into(),
             name: name.into(),
@@ -540,7 +538,7 @@ mod tests {
     /// "created context 'X' (id)" message.
     fn lookup_context_id(dispatcher: &KjDispatcher, label: &str) -> ContextId {
         let db = dispatcher.kernel_db().lock();
-        db.find_context_by_label(dispatcher.kernel_id(), label)
+        db.find_context_by_label(label)
             .expect("get_context_by_label")
             .expect("context exists")
             .context_id
@@ -1411,8 +1409,7 @@ test -z "$KJ_PARENT_BLOCK_COUNT" || exit 99
         timeout_secs: Option<u32>,
     ) {
         let row = RcScriptRow {
-            kernel_id: dispatcher.kernel_id(),
-            context_type: context_type.into(),
+                        context_type: context_type.into(),
             verb: verb.into(),
             sort_key: sort_key.into(),
             name: name.into(),

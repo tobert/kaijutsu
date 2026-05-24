@@ -47,20 +47,18 @@ async fn setup() -> Fixture {
 
     let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
     let creator = PrincipalId::system();
-    let kernel_id = KernelId::new();
     let ws_id = {
         let g = db.lock();
-        g.get_or_create_default_workspace(kernel_id, creator).unwrap()
+        g.get_or_create_default_workspace(creator).unwrap()
     };
-    let store: SharedBlockStore = shared_block_store_with_db(db.clone(), kernel_id, ws_id, creator);
+    let store: SharedBlockStore = shared_block_store_with_db(db.clone(), ws_id, creator);
 
     let ctx_id = ContextId::new();
     {
         let g = db.lock();
         g.insert_document(&DocumentRow {
             document_id: ctx_id,
-            kernel_id,
-            workspace_id: ws_id,
+                        workspace_id: ws_id,
             doc_kind: DocumentKind::Code,
             language: None,
             path: None,
@@ -82,7 +80,7 @@ async fn setup() -> Fixture {
         ctx_id,
         "/",
         SessionId::new(),
-        kernel_id,
+        KernelId::new(),
     );
 
     Fixture {
@@ -267,13 +265,14 @@ async fn tool_search_tiebreak_is_alphabetical() {
         .and_then(|m| m.as_array())
         .expect("matches array");
 
-    // Pull out just the hook_* names in the order returned. Other tools
-    // could plausibly match (e.g. if a description contains "hook_"),
-    // so filter rather than asserting exact length.
+    // Pull out the four single-segment hook_* names (the family the
+    // tiebreak was originally about). `hook_script_*` tools share the
+    // prefix but their descriptions can score them higher/lower than the
+    // base four; this assertion is only about the four-way tie.
     let hook_names: Vec<&str> = matches
         .iter()
         .filter_map(|m| m.get("name").and_then(|n| n.as_str()))
-        .filter(|n| n.starts_with("hook_"))
+        .filter(|n| n.starts_with("hook_") && !n.starts_with("hook_script_"))
         .collect();
     assert_eq!(
         hook_names,
@@ -281,14 +280,16 @@ async fn tool_search_tiebreak_is_alphabetical() {
         "tied scores should sort alphabetically by resolved name"
     );
 
-    // And every hook_* entry should have the same score (3 — name match,
-    // no description match), confirming the tie is real.
+    // And every single-segment hook_* entry should have the same score
+    // (3 — name match, no description match), confirming the tie is real.
+    // hook_script_* tools have richer descriptions and can score higher,
+    // which is fine — they're not part of this tiebreak set.
     let hook_scores: Vec<u64> = matches
         .iter()
         .filter(|m| {
             m.get("name")
                 .and_then(|n| n.as_str())
-                .map(|n| n.starts_with("hook_"))
+                .map(|n| n.starts_with("hook_") && !n.starts_with("hook_script_"))
                 .unwrap_or(false)
         })
         .filter_map(|m| m.get("score").and_then(|s| s.as_u64()))
@@ -868,21 +869,19 @@ async fn setup_with_db() -> (Fixture, Arc<parking_lot::Mutex<KernelDb>>) {
 
     let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
     let creator = PrincipalId::system();
-    let kernel_id = KernelId::new();
     let ws_id = {
         let g = db.lock();
-        g.get_or_create_default_workspace(kernel_id, creator).unwrap()
+        g.get_or_create_default_workspace(creator).unwrap()
     };
     let store: SharedBlockStore =
-        shared_block_store_with_db(db.clone(), kernel_id, ws_id, creator);
+        shared_block_store_with_db(db.clone(), ws_id, creator);
 
     let ctx_id = ContextId::new();
     {
         let g = db.lock();
         g.insert_document(&DocumentRow {
             document_id: ctx_id,
-            kernel_id,
-            workspace_id: ws_id,
+                        workspace_id: ws_id,
             doc_kind: DocumentKind::Code,
             language: None,
             path: None,
@@ -894,8 +893,7 @@ async fn setup_with_db() -> (Fixture, Arc<parking_lot::Mutex<KernelDb>>) {
         // so we need a matching context row for persistence tests.
         g.insert_context(&ContextRow {
             context_id: ctx_id,
-            kernel_id,
-            label: None,
+                        label: None,
             provider: None,
             model: None,
             system_prompt: None,
@@ -923,7 +921,7 @@ async fn setup_with_db() -> (Fixture, Arc<parking_lot::Mutex<KernelDb>>) {
     // Wire the DB into the broker so bind/unbind/set_binding persist.
     kernel.broker().set_db(db.clone()).await;
 
-    let exec_ctx = ExecContext::new(creator, ctx_id, "/", SessionId::new(), kernel_id);
+    let exec_ctx = ExecContext::new(creator, ctx_id, "/", SessionId::new(), KernelId::new());
     let fx = Fixture {
         kernel,
         ctx_id,
@@ -965,13 +963,13 @@ async fn binding_persists_across_kernel_restart() {
     let tmp2 = tempfile::tempdir().unwrap();
     let kernel2 = Arc::new(Kernel::new("phase5-m5-restart", Some(tmp2.path())).await);
     let creator2 = PrincipalId::system();
-    let kernel_id2 = KernelId::new();
+    let _kernel_id2 = KernelId::new();
     let ws_id2 = {
         let g = db.lock();
-        g.get_or_create_default_workspace(kernel_id2, creator2).unwrap()
+        g.get_or_create_default_workspace(creator2).unwrap()
     };
     let store2: SharedBlockStore =
-        shared_block_store_with_db(db.clone(), kernel_id2, ws_id2, creator2);
+        shared_block_store_with_db(db.clone(), ws_id2, creator2);
     let file_cache2 = Arc::new(FileDocumentCache::new(store2.clone(), kernel2.vfs().clone()));
     kernel2
         .register_builtin_mcp_servers(store2.clone(), file_cache2, None)
@@ -1242,13 +1240,13 @@ async fn hooks_persist_across_kernel_restart() {
     let tmp2 = tempfile::tempdir().unwrap();
     let kernel2 = Arc::new(Kernel::new("hook-persist-restart", Some(tmp2.path())).await);
     let creator2 = PrincipalId::system();
-    let kernel_id2 = KernelId::new();
+    let _kernel_id2 = KernelId::new();
     let ws_id2 = {
         let g = db.lock();
-        g.get_or_create_default_workspace(kernel_id2, creator2).unwrap()
+        g.get_or_create_default_workspace(creator2).unwrap()
     };
     let store2: SharedBlockStore =
-        shared_block_store_with_db(db.clone(), kernel_id2, ws_id2, creator2);
+        shared_block_store_with_db(db.clone(), ws_id2, creator2);
     let file_cache2 = Arc::new(FileDocumentCache::new(store2.clone(), kernel2.vfs().clone()));
     kernel2
         .register_builtin_mcp_servers(store2.clone(), file_cache2, None)

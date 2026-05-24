@@ -52,7 +52,7 @@ pub use action::Action;
 pub use context::InputContext;
 #[allow(unused_imports)]
 pub use events::{ActionFired, TextInputReceived};
-pub use focus::{ActiveSurface, FocusArea};
+pub use focus::FocusArea;
 #[allow(unused_imports)]
 pub use map::InputMap;
 

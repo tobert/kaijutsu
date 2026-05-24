@@ -48,11 +48,10 @@ impl KjDispatcher {
 
     async fn context_list(&self, argv: &[String], caller: &KjCaller) -> KjResult {
         let tree = argv.iter().any(|a| a == "--tree" || a == "-t");
-        let kernel_id = self.kernel_id();
 
         let db = self.kernel_db().lock();
         if tree {
-            match db.context_dag(kernel_id) {
+            match db.context_dag() {
                 Ok(dag) => {
                     let text = format_context_tree(&dag, caller.context_id);
                     let ids = context_handles(dag.iter().map(|(row, _)| row));
@@ -61,7 +60,7 @@ impl KjDispatcher {
                 Err(e) => KjResult::Err(format!("kj context list: {e}")),
             }
         } else {
-            match db.list_active_contexts(kernel_id) {
+            match db.list_active_contexts() {
                 Ok(contexts) => {
                     let text = format_context_table(&contexts, caller.context_id);
                     let ids = context_handles(contexts.iter());
@@ -74,11 +73,10 @@ impl KjDispatcher {
 
     fn context_info(&self, argv: &[String], caller: &KjCaller) -> KjResult {
         let db = self.kernel_db().lock();
-        let kernel_id = self.kernel_id();
 
         // Resolve target context (default: current)
         let target_arg = argv.get(1).map(|s| s.as_str());
-        let target_id = match super::refs::resolve_context_arg(target_arg, caller, &db, kernel_id) {
+        let target_id = match super::refs::resolve_context_arg(target_arg, caller, &db) {
             Ok(id) => id,
             Err(e) => return KjResult::Err(format!("kj context info: {e}")),
         };
@@ -204,7 +202,7 @@ impl KjDispatcher {
         // Resolve using DriftRouter for live state (not just DB)
         let resolved = {
             let db = self.kernel_db().lock();
-            resolve_context_ref(&ctx_ref, caller, &db, self.kernel_id())
+            resolve_context_ref(&ctx_ref, caller, &db)
         };
 
         match resolved {
@@ -242,7 +240,7 @@ impl KjDispatcher {
             };
 
             let db = self.kernel_db().lock();
-            match super::refs::resolve_context_arg(parent_ref, caller, &db, self.kernel_id()) {
+            match super::refs::resolve_context_arg(parent_ref, caller, &db) {
                 Ok(id) => Some(id),
                 Err(_) if parent_ref.is_none() => None, // Default to root if no current context
                 Err(e) => return KjResult::Err(format!("kj context create: {e}")),
@@ -256,20 +254,17 @@ impl KjDispatcher {
             .unwrap_or_else(|| "default".to_string());
 
         let new_id = ContextId::new();
-        let kernel_id = self.kernel_id();
 
         // Write-through: KernelDb first, then DriftRouter
         {
             let db = self.kernel_db().lock();
-            let default_ws =
-                match db.get_or_create_default_workspace(kernel_id, caller.principal_id) {
-                    Ok(id) => id,
-                    Err(e) => return KjResult::Err(format!("kj context create: {e}")),
-                };
+            let default_ws = match db.get_or_create_default_workspace(caller.principal_id) {
+                Ok(id) => id,
+                Err(e) => return KjResult::Err(format!("kj context create: {e}")),
+            };
 
             let row = ContextRow {
                 context_id: new_id,
-                kernel_id,
                 label: Some(label.to_string()),
                 provider: None,
                 model: None,
@@ -330,12 +325,11 @@ impl KjDispatcher {
     /// the existing context if labeled "scratch" already exists.
     async fn context_scratch(&self, caller: &KjCaller) -> KjResult {
         const SCRATCH_LABEL: &str = "scratch";
-        let kernel_id = self.kernel_id();
 
         // Resolve the label first; if found, return its id.
         {
             let db = self.kernel_db().lock();
-            if let Ok(id) = db.resolve_context(kernel_id, SCRATCH_LABEL) {
+            if let Ok(id) = db.resolve_context(SCRATCH_LABEL) {
                 return KjResult::ok(format!(
                     "scratch context exists: {} ({})",
                     SCRATCH_LABEL,
@@ -348,14 +342,12 @@ impl KjDispatcher {
         let new_id = ContextId::new();
         {
             let db = self.kernel_db().lock();
-            let default_ws =
-                match db.get_or_create_default_workspace(kernel_id, caller.principal_id) {
-                    Ok(id) => id,
-                    Err(e) => return KjResult::Err(format!("kj context scratch: {e}")),
-                };
+            let default_ws = match db.get_or_create_default_workspace(caller.principal_id) {
+                Ok(id) => id,
+                Err(e) => return KjResult::Err(format!("kj context scratch: {e}")),
+            };
             let row = ContextRow {
                 context_id: new_id,
-                kernel_id,
                 label: Some(SCRATCH_LABEL.to_string()),
                 provider: None,
                 model: None,
@@ -390,7 +382,6 @@ impl KjDispatcher {
 
     /// `kj context set <ctx> [--model p/m] [--system-prompt text] [--tool-filter spec] [--consent mode] [--cwd path] [--env KEY=VALUE]`
     async fn context_set(&self, argv: &[String], caller: &KjCaller) -> KjResult {
-        let kernel_id = self.kernel_id();
 
         // Parse all args upfront (no locks needed)
         let target_arg = argv
@@ -424,7 +415,7 @@ impl KjDispatcher {
             let db = self.kernel_db().lock();
 
             let target_id =
-                match super::refs::resolve_context_arg(target_arg, caller, &db, kernel_id) {
+                match super::refs::resolve_context_arg(target_arg, caller, &db) {
                     Ok(id) => id,
                     Err(e) => return KjResult::Err(format!("kj context set: {e}")),
                 };
@@ -543,7 +534,6 @@ impl KjDispatcher {
 
     /// `kj context unset [<ctx>] --env KEY` — remove an env var from a context.
     fn context_unset(&self, argv: &[String], caller: &KjCaller) -> KjResult {
-        let kernel_id = self.kernel_id();
 
         let target_arg = argv
             .get(1)
@@ -552,7 +542,7 @@ impl KjDispatcher {
         let env_key = extract_named_arg(argv, &["--env"]);
 
         let db = self.kernel_db().lock();
-        let target_id = match super::refs::resolve_context_arg(target_arg, caller, &db, kernel_id) {
+        let target_id = match super::refs::resolve_context_arg(target_arg, caller, &db) {
             Ok(id) => id,
             Err(e) => return KjResult::Err(format!("kj context unset: {e}")),
         };
@@ -571,10 +561,9 @@ impl KjDispatcher {
     /// `kj context log [<ctx>]` — show fork lineage from context up to root.
     fn context_log(&self, argv: &[String], caller: &KjCaller) -> KjResult {
         let db = self.kernel_db().lock();
-        let kernel_id = self.kernel_id();
 
         let target_arg = argv.get(1).map(|s| s.as_str());
-        let target_id = match super::refs::resolve_context_arg(target_arg, caller, &db, kernel_id) {
+        let target_id = match super::refs::resolve_context_arg(target_arg, caller, &db) {
             Ok(id) => id,
             Err(e) => return KjResult::Err(format!("kj context log: {e}")),
         };
@@ -606,16 +595,14 @@ impl KjDispatcher {
             }
         };
 
-        let kernel_id = self.kernel_id();
-
         // All DB work in a single lock scope, no await
         let db = self.kernel_db().lock();
 
-        let ctx_id = match db.resolve_context(kernel_id, ctx_ref) {
+        let ctx_id = match db.resolve_context(ctx_ref) {
             Ok(id) => id,
             Err(e) => return KjResult::Err(format!("kj context move: {e}")),
         };
-        let new_parent_id = match db.resolve_context(kernel_id, new_parent_ref) {
+        let new_parent_id = match db.resolve_context(new_parent_ref) {
             Ok(id) => id,
             Err(e) => return KjResult::Err(format!("kj context move: {e}")),
         };
@@ -669,11 +656,10 @@ impl KjDispatcher {
             }
         };
 
-        let kernel_id = self.kernel_id();
         let (target_id, target_label) = {
             let db = self.kernel_db().lock();
             let target_id =
-                match super::refs::resolve_context_arg(Some(ctx_ref), caller, &db, kernel_id) {
+                match super::refs::resolve_context_arg(Some(ctx_ref), caller, &db) {
                     Ok(id) => id,
                     Err(e) => return KjResult::Err(format!("kj context archive: {e}")),
                 };
@@ -759,11 +745,10 @@ impl KjDispatcher {
             }
         };
 
-        let kernel_id = self.kernel_id();
         let (target_id, target_label) = {
             let db = self.kernel_db().lock();
             let target_id =
-                match super::refs::resolve_context_arg(Some(ctx_ref), caller, &db, kernel_id) {
+                match super::refs::resolve_context_arg(Some(ctx_ref), caller, &db) {
                     Ok(id) => id,
                     Err(e) => return KjResult::Err(format!("kj context remove: {e}")),
                 };
@@ -840,17 +825,15 @@ impl KjDispatcher {
             }
         };
 
-        let kernel_id = self.kernel_id();
-
         // Resolve the new holder and find old holder (single lock scope)
         let (new_holder_id, old_holder) = {
             let db = self.kernel_db().lock();
             let new_holder_id =
-                match super::refs::resolve_context_arg(Some(ctx_ref), caller, &db, kernel_id) {
+                match super::refs::resolve_context_arg(Some(ctx_ref), caller, &db) {
                     Ok(id) => id,
                     Err(e) => return KjResult::Err(format!("kj context retag: {e}")),
                 };
-            let old_holder = db.find_context_by_label(kernel_id, label).ok().flatten();
+            let old_holder = db.find_context_by_label(label).ok().flatten();
             (new_holder_id, old_holder)
         };
 
@@ -1082,7 +1065,7 @@ mod tests {
 
         // Verify it's in the DB
         let db = d.kernel_db().lock();
-        let contexts = db.list_active_contexts(d.kernel_id()).unwrap();
+        let contexts = db.list_active_contexts().unwrap();
         assert!(
             contexts
                 .iter()

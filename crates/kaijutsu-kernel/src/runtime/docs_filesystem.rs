@@ -149,8 +149,7 @@ mod tests {
             PrincipalId::system(),
             session_contexts,
             sid,
-            kaijutsu_types::KernelId::new(),
-        ));
+                    ));
         let fs = KaijutsuFilesystem::new(backend);
         assert!(!fs.read_only());
     }
@@ -168,8 +167,7 @@ mod tests {
             PrincipalId::system(),
             session_contexts,
             sid,
-            kaijutsu_types::KernelId::new(),
-        ));
+                    ));
         let fs = KaijutsuFilesystem::new(backend);
         assert!(fs.real_path(Path::new("some/path")).is_none());
     }
@@ -187,8 +185,7 @@ mod tests {
             PrincipalId::system(),
             session_contexts,
             sid,
-            kaijutsu_types::KernelId::new(),
-        ));
+                    ));
         let fs = KaijutsuFilesystem::new(backend);
 
         // Listing root of docs should succeed (may be empty)

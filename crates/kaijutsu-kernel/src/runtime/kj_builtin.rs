@@ -139,10 +139,10 @@ impl KjBuiltin {
             );
         };
 
-        let kernel_id = self.dispatcher.kernel_id();
+        let _kernel_id = self.dispatcher.kernel_id();
         let contexts = {
             let db = self.dispatcher.kernel_db().lock();
-            match db.list_active_contexts(kernel_id) {
+            match db.list_active_contexts() {
                 Ok(rows) => rows,
                 Err(e) => return ExecResult::failure(1, format!("failed to list contexts: {e}")),
             }
@@ -230,10 +230,10 @@ impl KjBuiltin {
 
         // Resolve context reference
         let parsed = crate::kj::refs::parse_context_ref(ctx_ref);
-        let kernel_id = self.dispatcher.kernel_id();
+        let _kernel_id = self.dispatcher.kernel_id();
         let ctx_id = {
             let db = self.dispatcher.kernel_db().lock();
-            match crate::kj::refs::resolve_context_ref(&parsed, caller, &db, kernel_id) {
+            match crate::kj::refs::resolve_context_ref(&parsed, caller, &db) {
                 Ok(id) => id,
                 Err(e) => return ExecResult::failure(1, e),
             }
@@ -556,7 +556,7 @@ mod tests {
     ) -> EmbeddedKaish {
         let blocks = shared_block_store(PrincipalId::system());
         let kernel = dispatcher.kernel().clone();
-        let kernel_id = dispatcher.kernel_id();
+        let _kernel_id = dispatcher.kernel_id();
         let session_id = SessionId::new();
         let session_contexts = session_context_map();
         session_contexts.insert(session_id, ctx);
@@ -582,8 +582,7 @@ mod tests {
             PrincipalId::system(),
             ctx,
             session_id,
-            kernel_id,
-            session_contexts,
+                        session_contexts,
             configure_tools,
         )
         .expect("EmbeddedKaish init")

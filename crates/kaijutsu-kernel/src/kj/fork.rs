@@ -118,7 +118,6 @@ impl KjDispatcher {
             Err(e) => return e,
         };
         let new_id = ContextId::new();
-        let kernel_id = self.kernel_id();
 
         // Validate --model BEFORE any mutations
         let resolved = match self.resolve_fork_model(argv, source_id).await {
@@ -144,8 +143,7 @@ impl KjDispatcher {
 
             let row = ContextRow {
                 context_id: new_id,
-                kernel_id,
-                label: label.clone(),
+                                label: label.clone(),
                 provider: resolved.provider.clone(),
                 model: resolved.model.clone(),
                 system_prompt: None,
@@ -165,7 +163,7 @@ impl KjDispatcher {
                 preset_id: None,
             };
             let default_ws =
-                match db.get_or_create_default_workspace(kernel_id, caller.principal_id) {
+                match db.get_or_create_default_workspace(caller.principal_id) {
                     Ok(id) => id,
                     Err(e) => return KjResult::Err(format!("kj fork: {e}")),
                 };
@@ -319,7 +317,6 @@ impl KjDispatcher {
             Err(e) => return e,
         };
         let new_id = ContextId::new();
-        let kernel_id = self.kernel_id();
 
         // Validate --model BEFORE any mutations
         let resolved = match self.resolve_fork_model(argv, source_id).await {
@@ -354,8 +351,7 @@ impl KjDispatcher {
 
             let row = ContextRow {
                 context_id: new_id,
-                kernel_id,
-                label: label.clone(),
+                                label: label.clone(),
                 provider: resolved.provider.clone(),
                 model: resolved.model.clone(),
                 system_prompt: None,
@@ -371,7 +367,7 @@ impl KjDispatcher {
                 preset_id: None,
             };
             let default_ws =
-                match db.get_or_create_default_workspace(kernel_id, caller.principal_id) {
+                match db.get_or_create_default_workspace(caller.principal_id) {
                     Ok(id) => id,
                     Err(e) => return KjResult::Err(format!("kj fork --shallow: {e}")),
                 };
@@ -534,7 +530,6 @@ impl KjDispatcher {
             Err(e) => return e,
         };
         let new_id = ContextId::new();
-        let kernel_id = self.kernel_id();
 
         // Validate --model BEFORE any mutations
         let resolved = match self.resolve_fork_model(argv, source_id).await {
@@ -597,8 +592,7 @@ impl KjDispatcher {
 
             let row = ContextRow {
                 context_id: new_id,
-                kernel_id,
-                label: label.clone(),
+                                label: label.clone(),
                 provider: resolved.provider.clone(),
                 model: resolved.model.clone(),
                 system_prompt: None,
@@ -614,7 +608,7 @@ impl KjDispatcher {
                 preset_id: None,
             };
             let default_ws =
-                match db.get_or_create_default_workspace(kernel_id, caller.principal_id) {
+                match db.get_or_create_default_workspace(caller.principal_id) {
                     Ok(id) => id,
                     Err(e) => return KjResult::Err(format!("kj fork --compact: {e}")),
                 };
@@ -764,12 +758,11 @@ impl KjDispatcher {
             Err(e) => return e,
         };
 
-        let kernel_id = self.kernel_id();
 
         // Resolve template root
         let template_root_id = {
             let db = self.kernel_db().lock();
-            match db.resolve_context(kernel_id, &template_ref) {
+            match db.resolve_context(&template_ref) {
                 Ok(id) => id,
                 Err(e) => return KjResult::Err(format!("kj fork --as: {e}")),
             }
@@ -835,8 +828,7 @@ impl KjDispatcher {
 
                 let new_row = ContextRow {
                     context_id: new_id,
-                    kernel_id,
-                    label: new_label,
+                                        label: new_label,
                     provider: row.provider.clone(),
                     model: row.model.clone(),
                     system_prompt: row.system_prompt.clone(),
@@ -852,7 +844,7 @@ impl KjDispatcher {
                     preset_id: row.preset_id,
                 };
                 let default_ws =
-                    match db.get_or_create_default_workspace(kernel_id, caller.principal_id) {
+                    match db.get_or_create_default_workspace(caller.principal_id) {
                         Ok(id) => id,
                         Err(e) => return KjResult::Err(format!("kj fork --as: {e}")),
                     };
@@ -998,10 +990,9 @@ impl KjDispatcher {
 
     /// Apply a preset's settings to a context (post-fork).
     async fn apply_preset(&self, context_id: ContextId, preset_label: &str) -> Result<(), String> {
-        let kernel_id = self.kernel_id();
         let preset = {
             let db = self.kernel_db().lock();
-            db.get_preset_by_label(kernel_id, preset_label)
+            db.get_preset_by_label(preset_label)
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| format!("preset '{}' not found", preset_label))?
         };
@@ -1189,7 +1180,7 @@ mod tests {
 
         // Verify new context exists in DB
         let db = d.kernel_db().lock();
-        let contexts = db.list_active_contexts(d.kernel_id()).unwrap();
+        let contexts = db.list_active_contexts().unwrap();
         assert!(
             contexts
                 .iter()
@@ -1306,7 +1297,7 @@ mod tests {
         // Find the new context and verify config was copied
         let db = d.kernel_db().lock();
         let child = db
-            .find_context_by_label(d.kernel_id(), "child")
+            .find_context_by_label("child")
             .unwrap()
             .unwrap();
         let shell = db.get_context_shell(child.context_id).unwrap().unwrap();
@@ -1353,7 +1344,7 @@ mod tests {
 
         let db = d.kernel_db().lock();
         let child = db
-            .find_context_by_label(d.kernel_id(), "research")
+            .find_context_by_label("research")
             .unwrap()
             .unwrap();
         let shell = db.get_context_shell(child.context_id).unwrap().unwrap();
@@ -1400,7 +1391,7 @@ mod tests {
         // Verify child inherited provider+model in DB
         let db = d.kernel_db().lock();
         let child = db
-            .find_context_by_label(d.kernel_id(), "child")
+            .find_context_by_label("child")
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -1445,7 +1436,7 @@ mod tests {
         // Verify child has overridden model in DB
         let db = d.kernel_db().lock();
         let child = db
-            .find_context_by_label(d.kernel_id(), "override")
+            .find_context_by_label("override")
             .unwrap()
             .unwrap();
         assert_eq!(child.provider.as_deref(), Some("mock"));
@@ -1492,7 +1483,7 @@ mod tests {
 
         // Verify no context was created (mutation didn't happen)
         let db = d.kernel_db().lock();
-        let found = db.find_context_by_label(d.kernel_id(), "bad").unwrap();
+        let found = db.find_context_by_label("bad").unwrap();
         assert!(
             found.is_none(),
             "no context should have been created for invalid provider"
@@ -1538,7 +1529,7 @@ mod tests {
         // Verify provider was resolved from registry default
         let db = d.kernel_db().lock();
         let child = db
-            .find_context_by_label(d.kernel_id(), "bare")
+            .find_context_by_label("bare")
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -1605,8 +1596,7 @@ mod tests {
             let db = d.kernel_db().lock();
             db.insert_workspace(&crate::kernel_db::WorkspaceRow {
                 workspace_id: ws_id,
-                kernel_id: d.kernel_id(),
-                label: "test-ws".into(),
+                                label: "test-ws".into(),
                 description: None,
                 created_at: kaijutsu_types::now_millis() as i64,
                 created_by: principal,
@@ -1622,7 +1612,7 @@ mod tests {
 
         let db = d.kernel_db().lock();
         let child = db
-            .find_context_by_label(d.kernel_id(), "child")
+            .find_context_by_label("child")
             .unwrap()
             .unwrap();
         assert_eq!(child.workspace_id, Some(ws_id));

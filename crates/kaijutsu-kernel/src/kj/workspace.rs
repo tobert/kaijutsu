@@ -37,7 +37,7 @@ impl KjDispatcher {
 
     fn workspace_list(&self) -> KjResult {
         let db = self.kernel_db().lock();
-        match db.list_workspaces(self.kernel_id()) {
+        match db.list_workspaces() {
             Ok(workspaces) => {
                 // Workspace labels are the resolver key (`get_workspace_by_label`)
                 // and are required by the schema, so labels are the canonical
@@ -75,7 +75,7 @@ impl KjDispatcher {
         };
 
         let db = self.kernel_db().lock();
-        match db.get_workspace_by_label(self.kernel_id(), label) {
+        match db.get_workspace_by_label(label) {
             Ok(Some(w)) => {
                 let mut lines = vec![format!("Workspace: {}", w.label)];
                 if let Some(desc) = &w.description {
@@ -116,13 +116,11 @@ impl KjDispatcher {
         let paths = extract_all_named_args(argv, &["--path"]);
 
         let db = self.kernel_db().lock();
-        let kernel_id = self.kernel_id();
         let ws_id = WorkspaceId::new();
 
         let row = WorkspaceRow {
             workspace_id: ws_id,
-            kernel_id,
-            label: label.to_string(),
+                        label: label.to_string(),
             description: desc,
             created_at: kaijutsu_types::now_millis() as i64,
             created_by: caller.principal_id,
@@ -169,9 +167,8 @@ impl KjDispatcher {
         let read_only = has_flag(argv, &["--read-only"]);
 
         let db = self.kernel_db().lock();
-        let kernel_id = self.kernel_id();
 
-        let ws = match db.get_workspace_by_label(kernel_id, label) {
+        let ws = match db.get_workspace_by_label(label) {
             Ok(Some(w)) => w,
             Ok(None) => {
                 return KjResult::Err(format!("kj workspace add: workspace '{}' not found", label));
@@ -201,15 +198,14 @@ impl KjDispatcher {
         };
 
         let db = self.kernel_db().lock();
-        let kernel_id = self.kernel_id();
 
         let ctx_arg = argv.get(2).map(|s| s.as_str());
-        let target_id = match super::refs::resolve_context_arg(ctx_arg, caller, &db, kernel_id) {
+        let target_id = match super::refs::resolve_context_arg(ctx_arg, caller, &db) {
             Ok(id) => id,
             Err(e) => return KjResult::Err(format!("kj workspace bind: {e}")),
         };
 
-        let ws = match db.get_workspace_by_label(kernel_id, label) {
+        let ws = match db.get_workspace_by_label(label) {
             Ok(Some(w)) => w,
             Ok(None) => {
                 return KjResult::Err(format!(
@@ -262,9 +258,8 @@ impl KjDispatcher {
         };
 
         let db = self.kernel_db().lock();
-        let kernel_id = self.kernel_id();
 
-        let ws = match db.get_workspace_by_label(kernel_id, label) {
+        let ws = match db.get_workspace_by_label(label) {
             Ok(Some(w)) => w,
             Ok(None) => {
                 return KjResult::Err(format!("kj workspace remove: '{}' not found", label));
@@ -274,7 +269,7 @@ impl KjDispatcher {
 
         if !caller.confirmed {
             let usage_count = db
-                .contexts_using_workspace(kernel_id, ws.workspace_id)
+                .contexts_using_workspace(ws.workspace_id)
                 .unwrap_or(0);
             return KjResult::Latch {
                 command: "kj workspace remove".to_string(),

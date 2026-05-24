@@ -250,18 +250,17 @@ mod tests {
     use crate::kernel_db::KernelDb;
     use crate::mcp::{Broker, InstancePolicy, ToolContent};
     use crate::vfs::MountTable;
-    use kaijutsu_types::{KernelId, PrincipalId};
+    use kaijutsu_types::PrincipalId;
 
     #[tokio::test]
     async fn glob_via_broker() {
         let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
         let creator = PrincipalId::system();
-        let kernel_id = KernelId::new();
         let ws_id = db
             .lock()
-            .get_or_create_default_workspace(kernel_id, creator)
+            .get_or_create_default_workspace(creator)
             .unwrap();
-        let store = shared_block_store_with_db(db, kernel_id, ws_id, creator);
+        let store = shared_block_store_with_db(db, ws_id, creator);
         let _ = (&store, DocumentKind::Code); // keep imports meaningful
 
         let vfs = Arc::new(MountTable::new());
