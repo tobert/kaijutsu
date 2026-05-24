@@ -121,18 +121,15 @@ fn bootstrap_thread(
                             // spawn_actor creates the actor in this LocalSet.
                             // It will auto-connect on first command (lazy connect).
                             //
-                            // NOTE: Each SpawnActor creates a fresh SSH connection.
-                            // RpcClient/KernelHandle are !Send (capnp), so we can't
-                            // extract them from the old actor via the Send channel.
-                            // SSH handshake is ~10-50ms localhost, ~100-300ms remote.
-                            // Future optimization: coordinate handoff locally within
-                            // this LocalSet if latency becomes an issue.
+                            // The kernel_id passed in is advisory — the FSM
+                            // re-binds and learns the server-authoritative
+                            // kernel_id on every successful connect. It's
+                            // included in BootstrapResult only so callers can
+                            // log it for the in-flight cycle.
                             let handle = kaijutsu_client::spawn_actor(
                                 config,
-                                kernel_id,
                                 context_id,
                                 instance,
-                                None,
                             );
 
                             let _ = result_tx.send(BootstrapResult::ActorReady {

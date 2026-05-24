@@ -247,6 +247,19 @@ pub struct SharedKernelState {
     pub kj_dispatcher: Arc<kaijutsu_kernel::KjDispatcher>,
     /// Per-session current-context tracking for the `context` shell command.
     pub session_contexts: kaijutsu_kernel::runtime::context_engine::SessionContextMap,
+    /// Per-(principal, client-instance) registry of live FlowBus subscriptions.
+    ///
+    /// When a client calls `subscribeBlocksFiltered` with the same
+    /// `(principal, instance)` key as a prior live subscription, the old
+    /// task is aborted before the new one starts. Without this, a client
+    /// that reconnects after a silent socket death leaks one bridge task
+    /// per reconnect cycle — the orphan holds the dead callback capability
+    /// and (until the connection's `conn_cancel` finally fires) keeps the
+    /// FlowBus subscriber alive on the kernel side.
+    ///
+    /// `parking_lot::Mutex` because all ops are insert/remove/replace and
+    /// complete in microseconds.
+    pub subscription_registry: Arc<parking_lot::Mutex<HashMap<(PrincipalId, String), tokio::task::AbortHandle>>>,
 }
 
 pub type SharedKernel = Arc<SharedKernelState>;
@@ -1099,6 +1112,7 @@ pub async fn create_shared_kernel(
         interrupt_generation: AtomicU64::new(0),
         kj_dispatcher,
         session_contexts,
+        subscription_registry: Arc::new(parking_lot::Mutex::new(HashMap::new())),
     };
 
     Ok(Arc::new(shared))
@@ -2874,9 +2888,14 @@ impl kernel::Server for KernelImpl {
 
     fn subscribe_mcp_resources(
         self: Rc<Self>,
-        _params: kernel::SubscribeMcpResourcesParams,
+        params: kernel::SubscribeMcpResourcesParams,
         _results: kernel::SubscribeMcpResourcesResults,
     ) -> Promise<(), capnp::Error> {
+        // Accept the `instance` param for wire compatibility with the new
+        // client. No-op handler today (resource events not wired); when this
+        // gains a real bridge task it should plug into
+        // `subscription_registry` like `subscribe_blocks_filtered` does.
+        let _p = pry!(params.get());
         Promise::ok(())
     }
 
@@ -2885,7 +2904,12 @@ impl kernel::Server for KernelImpl {
         params: kernel::SubscribeMcpElicitationsParams,
         _results: kernel::SubscribeMcpElicitationsResults,
     ) -> Promise<(), capnp::Error> {
-        let callback = pry!(pry!(params.get()).get_callback());
+        let p = pry!(params.get());
+        let callback = pry!(p.get_callback());
+        // `instance` is read for wire compatibility. Elicitation subscribers
+        // are stored in per-connection state, which is dropped when the
+        // connection tears down — no cross-connection dedupe needed.
+        let _instance = pry!(pry!(p.get_instance()).to_str());
         self.connection
             .borrow_mut()
             .add_elicitation_subscriber(callback);
@@ -4209,6 +4233,15 @@ impl kernel::Server for KernelImpl {
         let p = pry!(params.get());
         let callback = pry!(p.get_callback());
 
+        // Client-supplied instance UUID. Together with the principal it forms
+        // the dedupe key — a reconnect from the same client (same instance)
+        // replaces the prior live subscription instead of stacking. Older
+        // clients that don't set it pass an empty string; those still benefit
+        // from dedupe per-principal but two distinct old clients of the same
+        // principal will trample each other. That's an acceptable degradation
+        // — the alternative (no dedupe for empty instance) leaks tasks again.
+        let instance = pry!(pry!(p.get_instance()).to_str()).to_owned();
+
         // Parse the BlockEventFilter from the capnp struct
         let filter = if p.has_filter() {
             let f = pry!(p.get_filter());
@@ -4250,8 +4283,11 @@ impl kernel::Server for KernelImpl {
             let input_flows = self.kernel.documents.input_flows().cloned();
             let kernel_id = self.kernel.id;
             let conn_cancel = self.connection.borrow().cancel_token();
+            let principal_id = self.connection.borrow().principal.id;
+            let registry = self.kernel.subscription_registry.clone();
+            let dedupe_key = (principal_id, instance.clone());
 
-            tokio::task::spawn_local(async move {
+            let task = tokio::task::spawn_local(async move {
                 let mut block_sub = block_flows.subscribe(subscribe_pattern);
                 let mut input_sub = input_flows.map(|f| f.subscribe("input.*"));
                 log::debug!(
@@ -4639,6 +4675,35 @@ impl kernel::Server for KernelImpl {
                     kernel_id
                 );
             });
+
+            // Register the AbortHandle. If a prior subscription exists for
+            // this (principal, instance) — typically a reconnect after the
+            // previous TCP connection died silently — abort it before
+            // dropping it from the map. The aborted task's `tokio::select!`
+            // wakes via the cancellation path and unwinds without delivering
+            // any more events; the dead callback held by that task is dropped
+            // with the task frame.
+            //
+            // We do NOT remove our own entry on natural exit (when conn_cancel
+            // fires from the connection's Drop). The cost of leaving a
+            // finished AbortHandle in the map is O(small struct) per distinct
+            // (principal, instance) ever seen; correctness wins over a tiny
+            // bounded leak.
+            let new_handle = task.abort_handle();
+            let prior = {
+                let mut reg = registry.lock();
+                reg.insert(dedupe_key.clone(), new_handle)
+            };
+            if let Some(prior) = prior {
+                if !prior.is_finished() {
+                    log::info!(
+                        "Replacing live FlowBus subscription for kernel {} \
+                         instance={} principal={:?}",
+                        kernel_id, dedupe_key.1, dedupe_key.0,
+                    );
+                    prior.abort();
+                }
+            }
         }
         Promise::ok(())
     }
@@ -4984,6 +5049,31 @@ impl kernel::Server for KernelImpl {
             }
             Err(e) => Promise::err(capnp::Error::failed(e.to_string())),
         }
+    }
+
+    /// Cheap liveness probe. Returns the kernel ID and wall-clock time.
+    ///
+    /// Used by the client's reconnect FSM to detect a wedged RPC system: if
+    /// `ping` doesn't return within the client's per-ping deadline, the
+    /// client transitions to `Closing` and reconnects. The handler must not
+    /// touch any per-context lock, hit the database, or otherwise do work
+    /// that could itself wedge — its purpose is purely to confirm that the
+    /// RPC pipe is being drained and the kernel can produce a reply.
+    fn ping(
+        self: Rc<Self>,
+        params: kernel::PingParams,
+        mut results: kernel::PingResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let _span = extract_rpc_trace(p.get_trace(), "ping").entered();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let mut r = results.get();
+        r.set_kernel_id(self.kernel.id.as_bytes());
+        r.set_server_time_ms(now_ms);
+        Promise::ok(())
     }
 }
 

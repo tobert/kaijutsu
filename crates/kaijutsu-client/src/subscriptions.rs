@@ -97,20 +97,44 @@ pub enum ServerEvent {
     ContextSwitched { context_id: ContextId },
 }
 
-/// Connection lifecycle status.
+/// Connection lifecycle status broadcast by the reconnect FSM.
 ///
 /// Subscribe via [`ActorHandle::subscribe_status()`](crate::ActorHandle::subscribe_status).
+///
+/// Variants mirror the actor's internal state machine: `Idle` is the initial
+/// state, `Connecting` is the handshake in flight, `Connected` means the
+/// pipe is live and subscriptions are registered, `Closing` is graceful
+/// teardown of a live connection, `Cooldown` is the backoff window between
+/// failed attempts, and `Terminal` is a sticky permanent failure.
 #[derive(Clone, Debug)]
 pub enum ConnectionStatus {
+    /// Initial state. No command has triggered the first connect yet.
+    Idle,
+    /// Handshake in progress.
+    Connecting { attempt: u32 },
+    /// Connection live; subscriptions registered; liveness ping running.
     Connected {
         kernel_id: KernelId,
         context_id: Option<ContextId>,
+        /// Milliseconds since this Connected transition began (best-effort).
+        since_ms: u64,
     },
-    Disconnected,
-    Reconnecting {
-        attempt: u32,
+    /// Connection being torn down; reconnect or terminal follows.
+    Closing {
+        /// Human-readable description of why we're closing.
+        cause: String,
     },
-    Error(String),
+    /// Waiting before the next connect attempt.
+    Cooldown {
+        /// Attempt number that will be used when the timer expires.
+        next_attempt: u32,
+        /// Unix-epoch milliseconds at which the next attempt fires.
+        until_ms: u64,
+        /// Human-readable description of the last failure.
+        last_error: String,
+    },
+    /// Permanent failure. Absorbing state — no more attempts.
+    Terminal { reason: String },
 }
 
 /// Monotonic generation counter — bumped on lag or reconnect.

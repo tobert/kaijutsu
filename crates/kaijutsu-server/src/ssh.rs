@@ -218,6 +218,15 @@ impl SshServer {
             auth_rejection_time: std::time::Duration::from_millis(100),
             auth_rejection_time_initial: Some(std::time::Duration::from_secs(0)),
             keys: vec![host_key],
+            // Server-side keepalive: emit SSH_MSG_GLOBAL_REQUEST every 30s and
+            // tear down the session if 3 in a row go unanswered. Without this,
+            // a silently-vanished client (TCP half-open after NAT timeout, app
+            // crash without graceful shutdown) leaves the per-connection RPC
+            // thread running and its FlowBus bridge holding subscriptions.
+            // 30s × 3 = ~90s upper bound on dead-peer detection, matched to
+            // the client-side keepalive in kaijutsu-client::constants.
+            keepalive_interval: Some(std::time::Duration::from_secs(30)),
+            keepalive_max: 3,
             ..Default::default()
         };
 

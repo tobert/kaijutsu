@@ -912,7 +912,7 @@ interface Kernel {
   # MCP Resource management (push-first with caching)
   listMcpResources @31 (server :Text, trace :TraceContext) -> (resources :List(McpResource));
   readMcpResource @32 (server :Text, uri :Text, trace :TraceContext) -> (contents :McpResourceContents, hasContents :Bool);
-  subscribeMcpResources @33 (callback :ResourceEvents);
+  subscribeMcpResources @33 (callback :ResourceEvents, instance :Text);
 
   # MCP Roots (client advertises workspaces to servers)
   setMcpRoots @34 (roots :List(McpRoot));
@@ -925,7 +925,7 @@ interface Kernel {
   subscribeMcpProgress @37 (callback :ProgressEvents);
 
   # MCP Elicitation (server-initiated requests for user input)
-  subscribeMcpElicitations @38 (callback :ElicitationEvents);
+  subscribeMcpElicitations @38 (callback :ElicitationEvents, instance :Text);
 
   # MCP Completion (request/response)
   completeMcp @39 (server :Text, refType :Text, refName :Text, argName :Text, value :Text) -> (result :McpCompletionResult);
@@ -1082,7 +1082,7 @@ interface Kernel {
   # Subscribe to block events with server-side filtering.
   # Like subscribeBlocks @13 but the server applies the filter before sending,
   # reducing bandwidth and client CPU during high-throughput streaming.
-  subscribeBlocksFiltered @74 (callback :BlockEvents, filter :BlockEventFilter);
+  subscribeBlocksFiltered @74 (callback :BlockEvents, filter :BlockEventFilter, instance :Text);
 
   # Interrupt a running LLM stream or shell jobs for a context.
   # immediate=false → soft interrupt (stop agentic loop after current tool turn).
@@ -1127,6 +1127,14 @@ interface Kernel {
   # `replayed = false` when the id isn't present (already drained or
   # never queued).
   replayDeadLetter @83 (id :UInt64, trace :TraceContext) -> (replayed :Bool);
+
+  # Cheap liveness probe used by the client's reconnection FSM.
+  # Returns the server-assigned kernel ID (so the client can detect a
+  # silent rebind across kernel restart) and the server's wall-clock time
+  # in milliseconds since the Unix epoch (for clock-skew diagnostics).
+  # Handler must not take any per-context locks — this exists to detect
+  # liveness, not to validate kernel state.
+  ping @84 (trace :TraceContext) -> (kernelId :Data, serverTimeMs :UInt64);
 }
 
 # A staged drift that exceeded its retry budget or whose target dropped

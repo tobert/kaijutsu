@@ -267,6 +267,29 @@ impl KernelHandle {
         parse_kernel_info(&info)
     }
 
+    /// Cheap liveness probe. Returns `(kernel_id, server_time_ms)`.
+    ///
+    /// Used by the reconnect FSM's background liveness pinger. The handler
+    /// is documented as "must not take per-context locks" so a wedge in
+    /// LLM / drift / context machinery doesn't mask itself as ping success.
+    /// A `kernel_id` mismatch vs. what the actor bound to means the server
+    /// restarted under us — the FSM treats that as a hard reconnect signal.
+    #[tracing::instrument(skip(self), name = "rpc_client.ping")]
+    pub async fn ping(&self) -> Result<(KernelId, u64), RpcError> {
+        let mut request = self.kernel.ping_request();
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        let response = request.send().promise.await?;
+        let reader = response.get()?;
+        let kernel_id = parse_kernel_id(reader.get_kernel_id()?)?;
+        let server_time_ms = reader.get_server_time_ms();
+        Ok((kernel_id, server_time_ms))
+    }
+
     // =========================================================================
     // Context management
     // =========================================================================
@@ -664,8 +687,10 @@ impl KernelHandle {
 
     /// Subscribe to block events with server-side filtering.
     ///
-    /// Like `subscribe_blocks` but the server applies the filter before sending,
-    /// reducing bandwidth and client CPU during high-throughput streaming.
+    /// `instance` is the client's stable per-session UUID. The server uses
+    /// `(principal, instance)` as a dedupe key — a new subscribe from the
+    /// same instance replaces the prior live subscription instead of stacking.
+    /// Passing an empty string disables instance-based dedupe (older callers).
     #[tracing::instrument(
         skip(self, callback, filter),
         name = "rpc_client.subscribe_blocks_filtered"
@@ -674,13 +699,15 @@ impl KernelHandle {
         &self,
         callback: crate::kaijutsu_capnp::block_events::Client,
         filter: &kaijutsu_types::BlockEventFilter,
+        instance: &str,
     ) -> Result<(), RpcError> {
         let mut request = self.kernel.subscribe_blocks_filtered_request();
         {
             let mut params = request.get();
             params.set_callback(callback);
-            let mut fb = params.init_filter();
+            let mut fb = params.reborrow().init_filter();
             set_block_event_filter_builder(&mut fb, filter);
+            params.set_instance(instance);
         }
         request.send().promise.await?;
         Ok(())
@@ -869,35 +896,44 @@ impl KernelHandle {
         }
     }
 
-    /// Subscribe to MCP resource events
+    /// Subscribe to MCP resource events.
     ///
-    /// The callback will receive notifications when resources are updated
-    /// or when a server's resource list changes.
+    /// `instance` is the client's stable per-session UUID — see
+    /// `subscribe_blocks_filtered` for dedupe semantics.
     #[tracing::instrument(skip(self, callback), name = "rpc_client.subscribe_mcp_resources")]
     pub async fn subscribe_mcp_resources(
         &self,
         callback: crate::kaijutsu_capnp::resource_events::Client,
+        instance: &str,
     ) -> Result<(), RpcError> {
         let mut request = self.kernel.subscribe_mcp_resources_request();
-        request.get().set_callback(callback);
+        {
+            let mut params = request.get();
+            params.set_callback(callback);
+            params.set_instance(instance);
+        }
         request.send().promise.await?;
         Ok(())
     }
 
-    /// Subscribe to MCP elicitation requests
+    /// Subscribe to MCP elicitation requests.
     ///
-    /// The callback will receive elicitation requests from MCP servers that
-    /// require user input. The callback must return a response for each request.
-    ///
-    /// Elicitation is a server-initiated pattern where MCP servers can request
-    /// confirmation or input from the user for operations that require consent.
+    /// `instance` is the client's stable per-session UUID — see
+    /// `subscribe_blocks_filtered` for dedupe semantics. Elicitation
+    /// subscriptions are per-connection on the server today, so dedupe is
+    /// a no-op there; the parameter exists for protocol uniformity.
     #[tracing::instrument(skip(self, callback), name = "rpc_client.subscribe_mcp_elicitations")]
     pub async fn subscribe_mcp_elicitations(
         &self,
         callback: crate::kaijutsu_capnp::elicitation_events::Client,
+        instance: &str,
     ) -> Result<(), RpcError> {
         let mut request = self.kernel.subscribe_mcp_elicitations_request();
-        request.get().set_callback(callback);
+        {
+            let mut params = request.get();
+            params.set_callback(callback);
+            params.set_instance(instance);
+        }
         request.send().promise.await?;
         Ok(())
     }

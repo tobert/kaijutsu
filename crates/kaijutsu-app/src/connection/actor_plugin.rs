@@ -474,9 +474,15 @@ fn update_connection_state(
 ) {
     for ConnectionStatusMessage(status) in status_events.read() {
         match status {
+            kaijutsu_client::ConnectionStatus::Idle => {
+                state.connected = false;
+                state.reconnect_attempt = 0;
+                state.last_error = None;
+            }
             kaijutsu_client::ConnectionStatus::Connected {
                 kernel_id,
                 context_id,
+                since_ms: _,
             } => {
                 state.connected = true;
                 state.reconnect_attempt = 0;
@@ -484,20 +490,30 @@ fn update_connection_state(
                 state.context_id = *context_id;
                 state.last_error = None;
             }
-            kaijutsu_client::ConnectionStatus::Disconnected => {
-                state.connected = false;
-                state.identity = None;
-                state.current_kernel = None;
-            }
-            kaijutsu_client::ConnectionStatus::Reconnecting { attempt } => {
+            kaijutsu_client::ConnectionStatus::Connecting { attempt } => {
                 state.connected = false;
                 state.reconnect_attempt = *attempt;
-                // Intentionally leave last_error in place — the cause
-                // outlives a single Reconnecting tick.
+                // Intentionally leave last_error in place — the cause from
+                // the previous cycle is what drives this Connecting.
             }
-            kaijutsu_client::ConnectionStatus::Error(msg) => {
+            kaijutsu_client::ConnectionStatus::Closing { cause } => {
                 state.connected = false;
-                state.last_error = Some(msg.clone());
+                state.last_error = Some(cause.clone());
+            }
+            kaijutsu_client::ConnectionStatus::Cooldown {
+                next_attempt,
+                last_error,
+                ..
+            } => {
+                state.connected = false;
+                state.reconnect_attempt = *next_attempt;
+                state.last_error = Some(last_error.clone());
+            }
+            kaijutsu_client::ConnectionStatus::Terminal { reason } => {
+                state.connected = false;
+                state.last_error = Some(reason.clone());
+                state.identity = None;
+                state.current_kernel = None;
             }
         }
     }

@@ -267,7 +267,7 @@ impl KaijutsuMcp {
         tracing::debug!(?config, "Connecting via SSH");
 
         let client = connect_ssh(config.clone()).await?;
-        let (kernel, kernel_id_typed) = client.bind_kernel().await?;
+        let (_kernel, kernel_id_typed) = client.bind_kernel().await?;
 
         tracing::info!(
             kernel = %kernel_id_typed,
@@ -275,16 +275,14 @@ impl KaijutsuMcp {
             "Connected to server (no context joined yet)"
         );
 
+        // Drop the eagerly-built client+kernel; the actor builds its own
+        // connection via its FSM. The eager bind_kernel above served as a
+        // permission probe (auth, kernel reachable) before we commit to
+        // spawning. The 50ms re-handshake by the actor is acceptable.
+        drop(client);
+
         // Spawn actor with no context — it will join via register_session.
-        // kernel_id is already known here because we drove bind_kernel
-        // ourselves above (vs the client which lazy-connects).
-        let actor = spawn_actor(
-            config,
-            Some(kernel_id_typed),
-            None,
-            "mcp-server".to_string(),
-            Some((client, kernel)),
-        );
+        let actor = spawn_actor(config, None, "mcp-server".to_string());
 
         tracing::info!("RPC actor spawned, persistent connection ready");
 
@@ -1882,8 +1880,10 @@ impl KaijutsuMcp {
             Err(e) => return format!("Error creating context: {e}"),
         };
 
-        // 2. Join it via the actor (updates actor's internal state for reconnects)
-        if let Err(e) = remote.actor.join_context(context_id, "mcp-server").await {
+        // 2. Join it via the actor (updates actor's internal state for reconnects).
+        // The actor's `instance` was set at spawn_actor time; the join_context
+        // RPC now only takes the context id.
+        if let Err(e) = remote.actor.join_context(context_id).await {
             return format!("Error joining context: {e}");
         }
 
