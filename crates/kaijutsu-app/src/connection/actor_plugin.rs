@@ -228,17 +228,43 @@ fn poll_bootstrap_results(
                     context_id
                 );
 
-                // Eagerly connect: fire whoami to trigger ensure_connected
-                // (SSH → bind_kernel → subscriptions → Connected).
-                // If a context was specified, fetch its state and emit ContextJoined.
-                // Otherwise just get identity + populate constellation from list_contexts().
+                // The reconnect FSM rejects the first call to a fresh actor
+                // with NotReady(Idle) and starts connecting in the
+                // background. We subscribe to status first so we don't race
+                // past the Connected event, kick the actor with a throwaway
+                // call, then wait for the FSM to surface Connected (or
+                // Terminal) before issuing the real bootstrap calls.
                 let h = handle.clone();
                 let tx = result_channel.sender();
                 let inv_tx = invocation_channel.tx.clone();
                 let ctx_id = context_id;
                 bevy::tasks::IoTaskPool::get()
                     .spawn(async move {
-                        // 1. whoami triggers ensure_connected + gives us identity
+                        let mut status_rx = h.subscribe_status();
+                        // Kick the FSM out of Idle. NotReady is expected.
+                        let _ = h.whoami().await;
+
+                        // Wait until the actor reaches Connected — or
+                        // Terminal, in which case bootstrap is over.
+                        loop {
+                            match status_rx.recv().await {
+                                Ok(kaijutsu_client::ConnectionStatus::Connected { .. }) => {
+                                    break;
+                                }
+                                Ok(kaijutsu_client::ConnectionStatus::Terminal { reason }) => {
+                                    log::warn!("Bootstrap aborted: actor terminal: {reason}");
+                                    return;
+                                }
+                                Ok(_) => continue,
+                                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                                Err(broadcast::error::RecvError::Closed) => {
+                                    log::warn!("Bootstrap aborted: status channel closed");
+                                    return;
+                                }
+                            }
+                        }
+
+                        // 1. whoami — now guaranteed not to be NotReady
                         let identity = match h.whoami().await {
                             Ok(id) => {
                                 let _ = tx.send(RpcResultMessage::IdentityReceived(id.clone()));
