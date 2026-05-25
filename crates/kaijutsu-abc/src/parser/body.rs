@@ -69,6 +69,23 @@ pub fn parse_body(
             at_line_start = false;
         }
 
+        // Trailing-backslash line continuation per §6.1.1: `\<newline>`
+        // joins the next physical line into the current logical line.
+        // No LineBreak is emitted; the next line is parsed mid-music
+        // (at_line_start stays false).
+        if remaining.starts_with("\\\n") {
+            remaining = &remaining[2..];
+            line_num += 1;
+            at_line_start = false;
+            continue;
+        }
+        if remaining.starts_with("\\\r\n") {
+            remaining = &remaining[3..];
+            line_num += 1;
+            at_line_start = false;
+            continue;
+        }
+
         // Check for newline
         if remaining.starts_with('\n') {
             remaining = &remaining[1..];

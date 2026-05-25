@@ -34,7 +34,11 @@ use std::path::{Path, PathBuf};
 ///    358 — broken rhythm < and > operators per §4.4
 ///    354 — voice overlay & marker per §7.4
 ///    351 — alternate decoration syntax +f+ per §4.14
-const MAX_TOTAL_WARNINGS: usize = 351;
+///    359 — trailing-\ line continuation per §6.1.1 (NET +8: removes
+///          the \-as-unknown warnings but exposes mid-music content on
+///          the continued physical line that the parser doesn't yet
+///          recognise — a more spec-correct surface, not a regression)
+const MAX_TOTAL_WARNINGS: usize = 359;
 const MAX_TOTAL_ERRORS: usize = 0;
 
 struct Outcome {
