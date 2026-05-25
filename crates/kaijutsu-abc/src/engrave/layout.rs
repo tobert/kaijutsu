@@ -385,6 +385,12 @@ fn render_staff(
             Element::Decoration(d) => {
                 pending_decorations.push(d.clone());
             }
+            Element::GraceNotes {
+                acciaccatura,
+                notes,
+            } => {
+                cursor_x = emit_grace_notes(elements, notes, *acciaccatura, cursor_x, ctx);
+            }
             Element::Slur(SlurBoundary::Start) => {
                 slur_stack.push(None);
             }
@@ -535,6 +541,96 @@ fn render_staff(
     }
 
     (line_start, line_end, cursor_x)
+}
+
+// --- Grace notes ------------------------------------------------------------
+
+/// Render a `{...}` grace group at smaller scale. Returns the new cursor_x
+/// after the grace prefix. Acciaccatura adds a diagonal slash through the
+/// first grace note's stem.
+fn emit_grace_notes(
+    elements: &mut Vec<EngravingElement>,
+    notes: &[Note],
+    acciaccatura: bool,
+    cursor_x: f64,
+    ctx: StaffCtx,
+) -> f64 {
+    if notes.is_empty() {
+        return cursor_x;
+    }
+    let font = font_cache();
+    let grace_scale = ctx.scale * 0.6;
+    let grace_step = ctx.sp * 1.0;
+    let notehead_cp = 0xE0A4u32; // filled
+    let advance = font.glyph_advance(notehead_cp).unwrap_or(500.0) * grace_scale;
+
+    let mut x = cursor_x;
+    let mut first_grace_anchor: Option<(f64, f64)> = None;
+
+    for note in notes {
+        let pos = note_to_staff_position(&note.pitch, note.octave, ctx.clef);
+        let y = ctx.y_at(pos);
+
+        // Accidental in front of the grace head, also small.
+        if let Some(acc) = note.accidental {
+            let acc_cp = match acc {
+                Accidental::Sharp | Accidental::DoubleSharp => 0xE262,
+                Accidental::Flat | Accidental::DoubleFlat => 0xE260,
+                Accidental::Natural => 0xE261,
+            };
+            elements.push(EngravingElement::Glyph {
+                codepoint: acc_cp,
+                x: x - ctx.sp * 0.5,
+                y,
+                scale: grace_scale,
+                source_span: (0, 0),
+            });
+        }
+
+        elements.push(EngravingElement::Glyph {
+            codepoint: notehead_cp,
+            x,
+            y,
+            scale: grace_scale,
+            source_span: (0, 0),
+        });
+
+        // Stem: always up for grace notes (a short stem from the right side).
+        let stem_x = x + advance;
+        let stem_top_y = y - ctx.sp * 2.0;
+        elements.push(EngravingElement::Line {
+            x1: stem_x,
+            y1: y,
+            x2: stem_x,
+            y2: stem_top_y,
+            width: 0.6,
+            source_span: (0, 0),
+        });
+
+        if first_grace_anchor.is_none() {
+            first_grace_anchor = Some((stem_x, y));
+        }
+
+        x += grace_step;
+    }
+
+    if acciaccatura {
+        if let Some((stem_x, y)) = first_grace_anchor {
+            // Slash crossing the stem at roughly mid-stem height.
+            let slash_half = ctx.sp * 0.5;
+            elements.push(EngravingElement::Line {
+                x1: stem_x - slash_half,
+                y1: y - ctx.sp * 0.5,
+                x2: stem_x + slash_half,
+                y2: y - ctx.sp * 1.7,
+                width: 0.7,
+                source_span: (0, 0),
+            });
+        }
+    }
+
+    // Leave a small gap between the grace group and the principal note.
+    x + ctx.sp * 0.3
 }
 
 // --- Decorations ------------------------------------------------------------
