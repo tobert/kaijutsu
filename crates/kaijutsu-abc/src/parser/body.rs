@@ -59,6 +59,15 @@ pub fn parse_body(
                 at_line_start = false;
                 continue;
             }
+            // Generic info field line (`M:3/4`, `K:G`, `P:A`, …) per
+            // spec §3.2. w:/W:/s: are handled above; V: is handled by
+            // try_parse_element as VoiceSwitch so multi-voice routing
+            // keeps working.
+            if let Some(field) = try_parse_line_start_info_field(&mut remaining) {
+                elements.push(Element::InlineField(field));
+                at_line_start = false;
+                continue;
+            }
         }
 
         // Skip leading whitespace (but not newlines)
@@ -260,6 +269,33 @@ fn broken_rhythm_ratios(signed: i32) -> (u16, u16, u16, u16) {
     } else {
         (short_num, short_den, long_num, long_den)
     }
+}
+
+/// Try to consume a body-position info-field line (`M:3/4`, `K:G`,
+/// `P:A`, etc.) per §3.2. Letters that have dedicated handling
+/// (w:, W:, s:, +:, V:) are left for their specific paths so this
+/// generic helper never preempts them.
+fn try_parse_line_start_info_field(remaining: &mut &str) -> Option<InfoField> {
+    let bytes = remaining.as_bytes();
+    if bytes.len() < 2 || bytes[1] != b':' {
+        return None;
+    }
+    let letter = bytes[0] as char;
+    // Special cases handled elsewhere.
+    if matches!(letter, 'w' | 'W' | 's' | 'V' | '+') {
+        return None;
+    }
+    if !letter.is_ascii_alphabetic() {
+        return None;
+    }
+    let after = &remaining[2..];
+    let line_end = after.find('\n').unwrap_or(after.len());
+    let value = after[..line_end].trim().to_string();
+    *remaining = &after[line_end..];
+    Some(InfoField {
+        field_type: letter,
+        value,
+    })
 }
 
 /// Append `+:` continuation content to the most recent field-line

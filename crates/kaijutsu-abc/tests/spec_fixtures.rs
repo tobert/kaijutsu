@@ -41,7 +41,9 @@ use std::path::{Path, PathBuf};
 ///    152 — multi-tune files: parse() returns Vec<Tune>, X:N markers
 ///          delimit tunes per §2.2; file-level header content folds
 ///          into the first tune (no inheritance yet)
-const MAX_TOTAL_WARNINGS: usize = 152;
+///    109 — mid-body inline info fields per §3.2 (M:, K:, P:, N: at
+///          body line-start emit Element::InlineField)
+const MAX_TOTAL_WARNINGS: usize = 109;
 const MAX_TOTAL_ERRORS: usize = 0;
 
 struct Outcome {
