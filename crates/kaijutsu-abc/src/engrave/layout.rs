@@ -331,6 +331,9 @@ fn render_staff(
     // The most recently-rendered note — needed to close a slur from its
     // last note, and to compute tie geometry when the prior note set tie.
     let mut last_anchor: Option<NoteAnchor> = None;
+    // Decorations seen as standalone `Element::Decoration` since the last
+    // note. Drained onto the next note's anchor.
+    let mut pending_decorations: Vec<Decoration> = Vec::new();
 
     for element in &voice.elements {
         match element {
@@ -365,10 +368,22 @@ fn render_staff(
                 }
 
                 cursor_x = emit_note(elements, note, cursor_x, ctx, unit_width, &unit_length, span);
+
+                // Drain pending standalone decorations onto this note,
+                // then add the note's own decorations.
+                if !pending_decorations.is_empty() || !note.decorations.is_empty() {
+                    let mut decos = std::mem::take(&mut pending_decorations);
+                    decos.extend(note.decorations.iter().cloned());
+                    emit_decorations_for_note(elements, &decos, anchor, ctx);
+                }
+
                 last_anchor = Some(anchor);
                 if note.tie {
                     pending_tie = Some(anchor);
                 }
+            }
+            Element::Decoration(d) => {
+                pending_decorations.push(d.clone());
             }
             Element::Slur(SlurBoundary::Start) => {
                 slur_stack.push(None);
@@ -520,6 +535,102 @@ fn render_staff(
     }
 
     (line_start, line_end, cursor_x)
+}
+
+// --- Decorations ------------------------------------------------------------
+
+/// SMuFL codepoint for a decoration glyph, when one exists in Bravura.
+/// Decorations without a glyph (`Other`, `Crescendo`, `Diminuendo` hairpins)
+/// return None — the caller decides whether to render text or skip.
+fn decoration_glyph(deco: &Decoration) -> Option<u32> {
+    match deco {
+        Decoration::Staccato => Some(0xE4A2),
+        Decoration::Accent => Some(0xE4A0),
+        Decoration::Fermata => Some(0xE4C0),
+        Decoration::Trill => Some(0xE566),
+        // Roll/Mordent/Turn — use ornament glyphs that exist in Bravura.
+        Decoration::Roll => Some(0xE566),         // Trill-like; the Irish roll has no
+                                                  // dedicated SMuFL glyph.
+        Decoration::Mordent { upper: false } => Some(0xE56C),
+        Decoration::Mordent { upper: true } => Some(0xE56D),
+        Decoration::Turn => Some(0xE567),
+        Decoration::UpBow => Some(0xE612),
+        Decoration::DownBow => Some(0xE610),
+        Decoration::Dynamic(d) => Some(match d {
+            Dynamic::PPP => 0xE52A,
+            Dynamic::PP => 0xE52B,
+            Dynamic::P => 0xE520,
+            Dynamic::MP => 0xE52C,
+            Dynamic::MF => 0xE52D,
+            Dynamic::F => 0xE522,
+            Dynamic::FF => 0xE52F,
+            Dynamic::FFF => 0xE530,
+        }),
+        Decoration::Crescendo { .. } | Decoration::Diminuendo { .. } => None,
+        Decoration::Other(_) => None,
+    }
+}
+
+/// True if the decoration is a dynamic mark — those always render below
+/// the staff regardless of stem direction.
+fn is_dynamic(deco: &Decoration) -> bool {
+    matches!(deco, Decoration::Dynamic(_))
+}
+
+/// Emit all decorations attached to a note. `decos` is the buffered list
+/// of standalone `Element::Decoration` items collected immediately before
+/// this note, concatenated with the note's own `.decorations`. The first
+/// dynamic stacks below the staff; non-dynamic decorations stack on the
+/// side opposite the stem.
+fn emit_decorations_for_note(
+    elements: &mut Vec<EngravingElement>,
+    decos: &[Decoration],
+    anchor: NoteAnchor,
+    ctx: StaffCtx,
+) {
+    let font = font_cache();
+    let sp = ctx.sp;
+    // Dynamics below the staff; their y stacks downward.
+    let mut dyn_y = ctx.y_at(4.0) + sp * 2.0;
+    // Above-note decorations: stack going up from a position above the
+    // higher of (note position, staff top).
+    let above_origin = ctx.y_at(anchor.pos.min(0.0)) - sp * 1.5;
+    // Below-note decorations: stack going down from below the lower of
+    // (note position, staff bottom).
+    let below_origin = ctx.y_at(anchor.pos.max(4.0)) + sp * 1.5;
+    let mut above_y = above_origin;
+    let mut below_y = below_origin;
+    // Side: stem-down (pos ≤ 2.0) → decorations above; stem-up → below.
+    let above_side = anchor.pos <= 2.0;
+
+    for deco in decos {
+        let Some(cp) = decoration_glyph(deco) else {
+            continue;
+        };
+        if font.glyph_path(cp).is_none() {
+            continue;
+        }
+        let (x, y) = if is_dynamic(deco) {
+            let y = dyn_y;
+            dyn_y += sp * 1.4;
+            (anchor.x_left, y)
+        } else if above_side {
+            let y = above_y;
+            above_y -= sp * 1.2;
+            (anchor.x_left, y)
+        } else {
+            let y = below_y;
+            below_y += sp * 1.2;
+            (anchor.x_left, y)
+        };
+        elements.push(EngravingElement::Glyph {
+            codepoint: cp,
+            x,
+            y,
+            scale: ctx.scale,
+            source_span: (0, 0),
+        });
+    }
 }
 
 // --- Tie / slur geometry ----------------------------------------------------

@@ -143,6 +143,27 @@ const PRELOAD_CODEPOINTS: &[u32] = &[
     0xE241, // Flag 8th down
     0xE242, // Flag 16th up
     0xE243, // Flag 16th down
+    // Articulations / ornaments
+    0xE4A0, // articAccentAbove
+    0xE4A2, // articStaccatoAbove
+    0xE4C0, // fermataAbove
+    0xE4C1, // fermataBelow
+    0xE566, // ornamentTrill
+    0xE567, // ornamentTurn
+    0xE56C, // ornamentMordent
+    0xE56D, // ornamentShortTrill (mordent lower)
+    // Strings
+    0xE610, // stringsDownBow
+    0xE612, // stringsUpBow
+    // Dynamics
+    0xE520, // dynamicPiano (p)
+    0xE522, // dynamicForte (f)
+    0xE52A, // dynamicPPP
+    0xE52B, // dynamicPP
+    0xE52C, // dynamicMP
+    0xE52D, // dynamicMF
+    0xE52F, // dynamicFF
+    0xE530, // dynamicFFF
 ];
 
 impl FontCache {
