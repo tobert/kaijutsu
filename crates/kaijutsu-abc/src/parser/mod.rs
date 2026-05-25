@@ -8,7 +8,7 @@ mod header;
 mod key;
 mod note;
 
-use crate::ast::{Element, Tune, Voice};
+use crate::ast::{Element, Header, InfoField, Tune, Voice};
 use crate::feedback::{FeedbackCollector, ParseResult};
 use crate::ParseMode;
 use std::collections::HashMap;
@@ -17,18 +17,35 @@ use std::collections::HashMap;
 ///
 /// A `.abc` source may contain a file-level header (anything before the
 /// first `X:`) followed by one or more tunes delimited by `X:N` lines.
-/// The file-level header lines are folded into the first tune so info
-/// fields like `O:` or `H:` at the top of the file aren't lost; later
-/// tunes get their own headers without file-level inheritance (a known
-/// limitation — spec §2.2 calls for inheritance).
+/// Per spec §2.2, info fields in the file header apply as defaults to
+/// every tune in the file; fields set on a tune itself win on conflict.
 pub fn parse(input: &str, mode: ParseMode) -> ParseResult<Vec<Tune>> {
     let mut collector = FeedbackCollector::new();
 
-    let segments = split_into_tune_segments(input);
-    let tunes = segments
-        .into_iter()
-        .map(|segment| parse_one_tune(segment, &mut collector, mode))
-        .collect();
+    let (file_header_text, tune_segments) = split_file_and_tunes(input);
+
+    // Parse the pre-X: file header as a bag of info fields. No defaults
+    // are filled here — we only want to capture explicit fields.
+    let file_header = parse_file_header_fields(file_header_text);
+
+    let tunes: Vec<Tune> = if tune_segments.is_empty() {
+        // No X: in input — fall back to single-fragment parsing on the
+        // whole input.
+        if input.trim().is_empty() {
+            Vec::new()
+        } else {
+            vec![parse_one_tune(input, &mut collector, mode)]
+        }
+    } else {
+        tune_segments
+            .into_iter()
+            .map(|segment| {
+                let mut tune = parse_one_tune(segment, &mut collector, mode);
+                inherit_from_file_header(&mut tune.header, &file_header);
+                tune
+            })
+            .collect()
+    };
 
     ParseResult::new(tunes, collector.into_feedback())
 }
@@ -40,27 +57,100 @@ fn parse_one_tune(input: &str, collector: &mut FeedbackCollector, mode: ParseMod
     Tune { header, voices }
 }
 
-/// Split the input into per-tune segments. Each segment starts at the
-/// beginning of an `X:` line (or at the start of input — that first
-/// segment covers any pre-`X:` file header plus the first tune). Files
-/// with no `X:` at all return a single segment containing the whole
-/// input — preserving the historical single-fragment behaviour.
-fn split_into_tune_segments(input: &str) -> Vec<&str> {
-    let mut boundaries = vec![0_usize];
+/// Split the input into (pre-X file header text, list of tune segments).
+/// Each tune segment starts at an `X:` line. If the input has no `X:`,
+/// returns ("", []) — caller falls back to single-fragment parsing.
+fn split_file_and_tunes(input: &str) -> (&str, Vec<&str>) {
+    let mut x_positions: Vec<usize> = Vec::new();
+    if input.starts_with("X:") {
+        x_positions.push(0);
+    }
     let mut cursor = if input.starts_with("X:") { 2 } else { 0 };
     while let Some(rel) = input[cursor..].find("\nX:") {
         let x_pos = cursor + rel + 1;
-        boundaries.push(x_pos);
+        x_positions.push(x_pos);
         cursor = x_pos + 2;
     }
-    boundaries
+    if x_positions.is_empty() {
+        return ("", Vec::new());
+    }
+    let file_header = &input[..x_positions[0]];
+    let tunes: Vec<&str> = x_positions
         .iter()
         .enumerate()
         .map(|(i, &start)| {
-            let end = boundaries.get(i + 1).copied().unwrap_or(input.len());
+            let end = x_positions.get(i + 1).copied().unwrap_or(input.len());
             &input[start..end]
         })
-        .collect()
+        .collect();
+    (file_header, tunes)
+}
+
+/// Minimal parse over pre-X: content: collect each `<letter>:` line as
+/// raw InfoField. Doesn't fill defaults, doesn't emit warnings — just
+/// captures what was explicitly written at file level.
+fn parse_file_header_fields(input: &str) -> Header {
+    let mut header = Header::default();
+    for line in input.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('%') {
+            continue;
+        }
+        if trimmed.len() < 2 || trimmed.chars().nth(1) != Some(':') {
+            continue;
+        }
+        let field_char = match trimmed.chars().next() {
+            Some(c) if c.is_ascii_alphabetic() => c,
+            _ => continue,
+        };
+        let value = trimmed[2..].trim().to_string();
+        match field_char {
+            'T' => {
+                if header.title.is_empty() {
+                    header.title = value;
+                } else {
+                    header.titles.push(value);
+                }
+            }
+            'C' => header.composer = Some(value),
+            'R' => header.rhythm = Some(value),
+            'S' => header.source = Some(value),
+            'N' => header.notes = Some(value),
+            _ => header.other_fields.push(InfoField {
+                field_type: field_char,
+                value,
+            }),
+        }
+    }
+    header
+}
+
+/// Per spec §2.2: copy fields set explicitly in the file header into a
+/// tune's header where the tune doesn't set them. Tune-level wins on
+/// conflict. We can only inherit fields where None signals "unset" —
+/// M:/L:/Q: are filled with defaults by parse_header so we can't tell
+/// "missing in tune" from "explicit in tune"; those are not inherited
+/// today.
+fn inherit_from_file_header(tune: &mut Header, file: &Header) {
+    if tune.composer.is_none() {
+        tune.composer = file.composer.clone();
+    }
+    if tune.rhythm.is_none() {
+        tune.rhythm = file.rhythm.clone();
+    }
+    if tune.source.is_none() {
+        tune.source = file.source.clone();
+    }
+    if tune.notes.is_none() {
+        tune.notes = file.notes.clone();
+    }
+    // Prepend file-level other_fields so the tune's appear later
+    // (tune wins if a downstream consumer reads in order).
+    if !file.other_fields.is_empty() {
+        let mut combined: Vec<InfoField> = file.other_fields.clone();
+        combined.append(&mut tune.other_fields);
+        tune.other_fields = combined;
+    }
 }
 
 /// Route parsed elements to their respective voices based on VoiceSwitch markers.
