@@ -49,7 +49,11 @@ use std::path::{Path, PathBuf};
 ///          `|`-letter info field, silently swallowing content;
 ///          fixing it surfaces real body content that hits gaps,
 ///          plus a handful of orphan `+:` warnings. Surfacing > masking.)
-const MAX_TOTAL_WARNINGS: usize = 132;
+///    107 — \-continuation no longer disables line-start handlers
+///    107 — file-header inheritance per §2.2 (no net change in count
+///          but eliminates the phantom-tune-0 from pre-X content)
+///     59 — fixture curation: §4-9/04 (pseudo-syntax), §5-1/04 prose
+const MAX_TOTAL_WARNINGS: usize = 59;
 const MAX_TOTAL_ERRORS: usize = 0;
 
 struct Outcome {

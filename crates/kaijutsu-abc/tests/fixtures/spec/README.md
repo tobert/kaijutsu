@@ -61,14 +61,30 @@ subsection in the order they appear in the spec.
 
 The extractor pulls every fenced code block, but the spec uses fenced
 blocks for non-ABC content too — tables of decoration names, syntax
-declarations like `%%pageheight <length>`, HTML embedding examples, and
-similar. These were manually pruned because they generate huge volumes
-of "Skipping unknown character" warnings without exercising real parser
-behaviour.
+declarations like `%%pageheight <length>`, pseudo-syntax with
+`<placeholder>` fragments, prose explanation lines, HTML embedding
+examples, and similar. These have been manually pruned because they
+generate volume "Skipping unknown character" warnings without exercising
+real parser behaviour.
 
-Current corpus: **107 fixtures across 40 sections**. If you re-run the
-extractor against an updated spec cache, expect to repeat the curation
-pass — diff the new tree against the old one to find regressions.
+If you re-run the extractor against an updated spec cache, expect to
+repeat the curation pass — diff the new tree against the old one to
+find regressions.
+
+### Intentionally-warning fixtures
+
+Some surviving fixtures still emit warnings *by design* — they
+demonstrate spec behavior our parser correctly implements:
+
+- **§8.1/02** (`# * ; ? @`): the spec's listing of reserved characters.
+  Each char produces a "Reserved character ... ignored (ABC v2.1 §8.1)"
+  warning, which is the spec-mandated behaviour.
+- **§8.1/03** (the `@a !pp! #bc2/3*` example): deliberately broken ABC
+  showing how reserved characters and unrecognised constructs should be
+  handled. Warnings here exercise the parser's tolerance path.
+
+Their warning counts should stay where they are — driving them to zero
+would mean *not* warning on reserved chars, which would be wrong.
 
 ## Test runner
 
