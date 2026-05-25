@@ -797,6 +797,10 @@ mod tests {
             mode: Mode::Major,
             explicit_accidentals: vec![],
             clef: None,
+            transpose: 0,
+            octave: 0,
+            stafflines: None,
+            middle: None,
         };
         let acc = compute_key_accidentals(&key);
         assert_eq!(acc.get(&NoteName::F), Some(&Accidental::Sharp));
@@ -811,6 +815,10 @@ mod tests {
             mode: Mode::Major,
             explicit_accidentals: vec![],
             clef: None,
+            transpose: 0,
+            octave: 0,
+            stafflines: None,
+            middle: None,
         };
         let acc = compute_key_accidentals(&key);
         assert_eq!(acc.get(&NoteName::B), Some(&Accidental::Flat));
@@ -826,6 +834,10 @@ mod tests {
             mode: Mode::Dorian,
             explicit_accidentals: vec![],
             clef: None,
+            transpose: 0,
+            octave: 0,
+            stafflines: None,
+            middle: None,
         };
         let acc = compute_key_accidentals(&key);
         assert!(acc.is_empty());

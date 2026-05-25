@@ -70,6 +70,16 @@ pub struct Key {
     pub mode: Mode,
     pub explicit_accidentals: Vec<(Accidental, NoteName)>,
     pub clef: Option<Clef>,
+    /// Semitone transposition applied to playback / display (§4.6
+    /// `transpose=<int>`). Default 0 = no transposition.
+    pub transpose: i8,
+    /// Octave shift applied to playback / display (§4.6
+    /// `octave=<int>`). Default 0 = no shift.
+    pub octave: i8,
+    /// Number of staff lines (§4.6 `stafflines=<int>`). None = default 5.
+    pub stafflines: Option<u8>,
+    /// Pitch on the middle staff line (§4.6 `middle=<pitch>`). None = default per clef.
+    pub middle: Option<String>,
 }
 
 impl Default for Key {
@@ -80,6 +90,10 @@ impl Default for Key {
             mode: Mode::Major,
             explicit_accidentals: Vec::new(),
             clef: None,
+            transpose: 0,
+            octave: 0,
+            stafflines: None,
+            middle: None,
         }
     }
 }

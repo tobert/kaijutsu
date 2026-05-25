@@ -5,15 +5,50 @@ use crate::feedback::FeedbackCollector;
 
 /// Parse a K: field value (e.g., "G", "Am", "D dorian", "F#m", "Bb")
 pub fn parse_key_field(value: &str, collector: &mut FeedbackCollector) -> Key {
-    let trimmed = value.trim();
+    // Pre-extract attribute clauses (clef=, transpose=, octave=,
+    // stafflines=, middle=) and bare clef shorthands (bass, treble,
+    // alto, tenor, perc), leaving just the key-signature tokens for
+    // the existing root/mode/accidentals parser.
+    let mut attrs = KeyAttrs::default();
+    let mut key_sig = String::new();
+    for tok in value.split_whitespace() {
+        if attrs.absorb_token(tok) {
+            continue;
+        }
+        if !key_sig.is_empty() {
+            key_sig.push(' ');
+        }
+        key_sig.push_str(tok);
+    }
+
+    // K:perc alone is short for K:none clef=perc.
+    if key_sig.eq_ignore_ascii_case("perc") && attrs.clef.is_none() {
+        attrs.clef = Some(Clef::Percussion);
+        key_sig.clear();
+    }
+
+    let trimmed = key_sig.trim();
 
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
-        return Key::default();
+        return Key {
+            clef: attrs.clef,
+            transpose: attrs.transpose,
+            octave: attrs.octave,
+            stafflines: attrs.stafflines,
+            middle: attrs.middle,
+            ..Key::default()
+        };
     }
 
     // Handle special keys
     if trimmed.eq_ignore_ascii_case("Hp") {
-        return parse_highland_bagpipe_key();
+        let mut hp = parse_highland_bagpipe_key();
+        hp.clef = attrs.clef.or(hp.clef);
+        hp.transpose = attrs.transpose;
+        hp.octave = attrs.octave;
+        hp.stafflines = attrs.stafflines;
+        hp.middle = attrs.middle;
+        return hp;
     }
 
     let mut chars = trimmed.chars().peekable();
@@ -97,7 +132,72 @@ pub fn parse_key_field(value: &str, collector: &mut FeedbackCollector) -> Key {
         accidental,
         mode,
         explicit_accidentals,
-        clef,
+        clef: attrs.clef.or(clef),
+        transpose: attrs.transpose,
+        octave: attrs.octave,
+        stafflines: attrs.stafflines,
+        middle: attrs.middle,
+    }
+}
+
+/// Tokens extracted from a K: or V: attribute list (clef=, transpose=,
+/// stafflines=, middle=, plus bare clef shorthands).
+#[derive(Debug, Default)]
+struct KeyAttrs {
+    clef: Option<Clef>,
+    transpose: i8,
+    octave: i8,
+    stafflines: Option<u8>,
+    middle: Option<String>,
+}
+
+impl KeyAttrs {
+    /// Try to consume `tok` as a known attribute or bare clef
+    /// shorthand. Returns true if consumed; false if the caller should
+    /// keep the token as part of the key signature.
+    fn absorb_token(&mut self, tok: &str) -> bool {
+        if let Some(rest) = tok.strip_prefix("clef=") {
+            self.clef = parse_clef_name(rest);
+            return true;
+        }
+        if let Some(rest) = tok.strip_prefix("transpose=") {
+            self.transpose = rest.parse().unwrap_or(0);
+            return true;
+        }
+        if let Some(rest) = tok.strip_prefix("octave=") {
+            self.octave = rest.parse().unwrap_or(0);
+            return true;
+        }
+        if let Some(rest) = tok.strip_prefix("stafflines=") {
+            self.stafflines = rest.parse().ok();
+            return true;
+        }
+        if let Some(rest) = tok.strip_prefix("middle=") {
+            self.middle = Some(rest.to_string());
+            return true;
+        }
+        // Bare clef shorthand: "bass", "treble", "alto", "tenor" with
+        // optional ±8 suffix. Only treated as a clef if we don't already
+        // have one (lets explicit `clef=foo` win on conflict).
+        if self.clef.is_none() {
+            if let Some(c) = parse_clef_name(tok) {
+                self.clef = Some(c);
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Parse a bare clef name (e.g. "bass", "treble-8", "alto", "perc").
+fn parse_clef_name(name: &str) -> Option<Clef> {
+    match name.to_lowercase().as_str() {
+        "treble" | "treble-8" | "treble+8" => Some(Clef::Treble),
+        "bass" | "bass-8" | "bass+8" => Some(Clef::Bass),
+        "alto" => Some(Clef::Alto),
+        "tenor" => Some(Clef::Tenor),
+        "perc" => Some(Clef::Percussion),
+        _ => None,
     }
 }
 
@@ -114,6 +214,7 @@ fn parse_highland_bagpipe_key() -> Key {
             (Accidental::Sharp, NoteName::F),
         ],
         clef: None,
+        ..Default::default()
     }
 }
 
@@ -210,7 +311,8 @@ fn parse_explicit_accidentals(
     result
 }
 
-/// Parse clef specification from key field
+/// Parse clef specification from a key-signature fragment that still
+/// contains a `clef=foo` token (kept for the legacy call site below).
 fn parse_clef_from_key(s: &str) -> Option<Clef> {
     if let Some(pos) = s.find("clef=") {
         let after = &s[pos + 5..];
@@ -218,14 +320,7 @@ fn parse_clef_from_key(s: &str) -> Option<Clef> {
             .chars()
             .take_while(|c| c.is_ascii_alphabetic() || *c == '-')
             .collect();
-
-        match clef_name.to_lowercase().as_str() {
-            "treble" | "treble-8" | "treble+8" => Some(Clef::Treble),
-            "bass" | "bass-8" | "bass+8" => Some(Clef::Bass),
-            "alto" => Some(Clef::Alto),
-            "tenor" => Some(Clef::Tenor),
-            _ => None,
-        }
+        parse_clef_name(&clef_name)
     } else {
         None
     }
