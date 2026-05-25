@@ -28,15 +28,32 @@ pub fn parse_body(
     let mut elements = Vec::new();
     let mut remaining = input;
     let mut line_num = 1;
+    // Tracks whether `remaining` is positioned at the start of a body
+    // line. Field-style markers like `w:` are only valid at line start,
+    // so this flag is what distinguishes the lyric line `w: doh re mi`
+    // from a stray `w` mid-music (which would still hit the fallback).
+    let mut at_line_start = true;
 
     while !remaining.is_empty() {
         collector.set_position(line_num, 1);
+
+        // Line-start info fields (w:, W:) must be checked before the
+        // generic element parser, otherwise their content gets shredded
+        // by the body fallback.
+        if at_line_start {
+            if let Some(elem) = try_parse_line_start_field(&mut remaining) {
+                elements.push(elem);
+                at_line_start = false;
+                continue;
+            }
+        }
 
         // Skip leading whitespace (but not newlines)
         let space_count = skip_spaces(&mut remaining);
 
         if space_count > 0 {
             elements.push(Element::Space);
+            at_line_start = false;
         }
 
         // Check for newline
@@ -44,12 +61,14 @@ pub fn parse_body(
             remaining = &remaining[1..];
             line_num += 1;
             elements.push(Element::LineBreak);
+            at_line_start = true;
             continue;
         }
         if remaining.starts_with("\r\n") {
             remaining = &remaining[2..];
             line_num += 1;
             elements.push(Element::LineBreak);
+            at_line_start = true;
             continue;
         }
 
@@ -67,12 +86,14 @@ pub fn parse_body(
             } else {
                 break;
             }
+            at_line_start = false;
             continue;
         }
 
         // Try to parse an element
         if let Some(element) = try_parse_element(&mut remaining, collector) {
             elements.push(element);
+            at_line_start = false;
         } else if !remaining.is_empty() {
             let c = remaining.chars().next().unwrap();
             if !c.is_whitespace() {
@@ -105,10 +126,30 @@ pub fn parse_body(
                 }
             }
             remaining = &remaining[c.len_utf8()..];
+            at_line_start = false;
         }
     }
 
     elements
+}
+
+/// Try to consume a line-start info field (currently `w:` aligned lyrics
+/// and `W:` words-after-the-tune, per spec §5). Advances `remaining` past
+/// the line content (up to but not including the terminating newline).
+/// Returns None if the input doesn't begin with one of these markers.
+fn try_parse_line_start_field(remaining: &mut &str) -> Option<Element> {
+    let aligned = if remaining.starts_with("w:") {
+        true
+    } else if remaining.starts_with("W:") {
+        false
+    } else {
+        return None;
+    };
+    let after_prefix = &remaining[2..];
+    let line_end = after_prefix.find('\n').unwrap_or(after_prefix.len());
+    let text = after_prefix[..line_end].trim().to_string();
+    *remaining = &after_prefix[line_end..];
+    Some(Element::Lyrics { aligned, text })
 }
 
 /// Try to parse a single element from the input

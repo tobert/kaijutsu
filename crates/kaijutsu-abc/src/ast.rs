@@ -355,6 +355,11 @@ pub enum Element {
     Decoration(Decoration),
     Slur(SlurBoundary),
     VoiceSwitch(String), // Switch to voice with given ID
+    /// Lyrics line. `aligned` distinguishes `w:` (true, aligns to preceding
+    /// music line per §5) from `W:` (false, words shown after the tune).
+    /// Content is captured verbatim — syllable parsing (alignment marks,
+    /// `-`, `_`, `*`, `~`, `\-`) is the renderer's job.
+    Lyrics { aligned: bool, text: String },
     Space,
     LineBreak,
 }

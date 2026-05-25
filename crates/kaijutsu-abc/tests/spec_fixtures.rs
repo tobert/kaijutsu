@@ -21,13 +21,15 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Regression baseline captured 2026-05-25, after the ParseMode split and
-/// the first round of fixture curation (24 non-ABC pseudo-syntax / table
-/// fixtures pruned, 107 real-ABC fixtures across 40 sections remain).
-/// These bounds should ratchet *down* as parser gaps are filled — never up.
-/// If a change drives a bound below the baseline, lower the baseline in the
-/// same commit so it stays honest.
-const MAX_TOTAL_WARNINGS: usize = 1946;
+/// Regression baseline. Ratchets *down* as parser gaps are filled — never
+/// up. If a change drives a bound below the baseline, lower the baseline
+/// in the same commit so it stays honest.
+///
+/// History:
+///   3001 — initial extraction after ParseMode split
+///   1946 — fixture curation (24 non-ABC pseudo-syntax fixtures pruned)
+///    650 — w:/W: lyric line recognition (§5)
+const MAX_TOTAL_WARNINGS: usize = 650;
 const MAX_TOTAL_ERRORS: usize = 0;
 
 struct Outcome {
@@ -38,6 +40,7 @@ struct Outcome {
     warning_count: usize,
     first_error: Option<String>,
     warning_messages: Vec<String>,
+    raw_warnings: Vec<String>,
 }
 
 /// Strip the variable bits out of a warning message so identical-shape
@@ -128,6 +131,14 @@ fn run() -> Vec<Outcome> {
                 })
                 .map(|f| normalize_message(&f.message))
                 .collect();
+            let raw_warnings: Vec<String> = result
+                .feedback
+                .iter()
+                .filter(|f| {
+                    matches!(f.level, kaijutsu_abc::FeedbackLevel::Warning)
+                })
+                .map(|f| f.message.clone())
+                .collect();
             Outcome {
                 section,
                 name,
@@ -138,6 +149,7 @@ fn run() -> Vec<Outcome> {
                     format!("L{}:C{} {}", e.line, e.column, e.message)
                 }),
                 warning_messages,
+                raw_warnings,
             }
         })
         .collect()
@@ -217,6 +229,26 @@ fn spec_fixture_landscape() {
     if patterns.len() > 25 {
         let tail: usize = patterns.iter().skip(25).map(|(_, n)| *n).sum();
         println!("  {:>6}×  (… {} more distinct patterns)", tail, patterns.len() - 25);
+    }
+
+    // Per-character breakdown of the "Skipping unknown character" fallback —
+    // this is what tells us which constructs are most worth implementing.
+    let mut char_counts: BTreeMap<char, usize> = BTreeMap::new();
+    for o in &outcomes {
+        for msg in &o.raw_warnings {
+            if let Some(rest) = msg.strip_prefix("Skipping unknown character '") {
+                if let Some(c) = rest.chars().next() {
+                    *char_counts.entry(c).or_default() += 1;
+                }
+            }
+        }
+    }
+    let mut chars: Vec<_> = char_counts.into_iter().collect();
+    chars.sort_by(|a, b| b.1.cmp(&a.1));
+    println!("\n=== unknown chars hitting the body.rs fallback ===\n");
+    for (c, n) in chars.iter().take(15) {
+        let codepoint = format!("U+{:04X}", *c as u32);
+        println!("  {:>6}×  '{}'  ({})", n, c, codepoint);
     }
 
     // Regression rail: tally totals and assert they don't exceed the
