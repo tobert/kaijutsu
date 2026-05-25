@@ -322,12 +322,65 @@ fn render_staff(
     // Open volta we haven't closed yet: (x_start, label_text). Closed at
     // the next barline (any variant) by `close_volta_bracket`.
     let mut open_volta: Option<(f64, String)> = None;
+    // Tie pending: last note had tie=true and is waiting for a same-pitch
+    // partner. Cleared after the next note (used or not).
+    let mut pending_tie: Option<NoteAnchor> = None;
+    // Slur stack: each entry is None until the first note after the open
+    // is rendered, then becomes Some(anchor). Pop on slur close.
+    let mut slur_stack: Vec<Option<NoteAnchor>> = Vec::new();
+    // The most recently-rendered note — needed to close a slur from its
+    // last note, and to compute tie geometry when the prior note set tie.
+    let mut last_anchor: Option<NoteAnchor> = None;
 
     for element in &voice.elements {
         match element {
             Element::Note(note) => {
                 let span = (0usize, 0usize);
+                let x_left = cursor_x;
+                let pos = ctx.pos_for(&note.pitch, note.octave);
+                let y = ctx.y_at(pos);
+                let cp = notehead_codepoint(&note.duration, &unit_length);
+                let notehead_width =
+                    font.glyph_advance(cp).unwrap_or(500.0) * ctx.scale;
+                let anchor = NoteAnchor {
+                    x_left,
+                    x_right: x_left + notehead_width,
+                    y,
+                    pos,
+                    pitch: note.pitch,
+                    octave: note.octave,
+                };
+
+                // Resolve any pending tie before the new notehead lands.
+                if let Some(prev) = pending_tie.take() {
+                    if prev.pitch == anchor.pitch && prev.octave == anchor.octave {
+                        emit_tie_or_slur(elements, prev, anchor, ctx, /*is_tie=*/ true);
+                    }
+                }
+                // Bind any pending slur opens to this note's anchor.
+                for slot in slur_stack.iter_mut() {
+                    if slot.is_none() {
+                        *slot = Some(anchor);
+                    }
+                }
+
                 cursor_x = emit_note(elements, note, cursor_x, ctx, unit_width, &unit_length, span);
+                last_anchor = Some(anchor);
+                if note.tie {
+                    pending_tie = Some(anchor);
+                }
+            }
+            Element::Slur(SlurBoundary::Start) => {
+                slur_stack.push(None);
+            }
+            Element::Slur(SlurBoundary::End) => {
+                if let Some(Some(start)) = slur_stack.pop() {
+                    if let Some(end) = last_anchor {
+                        emit_tie_or_slur(elements, start, end, ctx, /*is_tie=*/ false);
+                    }
+                }
+                // Slur::End with no matching open (or no notes inside): silently
+                // ignore. The parser already warns on unbalanced slurs.
             }
             Element::Chord(chord) => {
                 let span = (0usize, 0usize);
@@ -467,6 +520,81 @@ fn render_staff(
     }
 
     (line_start, line_end, cursor_x)
+}
+
+// --- Tie / slur geometry ----------------------------------------------------
+
+/// Geometric anchor for one rendered note. Used to draw ties (note-to-note
+/// curves of the same pitch) and slurs (curves over arbitrary note groups).
+#[derive(Clone, Copy)]
+struct NoteAnchor {
+    x_left: f64,
+    x_right: f64,
+    y: f64,
+    pos: f64,
+    pitch: NoteName,
+    octave: i8,
+}
+
+/// Draw a filled-lens curve between two note anchors. Used for both ties
+/// (`is_tie = true`, narrower endpoints) and slurs (`is_tie = false`,
+/// curve from outer edges of the span).
+fn emit_tie_or_slur(
+    elements: &mut Vec<EngravingElement>,
+    start: NoteAnchor,
+    end: NoteAnchor,
+    ctx: StaffCtx,
+    is_tie: bool,
+) {
+    let sp = ctx.sp;
+
+    // Direction is opposite to stem: pos ≤ 2.0 means top half of staff →
+    // stem down → curve above (dir = -1); else stem up → curve below.
+    let avg_pos = (start.pos + end.pos) / 2.0;
+    let dir = if avg_pos <= 2.0 { -1.0 } else { 1.0 };
+    let offset_from_note = sp * 0.5;
+    // Slurs are usually slightly deeper than ties because they span more.
+    let span_x = (end.x_left - start.x_right).abs().max(sp);
+    let depth = if is_tie {
+        sp * 0.7
+    } else {
+        sp * 0.7 + span_x * 0.05
+    };
+    let thickness = sp * 0.16;
+
+    // Curve endpoints: for ties, hug the noteheads' inside edges; for
+    // slurs, span from start's left edge to end's right edge so the
+    // curve clearly arches over the group.
+    let (x_a, x_b) = if is_tie {
+        (start.x_right, end.x_left)
+    } else {
+        (start.x_left, end.x_right)
+    };
+    let y_a = start.y + dir * offset_from_note;
+    let y_b = end.y + dir * offset_from_note;
+    let mid_x = (x_a + x_b) / 2.0;
+    let mid_y_outer = (y_a + y_b) / 2.0 + dir * depth;
+    let mid_y_inner = mid_y_outer - dir * thickness;
+
+    // Lens shape: outer arc then inner arc back to start.
+    let d = format!(
+        "M {:.3} {:.3} Q {:.3} {:.3} {:.3} {:.3} Q {:.3} {:.3} {:.3} {:.3} Z",
+        x_a,
+        y_a,
+        mid_x,
+        mid_y_outer,
+        x_b,
+        y_b,
+        mid_x,
+        mid_y_inner,
+        x_a,
+        y_a,
+    );
+    elements.push(EngravingElement::Path {
+        d,
+        fill: true,
+        source_span: (0, 0),
+    });
 }
 
 // --- Barlines & voltas ------------------------------------------------------
