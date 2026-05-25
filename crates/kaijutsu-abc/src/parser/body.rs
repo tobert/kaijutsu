@@ -79,19 +79,21 @@ pub fn parse_body(
         }
 
         // Trailing-backslash line continuation per §6.1.1: `\<newline>`
-        // joins the next physical line into the current logical line.
-        // No LineBreak is emitted; the next line is parsed mid-music
-        // (at_line_start stays false).
+        // is a typesetting hint that suppresses the visual line break.
+        // The next physical line is still a new line for field-marker
+        // detection (the §6.1 spec example shows w:/M: on the line
+        // after a `\` being treated as field lines), so at_line_start
+        // stays true.
         if remaining.starts_with("\\\n") {
             remaining = &remaining[2..];
             line_num += 1;
-            at_line_start = false;
+            at_line_start = true;
             continue;
         }
         if remaining.starts_with("\\\r\n") {
             remaining = &remaining[3..];
             line_num += 1;
-            at_line_start = false;
+            at_line_start = true;
             continue;
         }
 

@@ -66,18 +66,20 @@ fn backslash_not_at_end_still_warns() {
 }
 
 #[test]
-fn continuation_disables_line_start_handlers_on_next_line() {
-    // After a `\` continuation, the next physical line is mid-music —
-    // a "w:" prefix there is just text, not a lyrics marker.
-    let abc = "CDEF\\\nw:not_a_lyrics_line";
+fn continuation_preserves_field_markers_on_next_line() {
+    // Per §6.1.1, `\<newline>` is a typesetting hint that hides the
+    // visual break, but field-line markers (`w:`, `M:`, …) on the next
+    // physical line are still recognized — the spec's own §6.1 example
+    // uses this pattern.
+    let abc = "CDEF\\\nw: doh re mi fa";
     let result = parse_with_mode(abc, ParseMode::Fragment);
     let lyrics_count = elements(&result.value[0])
         .iter()
         .filter(|e| matches!(e, Element::Lyrics { .. }))
         .count();
     assert_eq!(
-        lyrics_count, 0,
-        "should not parse as lyrics after continuation, elements: {:?}",
+        lyrics_count, 1,
+        "w: after \\ should still parse as lyrics, elements: {:?}",
         elements(&result.value[0]),
     );
 }
