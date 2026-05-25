@@ -85,6 +85,18 @@ pub fn parse_body(
             continue;
         }
 
+        // Broken rhythm operators per §4.4. Looks back at the previous
+        // note to apply the lengthening half; consumes the operator and
+        // the following note for the shortening half. If no previous
+        // note or no follow-up note, leaves `remaining` alone so the
+        // chars hit the unknown-character fallback below.
+        if remaining.starts_with('>') || remaining.starts_with('<') {
+            if try_broken_rhythm(&mut remaining, &mut elements) {
+                at_line_start = false;
+                continue;
+            }
+        }
+
         // Check for comment or directive
         if remaining.starts_with('%') {
             // Check for %%MIDI directive in body - warn that it's ignored
@@ -144,6 +156,81 @@ pub fn parse_body(
     }
 
     elements
+}
+
+/// Attempt to consume a broken-rhythm group: looks back at `elements` for
+/// the most recent Note, peeks ahead through `remaining` for the operator
+/// chars + a following note. On a complete match, scales both durations
+/// per §4.4 and appends the second note. Returns true if consumed.
+fn try_broken_rhythm(remaining: &mut &str, elements: &mut Vec<Element>) -> bool {
+    let op = remaining.chars().next();
+    let op_char = match op {
+        Some('>') => '>',
+        Some('<') => '<',
+        _ => return false,
+    };
+    let chevrons = remaining.chars().take_while(|c| *c == op_char).count();
+    if chevrons == 0 || chevrons > 3 {
+        return false;
+    }
+    // Peek past operator + optional whitespace and try to parse a note.
+    let after_op = &remaining[chevrons..];
+    let mut peek = after_op;
+    let _ = skip_spaces(&mut peek);
+    let next_note = match super::note::parse_note.parse_next(&mut peek) {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    // Find the previous note in the element stream (skip Spaces /
+    // LineBreaks / ornamental elements that don't alter rhythm). If the
+    // intervening element is a Bar / Rest / Chord / etc., bail.
+    let prev_idx = elements.iter().enumerate().rev().find_map(|(i, e)| match e {
+        Element::Note(_) => Some(Ok(i)),
+        Element::Space
+        | Element::LineBreak
+        | Element::ChordSymbol(_)
+        | Element::Decoration(_)
+        | Element::Slur(_) => None,
+        _ => Some(Err(())),
+    });
+    let prev_idx = match prev_idx {
+        Some(Ok(i)) => i,
+        _ => return false,
+    };
+
+    // Ratios per §4.4. Signed chevron count: positive = lengthen left,
+    // negative = lengthen right.
+    let signed: i32 = chevrons as i32 * if op_char == '>' { 1 } else { -1 };
+    let (a_num, a_den, b_num, b_den) = broken_rhythm_ratios(signed);
+
+    if let Element::Note(prev) = &mut elements[prev_idx] {
+        prev.duration.numerator = prev.duration.numerator.saturating_mul(a_num);
+        prev.duration.denominator = prev.duration.denominator.saturating_mul(a_den);
+    }
+    let mut next_note = next_note;
+    next_note.duration.numerator = next_note.duration.numerator.saturating_mul(b_num);
+    next_note.duration.denominator = next_note.duration.denominator.saturating_mul(b_den);
+    elements.push(Element::Note(next_note));
+    *remaining = peek;
+    true
+}
+
+/// Returns (left_num, left_den, right_num, right_den) — the per-side
+/// numerator/denominator multipliers for broken rhythm. `signed` is
+/// chevron count with sign: +N for `>`*N, -N for `<`*N.
+fn broken_rhythm_ratios(signed: i32) -> (u16, u16, u16, u16) {
+    // |n| determines magnitude: 1 → 3/2 & 1/2, 2 → 7/4 & 1/4, 3 → 15/8 & 1/8.
+    let (long_num, long_den, short_num, short_den) = match signed.unsigned_abs() {
+        1 => (3, 2, 1, 2),
+        2 => (7, 4, 1, 4),
+        3 => (15, 8, 1, 8),
+        _ => (1, 1, 1, 1),
+    };
+    if signed > 0 {
+        (long_num, long_den, short_num, short_den)
+    } else {
+        (short_num, short_den, long_num, long_den)
+    }
 }
 
 /// Append `+:` continuation content to the most recent field-line
