@@ -114,7 +114,10 @@ impl skrifa::outline::OutlinePen for BezPathPen {
 
 /// Codepoints we pre-cache from Bravura (SMuFL).
 const PRELOAD_CODEPOINTS: &[u32] = &[
-    0xE050, // Treble clef
+    0xE050, // Treble clef (G clef)
+    0xE062, // Bass clef (F clef)
+    0xE05C, // C clef (alto/tenor)
+    0xE069, // Percussion clef
     0xE0A2, // Whole notehead
     0xE0A3, // Half notehead
     0xE0A4, // Quarter/filled notehead
