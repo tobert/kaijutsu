@@ -319,6 +319,10 @@ fn render_staff(
     let unit_length = header.unit_length.unwrap_or_default();
     let unit_width = sp * 2.5;
 
+    // Open volta we haven't closed yet: (x_start, label_text). Closed at
+    // the next barline (any variant) by `close_volta_bracket`.
+    let mut open_volta: Option<(f64, String)> = None;
+
     for element in &voice.elements {
         match element {
             Element::Note(note) => {
@@ -390,17 +394,16 @@ fn render_staff(
                 };
                 cursor_x += dur_width;
             }
-            Element::Bar(_) => {
-                let span = (0usize, 0usize);
-                elements.push(EngravingElement::Line {
-                    x1: cursor_x,
-                    y1: ctx.y_at(0.0),
-                    x2: cursor_x,
-                    y2: ctx.y_at(4.0),
-                    width: 1.0,
-                    source_span: span,
-                });
-                cursor_x += sp;
+            Element::Bar(bar) => {
+                // A bar of any variant closes an open volta.
+                close_volta_bracket(elements, &mut open_volta, cursor_x, ctx);
+                let bar_left = cursor_x;
+                cursor_x = emit_barline(elements, bar, cursor_x, ctx);
+                // If this bar is itself a volta opener, start a new bracket.
+                if let Some(label) = volta_label(bar) {
+                    emit_volta_open(elements, bar_left, &label, ctx);
+                    open_volta = Some((bar_left, label));
+                }
             }
             Element::Tuplet(tuplet) => {
                 let span = (0usize, 0usize);
@@ -438,15 +441,22 @@ fn render_staff(
         }
     }
 
-    // Final barline.
-    elements.push(EngravingElement::Line {
-        x1: cursor_x,
-        y1: ctx.y_at(0.0),
-        x2: cursor_x,
-        y2: ctx.y_at(4.0),
-        width: 2.0,
-        source_span: (0, 0),
-    });
+    // Close any volta that was still open at end-of-voice.
+    close_volta_bracket(elements, &mut open_volta, cursor_x, ctx);
+
+    // Auto-emitted thick final barline — only if the body didn't already
+    // end on a bar. Avoids double-drawing when the user wrote `|]`/`:|`/etc.
+    let ends_with_bar = matches!(voice.elements.last(), Some(Element::Bar(_)));
+    if !ends_with_bar {
+        elements.push(EngravingElement::Line {
+            x1: cursor_x,
+            y1: ctx.y_at(0.0),
+            x2: cursor_x,
+            y2: ctx.y_at(4.0),
+            width: 2.0,
+            source_span: (0, 0),
+        });
+    }
 
     // Initial pass: extend staff lines to current cursor. `engrave()`
     // re-extends them to the widest voice afterward.
@@ -457,6 +467,212 @@ fn render_staff(
     }
 
     (line_start, line_end, cursor_x)
+}
+
+// --- Barlines & voltas ------------------------------------------------------
+
+const BAR_THIN: f64 = 1.0;
+const BAR_THICK: f64 = 3.0;
+
+/// Draw a single full-height vertical line at `x` with the given stroke width.
+fn vertical_bar(elements: &mut Vec<EngravingElement>, x: f64, width: f64, ctx: StaffCtx) {
+    elements.push(EngravingElement::Line {
+        x1: x,
+        y1: ctx.y_at(0.0),
+        x2: x,
+        y2: ctx.y_at(4.0),
+        width,
+        source_span: (0, 0),
+    });
+}
+
+/// Two filled dots in the second and third spaces (between staff lines
+/// 1-2 and 3-4) at horizontal position `x`. Used for `:|` / `|:` / `::`.
+fn emit_repeat_dots(elements: &mut Vec<EngravingElement>, x: f64, ctx: StaffCtx) {
+    let r = ctx.sp * 0.18;
+    for pos in [1.5_f64, 2.5_f64] {
+        let cy = ctx.y_at(pos);
+        // SVG circle via two arc halves: M (x-r) cy A r,r 0 1,0 (x+r),cy A r,r 0 1,0 (x-r),cy Z
+        let d = format!(
+            "M {:.3} {:.3} A {:.3} {:.3} 0 1 0 {:.3} {:.3} A {:.3} {:.3} 0 1 0 {:.3} {:.3} Z",
+            x - r,
+            cy,
+            r,
+            r,
+            x + r,
+            cy,
+            r,
+            r,
+            x - r,
+            cy,
+        );
+        elements.push(EngravingElement::Path {
+            d,
+            fill: true,
+            source_span: (0, 0),
+        });
+    }
+}
+
+/// Render a barline (any variant) and return the new cursor_x position.
+fn emit_barline(
+    elements: &mut Vec<EngravingElement>,
+    bar: &Bar,
+    cursor_x: f64,
+    ctx: StaffCtx,
+) -> f64 {
+    let sp = ctx.sp;
+    let gap = sp * 0.3; // space between adjacent lines / dots
+    match bar {
+        // FirstEnding / NthEnding open a volta; they only draw a thin
+        // barline themselves — the bracket is drawn by `emit_volta_open`.
+        Bar::Single | Bar::FirstEnding | Bar::NthEnding(_) => {
+            vertical_bar(elements, cursor_x, BAR_THIN, ctx);
+            cursor_x + sp
+        }
+        Bar::Double => {
+            vertical_bar(elements, cursor_x, BAR_THIN, ctx);
+            vertical_bar(elements, cursor_x + gap, BAR_THIN, ctx);
+            cursor_x + sp + gap
+        }
+        Bar::End => {
+            // thin then thick (left → right)
+            vertical_bar(elements, cursor_x, BAR_THIN, ctx);
+            vertical_bar(elements, cursor_x + gap + BAR_THICK * 0.5, BAR_THICK, ctx);
+            cursor_x + sp + gap + BAR_THICK
+        }
+        Bar::Start => {
+            // thick then thin (left → right)
+            vertical_bar(elements, cursor_x + BAR_THICK * 0.5, BAR_THICK, ctx);
+            vertical_bar(elements, cursor_x + BAR_THICK + gap, BAR_THIN, ctx);
+            cursor_x + sp + gap + BAR_THICK
+        }
+        Bar::RepeatStart => {
+            // |: → thick + thin + dots
+            let x_thick = cursor_x + BAR_THICK * 0.5;
+            vertical_bar(elements, x_thick, BAR_THICK, ctx);
+            let x_thin = x_thick + BAR_THICK * 0.5 + gap;
+            vertical_bar(elements, x_thin, BAR_THIN, ctx);
+            let x_dots = x_thin + sp * 0.45;
+            emit_repeat_dots(elements, x_dots, ctx);
+            x_dots + sp * 0.6
+        }
+        // RepeatEnd and SecondEnding share the visual shape :|
+        // SecondEnding additionally opens a volta bracket — handled by the
+        // caller via `volta_label`.
+        Bar::RepeatEnd | Bar::SecondEnding => {
+            // :| → dots + thin + thick
+            let x_dots = cursor_x + sp * 0.2;
+            emit_repeat_dots(elements, x_dots, ctx);
+            let x_thin = x_dots + sp * 0.45;
+            vertical_bar(elements, x_thin, BAR_THIN, ctx);
+            let x_thick = x_thin + gap + BAR_THICK * 0.5;
+            vertical_bar(elements, x_thick, BAR_THICK, ctx);
+            x_thick + BAR_THICK * 0.5 + sp * 0.3
+        }
+        Bar::RepeatBoth => {
+            // :: → dots + thin + thick + thin + dots
+            let x_dots1 = cursor_x + sp * 0.2;
+            emit_repeat_dots(elements, x_dots1, ctx);
+            let x_thin1 = x_dots1 + sp * 0.45;
+            vertical_bar(elements, x_thin1, BAR_THIN, ctx);
+            let x_thick = x_thin1 + gap + BAR_THICK * 0.5;
+            vertical_bar(elements, x_thick, BAR_THICK, ctx);
+            let x_thin2 = x_thick + BAR_THICK * 0.5 + gap;
+            vertical_bar(elements, x_thin2, BAR_THIN, ctx);
+            let x_dots2 = x_thin2 + sp * 0.45;
+            emit_repeat_dots(elements, x_dots2, ctx);
+            x_dots2 + sp * 0.6
+        }
+    }
+}
+
+/// If the given bar opens a volta, return the label text ("1", "2", "1-3,5").
+/// Returns None for non-volta bars.
+fn volta_label(bar: &Bar) -> Option<String> {
+    match bar {
+        Bar::FirstEnding => Some("1".to_string()),
+        Bar::SecondEnding => Some("2".to_string()),
+        Bar::NthEnding(nums) => Some(format_nth_label(nums)),
+        _ => None,
+    }
+}
+
+/// Render the numeric list from `[1,3,5-7` etc. back into a compact label
+/// like `1,3,5-7`. Bracket-form `[1-3` keeps its dash; `[1,3` keeps the
+/// comma. The parser passes us the numbers in source order.
+fn format_nth_label(nums: &[u8]) -> String {
+    // The parser stores the raw numbers without separators, so we need a
+    // heuristic to display them. Use `-` to join a contiguous run (auto-
+    // detected) and `,` between runs. This matches how players read voltas.
+    if nums.is_empty() {
+        return String::new();
+    }
+    let mut runs: Vec<(u8, u8)> = Vec::new(); // (start, end) inclusive
+    for &n in nums {
+        if let Some(last) = runs.last_mut() {
+            if n == last.1 + 1 {
+                last.1 = n;
+                continue;
+            }
+        }
+        runs.push((n, n));
+    }
+    runs.iter()
+        .map(|(a, b)| if a == b { a.to_string() } else { format!("{}-{}", a, b) })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Draw the opening hook + label of a volta bracket. The horizontal line is
+/// drawn later by `close_volta_bracket` once the closing bar's x is known.
+fn emit_volta_open(
+    elements: &mut Vec<EngravingElement>,
+    x_start: f64,
+    label: &str,
+    ctx: StaffCtx,
+) {
+    let sp = ctx.sp;
+    let y_bracket = ctx.y_at(0.0) - sp * 2.5;
+    // Left hook: short vertical from the bracket down toward the staff top.
+    elements.push(EngravingElement::Line {
+        x1: x_start,
+        y1: y_bracket,
+        x2: x_start,
+        y2: y_bracket + sp * 0.9,
+        width: 0.8,
+        source_span: (0, 0),
+    });
+    // Label text just inside the hook.
+    elements.push(EngravingElement::Text {
+        content: label.to_string(),
+        x: x_start + sp * 0.4,
+        y: y_bracket + sp * 1.1,
+        size: sp * 1.1,
+        source_span: (0, 0),
+    });
+}
+
+/// Close any open volta bracket by drawing the horizontal line from its
+/// start_x to the current cursor_x.
+fn close_volta_bracket(
+    elements: &mut Vec<EngravingElement>,
+    open: &mut Option<(f64, String)>,
+    cursor_x: f64,
+    ctx: StaffCtx,
+) {
+    if let Some((x_start, _label)) = open.take() {
+        let sp = ctx.sp;
+        let y_bracket = ctx.y_at(0.0) - sp * 2.5;
+        elements.push(EngravingElement::Line {
+            x1: x_start,
+            y1: y_bracket,
+            x2: cursor_x,
+            y2: y_bracket,
+            width: 0.8,
+            source_span: (0, 0),
+        });
+    }
 }
 
 // --- Element emission -------------------------------------------------------
