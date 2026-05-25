@@ -33,7 +33,8 @@ use std::path::{Path, PathBuf};
 ///    417 — +: continuation lines folded into preceding field (§3.3)
 ///    358 — broken rhythm < and > operators per §4.4
 ///    354 — voice overlay & marker per §7.4
-const MAX_TOTAL_WARNINGS: usize = 354;
+///    351 — alternate decoration syntax +f+ per §4.14
+const MAX_TOTAL_WARNINGS: usize = 351;
 const MAX_TOTAL_ERRORS: usize = 0;
 
 struct Outcome {

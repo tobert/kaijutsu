@@ -619,41 +619,66 @@ fn try_parse_decoration(input: &mut &str) -> Option<crate::ast::Decoration> {
         return Some(Decoration::DownBow);
     }
 
-    // Long form decorations !trill!, !fermata!, etc.
-    if input.starts_with('!') {
-        if let Some(end) = input[1..].find('!') {
-            let name = &input[1..end + 1];
-            *input = &input[end + 2..];
-
-            return Some(match name {
-                "trill" => Decoration::Trill,
-                "fermata" => Decoration::Fermata,
-                "accent" => Decoration::Accent,
-                "staccato" => Decoration::Staccato,
-                "roll" => Decoration::Roll,
-                "upbow" => Decoration::UpBow,
-                "downbow" => Decoration::DownBow,
-                "turn" => Decoration::Turn,
-                "mordent" => Decoration::Mordent { upper: true },
-                "lowermordent" => Decoration::Mordent { upper: false },
-                "p" => Decoration::Dynamic(crate::ast::Dynamic::P),
-                "pp" => Decoration::Dynamic(crate::ast::Dynamic::PP),
-                "ppp" => Decoration::Dynamic(crate::ast::Dynamic::PPP),
-                "mp" => Decoration::Dynamic(crate::ast::Dynamic::MP),
-                "mf" => Decoration::Dynamic(crate::ast::Dynamic::MF),
-                "f" => Decoration::Dynamic(crate::ast::Dynamic::F),
-                "ff" => Decoration::Dynamic(crate::ast::Dynamic::FF),
-                "fff" => Decoration::Dynamic(crate::ast::Dynamic::FFF),
-                "crescendo(" | "<(" => Decoration::Crescendo { start: true },
-                "crescendo)" | "<)" => Decoration::Crescendo { start: false },
-                "diminuendo(" | ">(" => Decoration::Diminuendo { start: true },
-                "diminuendo)" | ">)" => Decoration::Diminuendo { start: false },
-                other => Decoration::Other(other.to_string()),
-            });
-        }
+    // Long form decorations !trill!, !fermata!, etc. — and the
+    // equivalent +trill+, +fermata+ form per §4.14 (older syntax used
+    // when `!` collided with line-break markers in some dialects).
+    if let Some(name_end) = matched_long_form_decoration(input) {
+        let name = &input[1..name_end];
+        *input = &input[name_end + 1..];
+        return Some(decoration_from_name(name));
     }
 
     None
+}
+
+/// If `input` starts with `!…!` or `+…+`, returns the index of the
+/// closing delimiter (i.e. the index of the second `!` / `+`). Returns
+/// None otherwise.
+fn matched_long_form_decoration(input: &str) -> Option<usize> {
+    let delim = match input.chars().next()? {
+        '!' => '!',
+        '+' => '+',
+        _ => return None,
+    };
+    // Find the closing delimiter. Restrict the search to the current
+    // line — if there's no close before end-of-line, this isn't a
+    // decoration, just a stray `+` (e.g. an inline math char) and we
+    // bail so it can hit other handlers.
+    let after = &input[1..];
+    let end = after.find(|c| c == delim || c == '\n')?;
+    if after.as_bytes()[end] != delim as u8 {
+        return None;
+    }
+    Some(end + 1)
+}
+
+fn decoration_from_name(name: &str) -> crate::ast::Decoration {
+    use crate::ast::Decoration;
+    match name {
+        "trill" => Decoration::Trill,
+        "fermata" => Decoration::Fermata,
+        "accent" => Decoration::Accent,
+        "staccato" => Decoration::Staccato,
+        "roll" => Decoration::Roll,
+        "upbow" => Decoration::UpBow,
+        "downbow" => Decoration::DownBow,
+        "turn" => Decoration::Turn,
+        "mordent" => Decoration::Mordent { upper: true },
+        "lowermordent" => Decoration::Mordent { upper: false },
+        "p" => Decoration::Dynamic(crate::ast::Dynamic::P),
+        "pp" => Decoration::Dynamic(crate::ast::Dynamic::PP),
+        "ppp" => Decoration::Dynamic(crate::ast::Dynamic::PPP),
+        "mp" => Decoration::Dynamic(crate::ast::Dynamic::MP),
+        "mf" => Decoration::Dynamic(crate::ast::Dynamic::MF),
+        "f" => Decoration::Dynamic(crate::ast::Dynamic::F),
+        "ff" => Decoration::Dynamic(crate::ast::Dynamic::FF),
+        "fff" => Decoration::Dynamic(crate::ast::Dynamic::FFF),
+        "crescendo(" | "<(" => Decoration::Crescendo { start: true },
+        "crescendo)" | "<)" => Decoration::Crescendo { start: false },
+        "diminuendo(" | ">(" => Decoration::Diminuendo { start: true },
+        "diminuendo)" | ">)" => Decoration::Diminuendo { start: false },
+        other => Decoration::Other(other.to_string()),
+    }
 }
 
 #[cfg(test)]
