@@ -70,9 +70,9 @@ fn strict_errors_on_body_before_k() {
 
 #[test]
 fn strict_errors_on_unrecognized_construct() {
-    // `&` is the voice-overlay marker per §7.4 — currently not parsed,
-    // so it hits the fallback path and must error in strict mode.
-    let abc = "X:1\nT:Test\nK:C\nCDE&FGA|\n";
+    // `y` is the invisible-space engraver hint per §6.1 — not currently
+    // parsed, so it hits the fallback path and must error in strict mode.
+    let abc = "X:1\nT:Test\nK:C\nCDEyFGA|\n";
     let result = parse_with_mode(abc, ParseMode::Strict);
     assert!(
         errors_contain(&result, "Unrecognized construct"),
@@ -127,7 +127,7 @@ fn generous_warns_on_missing_x_field() {
 
 #[test]
 fn generous_warns_on_unrecognized_construct() {
-    let abc = "X:1\nT:Test\nK:C\nCDE&FGA|\n";
+    let abc = "X:1\nT:Test\nK:C\nCDEyFGA|\n";
     let result = parse_with_mode(abc, ParseMode::Generous);
     assert!(
         no_errors(&result),
@@ -157,10 +157,10 @@ fn fragment_silent_on_missing_headers() {
 
 #[test]
 fn fragment_still_warns_on_unrecognized_construct() {
-    // A fragment containing a construct the parser doesn't know (`&` =
-    // voice overlay per §7.4, currently unimplemented). Fragment mode
-    // is about "no header required", not "any byte is fine".
-    let abc = "CDE&FGA";
+    // A fragment containing a construct the parser doesn't know
+    // (`y` = invisible-space engraver hint per §6.1). Fragment mode is
+    // about "no header required", not "any byte is fine".
+    let abc = "CDEyFGA";
     let result = parse_with_mode(abc, ParseMode::Fragment);
     assert!(no_errors(&result));
     assert!(warnings_contain(&result, "Skipping unknown character"));
