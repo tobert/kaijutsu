@@ -248,13 +248,10 @@ pub(crate) async fn spawn_llm_for_prompt(
 
 /// Agentic-loop iteration cap by consent mode (M1-A6).
 ///
-/// Collaborative caps at 2 iterations: the model can emit an initial
-/// tool-use response and one synthesis turn after seeing the tool result.
-/// That keeps the human in the loop for chained tool work — they can
-/// prompt "continue" to extend. Autonomous keeps the original 20-iteration
-/// guard against runaways.
-const COLLABORATIVE_MAX_ITERATIONS: u32 = 2;
-const AUTONOMOUS_MAX_ITERATIONS: u32 = 20;
+/// Both modes leave enough headroom for real chained tool work; the cap
+/// is a runaway guard, not a checkpoint. Autonomous gets more rope.
+const COLLABORATIVE_MAX_ITERATIONS: u32 = 50;
+const AUTONOMOUS_MAX_ITERATIONS: u32 = 100;
 
 fn iteration_cap_for_consent(mode: ConsentMode) -> u32 {
     match mode {
@@ -268,13 +265,13 @@ mod consent_tests {
     use super::*;
 
     #[test]
-    fn collaborative_caps_at_two_iterations() {
-        assert_eq!(iteration_cap_for_consent(ConsentMode::Collaborative), 2);
+    fn collaborative_caps_at_fifty_iterations() {
+        assert_eq!(iteration_cap_for_consent(ConsentMode::Collaborative), 50);
     }
 
     #[test]
-    fn autonomous_caps_at_twenty_iterations() {
-        assert_eq!(iteration_cap_for_consent(ConsentMode::Autonomous), 20);
+    fn autonomous_caps_at_one_hundred_iterations() {
+        assert_eq!(iteration_cap_for_consent(ConsentMode::Autonomous), 100);
     }
 }
 
