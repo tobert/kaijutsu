@@ -808,6 +808,14 @@ impl BlockStore {
     }
 
     /// Journal an input doc op and trigger compaction if needed.
+    ///
+    /// IMPORTANT: the `entry()` guards on `input_journal_seqs` and
+    /// `input_uncompacted` are scoped tightly around the `fetch_add` and
+    /// dropped before SQLite IO and before any call to `compact_input_doc`.
+    /// Holding them across the compact call self-deadlocks: `compact_input_doc`
+    /// re-reads both maps via `get()`, and parking_lot's RwLock (which DashMap
+    /// shards use internally) is not reentrant — write-then-read on the same
+    /// shard from the same thread blocks forever.
     fn journal_and_maybe_compact_input(
         &self,
         context_id: ContextId,
@@ -817,17 +825,21 @@ impl BlockStore {
             return Ok(());
         };
 
-        let seq_entry = self
-            .input_journal_seqs
-            .entry(context_id)
-            .or_insert_with(|| AtomicU64::new(0));
-        let seq = seq_entry.fetch_add(1, Ordering::SeqCst) + 1;
+        let seq = {
+            let seq_entry = self
+                .input_journal_seqs
+                .entry(context_id)
+                .or_insert_with(|| AtomicU64::new(0));
+            seq_entry.fetch_add(1, Ordering::SeqCst) + 1
+        };
 
-        let count_entry = self
-            .input_uncompacted
-            .entry(context_id)
-            .or_insert_with(|| AtomicU64::new(0));
-        let count = count_entry.fetch_add(1, Ordering::SeqCst) + 1;
+        let count = {
+            let count_entry = self
+                .input_uncompacted
+                .entry(context_id)
+                .or_insert_with(|| AtomicU64::new(0));
+            count_entry.fetch_add(1, Ordering::SeqCst) + 1
+        };
 
         {
             let db_guard = db.lock();
@@ -4484,6 +4496,61 @@ mod tests {
             text_after, expected,
             "input doc should survive drop+reload"
         );
+    }
+
+    /// Regression: triggering input doc compaction must not self-deadlock.
+    ///
+    /// `journal_and_maybe_compact_input` previously held `entry()` write
+    /// guards on `input_journal_seqs` and `input_uncompacted` while calling
+    /// `compact_input_doc`, which then re-read those same DashMaps via
+    /// `get()`. parking_lot's RwLock (which DashMap shards use) is not
+    /// reentrant — write-then-read on the same shard from the same thread
+    /// blocks forever. After 200 input ops (`INPUT_COMPACTION_OP_THRESHOLD`)
+    /// on one context, the next edit would wedge the whole RPC thread,
+    /// holding shard locks that subsequently broke all join_context calls
+    /// system-wide (creating the user-visible "one prompt then reconnect
+    /// loop" symptom).
+    ///
+    /// The test runs the edits on a background thread and aborts the
+    /// process if they don't finish in 10s — a deadlock would otherwise
+    /// hang the entire test binary.
+    #[test]
+    fn test_input_compaction_does_not_deadlock() {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (_db, store, ctx, _ws) = fresh_db_store(dir.path());
+        store.create_input_doc(ctx).unwrap();
+
+        let store = Arc::new(store);
+        let store_for_worker = store.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+
+        let worker = thread::spawn(move || {
+            // INPUT_COMPACTION_OP_THRESHOLD is 200; run well past it so
+            // the compaction path runs at least once.
+            for i in 0..250 {
+                store_for_worker
+                    .edit_input(ctx, i, "x", 0)
+                    .expect("edit_input must not error");
+            }
+            let _ = done_tx.send(());
+        });
+
+        match done_rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(()) => {
+                worker.join().expect("worker thread panicked");
+                // Sanity check the doc actually has 250 chars.
+                let text = store.get_input_text(ctx).unwrap();
+                assert_eq!(text.len(), 250, "all edits should have applied");
+            }
+            Err(_) => panic!(
+                "edit_input wedged — compaction path is self-deadlocking on \
+                 input_journal_seqs / input_uncompacted shard locks"
+            ),
+        }
     }
 
     // ====================================================================
