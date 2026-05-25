@@ -17,15 +17,6 @@ opted-in model would enable mid-sentence collaboration that no other
 agent framework can do — kaijutsu has the substrate; nothing currently
 uses it. Gate with explicit user opt-in to avoid creepy default behavior.
 
-## Interactive affordances on blocks
-
-Once a block reaches `Status::Done` it is static. No buttons, no
-clickable links to pre-fill the input doc, no expand/collapse handles
-the model can attach. A small block-metadata slot for "interactive
-affordances" turns model responses from monologues into interfaces.
-Related to the streaming-block-handle work in §9 of the (now-retired)
-tool-system redesign doc.
-
 ## Tool system follow-ups (post-Phase 5)
 
 The MCP-centric kernel landed in five phases plus hook persistence; the
@@ -157,5 +148,76 @@ d43df35). See the `project-live-eval` memory for scope.
   the test output and confuses casual readers. Either close the SSH client
   explicitly before exiting `run_local`, or upstream a fix to russh so drop
   is a no-op when no reactor is available.
+
+## ABC parser / kaijutsu-abc
+
+- **Multi-tune `.abc` files vs. kaijutsu blocks.** `kaijutsu_abc::parse`
+  now returns `Vec<Tune>` (`crates/kaijutsu-abc/src/lib.rs:59`) since a
+  `.abc` source can hold several tunes delimited by `X:N` per spec §2.2.
+  The rendering path in `kaijutsu-app` currently takes the first tune
+  and TODO's the rest (`crates/kaijutsu-app/src/text/rich.rs:397`).
+  Open design question: when an `abc_block` carries a multi-tune
+  library, should the kernel/drift layer split the tunes across
+  sibling blocks (so each Tune is its own renderable artifact, with
+  CRDT identity), or should the renderer stack them inside one block?
+  Affects abc_block storage shape and drift semantics. Most relevant
+  to §13-style sample libraries; not blocking single-tune authoring.
+
+- **File-header inheritance for M:/L:/Q:.** Spec §2.2 inheritance is
+  implemented for `T:`, `C:`, `R:`, `S:`, `N:`, and the `other_fields`
+  bag, but `M:`/`L:`/`Q:` don't inherit yet because `parse_header`
+  fills defaults eagerly — once the tune has `Some(default 4/4)` the
+  inheritance pass can't tell it apart from an explicit `M:4/4`. Fix:
+  track an explicit-vs-default flag, or move default-filling into a
+  separate post-parse pass that consults the file header first.
+
+- **Inline `%` comments inside field values.** Lines like
+  `X:1                   % tune no 1` or `M:3/4                 % meter`
+  feed the trailing `% comment` text into the field-value parser,
+  producing "Invalid X: value" / "Invalid meter" warnings. Spec §3.1
+  treats `%` as an end-of-line comment marker even inside field
+  values. Strip `% ...` from value strings before parsing.
+
+- **`$` line-break + `I:linebreak` directive (§6.1).** `I:linebreak $`
+  enables `$` as an explicit score line-break marker in the body. Not
+  implemented — `$` hits the unknown-character fallback. Also affects
+  `I:linebreak <none>` / `<EOL>` mode selection.
+
+- **`U:` user-defined symbol expansion.** `U:T = !trill!` is captured
+  in `Header::other_fields` but the body parser doesn't apply the
+  substitution, so `T` mid-music takes its default decoration meaning
+  (or hits the fallback). Apply U: mappings at body parse time.
+
+- **`m:` macro expansion.** `m:` macro definitions are captured as
+  `InfoField` (header `other_fields`, body `Element::InlineField`) but
+  the body parser doesn't expand `~G2` etc. into their definition.
+  Spec §9 covers both static macros and the transposing form
+  `m:~n2 = ...`.
+
+- **`y` invisible-space engraver hint (§6.1).** Used in spec text to
+  hint typesetters. Currently hits the unknown-character fallback —
+  used as the "definitely unknown" canary in `tests/parse_mode.rs`.
+  Trivial to consume as a no-op marker once we want it.
+
+- **Slur grouping in AST.** `Element::Slur(SlurBoundary::Start/End)`
+  markers are emitted but slurred notes aren't grouped into a
+  `Slur { notes: Vec<_> }` structure, so renderers / MIDI handlers
+  can't tell which notes are inside a slur without tracking depth.
+
+- **`%%` stylesheet directives.** Currently treated as comments and
+  silently skipped (only `%%MIDI program` is parsed, in the header
+  path). A general directive AST node would let downstream consumers
+  see `%%score`, `%%pageheight`, `%%setbarnb`, etc.
+
+- **Unicode escapes and font directives in text strings (§8.2).**
+  Mnemonics (`\'e` → é), named entities (`&eacute;`), fixed-width
+  escapes (`é`), and the `$1`-`$4` font directives are captured
+  verbatim in field values rather than decoded. Decoding belongs at
+  the rendering boundary, not the parser, but it has to happen
+  somewhere — track it here so it doesn't get lost.
+
+- **`P:` (parts) jump-to-part semantics.** `P:A`, `P:AABB`, etc. are
+  captured as info fields but the playback path doesn't reorder bars
+  according to a parts string. Per spec §3.2.
 
 
