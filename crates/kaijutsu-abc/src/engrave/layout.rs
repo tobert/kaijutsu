@@ -334,6 +334,9 @@ fn render_staff(
     // Decorations seen as standalone `Element::Decoration` since the last
     // note. Drained onto the next note's anchor.
     let mut pending_decorations: Vec<Decoration> = Vec::new();
+    // Note anchors accumulated since the last w: line. Drained when an
+    // Element::Lyrics{aligned:true} is encountered.
+    let mut lyric_anchors: Vec<NoteAnchor> = Vec::new();
 
     for element in &voice.elements {
         match element {
@@ -378,9 +381,14 @@ fn render_staff(
                 }
 
                 last_anchor = Some(anchor);
+                lyric_anchors.push(anchor);
                 if note.tie {
                     pending_tie = Some(anchor);
                 }
+            }
+            Element::Lyrics { aligned: true, text } => {
+                emit_aligned_lyrics(elements, text, &lyric_anchors, ctx);
+                lyric_anchors.clear();
             }
             Element::Decoration(d) => {
                 pending_decorations.push(d.clone());
@@ -541,6 +549,118 @@ fn render_staff(
     }
 
     (line_start, line_end, cursor_x)
+}
+
+// --- Lyrics -----------------------------------------------------------------
+
+/// A lyric token from a `w:` line. Per spec §17, syllables map to notes
+/// in order; `Skip` advances the note pointer without emitting text.
+enum LyricToken {
+    /// A syllable to draw under a note. Hyphenated words emit the leading
+    /// syllable(s) with a trailing `-`.
+    Syl(String),
+    /// `*` (skip) or `_` (extend previous). Both advance the note pointer
+    /// without drawing new text — the visual difference is left to a
+    /// future syllable-extension pass.
+    Skip,
+}
+
+/// Tokenise a `w:` line into syllables and skips. Whitespace and `-`
+/// separate syllables; `-` adds a hyphen suffix to the preceding
+/// syllable so it renders as `hel-`. `*` and `_` become Skip. `|` and
+/// `~` are tolerated (`|` ignored, `~` collapses to a space inside the
+/// current syllable).
+fn tokenize_lyrics(text: &str) -> Vec<LyricToken> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            ' ' | '\t' => {
+                if !current.is_empty() {
+                    tokens.push(LyricToken::Syl(std::mem::take(&mut current)));
+                }
+            }
+            '-' => {
+                // End the current syllable with a trailing hyphen marker.
+                current.push('-');
+                tokens.push(LyricToken::Syl(std::mem::take(&mut current)));
+            }
+            '*' | '_' => {
+                if !current.is_empty() {
+                    tokens.push(LyricToken::Syl(std::mem::take(&mut current)));
+                }
+                tokens.push(LyricToken::Skip);
+            }
+            '|' => {
+                if !current.is_empty() {
+                    tokens.push(LyricToken::Syl(std::mem::take(&mut current)));
+                }
+                // `|` syncs to the next bar; for v1 we just treat it as
+                // a delimiter without further alignment logic.
+            }
+            '~' => {
+                // Join words under a single note — write as space.
+                if !current.is_empty() {
+                    current.push(' ');
+                }
+            }
+            '\\' => {
+                // Soft hyphen `\-` — consume the next `-` literally.
+                if chars.peek() == Some(&'-') {
+                    chars.next();
+                    current.push('-');
+                } else {
+                    current.push(c);
+                }
+            }
+            _ => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(LyricToken::Syl(current));
+    }
+    tokens
+}
+
+/// Emit per-syllable Text elements under their assigned note anchors.
+fn emit_aligned_lyrics(
+    elements: &mut Vec<EngravingElement>,
+    text: &str,
+    anchors: &[NoteAnchor],
+    ctx: StaffCtx,
+) {
+    let tokens = tokenize_lyrics(text);
+    let mut note_idx = 0;
+    // Place lyrics below the lowest note in the line so they don't
+    // overlap a low-tessitura phrase or ledger lines below the staff.
+    let lowest_y = anchors
+        .iter()
+        .map(|a| a.y)
+        .fold(ctx.y_at(4.0), f64::max);
+    let y_lyric = lowest_y + ctx.sp * 2.5;
+    let size = ctx.sp * 1.1;
+    for tok in tokens {
+        if note_idx >= anchors.len() {
+            break;
+        }
+        let anchor = anchors[note_idx];
+        match tok {
+            LyricToken::Syl(text) => {
+                elements.push(EngravingElement::Text {
+                    content: text,
+                    x: anchor.x_left,
+                    y: y_lyric,
+                    size,
+                    source_span: (0, 0),
+                });
+                note_idx += 1;
+            }
+            LyricToken::Skip => {
+                note_idx += 1;
+            }
+        }
+    }
 }
 
 // --- Grace notes ------------------------------------------------------------
