@@ -50,8 +50,16 @@ pub fn parse_header<'a>(
             continue;
         }
 
-        // Check for field format
-        if trimmed.len() >= 2 && trimmed.chars().nth(1) == Some(':') {
+        // Check for field format. The first char must be an ASCII
+        // letter — without that guard, lines like `|: faf` would be
+        // accepted as a `|`-letter info field.
+        if trimmed.len() >= 2
+            && trimmed.chars().nth(1) == Some(':')
+            && trimmed
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic())
+        {
             let field_char = trimmed.chars().next().unwrap();
             let value = trimmed[2..].trim();
 

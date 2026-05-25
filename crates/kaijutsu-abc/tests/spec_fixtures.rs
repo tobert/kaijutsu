@@ -44,7 +44,12 @@ use std::path::{Path, PathBuf};
 ///    109 — mid-body inline info fields per §3.2 (M:, K:, P:, N: at
 ///          body line-start emit Element::InlineField)
 ///    105 — backtick beam-break per §4.7 silently consumed
-const MAX_TOTAL_WARNINGS: usize = 105;
+///    132 — NthEnding bracket form `[1`, `[1-3` per §4.10 (NET +27:
+///          header parser fix — `|:` was previously misparsed as a
+///          `|`-letter info field, silently swallowing content;
+///          fixing it surfaces real body content that hits gaps,
+///          plus a handful of orphan `+:` warnings. Surfacing > masking.)
+const MAX_TOTAL_WARNINGS: usize = 132;
 const MAX_TOTAL_ERRORS: usize = 0;
 
 struct Outcome {

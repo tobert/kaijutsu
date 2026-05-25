@@ -450,6 +450,18 @@ fn try_parse_bar(input: &mut &str) -> Option<Bar> {
         *input = &input[2..];
         return Some(Bar::Start);
     }
+    // Variant ending bracket form: [1, [2, [1-3, [1,3,5-7 (§4.10)
+    if input.starts_with('[') && input.chars().nth(1).is_some_and(|c| c.is_ascii_digit()) {
+        let (nums, consumed) = parse_ending_list(&input[1..]);
+        if !nums.is_empty() {
+            *input = &input[1 + consumed..];
+            return Some(match nums.as_slice() {
+                [1] => Bar::FirstEnding,
+                [2] => Bar::SecondEnding,
+                _ => Bar::NthEnding(nums),
+            });
+        }
+    }
     if input.starts_with("||") {
         *input = &input[2..];
         return Some(Bar::Double);
@@ -484,6 +496,54 @@ fn try_parse_bar(input: &mut &str) -> Option<Bar> {
     }
 
     None
+}
+
+/// Parse a comma/range list of ending numbers like `1`, `1-3`, or
+/// `1,3,5-7`. Returns the expanded number list plus the byte count
+/// consumed from the start of `input`. Stops at the first non-digit,
+/// non-`,`, non-`-` character.
+fn parse_ending_list(input: &str) -> (Vec<u8>, usize) {
+    let mut nums = Vec::new();
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    let mut current: Option<u8> = None;
+    let mut range_start: Option<u8> = None;
+    loop {
+        match bytes.get(i) {
+            Some(b) if b.is_ascii_digit() => {
+                let digit = (b - b'0') as u8;
+                current = Some(current.unwrap_or(0).saturating_mul(10).saturating_add(digit));
+                i += 1;
+            }
+            Some(b',') => {
+                if let Some(end) = current.take() {
+                    if let Some(start) = range_start.take() {
+                        for n in start..=end {
+                            nums.push(n);
+                        }
+                    } else {
+                        nums.push(end);
+                    }
+                }
+                i += 1;
+            }
+            Some(b'-') => {
+                range_start = current.take();
+                i += 1;
+            }
+            _ => break,
+        }
+    }
+    if let Some(end) = current {
+        if let Some(start) = range_start {
+            for n in start..=end {
+                nums.push(n);
+            }
+        } else {
+            nums.push(end);
+        }
+    }
+    (nums, i)
 }
 
 /// Try to parse a tuplet (3abc
