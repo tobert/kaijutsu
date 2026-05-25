@@ -146,15 +146,31 @@ K:Hp                   ← Highland bagpipe (F#, C#, G natural displayed)
 K:none                 ← no key signature
 ```
 
-### Clef in Key Field
+### Clef and Other K: Attributes **parse**
+
+K: accepts attribute clauses after the key signature per §4.6:
 
 ```
-K:C clef=bass
+K:C clef=bass                       ← clef change without key change
 K:Gm clef=tenor
 K:C clef=treble middle=B stafflines=5
+K:Am transpose=-2                   ← scale playback by N semitones
+K:G octave=1                        ← shift up an octave
+K:F middle=B                        ← middle staff line pitch
+K: clef=alto                        ← no root, clef only (defaults to C)
+K: perc stafflines=1                ← percussion shorthand
 ```
 
-Available clefs: `treble`, `bass`, `alto`, `tenor`, `perc`, `none`
+Available clef names (with or without `clef=` prefix): `treble`, `bass`,
+`alto`, `tenor`, `perc`. Each accepts an optional `±8` suffix
+(`treble-8`, `bass+8`).
+
+Recognised attributes: `clef=`, `middle=`, `transpose=`, `octave=`,
+`stafflines=`.
+
+Mid-tune K: changes are supported via both the bracketed form
+`[K:Am]` (mid-line) and the standalone line form at body line-start
+(see §16).
 
 ---
 
@@ -273,13 +289,19 @@ Notes without spaces between them are beamed together:
 ABCD           ← four beamed eighth notes
 AB CD          ← two groups of two beamed notes
 A B C D        ← four separate (unbeamed) notes
+A`B            ← backtick forces a beam break without inserting space
+A```B          ← multiple backticks accepted (§4.7)
 ```
+
+Backticks are a pure typesetting hint and are silently consumed by the
+parser; they don't appear in the AST.
 
 ---
 
-## 8. Broken Rhythm **standard only**
+## 8. Broken Rhythm **parse, midi**
 
-A shorthand for dotted rhythms:
+A shorthand for dotted rhythms — the operator scales whatever explicit
+duration each surrounding note already has:
 
 | Syntax | Effect |
 |--------|--------|
@@ -288,6 +310,11 @@ A shorthand for dotted rhythms:
 | `A>>B` | A double-dotted, B quartered |
 | `A<<B` | A quartered, B double-dotted |
 | `A>>>B` | A triple-dotted, B at 1/8 |
+
+Whitespace around the operator is allowed (`a > b`). The operator
+only fires between two parseable notes; with anything else in between
+(a bar, a rest, a chord), the chevrons fall through to the
+unknown-character path.
 
 ---
 
@@ -455,7 +482,11 @@ Single-character decorations placed before a note:
 | `R` | Roll | — |
 | `J` | Slide | — |
 
-### Long Form `!name!` **parse**
+### Long Form `!name!` or `+name+` **parse**
+
+Both delimiter forms accept the same vocabulary (§4.14). `+name+` is
+the older alternate from dialects that used `!` for line breaks; the
+parser routes both through the same lookup table.
 
 | Decoration | Category | Status |
 |-----------|----------|--------|
@@ -575,21 +606,27 @@ V:2
 C,G,C,G,|C,G,C,G,|
 ```
 
-### Voice Overlay **standard only**
+### Voice Overlay **parse**
 
-The `&` symbol starts a new voice overlaid on the current staff:
+The `&` symbol starts a parallel run aligned to the music since the
+last bar of the same voice. Repeating it (`&&`, `&&&`) introduces
+further overlay layers per spec §7.4.
 
 ```
 AB & cd           ← two voices on one staff
+g4 f4 | e6 e2 |
+&& (d8 | c6) c2| ← double-overlay starting from the previous bar
 ```
 
-Note: voice overlay is not yet parsed by kaijutsu-abc.
+The parser emits `Element::Overlay { layers }` markers. Playback and
+rendering of overlays into separate tracks is left for downstream
+work — the AST captures the structural marker only.
 
 ---
 
 ## 16. Inline Fields **parse**
 
-Change musical parameters mid-tune using `[field:value]`:
+Two forms per spec §3.2. Bracketed inline within a music line:
 
 ```
 ABcd [M:3/4] efg    ← change meter mid-tune
@@ -597,15 +634,31 @@ ABCD [K:Am] efga    ← change key mid-tune
 ABCD [Q:1/4=160] e  ← change tempo mid-tune
 ```
 
-Allowed inline: `K:`, `L:`, `M:`, `Q:`, `I:`, `V:`, `N:`, `R:`, `r:`, `U:`, `m:`, `w:`, `W:`
+Or as a standalone line at body line-start:
+
+```
+CDEF|
+M:3/4
+GAB|
+```
+
+Both forms emit `Element::InlineField`. The bracketed form is consumed
+mid-line; the standalone form must appear at the start of a body line
+(after a newline or `\` continuation). Letters with dedicated handling
+take their specific paths instead: `V:` → `VoiceSwitch`, `w:` / `W:` →
+`Lyrics`, `s:` → `SymbolLine`, `+:` → continuation of previous w:/W:/s:.
+
+Allowed inline letters: `K:`, `L:`, `M:`, `Q:`, `I:`, `V:`, `N:`, `R:`, `r:`, `U:`, `m:`, `P:`, `w:`, `W:`, `s:`
 
 ---
 
-## 17. Lyrics **standard only**
+## 17. Lyrics **parse**
 
-### Aligned Lyrics (`w:`)
+### Aligned Lyrics (`w:`) **parse**
 
-Each syllable aligns to the next note:
+Each syllable aligns to the next note. Content is captured verbatim
+into `Element::Lyrics { aligned: true, text }`; syllable-level parsing
+(splitting on `-`, applying `*` skips, etc.) is the renderer's job.
 
 ```
 C D E F | G A B c |
@@ -615,14 +668,17 @@ C2 D2 | E4 |
 w: hel-lo world~to-day
 ```
 
-Alignment controls:
+Alignment controls (significant within the captured text):
 - `-` separates syllables within a word
 - `~` joins words under a single note
 - `_` extends a syllable across the next note
 - `*` skips a note (blank syllable)
 - `|` advances to the next bar line
+- `\-` is a soft hyphen across the next note
 
-### End-of-tune Lyrics (`W:`)
+### End-of-tune Lyrics (`W:`) **parse**
+
+Captured the same way as `w:` but with `aligned: false`:
 
 ```
 W: This is the first verse of the song
@@ -631,11 +687,36 @@ W:
 W: This is the second verse
 ```
 
+### Continuation Lines (`+:`) **parse**
+
+A line beginning with `+:` extends the previous `w:`/`W:`/`s:` line.
+Its content is folded into the previous element's text, joined with
+`\n`. A `+:` with no preceding compatible field emits a warning.
+
+```
+C D E F | G A B c |
+w: verse one of the syl-la-bles
++: con-tin-ued lyric here
+```
+
+### Symbol Lines (`s:`) **parse**
+
+`s:` lines pair symbols (chord symbols, decorations, annotations,
+`*` skips, `|` bar-aligns) with the music on the preceding line:
+
+```
+C2  C2 Ez   A2|
+s: "C" *  "Am" * |
+```
+
+Captured as `Element::SymbolLine(text)`; symbol-level parsing is left
+to the renderer.
+
 ---
 
-## 18. Macros and User Symbols **standard only**
+## 18. Macros and User Symbols
 
-### User-Defined Symbol Shortcuts (`U:`)
+### User-Defined Symbol Shortcuts (`U:`) **standard only**
 
 Map single characters to decoration names:
 
@@ -645,7 +726,10 @@ U:R = !roll!           ← R becomes roll shorthand
 U:~ = !turn!           ← override default ~ meaning
 ```
 
-### Macros (`m:`)
+The `U:` field is captured in `Header::other_fields` but its mappings
+are not yet applied to body parsing.
+
+### Macros (`m:`) **parse**
 
 Static macro:
 ```
@@ -657,27 +741,49 @@ Transposing macro (uses `n` for pitch variable):
 m:~n2 = {n+1}n{n-1}n  ← works at any pitch
 ```
 
+The `m:` field is captured as `InfoField` (in header → `other_fields`;
+in body line-start → `Element::InlineField`). Macro expansion at body
+parse time is not yet implemented.
+
 ---
 
-## 19. Line Continuation and Breaks
+## 19. Line Continuation and Breaks **parse**
+
+`\<newline>` is a typesetting hint that suppresses the visual line
+break; the next physical line is still parsed normally, so field-line
+markers (`w:`, `M:`, `s:`, …) at its start are still recognized:
 
 ```
 ABcd\                  ← backslash continues to next line (no break)
 efga|                  ← this is part of the same music line
 
+ABcd cab|\
+w: text continues here ← w: still recognized as a lyric line
+
 ABcd|                  ← end of line = score line break (default)
 efga|                  ← new score line
-
-I:linebreak <none>     ← disable automatic line breaks
-ABcd|$                 ← $ forces a line break when linebreak is <none>
 ```
 
-### Field Continuation
+A stray `\` mid-line (not at end-of-line) still hits the unknown-
+character fallback.
+
+The `$` line-break marker and the `I:linebreak` directive are not yet
+implemented:
+
+```
+I:linebreak <none>     ← disable automatic line breaks (NOT YET)
+ABcd|$                 ← forces a line break ($ NOT YET)
+```
+
+### Field Continuation **parse**
 
 ```
 w:First part of lyrics
 +:second part continues on same field
 ```
+
+`+:` content folds into the previous `w:`/`W:`/`s:` element's text,
+joined with `\n`. See §17 for details.
 
 ---
 
@@ -920,33 +1026,69 @@ For use with `%%MIDI program N`:
 ## 23. Kaijutsu-ABC Public API
 
 ```rust
-use kaijutsu_abc::{parse, to_midi, transpose, to_abc, semitones_to_key, MidiParams};
+use kaijutsu_abc::{parse, parse_with_mode, ParseMode, to_midi, transpose,
+                   to_abc, semitones_to_key, MidiParams};
 use kaijutsu_abc::ast::*;
 use kaijutsu_abc::engrave::{engrave_to_svg, EngravingOptions};
 
-// Parse ABC text
+// Parse ABC text — returns Vec<Tune> since a .abc file can contain
+// multiple tunes delimited by X:N lines.
 let result = parse("X:1\nT:Test\nK:C\nCDEF|");
-let tune = result.value;
-let feedback = result.feedback;  // Vec<Feedback> — errors, warnings, info
+let tunes: &Vec<Tune> = &result.value;
+let feedback = &result.feedback;  // Vec<Feedback> — errors, warnings, info
+let first = &tunes[0];
 
-// Generate MIDI (SMF format 0)
-let midi_bytes = to_midi(&tune, &MidiParams::default());
+// Generate MIDI (SMF format 0) from a single tune
+let midi_bytes = to_midi(first, &MidiParams::default());
 
 // Transpose
-let transposed = transpose(&tune, 5);  // up 5 semitones
+let transposed = transpose(first, 5);  // up 5 semitones
 
 // Calculate transposition interval between keys
-let semitones = semitones_to_key(&tune.header.key, "Am").unwrap();
+let semitones = semitones_to_key(&first.header.key, "Am").unwrap();
 
-// Round-trip back to ABC text
-let abc_text = to_abc(&tune);
+// Round-trip back to ABC text (single tune at a time)
+let abc_text = to_abc(first);
 
 // Render to SVG
-let svg = engrave_to_svg(&tune, &EngravingOptions::default());
+let svg = engrave_to_svg(first, &EngravingOptions::default());
 ```
 
-Unknown `!name!` decorations are preserved as `Decoration::Other(String)` rather
-than rejected, so the parser won't fail on decorations it doesn't specifically handle.
+### Parse modes
+
+`parse_with_mode` controls how strictly the parser treats incomplete
+or malformed input. All three modes share the same parser; only the
+warn-vs-error promotion differs.
+
+- `ParseMode::Strict` — missing X:/K:, body-before-K:, and any
+  unrecognised construct become errors. Use when input is claimed
+  to be a complete tune.
+- `ParseMode::Generous` (default for `parse()`) — missing fields warn
+  but parsing continues with defaults. Historical behavior.
+- `ParseMode::Fragment` — no header expected; missing-header warnings
+  suppressed. Use for embedded snippets and inline ABC per spec §2.3.
+
+Reserved characters (`# * ; ? @` per §8.1) always warn, regardless of
+mode — they are spec-legal input the parser doesn't have a meaning for.
+
+### Multi-tune files
+
+```rust
+let result = parse(multi_tune_source);  // ParseResult<Vec<Tune>>
+for tune in &result.value {
+    println!("X:{} T:{}", tune.header.reference, tune.header.title);
+}
+```
+
+Info fields appearing before the first `X:` (the "file header") apply
+as defaults to every tune in the file per §2.2. Tune-level fields win
+on conflict.
+
+### Decoration tolerance
+
+Unknown `!name!` / `+name+` decorations are preserved as
+`Decoration::Other(String)` rather than rejected, so the parser won't
+fail on decorations it doesn't specifically handle.
 
 ---
 
@@ -966,6 +1108,11 @@ than rejected, so the parser won't fail on decorations it doesn't specifically h
 ## References
 
 - [ABC v2.1 Standard](https://abcnotation.com/wiki/abc:standard:v2.1) — the definitive specification
+- Local cache of the v2.1 spec for offline reference:
+  [`crates/kaijutsu-abc/docs/abc-spec-cache.md`](../crates/kaijutsu-abc/docs/abc-spec-cache.md)
+- Spec-derived test corpus: [`crates/kaijutsu-abc/tests/fixtures/spec/`](../crates/kaijutsu-abc/tests/fixtures/spec/)
+  — 106 fixtures across 40 sections, each paired with a `.md` note
+  linking back to the upstream subsection
 - [ABC v2.2 Draft](https://abcnotation.com/wiki/abc:standard:v2.2) — upcoming improvements
 - [abcjs](https://github.com/paulrosen/abcjs) — the industry-standard JS parser/renderer
 - [ABC Notation Examples](https://abcnotation.com/examples) — code + rendered output
