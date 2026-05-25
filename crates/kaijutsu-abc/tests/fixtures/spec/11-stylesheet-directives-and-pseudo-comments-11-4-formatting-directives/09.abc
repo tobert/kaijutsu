@@ -1,0 +1,3 @@
+%%sep     % draw a horizontal separator, i.e. a line
+%%vskip   % insert some vertical space
+%%newpage % start a new page

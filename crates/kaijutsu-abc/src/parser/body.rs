@@ -4,8 +4,13 @@ use winnow::prelude::*;
 
 use crate::ast::{Bar, Element, InfoField, Tuplet};
 use crate::feedback::FeedbackCollector;
+use crate::ParseMode;
 
 use super::note::{parse_chord, parse_chord_symbol, parse_note, parse_rest};
+
+/// Characters reserved by ABC v2.1 §8.1 for future extensions. Current
+/// software is instructed to ignore them with (at most) a warning.
+const RESERVED_CHARS: &[char] = &['#', '*', ';', '?', '@'];
 
 /// Skip whitespace (spaces and tabs) at the start of input, returning count
 fn skip_spaces(input: &mut &str) -> usize {
@@ -15,7 +20,11 @@ fn skip_spaces(input: &mut &str) -> usize {
 }
 
 /// Parse the body section of an ABC tune.
-pub fn parse_body(input: &str, collector: &mut FeedbackCollector) -> Vec<Element> {
+pub fn parse_body(
+    input: &str,
+    collector: &mut FeedbackCollector,
+    mode: ParseMode,
+) -> Vec<Element> {
     let mut elements = Vec::new();
     let mut remaining = input;
     let mut line_num = 1;
@@ -65,10 +74,35 @@ pub fn parse_body(input: &str, collector: &mut FeedbackCollector) -> Vec<Element
         if let Some(element) = try_parse_element(&mut remaining, collector) {
             elements.push(element);
         } else if !remaining.is_empty() {
-            // Unknown character - skip it with a warning
             let c = remaining.chars().next().unwrap();
             if !c.is_whitespace() {
-                collector.warning(format!("Skipping unknown character '{}'", c));
+                if RESERVED_CHARS.contains(&c) {
+                    // Reserved-for-future-use char per §8.1. Always a
+                    // warning regardless of mode — it's spec-legal input
+                    // we just don't have a meaning for.
+                    collector.warning(format!(
+                        "Reserved character '{}' ignored (ABC v2.1 §8.1)",
+                        c
+                    ));
+                } else {
+                    // The parser doesn't recognise this character as the
+                    // start of any construct. In Strict mode that's a
+                    // hard error — the input is either invalid ABC or
+                    // uses a feature the parser doesn't yet support, and
+                    // both cases want to surface loudly. In Generous and
+                    // Fragment modes we keep the historical warning so
+                    // existing callers aren't broken.
+                    let msg = format!("Unrecognized construct '{}'", c);
+                    match mode {
+                        ParseMode::Strict => collector.error(msg),
+                        ParseMode::Generous | ParseMode::Fragment => {
+                            collector.warning(format!(
+                                "Skipping unknown character '{}'",
+                                c
+                            ))
+                        }
+                    }
+                }
             }
             remaining = &remaining[c.len_utf8()..];
         }
@@ -452,7 +486,7 @@ mod tests {
     #[test]
     fn test_parse_simple_body() {
         let mut collector = FeedbackCollector::new();
-        let elements = parse_body("CDEF|", &mut collector);
+        let elements = parse_body("CDEF|", &mut collector, ParseMode::Generous);
 
         let notes: Vec<_> = elements
             .iter()
@@ -469,7 +503,7 @@ mod tests {
     #[test]
     fn test_parse_bar_types() {
         let mut collector = FeedbackCollector::new();
-        let elements = parse_body("|:C:|D||E|]", &mut collector);
+        let elements = parse_body("|:C:|D||E|]", &mut collector, ParseMode::Generous);
 
         let bars: Vec<_> = elements
             .iter()
@@ -488,7 +522,7 @@ mod tests {
     #[test]
     fn test_parse_triplet() {
         let mut collector = FeedbackCollector::new();
-        let elements = parse_body("(3CDE", &mut collector);
+        let elements = parse_body("(3CDE", &mut collector, ParseMode::Generous);
 
         let tuplets: Vec<_> = elements
             .iter()
@@ -507,7 +541,7 @@ mod tests {
     #[test]
     fn test_parse_grace_notes() {
         let mut collector = FeedbackCollector::new();
-        let elements = parse_body("{g}A", &mut collector);
+        let elements = parse_body("{g}A", &mut collector, ParseMode::Generous);
 
         let graces: Vec<_> = elements
             .iter()
@@ -520,7 +554,7 @@ mod tests {
     #[test]
     fn test_parse_acciaccatura() {
         let mut collector = FeedbackCollector::new();
-        let elements = parse_body("{/g}A", &mut collector);
+        let elements = parse_body("{/g}A", &mut collector, ParseMode::Generous);
 
         let graces: Vec<_> = elements
             .iter()
@@ -537,7 +571,7 @@ mod tests {
     #[test]
     fn test_parse_decorations() {
         let mut collector = FeedbackCollector::new();
-        let elements = parse_body(".C~D!trill!E", &mut collector);
+        let elements = parse_body(".C~D!trill!E", &mut collector, ParseMode::Generous);
 
         let decorations: Vec<_> = elements
             .iter()
@@ -553,7 +587,7 @@ mod tests {
     #[test]
     fn test_parse_inline_field() {
         let mut collector = FeedbackCollector::new();
-        let elements = parse_body("CD[M:3/4]EF", &mut collector);
+        let elements = parse_body("CD[M:3/4]EF", &mut collector, ParseMode::Generous);
 
         let fields: Vec<_> = elements
             .iter()
@@ -571,7 +605,7 @@ mod tests {
     #[test]
     fn test_parse_comments() {
         let mut collector = FeedbackCollector::new();
-        let elements = parse_body("CD % comment\nEF", &mut collector);
+        let elements = parse_body("CD % comment\nEF", &mut collector, ParseMode::Generous);
 
         let notes: Vec<_> = elements
             .iter()
@@ -589,7 +623,7 @@ mod tests {
         use crate::feedback::FeedbackLevel;
 
         let mut collector = FeedbackCollector::new();
-        let _elements = parse_body("CD\n%%MIDI program 56\nEF", &mut collector);
+        let _elements = parse_body("CD\n%%MIDI program 56\nEF", &mut collector, ParseMode::Generous);
 
         // Should have a warning about %%MIDI in body
         let warnings: Vec<_> = collector

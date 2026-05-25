@@ -1,0 +1,3 @@
+%%writefields O false         % the O field is not printed out - other defaults remain
+%%writefields X               % the X: field is printed out
+%%writefields BCDFGHNORSTWwXZ % all string-type fields are printed out

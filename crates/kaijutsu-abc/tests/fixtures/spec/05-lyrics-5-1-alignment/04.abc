@@ -1,0 +1,6 @@
+w: syll-a-ble    is aligned with three notes
+w: syll-a--ble   is aligned with four notes
+w: syll-a -ble   (equivalent to the previous line)
+w: time__        is aligned with three notes
+w: of~the~day    is treated as one syllable (i.e. aligned with one note)
+                 but appears as three separate words

@@ -33,12 +33,40 @@ pub mod parser;
 pub use ast::*;
 pub use feedback::{Feedback, FeedbackLevel, ParseResult};
 
-/// Parse ABC notation into a Tune AST.
+/// Controls how strictly the parser treats incomplete or malformed input.
 ///
-/// This is a generous parser that will attempt to continue parsing
-/// even when encountering issues, collecting feedback along the way.
+/// The same parser front-end is used for all modes; the mode only changes
+/// which conditions are reported as errors vs warnings vs silently accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ParseMode {
+    /// Structural violations (body before K:, missing X:, missing K:) are
+    /// errors. Use for inputs that claim to be complete tunes.
+    Strict,
+    /// Missing required fields warn but parsing continues with defaults.
+    /// The historical behavior of [`parse`]; preserved for back-compat.
+    #[default]
+    Generous,
+    /// Treat input as a fragment per spec §2.3 — no header is expected, so
+    /// missing X:/K:/M: and "body before K:" are not reported. Used for
+    /// spec-example fixtures and inline ABC.
+    Fragment,
+}
+
+/// Parse ABC notation into a Tune AST (generous mode).
+///
+/// Equivalent to [`parse_with_mode(input, ParseMode::Generous)`]. Missing
+/// fields warn, the parser keeps going with defaults.
 pub fn parse(input: &str) -> ParseResult<Tune> {
-    parser::parse(input)
+    parser::parse(input, ParseMode::Generous)
+}
+
+/// Parse ABC notation with an explicit [`ParseMode`].
+///
+/// Use [`ParseMode::Strict`] for inputs claimed to be complete tunes,
+/// [`ParseMode::Fragment`] for embedded snippets without headers, or
+/// [`ParseMode::Generous`] to preserve the historical lenient behavior.
+pub fn parse_with_mode(input: &str, mode: ParseMode) -> ParseResult<Tune> {
+    parser::parse(input, mode)
 }
 
 /// Parameters for MIDI generation

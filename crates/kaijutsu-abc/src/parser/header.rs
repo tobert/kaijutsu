@@ -2,13 +2,18 @@
 
 use crate::ast::{Clef, Header, InfoField, Meter, StemDirection, Tempo, UnitLength, VoiceDef};
 use crate::feedback::FeedbackCollector;
+use crate::ParseMode;
 
 use super::key::parse_key_field;
 
 /// Parse the header section of an ABC tune.
 ///
 /// Returns the remaining input after the header (starting at body).
-pub fn parse_header<'a>(input: &'a str, collector: &mut FeedbackCollector) -> (&'a str, Header) {
+pub fn parse_header<'a>(
+    input: &'a str,
+    collector: &mut FeedbackCollector,
+    mode: ParseMode,
+) -> (&'a str, Header) {
     let mut header = Header::default();
     let mut remaining = input;
     let mut found_x = false;
@@ -112,10 +117,18 @@ pub fn parse_header<'a>(input: &'a str, collector: &mut FeedbackCollector) -> (&
         } else {
             // Not a field line - must be body starting
             if !found_k {
-                collector.warning_with_suggestion(
-                    "Body started before K: field",
-                    "Add a K: field before the music (e.g., K:C for C major)",
-                );
+                match mode {
+                    ParseMode::Strict => collector.error_with_suggestion(
+                        "Body started before K: field",
+                        "Add a K: field before the music (e.g., K:C for C major)",
+                    ),
+                    ParseMode::Generous => collector.warning_with_suggestion(
+                        "Body started before K: field",
+                        "Add a K: field before the music (e.g., K:C for C major)",
+                    ),
+                    // Fragments by definition have no header; silent.
+                    ParseMode::Fragment => {}
+                }
             }
             break;
         }
@@ -129,27 +142,47 @@ pub fn parse_header<'a>(input: &'a str, collector: &mut FeedbackCollector) -> (&
         }
     }
 
-    // Emit warnings for missing fields
+    // Report missing required fields according to mode.
+    // Fragments suppress these (per spec §2.3); Strict promotes them to
+    // errors; Generous (legacy) keeps them as warnings.
     if !found_x {
         collector.set_position(1, 1);
-        collector.warning_with_suggestion(
-            "Missing X: field, assuming X:1",
-            "Add X:1 at the start of the tune",
-        );
+        match mode {
+            ParseMode::Strict => collector.error_with_suggestion(
+                "Missing X: field",
+                "Add X:1 at the start of the tune",
+            ),
+            ParseMode::Generous => collector.warning_with_suggestion(
+                "Missing X: field, assuming X:1",
+                "Add X:1 at the start of the tune",
+            ),
+            ParseMode::Fragment => {}
+        }
     }
 
     if !found_k {
-        collector.warning_with_suggestion(
-            "Missing K: field, assuming K:C",
-            "Add a K: field to specify the key signature",
-        );
+        match mode {
+            ParseMode::Strict => collector.error_with_suggestion(
+                "Missing K: field",
+                "Add a K: field to specify the key signature",
+            ),
+            ParseMode::Generous => collector.warning_with_suggestion(
+                "Missing K: field, assuming K:C",
+                "Add a K: field to specify the key signature",
+            ),
+            ParseMode::Fragment => {}
+        }
     }
 
     if header.meter.is_none() {
-        collector.warning_with_suggestion(
-            "Missing M: field, assuming 4/4",
-            "Add M:4/4 or appropriate meter",
-        );
+        // M: is not required by the spec — it defaults to "none" (free
+        // rhythm). Only Generous mode flags it for legacy reasons.
+        if mode == ParseMode::Generous {
+            collector.warning_with_suggestion(
+                "Missing M: field, assuming 4/4",
+                "Add M:4/4 or appropriate meter",
+            );
+        }
         header.meter = Some(Meter::Simple {
             numerator: 4,
             denominator: 4,
@@ -525,7 +558,7 @@ mod tests {
     fn test_parse_midi_program() {
         let mut collector = FeedbackCollector::new();
         let abc = "X:1\nT:Test\n%%MIDI program 33\nM:4/4\nK:C\n";
-        let (_, header) = parse_header(abc, &mut collector);
+        let (_, header) = parse_header(abc, &mut collector, ParseMode::Generous);
         assert_eq!(header.midi_program, Some(33));
     }
 
@@ -533,7 +566,7 @@ mod tests {
     fn test_parse_midi_program_trumpet() {
         let mut collector = FeedbackCollector::new();
         let abc = "X:1\nT:Fanfare\n%%MIDI program 56\nM:4/4\nK:C\n";
-        let (_, header) = parse_header(abc, &mut collector);
+        let (_, header) = parse_header(abc, &mut collector, ParseMode::Generous);
         assert_eq!(header.midi_program, Some(56)); // Trumpet
     }
 }

@@ -10,17 +10,18 @@ mod note;
 
 use crate::ast::{Element, Tune, Voice};
 use crate::feedback::{FeedbackCollector, ParseResult};
+use crate::ParseMode;
 use std::collections::HashMap;
 
 /// Parse ABC notation into a Tune AST.
-pub fn parse(input: &str) -> ParseResult<Tune> {
+pub fn parse(input: &str, mode: ParseMode) -> ParseResult<Tune> {
     let mut collector = FeedbackCollector::new();
 
     // Parse header
-    let (remaining, header) = header::parse_header(input, &mut collector);
+    let (remaining, header) = header::parse_header(input, &mut collector, mode);
 
     // Parse body
-    let elements = body::parse_body(remaining, &mut collector);
+    let elements = body::parse_body(remaining, &mut collector, mode);
 
     // Route elements to voices based on VoiceSwitch elements
     let voices = route_elements_to_voices(&header.voice_defs, elements);
@@ -120,13 +121,12 @@ fn route_elements_to_voices(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::ast::*;
 
     #[test]
     fn test_parse_minimal() {
         let abc = "X:1\nT:Test\nK:C\n";
-        let result = parse(abc);
+        let result = crate::parse(abc);
 
         assert!(!result.has_errors());
         assert_eq!(result.value.header.reference, 1);
@@ -137,7 +137,7 @@ mod tests {
     #[test]
     fn test_parse_with_meter() {
         let abc = "X:1\nT:Test\nM:6/8\nK:G\n";
-        let result = parse(abc);
+        let result = crate::parse(abc);
 
         assert!(!result.has_errors());
         assert_eq!(
@@ -152,7 +152,7 @@ mod tests {
     #[test]
     fn test_parse_common_time() {
         let abc = "X:1\nT:Test\nM:C\nK:D\n";
-        let result = parse(abc);
+        let result = crate::parse(abc);
 
         assert!(!result.has_errors());
         assert_eq!(result.value.header.meter, Some(Meter::Common));
@@ -161,7 +161,7 @@ mod tests {
     #[test]
     fn test_parse_cut_time() {
         let abc = "X:1\nT:Test\nM:C|\nK:D\n";
-        let result = parse(abc);
+        let result = crate::parse(abc);
 
         assert!(!result.has_errors());
         assert_eq!(result.value.header.meter, Some(Meter::Cut));
@@ -170,7 +170,7 @@ mod tests {
     #[test]
     fn test_parse_unit_length() {
         let abc = "X:1\nT:Test\nL:1/16\nK:C\n";
-        let result = parse(abc);
+        let result = crate::parse(abc);
 
         assert!(!result.has_errors());
         assert_eq!(
@@ -185,7 +185,7 @@ mod tests {
     #[test]
     fn test_parse_tempo() {
         let abc = "X:1\nT:Test\nQ:1/4=120\nK:C\n";
-        let result = parse(abc);
+        let result = crate::parse(abc);
 
         assert!(!result.has_errors());
         let tempo = result.value.header.tempo.as_ref().unwrap();
@@ -196,7 +196,7 @@ mod tests {
     #[test]
     fn test_parse_simple_notes() {
         let abc = "X:1\nT:Test\nK:C\nCDEF|";
-        let result = parse(abc);
+        let result = crate::parse(abc);
 
         assert!(!result.has_errors());
 
@@ -220,7 +220,7 @@ mod tests {
     #[test]
     fn test_parse_lowercase_notes() {
         let abc = "X:1\nT:Test\nK:C\ncdef|";
-        let result = parse(abc);
+        let result = crate::parse(abc);
 
         let notes: Vec<_> = result.value.voices[0]
             .elements
@@ -239,7 +239,7 @@ mod tests {
     #[test]
     fn test_parse_octave_modifiers() {
         let abc = "X:1\nT:Test\nK:C\nC,Cc'|";
-        let result = parse(abc);
+        let result = crate::parse(abc);
 
         let notes: Vec<_> = result.value.voices[0]
             .elements
@@ -259,7 +259,7 @@ mod tests {
     #[test]
     fn test_parse_accidentals() {
         let abc = "X:1\nT:Test\nK:C\n^C_D=E^^F__|";
-        let result = parse(abc);
+        let result = crate::parse(abc);
 
         let notes: Vec<_> = result.value.voices[0]
             .elements
@@ -282,7 +282,7 @@ mod tests {
     #[test]
     fn test_parse_durations() {
         let abc = "X:1\nT:Test\nK:C\nA A2 A/2 A3/2|";
-        let result = parse(abc);
+        let result = crate::parse(abc);
 
         let notes: Vec<_> = result.value.voices[0]
             .elements
@@ -303,7 +303,7 @@ mod tests {
     #[test]
     fn test_parse_rest() {
         let abc = "X:1\nT:Test\nK:C\nz z2|";
-        let result = parse(abc);
+        let result = crate::parse(abc);
 
         let rests: Vec<_> = result.value.voices[0]
             .elements
@@ -322,7 +322,7 @@ mod tests {
     #[test]
     fn test_parse_chord() {
         let abc = "X:1\nT:Test\nK:C\n[CEG]2|";
-        let result = parse(abc);
+        let result = crate::parse(abc);
 
         let chords: Vec<_> = result.value.voices[0]
             .elements
@@ -341,7 +341,7 @@ mod tests {
     #[test]
     fn test_parse_bar_types() {
         let abc = "X:1\nT:Test\nK:C\nC|D||E|]";
-        let result = parse(abc);
+        let result = crate::parse(abc);
 
         let bars: Vec<_> = result.value.voices[0]
             .elements
@@ -361,7 +361,7 @@ mod tests {
     #[test]
     fn test_parse_repeat_bars() {
         let abc = "X:1\nT:Test\nK:C\n|:C:|D::|";
-        let result = parse(abc);
+        let result = crate::parse(abc);
 
         let bars: Vec<_> = result.value.voices[0]
             .elements
@@ -379,7 +379,7 @@ mod tests {
     #[test]
     fn test_parse_tie() {
         let abc = "X:1\nT:Test\nK:C\nC-C|";
-        let result = parse(abc);
+        let result = crate::parse(abc);
 
         let notes: Vec<_> = result.value.voices[0]
             .elements
@@ -398,7 +398,7 @@ mod tests {
     #[test]
     fn test_parse_missing_x_field_warns() {
         let abc = "T:Test\nK:C\nCDE|";
-        let result = parse(abc);
+        let result = crate::parse(abc);
 
         // Should warn but not error
         assert!(result.feedback.iter().any(|f| f.message.contains("X:")));
@@ -409,7 +409,7 @@ mod tests {
     #[test]
     fn test_parse_key_modes() {
         let abc = "X:1\nT:Test\nK:D dorian\n";
-        let result = parse(abc);
+        let result = crate::parse(abc);
 
         assert_eq!(result.value.header.key.root, NoteName::D);
         assert_eq!(result.value.header.key.mode, Mode::Dorian);
@@ -418,7 +418,7 @@ mod tests {
     #[test]
     fn test_parse_key_with_accidental() {
         let abc = "X:1\nT:Test\nK:F#m\n";
-        let result = parse(abc);
+        let result = crate::parse(abc);
 
         assert_eq!(result.value.header.key.root, NoteName::F);
         assert_eq!(result.value.header.key.accidental, Some(Accidental::Sharp));
@@ -428,7 +428,7 @@ mod tests {
     #[test]
     fn test_parse_chord_symbol() {
         let abc = "X:1\nT:Test\nK:C\n\"G\"GAB|";
-        let result = parse(abc);
+        let result = crate::parse(abc);
 
         let symbols: Vec<_> = result.value.voices[0]
             .elements
@@ -448,7 +448,7 @@ mod tests {
         // This is the bug case from session-review-2026-01-05:
         // V:1 and V:2 in the body WITHOUT voice definitions in header
         let abc = "X:1\nT:Test\nM:4/4\nL:1/4\nK:C\nV:1\nCD|\nV:2\nEF|\n";
-        let result = parse(abc);
+        let result = crate::parse(abc);
 
         assert!(!result.has_errors(), "Parse errors: {:?}", result.feedback);
 
@@ -501,7 +501,7 @@ mod tests {
     fn test_multivoice_midi_simultaneous() {
         // Verify that multi-voice ABC produces MIDI with simultaneous notes
         let abc = "X:1\nT:Test\nM:4/4\nL:1/4\nK:C\nV:1\nc|\nV:2\nC|\n";
-        let result = parse(abc);
+        let result = crate::parse(abc);
         assert!(!result.has_errors());
         assert_eq!(result.value.voices.len(), 2);
 

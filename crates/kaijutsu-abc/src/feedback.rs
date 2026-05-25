@@ -124,6 +124,18 @@ impl FeedbackCollector {
         );
     }
 
+    /// Add an error with suggestion at current position
+    pub fn error_with_suggestion(
+        &mut self,
+        message: impl Into<String>,
+        suggestion: impl Into<String>,
+    ) {
+        self.feedback.push(
+            Feedback::error(message, self.current_line, self.current_column)
+                .with_suggestion(suggestion),
+        );
+    }
+
     /// Add info at current position
     pub fn info(&mut self, message: impl Into<String>) {
         self.feedback.push(Feedback::info(

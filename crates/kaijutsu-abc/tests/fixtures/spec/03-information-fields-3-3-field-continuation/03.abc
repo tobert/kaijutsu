@@ -1,0 +1,7 @@
+%%vocalfont Times-Roman 14
+w:nor-mal
+% legal, but not recommended
+%%vocalfont Times-Italic *
++:i-ta-lic
+%%vocalfont Times-Roman *
++:nor-mal

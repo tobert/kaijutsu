@@ -1,0 +1,3 @@
+|:DEF FED| % this is an end of line comment
+% this is a comment line
+DEF [r:and this is a remark] FED:|

@@ -1,0 +1,10 @@
+M:C
+L:1/8
+Q:1/4=66
+K:C
+V:Rueckpos
+%%MIDI voice instrument=53 bank=2
+A3B    c2c2    |d2e2    de/f/P^c3/d/|d8    |z8           |
+V:Organo
+%%MIDI voice instrument=73 bank=2
+z2E2-  E2AG    |F2E2    F2E2        |F6  F2|E2CD   E3F/G/|
