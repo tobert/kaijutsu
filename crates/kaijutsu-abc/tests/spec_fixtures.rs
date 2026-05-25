@@ -29,7 +29,8 @@ use std::path::{Path, PathBuf};
 ///   3001 — initial extraction after ParseMode split
 ///   1946 — fixture curation (24 non-ABC pseudo-syntax fixtures pruned)
 ///    650 — w:/W: lyric line recognition (§5)
-const MAX_TOTAL_WARNINGS: usize = 650;
+///    637 — s: symbol line recognition (§4.15)
+const MAX_TOTAL_WARNINGS: usize = 637;
 const MAX_TOTAL_ERRORS: usize = 0;
 
 struct Outcome {

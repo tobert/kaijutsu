@@ -377,6 +377,10 @@ fn format_element(output: &mut String, element: &Element) {
             output.push_str(if *aligned { "w:" } else { "W:" });
             output.push_str(text);
         }
+        Element::SymbolLine(text) => {
+            output.push_str("s:");
+            output.push_str(text);
+        }
         Element::InlineField(_)
         | Element::Decoration(_)
         | Element::Slur(_)

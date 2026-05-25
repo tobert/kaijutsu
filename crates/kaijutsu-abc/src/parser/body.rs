@@ -133,23 +133,29 @@ pub fn parse_body(
     elements
 }
 
-/// Try to consume a line-start info field (currently `w:` aligned lyrics
-/// and `W:` words-after-the-tune, per spec §5). Advances `remaining` past
-/// the line content (up to but not including the terminating newline).
-/// Returns None if the input doesn't begin with one of these markers.
+/// Try to consume a line-start info field. Currently handles:
+///   `w:` — aligned lyrics (§5)
+///   `W:` — words after the tune (§5)
+///   `s:` — symbol line (§4.15)
+/// Advances `remaining` past the line content (up to but not including the
+/// terminating newline). Returns None if the input doesn't begin with one
+/// of these markers.
 fn try_parse_line_start_field(remaining: &mut &str) -> Option<Element> {
-    let aligned = if remaining.starts_with("w:") {
-        true
-    } else if remaining.starts_with("W:") {
-        false
-    } else {
-        return None;
-    };
-    let after_prefix = &remaining[2..];
+    let (constructor, prefix_len): (fn(String) -> Element, usize) =
+        if remaining.starts_with("w:") {
+            (|t| Element::Lyrics { aligned: true, text: t }, 2)
+        } else if remaining.starts_with("W:") {
+            (|t| Element::Lyrics { aligned: false, text: t }, 2)
+        } else if remaining.starts_with("s:") {
+            (Element::SymbolLine, 2)
+        } else {
+            return None;
+        };
+    let after_prefix = &remaining[prefix_len..];
     let line_end = after_prefix.find('\n').unwrap_or(after_prefix.len());
     let text = after_prefix[..line_end].trim().to_string();
     *remaining = &after_prefix[line_end..];
-    Some(Element::Lyrics { aligned, text })
+    Some(constructor(text))
 }
 
 /// Try to parse a single element from the input

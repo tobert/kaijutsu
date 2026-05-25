@@ -360,6 +360,11 @@ pub enum Element {
     /// Content is captured verbatim — syllable parsing (alignment marks,
     /// `-`, `_`, `*`, `~`, `\-`) is the renderer's job.
     Lyrics { aligned: bool, text: String },
+    /// Symbol line (`s:` per §4.15). Pairs symbols — decorations, chord
+    /// symbols, annotations, `*` skips — with notes on the preceding
+    /// music line. Content captured verbatim; symbol parsing is the
+    /// renderer's job.
+    SymbolLine(String),
     Space,
     LineBreak,
 }
