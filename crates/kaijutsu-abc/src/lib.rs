@@ -19,7 +19,9 @@
 //!
 //! let result = parse(abc);
 //! if !result.has_errors() {
-//!     let midi_bytes = to_midi(&result.value, &MidiParams::default());
+//!     // parse() returns Vec<Tune> — files can hold multiple tunes
+//!     let tune = &result.value[0];
+//!     let midi_bytes = to_midi(tune, &MidiParams::default());
 //!     // midi_bytes is a valid SMF format 0 MIDI file
 //! }
 //! ```
@@ -52,11 +54,13 @@ pub enum ParseMode {
     Fragment,
 }
 
-/// Parse ABC notation into a Tune AST (generous mode).
+/// Parse ABC notation into a list of Tune ASTs (generous mode).
 ///
-/// Equivalent to [`parse_with_mode(input, ParseMode::Generous)`]. Missing
-/// fields warn, the parser keeps going with defaults.
-pub fn parse(input: &str) -> ParseResult<Tune> {
+/// A `.abc` source can contain multiple tunes delimited by `X:N` lines.
+/// Even single-tune input returns a `Vec<Tune>` of length 1; fragments
+/// without any `X:` line still return a one-element Vec containing the
+/// fragment as a single Tune.
+pub fn parse(input: &str) -> ParseResult<Vec<Tune>> {
     parser::parse(input, ParseMode::Generous)
 }
 
@@ -65,7 +69,7 @@ pub fn parse(input: &str) -> ParseResult<Tune> {
 /// Use [`ParseMode::Strict`] for inputs claimed to be complete tunes,
 /// [`ParseMode::Fragment`] for embedded snippets without headers, or
 /// [`ParseMode::Generous`] to preserve the historical lenient behavior.
-pub fn parse_with_mode(input: &str, mode: ParseMode) -> ParseResult<Tune> {
+pub fn parse_with_mode(input: &str, mode: ParseMode) -> ParseResult<Vec<Tune>> {
     parser::parse(input, mode)
 }
 
@@ -477,7 +481,7 @@ mod tests {
             "parse errors: {:?}",
             result.errors().collect::<Vec<_>>()
         );
-        to_abc(&result.value)
+        to_abc(&result.value[0])
     }
 
     #[test]

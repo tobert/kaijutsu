@@ -732,7 +732,7 @@ mod tests {
     #[test]
     fn eighth_notes_get_filled_noteheads() {
         let abc = "X:1\nT:Test\nM:4/4\nL:1/8\nK:C\nC D E\n";
-        let tune = crate::parse(abc).value;
+        let tune = crate::parse(abc).value.into_iter().next().unwrap();
         let elements = engrave(&tune, &EngravingOptions::default());
         let heads = notehead_codepoints(&elements);
         assert_eq!(heads.len(), 3, "expected 3 noteheads, got {}", heads.len());
@@ -753,7 +753,7 @@ mod tests {
     #[test]
     fn quarter_note_gets_filled_notehead() {
         let abc = "X:1\nT:Test\nM:4/4\nL:1/8\nK:C\nC2\n";
-        let tune = crate::parse(abc).value;
+        let tune = crate::parse(abc).value.into_iter().next().unwrap();
         let elements = engrave(&tune, &EngravingOptions::default());
         let heads = notehead_codepoints(&elements);
         assert_eq!(heads.len(), 1, "expected 1 notehead, got {}", heads.len());
@@ -772,7 +772,7 @@ mod tests {
     #[test]
     fn half_note_gets_half_notehead() {
         let abc = "X:1\nT:Test\nM:4/4\nL:1/8\nK:C\nC4\n";
-        let tune = crate::parse(abc).value;
+        let tune = crate::parse(abc).value.into_iter().next().unwrap();
         let elements = engrave(&tune, &EngravingOptions::default());
         let heads = notehead_codepoints(&elements);
         assert_eq!(heads.len(), 1, "expected 1 notehead, got {}", heads.len());
@@ -787,7 +787,7 @@ mod tests {
     #[test]
     fn whole_note_gets_whole_notehead() {
         let abc = "X:1\nT:Test\nM:4/4\nL:1/8\nK:C\nC8\n";
-        let tune = crate::parse(abc).value;
+        let tune = crate::parse(abc).value.into_iter().next().unwrap();
         let elements = engrave(&tune, &EngravingOptions::default());
         let heads = notehead_codepoints(&elements);
         assert_eq!(heads.len(), 1, "expected 1 notehead, got {}", heads.len());
@@ -802,7 +802,7 @@ mod tests {
     #[test]
     fn quarter_note_with_l14() {
         let abc = "X:1\nT:Test\nM:4/4\nL:1/4\nK:C\nC\n";
-        let tune = crate::parse(abc).value;
+        let tune = crate::parse(abc).value.into_iter().next().unwrap();
         let elements = engrave(&tune, &EngravingOptions::default());
         let heads = notehead_codepoints(&elements);
         assert_eq!(heads.len(), 1);
@@ -817,7 +817,7 @@ mod tests {
     #[test]
     fn half_note_with_l14() {
         let abc = "X:1\nT:Test\nM:4/4\nL:1/4\nK:C\nC2\n";
-        let tune = crate::parse(abc).value;
+        let tune = crate::parse(abc).value.into_iter().next().unwrap();
         let elements = engrave(&tune, &EngravingOptions::default());
         let heads = notehead_codepoints(&elements);
         assert_eq!(heads.len(), 1);
@@ -833,7 +833,7 @@ mod tests {
     #[test]
     fn quarter_rest_with_l18() {
         let abc = "X:1\nT:Test\nM:4/4\nL:1/8\nK:C\nz2\n";
-        let tune = crate::parse(abc).value;
+        let tune = crate::parse(abc).value.into_iter().next().unwrap();
         let elements = engrave(&tune, &EngravingOptions::default());
         let rest_cps: Vec<u32> = elements
             .iter()

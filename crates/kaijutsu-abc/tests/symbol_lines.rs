@@ -25,7 +25,7 @@ fn simple_s_line_captured() {
     let result = parse_with_mode(abc, ParseMode::Fragment);
     assert!(!result.has_errors(), "feedback: {:?}", result.feedback);
 
-    let symbols = symbol_lines_in(&result.value);
+    let symbols = symbol_lines_in(&result.value[0]);
     assert_eq!(symbols, vec!["\"C\" *  \"Am\" * |".to_string()]);
 }
 
@@ -52,7 +52,7 @@ fn s_line_does_not_collide_with_note_s() {
     // This input has a pure-music fragment with no `s:` line.
     let abc = "CDEF GABc|\n";
     let result = parse_with_mode(abc, ParseMode::Fragment);
-    assert!(symbol_lines_in(&result.value).is_empty());
+    assert!(symbol_lines_in(&result.value[0]).is_empty());
 }
 
 #[test]
@@ -61,7 +61,7 @@ fn s_and_w_lines_coexist() {
     let result = parse_with_mode(abc, ParseMode::Fragment);
     assert!(!result.has_errors(), "feedback: {:?}", result.feedback);
 
-    let elements: Vec<_> = result.value.voices[0].elements.iter().collect();
+    let elements: Vec<_> = result.value[0].voices[0].elements.iter().collect();
     let has_symbol = elements
         .iter()
         .any(|e| matches!(e, Element::SymbolLine(_)));

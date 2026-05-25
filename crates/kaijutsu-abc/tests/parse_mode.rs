@@ -13,7 +13,7 @@
 
 use kaijutsu_abc::{parse_with_mode, FeedbackLevel, ParseMode};
 
-fn errors_contain(result: &kaijutsu_abc::ParseResult<kaijutsu_abc::Tune>, needle: &str) -> bool {
+fn errors_contain(result: &kaijutsu_abc::ParseResult<Vec<kaijutsu_abc::Tune>>, needle: &str) -> bool {
     result
         .feedback
         .iter()
@@ -21,7 +21,7 @@ fn errors_contain(result: &kaijutsu_abc::ParseResult<kaijutsu_abc::Tune>, needle
         .any(|f| f.message.contains(needle))
 }
 
-fn warnings_contain(result: &kaijutsu_abc::ParseResult<kaijutsu_abc::Tune>, needle: &str) -> bool {
+fn warnings_contain(result: &kaijutsu_abc::ParseResult<Vec<kaijutsu_abc::Tune>>, needle: &str) -> bool {
     result
         .feedback
         .iter()
@@ -29,7 +29,7 @@ fn warnings_contain(result: &kaijutsu_abc::ParseResult<kaijutsu_abc::Tune>, need
         .any(|f| f.message.contains(needle))
 }
 
-fn no_errors(result: &kaijutsu_abc::ParseResult<kaijutsu_abc::Tune>) -> bool {
+fn no_errors(result: &kaijutsu_abc::ParseResult<Vec<kaijutsu_abc::Tune>>) -> bool {
     !result.has_errors()
 }
 

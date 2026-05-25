@@ -16,13 +16,13 @@ fn trailing_backslash_consumes_newline() {
     let abc = "CDEF\\\nGABc";
     let result = parse_with_mode(abc, ParseMode::Fragment);
     assert!(!result.has_errors(), "feedback: {:?}", result.feedback);
-    let has_linebreak = elements(&result.value)
+    let has_linebreak = elements(&result.value[0])
         .iter()
         .any(|e| matches!(e, Element::LineBreak));
     assert!(
         !has_linebreak,
         "trailing \\ should suppress LineBreak. elements: {:?}",
-        elements(&result.value),
+        elements(&result.value[0]),
     );
 }
 
@@ -31,7 +31,7 @@ fn trailing_backslash_with_crlf() {
     let abc = "CDEF\\\r\nGABc";
     let result = parse_with_mode(abc, ParseMode::Fragment);
     assert!(!result.has_errors(), "feedback: {:?}", result.feedback);
-    let has_linebreak = elements(&result.value)
+    let has_linebreak = elements(&result.value[0])
         .iter()
         .any(|e| matches!(e, Element::LineBreak));
     assert!(!has_linebreak);
@@ -71,13 +71,13 @@ fn continuation_disables_line_start_handlers_on_next_line() {
     // a "w:" prefix there is just text, not a lyrics marker.
     let abc = "CDEF\\\nw:not_a_lyrics_line";
     let result = parse_with_mode(abc, ParseMode::Fragment);
-    let lyrics_count = elements(&result.value)
+    let lyrics_count = elements(&result.value[0])
         .iter()
         .filter(|e| matches!(e, Element::Lyrics { .. }))
         .count();
     assert_eq!(
         lyrics_count, 0,
         "should not parse as lyrics after continuation, elements: {:?}",
-        elements(&result.value),
+        elements(&result.value[0]),
     );
 }

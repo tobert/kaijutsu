@@ -13,22 +13,54 @@ use crate::feedback::{FeedbackCollector, ParseResult};
 use crate::ParseMode;
 use std::collections::HashMap;
 
-/// Parse ABC notation into a Tune AST.
-pub fn parse(input: &str, mode: ParseMode) -> ParseResult<Tune> {
+/// Parse ABC notation into a list of Tune ASTs.
+///
+/// A `.abc` source may contain a file-level header (anything before the
+/// first `X:`) followed by one or more tunes delimited by `X:N` lines.
+/// The file-level header lines are folded into the first tune so info
+/// fields like `O:` or `H:` at the top of the file aren't lost; later
+/// tunes get their own headers without file-level inheritance (a known
+/// limitation — spec §2.2 calls for inheritance).
+pub fn parse(input: &str, mode: ParseMode) -> ParseResult<Vec<Tune>> {
     let mut collector = FeedbackCollector::new();
 
-    // Parse header
-    let (remaining, header) = header::parse_header(input, &mut collector, mode);
+    let segments = split_into_tune_segments(input);
+    let tunes = segments
+        .into_iter()
+        .map(|segment| parse_one_tune(segment, &mut collector, mode))
+        .collect();
 
-    // Parse body
-    let elements = body::parse_body(remaining, &mut collector, mode);
+    ParseResult::new(tunes, collector.into_feedback())
+}
 
-    // Route elements to voices based on VoiceSwitch elements
+fn parse_one_tune(input: &str, collector: &mut FeedbackCollector, mode: ParseMode) -> Tune {
+    let (remaining, header) = header::parse_header(input, collector, mode);
+    let elements = body::parse_body(remaining, collector, mode);
     let voices = route_elements_to_voices(&header.voice_defs, elements);
+    Tune { header, voices }
+}
 
-    let tune = Tune { header, voices };
-
-    ParseResult::new(tune, collector.into_feedback())
+/// Split the input into per-tune segments. Each segment starts at the
+/// beginning of an `X:` line (or at the start of input — that first
+/// segment covers any pre-`X:` file header plus the first tune). Files
+/// with no `X:` at all return a single segment containing the whole
+/// input — preserving the historical single-fragment behaviour.
+fn split_into_tune_segments(input: &str) -> Vec<&str> {
+    let mut boundaries = vec![0_usize];
+    let mut cursor = if input.starts_with("X:") { 2 } else { 0 };
+    while let Some(rel) = input[cursor..].find("\nX:") {
+        let x_pos = cursor + rel + 1;
+        boundaries.push(x_pos);
+        cursor = x_pos + 2;
+    }
+    boundaries
+        .iter()
+        .enumerate()
+        .map(|(i, &start)| {
+            let end = boundaries.get(i + 1).copied().unwrap_or(input.len());
+            &input[start..end]
+        })
+        .collect()
 }
 
 /// Route parsed elements to their respective voices based on VoiceSwitch markers.
@@ -129,9 +161,9 @@ mod tests {
         let result = crate::parse(abc);
 
         assert!(!result.has_errors());
-        assert_eq!(result.value.header.reference, 1);
-        assert_eq!(result.value.header.title, "Test");
-        assert_eq!(result.value.header.key.root, NoteName::C);
+        assert_eq!(result.value[0].header.reference, 1);
+        assert_eq!(result.value[0].header.title, "Test");
+        assert_eq!(result.value[0].header.key.root, NoteName::C);
     }
 
     #[test]
@@ -141,7 +173,7 @@ mod tests {
 
         assert!(!result.has_errors());
         assert_eq!(
-            result.value.header.meter,
+            result.value[0].header.meter,
             Some(Meter::Simple {
                 numerator: 6,
                 denominator: 8
@@ -155,7 +187,7 @@ mod tests {
         let result = crate::parse(abc);
 
         assert!(!result.has_errors());
-        assert_eq!(result.value.header.meter, Some(Meter::Common));
+        assert_eq!(result.value[0].header.meter, Some(Meter::Common));
     }
 
     #[test]
@@ -164,7 +196,7 @@ mod tests {
         let result = crate::parse(abc);
 
         assert!(!result.has_errors());
-        assert_eq!(result.value.header.meter, Some(Meter::Cut));
+        assert_eq!(result.value[0].header.meter, Some(Meter::Cut));
     }
 
     #[test]
@@ -174,7 +206,7 @@ mod tests {
 
         assert!(!result.has_errors());
         assert_eq!(
-            result.value.header.unit_length,
+            result.value[0].header.unit_length,
             Some(UnitLength {
                 numerator: 1,
                 denominator: 16
@@ -188,7 +220,7 @@ mod tests {
         let result = crate::parse(abc);
 
         assert!(!result.has_errors());
-        let tempo = result.value.header.tempo.as_ref().unwrap();
+        let tempo = result.value[0].header.tempo.as_ref().unwrap();
         assert_eq!(tempo.bpm, 120);
         assert_eq!(tempo.beat_unit, (1, 4));
     }
@@ -200,7 +232,7 @@ mod tests {
 
         assert!(!result.has_errors());
 
-        let notes: Vec<_> = result.value.voices[0]
+        let notes: Vec<_> = result.value[0].voices[0]
             .elements
             .iter()
             .filter_map(|e| match e {
@@ -222,7 +254,7 @@ mod tests {
         let abc = "X:1\nT:Test\nK:C\ncdef|";
         let result = crate::parse(abc);
 
-        let notes: Vec<_> = result.value.voices[0]
+        let notes: Vec<_> = result.value[0].voices[0]
             .elements
             .iter()
             .filter_map(|e| match e {
@@ -241,7 +273,7 @@ mod tests {
         let abc = "X:1\nT:Test\nK:C\nC,Cc'|";
         let result = crate::parse(abc);
 
-        let notes: Vec<_> = result.value.voices[0]
+        let notes: Vec<_> = result.value[0].voices[0]
             .elements
             .iter()
             .filter_map(|e| match e {
@@ -261,7 +293,7 @@ mod tests {
         let abc = "X:1\nT:Test\nK:C\n^C_D=E^^F__|";
         let result = crate::parse(abc);
 
-        let notes: Vec<_> = result.value.voices[0]
+        let notes: Vec<_> = result.value[0].voices[0]
             .elements
             .iter()
             .filter_map(|e| match e {
@@ -284,7 +316,7 @@ mod tests {
         let abc = "X:1\nT:Test\nK:C\nA A2 A/2 A3/2|";
         let result = crate::parse(abc);
 
-        let notes: Vec<_> = result.value.voices[0]
+        let notes: Vec<_> = result.value[0].voices[0]
             .elements
             .iter()
             .filter_map(|e| match e {
@@ -305,7 +337,7 @@ mod tests {
         let abc = "X:1\nT:Test\nK:C\nz z2|";
         let result = crate::parse(abc);
 
-        let rests: Vec<_> = result.value.voices[0]
+        let rests: Vec<_> = result.value[0].voices[0]
             .elements
             .iter()
             .filter_map(|e| match e {
@@ -324,7 +356,7 @@ mod tests {
         let abc = "X:1\nT:Test\nK:C\n[CEG]2|";
         let result = crate::parse(abc);
 
-        let chords: Vec<_> = result.value.voices[0]
+        let chords: Vec<_> = result.value[0].voices[0]
             .elements
             .iter()
             .filter_map(|e| match e {
@@ -343,7 +375,7 @@ mod tests {
         let abc = "X:1\nT:Test\nK:C\nC|D||E|]";
         let result = crate::parse(abc);
 
-        let bars: Vec<_> = result.value.voices[0]
+        let bars: Vec<_> = result.value[0].voices[0]
             .elements
             .iter()
             .filter_map(|e| match e {
@@ -363,7 +395,7 @@ mod tests {
         let abc = "X:1\nT:Test\nK:C\n|:C:|D::|";
         let result = crate::parse(abc);
 
-        let bars: Vec<_> = result.value.voices[0]
+        let bars: Vec<_> = result.value[0].voices[0]
             .elements
             .iter()
             .filter_map(|e| match e {
@@ -381,7 +413,7 @@ mod tests {
         let abc = "X:1\nT:Test\nK:C\nC-C|";
         let result = crate::parse(abc);
 
-        let notes: Vec<_> = result.value.voices[0]
+        let notes: Vec<_> = result.value[0].voices[0]
             .elements
             .iter()
             .filter_map(|e| match e {
@@ -403,7 +435,7 @@ mod tests {
         // Should warn but not error
         assert!(result.feedback.iter().any(|f| f.message.contains("X:")));
         // Should still parse
-        assert_eq!(result.value.header.title, "Test");
+        assert_eq!(result.value[0].header.title, "Test");
     }
 
     #[test]
@@ -411,8 +443,8 @@ mod tests {
         let abc = "X:1\nT:Test\nK:D dorian\n";
         let result = crate::parse(abc);
 
-        assert_eq!(result.value.header.key.root, NoteName::D);
-        assert_eq!(result.value.header.key.mode, Mode::Dorian);
+        assert_eq!(result.value[0].header.key.root, NoteName::D);
+        assert_eq!(result.value[0].header.key.mode, Mode::Dorian);
     }
 
     #[test]
@@ -420,9 +452,9 @@ mod tests {
         let abc = "X:1\nT:Test\nK:F#m\n";
         let result = crate::parse(abc);
 
-        assert_eq!(result.value.header.key.root, NoteName::F);
-        assert_eq!(result.value.header.key.accidental, Some(Accidental::Sharp));
-        assert_eq!(result.value.header.key.mode, Mode::Minor);
+        assert_eq!(result.value[0].header.key.root, NoteName::F);
+        assert_eq!(result.value[0].header.key.accidental, Some(Accidental::Sharp));
+        assert_eq!(result.value[0].header.key.mode, Mode::Minor);
     }
 
     #[test]
@@ -430,7 +462,7 @@ mod tests {
         let abc = "X:1\nT:Test\nK:C\n\"G\"GAB|";
         let result = crate::parse(abc);
 
-        let symbols: Vec<_> = result.value.voices[0]
+        let symbols: Vec<_> = result.value[0].voices[0]
             .elements
             .iter()
             .filter_map(|e| match e {
@@ -454,12 +486,11 @@ mod tests {
 
         // Should have TWO voices, not one merged voice
         assert_eq!(
-            result.value.voices.len(),
+            result.value[0].voices.len(),
             2,
             "Expected 2 voices, got {}. Voices: {:?}",
-            result.value.voices.len(),
-            result
-                .value
+            result.value[0].voices.len(),
+            result.value[0]
                 .voices
                 .iter()
                 .map(|v| v.id.clone())
@@ -467,7 +498,7 @@ mod tests {
         );
 
         // Voice 1 should have C, D
-        let v1_notes: Vec<_> = result.value.voices[0]
+        let v1_notes: Vec<_> = result.value[0].voices[0]
             .elements
             .iter()
             .filter_map(|e| match e {
@@ -482,7 +513,7 @@ mod tests {
         );
 
         // Voice 2 should have E, F
-        let v2_notes: Vec<_> = result.value.voices[1]
+        let v2_notes: Vec<_> = result.value[0].voices[1]
             .elements
             .iter()
             .filter_map(|e| match e {
@@ -503,10 +534,10 @@ mod tests {
         let abc = "X:1\nT:Test\nM:4/4\nL:1/4\nK:C\nV:1\nc|\nV:2\nC|\n";
         let result = crate::parse(abc);
         assert!(!result.has_errors());
-        assert_eq!(result.value.voices.len(), 2);
+        assert_eq!(result.value[0].voices.len(), 2);
 
         // Generate MIDI
-        let midi = crate::midi::generate(&result.value, &crate::MidiParams::default());
+        let midi = crate::midi::generate(&result.value[0], &crate::MidiParams::default());
 
         // Should be format 1 (multi-track) - byte 9 should be 0x01
         assert_eq!(&midi[0..4], b"MThd", "Not valid MIDI header");

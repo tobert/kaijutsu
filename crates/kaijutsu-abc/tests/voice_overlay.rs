@@ -22,21 +22,21 @@ fn overlays(tune: &kaijutsu_abc::Tune) -> Vec<u8> {
 fn single_ampersand_emits_one_overlay() {
     let result = parse_with_mode("CDEF&GABc", ParseMode::Fragment);
     assert!(!result.has_errors(), "feedback: {:?}", result.feedback);
-    assert_eq!(overlays(&result.value), vec![1]);
+    assert_eq!(overlays(&result.value[0]), vec![1]);
 }
 
 #[test]
 fn double_ampersand_emits_two_layers() {
     let result = parse_with_mode("CDEF&&GABc", ParseMode::Fragment);
     assert!(!result.has_errors());
-    assert_eq!(overlays(&result.value), vec![2]);
+    assert_eq!(overlays(&result.value[0]), vec![2]);
 }
 
 #[test]
 fn triple_ampersand_emits_three_layers() {
     let result = parse_with_mode("CDEF&&&GABc", ParseMode::Fragment);
     assert!(!result.has_errors());
-    assert_eq!(overlays(&result.value), vec![3]);
+    assert_eq!(overlays(&result.value[0]), vec![3]);
 }
 
 #[test]
@@ -45,7 +45,7 @@ fn overlay_at_line_start() {
     let abc = "g4 f4|e6 e2|\n&(d8|c6)c2|";
     let result = parse_with_mode(abc, ParseMode::Fragment);
     assert!(!result.has_errors());
-    assert_eq!(overlays(&result.value), vec![1]);
+    assert_eq!(overlays(&result.value[0]), vec![1]);
 }
 
 #[test]

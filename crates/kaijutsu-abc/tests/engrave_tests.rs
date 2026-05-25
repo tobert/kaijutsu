@@ -13,7 +13,7 @@ fn simple_melody_produces_valid_svg() {
     let result = parse(abc);
     assert!(!result.has_errors());
 
-    let svg = engrave_to_svg(&result.value, &default_options());
+    let svg = engrave_to_svg(&result.value[0], &default_options());
     assert!(svg.starts_with("<svg"), "Should start with <svg>");
     assert!(svg.contains("</svg>"), "Should end with </svg>");
 }
@@ -24,7 +24,7 @@ fn svg_has_five_staff_lines() {
     let result = parse(abc);
     assert!(!result.has_errors());
 
-    let svg = engrave_to_svg(&result.value, &default_options());
+    let svg = engrave_to_svg(&result.value[0], &default_options());
     // Count horizontal staff lines (they span most of the width)
     let line_count = svg.matches("<line").count();
     // At minimum: 5 staff lines + barlines + stems
@@ -41,7 +41,7 @@ fn svg_has_clef_path() {
     let result = parse(abc);
     assert!(!result.has_errors());
 
-    let svg = engrave_to_svg(&result.value, &default_options());
+    let svg = engrave_to_svg(&result.value[0], &default_options());
     // The treble clef should produce a <path> element
     assert!(
         svg.contains("<path"),
@@ -56,7 +56,7 @@ fn key_signature_adds_accidental_glyphs() {
     let result = parse(abc);
     assert!(!result.has_errors());
 
-    let elements = layout::engrave(&result.value, &default_options());
+    let elements = layout::engrave(&result.value[0], &default_options());
     // Should have at least one glyph with the sharp codepoint (0xE262)
     let sharp_glyphs: Vec<_> = elements
         .iter()
@@ -84,7 +84,7 @@ fn flat_key_signature() {
     let result = parse(abc);
     assert!(!result.has_errors());
 
-    let elements = layout::engrave(&result.value, &default_options());
+    let elements = layout::engrave(&result.value[0], &default_options());
     let flat_glyphs: Vec<_> = elements
         .iter()
         .filter(|e| {
@@ -110,7 +110,7 @@ fn time_signature_glyphs() {
     let result = parse(abc);
     assert!(!result.has_errors());
 
-    let elements = layout::engrave(&result.value, &default_options());
+    let elements = layout::engrave(&result.value[0], &default_options());
     // Should have time sig digit 4 (U+E084) twice (4/4)
     let digit_4_count = elements
         .iter()
@@ -133,7 +133,7 @@ fn barlines_produce_vertical_lines() {
     let result = parse(abc);
     assert!(!result.has_errors());
 
-    let elements = layout::engrave(&result.value, &default_options());
+    let elements = layout::engrave(&result.value[0], &default_options());
     // Barlines are vertical lines (x1 == x2)
     let barlines: Vec<_> = elements
         .iter()
@@ -159,7 +159,7 @@ fn all_elements_have_source_spans() {
     let result = parse(abc);
     assert!(!result.has_errors());
 
-    let svg = engrave_to_svg(&result.value, &default_options());
+    let svg = engrave_to_svg(&result.value[0], &default_options());
     // Every rendered element should have data-span-start and data-span-end
     for line in svg.lines() {
         let trimmed = line.trim();
@@ -187,7 +187,7 @@ fn multi_measure_layout_does_not_overflow() {
     let result = parse(abc);
     assert!(!result.has_errors());
 
-    let svg = engrave_to_svg(&result.value, &default_options());
+    let svg = engrave_to_svg(&result.value[0], &default_options());
     // Should produce a valid SVG with reasonable dimensions
     assert!(svg.contains("viewBox="));
     // Parse the viewBox to check it's reasonable
@@ -220,7 +220,7 @@ fn round_trip_parse_engrave_no_panic() {
     assert!(!result.has_errors());
 
     // Should not panic
-    let svg = engrave_to_svg(&result.value, &default_options());
+    let svg = engrave_to_svg(&result.value[0], &default_options());
     assert!(!svg.is_empty());
 }
 
@@ -230,7 +230,7 @@ fn rest_produces_rest_glyph() {
     let result = parse(abc);
     assert!(!result.has_errors());
 
-    let elements = layout::engrave(&result.value, &default_options());
+    let elements = layout::engrave(&result.value[0], &default_options());
     // Quarter rest = U+E4E5, half rest = U+E4E4
     let rest_glyphs: Vec<_> = elements
         .iter()
@@ -256,7 +256,7 @@ fn title_appears_as_text_element() {
     let result = parse(abc);
     assert!(!result.has_errors());
 
-    let svg = engrave_to_svg(&result.value, &default_options());
+    let svg = engrave_to_svg(&result.value[0], &default_options());
     assert!(svg.contains("Cooley"), "SVG should contain the tune title");
 }
 
@@ -266,7 +266,7 @@ fn chord_symbol_appears_as_text() {
     let result = parse(abc);
     assert!(!result.has_errors());
 
-    let svg = engrave_to_svg(&result.value, &default_options());
+    let svg = engrave_to_svg(&result.value[0], &default_options());
     assert!(svg.contains("Am"), "SVG should contain chord symbol Am");
 }
 
@@ -276,7 +276,7 @@ fn accidental_note_gets_accidental_glyph() {
     let result = parse(abc);
     assert!(!result.has_errors());
 
-    let elements = layout::engrave(&result.value, &default_options());
+    let elements = layout::engrave(&result.value[0], &default_options());
     // Should have a sharp glyph (0xE262) for the ^C
     let sharp_count = elements
         .iter()

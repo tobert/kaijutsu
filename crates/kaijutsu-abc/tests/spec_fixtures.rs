@@ -38,7 +38,10 @@ use std::path::{Path, PathBuf};
 ///          the \-as-unknown warnings but exposes mid-music content on
 ///          the continued physical line that the parser doesn't yet
 ///          recognise — a more spec-correct surface, not a regression)
-const MAX_TOTAL_WARNINGS: usize = 359;
+///    152 — multi-tune files: parse() returns Vec<Tune>, X:N markers
+///          delimit tunes per §2.2; file-level header content folds
+///          into the first tune (no inheritance yet)
+const MAX_TOTAL_WARNINGS: usize = 152;
 const MAX_TOTAL_ERRORS: usize = 0;
 
 struct Outcome {

@@ -920,7 +920,7 @@ mod tests {
         let result = crate::parse(abc);
         assert!(!result.has_errors());
 
-        let midi = generate(&result.value, &MidiParams::default());
+        let midi = generate(&result.value[0], &MidiParams::default());
 
         // Should produce valid MIDI
         assert_eq!(&midi[0..4], b"MThd");
@@ -934,7 +934,7 @@ mod tests {
         let result = crate::parse(abc);
         assert!(!result.has_errors());
 
-        let midi = generate(&result.value, &MidiParams::default());
+        let midi = generate(&result.value[0], &MidiParams::default());
 
         // Count note-on events (0x90) - should be exactly 1 for the tied note
         let note_ons = midi
@@ -951,7 +951,7 @@ mod tests {
         let result = crate::parse(abc);
         assert!(!result.has_errors());
 
-        let midi = generate(&result.value, &MidiParams::default());
+        let midi = generate(&result.value[0], &MidiParams::default());
 
         // Should still be one note
         let note_ons = midi
@@ -968,7 +968,7 @@ mod tests {
         let result = crate::parse(abc);
         assert!(!result.has_errors(), "Parse errors: {:?}", result.feedback);
 
-        let midi = generate(&result.value, &MidiParams::default());
+        let midi = generate(&result.value[0], &MidiParams::default());
 
         // Count c notes (midi 72) - should be 2 (once per repeat)
         let c_notes = midi
@@ -1022,7 +1022,7 @@ mod tests {
         assert!(!result.has_errors());
 
         // Channel 0 (default)
-        let midi_ch0 = generate(&result.value, &MidiParams::default());
+        let midi_ch0 = generate(&result.value[0], &MidiParams::default());
         // Look for note-on: 0x90 = channel 0 note-on, 72 = c (C5)
         let has_ch0 = midi_ch0.windows(2).any(|w| w[0] == 0x90 && w[1] == 72);
         assert!(has_ch0, "Should have note-on on channel 0");
@@ -1034,7 +1034,7 @@ mod tests {
             channel: 9,
             program: None,
         };
-        let midi_ch9 = generate(&result.value, &params_ch9);
+        let midi_ch9 = generate(&result.value[0], &params_ch9);
         // Look for note-on: 0x99 = channel 9 note-on
         let has_ch9 = midi_ch9.windows(2).any(|w| w[0] == 0x99 && w[1] == 72);
         assert!(has_ch9, "Should have note-on on channel 9");
@@ -1053,9 +1053,9 @@ mod tests {
         let abc = "X:1\nT:Test\n%%MIDI program 33\nM:4/4\nL:1/4\nK:C\ncde|\n";
         let result = crate::parse(abc);
         assert!(!result.has_errors());
-        assert_eq!(result.value.header.midi_program, Some(33));
+        assert_eq!(result.value[0].header.midi_program, Some(33));
 
-        let midi = generate(&result.value, &MidiParams::default());
+        let midi = generate(&result.value[0], &MidiParams::default());
 
         // Look for program change: 0xC0 = channel 0 program change, 33 = program
         let has_program_change = midi.windows(2).any(|w| w[0] == 0xC0 && w[1] == 33);
@@ -1068,7 +1068,7 @@ mod tests {
         let abc = "X:1\nT:Test\nM:4/4\nL:1/4\nK:C\ncde|\n";
         let result = crate::parse(abc);
         assert!(!result.has_errors());
-        assert_eq!(result.value.header.midi_program, None);
+        assert_eq!(result.value[0].header.midi_program, None);
 
         let params = MidiParams {
             velocity: 80,
@@ -1076,7 +1076,7 @@ mod tests {
             channel: 0,
             program: Some(56), // Trumpet
         };
-        let midi = generate(&result.value, &params);
+        let midi = generate(&result.value[0], &params);
 
         // Look for program change: 0xC0 = channel 0 program change, 56 = trumpet
         let has_program_change = midi.windows(2).any(|w| w[0] == 0xC0 && w[1] == 56);
@@ -1095,7 +1095,7 @@ mod tests {
             channel: 0,
             program: Some(0), // Piano - but ABC says 52
         };
-        let midi = generate(&result.value, &params);
+        let midi = generate(&result.value[0], &params);
 
         // Should use ABC's program 52, not params' program 0
         let has_program_52 = midi.windows(2).any(|w| w[0] == 0xC0 && w[1] == 52);
@@ -1110,12 +1110,12 @@ mod tests {
         let result = crate::parse(abc);
         assert!(!result.has_errors());
         assert_eq!(
-            result.value.header.midi_program,
+            result.value[0].header.midi_program,
             Some(56),
             "%%MIDI program before K: should be parsed"
         );
 
-        let midi = generate(&result.value, &MidiParams::default());
+        let midi = generate(&result.value[0], &MidiParams::default());
         let has_program_change = midi.windows(2).any(|w| w[0] == 0xC0 && w[1] == 56);
         assert!(has_program_change, "Should emit program change 56");
     }
@@ -1130,7 +1130,7 @@ mod tests {
         assert!(!result.has_errors());
         // Currently NOT parsed because it's after K:
         assert_eq!(
-            result.value.header.midi_program, None,
+            result.value[0].header.midi_program, None,
             "%%MIDI program after K: is not parsed (in body, not header)"
         );
     }
@@ -1170,7 +1170,7 @@ mod tests {
             let result = crate::parse(abc);
             assert!(!result.has_errors(), "Parse failed for {}", position);
             assert_eq!(
-                result.value.header.midi_program, expected_program,
+                result.value[0].header.midi_program, expected_program,
                 "Wrong program for %%MIDI {}",
                 position
             );

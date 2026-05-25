@@ -31,8 +31,8 @@ fn dur(num: u16, den: u16) -> Duration {
 fn single_chevron_lengthens_left_shortens_right() {
     let result = parse_with_mode("a>b", ParseMode::Fragment);
     assert!(!result.has_errors(), "feedback: {:?}", result.feedback);
-    let ns = notes(&result.value);
-    assert_eq!(ns.len(), 2, "elements: {:?}", result.value.voices[0].elements);
+    let ns = notes(&result.value[0]);
+    assert_eq!(ns.len(), 2, "elements: {:?}", result.value[0].voices[0].elements);
     assert_eq!(ns[0].duration, dur(3, 2));
     assert_eq!(ns[1].duration, dur(1, 2));
 }
@@ -41,7 +41,7 @@ fn single_chevron_lengthens_left_shortens_right() {
 fn single_chevron_reverse() {
     let result = parse_with_mode("a<b", ParseMode::Fragment);
     assert!(!result.has_errors(), "feedback: {:?}", result.feedback);
-    let ns = notes(&result.value);
+    let ns = notes(&result.value[0]);
     assert_eq!(ns[0].duration, dur(1, 2));
     assert_eq!(ns[1].duration, dur(3, 2));
 }
@@ -49,7 +49,7 @@ fn single_chevron_reverse() {
 #[test]
 fn double_chevron() {
     let result = parse_with_mode("a>>b", ParseMode::Fragment);
-    let ns = notes(&result.value);
+    let ns = notes(&result.value[0]);
     assert_eq!(ns[0].duration, dur(7, 4));
     assert_eq!(ns[1].duration, dur(1, 4));
 }
@@ -57,7 +57,7 @@ fn double_chevron() {
 #[test]
 fn triple_chevron() {
     let result = parse_with_mode("a>>>b", ParseMode::Fragment);
-    let ns = notes(&result.value);
+    let ns = notes(&result.value[0]);
     assert_eq!(ns[0].duration, dur(15, 8));
     assert_eq!(ns[1].duration, dur(1, 8));
 }
@@ -65,7 +65,7 @@ fn triple_chevron() {
 #[test]
 fn triple_chevron_reverse() {
     let result = parse_with_mode("a<<<b", ParseMode::Fragment);
-    let ns = notes(&result.value);
+    let ns = notes(&result.value[0]);
     assert_eq!(ns[0].duration, dur(1, 8));
     assert_eq!(ns[1].duration, dur(15, 8));
 }
@@ -74,7 +74,7 @@ fn triple_chevron_reverse() {
 fn whitespace_around_operator_allowed() {
     let result = parse_with_mode("a > b", ParseMode::Fragment);
     assert!(!result.has_errors(), "feedback: {:?}", result.feedback);
-    let ns = notes(&result.value);
+    let ns = notes(&result.value[0]);
     assert_eq!(ns.len(), 2);
     assert_eq!(ns[0].duration, dur(3, 2));
     assert_eq!(ns[1].duration, dur(1, 2));
@@ -84,7 +84,7 @@ fn whitespace_around_operator_allowed() {
 fn chained_pairs() {
     // From spec §4.4 fixture: each pair is independent
     let result = parse_with_mode("a>b c<d", ParseMode::Fragment);
-    let ns = notes(&result.value);
+    let ns = notes(&result.value[0]);
     assert_eq!(ns.len(), 4);
     assert_eq!(ns[0].duration, dur(3, 2));
     assert_eq!(ns[1].duration, dur(1, 2));
@@ -96,7 +96,7 @@ fn chained_pairs() {
 fn broken_rhythm_scales_explicit_durations() {
     // §4.4: rhythm scales whatever duration the notes already had
     let result = parse_with_mode("a2>b", ParseMode::Fragment);
-    let ns = notes(&result.value);
+    let ns = notes(&result.value[0]);
     assert_eq!(ns[0].duration, dur(6, 2)); // 2 * 3/2 = 3 (kept as 6/2)
     assert_eq!(ns[1].duration, dur(1, 2));
 }
@@ -117,7 +117,7 @@ fn lone_chevron_without_following_note_falls_through() {
     // `a>` with no follow-up — operator should fall through to the
     // unknown-character path so we know something is malformed.
     let result = parse_with_mode("a>", ParseMode::Fragment);
-    let ns = notes(&result.value);
+    let ns = notes(&result.value[0]);
     assert_eq!(ns.len(), 1, "should only have the leading note");
     // Should warn about the stray operator
     let has_warning = result

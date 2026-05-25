@@ -395,10 +395,20 @@ pub fn detect_rich_content_typed(
             // Errors are attached as child Error blocks by the kernel
             // and rendered via the ErrorChildIndex stacking path.
             let result = kaijutsu_abc::parse(text);
+            // TODO(multi-tune): RichContent::Abc currently holds a single
+            // Tune. When a file contains multiple tunes (e.g. §13 sample
+            // libraries), only the first is rendered. Revisit when the
+            // renderer / kaijutsu block model decides whether to split
+            // tunes across blocks or render them stacked in one block.
+            let tune = result
+                .value
+                .into_iter()
+                .next()
+                .unwrap_or_else(kaijutsu_abc::Tune::default);
             return Some(RichContent {
                 kind: RichContentKind::Abc {
                     source: Arc::new(text.to_string()),
-                    tune: Arc::new(result.value),
+                    tune: Arc::new(tune),
                 },
             });
         }

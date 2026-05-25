@@ -27,7 +27,7 @@ fn simple_w_line_aligned_to_preceding_music() {
     let result = parse_with_mode(abc, ParseMode::Fragment);
     assert!(!result.has_errors(), "feedback: {:?}", result.feedback);
 
-    let lyrics = lyrics_in(&result.value);
+    let lyrics = lyrics_in(&result.value[0]);
     assert_eq!(lyrics, vec![(true, "doh re mi fa".to_string())]);
 }
 
@@ -41,7 +41,7 @@ w: verse two syl-la-bles here\n\
     let result = parse_with_mode(abc, ParseMode::Fragment);
     assert!(!result.has_errors(), "feedback: {:?}", result.feedback);
 
-    let lyrics = lyrics_in(&result.value);
+    let lyrics = lyrics_in(&result.value[0]);
     assert_eq!(
         lyrics,
         vec![
@@ -57,7 +57,7 @@ fn capital_w_line_marks_unaligned() {
     let result = parse_with_mode(abc, ParseMode::Fragment);
     assert!(!result.has_errors(), "feedback: {:?}", result.feedback);
 
-    let lyrics = lyrics_in(&result.value);
+    let lyrics = lyrics_in(&result.value[0]);
     assert_eq!(
         lyrics,
         vec![(false, "words after the tune go here".to_string())]
@@ -92,6 +92,6 @@ fn lowercase_w_mid_line_is_not_lyrics() {
     // assert the parser does not invent a Lyrics element.
     let abc = "CDEF GABc|\n";
     let result = parse_with_mode(abc, ParseMode::Fragment);
-    let lyrics = lyrics_in(&result.value);
+    let lyrics = lyrics_in(&result.value[0]);
     assert!(lyrics.is_empty(), "unexpected lyrics: {:?}", lyrics);
 }

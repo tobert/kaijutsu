@@ -20,7 +20,7 @@ fn decorations(tune: &kaijutsu_abc::Tune) -> Vec<Decoration> {
 fn plus_trill_equivalent_to_bang_trill() {
     let result = parse_with_mode("+trill+C", ParseMode::Fragment);
     assert!(!result.has_errors(), "feedback: {:?}", result.feedback);
-    assert_eq!(decorations(&result.value), vec![Decoration::Trill]);
+    assert_eq!(decorations(&result.value[0]), vec![Decoration::Trill]);
 }
 
 #[test]
@@ -28,7 +28,7 @@ fn plus_dynamics() {
     let result = parse_with_mode("+pp+C +ff+D", ParseMode::Fragment);
     assert!(!result.has_errors());
     assert_eq!(
-        decorations(&result.value),
+        decorations(&result.value[0]),
         vec![
             Decoration::Dynamic(Dynamic::PP),
             Decoration::Dynamic(Dynamic::FF),
@@ -41,7 +41,7 @@ fn plus_unknown_falls_to_other() {
     let result = parse_with_mode("+novelty+C", ParseMode::Fragment);
     assert!(!result.has_errors());
     assert_eq!(
-        decorations(&result.value),
+        decorations(&result.value[0]),
         vec![Decoration::Other("novelty".to_string())]
     );
 }

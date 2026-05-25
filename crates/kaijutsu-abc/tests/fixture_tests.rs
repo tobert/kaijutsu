@@ -25,7 +25,7 @@ fn test_fixture(name: &str) {
     );
 
     // MIDI generation should produce valid output
-    let midi = to_midi(&result.value, &MidiParams::default());
+    let midi = to_midi(&result.value[0],&MidiParams::default());
 
     // Valid MIDI starts with MThd
     assert_eq!(
@@ -115,28 +115,28 @@ C,D,E,F,|
     assert!(!result.has_errors(), "Parse errors: {:?}", result.feedback);
 
     // Should have 2 voice definitions
-    assert_eq!(result.value.header.voice_defs.len(), 2);
-    assert_eq!(result.value.header.voice_defs[0].id, "1");
+    assert_eq!(result.value[0].header.voice_defs.len(), 2);
+    assert_eq!(result.value[0].header.voice_defs[0].id, "1");
     assert_eq!(
-        result.value.header.voice_defs[0].name,
+        result.value[0].header.voice_defs[0].name,
         Some("Melody".to_string())
     );
-    assert_eq!(result.value.header.voice_defs[1].id, "2");
+    assert_eq!(result.value[0].header.voice_defs[1].id, "2");
     assert_eq!(
-        result.value.header.voice_defs[1].name,
+        result.value[0].header.voice_defs[1].name,
         Some("Bass".to_string())
     );
 
     // Should have 2 voices in the tune
-    assert_eq!(result.value.voices.len(), 2);
+    assert_eq!(result.value[0].voices.len(), 2);
 
     // Each voice should have content (notes)
-    let voice1_notes = result.value.voices[0]
+    let voice1_notes = result.value[0].voices[0]
         .elements
         .iter()
         .filter(|e| matches!(e, kaijutsu_abc::Element::Note(_)))
         .count();
-    let voice2_notes = result.value.voices[1]
+    let voice2_notes = result.value[0].voices[1]
         .elements
         .iter()
         .filter(|e| matches!(e, kaijutsu_abc::Element::Note(_)))
@@ -146,7 +146,7 @@ C,D,E,F,|
     assert_eq!(voice2_notes, 4, "Voice 2 should have 4 notes");
 
     // MIDI should be format 1 (check header)
-    let midi = to_midi(&result.value, &MidiParams::default());
+    let midi = to_midi(&result.value[0],&MidiParams::default());
     assert_eq!(&midi[0..4], b"MThd");
     // Format at bytes 8-9
     assert_eq!(midi[9], 1, "Should be format 1 for multiple voices");
@@ -372,7 +372,7 @@ C,|
     let result = parse(abc);
     assert!(!result.has_errors(), "Parse errors: {:?}", result.feedback);
 
-    let midi = to_midi(&result.value, &MidiParams::default());
+    let midi = to_midi(&result.value[0],&MidiParams::default());
     let tracks = parse_midi_tracks(&midi);
 
     // Format 1: Track 0 = tempo, Track 1 = voice 1, Track 2 = voice 2
@@ -413,9 +413,9 @@ K:C
     assert!(!result.has_errors(), "Parse errors: {:?}", result.feedback);
 
     // Should have 2 voices with content routed correctly
-    assert_eq!(result.value.voices.len(), 2);
+    assert_eq!(result.value[0].voices.len(), 2);
 
-    let voice1_notes: Vec<_> = result.value.voices[0]
+    let voice1_notes: Vec<_> = result.value[0].voices[0]
         .elements
         .iter()
         .filter_map(|e| {
@@ -426,7 +426,7 @@ K:C
             }
         })
         .collect();
-    let voice2_notes: Vec<_> = result.value.voices[1]
+    let voice2_notes: Vec<_> = result.value[0].voices[1]
         .elements
         .iter()
         .filter_map(|e| {
@@ -480,12 +480,12 @@ c|
 
     // Verify transpose was parsed
     assert_eq!(
-        result.value.header.voice_defs[0].transpose,
+        result.value[0].header.voice_defs[0].transpose,
         Some(-12),
         "Voice should have transpose=-12"
     );
 
-    let midi = to_midi(&result.value, &MidiParams::default());
+    let midi = to_midi(&result.value[0],&MidiParams::default());
     let tracks = parse_midi_tracks(&midi);
 
     // Single voice = format 0 = single track (index 0)
@@ -519,12 +519,12 @@ c|
 
     // Verify octave was parsed
     assert_eq!(
-        result.value.header.voice_defs[0].octave,
+        result.value[0].header.voice_defs[0].octave,
         Some(-1),
         "Voice should have octave=-1"
     );
 
-    let midi = to_midi(&result.value, &MidiParams::default());
+    let midi = to_midi(&result.value[0],&MidiParams::default());
     let tracks = parse_midi_tracks(&midi);
 
     // Single voice = format 0 = single track (index 0)
@@ -559,7 +559,7 @@ CDEF|
     let result = parse(abc);
     assert!(!result.has_errors(), "Parse errors: {:?}", result.feedback);
 
-    let midi = to_midi(&result.value, &MidiParams::default());
+    let midi = to_midi(&result.value[0],&MidiParams::default());
     let tracks = parse_midi_tracks(&midi);
 
     assert!(
@@ -605,7 +605,7 @@ K:C
     let result = parse(abc);
     assert!(!result.has_errors(), "Parse errors: {:?}", result.feedback);
 
-    let midi = to_midi(&result.value, &MidiParams::default());
+    let midi = to_midi(&result.value[0],&MidiParams::default());
     let tracks = parse_midi_tracks(&midi);
 
     let notes: Vec<_> = tracks[0].iter().filter(|e| e.is_note_on).collect();
@@ -639,7 +639,7 @@ F G A B |
     let result = parse(abc);
     assert!(!result.has_errors(), "Parse errors: {:?}", result.feedback);
 
-    let midi = to_midi(&result.value, &MidiParams::default());
+    let midi = to_midi(&result.value[0],&MidiParams::default());
     let tracks = parse_midi_tracks(&midi);
 
     let notes: Vec<_> = tracks[0].iter().filter(|e| e.is_note_on).collect();
@@ -668,7 +668,7 @@ K:C
     let result = parse(abc);
     assert!(!result.has_errors(), "Parse errors: {:?}", result.feedback);
 
-    let midi = to_midi(&result.value, &MidiParams::default());
+    let midi = to_midi(&result.value[0],&MidiParams::default());
     let tracks = parse_midi_tracks(&midi);
 
     let notes: Vec<_> = tracks[0].iter().filter(|e| e.is_note_on).collect();
@@ -696,7 +696,7 @@ K:C
     let result = parse(abc);
     assert!(!result.has_errors(), "Parse errors: {:?}", result.feedback);
 
-    let midi = to_midi(&result.value, &MidiParams::default());
+    let midi = to_midi(&result.value[0],&MidiParams::default());
     let tracks = parse_midi_tracks(&midi);
 
     let notes: Vec<_> = tracks[0].iter().filter(|e| e.is_note_on).collect();
@@ -740,7 +740,7 @@ Z2 C |
     let result = parse(abc);
     assert!(!result.has_errors(), "Parse errors: {:?}", result.feedback);
 
-    let midi = to_midi(&result.value, &MidiParams::default());
+    let midi = to_midi(&result.value[0],&MidiParams::default());
     let tracks = parse_midi_tracks(&midi);
 
     let notes: Vec<_> = tracks[0].iter().filter(|e| e.is_note_on).collect();
@@ -773,7 +773,7 @@ K:C
     assert!(!result.has_errors(), "Parse errors: {:?}", result.feedback);
 
     // Check that grace notes are in the AST
-    let has_grace = result.value.voices[0]
+    let has_grace = result.value[0].voices[0]
         .elements
         .iter()
         .any(|e| matches!(e, kaijutsu_abc::Element::GraceNotes { .. }));
@@ -781,7 +781,7 @@ K:C
 
     // Note: Grace notes are currently NOT rendered to MIDI
     // This test documents the current behavior - MIDI only has the main notes
-    let midi = to_midi(&result.value, &MidiParams::default());
+    let midi = to_midi(&result.value[0],&MidiParams::default());
     let tracks = parse_midi_tracks(&midi);
     let notes: Vec<_> = tracks[0].iter().filter(|e| e.is_note_on).collect();
 
@@ -808,7 +808,7 @@ C x C |
     let result = parse(abc);
     assert!(!result.has_errors(), "Parse errors: {:?}", result.feedback);
 
-    let midi = to_midi(&result.value, &MidiParams::default());
+    let midi = to_midi(&result.value[0],&MidiParams::default());
     let tracks = parse_midi_tracks(&midi);
 
     let notes: Vec<_> = tracks[0].iter().filter(|e| e.is_note_on).collect();
@@ -850,7 +850,7 @@ c''' |
     let result = parse(abc);
     assert!(!result.has_errors(), "Parse errors: {:?}", result.feedback);
 
-    let midi = to_midi(&result.value, &MidiParams::default());
+    let midi = to_midi(&result.value[0],&MidiParams::default());
     let tracks = parse_midi_tracks(&midi);
 
     let notes: Vec<_> = tracks[0].iter().filter(|e| e.is_note_on).collect();
@@ -878,7 +878,7 @@ C,, |
     let result = parse(abc);
     assert!(!result.has_errors(), "Parse errors: {:?}", result.feedback);
 
-    let midi = to_midi(&result.value, &MidiParams::default());
+    let midi = to_midi(&result.value[0],&MidiParams::default());
     let tracks = parse_midi_tracks(&midi);
 
     let notes: Vec<_> = tracks[0].iter().filter(|e| e.is_note_on).collect();
@@ -903,13 +903,13 @@ K:C
     assert!(!result.has_errors(), "Parse errors: {:?}", result.feedback);
 
     // Check that bar types are in the AST
-    let has_first_ending = result.value.voices[0].elements.iter().any(|e| {
+    let has_first_ending = result.value[0].voices[0].elements.iter().any(|e| {
         matches!(
             e,
             kaijutsu_abc::Element::Bar(kaijutsu_abc::Bar::FirstEnding)
         )
     });
-    let has_second_ending = result.value.voices[0].elements.iter().any(|e| {
+    let has_second_ending = result.value[0].voices[0].elements.iter().any(|e| {
         matches!(
             e,
             kaijutsu_abc::Element::Bar(kaijutsu_abc::Bar::SecondEnding)
@@ -923,7 +923,7 @@ K:C
     // It just passes through the bar markers and does a simple repeat
     // Expected correct behavior: C D E F C D G A (8 notes)
     // Current behavior: C D E F C D E F (simple repeat, ignores endings)
-    let midi = to_midi(&result.value, &MidiParams::default());
+    let midi = to_midi(&result.value[0],&MidiParams::default());
     let tracks = parse_midi_tracks(&midi);
     let notes: Vec<_> = tracks[0].iter().filter(|e| e.is_note_on).collect();
 
@@ -949,7 +949,7 @@ K:C
     assert!(!result.has_errors(), "Parse errors: {:?}", result.feedback);
 
     // Check that tuplet was parsed with chord elements
-    let has_tuplet = result.value.voices[0]
+    let has_tuplet = result.value[0].voices[0]
         .elements
         .iter()
         .any(|e| matches!(e, kaijutsu_abc::Element::Tuplet(_)));
@@ -958,7 +958,7 @@ K:C
     // LIMITATION: Current MIDI generator only handles Note inside Tuplet, not Chord
     // The midi.rs Tuplet handler has: `if let Element::Note(note) = elem { ... }`
     // This means chords inside tuplets are silently skipped
-    let midi = to_midi(&result.value, &MidiParams::default());
+    let midi = to_midi(&result.value[0],&MidiParams::default());
     let tracks = parse_midi_tracks(&midi);
     let notes: Vec<_> = tracks[0].iter().filter(|e| e.is_note_on).collect();
 
@@ -1040,7 +1040,7 @@ f'|
     assert!(!result.has_errors(), "Parse errors: {:?}", result.feedback);
 
     // Should not panic, channels wrap modulo 16
-    let midi = to_midi(&result.value, &MidiParams::default());
+    let midi = to_midi(&result.value[0],&MidiParams::default());
     let tracks = parse_midi_tracks(&midi);
 
     // Should have tempo track + 18 voice tracks = 19 tracks
@@ -1077,7 +1077,7 @@ V:2
     let result = parse(abc);
     assert!(!result.has_errors(), "Parse errors: {:?}", result.feedback);
 
-    let midi = to_midi(&result.value, &MidiParams::default());
+    let midi = to_midi(&result.value[0],&MidiParams::default());
     let tracks = parse_midi_tracks(&midi);
 
     // Should handle gracefully - at least the tempo track and voice 1
@@ -1106,7 +1106,7 @@ C16 |
     let result = parse(abc);
     assert!(!result.has_errors(), "Parse errors: {:?}", result.feedback);
 
-    let midi = to_midi(&result.value, &MidiParams::default());
+    let midi = to_midi(&result.value[0],&MidiParams::default());
     let tracks = parse_midi_tracks(&midi);
 
     let all_events: Vec<_> = tracks[0].iter().collect();

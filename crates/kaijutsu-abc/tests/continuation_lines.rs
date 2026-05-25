@@ -26,14 +26,14 @@ w: line one\n\
     assert!(!result.has_errors(), "feedback: {:?}", result.feedback);
 
     // The two lines should be joined into a single Lyrics element.
-    let lyrics_count = result.value.voices[0]
+    let lyrics_count = result.value[0].voices[0]
         .elements
         .iter()
         .filter(|e| matches!(e, Element::Lyrics { .. }))
         .count();
     assert_eq!(lyrics_count, 1, "expected one merged Lyrics element");
     assert_eq!(
-        first_lyrics_text(&result.value),
+        first_lyrics_text(&result.value[0]),
         Some("line one\nline two".to_string())
     );
 }
@@ -48,7 +48,7 @@ s: \"C\" * \"F\" *\n\
     let result = parse_with_mode(abc, ParseMode::Fragment);
     assert!(!result.has_errors(), "feedback: {:?}", result.feedback);
 
-    let symbol_lines: Vec<_> = result.value.voices[0]
+    let symbol_lines: Vec<_> = result.value[0].voices[0]
         .elements
         .iter()
         .filter_map(|e| match e {
@@ -99,7 +99,7 @@ CDEF|\n\
         "expected a continuation warning, got: {:?}",
         result.feedback,
     );
-    assert!(first_lyrics_text(&result.value).is_none());
+    assert!(first_lyrics_text(&result.value[0]).is_none());
 }
 
 #[test]
@@ -113,7 +113,7 @@ w: one\n\
     let result = parse_with_mode(abc, ParseMode::Fragment);
     assert!(!result.has_errors(), "feedback: {:?}", result.feedback);
     assert_eq!(
-        first_lyrics_text(&result.value),
+        first_lyrics_text(&result.value[0]),
         Some("one\ntwo\nthree".to_string())
     );
 }
