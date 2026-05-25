@@ -37,10 +37,23 @@ pub fn parse_body(
     while !remaining.is_empty() {
         collector.set_position(line_num, 1);
 
-        // Line-start info fields (w:, W:) must be checked before the
-        // generic element parser, otherwise their content gets shredded
-        // by the body fallback.
+        // Line-start info fields (w:, W:, s:) and +: continuations must
+        // be checked before the generic element parser, otherwise their
+        // content gets shredded by the body fallback.
         if at_line_start {
+            if remaining.starts_with("+:") {
+                let after = &remaining[2..];
+                let line_end = after.find('\n').unwrap_or(after.len());
+                let content = after[..line_end].trim();
+                if !append_continuation(&mut elements, content) {
+                    collector.warning(
+                        "'+:' continuation has no preceding w:/W:/s: line to extend",
+                    );
+                }
+                remaining = &after[line_end..];
+                at_line_start = false;
+                continue;
+            }
             if let Some(elem) = try_parse_line_start_field(&mut remaining) {
                 elements.push(elem);
                 at_line_start = false;
@@ -131,6 +144,25 @@ pub fn parse_body(
     }
 
     elements
+}
+
+/// Append `+:` continuation content to the most recent field-line
+/// element (skipping any trailing LineBreaks/Spaces). Returns true on
+/// success. Returns false if no compatible field-line is found earlier
+/// in the stream — caller should warn.
+fn append_continuation(elements: &mut [Element], content: &str) -> bool {
+    for elem in elements.iter_mut().rev() {
+        match elem {
+            Element::LineBreak | Element::Space => continue,
+            Element::Lyrics { text, .. } | Element::SymbolLine(text) => {
+                text.push('\n');
+                text.push_str(content);
+                return true;
+            }
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// Try to consume a line-start info field. Currently handles:

@@ -30,7 +30,8 @@ use std::path::{Path, PathBuf};
 ///   1946 — fixture curation (24 non-ABC pseudo-syntax fixtures pruned)
 ///    650 — w:/W: lyric line recognition (§5)
 ///    637 — s: symbol line recognition (§4.15)
-const MAX_TOTAL_WARNINGS: usize = 637;
+///    417 — +: continuation lines folded into preceding field (§3.3)
+const MAX_TOTAL_WARNINGS: usize = 417;
 const MAX_TOTAL_ERRORS: usize = 0;
 
 struct Outcome {
