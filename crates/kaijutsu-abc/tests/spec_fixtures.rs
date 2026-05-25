@@ -32,7 +32,8 @@ use std::path::{Path, PathBuf};
 ///    637 — s: symbol line recognition (§4.15)
 ///    417 — +: continuation lines folded into preceding field (§3.3)
 ///    358 — broken rhythm < and > operators per §4.4
-const MAX_TOTAL_WARNINGS: usize = 358;
+///    354 — voice overlay & marker per §7.4
+const MAX_TOTAL_WARNINGS: usize = 354;
 const MAX_TOTAL_ERRORS: usize = 0;
 
 struct Outcome {

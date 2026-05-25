@@ -381,6 +381,11 @@ fn format_element(output: &mut String, element: &Element) {
             output.push_str("s:");
             output.push_str(text);
         }
+        Element::Overlay { layers } => {
+            for _ in 0..*layers {
+                output.push('&');
+            }
+        }
         Element::InlineField(_)
         | Element::Decoration(_)
         | Element::Slur(_)

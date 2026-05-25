@@ -365,6 +365,14 @@ pub enum Element {
     /// music line. Content captured verbatim; symbol parsing is the
     /// renderer's job.
     SymbolLine(String),
+    /// Voice overlay marker (`&` per §7.4). `layers` is the count of
+    /// consecutive `&` chars: 1 starts the first overlay, 2 the second,
+    /// etc. Music after this marker plays in parallel with the music
+    /// since the last bar line of the same voice. The AST does not yet
+    /// route overlay music into separate playback tracks — renderers
+    /// and the MIDI exporter should treat this as a structural marker
+    /// for now.
+    Overlay { layers: u8 },
     Space,
     LineBreak,
 }

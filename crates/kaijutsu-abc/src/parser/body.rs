@@ -85,6 +85,18 @@ pub fn parse_body(
             continue;
         }
 
+        // Voice overlay marker (`&` per §7.4). Consume any run of `&`
+        // chars and emit a single Overlay element with the count. The
+        // AST does not yet route overlay music into separate tracks.
+        if remaining.starts_with('&') {
+            let layers = remaining.chars().take_while(|c| *c == '&').count();
+            let clamped = layers.min(u8::MAX as usize) as u8;
+            remaining = &remaining[layers..];
+            elements.push(Element::Overlay { layers: clamped });
+            at_line_start = false;
+            continue;
+        }
+
         // Broken rhythm operators per §4.4. Looks back at the previous
         // note to apply the lengthening half; consumes the operator and
         // the following note for the shortening half. If no previous
