@@ -111,6 +111,15 @@ pub fn parse_body(
             continue;
         }
 
+        // Backtick beam-break per §4.7. Pure typesetting hint; AST has
+        // nowhere to record it, so silently consume any run of ` chars.
+        if remaining.starts_with('`') {
+            let n = remaining.chars().take_while(|c| *c == '`').count();
+            remaining = &remaining[n..];
+            at_line_start = false;
+            continue;
+        }
+
         // Voice overlay marker (`&` per §7.4). Consume any run of `&`
         // chars and emit a single Overlay element with the count. The
         // AST does not yet route overlay music into separate tracks.

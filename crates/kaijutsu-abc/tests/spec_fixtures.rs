@@ -43,7 +43,8 @@ use std::path::{Path, PathBuf};
 ///          into the first tune (no inheritance yet)
 ///    109 — mid-body inline info fields per §3.2 (M:, K:, P:, N: at
 ///          body line-start emit Element::InlineField)
-const MAX_TOTAL_WARNINGS: usize = 109;
+///    105 — backtick beam-break per §4.7 silently consumed
+const MAX_TOTAL_WARNINGS: usize = 105;
 const MAX_TOTAL_ERRORS: usize = 0;
 
 struct Outcome {

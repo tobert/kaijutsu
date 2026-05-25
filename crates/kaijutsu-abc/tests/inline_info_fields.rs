@@ -98,6 +98,17 @@ fn mid_body_v_switch_still_works() {
 }
 
 #[test]
+fn m_macro_field_in_body_captured() {
+    // Per §9.1, `m:` defines a static macro. Captured as InlineField;
+    // expansion is downstream.
+    let abc = "CDEF|\nm: ~g2 = {a}g{f}g\nGAB|\n";
+    let result = parse_with_mode(abc, ParseMode::Fragment);
+    assert!(!result.has_errors(), "feedback: {:?}", result.feedback);
+    let fields = inline_fields_in_body(&result.value[0]);
+    assert_eq!(fields, vec![('m', "~g2 = {a}g{f}g".to_string())]);
+}
+
+#[test]
 fn inline_info_field_emits_no_skipping_warnings() {
     let abc = "CDEF|\nM:3/4\nP:A\nN:a note about this\nGAB|\n";
     let result = parse_with_mode(abc, ParseMode::Fragment);
