@@ -16,6 +16,7 @@ use clap::{Parser, Subcommand};
 use kaijutsu_types::{BlockKind, ContentType, Role, Status};
 use serde::Serialize;
 
+use crate::block_tools::translate::{line_range_to_byte_range, line_to_byte_offset};
 use super::refs::resolve_context_arg;
 use super::{KjCaller, KjDispatcher, KjResult};
 
@@ -29,6 +30,44 @@ use super::{KjCaller, KjDispatcher, KjResult};
 struct BlockArgs {
     #[command(subcommand)]
     command: BlockCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum EditOp {
+    /// Insert text before line N (0-indexed). N == line_count appends.
+    Insert {
+        /// Line to insert before (0-indexed; equals line_count to append)
+        #[arg(long)]
+        line: u32,
+        /// Text to insert. A trailing newline is added if missing.
+        #[arg(long)]
+        content: String,
+    },
+    /// Delete lines [start, end) — end exclusive, 0-indexed.
+    Delete {
+        /// First line to delete (0-indexed, inclusive)
+        #[arg(long = "start")]
+        start_line: u32,
+        /// First line past the deletion (0-indexed, exclusive)
+        #[arg(long = "end")]
+        end_line: u32,
+    },
+    /// Replace lines [start, end) with new content. `--expected` adds
+    /// compare-and-set validation against the current text in that range.
+    Replace {
+        /// First line to replace (0-indexed, inclusive)
+        #[arg(long = "start")]
+        start_line: u32,
+        /// First line past the replacement (0-indexed, exclusive)
+        #[arg(long = "end")]
+        end_line: u32,
+        /// Replacement content. A trailing newline is added if missing.
+        #[arg(long)]
+        content: String,
+        /// CAS — fail unless the current range matches this text exactly
+        #[arg(long)]
+        expected: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -106,6 +145,17 @@ enum BlockCommand {
         #[arg(long)]
         original: Option<String>,
     },
+    /// Edit a block via line-based operations. Single op per invocation —
+    /// the kj surface trades MCP's batch-of-ops for a clean CLI shape.
+    /// Mirrors MCP `block_edit` minus the multi-op atomicity (which the
+    /// caller can recover with `kaish` script + `kj block read` between
+    /// edits to confirm intermediate state).
+    Edit {
+        /// Block id
+        block_id: String,
+        #[command(subcommand)]
+        op: EditOp,
+    },
     /// Create a new block in a context. Mirrors MCP `block_create`. Status
     /// defaults to Done and content_type to plain — matches the MCP shape.
     Create {
@@ -174,6 +224,7 @@ impl KjDispatcher {
             BlockCommand::Append { block_id, text } => {
                 self.block_append(&block_id, &text, caller)
             }
+            BlockCommand::Edit { block_id, op } => self.block_edit(&block_id, op, caller),
             BlockCommand::History { block_id } => self.block_history(&block_id),
             BlockCommand::Diff {
                 block_id,
@@ -492,6 +543,142 @@ impl KjDispatcher {
             "content_length": new_len,
         });
         KjResult::ok_with_data(format!("appended {} bytes\n", text.len()), record)
+    }
+
+    /// Edit a block via a single line-based operation. Mirrors a single
+    /// `EditOp` from MCP `block_edit`. CAS-validated when `--expected` is
+    /// provided on Replace; line indices are 0-indexed and half-open.
+    fn block_edit(&self, id_str: &str, op: EditOp, caller: &KjCaller) -> KjResult {
+        let block_id = match kaijutsu_types::BlockId::from_key(id_str) {
+            Some(id) => id,
+            None => {
+                return KjResult::Err(format!(
+                    "kj block edit: malformed id '{id_str}' (expected context_hex_principal_hex_seq)"
+                ));
+            }
+        };
+        let ctx_id = block_id.context_id;
+
+        // Fetch current content for offset translation + CAS checks. The op
+        // is small; reading the snapshot once is cheap relative to the edit.
+        let snap = match self
+            .blocks
+            .block_snapshots(ctx_id)
+            .ok()
+            .and_then(|v| v.into_iter().find(|b| b.id == block_id))
+        {
+            Some(s) => s,
+            None => {
+                return KjResult::Err(format!(
+                    "kj block edit: block '{id_str}' not found in {}",
+                    ctx_id.to_hex()
+                ));
+            }
+        };
+        let content = snap.content.clone();
+
+        // Translate the op into (pos, insert_text, delete_len) and apply.
+        let (pos, insert_text, delete_len, op_label) = match op {
+            EditOp::Insert { line, content: text } => {
+                let pos = match line_to_byte_offset(&content, line) {
+                    Ok(p) => p,
+                    Err(e) => return KjResult::Err(format!("kj block edit insert: {e}")),
+                };
+                let text_with_nl = if text.ends_with('\n') || content.is_empty() {
+                    text
+                } else {
+                    format!("{text}\n")
+                };
+                (pos, text_with_nl, 0usize, "insert")
+            }
+            EditOp::Delete {
+                start_line,
+                end_line,
+            } => {
+                let (start, end) = match line_range_to_byte_range(&content, start_line, end_line) {
+                    Ok(pair) => pair,
+                    Err(e) => return KjResult::Err(format!("kj block edit delete: {e}")),
+                };
+                if start >= end {
+                    // Empty range — treat as a no-op success rather than an
+                    // error. Matches MCP block_edit which silently no-ops here.
+                    let record = serde_json::json!({
+                        "block_id": id_str,
+                        "context_id": ctx_id.to_hex(),
+                        "op": "delete",
+                        "no_op": true,
+                    });
+                    return KjResult::ok_with_data("(no-op: empty range)\n".to_string(), record);
+                }
+                (start, String::new(), end - start, "delete")
+            }
+            EditOp::Replace {
+                start_line,
+                end_line,
+                content: text,
+                expected,
+            } => {
+                if let Some(ref want) = expected {
+                    let actual: String = content
+                        .lines()
+                        .skip(start_line as usize)
+                        .take(end_line.saturating_sub(start_line) as usize)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if actual.trim() != want.trim() {
+                        return KjResult::Err(format!(
+                            "kj block edit replace: CAS mismatch — expected {want:?} but found {actual:?}"
+                        ));
+                    }
+                }
+                let (start, end) = match line_range_to_byte_range(&content, start_line, end_line) {
+                    Ok(pair) => pair,
+                    Err(e) => return KjResult::Err(format!("kj block edit replace: {e}")),
+                };
+                let text_with_nl = if text.ends_with('\n') || text.is_empty() {
+                    text
+                } else {
+                    format!("{text}\n")
+                };
+                (start, text_with_nl, end - start, "replace")
+            }
+        };
+
+        if let Err(e) = self.blocks.edit_text_as(
+            ctx_id,
+            &block_id,
+            pos,
+            &insert_text,
+            delete_len,
+            Some(caller.principal_id),
+        ) {
+            return KjResult::Err(format!("kj block edit: {e}"));
+        }
+
+        let new_len = self
+            .blocks
+            .block_snapshots(ctx_id)
+            .ok()
+            .and_then(|v| v.into_iter().find(|b| b.id == block_id))
+            .map(|s| s.content.len())
+            .unwrap_or(0);
+
+        let record = serde_json::json!({
+            "block_id": id_str,
+            "context_id": ctx_id.to_hex(),
+            "op": op_label,
+            "inserted_bytes": insert_text.len(),
+            "deleted_bytes": delete_len,
+            "content_length": new_len,
+        });
+        KjResult::ok_with_data(
+            format!(
+                "{op_label}: +{}/-{} bytes (total {new_len})\n",
+                insert_text.len(),
+                delete_len
+            ),
+            record,
+        )
     }
 
     /// Version / creation info for a block. Mirrors MCP `block_history`.
@@ -1333,6 +1520,311 @@ mod tests {
             .find(|b| b.id == child_id)
             .unwrap();
         assert_eq!(snap.parent_id, Some(parent_id), "parent edge not set");
+    }
+
+    // ── New: block edit ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn block_edit_insert_adds_line() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let mut c = caller_with_context(ctx);
+        c.principal_id = principal;
+        let bid = insert_text_block(&d, ctx, "first\nthird");
+
+        let result = d
+            .dispatch(
+                &[
+                    s("block"),
+                    s("edit"),
+                    bid.to_key(),
+                    s("insert"),
+                    s("--line"),
+                    s("1"),
+                    s("--content"),
+                    s("second"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "insert failed: {}", result.message());
+
+        let snap = d
+            .block_store()
+            .block_snapshots(ctx)
+            .unwrap()
+            .into_iter()
+            .find(|b| b.id == bid)
+            .unwrap();
+        assert_eq!(snap.content, "first\nsecond\nthird", "got: {:?}", snap.content);
+    }
+
+    #[tokio::test]
+    async fn block_edit_delete_drops_lines() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let mut c = caller_with_context(ctx);
+        c.principal_id = principal;
+        // 4 lines so we have something to drop.
+        let bid = insert_text_block(&d, ctx, "a\nb\nc\nd");
+
+        // Delete lines [1, 3) → drops b and c, keeps a and d.
+        let result = d
+            .dispatch(
+                &[
+                    s("block"),
+                    s("edit"),
+                    bid.to_key(),
+                    s("delete"),
+                    s("--start"),
+                    s("1"),
+                    s("--end"),
+                    s("3"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "delete failed: {}", result.message());
+        let snap = d
+            .block_store()
+            .block_snapshots(ctx)
+            .unwrap()
+            .into_iter()
+            .find(|b| b.id == bid)
+            .unwrap();
+        assert_eq!(snap.content, "a\nd", "got: {:?}", snap.content);
+    }
+
+    #[tokio::test]
+    async fn block_edit_delete_empty_range_is_noop() {
+        use crate::kj::KjResult;
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let mut c = caller_with_context(ctx);
+        c.principal_id = principal;
+        let bid = insert_text_block(&d, ctx, "untouched");
+
+        let result = d
+            .dispatch(
+                &[
+                    s("block"),
+                    s("edit"),
+                    bid.to_key(),
+                    s("delete"),
+                    s("--start"),
+                    s("0"),
+                    s("--end"),
+                    s("0"),
+                ],
+                &c,
+            )
+            .await;
+        match result {
+            KjResult::Ok { data: Some(v), .. } => {
+                assert_eq!(v["no_op"], true, "expected no_op marker: {v}");
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
+        // Content unchanged.
+        let snap = d
+            .block_store()
+            .block_snapshots(ctx)
+            .unwrap()
+            .into_iter()
+            .find(|b| b.id == bid)
+            .unwrap();
+        assert_eq!(snap.content, "untouched");
+    }
+
+    #[tokio::test]
+    async fn block_edit_replace_swaps_range() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let mut c = caller_with_context(ctx);
+        c.principal_id = principal;
+        let bid = insert_text_block(&d, ctx, "alpha\nbeta\ngamma");
+
+        // Replace line [1, 2) with "BETA"
+        let result = d
+            .dispatch(
+                &[
+                    s("block"),
+                    s("edit"),
+                    bid.to_key(),
+                    s("replace"),
+                    s("--start"),
+                    s("1"),
+                    s("--end"),
+                    s("2"),
+                    s("--content"),
+                    s("BETA"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "replace failed: {}", result.message());
+        let snap = d
+            .block_store()
+            .block_snapshots(ctx)
+            .unwrap()
+            .into_iter()
+            .find(|b| b.id == bid)
+            .unwrap();
+        assert_eq!(snap.content, "alpha\nBETA\ngamma");
+    }
+
+    #[tokio::test]
+    async fn block_edit_replace_cas_match_succeeds() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let mut c = caller_with_context(ctx);
+        c.principal_id = principal;
+        let bid = insert_text_block(&d, ctx, "old\nstale\nkeep");
+
+        // --expected matches the current text in the range → swap proceeds.
+        let result = d
+            .dispatch(
+                &[
+                    s("block"),
+                    s("edit"),
+                    bid.to_key(),
+                    s("replace"),
+                    s("--start"),
+                    s("0"),
+                    s("--end"),
+                    s("2"),
+                    s("--content"),
+                    s("fresh\nclean"),
+                    s("--expected"),
+                    s("old\nstale"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "CAS replace failed: {}", result.message());
+        let snap = d
+            .block_store()
+            .block_snapshots(ctx)
+            .unwrap()
+            .into_iter()
+            .find(|b| b.id == bid)
+            .unwrap();
+        assert_eq!(snap.content, "fresh\nclean\nkeep");
+    }
+
+    #[tokio::test]
+    async fn block_edit_replace_cas_mismatch_rejects() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let mut c = caller_with_context(ctx);
+        c.principal_id = principal;
+        let bid = insert_text_block(&d, ctx, "actual content");
+
+        let result = d
+            .dispatch(
+                &[
+                    s("block"),
+                    s("edit"),
+                    bid.to_key(),
+                    s("replace"),
+                    s("--start"),
+                    s("0"),
+                    s("--end"),
+                    s("1"),
+                    s("--content"),
+                    s("new"),
+                    s("--expected"),
+                    s("something else entirely"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(!result.is_ok());
+        assert!(
+            result.message().contains("CAS mismatch"),
+            "expected 'CAS mismatch' error: {}",
+            result.message()
+        );
+        // Block content untouched.
+        let snap = d
+            .block_store()
+            .block_snapshots(ctx)
+            .unwrap()
+            .into_iter()
+            .find(|b| b.id == bid)
+            .unwrap();
+        assert_eq!(snap.content, "actual content");
+    }
+
+    #[tokio::test]
+    async fn block_edit_insert_at_end_appends() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let mut c = caller_with_context(ctx);
+        c.principal_id = principal;
+        // 3 lines → valid append positions include line=3 (one past last).
+        let bid = insert_text_block(&d, ctx, "a\nb\nc");
+
+        let result = d
+            .dispatch(
+                &[
+                    s("block"),
+                    s("edit"),
+                    bid.to_key(),
+                    s("insert"),
+                    s("--line"),
+                    s("3"),
+                    s("--content"),
+                    s("d"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "append-insert failed: {}", result.message());
+        let snap = d
+            .block_store()
+            .block_snapshots(ctx)
+            .unwrap()
+            .into_iter()
+            .find(|b| b.id == bid)
+            .unwrap();
+        assert!(snap.content.starts_with("a\nb\nc"), "got: {:?}", snap.content);
+        assert!(snap.content.contains('d'), "missing 'd': {:?}", snap.content);
+    }
+
+    #[tokio::test]
+    async fn block_edit_insert_out_of_range_errors() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let mut c = caller_with_context(ctx);
+        c.principal_id = principal;
+        let bid = insert_text_block(&d, ctx, "one\ntwo");
+
+        // Block has 2 lines (max addressable insert line = 2). Line 99 is past that.
+        let result = d
+            .dispatch(
+                &[
+                    s("block"),
+                    s("edit"),
+                    bid.to_key(),
+                    s("insert"),
+                    s("--line"),
+                    s("99"),
+                    s("--content"),
+                    s("nope"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(!result.is_ok(), "out-of-range insert should error");
     }
 
     // ── New: block append ──────────────────────────────────────────────
