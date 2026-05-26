@@ -1,45 +1,17 @@
-//! Helper functions for parsing and text manipulation.
+//! Block lookup helpers used by the remaining MCP tools.
 //!
-//! Parsing functions delegate to strum-derived FromStr implementations on the
-//! enums in kaijutsu-crdt and kaijutsu-kernel.
+//! Most of the parsing/formatting helpers were retired with the
+//! MCP slim-down (block_*, doc_*, kernel_search moved to `kj`).
+//! What stays is the block-by-key resolver still wired through the
+//! `analyze_document` / `editing_assistant` paths.
 
-use std::str::FromStr;
-
-use kaijutsu_crdt::{BlockId, BlockKind, ContextId, Role, Status};
-use kaijutsu_kernel::{DocumentKind, SharedBlockStore};
-
-// ============================================================================
-// Parsing Helpers
-// ============================================================================
-
-/// Parse document kind from string.
-pub fn parse_document_kind(s: &str) -> Option<DocumentKind> {
-    DocumentKind::from_str(s).ok()
-}
-
-/// Parse role from string.
-pub fn parse_role(s: &str) -> Option<Role> {
-    Role::from_str(s)
-}
-
-/// Parse block kind from string.
-pub fn parse_block_kind(s: &str) -> Option<BlockKind> {
-    BlockKind::from_str(s)
-}
-
-/// Parse status from string.
-pub fn parse_status(s: &str) -> Option<Status> {
-    Status::from_str(s)
-}
+use kaijutsu_crdt::{BlockId, ContextId};
+use kaijutsu_kernel::SharedBlockStore;
 
 /// Parse block ID from key string.
 pub fn parse_block_id(s: &str) -> Option<BlockId> {
     BlockId::from_key(s)
 }
-
-// ============================================================================
-// Block Lookup
-// ============================================================================
 
 /// Find a block by its key string, returning (ContextId, BlockId).
 ///
@@ -54,66 +26,4 @@ pub fn find_block(store: &SharedBlockStore, block_id_str: &str) -> Option<(Conte
     } else {
         None
     }
-}
-
-// ============================================================================
-// Line Number Utilities
-// ============================================================================
-
-/// Add line numbers to content.
-pub fn content_with_line_numbers(content: &str) -> String {
-    content
-        .lines()
-        .enumerate()
-        .map(|(i, line)| format!("{:4}→{}", i + 1, line))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Extract lines with numbers for a range.
-pub fn extract_lines_with_numbers(content: &str, start: u32, end: u32) -> String {
-    content
-        .lines()
-        .enumerate()
-        .skip(start as usize)
-        .take((end.saturating_sub(start)) as usize)
-        .map(|(i, line)| format!("{:4}→{}", i + 1, line))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Count lines in content.
-pub fn line_count(content: &str) -> usize {
-    if content.is_empty() {
-        0
-    } else {
-        content.lines().count()
-    }
-}
-
-/// Convert line number to byte offset.
-pub fn line_to_byte_offset(content: &str, line: u32) -> Option<usize> {
-    let mut offset = 0;
-    for (i, l) in content.lines().enumerate() {
-        if i == line as usize {
-            return Some(offset);
-        }
-        offset += l.len() + 1; // +1 for newline
-    }
-    // Line at end
-    if line as usize == content.lines().count() {
-        return Some(content.len());
-    }
-    None
-}
-
-/// Convert line range to byte range.
-pub fn line_range_to_byte_range(
-    content: &str,
-    start_line: u32,
-    end_line: u32,
-) -> Option<(usize, usize)> {
-    let start = line_to_byte_offset(content, start_line)?;
-    let end = line_to_byte_offset(content, end_line)?;
-    Some((start, end))
 }

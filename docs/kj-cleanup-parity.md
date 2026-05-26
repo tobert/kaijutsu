@@ -47,22 +47,22 @@ conversation-management surface. Not duplication.
 
 ## Summary
 
-**Overall parity: 16/16 tools (100%) safe to delete after this PR series lands**
+**Status: 16/16 deleted from MCP surface.**
 
-All MCP tools in scope for the slim-down now have kj equivalents:
+All MCP tools in scope had kj equivalents and have been removed from
+`crates/kaijutsu-mcp/src/lib.rs` (along with their request structs in
+`models.rs` and the now-orphan helpers in `helpers.rs`). Agents drive
+the deleted surfaces through `context_shell "kj …"`.
 
-- 10 block_* tools via the new `kj block` clap namespace
-- 4 doc_* tools via the new `kj doc` clap namespace (own primitive,
-  not duplication — see preamble under Document tools)
-- `stage_commit` → `kj stage commit`
-- `kernel_search` → `kj search`
-
-The next step in `docs/kj-cleanup.md` (MCP slim-down PR) is unblocked.
-Recommended deletion order:
-1. Block tools (10) — kj block has been tested and used in this session
-2. doc_* (4)
-3. kernel_search (1)
-4. stage_commit (1) — least risk, already a thin wrapper around `kj stage commit`
+Remaining MCP surface (narrow by design):
+- `shell` / `context_shell` — rich kaish entry points (kj routes through)
+- `kaish_exec` — escape hatch into kernel tools
+- `list_kernel_tools` — discovery
+- `read_input` / `write_input` / `edit_input` / `submit_input` — shared scratchpad
+- `register_session` / `whoami` — session lifecycle
+- `invoke_peer` — cross-peer coordination
+- `analyze_document` / `search_context` / `editing_assistant` — higher-level helpers
+  (separate from the storage-layer surface; kept)
 
 ## Gaps to close before MCP slim-down (prioritized by delete-blocking)
 

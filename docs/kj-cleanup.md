@@ -118,12 +118,17 @@ Numbered for ordering, not for atomic PRs. Each step lands independently.
    checklist; no code changes. Gates step 5.
 4. **(Parallel session lands kaish-clap.)** Watch for `Tool` trait stability.
 5. **kj uses clap_derive.** Lifts the new MCP-deprecated verbs (`doc`,
-   `search`, `stage commit`) as new kj subcommands.
-6. **MCP slim-down.** Delete the duplicate `block_*` / `doc_*` / `kernel_search`
-   / `stage_commit` MCP tools. Update orchestration.md and any agent-facing
-   docs.
-7. **Completion ships.** `kj __complete` + shell wrappers + kaish `Tool::complete`
-   hook.
+   `search`, `stage commit`) as new kj subcommands. **Done** — commits
+   `5b53eeb`, `7f0b766`, `2724330`, `7bf52cf`, `eec2316`, `0cd961c`.
+6. **MCP slim-down.** **Done.** Deleted the 16 duplicate MCP tools
+   (`block_*`, `doc_*`, `kernel_search`, `stage_commit`) and their
+   request structs/helpers/tests. Updated `register_session` description
+   to point at the slim remaining surface.
+7. **Completion.** Scoped to kaish-internal (REPL + kaijutsu app
+   embedded shell). No bash/zsh/fish wrappers. The `clap_complete`
+   work the kaish session shipped (`76ea7fd` upstream) plus its
+   `Tool::complete` hook covers what kaijutsu needs — no further
+   kaijutsu-side work required for now.
 
 ## Decisions for Amy
 
