@@ -442,6 +442,14 @@ impl BlockContent {
         self.header.updated_at = self.header.max_field_ts();
     }
 
+    /// Update `exit_code` and bump `tool_meta_at` (the tool_meta cluster's
+    /// LWW timestamp covering `tool_kind`, `exit_code`, `is_error`).
+    pub fn set_exit_code(&mut self, val: Option<i32>, lamport_ts: u64) {
+        self.header.exit_code = val;
+        self.header.tool_meta_at = lamport_ts;
+        self.header.updated_at = self.header.max_field_ts();
+    }
+
     // ── Sync ────────────────────────────────────────────────────────────
 
     /// Get operations since a frontier (per-block sync).

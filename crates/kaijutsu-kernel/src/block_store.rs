@@ -1451,6 +1451,35 @@ impl BlockStore {
         Ok(())
     }
 
+    /// Persist the real exit code on a ToolResult block. Shell execution
+    /// calls this after the tool returns so `BlockSnapshot::exit_code`
+    /// carries the actual value rather than being truncated to the binary
+    /// `Status::{Done, Error}`.
+    pub fn set_exit_code(
+        &self,
+        context_id: ContextId,
+        block_id: &BlockId,
+        exit_code: Option<i32>,
+    ) -> BlockStoreResult<()> {
+        let ops = {
+            let mut entry = self
+                .get_mut(context_id)
+                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+            let frontier_before = entry.doc.frontier();
+            entry.doc.set_exit_code(block_id, exit_code)?;
+            entry.touch(self.agent_id());
+            entry.doc.ops_since(&frontier_before)
+        };
+        self.journal_op(context_id, ops)?;
+        self.emit(BlockFlow::MetadataChanged {
+            context_id,
+            block_id: *block_id,
+            source: OpSource::Local,
+        });
+
+        Ok(())
+    }
+
     /// Set structured output data on a block.
     ///
     /// Output data provides formatting information (tables, trees) for richer output.

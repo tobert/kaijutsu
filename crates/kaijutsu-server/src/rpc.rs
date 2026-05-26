@@ -5413,6 +5413,21 @@ async fn execute_shell_command(
                     }
                 }
 
+                // Persist the real kaish exit code on the ToolResult block
+                // before flipping status. Consumers (MCP context_shell return,
+                // BRP introspection, history views) read this to distinguish
+                // exit codes that all map to the same Status::Error.
+                // Clamp to i32 — POSIX exit codes are 0-255; saturating cast
+                // covers the i64-to-i32 narrowing without surprise.
+                let exit_code_i32: i32 = result.code.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+                if let Err(e) = documents_clone.set_exit_code(
+                    context_id,
+                    &output_block_id_clone,
+                    Some(exit_code_i32),
+                ) {
+                    log::error!("Failed to set output block exit_code: {}", e);
+                }
+
                 // Exit 2: latch gate (rm/trash) — confirmation message shown, not a failure
                 // Exit 3 / did_spill: output truncated to spill file — command ran, not a failure
                 let final_status = match result.code {

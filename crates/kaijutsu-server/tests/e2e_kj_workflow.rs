@@ -395,3 +395,68 @@ fn test_shell_echo_e2e() {
         assert_eq!(tool_result.status, Status::Done);
     });
 }
+
+// ============================================================================
+// Exit code propagation (gates structured context_shell return)
+// ============================================================================
+
+/// `shell_execute` must persist the kaish exit code on the ToolResult block.
+/// Today only `Status::{Done, Error}` is set — `result.code` is dropped.
+/// The MCP `context_shell` work depends on this so agents can distinguish
+/// `kj` success/failure and shell command exit codes structurally rather than
+/// by text-matching block content.
+#[test]
+fn test_shell_propagates_exit_code() {
+    run_local(async {
+        let addr = start_server_with_mock_llm().await;
+        let client = connect_client(addr).await;
+        let (kernel, _) = client.bind_kernel().await.unwrap();
+        let ctx = kernel.create_context("exit-code-test").await.unwrap();
+        kernel.join_context(ctx, "test").await.unwrap();
+
+        // Success: `true` builtin → exit 0
+        let (cmd_ok, _, status_ok) = shell_exec_wait(&kernel, "true", ctx).await;
+        assert_eq!(status_ok, Status::Done, "`true` should succeed");
+        let blocks = get_all_blocks(&kernel, ctx).await;
+        let result_ok = blocks
+            .iter()
+            .find(|b| b.kind == BlockKind::ToolResult && b.tool_call_id == Some(cmd_ok))
+            .expect("ToolResult for `true` not found");
+        assert_eq!(
+            result_ok.exit_code,
+            Some(0),
+            "`true` should populate exit_code=Some(0), got {:?}",
+            result_ok.exit_code
+        );
+
+        // Failure: `false` builtin → exit 1
+        let (cmd_err, _, status_err) = shell_exec_wait(&kernel, "false", ctx).await;
+        assert_eq!(status_err, Status::Error, "`false` should fail");
+        let blocks = get_all_blocks(&kernel, ctx).await;
+        let result_err = blocks
+            .iter()
+            .find(|b| b.kind == BlockKind::ToolResult && b.tool_call_id == Some(cmd_err))
+            .expect("ToolResult for `false` not found");
+        assert_eq!(
+            result_err.exit_code,
+            Some(1),
+            "`false` should populate exit_code=Some(1), got {:?}",
+            result_err.exit_code
+        );
+
+        // kj help: success path through the kj builtin → exit 0
+        let (cmd_kj, _, status_kj) = shell_exec_wait(&kernel, "kj help", ctx).await;
+        assert_eq!(status_kj, Status::Done, "`kj help` should succeed");
+        let blocks = get_all_blocks(&kernel, ctx).await;
+        let result_kj = blocks
+            .iter()
+            .find(|b| b.kind == BlockKind::ToolResult && b.tool_call_id == Some(cmd_kj))
+            .expect("ToolResult for `kj help` not found");
+        assert_eq!(
+            result_kj.exit_code,
+            Some(0),
+            "`kj help` should populate exit_code=Some(0), got {:?}",
+            result_kj.exit_code
+        );
+    });
+}

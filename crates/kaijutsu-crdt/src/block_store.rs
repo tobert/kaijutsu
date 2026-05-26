@@ -840,6 +840,21 @@ impl BlockStore {
         Ok(())
     }
 
+    /// Set the exit_code on a ToolResult block using LWW semantics on the
+    /// shared tool_meta clock. The shell execution path calls this after the
+    /// underlying command finishes, capturing the real exit code instead of
+    /// truncating to the binary Done/Error status.
+    pub fn set_exit_code(&mut self, id: &BlockId, exit_code: Option<i32>) -> Result<()> {
+        let ts = self.tick();
+        let block = self
+            .blocks
+            .get_mut(id)
+            .ok_or(CrdtError::BlockNotFound(*id))?;
+        block.set_exit_code(exit_code, ts);
+        self.version += 1;
+        Ok(())
+    }
+
     /// Set the ephemeral flag on a block.
     pub fn set_ephemeral(&mut self, id: &BlockId, ephemeral: bool) -> Result<()> {
         let ts = self.tick();

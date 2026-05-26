@@ -136,6 +136,96 @@ pub enum Backend {
     Remote(RemoteState),
 }
 
+/// Outcome of `execute_and_poll_shell` — passed to per-tool JSON builders.
+///
+/// `Done` carries the completed ToolResult snapshot. The other variants
+/// describe failure modes that don't have a snapshot to read but still
+/// have useful diagnostic info (block id, elapsed time).
+enum ShellCompletion {
+    Done {
+        snapshot: kaijutsu_crdt::BlockSnapshot,
+        elapsed_ms: u64,
+    },
+    Timeout {
+        cmd_block_id: BlockId,
+        timeout_secs: u64,
+        elapsed_ms: u64,
+    },
+    StreamClosed {
+        cmd_block_id: BlockId,
+        elapsed_ms: u64,
+    },
+}
+
+impl ShellCompletion {
+    /// Render this completion as the JSON envelope returned by `shell` and
+    /// `context_shell`. The shape is documented on the tool descriptions —
+    /// agents parse this to extract `stdout`, `exit_code`, structured `data`,
+    /// and the result block id for follow-up reads.
+    fn to_json(&self) -> String {
+        match self {
+            Self::Done {
+                snapshot,
+                elapsed_ms,
+            } => {
+                // Derive exit_code: prefer the persisted value (the real
+                // kaish exit code); fall back to status mapping when absent
+                // (e.g. ToolResult blocks written by paths that predate
+                // exit_code propagation).
+                let exit_code = snapshot.exit_code.unwrap_or_else(|| match snapshot.status {
+                    kaijutsu_crdt::Status::Done => 0,
+                    _ => 1,
+                });
+                let stdout = if snapshot.content.is_empty() {
+                    "".to_string()
+                } else {
+                    snapshot.content.clone()
+                };
+                let data = snapshot
+                    .output
+                    .as_ref()
+                    .and_then(|o| serde_json::to_value(o).ok());
+                serde_json::json!({
+                    "stdout": stdout,
+                    "exit_code": exit_code,
+                    "status": snapshot.status.as_str(),
+                    "block_id": snapshot.id.to_key(),
+                    "content_type": snapshot.content_type.as_mime(),
+                    "ephemeral": snapshot.ephemeral,
+                    "data": data,
+                    "elapsed_ms": elapsed_ms,
+                })
+                .to_string()
+            }
+            Self::Timeout {
+                cmd_block_id,
+                timeout_secs,
+                elapsed_ms,
+            } => serde_json::json!({
+                "stdout": "",
+                "exit_code": -1,
+                "status": "timeout",
+                "block_id": cmd_block_id.to_key(),
+                "elapsed_ms": elapsed_ms,
+                "error": format!("Timeout after {}s waiting for command", timeout_secs),
+            })
+            .to_string(),
+            Self::StreamClosed {
+                cmd_block_id,
+                elapsed_ms,
+            } => serde_json::json!({
+                "stdout": "",
+                "exit_code": -1,
+                "status": "stream_closed",
+                "block_id": cmd_block_id.to_key(),
+                "elapsed_ms": elapsed_ms,
+                "error": "Event stream closed before completion",
+            })
+            .to_string(),
+        }
+    }
+}
+
 /// Remote backend state — persistent actor connection to kaijutsu-server.
 ///
 /// The `ActorHandle` is `Send+Sync` and wraps the `!Send` Cap'n Proto
@@ -571,7 +661,9 @@ impl KaijutsuMcp {
     ///
     /// Both `shell()` and `context_shell()` dispatch a command via `shell_execute`
     /// then wait for the ToolResult child block to reach Done/Error status.
-    /// This helper encapsulates that wait loop.
+    /// Returns the completed ToolResult block snapshot (or a synthetic one
+    /// describing timeout/event-stream errors). The caller serializes the
+    /// JSON envelope so each tool can shape its own response.
     async fn execute_and_poll_shell(
         &self,
         remote: &RemoteState,
@@ -580,14 +672,14 @@ impl KaijutsuMcp {
         command: &str,
         timeout_secs: u64,
         label: &str,
-    ) -> String {
+    ) -> ShellCompletion {
         let start = std::time::Instant::now();
         let mut event_rx = remote.actor.subscribe_events();
         let fallback_interval = tokio::time::Duration::from_millis(500);
 
         // Completion check — looks for a finished ToolResult child of our command block.
         // One shell command produces exactly one ToolResult child, so parent_id match is sufficient.
-        let check_completion = |source: &str| -> Option<String> {
+        let check_completion = |source: &str| -> Option<kaijutsu_crdt::BlockSnapshot> {
             let entry = remote.store.get(ctx_id)?;
             let blocks = entry.doc.blocks_ordered();
             let output = blocks.iter().find(|b| {
@@ -602,24 +694,21 @@ impl KaijutsuMcp {
             tracing::info!(
                 command = %command,
                 status = %output.status.as_str(),
+                exit_code = ?output.exit_code,
                 output_len = output.content.len(),
                 elapsed_ms = start.elapsed().as_millis() as u64,
                 "{label} completed (via {source})"
             );
-            Some(if output.content.is_empty() {
-                "(no output)".to_string()
-            } else {
-                output.content.clone()
-            })
+            Some((*output).clone())
         };
 
         loop {
             if start.elapsed().as_secs() > timeout_secs {
-                return format!(
-                    "Timeout after {}s waiting for command.\nCommand block: {}\nCheck kaijutsu-app for partial output.",
+                return ShellCompletion::Timeout {
+                    cmd_block_id,
                     timeout_secs,
-                    cmd_block_id.to_key()
-                );
+                    elapsed_ms: start.elapsed().as_millis() as u64,
+                };
             }
 
             // Wait for either an event or the fallback timeout
@@ -630,23 +719,35 @@ impl KaijutsuMcp {
                     status: kaijutsu_crdt::Status::Done | kaijutsu_crdt::Status::Error,
                     ..
                 })) => {
-                    if let Some(result) = check_completion("event") {
-                        return result;
+                    if let Some(snap) = check_completion("event") {
+                        return ShellCompletion::Done {
+                            snapshot: snap,
+                            elapsed_ms: start.elapsed().as_millis() as u64,
+                        };
                     }
                 }
                 Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
-                    return "Error: event stream closed".to_string();
+                    return ShellCompletion::StreamClosed {
+                        cmd_block_id,
+                        elapsed_ms: start.elapsed().as_millis() as u64,
+                    };
                 }
                 Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(n))) => {
                     tracing::warn!(skipped = n, "Event stream lagged, checking store");
-                    if let Some(result) = check_completion("lagged") {
-                        return result;
+                    if let Some(snap) = check_completion("lagged") {
+                        return ShellCompletion::Done {
+                            snapshot: snap,
+                            elapsed_ms: start.elapsed().as_millis() as u64,
+                        };
                     }
                 }
                 Err(_timeout) => {
                     // 500ms fallback — check store state
-                    if let Some(result) = check_completion("fallback") {
-                        return result;
+                    if let Some(snap) = check_completion("fallback") {
+                        return ShellCompletion::Done {
+                            snapshot: snap,
+                            elapsed_ms: start.elapsed().as_millis() as u64,
+                        };
                     }
                 }
                 _ => continue, // Other events — keep waiting
@@ -1749,7 +1850,7 @@ impl KaijutsuMcp {
     }
 
     #[tool(
-        description = "Execute a kaish command through the kernel. Output is written to CRDT blocks (observable in kaijutsu-app) and returned when complete. Use for shell commands like cargo, git, ls, etc. Requires --connect and register_session.",
+        description = "Execute a kaish command through the kernel. Returns a JSON object: {stdout, exit_code, status, block_id, content_type, ephemeral, data, elapsed_ms}. Detect failure via exit_code != 0 (or status == 'timeout'/'stream_closed') rather than text-matching. `data` is the kj structured payload when present (e.g. `kj context list` returns an array of context labels). Output also lands as CRDT blocks observable in kaijutsu-app. Requires --connect and register_session.",
         annotations(open_world_hint = true)
     )]
     #[tracing::instrument(skip(self, req), name = "mcp.shell")]
@@ -1788,10 +1889,11 @@ impl KaijutsuMcp {
             "Shell command",
         )
         .await
+        .to_json()
     }
 
     #[tool(
-        description = "Context-bound kaish shell. Executes commands in your current kernel context — '.' references it in kj commands. Full kaish: pipes, variables, scripting. Run `kj help` for context/drift/fork management or `kj drift help` for cross-context communication. Examples: 'kj context list --tree', 'kj fork --name alt', 'kj drift push impl \"found the bug\"', 'ls /mnt/project | grep rs'. Requires --connect and register_session.",
+        description = "Context-bound kaish shell. Executes commands in your current kernel context — '.' references it in kj commands. Full kaish: pipes, variables, scripting. Returns the same JSON envelope as `shell`: {stdout, exit_code, status, block_id, content_type, ephemeral, data, elapsed_ms}. Detect failure via exit_code != 0; `data` carries kj's structured payload (arrays for list commands, objects for inspect). Run `kj help` for context/drift/fork management. Examples: 'kj context list --tree', 'kj fork --name alt', 'kj drift push impl \"found the bug\"', 'ls /mnt/project | grep rs'. Requires --connect and register_session.",
         annotations(open_world_hint = true)
     )]
     #[tracing::instrument(skip(self, req), name = "mcp.context_shell")]
@@ -1829,6 +1931,7 @@ impl KaijutsuMcp {
             "Context shell command",
         )
         .await
+        .to_json()
     }
 
     // ========================================================================
@@ -4195,5 +4298,131 @@ mod tests {
             result.contains("Error"),
             "submit_input should error in local mode: {result}"
         );
+    }
+
+    // ========================================================================
+    // ShellCompletion JSON envelope
+    //
+    // Locks in the wire contract returned by `shell` and `context_shell`.
+    // Agents parse this JSON to extract `stdout`, `exit_code`, structured
+    // `data`, and `block_id` for follow-up reads. Changing the shape is
+    // an agent-visible break — start here when you do.
+    // ========================================================================
+
+    fn make_result_snapshot(content: &str, exit_code: Option<i32>) -> kaijutsu_crdt::BlockSnapshot {
+        let ctx_id = ContextId::new();
+        let call_id = kaijutsu_crdt::BlockId {
+            context_id: ctx_id,
+            agent_id: PrincipalId::new(),
+            seq: 1,
+        };
+        let result_id = kaijutsu_crdt::BlockId {
+            context_id: ctx_id,
+            agent_id: PrincipalId::new(),
+            seq: 2,
+        };
+        kaijutsu_crdt::BlockSnapshot::tool_result(
+            result_id,
+            call_id,
+            kaijutsu_crdt::ToolKind::Shell,
+            content,
+            exit_code.is_some_and(|c| c != 0),
+            exit_code,
+            None,
+        )
+    }
+
+    #[test]
+    fn test_shell_completion_done_success_envelope() {
+        let snap = make_result_snapshot("hello world\n", Some(0));
+        let block_key = snap.id.to_key();
+        let completion = ShellCompletion::Done {
+            snapshot: snap,
+            elapsed_ms: 42,
+        };
+        let json: serde_json::Value = serde_json::from_str(&completion.to_json()).unwrap();
+
+        assert_eq!(json["stdout"], "hello world\n");
+        assert_eq!(json["exit_code"], 0);
+        assert_eq!(json["status"], "done");
+        assert_eq!(json["block_id"], block_key);
+        assert_eq!(json["content_type"], "text/plain");
+        assert_eq!(json["ephemeral"], false);
+        assert!(json["data"].is_null(), "no OutputData → data must be null");
+        assert_eq!(json["elapsed_ms"], 42);
+    }
+
+    #[test]
+    fn test_shell_completion_done_failure_propagates_exit_code() {
+        // `false` builtin or `kj` Err — non-zero exit_code persisted on block.
+        let snap = make_result_snapshot("error: something broke\n", Some(7));
+        let completion = ShellCompletion::Done {
+            snapshot: snap,
+            elapsed_ms: 5,
+        };
+        let json: serde_json::Value = serde_json::from_str(&completion.to_json()).unwrap();
+
+        assert_eq!(json["exit_code"], 7);
+        assert_eq!(json["status"], "error");
+        assert_eq!(json["stdout"], "error: something broke\n");
+    }
+
+    #[test]
+    fn test_shell_completion_done_derives_exit_code_when_absent() {
+        // Backward-compat: blocks written before exit_code propagation have
+        // `exit_code = None`. Fall back to Status: Done → 0, anything else → 1.
+        let snap = make_result_snapshot("ok\n", None);
+        let json: serde_json::Value =
+            serde_json::from_str(&ShellCompletion::Done { snapshot: snap, elapsed_ms: 1 }.to_json())
+                .unwrap();
+        assert_eq!(
+            json["exit_code"], 0,
+            "missing exit_code + Status::Done → 0"
+        );
+    }
+
+    #[test]
+    fn test_shell_completion_timeout_envelope() {
+        let ctx_id = ContextId::new();
+        let cmd_block_id = kaijutsu_crdt::BlockId {
+            context_id: ctx_id,
+            agent_id: PrincipalId::new(),
+            seq: 99,
+        };
+        let block_key = cmd_block_id.to_key();
+        let completion = ShellCompletion::Timeout {
+            cmd_block_id,
+            timeout_secs: 300,
+            elapsed_ms: 300_000,
+        };
+        let json: serde_json::Value = serde_json::from_str(&completion.to_json()).unwrap();
+
+        assert_eq!(json["status"], "timeout");
+        assert_eq!(json["exit_code"], -1);
+        assert_eq!(json["block_id"], block_key);
+        assert_eq!(json["elapsed_ms"], 300_000);
+        assert!(
+            json["error"].as_str().unwrap().contains("300s"),
+            "timeout error string should mention duration: {json}"
+        );
+    }
+
+    #[test]
+    fn test_shell_completion_stream_closed_envelope() {
+        let ctx_id = ContextId::new();
+        let cmd_block_id = kaijutsu_crdt::BlockId {
+            context_id: ctx_id,
+            agent_id: PrincipalId::new(),
+            seq: 99,
+        };
+        let completion = ShellCompletion::StreamClosed {
+            cmd_block_id,
+            elapsed_ms: 50,
+        };
+        let json: serde_json::Value = serde_json::from_str(&completion.to_json()).unwrap();
+
+        assert_eq!(json["status"], "stream_closed");
+        assert_eq!(json["exit_code"], -1);
+        assert!(json["error"].is_string());
     }
 }
