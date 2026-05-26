@@ -44,6 +44,7 @@ kj drift merge
 ## Commands
 
 ```
+block           list, ls, inspect, count, read, create, append, history, diff
 cache           list, add, clear — Claude prompt-cache breakpoints
 cas             put, get, ls, info, rm — content-addressed blob storage
 context (ctx)   list, info, switch, create, set, log, move, archive, remove, retag
@@ -51,6 +52,7 @@ fork            Fork current context (--shallow, --compact, --as)
 drift           push, pull, merge, flush, queue, cancel, history
 prompt          list, show, inject — MCP prompt discovery and injection
 preset          list, show, save, remove
+search          <pattern> — regex search across blocks (--all, --context, --kind, --role)
 workspace (ws)  list, show, create, add, bind, remove
 synth           all, <ctx>, status — semantic indexing + keyword synthesis
 ```

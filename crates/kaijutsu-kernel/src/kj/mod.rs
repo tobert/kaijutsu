@@ -22,6 +22,7 @@ pub mod preset;
 pub mod rc;
 pub mod lifecycle;
 pub mod refs;
+pub mod search;
 pub mod stage;
 pub mod workspace;
 
@@ -305,6 +306,11 @@ impl KjDispatcher {
         // run without an active context.
         if cmd == "block" {
             return self.dispatch_block(&argv[1..], caller);
+        }
+        // `kj search` accepts --context ref or --all, no active context
+        // required. Same exemption rationale as `kj block`.
+        if cmd == "search" {
+            return self.dispatch_search(&argv[1..], caller);
         }
         // `kj attach <ctx>` brings an existing context into the current
         // session and fires the rc `attach` lifecycle on it. Like
