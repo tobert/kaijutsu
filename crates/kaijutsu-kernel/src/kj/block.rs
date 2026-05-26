@@ -84,6 +84,28 @@ enum BlockCommand {
         #[arg(long)]
         range: Option<String>,
     },
+    /// Append text to a block (streaming-friendly). Mirrors MCP `block_append`.
+    Append {
+        /// Block id to append to
+        block_id: String,
+        /// Text to append
+        #[arg(long)]
+        text: String,
+    },
+    /// Show creation + version info for a block. Mirrors MCP `block_history`.
+    History {
+        /// Block id
+        block_id: String,
+    },
+    /// Unified line-by-line diff of block content against original text.
+    /// Mirrors MCP `block_diff`. Without --original, prints current content.
+    Diff {
+        /// Block id
+        block_id: String,
+        /// Original text to diff against (omit for current-content view)
+        #[arg(long)]
+        original: Option<String>,
+    },
     /// Create a new block in a context. Mirrors MCP `block_create`. Status
     /// defaults to Done and content_type to plain — matches the MCP shape.
     Create {
@@ -149,6 +171,14 @@ impl KjDispatcher {
                 no_line_numbers,
                 range,
             } => self.block_read(&block_id, !no_line_numbers, range.as_deref()),
+            BlockCommand::Append { block_id, text } => {
+                self.block_append(&block_id, &text, caller)
+            }
+            BlockCommand::History { block_id } => self.block_history(&block_id),
+            BlockCommand::Diff {
+                block_id,
+                original,
+            } => self.block_diff(&block_id, original.as_deref()),
             BlockCommand::Create {
                 role,
                 kind,
@@ -417,6 +447,208 @@ impl KjDispatcher {
             "range_start": start,
             "range_end": end_clamped,
             "content_length": snap.content.len(),
+        });
+        KjResult::ok_with_data(out, record)
+    }
+
+    /// Append text to an existing block. Mirrors MCP `block_append`. Returns
+    /// the new content length so callers can confirm the write took.
+    fn block_append(&self, id_str: &str, text: &str, caller: &KjCaller) -> KjResult {
+        let block_id = match kaijutsu_types::BlockId::from_key(id_str) {
+            Some(id) => id,
+            None => {
+                return KjResult::Err(format!(
+                    "kj block append: malformed id '{id_str}' (expected context_hex_principal_hex_seq)"
+                ));
+            }
+        };
+        let ctx_id = block_id.context_id;
+
+        // append_text_as takes Option<PrincipalId>; pass the caller's so
+        // the op is attributed to whoever invoked kj, not the system agent.
+        if let Err(e) =
+            self.blocks
+                .append_text_as(ctx_id, &block_id, text, Some(caller.principal_id))
+        {
+            return KjResult::Err(format!("kj block append: {e}"));
+        }
+
+        // Read back to compute the new content length for the structured
+        // record. Cheaper than tracking it via the append op signature.
+        let snapshots = match self.blocks.block_snapshots(ctx_id) {
+            Ok(s) => s,
+            Err(e) => return KjResult::Err(format!("kj block append: {e}")),
+        };
+        let new_len = snapshots
+            .iter()
+            .find(|b| b.id == block_id)
+            .map(|s| s.content.len())
+            .unwrap_or(0);
+
+        let record = serde_json::json!({
+            "block_id": id_str,
+            "context_id": ctx_id.to_hex(),
+            "appended_bytes": text.len(),
+            "content_length": new_len,
+        });
+        KjResult::ok_with_data(format!("appended {} bytes\n", text.len()), record)
+    }
+
+    /// Version / creation info for a block. Mirrors MCP `block_history`.
+    fn block_history(&self, id_str: &str) -> KjResult {
+        let block_id = match kaijutsu_types::BlockId::from_key(id_str) {
+            Some(id) => id,
+            None => {
+                return KjResult::Err(format!(
+                    "kj block history: malformed id '{id_str}' (expected context_hex_principal_hex_seq)"
+                ));
+            }
+        };
+        let ctx_id = block_id.context_id;
+
+        let snapshots = match self.blocks.block_snapshots(ctx_id) {
+            Ok(s) => s,
+            Err(e) => return KjResult::Err(format!("kj block history: {e}")),
+        };
+        let snap = match snapshots.iter().find(|b| b.id == block_id) {
+            Some(s) => s,
+            None => {
+                return KjResult::Err(format!(
+                    "kj block history: block '{id_str}' not found in {}",
+                    ctx_id.to_hex()
+                ));
+            }
+        };
+        // `version` here is the document-level CRDT version, matching the
+        // MCP block_history semantics. Single-block oplog isn't surfaced
+        // by the BlockStore today; if we add it, swap this for the
+        // block-specific version.
+        let version = self.blocks.version(ctx_id).unwrap_or(0);
+        let content_lines = snap.content.lines().count().max(1);
+
+        let record = serde_json::json!({
+            "block_id": id_str,
+            "context_id": ctx_id.to_hex(),
+            "created_at_ms": snap.created_at,
+            "author": snap.author().to_hex(),
+            "document_version": version,
+            "content_lines": content_lines,
+            "content_bytes": snap.content.len(),
+            "status": snap.status.as_str(),
+        });
+        let out = format!(
+            "block:   {id}\n\
+             created: {created}ms (unix epoch) by {author}\n\
+             version: {version} (document)\n\
+             content: {lines} line{lp}, {bytes} byte{bp}\n\
+             status:  {status}\n",
+            id = id_str,
+            created = snap.created_at,
+            author = snap.author().to_hex(),
+            version = version,
+            lines = content_lines,
+            lp = if content_lines == 1 { "" } else { "s" },
+            bytes = snap.content.len(),
+            bp = if snap.content.len() == 1 { "" } else { "s" },
+            status = snap.status.as_str(),
+        );
+        KjResult::ok_with_data(out, record)
+    }
+
+    /// Unified line-by-line diff against an original. Mirrors MCP
+    /// `block_diff`. Without --original, prints current content.
+    fn block_diff(&self, id_str: &str, original: Option<&str>) -> KjResult {
+        let block_id = match kaijutsu_types::BlockId::from_key(id_str) {
+            Some(id) => id,
+            None => {
+                return KjResult::Err(format!(
+                    "kj block diff: malformed id '{id_str}' (expected context_hex_principal_hex_seq)"
+                ));
+            }
+        };
+        let ctx_id = block_id.context_id;
+
+        let snapshots = match self.blocks.block_snapshots(ctx_id) {
+            Ok(s) => s,
+            Err(e) => return KjResult::Err(format!("kj block diff: {e}")),
+        };
+        let snap = match snapshots.iter().find(|b| b.id == block_id) {
+            Some(s) => s,
+            None => {
+                return KjResult::Err(format!(
+                    "kj block diff: block '{id_str}' not found in {}",
+                    ctx_id.to_hex()
+                ));
+            }
+        };
+        let current = &snap.content;
+
+        let original = match original {
+            None => {
+                // No original — preview current content. Useful by itself.
+                let out = format!(
+                    "block: {id}\n\
+                     {sep}\n\
+                     no original text — showing current ({lines} lines, {bytes} bytes):\n\n\
+                     {content}\n",
+                    id = id_str,
+                    sep = "─".repeat(40),
+                    lines = current.lines().count(),
+                    bytes = current.len(),
+                    content = current,
+                );
+                let record = serde_json::json!({
+                    "block_id": id_str,
+                    "context_id": ctx_id.to_hex(),
+                    "has_original": false,
+                    "current_lines": current.lines().count(),
+                    "current_bytes": current.len(),
+                });
+                return KjResult::ok_with_data(out, record);
+            }
+            Some(s) => s,
+        };
+
+        let orig_lines: Vec<&str> = original.lines().collect();
+        let curr_lines: Vec<&str> = current.lines().collect();
+        let max_lines = orig_lines.len().max(curr_lines.len());
+
+        let mut out = format!("diff {id_str}\n{}\n", "─".repeat(40));
+        let mut added = 0usize;
+        let mut removed = 0usize;
+        let mut changed = 0usize;
+        for i in 0..max_lines {
+            match (orig_lines.get(i).copied(), curr_lines.get(i).copied()) {
+                (Some(o), Some(c)) if o == c => {
+                    out.push_str(&format!("  {o}\n"));
+                }
+                (Some(o), Some(c)) => {
+                    out.push_str(&format!("- {o}\n"));
+                    out.push_str(&format!("+ {c}\n"));
+                    changed += 1;
+                }
+                (Some(o), None) => {
+                    out.push_str(&format!("- {o}\n"));
+                    removed += 1;
+                }
+                (None, Some(c)) => {
+                    out.push_str(&format!("+ {c}\n"));
+                    added += 1;
+                }
+                (None, None) => {}
+            }
+        }
+        if added + removed + changed == 0 {
+            out.push_str("(no changes)\n");
+        }
+
+        let record = serde_json::json!({
+            "block_id": id_str,
+            "context_id": ctx_id.to_hex(),
+            "has_original": true,
+            "added_lines": added,
+            "removed_lines": removed,
+            "changed_lines": changed,
         });
         KjResult::ok_with_data(out, record)
     }
@@ -1101,6 +1333,251 @@ mod tests {
             .find(|b| b.id == child_id)
             .unwrap();
         assert_eq!(snap.parent_id, Some(parent_id), "parent edge not set");
+    }
+
+    // ── New: block append ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn block_append_extends_content() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let mut c = caller_with_context(ctx);
+        c.principal_id = principal;
+        let bid = insert_text_block(&d, ctx, "hello");
+
+        let result = d
+            .dispatch(
+                &[
+                    s("block"),
+                    s("append"),
+                    bid.to_key(),
+                    s("--text"),
+                    s(" world"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "append failed: {}", result.message());
+
+        let snap = d
+            .block_store()
+            .block_snapshots(ctx)
+            .unwrap()
+            .into_iter()
+            .find(|b| b.id == bid)
+            .unwrap();
+        assert_eq!(snap.content, "hello world", "content not appended");
+    }
+
+    #[tokio::test]
+    async fn block_append_emits_size_record() {
+        use crate::kj::KjResult;
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let mut c = caller_with_context(ctx);
+        c.principal_id = principal;
+        let bid = insert_text_block(&d, ctx, "abc");
+
+        let result = d
+            .dispatch(
+                &[s("block"), s("append"), bid.to_key(), s("--text"), s("def")],
+                &c,
+            )
+            .await;
+        match result {
+            KjResult::Ok { data: Some(v), .. } => {
+                assert_eq!(v["appended_bytes"], 3);
+                assert_eq!(v["content_length"], 6);
+                assert_eq!(v["block_id"], bid.to_key());
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn block_append_malformed_id_errors() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("c"), None, principal);
+        let c = caller_with_context(ctx);
+
+        let result = d
+            .dispatch(
+                &[s("block"), s("append"), s("garbage"), s("--text"), s("x")],
+                &c,
+            )
+            .await;
+        assert!(!result.is_ok());
+        assert!(result.message().contains("malformed"));
+    }
+
+    // ── New: block history ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn block_history_returns_metadata() {
+        use crate::kj::KjResult;
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let c = caller_with_context(ctx);
+        let bid = insert_text_block(&d, ctx, "first\nsecond");
+
+        let result = d
+            .dispatch(&[s("block"), s("history"), bid.to_key()], &c)
+            .await;
+        assert!(result.is_ok(), "history failed: {}", result.message());
+
+        let body = result.message();
+        assert!(body.contains("block:"), "missing 'block:' header: {body}");
+        assert!(body.contains("created:"), "missing 'created:': {body}");
+        assert!(body.contains("version:"), "missing 'version:': {body}");
+        assert!(body.contains("2 lines"), "wrong line count: {body}");
+
+        match result {
+            KjResult::Ok { data: Some(v), .. } => {
+                assert_eq!(v["block_id"], bid.to_key());
+                assert_eq!(v["content_lines"], 2);
+                assert_eq!(v["content_bytes"], 12);
+                assert!(v["document_version"].is_number());
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn block_history_malformed_id_errors() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("c"), None, principal);
+        let c = caller_with_context(ctx);
+
+        let result = d
+            .dispatch(&[s("block"), s("history"), s("notanid")], &c)
+            .await;
+        assert!(!result.is_ok());
+        assert!(result.message().contains("malformed"));
+    }
+
+    // ── New: block diff ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn block_diff_no_original_shows_current() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let c = caller_with_context(ctx);
+        let bid = insert_text_block(&d, ctx, "alpha\nbeta");
+
+        let result = d
+            .dispatch(&[s("block"), s("diff"), bid.to_key()], &c)
+            .await;
+        assert!(result.is_ok());
+        let body = result.message();
+        assert!(body.contains("no original"), "missing fallback note: {body}");
+        assert!(body.contains("alpha"));
+        assert!(body.contains("beta"));
+    }
+
+    #[tokio::test]
+    async fn block_diff_against_original_renders_unified_diff() {
+        use crate::kj::KjResult;
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let c = caller_with_context(ctx);
+        let bid = insert_text_block(&d, ctx, "alpha\nbeta\nDELTA");
+
+        let result = d
+            .dispatch(
+                &[
+                    s("block"),
+                    s("diff"),
+                    bid.to_key(),
+                    s("--original"),
+                    s("alpha\nbeta\ngamma"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok());
+        let body = result.message();
+        // unchanged line prefixed with two spaces; changed line shows -/+ pair
+        assert!(body.contains("  alpha"), "alpha unchanged: {body}");
+        assert!(body.contains("  beta"), "beta unchanged: {body}");
+        assert!(body.contains("- gamma"), "gamma removed: {body}");
+        assert!(body.contains("+ DELTA"), "DELTA added: {body}");
+
+        match result {
+            KjResult::Ok { data: Some(v), .. } => {
+                assert_eq!(v["has_original"], true);
+                assert_eq!(v["changed_lines"], 1);
+                assert_eq!(v["added_lines"], 0);
+                assert_eq!(v["removed_lines"], 0);
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn block_diff_identical_reports_no_changes() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let c = caller_with_context(ctx);
+        let bid = insert_text_block(&d, ctx, "same\nsame");
+
+        let result = d
+            .dispatch(
+                &[
+                    s("block"),
+                    s("diff"),
+                    bid.to_key(),
+                    s("--original"),
+                    s("same\nsame"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok());
+        assert!(
+            result.message().contains("(no changes)"),
+            "expected '(no changes)' marker: {}",
+            result.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn block_diff_pure_addition() {
+        use crate::kj::KjResult;
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let c = caller_with_context(ctx);
+        let bid = insert_text_block(&d, ctx, "a\nb\nc");
+
+        // Original has fewer lines → added lines counted as additions.
+        let result = d
+            .dispatch(
+                &[
+                    s("block"),
+                    s("diff"),
+                    bid.to_key(),
+                    s("--original"),
+                    s("a"),
+                ],
+                &c,
+            )
+            .await;
+        match result {
+            KjResult::Ok { data: Some(v), .. } => {
+                assert_eq!(v["added_lines"], 2, "b and c were added");
+                assert_eq!(v["removed_lines"], 0);
+                assert_eq!(v["changed_lines"], 0);
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
     }
 
     // ── Range spec parser unit tests ───────────────────────────────────
