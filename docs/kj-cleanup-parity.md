@@ -8,16 +8,16 @@ Each "FULL PARITY" line is safe to delete from MCP after audit passes. PARTIAL/M
 
 - [x] **block_list** — FULL PARITY via `kj block list [--kind|--role|--status|--context] [--json]`
 - [x] **block_inspect** — FULL PARITY via `kj block inspect <block-id> [--json]`
-- [x] **block_status** — FULL PARITY (via `kj block inspect` metadata; `set_status` is internal store API)
-- [ ] **block_create** — MISSING: no `kj block create` verb
-- [ ] **block_read** — PARTIAL: `kj block inspect` provides metadata but not formatted content with line numbers; MCP feature gap = line range filtering, `line_numbers` param
-- [ ] **block_append** — MISSING: no `kj block append` verb
-- [ ] **block_edit** — MISSING: no `kj block edit` verb (no line-based insert/delete/replace operations)
+- [x] **block_status** — FULL PARITY via `kj block status <block-id> <new-status>`
+- [x] **block_create** — FULL PARITY via `kj block create --role --kind [--content] [--parent] [--after] [--context]`
+- [x] **block_read** — FULL PARITY via `kj block read <block-id> [--no-line-numbers] [--range start:end]`
+- [x] **block_append** — FULL PARITY via `kj block append <block-id> --text "..."`
+- [x] **block_edit** — FULL PARITY via `kj block edit <block-id> {insert|delete|replace}` (MCP's multi-op batch becomes one-op-per-invocation; CAS preserved on replace)
 - [x] **block_exclude** — FULL PARITY via `kj stage exclude <block-id>` / `kj stage include <block-id>`
-- [ ] **block_history** — MISSING: no `kj block history` verb (MCP provides created_at, author, version info as timeline)
-- [ ] **block_diff** — MISSING: no `kj block diff` verb (MCP provides unified diff against arbitrary text)
+- [x] **block_history** — FULL PARITY via `kj block history <block-id>`
+- [x] **block_diff** — FULL PARITY via `kj block diff <block-id> [--original "..."]`
 
-**parity: 3/10 (block_list, block_inspect, block_exclude)**
+**parity: 10/10 — all block_* MCP tools deletable**
 
 ## Document tools
 
@@ -30,9 +30,9 @@ Each "FULL PARITY" line is safe to delete from MCP after audit passes. PARTIAL/M
 
 ## Search
 
-- [ ] **kernel_search** — MISSING: no `kj search` verb (regex search across blocks + filtering by kind/role not exposed)
+- [x] **kernel_search** — FULL PARITY via `kj search <pattern> [--all|--context] [--kind|--role] [--context-lines N] [--max-matches N] [--json]`
 
-**parity: 0/1**
+**parity: 1/1**
 
 ## Stage (management of liminal staging state)
 
@@ -42,22 +42,17 @@ Each "FULL PARITY" line is safe to delete from MCP after audit passes. PARTIAL/M
 
 ## Summary
 
-**Overall parity: 4/16 tools (25%) safe to delete immediately**
+**Overall parity: 12/16 tools (75%) safe to delete after this PR series lands**
 
-- 4 tools with full parity (delete after PR lands):
-  - `block_list` → `kj block list`
-  - `block_inspect` → `kj block inspect`
-  - `block_exclude` → `kj stage exclude` / `kj stage include`
+- 12 tools with full parity (delete after current commits ship):
+  - All 10 block_* tools via the new `kj block` clap namespace
   - `stage_commit` → `kj stage commit`
+  - `kernel_search` → `kj search`
 
-- 1 tool with partial parity (gap must be filled in kj first):
-  - `block_read` — kj lacks formatted content reading with line ranges and line-number display
-
-- 11 tools missing from kj entirely (new verbs needed before deletion):
-  - Block mutations: `block_create`, `block_append`, `block_edit` (create, stream, line-based edit)
-  - Block introspection: `block_history`, `block_diff` (timeline and diff-against-text)
-  - Document metadata: `doc_list`, `doc_tree`, `doc_create`, `doc_delete` (document-scoped queries and lifecycle)
-  - Discovery: `kernel_search` (regex + filter search across blocks)
+- 4 tools still missing from kj (the doc namespace; open design call):
+  - `doc_list`, `doc_tree`, `doc_create`, `doc_delete` — see open question
+    in docs/kj-cleanup.md about whether doc lives under `kj context` (since
+    docs and contexts are 1:1 in practice) or stands alone as `kj doc`.
 
 ## Gaps to close before MCP slim-down (prioritized by delete-blocking)
 

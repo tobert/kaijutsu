@@ -145,6 +145,13 @@ enum BlockCommand {
         #[arg(long)]
         original: Option<String>,
     },
+    /// Set the status field on a block. Mirrors MCP `block_status`.
+    Status {
+        /// Block id
+        block_id: String,
+        /// New status: pending|running|done|error
+        new_status: String,
+    },
     /// Edit a block via line-based operations. Single op per invocation —
     /// the kj surface trades MCP's batch-of-ops for a clean CLI shape.
     /// Mirrors MCP `block_edit` minus the multi-op atomicity (which the
@@ -225,6 +232,10 @@ impl KjDispatcher {
                 self.block_append(&block_id, &text, caller)
             }
             BlockCommand::Edit { block_id, op } => self.block_edit(&block_id, op, caller),
+            BlockCommand::Status {
+                block_id,
+                new_status,
+            } => self.block_status(&block_id, &new_status),
             BlockCommand::History { block_id } => self.block_history(&block_id),
             BlockCommand::Diff {
                 block_id,
@@ -543,6 +554,41 @@ impl KjDispatcher {
             "content_length": new_len,
         });
         KjResult::ok_with_data(format!("appended {} bytes\n", text.len()), record)
+    }
+
+    /// Set a block's status. Mirrors MCP `block_status`. Parses the status
+    /// string via `Status::from_str`, which already accepts the lenient set
+    /// of synonyms (active→running, completed→done, etc.).
+    fn block_status(&self, id_str: &str, new_status: &str) -> KjResult {
+        let block_id = match kaijutsu_types::BlockId::from_key(id_str) {
+            Some(id) => id,
+            None => {
+                return KjResult::Err(format!(
+                    "kj block status: malformed id '{id_str}' (expected context_hex_principal_hex_seq)"
+                ));
+            }
+        };
+        let ctx_id = block_id.context_id;
+        let status = match Status::from_str(new_status) {
+            Some(s) => s,
+            None => {
+                return KjResult::Err(format!(
+                    "kj block status: invalid status '{new_status}' (expected pending|running|done|error)"
+                ));
+            }
+        };
+        if let Err(e) = self.blocks.set_status(ctx_id, &block_id, status) {
+            return KjResult::Err(format!("kj block status: {e}"));
+        }
+        let record = serde_json::json!({
+            "block_id": id_str,
+            "context_id": ctx_id.to_hex(),
+            "status": status.as_str(),
+        });
+        KjResult::ok_with_data(
+            format!("status set to {}\n", status.as_str()),
+            record,
+        )
     }
 
     /// Edit a block via a single line-based operation. Mirrors a single
@@ -1520,6 +1566,65 @@ mod tests {
             .find(|b| b.id == child_id)
             .unwrap();
         assert_eq!(snap.parent_id, Some(parent_id), "parent edge not set");
+    }
+
+    // ── New: block status ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn block_status_changes_value() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let c = caller_with_context(ctx);
+        let bid = insert_text_block(&d, ctx, "x");
+        // Confirm starting state is Done (from insert_block_as default).
+        let before = d
+            .block_store()
+            .block_snapshots(ctx)
+            .unwrap()
+            .into_iter()
+            .find(|b| b.id == bid)
+            .unwrap();
+        assert_eq!(before.status, Status::Done);
+
+        let result = d
+            .dispatch(
+                &[s("block"), s("status"), bid.to_key(), s("running")],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "status failed: {}", result.message());
+
+        let after = d
+            .block_store()
+            .block_snapshots(ctx)
+            .unwrap()
+            .into_iter()
+            .find(|b| b.id == bid)
+            .unwrap();
+        assert_eq!(after.status, Status::Running);
+    }
+
+    #[tokio::test]
+    async fn block_status_invalid_value_errors() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let c = caller_with_context(ctx);
+        let bid = insert_text_block(&d, ctx, "x");
+
+        let result = d
+            .dispatch(
+                &[s("block"), s("status"), bid.to_key(), s("explosion")],
+                &c,
+            )
+            .await;
+        assert!(!result.is_ok());
+        assert!(
+            result.message().contains("invalid status"),
+            "expected 'invalid status' error: {}",
+            result.message()
+        );
     }
 
     // ── New: block edit ───────────────────────────────────────────────
