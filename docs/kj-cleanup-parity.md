@@ -21,12 +21,17 @@ Each "FULL PARITY" line is safe to delete from MCP after audit passes. PARTIAL/M
 
 ## Document tools
 
-- [ ] **doc_list** — MISSING: no `kj doc list` verb; `kj context list` exists but lists contexts, not documents (1:1 relationship but different semantics)
-- [ ] **doc_tree** — MISSING: no `kj doc tree` verb; conversational DAG visualization not available in kj
-- [ ] **doc_create** — MISSING: no `kj doc create` verb (document creation happens implicitly via `kj context create` + language metadata)
-- [ ] **doc_delete** — MISSING: no `kj doc delete` verb (document deletion via `kj context archive` or `kj context remove`)
+The doc namespace is a separate primitive from context — see CLARIFICATION
+in docs/kj-cleanup.md (Code, Text, Config docs exist without contexts).
+`kj doc` is the storage-layer surface; `kj context` stays as the
+conversation-management surface. Not duplication.
 
-**parity: 0/4 (all missing)**
+- [x] **doc_list** — FULL PARITY via `kj doc list [--kind <k>] [--json]`. Shows non-conversation docs that `kj context list` hides; attaches context metadata when present.
+- [x] **doc_tree** — FULL PARITY via `kj doc tree <id> [--max-depth N] [--expand-tools]`. Inlined `format_dag_tree` from `kaijutsu-mcp/src/tree.rs` (factor to `kaijutsu-crdt` later).
+- [x] **doc_create** — FULL PARITY via `kj doc create [--kind <k>] [--language <l>] [--id <hex>]`. For Conversation kind, prefer `kj context create` (also registers metadata).
+- [x] **doc_delete** — FULL PARITY via `kj doc delete <id> [--confirm <nonce>]`. Latch-gated — same destructive-op pattern as `kj context archive`.
+
+**parity: 4/4 — all doc_* MCP tools deletable**
 
 ## Search
 
@@ -42,17 +47,22 @@ Each "FULL PARITY" line is safe to delete from MCP after audit passes. PARTIAL/M
 
 ## Summary
 
-**Overall parity: 12/16 tools (75%) safe to delete after this PR series lands**
+**Overall parity: 16/16 tools (100%) safe to delete after this PR series lands**
 
-- 12 tools with full parity (delete after current commits ship):
-  - All 10 block_* tools via the new `kj block` clap namespace
-  - `stage_commit` → `kj stage commit`
-  - `kernel_search` → `kj search`
+All MCP tools in scope for the slim-down now have kj equivalents:
 
-- 4 tools still missing from kj (the doc namespace; open design call):
-  - `doc_list`, `doc_tree`, `doc_create`, `doc_delete` — see open question
-    in docs/kj-cleanup.md about whether doc lives under `kj context` (since
-    docs and contexts are 1:1 in practice) or stands alone as `kj doc`.
+- 10 block_* tools via the new `kj block` clap namespace
+- 4 doc_* tools via the new `kj doc` clap namespace (own primitive,
+  not duplication — see preamble under Document tools)
+- `stage_commit` → `kj stage commit`
+- `kernel_search` → `kj search`
+
+The next step in `docs/kj-cleanup.md` (MCP slim-down PR) is unblocked.
+Recommended deletion order:
+1. Block tools (10) — kj block has been tested and used in this session
+2. doc_* (4)
+3. kernel_search (1)
+4. stage_commit (1) — least risk, already a thin wrapper around `kj stage commit`
 
 ## Gaps to close before MCP slim-down (prioritized by delete-blocking)
 

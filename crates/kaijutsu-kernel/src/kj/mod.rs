@@ -14,6 +14,7 @@ pub mod cache;
 pub mod cas;
 pub mod compact;
 pub mod context;
+pub mod doc;
 pub mod drift;
 pub mod fork;
 pub mod format;
@@ -311,6 +312,12 @@ impl KjDispatcher {
         // required. Same exemption rationale as `kj block`.
         if cmd == "search" {
             return self.dispatch_search(&argv[1..], caller);
+        }
+        // `kj doc` operates on the storage layer (all documents, not just
+        // contexts). No active context required — list/create/delete take
+        // explicit ids.
+        if cmd == "doc" {
+            return self.dispatch_doc(&argv[1..], caller);
         }
         // `kj attach <ctx>` brings an existing context into the current
         // session and fires the rc `attach` lifecycle on it. Like
