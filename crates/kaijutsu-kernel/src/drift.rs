@@ -600,6 +600,7 @@ pub fn build_distillation_prompt(
             BlockKind::Error => " (error)",
             BlockKind::Notification => " (notification)",
             BlockKind::Resource => " (resource)",
+            BlockKind::Trace => " (trace)",
             BlockKind::Text => "",
         };
 

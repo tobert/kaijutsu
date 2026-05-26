@@ -22,9 +22,12 @@ uses it. Gate with explicit user opt-in to avoid creepy default behavior.
 The MCP-centric kernel landed in five phases plus hook persistence; the
 following are explicit follow-ups that did not ship:
 
-- **rc system follow-ups.** Capnp surface for `context_type` (paused
-  pending rethink); CRDT-VFS bridge for collaborative script editing
-  (speculative).
+- **rc system follow-ups.** `context_type` is now defined as "the
+  bucket of rc scripts that gives a context its mode" (a SysV-flavored
+  init bundle); capnp wire surface can land using that framing.
+  CRDT-VFS bridge for collaborative script editing (speculative).
+  `kj block insert/append/exclude` to match MCP — deferred until we
+  see the Trace + rc-md path used in anger.
 - **`StreamingBlockHandle` implementation.** Single-block streaming
   primitive. Build when the first caller arrives (likely the LLM
   streaming rewrite). Resolve async-drop strategy and append granularity

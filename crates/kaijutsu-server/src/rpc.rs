@@ -5569,6 +5569,7 @@ fn set_block_snapshot(
         kaijutsu_crdt::BlockKind::Error => crate::kaijutsu_capnp::BlockKind::Error,
         kaijutsu_crdt::BlockKind::Notification => crate::kaijutsu_capnp::BlockKind::Notification,
         kaijutsu_crdt::BlockKind::Resource => crate::kaijutsu_capnp::BlockKind::Resource,
+        kaijutsu_crdt::BlockKind::Trace => crate::kaijutsu_capnp::BlockKind::Trace,
     });
 
     // Set basic fields (no author — derived from id.agent_id)
@@ -5671,6 +5672,7 @@ fn set_block_snapshot(
                 kaijutsu_crdt::BlockKind::Resource => {
                     crate::kaijutsu_capnp::BlockKind::Resource
                 }
+                kaijutsu_crdt::BlockKind::Trace => crate::kaijutsu_capnp::BlockKind::Trace,
             });
         }
     }
@@ -5841,6 +5843,7 @@ fn parse_block_filter(
                 crate::kaijutsu_capnp::BlockKind::Error => BlockKind::Error,
                 crate::kaijutsu_capnp::BlockKind::Notification => BlockKind::Notification,
                 crate::kaijutsu_capnp::BlockKind::Resource => BlockKind::Resource,
+                crate::kaijutsu_capnp::BlockKind::Trace => BlockKind::Trace,
             });
         }
         if kinds.is_empty() {
@@ -5995,6 +5998,7 @@ fn parse_block_event_filter(
                             crate::kaijutsu_capnp::BlockKind::Error => BlockKind::Error,
                             crate::kaijutsu_capnp::BlockKind::Notification => BlockKind::Notification,
                             crate::kaijutsu_capnp::BlockKind::Resource => BlockKind::Resource,
+                            crate::kaijutsu_capnp::BlockKind::Trace => BlockKind::Trace,
                         })
                     })
                     .collect()

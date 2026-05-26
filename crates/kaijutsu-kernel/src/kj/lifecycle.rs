@@ -355,7 +355,24 @@ async fn run_kai_script(
         .with_vars(vars)
         .with_timeout(timeout);
     match kaish.execute_with_options(&script.content, opts).await {
-        Ok(exec) if exec.code == 0 => {}
+        Ok(exec) if exec.code == 0 => {
+            // Capture stdout/stderr from a successful run into a Trace
+            // block. Hidden from the LLM (Trace skips hydrate) but kept
+            // in the conversation document for operator debugging and
+            // potential downstream UI surfaces. No block at all when the
+            // script was silent — avoids littering the doc with empties.
+            let stdout = exec.text_out();
+            if !stdout.is_empty() || !exec.err.is_empty() {
+                insert_rc_trace_block(
+                    dispatcher,
+                    new_id,
+                    &script.path,
+                    &script.sort_key,
+                    tail_output(&stdout, &exec.err),
+                    principal,
+                );
+            }
+        }
         Ok(exec) => {
             let stdout = exec.text_out().into_owned();
             insert_rc_failure_block(
@@ -438,6 +455,39 @@ fn insert_rc_failure_block(
     ) {
         tracing::error!(
             "rc lifecycle: could not insert failure block for {rc_path}: {e}"
+        );
+    }
+}
+
+/// Insert a `BlockKind::Trace` block capturing the stdout/stderr of a
+/// successful rc `.kai` script. Hidden from the LLM (the hydrator skips
+/// `Trace` unconditionally) but available in the conversation document
+/// for operator inspection.
+fn insert_rc_trace_block(
+    dispatcher: &KjDispatcher,
+    new_id: ContextId,
+    rc_path: &str,
+    sort_key: &str,
+    detail: String,
+    principal: PrincipalId,
+) {
+    let summary = format!(
+        "rc {sort_key} trace: {rc_path}\nrc_path: {rc_path}\nsort_key: {sort_key}\n\n{detail}"
+    );
+    let after = dispatcher.block_store().last_block_id(new_id);
+    if let Err(e) = dispatcher.block_store().insert_block_as(
+        new_id,
+        None,
+        after.as_ref(),
+        Role::System,
+        BlockKind::Trace,
+        summary,
+        Status::Done,
+        ContentType::Plain,
+        Some(principal),
+    ) {
+        tracing::error!(
+            "rc lifecycle: could not insert trace block for {rc_path}: {e}"
         );
     }
 }
@@ -596,6 +646,132 @@ mod tests {
             !kinds.contains(&kaijutsu_types::BlockKind::Error),
             "successful .kai should not insert error block, got kinds: {kinds:?}"
         );
+    }
+
+    /// A successful `.kai` script that prints to stdout lands its output
+    /// in a `BlockKind::Trace` block (model-hidden, operator-visible).
+    /// Silent scripts must NOT produce a Trace block — only emit when
+    /// there's something to capture.
+    #[tokio::test]
+    async fn rc_kai_stdout_captured_as_trace_block() {
+        let d = test_dispatcher().await;
+        install_script(
+            &d,
+            "/etc/rc/test/create/S00-echo.kai",
+            "test",
+            "create",
+            "S00",
+            "echo",
+            "kai",
+            "echo \"hello from rc\"",
+        );
+        let caller = unjoined_caller();
+        let result = d
+            .dispatch(
+                &argv(&["context", "create", "ctx-echo", "--type", "test"]),
+                &caller,
+            )
+            .await;
+        assert!(result.is_ok(), "create failed: {}", result.message());
+
+        let new_id = lookup_context_id(&d, "ctx-echo");
+        let snapshots = d.block_store().block_snapshots(new_id).expect("snapshots");
+        let trace_blocks: Vec<_> = snapshots
+            .iter()
+            .filter(|b| b.kind == kaijutsu_types::BlockKind::Trace)
+            .collect();
+        assert_eq!(
+            trace_blocks.len(),
+            1,
+            "expected 1 trace block from echoing script; kinds: {:?}",
+            snapshots.iter().map(|b| b.kind).collect::<Vec<_>>()
+        );
+        let body = &trace_blocks[0].content;
+        assert!(
+            body.contains("hello from rc"),
+            "trace block must contain the stdout, got: {body}"
+        );
+        assert!(
+            body.contains("S00-echo.kai") || body.contains("S00"),
+            "trace block must reference the script path or sort key, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rc_kai_silent_success_inserts_no_trace_block() {
+        let d = test_dispatcher().await;
+        install_script(
+            &d,
+            "/etc/rc/test/create/S00-silent.kai",
+            "test",
+            "create",
+            "S00",
+            "silent",
+            "kai",
+            "true",
+        );
+        let caller = unjoined_caller();
+        let result = d
+            .dispatch(
+                &argv(&["context", "create", "ctx-silent", "--type", "test"]),
+                &caller,
+            )
+            .await;
+        assert!(result.is_ok(), "create failed: {}", result.message());
+
+        let new_id = lookup_context_id(&d, "ctx-silent");
+        let kinds = block_kinds_in(&d, new_id);
+        assert!(
+            !kinds.contains(&kaijutsu_types::BlockKind::Trace),
+            "silent script must not produce trace block, got kinds: {kinds:?}"
+        );
+    }
+
+    /// Trace blocks have `Role::System` but `BlockKind::Trace` — the
+    /// hydrator must skip them so the model never sees rc operator
+    /// telemetry. (Belt-and-suspenders against a future regression that
+    /// widens the System-role carve-out to all kinds.)
+    #[tokio::test]
+    async fn rc_kai_trace_block_is_hidden_from_llm_hydrate() {
+        let d = test_dispatcher().await;
+        install_script(
+            &d,
+            "/etc/rc/test/create/S00-echo.kai",
+            "test",
+            "create",
+            "S00",
+            "echo",
+            "kai",
+            "echo MODEL_MUST_NOT_SEE_THIS",
+        );
+        let caller = unjoined_caller();
+        let result = d
+            .dispatch(
+                &argv(&["context", "create", "ctx-hidden", "--type", "test"]),
+                &caller,
+            )
+            .await;
+        assert!(result.is_ok(), "create failed: {}", result.message());
+
+        let new_id = lookup_context_id(&d, "ctx-hidden");
+        let snapshots = d.block_store().block_snapshots(new_id).expect("snapshots");
+        // Sanity: the trace block exists in the document.
+        assert!(
+            snapshots
+                .iter()
+                .any(|b| b.kind == kaijutsu_types::BlockKind::Trace
+                    && b.content.contains("MODEL_MUST_NOT_SEE_THIS")),
+            "trace block with sentinel must exist in document"
+        );
+        // The hydrator must not surface it.
+        let msgs = crate::llm::hydrate_from_blocks(&snapshots);
+        for m in &msgs {
+            let rendered = format!("{:?}", m);
+            assert!(
+                !rendered.contains("MODEL_MUST_NOT_SEE_THIS"),
+                "trace content leaked into hydrated message: {rendered}"
+            );
+        }
     }
 
     /// End-to-end: a slow rc `.kai` script must time out, terminate any

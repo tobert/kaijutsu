@@ -72,6 +72,9 @@ enum BlockKind {
   error @6;
   notification @7;
   resource @8;
+  # Operator/UI telemetry — rc stdout, hook output, kernel diagnostics.
+  # Hydrator skips unconditionally so the LLM never sees them.
+  trace @9;
 }
 
 # Which execution engine handled a tool call/result.

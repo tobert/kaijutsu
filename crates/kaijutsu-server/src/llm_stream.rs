@@ -201,9 +201,15 @@ pub(crate) async fn spawn_llm_for_prompt(
     // the curation — D-54 retired the legacy post-filter).
     let tools = build_tool_definitions(&kernel_arc, context_id, user_agent_id).await;
 
-    // Assemble situational system-prompt addendum (A4): static base + per-call
-    // facts so the model has context name, lifecycle state, and current tool
-    // inventory without losing the static stance set in assets/defaults/system.md.
+    // Assemble situational system-prompt addendum (A4): static base + rc
+    // sections (the `.md` lifecycle scripts) + per-call facts so the model
+    // has context name, lifecycle state, and current tool inventory without
+    // losing the static stance set in assets/defaults/system.md.
+    //
+    // rc sections come from `(Role::System, BlockKind::Text)` blocks in the
+    // conversation — typically dropped in by rc-on-create/-on-fork. They
+    // land between the static base and the `<situation>` addendum (matching
+    // the doc layout: base → rc → situation).
     let situational = kaijutsu_kernel::SituationalContext {
         context_id: Some(context_id),
         context_label: ctx_label,
@@ -212,7 +218,12 @@ pub(crate) async fn spawn_llm_for_prompt(
         model: Some(model_name.clone()),
         tool_names: tools.iter().map(|t| t.name.clone()).collect(),
     };
-    let system_prompt = kaijutsu_kernel::build_system_prompt(&system_prompt, &situational);
+    let rc_sections = documents
+        .block_snapshots(context_id)
+        .map(|b| kaijutsu_kernel::extract_system_prompt_sections(&b))
+        .unwrap_or_default();
+    let system_prompt =
+        kaijutsu_kernel::build_system_prompt(&system_prompt, &situational, &rc_sections);
 
     log::info!(
         "Spawning LLM stream: context={}, model={}",

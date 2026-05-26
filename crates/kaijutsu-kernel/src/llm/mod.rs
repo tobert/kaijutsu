@@ -37,7 +37,7 @@ pub mod toml_config;
 
 // Re-export key types
 pub use config::ProviderConfig;
-pub use system_prompt::{SituationalContext, build_system_prompt};
+pub use system_prompt::{SituationalContext, build_system_prompt, extract_system_prompt_sections};
 pub use toml_config::{
     EmbeddingModelConfig, LlmConfig, ModelAlias, ModelsConfig, initialize_llm_registry,
     load_llm_config_toml, load_models_config_toml,
@@ -1061,7 +1061,10 @@ pub fn hydrate_from_blocks(blocks: &[kaijutsu_types::BlockSnapshot]) -> Vec<Mess
         if block.excluded {
             continue;
         }
-        if matches!(block.kind, BlockKind::Thinking | BlockKind::File) {
+        if matches!(
+            block.kind,
+            BlockKind::Thinking | BlockKind::File | BlockKind::Trace
+        ) {
             continue;
         }
         // Skip System blocks unless they're Drift, Error, Notification, or Resource (D-34)

@@ -50,6 +50,7 @@ pub fn block_color(block: &BlockSnapshot, theme: &Theme) -> bevy::prelude::Color
         }
         BlockKind::Notification => theme.block_notification,
         BlockKind::Resource => theme.block_resource,
+        BlockKind::Trace => theme.fg_dim,
         BlockKind::Drift => match block.drift_kind {
             Some(DriftKind::Push) => theme.block_drift_push,
             Some(DriftKind::Pull) | Some(DriftKind::Distill) => theme.block_drift_pull,
@@ -706,6 +707,7 @@ fn format_block_inner(block: &BlockSnapshot, local_ctx: Option<ContextId>) -> St
                 block.content.clone()
             }
         }
+        BlockKind::Trace => block.content.clone(),
     }
 }
 

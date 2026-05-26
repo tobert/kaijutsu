@@ -979,6 +979,14 @@ pub enum BlockKind {
     #[serde(rename = "resource")]
     #[strum(serialize = "resource")]
     Resource,
+    /// Operator/UI telemetry — rc script stdout, hook output, kernel-side
+    /// trace material. Never visible to the LLM (the hydrator skips
+    /// `Trace` blocks unconditionally). Use for "what did this lifecycle
+    /// actually do" timelines and similar diagnostic surfaces that should
+    /// live in the conversation document but stay out of the model's view.
+    #[serde(rename = "trace")]
+    #[strum(serialize = "trace")]
+    Trace,
 }
 
 impl BlockKind {
@@ -1000,6 +1008,7 @@ impl BlockKind {
             BlockKind::Error => "error",
             BlockKind::Notification => "notification",
             BlockKind::Resource => "resource",
+            BlockKind::Trace => "trace",
         }
     }
 

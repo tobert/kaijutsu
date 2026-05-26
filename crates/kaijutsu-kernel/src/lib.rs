@@ -81,6 +81,7 @@ pub use llm::{
     // System prompt assembly
     SituationalContext,
     build_system_prompt,
+    extract_system_prompt_sections,
     initialize_llm_registry,
     load_llm_config_toml,
     load_models_config_toml,

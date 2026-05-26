@@ -1558,6 +1558,7 @@ fn set_block_filter_builder(
                     BlockKind::Error => crate::kaijutsu_capnp::BlockKind::Error,
                     BlockKind::Notification => crate::kaijutsu_capnp::BlockKind::Notification,
                     BlockKind::Resource => crate::kaijutsu_capnp::BlockKind::Resource,
+                    BlockKind::Trace => crate::kaijutsu_capnp::BlockKind::Trace,
                 },
             );
         }
@@ -1688,6 +1689,7 @@ fn set_block_event_filter_builder(
                     BlockKind::Error => crate::kaijutsu_capnp::BlockKind::Error,
                     BlockKind::Notification => crate::kaijutsu_capnp::BlockKind::Notification,
                     BlockKind::Resource => crate::kaijutsu_capnp::BlockKind::Resource,
+                    BlockKind::Trace => crate::kaijutsu_capnp::BlockKind::Trace,
                 },
             );
         }
@@ -1892,7 +1894,7 @@ pub(crate) fn parse_block_snapshot(
     // Parse block ID
     let id = parse_block_id(&reader.get_id()?)?;
 
-    // Parse kind (9 variants)
+    // Parse kind (10 variants)
     let kind = match reader.get_kind()? {
         crate::kaijutsu_capnp::BlockKind::Text => BlockKind::Text,
         crate::kaijutsu_capnp::BlockKind::Thinking => BlockKind::Thinking,
@@ -1903,6 +1905,7 @@ pub(crate) fn parse_block_snapshot(
         crate::kaijutsu_capnp::BlockKind::Error => BlockKind::Error,
         crate::kaijutsu_capnp::BlockKind::Notification => BlockKind::Notification,
         crate::kaijutsu_capnp::BlockKind::Resource => BlockKind::Resource,
+        crate::kaijutsu_capnp::BlockKind::Trace => BlockKind::Trace,
     };
 
     let mut builder = BlockSnapshotBuilder::new(id, kind);
@@ -2093,6 +2096,7 @@ pub(crate) fn parse_block_snapshot(
                 crate::kaijutsu_capnp::BlockKind::Error => BlockKind::Error,
                 crate::kaijutsu_capnp::BlockKind::Notification => BlockKind::Notification,
                 crate::kaijutsu_capnp::BlockKind::Resource => BlockKind::Resource,
+                crate::kaijutsu_capnp::BlockKind::Trace => BlockKind::Trace,
             })
         } else {
             None
@@ -2465,6 +2469,7 @@ mod tests {
             BlockKind::Error => crate::kaijutsu_capnp::BlockKind::Error,
             BlockKind::Notification => crate::kaijutsu_capnp::BlockKind::Notification,
             BlockKind::Resource => crate::kaijutsu_capnp::BlockKind::Resource,
+            BlockKind::Trace => crate::kaijutsu_capnp::BlockKind::Trace,
         });
 
         // Set role
