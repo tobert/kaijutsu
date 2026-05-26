@@ -5976,6 +5976,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bytes",
+ "clap",
  "dashmap",
  "diamond-types-extended",
  "dunce",
@@ -6106,7 +6107,7 @@ dependencies = [
 
 [[package]]
 name = "kaish-glob"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "ignore",
@@ -6115,7 +6116,7 @@ dependencies = [
 
 [[package]]
 name = "kaish-kernel"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "ariadne",
@@ -6124,6 +6125,7 @@ dependencies = [
  "bstr",
  "chrono",
  "chumsky",
+ "clap",
  "digest 0.10.7",
  "directories",
  "git2",
@@ -6156,7 +6158,7 @@ dependencies = [
 
 [[package]]
 name = "kaish-types"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "serde",
  "serde_json",

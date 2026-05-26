@@ -1,53 +1,185 @@
 //! `kj block` — inspect blocks in a context.
 //!
-//! Wraps the same `BlockStore::block_snapshots` surface that powers the
+//! First kj namespace migrated to clap_derive. Pattern: one `BlockArgs`
+//! struct + `BlockCommand` enum at the top, dispatch_block parses argv via
+//! `try_parse_from`, then matches the variant to the per-verb function. The
+//! existing function bodies stayed mostly intact — only argv extraction
+//! moved into the derive.
+//!
+//! Routes through the same `BlockStore::block_snapshots` surface that powers
 //! `block_list` / `block_inspect` MCP tools, exposed as kj subcommands so
 //! kaish scripts (rc lifecycle, the live-eval harness) can read block state
-//! without going through MCP.
-//!
-//! ```text
-//! kj block list   [--context <ref>] [--kind <k>] [--role <r>] [--status <s>] [--json]
-//! kj block inspect <block-id> [--json]
-//! kj block count  [--context <ref>] [--kind <k>] [--role <r>]
-//! ```
+//! without going through MCP. `read` closes the partial-parity gap with
+//! `block_read` (line numbers + range filtering).
 
+use clap::{Parser, Subcommand};
 use kaijutsu_types::{BlockKind, ContentType, Role, Status};
 use serde::Serialize;
 
-use super::parse::extract_named_arg;
 use super::refs::resolve_context_arg;
 use super::{KjCaller, KjDispatcher, KjResult};
 
+#[derive(Parser, Debug)]
+#[command(
+    name = "block",
+    about = "Inspect blocks in a context",
+    disable_help_subcommand = true,
+    no_binary_name = true
+)]
+struct BlockArgs {
+    #[command(subcommand)]
+    command: BlockCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum BlockCommand {
+    /// List blocks in a context with optional filters.
+    #[command(alias = "ls")]
+    List {
+        /// Target context: . (default) | .parent | <label> | <hex prefix>
+        #[arg(long, short = 'c')]
+        context: Option<String>,
+        /// Filter by kind: text|thinking|tool_call|tool_result|drift|file|error|notification|resource|trace
+        #[arg(long)]
+        kind: Option<String>,
+        /// Filter by role: user|model|system|tool|asset
+        #[arg(long)]
+        role: Option<String>,
+        /// Filter by status: pending|running|done|error
+        #[arg(long)]
+        status: Option<String>,
+        /// Emit a single JSON object instead of a table
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect a single block's metadata.
+    Inspect {
+        /// Block id: context_hex_principal_hex_seq (or legacy : form)
+        block_id: String,
+        /// Emit a single JSON object instead of a labelled table
+        #[arg(long)]
+        json: bool,
+    },
+    /// Count blocks matching filters.
+    Count {
+        /// Target context: . (default) | .parent | <label> | <hex prefix>
+        #[arg(long, short = 'c')]
+        context: Option<String>,
+        /// Filter by kind
+        #[arg(long)]
+        kind: Option<String>,
+        /// Filter by role
+        #[arg(long)]
+        role: Option<String>,
+    },
+    /// Read a block's full content. Mirrors MCP `block_read` — line numbers
+    /// by default; `--range start:end` for half-open slices (0-indexed).
+    Read {
+        /// Block id
+        block_id: String,
+        /// Suppress line numbers (default: show them)
+        #[arg(long = "no-line-numbers")]
+        no_line_numbers: bool,
+        /// Line range "start:end" — 0-indexed, end exclusive. Omit to read all.
+        #[arg(long)]
+        range: Option<String>,
+    },
+    /// Create a new block in a context. Mirrors MCP `block_create`. Status
+    /// defaults to Done and content_type to plain — matches the MCP shape.
+    Create {
+        /// Role: user|model|system|tool
+        #[arg(long)]
+        role: String,
+        /// Kind: text|thinking|tool_call|tool_result|drift|file|error|notification|resource|trace
+        #[arg(long)]
+        kind: String,
+        /// Initial text content (empty if omitted)
+        #[arg(long)]
+        content: Option<String>,
+        /// Parent block id for DAG relationship (omit for root)
+        #[arg(long)]
+        parent: Option<String>,
+        /// Block id to insert after (for ordering)
+        #[arg(long)]
+        after: Option<String>,
+        /// Target context: . (default) | .parent | <label> | <hex prefix>
+        #[arg(long, short = 'c')]
+        context: Option<String>,
+    },
+}
+
 impl KjDispatcher {
     pub(crate) fn dispatch_block(&self, argv: &[String], caller: &KjCaller) -> KjResult {
+        // No argv → render help (clap reports DisplayHelp from `--help`; this
+        // covers bare `kj block` for parity with the old hand-rolled path).
         if argv.is_empty() {
-            return KjResult::Err(block_help());
+            return clap_help_for::<BlockArgs>();
         }
-        match argv[0].as_str() {
-            "list" | "ls" => self.block_list(&argv[1..], caller),
-            "inspect" => self.block_inspect(&argv[1..], caller),
-            "count" => self.block_count(&argv[1..], caller),
-            "help" | "--help" | "-h" => {
-                KjResult::ok_ephemeral(block_help(), ContentType::Markdown)
+        let parsed = match BlockArgs::try_parse_from(argv) {
+            Ok(p) => p,
+            Err(e) => {
+                // `--help` / `-h` requests come through as DisplayHelp errors;
+                // route them to ok-ephemeral so kaish prints them and exits 0.
+                if matches!(
+                    e.kind(),
+                    clap::error::ErrorKind::DisplayHelp
+                        | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+                ) {
+                    return KjResult::ok_ephemeral(e.to_string(), ContentType::Plain);
+                }
+                return KjResult::Err(format!("kj block: {e}"));
             }
-            other => KjResult::Err(format!(
-                "kj block: unknown subcommand '{}'\n\n{}",
-                other,
-                block_help()
-            )),
+        };
+        match parsed.command {
+            BlockCommand::List {
+                context,
+                kind,
+                role,
+                status,
+                json,
+            } => self.block_list(context.as_deref(), kind.as_deref(), role.as_deref(), status.as_deref(), json, caller),
+            BlockCommand::Inspect { block_id, json } => self.block_inspect(&block_id, json),
+            BlockCommand::Count {
+                context,
+                kind,
+                role,
+            } => self.block_count(context.as_deref(), kind.as_deref(), role.as_deref(), caller),
+            BlockCommand::Read {
+                block_id,
+                no_line_numbers,
+                range,
+            } => self.block_read(&block_id, !no_line_numbers, range.as_deref()),
+            BlockCommand::Create {
+                role,
+                kind,
+                content,
+                parent,
+                after,
+                context,
+            } => self.block_create(
+                context.as_deref(),
+                &role,
+                &kind,
+                content.as_deref().unwrap_or(""),
+                parent.as_deref(),
+                after.as_deref(),
+                caller,
+            ),
         }
     }
 
-    fn block_list(&self, argv: &[String], caller: &KjCaller) -> KjResult {
-        let json = argv.iter().any(|a| a == "--json");
-        let kind_arg = extract_named_arg(argv, &["--kind"]);
-        let role_arg = extract_named_arg(argv, &["--role"]);
-        let status_arg = extract_named_arg(argv, &["--status"]);
-        let ctx_ref = extract_named_arg(argv, &["--context", "-c"]);
-
+    fn block_list(
+        &self,
+        ctx_ref: Option<&str>,
+        kind_arg: Option<&str>,
+        role_arg: Option<&str>,
+        status_arg: Option<&str>,
+        json: bool,
+        caller: &KjCaller,
+    ) -> KjResult {
         let ctx_id = {
             let db = self.kernel_db().lock();
-            match resolve_context_arg(ctx_ref.as_deref(), caller, &db) {
+            match resolve_context_arg(ctx_ref, caller, &db) {
                 Ok(id) => id,
                 Err(e) => return KjResult::Err(format!("kj block list: {e}")),
             }
@@ -58,22 +190,21 @@ impl KjDispatcher {
             Err(e) => return KjResult::Err(format!("kj block list: {e}")),
         };
 
-        let kf = kind_arg.as_deref().and_then(parse_kind);
-        let rf = role_arg.as_deref().and_then(Role::from_str);
-        let sf = status_arg.as_deref().and_then(Status::from_str);
+        let kf = kind_arg.and_then(parse_kind);
+        let rf = role_arg.and_then(Role::from_str);
+        let sf = status_arg.and_then(Status::from_str);
 
         let filtered: Vec<_> = snapshots
             .iter()
             .filter(|b| {
-                kf.map_or(true, |k| b.kind == k)
-                    && rf.map_or(true, |r| b.role == r)
-                    && sf.map_or(true, |s| b.status == s)
+                kf.is_none_or(|k| b.kind == k)
+                    && rf.is_none_or(|r| b.role == r)
+                    && sf.is_none_or(|s| b.status == s)
             })
             .collect();
 
-        // Build the for-loop iteration payload: a JSON array of block id
-        // strings. `for b in $(kj block list); do echo $b; done` then walks
-        // each id without needing jq.
+        // For-loop iteration payload: JSON array of block id strings so
+        // `for b in $(kj block list); do echo $b; done` walks ids directly.
         let id_array: serde_json::Value = serde_json::Value::Array(
             filtered
                 .iter()
@@ -119,18 +250,12 @@ impl KjDispatcher {
         KjResult::ok_with_data(out, id_array)
     }
 
-    fn block_inspect(&self, argv: &[String], _caller: &KjCaller) -> KjResult {
-        let json = argv.iter().any(|a| a == "--json");
-        let id_str = match argv.iter().find(|a| !a.starts_with("--")) {
-            Some(s) => s.clone(),
-            None => return KjResult::Err("kj block inspect: <block-id> required".into()),
-        };
-
+    fn block_inspect(&self, id_str: &str, json: bool) -> KjResult {
         // Round-trip with the keys `block list` emits: `BlockId::to_key()`
         // uses `_` (legacy `:` still accepted by from_key). Without this,
         // `for b in $(kj block list); do kj block inspect $b; done` would
         // reject every iteration as malformed.
-        let block_id = match kaijutsu_types::BlockId::from_key(&id_str) {
+        let block_id = match kaijutsu_types::BlockId::from_key(id_str) {
             Some(id) => id,
             None => {
                 return KjResult::Err(format!(
@@ -194,14 +319,16 @@ impl KjDispatcher {
         KjResult::ok_with_data(out, record)
     }
 
-    fn block_count(&self, argv: &[String], caller: &KjCaller) -> KjResult {
-        let kind_arg = extract_named_arg(argv, &["--kind"]);
-        let role_arg = extract_named_arg(argv, &["--role"]);
-        let ctx_ref = extract_named_arg(argv, &["--context", "-c"]);
-
+    fn block_count(
+        &self,
+        ctx_ref: Option<&str>,
+        kind_arg: Option<&str>,
+        role_arg: Option<&str>,
+        caller: &KjCaller,
+    ) -> KjResult {
         let ctx_id = {
             let db = self.kernel_db().lock();
-            match resolve_context_arg(ctx_ref.as_deref(), caller, &db) {
+            match resolve_context_arg(ctx_ref, caller, &db) {
                 Ok(id) => id,
                 Err(e) => return KjResult::Err(format!("kj block count: {e}")),
             }
@@ -211,14 +338,204 @@ impl KjDispatcher {
             Ok(s) => s,
             Err(e) => return KjResult::Err(format!("kj block count: {e}")),
         };
-        let kf = kind_arg.as_deref().and_then(parse_kind);
-        let rf = role_arg.as_deref().and_then(Role::from_str);
+        let kf = kind_arg.and_then(parse_kind);
+        let rf = role_arg.and_then(Role::from_str);
         let n = snapshots
             .iter()
-            .filter(|b| kf.map_or(true, |k| b.kind == k) && rf.map_or(true, |r| b.role == r))
+            .filter(|b| kf.is_none_or(|k| b.kind == k) && rf.is_none_or(|r| b.role == r))
             .count();
         KjResult::ok_with_data(n.to_string(), serde_json::json!(n))
     }
+
+    /// Read a block's content. Closes the MCP `block_read` parity gap
+    /// (line numbers + range filtering) — kj inspect only shows metadata,
+    /// this returns the body.
+    fn block_read(&self, id_str: &str, line_numbers: bool, range: Option<&str>) -> KjResult {
+        let block_id = match kaijutsu_types::BlockId::from_key(id_str) {
+            Some(id) => id,
+            None => {
+                return KjResult::Err(format!(
+                    "kj block read: malformed id '{id_str}' (expected context_hex_principal_hex_seq)"
+                ));
+            }
+        };
+        let ctx_id = block_id.context_id;
+
+        let snapshots = match self.blocks.block_snapshots(ctx_id) {
+            Ok(s) => s,
+            Err(e) => return KjResult::Err(format!("kj block read: {e}")),
+        };
+        let snap = match snapshots.iter().find(|b| b.id == block_id) {
+            Some(s) => s,
+            None => {
+                return KjResult::Err(format!(
+                    "kj block read: block '{id_str}' not found in {}",
+                    ctx_id.to_hex()
+                ));
+            }
+        };
+
+        // Range parse: "start:end" — 0-indexed, end exclusive (mirrors
+        // BlockReadRequest.range in kaijutsu-mcp's models.rs).
+        let (start, end) = match range {
+            None => (0usize, usize::MAX),
+            Some(spec) => match parse_range_spec(spec) {
+                Ok(pair) => pair,
+                Err(e) => return KjResult::Err(format!("kj block read: {e}")),
+            },
+        };
+
+        let all_lines: Vec<&str> = snap.content.split('\n').collect();
+        let total = all_lines.len();
+        let end_clamped = end.min(total);
+        if start > end_clamped {
+            return KjResult::Err(format!(
+                "kj block read: range start {start} > clamped end {end_clamped} (block has {total} lines)"
+            ));
+        }
+        let slice = &all_lines[start..end_clamped];
+
+        let mut out = String::new();
+        for (i, line) in slice.iter().enumerate() {
+            if line_numbers {
+                // Display 1-indexed line numbers (matches MCP block_read
+                // convention; range itself stays 0-indexed for slicing).
+                let lineno = start + i + 1;
+                out.push_str(&format!("{:>5}  {}\n", lineno, line));
+            } else {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+
+        let record = serde_json::json!({
+            "block_id": id_str,
+            "context_id": ctx_id.to_hex(),
+            "kind": snap.kind.as_str(),
+            "role": snap.role.as_str(),
+            "total_lines": total,
+            "range_start": start,
+            "range_end": end_clamped,
+            "content_length": snap.content.len(),
+        });
+        KjResult::ok_with_data(out, record)
+    }
+
+    /// Create a new block. Mirrors `block_create` MCP tool semantics: status
+    /// defaults to Done, content_type to Plain. Returns the new block's id
+    /// in both the rendered text and the structured `data` payload so the
+    /// id is iterable (`for id in $(kj block create ...)`).
+    fn block_create(
+        &self,
+        ctx_ref: Option<&str>,
+        role: &str,
+        kind: &str,
+        content: &str,
+        parent: Option<&str>,
+        after: Option<&str>,
+        caller: &KjCaller,
+    ) -> KjResult {
+        let ctx_id = {
+            let db = self.kernel_db().lock();
+            match resolve_context_arg(ctx_ref, caller, &db) {
+                Ok(id) => id,
+                Err(e) => return KjResult::Err(format!("kj block create: {e}")),
+            }
+        };
+        let role_p = match Role::from_str(role) {
+            Some(r) => r,
+            None => {
+                return KjResult::Err(format!(
+                    "kj block create: invalid role '{role}' (expected user|model|system|tool|asset)"
+                ));
+            }
+        };
+        let kind_p = match parse_kind(kind) {
+            Some(k) => k,
+            None => {
+                return KjResult::Err(format!(
+                    "kj block create: invalid kind '{kind}' (expected text|thinking|tool_call|tool_result|drift|file|error|notification|resource|trace)"
+                ));
+            }
+        };
+        let parent_id = match parent {
+            None => None,
+            Some(s) => match kaijutsu_types::BlockId::from_key(s) {
+                Some(id) => Some(id),
+                None => {
+                    return KjResult::Err(format!(
+                        "kj block create: malformed --parent id '{s}'"
+                    ));
+                }
+            },
+        };
+        let after_id = match after {
+            None => None,
+            Some(s) => match kaijutsu_types::BlockId::from_key(s) {
+                Some(id) => Some(id),
+                None => {
+                    return KjResult::Err(format!("kj block create: malformed --after id '{s}'"));
+                }
+            },
+        };
+
+        let new_id = match self.blocks.insert_block_as(
+            ctx_id,
+            parent_id.as_ref(),
+            after_id.as_ref(),
+            role_p,
+            kind_p,
+            content,
+            Status::Done,
+            ContentType::Plain,
+            Some(caller.principal_id),
+        ) {
+            Ok(id) => id,
+            Err(e) => return KjResult::Err(format!("kj block create: {e}")),
+        };
+
+        // Iteration payload is an array of the single new id, matching the
+        // `list` shape so `for id in $(kj block create ...); do …; done`
+        // walks the one block without needing jq.
+        let key = new_id.to_key();
+        KjResult::ok_with_data(
+            format!("{key}\n"),
+            serde_json::Value::Array(vec![serde_json::Value::String(key)]),
+        )
+    }
+}
+
+/// Render the auto-generated clap help text for a parser without going
+/// through `try_parse_from`. Used when argv is empty so we can return the
+/// command's full help instead of clap's parse-error for missing subcommand.
+fn clap_help_for<T: clap::CommandFactory>() -> KjResult {
+    let mut cmd = T::command();
+    KjResult::ok_ephemeral(cmd.render_help().to_string(), ContentType::Plain)
+}
+
+/// Parse "start:end" into (start, end), end exclusive. Either side may be
+/// empty: ":10" → (0, 10), "5:" → (5, usize::MAX). Errors on missing colon,
+/// non-numeric parts, or end < start.
+fn parse_range_spec(spec: &str) -> Result<(usize, usize), String> {
+    let (lhs, rhs) = spec
+        .split_once(':')
+        .ok_or_else(|| format!("range '{spec}' must contain ':' (e.g. '5:10')"))?;
+    let start: usize = if lhs.is_empty() {
+        0
+    } else {
+        lhs.parse()
+            .map_err(|_| format!("range start '{lhs}' is not a non-negative integer"))?
+    };
+    let end: usize = if rhs.is_empty() {
+        usize::MAX
+    } else {
+        rhs.parse()
+            .map_err(|_| format!("range end '{rhs}' is not a non-negative integer"))?
+    };
+    if end < start {
+        return Err(format!("range end {end} < start {start}"));
+    }
+    Ok((start, end))
 }
 
 #[derive(Serialize)]
@@ -229,31 +546,6 @@ struct BlockListRow {
     kind: String,
     status: String,
     content_length: usize,
-}
-
-fn block_help() -> String {
-    "\
-kj block — inspect blocks in a context
-
-Commands:
-  kj block list   [--context <ref>] [--kind <k>] [--role <r>] [--status <s>] [--json]
-  kj block inspect <block-id> [--json]
-  kj block count  [--context <ref>] [--kind <k>] [--role <r>]
-
-Filters:
-  --kind     text | thinking | tool_call | tool_result | drift | file | error | notification | resource
-  --role     user | model | system | tool | asset
-  --status   pending | running | done | error
-  --context  . (current, default) | .parent | <label> | <hex prefix>
-
-Examples:
-  kj block list --json
-  kj block list --context main --kind text --role model
-  kj block count --kind text
-  kj block inspect <ctx>_<agent>_<seq> --json
-  for b in $(kj block list); do kj block inspect $b; done
-"
-    .to_string()
 }
 
 fn parse_kind(s: &str) -> Option<BlockKind> {
@@ -267,6 +559,7 @@ fn parse_kind(s: &str) -> Option<BlockKind> {
         "error" => Some(BlockKind::Error),
         "notification" => Some(BlockKind::Notification),
         "resource" => Some(BlockKind::Resource),
+        "trace" => Some(BlockKind::Trace),
         _ => None,
     }
 }
@@ -291,8 +584,9 @@ fn first_line_trunc(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::kj::test_helpers::*;
-    use kaijutsu_types::{DocKind, PrincipalId};
+    use kaijutsu_types::{BlockKind, ContentType, DocKind, PrincipalId, Role as TypesRole, Status};
 
     fn s(v: &str) -> String {
         v.to_string()
@@ -312,6 +606,30 @@ mod tests {
             .expect("create_document");
         ctx
     }
+
+    /// Insert a Text block directly via BlockStore so block_read tests have
+    /// real content to slice. Returns the inserted block id.
+    fn insert_text_block(
+        d: &crate::kj::KjDispatcher,
+        ctx: kaijutsu_types::ContextId,
+        content: &str,
+    ) -> kaijutsu_types::BlockId {
+        d.block_store()
+            .insert_block_as(
+                ctx,
+                None,
+                None,
+                TypesRole::User,
+                BlockKind::Text,
+                content,
+                Status::Done,
+                ContentType::Plain,
+                None,
+            )
+            .expect("insert_block_as")
+    }
+
+    // ── Existing behavior preserved ───────────────────────────────────
 
     #[tokio::test]
     async fn block_list_empty_context_json() {
@@ -353,7 +671,14 @@ mod tests {
 
         let result = d.dispatch(&[s("block"), s("nonsense")], &c).await;
         assert!(!result.is_ok());
-        assert!(result.message().contains("nonsense"));
+        // clap reports `unrecognized subcommand` (or similar) for the unknown
+        // verb; the legacy hand-rolled path said `unknown subcommand`. Both
+        // messages mention the bad input — that's the testable contract.
+        assert!(
+            result.message().contains("nonsense"),
+            "expected error to mention 'nonsense', got: {}",
+            result.message()
+        );
     }
 
     #[tokio::test]
@@ -365,7 +690,13 @@ mod tests {
 
         let result = d.dispatch(&[s("block"), s("inspect")], &c).await;
         assert!(!result.is_ok());
-        assert!(result.message().contains("required"));
+        // clap's missing-required-arg message names the missing argument.
+        assert!(
+            result.message().to_lowercase().contains("block_id")
+                || result.message().to_lowercase().contains("required"),
+            "expected error about missing required block_id, got: {}",
+            result.message()
+        );
     }
 
     #[tokio::test]
@@ -421,5 +752,388 @@ mod tests {
             }
             other => panic!("expected Ok with data, got {other:?}"),
         }
+    }
+
+    /// `ls` alias must dispatch to `list`. clap `#[command(alias = "ls")]`
+    /// gives us this; the test guards against an accidental removal.
+    #[tokio::test]
+    async fn block_list_ls_alias_works() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let c = caller_with_context(ctx);
+
+        let result = d.dispatch(&[s("block"), s("ls"), s("--json")], &c).await;
+        assert!(result.is_ok(), "ls alias failed: {}", result.message());
+        let v: serde_json::Value = serde_json::from_str(result.message()).unwrap();
+        assert_eq!(v["count"], 0);
+    }
+
+    // ── New: block read ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn block_read_returns_full_content_with_line_numbers() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let bid = insert_text_block(&d, ctx, "alpha\nbeta\ngamma");
+        let c = caller_with_context(ctx);
+
+        let result = d
+            .dispatch(&[s("block"), s("read"), bid.to_key()], &c)
+            .await;
+        assert!(result.is_ok(), "read failed: {}", result.message());
+        let body = result.message();
+        // Line numbers are 1-indexed for display.
+        assert!(body.contains("    1  alpha"), "missing line 1: {body}");
+        assert!(body.contains("    2  beta"), "missing line 2: {body}");
+        assert!(body.contains("    3  gamma"), "missing line 3: {body}");
+    }
+
+    #[tokio::test]
+    async fn block_read_no_line_numbers_strips_prefix() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let bid = insert_text_block(&d, ctx, "alpha\nbeta");
+        let c = caller_with_context(ctx);
+
+        let result = d
+            .dispatch(
+                &[s("block"), s("read"), bid.to_key(), s("--no-line-numbers")],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok());
+        let body = result.message();
+        assert_eq!(body, "alpha\nbeta\n", "raw lines: {body:?}");
+    }
+
+    #[tokio::test]
+    async fn block_read_range_slices_lines() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let bid = insert_text_block(&d, ctx, "0\n1\n2\n3\n4");
+        let c = caller_with_context(ctx);
+
+        // Range "1:3" → lines at indices 1 and 2 ("1" and "2"). End exclusive.
+        let result = d
+            .dispatch(
+                &[
+                    s("block"),
+                    s("read"),
+                    bid.to_key(),
+                    s("--range"),
+                    s("1:3"),
+                    s("--no-line-numbers"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "range read failed: {}", result.message());
+        assert_eq!(result.message(), "1\n2\n", "got: {:?}", result.message());
+    }
+
+    #[tokio::test]
+    async fn block_read_range_open_ended_works() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let bid = insert_text_block(&d, ctx, "a\nb\nc");
+        let c = caller_with_context(ctx);
+
+        // ":2" → first two lines (0..2 exclusive). Matches MCP block_read.
+        let result = d
+            .dispatch(
+                &[
+                    s("block"),
+                    s("read"),
+                    bid.to_key(),
+                    s("--range"),
+                    s(":2"),
+                    s("--no-line-numbers"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(result.message(), "a\nb\n");
+    }
+
+    #[tokio::test]
+    async fn block_read_emits_structured_metadata_record() {
+        use crate::kj::KjResult;
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let bid = insert_text_block(&d, ctx, "x\ny\nz");
+        let c = caller_with_context(ctx);
+
+        let result = d
+            .dispatch(&[s("block"), s("read"), bid.to_key()], &c)
+            .await;
+        match result {
+            KjResult::Ok { data: Some(v), .. } => {
+                assert_eq!(v["total_lines"], 3);
+                assert_eq!(v["range_start"], 0);
+                assert_eq!(v["range_end"], 3);
+                assert_eq!(v["kind"], "text");
+                assert_eq!(v["role"], "user");
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn block_read_missing_block_errors() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let c = caller_with_context(ctx);
+
+        // Construct a syntactically-valid id that points at no block.
+        let phantom = kaijutsu_types::BlockId {
+            context_id: ctx,
+            agent_id: PrincipalId::new(),
+            seq: 999,
+        };
+        let result = d
+            .dispatch(&[s("block"), s("read"), phantom.to_key()], &c)
+            .await;
+        assert!(!result.is_ok());
+        assert!(
+            result.message().contains("not found"),
+            "expected 'not found', got: {}",
+            result.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn block_read_malformed_id_errors() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("c"), None, principal);
+        let c = caller_with_context(ctx);
+
+        let result = d
+            .dispatch(&[s("block"), s("read"), s("garbage")], &c)
+            .await;
+        assert!(!result.is_ok());
+        assert!(result.message().contains("malformed"));
+    }
+
+    // ── New: block create ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn block_create_inserts_text_block_and_returns_id() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let mut c = caller_with_context(ctx);
+        c.principal_id = principal;
+
+        let result = d
+            .dispatch(
+                &[
+                    s("block"),
+                    s("create"),
+                    s("--role"),
+                    s("user"),
+                    s("--kind"),
+                    s("text"),
+                    s("--content"),
+                    s("hello from kj"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "create failed: {}", result.message());
+
+        // The text output is the new block id with a trailing newline.
+        let key = result.message().trim();
+        let parsed = kaijutsu_types::BlockId::from_key(key)
+            .expect("emitted id must be a valid BlockId key");
+        assert_eq!(parsed.context_id, ctx, "block id context mismatch");
+
+        // The block is actually in the store with the right content + role.
+        let snapshots = d.block_store().block_snapshots(ctx).unwrap();
+        let snap = snapshots
+            .iter()
+            .find(|b| b.id == parsed)
+            .expect("created block must be in store");
+        assert_eq!(snap.content, "hello from kj");
+        assert_eq!(snap.role, TypesRole::User);
+        assert_eq!(snap.kind, BlockKind::Text);
+        assert_eq!(snap.status, Status::Done);
+    }
+
+    #[tokio::test]
+    async fn block_create_empty_content_defaults_ok() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let mut c = caller_with_context(ctx);
+        c.principal_id = principal;
+
+        let result = d
+            .dispatch(
+                &[s("block"), s("create"), s("--role"), s("user"), s("--kind"), s("text")],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "empty-content create failed: {}", result.message());
+        let key = result.message().trim();
+        let id = kaijutsu_types::BlockId::from_key(key).unwrap();
+        let snap = d
+            .block_store()
+            .block_snapshots(ctx)
+            .unwrap()
+            .into_iter()
+            .find(|b| b.id == id)
+            .unwrap();
+        assert!(snap.content.is_empty(), "expected empty content");
+    }
+
+    #[tokio::test]
+    async fn block_create_data_is_iterable_array() {
+        use crate::kj::KjResult;
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let mut c = caller_with_context(ctx);
+        c.principal_id = principal;
+
+        let result = d
+            .dispatch(
+                &[s("block"), s("create"), s("--role"), s("user"), s("--kind"), s("text"), s("--content"), s("x")],
+                &c,
+            )
+            .await;
+        match result {
+            KjResult::Ok { data: Some(v), .. } => {
+                let arr = v.as_array().expect("data must be an array");
+                assert_eq!(arr.len(), 1, "single new id, got: {arr:?}");
+                assert!(arr[0].is_string());
+            }
+            other => panic!("expected Ok with array data, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn block_create_invalid_role_errors() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let c = caller_with_context(ctx);
+
+        let result = d
+            .dispatch(
+                &[s("block"), s("create"), s("--role"), s("bogus"), s("--kind"), s("text")],
+                &c,
+            )
+            .await;
+        assert!(!result.is_ok());
+        assert!(
+            result.message().contains("invalid role"),
+            "expected 'invalid role' error, got: {}",
+            result.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn block_create_invalid_kind_errors() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let c = caller_with_context(ctx);
+
+        let result = d
+            .dispatch(
+                &[s("block"), s("create"), s("--role"), s("user"), s("--kind"), s("notakind")],
+                &c,
+            )
+            .await;
+        assert!(!result.is_ok());
+        assert!(
+            result.message().contains("invalid kind"),
+            "expected 'invalid kind' error, got: {}",
+            result.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn block_create_with_parent_links_dag() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let mut c = caller_with_context(ctx);
+        c.principal_id = principal;
+
+        // First block as the parent.
+        let parent_id = insert_text_block(&d, ctx, "root");
+        let result = d
+            .dispatch(
+                &[
+                    s("block"),
+                    s("create"),
+                    s("--role"),
+                    s("user"),
+                    s("--kind"),
+                    s("text"),
+                    s("--content"),
+                    s("child"),
+                    s("--parent"),
+                    parent_id.to_key(),
+                ],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "create-with-parent failed: {}", result.message());
+
+        let child_key = result.message().trim();
+        let child_id = kaijutsu_types::BlockId::from_key(child_key).unwrap();
+        let snap = d
+            .block_store()
+            .block_snapshots(ctx)
+            .unwrap()
+            .into_iter()
+            .find(|b| b.id == child_id)
+            .unwrap();
+        assert_eq!(snap.parent_id, Some(parent_id), "parent edge not set");
+    }
+
+    // ── Range spec parser unit tests ───────────────────────────────────
+
+    #[test]
+    fn parse_range_spec_basic() {
+        assert_eq!(parse_range_spec("0:5").unwrap(), (0, 5));
+        assert_eq!(parse_range_spec("10:20").unwrap(), (10, 20));
+    }
+
+    #[test]
+    fn parse_range_spec_open_ended() {
+        assert_eq!(parse_range_spec(":7").unwrap(), (0, 7));
+        let (start, end) = parse_range_spec("3:").unwrap();
+        assert_eq!(start, 3);
+        assert_eq!(end, usize::MAX);
+    }
+
+    #[test]
+    fn parse_range_spec_rejects_missing_colon() {
+        let err = parse_range_spec("5").unwrap_err();
+        assert!(err.contains(":"), "{err}");
+    }
+
+    #[test]
+    fn parse_range_spec_rejects_inverted_range() {
+        let err = parse_range_spec("10:5").unwrap_err();
+        assert!(err.contains("end"));
+    }
+
+    #[test]
+    fn parse_range_spec_rejects_non_numeric() {
+        assert!(parse_range_spec("a:5").is_err());
+        assert!(parse_range_spec("0:b").is_err());
     }
 }
