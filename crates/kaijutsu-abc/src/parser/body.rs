@@ -122,6 +122,23 @@ pub fn parse_body(
             continue;
         }
 
+        // Invisible-space engraver hint `y` per §6.1. Pure typesetting
+        // marker — silently consume so it doesn't hit the unknown-char
+        // fallback. Followed-by-digit form (`y2`) is also a spec hint;
+        // we drop the count too.
+        if remaining.starts_with('y') {
+            remaining = &remaining[1..];
+            while let Some(c) = remaining.chars().next() {
+                if c.is_ascii_digit() {
+                    remaining = &remaining[c.len_utf8()..];
+                } else {
+                    break;
+                }
+            }
+            at_line_start = false;
+            continue;
+        }
+
         // Voice overlay marker (`&` per §7.4). Consume any run of `&`
         // chars and emit a single Overlay element with the count. The
         // AST does not yet route overlay music into separate tracks.

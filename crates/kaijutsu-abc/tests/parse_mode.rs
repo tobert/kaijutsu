@@ -70,9 +70,9 @@ fn strict_errors_on_body_before_k() {
 
 #[test]
 fn strict_errors_on_unrecognized_construct() {
-    // `y` is the invisible-space engraver hint per §6.1 — not currently
-    // parsed, so it hits the fallback path and must error in strict mode.
-    let abc = "X:1\nT:Test\nK:C\nCDEyFGA|\n";
+    // `j` is not a note, decoration, field, or reserved character — it
+    // hits the unknown-char fallback and must error in strict mode.
+    let abc = "X:1\nT:Test\nK:C\nCDEjFGA|\n";
     let result = parse_with_mode(abc, ParseMode::Strict);
     assert!(
         errors_contain(&result, "Unrecognized construct"),
@@ -127,7 +127,9 @@ fn generous_warns_on_missing_x_field() {
 
 #[test]
 fn generous_warns_on_unrecognized_construct() {
-    let abc = "X:1\nT:Test\nK:C\nCDEyFGA|\n";
+    // `j` hits the unknown-char fallback (not a note, decoration, field,
+    // or reserved char).
+    let abc = "X:1\nT:Test\nK:C\nCDEjFGA|\n";
     let result = parse_with_mode(abc, ParseMode::Generous);
     assert!(
         no_errors(&result),
@@ -156,11 +158,34 @@ fn fragment_silent_on_missing_headers() {
 }
 
 #[test]
+fn invisible_space_y_consumed_silently() {
+    // §6.1: `y` is the invisible-space engraver hint. Should be consumed
+    // without any warning in any mode.
+    let abc = "X:1\nT:Test\nK:C\nCDEyFGA|\n";
+    let result = parse_with_mode(abc, ParseMode::Strict);
+    assert!(
+        no_errors(&result),
+        "y should be silent, got: {:?}",
+        result.feedback,
+    );
+    assert!(
+        !warnings_contain(&result, "unknown") && !warnings_contain(&result, "Unrecognized"),
+        "y should not warn, got: {:?}",
+        result.feedback,
+    );
+
+    // y2 form (with count) — also a no-op
+    let abc = "X:1\nT:Test\nK:C\nCDEy2FGA|\n";
+    let result = parse_with_mode(abc, ParseMode::Strict);
+    assert!(no_errors(&result), "y2 should be silent, got: {:?}", result.feedback);
+}
+
+#[test]
 fn fragment_still_warns_on_unrecognized_construct() {
     // A fragment containing a construct the parser doesn't know
-    // (`y` = invisible-space engraver hint per §6.1). Fragment mode is
-    // about "no header required", not "any byte is fine".
-    let abc = "CDEyFGA";
+    // (`j` is not a note, decoration, field, or reserved char). Fragment
+    // mode is about "no header required", not "any byte is fine".
+    let abc = "CDEjFGA";
     let result = parse_with_mode(abc, ParseMode::Fragment);
     assert!(no_errors(&result));
     assert!(warnings_contain(&result, "Skipping unknown character"));

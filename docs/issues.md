@@ -195,11 +195,6 @@ d43df35). See the `project-live-eval` memory for scope.
   Spec §9 covers both static macros and the transposing form
   `m:~n2 = ...`.
 
-- **`y` invisible-space engraver hint (§6.1).** Used in spec text to
-  hint typesetters. Currently hits the unknown-character fallback —
-  used as the "definitely unknown" canary in `tests/parse_mode.rs`.
-  Trivial to consume as a no-op marker once we want it.
-
 - **Slur grouping in AST.** `Element::Slur(SlurBoundary::Start/End)`
   markers are emitted but slurred notes aren't grouped into a
   `Slur { notes: Vec<_> }` structure, so renderers / MIDI handlers
