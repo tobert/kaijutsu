@@ -159,11 +159,13 @@ fn parse_body_inner(
             continue;
         }
 
-        // Backtick beam-break per §4.7. Pure typesetting hint; AST has
-        // nowhere to record it, so silently consume any run of ` chars.
+        // Backtick beam-break per §4.7. A run of ` chars collapses to
+        // a single `Element::BeamBreak` — renderers use it to split
+        // beam/flag groups; consumers that don't care can ignore it.
         if remaining.starts_with('`') {
             let n = remaining.chars().take_while(|c| *c == '`').count();
             remaining = &remaining[n..];
+            elements.push(Element::BeamBreak);
             at_line_start = false;
             continue;
         }

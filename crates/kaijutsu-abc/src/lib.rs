@@ -357,6 +357,7 @@ fn format_element(output: &mut String, element: &Element) {
         },
         Element::LineBreak => output.push('\n'),
         Element::Space => output.push(' '),
+        Element::BeamBreak => output.push('`'),
         Element::ChordSymbol(symbol) => {
             output.push('"');
             output.push_str(symbol);

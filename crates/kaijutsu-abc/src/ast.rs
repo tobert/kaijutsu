@@ -411,6 +411,11 @@ pub enum Element {
     Overlay { layers: u8 },
     Space,
     LineBreak,
+    /// Explicit beam-break marker (§4.7 backtick). A pure typesetting
+    /// hint that splits a beam group without consuming horizontal
+    /// space. Renderers use it to break flag/beam grouping; consumers
+    /// that don't care can ignore it.
+    BeamBreak,
 }
 
 /// A single note
