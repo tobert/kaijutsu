@@ -33,6 +33,14 @@ kaijutsu/
 └── docs/                     # design-notes.md, telemetry.md, issues.md, etc.
 ```
 
+## Conversation vs Context
+
+**Context** is the durable side: CRDT block log, exclusions, edits, conversation metadata. Multi-writer. Holds more than the live conversation knows about.
+
+**Conversation** is the live session: an append-only message sequence shipped to the LLM. Hydrated from context once at boundary events (fork, new, cold start, attach) and append-only thereafter.
+
+`block exclude` / `block edit` operate on the context and only take effect at the next hydrate boundary — typically fork. To remediate a poisoned conversation (giant tool output, bad turn): exclude in context, then fork. Async events between turns (shell output, drift, MCP calls from sibling agents) queue in a per-context mailbox and flush on the next turn. The mailbox is also the atomicity gate that keeps tool_use+tool_result pairs (and other must-travel-together blocks) from being split by unrelated writers.
+
 ## Autonomous Development Loop
 
 Most testing happens on a Linux server with a real GPU that the user can connect to with remote desktop.
