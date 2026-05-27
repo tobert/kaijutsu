@@ -314,59 +314,81 @@ async fn process_llm_stream(
     interrupt_generation: u64,
     context_interrupts: Arc<TokioRwLock<HashMap<ContextId, Arc<ContextInterruptState>>>>,
 ) {
-    // Get per-context lock — held for the entire stream, serializing
-    // concurrent prompts to the same context (Fix D+E).
+    // Get per-context mailbox lock — held for the entire stream,
+    // serializing concurrent prompts to the same context (Fix D+E).
+    // The mailbox holds the live conversation session (see
+    // docs/conversation-session.md); we own this lock for the
+    // duration of catch_up + snapshot.
     let cache_lock = conversation_cache.get_or_create(context_id);
-    let mut messages = cache_lock.lock().await;
+    let mut mailbox = cache_lock.lock().await;
 
-    // Always re-hydrate from blocks — ensures shell commands, MCP tool calls,
-    // and other agent blocks added between prompts are visible to the LLM.
-    // block_snapshots() reads from in-memory DashMap, sub-millisecond for typical conversations.
-    // The user block was already inserted before this function was called, so
-    // hydrated messages include it — no explicit push needed.
-    match documents.block_snapshots(context_id) {
+    // Catch the mailbox up against the current block log — folds in
+    // any blocks that landed since the last turn (the user prompt
+    // that triggered this call, plus shell commands, MCP tool calls,
+    // drift, etc. from sibling writers). Blocks already folded in
+    // are skipped, so this is O(new blocks), not O(history).
+    // block_snapshots() reads from in-memory DashMap; sub-millisecond
+    // for typical conversations.
+    let mut messages = match documents.block_snapshots(context_id) {
         Ok(blocks) => {
-            let mut hydrated = kaijutsu_kernel::hydrate_from_blocks(&blocks);
-            // Resolve any (Asset, Text, Image) blocks against CAS so vision-
-            // capable providers receive the actual bytes. CAS reads are
-            // blocking std::fs; the resolver delegates each to
-            // spawn_blocking so the runtime stays responsive on stacks of
-            // images. Unresolved hashes fall back to a text marker via
-            // to_rig_request — never panic.
-            //
-            // The per-hash image cache (owned by ConversationCache) skips
-            // disk + base64 work for screenshots already resolved this
-            // session, so a 20-image conversation doesn't re-encode every
-            // turn.
-            let cas: std::sync::Arc<dyn kaijutsu_kernel::ContentStore> = kernel.cas().clone();
-            kaijutsu_kernel::resolve_image_blocks_from_cas(
-                &mut hydrated,
-                cas,
-                Some(conversation_cache.image_cache()),
-            )
-            .await;
+            let new_blocks = mailbox.catch_up(&blocks);
+            let snapshot = mailbox.snapshot();
             log::info!(
-                "Hydrated {} messages from {} blocks for context {}",
-                hydrated.len(),
-                blocks.len(),
+                "Mailbox caught up: +{} new blocks, {} messages on the wire for context {}",
+                new_blocks,
+                snapshot.len(),
                 context_id
             );
-            *messages = hydrated;
+            snapshot
         }
         Err(e) => {
-            // Hydration failed — fall back to appending the user message to
-            // whatever the cache currently holds (may be stale or empty).
-            // TODO: surface this as a user-visible error block instead of silently
-            // falling back. An empty cache means the model sees no history, which
-            // produces confusing responses after cache eviction or first prompt
-            // post-restart. Consider inserting a System block explaining the gap.
+            // Snapshot lookup failed — fall back to whatever the
+            // mailbox already has, plus the user message we were
+            // called with. The mailbox may be empty (first prompt
+            // after cache eviction / kernel restart) or stale; the
+            // appended user message at least lets the model see the
+            // current turn.
+            //
+            // TODO: surface this as a user-visible error block
+            // instead of silently falling back. An empty session
+            // means the model sees no history, which produces
+            // confusing responses. Consider inserting a System block
+            // explaining the gap.
             log::warn!(
-                "Could not hydrate cache for {}: {}, falling back to cache + append",
+                "Could not read blocks for {}: {}, falling back to mailbox snapshot + appended user message",
                 context_id,
                 e
             );
-            messages.push(LlmMessage::user(&content));
+            let mut snapshot = mailbox.snapshot();
+            snapshot.push(LlmMessage::user(&content));
+            snapshot
         }
+    };
+    // mailbox lock is held through the rest of the stream — same
+    // semantics as the previous MutexGuard<Vec<LlmMessage>>: only one
+    // prompt per context proceeds at a time (Fix D+E). `messages` is
+    // a local Vec — the agentic loop appends to it freely, but those
+    // appends don't write through to the mailbox. The next turn's
+    // catch_up picks up the assistant blocks via the block log.
+
+    // Resolve any (Asset, Text, Image) blocks against CAS so
+    // vision-capable providers receive the actual bytes. CAS reads
+    // are blocking std::fs; the resolver delegates each to
+    // spawn_blocking so the runtime stays responsive on stacks of
+    // images. Unresolved hashes fall back to a text marker via
+    // to_rig_request — never panic.
+    //
+    // The per-hash image cache (owned by ConversationCache) skips
+    // disk + base64 work for hashes already resolved this session,
+    // so a 20-image conversation doesn't re-encode every turn.
+    {
+        let cas: std::sync::Arc<dyn kaijutsu_kernel::ContentStore> = kernel.cas().clone();
+        kaijutsu_kernel::resolve_image_blocks_from_cas(
+            &mut messages,
+            cas,
+            Some(conversation_cache.image_cache()),
+        )
+        .await;
     }
     let _ = content; // owned String used only for the hydration-failure fallback path above
 

@@ -19,7 +19,7 @@
 //! [`snapshot`]: ConversationMailbox::snapshot
 //! [`HydrationState`]: super::hydrate::HydrationState
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use kaijutsu_types::{BlockId, BlockSnapshot};
 
@@ -32,10 +32,15 @@ use super::hydrate::HydrationState;
 /// repaired `Vec<Message>` on demand without consuming itself.
 pub struct ConversationMailbox {
     state: HydrationState,
-    /// True once `bootstrap` or `feed` has been called at least once.
-    /// Lets the LLM-stream path tell "I've hydrated this context (and
-    /// it might genuinely be empty)" apart from "cache miss — need to
-    /// hydrate."
+    /// Block ids already folded into `state`. Lets `catch_up` and
+    /// `feed` be idempotent so the LLM-stream path can call
+    /// `catch_up(&block_log)` every turn without paying for blocks
+    /// it has already processed.
+    seen: HashSet<BlockId>,
+    /// True once `bootstrap`, `feed`, or `catch_up` has been called
+    /// at least once. Lets the LLM-stream path tell "I've hydrated
+    /// this context (and it might genuinely be empty)" apart from
+    /// "cache miss — need to hydrate."
     materialized: bool,
 }
 
@@ -44,39 +49,77 @@ impl ConversationMailbox {
     pub fn new() -> Self {
         Self {
             state: HydrationState::new(),
+            seen: HashSet::new(),
             materialized: false,
         }
     }
 
     /// Has anything been fed in yet? Becomes `true` on the first
-    /// `bootstrap` or `feed` call, regardless of whether the input
-    /// was empty.
+    /// `bootstrap`, `feed`, or `catch_up` call, regardless of whether
+    /// the input was empty.
     pub fn is_materialized(&self) -> bool {
         self.materialized
     }
 
+    /// How many blocks have been folded in so far. Useful for
+    /// diagnostics ("hydrated N of M") in the LLM-stream path.
+    pub fn block_count(&self) -> usize {
+        self.seen.len()
+    }
+
     /// Fold a full block batch into the session. Use at boundary
     /// events — fork, new context, cold start, peer attach — when
-    /// the durable log is the source of truth.
+    /// the durable log is the source of truth and the mailbox is
+    /// known to be empty. Idempotent: blocks already seen are
+    /// skipped.
     pub fn bootstrap(&mut self, blocks: &[BlockSnapshot]) {
-        let by_id: HashMap<BlockId, &BlockSnapshot> =
-            blocks.iter().map(|b| (b.id, b)).collect();
-        for block in blocks {
-            let parent = block.parent_id.and_then(|pid| by_id.get(&pid).copied());
-            self.state.translate_block(block, parent);
-        }
-        self.materialized = true;
+        self.catch_up(blocks);
     }
 
     /// Fold one block into the session — incremental path.
+    ///
+    /// Idempotent: a block already folded in is silently skipped, so
+    /// a push subscriber that delivers the same event twice is
+    /// harmless.
     ///
     /// `parent` is consulted only for `BlockKind::Error` blocks (for
     /// fold-into-parent semantics). Callers that don't have the
     /// parent on hand can pass `None`; the Error block then falls
     /// back to a standalone user message.
     pub fn feed(&mut self, block: &BlockSnapshot, parent: Option<&BlockSnapshot>) {
+        if self.seen.contains(&block.id) {
+            return;
+        }
         self.state.translate_block(block, parent);
+        self.seen.insert(block.id);
         self.materialized = true;
+    }
+
+    /// Catch up against the full current block log — fold any blocks
+    /// not yet seen, in their committed order. Returns the number
+    /// of new blocks folded in.
+    ///
+    /// This is the pull-based incremental path: the LLM-stream
+    /// caller hands over the current `block_snapshots(context_id)`
+    /// result every turn, the mailbox reconciles against its own
+    /// high-water mark, and only the delta is processed. Cheaper
+    /// than re-hydrating the entire conversation, and works without
+    /// a separate BlockFlow subscriber.
+    pub fn catch_up(&mut self, blocks: &[BlockSnapshot]) -> usize {
+        let by_id: HashMap<BlockId, &BlockSnapshot> =
+            blocks.iter().map(|b| (b.id, b)).collect();
+        let mut new_blocks = 0usize;
+        for block in blocks {
+            if self.seen.contains(&block.id) {
+                continue;
+            }
+            let parent = block.parent_id.and_then(|pid| by_id.get(&pid).copied());
+            self.state.translate_block(block, parent);
+            self.seen.insert(block.id);
+            new_blocks += 1;
+        }
+        self.materialized = true;
+        new_blocks
     }
 
     /// Return the current wire-history view.
@@ -303,5 +346,93 @@ mod tests {
             assistant_text_of(&msgs[1]),
             "assistant message text identical across snapshots"
         );
+    }
+
+    #[test]
+    fn catch_up_only_processes_unseen_blocks() {
+        let initial = vec![
+            user_text("hello"),
+            model_text("hi"),
+        ];
+        let extended = {
+            let mut v = initial.clone();
+            v.push(user_text("more"));
+            v.push(model_text("more reply"));
+            v
+        };
+
+        let mut mb = ConversationMailbox::new();
+        let first = mb.catch_up(&initial);
+        assert_eq!(first, 2, "first catch_up processes all blocks");
+        assert_eq!(mb.block_count(), 2);
+
+        let second = mb.catch_up(&extended);
+        assert_eq!(second, 2, "second catch_up processes only the delta");
+        assert_eq!(mb.block_count(), 4);
+    }
+
+    #[test]
+    fn catch_up_is_idempotent_when_no_new_blocks() {
+        let blocks = vec![user_text("once"), model_text("only")];
+        let mut mb = ConversationMailbox::new();
+        let first = mb.catch_up(&blocks);
+        let second = mb.catch_up(&blocks);
+        let third = mb.catch_up(&blocks);
+
+        assert_eq!(first, 2);
+        assert_eq!(second, 0);
+        assert_eq!(third, 0);
+
+        // Snapshot stays stable across repeated no-op catch_ups.
+        let snap_a = mb.snapshot();
+        let snap_b = mb.snapshot();
+        assert_eq!(snap_a.len(), snap_b.len());
+        for (a, b) in snap_a.iter().zip(snap_b.iter()) {
+            assert_eq!(a.role, b.role);
+            assert_eq!(a.as_text(), b.as_text());
+        }
+    }
+
+    #[test]
+    fn feed_is_idempotent_for_duplicate_delivery() {
+        let block = user_text("only once please");
+        let mut mb = ConversationMailbox::new();
+        mb.feed(&block, None);
+        mb.feed(&block, None);
+        mb.feed(&block, None);
+
+        let msgs = mb.snapshot();
+        assert_eq!(
+            msgs.len(),
+            1,
+            "duplicate feed for same block id must not double-emit"
+        );
+        assert_eq!(mb.block_count(), 1);
+    }
+
+    #[test]
+    fn catch_up_matches_direct_hydrate_for_a_full_log() {
+        let blocks = vec![
+            user_text("first"),
+            model_text("first reply"),
+            user_text("second"),
+            model_text("second reply"),
+            user_text("third"),
+            model_text("third reply"),
+        ];
+
+        let direct = hydrate_from_blocks(&blocks);
+
+        // Walk the log in two chunks to exercise the incremental path.
+        let mut mb = ConversationMailbox::new();
+        mb.catch_up(&blocks[..3]);
+        mb.catch_up(&blocks); // full set; should fold only the remaining 3
+        let via_catch_up = mb.snapshot();
+
+        assert_eq!(direct.len(), via_catch_up.len());
+        for (a, b) in direct.iter().zip(via_catch_up.iter()) {
+            assert_eq!(a.role, b.role);
+            assert_eq!(a.as_text(), b.as_text());
+        }
     }
 }

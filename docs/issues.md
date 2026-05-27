@@ -52,6 +52,16 @@ following are explicit follow-ups that did not ship:
   framing; revisit if extended thinking lands and the stale-reasoning
   cost is worth the token spend.
 
+- **Push subscriber for ConversationMailbox.** Slice A wires the
+  mailbox in pull mode — `catch_up(&block_snapshots)` reconciles
+  against the durable log once per turn. A push subscriber on
+  `BlockFlow::Inserted` would let the mailbox stay current between
+  turns without re-reading the full block list. Defer until: (a) a
+  second async-event source needs the gate (drift, peer tool calls),
+  or (b) per-turn `catch_up` shows up as a hot path. See
+  `docs/conversation-session.md` and
+  `architecture_context_invariants` memory.
+
 ## Persistence & sync
 
 - **`KernelDb` connection pool.** Currently `Arc<parking_lot::Mutex<KernelDb>>`

@@ -85,11 +85,12 @@ use kaijutsu_kernel::{
     // Config
     ConfigCrdtBackend,
     ConfigWatcherHandle,
+    // Conversation session
+    ConversationMailbox,
     InputDocFlow,
     InvokeRequest,
     InvokeResponse,
     Kernel,
-    LlmMessage,
     LocalBackend,
     // Peers (drift navigation transport)
     PeerConfig,
@@ -144,18 +145,23 @@ fn extract_rpc_trace(
 // Server State
 // ============================================================================
 
-/// Per-context LLM conversation cache with per-context locking and LRU eviction.
+/// Per-context conversation sessions, each behind its own lock so
+/// concurrent prompts to the same context serialize properly.
 ///
-/// Each context gets its own `tokio::sync::Mutex<Vec<LlmMessage>>`, so concurrent
-/// prompts to the same context serialize properly. DashMap provides the outer
-/// concurrent access. LRU eviction keeps memory bounded.
+/// Each entry is a [`ConversationMailbox`] — the live, append-only
+/// session for that context (see `docs/conversation-session.md`).
+/// The LLM-stream path calls `mailbox.catch_up(&block_snapshots)` to
+/// fold any blocks that landed since the last turn, then `snapshot()`
+/// for the wire-history view. DashMap provides outer concurrent
+/// access; LRU eviction keeps memory bounded — an evicted context
+/// re-hydrates from blocks on next touch.
 ///
 /// Also owns the per-hash [`ImageBase64Cache`] so resolving the same
-/// screenshot every turn doesn't re-encode bytes. The image cache is keyed
-/// by content hash (global) but shares lifetime with this struct because
-/// both belong to the same LLM-stream subsystem.
+/// screenshot every turn doesn't re-encode bytes. The image cache is
+/// keyed by content hash (global) but shares lifetime with this
+/// struct because both belong to the same LLM-stream subsystem.
 pub struct ConversationCache {
-    entries: dashmap::DashMap<ContextId, Arc<tokio::sync::Mutex<Vec<LlmMessage>>>>,
+    entries: dashmap::DashMap<ContextId, Arc<tokio::sync::Mutex<ConversationMailbox>>>,
     last_accessed: dashmap::DashMap<ContextId, std::time::Instant>,
     max_contexts: usize,
     image_cache: Arc<kaijutsu_kernel::llm::image_cache::ImageBase64Cache>,
@@ -184,9 +190,14 @@ impl ConversationCache {
         &self.image_cache
     }
 
-    /// Get or create the per-context lock. Returns an Arc<Mutex> that the caller
-    /// holds for the entire `process_llm_stream` — serializing concurrent prompts.
-    pub fn get_or_create(&self, ctx: ContextId) -> Arc<tokio::sync::Mutex<Vec<LlmMessage>>> {
+    /// Get or create the per-context mailbox lock. Returns an
+    /// `Arc<Mutex<ConversationMailbox>>` — the caller holds the lock
+    /// for the entire `process_llm_stream`, serializing concurrent
+    /// prompts to the same context.
+    pub fn get_or_create(
+        &self,
+        ctx: ContextId,
+    ) -> Arc<tokio::sync::Mutex<ConversationMailbox>> {
         self.last_accessed.insert(ctx, std::time::Instant::now());
 
         if let Some(entry) = self.entries.get(&ctx) {
@@ -215,7 +226,7 @@ impl ConversationCache {
             }
         }
 
-        let lock = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let lock = Arc::new(tokio::sync::Mutex::new(ConversationMailbox::new()));
         self.entries.insert(ctx, lock.clone());
         lock
     }

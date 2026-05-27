@@ -75,6 +75,8 @@ pub use llm::{
     // Tool definitions
     ToolDefinition as LlmToolDefinition,
     Usage as LlmUsage,
+    // Conversation session
+    ConversationMailbox,
     // Hydration
     hydrate_from_blocks,
     resolve_image_blocks_from_cas,
