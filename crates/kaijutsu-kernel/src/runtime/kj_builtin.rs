@@ -362,6 +362,10 @@ impl Tool for KjBuiltin {
             // `kj rc add --timeout <secs>` — per-script wall-clock budget
             // for .kai execution; omit to inherit the kernel default.
             .param(ParamSchema::optional("timeout", "string", Value::String(String::new()), "Per-script wall-clock budget in seconds (kj rc add)"))
+            // `kj rc add|edit --content <body>` — script body. Declared so
+            // kaish treats `--content "multi\nline"` as a named arg
+            // (consuming the next positional) rather than a bool flag.
+            .param(ParamSchema::optional("content", "string", Value::String(String::new()), "Script body (kj rc add / edit). Pipe stdin to omit."))
             .example("Discover commands", "kj help")
             .example("View context topology", "kj context list --tree")
             .example("Create isolated workspace", "kj fork --name debug-auth")
@@ -422,6 +426,22 @@ impl Tool for KjBuiltin {
         // Extract --confirm <nonce> before dispatch
         let confirm_nonce = crate::kj::parse::extract_named_arg(&argv, &["--confirm"]);
         crate::kj::parse::strip_named_arg(&mut argv, &["--confirm"]);
+
+        // Stdin → --content for `kj rc add` / `kj rc edit`. Lets shell
+        // pipelines author multi-line .md / .kai scripts:
+        //   cat prompt.md | kj rc add /etc/rc/coder/create/S00-stance.md
+        // Only kicks in when --content was not given explicitly. Single
+        // consumer for now; if more kj subcommands grow stdin appetite,
+        // promote this to the dispatcher signature.
+        if argv.first().map(|s| s.as_str()) == Some("rc")
+            && matches!(argv.get(1).map(|s| s.as_str()), Some("add") | Some("edit"))
+            && !crate::kj::parse::has_flag(&argv, &["--content"])
+            && let Some(body) = ctx.read_stdin_to_string().await
+            && !body.is_empty()
+        {
+            argv.push("--content".into());
+            argv.push(body);
+        }
 
         let mut caller = KjCaller {
             principal_id: self.principal_id,
@@ -807,6 +827,74 @@ mod tests {
             Some(Value::Int(0)),
             "expected scalar Int(0) in .data, got {:?}",
             res.data,
+        );
+    }
+
+    /// Piped stdin populates `--content` for `kj rc add` when the flag is
+    /// omitted. Without the injection in `KjBuiltin::execute`, `rc add`
+    /// would error with "missing content" and the documented
+    /// `echo … | kj rc add …` example would never have worked.
+    #[tokio::test]
+    async fn pipe_stdin_provides_rc_add_content() {
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+
+        let principal = PrincipalId::new();
+        let ctx = register_context(&dispatcher, Some("stdinhost"), None, principal);
+        let kaish = embedded_with_kj(dispatcher, ctx).await;
+
+        let script = r#"
+            echo 'hello from pipe' | kj rc add /etc/rc/stditest/create/S00-from-pipe.kai
+            kj rc show /etc/rc/stditest/create/S00-from-pipe.kai
+        "#;
+        let res = kaish
+            .execute_with_options(script, ExecuteOptions::default())
+            .await
+            .expect("kaish exec");
+        assert!(res.ok(), "pipe-into-rc-add exit != 0: {res:?}");
+
+        let stdout = res.text_out();
+        assert!(
+            stdout.contains("hello from pipe"),
+            "stdin content didn't reach the script: {stdout}"
+        );
+        // Make sure the old "missing --content" error didn't leak through.
+        assert!(
+            !stdout.contains("missing content")
+                && !stdout.contains("missing --content"),
+            "rc add still reported missing content despite piped stdin: {stdout}"
+        );
+    }
+
+    /// Explicit `--content` wins over stdin: pipe + flag → flag's value
+    /// ends up persisted. Guards the precedence promised by the help text.
+    #[tokio::test]
+    async fn explicit_content_wins_over_stdin() {
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+
+        let principal = PrincipalId::new();
+        let ctx = register_context(&dispatcher, Some("stdinhost2"), None, principal);
+        let kaish = embedded_with_kj(dispatcher, ctx).await;
+
+        let script = r#"
+            echo 'from stdin' | kj rc add /etc/rc/stditest2/create/S00-flag-wins.kai --content 'from flag'
+            kj rc show /etc/rc/stditest2/create/S00-flag-wins.kai
+        "#;
+        let res = kaish
+            .execute_with_options(script, ExecuteOptions::default())
+            .await
+            .expect("kaish exec");
+        assert!(res.ok(), "flag-wins exit != 0: {res:?}");
+
+        let stdout = res.text_out();
+        assert!(
+            stdout.contains("from flag"),
+            "explicit --content didn't win: {stdout}"
+        );
+        assert!(
+            !stdout.contains("from stdin"),
+            "stdin leaked when --content was provided: {stdout}"
         );
     }
 }

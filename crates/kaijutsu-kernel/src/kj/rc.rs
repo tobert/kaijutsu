@@ -70,6 +70,9 @@ impl KjDispatcher {
             "add" => self.rc_add(argv, caller),
             "list" | "ls" => self.rc_list(argv),
             "rm" | "remove" => self.rc_rm(argv),
+            "show" | "cat" => self.rc_show(argv),
+            "edit" | "update" => self.rc_edit(argv),
+            "reseed" => self.rc_reseed(argv),
             "help" | "--help" | "-h" => {
                 KjResult::ok_ephemeral(self.rc_help(), ContentType::Markdown)
             }
@@ -91,9 +94,16 @@ encodes everything: `/etc/rc/<context_type>/<verb>/SXX-name.{kai,md}`.
 
 ## Commands
 
-- `kj rc add <path> --content <body> [--timeout <secs>]` — install a script
+- `kj rc add <path> [--content <body>] [--timeout <secs>]` — install a script
 - `kj rc list [--type=...] [--verb=...]` — list installed scripts
+- `kj rc show <path> [--json]` — print one script's content + metadata
+- `kj rc edit <path> [--content <body>] [--timeout <secs>]` — update content / timeout (preserves created_at)
 - `kj rc rm <path>` — remove a script
+- `kj rc reseed [--type <ctx_type>]` — overwrite built-in seed scripts from the in-code defaults (destructive: clobbers user edits to seeded paths)
+
+`--content` may be omitted when content is piped on stdin (e.g.
+`cat prompt.md | kj rc add /etc/rc/...`). Explicit `--content` wins
+when both are supplied.
 
 `--timeout` sets a per-script wall-clock budget for `.kai` execution;
 omit to inherit the kernel default. `.md` scripts ignore it.
@@ -147,8 +157,9 @@ kj context create my-plan --type=planner
             Some(c) => c,
             None => {
                 return KjResult::Err(
-                    "kj rc add: missing --content <body>\n\
-                     (stdin support is a follow-up; pipe via --content for now)"
+                    "kj rc add: missing content\n\
+                     usage: kj rc add <path> --content <body>\n\
+                     or:    <something producing the body> | kj rc add <path>"
                         .to_string(),
                 );
             }
@@ -250,6 +261,168 @@ kj context create my-plan --type=planner
         KjResult::ok_with_data(lines.join("\n"), paths)
     }
 
+    fn rc_show(&self, argv: &[String]) -> KjResult {
+        let path = match argv.get(1) {
+            Some(p) => p.clone(),
+            None => {
+                return KjResult::Err(
+                    "kj rc show: missing <path>\nusage: kj rc show <path> [--json]"
+                        .to_string(),
+                );
+            }
+        };
+        let json = super::parse::has_flag(argv, &["--json"]);
+
+        let row = {
+            let db = self.kernel_db().lock();
+            match db.get_rc_script(&path) {
+                Ok(Some(r)) => r,
+                Ok(None) => {
+                    return KjResult::Err(format!("kj rc show: '{path}' not found"));
+                }
+                Err(e) => return KjResult::Err(format!("kj rc show: {e}")),
+            }
+        };
+
+        let timeout_json = match row.timeout_secs {
+            Some(n) => serde_json::Value::Number(n.into()),
+            None => serde_json::Value::Null,
+        };
+        let record = serde_json::json!({
+            "path": row.path,
+            "context_type": row.context_type,
+            "verb": row.verb,
+            "sort_key": row.sort_key,
+            "name": row.name,
+            "extension": row.extension,
+            "timeout_secs": timeout_json,
+            "created_at": row.created_at,
+            "created_by": row.created_by.to_hex(),
+            "content_length": row.content.len(),
+            "content": row.content,
+        });
+
+        if json {
+            return KjResult::ok_with_data(record.to_string(), record);
+        }
+
+        let timeout_str = row
+            .timeout_secs
+            .map(|n| format!("{n}s"))
+            .unwrap_or_else(|| "(kernel default)".into());
+        // Fence content with the extension so .md renders as markdown and
+        // .kai displays as a shell-ish block in surfaces that highlight it.
+        let fence_tag = row.extension.as_str();
+        let out = format!(
+            "path:       {}\ntype:       {}\nverb:       {}\nsort_key:   {}\nname:       {}\nextension:  {}\ntimeout:    {}\ncreated_at: {}\ncreated_by: {}\nlength:     {} bytes\n\n```{}\n{}\n```\n",
+            row.path,
+            row.context_type,
+            row.verb,
+            row.sort_key,
+            row.name,
+            row.extension,
+            timeout_str,
+            row.created_at,
+            row.created_by.to_hex(),
+            row.content.len(),
+            fence_tag,
+            row.content,
+        );
+        KjResult::ok_typed_with_data(out, ContentType::Markdown, record)
+    }
+
+    fn rc_edit(&self, argv: &[String]) -> KjResult {
+        let path = match argv.get(1) {
+            Some(p) => p.clone(),
+            None => {
+                return KjResult::Err(
+                    "kj rc edit: missing <path>\n\
+                     usage: kj rc edit <path> [--content <body>] [--timeout <secs>]"
+                        .to_string(),
+                );
+            }
+        };
+
+        let content = extract_named_arg(argv, &["--content"]);
+        let timeout_raw = extract_named_arg(argv, &["--timeout"]);
+
+        if content.is_none() && timeout_raw.is_none() {
+            return KjResult::Err(
+                "kj rc edit: nothing to change\n\
+                 supply --content <body> and/or --timeout <secs>"
+                    .to_string(),
+            );
+        }
+
+        // Parse timeout if present. Allow `--timeout 0` to mean "clear
+        // the per-script override" (revert to kernel default) — this is
+        // the one path to drop a previously-set timeout without
+        // rm/add-ing the script. `rc add` still rejects 0 because there
+        // it would be the only signal you'd given for `.kai` budget.
+        let timeout_change: Option<Option<u32>> = match timeout_raw {
+            None => None,
+            Some(s) => match s.parse::<u32>() {
+                Ok(0) => Some(None),
+                Ok(n) => Some(Some(n)),
+                Err(_) => {
+                    return KjResult::Err(format!(
+                        "kj rc edit: --timeout must be a non-negative integer (got '{s}'; \
+                         use 0 to clear)"
+                    ));
+                }
+            },
+        };
+
+        let db = self.kernel_db().lock();
+        match db.update_rc_script(&path, content.as_deref(), timeout_change) {
+            Ok(true) => {
+                let mut changed: Vec<&str> = Vec::new();
+                if content.is_some() {
+                    changed.push("content");
+                }
+                if timeout_change.is_some() {
+                    changed.push("timeout");
+                }
+                KjResult::ok(format!(
+                    "edited rc script '{}' ({})",
+                    path,
+                    changed.join(", ")
+                ))
+            }
+            Ok(false) => KjResult::Err(format!("kj rc edit: '{path}' not found")),
+            Err(e) => KjResult::Err(format!("kj rc edit: {e}")),
+        }
+    }
+
+    fn rc_reseed(&self, argv: &[String]) -> KjResult {
+        let type_filter = extract_named_arg(argv, &["--type"]);
+
+        if let Some(t) = type_filter.as_deref() {
+            let allowed = crate::seed_scripts::seeded_context_types();
+            if !allowed.contains(&t) {
+                return KjResult::Err(format!(
+                    "kj rc reseed: '{t}' has no built-in seed scripts\n\
+                     known context_types with seeds: {}",
+                    allowed.join(", ")
+                ));
+            }
+        }
+
+        let db = self.kernel_db().lock();
+        match db.reseed_rc_scripts(type_filter.as_deref()) {
+            Ok(count) => {
+                let scope = match &type_filter {
+                    Some(t) => format!(" (context_type={t})"),
+                    None => String::new(),
+                };
+                KjResult::ok(format!(
+                    "reseeded {count} rc script(s){scope} from in-code defaults"
+                ))
+            }
+            Err(e) => KjResult::Err(format!("kj rc reseed: {e}")),
+        }
+    }
+
     fn rc_rm(&self, argv: &[String]) -> KjResult {
         let path = match argv.get(1) {
             Some(p) => p.clone(),
@@ -324,6 +497,297 @@ mod tests {
         // no-op them until those hooks land.
         assert!(parse_rc_path("/etc/rc/test/attach/S00-foo.md").is_ok());
         assert!(parse_rc_path("/etc/rc/test/drift/S00-foo.kai").is_ok());
+    }
+
+    /// `kj rc show <path>` round-trips content from an earlier `kj rc add`
+    /// and surfaces the metadata fields (path, type, verb, ext, timeout).
+    #[tokio::test]
+    async fn rc_show_round_trips_content_and_metadata() {
+        use crate::kj::test_helpers::*;
+        use crate::kj::KjResult;
+
+        let d = test_dispatcher().await;
+        let c = test_caller();
+        let s = |v: &str| v.to_string();
+
+        d.dispatch(
+            &[
+                s("rc"),
+                s("add"),
+                s("/etc/rc/showtest/create/S00-hello.kai"),
+                s("--content"),
+                s("echo hi"),
+                s("--timeout"),
+                s("30"),
+            ],
+            &c,
+        )
+        .await;
+
+        let result = d
+            .dispatch(
+                &[
+                    s("rc"),
+                    s("show"),
+                    s("/etc/rc/showtest/create/S00-hello.kai"),
+                ],
+                &c,
+            )
+            .await;
+        match result {
+            KjResult::Ok {
+                message,
+                data: Some(v),
+                ..
+            } => {
+                let obj = v.as_object().expect("show emits an object");
+                assert_eq!(obj["context_type"].as_str(), Some("showtest"));
+                assert_eq!(obj["verb"].as_str(), Some("create"));
+                assert_eq!(obj["sort_key"].as_str(), Some("S00"));
+                assert_eq!(obj["name"].as_str(), Some("hello"));
+                assert_eq!(obj["extension"].as_str(), Some("kai"));
+                assert_eq!(obj["timeout_secs"].as_u64(), Some(30));
+                assert_eq!(obj["content"].as_str(), Some("echo hi"));
+                assert!(message.contains("echo hi"), "fenced content in message: {message}");
+                assert!(message.contains("```kai"), "extension-tagged fence: {message}");
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
+    }
+
+    /// `kj rc show <unknown>` is an error, not a silent empty result.
+    #[tokio::test]
+    async fn rc_show_missing_path_errors() {
+        use crate::kj::test_helpers::*;
+        use crate::kj::KjResult;
+
+        let d = test_dispatcher().await;
+        let c = test_caller();
+        let s = |v: &str| v.to_string();
+
+        let result = d
+            .dispatch(
+                &[s("rc"), s("show"), s("/etc/rc/none/create/S00-noop.kai")],
+                &c,
+            )
+            .await;
+        match result {
+            KjResult::Err(msg) => assert!(msg.contains("not found"), "msg: {msg}"),
+            other => panic!("expected Err, got {other:?}"),
+        }
+    }
+
+    /// `kj rc edit` updates content while preserving created_at/created_by.
+    #[tokio::test]
+    async fn rc_edit_updates_content_preserves_metadata() {
+        use crate::kj::test_helpers::*;
+        use crate::kj::KjResult;
+
+        let d = test_dispatcher().await;
+        let c = test_caller();
+        let s = |v: &str| v.to_string();
+
+        d.dispatch(
+            &[
+                s("rc"),
+                s("add"),
+                s("/etc/rc/edittest/create/S00-foo.kai"),
+                s("--content"),
+                s("echo old"),
+            ],
+            &c,
+        )
+        .await;
+
+        // Snapshot the original metadata.
+        let before = d
+            .kernel_db()
+            .lock()
+            .get_rc_script("/etc/rc/edittest/create/S00-foo.kai")
+            .unwrap()
+            .unwrap();
+
+        let result = d
+            .dispatch(
+                &[
+                    s("rc"),
+                    s("edit"),
+                    s("/etc/rc/edittest/create/S00-foo.kai"),
+                    s("--content"),
+                    s("echo new"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(matches!(result, KjResult::Ok { .. }), "edit failed: {result:?}");
+
+        let after = d
+            .kernel_db()
+            .lock()
+            .get_rc_script("/etc/rc/edittest/create/S00-foo.kai")
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.content, "echo new");
+        assert_eq!(after.created_at, before.created_at, "created_at should be preserved");
+        assert_eq!(after.created_by, before.created_by, "created_by should be preserved");
+    }
+
+    /// `kj rc edit --timeout 0` clears the per-script override (back to
+    /// kernel default). Distinct from `rc add`, which rejects 0 because
+    /// it would be the only timeout signal in the install path.
+    #[tokio::test]
+    async fn rc_edit_timeout_zero_clears_override() {
+        use crate::kj::test_helpers::*;
+
+        let d = test_dispatcher().await;
+        let c = test_caller();
+        let s = |v: &str| v.to_string();
+
+        d.dispatch(
+            &[
+                s("rc"),
+                s("add"),
+                s("/etc/rc/edittest/create/S05-with-timeout.kai"),
+                s("--content"),
+                s("true"),
+                s("--timeout"),
+                s("45"),
+            ],
+            &c,
+        )
+        .await;
+
+        let pre = d
+            .kernel_db()
+            .lock()
+            .get_rc_script("/etc/rc/edittest/create/S05-with-timeout.kai")
+            .unwrap()
+            .unwrap();
+        assert_eq!(pre.timeout_secs, Some(45));
+
+        d.dispatch(
+            &[
+                s("rc"),
+                s("edit"),
+                s("/etc/rc/edittest/create/S05-with-timeout.kai"),
+                s("--timeout"),
+                s("0"),
+            ],
+            &c,
+        )
+        .await;
+
+        let post = d
+            .kernel_db()
+            .lock()
+            .get_rc_script("/etc/rc/edittest/create/S05-with-timeout.kai")
+            .unwrap()
+            .unwrap();
+        assert_eq!(post.timeout_secs, None, "0 should clear the override");
+    }
+
+    /// `kj rc edit` with no fields to change is a user error, not a no-op.
+    #[tokio::test]
+    async fn rc_edit_requires_at_least_one_field() {
+        use crate::kj::test_helpers::*;
+        use crate::kj::KjResult;
+
+        let d = test_dispatcher().await;
+        let c = test_caller();
+        let s = |v: &str| v.to_string();
+
+        d.dispatch(
+            &[
+                s("rc"),
+                s("add"),
+                s("/etc/rc/edittest/create/S10-bare.kai"),
+                s("--content"),
+                s("noop"),
+            ],
+            &c,
+        )
+        .await;
+
+        let result = d
+            .dispatch(
+                &[
+                    s("rc"),
+                    s("edit"),
+                    s("/etc/rc/edittest/create/S10-bare.kai"),
+                ],
+                &c,
+            )
+            .await;
+        match result {
+            KjResult::Err(msg) => {
+                assert!(msg.contains("nothing to change"), "msg: {msg}")
+            }
+            other => panic!("expected Err, got {other:?}"),
+        }
+    }
+
+    /// `kj rc reseed` overwrites user edits on seeded paths.
+    #[tokio::test]
+    async fn rc_reseed_overwrites_user_edit_on_seeded_path() {
+        use crate::kj::test_helpers::*;
+        use crate::kj::KjResult;
+
+        let d = test_dispatcher().await;
+        let c = test_caller();
+        let s = |v: &str| v.to_string();
+
+        // Edit a default seed (test_dispatcher's KernelDb has seeds because
+        // it goes through ensure_seeded_rc_scripts).
+        d.dispatch(
+            &[
+                s("rc"),
+                s("edit"),
+                s("/etc/rc/default/create/S20-cache.kai"),
+                s("--content"),
+                s("# user override"),
+            ],
+            &c,
+        )
+        .await;
+
+        let result = d.dispatch(&[s("rc"), s("reseed")], &c).await;
+        assert!(matches!(result, KjResult::Ok { .. }), "reseed failed: {result:?}");
+
+        let row = d
+            .kernel_db()
+            .lock()
+            .get_rc_script("/etc/rc/default/create/S20-cache.kai")
+            .unwrap()
+            .unwrap();
+        assert!(
+            row.content.contains("kj cache add --target tools"),
+            "reseed didn't restore: {}",
+            row.content
+        );
+    }
+
+    /// `kj rc reseed --type unknown` errors instead of silently no-oping.
+    #[tokio::test]
+    async fn rc_reseed_unknown_type_errors() {
+        use crate::kj::test_helpers::*;
+        use crate::kj::KjResult;
+
+        let d = test_dispatcher().await;
+        let c = test_caller();
+        let s = |v: &str| v.to_string();
+
+        let result = d
+            .dispatch(
+                &[s("rc"), s("reseed"), s("--type"), s("nope")],
+                &c,
+            )
+            .await;
+        match result {
+            KjResult::Err(msg) => {
+                assert!(msg.contains("no built-in seed"), "msg: {msg}")
+            }
+            other => panic!("expected Err, got {other:?}"),
+        }
     }
 
     /// `kj rc list` emits full absolute paths as iteration handles so

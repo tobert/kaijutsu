@@ -569,7 +569,7 @@ CREATE INDEX IF NOT EXISTS idx_cache_breakpoints_ctx
 // BLOB helpers
 // ============================================================================
 
-fn blob_param(id: &[u8; 16]) -> &[u8] {
+pub(crate) fn blob_param(id: &[u8; 16]) -> &[u8] {
     id.as_slice()
 }
 
@@ -816,7 +816,10 @@ impl KernelDb {
     /// Open or create at the given path.
     ///
     /// The DB schema is the single source of truth — there are no
-    /// migrations. Bumping the schema requires wiping the DB.
+    /// migrations. Bumping the schema requires wiping the DB. Built-in
+    /// rc lifecycle scripts (see `seed_scripts`) are seeded at every
+    /// open via INSERT OR IGNORE; user edits to seeded paths survive,
+    /// `kj rc rm` of a seeded path re-installs it on the next open.
     pub fn open<P: AsRef<Path>>(path: P) -> KernelDbResult<Self> {
         if let Some(parent) = path.as_ref().parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -825,6 +828,7 @@ impl KernelDb {
         Self::init_connection(&conn)?;
         conn.execute_batch(SCHEMA)?;
         Self::ensure_singleton_kernel(&conn)?;
+        crate::seed_scripts::ensure_seeded_rc_scripts(&conn)?;
         Ok(Self { conn })
     }
 
@@ -834,7 +838,17 @@ impl KernelDb {
         Self::init_connection(&conn)?;
         conn.execute_batch(SCHEMA)?;
         Self::ensure_singleton_kernel(&conn)?;
+        crate::seed_scripts::ensure_seeded_rc_scripts(&conn)?;
         Ok(Self { conn })
+    }
+
+    /// Force-overwrite built-in rc scripts from the in-code seed
+    /// (see `seed_scripts::SEED_SCRIPTS`). Powers `kj rc reseed`. With
+    /// `type_filter = Some(t)`, only scripts for context_type `t` are
+    /// touched; non-seed scripts are untouched in either case. Returns
+    /// the number of rows reseeded.
+    pub fn reseed_rc_scripts(&self, type_filter: Option<&str>) -> KernelDbResult<usize> {
+        Ok(crate::seed_scripts::reseed_rc_scripts(&self.conn, type_filter)?)
     }
 
     // ========================================================================
@@ -1971,6 +1985,52 @@ impl KernelDb {
             params![path],
         )?;
         Ok(deleted > 0)
+    }
+
+    /// Update an existing rc script's mutable fields (content, timeout)
+    /// while preserving structural metadata (context_type, verb, sort_key,
+    /// name, extension, created_at, created_by). `None` for a field leaves
+    /// it untouched. Returns true if the row existed.
+    pub fn update_rc_script(
+        &self,
+        path: &str,
+        content: Option<&str>,
+        timeout_secs: Option<Option<u32>>,
+    ) -> KernelDbResult<bool> {
+        // Build the UPDATE dynamically so callers can change just one
+        // field without forcing the other through a get-then-set dance.
+        // At least one of (content, timeout_secs) must be Some, otherwise
+        // the SQL has nothing to set.
+        if content.is_none() && timeout_secs.is_none() {
+            return Err(KernelDbError::Validation(
+                "update_rc_script: at least one of content or timeout_secs must be provided"
+                    .into(),
+            ));
+        }
+
+        let mut sets: Vec<&str> = Vec::new();
+        let mut binds: Vec<rusqlite::types::Value> = Vec::new();
+        if let Some(c) = content {
+            sets.push("content = ?");
+            binds.push(c.to_string().into());
+        }
+        if let Some(t) = timeout_secs {
+            sets.push("timeout_secs = ?");
+            binds.push(match t {
+                Some(n) => (n as i64).into(),
+                None => rusqlite::types::Value::Null,
+            });
+        }
+        let sql = format!(
+            "UPDATE rc_scripts SET {} WHERE path = ?",
+            sets.join(", ")
+        );
+        binds.push(path.to_string().into());
+
+        let updated = self
+            .conn
+            .execute(&sql, rusqlite::params_from_iter(binds.iter()))?;
+        Ok(updated > 0)
     }
 
     // ========================================================================

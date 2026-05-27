@@ -12,6 +12,15 @@ staffs.
 Kaijutsu's stdio MCP server offers most of its capabilities and can be called as a hook
 from client applications.
 
+## Stance
+
+The kernel restates the cybernetic / 改善 / TDD coding posture in its
+own rc lifecycle: `/etc/rc/coder/create/S00-stance.md` reaches the
+model via the system-prompt slot for every context with
+`context_type=coder`. That's the authoritative source inside the
+kernel; edit it with `kj rc edit /etc/rc/coder/create/S00-stance.md`
+and `kj rc reseed` restores the in-code default.
+
 ## Crate Structure
 
 ```
