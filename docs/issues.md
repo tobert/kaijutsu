@@ -184,11 +184,6 @@ d43df35). See the `project-live-eval` memory for scope.
   Spec §9 covers both static macros and the transposing form
   `m:~n2 = ...`.
 
-- **Slur grouping in AST.** `Element::Slur(SlurBoundary::Start/End)`
-  markers are emitted but slurred notes aren't grouped into a
-  `Slur { notes: Vec<_> }` structure, so renderers / MIDI handlers
-  can't tell which notes are inside a slur without tracking depth.
-
 - **`%%` stylesheet directives.** Currently treated as comments and
   silently skipped (only `%%MIDI program` is parsed, in the header
   path). A general directive AST node would let downstream consumers

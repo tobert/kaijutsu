@@ -148,6 +148,11 @@ fn transpose_element(element: &mut Element, semitones: i8) {
                 transpose_note(note, semitones);
             }
         }
+        Element::SlurGroup { elements } => {
+            for elem in elements {
+                transpose_element(elem, semitones);
+            }
+        }
         _ => {}
     }
 }
@@ -390,9 +395,15 @@ fn format_element(output: &mut String, element: &Element) {
                 output.push('&');
             }
         }
+        Element::SlurGroup { elements: inner } => {
+            output.push('(');
+            for elem in inner {
+                format_element(output, elem);
+            }
+            output.push(')');
+        }
         Element::InlineField(_)
         | Element::Decoration(_)
-        | Element::Slur(_)
         | Element::VoiceSwitch(_) => {}
     }
 }

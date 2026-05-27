@@ -45,10 +45,15 @@ fn parse_body_inner(
     user_symbols: &mut HashMap<char, String>,
     expansion_depth: u8,
 ) -> Vec<Element> {
-    let mut elements = Vec::new();
+    let mut elements: Vec<Element> = Vec::new();
     let mut remaining = input;
     let mut line_num = 1;
     let mut linebreak = linebreak;
+    // Outer scopes paused while we accumulate a slur's inner elements.
+    // On `(` the current `elements` is pushed here and a fresh inner
+    // vec takes its place; on `)` we pop, wrap the inner as
+    // `Element::SlurGroup`, and resume the outer.
+    let mut slur_stack: Vec<Vec<Element>> = Vec::new();
     // Tracks whether `remaining` is positioned at the start of a body
     // line. Field-style markers like `w:` are only valid at line start,
     // so this flag is what distinguishes the lyric line `w: doh re mi`
@@ -232,6 +237,34 @@ fn parse_body_inner(
             continue;
         }
 
+        // Slur open: `(` not followed by a digit (tuplets `(3…` are
+        // matched later by `try_parse_element`). Push the current
+        // scope and accumulate inner elements into a fresh vec.
+        if remaining.starts_with('(')
+            && !remaining.chars().nth(1).is_some_and(|c| c.is_ascii_digit())
+        {
+            remaining = &remaining[1..];
+            let outer = std::mem::take(&mut elements);
+            slur_stack.push(outer);
+            at_line_start = false;
+            continue;
+        }
+
+        // Slur close: `)`. Wrap the inner scope as `SlurGroup` and
+        // append it to the resumed outer scope. An unmatched `)` warns
+        // and is silently dropped.
+        if remaining.starts_with(')') {
+            remaining = &remaining[1..];
+            if let Some(outer) = slur_stack.pop() {
+                let inner = std::mem::replace(&mut elements, outer);
+                elements.push(Element::SlurGroup { elements: inner });
+            } else {
+                collector.warning("Unmatched `)` — no open slur");
+            }
+            at_line_start = false;
+            continue;
+        }
+
         // U:-defined redefinable symbol per spec §4.16. If the lead
         // char has been bound (in header or via inline `U:`), splice
         // the expansion in via a recursive body parse. Recursion is
@@ -303,6 +336,14 @@ fn parse_body_inner(
         }
     }
 
+    // Unclosed slurs at end of body: warn and flatten the inner
+    // elements into the outer so notes aren't lost.
+    while let Some(outer) = slur_stack.pop() {
+        let inner = std::mem::replace(&mut elements, outer);
+        collector.warning("Unclosed slur — `(` without matching `)`");
+        elements.extend(inner);
+    }
+
     elements
 }
 
@@ -337,8 +378,7 @@ fn try_broken_rhythm(remaining: &mut &str, elements: &mut Vec<Element>) -> bool 
         Element::Space
         | Element::LineBreak
         | Element::ChordSymbol(_)
-        | Element::Decoration(_)
-        | Element::Slur(_) => None,
+        | Element::Decoration(_) => None,
         _ => Some(Err(())),
     });
     let prev_idx = match prev_idx {
@@ -521,16 +561,6 @@ fn try_parse_element(input: &mut &str, collector: &mut FeedbackCollector) -> Opt
     // Try decoration
     if let Some(dec) = try_parse_decoration(input) {
         return Some(Element::Decoration(dec));
-    }
-
-    // Try slur
-    if input.starts_with('(') && !input.chars().nth(1).is_some_and(|c| c.is_ascii_digit()) {
-        *input = &input[1..];
-        return Some(Element::Slur(crate::ast::SlurBoundary::Start));
-    }
-    if input.starts_with(')') {
-        *input = &input[1..];
-        return Some(Element::Slur(crate::ast::SlurBoundary::End));
     }
 
     // Try note (must be last as it's most general for single chars)

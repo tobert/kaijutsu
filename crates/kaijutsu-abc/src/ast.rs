@@ -386,7 +386,10 @@ pub enum Element {
     ChordSymbol(String),
     InlineField(InfoField),
     Decoration(Decoration),
-    Slur(SlurBoundary),
+    /// A slurred group `( … )`. Spec §4.11 allows nesting, so the inner
+    /// `elements` list may itself contain `SlurGroup` entries. Renderers
+    /// draw a curve from the first to the last note of each group.
+    SlurGroup { elements: Vec<Element> },
     VoiceSwitch(String), // Switch to voice with given ID
     /// Lyrics line. `aligned` distinguishes `w:` (true, aligns to preceding
     /// music line per §5) from `W:` (false, words shown after the tune).
@@ -562,12 +565,6 @@ impl Tuplet {
             elements,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SlurBoundary {
-    Start,
-    End,
 }
 
 /// Decorations (articulations, ornaments, dynamics)

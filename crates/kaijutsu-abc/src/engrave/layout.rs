@@ -4,6 +4,30 @@ use crate::ast::*;
 use crate::engrave::font::font_cache;
 use crate::engrave::ir::{EngravingElement, EngravingOptions, SourceSpan};
 
+/// Layout walks the AST as a flat token stream; nested `SlurGroup`s are
+/// expanded into explicit Start/End boundaries so the slur-stack logic
+/// can treat them like the old `Element::Slur(SlurBoundary::*)` markers.
+enum LayoutToken<'a> {
+    Real(&'a Element),
+    SlurStart,
+    SlurEnd,
+}
+
+fn flatten_for_layout<'a>(elements: &'a [Element]) -> Vec<LayoutToken<'a>> {
+    let mut out = Vec::with_capacity(elements.len());
+    for e in elements {
+        match e {
+            Element::SlurGroup { elements: inner } => {
+                out.push(LayoutToken::SlurStart);
+                out.extend(flatten_for_layout(inner));
+                out.push(LayoutToken::SlurEnd);
+            }
+            _ => out.push(LayoutToken::Real(e)),
+        }
+    }
+    out
+}
+
 // --- Clef geometry ----------------------------------------------------------
 
 /// SMuFL codepoint and reference-line staff position (in sp units, where
@@ -338,7 +362,27 @@ fn render_staff(
     // Element::Lyrics{aligned:true} is encountered.
     let mut lyric_anchors: Vec<NoteAnchor> = Vec::new();
 
-    for element in &voice.elements {
+    // Walk a flattened token stream so nested `Element::SlurGroup`s map
+    // back to the explicit Start/End boundaries the slur_stack expects.
+    let tokens = flatten_for_layout(&voice.elements);
+    for token in tokens {
+        let element: &Element = match token {
+            LayoutToken::Real(e) => e,
+            LayoutToken::SlurStart => {
+                slur_stack.push(None);
+                continue;
+            }
+            LayoutToken::SlurEnd => {
+                if let Some(Some(start)) = slur_stack.pop() {
+                    if let Some(end) = last_anchor {
+                        emit_tie_or_slur(elements, start, end, ctx, /*is_tie=*/ false);
+                    }
+                }
+                // SlurEnd with no matching open (or empty group): drop
+                // silently. The parser already warns on unbalanced slurs.
+                continue;
+            }
+        };
         match element {
             Element::Note(note) => {
                 let span = (0usize, 0usize);
@@ -399,18 +443,11 @@ fn render_staff(
             } => {
                 cursor_x = emit_grace_notes(elements, notes, *acciaccatura, cursor_x, ctx);
             }
-            Element::Slur(SlurBoundary::Start) => {
-                slur_stack.push(None);
-            }
-            Element::Slur(SlurBoundary::End) => {
-                if let Some(Some(start)) = slur_stack.pop() {
-                    if let Some(end) = last_anchor {
-                        emit_tie_or_slur(elements, start, end, ctx, /*is_tie=*/ false);
-                    }
-                }
-                // Slur::End with no matching open (or no notes inside): silently
-                // ignore. The parser already warns on unbalanced slurs.
-            }
+            // SlurGroup is flattened to SlurStart/SlurEnd tokens before
+            // this match runs, so it should never reach here.
+            Element::SlurGroup { .. } => unreachable!(
+                "SlurGroup should have been flattened by flatten_for_layout"
+            ),
             Element::Chord(chord) => {
                 let span = (0usize, 0usize);
                 let dur_width = duration_to_width(&chord.duration, unit_width);

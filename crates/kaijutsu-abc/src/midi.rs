@@ -33,6 +33,22 @@ fn apply_pitch_offset(base_pitch: u8, offset: i16) -> u8 {
     ((base_pitch as i16) + offset).clamp(0, 127) as u8
 }
 
+/// Flatten `Element::SlurGroup` nesting away. Slurs have no MIDI
+/// semantics; their inner notes need to be heard as if the brackets
+/// weren't there.
+fn flatten_slurs(elements: &[Element]) -> Vec<Element> {
+    let mut out = Vec::with_capacity(elements.len());
+    for e in elements {
+        match e {
+            Element::SlurGroup { elements: inner } => {
+                out.extend(flatten_slurs(inner));
+            }
+            other => out.push(other.clone()),
+        }
+    }
+    out
+}
+
 /// Expand repeats in a voice's elements.
 ///
 /// Handles `|:` ... `:|` simple repeats. First/second endings are passed through unchanged.
@@ -135,8 +151,9 @@ pub fn generate(tune: &Tune, params: &MidiParams) -> Vec<u8> {
         // Get pitch offset from voice properties (transpose, octave)
         let pitch_offset = get_voice_pitch_offset(voice, &tune.header.voice_defs);
 
-        // Expand repeats before processing
-        let elements = expand_repeats(&voice.elements);
+        // Strip slur grouping (MIDI-irrelevant), then expand repeats.
+        let flat = flatten_slurs(&voice.elements);
+        let elements = expand_repeats(&flat);
 
         // Bar-scoped accidentals reset at each bar line
         let mut bar_accidentals = key_accidentals.clone();
@@ -321,7 +338,8 @@ fn generate_multitrack(tune: &Tune, params: &MidiParams) -> Vec<u8> {
             writer.program_change_channel(program, channel);
         }
 
-        let elements = expand_repeats(&voice.elements);
+        let flat = flatten_slurs(&voice.elements);
+        let elements = expand_repeats(&flat);
         let mut bar_accidentals = key_accidentals.clone();
         let mut held_notes: HashMap<u8, u32> = HashMap::new();
 
