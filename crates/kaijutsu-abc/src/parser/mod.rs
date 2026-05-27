@@ -8,10 +8,30 @@ mod header;
 mod key;
 mod note;
 
-use crate::ast::{Element, Header, InfoField, Tune, Voice};
+use crate::ast::{Element, Header, InfoField, LinebreakMode, Tune, Voice};
 use crate::feedback::{FeedbackCollector, ParseResult};
 use crate::ParseMode;
 use std::collections::HashMap;
+
+/// Derive [`LinebreakMode`] from `I:linebreak …` entries in `header`.
+/// Searches both `other_fields` (where header `I:` fields live today).
+pub(super) fn linebreak_mode_from_header(header: &Header) -> LinebreakMode {
+    for f in &header.other_fields {
+        if f.field_type != 'I' {
+            continue;
+        }
+        if let Some(rest) = f.value.trim().strip_prefix("linebreak") {
+            let marker = rest.trim();
+            return match marker {
+                "$" => LinebreakMode::Dollar,
+                "!" => LinebreakMode::Bang,
+                "<none>" | "none" => LinebreakMode::None,
+                _ => LinebreakMode::Eol,
+            };
+        }
+    }
+    LinebreakMode::Eol
+}
 
 /// Strip an inline `%` comment tail from a line per spec §3.1.
 ///
@@ -70,7 +90,8 @@ pub fn parse(input: &str, mode: ParseMode) -> ParseResult<Vec<Tune>> {
 
 fn parse_one_tune(input: &str, collector: &mut FeedbackCollector, mode: ParseMode) -> Tune {
     let (remaining, header) = header::parse_header(input, collector, mode);
-    let elements = body::parse_body(remaining, collector, mode);
+    let linebreak = linebreak_mode_from_header(&header);
+    let elements = body::parse_body(remaining, collector, mode, linebreak);
     let voices = route_elements_to_voices(&header.voice_defs, elements);
     Tune { header, voices }
 }
@@ -304,6 +325,54 @@ mod tests {
             })
         );
         assert_eq!(result.value[0].header.key.root, NoteName::C);
+    }
+
+    #[test]
+    fn linebreak_dollar_emits_linebreak() {
+        // I:linebreak $ in header turns `$` into a score line-break.
+        let abc = "X:1\nT:Test\nI:linebreak $\nK:C\nCDE$FGA|\n";
+        let result = crate::parse(abc);
+        assert!(!result.has_errors(), "feedback: {:?}", result.feedback);
+        let break_count = result.value[0].voices[0]
+            .elements
+            .iter()
+            .filter(|e| matches!(e, Element::LineBreak))
+            .count();
+        // Two breaks: the `$` and the trailing newline.
+        assert_eq!(
+            break_count, 2,
+            "expected 2 LineBreak elements (1 from `$` + 1 from \\n), got {}: {:?}",
+            break_count, result.value[0].voices[0].elements,
+        );
+    }
+
+    #[test]
+    fn linebreak_dollar_off_by_default() {
+        // Without I:linebreak $, `$` should hit the unknown-char path.
+        let abc = "X:1\nT:Test\nK:C\nCDE$FGA|\n";
+        let result = crate::parse(abc);
+        let warned = result
+            .feedback
+            .iter()
+            .any(|f| f.message.contains("$") || f.message.contains("unknown"));
+        assert!(
+            warned,
+            "expected unknown-char warning for `$` without directive, got: {:?}",
+            result.feedback,
+        );
+    }
+
+    #[test]
+    fn linebreak_dollar_inline_in_body_takes_effect() {
+        // Inline I:linebreak $ mid-body switches mode for the rest.
+        let abc = "X:1\nT:Test\nK:C\nCDE|\nI:linebreak $\nFGA$BCD|\n";
+        let result = crate::parse(abc);
+        assert!(!result.has_errors(), "feedback: {:?}", result.feedback);
+        let has_dollar_break = result.value[0].voices[0]
+            .elements
+            .iter()
+            .any(|e| matches!(e, Element::LineBreak));
+        assert!(has_dollar_break, "expected at least one LineBreak");
     }
 
     #[test]

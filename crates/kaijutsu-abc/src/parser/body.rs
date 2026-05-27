@@ -2,7 +2,7 @@
 
 use winnow::prelude::*;
 
-use crate::ast::{Bar, Element, InfoField, Tuplet};
+use crate::ast::{Bar, Element, InfoField, LinebreakMode, Tuplet};
 use crate::feedback::FeedbackCollector;
 use crate::ParseMode;
 
@@ -24,10 +24,12 @@ pub fn parse_body(
     input: &str,
     collector: &mut FeedbackCollector,
     mode: ParseMode,
+    linebreak: LinebreakMode,
 ) -> Vec<Element> {
     let mut elements = Vec::new();
     let mut remaining = input;
     let mut line_num = 1;
+    let mut linebreak = linebreak;
     // Tracks whether `remaining` is positioned at the start of a body
     // line. Field-style markers like `w:` are only valid at line start,
     // so this flag is what distinguishes the lyric line `w: doh re mi`
@@ -64,6 +66,19 @@ pub fn parse_body(
             // try_parse_element as VoiceSwitch so multi-voice routing
             // keeps working.
             if let Some(field) = try_parse_line_start_info_field(&mut remaining) {
+                // An inline `I:linebreak …` field updates the active
+                // linebreak mode mid-body so `$` recognition can be
+                // toggled per spec §6.1.
+                if field.field_type == 'I' {
+                    if let Some(rest) = field.value.trim().strip_prefix("linebreak") {
+                        linebreak = match rest.trim() {
+                            "$" => LinebreakMode::Dollar,
+                            "!" => LinebreakMode::Bang,
+                            "<none>" | "none" => LinebreakMode::None,
+                            _ => LinebreakMode::Eol,
+                        };
+                    }
+                }
                 elements.push(Element::InlineField(field));
                 at_line_start = false;
                 continue;
@@ -118,6 +133,16 @@ pub fn parse_body(
         if remaining.starts_with('`') {
             let n = remaining.chars().take_while(|c| *c == '`').count();
             remaining = &remaining[n..];
+            at_line_start = false;
+            continue;
+        }
+
+        // `$` line-break marker per §6.1 (`I:linebreak $`). Only acts
+        // when the directive has put us in Dollar mode; otherwise falls
+        // through to the unknown-character path.
+        if remaining.starts_with('$') && linebreak == LinebreakMode::Dollar {
+            remaining = &remaining[1..];
+            elements.push(Element::LineBreak);
             at_line_start = false;
             continue;
         }
@@ -831,7 +856,7 @@ mod tests {
     #[test]
     fn test_parse_simple_body() {
         let mut collector = FeedbackCollector::new();
-        let elements = parse_body("CDEF|", &mut collector, ParseMode::Generous);
+        let elements = parse_body("CDEF|", &mut collector, ParseMode::Generous, LinebreakMode::Eol);
 
         let notes: Vec<_> = elements
             .iter()
@@ -848,7 +873,7 @@ mod tests {
     #[test]
     fn test_parse_bar_types() {
         let mut collector = FeedbackCollector::new();
-        let elements = parse_body("|:C:|D||E|]", &mut collector, ParseMode::Generous);
+        let elements = parse_body("|:C:|D||E|]", &mut collector, ParseMode::Generous, LinebreakMode::Eol);
 
         let bars: Vec<_> = elements
             .iter()
@@ -867,7 +892,7 @@ mod tests {
     #[test]
     fn test_parse_triplet() {
         let mut collector = FeedbackCollector::new();
-        let elements = parse_body("(3CDE", &mut collector, ParseMode::Generous);
+        let elements = parse_body("(3CDE", &mut collector, ParseMode::Generous, LinebreakMode::Eol);
 
         let tuplets: Vec<_> = elements
             .iter()
@@ -886,7 +911,7 @@ mod tests {
     #[test]
     fn test_parse_grace_notes() {
         let mut collector = FeedbackCollector::new();
-        let elements = parse_body("{g}A", &mut collector, ParseMode::Generous);
+        let elements = parse_body("{g}A", &mut collector, ParseMode::Generous, LinebreakMode::Eol);
 
         let graces: Vec<_> = elements
             .iter()
@@ -899,7 +924,7 @@ mod tests {
     #[test]
     fn test_parse_acciaccatura() {
         let mut collector = FeedbackCollector::new();
-        let elements = parse_body("{/g}A", &mut collector, ParseMode::Generous);
+        let elements = parse_body("{/g}A", &mut collector, ParseMode::Generous, LinebreakMode::Eol);
 
         let graces: Vec<_> = elements
             .iter()
@@ -916,7 +941,7 @@ mod tests {
     #[test]
     fn test_parse_decorations() {
         let mut collector = FeedbackCollector::new();
-        let elements = parse_body(".C~D!trill!E", &mut collector, ParseMode::Generous);
+        let elements = parse_body(".C~D!trill!E", &mut collector, ParseMode::Generous, LinebreakMode::Eol);
 
         let decorations: Vec<_> = elements
             .iter()
@@ -932,7 +957,7 @@ mod tests {
     #[test]
     fn test_parse_inline_field() {
         let mut collector = FeedbackCollector::new();
-        let elements = parse_body("CD[M:3/4]EF", &mut collector, ParseMode::Generous);
+        let elements = parse_body("CD[M:3/4]EF", &mut collector, ParseMode::Generous, LinebreakMode::Eol);
 
         let fields: Vec<_> = elements
             .iter()
@@ -950,7 +975,7 @@ mod tests {
     #[test]
     fn test_parse_comments() {
         let mut collector = FeedbackCollector::new();
-        let elements = parse_body("CD % comment\nEF", &mut collector, ParseMode::Generous);
+        let elements = parse_body("CD % comment\nEF", &mut collector, ParseMode::Generous, LinebreakMode::Eol);
 
         let notes: Vec<_> = elements
             .iter()
@@ -968,7 +993,7 @@ mod tests {
         use crate::feedback::FeedbackLevel;
 
         let mut collector = FeedbackCollector::new();
-        let _elements = parse_body("CD\n%%MIDI program 56\nEF", &mut collector, ParseMode::Generous);
+        let _elements = parse_body("CD\n%%MIDI program 56\nEF", &mut collector, ParseMode::Generous, LinebreakMode::Eol);
 
         // Should have a warning about %%MIDI in body
         let warnings: Vec<_> = collector

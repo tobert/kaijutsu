@@ -172,10 +172,11 @@ d43df35). See the `project-live-eval` memory for scope.
   track an explicit-vs-default flag, or move default-filling into a
   separate post-parse pass that consults the file header first.
 
-- **`$` line-break + `I:linebreak` directive (§6.1).** `I:linebreak $`
-  enables `$` as an explicit score line-break marker in the body. Not
-  implemented — `$` hits the unknown-character fallback. Also affects
-  `I:linebreak <none>` / `<EOL>` mode selection.
+- **`I:linebreak` `<none>` / `!` mode selection.** `I:linebreak $`
+  now recognizes `$` as a line-break marker (§6.1); the dialect modes
+  `<none>` (suppress all auto breaks) and `!` (decoration-collision
+  marker) are still no-ops, and `I:linebreak $` does not yet suppress
+  source-newline breaks per the spec.
 
 - **`U:` user-defined symbol expansion.** `U:T = !trill!` is captured
   in `Header::other_fields` but the body parser doesn't apply the

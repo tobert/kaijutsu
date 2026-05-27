@@ -312,6 +312,25 @@ pub struct InfoField {
     pub value: String,
 }
 
+/// Score line-break mode per spec §6.1 (`I:linebreak …`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LinebreakMode {
+    /// Default: source line endings produce score line breaks.
+    /// (`I:linebreak <EOL>`.)
+    #[default]
+    Eol,
+    /// `$` is the explicit line-break marker. (`I:linebreak $`.)
+    /// In a complete implementation, newlines stop producing breaks
+    /// here; the current MVP only adds `$` recognition.
+    Dollar,
+    /// `!` is the line-break marker (collides with decorations).
+    /// (`I:linebreak !`.) Not yet acted on.
+    Bang,
+    /// No automatic line breaks except at blank lines.
+    /// (`I:linebreak <none>`.) Not yet acted on.
+    None,
+}
+
 /// Voice definition from V: field in header
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VoiceDef {
