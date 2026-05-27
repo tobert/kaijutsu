@@ -318,7 +318,8 @@ fn try_parse_line_start_info_field(remaining: &mut &str) -> Option<InfoField> {
     }
     let after = &remaining[2..];
     let line_end = after.find('\n').unwrap_or(after.len());
-    let value = after[..line_end].trim().to_string();
+    // Strip inline `% comment` tail per spec §3.1.
+    let value = super::strip_inline_comment(after[..line_end].trim()).to_string();
     *remaining = &after[line_end..];
     Some(InfoField {
         field_type: letter,

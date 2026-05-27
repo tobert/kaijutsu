@@ -13,6 +13,24 @@ use crate::feedback::{FeedbackCollector, ParseResult};
 use crate::ParseMode;
 use std::collections::HashMap;
 
+/// Strip an inline `%` comment tail from a line per spec §3.1.
+///
+/// `%` introduces an end-of-line comment anywhere on a line, including
+/// inside field values, so `M:3/4    % meter` must read `M:3/4` not
+/// `3/4 % meter`. `\%` is an escape sequence for a literal `%` and is
+/// preserved. Trailing whitespace from the stripped tail is removed.
+pub(super) fn strip_inline_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && (i == 0 || bytes[i - 1] != b'\\') {
+            return line[..i].trim_end();
+        }
+        i += 1;
+    }
+    line.trim_end()
+}
+
 /// Parse ABC notation into a list of Tune ASTs.
 ///
 /// A `.abc` source may contain a file-level header (anything before the
@@ -96,6 +114,7 @@ fn parse_file_header_fields(input: &str) -> Header {
         if trimmed.is_empty() || trimmed.starts_with('%') {
             continue;
         }
+        let trimmed = strip_inline_comment(trimmed);
         if trimmed.len() < 2 || trimmed.chars().nth(1) != Some(':') {
             continue;
         }
@@ -244,6 +263,48 @@ fn route_elements_to_voices(
 #[cfg(test)]
 mod tests {
     use crate::ast::*;
+
+    #[test]
+    fn strip_inline_comment_basic() {
+        assert_eq!(super::strip_inline_comment("3/4"), "3/4");
+        assert_eq!(super::strip_inline_comment("3/4 % meter"), "3/4");
+        assert_eq!(super::strip_inline_comment("3/4% meter"), "3/4");
+        assert_eq!(super::strip_inline_comment("% only comment"), "");
+        assert_eq!(super::strip_inline_comment("a\\%b % real"), "a\\%b");
+    }
+
+    #[test]
+    fn header_strips_inline_comments_in_field_values() {
+        // Spec §3.1: `%` starts a comment even inside field values.
+        let abc = "X:1                   % tune no 1\nT:Test         % the title\nM:3/4                 % meter\nL:1/8 % unit\nK:C   % key\nCDE|\n";
+        let result = crate::parse(abc);
+
+        // No warnings about invalid values for X:/M:/L:/K:
+        for fb in &result.feedback {
+            assert!(
+                !fb.message.contains("Invalid"),
+                "unexpected complaint about field value: {:?}",
+                fb,
+            );
+        }
+        assert_eq!(result.value[0].header.reference, 1);
+        assert_eq!(result.value[0].header.title, "Test");
+        assert_eq!(
+            result.value[0].header.meter,
+            Some(Meter::Simple {
+                numerator: 3,
+                denominator: 4,
+            })
+        );
+        assert_eq!(
+            result.value[0].header.unit_length,
+            Some(UnitLength {
+                numerator: 1,
+                denominator: 8,
+            })
+        );
+        assert_eq!(result.value[0].header.key.root, NoteName::C);
+    }
 
     #[test]
     fn test_parse_minimal() {

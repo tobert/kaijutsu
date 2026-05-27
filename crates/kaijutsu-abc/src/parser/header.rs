@@ -27,7 +27,11 @@ pub fn parse_header<'a>(
 
         // Handle %%MIDI directives before skipping comments
         if let Some(directive) = trimmed.strip_prefix("%%MIDI") {
-            parse_midi_directive(directive.trim(), &mut header, collector);
+            parse_midi_directive(
+                super::strip_inline_comment(directive.trim()),
+                &mut header,
+                collector,
+            );
             line_num += 1;
             remaining = &remaining[line.len()..];
             if remaining.starts_with('\n') {
@@ -49,6 +53,9 @@ pub fn parse_header<'a>(
             }
             continue;
         }
+
+        // Strip inline `% comment` tail per spec §3.1.
+        let trimmed = super::strip_inline_comment(trimmed);
 
         // Check for field format. The first char must be an ASCII
         // letter — without that guard, lines like `|: faf` would be

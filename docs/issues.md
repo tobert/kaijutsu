@@ -172,13 +172,6 @@ d43df35). See the `project-live-eval` memory for scope.
   track an explicit-vs-default flag, or move default-filling into a
   separate post-parse pass that consults the file header first.
 
-- **Inline `%` comments inside field values.** Lines like
-  `X:1                   % tune no 1` or `M:3/4                 % meter`
-  feed the trailing `% comment` text into the field-value parser,
-  producing "Invalid X: value" / "Invalid meter" warnings. Spec §3.1
-  treats `%` as an end-of-line comment marker even inside field
-  values. Strip `% ...` from value strings before parsing.
-
 - **`$` line-break + `I:linebreak` directive (§6.1).** `I:linebreak $`
   enables `$` as an explicit score line-break marker in the body. Not
   implemented — `$` hits the unknown-character fallback. Also affects
