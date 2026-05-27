@@ -28,6 +28,91 @@ fn flatten_for_layout<'a>(elements: &'a [Element]) -> Vec<LayoutToken<'a>> {
     out
 }
 
+/// One stem captured while a beam group is being collected.
+#[derive(Clone, Copy)]
+struct BeamStem {
+    /// X coordinate of the stem.
+    stem_x: f64,
+    /// Y of the notehead (anchor end of the stem).
+    note_y: f64,
+    /// Number of beams this individual note carries: 1 for 1/8,
+    /// 2 for 1/16, 3 for 1/32, 4 for 1/64.
+    beam_count: u8,
+}
+
+/// State accumulated for one open beam group between its first note
+/// and its last note.
+#[derive(Default)]
+struct BeamAccum {
+    stems: Vec<BeamStem>,
+    /// True = stems point up (notes below middle staff line).
+    /// Decided from the first note in the group.
+    stem_up: bool,
+}
+
+/// Identify beam groups in the token stream. A beam group is a
+/// maximal run of ≥ 2 consecutive notes with duration ≤ 1/8 (i.e.
+/// `absolute_ratio < 0.25`), where intervening elements are
+/// "transparent" (decorations, chord symbols, slur boundaries,
+/// grace notes, lyrics, inline fields). Spaces, bars, rests, chords,
+/// tuplets, voice switches, line breaks, overlays, and `BeamBreak`
+/// markers all break the group.
+fn compute_beam_groups(tokens: &[LayoutToken<'_>], unit: &UnitLength) -> Vec<Vec<usize>> {
+    fn flush(groups: &mut Vec<Vec<usize>>, current: &mut Vec<usize>) {
+        if current.len() >= 2 {
+            groups.push(std::mem::take(current));
+        } else {
+            current.clear();
+        }
+    }
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut current: Vec<usize> = Vec::new();
+    for (i, token) in tokens.iter().enumerate() {
+        match token {
+            LayoutToken::Real(Element::Note(note)) => {
+                if absolute_ratio(&note.duration, unit) < 0.25 {
+                    current.push(i);
+                } else {
+                    flush(&mut groups, &mut current);
+                }
+            }
+            LayoutToken::Real(e) => {
+                let transparent = matches!(
+                    e,
+                    Element::Decoration(_)
+                        | Element::ChordSymbol(_)
+                        | Element::Lyrics { .. }
+                        | Element::InlineField(_)
+                        | Element::GraceNotes { .. }
+                );
+                if !transparent {
+                    flush(&mut groups, &mut current);
+                }
+            }
+            LayoutToken::SlurStart | LayoutToken::SlurEnd => {
+                // Slur boundaries don't break beams (§3.1.6).
+            }
+        }
+    }
+    flush(&mut groups, &mut current);
+    groups
+}
+
+fn note_beam_count(duration: &Duration, unit: &UnitLength) -> u8 {
+    let abs = absolute_ratio(duration, unit);
+    if abs <= 1.0 / 64.0 + 1e-9 {
+        4
+    } else if abs <= 1.0 / 32.0 + 1e-9 {
+        3
+    } else if abs <= 1.0 / 16.0 + 1e-9 {
+        2
+    } else if abs <= 1.0 / 8.0 + 1e-9 {
+        1
+    } else {
+        0
+    }
+}
+
 // --- Clef geometry ----------------------------------------------------------
 
 /// SMuFL codepoint and reference-line staff position (in sp units, where
@@ -365,9 +450,22 @@ fn render_staff(
     // Walk a flattened token stream so nested `Element::SlurGroup`s map
     // back to the explicit Start/End boundaries the slur_stack expects.
     let tokens = flatten_for_layout(&voice.elements);
-    for token in tokens {
+    let beam_groups = compute_beam_groups(&tokens, &unit_length);
+    // For each token index, which beam group (if any) it belongs to.
+    let mut beam_group_of: Vec<Option<usize>> = vec![None; tokens.len()];
+    for (gid, members) in beam_groups.iter().enumerate() {
+        for &i in members {
+            beam_group_of[i] = Some(gid);
+        }
+    }
+    // Per-group accumulator, populated as we emit each member note.
+    let mut beam_accums: Vec<BeamAccum> = (0..beam_groups.len())
+        .map(|_| BeamAccum::default())
+        .collect();
+
+    for (token_idx, token) in tokens.iter().enumerate() {
         let element: &Element = match token {
-            LayoutToken::Real(e) => e,
+            LayoutToken::Real(e) => *e,
             LayoutToken::SlurStart => {
                 slur_stack.push(None);
                 continue;
@@ -414,7 +512,48 @@ fn render_staff(
                     }
                 }
 
-                cursor_x = emit_note(elements, note, cursor_x, ctx, unit_width, &unit_length, span);
+                let beam_gid = beam_group_of[token_idx];
+                let (suppress_flag, forced_up) = if let Some(gid) = beam_gid {
+                    // Decide direction from the FIRST note in the
+                    // group so all stems point the same way. `pos`
+                    // values increase downward, so `pos > 2.0` (below
+                    // middle line) → stems up.
+                    if beam_accums[gid].stems.is_empty() {
+                        beam_accums[gid].stem_up = pos > 2.0;
+                    }
+                    (true, Some(beam_accums[gid].stem_up))
+                } else {
+                    (false, None)
+                };
+                let cursor_after = emit_note_with(
+                    elements,
+                    note,
+                    cursor_x,
+                    ctx,
+                    unit_width,
+                    &unit_length,
+                    span,
+                    suppress_flag,
+                    forced_up,
+                );
+                if let Some(gid) = beam_gid {
+                    // Stem x matches the convention in emit_stem_directed.
+                    let stem_x = if beam_accums[gid].stem_up {
+                        x_left + notehead_width
+                    } else {
+                        x_left
+                    };
+                    beam_accums[gid].stems.push(BeamStem {
+                        stem_x,
+                        note_y: y,
+                        beam_count: note_beam_count(&note.duration, &unit_length),
+                    });
+                    // If this is the last note in the group, draw the beam.
+                    if beam_groups[gid].last() == Some(&token_idx) {
+                        emit_beam(elements, &beam_accums[gid], ctx);
+                    }
+                }
+                cursor_x = cursor_after;
 
                 // Drain pending standalone decorations onto this note,
                 // then add the note's own decorations.
@@ -1169,7 +1308,12 @@ fn close_volta_bracket(
 
 // --- Element emission -------------------------------------------------------
 
-fn emit_note(
+/// Emit a notehead, accidental, ledger lines, stem, and (unless
+/// `suppress_flag`) a flag. When `forced_stem_up` is `Some`, the stem
+/// direction overrides the default pitch-based heuristic so all
+/// stems in a beam group point the same way.
+#[allow(clippy::too_many_arguments)]
+fn emit_note_with(
     elements: &mut Vec<EngravingElement>,
     note: &Note,
     cursor_x: f64,
@@ -1177,6 +1321,8 @@ fn emit_note(
     unit_width: f64,
     unit: &UnitLength,
     span: SourceSpan,
+    suppress_flag: bool,
+    forced_stem_up: Option<bool>,
 ) -> f64 {
     let pos = ctx.pos_for(&note.pitch, note.octave);
     let y = ctx.y_at(pos);
@@ -1206,10 +1352,101 @@ fn emit_note(
     });
 
     emit_ledger_lines(elements, pos, cursor_x, ctx, span);
-    emit_stem(elements, pos, cursor_x, ctx, &note.duration, unit, span);
-    emit_flag(elements, pos, cursor_x, ctx, &note.duration, unit, span);
+    if let Some(up) = forced_stem_up {
+        emit_stem_directed(elements, pos, cursor_x, ctx, &note.duration, unit, span, up);
+    } else {
+        emit_stem(elements, pos, cursor_x, ctx, &note.duration, unit, span);
+    }
+    if !suppress_flag {
+        emit_flag(elements, pos, cursor_x, ctx, &note.duration, unit, span);
+    }
 
     cursor_x + duration_to_width(&note.duration, unit_width)
+}
+
+/// Stem emitter with an externally-chosen direction. `up == true`
+/// draws the stem upward (negative-y) from the right edge of the
+/// notehead; `up == false` draws downward from the left edge.
+#[allow(clippy::too_many_arguments)]
+fn emit_stem_directed(
+    elements: &mut Vec<EngravingElement>,
+    pos: f64,
+    x: f64,
+    ctx: StaffCtx,
+    duration: &Duration,
+    unit: &UnitLength,
+    span: SourceSpan,
+    up: bool,
+) {
+    let abs = absolute_ratio(duration, unit);
+    if abs >= 1.0 {
+        return;
+    }
+    let font = font_cache();
+    let cp = notehead_codepoint(duration, unit);
+    let notehead_width = font.glyph_advance(cp).unwrap_or(500.0) * ctx.scale;
+    let stem_length = ctx.sp * 3.5;
+    let note_y = ctx.y_at(pos);
+    let (stem_x, end_y) = if up {
+        (x + notehead_width, note_y - stem_length)
+    } else {
+        (x, note_y + stem_length)
+    };
+    elements.push(EngravingElement::Line {
+        x1: stem_x,
+        y1: note_y,
+        x2: stem_x,
+        y2: end_y,
+        width: 0.8,
+        source_span: span,
+    });
+}
+
+/// Emit `n` parallel beam lines stacked under the outer ends of the
+/// group's stems. Beams have thickness ~ sp/2 and are spaced ~ sp.
+fn emit_beam(elements: &mut Vec<EngravingElement>, accum: &BeamAccum, ctx: StaffCtx) {
+    if accum.stems.len() < 2 {
+        return;
+    }
+    let beam_levels = accum
+        .stems
+        .iter()
+        .map(|s| s.beam_count)
+        .max()
+        .unwrap_or(1);
+    if beam_levels == 0 {
+        return;
+    }
+    let stem_length = ctx.sp * 3.5;
+    let beam_thickness = ctx.sp * 0.5;
+    let beam_spacing = ctx.sp * 0.9;
+    let first = &accum.stems[0];
+    let last = &accum.stems[accum.stems.len() - 1];
+    // Outer y for first and last stem (where beams sit).
+    let outer = |s: &BeamStem| {
+        if accum.stem_up {
+            s.note_y - stem_length
+        } else {
+            s.note_y + stem_length
+        }
+    };
+    let y_first = outer(first);
+    let y_last = outer(last);
+    let dir = if accum.stem_up { 1.0 } else { -1.0 };
+    for level in 0..beam_levels {
+        // Inner offset: secondary beams stack toward the notehead.
+        let off = level as f64 * beam_spacing * dir;
+        let y1 = y_first + off;
+        let y2 = y_last + off;
+        elements.push(EngravingElement::Line {
+            x1: first.stem_x,
+            y1,
+            x2: last.stem_x,
+            y2,
+            width: beam_thickness,
+            source_span: (0, 0),
+        });
+    }
 }
 
 fn absolute_ratio(duration: &Duration, unit: &UnitLength) -> f64 {
@@ -1517,6 +1754,90 @@ mod tests {
             assert_eq!(cp, FILLED_NOTEHEAD);
         }
         assert!(has_flag_glyphs(&elements));
+    }
+
+    /// All beam lines (sp/2-ish thickness). Beams are noticeably
+    /// thicker than stems (~0.8) or staff lines (~0.5) and may be
+    /// slanted to follow the pitch contour.
+    fn beam_lines(elements: &[EngravingElement], sp: f64) -> Vec<&EngravingElement> {
+        elements
+            .iter()
+            .filter(|e| matches!(e, EngravingElement::Line { width, .. } if *width > sp * 0.4))
+            .collect()
+    }
+
+    #[test]
+    fn four_eighth_notes_beam_together() {
+        // CDEF with no spaces and L:1/8 — should beam as one group of
+        // four eighths. Expect no flag glyphs and at least one beam
+        // line.
+        let abc = "X:1\nT:Test\nM:4/4\nL:1/8\nK:C\nCDEF\n";
+        let tune = crate::parse(abc).value.into_iter().next().unwrap();
+        let elements = engrave(&tune, &EngravingOptions::default());
+        let sp = EngravingOptions::default().staff_spacing;
+        assert!(
+            !has_flag_glyphs(&elements),
+            "beamed eighths should not carry individual flags",
+        );
+        let beams = beam_lines(&elements, sp);
+        assert!(!beams.is_empty(), "expected at least one beam line");
+    }
+
+    #[test]
+    fn sixteenth_notes_get_double_beam() {
+        // Four sixteenths in a row: one group, two beam lines.
+        let abc = "X:1\nT:Test\nM:4/4\nL:1/16\nK:C\nCDEF\n";
+        let tune = crate::parse(abc).value.into_iter().next().unwrap();
+        let elements = engrave(&tune, &EngravingOptions::default());
+        let sp = EngravingOptions::default().staff_spacing;
+        let beams = beam_lines(&elements, sp);
+        assert!(
+            beams.len() >= 2,
+            "sixteenth-note group should draw ≥2 beam lines, got {}",
+            beams.len(),
+        );
+    }
+
+    #[test]
+    fn space_breaks_beam_group() {
+        // C D with a space between: two singletons, no beaming, each
+        // gets its own flag.
+        let abc = "X:1\nT:Test\nM:4/4\nL:1/8\nK:C\nC D\n";
+        let tune = crate::parse(abc).value.into_iter().next().unwrap();
+        let elements = engrave(&tune, &EngravingOptions::default());
+        let sp = EngravingOptions::default().staff_spacing;
+        let beams = beam_lines(&elements, sp);
+        assert!(beams.is_empty(), "space should prevent beaming");
+        assert!(has_flag_glyphs(&elements), "singletons should have flags");
+    }
+
+    #[test]
+    fn backtick_breaks_beam_group() {
+        // CD`EF: two beam groups of two notes each, separated by ` .
+        let abc = "X:1\nT:Test\nM:4/4\nL:1/8\nK:C\nCD`EF\n";
+        let tune = crate::parse(abc).value.into_iter().next().unwrap();
+        let elements = engrave(&tune, &EngravingOptions::default());
+        let sp = EngravingOptions::default().staff_spacing;
+        let beams = beam_lines(&elements, sp);
+        // Two groups of two each → two beam lines (one per group).
+        assert_eq!(
+            beams.len(),
+            2,
+            "expected 2 beam lines (one per group), got {}",
+            beams.len(),
+        );
+    }
+
+    #[test]
+    fn single_eighth_keeps_its_flag() {
+        // One eighth followed by quarter — no neighbour to beam with.
+        let abc = "X:1\nT:Test\nM:4/4\nL:1/8\nK:C\nCE2\n";
+        let tune = crate::parse(abc).value.into_iter().next().unwrap();
+        let elements = engrave(&tune, &EngravingOptions::default());
+        let sp = EngravingOptions::default().staff_spacing;
+        let beams = beam_lines(&elements, sp);
+        assert!(beams.is_empty(), "singleton eighth should not beam");
+        assert!(has_flag_glyphs(&elements), "singleton eighth keeps its flag");
     }
 
     #[test]
