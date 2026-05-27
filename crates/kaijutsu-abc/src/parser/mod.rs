@@ -13,6 +13,39 @@ use crate::feedback::{FeedbackCollector, ParseResult};
 use crate::ParseMode;
 use std::collections::HashMap;
 
+/// Parse a `U:` assignment value like `T = !trill!` into its letter
+/// and expansion. Per spec §4.16 the LHS is a single letter (any case).
+/// Returns None if the value isn't a well-formed assignment.
+pub(super) fn parse_u_assignment(value: &str) -> Option<(char, String)> {
+    let eq = value.find('=')?;
+    let lhs = value[..eq].trim();
+    let rhs = value[eq + 1..].trim().to_string();
+    let mut chars = lhs.chars();
+    let key = chars.next()?;
+    if chars.next().is_some() || !key.is_ascii_alphabetic() {
+        return None;
+    }
+    Some((key, rhs))
+}
+
+/// Build the initial U: redefinable-symbol map for a tune. Reads
+/// `U:` info fields from both the file header and the tune header,
+/// with tune-header assignments winning on collision (per §2.2).
+pub(super) fn build_user_symbols(
+    file_header: &Header,
+    tune_header: &Header,
+) -> HashMap<char, String> {
+    let mut map = HashMap::new();
+    for f in file_header.other_fields.iter().chain(tune_header.other_fields.iter()) {
+        if f.field_type == 'U' {
+            if let Some((k, v)) = parse_u_assignment(&f.value) {
+                map.insert(k, v);
+            }
+        }
+    }
+    map
+}
+
 /// Derive [`LinebreakMode`] from `I:linebreak …` entries in `header`.
 /// Searches both `other_fields` (where header `I:` fields live today).
 pub(super) fn linebreak_mode_from_header(header: &Header) -> LinebreakMode {
@@ -72,13 +105,13 @@ pub fn parse(input: &str, mode: ParseMode) -> ParseResult<Vec<Tune>> {
         if input.trim().is_empty() {
             Vec::new()
         } else {
-            vec![parse_one_tune(input, &mut collector, mode)]
+            vec![parse_one_tune(input, &mut collector, mode, &file_header)]
         }
     } else {
         tune_segments
             .into_iter()
             .map(|segment| {
-                let mut tune = parse_one_tune(segment, &mut collector, mode);
+                let mut tune = parse_one_tune(segment, &mut collector, mode, &file_header);
                 inherit_from_file_header(&mut tune.header, &file_header);
                 tune
             })
@@ -88,10 +121,16 @@ pub fn parse(input: &str, mode: ParseMode) -> ParseResult<Vec<Tune>> {
     ParseResult::new(tunes, collector.into_feedback())
 }
 
-fn parse_one_tune(input: &str, collector: &mut FeedbackCollector, mode: ParseMode) -> Tune {
+fn parse_one_tune(
+    input: &str,
+    collector: &mut FeedbackCollector,
+    mode: ParseMode,
+    file_header: &Header,
+) -> Tune {
     let (remaining, header) = header::parse_header(input, collector, mode);
     let linebreak = linebreak_mode_from_header(&header);
-    let elements = body::parse_body(remaining, collector, mode, linebreak);
+    let mut user_symbols = build_user_symbols(file_header, &header);
+    let elements = body::parse_body(remaining, collector, mode, linebreak, &mut user_symbols);
     let voices = route_elements_to_voices(&header.voice_defs, elements);
     Tune { header, voices }
 }
@@ -325,6 +364,109 @@ mod tests {
             })
         );
         assert_eq!(result.value[0].header.key.root, NoteName::C);
+    }
+
+    #[test]
+    fn parse_u_assignment_basic() {
+        assert_eq!(
+            super::parse_u_assignment("T = !trill!"),
+            Some(('T', "!trill!".to_string())),
+        );
+        assert_eq!(
+            super::parse_u_assignment("J = ~"),
+            Some(('J', "~".to_string())),
+        );
+        assert_eq!(super::parse_u_assignment("not an assignment"), None);
+        assert_eq!(super::parse_u_assignment("AB = !accent!"), None); // LHS not single char
+    }
+
+    #[test]
+    fn u_field_remaps_letter_in_body() {
+        // U:J = !trill! makes `J` produce a trill instead of hitting
+        // the unknown-char fallback.
+        let abc = "X:1\nT:Test\nU:J = !trill!\nK:C\nJCDE|\n";
+        let result = crate::parse(abc);
+        assert!(!result.has_errors(), "feedback: {:?}", result.feedback);
+        let has_trill = result.value[0].voices[0].elements.iter().any(|e| {
+            matches!(e, Element::Decoration(Decoration::Trill))
+        });
+        assert!(
+            has_trill,
+            "expected U:J to expand to a trill, got: {:?}",
+            result.value[0].voices[0].elements,
+        );
+    }
+
+    #[test]
+    fn u_field_overrides_default_decoration() {
+        // T defaults to Trill; U:T = !lowermordent! overrides.
+        let abc = "X:1\nT:Test\nU:T = !lowermordent!\nK:C\nTCDE|\n";
+        let result = crate::parse(abc);
+        assert!(!result.has_errors(), "feedback: {:?}", result.feedback);
+        let decorations: Vec<_> = result.value[0].voices[0]
+            .elements
+            .iter()
+            .filter_map(|e| match e {
+                Element::Decoration(d) => Some(d),
+                _ => None,
+            })
+            .collect();
+        // Should contain a lower mordent, NOT a trill.
+        assert!(
+            decorations
+                .iter()
+                .any(|d| matches!(d, Decoration::Mordent { upper: false })),
+            "expected lower mordent from U:T override, got: {:?}",
+            decorations,
+        );
+        assert!(
+            !decorations.iter().any(|d| matches!(d, Decoration::Trill)),
+            "U: override should suppress default Trill",
+        );
+    }
+
+    #[test]
+    fn inline_u_rebinds_mid_body() {
+        // Inline U: changes the binding for the rest of the body.
+        let abc = "X:1\nT:Test\nU:J = !trill!\nK:C\nJCD|\nU:J = !accent!\nJEF|\n";
+        let result = crate::parse(abc);
+        assert!(!result.has_errors(), "feedback: {:?}", result.feedback);
+        let decorations: Vec<_> = result.value[0].voices[0]
+            .elements
+            .iter()
+            .filter_map(|e| match e {
+                Element::Decoration(d) => Some(d),
+                _ => None,
+            })
+            .collect();
+        // First J (before rebind) → Trill; second J → Accent.
+        assert!(
+            decorations.contains(&&Decoration::Trill),
+            "expected trill from first J, got: {:?}",
+            decorations,
+        );
+        assert!(
+            decorations.contains(&&Decoration::Accent),
+            "expected accent from rebound J, got: {:?}",
+            decorations,
+        );
+    }
+
+    #[test]
+    fn u_recursion_depth_capped() {
+        // U:A = A — self-referential. Should not stack overflow.
+        let abc = "X:1\nT:Test\nU:N = N\nK:C\nNCDE|\n";
+        let result = crate::parse(abc);
+        // No panic; gets a depth warning.
+        let depth_warned = result
+            .feedback
+            .iter()
+            .any(|f| f.message.contains("depth"));
+        assert!(
+            depth_warned,
+            "expected depth warning, got: {:?}",
+            result.feedback,
+        );
     }
 
     #[test]

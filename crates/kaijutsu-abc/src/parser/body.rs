@@ -1,10 +1,17 @@
 //! Music body parsing for ABC notation.
 
+use std::collections::HashMap;
+
 use winnow::prelude::*;
 
 use crate::ast::{Bar, Element, InfoField, LinebreakMode, Tuplet};
 use crate::feedback::FeedbackCollector;
 use crate::ParseMode;
+
+/// Cap on nested U:-expansion to keep pathological definitions
+/// (e.g. `U:A = A`) from blowing the stack. Real expansions are at
+/// most a single decoration deep.
+const MAX_U_EXPANSION_DEPTH: u8 = 8;
 
 use super::note::{parse_chord, parse_chord_symbol, parse_note, parse_rest};
 
@@ -25,6 +32,18 @@ pub fn parse_body(
     collector: &mut FeedbackCollector,
     mode: ParseMode,
     linebreak: LinebreakMode,
+    user_symbols: &mut HashMap<char, String>,
+) -> Vec<Element> {
+    parse_body_inner(input, collector, mode, linebreak, user_symbols, 0)
+}
+
+fn parse_body_inner(
+    input: &str,
+    collector: &mut FeedbackCollector,
+    mode: ParseMode,
+    linebreak: LinebreakMode,
+    user_symbols: &mut HashMap<char, String>,
+    expansion_depth: u8,
 ) -> Vec<Element> {
     let mut elements = Vec::new();
     let mut remaining = input;
@@ -77,6 +96,13 @@ pub fn parse_body(
                             "<none>" | "none" => LinebreakMode::None,
                             _ => LinebreakMode::Eol,
                         };
+                    }
+                }
+                // Inline `U:` assignments (re)bind a redefinable
+                // symbol mid-body per spec §4.16.
+                if field.field_type == 'U' {
+                    if let Some((k, v)) = super::parse_u_assignment(&field.value) {
+                        user_symbols.insert(k, v);
                     }
                 }
                 elements.push(Element::InlineField(field));
@@ -204,6 +230,37 @@ pub fn parse_body(
             }
             at_line_start = false;
             continue;
+        }
+
+        // U:-defined redefinable symbol per spec §4.16. If the lead
+        // char has been bound (in header or via inline `U:`), splice
+        // the expansion in via a recursive body parse. Recursion is
+        // depth-capped so a self-referential definition can't blow
+        // the stack.
+        if let Some(c) = remaining.chars().next() {
+            if c.is_ascii_alphabetic() {
+                if let Some(expansion) = user_symbols.get(&c).cloned() {
+                    remaining = &remaining[c.len_utf8()..];
+                    if expansion_depth < MAX_U_EXPANSION_DEPTH {
+                        let expanded = parse_body_inner(
+                            &expansion,
+                            collector,
+                            mode,
+                            linebreak,
+                            user_symbols,
+                            expansion_depth + 1,
+                        );
+                        elements.extend(expanded);
+                    } else {
+                        collector.warning(format!(
+                            "U:{} expansion exceeded depth {} — dropped",
+                            c, MAX_U_EXPANSION_DEPTH
+                        ));
+                    }
+                    at_line_start = false;
+                    continue;
+                }
+            }
         }
 
         // Try to parse an element
@@ -856,7 +913,7 @@ mod tests {
     #[test]
     fn test_parse_simple_body() {
         let mut collector = FeedbackCollector::new();
-        let elements = parse_body("CDEF|", &mut collector, ParseMode::Generous, LinebreakMode::Eol);
+        let elements = parse_body("CDEF|", &mut collector, ParseMode::Generous, LinebreakMode::Eol, &mut HashMap::new());
 
         let notes: Vec<_> = elements
             .iter()
@@ -873,7 +930,7 @@ mod tests {
     #[test]
     fn test_parse_bar_types() {
         let mut collector = FeedbackCollector::new();
-        let elements = parse_body("|:C:|D||E|]", &mut collector, ParseMode::Generous, LinebreakMode::Eol);
+        let elements = parse_body("|:C:|D||E|]", &mut collector, ParseMode::Generous, LinebreakMode::Eol, &mut HashMap::new());
 
         let bars: Vec<_> = elements
             .iter()
@@ -892,7 +949,7 @@ mod tests {
     #[test]
     fn test_parse_triplet() {
         let mut collector = FeedbackCollector::new();
-        let elements = parse_body("(3CDE", &mut collector, ParseMode::Generous, LinebreakMode::Eol);
+        let elements = parse_body("(3CDE", &mut collector, ParseMode::Generous, LinebreakMode::Eol, &mut HashMap::new());
 
         let tuplets: Vec<_> = elements
             .iter()
@@ -911,7 +968,7 @@ mod tests {
     #[test]
     fn test_parse_grace_notes() {
         let mut collector = FeedbackCollector::new();
-        let elements = parse_body("{g}A", &mut collector, ParseMode::Generous, LinebreakMode::Eol);
+        let elements = parse_body("{g}A", &mut collector, ParseMode::Generous, LinebreakMode::Eol, &mut HashMap::new());
 
         let graces: Vec<_> = elements
             .iter()
@@ -924,7 +981,7 @@ mod tests {
     #[test]
     fn test_parse_acciaccatura() {
         let mut collector = FeedbackCollector::new();
-        let elements = parse_body("{/g}A", &mut collector, ParseMode::Generous, LinebreakMode::Eol);
+        let elements = parse_body("{/g}A", &mut collector, ParseMode::Generous, LinebreakMode::Eol, &mut HashMap::new());
 
         let graces: Vec<_> = elements
             .iter()
@@ -941,7 +998,7 @@ mod tests {
     #[test]
     fn test_parse_decorations() {
         let mut collector = FeedbackCollector::new();
-        let elements = parse_body(".C~D!trill!E", &mut collector, ParseMode::Generous, LinebreakMode::Eol);
+        let elements = parse_body(".C~D!trill!E", &mut collector, ParseMode::Generous, LinebreakMode::Eol, &mut HashMap::new());
 
         let decorations: Vec<_> = elements
             .iter()
@@ -957,7 +1014,7 @@ mod tests {
     #[test]
     fn test_parse_inline_field() {
         let mut collector = FeedbackCollector::new();
-        let elements = parse_body("CD[M:3/4]EF", &mut collector, ParseMode::Generous, LinebreakMode::Eol);
+        let elements = parse_body("CD[M:3/4]EF", &mut collector, ParseMode::Generous, LinebreakMode::Eol, &mut HashMap::new());
 
         let fields: Vec<_> = elements
             .iter()
@@ -975,7 +1032,7 @@ mod tests {
     #[test]
     fn test_parse_comments() {
         let mut collector = FeedbackCollector::new();
-        let elements = parse_body("CD % comment\nEF", &mut collector, ParseMode::Generous, LinebreakMode::Eol);
+        let elements = parse_body("CD % comment\nEF", &mut collector, ParseMode::Generous, LinebreakMode::Eol, &mut HashMap::new());
 
         let notes: Vec<_> = elements
             .iter()
@@ -993,7 +1050,7 @@ mod tests {
         use crate::feedback::FeedbackLevel;
 
         let mut collector = FeedbackCollector::new();
-        let _elements = parse_body("CD\n%%MIDI program 56\nEF", &mut collector, ParseMode::Generous, LinebreakMode::Eol);
+        let _elements = parse_body("CD\n%%MIDI program 56\nEF", &mut collector, ParseMode::Generous, LinebreakMode::Eol, &mut HashMap::new());
 
         // Should have a warning about %%MIDI in body
         let warnings: Vec<_> = collector

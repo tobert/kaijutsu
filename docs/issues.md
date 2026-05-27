@@ -178,11 +178,6 @@ d43df35). See the `project-live-eval` memory for scope.
   marker) are still no-ops, and `I:linebreak $` does not yet suppress
   source-newline breaks per the spec.
 
-- **`U:` user-defined symbol expansion.** `U:T = !trill!` is captured
-  in `Header::other_fields` but the body parser doesn't apply the
-  substitution, so `T` mid-music takes its default decoration meaning
-  (or hits the fallback). Apply U: mappings at body parse time.
-
 - **`m:` macro expansion.** `m:` macro definitions are captured as
   `InfoField` (header `other_fields`, body `Element::InlineField`) but
   the body parser doesn't expand `~G2` etc. into their definition.
