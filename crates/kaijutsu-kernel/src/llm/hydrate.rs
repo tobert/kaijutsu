@@ -25,6 +25,11 @@ use super::{ContentBlock, Message, MessageContent, Role};
 
 /// Accumulates blocks into outgoing `Message`s. Held across multiple
 /// `translate_block` calls; consumed by `into_messages`.
+///
+/// `Clone` is implemented so a live session (`ConversationMailbox`)
+/// can take a non-destructive snapshot for send-time repair without
+/// losing its in-progress accumulator state.
+#[derive(Clone)]
 pub(crate) struct HydrationState {
     messages: Vec<Message>,
     assistant_text: Option<String>,

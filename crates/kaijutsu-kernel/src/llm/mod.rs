@@ -32,12 +32,14 @@ pub mod config;
 pub mod gemini;
 mod hydrate;
 pub mod image_cache;
+pub mod mailbox;
 pub mod stream;
 pub mod system_prompt;
 pub mod toml_config;
 
 // Re-export key types
 pub use config::ProviderConfig;
+pub use mailbox::ConversationMailbox;
 pub use system_prompt::{SituationalContext, build_system_prompt, extract_system_prompt_sections};
 pub use toml_config::{
     EmbeddingModelConfig, LlmConfig, ModelAlias, ModelsConfig, initialize_llm_registry,

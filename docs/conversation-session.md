@@ -62,17 +62,24 @@ Consequences:
    `TextOps`, etc. are observed but produce only log events at this
    stage.
 
-3. **Tool-pair gate.** Session state tracks "open tool_uses awaiting
-   results." While the set is non-empty, non-tool-result inserts queue
-   in the mailbox; once empty, the queue drains in arrival order. The
-   gate sits in the mailbox, not in block writers — writers stay
-   ignorant of pairing.
-
-4. **Boundary detection in `process_llm_stream`.** Replace the
+3. **Boundary detection in `process_llm_stream`.** Replace the
    unconditional `hydrate_from_blocks` call with: if the session is
    empty (cache miss), hydrate once; otherwise trust the mailbox.
    Fork already produces a new `context_id` so it gets a fresh slot
-   for free — confirm during implementation.
+   for free — confirmed in `kj/fork.rs:120`.
+
+**Out of scope for Slice A — gate left for follow-up.** The original
+plan put a tool-pair gate inside the mailbox, queueing non-result
+inserts while tool_uses are open. After reading the BlockFlow
+shape we walked back: the mailbox-as-translator can't actually keep
+the block log coherent — it just hides interleavings from the LLM
+stream while leaving them in the durable log, where every future
+bootstrap / fork sees them. A real gate sits at insert time (block
+writers submit through a per-context queue; the queue holds non-
+tool-result writes during open tool_uses). That's a bigger
+architectural change touching every block writer; it deserves its
+own slice with two concrete consumers (drift, peer tool calls) in
+the design phase. Tracked as a follow-up alongside Slice B.
 
 ### Slice B — formalize Mailbox as a named type
 
