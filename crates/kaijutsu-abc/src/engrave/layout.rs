@@ -131,12 +131,15 @@ fn clef_glyph(clef: Clef) -> Option<(u32, f64)> {
 /// Absolute diatonic of the note that sits on the middle staff line for
 /// each clef, encoded the same way as in `note_to_staff_position`.
 fn clef_middle_abs(clef: Clef) -> i32 {
+    // Encoding matches the parser/MIDI convention: ABC octave 0 is the
+    // uppercase C–B band = MIDI 60–71 = the middle-C octave (C4–B4). So
+    // `abs = octave * 7 + diatonic` with C4 = (C, octave 0) = 0.
     match clef {
-        Clef::Treble => 13,     // B4 = (B, octave 1)
-        Clef::Bass => 1,        // D3 = (D, octave 0)
-        Clef::Alto => 7,        // C4 = (C, octave 1)
-        Clef::Tenor => 5,       // A3 = (A, octave 0)
-        Clef::Percussion => 13, // not really pitched; treat like treble for fallback
+        Clef::Treble => 6,      // B4 = (B, octave 0) = middle staff line
+        Clef::Bass => -6,       // D3 = (D, octave -1) = middle staff line
+        Clef::Alto => 0,        // C4 = (C, octave 0) = middle staff line
+        Clef::Tenor => -2,      // A3 = (A, octave -1) = middle staff line
+        Clef::Percussion => 6,  // not really pitched; treat like treble for fallback
     }
 }
 
@@ -146,14 +149,14 @@ fn clef_middle_abs(clef: Clef) -> i32 {
 fn sharp_octaves(clef: Clef) -> [(NoteName, i8); 7] {
     use NoteName::*;
     match clef {
-        Clef::Treble => [(F, 2), (C, 2), (G, 2), (D, 2), (A, 1), (E, 2), (B, 1)],
-        Clef::Bass => [(F, 0), (C, 0), (G, 0), (D, 0), (A, -1), (E, 0), (B, -1)],
-        Clef::Alto => [(F, 1), (C, 1), (G, 1), (D, 1), (A, 0), (E, 1), (B, 0)],
+        Clef::Treble => [(F, 1), (C, 1), (G, 1), (D, 1), (A, 0), (E, 1), (B, 0)],
+        Clef::Bass => [(F, -1), (C, -1), (G, -1), (D, -1), (A, -2), (E, -1), (B, -2)],
+        Clef::Alto => [(F, 0), (C, 0), (G, 0), (D, 0), (A, -1), (E, 0), (B, -1)],
         // Tenor sits high enough that the conventional placement matches
         // alto's sharps, except F# and G# which drop an octave to stay on
         // the staff.
-        Clef::Tenor => [(F, 0), (C, 1), (G, 0), (D, 1), (A, 0), (E, 1), (B, 0)],
-        Clef::Percussion => [(F, 2), (C, 2), (G, 2), (D, 2), (A, 1), (E, 2), (B, 1)],
+        Clef::Tenor => [(F, -1), (C, 0), (G, -1), (D, 0), (A, -1), (E, 0), (B, -1)],
+        Clef::Percussion => [(F, 1), (C, 1), (G, 1), (D, 1), (A, 0), (E, 1), (B, 0)],
     }
 }
 
@@ -167,6 +170,17 @@ fn flat_octaves(clef: Clef) -> [(NoteName, i8); 7] {
         Clef::Alto => [(B, 0), (E, 1), (A, 0), (D, 1), (G, 0), (C, 1), (F, 0)],
         Clef::Tenor => [(B, 0), (E, 1), (A, 0), (D, 1), (G, 0), (C, 1), (F, 0)],
         Clef::Percussion => [(B, 1), (E, 2), (A, 1), (D, 2), (G, 1), (C, 2), (F, 1)],
+    }
+}
+
+/// SMuFL codepoint for an accidental glyph (Bravura).
+fn accidental_codepoint(acc: Accidental) -> u32 {
+    match acc {
+        Accidental::Sharp => 0xE262,
+        Accidental::Flat => 0xE260,
+        Accidental::Natural => 0xE261,
+        Accidental::DoubleSharp => 0xE263,
+        Accidental::DoubleFlat => 0xE264,
     }
 }
 
@@ -234,8 +248,8 @@ fn note_to_staff_position(pitch: &NoteName, octave: i8, clef: Clef) -> f64 {
         NoteName::B => 6,
     };
 
-    // ABC octave 0 = uppercase (C3–B3), ABC octave 1 = lowercase (C4–B4).
-    // Each diatonic step = half a staff_spacing.
+    // ABC octave 0 = uppercase (C4–B4, the middle-C octave), ABC octave 1
+    // = lowercase (C5–B5). Each diatonic step = half a staff_spacing.
     let abs_diatonic = octave as i32 * 7 + diatonic;
     let mid = clef_middle_abs(clef);
     (mid - abs_diatonic) as f64 * 0.5 + 2.0
@@ -373,6 +387,10 @@ fn render_staff(
     }
     let line_end = line_start + 5;
 
+    // Small left margin so the clef sits a hair inside the staff rather than
+    // flush against the very first pixel of the staff lines.
+    cursor_x += sp * 0.4;
+
     // 2. Clef glyph.
     if let Some((cp, line_pos)) = clef_glyph(ctx.clef) {
         if font.glyph_path(cp).is_some() {
@@ -450,6 +468,13 @@ fn render_staff(
     // Walk a flattened token stream so nested `Element::SlurGroup`s map
     // back to the explicit Start/End boundaries the slur_stack expects.
     let tokens = flatten_for_layout(&voice.elements);
+    // The last token that carries real content — trailing line breaks,
+    // spaces, and beam-break hints don't count. Used to recognize a plain
+    // terminal `|` so it can be promoted to a proper final barline.
+    let last_structural_tok = tokens.iter().rposition(|t| {
+        matches!(t, LayoutToken::Real(e)
+            if !matches!(e, Element::LineBreak | Element::Space | Element::BeamBreak))
+    });
     let beam_groups = compute_beam_groups(&tokens, &unit_length);
     // For each token index, which beam group (if any) it belongs to.
     let mut beam_group_of: Vec<Option<usize>> = vec![None; tokens.len()];
@@ -458,9 +483,33 @@ fn render_staff(
             beam_group_of[i] = Some(gid);
         }
     }
+    // Stem direction per beam group, decided from the note *farthest* from
+    // the middle staff line (pos 2.0) — the conventional rule — rather than
+    // from whichever note happens to come first. Ties (the group reaches as
+    // far above as below) fall to stems-up. `pos` grows downward, so a note
+    // below the middle line has `pos > 2.0`.
+    let beam_stem_up: Vec<bool> = beam_groups
+        .iter()
+        .map(|members| {
+            let mut max_below = f64::NEG_INFINITY;
+            let mut max_above = f64::NEG_INFINITY;
+            for &ti in members {
+                if let LayoutToken::Real(Element::Note(n)) = &tokens[ti] {
+                    let pos = ctx.pos_for(&n.pitch, n.octave);
+                    max_below = max_below.max(pos - 2.0);
+                    max_above = max_above.max(2.0 - pos);
+                }
+            }
+            max_below >= max_above
+        })
+        .collect();
     // Per-group accumulator, populated as we emit each member note.
-    let mut beam_accums: Vec<BeamAccum> = (0..beam_groups.len())
-        .map(|_| BeamAccum::default())
+    let mut beam_accums: Vec<BeamAccum> = beam_stem_up
+        .iter()
+        .map(|&stem_up| BeamAccum {
+            stems: Vec::new(),
+            stem_up,
+        })
         .collect();
 
     for (token_idx, token) in tokens.iter().enumerate() {
@@ -513,14 +562,9 @@ fn render_staff(
                 }
 
                 let beam_gid = beam_group_of[token_idx];
+                // Direction was decided up-front from the whole group (see
+                // `beam_stem_up`); every stem in the group follows it.
                 let (suppress_flag, forced_up) = if let Some(gid) = beam_gid {
-                    // Decide direction from the FIRST note in the
-                    // group so all stems point the same way. `pos`
-                    // values increase downward, so `pos > 2.0` (below
-                    // middle line) → stems up.
-                    if beam_accums[gid].stems.is_empty() {
-                        beam_accums[gid].stem_up = pos > 2.0;
-                    }
                     (true, Some(beam_accums[gid].stem_up))
                 } else {
                     (false, None)
@@ -537,12 +581,8 @@ fn render_staff(
                     forced_up,
                 );
                 if let Some(gid) = beam_gid {
-                    // Stem x matches the convention in emit_stem_directed.
-                    let stem_x = if beam_accums[gid].stem_up {
-                        x_left + notehead_width
-                    } else {
-                        x_left
-                    };
+                    let stem_x =
+                        stem_center_x(x_left, notehead_width, beam_accums[gid].stem_up);
                     beam_accums[gid].stems.push(BeamStem {
                         stem_x,
                         note_y: y,
@@ -593,15 +633,26 @@ fn render_staff(
 
                 for note in &chord.notes {
                     let pos = ctx.pos_for(&note.pitch, note.octave);
+                    let y = ctx.y_at(pos);
+                    if let Some(acc) = note.accidental {
+                        elements.push(EngravingElement::Glyph {
+                            codepoint: accidental_codepoint(acc),
+                            x: cursor_x - ctx.sp * 0.8,
+                            y,
+                            scale: ctx.scale,
+                            source_span: span,
+                        });
+                    }
                     let cp = notehead_codepoint(&chord.duration, &unit_length);
+                    let nw = font.glyph_advance(cp).unwrap_or(500.0) * ctx.scale;
                     elements.push(EngravingElement::Glyph {
                         codepoint: cp,
                         x: cursor_x,
-                        y: ctx.y_at(pos),
+                        y,
                         scale: ctx.scale,
                         source_span: span,
                     });
-                    emit_ledger_lines(elements, pos, cursor_x, ctx, span);
+                    emit_ledger_lines(elements, pos, cursor_x, nw, ctx, span);
                 }
 
                 // Stem on the chord (highest to lowest note).
@@ -617,18 +668,15 @@ fn render_staff(
                         let cp = notehead_codepoint(&chord.duration, &unit_length);
                         let nw = font.glyph_advance(cp).unwrap_or(500.0) * ctx.scale;
                         let avg_pos = (stem_top + stem_bot) / 2.0;
-                        let stem_x = if avg_pos <= 2.0 {
-                            cursor_x
-                        } else {
-                            cursor_x + nw
-                        };
-                        let stem_dir = if avg_pos <= 2.0 { 1.0 } else { -1.0 };
+                        let up = avg_pos > 2.0;
+                        let stem_x = stem_center_x(cursor_x, nw, up);
+                        let stem_dir = if up { -1.0 } else { 1.0 };
                         elements.push(EngravingElement::Line {
                             x1: stem_x,
                             y1: ctx.y_at(stem_top),
                             x2: stem_x,
                             y2: ctx.y_at(stem_bot) + stem_dir * sp * 3.5,
-                            width: 0.8,
+                            width: STEM_WIDTH,
                             source_span: span,
                         });
                     }
@@ -653,6 +701,15 @@ fn render_staff(
                 cursor_x += dur_width;
             }
             Element::Bar(bar) => {
+                // A plain `|` that is the last real token of the tune is the
+                // end of the final measure. Don't draw it here — fall through
+                // to the end-of-voice code, which renders a tight thin+thick
+                // final barline. (Explicit terminal bars like `|]`, `:|`, or
+                // `||` keep their own meaning and are drawn normally.)
+                if Some(token_idx) == last_structural_tok && matches!(bar, Bar::Single) {
+                    close_volta_bracket(elements, &mut open_volta, cursor_x, ctx);
+                    continue;
+                }
                 // A bar of any variant closes an open volta.
                 close_volta_bracket(elements, &mut open_volta, cursor_x, ctx);
                 let bar_left = cursor_x;
@@ -672,6 +729,7 @@ fn render_staff(
                         let scaled_width = orig_width * scale_factor;
                         let pos = ctx.pos_for(&note.pitch, note.octave);
                         let cp = notehead_codepoint(&note.duration, &unit_length);
+                        let nw = font.glyph_advance(cp).unwrap_or(500.0) * ctx.scale;
                         elements.push(EngravingElement::Glyph {
                             codepoint: cp,
                             x: cursor_x,
@@ -679,7 +737,7 @@ fn render_staff(
                             scale: ctx.scale,
                             source_span: span,
                         });
-                        emit_ledger_lines(elements, pos, cursor_x, ctx, span);
+                        emit_ledger_lines(elements, pos, cursor_x, nw, ctx, span);
                         emit_stem(elements, pos, cursor_x, ctx, &note.duration, &unit_length, span);
                         cursor_x += scaled_width;
                     }
@@ -702,18 +760,48 @@ fn render_staff(
     // Close any volta that was still open at end-of-voice.
     close_volta_bracket(elements, &mut open_volta, cursor_x, ctx);
 
-    // Auto-emitted thick final barline — only if the body didn't already
-    // end on a bar. Avoids double-drawing when the user wrote `|]`/`:|`/etc.
-    let ends_with_bar = matches!(voice.elements.last(), Some(Element::Bar(_)));
+    // Auto-emitted final barline (thin then thick, the conventional
+    // end-of-tune barline). Skip it only when the tune already ends on an
+    // explicit terminal bar (`|]`, `:|`, `||`, …); a plain trailing `|` was
+    // suppressed in the loop and is promoted to a final barline here. The
+    // last() check used to miss trailing line breaks, so a final `|` drew a
+    // barline AND this auto bar — a doubled line.
+    let terminal = voice.elements.iter().rev().find(|e| {
+        !matches!(e, Element::LineBreak | Element::Space | Element::BeamBreak)
+    });
+    let ends_with_bar = matches!(terminal, Some(Element::Bar(b)) if !matches!(b, Bar::Single));
     if !ends_with_bar {
-        elements.push(EngravingElement::Line {
-            x1: cursor_x,
-            y1: ctx.y_at(0.0),
-            x2: cursor_x,
-            y2: ctx.y_at(4.0),
-            width: 2.0,
-            source_span: (0, 0),
-        });
+        // Pull the barline up to a small fixed gap after the last note. The
+        // per-note advance leaves a full duration-width of trailing space,
+        // which reads as an oversized gap at the end of a line. Only tighten
+        // when the last sounding element is a note (chords/rests don't update
+        // the anchor); never push the bar further right than the cursor.
+        let ends_on_note = voice
+            .elements
+            .iter()
+            .rev()
+            .find(|e| {
+                matches!(
+                    e,
+                    Element::Note(_)
+                        | Element::Chord(_)
+                        | Element::Rest(_)
+                        | Element::Tuplet(_)
+                        | Element::GraceNotes { .. }
+                )
+            })
+            .map(|e| matches!(e, Element::Note(_)))
+            .unwrap_or(false);
+        if ends_on_note {
+            if let Some(a) = last_anchor {
+                cursor_x = cursor_x.min(a.x_right + sp * 0.7);
+            }
+        }
+        let gap = sp * 0.3;
+        vertical_bar(elements, cursor_x, BAR_THIN, ctx);
+        let thick_center = cursor_x + gap + BAR_THICK * 0.5;
+        vertical_bar(elements, thick_center, BAR_THICK, ctx);
+        cursor_x = thick_center + BAR_THICK * 0.5;
     }
 
     // Initial pass: extend staff lines to current cursor. `engrave()`
@@ -869,13 +957,8 @@ fn emit_grace_notes(
 
         // Accidental in front of the grace head, also small.
         if let Some(acc) = note.accidental {
-            let acc_cp = match acc {
-                Accidental::Sharp | Accidental::DoubleSharp => 0xE262,
-                Accidental::Flat | Accidental::DoubleFlat => 0xE260,
-                Accidental::Natural => 0xE261,
-            };
             elements.push(EngravingElement::Glyph {
-                codepoint: acc_cp,
+                codepoint: accidental_codepoint(acc),
                 x: x - ctx.sp * 0.5,
                 y,
                 scale: grace_scale,
@@ -1328,13 +1411,8 @@ fn emit_note_with(
     let y = ctx.y_at(pos);
 
     if let Some(acc) = note.accidental {
-        let acc_cp = match acc {
-            Accidental::Sharp | Accidental::DoubleSharp => 0xE262,
-            Accidental::Flat | Accidental::DoubleFlat => 0xE260,
-            Accidental::Natural => 0xE261,
-        };
         elements.push(EngravingElement::Glyph {
-            codepoint: acc_cp,
+            codepoint: accidental_codepoint(acc),
             x: cursor_x - ctx.sp * 0.8,
             y,
             scale: ctx.scale,
@@ -1343,6 +1421,7 @@ fn emit_note_with(
     }
 
     let cp = notehead_codepoint(&note.duration, unit);
+    let notehead_width = font_cache().glyph_advance(cp).unwrap_or(500.0) * ctx.scale;
     elements.push(EngravingElement::Glyph {
         codepoint: cp,
         x: cursor_x,
@@ -1351,10 +1430,11 @@ fn emit_note_with(
         source_span: span,
     });
 
-    emit_ledger_lines(elements, pos, cursor_x, ctx, span);
-    if let Some(up) = forced_stem_up {
-        emit_stem_directed(elements, pos, cursor_x, ctx, &note.duration, unit, span, up);
-    } else {
+    emit_ledger_lines(elements, pos, cursor_x, notehead_width, ctx, span);
+    // Beamed notes (forced_stem_up = Some) get their stems drawn by
+    // `emit_beam`, which knows the final (slope-clamped) beam line each
+    // stem must reach. Un-beamed notes draw their own fixed-length stem.
+    if forced_stem_up.is_none() {
         emit_stem(elements, pos, cursor_x, ctx, &note.duration, unit, span);
     }
     if !suppress_flag {
@@ -1364,46 +1444,14 @@ fn emit_note_with(
     cursor_x + duration_to_width(&note.duration, unit_width)
 }
 
-/// Stem emitter with an externally-chosen direction. `up == true`
-/// draws the stem upward (negative-y) from the right edge of the
-/// notehead; `up == false` draws downward from the left edge.
-#[allow(clippy::too_many_arguments)]
-fn emit_stem_directed(
-    elements: &mut Vec<EngravingElement>,
-    pos: f64,
-    x: f64,
-    ctx: StaffCtx,
-    duration: &Duration,
-    unit: &UnitLength,
-    span: SourceSpan,
-    up: bool,
-) {
-    let abs = absolute_ratio(duration, unit);
-    if abs >= 1.0 {
-        return;
-    }
-    let font = font_cache();
-    let cp = notehead_codepoint(duration, unit);
-    let notehead_width = font.glyph_advance(cp).unwrap_or(500.0) * ctx.scale;
-    let stem_length = ctx.sp * 3.5;
-    let note_y = ctx.y_at(pos);
-    let (stem_x, end_y) = if up {
-        (x + notehead_width, note_y - stem_length)
-    } else {
-        (x, note_y + stem_length)
-    };
-    elements.push(EngravingElement::Line {
-        x1: stem_x,
-        y1: note_y,
-        x2: stem_x,
-        y2: end_y,
-        width: 0.8,
-        source_span: span,
-    });
-}
-
-/// Emit `n` parallel beam lines stacked under the outer ends of the
-/// group's stems. Beams have thickness ~ sp/2 and are spaced ~ sp.
+/// Emit the beam(s) for one group plus the stem of every note in it.
+///
+/// The beam is a straight line whose slope follows the first→last notehead
+/// contour but is *clamped* so wide pitch leaps don't produce near-vertical
+/// beams. The line is then positioned so the shortest stem in the group is
+/// `base_stem` long; every other stem is drawn from its notehead up/down to
+/// wherever the beam crosses that stem's x. Secondary beams (16ths, 32nds)
+/// stack toward the noteheads.
 fn emit_beam(elements: &mut Vec<EngravingElement>, accum: &BeamAccum, ctx: StaffCtx) {
     if accum.stems.len() < 2 {
         return;
@@ -1417,33 +1465,87 @@ fn emit_beam(elements: &mut Vec<EngravingElement>, accum: &BeamAccum, ctx: Staff
     if beam_levels == 0 {
         return;
     }
-    let stem_length = ctx.sp * 3.5;
-    let beam_thickness = ctx.sp * 0.5;
-    let beam_spacing = ctx.sp * 0.9;
-    let first = &accum.stems[0];
-    let last = &accum.stems[accum.stems.len() - 1];
-    // Outer y for first and last stem (where beams sit).
-    let outer = |s: &BeamStem| {
-        if accum.stem_up {
-            s.note_y - stem_length
-        } else {
-            s.note_y + stem_length
-        }
+    let sp = ctx.sp;
+    let base_stem = sp * 3.0;
+    let beam_thickness = sp * 0.5;
+    let beam_spacing = sp * 0.9;
+    // Max beam slope as rise-over-run. Standard engraving keeps beams gentle
+    // even across big leaps; ~0.25 reads as a clear-but-calm slant.
+    const MAX_SLOPE: f64 = 0.25;
+
+    let stems = &accum.stems;
+    let first = stems[0];
+    let last = stems[stems.len() - 1];
+    let x0 = first.stem_x;
+    let dx = last.stem_x - x0;
+
+    let raw_slope = if dx.abs() > 1e-6 {
+        (last.note_y - first.note_y) / dx
+    } else {
+        0.0
     };
-    let y_first = outer(first);
-    let y_last = outer(last);
-    let dir = if accum.stem_up { 1.0 } else { -1.0 };
-    for level in 0..beam_levels {
-        // Inner offset: secondary beams stack toward the notehead.
-        let off = level as f64 * beam_spacing * dir;
-        let y1 = y_first + off;
-        let y2 = y_last + off;
+    let slope = raw_slope.clamp(-MAX_SLOPE, MAX_SLOPE);
+
+    // De-slope each notehead to a common x so we can pick the beam offset
+    // that gives the closest note exactly `base_stem` of stem.
+    // g_i = note_y_i - slope*(x_i - x0); stem_up beam is above (smaller y),
+    // stem_down beam is below (larger y).
+    let beam_y0 = if accum.stem_up {
+        stems
+            .iter()
+            .map(|s| s.note_y - slope * (s.stem_x - x0))
+            .fold(f64::INFINITY, f64::min)
+            - base_stem
+    } else {
+        stems
+            .iter()
+            .map(|s| s.note_y - slope * (s.stem_x - x0))
+            .fold(f64::NEG_INFINITY, f64::max)
+            + base_stem
+    };
+    let beam_y = |x: f64| beam_y0 + slope * (x - x0);
+
+    // Stems: from each notehead to the primary beam line.
+    for s in stems {
         elements.push(EngravingElement::Line {
-            x1: first.stem_x,
-            y1,
-            x2: last.stem_x,
-            y2,
-            width: beam_thickness,
+            x1: s.stem_x,
+            y1: s.note_y,
+            x2: s.stem_x,
+            y2: beam_y(s.stem_x),
+            width: STEM_WIDTH,
+            source_span: (0, 0),
+        });
+    }
+
+    // Beams are filled parallelograms, not stroked lines, so their left and
+    // right edges are exactly vertical with no rounded stroke-cap overhang.
+    // The band runs from the outer edge of the first stem to the outer edge
+    // of the last stem (each stem's centerline ± half its stroke), so the
+    // beam ends flush with the stems rather than at their centerlines.
+    // Thickness is measured vertically (the engraving convention); secondary
+    // beams stack toward the noteheads.
+    let toward_heads = if accum.stem_up { 1.0 } else { -1.0 };
+    let half_t = beam_thickness / 2.0;
+    let bx_l = first.stem_x - STEM_WIDTH / 2.0;
+    let bx_r = last.stem_x + STEM_WIDTH / 2.0;
+    for level in 0..beam_levels {
+        let off = level as f64 * beam_spacing * toward_heads;
+        let yl = beam_y(bx_l) + off;
+        let yr = beam_y(bx_r) + off;
+        let d = format!(
+            "M {:.3} {:.3} L {:.3} {:.3} L {:.3} {:.3} L {:.3} {:.3} Z",
+            bx_l,
+            yl - half_t,
+            bx_r,
+            yr - half_t,
+            bx_r,
+            yr + half_t,
+            bx_l,
+            yl + half_t,
+        );
+        elements.push(EngravingElement::Path {
+            d,
+            fill: true,
             source_span: (0, 0),
         });
     }
@@ -1489,12 +1591,16 @@ fn emit_ledger_lines(
     elements: &mut Vec<EngravingElement>,
     pos: f64,
     x: f64,
+    notehead_width: f64,
     ctx: StaffCtx,
     span: SourceSpan,
 ) {
-    let ledger_width = ctx.sp * 1.4;
-    let lx1 = x - ctx.sp * 0.2;
-    let lx2 = lx1 + ledger_width;
+    // Center the ledger on the notehead and overhang it slightly on each
+    // side, the way an engraver draws it. `x` is the notehead's left edge.
+    let center = x + notehead_width / 2.0;
+    let half = notehead_width / 2.0 + ctx.sp * 0.28;
+    let lx1 = center - half;
+    let lx2 = center + half;
 
     // Above staff (pos < 0)
     let mut lp = -0.5;
@@ -1531,6 +1637,22 @@ fn emit_ledger_lines(
     }
 }
 
+/// Stroke width of a note stem (scene units).
+const STEM_WIDTH: f64 = 0.8;
+
+/// Centerline x for a stem given the notehead's left edge and width. A
+/// stroked line is centered on its path, so we inset by half the stroke:
+/// up-stems hug the notehead's right edge, down-stems its left edge, and in
+/// both cases the stem's *outer* edge lands flush on the notehead boundary
+/// rather than poking half a stroke past it.
+fn stem_center_x(x_left: f64, notehead_width: f64, up: bool) -> f64 {
+    if up {
+        x_left + notehead_width - STEM_WIDTH / 2.0
+    } else {
+        x_left + STEM_WIDTH / 2.0
+    }
+}
+
 fn emit_stem(
     elements: &mut Vec<EngravingElement>,
     pos: f64,
@@ -1551,28 +1673,23 @@ fn emit_stem(
 
     let stem_length = ctx.sp * 3.5;
     let note_y = ctx.y_at(pos);
-
-    if pos <= 2.0 {
-        let stem_x = x;
-        elements.push(EngravingElement::Line {
-            x1: stem_x,
-            y1: note_y,
-            x2: stem_x,
-            y2: note_y + stem_length,
-            width: 0.8,
-            source_span: span,
-        });
+    // pos ≤ 2.0 (upper half of the staff) → stem down on the left;
+    // otherwise stem up on the right.
+    let up = pos > 2.0;
+    let stem_x = stem_center_x(x, notehead_width, up);
+    let end_y = if up {
+        note_y - stem_length
     } else {
-        let stem_x = x + notehead_width;
-        elements.push(EngravingElement::Line {
-            x1: stem_x,
-            y1: note_y,
-            x2: stem_x,
-            y2: note_y - stem_length,
-            width: 0.8,
-            source_span: span,
-        });
-    }
+        note_y + stem_length
+    };
+    elements.push(EngravingElement::Line {
+        x1: stem_x,
+        y1: note_y,
+        x2: stem_x,
+        y2: end_y,
+        width: STEM_WIDTH,
+        source_span: span,
+    });
 }
 
 fn emit_flag(
@@ -1672,45 +1789,50 @@ mod tests {
 
     #[test]
     fn middle_c_is_below_treble_staff() {
-        // Middle C (C4) = ABC (C, octave 1) → pos 5.0, one ledger line below
-        let pos = note_to_staff_position(&NoteName::C, 1, Clef::Treble);
+        // Middle C (C4) = ABC uppercase C = (C, octave 0) → pos 5.0, one
+        // ledger line below the bottom line.
+        let pos = note_to_staff_position(&NoteName::C, 0, Clef::Treble);
         assert!((pos - 5.0).abs() < 0.01, "got {}", pos);
     }
 
     #[test]
     fn b4_is_treble_middle_line() {
-        let pos = note_to_staff_position(&NoteName::B, 1, Clef::Treble);
+        // B4 = uppercase B = (B, octave 0).
+        let pos = note_to_staff_position(&NoteName::B, 0, Clef::Treble);
         assert!((pos - 2.0).abs() < 0.01, "got {}", pos);
     }
 
     #[test]
     fn f5_is_treble_top_line() {
-        let pos = note_to_staff_position(&NoteName::F, 2, Clef::Treble);
+        // F5 = lowercase f = (F, octave 1).
+        let pos = note_to_staff_position(&NoteName::F, 1, Clef::Treble);
         assert!((pos - 0.0).abs() < 0.01, "got {}", pos);
     }
 
     #[test]
     fn e4_is_treble_bottom_line() {
-        let pos = note_to_staff_position(&NoteName::E, 1, Clef::Treble);
+        // E4 = uppercase E = (E, octave 0).
+        let pos = note_to_staff_position(&NoteName::E, 0, Clef::Treble);
         assert!((pos - 4.0).abs() < 0.01, "got {}", pos);
     }
 
     #[test]
     fn d3_is_bass_middle_line() {
-        // D3 = (D, octave 0) — uppercase D in ABC.
-        let pos = note_to_staff_position(&NoteName::D, 0, Clef::Bass);
+        // D3 = (D, octave -1) — `D,` in ABC.
+        let pos = note_to_staff_position(&NoteName::D, -1, Clef::Bass);
         assert!((pos - 2.0).abs() < 0.01, "got {}", pos);
     }
 
     #[test]
     fn middle_c_is_alto_middle_line() {
-        let pos = note_to_staff_position(&NoteName::C, 1, Clef::Alto);
+        // Middle C = uppercase C = (C, octave 0).
+        let pos = note_to_staff_position(&NoteName::C, 0, Clef::Alto);
         assert!((pos - 2.0).abs() < 0.01, "got {}", pos);
     }
 
     #[test]
     fn middle_c_is_tenor_fourth_line() {
-        let pos = note_to_staff_position(&NoteName::C, 1, Clef::Tenor);
+        let pos = note_to_staff_position(&NoteName::C, 0, Clef::Tenor);
         assert!((pos - 1.0).abs() < 0.01, "got {}", pos);
     }
 
@@ -1756,13 +1878,14 @@ mod tests {
         assert!(has_flag_glyphs(&elements));
     }
 
-    /// All beam lines (sp/2-ish thickness). Beams are noticeably
-    /// thicker than stems (~0.8) or staff lines (~0.5) and may be
-    /// slanted to follow the pitch contour.
-    fn beam_lines(elements: &[EngravingElement], sp: f64) -> Vec<&EngravingElement> {
+    /// All beams. Beams are filled parallelograms (straight `L` edges, no
+    /// `Q` curves like ties/slurs and no `A` arcs like repeat dots), one
+    /// `Path` per beam level.
+    fn beam_lines(elements: &[EngravingElement], _sp: f64) -> Vec<&EngravingElement> {
         elements
             .iter()
-            .filter(|e| matches!(e, EngravingElement::Line { width, .. } if *width > sp * 0.4))
+            .filter(|e| matches!(e, EngravingElement::Path { d, fill: true, .. }
+                if d.contains('L') && !d.contains('Q') && !d.contains('A')))
             .collect()
     }
 
@@ -1911,3 +2034,4 @@ mod tests {
         assert_eq!(rest_cps[0], 0xE4E5);
     }
 }
+

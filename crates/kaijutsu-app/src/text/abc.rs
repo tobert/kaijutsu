@@ -7,7 +7,7 @@
 use bevy::prelude::default;
 use bevy_vello::prelude::*;
 use bevy_vello::vello;
-use vello::kurbo::{Affine, BezPath, Line, Stroke};
+use vello::kurbo::{Affine, BezPath, Cap, Line, Stroke};
 use vello::peniko::{Brush, Fill};
 
 use kaijutsu_abc::engrave::font::font_cache;
@@ -106,7 +106,11 @@ pub fn render_engraving_to_scene(
                 ..
             } => {
                 let line = Line::new((*x1, *y1), (*x2, *y2));
-                scene.stroke(&Stroke::new(*line_width), offset, color, None, &line);
+                // Butt caps: stroked lines (barlines, stems, ledgers, staff
+                // lines) end exactly at their endpoints instead of overhanging
+                // by half the stroke width via the default round cap.
+                let stroke = Stroke::new(*line_width).with_caps(Cap::Butt);
+                scene.stroke(&stroke, offset, color, None, &line);
             }
             EngravingElement::Path { d, fill, .. } => {
                 if let Ok(bezpath) = BezPath::from_svg(d) {
