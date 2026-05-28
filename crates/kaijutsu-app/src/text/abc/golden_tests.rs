@@ -313,3 +313,14 @@ fn chord_with_accidentals() {
 fn beamed_eighths_sixteenths() {
     run_case("beamed_eighths");
 }
+
+/// Pure pitch→Y regression: chromatic quarter notes from C4 up to C6 and
+/// back (sharps ascending, flats descending), single treble staff, no
+/// beams or slurs. Spans one ledger below the staff to two above, so a
+/// notehead height or ledger-count shift — the octave bug that put every
+/// note an octave too low — shows immediately. Beaming/slurs are covered
+/// by other goldens; this one isolates the mapping.
+#[test]
+fn chromatic_run_octave_regression() {
+    run_case("chromatic_run");
+}
