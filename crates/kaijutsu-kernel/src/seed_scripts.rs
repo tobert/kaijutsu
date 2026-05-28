@@ -64,13 +64,11 @@ kj cache add --target=system --ttl=ephemeral
 ";
 
 const CACHE_FORK_BODY: &str = "\
-# rc on-fork cache breakpoint. KJ_PARENT_BLOCK_COUNT is the parent block
-# count at fork time, so index N-1 is the last shared message. Body must
-# avoid backticks, apostrophes, and dollar-paren-paren in comments — the
-# kaish arithmetic preprocessor is comment-blind and quote-greedy, so any
-# of those poison the parse of the real command below. Use --flag=value
-# because the kj tool schema does not declare these flag names; bare
-# --flag args otherwise parse as bool flags and lose their value.
+# rc on-fork cache breakpoint: cache the prefix shared with the parent.
+# KJ_PARENT_BLOCK_COUNT is the parent's block count at fork time, so
+# index N-1 is the last shared message. --flag=value because the kj
+# tool schema does not declare these flag names; bare --flag args
+# otherwise parse as bool flags in kaish.
 kj cache add --target=message --index=$((KJ_PARENT_BLOCK_COUNT - 1)) --ttl=extended
 ";
 
