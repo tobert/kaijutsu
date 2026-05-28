@@ -67,3 +67,4 @@ toml = { workspace = true }
 image = "0.25"
 crossbeam-channel = "0.5"
 tempfile = "3"
+pollster = "0.4"

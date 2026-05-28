@@ -154,3 +154,7 @@ pub fn render_engraving_to_scene(
 
     (scene, width, height)
 }
+
+#[cfg(test)]
+mod golden_tests;
+
