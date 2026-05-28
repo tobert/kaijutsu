@@ -760,7 +760,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(
-            row.content.contains("kj cache add --target tools"),
+            row.content.contains("kj cache add --target=tools"),
             "reseed didn't restore: {}",
             row.content
         );

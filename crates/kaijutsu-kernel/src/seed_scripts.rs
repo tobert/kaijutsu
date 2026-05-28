@@ -57,27 +57,32 @@ const CACHE_CREATE_BODY: &str = "\
 # rc on-create cache breakpoints (docs/help/kj-cache.md).
 # Tools array is fixed per session → 1h cache.
 # System prompt may shift on rc edits / model swaps → 5m.
-kj cache add --target tools  --ttl extended
-kj cache add --target system --ttl ephemeral
+# --flag=value because the kj tool schema does not declare these flag
+# names; bare --flag args otherwise parse as bool flags in kaish.
+kj cache add --target=tools  --ttl=extended
+kj cache add --target=system --ttl=ephemeral
 ";
 
 const CACHE_FORK_BODY: &str = "\
-# rc on-fork cache breakpoint: cache the prefix shared with the parent.
-# KJ_PARENT_BLOCK_COUNT is the parent's block count at fork time, so
-# index N-1 is the last shared message.
-kj cache add \\
-    --target message \\
-    --index $((KJ_PARENT_BLOCK_COUNT - 1)) \\
-    --ttl extended
+# rc on-fork cache breakpoint. KJ_PARENT_BLOCK_COUNT is the parent block
+# count at fork time, so index N-1 is the last shared message. Body must
+# avoid backticks, apostrophes, and dollar-paren-paren in comments — the
+# kaish arithmetic preprocessor is comment-blind and quote-greedy, so any
+# of those poison the parse of the real command below. Use --flag=value
+# because the kj tool schema does not declare these flag names; bare
+# --flag args otherwise parse as bool flags and lose their value.
+kj cache add --target=message --index=$((KJ_PARENT_BLOCK_COUNT - 1)) --ttl=extended
 ";
 
 const CACHE_DRIFT_BODY: &str = "\
 # rc on-drift cache reset: compact / model swap / doc inject reshape
 # the conversation, so old MessageIndex breakpoints point at the wrong
-# message now. Clear and re-seed the stable bits.
+# message now. Clear and re-seed the stable bits. --flag=value because
+# the kj tool schema does not declare these flag names; bare --flag args
+# otherwise parse as bool flags in kaish.
 kj cache clear
-kj cache add --target tools  --ttl extended
-kj cache add --target system --ttl ephemeral
+kj cache add --target=tools  --ttl=extended
+kj cache add --target=system --ttl=ephemeral
 ";
 
 /// The coder context_type's system-prompt stance. Drawn from the
@@ -342,7 +347,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(
-            row.content.contains("kj cache add --target tools"),
+            row.content.contains("kj cache add --target=tools"),
             "reseed didn't restore the in-code body: {}",
             row.content
         );
