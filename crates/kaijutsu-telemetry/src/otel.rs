@@ -7,8 +7,9 @@ use opentelemetry::trace::{
     TraceFlags, TraceId, TraceState, TracerProvider as _,
 };
 use opentelemetry::{Context, KeyValue, global};
-use opentelemetry_otlp::SpanExporter;
+use opentelemetry_otlp::{MetricExporter, SpanExporter};
 use opentelemetry_sdk::Resource;
+use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider, ShouldSample, SpanLimits};
 use tracing_opentelemetry::OpenTelemetryLayer;
 
@@ -17,6 +18,7 @@ use tracing_opentelemetry::OpenTelemetryLayer;
 /// (e.g. in the Bevy app which doesn't have its own Tokio runtime at init time).
 pub struct OtelGuard {
     provider: SdkTracerProvider,
+    meter_provider: SdkMeterProvider,
     // Order matters: enter guard must drop before runtime
     _runtime_enter: Option<tokio::runtime::EnterGuard<'static>>,
     _runtime: Option<&'static tokio::runtime::Runtime>,
@@ -24,6 +26,10 @@ pub struct OtelGuard {
 
 impl Drop for OtelGuard {
     fn drop(&mut self) {
+        // Flush metrics before traces so a final periodic export lands.
+        if let Err(e) = self.meter_provider.shutdown() {
+            eprintln!("OTel meter shutdown error: {e}");
+        }
         if let Err(e) = self.provider.shutdown() {
             eprintln!("OTel shutdown error: {e}");
         }
@@ -47,41 +53,61 @@ where
     // The server already has one, but the Bevy app doesn't when main() starts.
     // Create a dedicated runtime, leak it (lives for the process), and enter it
     // so that BatchSpanProcessor's tokio::spawn calls succeed.
-    let (exporter, runtime_ref, enter_guard) = match tokio::runtime::Handle::try_current() {
-        Ok(_handle) => {
-            let exp = SpanExporter::builder()
-                .with_tonic()
-                .build()
-                .expect("failed to build OTLP exporter");
-            (exp, None, None)
-        }
-        Err(_) => {
-            let rt: &'static tokio::runtime::Runtime = Box::leak(Box::new(
-                tokio::runtime::Runtime::new().expect("failed to create OTel tokio runtime"),
-            ));
-            let guard = rt.enter();
-            let exp = rt.block_on(async {
-                SpanExporter::builder()
+    let (span_exporter, metric_exporter, runtime_ref, enter_guard) =
+        match tokio::runtime::Handle::try_current() {
+            Ok(_handle) => {
+                let span = SpanExporter::builder()
                     .with_tonic()
                     .build()
-                    .expect("failed to build OTLP exporter")
-            });
-            (exp, Some(rt), Some(guard))
-        }
-    };
+                    .expect("failed to build OTLP span exporter");
+                let metric = MetricExporter::builder()
+                    .with_tonic()
+                    .build()
+                    .expect("failed to build OTLP metric exporter");
+                (span, metric, None, None)
+            }
+            Err(_) => {
+                let rt: &'static tokio::runtime::Runtime = Box::leak(Box::new(
+                    tokio::runtime::Runtime::new().expect("failed to create OTel tokio runtime"),
+                ));
+                let guard = rt.enter();
+                let (span, metric) = rt.block_on(async {
+                    let span = SpanExporter::builder()
+                        .with_tonic()
+                        .build()
+                        .expect("failed to build OTLP span exporter");
+                    let metric = MetricExporter::builder()
+                        .with_tonic()
+                        .build()
+                        .expect("failed to build OTLP metric exporter");
+                    (span, metric)
+                });
+                (span, metric, Some(rt), Some(guard))
+            }
+        };
 
     let resource = Resource::builder()
         .with_service_name(service_name.to_string())
         .build();
 
     let provider = SdkTracerProvider::builder()
-        .with_batch_exporter(exporter)
+        .with_batch_exporter(span_exporter)
         .with_sampler(KaijutsuSampler)
-        .with_resource(resource)
+        .with_resource(resource.clone())
         .with_span_limits(SpanLimits::default())
         .build();
 
     global::set_tracer_provider(provider.clone());
+
+    // Metrics export through the global meter provider on a periodic reader.
+    // Unlike traces, metrics need no tracing-subscriber layer — instruments
+    // record straight to the global provider (see `crate::metrics`).
+    let meter_provider = SdkMeterProvider::builder()
+        .with_periodic_exporter(metric_exporter)
+        .with_resource(resource)
+        .build();
+
+    global::set_meter_provider(meter_provider.clone());
 
     let tracer = provider.tracer(service_name.to_string());
     let layer = tracing_opentelemetry::layer().with_tracer(tracer);
@@ -90,6 +116,7 @@ where
         layer,
         OtelGuard {
             provider,
+            meter_provider,
             _runtime_enter: enter_guard,
             _runtime: runtime_ref,
         },
