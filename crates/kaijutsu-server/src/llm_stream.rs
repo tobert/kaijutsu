@@ -787,6 +787,20 @@ async fn process_llm_stream(
                     input_tokens,
                     output_tokens,
                 } => {
+                    // Record token usage to the global meter (no-op until OTel
+                    // is enabled). Both the completed and cancelled paths spend
+                    // tokens, so record before branching. Cache-token
+                    // accounting isn't carried on Done yet — input/output now,
+                    // extend when Done carries the richer Usage.
+                    kaijutsu_telemetry::record_llm_usage(
+                        provider.name(),
+                        &model_name,
+                        kaijutsu_telemetry::TokenCounts {
+                            input: input_tokens.unwrap_or(0),
+                            output: output_tokens.unwrap_or(0),
+                            ..Default::default()
+                        },
+                    );
                     if stream_cancelled {
                         // Hard interrupt confirmation: rig flushed its buffer cleanly.
                         // stop_reason is None on cancel (vs "end_turn"/"tool_use" normally).

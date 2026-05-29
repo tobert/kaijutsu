@@ -21,8 +21,10 @@
 //!
 //! Set `OTEL_SDK_DISABLED=true` to explicitly disable even when the endpoint is set.
 
+pub mod metrics;
 mod otel;
 
+pub use metrics::{TokenCounts, record_llm_usage};
 pub use otel::{OtelGuard, otel_layer};
 
 /// Check whether OTel export should be enabled.
