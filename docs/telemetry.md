@@ -201,6 +201,60 @@ The `KaijutsuSampler` applies differentiated rates based on span name prefix:
 
 Parent-sampled spans always inherit (trace continuity).
 
+**Prefix collision caveat:** the 100% namespaces are **dot-qualified**
+(`drift.`, `engine.`, `tool.`, `gen_ai.`, `llm.`). Auto-named actor/method spans
+like `drift_queue` must NOT match `drift.` — before the dot they were swept to
+100% and the app's 5s idle drift poll dominated trace volume. See
+`sampling_rate()` and its regression test in `kaijutsu-telemetry`.
+
+## Metrics
+
+OTel metrics are always compiled in and export through the **global meter
+provider** installed by `otel_layer` — there is no tracing-subscriber layer for
+metrics (unlike traces/logs). Activation is the same `OTEL_EXPORTER_OTLP_*`
+gating as traces. A periodic reader pushes over OTLP gRPC.
+
+Metrics are **not sampled** — instead, keep cardinality bounded by attribute
+choice (no context/trace ids as metric attributes).
+
+### Instruments
+
+| Metric | Type | Attributes | Source |
+|--------|------|------------|--------|
+| `gen_ai.client.token.usage` | histogram `{token}` | `gen_ai.system`, `gen_ai.request.model`, `gen_ai.token.type` (input/output/cache_read/cache_creation) | `record_llm_usage()` at `StreamEvent::Done` |
+| `gen_ai.client.operation.count` | counter `{operation}` | `gen_ai.system`, `gen_ai.request.model` | same |
+
+Naming follows OTel GenAI semantic conventions (`gen_ai.*`). This is
+**intentionally distinct** from the kaijutsu `llm.*` span fields — spans and
+metrics live in different namespaces so the metrics line up with standard
+dashboards and the collector's spanmetrics output. `record_llm_usage()` takes a
+`TokenCounts` so the recorder stays decoupled from any provider's usage struct.
+
+> Cache-token accounting (`cache_read` / `cache_creation`) isn't carried on
+> `StreamEvent::Done` yet — only `input` / `output` are recorded today. Extend
+> when `Done` carries the richer `Usage`.
+
+### RED metrics from spans (collector spanmetrics)
+
+RED metrics (rate / errors / duration) are derived at the **collector** from
+existing spans via the `spanmetrics` connector — no app instrumentation. This is
+free and retroactive to all spans, but it counts only **sampled** spans:
+`engine.`/`drift.`/`llm.` at 100% are accurate; `rpc` at 10% is a ×10 estimate.
+Drive "is the kernel busy" dashboards off the 100% namespaces, not raw `rpc`
+counts. (Connector config is collector-side — see the deploy notes.)
+
+## Logs
+
+Existing `tracing` events are bridged to OTLP log records via
+`opentelemetry-appender-tracing`. The bridge is added to each binary's registry
+by `otel_layer` alongside the trace layer (as a `Vec<Box<dyn Layer>>` so both
+sit at one level). Records carry the active trace/span id for correlation.
+
+The fmt → stderr/journald logging is unchanged; OTLP logs are additive and
+respect the same `EnvFilter`. The bridge **excludes `opentelemetry*` targets**
+so the exporter's own internal logs can't feed back into the exporter and storm
+on a persistent export failure.
+
 ## Per-Context Traces
 
 Each context gets a `trace_id` ([u8; 16], UUIDv4) at registration time. Every RPC
