@@ -12,6 +12,7 @@ tracing-subscriber = { version = "0.3", features = ["registry"] }
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 opentelemetry-otlp.workspace = true
+opentelemetry-appender-tracing.workspace = true
 tracing-opentelemetry.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread"] }
 
