@@ -107,17 +107,20 @@ fn alto_and_tenor_share_glyph_but_differ_in_y() {
 
 // --- Clef-aware notehead positioning ----------------------------------------
 //
-// In bass clef, D3 (ABC "D" with octave=0 → uppercase D) sits on the middle
-// line of the staff. y = 2*sp = 20.0.
-// In treble clef, that same D3 lands a 9th below middle line — well below the
-// staff (pos 6.5 → y = 65.0).
+// D3 in ABC is `D,` — uppercase D is the middle-C-octave D4 (ABC octave 0 =
+// C4–B4), and a single comma drops it to octave -1 = D3. (Feeding bare `D`
+// here is a D4, an octave too high — the trap these tests fell into before
+// the octave-mapping correction.)
+//
+// In bass clef, D3 sits exactly on the middle line: pos 2.0 → y = 2*sp = 20.0.
+// In treble clef the same D3 lands six positions below the middle line (B4) —
+// well below the bottom line: pos 8.0 → y = 80.0.
 
 #[test]
 fn d3_lands_on_bass_middle_line() {
-    // ABC: uppercase D with no octave marks = (D, octave=0) = D3 (one octave
-    // below middle C). K:none clef=bass keeps the key signature out of the
-    // way so we only get the notehead glyph at the expected y.
-    let els = engrave_default("X:1\nT:Test\nK:none clef=bass\nD\n");
+    // `D,` = (D, octave -1) = D3. K:none clef=bass keeps the key signature
+    // out of the way so we only get the notehead glyph at the expected y.
+    let els = engrave_default("X:1\nT:Test\nK:none clef=bass\nD,\n");
     let notes = glyphs(&els, FILLED_NOTEHEAD);
     assert_eq!(notes.len(), 1, "expected one notehead");
     let (_, y) = notes[0];
@@ -130,8 +133,8 @@ fn d3_lands_on_bass_middle_line() {
 
 #[test]
 fn d3_lands_below_treble_staff() {
-    // Same note, treble clef — should be well below the 40.0 bottom line.
-    let els = engrave_default("X:1\nT:Test\nK:none\nD\n");
+    // Same note (D3), treble clef — should be well below the 40.0 bottom line.
+    let els = engrave_default("X:1\nT:Test\nK:none\nD,\n");
     let notes = glyphs(&els, FILLED_NOTEHEAD);
     assert_eq!(notes.len(), 1);
     let (_, y) = notes[0];
