@@ -272,8 +272,21 @@ pub fn detect_output_content(output: &OutputData, _version: u64) -> Option<RichC
 /// Maximum SVG source size we'll attempt to parse (100KB).
 const SVG_MAX_BYTES: usize = 100 * 1024;
 
-/// Maximum rendered height for inline SVGs.
-pub const SVG_MAX_HEIGHT: f32 = 400.0;
+/// Soft cap on rendered height for inline SVG and ABC notation, used as the
+/// height term in the fit-to-block scale (`scale = min(width_fit, height_fit)`
+/// in `block_render`). Because it's the *height* term, it only binds for
+/// content that is tall relative to its width — e.g. a 4-part ABC score on
+/// four stacked staves — where the old 400px value forced the whole score
+/// (notes included) to shrink. Short/wide content is width-bound and never
+/// touched this cap.
+///
+/// Set to the GPU/Vello usable texture dimension (`VELLO_MAX_TEXTURE_DIM`,
+/// 8192) so it effectively defers to the real ceiling: the
+/// `GpuTextureLimits` clamp + texture-stretch fallback in `block_render`
+/// (see tech-debt: tall block texture stretching). Real scores are orders of
+/// magnitude shorter than this, so in practice tall multi-staff scores now
+/// render at width-fit scale instead of being squeezed.
+pub const SVG_MAX_HEIGHT: f32 = 8192.0;
 
 /// Try to extract and parse SVG content from block text.
 ///
