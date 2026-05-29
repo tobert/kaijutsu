@@ -230,24 +230,8 @@ impl ShouldSample for KaijutsuSampler {
             };
         }
 
-        // Determine rate by span name prefix
-        let rate = if name.starts_with("gen_ai")
-            || name.starts_with("llm")
-            || name.starts_with("engine")
-            || name.starts_with("tool")
-            || name.starts_with("drift")
-        {
-            1.0 // 100%
-        } else if name.starts_with("rpc") {
-            0.1 // 10%
-        } else if name.starts_with("sync") {
-            0.01 // 1%
-        } else {
-            0.1 // 10% default
-        };
-
         // Delegate to trace-id ratio sampler for deterministic decisions
-        Sampler::TraceIdRatioBased(rate).should_sample(
+        Sampler::TraceIdRatioBased(sampling_rate(name)).should_sample(
             parent_context,
             trace_id,
             name,
@@ -255,5 +239,74 @@ impl ShouldSample for KaijutsuSampler {
             attributes,
             links,
         )
+    }
+}
+
+/// Sampling rate for a span, selected by its name.
+///
+/// The high-value namespaces are **dot-qualified** (`drift.`, `engine.`, …) so
+/// that RPC/actor method spans never collide with them. The actor layer
+/// auto-names spans from the method (`drift_queue`, `drift_push`, …); without
+/// the dot, `starts_with("drift")` swept those into the 100% bucket and the
+/// app's 5s idle drift poll was fully sampled — ~10x its sibling
+/// `list_contexts`. The `rpc` family stays a bare prefix on purpose so it
+/// covers `rpc`, `rpc.request`, and `rpc_client.*` alike.
+fn sampling_rate(name: &str) -> f64 {
+    if name.starts_with("gen_ai.")
+        || name.starts_with("llm.")
+        || name.starts_with("engine.")
+        || name.starts_with("tool.")
+        || name.starts_with("drift.")
+    {
+        1.0 // 100% — high-value, low-volume namespaces
+    } else if name.starts_with("rpc") {
+        0.1 // 10% — rpc, rpc.request, rpc_client.* (high-volume Cap'n Proto)
+    } else if name.starts_with("sync") {
+        0.01 // 1% — very high-volume CRDT ops
+    } else {
+        0.1 // 10% default
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sampling_rate;
+
+    /// Regression: the auto-named actor/method span `drift_queue` (fired every
+    /// 5s by the app's idle drift poll) must be sampled at the default rate,
+    /// NOT mistaken for a `drift.{op}` engine span. This is the prefix
+    /// collision that made an idle kernel look busy.
+    #[test]
+    fn method_spans_do_not_collide_with_engine_namespaces() {
+        assert_eq!(sampling_rate("drift_queue"), 0.1);
+        assert_eq!(sampling_rate("drift_push"), 0.1);
+        assert_eq!(sampling_rate("drift_flush"), 0.1);
+    }
+
+    /// The dotted engine-style namespaces still sample at 100%.
+    #[test]
+    fn engine_style_namespaces_sample_full() {
+        assert_eq!(sampling_rate("drift.push"), 1.0);
+        assert_eq!(sampling_rate("drift.register"), 1.0);
+        assert_eq!(sampling_rate("engine.git"), 1.0);
+        assert_eq!(sampling_rate("engine.read"), 1.0);
+        assert_eq!(sampling_rate("tool.dispatch"), 1.0);
+        assert_eq!(sampling_rate("gen_ai.chat"), 1.0);
+        assert_eq!(sampling_rate("llm.prompt"), 1.0);
+    }
+
+    /// The rpc family — bare `rpc`, `rpc.request`, `rpc_client.*` — and other
+    /// unclassified method spans sample at 10%.
+    #[test]
+    fn rpc_family_and_methods_sampled_low() {
+        assert_eq!(sampling_rate("rpc"), 0.1);
+        assert_eq!(sampling_rate("rpc.request"), 0.1);
+        assert_eq!(sampling_rate("rpc_client.drift_queue"), 0.1);
+        assert_eq!(sampling_rate("list_contexts"), 0.1);
+    }
+
+    #[test]
+    fn sync_sampled_lowest() {
+        assert_eq!(sampling_rate("sync.push_ops"), 0.01);
     }
 }
