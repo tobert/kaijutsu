@@ -210,4 +210,50 @@ d43df35). See the `project-live-eval` memory for scope.
   captured as info fields but the playback path doesn't reorder bars
   according to a parts string. Per spec §3.2.
 
+## ABC engraving / kaijutsu-abc layout
+
+Surfaced while debugging 4-part hymn rendering (2026-05-29). The parser
+fix for body `V:` attributes shipped (`fix(abc): parse voice attributes
+on body V: switches`) and the in-app fit-height cap was raised from 400
+to the texture ceiling (`fix(app): raise ABC/SVG fit-height cap …`), so
+multi-staff scores no longer get squeezed. The following engraving-quality
+items remain. Open score (one staff per voice) is the supported path and
+is fine for testing; these are polish + the conventional hymn layout.
+
+- **Linear duration spacing — no measure justification.**
+  `duration_to_width` (`crates/kaijutsu-abc/src/engrave/layout.rs:1585`)
+  is purely proportional with a 0.25-unit floor: a half note is exactly
+  2× a quarter, a whole note 4×. Real engraving compresses this
+  (roughly logarithmic / Gould spacing, ~1.3–1.5× per doubling) and
+  justifies each measure to a target width. The current output looks
+  airy/loose for long-note material and ragged within a bar. Fix is a
+  spacing model in the layout pass; the duration→width call is the seam.
+
+- **No system bracket/brace joining staves (open score).** Each voice's
+  staff is laid out independently (`layout.rs` `engrave()` loop, ~line
+  331) with no left-edge bracket and no barlines drawn through the
+  inter-staff gap, so a multi-voice score reads as N detached staves
+  rather than one system. Cosmetic; ~half day (bracket glyph at left,
+  span barlines vertically across the group).
+
+- **Closed-score (grand-staff) layout + voice-on-staff grouping.**
+  Hymns conventionally print S+A on one treble staff (S stems up, A
+  down) and T+B on one bass staff — two staves, not four. Deferred;
+  not a current use case (hymns are test material, open score is fine).
+  Difficulty breakdown if revisited:
+  1. Parse `%%score (S A) (T B)` into a staff-grouping structure
+     (prereq; see the `%%` stylesheet-directives item above — `%%score`
+     is currently skipped). ~2h.
+  2. Render N voices onto one staff sharing lines/cursor/barlines —
+     the duration-proportional x-grid already aligns beats across
+     voices. ~half day.
+  3. Per-voice forced stem direction (voice 0 up, voice 1 down). ~2h.
+  4. **Collision handling** (notehead/accidental/rest displacement and
+     merging when two voices coincide). This is the hard, open-ended
+     part — 80/20 version (offset unisons/seconds, stack accidentals)
+     ~1 day; "always correct" Gould-quality is a long tail.
+  5. Brace + spanning barlines (overlaps the open-score bracket item). ~3h.
+  Pieces 1–3 + 5 (~1.5 days) give structurally-correct closed score that
+  reads fine for non-colliding voices; piece 4 is the unbounded cost.
+
 
