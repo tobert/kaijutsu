@@ -324,3 +324,16 @@ fn beamed_eighths_sixteenths() {
 fn chromatic_run_octave_regression() {
     run_case("chromatic_run");
 }
+
+/// Multi-voice regression: a 4-bar SATB hymn across four stacked staves
+/// (S/A treble, T/B bass). This is the only golden that exercises the
+/// multi-staff path in `layout::engrave` — independent per-voice layout,
+/// cross-voice staff-width normalization, and barline alignment between
+/// staves of equal per-bar duration. It also mixes half/quarter/eighth
+/// values (one beamed eighth pair in the soprano) so a per-voice cursor
+/// or duration-width regression that drifts the staves out of vertical
+/// alignment shows up immediately.
+#[test]
+fn hymn_four_part_satb() {
+    run_case("hymn_satb");
+}

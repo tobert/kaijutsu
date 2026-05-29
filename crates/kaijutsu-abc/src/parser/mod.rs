@@ -127,10 +127,15 @@ fn parse_one_tune(
     mode: ParseMode,
     file_header: &Header,
 ) -> Tune {
-    let (remaining, header) = header::parse_header(input, collector, mode);
+    let (remaining, mut header) = header::parse_header(input, collector, mode);
     let linebreak = linebreak_mode_from_header(&header);
     let mut user_symbols = build_user_symbols(file_header, &header);
-    let elements = body::parse_body(remaining, collector, mode, linebreak, &mut user_symbols);
+    let (elements, body_voice_defs) =
+        body::parse_body_with_voices(remaining, collector, mode, linebreak, &mut user_symbols);
+    // Voices declared inline in the body (`V:T clef=bass …`) are merged
+    // into the header's voice defs so the layout resolves their clef. A
+    // header def wins on conflict, but fills any field it left unset.
+    merge_body_voice_defs(&mut header.voice_defs, body_voice_defs);
     let voices = route_elements_to_voices(&header.voice_defs, elements);
     Tune { header, voices }
 }
@@ -229,6 +234,28 @@ fn inherit_from_file_header(tune: &mut Header, file: &Header) {
         let mut combined: Vec<InfoField> = file.other_fields.clone();
         combined.append(&mut tune.other_fields);
         tune.other_fields = combined;
+    }
+}
+
+/// Merge voice definitions discovered inline in the body into the header's
+/// list. A header definition takes precedence but inherits any field the
+/// body set that the header left unset (e.g. a header `V:T` with no clef
+/// picks up `clef=bass` from the body switch). Body-only voices are
+/// appended in encounter order so they render after header-declared ones.
+fn merge_body_voice_defs(
+    header_defs: &mut Vec<crate::ast::VoiceDef>,
+    body_defs: Vec<crate::ast::VoiceDef>,
+) {
+    for bd in body_defs {
+        if let Some(existing) = header_defs.iter_mut().find(|d| d.id == bd.id) {
+            existing.name = existing.name.take().or(bd.name);
+            existing.clef = existing.clef.or(bd.clef);
+            existing.octave = existing.octave.or(bd.octave);
+            existing.transpose = existing.transpose.or(bd.transpose);
+            existing.stem = existing.stem.or(bd.stem);
+        } else {
+            header_defs.push(bd);
+        }
     }
 }
 

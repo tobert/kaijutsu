@@ -222,6 +222,69 @@ C,D,E,F,|
     );
 }
 
+/// A 4-part hymn written with the voice declared *inline in the body*
+/// (`V:T clef=bass name="Tenor"` on its own line, music on the next),
+/// and no `K:` field at all — the shape models give us most often.
+///
+/// Regression: the standalone body `V:` handler used to consume only the
+/// voice id and leave `clef=… name="…"` in the stream, where it was lexed
+/// as stray notes ("clef" → C,E,F …). That corrupted the first voice and
+/// swallowed every voice after it, so the tenor/bass lines surfaced as raw
+/// text instead of staves. The attribute tail must be consumed *and* its
+/// clef applied, so all four voices render with the right clef.
+#[test]
+fn four_part_hymn_inline_voice_attributes() {
+    let abc = "\
+X:1
+M:4/4
+L:1/4
+%%score (S A T B)
+V:S clef=treble name=\"Soprano\"
+| G A B c |
+V:A clef=treble name=\"Alto\"
+| E F G A |
+V:T clef=bass name=\"Tenor\"
+| C D E F |
+V:B clef=bass name=\"Bass\"
+| C, D, E, F, |
+";
+    let result = parse(abc);
+    let tune = &result.value[0];
+
+    // All four voices must materialize, in declaration order.
+    let ids: Vec<_> = tune
+        .voices
+        .iter()
+        .filter_map(|v| v.id.clone())
+        .collect();
+    assert_eq!(ids, vec!["S", "A", "T", "B"], "four voices in order");
+
+    // No attribute text leaked as music: the soprano's first note is G4,
+    // not the C/E/F that "clef" would lex into.
+    let first_note = tune.voices[0]
+        .elements
+        .iter()
+        .find_map(|e| match e {
+            kaijutsu_abc::ast::Element::Note(n) => Some(n.pitch),
+            _ => None,
+        })
+        .expect("soprano has a note");
+    assert_eq!(
+        first_note,
+        kaijutsu_abc::ast::NoteName::G,
+        "soprano's first note is G, not leaked attribute text"
+    );
+
+    // Clefs are honored: S/A treble, T/B bass.
+    let els = engrave_default(abc);
+    assert_eq!(
+        glyphs(&els, TREBLE_CLEF).len(),
+        2,
+        "soprano + alto on treble"
+    );
+    assert_eq!(glyphs(&els, BASS_CLEF).len(), 2, "tenor + bass on bass clef");
+}
+
 #[test]
 fn voice_clef_overrides_header_clef() {
     // Header says treble, V:2 overrides to bass.

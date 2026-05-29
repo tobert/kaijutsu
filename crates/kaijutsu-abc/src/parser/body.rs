@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use winnow::prelude::*;
 
-use crate::ast::{Bar, Element, InfoField, LinebreakMode, Tuplet};
+use crate::ast::{Bar, Element, InfoField, LinebreakMode, Tuplet, VoiceDef};
 use crate::feedback::FeedbackCollector;
 use crate::ParseMode;
 
@@ -34,9 +34,28 @@ pub fn parse_body(
     linebreak: LinebreakMode,
     user_symbols: &mut HashMap<char, String>,
 ) -> Vec<Element> {
-    parse_body_inner(input, collector, mode, linebreak, user_symbols, 0)
+    parse_body_with_voices(input, collector, mode, linebreak, user_symbols).0
 }
 
+/// Like [`parse_body`], but also returns any voice definitions discovered
+/// inline in the body — `V:T clef=bass name="Tenor"` switch lines that
+/// carry attributes. The caller merges these into the header's voice
+/// defs so the layout can resolve each voice's clef even when the tune
+/// declares its voices in the body rather than the header.
+pub fn parse_body_with_voices(
+    input: &str,
+    collector: &mut FeedbackCollector,
+    mode: ParseMode,
+    linebreak: LinebreakMode,
+    user_symbols: &mut HashMap<char, String>,
+) -> (Vec<Element>, Vec<VoiceDef>) {
+    let mut voice_defs = Vec::new();
+    let elements =
+        parse_body_inner(input, collector, mode, linebreak, user_symbols, 0, &mut voice_defs);
+    (elements, voice_defs)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn parse_body_inner(
     input: &str,
     collector: &mut FeedbackCollector,
@@ -44,6 +63,7 @@ fn parse_body_inner(
     linebreak: LinebreakMode,
     user_symbols: &mut HashMap<char, String>,
     expansion_depth: u8,
+    voice_defs: &mut Vec<VoiceDef>,
 ) -> Vec<Element> {
     let mut elements: Vec<Element> = Vec::new();
     let mut remaining = input;
@@ -284,6 +304,7 @@ fn parse_body_inner(
                             linebreak,
                             user_symbols,
                             expansion_depth + 1,
+                            voice_defs,
                         );
                         elements.extend(expanded);
                     } else {
@@ -299,7 +320,7 @@ fn parse_body_inner(
         }
 
         // Try to parse an element
-        if let Some(element) = try_parse_element(&mut remaining, collector) {
+        if let Some(element) = try_parse_element(&mut remaining, collector, voice_defs) {
             elements.push(element);
             at_line_start = false;
         } else if !remaining.is_empty() {
@@ -496,8 +517,15 @@ fn try_parse_line_start_field(remaining: &mut &str) -> Option<Element> {
 }
 
 /// Try to parse a single element from the input
-fn try_parse_element(input: &mut &str, collector: &mut FeedbackCollector) -> Option<Element> {
-    // Try standalone voice switch V:id (at start of line typically)
+fn try_parse_element(
+    input: &mut &str,
+    collector: &mut FeedbackCollector,
+    voice_defs: &mut Vec<VoiceDef>,
+) -> Option<Element> {
+    // Try standalone voice switch V:id (at start of line typically). The
+    // id may be followed by voice attributes (`V:T clef=bass name="…"`);
+    // those are consumed here — not left to be lexed as music — and any
+    // clef/name recorded so the layout can resolve this voice's clef.
     if input.starts_with("V:") {
         let rest = &input[2..];
         // Get voice ID (up to whitespace or end of line)
@@ -506,6 +534,10 @@ fn try_parse_element(input: &mut &str, collector: &mut FeedbackCollector) -> Opt
             .unwrap_or(rest.len());
         let voice_id = rest[..id_end].trim().to_string();
         *input = &rest[id_end..];
+        let attrs = consume_voice_attributes(input);
+        if !attrs.is_empty() {
+            record_voice_def(voice_defs, &voice_id, &attrs, collector);
+        }
         return Some(Element::VoiceSwitch(voice_id));
     }
 
@@ -530,10 +562,20 @@ fn try_parse_element(input: &mut &str, collector: &mut FeedbackCollector) -> Opt
     if input.starts_with('[') {
         // Could be chord or inline field
         if input.len() >= 3 && input.chars().nth(2) == Some(':') {
-            // Check for voice switch [V:id]
+            // Check for voice switch [V:id]. The bracketed form can also
+            // carry attributes (`[V:T clef=bass]`); split the id from them
+            // so the switch target stays a bare id and the clef is recorded.
             if input.starts_with("[V:") {
                 if let Some(field) = try_parse_inline_field(input) {
-                    return Some(Element::VoiceSwitch(field.value));
+                    let value = field.value.trim();
+                    let (voice_id, attrs) = match value.find(char::is_whitespace) {
+                        Some(sp) => (value[..sp].to_string(), value[sp..].trim()),
+                        None => (value.to_string(), ""),
+                    };
+                    if !attrs.is_empty() {
+                        record_voice_def(voice_defs, &voice_id, attrs, collector);
+                    }
+                    return Some(Element::VoiceSwitch(voice_id));
                 }
             }
             // Other inline field [M:3/4]
@@ -740,13 +782,15 @@ fn try_parse_tuplet(input: &mut &str, collector: &mut FeedbackCollector) -> Opti
         (default_q, p)
     };
 
-    // Parse r elements
+    // Parse r elements. A voice switch can't appear inside a tuplet, so
+    // discovered voice defs are routed to a throwaway sink here.
     let mut elements = Vec::new();
+    let mut tuplet_voice_defs = Vec::new();
     for _ in 0..r {
         // Skip spaces
         skip_spaces(input);
 
-        if let Some(elem) = try_parse_element(input, collector) {
+        if let Some(elem) = try_parse_element(input, collector, &mut tuplet_voice_defs) {
             elements.push(elem);
         } else {
             break;
@@ -800,6 +844,71 @@ fn try_parse_grace_notes(input: &mut &str) -> Option<Element> {
 }
 
 /// Try to parse an inline field [M:3/4]
+/// Voice-attribute keys recognized on a body `V:` switch, mirroring the
+/// header's `parse_voice_def`. Each is a `key=value` pair; `name=` may be
+/// quoted. Anything not on this list ends the attribute run (so music
+/// following a switch on the same line — `V:1 abc` — is left untouched).
+const VOICE_ATTR_KEYS: &[&str] = &[
+    "name",
+    "subname",
+    "sname",
+    "snm",
+    "clef",
+    "octave",
+    "transpose",
+    "stem",
+];
+
+/// Consume a leading run of `key=value` voice attributes from `input`,
+/// quote-aware so `name="Lead Melody"` survives the embedded space.
+/// Advances `input` past the consumed attributes (leaving any trailing
+/// newline / music in place) and returns the consumed attribute text.
+fn consume_voice_attributes(input: &mut &str) -> String {
+    let original: &str = input;
+    let mut cur: &str = input;
+    let mut committed: &str = input;
+    loop {
+        let trimmed = cur.trim_start_matches([' ', '\t']);
+        let Some(key) = VOICE_ATTR_KEYS
+            .iter()
+            .find(|k| trimmed.starts_with(**k) && trimmed[k.len()..].starts_with('='))
+        else {
+            break;
+        };
+        let after_eq = &trimmed[key.len() + 1..];
+        let val_len = if let Some(rest) = after_eq.strip_prefix('"') {
+            // Through the closing quote (or to end if unterminated).
+            rest.find('"').map(|q| q + 2).unwrap_or(after_eq.len())
+        } else {
+            after_eq
+                .find(|c: char| c.is_whitespace() || c == '|')
+                .unwrap_or(after_eq.len())
+        };
+        cur = &after_eq[val_len..];
+        committed = cur;
+    }
+    let consumed_len = original.len() - committed.len();
+    *input = committed;
+    original[..consumed_len].trim().to_string()
+}
+
+/// Record a voice definition discovered on a body `V:` switch. The header
+/// parser already knows how to turn `id name="…" clef=… …` into a
+/// `VoiceDef`, so reuse it. Later body lines may repeat the same id with
+/// fewer attributes; keep the first definition that carried each id.
+fn record_voice_def(
+    voice_defs: &mut Vec<VoiceDef>,
+    voice_id: &str,
+    attrs: &str,
+    collector: &mut FeedbackCollector,
+) {
+    if voice_defs.iter().any(|d| d.id == voice_id) {
+        return;
+    }
+    let def = super::header::parse_voice_def(&format!("{voice_id} {attrs}"), collector);
+    voice_defs.push(def);
+}
+
 fn try_parse_inline_field(input: &mut &str) -> Option<InfoField> {
     if !input.starts_with('[') {
         return None;

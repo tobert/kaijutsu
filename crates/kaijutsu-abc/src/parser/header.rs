@@ -360,7 +360,7 @@ fn infer_unit_length(meter: &Option<Meter>) -> UnitLength {
 /// - `V:1`
 /// - `V:Melody name="Lead Melody" clef=treble`
 /// - `V:Bass clef=bass octave=-1`
-fn parse_voice_def(value: &str, _collector: &mut FeedbackCollector) -> VoiceDef {
+pub(super) fn parse_voice_def(value: &str, _collector: &mut FeedbackCollector) -> VoiceDef {
     let trimmed = value.trim();
 
     // Split into tokens - first is the ID, rest are key=value pairs
