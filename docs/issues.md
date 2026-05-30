@@ -139,6 +139,17 @@ Holographic shader trio + entry animation shipped. Open:
 - **Distill model selection.** `formation_edges`-style `auto_distill`
   defaults to the source context's model (potentially Opus). Add a
   `distill_model` knob so cheap models can do summarization.
+- **`kj wait`.** POSIX `wait()` for forks: block the caller until a
+  child context drifts back (or exits). `kj fork --prompt` already runs
+  the child autonomously and the parent keeps going (`turn.requested`
+  bus → server turn driver); `kj wait <child>` is the join side — let a
+  parent gather results when it explicitly wants them, instead of only
+  via async drift-on-next-turn. Same shape as Claude Code subagents.
+- **Autonomous turn runaway guard.** A `--prompt` fork drives one turn;
+  if that turn forks-and-seeds again, drives fan out unbounded. No cap
+  today (deliberate — wait for a real problem before paying for it).
+  When it bites: carry a `drive_depth` in `TurnFlow::Requested` and
+  refuse past a cap, mirroring `MAX_RC_DEPTH` in `kj/lifecycle.rs`.
 
 ## Live eval
 
