@@ -316,11 +316,28 @@ impl KernelHandle {
 
     /// Create a new context with an optional label.
     ///
-    /// Returns the server-assigned ContextId.
+    /// Returns the server-assigned ContextId. The context is born with the
+    /// `"default"` context_type — use [`create_context_typed`] to pick a mode
+    /// (e.g. `"coder"`, `"mcp"`) whose rc lifecycle then runs on creation.
     #[tracing::instrument(skip(self), name = "rpc_client.create_context")]
     pub async fn create_context(&self, label: &str) -> Result<ContextId, RpcError> {
+        self.create_context_typed(label, "").await
+    }
+
+    /// Create a new context with a label and an explicit `context_type`.
+    ///
+    /// The type selects which `/etc/rc/<context_type>/create/*` lifecycle
+    /// scripts run server-side. An empty `context_type` is treated as
+    /// `"default"` by the server.
+    #[tracing::instrument(skip(self), name = "rpc_client.create_context_typed")]
+    pub async fn create_context_typed(
+        &self,
+        label: &str,
+        context_type: &str,
+    ) -> Result<ContextId, RpcError> {
         let mut request = self.kernel.create_context_request();
         request.get().set_label(label);
+        request.get().set_context_type(context_type);
         let response = request.send().promise.await?;
         parse_context_id(response.get()?.get_id()?)
     }

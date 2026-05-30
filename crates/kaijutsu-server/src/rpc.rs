@@ -2378,6 +2378,14 @@ impl kernel::Server for KernelImpl {
         mut results: kernel::CreateContextResults,
     ) -> Promise<(), capnp::Error> {
         let label = pry!(pry!(pry!(params.get()).get_label()).to_str()).to_owned();
+        // Empty context_type on the wire (old clients, plain `create_context`)
+        // means "default" — the mode bundle whose rc create-scripts run below.
+        let context_type_raw = pry!(pry!(pry!(params.get()).get_context_type()).to_str()).to_owned();
+        let context_type = if context_type_raw.is_empty() {
+            "default".to_string()
+        } else {
+            context_type_raw
+        };
 
         let kernel = self.kernel.clone();
         let connection = self.connection.clone();
@@ -2453,7 +2461,7 @@ impl kernel::Server for KernelImpl {
                     system_prompt: None,
                     consent_mode: kaijutsu_kernel::control::ConsentMode::Collaborative,
                     context_state: kaijutsu_types::ContextState::Live,
-                    context_type: "default".to_string(),
+                    context_type: context_type.clone(),
                     created_at: kaijutsu_types::now_millis() as i64,
                     created_by,
                     forked_from: parent_ctx,
@@ -2492,6 +2500,27 @@ impl kernel::Server for KernelImpl {
                     context_id,
                     label_ref
                 );
+            }
+
+            // Run rc create-lifecycle scripts for this context_type — the same
+            // hook `kj context create` fires. Without this, app- and MCP-born
+            // contexts (which take this RPC path, not the kj dispatcher) would
+            // silently skip their stance / cache / policy seeding. Failures
+            // surface as Error blocks in the new context; they don't abort
+            // creation.
+            let rc_caller = kaijutsu_kernel::KjCaller {
+                principal_id: created_by,
+                context_id: Some(context_id),
+                session_id,
+                confirmed: false,
+                rc_depth: 0,
+            };
+            if let Err(e) = kernel
+                .kj_dispatcher
+                .run_rc_lifecycle("create", context_id, parent_ctx, None, None, &rc_caller)
+                .await
+            {
+                log::warn!("rc create lifecycle for {}: {e}", context_id.short());
             }
 
             results.get().set_id(context_id.as_bytes());

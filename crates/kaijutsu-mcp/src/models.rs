@@ -125,6 +125,12 @@ pub struct RegisterSessionRequest {
     /// Human-readable label for the context (auto-generated if omitted).
     #[schemars(description = "Human-readable label for the context (auto-generated if omitted)")]
     pub label: Option<String>,
+    /// Context mode bundle (context_type). Selects which rc lifecycle scripts
+    /// and tool policy the new context is born with. Defaults to "mcp".
+    #[schemars(
+        description = "Context mode (context_type) — selects rc lifecycle + tool policy. Defaults to \"mcp\""
+    )]
+    pub context_type: Option<String>,
 }
 
 // ============================================================================

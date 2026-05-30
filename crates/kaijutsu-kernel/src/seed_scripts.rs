@@ -109,6 +109,25 @@ share findings between contexts, cache to amortize prompt-token cost,
 rc to install lifecycle scripts, block to inspect the conversation.
 ";
 
+/// The `mcp` context_type's stance. This is the default mode for a context
+/// born from `register_session` — an external agent (Claude Code, Gemini CLI,
+/// opencode) driving the kernel over the narrow MCP surface, with
+/// `context_shell` as the entry point and `kj` as the rich command surface.
+const MCP_STANCE_BODY: &str = "\
+You are driving a kaijutsu context from outside the kernel, over MCP.
+`context_shell` is your entry point; everything rich happens by running
+`kj …` and shell commands through it. We work as equals: ask clarifying
+questions, push back when a prompt is ambiguous, name another option.
+
+The standard we walk by is the standard we accept (改善). Note problems
+we can fix later in auto-memory or the active plan; then move on.
+
+`kj` is the kernel's command surface: `kj context` to see where you are,
+`kj fork` to explore safely, `kj drift` to share findings between
+contexts, `kj block` to inspect the conversation, `kj help` for the rest.
+Prefer `kj` over guessing — it carries structured `--json` output.
+";
+
 const SEED_SCRIPTS: &[SeedScript] = &[
     // ── default context_type — cache recipe only ───────────────────────
     SeedScript {
@@ -175,6 +194,47 @@ const SEED_SCRIPTS: &[SeedScript] = &[
     SeedScript {
         path: "/etc/rc/coder/drift/S40-cache.kai",
         context_type: "coder",
+        verb: "drift",
+        sort_key: "S40",
+        name: "cache",
+        extension: "kai",
+        content: CACHE_DRIFT_BODY,
+        timeout_secs: None,
+    },
+    // ── mcp context_type — stance + cache (default for register_session) ──
+    SeedScript {
+        path: "/etc/rc/mcp/create/S00-stance.md",
+        context_type: "mcp",
+        verb: "create",
+        sort_key: "S00",
+        name: "stance",
+        extension: "md",
+        content: MCP_STANCE_BODY,
+        timeout_secs: None,
+    },
+    SeedScript {
+        path: "/etc/rc/mcp/create/S20-cache.kai",
+        context_type: "mcp",
+        verb: "create",
+        sort_key: "S20",
+        name: "cache",
+        extension: "kai",
+        content: CACHE_CREATE_BODY,
+        timeout_secs: None,
+    },
+    SeedScript {
+        path: "/etc/rc/mcp/fork/S30-cache.kai",
+        context_type: "mcp",
+        verb: "fork",
+        sort_key: "S30",
+        name: "cache",
+        extension: "kai",
+        content: CACHE_FORK_BODY,
+        timeout_secs: None,
+    },
+    SeedScript {
+        path: "/etc/rc/mcp/drift/S40-cache.kai",
+        context_type: "mcp",
         verb: "drift",
         sort_key: "S40",
         name: "cache",

@@ -43,6 +43,42 @@ following are explicit follow-ups that did not ship:
   `builtin.policy` get/set surface; per-principal accounting is the
   next layer up.
 
+## Context-type tool policy (unified governance)
+
+Goal: one capability policy per context, seeded per `context_type` via
+rc, governing **both** tool consumers — the in-kernel LLM loop and an
+external MCP agent. They are not two stacks; they are two *drivers* that
+converge at the kernel + broker (in-kernel: `broker.call_tool`; external:
+`context_shell` → `kj`/kaish). Govern the convergence point, with the
+enforcement style each driver needs: **hide** at
+`broker.list_visible_tools` for the in-kernel model, **refuse** at the
+`kj`/kaish layer for the external agent. No rmcp dynamic `list_tools`
+needed; `context_shell` stays always-present.
+
+Shipped (Phase 1): the divergent context-creation path is closed — the
+RPC `create_context` handler now runs `run_rc_lifecycle("create", …)`
+and honors a wire `contextType`, so app- and MCP-born contexts get rc
+like `kj context create` always did. `register_session` defaults new
+contexts to the new `mcp` context_type.
+
+Remaining:
+- **Capability taxonomy + policy row.** Generalize `ContextToolBinding`
+  (today instance-granular only — `mcp/binding.rs`) to a tool-granular
+  allow-set spanning broker `instance:tool` ids and `facade:` ids
+  (`context_shell`, `shell`, `*_input`). Default permissive.
+- **rc-native setter.** Add `kj binding`/`kj policy` to the kj
+  dispatcher delegating to the public `broker.bind/unbind/binding`, so
+  rc `.kai` scripts can write a context's loadout. (Today bindings are
+  reachable only from the `builtin.bindings` MCP tool — backwards vs.
+  the kj-is-rich stance.)
+- **External enforcement.** `kj`/kaish consults the policy before a
+  mutating subcommand and refuses — also the hook a read-only "explorer"
+  context_type will hang off.
+- **Restricted role bundles.** explorer (read-only), director
+  (block/peer tools) — deferred; needs the taxonomy above. Note read vs.
+  write tools are *mixed* inside `builtin.file`/`builtin.block`, so
+  fine-grained roles need tool-granular policy or instance-splitting.
+
 ## LLM providers
 
 - **Cross-turn thinking continuity.** `hydrate_from_blocks` skips

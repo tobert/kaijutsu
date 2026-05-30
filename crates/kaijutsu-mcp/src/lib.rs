@@ -883,8 +883,14 @@ impl KaijutsuMcp {
             session.unwrap_or_else(|| format!("mcp-{}", &ContextId::new().short()))
         });
 
-        // 1. Create context on the server
-        let context_id = match remote.actor.create_context(&label).await {
+        // 1. Create context on the server. MCP-attached contexts default to
+        // the "mcp" mode bundle so their rc lifecycle + tool policy runs.
+        let context_type = req.context_type.unwrap_or_else(|| "mcp".to_string());
+        let context_id = match remote
+            .actor
+            .create_context_typed(&label, &context_type)
+            .await
+        {
             Ok(id) => id,
             Err(e) => return format!("Error creating context: {e}"),
         };

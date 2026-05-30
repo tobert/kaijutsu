@@ -883,7 +883,7 @@ interface Kernel {
 
   # Context management (ContextId = 16-byte UUIDv7 as Data)
   listContexts @15 (trace :TraceContext) -> (contexts :List(ContextHandleInfo));
-  createContext @16 (label :Text) -> (id :Data);
+  createContext @16 (label :Text, contextType :Text) -> (id :Data);
   joinContext @17 (contextId :Data, instance :Text, trace :TraceContext) -> (contextId :Data);
 
   # MCP (Model Context Protocol) management

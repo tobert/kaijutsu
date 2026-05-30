@@ -527,3 +527,65 @@ fn test_fork_with_prompt_drives_autonomous_turn() {
         );
     });
 }
+
+// ============================================================================
+// rc create-lifecycle runs on the RPC creation path (app / MCP), not just
+// `kj context create`. Regression guard for the divergent-creation-path bug:
+// register_session / the GUI create dialog go through the kernel RPC
+// `create_context`, which used to skip rc entirely.
+// ============================================================================
+
+#[test]
+fn test_rpc_created_context_runs_rc_create() {
+    run_local(async {
+        let addr = start_server_with_mock_llm().await;
+        let client = connect_client(addr).await;
+        let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
+
+        // Create a context with the "coder" mode bundle over the RPC path —
+        // the same path the GUI app and MCP facade take. Its rc create
+        // lifecycle (`/etc/rc/coder/create/S00-stance.md`) installs the coder
+        // stance as a System/Text block.
+        let ctx = kernel
+            .create_context_typed("rc-coder", "coder")
+            .await
+            .expect("create_context_typed");
+        let _ = kernel.join_context(ctx, "test").await.unwrap();
+
+        let blocks = get_all_blocks(&kernel, ctx).await;
+        let has_stance = blocks.iter().any(|b| {
+            b.role == Role::System
+                && b.kind == BlockKind::Text
+                && b.content.contains("You are coding inside kaijutsu")
+        });
+        assert!(
+            has_stance,
+            "expected coder stance block from rc create lifecycle on an \
+             RPC-created context; got {} blocks: {:#?}",
+            blocks.len(),
+            blocks
+        );
+    });
+}
+
+#[test]
+fn test_rpc_default_context_type_is_default() {
+    run_local(async {
+        let addr = start_server_with_mock_llm().await;
+        let client = connect_client(addr).await;
+        let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
+
+        // Plain create_context (empty context_type on the wire) must still
+        // land as "default" — no coder stance leaks in.
+        let ctx = kernel.create_context("plain").await.unwrap();
+        let _ = kernel.join_context(ctx, "test").await.unwrap();
+
+        let blocks = get_all_blocks(&kernel, ctx).await;
+        assert!(
+            !blocks
+                .iter()
+                .any(|b| b.content.contains("You are coding inside kaijutsu")),
+            "default context must not get the coder stance"
+        );
+    });
+}

@@ -295,6 +295,7 @@ enum RpcCommand {
     },
     CreateContext {
         label: String,
+        context_type: String,
         reply: oneshot::Sender<Result<ContextId, CallError>>,
     },
 
@@ -648,8 +649,22 @@ impl ActorHandle {
 
     #[tracing::instrument(skip(self))]
     pub async fn create_context(&self, label: &str) -> Result<ContextId, CallError> {
+        self.create_context_typed(label, "").await
+    }
+
+    /// Create a context with an explicit `context_type` (mode bundle).
+    ///
+    /// The type selects which `/etc/rc/<context_type>/create/*` scripts run
+    /// server-side. Empty `context_type` is treated as `"default"`.
+    #[tracing::instrument(skip(self))]
+    pub async fn create_context_typed(
+        &self,
+        label: &str,
+        context_type: &str,
+    ) -> Result<ContextId, CallError> {
         self.send(|reply| RpcCommand::CreateContext {
             label: label.into(),
+            context_type: context_type.into(),
             reply,
         })
         .await
@@ -1940,8 +1955,18 @@ async fn dispatch_kernel_command(
         RpcCommand::ListContexts { reply } => {
             dispatch!(kernel, reply, close_tx, k, k.list_contexts());
         }
-        RpcCommand::CreateContext { label, reply } => {
-            dispatch!(kernel, reply, close_tx, k, k.create_context(&label));
+        RpcCommand::CreateContext {
+            label,
+            context_type,
+            reply,
+        } => {
+            dispatch!(
+                kernel,
+                reply,
+                close_tx,
+                k,
+                k.create_context_typed(&label, &context_type)
+            );
         }
 
         // ── CRDT Sync ──
