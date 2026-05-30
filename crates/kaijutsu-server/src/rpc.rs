@@ -101,6 +101,7 @@ use kaijutsu_kernel::{
     SharedInputDocFlowBus,
     VfsOps,
     block_store::BlockStore,
+    flows::TurnFlow,
     shared_block_flow_bus,
     shared_config_flow_bus,
     shared_input_doc_flow_bus,
@@ -354,13 +355,18 @@ pub fn spawn_turn_driver(registry: Arc<ServerRegistry>) {
             let mut sub = kernel.kernel.turn_flows().subscribe("turn.requested");
             log::info!("Turn driver online");
             while let Some(msg) = sub.recv().await {
-                let kaijutsu_kernel::flows::TurnFlow::Requested {
+                let TurnFlow::Requested {
                     context_id,
                     after_block_id,
                     content,
                     principal_id,
                     model,
-                } = msg.payload;
+                } = msg.payload
+                else {
+                    // The driver only subscribes to turn.requested; completion
+                    // and failure events are observed elsewhere (e.g. kj wait).
+                    continue;
+                };
                 // Headless turn: no interactive session, so synthesize the
                 // execution context. cwd is the root — fork copies the parent's
                 // shell config separately; the turn itself doesn't need it.
@@ -371,7 +377,7 @@ pub fn spawn_turn_driver(registry: Arc<ServerRegistry>) {
                     kaijutsu_types::SessionId::new(),
                     kernel.kernel.id(),
                 );
-                if let Err(e) = spawn_llm_for_prompt(
+                match spawn_llm_for_prompt(
                     kernel,
                     context_id,
                     &content,
@@ -382,7 +388,50 @@ pub fn spawn_turn_driver(registry: Arc<ServerRegistry>) {
                 )
                 .await
                 {
-                    log::warn!("turn.requested: failed to drive turn for {context_id}: {e}");
+                    Ok(()) => {
+                        kernel.kernel.turn_flows().publish(TurnFlow::Completed {
+                            context_id,
+                            principal_id,
+                        });
+                    }
+                    Err(e) => {
+                        let err = e.to_string();
+                        log::warn!(
+                            "turn.requested: failed to drive turn for {context_id}: {err}"
+                        );
+                        // Surface the failure as a visible Error block in the
+                        // child context — same `insert_error_block_as` error-block
+                        // API the LLM stream uses (llm_stream.rs report_llm_error),
+                        // anchored at the turn's `after_block_id` — so the dropped
+                        // turn isn't silently invisible.
+                        let payload = kaijutsu_types::ErrorPayload {
+                            category: kaijutsu_types::ErrorCategory::Stream,
+                            severity: kaijutsu_types::ErrorSeverity::Error,
+                            code: None,
+                            detail: Some(format!(
+                                "autonomous turn failed to run for this context: {err}"
+                            )),
+                            span: None,
+                            source_kind: None,
+                        };
+                        let summary = payload.summary_line();
+                        if let Err(insert_err) = kernel.documents.insert_error_block_as(
+                            context_id,
+                            &after_block_id,
+                            &payload,
+                            summary,
+                            Some(principal_id),
+                        ) {
+                            log::warn!(
+                                "turn.requested: failed to insert error block for {context_id}: {insert_err}"
+                            );
+                        }
+                        kernel.kernel.turn_flows().publish(TurnFlow::Failed {
+                            context_id,
+                            principal_id,
+                            error: err,
+                        });
+                    }
                 }
             }
             log::warn!("Turn driver: turn bus closed, driver exiting");

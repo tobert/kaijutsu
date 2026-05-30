@@ -180,12 +180,41 @@ Holographic shader trio + entry animation shipped. Open:
   the child autonomously and the parent keeps going (`turn.requested`
   bus → server turn driver); `kj wait <child>` is the join side — let a
   parent gather results when it explicitly wants them, instead of only
-  via async drift-on-next-turn. Same shape as Claude Code subagents.
+  via async drift-on-next-turn. Same shape as Claude Code subagents. The
+  completion substrate now exists: the turn driver publishes
+  `TurnFlow::Completed { context_id, principal_id }` on success and
+  `TurnFlow::Failed { context_id, principal_id, error }` on failure
+  (topics `turn.completed` / `turn.failed`), so the join side finally has
+  something to block on. Remaining work: the `kj wait` command itself +
+  its blocking semantics + the cross-fork "what does turn-complete
+  actually mean" question (one turn vs. a quiescent child that may itself
+  have fanned out more `--prompt` children).
 - **Autonomous turn runaway guard.** A `--prompt` fork drives one turn;
   if that turn forks-and-seeds again, drives fan out unbounded. No cap
   today (deliberate — wait for a real problem before paying for it).
-  When it bites: carry a `drive_depth` in `TurnFlow::Requested` and
-  refuse past a cap, mirroring `MAX_RC_DEPTH` in `kj/lifecycle.rs`.
+  Still needs `drive_depth` plumbing: add a `drive_depth` field to
+  `TurnFlow::Requested`, thread the incoming depth through the turn
+  driver (`rpc.rs` `spawn_turn_driver`) → `ExecContext`/`KjCaller` →
+  `request_child_turn` (publishing `depth + 1`), and refuse to drive past
+  a cap, mirroring `MAX_RC_DEPTH` in `kj/lifecycle.rs`.
+- **TurnFlow bus is lossy + in-memory.** The FlowBus drops the oldest
+  events on overflow and holds nothing across a server restart. A dropped
+  `turn.requested` = a child that was seeded but never acts. The
+  zero-subscriber case now at least writes a visible Error block
+  (`request_child_turn`), but an overflow-drop with a live subscriber is
+  silent. Revisit with persistence / reconciliation (e.g. a "pending
+  turns" table the driver drains on startup) when it bites.
+- **Headless turn cwd is `/`.** The turn driver synthesizes its
+  `ExecContext` with cwd `/` (`rpc.rs` `spawn_turn_driver`), so a
+  `--prompt` child running shell tools won't be in the project dir — even
+  though fork copies the parent's shell config (`fork_context_config`).
+  Decide whether to thread the context's stored shell cwd
+  (`get_context_shell`) into the headless `ExecContext`.
+- **`--switch --prompt` double-drives.** With both flags the caller is
+  moved into the child (Switch) *and* an autonomous turn fires there
+  (`request_child_turn`). The human and the autonomous turn then race in
+  the same child. Decide whether `--switch` should suppress the
+  autonomous turn (let the human drive) or keep both.
 
 ## Live eval
 

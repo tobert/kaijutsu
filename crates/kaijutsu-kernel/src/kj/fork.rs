@@ -453,8 +453,8 @@ impl KjDispatcher {
             ));
         }
 
-        if let Some(note) = prompt
-            && let Err(e) = self.inject_fork_note(new_id, source_id, &note)
+        if let Some(note) = &prompt
+            && let Err(e) = self.inject_fork_note(new_id, source_id, note)
         {
             return KjResult::Err(format!(
                 "kj fork --shallow: failed to inject fork note: {e}"
@@ -501,17 +501,20 @@ impl KjDispatcher {
             tracing::warn!("rc fork lifecycle (shallow): {e}");
         }
 
+        // POSIX-style: drive the child's autonomous turn (if --prompt) after all
+        // fork-time block injections + rc lifecycle, then honor stay-on-parent
+        // default / --switch via fork_outcome.
+        let switch = has_flag(argv, &["--switch"]);
+        self.request_child_turn(new_id, prompt.as_deref(), staging, caller);
         let short = new_id.short();
         let display = label.as_deref().unwrap_or(&short);
-        KjResult::Switch(
-            new_id,
-            format!(
-                "shallow-forked to '{}' ({}, depth {})",
-                display,
-                new_id.short(),
-                depth
-            ),
-        )
+        let message = format!(
+            "shallow-forked to '{}' ({}, depth {})",
+            display,
+            new_id.short(),
+            depth
+        );
+        self.fork_outcome(new_id, label.as_deref(), switch, message)
     }
 
     async fn fork_compact(&self, argv: &[String], caller: &KjCaller) -> KjResult {
@@ -574,8 +577,8 @@ impl KjDispatcher {
         }
 
         // If --prompt given, inject a fork note after the summary
-        if let Some(note) = prompt
-            && let Err(e) = self.inject_fork_note(new_id, source_id, &note)
+        if let Some(note) = &prompt
+            && let Err(e) = self.inject_fork_note(new_id, source_id, note)
         {
             tracing::warn!("failed to inject fork note: {e}");
         }
@@ -726,12 +729,15 @@ impl KjDispatcher {
             tracing::warn!("rc fork lifecycle (compact): {e}");
         }
 
+        // POSIX-style: drive the child's autonomous turn (if --prompt) after all
+        // fork-time block injections + rc lifecycle, then honor stay-on-parent
+        // default / --switch via fork_outcome.
+        let switch = has_flag(argv, &["--switch"]);
+        self.request_child_turn(new_id, prompt.as_deref(), staging, caller);
         let short = new_id.short();
         let display = label.as_deref().unwrap_or(&short);
-        KjResult::Switch(
-            new_id,
-            format!("compact-forked to '{}' ({})", display, new_id.short()),
-        )
+        let message = format!("compact-forked to '{}' ({})", display, new_id.short());
+        self.fork_outcome(new_id, label.as_deref(), switch, message)
     }
 
     async fn fork_subtree(&self, argv: &[String], caller: &KjCaller) -> KjResult {
@@ -752,6 +758,7 @@ impl KjDispatcher {
             }
         };
         let staging = has_flag(argv, &["--stage", "--staging"]);
+        let prompt = extract_named_arg(argv, &["--prompt"]);
 
         let source_id = match caller.require_context() {
             Ok(id) => id,
@@ -951,6 +958,15 @@ impl KjDispatcher {
 
         self.apply_fork_mcp_exclusions(new_root_id).await;
 
+        // If --prompt given, inject the fork note on the subtree root before the
+        // fork marker — matching fork_full's placement so the autonomous turn's
+        // anchor lands at the true tail.
+        if let Some(note) = &prompt
+            && let Err(e) = self.inject_fork_note(new_root_id, source_id, note)
+        {
+            return KjResult::Err(format!("kj fork --as: failed to inject fork note: {e}"));
+        }
+
         if let Err(e) = self.inject_fork_marker(
             new_root_id,
             source_id,
@@ -977,7 +993,11 @@ impl KjDispatcher {
             tracing::warn!("rc fork lifecycle (subtree): {e}");
         }
 
+        // POSIX-style: the prompt/turn targets the subtree root. Drive it after
+        // all fork-time block injections + rc lifecycle, then honor the
+        // stay-on-parent default / --switch via fork_outcome.
         let switch = has_flag(argv, &["--switch"]);
+        self.request_child_turn(new_root_id, prompt.as_deref(), staging, caller);
         let message = format!(
             "subtree-forked '{}' ({} contexts) from template '{}'",
             name,
@@ -1081,15 +1101,51 @@ impl KjDispatcher {
             );
             return;
         };
-        self.kernel()
-            .turn_flows()
-            .publish(crate::flows::TurnFlow::Requested {
-                context_id: new_id,
-                after_block_id: after,
-                content: note.to_string(),
-                principal_id: caller.principal_id,
-                model: None,
-            });
+        let delivered =
+            self.kernel()
+                .turn_flows()
+                .publish(crate::flows::TurnFlow::Requested {
+                    context_id: new_id,
+                    after_block_id: after,
+                    content: note.to_string(),
+                    principal_id: caller.principal_id,
+                    model: None,
+                });
+
+        // Zero subscribers means no turn driver is listening — the autonomous
+        // turn was requested but will never run. Don't silently no-op: warn and
+        // surface a visible Error block in the child (same API rc lifecycle uses)
+        // so the inert child is explained rather than mysterious.
+        if delivered == 0 {
+            tracing::warn!(
+                context_id = %new_id,
+                "kj fork --prompt: no turn driver subscribed; autonomous turn will not run"
+            );
+            let summary = "kj fork --prompt: no turn driver is active, so the requested \
+                           autonomous turn will not run. This child was seeded but will \
+                           stay idle until a turn is driven."
+                .to_string();
+            // Same BlockKind::Error / insert_block_as idiom rc lifecycle uses
+            // (see kj/lifecycle.rs insert_rc_failure_block): a plain Error block
+            // anchored at the tail, no structured ErrorPayload parent required.
+            let after = self.block_store().last_block_id(new_id);
+            if let Err(insert_err) = self.block_store().insert_block_as(
+                new_id,
+                None,
+                after.as_ref(),
+                kaijutsu_crdt::Role::System,
+                kaijutsu_crdt::BlockKind::Error,
+                summary,
+                kaijutsu_crdt::Status::Error,
+                kaijutsu_crdt::ContentType::Plain,
+                Some(caller.principal_id),
+            ) {
+                tracing::warn!(
+                    context_id = %new_id,
+                    "kj fork --prompt: failed to insert no-driver error block: {insert_err}"
+                );
+            }
+        }
     }
 
     fn inject_fork_note(
@@ -1711,6 +1767,7 @@ mod tests {
                 assert_eq!(principal_id, c.principal_id);
                 assert_eq!(content, "go explore");
             }
+            other => panic!("expected Requested, got {other:?}"),
         }
     }
 
@@ -1799,5 +1856,274 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(child.workspace_id, Some(ws_id));
+    }
+
+    // ====================================================================
+    // POSIX parity across fork kinds: --prompt drives a turn, --switch moves
+    // the caller, bare fork drives nothing. Mirrors the fork_full reference
+    // tests above (fork_with_prompt_requests_turn / _without_ / _switch_).
+    // ====================================================================
+
+    #[tokio::test]
+    async fn fork_shallow_with_prompt_requests_turn() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("parent"), None, principal);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        let c = caller_with_context(source);
+        let mut sub = d.kernel().turn_flows().subscribe("turn.requested");
+
+        let result = d
+            .dispatch(
+                &[s("fork"), s("--shallow"), s("--prompt"), s("explore shallow")],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "fork failed: {}", result.message());
+
+        let msg = sub
+            .try_recv()
+            .expect("fork --shallow --prompt should publish a turn request");
+        match msg.payload {
+            crate::flows::TurnFlow::Requested {
+                context_id,
+                principal_id,
+                content,
+                ..
+            } => {
+                assert_ne!(context_id, source, "the turn targets the child, not parent");
+                assert_eq!(principal_id, c.principal_id);
+                assert_eq!(content, "explore shallow");
+            }
+            other => panic!("expected Requested, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fork_shallow_without_prompt_requests_no_turn() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("parent"), None, principal);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        let c = caller_with_context(source);
+        let mut sub = d.kernel().turn_flows().subscribe("turn.requested");
+
+        let result = d.dispatch(&[s("fork"), s("--shallow")], &c).await;
+        assert!(result.is_ok(), "fork failed: {}", result.message());
+        assert!(
+            sub.try_recv().is_none(),
+            "a bare shallow fork must not request a turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_shallow_switch_flag_moves_to_child() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("parent"), None, principal);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        let c = caller_with_context(source);
+
+        let result = d
+            .dispatch(&[s("fork"), s("--shallow"), s("--switch")], &c)
+            .await;
+        match &result {
+            super::super::KjResult::Switch(id, _msg) => {
+                assert_ne!(*id, source, "--switch should move to a new child context");
+            }
+            other => panic!("expected Switch with --switch, got: {}", other.message()),
+        }
+    }
+
+    /// Register a mock LLM provider (set as default), configure it on `source`,
+    /// and seed `source` with a block so compact's distillation step (an LLM
+    /// call over non-empty content) can run in tests.
+    async fn setup_compact_source(
+        d: &super::super::KjDispatcher,
+        source: kaijutsu_types::ContextId,
+        principal: PrincipalId,
+    ) {
+        use crate::llm::{MockClient, Provider};
+        use std::sync::Arc;
+        {
+            let mut registry = d.kernel().llm().write().await;
+            registry.register("mock", Arc::new(Provider::Mock(MockClient::new("summary"))));
+            registry.set_default("mock");
+        }
+        {
+            let mut drift = d.drift_router().write();
+            let _ = drift.configure_llm(source, "mock", "mock-model");
+        }
+        // compact summarizes the source's included blocks; without content it
+        // errors (see fork_compact_empty_source_errors).
+        d.block_store()
+            .insert_block_as(
+                source,
+                None,
+                None,
+                kaijutsu_crdt::Role::User,
+                kaijutsu_crdt::BlockKind::Text,
+                "hello world".to_string(),
+                kaijutsu_crdt::Status::Done,
+                kaijutsu_crdt::ContentType::Plain,
+                Some(principal),
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn fork_compact_with_prompt_requests_turn() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("parent"), None, principal);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        setup_compact_source(&d, source, principal).await;
+        let c = caller_with_context(source);
+        let mut sub = d.kernel().turn_flows().subscribe("turn.requested");
+
+        let result = d
+            .dispatch(
+                &[s("fork"), s("--compact"), s("--prompt"), s("explore compact")],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "fork failed: {}", result.message());
+
+        let msg = sub
+            .try_recv()
+            .expect("fork --compact --prompt should publish a turn request");
+        match msg.payload {
+            crate::flows::TurnFlow::Requested {
+                context_id,
+                principal_id,
+                content,
+                ..
+            } => {
+                assert_ne!(context_id, source, "the turn targets the child, not parent");
+                assert_eq!(principal_id, c.principal_id);
+                assert_eq!(content, "explore compact");
+            }
+            other => panic!("expected Requested, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fork_compact_without_prompt_requests_no_turn() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("parent"), None, principal);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        setup_compact_source(&d, source, principal).await;
+        let c = caller_with_context(source);
+        let mut sub = d.kernel().turn_flows().subscribe("turn.requested");
+
+        let result = d.dispatch(&[s("fork"), s("--compact")], &c).await;
+        assert!(result.is_ok(), "fork failed: {}", result.message());
+        assert!(
+            sub.try_recv().is_none(),
+            "a bare compact fork must not request a turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_compact_switch_flag_moves_to_child() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("parent"), None, principal);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        setup_compact_source(&d, source, principal).await;
+        let c = caller_with_context(source);
+
+        let result = d
+            .dispatch(&[s("fork"), s("--compact"), s("--switch")], &c)
+            .await;
+        match &result {
+            super::super::KjResult::Switch(id, _msg) => {
+                assert_ne!(*id, source, "--switch should move to a new child context");
+            }
+            other => panic!("expected Switch with --switch, got: {}", other.message()),
+        }
+    }
+
+    #[tokio::test]
+    async fn fork_subtree_with_prompt_requests_turn() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("parent"), None, principal);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        let c = caller_with_context(source);
+        let mut sub = d.kernel().turn_flows().subscribe("turn.requested");
+
+        let result = d
+            .dispatch(
+                &[
+                    s("fork"),
+                    s("--as"),
+                    s("parent"),
+                    s("--name"),
+                    s("tmpl"),
+                    s("--prompt"),
+                    s("explore subtree"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "fork failed: {}", result.message());
+
+        // The turn targets the subtree root.
+        let msg = sub
+            .try_recv()
+            .expect("fork --as --prompt should publish a turn request");
+        match msg.payload {
+            crate::flows::TurnFlow::Requested {
+                context_id,
+                principal_id,
+                content,
+                ..
+            } => {
+                assert_ne!(context_id, source, "the turn targets the new root, not parent");
+                assert_eq!(principal_id, c.principal_id);
+                assert_eq!(content, "explore subtree");
+            }
+            other => panic!("expected Requested, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fork_subtree_without_prompt_requests_no_turn() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("parent"), None, principal);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        let c = caller_with_context(source);
+        let mut sub = d.kernel().turn_flows().subscribe("turn.requested");
+
+        let result = d
+            .dispatch(
+                &[s("fork"), s("--as"), s("parent"), s("--name"), s("tmpl")],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "fork failed: {}", result.message());
+        assert!(
+            sub.try_recv().is_none(),
+            "a bare subtree fork must not request a turn"
+        );
     }
 }

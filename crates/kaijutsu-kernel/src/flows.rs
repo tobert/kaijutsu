@@ -210,7 +210,7 @@ impl FlowTopics for InputDocFlow {
 }
 
 impl FlowTopics for TurnFlow {
-    const TOPICS: &[&'static str] = &["turn.requested"];
+    const TOPICS: &[&'static str] = &["turn.requested", "turn.completed", "turn.failed"];
 }
 
 // ============================================================================
@@ -1067,6 +1067,26 @@ pub enum TurnFlow {
         /// Model override, or None to use the context's configured model.
         model: Option<String>,
     },
+
+    /// An autonomous turn finished successfully. The join-side substrate for
+    /// `kj wait`: a blocking caller can wait for this to know the child acted.
+    Completed {
+        /// The context whose turn completed.
+        context_id: ContextId,
+        /// Principal the turn ran as.
+        principal_id: PrincipalId,
+    },
+
+    /// An autonomous turn failed. Carries the error so `kj wait` (and any
+    /// observer) can surface it rather than hanging or silently succeeding.
+    Failed {
+        /// The context whose turn failed.
+        context_id: ContextId,
+        /// Principal the turn ran as.
+        principal_id: PrincipalId,
+        /// Human-readable failure description.
+        error: String,
+    },
 }
 
 impl TurnFlow {
@@ -1074,6 +1094,8 @@ impl TurnFlow {
     pub fn subject(&self) -> &'static str {
         match self {
             Self::Requested { .. } => "turn.requested",
+            Self::Completed { .. } => "turn.completed",
+            Self::Failed { .. } => "turn.failed",
         }
     }
 
@@ -1081,6 +1103,8 @@ impl TurnFlow {
     pub fn context_id(&self) -> ContextId {
         match self {
             Self::Requested { context_id, .. } => *context_id,
+            Self::Completed { context_id, .. } => *context_id,
+            Self::Failed { context_id, .. } => *context_id,
         }
     }
 }
@@ -1621,8 +1645,68 @@ mod tests {
                 assert_eq!(principal_id, principal);
                 assert_eq!(model.as_deref(), Some("claude-haiku-4-5"));
             }
+            other => panic!("expected Requested, got {other:?}"),
         }
         assert!(sub.try_recv().is_none(), "no duplicate delivery");
+    }
+
+    #[tokio::test]
+    async fn test_turn_flow_outcome_topics() {
+        let bus: FlowBus<TurnFlow> = FlowBus::new(16);
+        let mut completed_sub = bus.subscribe("turn.completed");
+        let mut failed_sub = bus.subscribe("turn.failed");
+
+        let ctx = ContextId::new();
+        let principal = PrincipalId::new();
+
+        let delivered = bus.publish(TurnFlow::Completed {
+            context_id: ctx,
+            principal_id: principal,
+        });
+        assert_eq!(delivered, 1, "exactly one subscriber on turn.completed");
+
+        let delivered = bus.publish(TurnFlow::Failed {
+            context_id: ctx,
+            principal_id: principal,
+            error: "boom".into(),
+        });
+        assert_eq!(delivered, 1, "exactly one subscriber on turn.failed");
+
+        let msg = completed_sub.try_recv().expect("should receive completion");
+        assert_eq!(msg.topic, "turn.completed");
+        match msg.payload {
+            TurnFlow::Completed {
+                context_id,
+                principal_id,
+            } => {
+                assert_eq!(context_id, ctx);
+                assert_eq!(principal_id, principal);
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+        assert!(completed_sub.try_recv().is_none(), "no duplicate completion");
+
+        let msg = failed_sub.try_recv().expect("should receive failure");
+        assert_eq!(msg.topic, "turn.failed");
+        match msg.payload {
+            TurnFlow::Failed {
+                context_id,
+                principal_id,
+                error,
+            } => {
+                assert_eq!(context_id, ctx);
+                assert_eq!(principal_id, principal);
+                assert_eq!(error, "boom");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert!(failed_sub.try_recv().is_none(), "no duplicate failure");
+
+        // Cross-topic isolation: completed sub never saw the failure.
+        assert!(
+            completed_sub.try_recv().is_none(),
+            "turn.completed must not receive turn.failed"
+        );
     }
 
     // ====================================================================
