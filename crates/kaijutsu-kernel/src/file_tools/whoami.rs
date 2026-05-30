@@ -50,13 +50,10 @@ impl WhoamiEngine {
 
         // Invariant: every registered context (handle present) is written to the
         // DB before it is registered, so a handle with no row means state
-        // corruption — fail loudly rather than report a half-identity. The
-        // lost+found dead-letter sink is the one deliberate exception: it's
-        // registered without a row.
-        if handle.is_some()
-            && row.is_none()
-            && router.lost_found_id() != Some(ctx.context_id)
-        {
+        // corruption — fail loudly rather than report a half-identity. (The
+        // lost+found sink is persisted like any other context, so it's no
+        // exception.)
+        if handle.is_some() && row.is_none() {
             let id = ctx.context_id.to_hex();
             tracing::error!(
                 context_id = %id,
@@ -204,23 +201,5 @@ mod tests {
             .await
             .expect_err("handle without row must be fatal");
         assert!(err.to_string().contains("no persisted row"));
-    }
-
-    /// The lost+found dead-letter sink is the one context registered without a
-    /// DB row, so it's exempt from the invariant: whoami succeeds with a null
-    /// context_type rather than erroring.
-    #[tokio::test]
-    async fn whoami_exempts_lost_found_from_invariant() {
-        let router = shared_drift_router();
-        let (id, _created) = router.write().ensure_lost_found();
-
-        let db = Arc::new(Mutex::new(KernelDb::in_memory().unwrap()));
-        let engine = WhoamiEngine::new(router, db);
-
-        let result = engine.execute("", &exec_ctx(id)).await.unwrap();
-        let json: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
-
-        assert!(json["context_type"].is_null());
-        assert!(json["trace_id"].is_string());
     }
 }

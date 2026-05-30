@@ -395,13 +395,29 @@ impl DriftRouter {
     }
 
     /// The lost+found context id, if one has been created.
-    ///
-    /// This internal dead-letter sink is registered in the router without a
-    /// `KernelDb` context row (see [`Self::ensure_lost_found`]), so callers that
-    /// enforce the "a registered handle implies a persisted row" invariant must
-    /// exempt it.
     pub fn lost_found_id(&self) -> Option<ContextId> {
         self.lost_found_id
+    }
+
+    /// Claim an already-registered context as the lost+found sink.
+    ///
+    /// Cold-start hydration rebuilds the router from `KernelDb` rows and
+    /// registers the persisted lost+found through the normal [`Self::register`]
+    /// path like any context — but the router's `lost_found_id` resets to
+    /// `None` across restarts. Without re-claiming it, the next dead letter
+    /// would mint a *duplicate* lost+found and orphan the persisted one (and
+    /// the duplicate's `register` would conflict on the reserved label). The
+    /// caller passes the id of the recovered `label == "lost+found"` row.
+    pub fn adopt_lost_found(&mut self, id: ContextId) {
+        match self.lost_found_id {
+            Some(existing) if existing == id => {}
+            Some(existing) => tracing::warn!(
+                existing = %existing.short(),
+                candidate = %id.short(),
+                "adopt_lost_found ignored: a different lost+found is already claimed"
+            ),
+            None => self.lost_found_id = Some(id),
+        }
     }
 
     /// Stage a drift operation for later flush.
@@ -1231,6 +1247,35 @@ mod tests {
         assert_eq!(id1, id2);
         // Should be registered with label "lost+found"
         assert!(router.resolve_context("lost+found").is_ok());
+    }
+
+    #[test]
+    fn test_adopt_lost_found_claims_recovered_context() {
+        // Simulates cold-start: the persisted lost+found is registered through
+        // the normal path, then adopted so a later ensure_lost_found reuses it.
+        let mut router = DriftRouter::new();
+        let id = ContextId::new();
+        router
+            .register(id, Some("lost+found"), None, PrincipalId::system())
+            .unwrap();
+
+        assert_eq!(router.lost_found_id(), None, "not claimed until adopted");
+        router.adopt_lost_found(id);
+        assert_eq!(router.lost_found_id(), Some(id));
+
+        // ensure_lost_found must reuse the adopted id, not mint a duplicate.
+        let (got, is_new) = router.ensure_lost_found();
+        assert_eq!(got, id);
+        assert!(!is_new);
+    }
+
+    #[test]
+    fn test_adopt_lost_found_keeps_first_claim() {
+        let mut router = DriftRouter::new();
+        let (first, _) = router.ensure_lost_found();
+        // A stray second adopt with a different id is ignored.
+        router.adopt_lost_found(ContextId::new());
+        assert_eq!(router.lost_found_id(), Some(first));
     }
 
     #[test]

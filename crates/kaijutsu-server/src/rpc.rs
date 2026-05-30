@@ -999,6 +999,12 @@ pub async fn create_shared_kernel(
             if let (Some(provider), Some(model)) = (&row.provider, &row.model) {
                 let _ = drift.configure_llm(row.context_id, provider, model);
             }
+            // Re-claim the persisted lost+found sink so a later dead letter
+            // reuses it instead of minting a duplicate (which would also
+            // conflict on the reserved label).
+            if row.label.as_deref() == Some("lost+found") {
+                drift.adopt_lost_found(row.context_id);
+            }
             log::info!(
                 "Recovered context {} (label={:?}, provider={:?}) from KernelDb",
                 row.context_id.short(),

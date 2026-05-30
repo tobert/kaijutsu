@@ -438,10 +438,47 @@ impl KjDispatcher {
             router.drain_dead_letter()
         };
         if !dead.is_empty() {
-            let (lf_id, _is_new) = {
+            let (lf_id, is_new) = {
                 let mut router = self.drift_router().write();
                 router.ensure_lost_found()
             };
+            // Persist lost+found as a real context the first time it's created,
+            // so the "registered handle implies a DB row" invariant holds and
+            // dead letters survive a kernel restart (cold-start rehydrates it
+            // from this row and re-adopts it). The router itself has no DB
+            // handle; this caller does.
+            if is_new {
+                let db = self.kernel_db().lock();
+                let system = kaijutsu_types::PrincipalId::system();
+                match db.get_or_create_default_workspace(system) {
+                    Ok(ws) => {
+                        let now = kaijutsu_types::now_millis() as i64;
+                        let row = crate::kernel_db::ContextRow {
+                            context_id: lf_id,
+                            label: Some("lost+found".to_string()),
+                            provider: None,
+                            model: None,
+                            system_prompt: None,
+                            consent_mode: kaijutsu_types::ConsentMode::Collaborative,
+                            context_state: kaijutsu_types::ContextState::Live,
+                            context_type: "default".to_string(),
+                            created_at: now,
+                            created_by: system,
+                            forked_from: None,
+                            fork_kind: None,
+                            archived_at: None,
+                            workspace_id: None,
+                            preset_id: None,
+                        };
+                        if let Err(e) = db.insert_context_with_document(&row, ws) {
+                            tracing::error!("failed to persist lost+found context row: {e}");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("failed to resolve workspace for lost+found: {e}")
+                    }
+                }
+            }
             // create_document is idempotent (DashMap entry-based)
             let _ =
                 self.block_store()
@@ -683,6 +720,57 @@ mod tests {
         let result = d.dispatch(&[s("drift"), s("flush")], &c).await;
         assert!(result.is_ok(), "flush: {}", result.message());
         assert!(result.message().contains("flushed 1 drift"));
+    }
+
+    #[tokio::test]
+    async fn drift_flush_persists_lost_found_context_row() {
+        // A dead letter drained into lost+found must persist a real context
+        // row, so the "registered handle implies a DB row" invariant holds and
+        // the sink survives restart. The flush early-returns when the caller's
+        // staging is empty, so we need both a deliverable item AND a dead
+        // letter present at flush time.
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let src = register_context(&d, Some("src"), None, principal);
+        let dst = register_context(&d, Some("dst"), None, principal);
+        d.block_store()
+            .create_document(dst, crate::DocumentKind::Conversation, None)
+            .unwrap();
+
+        // Force a dead letter: stage a victim, then cycle drain→requeue past
+        // the retry ceiling so it lands in the dead-letter queue.
+        {
+            let mut router = d.drift_router().write();
+            router
+                .stage(src, dst, "victim".into(), None, kaijutsu_crdt::DriftKind::Push)
+                .unwrap();
+            for _ in 0..8 {
+                let drained = router.drain(None);
+                router.requeue(drained);
+            }
+            assert_eq!(router.dead_letters().len(), 1, "victim should be dead-lettered");
+        }
+
+        // Stage a deliverable item so flush proceeds past the empty-staging guard.
+        let c = caller_with_context(src);
+        d.dispatch(&[s("drift"), s("push"), s("dst"), s("ok")], &c)
+            .await;
+        let result = d.dispatch(&[s("drift"), s("flush")], &c).await;
+        assert!(result.is_ok(), "flush: {}", result.message());
+
+        // lost+found now exists with a persisted context row.
+        let lf_id = d
+            .drift_router()
+            .read()
+            .lost_found_id()
+            .expect("lost+found created during flush");
+        let row = d
+            .kernel_db()
+            .lock()
+            .get_context(lf_id)
+            .unwrap()
+            .expect("lost+found has a persisted context row");
+        assert_eq!(row.label.as_deref(), Some("lost+found"));
     }
 
     #[tokio::test]
