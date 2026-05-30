@@ -33,7 +33,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 
 use kaijutsu_crdt::{BlockId, BlockKind, BlockSnapshot, Status};
-use kaijutsu_types::{BlockEventFilter, BlockFlowKind, ContextId};
+use kaijutsu_types::{BlockEventFilter, BlockFlowKind, ContextId, PrincipalId};
 
 // ============================================================================
 // Origin Tracking
@@ -207,6 +207,10 @@ impl FlowTopics for ConfigFlow {
 
 impl FlowTopics for InputDocFlow {
     const TOPICS: &[&'static str] = &["input.text_ops", "input.cleared"];
+}
+
+impl FlowTopics for TurnFlow {
+    const TOPICS: &[&'static str] = &["turn.requested"];
 }
 
 // ============================================================================
@@ -1029,6 +1033,65 @@ impl HasSubject for InputDocFlow {
 }
 
 // ============================================================================
+// Turn Flow Events
+// ============================================================================
+
+/// Turn-driving flow events.
+///
+/// The keystone of headless autonomy: kernel-side code (which can't reach the
+/// server's turn driver directly) publishes a `Requested` event to ask the
+/// server to run an LLM turn for a context that has no interactive client
+/// attached. The first producer is `kj fork --prompt` (POSIX-style: the child
+/// starts acting immediately while the parent keeps running); later producers
+/// are drift delivery and the "cruise director". The server subscribes and
+/// calls `spawn_llm_for_prompt`.
+///
+/// The seed itself already lives in the context's block log (e.g. the fork
+/// note), so this carries only what the driver needs to anchor and attribute
+/// the turn — it does NOT re-insert the seed.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum TurnFlow {
+    /// Drive one autonomous turn for `context_id`.
+    Requested {
+        /// The context that should take a turn.
+        context_id: ContextId,
+        /// Block to anchor the response after (typically the context's last
+        /// block at request time — the seed and any fork markers precede it).
+        after_block_id: BlockId,
+        /// Seed text. Only a hydration-failure fallback; the authoritative
+        /// seed is the block already in the log.
+        content: String,
+        /// Principal the turn runs as — authors the seed half of the
+        /// exchange. The context's configured model answers.
+        principal_id: PrincipalId,
+        /// Model override, or None to use the context's configured model.
+        model: Option<String>,
+    },
+}
+
+impl TurnFlow {
+    /// Get the subject string for this event.
+    pub fn subject(&self) -> &'static str {
+        match self {
+            Self::Requested { .. } => "turn.requested",
+        }
+    }
+
+    /// Get the context ID for this event.
+    pub fn context_id(&self) -> ContextId {
+        match self {
+            Self::Requested { context_id, .. } => *context_id,
+        }
+    }
+}
+
+impl HasSubject for TurnFlow {
+    fn subject(&self) -> &'static str {
+        TurnFlow::subject(self)
+    }
+}
+
+// ============================================================================
 // Shared FlowBus Handle
 // ============================================================================
 
@@ -1040,6 +1103,9 @@ pub type SharedConfigFlowBus = Arc<FlowBus<ConfigFlow>>;
 
 /// Thread-safe handle to an InputDocFlow bus.
 pub type SharedInputDocFlowBus = Arc<FlowBus<InputDocFlow>>;
+
+/// Thread-safe handle to a TurnFlow bus.
+pub type SharedTurnFlowBus = Arc<FlowBus<TurnFlow>>;
 
 /// Create a new shared block flow bus.
 pub fn shared_block_flow_bus(capacity: usize) -> SharedBlockFlowBus {
@@ -1053,6 +1119,11 @@ pub fn shared_config_flow_bus(capacity: usize) -> SharedConfigFlowBus {
 
 /// Create a new shared input doc flow bus.
 pub fn shared_input_doc_flow_bus(capacity: usize) -> SharedInputDocFlowBus {
+    Arc::new(FlowBus::new(capacity))
+}
+
+/// Create a new shared turn flow bus.
+pub fn shared_turn_flow_bus(capacity: usize) -> SharedTurnFlowBus {
     Arc::new(FlowBus::new(capacity))
 }
 
@@ -1514,6 +1585,44 @@ mod tests {
         assert!(ops_sub.try_recv().is_none());
         assert!(cleared_sub.try_recv().is_some());
         assert!(cleared_sub.try_recv().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_turn_flow_topics() {
+        let bus: FlowBus<TurnFlow> = FlowBus::new(16);
+        let mut sub = bus.subscribe("turn.requested");
+
+        let ctx = ContextId::new();
+        let principal = PrincipalId::new();
+        let after = BlockId::new(ctx, principal, 7);
+
+        let delivered = bus.publish(TurnFlow::Requested {
+            context_id: ctx,
+            after_block_id: after,
+            content: "explore the auth module".into(),
+            principal_id: principal,
+            model: Some("claude-haiku-4-5".into()),
+        });
+        assert_eq!(delivered, 1, "exactly one subscriber should receive it");
+
+        let msg = sub.try_recv().expect("should receive the turn request");
+        assert_eq!(msg.topic, "turn.requested");
+        match msg.payload {
+            TurnFlow::Requested {
+                context_id,
+                after_block_id,
+                content,
+                principal_id,
+                model,
+            } => {
+                assert_eq!(context_id, ctx);
+                assert_eq!(after_block_id, after);
+                assert_eq!(content, "explore the auth module");
+                assert_eq!(principal_id, principal);
+                assert_eq!(model.as_deref(), Some("claude-haiku-4-5"));
+            }
+        }
+        assert!(sub.try_recv().is_none(), "no duplicate delivery");
     }
 
     // ====================================================================

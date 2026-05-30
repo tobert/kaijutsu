@@ -21,7 +21,9 @@ use crate::peers::{InvokeRequest, PeerConfig, PeerError, PeerInfo, PeerRegistry}
 use crate::control::ConsentMode;
 use crate::drift::{SharedDriftRouter, shared_drift_router};
 use crate::execution::{ExecContext, ExecResult};
-use crate::flows::{SharedBlockFlowBus, shared_block_flow_bus};
+use crate::flows::{
+    SharedBlockFlowBus, SharedTurnFlowBus, shared_block_flow_bus, shared_turn_flow_bus,
+};
 use crate::llm::{LlmRegistry, Provider};
 use crate::mcp::Broker;
 use crate::state::KernelState;
@@ -51,6 +53,9 @@ pub struct Kernel {
     consent_mode: RwLock<ConsentMode>,
     /// FlowBus for block events.
     block_flows: SharedBlockFlowBus,
+    /// FlowBus for autonomous turn requests (headless drive). Kernel-side
+    /// callers publish here; the server drains it and runs the LLM turn.
+    turn_flows: SharedTurnFlowBus,
     /// DriftRouter for cross-context communication.
     drift: SharedDriftRouter,
     /// Content-addressed store for binary blobs (images, etc.).
@@ -115,6 +120,7 @@ impl Kernel {
             peers: RwLock::new(PeerRegistry::new()),
             consent_mode: RwLock::new(ConsentMode::default()),
             block_flows: shared_block_flow_bus(DEFAULT_FLOW_CAPACITY),
+            turn_flows: shared_turn_flow_bus(DEFAULT_FLOW_CAPACITY),
             drift: shared_drift_router(),
             cas: Self::cas_for_data_dir(data_dir),
             image_backends: RwLock::new(crate::image::ImageBackendRegistry::new()),
@@ -144,6 +150,7 @@ impl Kernel {
             peers: RwLock::new(PeerRegistry::new()),
             consent_mode: RwLock::new(ConsentMode::default()),
             block_flows,
+            turn_flows: shared_turn_flow_bus(DEFAULT_FLOW_CAPACITY),
             drift: shared_drift_router(),
             cas: Self::cas_for_data_dir(data_dir),
             image_backends: RwLock::new(crate::image::ImageBackendRegistry::new()),
@@ -516,6 +523,11 @@ impl Kernel {
     /// Get the block flows bus.
     pub fn block_flows(&self) -> &SharedBlockFlowBus {
         &self.block_flows
+    }
+
+    /// Get the turn flows bus (autonomous turn requests).
+    pub fn turn_flows(&self) -> &SharedTurnFlowBus {
+        &self.turn_flows
     }
 
     /// Get the drift router.

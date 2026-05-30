@@ -248,8 +248,8 @@ impl KjDispatcher {
         }
 
         // If --prompt given, inject a Drift block
-        if let Some(note) = prompt
-            && let Err(e) = self.inject_fork_note(new_id, source_id, &note)
+        if let Some(note) = &prompt
+            && let Err(e) = self.inject_fork_note(new_id, source_id, note)
         {
             return KjResult::Err(format!("kj fork: failed to inject fork note: {e}"));
         }
@@ -294,12 +294,12 @@ impl KjDispatcher {
             tracing::warn!("rc fork lifecycle: {e}");
         }
 
+        let switch = has_flag(argv, &["--switch"]);
+        self.request_child_turn(new_id, prompt.as_deref(), staging, caller);
         let short = new_id.short();
         let display = label.as_deref().unwrap_or(&short);
-        KjResult::Switch(
-            new_id,
-            format!("forked to '{}' ({})", display, new_id.short()),
-        )
+        let message = format!("forked to '{}' ({})", display, short);
+        self.fork_outcome(new_id, label.as_deref(), switch, message)
     }
 
     async fn fork_shallow(&self, argv: &[String], caller: &KjCaller) -> KjResult {
@@ -977,15 +977,14 @@ impl KjDispatcher {
             tracing::warn!("rc fork lifecycle (subtree): {e}");
         }
 
-        KjResult::Switch(
-            new_root_id,
-            format!(
-                "subtree-forked '{}' ({} contexts) from template '{}'",
-                name,
-                template_nodes.len(),
-                template_ref
-            ),
-        )
+        let switch = has_flag(argv, &["--switch"]);
+        let message = format!(
+            "subtree-forked '{}' ({} contexts) from template '{}'",
+            name,
+            template_nodes.len(),
+            template_ref
+        );
+        self.fork_outcome(new_root_id, Some(name.as_str()), switch, message)
     }
 
     /// Apply a preset's settings to a context (post-fork).
@@ -1025,6 +1024,72 @@ impl KjDispatcher {
         }
 
         Ok(())
+    }
+
+    /// Build the terminal result for a completed fork.
+    ///
+    /// POSIX semantics: by default the caller stays on the parent and keeps
+    /// running — the child id is returned in `data` so `for x in $(kj fork …)`
+    /// and `kaish-last` can pick it up. `--switch` opts into moving the caller
+    /// into the child (the old unconditional behaviour).
+    fn fork_outcome(
+        &self,
+        new_id: ContextId,
+        label: Option<&str>,
+        switch: bool,
+        message: String,
+    ) -> KjResult {
+        if switch {
+            KjResult::Switch(new_id, message)
+        } else {
+            KjResult::Ok {
+                message,
+                content_type: ContentType::Plain,
+                ephemeral: false,
+                data: Some(serde_json::json!({
+                    "context_id": new_id.to_hex(),
+                    "label": label,
+                })),
+            }
+        }
+    }
+
+    /// Ask the server to drive one autonomous turn in the freshly forked child,
+    /// so a `kj fork --prompt "…"` child starts acting immediately while the
+    /// parent's fork call returns and keeps running (POSIX fork()).
+    ///
+    /// No-op when there's no seed (a bare fork is an inert snapshot) or when the
+    /// child is staged (it's awaiting human curation). The seed already lives in
+    /// the child's block log as the fork note, so this only publishes the
+    /// request — it does not re-insert the seed. Must run after all fork-time
+    /// block injections so `after_block_id` anchors at the true tail.
+    fn request_child_turn(
+        &self,
+        new_id: ContextId,
+        prompt: Option<&str>,
+        staging: bool,
+        caller: &KjCaller,
+    ) {
+        let Some(note) = prompt else { return };
+        if staging {
+            return;
+        }
+        let Some(after) = self.block_store().last_block_id(new_id) else {
+            tracing::warn!(
+                context_id = %new_id,
+                "kj fork --prompt: child has no blocks to anchor an autonomous turn"
+            );
+            return;
+        };
+        self.kernel()
+            .turn_flows()
+            .publish(crate::flows::TurnFlow::Requested {
+                context_id: new_id,
+                after_block_id: after,
+                content: note.to_string(),
+                principal_id: caller.principal_id,
+                model: None,
+            });
     }
 
     fn inject_fork_note(
@@ -1579,6 +1644,89 @@ mod tests {
             }
             other => panic!("expected Switch, got: {}", other.message()),
         }
+    }
+
+    #[tokio::test]
+    async fn fork_with_prompt_requests_turn() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("parent"), None, principal);
+        let c = caller_with_context(source);
+        let mut sub = d.kernel().turn_flows().subscribe("turn.requested");
+
+        let result = d
+            .dispatch(
+                &[
+                    s("fork"),
+                    s("--name"),
+                    s("child"),
+                    s("--prompt"),
+                    s("go explore"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "fork failed: {}", result.message());
+
+        let msg = sub
+            .try_recv()
+            .expect("fork --prompt should publish a turn request");
+        match msg.payload {
+            crate::flows::TurnFlow::Requested {
+                context_id,
+                principal_id,
+                content,
+                ..
+            } => {
+                assert_ne!(context_id, source, "the turn targets the child, not parent");
+                assert_eq!(principal_id, c.principal_id);
+                assert_eq!(content, "go explore");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fork_without_prompt_requests_no_turn() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("parent"), None, principal);
+        let c = caller_with_context(source);
+        let mut sub = d.kernel().turn_flows().subscribe("turn.requested");
+
+        let result = d.dispatch(&[s("fork"), s("--name"), s("child")], &c).await;
+        assert!(result.is_ok(), "fork failed: {}", result.message());
+        assert!(
+            sub.try_recv().is_none(),
+            "a bare fork is an inert snapshot — it must not request a turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_staged_with_prompt_requests_no_turn() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("parent"), None, principal);
+        let c = caller_with_context(source);
+        let mut sub = d.kernel().turn_flows().subscribe("turn.requested");
+
+        let result = d
+            .dispatch(
+                &[
+                    s("fork"),
+                    s("--name"),
+                    s("child"),
+                    s("--prompt"),
+                    s("go explore"),
+                    s("--stage"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "fork failed: {}", result.message());
+        assert!(
+            sub.try_recv().is_none(),
+            "a staged child is awaiting curation — no autonomous turn yet"
+        );
     }
 
     #[tokio::test]
