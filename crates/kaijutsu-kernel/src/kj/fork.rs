@@ -1622,9 +1622,10 @@ mod tests {
         );
     }
 
-    /// Fork should return Switch so the session moves to the new context.
+    /// Default fork is POSIX-style: the caller stays on the parent. The child
+    /// id is surfaced via `data`, not by switching.
     #[tokio::test]
-    async fn fork_returns_switch() {
+    async fn fork_default_stays_on_parent() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let source = register_context(&d, Some("parent"), None, principal);
@@ -1635,14 +1636,39 @@ mod tests {
         let c = caller_with_context(source);
         let result = d.dispatch(&[s("fork"), s("--name"), s("child")], &c).await;
         match &result {
+            super::super::KjResult::Ok { data, message, .. } => {
+                assert!(message.contains("child"), "msg: {message}");
+                let ctx = data
+                    .as_ref()
+                    .and_then(|d| d.get("context_id"))
+                    .and_then(|v| v.as_str())
+                    .expect("fork should surface child context_id in data");
+                assert_ne!(ctx, source.to_hex(), "child must be a new context");
+            }
+            other => panic!("expected Ok (stay on parent), got: {}", other.message()),
+        }
+    }
+
+    /// `--switch` opts back into the old behaviour: move the caller to the child.
+    #[tokio::test]
+    async fn fork_switch_flag_moves_to_child() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("parent"), None, principal);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+
+        let c = caller_with_context(source);
+        let result = d
+            .dispatch(&[s("fork"), s("--name"), s("child"), s("--switch")], &c)
+            .await;
+        match &result {
             super::super::KjResult::Switch(id, msg) => {
-                assert_ne!(
-                    *id, source,
-                    "should switch to new context, not stay on source"
-                );
+                assert_ne!(*id, source, "should switch to new context");
                 assert!(msg.contains("child"), "msg: {msg}");
             }
-            other => panic!("expected Switch, got: {}", other.message()),
+            other => panic!("expected Switch with --switch, got: {}", other.message()),
         }
     }
 
@@ -1651,6 +1677,9 @@ mod tests {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let source = register_context(&d, Some("parent"), None, principal);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
         let c = caller_with_context(source);
         let mut sub = d.kernel().turn_flows().subscribe("turn.requested");
 
@@ -1690,6 +1719,9 @@ mod tests {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let source = register_context(&d, Some("parent"), None, principal);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
         let c = caller_with_context(source);
         let mut sub = d.kernel().turn_flows().subscribe("turn.requested");
 
@@ -1706,6 +1738,9 @@ mod tests {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let source = register_context(&d, Some("parent"), None, principal);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
         let c = caller_with_context(source);
         let mut sub = d.kernel().turn_flows().subscribe("turn.requested");
 
