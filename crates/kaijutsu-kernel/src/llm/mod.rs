@@ -448,8 +448,10 @@ impl Provider {
     /// Start a streaming completion.
     ///
     /// Phase 1: real-provider variants return [`LlmError::Unavailable`].
-    /// Mock refuses streaming (matching the rig-era behavior — tests use
-    /// Mock for registry/dispatch validation, not streaming).
+    /// Mock replays its canned response as a well-formed text stream
+    /// (`TextStart → TextDelta → TextEnd → Done`) so tests can exercise the
+    /// full streaming turn — including the autonomous fork-and-act path —
+    /// without a live provider.
     #[tracing::instrument(skip(self, opts, messages), fields(llm.provider = self.name()))]
     pub async fn stream(
         &self,
@@ -466,9 +468,19 @@ impl Provider {
                 Ok(ProviderStream::Gemini(stream))
             }
             #[cfg(any(test, feature = "test-mock"))]
-            Self::Mock(_) => Err(LlmError::Unavailable(
-                "mock provider does not support streaming".into(),
-            )),
+            Self::Mock(mock) => {
+                let events = std::collections::VecDeque::from(vec![
+                    StreamEvent::TextStart,
+                    StreamEvent::TextDelta(mock.canned_response.clone()),
+                    StreamEvent::TextEnd,
+                    StreamEvent::Done {
+                        stop_reason: Some("end_turn".into()),
+                        input_tokens: Some(0),
+                        output_tokens: Some(0),
+                    },
+                ]);
+                Ok(ProviderStream::Mock(events))
+            }
         }
     }
 
@@ -491,6 +503,10 @@ impl Provider {
 pub enum ProviderStream {
     Claude(claude::Stream),
     Gemini(gemini::Stream),
+    /// Replays a pre-built event queue. Lets tests drive a real streaming
+    /// turn (e.g. the autonomous fork-and-act path) without a live provider.
+    #[cfg(any(test, feature = "test-mock"))]
+    Mock(std::collections::VecDeque<StreamEvent>),
 }
 
 impl ProviderStream {
@@ -500,6 +516,8 @@ impl ProviderStream {
         match self {
             Self::Claude(s) => s.next_event().await,
             Self::Gemini(s) => s.next_event().await,
+            #[cfg(any(test, feature = "test-mock"))]
+            Self::Mock(events) => events.pop_front(),
         }
     }
 
@@ -508,6 +526,8 @@ impl ProviderStream {
         match self {
             Self::Claude(s) => s.cancel(),
             Self::Gemini(s) => s.cancel(),
+            #[cfg(any(test, feature = "test-mock"))]
+            Self::Mock(_) => {}
         }
     }
 }

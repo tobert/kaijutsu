@@ -254,6 +254,11 @@ impl SshServer {
 
         log::info!("Shared kernel created: {}", registry.kernel.name);
 
+        // Bring the turn driver online before accepting connections so an
+        // autonomous turn requested by an early `kj fork --prompt` isn't
+        // dropped. One driver for the whole server (see spawn_turn_driver).
+        crate::rpc::spawn_turn_driver(registry.clone());
+
         let active_connections = Arc::new(AtomicUsize::new(0));
         log::info!("Max connections: {}", self.config.max_connections);
 

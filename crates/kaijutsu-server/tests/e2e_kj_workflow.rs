@@ -7,7 +7,7 @@ mod common;
 use common::*;
 
 use kaijutsu_client::KernelHandle;
-use kaijutsu_types::{BlockId, BlockKind, BlockQuery, BlockSnapshot, ContextId, Status};
+use kaijutsu_types::{BlockId, BlockKind, BlockQuery, BlockSnapshot, ContextId, Role, Status};
 
 // ============================================================================
 // Test helpers
@@ -457,6 +457,73 @@ fn test_shell_propagates_exit_code() {
             Some(0),
             "`kj help` should populate exit_code=Some(0), got {:?}",
             result_kj.exit_code
+        );
+    });
+}
+
+/// `kj fork --prompt` should drive an autonomous turn in the child: the fork
+/// publishes `turn.requested`, the server's turn driver consumes it and runs
+/// `spawn_llm_for_prompt` for the child, and the mock provider streams a
+/// response. We assert a Done assistant block appears in the *child* — it can
+/// only exist if that whole chain fired. The parent is untouched (POSIX fork).
+#[test]
+fn test_fork_with_prompt_drives_autonomous_turn() {
+    run_local(async {
+        let addr = start_server_with_mock_llm().await;
+        let client = connect_client(addr).await;
+        let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
+
+        let main_ctx = kernel.create_context("main").await.unwrap();
+        let _joined = kernel.join_context(main_ctx, "test").await.unwrap();
+
+        // Fork with a seed. POSIX-style: this returns immediately on the parent;
+        // the child starts acting on the seed via the turn driver.
+        let (_id, out, status) = shell_exec_wait(
+            &kernel,
+            r#"kj fork --name explorer --prompt "investigate the bug""#,
+            main_ctx,
+        )
+        .await;
+        assert_eq!(status, Status::Done, "kj fork --prompt failed: {out}");
+
+        // Locate the child and join so we can read its blocks.
+        let contexts = kernel.list_contexts().await.unwrap();
+        let child_id = contexts
+            .iter()
+            .find(|c| c.label == "explorer")
+            .expect("explorer context not found in list")
+            .id;
+        let _joined = kernel.join_context(child_id, "test").await.unwrap();
+
+        // Poll the child for a Done assistant block. Its presence proves the
+        // autonomous turn ran end-to-end.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if std::time::Instant::now() > deadline {
+                let blocks = get_all_blocks(&kernel, child_id).await;
+                panic!(
+                    "no assistant block appeared in child within 10s — the \
+                     autonomous turn was not driven.\nchild blocks: {blocks:#?}"
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let blocks = get_all_blocks(&kernel, child_id).await;
+            let drove = blocks.iter().any(|b| {
+                b.role == Role::Model && b.kind == BlockKind::Text && b.status == Status::Done
+            });
+            if drove {
+                break;
+            }
+        }
+
+        // The parent should NOT have been driven — no seed there, and fork
+        // didn't switch us. (A Model block in main would mean cross-talk.)
+        let main_blocks = get_all_blocks(&kernel, main_ctx).await;
+        assert!(
+            !main_blocks
+                .iter()
+                .any(|b| b.role == Role::Model && b.kind == BlockKind::Text),
+            "parent context should not have taken a turn"
         );
     });
 }

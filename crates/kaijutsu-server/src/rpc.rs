@@ -321,6 +321,77 @@ pub struct ServerRegistry {
     pub kernel: SharedKernel,
 }
 
+/// Spawn the server-lifetime turn driver.
+///
+/// This is the server half of the headless-drive keystone: it drains the
+/// kernel's `turn.requested` FlowBus and runs an autonomous LLM turn for each
+/// request. Producers are kernel-side code that can't reach the turn driver
+/// directly — today `kj fork --prompt`, later drift-wake and the cruise
+/// director.
+///
+/// It runs on its own dedicated thread with a current-thread runtime + LocalSet,
+/// mirroring the per-connection RPC threads in `ssh.rs`. That's deliberate, not
+/// incidental: `spawn_llm_for_prompt` uses `spawn_local`, so it needs a LocalSet
+/// to run on, and the per-connection LocalSets aren't a fit — the turn bus is a
+/// broadcast, so hosting a subscriber on every connection would drive each
+/// request once per connection. One driver, one subscription, one turn.
+pub fn spawn_turn_driver(registry: Arc<ServerRegistry>) {
+    let builder = std::thread::Builder::new().name("turn-driver".to_string());
+    if let Err(e) = builder.spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                log::error!("turn-driver: failed to build runtime: {e}");
+                return;
+            }
+        };
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async move {
+            let kernel = &registry.kernel;
+            let mut sub = kernel.kernel.turn_flows().subscribe("turn.requested");
+            log::info!("Turn driver online");
+            while let Some(msg) = sub.recv().await {
+                let kaijutsu_kernel::flows::TurnFlow::Requested {
+                    context_id,
+                    after_block_id,
+                    content,
+                    principal_id,
+                    model,
+                } = msg.payload;
+                // Headless turn: no interactive session, so synthesize the
+                // execution context. cwd is the root — fork copies the parent's
+                // shell config separately; the turn itself doesn't need it.
+                let tool_ctx = kaijutsu_kernel::ExecContext::new(
+                    principal_id,
+                    context_id,
+                    std::path::PathBuf::from("/"),
+                    kaijutsu_types::SessionId::new(),
+                    kernel.kernel.id(),
+                );
+                if let Err(e) = spawn_llm_for_prompt(
+                    kernel,
+                    context_id,
+                    &content,
+                    model.as_deref(),
+                    &after_block_id,
+                    tool_ctx,
+                    principal_id,
+                )
+                .await
+                {
+                    log::warn!("turn.requested: failed to drive turn for {context_id}: {e}");
+                }
+            }
+            log::warn!("Turn driver: turn bus closed, driver exiting");
+        });
+    }) {
+        log::error!("Failed to spawn turn-driver thread: {e}");
+    }
+}
+
 /// A background execution tracked by exec_id.
 struct RunningExecution {
     cancel: CancellationToken,
