@@ -175,12 +175,44 @@ Holographic shader trio + entry animation shipped. Open:
 - **Distill model selection.** `formation_edges`-style `auto_distill`
   defaults to the source context's model (potentially Opus). Add a
   `distill_model` knob so cheap models can do summarization.
+- **POSIX context quartet.** The frame for autonomy is four verbs
+  mirroring POSIX process control: `fork` (snapshot), `drive` (clock one
+  turn / exec), `wait` (join), `drift merge` (return). Shipped: `fork`,
+  `drift merge` (defaults to the `forked_from` parent), and `kj drive
+  [<ctx>] [--prompt]`, which clocks one autonomous turn via the shared
+  `publish_turn_request` helper (`kj/fork.rs`); `kj fork --prompt` is now
+  sugar over the same path. The drift-then-drive idiom (`kj drift <c>
+  "tools down"; kj drive <c>`) is a graceful steer-don't-kill shutdown —
+  the drift lands in the log and the driven turn's mailbox `catch_up`
+  folds it in. Remaining: `kj wait` and `kj stop` (below).
+- **`kj drive` follow-up.** No staging guard at the verb: driving a
+  `Staging` context isn't refused up front — it degrades to a visible
+  Error block because `spawn_llm_for_prompt` rejects staging server-side.
+  A verb-level refusal (mirroring `request_child_turn`'s staging skip) is
+  cleaner. Shares the lossy/in-memory-bus exposure below.
+- **`kj stop`.** The interrupt verb — the firm rungs above drift-and-
+  drive's gentle steer. `kj stop <ctx>` = soft (finish current tool, no
+  next LLM call); `kj stop <ctx> --now` = hard (abort stream + kill kaish
+  jobs). The engine exists (`ContextInterruptState::soft()/hard()` in
+  `server/src/interrupt.rs`, reachable today only via the
+  `interruptContext @75` RPC). Needs the same kernel→server bridge as
+  drive: a `TurnFlow::Interrupt { context_id, immediate }` variant + a
+  `turn.interrupt` subscriber arm in `spawn_turn_driver` that calls
+  `soft()/hard()` on `context_interrupts`. A missed *stop* is worse than
+  a missed *drive*, so `kj stop` must report its receiver count and `Err`
+  on zero subscribers (like `kj drive`).
 - **`kj wait`.** POSIX `wait()` for forks: block the caller until a
-  child context drifts back (or exits). `kj fork --prompt` already runs
-  the child autonomously and the parent keeps going (`turn.requested`
+  child context drifts back (or exits). `kj fork --prompt` / `kj drive`
+  run the child autonomously and the parent keeps going (`turn.requested`
   bus → server turn driver); `kj wait <child>` is the join side — let a
   parent gather results when it explicitly wants them, instead of only
-  via async drift-on-next-turn. Same shape as Claude Code subagents. The
+  via async drift-on-next-turn. Same shape as Claude Code subagents.
+  Open UX (from design): `--timeout <dur>` bounds the wait; `--poll`
+  makes timeout a non-error (exit 0, status "running") so it's loop-
+  friendly and idempotent. Default trigger should be the child's
+  *drift-return* (semantic "done"), not a single `turn.completed` — this
+  also serves a never-exiting persistent explorer that drifts back on
+  each drive; `--turn` opts into the low-level one-turn signal. The
   completion substrate now exists: the turn driver publishes
   `TurnFlow::Completed { context_id, principal_id }` on success and
   `TurnFlow::Failed { context_id, principal_id, error }` on failure
