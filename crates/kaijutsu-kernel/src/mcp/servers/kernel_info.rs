@@ -6,12 +6,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use crate::drift::DriftRouter;
 use crate::file_tools::WhoamiEngine;
+use crate::kernel_db::KernelDb;
 
 
 use super::super::context::CallContext;
@@ -37,11 +38,11 @@ pub struct KernelInfoServer {
 impl KernelInfoServer {
     pub const INSTANCE: &'static str = "builtin.kernel_info";
 
-    pub fn new(drift: Arc<RwLock<DriftRouter>>) -> Self {
+    pub fn new(drift: Arc<RwLock<DriftRouter>>, kernel_db: Arc<Mutex<KernelDb>>) -> Self {
         let (notif_tx, _) = broadcast::channel(16);
         Self {
             instance_id: InstanceId::new(Self::INSTANCE),
-            whoami: WhoamiEngine::new(drift),
+            whoami: WhoamiEngine::new(drift, kernel_db),
             notif_tx,
         }
     }
@@ -99,19 +100,62 @@ impl McpServerLike for KernelInfoServer {
 mod tests {
     use super::*;
     use crate::drift::shared_drift_router;
+    use crate::kernel_db::{ContextRow, DocumentRow};
     use crate::mcp::{Broker, InstancePolicy, KernelCallParams, ToolContent};
+    use kaijutsu_types::{ConsentMode, ContextId, ContextState, DocKind, PrincipalId};
+
+    /// In-memory DB seeded with a persisted context row of the given type, so
+    /// whoami's DB-backed `context_type` is always populated (never null).
+    fn db_with_context(id: ContextId, context_type: &str) -> Arc<Mutex<KernelDb>> {
+        let db = Arc::new(Mutex::new(KernelDb::in_memory().unwrap()));
+        {
+            let g = db.lock();
+            let creator = PrincipalId::new();
+            let ws_id = g.get_or_create_default_workspace(creator).unwrap();
+            g.insert_document(&DocumentRow {
+                document_id: id,
+                workspace_id: ws_id,
+                doc_kind: DocKind::Conversation,
+                language: None,
+                path: None,
+                created_at: kaijutsu_types::now_millis() as i64,
+                created_by: creator,
+            })
+            .unwrap();
+            g.insert_context(&ContextRow {
+                context_id: id,
+                label: Some("ctx".to_string()),
+                provider: None,
+                model: None,
+                system_prompt: None,
+                consent_mode: ConsentMode::Collaborative,
+                context_state: ContextState::Live,
+                context_type: context_type.to_string(),
+                created_at: kaijutsu_types::now_millis() as i64,
+                created_by: creator,
+                forked_from: None,
+                fork_kind: None,
+                archived_at: None,
+                workspace_id: None,
+                preset_id: None,
+            })
+            .unwrap();
+        }
+        db
+    }
 
     #[tokio::test]
     async fn whoami_reaches_broker() {
+        let ctx = CallContext::test();
         let drift = shared_drift_router();
-        let server = Arc::new(KernelInfoServer::new(drift));
+        let db = db_with_context(ctx.context_id, "coder");
+        let server = Arc::new(KernelInfoServer::new(drift, db));
         let broker = Arc::new(Broker::new());
         broker
             .register(server.clone(), InstancePolicy::default())
             .await
             .unwrap();
 
-        let ctx = CallContext::test();
         let result = broker
             .call_tool(
                 KernelCallParams {
@@ -127,7 +171,11 @@ mod tests {
 
         assert!(!result.is_error);
         match result.content.first().unwrap() {
-            ToolContent::Text(s) => assert!(s.contains(&ctx.context_id.to_hex())),
+            ToolContent::Text(s) => {
+                assert!(s.contains(&ctx.context_id.to_hex()));
+                // DB-backed context_type flows through the broker path.
+                assert!(s.contains("\"context_type\": \"coder\""));
+            }
             other => panic!("expected text content, got {:?}", other),
         }
     }
@@ -135,7 +183,8 @@ mod tests {
     #[tokio::test]
     async fn whoami_rejects_unknown_tool() {
         let drift = shared_drift_router();
-        let server = Arc::new(KernelInfoServer::new(drift));
+        let db = Arc::new(Mutex::new(KernelDb::in_memory().unwrap()));
+        let server = Arc::new(KernelInfoServer::new(drift, db));
         let broker = Arc::new(Broker::new());
         broker
             .register(server, InstancePolicy::default())

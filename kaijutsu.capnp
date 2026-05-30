@@ -34,7 +34,7 @@ struct Identity {
 # Uses typed UUIDs (binary, 16 bytes each) instead of strings.
 struct BlockId {
   contextId @0 :Data;   # 16-byte ContextId (UUIDv7)
-  agentId @1 :Data;     # 16-byte PrincipalId (UUIDv7)
+  principalId @1 :Data;     # 16-byte PrincipalId (UUIDv7)
   seq @2 :UInt64;
 }
 
@@ -136,7 +136,7 @@ struct BlockSnapshot {
   parentId @1 :BlockId;
   hasParentId @2 :Bool;       # True if parentId is set
 
-  # Metadata (author derived from id.agentId — no separate field)
+  # Metadata (author derived from id.principalId — no separate field)
   role @3 :Role;
   status @4 :Status;
   kind @5 :BlockKind;

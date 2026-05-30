@@ -130,9 +130,9 @@ pub struct BlockContent {
 
 impl BlockContent {
     /// Create a new block with empty content.
-    pub fn new(header: BlockHeader, agent_id: PrincipalId, order_key: String) -> Self {
+    pub fn new(header: BlockHeader, principal_id: PrincipalId, order_key: String) -> Self {
         let mut doc = Document::new();
-        let dte_uuid = Uuid::from_bytes(*agent_id.as_bytes());
+        let dte_uuid = Uuid::from_bytes(*principal_id.as_bytes());
         let agent = doc.create_agent(dte_uuid);
 
         // Create the text CRDT for content
@@ -168,10 +168,10 @@ impl BlockContent {
     pub fn with_content(
         header: BlockHeader,
         content: &str,
-        agent_id: PrincipalId,
+        principal_id: PrincipalId,
         order_key: String,
     ) -> Self {
-        let mut block = Self::new(header, agent_id, order_key);
+        let mut block = Self::new(header, principal_id, order_key);
         if !content.is_empty() {
             block.doc.transact(block.agent, |tx| {
                 if let Some(mut text) = tx.get_text_mut(&["content"]) {
@@ -188,12 +188,12 @@ impl BlockContent {
     /// to `fallback_order_key`.
     pub fn from_snapshot(
         snap: &BlockSnapshot,
-        agent_id: PrincipalId,
+        principal_id: PrincipalId,
         fallback_order_key: String,
     ) -> Self {
         let header = BlockHeader::from_snapshot(snap);
         let order_key = snap.order_key.clone().unwrap_or(fallback_order_key);
-        let mut block = Self::with_content(header, &snap.content, agent_id, order_key);
+        let mut block = Self::with_content(header, &snap.content, principal_id, order_key);
         block.tool_name = snap.tool_name.clone();
         block.tool_input = snap.tool_input.clone();
         block.tool_call_id = snap.tool_call_id;
@@ -220,7 +220,7 @@ impl BlockContent {
     /// causal history so subsequent incremental DTE ops can merge successfully.
     pub fn from_snapshot_for_sync(
         snap: &BlockSnapshot,
-        agent_id: PrincipalId,
+        principal_id: PrincipalId,
         fallback_order_key: String,
     ) -> Self {
         let header = BlockHeader::from_snapshot(snap);
@@ -228,7 +228,7 @@ impl BlockContent {
 
         // Bare DTE Document — no create_text, no content. Sender's ops provide everything.
         let mut doc = Document::new();
-        let dte_uuid = Uuid::from_bytes(*agent_id.as_bytes());
+        let dte_uuid = Uuid::from_bytes(*principal_id.as_bytes());
         let agent = doc.create_agent(dte_uuid);
 
         Self {

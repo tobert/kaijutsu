@@ -27,7 +27,7 @@ use crate::ids::{ContextId, PrincipalId};
 ///
 /// Composed of:
 /// - `context_id`: The context (= document) this block belongs to
-/// - `agent_id`: The principal that created this block
+/// - `principal_id`: The principal that created this block
 /// - `seq`: Agent-local sequence number (monotonically increasing)
 ///
 /// This ensures global uniqueness without coordination.
@@ -37,10 +37,10 @@ pub struct BlockId {
     /// Context (= document) this block belongs to.
     pub context_id: ContextId,
     /// Principal that created this block.
-    pub agent_id: PrincipalId,
+    pub principal_id: PrincipalId,
     /// Agent-local sequence number.
     ///
-    /// Callers must ensure monotonically increasing values per (context_id, agent_id)
+    /// Callers must ensure monotonically increasing values per (context_id, principal_id)
     /// pair. The types crate does not enforce this — that's BlockDocument's job.
     /// Violations won't cause incorrect equality, but will confuse debugging
     /// and may break compaction heuristics.
@@ -49,10 +49,10 @@ pub struct BlockId {
 
 impl BlockId {
     /// Create a new block ID from typed components.
-    pub fn new(context_id: ContextId, agent_id: PrincipalId, seq: u64) -> Self {
+    pub fn new(context_id: ContextId, principal_id: PrincipalId, seq: u64) -> Self {
         Self {
             context_id,
-            agent_id,
+            principal_id,
             seq,
         }
     }
@@ -66,7 +66,7 @@ impl BlockId {
         format!(
             "{}_{}_{}",
             self.context_id.to_hex(),
-            self.agent_id.to_hex(),
+            self.principal_id.to_hex(),
             self.seq
         )
     }
@@ -82,11 +82,11 @@ impl BlockId {
             return None;
         }
         let context_id = ContextId::parse(parts[0]).ok()?;
-        let agent_id = PrincipalId::parse(parts[1]).ok()?;
+        let principal_id = PrincipalId::parse(parts[1]).ok()?;
         let seq: u64 = parts[2].parse().ok()?;
         Some(Self {
             context_id,
-            agent_id,
+            principal_id,
             seq,
         })
     }
@@ -98,7 +98,7 @@ impl std::fmt::Display for BlockId {
             f,
             "{}@{}#{}",
             self.context_id.short(),
-            self.agent_id.short(),
+            self.principal_id.short(),
             self.seq
         )
     }
@@ -110,7 +110,7 @@ impl std::fmt::Debug for BlockId {
             f,
             "BlockId({}@{}#{})",
             self.context_id.short(),
-            self.agent_id.short(),
+            self.principal_id.short(),
             self.seq
         )
     }
@@ -1146,7 +1146,7 @@ impl std::fmt::Display for DriftKind {
 
 /// Serializable snapshot of a block (no CRDT state).
 ///
-/// All identity fields use typed IDs: `PrincipalId` for author/agent,
+/// All identity fields use typed IDs: `PrincipalId` for the author,
 /// `ContextId` for context references. Mechanism-specific fields are
 /// `Option` types — only populated for relevant block kinds.
 ///
@@ -1156,10 +1156,10 @@ impl std::fmt::Display for DriftKind {
 /// - **Tool** (ToolCall/ToolResult): tool_kind, tool_name, tool_input, tool_call_id, exit_code, is_error, output
 /// - **Drift** (Drift): drift_kind, source_context, source_model
 ///
-/// The block's author is always `id.agent_id` — no separate field to diverge.
+/// The block's author is always `id.principal_id` — no separate field to diverge.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockSnapshot {
-    /// Block ID (includes context_id, agent_id/author, and seq).
+    /// Block ID (includes context_id, principal_id/author, and seq).
     pub id: BlockId,
     /// Parent block ID (DAG edge — None for root blocks).
     #[serde(default)]
@@ -1304,9 +1304,9 @@ pub struct BlockSnapshot {
 }
 
 impl BlockSnapshot {
-    /// The principal that authored this block (always `id.agent_id`).
+    /// The principal that authored this block (always `id.principal_id`).
     pub fn author(&self) -> PrincipalId {
-        self.id.agent_id
+        self.id.principal_id
     }
 
     /// Create a new text block snapshot.
@@ -1957,7 +1957,7 @@ impl BlockSnapshot {
 /// Builder for `BlockSnapshot` — reduces boilerplate for the many-field struct.
 ///
 /// Starts with required fields (id, kind) and sane defaults for the rest.
-/// The author is always `id.agent_id` — no separate parameter.
+/// The author is always `id.principal_id` — no separate parameter.
 ///
 /// ```
 /// # use kaijutsu_types::*;
@@ -2325,7 +2325,7 @@ mod tests {
         let agent = test_agent();
         let id = BlockId::new(ctx, agent, 42);
         assert_eq!(id.context_id, ctx);
-        assert_eq!(id.agent_id, agent);
+        assert_eq!(id.principal_id, agent);
         assert_eq!(id.seq, 42);
     }
 
@@ -2365,7 +2365,7 @@ mod tests {
         let legacy_key = format!(
             "{}:{}:{}",
             id.context_id.to_hex(),
-            id.agent_id.to_hex(),
+            id.principal_id.to_hex(),
             id.seq
         );
         let parsed = BlockId::from_key(&legacy_key).unwrap();
@@ -2426,7 +2426,7 @@ mod tests {
     #[test]
     fn test_system_authored_block() {
         let id = BlockId::new(test_context(), PrincipalId::system(), 1);
-        assert_eq!(id.agent_id, PrincipalId::system());
+        assert_eq!(id.principal_id, PrincipalId::system());
     }
 
     // ── Role ────────────────────────────────────────────────────────────

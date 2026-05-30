@@ -36,7 +36,7 @@ use crate::view::shell_dock::ShellDockSummonState;
 use crate::view::{
     BlockCellContainer, BlockCellLayout, ContextSwitchRequested, ConversationContainer,
     ConversationScrollState, DocumentCache, EditorEntities, FocusTarget, LayoutGeneration,
-    MainCell, PendingContextSwitch, RoleGroupBorderLayout, SessionAgent, SubmitFailed,
+    MainCell, PendingContextSwitch, RoleGroupBorderLayout, SessionPrincipal, SubmitFailed,
     ViewingConversation,
 };
 
@@ -102,7 +102,7 @@ impl Plugin for CellPlugin {
         app.init_resource::<FocusTarget>()
             .init_resource::<ConversationScrollState>()
             .init_resource::<LayoutGeneration>()
-            .init_resource::<SessionAgent>()
+            .init_resource::<SessionPrincipal>()
             .init_resource::<DocumentCache>()
             .init_resource::<PendingContextSwitch>()
             .init_resource::<EditorEntities>()

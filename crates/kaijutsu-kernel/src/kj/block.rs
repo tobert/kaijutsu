@@ -1360,7 +1360,7 @@ mod tests {
         // Construct a syntactically-valid id that points at no block.
         let phantom = kaijutsu_types::BlockId {
             context_id: ctx,
-            agent_id: PrincipalId::new(),
+            principal_id: PrincipalId::new(),
             seq: 999,
         };
         let result = d

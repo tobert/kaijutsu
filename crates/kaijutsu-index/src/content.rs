@@ -69,7 +69,7 @@ mod tests {
         BlockSnapshot {
             id: BlockId {
                 context_id: ctx,
-                agent_id: agent,
+                principal_id: agent,
                 seq: 1,
             },
             parent_id: None,

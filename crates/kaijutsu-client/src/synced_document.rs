@@ -55,9 +55,9 @@ impl SyncedDocument {
     const MAX_EVENTS_PER_BLOCK: usize = 128;
 
     /// Create a new, empty synced document.
-    pub fn new(context_id: ContextId, agent_id: PrincipalId) -> Self {
+    pub fn new(context_id: ContextId, principal_id: PrincipalId) -> Self {
         Self {
-            doc: CrdtBlockStore::new(context_id, agent_id),
+            doc: CrdtBlockStore::new(context_id, principal_id),
             sync: SyncManager::new(),
             context_id,
             pending_events: HashMap::new(),
@@ -65,8 +65,8 @@ impl SyncedDocument {
     }
 
     /// Create from a [`SyncState`] (ops + version, no blocks).
-    pub fn from_sync_state(state: &SyncState, agent_id: PrincipalId) -> Result<Self, SyncError> {
-        let mut sd = Self::new(state.context_id, agent_id);
+    pub fn from_sync_state(state: &SyncState, principal_id: PrincipalId) -> Result<Self, SyncError> {
+        let mut sd = Self::new(state.context_id, principal_id);
         if !state.ops.is_empty() {
             sd.sync
                 .apply_initial_state(&mut sd.doc, state.context_id, &state.ops)?;
@@ -459,12 +459,12 @@ mod tests {
         ContextId::new()
     }
 
-    fn test_agent_id() -> PrincipalId {
+    fn test_principal_id() -> PrincipalId {
         PrincipalId::new()
     }
 
     fn create_server_store(context_id: ContextId) -> CrdtBlockStore {
-        let mut store = CrdtBlockStore::new(context_id, test_agent_id());
+        let mut store = CrdtBlockStore::new(context_id, test_principal_id());
         store
             .insert_block(
                 None,
@@ -505,7 +505,7 @@ mod tests {
             ops: snap,
         };
 
-        let sd = SyncedDocument::from_sync_state(&state, test_agent_id()).unwrap();
+        let sd = SyncedDocument::from_sync_state(&state, test_principal_id()).unwrap();
         assert_eq!(sd.context_id(), ctx);
         assert_eq!(sd.block_count(), 1);
         assert!(sd.is_synced());
@@ -523,7 +523,7 @@ mod tests {
             version: 1,
             ops: initial_snap,
         };
-        let mut sd = SyncedDocument::from_sync_state(&state, test_agent_id()).unwrap();
+        let mut sd = SyncedDocument::from_sync_state(&state, test_principal_id()).unwrap();
 
         // Add a new block on the server
         let frontier_before = server.frontier();
@@ -555,7 +555,7 @@ mod tests {
     fn test_apply_event_wrong_document_ignored() {
         let ctx = test_context_id();
         let other_ctx = test_context_id();
-        let mut sd = SyncedDocument::new(ctx, test_agent_id());
+        let mut sd = SyncedDocument::new(ctx, test_principal_id());
 
         let effect = sd.apply_event(&ServerEvent::BlockDeleted {
             context_id: other_ctx,
@@ -576,7 +576,7 @@ mod tests {
             version: 1,
             ops: snap,
         };
-        let mut sd = SyncedDocument::from_sync_state(&state, test_agent_id()).unwrap();
+        let mut sd = SyncedDocument::from_sync_state(&state, test_principal_id()).unwrap();
         assert!(sd.is_synced());
 
         let effect = sd.apply_event(&ServerEvent::SyncReset {
@@ -603,7 +603,7 @@ mod tests {
             version: 1,
             ops: initial_snap,
         };
-        let mut sd = SyncedDocument::from_sync_state(&state, test_agent_id()).unwrap();
+        let mut sd = SyncedDocument::from_sync_state(&state, test_principal_id()).unwrap();
 
         // Create a streaming block and add text on the server
         let block_id = server
@@ -636,7 +636,7 @@ mod tests {
     #[test]
     fn test_apply_sync_state() {
         let ctx = test_context_id();
-        let mut sd = SyncedDocument::new(ctx, test_agent_id());
+        let mut sd = SyncedDocument::new(ctx, test_principal_id());
         assert!(!sd.is_synced());
 
         let server = create_server_store(ctx);
@@ -657,7 +657,7 @@ mod tests {
     #[test]
     fn test_resource_events_ignored() {
         let ctx = test_context_id();
-        let mut sd = SyncedDocument::new(ctx, test_agent_id());
+        let mut sd = SyncedDocument::new(ctx, test_principal_id());
 
         let effect = sd.apply_event(&ServerEvent::ResourceUpdated {
             server: "test".to_string(),
@@ -679,8 +679,8 @@ mod tests {
     #[test]
     fn test_synced_document_to_block_document_rendering_chain() {
         let ctx = test_context_id();
-        let server_agent = test_agent_id();
-        let client_agent = test_agent_id();
+        let server_agent = test_principal_id();
+        let client_agent = test_principal_id();
 
         // Server creates a realistic conversation with explicit ordering
         let mut server = CrdtBlockStore::new(ctx, server_agent);
@@ -780,7 +780,7 @@ mod tests {
     #[test]
     fn test_out_of_order_status_before_insert() {
         let ctx = test_context_id();
-        let server_agent = test_agent_id();
+        let server_agent = test_principal_id();
         let mut server = CrdtBlockStore::new(ctx, server_agent);
 
         // Insert command block (arrives in order)
@@ -832,7 +832,7 @@ mod tests {
             version: 1,
             ops: initial_frontier,
         };
-        let mut sd = SyncedDocument::from_sync_state(&state, test_agent_id()).unwrap();
+        let mut sd = SyncedDocument::from_sync_state(&state, test_principal_id()).unwrap();
         assert_eq!(sd.block_count(), 1);
 
         // Simulate out-of-order: StatusChanged arrives BEFORE BlockInserted
@@ -866,7 +866,7 @@ mod tests {
     #[test]
     fn test_out_of_order_multiple_events_before_insert() {
         let ctx = test_context_id();
-        let server_agent = test_agent_id();
+        let server_agent = test_principal_id();
         let mut server = CrdtBlockStore::new(ctx, server_agent);
 
         let cmd_id = server
@@ -917,7 +917,7 @@ mod tests {
                 version: 1,
                 ops: initial,
             },
-            test_agent_id(),
+            test_principal_id(),
         )
         .unwrap();
 
@@ -953,7 +953,7 @@ mod tests {
     fn test_out_of_order_wrong_context_not_buffered() {
         let ctx = test_context_id();
         let other = test_context_id();
-        let mut sd = SyncedDocument::new(ctx, test_agent_id());
+        let mut sd = SyncedDocument::new(ctx, test_principal_id());
 
         sd.apply_event(&ServerEvent::BlockStatusChanged {
             context_id: other,
@@ -979,7 +979,7 @@ mod tests {
     #[test]
     fn test_synced_document_resilient_to_text_ops_failure() {
         let ctx = test_context_id();
-        let client_agent = test_agent_id();
+        let client_agent = test_principal_id();
 
         // Server creates initial block
         let server = create_server_store(ctx);

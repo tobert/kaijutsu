@@ -104,7 +104,16 @@ impl KjDispatcher {
             .unwrap_or(0);
 
         let is_current = Some(target_id) == caller.context_id;
-        let mut info = format_context_info(&row, children_count, drift_from + drift_to, is_current);
+        // Long-running OTel trace id lives on the in-memory drift handle, not
+        // the persisted row — look it up so the umbrella trace is pasteable.
+        let trace_id = self.drift_router().read().trace_id_for_context(target_id);
+        let mut info = format_context_info(
+            &row,
+            children_count,
+            drift_from + drift_to,
+            is_current,
+            trace_id,
+        );
 
         // Shell config — captured into the structured record below as well.
         let shell = db.get_context_shell(target_id).ok().flatten();
@@ -152,6 +161,7 @@ impl KjDispatcher {
             "consent_mode": format!("{:?}", row.consent_mode),
             "context_state": format!("{:?}", row.context_state),
             "context_type": row.context_type,
+            "trace_id": trace_id.map(crate::kj::format::hex32),
             "forked_from": row.forked_from.map(|id| id.to_hex()),
             "fork_kind": row.fork_kind.as_ref().map(|k| format!("{k:?}")),
             "children_count": children_count,

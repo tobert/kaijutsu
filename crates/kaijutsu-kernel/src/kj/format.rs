@@ -59,12 +59,22 @@ pub fn format_context_tree(dag: &[(ContextRow, i64)], current: Option<ContextId>
     lines.join("\n")
 }
 
+/// Render a 16-byte OTel trace id as 32 lowercase hex chars (no dashes) —
+/// the canonical W3C `trace-id` text form a trace viewer expects.
+pub(crate) fn hex32(bytes: [u8; 16]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// Format a single context's info for `kj context info`.
+///
+/// `trace_id` is the context's long-running OTel trace id (from the drift
+/// router handle); `None` when the context isn't registered in the router.
 pub fn format_context_info(
     ctx: &ContextRow,
     children_count: usize,
     drift_edge_count: usize,
     is_current: bool,
+    trace_id: Option<[u8; 16]>,
 ) -> String {
     let mut lines = Vec::new();
 
@@ -79,6 +89,10 @@ pub fn format_context_info(
         "Model:   {}",
         format_model(&ctx.provider, &ctx.model)
     ));
+    lines.push(format!("Type:    {}", ctx.context_type));
+    if let Some(tid) = trace_id {
+        lines.push(format!("Trace:   {}", hex32(tid)));
+    }
 
     if let Some(forked_from) = ctx.forked_from {
         let kind = ctx
@@ -293,11 +307,38 @@ mod tests {
     fn info_shows_fields() {
         let id = ContextId::new();
         let row = make_row(Some("test-ctx"), id);
-        let output = format_context_info(&row, 2, 1, true);
+        let output = format_context_info(&row, 2, 1, true, None);
         assert!(output.contains("test-ctx *"));
         assert!(output.contains("anthropic/claude-opus-4-6"));
         assert!(output.contains("Children: 2"));
         assert!(output.contains("Drifts:  1"));
+        // context_type always renders.
+        assert!(output.contains("Type:    default"));
+        // No trace id passed -> no Trace line.
+        assert!(!output.contains("Trace:"));
+    }
+
+    #[test]
+    fn info_shows_trace_id_when_present() {
+        let id = ContextId::new();
+        let mut row = make_row(Some("coder-ctx"), id);
+        row.context_type = "coder".to_string();
+        let mut tid = [0u8; 16];
+        tid[15] = 0xab;
+        let output = format_context_info(&row, 0, 0, false, Some(tid));
+        assert!(output.contains("Type:    coder"));
+        // 32 lowercase hex chars, leading zeros preserved.
+        assert!(output.contains("Trace:   000000000000000000000000000000ab"));
+    }
+
+    #[test]
+    fn hex32_pads_and_lowercases() {
+        let mut bytes = [0u8; 16];
+        bytes[0] = 0x0a;
+        bytes[15] = 0xff;
+        let s = hex32(bytes);
+        assert_eq!(s.len(), 32);
+        assert_eq!(s, "0a0000000000000000000000000000ff");
     }
 
     #[test]

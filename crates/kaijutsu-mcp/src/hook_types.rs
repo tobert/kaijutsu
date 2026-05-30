@@ -50,7 +50,7 @@ pub struct HookEvent {
     pub reason: Option<String>,
     /// Subagent identifier.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_id: Option<String>,
+    pub principal_id: Option<String>,
     /// Subagent type.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_type: Option<String>,

@@ -71,7 +71,7 @@ async fn setup() -> Fixture {
 
     let file_cache = Arc::new(FileDocumentCache::new(store.clone(), kernel.vfs().clone()));
     kernel
-        .register_builtin_mcp_servers(store.clone(), file_cache, None)
+        .register_builtin_mcp_servers(store.clone(), file_cache, None, db.clone())
         .await
         .expect("register_builtin_mcp_servers");
 
@@ -914,7 +914,7 @@ async fn setup_with_db() -> (Fixture, Arc<parking_lot::Mutex<KernelDb>>) {
 
     let file_cache = Arc::new(FileDocumentCache::new(store.clone(), kernel.vfs().clone()));
     kernel
-        .register_builtin_mcp_servers(store.clone(), file_cache, None)
+        .register_builtin_mcp_servers(store.clone(), file_cache, None, db.clone())
         .await
         .expect("register_builtin_mcp_servers");
 
@@ -972,7 +972,7 @@ async fn binding_persists_across_kernel_restart() {
         shared_block_store_with_db(db.clone(), ws_id2, creator2);
     let file_cache2 = Arc::new(FileDocumentCache::new(store2.clone(), kernel2.vfs().clone()));
     kernel2
-        .register_builtin_mcp_servers(store2.clone(), file_cache2, None)
+        .register_builtin_mcp_servers(store2.clone(), file_cache2, None, db.clone())
         .await
         .unwrap();
     kernel2.broker().set_db(db.clone()).await;
@@ -1249,7 +1249,7 @@ async fn hooks_persist_across_kernel_restart() {
         shared_block_store_with_db(db.clone(), ws_id2, creator2);
     let file_cache2 = Arc::new(FileDocumentCache::new(store2.clone(), kernel2.vfs().clone()));
     kernel2
-        .register_builtin_mcp_servers(store2.clone(), file_cache2, None)
+        .register_builtin_mcp_servers(store2.clone(), file_cache2, None, db.clone())
         .await
         .unwrap();
     // set_db is the hydrate trigger. Before this call the HookTables

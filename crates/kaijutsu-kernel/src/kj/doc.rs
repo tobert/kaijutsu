@@ -495,7 +495,7 @@ fn format_dag_node(
         "├─ "
     };
 
-    let short_id = format!("{}:{}", block_id.agent_id, block_id.seq);
+    let short_id = format!("{}:{}", block_id.principal_id, block_id.seq);
     let role_kind = format!("[{}/{}]", block.role.as_str(), block.kind.as_str());
     let summary = summarize(&block.content, 40);
 

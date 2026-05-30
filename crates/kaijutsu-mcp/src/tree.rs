@@ -62,7 +62,7 @@ fn format_dag_node(
     };
 
     // Format block ID as agent:seq (matches BlockId::to_key delimiter)
-    let short_id = format!("{}:{}", block_id.agent_id, block_id.seq);
+    let short_id = format!("{}:{}", block_id.principal_id, block_id.seq);
 
     // Format role/kind
     let role_kind = format!("[{}/{}]", block.role.as_str(), block.kind.as_str());

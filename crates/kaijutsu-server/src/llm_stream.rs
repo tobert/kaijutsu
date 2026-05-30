@@ -91,7 +91,7 @@ pub(crate) async fn spawn_llm_for_prompt(
     model: Option<&str>,
     after_block_id: &kaijutsu_crdt::BlockId,
     tool_ctx: kaijutsu_kernel::ExecContext,
-    user_agent_id: PrincipalId,
+    user_principal_id: PrincipalId,
 ) -> Result<(), capnp::Error> {
     let documents = kernel.documents.clone();
     let kernel_arc = kernel.kernel.clone();
@@ -199,7 +199,7 @@ pub(crate) async fn spawn_llm_for_prompt(
 
     // Build tool definitions via the broker (binding + ListTools filter do
     // the curation — D-54 retired the legacy post-filter).
-    let tools = build_tool_definitions(&kernel_arc, context_id, user_agent_id).await;
+    let tools = build_tool_definitions(&kernel_arc, context_id, user_principal_id).await;
 
     // Assemble situational system-prompt addendum (A4): static base + rc
     // sections (the `.md` lifecycle scripts) + per-call facts so the model
@@ -247,7 +247,7 @@ pub(crate) async fn spawn_llm_for_prompt(
         system_prompt,
         max_output_tokens,
         conversation_cache,
-        user_agent_id,
+        user_principal_id,
         tool_ctx,
         interrupt,
         interrupt_generation,
@@ -308,7 +308,7 @@ async fn process_llm_stream(
     max_output_tokens: u64,
     conversation_cache: Arc<ConversationCache>,
     // TODO: use for per-user attribution on model-generated blocks
-    _user_agent_id: PrincipalId,
+    _user_principal_id: PrincipalId,
     tool_ctx: kaijutsu_kernel::ExecContext,
     interrupt: Arc<ContextInterruptState>,
     interrupt_generation: u64,

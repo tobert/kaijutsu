@@ -15,9 +15,9 @@ pub use kaijutsu_types::{ContextId, PrincipalId};
 /// construction. Without this, each frame or context switch would generate
 /// a fresh PrincipalId, fragmenting CRDT authorship and wasting DTE agent slots.
 #[derive(Resource)]
-pub struct SessionAgent(pub PrincipalId);
+pub struct SessionPrincipal(pub PrincipalId);
 
-impl Default for SessionAgent {
+impl Default for SessionPrincipal {
     fn default() -> Self {
         Self(PrincipalId::new())
     }

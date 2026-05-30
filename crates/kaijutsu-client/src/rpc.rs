@@ -956,7 +956,7 @@ impl KernelHandle {
             let mut params = request.get();
             let mut source = params.reborrow().init_source_block_id();
             source.set_context_id(block_id.context_id.as_bytes());
-            source.set_agent_id(block_id.agent_id.as_bytes());
+            source.set_principal_id(block_id.principal_id.as_bytes());
             source.set_seq(block_id.seq);
             params.set_target_context_id(target_context.as_bytes());
         }
@@ -1698,7 +1698,7 @@ fn set_block_event_filter_builder(
 
 fn set_block_id_builder(builder: &mut crate::kaijutsu_capnp::block_id::Builder, id: &BlockId) {
     builder.set_context_id(id.context_id.as_bytes());
-    builder.set_agent_id(id.agent_id.as_bytes());
+    builder.set_principal_id(id.principal_id.as_bytes());
     builder.set_seq(id.seq);
 }
 
@@ -1882,9 +1882,9 @@ pub(crate) fn parse_block_id(
 ) -> Result<BlockId, RpcError> {
     let context_id = ContextId::try_from_slice(reader.get_context_id()?)
         .ok_or_else(|| RpcError::ServerError("invalid context_id in BlockId".into()))?;
-    let agent_id = PrincipalId::try_from_slice(reader.get_agent_id()?)
-        .ok_or_else(|| RpcError::ServerError("invalid agent_id in BlockId".into()))?;
-    Ok(BlockId::new(context_id, agent_id, reader.get_seq()))
+    let principal_id = PrincipalId::try_from_slice(reader.get_principal_id()?)
+        .ok_or_else(|| RpcError::ServerError("invalid principal_id in BlockId".into()))?;
+    Ok(BlockId::new(context_id, principal_id, reader.get_seq()))
 }
 
 /// Helper to parse a flat BlockSnapshot from Cap'n Proto using BlockSnapshotBuilder.
@@ -2454,7 +2454,7 @@ mod tests {
         {
             let mut id = builder.reborrow().init_id();
             id.set_context_id(snap.id.context_id.as_bytes());
-            id.set_agent_id(snap.id.agent_id.as_bytes());
+            id.set_principal_id(snap.id.principal_id.as_bytes());
             id.set_seq(snap.id.seq);
         }
 
@@ -2582,7 +2582,7 @@ mod tests {
                 rp.set_has_parent_resource_block_id(true);
                 let mut pid = rp.reborrow().init_parent_resource_block_id();
                 pid.set_context_id(parent.context_id.as_bytes());
-                pid.set_agent_id(parent.agent_id.as_bytes());
+                pid.set_principal_id(parent.principal_id.as_bytes());
                 pid.set_seq(parent.seq);
             }
         }
@@ -2600,7 +2600,7 @@ mod tests {
         let agent = PrincipalId::new();
         let id = BlockId {
             context_id: ctx,
-            agent_id: agent,
+            principal_id: agent,
             seq: 1,
         };
 
@@ -2624,7 +2624,7 @@ mod tests {
         let agent = PrincipalId::new();
         let id = BlockId {
             context_id: ctx,
-            agent_id: agent,
+            principal_id: agent,
             seq: 2,
         };
 
@@ -2646,7 +2646,7 @@ mod tests {
         let agent = PrincipalId::new();
         let id = BlockId {
             context_id: ctx,
-            agent_id: agent,
+            principal_id: agent,
             seq: 3,
         };
 
@@ -2685,7 +2685,7 @@ mod tests {
     fn notif_ctx_id() -> BlockId {
         BlockId {
             context_id: ContextId::new(),
-            agent_id: PrincipalId::system(),
+            principal_id: PrincipalId::system(),
             seq: 42,
         }
     }
@@ -2793,7 +2793,7 @@ mod tests {
         let id = notif_ctx_id();
         let parent_id = BlockId {
             context_id: id.context_id,
-            agent_id: id.agent_id,
+            principal_id: id.principal_id,
             seq: 42,
         };
         let payload = kaijutsu_types::ResourcePayload {

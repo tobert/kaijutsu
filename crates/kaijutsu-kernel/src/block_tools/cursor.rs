@@ -76,7 +76,7 @@ fn transform_offset(offset: usize, edit_offset: usize, deleted: usize, inserted:
 #[derive(Debug, Clone)]
 pub struct CursorEvent {
     /// The agent whose cursor moved.
-    pub agent_id: PrincipalId,
+    pub principal_id: PrincipalId,
     /// The new cursor position (None if cursor removed).
     pub position: Option<CursorPosition>,
 }
@@ -105,33 +105,33 @@ impl CursorTracker {
     }
 
     /// Set an agent's cursor position.
-    pub fn set_cursor(&self, agent_id: PrincipalId, position: CursorPosition) {
+    pub fn set_cursor(&self, principal_id: PrincipalId, position: CursorPosition) {
         {
             let mut cursors = self.cursors.write();
-            cursors.insert(agent_id, position.clone());
+            cursors.insert(principal_id, position.clone());
         }
         let _ = self.sender.send(CursorEvent {
-            agent_id,
+            principal_id,
             position: Some(position),
         });
     }
 
     /// Remove an agent's cursor.
-    pub fn remove_cursor(&self, agent_id: PrincipalId) {
+    pub fn remove_cursor(&self, principal_id: PrincipalId) {
         {
             let mut cursors = self.cursors.write();
-            cursors.remove(&agent_id);
+            cursors.remove(&principal_id);
         }
         let _ = self.sender.send(CursorEvent {
-            agent_id,
+            principal_id,
             position: None,
         });
     }
 
     /// Get an agent's current cursor position.
-    pub fn get_cursor(&self, agent_id: PrincipalId) -> Option<CursorPosition> {
+    pub fn get_cursor(&self, principal_id: PrincipalId) -> Option<CursorPosition> {
         let cursors = self.cursors.read();
-        cursors.get(&agent_id).cloned()
+        cursors.get(&principal_id).cloned()
     }
 
     /// Get all cursor positions.
@@ -164,30 +164,30 @@ impl CursorTracker {
 
         {
             let mut cursors = self.cursors.write();
-            for (agent_id, position) in cursors.iter_mut() {
+            for (principal_id, position) in cursors.iter_mut() {
                 if &position.block_id == block_id {
                     position.transform(edit_offset, deleted, inserted);
-                    updated.push((*agent_id, position.clone()));
+                    updated.push((*principal_id, position.clone()));
                 }
             }
         }
 
         // Broadcast cursor updates
-        for (agent_id, position) in updated {
+        for (principal_id, position) in updated {
             let _ = self.sender.send(CursorEvent {
-                agent_id,
+                principal_id,
                 position: Some(position),
             });
         }
     }
 
     /// Move a cursor by a relative delta.
-    pub fn move_cursor(&self, agent_id: PrincipalId, delta: isize) -> Option<CursorPosition> {
+    pub fn move_cursor(&self, principal_id: PrincipalId, delta: isize) -> Option<CursorPosition> {
         let mut result = None;
 
         {
             let mut cursors = self.cursors.write();
-            if let Some(position) = cursors.get_mut(&agent_id) {
+            if let Some(position) = cursors.get_mut(&principal_id) {
                 let new_offset = if delta < 0 {
                     position.offset.saturating_sub((-delta) as usize)
                 } else {
@@ -201,7 +201,7 @@ impl CursorTracker {
 
         if let Some(ref pos) = result {
             let _ = self.sender.send(CursorEvent {
-                agent_id,
+                principal_id,
                 position: Some(pos.clone()),
             });
         }
@@ -423,7 +423,7 @@ mod tests {
         tracker.set_cursor(agent1, CursorPosition::new(block_id, 10));
 
         let event = rx.recv().await.unwrap();
-        assert_eq!(event.agent_id, agent1);
+        assert_eq!(event.principal_id, agent1);
         assert!(event.position.is_some());
         assert_eq!(event.position.unwrap().offset, 10);
     }

@@ -70,8 +70,8 @@ pub struct BlockStore {
     /// Context this store belongs to.
     context_id: ContextId,
 
-    /// Principal ID for this agent instance.
-    agent_id: PrincipalId,
+    /// Principal ID stamped on blocks created through this store.
+    principal_id: PrincipalId,
 
     /// Blocks indexed by ID.
     blocks: BTreeMap<BlockId, BlockContent>,
@@ -89,10 +89,10 @@ pub struct BlockStore {
 
 impl BlockStore {
     /// Create a new empty store.
-    pub fn new(context_id: ContextId, agent_id: PrincipalId) -> Self {
+    pub fn new(context_id: ContextId, principal_id: PrincipalId) -> Self {
         Self {
             context_id,
-            agent_id,
+            principal_id,
             blocks: BTreeMap::new(),
             next_seq: 0,
             version: 0,
@@ -124,18 +124,18 @@ impl BlockStore {
         self.context_id
     }
 
-    /// Get the agent/principal ID.
-    pub fn agent_id(&self) -> PrincipalId {
-        self.agent_id
+    /// Get the principal ID.
+    pub fn principal_id(&self) -> PrincipalId {
+        self.principal_id
     }
 
-    /// Override the agent/principal ID for subsequent block operations.
+    /// Override the principal ID for subsequent block operations.
     ///
-    /// This changes who "authored" newly created blocks (via `BlockId.agent_id`).
+    /// This changes who "authored" newly created blocks (via `BlockId.principal_id`).
     /// The DTE agent within each per-block Document is unrelated — it tracks
     /// CRDT operation identity, not block authorship.
-    pub fn set_agent_id(&mut self, agent_id: PrincipalId) {
-        self.agent_id = agent_id;
+    pub fn set_principal_id(&mut self, principal_id: PrincipalId) {
+        self.principal_id = principal_id;
     }
 
     /// Get the current version.
@@ -248,7 +248,7 @@ impl BlockStore {
     // =========================================================================
 
     fn new_block_id(&mut self) -> BlockId {
-        let id = BlockId::new(self.context_id, self.agent_id, self.next_seq);
+        let id = BlockId::new(self.context_id, self.principal_id, self.next_seq);
         self.next_seq += 1;
         id
     }
@@ -264,7 +264,7 @@ impl BlockStore {
     /// stripping needed. Sequential inserts by the same agent naturally group
     /// because they all share the same suffix in their key lineage.
     fn agent_order_suffix(&self) -> String {
-        let bytes = self.agent_id.as_bytes();
+        let bytes = self.principal_id.as_bytes();
         // Use bytes 10-13 (random portion of UUIDv7, not the timestamp prefix)
         // to maximize entropy and minimize suffix collisions between agents.
         let c1 = crate::content::BASE62[(bytes[10] as usize) % 62] as char;
@@ -337,7 +337,7 @@ impl BlockStore {
 
     /// Insert a new block.
     ///
-    /// Author is implicit — derived from `self.agent_id` via the BlockId.
+    /// Author is implicit — derived from `self.principal_id` via the BlockId.
     pub fn insert_block(
         &mut self,
         parent_id: Option<&BlockId>,
@@ -390,7 +390,7 @@ impl BlockStore {
             content_type_at: ts,
         };
 
-        let block = BlockContent::with_content(header, &content_str, self.agent_id, order_key);
+        let block = BlockContent::with_content(header, &content_str, self.principal_id, order_key);
         self.blocks.insert(id, block);
         self.version += 1;
         Ok(id)
@@ -450,7 +450,7 @@ impl BlockStore {
             content_type_at: ts,
         };
 
-        let mut block = BlockContent::with_content(header, &input_json, self.agent_id, order_key);
+        let mut block = BlockContent::with_content(header, &input_json, self.principal_id, order_key);
         block.set_tool_name(Some(tool_name.into()));
         block.set_tool_input(Some(input_json));
         self.blocks.insert(id, block);
@@ -514,7 +514,7 @@ impl BlockStore {
         };
 
         let mut block =
-            BlockContent::with_content(header, &content.into(), self.agent_id, order_key);
+            BlockContent::with_content(header, &content.into(), self.principal_id, order_key);
         block.set_tool_call_id(Some(*tool_call_id));
         self.blocks.insert(id, block);
         self.version += 1;
@@ -554,7 +554,7 @@ impl BlockStore {
             source_model,
             drift_kind,
         );
-        let block = BlockContent::from_snapshot(&snap, self.agent_id, order_key);
+        let block = BlockContent::from_snapshot(&snap, self.principal_id, order_key);
         self.blocks.insert(id, block);
         self.version += 1;
         Ok(id)
@@ -583,7 +583,7 @@ impl BlockStore {
 
         let order_key = self.calc_order_key(after);
         let snap = BlockSnapshot::file(id, parent_id.copied(), file_path, content);
-        let block = BlockContent::from_snapshot(&snap, self.agent_id, order_key);
+        let block = BlockContent::from_snapshot(&snap, self.principal_id, order_key);
         self.blocks.insert(id, block);
         self.version += 1;
         Ok(id)
@@ -611,7 +611,7 @@ impl BlockStore {
         let order_key = self.calc_order_key(after);
         let snap =
             BlockSnapshot::error_for(id, *parent_id, payload.clone(), summary);
-        let block = BlockContent::from_snapshot(&snap, self.agent_id, order_key);
+        let block = BlockContent::from_snapshot(&snap, self.principal_id, order_key);
         self.blocks.insert(id, block);
         self.version += 1;
         Ok(id)
@@ -649,7 +649,7 @@ impl BlockStore {
             payload.clone(),
             summary,
         );
-        let block = BlockContent::from_snapshot(&snap, self.agent_id, order_key);
+        let block = BlockContent::from_snapshot(&snap, self.principal_id, order_key);
         self.blocks.insert(id, block);
         self.version += 1;
         Ok(id)
@@ -688,7 +688,7 @@ impl BlockStore {
             payload.clone(),
             summary,
         );
-        let block = BlockContent::from_snapshot(&snap, self.agent_id, order_key);
+        let block = BlockContent::from_snapshot(&snap, self.principal_id, order_key);
         self.blocks.insert(id, block);
         self.version += 1;
         Ok(id)
@@ -701,7 +701,7 @@ impl BlockStore {
         after: Option<&BlockId>,
     ) -> Result<BlockId> {
         let block_id = snapshot.id;
-        if snapshot.id.agent_id == self.agent_id {
+        if snapshot.id.principal_id == self.principal_id {
             self.next_seq = self.next_seq.max(snapshot.id.seq + 1);
         }
 
@@ -710,7 +710,7 @@ impl BlockStore {
         }
 
         let order_key = self.calc_order_key(after);
-        let block = BlockContent::from_snapshot(&snapshot, self.agent_id, order_key);
+        let block = BlockContent::from_snapshot(&snapshot, self.principal_id, order_key);
         self.blocks.insert(block_id, block);
         self.version += 1;
         Ok(block_id)
@@ -986,14 +986,14 @@ impl BlockStore {
                 let block = if has_ops_for.contains(&snap.id) {
                     // DTE ops will provide content with proper causal history.
                     // Bare DTE — no structure creation, sender's ops bring everything.
-                    BlockContent::from_snapshot_for_sync(snap, self.agent_id, fallback_key)
+                    BlockContent::from_snapshot_for_sync(snap, self.principal_id, fallback_key)
                 } else {
                     // No DTE ops (persistence restore) — use snapshot content
-                    BlockContent::from_snapshot(snap, self.agent_id, fallback_key)
+                    BlockContent::from_snapshot(snap, self.principal_id, fallback_key)
                 };
                 max_remote_ts = max_remote_ts.max(snap.updated_at);
                 self.blocks.insert(snap.id, block);
-                if snap.id.agent_id == self.agent_id {
+                if snap.id.principal_id == self.principal_id {
                     self.next_seq = self.next_seq.max(snap.id.seq + 1);
                 }
             }
@@ -1061,8 +1061,8 @@ impl BlockStore {
     /// that "merges back" travels via drift blocks, not DTE merge.
     /// The clean DTE history also means forked contexts rarely need
     /// compaction.
-    pub fn fork(&self, new_context_id: ContextId, new_agent_id: PrincipalId) -> Self {
-        let mut forked = Self::new(new_context_id, new_agent_id);
+    pub fn fork(&self, new_context_id: ContextId, new_principal_id: PrincipalId) -> Self {
+        let mut forked = Self::new(new_context_id, new_principal_id);
 
         for block in self.blocks.values() {
             if block.is_deleted() {
@@ -1071,15 +1071,15 @@ impl BlockStore {
             let snap = block.snapshot();
 
             // Remap IDs: only context_id changes
-            let new_id = BlockId::new(new_context_id, snap.id.agent_id, snap.id.seq);
+            let new_id = BlockId::new(new_context_id, snap.id.principal_id, snap.id.seq);
             let new_parent_id = snap
                 .parent_id
-                .map(|pid| BlockId::new(new_context_id, pid.agent_id, pid.seq));
+                .map(|pid| BlockId::new(new_context_id, pid.principal_id, pid.seq));
             let new_tool_call_id = snap
                 .tool_call_id
-                .map(|tcid| BlockId::new(new_context_id, tcid.agent_id, tcid.seq));
+                .map(|tcid| BlockId::new(new_context_id, tcid.principal_id, tcid.seq));
 
-            if snap.id.agent_id == new_agent_id {
+            if snap.id.principal_id == new_principal_id {
                 forked.next_seq = forked.next_seq.max(snap.id.seq + 1);
             }
 
@@ -1089,7 +1089,7 @@ impl BlockStore {
             remapped.tool_call_id = new_tool_call_id;
 
             let order_key = block.order_key().to_string();
-            let content = BlockContent::from_snapshot(&remapped, new_agent_id, order_key);
+            let content = BlockContent::from_snapshot(&remapped, new_principal_id, order_key);
             forked.blocks.insert(new_id, content);
         }
 
@@ -1103,10 +1103,10 @@ impl BlockStore {
     pub fn fork_at_version(
         &self,
         new_context_id: ContextId,
-        new_agent_id: PrincipalId,
+        new_principal_id: PrincipalId,
         before_timestamp: u64,
     ) -> Self {
-        let mut forked = Self::new(new_context_id, new_agent_id);
+        let mut forked = Self::new(new_context_id, new_principal_id);
 
         for block in self.blocks.values() {
             if block.is_deleted() {
@@ -1118,15 +1118,15 @@ impl BlockStore {
             let snap = block.snapshot();
 
             // Remap IDs: only context_id changes
-            let new_id = BlockId::new(new_context_id, snap.id.agent_id, snap.id.seq);
+            let new_id = BlockId::new(new_context_id, snap.id.principal_id, snap.id.seq);
             let new_parent_id = snap
                 .parent_id
-                .map(|pid| BlockId::new(new_context_id, pid.agent_id, pid.seq));
+                .map(|pid| BlockId::new(new_context_id, pid.principal_id, pid.seq));
             let new_tool_call_id = snap
                 .tool_call_id
-                .map(|tcid| BlockId::new(new_context_id, tcid.agent_id, tcid.seq));
+                .map(|tcid| BlockId::new(new_context_id, tcid.principal_id, tcid.seq));
 
-            if snap.id.agent_id == new_agent_id {
+            if snap.id.principal_id == new_principal_id {
                 forked.next_seq = forked.next_seq.max(snap.id.seq + 1);
             }
 
@@ -1136,7 +1136,7 @@ impl BlockStore {
             remapped.tool_call_id = new_tool_call_id;
 
             let order_key = block.order_key().to_string();
-            let content = BlockContent::from_snapshot(&remapped, new_agent_id, order_key);
+            let content = BlockContent::from_snapshot(&remapped, new_principal_id, order_key);
             forked.blocks.insert(new_id, content);
         }
 
@@ -1152,11 +1152,11 @@ impl BlockStore {
     pub fn fork_filtered(
         &self,
         new_context_id: ContextId,
-        new_agent_id: PrincipalId,
+        new_principal_id: PrincipalId,
         before_timestamp: u64,
         filter: &ForkBlockFilter,
     ) -> Self {
-        let mut forked = Self::new(new_context_id, new_agent_id);
+        let mut forked = Self::new(new_context_id, new_principal_id);
 
         // Collect passing blocks first (for max_blocks truncation)
         let mut passing: Vec<(&BlockContent, BlockSnapshot)> = Vec::new();
@@ -1184,15 +1184,15 @@ impl BlockStore {
         }
 
         for (block, snap) in passing {
-            let new_id = BlockId::new(new_context_id, snap.id.agent_id, snap.id.seq);
+            let new_id = BlockId::new(new_context_id, snap.id.principal_id, snap.id.seq);
             let new_parent_id = snap
                 .parent_id
-                .map(|pid| BlockId::new(new_context_id, pid.agent_id, pid.seq));
+                .map(|pid| BlockId::new(new_context_id, pid.principal_id, pid.seq));
             let new_tool_call_id = snap
                 .tool_call_id
-                .map(|tcid| BlockId::new(new_context_id, tcid.agent_id, tcid.seq));
+                .map(|tcid| BlockId::new(new_context_id, tcid.principal_id, tcid.seq));
 
-            if snap.id.agent_id == new_agent_id {
+            if snap.id.principal_id == new_principal_id {
                 forked.next_seq = forked.next_seq.max(snap.id.seq + 1);
             }
 
@@ -1202,7 +1202,7 @@ impl BlockStore {
             remapped.tool_call_id = new_tool_call_id;
 
             let order_key = block.order_key().to_string();
-            let content = BlockContent::from_snapshot(&remapped, new_agent_id, order_key);
+            let content = BlockContent::from_snapshot(&remapped, new_principal_id, order_key);
             forked.blocks.insert(new_id, content);
         }
 
@@ -1253,8 +1253,8 @@ impl BlockStore {
     /// Each block is rebuilt with `from_snapshot_for_sync` (bare DTE Document)
     /// and then its saved DTE ops are merged in. This preserves the causal
     /// graph so subsequent oplog replay can merge incremental ops.
-    pub fn from_snapshot(snapshot: StoreSnapshot, agent_id: PrincipalId) -> Result<Self> {
-        let mut store = Self::new(snapshot.context_id, agent_id);
+    pub fn from_snapshot(snapshot: StoreSnapshot, principal_id: PrincipalId) -> Result<Self> {
+        let mut store = Self::new(snapshot.context_id, principal_id);
 
         for (order_seq, (block_snap, history)) in snapshot
             .blocks
@@ -1262,7 +1262,7 @@ impl BlockStore {
             .zip(snapshot.block_history.iter())
             .enumerate()
         {
-            if block_snap.id.agent_id == agent_id {
+            if block_snap.id.principal_id == principal_id {
                 store.next_seq = store.next_seq.max(block_snap.id.seq + 1);
             }
 
@@ -1270,11 +1270,11 @@ impl BlockStore {
 
             if history.is_empty() {
                 let content =
-                    BlockContent::from_snapshot(block_snap, agent_id, fallback_key);
+                    BlockContent::from_snapshot(block_snap, principal_id, fallback_key);
                 store.blocks.insert(block_snap.id, content);
             } else {
                 let mut content =
-                    BlockContent::from_snapshot_for_sync(block_snap, agent_id, fallback_key);
+                    BlockContent::from_snapshot_for_sync(block_snap, principal_id, fallback_key);
                 content.merge_ops(history.clone())?;
                 store.blocks.insert(block_snap.id, content);
             }
@@ -1285,7 +1285,7 @@ impl BlockStore {
             if !store.blocks.contains_key(id) {
                 let snap = crate::BlockSnapshotBuilder::new(*id, crate::BlockKind::Text)
                     .build();
-                let mut block = BlockContent::from_snapshot(&snap, agent_id, "Z".to_string());
+                let mut block = BlockContent::from_snapshot(&snap, principal_id, "Z".to_string());
                 block.mark_deleted(0);
                 store.blocks.insert(*id, block);
             }
@@ -1897,7 +1897,7 @@ mod tests {
     #[test]
     fn test_fork() {
         let mut original = test_store();
-        let original_agent = original.agent_id();
+        let original_agent = original.principal_id();
 
         let user_msg = original
             .insert_block(
@@ -1935,7 +1935,7 @@ mod tests {
         assert_eq!(blocks[0].id.context_id, fork_ctx);
         assert_eq!(blocks[1].id.context_id, fork_ctx);
         // Authorship preserved
-        assert_eq!(blocks[0].id.agent_id, original_agent);
+        assert_eq!(blocks[0].id.principal_id, original_agent);
     }
 
     #[test]
@@ -1943,7 +1943,7 @@ mod tests {
         let mut store = test_store();
         let source_ctx = ContextId::new();
 
-        let drift_id = BlockId::new(store.context_id(), store.agent_id(), 0);
+        let drift_id = BlockId::new(store.context_id(), store.principal_id(), 0);
         let drift_snap = BlockSnapshot::drift(
             drift_id,
             None,

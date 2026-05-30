@@ -74,10 +74,10 @@ const KEY_ERROR_SOURCE_KIND: &str = "error_source_kind";
 /// # Single-Writer-Per-Replica Model
 ///
 /// Each `BlockDocument` instance is owned by one agent (identified by
-/// `agent_id`). All new blocks created via [`insert_block`], [`insert_tool_call`],
+/// `principal_id`). All new blocks created via [`insert_block`], [`insert_tool_call`],
 /// etc. are stamped with this agent's `PrincipalId`. Multi-agent collaboration
 /// happens through CRDT sync — each agent maintains its own `BlockDocument`
-/// instance with a distinct `agent_id`, and operations merge via `merge_ops`.
+/// instance with a distinct `principal_id`, and operations merge via `merge_ops`.
 ///
 /// # Document Structure
 ///
@@ -115,10 +115,10 @@ pub struct BlockDocument {
     /// Context ID this document belongs to.
     context_id: ContextId,
 
-    /// Principal ID for this agent instance.
-    agent_id: PrincipalId,
+    /// Principal ID stamped on blocks created through this document.
+    principal_id: PrincipalId,
 
-    /// Agent ID (numeric) in the Document.
+    /// Diamond-types actor ID (numeric) for CRDT ops in the Document.
     agent: AgentId,
 
     /// Facet Document containing all CRDT state.
@@ -133,9 +133,9 @@ pub struct BlockDocument {
 
 impl BlockDocument {
     /// Create a new empty document (server-side, creates initial structure).
-    pub fn new(context_id: ContextId, agent_id: PrincipalId) -> Self {
+    pub fn new(context_id: ContextId, principal_id: PrincipalId) -> Self {
         let mut doc = Document::new();
-        let dte_uuid = Uuid::from_bytes(*agent_id.as_bytes());
+        let dte_uuid = Uuid::from_bytes(*principal_id.as_bytes());
         let agent = doc.create_agent(dte_uuid);
 
         // Create the blocks Set at ROOT["blocks"]
@@ -145,7 +145,7 @@ impl BlockDocument {
 
         Self {
             context_id,
-            agent_id,
+            principal_id,
             agent,
             doc,
             next_seq: 0,
@@ -157,14 +157,14 @@ impl BlockDocument {
     ///
     /// Use this when the document will receive its initial state via `merge_ops`.
     /// The blocks Set will be created when ops are merged from the server.
-    pub fn new_for_sync(context_id: ContextId, agent_id: PrincipalId) -> Self {
+    pub fn new_for_sync(context_id: ContextId, principal_id: PrincipalId) -> Self {
         let mut doc = Document::new();
-        let dte_uuid = Uuid::from_bytes(*agent_id.as_bytes());
+        let dte_uuid = Uuid::from_bytes(*principal_id.as_bytes());
         let agent = doc.create_agent(dte_uuid);
 
         Self {
             context_id,
-            agent_id,
+            principal_id,
             agent,
             doc,
             next_seq: 0,
@@ -181,19 +181,19 @@ impl BlockDocument {
         self.context_id
     }
 
-    /// Get the agent/principal ID.
-    pub fn agent_id(&self) -> PrincipalId {
-        self.agent_id
+    /// Get the principal ID.
+    pub fn principal_id(&self) -> PrincipalId {
+        self.principal_id
     }
 
-    /// Set the agent/principal ID for subsequent block operations.
+    /// Set the principal ID for subsequent block operations.
     ///
     /// This changes which PrincipalId is stamped into new BlockIds.
     /// The DTE AgentId (self.agent) stays unchanged — it's for CRDT op
-    /// identity, not block authorship. BlockId.agent_id is what tracks
+    /// identity, not block authorship. BlockId.principal_id is what tracks
     /// who created a block.
-    pub fn set_agent_id(&mut self, agent_id: PrincipalId) {
-        self.agent_id = agent_id;
+    pub fn set_principal_id(&mut self, principal_id: PrincipalId) {
+        self.principal_id = principal_id;
     }
 
     /// Get the current version.
@@ -583,7 +583,7 @@ impl BlockDocument {
 
     /// Generate a new block ID.
     fn new_block_id(&mut self) -> BlockId {
-        let id = BlockId::new(self.context_id, self.agent_id, self.next_seq);
+        let id = BlockId::new(self.context_id, self.principal_id, self.next_seq);
         self.next_seq += 1;
         id
     }
@@ -666,7 +666,7 @@ impl BlockDocument {
 
     /// Insert a new block with full DAG support.
     ///
-    /// Author is implicit — derived from `self.agent_id` via the BlockId.
+    /// Author is implicit — derived from `self.principal_id` via the BlockId.
     ///
     /// # Arguments
     ///
@@ -885,7 +885,7 @@ impl BlockDocument {
     ) -> Result<BlockId> {
         // Update next_seq if needed to avoid collisions with remote IDs
         let block_id = snapshot.id;
-        if snapshot.id.agent_id == self.agent_id {
+        if snapshot.id.principal_id == self.principal_id {
             self.next_seq = self.next_seq.max(snapshot.id.seq + 1);
         }
 
@@ -990,7 +990,7 @@ impl BlockDocument {
                 let block_map_id = tx.root().create_map(&block_map_key);
                 let mut block_map = tx.map_by_id(block_map_id);
 
-                // Store block metadata (no author — derived from id.agent_id)
+                // Store block metadata (no author — derived from id.principal_id)
                 block_map.set(KEY_CREATED_AT, created_at);
                 block_map.set(KEY_KIND, kind.as_str());
                 block_map.set(KEY_ROLE, role.as_str());
@@ -1399,7 +1399,7 @@ impl BlockDocument {
             drop(blocks_set);
             for key in keys {
                 if let Some(block_id) = BlockId::from_key(&key)
-                    && block_id.agent_id == self.agent_id
+                    && block_id.principal_id == self.principal_id
                 {
                     self.next_seq = self.next_seq.max(block_id.seq + 1);
                 }
@@ -1422,40 +1422,40 @@ impl BlockDocument {
     ///
     /// All blocks and their content are copied to the new document.
     /// The new document gets a fresh agent ID for future edits, but
-    /// existing blocks preserve their original authorship (agent_id + seq).
+    /// existing blocks preserve their original authorship (principal_id + seq).
     /// Only the context_id changes — a conversation between Alice and Claude
     /// forked by Charlie still shows Alice and Claude as the authors.
-    pub fn fork(&self, new_context_id: ContextId, new_agent_id: PrincipalId) -> Self {
-        Self::fork_blocks(new_context_id, new_agent_id, self.blocks_ordered())
+    pub fn fork(&self, new_context_id: ContextId, new_principal_id: PrincipalId) -> Self {
+        Self::fork_blocks(new_context_id, new_principal_id, self.blocks_ordered())
     }
 
     /// Internal: copy blocks into a new document, preserving original authorship.
     ///
-    /// Only context_id changes in each BlockId. Original agent_id and seq are
+    /// Only context_id changes in each BlockId. Original principal_id and seq are
     /// preserved so authorship attribution survives forking.
     fn fork_blocks(
         new_context_id: ContextId,
-        new_agent_id: PrincipalId,
+        new_principal_id: PrincipalId,
         blocks: Vec<BlockSnapshot>,
     ) -> Self {
-        let mut forked = BlockDocument::new(new_context_id, new_agent_id);
+        let mut forked = BlockDocument::new(new_context_id, new_principal_id);
 
         let mut last_id: Option<BlockId> = None;
 
         for block in blocks {
-            // Preserve original agent_id + seq, only change context_id
-            let new_id = BlockId::new(new_context_id, block.id.agent_id, block.id.seq);
+            // Preserve original principal_id + seq, only change context_id
+            let new_id = BlockId::new(new_context_id, block.id.principal_id, block.id.seq);
 
             // Remap references: same transform (only context_id changes)
             let new_parent_id = block
                 .parent_id
-                .map(|pid| BlockId::new(new_context_id, pid.agent_id, pid.seq));
+                .map(|pid| BlockId::new(new_context_id, pid.principal_id, pid.seq));
             let new_tool_call_id = block
                 .tool_call_id
-                .map(|tcid| BlockId::new(new_context_id, tcid.agent_id, tcid.seq));
+                .map(|tcid| BlockId::new(new_context_id, tcid.principal_id, tcid.seq));
 
             // Track max seq per agent to avoid future ID collisions
-            if block.id.agent_id == new_agent_id {
+            if block.id.principal_id == new_principal_id {
                 forked.next_seq = forked.next_seq.max(block.id.seq + 1);
             }
 
@@ -1503,7 +1503,7 @@ impl BlockDocument {
     /// Create document from serialized oplog (client-side sync).
     pub fn from_oplog(
         context_id: ContextId,
-        agent_id: PrincipalId,
+        principal_id: PrincipalId,
         oplog_bytes: &[u8],
     ) -> Result<Self> {
         let mut doc = Document::new();
@@ -1519,7 +1519,7 @@ impl BlockDocument {
             ));
         }
 
-        let dte_uuid = Uuid::from_bytes(*agent_id.as_bytes());
+        let dte_uuid = Uuid::from_bytes(*principal_id.as_bytes());
         let agent = doc.create_agent(dte_uuid);
 
         // Calculate next_seq from existing blocks (avoid ID collisions).
@@ -1533,7 +1533,7 @@ impl BlockDocument {
             drop(blocks_set);
             for key in keys {
                 if let Some(block_id) = BlockId::from_key(&key)
-                    && block_id.agent_id == agent_id
+                    && block_id.principal_id == principal_id
                 {
                     next_seq = next_seq.max(block_id.seq + 1);
                 }
@@ -1549,7 +1549,7 @@ impl BlockDocument {
 
         Ok(Self {
             context_id,
-            agent_id,
+            principal_id,
             agent,
             doc,
             next_seq,
@@ -1573,7 +1573,7 @@ impl BlockDocument {
     /// Compact the oplog by rebuilding from a snapshot of current state.
     pub fn compact(&mut self) -> Result<Frontier> {
         let snapshot = self.snapshot();
-        let compacted = Self::from_snapshot(snapshot, self.agent_id);
+        let compacted = Self::from_snapshot(snapshot, self.principal_id);
         self.doc = compacted.doc;
         self.agent = compacted.agent;
         self.next_seq = compacted.next_seq;
@@ -1581,15 +1581,15 @@ impl BlockDocument {
     }
 
     /// Restore from a snapshot.
-    pub fn from_snapshot(snapshot: DocumentSnapshot, agent_id: PrincipalId) -> Self {
-        let mut doc = Self::new(snapshot.context_id, agent_id);
+    pub fn from_snapshot(snapshot: DocumentSnapshot, principal_id: PrincipalId) -> Self {
+        let mut doc = Self::new(snapshot.context_id, principal_id);
 
         let mut last_id: Option<BlockId> = None;
         let mut finalized_content: Vec<(BlockId, String)> = Vec::new();
 
         for block_snap in &snapshot.blocks {
-            // Track max seq for our agent_id to avoid ID collisions
-            if block_snap.id.agent_id == agent_id {
+            // Track max seq for our principal_id to avoid ID collisions
+            if block_snap.id.principal_id == principal_id {
                 doc.next_seq = doc.next_seq.max(block_snap.id.seq + 1);
             }
 
@@ -1682,7 +1682,7 @@ mod tests {
         let agent = PrincipalId::new();
         let doc = BlockDocument::new(ctx, agent);
         assert_eq!(doc.context_id(), ctx);
-        assert_eq!(doc.agent_id(), agent);
+        assert_eq!(doc.principal_id(), agent);
         assert!(doc.is_empty());
         assert_eq!(doc.version(), 0);
     }
@@ -2013,7 +2013,7 @@ mod tests {
         assert_eq!(ordered[2].id, a, "A should be last after moving after B");
 
         // Moving non-existent block should fail
-        let fake_id = BlockId::new(doc.context_id(), doc.agent_id(), 999);
+        let fake_id = BlockId::new(doc.context_id(), doc.principal_id(), 999);
         assert!(doc.move_block(&fake_id, None).is_err());
         assert!(doc.move_block(&a, Some(&fake_id)).is_err());
     }
@@ -2190,7 +2190,7 @@ mod tests {
     #[test]
     fn test_fork_document() {
         let mut original = test_doc();
-        let original_agent = original.agent_id();
+        let original_agent = original.principal_id();
 
         let user_msg = original
             .insert_block(
@@ -2220,7 +2220,7 @@ mod tests {
 
         assert_eq!(forked.block_count(), 2);
         assert_eq!(forked.context_id(), fork_ctx);
-        assert_eq!(forked.agent_id(), fork_agent);
+        assert_eq!(forked.principal_id(), fork_agent);
 
         let forked_blocks = forked.blocks_ordered();
         assert_eq!(forked_blocks[0].content, "Hello Claude!");
@@ -2232,9 +2232,9 @@ mod tests {
         assert_eq!(forked_blocks[0].id.context_id, fork_ctx);
         assert_eq!(forked_blocks[1].id.context_id, fork_ctx);
 
-        // Authorship preserved — agent_id is original author, NOT the forker
-        assert_eq!(forked_blocks[0].id.agent_id, original_agent);
-        assert_eq!(forked_blocks[1].id.agent_id, original_agent);
+        // Authorship preserved — principal_id is original author, NOT the forker
+        assert_eq!(forked_blocks[0].id.principal_id, original_agent);
+        assert_eq!(forked_blocks[1].id.principal_id, original_agent);
 
         // Parent-child preserved with new IDs
         assert!(forked_blocks[0].parent_id.is_none());
@@ -2280,7 +2280,7 @@ mod tests {
                 Status::Done,
             )
             .unwrap();
-        assert_eq!(alice_msg.agent_id, alice);
+        assert_eq!(alice_msg.principal_id, alice);
 
         // Simulate Claude's block by using insert_from_snapshot with a different agent
         let claude = PrincipalId::new();
@@ -2298,11 +2298,11 @@ mod tests {
         let blocks = forked.blocks_ordered();
         assert_eq!(blocks.len(), 2);
         assert_eq!(
-            blocks[0].id.agent_id, alice,
+            blocks[0].id.principal_id, alice,
             "Alice's authorship must survive fork"
         );
         assert_eq!(
-            blocks[1].id.agent_id, claude,
+            blocks[1].id.principal_id, claude,
             "Claude's authorship must survive fork"
         );
         assert_eq!(blocks[0].id.context_id, fork_ctx);
@@ -2360,7 +2360,7 @@ mod tests {
         let source_ctx = ContextId::new();
 
         // Create a drift block using insert_from_snapshot
-        let drift_id = BlockId::new(doc.context_id(), doc.agent_id(), 0);
+        let drift_id = BlockId::new(doc.context_id(), doc.principal_id(), 0);
         let drift_snap = BlockSnapshot::drift(
             drift_id,
             None,
@@ -2411,7 +2411,7 @@ mod tests {
 
         // ID should belong to this document's context
         assert_eq!(snap.id.context_id, doc.context_id());
-        assert_eq!(snap.id.agent_id, doc.agent_id());
+        assert_eq!(snap.id.principal_id, doc.principal_id());
     }
 
     #[test]
@@ -2511,7 +2511,7 @@ mod tests {
             )
             .unwrap();
 
-        let drift_id = BlockId::new(original.context_id(), original.agent_id(), 99);
+        let drift_id = BlockId::new(original.context_id(), original.principal_id(), 99);
         let drift_snap = BlockSnapshot::drift(
             drift_id,
             Some(user_msg),
@@ -2887,7 +2887,7 @@ mod tests {
         doc.set_status(&id2, Status::Running).unwrap();
 
         let snapshot = doc.snapshot();
-        let restored = BlockDocument::from_snapshot(snapshot, doc.agent_id());
+        let restored = BlockDocument::from_snapshot(snapshot, doc.principal_id());
 
         let snap1 = restored.get_block_snapshot(&id1).unwrap();
         assert_eq!(snap1.content, "Done block");
@@ -2913,7 +2913,7 @@ mod tests {
         doc.set_status(&id, Status::Running).unwrap();
 
         let snapshot = doc.snapshot();
-        let restored = BlockDocument::from_snapshot(snapshot, doc.agent_id());
+        let restored = BlockDocument::from_snapshot(snapshot, doc.principal_id());
 
         let snap = restored.get_block_snapshot(&id).unwrap();
         assert_eq!(snap.content, "Streaming...");

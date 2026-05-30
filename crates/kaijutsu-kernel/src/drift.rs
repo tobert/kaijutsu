@@ -394,6 +394,16 @@ impl DriftRouter {
         self.contexts.get(&id).map(|h| h.trace_id)
     }
 
+    /// The lost+found context id, if one has been created.
+    ///
+    /// This internal dead-letter sink is registered in the router without a
+    /// `KernelDb` context row (see [`Self::ensure_lost_found`]), so callers that
+    /// enforce the "a registered handle implies a persisted row" invariant must
+    /// exempt it.
+    pub fn lost_found_id(&self) -> Option<ContextId> {
+        self.lost_found_id
+    }
+
     /// Stage a drift operation for later flush.
     ///
     /// Returns the staged drift ID.

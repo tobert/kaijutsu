@@ -297,7 +297,7 @@ impl SyncManager {
             }
         };
 
-        let new_store = CrdtBlockStore::from_snapshot(snapshot, doc.agent_id())
+        let new_store = CrdtBlockStore::from_snapshot(snapshot, doc.principal_id())
             .map_err(|e| SyncError::FromOplog(format!("snapshot restore failed: {}", e)))?;
         let block_count = new_store.block_count();
 
@@ -503,7 +503,7 @@ impl SyncManager {
             }
         };
 
-        let new_store = CrdtBlockStore::from_snapshot(snapshot, doc.agent_id())
+        let new_store = CrdtBlockStore::from_snapshot(snapshot, doc.principal_id())
             .map_err(|e| SyncError::FromOplog(format!("snapshot restore failed: {}", e)))?;
         let block_count = new_store.block_count();
 

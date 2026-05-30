@@ -126,7 +126,7 @@ pub struct FlowMessage<T> {
     pub payload: T,
     /// When this message was created.
     pub timestamp: Instant,
-    /// Optional sender identifier (agent_id or user_id).
+    /// Optional sender identifier (principal_id or user_id).
     pub sender: Option<String>,
 }
 

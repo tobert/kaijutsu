@@ -107,14 +107,14 @@ impl DocumentEntry {
         context_id: ContextId,
         kind: DocKind,
         language: Option<String>,
-        agent_id: PrincipalId,
+        principal_id: PrincipalId,
     ) -> Self {
         Self {
-            doc: CrdtBlockStore::new(context_id, agent_id),
+            doc: CrdtBlockStore::new(context_id, principal_id),
             kind,
             language,
             version: AtomicU64::new(0),
-            last_agent: RwLock::new(agent_id),
+            last_agent: RwLock::new(principal_id),
             sync_generation: AtomicU64::new(0),
             next_journal_seq: AtomicU64::new(0),
             uncompacted_count: AtomicU64::new(0),
@@ -128,19 +128,19 @@ impl DocumentEntry {
         snapshot: StoreSnapshot,
         kind: DocKind,
         language: Option<String>,
-        agent_id: PrincipalId,
+        principal_id: PrincipalId,
         journal_seq: u64,
         uncompacted_count: u64,
         uncompacted_bytes: u64,
     ) -> BlockStoreResult<Self> {
-        let store = CrdtBlockStore::from_snapshot(snapshot, agent_id)?;
+        let store = CrdtBlockStore::from_snapshot(snapshot, principal_id)?;
         let version = store.version();
         Ok(Self {
             doc: store,
             kind,
             language,
             version: AtomicU64::new(version),
-            last_agent: RwLock::new(agent_id),
+            last_agent: RwLock::new(principal_id),
             sync_generation: AtomicU64::new(0),
             next_journal_seq: AtomicU64::new(journal_seq),
             uncompacted_count: AtomicU64::new(uncompacted_count),
@@ -154,9 +154,9 @@ impl DocumentEntry {
     }
 
     /// Increment version and record agent.
-    pub fn touch(&self, agent_id: PrincipalId) {
+    pub fn touch(&self, principal_id: PrincipalId) {
         self.version.fetch_add(1, Ordering::SeqCst);
-        *self.last_agent.write() = agent_id;
+        *self.last_agent.write() = principal_id;
     }
 
     /// Get the full text content.
@@ -196,7 +196,7 @@ pub struct BlockStore {
         /// Default workspace ID for new documents.
     default_workspace_id: Option<WorkspaceId>,
     /// Default agent ID for this store.
-    agent_id: RwLock<PrincipalId>,
+    principal_id: RwLock<PrincipalId>,
     /// FlowBus for typed pub/sub.
     block_flows: Option<SharedBlockFlowBus>,
     /// FlowBus for input doc events.
@@ -205,7 +205,7 @@ pub struct BlockStore {
 
 impl BlockStore {
     /// Create a new in-memory block store.
-    pub fn new(agent_id: PrincipalId) -> Self {
+    pub fn new(principal_id: PrincipalId) -> Self {
         Self {
             documents: DashMap::new(),
             input_docs: DashMap::new(),
@@ -215,14 +215,14 @@ impl BlockStore {
             input_text_seqs: DashMap::new(),
             db: None,
                         default_workspace_id: None,
-            agent_id: RwLock::new(agent_id),
+            principal_id: RwLock::new(principal_id),
             block_flows: None,
             input_flows: None,
         }
     }
 
     /// Create a new in-memory block store with FlowBus.
-    pub fn with_flows(agent_id: PrincipalId, block_flows: SharedBlockFlowBus) -> Self {
+    pub fn with_flows(principal_id: PrincipalId, block_flows: SharedBlockFlowBus) -> Self {
         Self {
             documents: DashMap::new(),
             input_docs: DashMap::new(),
@@ -232,7 +232,7 @@ impl BlockStore {
             input_text_seqs: DashMap::new(),
             db: None,
                         default_workspace_id: None,
-            agent_id: RwLock::new(agent_id),
+            principal_id: RwLock::new(principal_id),
             block_flows: Some(block_flows),
             input_flows: None,
         }
@@ -242,7 +242,7 @@ impl BlockStore {
     pub fn with_db(
         db: DbHandle,
                 default_workspace_id: WorkspaceId,
-        agent_id: PrincipalId,
+        principal_id: PrincipalId,
     ) -> Self {
         Self {
             documents: DashMap::new(),
@@ -253,7 +253,7 @@ impl BlockStore {
             input_text_seqs: DashMap::new(),
             db: Some(db),
                         default_workspace_id: Some(default_workspace_id),
-            agent_id: RwLock::new(agent_id),
+            principal_id: RwLock::new(principal_id),
             block_flows: None,
             input_flows: None,
         }
@@ -263,7 +263,7 @@ impl BlockStore {
     pub fn with_db_and_flows(
         db: DbHandle,
                 default_workspace_id: WorkspaceId,
-        agent_id: PrincipalId,
+        principal_id: PrincipalId,
         block_flows: SharedBlockFlowBus,
     ) -> Self {
         Self {
@@ -275,7 +275,7 @@ impl BlockStore {
             input_text_seqs: DashMap::new(),
             db: Some(db),
                         default_workspace_id: Some(default_workspace_id),
-            agent_id: RwLock::new(agent_id),
+            principal_id: RwLock::new(principal_id),
             block_flows: Some(block_flows),
             input_flows: None,
         }
@@ -320,13 +320,13 @@ impl BlockStore {
     }
 
     /// Get the current agent ID.
-    pub fn agent_id(&self) -> PrincipalId {
-        *self.agent_id.read()
+    pub fn principal_id(&self) -> PrincipalId {
+        *self.principal_id.read()
     }
 
     /// Set the agent ID.
-    pub fn set_agent_id(&self, agent_id: PrincipalId) {
-        *self.agent_id.write() = agent_id;
+    pub fn set_principal_id(&self, principal_id: PrincipalId) {
+        *self.principal_id.write() = principal_id;
     }
 
     /// Create a new document.
@@ -344,7 +344,7 @@ impl BlockStore {
         match self.documents.entry(context_id) {
             Entry::Occupied(_) => Err(BlockStoreError::DocumentAlreadyExists(context_id)),
             Entry::Vacant(vacant) => {
-                let agent_id = self.agent_id();
+                let principal_id = self.principal_id();
 
                 // Persist metadata if we have a DB
                 if let Some(db) = &self.db {
@@ -356,7 +356,7 @@ impl BlockStore {
                         language: language.clone(),
                         path: None,
                         created_at: kaijutsu_types::now_millis() as i64,
-                        created_by: agent_id,
+                        created_by: principal_id,
                     };
                     match db_guard.insert_document(&row) {
                         Ok(()) => {}
@@ -370,7 +370,7 @@ impl BlockStore {
                     }
                 }
 
-                let entry = DocumentEntry::new(context_id, kind, language, agent_id);
+                let entry = DocumentEntry::new(context_id, kind, language, principal_id);
                 vacant.insert(entry);
 
                 Ok(())
@@ -396,8 +396,8 @@ impl BlockStore {
         let snapshot: StoreSnapshot = postcard::from_bytes(snapshot_bytes)
             .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
 
-        let agent_id = self.agent_id();
-        let entry = DocumentEntry::from_store_snapshot(snapshot, kind, language, agent_id, 0, 0, 0)?;
+        let principal_id = self.principal_id();
+        let entry = DocumentEntry::from_store_snapshot(snapshot, kind, language, principal_id, 0, 0, 0)?;
         self.documents.insert(context_id, entry);
 
         Ok(())
@@ -490,8 +490,8 @@ impl BlockStore {
             .get(source_id)
             .ok_or(BlockStoreError::DocumentNotFound(source_id))?;
 
-        let agent_id = self.agent_id();
-        let forked_store = source_entry.doc.fork(new_id, agent_id);
+        let principal_id = self.principal_id();
+        let forked_store = source_entry.doc.fork(new_id, principal_id);
         let kind = source_entry.kind;
         let language = source_entry.language.clone();
         drop(source_entry); // Release the read lock
@@ -506,7 +506,7 @@ impl BlockStore {
                 language: language.clone(),
                 path: None,
                 created_at: kaijutsu_types::now_millis() as i64,
-                created_by: agent_id,
+                created_by: principal_id,
             };
             db_guard
                 .insert_document(&row)
@@ -519,7 +519,7 @@ impl BlockStore {
             kind,
             language,
             version: AtomicU64::new(version),
-            last_agent: RwLock::new(agent_id),
+            last_agent: RwLock::new(principal_id),
             sync_generation: AtomicU64::new(0),
             next_journal_seq: AtomicU64::new(0),
             uncompacted_count: AtomicU64::new(0),
@@ -568,10 +568,10 @@ impl BlockStore {
             )));
         }
 
-        let agent_id = self.agent_id();
+        let principal_id = self.principal_id();
         let forked_store = source_entry
             .doc
-            .fork_at_version(new_id, agent_id, before_timestamp);
+            .fork_at_version(new_id, principal_id, before_timestamp);
         let kind = source_entry.kind;
         let language = source_entry.language.clone();
         drop(source_entry); // Release the read lock
@@ -586,7 +586,7 @@ impl BlockStore {
                 language: language.clone(),
                 path: None,
                 created_at: kaijutsu_types::now_millis() as i64,
-                created_by: agent_id,
+                created_by: principal_id,
             };
             db_guard
                 .insert_document(&row)
@@ -599,7 +599,7 @@ impl BlockStore {
             kind,
             language,
             version: AtomicU64::new(version),
-            last_agent: RwLock::new(agent_id),
+            last_agent: RwLock::new(principal_id),
             sync_generation: AtomicU64::new(0),
             next_journal_seq: AtomicU64::new(0),
             uncompacted_count: AtomicU64::new(0),
@@ -639,11 +639,11 @@ impl BlockStore {
             )));
         }
 
-        let agent_id = self.agent_id();
+        let principal_id = self.principal_id();
         let forked_store =
             source_entry
                 .doc
-                .fork_filtered(new_id, agent_id, before_timestamp, filter);
+                .fork_filtered(new_id, principal_id, before_timestamp, filter);
         let kind = source_entry.kind;
         let language = source_entry.language.clone();
         drop(source_entry);
@@ -658,7 +658,7 @@ impl BlockStore {
                 language: language.clone(),
                 path: None,
                 created_at: kaijutsu_types::now_millis() as i64,
-                created_by: agent_id,
+                created_by: principal_id,
             };
             db_guard
                 .insert_document(&row)
@@ -671,7 +671,7 @@ impl BlockStore {
             kind,
             language,
             version: AtomicU64::new(version),
-            last_agent: RwLock::new(agent_id),
+            last_agent: RwLock::new(principal_id),
             sync_generation: AtomicU64::new(0),
             next_journal_seq: AtomicU64::new(0),
             uncompacted_count: AtomicU64::new(0),
@@ -924,8 +924,8 @@ impl BlockStore {
 
     /// Insert a block with an explicit author identity.
     ///
-    /// If `agent_id` is `Some`, the block will be stamped with that principal.
-    /// If `None`, the store's default agent_id is used (backwards compat).
+    /// If `principal_id` is `Some`, the block will be stamped with that principal.
+    /// If `None`, the store's default principal_id is used (backwards compat).
     pub fn insert_block_as(
         &self,
         context_id: ContextId,
@@ -936,17 +936,17 @@ impl BlockStore {
         content: impl Into<String>,
         status: Status,
         content_type: ContentType,
-        agent_id: Option<PrincipalId>,
+        principal_id: Option<PrincipalId>,
     ) -> BlockStoreResult<BlockId> {
         let after_id = after.cloned();
         let (block_id, snapshot, ops, ops_bytes) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
-            let effective_agent = agent_id.unwrap_or_else(|| self.agent_id());
+            let effective_agent = principal_id.unwrap_or_else(|| self.principal_id());
 
             // Set the agent for this operation so BlockId gets the right author
-            entry.doc.set_agent_id(effective_agent);
+            entry.doc.set_principal_id(effective_agent);
 
             // Capture frontier before the operation for incremental ops.
             // Clients that are in sync can merge these directly.
@@ -1012,7 +1012,7 @@ impl BlockStore {
         tool_name: impl Into<String>,
         tool_input: serde_json::Value,
         tool_kind: Option<ToolKind>,
-        agent_id: Option<PrincipalId>,
+        principal_id: Option<PrincipalId>,
         tool_use_id: Option<String>,
         role: Option<Role>,
     ) -> BlockStoreResult<BlockId> {
@@ -1021,8 +1021,8 @@ impl BlockStore {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
-            let effective_agent = agent_id.unwrap_or_else(|| self.agent_id());
-            entry.doc.set_agent_id(effective_agent);
+            let effective_agent = principal_id.unwrap_or_else(|| self.principal_id());
+            entry.doc.set_principal_id(effective_agent);
 
             // Capture frontier before the operation for incremental ops
             let frontier_before = entry.doc.frontier();
@@ -1099,7 +1099,7 @@ impl BlockStore {
         is_error: bool,
         exit_code: Option<i32>,
         tool_kind: Option<ToolKind>,
-        agent_id: Option<PrincipalId>,
+        principal_id: Option<PrincipalId>,
         tool_use_id: Option<String>,
     ) -> BlockStoreResult<BlockId> {
         let after_id = after.cloned();
@@ -1107,8 +1107,8 @@ impl BlockStore {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
-            let effective_agent = agent_id.unwrap_or_else(|| self.agent_id());
-            entry.doc.set_agent_id(effective_agent);
+            let effective_agent = principal_id.unwrap_or_else(|| self.principal_id());
+            entry.doc.set_principal_id(effective_agent);
 
             // Capture frontier before the operation for incremental ops
             let frontier_before = entry.doc.frontier();
@@ -1155,7 +1155,7 @@ impl BlockStore {
 
     /// Insert a block from a snapshot (used by drift flush and cross-context injection).
     ///
-    /// The snapshot's ID is used as-is if the agent_id matches this store's agent,
+    /// The snapshot's ID is used as-is if the principal_id matches this store's agent,
     /// otherwise a new ID is assigned. Emits FlowBus events for real-time sync.
     pub fn insert_from_snapshot(
         &self,
@@ -1172,15 +1172,15 @@ impl BlockStore {
         context_id: ContextId,
         snapshot: BlockSnapshot,
         after: Option<&BlockId>,
-        agent_id: Option<PrincipalId>,
+        principal_id: Option<PrincipalId>,
     ) -> BlockStoreResult<BlockId> {
         let after_id = after.cloned();
         let (block_id, final_snapshot, ops, ops_bytes) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
-            let effective_agent = agent_id.unwrap_or_else(|| self.agent_id());
-            entry.doc.set_agent_id(effective_agent);
+            let effective_agent = principal_id.unwrap_or_else(|| self.principal_id());
+            entry.doc.set_principal_id(effective_agent);
 
             let frontier_before = entry.doc.frontier();
 
@@ -1220,10 +1220,10 @@ impl BlockStore {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
-            let agent_id = self.agent_id();
+            let principal_id = self.principal_id();
             let frontier_before = entry.doc.frontier();
             entry.doc.set_status(block_id, status)?;
-            entry.touch(agent_id);
+            entry.touch(principal_id);
             entry.doc.ops_since(&frontier_before)
         };
         self.journal_op(context_id, ops)?;
@@ -1281,14 +1281,14 @@ impl BlockStore {
         pos: usize,
         insert: &str,
         delete: usize,
-        agent_id: Option<PrincipalId>,
+        principal_id: Option<PrincipalId>,
     ) -> BlockStoreResult<()> {
         let (ops, ops_bytes) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
-            let effective_agent = agent_id.unwrap_or_else(|| self.agent_id());
-            entry.doc.set_agent_id(effective_agent);
+            let effective_agent = principal_id.unwrap_or_else(|| self.principal_id());
+            entry.doc.set_principal_id(effective_agent);
             // Capture frontier before edit
             let frontier = entry.doc.frontier();
             entry.doc.edit_text(block_id, pos, insert, delete)?;
@@ -1327,7 +1327,7 @@ impl BlockStore {
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
             let frontier_before = entry.doc.frontier();
             entry.doc.set_ephemeral(block_id, ephemeral)?;
-            entry.touch(self.agent_id());
+            entry.touch(self.principal_id());
             entry.doc.ops_since(&frontier_before)
         };
         self.journal_op(context_id, ops)?;
@@ -1353,7 +1353,7 @@ impl BlockStore {
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
             let frontier_before = entry.doc.frontier();
             entry.doc.set_excluded(block_id, excluded)?;
-            entry.touch(self.agent_id());
+            entry.touch(self.principal_id());
             entry.doc.ops_since(&frontier_before)
         };
         self.journal_op(context_id, ops)?;
@@ -1385,7 +1385,7 @@ impl BlockStore {
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
             let frontier_before = entry.doc.frontier();
             entry.doc.move_block(block_id, after)?;
-            entry.touch(self.agent_id());
+            entry.touch(self.principal_id());
             entry.doc.ops_since(&frontier_before)
         };
         self.journal_op(context_id, ops)?;
@@ -1412,7 +1412,7 @@ impl BlockStore {
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
             let frontier_before = entry.doc.frontier();
             entry.doc.set_compacted(block_id, compacted)?;
-            entry.touch(self.agent_id());
+            entry.touch(self.principal_id());
             entry.doc.ops_since(&frontier_before)
         };
         self.journal_op(context_id, ops)?;
@@ -1438,7 +1438,7 @@ impl BlockStore {
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
             let frontier_before = entry.doc.frontier();
             entry.doc.set_content_type(block_id, content_type)?;
-            entry.touch(self.agent_id());
+            entry.touch(self.principal_id());
             entry.doc.ops_since(&frontier_before)
         };
         self.journal_op(context_id, ops)?;
@@ -1467,7 +1467,7 @@ impl BlockStore {
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
             let frontier_before = entry.doc.frontier();
             entry.doc.set_exit_code(block_id, exit_code)?;
-            entry.touch(self.agent_id());
+            entry.touch(self.principal_id());
             entry.doc.ops_since(&frontier_before)
         };
         self.journal_op(context_id, ops)?;
@@ -1495,10 +1495,10 @@ impl BlockStore {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
-            let agent_id = self.agent_id();
+            let principal_id = self.principal_id();
             let frontier_before = entry.doc.frontier();
             entry.doc.set_output(block_id, output.cloned())?;
-            entry.touch(agent_id);
+            entry.touch(principal_id);
             entry.doc.ops_since(&frontier_before)
         };
         self.journal_op(context_id, ops)?;
@@ -1523,10 +1523,10 @@ impl BlockStore {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
-            let agent_id = self.agent_id();
+            let principal_id = self.principal_id();
             let frontier_before = entry.doc.frontier();
             entry.doc.set_tool_use_id(block_id, tool_use_id)?;
-            entry.touch(agent_id);
+            entry.touch(principal_id);
             entry.doc.ops_since(&frontier_before)
         };
         self.journal_op(context_id, ops)?;
@@ -1555,14 +1555,14 @@ impl BlockStore {
         context_id: ContextId,
         block_id: &BlockId,
         text: &str,
-        agent_id: Option<PrincipalId>,
+        principal_id: Option<PrincipalId>,
     ) -> BlockStoreResult<()> {
         let (ops, ops_bytes) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
-            let effective_agent = agent_id.unwrap_or_else(|| self.agent_id());
-            entry.doc.set_agent_id(effective_agent);
+            let effective_agent = principal_id.unwrap_or_else(|| self.principal_id());
+            entry.doc.set_principal_id(effective_agent);
             // Capture frontier before append
             let frontier = entry.doc.frontier();
             entry.doc.append_text(block_id, text)?;
@@ -1599,10 +1599,10 @@ impl BlockStore {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
-            let agent_id = self.agent_id();
+            let principal_id = self.principal_id();
             let frontier_before = entry.doc.frontier();
             entry.doc.set_collapsed(block_id, collapsed)?;
-            entry.touch(agent_id);
+            entry.touch(principal_id);
             entry.doc.ops_since(&frontier_before)
         };
         self.journal_op(context_id, ops)?;
@@ -1624,10 +1624,10 @@ impl BlockStore {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
-            let agent_id = self.agent_id();
+            let principal_id = self.principal_id();
             let frontier_before = entry.doc.frontier();
             entry.doc.delete_block(block_id)?;
-            entry.touch(agent_id);
+            entry.touch(principal_id);
             entry.doc.ops_since(&frontier_before)
         };
         self.journal_op(context_id, ops)?;
@@ -1916,7 +1916,7 @@ impl BlockStore {
         let docs = db_guard
             .list_documents()
             .map_err(|e| BlockStoreError::Db(e.to_string()))?;
-        let agent_id = self.agent_id();
+        let principal_id = self.principal_id();
 
         for doc in docs {
             let context_id = doc.document_id;
@@ -1932,7 +1932,7 @@ impl BlockStore {
                                 snap_seq = snap_row.seq,
                                 "Restored document from snapshot"
                             );
-                            match CrdtBlockStore::from_snapshot(store_snapshot, agent_id) {
+                            match CrdtBlockStore::from_snapshot(store_snapshot, principal_id) {
                                 Ok(store) => (store, snap_row.seq),
                                 Err(e) => {
                                     tracing::error!(document_id = %context_id.to_hex(), error = %e, "Failed to restore snapshot, skipping");
@@ -1946,7 +1946,7 @@ impl BlockStore {
                         }
                     }
                 }
-                Ok(None) => (CrdtBlockStore::new(context_id, agent_id), 0),
+                Ok(None) => (CrdtBlockStore::new(context_id, principal_id), 0),
                 Err(e) => {
                     tracing::error!(document_id = %context_id.to_hex(), error = %e, "Failed to load snapshot, skipping");
                     continue;
@@ -2002,7 +2002,7 @@ impl BlockStore {
                 kind: doc.doc_kind,
                 language: doc.language.clone(),
                 version: AtomicU64::new(version),
-                last_agent: RwLock::new(agent_id),
+                last_agent: RwLock::new(principal_id),
                 sync_generation: AtomicU64::new(0),
                 next_journal_seq: AtomicU64::new(max_seq as u64),
                 uncompacted_count: AtomicU64::new(oplog_entries.len() as u64),
@@ -2044,7 +2044,7 @@ impl BlockStore {
             return Ok(false);
         };
 
-        let agent_id = self.agent_id();
+        let principal_id = self.principal_id();
 
         // Load base snapshot if available
         let (mut crdt_store, base_seq) = match db_guard.load_latest_snapshot(context_id) {
@@ -2057,7 +2057,7 @@ impl BlockStore {
                             snap_seq = snap_row.seq,
                             "Hydrated document from snapshot"
                         );
-                        match CrdtBlockStore::from_snapshot(store_snapshot, agent_id) {
+                        match CrdtBlockStore::from_snapshot(store_snapshot, principal_id) {
                             Ok(store) => (store, snap_row.seq),
                             Err(e) => {
                                 tracing::warn!(document_id = %context_id.to_hex(), error = %e, "Failed to restore snapshot");
@@ -2071,7 +2071,7 @@ impl BlockStore {
                     }
                 }
             }
-            Ok(None) => (CrdtBlockStore::new(context_id, agent_id), 0),
+            Ok(None) => (CrdtBlockStore::new(context_id, principal_id), 0),
             Err(e) => {
                 tracing::warn!(document_id = %context_id.to_hex(), error = %e, "Failed to load snapshot");
                 return Ok(false);
@@ -2127,7 +2127,7 @@ impl BlockStore {
             kind: doc.doc_kind,
             language: doc.language.clone(),
             version: AtomicU64::new(version),
-            last_agent: RwLock::new(agent_id),
+            last_agent: RwLock::new(principal_id),
             sync_generation: AtomicU64::new(0),
             next_journal_seq: AtomicU64::new(max_seq as u64),
             uncompacted_count: AtomicU64::new(oplog_entries.len() as u64),
@@ -2169,8 +2169,8 @@ impl BlockStore {
         match self.input_docs.entry(context_id) {
             Entry::Occupied(_) => Ok(()), // Already exists
             Entry::Vacant(vacant) => {
-                let agent_id = self.agent_id();
-                let entry = InputDocEntry::new(agent_id);
+                let principal_id = self.principal_id();
+                let entry = InputDocEntry::new(principal_id);
                 vacant.insert(entry);
                 Ok(())
             }
@@ -2315,14 +2315,14 @@ impl BlockStore {
             .list_input_doc_ids()
             .map_err(|e| BlockStoreError::Db(e.to_string()))?;
 
-        let agent_id = self.agent_id();
+        let principal_id = self.principal_id();
 
         for context_id in doc_ids {
             // Load base snapshot if available
             let (mut input_entry, base_seq) =
                 match db_guard.load_latest_input_snapshot(context_id) {
                     Ok(Some(snap_row)) => {
-                        match InputDocEntry::from_ops(&snap_row.state, agent_id) {
+                        match InputDocEntry::from_ops(&snap_row.state, principal_id) {
                             Ok(entry) => {
                                 tracing::debug!(
                                     context_id = %context_id.to_hex(),
@@ -2333,14 +2333,14 @@ impl BlockStore {
                             }
                             Err(e) => {
                                 tracing::warn!(context_id = %context_id.to_hex(), error = %e, "Failed to restore input snapshot, creating empty");
-                                (InputDocEntry::new(agent_id), 0)
+                                (InputDocEntry::new(principal_id), 0)
                             }
                         }
                     }
-                    Ok(None) => (InputDocEntry::new(agent_id), 0),
+                    Ok(None) => (InputDocEntry::new(principal_id), 0),
                     Err(e) => {
                         tracing::warn!(context_id = %context_id.to_hex(), error = %e, "Failed to load input snapshot, creating empty");
-                        (InputDocEntry::new(agent_id), 0)
+                        (InputDocEntry::new(principal_id), 0)
                     }
                 };
 
@@ -2415,15 +2415,15 @@ impl BlockStore {
         source_context: ContextId,
         source_model: Option<String>,
         drift_kind: kaijutsu_crdt::DriftKind,
-        agent_id: Option<PrincipalId>,
+        principal_id: Option<PrincipalId>,
     ) -> BlockStoreResult<BlockId> {
         let after_id = after.cloned();
         let (block_id, snapshot, ops, ops_bytes) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
-            let effective_agent = agent_id.unwrap_or_else(|| self.agent_id());
-            entry.doc.set_agent_id(effective_agent);
+            let effective_agent = principal_id.unwrap_or_else(|| self.principal_id());
+            entry.doc.set_principal_id(effective_agent);
 
             let frontier_before = entry.doc.frontier();
 
@@ -2563,15 +2563,15 @@ impl BlockStore {
         parent_id: Option<&BlockId>,
         payload: &kaijutsu_types::NotificationPayload,
         summary: impl Into<String>,
-        agent_id: Option<PrincipalId>,
+        principal_id: Option<PrincipalId>,
     ) -> BlockStoreResult<BlockId> {
         let after_id = parent_id.copied();
         let (block_id, snapshot, ops, ops_bytes) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
-            let effective_agent = agent_id.unwrap_or_else(|| self.agent_id());
-            entry.doc.set_agent_id(effective_agent);
+            let effective_agent = principal_id.unwrap_or_else(|| self.principal_id());
+            entry.doc.set_principal_id(effective_agent);
 
             let frontier_before = entry.doc.frontier();
 
@@ -2615,15 +2615,15 @@ impl BlockStore {
         parent_id: Option<&BlockId>,
         payload: &kaijutsu_types::ResourcePayload,
         summary: impl Into<String>,
-        agent_id: Option<PrincipalId>,
+        principal_id: Option<PrincipalId>,
     ) -> BlockStoreResult<BlockId> {
         let after_id = parent_id.copied();
         let (block_id, snapshot, ops, ops_bytes) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
-            let effective_agent = agent_id.unwrap_or_else(|| self.agent_id());
-            entry.doc.set_agent_id(effective_agent);
+            let effective_agent = principal_id.unwrap_or_else(|| self.principal_id());
+            entry.doc.set_principal_id(effective_agent);
 
             let frontier_before = entry.doc.frontier();
 
@@ -2665,14 +2665,14 @@ impl BlockStore {
         parent_id: &BlockId,
         payload: &kaijutsu_types::ErrorPayload,
         summary: impl Into<String>,
-        agent_id: Option<PrincipalId>,
+        principal_id: Option<PrincipalId>,
     ) -> BlockStoreResult<BlockId> {
         let (block_id, snapshot, ops, ops_bytes) = {
             let mut entry = self
                 .get_mut(context_id)
                 .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
-            let effective_agent = agent_id.unwrap_or_else(|| self.agent_id());
-            entry.doc.set_agent_id(effective_agent);
+            let effective_agent = principal_id.unwrap_or_else(|| self.principal_id());
+            entry.doc.set_principal_id(effective_agent);
 
             let frontier_before = entry.doc.frontier();
 
@@ -2821,20 +2821,20 @@ impl Default for BlockStore {
 pub type SharedBlockStore = Arc<BlockStore>;
 
 /// Create a new shared block store.
-pub fn shared_block_store(agent_id: PrincipalId) -> SharedBlockStore {
-    Arc::new(BlockStore::new(agent_id))
+pub fn shared_block_store(principal_id: PrincipalId) -> SharedBlockStore {
+    Arc::new(BlockStore::new(principal_id))
 }
 
 /// Create a shared block store with database persistence.
 pub fn shared_block_store_with_db(
     db: DbHandle,
         default_workspace_id: WorkspaceId,
-    agent_id: PrincipalId,
+    principal_id: PrincipalId,
 ) -> SharedBlockStore {
     Arc::new(BlockStore::with_db(
         db,
                 default_workspace_id,
-        agent_id,
+        principal_id,
     ))
 }
 

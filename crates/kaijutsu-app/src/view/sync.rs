@@ -28,14 +28,14 @@ pub fn handle_block_events(
     mut pending_switch: ResMut<crate::cell::PendingContextSwitch>,
     mut switch_writer: MessageWriter<crate::cell::ContextSwitchRequested>,
     mut sync_gen: ResMut<crate::connection::actor_plugin::SyncGeneration>,
-    session_agent: Res<crate::cell::SessionAgent>,
+    session_principal: Res<crate::cell::SessionPrincipal>,
     actor: Option<Res<crate::connection::RpcActor>>,
     channel: Res<crate::connection::RpcResultChannel>,
 ) {
     use kaijutsu_client::ServerEvent;
 
     let was_at_bottom = scroll_state.is_at_bottom();
-    let agent_id = session_agent.0;
+    let principal_id = session_principal.0;
 
     // Handle initial document state from ContextJoined
     for result in result_events.read() {
@@ -47,7 +47,7 @@ pub fn handle_block_events(
                 let ctx_id = membership.context_id;
 
                 if !doc_cache.contains(ctx_id) {
-                    let mut synced = kaijutsu_client::SyncedDocument::new(ctx_id, agent_id);
+                    let mut synced = kaijutsu_client::SyncedDocument::new(ctx_id, principal_id);
 
                     if let Some(state) = initial_sync {
                         match synced.apply_sync_state(state) {
@@ -135,10 +135,10 @@ pub fn handle_block_events(
                     && cached.input.is_none()
                 {
                     if state.ops.is_empty() {
-                        cached.input = Some(kaijutsu_client::SyncedInput::new(ctx_id, agent_id));
+                        cached.input = Some(kaijutsu_client::SyncedInput::new(ctx_id, principal_id));
                         info!("Initialized empty SyncedInput for {}", ctx_id);
                     } else {
-                        match kaijutsu_client::SyncedInput::from_state(ctx_id, agent_id, &state.ops)
+                        match kaijutsu_client::SyncedInput::from_state(ctx_id, principal_id, &state.ops)
                         {
                             Ok(input) => {
                                 info!(
@@ -153,7 +153,7 @@ pub fn handle_block_events(
                                     ctx_id, e
                                 );
                                 cached.input =
-                                    Some(kaijutsu_client::SyncedInput::new(ctx_id, agent_id));
+                                    Some(kaijutsu_client::SyncedInput::new(ctx_id, principal_id));
                             }
                         }
                     }
@@ -218,7 +218,7 @@ pub fn handle_input_doc_events(
     mut overlay: Query<&mut crate::cell::InputOverlay, With<crate::cell::InputOverlayMarker>>,
     mut scroll_state: ResMut<ConversationScrollState>,
     mut focus: ResMut<crate::input::focus::FocusArea>,
-    session_agent: Res<crate::cell::SessionAgent>,
+    session_principal: Res<crate::cell::SessionPrincipal>,
     actor: Option<Res<crate::connection::RpcActor>>,
     channel: Res<crate::connection::RpcResultChannel>,
 ) {
@@ -257,7 +257,7 @@ pub fn handle_input_doc_events(
 
                 // Re-fetch input state — server's doc is now clean post-clear.
                 // InputStateReceived handler will recreate SyncedInput.
-                let agent_id = session_agent.0;
+                let principal_id = session_principal.0;
                 if let Some(ref actor) = actor {
                     let handle = actor.handle.clone();
                     let tx = channel.sender();
@@ -291,7 +291,7 @@ pub fn handle_input_doc_events(
                 } else {
                     // No actor — create empty SyncedInput directly
                     if let Some(cached) = doc_cache.get_mut(ctx_id) {
-                        cached.input = Some(kaijutsu_client::SyncedInput::new(ctx_id, agent_id));
+                        cached.input = Some(kaijutsu_client::SyncedInput::new(ctx_id, principal_id));
                     }
                 }
 
@@ -348,9 +348,9 @@ pub fn sync_main_cell_to_conversation(
         return;
     }
 
-    let agent_id = editor.store.agent_id();
+    let principal_id = editor.store.principal_id();
     let store_snap = cached.synced.snapshot();
-    editor.store = match kaijutsu_crdt::BlockStore::from_snapshot(store_snap, agent_id) {
+    editor.store = match kaijutsu_crdt::BlockStore::from_snapshot(store_snap, principal_id) {
         Ok(store) => store,
         Err(e) => {
             tracing::error!("Failed to restore snapshot for sync: {e}");

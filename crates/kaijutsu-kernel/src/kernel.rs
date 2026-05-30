@@ -399,6 +399,7 @@ impl Kernel {
         documents: crate::block_store::SharedBlockStore,
         file_cache: Arc<crate::file_tools::FileDocumentCache>,
         workspace_guard: Option<crate::file_tools::WorkspaceGuard>,
+        kernel_db: Arc<parking_lot::Mutex<crate::kernel_db::KernelDb>>,
     ) -> crate::mcp::McpResult<()> {
         use crate::mcp::servers::{
             BlockToolsServer, BuiltinBindingsServer, BuiltinHooksServer, BuiltinResourcesServer,
@@ -434,7 +435,7 @@ impl Kernel {
 
         self.broker
             .register_silently(
-                Arc::new(KernelInfoServer::new(self.drift.clone())),
+                Arc::new(KernelInfoServer::new(self.drift.clone(), kernel_db.clone())),
                 InstancePolicy::for_kernel(self),
             )
             .await?;

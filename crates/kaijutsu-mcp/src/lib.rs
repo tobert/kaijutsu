@@ -2791,12 +2791,12 @@ mod tests {
         let ctx_id = ContextId::new();
         let call_id = kaijutsu_crdt::BlockId {
             context_id: ctx_id,
-            agent_id: PrincipalId::new(),
+            principal_id: PrincipalId::new(),
             seq: 1,
         };
         let result_id = kaijutsu_crdt::BlockId {
             context_id: ctx_id,
-            agent_id: PrincipalId::new(),
+            principal_id: PrincipalId::new(),
             seq: 2,
         };
         kaijutsu_crdt::BlockSnapshot::tool_result(
@@ -2864,7 +2864,7 @@ mod tests {
         let ctx_id = ContextId::new();
         let cmd_block_id = kaijutsu_crdt::BlockId {
             context_id: ctx_id,
-            agent_id: PrincipalId::new(),
+            principal_id: PrincipalId::new(),
             seq: 99,
         };
         let block_key = cmd_block_id.to_key();
@@ -2890,7 +2890,7 @@ mod tests {
         let ctx_id = ContextId::new();
         let cmd_block_id = kaijutsu_crdt::BlockId {
             context_id: ctx_id,
-            agent_id: PrincipalId::new(),
+            principal_id: PrincipalId::new(),
             seq: 99,
         };
         let completion = ShellCompletion::StreamClosed {

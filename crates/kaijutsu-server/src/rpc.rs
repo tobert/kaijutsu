@@ -492,12 +492,12 @@ fn kernel_data_dir() -> std::path::PathBuf {
 fn create_block_store_with_kernel_db(
     db: Arc<parking_lot::Mutex<KernelDb>>,
     default_workspace_id: kaijutsu_types::WorkspaceId,
-    agent_id: PrincipalId,
+    principal_id: PrincipalId,
     block_flows: SharedBlockFlowBus,
     input_flows: SharedInputDocFlowBus,
 ) -> Result<SharedBlockStore, String> {
     let mut inner =
-        BlockStore::with_db_and_flows(db, default_workspace_id, agent_id, block_flows);
+        BlockStore::with_db_and_flows(db, default_workspace_id, principal_id, block_flows);
     inner.set_input_flows(input_flows);
     let store = Arc::new(inner);
     store.load_from_db().map_err(|e| {
@@ -904,6 +904,7 @@ pub async fn create_shared_kernel(
             documents.clone(),
             file_cache_for_broker,
             workspace_guard,
+            kernel_db_arc.clone(),
         )
         .await
     {
@@ -2121,7 +2122,7 @@ impl kernel::Server for KernelImpl {
             .map(|s| s.to_owned());
 
         let kernel = self.kernel.clone();
-        let (user_agent_id, session_id, kaish_ref) = {
+        let (user_principal_id, session_id, kaish_ref) = {
             let conn = self.connection.borrow();
             (conn.principal.id, conn.session_id, conn.kaish.clone())
         };
@@ -2136,7 +2137,7 @@ impl kernel::Server for KernelImpl {
                     None => std::path::PathBuf::from("/"),
                 };
                 let tool_ctx = kaijutsu_kernel::ExecContext::new(
-                    user_agent_id,
+                    user_principal_id,
                     context_id,
                     cwd,
                     session_id,
@@ -2170,7 +2171,7 @@ impl kernel::Server for KernelImpl {
                         &content,
                         Status::Done,
                         ContentType::Plain,
-                        Some(user_agent_id),
+                        Some(user_principal_id),
                     )
                     .map_err(|e| {
                         log::error!("Failed to insert user block: {}", e);
@@ -2197,7 +2198,7 @@ impl kernel::Server for KernelImpl {
                     model.as_deref(),
                     &user_block_id,
                     tool_ctx,
-                    user_agent_id,
+                    user_principal_id,
                 )
                 .await?;
 
@@ -2624,14 +2625,14 @@ impl kernel::Server for KernelImpl {
 
         let kernel = self.kernel.clone();
         let connection = self.connection.clone();
-        let user_agent_id = self.connection.borrow().principal.id;
+        let user_principal_id = self.connection.borrow().principal.id;
 
         Promise::from_future(
             async move {
                 let command_block_id = execute_shell_command(
                     &code,
                     context_id,
-                    user_agent_id,
+                    user_principal_id,
                     user_initiated,
                     &kernel,
                     &connection,
@@ -3102,7 +3103,7 @@ impl kernel::Server for KernelImpl {
 
         let documents = self.kernel.documents.clone();
         let kernel_arc = self.kernel.kernel.clone();
-        let user_agent_id = self.connection.borrow().principal.id;
+        let user_principal_id = self.connection.borrow().principal.id;
 
         // Get the source document and extract block snapshot (DashMap access is sync)
         let doc_entry = match documents.get(source_block_id.context_id) {
@@ -3148,7 +3149,7 @@ impl kernel::Server for KernelImpl {
                         block_snapshot.content,
                         Status::Done,
                         block_snapshot.content_type,
-                        Some(user_agent_id),
+                        Some(user_principal_id),
                     )
                     .map_err(|e| capnp::Error::failed(format!("Failed to insert block: {}", e)))?;
 
@@ -3879,7 +3880,7 @@ impl kernel::Server for KernelImpl {
 
         let kernel = self.kernel.clone();
         let connection = self.connection.clone();
-        let user_agent_id = self.connection.borrow().principal.id;
+        let user_principal_id = self.connection.borrow().principal.id;
 
         Promise::from_future(
             async move {
@@ -3903,7 +3904,7 @@ impl kernel::Server for KernelImpl {
                     let command_block_id = execute_shell_command(
                         &text,
                         context_id,
-                        user_agent_id,
+                        user_principal_id,
                         true,
                         &kernel,
                         &connection,
@@ -3933,7 +3934,7 @@ impl kernel::Server for KernelImpl {
                         None => std::path::PathBuf::from("/"),
                     };
                     let tool_ctx = kaijutsu_kernel::ExecContext::new(
-                        user_agent_id,
+                        user_principal_id,
                         context_id,
                         cwd,
                         session_id,
@@ -3952,7 +3953,7 @@ impl kernel::Server for KernelImpl {
                             &text,
                             Status::Done,
                             ContentType::Plain,
-                            Some(user_agent_id),
+                            Some(user_principal_id),
                         )
                         .map_err(|e| {
                             capnp::Error::failed(format!("failed to insert user block: {}", e))
@@ -3966,7 +3967,7 @@ impl kernel::Server for KernelImpl {
                         None,
                         &user_block_id,
                         tool_ctx,
-                        user_agent_id,
+                        user_principal_id,
                     )
                     .await?;
 
@@ -5201,7 +5202,7 @@ fn set_peer_info(builder: &mut peer_info::Builder, info: &PeerInfo) {
 async fn execute_shell_command(
     code: &str,
     context_id: ContextId,
-    user_agent_id: PrincipalId,
+    user_principal_id: PrincipalId,
     user_initiated: bool,
     kernel: &SharedKernelState,
     connection: &Rc<RefCell<ConnectionState>>,
@@ -5300,7 +5301,7 @@ async fn execute_shell_command(
             "shell",
             serde_json::json!({"code": code}),
             Some(TypesToolKind::Shell),
-            Some(user_agent_id),
+            Some(user_principal_id),
             None,
             role,
         )
@@ -5513,11 +5514,11 @@ fn parse_block_id_from_reader(
 ) -> Result<kaijutsu_crdt::BlockId, capnp::Error> {
     let context_id = ContextId::try_from_slice(reader.get_context_id()?)
         .ok_or_else(|| capnp::Error::failed("invalid context_id in BlockId".into()))?;
-    let agent_id = PrincipalId::try_from_slice(reader.get_agent_id()?)
-        .ok_or_else(|| capnp::Error::failed("invalid agent_id in BlockId".into()))?;
+    let principal_id = PrincipalId::try_from_slice(reader.get_principal_id()?)
+        .ok_or_else(|| capnp::Error::failed("invalid principal_id in BlockId".into()))?;
     Ok(kaijutsu_crdt::BlockId {
         context_id,
-        agent_id,
+        principal_id,
         seq: reader.get_seq(),
     })
 }
@@ -5528,7 +5529,7 @@ fn set_block_id_builder(
     block_id: &kaijutsu_crdt::BlockId,
 ) {
     builder.set_context_id(block_id.context_id.as_bytes());
-    builder.set_agent_id(block_id.agent_id.as_bytes());
+    builder.set_principal_id(block_id.principal_id.as_bytes());
     builder.set_seq(block_id.seq);
 }
 
@@ -5583,7 +5584,7 @@ fn set_block_snapshot(
         kaijutsu_crdt::BlockKind::Trace => crate::kaijutsu_capnp::BlockKind::Trace,
     });
 
-    // Set basic fields (no author — derived from id.agent_id)
+    // Set basic fields (no author — derived from id.principal_id)
     builder.set_content(&block.content);
     builder.set_collapsed(block.collapsed);
     builder.set_created_at(block.created_at);

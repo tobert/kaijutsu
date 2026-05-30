@@ -255,7 +255,7 @@ impl HookListener {
             }
 
             "subagent.start" => {
-                let agent = event.agent_id.as_deref().unwrap_or("unknown");
+                let agent = event.principal_id.as_deref().unwrap_or("unknown");
                 let kind = event.agent_type.as_deref().unwrap_or("subagent");
                 self.insert_text_block(
                     Role::System,
@@ -264,7 +264,7 @@ impl HookListener {
             }
 
             "subagent.stop" => {
-                let agent = event.agent_id.as_deref().unwrap_or("unknown");
+                let agent = event.principal_id.as_deref().unwrap_or("unknown");
                 self.insert_text_block(Role::System, &format!("Subagent stopped: {agent}"));
             }
 
