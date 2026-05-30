@@ -16,6 +16,7 @@ pub mod compact;
 pub mod context;
 pub mod doc;
 pub mod drift;
+pub mod drive;
 pub mod fork;
 pub mod format;
 pub mod parse;
@@ -334,6 +335,7 @@ impl KjDispatcher {
 
         match cmd {
             "fork" => self.dispatch_fork(&argv[1..], caller).await,
+            "drive" => self.dispatch_drive(&argv[1..], caller).await,
             "stage" => self.dispatch_stage(&argv[1..], caller).await,
             "drift" => self.dispatch_drift(&argv[1..], caller).await,
             "cache" => self.dispatch_cache(&argv[1..], caller),

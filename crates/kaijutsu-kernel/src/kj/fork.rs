@@ -1074,6 +1074,31 @@ impl KjDispatcher {
         }
     }
 
+    /// Publish a single `TurnFlow::Requested` and return how many subscribers
+    /// received it (the turn-driver count). This is the one shared bridge from
+    /// kernel-side commands (`kj fork --prompt`, `kj drive`) to the server's
+    /// turn driver — the kernel can't call the server directly, so it clocks a
+    /// turn by publishing on the FlowBus. A `delivered == 0` return means no
+    /// driver is listening; callers decide how to surface that (fork writes an
+    /// Error block; `kj drive` returns an error to the user directly).
+    pub(crate) fn publish_turn_request(
+        &self,
+        context_id: ContextId,
+        after_block_id: kaijutsu_types::BlockId,
+        content: &str,
+        principal_id: kaijutsu_types::PrincipalId,
+    ) -> usize {
+        self.kernel()
+            .turn_flows()
+            .publish(crate::flows::TurnFlow::Requested {
+                context_id,
+                after_block_id,
+                content: content.to_string(),
+                principal_id,
+                model: None,
+            })
+    }
+
     /// Ask the server to drive one autonomous turn in the freshly forked child,
     /// so a `kj fork --prompt "…"` child starts acting immediately while the
     /// parent's fork call returns and keeps running (POSIX fork()).
@@ -1102,15 +1127,7 @@ impl KjDispatcher {
             return;
         };
         let delivered =
-            self.kernel()
-                .turn_flows()
-                .publish(crate::flows::TurnFlow::Requested {
-                    context_id: new_id,
-                    after_block_id: after,
-                    content: note.to_string(),
-                    principal_id: caller.principal_id,
-                    model: None,
-                });
+            self.publish_turn_request(new_id, after, note, caller.principal_id);
 
         // Zero subscribers means no turn driver is listening — the autonomous
         // turn was requested but will never run. Don't silently no-op: warn and
