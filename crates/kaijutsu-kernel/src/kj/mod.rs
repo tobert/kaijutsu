@@ -14,6 +14,7 @@ pub mod cache;
 pub mod cas;
 pub mod compact;
 pub mod context;
+pub mod context_shell;
 pub mod doc;
 pub mod drift;
 pub mod drive;

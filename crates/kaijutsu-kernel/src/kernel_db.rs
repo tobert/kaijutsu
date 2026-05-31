@@ -235,7 +235,6 @@ pub struct InputDocSnapshotRow {
 pub struct ContextShellRow {
     pub context_id: ContextId,
     pub cwd: Option<String>,
-    pub init_script: Option<String>,
     pub updated_at: i64,
 }
 
@@ -408,7 +407,6 @@ CREATE TABLE IF NOT EXISTS input_doc_snapshots (
 CREATE TABLE IF NOT EXISTS context_shell (
     context_id  BLOB NOT NULL PRIMARY KEY REFERENCES contexts(context_id) ON DELETE CASCADE,
     cwd         TEXT,
-    init_script TEXT,
     updated_at  INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER))
 );
 
@@ -2195,19 +2193,17 @@ impl KernelDb {
     // Context Shell Configuration
     // ========================================================================
 
-    /// Upsert per-context shell configuration (cwd, init_script).
+    /// Upsert per-context shell configuration (cwd).
     pub fn upsert_context_shell(&self, row: &ContextShellRow) -> KernelDbResult<()> {
         self.conn.execute(
-            "INSERT INTO context_shell (context_id, cwd, init_script, updated_at)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO context_shell (context_id, cwd, updated_at)
+             VALUES (?1, ?2, ?3)
              ON CONFLICT(context_id) DO UPDATE SET
                 cwd = excluded.cwd,
-                init_script = excluded.init_script,
                 updated_at = excluded.updated_at",
             params![
                 blob_param(row.context_id.as_bytes()),
                 row.cwd,
-                row.init_script,
                 row.updated_at,
             ],
         )?;
@@ -2220,15 +2216,14 @@ impl KernelDb {
         context_id: ContextId,
     ) -> KernelDbResult<Option<ContextShellRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT context_id, cwd, init_script, updated_at
+            "SELECT context_id, cwd, updated_at
              FROM context_shell WHERE context_id = ?1",
         )?;
         let mut rows = stmt.query_map(params![blob_param(context_id.as_bytes())], |row| {
             Ok(ContextShellRow {
                 context_id: read_context_id(row, 0)?,
                 cwd: row.get(1)?,
-                init_script: row.get(2)?,
-                updated_at: row.get(3)?,
+                updated_at: row.get(2)?,
             })
         })?;
         match rows.next() {
@@ -2246,7 +2241,6 @@ impl KernelDb {
         let row = ContextShellRow {
             context_id: target,
             cwd: src.cwd,
-            init_script: src.init_script,
             updated_at: now_millis(),
         };
         self.upsert_context_shell(&row)?;
@@ -3858,27 +3852,23 @@ mod tests {
         let row = ContextShellRow {
             context_id: ctx.context_id,
             cwd: Some("/home/user/src/kaijutsu".into()),
-            init_script: None,
             updated_at: now_millis() as i64,
         };
         db.upsert_context_shell(&row).unwrap();
 
         let loaded = db.get_context_shell(ctx.context_id).unwrap().unwrap();
         assert_eq!(loaded.cwd, Some("/home/user/src/kaijutsu".into()));
-        assert!(loaded.init_script.is_none());
 
         // Update (upsert changes cwd)
         let row2 = ContextShellRow {
             context_id: ctx.context_id,
             cwd: Some("/tmp/work".into()),
-            init_script: Some("set -o strict".into()),
             updated_at: now_millis() as i64,
         };
         db.upsert_context_shell(&row2).unwrap();
 
         let loaded = db.get_context_shell(ctx.context_id).unwrap().unwrap();
         assert_eq!(loaded.cwd, Some("/tmp/work".into()));
-        assert_eq!(loaded.init_script, Some("set -o strict".into()));
     }
 
     #[test]
@@ -3900,7 +3890,6 @@ mod tests {
         let row = ContextShellRow {
             context_id: src.context_id,
             cwd: Some("/home/user/project".into()),
-            init_script: Some("alias ll='ls -la'".into()),
             updated_at: now_millis() as i64,
         };
         db.upsert_context_shell(&row).unwrap();
@@ -3912,7 +3901,6 @@ mod tests {
 
         let copied = db.get_context_shell(tgt.context_id).unwrap().unwrap();
         assert_eq!(copied.cwd, Some("/home/user/project".into()));
-        assert_eq!(copied.init_script, Some("alias ll='ls -la'".into()));
     }
 
     #[test]
@@ -3942,7 +3930,6 @@ mod tests {
         db.upsert_context_shell(&ContextShellRow {
             context_id: ctx.context_id,
             cwd: Some("/tmp".into()),
-            init_script: None,
             updated_at: now_millis() as i64,
         })
         .unwrap();
@@ -4751,7 +4738,6 @@ mod tests {
         db.upsert_context_shell(&ContextShellRow {
             context_id: src.context_id,
             cwd: Some("/home/user/src/kaijutsu".into()),
-            init_script: None,
             updated_at: now_millis() as i64,
         })
         .unwrap();

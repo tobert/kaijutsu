@@ -121,10 +121,6 @@ impl KjDispatcher {
             if let Some(cwd) = &s.cwd {
                 info.push_str(&format!("\nCwd:     {cwd}"));
             }
-            if let Some(init) = &s.init_script {
-                let preview = if init.len() > 60 { &init[..60] } else { init };
-                info.push_str(&format!("\nInit:    {preview}..."));
-            }
         }
 
         // Env vars
@@ -490,11 +486,9 @@ impl KjDispatcher {
 
             // Update cwd
             if let Some(ref cwd) = cwd_spec {
-                let existing = db.get_context_shell(target_id).ok().flatten();
                 let shell = ContextShellRow {
                     context_id: target_id,
                     cwd: Some(cwd.clone()),
-                    init_script: existing.and_then(|s| s.init_script),
                     updated_at: kaijutsu_types::now_millis() as i64,
                 };
                 if let Err(e) = db.upsert_context_shell(&shell) {
@@ -1499,7 +1493,6 @@ mod tests {
             db.upsert_context_shell(&crate::kernel_db::ContextShellRow {
                 context_id: ctx,
                 cwd: Some("/home/user/project".into()),
-                init_script: None,
                 updated_at: kaijutsu_types::now_millis() as i64,
             })
             .unwrap();

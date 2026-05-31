@@ -76,7 +76,6 @@ impl KjBuiltin {
             &crate::kernel_db::ContextShellRow {
                 context_id,
                 cwd: Some(ctx.cwd.to_string_lossy().into_owned()),
-                init_script: None,
                 updated_at: kaijutsu_types::now_millis() as i64,
             },
         ) {

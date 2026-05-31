@@ -235,7 +235,6 @@ impl KjDispatcher {
             let shell = crate::kernel_db::ContextShellRow {
                 context_id: target_id,
                 cwd: Some(first_rw.path.clone()),
-                init_script: None,
                 updated_at: kaijutsu_types::now_millis() as i64,
             };
             if let Err(e) = db.upsert_context_shell(&shell) {

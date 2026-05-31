@@ -181,11 +181,6 @@ impl KjDispatcher {
                 let shell = ContextShellRow {
                     context_id: new_id,
                     cwd: Some(pwd.clone()),
-                    init_script: db
-                        .get_context_shell(source_id)
-                        .ok()
-                        .flatten()
-                        .and_then(|s| s.init_script),
                     updated_at: kaijutsu_types::now_millis() as i64,
                 };
                 if let Err(e) = db.upsert_context_shell(&shell) {
@@ -385,11 +380,6 @@ impl KjDispatcher {
                 let shell = ContextShellRow {
                     context_id: new_id,
                     cwd: Some(pwd.clone()),
-                    init_script: db
-                        .get_context_shell(source_id)
-                        .ok()
-                        .flatten()
-                        .and_then(|s| s.init_script),
                     updated_at: kaijutsu_types::now_millis() as i64,
                 };
                 if let Err(e) = db.upsert_context_shell(&shell) {
@@ -629,11 +619,6 @@ impl KjDispatcher {
                 let shell = ContextShellRow {
                     context_id: new_id,
                     cwd: Some(pwd.clone()),
-                    init_script: db
-                        .get_context_shell(source_id)
-                        .ok()
-                        .flatten()
-                        .and_then(|s| s.init_script),
                     updated_at: kaijutsu_types::now_millis() as i64,
                 };
                 if let Err(e) = db.upsert_context_shell(&shell) {
@@ -1420,7 +1405,6 @@ mod tests {
             db.upsert_context_shell(&crate::kernel_db::ContextShellRow {
                 context_id: source,
                 cwd: Some("/home/user/project".into()),
-                init_script: None,
                 updated_at: kaijutsu_types::now_millis() as i64,
             })
             .unwrap();
@@ -1459,7 +1443,6 @@ mod tests {
             db.upsert_context_shell(&crate::kernel_db::ContextShellRow {
                 context_id: source,
                 cwd: Some("/home/user/project".into()),
-                init_script: None,
                 updated_at: kaijutsu_types::now_millis() as i64,
             })
             .unwrap();
