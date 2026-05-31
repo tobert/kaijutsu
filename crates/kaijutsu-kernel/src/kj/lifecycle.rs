@@ -221,49 +221,24 @@ async fn run_kai_script(
     child_depth: u8,
     principal: PrincipalId,
 ) {
-    use crate::runtime::context_engine::session_context_map;
-    use crate::runtime::embedded_kaish::EmbeddedKaish;
     use kaijutsu_types::SessionId;
 
-    let session_id = SessionId::new();
-    let _kernel_id = dispatcher.kernel_id();
-    let session_contexts = session_context_map();
-    session_contexts.insert(session_id, new_id);
-
-    let blocks = dispatcher.block_store().clone();
-    let kernel = dispatcher.kernel().clone();
-
-    // Register `kj` so scripts can introspect/mutate the new context.
-    // Falls back to no tools if `set_self_arc` was never called (test
-    // dispatchers may not bother, in which case scripts get the bare
-    // kaish surface only — same as hunk #1).
-    let dispatcher_arc = dispatcher.self_arc();
-    let configure_tools = move |scm: crate::runtime::context_engine::SessionContextMap,
-                                sid: kaijutsu_types::SessionId,
-                                tools: &mut kaish_kernel::ToolRegistry| {
-        if let Some(d) = dispatcher_arc {
-            tools.register(crate::runtime::kj_builtin::KjBuiltin::new(
-                d,
-                scm,
-                principal,
-                sid,
-                None,
-                std::sync::Arc::new(NoopBlockSource),
-            ));
-        }
-    };
-
-    let kaish = match EmbeddedKaish::with_identity(
-        "rc",
-        blocks,
-        kernel,
-        None,
-        principal,
-        new_id,
-        session_id,
-                session_contexts,
-        configure_tools,
-    ) {
+    // Each rc script runs in its own single-use context shell — a snapshot of
+    // the context's durable state (env + cwd). Scripts evolve durable state
+    // only through the explicit `kj context set` channel, so later scripts in
+    // the phase see earlier ones' deliberate writes, never their transients.
+    // rc uses the bare kj surface (no semantic index): `NoopBlockSource`.
+    let kaish = match dispatcher
+        .materialize_context_kaish(
+            "rc",
+            principal,
+            new_id,
+            SessionId::new(),
+            None,
+            std::sync::Arc::new(NoopBlockSource),
+        )
+        .await
+    {
         Ok(k) => k,
         Err(e) => {
             insert_rc_failure_block(

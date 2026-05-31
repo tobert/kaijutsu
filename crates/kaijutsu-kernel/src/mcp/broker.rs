@@ -1487,67 +1487,39 @@ impl Broker {
         ctx: &CallContext,
         payload: &PhasePayload<'_>,
     ) -> Result<(), String> {
-        use crate::runtime::context_engine::session_context_map;
-        use crate::runtime::embedded_kaish::EmbeddedKaish;
         use std::collections::HashMap;
 
-        let kernel = match self.kernel.read().await.as_ref().and_then(|w| w.upgrade()) {
-            Some(k) => k,
-            None => {
-                return Err(
-                    "kaish hook requires Broker::set_kernel; not wired".to_string()
-                );
-            }
-        };
-        let docs = match self.documents.read().await.clone() {
-            Some(d) => d,
-            None => {
-                return Err(
-                    "kaish hook requires Broker::set_documents; not wired".to_string()
-                );
-            }
-        };
-
-        let session_id = kaijutsu_types::SessionId::new();
-        let session_contexts = session_context_map();
-        session_contexts.insert(session_id, ctx.context_id);
-
-        // Register `kj` if the dispatcher is wired so hook scripts can
-        // introspect the calling context. Falls back to no tools if
-        // `set_kj_dispatcher` was never called.
-        let kj = self
+        // A hook body runs in a single-use context shell — a snapshot of the
+        // calling context's durable state (env + cwd), with `kj` wired. This is
+        // the same materialization path rc and the interactive shell use, so a
+        // hook sees the context's current state and cannot accumulate junk.
+        // Requires the dispatcher to be wired (no silent fallback): a hook that
+        // can't reach the context shell fails loudly rather than running blind.
+        let dispatcher = match self
             .kj_dispatcher
             .read()
             .await
             .as_ref()
-            .and_then(|w| w.upgrade());
-        let principal = ctx.principal_id;
-        let configure_tools = move |scm: crate::runtime::context_engine::SessionContextMap,
-                                    sid: kaijutsu_types::SessionId,
-                                    tools: &mut kaish_kernel::ToolRegistry| {
-            if let Some(d) = kj {
-                tools.register(crate::runtime::kj_builtin::KjBuiltin::new(
-                    d,
-                    scm,
-                    principal,
-                    sid,
-                    None,
-                    Arc::new(crate::kj::lifecycle::NoopBlockSource),
-                ));
+            .and_then(|w| w.upgrade())
+        {
+            Some(d) => d,
+            None => {
+                return Err(
+                    "kaish hook requires Broker::set_kj_dispatcher; not wired".to_string(),
+                );
             }
         };
-        let kaish = EmbeddedKaish::with_identity(
-            "hook",
-            docs,
-            kernel,
-            None,
-            ctx.principal_id,
-            ctx.context_id,
-            session_id,
-            session_contexts,
-            configure_tools,
-        )
-        .map_err(|e| format!("kaish hook init failed: {e}"))?;
+        let kaish = dispatcher
+            .materialize_context_kaish(
+                "hook",
+                ctx.principal_id,
+                ctx.context_id,
+                kaijutsu_types::SessionId::new(),
+                None,
+                Arc::new(crate::kj::lifecycle::NoopBlockSource),
+            )
+            .await
+            .map_err(|e| format!("kaish hook init failed: {e}"))?;
 
         let phase_str = match phase {
             HookPhase::PreCall => "pre_call",
@@ -5198,12 +5170,8 @@ mod tests {
     /// exit code → outcome.
     #[tokio::test]
     async fn kaish_pre_call_hook_allows_and_denies() {
-        let broker = Arc::new(Broker::new());
-        let kernel = Arc::new(crate::Kernel::new("kaish-hook-test", None).await);
-        let store = crate::block_store::shared_block_store(PrincipalId::system());
-
-        broker.set_documents(store.clone()).await;
-        broker.set_kernel(&kernel).await;
+        // Hooks materialize their shell through the `kj` dispatcher, so wire one.
+        let (broker, _kernel, _kj) = wired_kaish_broker("kaish-hook-test").await;
 
         let svc = Arc::new(MockServer::new("svc").with_tool("t"));
         broker
@@ -6001,15 +5969,43 @@ mod tests {
     /// tests. Returns `(broker, kernel)` so callers can register tools and
     /// hooks freely; the kernel is held to prevent the `Weak` inside the
     /// broker from upgrading to `None` mid-test.
+    /// Wire a broker for hook tests: documents, kernel, and a `kj` dispatcher.
+    /// The dispatcher is returned (not just set) because the broker holds a
+    /// `Weak` to it — kaish hooks now materialize their shell through the
+    /// dispatcher, so it must outlive the call. Drop it and the hook can't
+    /// upgrade the weak ref.
     async fn wired_kaish_broker(
         name: &str,
-    ) -> (Arc<Broker>, Arc<crate::Kernel>) {
+    ) -> (
+        Arc<Broker>,
+        Arc<crate::Kernel>,
+        Arc<crate::kj::KjDispatcher>,
+    ) {
+        use crate::drift::shared_drift_router;
+        use crate::kernel_db::KernelDb;
+        use crate::kj::KjDispatcher;
+
         let kernel = Arc::new(crate::Kernel::new(name, None).await);
-        let broker = kernel.broker().clone();
         let store = crate::block_store::shared_block_store(PrincipalId::system());
+        let kernel_db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+        {
+            let db = kernel_db.lock();
+            db.get_or_create_default_workspace(PrincipalId::system())
+                .unwrap();
+        }
+        let kj_dispatcher = Arc::new(KjDispatcher::new(
+            shared_drift_router(),
+            store.clone(),
+            kernel_db,
+            kernel.clone(),
+        ));
+        kj_dispatcher.set_self_arc();
+
+        let broker = kernel.broker().clone();
         broker.set_documents(store).await;
         broker.set_kernel(&kernel).await;
-        (broker, kernel)
+        broker.set_kj_dispatcher(&kj_dispatcher).await;
+        (broker, kernel, kj_dispatcher)
     }
 
     /// PostCall sees `KJ_TOOL_RESULT` populated with the JSON encoding of
@@ -6020,7 +6016,7 @@ mod tests {
     /// `Denied`, which the assertion would catch.
     #[tokio::test]
     async fn post_call_hook_sees_tool_result_var_for_success() {
-        let (broker, _kernel) = wired_kaish_broker("post-call-result-success").await;
+        let (broker, _kernel, _kj) = wired_kaish_broker("post-call-result-success").await;
 
         let svc = Arc::new(MockServer::new("svc").with_tool("t"));
         broker
@@ -6058,7 +6054,7 @@ mod tests {
     /// the broker's outer `Result`.
     #[tokio::test]
     async fn post_call_hook_sees_tool_result_var_for_error_result() {
-        let (broker, _kernel) = wired_kaish_broker("post-call-result-error").await;
+        let (broker, _kernel, _kj) = wired_kaish_broker("post-call-result-error").await;
 
         let svc = Arc::new(
             MockServer::new("svc").with_tool("t").on_call(|_p| async {
@@ -6100,7 +6096,7 @@ mod tests {
     /// vs `Denied(_)` (the failure mode).
     #[tokio::test]
     async fn on_error_hook_sees_tool_error_var() {
-        let (broker, _kernel) = wired_kaish_broker("on-error-error-var").await;
+        let (broker, _kernel, _kj) = wired_kaish_broker("on-error-error-var").await;
 
         let svc = Arc::new(
             MockServer::new("svc").with_tool("t").on_call(|_p| async {
