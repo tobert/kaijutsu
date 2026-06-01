@@ -5,12 +5,17 @@
 //! provider-specific extensions we care about:
 //!
 //! - **`reasoning_content`** on assistant deltas / messages — the
-//!   chain-of-thought for thinking-mode models. It streams *before*
-//!   `content`. Crucially, it must **never** be echoed back in a
-//!   request message: DeepSeek returns HTTP 400 if `reasoning_content`
-//!   appears in the input. [`super::build`] enforces that by never
-//!   translating [`crate::llm::ContentBlock::Reasoning`] into a
-//!   [`RequestMessage`].
+//!   chain-of-thought for thinking-mode models (V4 thinks by default).
+//!   It streams *before* `content`. The V4 multi-turn contract
+//!   (<https://api-docs.deepseek.com/guides/thinking_mode>): for an
+//!   assistant turn that **performs tool calls**, its `reasoning_content`
+//!   MUST be echoed back on every subsequent request or DeepSeek returns
+//!   HTTP 400; on a turn with no tool call it is ignored if sent. Because
+//!   the API checks only presence (not authenticity), [`super::build`]
+//!   emits `reasoning_content` on every assistant message — the real
+//!   chain-of-thought when we have it, an empty string as a fallback when
+//!   we don't (tool-only or cross-provider history). An earlier model
+//!   generation 400'd on *any* echoed reasoning; that rule inverted in V4.
 //! - **cache accounting** in `usage`: `prompt_cache_hit_tokens` /
 //!   `prompt_cache_miss_tokens` (DeepSeek caches automatically — no
 //!   `cache_control` knob) and `completion_tokens_details.reasoning_tokens`.
@@ -89,6 +94,13 @@ pub struct RequestMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<MessageContent>,
 
+    /// Thinking-mode chain-of-thought echoed back on assistant messages.
+    /// Set (possibly to `""`) on every assistant turn so tool-call turns
+    /// satisfy DeepSeek's V4 round-trip requirement; `None` (skipped) on
+    /// system/user/tool roles. See the module doc.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+
     /// Present only on assistant messages that invoke tools.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<RequestToolCall>,
@@ -103,6 +115,7 @@ impl RequestMessage {
         Self {
             role: MessageRole::System,
             content: Some(MessageContent::Text(text.into())),
+            reasoning_content: None,
             tool_calls: Vec::new(),
             tool_call_id: None,
         }
@@ -112,15 +125,24 @@ impl RequestMessage {
         Self {
             role: MessageRole::User,
             content: Some(MessageContent::Text(text.into())),
+            reasoning_content: None,
             tool_calls: Vec::new(),
             tool_call_id: None,
         }
     }
 
-    pub fn assistant(content: Option<MessageContent>, tool_calls: Vec<RequestToolCall>) -> Self {
+    /// An assistant turn. `reasoning_content` is always set (the real
+    /// chain-of-thought, or `""` when none is available) so tool-call turns
+    /// meet DeepSeek's V4 round-trip requirement; see the module doc.
+    pub fn assistant(
+        content: Option<MessageContent>,
+        reasoning_content: String,
+        tool_calls: Vec<RequestToolCall>,
+    ) -> Self {
         Self {
             role: MessageRole::Assistant,
             content,
+            reasoning_content: Some(reasoning_content),
             tool_calls,
             tool_call_id: None,
         }
@@ -130,6 +152,7 @@ impl RequestMessage {
         Self {
             role: MessageRole::Tool,
             content: Some(MessageContent::Text(content.into())),
+            reasoning_content: None,
             tool_calls: Vec::new(),
             tool_call_id: Some(tool_call_id.into()),
         }
@@ -411,6 +434,7 @@ mod tests {
     fn assistant_message_with_tool_calls_serializes_openai_shape() {
         let msg = RequestMessage::assistant(
             None,
+            "thinking about it".into(),
             vec![RequestToolCall {
                 id: "call_abc".into(),
                 kind: "function",
@@ -424,6 +448,8 @@ mod tests {
         assert_eq!(v["role"], "assistant");
         // content omitted entirely when None
         assert!(v.get("content").is_none(), "null content must skip");
+        // reasoning_content rides alongside the tool call (V4 requirement)
+        assert_eq!(v["reasoning_content"], "thinking about it");
         assert_eq!(v["tool_calls"][0]["id"], "call_abc");
         assert_eq!(v["tool_calls"][0]["type"], "function");
         assert_eq!(v["tool_calls"][0]["function"]["name"], "read_file");

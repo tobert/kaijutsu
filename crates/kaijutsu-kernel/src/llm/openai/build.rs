@@ -3,11 +3,14 @@
 //!
 //! Specializations that distinguish DeepSeek from Claude's `build`:
 //!
-//! - **`Reasoning` blocks are dropped.** DeepSeek returns HTTP 400 if
-//!   `reasoning_content` appears in an input message, so a model's prior
-//!   chain-of-thought is never echoed back. (kaijutsu's hydrator already
-//!   omits thinking blocks from history, so this only matters for the
-//!   in-turn agentic-loop assistant messages the driver synthesizes.)
+//! - **`Reasoning` blocks become `reasoning_content`.** DeepSeek V4
+//!   thinks by default and *requires* the chain-of-thought to be echoed
+//!   back on any assistant turn that performed tool calls (else HTTP 400);
+//!   on other turns it is ignored. Since the API checks only presence, we
+//!   set `reasoning_content` on every assistant message — the real text
+//!   when a `Reasoning` block is present (the in-turn agentic loop carries
+//!   it), an empty string otherwise (tool-only turns, and cross-provider
+//!   history hydrated without thinking blocks). See `super::types`.
 //! - **Tool results become their own `tool`-role messages**, one per
 //!   `tool_use_id` — OpenAI's shape — rather than blocks nested inside a
 //!   user turn.
@@ -140,25 +143,30 @@ fn user_message_from_parts(parts: Vec<ContentPart>) -> RequestMessage {
     RequestMessage {
         role: super::types::MessageRole::User,
         content: Some(content),
+        reasoning_content: None,
         tool_calls: Vec::new(),
         tool_call_id: None,
     }
 }
 
 /// Assistant turn → one assistant message. Text blocks concatenate into
-/// `content`; ToolUse blocks become `tool_calls`; Reasoning blocks are
-/// dropped (the no-echo rule). An assistant message with only tool calls
-/// has `content: None`.
+/// `content`; ToolUse blocks become `tool_calls`; a Reasoning block becomes
+/// `reasoning_content`. Every assistant message carries `reasoning_content`
+/// (empty string when there is no Reasoning block) so tool-call turns meet
+/// DeepSeek's V4 round-trip requirement. An assistant message with only
+/// tool calls has `content: None`.
 fn translate_assistant(msg: &Message, out: &mut Vec<RequestMessage>) {
     match &msg.content {
         MessageContent::Text(t) => {
             out.push(RequestMessage::assistant(
                 Some(WireContent::Text(t.clone())),
+                String::new(),
                 Vec::new(),
             ));
         }
         MessageContent::Blocks(blocks) => {
             let mut text = String::new();
+            let mut reasoning = String::new();
             let mut tool_calls: Vec<RequestToolCall> = Vec::new();
             for block in blocks {
                 match block {
@@ -180,17 +188,59 @@ fn translate_assistant(msg: &Message, out: &mut Vec<RequestMessage>) {
                             },
                         });
                     }
-                    // Dropped: DeepSeek 400s on echoed reasoning_content.
-                    ContentBlock::Reasoning { .. } => {}
+                    // Echoed back as reasoning_content (V4 requires it on
+                    // tool-call turns). Concatenate if several are present.
+                    ContentBlock::Reasoning { text: r, .. } => {
+                        if !reasoning.is_empty() {
+                            reasoning.push('\n');
+                        }
+                        reasoning.push_str(r);
+                    }
                     // Tool results never appear in an assistant turn.
                     ContentBlock::ToolResult { .. } => {}
                     ContentBlock::Image { .. } => {}
                 }
             }
+            // Real reasoning rides verbatim. A tool-call turn that lost its
+            // chain-of-thought gets a synthesized marker (V4 requires the
+            // field present on tool-call turns). A non-tool-call turn needs
+            // nothing — the API ignores reasoning there, so "" is cheapest.
+            let reasoning_content = if !reasoning.is_empty() {
+                reasoning
+            } else if !tool_calls.is_empty() {
+                synthesized_reasoning(&tool_calls)
+            } else {
+                String::new()
+            };
             let content = (!text.is_empty()).then_some(WireContent::Text(text));
-            out.push(RequestMessage::assistant(content, tool_calls));
+            out.push(RequestMessage::assistant(
+                content,
+                reasoning_content,
+                tool_calls,
+            ));
         }
     }
+}
+
+/// Fallback `reasoning_content` for a tool-call turn whose real
+/// chain-of-thought is unavailable (history forked from another provider, or
+/// reasoning never captured). DeepSeek V4 only checks that the field is
+/// present, so we emit a non-empty, bracketed marker that names the tool(s)
+/// called. Per DeepSeek's own guidance: the `[…]` convention reads as a
+/// meta-note rather than a thought, the "synthesized" tag stops the model
+/// mistaking it for genuine prior reasoning, and the tool name gives one
+/// factual clue about *what* was happening without inventing *why* — so the
+/// model leans on the tool result instead of a ghost thought. An empty string
+/// also passes the 400 check but wastes the slot the model will read.
+fn synthesized_reasoning(tool_calls: &[RequestToolCall]) -> String {
+    let names: Vec<&str> = tool_calls
+        .iter()
+        .map(|t| t.function.name.as_str())
+        .collect();
+    format!(
+        "[synthesized: prior reasoning unavailable; called {}]",
+        names.join(", ")
+    )
 }
 
 // ============================================================================
@@ -248,8 +298,9 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_block_is_dropped_from_assistant_message() {
-        // The no-echo rule: a prior reasoning chain must not reach the wire.
+    fn reasoning_block_round_trips_as_reasoning_content() {
+        // V4 contract: the chain-of-thought is echoed back, separate from
+        // content — required on tool-call turns, ignored otherwise.
         let msg = Message::with_reasoning_text_and_tool_uses(
             Some(("internal thoughts".into(), Some("sig".into()))),
             Some("the answer".into()),
@@ -257,17 +308,67 @@ mod tests {
         );
         let req = build_request(&opts(), &[msg], false);
         let v = serde_json::to_value(&req).unwrap();
-        let content = v["messages"][0]["content"].as_str().unwrap();
-        assert_eq!(content, "the answer");
-        assert!(
-            !content.contains("internal thoughts"),
-            "reasoning must never appear on the wire"
+        assert_eq!(v["messages"][0]["content"], "the answer");
+        assert_eq!(
+            v["messages"][0]["reasoning_content"], "internal thoughts",
+            "reasoning must echo back as reasoning_content, not in content"
         );
-        let serialized = serde_json::to_string(&req).unwrap();
-        assert!(
-            !serialized.contains("reasoning_content"),
-            "no reasoning_content field anywhere: {serialized}"
+    }
+
+    #[test]
+    fn tool_call_turn_without_reasoning_gets_synthesized_marker() {
+        // The synthesized fallback: a tool-call assistant turn that carries
+        // no Reasoning block (cross-provider history, or a tool-only turn)
+        // still emits a non-empty reasoning_content so DeepSeek V4 won't 400 —
+        // an honest, bracketed marker naming the tool, not fake reasoning.
+        let msg = Message::with_tool_uses(
+            None,
+            vec![ContentBlock::ToolUse {
+                id: "call_1".into(),
+                name: "ls".into(),
+                input: serde_json::json!({}),
+            }],
         );
+        let req = build_request(&opts(), &[msg], false);
+        let v = serde_json::to_value(&req).unwrap();
+        let rc = v["messages"][0]["reasoning_content"].as_str().unwrap();
+        assert!(!rc.is_empty(), "tool-call turn must carry non-empty reasoning_content");
+        assert!(rc.contains("synthesized"), "marker must flag itself as not genuine: {rc}");
+        assert!(rc.contains("ls"), "marker should name the tool called: {rc}");
+        assert_eq!(v["messages"][0]["tool_calls"][0]["function"]["name"], "ls");
+    }
+
+    #[test]
+    fn synthesized_marker_lists_multiple_tools() {
+        let msg = Message::with_tool_uses(
+            None,
+            vec![
+                ContentBlock::ToolUse {
+                    id: "c1".into(),
+                    name: "read_file".into(),
+                    input: serde_json::json!({}),
+                },
+                ContentBlock::ToolUse {
+                    id: "c2".into(),
+                    name: "grep".into(),
+                    input: serde_json::json!({}),
+                },
+            ],
+        );
+        let req = build_request(&opts(), &[msg], false);
+        let v = serde_json::to_value(&req).unwrap();
+        let rc = v["messages"][0]["reasoning_content"].as_str().unwrap();
+        assert!(rc.contains("read_file") && rc.contains("grep"), "both tools named: {rc}");
+    }
+
+    #[test]
+    fn non_assistant_messages_omit_reasoning_content() {
+        // Only assistant turns carry the field; system/user/tool skip it.
+        let o = opts().with_system("be terse");
+        let req = build_request(&o, &[Message::user("hi")], false);
+        let v = serde_json::to_value(&req).unwrap();
+        assert!(v["messages"][0].get("reasoning_content").is_none()); // system
+        assert!(v["messages"][1].get("reasoning_content").is_none()); // user
     }
 
     #[test]
