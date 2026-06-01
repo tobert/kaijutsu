@@ -210,7 +210,10 @@ took.
 - [x] Phase 1 — Drop rig
 - [x] Phase 2 — Claude (incl. 2.5 signature plumbing)
 - [ ] Phase 3 — Gemini
-- [ ] Phase 4 — Local models (deferred)
+- [x] Phase 3.5 — DeepSeek (OpenAI-compatible; validates the contract
+      against a second live provider ahead of Gemini)
+- [ ] Phase 4 — Local models (deferred; the DeepSeek module is the
+      OpenAI-compatible base a local server would reuse)
 
 ---
 
@@ -368,3 +371,42 @@ took.
   ("hi there" → "Hey! 👋 How's it going? What can I help you with?",
   17 input / 21 output tokens, natural `end_turn`). 646 kernel + 15
   server unit tests pass.
+- **2026-06-01** — DeepSeek provider landed (Phase 3.5), OpenAI-compatible
+  chat completions under `crates/kaijutsu-kernel/src/llm/deepseek/`
+  (`types`/`build`/`sse`/`stream`/`mod`, mirroring `claude/`). Scope:
+  `deepseek-v4-flash` + `deepseek-v4-pro` (the tool-capable V4 models;
+  `deepseek-chat`/`-reasoner` are now deprecated aliases). The pure
+  reasoning model is intentionally out of scope — it can't call tools, so
+  it belongs in a forked tool-less context, not the agentic loop.
+  Specializations vs Claude:
+  - **No bracketed blocks on the wire.** OpenAI SSE emits anonymous
+    `data:` chunks ending in `data: [DONE]`; the `stream` state machine
+    *synthesizes* `*Start`/`*End` brackets from which delta field is
+    populated (`reasoning_content` → `content` → `tool_calls`). Tool-call
+    args accumulate by `tool_calls[].index`, flush atomically on
+    `finish_reason`.
+  - **`reasoning_content` is never echoed back.** DeepSeek 400s if it
+    appears in an input message, so `build` drops `ContentBlock::Reasoning`
+    entirely (the opposite of Claude's signature round-trip). Every
+    `ThinkingEnd` carries `signature: None`.
+  - **Automatic caching** — no `cache_control`; `cache_breakpoints` are
+    ignored. Cache hit/miss + reasoning tokens come back in `usage`.
+  - Tool results → separate `tool`-role messages (one per `tool_call_id`).
+  Metrics gap closed in the same pass (was flagged at `llm_stream.rs`):
+  `StreamEvent::Done` gained `extra: Option<UsageExtra>` (+ a new
+  `UsageExtra::DeepSeek` / `DeepSeekUsageExtra`), so DeepSeek cache
+  hit/miss + reasoning tokens — *and Claude's previously-dropped cache
+  read/creation stats* — now reach the telemetry layer. `TokenCounts`
+  grew a `reasoning` field (`gen_ai.token.type = reasoning`), and the
+  server's turn handler is now an instrumented span recording
+  `llm.usage.{input,output,cache_read,cache_write,reasoning}_tokens` +
+  `llm.response.stop_reason`. Verified live against api.deepseek.com:
+  V4-flash thinks **by default** and emits `reasoning_content` +
+  `tool_calls` in one turn (`get_weather {"city":"Tokyo"}`,
+  `finish_reason: tool_calls`) — so V4 gives thinking *and* tools
+  together, unlike the old reasoner. 39 deepseek unit tests + live smoke
+  pass; 891 kernel + 15 server + 5 telemetry tests green; full workspace
+  builds clean.
+  - *Open knob (deferred):* V4 thinking is on by default; whether/how to
+    toggle it off per-context (speed/cost) is a typed-builder knob to add
+    later, mirroring Claude's `with_thinking`.

@@ -96,6 +96,7 @@ impl ProviderConfig {
         let standard_env = match self.provider_type.as_str() {
             "anthropic" => "ANTHROPIC_API_KEY",
             "gemini" => "GEMINI_API_KEY",
+            "deepseek" => "DEEPSEEK_API_KEY",
             "openai" => "OPENAI_API_KEY",
             _ => return None,
         };

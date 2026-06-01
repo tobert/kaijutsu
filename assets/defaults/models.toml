@@ -36,6 +36,17 @@ max_output_tokens = 16384
 [providers.gemini.default_tools]
 type = "all"
 
+[providers.deepseek]
+enabled = true
+api_key_env = "DEEPSEEK_API_KEY"
+default_model = "deepseek-v4-flash"
+# V4 models think by default; reasoning tokens count toward the output
+# budget (max 64K), so leave headroom above a plain-answer ceiling.
+max_output_tokens = 16384
+
+[providers.deepseek.default_tools]
+type = "all"
+
 [providers.openai]
 enabled = false
 api_key_env = "OPENAI_API_KEY"
@@ -65,6 +76,9 @@ balanced = { provider = "anthropic", model = "claude-sonnet-4-20250514" }
 default  = { provider = "anthropic", model = "claude-sonnet-4-20250514" }
 smart    = { provider = "anthropic", model = "claude-opus-4-5-20251101" }
 best     = { provider = "anthropic", model = "claude-opus-4-5-20251101" }
+deepseek    = { provider = "deepseek", model = "deepseek-v4-flash" }
+ds-flash    = { provider = "deepseek", model = "deepseek-v4-flash" }
+ds-pro      = { provider = "deepseek", model = "deepseek-v4-pro" }
 local       = { provider = "ollama", model = "gemma4:31b" }
 offline     = { provider = "ollama", model = "gemma4:31b" }
 local-vision = { provider = "ollama", model = "gemma4:31b" }

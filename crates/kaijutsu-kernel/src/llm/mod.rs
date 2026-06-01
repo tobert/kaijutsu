@@ -29,6 +29,7 @@
 
 pub mod claude;
 pub mod config;
+pub mod deepseek;
 pub mod gemini;
 mod hydrate;
 pub mod image_cache;
@@ -46,8 +47,8 @@ pub use toml_config::{
     load_llm_config_toml, load_models_config_toml,
 };
 pub use stream::{
-    BuildOpts, CacheTarget, CacheTtl, ClaudeUsageExtra, FinishReason, GeminiUsageExtra,
-    StreamError, StreamEvent, UsageExtra,
+    BuildOpts, CacheTarget, CacheTtl, ClaudeUsageExtra, DeepSeekUsageExtra, FinishReason,
+    GeminiUsageExtra, StreamError, StreamEvent, UsageExtra,
 };
 
 use serde::{Deserialize, Serialize};
@@ -345,6 +346,8 @@ pub enum Provider {
     Claude(claude::Client),
     /// Google Gemini (see `llm/gemini/`).
     Gemini(gemini::Client),
+    /// DeepSeek, OpenAI-compatible chat completions (see `llm/deepseek/`).
+    DeepSeek(deepseek::Client),
     /// Mock provider for tests.
     #[cfg(any(test, feature = "test-mock"))]
     Mock(MockClient),
@@ -379,6 +382,16 @@ impl Provider {
                 }
                 Ok(Self::Gemini(client))
             }
+            "deepseek" => {
+                let api_key = config
+                    .resolve_api_key()
+                    .ok_or_else(|| LlmError::AuthError("No API key for DeepSeek".into()))?;
+                let mut client = deepseek::Client::new(api_key);
+                if let Some(ref url) = config.base_url {
+                    client = client.with_base_url(url);
+                }
+                Ok(Self::DeepSeek(client))
+            }
             #[cfg(any(test, feature = "test-mock"))]
             "mock" => {
                 let model = config
@@ -391,7 +404,7 @@ impl Provider {
             }
             other => Err(LlmError::Unavailable(format!(
                 "Unknown or unsupported provider type: {other} \
-                 (supported: anthropic, gemini)"
+                 (supported: anthropic, gemini, deepseek)"
             ))),
         }
     }
@@ -408,12 +421,19 @@ impl Provider {
         Self::from_config(&config)
     }
 
+    /// Create a DeepSeek provider from `DEEPSEEK_API_KEY`.
+    pub fn deepseek_from_env() -> LlmResult<Self> {
+        let config = ProviderConfig::new("deepseek").with_api_key_env("DEEPSEEK_API_KEY");
+        Self::from_config(&config)
+    }
+
     /// Stable provider identifier (matches the `provider_type` field used
     /// in models.toml and the DriftRouter).
     pub fn name(&self) -> &'static str {
         match self {
             Self::Claude(_) => "anthropic",
             Self::Gemini(_) => "gemini",
+            Self::DeepSeek(_) => "deepseek",
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(_) => "mock",
         }
@@ -440,6 +460,7 @@ impl Provider {
         match self {
             Self::Claude(client) => client.prompt(model, system, prompt).await,
             Self::Gemini(client) => client.prompt(model, system, prompt).await,
+            Self::DeepSeek(client) => client.prompt(model, system, prompt).await,
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(mock) => Ok(mock.canned_response.clone()),
         }
@@ -467,6 +488,10 @@ impl Provider {
                 let stream = client.stream(opts, messages).await?;
                 Ok(ProviderStream::Gemini(stream))
             }
+            Self::DeepSeek(client) => {
+                let stream = client.stream(opts, messages).await?;
+                Ok(ProviderStream::DeepSeek(stream))
+            }
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(mock) => {
                 let events = std::collections::VecDeque::from(vec![
@@ -477,6 +502,7 @@ impl Provider {
                         stop_reason: Some("end_turn".into()),
                         input_tokens: Some(0),
                         output_tokens: Some(0),
+                        extra: None,
                     },
                 ]);
                 Ok(ProviderStream::Mock(events))
@@ -489,6 +515,7 @@ impl Provider {
         match self {
             Self::Claude(c) => c.available_models(),
             Self::Gemini(c) => c.available_models(),
+            Self::DeepSeek(c) => c.available_models(),
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(_) => vec!["mock-model"],
         }
@@ -503,6 +530,7 @@ impl Provider {
 pub enum ProviderStream {
     Claude(claude::Stream),
     Gemini(gemini::Stream),
+    DeepSeek(deepseek::Stream),
     /// Replays a pre-built event queue. Lets tests drive a real streaming
     /// turn (e.g. the autonomous fork-and-act path) without a live provider.
     #[cfg(any(test, feature = "test-mock"))]
@@ -516,6 +544,7 @@ impl ProviderStream {
         match self {
             Self::Claude(s) => s.next_event().await,
             Self::Gemini(s) => s.next_event().await,
+            Self::DeepSeek(s) => s.next_event().await,
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(events) => events.pop_front(),
         }
@@ -526,6 +555,7 @@ impl ProviderStream {
         match self {
             Self::Claude(s) => s.cancel(),
             Self::Gemini(s) => s.cancel(),
+            Self::DeepSeek(s) => s.cancel(),
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(_) => {}
         }

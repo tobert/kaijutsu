@@ -294,6 +294,25 @@ mod consent_tests {
 ///
 /// `after_block_id` is the starting point for block ordering — all streaming
 /// blocks will be inserted after this block (typically the user's message).
+///
+/// The span carries `llm.*` fields (matching the kernel's span namespace;
+/// metrics live under `gen_ai.*`). Usage fields are declared empty and
+/// recorded from the terminal `Done` event so token/cache/reasoning
+/// accounting lands on the trace, not just the metrics meter.
+#[tracing::instrument(
+    name = "llm.turn",
+    skip_all,
+    fields(
+        llm.provider = provider.name(),
+        llm.model = %model_name,
+        llm.usage.input_tokens = tracing::field::Empty,
+        llm.usage.output_tokens = tracing::field::Empty,
+        llm.usage.cache_read_tokens = tracing::field::Empty,
+        llm.usage.cache_write_tokens = tracing::field::Empty,
+        llm.usage.reasoning_tokens = tracing::field::Empty,
+        llm.response.stop_reason = tracing::field::Empty,
+    )
+)]
 async fn process_llm_stream(
     provider: Arc<Provider>,
     documents: SharedBlockStore,
@@ -786,19 +805,53 @@ async fn process_llm_stream(
                     stop_reason,
                     input_tokens,
                     output_tokens,
+                    extra,
                 } => {
+                    // Map the provider-specific usage extra into the shared
+                    // TokenCounts shape. DeepSeek reports an automatic-cache
+                    // hit/miss split + reasoning tokens; Anthropic reports
+                    // cache read/creation. Gemini's cached-content tokens
+                    // land on cache_read too. Unknown / absent → zeros.
+                    use kaijutsu_kernel::llm::UsageExtra;
+                    let (cache_read, cache_write, reasoning) = match &extra {
+                        Some(UsageExtra::DeepSeek(d)) => {
+                            (d.prompt_cache_hit_tokens, 0, d.reasoning_tokens)
+                        }
+                        Some(UsageExtra::Claude(c)) => (
+                            c.cache_read_input_tokens,
+                            c.cache_creation_input_tokens,
+                            0,
+                        ),
+                        Some(UsageExtra::Gemini(g)) => (g.cached_content_tokens, 0, 0),
+                        None => (0, 0, 0),
+                    };
+
+                    // Tack the usage onto the turn span (llm.* namespace) so
+                    // the numbers reach the trace, not just the metrics meter.
+                    let span = tracing::Span::current();
+                    span.record("llm.usage.input_tokens", input_tokens.unwrap_or(0));
+                    span.record("llm.usage.output_tokens", output_tokens.unwrap_or(0));
+                    span.record("llm.usage.cache_read_tokens", cache_read);
+                    span.record("llm.usage.cache_write_tokens", cache_write);
+                    span.record("llm.usage.reasoning_tokens", reasoning);
+                    if let Some(ref sr) = stop_reason {
+                        span.record("llm.response.stop_reason", sr.as_str());
+                    }
+
                     // Record token usage to the global meter (no-op until OTel
                     // is enabled). Both the completed and cancelled paths spend
-                    // tokens, so record before branching. Cache-token
-                    // accounting isn't carried on Done yet — input/output now,
-                    // extend when Done carries the richer Usage.
+                    // tokens, so record before branching. cache_creation maps
+                    // from the provider extra (Anthropic cache writes); reasoning
+                    // rides as its own gen_ai.token.type.
                     kaijutsu_telemetry::record_llm_usage(
                         provider.name(),
                         &model_name,
                         kaijutsu_telemetry::TokenCounts {
                             input: input_tokens.unwrap_or(0),
                             output: output_tokens.unwrap_or(0),
-                            ..Default::default()
+                            cache_read,
+                            cache_creation: cache_write,
+                            reasoning,
                         },
                     );
                     if stream_cancelled {

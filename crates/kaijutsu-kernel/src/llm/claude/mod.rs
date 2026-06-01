@@ -305,6 +305,7 @@ impl Stream {
                         stop_reason: None,
                         input_tokens: None,
                         output_tokens: None,
+                        extra: None,
                     });
                 }
                 item = inner.next() => {
@@ -405,6 +406,7 @@ data: {\"type\":\"message_stop\"}
                 stop_reason,
                 input_tokens,
                 output_tokens,
+                ..
             } => {
                 assert_eq!(stop_reason.as_deref(), Some("end_turn"));
                 assert_eq!(*input_tokens, Some(10));
@@ -427,6 +429,7 @@ data: {\"type\":\"message_stop\"}
                 stop_reason,
                 input_tokens,
                 output_tokens,
+                ..
             } => {
                 assert!(stop_reason.is_none(), "cancel Done.stop_reason must be None");
                 assert!(input_tokens.is_none());
@@ -480,6 +483,7 @@ data: {\"type\":\"message_stop\"}
                     stop_reason: sr,
                     input_tokens: it,
                     output_tokens: ot,
+                    ..
                 } => {
                     saw_done = true;
                     if let Some(s) = sr {

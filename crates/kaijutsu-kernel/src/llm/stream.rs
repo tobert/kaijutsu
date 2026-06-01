@@ -85,13 +85,18 @@ pub enum StreamEvent {
 
     /// Generation completed.
     ///
-    /// `stop_reason` is kept as `Option<String>` for Phase 1 wire-compat
-    /// with the existing server-side log/cancel checks. Phase 2 will
-    /// re-shape this to carry [`FinishReason`] alongside [`Usage`].
+    /// `stop_reason` is kept as `Option<String>` for wire-compat with the
+    /// server-side log/cancel checks. `input_tokens` / `output_tokens`
+    /// are the common counts; `extra` carries provider-specific usage
+    /// accounting (Anthropic cache stats, DeepSeek cache hit/miss +
+    /// reasoning tokens) so it reaches the telemetry layer instead of
+    /// being dropped on the floor. `None` when the provider reported no
+    /// extra (or on a cancel-confirm `Done`).
     Done {
         stop_reason: Option<String>,
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
+        extra: Option<UsageExtra>,
     },
 
     /// Error during generation. Carries a human-readable string; Phase 2
@@ -259,21 +264,36 @@ impl Usage {
 }
 
 /// Typed provider-specific usage extension.
-#[derive(Debug, Clone)]
+///
+/// Rides on [`StreamEvent::Done`] (which is serde-serialized over the
+/// wire), so each variant must round-trip — they're all plain `u64`
+/// counts, so that's free.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UsageExtra {
     Claude(ClaudeUsageExtra),
     Gemini(GeminiUsageExtra),
+    DeepSeek(DeepSeekUsageExtra),
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaudeUsageExtra {
     pub cache_read_input_tokens: u64,
     pub cache_creation_input_tokens: u64,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GeminiUsageExtra {
     pub cached_content_tokens: u64,
+}
+
+/// DeepSeek caches the prompt prefix automatically (no `cache_control`
+/// knob), reporting the split in `usage`. `reasoning_tokens` counts the
+/// chain-of-thought tokens billed as output on thinking-mode turns.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeepSeekUsageExtra {
+    pub prompt_cache_hit_tokens: u64,
+    pub prompt_cache_miss_tokens: u64,
+    pub reasoning_tokens: u64,
 }
 
 /// Common finish reasons plus a typed provider escape hatch.
@@ -343,6 +363,7 @@ mod tests {
                 stop_reason: None,
                 input_tokens: None,
                 output_tokens: None,
+                extra: None,
             }
             .is_terminal()
         );

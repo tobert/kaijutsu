@@ -85,6 +85,12 @@ pub struct StateMachine {
     input_tokens: Option<u64>,
     /// Output tokens — updated by `message_delta` (final value).
     output_tokens: Option<u64>,
+    /// Cache accounting captured at `message_start` (Anthropic reports
+    /// the cache split there alongside input tokens). Surfaced on the
+    /// terminal `Done` so the telemetry layer can record cache hits
+    /// instead of dropping them.
+    cache_read_input_tokens: u64,
+    cache_creation_input_tokens: u64,
 }
 
 impl StateMachine {
@@ -102,6 +108,8 @@ impl StateMachine {
         match event {
             ClaudeSseEvent::MessageStart(p) => {
                 self.input_tokens = Some(p.message.usage.input_tokens);
+                self.cache_read_input_tokens = p.message.usage.cache_read_input_tokens;
+                self.cache_creation_input_tokens = p.message.usage.cache_creation_input_tokens;
                 vec![]
             }
             ClaudeSseEvent::ContentBlockStart(p) => self.on_block_start(p.index, p.content_block),
@@ -115,11 +123,24 @@ impl StateMachine {
                 self.output_tokens = Some(p.usage.output_tokens);
                 vec![]
             }
-            ClaudeSseEvent::MessageStop => vec![StreamEvent::Done {
-                stop_reason: self.stop_reason.clone(),
-                input_tokens: self.input_tokens,
-                output_tokens: self.output_tokens,
-            }],
+            ClaudeSseEvent::MessageStop => {
+                let extra = (self.cache_read_input_tokens > 0
+                    || self.cache_creation_input_tokens > 0)
+                    .then(|| {
+                        crate::llm::stream::UsageExtra::Claude(
+                            crate::llm::stream::ClaudeUsageExtra {
+                                cache_read_input_tokens: self.cache_read_input_tokens,
+                                cache_creation_input_tokens: self.cache_creation_input_tokens,
+                            },
+                        )
+                    });
+                vec![StreamEvent::Done {
+                    stop_reason: self.stop_reason.clone(),
+                    input_tokens: self.input_tokens,
+                    output_tokens: self.output_tokens,
+                    extra,
+                }]
+            }
             ClaudeSseEvent::Error(e) => vec![StreamEvent::Error(format!(
                 "{}: {}",
                 e.error.kind, e.error.message
@@ -292,6 +313,7 @@ data: {\"type\":\"message_stop\"}
                     stop_reason: Some("end_turn".into()),
                     input_tokens: Some(12),
                     output_tokens: Some(7),
+                    extra: None,
                 },
             ]
         );
@@ -340,6 +362,7 @@ data: {\"type\":\"message_stop\"}
                 stop_reason,
                 input_tokens,
                 output_tokens,
+                ..
             } => {
                 assert_eq!(stop_reason.as_deref(), Some("tool_use"));
                 assert_eq!(*input_tokens, Some(50));
@@ -411,6 +434,7 @@ data: {\"type\":\"message_stop\"}
                     stop_reason: None,
                     input_tokens: None,
                     output_tokens: None,
+                    extra: None,
                 },
             ]
         );

@@ -65,6 +65,7 @@ impl LlmMetrics {
             ("output", tokens.output),
             ("cache_read", tokens.cache_read),
             ("cache_creation", tokens.cache_creation),
+            ("reasoning", tokens.reasoning),
         ] {
             if n == 0 {
                 continue;
@@ -91,6 +92,10 @@ pub struct TokenCounts {
     pub output: u64,
     pub cache_read: u64,
     pub cache_creation: u64,
+    /// Chain-of-thought tokens (DeepSeek reasoner / thinking modes),
+    /// billed as output but reported separately so dashboards can split
+    /// reasoning spend from answer spend.
+    pub reasoning: u64,
 }
 
 /// Process-wide LLM instruments, lazily bound to the global meter provider.
@@ -172,12 +177,12 @@ mod tests {
         metrics.record(
             "anthropic",
             "claude-opus-4-8",
-            TokenCounts { input: 100, output: 50, cache_read: 20, cache_creation: 10 },
+            TokenCounts { input: 100, output: 50, cache_read: 20, cache_creation: 10, reasoning: 0 },
         );
         metrics.record(
-            "anthropic",
-            "claude-opus-4-8",
-            TokenCounts { input: 200, output: 60, cache_read: 0, cache_creation: 0 },
+            "deepseek",
+            "deepseek-v4-pro",
+            TokenCounts { input: 200, output: 60, cache_read: 0, cache_creation: 0, reasoning: 40 },
         );
 
         provider.force_flush().expect("flush");
@@ -190,5 +195,6 @@ mod tests {
         assert_eq!(token_sum(&rm, "output"), 110, "output tokens");
         assert_eq!(token_sum(&rm, "cache_read"), 20, "cache_read tokens");
         assert_eq!(token_sum(&rm, "cache_creation"), 10, "cache_creation tokens");
+        assert_eq!(token_sum(&rm, "reasoning"), 40, "reasoning tokens");
     }
 }
