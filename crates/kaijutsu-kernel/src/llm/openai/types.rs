@@ -131,18 +131,19 @@ impl RequestMessage {
         }
     }
 
-    /// An assistant turn. `reasoning_content` is always set (the real
-    /// chain-of-thought, or `""` when none is available) so tool-call turns
-    /// meet DeepSeek's V4 round-trip requirement; see the module doc.
+    /// An assistant turn. `reasoning_content` is `Some` (possibly `""`) for
+    /// DeepSeek's V4 round-trip requirement and `None` for plain
+    /// OpenAI-compatible servers that don't want the field; [`super::build`]
+    /// decides based on the provider's `reasoning_required` flag.
     pub fn assistant(
         content: Option<MessageContent>,
-        reasoning_content: String,
+        reasoning_content: Option<String>,
         tool_calls: Vec<RequestToolCall>,
     ) -> Self {
         Self {
             role: MessageRole::Assistant,
             content,
-            reasoning_content: Some(reasoning_content),
+            reasoning_content,
             tool_calls,
             tool_call_id: None,
         }
@@ -434,7 +435,7 @@ mod tests {
     fn assistant_message_with_tool_calls_serializes_openai_shape() {
         let msg = RequestMessage::assistant(
             None,
-            "thinking about it".into(),
+            Some("thinking about it".into()),
             vec![RequestToolCall {
                 id: "call_abc".into(),
                 kind: "function",

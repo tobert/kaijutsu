@@ -1,20 +1,21 @@
-//! Hand-rolled DeepSeek provider (OpenAI-compatible chat completions).
+//! Generic OpenAI-compatible chat-completions provider.
+//!
+//! Speaks the OpenAI `/chat/completions` dialect, which a wide field of
+//! servers implement: a local lemonade / llama.cpp server, Ollama, OpenAI
+//! itself, and DeepSeek. The DeepSeek-specific preset (required key,
+//! `api.deepseek.com`, the V4 reasoning-echo quirk) lives in
+//! [`crate::llm::deepseek`] as a thin wrapper over this [`Client`].
 //!
 //! Submodules:
 //! - [`types`] — chat-completions native request/response/chunk types.
-//! - [`build`] — kaijutsu `Message` / `ContentBlock` → DeepSeek shapes.
+//! - [`build`] — kaijutsu `Message` / `ContentBlock` → wire shapes.
 //! - [`sse`] — Server-Sent Events parser (`data:` chunks + `[DONE]`).
 //! - [`stream`] — SSE → kaijutsu `StreamEvent` state machine.
 //!
-//! [`Client`] owns a `reqwest::Client` with the `Authorization: Bearer`
-//! header pinned at construction. `stream()` POSTs to `/chat/completions`
-//! with `stream: true`; `prompt()` does the non-streaming form.
-//!
-//! DeepSeek's two tool-capable models are `deepseek-v4-flash` and
-//! `deepseek-v4-pro` (1M context, automatic prompt caching). The pure
-//! reasoning model is intentionally out of scope here — it can't call
-//! tools, so it belongs in a forked, tool-less context (see project notes
-//! on the fork-and-dump pattern) rather than the agentic loop.
+//! [`Client`] owns a `reqwest::Client` and attaches `Authorization: Bearer`
+//! per request *when a key is configured* — local servers need none.
+//! `stream()` POSTs to `/chat/completions` with `stream: true`; `prompt()`
+//! does the non-streaming form.
 
 pub mod build;
 pub mod sse;
@@ -30,57 +31,88 @@ use tokio_util::sync::CancellationToken;
 use crate::llm::stream::{BuildOpts, StreamEvent};
 use crate::llm::{LlmError, LlmResult, Message};
 
-use self::sse::{DeepSeekSseEvent, decode_event};
+use self::sse::{OpenAiSseEvent, decode_event};
 use self::stream::StateMachine;
 use self::types::{ApiError, ChatResponse};
 
-const DEEPSEEK_DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
+/// Fallback endpoint when no `base_url` is configured — OpenAI's own API.
+/// Local providers (lemonade, Ollama) always set `base_url` in config.
+const OPENAI_DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
-/// DeepSeek chat-completions client.
+/// Generic OpenAI-compatible chat-completions client.
 ///
-/// Owns a configured `reqwest::Client` with the bearer auth header baked
-/// into `default_headers`, so every request is authenticated by
-/// construction and reqwest can pool connections across stream calls.
+/// One `reqwest::Client` pools connections across calls; the optional
+/// bearer key is attached per request (so a keyless local server works).
+/// `provider_name` is the stable identifier reported to telemetry / theming
+/// (e.g. "deepseek", "lemonade", "ollama"); `reasoning_required` toggles the
+/// DeepSeek V4 round-trip quirk in [`build`] (echo `reasoning_content` on
+/// every assistant turn) — `false` for plain OpenAI-compatible servers.
 #[derive(Clone, Debug)]
 pub struct Client {
     http: reqwest::Client,
     base_url: String,
+    api_key: Option<String>,
+    provider_name: String,
+    reasoning_required: bool,
 }
 
 impl Client {
-    /// Construct a client from an API key.
-    ///
-    /// Panics only if the key is non-ASCII (operator misconfiguration —
-    /// crash loudly) or reqwest's TLS backend fails to initialize.
-    pub fn new(api_key: impl Into<String>) -> Self {
-        let api_key = api_key.into();
-        let mut headers = reqwest::header::HeaderMap::new();
-        let bearer = format!("Bearer {api_key}");
-        headers.insert(
-            reqwest::header::AUTHORIZATION,
-            reqwest::header::HeaderValue::from_str(&bearer)
-                .expect("DeepSeek API key must be ASCII"),
-        );
+    /// Construct a keyless client identified by `provider_name`, pointed at
+    /// the OpenAI default base URL. Use the builders to add a key, override
+    /// the base URL, or enable the reasoning-echo quirk.
+    pub fn new(provider_name: impl Into<String>) -> Self {
         let http = reqwest::Client::builder()
-            .default_headers(headers)
             .build()
             .expect("reqwest::Client::builder must succeed on healthy host");
         Self {
             http,
-            base_url: DEEPSEEK_DEFAULT_BASE_URL.to_string(),
+            base_url: OPENAI_DEFAULT_BASE_URL.to_string(),
+            api_key: None,
+            provider_name: provider_name.into(),
+            reasoning_required: false,
         }
     }
 
-    /// Override the API base URL (for the `/beta` endpoint, proxies, or
+    /// Attach a bearer API key. Validity is checked at send time (an
+    /// invalid key surfaces as an auth error, not a panic).
+    pub fn with_api_key(mut self, api_key: impl Into<String>) -> Self {
+        self.api_key = Some(api_key.into());
+        self
+    }
+
+    /// Override the API base URL (for the DeepSeek endpoint, proxies, or
     /// local OpenAI-compatible servers).
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
         self
     }
 
-    /// Tool-capable models surfaced by this provider.
+    /// Enable the DeepSeek V4 quirk: echo `reasoning_content` on every
+    /// assistant turn (required on tool-call turns or the API 400s). Plain
+    /// OpenAI-compatible servers leave this off.
+    pub fn with_reasoning_required(mut self, required: bool) -> Self {
+        self.reasoning_required = required;
+        self
+    }
+
+    /// Stable provider identifier reported to telemetry / theming.
+    pub fn provider_name(&self) -> &str {
+        &self.provider_name
+    }
+
+    /// Models surfaced by default. Config-driven for generic OpenAI-compatible
+    /// servers (the registry sources models from `default_model` + aliases),
+    /// so the base client advertises none; presets like DeepSeek override.
     pub fn available_models(&self) -> Vec<&'static str> {
-        vec!["deepseek-v4-flash", "deepseek-v4-pro"]
+        Vec::new()
+    }
+
+    /// Attach the bearer header to a request builder when a key is set.
+    fn auth(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.api_key {
+            Some(key) => rb.bearer_auth(key),
+            None => rb,
+        }
     }
 
     /// One-shot prompt with optional system preamble (non-streaming).
@@ -97,11 +129,10 @@ impl Client {
         if let Some(sys) = system {
             opts = opts.with_system(sys);
         }
-        let body = build::build_request(&opts, &messages, false);
+        let body = build::build_request(&opts, &messages, false, self.reasoning_required);
 
         let response = self
-            .http
-            .post(format!("{}/chat/completions", self.base_url))
+            .auth(self.http.post(format!("{}/chat/completions", self.base_url)))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .json(&body)
             .send()
@@ -127,11 +158,10 @@ impl Client {
     /// Start a streaming completion. POSTs `stream: true` and wraps the
     /// `text/event-stream` response in a [`Stream`].
     pub async fn stream(&self, opts: BuildOpts, messages: Vec<Message>) -> LlmResult<Stream> {
-        let body = build::build_request(&opts, &messages, true);
+        let body = build::build_request(&opts, &messages, true, self.reasoning_required);
 
         let response = self
-            .http
-            .post(format!("{}/chat/completions", self.base_url))
+            .auth(self.http.post(format!("{}/chat/completions", self.base_url)))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .json(&body)
@@ -144,9 +174,9 @@ impl Client {
         Ok(Stream::from_response(response))
     }
 
-    /// Map a DeepSeek 4xx/5xx response body into [`LlmError`].
+    /// Map an OpenAI-compatible 4xx/5xx response body into [`LlmError`].
     ///
-    /// DeepSeek returns OpenAI-shaped `{"error": {"message": …, "type":
+    /// These servers return OpenAI-shaped `{"error": {"message": …, "type":
     /// …}}`. We decode the inner error to map onto kaijutsu-typed
     /// variants; unparseable bodies pass through raw — never swallowed.
     async fn error_for_status(
@@ -189,10 +219,10 @@ fn http_error(e: reqwest::Error) -> LlmError {
     }
 }
 
-/// Streaming response from DeepSeek.
+/// Streaming response from an OpenAI-compatible server.
 ///
 /// Wraps the reqwest byte-stream in an `eventsource-stream` parser,
-/// decodes each `data:` payload into a [`DeepSeekSseEvent`], and drives
+/// decodes each `data:` payload into a [`OpenAiSseEvent`], and drives
 /// the [`StateMachine`] to produce kaijutsu [`StreamEvent`]s. Multiple
 /// kaijutsu events per chunk are buffered in `pending`.
 ///
@@ -275,7 +305,7 @@ impl Stream {
                     match item {
                         Some(Ok(event)) => match decode_event(&event) {
                             Ok(typed) => {
-                                if matches!(&typed, DeepSeekSseEvent::Done) {
+                                if matches!(&typed, OpenAiSseEvent::Done) {
                                     self.finished = true;
                                 }
                                 let emitted = self.state.step(typed);
@@ -319,7 +349,7 @@ impl Stream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::stream::{DeepSeekUsageExtra, UsageExtra};
+    use crate::llm::stream::{OpenAiCompatUsageExtra, UsageExtra};
 
     const SIMPLE: &str = "\
 data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"finish_reason\":null}]}
@@ -359,7 +389,7 @@ data: [DONE]
                 assert_eq!(*output_tokens, Some(1));
                 assert_eq!(
                     *extra,
-                    Some(UsageExtra::DeepSeek(DeepSeekUsageExtra {
+                    Some(UsageExtra::OpenAiCompat(OpenAiCompatUsageExtra {
                         prompt_cache_hit_tokens: 0,
                         prompt_cache_miss_tokens: 7,
                         reasoning_tokens: 0,
@@ -389,57 +419,64 @@ data: [DONE]
         assert!(s.next_event().await.is_none());
     }
 
-    /// Live API smoke test against api.deepseek.com. Gated behind
-    /// `DEEPSEEK_API_KEY` so CI / casual `cargo test` skip it.
+    /// Live smoke test against a local OpenAI-compatible server (lemonade /
+    /// llama.cpp / Ollama). Gated behind `OPENAI_COMPAT_BASE_URL` so CI and
+    /// casual `cargo test` skip it; reads no API key (local servers need
+    /// none). The model defaults to a small lemonade Gemma but is
+    /// overridable.
     ///
     /// ```sh
-    /// DEEPSEEK_API_KEY=$(< ~/.deepseek-key) \
-    ///   cargo test -p kaijutsu-kernel --lib deepseek_live \
+    /// OPENAI_COMPAT_BASE_URL=http://localhost:13305/v1 \
+    ///   cargo test -p kaijutsu-kernel --lib openai_live \
     ///   -- --ignored --nocapture
     /// ```
+    ///
+    /// Gemma-4 puts its chain-of-thought in `reasoning_content` and the
+    /// answer in `content`, so the state machine surfaces a Thinking block
+    /// then a Text block — give it `max_tokens` headroom or the thinking
+    /// eats the budget before the answer lands.
     #[tokio::test]
-    #[ignore = "requires DEEPSEEK_API_KEY; run with `cargo test --ignored deepseek_live`"]
-    async fn deepseek_live_smoke_streams_real_response() {
-        let api_key = match std::env::var("DEEPSEEK_API_KEY") {
-            Ok(k) if !k.is_empty() => k,
+    #[ignore = "requires a local OpenAI-compatible server; run with `cargo test --ignored openai_live`"]
+    async fn openai_live_smoke_streams_real_response() {
+        let base_url = match std::env::var("OPENAI_COMPAT_BASE_URL") {
+            Ok(u) if !u.is_empty() => u,
             _ => return,
         };
-        let client = Client::new(api_key);
-        let opts = BuildOpts::new("deepseek-v4-flash")
-            .with_max_tokens(128)
+        let model = std::env::var("OPENAI_COMPAT_MODEL")
+            .unwrap_or_else(|_| "Gemma-4-E4B-it-GGUF".to_string());
+        let client = Client::new("lemonade").with_base_url(base_url);
+        let opts = BuildOpts::new(model)
+            .with_max_tokens(512)
             .with_system("You are friendly. Respond briefly.");
         let mut stream = client
             .stream(opts, vec![Message::user("hi there")])
             .await
-            .expect("stream open must succeed with valid key");
+            .expect("stream open must succeed against a healthy local server");
         let mut text = String::new();
+        let mut thinking = String::new();
         let mut saw_done = false;
         let mut input_tokens = 0u64;
         let mut output_tokens = 0u64;
-        let mut cache_hit = 0u64;
         while let Some(ev) = stream.next_event().await {
             match ev {
                 StreamEvent::TextDelta(t) => text.push_str(&t),
+                StreamEvent::ThinkingDelta(t) => thinking.push_str(&t),
                 StreamEvent::Done {
                     input_tokens: it,
                     output_tokens: ot,
-                    extra,
                     ..
                 } => {
                     saw_done = true;
                     input_tokens = it.unwrap_or(0);
                     output_tokens = ot.unwrap_or(0);
-                    if let Some(UsageExtra::DeepSeek(d)) = extra {
-                        cache_hit = d.prompt_cache_hit_tokens;
-                    }
                 }
                 StreamEvent::Error(e) => panic!("live stream error: {e}"),
                 _ => {}
             }
         }
-        println!("\n--- deepseek said ---\n{text}\n--- meta ---");
-        println!("tokens: in={input_tokens} out={output_tokens} cache_hit={cache_hit}\n");
-        assert!(!text.is_empty(), "live response must include some text");
+        println!("\n--- server said ---\n{text}\n--- thinking ---\n{thinking}\n--- meta ---");
+        println!("tokens: in={input_tokens} out={output_tokens}\n");
+        assert!(!text.is_empty(), "live response must include some answer text");
         assert!(saw_done, "live response must terminate with Done");
         assert!(input_tokens > 0, "usage must be captured from trailing chunk");
     }

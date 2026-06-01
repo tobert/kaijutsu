@@ -10,9 +10,9 @@
 //! ```text
 //! DeepSeek SSE                          decoded
 //! ────────────                          ───────
-//! data: {"choices":[{"delta":…}]}       DeepSeekSseEvent::Chunk(ChatChunk)
-//! data: {"choices":[],"usage":{…}}      DeepSeekSseEvent::Chunk (usage-only)
-//! data: [DONE]                          DeepSeekSseEvent::Done
+//! data: {"choices":[{"delta":…}]}       OpenAiSseEvent::Chunk(ChatChunk)
+//! data: {"choices":[],"usage":{…}}      OpenAiSseEvent::Chunk (usage-only)
+//! data: [DONE]                          OpenAiSseEvent::Done
 //! ```
 //!
 //! Tests feed fixture byte slices through the same parser the wire path
@@ -26,7 +26,7 @@ const DONE_SENTINEL: &str = "[DONE]";
 
 /// A decoded DeepSeek streaming event.
 #[derive(Debug, Clone, PartialEq)]
-pub enum DeepSeekSseEvent {
+pub enum OpenAiSseEvent {
     /// A `chat.completion.chunk` payload (content / reasoning / tool-call
     /// deltas, or the trailing usage-only chunk).
     Chunk(ChatChunk),
@@ -46,19 +46,19 @@ pub enum SseDecodeError {
 }
 
 /// Decode one [`eventsource_stream::Event`] into a typed
-/// [`DeepSeekSseEvent`].
+/// [`OpenAiSseEvent`].
 ///
-/// The `[DONE]` sentinel decodes to [`DeepSeekSseEvent::Done`]; anything
+/// The `[DONE]` sentinel decodes to [`OpenAiSseEvent::Done`]; anything
 /// else is parsed as a [`ChatChunk`]. A JSON parse failure surfaces as
 /// [`SseDecodeError::InvalidJson`] rather than silently dropping — per
 /// the crash-over-corrupt principle.
-pub fn decode_event(event: &eventsource_stream::Event) -> Result<DeepSeekSseEvent, SseDecodeError> {
+pub fn decode_event(event: &eventsource_stream::Event) -> Result<OpenAiSseEvent, SseDecodeError> {
     let data = event.data.trim();
     if data == DONE_SENTINEL {
-        return Ok(DeepSeekSseEvent::Done);
+        return Ok(OpenAiSseEvent::Done);
     }
     serde_json::from_str::<ChatChunk>(data)
-        .map(DeepSeekSseEvent::Chunk)
+        .map(OpenAiSseEvent::Chunk)
         .map_err(|source| SseDecodeError::InvalidJson {
             raw: data.to_string(),
             source,
@@ -76,7 +76,7 @@ mod tests {
     use futures::StreamExt;
     use std::convert::Infallible;
 
-    async fn parse_all(payload: &str) -> Vec<Result<DeepSeekSseEvent, SseDecodeError>> {
+    async fn parse_all(payload: &str) -> Vec<Result<OpenAiSseEvent, SseDecodeError>> {
         let bytes = bytes::Bytes::from(payload.to_string());
         let stream = futures::stream::iter(vec![Ok::<_, Infallible>(bytes)]).eventsource();
         let mut out = Vec::new();
@@ -90,7 +90,7 @@ mod tests {
         out
     }
 
-    async fn parse_chunked(chunks: Vec<&str>) -> Vec<Result<DeepSeekSseEvent, SseDecodeError>> {
+    async fn parse_chunked(chunks: Vec<&str>) -> Vec<Result<OpenAiSseEvent, SseDecodeError>> {
         let items: Vec<Result<bytes::Bytes, Infallible>> = chunks
             .into_iter()
             .map(|c| Ok(bytes::Bytes::from(c.to_string())))
@@ -134,34 +134,34 @@ data: [DONE]
         assert_eq!(events.len(), 6);
         // First chunk: role assignment, empty content.
         match &events[0] {
-            DeepSeekSseEvent::Chunk(c) => {
+            OpenAiSseEvent::Chunk(c) => {
                 assert_eq!(c.choices[0].delta.role.as_deref(), Some("assistant"));
             }
             other => panic!("expected Chunk, got {other:?}"),
         }
         // Second: content delta "Hello".
         match &events[1] {
-            DeepSeekSseEvent::Chunk(c) => {
+            OpenAiSseEvent::Chunk(c) => {
                 assert_eq!(c.choices[0].delta.content.as_deref(), Some("Hello"));
             }
             other => panic!("expected Chunk, got {other:?}"),
         }
         // finish_reason chunk.
         match &events[3] {
-            DeepSeekSseEvent::Chunk(c) => {
+            OpenAiSseEvent::Chunk(c) => {
                 assert_eq!(c.choices[0].finish_reason.as_deref(), Some("stop"));
             }
             other => panic!("expected Chunk, got {other:?}"),
         }
         // usage-only chunk: empty choices, populated usage.
         match &events[4] {
-            DeepSeekSseEvent::Chunk(c) => {
+            OpenAiSseEvent::Chunk(c) => {
                 assert!(c.choices.is_empty());
                 assert_eq!(c.usage.as_ref().unwrap().prompt_tokens, 10);
             }
             other => panic!("expected usage Chunk, got {other:?}"),
         }
-        assert_eq!(events[5], DeepSeekSseEvent::Done);
+        assert_eq!(events[5], OpenAiSseEvent::Done);
     }
 
     #[tokio::test]
@@ -171,7 +171,7 @@ data: [DONE]
             .into_iter()
             .map(|r| r.unwrap())
             .collect();
-        assert_eq!(events, vec![DeepSeekSseEvent::Done]);
+        assert_eq!(events, vec![OpenAiSseEvent::Done]);
     }
 
     #[tokio::test]
@@ -184,7 +184,7 @@ data: [DONE]
             .map(|r| r.unwrap())
             .collect();
         match &events[0] {
-            DeepSeekSseEvent::Chunk(c) => {
+            OpenAiSseEvent::Chunk(c) => {
                 assert_eq!(
                     c.choices[0].delta.reasoning_content.as_deref(),
                     Some("hmm")
@@ -222,7 +222,7 @@ data: [DONE]
             .collect();
         assert_eq!(events.len(), 1);
         match &events[0] {
-            DeepSeekSseEvent::Chunk(c) => {
+            OpenAiSseEvent::Chunk(c) => {
                 assert_eq!(c.choices[0].delta.content.as_deref(), Some("split"));
             }
             other => panic!("expected Chunk, got {other:?}"),

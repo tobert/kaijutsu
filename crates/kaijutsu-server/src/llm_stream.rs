@@ -814,7 +814,7 @@ async fn process_llm_stream(
                     // land on cache_read too. Unknown / absent → zeros.
                     use kaijutsu_kernel::llm::UsageExtra;
                     let (cache_read, cache_write, reasoning) = match &extra {
-                        Some(UsageExtra::DeepSeek(d)) => {
+                        Some(UsageExtra::OpenAiCompat(d)) => {
                             (d.prompt_cache_hit_tokens, 0, d.reasoning_tokens)
                         }
                         Some(UsageExtra::Claude(c)) => (

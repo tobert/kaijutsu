@@ -53,6 +53,10 @@ max_output_tokens = 16384
 [providers.deepseek.default_tools]
 type = "all"
 
+# OpenAI itself, plus any OpenAI-compatible server (Ollama, lemonade,
+# llama.cpp, a proxy) all share one provider implementation — they speak the
+# same `/chat/completions` dialect. Set `base_url` for a local/proxy server;
+# the API key is optional (a local server needs none).
 [providers.openai]
 enabled = false
 api_key_env = "OPENAI_API_KEY"
@@ -64,10 +68,21 @@ type = "all"
 
 [providers.ollama]
 enabled = true
-base_url = "http://localhost:11434"
+base_url = "http://localhost:11434/v1"
 default_model = "gemma4:31b"
 
 [providers.ollama.default_tools]
+type = "all"
+
+# lemonade — a local OpenAI-compatible server (AMD ROCm / llama.cpp). No API
+# key; point `base_url` at your instance (the port/path are server-specific).
+# Disabled by default since the endpoint is environment-specific.
+[providers.lemonade]
+enabled = false
+base_url = "http://localhost:8000/api/v1"
+default_model = "Gemma-4-E4B-it-GGUF"
+
+[providers.lemonade.default_tools]
 type = "all"
 
 # ============================================================================
@@ -90,6 +105,10 @@ offline     = { provider = "ollama", model = "gemma4:31b" }
 local-vision = { provider = "ollama", model = "gemma4:31b" }
 local-fast  = { provider = "ollama", model = "qwen3.5:9b-bf16" }
 local-moe   = { provider = "ollama", model = "qwen3.5:35b-a3b" }
+# lemonade local models (enable [providers.lemonade] above to use these)
+lemon       = { provider = "lemonade", model = "Gemma-4-26B-A4B-it-GGUF" }
+lemon-fast  = { provider = "lemonade", model = "Gemma-4-E4B-it-GGUF" }
+lemon-coder = { provider = "lemonade", model = "Qwen3-Coder-Next-GGUF" }
 
 # ============================================================================
 # Streaming Configuration

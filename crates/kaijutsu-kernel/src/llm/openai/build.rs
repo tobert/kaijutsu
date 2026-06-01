@@ -31,7 +31,18 @@ use super::types::{
 ///
 /// `streaming` toggles `stream: true` + `stream_options.include_usage`
 /// (so the trailing usage chunk carries token accounting).
-pub fn build_request(opts: &BuildOpts, messages: &[Message], streaming: bool) -> ChatRequest {
+///
+/// `reasoning_required` is the DeepSeek V4 quirk: when `true`, every
+/// assistant message carries `reasoning_content` (real, synthesized, or
+/// `""`) so tool-call turns survive the API's presence check. Plain
+/// OpenAI-compatible servers pass `false` — the field is then emitted only
+/// when genuine reasoning exists, and omitted otherwise.
+pub fn build_request(
+    opts: &BuildOpts,
+    messages: &[Message],
+    streaming: bool,
+    reasoning_required: bool,
+) -> ChatRequest {
     let mut wire: Vec<RequestMessage> = Vec::with_capacity(messages.len() + 1);
 
     if let Some(system) = &opts.system {
@@ -41,7 +52,7 @@ pub fn build_request(opts: &BuildOpts, messages: &[Message], streaming: bool) ->
     for msg in messages {
         match msg.role {
             Role::User => translate_user(msg, &mut wire),
-            Role::Assistant => translate_assistant(msg, &mut wire),
+            Role::Assistant => translate_assistant(msg, &mut wire, reasoning_required),
         }
     }
 
@@ -151,16 +162,17 @@ fn user_message_from_parts(parts: Vec<ContentPart>) -> RequestMessage {
 
 /// Assistant turn → one assistant message. Text blocks concatenate into
 /// `content`; ToolUse blocks become `tool_calls`; a Reasoning block becomes
-/// `reasoning_content`. Every assistant message carries `reasoning_content`
-/// (empty string when there is no Reasoning block) so tool-call turns meet
-/// DeepSeek's V4 round-trip requirement. An assistant message with only
-/// tool calls has `content: None`.
-fn translate_assistant(msg: &Message, out: &mut Vec<RequestMessage>) {
+/// `reasoning_content`. When `reasoning_required`, every assistant message
+/// carries `reasoning_content` (empty string when there is no Reasoning
+/// block) so tool-call turns meet DeepSeek's V4 round-trip requirement;
+/// otherwise the field is emitted only when genuine reasoning exists. An
+/// assistant message with only tool calls has `content: None`.
+fn translate_assistant(msg: &Message, out: &mut Vec<RequestMessage>, reasoning_required: bool) {
     match &msg.content {
         MessageContent::Text(t) => {
             out.push(RequestMessage::assistant(
                 Some(WireContent::Text(t.clone())),
-                String::new(),
+                reasoning_required.then(String::new),
                 Vec::new(),
             ));
         }
@@ -201,16 +213,25 @@ fn translate_assistant(msg: &Message, out: &mut Vec<RequestMessage>) {
                     ContentBlock::Image { .. } => {}
                 }
             }
-            // Real reasoning rides verbatim. A tool-call turn that lost its
-            // chain-of-thought gets a synthesized marker (V4 requires the
-            // field present on tool-call turns). A non-tool-call turn needs
-            // nothing — the API ignores reasoning there, so "" is cheapest.
+            // Real reasoning rides verbatim, always. Beyond that the
+            // behavior splits on `reasoning_required`:
+            //   - DeepSeek (true): a tool-call turn that lost its
+            //     chain-of-thought gets a synthesized marker (V4 requires the
+            //     field on tool-call turns); a plain turn gets "" (the API
+            //     ignores it, so "" is the cheapest way to keep the field
+            //     present and uniform).
+            //   - Generic OpenAI-compatible (false): omit the field entirely
+            //     when there's no genuine reasoning — no synth, no echo noise.
             let reasoning_content = if !reasoning.is_empty() {
-                reasoning
-            } else if !tool_calls.is_empty() {
-                synthesized_reasoning(&tool_calls)
+                Some(reasoning)
+            } else if reasoning_required {
+                if !tool_calls.is_empty() {
+                    Some(synthesized_reasoning(&tool_calls))
+                } else {
+                    Some(String::new())
+                }
             } else {
-                String::new()
+                None
             };
             let content = (!text.is_empty()).then_some(WireContent::Text(text));
             out.push(RequestMessage::assistant(
@@ -259,7 +280,7 @@ mod tests {
     #[test]
     fn system_prompt_becomes_first_system_message() {
         let o = opts().with_system("be terse");
-        let req = build_request(&o, &[Message::user("hi")], false);
+        let req = build_request(&o, &[Message::user("hi")], false, true);
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["messages"][0]["role"], "system");
         assert_eq!(v["messages"][0]["content"], "be terse");
@@ -269,7 +290,7 @@ mod tests {
 
     #[test]
     fn streaming_sets_stream_and_include_usage() {
-        let req = build_request(&opts(), &[Message::user("hi")], true);
+        let req = build_request(&opts(), &[Message::user("hi")], true, true);
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["stream"], true);
         assert_eq!(v["stream_options"]["include_usage"], true);
@@ -277,7 +298,7 @@ mod tests {
 
     #[test]
     fn non_streaming_omits_stream_fields() {
-        let req = build_request(&opts(), &[Message::user("hi")], false);
+        let req = build_request(&opts(), &[Message::user("hi")], false, true);
         let v = serde_json::to_value(&req).unwrap();
         assert!(v.get("stream").is_none());
         assert!(v.get("stream_options").is_none());
@@ -290,7 +311,7 @@ mod tests {
             description: "read a file".into(),
             input_schema: serde_json::json!({"type": "object"}),
         }]);
-        let req = build_request(&o, &[Message::user("hi")], false);
+        let req = build_request(&o, &[Message::user("hi")], false, true);
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["tools"][0]["type"], "function");
         assert_eq!(v["tools"][0]["function"]["name"], "read_file");
@@ -306,7 +327,7 @@ mod tests {
             Some("the answer".into()),
             vec![],
         );
-        let req = build_request(&opts(), &[msg], false);
+        let req = build_request(&opts(), &[msg], false, true);
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["messages"][0]["content"], "the answer");
         assert_eq!(
@@ -329,7 +350,7 @@ mod tests {
                 input: serde_json::json!({}),
             }],
         );
-        let req = build_request(&opts(), &[msg], false);
+        let req = build_request(&opts(), &[msg], false, true);
         let v = serde_json::to_value(&req).unwrap();
         let rc = v["messages"][0]["reasoning_content"].as_str().unwrap();
         assert!(!rc.is_empty(), "tool-call turn must carry non-empty reasoning_content");
@@ -355,7 +376,7 @@ mod tests {
                 },
             ],
         );
-        let req = build_request(&opts(), &[msg], false);
+        let req = build_request(&opts(), &[msg], false, true);
         let v = serde_json::to_value(&req).unwrap();
         let rc = v["messages"][0]["reasoning_content"].as_str().unwrap();
         assert!(rc.contains("read_file") && rc.contains("grep"), "both tools named: {rc}");
@@ -365,7 +386,7 @@ mod tests {
     fn non_assistant_messages_omit_reasoning_content() {
         // Only assistant turns carry the field; system/user/tool skip it.
         let o = opts().with_system("be terse");
-        let req = build_request(&o, &[Message::user("hi")], false);
+        let req = build_request(&o, &[Message::user("hi")], false, true);
         let v = serde_json::to_value(&req).unwrap();
         assert!(v["messages"][0].get("reasoning_content").is_none()); // system
         assert!(v["messages"][1].get("reasoning_content").is_none()); // user
@@ -381,7 +402,7 @@ mod tests {
                 input: serde_json::json!({"location": "Tokyo"}),
             }],
         );
-        let req = build_request(&opts(), &[msg], false);
+        let req = build_request(&opts(), &[msg], false, true);
         let v = serde_json::to_value(&req).unwrap();
         let m = &v["messages"][0];
         assert_eq!(m["role"], "assistant");
@@ -404,7 +425,7 @@ mod tests {
                 input: serde_json::json!({}),
             }],
         );
-        let req = build_request(&opts(), &[msg], false);
+        let req = build_request(&opts(), &[msg], false, true);
         let v = serde_json::to_value(&req).unwrap();
         assert!(
             v["messages"][0].get("content").is_none(),
@@ -427,7 +448,7 @@ mod tests {
                 is_error: true,
             },
         ]);
-        let req = build_request(&opts(), &[msg], false);
+        let req = build_request(&opts(), &[msg], false, true);
         let v = serde_json::to_value(&req).unwrap();
         let msgs = v["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 2, "two tool results → two tool messages");
@@ -449,7 +470,7 @@ mod tests {
             data_base64: Some("QUJD".into()),
         }]);
         // (tool_results just wraps blocks in a User message — fine for this test)
-        let req = build_request(&opts(), &[msg], false);
+        let req = build_request(&opts(), &[msg], false, true);
         let v = serde_json::to_value(&req).unwrap();
         let parts = v["messages"][0]["content"].as_array().unwrap();
         assert_eq!(parts[0]["type"], "image_url");
@@ -463,7 +484,7 @@ mod tests {
             media_type: "image/png".into(),
             data_base64: None,
         }]);
-        let req = build_request(&opts(), &[msg], false);
+        let req = build_request(&opts(), &[msg], false, true);
         let v = serde_json::to_value(&req).unwrap();
         // single text part collapses to a plain string
         let content = v["messages"][0]["content"].as_str().unwrap();
@@ -475,7 +496,64 @@ mod tests {
     fn max_tokens_clamps_zero_to_default() {
         let mut o = opts();
         o.max_tokens = 0;
-        let req = build_request(&o, &[Message::user("hi")], false);
+        let req = build_request(&o, &[Message::user("hi")], false, true);
         assert!(req.max_tokens > 0, "zero must become a sane default");
+    }
+
+    // ── Generic OpenAI-compatible mode (reasoning_required = false) ──────
+    // These assert the inverse of the DeepSeek contract above: no echoed
+    // empty string, no synthesized marker — the field is present only when
+    // genuine reasoning exists. Lemonade/llama.cpp ignore the field on
+    // input, so emitting it would be noise the model might read.
+
+    #[test]
+    fn generic_text_assistant_omits_reasoning_content() {
+        let msg = Message::assistant("plain answer");
+        let req = build_request(&opts(), &[msg], false, false);
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["messages"][0]["content"], "plain answer");
+        assert!(
+            v["messages"][0].get("reasoning_content").is_none(),
+            "generic mode must omit reasoning_content on a plain assistant turn"
+        );
+    }
+
+    #[test]
+    fn generic_tool_call_turn_omits_synthesized_reasoning() {
+        // A tool-call turn with no Reasoning block: DeepSeek would synthesize
+        // a marker; generic mode emits nothing.
+        let msg = Message::with_tool_uses(
+            None,
+            vec![ContentBlock::ToolUse {
+                id: "call_1".into(),
+                name: "ls".into(),
+                input: serde_json::json!({}),
+            }],
+        );
+        let req = build_request(&opts(), &[msg], false, false);
+        let v = serde_json::to_value(&req).unwrap();
+        assert!(
+            v["messages"][0].get("reasoning_content").is_none(),
+            "generic mode must not synthesize reasoning_content on tool-call turns"
+        );
+        assert_eq!(v["messages"][0]["tool_calls"][0]["function"]["name"], "ls");
+    }
+
+    #[test]
+    fn generic_mode_still_echoes_real_reasoning() {
+        // Genuine reasoning is preserved regardless of the flag — a local
+        // reasoning model (Gemma-4) emits it and the round-trip keeps it.
+        let msg = Message::with_reasoning_text_and_tool_uses(
+            Some(("real thoughts".into(), None)),
+            Some("the answer".into()),
+            vec![],
+        );
+        let req = build_request(&opts(), &[msg], false, false);
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["messages"][0]["content"], "the answer");
+        assert_eq!(
+            v["messages"][0]["reasoning_content"], "real thoughts",
+            "genuine reasoning must survive even in generic mode"
+        );
     }
 }

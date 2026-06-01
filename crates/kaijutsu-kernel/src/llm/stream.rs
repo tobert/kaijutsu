@@ -272,7 +272,10 @@ impl Usage {
 pub enum UsageExtra {
     Claude(ClaudeUsageExtra),
     Gemini(GeminiUsageExtra),
-    DeepSeek(DeepSeekUsageExtra),
+    /// Any OpenAI-compatible chat-completions provider (DeepSeek, a local
+    /// lemonade/llama.cpp server, Ollama, OpenAI itself). DeepSeek populates
+    /// the cache split + reasoning tokens; leaner servers leave them zero.
+    OpenAiCompat(OpenAiCompatUsageExtra),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -286,11 +289,15 @@ pub struct GeminiUsageExtra {
     pub cached_content_tokens: u64,
 }
 
+/// Usage extras for OpenAI-compatible chat-completions providers.
+///
 /// DeepSeek caches the prompt prefix automatically (no `cache_control`
-/// knob), reporting the split in `usage`. `reasoning_tokens` counts the
-/// chain-of-thought tokens billed as output on thinking-mode turns.
+/// knob), reporting the split in `usage`; `reasoning_tokens` counts the
+/// chain-of-thought tokens billed as output on thinking-mode turns. Local
+/// servers (lemonade/llama.cpp, Ollama) that don't report a cache split
+/// leave these zero — the field carrier is shared, not the guarantee.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeepSeekUsageExtra {
+pub struct OpenAiCompatUsageExtra {
     pub prompt_cache_hit_tokens: u64,
     pub prompt_cache_miss_tokens: u64,
     pub reasoning_tokens: u64,

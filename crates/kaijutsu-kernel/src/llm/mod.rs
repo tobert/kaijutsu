@@ -34,6 +34,7 @@ pub mod gemini;
 mod hydrate;
 pub mod image_cache;
 pub mod mailbox;
+pub mod openai;
 pub mod stream;
 pub mod system_prompt;
 pub mod toml_config;
@@ -47,8 +48,8 @@ pub use toml_config::{
     load_llm_config_toml, load_models_config_toml,
 };
 pub use stream::{
-    BuildOpts, CacheTarget, CacheTtl, ClaudeUsageExtra, DeepSeekUsageExtra, FinishReason,
-    GeminiUsageExtra, StreamError, StreamEvent, UsageExtra,
+    BuildOpts, CacheTarget, CacheTtl, ClaudeUsageExtra, FinishReason, GeminiUsageExtra,
+    OpenAiCompatUsageExtra, StreamError, StreamEvent, UsageExtra,
 };
 
 use serde::{Deserialize, Serialize};
@@ -346,8 +347,13 @@ pub enum Provider {
     Claude(claude::Client),
     /// Google Gemini (see `llm/gemini/`).
     Gemini(gemini::Client),
-    /// DeepSeek, OpenAI-compatible chat completions (see `llm/deepseek/`).
+    /// DeepSeek — a preset over the OpenAI-compatible client, with required
+    /// auth + the V4 reasoning-echo quirk (see `llm/deepseek/`).
     DeepSeek(deepseek::Client),
+    /// Any other OpenAI-compatible chat-completions server: a local
+    /// lemonade / llama.cpp server, Ollama, or OpenAI itself (see
+    /// `llm/openai/`). Auth is optional; the provider name is config-driven.
+    OpenAi(openai::Client),
     /// Mock provider for tests.
     #[cfg(any(test, feature = "test-mock"))]
     Mock(MockClient),
@@ -356,10 +362,11 @@ pub enum Provider {
 impl Provider {
     /// Create a provider from configuration.
     ///
-    /// The `provider_type` string maps to the enum variant. Unknown types
-    /// (including `openai` and `ollama`, which the unrig pass dropped from
-    /// initial scope) return [`LlmError::Unavailable`] rather than silently
-    /// falling back — surfacing the mismatch is the point.
+    /// The `provider_type` string maps to the enum variant: `anthropic`/
+    /// `claude`, `gemini`, `deepseek`, and the OpenAI-compatible family
+    /// (`openai`, `ollama`, `lemonade`, `local`). Unknown types return
+    /// [`LlmError::Unavailable`] rather than silently falling back —
+    /// surfacing the mismatch is the point.
     pub fn from_config(config: &ProviderConfig) -> LlmResult<Self> {
         match config.provider_type.as_str() {
             "anthropic" | "claude" => {
@@ -392,6 +399,20 @@ impl Provider {
                 }
                 Ok(Self::DeepSeek(client))
             }
+            // Generic OpenAI-compatible servers. `openai` is OpenAI itself;
+            // `ollama`, `lemonade`, and `local` are common local-server
+            // aliases pointed at a `base_url`. Auth is optional — a local
+            // server needs no key — so a missing key is not an error here.
+            "openai" | "ollama" | "lemonade" | "local" => {
+                let mut client = openai::Client::new(config.provider_type.clone());
+                if let Some(ref url) = config.base_url {
+                    client = client.with_base_url(url);
+                }
+                if let Some(key) = config.resolve_api_key() {
+                    client = client.with_api_key(key);
+                }
+                Ok(Self::OpenAi(client))
+            }
             #[cfg(any(test, feature = "test-mock"))]
             "mock" => {
                 let model = config
@@ -404,7 +425,7 @@ impl Provider {
             }
             other => Err(LlmError::Unavailable(format!(
                 "Unknown or unsupported provider type: {other} \
-                 (supported: anthropic, gemini, deepseek)"
+                 (supported: anthropic, gemini, deepseek, openai, ollama, lemonade, local)"
             ))),
         }
     }
@@ -429,11 +450,16 @@ impl Provider {
 
     /// Stable provider identifier (matches the `provider_type` field used
     /// in models.toml and the DriftRouter).
-    pub fn name(&self) -> &'static str {
+    ///
+    /// Most variants map to a static string; `OpenAi` borrows its
+    /// config-supplied name (e.g. "lemonade", "ollama", "openai"), so this
+    /// returns `&str` rather than `&'static str`.
+    pub fn name(&self) -> &str {
         match self {
             Self::Claude(_) => "anthropic",
             Self::Gemini(_) => "gemini",
             Self::DeepSeek(_) => "deepseek",
+            Self::OpenAi(c) => c.provider_name(),
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(_) => "mock",
         }
@@ -461,6 +487,7 @@ impl Provider {
             Self::Claude(client) => client.prompt(model, system, prompt).await,
             Self::Gemini(client) => client.prompt(model, system, prompt).await,
             Self::DeepSeek(client) => client.prompt(model, system, prompt).await,
+            Self::OpenAi(client) => client.prompt(model, system, prompt).await,
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(mock) => Ok(mock.canned_response.clone()),
         }
@@ -488,9 +515,15 @@ impl Provider {
                 let stream = client.stream(opts, messages).await?;
                 Ok(ProviderStream::Gemini(stream))
             }
+            // DeepSeek delegates to the OpenAI-compatible client, so both
+            // yield an `openai::Stream` under the one `ProviderStream::OpenAi`.
             Self::DeepSeek(client) => {
                 let stream = client.stream(opts, messages).await?;
-                Ok(ProviderStream::DeepSeek(stream))
+                Ok(ProviderStream::OpenAi(stream))
+            }
+            Self::OpenAi(client) => {
+                let stream = client.stream(opts, messages).await?;
+                Ok(ProviderStream::OpenAi(stream))
             }
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(mock) => {
@@ -516,6 +549,7 @@ impl Provider {
             Self::Claude(c) => c.available_models(),
             Self::Gemini(c) => c.available_models(),
             Self::DeepSeek(c) => c.available_models(),
+            Self::OpenAi(c) => c.available_models(),
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(_) => vec!["mock-model"],
         }
@@ -530,7 +564,9 @@ impl Provider {
 pub enum ProviderStream {
     Claude(claude::Stream),
     Gemini(gemini::Stream),
-    DeepSeek(deepseek::Stream),
+    /// Every OpenAI-compatible provider (DeepSeek and the generic `OpenAi`
+    /// variant) streams through the one `openai::Stream`.
+    OpenAi(openai::Stream),
     /// Replays a pre-built event queue. Lets tests drive a real streaming
     /// turn (e.g. the autonomous fork-and-act path) without a live provider.
     #[cfg(any(test, feature = "test-mock"))]
@@ -544,7 +580,7 @@ impl ProviderStream {
         match self {
             Self::Claude(s) => s.next_event().await,
             Self::Gemini(s) => s.next_event().await,
-            Self::DeepSeek(s) => s.next_event().await,
+            Self::OpenAi(s) => s.next_event().await,
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(events) => events.pop_front(),
         }
@@ -555,7 +591,7 @@ impl ProviderStream {
         match self {
             Self::Claude(s) => s.cancel(),
             Self::Gemini(s) => s.cancel(),
-            Self::DeepSeek(s) => s.cancel(),
+            Self::OpenAi(s) => s.cancel(),
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(_) => {}
         }

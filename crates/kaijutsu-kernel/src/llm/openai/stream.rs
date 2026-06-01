@@ -31,9 +31,9 @@
 
 use std::collections::BTreeMap;
 
-use crate::llm::stream::{DeepSeekUsageExtra, StreamEvent, UsageExtra};
+use crate::llm::stream::{OpenAiCompatUsageExtra, StreamEvent, UsageExtra};
 
-use super::sse::DeepSeekSseEvent;
+use super::sse::OpenAiSseEvent;
 use super::types::{ChunkChoice, ToolCallChunk, Usage};
 
 /// Which content block is currently open.
@@ -75,9 +75,9 @@ impl StateMachine {
         Self::default()
     }
 
-    pub fn step(&mut self, event: DeepSeekSseEvent) -> Vec<StreamEvent> {
+    pub fn step(&mut self, event: OpenAiSseEvent) -> Vec<StreamEvent> {
         match event {
-            DeepSeekSseEvent::Chunk(chunk) => {
+            OpenAiSseEvent::Chunk(chunk) => {
                 let mut out = Vec::new();
                 if chunk.usage.is_some() {
                     // The trailing usage-only chunk (or a usage field on a
@@ -89,7 +89,7 @@ impl StateMachine {
                 }
                 out
             }
-            DeepSeekSseEvent::Done => {
+            OpenAiSseEvent::Done => {
                 let mut out = Vec::new();
                 // Defensive: if the stream ended without a finish_reason
                 // chunk, close any block still open and flush pending tool
@@ -101,7 +101,7 @@ impl StateMachine {
                     Some(u) => (
                         Some(u.prompt_tokens),
                         Some(u.completion_tokens),
-                        Some(UsageExtra::DeepSeek(DeepSeekUsageExtra {
+                        Some(UsageExtra::OpenAiCompat(OpenAiCompatUsageExtra {
                             prompt_cache_hit_tokens: u.prompt_cache_hit_tokens,
                             prompt_cache_miss_tokens: u.prompt_cache_miss_tokens,
                             reasoning_tokens: u.reasoning_tokens(),
@@ -233,7 +233,7 @@ impl StateMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::deepseek::sse::decode_event;
+    use crate::llm::openai::sse::decode_event;
     use eventsource_stream::Eventsource;
     use futures::StreamExt;
     use std::convert::Infallible;
@@ -280,7 +280,7 @@ data: [DONE]
                     stop_reason: Some("stop".into()),
                     input_tokens: Some(10),
                     output_tokens: Some(3),
-                    extra: Some(UsageExtra::DeepSeek(DeepSeekUsageExtra {
+                    extra: Some(UsageExtra::OpenAiCompat(OpenAiCompatUsageExtra {
                         prompt_cache_hit_tokens: 8,
                         prompt_cache_miss_tokens: 2,
                         reasoning_tokens: 0,
@@ -323,7 +323,7 @@ data: [DONE]
                     stop_reason: Some("stop".into()),
                     input_tokens: Some(5),
                     output_tokens: Some(9),
-                    extra: Some(UsageExtra::DeepSeek(DeepSeekUsageExtra {
+                    extra: Some(UsageExtra::OpenAiCompat(OpenAiCompatUsageExtra {
                         prompt_cache_hit_tokens: 0,
                         prompt_cache_miss_tokens: 0,
                         reasoning_tokens: 6,
