@@ -25,6 +25,12 @@ pub struct ProviderConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
 
+    /// Path to a file whose trimmed contents are the API key (e.g.
+    /// `~/.deepseek-key`). Lets the kernel read credentials without the key
+    /// living in its process environment. `~` is expanded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_file: Option<String>,
+
     /// Base URL override (for custom endpoints or local providers).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
@@ -50,6 +56,7 @@ impl ProviderConfig {
             enabled: true,
             api_key: None,
             api_key_env: None,
+            api_key_file: None,
             base_url: None,
             default_model: None,
             max_output_tokens: None,
@@ -68,6 +75,12 @@ impl ProviderConfig {
         self
     }
 
+    /// Set API key from a file path (trimmed contents). `~` is expanded.
+    pub fn with_api_key_file(mut self, path: impl Into<String>) -> Self {
+        self.api_key_file = Some(path.into());
+        self
+    }
+
     /// Set base URL.
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = Some(url.into());
@@ -80,28 +93,65 @@ impl ProviderConfig {
         self
     }
 
-    /// Resolve API key from config or environment.
+    /// Resolve the API key, trying sources in order (first hit wins):
+    ///
+    /// 1. inline `api_key` — most explicit
+    /// 2. `api_key_file` — trimmed file contents (`~` expanded). A configured
+    ///    but unreadable file warns and falls through (not a silent vanish).
+    /// 3. environment variable — the explicit `api_key_env` if set, otherwise
+    ///    the provider type's standard var.
+    ///
+    /// Returns `None` when no source yields a key; the registry skips such a
+    /// provider with a warning (it only hard-fails on the *default* provider).
     pub fn resolve_api_key(&self) -> Option<String> {
-        // Direct key takes precedence
+        // 1. Inline key.
         if let Some(key) = &self.api_key {
             return Some(key.clone());
         }
 
-        // Try environment variable
-        if let Some(env_var) = &self.api_key_env {
-            return std::env::var(env_var).ok();
+        // 2. Key file.
+        if let Some(path) = &self.api_key_file {
+            match read_key_file(path) {
+                Ok(key) => return Some(key),
+                Err(e) => tracing::warn!(
+                    provider = %self.provider_type,
+                    path = %path,
+                    error = %e,
+                    "api_key_file configured but unreadable; falling through to env"
+                ),
+            }
         }
 
-        // Try standard env var for provider type
-        let standard_env = match self.provider_type.as_str() {
-            "anthropic" => "ANTHROPIC_API_KEY",
-            "gemini" => "GEMINI_API_KEY",
-            "deepseek" => "DEEPSEEK_API_KEY",
-            "openai" => "OPENAI_API_KEY",
-            _ => return None,
+        // 3. Environment variable: explicit name if given, else the standard
+        //    var for this provider type. An explicit-but-unset var does not
+        //    fall back to the standard var (preserves prior behavior).
+        let env_var = match &self.api_key_env {
+            Some(name) => name.as_str(),
+            None => match self.provider_type.as_str() {
+                "anthropic" => "ANTHROPIC_API_KEY",
+                "gemini" => "GEMINI_API_KEY",
+                "deepseek" => "DEEPSEEK_API_KEY",
+                "openai" => "OPENAI_API_KEY",
+                _ => return None,
+            },
         };
-        std::env::var(standard_env).ok()
+        std::env::var(env_var).ok()
     }
+}
+
+/// Read an API key from a file: expand `~`, read, trim surrounding
+/// whitespace. An empty file is an error so the caller can warn rather than
+/// register a provider with a blank key.
+fn read_key_file(path: &str) -> std::io::Result<String> {
+    let expanded = shellexpand::tilde(path);
+    let key = std::fs::read_to_string(expanded.as_ref())?.trim().to_string();
+    if key.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "key file is empty after trimming",
+        ));
+    }
+    Ok(key)
 }
 
 #[cfg(test)]
@@ -127,5 +177,86 @@ mod tests {
         unsafe {
             std::env::remove_var("TEST_API_KEY");
         }
+    }
+
+    #[test]
+    fn key_file_is_read_and_trimmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deepseek-key");
+        // Trailing newline + surrounding whitespace must be stripped.
+        std::fs::write(&path, "  sk-from-file\n").unwrap();
+
+        let config =
+            ProviderConfig::new("deepseek").with_api_key_file(path.to_str().unwrap());
+        assert_eq!(config.resolve_api_key().as_deref(), Some("sk-from-file"));
+    }
+
+    #[test]
+    fn inline_key_beats_key_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key");
+        std::fs::write(&path, "sk-from-file").unwrap();
+
+        let config = ProviderConfig::new("deepseek")
+            .with_api_key_file(path.to_str().unwrap())
+            .with_api_key("sk-inline");
+        assert_eq!(config.resolve_api_key().as_deref(), Some("sk-inline"));
+    }
+
+    #[test]
+    fn key_file_beats_env() {
+        // SAFETY: single-threaded test; unique var name avoids cross-test races.
+        unsafe {
+            std::env::set_var("KEYFILE_PRECEDENCE_ENV", "sk-from-env");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key");
+        std::fs::write(&path, "sk-from-file").unwrap();
+
+        let config = ProviderConfig::new("deepseek")
+            .with_api_key_env("KEYFILE_PRECEDENCE_ENV")
+            .with_api_key_file(path.to_str().unwrap());
+        assert_eq!(config.resolve_api_key().as_deref(), Some("sk-from-file"));
+
+        // SAFETY: single-threaded test cleanup.
+        unsafe {
+            std::env::remove_var("KEYFILE_PRECEDENCE_ENV");
+        }
+    }
+
+    #[test]
+    fn unreadable_key_file_falls_through_to_env() {
+        // SAFETY: single-threaded test; unique var name.
+        unsafe {
+            std::env::set_var("MISSING_FILE_FALLBACK_ENV", "sk-from-env");
+        }
+        let config = ProviderConfig::new("deepseek")
+            .with_api_key_env("MISSING_FILE_FALLBACK_ENV")
+            .with_api_key_file("/nonexistent/path/to/key");
+        // A configured-but-missing file must not silently yield "no key";
+        // it warns (see resolve_api_key) and falls through to the env var.
+        assert_eq!(config.resolve_api_key().as_deref(), Some("sk-from-env"));
+
+        // SAFETY: single-threaded test cleanup.
+        unsafe {
+            std::env::remove_var("MISSING_FILE_FALLBACK_ENV");
+        }
+    }
+
+    #[test]
+    fn empty_key_file_is_not_a_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blank-key");
+        std::fs::write(&path, "   \n\n").unwrap();
+
+        // The helper rejects a whitespace-only file outright...
+        assert!(read_key_file(path.to_str().unwrap()).is_err());
+
+        // ...and resolve_api_key falls through to an (unset) explicit env var,
+        // yielding None rather than a blank key.
+        let config = ProviderConfig::new("deepseek")
+            .with_api_key_file(path.to_str().unwrap())
+            .with_api_key_env("DEFINITELY_UNSET_KEY_VAR_XYZ");
+        assert_eq!(config.resolve_api_key(), None);
     }
 }

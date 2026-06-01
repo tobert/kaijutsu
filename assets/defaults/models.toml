@@ -1,11 +1,15 @@
 # Kaijutsu Model Configuration
 #
 # Defines available LLM providers, model aliases, and embedding settings.
-# API keys are read from environment variables, never stored here.
+# API keys are read from the environment or a key file, never stored inline.
 #
 # Provider fields:
 #   enabled         - Whether this provider is available
 #   api_key_env     - Environment variable containing the API key
+#   api_key_file    - Path to a file holding the key (trimmed; ~ expanded),
+#                     e.g. "~/.deepseek-key". Tried before the env var; lets
+#                     the kernel read credentials without them living in its
+#                     process environment.
 #   base_url        - Optional custom endpoint (for local/proxy servers)
 #   default_model   - Model to use when not specified
 #   max_output_tokens - Maximum response tokens (optional)
@@ -39,6 +43,8 @@ type = "all"
 [providers.deepseek]
 enabled = true
 api_key_env = "DEEPSEEK_API_KEY"
+# Or read the key from a file instead of the environment:
+# api_key_file = "~/.deepseek-key"
 default_model = "deepseek-v4-flash"
 # V4 models think by default; reasoning tokens count toward the output
 # budget (max 64K), so leave headroom above a plain-answer ceiling.

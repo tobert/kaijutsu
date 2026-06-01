@@ -154,6 +154,9 @@ struct ProviderToml {
     api_key_env: Option<String>,
 
     #[serde(default)]
+    api_key_file: Option<String>,
+
+    #[serde(default)]
     base_url: Option<String>,
 
     #[serde(default)]
@@ -248,6 +251,7 @@ fn convert_llm_config(raw: &ModelsToml) -> LlmResult<LlmConfig> {
         let mut config = ProviderConfig::new(name);
         config.enabled = p.enabled;
         config.api_key_env = p.api_key_env.clone();
+        config.api_key_file = p.api_key_file.clone();
         config.base_url = p.base_url.clone();
         config.default_model = p.default_model.clone();
         config.max_output_tokens = p.max_output_tokens;

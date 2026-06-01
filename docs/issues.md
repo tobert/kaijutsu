@@ -81,6 +81,25 @@ Remaining:
 
 ## LLM providers
 
+- **Move per-model knobs out of the config layer, into the app.** `models.toml`
+  is the wrong home for settings that want to be live and model-specific.
+  Surfaced while editing `~/.config/kaijutsu/models.toml` (2026-06-01):
+  - `max_output_tokens` is a flat per-provider number; it should be tunable
+    in-app and keyed to the precise model (different ceilings/reasoning
+    budgets per model, cf. the deepseek V4 64K note).
+  - `default_model` is likewise a static per-provider field; want in-app
+    selection rather than a config edit + kernel restart.
+  - Model aliases (`fast`/`smart`/`local`/…) should leave the config layer
+    entirely and become an in-app affordance. Overlaps the `kj models`
+    alias-resolution item under **kj / control plane** below — pick one home
+    for alias truth (registry vs. app) when this lands.
+
+- **Credential file option (alongside `api_key_env`).** Provider config
+  reads keys only from an env var (`api_key_env`). Add a file-path option so
+  a provider can point at e.g. `~/.deepseek-key` / `~/.anthropic-key.txt`,
+  removing the requirement that the kernel process inherit every key in its
+  environment. (Active work as of 2026-06-01.)
+
 - **Cross-turn thinking continuity.** `hydrate_from_blocks` skips
   `BlockKind::Thinking` entirely (`llm/mod.rs:1041`), so reasoning
   never re-enters the conversation between separate
@@ -157,6 +176,18 @@ Holographic shader trio + entry animation shipped. Open:
 
 ## kj / control plane
 
+- **`kj model` / `kj models` subcommand.** No way to discover available
+  providers/models or inspect the current context's model from `kj`
+  today — callers have to know the exact `provider/model` spec (e.g.
+  `deepseek/deepseek-v4-pro`) for `kj fork --model`, and `--model` does
+  *not* resolve `models.toml` aliases (bare names resolve provider to the
+  default, not via alias). Want `kj models` to list registered providers
+  + their models + aliases (from the `LlmRegistry`), and `kj model [ctx]`
+  to show/peek the context's resolved provider+model. Reuse
+  `LlmRegistry::{list, models_for_provider, resolve_alias}` and the
+  DriftRouter handle's `provider`/`model`. Consider letting
+  `--model <alias>` resolve through `resolve_alias` so fork/context-set
+  accept the friendly names too.
 - **Tab completion.** Phase 6 of the kj rollout — context labels (with
   prefix resolution), preset labels, workspace labels, tag syntax
   (`opusplan:` then hex prefix suggestions). Integrate with kaish's

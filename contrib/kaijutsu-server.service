@@ -5,7 +5,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/bin/bash -c 'export ANTHROPIC_API_KEY=$(< %h/.anthropic-key.txt) && exec %h/src/kaijutsu/target/debug/kaijutsu-server'
+ExecStart=/bin/bash -c 'export ANTHROPIC_API_KEY=$(< %h/.anthropic-key.txt) && export DEEPSEEK_API_KEY=$(< %h/.deepseek-key) && exec %h/src/kaijutsu/target/debug/kaijutsu-server'
 WorkingDirectory=%h/src/kaijutsu
 Restart=on-failure
 RestartSec=5
