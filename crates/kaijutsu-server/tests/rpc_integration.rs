@@ -566,3 +566,119 @@ async fn collect_output_events(
         }
     }
 }
+
+// ─── Shell vars / cwd are durable, context-scoped L1 state ─────────────────
+// After the per-connection kaish was retired, shell-var RPCs read/write the
+// context's durable env (L1 `context_env`) rather than a connection-local
+// shell. These tests lock that contract.
+
+#[test]
+fn test_shell_var_round_trips_through_context() {
+    run_local(async {
+        let addr = start_server().await;
+        let (_client, kernel) = setup_execute_context(addr).await;
+
+        kernel
+            .set_shell_var(
+                "GREETING",
+                &kaijutsu_client::ShellValue::String("hello".into()),
+            )
+            .await
+            .unwrap();
+
+        let (value, found) = kernel.get_shell_var("GREETING").await.unwrap();
+        assert!(found, "var should be found after set");
+        assert_eq!(
+            value,
+            Some(kaijutsu_client::ShellValue::String("hello".into()))
+        );
+
+        let vars = kernel.list_shell_vars().await.unwrap();
+        assert!(
+            vars.iter().any(|(k, v)| k == "GREETING"
+                && *v == kaijutsu_client::ShellValue::String("hello".into())),
+            "list_shell_vars should include the set var, got: {:?}",
+            vars
+        );
+    });
+}
+
+/// Shell vars live in the context's durable L1 env, not on a per-connection
+/// kaish. A var set by one connection MUST be visible to a second connection
+/// joined to the same context. This would fail under the old per-connection
+/// model where each connection held its own transient shell scope.
+#[test]
+fn test_shell_var_shared_across_connections() {
+    run_local(async {
+        let addr = start_server().await;
+
+        // Connection A creates + joins a context and sets a var.
+        let client_a = connect_client(addr).await;
+        let (kernel_a, _) = client_a.bind_kernel().await.unwrap();
+        let ctx_id = kernel_a.create_context("shared-env").await.unwrap();
+        kernel_a.join_context(ctx_id, "conn-a").await.unwrap();
+        kernel_a
+            .set_shell_var(
+                "SHARED",
+                &kaijutsu_client::ShellValue::String("from-a".into()),
+            )
+            .await
+            .unwrap();
+
+        // Connection B joins the SAME context and reads the var back.
+        let client_b = connect_client(addr).await;
+        let (kernel_b, _) = client_b.bind_kernel().await.unwrap();
+        kernel_b.join_context(ctx_id, "conn-b").await.unwrap();
+
+        let (value, found) = kernel_b.get_shell_var("SHARED").await.unwrap();
+        assert!(
+            found,
+            "var set on connection A must be visible to connection B (durable L1)"
+        );
+        assert_eq!(
+            value,
+            Some(kaijutsu_client::ShellValue::String("from-a".into()))
+        );
+    });
+}
+
+/// A durable env var seeds every materialized shell, so `$VAR` expands inside an
+/// interactive `execute`. Proves the L1 → materialized-shell seeding path that
+/// replaced the cached per-connection kaish.
+#[test]
+fn test_shell_var_seeds_materialized_shell() {
+    run_local(async {
+        let addr = start_server().await;
+        let (_client, kernel) = setup_execute_context(addr).await;
+
+        kernel
+            .set_shell_var(
+                "SEEDED",
+                &kaijutsu_client::ShellValue::String("visible".into()),
+            )
+            .await
+            .unwrap();
+
+        let mut rx = kernel.subscribe_output().await.unwrap();
+        let exec_id = kernel.execute("echo $SEEDED").await.unwrap();
+        let events = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            collect_output_events(&mut rx, exec_id),
+        )
+        .await
+        .expect("timed out waiting for output events");
+
+        let stdout: String = events
+            .iter()
+            .filter_map(|e| match e {
+                kaijutsu_client::OutputEvent::Stdout { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            stdout.contains("visible"),
+            "materialized shell should expand the durable env var, got: {:?}",
+            stdout
+        );
+    });
+}

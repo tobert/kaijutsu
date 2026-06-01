@@ -64,11 +64,41 @@ fn test_shell_switch_updates_rpc() {
         }).collect::<String>();
 
         assert!(stdout.contains("beta"), "After shell switch, kj context current should show beta. Got: {}", stdout);
-        
-        // 5. Also verify via a direct RPC that requires context (like get_blocks)
-        // If require_context() was stale, it would still point to alpha or fail.
-        let blocks = kernel.get_blocks(ctx_b, &kaijutsu_types::BlockQuery::All).await.unwrap();
-        assert!(blocks.is_empty(), "Should be able to query blocks for beta");
+
+        // 5. Verify a context-dependent RPC that resolves the *active* context
+        //    (no explicit context arg) now targets beta. set_shell_var writes to
+        //    require_context()'s context, so the write must land in beta — not
+        //    the pre-switch alpha. (The old assertion queried get_blocks(ctx_b)
+        //    with an *explicit* id, so it never exercised require_context; and
+        //    rc-create now seeds a stance block, so "blocks empty" was never
+        //    true. See tech_debt.md #11.)
+        kernel
+            .set_shell_var(
+                "SWITCH_MARK",
+                &kaijutsu_client::ShellValue::String("beta".into()),
+            )
+            .await
+            .unwrap();
+
+        // A fresh connection that joins beta explicitly sees the var...
+        let verifier = connect_client(addr).await;
+        let (vkernel, _) = verifier.bind_kernel().await.unwrap();
+        vkernel.join_context(ctx_b, "verify-beta").await.unwrap();
+        let (beta_val, beta_found) = vkernel.get_shell_var("SWITCH_MARK").await.unwrap();
+        assert!(beta_found, "var set after switch must land in beta");
+        assert_eq!(
+            beta_val,
+            Some(kaijutsu_client::ShellValue::String("beta".into()))
+        );
+
+        // ...and the same verifier, rejoined to alpha, does NOT — proving the
+        // write resolved to beta, not the stale pre-switch context.
+        vkernel.join_context(ctx_a, "verify-alpha").await.unwrap();
+        let (_, alpha_found) = vkernel.get_shell_var("SWITCH_MARK").await.unwrap();
+        assert!(
+            !alpha_found,
+            "var must be absent in alpha — require_context() resolved to beta"
+        );
     });
 }
 

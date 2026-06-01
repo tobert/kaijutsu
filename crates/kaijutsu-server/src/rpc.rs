@@ -78,7 +78,7 @@ use crate::kaijutsu_capnp::*;
 use crate::llm_stream::spawn_llm_for_prompt;
 
 use kaijutsu_crdt::{BlockKind, ContentType, Role, Status};
-use kaijutsu_kernel::kernel_db::{ContextRow, KernelDb};
+use kaijutsu_kernel::kernel_db::{ContextRow, ContextShellRow, KernelDb};
 use kaijutsu_kernel::{
     // FlowBus
     BlockFlow,
@@ -452,7 +452,6 @@ pub struct ConnectionState {
     pub session_id: SessionId,
     /// Global session map for context tracking.
     pub session_contexts: kaijutsu_kernel::runtime::context_engine::SessionContextMap,
-    pub kaish: Option<Rc<EmbeddedKaish>>,
     pub command_history: Vec<CommandEntry>,
     next_exec_id: AtomicU64,
     /// Currently running executions, keyed by exec_id.
@@ -480,7 +479,6 @@ impl ConnectionState {
             principal,
             session_id: SessionId::new(),
             session_contexts,
-            kaish: None,
             command_history: Vec::new(),
             next_exec_id: AtomicU64::new(1),
             running_executions: HashMap::new(),
@@ -531,6 +529,15 @@ impl ConnectionState {
     /// Check if any execution is currently in-flight.
     fn has_running_execution(&self) -> bool {
         !self.running_executions.is_empty()
+    }
+
+    /// Cancel every in-flight execution on this connection. The `execute`
+    /// path's `tokio::select!` arm observes the token and calls
+    /// `kaish.cancel()`, aborting the materialized shell mid-command.
+    fn cancel_running_executions(&self) {
+        for running in self.running_executions.values() {
+            running.cancel.cancel();
+        }
     }
 
     /// Register an output subscriber callback.
@@ -1365,67 +1372,11 @@ impl kernel::Server for KernelImpl {
 
         Promise::from_future(
             async move {
-                // Get or create embedded kaish executor with real connection identity
-                let (kaish, newly_created) = {
-                    let mut conn = connection.borrow_mut();
-                    let was_none = conn.kaish.is_none();
-
-                    if was_none {
-                        log::info!("Creating embedded kaish for kernel {}", kernel.id.to_hex());
-                        let context_id = conn.require_context()?;
-                        let kj_disp = kernel.kj_dispatcher.clone();
-                        let kj_principal = conn.principal.id;
-                        let session_contexts = conn.session_contexts.clone();
-                        match EmbeddedKaish::with_identity_and_db(
-                            &format!(
-                                "{}-{}-{}",
-                                kernel.name,
-                                conn.principal.username,
-                                conn.session_id.short()
-                            ),
-                            kernel.documents.clone(),
-                            kernel.kernel.clone(),
-                            None,
-                            conn.principal.id,
-                            context_id,
-                            conn.session_id,
-                            Some(&kernel.kernel_db),
-                            session_contexts.clone(),
-                            |map, sid, tools| {
-                                let block_source: Arc<dyn kaijutsu_index::BlockSource> =
-                                    Arc::new(BlockStoreSource(kernel.documents.clone()));
-                                tools.register(kaijutsu_kernel::runtime::kj_builtin::KjBuiltin::new(
-                                    kj_disp,
-                                    map,
-                                    kj_principal,
-                                    sid,
-                                    kernel.semantic_index.clone(),
-                                    block_source,
-                                ));
-                            },
-                        ) {
-                            Ok(kaish) => {
-                                conn.kaish = Some(Rc::new(kaish));
-                            }
-                            Err(e) => {
-                                log::error!("Failed to create embedded kaish: {}", e);
-                                return Err(capnp::Error::failed(format!(
-                                    "kaish creation failed: {}",
-                                    e
-                                )));
-                            }
-                        }
-                    }
-
-                    (conn.kaish.as_ref().unwrap().clone(), was_none)
-                };
-
-                // Apply persisted env vars and init_script on first creation.
-                if newly_created {
-                    if let Some(ctx_id) = kaish.context_id() {
-                        kaish.apply_context_config(&kernel.kernel_db, ctx_id).await;
-                    }
-                }
+                // Materialize a single-use context shell seeded from L1. One
+                // instance per execute call — durable env + cwd persist in the
+                // DB, transient scope dies with the instance.
+                let started_ctx = connection.borrow().require_context()?;
+                let kaish = materialize_context_shell(&kernel, &connection).await?;
 
                 // Reject concurrent executions — kaish kernel is serial.
                 {
@@ -1479,6 +1430,16 @@ impl kernel::Server for KernelImpl {
                             kaish_kernel::interpreter::ExecResult::failure(130, "interrupted")
                         }
                     };
+
+                    // Propagate any in-shell context switch (`kj context switch`
+                    // / `kj fork`) back to the connection's shared map — the
+                    // materialized shell's map is isolated, so without this the
+                    // switch would be invisible to subsequent RPCs. Done *before*
+                    // dispatching the exit-code event so the active context is
+                    // settled by the time the client learns the command finished
+                    // (otherwise a client firing its next RPC immediately could
+                    // observe a stale active context).
+                    propagate_context_switch(&kaish, started_ctx, &connection_bg);
 
                     // Dispatch output events to all subscribers.
                     dispatch_output_events(exec_id, &exec_result, &connection_bg).await;
@@ -1694,27 +1655,22 @@ impl kernel::Server for KernelImpl {
         let kernel_arc = self.kernel.kernel.clone();
         let _kernel_id = self.kernel.id;
 
-        // Extract identity and kaish ref for async cwd resolution
-        let (principal_id, context_id, session_id, kaish_ref) = {
+        // Extract identity and resolve cwd from the context's durable L1 state.
+        let (principal_id, context_id, session_id) = {
             let conn = self.connection.borrow();
             (
                 conn.principal.id,
                 pry!(conn.require_context()),
                 conn.session_id,
-                conn.kaish.clone(),
             )
         };
+        let cwd = context_cwd(&self.kernel, context_id)
+            .unwrap_or_else(|| std::path::PathBuf::from("/"));
 
         Promise::from_future(
             async move {
                 let mut result = results.get().init_result();
                 result.set_request_id(&request_id);
-
-                // Resolve cwd from kaish session (now in async context, can await)
-                let cwd = match &kaish_ref {
-                    Some(k) => k.cwd().await,
-                    None => std::path::PathBuf::from("/"),
-                };
 
                 let tool_ctx = kaijutsu_kernel::ExecContext::new(
                     principal_id,
@@ -2248,20 +2204,18 @@ impl kernel::Server for KernelImpl {
             .map(|s| s.to_owned());
 
         let kernel = self.kernel.clone();
-        let (user_principal_id, session_id, kaish_ref) = {
+        let (user_principal_id, session_id) = {
             let conn = self.connection.borrow();
-            (conn.principal.id, conn.session_id, conn.kaish.clone())
+            (conn.principal.id, conn.session_id)
         };
 
         Promise::from_future(
             async move {
                 log::debug!("prompt future started for context_id={}", context_id);
 
-                // Resolve cwd from kaish session (in async context, can await)
-                let cwd = match &kaish_ref {
-                    Some(k) => k.cwd().await,
-                    None => std::path::PathBuf::from("/"),
-                };
+                // Resolve cwd from the context's durable L1 state.
+                let cwd = context_cwd(&kernel, context_id)
+                    .unwrap_or_else(|| std::path::PathBuf::from("/"));
                 let tool_ctx = kaijutsu_kernel::ExecContext::new(
                     user_principal_id,
                     context_id,
@@ -2812,20 +2766,16 @@ impl kernel::Server for KernelImpl {
         mut results: kernel::GetCwdResults,
     ) -> Promise<(), capnp::Error> {
         let connection = self.connection.clone();
+        let kernel = self.kernel.clone();
 
         let span = tracing::info_span!("rpc", method = "get_cwd");
         Promise::from_future(
             async move {
-                let kaish = {
-                    let conn = connection.borrow();
-                    conn.kaish.clone()
-                };
-
-                let cwd = if let Some(kaish) = kaish {
-                    kaish.cwd().await
-                } else {
-                    std::path::PathBuf::from("/docs")
-                };
+                // cwd is durable context state (L1), shared across the context's
+                // lifetime; default to the VFS landing dir when unset.
+                let context_id = connection.borrow().require_context()?;
+                let cwd = context_cwd(&kernel, context_id)
+                    .unwrap_or_else(|| std::path::PathBuf::from("/docs"));
 
                 results.get().set_path(cwd.to_string_lossy());
                 Ok(())
@@ -2850,19 +2800,30 @@ impl kernel::Server for KernelImpl {
         };
 
         let connection = self.connection.clone();
+        let kernel = self.kernel.clone();
 
         let span = tracing::info_span!("rpc", method = "set_cwd");
         Promise::from_future(
             async move {
-                let kaish = {
-                    let conn = connection.borrow();
-                    conn.kaish
-                        .clone()
-                        .ok_or_else(|| capnp::Error::failed("kaish not initialized".into()))?
-                };
-
-                // set_cwd doesn't return a Result in kaish
-                kaish.set_cwd(std::path::PathBuf::from(&path)).await;
+                // cwd is durable, context-scoped state: write it straight to L1
+                // (`context_shell.cwd`). Every materialized shell for this
+                // context — model, interactive, headless — seeds from here.
+                let context_id = connection.borrow().require_context()?;
+                let updated_at = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system clock before UNIX epoch")
+                    .as_millis() as i64;
+                kernel
+                    .kernel_db
+                    .lock()
+                    .upsert_context_shell(&ContextShellRow {
+                        context_id,
+                        cwd: Some(path.clone()),
+                        updated_at,
+                    })
+                    .map_err(|e| {
+                        capnp::Error::failed(format!("failed to persist cwd: {}", e))
+                    })?;
                 results.get().set_success(true);
                 results.get().set_error("");
                 Ok(())
@@ -2876,53 +2837,21 @@ impl kernel::Server for KernelImpl {
         _params: kernel::GetLastResultParams,
         mut results: kernel::GetLastResultResults,
     ) -> Promise<(), capnp::Error> {
-        let connection = self.connection.clone();
+        let _span = tracing::info_span!("rpc", method = "get_last_result").entered();
 
-        let span = tracing::info_span!("rpc", method = "get_last_result");
-        Promise::from_future(
-            async move {
-                let kaish = {
-                    let conn = connection.borrow();
-                    conn.kaish.clone()
-                };
-
-                let last_result = if let Some(kaish) = kaish {
-                    kaish.last_result().await
-                } else {
-                    None
-                };
-
-                let mut result_builder = results.get().init_result();
-                if let Some(exec_result) = last_result {
-                    result_builder.set_code(exec_result.code);
-                    result_builder.set_ok(exec_result.ok());
-                    result_builder.set_stdout(exec_result.text_out().as_bytes());
-                    result_builder.set_stderr(&exec_result.err);
-
-                    // Serialize data if present
-                    if let Some(ref data) = exec_result.data {
-                        value_to_shell_value(result_builder.reborrow().init_data(), data);
-                    }
-
-                    // Serialize structured output data
-                    if let Some(output_data) = exec_result.output() {
-                        build_output_data(
-                            result_builder.reborrow().init_output_data(),
-                            output_data,
-                        );
-                    }
-                } else {
-                    // No last result - return empty/zero values
-                    result_builder.set_code(0);
-                    result_builder.set_ok(true);
-                    result_builder.set_stdout(&[]);
-                    result_builder.set_stderr("");
-                }
-
-                Ok(())
-            }
-            .instrument(span),
-        )
+        // `$?` was read off the per-connection persistent kaish. Under the
+        // per-use materialization model there is no persistent shell to hold a
+        // "last exit code" — each command runs in a throwaway instance — so this
+        // always returns the empty/zero result. The wire method stays for
+        // compatibility; shell exit codes now live on the ToolResult block
+        // (`set_exit_code` in `execute_shell_command`), which is the durable,
+        // multi-writer-safe home for them.
+        let mut result_builder = results.get().init_result();
+        result_builder.set_code(0);
+        result_builder.set_ok(true);
+        result_builder.set_stdout(&[]);
+        result_builder.set_stderr("");
+        Promise::ok(())
     }
 
     // =========================================================================
@@ -3779,22 +3708,30 @@ impl kernel::Server for KernelImpl {
         };
 
         let connection = self.connection.clone();
+        let kernel = self.kernel.clone();
 
         let span = tracing::info_span!("rpc", method = "get_shell_var");
         Promise::from_future(
             async move {
-                let kaish = {
-                    let conn = connection.borrow();
-                    conn.kaish
-                        .clone()
-                        .ok_or_else(|| capnp::Error::failed("kaish not initialized".into()))?
-                };
+                // Shell vars are durable, context-scoped env (L1 `context_env`,
+                // string-only). A var set here is equivalent to
+                // `kj context set --env` and visible to every materialized shell.
+                let context_id = connection.borrow().require_context()?;
+                let value = kernel
+                    .kernel_db
+                    .lock()
+                    .get_context_env(context_id)
+                    .map_err(|e| {
+                        capnp::Error::failed(format!("failed to read context env: {}", e))
+                    })?
+                    .into_iter()
+                    .find(|row| row.key == name)
+                    .map(|row| row.value);
 
-                let value = kaish.get_var(&name).await;
                 let mut builder = results.get();
                 if let Some(val) = value {
                     builder.set_found(true);
-                    value_to_shell_value(builder.init_value(), &val);
+                    value_to_shell_value(builder.init_value(), &kaish_kernel::ast::Value::String(val));
                 } else {
                     builder.set_found(false);
                 }
@@ -3822,18 +3759,22 @@ impl kernel::Server for KernelImpl {
         };
 
         let connection = self.connection.clone();
+        let kernel = self.kernel.clone();
 
         let span = tracing::info_span!("rpc", method = "set_shell_var");
         Promise::from_future(
             async move {
-                let kaish = {
-                    let conn = connection.borrow();
-                    conn.kaish
-                        .clone()
-                        .ok_or_else(|| capnp::Error::failed("kaish not initialized".into()))?
-                };
-
-                kaish.set_var(&name, value).await;
+                // Durable, context-scoped write to L1. Structured values collapse
+                // to string (env is string-only) — the lossy half of the
+                // shell-var ⇄ env round-trip, accepted by design.
+                let context_id = connection.borrow().require_context()?;
+                kernel
+                    .kernel_db
+                    .lock()
+                    .set_context_env(context_id, &name, &value_to_env_string(&value))
+                    .map_err(|e| {
+                        capnp::Error::failed(format!("failed to persist context env: {}", e))
+                    })?;
                 results.get().set_success(true);
                 results.get().set_error("");
                 Ok(())
@@ -3848,28 +3789,29 @@ impl kernel::Server for KernelImpl {
         mut results: kernel::ListShellVarsResults,
     ) -> Promise<(), capnp::Error> {
         let connection = self.connection.clone();
+        let kernel = self.kernel.clone();
 
         let span = tracing::info_span!("rpc", method = "list_shell_vars");
         Promise::from_future(
             async move {
-                let kaish = {
-                    let conn = connection.borrow();
-                    conn.kaish
-                        .clone()
-                        .ok_or_else(|| capnp::Error::failed("kaish not initialized".into()))?
-                };
+                // List the context's durable env (L1) as shell vars.
+                let context_id = connection.borrow().require_context()?;
+                let rows = kernel
+                    .kernel_db
+                    .lock()
+                    .get_context_env(context_id)
+                    .map_err(|e| {
+                        capnp::Error::failed(format!("failed to list context env: {}", e))
+                    })?;
 
-                let var_names = kaish.list_vars().await;
-                let mut list_builder = results.get().init_vars(var_names.len() as u32);
-
-                for (i, name) in var_names.iter().enumerate() {
+                let mut list_builder = results.get().init_vars(rows.len() as u32);
+                for (i, row) in rows.iter().enumerate() {
                     let mut entry = list_builder.reborrow().get(i as u32);
-                    entry.set_name(name);
-
-                    // Fetch each variable's value for the full listing
-                    if let Some(val) = kaish.get_var(name).await {
-                        value_to_shell_value(entry.init_value(), &val);
-                    }
+                    entry.set_name(&row.key);
+                    value_to_shell_value(
+                        entry.init_value(),
+                        &kaish_kernel::ast::Value::String(row.value.clone()),
+                    );
                 }
 
                 Ok(())
@@ -4079,15 +4021,11 @@ impl kernel::Server for KernelImpl {
                         )));
                     }
 
-                    // Build ToolContext from connection state
-                    let (session_id, kaish_ref) = {
-                        let conn = connection.borrow();
-                        (conn.session_id, conn.kaish.clone())
-                    };
-                    let cwd = match &kaish_ref {
-                        Some(k) => k.cwd().await,
-                        None => std::path::PathBuf::from("/"),
-                    };
+                    // Build ToolContext from connection state; cwd is durable
+                    // context-scoped state (L1).
+                    let session_id = connection.borrow().session_id;
+                    let cwd = context_cwd(&kernel, context_id)
+                        .unwrap_or_else(|| std::path::PathBuf::from("/"));
                     let tool_ctx = kaijutsu_kernel::ExecContext::new(
                         user_principal_id,
                         context_id,
@@ -4873,9 +4811,17 @@ impl kernel::Server for KernelImpl {
         );
         let immediate = params_reader.get_immediate();
 
-        // Cancel kaish synchronously — cancel() is a sync method.
-        if immediate && let Some(kaish) = self.connection.borrow().kaish.as_ref() {
-            kaish.cancel();
+        // Hard interrupt: kill this connection's in-flight kaish command(s).
+        // The per-use shell holds no persistent handle, so we cancel via the
+        // running-execution registry — each `execute` spawns with a token whose
+        // `select!` arm calls `kaish.cancel()`. Gated on the target context
+        // matching the one this connection is driving; the old per-connection
+        // cancel fired regardless of which context was targeted.
+        if immediate {
+            let conn = self.connection.borrow();
+            if conn.require_context().ok() == Some(context_id) {
+                conn.cancel_running_executions();
+            }
         }
 
         let kernel = self.kernel.clone();
@@ -5354,6 +5300,104 @@ fn set_peer_info(builder: &mut peer_info::Builder, info: &PeerInfo) {
 ///
 /// Shared by `shell_execute` (direct RPC) and `submit_input` (shell mode).
 /// Exit codes 0/2/3 map to Done; everything else is Error.
+/// Render a kaish value as a string for durable `context_env` storage.
+///
+/// `context_env` is string-only (a normalized KV table — defense in depth), so
+/// structured shell values collapse to their scalar/JSON text form on the way
+/// to L1. This is the lossy half of the shell-var ⇄ env round-trip: a value set
+/// via `setShellVar` and read back via `getShellVar` returns as a `String`.
+fn value_to_env_string(value: &kaish_kernel::ast::Value) -> String {
+    use kaish_kernel::ast::Value;
+    match value {
+        Value::Null => String::new(),
+        Value::Bool(b) => b.to_string(),
+        Value::Int(i) => i.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::String(s) => s.clone(),
+        Value::Json(j) => serde_json::to_string(j).unwrap_or_default(),
+        Value::Blob(b) => b.id.clone(),
+    }
+}
+
+/// Read a context's durable cwd from L1 (`context_shell.cwd`). Returns `None`
+/// when unset or unreadable — callers apply their own default (the interactive
+/// shell lands in `/docs`; tool-context resolution defaults to `/`).
+fn context_cwd(kernel: &SharedKernelState, context_id: ContextId) -> Option<std::path::PathBuf> {
+    kernel
+        .kernel_db
+        .lock()
+        .get_context_shell(context_id)
+        .ok()
+        .flatten()
+        .and_then(|row| row.cwd)
+        .map(std::path::PathBuf::from)
+}
+
+/// Materialize a single-use context shell for this connection's current
+/// identity (principal + active context + session), seeded from the context's
+/// durable L1 state (`context_env` + `context_shell.cwd`).
+///
+/// The instance is throwaway: run exactly one command against it and drop it.
+/// Durable changes flow through `kj context set`, never through this instance's
+/// transient scope — so two callers never see each other's in-flight vars. The
+/// factory hands back a kaish whose session→context map is *isolated* from the
+/// connection's; callers that run context-switching commands (`kj context
+/// switch`, `kj fork`) must read `kaish.context_id()` afterward and write any
+/// change back to the connection's `session_contexts`.
+async fn materialize_context_shell(
+    kernel: &SharedKernelState,
+    connection: &Rc<RefCell<ConnectionState>>,
+) -> Result<EmbeddedKaish, capnp::Error> {
+    let (name, principal, context_id, session_id) = {
+        let conn = connection.borrow();
+        (
+            format!(
+                "{}-{}-{}",
+                kernel.name,
+                conn.principal.username,
+                conn.session_id.short()
+            ),
+            conn.principal.id,
+            conn.require_context()?,
+            conn.session_id,
+        )
+    };
+    let block_source: Arc<dyn kaijutsu_index::BlockSource> =
+        Arc::new(BlockStoreSource(kernel.documents.clone()));
+    kernel
+        .kj_dispatcher
+        .materialize_context_kaish(
+            &name,
+            principal,
+            context_id,
+            session_id,
+            kernel.semantic_index.clone(),
+            block_source,
+        )
+        .await
+        .map_err(|e| capnp::Error::failed(format!("kaish materialization failed: {}", e)))
+}
+
+/// After a materialized shell runs, propagate any in-shell context switch
+/// (`kj context switch` / `kj fork`) back to the connection's shared
+/// `session_contexts`. The materialized shell carries an isolated map, so
+/// without this an in-shell switch would be invisible to subsequent RPCs
+/// (`require_context`). Returns the new context id when a switch occurred.
+fn propagate_context_switch(
+    kaish: &EmbeddedKaish,
+    started_at: ContextId,
+    connection: &Rc<RefCell<ConnectionState>>,
+) -> Option<ContextId> {
+    match kaish.context_id() {
+        Some(new_id) if new_id != started_at => {
+            let conn = connection.borrow();
+            conn.session_contexts.insert(conn.session_id, new_id);
+            Some(new_id)
+        }
+        _ => None,
+    }
+}
+
 async fn execute_shell_command(
     code: &str,
     context_id: ContextId,
@@ -5362,66 +5406,10 @@ async fn execute_shell_command(
     kernel: &SharedKernelState,
     connection: &Rc<RefCell<ConnectionState>>,
 ) -> Result<kaijutsu_crdt::BlockId, capnp::Error> {
-    // Get or create embedded kaish executor with real connection identity
-    let (kaish, newly_created) = {
-        let mut conn = connection.borrow_mut();
-        let was_none = conn.kaish.is_none();
-
-        if was_none {
-            log::info!("Creating embedded kaish for kernel {}", kernel.id.to_hex());
-            let kj_disp = kernel.kj_dispatcher.clone();
-            let kj_principal = conn.principal.id;
-            let session_contexts = conn.session_contexts.clone();
-            match EmbeddedKaish::with_identity_and_db(
-                &format!(
-                    "{}-{}-{}",
-                    kernel.name,
-                    conn.principal.username,
-                    conn.session_id.short()
-                ),
-                kernel.documents.clone(),
-                kernel.kernel.clone(),
-                None,
-                conn.principal.id,
-                conn.require_context()?,
-                conn.session_id,
-                Some(&kernel.kernel_db),
-                session_contexts.clone(),
-                |map, sid, tools| {
-                    let block_source: Arc<dyn kaijutsu_index::BlockSource> =
-                        Arc::new(BlockStoreSource(kernel.documents.clone()));
-                    tools.register(kaijutsu_kernel::runtime::kj_builtin::KjBuiltin::new(
-                        kj_disp,
-                        map,
-                        kj_principal,
-                        sid,
-                        kernel.semantic_index.clone(),
-                        block_source,
-                    ));
-                },
-            ) {
-                Ok(kaish) => {
-                    conn.kaish = Some(Rc::new(kaish));
-                }
-                Err(e) => {
-                    log::error!("Failed to create embedded kaish: {}", e);
-                    return Err(capnp::Error::failed(format!(
-                        "kaish creation failed: {}",
-                        e
-                    )));
-                }
-            }
-        }
-
-        (conn.kaish.as_ref().unwrap().clone(), was_none)
-    };
-
-    // Apply persisted env vars and init_script on first creation.
-    if newly_created {
-        if let Some(ctx_id) = kaish.context_id() {
-            kaish.apply_context_config(&kernel.kernel_db, ctx_id).await;
-        }
-    }
+    // Materialize a single-use context shell seeded from L1 (durable env + cwd).
+    // No caching: transient scope evaporates when this instance drops, so the
+    // context's durable state only ever changes through `kj context set`.
+    let kaish = materialize_context_shell(kernel, connection).await?;
 
     let documents = kernel.documents.clone();
     let kernel_arc = kernel.kernel.clone();
@@ -5499,6 +5487,7 @@ async fn execute_shell_command(
     let output_block_id_clone = output_block_id;
     let command_block_id_clone = command_block_id;
     let block_flows = kernel_arc.block_flows().clone();
+    let connection_switch = connection.clone();
 
     tokio::task::spawn_local(async move {
         // Yield to let the event loop flush BlockInserted events to clients
@@ -5612,12 +5601,15 @@ async fn execute_shell_command(
                     log::error!("Failed to set command block status: {}", e);
                 }
 
-                // Detect context switch (kj fork, kj context switch).
-                // If the kaish session has no active context (e.g. post-leave),
-                // we suppress the event rather than publish a nil sentinel —
-                // subscribers keep their last known good context.
-                if let Some(new_context_id) = kaish.context_id()
-                    && new_context_id != context_id
+                // Detect context switch (kj fork, kj context switch). The
+                // materialized shell carries an isolated session→context map, so
+                // we propagate any switch back to the connection's shared map
+                // (keeps `require_context` correct on later RPCs) and publish for
+                // subscribers. A shell with no active context (e.g. post-leave)
+                // yields None — suppressed rather than published as a nil
+                // sentinel, so subscribers keep their last known good context.
+                if let Some(new_context_id) =
+                    propagate_context_switch(&kaish, context_id, &connection_switch)
                 {
                     log::info!(
                         "shell_execute: context switched {} → {}",
