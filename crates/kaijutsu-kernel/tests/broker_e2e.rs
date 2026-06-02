@@ -198,6 +198,215 @@ async fn tool_search_returns_scored_matches() {
 }
 
 #[tokio::test]
+async fn tool_granular_binding_hides_ungranted_sibling_tools() {
+    // Slice 1 (hide): a binding that grants only `builtin.file:read` must
+    // surface `read` but not its sibling `write` on the same instance.
+    use kaijutsu_kernel::mcp::Capability;
+    let fx = setup().await;
+
+    let mut binding = ContextToolBinding::new();
+    binding.grant(Capability::Tool {
+        instance: InstanceId::new("builtin.file"),
+        tool: "read".into(),
+    });
+    fx.kernel.broker().set_binding(fx.ctx_id, binding).await;
+
+    let call_ctx = CallContext::new(
+        fx.exec_ctx.principal_id,
+        fx.ctx_id,
+        SessionId::new(),
+        KernelId::new(),
+    );
+    let visible = fx
+        .kernel
+        .broker()
+        .list_visible_tools(fx.ctx_id, &call_ctx)
+        .await
+        .expect("list_visible_tools");
+    let names: Vec<&str> = visible.iter().map(|(n, _)| n.as_str()).collect();
+
+    assert!(names.contains(&"read"), "granted tool hidden: {names:?}");
+    assert!(
+        !names.contains(&"write"),
+        "ungranted sibling tool leaked into visible set: {names:?}"
+    );
+    // A tool grant must not pull in the whole instance: block tools are absent.
+    assert!(
+        !names.contains(&"block_create"),
+        "unrelated instance leaked: {names:?}"
+    );
+}
+
+#[tokio::test]
+async fn call_tool_refuses_ungranted_tool_directly() {
+    // Slice 2 (refuse, defense-in-depth): even a caller that names the
+    // (instance, tool) pair directly — bypassing list/resolve — is refused
+    // when the binding is narrowed and does not grant it.
+    use kaijutsu_kernel::mcp::Capability;
+    let fx = setup().await;
+
+    let mut binding = ContextToolBinding::new();
+    binding.grant(Capability::Tool {
+        instance: InstanceId::new("builtin.file"),
+        tool: "read".into(),
+    });
+    fx.kernel.broker().set_binding(fx.ctx_id, binding).await;
+
+    let call_ctx = CallContext::new(
+        fx.exec_ctx.principal_id,
+        fx.ctx_id,
+        SessionId::new(),
+        KernelId::new(),
+    );
+
+    // write is not granted → CapabilityDenied, regardless of args.
+    let denied = fx
+        .kernel
+        .broker()
+        .call_tool(
+            KernelCallParams {
+                instance: InstanceId::new("builtin.file"),
+                tool: "write".into(),
+                arguments: serde_json::json!({"path": "/x", "content": "y"}),
+            },
+            &call_ctx,
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(
+        matches!(&denied, Err(McpError::CapabilityDenied { instance, tool })
+            if instance.as_str() == "builtin.file" && tool == "write"),
+        "expected CapabilityDenied for ungranted write, got {denied:?}"
+    );
+
+    // read IS granted → it passes the capability gate (it may still fail for
+    // unrelated reasons, but it must not be CapabilityDenied).
+    let allowed = fx
+        .kernel
+        .broker()
+        .call_tool(
+            KernelCallParams {
+                instance: InstanceId::new("builtin.file"),
+                tool: "read".into(),
+                arguments: serde_json::json!({"path": "/nonexistent"}),
+            },
+            &call_ctx,
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(
+        !matches!(allowed, Err(McpError::CapabilityDenied { .. })),
+        "granted tool must not be capability-denied"
+    );
+}
+
+#[tokio::test]
+async fn kj_binding_allow_narrows_and_enforces_end_to_end() {
+    // Slice 4 end-to-end: the `kj binding` setter writes the allow-set, and
+    // that same allow-set is enforced at call_tool. This is the rc-native
+    // path (rc `.kai` scripts call `kj binding`) proven against the real
+    // dispatcher + broker, not a mock.
+    use kaijutsu_kernel::block_store::shared_block_store;
+    use kaijutsu_kernel::drift::shared_drift_router;
+    use kaijutsu_kernel::{KjCaller, KjDispatcher, KjResult};
+
+    let fx = setup().await;
+
+    // Build a dispatcher over the fixture's kernel so `kj binding` mutates the
+    // very broker we then inspect. Current-ref (default) resolves to the
+    // caller's context, so no DB rows are needed for the dispatcher's own db.
+    let dispatcher = KjDispatcher::new(
+        shared_drift_router(),
+        shared_block_store(PrincipalId::system()),
+        Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap())),
+        fx.kernel.clone(),
+    );
+    let caller = KjCaller {
+        principal_id: fx.exec_ctx.principal_id,
+        context_id: Some(fx.ctx_id),
+        session_id: SessionId::new(),
+        confirmed: false,
+        rc_depth: 0,
+    };
+
+    let argv: Vec<String> = ["binding", "allow", "builtin.file:read"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let res = dispatcher.dispatch(&argv, &caller).await;
+    assert!(
+        !matches!(res, KjResult::Err(_)),
+        "kj binding allow failed: {res:?}"
+    );
+
+    // The allow-set landed on the broker.
+    let binding = fx
+        .kernel
+        .broker()
+        .binding(&fx.ctx_id)
+        .await
+        .expect("binding written by kj");
+    assert!(binding.allows(&InstanceId::new("builtin.file"), "read"));
+    assert!(!binding.allows(&InstanceId::new("builtin.file"), "write"));
+
+    // And it is enforced: write is refused, read passes the gate.
+    let call_ctx = CallContext::new(
+        fx.exec_ctx.principal_id,
+        fx.ctx_id,
+        SessionId::new(),
+        KernelId::new(),
+    );
+    let denied = fx
+        .kernel
+        .broker()
+        .call_tool(
+            KernelCallParams {
+                instance: InstanceId::new("builtin.file"),
+                tool: "write".into(),
+                arguments: serde_json::json!({"path": "/x", "content": "y"}),
+            },
+            &call_ctx,
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(
+        matches!(denied, Err(McpError::CapabilityDenied { .. })),
+        "kj-set binding must be enforced at call_tool, got {denied:?}"
+    );
+}
+
+#[tokio::test]
+async fn empty_binding_is_permissive_at_call_tool() {
+    // The never-bound sentinel (no grants) is default-permissive: call_tool
+    // must not refuse when no binding has been set. This is what keeps
+    // first-touch contexts and system callers working.
+    let fx = setup().await;
+    let call_ctx = CallContext::new(
+        fx.exec_ctx.principal_id,
+        fx.ctx_id,
+        SessionId::new(),
+        KernelId::new(),
+    );
+    let res = fx
+        .kernel
+        .broker()
+        .call_tool(
+            KernelCallParams {
+                instance: InstanceId::new("builtin.file"),
+                tool: "write".into(),
+                arguments: serde_json::json!({"path": "/tmp/permissive", "content": "ok"}),
+            },
+            &call_ctx,
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(
+        !matches!(res, Err(McpError::CapabilityDenied { .. })),
+        "unbound context must be permissive, got {res:?}"
+    );
+}
+
+#[tokio::test]
 async fn tool_search_no_match_returns_empty() {
     // A query that nothing matches should return success with an empty
     // matches array — not an error, not a missing field.

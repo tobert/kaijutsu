@@ -9,6 +9,7 @@
 //! kernel state and is constructed once per server.
 
 pub mod attach;
+pub mod binding;
 pub mod block;
 pub mod cache;
 pub mod cas;
@@ -21,6 +22,7 @@ pub mod drive;
 pub mod fork;
 pub mod format;
 pub mod parse;
+pub mod policy;
 pub mod preset;
 pub mod rc;
 pub mod lifecycle;
@@ -309,6 +311,16 @@ impl KjDispatcher {
         // run without an active context.
         if cmd == "block" {
             return self.dispatch_block(&argv[1..], caller);
+        }
+        // `kj binding` / `kj policy` take an optional <ctx>/<instance> arg and
+        // default to the active context, so rc scripts (which run with an
+        // active context) and external callers both reach them without a
+        // mandatory join.
+        if cmd == "binding" {
+            return self.dispatch_binding(&argv[1..], caller).await;
+        }
+        if cmd == "policy" {
+            return self.dispatch_policy(&argv[1..], caller).await;
         }
         // `kj search` accepts --context ref or --all, no active context
         // required. Same exemption rationale as `kj block`.

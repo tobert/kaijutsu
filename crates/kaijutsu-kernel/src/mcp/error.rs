@@ -78,6 +78,9 @@ pub enum McpError {
     #[error("denied by hook {by_hook}")]
     Denied { by_hook: HookId },
 
+    #[error("tool `{tool}` on instance {instance} is not in this context's capability allow-set")]
+    CapabilityDenied { instance: InstanceId, tool: String },
+
     #[error("hook recursion depth exceeded ({depth})")]
     HookRecursionLimit { depth: u32 },
 

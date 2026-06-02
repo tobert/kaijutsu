@@ -16,10 +16,40 @@ use super::types::InstanceId;
 /// Resolved tool name → (instance, original tool name).
 pub type ResolvedName = (InstanceId, String);
 
+/// A single capability grant in a context's allow-set. The allow-set is the
+/// positive surface a context may use; default-permissive is expressed as
+/// instance-wide grants (what first-touch seeding writes), while tool-granular
+/// roles (explorer, director) enumerate `Tool`/`Facade` grants.
+///
+/// `Instance` is the coarse grant and stays fresh as an instance registers new
+/// tools; `Tool` pins one tool on one instance; `Facade` names a non-broker
+/// tool surface (`context_shell`, `shell`, `*_input`). Facade *enforcement* is
+/// a kj/RPC-layer follow-up — the broker call path only routes `Instance`/`Tool`
+/// — but the grant is representable here so the setter and persistence are
+/// complete.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub enum Capability {
+    /// Every tool on an instance.
+    Instance(InstanceId),
+    /// A single tool on an instance.
+    Tool { instance: InstanceId, tool: String },
+    /// A facade tool not routed through the broker.
+    Facade(String),
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ContextToolBinding {
-    /// Instance visibility; order is a tiebreaker for name resolution (§4.2).
+    /// Instance-wide grants; order is a tiebreaker for name resolution (§4.2).
     pub allowed_instances: Vec<InstanceId>,
+    /// Tool-granular grants — `(instance, tool)` pairs allowed even when the
+    /// whole instance is not. Lets a role allow `builtin.file:read` without
+    /// `builtin.file:write` (read/write are mixed inside an instance).
+    #[serde(default)]
+    pub allowed_tools: Vec<ResolvedName>,
+    /// Facade grants (`context_shell`, `shell`, `*_input`). Stored and
+    /// persisted; broker-call enforcement is a follow-up (see `Capability`).
+    #[serde(default)]
+    pub allowed_facades: Vec<String>,
     /// Sticky resolved names. Once resolved, the binding preserves the name
     /// until an operator explicitly requalifies.
     pub name_map: HashMap<String, ResolvedName>,
@@ -33,7 +63,53 @@ impl ContextToolBinding {
     pub fn with_instances(instances: Vec<InstanceId>) -> Self {
         Self {
             allowed_instances: instances,
+            allowed_tools: Vec::new(),
+            allowed_facades: Vec::new(),
             name_map: HashMap::new(),
+        }
+    }
+
+    /// True when the binding carries no grants of any kind. This is the
+    /// "never bound" sentinel: callers seed the default-permissive "bind all
+    /// registered instances" only when this holds, so a tool-only role bundle
+    /// (empty `allowed_instances`, populated `allowed_tools`) is *not*
+    /// re-seeded into permissiveness.
+    pub fn is_empty(&self) -> bool {
+        self.allowed_instances.is_empty()
+            && self.allowed_tools.is_empty()
+            && self.allowed_facades.is_empty()
+    }
+
+    /// Add one capability grant (idempotent).
+    pub fn grant(&mut self, cap: Capability) {
+        match cap {
+            Capability::Instance(instance) => self.allow(instance),
+            Capability::Tool { instance, tool } => {
+                let pair = (instance, tool);
+                if !self.allowed_tools.contains(&pair) {
+                    self.allowed_tools.push(pair);
+                }
+            }
+            Capability::Facade(name) => {
+                if !self.allowed_facades.contains(&name) {
+                    self.allowed_facades.push(name);
+                }
+            }
+        }
+    }
+
+    /// Remove one capability grant (idempotent if absent). Revoking an
+    /// instance also drops tool grants and `name_map` entries for it.
+    pub fn revoke_cap(&mut self, cap: &Capability) {
+        match cap {
+            Capability::Instance(instance) => self.revoke(instance),
+            Capability::Tool { instance, tool } => {
+                self.allowed_tools
+                    .retain(|(i, t)| !(i == instance && t == tool));
+                self.name_map
+                    .retain(|_, (i, t)| !(i == instance && t == tool));
+            }
+            Capability::Facade(name) => self.allowed_facades.retain(|f| f != name),
         }
     }
 
@@ -45,11 +121,42 @@ impl ContextToolBinding {
 
     pub fn revoke(&mut self, instance: &InstanceId) {
         self.allowed_instances.retain(|i| i != instance);
+        self.allowed_tools.retain(|(i, _)| i != instance);
         self.name_map.retain(|_, (inst, _)| inst != instance);
     }
 
     pub fn is_allowed(&self, instance: &InstanceId) -> bool {
         self.allowed_instances.contains(instance)
+    }
+
+    /// The single capability predicate both pinch points consult:
+    /// `list_visible_tools` (hide) and `call_tool` (refuse). A `(instance,
+    /// tool)` is allowed if the whole instance is granted or the specific
+    /// tool is granted.
+    pub fn allows(&self, instance: &InstanceId, tool: &str) -> bool {
+        self.allowed_instances.contains(instance)
+            || self
+                .allowed_tools
+                .iter()
+                .any(|(i, t)| i == instance && t == tool)
+    }
+
+    /// True if a facade tool surface is granted (or no facade narrowing is in
+    /// effect). Facade enforcement is not yet wired into a call path.
+    pub fn allows_facade(&self, name: &str) -> bool {
+        self.allowed_facades.iter().any(|f| f == name)
+    }
+
+    /// Every instance referenced by any grant (instance-wide or tool-granular)
+    /// — the set of servers `list_visible_tools` must query.
+    pub fn candidate_instances(&self) -> Vec<InstanceId> {
+        let mut out = self.allowed_instances.clone();
+        for (inst, _) in &self.allowed_tools {
+            if !out.contains(inst) {
+                out.push(inst.clone());
+            }
+        }
+        out
     }
 
     pub fn resolve(&self, visible_name: &str) -> Option<&ResolvedName> {
@@ -108,6 +215,64 @@ mod tests {
         b.revoke(&a);
         assert!(!b.is_allowed(&a));
         assert!(b.is_allowed(&c));
+    }
+
+    #[test]
+    fn allows_matrix_instance_and_tool_grants() {
+        let mut b = ContextToolBinding::new();
+        assert!(b.is_empty(), "fresh binding is the never-bound sentinel");
+
+        // Instance grant allows every tool on that instance.
+        b.grant(Capability::Instance(inst("file")));
+        assert!(b.allows(&inst("file"), "read"));
+        assert!(b.allows(&inst("file"), "write"));
+        assert!(!b.allows(&inst("block"), "read"), "other instance not granted");
+        assert!(!b.is_empty());
+
+        // Tool grant allows only that one tool on the named instance.
+        b.grant(Capability::Tool {
+            instance: inst("block"),
+            tool: "block_read".into(),
+        });
+        assert!(b.allows(&inst("block"), "block_read"));
+        assert!(
+            !b.allows(&inst("block"), "block_edit"),
+            "tool grant must not leak to sibling tools"
+        );
+
+        // Facade grants are a separate axis; allows() (broker path) ignores them.
+        b.grant(Capability::Facade("context_shell".into()));
+        assert!(b.allows_facade("context_shell"));
+        assert!(!b.allows_facade("shell"));
+
+        // candidate_instances unions instance- and tool-granted instances.
+        let mut cands = b.candidate_instances();
+        cands.sort();
+        assert_eq!(cands, vec![inst("block"), inst("file")]);
+    }
+
+    #[test]
+    fn grant_is_idempotent_and_revoke_cap_is_surgical() {
+        let mut b = ContextToolBinding::new();
+        let tool = Capability::Tool {
+            instance: inst("file"),
+            tool: "read".into(),
+        };
+        b.grant(tool.clone());
+        b.grant(tool.clone()); // duplicate
+        assert_eq!(b.allowed_tools.len(), 1, "double-grant duplicated");
+
+        b.grant(Capability::Tool {
+            instance: inst("file"),
+            tool: "write".into(),
+        });
+        b.revoke_cap(&tool);
+        assert!(!b.allows(&inst("file"), "read"));
+        assert!(b.allows(&inst("file"), "write"), "sibling tool grant survives");
+
+        // Revoking the instance drops remaining tool grants for it too.
+        b.revoke(&inst("file"));
+        assert!(b.is_empty(), "revoking instance cleared its tool grants");
     }
 
     #[test]

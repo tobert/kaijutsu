@@ -238,7 +238,7 @@ impl Kernel {
         // with every registered instance so the LLM sees everything.
         let broker = self.broker.clone();
         let binding = match broker.binding(&tool_ctx.context_id).await {
-            Some(b) if !b.allowed_instances.is_empty() => b,
+            Some(b) if !b.is_empty() => b,
             _ => {
                 let instances = broker.list_instances().await;
                 let binding = ContextToolBinding::with_instances(instances);
@@ -369,7 +369,7 @@ impl Kernel {
         if broker
             .binding(&context_id)
             .await
-            .map(|b| b.allowed_instances.is_empty())
+            .map(|b| b.is_empty())
             .unwrap_or(true)
         {
             let instances = broker.list_instances().await;

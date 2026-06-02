@@ -444,6 +444,19 @@ mod tests {
             "fresh context must show no binding",
         );
 
+        // Bind the admin instance first (while the binding is still the
+        // permissive sentinel) so the bindings tool stays callable once the
+        // binding is narrowed — the capability gate refuses any tool not in a
+        // non-empty allow-set, including the admin tool itself.
+        broker
+            .call_tool(
+                call_params("bind", serde_json::json!({ "instance": "builtin.bindings" })),
+                &call_ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
         // Bind "target".
         let result = broker
             .call_tool(
@@ -471,7 +484,10 @@ mod tests {
             .iter()
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
-        assert_eq!(allowed, vec!["target".to_string()]);
+        assert!(
+            allowed.contains(&"target".to_string()),
+            "bind must add target, got {allowed:?}"
+        );
     }
 
     /// `unbind` admin tool removes the instance from the binding.
@@ -492,6 +508,12 @@ mod tests {
             .unwrap();
 
         let ctx_id = ContextId::new();
+        // Keep the admin instance bound so its tool stays callable after we
+        // unbind "target" (the capability gate refuses tools outside a
+        // narrowed allow-set, the admin tool included).
+        broker
+            .bind(ctx_id, InstanceId::new("builtin.bindings"))
+            .await;
         broker.bind(ctx_id, InstanceId::new("target")).await;
         let call_ctx = call_ctx_for(ctx_id);
 
@@ -512,11 +534,16 @@ mod tests {
             )
             .await
             .unwrap();
-        let allowed: &Vec<serde_json::Value> =
-            show.structured.as_ref().unwrap()["allowed_instances"]
-                .as_array()
-                .unwrap();
-        assert!(allowed.is_empty(), "unbind must leave no instances");
+        let allowed: Vec<String> = show.structured.as_ref().unwrap()["allowed_instances"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            !allowed.contains(&"target".to_string()),
+            "unbind must remove target, got {allowed:?}"
+        );
     }
 
     /// `show` on a never-bound context returns empty rather than erroring.

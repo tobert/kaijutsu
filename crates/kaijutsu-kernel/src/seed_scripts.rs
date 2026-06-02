@@ -128,6 +128,56 @@ contexts, `kj block` to inspect the conversation, `kj help` for the rest.
 Prefer `kj` over guessing — it carries structured `--json` output.
 ";
 
+/// The explorer context_type's stance: a read-only role for investigation
+/// without mutation. Pairs with the capability allow-set below — the stance
+/// tells the model what it is; the binding enforces it.
+const EXPLORER_STANCE_BODY: &str = "\
+You are an explorer context: read-only by design. You can read files,
+search blocks, and inspect the kernel, but write/edit/mutate tools are
+withheld — a call to one is refused, not silently dropped. Investigate,
+report findings, and `kj drift` them back to a context that can act.
+";
+
+/// explorer capability allow-set. The first `kj binding allow` narrows this
+/// context from default-permissive to exactly the read-oriented tools
+/// granted here; everything else is refused at `call_tool`. Tokens are
+/// quoted because the kaish lexer special-cases bare words containing
+/// `.`/`:`.
+const EXPLORER_BINDING_BODY: &str = "\
+# explorer: read-only allow-set (capability narrowing).
+kj binding allow \"builtin.file:read\"
+kj binding allow \"builtin.file:glob\"
+kj binding allow \"builtin.file:grep\"
+kj binding allow \"builtin.block:block_read\"
+kj binding allow \"builtin.block:block_list\"
+kj binding allow \"builtin.block:block_search\"
+kj binding allow \"builtin.block:block_status\"
+kj binding allow \"builtin.block:kernel_search\"
+kj binding allow \"builtin.resources\"
+kj binding allow \"builtin.tool_search\"
+kj binding allow \"builtin.kernel_info\"
+";
+
+/// The director context_type's stance: a coordination role that owns block
+/// tooling and binding administration but not raw file writes.
+const DIRECTOR_STANCE_BODY: &str = "\
+You are a director context: you coordinate work across contexts. You hold
+the full block toolset and can administer bindings, plus read access for
+context. Raw file writes are not in your loadout — delegate edits to a
+coder context via `kj fork`/`kj drive` and gather results with `kj drift`.
+";
+
+/// director capability allow-set: full block tooling + read + binding admin.
+const DIRECTOR_BINDING_BODY: &str = "\
+# director: block/coordination allow-set.
+kj binding allow \"builtin.block\"
+kj binding allow \"builtin.file:read\"
+kj binding allow \"builtin.resources\"
+kj binding allow \"builtin.tool_search\"
+kj binding allow \"builtin.kernel_info\"
+kj binding allow \"builtin.bindings\"
+";
+
 const SEED_SCRIPTS: &[SeedScript] = &[
     // ── default context_type — cache recipe only ───────────────────────
     SeedScript {
@@ -235,6 +285,108 @@ const SEED_SCRIPTS: &[SeedScript] = &[
     SeedScript {
         path: "/etc/rc/mcp/drift/S40-cache.kai",
         context_type: "mcp",
+        verb: "drift",
+        sort_key: "S40",
+        name: "cache",
+        extension: "kai",
+        content: CACHE_DRIFT_BODY,
+        timeout_secs: None,
+    },
+    // ── explorer context_type — read-only role (stance + binding + cache) ──
+    SeedScript {
+        path: "/etc/rc/explorer/create/S00-stance.md",
+        context_type: "explorer",
+        verb: "create",
+        sort_key: "S00",
+        name: "stance",
+        extension: "md",
+        content: EXPLORER_STANCE_BODY,
+        timeout_secs: None,
+    },
+    SeedScript {
+        path: "/etc/rc/explorer/create/S10-binding.kai",
+        context_type: "explorer",
+        verb: "create",
+        sort_key: "S10",
+        name: "binding",
+        extension: "kai",
+        content: EXPLORER_BINDING_BODY,
+        timeout_secs: None,
+    },
+    SeedScript {
+        path: "/etc/rc/explorer/create/S20-cache.kai",
+        context_type: "explorer",
+        verb: "create",
+        sort_key: "S20",
+        name: "cache",
+        extension: "kai",
+        content: CACHE_CREATE_BODY,
+        timeout_secs: None,
+    },
+    SeedScript {
+        path: "/etc/rc/explorer/fork/S30-cache.kai",
+        context_type: "explorer",
+        verb: "fork",
+        sort_key: "S30",
+        name: "cache",
+        extension: "kai",
+        content: CACHE_FORK_BODY,
+        timeout_secs: None,
+    },
+    SeedScript {
+        path: "/etc/rc/explorer/drift/S40-cache.kai",
+        context_type: "explorer",
+        verb: "drift",
+        sort_key: "S40",
+        name: "cache",
+        extension: "kai",
+        content: CACHE_DRIFT_BODY,
+        timeout_secs: None,
+    },
+    // ── director context_type — coordination role (stance + binding + cache) ──
+    SeedScript {
+        path: "/etc/rc/director/create/S00-stance.md",
+        context_type: "director",
+        verb: "create",
+        sort_key: "S00",
+        name: "stance",
+        extension: "md",
+        content: DIRECTOR_STANCE_BODY,
+        timeout_secs: None,
+    },
+    SeedScript {
+        path: "/etc/rc/director/create/S10-binding.kai",
+        context_type: "director",
+        verb: "create",
+        sort_key: "S10",
+        name: "binding",
+        extension: "kai",
+        content: DIRECTOR_BINDING_BODY,
+        timeout_secs: None,
+    },
+    SeedScript {
+        path: "/etc/rc/director/create/S20-cache.kai",
+        context_type: "director",
+        verb: "create",
+        sort_key: "S20",
+        name: "cache",
+        extension: "kai",
+        content: CACHE_CREATE_BODY,
+        timeout_secs: None,
+    },
+    SeedScript {
+        path: "/etc/rc/director/fork/S30-cache.kai",
+        context_type: "director",
+        verb: "fork",
+        sort_key: "S30",
+        name: "cache",
+        extension: "kai",
+        content: CACHE_FORK_BODY,
+        timeout_secs: None,
+    },
+    SeedScript {
+        path: "/etc/rc/director/drift/S40-cache.kai",
+        context_type: "director",
         verb: "drift",
         sort_key: "S40",
         name: "cache",

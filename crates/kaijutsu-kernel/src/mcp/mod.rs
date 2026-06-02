@@ -18,7 +18,7 @@ pub mod server_like;
 pub mod servers;
 pub mod types;
 
-pub use binding::{ContextToolBinding, ResolvedName};
+pub use binding::{Capability, ContextToolBinding, ResolvedName};
 pub use broker::Broker;
 pub use coalescer::{CoalescePolicy, NotificationCoalescer};
 pub use context::{CallContext, TraceContext};

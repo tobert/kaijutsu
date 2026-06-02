@@ -445,6 +445,25 @@ CREATE TABLE IF NOT EXISTS context_binding_names (
 CREATE INDEX IF NOT EXISTS idx_binding_names_target
     ON context_binding_names(context_id, instance_id, original_tool);
 
+-- Tool-granular grants (Vec<(InstanceId, tool)>) — tools allowed even when the
+-- whole instance is not bound. order_idx preserves insertion order.
+CREATE TABLE IF NOT EXISTS context_binding_tools (
+    context_id    BLOB    NOT NULL REFERENCES context_bindings(context_id) ON DELETE CASCADE,
+    instance_id   TEXT    NOT NULL,
+    original_tool TEXT    NOT NULL,
+    order_idx     INTEGER NOT NULL,
+    PRIMARY KEY (context_id, instance_id, original_tool)
+);
+
+-- Facade grants (Vec<String>) — non-broker tool surfaces (context_shell,
+-- shell, *_input). order_idx preserves insertion order.
+CREATE TABLE IF NOT EXISTS context_binding_facades (
+    context_id BLOB    NOT NULL REFERENCES context_bindings(context_id) ON DELETE CASCADE,
+    facade_id  TEXT    NOT NULL,
+    order_idx  INTEGER NOT NULL,
+    PRIMARY KEY (context_id, facade_id)
+);
+
 CREATE TABLE IF NOT EXISTS context_env (
     context_id BLOB NOT NULL REFERENCES contexts(context_id) ON DELETE CASCADE,
     key        TEXT NOT NULL,
@@ -2278,6 +2297,14 @@ impl KernelDb {
             "DELETE FROM context_binding_names WHERE context_id = ?1",
             params![blob_param(context_id.as_bytes())],
         )?;
+        tx.execute(
+            "DELETE FROM context_binding_tools WHERE context_id = ?1",
+            params![blob_param(context_id.as_bytes())],
+        )?;
+        tx.execute(
+            "DELETE FROM context_binding_facades WHERE context_id = ?1",
+            params![blob_param(context_id.as_bytes())],
+        )?;
         for (idx, instance) in binding.allowed_instances.iter().enumerate() {
             tx.execute(
                 "INSERT INTO context_binding_instances (context_id, instance_id, order_idx)
@@ -2287,6 +2314,26 @@ impl KernelDb {
                     instance.as_str(),
                     idx as i64,
                 ],
+            )?;
+        }
+        for (idx, (instance, tool)) in binding.allowed_tools.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO context_binding_tools
+                     (context_id, instance_id, original_tool, order_idx)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    blob_param(context_id.as_bytes()),
+                    instance.as_str(),
+                    tool,
+                    idx as i64,
+                ],
+            )?;
+        }
+        for (idx, facade) in binding.allowed_facades.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO context_binding_facades (context_id, facade_id, order_idx)
+                 VALUES (?1, ?2, ?3)",
+                params![blob_param(context_id.as_bytes()), facade, idx as i64],
             )?;
         }
         for (visible_name, (instance, tool)) in &binding.name_map {
@@ -2343,6 +2390,42 @@ impl KernelDb {
         };
         allowed_instances.shrink_to_fit();
 
+        let mut allowed_tools: Vec<(InstanceId, String)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT instance_id, original_tool FROM context_binding_tools
+                 WHERE context_id = ?1
+                 ORDER BY order_idx ASC",
+            )?;
+            let rows = stmt.query_map(params![blob_param(context_id.as_bytes())], |row| {
+                let inst: String = row.get(0)?;
+                let tool: String = row.get(1)?;
+                Ok((InstanceId::new(inst), tool))
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            out
+        };
+        allowed_tools.shrink_to_fit();
+
+        let mut allowed_facades: Vec<String> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT facade_id FROM context_binding_facades
+                 WHERE context_id = ?1
+                 ORDER BY order_idx ASC",
+            )?;
+            let rows = stmt.query_map(params![blob_param(context_id.as_bytes())], |row| {
+                row.get::<_, String>(0)
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            out
+        };
+        allowed_facades.shrink_to_fit();
+
         let mut name_map = std::collections::HashMap::new();
         {
             let mut stmt = self.conn.prepare(
@@ -2364,6 +2447,8 @@ impl KernelDb {
 
         Ok(Some(ContextToolBinding {
             allowed_instances,
+            allowed_tools,
+            allowed_facades,
             name_map,
         }))
     }
@@ -3999,6 +4084,48 @@ mod tests {
             loaded.name_map.get("consult").unwrap(),
             &(InstanceId::new("external.gpal"), "consult_gemini".into())
         );
+    }
+
+    #[test]
+    fn context_binding_roundtrip_preserves_tool_and_facade_grants() {
+        use crate::mcp::Capability;
+        let mut db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("binding-caps"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+
+        // A tool-granular role bundle: no instance-wide grants, just specific
+        // tools plus a facade. This is the explorer shape (slice 5).
+        let mut original = ContextToolBinding::new();
+        original.grant(Capability::Tool {
+            instance: InstanceId::new("builtin.file"),
+            tool: "read".into(),
+        });
+        original.grant(Capability::Tool {
+            instance: InstanceId::new("builtin.file"),
+            tool: "grep".into(),
+        });
+        original.grant(Capability::Facade("context_shell".into()));
+        db.upsert_context_binding(ctx.context_id, &original).unwrap();
+
+        let loaded = db
+            .get_context_binding(ctx.context_id)
+            .unwrap()
+            .expect("binding should exist after upsert");
+
+        assert!(
+            loaded.allowed_instances.is_empty(),
+            "no instance-wide grants were written"
+        );
+        assert!(!loaded.is_empty(), "tool/facade grants make it non-empty");
+        assert_eq!(loaded.allowed_tools.len(), 2, "both tool grants survived");
+        assert!(loaded.allows(&InstanceId::new("builtin.file"), "read"));
+        assert!(loaded.allows(&InstanceId::new("builtin.file"), "grep"));
+        assert!(
+            !loaded.allows(&InstanceId::new("builtin.file"), "write"),
+            "ungranted sibling tool stays denied across restart"
+        );
+        assert_eq!(loaded.allowed_facades, vec!["context_shell".to_string()]);
     }
 
     #[test]

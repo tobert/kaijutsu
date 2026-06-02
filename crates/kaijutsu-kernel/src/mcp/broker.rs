@@ -776,10 +776,12 @@ impl Broker {
     ) -> HashSet<(InstanceId, String)> {
         let snapshots = self.tool_snapshots.lock().await;
         let mut pairs = HashSet::new();
-        for instance in &binding.allowed_instances {
+        for instance in &binding.candidate_instances() {
             if let Some(tools) = snapshots.get(instance) {
                 for kt in tools {
-                    pairs.insert((instance.clone(), kt.name.clone()));
+                    if binding.allows(instance, &kt.name) {
+                        pairs.insert((instance.clone(), kt.name.clone()));
+                    }
                 }
             }
         }
@@ -1026,20 +1028,29 @@ impl Broker {
             let guard = self.bindings.read().await;
             guard.get(&context_id).cloned().unwrap_or_default()
         };
+        // Candidate servers span every instance referenced by a grant —
+        // instance-wide *or* tool-granular — so a context that was granted a
+        // single `instance:tool` still has that instance's server queried.
         let servers: Vec<Arc<dyn McpServerLike>> = {
             let guard = self.instances.read().await;
             binding
-                .allowed_instances
+                .candidate_instances()
                 .iter()
                 .filter_map(|id| guard.get(id).cloned())
                 .collect()
         };
 
-        // Gather advertised tools from allowed instances.
+        // Gather advertised tools, keeping only those the binding allows.
+        // For a pure instance grant `allows()` is true for every tool (same
+        // surface as before); a tool grant narrows to the named tool.
         let mut all: Vec<KernelTool> = Vec::new();
         for server in servers {
             let tools = server.list_tools(ctx).await?;
-            all.extend(tools);
+            all.extend(
+                tools
+                    .into_iter()
+                    .filter(|kt| binding.allows(&kt.instance, &kt.name)),
+            );
         }
 
         // Phase 5 (D-56): apply `ListTools` hook filter before resolution
@@ -1145,6 +1156,23 @@ impl Broker {
                 .cloned()
                 .ok_or_else(|| McpError::InstanceNotFound(params.instance.clone()))?
         };
+
+        // Capability refuse (defense-in-depth). `list_visible_tools` already
+        // hides un-granted tools from the in-kernel model, but `call_tool` is
+        // also reachable by anything that can name an `(instance, tool)` pair
+        // directly (external agents, hook `Invoke` bodies). Enforce the same
+        // allow-set here so both drivers converge on one policy. An absent or
+        // empty binding is the never-bound / default-permissive sentinel —
+        // refuse only once a binding has been explicitly narrowed.
+        if let Some(binding) = self.binding(&ctx.context_id).await
+            && !binding.is_empty()
+            && !binding.allows(&params.instance, &params.tool)
+        {
+            return Err(McpError::CapabilityDenied {
+                instance: params.instance.clone(),
+                tool: params.tool.clone(),
+            });
+        }
 
         let policy = self
             .policies
@@ -2028,6 +2056,10 @@ fn error_to_hook_json(e: &McpError) -> String {
         McpError::Denied { by_hook } => (
             "Denied",
             serde_json::json!({"by_hook": by_hook.to_string()}),
+        ),
+        McpError::CapabilityDenied { instance, tool } => (
+            "CapabilityDenied",
+            serde_json::json!({"instance": instance.as_str(), "tool": tool}),
         ),
         McpError::HookRecursionLimit { depth } => (
             "HookRecursionLimit",
