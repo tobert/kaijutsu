@@ -376,6 +376,65 @@ async fn kj_binding_allow_narrows_and_enforces_end_to_end() {
 }
 
 #[tokio::test]
+async fn check_facade_refuses_only_when_narrowed_and_ungranted() {
+    use kaijutsu_kernel::mcp::Capability;
+    let fx = setup().await;
+    let broker = fx.kernel.broker();
+
+    // Never-bound context: facade-permissive.
+    assert!(broker.check_facade(&fx.ctx_id, "context_shell").await.is_ok());
+
+    // Narrow to a tool grant with no facades → facades refused.
+    let mut b = ContextToolBinding::new();
+    b.grant(Capability::Tool {
+        instance: InstanceId::new("builtin.file"),
+        tool: "read".into(),
+    });
+    broker.set_binding(fx.ctx_id, b).await;
+    assert!(
+        matches!(
+            broker.check_facade(&fx.ctx_id, "context_shell").await,
+            Err(McpError::FacadeDenied { .. })
+        ),
+        "narrowed binding without the facade must refuse"
+    );
+
+    // Grant just that facade → it passes, siblings still refused.
+    let mut b2 = broker.binding(&fx.ctx_id).await.unwrap();
+    b2.grant(Capability::Facade("context_shell".into()));
+    broker.set_binding(fx.ctx_id, b2).await;
+    assert!(broker.check_facade(&fx.ctx_id, "context_shell").await.is_ok());
+    assert!(
+        matches!(
+            broker.check_facade(&fx.ctx_id, "submit_input").await,
+            Err(McpError::FacadeDenied { .. })
+        ),
+        "ungranted sibling facade still refused"
+    );
+}
+
+#[tokio::test]
+async fn first_touch_seeding_is_facade_permissive() {
+    // Regression guard for the default-permissive trap: first-touch seeding
+    // makes the binding non-empty (all instances), and must ALSO seed facades
+    // — otherwise a plain mcp agent's context_shell would start getting
+    // refused the moment the in-kernel model touched one broker tool.
+    let fx = setup().await;
+    let _ = fx
+        .kernel
+        .list_tool_defs_via_broker(fx.ctx_id, fx.exec_ctx.principal_id)
+        .await;
+    let binding = fx.kernel.broker().binding(&fx.ctx_id).await.expect("seeded");
+    assert!(!binding.is_empty(), "first-touch seeded a non-empty binding");
+    for facade in ["context_shell", "shell", "submit_input", "read_input"] {
+        assert!(
+            fx.kernel.broker().check_facade(&fx.ctx_id, facade).await.is_ok(),
+            "first-touch seed must leave {facade} permissive"
+        );
+    }
+}
+
+#[tokio::test]
 async fn empty_binding_is_permissive_at_call_tool() {
     // The never-bound sentinel (no grants) is default-permissive: call_tool
     // must not refuse when no binding has been set. This is what keeps

@@ -81,6 +81,9 @@ pub enum McpError {
     #[error("tool `{tool}` on instance {instance} is not in this context's capability allow-set")]
     CapabilityDenied { instance: InstanceId, tool: String },
 
+    #[error("facade `{facade}` is not in this context's capability allow-set")]
+    FacadeDenied { facade: String },
+
     #[error("hook recursion depth exceeded ({depth})")]
     HookRecursionLimit { depth: u32 },
 

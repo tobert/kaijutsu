@@ -517,6 +517,28 @@ impl KaijutsuMcp {
         }
     }
 
+    /// Facade capability gate for the external-agent boundary. Returns
+    /// `Some(error_envelope)` to short-circuit the handler when the context's
+    /// allow-set withholds `facade`, `None` to proceed.
+    ///
+    /// Fails closed: a check that errors *denies* — a mutating facade
+    /// (`context_shell`, `submit_input`, …) must not slip through on a
+    /// transient RPC failure (silent fallbacks are a mistake). Enforced on the
+    /// Remote backend only; the Local (in-process) backend is the trusted
+    /// embedding and has no kernel broker handle here.
+    async fn facade_denied(
+        &self,
+        actor: &ActorHandle,
+        ctx_id: ContextId,
+        facade: &str,
+    ) -> Option<String> {
+        match actor.check_facade(ctx_id, facade).await {
+            Ok((true, _)) => None,
+            Ok((false, reason)) => Some(format!("Error: {reason}")),
+            Err(e) => Some(format!("Error: facade capability check failed: {e}")),
+        }
+    }
+
     /// Resolve a user-provided context query (label or hex prefix) to a ContextId.
     async fn resolve_context(
         &self,
@@ -769,6 +791,9 @@ impl KaijutsuMcp {
             Some(r) => r,
             None => return "Error: shell requires --connect to server".to_string(),
         };
+        if let Some(denied) = self.facade_denied(actor, ctx_id, "shell").await {
+            return denied;
+        }
 
         // Execute command — creates ToolCall + ToolResult blocks in the document.
         // The output block starts as Status::Running and transitions to Done/Error
@@ -814,6 +839,9 @@ impl KaijutsuMcp {
             Some(r) => r,
             None => return "Error: shell requires --connect to server".to_string(),
         };
+        if let Some(denied) = self.facade_denied(actor, ctx_id, "context_shell").await {
+            return denied;
+        }
 
         let cmd_block_id = match actor.shell_execute(&req.command, ctx_id, false).await {
             Ok(id) => id,
@@ -1094,16 +1122,23 @@ impl KaijutsuMcp {
                     Err(e) => format!("Error: {}", e),
                 }
             }
-            Backend::Remote(remote) => match remote.actor.get_input_state(ctx_id).await {
-                Ok(state) => serde_json::json!({
-                    "context_id": ctx_id.short(),
-                    "content": state.content,
-                    "length": state.content.len(),
-                    "version": state.version,
-                })
-                .to_string(),
-                Err(e) => format!("Error: {}", e),
-            },
+            Backend::Remote(remote) => {
+                if let Some(denied) =
+                    self.facade_denied(&remote.actor, ctx_id, "read_input").await
+                {
+                    return denied;
+                }
+                match remote.actor.get_input_state(ctx_id).await {
+                    Ok(state) => serde_json::json!({
+                        "context_id": ctx_id.short(),
+                        "content": state.content,
+                        "length": state.content.len(),
+                        "version": state.version,
+                    })
+                    .to_string(),
+                    Err(e) => format!("Error: {}", e),
+                }
+            }
         }
     }
 
@@ -1137,6 +1172,11 @@ impl KaijutsuMcp {
                 .to_string()
             }
             Backend::Remote(remote) => {
+                if let Some(denied) =
+                    self.facade_denied(&remote.actor, ctx_id, "write_input").await
+                {
+                    return denied;
+                }
                 // Get current state to know how much to delete
                 let current_len = match remote.actor.get_input_state(ctx_id).await {
                     Ok(state) => state.content.len() as u64,
@@ -1190,6 +1230,11 @@ impl KaijutsuMcp {
                 }
             }
             Backend::Remote(remote) => {
+                if let Some(denied) =
+                    self.facade_denied(&remote.actor, ctx_id, "edit_input").await
+                {
+                    return denied;
+                }
                 match remote
                     .actor
                     .edit_input(ctx_id, req.pos, &req.insert, req.delete)
@@ -1224,6 +1269,11 @@ impl KaijutsuMcp {
                 "Error: submit_input requires --connect to kaijutsu-server".to_string()
             }
             Backend::Remote(remote) => {
+                if let Some(denied) =
+                    self.facade_denied(&remote.actor, ctx_id, "submit_input").await
+                {
+                    return denied;
+                }
                 let is_shell = req.mode.as_deref() == Some("shell");
                 match remote.actor.submit_input(ctx_id, is_shell).await {
                     Ok(result) => serde_json::json!({

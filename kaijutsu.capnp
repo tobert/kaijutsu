@@ -1138,6 +1138,17 @@ interface Kernel {
   # Handler must not take any per-context locks — this exists to detect
   # liveness, not to validate kernel state.
   ping @84 (trace :TraceContext) -> (kernelId :Data, serverTimeMs :UInt64);
+
+  # Capability gate for facade tools (context_shell, shell, *_input) — the
+  # non-broker-routed surface the external agent reaches over RPC. The MCP
+  # handler calls this before dispatching the real facade RPC, passing the
+  # exact facade name it implements. `allowed = false` means the context's
+  # capability allow-set has been narrowed and does not grant the facade
+  # (`reason` carries a human-readable note). A never-bound / permissive
+  # context returns `allowed = true`. Enforced at the agent boundary, not
+  # the broker call path; humans drive the input/shell RPCs directly and
+  # never traverse this gate.
+  checkFacade @85 (contextId :Data, facade :Text, trace :TraceContext) -> (allowed :Bool, reason :Text);
 }
 
 # A staged drift that exceeded its retry budget or whose target dropped

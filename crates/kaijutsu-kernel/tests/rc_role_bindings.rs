@@ -90,6 +90,15 @@ async fn create_typed(h: &Harness, label: &str, context_type: &str) -> kaijutsu_
         .unwrap_or_else(|e| panic!("context '{label}' not found: {e}"))
 }
 
+/// Thin wrapper so the facade assertions read cleanly.
+async fn fx_broker_check(
+    h: &Harness,
+    ctx: &kaijutsu_types::ContextId,
+    facade: &str,
+) -> Result<(), McpError> {
+    h.kernel.broker().check_facade(ctx, facade).await
+}
+
 #[tokio::test]
 async fn explorer_role_seeds_readonly_allow_set_and_refuses_writes() {
     let h = harness().await;
@@ -124,6 +133,27 @@ async fn explorer_role_seeds_readonly_allow_set_and_refuses_writes() {
     assert!(
         !binding.allows(&block, "block_create"),
         "explorer must NOT allow block_create"
+    );
+
+    // Facades: read the compose buffer, but no shell / write / submit.
+    assert!(
+        binding.allows_facade("read_input"),
+        "explorer should allow read_input facade"
+    );
+    assert!(
+        !binding.allows_facade("context_shell"),
+        "explorer must NOT allow context_shell facade"
+    );
+    assert!(
+        fx_broker_check(&h, &ctx, "read_input").await.is_ok(),
+        "explorer read_input facade should pass the gate"
+    );
+    assert!(
+        matches!(
+            fx_broker_check(&h, &ctx, "context_shell").await,
+            Err(McpError::FacadeDenied { .. })
+        ),
+        "explorer context_shell facade must be refused"
     );
 
     // Enforced at the call path: a write is refused, not silently dropped.
@@ -173,4 +203,23 @@ async fn director_role_seeds_block_tooling_but_not_file_writes() {
         !binding.allows(&file, "write"),
         "director must NOT allow file write"
     );
+
+    // Facades: director gets the full interaction surface (all 6).
+    for facade in [
+        "shell",
+        "context_shell",
+        "read_input",
+        "write_input",
+        "edit_input",
+        "submit_input",
+    ] {
+        assert!(
+            binding.allows_facade(facade),
+            "director should allow facade {facade}"
+        );
+        assert!(
+            fx_broker_check(&h, &ctx, facade).await.is_ok(),
+            "director facade {facade} should pass the gate"
+        );
+    }
 }

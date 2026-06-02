@@ -1014,6 +1014,25 @@ impl Broker {
         }
     }
 
+    /// Capability gate for facade tools (`context_shell`, `shell`, `*_input`)
+    /// — the non-broker-routed surface the external agent reaches over RPC.
+    /// Mirrors the `Instance`/`Tool` refusal in `call_tool`: an absent or
+    /// empty binding is the never-bound / default-permissive sentinel, so a
+    /// facade is refused only once a binding has been explicitly narrowed and
+    /// does not grant it. Called from the MCP/RPC agent boundary, not the
+    /// broker call path (facades never enter `call_tool`).
+    pub async fn check_facade(&self, context_id: &ContextId, facade: &str) -> McpResult<()> {
+        if let Some(binding) = self.binding(context_id).await
+            && !binding.is_empty()
+            && !binding.allows_facade(facade)
+        {
+            return Err(McpError::FacadeDenied {
+                facade: facade.to_string(),
+            });
+        }
+        Ok(())
+    }
+
     /// Compute the visible tool list for `context_id` by walking the
     /// binding's `allowed_instances` and applying sticky `Auto` resolution
     /// (D-20). Updates the sticky `name_map` side-effectfully with
@@ -2060,6 +2079,10 @@ fn error_to_hook_json(e: &McpError) -> String {
         McpError::CapabilityDenied { instance, tool } => (
             "CapabilityDenied",
             serde_json::json!({"instance": instance.as_str(), "tool": tool}),
+        ),
+        McpError::FacadeDenied { facade } => (
+            "FacadeDenied",
+            serde_json::json!({"facade": facade}),
         ),
         McpError::HookRecursionLimit { depth } => (
             "HookRecursionLimit",

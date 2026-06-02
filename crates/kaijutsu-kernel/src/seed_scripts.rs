@@ -156,6 +156,8 @@ kj binding allow \"builtin.block:kernel_search\"
 kj binding allow \"builtin.resources\"
 kj binding allow \"builtin.tool_search\"
 kj binding allow \"builtin.kernel_info\"
+# Facades: read the compose buffer, but no shell / write / submit.
+kj binding allow \"facade:read_input\"
 ";
 
 /// The director context_type's stance: a coordination role that owns block
@@ -176,6 +178,13 @@ kj binding allow \"builtin.resources\"
 kj binding allow \"builtin.tool_search\"
 kj binding allow \"builtin.kernel_info\"
 kj binding allow \"builtin.bindings\"
+# Facades: full interaction surface (shell + compose buffer + submit).
+kj binding allow \"facade:shell\"
+kj binding allow \"facade:context_shell\"
+kj binding allow \"facade:read_input\"
+kj binding allow \"facade:write_input\"
+kj binding allow \"facade:edit_input\"
+kj binding allow \"facade:submit_input\"
 ";
 
 const SEED_SCRIPTS: &[SeedScript] = &[

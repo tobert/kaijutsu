@@ -5200,6 +5200,36 @@ impl kernel::Server for KernelImpl {
         r.set_server_time_ms(now_ms);
         Promise::ok(())
     }
+
+    fn check_facade(
+        self: Rc<Self>,
+        params: kernel::CheckFacadeParams,
+        mut results: kernel::CheckFacadeResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let _span = extract_rpc_trace(p.get_trace(), "check_facade").entered();
+        let context_id = pry!(
+            ContextId::try_from_slice(pry!(p.get_context_id()))
+                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
+        );
+        let facade = pry!(pry!(p.get_facade()).to_str()).to_owned();
+        let kernel = self.kernel.kernel.clone();
+
+        Promise::from_future(async move {
+            let mut r = results.get();
+            match kernel.broker().check_facade(&context_id, &facade).await {
+                Ok(()) => {
+                    r.set_allowed(true);
+                    r.set_reason("");
+                }
+                Err(e) => {
+                    r.set_allowed(false);
+                    r.set_reason(&e.to_string());
+                }
+            }
+            Ok(())
+        })
+    }
 }
 
 // ============================================================================

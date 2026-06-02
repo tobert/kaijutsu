@@ -39,9 +39,7 @@ following are explicit follow-ups that did not ship:
   rendering.
 - **MCP `progress` → `StreamingBlockHandle` bridge.** External streaming
   tools wired the same way virtual tools will be.
-- **Per-principal budgets + fair queuing.** Adjacent to the now-shipped
-  `builtin.policy` get/set surface; per-principal accounting is the
-  next layer up.
+- TODO: add some kaish variant tools like a read-only explorer kaish. maybe restrict it to a project and hide the system and ~ better? needs some design work but it's a goal down the road
 
 ## Context-type tool policy (unified governance)
 
@@ -83,12 +81,29 @@ Shipped (Phase 2): the capability allow-set landed.
   (block/coordination) context_types seeded in `seed_scripts.rs`; their
   `S10-binding.kai` narrows the new context at create time.
 
+Shipped (Phase 3): facade enforcement at the agent boundary.
+- **`Facade` capabilities are now enforced.** `KNOWN_FACADES` = `shell`,
+  `context_shell`, `read_input`, `write_input`, `edit_input`,
+  `submit_input`. `broker.check_facade(context_id, facade)` mirrors the
+  `call_tool` gate (refuse only once narrowed → `McpError::FacadeDenied`).
+- **Enforced at the MCP agent boundary**, not the broker call path
+  (facades never enter `call_tool`): a new `checkFacade @85` RPC, called by
+  each facade handler in `kaijutsu-mcp` before it dispatches. The human app
+  drives `editInput`/`shellExecute` directly and never traverses this gate,
+  so live compose typing is unaffected. Fails closed (a check error denies).
+- **Default-permissive on the facade axis too.** First-touch seeding now
+  uses `ContextToolBinding::permissive()` (all instances **+** all known
+  facades), so a plain `mcp` agent keeps `context_shell` after the in-kernel
+  model touches a broker tool. Regression-guarded.
+- **Role facades.** explorer grants `facade:read_input` only; director
+  grants all six. Granularity is wire-observable: `shell`/`context_shell`
+  and `write_input`/`edit_input` are separately grantable because the MCP
+  handler passes its exact tool name to `checkFacade`.
+- **Local (in-process) MCP backend is unenforced by design** — the trusted
+  embedding has no broker handle at the handler; only the Remote
+  (over-SSH external agent) path is gated.
+
 Remaining:
-- **Facade enforcement at the call path.** The `Facade` capability is
-  represented, granted, and persisted, but `context_shell`/`shell`/`*_input`
-  are not broker-routed, so `call_tool` only enforces `Instance`/`Tool`.
-  Wire facade refusal at the kj/RPC facade layer (the original "refuse at
-  the `kj`/kaish layer" framing) so a role can withhold shell/input too.
 - **Dynamic / principal-scoped overrides.** The allow-set is the static
   per-context_type loadout; the `ListTools`/`Deny` hook layer (D-56)
   remains the place for dynamic, principal-matched denies layered on top.
@@ -227,7 +242,50 @@ Holographic shader trio + entry animation shipped. Open:
 - **kj CLI binary.** Standalone `kj` for headless scripting; thin
   adapter over `KjDispatcher`.
 - **Distill model selection.** `formation_edges`-style `auto_distill`
-  defaults to the source context's model (potentially Opus). Add a
+  d● I dug into the actual current lexer (crates/kaish-kernel/src/lexer.rs) rather than trusting the note. Here's what's real and what isn't.
+
+  The note is partly outdated / conflated
+
+  The specific claim — that builtin.file:read needs defensive quoting because of ./ quirks — is not accurate. Those are two unrelated things, and the
+  colon-bearing tool name lexes cleanly:
+
+  `builtin.file:read`           => Ident("builtin.file:read")          ✅ single token
+  `builtin.file:read ./foo.txt` => Ident("builtin.file:read") | DotSlashPath("./foo.txt")  ✅
+
+  The : in builtin.file:read is handled by the lexer's colon-merge pass (merge_colon_adjacent), which fuses span-adjacent Ident : Ident runs into one
+  Ident. So host:port, a:b, and builtin.file:read all come out as single identifiers. No quoting needed.
+
+  Also worth noting: the memories that note points at don't actually cover this. lang_argv_barewords is about digit-leading (019dda1c) and dot-prefixed
+  (.gitignore) barewords; gotcha_comment_arithmetic_preprocessor is about #-comments leaking into the arithmetic preprocessor. Neither is about : in tool
+  names or ./ paths. The note's "per the gotcha memories" citation is loose.
+
+  There are two genuine ./ / : edge cases (so quoting isn't pointless)
+
+  These are real and worth knowing — defensive quoting genuinely sidesteps them:
+
+  `./`           => Dot | Path("/")        ⚠️  bare "./" splits — and Dot is the POSIX source alias
+  `./file:1`     => DotSlashPath("./file") | Ident(":1")   ⚠️  colon after a path does NOT merge
+  `./a/b:c`      => DotSlashPath("./a/b")  | Ident(":c")    ⚠️  same
+
+  Two distinct quirks:
+
+  1. Bare ./ matches no DotSlashPath regex (it requires \./[a-zA-Z0-9_./-]+ — at least one char after the slash), so it falls back to Dot + Path("/").
+  The Dot is the same token used for the . file source alias, so a lone ./ is genuinely ambiguous.
+  2. Colon-after-path doesn't merge. DotSlashPath is a Path-category token, and the colon-merge pass only fuses idents/numbers/dotted-idents — not
+  DotSlashPath. So ./file:1 (e.g. a path:line reference) splits the :1 off.
+
+  Quoting fixes both — './', "./file:1", "./a/b:c" all become a single string token.
+
+  Bottom line for the kaijutsu note
+
+  - For builtin.file:read specifically: quoting is unnecessary but harmless. The tool name is one clean Ident either way.
+  - For the path arguments you pass alongside it (./foo, especially anything with a trailing bare ./ or an embedded : like path:line): quoting is
+  genuinely useful and a reasonable defensive default.
+
+  So I'd reword the note from "the lexer has known quirks with ./:" (which reads as if builtin.file:read is the risky part) to something like: "tool
+  names with : lex fine; I quote the path args because bare ./ and path:line-style colons can split."
+
+  Want me to update the kaijutsu note, or capture a corrected lang_colon_dotslash_lexing memory here so this doesn't get re-confused next time?efaults to the source context's model (potentially Opus). Add a
   `distill_model` knob so cheap models can do summarization.
 - **POSIX context quartet.** The frame for autonomy is four verbs
   mirroring POSIX process control: `fork` (snapshot), `drive` (clock one

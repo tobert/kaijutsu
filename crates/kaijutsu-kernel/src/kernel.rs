@@ -241,7 +241,7 @@ impl Kernel {
             Some(b) if !b.is_empty() => b,
             _ => {
                 let instances = broker.list_instances().await;
-                let binding = ContextToolBinding::with_instances(instances);
+                let binding = ContextToolBinding::permissive(instances);
                 broker.set_binding(tool_ctx.context_id, binding).await;
                 // Kick the resolver so `name_map` populates.
                 let seed_ctx = CallContext::new(
@@ -374,7 +374,7 @@ impl Kernel {
         {
             let instances = broker.list_instances().await;
             broker
-                .set_binding(context_id, ContextToolBinding::with_instances(instances))
+                .set_binding(context_id, ContextToolBinding::permissive(instances))
                 .await;
         }
         let ctx = CallContext::new(

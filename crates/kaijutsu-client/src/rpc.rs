@@ -1423,6 +1423,29 @@ impl KernelHandle {
         })
     }
 
+    /// Ask the kernel whether `facade` is in this context's capability
+    /// allow-set. Returns `(allowed, reason)`. The MCP agent boundary calls
+    /// this before dispatching a facade tool (`context_shell`, `*_input`).
+    #[tracing::instrument(skip(self), name = "rpc_client.check_facade")]
+    pub async fn check_facade(
+        &self,
+        context_id: ContextId,
+        facade: &str,
+    ) -> Result<(bool, String), RpcError> {
+        let mut request = self.kernel.check_facade_request();
+        request.get().set_context_id(context_id.as_bytes());
+        request.get().set_facade(facade);
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        let response = request.send().promise.await?;
+        let result = response.get()?;
+        Ok((result.get_allowed(), result.get_reason()?.to_string()?))
+    }
+
     /// Push raw CRDT operations to the input document.
     ///
     /// For CRDT-aware clients that maintain their own DTE document.

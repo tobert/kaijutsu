@@ -16,6 +16,26 @@ use super::types::InstanceId;
 /// Resolved tool name → (instance, original tool name).
 pub type ResolvedName = (InstanceId, String);
 
+/// The facade tool surfaces a context can be granted. These are the
+/// non-broker-routed tools the external agent reaches over RPC — they don't
+/// pass through `broker.call_tool`, so they're enforced at the MCP/RPC agent
+/// boundary (`broker.check_facade`) rather than the broker call path.
+///
+/// `shell`/`context_shell` and `write_input`/`edit_input` are listed
+/// separately on purpose: they are distinct *tool surfaces* even where the
+/// underlying RPC coincides, so a role can grant one without the other.
+/// First-touch seeding grants this whole set so default-permissive covers the
+/// facade axis too (otherwise a context that became non-empty by touching one
+/// broker tool would start refusing `context_shell`).
+pub const KNOWN_FACADES: &[&str] = &[
+    "shell",
+    "context_shell",
+    "read_input",
+    "write_input",
+    "edit_input",
+    "submit_input",
+];
+
 /// A single capability grant in a context's allow-set. The allow-set is the
 /// positive surface a context may use; default-permissive is expressed as
 /// instance-wide grants (what first-touch seeding writes), while tool-granular
@@ -65,6 +85,19 @@ impl ContextToolBinding {
             allowed_instances: instances,
             allowed_tools: Vec::new(),
             allowed_facades: Vec::new(),
+            name_map: HashMap::new(),
+        }
+    }
+
+    /// The default-permissive binding written by first-touch seeding: all
+    /// registered instances plus every known facade, so a never-bound context
+    /// can use the full surface on every axis. A role bundle narrows from
+    /// empty instead (via `kj binding allow`) and so never lands here.
+    pub fn permissive(instances: Vec<InstanceId>) -> Self {
+        Self {
+            allowed_instances: instances,
+            allowed_tools: Vec::new(),
+            allowed_facades: KNOWN_FACADES.iter().map(|s| s.to_string()).collect(),
             name_map: HashMap::new(),
         }
     }
