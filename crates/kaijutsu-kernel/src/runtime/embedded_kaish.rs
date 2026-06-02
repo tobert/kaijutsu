@@ -108,34 +108,6 @@ impl EmbeddedKaish {
                 session_contexts: SessionContextMap,
         configure_tools: impl FnOnce(SessionContextMap, SessionId, &mut kaish_kernel::ToolRegistry),
     ) -> Result<Self> {
-        Self::with_identity_and_db(
-            name,
-            blocks,
-            kernel,
-            project_root,
-            principal_id,
-            context_id,
-            session_id,
-                        None,
-            session_contexts,
-            configure_tools,
-        )
-    }
-
-    /// Like `with_identity`, but accepts a `KernelDb` to restore persisted
-    /// session state (cwd) on creation.
-    pub fn with_identity_and_db(
-        name: &str,
-        blocks: SharedBlockStore,
-        kernel: Arc<KaijutsuKernel>,
-        project_root: Option<PathBuf>,
-        principal_id: PrincipalId,
-        context_id: ContextId,
-        session_id: SessionId,
-                kernel_db: Option<&Arc<parking_lot::Mutex<KernelDb>>>,
-        session_contexts: SessionContextMap,
-        configure_tools: impl FnOnce(SessionContextMap, SessionId, &mut kaish_kernel::ToolRegistry),
-    ) -> Result<Self> {
         // Initialize session map entry if missing
         session_contexts.entry(session_id).or_insert(context_id);
 
@@ -165,8 +137,11 @@ impl EmbeddedKaish {
         //
         // `project_root` sets the cwd to a specific project directory (used by
         // MCP sessions that operate on a particular repo). When None, cwd
-        // defaults to $HOME via `KaishConfig::named()`, then we check the DB
-        // for a persisted cwd from a previous session.
+        // defaults to $HOME via `KaishConfig::named()`. The context's persisted
+        // cwd (`context_shell.cwd`) is *not* restored here: it must be validated
+        // against the shell's backend (the VFS namespace `cd` uses), which is
+        // async, so `restore_cwd_from_db` does it post-construction — see
+        // `materialize_context_kaish`.
         let mut config = match project_root {
             Some(root) => KaishConfig::mcp_with_root(root),
             None => KaishConfig::named(name),
@@ -176,19 +151,6 @@ impl EmbeddedKaish {
         // (rc lifecycle, hook bodies, init scripts) can override via
         // `ExecuteOptions::with_timeout` for stricter per-context bounds.
         config.request_timeout = Some(kernel.timeouts().kaish_request_timeout);
-
-        // Restore persisted cwd from context_shell if available.
-        if let Some(db) = kernel_db {
-            let db_guard = db.lock();
-            if let Ok(Some(shell)) = db_guard.get_context_shell(context_id) {
-                if let Some(cwd) = shell.cwd {
-                    let path = PathBuf::from(&cwd);
-                    if path.is_dir() {
-                        config.cwd = path;
-                    }
-                }
-            }
-        }
 
         let ctx_for_tools = session_contexts.clone();
         let sid_for_tools = session_id;
@@ -297,6 +259,43 @@ impl EmbeddedKaish {
         self.kernel.set_cwd(path).await
     }
 
+    /// Set cwd only if `path` resolves to a directory in the shell's backend
+    /// (the VFS namespace `cd` validates against). Returns whether it changed.
+    pub async fn try_set_cwd(&self, path: std::path::PathBuf) -> bool {
+        self.kernel.try_set_cwd(path).await
+    }
+
+    /// Restore this context's persisted cwd (`context_shell.cwd`) into the
+    /// shell, validating it against the shell's backend — the same namespace
+    /// `cd` resolves against, *not* the host filesystem. Returns:
+    ///   - `Ok(None)` — nothing persisted; the shell keeps its default cwd.
+    ///   - `Ok(Some(path))` — the persisted cwd was restored.
+    ///   - `Err(path)` — a cwd was persisted but no longer resolves to a
+    ///     directory; the shell keeps its default. Callers should surface this
+    ///     rather than swallow it (it would otherwise be a silent fallback).
+    pub async fn restore_cwd_from_db(
+        &self,
+        kernel_db: &Arc<parking_lot::Mutex<KernelDb>>,
+        context_id: ContextId,
+    ) -> Result<Option<std::path::PathBuf>, std::path::PathBuf> {
+        let persisted = {
+            let db = kernel_db.lock();
+            db.get_context_shell(context_id)
+                .ok()
+                .flatten()
+                .and_then(|row| row.cwd)
+        };
+        let Some(cwd) = persisted else {
+            return Ok(None);
+        };
+        let path = std::path::PathBuf::from(cwd);
+        if self.try_set_cwd(path.clone()).await {
+            Ok(Some(path))
+        } else {
+            Err(path)
+        }
+    }
+
     /// Get the last execution result ($?).
     pub async fn last_result(&self) -> Option<ExecResult> {
         Some(self.kernel.last_result().await)
@@ -316,7 +315,7 @@ impl EmbeddedKaish {
     ///
     /// The context shell is shared state that evolves over the context's
     /// lifetime; its durable identity is `env + cwd` in the DB. cwd is restored
-    /// at construction (`with_identity_and_db`); this applies the env half.
+    /// post-construction by `restore_cwd_from_db`; this applies the env half.
     /// Context-setup *scripting* is RC's job now (the former
     /// `context_shell.init_script` was a leftover and has been folded into the
     /// rc lifecycle), so this no longer runs any script.
@@ -477,7 +476,7 @@ mod tests {
 
         let sid = SessionId::new();
         let session_contexts = crate::runtime::context_engine::session_context_map();
-        let kaish = EmbeddedKaish::with_identity_and_db(
+        let kaish = EmbeddedKaish::with_identity(
             "test-env",
             blocks,
             kernel,
@@ -485,7 +484,6 @@ mod tests {
             principal,
             context_id,
             sid,
-                        Some(&kernel_db),
             session_contexts,
             |_, _, _| {},
         )
@@ -516,33 +514,33 @@ mod tests {
         );
     }
 
-    /// Regression test: when a context has a persisted cwd in KernelDb,
-    /// creating an EmbeddedKaish for that context should restore it.
-    ///
-    /// Before the fix, cwd defaulted to $HOME regardless of what was
-    /// persisted — apply_context_config only ran on `kj context switch`,
-    /// not on initial session creation.
+    /// Regression test: a persisted cwd that is a directory in the shell's
+    /// *backend* (a VFS mount) but does NOT exist on the host filesystem must
+    /// still restore. The old restore gated on host-FS `PathBuf::is_dir()` and
+    /// would silently drop it; `restore_cwd_from_db` validates against the same
+    /// backend `cd` resolves against.
     #[tokio::test]
-    async fn test_persisted_cwd_restored_on_creation() {
+    async fn test_persisted_vfs_cwd_restored_against_backend() {
         use crate::kernel_db::{ContextRow, ContextShellRow, KernelDb};
+        use crate::vfs::{MemoryBackend, VfsOps};
         use kaijutsu_types::{ConsentMode, ContextState, now_millis};
+        use std::path::Path;
 
-        let tmp = tempfile::tempdir().unwrap();
-        let persisted_cwd = tmp.path().to_path_buf();
+        // A VFS-only path: lives in the MemoryBackend mount below, never on disk.
+        let vfs_cwd = "/scratch/work";
+        assert!(
+            !Path::new(vfs_cwd).is_dir(),
+            "precondition: cwd must not exist on the host filesystem"
+        );
 
-        // Set up KernelDb with a context that has a persisted cwd
         let context_id = ContextId::new();
         let principal = PrincipalId::system();
         let db = KernelDb::in_memory().unwrap();
-
-        let ws_id = db
-            .get_or_create_default_workspace(principal)
-            .unwrap();
-
+        let ws_id = db.get_or_create_default_workspace(principal).unwrap();
         db.insert_context_with_document(
             &ContextRow {
                 context_id,
-                                label: Some("test-restore".into()),
+                label: Some("test-restore-vfs".into()),
                 provider: None,
                 model: None,
                 system_prompt: None,
@@ -560,59 +558,49 @@ mod tests {
             ws_id,
         )
         .unwrap();
-
         db.upsert_context_shell(&ContextShellRow {
             context_id,
-            cwd: Some(persisted_cwd.to_string_lossy().into_owned()),
+            cwd: Some(vfs_cwd.to_string()),
             updated_at: now_millis() as i64,
         })
         .unwrap();
 
-        // Verify it's really in the DB
-        let shell = db.get_context_shell(context_id).unwrap().unwrap();
-        assert_eq!(
-            shell.cwd.as_deref(),
-            Some(persisted_cwd.to_str().unwrap()),
-            "precondition: cwd should be in DB"
-        );
-
         let kernel_db = Arc::new(parking_lot::Mutex::new(db));
-
-        // Create EmbeddedKaish the same way rpc.rs does: no project_root,
-        // relying on the persisted context_shell.cwd to be restored.
         let blocks = shared_block_store(principal);
-        let kernel = Arc::new(KaijutsuKernel::new("test-restore", None).await);
+        let kernel = Arc::new(KaijutsuKernel::new("test-restore-vfs", None).await);
+
+        // Mount an in-memory FS and create the dir there — pure VFS, no host path.
+        kernel.mount("/scratch", MemoryBackend::new()).await;
+        kernel
+            .vfs()
+            .mkdir(Path::new(vfs_cwd), 0o755)
+            .await
+            .expect("mkdir in VFS mount");
 
         let sid = SessionId::new();
         let session_contexts = crate::runtime::context_engine::session_context_map();
-        let kaish = EmbeddedKaish::with_identity_and_db(
-            "test-restore",
+        let kaish = EmbeddedKaish::with_identity(
+            "test-restore-vfs",
             blocks,
             kernel,
-            None, // no project_root — same as SSH connection path
+            None,
             principal,
             context_id,
             sid,
-                        Some(&kernel_db),
             session_contexts,
             |_, _, _| {},
         )
         .unwrap();
 
-        // BUG: without the fix, this will be $HOME instead of the persisted cwd
-        let actual_cwd = kaish.cwd().await;
-        let actual = actual_cwd
-            .canonicalize()
-            .unwrap_or_else(|_| actual_cwd.clone());
-        let expected = persisted_cwd
-            .canonicalize()
-            .unwrap_or_else(|_| persisted_cwd.clone());
-
+        let restored = kaish
+            .restore_cwd_from_db(&kernel_db, context_id)
+            .await
+            .expect("VFS cwd should restore via backend, not be rejected by a host-FS check");
+        assert_eq!(restored.as_deref(), Some(Path::new(vfs_cwd)));
         assert_eq!(
-            actual, expected,
-            "cwd should be restored from context_shell on creation, \
-             got {:?} (expected {:?})",
-            actual_cwd, persisted_cwd,
+            kaish.cwd().await,
+            std::path::PathBuf::from(vfs_cwd),
+            "shell cwd should be the restored VFS path"
         );
     }
 }

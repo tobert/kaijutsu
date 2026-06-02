@@ -77,7 +77,7 @@ impl KjDispatcher {
             }
         };
 
-        let kaish = EmbeddedKaish::with_identity_and_db(
+        let kaish = EmbeddedKaish::with_identity(
             name,
             self.block_store().clone(),
             self.kernel().clone(),
@@ -85,14 +85,25 @@ impl KjDispatcher {
             principal,
             context_id,
             session_id,
-            Some(self.kernel_db()),
             session_contexts,
             configure_tools,
         )?;
 
-        // cwd is restored by `with_identity_and_db`; this seeds the env half of
-        // the context's durable state.
+        // Seed the env half of the context's durable state.
         kaish.apply_context_config(self.kernel_db(), context_id).await;
+
+        // Restore the persisted cwd, validated against the shell's backend (the
+        // VFS namespace `cd` uses — a host-FS check would wrongly reject
+        // VFS-only cwds like /scratch or /v/docs). A persisted cwd that no
+        // longer resolves is surfaced, not silently dropped.
+        if let Err(dead) = kaish.restore_cwd_from_db(self.kernel_db(), context_id).await {
+            tracing::warn!(
+                context = %context_id.to_hex(),
+                cwd = %dead.display(),
+                "persisted context cwd no longer resolves in backend; using default landing dir",
+            );
+            kaijutsu_telemetry::record_cwd_restore_failed();
+        }
 
         Ok(kaish)
     }

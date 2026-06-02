@@ -98,6 +98,43 @@ pub struct TokenCounts {
     pub reasoning: u64,
 }
 
+/// Context-shell instruments, lazily bound to the global meter provider.
+pub struct ContextShellMetrics {
+    /// `kaijutsu.context_shell.cwd_restore_failed` — a persisted cwd that no
+    /// longer resolves to a directory in the shell's backend at restore time,
+    /// so the shell fell back to its default landing dir.
+    cwd_restore_failed: Counter<u64>,
+}
+
+impl ContextShellMetrics {
+    /// Build the instruments from a meter. Public so tests can bind a meter
+    /// backed by an in-memory reader.
+    pub fn new(meter: &Meter) -> Self {
+        let cwd_restore_failed = meter
+            .u64_counter("kaijutsu.context_shell.cwd_restore_failed")
+            .with_unit("{restore}")
+            .with_description(
+                "Persisted context cwd that no longer resolves in the backend on restore",
+            )
+            .build();
+        Self { cwd_restore_failed }
+    }
+
+    /// Record one persisted-cwd restore that failed to resolve.
+    pub fn record_cwd_restore_failed(&self) {
+        self.cwd_restore_failed.add(1, &[]);
+    }
+}
+
+static CONTEXT_SHELL_METRICS: LazyLock<ContextShellMetrics> =
+    LazyLock::new(|| ContextShellMetrics::new(&global::meter("kaijutsu")));
+
+/// Record one failed context-cwd restore to the global meter provider. Cheap
+/// and safe before OTel is initialized (no-op meter), like [`record_llm_usage`].
+pub fn record_cwd_restore_failed() {
+    CONTEXT_SHELL_METRICS.record_cwd_restore_failed();
+}
+
 /// Process-wide LLM instruments, lazily bound to the global meter provider.
 ///
 /// Initialized on first use — which in practice is the first LLM call, well

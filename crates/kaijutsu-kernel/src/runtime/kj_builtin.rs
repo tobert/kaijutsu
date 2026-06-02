@@ -88,27 +88,41 @@ impl KjBuiltin {
     }
 
     /// Load context shell config (cwd + env vars) from KernelDb and apply to ExecContext.
-    fn apply_context_config(&self, context_id: ContextId, ctx: &mut ExecContext) {
-        let db = self.dispatcher.kernel_db().lock();
+    async fn apply_context_config(&self, context_id: ContextId, ctx: &mut ExecContext) {
+        // Snapshot durable state and drop the DB lock before any await.
+        let (persisted_cwd, env_vars) = {
+            let db = self.dispatcher.kernel_db().lock();
+            let cwd = db
+                .get_context_shell(context_id)
+                .ok()
+                .flatten()
+                .and_then(|shell| shell.cwd);
+            let vars = db.get_context_env(context_id).unwrap_or_default();
+            (cwd, vars)
+        };
 
-        // Apply cwd
-        if let Ok(Some(shell)) = db.get_context_shell(context_id)
-            && let Some(cwd) = shell.cwd
-        {
+        // Apply cwd, validated against the shell's backend — the namespace `cd`
+        // resolves against, not the host filesystem (a host-FS `is_dir()` check
+        // would wrongly reject VFS-only cwds like /scratch or /v/docs).
+        if let Some(cwd) = persisted_cwd {
             let path = std::path::PathBuf::from(&cwd);
-            if path.is_dir() {
+            let is_dir = matches!(ctx.backend.stat(&path).await, Ok(entry) if entry.is_dir());
+            if is_dir {
                 ctx.set_cwd(path);
             } else {
-                tracing::warn!("context cwd '{}' is not a directory, skipping", cwd);
+                tracing::warn!(
+                    context = %context_id.to_hex(),
+                    cwd = %cwd,
+                    "context cwd no longer resolves in backend on switch; keeping current",
+                );
+                kaijutsu_telemetry::record_cwd_restore_failed();
             }
         }
 
         // Apply env vars (exported so they propagate to child processes)
-        if let Ok(vars) = db.get_context_env(context_id) {
-            for var in &vars {
-                ctx.scope
-                    .set_exported(&var.key, Value::String(var.value.clone()));
-            }
+        for var in &env_vars {
+            ctx.scope
+                .set_exported(&var.key, Value::String(var.value.clone()));
         }
     }
 
@@ -506,7 +520,7 @@ impl Tool for KjBuiltin {
                 self.set_context_id(new_id);
 
                 // Apply context shell config (cwd + env vars)
-                self.apply_context_config(new_id, ctx);
+                self.apply_context_config(new_id, ctx).await;
 
                 ExecResult::success(msg)
             }
