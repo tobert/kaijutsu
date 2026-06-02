@@ -61,23 +61,46 @@ and honors a wire `contextType`, so app- and MCP-born contexts get rc
 like `kj context create` always did. `register_session` defaults new
 contexts to the new `mcp` context_type.
 
+Shipped (Phase 2): the capability allow-set landed.
+- **Capability taxonomy.** `Capability` enum (`Instance | Tool | Facade`)
+  in `mcp/binding.rs`; `ContextToolBinding` carries `allowed_instances`
+  (coarse), `allowed_tools` (`instance:tool`), `allowed_facades`.
+  `allows(instance, tool)` is the one predicate both pinch points call.
+  Persisted via `context_binding_tools` / `context_binding_facades`.
+  Default-permissive preserved: an empty/absent binding is the never-bound
+  sentinel that first-touch seeds to all instances (`is_empty()` now gates
+  that seed so a tool-only role bundle is not re-seeded).
+- **Both pinch points enforce one allow-set.** Hide at
+  `broker.list_visible_tools` (filters advertised tools by `allows()`);
+  refuse at `broker.call_tool` with `McpError::CapabilityDenied`
+  (defense-in-depth — catches a directly-named `instance:tool`, not just
+  the in-kernel model). Refusal only kicks in once a binding is narrowed.
+- **rc-native setter.** `kj binding {show,allow,revoke,reset}` (cap =
+  `instance` | `instance:tool` | `facade:name`) + `kj policy {show,set}`,
+  delegating to `broker.binding/set_binding/clear_binding` and
+  `policy_of/update_policy`. rc `.kai` create scripts call them.
+- **Restricted role bundles.** `explorer` (read-only) and `director`
+  (block/coordination) context_types seeded in `seed_scripts.rs`; their
+  `S10-binding.kai` narrows the new context at create time.
+
 Remaining:
-- **Capability taxonomy + policy row.** Generalize `ContextToolBinding`
-  (today instance-granular only — `mcp/binding.rs`) to a tool-granular
-  allow-set spanning broker `instance:tool` ids and `facade:` ids
-  (`context_shell`, `shell`, `*_input`). Default permissive.
-- **rc-native setter.** Add `kj binding`/`kj policy` to the kj
-  dispatcher delegating to the public `broker.bind/unbind/binding`, so
-  rc `.kai` scripts can write a context's loadout. (Today bindings are
-  reachable only from the `builtin.bindings` MCP tool — backwards vs.
-  the kj-is-rich stance.)
-- **External enforcement.** `kj`/kaish consults the policy before a
-  mutating subcommand and refuses — also the hook a read-only "explorer"
-  context_type will hang off.
-- **Restricted role bundles.** explorer (read-only), director
-  (block/peer tools) — deferred; needs the taxonomy above. Note read vs.
-  write tools are *mixed* inside `builtin.file`/`builtin.block`, so
-  fine-grained roles need tool-granular policy or instance-splitting.
+- **Facade enforcement at the call path.** The `Facade` capability is
+  represented, granted, and persisted, but `context_shell`/`shell`/`*_input`
+  are not broker-routed, so `call_tool` only enforces `Instance`/`Tool`.
+  Wire facade refusal at the kj/RPC facade layer (the original "refuse at
+  the `kj`/kaish layer" framing) so a role can withhold shell/input too.
+- **Dynamic / principal-scoped overrides.** The allow-set is the static
+  per-context_type loadout; the `ListTools`/`Deny` hook layer (D-56)
+  remains the place for dynamic, principal-matched denies layered on top.
+- **Self-lockout ergonomics.** Narrowing a binding to exclude
+  `builtin.bindings` makes the MCP admin tool uncallable from that context
+  (by design — a restricted role must not rebind itself to escalate);
+  `kj binding` is the operator escape hatch since it bypasses the call
+  gate. If external agents should also be denied `kj binding`, that's the
+  facade-enforcement item above.
+- **Per-principal budgets + fair queuing.** Still deferred (see Tool
+  system follow-ups); capability ≠ QoS, and `InstancePolicy` remains
+  per-instance, not per-principal.
 
 ## LLM providers
 
