@@ -2826,6 +2826,20 @@ impl kernel::Server for KernelImpl {
                 // (`context_shell.cwd`). Every materialized shell for this
                 // context — model, interactive, headless — seeds from here.
                 let context_id = connection.borrow().require_context()?;
+
+                // Validate the path against the context's shell backend (the
+                // namespace `cd` uses) before persisting — fail fast rather than
+                // store a cwd that every later materialized shell would reject
+                // on restore. A throwaway shell is enough to reach the backend.
+                let kaish = materialize_context_shell(&kernel, &connection).await?;
+                if !kaish.try_set_cwd(std::path::PathBuf::from(&path)).await {
+                    results.get().set_success(false);
+                    results
+                        .get()
+                        .set_error(format!("not a directory: {}", path));
+                    return Ok(());
+                }
+
                 let updated_at = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .expect("system clock before UNIX epoch")

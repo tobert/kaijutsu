@@ -70,12 +70,29 @@ impl KjBuiltin {
 
     /// Persist the current context's cwd to KernelDb so it survives session
     /// reconnects and context switches.
-    fn save_context_cwd(&self, context_id: ContextId, ctx: &ExecContext) {
+    ///
+    /// The live cwd was validated when `cd` set it, so this normally persists
+    /// known-good state — but if the directory was removed under us mid-session
+    /// it would now point at a dead path. Validate against the backend and skip
+    /// the write in that case, preserving the last good persisted value rather
+    /// than overwriting it with a path every later restore would reject.
+    async fn save_context_cwd(&self, context_id: ContextId, ctx: &ExecContext) {
+        let path = ctx.cwd.clone();
+        let is_dir = matches!(ctx.backend.stat(&path).await, Ok(entry) if entry.is_dir());
+        if !is_dir {
+            tracing::warn!(
+                context = %context_id.to_hex(),
+                cwd = %path.display(),
+                "live cwd no longer resolves in backend; not persisting on switch",
+            );
+            kaijutsu_telemetry::record_cwd_restore_failed();
+            return;
+        }
         let db = self.dispatcher.kernel_db().lock();
         if let Err(e) = db.upsert_context_shell(
             &crate::kernel_db::ContextShellRow {
                 context_id,
-                cwd: Some(ctx.cwd.to_string_lossy().into_owned()),
+                cwd: Some(path.to_string_lossy().into_owned()),
                 updated_at: kaijutsu_types::now_millis() as i64,
             },
         ) {
@@ -513,7 +530,7 @@ impl Tool for KjBuiltin {
             KjResult::Switch(new_id, msg) => {
                 // Persist outgoing context's cwd so it survives the switch
                 if let Some(old_id) = self.current_context_id() {
-                    self.save_context_cwd(old_id, ctx);
+                    self.save_context_cwd(old_id, ctx).await;
                 }
 
                 // Side-effect: update the shared context ID

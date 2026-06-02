@@ -100,9 +100,10 @@ pub struct TokenCounts {
 
 /// Context-shell instruments, lazily bound to the global meter provider.
 pub struct ContextShellMetrics {
-    /// `kaijutsu.context_shell.cwd_restore_failed` — a persisted cwd that no
-    /// longer resolves to a directory in the shell's backend at restore time,
-    /// so the shell fell back to its default landing dir.
+    /// `kaijutsu.context_shell.cwd_restore_failed` — a context cwd that no
+    /// longer resolves to a directory in the shell's backend: either dropped on
+    /// restore (fell back to the default landing dir) or skipped on a
+    /// switch-time save (last good value preserved).
     cwd_restore_failed: Counter<u64>,
 }
 
