@@ -61,7 +61,10 @@ PROJECT_DIR="/home/atobey/src/kaijutsu"
 
 PROFILE="debug"
 CARGO_PROFILE_FLAG=""
-[[ "${1:-}" == "--release" ]] && PROFILE="release" && CARGO_PROFILE_FLAG="--release"
+# dynamic_linking compiles Bevy as a shared lib for fast incremental relinks —
+# debug-only, so release builds stay self-contained.
+CARGO_FEATURES_FLAG="--features dynamic_linking"
+[[ "${1:-}" == "--release" ]] && PROFILE="release" && CARGO_PROFILE_FLAG="--release" && CARGO_FEATURES_FLAG=""
 
 # If not already inside script(1), re-exec under it
 if [[ -z "${SCRIPT_WRAPPER:-}" ]]; then
@@ -110,7 +113,7 @@ start_watch() {
     export OTEL_SERVICE_NAME="${OTEL_SERVICE_NAME:-kaijutsu-app}"
 
     cargo watch \
-        -x "run -p kaijutsu-app $CARGO_PROFILE_FLAG" \
+        -x "run -p kaijutsu-app $CARGO_PROFILE_FLAG $CARGO_FEATURES_FLAG" \
         -w crates/kaijutsu-app \
         -w crates/kaijutsu-client \
         --why \
@@ -129,7 +132,7 @@ full_rebuild() {
     cd "$PROJECT_DIR"
     status "building" "Clean rebuild in progress"
     cargo clean -p kaijutsu-app
-    cargo build -p kaijutsu-app $CARGO_PROFILE_FLAG
+    cargo build -p kaijutsu-app $CARGO_PROFILE_FLAG $CARGO_FEATURES_FLAG
 
     rm -f "$CTRL_REBUILD" "$CTRL_NOLOOP"
     start_watch

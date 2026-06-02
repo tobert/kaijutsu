@@ -1,0 +1,10 @@
+# Use mold as the linker on Linux. mold is a drop-in, much faster than the
+# default bfd/gold linkers; this is the single biggest lever on incremental
+# link time for the Bevy app. Applies to all profiles — mold produces correct
+# release binaries too. Requires `mold` on PATH (pacman -S mold).
+#
+# The Bevy `dynamic_linking` feature (the other half of fast iteration) is NOT
+# set here: it's a debug-only passthrough feature on kaijutsu-app, wired into
+# the dev loop by contrib/kaijutsu-runner.sh so it never leaks into release.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-Clink-arg=-fuse-ld=mold"]

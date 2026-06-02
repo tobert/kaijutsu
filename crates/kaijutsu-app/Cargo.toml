@@ -4,6 +4,13 @@ version.workspace = true
 edition.workspace = true
 description = "Bevy GUI client for kaijutsu"
 
+[features]
+# Opt-in only (dev iteration). Compiles Bevy as a shared library so incremental
+# rebuilds skip re-linking all of Bevy statically — the big iteration win.
+# The dev loop (contrib/kaijutsu-runner.sh) passes `--features dynamic_linking`
+# for debug builds; release builds omit it so they stay self-contained.
+dynamic_linking = ["bevy/dynamic_linking"]
+
 [dependencies]
 kaijutsu-abc.workspace = true
 kaijutsu-crdt.workspace = true
