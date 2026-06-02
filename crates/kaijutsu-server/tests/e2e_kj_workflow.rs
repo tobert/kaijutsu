@@ -461,6 +461,69 @@ fn test_shell_propagates_exit_code() {
     });
 }
 
+/// A `cd` and an `export` in one shell command must persist to the context's
+/// durable L1 state, so the *next* command — which runs in a freshly
+/// materialized, single-use shell re-seeded from L1 — lands in the same cwd and
+/// sees the same exported var. Before cwd/env write-back existed, the throwaway
+/// shell dropped both changes and the second command re-seeded from the
+/// original cwd with no var. This is the regression guard for that round-trip.
+///
+/// Uses `CARGO_MANIFEST_DIR` as the cd target: a real host directory (the cwd
+/// restore path validates against the host FS) that differs from the default
+/// landing cwd (`$HOME`).
+#[test]
+fn test_shell_cd_and_export_persist_across_commands() {
+    run_local(async {
+        let addr = start_server().await;
+        let client = connect_client(addr).await;
+        let (kernel, _) = client.bind_kernel().await.unwrap();
+        let ctx = kernel.create_context("cwd-persist-test").await.unwrap();
+        kernel.join_context(ctx, "test").await.unwrap();
+
+        let target = env!("CARGO_MANIFEST_DIR");
+
+        // Baseline: capture the starting cwd so we can prove it actually moves.
+        let (_, before, before_status) = shell_exec_wait(&kernel, "pwd", ctx).await;
+        assert_eq!(before_status, Status::Done, "baseline pwd failed: {before}");
+        assert!(
+            !before.trim().is_empty(),
+            "baseline pwd produced no output"
+        );
+        assert_ne!(
+            before.trim(),
+            target,
+            "test precondition: starting cwd must differ from the cd target"
+        );
+
+        // Command 1 (one materialized shell): change dir and export a var.
+        let (_, mutate_out, mutate_status) = shell_exec_wait(
+            &kernel,
+            &format!("cd {target}; export KJ_PERSIST_TEST=marker_value"),
+            ctx,
+        )
+        .await;
+        assert_eq!(
+            mutate_status,
+            Status::Done,
+            "cd + export command failed: {mutate_out}"
+        );
+
+        // Command 2 (a *different* materialized shell, re-seeded from L1):
+        // both the cwd and the exported var must have survived.
+        let (_, after, after_status) =
+            shell_exec_wait(&kernel, "pwd; echo \"marker=$KJ_PERSIST_TEST\"", ctx).await;
+        assert_eq!(after_status, Status::Done, "follow-up command failed: {after}");
+        assert!(
+            after.contains(target),
+            "cwd did not persist across commands: expected pwd to be {target}, got: {after}"
+        );
+        assert!(
+            after.contains("marker=marker_value"),
+            "exported var did not persist across commands, got: {after}"
+        );
+    });
+}
+
 /// `kj fork --prompt` should drive an autonomous turn in the child: the fork
 /// publishes `turn.requested`, the server's turn driver consumes it and runs
 /// `spawn_llm_for_prompt` for the child, and the mock provider streams a

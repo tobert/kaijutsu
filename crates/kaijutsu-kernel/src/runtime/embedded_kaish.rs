@@ -249,6 +249,20 @@ impl EmbeddedKaish {
             .collect()
     }
 
+    /// Snapshot the shell's exported (env) variables as `(name, value)` string
+    /// pairs, coerced with the same `value_to_string` a child process sees.
+    /// Used to diff a command's effect on durable `context_env`.
+    pub async fn exported_vars(&self) -> Vec<(String, String)> {
+        self.kernel
+            .exported_vars()
+            .await
+            .into_iter()
+            .map(|(name, value)| {
+                (name, kaish_kernel::interpreter::value_to_string(&value))
+            })
+            .collect()
+    }
+
     /// Get the kernel name.
     pub fn name(&self) -> &str {
         &self.name

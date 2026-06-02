@@ -1411,9 +1411,14 @@ impl kernel::Server for KernelImpl {
 
                 // Spawn background execution — Rc<EmbeddedKaish> is fine on LocalSet.
                 let connection_bg = connection.clone();
+                let kernel_db_for_persist = kernel.kernel_db.clone();
                 tokio::task::spawn_local(async move {
                     // Yield so the RPC response is sent before we start executing.
                     tokio::task::yield_now().await;
+
+                    // Snapshot the shell's durable surface (cwd + exported env)
+                    // so we can persist what this command changes back to L1.
+                    let state_before = snapshot_shell_state(&kaish).await;
 
                     let exec_result = tokio::select! {
                         result = kaish.execute_with_options(&code, kaish_kernel::ExecuteOptions::default()) => {
@@ -1439,7 +1444,19 @@ impl kernel::Server for KernelImpl {
                     // settled by the time the client learns the command finished
                     // (otherwise a client firing its next RPC immediately could
                     // observe a stale active context).
-                    propagate_context_switch(&kaish, started_ctx, &connection_bg);
+                    // No switch: persist this command's cwd/export changes to
+                    // the context it ran in. On a switch the snapshots straddle
+                    // two contexts and the outgoing cwd is already saved inside
+                    // kaish, so we skip the write-back.
+                    if propagate_context_switch(&kaish, started_ctx, &connection_bg).is_none() {
+                        let state_after = snapshot_shell_state(&kaish).await;
+                        persist_shell_state(
+                            &kernel_db_for_persist,
+                            started_ctx,
+                            &state_before,
+                            &state_after,
+                        );
+                    }
 
                     // Dispatch output events to all subscribers.
                     dispatch_output_events(exec_id, &exec_result, &connection_bg).await;
@@ -5398,6 +5415,68 @@ fn propagate_context_switch(
     }
 }
 
+/// The durable surface of a context shell: working directory + exported env.
+/// Snapshotted before and after a command so we can persist exactly what the
+/// command changed back to L1, the same way a real shell's `cd` / `export`
+/// outlive the command that ran them.
+struct ShellStateSnapshot {
+    cwd: std::path::PathBuf,
+    env: std::collections::BTreeMap<String, String>,
+}
+
+async fn snapshot_shell_state(kaish: &EmbeddedKaish) -> ShellStateSnapshot {
+    ShellStateSnapshot {
+        cwd: kaish.cwd().await,
+        env: kaish.exported_vars().await.into_iter().collect(),
+    }
+}
+
+/// Persist a command's effect on the shell's durable surface (cwd + exported
+/// env) back to L1, so the next materialized shell for this context lands where
+/// the last command left off. Diffs `before`/`after`: only a moved cwd or an
+/// added/changed/removed export is written — an `ls` touches nothing.
+/// Last-writer-wins across concurrent peers, matching `propagate_context_switch`.
+///
+/// Caller must skip this when the command switched context (`kj context switch`
+/// / `kj fork`): the snapshots straddle two contexts, and the outgoing cwd is
+/// already saved inside kaish on switch (`KjBuiltin::save_context_cwd`).
+fn persist_shell_state(
+    kernel_db: &Arc<parking_lot::Mutex<KernelDb>>,
+    context_id: ContextId,
+    before: &ShellStateSnapshot,
+    after: &ShellStateSnapshot,
+) {
+    let db = kernel_db.lock();
+
+    // cwd: write only when the command moved it, so we never clobber a
+    // concurrent peer's cwd with a value this command never touched.
+    if after.cwd != before.cwd {
+        if let Err(e) = db.upsert_context_shell(&ContextShellRow {
+            context_id,
+            cwd: Some(after.cwd.to_string_lossy().into_owned()),
+            updated_at: kaijutsu_types::now_millis() as i64,
+        }) {
+            log::warn!("failed to persist context cwd: {}", e);
+        }
+    }
+
+    // exported env: upsert added/changed keys, delete keys the command unset.
+    for (key, value) in &after.env {
+        if before.env.get(key) != Some(value) {
+            if let Err(e) = db.set_context_env(context_id, key, value) {
+                log::warn!("failed to persist context env {}: {}", key, e);
+            }
+        }
+    }
+    for key in before.env.keys() {
+        if !after.env.contains_key(key) {
+            if let Err(e) = db.delete_context_env(context_id, key) {
+                log::warn!("failed to delete context env {}: {}", key, e);
+            }
+        }
+    }
+}
+
 async fn execute_shell_command(
     code: &str,
     context_id: ContextId,
@@ -5488,6 +5567,7 @@ async fn execute_shell_command(
     let command_block_id_clone = command_block_id;
     let block_flows = kernel_arc.block_flows().clone();
     let connection_switch = connection.clone();
+    let kernel_db_for_persist = kernel.kernel_db.clone();
 
     tokio::task::spawn_local(async move {
         // Yield to let the event loop flush BlockInserted events to clients
@@ -5495,6 +5575,10 @@ async fn execute_shell_command(
         // (like `ls`) can emit edit_text before the client has processed the
         // BlockInserted, causing DataMissing errors on the client side.
         tokio::task::yield_now().await;
+
+        // Snapshot the shell's durable surface (cwd + exported env) so we can
+        // persist whatever this command changes (`cd`, `export`) back to L1.
+        let state_before = snapshot_shell_state(&kaish).await;
 
         log::info!(
             "shell_execute: executing code via EmbeddedKaish: {:?}",
@@ -5584,6 +5668,39 @@ async fn execute_shell_command(
                     log::error!("Failed to set output block exit_code: {}", e);
                 }
 
+                // Settle durable context state *before* flipping status to a
+                // terminal value: clients (and our own e2e harness) treat the
+                // ToolResult reaching Done/Error as "command finished" and may
+                // fire their next command immediately. If we persisted after, a
+                // back-to-back `cd /x` then `pwd` could re-materialize the shell
+                // off stale L1. Detect an in-shell context switch (kj fork /
+                // context switch) and propagate it to the connection's shared
+                // map; otherwise persist this command's cwd/export changes to the
+                // context it ran in. (On a switch the snapshots straddle two
+                // contexts and the outgoing cwd is already saved inside kaish, so
+                // we skip the write-back.)
+                match propagate_context_switch(&kaish, context_id, &connection_switch) {
+                    Some(new_context_id) => {
+                        log::info!(
+                            "shell_execute: context switched {} → {}",
+                            context_id,
+                            new_context_id
+                        );
+                        block_flows.publish(kaijutsu_kernel::flows::BlockFlow::ContextSwitched {
+                            context_id: new_context_id,
+                        });
+                    }
+                    None => {
+                        let state_after = snapshot_shell_state(&kaish).await;
+                        persist_shell_state(
+                            &kernel_db_for_persist,
+                            context_id,
+                            &state_before,
+                            &state_after,
+                        );
+                    }
+                }
+
                 // Exit 2: latch gate (rm/trash) — confirmation message shown, not a failure
                 // Exit 3 / did_spill: output truncated to spill file — command ran, not a failure
                 let final_status = match result.code {
@@ -5599,26 +5716,6 @@ async fn execute_shell_command(
                     documents_clone.set_status(context_id, &command_block_id_clone, final_status)
                 {
                     log::error!("Failed to set command block status: {}", e);
-                }
-
-                // Detect context switch (kj fork, kj context switch). The
-                // materialized shell carries an isolated session→context map, so
-                // we propagate any switch back to the connection's shared map
-                // (keeps `require_context` correct on later RPCs) and publish for
-                // subscribers. A shell with no active context (e.g. post-leave)
-                // yields None — suppressed rather than published as a nil
-                // sentinel, so subscribers keep their last known good context.
-                if let Some(new_context_id) =
-                    propagate_context_switch(&kaish, context_id, &connection_switch)
-                {
-                    log::info!(
-                        "shell_execute: context switched {} → {}",
-                        context_id,
-                        new_context_id
-                    );
-                    block_flows.publish(kaijutsu_kernel::flows::BlockFlow::ContextSwitched {
-                        context_id: new_context_id,
-                    });
                 }
             }
             Err(e) => {
