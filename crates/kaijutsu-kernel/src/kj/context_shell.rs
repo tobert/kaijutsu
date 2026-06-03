@@ -51,6 +51,54 @@ impl KjDispatcher {
         semantic_index: Option<Arc<kaijutsu_index::SemanticIndex>>,
         block_source: Arc<dyn kaijutsu_index::BlockSource>,
     ) -> Result<EmbeddedKaish> {
+        self.materialize_context_kaish_inner(
+            name,
+            principal,
+            context_id,
+            session_id,
+            semantic_index,
+            block_source,
+            false,
+        )
+        .await
+    }
+
+    /// Like [`Self::materialize_context_kaish`] but the materialized `kj` runs
+    /// **privileged** — the rc lifecycle's trusted control plane, allowed to
+    /// assign (widen) a context's loadout. ONLY the rc runner may call this;
+    /// agent/hook/human paths use the unprivileged variant.
+    pub async fn materialize_context_kaish_rc(
+        &self,
+        name: &str,
+        principal: PrincipalId,
+        context_id: ContextId,
+        session_id: SessionId,
+        semantic_index: Option<Arc<kaijutsu_index::SemanticIndex>>,
+        block_source: Arc<dyn kaijutsu_index::BlockSource>,
+    ) -> Result<EmbeddedKaish> {
+        self.materialize_context_kaish_inner(
+            name,
+            principal,
+            context_id,
+            session_id,
+            semantic_index,
+            block_source,
+            true,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn materialize_context_kaish_inner(
+        &self,
+        name: &str,
+        principal: PrincipalId,
+        context_id: ContextId,
+        session_id: SessionId,
+        semantic_index: Option<Arc<kaijutsu_index::SemanticIndex>>,
+        block_source: Arc<dyn kaijutsu_index::BlockSource>,
+        privileged: bool,
+    ) -> Result<EmbeddedKaish> {
         // Fresh, isolated session map: this kaish lives for one invocation and
         // tracks exactly one session→context mapping. No cross-invocation
         // leakage, nothing to evict.
@@ -73,6 +121,7 @@ impl KjDispatcher {
                     sid,
                     semantic_index,
                     block_source,
+                    privileged,
                 ));
             }
         };

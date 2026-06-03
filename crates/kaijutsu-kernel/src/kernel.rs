@@ -124,7 +124,11 @@ impl Kernel {
             drift: shared_drift_router(),
             cas: Self::cas_for_data_dir(data_dir),
             image_backends: RwLock::new(crate::image::ImageBackendRegistry::new()),
-            broker: Arc::new(Broker::new()),
+            broker: Arc::new({
+                let b = Broker::new();
+                b.engage_unbound_deny();
+                b
+            }),
             timeouts: kaijutsu_types::TimeoutPolicy::default(),
         }
     }
@@ -154,7 +158,11 @@ impl Kernel {
             drift: shared_drift_router(),
             cas: Self::cas_for_data_dir(data_dir),
             image_backends: RwLock::new(crate::image::ImageBackendRegistry::new()),
-            broker: Arc::new(Broker::new()),
+            broker: Arc::new({
+                let b = Broker::new();
+                b.engage_unbound_deny();
+                b
+            }),
             timeouts: kaijutsu_types::TimeoutPolicy::default(),
         }
     }
@@ -230,35 +238,28 @@ impl Kernel {
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<ExecResult, crate::mcp::McpError> {
         use crate::mcp::{
-            CallContext, ContextToolBinding, InstanceId, KernelCallParams, McpError, ToolContent,
-            TraceContext,
+            CallContext, InstanceId, KernelCallParams, McpError, ToolContent, TraceContext,
         };
 
-        // Ensure a binding exists for this context. First-touch, populate
-        // with every registered instance so the LLM sees everything.
+        // Deny-by-default: use whatever binding the context has (assigned by
+        // its rc `create`/`fork` lifecycle). No first-touch permissive seeding
+        // — an unbound context grants nothing. The resolver still needs the
+        // sticky `name_map` populated, so kick `list_visible_tools` to refresh
+        // it against the current binding.
         let broker = self.broker.clone();
-        let binding = match broker.binding(&tool_ctx.context_id).await {
-            Some(b) if !b.is_empty() => b,
-            _ => {
-                let instances = broker.list_instances().await;
-                let binding = ContextToolBinding::permissive(instances);
-                broker.set_binding(tool_ctx.context_id, binding).await;
-                // Kick the resolver so `name_map` populates.
-                let seed_ctx = CallContext::new(
-                    tool_ctx.principal_id,
-                    tool_ctx.context_id,
-                    tool_ctx.session_id,
-                    tool_ctx.kernel_id,
-                );
-                let _ = broker
-                    .list_visible_tools(tool_ctx.context_id, &seed_ctx)
-                    .await?;
-                broker
-                    .binding(&tool_ctx.context_id)
-                    .await
-                    .unwrap_or_default()
-            }
-        };
+        let seed_ctx = CallContext::new(
+            tool_ctx.principal_id,
+            tool_ctx.context_id,
+            tool_ctx.session_id,
+            tool_ctx.kernel_id,
+        );
+        let _ = broker
+            .list_visible_tools(tool_ctx.context_id, &seed_ctx)
+            .await?;
+        let binding = broker
+            .binding(&tool_ctx.context_id)
+            .await
+            .unwrap_or_default();
 
         let (instance, tool) = binding.resolve(tool_name).cloned().ok_or_else(|| {
             McpError::ToolNotFound {
@@ -363,20 +364,11 @@ impl Kernel {
         context_id: kaijutsu_types::ContextId,
         principal_id: PrincipalId,
     ) -> Vec<(String, serde_json::Value, Option<String>)> {
-        use crate::mcp::{CallContext, ContextToolBinding};
+        use crate::mcp::CallContext;
 
+        // Deny-by-default: list whatever the context's binding (assigned by its
+        // rc lifecycle) allows. No first-touch permissive seeding.
         let broker = self.broker.clone();
-        if broker
-            .binding(&context_id)
-            .await
-            .map(|b| b.is_empty())
-            .unwrap_or(true)
-        {
-            let instances = broker.list_instances().await;
-            broker
-                .set_binding(context_id, ContextToolBinding::permissive(instances))
-                .await;
-        }
         let ctx = CallContext::new(
             principal_id,
             context_id,
@@ -421,6 +413,11 @@ impl Kernel {
         // so the initial tool snapshots are captured but `register_silently`
         // suppresses the bootstrap ToolAdded noise (D-38).
         self.broker.set_documents(documents.clone()).await;
+
+        // Wire the kernel DB so `ContextToolBinding`s persist (and survive
+        // restart) and so binding reads (e.g. fork inheritance via
+        // `get_context_binding`) see what `set_binding` wrote.
+        self.broker.set_db(kernel_db.clone()).await;
 
         self.broker
             .register_silently(

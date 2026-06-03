@@ -376,11 +376,6 @@ enum RpcCommand {
         context_id: ContextId,
         reply: oneshot::Sender<Result<InputState, CallError>>,
     },
-    CheckFacade {
-        context_id: ContextId,
-        facade: String,
-        reply: oneshot::Sender<Result<(bool, String), CallError>>,
-    },
     PushInputOps {
         context_id: ContextId,
         ops: Vec<u8>,
@@ -548,7 +543,6 @@ impl RpcCommand {
             Self::ListShellVars { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::EditInput { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetInputState { reply, .. } => { let _ = reply.send(Err(err)); }
-            Self::CheckFacade { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::PushInputOps { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::SubmitInput { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ClearInput { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -877,23 +871,6 @@ impl ActorHandle {
     pub async fn get_input_state(&self, context_id: ContextId) -> Result<InputState, CallError> {
         self.send(|reply| RpcCommand::GetInputState { context_id, reply })
             .await
-    }
-
-    /// Ask the kernel whether `facade` is in `context_id`'s capability
-    /// allow-set. Returns `(allowed, reason)`; `reason` is empty when allowed.
-    #[tracing::instrument(skip(self))]
-    pub async fn check_facade(
-        &self,
-        context_id: ContextId,
-        facade: &str,
-    ) -> Result<(bool, String), CallError> {
-        let facade = facade.to_string();
-        self.send(|reply| RpcCommand::CheckFacade {
-            context_id,
-            facade,
-            reply,
-        })
-        .await
     }
 
     #[tracing::instrument(skip(self, ops))]
@@ -2080,13 +2057,6 @@ async fn dispatch_kernel_command(
         }
         RpcCommand::GetInputState { context_id, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.get_input_state(context_id));
-        }
-        RpcCommand::CheckFacade {
-            context_id,
-            facade,
-            reply,
-        } => {
-            dispatch!(kernel, reply, close_tx, k, k.check_facade(context_id, &facade));
         }
         RpcCommand::PushInputOps {
             context_id,

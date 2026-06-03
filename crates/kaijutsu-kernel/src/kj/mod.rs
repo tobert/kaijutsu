@@ -60,6 +60,13 @@ pub struct KjCaller {
     /// `kj context create` runs at depth 1, etc. Capped at MAX_RC_DEPTH to
     /// prevent runaway recursion (see `kj/lifecycle.rs`).
     pub rc_depth: u8,
+    /// True when this caller originates from the rc lifecycle's privileged
+    /// kaish (the trusted control plane that assigns loadouts). Stamped at
+    /// `KjBuiltin` construction by the rc runner — **never** derived from a
+    /// shell var like `KJ_RC_DEPTH` (those are agent-settable, forgeable).
+    /// Gates binding *writes*: only a privileged or `binding_admin` caller may
+    /// widen a loadout; everyone else may only narrow their own.
+    pub privileged: bool,
 }
 
 impl KjCaller {
@@ -494,6 +501,7 @@ pub(crate) mod test_helpers {
             session_id: SessionId::new(),
             confirmed: false,
             rc_depth: 0,
+            privileged: false,
         }
     }
 
@@ -505,6 +513,7 @@ pub(crate) mod test_helpers {
             session_id: SessionId::new(),
             confirmed: false,
             rc_depth: 0,
+            privileged: false,
         }
     }
 
@@ -516,6 +525,7 @@ pub(crate) mod test_helpers {
             session_id: SessionId::new(),
             confirmed: true,
             rc_depth: 0,
+            privileged: false,
         }
     }
 
@@ -605,6 +615,7 @@ mod unjoined_context_tests {
             session_id: SessionId::new(),
             confirmed: false,
             rc_depth: 0,
+            privileged: false,
         }
     }
 

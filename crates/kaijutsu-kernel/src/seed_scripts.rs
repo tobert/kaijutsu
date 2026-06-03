@@ -138,11 +138,24 @@ withheld — a call to one is refused, not silently dropped. Investigate,
 report findings, and `kj drift` them back to a context that can act.
 ";
 
-/// explorer capability allow-set. The first `kj binding allow` narrows this
-/// context from default-permissive to exactly the read-oriented tools
-/// granted here; everything else is refused at `call_tool`. Tokens are
-/// quoted because the kaish lexer special-cases bare words containing
-/// `.`/`:`.
+/// The broad loadout for human-facing / general roles (`default`, `coder`,
+/// `mcp`). Deny-by-default everywhere, so permissiveness is explicit: `*` =
+/// every instance, `facade:*` = every facade. Does **not** grant `admin` —
+/// these roles can use everything but cannot rebind *other* contexts (that's
+/// the director role). The rc lifecycle runs privileged, so this widen from
+/// deny-all is allowed; an agent could not issue it at runtime.
+const PERMISSIVE_BINDING_BODY: &str = "\
+# Broad loadout: every instance + every facade (explicit; deny-by-default).
+kj binding allow \"*\"
+kj binding allow \"facade:*\"
+";
+
+/// explorer capability allow-set. Deny-by-default means this enumerates
+/// exactly the read-oriented tools the role may use; everything else is
+/// refused at `call_tool`. No facades — shell/edit/submit are withheld, and
+/// reading the compose buffer (`get_input_state`) is ungated, so a read-only
+/// role needs no facade grant. Tokens are quoted because the kaish lexer
+/// special-cases bare words containing `.`/`:`.
 const EXPLORER_BINDING_BODY: &str = "\
 # explorer: read-only allow-set (capability narrowing).
 kj binding allow \"builtin.file:read\"
@@ -156,8 +169,6 @@ kj binding allow \"builtin.block:kernel_search\"
 kj binding allow \"builtin.resources\"
 kj binding allow \"builtin.tool_search\"
 kj binding allow \"builtin.kernel_info\"
-# Facades: read the compose buffer, but no shell / write / submit.
-kj binding allow \"facade:read_input\"
 ";
 
 /// The director context_type's stance: a coordination role that owns block
@@ -170,6 +181,8 @@ coder context via `kj fork`/`kj drive` and gather results with `kj drift`.
 ";
 
 /// director capability allow-set: full block tooling + read + binding admin.
+/// `admin` is the binding-admin capability — a director may write *any*
+/// context's loadout (manage other contexts), which broad roles cannot.
 const DIRECTOR_BINDING_BODY: &str = "\
 # director: block/coordination allow-set.
 kj binding allow \"builtin.block\"
@@ -178,17 +191,29 @@ kj binding allow \"builtin.resources\"
 kj binding allow \"builtin.tool_search\"
 kj binding allow \"builtin.kernel_info\"
 kj binding allow \"builtin.bindings\"
-# Facades: full interaction surface (shell + compose buffer + submit).
+# Binding administration: may write any context's loadout.
+kj binding allow \"admin\"
+# Facades: full interaction surface (shell + edit + submit). `shell` covers
+# both shell and context_shell; `edit_input` covers write_input too.
 kj binding allow \"facade:shell\"
-kj binding allow \"facade:context_shell\"
-kj binding allow \"facade:read_input\"
-kj binding allow \"facade:write_input\"
 kj binding allow \"facade:edit_input\"
 kj binding allow \"facade:submit_input\"
 ";
 
 const SEED_SCRIPTS: &[SeedScript] = &[
-    // ── default context_type — cache recipe only ───────────────────────
+    // ── default context_type — broad loadout + cache recipe ─────────────
+    // S10 must precede any rc script that calls a broker tool: deny-by-default
+    // means tool calls before the loadout is assigned would be refused.
+    SeedScript {
+        path: "/etc/rc/default/create/S10-binding.kai",
+        context_type: "default",
+        verb: "create",
+        sort_key: "S10",
+        name: "binding",
+        extension: "kai",
+        content: PERMISSIVE_BINDING_BODY,
+        timeout_secs: None,
+    },
     SeedScript {
         path: "/etc/rc/default/create/S20-cache.kai",
         context_type: "default",
@@ -219,7 +244,7 @@ const SEED_SCRIPTS: &[SeedScript] = &[
         content: CACHE_DRIFT_BODY,
         timeout_secs: None,
     },
-    // ── coder context_type — stance + cache ────────────────────────────
+    // ── coder context_type — stance + broad loadout + cache ─────────────
     SeedScript {
         path: "/etc/rc/coder/create/S00-stance.md",
         context_type: "coder",
@@ -228,6 +253,16 @@ const SEED_SCRIPTS: &[SeedScript] = &[
         name: "stance",
         extension: "md",
         content: CODER_STANCE_BODY,
+        timeout_secs: None,
+    },
+    SeedScript {
+        path: "/etc/rc/coder/create/S10-binding.kai",
+        context_type: "coder",
+        verb: "create",
+        sort_key: "S10",
+        name: "binding",
+        extension: "kai",
+        content: PERMISSIVE_BINDING_BODY,
         timeout_secs: None,
     },
     SeedScript {
@@ -260,7 +295,7 @@ const SEED_SCRIPTS: &[SeedScript] = &[
         content: CACHE_DRIFT_BODY,
         timeout_secs: None,
     },
-    // ── mcp context_type — stance + cache (default for register_session) ──
+    // ── mcp context_type — stance + broad loadout + cache (register_session) ──
     SeedScript {
         path: "/etc/rc/mcp/create/S00-stance.md",
         context_type: "mcp",
@@ -269,6 +304,16 @@ const SEED_SCRIPTS: &[SeedScript] = &[
         name: "stance",
         extension: "md",
         content: MCP_STANCE_BODY,
+        timeout_secs: None,
+    },
+    SeedScript {
+        path: "/etc/rc/mcp/create/S10-binding.kai",
+        context_type: "mcp",
+        verb: "create",
+        sort_key: "S10",
+        name: "binding",
+        extension: "kai",
+        content: PERMISSIVE_BINDING_BODY,
         timeout_secs: None,
     },
     SeedScript {

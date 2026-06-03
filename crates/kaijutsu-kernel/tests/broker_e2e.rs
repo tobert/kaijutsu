@@ -75,6 +75,21 @@ async fn setup() -> Fixture {
         .await
         .expect("register_builtin_mcp_servers");
 
+    // Deny-by-default: a real context gets `*` + `facade:*` from its rc create
+    // lifecycle. Mirror that here so the happy-path tests exercise a context
+    // with the broad loadout; deny tests override the binding explicitly.
+    kernel
+        .broker()
+        .set_binding(
+            ctx_id,
+            ContextToolBinding {
+                all_instances: true,
+                all_facades: true,
+                ..Default::default()
+            },
+        )
+        .await;
+
     let exec_ctx = ExecContext::new(
         creator,
         ctx_id,
@@ -311,6 +326,9 @@ async fn kj_binding_allow_narrows_and_enforces_end_to_end() {
     use kaijutsu_kernel::{KjCaller, KjDispatcher, KjResult};
 
     let fx = setup().await;
+    // setup() seeds a broad loadout for happy-path tests; start this one from
+    // deny-all so the kj-set narrow binding is the only grant under test.
+    fx.kernel.broker().clear_binding(&fx.ctx_id).await;
 
     // Build a dispatcher over the fixture's kernel so `kj binding` mutates the
     // very broker we then inspect. Current-ref (default) resolves to the
@@ -321,12 +339,15 @@ async fn kj_binding_allow_narrows_and_enforces_end_to_end() {
         Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap())),
         fx.kernel.clone(),
     );
+    // Widening (`allow`) requires a privileged (rc) or admin caller — simulate
+    // the rc lifecycle that assigns loadouts.
     let caller = KjCaller {
         principal_id: fx.exec_ctx.principal_id,
         context_id: Some(fx.ctx_id),
         session_id: SessionId::new(),
         confirmed: false,
         rc_depth: 0,
+        privileged: true,
     };
 
     let argv: Vec<String> = ["binding", "allow", "builtin.file:read"]
@@ -346,8 +367,8 @@ async fn kj_binding_allow_narrows_and_enforces_end_to_end() {
         .binding(&fx.ctx_id)
         .await
         .expect("binding written by kj");
-    assert!(binding.allows(&InstanceId::new("builtin.file"), "read"));
-    assert!(!binding.allows(&InstanceId::new("builtin.file"), "write"));
+    assert!(binding.allows_tool(&InstanceId::new("builtin.file"), "read"));
+    assert!(!binding.allows_tool(&InstanceId::new("builtin.file"), "write"));
 
     // And it is enforced: write is refused, read passes the gate.
     let call_ctx = CallContext::new(
@@ -376,34 +397,27 @@ async fn kj_binding_allow_narrows_and_enforces_end_to_end() {
 }
 
 #[tokio::test]
-async fn check_facade_refuses_only_when_narrowed_and_ungranted() {
+async fn check_facade_denies_by_default_and_permits_when_granted() {
     use kaijutsu_kernel::mcp::Capability;
     let fx = setup().await;
     let broker = fx.kernel.broker();
+    // setup() seeds a broad loadout; reset to deny-all to test the gate.
+    broker.clear_binding(&fx.ctx_id).await;
 
-    // Never-bound context: facade-permissive.
-    assert!(broker.check_facade(&fx.ctx_id, "context_shell").await.is_ok());
-
-    // Narrow to a tool grant with no facades → facades refused.
-    let mut b = ContextToolBinding::new();
-    b.grant(Capability::Tool {
-        instance: InstanceId::new("builtin.file"),
-        tool: "read".into(),
-    });
-    broker.set_binding(fx.ctx_id, b).await;
+    // Never-bound context: deny-by-default — facades refused.
     assert!(
         matches!(
-            broker.check_facade(&fx.ctx_id, "context_shell").await,
+            broker.check_facade(&fx.ctx_id, "shell").await,
             Err(McpError::FacadeDenied { .. })
         ),
-        "narrowed binding without the facade must refuse"
+        "unbound context must refuse facades (deny-by-default)"
     );
 
     // Grant just that facade → it passes, siblings still refused.
-    let mut b2 = broker.binding(&fx.ctx_id).await.unwrap();
-    b2.grant(Capability::Facade("context_shell".into()));
-    broker.set_binding(fx.ctx_id, b2).await;
-    assert!(broker.check_facade(&fx.ctx_id, "context_shell").await.is_ok());
+    let mut b = ContextToolBinding::new();
+    b.grant(Capability::Facade("shell".into()));
+    broker.set_binding(fx.ctx_id, b).await;
+    assert!(broker.check_facade(&fx.ctx_id, "shell").await.is_ok());
     assert!(
         matches!(
             broker.check_facade(&fx.ctx_id, "submit_input").await,
@@ -411,38 +425,46 @@ async fn check_facade_refuses_only_when_narrowed_and_ungranted() {
         ),
         "ungranted sibling facade still refused"
     );
+
+    // `facade:*` (all_facades) grants every facade surface.
+    let mut b2 = broker.binding(&fx.ctx_id).await.unwrap();
+    b2.grant(Capability::AllFacades);
+    broker.set_binding(fx.ctx_id, b2).await;
+    assert!(broker.check_facade(&fx.ctx_id, "submit_input").await.is_ok());
 }
 
 #[tokio::test]
-async fn first_touch_seeding_is_facade_permissive() {
-    // Regression guard for the default-permissive trap: first-touch seeding
-    // makes the binding non-empty (all instances), and must ALSO seed facades
-    // — otherwise a plain mcp agent's context_shell would start getting
-    // refused the moment the in-kernel model touched one broker tool.
+async fn no_first_touch_seeding_under_deny_by_default() {
+    // Deny-by-default: listing tools for an unbound context must NOT seed a
+    // permissive binding — the context stays unbound and sees no tools.
     let fx = setup().await;
-    let _ = fx
+    let unbound = ContextId::new();
+    let defs = fx
         .kernel
-        .list_tool_defs_via_broker(fx.ctx_id, fx.exec_ctx.principal_id)
+        .list_tool_defs_via_broker(unbound, fx.exec_ctx.principal_id)
         .await;
-    let binding = fx.kernel.broker().binding(&fx.ctx_id).await.expect("seeded");
-    assert!(!binding.is_empty(), "first-touch seeded a non-empty binding");
-    for facade in ["context_shell", "shell", "submit_input", "read_input"] {
-        assert!(
-            fx.kernel.broker().check_facade(&fx.ctx_id, facade).await.is_ok(),
-            "first-touch seed must leave {facade} permissive"
-        );
-    }
+    assert!(defs.is_empty(), "unbound context must see no tools");
+    // list_visible_tools may write back a name_map, but it must NOT seed a
+    // permissive (granting) binding — deny-by-default holds.
+    assert!(
+        fx.kernel
+            .broker()
+            .binding(&unbound)
+            .await
+            .is_none_or(|b| b.is_empty()),
+        "listing must not auto-seed a granting binding"
+    );
 }
 
 #[tokio::test]
-async fn empty_binding_is_permissive_at_call_tool() {
-    // The never-bound sentinel (no grants) is default-permissive: call_tool
-    // must not refuse when no binding has been set. This is what keeps
-    // first-touch contexts and system callers working.
+async fn empty_binding_denies_at_call_tool() {
+    // Deny-by-default: an unbound context (no grants) must be REFUSED at
+    // call_tool. A fresh ContextId is never seeded, so it carries no binding.
     let fx = setup().await;
+    let unbound = ContextId::new();
     let call_ctx = CallContext::new(
         fx.exec_ctx.principal_id,
-        fx.ctx_id,
+        unbound,
         SessionId::new(),
         KernelId::new(),
     );
@@ -453,15 +475,15 @@ async fn empty_binding_is_permissive_at_call_tool() {
             KernelCallParams {
                 instance: InstanceId::new("builtin.file"),
                 tool: "write".into(),
-                arguments: serde_json::json!({"path": "/tmp/permissive", "content": "ok"}),
+                arguments: serde_json::json!({"path": "/tmp/denied", "content": "ok"}),
             },
             &call_ctx,
             CancellationToken::new(),
         )
         .await;
     assert!(
-        !matches!(res, Err(McpError::CapabilityDenied { .. })),
-        "unbound context must be permissive, got {res:?}"
+        matches!(res, Err(McpError::CapabilityDenied { .. })),
+        "unbound context must be denied (deny-by-default), got {res:?}"
     );
 }
 
@@ -857,10 +879,8 @@ async fn late_registration_visible_next_turn() {
         .await
         .expect("runtime register should succeed");
 
-    // Clear the binding so the next call auto-populates with the full
-    // instance list — simulates the admin-hatch path that reconciles
-    // bindings when a new MCP is registered.
-    fx.kernel.broker().clear_binding(&fx.ctx_id).await;
+    // fx.ctx_id holds the broad loadout (`all_instances`), so the next listing
+    // sees the newly-registered instance without any re-seeding.
 
     // Turn 2: `list_tool_defs_via_broker` must NOT return a cached list —
     // it queries the broker fresh, sees the newly-registered instance, and
@@ -1452,6 +1472,20 @@ async fn kernel_tools_resource_end_to_end() {
 async fn hooks_persist_across_kernel_restart() {
     let (fx, db) = setup_with_db().await;
     let sys = CallContext::system();
+    // Grant the admin context the broad loadout on kernel A so the capability
+    // gate passes — this test is about hook persistence, and we want the *hook*
+    // to be what denies builtin.block, not deny-by-default.
+    fx.kernel
+        .broker()
+        .set_binding(
+            sys.context_id,
+            ContextToolBinding {
+                all_instances: true,
+                all_facades: true,
+                ..Default::default()
+            },
+        )
+        .await;
 
     // --- Kernel A: install a PreCall Deny on builtin.block via admin. ---
     let add = fx
@@ -1523,6 +1557,18 @@ async fn hooks_persist_across_kernel_restart() {
     // set_db is the hydrate trigger. Before this call the HookTables
     // are empty; after, the persisted Deny is back in place.
     kernel2.broker().set_db(db.clone()).await;
+    // Same broad loadout for the admin context on kernel B.
+    kernel2
+        .broker()
+        .set_binding(
+            sys.context_id,
+            ContextToolBinding {
+                all_instances: true,
+                all_facades: true,
+                ..Default::default()
+            },
+        )
+        .await;
 
     // Kernel B: same Deny fires on the same instance. No new hook_add
     // was issued — if this passes, the hook came back from the DB.

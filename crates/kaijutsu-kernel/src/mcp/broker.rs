@@ -169,6 +169,14 @@ pub struct Broker {
     /// `set_kj_dispatcher` at bootstrap; `None` → hook scripts run
     /// without `kj` in their tool registry.
     kj_dispatcher: RwLock<Option<Weak<crate::kj::KjDispatcher>>>,
+    /// Deny-by-default switch for *unbound* contexts at `call_tool`. A real
+    /// kernel engages this in `Kernel::new` (`engage_unbound_deny`), so a
+    /// context with no binding is refused. Bare `Broker::new()` unit tests —
+    /// which exercise the hook/policy/notification pipeline, not the capability
+    /// gate — leave it off so they need no per-test binding. A context that
+    /// *has* a binding is always enforced against it (an empty binding denies),
+    /// regardless of this flag.
+    enforce_unbound_deny: std::sync::atomic::AtomicBool,
 }
 
 impl Default for Broker {
@@ -204,7 +212,26 @@ impl Broker {
             db: RwLock::new(None),
             kernel: RwLock::new(None),
             kj_dispatcher: RwLock::new(None),
+            enforce_unbound_deny: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Engage deny-by-default for unbound contexts at `call_tool`. Called once
+    /// by `Kernel::new` so every real kernel refuses a context that has no
+    /// binding. Idempotent.
+    pub fn engage_unbound_deny(&self) {
+        self.enforce_unbound_deny
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Relax the unbound-deny gate. Test-only: a kernel-backed test broker is
+    /// engaged by `Kernel::new`, but tests exercising the hook/policy pipeline
+    /// (not capabilities) call this so an unbound `CallContext::test()` is not
+    /// refused before the pipeline runs.
+    #[cfg(test)]
+    pub(crate) fn relax_unbound_deny_for_test(&self) {
+        self.enforce_unbound_deny
+            .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Wire a `Weak<Kernel>` so `HookBody::Kaish` evaluation can construct
@@ -267,6 +294,14 @@ impl Broker {
         // column is read by `row_to_entry` purely as provenance and
         // surfaced on `HookEntry.kaish_script_id`.
         let mut hooks = self.hooks.write().await;
+        // Reconstruct in place: clear persisted entries first so `set_db` is
+        // idempotent (it may be called more than once — e.g. bootstrap wiring
+        // plus an explicit re-hydrate — without double-loading the same rows).
+        hooks.pre_call.entries.clear();
+        hooks.post_call.entries.clear();
+        hooks.on_error.entries.clear();
+        hooks.on_notification.entries.clear();
+        hooks.list_tools.entries.clear();
         let mut loaded = 0usize;
         let mut skipped = 0usize;
         for row in rows {
@@ -779,7 +814,7 @@ impl Broker {
         for instance in &binding.candidate_instances() {
             if let Some(tools) = snapshots.get(instance) {
                 for kt in tools {
-                    if binding.allows(instance, &kt.name) {
+                    if binding.allows_tool(instance, &kt.name) {
                         pairs.insert((instance.clone(), kt.name.clone()));
                     }
                 }
@@ -1014,18 +1049,16 @@ impl Broker {
         }
     }
 
-    /// Capability gate for facade tools (`context_shell`, `shell`, `*_input`)
-    /// — the non-broker-routed surface the external agent reaches over RPC.
-    /// Mirrors the `Instance`/`Tool` refusal in `call_tool`: an absent or
-    /// empty binding is the never-bound / default-permissive sentinel, so a
-    /// facade is refused only once a binding has been explicitly narrowed and
-    /// does not grant it. Called from the MCP/RPC agent boundary, not the
-    /// broker call path (facades never enter `call_tool`).
+    /// Capability gate for facade tools (`shell`, `edit_input`, `submit_input`)
+    /// — the non-broker-routed surface that reaches the kernel over the shared
+    /// RPC handlers (`shell_execute`/`edit_input`/`submit_input`), which both
+    /// the human app and external agents cross. Deny-by-default through the one
+    /// [`ContextToolBinding::allows`] predicate: a facade is refused unless the
+    /// context's binding positively grants it (an absent binding grants
+    /// nothing). Facades never enter `call_tool`.
     pub async fn check_facade(&self, context_id: &ContextId, facade: &str) -> McpResult<()> {
-        if let Some(binding) = self.binding(context_id).await
-            && !binding.is_empty()
-            && !binding.allows_facade(facade)
-        {
+        let binding = self.binding(context_id).await.unwrap_or_default();
+        if !binding.allows(&super::binding::Capability::Facade(facade.to_string())) {
             return Err(McpError::FacadeDenied {
                 facade: facade.to_string(),
             });
@@ -1050,13 +1083,19 @@ impl Broker {
         // Candidate servers span every instance referenced by a grant —
         // instance-wide *or* tool-granular — so a context that was granted a
         // single `instance:tool` still has that instance's server queried.
+        // `all_instances` ("*") means every registered instance, which
+        // `candidate_instances()` cannot enumerate, so query the full registry.
         let servers: Vec<Arc<dyn McpServerLike>> = {
             let guard = self.instances.read().await;
-            binding
-                .candidate_instances()
-                .iter()
-                .filter_map(|id| guard.get(id).cloned())
-                .collect()
+            if binding.all_instances {
+                guard.values().cloned().collect()
+            } else {
+                binding
+                    .candidate_instances()
+                    .iter()
+                    .filter_map(|id| guard.get(id).cloned())
+                    .collect()
+            }
         };
 
         // Gather advertised tools, keeping only those the binding allows.
@@ -1068,7 +1107,7 @@ impl Broker {
             all.extend(
                 tools
                     .into_iter()
-                    .filter(|kt| binding.allows(&kt.instance, &kt.name)),
+                    .filter(|kt| binding.allows_tool(&kt.instance, &kt.name)),
             );
         }
 
@@ -1180,13 +1219,20 @@ impl Broker {
         // hides un-granted tools from the in-kernel model, but `call_tool` is
         // also reachable by anything that can name an `(instance, tool)` pair
         // directly (external agents, hook `Invoke` bodies). Enforce the same
-        // allow-set here so both drivers converge on one policy. An absent or
-        // empty binding is the never-bound / default-permissive sentinel —
-        // refuse only once a binding has been explicitly narrowed.
-        if let Some(binding) = self.binding(&ctx.context_id).await
-            && !binding.is_empty()
-            && !binding.allows(&params.instance, &params.tool)
-        {
+        // allow-set here so both drivers converge on one predicate.
+        // Deny-by-default: refuse unless the context's binding positively
+        // allows this `(instance, tool)`. No bypass — a hook `Invoke` body runs
+        // subject to its context's own binding. A context that HAS a binding is
+        // always enforced (an empty binding denies). An *unbound* context is
+        // refused only on a real kernel (`engage_unbound_deny`); bare-broker
+        // unit tests that don't touch the gate leave it permissive.
+        let allowed = match self.binding(&ctx.context_id).await {
+            Some(binding) => binding.allows_tool(&params.instance, &params.tool),
+            None => !self
+                .enforce_unbound_deny
+                .load(std::sync::atomic::Ordering::Relaxed),
+        };
+        if !allowed {
             return Err(McpError::CapabilityDenied {
                 instance: params.instance.clone(),
                 tool: params.tool.clone(),
@@ -3398,6 +3444,7 @@ mod tests {
                 builtin_hooks: BuiltinHookRegistry::new(),
                 kernel: RwLock::new(None),
                 kj_dispatcher: RwLock::new(None),
+                enforce_unbound_deny: std::sync::atomic::AtomicBool::new(false),
                 db: RwLock::new(None),
             }
         });
@@ -3571,6 +3618,7 @@ mod tests {
                 builtin_hooks: BuiltinHookRegistry::new(),
                 kernel: RwLock::new(None),
                 kj_dispatcher: RwLock::new(None),
+                enforce_unbound_deny: std::sync::atomic::AtomicBool::new(false),
                 db: RwLock::new(None),
             }
         });
@@ -4954,6 +5002,7 @@ mod tests {
                 builtin_hooks: BuiltinHookRegistry::new(),
                 kernel: RwLock::new(None),
                 kj_dispatcher: RwLock::new(None),
+                enforce_unbound_deny: std::sync::atomic::AtomicBool::new(false),
                 db: RwLock::new(None),
             }
         });
@@ -5317,6 +5366,9 @@ mod tests {
         broker.set_documents(store).await;
         broker.set_kernel(&kernel).await;
         broker.set_kj_dispatcher(&kj_dispatcher).await;
+        // Hook-pipeline test, not a capability test: relax deny-by-default so
+        // the unbound CallContext::test() reaches the hook.
+        broker.relax_unbound_deny_for_test();
 
         let svc = Arc::new(MockServer::new("svc").with_tool("t"));
         broker
@@ -5390,11 +5442,7 @@ mod tests {
         let broker2 = broker.clone();
         let panic_result = tokio::spawn(async move {
             broker2
-                .call_tool(
-                    params("svc", "t"),
-                    &CallContext::test(),
-                    CancellationToken::new(),
-                )
+                .call_tool(params("svc", "t"), &CallContext::test(), CancellationToken::new())
                 .await
         })
         .await;
@@ -6060,6 +6108,9 @@ mod tests {
         broker.set_documents(store).await;
         broker.set_kernel(&kernel).await;
         broker.set_kj_dispatcher(&kj_dispatcher).await;
+        // These hook-pipeline tests use unbound CallContext::test(); they are
+        // not about the capability gate, so relax the kernel's deny-by-default.
+        broker.relax_unbound_deny_for_test();
         (broker, kernel, kj_dispatcher)
     }
 

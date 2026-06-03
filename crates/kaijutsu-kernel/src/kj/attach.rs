@@ -118,6 +118,7 @@ mod tests {
             session_id: SessionId::new(),
             confirmed: false,
             rc_depth: 0,
+            privileged: false,
         }
     }
 

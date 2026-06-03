@@ -39,6 +39,11 @@ pub struct KjBuiltin {
     semantic_index: Option<Arc<kaijutsu_index::SemanticIndex>>,
     /// Block source adapter for fetching context blocks during synthesis.
     block_source: Arc<dyn kaijutsu_index::BlockSource>,
+    /// True only when registered by the rc lifecycle's privileged kaish.
+    /// Stamped onto every `KjCaller` this builtin constructs so the binding
+    /// setter can tell rc-assigned loadouts from agent-issued ones. Trusted
+    /// because the agent cannot influence how its `KjBuiltin` was built.
+    privileged: bool,
 }
 
 impl KjBuiltin {
@@ -49,6 +54,7 @@ impl KjBuiltin {
         session_id: SessionId,
         semantic_index: Option<Arc<kaijutsu_index::SemanticIndex>>,
         block_source: Arc<dyn kaijutsu_index::BlockSource>,
+        privileged: bool,
     ) -> Self {
         Self {
             dispatcher,
@@ -57,6 +63,7 @@ impl KjBuiltin {
             session_id,
             semantic_index,
             block_source,
+            privileged,
         }
     }
 
@@ -479,6 +486,7 @@ impl Tool for KjBuiltin {
             session_id: self.session_id,
             confirmed: false,
             rc_depth: 0,
+            privileged: self.privileged,
         };
 
         // If --confirm provided, verify nonce BEFORE dispatching
@@ -621,6 +629,7 @@ mod tests {
                 sid,
                 None,
                 Arc::new(crate::kj::lifecycle::NoopBlockSource),
+                false,
             ));
         };
 

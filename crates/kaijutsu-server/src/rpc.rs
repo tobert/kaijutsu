@@ -2534,6 +2534,10 @@ impl kernel::Server for KernelImpl {
                 session_id,
                 confirmed: false,
                 rc_depth: 0,
+                // Bookkeeping caller for run_rc_lifecycle; the privileged
+                // binding-write path is the rc kaish (materialize_context_kaish_rc),
+                // not this caller, so it stays unprivileged.
+                privileged: false,
             };
             if let Err(e) = kernel
                 .kj_dispatcher
@@ -2755,6 +2759,17 @@ impl kernel::Server for KernelImpl {
 
         Promise::from_future(
             async move {
+                // Shared facade gate (deny-by-default): humans (app) and agents
+                // (MCP) both reach shell execution through this RPC, so the
+                // allow-set is enforced here for everyone, keyed on the context
+                // binding — not on which client called.
+                kernel
+                    .kernel
+                    .broker()
+                    .check_facade(&context_id, "shell")
+                    .await
+                    .map_err(|e| capnp::Error::failed(format!("shell denied: {e}")))?;
+
                 let command_block_id = execute_shell_command(
                     &code,
                     context_id,
@@ -3892,7 +3907,7 @@ impl kernel::Server for KernelImpl {
         mut results: kernel::EditInputResults,
     ) -> Promise<(), capnp::Error> {
         let p = pry!(params.get());
-        let _trace_guard = extract_rpc_trace(p.get_trace(), "edit_input").entered();
+        let span = extract_rpc_trace(p.get_trace(), "edit_input");
         let context_id_bytes = pry!(p.get_context_id());
         let context_id = pry!(
             ContextId::try_from_slice(context_id_bytes)
@@ -3910,18 +3925,31 @@ impl kernel::Server for KernelImpl {
             delete
         );
 
-        let documents = &self.kernel.documents;
+        let kernel = self.kernel.clone();
+        Promise::from_future(
+            async move {
+                // Shared facade gate — both live compose typing (app) and the
+                // MCP write_input/edit_input handlers reach the input doc through
+                // this RPC, so the allow-set is enforced here for everyone.
+                kernel
+                    .kernel
+                    .broker()
+                    .check_facade(&context_id, "edit_input")
+                    .await
+                    .map_err(|e| capnp::Error::failed(format!("edit_input denied: {e}")))?;
 
-        match documents.edit_input(context_id, pos, &insert, delete) {
-            Ok(_ops) => {
-                // edit_input returns the ops and emits InputDocFlow::TextOps via FlowBus.
-                // The version is implicit from the DTE document; return 0 as ack.
-                // Clients use the FlowBus subscription for real-time sync.
-                results.get().set_ack_version(0);
-                Promise::ok(())
+                match kernel.documents.edit_input(context_id, pos, &insert, delete) {
+                    Ok(_ops) => {
+                        // edit_input emits InputDocFlow::TextOps via FlowBus; the
+                        // version is implicit from the DTE document, return 0 as ack.
+                        results.get().set_ack_version(0);
+                        Ok(())
+                    }
+                    Err(e) => Err(capnp::Error::failed(format!("edit_input failed: {}", e))),
+                }
             }
-            Err(e) => Promise::err(capnp::Error::failed(format!("edit_input failed: {}", e))),
-        }
+            .instrument(span),
+        )
     }
 
     fn get_input_state(
@@ -4012,6 +4040,15 @@ impl kernel::Server for KernelImpl {
 
         Promise::from_future(
             async move {
+                // Shared facade gate (deny-by-default): submit is reachable by
+                // both the app (Enter in compose) and the MCP submit_input tool.
+                kernel
+                    .kernel
+                    .broker()
+                    .check_facade(&context_id, "submit_input")
+                    .await
+                    .map_err(|e| capnp::Error::failed(format!("submit_input denied: {e}")))?;
+
                 let documents = kernel.documents.clone();
 
                 // Read text first, validate, THEN clear — avoids clearing compose
@@ -5201,35 +5238,6 @@ impl kernel::Server for KernelImpl {
         Promise::ok(())
     }
 
-    fn check_facade(
-        self: Rc<Self>,
-        params: kernel::CheckFacadeParams,
-        mut results: kernel::CheckFacadeResults,
-    ) -> Promise<(), capnp::Error> {
-        let p = pry!(params.get());
-        let _span = extract_rpc_trace(p.get_trace(), "check_facade").entered();
-        let context_id = pry!(
-            ContextId::try_from_slice(pry!(p.get_context_id()))
-                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
-        );
-        let facade = pry!(pry!(p.get_facade()).to_str()).to_owned();
-        let kernel = self.kernel.kernel.clone();
-
-        Promise::from_future(async move {
-            let mut r = results.get();
-            match kernel.broker().check_facade(&context_id, &facade).await {
-                Ok(()) => {
-                    r.set_allowed(true);
-                    r.set_reason("");
-                }
-                Err(e) => {
-                    r.set_allowed(false);
-                    r.set_reason(&e.to_string());
-                }
-            }
-            Ok(())
-        })
-    }
 }
 
 // ============================================================================

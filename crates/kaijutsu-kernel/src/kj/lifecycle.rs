@@ -229,7 +229,7 @@ async fn run_kai_script(
     // the phase see earlier ones' deliberate writes, never their transients.
     // rc uses the bare kj surface (no semantic index): `NoopBlockSource`.
     let kaish = match dispatcher
-        .materialize_context_kaish(
+        .materialize_context_kaish_rc(
             "rc",
             principal,
             new_id,
@@ -536,6 +536,7 @@ mod tests {
             session_id: kaijutsu_types::SessionId::new(),
             confirmed: false,
             rc_depth: 0,
+            privileged: false,
         }
     }
 

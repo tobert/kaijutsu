@@ -411,14 +411,18 @@ CREATE TABLE IF NOT EXISTS context_shell (
 );
 
 -- ── Context Tool Bindings (Phase 5, D-54) ───────────────────────
--- Per-context instance visibility + sticky name resolution, persisted so
--- curation survives kernel restart. First-touch loads from this set of
--- tables; fall-back to "bind all registered" only when the parent row is
--- absent. Normalized per feedback_sql_schema.md: the Rust struct
--- ContextToolBinding reconstructs by joining.
+-- Per-context capability allow-set + sticky name resolution, persisted so the
+-- loadout survives kernel restart. Deny-by-default: an absent parent row (or an
+-- all-empty one) grants nothing. Permissiveness is explicit — the all_instances
+-- / all_facades / binding_admin flags below. Normalized per
+-- feedback_sql_schema.md: the Rust struct ContextToolBinding reconstructs by
+-- joining.
 CREATE TABLE IF NOT EXISTS context_bindings (
-    context_id BLOB    NOT NULL PRIMARY KEY REFERENCES contexts(context_id) ON DELETE CASCADE,
-    updated_at INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER))
+    context_id    BLOB    NOT NULL PRIMARY KEY REFERENCES contexts(context_id) ON DELETE CASCADE,
+    all_instances INTEGER NOT NULL DEFAULT 0,  -- "*"        — every broker instance
+    all_facades   INTEGER NOT NULL DEFAULT 0,  -- "facade:*" — every facade surface
+    binding_admin INTEGER NOT NULL DEFAULT 0,  -- "admin"    — may write any context's loadout
+    updated_at    INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER))
 );
 
 -- Ordered list of allowed instances (Vec<InstanceId>). order_idx preserves
@@ -2284,10 +2288,21 @@ impl KernelDb {
     ) -> KernelDbResult<()> {
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT INTO context_bindings (context_id, updated_at)
-             VALUES (?1, ?2)
-             ON CONFLICT(context_id) DO UPDATE SET updated_at = excluded.updated_at",
-            params![blob_param(context_id.as_bytes()), now_millis()],
+            "INSERT INTO context_bindings
+                 (context_id, all_instances, all_facades, binding_admin, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(context_id) DO UPDATE SET
+                 all_instances = excluded.all_instances,
+                 all_facades   = excluded.all_facades,
+                 binding_admin = excluded.binding_admin,
+                 updated_at    = excluded.updated_at",
+            params![
+                blob_param(context_id.as_bytes()),
+                binding.all_instances as i64,
+                binding.all_facades as i64,
+                binding.binding_admin as i64,
+                now_millis(),
+            ],
         )?;
         tx.execute(
             "DELETE FROM context_binding_instances WHERE context_id = ?1",
@@ -2354,23 +2369,31 @@ impl KernelDb {
     }
 
     /// Load a `ContextToolBinding` for `context_id`, or `None` if the context
-    /// has never been bound. Callers fall back to "bind all registered"
-    /// (first-touch auto-populate) when this returns `None`.
+    /// has never been bound. Deny-by-default: callers treat `None` (and an
+    /// all-empty binding) as "grants nothing" — there is no first-touch
+    /// auto-populate.
     pub fn get_context_binding(
         &self,
         context_id: ContextId,
     ) -> KernelDbResult<Option<ContextToolBinding>> {
-        let exists: Option<i64> = self
+        let flags: Option<(bool, bool, bool)> = self
             .conn
             .query_row(
-                "SELECT 1 FROM context_bindings WHERE context_id = ?1",
+                "SELECT all_instances, all_facades, binding_admin
+                 FROM context_bindings WHERE context_id = ?1",
                 params![blob_param(context_id.as_bytes())],
-                |row| row.get(0),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)? != 0,
+                        row.get::<_, i64>(1)? != 0,
+                        row.get::<_, i64>(2)? != 0,
+                    ))
+                },
             )
             .ok();
-        if exists.is_none() {
+        let Some((all_instances, all_facades, binding_admin)) = flags else {
             return Ok(None);
-        }
+        };
 
         let mut allowed_instances: Vec<InstanceId> = {
             let mut stmt = self.conn.prepare(
@@ -2446,6 +2469,9 @@ impl KernelDb {
         }
 
         Ok(Some(ContextToolBinding {
+            all_instances,
+            all_facades,
+            binding_admin,
             allowed_instances,
             allowed_tools,
             allowed_facades,
@@ -2853,12 +2879,33 @@ impl KernelDb {
     // Context Config Fork + Workspace Query
     // ========================================================================
 
-    /// Copy shell config + env vars from source context to target.
-    /// Called during all fork operations.
-    pub fn fork_context_config(&self, source: ContextId, target: ContextId) -> KernelDbResult<()> {
+    /// Copy shell config + env vars + capability binding from source context
+    /// to target. Called during all fork operations. The binding copy makes
+    /// permissions follow the fork — under deny-by-default a fork would
+    /// otherwise start with no loadout and be locked out.
+    pub fn fork_context_config(&mut self, source: ContextId, target: ContextId) -> KernelDbResult<()> {
         self.copy_context_shell(source, target)?;
         self.copy_context_env(source, target)?;
+        self.copy_context_binding(source, target)?;
         Ok(())
+    }
+
+    /// Copy the capability binding (flags + instances + tools + facades +
+    /// sticky names) from `source` to `target`. No-op if the source has no
+    /// binding. The child can later attenuate (self-narrow) but inherits the
+    /// parent's loadout as its starting point.
+    pub fn copy_context_binding(
+        &mut self,
+        source: ContextId,
+        target: ContextId,
+    ) -> KernelDbResult<bool> {
+        match self.get_context_binding(source)? {
+            Some(binding) => {
+                self.upsert_context_binding(target, &binding)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
     /// Get workspace paths for a context (via contexts.workspace_id FK).
@@ -4105,7 +4152,7 @@ mod tests {
             instance: InstanceId::new("builtin.file"),
             tool: "grep".into(),
         });
-        original.grant(Capability::Facade("context_shell".into()));
+        original.grant(Capability::Facade("shell".into()));
         db.upsert_context_binding(ctx.context_id, &original).unwrap();
 
         let loaded = db
@@ -4119,20 +4166,69 @@ mod tests {
         );
         assert!(!loaded.is_empty(), "tool/facade grants make it non-empty");
         assert_eq!(loaded.allowed_tools.len(), 2, "both tool grants survived");
-        assert!(loaded.allows(&InstanceId::new("builtin.file"), "read"));
-        assert!(loaded.allows(&InstanceId::new("builtin.file"), "grep"));
+        assert!(loaded.allows_tool(&InstanceId::new("builtin.file"), "read"));
+        assert!(loaded.allows_tool(&InstanceId::new("builtin.file"), "grep"));
         assert!(
-            !loaded.allows(&InstanceId::new("builtin.file"), "write"),
+            !loaded.allows_tool(&InstanceId::new("builtin.file"), "write"),
             "ungranted sibling tool stays denied across restart"
         );
-        assert_eq!(loaded.allowed_facades, vec!["context_shell".to_string()]);
+        assert_eq!(loaded.allowed_facades, vec!["shell".to_string()]);
+    }
+
+    #[test]
+    fn context_binding_flags_roundtrip() {
+        use crate::mcp::Capability;
+        let mut db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("binding-flags"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+
+        let mut original = ContextToolBinding::new();
+        original.grant(Capability::AllInstances);
+        original.grant(Capability::AllFacades);
+        original.grant(Capability::Admin);
+        db.upsert_context_binding(ctx.context_id, &original).unwrap();
+
+        let loaded = db
+            .get_context_binding(ctx.context_id)
+            .unwrap()
+            .expect("binding should exist");
+        assert!(loaded.all_instances, "all_instances survived restart");
+        assert!(loaded.all_facades, "all_facades survived restart");
+        assert!(loaded.binding_admin, "binding_admin survived restart");
+    }
+
+    #[test]
+    fn fork_copies_binding() {
+        // Permissions follow the fork: copy_context_binding clones the parent's
+        // loadout so a fork is not locked out under deny-by-default.
+        use crate::mcp::Capability;
+        let mut db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let parent = make_context_row(Some("fork-parent"));
+        let child = make_context_row(Some("fork-child"));
+        insert_context_with_doc(&db, &parent, ws_id);
+        insert_context_with_doc(&db, &child, ws_id);
+
+        let mut b = ContextToolBinding::new();
+        b.grant(Capability::AllInstances);
+        b.grant(Capability::Facade("shell".into()));
+        db.upsert_context_binding(parent.context_id, &b).unwrap();
+
+        assert!(db.copy_context_binding(parent.context_id, child.context_id).unwrap());
+        let loaded = db
+            .get_context_binding(child.context_id)
+            .unwrap()
+            .expect("child inherited a binding");
+        assert!(loaded.all_instances);
+        assert!(loaded.allows(&Capability::Facade("shell".into())));
     }
 
     #[test]
     fn context_binding_get_absent_returns_none() {
         let db = KernelDb::in_memory().unwrap();
-        // No context, no upsert: get must return None so the broker can
-        // fall back to "bind all registered" on first touch.
+        // No context, no upsert: get must return None. Deny-by-default — the
+        // broker treats None as "grants nothing", no first-touch fallback.
         assert!(db.get_context_binding(ContextId::new()).unwrap().is_none());
     }
 
@@ -4854,7 +4950,7 @@ mod tests {
 
     #[test]
     fn fork_context_config_full() {
-        let db = KernelDb::in_memory().unwrap();
+        let mut db = KernelDb::in_memory().unwrap();
         let ws_id = setup_test_db(&db);
         let src = make_context_row(Some("fork-src"));
         let tgt = make_context_row(Some("fork-tgt"));
@@ -4888,7 +4984,7 @@ mod tests {
 
     #[test]
     fn fork_context_config_empty_source() {
-        let db = KernelDb::in_memory().unwrap();
+        let mut db = KernelDb::in_memory().unwrap();
         let ws_id = setup_test_db(&db);
         let src = make_context_row(Some("empty-src"));
         let tgt = make_context_row(Some("empty-tgt"));

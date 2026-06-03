@@ -199,6 +199,21 @@ impl McpServerLike for BuiltinBindingsServer {
             "bind" => {
                 let p: InstanceParams = serde_json::from_value(params.arguments.clone())
                     .map_err(McpError::InvalidParams)?;
+                // `bind` widens the loadout. Loadout-write policy: a context may
+                // not widen itself unless it holds binding-admin. (`unbind` is
+                // self-narrowing and stays open.) Mirrors `kj binding`'s guard
+                // for the non-broker setter; MCP tools are never rc-privileged.
+                let is_admin = broker
+                    .binding(&ctx.context_id)
+                    .await
+                    .map(|b| b.is_admin())
+                    .unwrap_or(false);
+                if !is_admin {
+                    return Err(McpError::CapabilityDenied {
+                        instance: self.instance_id.clone(),
+                        tool: "bind".to_string(),
+                    });
+                }
                 let instance = InstanceId::new(p.instance.clone());
                 broker.bind(ctx.context_id, instance).await;
                 let json = serde_json::json!({ "instance": p.instance });
@@ -426,6 +441,20 @@ mod tests {
             .unwrap();
 
         let ctx_id = ContextId::new();
+        // `bind` widens the loadout, so it requires binding-admin (loadout-write
+        // policy). Grant admin + the broad surface so the bindings tool is
+        // callable; `allowed_instances` (the explicit list `show` reports) stays
+        // empty because `all_instances` is a flag, not a list entry.
+        broker
+            .set_binding(
+                ctx_id,
+                crate::mcp::ContextToolBinding {
+                    all_instances: true,
+                    binding_admin: true,
+                    ..Default::default()
+                },
+            )
+            .await;
         let call_ctx = call_ctx_for(ctx_id);
 
         // Initially empty.
@@ -441,21 +470,8 @@ mod tests {
         assert_eq!(
             s0["allowed_instances"].as_array().unwrap().len(),
             0,
-            "fresh context must show no binding",
+            "fresh context must show no explicit instance grants",
         );
-
-        // Bind the admin instance first (while the binding is still the
-        // permissive sentinel) so the bindings tool stays callable once the
-        // binding is narrowed — the capability gate refuses any tool not in a
-        // non-empty allow-set, including the admin tool itself.
-        broker
-            .call_tool(
-                call_params("bind", serde_json::json!({ "instance": "builtin.bindings" })),
-                &call_ctx,
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
 
         // Bind "target".
         let result = broker

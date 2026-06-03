@@ -132,7 +132,7 @@ impl KjDispatcher {
 
         // Write-through: KernelDb then DriftRouter
         {
-            let db = self.kernel_db().lock();
+            let mut db = self.kernel_db().lock();
 
             // Inherit workspace from source
             let source_ws = db
@@ -336,7 +336,7 @@ impl KjDispatcher {
 
         // Write-through
         {
-            let db = self.kernel_db().lock();
+            let mut db = self.kernel_db().lock();
 
             let source_ws = db
                 .get_context(source_id)
@@ -575,7 +575,7 @@ impl KjDispatcher {
 
         // Write-through: KernelDb then DriftRouter
         {
-            let db = self.kernel_db().lock();
+            let mut db = self.kernel_db().lock();
 
             let source_ws = db
                 .get_context(source_id)
@@ -799,7 +799,7 @@ impl KjDispatcher {
 
         // Create new contexts (BFS order — template_nodes is already ordered by depth)
         {
-            let db = self.kernel_db().lock();
+            let mut db = self.kernel_db().lock();
 
             for (row, _depth) in &template_nodes {
                 let new_id = id_map[&row.context_id];

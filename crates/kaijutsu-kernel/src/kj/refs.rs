@@ -143,6 +143,7 @@ mod tests {
             session_id: kaijutsu_types::SessionId::new(),
             confirmed: false,
             rc_depth: 0,
+            privileged: false,
         };
 
         let result = resolve_context_ref(&ContextRef::Current, &caller, &db);
@@ -182,6 +183,7 @@ mod tests {
             session_id: kaijutsu_types::SessionId::new(),
             confirmed: false,
             rc_depth: 0,
+            privileged: false,
         };
 
         let result = resolve_context_ref(&ContextRef::Parent(1), &caller, &db);
@@ -274,6 +276,7 @@ mod tests {
             session_id: kaijutsu_types::SessionId::new(),
             confirmed: false,
             rc_depth: 0,
+            privileged: false,
         };
 
         // .parent → parent_id

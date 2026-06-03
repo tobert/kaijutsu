@@ -10,35 +10,53 @@
 //! kj binding show   [<ctx>]
 //! kj binding allow  <cap> [<ctx>]
 //! kj binding revoke <cap> [<ctx>]
-//! kj binding reset  [<ctx>]          # back to default-permissive (clear)
+//! kj binding reset  [<ctx>]          # clear → deny-all (deny-by-default)
 //! ```
 //!
 //! A `<cap>` is one of:
 //!   • `builtin.file`              — instance-wide grant (every tool on it)
 //!   • `builtin.file:read`         — a single tool on an instance
-//!   • `facade:context_shell`      — a facade surface (broker-call enforcement
-//!                                   is a follow-up; the grant is recorded)
+//!   • `facade:shell`              — a facade surface (shell / edit_input / submit_input)
+//!   • `*`                         — every instance (explicit permissive)
+//!   • `facade:*`                  — every facade surface
+//!   • `admin`                     — binding-admin (write any context's loadout)
 //!
-//! Semantics: a context with **no** binding is default-permissive (first
-//! touch seeds every instance). The first `allow` narrows it to exactly what
-//! is granted — that is how read-only roles are built. `revoke` removes a
+//! Semantics: **deny-by-default** — a context with no binding grants nothing.
+//! The rc `create`/`fork` lifecycle assigns the initial loadout (broad roles
+//! grant `*` + `facade:*`; read-only roles enumerate). `revoke` removes a
 //! grant; it does not add a deny (denying one tool of an otherwise-allowed
 //! instance is the dynamic hook layer's job, not the static allow-set).
+//!
+//! Write policy ([`KjDispatcher::authorize_binding_write`]): the rc lifecycle
+//! (privileged kaish) or a `binding_admin` context may widen / target any
+//! context; an ordinary context may only narrow (`revoke`/`reset`) **its own**
+//! loadout — it cannot self-escalate even though `kj` bypasses `call_tool`.
 
-use kaijutsu_types::ContentType;
+use kaijutsu_types::{ContentType, ContextId};
 
 use crate::mcp::{Capability, InstanceId};
 
 use super::refs::resolve_context_arg;
 use super::{KjCaller, KjDispatcher, KjResult};
 
-/// Parse a capability token. Order matters: the `facade:` prefix is checked
-/// before the generic `instance:tool` split so a facade name containing no
-/// colon still routes correctly.
+/// Parse a capability token. Order matters: the wildcards and the `facade:`
+/// prefix are checked before the generic `instance:tool` split so a facade name
+/// containing no colon still routes correctly.
+///
+/// Wildcards make default-permissive explicit (deny-by-default everywhere else):
+///   `*`        → every broker instance (`AllInstances`)
+///   `facade:*` → every facade surface (`AllFacades`)
+///   `admin`    → binding-admin (may write any context's loadout)
 fn parse_capability(s: &str) -> Result<Capability, String> {
+    match s {
+        "*" => return Ok(Capability::AllInstances),
+        "facade:*" => return Ok(Capability::AllFacades),
+        "admin" => return Ok(Capability::Admin),
+        _ => {}
+    }
     if let Some(rest) = s.strip_prefix("facade:") {
         if rest.is_empty() {
-            return Err("kj binding: `facade:` needs a name (e.g. facade:context_shell)".into());
+            return Err("kj binding: `facade:` needs a name (e.g. facade:shell)".into());
         }
         return Ok(Capability::Facade(rest.to_string()));
     }
@@ -84,7 +102,7 @@ impl KjDispatcher {
             "  kj binding allow  <cap> [<ctx>]\n",
             "  kj binding revoke <cap> [<ctx>]\n",
             "  kj binding reset  [<ctx>]\n\n",
-            "  <cap>: <instance> | <instance>:<tool> | facade:<name>\n",
+            "  <cap>: <instance> | <instance>:<tool> | facade:<name> | * | facade:* | admin\n",
             "  <ctx>: . (default) | .parent | <label> | <hex prefix>\n"
         )
         .to_string()
@@ -179,6 +197,13 @@ impl KjDispatcher {
             }
         };
 
+        // `allow` widens the loadout; `revoke` narrows it. Only the rc
+        // lifecycle or a binding-admin context may widen / touch another
+        // context — everyone else may only attenuate their own.
+        if let Err(e) = self.authorize_binding_write(caller, ctx_id, allow).await {
+            return KjResult::Err(e);
+        }
+
         let broker = self.kernel().broker();
         let mut binding = broker.binding(&ctx_id).await.unwrap_or_default();
         if allow {
@@ -200,11 +225,57 @@ impl KjDispatcher {
                 Err(e) => return KjResult::Err(e),
             }
         };
+        // reset clears the binding → deny-all. Pure attenuation, so an ordinary
+        // context may reset itself; targeting another context still needs admin.
+        if let Err(e) = self.authorize_binding_write(caller, ctx_id, false).await {
+            return KjResult::Err(e);
+        }
         self.kernel().broker().clear_binding(&ctx_id).await;
         KjResult::ok(format!(
-            "reset context {} to default-permissive",
+            "reset context {} — now denies all (deny-by-default; grant with `kj binding allow`)",
             ctx_id.short()
         ))
+    }
+
+    /// Authorize a binding *write* on `target` from `caller`. Three tiers:
+    /// rc-privileged (the lifecycle assigning loadouts) → anything; a
+    /// binding-admin context → anything, any target; otherwise → only narrowing
+    /// (`widening == false`) of the caller's *own* context. Widening is `allow`
+    /// (grant); narrowing is `revoke`/`reset`.
+    async fn authorize_binding_write(
+        &self,
+        caller: &KjCaller,
+        target: ContextId,
+        widening: bool,
+    ) -> Result<(), String> {
+        if caller.privileged {
+            return Ok(());
+        }
+        let caller_ctx = caller.context_id;
+        let is_admin = match caller_ctx {
+            Some(c) => self
+                .kernel()
+                .broker()
+                .binding(&c)
+                .await
+                .map(|b| b.is_admin())
+                .unwrap_or(false),
+            None => false,
+        };
+        if is_admin {
+            return Ok(());
+        }
+        if caller_ctx != Some(target) {
+            return Err("kj binding: only a binding-admin context (or the rc lifecycle) \
+                 may modify another context's loadout"
+                .to_string());
+        }
+        if widening {
+            return Err("kj binding: this context may only narrow (revoke) its own loadout; \
+                 widening needs a binding-admin context or the rc lifecycle"
+                .to_string());
+        }
+        Ok(())
     }
 }
 
@@ -213,6 +284,9 @@ fn cap_label(cap: &Capability) -> String {
         Capability::Instance(i) => i.as_str().to_string(),
         Capability::Tool { instance, tool } => format!("{}:{}", instance.as_str(), tool),
         Capability::Facade(name) => format!("facade:{name}"),
+        Capability::AllInstances => "*".to_string(),
+        Capability::AllFacades => "facade:*".to_string(),
+        Capability::Admin => "admin".to_string(),
     }
 }
 
@@ -230,17 +304,22 @@ mod tests {
     async fn kj_binding_allow_show_revoke_reset_round_trip() {
         let d = test_dispatcher().await;
         let ctx = register_context(&d, Some("bind-test"), None, PrincipalId::system());
-        let caller = caller_with_context(ctx);
+        // Widening (`allow`) requires a privileged (rc) or admin caller — the
+        // rc lifecycle is what assigns loadouts. Simulate the rc path here.
+        let caller = KjCaller {
+            privileged: true,
+            ..caller_with_context(ctx)
+        };
         let file = InstanceId::new("builtin.file");
 
-        // Granting one tool narrows an otherwise-permissive context.
+        // Granting one tool builds a loadout from deny-all (deny-by-default).
         let r = d
             .dispatch(&argv(&["binding", "allow", "builtin.file:read"]), &caller)
             .await;
         assert!(!matches!(r, KjResult::Err(_)), "allow failed: {r:?}");
         let b = d.kernel().broker().binding(&ctx).await.expect("bound");
-        assert!(b.allows(&file, "read"), "granted tool not allowed");
-        assert!(!b.allows(&file, "write"), "ungranted sibling leaked");
+        assert!(b.allows_tool(&file, "read"), "granted tool not allowed");
+        assert!(!b.allows_tool(&file, "write"), "ungranted sibling leaked");
 
         // show returns structured data listing the grant.
         let show = d.dispatch(&argv(&["binding", "show"]), &caller).await;
@@ -257,14 +336,97 @@ mod tests {
             .await;
         assert!(!matches!(r, KjResult::Err(_)), "revoke failed: {r:?}");
         let b = d.kernel().broker().binding(&ctx).await.expect("still bound");
-        assert!(!b.allows(&file, "read"), "revoke did not remove grant");
+        assert!(!b.allows_tool(&file, "read"), "revoke did not remove grant");
 
-        // reset clears the binding back to default-permissive (no row).
+        // reset clears the binding → deny-all (no row).
         let r = d.dispatch(&argv(&["binding", "reset"]), &caller).await;
         assert!(!matches!(r, KjResult::Err(_)), "reset failed: {r:?}");
         assert!(
             d.kernel().broker().binding(&ctx).await.is_none(),
             "reset should clear the binding"
+        );
+    }
+
+    #[tokio::test]
+    async fn loadout_write_guard_enforces_self_narrow_only() {
+        // Deny-by-default + write policy: an ordinary (non-rc, non-admin)
+        // context may narrow its OWN loadout but never widen, and never touch
+        // another context.
+        let d = test_dispatcher().await;
+        let ctx = register_context(&d, Some("ordinary"), None, PrincipalId::system());
+        let other = register_context(&d, Some("other"), None, PrincipalId::system());
+        let file = InstanceId::new("builtin.file");
+
+        // Seed a loadout as the rc lifecycle would (privileged).
+        let rc = KjCaller {
+            privileged: true,
+            ..caller_with_context(ctx)
+        };
+        let r = d.dispatch(&argv(&["binding", "allow", "builtin.file:read"]), &rc).await;
+        assert!(!matches!(r, KjResult::Err(_)), "rc allow failed: {r:?}");
+
+        // Ordinary caller in `ctx` (not privileged, not admin).
+        let me = caller_with_context(ctx);
+
+        // Widen own loadout → DENIED.
+        let r = d.dispatch(&argv(&["binding", "allow", "builtin.file:write"]), &me).await;
+        assert!(matches!(r, KjResult::Err(_)), "self-widen must be denied");
+        let b = d.kernel().broker().binding(&ctx).await.expect("bound");
+        assert!(!b.allows_tool(&file, "write"), "denied widen still mutated");
+
+        // Narrow own loadout → ALLOWED.
+        let r = d.dispatch(&argv(&["binding", "revoke", "builtin.file:read"]), &me).await;
+        assert!(!matches!(r, KjResult::Err(_)), "self-narrow must be allowed: {r:?}");
+        let b = d.kernel().broker().binding(&ctx).await.expect("still bound");
+        assert!(!b.allows_tool(&file, "read"), "self-narrow did not take effect");
+
+        // Self-grant of admin → DENIED (no self-escalation).
+        let r = d.dispatch(&argv(&["binding", "allow", "admin"]), &me).await;
+        assert!(matches!(r, KjResult::Err(_)), "self-grant admin must be denied");
+
+        // Touch ANOTHER context → DENIED for a non-admin.
+        let r = d
+            .dispatch(&argv(&["binding", "revoke", "builtin.file:read", &other.to_hex()]), &me)
+            .await;
+        assert!(matches!(r, KjResult::Err(_)), "cross-context write must be denied");
+    }
+
+    #[tokio::test]
+    async fn admin_context_may_widen_and_target_others() {
+        // A binding_admin context (director) may widen its own loadout and
+        // write another context's — the "everything + manage others" path.
+        let d = test_dispatcher().await;
+        let admin_ctx = register_context(&d, Some("director"), None, PrincipalId::system());
+        let target = register_context(&d, Some("managed"), None, PrincipalId::system());
+
+        // Make admin_ctx an admin (privileged rc bootstrap).
+        let rc = KjCaller {
+            privileged: true,
+            ..caller_with_context(admin_ctx)
+        };
+        let r = d.dispatch(&argv(&["binding", "allow", "admin"]), &rc).await;
+        assert!(!matches!(r, KjResult::Err(_)), "rc admin grant failed: {r:?}");
+
+        // Now act as the (non-privileged) admin context.
+        let admin = caller_with_context(admin_ctx);
+
+        // Widen self → allowed (admin).
+        let r = d.dispatch(&argv(&["binding", "allow", "*"]), &admin).await;
+        assert!(!matches!(r, KjResult::Err(_)), "admin self-widen failed: {r:?}");
+        assert!(d.kernel().broker().binding(&admin_ctx).await.unwrap().all_instances);
+
+        // Widen ANOTHER context → allowed (admin).
+        let r = d
+            .dispatch(&argv(&["binding", "allow", "builtin.file:read", &target.to_hex()]), &admin)
+            .await;
+        assert!(!matches!(r, KjResult::Err(_)), "admin cross-context write failed: {r:?}");
+        assert!(
+            d.kernel()
+                .broker()
+                .binding(&target)
+                .await
+                .unwrap()
+                .allows_tool(&InstanceId::new("builtin.file"), "read")
         );
     }
 
