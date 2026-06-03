@@ -116,6 +116,11 @@ impl EmbeddedKaish {
             session_contexts.clone(),
             session_id,
         ));
+        // The shared CRDT file cache: same instance the MCP file tools use
+        // (installed at server startup), or lazily built from this block store
+        // in embedded/test paths. Routing MountBackend through it is the whole
+        // point of kaish — shell scripting on the same CRDT substrate.
+        let file_cache = kernel.file_cache(&blocks);
         let docs_backend = Arc::new(KaijutsuBackend::new(
             blocks,
             kernel.clone(),
@@ -125,8 +130,11 @@ impl EmbeddedKaish {
                     ));
         let mount_table = kernel.vfs().clone();
 
-        let mount_backend: Arc<dyn KernelBackend> =
-            Arc::new(MountBackend::new(mount_table, docs_backend.clone()));
+        let mount_backend: Arc<dyn KernelBackend> = Arc::new(MountBackend::new(
+            mount_table,
+            docs_backend.clone(),
+            file_cache,
+        ));
 
         let docs_fs = Arc::new(KaijutsuFilesystem::new(docs_backend));
 

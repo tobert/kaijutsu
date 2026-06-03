@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use kaijutsu_types::PrincipalId;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -69,6 +70,12 @@ pub struct Kernel {
     /// MCP connect/handshake. Per-instance MCP `call_timeout` overrides live
     /// on `InstancePolicy`.
     timeouts: kaijutsu_types::TimeoutPolicy,
+    /// Shared CRDT file-document cache. Both the MCP `builtin.file` tools and
+    /// the kaish `MountBackend` resolve through this one instance so a single
+    /// real file maps to a single CRDT document regardless of surface. Set
+    /// explicitly by the server at startup; lazily initialized from a block
+    /// store otherwise (tests, embedded callers).
+    file_cache: OnceLock<Arc<crate::file_tools::FileDocumentCache>>,
 }
 
 impl std::fmt::Debug for Kernel {
@@ -130,6 +137,7 @@ impl Kernel {
                 b
             }),
             timeouts: kaijutsu_types::TimeoutPolicy::default(),
+            file_cache: OnceLock::new(),
         }
     }
 
@@ -164,6 +172,7 @@ impl Kernel {
                 b
             }),
             timeouts: kaijutsu_types::TimeoutPolicy::default(),
+            file_cache: OnceLock::new(),
         }
     }
 
@@ -571,6 +580,36 @@ impl Kernel {
     /// Get the VFS mount table.
     pub fn vfs(&self) -> &Arc<MountTable> {
         &self.vfs
+    }
+
+    /// Install the shared CRDT file-document cache. Called once by the server
+    /// at startup with the same instance handed to the MCP `builtin.file`
+    /// tools, so the kaish `MountBackend` and the tools share one cache.
+    /// Returns whether it was set (false if already initialized).
+    pub fn set_file_cache(
+        &self,
+        cache: Arc<crate::file_tools::FileDocumentCache>,
+    ) -> bool {
+        self.file_cache.set(cache).is_ok()
+    }
+
+    /// Get the shared CRDT file-document cache, lazily building one from
+    /// `blocks` + the kernel VFS if the server never installed one (tests,
+    /// embedded callers). The lazy instance is backed by the same block store
+    /// and mount table, so it stays coherent with any other instance over the
+    /// shared CRDT documents.
+    pub fn file_cache(
+        &self,
+        blocks: &crate::block_store::SharedBlockStore,
+    ) -> Arc<crate::file_tools::FileDocumentCache> {
+        self.file_cache
+            .get_or_init(|| {
+                Arc::new(crate::file_tools::FileDocumentCache::new(
+                    blocks.clone(),
+                    self.vfs.clone(),
+                ))
+            })
+            .clone()
     }
 
     /// Mount a filesystem at the given path.

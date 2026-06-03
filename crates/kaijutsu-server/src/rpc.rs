@@ -1026,6 +1026,9 @@ pub async fn create_shared_kernel(
         documents.clone(),
         kernel_arc.vfs().clone(),
     ));
+    // Share this exact instance with the kaish MountBackend so both surfaces
+    // map a real file to the same CRDT document.
+    kernel_arc.set_file_cache(file_cache_for_broker.clone());
     if let Err(e) = kernel_arc
         .register_builtin_mcp_servers(
             documents.clone(),

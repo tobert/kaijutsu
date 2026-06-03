@@ -24,25 +24,82 @@ use kaish_kernel::{
     BackendError, BackendResult, KernelBackend, PatchOp, ReadRange, ToolInfo, ToolResult, WriteMode,
 };
 
+use crate::file_tools::path::resolve_str;
+use crate::file_tools::FileDocumentCache;
 use crate::vfs::{FileType, MountTable, VfsError, VfsOps};
 
 use super::kaish_backend::KaijutsuBackend;
 
-/// Routes file operations through kaijutsu's `MountTable` and tool
-/// calls through the CRDT backends.
+/// Routes file *content* operations through the shared CRDT
+/// `FileDocumentCache` and directory/metadata/tool operations through
+/// kaijutsu's `MountTable`.
+///
+/// This is what makes kaish "shell scripting on the same CRDT substrate":
+/// a `cat`/`read`/`write`/`edit` from the shell hits the same CRDT document
+/// the MCP `builtin.file` tools use, keyed by the canonical absolute path.
+/// Binary files (not representable as CRDT text) fall through to the raw
+/// `MountTable`; that fallthrough is a deliberate type distinction, not a
+/// silent error-swallow.
 pub struct MountBackend {
-    /// Kaijutsu kernel's VFS mount table for real filesystem access.
+    /// Kaijutsu kernel's VFS mount table — directory/metadata ops and the
+    /// binary-file fallback path.
     mount_table: Arc<MountTable>,
+    /// Shared CRDT file-document cache — the source of truth for text file
+    /// content across both the kaish and MCP surfaces.
+    file_cache: Arc<FileDocumentCache>,
     /// CRDT backend for document tool dispatch.
     docs_tools: Arc<KaijutsuBackend>,
 }
 
 impl MountBackend {
     /// Create a new MountBackend.
-    pub fn new(mount_table: Arc<MountTable>, docs_tools: Arc<KaijutsuBackend>) -> Self {
+    pub fn new(
+        mount_table: Arc<MountTable>,
+        docs_tools: Arc<KaijutsuBackend>,
+        file_cache: Arc<FileDocumentCache>,
+    ) -> Self {
         Self {
             mount_table,
+            file_cache,
             docs_tools,
+        }
+    }
+
+    /// Canonicalize an (already absolute) backend path into the cache key form,
+    /// so the kaish surface and the MCP surface address one CRDT document per
+    /// real file. Rejects `..`-escapes above root (untrusted input → refuse,
+    /// never silently clamp).
+    fn cache_key(&self, path: &Path) -> BackendResult<String> {
+        resolve_str(Path::new("/"), &path.to_string_lossy())
+            .map_err(|e| BackendError::PermissionDenied(e.to_string()))
+    }
+}
+
+/// Apply a `ReadRange` to a byte buffer (line- or offset-based windowing).
+fn apply_range(data: Vec<u8>, range: Option<ReadRange>) -> Vec<u8> {
+    match range {
+        None => data,
+        Some(range) => {
+            if let (Some(start), Some(end)) = (range.start_line, range.end_line) {
+                let text = String::from_utf8_lossy(&data);
+                let lines: Vec<&str> = text.lines().collect();
+                let start = (start.saturating_sub(1)).min(lines.len());
+                let end = end.min(lines.len());
+                let selected: Vec<&str> = lines[start..end].to_vec();
+                selected.join("\n").into_bytes()
+            } else if let Some(off) = range.offset {
+                let off = off as usize;
+                if off >= data.len() {
+                    Vec::new()
+                } else if let Some(lim) = range.limit {
+                    let end = (off + lim as usize).min(data.len());
+                    data[off..end].to_vec()
+                } else {
+                    data[off..].to_vec()
+                }
+            } else {
+                data
+            }
         }
     }
 }
@@ -116,112 +173,113 @@ impl KernelBackend for MountBackend {
     // =========================================================================
 
     async fn read(&self, path: &Path, range: Option<ReadRange>) -> BackendResult<Vec<u8>> {
-        match range {
-            None => {
-                // Read entire file
-                self.mount_table
-                    .read_all(path)
-                    .await
-                    .map_err(vfs_to_backend)
-            }
-            Some(ReadRange {
-                offset: Some(off),
-                limit: Some(lim),
-                ..
-            }) => self
-                .mount_table
-                .read(path, off, lim as u32)
-                .await
-                .map_err(vfs_to_backend),
-            Some(range) => {
-                // Line-based or partial: read all then slice
+        let key = self.cache_key(path)?;
+        match self.file_cache.read_content(&key).await {
+            Ok(text) => Ok(apply_range(text.into_bytes(), range)),
+            Err(_) => {
+                // Not loadable as CRDT text — either missing or binary.
+                // Distinguish by existence, then read raw bytes so `cat` on a
+                // binary file still works.
+                if !self.mount_table.exists(path).await {
+                    return Err(BackendError::NotFound(path.display().to_string()));
+                }
                 let data = self
                     .mount_table
                     .read_all(path)
                     .await
                     .map_err(vfs_to_backend)?;
-
-                if let (Some(start), Some(end)) = (range.start_line, range.end_line) {
-                    let text = String::from_utf8_lossy(&data);
-                    let lines: Vec<&str> = text.lines().collect();
-                    let start = (start.saturating_sub(1)).min(lines.len());
-                    let end = end.min(lines.len());
-                    let selected: Vec<&str> = lines[start..end].to_vec();
-                    Ok(selected.join("\n").into_bytes())
-                } else if let Some(off) = range.offset {
-                    let off = off as usize;
-                    if off >= data.len() {
-                        Ok(Vec::new())
-                    } else if let Some(lim) = range.limit {
-                        let end = (off + lim as usize).min(data.len());
-                        Ok(data[off..end].to_vec())
-                    } else {
-                        Ok(data[off..].to_vec())
-                    }
-                } else {
-                    Ok(data)
-                }
+                Ok(apply_range(data, range))
             }
         }
     }
 
     async fn write(&self, path: &Path, content: &[u8], mode: WriteMode) -> BackendResult<()> {
-        match mode {
-            WriteMode::CreateNew => {
-                if self.mount_table.exists(path).await {
+        let key = self.cache_key(path)?;
+
+        // Binary content can't live in the CRDT text substrate: write raw and
+        // drop any cached text doc so a later read reloads fresh.
+        let text = match std::str::from_utf8(content) {
+            Ok(t) => t,
+            Err(_) => {
+                if matches!(mode, WriteMode::CreateNew) && self.mount_table.exists(path).await {
                     return Err(BackendError::AlreadyExists(path.display().to_string()));
                 }
-                self.mount_table
-                    .create(path, 0o644)
-                    .await
-                    .map_err(vfs_to_backend)?;
-                self.mount_table
-                    .write(path, 0, content)
-                    .await
-                    .map_err(vfs_to_backend)?;
-                Ok(())
-            }
-            WriteMode::UpdateOnly => {
-                if !self.mount_table.exists(path).await {
+                if matches!(mode, WriteMode::UpdateOnly) && !self.mount_table.exists(path).await {
                     return Err(BackendError::NotFound(path.display().to_string()));
                 }
                 self.mount_table
                     .write_all(path, content)
                     .await
-                    .map_err(vfs_to_backend)
+                    .map_err(vfs_to_backend)?;
+                self.file_cache.invalidate(&key);
+                return Ok(());
             }
-            WriteMode::Overwrite | WriteMode::Truncate => self
-                .mount_table
-                .write_all(path, content)
-                .await
-                .map_err(vfs_to_backend),
-            _ => Err(BackendError::InvalidOperation(
-                "unsupported write mode".into(),
-            )),
+        };
+
+        match mode {
+            WriteMode::CreateNew => {
+                if self.file_cache.exists(&key).await {
+                    return Err(BackendError::AlreadyExists(path.display().to_string()));
+                }
+            }
+            WriteMode::UpdateOnly => {
+                if !self.file_cache.exists(&key).await {
+                    return Err(BackendError::NotFound(path.display().to_string()));
+                }
+            }
+            WriteMode::Overwrite | WriteMode::Truncate => {}
+            _ => {
+                return Err(BackendError::InvalidOperation(
+                    "unsupported write mode".into(),
+                ));
+            }
         }
+
+        self.file_cache
+            .create_or_replace(&key, text)
+            .await
+            .map_err(BackendError::Io)?;
+        self.file_cache.mark_dirty(&key);
+        // Write-through: external tools (cargo, git) read the real filesystem,
+        // so flush the CRDT content out immediately rather than deferring.
+        self.file_cache.flush_one(&key).await.map_err(BackendError::Io)
     }
 
     async fn append(&self, path: &Path, content: &[u8]) -> BackendResult<()> {
-        let attr = self
-            .mount_table
-            .getattr(path)
+        let key = self.cache_key(path)?;
+        let suffix = match std::str::from_utf8(content) {
+            Ok(s) => s,
+            Err(_) => {
+                // Binary append: raw VFS append, then drop the stale text doc.
+                let attr = self.mount_table.getattr(path).await.map_err(vfs_to_backend)?;
+                self.mount_table
+                    .write(path, attr.size, content)
+                    .await
+                    .map_err(vfs_to_backend)?;
+                self.file_cache.invalidate(&key);
+                return Ok(());
+            }
+        };
+        // Append onto current CRDT content (empty if the file is new).
+        let existing = self.file_cache.read_content(&key).await.unwrap_or_default();
+        let combined = format!("{existing}{suffix}");
+        self.file_cache
+            .create_or_replace(&key, &combined)
             .await
-            .map_err(vfs_to_backend)?;
-        self.mount_table
-            .write(path, attr.size, content)
-            .await
-            .map_err(vfs_to_backend)?;
-        Ok(())
+            .map_err(BackendError::Io)?;
+        self.file_cache.mark_dirty(&key);
+        self.file_cache.flush_one(&key).await.map_err(BackendError::Io)
     }
 
     async fn patch(&self, path: &Path, ops: &[PatchOp]) -> BackendResult<()> {
-        // Read current content, apply patches in memory, write back
-        let mut data = self
-            .mount_table
-            .read_all(path)
+        // Read current content from the CRDT cache, apply patches in memory,
+        // write back through the cache so the document stays the source of truth.
+        let key = self.cache_key(path)?;
+        let mut text = self
+            .file_cache
+            .read_content(&key)
             .await
-            .map_err(vfs_to_backend)?;
-        let mut text = String::from_utf8_lossy(&data).to_string();
+            .map_err(BackendError::Io)?;
 
         for op in ops {
             match op {
@@ -348,11 +406,12 @@ impl KernelBackend for MountBackend {
             }
         }
 
-        data = text.into_bytes();
-        self.mount_table
-            .write_all(path, &data)
+        self.file_cache
+            .create_or_replace(&key, &text)
             .await
-            .map_err(vfs_to_backend)
+            .map_err(BackendError::Io)?;
+        self.file_cache.mark_dirty(&key);
+        self.file_cache.flush_one(&key).await.map_err(BackendError::Io)
     }
 
     // =========================================================================
@@ -509,6 +568,7 @@ mod tests {
     use super::*;
     use crate::Kernel as KaijutsuKernel;
     use crate::block_store::shared_block_store;
+    use crate::file_tools::FileDocumentCache;
     use crate::vfs::backends::MemoryBackend;
     use kaijutsu_types::PrincipalId;
 
@@ -519,6 +579,11 @@ mod tests {
         let sid = kaijutsu_types::SessionId::new();
         let session_contexts = crate::runtime::context_engine::session_context_map();
         session_contexts.insert(sid, kaijutsu_types::ContextId::new());
+        let mount_table = Arc::new(MountTable::new());
+        mount_table.mount("/tmp", MemoryBackend::new()).await;
+
+        let file_cache = Arc::new(FileDocumentCache::new(blocks.clone(), mount_table.clone()));
+
         let docs = Arc::new(KaijutsuBackend::new(
             blocks,
             kernel,
@@ -527,10 +592,7 @@ mod tests {
             sid,
         ));
 
-        let mount_table = Arc::new(MountTable::new());
-        mount_table.mount("/tmp", MemoryBackend::new()).await;
-
-        MountBackend::new(mount_table, docs)
+        MountBackend::new(mount_table, docs, file_cache)
     }
 
     #[tokio::test]
@@ -631,6 +693,64 @@ mod tests {
     async fn test_backend_type() {
         let backend = test_mount_backend().await;
         assert_eq!(backend.backend_type(), "mount");
+    }
+
+    /// The reason this whole change exists: a write from the kaish surface and
+    /// a read from the MCP surface address one CRDT document. We exercise both
+    /// directions over a single shared `FileDocumentCache`.
+    #[tokio::test]
+    async fn kaish_and_mcp_share_one_crdt_document() {
+        let blocks = shared_block_store(PrincipalId::system());
+        let kernel = Arc::new(KaijutsuKernel::new("test-xsurface", None).await);
+        let sid = kaijutsu_types::SessionId::new();
+        let session_contexts = crate::runtime::context_engine::session_context_map();
+        session_contexts.insert(sid, kaijutsu_types::ContextId::new());
+
+        let mount_table = Arc::new(MountTable::new());
+        mount_table.mount("/tmp", MemoryBackend::new()).await;
+        let file_cache = Arc::new(FileDocumentCache::new(blocks.clone(), mount_table.clone()));
+        let docs = Arc::new(KaijutsuBackend::new(
+            blocks,
+            kernel,
+            PrincipalId::system(),
+            session_contexts,
+            sid,
+        ));
+        let backend = MountBackend::new(mount_table, docs, file_cache.clone());
+
+        // kaish surface writes a file...
+        backend
+            .write(Path::new("/tmp/shared.rs"), b"fn main() {}", WriteMode::Overwrite)
+            .await
+            .unwrap();
+
+        // ...and the MCP surface (same shared cache) sees it immediately.
+        assert_eq!(
+            file_cache.read_content("/tmp/shared.rs").await.unwrap(),
+            "fn main() {}"
+        );
+
+        // An edit through the cache (the MCP `edit` path) is visible back
+        // through a kaish read — including before any flush to disk.
+        file_cache
+            .create_or_replace("/tmp/shared.rs", "fn main() { /* edited */ }")
+            .await
+            .unwrap();
+        let via_kaish = backend.read(Path::new("/tmp/shared.rs"), None).await.unwrap();
+        assert_eq!(
+            String::from_utf8(via_kaish).unwrap(),
+            "fn main() { /* edited */ }"
+        );
+
+        // Different spellings of the same path resolve to the same document.
+        let via_relative_key = backend
+            .read(Path::new("/tmp/./shared.rs"), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(via_relative_key).unwrap(),
+            "fn main() { /* edited */ }"
+        );
     }
 
     #[tokio::test]
