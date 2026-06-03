@@ -11,10 +11,162 @@ use super::parse::{extract_named_arg, parse_model_spec};
 use super::refs::{parse_context_ref, resolve_context_ref};
 use super::{KjCaller, KjDispatcher, KjResult};
 
+/// Settable context configuration shared by `create` and `set`.
+///
+/// These are the knobs that can be applied to an existing context row:
+/// model, system prompt, consent mode, working directory, an env var, and
+/// the rc-dispatch `context_type`. `create` reuses the same surface so a
+/// context can be born fully configured (fork-parity) instead of needing a
+/// follow-up `kj context set`.
+struct ContextConfig {
+    model_spec: Option<String>,
+    system_prompt: Option<String>,
+    consent_spec: Option<String>,
+    cwd_spec: Option<String>,
+    env_spec: Option<String>,
+    type_spec: Option<String>,
+}
+
+impl ContextConfig {
+    fn from_argv(argv: &[String]) -> Self {
+        Self {
+            model_spec: extract_named_arg(argv, &["--model", "-m"]),
+            system_prompt: extract_named_arg(argv, &["--system-prompt"]),
+            consent_spec: extract_named_arg(argv, &["--consent"]),
+            cwd_spec: extract_named_arg(argv, &["--cwd"]),
+            env_spec: extract_named_arg(argv, &["--env"]),
+            type_spec: extract_named_arg(argv, &["--type"]),
+        }
+    }
+}
+
 impl KjDispatcher {
+    /// Validate user-supplied config BEFORE any mutation: provider existence,
+    /// consent mode spelling, and `--env KEY=VALUE` shape. Pure checks plus an
+    /// async registry read — no DB writes — so callers can bail out cleanly
+    /// without leaving a half-configured (or orphan) context behind.
+    async fn validate_context_config(&self, cfg: &ContextConfig) -> Result<(), String> {
+        if let Some(ref spec) = cfg.model_spec {
+            let (provider, _) = parse_model_spec(spec);
+            if let Some(ref p) = provider {
+                let registry = self.kernel().llm().read().await;
+                if registry.get(p).is_none() {
+                    return Err(format!("unknown provider '{p}'"));
+                }
+            }
+        }
+        if let Some(ref spec) = cfg.consent_spec
+            && spec.parse::<ConsentMode>().is_err()
+        {
+            return Err(format!(
+                "invalid consent mode '{spec}' — use 'collaborative' or 'autonomous'"
+            ));
+        }
+        if let Some(ref env) = cfg.env_spec
+            && !env.contains('=')
+        {
+            return Err("--env requires KEY=VALUE format".to_string());
+        }
+        Ok(())
+    }
+
+    /// Apply already-validated config to an existing context row and return
+    /// the human-readable change list. Assumes [`Self::validate_context_config`]
+    /// has already run, so provider existence is not re-checked here — only DB
+    /// I/O errors surface. The model column is updated in the DB regardless;
+    /// the DriftRouter is reconfigured only when both provider and model are
+    /// present (a bare model name updates the row but not the live handle,
+    /// matching pre-existing `set` behaviour).
+    async fn apply_context_config(
+        &self,
+        target_id: ContextId,
+        cfg: &ContextConfig,
+    ) -> Result<Vec<String>, String> {
+        let (changes, model_for_drift) = {
+            let db = self.kernel_db().lock();
+            let mut changes = Vec::new();
+            let mut model_for_drift: Option<(String, String)> = None;
+
+            if let Some(ref spec) = cfg.model_spec {
+                let (provider, model) = parse_model_spec(spec);
+                db.update_model(target_id, provider.as_deref(), model.as_deref())
+                    .map_err(|e| e.to_string())?;
+                changes.push(format!("model={spec}"));
+                if let (Some(p), Some(m)) = (provider, model) {
+                    model_for_drift = Some((p, m));
+                }
+            }
+
+            // consent_spec is validated upstream; treat a parse miss as absent.
+            let consent_mode = cfg
+                .consent_spec
+                .as_ref()
+                .and_then(|s| s.parse::<ConsentMode>().ok());
+
+            if cfg.system_prompt.is_some() || consent_mode.is_some() {
+                let current = db
+                    .get_context(target_id)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "context not found".to_string())?;
+                let new_prompt = cfg
+                    .system_prompt
+                    .as_deref()
+                    .or(current.system_prompt.as_deref());
+                let new_consent = consent_mode.unwrap_or(current.consent_mode);
+                db.update_settings(target_id, new_prompt, new_consent)
+                    .map_err(|e| e.to_string())?;
+                if cfg.system_prompt.is_some() {
+                    changes.push("system-prompt".to_string());
+                }
+                if let Some(ref spec) = cfg.consent_spec
+                    && consent_mode.is_some()
+                {
+                    changes.push(format!("consent={spec}"));
+                }
+            }
+
+            if let Some(ref cwd) = cfg.cwd_spec {
+                let shell = ContextShellRow {
+                    context_id: target_id,
+                    cwd: Some(cwd.clone()),
+                    updated_at: kaijutsu_types::now_millis() as i64,
+                };
+                db.upsert_context_shell(&shell).map_err(|e| e.to_string())?;
+                changes.push(format!("cwd={cwd}"));
+            }
+
+            if let Some(ref env) = cfg.env_spec {
+                // KEY=VALUE shape validated upstream.
+                if let Some((key, value)) = env.split_once('=') {
+                    db.set_context_env(target_id, key, value)
+                        .map_err(|e| e.to_string())?;
+                    changes.push(format!("env {key}={value}"));
+                }
+            }
+
+            if let Some(ref t) = cfg.type_spec {
+                db.update_context_type(target_id, t)
+                    .map_err(|e| e.to_string())?;
+                changes.push(format!("type={t}"));
+            }
+
+            (changes, model_for_drift)
+        };
+        // db lock released here
+
+        if let Some((p, m)) = model_for_drift {
+            let mut drift = self.drift_router().write();
+            let _ = drift.configure_llm(target_id, &p, &m);
+        }
+
+        Ok(changes)
+    }
+
     pub(crate) async fn dispatch_context(&self, argv: &[String], caller: &KjCaller) -> KjResult {
         if argv.is_empty() {
-            return KjResult::Err(self.context_help());
+            // No subcommand: show help as rendered Markdown rather than a raw
+            // error string (the fenced blocks are unreadable as plain text).
+            return KjResult::ok_ephemeral(self.context_help(), ContentType::Markdown);
         }
 
         match argv[0].as_str() {
@@ -231,10 +383,23 @@ impl KjDispatcher {
     }
 
     async fn context_create(&self, argv: &[String], caller: &KjCaller) -> KjResult {
-        // Parse args: kj context create <label> [--parent <ctx>] [--type <type>]
-        let label = match argv.get(1) {
-            Some(l) => l.as_str(),
-            None => return KjResult::Err("kj context create: requires a label".to_string()),
+        // Parse args: kj context create <label|--name label> [--parent <ctx>]
+        //             [--model p/m] [--system-prompt t] [--consent mode]
+        //             [--cwd path] [--env KEY=VALUE] [--type t]
+        //
+        // Label comes from --name/-n (fork-parity) or the first positional
+        // argument that isn't a flag.
+        let label = match extract_named_arg(argv, &["--name", "-n"]).or_else(|| {
+            argv.get(1)
+                .filter(|a| !a.starts_with('-'))
+                .map(|s| s.to_string())
+        }) {
+            Some(l) => l,
+            None => {
+                return KjResult::Err(
+                    "kj context create: requires a label (positional or --name)".to_string(),
+                );
+            }
         };
 
         // Find --parent flag
@@ -253,11 +418,21 @@ impl KjDispatcher {
             }
         };
 
+        // Settable config shared with `set`. `--type` is pulled out here so it
+        // lands on the row up front (the rc create-lifecycle dispatches on
+        // context_type); the rest is applied after the context exists.
+        let mut cfg = ContextConfig::from_argv(argv);
         // --type <context_type> selects which rc scripts run for this
         // context. Default is "default" — runs scripts under
         // /etc/rc/default/<verb>/.
-        let context_type = super::parse::extract_named_arg(argv, &["--type"])
-            .unwrap_or_else(|| "default".to_string());
+        let context_type = cfg.type_spec.take().unwrap_or_else(|| "default".to_string());
+
+        // Validate the rest before any mutation so a typo'd --model/--consent/
+        // --env can't leave an orphan context behind.
+        if let Err(e) = self.validate_context_config(&cfg).await {
+            return KjResult::Err(format!("kj context create: {e}"));
+        }
+        let label = label.as_str();
 
         let new_id = ContextId::new();
 
@@ -314,6 +489,14 @@ impl KjDispatcher {
             }
         }
 
+        // Apply settable config (model, system-prompt, consent, cwd, env) now
+        // that the row and drift handle exist. Validated above; only DB I/O
+        // errors surface here.
+        let config_changes = match self.apply_context_config(new_id, &cfg).await {
+            Ok(changes) => changes,
+            Err(e) => return KjResult::Err(format!("kj context create: {e}")),
+        };
+
         // Run rc create-lifecycle scripts. Failures surface as Error
         // blocks in the new context — they don't abort context creation.
         if let Err(e) = self
@@ -323,7 +506,11 @@ impl KjDispatcher {
             tracing::warn!("rc create lifecycle: {e}");
         }
 
-        KjResult::ok(format!("created context '{}' ({})", label, new_id.short()))
+        let mut msg = format!("created context '{}' ({})", label, new_id.short());
+        if !config_changes.is_empty() {
+            msg.push_str(&format!(" [{}]", config_changes.join(", ")));
+        }
+        KjResult::ok(msg)
     }
 
     /// `kj context scratch` — get-or-create the well-known "scratch"
@@ -386,154 +573,35 @@ impl KjDispatcher {
         ))
     }
 
-    /// `kj context set <ctx> [--model p/m] [--system-prompt text] [--tool-filter spec] [--consent mode] [--cwd path] [--env KEY=VALUE]`
+    /// `kj context set <ctx> [--model p/m] [--system-prompt text] [--consent mode] [--cwd path] [--env KEY=VALUE] [--type t]`
     async fn context_set(&self, argv: &[String], caller: &KjCaller) -> KjResult {
-
-        // Parse all args upfront (no locks needed)
         let target_arg = argv
             .get(1)
             .filter(|a| !a.starts_with('-'))
             .map(|s| s.as_str());
-        let model_spec = extract_named_arg(argv, &["--model", "-m"]);
-        let system_prompt = extract_named_arg(argv, &["--system-prompt"]);
-        let consent_spec = extract_named_arg(argv, &["--consent"]);
-        let cwd_spec = extract_named_arg(argv, &["--cwd"]);
-        let env_spec = extract_named_arg(argv, &["--env"]);
-        let type_spec = extract_named_arg(argv, &["--type"]);
+        let cfg = ContextConfig::from_argv(argv);
 
-        // Validate provider against LlmRegistry BEFORE taking DB lock
-        let parsed_model = match model_spec {
-            Some(ref spec) => {
-                let (provider, model) = parse_model_spec(spec);
-                if let Some(ref p) = provider {
-                    let registry = self.kernel().llm().read().await;
-                    if registry.get(p).is_none() {
-                        return KjResult::Err(format!("kj context set: unknown provider '{}'", p,));
-                    }
-                }
-                Some((provider, model))
-            }
-            None => None,
-        };
+        // Validate before touching the DB.
+        if let Err(e) = self.validate_context_config(&cfg).await {
+            return KjResult::Err(format!("kj context set: {e}"));
+        }
 
-        // Resolve target + apply DB changes (lock scope)
-        let (target_id, changes, model_for_drift) = {
+        // Resolve target (brief lock; resolver borrows the db).
+        let target_id = {
             let db = self.kernel_db().lock();
-
-            let target_id =
-                match super::refs::resolve_context_arg(target_arg, caller, &db) {
-                    Ok(id) => id,
-                    Err(e) => return KjResult::Err(format!("kj context set: {e}")),
-                };
-
-            let mut changes = Vec::new();
-            let mut model_for_drift: Option<(String, String)> = None;
-
-            // Update model (already validated above)
-            if let Some((provider, model)) = parsed_model {
-                if let Err(e) = db.update_model(target_id, provider.as_deref(), model.as_deref()) {
-                    return KjResult::Err(format!("kj context set: {e}"));
-                }
-                changes.push(format!("model={}", model_spec.as_deref().unwrap_or("?")));
-                if let (Some(p), Some(m)) = (provider, model) {
-                    model_for_drift = Some((p, m));
-                }
+            match super::refs::resolve_context_arg(target_arg, caller, &db) {
+                Ok(id) => id,
+                Err(e) => return KjResult::Err(format!("kj context set: {e}")),
             }
-
-            // Parse consent mode
-            let consent_mode = match consent_spec {
-                Some(ref spec) => match spec.parse::<ConsentMode>() {
-                    Ok(cm) => Some(cm),
-                    Err(_) => {
-                        return KjResult::Err(format!(
-                            "kj context set: invalid consent mode '{}' — use 'collaborative' or 'autonomous'",
-                            spec
-                        ));
-                    }
-                },
-                None => None,
-            };
-
-            // Apply settings
-            if system_prompt.is_some() || consent_mode.is_some() {
-                let current = match db.get_context(target_id) {
-                    Ok(Some(row)) => row,
-                    Ok(None) => {
-                        return KjResult::Err("kj context set: context not found".to_string());
-                    }
-                    Err(e) => return KjResult::Err(format!("kj context set: {e}")),
-                };
-
-                let new_prompt = system_prompt
-                    .as_deref()
-                    .or(current.system_prompt.as_deref());
-                let new_consent = consent_mode.unwrap_or(current.consent_mode);
-
-                if let Err(e) = db.update_settings(target_id, new_prompt, new_consent) {
-                    return KjResult::Err(format!("kj context set: {e}"));
-                }
-
-                if system_prompt.is_some() {
-                    changes.push("system-prompt".to_string());
-                }
-                if consent_mode.is_some() {
-                    changes.push(format!(
-                        "consent={}",
-                        consent_spec.as_deref().unwrap_or("?")
-                    ));
-                }
-            }
-
-            // Update cwd
-            if let Some(ref cwd) = cwd_spec {
-                let shell = ContextShellRow {
-                    context_id: target_id,
-                    cwd: Some(cwd.clone()),
-                    updated_at: kaijutsu_types::now_millis() as i64,
-                };
-                if let Err(e) = db.upsert_context_shell(&shell) {
-                    return KjResult::Err(format!("kj context set: {e}"));
-                }
-                changes.push(format!("cwd={cwd}"));
-            }
-
-            // Update env var (KEY=VALUE)
-            if let Some(ref env) = env_spec {
-                if let Some((key, value)) = env.split_once('=') {
-                    if let Err(e) = db.set_context_env(target_id, key, value) {
-                        return KjResult::Err(format!("kj context set: {e}"));
-                    }
-                    changes.push(format!("env {key}={value}"));
-                } else {
-                    return KjResult::Err(
-                        "kj context set: --env requires KEY=VALUE format".to_string(),
-                    );
-                }
-            }
-
-            // Update context_type (rc dispatch selector)
-            if let Some(ref t) = type_spec {
-                if let Err(e) = db.update_context_type(target_id, t) {
-                    return KjResult::Err(format!("kj context set: {e}"));
-                }
-                changes.push(format!("type={t}"));
-            }
-
-            (target_id, changes, model_for_drift)
         };
-        // db lock released here
 
-        // Update DriftRouter (async, no db lock held)
-        if let Some((p, m)) = model_for_drift {
-            let mut drift = self.drift_router().write();
-            let _ = drift.configure_llm(target_id, &p, &m);
+        match self.apply_context_config(target_id, &cfg).await {
+            Ok(changes) if changes.is_empty() => {
+                KjResult::ok("no changes specified".to_string())
+            }
+            Ok(changes) => KjResult::ok(format!("updated: {}", changes.join(", "))),
+            Err(e) => KjResult::Err(format!("kj context set: {e}")),
         }
-
-        if changes.is_empty() {
-            return KjResult::ok("no changes specified".to_string());
-        }
-
-        KjResult::ok(format!("updated: {}", changes.join(", ")))
     }
 
     /// `kj context unset [<ctx>] --env KEY` — remove an env var from a context.
@@ -1510,6 +1578,141 @@ mod tests {
         );
         assert!(msg.contains("Env:"), "should show env: {msg}");
         assert!(msg.contains("RUST_LOG=debug"), "should show env var: {msg}");
+    }
+
+    #[tokio::test]
+    async fn context_create_with_model_configures_drift() {
+        // create parity with fork: `--model` is applied inline, not via a
+        // follow-up `kj context set`.
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let parent = register_context(&d, Some("parent"), None, principal);
+
+        // Register mock provider so validation passes.
+        {
+            use crate::llm::{MockClient, Provider};
+            use std::sync::Arc;
+            let mock = Arc::new(Provider::Mock(MockClient::new("mock")));
+            let mut registry = d.kernel().llm().write().await;
+            registry.register("mock", mock);
+        }
+
+        let c = caller_with_context(parent);
+        let result = d
+            .dispatch(
+                &[
+                    s("context"),
+                    s("create"),
+                    s("kid"),
+                    s("--model"),
+                    s("mock/test-model"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "create failed: {}", result.message());
+
+        let id = {
+            let db = d.kernel_db().lock();
+            db.resolve_context("kid").expect("kid should exist")
+        };
+        let router = d.drift_router().read();
+        let handle = router.get(id).expect("kid registered in drift");
+        assert_eq!(handle.provider.as_deref(), Some("mock"));
+        assert_eq!(handle.model.as_deref(), Some("test-model"));
+    }
+
+    #[tokio::test]
+    async fn context_create_name_alias() {
+        // `--name` / `-n` is accepted as an alias for the positional label,
+        // matching `kj fork`.
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let parent = register_context(&d, Some("parent"), None, principal);
+
+        let c = caller_with_context(parent);
+        let result = d
+            .dispatch(&[s("context"), s("create"), s("--name"), s("aliased")], &c)
+            .await;
+        assert!(result.is_ok(), "create --name failed: {}", result.message());
+
+        let db = d.kernel_db().lock();
+        assert!(
+            db.resolve_context("aliased").is_ok(),
+            "context created via --name should resolve by label"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_create_with_cwd_and_env() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let parent = register_context(&d, Some("parent"), None, principal);
+
+        let c = caller_with_context(parent);
+        let result = d
+            .dispatch(
+                &[
+                    s("context"),
+                    s("create"),
+                    s("kid"),
+                    s("--cwd"),
+                    s("/tmp/work"),
+                    s("--env"),
+                    s("RUST_LOG=debug"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "create failed: {}", result.message());
+
+        let id = {
+            let db = d.kernel_db().lock();
+            db.resolve_context("kid").expect("kid should exist")
+        };
+        let db = d.kernel_db().lock();
+        let shell = db.get_context_shell(id).unwrap().unwrap();
+        assert_eq!(shell.cwd, Some("/tmp/work".into()));
+        let env = db.get_context_env(id).unwrap();
+        assert_eq!(env.len(), 1);
+        assert_eq!(env[0].key, "RUST_LOG");
+        assert_eq!(env[0].value, "debug");
+    }
+
+    #[tokio::test]
+    async fn context_create_invalid_provider_leaves_no_orphan() {
+        // A bad `--model` must be rejected BEFORE the context is created —
+        // crashing the command is preferred over leaving an orphan context.
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let parent = register_context(&d, Some("parent"), None, principal);
+
+        let c = caller_with_context(parent);
+        let result = d
+            .dispatch(
+                &[
+                    s("context"),
+                    s("create"),
+                    s("kid"),
+                    s("--model"),
+                    s("nonexistent/foo"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(!result.is_ok(), "should fail: {}", result.message());
+        assert!(
+            result.message().contains("unknown provider"),
+            "msg: {}",
+            result.message()
+        );
+
+        // No half-created context left behind.
+        let db = d.kernel_db().lock();
+        assert!(
+            db.resolve_context("kid").is_err(),
+            "failed create must not leave an orphan context"
+        );
     }
 
     /// `kj context list` must emit a JSON array of resolver-friendly handles

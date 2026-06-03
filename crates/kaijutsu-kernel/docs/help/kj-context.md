@@ -3,17 +3,37 @@
 ## Subcommands
 
 ```
-list [--tree]            List contexts (flat or tree view)
-info [<ctx>]             Show context details (default: current)
-switch <ctx>             Switch to a different context
-create <label>           Create a new empty context
-set <ctx> [flags]        Update context settings
-log [<ctx>]              Show fork lineage
-move <ctx> <new-parent>  Reparent a context
-archive <ctx>            Soft-delete (latched — needs --confirm)
-remove <ctx>             Hard-delete (latched)
-retag <label> <ctx>      Move a label to a different context (latched)
+list [--tree]                List contexts (flat or tree view)   (alias: ls)
+info [<ctx>]                 Show context details (default: current)
+current                      Show the current context            (alias: show)
+switch <ctx>                 Switch to a different context        (alias: sw)
+create <label> [flags]       Create a new context                (alias: new)
+scratch                      Get-or-create the "scratch" context (alias: self)
+set <ctx> [flags]            Update context settings
+unset [<ctx>] --env KEY      Remove an env var from a context
+log [<ctx>]                  Show fork lineage
+move <ctx> <new-parent>      Reparent a context                  (alias: mv)
+archive <ctx>                Soft-delete (latched — needs --confirm)
+remove <ctx>                 Hard-delete (latched)                (alias: rm)
+retag <label> <ctx>          Move a label to a different context (latched)
 ```
+
+`<ctx>` accepts a label, a full/short context id, or `.` for the current context.
+
+## create / set flags
+
+`create` and `set` share the same configuration flags, so a context can be
+born fully configured instead of needing a follow-up `set`:
+
+- `--name`, `-n` — Label (create only; alternative to the positional `<label>`)
+- `--parent`, `-p` — Parent context (create only; defaults to the current context)
+- `--model`, `-m` — Model, format `provider/model` (e.g. `anthropic/claude-sonnet-4-6`).
+  A bare `model` updates the stored model but won't switch the live handle.
+- `--system-prompt` — System prompt text
+- `--consent` — `collaborative` or `autonomous`
+- `--cwd` — Working directory
+- `--env` — Set an env var, format `KEY=VALUE`
+- `--type` — Context type (selects which rc lifecycle scripts run; default `default`)
 
 ## Examples
 
@@ -21,34 +41,25 @@ retag <label> <ctx>      Move a label to a different context (latched)
 # See the full context tree
 kj context list --tree
 
-# Create and configure a context
-kj context create review
-kj context set review --model anthropic:claude-sonnet-4-5-20250929
-kj context set review --tools deny:shell
+# Create a context, fully configured in one shot
+kj context create review --model anthropic/claude-sonnet-4-6 --cwd /srv/app
+kj context create --name explore --parent review --consent autonomous
 
-# Check current context details
+# Update settings on an existing context
+kj context set review --model google/gemini-2.5-pro
+kj context set . --env RUST_LOG=debug
+kj context set . --system-prompt "you are a careful reviewer"
+
+# Check current context details / walk fork lineage
 kj context info .
-
-# Walk fork lineage
 kj context log .
+
+# Remove an env var
+kj context unset review --env RUST_LOG
 ```
 
-## Model Assignment
+## Model vs fork
 
-```bash
-# Set model on current context
-kj context set . --model anthropic:claude-sonnet-4-5-20250929
-
-# Set model on a named context
-kj context set explore --model google:gemini-2.5-pro
-```
-
-Model is immutable on a context once set — fork to change it.
-
-## Tool Filtering
-
-```bash
-kj context set . --tools all              # unrestricted
-kj context set . --tools allow:glob,grep  # allowlist
-kj context set . --tools deny:shell       # denylist
-```
+`set --model` re-points an existing context at a different model. To branch
+the conversation onto a new model while keeping the original intact, use
+`kj fork --model <provider/model>` instead — see `kj fork --help`.
