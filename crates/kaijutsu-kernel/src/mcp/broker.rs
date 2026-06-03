@@ -430,43 +430,39 @@ impl Broker {
             .map_err(|e| McpError::Protocol(format!("delete_hook_script: {e}")))
     }
 
-    /// Persist one hook entry to the DB after `hook_add`. Best-effort:
-    /// failure warns but does not bubble up so the in-memory push
-    /// remains authoritative for the rest of the kernel's lifetime
-    /// (operator retries via `hook_add` after fixing the DB problem).
-    pub async fn persist_hook_insert(&self, phase: HookPhase, entry: &HookEntry) {
+    /// Persist one hook entry to the DB. The caller must run this BEFORE
+    /// mutating the in-memory `HookTables`, and must surface an `Err`
+    /// instead of touching the mirror: a failed durable write is a major
+    /// error the operator has to observe, and a mirror that diverges from
+    /// the DB would silently vanish (or resurrect) hooks on the next
+    /// restart. `Ok(())` when no DB is wired (bootstrap / tests) — in-memory
+    /// is legitimately authoritative there.
+    pub async fn persist_hook_insert(
+        &self,
+        phase: HookPhase,
+        entry: &HookEntry,
+    ) -> crate::kernel_db::KernelDbResult<()> {
         let db = match self.db.read().await.clone() {
             Some(h) => h,
-            None => return,
+            None => return Ok(()),
         };
         let row = super::hook_persist::entry_to_row(phase, entry);
-        let guard = db.lock();
-        if let Err(e) = guard.insert_hook(&row) {
-            tracing::warn!(
-                hook_id = %entry.id,
-                phase = ?phase,
-                error = ?e,
-                "failed to persist hook insert",
-            );
-        }
+        db.lock().insert_hook(&row)
     }
 
-    /// Drop a hook from the DB after `hook_remove`. Best-effort mirror
-    /// of `persist_hook_insert`; idempotent (delete of an unknown id
-    /// is a non-error).
-    pub async fn persist_hook_delete(&self, hook_id: &str) {
+    /// Drop a hook from the DB. Mirror of [`Self::persist_hook_insert`]:
+    /// run it before the in-memory removal and surface `Err` rather than
+    /// diverging the mirror. Idempotent — deleting an unknown id is `Ok`.
+    /// `Ok(())` when no DB is wired.
+    pub async fn persist_hook_delete(
+        &self,
+        hook_id: &str,
+    ) -> crate::kernel_db::KernelDbResult<()> {
         let db = match self.db.read().await.clone() {
             Some(h) => h,
-            None => return,
+            None => return Ok(()),
         };
-        let guard = db.lock();
-        if let Err(e) = guard.delete_hook(hook_id) {
-            tracing::warn!(
-                hook_id = hook_id,
-                error = ?e,
-                "failed to persist hook delete",
-            );
-        }
+        db.lock().delete_hook(hook_id).map(|_| ())
     }
 
     pub fn coalescer(&self) -> &Arc<NotificationCoalescer> {
@@ -5975,7 +5971,10 @@ mod tests {
         broker.set_db(db.clone()).await;
 
         let entry = log_entry("h1", Some("file_*"));
-        broker.persist_hook_insert(HookPhase::PreCall, &entry).await;
+        broker
+            .persist_hook_insert(HookPhase::PreCall, &entry)
+            .await
+            .unwrap();
 
         let rows = db.lock().load_all_hooks().unwrap();
         assert_eq!(rows.len(), 1);
@@ -5995,14 +5994,55 @@ mod tests {
 
         broker
             .persist_hook_insert(HookPhase::PreCall, &log_entry("h-del", None))
-            .await;
+            .await
+            .unwrap();
         assert_eq!(db.lock().load_all_hooks().unwrap().len(), 1);
 
-        broker.persist_hook_delete("h-del").await;
+        broker.persist_hook_delete("h-del").await.unwrap();
         assert_eq!(db.lock().load_all_hooks().unwrap().len(), 0);
 
         // Idempotent — deleting again is fine.
-        broker.persist_hook_delete("h-del").await;
+        broker.persist_hook_delete("h-del").await.unwrap();
+    }
+
+    /// A failed durable write surfaces as `Err`, never a swallowed warn —
+    /// the operator has to be able to observe it, and the caller relies on
+    /// the `Err` to leave the in-memory mirror untouched. Forced with a
+    /// duplicate `hook_id` (the PK), which `insert_hook` rejects.
+    #[tokio::test]
+    async fn persist_hook_insert_surfaces_write_failure() {
+        let db = hook_db();
+        let broker = Arc::new(Broker::new());
+        broker.set_db(db.clone()).await;
+
+        let entry = log_entry("dup", None);
+        broker
+            .persist_hook_insert(HookPhase::PreCall, &entry)
+            .await
+            .expect("first insert occupies the PK");
+
+        let second = broker.persist_hook_insert(HookPhase::PreCall, &entry).await;
+        assert!(
+            second.is_err(),
+            "duplicate hook_id must surface as Err, not a silent warn",
+        );
+        // The failed write left no partial/duplicate state behind.
+        assert_eq!(db.lock().load_all_hooks().unwrap().len(), 1);
+    }
+
+    /// No DB wired (bootstrap / tests) is a legitimate no-op, not a failure:
+    /// in-memory is authoritative there, so persistence returns `Ok`.
+    #[tokio::test]
+    async fn persist_hook_insert_no_db_is_ok() {
+        let broker = Arc::new(Broker::new());
+        broker
+            .persist_hook_insert(HookPhase::PreCall, &log_entry("x", None))
+            .await
+            .expect("no DB wired is Ok, not an error");
+        broker
+            .persist_hook_delete("x")
+            .await
+            .expect("delete with no DB wired is Ok too");
     }
 
     /// A row with an `action_builtin_name` not in the registry is

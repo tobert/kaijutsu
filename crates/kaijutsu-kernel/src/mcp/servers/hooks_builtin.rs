@@ -524,17 +524,21 @@ impl McpServerLike for BuiltinHooksServer {
                     action,
                     priority: p.priority.unwrap_or(0),
                 };
+                // Durable store FIRST. A failed write is a major error the
+                // operator must see — never a silent warn — and the in-memory
+                // mirror stays untouched so it cannot diverge from what
+                // survives a restart. No DB wired (tests / early bootstrap)
+                // is `Ok`: in-memory is authoritative there.
+                broker.persist_hook_insert(phase, &entry).await.map_err(|e| {
+                    McpError::Protocol(format!(
+                        "hook_add: failed to persist hook {id}: {e}"
+                    ))
+                })?;
                 {
                     let mut hooks = broker.hooks().write().await;
                     let table = phase_table_mut(&mut hooks, phase);
                     table.entries.push(entry.clone());
                 }
-                // Best-effort persist to the kernel DB. No-op when the
-                // broker has no DB handle wired (tests, early bootstrap);
-                // failure warns but does not bubble — the in-memory
-                // push is authoritative for the rest of this kernel's
-                // lifetime.
-                broker.persist_hook_insert(phase, &entry).await;
                 let json = serde_json::json!({ "hook_id": id });
                 Ok(KernelToolResult {
                     is_error: false,
@@ -546,6 +550,16 @@ impl McpServerLike for BuiltinHooksServer {
                 let p: HookRemoveParams =
                     serde_json::from_value(params.arguments.clone())
                         .map_err(McpError::InvalidParams)?;
+                // Durable delete FIRST — same contract as `hook_add`: a
+                // failed write surfaces as an error and the mirror is left
+                // alone so the two stores cannot disagree. Idempotent, so a
+                // delete of an unknown id is `Ok` and callers may retry.
+                broker.persist_hook_delete(&p.hook_id).await.map_err(|e| {
+                    McpError::Protocol(format!(
+                        "hook_remove: failed to persist delete of {}: {e}",
+                        p.hook_id
+                    ))
+                })?;
                 let removed = {
                     let mut hooks = broker.hooks().write().await;
                     let mut any_removed = false;
@@ -561,11 +575,6 @@ impl McpServerLike for BuiltinHooksServer {
                     any_removed |= drop_id(&mut hooks.list_tools, &p.hook_id);
                     any_removed
                 };
-                // Mirror the delete into the DB regardless of whether
-                // an in-memory entry existed: callers may retry
-                // `hook_remove` after a partial failure, and the DB is
-                // the authoritative store for post-restart state.
-                broker.persist_hook_delete(&p.hook_id).await;
                 let json = serde_json::json!({ "removed": removed });
                 Ok(KernelToolResult {
                     is_error: false,
@@ -1310,6 +1319,64 @@ mod tests {
             })
         });
         broker
+    }
+
+    /// A `hook_add` whose durable write fails must (1) surface the error to
+    /// the caller and (2) leave the in-memory mirror untouched — otherwise
+    /// the running kernel would carry a hook that silently vanishes on the
+    /// next restart. Forced with a duplicate `hook_id`, which the PK rejects
+    /// on the second insert.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn hook_add_persist_failure_leaves_mirror_untouched() {
+        let broker = broker_with_db();
+        let server = Arc::new(BuiltinHooksServer::new(Arc::downgrade(&broker)));
+        broker
+            .register(server, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        let add = |id: &str| {
+            call_params(
+                "hook_add",
+                serde_json::json!({
+                    "phase": "pre_call",
+                    "match_tool": "*",
+                    "hook_id": id,
+                    "action": {
+                        "type": "log",
+                        "level": "info",
+                        "target": "kaijutsu::hooks::audit",
+                    },
+                }),
+            )
+        };
+
+        // First add lands in both stores.
+        broker
+            .call_tool(add("dup"), &CallContext::test(), CancellationToken::new())
+            .await
+            .expect("first hook_add succeeds");
+
+        // Second add with the same id: the persist hits a PK conflict.
+        let err = broker
+            .call_tool(add("dup"), &CallContext::test(), CancellationToken::new())
+            .await
+            .expect_err("duplicate persist must surface as an error, not Ok");
+        assert!(
+            matches!(&err, McpError::Protocol(m) if m.contains("persist")),
+            "expected a persist-failure Protocol error, got {err:?}",
+        );
+
+        // The mirror still holds exactly one entry — the failed write did
+        // not push a phantom second copy that a restart would drop.
+        let hooks = broker.hooks().read().await;
+        let dup_count = hooks
+            .pre_call
+            .entries
+            .iter()
+            .filter(|e| e.id.0 == "dup")
+            .count();
+        assert_eq!(dup_count, 1, "mirror must not diverge from the DB on a failed write");
     }
 
     /// `hook_script_add` → `hook_script_inspect` → `hook_script_list`
