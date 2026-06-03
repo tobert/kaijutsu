@@ -119,6 +119,17 @@ impl MountTable {
         mounts.remove(&path).is_some()
     }
 
+    /// Whether the mount backing `path` is writable (longest-prefix match).
+    /// Returns `false` when no mount matches — you can't write where nothing
+    /// is mounted. Used to decide whether a path is eligible for CRDT-backed
+    /// editing (writable) or should pass straight through (read-only/OS).
+    pub async fn is_writable(&self, path: &Path) -> bool {
+        match self.find_mount(path).await {
+            Ok((fs, _)) => !fs.read_only(),
+            Err(_) => false,
+        }
+    }
+
     /// List all current mounts.
     pub async fn list_mounts(&self) -> Vec<MountInfo> {
         let mounts = self.mounts.read().await;
@@ -630,6 +641,25 @@ mod tests {
         let real = real.unwrap();
         assert!(real.is_absolute());
         assert!(real.ends_with("test.txt"));
+    }
+
+    #[tokio::test]
+    async fn test_is_writable_honors_read_only_and_longest_prefix() {
+        use crate::vfs::backends::LocalBackend;
+
+        let dir = tempfile::tempdir().unwrap();
+        let table = MountTable::new();
+        // Read-only root, writable subtree (longest-prefix wins) — mirrors the
+        // server's `/` (read_only) + `~/src` (read-write) layout.
+        table.mount("/", LocalBackend::read_only(dir.path())).await;
+        table.mount("/sub", MemoryBackend::new()).await;
+
+        assert!(!table.is_writable(Path::new("/etc/hostname")).await);
+        assert!(!table.is_writable(Path::new("/anything")).await);
+        assert!(table.is_writable(Path::new("/sub/file.rs")).await);
+        // No matching mount at all → not writable.
+        let empty = MountTable::new();
+        assert!(!empty.is_writable(Path::new("/nope")).await);
     }
 
     #[tokio::test]

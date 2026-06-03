@@ -73,6 +73,55 @@ impl MountBackend {
         resolve_str(Path::new("/"), &path.to_string_lossy())
             .map_err(|e| BackendError::PermissionDenied(e.to_string()))
     }
+
+    /// Write straight to the VFS, honoring `WriteMode`, without touching the
+    /// CRDT cache. Used for read-only/OS mounts (so the VFS rejects cleanly)
+    /// and for binary content on writable mounts.
+    async fn raw_write(&self, path: &Path, content: &[u8], mode: WriteMode) -> BackendResult<()> {
+        match mode {
+            WriteMode::CreateNew => {
+                if self.mount_table.exists(path).await {
+                    return Err(BackendError::AlreadyExists(path.display().to_string()));
+                }
+                self.mount_table
+                    .create(path, 0o644)
+                    .await
+                    .map_err(vfs_to_backend)?;
+                self.mount_table
+                    .write(path, 0, content)
+                    .await
+                    .map_err(vfs_to_backend)?;
+                Ok(())
+            }
+            WriteMode::UpdateOnly => {
+                if !self.mount_table.exists(path).await {
+                    return Err(BackendError::NotFound(path.display().to_string()));
+                }
+                self.mount_table
+                    .write_all(path, content)
+                    .await
+                    .map_err(vfs_to_backend)
+            }
+            WriteMode::Overwrite | WriteMode::Truncate => self
+                .mount_table
+                .write_all(path, content)
+                .await
+                .map_err(vfs_to_backend),
+            _ => Err(BackendError::InvalidOperation(
+                "unsupported write mode".into(),
+            )),
+        }
+    }
+
+    /// Append straight to the VFS without touching the cache.
+    async fn raw_append(&self, path: &Path, content: &[u8]) -> BackendResult<()> {
+        let attr = self.mount_table.getattr(path).await.map_err(vfs_to_backend)?;
+        self.mount_table
+            .write(path, attr.size, content)
+            .await
+            .map_err(vfs_to_backend)?;
+        Ok(())
+    }
 }
 
 /// Apply a `ReadRange` to a byte buffer (line- or offset-based windowing).
@@ -173,27 +222,34 @@ impl KernelBackend for MountBackend {
     // =========================================================================
 
     async fn read(&self, path: &Path, range: Option<ReadRange>) -> BackendResult<Vec<u8>> {
-        let key = self.cache_key(path)?;
-        match self.file_cache.read_content(&key).await {
-            Ok(text) => Ok(apply_range(text.into_bytes(), range)),
-            Err(_) => {
-                // Not loadable as CRDT text — either missing or binary.
-                // Distinguish by existence, then read raw bytes so `cat` on a
-                // binary file still works.
-                if !self.mount_table.exists(path).await {
-                    return Err(BackendError::NotFound(path.display().to_string()));
-                }
-                let data = self
-                    .mount_table
-                    .read_all(path)
-                    .await
-                    .map_err(vfs_to_backend)?;
-                Ok(apply_range(data, range))
+        // CRDT-back only writable mounts. Reading a read-only/OS path shouldn't
+        // mint a CRDT document — pass it straight through the VFS.
+        if self.mount_table.is_writable(path).await {
+            let key = self.cache_key(path)?;
+            if let Ok(text) = self.file_cache.read_content(&key).await {
+                return Ok(apply_range(text.into_bytes(), range));
             }
+            // Missing or binary: fall through to a raw read so `cat` on a
+            // binary still works.
         }
+        if !self.mount_table.exists(path).await {
+            return Err(BackendError::NotFound(path.display().to_string()));
+        }
+        let data = self
+            .mount_table
+            .read_all(path)
+            .await
+            .map_err(vfs_to_backend)?;
+        Ok(apply_range(data, range))
     }
 
     async fn write(&self, path: &Path, content: &[u8], mode: WriteMode) -> BackendResult<()> {
+        // Read-only / OS mounts never touch the cache: let the VFS reject the
+        // write cleanly rather than poison the cache with an un-flushable edit.
+        if !self.mount_table.is_writable(path).await {
+            return self.raw_write(path, content, mode).await;
+        }
+
         let key = self.cache_key(path)?;
 
         // Binary content can't live in the CRDT text substrate: write raw and
@@ -201,16 +257,7 @@ impl KernelBackend for MountBackend {
         let text = match std::str::from_utf8(content) {
             Ok(t) => t,
             Err(_) => {
-                if matches!(mode, WriteMode::CreateNew) && self.mount_table.exists(path).await {
-                    return Err(BackendError::AlreadyExists(path.display().to_string()));
-                }
-                if matches!(mode, WriteMode::UpdateOnly) && !self.mount_table.exists(path).await {
-                    return Err(BackendError::NotFound(path.display().to_string()));
-                }
-                self.mount_table
-                    .write_all(path, content)
-                    .await
-                    .map_err(vfs_to_backend)?;
+                self.raw_write(path, content, mode).await?;
                 self.file_cache.invalidate(&key);
                 return Ok(());
             }
@@ -240,22 +287,27 @@ impl KernelBackend for MountBackend {
             .await
             .map_err(BackendError::Io)?;
         self.file_cache.mark_dirty(&key);
-        // Write-through: external tools (cargo, git) read the real filesystem,
-        // so flush the CRDT content out immediately rather than deferring.
-        self.file_cache.flush_one(&key).await.map_err(BackendError::Io)
+        // Write-through: external tools (cargo, git) read the real filesystem.
+        // If the flush fails, roll the edit back out of the cache so a later
+        // read can't serve content that never reached disk — crash, don't
+        // corrupt.
+        if let Err(e) = self.file_cache.flush_one(&key).await {
+            self.file_cache.invalidate(&key);
+            return Err(BackendError::Io(e));
+        }
+        Ok(())
     }
 
     async fn append(&self, path: &Path, content: &[u8]) -> BackendResult<()> {
+        if !self.mount_table.is_writable(path).await {
+            return self.raw_append(path, content).await;
+        }
+
         let key = self.cache_key(path)?;
         let suffix = match std::str::from_utf8(content) {
             Ok(s) => s,
             Err(_) => {
-                // Binary append: raw VFS append, then drop the stale text doc.
-                let attr = self.mount_table.getattr(path).await.map_err(vfs_to_backend)?;
-                self.mount_table
-                    .write(path, attr.size, content)
-                    .await
-                    .map_err(vfs_to_backend)?;
+                self.raw_append(path, content).await?;
                 self.file_cache.invalidate(&key);
                 return Ok(());
             }
@@ -268,18 +320,32 @@ impl KernelBackend for MountBackend {
             .await
             .map_err(BackendError::Io)?;
         self.file_cache.mark_dirty(&key);
-        self.file_cache.flush_one(&key).await.map_err(BackendError::Io)
+        if let Err(e) = self.file_cache.flush_one(&key).await {
+            self.file_cache.invalidate(&key);
+            return Err(BackendError::Io(e));
+        }
+        Ok(())
     }
 
     async fn patch(&self, path: &Path, ops: &[PatchOp]) -> BackendResult<()> {
-        // Read current content from the CRDT cache, apply patches in memory,
-        // write back through the cache so the document stays the source of truth.
+        // Writable mounts apply through the CRDT cache (source of truth);
+        // read-only/OS paths read+write straight through the VFS (which rejects
+        // the write cleanly).
+        let writable = self.mount_table.is_writable(path).await;
         let key = self.cache_key(path)?;
-        let mut text = self
-            .file_cache
-            .read_content(&key)
-            .await
-            .map_err(BackendError::Io)?;
+        let mut text = if writable {
+            self.file_cache
+                .read_content(&key)
+                .await
+                .map_err(BackendError::Io)?
+        } else {
+            let bytes = self
+                .mount_table
+                .read_all(path)
+                .await
+                .map_err(vfs_to_backend)?;
+            String::from_utf8_lossy(&bytes).to_string()
+        };
 
         for op in ops {
             match op {
@@ -406,12 +472,23 @@ impl KernelBackend for MountBackend {
             }
         }
 
-        self.file_cache
-            .create_or_replace(&key, &text)
-            .await
-            .map_err(BackendError::Io)?;
-        self.file_cache.mark_dirty(&key);
-        self.file_cache.flush_one(&key).await.map_err(BackendError::Io)
+        if writable {
+            self.file_cache
+                .create_or_replace(&key, &text)
+                .await
+                .map_err(BackendError::Io)?;
+            self.file_cache.mark_dirty(&key);
+            if let Err(e) = self.file_cache.flush_one(&key).await {
+                self.file_cache.invalidate(&key);
+                return Err(BackendError::Io(e));
+            }
+            Ok(())
+        } else {
+            self.mount_table
+                .write_all(path, text.as_bytes())
+                .await
+                .map_err(vfs_to_backend)
+        }
     }
 
     // =========================================================================
@@ -569,7 +646,7 @@ mod tests {
     use crate::Kernel as KaijutsuKernel;
     use crate::block_store::shared_block_store;
     use crate::file_tools::FileDocumentCache;
-    use crate::vfs::backends::MemoryBackend;
+    use crate::vfs::backends::{LocalBackend, MemoryBackend};
     use kaijutsu_types::PrincipalId;
 
     /// Create a test MountBackend with a MemoryBackend mounted at /tmp.
@@ -751,6 +828,54 @@ mod tests {
             String::from_utf8(via_relative_key).unwrap(),
             "fn main() { /* edited */ }"
         );
+    }
+
+    /// Read-only / OS mounts pass through the VFS and never touch the CRDT
+    /// cache: reads work, writes are rejected cleanly, and a rejected write
+    /// must NOT leave a phantom edit that a later read would serve.
+    #[tokio::test]
+    async fn readonly_mount_passes_through_and_does_not_poison() {
+        let dir = std::env::temp_dir().join(format!("kj-ro-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ro.txt"), b"on-disk").unwrap();
+
+        let blocks = shared_block_store(PrincipalId::system());
+        let kernel = Arc::new(KaijutsuKernel::new("test-ro", None).await);
+        let sid = kaijutsu_types::SessionId::new();
+        let session_contexts = crate::runtime::context_engine::session_context_map();
+        session_contexts.insert(sid, kaijutsu_types::ContextId::new());
+
+        let mount_table = Arc::new(MountTable::new());
+        mount_table
+            .mount(dir.to_str().unwrap(), LocalBackend::read_only(&dir))
+            .await;
+        let file_cache = Arc::new(FileDocumentCache::new(blocks.clone(), mount_table.clone()));
+        let docs = Arc::new(KaijutsuBackend::new(
+            blocks,
+            kernel,
+            PrincipalId::system(),
+            session_contexts,
+            sid,
+        ));
+        let backend = MountBackend::new(mount_table, docs, file_cache);
+
+        let file = dir.join("ro.txt");
+
+        // Read passes through.
+        assert_eq!(backend.read(&file, None).await.unwrap(), b"on-disk");
+
+        // Write is rejected (read-only) — the exact error variant depends on the
+        // backend, but it must fail.
+        let w = backend
+            .write(&file, b"tampered", WriteMode::Overwrite)
+            .await;
+        assert!(w.is_err(), "write to a read-only mount must fail");
+
+        // And the rejected write must not have poisoned anything: a fresh read
+        // still returns the on-disk content, not the phantom edit.
+        assert_eq!(backend.read(&file, None).await.unwrap(), b"on-disk");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
