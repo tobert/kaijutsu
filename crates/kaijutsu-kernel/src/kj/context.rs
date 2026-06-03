@@ -40,21 +40,48 @@ impl ContextConfig {
     }
 }
 
+/// A `--model` spec resolved against the LLM registry: a bare model name has
+/// had its provider filled in from the registry default (matching `kj fork`).
+struct ResolvedModel {
+    provider: Option<String>,
+    model: Option<String>,
+}
+
 impl KjDispatcher {
-    /// Validate user-supplied config BEFORE any mutation: provider existence,
-    /// consent mode spelling, and `--env KEY=VALUE` shape. Pure checks plus an
-    /// async registry read — no DB writes — so callers can bail out cleanly
-    /// without leaving a half-configured (or orphan) context behind.
-    async fn validate_context_config(&self, cfg: &ContextConfig) -> Result<(), String> {
-        if let Some(ref spec) = cfg.model_spec {
-            let (provider, _) = parse_model_spec(spec);
-            if let Some(ref p) = provider {
+    /// Validate user-supplied config and resolve `--model` BEFORE any mutation.
+    ///
+    /// Checks provider existence, consent-mode spelling, and `--env KEY=VALUE`
+    /// shape, and resolves a bare model name (no `provider/` prefix) to the
+    /// registry's default provider — erroring if none is configured, exactly
+    /// like `kj fork`. Pure checks plus an async registry read, no DB writes,
+    /// so callers can bail out cleanly without leaving a half-configured (or
+    /// orphan) context behind. Returns the resolved model when `--model` was
+    /// given, else `None`.
+    async fn resolve_context_config(
+        &self,
+        cfg: &ContextConfig,
+    ) -> Result<Option<ResolvedModel>, String> {
+        let resolved_model = match cfg.model_spec {
+            Some(ref spec) if !spec.is_empty() => {
+                let (mut provider, model) = parse_model_spec(spec);
                 let registry = self.kernel().llm().read().await;
-                if registry.get(p).is_none() {
-                    return Err(format!("unknown provider '{p}'"));
+                if let Some(ref p) = provider {
+                    // Explicit provider — must exist.
+                    if registry.get(p).is_none() {
+                        return Err(format!("unknown provider '{p}'"));
+                    }
+                } else if let Some(ref m) = model {
+                    // Bare model name — resolve provider from the registry default.
+                    match registry.default_provider_name() {
+                        Some(p) => provider = Some(p.to_string()),
+                        None => return Err(format!("no provider configured for model '{m}'")),
+                    }
                 }
+                Some(ResolvedModel { provider, model })
             }
-        }
+            _ => None,
+        };
+
         if let Some(ref spec) = cfg.consent_spec
             && spec.parse::<ConsentMode>().is_err()
         {
@@ -67,33 +94,35 @@ impl KjDispatcher {
         {
             return Err("--env requires KEY=VALUE format".to_string());
         }
-        Ok(())
+        Ok(resolved_model)
     }
 
     /// Apply already-validated config to an existing context row and return
-    /// the human-readable change list. Assumes [`Self::validate_context_config`]
-    /// has already run, so provider existence is not re-checked here — only DB
-    /// I/O errors surface. The model column is updated in the DB regardless;
-    /// the DriftRouter is reconfigured only when both provider and model are
-    /// present (a bare model name updates the row but not the live handle,
-    /// matching pre-existing `set` behaviour).
+    /// the human-readable change list. Assumes [`Self::resolve_context_config`]
+    /// has already run, so the model is pre-resolved and not re-checked here —
+    /// only DB I/O errors surface. The model column is updated in the DB; the
+    /// DriftRouter is reconfigured whenever both provider and model are present
+    /// (which, post-resolution, is every non-degenerate `--model` spec).
     async fn apply_context_config(
         &self,
         target_id: ContextId,
         cfg: &ContextConfig,
+        resolved_model: Option<&ResolvedModel>,
     ) -> Result<Vec<String>, String> {
         let (changes, model_for_drift) = {
             let db = self.kernel_db().lock();
             let mut changes = Vec::new();
             let mut model_for_drift: Option<(String, String)> = None;
 
-            if let Some(ref spec) = cfg.model_spec {
-                let (provider, model) = parse_model_spec(spec);
-                db.update_model(target_id, provider.as_deref(), model.as_deref())
+            if let Some(rm) = resolved_model {
+                db.update_model(target_id, rm.provider.as_deref(), rm.model.as_deref())
                     .map_err(|e| e.to_string())?;
+                // `model_spec` is the original argv string — guaranteed present
+                // here since `resolved_model` is Some only when it was given.
+                let spec = cfg.model_spec.as_deref().unwrap_or("?");
                 changes.push(format!("model={spec}"));
-                if let (Some(p), Some(m)) = (provider, model) {
-                    model_for_drift = Some((p, m));
+                if let (Some(p), Some(m)) = (&rm.provider, &rm.model) {
+                    model_for_drift = Some((p.clone(), m.clone()));
                 }
             }
 
@@ -427,11 +456,12 @@ impl KjDispatcher {
         // /etc/rc/default/<verb>/.
         let context_type = cfg.type_spec.take().unwrap_or_else(|| "default".to_string());
 
-        // Validate the rest before any mutation so a typo'd --model/--consent/
-        // --env can't leave an orphan context behind.
-        if let Err(e) = self.validate_context_config(&cfg).await {
-            return KjResult::Err(format!("kj context create: {e}"));
-        }
+        // Validate + resolve the rest before any mutation so a typo'd
+        // --model/--consent/--env can't leave an orphan context behind.
+        let resolved_model = match self.resolve_context_config(&cfg).await {
+            Ok(r) => r,
+            Err(e) => return KjResult::Err(format!("kj context create: {e}")),
+        };
         let label = label.as_str();
 
         let new_id = ContextId::new();
@@ -492,7 +522,10 @@ impl KjDispatcher {
         // Apply settable config (model, system-prompt, consent, cwd, env) now
         // that the row and drift handle exist. Validated above; only DB I/O
         // errors surface here.
-        let config_changes = match self.apply_context_config(new_id, &cfg).await {
+        let config_changes = match self
+            .apply_context_config(new_id, &cfg, resolved_model.as_ref())
+            .await
+        {
             Ok(changes) => changes,
             Err(e) => return KjResult::Err(format!("kj context create: {e}")),
         };
@@ -581,10 +614,11 @@ impl KjDispatcher {
             .map(|s| s.as_str());
         let cfg = ContextConfig::from_argv(argv);
 
-        // Validate before touching the DB.
-        if let Err(e) = self.validate_context_config(&cfg).await {
-            return KjResult::Err(format!("kj context set: {e}"));
-        }
+        // Validate + resolve the model before touching the DB.
+        let resolved_model = match self.resolve_context_config(&cfg).await {
+            Ok(r) => r,
+            Err(e) => return KjResult::Err(format!("kj context set: {e}")),
+        };
 
         // Resolve target (brief lock; resolver borrows the db).
         let target_id = {
@@ -595,7 +629,10 @@ impl KjDispatcher {
             }
         };
 
-        match self.apply_context_config(target_id, &cfg).await {
+        match self
+            .apply_context_config(target_id, &cfg, resolved_model.as_ref())
+            .await
+        {
             Ok(changes) if changes.is_empty() => {
                 KjResult::ok("no changes specified".to_string())
             }
@@ -1578,6 +1615,66 @@ mod tests {
         );
         assert!(msg.contains("Env:"), "should show env: {msg}");
         assert!(msg.contains("RUST_LOG=debug"), "should show env var: {msg}");
+    }
+
+    #[tokio::test]
+    async fn context_set_bare_model_resolves_default_provider() {
+        // `--model <bare>` (no provider) resolves the provider from the
+        // registry default and configures the live DriftRouter handle —
+        // parity with `kj fork`. Before the fix it only touched the DB column.
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("target"), None, principal);
+
+        {
+            use crate::llm::{MockClient, Provider};
+            use std::sync::Arc;
+            let mock = Arc::new(Provider::Mock(MockClient::new("mock")));
+            let mut registry = d.kernel().llm().write().await;
+            registry.register("mock", mock);
+            assert!(registry.set_default("mock"), "default should set");
+        }
+
+        let c = caller_with_context(ctx);
+        let result = d
+            .dispatch(
+                &[s("context"), s("set"), s("."), s("--model"), s("bare-model")],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "set failed: {}", result.message());
+
+        let router = d.drift_router().read();
+        let handle = router.get(ctx).unwrap();
+        assert_eq!(
+            handle.provider.as_deref(),
+            Some("mock"),
+            "bare model should resolve the default provider"
+        );
+        assert_eq!(handle.model.as_deref(), Some("bare-model"));
+    }
+
+    #[tokio::test]
+    async fn context_set_bare_model_no_default_errors() {
+        // A bare model name with no default provider configured must error,
+        // not silently update only the DB column.
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("target"), None, principal);
+
+        let c = caller_with_context(ctx);
+        let result = d
+            .dispatch(
+                &[s("context"), s("set"), s("."), s("--model"), s("orphan-model")],
+                &c,
+            )
+            .await;
+        assert!(!result.is_ok(), "should fail: {}", result.message());
+        assert!(
+            result.message().contains("no provider configured"),
+            "msg: {}",
+            result.message()
+        );
     }
 
     #[tokio::test]

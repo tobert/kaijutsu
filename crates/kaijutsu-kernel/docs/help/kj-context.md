@@ -28,7 +28,7 @@ born fully configured instead of needing a follow-up `set`:
 - `--name`, `-n` — Label (create only; alternative to the positional `<label>`)
 - `--parent`, `-p` — Parent context (create only; defaults to the current context)
 - `--model`, `-m` — Model, format `provider/model` (e.g. `anthropic/claude-sonnet-4-6`).
-  A bare `model` updates the stored model but won't switch the live handle.
+  A bare `model` resolves the provider from the registry default (errors if none).
 - `--system-prompt` — System prompt text
 - `--consent` — `collaborative` or `autonomous`
 - `--cwd` — Working directory
