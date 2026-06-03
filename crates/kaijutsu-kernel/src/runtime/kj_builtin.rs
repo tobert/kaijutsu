@@ -936,4 +936,66 @@ mod tests {
             "stdin leaked when --content was provided: {stdout}"
         );
     }
+
+    /// Latch regression: a confirmation nonce issued by one `EmbeddedKaish`
+    /// must still validate when the *next* shell confirms it. kaish is
+    /// materialized fresh per MCP `execute`, so the nonce store can't live on
+    /// the shell — it lives per-context on the kernel. Before the fix, the
+    /// `--confirm` landed in a brand-new empty store and the kernel reported
+    /// "invalid nonce", exactly the `kj context retag … --confirm <nonce>`
+    /// failure observed in the app.
+    #[tokio::test]
+    async fn latch_nonce_survives_fresh_shell_for_same_context() {
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+
+        let principal = PrincipalId::new();
+        let ctx = register_context(&dispatcher, Some("alpha"), None, principal);
+
+        // Shell #1: issue the latch nonce (no --confirm yet → exit 2).
+        let kaish_a = embedded_with_kj(dispatcher.clone(), ctx).await;
+        let issue = kaish_a
+            .execute_with_options(
+                "kj context retag beta alpha",
+                ExecuteOptions::default(),
+            )
+            .await
+            .expect("kaish exec (issue)");
+        assert_eq!(
+            issue.code, 2,
+            "retag without --confirm should latch (exit 2): {issue:?}"
+        );
+
+        // Pull the nonce out of the confirmation hint kaish emitted, e.g.
+        // "...To confirm, run: kj context retag beta alpha --confirm 1a2b3c4d".
+        let hint = &issue.err;
+        let nonce = hint
+            .split("--confirm ")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .unwrap_or_else(|| panic!("no --confirm nonce in latch message: {hint}"));
+
+        // Shell #2: a *fresh* materialization for the same context — the real
+        // path a follow-up MCP `execute` takes. The nonce must still validate.
+        let kaish_b = embedded_with_kj(dispatcher.clone(), ctx).await;
+        let confirm = kaish_b
+            .execute_with_options(
+                &format!("kj context retag beta alpha --confirm {nonce}"),
+                ExecuteOptions::default(),
+            )
+            .await
+            .expect("kaish exec (confirm)");
+
+        assert!(
+            !confirm.err.contains("invalid nonce"),
+            "nonce was lost between fresh shells: {}",
+            confirm.err
+        );
+        assert!(
+            confirm.ok(),
+            "confirm in a fresh shell should succeed, got code {} / err {:?}",
+            confirm.code,
+            confirm.err
+        );
+    }
 }

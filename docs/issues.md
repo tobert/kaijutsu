@@ -165,6 +165,27 @@ Remaining:
 - **CRDT `order_index` BTreeMap.** `blocks_ordered()` is O(N log N).
   Works correctly but scales poorly; add a secondary sorted index when
   scale demands.
+- **Latch state should persist with the context.** Two related gaps,
+  both surfaced fixing the `kj context retag … --confirm` "invalid nonce"
+  bug (2026-06-03):
+  1. **`set -o latch` mode is per-shell.** The flag lives on the kaish
+     `Scope` (`kaish-kernel/src/interpreter/scope.rs`), which is rebuilt
+     fresh per MCP `execute` since kaish is per-use materialized. So a
+     user who runs `set -o latch` in one command and `rm` in the next is
+     *not* gated across the materialization boundary. The `kj` confirm
+     verbs (e.g. `retag`) are unaffected because they're always-latched
+     regardless of the flag. Eventually `set -o latch` should persist
+     with the context like shell vars / cwd already do (`context_env`,
+     `context_shell.cwd`) — i.e. a durable per-context latch-enabled bit.
+  2. **Latch nonces should eventually live in a SQLite table.** The
+     confirmation nonces now survive between commands via a per-`ContextId`
+     in-memory `NonceStore` on the kernel (`Kernel::nonce_store_for`,
+     injected into each `EmbeddedKaish` via `with_nonce_store`). That's
+     in-memory only — nonces are lost on kernel restart, and they don't
+     replicate. Promote to a `KernelDb` table (nonce, context_id,
+     command/target scope, created_at/ttl) so latch confirmation is
+     durable and inspectable like the rest of per-context state. Note the
+     `Instant`-based TTL must become a wall-clock timestamp to serialize.
 
 ## Index
 

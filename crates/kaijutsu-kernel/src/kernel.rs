@@ -76,6 +76,14 @@ pub struct Kernel {
     /// explicitly by the server at startup; lazily initialized from a block
     /// store otherwise (tests, embedded callers).
     file_cache: OnceLock<Arc<crate::file_tools::FileDocumentCache>>,
+    /// Per-context latch confirmation nonce stores. kaish is materialized fresh
+    /// per MCP `execute`, but a latch nonce issued by one command must be
+    /// confirmable by the next. Keying these stores by `ContextId` here — on
+    /// the long-lived kernel rather than the ephemeral `EmbeddedKaish` — gives
+    /// the nonce the same durable, per-context lifetime that shell vars and cwd
+    /// already have. Without it, every `--confirm` lands in a fresh empty store
+    /// and reports "invalid nonce".
+    nonce_stores: dashmap::DashMap<kaijutsu_types::ContextId, kaish_kernel::nonce::NonceStore>,
 }
 
 impl std::fmt::Debug for Kernel {
@@ -138,6 +146,7 @@ impl Kernel {
             }),
             timeouts: kaijutsu_types::TimeoutPolicy::default(),
             file_cache: OnceLock::new(),
+            nonce_stores: dashmap::DashMap::new(),
         }
     }
 
@@ -173,6 +182,7 @@ impl Kernel {
             }),
             timeouts: kaijutsu_types::TimeoutPolicy::default(),
             file_cache: OnceLock::new(),
+            nonce_stores: dashmap::DashMap::new(),
         }
     }
 
@@ -609,6 +619,23 @@ impl Kernel {
                     self.vfs.clone(),
                 ))
             })
+            .clone()
+    }
+
+    /// Get the latch-nonce store for a context, creating it on first use.
+    ///
+    /// The returned `NonceStore` is `Arc`-backed and `Clone`; clones share the
+    /// same nonce table. Each `EmbeddedKaish` materialized for `context_id`
+    /// injects this clone into its kaish config so a nonce issued by one
+    /// command survives to be confirmed by the next, even though the shell
+    /// itself is rebuilt per `execute`.
+    pub fn nonce_store_for(
+        &self,
+        context_id: kaijutsu_types::ContextId,
+    ) -> kaish_kernel::nonce::NonceStore {
+        self.nonce_stores
+            .entry(context_id)
+            .or_insert_with(kaish_kernel::nonce::NonceStore::new)
             .clone()
     }
 

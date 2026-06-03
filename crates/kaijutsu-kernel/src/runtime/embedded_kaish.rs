@@ -158,7 +158,13 @@ impl EmbeddedKaish {
         // constructor so this survives kaish config-API churn.
         let mut config = KaishConfig::named(name)
             .with_ignore_config(IgnoreConfig::mcp())
-            .with_output_limit(OutputLimitConfig::mcp());
+            .with_output_limit(OutputLimitConfig::mcp())
+            // Latch nonces must outlive this per-execute shell: a nonce issued
+            // by one command (e.g. `kj context retag`) is confirmed by the
+            // *next* command in a fresh `EmbeddedKaish`. The store is keyed by
+            // context on the long-lived kernel, so the `--confirm` lands in the
+            // same table that issued the nonce instead of a fresh empty one.
+            .with_nonce_store(kernel.nonce_store_for(context_id));
         if let Some(root) = project_root {
             config = config.with_cwd(root);
         }
