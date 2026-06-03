@@ -32,8 +32,9 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use kaish_kernel::interpreter::ExecResult;
+use kaish_kernel::output_limit::OutputLimitConfig;
 use kaish_kernel::{
-    ExecuteOptions, Kernel as KaishKernel, KernelBackend, KernelConfig as KaishConfig,
+    ExecuteOptions, IgnoreConfig, Kernel as KaishKernel, KernelBackend, KernelConfig as KaishConfig,
 };
 
 use crate::Kernel as KaijutsuKernel;
@@ -150,10 +151,17 @@ impl EmbeddedKaish {
         // against the shell's backend (the VFS namespace `cd` uses), which is
         // async, so `restore_cwd_from_db` does it post-construction — see
         // `materialize_context_kaish`.
-        let mut config = match project_root {
-            Some(root) => KaishConfig::mcp_with_root(root),
-            None => KaishConfig::named(name),
-        };
+        // kaijutsu overrides the backend with MountBackend (see below), so the
+        // config's vfs_mode is moot — what matters is the cwd and the MCP-grade
+        // ignore/output-limit presets (gitignore-aware walks + capped output).
+        // Build them explicitly via the builder chain rather than a bundled
+        // constructor so this survives kaish config-API churn.
+        let mut config = KaishConfig::named(name)
+            .with_ignore_config(IgnoreConfig::mcp())
+            .with_output_limit(OutputLimitConfig::mcp());
+        if let Some(root) = project_root {
+            config = config.with_cwd(root);
+        }
 
         // Apply kernel-wide kaish-script default timeout. Per-call sites
         // (rc lifecycle, hook bodies, init scripts) can override via
