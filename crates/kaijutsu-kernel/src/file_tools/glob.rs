@@ -9,6 +9,7 @@ use crate::execution::{ExecContext, ExecResult};
 use crate::vfs::MountTable;
 
 use super::guard::WorkspaceGuard;
+use super::path::resolve_str;
 use super::vfs_walker::VfsWalkerAdapter;
 
 /// Engine for glob pattern matching over the VFS.
@@ -47,16 +48,22 @@ impl GlobEngine {
             Err(e) => return Ok(ExecResult::failure(1, format!("Invalid pattern: {}", e))),
         };
 
-        // Determine the search root: use static_prefix optimization + user path
-        let default_root = ctx.cwd.to_string_lossy();
-        let base = p.path.as_deref().unwrap_or(&default_root);
+        // Determine the search root: resolve the user path against cwd, then
+        // apply the static_prefix optimization.
+        let base = match &p.path {
+            Some(pp) => match resolve_str(&ctx.cwd, pp) {
+                Ok(s) => s,
+                Err(e) => return Ok(ExecResult::failure(1, e.to_string())),
+            },
+            None => ctx.cwd.to_string_lossy().into_owned(),
+        };
         let search_root = match glob_path.static_prefix() {
             Some(prefix) => {
-                let mut root = std::path::PathBuf::from(base);
+                let mut root = std::path::PathBuf::from(&base);
                 root.push(prefix);
                 root
             }
-            None => std::path::PathBuf::from(base),
+            None => std::path::PathBuf::from(&base),
         };
 
         if let Some(ref guard) = self.guard

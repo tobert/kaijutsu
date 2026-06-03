@@ -10,6 +10,7 @@ use crate::vfs::{MountTable, VfsOps};
 
 use super::cache::FileDocumentCache;
 use super::guard::WorkspaceGuard;
+use super::path::resolve_str;
 use super::vfs_walker::VfsWalkerAdapter;
 
 /// Engine for searching file content with regex.
@@ -64,22 +65,24 @@ impl GrepEngine {
             Err(e) => return Ok(ExecResult::failure(1, format!("Invalid params: {}", e))),
         };
 
+        // No silent fallback: an invalid regex is a caller error, not an
+        // excuse to quietly search for a different (literal) thing.
         let re = match regex::Regex::new(&p.pattern) {
             Ok(r) => r,
-            Err(_) => {
-                // Fall back to literal search
-                match regex::Regex::new(&regex::escape(&p.pattern)) {
-                    Ok(r) => r,
-                    Err(e) => return Ok(ExecResult::failure(1, format!("Invalid pattern: {}", e))),
-                }
-            }
+            Err(e) => return Ok(ExecResult::failure(1, format!("Invalid regex pattern: {}", e))),
         };
 
-        let default_root = ctx.cwd.to_string_lossy();
-        let search_root = p.path.as_deref().unwrap_or(&default_root);
+        // Resolve the search root against cwd so grep agrees with read/edit.
+        let search_root = match &p.path {
+            Some(pp) => match resolve_str(&ctx.cwd, pp) {
+                Ok(s) => s,
+                Err(e) => return Ok(ExecResult::failure(1, e.to_string())),
+            },
+            None => ctx.cwd.to_string_lossy().into_owned(),
+        };
 
         if let Some(ref guard) = self.guard
-            && let Err(denied) = guard.check_read(ctx, search_root)
+            && let Err(denied) = guard.check_read(ctx, &search_root)
         {
             return Ok(denied);
         }
@@ -92,7 +95,7 @@ impl GrepEngine {
         };
 
         // Build walker, optionally filtered by glob
-        let mut walker = FileWalker::new(&adapter, search_root).with_options(options);
+        let mut walker = FileWalker::new(&adapter, &search_root).with_options(options);
 
         if let Some(ref glob_pattern) = p.glob {
             match GlobPath::new(glob_pattern) {

@@ -8,6 +8,7 @@ use crate::execution::{ExecContext, ExecResult};
 
 use super::cache::FileDocumentCache;
 use super::guard::WorkspaceGuard;
+use super::path::resolve_str;
 
 /// Engine for editing files via exact string replacement.
 pub struct EditEngine {
@@ -51,8 +52,13 @@ impl EditEngine {
             Err(e) => return Ok(ExecResult::failure(1, format!("Invalid params: {}", e))),
         };
 
+        let path = match resolve_str(&ctx.cwd, &p.path) {
+            Ok(s) => s,
+            Err(e) => return Ok(ExecResult::failure(1, e.to_string())),
+        };
+
         if let Some(ref guard) = self.guard
-            && let Err(denied) = guard.check_write(ctx, &p.path)
+            && let Err(denied) = guard.check_write(ctx, &path)
         {
             return Ok(denied);
         }
@@ -64,12 +70,12 @@ impl EditEngine {
             ));
         }
 
-        let (ctx_id, block_id) = match self.cache.get_or_load(&p.path).await {
+        let (ctx_id, block_id) = match self.cache.get_or_load(&path).await {
             Ok(ids) => ids,
             Err(e) => return Ok(ExecResult::failure(1, e)),
         };
 
-        let content = match self.cache.read_content(&p.path).await {
+        let content = match self.cache.read_content(&path).await {
             Ok(c) => c,
             Err(e) => return Ok(ExecResult::failure(1, e)),
         };
@@ -85,7 +91,7 @@ impl EditEngine {
                 1,
                 format!(
                     "old_string not found in {}. Make sure it matches exactly.",
-                    p.path
+                    path
                 ),
             ));
         }
@@ -96,7 +102,7 @@ impl EditEngine {
                 format!(
                     "old_string found {} times in {}. Use replace_all: true or provide more context to make it unique.",
                     matches.len(),
-                    p.path
+                    path
                 ),
             ));
         }
@@ -117,10 +123,18 @@ impl EditEngine {
             replacements += 1;
         }
 
-        self.cache.mark_dirty(&p.path);
+        self.cache.mark_dirty(&path);
+        // Write-through so the edit lands on disk for external tools (cargo,
+        // git) rather than sitting dirty in the cache.
+        if let Err(e) = self.cache.flush_one(&path).await {
+            return Ok(ExecResult::failure(
+                1,
+                format!("edited CRDT but failed to flush {}: {}", path, e),
+            ));
+        }
 
         // Build context around the first replacement for confirmation
-        let updated = self.cache.read_content(&p.path).await.unwrap_or_default();
+        let updated = self.cache.read_content(&path).await.unwrap_or_default();
         let first_pos = updated.find(&p.new_string).unwrap_or(0);
         let context = extract_context(&updated, first_pos, p.new_string.len());
 
@@ -128,7 +142,7 @@ impl EditEngine {
             "Replaced {} occurrence{} in {}\n\n{}",
             replacements,
             if replacements == 1 { "" } else { "s" },
-            p.path,
+            path,
             context
         )))
     }

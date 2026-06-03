@@ -8,6 +8,7 @@ use crate::execution::{ExecContext, ExecResult};
 
 use super::cache::FileDocumentCache;
 use super::guard::WorkspaceGuard;
+use super::path::resolve_str;
 
 /// Engine for writing/creating files.
 pub struct WriteEngine {
@@ -40,19 +41,35 @@ impl WriteEngine {
             Err(e) => return Ok(ExecResult::failure(1, format!("Invalid params: {}", e))),
         };
 
+        let path = match resolve_str(&ctx.cwd, &p.path) {
+            Ok(s) => s,
+            Err(e) => return Ok(ExecResult::failure(1, e.to_string())),
+        };
+
         if let Some(ref guard) = self.guard
-            && let Err(denied) = guard.check_write(ctx, &p.path)
+            && let Err(denied) = guard.check_write(ctx, &path)
         {
             return Ok(denied);
         }
 
-        match self.cache.create_or_replace(&p.path, &p.content).await {
+        let existed = self.cache.exists(&path).await;
+
+        match self.cache.create_or_replace(&path, &p.content).await {
             Ok(_) => {
-                self.cache.mark_dirty(&p.path);
+                self.cache.mark_dirty(&path);
+                // Write-through: external tools read the real filesystem, so
+                // persist now rather than leaving the edit stranded in the cache.
+                if let Err(e) = self.cache.flush_one(&path).await {
+                    return Ok(ExecResult::failure(
+                        1,
+                        format!("wrote to CRDT but failed to flush {}: {}", path, e),
+                    ));
+                }
                 Ok(ExecResult::success(format!(
-                    "Wrote {} bytes to {}",
+                    "{} {} ({} bytes)",
+                    if existed { "Updated" } else { "Created" },
+                    path,
                     p.content.len(),
-                    p.path
                 )))
             }
             Err(e) => Ok(ExecResult::failure(1, e)),

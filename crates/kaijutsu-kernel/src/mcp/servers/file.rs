@@ -32,12 +32,14 @@ use super::adapter::{from_exec_result, to_exec_context};
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReadParams {
-    /// File path to read (relative to VFS root).
+    /// File path. Relative paths resolve against the context cwd.
     pub path: String,
-    /// Start line (0-indexed). Omit to read from beginning.
+    /// 1-indexed line to start at (matches the line numbers in the output and
+    /// in grep results). Omit to start at line 1.
     #[serde(default)]
     pub offset: Option<u32>,
-    /// Maximum number of lines to return. Omit for all lines.
+    /// Maximum number of lines to return. Omit to use the default cap (2000);
+    /// the output notes when the window is partial.
     #[serde(default)]
     pub limit: Option<u32>,
 }
