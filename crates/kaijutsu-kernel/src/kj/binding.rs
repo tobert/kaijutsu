@@ -129,6 +129,9 @@ impl KjDispatcher {
             Some(b) => serde_json::json!({
                 "context_id": ctx_id.to_hex(),
                 "bound": true,
+                "all_instances": b.all_instances,
+                "all_facades": b.all_facades,
+                "admin": b.binding_admin,
                 "instances": b.allowed_instances.iter().map(|i| i.as_str()).collect::<Vec<_>>(),
                 "tools": b.allowed_tools.iter()
                     .map(|(i, t)| format!("{}:{}", i.as_str(), t))
@@ -139,7 +142,7 @@ impl KjDispatcher {
 
         let text = match &binding {
             None => format!(
-                "context {}: no binding (default-permissive — all instances)",
+                "context {}: no binding — denies all (deny-by-default; grant with `kj binding allow`)",
                 ctx_id.short()
             ),
             Some(b) => {
@@ -166,8 +169,26 @@ impl KjDispatcher {
                 } else {
                     b.allowed_facades.join(", ")
                 };
+                // Flags first — they dominate the granular lists (`*` allows every
+                // instance regardless of the explicit list, etc.). Without this
+                // line a broad binding misleadingly reads as all "(none)".
+                let mut flags = Vec::new();
+                if b.all_instances {
+                    flags.push("* (all instances)");
+                }
+                if b.all_facades {
+                    flags.push("facade:* (all facades)");
+                }
+                if b.binding_admin {
+                    flags.push("admin");
+                }
+                let flags = if flags.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    flags.join(", ")
+                };
                 format!(
-                    "context {}:\n  instances: {instances}\n  tools: {tools}\n  facades: {facades}",
+                    "context {}:\n  grants: {flags}\n  instances: {instances}\n  tools: {tools}\n  facades: {facades}",
                     ctx_id.short()
                 )
             }
