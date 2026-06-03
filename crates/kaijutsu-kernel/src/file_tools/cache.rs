@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use kaijutsu_crdt::{BlockId, BlockKind, ContentType, ContextId, Role, Status};
 use parking_lot::RwLock;
@@ -30,6 +30,11 @@ struct CachedFileDoc {
     dirty: bool,
     /// Last access time for LRU eviction.
     last_access: Instant,
+    /// VFS modification time when the content was last loaded from / flushed to
+    /// disk. A clean entry whose backing file has a newer mtime is stale and
+    /// gets reloaded — this is how external edits (cargo, git, the GUI) become
+    /// visible. `None` means we couldn't read an mtime, so we trust the cache.
+    loaded_mtime: Option<SystemTime>,
 }
 
 /// Cache that maps VFS files to CRDT documents.
@@ -58,18 +63,40 @@ impl FileDocumentCache {
     /// Get the context_id and block_id for a path, loading from VFS on cache miss.
     pub async fn get_or_load(&self, path: &str) -> Result<(ContextId, BlockId), String> {
         let ctx_id = file_context_id(path);
+        let vfs_path = std::path::Path::new(path);
 
-        // Fast path: already cached
-        {
+        // Fast path: already cached.
+        let cached = {
             let mut cache = self.cache.write();
-            if let Some(entry) = cache.get_mut(&ctx_id) {
-                entry.last_access = Instant::now();
-                return Ok((entry.context_id, entry.block_id));
+            cache.get_mut(&ctx_id).map(|e| {
+                e.last_access = Instant::now();
+                (e.context_id, e.block_id, e.dirty, e.loaded_mtime)
+            })
+        };
+        if let Some((cid, bid, dirty, loaded_mtime)) = cached {
+            // Uncommitted local edits win — never clobber them with disk state.
+            if dirty {
+                return Ok((cid, bid));
+            }
+            // Clean entry: if the backing file changed under us (external edit),
+            // refresh the CRDT block from disk so readers see the new content.
+            let disk_mtime = self.vfs.getattr(vfs_path).await.ok().map(|a| a.mtime);
+            let stale = matches!((disk_mtime, loaded_mtime), (Some(d), Some(l)) if d > l);
+            if !stale {
+                return Ok((cid, bid));
+            }
+            match self.reload_block_from_disk(ctx_id, &bid, path).await {
+                Ok(()) => return Ok((cid, bid)),
+                Err(e) => {
+                    // Couldn't reload (became binary/unreadable/removed): drop
+                    // the entry rather than serve stale content, and surface it.
+                    self.cache.write().remove(&ctx_id);
+                    return Err(e);
+                }
             }
         }
 
         // Cache miss: load from VFS
-        let vfs_path = std::path::Path::new(path);
         let content = self
             .vfs
             .read_all(vfs_path)
@@ -78,6 +105,9 @@ impl FileDocumentCache {
 
         let text = String::from_utf8(content)
             .map_err(|e| format!("{} is not valid UTF-8: {}", path, e))?;
+
+        // Capture the load-time mtime for staleness checks on later reads.
+        let loaded_mtime = self.vfs.getattr(vfs_path).await.ok().map(|a| a.mtime);
 
         // Detect language from extension
         let language = detect_language(path);
@@ -134,11 +164,67 @@ impl FileDocumentCache {
                     block_id,
                     dirty: false,
                     last_access: Instant::now(),
+                    loaded_mtime,
                 },
             );
         }
 
         Ok((ctx_id, block_id))
+    }
+
+    /// Replace a cached block's content with the current on-disk bytes. Used to
+    /// pick up external edits when a clean entry's file mtime has advanced.
+    /// Only emits a CRDT edit when the content actually differs.
+    async fn reload_block_from_disk(
+        &self,
+        ctx_id: ContextId,
+        block_id: &BlockId,
+        path: &str,
+    ) -> Result<(), String> {
+        let vfs_path = std::path::Path::new(path);
+        let bytes = self
+            .vfs
+            .read_all(vfs_path)
+            .await
+            .map_err(|e| format!("failed to reread {}: {}", path, e))?;
+        let text = String::from_utf8(bytes)
+            .map_err(|e| format!("{} is not valid UTF-8: {}", path, e))?;
+
+        let old = self
+            .block_store
+            .block_snapshots(ctx_id)
+            .ok()
+            .and_then(|snaps| {
+                snaps
+                    .iter()
+                    .find(|s| s.id == *block_id)
+                    .map(|s| s.content.clone())
+            })
+            .unwrap_or_default();
+
+        if old != text {
+            self.block_store
+                .edit_text(ctx_id, block_id, 0, &text, old.len())
+                .map_err(|e| e.to_string())?;
+        }
+
+        let mtime = self.vfs.getattr(vfs_path).await.ok().map(|a| a.mtime);
+        let mut cache = self.cache.write();
+        if let Some(entry) = cache.get_mut(&ctx_id) {
+            entry.loaded_mtime = mtime;
+            entry.dirty = false;
+        }
+        Ok(())
+    }
+
+    /// Whether a file already exists — cached as a CRDT document or present
+    /// on the backing VFS. Used to report created-vs-updated on write.
+    pub async fn exists(&self, path: &str) -> bool {
+        let ctx_id = file_context_id(path);
+        if self.cache.read().contains_key(&ctx_id) {
+            return true;
+        }
+        self.vfs.exists(std::path::Path::new(path)).await
     }
 
     /// Read the current content of a file (reflects any CRDT edits).
@@ -193,6 +279,14 @@ impl FileDocumentCache {
         self.get_or_load_with_content(path, content).await
     }
 
+    /// Drop a path's cached CRDT document, if any. Used when a write bypasses
+    /// the text substrate (e.g. binary content) so a later text read reloads
+    /// fresh rather than serving a stale CRDT doc.
+    pub fn invalidate(&self, path: &str) {
+        let ctx_id = file_context_id(path);
+        self.cache.write().remove(&ctx_id);
+    }
+
     /// Mark a file as dirty (needs flush to VFS).
     pub fn mark_dirty(&self, path: &str) {
         let ctx_id = file_context_id(path);
@@ -215,7 +309,7 @@ impl FileDocumentCache {
 
         let mut flushed = 0;
         let mut errors: Vec<String> = Vec::new();
-        let mut succeeded_ctx_ids: Vec<ContextId> = Vec::new();
+        let mut succeeded: Vec<(ContextId, Option<SystemTime>)> = Vec::new();
 
         for (path, ctx_id, block_id) in &dirty_entries {
             let content = self
@@ -230,14 +324,12 @@ impl FileDocumentCache {
                 })
                 .unwrap_or_default();
 
-            match self
-                .vfs
-                .write_all(std::path::Path::new(path), content.as_bytes())
-                .await
-            {
+            let vfs_path = std::path::Path::new(path);
+            match self.vfs.write_all(vfs_path, content.as_bytes()).await {
                 Ok(()) => {
                     flushed += 1;
-                    succeeded_ctx_ids.push(*ctx_id);
+                    let mtime = self.vfs.getattr(vfs_path).await.ok().map(|a| a.mtime);
+                    succeeded.push((*ctx_id, mtime));
                 }
                 Err(e) => {
                     errors.push(format!("failed to flush {}: {}", path, e));
@@ -245,12 +337,14 @@ impl FileDocumentCache {
             }
         }
 
-        // Only clear dirty flags for files that were successfully flushed
+        // Only clear dirty flags for files that were successfully flushed, and
+        // stamp the post-flush mtime so they aren't seen as externally changed.
         {
             let mut cache = self.cache.write();
-            for ctx_id in &succeeded_ctx_ids {
+            for (ctx_id, mtime) in &succeeded {
                 if let Some(entry) = cache.get_mut(ctx_id) {
                     entry.dirty = false;
+                    entry.loaded_mtime = *mtime;
                 }
             }
         }
@@ -291,15 +385,20 @@ impl FileDocumentCache {
             })
             .unwrap_or_default();
 
+        let vfs_path = std::path::Path::new(path);
         self.vfs
-            .write_all(std::path::Path::new(path), content.as_bytes())
+            .write_all(vfs_path, content.as_bytes())
             .await
             .map_err(|e| format!("failed to flush {}: {}", path, e))?;
 
+        // Stamp the post-flush mtime so our own write isn't later mistaken for
+        // an external change and needlessly reloaded.
+        let mtime = self.vfs.getattr(vfs_path).await.ok().map(|a| a.mtime);
         {
             let mut cache = self.cache.write();
             if let Some(entry) = cache.get_mut(&ctx_id) {
                 entry.dirty = false;
+                entry.loaded_mtime = mtime;
             }
         }
 
@@ -354,6 +453,8 @@ impl FileDocumentCache {
                     block_id,
                     dirty: false,
                     last_access: Instant::now(),
+                    // Not yet on disk; the next flush stamps the real mtime.
+                    loaded_mtime: None,
                 },
             );
         }
@@ -451,6 +552,64 @@ mod tests {
             id1, id3,
             "different paths should produce different ContextIds"
         );
+    }
+
+    use crate::block_store::shared_block_store;
+    use crate::vfs::backends::MemoryBackend;
+    use crate::vfs::{SetAttr, VfsOps};
+    use kaijutsu_types::PrincipalId;
+
+    /// Build a cache over a MemoryBackend mounted at /tmp.
+    async fn tmp_cache() -> (Arc<MountTable>, FileDocumentCache) {
+        let blocks = shared_block_store(PrincipalId::system());
+        let vfs = Arc::new(MountTable::new());
+        vfs.mount("/tmp", MemoryBackend::new()).await;
+        let cache = FileDocumentCache::new(blocks, vfs.clone());
+        (vfs, cache)
+    }
+
+    fn p(s: &str) -> &std::path::Path {
+        std::path::Path::new(s)
+    }
+
+    #[tokio::test]
+    async fn external_change_invalidates_clean_cache() {
+        let (vfs, cache) = tmp_cache().await;
+
+        vfs.write_all(p("/tmp/f.txt"), b"v1").await.unwrap();
+        assert_eq!(cache.read_content("/tmp/f.txt").await.unwrap(), "v1");
+
+        // External writer changes the file with a strictly-newer mtime.
+        vfs.write_all(p("/tmp/f.txt"), b"v2").await.unwrap();
+        let future = SystemTime::now() + std::time::Duration::from_secs(3600);
+        vfs.setattr(p("/tmp/f.txt"), SetAttr::new().with_mtime(future))
+            .await
+            .unwrap();
+
+        // Clean entry must reload and serve the new content.
+        assert_eq!(cache.read_content("/tmp/f.txt").await.unwrap(), "v2");
+    }
+
+    #[tokio::test]
+    async fn dirty_edits_survive_external_change() {
+        let (vfs, cache) = tmp_cache().await;
+
+        vfs.write_all(p("/tmp/g.txt"), b"disk-v1").await.unwrap();
+        assert_eq!(cache.read_content("/tmp/g.txt").await.unwrap(), "disk-v1");
+
+        // Local uncommitted edit (dirty, not flushed).
+        cache.create_or_replace("/tmp/g.txt", "local-edit").await.unwrap();
+        cache.mark_dirty("/tmp/g.txt");
+
+        // External writer also changes the file with a newer mtime.
+        vfs.write_all(p("/tmp/g.txt"), b"disk-v2").await.unwrap();
+        let future = SystemTime::now() + std::time::Duration::from_secs(3600);
+        vfs.setattr(p("/tmp/g.txt"), SetAttr::new().with_mtime(future))
+            .await
+            .unwrap();
+
+        // Local edits win — we must not clobber uncommitted work with disk state.
+        assert_eq!(cache.read_content("/tmp/g.txt").await.unwrap(), "local-edit");
     }
 
     #[test]
