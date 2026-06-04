@@ -55,7 +55,7 @@ impl KaijutsuToolInfo {
     }
 }
 
-use kaish_kernel::tools::{ExecContext, ParamSchema, ToolArgs, ToolSchema};
+use kaish_kernel::tools::{ParamSchema, ToolArgs, ToolCtx, ToolSchema};
 use kaish_kernel::vfs::{DirEntry, MountInfo};
 use kaish_kernel::{
     BackendError, BackendResult, KernelBackend, PatchOp, ReadRange, ToolInfo, ToolResult, WriteMode,
@@ -640,7 +640,7 @@ impl KernelBackend for KaijutsuBackend {
         &self,
         name: &str,
         args: ToolArgs,
-        ctx: &mut ExecContext,
+        ctx: &mut dyn ToolCtx,
     ) -> BackendResult<ToolResult> {
         let params_json = tool_args_to_json(&args);
         let params_str =
@@ -656,7 +656,7 @@ impl KernelBackend for KaijutsuBackend {
         let tool_ctx = crate::ExecContext::new(
             self.principal_id,
             context_id,
-            ctx.cwd.clone(),
+            ctx.cwd().to_path_buf(),
             self.session_id,
             self.kernel.id(),
         );

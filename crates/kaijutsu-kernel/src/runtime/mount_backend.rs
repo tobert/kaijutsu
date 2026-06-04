@@ -18,7 +18,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use kaish_kernel::backend::ConflictError;
-use kaish_kernel::tools::{ExecContext, ToolArgs};
+use kaish_kernel::tools::{ToolArgs, ToolCtx};
 use kaish_kernel::vfs::{DirEntry, DirEntryKind};
 use kaish_kernel::{
     BackendError, BackendResult, KernelBackend, PatchOp, ReadRange, ToolInfo, ToolResult, WriteMode,
@@ -577,7 +577,7 @@ impl KernelBackend for MountBackend {
         &self,
         name: &str,
         args: ToolArgs,
-        ctx: &mut ExecContext,
+        ctx: &mut dyn ToolCtx,
     ) -> BackendResult<ToolResult> {
         self.docs_tools.call_tool(name, args, ctx).await
     }
@@ -643,6 +643,7 @@ impl MountBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kaish_kernel::tools::ExecContext;
     use crate::Kernel as KaijutsuKernel;
     use crate::block_store::shared_block_store;
     use crate::file_tools::FileDocumentCache;

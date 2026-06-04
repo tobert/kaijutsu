@@ -17,7 +17,7 @@ use async_trait::async_trait;
 
 use kaish_kernel::ast::Value;
 use kaish_kernel::interpreter::ExecResult;
-use kaish_kernel::tools::{ParamSchema, ToolArgs, ToolSchema};
+use kaish_kernel::tools::{ParamSchema, ToolArgs, ToolCtx, ToolSchema};
 use kaish_kernel::{ExecContext, Tool};
 
 use crate::kj::{KjCaller, KjDispatcher, KjResult};
@@ -417,7 +417,15 @@ impl Tool for KjBuiltin {
             .example("Bulk synthesize keywords", "kj synth all")
     }
 
-    async fn execute(&self, args: ToolArgs, ctx: &mut ExecContext) -> ExecResult {
+    async fn execute(&self, args: ToolArgs, ctx: &mut dyn ToolCtx) -> ExecResult {
+        // kj is a trusted in-tree builtin: it needs the kernel's full
+        // ExecContext (stdin pipe, nonce latch, cwd persistence), not the
+        // trimmed portable surface. Downcast through the trait's escape hatch.
+        let ctx = ctx
+            .as_any_mut()
+            .downcast_mut::<ExecContext>()
+            .expect("kj builtin always runs against the kernel ExecContext");
+
         // Build argv from positional args + named args + flags.
         // kaish splits `kj fork --name exploration` into:
         //   positional: ["fork"], named: {"name": "exploration"}
