@@ -995,7 +995,14 @@ impl KernelDb {
 
     /// Insert a document, ignoring if it already exists (idempotent).
     pub fn insert_document_or_ignore(&self, row: &DocumentRow) -> KernelDbResult<()> {
-        self.conn.execute(
+        Self::write_document_or_ignore(&self.conn, row)
+    }
+
+    /// Insert-or-ignore a document row against `conn` (a `&Connection` or a
+    /// `&Transaction` via deref). Shared by `insert_document_or_ignore` and
+    /// the transactional `insert_forked_context`. Does NOT commit.
+    fn write_document_or_ignore(conn: &Connection, row: &DocumentRow) -> KernelDbResult<()> {
+        conn.execute(
             "INSERT OR IGNORE INTO documents (
                 document_id, workspace_id, doc_kind,
                 language, path, created_at, created_by
@@ -1274,16 +1281,79 @@ impl KernelDb {
         self.insert_context(row)
     }
 
+    /// Atomically create a forked context: the document row, the context row,
+    /// and the shell + env + capability-binding config copied from `source`,
+    /// all in ONE transaction.
+    ///
+    /// This folds `insert_context_with_document` + `fork_context_config` into a
+    /// single all-or-nothing write. Calling them separately left a gap: the
+    /// context insert committed first, so a failure copying the config stranded
+    /// a committed-but-misconfigured context (under deny-by-default, one with no
+    /// loadout — locked out). Here a failure on any write rolls the whole fork
+    /// back, leaving no context row behind.
+    ///
+    /// The source config is read up front (SELECTs) so the transaction holds
+    /// only the writes, matching `fork_context_config`.
+    pub fn insert_forked_context(
+        &mut self,
+        row: &ContextRow,
+        default_workspace_id: WorkspaceId,
+        source: ContextId,
+    ) -> KernelDbResult<()> {
+        let shell = self.get_context_shell(source)?;
+        let env = self.get_context_env(source)?;
+        let binding = self.get_context_binding(source)?;
+
+        let ws_id = row.workspace_id.unwrap_or(default_workspace_id);
+        let doc = DocumentRow {
+            document_id: row.context_id,
+            workspace_id: ws_id,
+            doc_kind: DocKind::Conversation,
+            language: None,
+            path: None,
+            created_at: row.created_at,
+            created_by: row.created_by,
+        };
+
+        let tx = self.conn.transaction()?;
+        Self::write_document_or_ignore(&tx, &doc)?;
+        Self::write_context(&tx, row)?;
+        if let Some(src) = shell {
+            Self::write_context_shell(
+                &tx,
+                &ContextShellRow {
+                    context_id: row.context_id,
+                    cwd: src.cwd,
+                    updated_at: now_millis(),
+                },
+            )?;
+        }
+        for var in &env {
+            Self::write_context_env(&tx, row.context_id, &var.key, &var.value)?;
+        }
+        if let Some(binding) = binding {
+            Self::write_binding(&tx, row.context_id, &binding)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Insert a new context.
     ///
     /// The corresponding document row must already exist (FK enforced).
     pub fn insert_context(&self, row: &ContextRow) -> KernelDbResult<()> {
+        Self::write_context(&self.conn, row)
+    }
+
+    /// Insert a context row against `conn` (a `&Connection` or a
+    /// `&Transaction` via deref). Shared by `insert_context` and the
+    /// transactional `insert_forked_context`. Does NOT commit.
+    fn write_context(conn: &Connection, row: &ContextRow) -> KernelDbResult<()> {
         if let Some(ref label) = row.label {
             validate_label(label)?;
         }
 
-        self.conn
-            .execute(
+        conn.execute(
                 "INSERT INTO contexts (
                 context_id, label, provider, model,
                 system_prompt, consent_mode, context_state, context_type,
@@ -5109,6 +5179,91 @@ mod tests {
         assert!(
             db.get_context_env(tgt.context_id).unwrap().is_empty(),
             "no env rows on a rolled-back fork",
+        );
+    }
+
+    /// The composite fork — document row + context row + shell/env/binding copy
+    /// — lands in one shot. Insert a source with full config, fork it into a
+    /// brand-new target via `insert_forked_context`, and prove every piece
+    /// arrived: both rows exist and all three config kinds copied.
+    #[test]
+    fn insert_forked_context_creates_rows_and_copies_config() {
+        let mut db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let src = make_context_row(Some("ifc-src"));
+        insert_context_with_doc(&db, &src, ws_id);
+
+        db.upsert_context_shell(&ContextShellRow {
+            context_id: src.context_id,
+            cwd: Some("/work/kaijutsu".into()),
+            updated_at: now_millis() as i64,
+        })
+        .unwrap();
+        db.set_context_env(src.context_id, "RUST_LOG", "debug").unwrap();
+        db.upsert_context_binding(
+            src.context_id,
+            &binding_with(&["builtin.file"], &[("read", "builtin.file", "file_read")]),
+        )
+        .unwrap();
+
+        // The target is a fresh context that does not yet exist in any table.
+        let tgt = make_context_row(Some("ifc-tgt"));
+        db.insert_forked_context(&tgt, ws_id, src.context_id).unwrap();
+
+        // Both the document row and the context row were created.
+        assert!(db.get_document(tgt.context_id).unwrap().is_some());
+        assert!(db.get_context(tgt.context_id).unwrap().is_some());
+
+        // Shell + env + binding all followed the fork.
+        assert_eq!(
+            db.get_context_shell(tgt.context_id).unwrap().unwrap().cwd,
+            Some("/work/kaijutsu".into()),
+        );
+        assert_eq!(db.get_context_env(tgt.context_id).unwrap().len(), 1);
+        assert!(db.get_context_binding(tgt.context_id).unwrap().is_some());
+    }
+
+    /// The whole fork is all-or-nothing: if a *later* write (the config copy)
+    /// fails, the context + document rows inserted *earlier* in the same
+    /// transaction must roll back too. Otherwise a fork could strand a
+    /// committed-but-misconfigured context — the exact gap this method closes.
+    /// Booby-trap the target's env INSERT, then prove neither row survived.
+    /// Against the old `insert_context_with_document` + `fork_context_config`
+    /// pair (two separate autocommits), the context row would persist.
+    #[test]
+    fn insert_forked_context_rolls_back_rows_on_config_failure() {
+        let mut db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let src = make_context_row(Some("ifc-atomic-src"));
+        insert_context_with_doc(&db, &src, ws_id);
+        // Source has an env var, so the fork will attempt a target env write.
+        db.set_context_env(src.context_id, "RUST_LOG", "debug").unwrap();
+
+        // Abort any INSERT into context_env. The source's var is already in
+        // place (inserted above); only the fork's target write trips this,
+        // after the context + document rows have run in the transaction.
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER boom BEFORE INSERT ON context_env
+                 BEGIN SELECT RAISE(ABORT, 'forced'); END;",
+            )
+            .unwrap();
+
+        let tgt = make_context_row(Some("ifc-atomic-tgt"));
+        let result = db.insert_forked_context(&tgt, ws_id, src.context_id);
+        assert!(result.is_err(), "the aborted env write must surface as an error");
+
+        db.conn.execute_batch("DROP TRIGGER boom;").unwrap();
+
+        // The context + document inserts succeeded earlier in the tx, yet must
+        // be gone: the transaction rolled back on drop. No half-built fork.
+        assert!(
+            db.get_context(tgt.context_id).unwrap().is_none(),
+            "context row must roll back when the config copy fails",
+        );
+        assert!(
+            db.get_document(tgt.context_id).unwrap().is_none(),
+            "document row must roll back when the config copy fails",
         );
     }
 

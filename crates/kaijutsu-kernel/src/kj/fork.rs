@@ -167,13 +167,10 @@ impl KjDispatcher {
                     Ok(id) => id,
                     Err(e) => return KjResult::Err(format!("kj fork: {e}")),
                 };
-            if let Err(e) = db.insert_context_with_document(&row, default_ws) {
+            // Context row + shell/env/binding copy land in one transaction, so
+            // a failure can't strand a committed-but-misconfigured context.
+            if let Err(e) = db.insert_forked_context(&row, default_ws, source_id) {
                 return KjResult::Err(format!("kj fork: {e}"));
-            }
-
-            // Copy shell config + env vars from source
-            if let Err(e) = db.fork_context_config(source_id, new_id) {
-                return KjResult::Err(format!("kj fork: failed to copy context config: {e}"));
             }
 
             // Apply --pwd override
@@ -366,14 +363,10 @@ impl KjDispatcher {
                     Ok(id) => id,
                     Err(e) => return KjResult::Err(format!("kj fork --shallow: {e}")),
                 };
-            if let Err(e) = db.insert_context_with_document(&row, default_ws) {
+            // Context row + shell/env/binding copy land in one transaction, so
+            // a failure can't strand a committed-but-misconfigured context.
+            if let Err(e) = db.insert_forked_context(&row, default_ws, source_id) {
                 return KjResult::Err(format!("kj fork --shallow: {e}"));
-            }
-
-            if let Err(e) = db.fork_context_config(source_id, new_id) {
-                return KjResult::Err(format!(
-                    "kj fork --shallow: failed to copy context config: {e}"
-                ));
             }
 
             if let Some(ref pwd) = pwd_override {
@@ -605,14 +598,10 @@ impl KjDispatcher {
                     Ok(id) => id,
                     Err(e) => return KjResult::Err(format!("kj fork --compact: {e}")),
                 };
-            if let Err(e) = db.insert_context_with_document(&row, default_ws) {
+            // Context row + shell/env/binding copy land in one transaction, so
+            // a failure can't strand a committed-but-misconfigured context.
+            if let Err(e) = db.insert_forked_context(&row, default_ws, source_id) {
                 return KjResult::Err(format!("kj fork --compact: {e}"));
-            }
-
-            if let Err(e) = db.fork_context_config(source_id, new_id) {
-                return KjResult::Err(format!(
-                    "kj fork --compact: failed to copy context config: {e}"
-                ));
             }
 
             if let Some(ref pwd) = pwd_override {
@@ -840,15 +829,11 @@ impl KjDispatcher {
                         Ok(id) => id,
                         Err(e) => return KjResult::Err(format!("kj fork --as: {e}")),
                     };
-                if let Err(e) = db.insert_context_with_document(&new_row, default_ws) {
+                // Context row + shell/env/binding copy (from the template
+                // context) land in one transaction, so a failure can't strand a
+                // committed-but-misconfigured context.
+                if let Err(e) = db.insert_forked_context(&new_row, default_ws, row.context_id) {
                     return KjResult::Err(format!("kj fork --as: failed to create context: {e}"));
-                }
-
-                // Copy shell config + env vars from template context
-                if let Err(e) = db.fork_context_config(row.context_id, new_id) {
-                    return KjResult::Err(format!(
-                        "kj fork --as: failed to copy context config: {e}"
-                    ));
                 }
 
                 // Create empty document for each new context
