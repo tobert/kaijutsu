@@ -384,6 +384,7 @@ struct ContextHandleInfo {
   keywords @9 :List(Text);        # Synthesis keywords (empty if not yet synthesized)
   topBlockPreview @10 :Text;      # Preview of most representative block (empty if none)
   contextState @11 :Text;         # "live"/"staging"/"archived" (default "live")
+  contextType @12 :Text;          # rc bucket / mode bundle (default "default")
 }
 
 struct PresetInfo {

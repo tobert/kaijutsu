@@ -2367,6 +2367,7 @@ impl kernel::Server for KernelImpl {
                     if let Some(row) = db_map.get(&ctx.id) {
                         c.set_fork_kind(row.fork_kind.as_ref().map(|fk| fk.as_str()).unwrap_or(""));
                         c.set_archived_at(row.archived_at.map(|ts| ts as u64).unwrap_or(0));
+                        c.set_context_type(&row.context_type);
                     }
 
                     // Supplement with synthesis data (keywords + preview)

@@ -206,6 +206,9 @@ pub struct ContextInfo {
     pub trace_id: [u8; 16],
     /// How this context was forked (e.g. "full", "shallow", "compact", "subtree").
     pub fork_kind: Option<String>,
+    /// rc bucket / mode bundle that drives lifecycle-script dispatch (e.g.
+    /// "default", "coder"). Empty on the wire is normalized to "default".
+    pub context_type: String,
     /// Whether this context has been archived.
     pub archived: bool,
     /// Synthesis keywords (empty if not yet synthesized).
@@ -1836,6 +1839,13 @@ fn parse_context_info(
     };
     let archived = reader.get_archived_at() > 0;
 
+    let context_type_str = reader.get_context_type()?.to_str().unwrap_or("");
+    let context_type = if context_type_str.is_empty() {
+        "default".to_string()
+    } else {
+        context_type_str.to_string()
+    };
+
     // Parse synthesis keywords
     let keywords = if reader.has_keywords() {
         reader
@@ -1867,6 +1877,7 @@ fn parse_context_info(
         created_at: reader.get_created_at(),
         trace_id,
         fork_kind,
+        context_type,
         archived,
         keywords,
         top_block_preview,
