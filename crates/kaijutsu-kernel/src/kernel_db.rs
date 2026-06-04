@@ -2216,9 +2216,12 @@ impl KernelDb {
     // Context Shell Configuration
     // ========================================================================
 
-    /// Upsert per-context shell configuration (cwd).
-    pub fn upsert_context_shell(&self, row: &ContextShellRow) -> KernelDbResult<()> {
-        self.conn.execute(
+    /// Write per-context shell config against `conn` — a bare `Connection`
+    /// or an open `Transaction` (which derefs to one). Shared by
+    /// `upsert_context_shell` and the transactional `fork_context_config` so
+    /// the SQL has a single home.
+    fn write_context_shell(conn: &Connection, row: &ContextShellRow) -> KernelDbResult<()> {
+        conn.execute(
             "INSERT INTO context_shell (context_id, cwd, updated_at)
              VALUES (?1, ?2, ?3)
              ON CONFLICT(context_id) DO UPDATE SET
@@ -2231,6 +2234,11 @@ impl KernelDb {
             ],
         )?;
         Ok(())
+    }
+
+    /// Upsert per-context shell configuration (cwd).
+    pub fn upsert_context_shell(&self, row: &ContextShellRow) -> KernelDbResult<()> {
+        Self::write_context_shell(&self.conn, row)
     }
 
     /// Get per-context shell configuration. Returns None if not set.
@@ -2287,7 +2295,22 @@ impl KernelDb {
         binding: &ContextToolBinding,
     ) -> KernelDbResult<()> {
         let tx = self.conn.transaction()?;
-        tx.execute(
+        Self::write_binding(&tx, context_id, binding)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Wholesale-replace a context's binding (parent flags + every child row)
+    /// against `conn`. The caller owns the transaction: `upsert_context_binding`
+    /// wraps a fresh one, `fork_context_config` reuses its multi-write tx so
+    /// the binding lands atomically alongside the shell + env copy. Does NOT
+    /// commit — that is the caller's job.
+    fn write_binding(
+        conn: &Connection,
+        context_id: ContextId,
+        binding: &ContextToolBinding,
+    ) -> KernelDbResult<()> {
+        conn.execute(
             "INSERT INTO context_bindings
                  (context_id, all_instances, all_facades, binding_admin, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5)
@@ -2304,24 +2327,24 @@ impl KernelDb {
                 now_millis(),
             ],
         )?;
-        tx.execute(
+        conn.execute(
             "DELETE FROM context_binding_instances WHERE context_id = ?1",
             params![blob_param(context_id.as_bytes())],
         )?;
-        tx.execute(
+        conn.execute(
             "DELETE FROM context_binding_names WHERE context_id = ?1",
             params![blob_param(context_id.as_bytes())],
         )?;
-        tx.execute(
+        conn.execute(
             "DELETE FROM context_binding_tools WHERE context_id = ?1",
             params![blob_param(context_id.as_bytes())],
         )?;
-        tx.execute(
+        conn.execute(
             "DELETE FROM context_binding_facades WHERE context_id = ?1",
             params![blob_param(context_id.as_bytes())],
         )?;
         for (idx, instance) in binding.allowed_instances.iter().enumerate() {
-            tx.execute(
+            conn.execute(
                 "INSERT INTO context_binding_instances (context_id, instance_id, order_idx)
                  VALUES (?1, ?2, ?3)",
                 params![
@@ -2332,7 +2355,7 @@ impl KernelDb {
             )?;
         }
         for (idx, (instance, tool)) in binding.allowed_tools.iter().enumerate() {
-            tx.execute(
+            conn.execute(
                 "INSERT INTO context_binding_tools
                      (context_id, instance_id, original_tool, order_idx)
                  VALUES (?1, ?2, ?3, ?4)",
@@ -2345,14 +2368,14 @@ impl KernelDb {
             )?;
         }
         for (idx, facade) in binding.allowed_facades.iter().enumerate() {
-            tx.execute(
+            conn.execute(
                 "INSERT INTO context_binding_facades (context_id, facade_id, order_idx)
                  VALUES (?1, ?2, ?3)",
                 params![blob_param(context_id.as_bytes()), facade, idx as i64],
             )?;
         }
         for (visible_name, (instance, tool)) in &binding.name_map {
-            tx.execute(
+            conn.execute(
                 "INSERT INTO context_binding_names
                      (context_id, visible_name, instance_id, original_tool)
                  VALUES (?1, ?2, ?3, ?4)",
@@ -2364,7 +2387,6 @@ impl KernelDb {
                 ],
             )?;
         }
-        tx.commit()?;
         Ok(())
     }
 
@@ -2726,6 +2748,23 @@ impl KernelDb {
     // Context Environment Variables
     // ========================================================================
 
+    /// Write one env var against `conn` (a `Connection` or an open
+    /// `Transaction`). Shared by `set_context_env` and `fork_context_config`.
+    fn write_context_env(
+        conn: &Connection,
+        context_id: ContextId,
+        key: &str,
+        value: &str,
+    ) -> KernelDbResult<()> {
+        conn.execute(
+            "INSERT INTO context_env (context_id, key, value)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(context_id, key) DO UPDATE SET value = excluded.value",
+            params![blob_param(context_id.as_bytes()), key, value],
+        )?;
+        Ok(())
+    }
+
     /// Set a single environment variable for a context (upsert).
     pub fn set_context_env(
         &self,
@@ -2733,13 +2772,7 @@ impl KernelDb {
         key: &str,
         value: &str,
     ) -> KernelDbResult<()> {
-        self.conn.execute(
-            "INSERT INTO context_env (context_id, key, value)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(context_id, key) DO UPDATE SET value = excluded.value",
-            params![blob_param(context_id.as_bytes()), key, value],
-        )?;
-        Ok(())
+        Self::write_context_env(&self.conn, context_id, key, value)
     }
 
     /// Get all environment variables for a context.
@@ -2883,10 +2916,36 @@ impl KernelDb {
     /// to target. Called during all fork operations. The binding copy makes
     /// permissions follow the fork — under deny-by-default a fork would
     /// otherwise start with no loadout and be locked out.
+    ///
+    /// Atomic: the three copies land in ONE transaction. A fork that fails
+    /// partway must leave NO partial config behind — a half-copied loadout
+    /// would lock the fork out (or grant a stale subset), and the caller has
+    /// already committed the context row, so a silent partial here would
+    /// strand a misconfigured context. The source is read up front so the
+    /// transaction holds only the writes.
     pub fn fork_context_config(&mut self, source: ContextId, target: ContextId) -> KernelDbResult<()> {
-        self.copy_context_shell(source, target)?;
-        self.copy_context_env(source, target)?;
-        self.copy_context_binding(source, target)?;
+        let shell = self.get_context_shell(source)?;
+        let env = self.get_context_env(source)?;
+        let binding = self.get_context_binding(source)?;
+
+        let tx = self.conn.transaction()?;
+        if let Some(src) = shell {
+            Self::write_context_shell(
+                &tx,
+                &ContextShellRow {
+                    context_id: target,
+                    cwd: src.cwd,
+                    updated_at: now_millis(),
+                },
+            )?;
+        }
+        for var in &env {
+            Self::write_context_env(&tx, target, &var.key, &var.value)?;
+        }
+        if let Some(binding) = binding {
+            Self::write_binding(&tx, target, &binding)?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -4997,6 +5056,60 @@ mod tests {
 
         assert!(db.get_context_shell(tgt.context_id).unwrap().is_none());
         assert!(db.get_context_env(tgt.context_id).unwrap().is_empty());
+    }
+
+    /// A fork that fails partway must leave NO partial config behind — a
+    /// half-copied loadout strands a misconfigured (locked-out) context. The
+    /// three copies share one transaction, so a failure on a later write must
+    /// roll back the earlier ones. Force the env write (step 2) to abort after
+    /// the shell write (step 1) has already executed, then prove the shell row
+    /// never lands. Against the old per-write autocommit, the shell row would
+    /// survive and this fails.
+    #[test]
+    fn fork_context_config_rolls_back_on_partial_failure() {
+        let mut db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let src = make_context_row(Some("atomic-src"));
+        let tgt = make_context_row(Some("atomic-tgt"));
+        insert_context_with_doc(&db, &src, ws_id);
+        insert_context_with_doc(&db, &tgt, ws_id);
+
+        // Source has shell config (copied first) AND an env var (copied second).
+        db.upsert_context_shell(&ContextShellRow {
+            context_id: src.context_id,
+            cwd: Some("/work".into()),
+            updated_at: now_millis() as i64,
+        })
+        .unwrap();
+        db.set_context_env(src.context_id, "RUST_LOG", "debug")
+            .unwrap();
+
+        // Booby-trap the env INSERT: a BEFORE INSERT trigger that aborts the
+        // statement. Source reads are SELECTs and unaffected — only the
+        // target's env write trips it, after the shell write has run in the tx.
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER boom BEFORE INSERT ON context_env
+                 BEGIN SELECT RAISE(ABORT, 'forced'); END;",
+            )
+            .unwrap();
+
+        let result = db.fork_context_config(src.context_id, tgt.context_id);
+        assert!(result.is_err(), "the aborted env write must surface as an error");
+
+        // Remove the trap; SELECTs below don't fire it, but keep the db clean.
+        db.conn.execute_batch("DROP TRIGGER boom;").unwrap();
+
+        // The shell write succeeded *before* the abort, yet must be gone: the
+        // transaction rolled back on drop. No partial fork survived.
+        assert!(
+            db.get_context_shell(tgt.context_id).unwrap().is_none(),
+            "shell copy must roll back when a later fork write fails",
+        );
+        assert!(
+            db.get_context_env(tgt.context_id).unwrap().is_empty(),
+            "no env rows on a rolled-back fork",
+        );
     }
 
     // ── 27. Context workspace paths query ─────────────────────────────
