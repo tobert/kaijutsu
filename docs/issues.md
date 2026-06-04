@@ -24,7 +24,6 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 ## Persistence & Sync
 
 - **`KernelDb` connection pool:** Currently `Arc<parking_lot::Mutex<KernelDb>>` in `block_store.rs:69`. This bottleneck prevents utilizing SQLite's WAL mode for concurrent readers. Migrate to `r2d2` or `sqlx` to allow non-blocking reads during LLM streams and heavy writes.
-- **Fork is not fully atomic:** `fork_context_config` now copies shell+env+binding in one transaction (`kernel_db.rs`), but each fork call site (`kj/fork.rs:175,373,612,848`) still runs `insert_context_with_document` (itself two unwrapped writes: document + context row) as a *separate* statement before it. A failure between the context insert and the config copy strands a committed-but-misconfigured context. Fold the insert + config copy into one transaction (e.g. an `insert_forked_context` doing both) so a fork is all-or-nothing.
 - **Config CRDT ops:** Config backend needs DTE integration so changes replicate across peers.
 - **CRDT `order_index` BTreeMap:** `blocks_ordered()` is O(N log N). Works correctly but scales poorly; add a secondary sorted index when scale demands.
 - **Latch state should persist with the context:** 
@@ -53,7 +52,7 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ## Tool System Follow-ups (post-Phase 5)
 
-- **rc system follow-ups:** Wire surface for `context_type`. CRDT-VFS bridge for collaborative script editing.
+- **rc system follow-ups:** CRDT-VFS bridge for collaborative script editing — rc scripts live in the `rc_scripts` SQLite table (`kj rc add/edit/rm` write rows); back them with the CRDT `FileDocumentCache` (`file_tools/cache.rs`) so peers can co-edit lifecycle scripts. Design sketch: `docs/rc-crdt-vfs-bridge.md`.
 - **`StreamingBlockHandle` implementation:** Single-block streaming primitive.
 - **LLM streaming rewrite:** Move `process_llm_stream` onto `StreamingBlockHandle`.
 - **Block content abstraction:** Blocks as containers for multiple content artifacts.
