@@ -649,6 +649,15 @@ fn format_block_inner(block: &BlockSnapshot, local_ctx: Option<ContextId>) -> St
                 }
             };
 
+            // stderr is now stored separately from content (stdout). Surface it
+            // after the body so failures/warnings stay visible in the UI — it
+            // used to be merged into content at the source.
+            let body = match (body, block.stderr.as_deref().map(str::trim)) {
+                (Some(b), Some(err)) if !err.is_empty() => Some(format!("{b}\n{err}")),
+                (None, Some(err)) if !err.is_empty() => Some(err.to_string()),
+                (b, _) => b,
+            };
+
             if block.is_error {
                 match body {
                     None => "\u{2717}".to_string(),

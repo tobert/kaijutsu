@@ -989,10 +989,19 @@ impl KaijutsuMcp {
                                 );
                                 resync_store(&actor_bg, &store_bg, &sync_bg, ctx_id_bg).await;
                             }
-                            // Other statuses don't require a catch-up. A closed
-                            // status stream just means no more transitions; keep
-                            // serving events.
-                            Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                            // A lagged status stream may have DROPPED a Connected
+                            // transition — we can't tell, so resync to be safe
+                            // rather than silently miss a reconnect's catch-up.
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                tracing::warn!(
+                                    context_id = %ctx_id_bg,
+                                    "Status stream lagged ({n}) — resyncing in case a reconnect was missed",
+                                );
+                                resync_store(&actor_bg, &store_bg, &sync_bg, ctx_id_bg).await;
+                            }
+                            // Other statuses need no catch-up; a closed status
+                            // stream just means no more transitions.
+                            Ok(_) => {}
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
                         },
                     }
