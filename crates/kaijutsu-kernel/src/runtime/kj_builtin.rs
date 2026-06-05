@@ -593,13 +593,32 @@ impl Tool for KjBuiltin {
 ///
 /// e.g., `["context", "archive", "old-ctx"]` → `"kj context archive"`
 fn build_command_scope(argv: &[String]) -> String {
-    let parts: Vec<&str> = argv
+    let mut parts: Vec<&str> = argv
         .iter()
         .map(|s| s.as_str())
         .take_while(|s| !s.starts_with('-'))
         .take(2) // At most: subcommand + verb
         .collect();
+    // Canonicalize the verb alias so a nonce issued for the canonical scope
+    // (e.g. "kj context remove" — the form printed in the "To confirm, run:"
+    // message) verifies whether the user confirmed with the canonical verb or
+    // its alias ("kj context rm … --confirm"). Latched destructive commands
+    // are the only ones that reach here; today only `rm` aliases a latched
+    // verb (context/preset/workspace remove), but mapping is centralized so a
+    // future alias (`del`, etc.) is a one-line add.
+    if let Some(verb) = parts.get_mut(1) {
+        *verb = canonical_latched_verb(verb);
+    }
     format!("kj {}", parts.join(" "))
+}
+
+/// Map a verb alias to the canonical form used by latched-command nonce
+/// scopes. Identity for anything that isn't a known destructive alias.
+fn canonical_latched_verb(verb: &str) -> &str {
+    match verb {
+        "rm" => "remove",
+        other => other,
+    }
 }
 
 /// Extract the target (context label/ref) from argv for nonce validation.
@@ -729,6 +748,25 @@ mod tests {
             );
         }
         let _ = beta; // touched above; keep the binding live
+    }
+
+    /// A latch nonce issued for the canonical scope (`kj context remove`,
+    /// the form printed in the confirm prompt) must verify whether the user
+    /// confirms via the canonical verb or the `rm` alias. Regression: the
+    /// confirm path echoed the raw alias (`kj context rm`) and rejected the
+    /// nonce with "scope mismatch".
+    #[test]
+    fn latch_scope_canonicalizes_rm_alias() {
+        let s = |v: &str| v.to_string();
+        let canonical = build_command_scope(&[s("context"), s("remove"), s("victim")]);
+        let aliased = build_command_scope(&[s("context"), s("rm"), s("victim")]);
+        assert_eq!(canonical, "kj context remove");
+        assert_eq!(aliased, canonical, "rm alias must map to the canonical scope");
+        // Non-aliased verbs are untouched.
+        assert_eq!(
+            build_command_scope(&[s("context"), s("archive"), s("x")]),
+            "kj context archive"
+        );
     }
 
     /// A space-separated valued flag (`--type default`) must reach kj
