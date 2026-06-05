@@ -1,170 +1,116 @@
-# RC Scripts on the CRDT-VFS — Design Sketch
+# RC Scripts on the CRDT-VFS
 
-Status: **design only, not implemented.** Tracks the "CRDT-VFS bridge for
-collaborative script editing" follow-up in `docs/issues.md`.
+Status: **decided; landing in increments.** Increment 1 (seed bodies →
+repo asset files) is shipped. The files-as-truth migration is in progress.
+Supersedes the earlier A/B/C options analysis — the chosen architecture is
+recorded below.
 
 ## Goal
 
-Let multiple peers co-edit rc lifecycle scripts (`/etc/rc/<context_type>/<verb>/SXX-name.{kai,md}`)
-the same way they co-edit any other file — live, conflict-free, via the CRDT —
-instead of each `kj rc edit` being a lone last-writer-wins `UPDATE` against a
-SQLite row.
+Back rc lifecycle scripts (`/etc/rc/<context_type>/<verb>/SXX-name.{kai,md}`)
+with **real files** instead of a SQLite `rc_scripts` table, so they can be:
 
-Non-goal: changing *what* rc scripts do or *when* they fire. This is purely a
-storage/edit-surface change underneath the existing dispatch.
+- edited with `vim` on the host (and, later, co-edited live in-app via the CRDT),
+- read/inspected as ordinary files through the same path we'd edit any code,
+- reviewed in the repo as the default `/etc/rc` image.
 
-## Current state (code is truth)
+Non-goal: changing *what* rc scripts do or *when* they fire. Purely a
+storage / edit-surface change underneath the existing dispatch.
 
-**Storage — plain SQLite.** `rc_scripts` table (`kernel_db.rs:546`), PK
-`(context_type, verb, sort_key, name)`, `UNIQUE(path)`. Every edit path is a
-direct row op:
+## Decisions (locked)
 
-- `kj rc add`  → `insert_rc_script` (`kernel_db.rs:1997`)
-- `kj rc edit` → `update_rc_script` (`kernel_db.rs:2085`) — last write wins, no merge
-- `kj rc rm`   → `delete_rc_script` (`kernel_db.rs:2073`)
-- `kj rc show` → `get_rc_script` (`kernel_db.rs:2023`)
-- `kj rc reseed` → re-applies `seed_scripts.rs` defaults
+1. **Files are the single source of truth.** No `rc_scripts` table. Dispatch
+   reads the files directly (via `FileDocumentCache`, mtime-cached). There is
+   exactly one durable representation of script content — the file — so the
+   row-vs-CRDT divergence the old options worried about cannot occur. The CRDT
+   is the edit/merge layer every file already has; the (future) in-app editor
+   and host-side `vim` both land in the same place.
 
-**Dispatch — reads rows.** `run_rc_lifecycle` (`lifecycle.rs:76`) calls
-`db.list_rc_scripts(ctx_type, verb)` (`kernel_db.rs:2042`), ordered by
-`(sort_key, name)`, then runs each: `.md` → block into the system-prompt slot,
-`.kai` → `kaish` execution with `KJ_*` overlay vars.
+2. **Storage layout.**
+   - **Repo seed source:** `assets/defaults/rc/**`, a 1:1 mirror of `/etc/rc`,
+     embedded at build time (`include_str!`). This is the "floor."
+   - **Deployed tree:** `~/.config/kaijutsu/rc/**` (XDG config, beside
+     `models.toml` et al.), mounted into the VFS at `/etc/rc` as a
+     **read-write** `LocalBackend`. Longest-prefix wins over the read-only `/`
+     mount, so the **host's real `/etc` is never touched**.
+   - On boot, embedded seeds are written to the deployed tree **if absent**
+     (the `config_backend` floor pattern: write-default-if-missing). A deleted
+     file reappears next boot; a user edit persists; `kj rc reseed` overwrites.
 
-**Seeding — floor, not state.** `ensure_seeded_rc_scripts` (`seed_scripts.rs`,
-called from `KernelDb::open`) does `INSERT OR IGNORE` per canonical path on every
-DB open. Built-in defaults (e.g. `S00-stance.md` for `coder`) are a *floor*: a
-user `rm` reappears on next open; `kj rc edit` overrides in place; `kj rc reseed`
-force-overwrites.
+3. **Write gate (deny-by-default).** `/etc/rc` is a real rw VFS path, but the
+   kernel's `builtin.file:write` / `file:edit` tools are **refused** under
+   `/etc/**` unless the calling context's loadout explicitly grants an
+   `rc-write` capability. rc scripts run *privileged on every fork*, so an
+   open writable `/etc/rc` would hand privileged persistence to any context
+   holding `file:write` (e.g. `coder`) — a prompt-injection escalation. Host
+   `vim` is unaffected (it bypasses the kernel guard entirely), so the
+   "edit the real file" goal holds regardless of the in-kernel gate.
 
-**The CRDT side already exists.** `FileDocumentCache` (`file_tools/cache.rs`)
-maps any VFS path → a CRDT document: deterministic `ContextId` via
-`uuid_v5(NAMESPACE_URL, "kaijutsu:file:{path}")`, one `BlockKind::Text` block per
-file, full oplog + snapshot persistence (survives restart), mtime-staleness
-reload, write-through `flush_dirty`/`flush_one`. It is owned by `Kernel`
-(`file_cache: OnceLock<Arc<FileDocumentCache>>`) and reachable from rc/lifecycle
-code via `KjDispatcher::kernel()` — just not wired there yet.
+4. **No per-script metadata columns.** The path encodes
+   `context_type / verb / sort_key / name / ext`. `created_by` is dropped —
+   provenance comes from the CRDT block's `principal_id`. `created_at` is
+   dropped. **Per-script `--timeout` is removed**; all `.kai` run under the
+   kernel default (`kaish.timeouts().rc_script_timeout`). A `kj` knob can
+   re-add a per-script override later (frontmatter or sidecar).
 
-So the infrastructure is present and proven (the file tools use it). The work is
-**wiring + a consistency decision + migration**, not new machinery.
+## Why this over the old "row is truth, CRDT projects" sketch
 
-## The core tension: who is authority?
+Keeping the row authoritative meant you could never `vim` the canonical copy
+— it lived in a SQLite blob. Making the **file** canonical delivers the
+stated goal directly and reuses an already-proven pattern (`config_backend`:
+embed default → snap to `~/.config` → file-watch → CRDT). The only cost is
+dispatch reading files on the fork hot path instead of an indexed row; the
+files are tiny, OS-cached, and behind `FileDocumentCache`'s mtime cache.
 
-Two durable representations want to hold the same bytes:
+## Existing infrastructure this reuses (code is truth)
 
-1. The `rc_scripts` **row** — queried by dispatch, keyed by the canonical tuple,
-   carries `timeout_secs`, `created_by`, ordering.
-2. The CRDT **document** — the collaborative edit surface, but a bag of text
-   with no rc-specific columns.
+- **`FileDocumentCache`** (`file_tools/cache.rs`): VFS path → CRDT doc
+  (`uuid_v5` of path) → write-through `flush_one` → `MountTable.write_all` →
+  `LocalBackend` → host disk. mtime-stale reload picks up external `vim`
+  edits; dirty-edits-win never clobbers in-flight work. Owned by `Kernel`
+  (`file_cache`), reachable from rc/lifecycle via `kernel().file_cache(blocks)`.
+- **VFS mounts** (`rpc.rs`): `/` = `LocalBackend::read_only("/")`, `~/src` rw,
+  `/tmp` rw, then `freeze_mounts()`. The `/etc/rc` rw mount is added before
+  the freeze.
+- **Capability allow-set** (`mcp/binding.rs`): one `allows(&Capability)`
+  predicate; `Admin` is the template for a new unit `RcWrite` capability,
+  grantable via the binding string `"rc-write"`.
 
-Dispatch must stay cheap and synchronous-ish (`list_rc_scripts` is on the hot
-fork path). Editing must become CRDT-mergeable. The design is mostly about how
-these two stay coherent without a silent-fallback divergence (a poisoned rc
-script is a footgun — it runs on every fork).
+## Increment plan
 
-## Options
+- **1 — Asset extraction (shipped).** Seed bodies moved from inline Rust
+  consts into `assets/defaults/rc/**`, embedded via `include_str!`. Behavior
+  unchanged (still seeds the table); the files are now vim-able. Commit
+  `refactor(rc): extract seed bodies to assets/defaults/rc files`.
 
-### Option A — CRDT is the edit surface, row is a projection (recommended)
+- **2 — Files-as-truth (the migration, atomic switch).**
+  - Mount `~/.config/kaijutsu/rc` → `/etc/rc` rw before freeze; seed-to-disk
+    floor on boot; `kj rc reseed` rewrites files.
+  - `run_rc_lifecycle`: `readdir /etc/rc/<type>/<verb>/`, sort by filename,
+    read each via `FileDocumentCache`. `.md` → block; `.kai` → kaish with the
+    kernel-default timeout.
+  - `kj rc add/edit/rm/show/list` operate through the cache, not rows.
+  - Remove `rc_scripts` table, `RcScriptRow`, and CRUD. One-time migration:
+    any existing rows → files on first boot (no data loss). Rewrite the
+    lifecycle/rc/seed tests against an `/etc/rc` mount in `test_dispatcher`.
+  - Write policy here is the **safe baseline**: tool-writes to `/etc/rc` are
+    denied for everyone; only admin `kj rc` (direct cache use) and host `vim`
+    can edit. This is a non-divergent, shippable state on its own.
 
-The `rc_scripts` row stays the dispatch source of truth and the metadata home
-(`timeout_secs`, ordering, `created_by`). The **content** column becomes a
-write-through projection of a CRDT document at a canonical VFS path,
-`/etc/rc/<type>/<verb>/SXX-name.<ext>`.
+- **3 — `rc-write` capability (opt-in widening, additive).** Add the unit
+  `Capability::RcWrite` + `"rc-write"` binding token; relax the `/etc/rc`
+  write gate to allow `file:write`/`edit` when a context's loadout grants it.
+  `coder` stays locked out; a trusted rc-editor / director role can opt in.
 
-- `kj rc add` → create the CRDT doc (`create_or_replace`) **and** insert the row
-  (content = current CRDT text) in one transaction-ish unit.
-- `kj rc edit` → edit the CRDT doc; a flush hook projects the new text into
-  `update_rc_script`. Concurrent peer edits merge in the CRDT; the row is
-  overwritten with the merged result, not a racing raw string.
-- `kj rc rm` → delete row + invalidate/evict the CRDT doc.
-- Dispatch → unchanged: still reads the row. It never blocks on the CRDT.
-- Reseed → writes both layers; CRDT doc replaced with the default body.
-
-**Why recommended:** dispatch stays a plain indexed row read (no async CRDT
-hydrate on the fork hot path); metadata keeps its typed columns; collaboration
-lands exactly where editing happens. The row is a *cache* of the CRDT content,
-refreshed on flush — and a cache that's always rewritten from the merged CRDT
-state, never the other way, so there's a single direction of truth for content.
-
-**Risks:** the row-content projection can lag a not-yet-flushed CRDT edit. Two
-mitigations: (a) flush-on-edit synchronously inside `kj rc edit` before
-returning; (b) dispatch could, behind a flag, read live CRDT content for any doc
-that's currently dirty. Start with (a); it keeps dispatch untouched.
-
-### Option B — CRDT is the only store; drop the content column
-
-Make the rc script content live *solely* in the CRDT doc. `rc_scripts` keeps
-only metadata (`path`, `timeout_secs`, ordering, `created_by`) — no `content`.
-Dispatch loads content via `FileDocumentCache::read_content(path)` per script.
-
-- Cleanest "single source of truth" for content.
-- But: puts an `async` CRDT read (hydrate-from-snapshot+oplog, possible disk) on
-  the fork hot path, N times per lifecycle. Fork latency is already load-bearing
-  (cache breakpoints, rc, parent block count). Measure before committing.
-- Migration must move every existing `content` into a CRDT doc with no window
-  where dispatch sees an empty script.
-- A CRDT read failure on the fork path is now a *fork* failure — needs an
-  explicit, observable error (no silent empty-script fallback; per the
-  crash-over-corruption stance an empty stance script is corruption).
-
-### Option C — status quo + advisory CRDT mirror (rejected)
-
-Keep rows authoritative; maintain a *best-effort* CRDT mirror for a future
-collaborative editor, with no guarantee they agree. Rejected: a mirror that can
-silently disagree with the executed script is exactly the silent-fallback /
-data-corruption footgun the project stance forbids. If the CRDT and the row can
-diverge, peers "collaborating" in the editor may not be editing what actually
-runs.
-
-## Recommendation
-
-**Option A.** It reuses the existing cache, keeps the fork hot path a row read,
-preserves the typed metadata, and gives collaboration the merge semantics at the
-edit surface. Revisit Option B only if a use case needs dispatch to honor
-unflushed live edits, and only after measuring the per-script async read cost on
-the fork path.
-
-## Sketch of the wiring (Option A)
-
-1. **Canonical path = VFS path.** rc canonical paths are already
-   `/etc/rc/...` — feed them straight to `FileDocumentCache`. The UUIDv5
-   derivation makes the doc id stable across peers and restarts for free.
-2. **`kj rc add`:** `cache.create_or_replace(path, body)` → read back merged
-   content → `insert_rc_script(row{ content })`. Fail the whole op if either
-   half fails (mirror the fork-atomicity transaction discipline:
-   `insert_forked_context` is the template for "both writes or neither").
-3. **`kj rc edit`:** apply the edit to the CRDT doc, `flush_one(path)`, then
-   `update_rc_script(path, content = merged)`. Synchronous flush before return.
-4. **`kj rc rm`:** `delete_rc_script` + `cache.invalidate(path)`.
-5. **`kj rc reseed`:** rewrite both layers from `seed_scripts.rs`.
-6. **Dispatch:** untouched.
-7. **Access:** rc.rs / lifecycle.rs reach the cache via
-   `self.kernel().file_cache(&self.blocks)`; thread it through `KjDispatcher`
-   like the other kernel services.
-
-## Migration
-
-- On first open after the feature lands, for every existing `rc_scripts` row
-  with no backing CRDT doc: create the doc from the row's `content`
-  (`create_or_replace`). Idempotent (deterministic id + `INSERT OR IGNORE`-style
-  guard). Reuses the seeding "floor on every open" pattern.
-- Seed defaults (`seed_scripts.rs`) get the same treatment: when a seed inserts a
-  row, ensure its CRDT doc exists.
-- No down-migration needed — the `content` column stays populated, so an older
-  binary reading the table still works (it just won't see live collaborative
-  edits).
-
-## Open questions
+## Open questions (carried forward)
 
 - **Edit-while-fork.** A peer editing `S00-stance.md` while another forks a
-  `coder` context: Option A runs the last-flushed content. Is that acceptable, or
-  do we need fork to see the live doc? (Leans acceptable; flag for Option B if
-  not.)
-- **`.kai` validation.** Should the CRDT edit surface pre-validate kaish syntax
-  (kaish already pre-validates) before the row projection accepts a body, so a
-  broken script can't reach dispatch? Probably yes — reject the projection, keep
-  the prior row.
-- **DTE / cross-peer replication.** rc docs are CRDT docs; do they replicate over
-  the same drift/DTE path as conversation docs, or a dedicated channel? Ties into
-  the "Config CRDT ops" issue.
-- **Eviction.** rc docs are tiny and hot at fork time; consider pinning them in
-  the cache (exempt from the 64-entry LRU) so a fork never pays a cold reload.
+  `coder` context: dispatch runs the last-flushed content. Leans acceptable.
+- **`.kai` validation.** Should the edit surface pre-validate kaish syntax
+  before a body becomes dispatch-visible? kaish already pre-validates at run;
+  a broken `.kai` lands an Error block, not a silent failure. Probably enough.
+- **DTE / cross-peer replication.** rc docs are CRDT docs; do they replicate
+  over the same drift/DTE path as conversation docs? Ties into the
+  "Config CRDT ops" issue.
+- **Eviction.** rc docs are tiny and hot at fork; consider pinning them
+  (exempt from the cache LRU) so a fork never pays a cold reload.
