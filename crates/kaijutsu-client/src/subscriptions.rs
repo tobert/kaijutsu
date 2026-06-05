@@ -52,6 +52,14 @@ pub enum ServerEvent {
         /// Structured output data piggybacked on status change (output is not DTE-tracked).
         output: Option<kaijutsu_types::OutputData>,
     },
+    /// A block's scalar metadata changed (exit_code, stderr, content_type, …).
+    /// Frontier-independent — applied directly to the store, so it survives a
+    /// reconnect even while text ops await a full resync.
+    BlockMetadataChanged {
+        context_id: ContextId,
+        block_id: BlockId,
+        metadata: kaijutsu_types::BlockMetadata,
+    },
     /// A block was deleted from a document.
     BlockDeleted {
         context_id: ContextId,
@@ -333,6 +341,48 @@ impl block_events::Server for BlockEventsForwarder {
         };
         if self.event_tx.send(event).is_err() {
             tracing::warn!("Event channel closed, dropping BlockExcludedChanged event");
+        }
+        Promise::ok(())
+    }
+
+    fn on_block_metadata_changed(
+        self: Rc<Self>,
+        params: block_events::OnBlockMetadataChangedParams,
+        _results: block_events::OnBlockMetadataChangedResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = match params.get() {
+            Ok(p) => p,
+            Err(e) => return Promise::err(e),
+        };
+
+        let context_id = match params.get_context_id() {
+            Ok(s) => match parse_context_id_data(s) {
+                Ok(id) => id,
+                Err(e) => return Promise::err(e),
+            },
+            Err(e) => return Promise::err(e),
+        };
+
+        let block_id = match params.get_block_id() {
+            Ok(b) => match parse_block_id(&b) {
+                Ok(id) => id,
+                Err(e) => return Promise::err(rpc_to_capnp(e)),
+            },
+            Err(e) => return Promise::err(e),
+        };
+
+        let metadata = match params.get_metadata() {
+            Ok(m) => crate::rpc::parse_block_metadata(m),
+            Err(e) => return Promise::err(e),
+        };
+
+        let event = ServerEvent::BlockMetadataChanged {
+            context_id,
+            block_id,
+            metadata,
+        };
+        if self.event_tx.send(event).is_err() {
+            tracing::warn!("Event channel closed, dropping BlockMetadataChanged event");
         }
         Promise::ok(())
     }

@@ -76,7 +76,9 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
-use kaijutsu_client::{ActorHandle, ServerEvent, SshConfig, SyncManager, connect_ssh, spawn_actor};
+use kaijutsu_client::{
+    ActorHandle, ConnectionStatus, ServerEvent, SshConfig, SyncManager, connect_ssh, spawn_actor,
+};
 use kaijutsu_crdt::{BlockId, ContextId, ConversationDAG, PrincipalId};
 use kaijutsu_kernel::block_store::DocumentKind as DocKind;
 use kaijutsu_kernel::{SharedBlockStore, shared_block_flow_bus, shared_block_store};
@@ -168,25 +170,27 @@ impl ShellCompletion {
                 snapshot,
                 elapsed_ms,
             } => {
-                // Derive exit_code: prefer the persisted value (the real
-                // kaish exit code); fall back to status mapping when absent
-                // (e.g. ToolResult blocks written by paths that predate
-                // exit_code propagation).
-                let exit_code = snapshot.exit_code.unwrap_or_else(|| match snapshot.status {
-                    kaijutsu_crdt::Status::Done => 0,
-                    _ => 1,
-                });
-                let stdout = if snapshot.content.is_empty() {
-                    "".to_string()
-                } else {
-                    snapshot.content.clone()
+                // exit_code: surface the real persisted value, or `null` when
+                // it genuinely hasn't replicated. We deliberately do NOT fall
+                // back to a status-derived 0/1 here — a false `0` reads as
+                // success and masks a replication gap. `null` is self-
+                // announcing; callers detect failure via a non-zero code OR a
+                // status of "error"/"timeout"/"stream_closed".
+                let exit_code = match snapshot.exit_code {
+                    Some(c) => serde_json::Value::from(c),
+                    None => serde_json::Value::Null,
                 };
+                // stdout lives in content; stderr is its own field (split at
+                // the source — see shell_execute). Empty string when unset.
+                let stdout = snapshot.content.clone();
+                let stderr = snapshot.stderr.clone().unwrap_or_default();
                 let data = snapshot
                     .output
                     .as_ref()
                     .and_then(|o| serde_json::to_value(o).ok());
                 serde_json::json!({
                     "stdout": stdout,
+                    "stderr": stderr,
                     "exit_code": exit_code,
                     "status": snapshot.status.as_str(),
                     "block_id": snapshot.id.to_key(),
@@ -756,7 +760,7 @@ impl KaijutsuMcp {
     }
 
     #[tool(
-        description = "Execute a kaish command through the kernel. Returns a JSON object: {stdout, exit_code, status, block_id, content_type, ephemeral, data, elapsed_ms}. Detect failure via exit_code != 0 (or status == 'timeout'/'stream_closed') rather than text-matching. `data` is the kj structured payload when present (e.g. `kj context list` returns an array of context labels). Output also lands as CRDT blocks observable in kaijutsu-app. Requires --connect and register_session.",
+        description = "Execute a kaish command through the kernel. Returns a JSON object: {stdout, stderr, exit_code, status, block_id, content_type, ephemeral, data, elapsed_ms}. `stdout` and `stderr` are separate (stderr is empty when the command wrote none). Detect failure via exit_code != 0 (or status == 'timeout'/'stream_closed') rather than text-matching; exit_code may be null if it hasn't replicated yet — treat null as unknown, not success. `data` is the kj structured payload when present (e.g. `kj context list` returns an array of context labels). Output also lands as CRDT blocks observable in kaijutsu-app. Requires --connect and register_session.",
         annotations(open_world_hint = true)
     )]
     #[tracing::instrument(skip(self, req), name = "mcp.shell")]
@@ -798,7 +802,7 @@ impl KaijutsuMcp {
     }
 
     #[tool(
-        description = "Context-bound kaish shell. Executes commands in your current kernel context — '.' references it in kj commands. Full kaish: pipes, variables, scripting. Returns the same JSON envelope as `shell`: {stdout, exit_code, status, block_id, content_type, ephemeral, data, elapsed_ms}. Detect failure via exit_code != 0; `data` carries kj's structured payload (arrays for list commands, objects for inspect). Run `kj help` for context/drift/fork management. Examples: 'kj context list --tree', 'kj fork --name alt', 'kj drift push impl \"found the bug\"', 'ls /mnt/project | grep rs'. Requires --connect and register_session.",
+        description = "Context-bound kaish shell. Executes commands in your current kernel context — '.' references it in kj commands. Full kaish: pipes, variables, scripting. Returns the same JSON envelope as `shell`: {stdout, stderr, exit_code, status, block_id, content_type, ephemeral, data, elapsed_ms}. stdout/stderr are separate; detect failure via exit_code != 0 (null exit_code means unknown, not success); `data` carries kj's structured payload (arrays for list commands, objects for inspect). Run `kj help` for context/drift/fork management. Examples: 'kj context list --tree', 'kj fork --name alt', 'kj drift push impl \"found the bug\"', 'ls /mnt/project | grep rs'. Requires --connect and register_session.",
         annotations(open_world_hint = true)
     )]
     #[tracing::instrument(skip(self, req), name = "mcp.context_shell")]
@@ -932,24 +936,65 @@ impl KaijutsuMcp {
         let sync = SyncManager::with_state(Some(sync_state.context_id), Some(frontier));
         let sync_arc = Arc::new(Mutex::new(sync));
 
-        // 6. Spawn background event listener
+        // 6. Spawn background event listener.
+        //
+        // Besides applying events, this task keeps the store replica from
+        // silently diverging from the server (the root of the empty-stdout-
+        // after-reconnect bug). It triggers a full resync — re-fetch the
+        // server snapshot and realign the SyncManager frontier — on three
+        // signals:
+        //   * a `Connected` status (every one received here is a *re*connect,
+        //     since we were already connected when we subscribed),
+        //   * a broadcast `Lagged` (dropped events → frontier may be stale),
+        //   * the SyncManager landing in `needs_full_sync` after an event
+        //     (an incremental merge failed and stranded text ops).
+        // Without this, a reconnect re-subscribes but never catches up, so
+        // stdout edits never replicate while status changes still do.
         let bg_abort = {
             let mut event_rx = remote.actor.subscribe_events();
+            let mut status_rx = remote.actor.subscribe_status();
             let store_bg = Arc::clone(&remote.store);
             let sync_bg = Arc::clone(&sync_arc);
+            let actor_bg = remote.actor.clone();
             let ctx_id_bg = context_id;
 
             let bg_handle = tokio::spawn(async move {
                 loop {
-                    match event_rx.recv().await {
-                        Ok(event) => {
-                            apply_server_event(&store_bg, &sync_bg, ctx_id_bg, event);
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            tracing::warn!("Missed {n} events, forcing full resync");
-                            sync_bg.lock().expect("sync mutex poisoned").reset();
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    tokio::select! {
+                        ev = event_rx.recv() => match ev {
+                            Ok(event) => {
+                                apply_server_event(&store_bg, &sync_bg, ctx_id_bg, event);
+                                // An incremental merge may have reset the
+                                // frontier; if so, recover by full resync
+                                // rather than stranding future text ops.
+                                let needs = sync_bg
+                                    .lock()
+                                    .expect("sync mutex poisoned")
+                                    .needs_full_sync(ctx_id_bg);
+                                if needs {
+                                    resync_store(&actor_bg, &store_bg, &sync_bg, ctx_id_bg).await;
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                tracing::warn!("Missed {n} events, forcing full resync");
+                                resync_store(&actor_bg, &store_bg, &sync_bg, ctx_id_bg).await;
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        },
+                        st = status_rx.recv() => match st {
+                            Ok(ConnectionStatus::Connected { .. }) => {
+                                tracing::info!(
+                                    context_id = %ctx_id_bg,
+                                    "Reconnected — resyncing MCP store replica",
+                                );
+                                resync_store(&actor_bg, &store_bg, &sync_bg, ctx_id_bg).await;
+                            }
+                            // Other statuses don't require a catch-up. A closed
+                            // status stream just means no more transitions; keep
+                            // serving events.
+                            Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
+                        },
                     }
                 }
             });
@@ -1550,6 +1595,46 @@ impl KaijutsuMcp {
 // Background Event Listener
 // ============================================================================
 
+/// Re-fetch the server's full snapshot and realign the store + frontier.
+///
+/// This is the catch-up that a bare re-subscribe skips. After a reconnect (or
+/// a lag / failed incremental merge), the client replica can diverge: status
+/// changes keep applying directly while text ops stall behind a stale
+/// frontier. Pulling `get_context_sync` and feeding it through
+/// `apply_initial_state` rebuilds the document from the server's current state
+/// (content, exit_code, stderr — everything) and resets the frontier so future
+/// incremental ops merge cleanly.
+async fn resync_store(
+    actor: &ActorHandle,
+    store: &SharedBlockStore,
+    sync: &Arc<Mutex<SyncManager>>,
+    context_id: ContextId,
+) {
+    let sync_state = match actor.get_context_sync(context_id).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(%context_id, "resync get_context_sync failed: {e}");
+            return;
+        }
+    };
+    if sync_state.ops.is_empty() {
+        tracing::debug!(%context_id, "resync skipped — empty server snapshot");
+        return;
+    }
+    let mut sync_guard = sync.lock().expect("sync mutex poisoned");
+    let Some(mut entry) = store.get_mut(context_id) else {
+        tracing::warn!(%context_id, "resync skipped — context not resident in store");
+        return;
+    };
+    match sync_guard.apply_initial_state(&mut entry.doc, context_id, &sync_state.ops) {
+        Ok(_) => {
+            entry.touch(PrincipalId::system());
+            tracing::info!(%context_id, "MCP store replica resynced from server snapshot");
+        }
+        Err(e) => tracing::warn!(%context_id, "resync apply_initial_state failed: {e}"),
+    }
+}
+
 /// Apply a server event to the store's BlockDocument via SyncManager.
 ///
 /// Called by the background event listener spawned in `connect()`.
@@ -1619,6 +1704,36 @@ fn apply_server_event(
             // Use store's set_status — handles version bump and flow events
             if let Err(e) = store.set_status(context_id, &block_id, status) {
                 tracing::warn!("BlockStatusChanged error: {e}");
+            }
+        }
+        ServerEvent::BlockMetadataChanged {
+            context_id: event_ctx_id,
+            block_id,
+            ref metadata,
+        } => {
+            if event_ctx_id != context_id {
+                return;
+            }
+            // Scalar metadata is not DTE-tracked — apply it directly to the
+            // store, bypassing the SyncManager frontier. This is what makes
+            // exit_code/stderr survive a reconnect: unlike text ops, these
+            // never get stranded behind a needs-full-sync gate.
+            if let Err(e) = store.set_exit_code(context_id, &block_id, metadata.exit_code) {
+                tracing::warn!("BlockMetadataChanged set_exit_code error: {e}");
+            }
+            if let Err(e) = store.set_stderr(context_id, &block_id, metadata.stderr.clone()) {
+                tracing::warn!("BlockMetadataChanged set_stderr error: {e}");
+            }
+            if let Err(e) = store.set_content_type(context_id, &block_id, metadata.content_type) {
+                tracing::warn!("BlockMetadataChanged set_content_type error: {e}");
+            }
+            if let Err(e) = store.set_ephemeral(context_id, &block_id, metadata.ephemeral) {
+                tracing::warn!("BlockMetadataChanged set_ephemeral error: {e}");
+            }
+            if let Err(e) =
+                store.set_tool_use_id(context_id, &block_id, metadata.tool_use_id.clone())
+            {
+                tracing::warn!("BlockMetadataChanged set_tool_use_id error: {e}");
             }
         }
         // Other event variants don't affect CRDT state
@@ -2613,6 +2728,116 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_metadata_changed_applies_independent_of_frontier() {
+        // exit_code + stderr must reach the client store even when the
+        // SyncManager frontier is reset (text ops would be skipped here). This
+        // is what makes them survive a reconnect: they ride MetadataChanged,
+        // not the frontier-gated text stream.
+        let (store, sync, server, ctx_id) = setup_synced_store();
+        let block_id = server.block_snapshots(ctx_id).unwrap()[0].id;
+
+        // Server records the real exit code + stderr.
+        server.set_exit_code(ctx_id, &block_id, Some(7)).unwrap();
+        server
+            .set_stderr(ctx_id, &block_id, Some("boom\n".to_string()))
+            .unwrap();
+        let metadata = server
+            .get(ctx_id)
+            .unwrap()
+            .doc
+            .get_block_snapshot(&block_id)
+            .unwrap()
+            .metadata();
+
+        // Simulate a degraded connection: frontier reset → text ops would skip.
+        sync.lock().unwrap().reset();
+        assert!(sync.lock().unwrap().needs_full_sync(ctx_id));
+
+        apply_server_event(
+            &store,
+            &sync,
+            ctx_id,
+            ServerEvent::BlockMetadataChanged {
+                context_id: ctx_id,
+                block_id,
+                metadata,
+            },
+        );
+
+        let snap = store
+            .get(ctx_id)
+            .unwrap()
+            .doc
+            .get_block_snapshot(&block_id)
+            .unwrap();
+        assert_eq!(snap.exit_code, Some(7), "exit_code applied despite reset frontier");
+        assert_eq!(
+            snap.stderr.as_deref(),
+            Some("boom\n"),
+            "stderr applied despite reset frontier"
+        );
+    }
+
+    #[test]
+    fn test_resync_via_initial_state_recovers_stranded_content() {
+        // The core reconnect bug, deterministically: with a reset frontier the
+        // client SKIPS text ops, so stdout written on the server never lands —
+        // exactly the empty-stdout symptom. A full resync (what `resync_store`
+        // performs via get_context_sync + apply_initial_state) must recover it.
+        let (store, sync, server, ctx_id) = setup_synced_store();
+        let block_id = server.block_snapshots(ctx_id).unwrap()[0].id;
+
+        // Degrade: frontier reset (as after a lag / failed incremental merge).
+        sync.lock().unwrap().reset();
+
+        // Server appends stdout to the existing block (an edit, NOT a new
+        // block — so no BlockInserted will ever come to rescue the frontier).
+        let pre_frontier = server.frontier(ctx_id).unwrap();
+        server
+            .edit_text(ctx_id, &block_id, 17, " STDOUT-X", 0)
+            .expect("edit");
+        let text_ops = server_ops_bytes(&server, ctx_id, &pre_frontier);
+
+        // The text op is skipped while needs_full_sync — content stays stale.
+        apply_server_event(
+            &store,
+            &sync,
+            ctx_id,
+            ServerEvent::BlockTextOps {
+                context_id: ctx_id,
+                block_id,
+                ops: text_ops,
+                seq_num: 1,
+            },
+        );
+        assert!(
+            !store.get(ctx_id).unwrap().doc.full_text().contains("STDOUT-X"),
+            "precondition: text op is stranded by the reset frontier"
+        );
+
+        // Resync: feed the server's full snapshot through apply_initial_state,
+        // the same bytes get_context_sync ships and resync_store applies.
+        let snapshot_bytes =
+            postcard::to_allocvec(&server.get(ctx_id).unwrap().doc.snapshot()).unwrap();
+        {
+            let mut guard = sync.lock().unwrap();
+            let mut entry = store.get_mut(ctx_id).unwrap();
+            guard
+                .apply_initial_state(&mut entry.doc, ctx_id, &snapshot_bytes)
+                .expect("resync apply_initial_state");
+        }
+
+        assert!(
+            store.get(ctx_id).unwrap().doc.full_text().contains("STDOUT-X"),
+            "resync recovers the stranded stdout"
+        );
+        assert!(
+            !sync.lock().unwrap().needs_full_sync(ctx_id),
+            "frontier realigned after resync"
+        );
+    }
+
     // =========================================================================
     // Input Document Tools (Local mode)
     // =========================================================================
@@ -2816,6 +3041,17 @@ mod tests {
         )
     }
 
+    /// Like [`make_result_snapshot`] but with a separate stderr stream.
+    fn make_result_snapshot_with_stderr(
+        content: &str,
+        stderr: &str,
+        exit_code: Option<i32>,
+    ) -> kaijutsu_crdt::BlockSnapshot {
+        let mut snap = make_result_snapshot(content, exit_code);
+        snap.stderr = Some(stderr.to_string());
+        snap
+    }
+
     #[test]
     fn test_shell_completion_done_success_envelope() {
         let snap = make_result_snapshot("hello world\n", Some(0));
@@ -2827,6 +3063,7 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&completion.to_json()).unwrap();
 
         assert_eq!(json["stdout"], "hello world\n");
+        assert_eq!(json["stderr"], "", "no stderr → empty string");
         assert_eq!(json["exit_code"], 0);
         assert_eq!(json["status"], "done");
         assert_eq!(json["block_id"], block_key);
@@ -2834,6 +3071,26 @@ mod tests {
         assert_eq!(json["ephemeral"], false);
         assert!(json["data"].is_null(), "no OutputData → data must be null");
         assert_eq!(json["elapsed_ms"], 42);
+    }
+
+    #[test]
+    fn test_shell_completion_surfaces_stderr_separately() {
+        // A successful-with-warnings command: stdout + stderr + exit 0. The
+        // envelope keeps them apart (the old merge would have hidden stderr
+        // inside stdout).
+        let snap = make_result_snapshot_with_stderr(
+            "build ok\n",
+            "warning: unused variable\n",
+            Some(0),
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&ShellCompletion::Done { snapshot: snap, elapsed_ms: 3 }.to_json())
+                .unwrap();
+
+        assert_eq!(json["stdout"], "build ok\n");
+        assert_eq!(json["stderr"], "warning: unused variable\n");
+        assert_eq!(json["exit_code"], 0, "stderr present does not imply failure");
+        assert_eq!(json["status"], "done");
     }
 
     #[test]
@@ -2852,16 +3109,19 @@ mod tests {
     }
 
     #[test]
-    fn test_shell_completion_done_derives_exit_code_when_absent() {
-        // Backward-compat: blocks written before exit_code propagation have
-        // `exit_code = None`. Fall back to Status: Done → 0, anything else → 1.
+    fn test_shell_completion_missing_exit_code_is_null_not_zero() {
+        // A missing exit_code means it hasn't replicated — surface `null`, NOT
+        // a false `0`. A `0` reads as success and masks the replication gap
+        // that produced the empty-stdout-after-reconnect bug; `null` is self-
+        // announcing so callers don't trust a fabricated success.
         let snap = make_result_snapshot("ok\n", None);
         let json: serde_json::Value =
             serde_json::from_str(&ShellCompletion::Done { snapshot: snap, elapsed_ms: 1 }.to_json())
                 .unwrap();
-        assert_eq!(
-            json["exit_code"], 0,
-            "missing exit_code + Status::Done → 0"
+        assert!(
+            json["exit_code"].is_null(),
+            "missing exit_code must be null, got {}",
+            json["exit_code"]
         );
     }
 

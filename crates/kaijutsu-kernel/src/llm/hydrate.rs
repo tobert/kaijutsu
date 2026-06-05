@@ -221,9 +221,19 @@ impl HydrationState {
                             );
                             block.id.to_key()
                         });
+                    // stdout lives in `content`, stderr in its own field. The
+                    // model needs both — merge them back the way they were
+                    // before stderr was split off (stdout, then stderr).
+                    let content = match block.stderr.as_deref() {
+                        Some(err) if !err.is_empty() && !block.content.is_empty() => {
+                            format!("{}\n{}", block.content, err)
+                        }
+                        Some(err) if !err.is_empty() => err.to_string(),
+                        _ => block.content.clone(),
+                    };
                     self.tool_results.push(ContentBlock::ToolResult {
                         tool_use_id,
-                        content: block.content.clone(),
+                        content,
                         is_error: block.is_error,
                     });
                 }

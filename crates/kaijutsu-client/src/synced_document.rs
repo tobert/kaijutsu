@@ -80,6 +80,7 @@ impl SyncedDocument {
         match event {
             ServerEvent::BlockTextOps { block_id, .. }
             | ServerEvent::BlockStatusChanged { block_id, .. }
+            | ServerEvent::BlockMetadataChanged { block_id, .. }
             | ServerEvent::BlockDeleted { block_id, .. }
             | ServerEvent::BlockCollapsedChanged { block_id, .. }
             | ServerEvent::BlockExcludedChanged { block_id, .. }
@@ -94,6 +95,7 @@ impl SyncedDocument {
             ServerEvent::BlockInserted { context_id, .. }
             | ServerEvent::BlockTextOps { context_id, .. }
             | ServerEvent::BlockStatusChanged { context_id, .. }
+            | ServerEvent::BlockMetadataChanged { context_id, .. }
             | ServerEvent::BlockDeleted { context_id, .. }
             | ServerEvent::BlockCollapsedChanged { context_id, .. }
             | ServerEvent::BlockExcludedChanged { context_id, .. }
@@ -293,6 +295,22 @@ impl SyncedDocument {
                     && let Err(e) = self.sync.apply_output_change(&mut self.doc, block_id, Some(output_data.clone()))
                 {
                     warn!("SyncedDocument: set_output error: {e}");
+                }
+                SyncEffect::Updated {
+                    block_count: self.doc.block_count(),
+                }
+            }
+
+            ServerEvent::BlockMetadataChanged {
+                context_id,
+                block_id,
+                metadata,
+            } => {
+                if *context_id != self.context_id {
+                    return SyncEffect::Ignored;
+                }
+                if let Err(e) = self.sync.apply_metadata_change(&mut self.doc, block_id, metadata) {
+                    warn!("SyncedDocument: set_metadata error: {e}");
                 }
                 SyncEffect::Updated {
                     block_count: self.doc.block_count(),

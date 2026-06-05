@@ -594,6 +594,30 @@ impl SyncManager {
         Ok(())
     }
 
+    /// Apply scalar metadata (exit_code, stderr, content_type, ephemeral,
+    /// tool_use_id) directly to a block. Frontier-independent — these fields
+    /// are not DTE-tracked, so this is safe to apply regardless of sync state
+    /// and survives a reconnect that would otherwise gate text ops.
+    pub fn apply_metadata_change(
+        &mut self,
+        doc: &mut CrdtBlockStore,
+        block_id: &BlockId,
+        metadata: &kaijutsu_types::BlockMetadata,
+    ) -> Result<(), SyncError> {
+        doc.set_exit_code(block_id, metadata.exit_code)
+            .map_err(|e| SyncError::Merge(e.to_string()))?;
+        doc.set_stderr(block_id, metadata.stderr.clone())
+            .map_err(|e| SyncError::Merge(e.to_string()))?;
+        doc.set_content_type(block_id, metadata.content_type)
+            .map_err(|e| SyncError::Merge(e.to_string()))?;
+        doc.set_ephemeral(block_id, metadata.ephemeral)
+            .map_err(|e| SyncError::Merge(e.to_string()))?;
+        doc.set_tool_use_id(block_id, metadata.tool_use_id.clone())
+            .map_err(|e| SyncError::Merge(e.to_string()))?;
+        self.version = self.version.wrapping_add(1);
+        Ok(())
+    }
+
     /// Delete a block (tombstone).
     pub fn apply_delete(
         &mut self,

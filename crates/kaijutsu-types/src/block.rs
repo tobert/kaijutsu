@@ -1218,6 +1218,13 @@ pub struct BlockSnapshot {
     /// emit a child Error block with full diagnostics.
     #[serde(default)]
     pub is_error: bool,
+    /// Standard error stream from tool execution (for ToolResult blocks).
+    /// Persisted separately from `content` (stdout) so callers can
+    /// distinguish the two — a successful-with-warnings command carries
+    /// stderr text with `exit_code == Some(0)`. Set once at completion (LWW
+    /// on the shared `tool_meta_at` clock); `None` until the tool finishes.
+    #[serde(default)]
+    pub stderr: Option<String>,
     /// Structured output data for richer formatting (tables, trees).
     /// Used for shell output blocks to enable per-viewer rendering.
     ///
@@ -1303,10 +1310,40 @@ pub struct BlockSnapshot {
     pub content_type_at: u64,
 }
 
+/// Scalar block metadata carried by the `MetadataChanged` flow / wire event.
+///
+/// These fields are set (typically once) after a block is inserted — e.g. the
+/// real exit code and stderr written when a shell command finishes. Unlike
+/// `content`, they are not DTE-tracked, so they travel on a dedicated event
+/// and are applied directly to a store replica, independent of the text
+/// frontier. That makes them survive a reconnect even when text ops are gated
+/// behind a full resync.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockMetadata {
+    pub exit_code: Option<i32>,
+    pub is_error: bool,
+    pub content_type: ContentType,
+    pub ephemeral: bool,
+    pub tool_use_id: Option<String>,
+    pub stderr: Option<String>,
+}
+
 impl BlockSnapshot {
     /// The principal that authored this block (always `id.principal_id`).
     pub fn author(&self) -> PrincipalId {
         self.id.principal_id
+    }
+
+    /// Extract the scalar metadata fields carried by `MetadataChanged`.
+    pub fn metadata(&self) -> BlockMetadata {
+        BlockMetadata {
+            exit_code: self.exit_code,
+            is_error: self.is_error,
+            content_type: self.content_type,
+            ephemeral: self.ephemeral,
+            tool_use_id: self.tool_use_id.clone(),
+            stderr: self.stderr.clone(),
+        }
     }
 
     /// Create a new text block snapshot.
@@ -1339,6 +1376,7 @@ impl BlockSnapshot {
             tool_call_id: None,
             exit_code: None,
             is_error: false,
+            stderr: None,
             output: None,
             source_context: None,
             source_model: None,
@@ -1385,6 +1423,7 @@ impl BlockSnapshot {
             tool_call_id: None,
             exit_code: None,
             is_error: false,
+            stderr: None,
             output: None,
             source_context: None,
             source_model: None,
@@ -1443,6 +1482,7 @@ impl BlockSnapshot {
             tool_call_id: None,
             exit_code: None,
             is_error: false,
+            stderr: None,
             output: None,
             source_context: None,
             source_model: None,
@@ -1501,6 +1541,7 @@ impl BlockSnapshot {
             tool_call_id: Some(tool_call_id),
             exit_code,
             is_error,
+            stderr: None,
             output: None,
             source_context: None,
             source_model: None,
@@ -1563,6 +1604,7 @@ impl BlockSnapshot {
             tool_call_id: Some(tool_call_id),
             exit_code,
             is_error,
+            stderr: None,
             output,
             source_context: None,
             source_model: None,
@@ -1616,6 +1658,7 @@ impl BlockSnapshot {
             tool_call_id: None,
             exit_code: None,
             is_error: false,
+            stderr: None,
             output: None,
             source_context: Some(source_context),
             source_model,
@@ -1667,6 +1710,7 @@ impl BlockSnapshot {
             tool_call_id: None,
             exit_code: None,
             is_error: false,
+            stderr: None,
             output: None,
             source_context: None,
             source_model: None,
@@ -1718,6 +1762,7 @@ impl BlockSnapshot {
             tool_call_id: None,
             exit_code: None,
             is_error: false,
+            stderr: None,
             output: None,
             source_context: None,
             source_model: None,
@@ -1765,6 +1810,7 @@ impl BlockSnapshot {
             tool_call_id: None,
             exit_code: None,
             is_error: false,
+            stderr: None,
             output: None,
             source_context: None,
             source_model: None,
@@ -1823,6 +1869,7 @@ impl BlockSnapshot {
             tool_call_id: None,
             exit_code: None,
             is_error: false,
+            stderr: None,
             output: None,
             source_context: None,
             source_model: None,
@@ -1879,6 +1926,7 @@ impl BlockSnapshot {
             tool_call_id: None,
             exit_code: None,
             is_error: false,
+            stderr: None,
             output: None,
             source_context: None,
             source_model: None,
@@ -2001,6 +2049,7 @@ impl BlockSnapshotBuilder {
                 tool_call_id: None,
                 exit_code: None,
                 is_error: false,
+            stderr: None,
                 output: None,
                 source_context: None,
                 source_model: None,
@@ -2080,6 +2129,11 @@ impl BlockSnapshotBuilder {
 
     pub fn exit_code(mut self, code: i32) -> Self {
         self.snap.exit_code = Some(code);
+        self
+    }
+
+    pub fn stderr(mut self, stderr: impl Into<String>) -> Self {
+        self.snap.stderr = Some(stderr.into());
         self
     }
 

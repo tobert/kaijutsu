@@ -1331,9 +1331,16 @@ impl BlockStore {
             entry.doc.ops_since(&frontier_before)
         };
         self.journal_op(context_id, ops)?;
+        let metadata = self
+            .get_block_snapshot(context_id, block_id)
+            .ok()
+            .flatten()
+            .map(|s| s.metadata())
+            .unwrap_or_default();
         self.emit(BlockFlow::MetadataChanged {
             context_id,
             block_id: *block_id,
+            metadata,
             source: OpSource::Local,
         });
 
@@ -1416,9 +1423,16 @@ impl BlockStore {
             entry.doc.ops_since(&frontier_before)
         };
         self.journal_op(context_id, ops)?;
+        let metadata = self
+            .get_block_snapshot(context_id, block_id)
+            .ok()
+            .flatten()
+            .map(|s| s.metadata())
+            .unwrap_or_default();
         self.emit(BlockFlow::MetadataChanged {
             context_id,
             block_id: *block_id,
+            metadata,
             source: OpSource::Local,
         });
 
@@ -1442,9 +1456,16 @@ impl BlockStore {
             entry.doc.ops_since(&frontier_before)
         };
         self.journal_op(context_id, ops)?;
+        let metadata = self
+            .get_block_snapshot(context_id, block_id)
+            .ok()
+            .flatten()
+            .map(|s| s.metadata())
+            .unwrap_or_default();
         self.emit(BlockFlow::MetadataChanged {
             context_id,
             block_id: *block_id,
+            metadata,
             source: OpSource::Local,
         });
 
@@ -1471,9 +1492,53 @@ impl BlockStore {
             entry.doc.ops_since(&frontier_before)
         };
         self.journal_op(context_id, ops)?;
+        let metadata = self
+            .get_block_snapshot(context_id, block_id)
+            .ok()
+            .flatten()
+            .map(|s| s.metadata())
+            .unwrap_or_default();
         self.emit(BlockFlow::MetadataChanged {
             context_id,
             block_id: *block_id,
+            metadata,
+            source: OpSource::Local,
+        });
+
+        Ok(())
+    }
+
+    /// Persist the standard-error stream on a ToolResult block. The shell
+    /// execution path calls this at completion so `BlockSnapshot::stderr`
+    /// carries stderr separately from `content` (stdout). Emits
+    /// `MetadataChanged` so the value replicates directly to client store
+    /// replicas (frontier-independent, reconnect-proof).
+    pub fn set_stderr(
+        &self,
+        context_id: ContextId,
+        block_id: &BlockId,
+        stderr: Option<String>,
+    ) -> BlockStoreResult<()> {
+        let ops = {
+            let mut entry = self
+                .get_mut(context_id)
+                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+            let frontier_before = entry.doc.frontier();
+            entry.doc.set_stderr(block_id, stderr)?;
+            entry.touch(self.principal_id());
+            entry.doc.ops_since(&frontier_before)
+        };
+        self.journal_op(context_id, ops)?;
+        let metadata = self
+            .get_block_snapshot(context_id, block_id)
+            .ok()
+            .flatten()
+            .map(|s| s.metadata())
+            .unwrap_or_default();
+        self.emit(BlockFlow::MetadataChanged {
+            context_id,
+            block_id: *block_id,
+            metadata,
             source: OpSource::Local,
         });
 
@@ -1530,9 +1595,16 @@ impl BlockStore {
             entry.doc.ops_since(&frontier_before)
         };
         self.journal_op(context_id, ops)?;
+        let metadata = self
+            .get_block_snapshot(context_id, block_id)
+            .ok()
+            .flatten()
+            .map(|s| s.metadata())
+            .unwrap_or_default();
         self.emit(BlockFlow::MetadataChanged {
             context_id,
             block_id: *block_id,
+            metadata,
             source: OpSource::Local,
         });
 

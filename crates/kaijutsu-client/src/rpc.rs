@@ -1763,6 +1763,44 @@ fn parse_output_node(
     })
 }
 
+/// Parse a Cap'n Proto `BlockMetadata` into the typed struct.
+///
+/// Lenient: malformed text fields degrade to defaults rather than erroring —
+/// a metadata event is advisory, not load-bearing for protocol correctness.
+pub(crate) fn parse_block_metadata(
+    reader: crate::kaijutsu_capnp::block_metadata::Reader<'_>,
+) -> kaijutsu_types::BlockMetadata {
+    let content_type = reader
+        .get_content_type()
+        .ok()
+        .and_then(|t| t.to_str().ok())
+        .map(kaijutsu_types::ContentType::from_mime)
+        .unwrap_or_default();
+    let tool_use_id = reader
+        .get_tool_use_id()
+        .ok()
+        .and_then(|t| t.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_owned());
+    let stderr = if reader.get_has_stderr() {
+        reader
+            .get_stderr()
+            .ok()
+            .and_then(|t| t.to_str().ok())
+            .map(|s| s.to_owned())
+    } else {
+        None
+    };
+    kaijutsu_types::BlockMetadata {
+        exit_code: reader.get_has_exit_code().then(|| reader.get_exit_code()),
+        is_error: reader.get_is_error(),
+        content_type,
+        ephemeral: reader.get_ephemeral(),
+        tool_use_id,
+        stderr,
+    }
+}
+
 pub(crate) fn parse_output_data(
     reader: crate::kaijutsu_capnp::output_data::Reader<'_>,
 ) -> Result<kaijutsu_types::OutputData, capnp::Error> {
@@ -1991,6 +2029,13 @@ pub(crate) fn parse_block_snapshot(
 
     if reader.get_is_error() {
         builder = builder.is_error(true);
+    }
+
+    if reader.get_has_stderr()
+        && let Ok(s) = reader.get_stderr()
+        && let Ok(s) = s.to_str()
+    {
+        builder = builder.stderr(s);
     }
 
     // Structured output data

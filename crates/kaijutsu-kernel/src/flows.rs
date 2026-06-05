@@ -352,12 +352,18 @@ pub enum BlockFlow {
         source: OpSource,
     },
 
-    /// Block metadata changed (tool_use_id, etc).
+    /// Block scalar metadata changed (exit_code, stderr, content_type, …).
+    ///
+    /// Carries the block's current metadata snapshot so subscribers can apply
+    /// it directly without a refetch. Frontier-independent — see
+    /// [`kaijutsu_types::BlockMetadata`].
     MetadataChanged {
         /// The context ID.
         context_id: ContextId,
         /// The block whose metadata changed.
         block_id: BlockId,
+        /// Current scalar metadata for the block.
+        metadata: kaijutsu_types::BlockMetadata,
         /// Origin of this operation (Local or Remote).
         #[serde(default)]
         source: OpSource,

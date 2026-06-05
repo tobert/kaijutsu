@@ -60,8 +60,9 @@ pub use kaish_types::output::{EntryType as OutputEntryType, OutputData, OutputNo
 
 // Re-export primary types at crate root for convenience.
 pub use block::{
-    BlockEventFilter, BlockFilter, BlockFlowKind, BlockHeader, BlockId, BlockKind, BlockQuery,
-    BlockSnapshot, BlockSnapshotBuilder, ContentType, DriftKind, ErrorCategory, ErrorPayload,
+    BlockEventFilter, BlockFilter, BlockFlowKind, BlockHeader, BlockId, BlockKind, BlockMetadata,
+    BlockQuery, BlockSnapshot, BlockSnapshotBuilder, ContentType, DriftKind, ErrorCategory,
+    ErrorPayload,
     ErrorSeverity, ErrorSpan, LogLevel, MAX_DAG_DEPTH, NotificationKind, NotificationPayload,
     ResourcePayload, Role, Status, ToolKind, ERROR_DETAIL_HYDRATION_BUDGET,
     NOTIFICATION_DETAIL_HYDRATION_BUDGET, RESOURCE_CONTENT_HYDRATION_BUDGET,

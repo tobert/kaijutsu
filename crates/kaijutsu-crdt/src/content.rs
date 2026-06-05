@@ -101,6 +101,9 @@ pub struct BlockContent {
     tool_call_id: Option<BlockId>,
     tool_use_id: Option<String>,
     output: Option<kaijutsu_types::OutputData>,
+    /// Standard error stream, persisted separately from `content` (stdout).
+    /// Set once at tool completion via [`set_stderr`](Self::set_stderr).
+    stderr: Option<String>,
     source_context: Option<crate::ContextId>,
     source_model: Option<String>,
     drift_kind: Option<crate::DriftKind>,
@@ -150,6 +153,7 @@ impl BlockContent {
             tool_call_id: None,
             tool_use_id: None,
             output: None,
+            stderr: None,
             source_context: None,
             source_model: None,
             drift_kind: None,
@@ -199,6 +203,7 @@ impl BlockContent {
         block.tool_call_id = snap.tool_call_id;
         block.tool_use_id = snap.tool_use_id.clone();
         block.output = snap.output.clone();
+        block.stderr = snap.stderr.clone();
         block.source_context = snap.source_context;
         block.source_model = snap.source_model.clone();
         block.drift_kind = snap.drift_kind;
@@ -241,6 +246,7 @@ impl BlockContent {
             tool_call_id: snap.tool_call_id,
             tool_use_id: snap.tool_use_id.clone(),
             output: snap.output.clone(),
+            stderr: snap.stderr.clone(),
             source_context: snap.source_context,
             source_model: snap.source_model.clone(),
             drift_kind: snap.drift_kind,
@@ -370,6 +376,15 @@ impl BlockContent {
 
     pub fn set_output(&mut self, output: Option<kaijutsu_types::OutputData>) {
         self.output = output;
+    }
+
+    pub fn stderr(&self) -> Option<&str> {
+        self.stderr.as_deref()
+    }
+
+    /// Set the standard-error stream (write-once at tool completion).
+    pub fn set_stderr(&mut self, stderr: Option<String>) {
+        self.stderr = stderr;
     }
 
     pub fn source_context(&self) -> Option<crate::ContextId> {
@@ -506,6 +521,7 @@ impl BlockContent {
             tool_call_id: self.tool_call_id,
             exit_code: self.header.exit_code,
             is_error: self.header.is_error,
+            stderr: self.stderr.clone(),
             output: self.output.clone(),
             source_context: self.source_context,
             source_model: self.source_model.clone(),

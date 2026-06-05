@@ -197,6 +197,10 @@ struct BlockSnapshot {
   # Resource-specific fields (Resource blocks)
   resourcePayload @31 :ResourcePayload;
   hasResourcePayload @32 :Bool;
+
+  # Standard error stream (toolResult) — persisted separately from content (stdout)
+  stderr @33 :Text;
+  hasStderr @34 :Bool;        # True if stderr is set (distinguishes "" from unset)
 }
 
 # What system produced the error.
@@ -328,6 +332,23 @@ struct VersionSnapshot {
   changedBlockId @4 :BlockId; # The block that changed (if applicable)
 }
 
+# Scalar block metadata carried by onBlockMetadataChanged.
+#
+# These fields are set (typically once) after a block is inserted — e.g. the
+# real exit code and stderr written when a shell command finishes. They are
+# NOT DTE-tracked (unlike content), so they ride this event and are applied
+# directly to the client's store replica, independent of the text frontier.
+struct BlockMetadata {
+  exitCode @0 :Int32;
+  hasExitCode @1 :Bool;       # True if exitCode is set
+  isError @2 :Bool;
+  contentType @3 :Text;       # MIME type; empty falls back to heuristic
+  ephemeral @4 :Bool;
+  toolUseId @5 :Text;         # LLM-assigned tool invocation id ("" if unset)
+  stderr @6 :Text;            # Standard error stream
+  hasStderr @7 :Bool;         # True if stderr is set (distinguishes "" from unset)
+}
+
 # Callback for receiving block updates from server
 interface BlockEvents {
   onBlockInserted @0 (contextId :Data, block :BlockSnapshot, afterId :BlockId, hasAfterId :Bool, ops :Data);
@@ -350,6 +371,11 @@ interface BlockEvents {
 
   # Block excluded flag changed (staging curation)
   onBlockExcludedChanged @10 (contextId :Data, blockId :BlockId, excluded :Bool);
+
+  # Scalar metadata changed (exit code, stderr, content type, …). Applied
+  # directly to the client store — frontier-independent, so it survives a
+  # reconnect even when text ops are gated behind a full resync.
+  onBlockMetadataChanged @11 (contextId :Data, blockId :BlockId, metadata :BlockMetadata);
 }
 
 # ============================================================================

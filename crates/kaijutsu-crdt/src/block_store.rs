@@ -816,6 +816,21 @@ impl BlockStore {
         Ok(())
     }
 
+    /// Set the standard-error stream on a ToolResult block. The shell
+    /// execution path calls this at completion so `BlockSnapshot::stderr`
+    /// carries stderr separately from `content` (stdout). Write-once — no
+    /// LWW clock; the value is replicated via `MetadataChanged` / snapshot.
+    pub fn set_stderr(&mut self, id: &BlockId, stderr: Option<String>) -> Result<()> {
+        let block = self
+            .blocks
+            .get_mut(id)
+            .filter(|b| !b.is_deleted())
+            .ok_or(CrdtError::BlockNotFound(*id))?;
+        block.set_stderr(stderr);
+        self.version += 1;
+        Ok(())
+    }
+
     /// Set the LLM-assigned tool invocation ID on a block.
     pub fn set_tool_use_id(&mut self, id: &BlockId, tool_use_id: Option<String>) -> Result<()> {
         let block = self
@@ -1647,6 +1662,44 @@ mod tests {
         assert_eq!(snap.tool_call_id, Some(call_id));
         assert!(!snap.is_error);
         assert_eq!(snap.exit_code, Some(0));
+    }
+
+    #[test]
+    fn test_set_stderr_roundtrips_through_snapshot() {
+        let mut store = test_store();
+        let call_id = store
+            .insert_tool_call(None, None, "sh", serde_json::json!({"cmd": "x"}), None, None)
+            .unwrap();
+        let result_id = store
+            .insert_tool_result_block(&call_id, Some(&call_id), "out\n", false, Some(0), None)
+            .unwrap();
+
+        // Default: no stderr until set.
+        assert_eq!(store.get_block_snapshot(&result_id).unwrap().stderr, None);
+
+        store
+            .set_stderr(&result_id, Some("warning: deprecated\n".to_string()))
+            .unwrap();
+
+        let snap = store.get_block_snapshot(&result_id).unwrap();
+        assert_eq!(snap.content, "out\n", "stdout stays in content");
+        assert_eq!(
+            snap.stderr.as_deref(),
+            Some("warning: deprecated\n"),
+            "stderr persisted separately"
+        );
+
+        // Survives a StoreSnapshot round-trip (the sync/persistence path).
+        let bytes = postcard::to_allocvec(&store.snapshot()).unwrap();
+        let restored = BlockStore::from_snapshot(
+            postcard::from_bytes(&bytes).unwrap(),
+            store.principal_id(),
+        )
+        .unwrap();
+        assert_eq!(
+            restored.get_block_snapshot(&result_id).unwrap().stderr.as_deref(),
+            Some("warning: deprecated\n"),
+        );
     }
 
     #[test]

@@ -2125,9 +2125,38 @@ impl kernel::Server for KernelImpl {
                                         }
                                     }
                                 }
-                                // No wire protocol for these yet — drop silently
-                                BlockFlow::OutputChanged { .. }
-                                | BlockFlow::MetadataChanged { .. } => true,
+                                // OutputChanged is piggybacked on StatusChanged
+                                // (see the StatusChanged arm) — no separate wire event.
+                                BlockFlow::OutputChanged { .. } => true,
+                                BlockFlow::MetadataChanged { context_id, ref block_id, ref metadata, .. } => {
+                                    let mut req = callback.on_block_metadata_changed_request();
+                                    {
+                                        let mut params = req.get();
+                                        params.set_context_id(context_id.as_bytes());
+                                        set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
+                                        build_block_metadata(params.reborrow().init_metadata(), metadata);
+                                    }
+                                    match tokio::time::timeout(
+                                        CALLBACK_TIMEOUT, req.send().promise,
+                                    ).await {
+                                        Ok(Ok(_)) => true,
+                                        Ok(Err(e)) => {
+                                            log::debug!(
+                                                "FlowBus callback failed for {kernel_id}: {e}",
+                                            );
+                                            false
+                                        }
+                                        Err(_) => {
+                                            log::warn!(
+                                                "FlowBus callback timed out after {:?} \
+                                                 for kernel {kernel_id} — peer is not \
+                                                 reading; dropping subscriber",
+                                                CALLBACK_TIMEOUT,
+                                            );
+                                            false
+                                        }
+                                    }
+                                }
                             }
                         }
                         Some(msg) = async {
@@ -4781,9 +4810,38 @@ impl kernel::Server for KernelImpl {
                                         }
                                     }
                                 }
-                                // No wire protocol for these yet — drop silently
-                                BlockFlow::OutputChanged { .. }
-                                | BlockFlow::MetadataChanged { .. } => true,
+                                // OutputChanged is piggybacked on StatusChanged
+                                // (see the StatusChanged arm) — no separate wire event.
+                                BlockFlow::OutputChanged { .. } => true,
+                                BlockFlow::MetadataChanged { context_id, ref block_id, ref metadata, .. } => {
+                                    let mut req = callback.on_block_metadata_changed_request();
+                                    {
+                                        let mut params = req.get();
+                                        params.set_context_id(context_id.as_bytes());
+                                        set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
+                                        build_block_metadata(params.reborrow().init_metadata(), metadata);
+                                    }
+                                    match tokio::time::timeout(
+                                        CALLBACK_TIMEOUT, req.send().promise,
+                                    ).await {
+                                        Ok(Ok(_)) => true,
+                                        Ok(Err(e)) => {
+                                            log::debug!(
+                                                "FlowBus callback failed for {kernel_id}: {e}",
+                                            );
+                                            false
+                                        }
+                                        Err(_) => {
+                                            log::warn!(
+                                                "FlowBus callback timed out after {:?} \
+                                                 for kernel {kernel_id} — peer is not \
+                                                 reading; dropping subscriber",
+                                                CALLBACK_TIMEOUT,
+                                            );
+                                            false
+                                        }
+                                    }
+                                }
                             }
                         }
                         Some(msg) = async {
@@ -5386,6 +5444,27 @@ fn build_output_data(
     }
 }
 
+/// Fill a Cap'n Proto `BlockMetadata` builder from the typed metadata.
+fn build_block_metadata(
+    mut builder: crate::kaijutsu_capnp::block_metadata::Builder<'_>,
+    meta: &kaijutsu_types::BlockMetadata,
+) {
+    if let Some(code) = meta.exit_code {
+        builder.set_has_exit_code(true);
+        builder.set_exit_code(code);
+    }
+    builder.set_is_error(meta.is_error);
+    builder.set_content_type(meta.content_type.as_mime());
+    builder.set_ephemeral(meta.ephemeral);
+    if let Some(ref tui) = meta.tool_use_id {
+        builder.set_tool_use_id(tui);
+    }
+    if let Some(ref stderr) = meta.stderr {
+        builder.set_has_stderr(true);
+        builder.set_stderr(stderr);
+    }
+}
+
 // ============================================================================
 // Peer Helper Functions
 // ============================================================================
@@ -5689,24 +5768,31 @@ async fn execute_shell_command(
                     result.err.len()
                 );
 
+                // stdout → block content (DTE-tracked, app-observable, streams).
+                // stderr → its own metadata field so callers can tell them apart
+                // (a successful-with-warnings command carries stderr + exit 0).
+                // The LLM still sees both: hydration merges stderr back into the
+                // tool_result content (see hydrate.rs).
                 let out_text = result.text_out().into_owned();
-                let output_text = if result.err.is_empty() {
-                    out_text
-                } else if out_text.is_empty() {
-                    result.err.clone()
-                } else {
-                    format!("{}\n{}", out_text, result.err)
-                };
-
                 if let Err(e) = documents_clone.edit_text_as(
                     context_id,
                     &output_block_id_clone,
                     0,
-                    &output_text,
+                    &out_text,
                     0,
                     Some(PrincipalId::system()),
                 ) {
                     log::error!("Failed to update shell output: {}", e);
+                }
+
+                if !result.err.is_empty()
+                    && let Err(e) = documents_clone.set_stderr(
+                        context_id,
+                        &output_block_id_clone,
+                        Some(result.err.clone()),
+                    )
+                {
+                    log::error!("Failed to set shell stderr: {}", e);
                 }
 
                 if let Some(output_data) = result.output()
@@ -5940,6 +6026,10 @@ fn set_block_snapshot(
         builder.set_exit_code(code);
     }
     builder.set_is_error(block.is_error);
+    if let Some(ref stderr) = block.stderr {
+        builder.set_has_stderr(true);
+        builder.set_stderr(stderr);
+    }
 
     // Set output data if present
     if let Some(ref output) = block.output {

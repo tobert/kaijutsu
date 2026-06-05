@@ -87,6 +87,7 @@ mod tests {
             tool_call_id: None,
             exit_code: None,
             is_error: false,
+            stderr: None,
             source_context: None,
             source_model: None,
             drift_kind: None,
