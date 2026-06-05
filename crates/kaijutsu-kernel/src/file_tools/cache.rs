@@ -203,8 +203,9 @@ impl FileDocumentCache {
             .unwrap_or_default();
 
         if old != text {
+            // Char-indexed delete (CRDT text positions are chars, not bytes).
             self.block_store
-                .edit_text(ctx_id, block_id, 0, &text, old.len())
+                .edit_text(ctx_id, block_id, 0, &text, old.chars().count())
                 .map_err(|e| e.to_string())?;
         }
 
@@ -434,23 +435,51 @@ impl FileDocumentCache {
         let ctx_id = file_context_id(path);
         let language = detect_language(path);
 
-        self.block_store
-            .create_document(ctx_id, DocKind::Code, language)
-            .map_err(|e| format!("failed to create document for {}: {}", path, e))?;
-
-        let block_id = self
+        // The CRDT block store persists file documents across restarts while
+        // this in-memory cache starts cold. So a cache miss does NOT imply the
+        // document is new — it may already exist in the store (e.g. after a
+        // kernel restart). create_document fails in that case; fall back to
+        // replacing the existing block's content rather than erroring.
+        let block_id = match self
             .block_store
-            .insert_block(
-                ctx_id,
-                None,
-                None,
-                Role::System,
-                BlockKind::Text,
-                content,
-                Status::Done,
-                ContentType::Plain,
-            )
-            .map_err(|e| format!("failed to insert block for {}: {}", path, e))?;
+            .create_document(ctx_id, DocKind::Code, language)
+        {
+            Ok(()) => self
+                .block_store
+                .insert_block(
+                    ctx_id,
+                    None,
+                    None,
+                    Role::System,
+                    BlockKind::Text,
+                    content,
+                    Status::Done,
+                    ContentType::Plain,
+                )
+                .map_err(|e| format!("failed to insert block for {}: {}", path, e))?,
+            Err(_) => {
+                // Doc already in the store (cold cache). Replace its block's
+                // content with the new bytes (char-indexed delete, like the
+                // cached-hit path).
+                let snaps = self
+                    .block_store
+                    .block_snapshots(ctx_id)
+                    .map_err(|e| format!("failed to read existing doc {}: {}", path, e))?;
+                let existing = snaps
+                    .first()
+                    .ok_or_else(|| format!("document {} exists but has no blocks", path))?;
+                self.block_store
+                    .edit_text(
+                        ctx_id,
+                        &existing.id,
+                        0,
+                        content,
+                        existing.content.chars().count(),
+                    )
+                    .map_err(|e| e.to_string())?;
+                existing.id
+            }
+        };
 
         {
             let mut cache = self.cache.write();
@@ -606,6 +635,27 @@ mod tests {
             cache.read_content("/tmp/s.md").await.unwrap(),
             replacement
         );
+    }
+
+    #[tokio::test]
+    async fn create_or_replace_handles_doc_in_store_but_not_cache() {
+        // Regression: the CRDT store persists file docs across restarts while
+        // this cache starts cold. A cache miss with the doc still in the store
+        // must replace its content, not fail create_document with
+        // "document already exists". `invalidate` reproduces the cold cache.
+        let (_vfs, cache) = tmp_cache().await;
+
+        cache.create_or_replace("/tmp/r.kai", "v1").await.unwrap();
+        // Simulate restart: cache entry gone, store doc remains.
+        cache.invalidate("/tmp/r.kai");
+
+        // Replace through the cold-cache path (with multi-byte, to also cover
+        // the char-count delete in the fallback branch).
+        cache
+            .create_or_replace("/tmp/r.kai", "改善 v2 …")
+            .await
+            .expect("replace a store-resident doc after a cold cache");
+        assert_eq!(cache.read_content("/tmp/r.kai").await.unwrap(), "改善 v2 …");
     }
 
     #[tokio::test]

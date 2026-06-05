@@ -759,4 +759,34 @@ mod tests {
             other => panic!("expected Ok with data, got {other:?}"),
         }
     }
+
+    /// `kj rc reseed` (no filter) must succeed even when a seed doc with
+    /// multi-byte UTF-8 (the stances: 改善, em-dashes, …) is already in the
+    /// cache — the production state when a live mcp context has loaded its
+    /// stance. Reproduces the create_or_replace byte/char overrun via the
+    /// reseed path end-to-end.
+    #[tokio::test]
+    async fn rc_reseed_succeeds_with_cached_multibyte_stance() {
+        use crate::kj::test_helpers::*;
+        use crate::kj::KjResult;
+
+        let d = test_dispatcher().await;
+        let c = test_caller();
+        let s = |v: &str| v.to_string();
+
+        // Warm the cache with a multi-byte stance, as an mcp/coder context's
+        // create lifecycle would (read_content loads + caches the doc).
+        let _ = d
+            .kernel()
+            .file_cache(d.block_store())
+            .read_content("/etc/rc/mcp/create/S00-stance.md")
+            .await
+            .expect("seeded stance is readable");
+
+        let result = d.dispatch(&[s("rc"), s("reseed")], &c).await;
+        assert!(
+            matches!(result, KjResult::Ok { .. }),
+            "reseed over a cached multi-byte stance must succeed, got: {result:?}"
+        );
+    }
 }
