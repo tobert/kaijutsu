@@ -1,0 +1,6 @@
+# rc on-fork cache breakpoint: cache the prefix shared with the parent.
+# KJ_PARENT_BLOCK_COUNT is the parent's block count at fork time, so
+# index N-1 is the last shared message. --flag=value because the kj
+# tool schema does not declare these flag names; bare --flag args
+# otherwise parse as bool flags in kaish.
+kj cache add --target=message --index=$((KJ_PARENT_BLOCK_COUNT - 1)) --ttl=extended

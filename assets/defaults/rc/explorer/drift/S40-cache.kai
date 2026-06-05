@@ -1,0 +1,8 @@
+# rc on-drift cache reset: compact / model swap / doc inject reshape
+# the conversation, so old MessageIndex breakpoints point at the wrong
+# message now. Clear and re-seed the stable bits. --flag=value because
+# the kj tool schema does not declare these flag names; bare --flag args
+# otherwise parse as bool flags in kaish.
+kj cache clear
+kj cache add --target=tools  --ttl=extended
+kj cache add --target=system --ttl=ephemeral

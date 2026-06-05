@@ -1,0 +1,12 @@
+# explorer: read-only allow-set (capability narrowing).
+kj binding allow "builtin.file:read"
+kj binding allow "builtin.file:glob"
+kj binding allow "builtin.file:grep"
+kj binding allow "builtin.block:block_read"
+kj binding allow "builtin.block:block_list"
+kj binding allow "builtin.block:block_search"
+kj binding allow "builtin.block:block_status"
+kj binding allow "builtin.block:kernel_search"
+kj binding allow "builtin.resources"
+kj binding allow "builtin.tool_search"
+kj binding allow "builtin.kernel_info"

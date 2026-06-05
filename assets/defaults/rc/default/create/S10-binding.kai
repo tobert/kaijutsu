@@ -1,0 +1,3 @@
+# Broad loadout: every instance + every facade (explicit; deny-by-default).
+kj binding allow "*"
+kj binding allow "facade:*"

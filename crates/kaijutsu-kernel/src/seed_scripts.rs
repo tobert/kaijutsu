@@ -25,10 +25,12 @@
 //!
 //! ## Updating the seed
 //!
-//! Editing a constant here changes what fresh DBs get, but not what
+//! The script bodies live as real files under `assets/defaults/rc/` (a
+//! 1:1 mirror of the `/etc/rc` tree), embedded here via `include_str!`.
+//! Edit the asset file to change what fresh DBs get — but not what
 //! already-seeded DBs have (paths collide, INSERT OR IGNORE skips).
 //! `kj rc reseed` is the explicit push-updates path: it overwrites
-//! matching paths from these constants.
+//! matching paths from these embedded defaults.
 
 use rusqlite::{params, Connection, Result as SqliteResult};
 
@@ -53,90 +55,38 @@ struct SeedScript {
 /// `default` and `coder` because every conversational context wants
 /// these breakpoints; the duplication is fine until a third consumer
 /// shows up.
-const CACHE_CREATE_BODY: &str = "\
-# rc on-create cache breakpoints (docs/help/kj-cache.md).
-# Tools array is fixed per session → 1h cache.
-# System prompt may shift on rc edits / model swaps → 5m.
-# --flag=value because the kj tool schema does not declare these flag
-# names; bare --flag args otherwise parse as bool flags in kaish.
-kj cache add --target=tools  --ttl=extended
-kj cache add --target=system --ttl=ephemeral
-";
+// Bodies live as real files under `assets/defaults/rc/` (a 1:1 mirror of
+// the `/etc/rc` tree) so they can be edited with an external editor and
+// reviewed as files. `include_str!` embeds them at build time. Shared
+// recipes (cache, permissive binding) appear at multiple `/etc/rc` paths;
+// each const points at one representative copy in the mirror.
+const CACHE_CREATE_BODY: &str =
+    include_str!("../../../assets/defaults/rc/default/create/S20-cache.kai");
 
-const CACHE_FORK_BODY: &str = "\
-# rc on-fork cache breakpoint: cache the prefix shared with the parent.
-# KJ_PARENT_BLOCK_COUNT is the parent's block count at fork time, so
-# index N-1 is the last shared message. --flag=value because the kj
-# tool schema does not declare these flag names; bare --flag args
-# otherwise parse as bool flags in kaish.
-kj cache add --target=message --index=$((KJ_PARENT_BLOCK_COUNT - 1)) --ttl=extended
-";
+const CACHE_FORK_BODY: &str =
+    include_str!("../../../assets/defaults/rc/default/fork/S30-cache.kai");
 
-const CACHE_DRIFT_BODY: &str = "\
-# rc on-drift cache reset: compact / model swap / doc inject reshape
-# the conversation, so old MessageIndex breakpoints point at the wrong
-# message now. Clear and re-seed the stable bits. --flag=value because
-# the kj tool schema does not declare these flag names; bare --flag args
-# otherwise parse as bool flags in kaish.
-kj cache clear
-kj cache add --target=tools  --ttl=extended
-kj cache add --target=system --ttl=ephemeral
-";
+const CACHE_DRIFT_BODY: &str =
+    include_str!("../../../assets/defaults/rc/default/drift/S40-cache.kai");
 
 /// The coder context_type's system-prompt stance. Drawn from the
 /// project's cybernetic / kaizen directives — restated in-kernel so the
 /// contract doesn't depend on which client connected.
-const CODER_STANCE_BODY: &str = "\
-You are coding inside kaijutsu — a cybernetic system for multi-user,
-multi-model, multi-context collaboration. We work as equals: ask
-clarifying questions, push back when a prompt is ambiguous, name
-another option when one exists.
-
-The standard we walk by is the standard we accept (改善). Note problems
-we can fix later in auto-memory or the active plan; then move on.
-
-Test-driven: write tests that can and will fail when we make mistakes.
-Crash on data corruption; silent fallbacks are usually a mistake.
-
-We do not seek a single root cause — describe contributing factors and
-the system shape that admitted the failure.
-
-Don't add features, refactors, or abstractions the task didn't ask for.
-Edit existing files rather than creating new ones when you can.
-
-`kj` is your lever inside the kernel: fork to explore safely, drift to
-share findings between contexts, cache to amortize prompt-token cost,
-rc to install lifecycle scripts, block to inspect the conversation.
-";
+const CODER_STANCE_BODY: &str =
+    include_str!("../../../assets/defaults/rc/coder/create/S00-stance.md");
 
 /// The `mcp` context_type's stance. This is the default mode for a context
 /// born from `register_session` — an external agent (Claude Code, Gemini CLI,
 /// opencode) driving the kernel over the narrow MCP surface, with
 /// `context_shell` as the entry point and `kj` as the rich command surface.
-const MCP_STANCE_BODY: &str = "\
-You are driving a kaijutsu context from outside the kernel, over MCP.
-`context_shell` is your entry point; everything rich happens by running
-`kj …` and shell commands through it. We work as equals: ask clarifying
-questions, push back when a prompt is ambiguous, name another option.
-
-The standard we walk by is the standard we accept (改善). Note problems
-we can fix later in auto-memory or the active plan; then move on.
-
-`kj` is the kernel's command surface: `kj context` to see where you are,
-`kj fork` to explore safely, `kj drift` to share findings between
-contexts, `kj block` to inspect the conversation, `kj help` for the rest.
-Prefer `kj` over guessing — it carries structured `--json` output.
-";
+const MCP_STANCE_BODY: &str =
+    include_str!("../../../assets/defaults/rc/mcp/create/S00-stance.md");
 
 /// The explorer context_type's stance: a read-only role for investigation
 /// without mutation. Pairs with the capability allow-set below — the stance
 /// tells the model what it is; the binding enforces it.
-const EXPLORER_STANCE_BODY: &str = "\
-You are an explorer context: read-only by design. You can read files,
-search blocks, and inspect the kernel, but write/edit/mutate tools are
-withheld — a call to one is refused, not silently dropped. Investigate,
-report findings, and `kj drift` them back to a context that can act.
-";
+const EXPLORER_STANCE_BODY: &str =
+    include_str!("../../../assets/defaults/rc/explorer/create/S00-stance.md");
 
 /// The broad loadout for human-facing / general roles (`default`, `coder`,
 /// `mcp`). Deny-by-default everywhere, so permissiveness is explicit: `*` =
@@ -144,11 +94,8 @@ report findings, and `kj drift` them back to a context that can act.
 /// these roles can use everything but cannot rebind *other* contexts (that's
 /// the director role). The rc lifecycle runs privileged, so this widen from
 /// deny-all is allowed; an agent could not issue it at runtime.
-const PERMISSIVE_BINDING_BODY: &str = "\
-# Broad loadout: every instance + every facade (explicit; deny-by-default).
-kj binding allow \"*\"
-kj binding allow \"facade:*\"
-";
+const PERMISSIVE_BINDING_BODY: &str =
+    include_str!("../../../assets/defaults/rc/default/create/S10-binding.kai");
 
 /// explorer capability allow-set. Deny-by-default means this enumerates
 /// exactly the read-oriented tools the role may use; everything else is
@@ -156,49 +103,19 @@ kj binding allow \"facade:*\"
 /// reading the compose buffer (`get_input_state`) is ungated, so a read-only
 /// role needs no facade grant. Tokens are quoted because the kaish lexer
 /// special-cases bare words containing `.`/`:`.
-const EXPLORER_BINDING_BODY: &str = "\
-# explorer: read-only allow-set (capability narrowing).
-kj binding allow \"builtin.file:read\"
-kj binding allow \"builtin.file:glob\"
-kj binding allow \"builtin.file:grep\"
-kj binding allow \"builtin.block:block_read\"
-kj binding allow \"builtin.block:block_list\"
-kj binding allow \"builtin.block:block_search\"
-kj binding allow \"builtin.block:block_status\"
-kj binding allow \"builtin.block:kernel_search\"
-kj binding allow \"builtin.resources\"
-kj binding allow \"builtin.tool_search\"
-kj binding allow \"builtin.kernel_info\"
-";
+const EXPLORER_BINDING_BODY: &str =
+    include_str!("../../../assets/defaults/rc/explorer/create/S10-binding.kai");
 
 /// The director context_type's stance: a coordination role that owns block
 /// tooling and binding administration but not raw file writes.
-const DIRECTOR_STANCE_BODY: &str = "\
-You are a director context: you coordinate work across contexts. You hold
-the full block toolset and can administer bindings, plus read access for
-context. Raw file writes are not in your loadout — delegate edits to a
-coder context via `kj fork`/`kj drive` and gather results with `kj drift`.
-";
+const DIRECTOR_STANCE_BODY: &str =
+    include_str!("../../../assets/defaults/rc/director/create/S00-stance.md");
 
 /// director capability allow-set: full block tooling + read + binding admin.
 /// `admin` is the binding-admin capability — a director may write *any*
 /// context's loadout (manage other contexts), which broad roles cannot.
-const DIRECTOR_BINDING_BODY: &str = "\
-# director: block/coordination allow-set.
-kj binding allow \"builtin.block\"
-kj binding allow \"builtin.file:read\"
-kj binding allow \"builtin.resources\"
-kj binding allow \"builtin.tool_search\"
-kj binding allow \"builtin.kernel_info\"
-kj binding allow \"builtin.bindings\"
-# Binding administration: may write any context's loadout.
-kj binding allow \"admin\"
-# Facades: full interaction surface (shell + edit + submit). `shell` covers
-# both shell and context_shell; `edit_input` covers write_input too.
-kj binding allow \"facade:shell\"
-kj binding allow \"facade:edit_input\"
-kj binding allow \"facade:submit_input\"
-";
+const DIRECTOR_BINDING_BODY: &str =
+    include_str!("../../../assets/defaults/rc/director/create/S10-binding.kai");
 
 const SEED_SCRIPTS: &[SeedScript] = &[
     // ── default context_type — broad loadout + cache recipe ─────────────

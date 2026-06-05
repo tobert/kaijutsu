@@ -1,0 +1,14 @@
+# director: block/coordination allow-set.
+kj binding allow "builtin.block"
+kj binding allow "builtin.file:read"
+kj binding allow "builtin.resources"
+kj binding allow "builtin.tool_search"
+kj binding allow "builtin.kernel_info"
+kj binding allow "builtin.bindings"
+# Binding administration: may write any context's loadout.
+kj binding allow "admin"
+# Facades: full interaction surface (shell + edit + submit). `shell` covers
+# both shell and context_shell; `edit_input` covers write_input too.
+kj binding allow "facade:shell"
+kj binding allow "facade:edit_input"
+kj binding allow "facade:submit_input"
