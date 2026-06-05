@@ -396,9 +396,27 @@ impl Tool for KjBuiltin {
             .param(ParamSchema::optional("kind", "string", Value::String(String::new()), "Block kind filter"))
             .param(ParamSchema::optional("role", "string", Value::String(String::new()), "Block role filter"))
             .param(ParamSchema::optional("status", "string", Value::String(String::new()), "Block status filter"))
-            // `kj rc add --timeout <secs>` — per-script wall-clock budget
-            // for .kai execution; omit to inherit the kernel default.
-            .param(ParamSchema::optional("timeout", "string", Value::String(String::new()), "Per-script wall-clock budget in seconds (kj rc add)"))
+            // Every long flag kj reads as a *value* must be declared here, or
+            // kaish parses `--flag value` as a bool flag + stray positional and
+            // the value is silently dropped (only the `--flag=value` form would
+            // survive). These mirror the `extract_named_arg` call sites across
+            // crates/kaijutsu-kernel/src/kj/*.rs.
+            .param(ParamSchema::optional("type", "string", Value::String(String::new()), "Context type (context_type) for create/fork; filter for rc list"))
+            .param(ParamSchema::optional("verb", "string", Value::String(String::new()), "Lifecycle verb filter (kj rc list)"))
+            .param(ParamSchema::optional("target", "string", Value::String(String::new()), "Cache target (kj cache add)").with_aliases(["-t"]))
+            .param(ParamSchema::optional("ttl", "string", Value::String(String::new()), "Cache TTL (kj cache add)"))
+            .param(ParamSchema::optional("index", "string", Value::String(String::new()), "Message index (kj cache add)").with_aliases(["-i"]))
+            .param(ParamSchema::optional("consent", "string", Value::String(String::new()), "Consent mode (kj context set)"))
+            .param(ParamSchema::optional("cwd", "string", Value::String(String::new()), "Working directory (kj context set)"))
+            .param(ParamSchema::optional("pwd", "string", Value::String(String::new()), "Working directory alias"))
+            .param(ParamSchema::optional("env", "string", Value::String(String::new()), "Env var KEY=VALUE (kj context set)"))
+            .param(ParamSchema::optional("path", "string", Value::String(String::new()), "Path argument"))
+            .param(ParamSchema::optional("desc", "string", Value::String(String::new()), "Short description"))
+            .param(ParamSchema::optional("description", "string", Value::String(String::new()), "Description"))
+            .param(ParamSchema::optional("distill-model", "string", Value::String(String::new()), "Model for drift distillation"))
+            .param(ParamSchema::optional("system-prompt", "string", Value::String(String::new()), "System prompt override (kj context set)"))
+            .param(ParamSchema::optional("max-result-bytes", "string", Value::String(String::new()), "Max result bytes"))
+            .param(ParamSchema::optional("timeout-ms", "string", Value::String(String::new()), "Timeout in milliseconds"))
             // `kj rc add|edit --content <body>` — script body. Declared so
             // kaish treats `--content "multi\nline"` as a named arg
             // (consuming the next positional) rather than a bool flag.
@@ -711,6 +729,48 @@ mod tests {
             );
         }
         let _ = beta; // touched above; keep the binding live
+    }
+
+    /// A space-separated valued flag (`--type default`) must reach kj
+    /// through kaish, not just the `--type=default` form. Regression: kaish
+    /// only treats `--flag value` as a valued arg when the flag is declared
+    /// in the kj tool schema; an undeclared `--type` was parsed as a bool
+    /// flag and the value dropped, so `kj rc list --type default` silently
+    /// listed every type. Asserts the filter actually applies.
+    #[tokio::test]
+    async fn space_separated_type_flag_reaches_kj() {
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+        let principal = PrincipalId::new();
+        let ctx = register_context(&dispatcher, Some("alpha"), None, principal);
+        let kaish = embedded_with_kj(dispatcher.clone(), ctx).await;
+
+        let res = kaish
+            .execute_with_options(
+                "kj rc list --type default",
+                ExecuteOptions::default(),
+            )
+            .await
+            .expect("kaish exec");
+        assert!(res.ok(), "kj rc list exit != 0: {res:?}");
+        let stdout = res.text_out();
+
+        assert!(
+            stdout.contains("/etc/rc/default/"),
+            "filtered list should include default paths: {stdout}"
+        );
+        // The filter must EXCLUDE other types — the whole point of --type.
+        for other in [
+            "/etc/rc/coder/",
+            "/etc/rc/mcp/",
+            "/etc/rc/director/",
+            "/etc/rc/explorer/",
+        ] {
+            assert!(
+                !stdout.contains(other),
+                "--type default must exclude {other}, got: {stdout}"
+            );
+        }
     }
 
     /// The other half of the headline guarantee: the keys `kj block list`
