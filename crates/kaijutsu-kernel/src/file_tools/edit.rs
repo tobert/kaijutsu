@@ -8,7 +8,7 @@ use crate::execution::{ExecContext, ExecResult};
 
 use super::cache::FileDocumentCache;
 use super::guard::WorkspaceGuard;
-use super::path::{deny_etc_write, resolve_str};
+use super::path::{deny_etc_write, is_rc_path, rc_write_denied, resolve_str};
 
 /// Engine for editing files via exact string replacement.
 pub struct EditEngine {
@@ -57,7 +57,17 @@ impl EditEngine {
             Err(e) => return Ok(ExecResult::failure(1, e.to_string())),
         };
 
-        if let Some(denied) = deny_etc_write(&path) {
+        // See write.rs: rc tree needs the rc-write capability; rest of /etc
+        // is denied flat.
+        if is_rc_path(&path) {
+            if !self
+                .guard
+                .as_ref()
+                .is_some_and(|g| g.context_allows_rc_write(ctx))
+            {
+                return Ok(rc_write_denied(&path));
+            }
+        } else if let Some(denied) = deny_etc_write(&path) {
             return Ok(denied);
         }
 

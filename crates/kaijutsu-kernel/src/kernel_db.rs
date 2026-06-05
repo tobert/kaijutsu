@@ -397,6 +397,7 @@ CREATE TABLE IF NOT EXISTS context_bindings (
     all_instances INTEGER NOT NULL DEFAULT 0,  -- "*"        — every broker instance
     all_facades   INTEGER NOT NULL DEFAULT 0,  -- "facade:*" — every facade surface
     binding_admin INTEGER NOT NULL DEFAULT 0,  -- "admin"    — may write any context's loadout
+    binding_rc_write INTEGER NOT NULL DEFAULT 0, -- "rc-write" — may write /etc/rc via file tools
     updated_at    INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER))
 );
 
@@ -790,6 +791,22 @@ impl KernelDb {
         Ok(())
     }
 
+    /// Additive column backfills for DBs created before a column existed.
+    /// The project's stance is "schema is truth, bump = wipe", but a single
+    /// `ADD COLUMN ... DEFAULT 0` is cheap and spares a live kernel a wipe.
+    /// Each ALTER is guarded: a "duplicate column" error on a fresh DB (the
+    /// column is already in `SCHEMA`) is expected and ignored.
+    fn apply_additive_migrations(conn: &Connection) {
+        let alters = [
+            "ALTER TABLE context_bindings ADD COLUMN binding_rc_write INTEGER NOT NULL DEFAULT 0",
+        ];
+        for sql in alters {
+            // Ignore "duplicate column name" (column already present); a real
+            // failure surfaces on the next read of the column.
+            let _ = conn.execute(sql, []);
+        }
+    }
+
     /// Open or create at the given path.
     ///
     /// The DB schema is the single source of truth — there are no
@@ -804,6 +821,7 @@ impl KernelDb {
         let conn = Connection::open(path)?;
         Self::init_connection(&conn)?;
         conn.execute_batch(SCHEMA)?;
+        Self::apply_additive_migrations(&conn);
         Self::ensure_singleton_kernel(&conn)?;
         Ok(Self { conn })
     }
@@ -813,6 +831,7 @@ impl KernelDb {
         let conn = Connection::open_in_memory()?;
         Self::init_connection(&conn)?;
         conn.execute_batch(SCHEMA)?;
+        Self::apply_additive_migrations(&conn);
         Self::ensure_singleton_kernel(&conn)?;
         Ok(Self { conn })
     }
@@ -2213,18 +2232,20 @@ impl KernelDb {
     ) -> KernelDbResult<()> {
         conn.execute(
             "INSERT INTO context_bindings
-                 (context_id, all_instances, all_facades, binding_admin, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+                 (context_id, all_instances, all_facades, binding_admin, binding_rc_write, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(context_id) DO UPDATE SET
-                 all_instances = excluded.all_instances,
-                 all_facades   = excluded.all_facades,
-                 binding_admin = excluded.binding_admin,
-                 updated_at    = excluded.updated_at",
+                 all_instances    = excluded.all_instances,
+                 all_facades      = excluded.all_facades,
+                 binding_admin    = excluded.binding_admin,
+                 binding_rc_write = excluded.binding_rc_write,
+                 updated_at       = excluded.updated_at",
             params![
                 blob_param(context_id.as_bytes()),
                 binding.all_instances as i64,
                 binding.all_facades as i64,
                 binding.binding_admin as i64,
+                binding.binding_rc_write as i64,
                 now_millis(),
             ],
         )?;
@@ -2299,10 +2320,10 @@ impl KernelDb {
         &self,
         context_id: ContextId,
     ) -> KernelDbResult<Option<ContextToolBinding>> {
-        let flags: Option<(bool, bool, bool)> = self
+        let flags: Option<(bool, bool, bool, bool)> = self
             .conn
             .query_row(
-                "SELECT all_instances, all_facades, binding_admin
+                "SELECT all_instances, all_facades, binding_admin, binding_rc_write
                  FROM context_bindings WHERE context_id = ?1",
                 params![blob_param(context_id.as_bytes())],
                 |row| {
@@ -2310,11 +2331,12 @@ impl KernelDb {
                         row.get::<_, i64>(0)? != 0,
                         row.get::<_, i64>(1)? != 0,
                         row.get::<_, i64>(2)? != 0,
+                        row.get::<_, i64>(3)? != 0,
                     ))
                 },
             )
             .ok();
-        let Some((all_instances, all_facades, binding_admin)) = flags else {
+        let Some((all_instances, all_facades, binding_admin, binding_rc_write)) = flags else {
             return Ok(None);
         };
 
@@ -2395,6 +2417,7 @@ impl KernelDb {
             all_instances,
             all_facades,
             binding_admin,
+            binding_rc_write,
             allowed_instances,
             allowed_tools,
             allowed_facades,
@@ -4132,6 +4155,7 @@ mod tests {
         original.grant(Capability::AllInstances);
         original.grant(Capability::AllFacades);
         original.grant(Capability::Admin);
+        original.grant(Capability::RcWrite);
         db.upsert_context_binding(ctx.context_id, &original).unwrap();
 
         let loaded = db
@@ -4141,6 +4165,7 @@ mod tests {
         assert!(loaded.all_instances, "all_instances survived restart");
         assert!(loaded.all_facades, "all_facades survived restart");
         assert!(loaded.binding_admin, "binding_admin survived restart");
+        assert!(loaded.binding_rc_write, "binding_rc_write survived restart");
     }
 
     #[test]

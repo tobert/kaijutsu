@@ -59,4 +59,20 @@ impl WorkspaceGuard {
             }
         }
     }
+
+    /// True if the caller's context holds the `rc-write` capability — i.e.
+    /// its loadout may write rc lifecycle scripts under `/etc/rc` via the
+    /// file tools. Deny-by-default: an unbound context (no loadout row) does
+    /// NOT hold it. A broad `"*"` / `"facade:*"` loadout does NOT imply it
+    /// either — `rc-write` is a dedicated grant so a coder can't clobber a
+    /// privileged lifecycle script by accident (an ergonomic nudge; host
+    /// `vim` and `kj rc` are unaffected). Fails closed on the deny side: a
+    /// DB error is treated as "not granted".
+    pub fn context_allows_rc_write(&self, ctx: &ExecContext) -> bool {
+        let db = self.db.lock();
+        matches!(
+            db.get_context_binding(ctx.context_id),
+            Ok(Some(b)) if b.is_rc_write()
+        )
+    }
 }

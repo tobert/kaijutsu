@@ -62,23 +62,36 @@ pub fn resolve_str(cwd: &Path, path: &str) -> Result<String, PathError> {
     Ok(resolve(cwd, path)?.to_string_lossy().into_owned())
 }
 
-/// Safe-baseline deny for writes under `/etc` via the `file:write`/`edit`
-/// tools. rc lifecycle scripts live at `/etc/rc/...` and run privileged on
-/// every fork, so letting a general file tool install them is an escalation
-/// surface: only `kj rc` (admin) and host-side editors may write there.
-/// Returns `Some(failure)` if the (already-canonicalized) path is under
-/// `/etc`, else `None`.
-///
-/// This is the conservative floor; an `rc-write` capability will later
-/// relax it per-binding (see `docs/rc-crdt-vfs-bridge.md`).
+/// True if the (already-canonicalized) path is under the rc tree
+/// (`/etc/rc` or `/etc/rc/...`). Writing here via the file tools is gated on
+/// the `rc-write` capability; everything else under `/etc` is denied flat.
+pub(crate) fn is_rc_path(canonical_path: &str) -> bool {
+    canonical_path == "/etc/rc" || canonical_path.starts_with("/etc/rc/")
+}
+
+/// The denial returned when a context without `rc-write` tries to write an
+/// rc script via the file tools. Names the deliberate paths so the nudge is
+/// actionable, not a dead end.
+pub(crate) fn rc_write_denied(path: &str) -> crate::execution::ExecResult {
+    crate::execution::ExecResult::failure(
+        1,
+        format!(
+            "file write to '{path}' needs the rc-write capability \
+             (grant it with `kj binding allow rc-write`, or edit via `kj rc` / host editor)"
+        ),
+    )
+}
+
+/// Flat deny for writes under `/etc` *outside* the rc tree via the
+/// `file:write`/`edit` tools. The rc tree (`/etc/rc`) is handled separately
+/// with the `rc-write` capability; everything else under `/etc` maps to the
+/// host's read-only root mount and is not a kaijutsu write surface. Returns
+/// `Some(failure)` if the path is under `/etc`, else `None`.
 pub(crate) fn deny_etc_write(canonical_path: &str) -> Option<crate::execution::ExecResult> {
     if canonical_path == "/etc" || canonical_path.starts_with("/etc/") {
         return Some(crate::execution::ExecResult::failure(
             1,
-            format!(
-                "file write denied under /etc: '{canonical_path}' \
-                 (rc scripts are admin-only — use `kj rc`)"
-            ),
+            format!("file write denied under /etc: '{canonical_path}'"),
         ));
     }
     None
@@ -116,14 +129,23 @@ mod tests {
     }
 
     #[test]
-    fn deny_etc_write_blocks_rc_and_etc_root() {
-        // rc scripts run privileged on every fork; the file:write tool must
-        // not be able to install them. /etc and anything under it is denied.
-        assert!(deny_etc_write("/etc/rc/coder/create/S99-evil.kai").is_some());
-        assert!(deny_etc_write("/etc/rc").is_some());
+    fn is_rc_path_identifies_the_rc_tree() {
+        assert!(is_rc_path("/etc/rc"));
+        assert!(is_rc_path("/etc/rc/coder/create/S00-stance.md"));
+        // Not the rc tree:
+        assert!(!is_rc_path("/etc/passwd"));
+        assert!(!is_rc_path("/etc"));
+        assert!(!is_rc_path("/etcrc")); // no slash boundary
+        assert!(!is_rc_path("/src/kaijutsu/foo.rs"));
+    }
+
+    #[test]
+    fn deny_etc_write_blocks_etc_but_passes_others() {
+        // The rc tree is handled by is_rc_path + rc-write capability, not here;
+        // deny_etc_write is the flat deny for the rest of /etc (host root).
         assert!(deny_etc_write("/etc").is_some());
         assert!(deny_etc_write("/etc/passwd").is_some());
-        // Everything else is allowed through (workspace guard still applies).
+        // Everything outside /etc is allowed through (workspace guard applies).
         assert!(deny_etc_write("/src/kaijutsu/foo.rs").is_none());
         assert!(deny_etc_write("/tmp/scratch").is_none());
         // Not fooled by a prefix that merely starts with the letters "etc".

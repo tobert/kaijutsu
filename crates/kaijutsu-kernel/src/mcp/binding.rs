@@ -61,6 +61,12 @@ pub enum Capability {
     /// Deliberately separate from `AllInstances`: a broad role must not become
     /// an admin just by holding "*".
     Admin,
+    /// May write rc lifecycle scripts under `/etc/rc` via the `file:write`/
+    /// `edit` tools. Deliberately separate from `AllInstances`/`AllFacades`:
+    /// a broad role (e.g. `coder` with "*") must NOT be able to clobber a
+    /// privileged lifecycle script by accident — that's an ergonomic nudge,
+    /// not a hard wall (host `vim` and `kj rc` always work).
+    RcWrite,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -76,6 +82,10 @@ pub struct ContextToolBinding {
     /// implied by `all_instances`.
     #[serde(default)]
     pub binding_admin: bool,
+    /// rc-write grant ("rc-write"): may write `/etc/rc` lifecycle scripts via
+    /// the file tools. Not implied by `all_instances`/`all_facades`.
+    #[serde(default)]
+    pub binding_rc_write: bool,
     /// Instance-wide grants; order is a tiebreaker for name resolution (§4.2).
     pub allowed_instances: Vec<InstanceId>,
     /// Tool-granular grants — `(instance, tool)` pairs allowed even when the
@@ -110,6 +120,7 @@ impl ContextToolBinding {
         !self.all_instances
             && !self.all_facades
             && !self.binding_admin
+            && !self.binding_rc_write
             && self.allowed_instances.is_empty()
             && self.allowed_tools.is_empty()
             && self.allowed_facades.is_empty()
@@ -118,6 +129,12 @@ impl ContextToolBinding {
     /// True if this context may administer bindings (its own and others').
     pub fn is_admin(&self) -> bool {
         self.binding_admin
+    }
+
+    /// True if this context may write rc lifecycle scripts under `/etc/rc`
+    /// via the file tools.
+    pub fn is_rc_write(&self) -> bool {
+        self.binding_rc_write
     }
 
     /// The single capability predicate every enforcement point consults:
@@ -143,6 +160,7 @@ impl ContextToolBinding {
             Capability::AllInstances => self.all_instances,
             Capability::AllFacades => self.all_facades,
             Capability::Admin => self.binding_admin,
+            Capability::RcWrite => self.binding_rc_write,
         }
     }
 
@@ -174,6 +192,7 @@ impl ContextToolBinding {
             Capability::AllInstances => self.all_instances = true,
             Capability::AllFacades => self.all_facades = true,
             Capability::Admin => self.binding_admin = true,
+            Capability::RcWrite => self.binding_rc_write = true,
         }
     }
 
@@ -192,6 +211,7 @@ impl ContextToolBinding {
             Capability::AllInstances => self.all_instances = false,
             Capability::AllFacades => self.all_facades = false,
             Capability::Admin => self.binding_admin = false,
+            Capability::RcWrite => self.binding_rc_write = false,
         }
     }
 
@@ -282,6 +302,31 @@ mod tests {
         assert!(!b.is_admin(), "all_instances must NOT imply admin");
         // And "*" does not grant facades.
         assert!(!b.allows(&Capability::Facade("shell".into())));
+        // Nor rc-write: a broad loadout (coder) must not be able to clobber
+        // a privileged /etc/rc script by accident.
+        assert!(
+            !b.allows(&Capability::RcWrite),
+            "all_instances must NOT imply rc-write"
+        );
+    }
+
+    #[test]
+    fn rc_write_is_a_dedicated_grant() {
+        // Even a maximally-broad loadout doesn't imply rc-write...
+        let mut b = ContextToolBinding::new();
+        b.grant(Capability::AllInstances);
+        b.grant(Capability::AllFacades);
+        b.grant(Capability::Admin);
+        assert!(!b.allows(&Capability::RcWrite), "broad loadout ≠ rc-write");
+        assert!(!b.is_rc_write());
+        // ...but an explicit grant does, and revoke is surgical.
+        b.grant(Capability::RcWrite);
+        assert!(b.allows(&Capability::RcWrite));
+        assert!(b.is_rc_write());
+        b.revoke_cap(&Capability::RcWrite);
+        assert!(!b.is_rc_write());
+        // Revoking rc-write left the other broad grants intact.
+        assert!(b.allows(&Capability::AllInstances) && b.is_admin());
     }
 
     #[test]

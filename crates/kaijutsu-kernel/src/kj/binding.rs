@@ -47,11 +47,14 @@ use super::{KjCaller, KjDispatcher, KjResult};
 ///   `*`        → every broker instance (`AllInstances`)
 ///   `facade:*` → every facade surface (`AllFacades`)
 ///   `admin`    → binding-admin (may write any context's loadout)
+///   `rc-write` → may write /etc/rc lifecycle scripts via the file tools
+///                (dedicated; NOT implied by `*`/`facade:*`)
 fn parse_capability(s: &str) -> Result<Capability, String> {
     match s {
         "*" => return Ok(Capability::AllInstances),
         "facade:*" => return Ok(Capability::AllFacades),
         "admin" => return Ok(Capability::Admin),
+        "rc-write" => return Ok(Capability::RcWrite),
         _ => {}
     }
     if let Some(rest) = s.strip_prefix("facade:") {
@@ -102,7 +105,7 @@ impl KjDispatcher {
             "  kj binding allow  <cap> [<ctx>]\n",
             "  kj binding revoke <cap> [<ctx>]\n",
             "  kj binding reset  [<ctx>]\n\n",
-            "  <cap>: <instance> | <instance>:<tool> | facade:<name> | * | facade:* | admin\n",
+            "  <cap>: <instance> | <instance>:<tool> | facade:<name> | * | facade:* | admin | rc-write\n",
             "  <ctx>: . (default) | .parent | <label> | <hex prefix>\n"
         )
         .to_string()
@@ -132,6 +135,7 @@ impl KjDispatcher {
                 "all_instances": b.all_instances,
                 "all_facades": b.all_facades,
                 "admin": b.binding_admin,
+                "rc_write": b.binding_rc_write,
                 "instances": b.allowed_instances.iter().map(|i| i.as_str()).collect::<Vec<_>>(),
                 "tools": b.allowed_tools.iter()
                     .map(|(i, t)| format!("{}:{}", i.as_str(), t))
@@ -181,6 +185,9 @@ impl KjDispatcher {
                 }
                 if b.binding_admin {
                     flags.push("admin");
+                }
+                if b.binding_rc_write {
+                    flags.push("rc-write");
                 }
                 let flags = if flags.is_empty() {
                     "(none)".to_string()
@@ -308,6 +315,7 @@ fn cap_label(cap: &Capability) -> String {
         Capability::AllInstances => "*".to_string(),
         Capability::AllFacades => "facade:*".to_string(),
         Capability::Admin => "admin".to_string(),
+        Capability::RcWrite => "rc-write".to_string(),
     }
 }
 
@@ -468,6 +476,8 @@ mod tests {
             parse_capability("facade:context_shell").unwrap(),
             Capability::Facade("context_shell".into())
         );
+        assert_eq!(parse_capability("admin").unwrap(), Capability::Admin);
+        assert_eq!(parse_capability("rc-write").unwrap(), Capability::RcWrite);
         assert!(parse_capability("").is_err());
         assert!(parse_capability("builtin.file:").is_err());
         assert!(parse_capability("facade:").is_err());

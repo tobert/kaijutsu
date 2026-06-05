@@ -52,7 +52,6 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ## Tool System Follow-ups (post-Phase 5)
 
-- **rc-write capability (increment 3):** rc scripts are now files under `/etc/rc` (`~/.config/kaijutsu/rc`), read by dispatch via `FileDocumentCache`; the `rc_scripts` table is gone. The remaining piece is the deny-by-default `rc-write` capability: today `builtin.file:write`/`edit` under `/etc` is *fully* denied (safe baseline in `file_tools/path.rs::deny_etc_write`), so only `kj rc` (admin) and host `vim` edit rc. Add a `Capability::RcWrite` + `"rc-write"` binding token and relax the gate per-binding so a trusted role can co-edit rc through the file tools. Design: `docs/rc-crdt-vfs-bridge.md`.
 - **`StreamingBlockHandle` implementation:** Single-block streaming primitive.
 - **LLM streaming rewrite:** Move `process_llm_stream` onto `StreamingBlockHandle`.
 - **Block content abstraction:** Blocks as containers for multiple content artifacts.

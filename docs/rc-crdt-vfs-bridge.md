@@ -1,11 +1,16 @@
 # RC Scripts on the CRDT-VFS
 
-Status: **increments 1 & 2 shipped; increment 3 (rc-write capability)
-remains.** rc scripts are now files under `/etc/rc`, read by dispatch via
-`FileDocumentCache`; the `rc_scripts` table, `RcScriptRow`, and per-script
-timeout are gone. In-kernel `file:write` under `/etc` is currently a flat
-deny (safe baseline); the per-binding `rc-write` capability is the only
-outstanding piece. Supersedes the earlier A/B/C options analysis.
+Status: **shipped (increments 1–3).** rc scripts are now files under
+`/etc/rc`, read by dispatch via `FileDocumentCache`; the `rc_scripts` table,
+`RcScriptRow`, and per-script timeout are gone. `file:write`/`edit` under
+`/etc/rc` is gated on the dedicated `Capability::RcWrite` (deny-by-default,
+*not* implied by `*`/`facade:*`); the rest of `/etc` is denied flat. Host
+`vim` and `kj rc` are unaffected. Supersedes the earlier A/B/C analysis.
+
+Per the shared-trust model this is an **ergonomic nudge**, not a security
+wall: the kernel runs with the user's full rights, so the gate exists to
+make the deliberate path (a role granted `rc-write`, or `kj rc`) easier than
+the accidental one (a `coder` clobbering a privileged lifecycle script).
 
 ## Goal
 
@@ -101,13 +106,14 @@ files are tiny, OS-cached, and behind `FileDocumentCache`'s mtime cache.
     is denied for everyone (`file_tools/path.rs::deny_etc_write`); only admin
     `kj rc` (direct cache use) and host `vim` can edit. Non-divergent.
 
-- **3 — `rc-write` capability (remaining, additive).** Add the unit
-  `Capability::RcWrite` + `"rc-write"` binding token; relax `deny_etc_write`
-  to allow `file:write`/`edit` under `/etc/rc` when a context's loadout
-  grants it. `coder` stays locked out; a trusted rc-editor / director role
-  can opt in. This realizes the chosen write-gate policy (deny-by-default,
-  per-binding grant); until it lands, the flat deny is the conservative
-  stand-in.
+- **3 — `rc-write` capability (shipped).** Added the dedicated
+  `Capability::RcWrite` + `"rc-write"` binding token (mirrors `Admin`:
+  persisted as the `binding_rc_write` column, not implied by `*`/`facade:*`).
+  The file engines gate `/etc/rc` writes on it via
+  `WorkspaceGuard::context_allows_rc_write`; `is_rc_path` separates the rc
+  tree from the flat `/etc` deny. `coder` stays locked out by default; a
+  trusted role opts in with `kj binding allow rc-write`. An additive
+  `ALTER TABLE ... ADD COLUMN` backfills pre-existing DBs (no wipe needed).
 
 ## Open questions (carried forward)
 
