@@ -7,6 +7,13 @@ kj binding allow "builtin.kernel_info"
 kj binding allow "builtin.bindings"
 # Binding administration: may write any context's loadout.
 kj binding allow "admin"
+# rc-lifecycle governance: a director owns the rc scripts. file:write/edit
+# enable the write tools; rc-write opens the /etc/rc subtree (deny-by-default,
+# not implied by the grants above). General code edits still delegate to a
+# coder context — this is for lifecycle / governance artifacts.
+kj binding allow "builtin.file:write"
+kj binding allow "builtin.file:edit"
+kj binding allow "rc-write"
 # Facades: full interaction surface (shell + edit + submit). `shell` covers
 # both shell and context_shell; `edit_input` covers write_input too.
 kj binding allow "facade:shell"
