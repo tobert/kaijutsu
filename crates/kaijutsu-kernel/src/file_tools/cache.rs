@@ -267,8 +267,18 @@ impl FileDocumentCache {
                     })
                     .unwrap_or_default();
 
+                // `edit_text` indexes in CHARACTERS (CRDT text positions),
+                // not bytes — delete the whole block by char count. Using
+                // `old_content.len()` (bytes) over-counts on multi-byte
+                // UTF-8 (e.g. 改善, em-dashes) and panics out-of-bounds.
                 self.block_store
-                    .edit_text(ctx_id, &entry.block_id, 0, content, old_content.len())
+                    .edit_text(
+                        ctx_id,
+                        &entry.block_id,
+                        0,
+                        content,
+                        old_content.chars().count(),
+                    )
                     .map_err(|e| e.to_string())?;
 
                 return Ok((entry.context_id, entry.block_id));
@@ -570,6 +580,32 @@ mod tests {
 
     fn p(s: &str) -> &std::path::Path {
         std::path::Path::new(s)
+    }
+
+    #[tokio::test]
+    async fn create_or_replace_handles_multibyte_when_cached() {
+        // Regression: create_or_replace deleted `old_content.len()` (bytes)
+        // chars from a CRDT block, panicking out-of-bounds when the cached
+        // content held multi-byte UTF-8 (the rc stance files: 改善, em-dashes,
+        // …). It must delete by CHARACTER count.
+        let (_vfs, cache) = tmp_cache().await;
+
+        // First write loads the doc into the cache (new-file path).
+        let original = "改善 — the standard we accept …\nline two";
+        cache.create_or_replace("/tmp/s.md", original).await.unwrap();
+        assert_eq!(cache.read_content("/tmp/s.md").await.unwrap(), original);
+
+        // Replace the now-cached doc with different multi-byte content of a
+        // *shorter* char length — the byte-vs-char bug overran here.
+        let replacement = "短い";
+        cache
+            .create_or_replace("/tmp/s.md", replacement)
+            .await
+            .expect("replace cached multi-byte doc must not panic");
+        assert_eq!(
+            cache.read_content("/tmp/s.md").await.unwrap(),
+            replacement
+        );
     }
 
     #[tokio::test]
