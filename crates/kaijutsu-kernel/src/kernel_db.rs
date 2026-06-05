@@ -138,31 +138,6 @@ pub struct HookScriptRow {
     pub updated_at: i64,
 }
 
-/// A run-control (rc) script row.
-///
-/// Lifecycle scripts at `/etc/rc/<context_type>/<verb>/SXX-name.{kai,md}`.
-/// Run when the corresponding lifecycle moment fires for a context whose
-/// `context_type` matches. `.kai` files execute via kaish; `.md` files
-/// become blocks. Sort order is lexical on `(sort_key, name)`.
-#[derive(Debug, Clone)]
-pub struct RcScriptRow {
-    pub context_type: String,
-    pub verb: String,       // "create" | "fork" | "attach" | "drift"
-    pub sort_key: String,   // e.g. "S05", "S010"
-    pub name: String,
-    pub extension: String,  // "kai" | "md"
-    pub content: String,
-    pub path: String,       // canonical /etc/rc/<type>/<verb>/<sort_key>-<name>.<ext>
-    pub created_at: i64,
-    pub created_by: PrincipalId,
-    /// Per-script wall-clock budget for `.kai` execution, in seconds.
-    /// `None` falls back to `TimeoutPolicy::rc_script_timeout` (the
-    /// kernel-wide default). `.md` scripts ignore this — they don't
-    /// execute. The column is nullable so existing rows hydrate to
-    /// `None` without backfill.
-    pub timeout_secs: Option<u32>,
-}
-
 /// A preset template row.
 #[derive(Debug, Clone)]
 pub struct PresetRow {
@@ -537,29 +512,10 @@ CREATE TABLE IF NOT EXISTS hook_scripts (
         DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER))
 );
 
--- ── Run-Control (rc) scripts ──────────────────────────────────────
--- Lifecycle scripts at /etc/rc/<context_type>/<verb>/SXX-name.{kai,md}.
--- Run at context.create / fork / attach / drift moments. `.kai` files
--- execute via kaish_kernel::Kernel::execute_with_vars; `.md` files are
--- inserted as blocks. Scripts are ordered lexically by sort_key, then
--- name.
-CREATE TABLE IF NOT EXISTS rc_scripts (
-    context_type TEXT    NOT NULL,
-    verb         TEXT    NOT NULL,
-    sort_key     TEXT    NOT NULL,
-    name         TEXT    NOT NULL,
-    extension    TEXT    NOT NULL,
-    content      TEXT    NOT NULL,
-    path         TEXT    NOT NULL UNIQUE,
-    created_at   INTEGER NOT NULL
-        DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
-    created_by   BLOB    NOT NULL,
-    -- Per-script wall-clock budget for .kai execution. NULL falls
-    -- back to TimeoutPolicy::rc_script_timeout (kernel-wide default).
-    -- .md scripts ignore this column.
-    timeout_secs INTEGER,
-    PRIMARY KEY (context_type, verb, sort_key, name)
-);
+-- rc lifecycle scripts are no longer table rows: they live as files under
+-- /etc/rc (~/.config/kaijutsu/rc), seeded to disk at boot. See
+-- crate::seed_scripts and kj/lifecycle.rs. A legacy `rc_scripts` table may
+-- still exist in pre-files DBs; KernelDb::legacy_rc_scripts migrates it.
 
 -- ── Claude cache breakpoints (per-context policy) ───────────────
 -- Populated by rc lifecycle scripts (create/fork/drift) via the
@@ -837,10 +793,10 @@ impl KernelDb {
     /// Open or create at the given path.
     ///
     /// The DB schema is the single source of truth — there are no
-    /// migrations. Bumping the schema requires wiping the DB. Built-in
-    /// rc lifecycle scripts (see `seed_scripts`) are seeded at every
-    /// open via INSERT OR IGNORE; user edits to seeded paths survive,
-    /// `kj rc rm` of a seeded path re-installs it on the next open.
+    /// migrations. Bumping the schema requires wiping the DB. rc lifecycle
+    /// scripts are no longer table rows — they live as files under
+    /// `/etc/rc` (see `seed_scripts` and `kj/lifecycle.rs`), seeded to disk
+    /// at server boot.
     pub fn open<P: AsRef<Path>>(path: P) -> KernelDbResult<Self> {
         if let Some(parent) = path.as_ref().parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -849,7 +805,6 @@ impl KernelDb {
         Self::init_connection(&conn)?;
         conn.execute_batch(SCHEMA)?;
         Self::ensure_singleton_kernel(&conn)?;
-        crate::seed_scripts::ensure_seeded_rc_scripts(&conn)?;
         Ok(Self { conn })
     }
 
@@ -859,17 +814,29 @@ impl KernelDb {
         Self::init_connection(&conn)?;
         conn.execute_batch(SCHEMA)?;
         Self::ensure_singleton_kernel(&conn)?;
-        crate::seed_scripts::ensure_seeded_rc_scripts(&conn)?;
         Ok(Self { conn })
     }
 
-    /// Force-overwrite built-in rc scripts from the in-code seed
-    /// (see `seed_scripts::SEED_SCRIPTS`). Powers `kj rc reseed`. With
-    /// `type_filter = Some(t)`, only scripts for context_type `t` are
-    /// touched; non-seed scripts are untouched in either case. Returns
-    /// the number of rows reseeded.
-    pub fn reseed_rc_scripts(&self, type_filter: Option<&str>) -> KernelDbResult<usize> {
-        Ok(crate::seed_scripts::reseed_rc_scripts(&self.conn, type_filter)?)
+    /// Read any legacy `rc_scripts` rows from a pre-files DB, as
+    /// `(canonical_path, content)` pairs. Used once at boot to migrate a
+    /// user's customizations onto the `/etc/rc` file tree. New DBs never
+    /// create the table, so a missing table yields an empty vec (not an
+    /// error) — the migration simply no-ops.
+    pub fn legacy_rc_scripts(&self) -> Vec<(String, String)> {
+        let mut stmt = match self
+            .conn
+            .prepare("SELECT path, content FROM rc_scripts")
+        {
+            Ok(s) => s,
+            Err(_) => return Vec::new(), // table absent on new DBs
+        };
+        let rows = match stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        rows.filter_map(|r| r.ok()).collect()
     }
 
     // ========================================================================
@@ -1986,142 +1953,6 @@ impl KernelDb {
             params![blob_param(id.as_bytes())],
         )?;
         Ok(deleted > 0)
-    }
-
-    // ========================================================================
-    // Run-control (rc) scripts
-    // ========================================================================
-
-    /// Insert a new rc script. Path collisions return a unique-violation
-    /// error mapped to `KernelDbError::AlreadyExists`.
-    pub fn insert_rc_script(&self, row: &RcScriptRow) -> KernelDbResult<()> {
-        self.conn
-            .execute(
-                "INSERT INTO rc_scripts (
-                    context_type, verb, sort_key, name,
-                    extension, content, path, created_at, created_by,
-                    timeout_secs
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                params![
-                    row.context_type,
-                    row.verb,
-                    row.sort_key,
-                    row.name,
-                    row.extension,
-                    row.content,
-                    row.path,
-                    row.created_at,
-                    blob_param(row.created_by.as_bytes()),
-                    row.timeout_secs,
-                ],
-            )
-            .map_err(|e| map_unique_violation(e, format!("rc script '{}' already exists", row.path)))?;
-        Ok(())
-    }
-
-    /// Look up a single rc script by canonical path.
-    pub fn get_rc_script(&self, path: &str) -> KernelDbResult<Option<RcScriptRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT context_type, verb, sort_key, name,
-                    extension, content, path, created_at, created_by,
-                    timeout_secs
-             FROM rc_scripts
-             WHERE path = ?1",
-        )?;
-        let mut rows = stmt.query(params![path])?;
-        if let Some(row) = rows.next()? {
-            Ok(Some(row_to_rc_script_row(row)?))
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// List rc scripts for a (context_type, verb) ordered by (sort_key,
-    /// name). Empty result is not an error — most contexts have no scripts
-    /// for any given verb.
-    pub fn list_rc_scripts(
-        &self,
-        context_type: &str,
-        verb: &str,
-    ) -> KernelDbResult<Vec<RcScriptRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT context_type, verb, sort_key, name,
-                    extension, content, path, created_at, created_by,
-                    timeout_secs
-             FROM rc_scripts
-             WHERE context_type = ?1 AND verb = ?2
-             ORDER BY sort_key ASC, name ASC",
-        )?;
-        let rows = stmt.query_map(params![context_type, verb], row_to_rc_script_row)?;
-        Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
-    }
-
-    /// List every rc script (admin / `kj rc list`).
-    pub fn list_rc_scripts_all(&self) -> KernelDbResult<Vec<RcScriptRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT context_type, verb, sort_key, name,
-                    extension, content, path, created_at, created_by,
-                    timeout_secs
-             FROM rc_scripts
-             ORDER BY context_type ASC, verb ASC, sort_key ASC, name ASC",
-        )?;
-        let rows = stmt.query_map([], row_to_rc_script_row)?;
-        Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
-    }
-
-    /// Delete an rc script by path. Returns true if it existed.
-    pub fn delete_rc_script(&self, path: &str) -> KernelDbResult<bool> {
-        let deleted = self.conn.execute(
-            "DELETE FROM rc_scripts WHERE path = ?1",
-            params![path],
-        )?;
-        Ok(deleted > 0)
-    }
-
-    /// Update an existing rc script's mutable fields (content, timeout)
-    /// while preserving structural metadata (context_type, verb, sort_key,
-    /// name, extension, created_at, created_by). `None` for a field leaves
-    /// it untouched. Returns true if the row existed.
-    pub fn update_rc_script(
-        &self,
-        path: &str,
-        content: Option<&str>,
-        timeout_secs: Option<Option<u32>>,
-    ) -> KernelDbResult<bool> {
-        // Build the UPDATE dynamically so callers can change just one
-        // field without forcing the other through a get-then-set dance.
-        // At least one of (content, timeout_secs) must be Some, otherwise
-        // the SQL has nothing to set.
-        if content.is_none() && timeout_secs.is_none() {
-            return Err(KernelDbError::Validation(
-                "update_rc_script: at least one of content or timeout_secs must be provided"
-                    .into(),
-            ));
-        }
-
-        let mut sets: Vec<&str> = Vec::new();
-        let mut binds: Vec<rusqlite::types::Value> = Vec::new();
-        if let Some(c) = content {
-            sets.push("content = ?");
-            binds.push(c.to_string().into());
-        }
-        if let Some(t) = timeout_secs {
-            sets.push("timeout_secs = ?");
-            binds.push(match t {
-                Some(n) => (n as i64).into(),
-                None => rusqlite::types::Value::Null,
-            });
-        }
-        let sql = format!(
-            "UPDATE rc_scripts SET {} WHERE path = ?",
-            sets.join(", ")
-        );
-        binds.push(path.to_string().into());
-
-        let updated = self
-            .conn
-            .execute(&sql, rusqlite::params_from_iter(binds.iter()))?;
-        Ok(updated > 0)
     }
 
     // ========================================================================
@@ -3250,21 +3081,6 @@ fn row_to_preset_row(row: &rusqlite::Row<'_>) -> SqliteResult<PresetRow> {
         consent_mode: consent_mode_from_sql(&consent_str),
         created_at: row.get(7)?,
         created_by: read_principal_id(row, 8)?,
-    })
-}
-
-fn row_to_rc_script_row(row: &rusqlite::Row<'_>) -> SqliteResult<RcScriptRow> {
-    Ok(RcScriptRow {
-        context_type: row.get(0)?,
-        verb: row.get(1)?,
-        sort_key: row.get(2)?,
-        name: row.get(3)?,
-        extension: row.get(4)?,
-        content: row.get(5)?,
-        path: row.get(6)?,
-        created_at: row.get(7)?,
-        created_by: read_principal_id(row, 8)?,
-        timeout_secs: row.get(9)?,
     })
 }
 

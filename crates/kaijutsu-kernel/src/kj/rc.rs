@@ -1,18 +1,18 @@
-//! Run-control (rc) subcommands: add, list, rm.
+//! Run-control (rc) subcommands: add, list, rm, show, edit, reseed.
 //!
-//! Manages persistent lifecycle scripts at canonical paths
-//! `/etc/rc/<context_type>/<verb>/SXX-name.{kai,md}`. The path itself is
-//! the user-facing key; structural columns (context_type, verb, sort_key,
-//! name, extension) are derived during install via `parse_rc_path`.
+//! Manages lifecycle script **files** at canonical paths
+//! `/etc/rc/<context_type>/<verb>/SXX-name.{kai,md}` (deployed under
+//! `~/.config/kaijutsu/rc/`). The path itself is the user-facing key;
+//! structural fields (context_type, verb, sort_key, name, extension) are
+//! derived from it via `parse_rc_path`.
 //!
-//! Lifecycle dispatch (Phase 5) reads scripts from this table; this
-//! module is admin-only.
+//! These commands write through the kernel's CRDT file cache (admin-only
+//! surface, so they bypass the gated `builtin.file:write` tool). Lifecycle
+//! dispatch reads the same files; see `kj/lifecycle.rs`.
 
 use kaijutsu_types::ContentType;
 use regex::Regex;
 use std::sync::OnceLock;
-
-use crate::kernel_db::RcScriptRow;
 
 use super::parse::extract_named_arg;
 use super::{KjCaller, KjDispatcher, KjResult};
@@ -62,17 +62,17 @@ pub fn parse_rc_path(path: &str) -> Result<RcPathParts, String> {
 }
 
 impl KjDispatcher {
-    pub(crate) fn dispatch_rc(&self, argv: &[String], caller: &KjCaller) -> KjResult {
+    pub(crate) async fn dispatch_rc(&self, argv: &[String], caller: &KjCaller) -> KjResult {
         if argv.is_empty() {
             return KjResult::Err(self.rc_help());
         }
         match argv[0].as_str() {
-            "add" => self.rc_add(argv, caller),
-            "list" | "ls" => self.rc_list(argv),
-            "rm" | "remove" => self.rc_rm(argv),
-            "show" | "cat" => self.rc_show(argv),
-            "edit" | "update" => self.rc_edit(argv),
-            "reseed" => self.rc_reseed(argv),
+            "add" => self.rc_add(argv, caller).await,
+            "list" | "ls" => self.rc_list(argv).await,
+            "rm" | "remove" => self.rc_rm(argv).await,
+            "show" | "cat" => self.rc_show(argv).await,
+            "edit" | "update" => self.rc_edit(argv).await,
+            "reseed" => self.rc_reseed(argv).await,
             "help" | "--help" | "-h" => {
                 KjResult::ok_ephemeral(self.rc_help(), ContentType::Markdown)
             }
@@ -82,6 +82,14 @@ impl KjDispatcher {
                 self.rc_help()
             )),
         }
+    }
+
+    /// The shared CRDT file cache that backs `/etc/rc`. `kj rc` writes go
+    /// through this (privileged, admin-only command surface) rather than the
+    /// gated `builtin.file:write` tool, so the rc-write capability gate does
+    /// not apply here.
+    fn rc_cache(&self) -> std::sync::Arc<crate::file_tools::FileDocumentCache> {
+        self.kernel().file_cache(self.block_store())
     }
 
     fn rc_help(&self) -> String {
@@ -94,19 +102,18 @@ encodes everything: `/etc/rc/<context_type>/<verb>/SXX-name.{kai,md}`.
 
 ## Commands
 
-- `kj rc add <path> [--content <body>] [--timeout <secs>]` — install a script
+- `kj rc add <path> --content <body>` — install a script
 - `kj rc list [--type=...] [--verb=...]` — list installed scripts
 - `kj rc show <path> [--json]` — print one script's content + metadata
-- `kj rc edit <path> [--content <body>] [--timeout <secs>]` — update content / timeout (preserves created_at)
+- `kj rc edit <path> --content <body>` — replace a script's content
 - `kj rc rm <path>` — remove a script
-- `kj rc reseed [--type <ctx_type>]` — overwrite built-in seed scripts from the in-code defaults (destructive: clobbers user edits to seeded paths)
+- `kj rc reseed [--type <ctx_type>]` — overwrite built-in seed scripts from the embedded defaults (destructive: clobbers edits to seeded paths)
 
-`--content` may be omitted when content is piped on stdin (e.g.
-`cat prompt.md | kj rc add /etc/rc/...`). Explicit `--content` wins
-when both are supplied.
-
-`--timeout` sets a per-script wall-clock budget for `.kai` execution;
-omit to inherit the kernel default. `.md` scripts ignore it.
+Scripts are files under `/etc/rc` (`~/.config/kaijutsu/rc/`); these
+commands edit them through the CRDT file cache. You can also edit the
+files directly with an external editor — dispatch picks up changes on the
+next lifecycle event. All `.kai` scripts run under the kernel-default
+timeout.
 
 ## Verbs
 
@@ -137,7 +144,7 @@ kj context create my-plan --type=planner
         .to_string()
     }
 
-    fn rc_add(&self, argv: &[String], caller: &KjCaller) -> KjResult {
+    async fn rc_add(&self, argv: &[String], _caller: &KjCaller) -> KjResult {
         let path = match argv.get(1) {
             Some(p) => p.clone(),
             None => {
@@ -157,111 +164,105 @@ kj context create my-plan --type=planner
             Some(c) => c,
             None => {
                 return KjResult::Err(
-                    "kj rc add: missing content\n\
-                     usage: kj rc add <path> --content <body>\n\
-                     or:    <something producing the body> | kj rc add <path>"
+                    "kj rc add: missing content\nusage: kj rc add <path> --content <body>"
                         .to_string(),
                 );
             }
         };
 
-        // Per-script wall-clock budget. Omit → falls back to the kernel
-        // policy at lifecycle dispatch time; explicit 0 is rejected
-        // (would deadlock the script). `.md` scripts accept the column
-        // but don't execute, so the value is recorded for documentation
-        // even though it has no runtime effect.
-        let timeout_secs = match extract_named_arg(argv, &["--timeout"]) {
-            None => None,
-            Some(s) => match s.parse::<u32>() {
-                Ok(0) => {
-                    return KjResult::Err(
-                        "kj rc add: --timeout must be > 0 (omit to use the kernel default)"
-                            .to_string(),
-                    );
-                }
-                Ok(n) => Some(n),
-                Err(_) => {
-                    return KjResult::Err(format!(
-                        "kj rc add: --timeout must be a positive integer (got '{s}')"
-                    ));
-                }
-            },
-        };
-
-        let row = RcScriptRow {
-            context_type: parts.context_type.clone(),
-            verb: parts.verb.clone(),
-            sort_key: parts.sort_key.clone(),
-            name: parts.name.clone(),
-            extension: parts.extension.clone(),
-            content,
-            path: path.clone(),
-            created_at: kaijutsu_types::now_millis() as i64,
-            created_by: caller.principal_id,
-            timeout_secs,
-        };
-
-        let db = self.kernel_db().lock();
-        match db.insert_rc_script(&row) {
-            Ok(()) => KjResult::ok(format!(
-                "installed rc script '{}' (type={}, verb={}, sort={}, name={})",
-                path, parts.context_type, parts.verb, parts.sort_key, parts.name
-            )),
-            Err(e) => KjResult::Err(format!("kj rc add: {e}")),
+        let cache = self.rc_cache();
+        // `add` must not clobber an existing script — use `edit` for that.
+        if cache.exists(&path).await {
+            return KjResult::Err(format!("kj rc add: '{path}' already exists (use edit)"));
         }
+        if let Err(e) = self.write_rc_file(&cache, &path, &content).await {
+            return KjResult::Err(format!("kj rc add: {e}"));
+        }
+        KjResult::ok(format!(
+            "installed rc script '{}' (type={}, verb={}, sort={}, name={})",
+            path, parts.context_type, parts.verb, parts.sort_key, parts.name
+        ))
     }
 
-    fn rc_list(&self, argv: &[String]) -> KjResult {
+    /// Write `content` to the rc file at `path` through the CRDT cache and
+    /// flush it to disk, so dispatch (which reads through the same cache)
+    /// and external tools (`vim`, readdir) all see the new bytes.
+    async fn write_rc_file(
+        &self,
+        cache: &crate::file_tools::FileDocumentCache,
+        path: &str,
+        content: &str,
+    ) -> Result<(), String> {
+        cache.create_or_replace(path, content).await?;
+        cache.mark_dirty(path);
+        cache.flush_one(path).await
+    }
+
+    async fn rc_list(&self, argv: &[String]) -> KjResult {
         let type_filter = extract_named_arg(argv, &["--type"]);
         let verb_filter = extract_named_arg(argv, &["--verb"]);
 
-        let db = self.kernel_db().lock();
-        let scripts = match db.list_rc_scripts_all() {
-            Ok(s) => s,
+        let mut paths = match self.walk_rc_paths().await {
+            Ok(p) => p,
             Err(e) => return KjResult::Err(format!("kj rc list: {e}")),
         };
+        paths.retain(|p| {
+            let parts = match parse_rc_path(p) {
+                Ok(parts) => parts,
+                Err(_) => return false, // stray non-canonical file
+            };
+            type_filter.as_ref().is_none_or(|t| parts.context_type == *t)
+                && verb_filter.as_ref().is_none_or(|v| parts.verb == *v)
+        });
+        paths.sort();
 
-        let filtered: Vec<&RcScriptRow> = scripts
-            .iter()
-            .filter(|s| match &type_filter {
-                Some(t) => s.context_type == *t,
-                None => true,
-            })
-            .filter(|s| match &verb_filter {
-                Some(v) => s.verb == *v,
-                None => true,
-            })
-            .collect();
-
-        // Iteration handles: full rc-script paths. Paths are the
-        // resolver key for `kj rc rm` / `kj rc show`, and they're absolute
-        // (`/etc/rc/<type>/<verb>/<sort>-<name>.<ext>`) so there's nothing
-        // to truncate.
-        let paths = serde_json::Value::Array(
-            filtered
-                .iter()
-                .map(|s| serde_json::Value::String(s.path.clone()))
-                .collect(),
+        // Iteration handles: full rc-script paths (the resolver key for
+        // `kj rc rm` / `kj rc show`), absolute so there's nothing to truncate.
+        let data = serde_json::Value::Array(
+            paths.iter().cloned().map(serde_json::Value::String).collect(),
         );
-
-        if filtered.is_empty() {
-            return KjResult::ok_with_data("(no rc scripts)".to_string(), paths);
+        if paths.is_empty() {
+            return KjResult::ok_with_data("(no rc scripts)".to_string(), data);
         }
-
-        let lines: Vec<String> = filtered
-            .iter()
-            .map(|s| {
-                let timeout = match s.timeout_secs {
-                    Some(n) => format!(", timeout={}s", n),
-                    None => String::new(),
-                };
-                format!("  {}  ({} bytes{})", s.path, s.content.len(), timeout)
-            })
-            .collect();
-        KjResult::ok_with_data(lines.join("\n"), paths)
+        let lines: Vec<String> = paths.iter().map(|p| format!("  {p}")).collect();
+        KjResult::ok_with_data(lines.join("\n"), data)
     }
 
-    fn rc_show(&self, argv: &[String]) -> KjResult {
+    /// Walk the `/etc/rc` tree (`<type>/<verb>/SXX-name.ext`) and return all
+    /// canonical script paths. A missing tree yields an empty list.
+    async fn walk_rc_paths(&self) -> Result<Vec<String>, String> {
+        use crate::vfs::{VfsError, VfsOps};
+        use std::path::Path;
+
+        let vfs = self.kernel().vfs();
+        // readdir, mapping "directory absent" to an empty listing.
+        async fn entries(
+            vfs: &crate::vfs::MountTable,
+            dir: &str,
+        ) -> Result<Vec<crate::vfs::DirEntry>, String> {
+            match vfs.readdir(Path::new(dir)).await {
+                Ok(e) => Ok(e),
+                Err(VfsError::NotFound(_)) | Err(VfsError::NoMountPoint(_)) => Ok(Vec::new()),
+                Err(e) => Err(format!("readdir {dir}: {e}")),
+            }
+        }
+
+        let mut out = Vec::new();
+        for type_e in entries(vfs, "/etc/rc").await?.into_iter().filter(|e| e.kind.is_dir()) {
+            let type_dir = format!("/etc/rc/{}", type_e.name);
+            for verb_e in entries(vfs, &type_dir).await?.into_iter().filter(|e| e.kind.is_dir()) {
+                let verb_dir = format!("{type_dir}/{}", verb_e.name);
+                for file_e in entries(vfs, &verb_dir).await?.into_iter().filter(|e| e.kind.is_file()) {
+                    if file_e.name.ends_with(".kai") || file_e.name.ends_with(".md") {
+                        out.push(format!("{verb_dir}/{}", file_e.name));
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    async fn rc_show(&self, argv: &[String]) -> KjResult {
         let path = match argv.get(1) {
             Some(p) => p.clone(),
             None => {
@@ -273,128 +274,84 @@ kj context create my-plan --type=planner
         };
         let json = super::parse::has_flag(argv, &["--json"]);
 
-        let row = {
-            let db = self.kernel_db().lock();
-            match db.get_rc_script(&path) {
-                Ok(Some(r)) => r,
-                Ok(None) => {
-                    return KjResult::Err(format!("kj rc show: '{path}' not found"));
-                }
-                Err(e) => return KjResult::Err(format!("kj rc show: {e}")),
-            }
+        let parts = match parse_rc_path(&path) {
+            Ok(p) => p,
+            Err(e) => return KjResult::Err(format!("kj rc show: {e}")),
+        };
+        let cache = self.rc_cache();
+        let content = match cache.read_content(&path).await {
+            Ok(c) => c,
+            Err(_) => return KjResult::Err(format!("kj rc show: '{path}' not found")),
         };
 
-        let timeout_json = match row.timeout_secs {
-            Some(n) => serde_json::Value::Number(n.into()),
-            None => serde_json::Value::Null,
-        };
+        // Metadata is derived from the canonical path; provenance lives in
+        // the CRDT block, not here.
         let record = serde_json::json!({
-            "path": row.path,
-            "context_type": row.context_type,
-            "verb": row.verb,
-            "sort_key": row.sort_key,
-            "name": row.name,
-            "extension": row.extension,
-            "timeout_secs": timeout_json,
-            "created_at": row.created_at,
-            "created_by": row.created_by.to_hex(),
-            "content_length": row.content.len(),
-            "content": row.content,
+            "path": path,
+            "context_type": parts.context_type,
+            "verb": parts.verb,
+            "sort_key": parts.sort_key,
+            "name": parts.name,
+            "extension": parts.extension,
+            "content_length": content.len(),
+            "content": content,
         });
 
         if json {
             return KjResult::ok_with_data(record.to_string(), record);
         }
 
-        let timeout_str = row
-            .timeout_secs
-            .map(|n| format!("{n}s"))
-            .unwrap_or_else(|| "(kernel default)".into());
         // Fence content with the extension so .md renders as markdown and
         // .kai displays as a shell-ish block in surfaces that highlight it.
-        let fence_tag = row.extension.as_str();
         let out = format!(
-            "path:       {}\ntype:       {}\nverb:       {}\nsort_key:   {}\nname:       {}\nextension:  {}\ntimeout:    {}\ncreated_at: {}\ncreated_by: {}\nlength:     {} bytes\n\n```{}\n{}\n```\n",
-            row.path,
-            row.context_type,
-            row.verb,
-            row.sort_key,
-            row.name,
-            row.extension,
-            timeout_str,
-            row.created_at,
-            row.created_by.to_hex(),
-            row.content.len(),
-            fence_tag,
-            row.content,
+            "path:       {}\ntype:       {}\nverb:       {}\nsort_key:   {}\nname:       {}\nextension:  {}\nlength:     {} bytes\n\n```{}\n{}\n```\n",
+            path,
+            parts.context_type,
+            parts.verb,
+            parts.sort_key,
+            parts.name,
+            parts.extension,
+            content.len(),
+            parts.extension,
+            content,
         );
         KjResult::ok_typed_with_data(out, ContentType::Markdown, record)
     }
 
-    fn rc_edit(&self, argv: &[String]) -> KjResult {
+    async fn rc_edit(&self, argv: &[String]) -> KjResult {
         let path = match argv.get(1) {
             Some(p) => p.clone(),
             None => {
                 return KjResult::Err(
-                    "kj rc edit: missing <path>\n\
-                     usage: kj rc edit <path> [--content <body>] [--timeout <secs>]"
+                    "kj rc edit: missing <path>\nusage: kj rc edit <path> --content <body>"
                         .to_string(),
                 );
             }
         };
-
-        let content = extract_named_arg(argv, &["--content"]);
-        let timeout_raw = extract_named_arg(argv, &["--timeout"]);
-
-        if content.is_none() && timeout_raw.is_none() {
-            return KjResult::Err(
-                "kj rc edit: nothing to change\n\
-                 supply --content <body> and/or --timeout <secs>"
-                    .to_string(),
-            );
+        if let Err(e) = parse_rc_path(&path) {
+            return KjResult::Err(format!("kj rc edit: {e}"));
         }
 
-        // Parse timeout if present. Allow `--timeout 0` to mean "clear
-        // the per-script override" (revert to kernel default) — this is
-        // the one path to drop a previously-set timeout without
-        // rm/add-ing the script. `rc add` still rejects 0 because there
-        // it would be the only signal you'd given for `.kai` budget.
-        let timeout_change: Option<Option<u32>> = match timeout_raw {
-            None => None,
-            Some(s) => match s.parse::<u32>() {
-                Ok(0) => Some(None),
-                Ok(n) => Some(Some(n)),
-                Err(_) => {
-                    return KjResult::Err(format!(
-                        "kj rc edit: --timeout must be a non-negative integer (got '{s}'; \
-                         use 0 to clear)"
-                    ));
-                }
-            },
+        let content = match extract_named_arg(argv, &["--content"]) {
+            Some(c) => c,
+            None => {
+                return KjResult::Err(
+                    "kj rc edit: nothing to change\nsupply --content <body>".to_string(),
+                );
+            }
         };
 
-        let db = self.kernel_db().lock();
-        match db.update_rc_script(&path, content.as_deref(), timeout_change) {
-            Ok(true) => {
-                let mut changed: Vec<&str> = Vec::new();
-                if content.is_some() {
-                    changed.push("content");
-                }
-                if timeout_change.is_some() {
-                    changed.push("timeout");
-                }
-                KjResult::ok(format!(
-                    "edited rc script '{}' ({})",
-                    path,
-                    changed.join(", ")
-                ))
-            }
-            Ok(false) => KjResult::Err(format!("kj rc edit: '{path}' not found")),
-            Err(e) => KjResult::Err(format!("kj rc edit: {e}")),
+        let cache = self.rc_cache();
+        if !cache.exists(&path).await {
+            return KjResult::Err(format!("kj rc edit: '{path}' not found"));
         }
+        if let Err(e) = self.write_rc_file(&cache, &path, &content).await {
+            return KjResult::Err(format!("kj rc edit: {e}"));
+        }
+        KjResult::ok(format!("edited rc script '{path}' (content)"))
     }
 
-    fn rc_reseed(&self, argv: &[String]) -> KjResult {
+    async fn rc_reseed(&self, argv: &[String]) -> KjResult {
         let type_filter = extract_named_arg(argv, &["--type"]);
 
         if let Some(t) = type_filter.as_deref() {
@@ -408,22 +365,37 @@ kj context create my-plan --type=planner
             }
         }
 
-        let db = self.kernel_db().lock();
-        match db.reseed_rc_scripts(type_filter.as_deref()) {
-            Ok(count) => {
-                let scope = match &type_filter {
-                    Some(t) => format!(" (context_type={t})"),
-                    None => String::new(),
-                };
-                KjResult::ok(format!(
-                    "reseeded {count} rc script(s){scope} from in-code defaults"
-                ))
+        // Write each embedded seed back through the cache (→ disk). Matches
+        // the type filter against the canonical path's context_type segment.
+        let cache = self.rc_cache();
+        let mut count = 0usize;
+        for (seed_path, body) in crate::seed_scripts::seed_files() {
+            if let Some(t) = type_filter.as_deref() {
+                let seg = seed_path
+                    .strip_prefix(crate::seed_scripts::RC_VFS_ROOT)
+                    .and_then(|r| r.split('/').next());
+                if seg != Some(t) {
+                    continue;
+                }
             }
-            Err(e) => KjResult::Err(format!("kj rc reseed: {e}")),
+            if let Err(e) = self.write_rc_file(&cache, seed_path, body).await {
+                return KjResult::Err(format!("kj rc reseed: {seed_path}: {e}"));
+            }
+            count += 1;
         }
+
+        let scope = match &type_filter {
+            Some(t) => format!(" (context_type={t})"),
+            None => String::new(),
+        };
+        KjResult::ok(format!(
+            "reseeded {count} rc script(s){scope} from embedded defaults"
+        ))
     }
 
-    fn rc_rm(&self, argv: &[String]) -> KjResult {
+    async fn rc_rm(&self, argv: &[String]) -> KjResult {
+        use crate::vfs::VfsOps;
+
         let path = match argv.get(1) {
             Some(p) => p.clone(),
             None => {
@@ -433,12 +405,16 @@ kj context create my-plan --type=planner
             }
         };
 
-        let db = self.kernel_db().lock();
-        match db.delete_rc_script(&path) {
-            Ok(true) => KjResult::ok(format!("removed rc script '{}'", path)),
-            Ok(false) => KjResult::Err(format!("kj rc rm: '{}' not found", path)),
-            Err(e) => KjResult::Err(format!("kj rc rm: {e}")),
+        let cache = self.rc_cache();
+        if !cache.exists(&path).await {
+            return KjResult::Err(format!("kj rc rm: '{path}' not found"));
         }
+        // Drop the cached CRDT doc, then unlink the backing file.
+        cache.invalidate(&path);
+        if let Err(e) = self.kernel().vfs().unlink(std::path::Path::new(&path)).await {
+            return KjResult::Err(format!("kj rc rm: unlink '{path}': {e}"));
+        }
+        KjResult::ok(format!("removed rc script '{path}'"))
     }
 }
 
@@ -517,8 +493,6 @@ mod tests {
                 s("/etc/rc/showtest/create/S00-hello.kai"),
                 s("--content"),
                 s("echo hi"),
-                s("--timeout"),
-                s("30"),
             ],
             &c,
         )
@@ -546,7 +520,6 @@ mod tests {
                 assert_eq!(obj["sort_key"].as_str(), Some("S00"));
                 assert_eq!(obj["name"].as_str(), Some("hello"));
                 assert_eq!(obj["extension"].as_str(), Some("kai"));
-                assert_eq!(obj["timeout_secs"].as_u64(), Some(30));
                 assert_eq!(obj["content"].as_str(), Some("echo hi"));
                 assert!(message.contains("echo hi"), "fenced content in message: {message}");
                 assert!(message.contains("```kai"), "extension-tagged fence: {message}");
@@ -577,9 +550,19 @@ mod tests {
         }
     }
 
-    /// `kj rc edit` updates content while preserving created_at/created_by.
+    /// Read an rc script's content back through the file cache (the same
+    /// path dispatch reads), so tests verify the on-disk file, not a row.
+    async fn read_rc(d: &KjDispatcher, path: &str) -> Option<String> {
+        d.kernel()
+            .file_cache(d.block_store())
+            .read_content(path)
+            .await
+            .ok()
+    }
+
+    /// `kj rc edit` replaces a script's content in the file.
     #[tokio::test]
-    async fn rc_edit_updates_content_preserves_metadata() {
+    async fn rc_edit_updates_content() {
         use crate::kj::test_helpers::*;
         use crate::kj::KjResult;
 
@@ -599,14 +582,6 @@ mod tests {
         )
         .await;
 
-        // Snapshot the original metadata.
-        let before = d
-            .kernel_db()
-            .lock()
-            .get_rc_script("/etc/rc/edittest/create/S00-foo.kai")
-            .unwrap()
-            .unwrap();
-
         let result = d
             .dispatch(
                 &[
@@ -621,72 +596,13 @@ mod tests {
             .await;
         assert!(matches!(result, KjResult::Ok { .. }), "edit failed: {result:?}");
 
-        let after = d
-            .kernel_db()
-            .lock()
-            .get_rc_script("/etc/rc/edittest/create/S00-foo.kai")
-            .unwrap()
-            .unwrap();
-        assert_eq!(after.content, "echo new");
-        assert_eq!(after.created_at, before.created_at, "created_at should be preserved");
-        assert_eq!(after.created_by, before.created_by, "created_by should be preserved");
+        assert_eq!(
+            read_rc(&d, "/etc/rc/edittest/create/S00-foo.kai").await.as_deref(),
+            Some("echo new"),
+        );
     }
 
-    /// `kj rc edit --timeout 0` clears the per-script override (back to
-    /// kernel default). Distinct from `rc add`, which rejects 0 because
-    /// it would be the only timeout signal in the install path.
-    #[tokio::test]
-    async fn rc_edit_timeout_zero_clears_override() {
-        use crate::kj::test_helpers::*;
-
-        let d = test_dispatcher().await;
-        let c = test_caller();
-        let s = |v: &str| v.to_string();
-
-        d.dispatch(
-            &[
-                s("rc"),
-                s("add"),
-                s("/etc/rc/edittest/create/S05-with-timeout.kai"),
-                s("--content"),
-                s("true"),
-                s("--timeout"),
-                s("45"),
-            ],
-            &c,
-        )
-        .await;
-
-        let pre = d
-            .kernel_db()
-            .lock()
-            .get_rc_script("/etc/rc/edittest/create/S05-with-timeout.kai")
-            .unwrap()
-            .unwrap();
-        assert_eq!(pre.timeout_secs, Some(45));
-
-        d.dispatch(
-            &[
-                s("rc"),
-                s("edit"),
-                s("/etc/rc/edittest/create/S05-with-timeout.kai"),
-                s("--timeout"),
-                s("0"),
-            ],
-            &c,
-        )
-        .await;
-
-        let post = d
-            .kernel_db()
-            .lock()
-            .get_rc_script("/etc/rc/edittest/create/S05-with-timeout.kai")
-            .unwrap()
-            .unwrap();
-        assert_eq!(post.timeout_secs, None, "0 should clear the override");
-    }
-
-    /// `kj rc edit` with no fields to change is a user error, not a no-op.
+    /// `kj rc edit` with no --content is a user error, not a no-op.
     #[tokio::test]
     async fn rc_edit_requires_at_least_one_field() {
         use crate::kj::test_helpers::*;
@@ -753,16 +669,12 @@ mod tests {
         let result = d.dispatch(&[s("rc"), s("reseed")], &c).await;
         assert!(matches!(result, KjResult::Ok { .. }), "reseed failed: {result:?}");
 
-        let row = d
-            .kernel_db()
-            .lock()
-            .get_rc_script("/etc/rc/default/create/S20-cache.kai")
-            .unwrap()
-            .unwrap();
+        let restored = read_rc(&d, "/etc/rc/default/create/S20-cache.kai")
+            .await
+            .expect("seed file present after reseed");
         assert!(
-            row.content.contains("kj cache add --target=tools"),
-            "reseed didn't restore: {}",
-            row.content
+            restored.contains("kj cache add --target=tools"),
+            "reseed didn't restore: {restored}"
         );
     }
 

@@ -36,9 +36,30 @@ use kaijutsu_types::{
     BlockKind, ContentType, ContextId, DriftKind, ForkKind, PrincipalId, Role, Status,
 };
 
-use crate::kernel_db::RcScriptRow;
-
 use super::{KjCaller, KjDispatcher};
+
+/// One rc script resolved from the `/etc/rc` file tree for a single
+/// lifecycle run. The path is canonical (`/etc/rc/<type>/<verb>/SXX-name.ext`);
+/// `sort_key` and `extension` are parsed from the filename for ordering and
+/// dispatch. Content is read through the kernel's `FileDocumentCache`.
+pub(crate) struct RcScript {
+    pub path: String,
+    pub sort_key: String,
+    pub extension: String,
+    pub content: String,
+}
+
+/// Split an rc filename `SXX-name.ext` into `(sort_key, extension)`.
+/// `sort_key` is everything before the first `-`; `extension` is everything
+/// after the last `.`. Canonical seed/installed paths always match
+/// `parse_rc_path`, so these are well-formed; a stray file that doesn't is
+/// handled gracefully (empty sort_key / extension → skipped or errored by
+/// the caller's extension match).
+fn parse_rc_filename(name: &str) -> (String, String) {
+    let sort_key = name.split('-').next().unwrap_or("").to_string();
+    let extension = name.rsplit('.').next().unwrap_or("").to_string();
+    (sort_key, extension)
+}
 
 /// Per-drift metadata surfaced to rc scripts via `KJ_DRIFT_INFO`. Built by
 /// drift call sites and passed into `run_rc_lifecycle` as `drift_info`.
@@ -87,9 +108,9 @@ impl KjDispatcher {
             return Ok(());
         }
 
-        let (context_type, scripts) = {
+        let context_type = {
             let db = self.kernel_db().lock();
-            let ctx_type = match db.get_context(new_id) {
+            match db.get_context(new_id) {
                 Ok(Some(row)) => row.context_type,
                 Ok(None) => {
                     return Err(format!(
@@ -98,12 +119,10 @@ impl KjDispatcher {
                     ));
                 }
                 Err(e) => return Err(format!("rc lifecycle: {e}")),
-            };
-            let scripts = db
-                .list_rc_scripts(&ctx_type, verb)
-                .map_err(|e| format!("rc lifecycle: list scripts: {e}"))?;
-            (ctx_type, scripts)
+            }
         };
+
+        let scripts = self.load_rc_scripts(&context_type, verb).await?;
 
         if scripts.is_empty() {
             return Ok(());
@@ -176,12 +195,66 @@ impl KjDispatcher {
 
         Ok(())
     }
+
+    /// Load the rc scripts for `(context_type, verb)` from the `/etc/rc`
+    /// file tree, ordered lexically by filename (which is exactly
+    /// `(sort_key, name)` order). A missing directory means "no scripts for
+    /// this verb" — the common case — and returns empty, not an error. A
+    /// read failure on a present file *is* surfaced: per the
+    /// crash-over-corruption stance an unreadable stance script is
+    /// corruption, not an empty default.
+    pub(crate) async fn load_rc_scripts(
+        &self,
+        context_type: &str,
+        verb: &str,
+    ) -> Result<Vec<RcScript>, String> {
+        use crate::vfs::{VfsError, VfsOps};
+
+        let dir = format!("/etc/rc/{context_type}/{verb}");
+        let vfs = self.kernel().vfs();
+        let entries = match vfs.readdir(std::path::Path::new(&dir)).await {
+            Ok(e) => e,
+            // Directory absent → no scripts for this (type, verb).
+            Err(VfsError::NotFound(_)) | Err(VfsError::NoMountPoint(_)) => {
+                return Ok(Vec::new());
+            }
+            Err(e) => return Err(format!("rc lifecycle: readdir {dir}: {e}")),
+        };
+
+        let mut names: Vec<String> = entries
+            .into_iter()
+            .filter(|e| e.kind.is_file())
+            .map(|e| e.name)
+            .filter(|n| n.ends_with(".kai") || n.ends_with(".md"))
+            .collect();
+        // Lexical filename sort == (sort_key, name) order: the filename is
+        // `{sort_key}-{name}.{ext}`, so S00 < S10 and ties break on name.
+        names.sort();
+
+        let cache = self.kernel().file_cache(self.block_store());
+        let mut scripts = Vec::with_capacity(names.len());
+        for name in names {
+            let path = format!("{dir}/{name}");
+            let content = cache
+                .read_content(&path)
+                .await
+                .map_err(|e| format!("rc lifecycle: read {path}: {e}"))?;
+            let (sort_key, extension) = parse_rc_filename(&name);
+            scripts.push(RcScript {
+                path,
+                sort_key,
+                extension,
+                content,
+            });
+        }
+        Ok(scripts)
+    }
 }
 
 fn run_md_script(
     dispatcher: &KjDispatcher,
     new_id: ContextId,
-    script: &RcScriptRow,
+    script: &RcScript,
     principal: PrincipalId,
 ) {
     let after = dispatcher.block_store().last_block_id(new_id);
@@ -217,7 +290,7 @@ async fn run_kai_script(
     fork_kind: Option<ForkKind>,
     drift_info: Option<&DriftInfo>,
     verb: &str,
-    script: &RcScriptRow,
+    script: &RcScript,
     child_depth: u8,
     principal: PrincipalId,
 ) {
@@ -316,16 +389,10 @@ async fn run_kai_script(
         );
     }
 
-    // Per-script timeout overrides the kernel-wide default. `None`
-    // (column omitted at install time) keeps the historical behavior:
-    // every script in a lifecycle shares the kernel's
-    // `rc_script_timeout` budget. An explicit `Some(n)` lets a slow
-    // script declare its own headroom without lifting the global
-    // ceiling for unrelated work.
-    let timeout = match script.timeout_secs {
-        Some(n) => std::time::Duration::from_secs(n as u64),
-        None => kaish.timeouts().rc_script_timeout,
-    };
+    // Every `.kai` script runs under the kernel-wide `rc_script_timeout`
+    // budget. (Per-script overrides were dropped with the move to files;
+    // a `kj` knob can re-introduce them later via frontmatter/sidecar.)
+    let timeout = kaish.timeouts().rc_script_timeout;
     let opts = kaish_kernel::ExecuteOptions::new()
         .with_vars(vars)
         .with_timeout(timeout);
@@ -492,34 +559,24 @@ fn log_unwired_verb_once(verb: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel_db::RcScriptRow;
     use crate::kj::test_helpers::*;
     use kaijutsu_types::{ContextId, PrincipalId};
 
-    fn install_script(
+    /// Install an rc script as a file in the mounted `/etc/rc` tree. The
+    /// structural args (type/verb/sort/name/ext) are redundant now that the
+    /// path encodes them — kept so existing call sites stay unchanged — and
+    /// only `path` + `content` are used.
+    async fn install_script(
         dispatcher: &KjDispatcher,
         path: &str,
-        context_type: &str,
-        verb: &str,
-        sort_key: &str,
-        name: &str,
-        ext: &str,
+        _context_type: &str,
+        _verb: &str,
+        _sort_key: &str,
+        _name: &str,
+        _ext: &str,
         content: &str,
     ) {
-        let row = RcScriptRow {
-                        context_type: context_type.into(),
-            verb: verb.into(),
-            sort_key: sort_key.into(),
-            name: name.into(),
-            extension: ext.into(),
-            content: content.into(),
-            path: path.into(),
-            created_at: kaijutsu_types::now_millis() as i64,
-            created_by: PrincipalId::system(),
-            timeout_secs: None,
-        };
-        let db = dispatcher.kernel_db().lock();
-        db.insert_rc_script(&row).expect("install rc script");
+        install_rc_script_file(dispatcher, path, content).await;
     }
 
     fn argv(parts: &[&str]) -> Vec<String> {
@@ -582,7 +639,7 @@ mod tests {
             "prompt",
             "md",
             "You are a test context. Be terse.",
-        );
+        ).await;
         let caller = unjoined_caller();
         let result = d
             .dispatch(&argv(&["context", "create", "ctx-md", "--type", "test"]), &caller)
@@ -609,7 +666,7 @@ mod tests {
             "noop",
             "kai",
             "true",
-        );
+        ).await;
         let caller = unjoined_caller();
         let result = d
             .dispatch(&argv(&["context", "create", "ctx-kai", "--type", "test"]), &caller)
@@ -640,7 +697,7 @@ mod tests {
             "echo",
             "kai",
             "echo \"hello from rc\"",
-        );
+        ).await;
         let caller = unjoined_caller();
         let result = d
             .dispatch(
@@ -685,7 +742,7 @@ mod tests {
             "silent",
             "kai",
             "true",
-        );
+        ).await;
         let caller = unjoined_caller();
         let result = d
             .dispatch(
@@ -719,7 +776,7 @@ mod tests {
             "echo",
             "kai",
             "echo MODEL_MUST_NOT_SEE_THIS",
-        );
+        ).await;
         let caller = unjoined_caller();
         let result = d
             .dispatch(
@@ -780,7 +837,7 @@ mod tests {
             "slow",
             "kai",
             "sleep 10",
-        );
+        ).await;
 
         let caller = unjoined_caller();
         let started = std::time::Instant::now();
@@ -856,7 +913,7 @@ mod tests {
             "introspect",
             "kai",
             "test -n \"$KJ_CONTEXT\" && test -n \"$KJ_VERB\" && kj context list",
-        );
+        ).await;
         let caller = unjoined_caller();
         let result = d
             .dispatch(
@@ -907,7 +964,7 @@ mod tests {
             "fail",
             "kai",
             "exit 17",
-        );
+        ).await;
         install_script(
             &d,
             "/etc/rc/test/create/S10-after.md",
@@ -917,7 +974,7 @@ mod tests {
             "after",
             "md",
             "ran-after-failure",
-        );
+        ).await;
 
         let caller = unjoined_caller();
         let result = d
@@ -959,7 +1016,7 @@ mod tests {
             "banner",
             "md",
             "attach-banner-content",
-        );
+        ).await;
 
         let principal = PrincipalId::new();
         let target = register_context(&d, Some("attach-target"), None, principal);
@@ -990,7 +1047,7 @@ mod tests {
             "noop",
             "md",
             "would-run",
-        );
+        ).await;
         let mut caller = unjoined_caller();
         caller.rc_depth = MAX_RC_DEPTH; // simulate already-deep invocation
 
@@ -1057,7 +1114,7 @@ case "$KJ_DRIFT_INFO" in
   *) exit 5 ;;
 esac
 "#,
-        );
+        ).await;
 
         let principal = PrincipalId::new();
         let dst = register_context(&d, Some("dst"), None, principal);
@@ -1112,7 +1169,7 @@ case "$KJ_DRIFT_INFO" in
   *) exit 3 ;;
 esac
 "#,
-        );
+        ).await;
 
         let principal = PrincipalId::new();
         let parent = register_context(&d, Some("parent"), None, principal);
@@ -1157,7 +1214,7 @@ esac
             "marker",
             "md",
             "DRIFT-MARKER",
-        );
+        ).await;
 
         let principal = PrincipalId::new();
         let src = register_context(&d, Some("src"), None, principal);
@@ -1207,7 +1264,7 @@ esac
             "fail",
             "kai",
             "exit 17",
-        );
+        ).await;
         install_script(
             &d,
             "/etc/rc/test/drift/S10-after.md",
@@ -1217,7 +1274,7 @@ esac
             "after",
             "md",
             "AFTER-MARKER",
-        );
+        ).await;
 
         let principal = PrincipalId::new();
         let src = register_context(&d, Some("src"), None, principal);
@@ -1268,7 +1325,7 @@ esac
             "fork-marker",
             "md",
             "FORK-MARKER",
-        );
+        ).await;
         install_script(
             &d,
             "/etc/rc/test/drift/S00-drift.md",
@@ -1278,7 +1335,7 @@ esac
             "drift-marker",
             "md",
             "DRIFT-MARKER",
-        );
+        ).await;
 
         let caller = unjoined_caller();
         let r = d
@@ -1379,7 +1436,7 @@ case "$KJ_PARENT_BLOCK_COUNT" in
   *) exit 3 ;;
 esac
 "#,
-        );
+        ).await;
 
         // Parent context, typed "test" so the fork hook above fires.
         let caller = unjoined_caller();
@@ -1461,7 +1518,7 @@ esac
             r#"
 test -z "$KJ_PARENT_BLOCK_COUNT" || exit 99
 "#,
-        );
+        ).await;
 
         let caller = unjoined_caller();
         let r = d
@@ -1493,7 +1550,7 @@ test -z "$KJ_PARENT_BLOCK_COUNT" || exit 99
             "only-create",
             "md",
             "CREATE-MARKER",
-        );
+        ).await;
         install_script(
             &d,
             "/etc/rc/test/fork/S00-only-fork.md",
@@ -1503,7 +1560,7 @@ test -z "$KJ_PARENT_BLOCK_COUNT" || exit 99
             "only-fork",
             "md",
             "FORK-MARKER",
-        );
+        ).await;
 
         // Step 1: create parent (CREATE-MARKER appears in parent).
         let caller = unjoined_caller();
@@ -1545,129 +1602,17 @@ test -z "$KJ_PARENT_BLOCK_COUNT" || exit 99
         );
     }
 
-    // ── Per-script wall-clock budgets ─────────────────────────────────
-
-    /// Same shape as `install_script` but with an explicit per-script
-    /// timeout. `None` keeps the current behavior (kernel-default).
-    fn install_script_with_timeout(
-        dispatcher: &KjDispatcher,
-        path: &str,
-        context_type: &str,
-        verb: &str,
-        sort_key: &str,
-        name: &str,
-        ext: &str,
-        content: &str,
-        timeout_secs: Option<u32>,
-    ) {
-        let row = RcScriptRow {
-                        context_type: context_type.into(),
-            verb: verb.into(),
-            sort_key: sort_key.into(),
-            name: name.into(),
-            extension: ext.into(),
-            content: content.into(),
-            path: path.into(),
-            created_at: kaijutsu_types::now_millis() as i64,
-            created_by: PrincipalId::system(),
-            timeout_secs,
-        };
-        let db = dispatcher.kernel_db().lock();
-        db.insert_rc_script(&row).expect("install rc script");
-    }
-
-    /// A per-script timeout SHORTER than the kernel default kills a
-    /// runaway script and produces an error block. Kernel default is the
-    /// 30s production value; the script declares a 1s budget and sleeps
-    /// for 3s — without the override, the script would run to completion
-    /// and the test would erroneously pass.
+    /// All `.kai` scripts run under the kernel-wide `rc_script_timeout`
+    /// (per-script overrides were dropped with the move to files). Pin it
+    /// to 200ms, well under the script's 1s sleep, and confirm the runaway
+    /// script is killed with an Error block and never completes.
     #[tokio::test]
-    async fn rc_per_script_timeout_overrides_kernel_default_shorter() {
-        let d = test_dispatcher().await;
-        install_script_with_timeout(
-            &d,
-            "/etc/rc/test/create/S00-slow.kai",
-            "test",
-            "create",
-            "S00",
-            "slow",
-            "kai",
-            "sleep 3 && echo never-reached",
-            Some(1),
-        );
-
-        let caller = unjoined_caller();
-        let result = d
-            .dispatch(&argv(&["context", "create", "ctx-slow", "--type", "test"]), &caller)
-            .await;
-        assert!(result.is_ok(), "create failed: {}", result.message());
-
-        let new_id = lookup_context_id(&d, "ctx-slow");
-        let kinds = block_kinds_in(&d, new_id);
-        assert!(
-            kinds.contains(&kaijutsu_types::BlockKind::Error),
-            "1s per-script timeout must kill 3s sleep; kinds: {kinds:?}"
-        );
-        let contents = block_contents_in(&d, new_id);
-        assert!(
-            !contents.iter().any(|c| c.contains("never-reached")),
-            "script body must not have completed; contents: {contents:?}"
-        );
-    }
-
-    /// A per-script timeout LONGER than the kernel default lets a slow
-    /// script finish even when the kernel-wide budget would have killed
-    /// it. Pin the kernel's `rc_script_timeout` to 200ms (well below the
-    /// script's 1s sleep) and give the script a 5s override; assert
-    /// success.
-    #[tokio::test]
-    async fn rc_per_script_timeout_overrides_kernel_default_longer() {
+    async fn rc_kernel_default_timeout_kills_runaway_script() {
         let mut policy = kaijutsu_types::TimeoutPolicy::default();
         policy.rc_script_timeout = std::time::Duration::from_millis(200);
         let d = crate::kj::test_helpers::test_dispatcher_with_timeouts(policy).await;
 
-        install_script_with_timeout(
-            &d,
-            "/etc/rc/test/create/S00-slow.kai",
-            "test",
-            "create",
-            "S00",
-            "slow",
-            "kai",
-            "sleep 1 && echo done-anyway",
-            Some(5),
-        );
-
-        let caller = unjoined_caller();
-        let result = d
-            .dispatch(&argv(&["context", "create", "ctx-slow-ok", "--type", "test"]), &caller)
-            .await;
-        assert!(result.is_ok(), "create failed: {}", result.message());
-
-        let new_id = lookup_context_id(&d, "ctx-slow-ok");
-        let kinds = block_kinds_in(&d, new_id);
-        assert!(
-            !kinds.contains(&kaijutsu_types::BlockKind::Error),
-            "5s per-script override must let 1s sleep complete despite 200ms kernel default; \
-             kinds: {kinds:?}, contents: {:?}",
-            block_contents_in(&d, new_id),
-        );
-    }
-
-    /// Without a per-script override, the kernel-default timeout still
-    /// applies. Same setup as the override test but with `timeout_secs:
-    /// None` — the 200ms kernel default kills the 1s sleep. Pinned so a
-    /// future regression that drops the override branch and falls back
-    /// to "always use kernel default" is still detected (this test would
-    /// pass on broken code; the override-longer test is what catches it).
-    /// Kept here as the symmetric boundary check.
-    #[tokio::test]
-    async fn rc_kernel_default_timeout_kills_script_without_override() {
-        let mut policy = kaijutsu_types::TimeoutPolicy::default();
-        policy.rc_script_timeout = std::time::Duration::from_millis(200);
-        let d = crate::kj::test_helpers::test_dispatcher_with_timeouts(policy).await;
-
-        install_script_with_timeout(
+        install_script(
             &d,
             "/etc/rc/test/create/S00-slow.kai",
             "test",
@@ -1676,8 +1621,8 @@ test -z "$KJ_PARENT_BLOCK_COUNT" || exit 99
             "slow",
             "kai",
             "sleep 1 && echo never-reached",
-            None,
-        );
+        )
+        .await;
 
         let caller = unjoined_caller();
         let result = d
@@ -1689,7 +1634,12 @@ test -z "$KJ_PARENT_BLOCK_COUNT" || exit 99
         let kinds = block_kinds_in(&d, new_id);
         assert!(
             kinds.contains(&kaijutsu_types::BlockKind::Error),
-            "200ms kernel default must kill 1s sleep without override; kinds: {kinds:?}"
+            "200ms kernel default must kill 1s sleep; kinds: {kinds:?}"
+        );
+        let contents = block_contents_in(&d, new_id);
+        assert!(
+            !contents.iter().any(|c| c.contains("never-reached")),
+            "script body must not have completed; contents: {contents:?}"
         );
     }
 }

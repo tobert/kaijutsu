@@ -312,7 +312,7 @@ impl KjDispatcher {
             return self.dispatch_cas(&argv[1..], caller);
         }
         if cmd == "rc" {
-            return self.dispatch_rc(&argv[1..], caller);
+            return self.dispatch_rc(&argv[1..], caller).await;
         }
         // `kj block` operates by --context ref when given one, so it can
         // run without an active context.
@@ -490,7 +490,31 @@ pub(crate) mod test_helpers {
                 .unwrap();
         }
         let kernel = Arc::new(Kernel::new("test", None).await.with_timeouts(policy));
+        // Mount a private, seeded /etc/rc tree so rc tests exercise the real
+        // file-backed dispatch path (readdir + FileDocumentCache). The temp
+        // dir is intentionally leaked — it lives for the test process.
+        let rc_tmp = std::env::temp_dir()
+            .join(format!("kj-rc-test-{}", ContextId::new().to_hex()));
+        std::fs::create_dir_all(&rc_tmp).expect("create rc test dir");
+        crate::seed_scripts::ensure_rc_seed_files(&rc_tmp).expect("seed rc test files");
+        kernel
+            .mount("/etc/rc", crate::vfs::LocalBackend::new(&rc_tmp))
+            .await;
         KjDispatcher::new(drift, blocks, kernel_db, kernel)
+    }
+
+    /// Install an rc script as a file in the mounted `/etc/rc` tree, through
+    /// the same CRDT cache `kj rc` uses. Async because the cache flush is.
+    pub async fn install_rc_script_file(dispatcher: &KjDispatcher, path: &str, content: &str) {
+        let cache = dispatcher
+            .kernel()
+            .file_cache(dispatcher.block_store());
+        cache
+            .create_or_replace(path, content)
+            .await
+            .expect("write rc script file");
+        cache.mark_dirty(path);
+        cache.flush_one(path).await.expect("flush rc script file");
     }
 
     /// Create a KjCaller with fresh IDs for testing.

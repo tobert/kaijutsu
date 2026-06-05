@@ -1,9 +1,11 @@
 # RC Scripts on the CRDT-VFS
 
-Status: **decided; landing in increments.** Increment 1 (seed bodies →
-repo asset files) is shipped. The files-as-truth migration is in progress.
-Supersedes the earlier A/B/C options analysis — the chosen architecture is
-recorded below.
+Status: **increments 1 & 2 shipped; increment 3 (rc-write capability)
+remains.** rc scripts are now files under `/etc/rc`, read by dispatch via
+`FileDocumentCache`; the `rc_scripts` table, `RcScriptRow`, and per-script
+timeout are gone. In-kernel `file:write` under `/etc` is currently a flat
+deny (safe baseline); the per-binding `rc-write` capability is the only
+outstanding piece. Supersedes the earlier A/B/C options analysis.
 
 ## Goal
 
@@ -83,24 +85,29 @@ files are tiny, OS-cached, and behind `FileDocumentCache`'s mtime cache.
   unchanged (still seeds the table); the files are now vim-able. Commit
   `refactor(rc): extract seed bodies to assets/defaults/rc files`.
 
-- **2 — Files-as-truth (the migration, atomic switch).**
-  - Mount `~/.config/kaijutsu/rc` → `/etc/rc` rw before freeze; seed-to-disk
-    floor on boot; `kj rc reseed` rewrites files.
-  - `run_rc_lifecycle`: `readdir /etc/rc/<type>/<verb>/`, sort by filename,
-    read each via `FileDocumentCache`. `.md` → block; `.kai` → kaish with the
-    kernel-default timeout.
-  - `kj rc add/edit/rm/show/list` operate through the cache, not rows.
-  - Remove `rc_scripts` table, `RcScriptRow`, and CRUD. One-time migration:
-    any existing rows → files on first boot (no data loss). Rewrite the
-    lifecycle/rc/seed tests against an `/etc/rc` mount in `test_dispatcher`.
-  - Write policy here is the **safe baseline**: tool-writes to `/etc/rc` are
-    denied for everyone; only admin `kj rc` (direct cache use) and host `vim`
-    can edit. This is a non-divergent, shippable state on its own.
+- **2 — Files-as-truth (shipped).** The atomic DB→files switch:
+  - Mount `~/.config/kaijutsu/rc` → `/etc/rc` rw before freeze
+    (`rpc.rs`); seed-to-disk floor on boot; `kj rc reseed` rewrites files.
+  - `run_rc_lifecycle` (`kj/lifecycle.rs`): `readdir /etc/rc/<type>/<verb>/`,
+    sort by filename, read each via `FileDocumentCache`. `.md` → block;
+    `.kai` → kaish with the kernel-default timeout.
+  - `kj rc add/edit/rm/show/list` operate through the cache, not rows
+    (`kj/rc.rs`, now async).
+  - Removed the `rc_scripts` table, `RcScriptRow`, CRUD, and per-script
+    timeout. One-time migration: legacy rows → files on first boot
+    (`KernelDb::legacy_rc_scripts`, no data loss). Tests rewritten against a
+    seeded `/etc/rc` mount in `test_dispatcher`.
+  - Write policy is the **safe baseline**: `file:write`/`edit` under `/etc`
+    is denied for everyone (`file_tools/path.rs::deny_etc_write`); only admin
+    `kj rc` (direct cache use) and host `vim` can edit. Non-divergent.
 
-- **3 — `rc-write` capability (opt-in widening, additive).** Add the unit
-  `Capability::RcWrite` + `"rc-write"` binding token; relax the `/etc/rc`
-  write gate to allow `file:write`/`edit` when a context's loadout grants it.
-  `coder` stays locked out; a trusted rc-editor / director role can opt in.
+- **3 — `rc-write` capability (remaining, additive).** Add the unit
+  `Capability::RcWrite` + `"rc-write"` binding token; relax `deny_etc_write`
+  to allow `file:write`/`edit` under `/etc/rc` when a context's loadout
+  grants it. `coder` stays locked out; a trusted rc-editor / director role
+  can opt in. This realizes the chosen write-gate policy (deny-by-default,
+  per-binding grant); until it lands, the flat deny is the conservative
+  stand-in.
 
 ## Open questions (carried forward)
 

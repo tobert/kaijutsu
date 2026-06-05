@@ -101,7 +101,6 @@ roll back the attach — consistent with create / fork / drift verbs.
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel_db::RcScriptRow;
     use crate::kj::test_helpers::*;
     use kaijutsu_types::{ContextId, PrincipalId, SessionId};
 
@@ -129,20 +128,9 @@ mod tests {
             .expect("set context_type");
     }
 
-    fn install_attach_script(d: &KjDispatcher, ctx_type: &str, content: &str, ext: &str) {
-        let row = RcScriptRow {
-            context_type: ctx_type.into(),
-            verb: "attach".into(),
-            sort_key: "S00".into(),
-            name: "marker".into(),
-            extension: ext.into(),
-            content: content.into(),
-            path: format!("/etc/rc/{ctx_type}/attach/S00-marker.{ext}"),
-            created_at: kaijutsu_types::now_millis() as i64,
-            created_by: PrincipalId::system(),
-            timeout_secs: None,
-        };
-        d.kernel_db().lock().insert_rc_script(&row).unwrap();
+    async fn install_attach_script(d: &KjDispatcher, ctx_type: &str, content: &str, ext: &str) {
+        let path = format!("/etc/rc/{ctx_type}/attach/S00-marker.{ext}");
+        install_rc_script_file(d, &path, content).await;
     }
 
     fn block_contents(d: &KjDispatcher, ctx: ContextId) -> Vec<String> {
@@ -168,7 +156,7 @@ mod tests {
         let target = register_context(&d, Some("planner"), None, principal);
         set_context_type(&d, target, "planner");
 
-        install_attach_script(&d, "planner", "attach-marker", "md");
+        install_attach_script(&d, "planner", "attach-marker", "md").await;
 
         let caller = unjoined_caller();
         let result = d.dispatch(&[s("attach"), s("planner")], &caller).await;
@@ -204,7 +192,8 @@ mod tests {
             // produces an Error block.
             "test -n \"$KJ_CONTEXT\" || exit 1\ncase \"$KJ_VERB\" in attach) ;; *) exit 2 ;; esac",
             "kai",
-        );
+        )
+        .await;
 
         let caller = unjoined_caller();
         let result = d.dispatch(&[s("attach"), s("watched")], &caller).await;

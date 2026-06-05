@@ -995,6 +995,25 @@ pub async fn create_shared_kernel(
         .map(|p| p.to_path_buf())
         .unwrap_or_else(self::config_dir)
         .join("rc");
+    // One-time migration: a pre-files DB may carry user `kj rc add/edit`
+    // customizations in the legacy rc_scripts table. Write them to disk
+    // first (only if the file is absent) so the floor seed below doesn't
+    // shadow them. New DBs have no such table → this is a no-op.
+    for (path, content) in kernel_db.legacy_rc_scripts() {
+        if let Some(rel) = path.strip_prefix(kaijutsu_kernel::seed_scripts::RC_VFS_ROOT) {
+            let dest = rc_dir.join(rel);
+            if !dest.exists() {
+                if let Some(parent) = dest.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if let Err(e) = std::fs::write(&dest, &content) {
+                    log::error!("rc migration: write {}: {e}", dest.display());
+                } else {
+                    log::info!("rc migration: {path} -> {}", dest.display());
+                }
+            }
+        }
+    }
     match kaijutsu_kernel::seed_scripts::ensure_rc_seed_files(&rc_dir) {
         Ok(n) if n > 0 => log::info!("seeded {n} rc script file(s) into {}", rc_dir.display()),
         Ok(_) => {}

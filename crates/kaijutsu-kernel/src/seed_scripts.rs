@@ -1,4 +1,5 @@
-//! Built-in rc lifecycle scripts seeded into the kernel DB on open.
+//! Built-in rc lifecycle scripts, embedded at build time and seeded onto
+//! the deployed `/etc/rc` tree (`~/.config/kaijutsu/rc/`) on first boot.
 //!
 //! These are the "floor" that every kernel boots with. Two purposes:
 //!
@@ -7,54 +8,37 @@
 //!   applied to every context that doesn't opt into a different
 //!   `context_type`. Without this seed, fresh kernels miss all cache
 //!   breakpoints until the user installs them by hand.
-//! - `/etc/rc/coder/**` — the worked example of a real context_type.
-//!   Includes an `S00-stance.md` so the kernel-side coding contract is
-//!   self-contained (independent of any per-client CLAUDE.md), plus the
-//!   same cache recipe as `default`.
+//! - `/etc/rc/<type>/**` — the worked examples of real context_types
+//!   (coder, mcp, explorer, director). Each ships an `S00-stance.md` so the
+//!   kernel-side contract is self-contained (independent of any per-client
+//!   CLAUDE.md), a binding loadout, and the cache recipe.
+//!
+//! ## Storage
+//!
+//! rc scripts are **files**, not table rows. The bodies live as real files
+//! under `assets/defaults/rc/` (a 1:1 mirror of the `/etc/rc` tree),
+//! embedded here via `include_str!`. [`ensure_rc_seed_files`] writes them to
+//! the deployed tree if absent (the floor); [`reseed_rc_files`] force-
+//! overwrites from these defaults. Dispatch reads the deployed files; see
+//! `kj/lifecycle.rs`.
 //!
 //! ## Seed contract
 //!
-//! `ensure_seeded_rc_scripts` runs at `KernelDb::open` / `in_memory` via
-//! `INSERT OR IGNORE` on the rc_scripts unique-path index. Effects:
+//! Boot writes each embedded default to disk **only if the file is absent**:
 //!
-//! - Fresh DB: every seed row inserts.
-//! - Re-open with seeds intact: no-op (path collision ignored).
-//! - User rm'd a seed: it reappears on the next open. This is intentional
-//!   — the seed is the floor, not a one-time gift. To override a seed,
-//!   use `kj rc edit` (replaces content in place) rather than `kj rc rm`.
+//! - Fresh install: every seed file is created.
+//! - Re-open with files intact: no-op (file exists → skipped).
+//! - User `rm`'d a seed: it reappears on the next boot. The seed is the
+//!   floor, not a one-time gift. To override a seed, edit the file in place
+//!   (`kj rc edit` or host `vim`) rather than removing it.
 //!
 //! ## Updating the seed
 //!
-//! The script bodies live as real files under `assets/defaults/rc/` (a
-//! 1:1 mirror of the `/etc/rc` tree), embedded here via `include_str!`.
-//! Edit the asset file to change what fresh DBs get — but not what
-//! already-seeded DBs have (paths collide, INSERT OR IGNORE skips).
-//! `kj rc reseed` is the explicit push-updates path: it overwrites
-//! matching paths from these embedded defaults.
+//! Edit the asset file under `assets/defaults/rc/` to change what fresh
+//! installs get — but not what already-deployed trees have (the file
+//! exists, so the floor skips it). `kj rc reseed` is the explicit push-
+//! updates path: it overwrites matching files from these embedded defaults.
 
-use rusqlite::{params, Connection, Result as SqliteResult};
-
-use kaijutsu_types::PrincipalId;
-
-use crate::kernel_db::blob_param;
-
-/// One entry in the seed table. `timeout_secs = None` lets the kernel
-/// default apply (only meaningful for `.kai` rows; `.md` ignores it).
-struct SeedScript {
-    path: &'static str,
-    context_type: &'static str,
-    verb: &'static str,
-    sort_key: &'static str,
-    name: &'static str,
-    extension: &'static str,
-    content: &'static str,
-    timeout_secs: Option<u32>,
-}
-
-/// Universal cache recipe from `docs/help/kj-cache.md`. Shared between
-/// `default` and `coder` because every conversational context wants
-/// these breakpoints; the duplication is fine until a third consumer
-/// shows up.
 // Bodies live as real files under `assets/defaults/rc/` (a 1:1 mirror of
 // the `/etc/rc` tree) so they can be edited with an external editor and
 // reviewed as files. `include_str!` embeds them at build time. Shared
@@ -69,385 +53,65 @@ const CACHE_FORK_BODY: &str =
 const CACHE_DRIFT_BODY: &str =
     include_str!("../../../assets/defaults/rc/default/drift/S40-cache.kai");
 
-/// The coder context_type's system-prompt stance. Drawn from the
-/// project's cybernetic / kaizen directives — restated in-kernel so the
-/// contract doesn't depend on which client connected.
 const CODER_STANCE_BODY: &str =
     include_str!("../../../assets/defaults/rc/coder/create/S00-stance.md");
 
-/// The `mcp` context_type's stance. This is the default mode for a context
-/// born from `register_session` — an external agent (Claude Code, Gemini CLI,
-/// opencode) driving the kernel over the narrow MCP surface, with
-/// `context_shell` as the entry point and `kj` as the rich command surface.
 const MCP_STANCE_BODY: &str =
     include_str!("../../../assets/defaults/rc/mcp/create/S00-stance.md");
 
-/// The explorer context_type's stance: a read-only role for investigation
-/// without mutation. Pairs with the capability allow-set below — the stance
-/// tells the model what it is; the binding enforces it.
 const EXPLORER_STANCE_BODY: &str =
     include_str!("../../../assets/defaults/rc/explorer/create/S00-stance.md");
 
-/// The broad loadout for human-facing / general roles (`default`, `coder`,
-/// `mcp`). Deny-by-default everywhere, so permissiveness is explicit: `*` =
-/// every instance, `facade:*` = every facade. Does **not** grant `admin` —
-/// these roles can use everything but cannot rebind *other* contexts (that's
-/// the director role). The rc lifecycle runs privileged, so this widen from
-/// deny-all is allowed; an agent could not issue it at runtime.
-const PERMISSIVE_BINDING_BODY: &str =
-    include_str!("../../../assets/defaults/rc/default/create/S10-binding.kai");
-
-/// explorer capability allow-set. Deny-by-default means this enumerates
-/// exactly the read-oriented tools the role may use; everything else is
-/// refused at `call_tool`. No facades — shell/edit/submit are withheld, and
-/// reading the compose buffer (`get_input_state`) is ungated, so a read-only
-/// role needs no facade grant. Tokens are quoted because the kaish lexer
-/// special-cases bare words containing `.`/`:`.
-const EXPLORER_BINDING_BODY: &str =
-    include_str!("../../../assets/defaults/rc/explorer/create/S10-binding.kai");
-
-/// The director context_type's stance: a coordination role that owns block
-/// tooling and binding administration but not raw file writes.
 const DIRECTOR_STANCE_BODY: &str =
     include_str!("../../../assets/defaults/rc/director/create/S00-stance.md");
 
-/// director capability allow-set: full block tooling + read + binding admin.
-/// `admin` is the binding-admin capability — a director may write *any*
-/// context's loadout (manage other contexts), which broad roles cannot.
+const PERMISSIVE_BINDING_BODY: &str =
+    include_str!("../../../assets/defaults/rc/default/create/S10-binding.kai");
+
+const EXPLORER_BINDING_BODY: &str =
+    include_str!("../../../assets/defaults/rc/explorer/create/S10-binding.kai");
+
 const DIRECTOR_BINDING_BODY: &str =
     include_str!("../../../assets/defaults/rc/director/create/S10-binding.kai");
 
-const SEED_SCRIPTS: &[SeedScript] = &[
-    // ── default context_type — broad loadout + cache recipe ─────────────
-    // S10 must precede any rc script that calls a broker tool: deny-by-default
-    // means tool calls before the loadout is assigned would be refused.
-    SeedScript {
-        path: "/etc/rc/default/create/S10-binding.kai",
-        context_type: "default",
-        verb: "create",
-        sort_key: "S10",
-        name: "binding",
-        extension: "kai",
-        content: PERMISSIVE_BINDING_BODY,
-        timeout_secs: None,
-    },
-    SeedScript {
-        path: "/etc/rc/default/create/S20-cache.kai",
-        context_type: "default",
-        verb: "create",
-        sort_key: "S20",
-        name: "cache",
-        extension: "kai",
-        content: CACHE_CREATE_BODY,
-        timeout_secs: None,
-    },
-    SeedScript {
-        path: "/etc/rc/default/fork/S30-cache.kai",
-        context_type: "default",
-        verb: "fork",
-        sort_key: "S30",
-        name: "cache",
-        extension: "kai",
-        content: CACHE_FORK_BODY,
-        timeout_secs: None,
-    },
-    SeedScript {
-        path: "/etc/rc/default/drift/S40-cache.kai",
-        context_type: "default",
-        verb: "drift",
-        sort_key: "S40",
-        name: "cache",
-        extension: "kai",
-        content: CACHE_DRIFT_BODY,
-        timeout_secs: None,
-    },
-    // ── coder context_type — stance + broad loadout + cache ─────────────
-    SeedScript {
-        path: "/etc/rc/coder/create/S00-stance.md",
-        context_type: "coder",
-        verb: "create",
-        sort_key: "S00",
-        name: "stance",
-        extension: "md",
-        content: CODER_STANCE_BODY,
-        timeout_secs: None,
-    },
-    SeedScript {
-        path: "/etc/rc/coder/create/S10-binding.kai",
-        context_type: "coder",
-        verb: "create",
-        sort_key: "S10",
-        name: "binding",
-        extension: "kai",
-        content: PERMISSIVE_BINDING_BODY,
-        timeout_secs: None,
-    },
-    SeedScript {
-        path: "/etc/rc/coder/create/S20-cache.kai",
-        context_type: "coder",
-        verb: "create",
-        sort_key: "S20",
-        name: "cache",
-        extension: "kai",
-        content: CACHE_CREATE_BODY,
-        timeout_secs: None,
-    },
-    SeedScript {
-        path: "/etc/rc/coder/fork/S30-cache.kai",
-        context_type: "coder",
-        verb: "fork",
-        sort_key: "S30",
-        name: "cache",
-        extension: "kai",
-        content: CACHE_FORK_BODY,
-        timeout_secs: None,
-    },
-    SeedScript {
-        path: "/etc/rc/coder/drift/S40-cache.kai",
-        context_type: "coder",
-        verb: "drift",
-        sort_key: "S40",
-        name: "cache",
-        extension: "kai",
-        content: CACHE_DRIFT_BODY,
-        timeout_secs: None,
-    },
-    // ── mcp context_type — stance + broad loadout + cache (register_session) ──
-    SeedScript {
-        path: "/etc/rc/mcp/create/S00-stance.md",
-        context_type: "mcp",
-        verb: "create",
-        sort_key: "S00",
-        name: "stance",
-        extension: "md",
-        content: MCP_STANCE_BODY,
-        timeout_secs: None,
-    },
-    SeedScript {
-        path: "/etc/rc/mcp/create/S10-binding.kai",
-        context_type: "mcp",
-        verb: "create",
-        sort_key: "S10",
-        name: "binding",
-        extension: "kai",
-        content: PERMISSIVE_BINDING_BODY,
-        timeout_secs: None,
-    },
-    SeedScript {
-        path: "/etc/rc/mcp/create/S20-cache.kai",
-        context_type: "mcp",
-        verb: "create",
-        sort_key: "S20",
-        name: "cache",
-        extension: "kai",
-        content: CACHE_CREATE_BODY,
-        timeout_secs: None,
-    },
-    SeedScript {
-        path: "/etc/rc/mcp/fork/S30-cache.kai",
-        context_type: "mcp",
-        verb: "fork",
-        sort_key: "S30",
-        name: "cache",
-        extension: "kai",
-        content: CACHE_FORK_BODY,
-        timeout_secs: None,
-    },
-    SeedScript {
-        path: "/etc/rc/mcp/drift/S40-cache.kai",
-        context_type: "mcp",
-        verb: "drift",
-        sort_key: "S40",
-        name: "cache",
-        extension: "kai",
-        content: CACHE_DRIFT_BODY,
-        timeout_secs: None,
-    },
-    // ── explorer context_type — read-only role (stance + binding + cache) ──
-    SeedScript {
-        path: "/etc/rc/explorer/create/S00-stance.md",
-        context_type: "explorer",
-        verb: "create",
-        sort_key: "S00",
-        name: "stance",
-        extension: "md",
-        content: EXPLORER_STANCE_BODY,
-        timeout_secs: None,
-    },
-    SeedScript {
-        path: "/etc/rc/explorer/create/S10-binding.kai",
-        context_type: "explorer",
-        verb: "create",
-        sort_key: "S10",
-        name: "binding",
-        extension: "kai",
-        content: EXPLORER_BINDING_BODY,
-        timeout_secs: None,
-    },
-    SeedScript {
-        path: "/etc/rc/explorer/create/S20-cache.kai",
-        context_type: "explorer",
-        verb: "create",
-        sort_key: "S20",
-        name: "cache",
-        extension: "kai",
-        content: CACHE_CREATE_BODY,
-        timeout_secs: None,
-    },
-    SeedScript {
-        path: "/etc/rc/explorer/fork/S30-cache.kai",
-        context_type: "explorer",
-        verb: "fork",
-        sort_key: "S30",
-        name: "cache",
-        extension: "kai",
-        content: CACHE_FORK_BODY,
-        timeout_secs: None,
-    },
-    SeedScript {
-        path: "/etc/rc/explorer/drift/S40-cache.kai",
-        context_type: "explorer",
-        verb: "drift",
-        sort_key: "S40",
-        name: "cache",
-        extension: "kai",
-        content: CACHE_DRIFT_BODY,
-        timeout_secs: None,
-    },
-    // ── director context_type — coordination role (stance + binding + cache) ──
-    SeedScript {
-        path: "/etc/rc/director/create/S00-stance.md",
-        context_type: "director",
-        verb: "create",
-        sort_key: "S00",
-        name: "stance",
-        extension: "md",
-        content: DIRECTOR_STANCE_BODY,
-        timeout_secs: None,
-    },
-    SeedScript {
-        path: "/etc/rc/director/create/S10-binding.kai",
-        context_type: "director",
-        verb: "create",
-        sort_key: "S10",
-        name: "binding",
-        extension: "kai",
-        content: DIRECTOR_BINDING_BODY,
-        timeout_secs: None,
-    },
-    SeedScript {
-        path: "/etc/rc/director/create/S20-cache.kai",
-        context_type: "director",
-        verb: "create",
-        sort_key: "S20",
-        name: "cache",
-        extension: "kai",
-        content: CACHE_CREATE_BODY,
-        timeout_secs: None,
-    },
-    SeedScript {
-        path: "/etc/rc/director/fork/S30-cache.kai",
-        context_type: "director",
-        verb: "fork",
-        sort_key: "S30",
-        name: "cache",
-        extension: "kai",
-        content: CACHE_FORK_BODY,
-        timeout_secs: None,
-    },
-    SeedScript {
-        path: "/etc/rc/director/drift/S40-cache.kai",
-        context_type: "director",
-        verb: "drift",
-        sort_key: "S40",
-        name: "cache",
-        extension: "kai",
-        content: CACHE_DRIFT_BODY,
-        timeout_secs: None,
-    },
-];
-
-/// Apply the in-code seed scripts to a freshly-opened DB. Idempotent
-/// via `INSERT OR IGNORE` on the rc_scripts unique-path constraint:
-/// reseed-on-every-open is the floor contract.
-pub(crate) fn ensure_seeded_rc_scripts(conn: &Connection) -> SqliteResult<()> {
-    let founder = PrincipalId::system();
-    let now = kaijutsu_types::now_millis() as i64;
-    for seed in SEED_SCRIPTS {
-        conn.execute(
-            "INSERT OR IGNORE INTO rc_scripts (
-                context_type, verb, sort_key, name,
-                extension, content, path,
-                created_at, created_by, timeout_secs
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![
-                seed.context_type,
-                seed.verb,
-                seed.sort_key,
-                seed.name,
-                seed.extension,
-                seed.content,
-                seed.path,
-                now,
-                blob_param(founder.as_bytes()),
-                seed.timeout_secs,
-            ],
-        )?;
-    }
-    Ok(())
-}
-
-/// Force-overwrite seed rows from the in-code defaults. Powers
-/// `kj rc reseed`. Uses INSERT OR REPLACE so user edits to seeded
-/// paths get reverted; non-seed paths are untouched.
+/// The embedded seed manifest: `(canonical /etc/rc path, body)`. The path
+/// encodes `context_type / verb / sort_key / name / ext`; nothing else is
+/// stored (provenance comes from the CRDT block's principal on write).
 ///
-/// `type_filter`, if `Some`, narrows the reseed to one context_type.
-/// Returns the number of paths reseeded.
-pub(crate) fn reseed_rc_scripts(
-    conn: &Connection,
-    type_filter: Option<&str>,
-) -> SqliteResult<usize> {
-    let founder = PrincipalId::system();
-    let now = kaijutsu_types::now_millis() as i64;
-    let mut count = 0usize;
-    for seed in SEED_SCRIPTS {
-        if let Some(t) = type_filter {
-            if seed.context_type != t {
-                continue;
-            }
-        }
-        conn.execute(
-            "INSERT OR REPLACE INTO rc_scripts (
-                context_type, verb, sort_key, name,
-                extension, content, path,
-                created_at, created_by, timeout_secs
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![
-                seed.context_type,
-                seed.verb,
-                seed.sort_key,
-                seed.name,
-                seed.extension,
-                seed.content,
-                seed.path,
-                now,
-                blob_param(founder.as_bytes()),
-                seed.timeout_secs,
-            ],
-        )?;
-        count += 1;
-    }
-    Ok(count)
-}
-
-/// The set of context_types we ship seeds for. `kj rc reseed --type X`
-/// rejects values outside this list so typos don't silently no-op.
-pub(crate) fn seeded_context_types() -> Vec<&'static str> {
-    let mut types: Vec<&'static str> = SEED_SCRIPTS.iter().map(|s| s.context_type).collect();
-    types.sort();
-    types.dedup();
-    types
-}
+/// S10 bindings must precede any rc script that calls a broker tool:
+/// deny-by-default means tool calls before the loadout is assigned would be
+/// refused.
+const SEED_FILES: &[(&str, &str)] = &[
+    // ── default — broad loadout + cache recipe ──────────────────────────
+    ("/etc/rc/default/create/S10-binding.kai", PERMISSIVE_BINDING_BODY),
+    ("/etc/rc/default/create/S20-cache.kai", CACHE_CREATE_BODY),
+    ("/etc/rc/default/fork/S30-cache.kai", CACHE_FORK_BODY),
+    ("/etc/rc/default/drift/S40-cache.kai", CACHE_DRIFT_BODY),
+    // ── coder — stance + broad loadout + cache ──────────────────────────
+    ("/etc/rc/coder/create/S00-stance.md", CODER_STANCE_BODY),
+    ("/etc/rc/coder/create/S10-binding.kai", PERMISSIVE_BINDING_BODY),
+    ("/etc/rc/coder/create/S20-cache.kai", CACHE_CREATE_BODY),
+    ("/etc/rc/coder/fork/S30-cache.kai", CACHE_FORK_BODY),
+    ("/etc/rc/coder/drift/S40-cache.kai", CACHE_DRIFT_BODY),
+    // ── mcp — stance + broad loadout + cache (register_session) ──────────
+    ("/etc/rc/mcp/create/S00-stance.md", MCP_STANCE_BODY),
+    ("/etc/rc/mcp/create/S10-binding.kai", PERMISSIVE_BINDING_BODY),
+    ("/etc/rc/mcp/create/S20-cache.kai", CACHE_CREATE_BODY),
+    ("/etc/rc/mcp/fork/S30-cache.kai", CACHE_FORK_BODY),
+    ("/etc/rc/mcp/drift/S40-cache.kai", CACHE_DRIFT_BODY),
+    // ── explorer — read-only role (stance + binding + cache) ─────────────
+    ("/etc/rc/explorer/create/S00-stance.md", EXPLORER_STANCE_BODY),
+    ("/etc/rc/explorer/create/S10-binding.kai", EXPLORER_BINDING_BODY),
+    ("/etc/rc/explorer/create/S20-cache.kai", CACHE_CREATE_BODY),
+    ("/etc/rc/explorer/fork/S30-cache.kai", CACHE_FORK_BODY),
+    ("/etc/rc/explorer/drift/S40-cache.kai", CACHE_DRIFT_BODY),
+    // ── director — coordination role (stance + binding + cache) ──────────
+    ("/etc/rc/director/create/S00-stance.md", DIRECTOR_STANCE_BODY),
+    ("/etc/rc/director/create/S10-binding.kai", DIRECTOR_BINDING_BODY),
+    ("/etc/rc/director/create/S20-cache.kai", CACHE_CREATE_BODY),
+    ("/etc/rc/director/fork/S30-cache.kai", CACHE_FORK_BODY),
+    ("/etc/rc/director/drift/S40-cache.kai", CACHE_DRIFT_BODY),
+];
 
 /// The VFS prefix every rc canonical path lives under. The deployed tree
 /// (`~/.config/kaijutsu/rc/...`) and the embedded mirror (`assets/defaults/rc/`)
@@ -458,6 +122,29 @@ pub const RC_VFS_ROOT: &str = "/etc/rc/";
 /// for a path that isn't under the rc root (shouldn't happen for seeds).
 fn rc_relpath(canonical: &str) -> Option<&str> {
     canonical.strip_prefix(RC_VFS_ROOT)
+}
+
+/// The context_type segment of a canonical rc path (`/etc/rc/<type>/...`).
+fn context_type_of(canonical: &str) -> Option<&str> {
+    rc_relpath(canonical).and_then(|rel| rel.split('/').next())
+}
+
+/// The embedded seed manifest as `(canonical /etc/rc path, body)` pairs.
+/// `kj rc reseed` writes these back through the file cache.
+pub fn seed_files() -> &'static [(&'static str, &'static str)] {
+    SEED_FILES
+}
+
+/// The set of context_types we ship seeds for. `kj rc reseed --type X`
+/// rejects values outside this list so typos don't silently no-op.
+pub fn seeded_context_types() -> Vec<&'static str> {
+    let mut types: Vec<&'static str> = SEED_FILES
+        .iter()
+        .filter_map(|(path, _)| context_type_of(path))
+        .collect();
+    types.sort();
+    types.dedup();
+    types
 }
 
 /// Write the embedded seed tree into `root` (the host dir mounted at
@@ -471,8 +158,8 @@ fn rc_relpath(canonical: &str) -> Option<&str> {
 /// caller decides whether a fork can proceed without its stance script.
 pub fn ensure_rc_seed_files(root: &std::path::Path) -> std::io::Result<usize> {
     let mut written = 0usize;
-    for seed in SEED_SCRIPTS {
-        let Some(rel) = rc_relpath(seed.path) else {
+    for (path, content) in SEED_FILES {
+        let Some(rel) = rc_relpath(path) else {
             continue;
         };
         let dest = root.join(rel);
@@ -482,34 +169,35 @@ pub fn ensure_rc_seed_files(root: &std::path::Path) -> std::io::Result<usize> {
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&dest, seed.content)?;
+        std::fs::write(&dest, content)?;
         written += 1;
     }
     Ok(written)
 }
 
 /// Force-overwrite the deployed seed files from the embedded defaults —
-/// the disk equivalent of `reseed_rc_scripts`. `type_filter`, if `Some`,
-/// narrows to one context_type. Returns the number of files rewritten.
+/// the floor's explicit push-updates path, powering `kj rc reseed`.
+/// `type_filter`, if `Some`, narrows to one context_type. Returns the
+/// number of files rewritten.
 pub fn reseed_rc_files(
     root: &std::path::Path,
     type_filter: Option<&str>,
 ) -> std::io::Result<usize> {
     let mut count = 0usize;
-    for seed in SEED_SCRIPTS {
+    for (path, content) in SEED_FILES {
         if let Some(t) = type_filter {
-            if seed.context_type != t {
+            if context_type_of(path) != Some(t) {
                 continue;
             }
         }
-        let Some(rel) = rc_relpath(seed.path) else {
+        let Some(rel) = rc_relpath(path) else {
             continue;
         };
         let dest = root.join(rel);
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&dest, seed.content)?;
+        std::fs::write(&dest, content)?;
         count += 1;
     }
     Ok(count)
@@ -518,126 +206,94 @@ pub fn reseed_rc_files(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel_db::KernelDb;
 
-    #[test]
-    fn fresh_db_has_default_and_coder_seeds() {
-        let db = KernelDb::in_memory().expect("in-memory db");
-        // Default cache scripts present.
-        for path in [
-            "/etc/rc/default/create/S20-cache.kai",
-            "/etc/rc/default/fork/S30-cache.kai",
-            "/etc/rc/default/drift/S40-cache.kai",
-        ] {
-            assert!(
-                db.get_rc_script(path).unwrap().is_some(),
-                "missing default seed: {path}"
-            );
-        }
-        // Coder stance + cache scripts present.
-        for path in [
-            "/etc/rc/coder/create/S00-stance.md",
-            "/etc/rc/coder/create/S20-cache.kai",
-            "/etc/rc/coder/fork/S30-cache.kai",
-            "/etc/rc/coder/drift/S40-cache.kai",
-        ] {
-            assert!(
-                db.get_rc_script(path).unwrap().is_some(),
-                "missing coder seed: {path}"
-            );
-        }
+    fn read(root: &std::path::Path, rel: &str) -> Option<String> {
+        std::fs::read_to_string(root.join(rel)).ok()
     }
 
     #[test]
-    fn seed_is_idempotent_user_edits_persist() {
-        // Open, edit a seed, reopen the SAME DB (file-backed), confirm
-        // edit survived (INSERT OR IGNORE didn't clobber it).
+    fn fresh_tree_gets_default_and_coder_seeds() {
         let dir = tempfile::tempdir().expect("tmpdir");
-        let path = dir.path().join("kernel.db");
+        let n = ensure_rc_seed_files(dir.path()).expect("seed");
+        assert_eq!(n, SEED_FILES.len(), "every seed file should be written");
 
-        {
-            let db = KernelDb::open(&path).expect("open 1");
-            db.update_rc_script(
-                "/etc/rc/default/create/S20-cache.kai",
-                Some("# user-edited body"),
-                None,
-            )
-            .expect("edit seed");
+        for rel in [
+            "default/create/S20-cache.kai",
+            "default/fork/S30-cache.kai",
+            "default/drift/S40-cache.kai",
+            "coder/create/S00-stance.md",
+            "coder/create/S20-cache.kai",
+        ] {
+            assert!(read(dir.path(), rel).is_some(), "missing seed: {rel}");
         }
+        // Cache recipe content round-trips from the embedded asset.
+        assert!(read(dir.path(), "default/create/S20-cache.kai")
+            .unwrap()
+            .contains("kj cache add --target=tools"));
+    }
 
-        let db2 = KernelDb::open(&path).expect("open 2");
-        let row = db2
-            .get_rc_script("/etc/rc/default/create/S20-cache.kai")
-            .expect("get")
-            .expect("row exists");
+    #[test]
+    fn ensure_is_idempotent_user_edits_persist() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        ensure_rc_seed_files(dir.path()).expect("seed 1");
+
+        // Edit a seed file, then re-run ensure: the edit must survive
+        // (file exists → skipped).
+        let target = dir.path().join("default/create/S20-cache.kai");
+        std::fs::write(&target, "# user-edited body").expect("edit");
+        let n = ensure_rc_seed_files(dir.path()).expect("seed 2");
+        assert_eq!(n, 0, "second ensure should write nothing");
         assert_eq!(
-            row.content, "# user-edited body",
-            "edit was clobbered by second open's seed"
+            std::fs::read_to_string(&target).unwrap(),
+            "# user-edited body",
+            "edit was clobbered by re-seed"
         );
     }
 
     #[test]
     fn reseed_overwrites_user_edits() {
-        let db = KernelDb::in_memory().expect("in-memory db");
-        db.update_rc_script(
-            "/etc/rc/default/create/S20-cache.kai",
-            Some("# user override"),
-            None,
-        )
-        .expect("edit seed");
+        let dir = tempfile::tempdir().expect("tmpdir");
+        ensure_rc_seed_files(dir.path()).expect("seed");
+        let target = dir.path().join("default/create/S20-cache.kai");
+        std::fs::write(&target, "# user override").expect("edit");
 
-        let count = db.reseed_rc_scripts(None).expect("reseed");
-        assert!(count > 0, "reseed should touch >0 rows");
-
-        let row = db
-            .get_rc_script("/etc/rc/default/create/S20-cache.kai")
-            .unwrap()
-            .unwrap();
+        let count = reseed_rc_files(dir.path(), None).expect("reseed");
+        assert!(count > 0, "reseed should touch >0 files");
         assert!(
-            row.content.contains("kj cache add --target=tools"),
-            "reseed didn't restore the in-code body: {}",
-            row.content
+            std::fs::read_to_string(&target)
+                .unwrap()
+                .contains("kj cache add --target=tools"),
+            "reseed didn't restore the embedded body"
         );
     }
 
     #[test]
     fn reseed_with_type_filter_skips_others() {
-        let db = KernelDb::in_memory().expect("in-memory db");
-        // Edit both a default and a coder seed.
-        db.update_rc_script(
-            "/etc/rc/default/create/S20-cache.kai",
-            Some("# default edited"),
-            None,
-        )
-        .unwrap();
-        db.update_rc_script(
-            "/etc/rc/coder/create/S20-cache.kai",
-            Some("# coder edited"),
-            None,
-        )
-        .unwrap();
+        let dir = tempfile::tempdir().expect("tmpdir");
+        ensure_rc_seed_files(dir.path()).expect("seed");
+        let default_f = dir.path().join("default/create/S20-cache.kai");
+        let coder_f = dir.path().join("coder/create/S20-cache.kai");
+        std::fs::write(&default_f, "# default edited").unwrap();
+        std::fs::write(&coder_f, "# coder edited").unwrap();
 
-        // Reseed only coder.
-        db.reseed_rc_scripts(Some("coder")).unwrap();
+        reseed_rc_files(dir.path(), Some("coder")).expect("reseed coder");
 
-        // Coder restored.
-        let coder = db
-            .get_rc_script("/etc/rc/coder/create/S20-cache.kai")
-            .unwrap()
-            .unwrap();
-        assert!(coder.content.contains("kj cache add"));
-        // Default edit preserved.
-        let default = db
-            .get_rc_script("/etc/rc/default/create/S20-cache.kai")
-            .unwrap()
-            .unwrap();
-        assert_eq!(default.content, "# default edited");
+        assert!(
+            std::fs::read_to_string(&coder_f).unwrap().contains("kj cache add"),
+            "coder should be restored"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&default_f).unwrap(),
+            "# default edited",
+            "default edit should be preserved"
+        );
     }
 
     #[test]
-    fn seeded_context_types_covers_both() {
+    fn seeded_context_types_covers_roles() {
         let types = seeded_context_types();
-        assert!(types.contains(&"default"));
-        assert!(types.contains(&"coder"));
+        for t in ["default", "coder", "mcp", "explorer", "director"] {
+            assert!(types.contains(&t), "missing context_type: {t}");
+        }
     }
 }

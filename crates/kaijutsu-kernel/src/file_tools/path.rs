@@ -62,6 +62,28 @@ pub fn resolve_str(cwd: &Path, path: &str) -> Result<String, PathError> {
     Ok(resolve(cwd, path)?.to_string_lossy().into_owned())
 }
 
+/// Safe-baseline deny for writes under `/etc` via the `file:write`/`edit`
+/// tools. rc lifecycle scripts live at `/etc/rc/...` and run privileged on
+/// every fork, so letting a general file tool install them is an escalation
+/// surface: only `kj rc` (admin) and host-side editors may write there.
+/// Returns `Some(failure)` if the (already-canonicalized) path is under
+/// `/etc`, else `None`.
+///
+/// This is the conservative floor; an `rc-write` capability will later
+/// relax it per-binding (see `docs/rc-crdt-vfs-bridge.md`).
+pub(crate) fn deny_etc_write(canonical_path: &str) -> Option<crate::execution::ExecResult> {
+    if canonical_path == "/etc" || canonical_path.starts_with("/etc/") {
+        return Some(crate::execution::ExecResult::failure(
+            1,
+            format!(
+                "file write denied under /etc: '{canonical_path}' \
+                 (rc scripts are admin-only — use `kj rc`)"
+            ),
+        ));
+    }
+    None
+}
+
 fn normalize(path: &Path, original: &str) -> Result<PathBuf, PathError> {
     let mut parts: Vec<Component> = Vec::new();
     for component in path.components() {
@@ -91,6 +113,21 @@ mod tests {
 
     fn cwd(s: &str) -> PathBuf {
         PathBuf::from(s)
+    }
+
+    #[test]
+    fn deny_etc_write_blocks_rc_and_etc_root() {
+        // rc scripts run privileged on every fork; the file:write tool must
+        // not be able to install them. /etc and anything under it is denied.
+        assert!(deny_etc_write("/etc/rc/coder/create/S99-evil.kai").is_some());
+        assert!(deny_etc_write("/etc/rc").is_some());
+        assert!(deny_etc_write("/etc").is_some());
+        assert!(deny_etc_write("/etc/passwd").is_some());
+        // Everything else is allowed through (workspace guard still applies).
+        assert!(deny_etc_write("/src/kaijutsu/foo.rs").is_none());
+        assert!(deny_etc_write("/tmp/scratch").is_none());
+        // Not fooled by a prefix that merely starts with the letters "etc".
+        assert!(deny_etc_write("/etcetera/x").is_none());
     }
 
     #[test]

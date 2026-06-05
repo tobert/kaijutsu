@@ -8,7 +8,7 @@ use crate::execution::{ExecContext, ExecResult};
 
 use super::cache::FileDocumentCache;
 use super::guard::WorkspaceGuard;
-use super::path::resolve_str;
+use super::path::{deny_etc_write, resolve_str};
 
 /// Engine for editing files via exact string replacement.
 pub struct EditEngine {
@@ -56,6 +56,10 @@ impl EditEngine {
             Ok(s) => s,
             Err(e) => return Ok(ExecResult::failure(1, e.to_string())),
         };
+
+        if let Some(denied) = deny_etc_write(&path) {
+            return Ok(denied);
+        }
 
         if let Some(ref guard) = self.guard
             && let Err(denied) = guard.check_write(ctx, &path)

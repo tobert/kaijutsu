@@ -17,9 +17,11 @@ from client applications.
 The kernel restates the cybernetic / 改善 / TDD coding posture in its
 own rc lifecycle: `/etc/rc/coder/create/S00-stance.md` reaches the
 model via the system-prompt slot for every context with
-`context_type=coder`. That's the authoritative source inside the
-kernel; edit it with `kj rc edit /etc/rc/coder/create/S00-stance.md`
-and `kj rc reseed` restores the in-code default.
+`context_type=coder`. rc scripts are files under `/etc/rc`
+(`~/.config/kaijutsu/rc/`, read via the CRDT file cache); the embedded
+defaults live in `assets/defaults/rc/`. Edit a live script with
+`kj rc edit /etc/rc/coder/create/S00-stance.md` (or just `vim` the file);
+`kj rc reseed` restores the embedded default.
 
 ## Crate Structure
 
