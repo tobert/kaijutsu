@@ -449,6 +449,72 @@ pub(crate) fn seeded_context_types() -> Vec<&'static str> {
     types
 }
 
+/// The VFS prefix every rc canonical path lives under. The deployed tree
+/// (`~/.config/kaijutsu/rc/...`) and the embedded mirror (`assets/defaults/rc/`)
+/// drop this prefix — the host path is `root.join(relpath)`.
+pub const RC_VFS_ROOT: &str = "/etc/rc/";
+
+/// Strip the `/etc/rc/` prefix from a canonical rc path. Returns `None`
+/// for a path that isn't under the rc root (shouldn't happen for seeds).
+fn rc_relpath(canonical: &str) -> Option<&str> {
+    canonical.strip_prefix(RC_VFS_ROOT)
+}
+
+/// Write the embedded seed tree into `root` (the host dir mounted at
+/// `/etc/rc`), creating only files that don't already exist — the "floor"
+/// contract, mirroring `config_backend`'s write-default-if-missing. A
+/// user's edit persists (file present → skipped); a deleted seed reappears
+/// next boot. Returns the number of files newly written.
+///
+/// Per the crash-over-corruption stance this surfaces I/O errors rather
+/// than swallowing them: a half-written seed tree is corruption, and the
+/// caller decides whether a fork can proceed without its stance script.
+pub fn ensure_rc_seed_files(root: &std::path::Path) -> std::io::Result<usize> {
+    let mut written = 0usize;
+    for seed in SEED_SCRIPTS {
+        let Some(rel) = rc_relpath(seed.path) else {
+            continue;
+        };
+        let dest = root.join(rel);
+        if dest.exists() {
+            continue;
+        }
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&dest, seed.content)?;
+        written += 1;
+    }
+    Ok(written)
+}
+
+/// Force-overwrite the deployed seed files from the embedded defaults —
+/// the disk equivalent of `reseed_rc_scripts`. `type_filter`, if `Some`,
+/// narrows to one context_type. Returns the number of files rewritten.
+pub fn reseed_rc_files(
+    root: &std::path::Path,
+    type_filter: Option<&str>,
+) -> std::io::Result<usize> {
+    let mut count = 0usize;
+    for seed in SEED_SCRIPTS {
+        if let Some(t) = type_filter {
+            if seed.context_type != t {
+                continue;
+            }
+        }
+        let Some(rel) = rc_relpath(seed.path) else {
+            continue;
+        };
+        let dest = root.join(rel);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&dest, seed.content)?;
+        count += 1;
+    }
+    Ok(count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -986,6 +986,22 @@ pub async fn create_shared_kernel(
     // Read-write /tmp for scratch/interop with external tools
     kernel.mount("/tmp", LocalBackend::new("/tmp")).await;
 
+    // Read-write rc tree: ~/.config/kaijutsu/rc mounted at /etc/rc. Longest-
+    // prefix wins over the read-only `/`, so this overrides only the rc
+    // subtree — the host's real /etc is never touched. rc lifecycle scripts
+    // live here as files; embedded defaults are written to disk if absent
+    // (the floor pattern), so a fresh install boots with a populated tree.
+    let rc_dir = config_dir
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(self::config_dir)
+        .join("rc");
+    match kaijutsu_kernel::seed_scripts::ensure_rc_seed_files(&rc_dir) {
+        Ok(n) if n > 0 => log::info!("seeded {n} rc script file(s) into {}", rc_dir.display()),
+        Ok(_) => {}
+        Err(e) => log::error!("rc seed-to-disk failed for {}: {e}", rc_dir.display()),
+    }
+    kernel.mount("/etc/rc", LocalBackend::new(&rc_dir)).await;
+
     // Freeze the mount table — security perimeter is now fixed.
     // No more mount/unmount via RPC after this point.
     kernel.freeze_mounts();
