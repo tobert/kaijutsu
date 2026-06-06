@@ -1392,6 +1392,42 @@ mod tests {
         BlockStore::new(ContextId::new(), PrincipalId::new())
     }
 
+    /// Measure the block-insert hot path at coder scale (append-only, the way a
+    /// coding session grows). Run with:
+    ///   cargo test -p kaijutsu-crdt bench_append_hot_path -- --ignored --nocapture
+    /// This is the budget a hyoushigi `Tick` (an O(1) counter bump) would be added
+    /// against — and it exposes the pre-existing O(N log N) `calc_order_key` cost.
+    #[test]
+    #[ignore = "timing benchmark, run explicitly with --ignored --nocapture"]
+    fn bench_append_hot_path() {
+        use std::time::Instant;
+        for n in [200usize, 1000, 4000] {
+            let mut store = test_store();
+            let mut last: Option<BlockId> = None;
+            let start = Instant::now();
+            for _ in 0..n {
+                let id = store
+                    .insert_block(
+                        last.as_ref(),
+                        last.as_ref(),
+                        Role::Model,
+                        BlockKind::Text,
+                        "a typical line of streamed model text for a coding turn",
+                        Status::Done,
+                        ContentType::Plain,
+                    )
+                    .unwrap();
+                last = Some(id);
+            }
+            let elapsed = start.elapsed();
+            println!(
+                "N={n:>5}: total={:>8.2}ms  per-insert={:>7.2}µs",
+                elapsed.as_secs_f64() * 1000.0,
+                elapsed.as_secs_f64() * 1e6 / n as f64,
+            );
+        }
+    }
+
     #[test]
     fn test_new_store() {
         let store = test_store();

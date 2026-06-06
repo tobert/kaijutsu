@@ -362,6 +362,53 @@ hardware-clocked, never network-clocked.** The DAC's clock drives the callback; 
 kernel timebase only aligns *musical* position, and the audio path slews loosely to it.
 Network jitter never enters an audio callback.
 
+### One coalescing scheduler; virtual tickers and jobs
+
+The kernel does **not** run a timer per context. It runs **one** coalescing wakeup
+scheduler — the single active thing in the system — and every context's "ticker" is
+*virtual*: pure state (its `Timebase` + an optional registered next-deadline + a
+callback), advanced lazily by the scheduler, never a loop of its own. A context's `now()`
+is *computed on demand* from the timebase (`epoch_tick + elapsed × rate`); a playhead
+nobody is watching is never advanced.
+
+The scheduler is a min-heap of `(next_wake_tick, ContextId)` plus a message ingress, run
+as a single `select!` over two arms:
+
+- **the heap** — sleep until the nearest deadline, wake, coalesce everything due within
+  the window, advance those contexts and fire their callbacks, re-register next deadlines;
+- **the message channel** — fire-and-forget wakeups (and inbound turns, drift offers,
+  sibling messages) that may *re-arm* a context.
+
+This makes the cheap things cheap **by construction**:
+
+- **Pausing an inactive context is free** — "paused" is simply *no heap entry*. There is
+  no loop to stop; the context is dormant state at zero CPU until an inbound event re-arms
+  it. A **coder never has a heap entry at all** — it is event-driven, its `Tick` bumped
+  synchronously when a turn appends a block. Contrast N per-context OS timers, where idle
+  still costs a wakeup and a slot each.
+- **Backoff is one heap operation** — push a context's next deadline out (double on
+  repeat). The single heap owns the policy globally, and it can be *driven by signals the
+  engine already emits*: the `Squashed` ledger (a context burning compute on repeated
+  mispredictions backs off) and `estimate_cost`'s measured-vs-predicted learning. The
+  cadence adapts from the same feedback the speculation loop produces.
+
+Wakeup work is **fire-and-forget and lightweight on the scheduler** — it advances the
+timeline and enqueues/flushes; it must never run a model turn or synthesis inline, or the
+single driver stalls behind one slow context (and the beat can't block). Slow work is
+dispatched to a worker and commits back asynchronously through the existing mailbox /
+block-insert path. The natural work hook is a **new rc verb, `tick`** (a.k.a. `beat`),
+materialized the same throwaway-kaish way `create` / `fork` / `drift` already are — new
+verb, old mechanism, no new runtime.
+
+**Jobs are virtual too.** kaish has a real `JobManager` (`&`, `bg`/`fg`), but kaish is
+materialized fresh per use and torn down, so its job table can't host anything durable —
+there is no persistent per-context job runner, and we don't build one. A "context job" is
+a kernel-owned task tagged with `ContextId`, scheduled and run by the kernel exactly like
+the virtual ticker. (A future read-only `jobs` projection into the context shell could
+*display* a context's kernel jobs/next-wakeups for debugging, without owning them there.)
+A durable, cross-beat background job — a synthesis that lives across many beats — is
+genuinely new surface and is deferred until the composer needs it.
+
 ### Clients run hyoushigi too
 
 The app may attach to several contexts at once (the constellation view), each needing its
