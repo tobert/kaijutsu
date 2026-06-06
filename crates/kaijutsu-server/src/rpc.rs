@@ -6061,6 +6061,12 @@ fn set_block_snapshot(
     builder.set_ephemeral(block.ephemeral);
     builder.set_excluded(block.excluded);
 
+    // Set hyoushigi timeline coordinate if present
+    if let Some(tick) = block.tick {
+        builder.set_has_tick(true);
+        builder.set_tick(tick.get());
+    }
+
     // Set drift-specific fields if present
     if let Some(ref ctx) = block.source_context {
         builder.set_source_context(ctx.as_bytes());

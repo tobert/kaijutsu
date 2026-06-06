@@ -8,7 +8,7 @@ use kaijutsu_crdt::{ContextId, KernelId};
 use kaijutsu_types::{
     BlockFilter, BlockId, BlockKind, BlockQuery, BlockSnapshot, BlockSnapshotBuilder, ContentType,
     DriftKind, ErrorCategory, ErrorPayload, ErrorSeverity, ErrorSpan, PrincipalId, Role, Status,
-    ToolKind,
+    Tick, ToolKind,
 };
 use russh::ChannelStream;
 use russh::client::Msg;
@@ -2123,6 +2123,11 @@ pub(crate) fn parse_block_snapshot(
         builder = builder.ephemeral(true);
     }
 
+    // Hyoushigi timeline coordinate (Some only for materialized timeline cells)
+    if reader.get_has_tick() {
+        builder = builder.tick(Tick::new(reader.get_tick()));
+    }
+
     // Error payload (for Error blocks)
     if reader.get_has_error_payload()
         && let Ok(ep) = reader.get_error_payload()
@@ -2660,11 +2665,34 @@ mod tests {
             }
         }
 
+        if let Some(tick) = snap.tick {
+            builder.set_has_tick(true);
+            builder.set_tick(tick.get());
+        }
+
         // Parse back
         let reader = message
             .get_root_as_reader::<crate::kaijutsu_capnp::block_snapshot::Reader>()
             .unwrap();
         parse_block_snapshot(&reader).unwrap()
+    }
+
+    #[test]
+    fn test_parse_block_snapshot_tick_roundtrip() {
+        let id = BlockId {
+            context_id: ContextId::new(),
+            principal_id: PrincipalId::new(),
+            seq: 1,
+        };
+        // A materialized timeline cell carries its tick across the wire.
+        let snap = BlockSnapshotBuilder::new(id, BlockKind::Text)
+            .tick(Tick::new(42))
+            .build();
+        assert_eq!(roundtrip_snapshot(&snap).tick, Some(Tick::new(42)));
+
+        // An ordinary block has no tick, and absence roundtrips as None.
+        let plain = BlockSnapshotBuilder::new(id, BlockKind::Text).build();
+        assert_eq!(roundtrip_snapshot(&plain).tick, None);
     }
 
     #[test]

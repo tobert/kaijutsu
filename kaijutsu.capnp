@@ -201,6 +201,11 @@ struct BlockSnapshot {
   # Standard error stream (toolResult) — persisted separately from content (stdout)
   stderr @33 :Text;
   hasStderr @34 :Bool;        # True if stderr is set (distinguishes "" from unset)
+
+  # Hyoushigi timeline coordinate — Some only for blocks materialized from a
+  # committed timeline cell; absent on every ordinary block.
+  tick @35 :Int64;
+  hasTick @36 :Bool;          # True if tick is set (Int64 value type)
 }
 
 # What system produced the error.

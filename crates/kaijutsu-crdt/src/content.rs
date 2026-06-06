@@ -532,6 +532,7 @@ impl BlockContent {
             resource: self.resource.clone(),
             content_type: self.header.content_type,
             order_key: Some(self.order_key.clone()),
+            tick: None,
             updated_at: self.header.updated_at,
             status_at: self.header.status_at,
             collapsed_at: self.header.collapsed_at,

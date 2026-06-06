@@ -13,6 +13,7 @@ members = [
     "crates/kaijutsu-index",
     "crates/kaijutsu-abc",
     "crates/kaijutsu-cas",
+    "crates/kaijutsu-hyoushigi",
 ]
 
 [workspace.package]
@@ -25,6 +26,7 @@ repository = "https://github.com/atobey/kaijutsu"
 # Internal crates
 kaijutsu-abc = { path = "crates/kaijutsu-abc" }
 kaijutsu-cas = { path = "crates/kaijutsu-cas" }
+kaijutsu-hyoushigi = { path = "crates/kaijutsu-hyoushigi" }
 kaijutsu-types = { path = "crates/kaijutsu-types" }
 kaijutsu-crdt = { path = "crates/kaijutsu-crdt" }
 kaijutsu-kernel = { path = "crates/kaijutsu-kernel" }

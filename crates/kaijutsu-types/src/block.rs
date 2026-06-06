@@ -22,6 +22,7 @@ use strum::EnumString;
 
 use crate::OutputData;
 use crate::ids::{ContextId, PrincipalId};
+use crate::tick::Tick;
 
 /// Globally unique block identifier with typed IDs.
 ///
@@ -1279,6 +1280,14 @@ pub struct BlockSnapshot {
     #[serde(default)]
     pub order_key: Option<String>,
 
+    /// Semantic timeline coordinate (hyoushigi `Tick`). `Some` only for blocks
+    /// materialized from a committed timeline cell; `None` for every ordinary
+    /// block. Distinct from `order_key` (the CRDT sibling index, which the kernel
+    /// emits to *match* tick order at materialization) and from DAG parentage
+    /// (an orthogonal cross-context axis). See `docs/hyoushigi.md`.
+    #[serde(default)]
+    pub tick: Option<Tick>,
+
     // CRDT metadata
     /// Aggregate Lamport timestamp — `max(all per-field timestamps)`.
     /// Propagated during sync so receivers can advance their clocks.
@@ -1387,6 +1396,7 @@ impl BlockSnapshot {
             resource: None,
             content_type: ContentType::Plain,
             order_key: None,
+            tick: None,
             updated_at: 0,
             status_at: 0,
             collapsed_at: 0,
@@ -1434,6 +1444,7 @@ impl BlockSnapshot {
             resource: None,
             content_type: ContentType::Plain,
             order_key: None,
+            tick: None,
             updated_at: 0,
             status_at: 0,
             collapsed_at: 0,
@@ -1493,6 +1504,7 @@ impl BlockSnapshot {
             resource: None,
             content_type: ContentType::Plain,
             order_key: None,
+            tick: None,
             updated_at: 0,
             status_at: 0,
             collapsed_at: 0,
@@ -1552,6 +1564,7 @@ impl BlockSnapshot {
             resource: None,
             content_type: ContentType::Plain,
             order_key: None,
+            tick: None,
             updated_at: 0,
             status_at: 0,
             collapsed_at: 0,
@@ -1615,6 +1628,7 @@ impl BlockSnapshot {
             resource: None,
             content_type: ContentType::Plain,
             order_key: None,
+            tick: None,
             updated_at: 0,
             status_at: 0,
             collapsed_at: 0,
@@ -1669,6 +1683,7 @@ impl BlockSnapshot {
             resource: None,
             content_type: ContentType::Plain,
             order_key: None,
+            tick: None,
             updated_at: 0,
             status_at: 0,
             collapsed_at: 0,
@@ -1721,6 +1736,7 @@ impl BlockSnapshot {
             resource: None,
             content_type: ContentType::Plain,
             order_key: None,
+            tick: None,
             updated_at: 0,
             status_at: 0,
             collapsed_at: 0,
@@ -1773,6 +1789,7 @@ impl BlockSnapshot {
             resource: None,
             content_type: ContentType::Plain,
             order_key: None,
+            tick: None,
             updated_at: 0,
             status_at: 0,
             collapsed_at: 0,
@@ -1821,6 +1838,7 @@ impl BlockSnapshot {
             resource: None,
             content_type: ContentType::Plain,
             order_key: None,
+            tick: None,
             updated_at: 0,
             status_at: 0,
             collapsed_at: 0,
@@ -1880,6 +1898,7 @@ impl BlockSnapshot {
             resource: Some(payload),
             content_type: ContentType::Plain,
             order_key: None,
+            tick: None,
             updated_at: 0,
             status_at: 0,
             collapsed_at: 0,
@@ -1937,6 +1956,7 @@ impl BlockSnapshot {
             resource: None,
             content_type: ContentType::Plain,
             order_key: None,
+            tick: None,
             updated_at: 0,
             status_at: 0,
             collapsed_at: 0,
@@ -2060,6 +2080,7 @@ impl BlockSnapshotBuilder {
                 resource: None,
                 content_type: ContentType::Plain,
                 order_key: None,
+                tick: None,
                 updated_at: 0,
                 status_at: 0,
                 collapsed_at: 0,
@@ -2182,6 +2203,11 @@ impl BlockSnapshotBuilder {
 
     pub fn ephemeral(mut self, ephemeral: bool) -> Self {
         self.snap.ephemeral = ephemeral;
+        self
+    }
+
+    pub fn tick(mut self, tick: Tick) -> Self {
+        self.snap.tick = Some(tick);
         self
     }
 

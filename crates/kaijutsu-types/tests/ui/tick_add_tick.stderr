@@ -1,0 +1,5 @@
+error[E0308]: mismatched types
+ --> tests/ui/tick_add_tick.rs:5:28
+  |
+5 |     let _ = Tick::new(1) + Tick::new(2);
+  |                            ^^^^^^^^^^^^ expected `TickDelta`, found `Tick`

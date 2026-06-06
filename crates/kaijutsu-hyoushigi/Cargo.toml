@@ -1,0 +1,14 @@
+[package]
+name = "kaijutsu-hyoushigi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "拍子木 — kaijutsu's timing substrate: timelines, cells, resolvers, speculation"
+
+[dependencies]
+kaijutsu-types = { workspace = true }
+kaijutsu-cas = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
