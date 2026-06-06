@@ -212,10 +212,39 @@ impl Timeline {
         Ok(())
     }
 
+    /// Map wall-clock elapsed-since-epoch to a [`Tick`] via the clock's rate.
+    ///
+    /// This is the (stub) wall-clock binding — PPQ + tempo collapse to
+    /// `ticks_per_sec` here; the real binding carries epoch + tempo + PPQ. It is
+    /// the boundary the doc calls "a logical integer coordinate with a pluggable
+    /// wall-clock binding": ticks are pure integers, wall-clock lives only here.
+    pub fn tick_at(&self, since_epoch: Duration) -> Tick {
+        Tick::new((since_epoch.as_secs_f64() * self.clock.ticks_per_sec).round() as i64)
+    }
+
+    /// Drive the playhead from a wall-clock reading — the **internal beat**.
+    ///
+    /// The beat advances on its own schedule; it does *not* wait for resolves.
+    /// Every speculation, commit, squash, and fallback the playhead crosses fires
+    /// as it passes. This is the can't-block discipline: an integrator (kernel or
+    /// client timer) calls `pump` on each beat tick, and the playhead is wherever
+    /// wall-clock says — content is either staged ahead in time or the fallback
+    /// fired. Monotonic: a reading behind the playhead is ignored.
+    pub fn pump(&mut self, since_epoch: Duration) {
+        let target = self.tick_at(since_epoch);
+        if target > self.playhead {
+            self.advance_to(target);
+        }
+    }
+
     /// Advance the playhead to `target`, firing each due lifecycle action in tick
     /// order. The clock can't block: actions happen *because* the playhead
-    /// arrives, not because a resolve finished.
+    /// arrives, not because a resolve finished. Time only moves forward — a
+    /// non-advancing target is a no-op (the write barrier never walks backward).
     pub fn advance_to(&mut self, target: Tick) {
+        if target <= self.playhead {
+            return;
+        }
         loop {
             // Find the earliest pending action at or before `target`.
             let mut next: Option<(usize, Tick)> = None;
@@ -597,6 +626,46 @@ mod tests {
             }
             _ => panic!("re-speculated content must commit concrete"),
         }
+    }
+
+    /// The internal beat: wall-clock pumps alone drive the playhead through the
+    /// lifecycle — no manual `advance_to`. The beat doesn't wait for the resolve.
+    #[test]
+    fn beat_drives_commit_from_wallclock() {
+        let clock = TickClock {
+            ticks_per_sec: 10.0, // 10 ticks/sec → tick 10 == 1.0s
+            safety_factor: 2.0,
+            commit_margin: TickDelta::new(2),
+        };
+        let mut tl = Timeline::new(clock);
+        tl.register_resolver(Box::new(EchoBeat {
+            cost: Duration::from_millis(300), // est 3 ticks, lead 6 → speculate_at=4
+        }));
+        tl.set_ambient("beat", *b"A");
+        tl.schedule(deferred_at(10, Fallback::Skip)).unwrap(); // start at 1.0s
+
+        // Beat ticks arrive on the wall clock; nobody calls advance_to.
+        tl.pump(Duration::from_millis(500)); // → tick 5: crosses speculate_at(4)
+        assert!(tl.committed().is_empty(), "not committed before its deadline");
+        tl.pump(Duration::from_millis(1000)); // → tick 10: crosses commit_deadline(8)
+
+        assert_eq!(tl.committed().len(), 1);
+        assert!(tl.squashes().is_empty());
+        match &tl.committed()[0].body {
+            Body::Concrete(cref) => assert_eq!(cref.hash, concrete_hash(b"A")),
+            _ => panic!("beat should have committed concrete content"),
+        }
+    }
+
+    /// A wall-clock reading behind the playhead is ignored — the beat never walks
+    /// time backward.
+    #[test]
+    fn pump_is_monotonic() {
+        let mut tl = Timeline::new(TickClock::default());
+        tl.pump(Duration::from_secs(5));
+        let p = tl.playhead();
+        tl.pump(Duration::from_secs(2)); // stale reading
+        assert_eq!(tl.playhead(), p, "stale beat reading must not rewind the playhead");
     }
 
     /// Scheduling behind the playhead is rejected — crash over corruption, never a

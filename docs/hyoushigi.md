@@ -496,11 +496,18 @@ fallback are exercised by their first user.
 > `SquashEvent` ledger (predicted vs. actual basis) — exercised by clean-commit,
 > squash→fallback, and squash→re-speculate→commit tests; a `tick: Option<Tick>`
 > field on `BlockSnapshot` through the **full capnp wire** (schema + both
-> conversion directions + roundtrip test) and all struct-literal sites; and the
+> conversion directions + roundtrip test) and all struct-literal sites; the
 > `Cell → BlockSnapshot` materialization (mime → `ContentType::from_mime`, text
-> inline vs. binary-as-CAS-hash byte homes). **Not yet:** the internal beat driver
-> as a live timer (the loop is driven by manual `advance_to` today), the UI
-> timeline render, and steps 5–6.
+> inline vs. binary-as-CAS-hash byte homes); and the **internal beat** —
+> `tick_at`/`pump` drive the playhead from a wall-clock reading without waiting
+> for resolves (the actual interval timer is the kernel/client integrator's job,
+> keeping the crate runtime-agnostic). **Not yet:** wiring hyoushigi into the
+> kernel at all (it's a standalone island — no live code constructs a ticked
+> block, so every block on the wire has `tick = None`); the UI timeline render;
+> and steps 5–6. **At integration:** attach `hyoushigi.tick` as a span attribute
+> on the `engine.block_create`/`block_append` (and materialize→insert) spans, so
+> a block's timeline position shows up in traces — there is no producer to
+> instrument until then.
 
 1. **Generalize position first** — land the `Tick` / `TickDelta` split as the
    logical-coordinate-with-pluggable-binding generalization, per the spec'd algebra under
