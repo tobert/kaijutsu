@@ -8,6 +8,7 @@
 use diamond_types_extended::{AgentId, Document, Frontier, SerializedOpsOwned, Uuid};
 
 use crate::{BlockHeader, BlockId, BlockSnapshot, ContentType, PrincipalId, Status};
+use kaijutsu_types::Tick;
 
 /// Value-based tiebreaker for per-field LWW merge.
 ///
@@ -24,6 +25,23 @@ pub const BASE62: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkl
 /// Get the index of a character in the BASE62 charset.
 fn base62_index(c: u8) -> usize {
     BASE62.iter().position(|&b| b == c).unwrap_or(0)
+}
+
+/// Encode a non-negative integer as a fixed-width, '0'-left-padded base-62
+/// string. Fixed width makes lexicographic order match numeric order, so a
+/// monotonic counter yields monotonically-sorting keys of bounded length —
+/// the basis for tick-derived `order_key`s that append in O(1) without growth.
+/// Width 11 covers the full `i64` range (62^11 > i64::MAX).
+pub fn base62_encode_padded(value: i64, width: usize) -> String {
+    let mut n = value.max(0) as u64;
+    let mut buf = vec![b'0'; width];
+    let mut i = width;
+    while n > 0 && i > 0 {
+        i -= 1;
+        buf[i] = BASE62[(n % 62) as usize];
+        n /= 62;
+    }
+    String::from_utf8(buf).expect("base62 chars are valid utf8")
 }
 
 /// Compute a lexicographic midpoint between two base-62 strings.
@@ -91,8 +109,14 @@ pub struct BlockContent {
     agent: AgentId,
 
     /// Fractional index for sibling ordering (base-62 lexicographic).
-    /// Calculated via order_midpoint() on insertion.
+    /// Calculated via order_midpoint() on insertion (or derived from `tick`).
     order_key: String,
+
+    /// Semantic timeline coordinate (hyoushigi). `Some` for blocks created on a
+    /// timeline (every freshly-inserted block); the `order_key` is derived to
+    /// match tick order on append. Distinct axis from `order_key` — see
+    /// `docs/hyoushigi.md`.
+    tick: Option<Tick>,
 
     /// Non-Copy snapshot fields that don't belong on BlockHeader.
     /// These are write-once metadata set at creation time.
@@ -148,6 +172,7 @@ impl BlockContent {
             doc,
             agent,
             order_key,
+            tick: None,
             tool_name: None,
             tool_input: None,
             tool_call_id: None,
@@ -168,14 +193,17 @@ impl BlockContent {
         }
     }
 
-    /// Create a new block with initial text content.
+    /// Create a new block with initial text content. `tick` is the block's
+    /// timeline coordinate (`None` only when restoring a pre-tick block).
     pub fn with_content(
         header: BlockHeader,
         content: &str,
         principal_id: PrincipalId,
         order_key: String,
+        tick: Option<Tick>,
     ) -> Self {
         let mut block = Self::new(header, principal_id, order_key);
+        block.tick = tick;
         if !content.is_empty() {
             block.doc.transact(block.agent, |tx| {
                 if let Some(mut text) = tx.get_text_mut(&["content"]) {
@@ -197,7 +225,7 @@ impl BlockContent {
     ) -> Self {
         let header = BlockHeader::from_snapshot(snap);
         let order_key = snap.order_key.clone().unwrap_or(fallback_order_key);
-        let mut block = Self::with_content(header, &snap.content, principal_id, order_key);
+        let mut block = Self::with_content(header, &snap.content, principal_id, order_key, snap.tick);
         block.tool_name = snap.tool_name.clone();
         block.tool_input = snap.tool_input.clone();
         block.tool_call_id = snap.tool_call_id;
@@ -241,6 +269,7 @@ impl BlockContent {
             doc,
             agent,
             order_key,
+            tick: snap.tick,
             tool_name: snap.tool_name.clone(),
             tool_input: snap.tool_input.clone(),
             tool_call_id: snap.tool_call_id,
@@ -316,6 +345,16 @@ impl BlockContent {
     /// Set the ordering key (for move operations).
     pub fn set_order_key(&mut self, key: String) {
         self.order_key = key;
+    }
+
+    /// The block's timeline coordinate, if it has one.
+    pub fn tick(&self) -> Option<Tick> {
+        self.tick
+    }
+
+    /// Set the timeline coordinate (used at insert and during normalization).
+    pub fn set_tick(&mut self, tick: Tick) {
+        self.tick = Some(tick);
     }
 
     /// Set the status, bumping per-field and aggregate timestamps.
@@ -532,7 +571,7 @@ impl BlockContent {
             resource: self.resource.clone(),
             content_type: self.header.content_type,
             order_key: Some(self.order_key.clone()),
-            tick: None,
+            tick: self.tick,
             updated_at: self.header.updated_at,
             status_at: self.header.status_at,
             collapsed_at: self.header.collapsed_at,

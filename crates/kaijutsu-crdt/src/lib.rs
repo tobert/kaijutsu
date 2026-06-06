@@ -35,7 +35,7 @@ pub use kaijutsu_types::{
     ContentType, ContextId, DriftKind, ErrorCategory, ErrorPayload, ErrorSeverity, ErrorSpan,
     KernelId, LogLevel, MAX_DAG_DEPTH, NotificationKind, NotificationPayload, OutputData,
     OutputEntryType, OutputNode, PrefixError, PrefixResolvable, PrincipalId, ResourcePayload,
-    Role, SessionId, Status, ToolKind, resolve_context_prefix,
+    Role, SessionId, Span, Status, Tick, TickDelta, ToolKind, resolve_context_prefix,
 };
 
 // New architecture

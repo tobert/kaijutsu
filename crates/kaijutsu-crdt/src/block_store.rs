@@ -8,10 +8,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use diamond_types_extended::{Frontier, SerializedOpsOwned};
 
-use crate::content::{BlockContent, order_midpoint};
+use crate::content::{BlockContent, base62_encode_padded, order_midpoint};
 use crate::{
     BlockHeader, BlockId, BlockKind, BlockSnapshot, ContentType, ContextId, CrdtError, DriftKind,
-    MAX_DAG_DEPTH, PrincipalId, Result, Role, Status, ToolKind,
+    MAX_DAG_DEPTH, PrincipalId, Result, Role, Status, Tick, ToolKind,
 };
 
 /// Filter criteria for selective block inclusion during fork.
@@ -85,6 +85,11 @@ pub struct BlockStore {
     /// Lamport clock for LWW conflict resolution on header fields.
     /// Monotonically increasing. Advanced on local mutations and on merge.
     lamport_clock: u64,
+
+    /// Next hyoushigi timeline tick — a per-context, per-block monotonic ordinal
+    /// stamped on every inserted block (distinct from the Lamport clock, which
+    /// bumps on many metadata ops). The append `order_key` is derived from it.
+    next_tick: i64,
 }
 
 impl BlockStore {
@@ -97,6 +102,7 @@ impl BlockStore {
             next_seq: 0,
             version: 0,
             lamport_clock: 0,
+            next_tick: 0,
         }
     }
 
@@ -274,23 +280,50 @@ impl BlockStore {
         format!("{c1}{c2}{c3}{c4}")
     }
 
-    /// Compute an order_key for a new block inserted after `after`.
+    /// A bounded, monotonic `order_key` derived from a timeline `tick`.
     ///
-    /// Appends a 4-char base62 agent suffix (derived from agent UUID) to
-    /// the midpoint. Since the suffix chars are valid base62, they participate
-    /// naturally in subsequent midpoint calculations — no stripping needed.
-    /// Concurrent inserts at the same position get different keys (different
-    /// agent suffix), and sequential inserts by the same agent group together
-    /// (same suffix in the key lineage).
-    // TODO: This is O(N log N) per insertion due to block_ids_ordered() full sort.
-    // For high-frequency inserts (>1000 blocks), maintain a secondary sorted index.
-    fn calc_order_key(&self, after: Option<&BlockId>) -> String {
+    /// Width-11 base62 covers the full `i64` range; the `'V'` prefix (mid-
+    /// alphabet) leaves keyspace below for an explicit move-to-front via
+    /// `order_midpoint`. Because the key length is fixed, a monotonic tick yields
+    /// monotonically-sorting keys in O(1) — no per-append growth, no full sort.
+    fn order_key_for_tick(&self, tick: i64) -> String {
+        // Tick dominates the sort (chronological order within a store); the agent
+        // suffix is a low-order tiebreak that keeps keys unique across replicas
+        // that independently assign the same tick (a multi-writer concern, still
+        // deferred — see docs/hyoushigi.md).
+        format!("V{}{}", base62_encode_padded(tick, 11), self.agent_order_suffix())
+    }
+
+    /// Assign the next timeline tick and a matching `order_key` for a freshly
+    /// created block inserted at `after`. Returns the tick to stamp on the block.
+    fn next_position(&mut self, after: Option<&BlockId>) -> (Option<Tick>, String) {
+        let tick = self.next_tick;
+        self.next_tick += 1;
+        let order_key = self.calc_order_key(after, Some(tick));
+        (Some(Tick::new(tick)), order_key)
+    }
+
+    /// Compute an `order_key` for a block inserted after `after`.
+    ///
+    /// When `tick` is `Some` (a freshly-created block) and the insertion is an
+    /// append (after the last block, or the first block), the key is derived
+    /// directly from the tick — bounded and O(1), the hot path that retires the
+    /// old append cliff. A genuine insert-between (e.g. a tool_result placed
+    /// after a non-last tool_call during parallel tool use) keeps a fractional
+    /// `order_midpoint` so placement is preserved; those keys carry the 4-char
+    /// agent suffix for concurrent-insert tiebreak. `tick == None` is the legacy
+    /// path used by `move_block` and snapshot restore.
+    fn calc_order_key(&self, after: Option<&BlockId>, tick: Option<i64>) -> String {
         let ordered = self.block_ids_ordered();
         let suffix = self.agent_order_suffix();
 
         let base = match after {
             None => {
                 if ordered.is_empty() {
+                    // First block on the timeline.
+                    if let Some(t) = tick {
+                        return self.order_key_for_tick(t);
+                    }
                     "V".to_string()
                 } else {
                     let first_key = self.blocks[&ordered[0]].order_key();
@@ -306,6 +339,10 @@ impl BlockStore {
                             let next_key = self.blocks[&ordered[idx + 1]].order_key();
                             order_midpoint(&after_key, next_key)
                         } else {
+                            // Appending after the last block.
+                            if let Some(t) = tick {
+                                return self.order_key_for_tick(t);
+                            }
                             format!("{after_key}V")
                         }
                     }
@@ -317,6 +354,9 @@ impl BlockStore {
                             total_blocks = ordered.len(),
                             "calc_order_key: after_id not found in ordered list, appending to end"
                         );
+                        if let Some(t) = tick {
+                            return self.order_key_for_tick(t);
+                        }
                         if let Some(last) = ordered.last() {
                             let last_key = self.blocks[last].order_key();
                             format!("{last_key}V")
@@ -329,6 +369,43 @@ impl BlockStore {
         };
 
         format!("{base}{suffix}")
+    }
+
+    /// Normalize legacy ordering: assign timeline ticks to any blocks created
+    /// before the tick coordinate existed, re-keying them into the tick scheme
+    /// in their current visual order. Idempotent — a no-op once every live block
+    /// has a tick. Also seeds `next_tick` so subsequent inserts stay monotonic.
+    fn normalize_timeline(&mut self) {
+        let live_missing_tick = self
+            .blocks
+            .values()
+            .any(|b| !b.is_deleted() && b.tick().is_none());
+
+        if live_missing_tick {
+            // Re-key every live block in its established order, eliminating the
+            // legacy `order_key`s entirely.
+            let ordered = self.block_ids_ordered();
+            for (i, id) in ordered.iter().enumerate() {
+                let t = i as i64;
+                let key = self.order_key_for_tick(t);
+                if let Some(block) = self.blocks.get_mut(id) {
+                    block.set_order_key(key);
+                    block.set_tick(Tick::new(t));
+                }
+            }
+            self.next_tick = ordered.len() as i64;
+        } else {
+            // Already ticked — resume the counter past the maximum.
+            self.next_tick = self
+                .blocks
+                .values()
+                .filter(|b| !b.is_deleted())
+                .filter_map(|b| b.tick())
+                .map(|t| t.get())
+                .max()
+                .map(|m| m + 1)
+                .unwrap_or(0);
+        }
     }
 
     // =========================================================================
@@ -363,7 +440,7 @@ impl BlockStore {
             return Err(CrdtError::InvalidReference(*pid));
         }
 
-        let order_key = self.calc_order_key(after);
+        let (block_tick, order_key) = self.next_position(after);
         let ts = self.tick();
         let header = BlockHeader {
             id,
@@ -390,7 +467,8 @@ impl BlockStore {
             content_type_at: ts,
         };
 
-        let block = BlockContent::with_content(header, &content_str, self.principal_id, order_key);
+        let block =
+            BlockContent::with_content(header, &content_str, self.principal_id, order_key, block_tick);
         self.blocks.insert(id, block);
         self.version += 1;
         Ok(id)
@@ -422,7 +500,7 @@ impl BlockStore {
             return Err(CrdtError::InvalidReference(*pid));
         }
 
-        let order_key = self.calc_order_key(after);
+        let (block_tick, order_key) = self.next_position(after);
         let now = now_millis();
         let ts = self.tick();
         let header = BlockHeader {
@@ -450,7 +528,8 @@ impl BlockStore {
             content_type_at: ts,
         };
 
-        let mut block = BlockContent::with_content(header, &input_json, self.principal_id, order_key);
+        let mut block =
+            BlockContent::with_content(header, &input_json, self.principal_id, order_key, block_tick);
         block.set_tool_name(Some(tool_name.into()));
         block.set_tool_input(Some(input_json));
         self.blocks.insert(id, block);
@@ -481,7 +560,7 @@ impl BlockStore {
             return Err(CrdtError::InvalidReference(*after_id));
         }
 
-        let order_key = self.calc_order_key(after);
+        let (block_tick, order_key) = self.next_position(after);
         let now = now_millis();
         let ts = self.tick();
         let header = BlockHeader {
@@ -514,7 +593,7 @@ impl BlockStore {
         };
 
         let mut block =
-            BlockContent::with_content(header, &content.into(), self.principal_id, order_key);
+            BlockContent::with_content(header, &content.into(), self.principal_id, order_key, block_tick);
         block.set_tool_call_id(Some(*tool_call_id));
         self.blocks.insert(id, block);
         self.version += 1;
@@ -544,7 +623,7 @@ impl BlockStore {
             return Err(CrdtError::InvalidReference(*pid));
         }
 
-        let order_key = self.calc_order_key(after);
+        let (block_tick, order_key) = self.next_position(after);
 
         let snap = BlockSnapshot::drift(
             id,
@@ -554,7 +633,10 @@ impl BlockStore {
             source_model,
             drift_kind,
         );
-        let block = BlockContent::from_snapshot(&snap, self.principal_id, order_key);
+        let mut block = BlockContent::from_snapshot(&snap, self.principal_id, order_key);
+        if let Some(t) = block_tick {
+            block.set_tick(t);
+        }
         self.blocks.insert(id, block);
         self.version += 1;
         Ok(id)
@@ -581,9 +663,12 @@ impl BlockStore {
             return Err(CrdtError::InvalidReference(*pid));
         }
 
-        let order_key = self.calc_order_key(after);
+        let (block_tick, order_key) = self.next_position(after);
         let snap = BlockSnapshot::file(id, parent_id.copied(), file_path, content);
-        let block = BlockContent::from_snapshot(&snap, self.principal_id, order_key);
+        let mut block = BlockContent::from_snapshot(&snap, self.principal_id, order_key);
+        if let Some(t) = block_tick {
+            block.set_tick(t);
+        }
         self.blocks.insert(id, block);
         self.version += 1;
         Ok(id)
@@ -608,10 +693,13 @@ impl BlockStore {
             return Err(CrdtError::InvalidReference(*after_id));
         }
 
-        let order_key = self.calc_order_key(after);
+        let (block_tick, order_key) = self.next_position(after);
         let snap =
             BlockSnapshot::error_for(id, *parent_id, payload.clone(), summary);
-        let block = BlockContent::from_snapshot(&snap, self.principal_id, order_key);
+        let mut block = BlockContent::from_snapshot(&snap, self.principal_id, order_key);
+        if let Some(t) = block_tick {
+            block.set_tick(t);
+        }
         self.blocks.insert(id, block);
         self.version += 1;
         Ok(id)
@@ -642,14 +730,17 @@ impl BlockStore {
             return Err(CrdtError::InvalidReference(*pid));
         }
 
-        let order_key = self.calc_order_key(after);
+        let (block_tick, order_key) = self.next_position(after);
         let snap = BlockSnapshot::notification_block(
             id,
             parent_id.copied(),
             payload.clone(),
             summary,
         );
-        let block = BlockContent::from_snapshot(&snap, self.principal_id, order_key);
+        let mut block = BlockContent::from_snapshot(&snap, self.principal_id, order_key);
+        if let Some(t) = block_tick {
+            block.set_tick(t);
+        }
         self.blocks.insert(id, block);
         self.version += 1;
         Ok(id)
@@ -681,14 +772,17 @@ impl BlockStore {
             return Err(CrdtError::InvalidReference(*pid));
         }
 
-        let order_key = self.calc_order_key(after);
+        let (block_tick, order_key) = self.next_position(after);
         let snap = BlockSnapshot::resource_block(
             id,
             parent_id.copied(),
             payload.clone(),
             summary,
         );
-        let block = BlockContent::from_snapshot(&snap, self.principal_id, order_key);
+        let mut block = BlockContent::from_snapshot(&snap, self.principal_id, order_key);
+        if let Some(t) = block_tick {
+            block.set_tick(t);
+        }
         self.blocks.insert(id, block);
         self.version += 1;
         Ok(id)
@@ -709,7 +803,9 @@ impl BlockStore {
             return Err(CrdtError::DuplicateBlock(block_id));
         }
 
-        let order_key = self.calc_order_key(after);
+        // Restore/receive: keep the snapshot's own tick (via from_snapshot); the
+        // order_key is computed legacy-style without consuming a local tick.
+        let order_key = self.calc_order_key(after, None);
         let block = BlockContent::from_snapshot(&snapshot, self.principal_id, order_key);
         self.blocks.insert(block_id, block);
         self.version += 1;
@@ -919,7 +1015,8 @@ impl BlockStore {
             return Err(CrdtError::InvalidReference(*after_id));
         }
 
-        let order_key = self.calc_order_key(after);
+        // Reorder keeps the block's original tick; only its order_key moves.
+        let order_key = self.calc_order_key(after, None);
         self.blocks.get_mut(id).unwrap().set_order_key(order_key);
         self.version += 1;
         Ok(())
@@ -1314,6 +1411,10 @@ impl BlockStore {
             .map(|b| b.updated_at)
             .max()
             .unwrap_or(0);
+
+        // Seed `next_tick` past the max existing tick, and re-key any pre-tick
+        // (legacy) blocks into the tick scheme so the old order_keys don't linger.
+        store.normalize_timeline();
 
         Ok(store)
     }
@@ -2600,28 +2701,132 @@ mod tests {
             .iter()
             .map(|b| b.content.clone())
             .collect();
+        // Deterministic convergence still holds: both replicas agree on order.
         assert_eq!(order1, order2, "both stores should converge to same order");
 
-        // A and B should be adjacent, C and D should be adjacent (no interleaving)
         let a_pos = order1.iter().position(|c| c == "A").unwrap();
         let b_pos = order1.iter().position(|c| c == "B").unwrap();
         let c_pos = order1.iter().position(|c| c == "C").unwrap();
         let d_pos = order1.iter().position(|c| c == "D").unwrap();
 
-        assert_eq!(
-            (b_pos as isize - a_pos as isize).abs(),
-            1,
-            "A and B should be adjacent, got positions A={}, B={}",
-            a_pos,
-            b_pos
-        );
-        assert_eq!(
-            (d_pos as isize - c_pos as isize).abs(),
-            1,
-            "C and D should be adjacent, got positions C={}, D={}",
-            c_pos,
-            d_pos
-        );
+        // Per-replica tick order is preserved (each replica's own counter is
+        // monotonic): A precedes B, C precedes D.
+        assert!(a_pos < b_pos, "A should precede B (tick order within replica 1)");
+        assert!(c_pos < d_pos, "C should precede D (tick order within replica 2)");
+
+        // NOTE: cross-replica *grouping* (A,B adjacent; C,D adjacent) is no longer
+        // guaranteed. With tick-derived order_keys, two replicas that independently
+        // assign the same tick interleave by tick instead of grouping by author.
+        // Non-interleaving across writers is a multi-writer-timeline property that
+        // is explicitly deferred — see docs/hyoushigi.md ("single-writer first").
+    }
+
+    #[test]
+    fn test_inserts_get_monotonic_ticks() {
+        let mut store = test_store();
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            ids.push(
+                store
+                    .insert_block(
+                        ids.last(),
+                        ids.last(),
+                        Role::Model,
+                        BlockKind::Text,
+                        format!("line {i}"),
+                        Status::Done,
+                        ContentType::Plain,
+                    )
+                    .unwrap(),
+            );
+        }
+        // Ticks are 0..5, gap-free, in insertion order.
+        let ticks: Vec<i64> = ids
+            .iter()
+            .map(|id| store.get_block_snapshot(id).unwrap().tick.unwrap().get())
+            .collect();
+        assert_eq!(ticks, vec![0, 1, 2, 3, 4]);
+
+        // And blocks_ordered matches tick order.
+        let ordered: Vec<String> = store.blocks_ordered().iter().map(|b| b.content.clone()).collect();
+        assert_eq!(ordered, vec!["line 0", "line 1", "line 2", "line 3", "line 4"]);
+    }
+
+    #[test]
+    fn test_tick_order_keys_are_bounded() {
+        // The old append path grew order_keys by a char per insert (the O(N^3)
+        // cliff). Tick-derived keys stay fixed-width no matter how many blocks.
+        let mut store = test_store();
+        let mut last = None;
+        for _ in 0..500 {
+            last = Some(
+                store
+                    .insert_block(
+                        last.as_ref(),
+                        last.as_ref(),
+                        Role::Model,
+                        BlockKind::Text,
+                        "x",
+                        Status::Done,
+                        ContentType::Plain,
+                    )
+                    .unwrap(),
+            );
+        }
+        let lens: std::collections::HashSet<usize> = store
+            .blocks_ordered()
+            .iter()
+            .map(|b| b.order_key.as_ref().unwrap().len())
+            .collect();
+        assert_eq!(lens.len(), 1, "all tick-derived order_keys share one bounded length");
+    }
+
+    #[test]
+    fn test_normalize_rekeys_legacy_blocks() {
+        // Simulate a pre-tick store: blocks with legacy order_keys and no tick.
+        let mut store = test_store();
+        for (key, text) in [("V", "first"), ("VV", "second"), ("VVV", "third")] {
+            let id = store.new_block_id();
+            let header = BlockHeader {
+                id,
+                parent_id: None,
+                role: Role::User,
+                kind: BlockKind::Text,
+                status: Status::Done,
+                compacted: false,
+                collapsed: false,
+                ephemeral: false,
+                excluded: false,
+                created_at: now_millis(),
+                updated_at: 0,
+                tool_kind: None,
+                exit_code: None,
+                is_error: false,
+                status_at: 0,
+                collapsed_at: 0,
+                ephemeral_at: 0,
+                excluded_at: 0,
+                compacted_at: 0,
+                tool_meta_at: 0,
+                content_type: ContentType::Plain,
+                content_type_at: 0,
+            };
+            // tick = None — legacy.
+            let block = BlockContent::with_content(header, text, store.principal_id, key.to_string(), None);
+            store.blocks.insert(id, block);
+        }
+
+        store.normalize_timeline();
+
+        // Visual order preserved, every block now ticked 0..3, next_tick seeded.
+        let ordered = store.blocks_ordered();
+        let texts: Vec<String> = ordered.iter().map(|b| b.content.clone()).collect();
+        assert_eq!(texts, vec!["first", "second", "third"]);
+        let ticks: Vec<i64> = ordered.iter().map(|b| b.tick.unwrap().get()).collect();
+        assert_eq!(ticks, vec![0, 1, 2]);
+        assert_eq!(store.next_tick, 3);
+        // Legacy "V"/"VV"/"VVV" keys are gone — all bounded tick keys now.
+        assert!(ordered.iter().all(|b| b.order_key.as_ref().unwrap().starts_with("V0")));
     }
 
     #[test]
@@ -3242,7 +3447,7 @@ mod tests {
             content_type: ContentType::Plain,
             content_type_at: 0,
         };
-        let b1 = BlockContent::with_content(h1, "early", agent, "V".to_string());
+        let b1 = BlockContent::with_content(h1, "early", agent, "V".to_string(), None);
         store.blocks.insert(id1, b1);
         store.version += 1;
 
@@ -3271,7 +3476,7 @@ mod tests {
             content_type: ContentType::Plain,
             content_type_at: 0,
         };
-        let b2 = BlockContent::with_content(h2, "mid", agent, "W".to_string());
+        let b2 = BlockContent::with_content(h2, "mid", agent, "W".to_string(), None);
         store.blocks.insert(id2, b2);
         store.version += 1;
 
@@ -3300,7 +3505,7 @@ mod tests {
             content_type: ContentType::Plain,
             content_type_at: 0,
         };
-        let b3 = BlockContent::with_content(h3, "late", agent, "X".to_string());
+        let b3 = BlockContent::with_content(h3, "late", agent, "X".to_string(), None);
         store.blocks.insert(id3, b3);
         store.version += 1;
 
@@ -3369,7 +3574,7 @@ mod tests {
         };
         store.blocks.insert(
             id1,
-            BlockContent::with_content(h1, "keep", agent, "V".to_string()),
+            BlockContent::with_content(h1, "keep", agent, "V".to_string(), None),
         );
         store.version += 1;
 
@@ -3400,7 +3605,7 @@ mod tests {
         };
         store.blocks.insert(
             id2,
-            BlockContent::with_content(h2, "drop", agent, "W".to_string()),
+            BlockContent::with_content(h2, "drop", agent, "W".to_string(), None),
         );
         store.version += 1;
 

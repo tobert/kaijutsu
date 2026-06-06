@@ -3559,6 +3559,58 @@ mod tests {
         assert_eq!(snapshot.content, "Hello from server");
     }
 
+    /// e2e: a coder turn gets monotonic per-context timeline ticks that survive a
+    /// persistence (snapshot → reload) roundtrip — the recovery path the kernel
+    /// runs on restart. Exercises CRDT tick assignment → BlockSnapshot → postcard
+    /// StoreSnapshot → from_snapshot (+ normalize).
+    #[test]
+    fn test_coder_turn_ticks_survive_persistence_roundtrip() {
+        let store = BlockStore::new(test_agent());
+        let ctx = ContextId::new();
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+
+        // A coder turn: user prompt, model reply, then two streamed model lines —
+        // each appended after the previous (the streaming hot path).
+        let turn = ["fix the bug", "on it", "patching foo.rs", "done"];
+        let roles = [Role::User, Role::Model, Role::Model, Role::Model];
+        let mut prev: Option<BlockId> = None;
+        for (text, role) in turn.iter().zip(roles) {
+            prev = Some(
+                store
+                    .insert_block(
+                        ctx,
+                        None,
+                        prev.as_ref(),
+                        role,
+                        BlockKind::Text,
+                        *text,
+                        Status::Done,
+                        ContentType::Plain,
+                    )
+                    .unwrap(),
+            );
+        }
+
+        // Ticks are monotonic, gap-free, in turn order.
+        let live = store.block_snapshots(ctx).unwrap();
+        let ticks: Vec<i64> = live.iter().map(|b| b.tick.unwrap().get()).collect();
+        assert_eq!(ticks, vec![0, 1, 2, 3], "coder turn gets monotonic ticks");
+
+        // Persist → reload, exactly as the kernel recovers a context on restart.
+        let snapshot = store.get(ctx).unwrap().doc.snapshot();
+        let bytes = postcard::to_allocvec(&snapshot).unwrap();
+        let restored: StoreSnapshot = postcard::from_bytes(&bytes).unwrap();
+        let reloaded = CrdtBlockStore::from_snapshot(restored, test_agent()).unwrap();
+
+        let rblocks = reloaded.blocks_ordered();
+        let rticks: Vec<i64> = rblocks.iter().map(|b| b.tick.unwrap().get()).collect();
+        assert_eq!(rticks, vec![0, 1, 2, 3], "ticks survive the persistence roundtrip");
+        let rtexts: Vec<String> = rblocks.iter().map(|b| b.content.clone()).collect();
+        assert_eq!(rtexts, turn.to_vec(), "order preserved across reload");
+    }
+
     /// Test that insert_tool_call emits mergeable SyncPayload.
     #[tokio::test]
     async fn test_insert_tool_call_emits_sync_payload() {
