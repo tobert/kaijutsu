@@ -41,6 +41,19 @@ async fn harness() -> Harness {
     let store = shared_block_store_with_db(db.clone(), ws_id, creator);
 
     let kernel = Arc::new(Kernel::new("rc-role-test", Some(tmp.path())).await);
+
+    // Seed and mount a private `/etc/rc` tree — the same setup the server RPC
+    // boot path (kaijutsu-server/src/rpc.rs) and the unit-test helper
+    // (kj::test_helpers) perform. Without it, `load_rc_scripts` hits
+    // `NoMountPoint`, finds no scripts, and the role lifecycle never runs —
+    // which is exactly what these tests exist to exercise.
+    let rc_dir = tmp.path().join("rc");
+    std::fs::create_dir_all(&rc_dir).expect("create rc dir");
+    kaijutsu_kernel::seed_scripts::ensure_rc_seed_files(&rc_dir).expect("seed rc files");
+    kernel
+        .mount("/etc/rc", kaijutsu_kernel::vfs::LocalBackend::new(&rc_dir))
+        .await;
+
     let file_cache = Arc::new(FileDocumentCache::new(store.clone(), kernel.vfs().clone()));
     kernel
         .register_builtin_mcp_servers(store.clone(), file_cache, None, db.clone())
@@ -197,11 +210,24 @@ async fn director_role_seeds_block_tooling_but_not_file_writes() {
         "director should allow block_create (whole-instance grant)"
     );
     assert!(binding.allows_tool(&block, "block_read"));
-    // Read file access, but not writes.
+    // File access: read + the write tools. A director owns the rc lifecycle
+    // scripts, so it gets file:write/edit (and rc-write below) for governance
+    // artifacts — general code edits still delegate to a coder context. See
+    // assets/defaults/rc/director/create/S10-binding.kai.
     assert!(binding.allows_tool(&file, "read"), "director should allow file read");
     assert!(
-        !binding.allows_tool(&file, "write"),
-        "director must NOT allow file write"
+        binding.allows_tool(&file, "write"),
+        "director should allow file write (rc-lifecycle governance)"
+    );
+    assert!(
+        binding.allows_tool(&file, "edit"),
+        "director should allow file edit (rc-lifecycle governance)"
+    );
+    // The dedicated /etc/rc subtree grant — deny-by-default, not implied by the
+    // file-tool grants above.
+    assert!(
+        binding.allows(&Capability::RcWrite),
+        "director should hold rc-write for the /etc/rc subtree"
     );
 
     // Director is a binding admin — may write any context's loadout.

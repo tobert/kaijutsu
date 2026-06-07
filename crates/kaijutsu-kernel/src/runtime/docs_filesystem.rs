@@ -44,6 +44,9 @@ fn backend_to_io(err: BackendError) -> io::Error {
         BackendError::InvalidOperation(msg) => io::Error::new(io::ErrorKind::InvalidInput, msg),
         BackendError::ToolNotFound(msg) => io::Error::new(io::ErrorKind::NotFound, msg),
         BackendError::Conflict(e) => io::Error::other(e.to_string()),
+        // `BackendError` is `#[non_exhaustive]` upstream; map any variant added
+        // later through its Display so we surface it rather than fail to build.
+        other => io::Error::other(other.to_string()),
     }
 }
 
