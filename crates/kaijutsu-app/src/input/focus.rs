@@ -93,6 +93,7 @@ impl FocusArea {
     }
 
     /// Human-readable name for the current focus area (for hint widget).
+    #[allow(dead_code)] // Hint widget not yet wired to this label.
     pub fn name(&self) -> &'static str {
         match self {
             FocusArea::Compose => "COMPOSE",

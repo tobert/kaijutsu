@@ -130,10 +130,15 @@ struct ModelsToml {
     #[serde(default)]
     model_aliases: HashMap<String, ModelAlias>,
 
+    // Accepted in models.toml but not yet consumed by the loader — kept so
+    // configs can declare them ahead of the wiring (and so the parse doesn't
+    // warn on a present-but-unread section).
     #[serde(default)]
+    #[allow(dead_code)]
     streaming: Option<StreamingToml>,
 
     #[serde(default)]
+    #[allow(dead_code)]
     rate_limits: Option<RateLimitsToml>,
 
     #[serde(default)]

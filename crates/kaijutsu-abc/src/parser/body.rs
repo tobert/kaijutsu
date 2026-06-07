@@ -26,7 +26,11 @@ fn skip_spaces(input: &mut &str) -> usize {
     start_len - input.len()
 }
 
-/// Parse the body section of an ABC tune.
+/// Parse the body section of an ABC tune. Test-only thin wrapper over
+/// [`parse_body_with_voices`] that discards the inline voice defs — the
+/// production path always wants the voices, so only the unit tests below
+/// use this shape.
+#[cfg(test)]
 pub fn parse_body(
     input: &str,
     collector: &mut FeedbackCollector,

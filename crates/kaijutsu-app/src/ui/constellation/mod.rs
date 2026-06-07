@@ -199,6 +199,7 @@ impl Constellation {
     ///
     /// Extracts the context hex prefix and matches against node context_id.
     /// Falls back to the focused node if the block_id can't be parsed.
+    #[allow(dead_code)] // Block→node routing helper; caller not yet wired.
     fn node_by_block_id_mut(&mut self, block_id: &str) -> Option<&mut ContextNode> {
         let ctx_hex = block_id.split('_').next()?;
         if let Ok(ctx_id) = ContextId::parse(ctx_hex)

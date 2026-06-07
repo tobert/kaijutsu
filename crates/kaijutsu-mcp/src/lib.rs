@@ -290,6 +290,9 @@ impl Default for McpServerState {
 pub struct KaijutsuMcp {
     backend: Backend,
     tool_router: ToolRouter<Self>,
+    /// Held for the rmcp prompt surface; no prompts are served yet, so the
+    /// field is constructed but not yet read.
+    #[allow(dead_code)]
     prompt_router: PromptRouter<Self>,
     server_state: McpServerState,
     /// Handle to abort the background event listener when all clones are dropped.
@@ -300,7 +303,9 @@ pub struct KaijutsuMcp {
     context_name: String,
     /// Detected agent name (e.g., "claude-code").
     agent_name: Option<String>,
-    /// Per-session principal for block authorship.
+    /// Per-session principal for block authorship. Captured at connect; the
+    /// authorship path doesn't read it back through this handle yet.
+    #[allow(dead_code)]
     session_principal: PrincipalId,
 }
 

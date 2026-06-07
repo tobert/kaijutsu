@@ -65,13 +65,16 @@ pub enum RichContentKind {
         /// Display height (capped to a reasonable maximum).
         height: f32,
         /// Raw SVG source for future re-parse (e.g. DPI-aware re-rendering).
+        #[allow(dead_code)] // Retained for the planned DPI-aware re-parse.
         source: Arc<String>,
         /// Scale factor at parse time (placeholder for future DPI re-parse).
+        #[allow(dead_code)] // Retained for the planned DPI-aware re-parse.
         rendered_at_dpi: f32,
     },
     /// ABC music notation — rendered directly to vello from engraving IR.
     Abc {
         /// Raw ABC source text.
+        #[allow(dead_code)] // Retained for re-parse / source inspection; render uses `tune`.
         source: Arc<String>,
         /// Parsed AST (avoids re-parsing on resize).
         tune: Arc<kaijutsu_abc::Tune>,

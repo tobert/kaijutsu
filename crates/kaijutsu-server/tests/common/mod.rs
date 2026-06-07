@@ -23,6 +23,7 @@ pub fn run_local<F: std::future::Future<Output = ()>>(f: F) {
 /// Start an SSH server on an ephemeral port and return the address.
 ///
 /// The listener is pre-bound so connections queue during kernel initialization.
+#[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
 pub async fn start_server() -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -44,6 +45,7 @@ pub async fn start_server() -> SocketAddr {
 ///
 /// This makes `initialize_kernel_models()` register a "mock" provider so that
 /// `KjDispatcher.summarize()` and other LLM-dependent paths work in tests.
+#[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
 pub async fn start_server_with_mock_llm() -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

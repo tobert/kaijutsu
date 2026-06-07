@@ -335,6 +335,7 @@ pub struct InputOverlay {
     pub vim_mode: Option<String>,
     /// Target context for this input (None = use active context).
     #[reflect(ignore)]
+    #[allow(dead_code)] // Floating-chat context targeting; submit path not yet reading it.
     pub target_context: Option<ContextId>,
 }
 
@@ -699,11 +700,13 @@ pub struct ErrorChildIndex {
 
 impl ErrorChildIndex {
     /// Check if this block has any Error children.
+    #[allow(dead_code)] // Error-block grouping UI (polish phase); readers not yet wired.
     pub fn has_errors(&self, block_id: &BlockId) -> bool {
         self.by_parent.contains_key(block_id)
     }
 
     /// Get Error children of a block (empty slice if none).
+    #[allow(dead_code)] // Error-block grouping UI (polish phase); readers not yet wired.
     pub fn children(&self, block_id: &BlockId) -> &[BlockId] {
         self.by_parent
             .get(block_id)
@@ -741,14 +744,17 @@ pub fn build_error_child_index(
 /// Not persisted, not in CRDT — purely per-viewer.
 #[derive(Resource, Default)]
 pub struct ExpandedErrorParents {
+    #[allow(dead_code)] // Error-block expand UI (polish phase); not yet wired to a system.
     pub expanded: std::collections::HashSet<BlockId>,
 }
 
 impl ExpandedErrorParents {
+    #[allow(dead_code)] // Error-block expand UI (polish phase); not yet wired to a system.
     pub fn is_expanded(&self, id: &BlockId) -> bool {
         self.expanded.contains(id)
     }
 
+    #[allow(dead_code)] // Error-block expand UI (polish phase); not yet wired to a system.
     pub fn toggle(&mut self, id: BlockId) {
         if !self.expanded.remove(&id) {
             self.expanded.insert(id);
@@ -772,7 +778,9 @@ pub struct GlobalErrorQueue {
 
 /// A single transient error entry for dock HUD display.
 pub struct GlobalError {
+    #[allow(dead_code)] // Dock HUD toast fields; renderer reads `created_at` only so far.
     pub operation: String,
+    #[allow(dead_code)] // Dock HUD toast fields; renderer reads `created_at` only so far.
     pub message: String,
     pub created_at: f64,
 }
