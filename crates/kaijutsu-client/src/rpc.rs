@@ -1819,11 +1819,14 @@ pub(crate) fn parse_output_data(
     for i in 0..root_reader.len() {
         root.push(parse_output_node(root_reader.get(i))?);
     }
-    Ok(kaijutsu_types::OutputData {
-        headers,
-        root,
-        rich_json: None,
-    })
+    // `OutputData` is `#[non_exhaustive]` upstream — build it through the
+    // constructors rather than a struct literal. `nodes` sets `rich_json:
+    // None`; headers are attached only when present.
+    let mut data = kaijutsu_types::OutputData::nodes(root);
+    if let Some(headers) = headers {
+        data = data.with_headers(headers);
+    }
+    Ok(data)
 }
 
 fn parse_context_id(data: &[u8]) -> Result<ContextId, RpcError> {
