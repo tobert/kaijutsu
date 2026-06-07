@@ -209,6 +209,26 @@ impl KjDispatcher {
                 return KjResult::Err(format!("kj block: {e}"));
             }
         };
+        // Block mutations are gated on the matching `builtin.block` tool cap —
+        // the kj surface checks the same capability the MCP tool would, so a
+        // read-only loadout can't write blocks by routing through kj. Reads
+        // (list/inspect/count/read/history/diff) stay ungated.
+        let block_write_tool = match &parsed.command {
+            BlockCommand::Append { .. } => Some("block_append"),
+            BlockCommand::Edit { .. } => Some("block_edit"),
+            BlockCommand::Create { .. } => Some("block_create"),
+            BlockCommand::Status { .. } => Some("block_status"),
+            _ => None,
+        };
+        if let Some(tool) = block_write_tool {
+            let cap = crate::mcp::Capability::Tool {
+                instance: crate::mcp::InstanceId::new("builtin.block"),
+                tool: tool.to_string(),
+            };
+            if let Err(denied) = self.require_cap(caller, cap, "block") {
+                return denied;
+            }
+        }
         match parsed.command {
             BlockCommand::List {
                 context,

@@ -23,7 +23,18 @@ use super::parse::extract_named_arg;
 use super::{KjCaller, KjDispatcher, KjResult};
 
 impl KjDispatcher {
-    pub(crate) async fn dispatch_policy(&self, argv: &[String], _caller: &KjCaller) -> KjResult {
+    pub(crate) async fn dispatch_policy(&self, argv: &[String], caller: &KjCaller) -> KjResult {
+        // `set` writes an instance's QoS policy — gated on the same
+        // `builtin.policy:policy_set` tool cap the MCP surface uses. `show` reads.
+        if matches!(argv.first().map(|s| s.as_str()), Some("set")) {
+            let cap = crate::mcp::Capability::Tool {
+                instance: InstanceId::new("builtin.policy"),
+                tool: "policy_set".to_string(),
+            };
+            if let Err(denied) = self.require_cap(caller, cap, "policy set") {
+                return denied;
+            }
+        }
         match argv.first().map(|s| s.as_str()) {
             Some("show") => self.policy_show(&argv[1..]).await,
             Some("set") => self.policy_set(&argv[1..]).await,

@@ -11,10 +11,22 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 - **VFS Multiplexing:** `Kernel` implements `VfsOps` directly (`crates/kaijutsu-kernel/src/kernel.rs:870`). As the VFS grows to support multiple mount backends (local, memory, remote), this might become a bottleneck or overly complex. Consider extracting to a dedicated `VfsManager` or `VfsRouter`.
 - **Server RPC Modularization:** `crates/kaijutsu-server/src/rpc.rs` is a massive file (~292KB). The monolithic implementation of the Cap'n Proto traits should be split into smaller modules by domain (e.g., `rpc/vfs.rs`, `rpc/llm.rs`, `rpc/mcp.rs`).
 - **Cap'n Proto Schema Clarity:** There is slight conceptual overlap between `BlockKind` and `ContentType` in `kaijutsu.capnp`. Consider documenting the strict boundaries (e.g., `BlockKind` is the structural DAG role, `ContentType` is the raw MIME rendering hint).
-- **Context-type tool policy (unified governance):** 
+- **Context-type tool policy (unified governance):** The `kj` surface is now
+  capability-gated — escalation-relevant verbs check the caller's loadout via
+  `KjDispatcher::require_cap` (five authority caps: `drive`/`fork`/`drift`/
+  `transport`/`operator`, plus reuse of `rc-write` and the `builtin.block`/
+  `builtin.policy` tool caps). `kj` was previously an ungated hole behind
+  `facade:shell`. Remaining:
   - Dynamic / principal-scoped overrides.
   - Self-lockout ergonomics (narrowing binding to exclude `builtin.bindings`).
   - Per-principal budgets + fair queuing.
+  - **Unjoined-`attach` authorization:** `kj attach` is gated on `operator`, but
+    a caller with no joined context has no loadout to check, so an unjoined
+    session is refused. Decide whether attach (switch + run target's rc) should
+    be ungated like `switch`, or authorize against the target/session instead.
+  - **Live contexts need reseed/restart:** broadened role loadouts only reach
+    newly-created contexts; existing ones keep their old (now authority-less)
+    binding until `kj rc reseed` + re-create or a kernel restart.
 - **LLM providers:**
   - Move per-model knobs out of the config layer (`models.toml`), into the app.
   - Credential file option (alongside `api_key_env`).
@@ -68,12 +80,13 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ## Hyoushigi / Composer
 
-- **Evaluate the composer `kj` capability loadout:** the `composer` context_type
-  currently reuses the broad permissive binding (`*` + `facade:*`). The OODA
-  `tick` verb only needs to drive a turn (`kj drive`) — work out the *minimal*
-  capability set a composer (and its tick script) actually requires and narrow
-  `assets/defaults/rc/composer/create/S10-binding.kai` accordingly. Note the tick
-  hook runs under the context's loadout, so the binding gates self-driving.
+- **Composer `kj` loadout — narrowed (kj capability gates).** `composer` now
+  seeds its own `assets/defaults/rc/composer/create/S10-binding.kai`: `drive` +
+  the block/read tooling + facades, *not* `fork`/`drift`/`transport`/`operator`.
+  The tick (`kj drive`) runs under this loadout, so narrowing the binding now
+  actually gates self-driving (it didn't before `kj` grew capability gates).
+  Follow-up: revisit whether the composing turn also needs `submit_input` vs.
+  relying on the turn driver, and trim further if the tick proves it can.
 - **Cadence/tempo should be settable per context:** `kj transport tempo <bpm>`
   exists, but the OODA cadence (`ooda_every`, default 32 bars) is fixed in
   `BeatPolicy::composer_default()`. Make the cadence a settable knob (rc-declared

@@ -37,6 +37,19 @@ pub type ResolvedName = (InstanceId, String);
 /// writes.
 pub const KNOWN_FACADES: &[&str] = &["shell", "edit_input", "submit_input"];
 
+/// The `kj` *authority* capabilities — bare-word grants that gate the
+/// escalation-relevant `kj` verbs which never reach the broker `call_tool` path
+/// (so they have no `Instance`/`Tool` to hang off). Like `admin`/`rc-write`,
+/// these are **deliberately not implied by `*`**: a broad loadout (`coder` with
+/// "*") must not silently be able to self-drive, fork, merge drift, drive the
+/// transport, or perform context/workspace/preset/doc lifecycle. The narrow
+/// roles (`explorer`, `composer`) grant exactly the ones they need.
+///
+/// Stored as a normalized set (`ContextToolBinding::authorities`) persisted in
+/// the `context_binding_authorities` table — extensible (a future authority is
+/// a new variant + token, no schema migration).
+pub const KNOWN_AUTHORITIES: &[&str] = &["drive", "fork", "drift", "transport", "operator"];
+
 /// A single capability grant or query. The allow-set is the positive surface a
 /// context may use. `Instance`/`Tool`/`Facade` are the granular grants;
 /// `AllInstances`/`AllFacades`/`Admin` are the explicit broad grants that set
@@ -67,6 +80,51 @@ pub enum Capability {
     /// privileged lifecycle script by accident — that's an ergonomic nudge,
     /// not a hard wall (host `vim` and `kj rc` always work).
     RcWrite,
+    /// `kj drive` — clock an autonomous turn. The composer OODA tick runs under
+    /// its context's loadout, so this is the cap that gates self-driving.
+    Drive,
+    /// `kj fork` — snapshot a context into a child.
+    Fork,
+    /// `kj drift push/pull/merge/flush/cancel` and `kj stage commit` — the
+    /// cross-context write surface (merge into a parent, push edits to a peer).
+    Drift,
+    /// `kj transport play/pause/stop/tempo/ooda` — drive a context's beat.
+    Transport,
+    /// Context/workspace/preset/doc/cas lifecycle (create/set/archive/remove…)
+    /// and `kj attach`. Operator authority over the durable structure, kept
+    /// distinct from `Admin` (which is narrowly loadout-write).
+    Operator,
+}
+
+impl Capability {
+    /// The canonical bare-word token for an *authority* capability (the grants
+    /// kept in [`ContextToolBinding::authorities`]), or `None` for the
+    /// structural `Instance`/`Tool`/`Facade`/broad-flag variants. Centralizes
+    /// the variant⟷token mapping so `allows`/`grant`/`revoke_cap` and the
+    /// persistence layer never drift.
+    pub fn authority_name(&self) -> Option<&'static str> {
+        Some(match self {
+            Capability::Drive => "drive",
+            Capability::Fork => "fork",
+            Capability::Drift => "drift",
+            Capability::Transport => "transport",
+            Capability::Operator => "operator",
+            _ => return None,
+        })
+    }
+
+    /// Parse a bare-word authority token into its capability, or `None` if the
+    /// token is not a known authority. Inverse of [`Self::authority_name`].
+    pub fn from_authority_name(token: &str) -> Option<Capability> {
+        Some(match token {
+            "drive" => Capability::Drive,
+            "fork" => Capability::Fork,
+            "drift" => Capability::Drift,
+            "transport" => Capability::Transport,
+            "operator" => Capability::Operator,
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -96,6 +154,11 @@ pub struct ContextToolBinding {
     /// Facade grants (`shell`, `edit_input`, `submit_input`).
     #[serde(default)]
     pub allowed_facades: Vec<String>,
+    /// Authority grants — the bare-word `kj` verb caps (`drive`, `fork`,
+    /// `drift`, `transport`, `operator`). A normalized set; **not** implied by
+    /// `all_instances`. See [`KNOWN_AUTHORITIES`].
+    #[serde(default)]
+    pub authorities: std::collections::BTreeSet<String>,
     /// Sticky resolved names. Once resolved, the binding preserves the name
     /// until an operator explicitly requalifies.
     pub name_map: HashMap<String, ResolvedName>,
@@ -124,6 +187,13 @@ impl ContextToolBinding {
             && self.allowed_instances.is_empty()
             && self.allowed_tools.is_empty()
             && self.allowed_facades.is_empty()
+            && self.authorities.is_empty()
+    }
+
+    /// True if this context holds the named `kj` authority (`drive`, `fork`,
+    /// `drift`, `transport`, `operator`). Sugar over [`Self::allows`].
+    pub fn has_authority(&self, name: &str) -> bool {
+        self.authorities.contains(name)
     }
 
     /// True if this context may administer bindings (its own and others').
@@ -161,6 +231,16 @@ impl ContextToolBinding {
             Capability::AllFacades => self.all_facades,
             Capability::Admin => self.binding_admin,
             Capability::RcWrite => self.binding_rc_write,
+            // Authority caps are explicit and **not** implied by `*`: a broad
+            // loadout never silently self-drives/forks/merges. Checked against
+            // the normalized set, never a flag.
+            Capability::Drive
+            | Capability::Fork
+            | Capability::Drift
+            | Capability::Transport
+            | Capability::Operator => {
+                cap.authority_name().is_some_and(|n| self.authorities.contains(n))
+            }
         }
     }
 
@@ -193,6 +273,15 @@ impl ContextToolBinding {
             Capability::AllFacades => self.all_facades = true,
             Capability::Admin => self.binding_admin = true,
             Capability::RcWrite => self.binding_rc_write = true,
+            c @ (Capability::Drive
+            | Capability::Fork
+            | Capability::Drift
+            | Capability::Transport
+            | Capability::Operator) => {
+                if let Some(n) = c.authority_name() {
+                    self.authorities.insert(n.to_string());
+                }
+            }
         }
     }
 
@@ -212,6 +301,15 @@ impl ContextToolBinding {
             Capability::AllFacades => self.all_facades = false,
             Capability::Admin => self.binding_admin = false,
             Capability::RcWrite => self.binding_rc_write = false,
+            Capability::Drive
+            | Capability::Fork
+            | Capability::Drift
+            | Capability::Transport
+            | Capability::Operator => {
+                if let Some(n) = cap.authority_name() {
+                    self.authorities.remove(n);
+                }
+            }
         }
     }
 
@@ -327,6 +425,68 @@ mod tests {
         assert!(!b.is_rc_write());
         // Revoking rc-write left the other broad grants intact.
         assert!(b.allows(&Capability::AllInstances) && b.is_admin());
+    }
+
+    #[test]
+    fn authority_caps_are_explicit_and_not_implied_by_star() {
+        // The whole point: a broad loadout ("*" + "facade:*" + admin + rc-write)
+        // must NOT silently grant any kj authority verb.
+        let mut b = ContextToolBinding::new();
+        b.grant(Capability::AllInstances);
+        b.grant(Capability::AllFacades);
+        b.grant(Capability::Admin);
+        b.grant(Capability::RcWrite);
+        for cap in [
+            Capability::Drive,
+            Capability::Fork,
+            Capability::Drift,
+            Capability::Transport,
+            Capability::Operator,
+        ] {
+            assert!(
+                !b.allows(&cap),
+                "broad loadout must NOT imply authority {:?}",
+                cap.authority_name()
+            );
+        }
+    }
+
+    #[test]
+    fn authority_grant_revoke_round_trips_each_variant() {
+        for cap in [
+            Capability::Drive,
+            Capability::Fork,
+            Capability::Drift,
+            Capability::Transport,
+            Capability::Operator,
+        ] {
+            let mut b = ContextToolBinding::new();
+            assert!(!b.allows(&cap), "{cap:?} granted on a fresh binding");
+            b.grant(cap.clone());
+            assert!(b.allows(&cap), "{cap:?} not allowed after grant");
+            let name = cap.authority_name().expect("authority has a token");
+            assert!(b.has_authority(name), "{name} missing from set after grant");
+            // Granting one authority must not leak to the siblings.
+            for other in KNOWN_AUTHORITIES {
+                if *other != name {
+                    assert!(!b.has_authority(other), "{name} grant leaked to {other}");
+                }
+            }
+            b.revoke_cap(&cap);
+            assert!(!b.allows(&cap), "{cap:?} survived revoke");
+            assert!(b.is_empty(), "binding not empty after revoking sole authority");
+        }
+    }
+
+    #[test]
+    fn authority_name_round_trips_known_tokens() {
+        for token in KNOWN_AUTHORITIES {
+            let cap = Capability::from_authority_name(token)
+                .unwrap_or_else(|| panic!("{token} did not parse as an authority"));
+            assert_eq!(cap.authority_name(), Some(*token));
+        }
+        assert!(Capability::from_authority_name("nope").is_none());
+        assert!(Capability::AllInstances.authority_name().is_none());
     }
 
     #[test]

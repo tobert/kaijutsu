@@ -29,6 +29,12 @@ impl KjDispatcher {
             return KjResult::ok_ephemeral(self.drive_help(), ContentType::Markdown);
         }
 
+        // Self-driving is gated: the caller's loadout must hold `drive`. This is
+        // what makes narrowing a composer's binding actually stop its OODA tick.
+        if let Err(denied) = self.require_cap(caller, crate::mcp::Capability::Drive, "drive") {
+            return denied;
+        }
+
         // --prompt is the optional seed; when omitted the turn runs against
         // whatever is already in the context's block log (the drift-then-drive
         // path). The seed lives in TurnFlow::Requested.content, which is only a
@@ -142,6 +148,7 @@ fn short_hex(id: kaijutsu_types::ContextId) -> String {
 #[cfg(test)]
 mod tests {
     use crate::kj::test_helpers::*;
+    use crate::kj::KjCaller;
     use kaijutsu_types::PrincipalId;
 
     fn s(v: &str) -> String {
@@ -314,6 +321,73 @@ mod tests {
         assert!(
             result.message().contains("no turn driver"),
             "error should name the missing turn driver: {}",
+            result.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn drive_denied_without_drive_capability() {
+        // The gate that makes narrowing a composer's binding actually stop its
+        // OODA tick: a non-privileged caller whose loadout lacks `drive` is
+        // refused before any turn is requested.
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("nodrive"), None, principal);
+        seed_with_block(&d, ctx, principal);
+        // Replace the broad test loadout with everything EXCEPT drive, to prove
+        // the denial is specific to the missing `drive` authority. Written to
+        // the DB — the authoritative store require_cap reads (the broker's DB
+        // handle is unset in test_dispatcher, so broker.set_binding alone would
+        // only touch the cache require_cap doesn't consult).
+        let mut binding = crate::mcp::ContextToolBinding::new();
+        binding.grant(crate::mcp::Capability::AllInstances);
+        binding.grant(crate::mcp::Capability::AllFacades);
+        binding.grant(crate::mcp::Capability::Operator);
+        d.kernel_db().lock().upsert_context_binding(ctx, &binding).unwrap();
+
+        let c = caller_with_context(ctx);
+        // A subscriber exists, so a pass would actually publish — isolate the gate.
+        let _sub = d.kernel().turn_flows().subscribe("turn.requested");
+
+        let result = d.dispatch(&[s("drive")], &c).await;
+        assert!(!result.is_ok(), "drive without the `drive` cap must be denied");
+        assert!(
+            result.message().contains("denied") && result.message().contains("drive"),
+            "denial should name the missing capability: {}",
+            result.message()
+        );
+
+        // Granting `drive` lets the same caller through.
+        binding.grant(crate::mcp::Capability::Drive);
+        d.kernel_db().lock().upsert_context_binding(ctx, &binding).unwrap();
+        let result = d.dispatch(&[s("drive")], &c).await;
+        assert!(result.is_ok(), "drive with the `drive` cap should pass: {}", result.message());
+    }
+
+    #[tokio::test]
+    async fn drive_privileged_caller_bypasses_gate() {
+        // The rc lifecycle (privileged kaish) drives without holding `drive` —
+        // the control plane exercises loadouts it assigns.
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("rc"), None, principal);
+        seed_with_block(&d, ctx, principal);
+        // Deny-all in the DB (the source require_cap reads) to prove the
+        // privileged bypass holds even with zero granted capabilities.
+        d.kernel_db()
+            .lock()
+            .upsert_context_binding(ctx, &crate::mcp::ContextToolBinding::new())
+            .unwrap();
+        let _sub = d.kernel().turn_flows().subscribe("turn.requested");
+
+        let c = KjCaller {
+            privileged: true,
+            ..caller_with_context(ctx)
+        };
+        let result = d.dispatch(&[s("drive")], &c).await;
+        assert!(
+            result.is_ok(),
+            "privileged caller should bypass the drive gate: {}",
             result.message()
         );
     }

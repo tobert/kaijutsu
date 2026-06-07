@@ -70,6 +70,11 @@ impl KjDispatcher {
             return KjResult::ok_ephemeral(self.fork_help(), ContentType::Markdown);
         }
 
+        // All fork variants snapshot a context into a child — gated on `fork`.
+        if let Err(denied) = self.require_cap(caller, crate::mcp::Capability::Fork, "fork") {
+            return denied;
+        }
+
         if has_flag(argv, &["--shallow"]) {
             return self.fork_shallow(argv, caller).await;
         }

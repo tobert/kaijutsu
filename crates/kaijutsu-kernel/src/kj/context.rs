@@ -198,6 +198,23 @@ impl KjDispatcher {
             return KjResult::ok_ephemeral(self.context_help(), ContentType::Markdown);
         }
 
+        // Mutating or destroying an *existing* context is operator authority.
+        // `create`/`scratch` are deliberately ungated: minting a context is the
+        // bootstrap entry point (a fresh, unjoined session must be able to make
+        // its first context), and the new context's loadout is assigned by its
+        // rc `create` lifecycle, not the caller's. Read/navigation verbs
+        // (list/info/current/switch/log) stay ungated too.
+        if matches!(
+            argv[0].as_str(),
+            "set" | "unset" | "move" | "mv" | "archive" | "remove" | "rm" | "retag"
+        ) {
+            if let Err(denied) =
+                self.require_cap(caller, crate::mcp::Capability::Operator, "context")
+            {
+                return denied;
+            }
+        }
+
         match argv[0].as_str() {
             "list" | "ls" => self.context_list(argv, caller).await,
             "info" => self.context_info(argv, caller),

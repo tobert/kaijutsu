@@ -23,6 +23,17 @@ impl KjDispatcher {
             return self.stage_status(context_id);
         }
 
+        // `commit` merges the staged child live (a cross-context write) — same
+        // risk class as `drift merge`, so it shares the `drift` authority. The
+        // status/include/exclude curation verbs stay ungated.
+        if matches!(argv[0].as_str(), "commit" | "go") {
+            if let Err(denied) =
+                self.require_cap(caller, crate::mcp::Capability::Drift, "stage commit")
+            {
+                return denied;
+            }
+        }
+
         match argv[0].as_str() {
             "commit" | "go" => self.stage_commit(context_id).await,
             "status" | "st" => self.stage_status(context_id),

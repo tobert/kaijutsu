@@ -14,6 +14,14 @@ kj binding allow "admin"
 kj binding allow "builtin.file:write"
 kj binding allow "builtin.file:edit"
 kj binding allow "rc-write"
+# kj verb authorities: a director coordinates contexts end-to-end — drives and
+# forks them, merges drift, runs the transport, and performs context/workspace
+# lifecycle. Explicit grants (NOT implied by any of the above).
+kj binding allow "drive"
+kj binding allow "fork"
+kj binding allow "drift"
+kj binding allow "transport"
+kj binding allow "operator"
 # Facades: full interaction surface (shell + edit + submit). `shell` covers
 # both shell and context_shell; `edit_input` covers write_input too.
 kj binding allow "facade:shell"

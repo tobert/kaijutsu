@@ -4,9 +4,16 @@ use kaijutsu_types::ContentType;
 use super::{KjCaller, KjDispatcher, KjResult};
 
 impl KjDispatcher {
-    pub(crate) fn dispatch_cas(&self, argv: &[String], _caller: &KjCaller) -> KjResult {
+    pub(crate) fn dispatch_cas(&self, argv: &[String], caller: &KjCaller) -> KjResult {
         if argv.is_empty() {
             return KjResult::ok_ephemeral(self.cas_help(), ContentType::Markdown);
+        }
+
+        // Writing/removing blobs is operator authority; get/ls/info stay ungated.
+        if matches!(argv[0].as_str(), "put" | "rm" | "remove") {
+            if let Err(denied) = self.require_cap(caller, crate::mcp::Capability::Operator, "cas") {
+                return denied;
+            }
         }
 
         match argv[0].as_str() {

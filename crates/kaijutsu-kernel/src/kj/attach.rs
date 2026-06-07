@@ -34,6 +34,11 @@ impl KjDispatcher {
             );
         }
 
+        // Attach runs the target's rc `attach` lifecycle — operator authority.
+        if let Err(denied) = self.require_cap(caller, crate::mcp::Capability::Operator, "attach") {
+            return denied;
+        }
+
         let ctx_ref = parse_context_ref(first);
         let target_id = {
             let db = self.kernel_db().lock();
@@ -109,7 +114,9 @@ mod tests {
     }
 
     /// Caller with no joined context — kj attach should work without
-    /// one (the user is attaching FROM nowhere TO something).
+    /// one (the user is attaching FROM nowhere TO something). Privileged so
+    /// these mechanics tests bypass the Operator gate; attach authorization for
+    /// an unjoined session is tracked as a follow-up in docs/issues.md.
     fn unjoined_caller() -> KjCaller {
         KjCaller {
             principal_id: PrincipalId::new(),
@@ -117,7 +124,7 @@ mod tests {
             session_id: SessionId::new(),
             confirmed: false,
             rc_depth: 0,
-            privileged: false,
+            privileged: true,
         }
     }
 

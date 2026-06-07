@@ -13,7 +13,16 @@ impl KjDispatcher {
             return KjResult::Err(self.drift_help());
         }
 
-        match argv[0].as_str() {
+        // The cross-context write surface (push/pull/merge/flush/cancel) is
+        // gated on `drift`; the read-only views (queue/history/edge) are not.
+        let sub = argv[0].as_str();
+        if matches!(sub, "push" | "pull" | "merge" | "flush" | "cancel") {
+            if let Err(denied) = self.require_cap(caller, crate::mcp::Capability::Drift, "drift") {
+                return denied;
+            }
+        }
+
+        match sub {
             "push" => self.drift_push(argv, caller).await,
             "pull" => self.drift_pull(argv, caller).await,
             "merge" => self.drift_merge(argv, caller).await,

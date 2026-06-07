@@ -77,6 +77,9 @@ const DIRECTOR_BINDING_BODY: &str =
 const COMPOSER_STANCE_BODY: &str =
     include_str!("../../../assets/defaults/rc/composer/create/S00-stance.md");
 
+const COMPOSER_BINDING_BODY: &str =
+    include_str!("../../../assets/defaults/rc/composer/create/S10-binding.kai");
+
 const COMPOSER_TICK_BODY: &str =
     include_str!("../../../assets/defaults/rc/composer/tick/S10-drive.kai");
 
@@ -117,11 +120,14 @@ const SEED_FILES: &[(&str, &str)] = &[
     ("/etc/rc/director/create/S20-cache.kai", CACHE_CREATE_BODY),
     ("/etc/rc/director/fork/S30-cache.kai", CACHE_FORK_BODY),
     ("/etc/rc/director/drift/S40-cache.kai", CACHE_DRIFT_BODY),
-    // ── composer — beat-aware role (stance + broad loadout + cache + beat) ─
-    // Broad loadout: the composer drives turns, edits blocks, runs kj. The
-    // `tick` verb is the beat hook fired by the kernel scheduler.
+    // ── composer — beat-aware role (stance + narrow loadout + cache + beat) ─
+    // Narrowed loadout: the composer drives ITSELF (the `tick` verb is the beat
+    // hook fired by the kernel scheduler, running `kj drive` under this loadout)
+    // and authors music blocks — but does not fork, merge drift, run the
+    // transport, or perform context lifecycle. `drive` is the cap that gates
+    // self-driving.
     ("/etc/rc/composer/create/S00-stance.md", COMPOSER_STANCE_BODY),
-    ("/etc/rc/composer/create/S10-binding.kai", PERMISSIVE_BINDING_BODY),
+    ("/etc/rc/composer/create/S10-binding.kai", COMPOSER_BINDING_BODY),
     ("/etc/rc/composer/create/S20-cache.kai", CACHE_CREATE_BODY),
     ("/etc/rc/composer/fork/S30-cache.kai", CACHE_FORK_BODY),
     ("/etc/rc/composer/drift/S40-cache.kai", CACHE_DRIFT_BODY),

@@ -27,6 +27,13 @@ impl KjDispatcher {
         }
         let action = action.unwrap();
 
+        // Driving the beat (play/pause/stop/tempo/ooda) is gated on `transport`.
+        if let Err(denied) =
+            self.require_cap(caller, crate::mcp::Capability::Transport, "transport")
+        {
+            return denied;
+        }
+
         // Target context: `--context <ref>`, else the caller's current context.
         let ctx_ref = super::parse::extract_named_arg(argv, &["--context"]);
         let ctx = {

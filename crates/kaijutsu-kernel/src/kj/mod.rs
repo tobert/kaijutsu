@@ -399,6 +399,58 @@ impl KjDispatcher {
         &self.kernel
     }
 
+    /// Gate an escalation-relevant `kj` verb on the **caller's** loadout.
+    ///
+    /// `kj` is a kaish builtin that bypasses the broker `call_tool` / facade
+    /// gates entirely, so without this check a context that can merely reach a
+    /// shell could drive turns, fork, merge drift, etc. regardless of its
+    /// binding. This is the third enforcement surface alongside the broker and
+    /// the facade gate, and like them it is **deny-by-default**.
+    ///
+    /// The capability is checked against the caller's *own* context binding —
+    /// the loadout the actor operates under (so a composer's `drive` grant
+    /// gates its OODA tick even when it drives a sibling). The authoritative
+    /// binding is read from `KernelDb` (which `broker.set_binding` always
+    /// writes through), keeping this synchronous so both the sync and async
+    /// dispatch leaves can call it.
+    ///
+    /// Privileged callers (the rc lifecycle's trusted kaish) bypass: the
+    /// control plane assigns and exercises loadouts.
+    pub(crate) fn require_cap(
+        &self,
+        caller: &KjCaller,
+        cap: crate::mcp::Capability,
+        verb: &str,
+    ) -> Result<(), KjResult> {
+        if caller.privileged {
+            return Ok(());
+        }
+        let label = binding::cap_label(&cap);
+        let Some(ctx) = caller.context_id else {
+            return Err(KjResult::Err(format!(
+                "kj {verb}: denied — no active context to authorize against; \
+                 this verb requires the '{label}' capability"
+            )));
+        };
+        let allowed = self
+            .kernel_db()
+            .lock()
+            .get_context_binding(ctx)
+            .ok()
+            .flatten()
+            .map(|b| b.allows(&cap))
+            .unwrap_or(false);
+        if allowed {
+            Ok(())
+        } else {
+            Err(KjResult::Err(format!(
+                "kj {verb}: denied — context {} lacks the '{label}' capability \
+                 (grant with `kj binding allow \"{label}\"`)",
+                ctx.short()
+            )))
+        }
+    }
+
     /// Summarize a context's blocks via LLM.
     ///
     /// Used by `fork --compact`, `drift pull`, and `drift merge`.
@@ -525,6 +577,12 @@ pub(crate) mod test_helpers {
     }
 
     /// Create a KjCaller with fresh IDs for testing.
+    ///
+    /// Privileged by default: this stands in for the trusted control plane in
+    /// verb-mechanics tests (its context_id is a fresh, unregistered id with no
+    /// binding, so it would otherwise be denied by the kj capability gates).
+    /// Capability tests construct non-privileged callers explicitly via
+    /// [`caller_with_context`].
     pub fn test_caller() -> KjCaller {
         KjCaller {
             principal_id: PrincipalId::new(),
@@ -532,7 +590,7 @@ pub(crate) mod test_helpers {
             session_id: SessionId::new(),
             confirmed: false,
             rc_depth: 0,
-            privileged: false,
+            privileged: true,
         }
     }
 
@@ -549,6 +607,9 @@ pub(crate) mod test_helpers {
     }
 
     /// Create a confirmed caller (for testing destructive ops post-latch).
+    /// Privileged for the same reason as [`test_caller`]: it's a trusted
+    /// control-plane fixture, and some destructive-op tests target unregistered
+    /// contexts that carry no binding.
     pub fn confirmed_caller(context_id: ContextId) -> KjCaller {
         KjCaller {
             principal_id: PrincipalId::new(),
@@ -556,7 +617,7 @@ pub(crate) mod test_helpers {
             session_id: SessionId::new(),
             confirmed: true,
             rc_depth: 0,
-            privileged: false,
+            privileged: true,
         }
     }
 
@@ -572,7 +633,7 @@ pub(crate) mod test_helpers {
 
         // Insert document + context into KernelDb
         {
-            let db = dispatcher.kernel_db().lock();
+            let mut db = dispatcher.kernel_db().lock();
             let ws_id = db
                 .get_or_create_default_workspace(created_by)
                 .unwrap();
@@ -607,6 +668,23 @@ pub(crate) mod test_helpers {
                 preset_id: None,
             };
             db.insert_context(&row).unwrap();
+
+            // Grant test contexts a fully-capable loadout by default so the kj
+            // capability gates don't trip verb-*mechanics* tests. Capability
+            // tests (kj::binding, the *_denied gate tests) clear or narrow this
+            // explicitly via `broker().clear_binding` / `set_binding`. Written
+            // straight to the DB (the authoritative source `require_cap` reads).
+            let mut binding = crate::mcp::ContextToolBinding::new();
+            binding.grant(crate::mcp::Capability::AllInstances);
+            binding.grant(crate::mcp::Capability::AllFacades);
+            binding.grant(crate::mcp::Capability::Admin);
+            binding.grant(crate::mcp::Capability::RcWrite);
+            binding.grant(crate::mcp::Capability::Drive);
+            binding.grant(crate::mcp::Capability::Fork);
+            binding.grant(crate::mcp::Capability::Drift);
+            binding.grant(crate::mcp::Capability::Transport);
+            binding.grant(crate::mcp::Capability::Operator);
+            db.upsert_context_binding(id, &binding).unwrap();
         }
 
         // Register in DriftRouter

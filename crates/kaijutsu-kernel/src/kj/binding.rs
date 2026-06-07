@@ -20,6 +20,8 @@
 //!   • `*`                         — every instance (explicit permissive)
 //!   • `facade:*`                  — every facade surface
 //!   • `admin`                     — binding-admin (write any context's loadout)
+//!   • `drive`/`fork`/`drift`/`transport`/`operator` — kj verb authorities
+//!     (escalation-relevant kj subcommands; explicit, NOT implied by `*`)
 //!
 //! Semantics: **deny-by-default** — a context with no binding grants nothing.
 //! The rc `create`/`fork` lifecycle assigns the initial loadout (broad roles
@@ -56,6 +58,12 @@ fn parse_capability(s: &str) -> Result<Capability, String> {
         "admin" => return Ok(Capability::Admin),
         "rc-write" => return Ok(Capability::RcWrite),
         _ => {}
+    }
+    // Authority caps: bare-word kj verb grants (drive/fork/drift/transport/
+    // operator), explicit and not implied by `*`. Checked before the generic
+    // `instance:tool` split since they contain no colon.
+    if let Some(cap) = Capability::from_authority_name(s) {
+        return Ok(cap);
     }
     if let Some(rest) = s.strip_prefix("facade:") {
         if rest.is_empty() {
@@ -106,6 +114,7 @@ impl KjDispatcher {
             "  kj binding revoke <cap> [<ctx>]\n",
             "  kj binding reset  [<ctx>]\n\n",
             "  <cap>: <instance> | <instance>:<tool> | facade:<name> | * | facade:* | admin | rc-write\n",
+            "         | drive | fork | drift | transport | operator  (kj verb authorities)\n",
             "  <ctx>: . (default) | .parent | <label> | <hex prefix>\n"
         )
         .to_string()
@@ -141,6 +150,7 @@ impl KjDispatcher {
                     .map(|(i, t)| format!("{}:{}", i.as_str(), t))
                     .collect::<Vec<_>>(),
                 "facades": b.allowed_facades.clone(),
+                "authorities": b.authorities.iter().cloned().collect::<Vec<_>>(),
             }),
         };
 
@@ -173,6 +183,11 @@ impl KjDispatcher {
                 } else {
                     b.allowed_facades.join(", ")
                 };
+                let authorities = if b.authorities.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    b.authorities.iter().cloned().collect::<Vec<_>>().join(", ")
+                };
                 // Flags first — they dominate the granular lists (`*` allows every
                 // instance regardless of the explicit list, etc.). Without this
                 // line a broad binding misleadingly reads as all "(none)".
@@ -195,7 +210,7 @@ impl KjDispatcher {
                     flags.join(", ")
                 };
                 format!(
-                    "context {}:\n  grants: {flags}\n  instances: {instances}\n  tools: {tools}\n  facades: {facades}",
+                    "context {}:\n  grants: {flags}\n  instances: {instances}\n  tools: {tools}\n  facades: {facades}\n  authorities: {authorities}",
                     ctx_id.short()
                 )
             }
@@ -307,7 +322,7 @@ impl KjDispatcher {
     }
 }
 
-fn cap_label(cap: &Capability) -> String {
+pub(crate) fn cap_label(cap: &Capability) -> String {
     match cap {
         Capability::Instance(i) => i.as_str().to_string(),
         Capability::Tool { instance, tool } => format!("{}:{}", instance.as_str(), tool),
@@ -316,6 +331,14 @@ fn cap_label(cap: &Capability) -> String {
         Capability::AllFacades => "facade:*".to_string(),
         Capability::Admin => "admin".to_string(),
         Capability::RcWrite => "rc-write".to_string(),
+        Capability::Drive
+        | Capability::Fork
+        | Capability::Drift
+        | Capability::Transport
+        | Capability::Operator => cap
+            .authority_name()
+            .expect("authority variant has a token")
+            .to_string(),
     }
 }
 
@@ -333,6 +356,9 @@ mod tests {
     async fn kj_binding_allow_show_revoke_reset_round_trip() {
         let d = test_dispatcher().await;
         let ctx = register_context(&d, Some("bind-test"), None, PrincipalId::system());
+        // register_context grants a broad test loadout; clear it so this test
+        // starts from the real deny-by-default state it asserts about.
+        d.kernel().broker().clear_binding(&ctx).await;
         // Widening (`allow`) requires a privileged (rc) or admin caller — the
         // rc lifecycle is what assigns loadouts. Simulate the rc path here.
         let caller = KjCaller {
@@ -384,6 +410,10 @@ mod tests {
         let d = test_dispatcher().await;
         let ctx = register_context(&d, Some("ordinary"), None, PrincipalId::system());
         let other = register_context(&d, Some("other"), None, PrincipalId::system());
+        // Clear the broad test loadout: this guard is about deny-by-default and
+        // self-narrow-only, so both contexts must start from a clean slate.
+        d.kernel().broker().clear_binding(&ctx).await;
+        d.kernel().broker().clear_binding(&other).await;
         let file = InstanceId::new("builtin.file");
 
         // Seed a loadout as the rc lifecycle would (privileged).
@@ -427,6 +457,10 @@ mod tests {
         let d = test_dispatcher().await;
         let admin_ctx = register_context(&d, Some("director"), None, PrincipalId::system());
         let target = register_context(&d, Some("managed"), None, PrincipalId::system());
+        // Clear the broad test loadout so the admin grant + widening below are
+        // the only grants in play (otherwise both start fully capable).
+        d.kernel().broker().clear_binding(&admin_ctx).await;
+        d.kernel().broker().clear_binding(&target).await;
 
         // Make admin_ctx an admin (privileged rc bootstrap).
         let rc = KjCaller {
@@ -478,6 +512,11 @@ mod tests {
         );
         assert_eq!(parse_capability("admin").unwrap(), Capability::Admin);
         assert_eq!(parse_capability("rc-write").unwrap(), Capability::RcWrite);
+        assert_eq!(parse_capability("drive").unwrap(), Capability::Drive);
+        assert_eq!(parse_capability("fork").unwrap(), Capability::Fork);
+        assert_eq!(parse_capability("drift").unwrap(), Capability::Drift);
+        assert_eq!(parse_capability("transport").unwrap(), Capability::Transport);
+        assert_eq!(parse_capability("operator").unwrap(), Capability::Operator);
         assert!(parse_capability("").is_err());
         assert!(parse_capability("builtin.file:").is_err());
         assert!(parse_capability("facade:").is_err());

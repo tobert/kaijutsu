@@ -591,6 +591,9 @@ mod tests {
     /// Caller with no joined context — `kj context create` without
     /// `--parent` resolves to `None` rather than the test caller's fake
     /// id, avoiding a FK violation on the forked_from column.
+    /// Privileged so these rc-lifecycle tests can `kj context create` (now
+    /// Operator-gated) as the trusted bootstrap/control plane would. The
+    /// `context_id: None` models dispatching before a context is joined.
     fn unjoined_caller() -> KjCaller {
         KjCaller {
             principal_id: PrincipalId::new(),
@@ -598,7 +601,7 @@ mod tests {
             session_id: kaijutsu_types::SessionId::new(),
             confirmed: false,
             rc_depth: 0,
-            privileged: false,
+            privileged: true,
         }
     }
 
@@ -1377,7 +1380,13 @@ esac
             )
             .unwrap();
 
-        let fork_caller = caller_with_context(parent_id);
+        // Privileged: the parent was made via `kj context create` (deny-by-
+        // default), so a plain caller would be refused by the `fork` gate. This
+        // test exercises fork mechanics, not the capability check.
+        let fork_caller = KjCaller {
+            privileged: true,
+            ..caller_with_context(parent_id)
+        };
         let r = d
             .dispatch(
                 &argv(&["fork", "--name", "child", "--compact"]),
@@ -1489,7 +1498,13 @@ esac
         // Fork. Parent's blocks copy into the child, then the fork
         // marker injects (taking the child's count to >3), then
         // rc-on-fork runs and reads KJ_PARENT_BLOCK_COUNT.
-        let fork_caller = caller_with_context(parent_id);
+        // Privileged: the parent was made via `kj context create` (deny-by-
+        // default), so a plain caller would be refused by the `fork` gate. This
+        // test exercises fork mechanics, not the capability check.
+        let fork_caller = KjCaller {
+            privileged: true,
+            ..caller_with_context(parent_id)
+        };
         let r = d
             .dispatch(&argv(&["fork", "--name", "child"]), &fork_caller)
             .await;
@@ -1580,7 +1595,13 @@ test -z "$KJ_PARENT_BLOCK_COUNT" || exit 99
 
         // Step 2: fork the parent. Use a caller bound to the parent so
         // fork resolves "."  to the parent context.
-        let fork_caller = caller_with_context(parent_id);
+        // Privileged: the parent was made via `kj context create` (deny-by-
+        // default), so a plain caller would be refused by the `fork` gate. This
+        // test exercises fork mechanics, not the capability check.
+        let fork_caller = KjCaller {
+            privileged: true,
+            ..caller_with_context(parent_id)
+        };
         let fork_result = d
             .dispatch(&argv(&["fork", "--name", "child"]), &fork_caller)
             .await;

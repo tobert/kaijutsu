@@ -444,6 +444,16 @@ CREATE TABLE IF NOT EXISTS context_binding_facades (
     PRIMARY KEY (context_id, facade_id)
 );
 
+-- Authority grants (BTreeSet<String>) — the bare-word `kj` verb caps
+-- (drive/fork/drift/transport/operator). A normalized set, not a flag column:
+-- a future authority is a new row, no schema migration. Deliberately NOT
+-- implied by all_instances, mirroring binding_admin / binding_rc_write.
+CREATE TABLE IF NOT EXISTS context_binding_authorities (
+    context_id BLOB NOT NULL REFERENCES context_bindings(context_id) ON DELETE CASCADE,
+    authority  TEXT NOT NULL,
+    PRIMARY KEY (context_id, authority)
+);
+
 CREATE TABLE IF NOT EXISTS context_env (
     context_id BLOB NOT NULL REFERENCES contexts(context_id) ON DELETE CASCADE,
     key        TEXT NOT NULL,
@@ -2265,6 +2275,10 @@ impl KernelDb {
             "DELETE FROM context_binding_facades WHERE context_id = ?1",
             params![blob_param(context_id.as_bytes())],
         )?;
+        conn.execute(
+            "DELETE FROM context_binding_authorities WHERE context_id = ?1",
+            params![blob_param(context_id.as_bytes())],
+        )?;
         for (idx, instance) in binding.allowed_instances.iter().enumerate() {
             conn.execute(
                 "INSERT INTO context_binding_instances (context_id, instance_id, order_idx)
@@ -2294,6 +2308,14 @@ impl KernelDb {
                 "INSERT INTO context_binding_facades (context_id, facade_id, order_idx)
                  VALUES (?1, ?2, ?3)",
                 params![blob_param(context_id.as_bytes()), facade, idx as i64],
+            )?;
+        }
+        // Authorities are a set (BTreeSet iterates sorted) — no order_idx.
+        for authority in &binding.authorities {
+            conn.execute(
+                "INSERT INTO context_binding_authorities (context_id, authority)
+                 VALUES (?1, ?2)",
+                params![blob_param(context_id.as_bytes()), authority],
             )?;
         }
         for (visible_name, (instance, tool)) in &binding.name_map {
@@ -2394,6 +2416,21 @@ impl KernelDb {
         };
         allowed_facades.shrink_to_fit();
 
+        let authorities: std::collections::BTreeSet<String> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT authority FROM context_binding_authorities
+                 WHERE context_id = ?1",
+            )?;
+            let rows = stmt.query_map(params![blob_param(context_id.as_bytes())], |row| {
+                row.get::<_, String>(0)
+            })?;
+            let mut out = std::collections::BTreeSet::new();
+            for r in rows {
+                out.insert(r?);
+            }
+            out
+        };
+
         let mut name_map = std::collections::HashMap::new();
         {
             let mut stmt = self.conn.prepare(
@@ -2421,6 +2458,7 @@ impl KernelDb {
             allowed_instances,
             allowed_tools,
             allowed_facades,
+            authorities,
             name_map,
         }))
     }

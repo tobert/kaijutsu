@@ -13,6 +13,18 @@ impl KjDispatcher {
             return KjResult::Err(self.workspace_help());
         }
 
+        // Workspace mutation is operator authority; list/show stay ungated.
+        if matches!(
+            argv[0].as_str(),
+            "create" | "new" | "add" | "bind" | "remove" | "rm"
+        ) {
+            if let Err(denied) =
+                self.require_cap(caller, crate::mcp::Capability::Operator, "workspace")
+            {
+                return denied;
+            }
+        }
+
         match argv[0].as_str() {
             "list" | "ls" => self.workspace_list(),
             "show" => self.workspace_show(argv),

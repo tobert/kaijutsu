@@ -67,6 +67,15 @@ impl KjDispatcher {
         if argv.is_empty() {
             return KjResult::Err(self.rc_help());
         }
+        // Writing /etc/rc lifecycle scripts is gated on `rc-write`. `kj rc`
+        // writes go through the admin-only rc_cache (not builtin.file:write), so
+        // this is the *only* place the rc-write capability is enforced for the
+        // kj surface. Reads (list/show) stay ungated.
+        if matches!(argv[0].as_str(), "add" | "rm" | "remove" | "edit" | "update" | "reseed") {
+            if let Err(denied) = self.require_cap(caller, crate::mcp::Capability::RcWrite, "rc") {
+                return denied;
+            }
+        }
         match argv[0].as_str() {
             "add" => self.rc_add(argv, caller).await,
             "list" | "ls" => self.rc_list(argv).await,
@@ -86,9 +95,9 @@ impl KjDispatcher {
     }
 
     /// The shared CRDT file cache that backs `/etc/rc`. `kj rc` writes go
-    /// through this (privileged, admin-only command surface) rather than the
-    /// gated `builtin.file:write` tool, so the rc-write capability gate does
-    /// not apply here.
+    /// through this rather than the gated `builtin.file:write` tool; the
+    /// rc-write capability is enforced up front in [`Self::dispatch_rc`] so the
+    /// two write paths (`kj rc` and `builtin.file`) share the same gate.
     fn rc_cache(&self) -> std::sync::Arc<crate::file_tools::FileDocumentCache> {
         self.kernel().file_cache(self.block_store())
     }

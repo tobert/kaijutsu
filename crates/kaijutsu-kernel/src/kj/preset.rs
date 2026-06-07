@@ -13,6 +13,15 @@ impl KjDispatcher {
             return KjResult::Err(self.preset_help());
         }
 
+        // Preset mutation is operator authority; list/show stay ungated.
+        if matches!(argv[0].as_str(), "save" | "remove" | "rm") {
+            if let Err(denied) =
+                self.require_cap(caller, crate::mcp::Capability::Operator, "preset")
+            {
+                return denied;
+            }
+        }
+
         match argv[0].as_str() {
             "list" | "ls" => self.preset_list(),
             "show" => self.preset_show(argv),

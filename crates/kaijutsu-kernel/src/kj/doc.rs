@@ -126,6 +126,12 @@ impl KjDispatcher {
                 return KjResult::Err(format!("kj doc: {e}"));
             }
         };
+        // Document lifecycle (create/delete) is operator authority; list/tree read.
+        if matches!(parsed.command, DocCommand::Create { .. } | DocCommand::Delete { .. }) {
+            if let Err(denied) = self.require_cap(caller, crate::mcp::Capability::Operator, "doc") {
+                return denied;
+            }
+        }
         match parsed.command {
             DocCommand::List { kind, json } => self.doc_list(kind.as_deref(), json),
             DocCommand::Tree {
@@ -640,7 +646,7 @@ mod tests {
     #[tokio::test]
     async fn doc_list_empty_returns_friendly_text() {
         let d = test_dispatcher().await;
-        let c = caller_with_context(ContextId::new());
+        let c = test_caller();
 
         let result = d.dispatch(&[s("doc"), s("list")], &c).await;
         assert!(result.is_ok(), "list failed: {}", result.message());
@@ -712,7 +718,7 @@ mod tests {
     #[tokio::test]
     async fn doc_list_invalid_kind_errors() {
         let d = test_dispatcher().await;
-        let c = caller_with_context(ContextId::new());
+        let c = test_caller();
 
         let result = d
             .dispatch(&[s("doc"), s("list"), s("--kind"), s("bogus")], &c)
@@ -726,7 +732,7 @@ mod tests {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let _conv = register_context_with_doc(&d, Some("c"), principal);
-        let c = caller_with_context(ContextId::new());
+        let c = test_caller();
 
         let result = d.dispatch(&[s("doc"), s("list")], &c).await;
         match result {
@@ -776,7 +782,7 @@ mod tests {
     #[tokio::test]
     async fn doc_tree_invalid_id_errors() {
         let d = test_dispatcher().await;
-        let c = caller_with_context(ContextId::new());
+        let c = test_caller();
 
         let result = d.dispatch(&[s("doc"), s("tree"), s("not-hex")], &c).await;
         assert!(!result.is_ok());
@@ -788,7 +794,7 @@ mod tests {
     #[tokio::test]
     async fn doc_create_default_kind_is_conversation() {
         let d = test_dispatcher().await;
-        let c = caller_with_context(ContextId::new());
+        let c = test_caller();
 
         let result = d.dispatch(&[s("doc"), s("create")], &c).await;
         assert!(result.is_ok(), "create failed: {}", result.message());
@@ -802,7 +808,7 @@ mod tests {
     #[tokio::test]
     async fn doc_create_code_with_language() {
         let d = test_dispatcher().await;
-        let c = caller_with_context(ContextId::new());
+        let c = test_caller();
 
         let result = d
             .dispatch(
@@ -827,7 +833,7 @@ mod tests {
     #[tokio::test]
     async fn doc_create_with_explicit_id() {
         let d = test_dispatcher().await;
-        let c = caller_with_context(ContextId::new());
+        let c = test_caller();
         let chosen = ContextId::new();
 
         let result = d
@@ -844,7 +850,7 @@ mod tests {
     #[tokio::test]
     async fn doc_create_invalid_kind_errors() {
         let d = test_dispatcher().await;
-        let c = caller_with_context(ContextId::new());
+        let c = test_caller();
 
         let result = d
             .dispatch(&[s("doc"), s("create"), s("--kind"), s("not-a-kind")], &c)
