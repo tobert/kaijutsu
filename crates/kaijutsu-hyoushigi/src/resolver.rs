@@ -69,7 +69,12 @@ pub enum ResolveError {
 
 /// The one content-specific capability. A recipe names a `Resolver` by
 /// [`ResolverId`]; the engine looks it up and drives it through the lifecycle.
-pub trait Resolver {
+///
+/// `Send + Sync` because a [`Timeline`](crate::Timeline) owns its resolvers and
+/// is itself driven from a kernel beat-scheduler thread distinct from the one
+/// that registers them — the engine stays single-threaded internally, but the
+/// whole timeline must be shareable across threads to be pumped.
+pub trait Resolver: Send + Sync {
     fn id(&self) -> ResolverId;
 
     /// Wall-clock estimate; feeds lead-time derivation

@@ -548,13 +548,52 @@ fallback are exercised by their first user.
 > inline vs. binary-as-CAS-hash byte homes); and the **internal beat** —
 > `tick_at`/`pump` drive the playhead from a wall-clock reading without waiting
 > for resolves (the actual interval timer is the kernel/client integrator's job,
-> keeping the crate runtime-agnostic). **Not yet:** wiring hyoushigi into the
-> kernel at all (it's a standalone island — no live code constructs a ticked
-> block, so every block on the wire has `tick = None`); the UI timeline render;
-> and steps 5–6. **At integration:** attach `hyoushigi.tick` as a span attribute
-> on the `engine.block_create`/`block_append` (and materialize→insert) spans, so
-> a block's timeline position shows up in traces — there is no producer to
-> instrument until then.
+> keeping the crate runtime-agnostic).
+>
+> **Kernel integration (landed — the composer slice):** hyoushigi is no longer an
+> island. `kaijutsu-kernel` depends on it and owns a per-context `timelines`
+> registry (`arm_timeline`/`timeline`/`disarm_timeline`); `Resolver` gained a
+> `Send + Sync` bound so a timeline can be pumped from a scheduler thread. The
+> **single coalescing beat scheduler** lives in `kaijutsu-server`
+> (`beat.rs`, twin of the turn driver): a min-heap + ingress, one `select!`,
+> arming only contexts that own a beat (coders never get a heap entry). Each beat
+> it `pump`s the timeline and runs the **CAS+block bridge**
+> (`hyoushigi::materialize_committed`): committed cell → durable CAS → ticked
+> `BlockSnapshot` → `insert_from_snapshot` (now tick-aware: `order_key` derives
+> from the cell's beat coordinate). Materialized cells are authored by
+> `PrincipalId::beat()`. The **`tick` rc verb** is wired; the **composer**
+> `context_type` ships (`assets/defaults/rc/composer/` stance + binding + cache +
+> `tick/S10-drive.kai`), is armed on create, and on its coarse OODA cadence (32
+> bars @ 120 BPM default) fires the `tick` verb (`kj drive`) to request the next
+> turn. The first production `Resolver` — `abc_to_midi` — crystallizes
+> ABC-by-hash into SMF MIDI. Note: `block.tick` was unified by commit `3d437d4`
+> into a **shared per-context coordinate** (ties allowed; `BlockId` is the unique
+> row id), correcting the earlier "Some only for materialized cells" framing.
+>
+> **Transport + closed OODA loop (landed):** the scheduler is the composer's
+> **transport**, with two independent switches — the **clock** (`play`/`pause`/
+> `stop`) and the **OODA-arm** — driven by `kj transport play|pause|stop|tempo
+> <bpm>|ooda <on|off>` (→ `BeatCommand` over the kernel ingress). The context tick
+> is **event-counted**: while playing each beat does `advance_to(playhead + 1)`,
+> so a pause freezes musical time and a resume picks up at **+1** with no
+> wall-clock catch-up — the kernel runs 24×7 and keeps its scheduler alive while a
+> context goes quiescent (no heap entry, zero tokens) and continues "as if nothing
+> happened." Contexts arm **stopped** on create (and after restart) — no surprise
+> token spend; explicit `play` starts. There is **no rewind** (the playhead is
+> forward-only; revisiting the past is an *export* of committed content, not a
+> seek). The OODA loop is closed: on `turn.completed` for an OODA-armed composer
+> the scheduler reads the model's ABC block, stores it to CAS, and
+> `schedule_abc_cell`s an `abc_to_midi` cell a bar ahead — so a played composer
+> turns model output into MIDI on the beat, end to end.
+>
+> **Not yet:** the UI timeline render + transport buttons/spacebar + a capnp
+> transport surface (today `kj transport` only); external-MIDI clock discipline;
+> disarm-on-archive and re-arm-on-restart (no archive RPC yet; restart resets to
+> stopped, doesn't re-arm); seeding the playhead from the max committed tick on
+> re-arm; a richer `compute_basis` / section-placement policy (the MIDI cell is
+> scheduled a fixed bar ahead for now); a `Midi` `ContentType` render variant; and
+> step 6 (audio). **Still open:** attach `hyoushigi.tick` as a span attribute on the materialize→insert
+> spans (the producer now exists, so this can land).
 
 1. **Generalize position first** — land the `Tick` / `TickDelta` split as the
    logical-coordinate-with-pluggable-binding generalization, per the spec'd algebra under

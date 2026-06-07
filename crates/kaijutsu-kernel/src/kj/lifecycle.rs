@@ -82,9 +82,14 @@ pub const VERB_CREATE: &str = "create";
 pub const VERB_FORK: &str = "fork";
 pub const VERB_ATTACH: &str = "attach";
 pub const VERB_DRIFT: &str = "drift";
+/// The beat verb: fired by the kernel beat scheduler on a context's coarse OODA
+/// cadence (e.g. every N bars for a composer). Its scripts are the per-beat work
+/// hook — typically `kj drive` to request the next OODA turn. Materialized the
+/// same throwaway-kaish way the other verbs are; no new runtime.
+pub const VERB_TICK: &str = "tick";
 
 fn verb_is_wired(verb: &str) -> bool {
-    matches!(verb, VERB_CREATE | VERB_FORK | VERB_DRIFT | VERB_ATTACH)
+    matches!(verb, VERB_CREATE | VERB_FORK | VERB_DRIFT | VERB_ATTACH | VERB_TICK)
 }
 
 impl KjDispatcher {

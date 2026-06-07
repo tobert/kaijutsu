@@ -1,0 +1,12 @@
+# Composer beat — the OODA cadence hook.
+#
+# Fired by the kernel beat scheduler on this context's coarse cadence
+# (every N bars; default 32 bars @ 120 BPM). `kj drive` publishes a turn
+# request for the current context; the server's turn driver runs the model
+# turn, whose ABC output the abc_to_midi resolver crystallizes into MIDI on
+# the beat. This script is the user-editable seam — change the prompt, gate
+# the drive on conditions, or add pre-beat bookkeeping here.
+#
+# No positional context: the tick lifecycle runs with this context as the
+# current one, so `kj drive` targets it (avoids passing the raw id as an arg).
+kj drive --prompt "Beat boundary: observe the musical layers committed so far and compose the next section as ABC notation."

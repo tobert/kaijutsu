@@ -66,6 +66,31 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 - **ABC features:** `I:linebreak`, `m:` macro expansion, `%%` directives, Unicode escapes/fonts.
 - **ABC layout:** Linear duration spacing (needs Gould spacing/justification), system bracket/brace, closed-score layout.
 
+## Hyoushigi / Composer
+
+- **Evaluate the composer `kj` capability loadout:** the `composer` context_type
+  currently reuses the broad permissive binding (`*` + `facade:*`). The OODA
+  `tick` verb only needs to drive a turn (`kj drive`) — work out the *minimal*
+  capability set a composer (and its tick script) actually requires and narrow
+  `assets/defaults/rc/composer/create/S10-binding.kai` accordingly. Note the tick
+  hook runs under the context's loadout, so the binding gates self-driving.
+- **Cadence/tempo should be settable per context:** `kj transport tempo <bpm>`
+  exists, but the OODA cadence (`ooda_every`, default 32 bars) is fixed in
+  `BeatPolicy::composer_default()`. Make the cadence a settable knob (rc-declared
+  and/or a `kj transport` arg), persisted per context. Fine to do later.
+- **Transport surface beyond `kj`:** app transport buttons / spacebar + a capnp
+  transport surface (today `kj transport play|pause|stop|tempo|ooda` only).
+- **Restart re-arm + playhead recovery:** a kernel restart resets composers to
+  stopped and does *not* re-arm them; on re-arm, seed the playhead from the max
+  committed tick rather than 0. (No archive RPC yet → disarm-on-archive also TODO.)
+- **Section-placement policy:** the OODA `abc_to_midi` cell is scheduled a fixed
+  bar ahead (`OODA_LEAD`); a real composer wants musical placement (next section
+  boundary, loop region) and a richer `compute_basis`.
+- **`Midi` render variant + UI timeline:** `audio/midi` projects to `ContentType::Plain`
+  today; add a `Midi` variant + renderer, and the scrubbable timeline render.
+- **Trace span attribute:** attach `hyoushigi.tick` on the materialize→insert
+  spans now that a producer exists.
+
 ## Testing & Tooling
 
 - **Live eval fork copy scope:** `kj fork` is a full copy. Decide if fork should be selective by default.

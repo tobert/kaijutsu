@@ -199,6 +199,18 @@ impl PrincipalId {
     pub fn system() -> Self {
         Self(uuid::Uuid::new_v5(&KAIJUTSU_PRINCIPAL_NS, b"system"))
     }
+
+    /// The well-known "beat" principal — author of hyoushigi-materialized cells.
+    ///
+    /// A committed timeline cell is crystallized into a block by the beat
+    /// scheduler, not by any human or model. Giving the beat its own deterministic
+    /// author lane keeps its `(principal, seq)` row-id space disjoint from turn
+    /// blocks and `system()` output, so a manually-minted materialization `seq`
+    /// can never collide with a sequencer-minted one. Deterministic (UUIDv5 from
+    /// `b"hyoushigi"`).
+    pub fn beat() -> Self {
+        Self(uuid::Uuid::new_v5(&KAIJUTSU_PRINCIPAL_NS, b"hyoushigi"))
+    }
 }
 
 // ── Prefix resolution ───────────────────────────────────────────────────────

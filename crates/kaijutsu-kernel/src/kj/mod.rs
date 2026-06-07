@@ -29,6 +29,7 @@ pub mod lifecycle;
 pub mod refs;
 pub mod search;
 pub mod stage;
+pub mod transport;
 pub mod workspace;
 
 use std::sync::Arc;
@@ -346,6 +347,12 @@ impl KjDispatcher {
         // to attach to one.
         if cmd == "attach" {
             return self.dispatch_attach(&argv[1..], caller).await;
+        }
+        // `kj transport <play|pause|stop|tempo|ooda>` controls a context's beat.
+        // Exempt from the active-context gate so `--context <ref>` works from a
+        // session with no joined context (the beat scheduler is global).
+        if cmd == "transport" {
+            return self.dispatch_transport(&argv[1..], caller);
         }
 
         // Everything else requires an active context

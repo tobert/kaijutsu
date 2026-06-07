@@ -74,6 +74,12 @@ const EXPLORER_BINDING_BODY: &str =
 const DIRECTOR_BINDING_BODY: &str =
     include_str!("../../../assets/defaults/rc/director/create/S10-binding.kai");
 
+const COMPOSER_STANCE_BODY: &str =
+    include_str!("../../../assets/defaults/rc/composer/create/S00-stance.md");
+
+const COMPOSER_TICK_BODY: &str =
+    include_str!("../../../assets/defaults/rc/composer/tick/S10-drive.kai");
+
 /// The embedded seed manifest: `(canonical /etc/rc path, body)`. The path
 /// encodes `context_type / verb / sort_key / name / ext`; nothing else is
 /// stored (provenance comes from the CRDT block's principal on write).
@@ -111,6 +117,15 @@ const SEED_FILES: &[(&str, &str)] = &[
     ("/etc/rc/director/create/S20-cache.kai", CACHE_CREATE_BODY),
     ("/etc/rc/director/fork/S30-cache.kai", CACHE_FORK_BODY),
     ("/etc/rc/director/drift/S40-cache.kai", CACHE_DRIFT_BODY),
+    // ── composer — beat-aware role (stance + broad loadout + cache + beat) ─
+    // Broad loadout: the composer drives turns, edits blocks, runs kj. The
+    // `tick` verb is the beat hook fired by the kernel scheduler.
+    ("/etc/rc/composer/create/S00-stance.md", COMPOSER_STANCE_BODY),
+    ("/etc/rc/composer/create/S10-binding.kai", PERMISSIVE_BINDING_BODY),
+    ("/etc/rc/composer/create/S20-cache.kai", CACHE_CREATE_BODY),
+    ("/etc/rc/composer/fork/S30-cache.kai", CACHE_FORK_BODY),
+    ("/etc/rc/composer/drift/S40-cache.kai", CACHE_DRIFT_BODY),
+    ("/etc/rc/composer/tick/S10-drive.kai", COMPOSER_TICK_BODY),
 ];
 
 /// The VFS prefix every rc canonical path lives under. The deployed tree
@@ -292,8 +307,29 @@ mod tests {
     #[test]
     fn seeded_context_types_covers_roles() {
         let types = seeded_context_types();
-        for t in ["default", "coder", "mcp", "explorer", "director"] {
+        for t in ["default", "coder", "mcp", "explorer", "director", "composer"] {
             assert!(types.contains(&t), "missing context_type: {t}");
         }
+    }
+
+    /// The composer ships a `tick` (beat) verb script and a stance — the beat
+    /// hook and persona that make a created composer self-compose. The `tick`
+    /// path must parse under the rc path grammar (it's a newly-wired verb).
+    #[test]
+    fn composer_seeds_include_beat_tick_verb() {
+        let paths: Vec<&str> = SEED_FILES.iter().map(|(p, _)| *p).collect();
+        assert!(
+            paths.contains(&"/etc/rc/composer/tick/S10-drive.kai"),
+            "composer must seed a tick/beat script"
+        );
+        assert!(
+            paths.contains(&"/etc/rc/composer/create/S00-stance.md"),
+            "composer must seed a stance"
+        );
+        // The tick verb is wired into the rc path grammar.
+        let parts = crate::kj::rc::parse_rc_path("/etc/rc/composer/tick/S10-drive.kai")
+            .expect("tick rc path must parse");
+        assert_eq!(parts.context_type, "composer");
+        assert_eq!(parts.verb, "tick");
     }
 }

@@ -45,6 +45,7 @@ capnpc.workspace = true
 kaijutsu-client.workspace = true
 kaijutsu-kernel = { workspace = true, features = ["test-mock"] }
 kaijutsu-types.workspace = true
+kaijutsu-hyoushigi.workspace = true
 futures.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tempfile = { workspace = true }

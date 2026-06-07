@@ -119,7 +119,7 @@ pub enum ScheduleError {
 pub struct Timeline {
     clock: TickClock,
     playhead: Tick,
-    resolvers: HashMap<String, Box<dyn Resolver>>,
+    resolvers: HashMap<String, Box<dyn Resolver + Send + Sync>>,
     /// The mutable context resolvers read (a beat counter, environment, …).
     ambient: HashMap<String, Vec<u8>>,
     /// The open future: deferred cells ahead of the commit point.
@@ -146,7 +146,7 @@ impl Timeline {
         }
     }
 
-    pub fn register_resolver(&mut self, resolver: Box<dyn Resolver>) {
+    pub fn register_resolver(&mut self, resolver: Box<dyn Resolver + Send + Sync>) {
         self.resolvers.insert(resolver.id().0, resolver);
     }
 

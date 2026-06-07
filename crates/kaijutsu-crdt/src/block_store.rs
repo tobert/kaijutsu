@@ -803,9 +803,16 @@ impl BlockStore {
             return Err(CrdtError::DuplicateBlock(block_id));
         }
 
-        // Restore/receive: keep the snapshot's own tick (via from_snapshot); the
-        // order_key is computed legacy-style without consuming a local tick.
-        let order_key = self.calc_order_key(after, None);
+        // Keep the snapshot's own tick (via from_snapshot). If it carries one — a
+        // hyoushigi-materialized cell stamped with its beat/playhead coordinate —
+        // derive the `order_key` from that tick so CRDT order matches the timeline
+        // coordinate. The tick is a *shared coordinate*, not a row id: several
+        // blocks on the same beat get the same tick and thus the same
+        // `order_key_for_tick`; the `(order_key, BlockId)` sort in
+        // `block_ids_ordered` breaks the within-beat tie deterministically by
+        // `BlockId`. A snapshot with no tick (drift / error / legacy sync) keeps
+        // the fractional legacy path — `None` consumes no local tick.
+        let order_key = self.calc_order_key(after, snapshot.tick.map(|t| t.get()));
         let block = BlockContent::from_snapshot(&snapshot, self.principal_id, order_key);
         self.blocks.insert(block_id, block);
         self.version += 1;
@@ -2147,6 +2154,60 @@ mod tests {
         let snap = store.get_block_snapshot(&id).unwrap();
         assert_eq!(snap.kind, BlockKind::Drift);
         assert_eq!(snap.source_context, Some(source_ctx));
+    }
+
+    /// A snapshot carrying a hyoushigi `tick` orders by that tick coordinate, not
+    /// by insertion/`after` position: a later-inserted, appended cell with an
+    /// *earlier* tick still sorts first. This is the materialized-cell path —
+    /// CRDT order must track the timeline coordinate.
+    #[test]
+    fn snapshot_tick_drives_order_key_not_insertion_order() {
+        let mut store = test_store();
+        let (ctx, prin) = (store.context_id(), store.principal_id());
+        let ticked = |seq: u64, tick: i64| {
+            crate::BlockSnapshotBuilder::new(BlockId::new(ctx, prin, seq), BlockKind::Text)
+                .tick(Tick::new(tick))
+                .content(format!("beat-{tick}"))
+                .build()
+        };
+
+        // Insert tick=5 first (first block), then APPEND tick=3 after it.
+        let id5 = store.insert_from_snapshot(ticked(0, 5), None).unwrap();
+        let _id3 = store.insert_from_snapshot(ticked(1, 3), Some(&id5)).unwrap();
+
+        let order: Vec<i64> = store
+            .blocks_ordered()
+            .iter()
+            .map(|b| b.tick.unwrap().get())
+            .collect();
+        assert_eq!(order, vec![3, 5], "order follows the tick coordinate, not the append position");
+    }
+
+    /// Two blocks on the *same* beat share a tick — a coordinate, not a row id.
+    /// They get identical `order_key`s; the `(order_key, BlockId)` sort still
+    /// yields a deterministic total order, broken by `BlockId` (seq).
+    #[test]
+    fn blocks_on_same_tick_share_coordinate_and_order_by_blockid() {
+        let mut store = test_store();
+        let (ctx, prin) = (store.context_id(), store.principal_id());
+        let ticked = |seq: u64| {
+            crate::BlockSnapshotBuilder::new(BlockId::new(ctx, prin, seq), BlockKind::Text)
+                .tick(Tick::new(7))
+                .content(format!("note-{seq}"))
+                .build()
+        };
+
+        // Two cells coalesced onto beat 7, appended in seq order 2 then 1.
+        let first = store.insert_from_snapshot(ticked(2), None).unwrap();
+        let _second = store.insert_from_snapshot(ticked(1), Some(&first)).unwrap();
+
+        let ordered = store.blocks_ordered();
+        assert_eq!(ordered.len(), 2);
+        // Same tick on both — ties are expected and fine.
+        assert!(ordered.iter().all(|b| b.tick == Some(Tick::new(7))));
+        // Deterministic: BlockId (seq) breaks the tie, so seq=1 sorts before seq=2.
+        let seqs: Vec<u64> = ordered.iter().map(|b| b.id.seq).collect();
+        assert_eq!(seqs, vec![1, 2], "within-beat ties resolve deterministically by BlockId");
     }
 
     #[test]

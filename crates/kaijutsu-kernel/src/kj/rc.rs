@@ -17,10 +17,11 @@ use std::sync::OnceLock;
 use super::parse::extract_named_arg;
 use super::{KjCaller, KjDispatcher, KjResult};
 
-/// Canonical rc path format. `attach` and `drift` are reserved verbs —
-/// scripts install fine but lifecycle dispatch is a no-op until those
-/// hooks are wired (tracked in `docs/issues.md`).
-const RC_PATH_PATTERN: &str = r"^/etc/rc/([a-z][a-z0-9_-]*)/(create|fork|attach|drift)/(S\d{1,3})-([a-z][a-z0-9_-]*)\.(kai|md)$";
+/// Canonical rc path format. `attach` is a reserved verb — scripts install fine
+/// but lifecycle dispatch is a no-op until that hook is wired (tracked in
+/// `docs/issues.md`). `tick` is the beat verb (fired by the beat scheduler on a
+/// context's OODA cadence).
+const RC_PATH_PATTERN: &str = r"^/etc/rc/([a-z][a-z0-9_-]*)/(create|fork|attach|drift|tick)/(S\d{1,3})-([a-z][a-z0-9_-]*)\.(kai|md)$";
 
 fn rc_path_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -40,14 +41,14 @@ pub struct RcPathParts {
 ///
 /// Format: `/etc/rc/<context_type>/<verb>/SXX-name.{kai,md}`. Type and
 /// name are lowercase identifiers (`[a-z][a-z0-9_-]*`); sort_key matches
-/// `S\d{1,3}`. Verbs: create, fork, attach, drift.
+/// `S\d{1,3}`. Verbs: create, fork, attach, drift, tick.
 pub fn parse_rc_path(path: &str) -> Result<RcPathParts, String> {
     let caps = rc_path_regex().captures(path).ok_or_else(|| {
         format!(
             "invalid rc path: '{path}'\n\
              expected /etc/rc/<context_type>/<verb>/SXX-name.{{kai,md}}\n\
              - context_type and name must be lowercase ([a-z][a-z0-9_-]*)\n\
-             - verb must be one of: create, fork, attach, drift\n\
+             - verb must be one of: create, fork, attach, drift, tick\n\
              - sort_key must be S followed by 1-3 digits (e.g. S00, S05, S100)\n\
              - extension must be 'kai' or 'md'"
         )

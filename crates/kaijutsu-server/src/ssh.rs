@@ -259,6 +259,11 @@ impl SshServer {
         // dropped. One driver for the whole server (see spawn_turn_driver).
         crate::rpc::spawn_turn_driver(registry.clone());
 
+        // The single coalescing beat scheduler: drives per-context hyoushigi
+        // timelines on their wall-clock beat (composer contexts). Installs its
+        // ingress on the kernel so the rc lifecycle can arm/disarm composers.
+        crate::beat::spawn_beat_scheduler(registry.clone());
+
         let active_connections = Arc::new(AtomicUsize::new(0));
         log::info!("Max connections: {}", self.config.max_connections);
 

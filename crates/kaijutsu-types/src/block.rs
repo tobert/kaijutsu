@@ -1280,11 +1280,15 @@ pub struct BlockSnapshot {
     #[serde(default)]
     pub order_key: Option<String>,
 
-    /// Semantic timeline coordinate (hyoushigi `Tick`). `Some` only for blocks
-    /// materialized from a committed timeline cell; `None` for every ordinary
-    /// block. Distinct from `order_key` (the CRDT sibling index, which the kernel
-    /// emits to *match* tick order at materialization) and from DAG parentage
-    /// (an orthogonal cross-context axis). See `docs/hyoushigi.md`.
+    /// Semantic timeline coordinate (hyoushigi `Tick`) — a *shared position*, not
+    /// a row id: several blocks landing on the same beat carry the same tick
+    /// (coalesced events in one beat window). Uniqueness is `BlockId`'s job; the
+    /// `(order_key, BlockId)` sort in `block_ids_ordered` breaks within-beat ties
+    /// deterministically. The block store stamps every block (a coder's playhead
+    /// advances ~one per turn; a composer's is beat-driven), so this is `Some`
+    /// for live blocks and `None` only for legacy/older-wire blocks. Distinct from
+    /// `order_key` (the sibling index, derived from the tick on appends) and from
+    /// DAG parentage (an orthogonal cross-context axis). See `docs/hyoushigi.md`.
     #[serde(default)]
     pub tick: Option<Tick>,
 

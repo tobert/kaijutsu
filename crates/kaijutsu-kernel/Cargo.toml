@@ -24,6 +24,9 @@ kaijutsu-crdt.workspace = true
 kaijutsu-types.workspace = true
 kaijutsu-cas.workspace = true
 
+# Hyoushigi — per-context timeline engine (the beat substrate)
+kaijutsu-hyoushigi.workspace = true
+
 # Concurrency
 dashmap = { workspace = true }
 parking_lot = { workspace = true }

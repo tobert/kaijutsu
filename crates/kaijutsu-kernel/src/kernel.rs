@@ -84,6 +84,18 @@ pub struct Kernel {
     /// already have. Without it, every `--confirm` lands in a fresh empty store
     /// and reports "invalid nonce".
     nonce_stores: dashmap::DashMap<kaijutsu_types::ContextId, kaish_kernel::nonce::NonceStore>,
+    /// Per-context hyoushigi timelines — the live open future for contexts that
+    /// own a beat (composer, audio). A context is **armed** by inserting it here;
+    /// a context with no entry (every coder) has no timeline and costs nothing.
+    /// The beat scheduler in `kaijutsu-server` pumps these; the turn-completion
+    /// handler schedules cells onto them. Sharded by `ContextId` like
+    /// `nonce_stores`, each behind a sync mutex (see [`SharedTimeline`]).
+    timelines: dashmap::DashMap<kaijutsu_types::ContextId, crate::hyoushigi::SharedTimeline>,
+    /// Ingress to the beat scheduler. Installed by the server at startup (the
+    /// scheduler lives there, since it needs the block store too). Kernel-side rc
+    /// code arms/disarms composer contexts by sending here; absent in embedded /
+    /// test setups with no scheduler, where sends are simply no-ops.
+    beat_ingress: OnceLock<tokio::sync::mpsc::UnboundedSender<crate::hyoushigi::BeatCommand>>,
 }
 
 impl std::fmt::Debug for Kernel {
@@ -147,6 +159,8 @@ impl Kernel {
             timeouts: kaijutsu_types::TimeoutPolicy::default(),
             file_cache: OnceLock::new(),
             nonce_stores: dashmap::DashMap::new(),
+            timelines: dashmap::DashMap::new(),
+            beat_ingress: OnceLock::new(),
         }
     }
 
@@ -183,6 +197,8 @@ impl Kernel {
             timeouts: kaijutsu_types::TimeoutPolicy::default(),
             file_cache: OnceLock::new(),
             nonce_stores: dashmap::DashMap::new(),
+            timelines: dashmap::DashMap::new(),
+            beat_ingress: OnceLock::new(),
         }
     }
 
@@ -559,6 +575,69 @@ impl Kernel {
     /// Get the image backend registry.
     pub fn image_backends(&self) -> &RwLock<crate::image::ImageBackendRegistry> {
         &self.image_backends
+    }
+
+    // ========================================================================
+    // Hyoushigi timelines (the beat substrate)
+    // ========================================================================
+
+    /// Arm a context with a hyoushigi timeline driven by `clock`, registering
+    /// the production resolvers onto it. Idempotent: a context already armed
+    /// keeps its live timeline (we never clobber an open future), so re-arming
+    /// is a no-op that returns the existing handle.
+    ///
+    /// Arming is the *only* thing that gives a context a timeline — a coder is
+    /// never armed, so it has no entry and the beat scheduler never wakes for
+    /// it ("paused is no heap entry").
+    pub fn arm_timeline(
+        &self,
+        context_id: kaijutsu_types::ContextId,
+        clock: kaijutsu_hyoushigi::TickClock,
+    ) -> crate::hyoushigi::SharedTimeline {
+        self.timelines
+            .entry(context_id)
+            .or_insert_with(|| {
+                let mut tl = kaijutsu_hyoushigi::Timeline::new(clock);
+                crate::hyoushigi::register_resolvers(&mut tl, self.cas.clone());
+                Arc::new(parking_lot::Mutex::new(tl))
+            })
+            .clone()
+    }
+
+    /// Look up a context's timeline, if it is armed. Returns `None` for every
+    /// un-armed context (lookup never arms).
+    pub fn timeline(
+        &self,
+        context_id: kaijutsu_types::ContextId,
+    ) -> Option<crate::hyoushigi::SharedTimeline> {
+        self.timelines.get(&context_id).map(|e| e.value().clone())
+    }
+
+    /// Disarm a context: drop its timeline and its open future. Used when a
+    /// context is archived. The beat scheduler skips a context with no entry.
+    pub fn disarm_timeline(&self, context_id: kaijutsu_types::ContextId) {
+        self.timelines.remove(&context_id);
+    }
+
+    /// Install the beat-scheduler ingress. Called once by the server at startup.
+    /// Returns whether it was set (false if already installed).
+    pub fn set_beat_ingress(
+        &self,
+        tx: tokio::sync::mpsc::UnboundedSender<crate::hyoushigi::BeatCommand>,
+    ) -> bool {
+        self.beat_ingress.set(tx).is_ok()
+    }
+
+    /// Send a command to the beat scheduler, if one is installed. Returns whether
+    /// it was delivered — `false` when no scheduler is wired (embedded/test) or
+    /// the scheduler has shut down. Callers decide whether that's fatal; arming a
+    /// composer with no scheduler simply means it never beats (no silent
+    /// corruption, just no beat).
+    pub fn send_beat_command(&self, cmd: crate::hyoushigi::BeatCommand) -> bool {
+        match self.beat_ingress.get() {
+            Some(tx) => tx.send(cmd).is_ok(),
+            None => false,
+        }
     }
 
     // ========================================================================

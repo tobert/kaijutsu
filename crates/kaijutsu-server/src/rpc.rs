@@ -2615,6 +2615,26 @@ impl kernel::Server for KernelImpl {
                 log::warn!("rc create lifecycle for {}: {e}", context_id.short());
             }
 
+            // Arm the beat for context types that own one. A composer's playhead
+            // can't block, so the beat scheduler drives it; coders are never
+            // armed (they have no heap entry and cost nothing). The scheduler
+            // creates the timeline on arm; absent a scheduler (embedded/test)
+            // this is a no-op.
+            if context_type == "composer" {
+                let armed = kernel.kernel.send_beat_command(
+                    kaijutsu_kernel::hyoushigi::BeatCommand::Arm {
+                        context_id,
+                        policy: kaijutsu_kernel::hyoushigi::BeatPolicy::composer_default(),
+                    },
+                );
+                if !armed {
+                    log::warn!(
+                        "composer {} created but no beat scheduler is wired — it will not beat",
+                        context_id.short()
+                    );
+                }
+            }
+
             results.get().set_id(context_id.as_bytes());
             Ok(())
         })
