@@ -20,10 +20,6 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   - Dynamic / principal-scoped overrides.
   - Self-lockout ergonomics (narrowing binding to exclude `builtin.bindings`).
   - Per-principal budgets + fair queuing.
-  - **Unjoined-`attach` authorization:** `kj attach` is gated on `operator`, but
-    a caller with no joined context has no loadout to check, so an unjoined
-    session is refused. Decide whether attach (switch + run target's rc) should
-    be ungated like `switch`, or authorize against the target/session instead.
   - **Live contexts need reseed/restart:** broadened role loadouts only reach
     newly-created contexts; existing ones keep their old (now authority-less)
     binding until `kj rc reseed` + re-create or a kernel restart.
