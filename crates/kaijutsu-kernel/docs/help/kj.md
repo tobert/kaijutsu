@@ -50,7 +50,9 @@ cas             put, get, ls, info, rm — content-addressed blob storage
 context (ctx)   list, info, switch, create, set, log, move, archive, remove, retag
 doc             list, tree, create, delete — storage layer (all kinds, not just conversation)
 fork            Fork current context (--shallow, --compact, --as)
+drive           Clock one autonomous turn on a context (--prompt)
 drift           push, pull, merge, flush, queue, cancel, history
+transport       play, pause, stop, tempo <bpm>, ooda <on|off> — composer beat/playhead control
 prompt          list, show, inject — MCP prompt discovery and injection
 preset          list, show, save, remove
 search          <pattern> — regex search across blocks (--all, --context, --kind, --role)
