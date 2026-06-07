@@ -26,7 +26,7 @@ use kaish_kernel::{
 
 use crate::file_tools::path::resolve_str;
 use crate::file_tools::FileDocumentCache;
-use crate::vfs::{FileType, MountTable, VfsError, VfsOps};
+use crate::vfs::{FileType, MountTable, SetAttr, VfsError, VfsOps};
 
 use super::kaish_backend::KaijutsuBackend;
 
@@ -522,6 +522,25 @@ impl KernelBackend for MountBackend {
             .mkdir(path, 0o755)
             .await
             .map_err(vfs_to_backend)?;
+        Ok(())
+    }
+
+    async fn set_mtime(&self, path: &Path, mtime: std::time::SystemTime) -> BackendResult<()> {
+        // `touch` on an existing file routes through the VFS — never escape to
+        // the host via a real-path. A read-only mount's `setattr` rejects
+        // cleanly (the VFS error maps to a BackendError), satisfying the
+        // "virtual/read-only mounts reject rather than silently succeed"
+        // contract.
+        self.mount_table
+            .setattr(path, SetAttr::new().with_mtime(mtime))
+            .await
+            .map_err(vfs_to_backend)?;
+        // We deliberately don't touch `file_cache` here: for writable
+        // CRDT-backed text files the content is write-through to disk, so a
+        // newer disk mtime simply trips the cache's existing staleness check on
+        // the next read (which reloads and re-pins `loaded_mtime`). That path is
+        // already tested; invalidating here would risk dropping an unflushed
+        // edit, so we let the staleness logic own freshness.
         Ok(())
     }
 

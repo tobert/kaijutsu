@@ -547,6 +547,17 @@ impl KernelBackend for KaijutsuBackend {
         }
     }
 
+    async fn set_mtime(&self, path: &Path, _mtime: std::time::SystemTime) -> BackendResult<()> {
+        // The kaijutsu:// document namespace is purely virtual — context/block/
+        // doc rows derive their timing from CRDT ticks, not a settable mtime.
+        // Per the KernelBackend contract a virtual mount rejects rather than
+        // silently succeeding, so `touch` never quietly no-ops here.
+        Err(BackendError::InvalidOperation(format!(
+            "set_mtime: {} is a virtual kaijutsu document; mtime is not settable",
+            path.display()
+        )))
+    }
+
     async fn remove(&self, path: &Path, recursive: bool) -> BackendResult<()> {
         match self.resolve_path(path) {
             PathResolution::Document(ctx_id) => {
