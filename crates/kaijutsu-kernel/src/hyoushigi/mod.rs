@@ -513,7 +513,7 @@ mod tests {
     /// (The registry is the whole "paused is no heap entry" mechanic.)
     #[tokio::test]
     async fn arm_then_lookup_returns_some_unarmed_returns_none() {
-        let kernel = Kernel::new("test", None).await;
+        let kernel = Kernel::new_ephemeral("test").await;
         let armed = ContextId::new();
         let bare = ContextId::new();
 
@@ -526,7 +526,7 @@ mod tests {
     /// Re-arming never clobbers the live timeline — the same handle comes back.
     #[tokio::test]
     async fn arm_is_idempotent() {
-        let kernel = Kernel::new("test", None).await;
+        let kernel = Kernel::new_ephemeral("test").await;
         let ctx = ContextId::new();
         let a = kernel.arm_timeline(ctx, TickClock::default());
         let b = kernel.arm_timeline(ctx, TickClock::default());
@@ -536,7 +536,7 @@ mod tests {
     /// Disarming drops the entry — the scheduler will skip a context with none.
     #[tokio::test]
     async fn disarm_removes_the_timeline() {
-        let kernel = Kernel::new("test", None).await;
+        let kernel = Kernel::new_ephemeral("test").await;
         let ctx = ContextId::new();
         kernel.arm_timeline(ctx, TickClock::default());
         kernel.disarm_timeline(ctx);

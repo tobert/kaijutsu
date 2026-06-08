@@ -43,7 +43,7 @@ struct Fixture {
 
 async fn setup() -> Fixture {
     let tmp = tempfile::tempdir().unwrap();
-    let kernel = Arc::new(Kernel::new("broker-e2e", Some(tmp.path())).await);
+    let kernel = Arc::new(Kernel::new("broker-e2e", tmp.path()).await);
 
     let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
     let creator = PrincipalId::system();
@@ -1153,7 +1153,7 @@ async fn setup_with_db() -> (Fixture, Arc<parking_lot::Mutex<KernelDb>>) {
     use kaijutsu_types::{ConsentMode, ContextState};
 
     let tmp = tempfile::tempdir().unwrap();
-    let kernel = Arc::new(Kernel::new("phase5-m5", Some(tmp.path())).await);
+    let kernel = Arc::new(Kernel::new("phase5-m5", tmp.path()).await);
 
     let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
     let creator = PrincipalId::system();
@@ -1249,7 +1249,7 @@ async fn binding_persists_across_kernel_restart() {
     // Stand up a second kernel pointing at the same DB. No call to
     // `set_binding` here — it must hydrate from `KernelDb` on first touch.
     let tmp2 = tempfile::tempdir().unwrap();
-    let kernel2 = Arc::new(Kernel::new("phase5-m5-restart", Some(tmp2.path())).await);
+    let kernel2 = Arc::new(Kernel::new("phase5-m5-restart", tmp2.path()).await);
     let creator2 = PrincipalId::system();
     let _kernel_id2 = KernelId::new();
     let ws_id2 = {
@@ -1540,7 +1540,7 @@ async fn hooks_persist_across_kernel_restart() {
 
     // --- Kernel B: fresh kernel, same DB. ---
     let tmp2 = tempfile::tempdir().unwrap();
-    let kernel2 = Arc::new(Kernel::new("hook-persist-restart", Some(tmp2.path())).await);
+    let kernel2 = Arc::new(Kernel::new("hook-persist-restart", tmp2.path()).await);
     let creator2 = PrincipalId::system();
     let _kernel_id2 = KernelId::new();
     let ws_id2 = {

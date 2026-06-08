@@ -5340,7 +5340,7 @@ mod tests {
         use crate::kernel_db::KernelDb;
         use crate::kj::KjDispatcher;
 
-        let kernel = Arc::new(crate::Kernel::new("kaish-hook-kj-test", None).await);
+        let kernel = Arc::new(crate::Kernel::new_ephemeral("kaish-hook-kj-test").await);
         let store = shared_block_store(PrincipalId::system());
         let kernel_db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
         let _kernel_id = kaijutsu_types::KernelId::new();
@@ -6128,7 +6128,7 @@ mod tests {
         use crate::kernel_db::KernelDb;
         use crate::kj::KjDispatcher;
 
-        let kernel = Arc::new(crate::Kernel::new(name, None).await);
+        let kernel = Arc::new(crate::Kernel::new_ephemeral(name).await);
         let store = crate::block_store::shared_block_store(PrincipalId::system());
         let kernel_db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
         {

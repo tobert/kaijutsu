@@ -40,7 +40,7 @@ async fn harness() -> Harness {
     let ws_id = db.lock().get_or_create_default_workspace(creator).unwrap();
     let store = shared_block_store_with_db(db.clone(), ws_id, creator);
 
-    let kernel = Arc::new(Kernel::new("rc-role-test", Some(tmp.path())).await);
+    let kernel = Arc::new(Kernel::new("rc-role-test", tmp.path()).await);
 
     // Seed and mount a private `/etc/rc` tree — the same setup the server RPC
     // boot path (kaijutsu-server/src/rpc.rs) and the unit-test helper

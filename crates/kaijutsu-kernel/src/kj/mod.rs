@@ -571,7 +571,8 @@ pub(crate) mod test_helpers {
         }
         // Ephemeral kernel: rooted at a throwaway temp data_dir so CAS (and any
         // other data_dir-rooted state) never touches the user's real XDG store.
-        // `Kernel::new` no longer defaults data_dir — see docs/issues.md.
+        // `Kernel::new` takes a required data_dir (no XDG fallback), so a test
+        // can never accidentally resolve CAS to the user's real store.
         let kernel = Arc::new(Kernel::new_ephemeral("test").await.with_timeouts(policy));
         // Mount a private, seeded /etc/rc tree so rc tests exercise the real
         // file-backed dispatch path (readdir + FileDocumentCache). The temp

@@ -433,7 +433,7 @@ mod tests {
     }
 
     async fn fresh_kernel_and_docs() -> (Arc<Kernel>, SharedBlockStore) {
-        let kernel = Arc::new(Kernel::new("test", None).await);
+        let kernel = Arc::new(Kernel::new_ephemeral("test").await);
         let bus: SharedBlockFlowBus = Arc::new(FlowBus::new(256));
         let documents: SharedBlockStore =
             Arc::new(BlockStore::with_flows(PrincipalId::new(), bus));

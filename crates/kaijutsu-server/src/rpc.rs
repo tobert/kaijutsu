@@ -968,7 +968,7 @@ pub async fn create_shared_kernel(
 
     // Create the kaijutsu kernel with shared FlowBus
     let kernel =
-        Kernel::with_flows(id, &id_str, block_flows.clone(), Some(&resolved_data_dir)).await;
+        Kernel::with_flows(id, &id_str, block_flows.clone(), &resolved_data_dir).await;
 
     // Read-only root — whole system visible (ls /usr/bin, cargo, etc.)
     kernel.mount("/", LocalBackend::read_only("/")).await;

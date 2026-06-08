@@ -672,7 +672,7 @@ mod tests {
     /// Create a test MountBackend with a MemoryBackend mounted at /tmp.
     async fn test_mount_backend() -> MountBackend {
         let blocks = shared_block_store(PrincipalId::system());
-        let kernel = Arc::new(KaijutsuKernel::new("test-mount", None).await);
+        let kernel = Arc::new(KaijutsuKernel::new_ephemeral("test-mount").await);
         let sid = kaijutsu_types::SessionId::new();
         let session_contexts = crate::runtime::context_engine::session_context_map();
         session_contexts.insert(sid, kaijutsu_types::ContextId::new());
@@ -798,7 +798,7 @@ mod tests {
     #[tokio::test]
     async fn kaish_and_mcp_share_one_crdt_document() {
         let blocks = shared_block_store(PrincipalId::system());
-        let kernel = Arc::new(KaijutsuKernel::new("test-xsurface", None).await);
+        let kernel = Arc::new(KaijutsuKernel::new_ephemeral("test-xsurface").await);
         let sid = kaijutsu_types::SessionId::new();
         let session_contexts = crate::runtime::context_engine::session_context_map();
         session_contexts.insert(sid, kaijutsu_types::ContextId::new());
@@ -860,7 +860,7 @@ mod tests {
         std::fs::write(dir.join("ro.txt"), b"on-disk").unwrap();
 
         let blocks = shared_block_store(PrincipalId::system());
-        let kernel = Arc::new(KaijutsuKernel::new("test-ro", None).await);
+        let kernel = Arc::new(KaijutsuKernel::new_ephemeral("test-ro").await);
         let sid = kaijutsu_types::SessionId::new();
         let session_contexts = crate::runtime::context_engine::session_context_map();
         session_contexts.insert(sid, kaijutsu_types::ContextId::new());

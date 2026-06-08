@@ -381,7 +381,7 @@ mod tests {
     #[tokio::test]
     async fn test_embedded_kaish_creation() {
         let blocks = shared_block_store(kaijutsu_types::PrincipalId::system());
-        let kernel = Arc::new(KaijutsuKernel::new("test-agent", None).await);
+        let kernel = Arc::new(KaijutsuKernel::new_ephemeral("test-agent").await);
 
         let kaish = EmbeddedKaish::new("test-kernel", blocks, kernel, None);
         assert!(kaish.is_ok());
@@ -393,7 +393,7 @@ mod tests {
     #[tokio::test]
     async fn test_embedded_kaish_variables() {
         let blocks = shared_block_store(kaijutsu_types::PrincipalId::system());
-        let kernel = Arc::new(KaijutsuKernel::new("test-vars", None).await);
+        let kernel = Arc::new(KaijutsuKernel::new_ephemeral("test-vars").await);
         let kaish = EmbeddedKaish::new("test-vars", blocks, kernel, None).unwrap();
 
         // Set and get a variable
@@ -412,7 +412,7 @@ mod tests {
     #[tokio::test]
     async fn test_named_config_cwd_is_home() {
         let blocks = shared_block_store(kaijutsu_types::PrincipalId::system());
-        let kernel = Arc::new(KaijutsuKernel::new("test-cwd-home", None).await);
+        let kernel = Arc::new(KaijutsuKernel::new_ephemeral("test-cwd-home").await);
         let kaish = EmbeddedKaish::new("test-cwd-home", blocks, kernel, None).unwrap();
 
         let cwd = kaish.cwd().await;
@@ -430,7 +430,7 @@ mod tests {
     async fn test_mcp_config_cwd_is_project_root() {
         let tmp = tempfile::tempdir().unwrap();
         let blocks = shared_block_store(kaijutsu_types::PrincipalId::system());
-        let kernel = Arc::new(KaijutsuKernel::new("test-cwd-project", None).await);
+        let kernel = Arc::new(KaijutsuKernel::new_ephemeral("test-cwd-project").await);
         let kaish = EmbeddedKaish::new(
             "test-cwd-project",
             blocks,
@@ -494,7 +494,7 @@ mod tests {
 
         let kernel_db = Arc::new(parking_lot::Mutex::new(db));
         let blocks = shared_block_store(principal);
-        let kernel = Arc::new(KaijutsuKernel::new("test-env", None).await);
+        let kernel = Arc::new(KaijutsuKernel::new_ephemeral("test-env").await);
 
         let sid = SessionId::new();
         let session_contexts = crate::runtime::context_engine::session_context_map();
@@ -589,7 +589,7 @@ mod tests {
 
         let kernel_db = Arc::new(parking_lot::Mutex::new(db));
         let blocks = shared_block_store(principal);
-        let kernel = Arc::new(KaijutsuKernel::new("test-restore-vfs", None).await);
+        let kernel = Arc::new(KaijutsuKernel::new_ephemeral("test-restore-vfs").await);
 
         // Mount an in-memory FS and create the dir there — pure VFS, no host path.
         kernel.mount("/scratch", MemoryBackend::new()).await;

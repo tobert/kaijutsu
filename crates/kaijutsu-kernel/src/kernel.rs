@@ -9,7 +9,7 @@
 
 use async_trait::async_trait;
 use kaijutsu_types::PrincipalId;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -114,28 +114,19 @@ impl std::fmt::Debug for Kernel {
 /// Default capacity for the block flow bus.
 const DEFAULT_FLOW_CAPACITY: usize = 1024;
 
-fn default_data_dir() -> PathBuf {
-    kaish_kernel::xdg_data_home()
-        .join("kaijutsu")
-        .join("kernel")
-}
-
 impl Kernel {
     /// Resolve the CAS base path from a data_dir.
-    fn cas_for_data_dir(data_dir: Option<&Path>) -> Arc<FileStore> {
-        let cas_path = match data_dir {
-            Some(dir) => dir.join("cas"),
-            None => default_data_dir().join("cas"),
-        };
-        Arc::new(FileStore::at_path(cas_path))
+    fn cas_for_data_dir(data_dir: &Path) -> Arc<FileStore> {
+        Arc::new(FileStore::at_path(data_dir.join("cas")))
     }
 
     /// Create a new kernel with the given name.
     ///
-    /// `data_dir` is the kernel's on-disk data directory. Pass `None` to use
-    /// the XDG default (`~/.local/share/kaijutsu/kernel`). CAS lives at
-    /// `{data_dir}/cas/` and creates directories lazily on first write.
-    pub async fn new(name: impl Into<String>, data_dir: Option<&Path>) -> Self {
+    /// `data_dir` is the kernel's on-disk data directory; the frontend owns
+    /// resolving it (XDG, config flag, etc.) — the kernel never defaults it,
+    /// so a process can't accidentally write into the user's real store. CAS
+    /// lives at `{data_dir}/cas/` and creates directories lazily on first write.
+    pub async fn new(name: impl Into<String>, data_dir: &Path) -> Self {
         let name = name.into();
         let vfs = Arc::new(MountTable::new());
 
@@ -164,6 +155,21 @@ impl Kernel {
         }
     }
 
+    /// Create a kernel rooted at a throwaway, per-call temp directory.
+    ///
+    /// For tests and short-lived tooling that need a real on-disk `data_dir`
+    /// but must never touch the user's XDG store or share CAS state with any
+    /// other kernel. Each call mints a unique `kj-eph-<id>/` under the system
+    /// temp dir, isolating every kernel from every other. The directory is
+    /// leaked for the process lifetime — there is no live handle to drop it
+    /// out from under the kernel.
+    pub async fn new_ephemeral(name: impl Into<String>) -> Self {
+        let dir = std::env::temp_dir()
+            .join(format!("kj-eph-{}", kaijutsu_types::KernelId::new().to_hex()));
+        std::fs::create_dir_all(&dir).expect("create ephemeral kernel data dir");
+        Self::new(name, &dir).await
+    }
+
     /// Create a new kernel with a shared FlowBus.
     ///
     /// Use this when you need to share the flow bus with other components
@@ -172,7 +178,7 @@ impl Kernel {
         id: kaijutsu_types::KernelId,
         name: impl Into<String>,
         block_flows: SharedBlockFlowBus,
-        data_dir: Option<&Path>,
+        data_dir: &Path,
     ) -> Self {
         let name = name.into();
         let vfs = Arc::new(MountTable::new());
@@ -1022,13 +1028,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_kernel_creation() {
-        let kernel = Kernel::new("test", None).await;
+        let kernel = Kernel::new_ephemeral("test").await;
         assert_eq!(kernel.name().await, "test");
     }
 
     #[tokio::test]
     async fn test_variables() {
-        let kernel = Kernel::new("test", None).await;
+        let kernel = Kernel::new_ephemeral("test").await;
 
         kernel.set_var("FOO", "bar").await;
         assert_eq!(kernel.get_var("FOO").await, Some("bar".to_string()));
@@ -1039,7 +1045,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_history() {
-        let kernel = Kernel::new("test", None).await;
+        let kernel = Kernel::new_ephemeral("test").await;
 
         kernel.add_history("echo hello").await;
         kernel.add_history("ls -la").await;
@@ -1051,7 +1057,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_llm_provider() {
-        let kernel = Kernel::new("test", None).await;
+        let kernel = Kernel::new_ephemeral("test").await;
 
         // Register a provider (uses fake key, won't actually call API)
         let provider = Arc::new(Provider::Claude(crate::llm::claude::Client::new(
@@ -1067,7 +1073,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_llm_no_provider() {
-        let kernel = Kernel::new("test", None).await;
+        let kernel = Kernel::new_ephemeral("test").await;
 
         // Should fail gracefully without provider
         let result = kernel.llm().read().await.prompt("Hello").await;
