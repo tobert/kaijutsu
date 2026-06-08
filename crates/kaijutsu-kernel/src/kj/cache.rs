@@ -18,35 +18,74 @@
 //! Adding a 5th breakpoint here succeeds; the wire layer drops it with
 //! a `tracing::warn!` at stream time.
 
+use clap::{Parser, Subcommand};
 use kaijutsu_types::ContentType;
 
 use crate::llm::stream::{CacheTarget, CacheTtl};
 
-use super::parse::extract_named_arg;
-use super::{KjCaller, KjDispatcher, KjResult};
+use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "cache",
+    about = "Manage Claude prompt-cache breakpoints on the active context",
+    disable_help_subcommand = true,
+    no_binary_name = true
+)]
+struct CacheArgs {
+    #[command(subcommand)]
+    command: CacheCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum CacheCommand {
+    /// List cache breakpoints on the active context.
+    #[command(alias = "ls")]
+    List,
+    /// Add a cache breakpoint. `--target message` also needs `--index`.
+    Add {
+        /// Breakpoint target: tools|system|message
+        #[arg(long, short = 't')]
+        target: String,
+        /// TTL: ephemeral|extended (default ephemeral)
+        #[arg(long)]
+        ttl: Option<String>,
+        /// Message index (required when --target=message)
+        #[arg(long, short = 'i')]
+        index: Option<usize>,
+    },
+    /// Clear all cache breakpoints on the active context.
+    #[command(alias = "rm")]
+    Clear,
+}
 
 impl KjDispatcher {
     pub(crate) fn dispatch_cache(&self, argv: &[String], caller: &KjCaller) -> KjResult {
         if argv.is_empty() {
-            return KjResult::Err(self.cache_help());
+            return clap_help_for::<CacheArgs>();
         }
-        match argv[0].as_str() {
-            "list" | "ls" => self.cache_list(caller),
-            "add" => self.cache_add(&argv[1..], caller),
-            "clear" | "rm" => self.cache_clear(caller),
-            "help" | "--help" | "-h" => {
-                KjResult::ok_ephemeral(self.cache_help(), ContentType::Markdown)
+        let parsed = match CacheArgs::try_parse_from(argv) {
+            Ok(p) => p,
+            Err(e) => {
+                if matches!(
+                    e.kind(),
+                    clap::error::ErrorKind::DisplayHelp
+                        | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+                ) {
+                    return KjResult::ok_ephemeral(e.to_string(), ContentType::Plain);
+                }
+                return KjResult::Err(format!("kj cache: {e}"));
             }
-            other => KjResult::Err(format!(
-                "kj cache: unknown subcommand '{}'\n\n{}",
-                other,
-                self.cache_help()
-            )),
+        };
+        match parsed.command {
+            CacheCommand::List => self.cache_list(caller),
+            CacheCommand::Add {
+                target,
+                ttl,
+                index,
+            } => self.cache_add(&target, ttl.as_deref(), index, caller),
+            CacheCommand::Clear => self.cache_clear(caller),
         }
-    }
-
-    fn cache_help(&self) -> String {
-        include_str!("../../docs/help/kj-cache.md").to_string()
     }
 
     fn cache_list(&self, caller: &KjCaller) -> KjResult {
@@ -84,25 +123,19 @@ impl KjDispatcher {
         }
     }
 
-    fn cache_add(&self, argv: &[String], caller: &KjCaller) -> KjResult {
+    fn cache_add(
+        &self,
+        target_str: &str,
+        ttl_str: Option<&str>,
+        index: Option<usize>,
+        caller: &KjCaller,
+    ) -> KjResult {
         let context_id = match caller.require_context() {
             Ok(id) => id,
             Err(e) => return e,
         };
 
-        let target_str = match extract_named_arg(argv, &["--target", "-t"]) {
-            Some(t) => t,
-            None => {
-                return KjResult::Err(
-                    "kj cache add: --target required (tools|system|message)".to_string(),
-                );
-            }
-        };
-
-        let ttl = match extract_named_arg(argv, &["--ttl"])
-            .as_deref()
-            .unwrap_or("ephemeral")
-        {
+        let ttl = match ttl_str.unwrap_or("ephemeral") {
             "ephemeral" | "eph" | "5m" => CacheTtl::Ephemeral,
             "extended" | "ext" | "1h" => CacheTtl::Extended,
             other => {
@@ -112,25 +145,17 @@ impl KjDispatcher {
             }
         };
 
-        let cache_target = match target_str.as_str() {
+        let cache_target = match target_str {
             "tools" => CacheTarget::Tools(ttl),
             "system" => CacheTarget::System(ttl),
             "message" | "msg" => {
-                let idx_str = match extract_named_arg(argv, &["--index", "-i"]) {
-                    Some(s) => s,
-                    None => {
-                        return KjResult::Err(
-                            "kj cache add: --target=message requires --index <N>".to_string(),
-                        );
-                    }
-                };
-                let idx: usize = match idx_str.parse() {
-                    Ok(n) => n,
-                    Err(e) => {
-                        return KjResult::Err(format!(
-                            "kj cache add: invalid --index '{idx_str}': {e}"
-                        ));
-                    }
+                // `--index` is parsed as a typed `usize` by clap, so an invalid
+                // value already failed at parse time; here we only enforce that
+                // it's present for the message target.
+                let Some(idx) = index else {
+                    return KjResult::Err(
+                        "kj cache add: --target=message requires --index <N>".to_string(),
+                    );
                 };
                 CacheTarget::MessageIndex(idx, ttl)
             }
