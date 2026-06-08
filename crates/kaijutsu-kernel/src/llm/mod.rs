@@ -701,6 +701,14 @@ impl LlmRegistry {
         self.model_aliases = aliases;
     }
 
+    /// All configured model aliases (friendly name → provider/model).
+    ///
+    /// Exposed for discovery surfaces (`kj models`) that enumerate the
+    /// `--model` specs a caller can name. Read-only borrow of the map.
+    pub fn model_aliases(&self) -> &HashMap<String, toml_config::ModelAlias> {
+        &self.model_aliases
+    }
+
     /// Resolve a model name through aliases.
     ///
     /// If the name matches an alias, returns the (provider, model) tuple.

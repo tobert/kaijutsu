@@ -26,6 +26,7 @@ pub mod policy;
 pub mod preset;
 pub mod rc;
 pub mod lifecycle;
+pub mod model;
 pub mod refs;
 pub mod search;
 pub mod stage;
@@ -353,6 +354,17 @@ impl KjDispatcher {
         // session with no joined context (the beat scheduler is global).
         if cmd == "transport" {
             return self.dispatch_transport(&argv[1..], caller);
+        }
+        // `kj models` is pure discovery against the LLM registry — no context.
+        if cmd == "models" {
+            return self.dispatch_models(&argv[1..]).await;
+        }
+        // `kj model` reports a context's effective model; it defaults to the
+        // current context but accepts `--context <ref>`, so like `kj transport`
+        // it resolves its own target rather than relying on the active-context
+        // gate below (which would reject `--context` from an unjoined session).
+        if cmd == "model" {
+            return self.dispatch_model(&argv[1..], caller).await;
         }
 
         // Everything else requires an active context

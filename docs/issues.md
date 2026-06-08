@@ -25,7 +25,6 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
     binding until `kj rc reseed` + re-create or a kernel restart.
 - **LLM providers:**
   - Move per-model knobs out of the config layer (`models.toml`), into the app.
-  - Credential file option (alongside `api_key_env`).
   - Cross-turn thinking continuity (`hydrate_from_blocks` skips `Thinking`).
   - Push subscriber for `ConversationMailbox`.
 
@@ -47,7 +46,6 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ## Control Plane & Navigation (kj)
 
-- **`kj model` / `kj models` subcommand:** Add discovery for available providers/models and inspect the current context's model from `kj`.
 - **Tab completion:** Context labels, preset labels, workspace labels, tag syntax. Integrate with kaish.
 - **Cross-kernel drift:** Schema preserves `kernel_id` everywhere; not yet implemented.
 - **Compact quality:** Distill model selection, preset-level or context-level summary-style control.

@@ -52,6 +52,8 @@ doc             list, tree, create, delete — storage layer (all kinds, not jus
 fork            Fork current context (--shallow, --compact, --as)
 drive           Clock one autonomous turn on a context (--prompt)
 drift           push, pull, merge, flush, queue, cancel, history
+model           Show a context's effective model (--context <ref>)
+models          List configured providers, their models, and --model aliases
 transport       play, pause, stop, tempo <bpm>, ooda <on|off> — composer beat/playhead control
 prompt          list, show, inject — MCP prompt discovery and injection
 preset          list, show, save, remove
