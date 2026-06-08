@@ -2,12 +2,54 @@
 
 use std::collections::HashMap;
 
+use clap::Parser;
 use kaijutsu_types::{ConsentMode, ContentType, ContextId, ContextState, EdgeKind, ForkKind};
 
 use crate::kernel_db::{ContextEdgeRow, ContextRow, ContextShellRow};
 
-use super::parse::{extract_named_arg, has_flag, parse_model_spec};
+use super::parse::parse_model_spec;
 use super::{KjCaller, KjDispatcher, KjResult};
+
+#[derive(Parser, Debug, Default)]
+#[command(name = "fork", about = "Fork the current context into a child", disable_help_subcommand = true, no_binary_name = true)]
+struct ForkArgs {
+    /// Label for the child (--name/-n)
+    #[arg(long, short = 'n')]
+    name: Option<String>,
+    /// Seed prompt; drives the child's turn
+    #[arg(long)]
+    prompt: Option<String>,
+    /// Preset to apply to the child
+    #[arg(long)]
+    preset: Option<String>,
+    /// Override cwd on the forked context
+    #[arg(long)]
+    pwd: Option<String>,
+    /// Model spec provider/model (or bare model)
+    #[arg(long, short = 'm')]
+    model: Option<String>,
+    /// Distillation model for compact forks
+    #[arg(long = "distill-model")]
+    distill_model: Option<String>,
+    /// Shallow-fork depth (block count)
+    #[arg(long)]
+    depth: Option<usize>,
+    /// Subtree template context ref; presence selects subtree mode
+    #[arg(long = "as")]
+    as_template: Option<String>,
+    /// Start the child in liminal staging state
+    #[arg(long, visible_alias = "staging")]
+    stage: bool,
+    /// Move the session to the child after forking
+    #[arg(long)]
+    switch: bool,
+    /// Shallow fork (last N blocks)
+    #[arg(long)]
+    shallow: bool,
+    /// Compact (distill) fork
+    #[arg(long)]
+    compact: bool,
+}
 
 /// Resolved provider+model for a fork.
 struct ResolvedModel {
@@ -21,11 +63,9 @@ impl KjDispatcher {
     /// Resolve the model for a fork: parse `--model`, validate provider, or inherit from parent.
     async fn resolve_fork_model(
         &self,
-        argv: &[String],
+        model_spec: Option<&str>,
         source_id: ContextId,
     ) -> Result<ResolvedModel, String> {
-        let model_spec = extract_named_arg(argv, &["--model", "-m"]);
-
         // Read parent's provider+model from DriftRouter (before any mutations)
         let (parent_provider, parent_model) = {
             let router = self.drift_router().read();
@@ -37,7 +77,7 @@ impl KjDispatcher {
 
         match model_spec {
             Some(spec) => {
-                let (mut provider, model) = parse_model_spec(&spec);
+                let (mut provider, model) = parse_model_spec(spec);
                 let registry = self.kernel().llm().read().await;
                 if let Some(ref p) = provider {
                     // Explicit provider — validate it exists
@@ -66,30 +106,36 @@ impl KjDispatcher {
     }
 
     pub(crate) async fn dispatch_fork(&self, argv: &[String], caller: &KjCaller) -> KjResult {
-        if has_flag(argv, &["help", "--help", "-h"]) {
-            return KjResult::ok_ephemeral(self.fork_help(), ContentType::Markdown);
-        }
+        let args = match ForkArgs::try_parse_from(argv) {
+            Ok(a) => a,
+            Err(e) => {
+                if matches!(
+                    e.kind(),
+                    clap::error::ErrorKind::DisplayHelp
+                        | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+                ) {
+                    return KjResult::ok_ephemeral(e.to_string(), ContentType::Plain);
+                }
+                return KjResult::Err(format!("kj fork: {e}"));
+            }
+        };
 
         // All fork variants snapshot a context into a child — gated on `fork`.
         if let Err(denied) = self.require_cap(caller, crate::mcp::Capability::Fork, "fork") {
             return denied;
         }
 
-        if has_flag(argv, &["--shallow"]) {
-            return self.fork_shallow(argv, caller).await;
+        if args.shallow {
+            return self.fork_shallow(&args, caller).await;
         }
-        if has_flag(argv, &["--compact"]) {
-            return self.fork_compact(argv, caller).await;
+        if args.compact {
+            return self.fork_compact(&args, caller).await;
         }
-        if has_flag(argv, &["--as"]) {
-            return self.fork_subtree(argv, caller).await;
+        if args.as_template.is_some() {
+            return self.fork_subtree(&args, caller).await;
         }
 
-        self.fork_full(argv, caller).await
-    }
-
-    fn fork_help(&self) -> String {
-        include_str!("../../docs/help/kj-fork.md").to_string()
+        self.fork_full(&args, caller).await
     }
 
     /// Apply MCP fork mode exclusions to a newly forked context.
@@ -102,21 +148,12 @@ impl KjDispatcher {
         // ExternalMcpServer health/policy.
     }
 
-    async fn fork_full(&self, argv: &[String], caller: &KjCaller) -> KjResult {
-        // Parse --name / -n
-        let label = extract_named_arg(argv, &["--name", "-n"]);
-
-        // Parse --prompt
-        let prompt = extract_named_arg(argv, &["--prompt"]);
-
-        // Parse --preset
-        let preset_label = extract_named_arg(argv, &["--preset"]);
-
-        // Parse --pwd (override cwd on forked context)
-        let pwd_override = extract_named_arg(argv, &["--pwd"]);
-
-        // Parse --stage (liminal state: user curates blocks before LLM invocation)
-        let staging = has_flag(argv, &["--stage", "--staging"]);
+    async fn fork_full(&self, args: &ForkArgs, caller: &KjCaller) -> KjResult {
+        let label = args.name.clone();
+        let prompt = args.prompt.clone();
+        let preset_label = args.preset.clone();
+        let pwd_override = args.pwd.clone();
+        let staging = args.stage;
 
         let source_id = match caller.require_context() {
             Ok(id) => id,
@@ -125,7 +162,7 @@ impl KjDispatcher {
         let new_id = ContextId::new();
 
         // Validate --model BEFORE any mutations
-        let resolved = match self.resolve_fork_model(argv, source_id).await {
+        let resolved = match self.resolve_fork_model(args.model.as_deref(), source_id).await {
             Ok(r) => r,
             Err(e) => return KjResult::Err(format!("kj fork: {e}")),
         };
@@ -213,10 +250,10 @@ impl KjDispatcher {
                 return KjResult::Err(format!("kj fork: parent context not in router: {e}"));
             }
             // Set staging state if --stage flag was given
-            if staging {
-                if let Err(e) = drift.set_state(new_id, ContextState::Staging) {
-                    return KjResult::Err(format!("kj fork: failed to set staging state: {e}"));
-                }
+            if staging
+                && let Err(e) = drift.set_state(new_id, ContextState::Staging)
+            {
+                return KjResult::Err(format!("kj fork: failed to set staging state: {e}"));
             }
             // If --model was explicit, override the inherited model
             if resolved.explicit {
@@ -291,7 +328,7 @@ impl KjDispatcher {
             tracing::warn!("rc fork lifecycle: {e}");
         }
 
-        let switch = has_flag(argv, &["--switch"]);
+        let switch = args.switch;
         self.request_child_turn(new_id, prompt.as_deref(), staging, caller);
         let short = new_id.short();
         let display = label.as_deref().unwrap_or(&short);
@@ -299,15 +336,13 @@ impl KjDispatcher {
         self.fork_outcome(new_id, label.as_deref(), switch, message)
     }
 
-    async fn fork_shallow(&self, argv: &[String], caller: &KjCaller) -> KjResult {
-        let label = extract_named_arg(argv, &["--name", "-n"]);
-        let prompt = extract_named_arg(argv, &["--prompt"]);
-        let preset_label = extract_named_arg(argv, &["--preset"]);
-        let pwd_override = extract_named_arg(argv, &["--pwd"]);
-        let staging = has_flag(argv, &["--stage", "--staging"]);
-        let depth: usize = extract_named_arg(argv, &["--depth"])
-            .and_then(|d| d.parse().ok())
-            .unwrap_or(50);
+    async fn fork_shallow(&self, args: &ForkArgs, caller: &KjCaller) -> KjResult {
+        let label = args.name.clone();
+        let prompt = args.prompt.clone();
+        let preset_label = args.preset.clone();
+        let pwd_override = args.pwd.clone();
+        let staging = args.stage;
+        let depth: usize = args.depth.unwrap_or(50);
 
         let source_id = match caller.require_context() {
             Ok(id) => id,
@@ -316,7 +351,7 @@ impl KjDispatcher {
         let new_id = ContextId::new();
 
         // Validate --model BEFORE any mutations
-        let resolved = match self.resolve_fork_model(argv, source_id).await {
+        let resolved = match self.resolve_fork_model(args.model.as_deref(), source_id).await {
             Ok(r) => r,
             Err(e) => return KjResult::Err(format!("kj fork --shallow: {e}")),
         };
@@ -409,10 +444,10 @@ impl KjDispatcher {
                     "kj fork --shallow: parent context not in router: {e}"
                 ));
             }
-            if staging {
-                if let Err(e) = drift.set_state(new_id, ContextState::Staging) {
-                    return KjResult::Err(format!("kj fork --shallow: failed to set staging state: {e}"));
-                }
+            if staging
+                && let Err(e) = drift.set_state(new_id, ContextState::Staging)
+            {
+                return KjResult::Err(format!("kj fork --shallow: failed to set staging state: {e}"));
             }
             if resolved.explicit {
                 match (&resolved.provider, &resolved.model) {
@@ -492,7 +527,7 @@ impl KjDispatcher {
         // POSIX-style: drive the child's autonomous turn (if --prompt) after all
         // fork-time block injections + rc lifecycle, then honor stay-on-parent
         // default / --switch via fork_outcome.
-        let switch = has_flag(argv, &["--switch"]);
+        let switch = args.switch;
         self.request_child_turn(new_id, prompt.as_deref(), staging, caller);
         let short = new_id.short();
         let display = label.as_deref().unwrap_or(&short);
@@ -505,16 +540,16 @@ impl KjDispatcher {
         self.fork_outcome(new_id, label.as_deref(), switch, message)
     }
 
-    async fn fork_compact(&self, argv: &[String], caller: &KjCaller) -> KjResult {
-        let label = extract_named_arg(argv, &["--name", "-n"]);
-        let prompt = extract_named_arg(argv, &["--prompt"]);
-        let pwd_override = extract_named_arg(argv, &["--pwd"]);
-        let staging = has_flag(argv, &["--stage", "--staging"]);
+    async fn fork_compact(&self, args: &ForkArgs, caller: &KjCaller) -> KjResult {
+        let label = args.name.clone();
+        let prompt = args.prompt.clone();
+        let pwd_override = args.pwd.clone();
+        let staging = args.stage;
         // M5-F5: optional cheaper model for the distillation step.
         // Distillation is a one-shot summary — using Opus to summarize for
         // a Haiku follow-up is wasteful. Fall through to the source
         // context's chat model when not specified.
-        let distill_model = extract_named_arg(argv, &["--distill-model"]);
+        let distill_model = args.distill_model.clone();
 
         let source_id = match caller.require_context() {
             Ok(id) => id,
@@ -523,7 +558,7 @@ impl KjDispatcher {
         let new_id = ContextId::new();
 
         // Validate --model BEFORE any mutations
-        let resolved = match self.resolve_fork_model(argv, source_id).await {
+        let resolved = match self.resolve_fork_model(args.model.as_deref(), source_id).await {
             Ok(r) => r,
             Err(e) => return KjResult::Err(format!("kj fork --compact: {e}")),
         };
@@ -644,10 +679,10 @@ impl KjDispatcher {
                     "kj fork --compact: parent context not in router: {e}"
                 ));
             }
-            if staging {
-                if let Err(e) = drift.set_state(new_id, ContextState::Staging) {
-                    return KjResult::Err(format!("kj fork --compact: failed to set staging state: {e}"));
-                }
+            if staging
+                && let Err(e) = drift.set_state(new_id, ContextState::Staging)
+            {
+                return KjResult::Err(format!("kj fork --compact: failed to set staging state: {e}"));
             }
             if resolved.explicit {
                 match (&resolved.provider, &resolved.model) {
@@ -711,7 +746,7 @@ impl KjDispatcher {
         // POSIX-style: drive the child's autonomous turn (if --prompt) after all
         // fork-time block injections + rc lifecycle, then honor stay-on-parent
         // default / --switch via fork_outcome.
-        let switch = has_flag(argv, &["--switch"]);
+        let switch = args.switch;
         self.request_child_turn(new_id, prompt.as_deref(), staging, caller);
         let short = new_id.short();
         let display = label.as_deref().unwrap_or(&short);
@@ -719,8 +754,8 @@ impl KjDispatcher {
         self.fork_outcome(new_id, label.as_deref(), switch, message)
     }
 
-    async fn fork_subtree(&self, argv: &[String], caller: &KjCaller) -> KjResult {
-        let template_ref = match extract_named_arg(argv, &["--as"]) {
+    async fn fork_subtree(&self, args: &ForkArgs, caller: &KjCaller) -> KjResult {
+        let template_ref = match args.as_template.clone() {
             Some(r) => r,
             None => {
                 return KjResult::Err(
@@ -728,7 +763,7 @@ impl KjDispatcher {
                 );
             }
         };
-        let name = match extract_named_arg(argv, &["--name", "-n"]) {
+        let name = match args.name.clone() {
             Some(n) => n,
             None => {
                 return KjResult::Err(
@@ -736,8 +771,8 @@ impl KjDispatcher {
                 );
             }
         };
-        let staging = has_flag(argv, &["--stage", "--staging"]);
-        let prompt = extract_named_arg(argv, &["--prompt"]);
+        let staging = args.stage;
+        let prompt = args.prompt.clone();
 
         let source_id = match caller.require_context() {
             Ok(id) => id,
@@ -923,10 +958,10 @@ impl KjDispatcher {
                 } else if let Err(e) = drift.register(new_id, label, None, caller.principal_id) {
                     return KjResult::Err(format!("kj fork --as: {e}"));
                 }
-                if staging {
-                    if let Err(e) = drift.set_state(new_id, ContextState::Staging) {
-                        return KjResult::Err(format!("kj fork --as: failed to set staging state: {e}"));
-                    }
+                if staging
+                    && let Err(e) = drift.set_state(new_id, ContextState::Staging)
+                {
+                    return KjResult::Err(format!("kj fork --as: failed to set staging state: {e}"));
                 }
             }
         }
@@ -971,7 +1006,7 @@ impl KjDispatcher {
         // POSIX-style: the prompt/turn targets the subtree root. Drive it after
         // all fork-time block injections + rc lifecycle, then honor the
         // stay-on-parent default / --switch via fork_outcome.
-        let switch = has_flag(argv, &["--switch"]);
+        let switch = args.switch;
         self.request_child_turn(new_root_id, prompt.as_deref(), staging, caller);
         let message = format!(
             "subtree-forked '{}' ({} contexts) from template '{}'",
@@ -1345,9 +1380,13 @@ mod tests {
     async fn fork_help() {
         let d = test_dispatcher().await;
         let c = test_caller();
-        let result = d.dispatch(&[s("fork"), s("help")], &c).await;
+        let result = d.dispatch(&[s("fork"), s("--help")], &c).await;
         assert!(result.is_ok());
-        assert!(result.message().contains("## Fork Kinds"));
+        assert!(
+            result.message().contains("Usage") && result.message().contains("--prompt"),
+            "clap help should list usage + flags: {}",
+            result.message()
+        );
     }
 
     #[tokio::test]
