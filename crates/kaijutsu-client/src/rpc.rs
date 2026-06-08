@@ -2041,6 +2041,13 @@ pub(crate) fn parse_block_snapshot(
         builder = builder.stderr(s);
     }
 
+    if reader.get_has_signature()
+        && let Ok(s) = reader.get_signature()
+        && let Ok(s) = s.to_str()
+    {
+        builder = builder.signature(s);
+    }
+
     // Structured output data
     if let Ok(output_data_reader) = reader.get_output_data()
         && let Ok(data) = parse_output_data(output_data_reader)
@@ -2673,6 +2680,11 @@ mod tests {
             builder.set_tick(tick.get());
         }
 
+        if let Some(ref signature) = snap.signature {
+            builder.set_has_signature(true);
+            builder.set_signature(signature);
+        }
+
         // Parse back
         let reader = message
             .get_root_as_reader::<crate::kaijutsu_capnp::block_snapshot::Reader>()
@@ -2696,6 +2708,28 @@ mod tests {
         // An ordinary block has no tick, and absence roundtrips as None.
         let plain = BlockSnapshotBuilder::new(id, BlockKind::Text).build();
         assert_eq!(roundtrip_snapshot(&plain).tick, None);
+    }
+
+    #[test]
+    fn test_parse_block_snapshot_signature_roundtrip() {
+        let id = BlockId {
+            context_id: ContextId::new(),
+            principal_id: PrincipalId::new(),
+            seq: 1,
+        };
+        // A signed Thinking block carries its reasoning-continuity token across
+        // the wire verbatim.
+        let snap = BlockSnapshotBuilder::new(id, BlockKind::Thinking)
+            .signature("sig_xyz")
+            .build();
+        assert_eq!(
+            roundtrip_snapshot(&snap).signature.as_deref(),
+            Some("sig_xyz")
+        );
+
+        // A block with no signature roundtrips as None (hasSignature=false).
+        let plain = BlockSnapshotBuilder::new(id, BlockKind::Text).build();
+        assert_eq!(roundtrip_snapshot(&plain).signature, None);
     }
 
     #[test]

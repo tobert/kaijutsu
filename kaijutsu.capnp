@@ -206,6 +206,13 @@ struct BlockSnapshot {
   # committed timeline cell; absent on every ordinary block.
   tick @35 :Int64;
   hasTick @36 :Bool;          # True if tick is set (Int64 value type)
+
+  # Reasoning-continuity token for Thinking blocks — opaque, provider-agnostic
+  # marker ("rehydratable"): the verbatim Anthropic/Gemini signature, or a
+  # provider nonce. Absent (hasSignature=false) on non-reasoning blocks and
+  # legacy/older-wire blocks.
+  signature @37 :Text;
+  hasSignature @38 :Bool;     # True if signature is set (distinguishes "" from unset)
 }
 
 # What system produced the error.

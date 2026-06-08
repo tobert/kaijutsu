@@ -6050,6 +6050,10 @@ fn set_block_snapshot(
         builder.set_has_stderr(true);
         builder.set_stderr(stderr);
     }
+    if let Some(ref signature) = block.signature {
+        builder.set_has_signature(true);
+        builder.set_signature(signature);
+    }
 
     // Set output data if present
     if let Some(ref output) = block.output {

@@ -26,19 +26,15 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 - **LLM providers:**
   - Move per-model knobs out of the config layer (`models.toml`), into the app.
   - Push subscriber for `ConversationMailbox`.
-- **Reasoning-continuity follow-ups (post `BlockSnapshot::signature`):**
-  Cross-turn thinking now rehydrates — `BlockSnapshot.signature` is an opaque
-  "rehydratable" token (real Anthropic/Gemini sig, or a DeepSeek nonce), set on
-  `ThinkingEnd`, and `hydrate` re-emits *signed* Thinking as `Reasoning`.
-  Remaining:
-  - **Cross-provider guard (policy, not Rust):** block `kj context set --model`
-    across provider families when signed Thinking exists in history (a DeepSeek
-    nonce fed to Anthropic 400s); allow the transition only at `fork`, where an
-    rc script decides to elide thinking or downgrade it to plain blocks.
-  - **Cap'n Proto wire:** `signature` is deferred off the wire — it rides the
-    postcard `StoreSnapshot` (persistence + fork-copy), which is all kernel-local
-    hydration needs. Add a `BlockSnapshot.signature` field + rpc encode/decode if
-    cross-kernel drift or app-side round-trips ever need to preserve it.
+- **Reasoning-continuity cross-provider guard (policy, not Rust):** cross-turn
+  thinking now rehydrates — `BlockSnapshot.signature` is an opaque "rehydratable"
+  token (real Anthropic/Gemini sig, or a DeepSeek nonce), set on `ThinkingEnd`,
+  persisted (CRDT snapshot + Cap'n Proto wire), and `hydrate` re-emits *signed*
+  Thinking as `Reasoning` (one block per thinking block). Remaining: block
+  `kj context set --model` across provider families when signed Thinking exists
+  in history (a DeepSeek nonce fed to Anthropic 400s); allow the transition only
+  at `fork`, where an rc script decides to elide thinking or downgrade it to
+  plain blocks.
 
 ## Persistence & Sync
 
