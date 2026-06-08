@@ -1,5 +1,6 @@
 //! Context subcommands: list, info, switch, create, set, log, move, archive, remove, retag.
 
+use clap::{Args, Parser, Subcommand};
 use kaijutsu_types::{ConsentMode, ContentType, ContextId, ContextState, EdgeKind};
 
 use crate::kernel_db::{ContextEdgeRow, ContextRow, ContextShellRow};
@@ -7,9 +8,122 @@ use crate::kernel_db::{ContextEdgeRow, ContextRow, ContextShellRow};
 use super::format::{
     format_context_info, format_context_table, format_context_tree, format_fork_lineage,
 };
-use super::parse::{extract_named_arg, parse_model_spec};
+use super::parse::parse_model_spec;
 use super::refs::{parse_context_ref, resolve_context_ref};
-use super::{KjCaller, KjDispatcher, KjResult};
+use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "context",
+    about = "Inspect, navigate, and manage contexts",
+    disable_help_subcommand = true,
+    no_binary_name = true
+)]
+struct ContextArgs {
+    #[command(subcommand)]
+    command: ContextCommand,
+}
+
+/// Settable context configuration shared by `create` and `set`, flattened into
+/// both clap variants. Mirrors [`ContextConfig`] (the internal apply struct).
+#[derive(Args, Debug, Default)]
+struct ContextConfigArgs {
+    /// Model spec `provider/model` or a bare model name (resolved to default provider)
+    #[arg(long, short = 'm')]
+    model: Option<String>,
+    /// System prompt text
+    #[arg(long = "system-prompt")]
+    system_prompt: Option<String>,
+    /// Consent mode: collaborative|autonomous
+    #[arg(long)]
+    consent: Option<String>,
+    /// Working directory for the context's shell
+    #[arg(long)]
+    cwd: Option<String>,
+    /// Set an env var as KEY=VALUE
+    #[arg(long)]
+    env: Option<String>,
+    /// rc-dispatch context_type (selects which /etc/rc scripts run)
+    #[arg(long = "type")]
+    type_: Option<String>,
+}
+
+impl From<ContextConfigArgs> for ContextConfig {
+    fn from(a: ContextConfigArgs) -> Self {
+        ContextConfig {
+            model_spec: a.model,
+            system_prompt: a.system_prompt,
+            consent_spec: a.consent,
+            cwd_spec: a.cwd,
+            env_spec: a.env,
+            type_spec: a.type_,
+        }
+    }
+}
+
+#[derive(Subcommand, Debug)]
+enum ContextCommand {
+    /// List active contexts (or the fork DAG with --tree).
+    #[command(alias = "ls")]
+    List {
+        /// Render the fork DAG as a tree
+        #[arg(long, short = 't')]
+        tree: bool,
+    },
+    /// Show a context's metadata (default: current).
+    Info { context: Option<String> },
+    /// Print the current context.
+    #[command(alias = "show")]
+    Current,
+    /// Switch the session to another context.
+    #[command(alias = "sw")]
+    Switch { context: String },
+    /// Create a new context. Label is positional or `--name`.
+    #[command(alias = "new")]
+    Create {
+        /// Label (positional form; or use --name)
+        label: Option<String>,
+        /// Label (flag form, fork-parity)
+        #[arg(long, short = 'n')]
+        name: Option<String>,
+        /// Parent context to fork the structural edge from
+        #[arg(long, short = 'p')]
+        parent: Option<String>,
+        #[command(flatten)]
+        config: ContextConfigArgs,
+    },
+    /// Get-or-create the well-known "scratch" context.
+    #[command(alias = "self")]
+    Scratch,
+    /// Apply settable config to an existing context (default: current).
+    Set {
+        context: Option<String>,
+        #[command(flatten)]
+        config: ContextConfigArgs,
+    },
+    /// Remove an env var from a context.
+    Unset {
+        context: Option<String>,
+        /// Env var key to remove
+        #[arg(long)]
+        env: Option<String>,
+    },
+    /// Show fork lineage from a context up to root (default: current).
+    Log { context: Option<String> },
+    /// Reparent a context under a new parent.
+    #[command(alias = "mv")]
+    Move {
+        context: String,
+        new_parent: String,
+    },
+    /// Soft-delete a context (latched).
+    Archive { context: String },
+    /// Permanently delete a context (latched).
+    #[command(alias = "rm")]
+    Remove { context: String },
+    /// Move a label to a different context (latched).
+    Retag { label: String, context: String },
+}
 
 /// Settable context configuration shared by `create` and `set`.
 ///
@@ -18,6 +132,7 @@ use super::{KjCaller, KjDispatcher, KjResult};
 /// the rc-dispatch `context_type`. `create` reuses the same surface so a
 /// context can be born fully configured (fork-parity) instead of needing a
 /// follow-up `kj context set`.
+#[derive(Default)]
 struct ContextConfig {
     model_spec: Option<String>,
     system_prompt: Option<String>,
@@ -25,19 +140,6 @@ struct ContextConfig {
     cwd_spec: Option<String>,
     env_spec: Option<String>,
     type_spec: Option<String>,
-}
-
-impl ContextConfig {
-    fn from_argv(argv: &[String]) -> Self {
-        Self {
-            model_spec: extract_named_arg(argv, &["--model", "-m"]),
-            system_prompt: extract_named_arg(argv, &["--system-prompt"]),
-            consent_spec: extract_named_arg(argv, &["--consent"]),
-            cwd_spec: extract_named_arg(argv, &["--cwd"]),
-            env_spec: extract_named_arg(argv, &["--env"]),
-            type_spec: extract_named_arg(argv, &["--type"]),
-        }
-    }
 }
 
 /// A `--model` spec resolved against the LLM registry: a bare model name has
@@ -193,10 +295,21 @@ impl KjDispatcher {
 
     pub(crate) async fn dispatch_context(&self, argv: &[String], caller: &KjCaller) -> KjResult {
         if argv.is_empty() {
-            // No subcommand: show help as rendered Markdown rather than a raw
-            // error string (the fenced blocks are unreadable as plain text).
-            return KjResult::ok_ephemeral(self.context_help(), ContentType::Markdown);
+            return clap_help_for::<ContextArgs>();
         }
+        let parsed = match ContextArgs::try_parse_from(argv) {
+            Ok(p) => p,
+            Err(e) => {
+                if matches!(
+                    e.kind(),
+                    clap::error::ErrorKind::DisplayHelp
+                        | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+                ) {
+                    return KjResult::ok_ephemeral(e.to_string(), ContentType::Plain);
+                }
+                return KjResult::Err(format!("kj context: {e}"));
+            }
+        };
 
         // Mutating or destroying an *existing* context is operator authority.
         // `create`/`scratch` are deliberately ungated: minting a context is the
@@ -205,48 +318,59 @@ impl KjDispatcher {
         // rc `create` lifecycle, not the caller's. Read/navigation verbs
         // (list/info/current/switch/log) stay ungated too.
         if matches!(
-            argv[0].as_str(),
-            "set" | "unset" | "move" | "mv" | "archive" | "remove" | "rm" | "retag"
-        ) {
-            if let Err(denied) =
-                self.require_cap(caller, crate::mcp::Capability::Operator, "context")
-            {
-                return denied;
-            }
+            parsed.command,
+            ContextCommand::Set { .. }
+                | ContextCommand::Unset { .. }
+                | ContextCommand::Move { .. }
+                | ContextCommand::Archive { .. }
+                | ContextCommand::Remove { .. }
+                | ContextCommand::Retag { .. }
+        ) && let Err(denied) =
+            self.require_cap(caller, crate::mcp::Capability::Operator, "context")
+        {
+            return denied;
         }
 
-        match argv[0].as_str() {
-            "list" | "ls" => self.context_list(argv, caller).await,
-            "info" => self.context_info(argv, caller),
-            "current" | "show" => self.context_current(argv, caller).await,
-            "switch" | "sw" => self.context_switch(argv, caller).await,
-            "create" | "new" => self.context_create(argv, caller).await,
-            "scratch" | "self" => self.context_scratch(caller).await,
-            "set" => self.context_set(argv, caller).await,
-            "unset" => self.context_unset(argv, caller),
-            "log" => self.context_log(argv, caller),
-            "move" | "mv" => self.context_move(argv, caller).await,
-            "archive" => self.context_archive(argv, caller).await,
-            "remove" | "rm" => self.context_remove(argv, caller).await,
-            "retag" => self.context_retag(argv, caller).await,
-            "help" | "--help" | "-h" => {
-                KjResult::ok_ephemeral(self.context_help(), ContentType::Markdown)
+        match parsed.command {
+            ContextCommand::List { tree } => self.context_list(tree, caller).await,
+            ContextCommand::Info { context } => self.context_info(context.as_deref(), caller),
+            ContextCommand::Current => self.context_current(caller).await,
+            ContextCommand::Switch { context } => self.context_switch(&context, caller).await,
+            ContextCommand::Create {
+                label,
+                name,
+                parent,
+                config,
+            } => {
+                self.context_create(
+                    name.or(label).as_deref(),
+                    parent.as_deref(),
+                    config.into(),
+                    caller,
+                )
+                .await
             }
-            other => KjResult::Err(format!(
-                "kj context: unknown subcommand '{}'\n\n{}",
-                other,
-                self.context_help()
-            )),
+            ContextCommand::Scratch => self.context_scratch(caller).await,
+            ContextCommand::Set { context, config } => {
+                self.context_set(context.as_deref(), config.into(), caller).await
+            }
+            ContextCommand::Unset { context, env } => {
+                self.context_unset(context.as_deref(), env.as_deref(), caller)
+            }
+            ContextCommand::Log { context } => self.context_log(context.as_deref(), caller),
+            ContextCommand::Move {
+                context,
+                new_parent,
+            } => self.context_move(&context, &new_parent, caller).await,
+            ContextCommand::Archive { context } => self.context_archive(&context, caller).await,
+            ContextCommand::Remove { context } => self.context_remove(&context, caller).await,
+            ContextCommand::Retag { label, context } => {
+                self.context_retag(&label, &context, caller).await
+            }
         }
     }
 
-    fn context_help(&self) -> String {
-        include_str!("../../docs/help/kj-context.md").to_string()
-    }
-
-    async fn context_list(&self, argv: &[String], caller: &KjCaller) -> KjResult {
-        let tree = argv.iter().any(|a| a == "--tree" || a == "-t");
-
+    async fn context_list(&self, tree: bool, caller: &KjCaller) -> KjResult {
         let db = self.kernel_db().lock();
         if tree {
             match db.context_dag() {
@@ -269,12 +393,11 @@ impl KjDispatcher {
         }
     }
 
-    fn context_info(&self, argv: &[String], caller: &KjCaller) -> KjResult {
+    fn context_info(&self, context: Option<&str>, caller: &KjCaller) -> KjResult {
         let db = self.kernel_db().lock();
 
         // Resolve target context (default: current)
-        let target_arg = argv.get(1).map(|s| s.as_str());
-        let target_id = match super::refs::resolve_context_arg(target_arg, caller, &db) {
+        let target_id = match super::refs::resolve_context_arg(context, caller, &db) {
             Ok(id) => id,
             Err(e) => return KjResult::Err(format!("kj context info: {e}")),
         };
@@ -315,10 +438,10 @@ impl KjDispatcher {
 
         // Shell config — captured into the structured record below as well.
         let shell = db.get_context_shell(target_id).ok().flatten();
-        if let Some(ref s) = shell {
-            if let Some(cwd) = &s.cwd {
-                info.push_str(&format!("\nCwd:     {cwd}"));
-            }
+        if let Some(ref s) = shell
+            && let Some(cwd) = &s.cwd
+        {
+            info.push_str(&format!("\nCwd:     {cwd}"));
         }
 
         // Env vars
@@ -373,7 +496,7 @@ impl KjDispatcher {
         KjResult::ok_with_data(info, record)
     }
 
-    async fn context_current(&self, _argv: &[String], caller: &KjCaller) -> KjResult {
+    async fn context_current(&self, caller: &KjCaller) -> KjResult {
         let Some(ctx_id) = caller.context_id else {
             return KjResult::ok("No active context joined. Use 'kj context switch' to join one.");
         };
@@ -391,16 +514,7 @@ impl KjDispatcher {
         ))
     }
 
-    async fn context_switch(&self, argv: &[String], caller: &KjCaller) -> KjResult {
-        let query = match argv.get(1) {
-            Some(q) => q.as_str(),
-            None => {
-                return KjResult::Err(
-                    "kj context switch: requires a context reference".to_string(),
-                );
-            }
-        };
-
+    async fn context_switch(&self, query: &str, caller: &KjCaller) -> KjResult {
         let ctx_ref = parse_context_ref(query);
 
         // Resolve using DriftRouter for live state (not just DB)
@@ -428,18 +542,16 @@ impl KjDispatcher {
         }
     }
 
-    async fn context_create(&self, argv: &[String], caller: &KjCaller) -> KjResult {
-        // Parse args: kj context create <label|--name label> [--parent <ctx>]
-        //             [--model p/m] [--system-prompt t] [--consent mode]
-        //             [--cwd path] [--env KEY=VALUE] [--type t]
-        //
+    async fn context_create(
+        &self,
+        label: Option<&str>,
+        parent: Option<&str>,
+        mut cfg: ContextConfig,
+        caller: &KjCaller,
+    ) -> KjResult {
         // Label comes from --name/-n (fork-parity) or the first positional
-        // argument that isn't a flag.
-        let label = match extract_named_arg(argv, &["--name", "-n"]).or_else(|| {
-            argv.get(1)
-                .filter(|a| !a.starts_with('-'))
-                .map(|s| s.to_string())
-        }) {
+        // argument (resolved in the dispatcher as `name.or(label)`).
+        let label = match label {
             Some(l) => l,
             None => {
                 return KjResult::Err(
@@ -448,26 +560,19 @@ impl KjDispatcher {
             }
         };
 
-        // Find --parent flag
+        // Resolve --parent (default to root when absent / unresolvable-as-none).
         let parent_id = {
-            let parent_ref = if let Some(idx) = argv.iter().position(|a| a == "--parent" || a == "-p") {
-                argv.get(idx + 1).map(|s| s.as_str())
-            } else {
-                None
-            };
-
             let db = self.kernel_db().lock();
-            match super::refs::resolve_context_arg(parent_ref, caller, &db) {
+            match super::refs::resolve_context_arg(parent, caller, &db) {
                 Ok(id) => Some(id),
-                Err(_) if parent_ref.is_none() => None, // Default to root if no current context
+                Err(_) if parent.is_none() => None, // Default to root if no current context
                 Err(e) => return KjResult::Err(format!("kj context create: {e}")),
             }
         };
 
-        // Settable config shared with `set`. `--type` is pulled out here so it
-        // lands on the row up front (the rc create-lifecycle dispatches on
-        // context_type); the rest is applied after the context exists.
-        let mut cfg = ContextConfig::from_argv(argv);
+        // `--type` is pulled out here so it lands on the row up front (the rc
+        // create-lifecycle dispatches on context_type); the rest is applied
+        // after the context exists.
         // --type <context_type> selects which rc scripts run for this
         // context. Default is "default" — runs scripts under
         // /etc/rc/default/<verb>/.
@@ -479,8 +584,6 @@ impl KjDispatcher {
             Ok(r) => r,
             Err(e) => return KjResult::Err(format!("kj context create: {e}")),
         };
-        let label = label.as_str();
-
         let new_id = ContextId::new();
 
         // Write-through: KernelDb first, then DriftRouter
@@ -624,13 +727,12 @@ impl KjDispatcher {
     }
 
     /// `kj context set <ctx> [--model p/m] [--system-prompt text] [--consent mode] [--cwd path] [--env KEY=VALUE] [--type t]`
-    async fn context_set(&self, argv: &[String], caller: &KjCaller) -> KjResult {
-        let target_arg = argv
-            .get(1)
-            .filter(|a| !a.starts_with('-'))
-            .map(|s| s.as_str());
-        let cfg = ContextConfig::from_argv(argv);
-
+    async fn context_set(
+        &self,
+        target_arg: Option<&str>,
+        cfg: ContextConfig,
+        caller: &KjCaller,
+    ) -> KjResult {
         // Validate + resolve the model before touching the DB.
         let resolved_model = match self.resolve_context_config(&cfg).await {
             Ok(r) => r,
@@ -659,14 +761,12 @@ impl KjDispatcher {
     }
 
     /// `kj context unset [<ctx>] --env KEY` — remove an env var from a context.
-    fn context_unset(&self, argv: &[String], caller: &KjCaller) -> KjResult {
-
-        let target_arg = argv
-            .get(1)
-            .filter(|a| !a.starts_with('-'))
-            .map(|s| s.as_str());
-        let env_key = extract_named_arg(argv, &["--env"]);
-
+    fn context_unset(
+        &self,
+        target_arg: Option<&str>,
+        env_key: Option<&str>,
+        caller: &KjCaller,
+    ) -> KjResult {
         let db = self.kernel_db().lock();
         let target_id = match super::refs::resolve_context_arg(target_arg, caller, &db) {
             Ok(id) => id,
@@ -674,7 +774,7 @@ impl KjDispatcher {
         };
 
         if let Some(key) = env_key {
-            match db.delete_context_env(target_id, &key) {
+            match db.delete_context_env(target_id, key) {
                 Ok(true) => KjResult::ok(format!("unset env {key}")),
                 Ok(false) => KjResult::Err(format!("kj context unset: env var '{}' not set", key)),
                 Err(e) => KjResult::Err(format!("kj context unset: {e}")),
@@ -685,10 +785,9 @@ impl KjDispatcher {
     }
 
     /// `kj context log [<ctx>]` — show fork lineage from context up to root.
-    fn context_log(&self, argv: &[String], caller: &KjCaller) -> KjResult {
+    fn context_log(&self, target_arg: Option<&str>, caller: &KjCaller) -> KjResult {
         let db = self.kernel_db().lock();
 
-        let target_arg = argv.get(1).map(|s| s.as_str());
         let target_id = match super::refs::resolve_context_arg(target_arg, caller, &db) {
             Ok(id) => id,
             Err(e) => return KjResult::Err(format!("kj context log: {e}")),
@@ -705,22 +804,12 @@ impl KjDispatcher {
     }
 
     /// `kj context move <ctx> <new-parent>` — reparent a context.
-    async fn context_move(&self, argv: &[String], _caller: &KjCaller) -> KjResult {
-        let ctx_ref = match argv.get(1) {
-            Some(r) => r.as_str(),
-            None => {
-                return KjResult::Err("kj context move: requires a context reference".to_string());
-            }
-        };
-        let new_parent_ref = match argv.get(2) {
-            Some(r) => r.as_str(),
-            None => {
-                return KjResult::Err(
-                    "kj context move: requires a new parent reference".to_string(),
-                );
-            }
-        };
-
+    async fn context_move(
+        &self,
+        ctx_ref: &str,
+        new_parent_ref: &str,
+        _caller: &KjCaller,
+    ) -> KjResult {
         // All DB work in a single lock scope, no await
         let db = self.kernel_db().lock();
 
@@ -772,16 +861,7 @@ impl KjDispatcher {
     }
 
     /// `kj context archive <ctx>` — soft-delete a context (latched).
-    async fn context_archive(&self, argv: &[String], caller: &KjCaller) -> KjResult {
-        let ctx_ref = match argv.get(1) {
-            Some(r) => r.as_str(),
-            None => {
-                return KjResult::Err(
-                    "kj context archive: requires a context reference".to_string(),
-                );
-            }
-        };
-
+    async fn context_archive(&self, ctx_ref: &str, caller: &KjCaller) -> KjResult {
         let (target_id, target_label) = {
             let db = self.kernel_db().lock();
             let target_id =
@@ -861,16 +941,7 @@ impl KjDispatcher {
     }
 
     /// `kj context remove <ctx>` — permanently delete a context (latched).
-    async fn context_remove(&self, argv: &[String], caller: &KjCaller) -> KjResult {
-        let ctx_ref = match argv.get(1) {
-            Some(r) => r.as_str(),
-            None => {
-                return KjResult::Err(
-                    "kj context remove: requires a context reference".to_string(),
-                );
-            }
-        };
-
+    async fn context_remove(&self, ctx_ref: &str, caller: &KjCaller) -> KjResult {
         let (target_id, target_label) = {
             let db = self.kernel_db().lock();
             let target_id =
@@ -937,20 +1008,7 @@ impl KjDispatcher {
     }
 
     /// `kj context retag <label> <ctx>` — move a label to a different context (latched).
-    async fn context_retag(&self, argv: &[String], caller: &KjCaller) -> KjResult {
-        let label = match argv.get(1) {
-            Some(l) => l.as_str(),
-            None => return KjResult::Err("kj context retag: requires a label".to_string()),
-        };
-        let ctx_ref = match argv.get(2) {
-            Some(r) => r.as_str(),
-            None => {
-                return KjResult::Err(
-                    "kj context retag: requires a target context reference".to_string(),
-                );
-            }
-        };
-
+    async fn context_retag(&self, label: &str, ctx_ref: &str, caller: &KjCaller) -> KjResult {
         // Resolve the new holder and find old holder (single lock scope)
         let (new_holder_id, old_holder) = {
             let db = self.kernel_db().lock();
@@ -1219,9 +1277,15 @@ mod tests {
     async fn context_help() {
         let d = test_dispatcher().await;
         let c = test_caller();
-        let result = d.dispatch(&[s("context"), s("help")], &c).await;
+        // `--help` routes through clap's DisplayHelp (the bare `help` word is no
+        // longer special). Assert on the clap-rendered usage + a known verb.
+        let result = d.dispatch(&[s("context"), s("--help")], &c).await;
         assert!(result.is_ok());
-        assert!(result.message().contains("## Subcommands"));
+        assert!(
+            result.message().contains("Usage") && result.message().contains("switch"),
+            "clap help should list usage + verbs: {}",
+            result.message()
+        );
     }
 
     #[tokio::test]
