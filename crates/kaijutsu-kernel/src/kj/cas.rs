@@ -1,44 +1,90 @@
+use clap::{Parser, Subcommand};
 use kaijutsu_cas::ContentStore;
 use kaijutsu_types::ContentType;
 
-use super::{KjCaller, KjDispatcher, KjResult};
+use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "cas",
+    about = "Content-addressed storage for binary blobs (images, etc.)",
+    disable_help_subcommand = true,
+    no_binary_name = true
+)]
+struct CasArgs {
+    #[command(subcommand)]
+    command: CasCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum CasCommand {
+    /// Ingest a file, print its hash.
+    Put {
+        /// Path to the file to ingest
+        path: String,
+    },
+    /// Retrieve by hash. With `--out`, write the bytes to a file; otherwise
+    /// report the size (binary data can't go to stdout as text).
+    Get {
+        /// Content hash to retrieve
+        hash: String,
+        /// Write the retrieved bytes to this path instead of reporting size
+        #[arg(long)]
+        out: Option<String>,
+    },
+    /// List all stored objects.
+    #[command(alias = "list")]
+    Ls,
+    /// Show metadata (mime, size, path) for a hash.
+    Info {
+        /// Content hash to inspect
+        hash: String,
+    },
+    /// Remove an object (unconditional, no ref-checking).
+    #[command(alias = "remove")]
+    Rm {
+        /// Content hash to remove
+        hash: String,
+    },
+}
 
 impl KjDispatcher {
     pub(crate) fn dispatch_cas(&self, argv: &[String], caller: &KjCaller) -> KjResult {
         if argv.is_empty() {
-            return KjResult::ok_ephemeral(self.cas_help(), ContentType::Markdown);
+            return clap_help_for::<CasArgs>();
         }
+        let parsed = match CasArgs::try_parse_from(argv) {
+            Ok(p) => p,
+            Err(e) => {
+                if matches!(
+                    e.kind(),
+                    clap::error::ErrorKind::DisplayHelp
+                        | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+                ) {
+                    return KjResult::ok_ephemeral(e.to_string(), ContentType::Plain);
+                }
+                return KjResult::Err(format!("kj cas: {e}"));
+            }
+        };
 
         // Writing/removing blobs is operator authority; get/ls/info stay ungated.
-        if matches!(argv[0].as_str(), "put" | "rm" | "remove") {
-            if let Err(denied) = self.require_cap(caller, crate::mcp::Capability::Operator, "cas") {
-                return denied;
-            }
+        if matches!(parsed.command, CasCommand::Put { .. } | CasCommand::Rm { .. })
+            && let Err(denied) =
+                self.require_cap(caller, crate::mcp::Capability::Operator, "cas")
+        {
+            return denied;
         }
 
-        match argv[0].as_str() {
-            "put" => self.cas_put(&argv[1..]),
-            "get" => self.cas_get(&argv[1..]),
-            "ls" | "list" => self.cas_ls(),
-            "info" => self.cas_info(&argv[1..]),
-            "rm" | "remove" => self.cas_rm(&argv[1..]),
-            "help" | "--help" | "-h" => {
-                KjResult::ok_ephemeral(self.cas_help(), ContentType::Markdown)
-            }
-            other => KjResult::Err(format!(
-                "kj cas: unknown subcommand '{}'\n\n{}",
-                other,
-                self.cas_help()
-            )),
+        match parsed.command {
+            CasCommand::Put { path } => self.cas_put(&path),
+            CasCommand::Get { hash, out } => self.cas_get(&hash, out.as_deref()),
+            CasCommand::Ls => self.cas_ls(),
+            CasCommand::Info { hash } => self.cas_info(&hash),
+            CasCommand::Rm { hash } => self.cas_rm(&hash),
         }
     }
 
-    fn cas_put(&self, argv: &[String]) -> KjResult {
-        let path_str = match argv.first() {
-            Some(p) => p,
-            None => return KjResult::Err("usage: kj cas put <path>".into()),
-        };
-
+    fn cas_put(&self, path_str: &str) -> KjResult {
         let path = std::path::Path::new(path_str);
         let data = match std::fs::read(path) {
             Ok(d) => d,
@@ -54,12 +100,8 @@ impl KjDispatcher {
         }
     }
 
-    fn cas_get(&self, argv: &[String]) -> KjResult {
-        if argv.is_empty() {
-            return KjResult::Err("usage: kj cas get <hash> [--out <path>]".into());
-        }
-
-        let hash = match argv[0].parse::<kaijutsu_cas::ContentHash>() {
+    fn cas_get(&self, hash_str: &str, out: Option<&str>) -> KjResult {
+        let hash = match hash_str.parse::<kaijutsu_cas::ContentHash>() {
             Ok(h) => h,
             Err(e) => return KjResult::Err(format!("kj cas get: invalid hash: {}", e)),
         };
@@ -71,17 +113,16 @@ impl KjDispatcher {
             Err(e) => return KjResult::Err(format!("kj cas get: {}", e)),
         };
 
-        // --out <path>: write to file
-        if argv.len() >= 3 && argv[1] == "--out" {
-            match std::fs::write(&argv[2], &data) {
-                Ok(()) => {
-                    return KjResult::ok_ephemeral(
-                        format!("wrote {} bytes to {}", data.len(), argv[2]),
-                        ContentType::Plain,
-                    )
-                }
-                Err(e) => return KjResult::Err(format!("kj cas get --out: {}", e)),
-            }
+        // --out <path>: write to file. Clap binds it regardless of position,
+        // so the old `argv[1] == "--out"` positional fragility is gone.
+        if let Some(out_path) = out {
+            return match std::fs::write(out_path, &data) {
+                Ok(()) => KjResult::ok_ephemeral(
+                    format!("wrote {} bytes to {}", data.len(), out_path),
+                    ContentType::Plain,
+                ),
+                Err(e) => KjResult::Err(format!("kj cas get --out: {}", e)),
+            };
         }
 
         // Default: report size (binary data can't meaningfully go to stdout as text)
@@ -148,12 +189,7 @@ impl KjDispatcher {
         KjResult::ok_ephemeral_with_data(text, ContentType::Plain, hashes)
     }
 
-    fn cas_info(&self, argv: &[String]) -> KjResult {
-        let hash_str = match argv.first() {
-            Some(h) => h,
-            None => return KjResult::Err("usage: kj cas info <hash>".into()),
-        };
-
+    fn cas_info(&self, hash_str: &str) -> KjResult {
         let hash = match hash_str.parse::<kaijutsu_cas::ContentHash>() {
             Ok(h) => h,
             Err(e) => return KjResult::Err(format!("kj cas info: invalid hash: {}", e)),
@@ -177,12 +213,7 @@ impl KjDispatcher {
         }
     }
 
-    fn cas_rm(&self, argv: &[String]) -> KjResult {
-        let hash_str = match argv.first() {
-            Some(h) => h,
-            None => return KjResult::Err("usage: kj cas rm <hash>".into()),
-        };
-
+    fn cas_rm(&self, hash_str: &str) -> KjResult {
         let hash = match hash_str.parse::<kaijutsu_cas::ContentHash>() {
             Ok(h) => h,
             Err(e) => return KjResult::Err(format!("kj cas rm: invalid hash: {}", e)),
@@ -196,21 +227,6 @@ impl KjDispatcher {
         }
     }
 
-    fn cas_help(&self) -> String {
-        [
-            "## kj cas",
-            "",
-            "Content-addressed storage for binary blobs (images, etc.).",
-            "",
-            "**Subcommands:**",
-            "- `put <path>` — ingest a file, print its hash",
-            "- `get <hash> [--out <path>]` — retrieve by hash (write to file with --out)",
-            "- `ls` — list all stored objects",
-            "- `info <hash>` — show metadata (mime, size, path)",
-            "- `rm <hash>` — remove an object (unconditional, no ref-checking)",
-        ]
-        .join("\n")
-    }
 }
 
 pub fn mime_from_extension(path: &str) -> &'static str {
@@ -235,5 +251,75 @@ pub fn mime_from_extension(path: &str) -> &'static str {
         "application/pdf"
     } else {
         "application/octet-stream"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::kj::test_helpers::{test_caller, test_dispatcher};
+    use std::sync::Arc;
+
+    /// `cas get --out <path> <hash>` must bind regardless of flag/positional
+    /// order. The old hand-parser read `argv[1] == "--out"`, so the flag-first
+    /// form fed "--out" to the hash parser and failed. Clap binds either order —
+    /// this is the order-independence the migration buys. Fails red if anyone
+    /// reverts `cas_get` to positional-index `--out` handling.
+    #[tokio::test]
+    async fn cas_get_out_flag_before_positional() {
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+        let caller = test_caller();
+
+        // Seed a blob via `cas put` of a temp file; capture its hash.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let src = dir.path().join("blob.bin");
+        std::fs::write(&src, b"hello cas").expect("write src");
+        let put = dispatcher.dispatch_cas(
+            &["put".to_string(), src.to_string_lossy().into_owned()],
+            &caller,
+        );
+        assert!(put.is_ok(), "cas put failed: {put:?}");
+        let hash = put.message().to_string();
+
+        // Flag-first: `get --out <path> <hash>` — the form the old parser broke.
+        let out = dir.path().join("out.bin");
+        let res = dispatcher.dispatch_cas(
+            &[
+                "get".to_string(),
+                "--out".to_string(),
+                out.to_string_lossy().into_owned(),
+                hash,
+            ],
+            &caller,
+        );
+        assert!(res.is_ok(), "cas get --out (flag first) failed: {res:?}");
+        let got = std::fs::read(&out).expect("out file written");
+        assert_eq!(got, b"hello cas", "round-tripped bytes must match");
+    }
+
+    /// Command aliases route to the same leaf: `list`→`ls`, `remove`→`rm`.
+    /// Fails red if the aliases drop off the clap subcommands.
+    #[tokio::test]
+    async fn cas_aliases_route() {
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+        let caller = test_caller();
+
+        // `list` is an alias of `ls` — empty store lists cleanly (is_ok).
+        let res = dispatcher.dispatch_cas(&["list".to_string()], &caller);
+        assert!(res.is_ok(), "cas list (alias of ls) failed: {res:?}");
+
+        // `remove <hash>` is an alias of `rm`; removing an absent hash is a
+        // clean error from cas_rm (not an unknown-subcommand error), proving
+        // the alias routed to the rm leaf.
+        let res = dispatcher.dispatch_cas(
+            &["remove".to_string(), "0".repeat(64)],
+            &caller,
+        );
+        assert!(!res.is_ok(), "remove of absent hash should error: {res:?}");
+        assert!(
+            res.message().contains("cas rm"),
+            "alias `remove` must route to cas_rm, got: {res:?}"
+        );
     }
 }

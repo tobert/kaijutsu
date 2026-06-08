@@ -18,7 +18,7 @@ use serde::Serialize;
 
 use crate::block_tools::translate::{line_range_to_byte_range, line_to_byte_offset};
 use super::refs::resolve_context_arg;
-use super::{KjCaller, KjDispatcher, KjResult};
+use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -988,14 +988,6 @@ impl KjDispatcher {
             serde_json::Value::Array(vec![serde_json::Value::String(key)]),
         )
     }
-}
-
-/// Render the auto-generated clap help text for a parser without going
-/// through `try_parse_from`. Used when argv is empty so we can return the
-/// command's full help instead of clap's parse-error for missing subcommand.
-fn clap_help_for<T: clap::CommandFactory>() -> KjResult {
-    let mut cmd = T::command();
-    KjResult::ok_ephemeral(cmd.render_help().to_string(), ContentType::Plain)
 }
 
 /// Parse "start:end" into (start, end), end exclusive. Either side may be

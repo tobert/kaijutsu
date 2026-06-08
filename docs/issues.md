@@ -111,3 +111,14 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 - **Live eval fork copy scope:** `kj fork` is a full copy. Decide if fork should be selective by default.
 - **russh teardown panic:** `ChannelCloseOnDrop::drop` panics with "there is no reactor running" in tests.
+- **Tests write to the real XDG data dir:** `test_dispatcher` builds the kernel
+  via `Kernel::new("test", None)` (`kj/mod.rs:563`), and `data_dir=None` resolves
+  CAS to `default_data_dir().join("cas")` — i.e. `~/.local/share/kaijutsu/kernel/cas`
+  (`kernel.rs:125` `cas_for_data_dir`). Any test that drives CAS pollutes (and can
+  collide on) the user's real storage; this is why no `kj cas` end-to-end test
+  exists yet. Audit for *every* test ctor that passes `None`/no explicit dir and
+  thread a `tempfile::tempdir()` through (add a `test_dispatcher_with_data_dir`,
+  or make `test_dispatcher` always use a temp dir). Sweep the whole kernel crate —
+  CAS is the known offender; check for other `None`/default-path ctors (oplog,
+  index, config) that may do the same. Fix opportunistically as our work touches
+  each path; the cas clap migration will need the temp-dir harness first.
