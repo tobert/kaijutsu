@@ -1,6 +1,6 @@
 # Monday clap upgrades — per-subcommand tool schemas
 
-Status: **Part 1 (kaish) DONE 2026-06-08 · Part 2 (kj) in progress — `cas` migrated 2026-06-08**
+Status: **Part 1 (kaish) DONE · Part 2 (kj) DONE 2026-06-08 — all 16 manual subcommands migrated + flat schema retired (flip landed)**
 Spans two repos: **kaish** (`~/src/kaish`) and **kaijutsu** (`~/src/kaijutsu`, the `kj` builtin).
 
 ---
@@ -138,6 +138,29 @@ already sorted). `fork` stays last. `cache` must land before the §2.3 flip for
   renders it). Operator-cap gate collapsed to a let-chain. 2 unit tests added.
   Flat `schema()` still drives kaish — no external change yet.
 - **Test-dispatcher data-dir isolation** (`kj/mod.rs`) — see §2.5 prerequisite.
+  (Superseded by the user's `Kernel::new_ephemeral` refactor; test_dispatcher now
+  uses it.)
+
+**Part 2 COMPLETE 2026-06-08.** All 16 manual subcommands migrated to clap
+(cas → wave1 drive/transport/stage/drift/model → wave2
+attach/policy/binding/workspace/preset → cache → rc → context → fork), then the
+flip landed: `KjBuiltin::schema()` reflects `kj_command()` (composed from every
+`*Args`) via `schema_tree_from_clap(...).with_owned_output()`; the flat
+`.param(...)` union is deleted. The flip required two **general** kaish fixes
+(committed in `~/src/kaish`):
+
+- **Long flag is the canonical param name** (was the snake field id). Every tool
+  reconstructs argv via `to_argv()` + clap re-parse, so the param name must equal
+  the clap long or `--system_prompt` ≠ `--system-prompt`. Latent until kj — the
+  first tool with field-name ≠ long-name flags.
+- **Root params merge onto every leaf** in `build_args_async`, so the top-level
+  global `--confirm <nonce>` binds at any leaf (incl. the trailing
+  `kj context retag a b --confirm <n>` form). `--confirm` declared as the root
+  arg in `kj_command()`.
+
+`-t` disambiguation works (`dash_t_disambiguates_per_leaf` is the gate); both
+`11160e5` tests stay green. kaijutsu-kernel 982 lib tests + full kaish workspace
+green.
 
 What shipped (all with tests, `cargo clippy --all` clean, `--no-default-features`
 compiles):
