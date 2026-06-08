@@ -538,6 +538,49 @@ pub(crate) fn clap_help_for<T: clap::CommandFactory>() -> KjResult {
     KjResult::ok_ephemeral(cmd.render_help().to_string(), ContentType::Plain)
 }
 
+/// Compose the full `kj` clap `Command` tree from every subcommand's derived
+/// `*Args`. Used **only** for schema reflection (`KjBuiltin::schema`) — routing
+/// stays in `dispatch`. The single-source guarantee holds at the leaf level
+/// because each `dispatch_*` parses the same `*Args`. The top-level name/alias
+/// list below must mirror `dispatch`'s match arms (see
+/// docs/monday-clap-upgrades.md §2.1). Aliases (`ctx`, `ws`) ride on the
+/// respective `*Args` as `visible_alias` so kaish's leaf-walker matches them.
+pub(crate) fn kj_command() -> clap::Command {
+    use clap::CommandFactory;
+    clap::Command::new("kj")
+        .about("Kernel command interface. Run `kj help` or `kj <command> help` for detailed workflows.")
+        // Root-level (global) flag: kj extracts `--confirm <nonce>` in
+        // KjBuiltin::execute before dispatch, so it isn't on any subcommand's
+        // clap struct. Declaring it here puts it in the reflected top-level
+        // params, and kaish's binder merges root params onto every leaf so the
+        // trailing `… retag a b --confirm <nonce>` form binds the value.
+        .arg(
+            clap::Arg::new("confirm")
+                .long("confirm")
+                .action(clap::ArgAction::Set)
+                .help("Latch confirmation nonce"),
+        )
+        .subcommand(context::ContextArgs::command())
+        .subcommand(workspace::WorkspaceArgs::command())
+        .subcommand(preset::PresetArgs::command())
+        .subcommand(cas::CasArgs::command())
+        .subcommand(rc::RcArgs::command())
+        .subcommand(block::BlockArgs::command())
+        .subcommand(binding::BindingArgs::command())
+        .subcommand(policy::PolicyArgs::command())
+        .subcommand(search::SearchArgs::command())
+        .subcommand(doc::DocArgs::command())
+        .subcommand(attach::AttachArgs::command())
+        .subcommand(transport::TransportArgs::command())
+        .subcommand(model::ModelsArgs::command())
+        .subcommand(model::ModelArgs::command())
+        .subcommand(fork::ForkArgs::command())
+        .subcommand(drive::DriveArgs::command())
+        .subcommand(stage::StageArgs::command())
+        .subcommand(drift::DriftArgs::command())
+        .subcommand(cache::CacheArgs::command())
+}
+
 #[cfg(test)]
 pub(crate) mod test_helpers {
     use super::*;

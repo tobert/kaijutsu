@@ -10,11 +10,12 @@ use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
 #[derive(Parser, Debug)]
 #[command(
     name = "workspace",
+    visible_alias = "ws",
     about = "Workspace management — group filesystem paths for mounting into contexts",
     disable_help_subcommand = true,
     no_binary_name = true
 )]
-struct WorkspaceArgs {
+pub(crate) struct WorkspaceArgs {
     #[command(subcommand)]
     command: WorkspaceCommand,
 }

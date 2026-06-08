@@ -22,7 +22,7 @@ use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
     disable_help_subcommand = true,
     no_binary_name = true
 )]
-struct AttachArgs {
+pub(crate) struct AttachArgs {
     /// Context to attach to (label, id prefix, or `.parent`).
     ctx: String,
 }

@@ -22,7 +22,7 @@ use super::{KjCaller, KjDispatcher, KjResult};
     disable_help_subcommand = true,
     no_binary_name = true
 )]
-struct StageArgs {
+pub(crate) struct StageArgs {
     #[command(subcommand)]
     command: StageCommand,
 }

@@ -49,7 +49,7 @@ use super::{KjCaller, KjDispatcher, KjResult};
     disable_help_subcommand = true,
     no_binary_name = true
 )]
-struct BindingArgs {
+pub(crate) struct BindingArgs {
     #[command(subcommand)]
     command: BindingCommand,
 }

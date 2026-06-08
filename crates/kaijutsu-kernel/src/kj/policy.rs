@@ -28,7 +28,7 @@ use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
     disable_help_subcommand = true,
     no_binary_name = true
 )]
-struct PolicyArgs {
+pub(crate) struct PolicyArgs {
     #[command(subcommand)]
     command: PolicyCommand,
 }

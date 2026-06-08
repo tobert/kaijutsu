@@ -15,11 +15,12 @@ use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
 #[derive(Parser, Debug)]
 #[command(
     name = "context",
+    visible_alias = "ctx",
     about = "Inspect, navigate, and manage contexts",
     disable_help_subcommand = true,
     no_binary_name = true
 )]
-struct ContextArgs {
+pub(crate) struct ContextArgs {
     #[command(subcommand)]
     command: ContextCommand,
 }
@@ -27,7 +28,7 @@ struct ContextArgs {
 /// Settable context configuration shared by `create` and `set`, flattened into
 /// both clap variants. Mirrors [`ContextConfig`] (the internal apply struct).
 #[derive(Args, Debug, Default)]
-struct ContextConfigArgs {
+pub(crate) struct ContextConfigArgs {
     /// Model spec `provider/model` or a bare model name (resolved to default provider)
     #[arg(long, short = 'm')]
     model: Option<String>,

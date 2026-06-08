@@ -17,7 +17,7 @@ use async_trait::async_trait;
 
 use kaish_kernel::ast::Value;
 use kaish_kernel::interpreter::ExecResult;
-use kaish_kernel::tools::{ParamSchema, ToolArgs, ToolCtx, ToolSchema};
+use kaish_kernel::tools::{ToolArgs, ToolCtx, ToolSchema};
 use kaish_kernel::{ExecContext, Tool};
 
 use crate::kj::{KjCaller, KjDispatcher, KjResult};
@@ -376,114 +376,41 @@ impl Tool for KjBuiltin {
     }
 
     fn schema(&self) -> ToolSchema {
-        ToolSchema::new("kj", "Kernel command interface. Run `kj help` or `kj <command> help` for detailed workflows.")
-            .param(ParamSchema::required("subcommand", "string", "Command and arguments (e.g. 'drift push main \"finding\"')"))
-            // Schema-declared named params so kaish puts them in `named` (not `flags`)
-            .param(ParamSchema::optional("name", "string", Value::String(String::new()), "Label for context or fork")
-                .with_aliases(["-n"]))
-            .param(ParamSchema::optional("depth", "int", Value::Int(50), "Depth limit for shallow fork"))
-            .param(ParamSchema::optional("prompt", "string", Value::String(String::new()), "Prompt note to inject on fork"))
-            .param(ParamSchema::optional("preset", "string", Value::String(String::new()), "Preset to apply on fork"))
-            .param(ParamSchema::optional("model", "string", Value::String(String::new()), "Model spec (provider/model)")
-                .with_aliases(["-m"]))
-            .param(ParamSchema::optional("tools", "string", Value::String(String::new()), "Tool filter spec"))
-            .param(ParamSchema::optional("confirm", "string", Value::String(String::new()), "Latch confirmation nonce"))
-            .param(ParamSchema::optional("as", "string", Value::String(String::new()), "Template context for subtree fork"))
-            // Declared so kaish parses `--context main` / `--kind text` etc. as
-            // named args (consuming the next positional) instead of defaulting
-            // to bool flags. Used by `kj block` subcommands.
-            .param(ParamSchema::optional("context", "string", Value::String(String::new()), "Target context ref (label, hex, .parent)")
-                .with_aliases(["-c"]))
-            .param(ParamSchema::optional("kind", "string", Value::String(String::new()), "Block kind filter"))
-            .param(ParamSchema::optional("role", "string", Value::String(String::new()), "Block role filter"))
-            .param(ParamSchema::optional("status", "string", Value::String(String::new()), "Block status filter"))
-            // Every long flag kj reads as a *value* must be declared here, or
-            // kaish parses `--flag value` as a bool flag + stray positional and
-            // the value is silently dropped (only the `--flag=value` form would
-            // survive). These mirror the `extract_named_arg` call sites across
-            // crates/kaijutsu-kernel/src/kj/*.rs.
-            .param(ParamSchema::optional("type", "string", Value::String(String::new()), "Context type (context_type) for create/fork; filter for rc list"))
-            .param(ParamSchema::optional("verb", "string", Value::String(String::new()), "Lifecycle verb filter (kj rc list)"))
-            .param(ParamSchema::optional("target", "string", Value::String(String::new()), "Cache target (kj cache add)").with_aliases(["-t"]))
-            .param(ParamSchema::optional("ttl", "string", Value::String(String::new()), "Cache TTL (kj cache add)"))
-            .param(ParamSchema::optional("index", "string", Value::String(String::new()), "Message index (kj cache add)").with_aliases(["-i"]))
-            .param(ParamSchema::optional("consent", "string", Value::String(String::new()), "Consent mode (kj context set)"))
-            .param(ParamSchema::optional("cwd", "string", Value::String(String::new()), "Working directory (kj context set)"))
-            .param(ParamSchema::optional("pwd", "string", Value::String(String::new()), "Working directory alias"))
-            .param(ParamSchema::optional("env", "string", Value::String(String::new()), "Env var KEY=VALUE (kj context set)"))
-            .param(ParamSchema::optional("path", "string", Value::String(String::new()), "Path argument"))
-            .param(ParamSchema::optional("desc", "string", Value::String(String::new()), "Short description"))
-            .param(ParamSchema::optional("description", "string", Value::String(String::new()), "Description"))
-            .param(ParamSchema::optional("distill-model", "string", Value::String(String::new()), "Model for drift distillation"))
-            .param(ParamSchema::optional("system-prompt", "string", Value::String(String::new()), "System prompt override (kj context set)"))
-            .param(ParamSchema::optional("max-result-bytes", "string", Value::String(String::new()), "Max result bytes"))
-            .param(ParamSchema::optional("timeout-ms", "string", Value::String(String::new()), "Timeout in milliseconds"))
-            // `kj rc add|edit --content <body>` — script body. Declared so
-            // kaish treats `--content "multi\nline"` as a named arg
-            // (consuming the next positional) rather than a bool flag.
-            .param(ParamSchema::optional("content", "string", Value::String(String::new()), "Script body (kj rc add / edit). Pipe stdin to omit."))
-            // Value flags from the clap-parsed subcommands (`kj block`,
-            // `kj doc`, `kj search`) and the remaining manual parsers
-            // (`kj context create --parent`, `kj cas get --out`). The flat
-            // kj schema is what kaish sees via get_tool; a subcommand flag
-            // that kaish doesn't know is value-taking gets bound as a bool
-            // (the value divorced to a stray positional), so each clap
-            // `#[arg(long)]` that takes a value — and each inline
-            // `argv[i] == "--flag"` reader — must appear here too.
-            .param(ParamSchema::optional("parent", "string", Value::String(String::new()), "Parent ref (kj context create / kj block create)")
-                .with_aliases(["-p"]))
-            .param(ParamSchema::optional("after", "string", Value::String(String::new()), "Insert-after block id (kj block create)"))
-            .param(ParamSchema::optional("text", "string", Value::String(String::new()), "Text to append (kj block append)"))
-            .param(ParamSchema::optional("range", "string", Value::String(String::new()), "Line range start:end (kj block read)"))
-            .param(ParamSchema::optional("original", "string", Value::String(String::new()), "Original text to diff against (kj block diff)"))
-            .param(ParamSchema::optional("expected", "string", Value::String(String::new()), "CAS expected text (kj block edit replace)"))
-            .param(ParamSchema::optional("line", "int", Value::Int(0), "Insert-before line, 0-indexed (kj block edit insert)"))
-            .param(ParamSchema::optional("start", "int", Value::Int(0), "First line, inclusive (kj block edit delete/replace)"))
-            .param(ParamSchema::optional("end", "int", Value::Int(0), "First line past the range, exclusive (kj block edit delete/replace)"))
-            .param(ParamSchema::optional("language", "string", Value::String(String::new()), "Programming language (kj doc create code)"))
-            .param(ParamSchema::optional("id", "string", Value::String(String::new()), "Explicit document hex UUID (kj doc create)"))
-            .param(ParamSchema::optional("max-depth", "int", Value::Int(0), "Max tree depth (kj doc tree)"))
-            .param(ParamSchema::optional("context-lines", "int", Value::Int(2), "Lines of context around matches (kj search)"))
-            .param(ParamSchema::optional("max-matches", "int", Value::Int(100), "Max matches to return (kj search)"))
-            .param(ParamSchema::optional("out", "string", Value::String(String::new()), "Output file path (kj cas get)"))
-            // Genuine boolean switches. Declared bool so kaish binds the
-            // space form correctly when a positional follows (e.g.
-            // `kj block read --no-line-numbers <id>`); under the
-            // map_positionals=true backend path an *undeclared* bool flag
-            // before a positional is the privilege-escalation-by-typo case
-            // that now fails loud (docs/issues.md). A bool param never
-            // consumes the next token (kaish's is_bool branch just records
-            // the flag), so a following positional stays positional.
-            .param(ParamSchema::optional("json", "bool", Value::Bool(false), "Emit JSON instead of a table"))
-            // `-t` is NOT aliased here: it already maps to `target` (a value
-            // flag, kj cache add). `kj context list` reads `-t` as a `--tree`
-            // shorthand internally, but a flat tool schema can't bind one
-            // short flag to two meanings — the long `--tree` form is the
-            // unambiguous one. TODO: per-subcommand schemas would resolve this.
-            .param(ParamSchema::optional("tree", "bool", Value::Bool(false), "Render topology as a tree (kj context list)"))
-            .param(ParamSchema::optional("switch", "bool", Value::Bool(false), "Switch to the new context after fork"))
-            .param(ParamSchema::optional("stage", "bool", Value::Bool(false), "Fork into staging (curate blocks before LLM)")
-                .with_aliases(["staging"]))
-            .param(ParamSchema::optional("shallow", "bool", Value::Bool(false), "Shallow fork (kj fork --shallow)"))
-            .param(ParamSchema::optional("compact", "bool", Value::Bool(false), "Compact fork (kj fork --compact)"))
-            .param(ParamSchema::optional("read-only", "bool", Value::Bool(false), "Mark workspace path read-only (kj workspace add)"))
-            .param(ParamSchema::optional("summarize", "bool", Value::Bool(false), "Summarize drift output (kj drift)")
-                .with_aliases(["-s"]))
-            .param(ParamSchema::optional("all", "bool", Value::Bool(false), "Search all active contexts (kj search --all)"))
-            .param(ParamSchema::optional("expand-tools", "bool", Value::Bool(false), "Expand ToolCall/ToolResult nodes (kj doc tree)"))
-            .param(ParamSchema::optional("no-line-numbers", "bool", Value::Bool(false), "Suppress line numbers (kj block read)"))
-            .example("Discover commands", "kj help")
-            .example("View context topology", "kj context list --tree")
-            .example("Create isolated workspace", "kj fork --name debug-auth")
-            .example("Navigate to context", "kj context switch debug-auth")
-            .example("Stage finding for another context", "kj drift push main \"auth tokens are stored in Redis\"")
-            .example("Deliver all staged drifts", "kj drift flush")
-            .example("LLM-distill another context's work", "kj drift pull main \"what changed in auth?\"")
-            .example("Distill from parent context", "kj drift pull .parent \"summarize findings\"")
-            .example("Merge fork back to parent", "kj drift merge")
-            .example("Set model on current context", "kj context set . --model anthropic:claude-sonnet-4-5-20250929")
-            .example("Learn drift workflows", "kj drift help")
-            .example("Bulk synthesize keywords", "kj synth all")
+        // Reflected from the composed clap `Command` tree — the single source of
+        // truth for both routing (`dispatch`) and schema. `with_owned_output()`
+        // marks the tree so the kernel skips its generic `--json` formatter (kj
+        // renders its own envelopes) and re-advertises `json` per node. See
+        // docs/monday-clap-upgrades.md §2.1/§2.4. This replaces the hand-written
+        // flat `.param(...)` union that `11160e5` last reconciled; the `-t`
+        // collision (cache `--target` vs context `--tree`) now resolves because
+        // each lives on its own leaf.
+        kaish_kernel::tools::schema_tree_from_clap(
+            &crate::kj::kj_command(),
+            "kj",
+            "Kernel command interface. Run `kj help` or `kj <command> help` for detailed workflows.",
+            [
+                ("Discover commands", "kj help"),
+                ("View context topology", "kj context list --tree"),
+                ("Create isolated workspace", "kj fork --name debug-auth"),
+                ("Navigate to context", "kj context switch debug-auth"),
+                (
+                    "Stage finding for another context",
+                    "kj drift push main \"auth tokens are stored in Redis\"",
+                ),
+                ("Deliver all staged drifts", "kj drift flush"),
+                (
+                    "LLM-distill another context's work",
+                    "kj drift pull main \"what changed in auth?\"",
+                ),
+                ("Merge fork back to parent", "kj drift merge"),
+                (
+                    "Set model on current context",
+                    "kj context set . --model anthropic:claude-sonnet-4-5-20250929",
+                ),
+                ("Bulk synthesize keywords", "kj synth all"),
+            ],
+        )
+        .with_owned_output()
     }
 
     async fn execute(&self, args: ToolArgs, ctx: &mut dyn ToolCtx) -> ExecResult {
@@ -860,6 +787,50 @@ mod tests {
                 "--type default must exclude {other}, got: {stdout}"
             );
         }
+    }
+
+    /// The headline win of per-leaf schemas (the flat-schema retirement): `-t`
+    /// means different things on different leaves and BOTH bind correctly.
+    /// `kj cache add -t <target>` takes a value (the cache target); `kj context
+    /// list -t` is a bool (tree view). The old flat schema could bind `-t` to
+    /// exactly one meaning (`target`), so `kj context list -t` was the casualty.
+    /// This is the acceptance gate for the reflected schema.
+    #[tokio::test]
+    async fn dash_t_disambiguates_per_leaf() {
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+        let principal = PrincipalId::system();
+        let ctx = register_context(&dispatcher, Some("alpha"), None, principal);
+        let kaish = embedded_with_kj(dispatcher.clone(), ctx).await;
+
+        // `-t tools` binds as a VALUE on `cache add`. If `-t` bound as a bool,
+        // clap would reject the missing required `--target` (or strand "tools"),
+        // so a clean exit already proves it took the value.
+        let add = kaish
+            .execute_with_options("kj cache add -t tools --ttl extended", ExecuteOptions::default())
+            .await
+            .expect("kaish exec (cache add)");
+        assert!(add.ok(), "cache add -t tools (value) failed: {add:?}");
+
+        // Confirm the value reached the target — a 'tools' breakpoint exists.
+        let bps = dispatcher
+            .kernel_db()
+            .lock()
+            .list_cache_breakpoints(ctx)
+            .expect("list breakpoints");
+        assert!(
+            bps.iter().any(|bp| matches!(bp, crate::llm::stream::CacheTarget::Tools(_))),
+            "`-t tools` must bind target=tools, got: {bps:?}"
+        );
+
+        // `-t` binds as a BOOL on `context list` (tree view). Under the old flat
+        // schema `-t` was the value flag `target`, so this form mis-bound; now it
+        // resolves to `--tree` on its own leaf.
+        let list = kaish
+            .execute_with_options("kj context list -t", ExecuteOptions::default())
+            .await
+            .expect("kaish exec (context list -t)");
+        assert!(list.ok(), "context list -t (bool tree) failed: {list:?}");
     }
 
     /// `kj context create <label> --type <t>` must land the context_type on

@@ -26,7 +26,7 @@ use super::{KjCaller, KjDispatcher, KjResult};
     about = "Regex search across block content",
     no_binary_name = true
 )]
-struct SearchArgs {
+pub(crate) struct SearchArgs {
     /// Regex pattern (Rust `regex` crate syntax)
     pattern: String,
     /// Single context: . (default) | .parent | <label> | <hex prefix>

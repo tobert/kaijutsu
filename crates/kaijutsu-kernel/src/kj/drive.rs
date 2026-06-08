@@ -27,7 +27,7 @@ use super::{KjCaller, KjDispatcher, KjResult};
     disable_help_subcommand = true,
     no_binary_name = true
 )]
-struct DriveArgs {
+pub(crate) struct DriveArgs {
     /// Seed the turn with this text; when omitted the turn runs against
     /// whatever is already in the context's block log.
     #[arg(long)]

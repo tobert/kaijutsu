@@ -34,7 +34,7 @@ use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
     disable_help_subcommand = true,
     no_binary_name = true
 )]
-struct ModelsArgs {}
+pub(crate) struct ModelsArgs {}
 
 /// `kj model` — report the effective model for a context. The only knob is
 /// `--context <ref>`, which targets a context other than the caller's current.
@@ -45,7 +45,7 @@ struct ModelsArgs {}
     disable_help_subcommand = true,
     no_binary_name = true
 )]
-struct ModelArgs {
+pub(crate) struct ModelArgs {
     /// Target context: . (default) | .parent | <label> | <hex prefix>
     #[arg(long, short = 'c')]
     context: Option<String>,

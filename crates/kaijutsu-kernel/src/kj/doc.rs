@@ -29,7 +29,7 @@ use super::{KjCaller, KjDispatcher, KjResult};
     disable_help_subcommand = true,
     no_binary_name = true
 )]
-struct DocArgs {
+pub(crate) struct DocArgs {
     #[command(subcommand)]
     command: DocCommand,
 }

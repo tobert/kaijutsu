@@ -24,7 +24,7 @@ use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
     disable_help_subcommand = true,
     no_binary_name = true
 )]
-struct RcArgs {
+pub(crate) struct RcArgs {
     #[command(subcommand)]
     command: RcCommand,
 }

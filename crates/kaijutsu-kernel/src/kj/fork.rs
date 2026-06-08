@@ -12,7 +12,7 @@ use super::{KjCaller, KjDispatcher, KjResult};
 
 #[derive(Parser, Debug, Default)]
 #[command(name = "fork", about = "Fork the current context into a child", disable_help_subcommand = true, no_binary_name = true)]
-struct ForkArgs {
+pub(crate) struct ForkArgs {
     /// Label for the child (--name/-n)
     #[arg(long, short = 'n')]
     name: Option<String>,

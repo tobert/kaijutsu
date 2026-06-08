@@ -27,7 +27,7 @@ use crate::hyoushigi::BeatCommand;
     disable_help_subcommand = true,
     no_binary_name = true
 )]
-struct TransportArgs {
+pub(crate) struct TransportArgs {
     #[command(subcommand)]
     command: TransportCommand,
 }
