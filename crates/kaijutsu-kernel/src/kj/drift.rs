@@ -1,64 +1,150 @@
 //! Drift subcommands: push, flush, queue, cancel.
+//!
+//! Migrated to clap_derive following the `block`/`cas` template. One
+//! `DriftArgs` struct + `DriftCommand` enum at the top; `dispatch_drift`
+//! parses argv via `try_parse_from`, routes DisplayHelp to ok-ephemeral,
+//! real errors to `KjResult::Err`, and empty argv to `clap_help_for`. The
+//! per-verb async handler bodies are unchanged — only argv extraction moved
+//! into the derive. Capability gating (push/pull/merge/flush/cancel on the
+//! `Drift` cap) is preserved against the matched variant.
 
+use clap::{Parser, Subcommand};
 use kaijutsu_crdt::DriftKind;
 use kaijutsu_types::{ContentType, EdgeKind};
 
 use super::format::format_drift_queue;
 use super::refs;
-use super::{KjCaller, KjDispatcher, KjResult};
+use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "drift",
+    about = "Cross-context communication (push/pull/merge/flush)",
+    disable_help_subcommand = true,
+    no_binary_name = true
+)]
+struct DriftArgs {
+    #[command(subcommand)]
+    command: DriftCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum DriftCommand {
+    /// Stage content for a target context. With --summarize, LLM-distill
+    /// the caller's whole context instead of sending literal content.
+    Push {
+        /// Destination context reference
+        dst: String,
+        /// LLM-distill the caller's context instead of using literal content
+        #[arg(long, short = 's')]
+        summarize: bool,
+        /// Content to stage (joined with spaces). Omit when using --summarize.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        content: Vec<String>,
+    },
+    /// Pull + LLM-distill from a source context into the caller's context.
+    Pull {
+        /// Source context reference
+        src: String,
+        /// Optional directed prompt (joined with spaces)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        prompt: Vec<String>,
+    },
+    /// Summarize this fork back into the parent context (or a given ctx).
+    Merge {
+        /// Target context (defaults to forked_from parent)
+        ctx: Option<String>,
+    },
+    /// Deliver all staged drifts.
+    Flush,
+    /// Show the staging queue (yields queue u64 ids).
+    #[command(alias = "q")]
+    Queue,
+    /// Remove a staged drift before flush (pre-flush only).
+    Cancel {
+        /// Staged drift queue id (u64)
+        queue_id: String,
+    },
+    /// Show drift edges for a context (yields edge UUIDs).
+    History {
+        /// Target context (defaults to caller's context)
+        ctx: Option<String>,
+    },
+    /// Manage post-flush drift edges.
+    Edge {
+        #[command(subcommand)]
+        op: EdgeCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum EdgeCommand {
+    /// Remove a post-flush drift edge by its UUID (see `kj drift history`).
+    #[command(alias = "remove")]
+    Rm {
+        /// Drift edge UUID
+        uuid: String,
+    },
+}
 
 impl KjDispatcher {
     pub(crate) async fn dispatch_drift(&self, argv: &[String], caller: &KjCaller) -> KjResult {
         if argv.is_empty() {
-            return KjResult::Err(self.drift_help());
+            return clap_help_for::<DriftArgs>();
         }
-
-        // The cross-context write surface (push/pull/merge/flush/cancel) is
-        // gated on `drift`; the read-only views (queue/history/edge) are not.
-        let sub = argv[0].as_str();
-        if matches!(sub, "push" | "pull" | "merge" | "flush" | "cancel") {
-            if let Err(denied) = self.require_cap(caller, crate::mcp::Capability::Drift, "drift") {
-                return denied;
-            }
-        }
-
-        match sub {
-            "push" => self.drift_push(argv, caller).await,
-            "pull" => self.drift_pull(argv, caller).await,
-            "merge" => self.drift_merge(argv, caller).await,
-            "flush" => self.drift_flush(caller).await,
-            "queue" | "q" => self.drift_queue().await,
-            "cancel" => self.drift_cancel(argv).await,
-            "history" => self.drift_history(argv, caller),
-            "edge" => self.drift_edge(&argv[1..]),
-            "help" | "--help" | "-h" => KjResult::ok_ephemeral(self.drift_help(), ContentType::Markdown),
-            other => KjResult::Err(format!(
-                "kj drift: unknown subcommand '{}'\n\n{}",
-                other,
-                self.drift_help()
-            )),
-        }
-    }
-
-    fn drift_help(&self) -> String {
-        include_str!("../../docs/help/kj-drift.md").to_string()
-    }
-
-    async fn drift_push(&self, argv: &[String], caller: &KjCaller) -> KjResult {
-        use super::parse::has_flag;
-
-        // kj drift push <dst> [--summarize|-s] [content...]
-        let summarize = has_flag(argv, &["--summarize", "-s"]);
-
-        let dst_query = match argv.get(1) {
-            Some(q) if !q.starts_with('-') => q.as_str(),
-            _ => {
-                return KjResult::Err(
-                    "kj drift push: requires a destination context reference".to_string(),
-                );
+        let parsed = match DriftArgs::try_parse_from(argv) {
+            Ok(p) => p,
+            Err(e) => {
+                if matches!(
+                    e.kind(),
+                    clap::error::ErrorKind::DisplayHelp
+                        | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+                ) {
+                    return KjResult::ok_ephemeral(e.to_string(), ContentType::Plain);
+                }
+                return KjResult::Err(format!("kj drift: {e}"));
             }
         };
 
+        // The cross-context write surface (push/pull/merge/flush/cancel) is
+        // gated on `drift`; the read-only views (queue/history/edge) are not.
+        if matches!(
+            parsed.command,
+            DriftCommand::Push { .. }
+                | DriftCommand::Pull { .. }
+                | DriftCommand::Merge { .. }
+                | DriftCommand::Flush
+                | DriftCommand::Cancel { .. }
+        ) && let Err(denied) = self.require_cap(caller, crate::mcp::Capability::Drift, "drift")
+        {
+            return denied;
+        }
+
+        match parsed.command {
+            DriftCommand::Push {
+                dst,
+                summarize,
+                content,
+            } => self.drift_push(&dst, summarize, &content, caller).await,
+            DriftCommand::Pull { src, prompt } => self.drift_pull(&src, &prompt, caller).await,
+            DriftCommand::Merge { ctx } => self.drift_merge(ctx.as_deref(), caller).await,
+            DriftCommand::Flush => self.drift_flush(caller).await,
+            DriftCommand::Queue => self.drift_queue().await,
+            DriftCommand::Cancel { queue_id } => self.drift_cancel(&queue_id).await,
+            DriftCommand::History { ctx } => self.drift_history(ctx.as_deref(), caller),
+            DriftCommand::Edge { op } => match op {
+                EdgeCommand::Rm { uuid } => self.drift_edge_rm(&uuid),
+            },
+        }
+    }
+
+    async fn drift_push(
+        &self,
+        dst_query: &str,
+        summarize: bool,
+        content: &[String],
+        caller: &KjCaller,
+    ) -> KjResult {
         // Resolve destination
         let target_id = {
             let router = self.drift_router().read();
@@ -81,18 +167,12 @@ impl KjDispatcher {
                 Err(e) => return KjResult::Err(format!("kj drift push --summarize: {e}")),
             }
         } else {
-            // Content is everything after the destination, excluding flags
-            let content_args: Vec<&str> = argv[2..]
-                .iter()
-                .filter(|a| *a != "--summarize" && *a != "-s")
-                .map(|s| s.as_str())
-                .collect();
-            if content_args.is_empty() {
+            if content.is_empty() {
                 return KjResult::Err(
                     "kj drift push: requires content (or use --summarize)".to_string(),
                 );
             }
-            (content_args.join(" "), DriftKind::Push)
+            (content.join(" "), DriftKind::Push)
         };
 
         // Get source model for provenance
@@ -119,17 +199,7 @@ impl KjDispatcher {
         KjResult::ok(format!("staged drift #{} → {}", staged_id, dst_query))
     }
 
-    async fn drift_pull(&self, argv: &[String], caller: &KjCaller) -> KjResult {
-        // kj drift pull <src> [prompt...]
-        let src_query = match argv.get(1) {
-            Some(q) => q.as_str(),
-            None => {
-                return KjResult::Err(
-                    "kj drift pull: requires a source context reference".to_string(),
-                );
-            }
-        };
-
+    async fn drift_pull(&self, src_query: &str, prompt: &[String], caller: &KjCaller) -> KjResult {
         // Resolve source context
         let source_id = {
             let db = self.kernel_db().lock();
@@ -149,10 +219,10 @@ impl KjDispatcher {
         }
 
         // Directed prompt is everything after the source ref
-        let directed_prompt = if argv.len() > 2 {
-            Some(argv[2..].join(" "))
-        } else {
+        let directed_prompt = if prompt.is_empty() {
             None
+        } else {
+            Some(prompt.join(" "))
         };
 
         // Summarize source via LLM
@@ -229,7 +299,7 @@ impl KjDispatcher {
         KjResult::ok(format!("pulled from {}:\n{}", src_query, preview))
     }
 
-    async fn drift_merge(&self, argv: &[String], caller: &KjCaller) -> KjResult {
+    async fn drift_merge(&self, target_arg: Option<&str>, caller: &KjCaller) -> KjResult {
         let context_id = match caller.require_context() {
             Ok(id) => id,
             Err(e) => return e,
@@ -237,9 +307,9 @@ impl KjDispatcher {
 
         // kj drift merge [ctx]
         // Default target = caller's forked_from parent
-        let target_id = if let Some(target_query) = argv.get(1) {
+        let target_id = if let Some(target_query) = target_arg {
             let db = self.kernel_db().lock();
-            match refs::resolve_context_arg(Some(target_query.as_str()), caller, &db) {
+            match refs::resolve_context_arg(Some(target_query), caller, &db) {
                 Ok(id) => id,
                 Err(e) => return KjResult::Err(format!("kj drift merge: {e}")),
             }
@@ -544,10 +614,9 @@ impl KjDispatcher {
     }
 
     /// `kj drift history [ctx]` — show drift history (edges) for a context.
-    fn drift_history(&self, argv: &[String], caller: &KjCaller) -> KjResult {
+    fn drift_history(&self, target_arg: Option<&str>, caller: &KjCaller) -> KjResult {
         let db = self.kernel_db().lock();
 
-        let target_arg = argv.get(1).map(|s| s.as_str());
         let target_id = match super::refs::resolve_context_arg(target_arg, caller, &db) {
             Ok(id) => id,
             Err(e) => return KjResult::Err(format!("kj drift history: {e}")),
@@ -576,56 +645,27 @@ impl KjDispatcher {
     /// `for e in $(kj drift history); do kj drift edge rm $e; done`
     /// round-trips. Distinct from `kj drift cancel` which takes the
     /// in-memory queue id (u64, pre-flush).
-    fn drift_edge(&self, argv: &[String]) -> KjResult {
-        let sub = argv.first().map(|s| s.as_str()).unwrap_or("");
-        match sub {
-            "rm" | "remove" => {
-                let id_str = match argv.get(1) {
-                    Some(s) => s.as_str(),
-                    None => {
-                        return KjResult::Err(
-                            "kj drift edge rm: requires a drift edge UUID (see `kj drift history`)"
-                                .to_string(),
-                        );
-                    }
-                };
-                let edge_id = match uuid::Uuid::parse_str(id_str) {
-                    Ok(u) => u,
-                    Err(_) => {
-                        return KjResult::Err(format!(
-                            "kj drift edge rm: '{id_str}' is not a valid UUID"
-                        ));
-                    }
-                };
-                let db = self.kernel_db().lock();
-                match db.delete_drift_edge(edge_id) {
-                    Ok(true) => KjResult::ok(format!("removed drift edge {edge_id}")),
-                    Ok(false) => KjResult::Err(format!(
-                        "kj drift edge rm: no drift edge {edge_id} (already removed, \
-                         or wrong kind — only drift edges are eligible)"
-                    )),
-                    Err(e) => KjResult::Err(format!("kj drift edge rm: {e}")),
-                }
+    fn drift_edge_rm(&self, id_str: &str) -> KjResult {
+        let edge_id = match uuid::Uuid::parse_str(id_str) {
+            Ok(u) => u,
+            Err(_) => {
+                return KjResult::Err(format!(
+                    "kj drift edge rm: '{id_str}' is not a valid UUID"
+                ));
             }
-            // Defer to the canonical `kj drift --help` (rendered from
-            // `docs/help/kj-drift.md`) so there's one source of truth.
-            "" | "help" | "--help" | "-h" => {
-                KjResult::ok_ephemeral(self.drift_help(), ContentType::Markdown)
-            }
-            other => KjResult::Err(format!(
-                "kj drift edge: unknown subcommand '{other}' (try `rm <uuid>`)"
+        };
+        let db = self.kernel_db().lock();
+        match db.delete_drift_edge(edge_id) {
+            Ok(true) => KjResult::ok(format!("removed drift edge {edge_id}")),
+            Ok(false) => KjResult::Err(format!(
+                "kj drift edge rm: no drift edge {edge_id} (already removed, \
+                 or wrong kind — only drift edges are eligible)"
             )),
+            Err(e) => KjResult::Err(format!("kj drift edge rm: {e}")),
         }
     }
 
-    async fn drift_cancel(&self, argv: &[String]) -> KjResult {
-        let id_str = match argv.get(1) {
-            Some(s) => s,
-            None => {
-                return KjResult::Err("kj drift cancel: requires a staged drift ID".to_string());
-            }
-        };
-
+    async fn drift_cancel(&self, id_str: &str) -> KjResult {
         let id: u64 = match id_str.parse() {
             Ok(n) => n,
             Err(_) => {
@@ -1016,7 +1056,8 @@ mod tests {
         let result = d.dispatch(&[s("drift"), s("pull")], &c).await;
         assert!(!result.is_ok());
         assert!(
-            result.message().contains("requires a source"),
+            result.message().contains("required")
+                || result.message().contains("<SRC>"),
             "msg: {}",
             result.message()
         );

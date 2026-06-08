@@ -2,64 +2,104 @@
 //!
 //! Manages the liminal staging state during fork curation.
 //! Blocks can be toggled in/out before the conversation goes live.
+//!
+//! Migrated to clap_derive following the `cas`/`block` pattern: one
+//! `StageArgs` struct + a `StageCommand` enum at the top, `dispatch_stage`
+//! parses argv via `try_parse_from`, then matches the variant to the per-verb
+//! function. The handler bodies stayed intact — only argv extraction moved
+//! into the derive. Verb aliases (commit↔go, status↔st, include↔in,
+//! exclude↔ex) are modeled with `#[command(alias = "...")]`.
 
+use clap::{Parser, Subcommand};
 use kaijutsu_types::{ContentType, ContextId, ContextState};
 
 use super::{KjCaller, KjDispatcher, KjResult};
 
+#[derive(Parser, Debug)]
+#[command(
+    name = "stage",
+    about = "Manage liminal staging state for fork curation",
+    disable_help_subcommand = true,
+    no_binary_name = true
+)]
+struct StageArgs {
+    #[command(subcommand)]
+    command: StageCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum StageCommand {
+    /// Transition from Staging to Live. Merges the staged child live (a
+    /// cross-context write) — same authority as `drift merge`.
+    #[command(alias = "go")]
+    Commit,
+    /// Show staging state and block counts.
+    #[command(alias = "st")]
+    Status,
+    /// Set excluded=false on a block.
+    #[command(alias = "in")]
+    Include {
+        /// Block key (suffix match on the full id key)
+        block_key: String,
+    },
+    /// Set excluded=true on a block.
+    #[command(alias = "ex")]
+    Exclude {
+        /// Block key (suffix match on the full id key)
+        block_key: String,
+    },
+}
+
 impl KjDispatcher {
     pub(crate) async fn dispatch_stage(&self, argv: &[String], caller: &KjCaller) -> KjResult {
-        // Help doesn't need a context, dispatch it before the guard.
-        if matches!(argv.first().map(|s| s.as_str()), Some("help" | "--help" | "-h")) {
-            return KjResult::ok_ephemeral(self.stage_help(), ContentType::Markdown);
-        }
+        // Bare `kj stage` (empty sub-args) shows status — a valid default
+        // operation, NOT a help request (unlike subcommand-required tools like
+        // cas). `--help`/`-h` still route to clap's DisplayHelp below.
+        let command = if argv.is_empty() {
+            StageCommand::Status
+        } else {
+            match StageArgs::try_parse_from(argv) {
+                Ok(p) => p.command,
+                Err(e) => {
+                    // `--help` / `-h` requests come through as DisplayHelp
+                    // errors; route them to ok-ephemeral so kaish prints them.
+                    if matches!(
+                        e.kind(),
+                        clap::error::ErrorKind::DisplayHelp
+                            | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+                    ) {
+                        return KjResult::ok_ephemeral(e.to_string(), ContentType::Plain);
+                    }
+                    return KjResult::Err(format!("kj stage: {e}"));
+                }
+            }
+        };
 
         let context_id = match caller.require_context() {
             Ok(id) => id,
             Err(e) => return e,
         };
 
-        if argv.is_empty() {
-            return self.stage_status(context_id);
-        }
-
         // `commit` merges the staged child live (a cross-context write) — same
         // risk class as `drift merge`, so it shares the `drift` authority. The
         // status/include/exclude curation verbs stay ungated.
-        if matches!(argv[0].as_str(), "commit" | "go") {
-            if let Err(denied) =
+        if matches!(command, StageCommand::Commit)
+            && let Err(denied) =
                 self.require_cap(caller, crate::mcp::Capability::Drift, "stage commit")
-            {
-                return denied;
+        {
+            return denied;
+        }
+
+        match command {
+            StageCommand::Commit => self.stage_commit(context_id).await,
+            StageCommand::Status => self.stage_status(context_id),
+            StageCommand::Include { block_key } => {
+                self.stage_include(&block_key, context_id)
+            }
+            StageCommand::Exclude { block_key } => {
+                self.stage_exclude(&block_key, context_id)
             }
         }
-
-        match argv[0].as_str() {
-            "commit" | "go" => self.stage_commit(context_id).await,
-            "status" | "st" => self.stage_status(context_id),
-            "include" | "in" => self.stage_include(&argv[1..], context_id),
-            "exclude" | "ex" => self.stage_exclude(&argv[1..], context_id),
-            other => KjResult::Err(format!(
-                "kj stage: unknown subcommand '{}'\n\n{}",
-                other,
-                self.stage_help()
-            )),
-        }
-    }
-
-    fn stage_help(&self) -> String {
-        [
-            "## kj stage",
-            "",
-            "Manage liminal staging state for fork curation.",
-            "",
-            "**Subcommands:**",
-            "- `commit` / `go` — transition from Staging to Live",
-            "- `status` / `st` — show staging state and block counts",
-            "- `include <block-id>` / `in` — set excluded=false on a block",
-            "- `exclude <block-id>` / `ex` — set excluded=true on a block",
-        ]
-        .join("\n")
     }
 
     fn require_staging(&self, context_id: ContextId) -> Result<(), KjResult> {
@@ -151,27 +191,21 @@ impl KjDispatcher {
         KjResult::ok_ephemeral(lines.join("\n"), ContentType::Markdown)
     }
 
-    fn stage_include(&self, argv: &[String], context_id: ContextId) -> KjResult {
+    fn stage_include(&self, block_key: &str, context_id: ContextId) -> KjResult {
         if let Err(result) = self.require_staging(context_id) {
             return result;
         }
-        self.stage_toggle(argv, context_id, false)
+        self.stage_toggle(block_key, context_id, false)
     }
 
-    fn stage_exclude(&self, argv: &[String], context_id: ContextId) -> KjResult {
+    fn stage_exclude(&self, block_key: &str, context_id: ContextId) -> KjResult {
         if let Err(result) = self.require_staging(context_id) {
             return result;
         }
-        self.stage_toggle(argv, context_id, true)
+        self.stage_toggle(block_key, context_id, true)
     }
 
-    fn stage_toggle(&self, argv: &[String], context_id: ContextId, excluded: bool) -> KjResult {
-        if argv.is_empty() {
-            return KjResult::Err("kj stage: missing block ID".to_string());
-        }
-
-        let block_key = &argv[0];
-
+    fn stage_toggle(&self, block_key: &str, context_id: ContextId, excluded: bool) -> KjResult {
         // Find the block by suffix match on the key
         let blocks = match self.block_store().block_snapshots(context_id) {
             Ok(b) => b,
@@ -182,7 +216,7 @@ impl KjDispatcher {
             .iter()
             .filter(|b| {
                 let key = b.id.to_key();
-                key.ends_with(block_key.as_str()) || key == *block_key
+                key.ends_with(block_key) || key == block_key
             })
             .collect();
 

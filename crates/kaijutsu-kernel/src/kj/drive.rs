@@ -14,20 +14,48 @@
 //! turn driver is subscribed it reports the failure to the user directly rather
 //! than burying an Error block in the context.
 
+use clap::Parser;
 use kaijutsu_types::ContentType;
 
 use super::refs;
 use super::{KjCaller, KjDispatcher, KjResult};
 
+#[derive(Parser, Debug)]
+#[command(
+    name = "drive",
+    about = "Clock one autonomous turn on a context.",
+    disable_help_subcommand = true,
+    no_binary_name = true
+)]
+struct DriveArgs {
+    /// Seed the turn with this text; when omitted the turn runs against
+    /// whatever is already in the context's block log.
+    #[arg(long)]
+    prompt: Option<String>,
+    /// Target context to drive (label or id); defaults to the current context.
+    target: Option<String>,
+}
+
 impl KjDispatcher {
     pub(crate) async fn dispatch_drive(&self, argv: &[String], caller: &KjCaller) -> KjResult {
-        // Help doesn't need a context, dispatch it before any resolution.
-        if matches!(
-            argv.first().map(|s| s.as_str()),
-            Some("help" | "--help" | "-h")
-        ) {
-            return KjResult::ok_ephemeral(self.drive_help(), ContentType::Markdown);
-        }
+        // NOTE: bare `kj drive` (empty sub-args) is a VALID operation — it
+        // drives the current context. Both DriveArgs fields are optional, so
+        // `try_parse_from(&[])` yields the all-default form; we must NOT treat
+        // empty argv as a help request the way subcommand-required tools (cas)
+        // do. Help comes only via `--help`/`-h` (clap's DisplayHelp).
+        let parsed = match DriveArgs::try_parse_from(argv) {
+            Ok(p) => p,
+            Err(e) => {
+                if matches!(
+                    e.kind(),
+                    clap::error::ErrorKind::DisplayHelp
+                        | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+                ) {
+                    return KjResult::ok_ephemeral(e.to_string(), ContentType::Plain);
+                }
+                return KjResult::Err(format!("kj drive: {e}"));
+            }
+        };
 
         // Self-driving is gated: the caller's loadout must hold `drive`. This is
         // what makes narrowing a composer's binding actually stop its OODA tick.
@@ -40,32 +68,12 @@ impl KjDispatcher {
         // path). The seed lives in TurnFlow::Requested.content, which is only a
         // hydration-failure fallback, so an empty string is correct when no
         // prompt is given.
-        let seed: String =
-            super::parse::extract_named_arg(argv, &["--prompt"]).unwrap_or_default();
+        let seed: String = parsed.prompt.unwrap_or_default();
 
-        // First positional non-flag arg is the target context; default to the
-        // caller's current context (".") when omitted. `kj drive` drives here;
-        // `kj drive <label-or-id>` drives another context. Skip the value that
-        // follows `--prompt` so the seed text is never mistaken for a target.
-        let target_ref = {
-            let mut found = None;
-            let mut skip_next = false;
-            for arg in argv {
-                if skip_next {
-                    skip_next = false;
-                    continue;
-                }
-                if arg == "--prompt" {
-                    skip_next = true;
-                    continue;
-                }
-                if !arg.starts_with('-') {
-                    found = Some(arg.as_str());
-                    break;
-                }
-            }
-            found
-        };
+        // The positional target context; default to the caller's current
+        // context (".") when omitted. `kj drive` drives here; `kj drive
+        // <label-or-id>` drives another context.
+        let target_ref = parsed.target.as_deref();
 
         let target = {
             let db = self.kernel_db().lock();
@@ -114,28 +122,6 @@ impl KjDispatcher {
                 "delivered": delivered,
             })),
         }
-    }
-
-    fn drive_help(&self) -> String {
-        [
-            "## kj drive",
-            "",
-            "Clock one autonomous turn on a context.",
-            "",
-            "POSIX model: `fork` snapshots, `drive` execs — it advances a single",
-            "turn. Use it to act on a context that isn't driving itself (after",
-            "pushing drift to it, after committing a staged child, or any manual",
-            "repair).",
-            "",
-            "**Usage:**",
-            "- `kj drive` — drive the current context",
-            "- `kj drive <label-or-id>` — drive another context",
-            "- `kj drive --prompt \"text\"` — seed the turn with text",
-            "",
-            "Without `--prompt`, the turn runs against whatever is already in the",
-            "context's block log. Errors if no turn driver is active.",
-        ]
-        .join("\n")
     }
 }
 
@@ -399,11 +385,13 @@ mod tests {
         let ctx = register_context(&d, Some("here"), None, principal);
         let c = caller_with_context(ctx);
 
-        let result = d.dispatch(&[s("drive"), s("help")], &c).await;
+        // `--help` routes through clap's DisplayHelp (the bare `help` word is no
+        // longer special — it would parse as a target context ref).
+        let result = d.dispatch(&[s("drive"), s("--help")], &c).await;
         assert!(result.is_ok(), "help failed: {}", result.message());
         assert!(
-            result.message().contains("kj drive"),
-            "help should carry a recognizable heading: {}",
+            result.message().contains("Usage") && result.message().contains("--prompt"),
+            "help should carry clap usage + the --prompt flag: {}",
             result.message()
         );
     }

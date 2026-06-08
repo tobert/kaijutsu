@@ -16,16 +16,50 @@
 //! Both read the LLM registry behind its async `RwLock`, so the dispatch leaves
 //! are async.
 
+use clap::Parser;
 use kaijutsu_types::ContentType;
 
 use super::refs;
-use super::{KjCaller, KjDispatcher, KjResult};
+use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
+
+/// `kj models` is pure discovery — no positionals, no value flags. The empty
+/// struct exists so help routes through the shared `clap_help_for` path for
+/// consistency with the other clap-migrated subcommands. Note: bare
+/// `kj models` (no argv) deliberately *lists* rather than showing help, so the
+/// dispatch path handles the empty-argv case before clap ever sees it.
+#[derive(Parser, Debug)]
+#[command(
+    name = "models",
+    about = "List configured LLM providers, their models, and --model aliases",
+    disable_help_subcommand = true,
+    no_binary_name = true
+)]
+struct ModelsArgs {}
+
+/// `kj model` — report the effective model for a context. The only knob is
+/// `--context <ref>`, which targets a context other than the caller's current.
+#[derive(Parser, Debug)]
+#[command(
+    name = "model",
+    about = "Report the effective model for a context",
+    disable_help_subcommand = true,
+    no_binary_name = true
+)]
+struct ModelArgs {
+    /// Target context: . (default) | .parent | <label> | <hex prefix>
+    #[arg(long, short = 'c')]
+    context: Option<String>,
+}
 
 impl KjDispatcher {
     /// `kj models` — list providers, their models, and `--model` aliases.
     pub(crate) async fn dispatch_models(&self, argv: &[String]) -> KjResult {
+        // Bare `kj models` (empty argv) LISTS — preserving the historical
+        // behavior — so we only intercept explicit help requests here. An
+        // empty `ModelsArgs` means there are no other args to parse: the list
+        // path below needs no clap pass.
         if matches!(argv.first().map(|s| s.as_str()), Some("help" | "--help" | "-h")) {
-            return KjResult::ok_ephemeral(models_help(), ContentType::Markdown);
+            return clap_help_for::<ModelsArgs>();
         }
 
         let registry = self.kernel().llm().read().await;
@@ -127,11 +161,25 @@ impl KjDispatcher {
 
     /// `kj model` — report the effective model for a context.
     pub(crate) async fn dispatch_model(&self, argv: &[String], caller: &KjCaller) -> KjResult {
-        if matches!(argv.first().map(|s| s.as_str()), Some("help" | "--help" | "-h")) {
-            return KjResult::ok_ephemeral(model_help(), ContentType::Markdown);
-        }
-
-        let ctx_ref = super::parse::extract_named_arg(argv, &["--context"]);
+        // Bare `kj model` (no argv) reports the current context's model, so
+        // empty argv parses cleanly to `ModelArgs { context: None }` — no
+        // early help return needed here (unlike subcommand-bearing modules).
+        let parsed = match ModelArgs::try_parse_from(argv) {
+            Ok(p) => p,
+            Err(e) => {
+                // `--help` / `-h` come through as DisplayHelp; route them to
+                // ok-ephemeral so kaish prints the help and exits 0.
+                if matches!(
+                    e.kind(),
+                    clap::error::ErrorKind::DisplayHelp
+                        | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+                ) {
+                    return KjResult::ok_ephemeral(e.to_string(), ContentType::Plain);
+                }
+                return KjResult::Err(format!("kj model: {e}"));
+            }
+        };
+        let ctx_ref = parsed.context;
 
         // Read the context row (its explicit provider/model columns, if any).
         let (ctx_id, row_provider, row_model) = {
@@ -189,37 +237,6 @@ impl KjDispatcher {
             }),
         )
     }
-}
-
-fn models_help() -> String {
-    [
-        "## kj models",
-        "",
-        "List the configured LLM providers, the models each one knows about,",
-        "and the friendly `--model` aliases.",
-        "",
-        "The structured output is an array of every spec you can pass to",
-        "`kj context set --model <spec>`: each alias name plus the",
-        "fully-qualified `provider/model` for each known model — so",
-        "`for m in $(kj models)` iterates usable handles.",
-    ]
-    .join("\n")
-}
-
-fn model_help() -> String {
-    [
-        "## kj model",
-        "",
-        "Report the effective model for a context.",
-        "",
-        "**Usage:**",
-        "- `kj model` — the current context's model",
-        "- `kj model --context <label-or-id>` — another context's model",
-        "",
-        "When the context has no model column of its own, the effective model is",
-        "the registry default it falls through to at turn time (`source=default`).",
-    ]
-    .join("\n")
 }
 
 #[cfg(test)]

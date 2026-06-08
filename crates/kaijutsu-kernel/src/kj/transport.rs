@@ -13,19 +13,106 @@
 //! explicit user command, so it reports the failure rather than silently
 //! no-opping.
 
+use clap::{Parser, Subcommand};
 use kaijutsu_types::ContentType;
 
 use super::refs;
-use super::{KjCaller, KjDispatcher, KjResult};
+use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
 use crate::hyoushigi::BeatCommand;
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "transport",
+    about = "Transport control for a context's beat (the composer playhead)",
+    disable_help_subcommand = true,
+    no_binary_name = true
+)]
+struct TransportArgs {
+    #[command(subcommand)]
+    command: TransportCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum TransportCommand {
+    /// Start/resume the clock.
+    Play {
+        /// Target context: . (default) | <label> | <hex prefix>
+        #[arg(long)]
+        context: Option<String>,
+    },
+    /// Hold the clock (freeze the playhead).
+    Pause {
+        /// Target context: . (default) | <label> | <hex prefix>
+        #[arg(long)]
+        context: Option<String>,
+    },
+    /// Pause the clock and disarm OODA.
+    Stop {
+        /// Target context: . (default) | <label> | <hex prefix>
+        #[arg(long)]
+        context: Option<String>,
+    },
+    /// Set the beat period from a BPM value.
+    Tempo {
+        /// Beats per minute (positive integer)
+        bpm: Option<u64>,
+        /// Target context: . (default) | <label> | <hex prefix>
+        #[arg(long)]
+        context: Option<String>,
+    },
+    /// Arm/disarm the OODA loop.
+    Ooda {
+        /// `on` to arm, `off` to disarm
+        state: Option<String>,
+        /// Target context: . (default) | <label> | <hex prefix>
+        #[arg(long)]
+        context: Option<String>,
+    },
+}
+
+impl TransportCommand {
+    /// The `--context` ref this verb targets (shared across all verbs).
+    fn context(&self) -> Option<&str> {
+        match self {
+            TransportCommand::Play { context }
+            | TransportCommand::Pause { context }
+            | TransportCommand::Stop { context }
+            | TransportCommand::Tempo { context, .. }
+            | TransportCommand::Ooda { context, .. } => context.as_deref(),
+        }
+    }
+
+    /// The verb name for the result `action` field / data payload.
+    fn action(&self) -> &'static str {
+        match self {
+            TransportCommand::Play { .. } => "play",
+            TransportCommand::Pause { .. } => "pause",
+            TransportCommand::Stop { .. } => "stop",
+            TransportCommand::Tempo { .. } => "tempo",
+            TransportCommand::Ooda { .. } => "ooda",
+        }
+    }
+}
 
 impl KjDispatcher {
     pub(crate) fn dispatch_transport(&self, argv: &[String], caller: &KjCaller) -> KjResult {
-        let action = argv.first().map(|s| s.as_str());
-        if matches!(action, None | Some("help" | "--help" | "-h")) {
-            return KjResult::ok_ephemeral(transport_help(), ContentType::Markdown);
+        if argv.is_empty() {
+            return clap_help_for::<TransportArgs>();
         }
-        let action = action.unwrap();
+        let parsed = match TransportArgs::try_parse_from(argv) {
+            Ok(p) => p,
+            Err(e) => {
+                if matches!(
+                    e.kind(),
+                    clap::error::ErrorKind::DisplayHelp
+                        | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+                ) {
+                    return KjResult::ok_ephemeral(e.to_string(), ContentType::Plain);
+                }
+                return KjResult::Err(format!("kj transport: {e}"));
+            }
+        };
+        let command = parsed.command;
 
         // Driving the beat (play/pause/stop/tempo/ooda) is gated on `transport`.
         if let Err(denied) =
@@ -35,26 +122,22 @@ impl KjDispatcher {
         }
 
         // Target context: `--context <ref>`, else the caller's current context.
-        let ctx_ref = super::parse::extract_named_arg(argv, &["--context"]);
         let ctx = {
             let db = self.kernel_db().lock();
-            match refs::resolve_context_arg(ctx_ref.as_deref(), caller, &db) {
+            match refs::resolve_context_arg(command.context(), caller, &db) {
                 Ok(id) => id,
                 Err(e) => return KjResult::Err(format!("kj transport: {e}")),
             }
         };
 
-        // First positional non-flag (skipping the --context value) is the
-        // action's argument (a BPM for `tempo`, on|off for `ooda`).
-        let positional = action_argument(argv);
+        let action = command.action();
 
-        let (cmd, verb): (BeatCommand, String) = match action {
-            "play" => (BeatCommand::Play(ctx), "playing".into()),
-            "pause" => (BeatCommand::Pause(ctx), "paused".into()),
-            "stop" => (BeatCommand::Stop(ctx), "stopped".into()),
-            "tempo" => {
-                let Some(bpm) = positional.and_then(|s| s.parse::<u64>().ok()).filter(|b| *b > 0)
-                else {
+        let (cmd, verb): (BeatCommand, String) = match &command {
+            TransportCommand::Play { .. } => (BeatCommand::Play(ctx), "playing".into()),
+            TransportCommand::Pause { .. } => (BeatCommand::Pause(ctx), "paused".into()),
+            TransportCommand::Stop { .. } => (BeatCommand::Stop(ctx), "stopped".into()),
+            TransportCommand::Tempo { bpm, .. } => {
+                let Some(bpm) = bpm.filter(|b| *b > 0) else {
                     return KjResult::Err(
                         "kj transport tempo: need a positive BPM, e.g. `kj transport tempo 120`"
                             .to_string(),
@@ -66,8 +149,8 @@ impl KjDispatcher {
                     format!("tempo {bpm} BPM"),
                 )
             }
-            "ooda" => {
-                let armed = match positional.as_deref() {
+            TransportCommand::Ooda { state, .. } => {
+                let armed = match state.as_deref() {
                     Some("on") => true,
                     Some("off") => false,
                     _ => {
@@ -80,12 +163,6 @@ impl KjDispatcher {
                     BeatCommand::SetOoda { context_id: ctx, armed },
                     format!("OODA {}", if armed { "armed" } else { "disarmed" }),
                 )
-            }
-            other => {
-                return KjResult::Err(format!(
-                    "kj transport: unknown action '{other}'\n\n{}",
-                    transport_help()
-                ));
             }
         };
 
@@ -108,50 +185,8 @@ impl KjDispatcher {
     }
 }
 
-/// The first positional (non-flag) argument after the action word, skipping the
-/// `--context` value so a ref is never mistaken for the action's argument.
-fn action_argument(argv: &[String]) -> Option<String> {
-    let mut skip_next = false;
-    for arg in argv.iter().skip(1) {
-        if skip_next {
-            skip_next = false;
-            continue;
-        }
-        if arg == "--context" {
-            skip_next = true;
-            continue;
-        }
-        if !arg.starts_with('-') {
-            return Some(arg.clone());
-        }
-    }
-    None
-}
-
 fn short_hex(id: kaijutsu_types::ContextId) -> String {
     id.to_hex().chars().take(8).collect()
-}
-
-fn transport_help() -> String {
-    [
-        "## kj transport",
-        "",
-        "Transport control for a context's beat (the composer playhead).",
-        "",
-        "Two switches: the **clock** (play/pause/stop) and the **OODA-arm**.",
-        "The tick is event-counted — pause freezes musical time, play resumes at",
-        "+1, and there is no rewind (revisiting the past is an export, not a seek).",
-        "",
-        "**Usage:**",
-        "- `kj transport play` — start/resume the clock",
-        "- `kj transport pause` — hold the clock (freeze the playhead)",
-        "- `kj transport stop` — pause the clock and disarm OODA",
-        "- `kj transport tempo <bpm>` — set the beat period",
-        "- `kj transport ooda <on|off>` — arm/disarm the OODA loop",
-        "",
-        "Target the current context by default, or `--context <label-or-id>`.",
-    ]
-    .join("\n")
 }
 
 #[cfg(test)]
