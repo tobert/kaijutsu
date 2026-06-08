@@ -55,6 +55,12 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ## Control Plane & Navigation (kj)
 
+- **Workspace path mount points:** `kj workspace add --mount <target>` was
+  documented + parsed but silently ignored (no backing storage) — removed during
+  the clap migration so it now fails loud. To implement: add a `mount` column to
+  `WorkspacePathRow` (`kernel_db.rs:168`, SQL migration), thread it through
+  `workspace_add` and the context-mounting path, decide mount semantics, then
+  re-add the `--mount` flag + help example.
 - **Tab completion:** Context labels, preset labels, workspace labels, tag syntax. Integrate with kaish.
 - **Cross-kernel drift:** Schema preserves `kernel_id` everywhere; not yet implemented.
 - **Compact quality:** Distill model selection, preset-level or context-level summary-style control.

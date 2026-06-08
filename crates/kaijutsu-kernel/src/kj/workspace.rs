@@ -48,9 +48,6 @@ enum WorkspaceCommand {
         label: String,
         /// Path to add
         path: String,
-        /// Mount point (documented; currently unused — see note in migration)
-        #[arg(long)]
-        mount: Option<String>,
         /// Mark the path read-only
         #[arg(long)]
         read_only: bool,
@@ -111,7 +108,6 @@ impl KjDispatcher {
             WorkspaceCommand::Add {
                 label,
                 path,
-                mount: _,
                 read_only,
             } => self.workspace_add(&label, &path, read_only),
             WorkspaceCommand::Bind { label, context } => {
@@ -485,18 +481,26 @@ mod tests {
 
         let result = d
             .dispatch(
-                &[
-                    s("workspace"),
-                    s("add"),
-                    s("ws3"),
-                    s("/extra"),
-                    s("--mount"),
-                    s("/mnt/extra"),
-                ],
+                &[s("workspace"), s("add"), s("ws3"), s("/extra")],
                 &c,
             )
             .await;
         assert!(result.is_ok(), "add failed: {}", result.message());
+
+        // `--mount` was never implemented (no DB column); it used to be parsed
+        // and silently ignored. It's now removed, so clap rejects it loudly
+        // rather than dropping the value. See docs/issues.md.
+        let rejected = d
+            .dispatch(
+                &[s("workspace"), s("add"), s("ws3"), s("/extra2"), s("--mount"), s("/mnt/x")],
+                &c,
+            )
+            .await;
+        assert!(
+            !rejected.is_ok() && rejected.message().contains("--mount"),
+            "removed --mount must fail loud, got: {}",
+            rejected.message()
+        );
     }
 
     #[tokio::test]
