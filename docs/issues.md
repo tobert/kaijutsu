@@ -41,6 +41,7 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 - **`KernelDb` connection pool:** Currently `Arc<parking_lot::Mutex<KernelDb>>` in `block_store.rs:69`. This bottleneck prevents utilizing SQLite's WAL mode for concurrent readers. Migrate to `r2d2` or `sqlx` to allow non-blocking reads during LLM streams and heavy writes.
 - **Config CRDT ops:** Config backend needs DTE integration so changes replicate across peers.
 - **CRDT `order_index` BTreeMap:** `blocks_ordered()` is O(N log N). Works correctly but scales poorly; add a secondary sorted index when scale demands.
+- **Oplog isn't schema-evolution-safe:** `StoreSnapshot`/block state persists via positional `postcard`, so adding or reordering a `BlockSnapshot`/`BlockContent` field corrupts existing oplogs (`#[serde(default)]` does nothing for postcard). Each such change (latest: `signature`) silently breaks old dev stores — they must be wiped. Needs a versioned envelope or a self-describing format before any persistent deployment. See auto-memory `tech_debt_binary_serialization_oplog`.
 - **Latch state should persist with the context:** 
   - `set -o latch` mode is per-shell and lost on restart.
   - Latch nonces should eventually live in a SQLite table rather than in-memory.
