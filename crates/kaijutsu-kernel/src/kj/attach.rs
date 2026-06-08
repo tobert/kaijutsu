@@ -9,10 +9,23 @@
 //! of rc script outcomes — failures land as Error blocks in the target,
 //! consistent with create / fork / drift verbs.
 
+use clap::Parser;
 use kaijutsu_types::ContentType;
 
 use super::refs::{parse_context_ref, resolve_context_ref};
-use super::{KjCaller, KjDispatcher, KjResult};
+use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "attach",
+    about = "Attach to an existing context and run its rc `attach` lifecycle.",
+    disable_help_subcommand = true,
+    no_binary_name = true
+)]
+struct AttachArgs {
+    /// Context to attach to (label, id prefix, or `.parent`).
+    ctx: String,
+}
 
 impl KjDispatcher {
     pub(crate) async fn dispatch_attach(
@@ -20,19 +33,24 @@ impl KjDispatcher {
         argv: &[String],
         caller: &KjCaller,
     ) -> KjResult {
+        // Empty argv returns help: attach requires a target, so there's no
+        // valid default action (matches the original's help-on-empty).
         if argv.is_empty() {
-            return KjResult::ok_ephemeral(
-                self.attach_help(),
-                ContentType::Markdown,
-            );
+            return clap_help_for::<AttachArgs>();
         }
-        let first = argv[0].as_str();
-        if matches!(first, "help" | "--help" | "-h") {
-            return KjResult::ok_ephemeral(
-                self.attach_help(),
-                ContentType::Markdown,
-            );
-        }
+        let parsed = match AttachArgs::try_parse_from(argv) {
+            Ok(p) => p,
+            Err(e) => {
+                if matches!(
+                    e.kind(),
+                    clap::error::ErrorKind::DisplayHelp
+                        | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+                ) {
+                    return KjResult::ok_ephemeral(e.to_string(), ContentType::Plain);
+                }
+                return KjResult::Err(format!("kj attach: {e}"));
+            }
+        };
 
         // Ungated, like `kj context switch`: attach is switch + run the
         // target's rc `attach` lifecycle, and that lifecycle runs under its own
@@ -40,7 +58,7 @@ impl KjDispatcher {
         // would only break the bootstrap case (an unjoined session has no
         // loadout to authorize against) without adding any real authority — the
         // attach scripts assign/exercise capability themselves.
-        let ctx_ref = parse_context_ref(first);
+        let ctx_ref = parse_context_ref(&parsed.ctx);
         let target_id = {
             let db = self.kernel_db().lock();
             match resolve_context_ref(&ctx_ref, caller, &db) {
@@ -73,34 +91,6 @@ impl KjDispatcher {
                 .unwrap_or_else(|| target_id.short())
         };
         KjResult::Switch(target_id, format!("attached to {label}"))
-    }
-
-    fn attach_help(&self) -> String {
-        r#"# kj attach — attach to an existing context
-
-`kj attach <ctx>` brings an existing context into the current session
-and fires the `attach` rc lifecycle on it. The session focus moves to
-the target (same effect as `kj context switch`), and any scripts under
-`/etc/rc/<context_type>/attach/SXX-*.{kai,md}` run on the target.
-
-## Usage
-
-- `kj attach <label>` — by label (e.g. `kj attach planner`)
-- `kj attach <hex-prefix>` — by id prefix
-- `kj attach .parent` — to the current context's parent
-
-## When to use vs `kj context switch`
-
-- `kj context switch` — pure focus change; no scripts fire.
-- `kj attach` — focus change + lifecycle scripts (banner blocks,
-  state refresh, audit log entries).
-
-## Failure semantics
-
-Script failures insert Error blocks in the target context but don't
-roll back the attach — consistent with create / fork / drift verbs.
-"#
-        .to_string()
     }
 }
 
@@ -223,8 +213,9 @@ mod tests {
         assert!(matches!(result, KjResult::Err(_)), "result: {result:?}");
     }
 
-    /// No-arg `kj attach` prints help (ephemeral, content-type
-    /// markdown), not an error — matches `kj rc help` style.
+    /// No-arg `kj attach` prints help (ephemeral), not an error — clap renders
+    /// the usage now, so assert on the clap-generated shape rather than a
+    /// hand-written "kj attach" heading.
     #[tokio::test]
     async fn attach_no_args_prints_help() {
         let d = test_dispatcher().await;
@@ -232,8 +223,8 @@ mod tests {
         let result = d.dispatch(&[s("attach")], &caller).await;
         assert!(result.is_ok(), "result: {result:?}");
         assert!(
-            result.message().contains("kj attach"),
-            "help output should mention the command, got: {}",
+            result.message().contains("Usage") && result.message().contains("attach"),
+            "help output should carry clap usage for attach, got: {}",
             result.message()
         );
     }

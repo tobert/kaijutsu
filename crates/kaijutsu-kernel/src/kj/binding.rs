@@ -34,12 +34,58 @@
 //! context; an ordinary context may only narrow (`revoke`/`reset`) **its own**
 //! loadout — it cannot self-escalate even though `kj` bypasses `call_tool`.
 
+use clap::{Parser, Subcommand};
 use kaijutsu_types::{ContentType, ContextId};
 
 use crate::mcp::{Capability, InstanceId};
 
 use super::refs::resolve_context_arg;
 use super::{KjCaller, KjDispatcher, KjResult};
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "binding",
+    about = "Read and write a context's tool-capability allow-set",
+    disable_help_subcommand = true,
+    no_binary_name = true
+)]
+struct BindingArgs {
+    #[command(subcommand)]
+    command: BindingCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum BindingCommand {
+    /// Show a context's binding (deny-by-default if unbound).
+    #[command(alias = "ls", alias = "list")]
+    Show {
+        /// Target context: . (default) | .parent | <label> | <hex prefix>
+        ctx: Option<String>,
+    },
+    /// Grant a capability (widen the loadout). Privileged/admin only.
+    #[command(alias = "grant")]
+    Allow {
+        /// Capability: <instance> | <instance>:<tool> | facade:<name> | * |
+        /// facade:* | admin | rc-write | drive | fork | drift | transport | operator
+        cap: String,
+        /// Target context: . (default) | .parent | <label> | <hex prefix>
+        ctx: Option<String>,
+    },
+    /// Revoke a capability (narrow the loadout).
+    #[command(alias = "deny")]
+    Revoke {
+        /// Capability to revoke (same forms as `allow`)
+        cap: String,
+        /// Target context: . (default) | .parent | <label> | <hex prefix>
+        ctx: Option<String>,
+    },
+    /// Clear the binding → deny-all (deny-by-default).
+    #[command(alias = "clear")]
+    Reset {
+        /// Target context: . (default) | .parent | <label> | <hex prefix>
+        ctx: Option<String>,
+    },
+}
 
 /// Parse a capability token. Order matters: the wildcards and the `facade:`
 /// prefix are checked before the generic `instance:tool` split so a facade name
@@ -90,40 +136,44 @@ fn parse_capability(s: &str) -> Result<Capability, String> {
 
 impl KjDispatcher {
     pub(crate) async fn dispatch_binding(&self, argv: &[String], caller: &KjCaller) -> KjResult {
-        let sub = argv.first().map(|s| s.as_str()).unwrap_or("show");
-        match sub {
-            "show" | "ls" | "list" => self.binding_show(&argv[1..], caller).await,
-            "allow" | "grant" => self.binding_mutate(&argv[1..], caller, true).await,
-            "revoke" | "deny" => self.binding_mutate(&argv[1..], caller, false).await,
-            "reset" | "clear" => self.binding_reset(&argv[1..], caller).await,
-            "help" | "--help" | "-h" => {
-                KjResult::ok_ephemeral(Self::binding_help(), ContentType::Markdown)
+        // Empty argv defaults to `show` (the original `unwrap_or("show")`), so
+        // synthesize that subcommand rather than rendering help.
+        let parsed = if argv.is_empty() {
+            BindingArgs {
+                command: BindingCommand::Show { ctx: None },
             }
-            other => KjResult::Err(format!(
-                "kj binding: unknown subcommand '{other}'\n\n{}",
-                Self::binding_help()
-            )),
+        } else {
+            match BindingArgs::try_parse_from(argv) {
+                Ok(p) => p,
+                Err(e) => {
+                    if matches!(
+                        e.kind(),
+                        clap::error::ErrorKind::DisplayHelp
+                            | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+                    ) {
+                        return KjResult::ok_ephemeral(e.to_string(), ContentType::Plain);
+                    }
+                    return KjResult::Err(format!("kj binding: {e}"));
+                }
+            }
+        };
+
+        match parsed.command {
+            BindingCommand::Show { ctx } => self.binding_show(ctx.as_deref(), caller).await,
+            BindingCommand::Allow { cap, ctx } => {
+                self.binding_mutate(&cap, ctx.as_deref(), caller, true).await
+            }
+            BindingCommand::Revoke { cap, ctx } => {
+                self.binding_mutate(&cap, ctx.as_deref(), caller, false).await
+            }
+            BindingCommand::Reset { ctx } => self.binding_reset(ctx.as_deref(), caller).await,
         }
     }
 
-    fn binding_help() -> String {
-        concat!(
-            "kj binding — manage a context's tool-capability allow-set\n\n",
-            "  kj binding show   [<ctx>]\n",
-            "  kj binding allow  <cap> [<ctx>]\n",
-            "  kj binding revoke <cap> [<ctx>]\n",
-            "  kj binding reset  [<ctx>]\n\n",
-            "  <cap>: <instance> | <instance>:<tool> | facade:<name> | * | facade:* | admin | rc-write\n",
-            "         | drive | fork | drift | transport | operator  (kj verb authorities)\n",
-            "  <ctx>: . (default) | .parent | <label> | <hex prefix>\n"
-        )
-        .to_string()
-    }
-
-    async fn binding_show(&self, argv: &[String], caller: &KjCaller) -> KjResult {
+    async fn binding_show(&self, ctx: Option<&str>, caller: &KjCaller) -> KjResult {
         let ctx_id = {
             let db = self.kernel_db().lock();
-            match resolve_context_arg(argv.first().map(|s| s.as_str()), caller, &db) {
+            match resolve_context_arg(ctx, caller, &db) {
                 Ok(id) => id,
                 Err(e) => return KjResult::Err(e),
             }
@@ -218,23 +268,20 @@ impl KjDispatcher {
         KjResult::ok_with_data(text, data)
     }
 
-    async fn binding_mutate(&self, argv: &[String], caller: &KjCaller, allow: bool) -> KjResult {
-        let cap = match argv.first() {
-            Some(s) => match parse_capability(s) {
-                Ok(c) => c,
-                Err(e) => return KjResult::Err(e),
-            },
-            None => {
-                return KjResult::Err(format!(
-                    "kj binding {}: a capability is required\n\n{}",
-                    if allow { "allow" } else { "revoke" },
-                    Self::binding_help()
-                ));
-            }
+    async fn binding_mutate(
+        &self,
+        cap: &str,
+        ctx: Option<&str>,
+        caller: &KjCaller,
+        allow: bool,
+    ) -> KjResult {
+        let cap = match parse_capability(cap) {
+            Ok(c) => c,
+            Err(e) => return KjResult::Err(e),
         };
         let ctx_id = {
             let db = self.kernel_db().lock();
-            match resolve_context_arg(argv.get(1).map(|s| s.as_str()), caller, &db) {
+            match resolve_context_arg(ctx, caller, &db) {
                 Ok(id) => id,
                 Err(e) => return KjResult::Err(e),
             }
@@ -260,10 +307,10 @@ impl KjDispatcher {
         KjResult::ok(format!("{verb} {} on context {}", cap_label(&cap), ctx_id.short()))
     }
 
-    async fn binding_reset(&self, argv: &[String], caller: &KjCaller) -> KjResult {
+    async fn binding_reset(&self, ctx: Option<&str>, caller: &KjCaller) -> KjResult {
         let ctx_id = {
             let db = self.kernel_db().lock();
-            match resolve_context_arg(argv.first().map(|s| s.as_str()), caller, &db) {
+            match resolve_context_arg(ctx, caller, &db) {
                 Ok(id) => id,
                 Err(e) => return KjResult::Err(e),
             }

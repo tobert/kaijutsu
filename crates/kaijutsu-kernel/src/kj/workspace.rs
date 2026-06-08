@@ -1,50 +1,123 @@
 //! Workspace subcommands: list, show, create, add, bind, remove.
 
+use clap::{Parser, Subcommand};
 use kaijutsu_types::{ContentType, WorkspaceId};
 
 use crate::kernel_db::{WorkspacePathRow, WorkspaceRow};
 
-use super::parse::{extract_all_named_args, extract_named_arg, has_flag};
-use super::{KjCaller, KjDispatcher, KjResult};
+use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "workspace",
+    about = "Workspace management — group filesystem paths for mounting into contexts",
+    disable_help_subcommand = true,
+    no_binary_name = true
+)]
+struct WorkspaceArgs {
+    #[command(subcommand)]
+    command: WorkspaceCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum WorkspaceCommand {
+    /// List all workspaces.
+    #[command(alias = "ls")]
+    List,
+    /// Show a workspace's description and paths.
+    Show {
+        /// Workspace label
+        label: String,
+    },
+    /// Create a workspace with optional description and initial paths.
+    #[command(alias = "new")]
+    Create {
+        /// Workspace label
+        label: String,
+        /// Description text
+        #[arg(long, alias = "description")]
+        desc: Option<String>,
+        /// Initial path (repeatable)
+        #[arg(long)]
+        path: Vec<String>,
+    },
+    /// Add a path to an existing workspace.
+    Add {
+        /// Workspace label
+        label: String,
+        /// Path to add
+        path: String,
+        /// Mount point (documented; currently unused — see note in migration)
+        #[arg(long)]
+        mount: Option<String>,
+        /// Mark the path read-only
+        #[arg(long)]
+        read_only: bool,
+    },
+    /// Bind a workspace to a context.
+    Bind {
+        /// Workspace label
+        label: String,
+        /// Target context: . (default) | .parent | <label> | <hex prefix>
+        context: Option<String>,
+    },
+    /// Archive a workspace (latched).
+    #[command(alias = "rm")]
+    Remove {
+        /// Workspace label
+        label: String,
+    },
+}
 
 impl KjDispatcher {
     pub(crate) fn dispatch_workspace(&self, argv: &[String], caller: &KjCaller) -> KjResult {
         if argv.is_empty() {
-            return KjResult::Err(self.workspace_help());
+            return clap_help_for::<WorkspaceArgs>();
         }
+        let parsed = match WorkspaceArgs::try_parse_from(argv) {
+            Ok(p) => p,
+            Err(e) => {
+                if matches!(
+                    e.kind(),
+                    clap::error::ErrorKind::DisplayHelp
+                        | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+                ) {
+                    return KjResult::ok_ephemeral(e.to_string(), ContentType::Plain);
+                }
+                return KjResult::Err(format!("kj workspace: {e}"));
+            }
+        };
 
         // Workspace mutation is operator authority; list/show stay ungated.
         if matches!(
-            argv[0].as_str(),
-            "create" | "new" | "add" | "bind" | "remove" | "rm"
-        ) {
-            if let Err(denied) =
-                self.require_cap(caller, crate::mcp::Capability::Operator, "workspace")
-            {
-                return denied;
-            }
+            parsed.command,
+            WorkspaceCommand::Create { .. }
+                | WorkspaceCommand::Add { .. }
+                | WorkspaceCommand::Bind { .. }
+                | WorkspaceCommand::Remove { .. }
+        ) && let Err(denied) =
+            self.require_cap(caller, crate::mcp::Capability::Operator, "workspace")
+        {
+            return denied;
         }
 
-        match argv[0].as_str() {
-            "list" | "ls" => self.workspace_list(),
-            "show" => self.workspace_show(argv),
-            "create" | "new" => self.workspace_create(argv, caller),
-            "add" => self.workspace_add(argv),
-            "bind" => self.workspace_bind(argv, caller),
-            "remove" | "rm" => self.workspace_remove(argv, caller),
-            "help" | "--help" | "-h" => {
-                KjResult::ok_ephemeral(self.workspace_help(), ContentType::Markdown)
+        match parsed.command {
+            WorkspaceCommand::List => self.workspace_list(),
+            WorkspaceCommand::Show { label } => self.workspace_show(&label),
+            WorkspaceCommand::Create { label, desc, path } => {
+                self.workspace_create(&label, desc, &path, caller)
             }
-            other => KjResult::Err(format!(
-                "kj workspace: unknown subcommand '{}'\n\n{}",
-                other,
-                self.workspace_help()
-            )),
+            WorkspaceCommand::Add {
+                label,
+                path,
+                mount: _,
+                read_only,
+            } => self.workspace_add(&label, &path, read_only),
+            WorkspaceCommand::Bind { label, context } => {
+                self.workspace_bind(&label, context.as_deref(), caller)
+            }
+            WorkspaceCommand::Remove { label } => self.workspace_remove(&label, caller),
         }
-    }
-
-    fn workspace_help(&self) -> String {
-        include_str!("../../docs/help/kj-workspace.md").to_string()
     }
 
     fn workspace_list(&self) -> KjResult {
@@ -80,12 +153,7 @@ impl KjDispatcher {
         }
     }
 
-    fn workspace_show(&self, argv: &[String]) -> KjResult {
-        let label = match argv.get(1) {
-            Some(l) => l.as_str(),
-            None => return KjResult::Err("kj workspace show: requires a label".to_string()),
-        };
-
+    fn workspace_show(&self, label: &str) -> KjResult {
         let db = self.kernel_db().lock();
         match db.get_workspace_by_label(label) {
             Ok(Some(w)) => {
@@ -118,15 +186,13 @@ impl KjDispatcher {
     }
 
     /// `kj workspace create <label> [--desc text] [--path p ...]`
-    fn workspace_create(&self, argv: &[String], caller: &KjCaller) -> KjResult {
-        let label = match argv.get(1) {
-            Some(l) => l.as_str(),
-            None => return KjResult::Err("kj workspace create: requires a label".to_string()),
-        };
-
-        let desc = extract_named_arg(argv, &["--desc", "--description"]);
-        let paths = extract_all_named_args(argv, &["--path"]);
-
+    fn workspace_create(
+        &self,
+        label: &str,
+        desc: Option<String>,
+        paths: &[String],
+        caller: &KjCaller,
+    ) -> KjResult {
         let db = self.kernel_db().lock();
         let ws_id = WorkspaceId::new();
 
@@ -143,7 +209,7 @@ impl KjDispatcher {
         }
 
         // Add initial paths
-        for path in &paths {
+        for path in paths {
             let path_row = WorkspacePathRow {
                 workspace_id: ws_id,
                 path: path.clone(),
@@ -164,20 +230,7 @@ impl KjDispatcher {
     }
 
     /// `kj workspace add <label> <path> [--mount m] [--read-only]`
-    fn workspace_add(&self, argv: &[String]) -> KjResult {
-        let label = match argv.get(1) {
-            Some(l) => l.as_str(),
-            None => {
-                return KjResult::Err("kj workspace add: requires a workspace label".to_string());
-            }
-        };
-        let path = match argv.get(2) {
-            Some(p) => p.as_str(),
-            None => return KjResult::Err("kj workspace add: requires a path".to_string()),
-        };
-
-        let read_only = has_flag(argv, &["--read-only"]);
-
+    fn workspace_add(&self, label: &str, path: &str, read_only: bool) -> KjResult {
         let db = self.kernel_db().lock();
 
         let ws = match db.get_workspace_by_label(label) {
@@ -201,17 +254,9 @@ impl KjDispatcher {
     }
 
     /// `kj workspace bind <label> [ctx]`
-    fn workspace_bind(&self, argv: &[String], caller: &KjCaller) -> KjResult {
-        let label = match argv.get(1) {
-            Some(l) => l.as_str(),
-            None => {
-                return KjResult::Err("kj workspace bind: requires a workspace label".to_string());
-            }
-        };
-
+    fn workspace_bind(&self, label: &str, ctx_arg: Option<&str>, caller: &KjCaller) -> KjResult {
         let db = self.kernel_db().lock();
 
-        let ctx_arg = argv.get(2).map(|s| s.as_str());
         let target_id = match super::refs::resolve_context_arg(ctx_arg, caller, &db) {
             Ok(id) => id,
             Err(e) => return KjResult::Err(format!("kj workspace bind: {e}")),
@@ -262,12 +307,7 @@ impl KjDispatcher {
     }
 
     /// `kj workspace remove <label>` — archive a workspace (latched).
-    fn workspace_remove(&self, argv: &[String], caller: &KjCaller) -> KjResult {
-        let label = match argv.get(1) {
-            Some(l) => l.as_str(),
-            None => return KjResult::Err("kj workspace remove: requires a label".to_string()),
-        };
-
+    fn workspace_remove(&self, label: &str, caller: &KjCaller) -> KjResult {
         let db = self.kernel_db().lock();
 
         let ws = match db.get_workspace_by_label(label) {

@@ -15,18 +15,66 @@
 
 use std::time::Duration;
 
-use kaijutsu_types::ContentType;
+use clap::{Parser, Subcommand};
 
 use crate::mcp::InstanceId;
 
-use super::parse::extract_named_arg;
-use super::{KjCaller, KjDispatcher, KjResult};
+use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "policy",
+    about = "Inspect and tune a registered instance's per-call QoS policy",
+    disable_help_subcommand = true,
+    no_binary_name = true
+)]
+struct PolicyArgs {
+    #[command(subcommand)]
+    command: PolicyCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum PolicyCommand {
+    /// Show an instance's current QoS policy (timeout, max result bytes, concurrency).
+    Show {
+        /// Instance to inspect
+        instance: String,
+    },
+    /// Update an instance's per-call QoS policy. Pass at least one flag.
+    Set {
+        /// Instance to update
+        instance: String,
+        /// Per-call timeout, in milliseconds
+        #[arg(long = "timeout-ms")]
+        timeout_ms: Option<u64>,
+        /// Maximum result payload size, in bytes
+        #[arg(long = "max-result-bytes")]
+        max_result_bytes: Option<usize>,
+    },
+}
 
 impl KjDispatcher {
     pub(crate) async fn dispatch_policy(&self, argv: &[String], caller: &KjCaller) -> KjResult {
+        if argv.is_empty() {
+            return clap_help_for::<PolicyArgs>();
+        }
+        let parsed = match PolicyArgs::try_parse_from(argv) {
+            Ok(p) => p,
+            Err(e) => {
+                if matches!(
+                    e.kind(),
+                    clap::error::ErrorKind::DisplayHelp
+                        | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+                ) {
+                    return KjResult::ok_ephemeral(e.to_string(), kaijutsu_types::ContentType::Plain);
+                }
+                return KjResult::Err(format!("kj policy: {e}"));
+            }
+        };
+
         // `set` writes an instance's QoS policy — gated on the same
         // `builtin.policy:policy_set` tool cap the MCP surface uses. `show` reads.
-        if matches!(argv.first().map(|s| s.as_str()), Some("set")) {
+        if matches!(parsed.command, PolicyCommand::Set { .. }) {
             let cap = crate::mcp::Capability::Tool {
                 instance: InstanceId::new("builtin.policy"),
                 tool: "policy_set".to_string(),
@@ -35,33 +83,19 @@ impl KjDispatcher {
                 return denied;
             }
         }
-        match argv.first().map(|s| s.as_str()) {
-            Some("show") => self.policy_show(&argv[1..]).await,
-            Some("set") => self.policy_set(&argv[1..]).await,
-            Some("help") | Some("--help") | Some("-h") | None => {
-                KjResult::ok_ephemeral(Self::policy_help(), ContentType::Markdown)
-            }
-            Some(other) => KjResult::Err(format!(
-                "kj policy: unknown subcommand '{other}'\n\n{}",
-                Self::policy_help()
-            )),
+
+        match parsed.command {
+            PolicyCommand::Show { instance } => self.policy_show(&instance).await,
+            PolicyCommand::Set {
+                instance,
+                timeout_ms,
+                max_result_bytes,
+            } => self.policy_set(&instance, timeout_ms, max_result_bytes).await,
         }
     }
 
-    fn policy_help() -> String {
-        concat!(
-            "kj policy — inspect/tune an instance's per-call QoS policy\n\n",
-            "  kj policy show <instance>\n",
-            "  kj policy set  <instance> [--timeout-ms N] [--max-result-bytes N]\n"
-        )
-        .to_string()
-    }
-
-    async fn policy_show(&self, argv: &[String]) -> KjResult {
-        let instance = match argv.first() {
-            Some(s) if !s.is_empty() => InstanceId::new(s.as_str()),
-            _ => return KjResult::Err("kj policy show: <instance> required".into()),
-        };
+    async fn policy_show(&self, instance_str: &str) -> KjResult {
+        let instance = InstanceId::new(instance_str);
         match self.kernel().broker().policy_of(&instance).await {
             Some(p) => {
                 let data = serde_json::json!({
@@ -88,29 +122,16 @@ impl KjDispatcher {
         }
     }
 
-    async fn policy_set(&self, argv: &[String]) -> KjResult {
-        let instance = match argv.first() {
-            Some(s) if !s.is_empty() && !s.starts_with('-') => InstanceId::new(s.as_str()),
-            _ => return KjResult::Err("kj policy set: <instance> required".into()),
-        };
-        let rest = &argv[1..];
+    async fn policy_set(
+        &self,
+        instance_str: &str,
+        timeout_ms: Option<u64>,
+        max_result_bytes: Option<usize>,
+    ) -> KjResult {
+        let instance = InstanceId::new(instance_str);
 
-        let timeout = match extract_named_arg(rest, &["--timeout-ms"]) {
-            Some(s) => match s.parse::<u64>() {
-                Ok(n) => Some(Duration::from_millis(n)),
-                Err(_) => return KjResult::Err(format!("kj policy set: bad --timeout-ms '{s}'")),
-            },
-            None => None,
-        };
-        let max_bytes = match extract_named_arg(rest, &["--max-result-bytes"]) {
-            Some(s) => match s.parse::<usize>() {
-                Ok(n) => Some(n),
-                Err(_) => {
-                    return KjResult::Err(format!("kj policy set: bad --max-result-bytes '{s}'"));
-                }
-            },
-            None => None,
-        };
+        let timeout = timeout_ms.map(Duration::from_millis);
+        let max_bytes = max_result_bytes;
         if timeout.is_none() && max_bytes.is_none() {
             return KjResult::Err(
                 "kj policy set: nothing to change (pass --timeout-ms and/or --max-result-bytes)"

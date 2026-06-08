@@ -569,19 +569,10 @@ pub(crate) mod test_helpers {
             db.get_or_create_default_workspace(PrincipalId::system())
                 .unwrap();
         }
-        // Isolate the kernel's data dir to a per-test temp dir so CAS (and any
+        // Ephemeral kernel: rooted at a throwaway temp data_dir so CAS (and any
         // other data_dir-rooted state) never touches the user's real XDG store.
-        // `Kernel::new("test", None)` would resolve CAS to
-        // ~/.local/share/kaijutsu/kernel/cas — see docs/issues.md. Leaked like
-        // the rc tree below: it lives for the test process.
-        let data_tmp = std::env::temp_dir()
-            .join(format!("kj-data-test-{}", ContextId::new().to_hex()));
-        std::fs::create_dir_all(&data_tmp).expect("create data test dir");
-        let kernel = Arc::new(
-            Kernel::new("test", Some(data_tmp.as_path()))
-                .await
-                .with_timeouts(policy),
-        );
+        // `Kernel::new` no longer defaults data_dir — see docs/issues.md.
+        let kernel = Arc::new(Kernel::new_ephemeral("test").await.with_timeouts(policy));
         // Mount a private, seeded /etc/rc tree so rc tests exercise the real
         // file-backed dispatch path (readdir + FileDocumentCache). The temp
         // dir is intentionally leaked — it lives for the test process.

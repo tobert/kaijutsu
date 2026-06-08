@@ -1,43 +1,101 @@
 //! Preset subcommands: list, show, save, remove.
 
+use clap::{Parser, Subcommand};
 use kaijutsu_types::{ContentType, PresetId};
 
 use crate::kernel_db::PresetRow;
 
-use super::parse::{extract_named_arg, parse_model_spec};
-use super::{KjCaller, KjDispatcher, KjResult};
+use super::parse::parse_model_spec;
+use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "preset",
+    about = "Manage model/consent presets",
+    disable_help_subcommand = true,
+    no_binary_name = true
+)]
+struct PresetArgs {
+    #[command(subcommand)]
+    command: PresetCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum PresetCommand {
+    /// List all presets.
+    #[command(alias = "ls")]
+    List,
+    /// Show details for a preset.
+    Show {
+        /// Preset label to inspect
+        label: String,
+    },
+    /// Create or update a preset.
+    Save {
+        /// Preset label (resolver key)
+        label: String,
+        /// Model spec `provider/model` (or bare model)
+        #[arg(long, short = 'm')]
+        model: Option<String>,
+        /// System prompt text
+        #[arg(long = "system-prompt")]
+        system_prompt: Option<String>,
+        /// Consent mode (e.g. collaborative, autonomous)
+        #[arg(long)]
+        consent: Option<String>,
+        /// Description text
+        #[arg(long, alias = "description")]
+        desc: Option<String>,
+    },
+    /// Remove a preset (latched).
+    #[command(alias = "rm")]
+    Remove {
+        /// Preset label to delete
+        label: String,
+    },
+}
 
 impl KjDispatcher {
     pub(crate) fn dispatch_preset(&self, argv: &[String], caller: &KjCaller) -> KjResult {
         if argv.is_empty() {
-            return KjResult::Err(self.preset_help());
+            return clap_help_for::<PresetArgs>();
         }
+        let parsed = match PresetArgs::try_parse_from(argv) {
+            Ok(p) => p,
+            Err(e) => {
+                if matches!(
+                    e.kind(),
+                    clap::error::ErrorKind::DisplayHelp
+                        | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+                ) {
+                    return KjResult::ok_ephemeral(e.to_string(), ContentType::Plain);
+                }
+                return KjResult::Err(format!("kj preset: {e}"));
+            }
+        };
 
         // Preset mutation is operator authority; list/show stay ungated.
-        if matches!(argv[0].as_str(), "save" | "remove" | "rm") {
-            if let Err(denied) =
-                self.require_cap(caller, crate::mcp::Capability::Operator, "preset")
-            {
-                return denied;
-            }
+        if matches!(
+            parsed.command,
+            PresetCommand::Save { .. } | PresetCommand::Remove { .. }
+        ) && let Err(denied) =
+            self.require_cap(caller, crate::mcp::Capability::Operator, "preset")
+        {
+            return denied;
         }
 
-        match argv[0].as_str() {
-            "list" | "ls" => self.preset_list(),
-            "show" => self.preset_show(argv),
-            "save" => self.preset_save(argv, caller),
-            "remove" | "rm" => self.preset_remove(argv, caller),
-            "help" | "--help" | "-h" => KjResult::ok_ephemeral(self.preset_help(), ContentType::Markdown),
-            other => KjResult::Err(format!(
-                "kj preset: unknown subcommand '{}'\n\n{}",
-                other,
-                self.preset_help()
-            )),
+        match parsed.command {
+            PresetCommand::List => self.preset_list(),
+            PresetCommand::Show { label } => self.preset_show(&label),
+            PresetCommand::Save {
+                label,
+                model,
+                system_prompt,
+                consent,
+                desc,
+            } => self.preset_save(&label, model, system_prompt, consent, desc, caller),
+            PresetCommand::Remove { label } => self.preset_remove(&label, caller),
         }
-    }
-
-    fn preset_help(&self) -> String {
-        include_str!("../../docs/help/kj-preset.md").to_string()
     }
 
     fn preset_list(&self) -> KjResult {
@@ -79,12 +137,7 @@ impl KjDispatcher {
         }
     }
 
-    fn preset_show(&self, argv: &[String]) -> KjResult {
-        let label = match argv.get(1) {
-            Some(l) => l.as_str(),
-            None => return KjResult::Err("kj preset show: requires a label".to_string()),
-        };
-
+    fn preset_show(&self, label: &str) -> KjResult {
         let db = self.kernel_db().lock();
         match db.get_preset_by_label(label) {
             Ok(Some(p)) => {
@@ -114,18 +167,16 @@ impl KjDispatcher {
         }
     }
 
-    /// `kj preset save <label> [--model p/m] [--system-prompt text] [--tool-filter spec] [--consent mode] [--desc text]`
-    fn preset_save(&self, argv: &[String], caller: &KjCaller) -> KjResult {
-        let label = match argv.get(1) {
-            Some(l) => l.as_str(),
-            None => return KjResult::Err("kj preset save: requires a label".to_string()),
-        };
-
-        let model_spec = extract_named_arg(argv, &["--model", "-m"]);
-        let system_prompt = extract_named_arg(argv, &["--system-prompt"]);
-        let consent_spec = extract_named_arg(argv, &["--consent"]);
-        let desc = extract_named_arg(argv, &["--desc", "--description"]);
-
+    /// `kj preset save <label> [--model p/m] [--system-prompt text] [--consent mode] [--desc text]`
+    fn preset_save(
+        &self,
+        label: &str,
+        model_spec: Option<String>,
+        system_prompt: Option<String>,
+        consent_spec: Option<String>,
+        desc: Option<String>,
+        caller: &KjCaller,
+    ) -> KjResult {
         let (provider, model) = model_spec
             .as_deref()
             .map(parse_model_spec)
@@ -184,12 +235,7 @@ impl KjDispatcher {
     }
 
     /// `kj preset remove <label>` — delete a preset (latched).
-    fn preset_remove(&self, argv: &[String], caller: &KjCaller) -> KjResult {
-        let label = match argv.get(1) {
-            Some(l) => l.as_str(),
-            None => return KjResult::Err("kj preset remove: requires a label".to_string()),
-        };
-
+    fn preset_remove(&self, label: &str, caller: &KjCaller) -> KjResult {
         let db = self.kernel_db().lock();
 
         let preset = match db.get_preset_by_label(label) {
