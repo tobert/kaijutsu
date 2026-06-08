@@ -384,7 +384,8 @@ impl Tool for KjBuiltin {
             .param(ParamSchema::optional("depth", "int", Value::Int(50), "Depth limit for shallow fork"))
             .param(ParamSchema::optional("prompt", "string", Value::String(String::new()), "Prompt note to inject on fork"))
             .param(ParamSchema::optional("preset", "string", Value::String(String::new()), "Preset to apply on fork"))
-            .param(ParamSchema::optional("model", "string", Value::String(String::new()), "Model spec (provider/model)"))
+            .param(ParamSchema::optional("model", "string", Value::String(String::new()), "Model spec (provider/model)")
+                .with_aliases(["-m"]))
             .param(ParamSchema::optional("tools", "string", Value::String(String::new()), "Tool filter spec"))
             .param(ParamSchema::optional("confirm", "string", Value::String(String::new()), "Latch confirmation nonce"))
             .param(ParamSchema::optional("as", "string", Value::String(String::new()), "Template context for subtree fork"))
@@ -421,6 +422,56 @@ impl Tool for KjBuiltin {
             // kaish treats `--content "multi\nline"` as a named arg
             // (consuming the next positional) rather than a bool flag.
             .param(ParamSchema::optional("content", "string", Value::String(String::new()), "Script body (kj rc add / edit). Pipe stdin to omit."))
+            // Value flags from the clap-parsed subcommands (`kj block`,
+            // `kj doc`, `kj search`) and the remaining manual parsers
+            // (`kj context create --parent`, `kj cas get --out`). The flat
+            // kj schema is what kaish sees via get_tool; a subcommand flag
+            // that kaish doesn't know is value-taking gets bound as a bool
+            // (the value divorced to a stray positional), so each clap
+            // `#[arg(long)]` that takes a value — and each inline
+            // `argv[i] == "--flag"` reader — must appear here too.
+            .param(ParamSchema::optional("parent", "string", Value::String(String::new()), "Parent ref (kj context create / kj block create)")
+                .with_aliases(["-p"]))
+            .param(ParamSchema::optional("after", "string", Value::String(String::new()), "Insert-after block id (kj block create)"))
+            .param(ParamSchema::optional("text", "string", Value::String(String::new()), "Text to append (kj block append)"))
+            .param(ParamSchema::optional("range", "string", Value::String(String::new()), "Line range start:end (kj block read)"))
+            .param(ParamSchema::optional("original", "string", Value::String(String::new()), "Original text to diff against (kj block diff)"))
+            .param(ParamSchema::optional("expected", "string", Value::String(String::new()), "CAS expected text (kj block edit replace)"))
+            .param(ParamSchema::optional("line", "int", Value::Int(0), "Insert-before line, 0-indexed (kj block edit insert)"))
+            .param(ParamSchema::optional("start", "int", Value::Int(0), "First line, inclusive (kj block edit delete/replace)"))
+            .param(ParamSchema::optional("end", "int", Value::Int(0), "First line past the range, exclusive (kj block edit delete/replace)"))
+            .param(ParamSchema::optional("language", "string", Value::String(String::new()), "Programming language (kj doc create code)"))
+            .param(ParamSchema::optional("id", "string", Value::String(String::new()), "Explicit document hex UUID (kj doc create)"))
+            .param(ParamSchema::optional("max-depth", "int", Value::Int(0), "Max tree depth (kj doc tree)"))
+            .param(ParamSchema::optional("context-lines", "int", Value::Int(2), "Lines of context around matches (kj search)"))
+            .param(ParamSchema::optional("max-matches", "int", Value::Int(100), "Max matches to return (kj search)"))
+            .param(ParamSchema::optional("out", "string", Value::String(String::new()), "Output file path (kj cas get)"))
+            // Genuine boolean switches. Declared bool so kaish binds the
+            // space form correctly when a positional follows (e.g.
+            // `kj block read --no-line-numbers <id>`); under the
+            // map_positionals=true backend path an *undeclared* bool flag
+            // before a positional is the privilege-escalation-by-typo case
+            // that now fails loud (docs/issues.md). A bool param never
+            // consumes the next token (kaish's is_bool branch just records
+            // the flag), so a following positional stays positional.
+            .param(ParamSchema::optional("json", "bool", Value::Bool(false), "Emit JSON instead of a table"))
+            // `-t` is NOT aliased here: it already maps to `target` (a value
+            // flag, kj cache add). `kj context list` reads `-t` as a `--tree`
+            // shorthand internally, but a flat tool schema can't bind one
+            // short flag to two meanings — the long `--tree` form is the
+            // unambiguous one. TODO: per-subcommand schemas would resolve this.
+            .param(ParamSchema::optional("tree", "bool", Value::Bool(false), "Render topology as a tree (kj context list)"))
+            .param(ParamSchema::optional("switch", "bool", Value::Bool(false), "Switch to the new context after fork"))
+            .param(ParamSchema::optional("stage", "bool", Value::Bool(false), "Fork into staging (curate blocks before LLM)")
+                .with_aliases(["staging"]))
+            .param(ParamSchema::optional("shallow", "bool", Value::Bool(false), "Shallow fork (kj fork --shallow)"))
+            .param(ParamSchema::optional("compact", "bool", Value::Bool(false), "Compact fork (kj fork --compact)"))
+            .param(ParamSchema::optional("read-only", "bool", Value::Bool(false), "Mark workspace path read-only (kj workspace add)"))
+            .param(ParamSchema::optional("summarize", "bool", Value::Bool(false), "Summarize drift output (kj drift)")
+                .with_aliases(["-s"]))
+            .param(ParamSchema::optional("all", "bool", Value::Bool(false), "Search all active contexts (kj search --all)"))
+            .param(ParamSchema::optional("expand-tools", "bool", Value::Bool(false), "Expand ToolCall/ToolResult nodes (kj doc tree)"))
+            .param(ParamSchema::optional("no-line-numbers", "bool", Value::Bool(false), "Suppress line numbers (kj block read)"))
             .example("Discover commands", "kj help")
             .example("View context topology", "kj context list --tree")
             .example("Create isolated workspace", "kj fork --name debug-auth")
@@ -809,6 +860,111 @@ mod tests {
                 "--type default must exclude {other}, got: {stdout}"
             );
         }
+    }
+
+    /// `kj context create <label> --type <t>` must land the context_type on
+    /// the row for BOTH the space form (`--type explorer`) and the equals
+    /// form (`--type=explorer`). Regression: when `--type` is absent from the
+    /// kj tool schema, kaish parses the space form as a bool flag + a stray
+    /// positional, the value is divorced, and create silently falls back to
+    /// the permissive "default" context_type — a privilege-escalation-by-typo
+    /// (read-only `explorer` becomes the default loadout). The equals form is
+    /// the control: it binds regardless of the schema, so if both asserts
+    /// pass we know the space form genuinely round-tripped.
+    #[tokio::test]
+    async fn context_create_type_flag_binds_both_forms() {
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+        let principal = PrincipalId::system();
+        let root = register_context(&dispatcher, Some("root"), None, principal);
+        let kaish = embedded_with_kj(dispatcher.clone(), root).await;
+
+        // Space form.
+        let res = kaish
+            .execute_with_options(
+                "kj context create exp --type explorer",
+                ExecuteOptions::default(),
+            )
+            .await
+            .expect("kaish exec");
+        assert!(res.ok(), "create (space form) exit != 0: {res:?}");
+
+        // Equals form (control).
+        let res2 = kaish
+            .execute_with_options(
+                "kj context create exp2 --type=explorer",
+                ExecuteOptions::default(),
+            )
+            .await
+            .expect("kaish exec");
+        assert!(res2.ok(), "create (eq form) exit != 0: {res2:?}");
+
+        let db = dispatcher.kernel_db().lock();
+        let exp = db
+            .find_context_by_label("exp")
+            .unwrap()
+            .expect("exp context exists");
+        assert_eq!(
+            exp.context_type, "explorer",
+            "space-form `--type explorer` must set context_type, not silently default"
+        );
+        let exp2 = db
+            .find_context_by_label("exp2")
+            .unwrap()
+            .expect("exp2 context exists");
+        assert_eq!(
+            exp2.context_type, "explorer",
+            "eq-form `--type=explorer` must set context_type"
+        );
+    }
+
+    /// A newly-declared clap-subcommand value flag binds in the space form.
+    /// `kj block append <id> --text <body>` lives in the clap-parsed `block`
+    /// surface; before `text` was added to the kj tool schema, kaish would
+    /// bind `--text` as a bool and divorce the body, and clap would then
+    /// reject the leftover positional. Asserts the appended text landed.
+    #[tokio::test]
+    async fn block_append_text_flag_binds_space_form() {
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+        let principal = PrincipalId::system();
+        let ctx = register_context(&dispatcher, Some("append-ctx"), None, principal);
+        dispatcher
+            .block_store()
+            .create_document(ctx, kaijutsu_types::DocKind::Conversation, None)
+            .expect("create_document");
+        let bid = dispatcher
+            .block_store()
+            .insert_block(
+                ctx,
+                None,
+                None,
+                kaijutsu_types::Role::User,
+                kaijutsu_types::BlockKind::Text,
+                "seed ",
+                kaijutsu_types::Status::Done,
+                kaijutsu_types::ContentType::Plain,
+            )
+            .expect("insert block");
+
+        let kaish = embedded_with_kj(dispatcher.clone(), ctx).await;
+        let script = format!("kj block append {} --text appended", bid.to_key());
+        let res = kaish
+            .execute_with_options(&script, ExecuteOptions::default())
+            .await
+            .expect("kaish exec");
+        assert!(res.ok(), "block append exit != 0: {res:?}");
+
+        let snap = dispatcher
+            .block_store()
+            .get_block_snapshot(ctx, &bid)
+            .expect("block store ok")
+            .expect("block exists");
+        assert!(
+            snap.content.contains("appended"),
+            "space-form `--text appended` must reach block append, got: {:?}",
+            snap.content
+        );
     }
 
     /// The other half of the headline guarantee: the keys `kj block list`
