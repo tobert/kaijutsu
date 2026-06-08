@@ -946,6 +946,20 @@ impl BlockStore {
         Ok(())
     }
 
+    /// Set the reasoning-continuity token on a block (Thinking blocks).
+    /// Write-once at `ThinkingEnd`; replicated via snapshot. See
+    /// [`kaijutsu_types::BlockSnapshot::signature`].
+    pub fn set_signature(&mut self, id: &BlockId, signature: Option<String>) -> Result<()> {
+        let block = self
+            .blocks
+            .get_mut(id)
+            .filter(|b| !b.is_deleted())
+            .ok_or(CrdtError::BlockNotFound(*id))?;
+        block.set_signature(signature);
+        self.version += 1;
+        Ok(())
+    }
+
     /// Set the content type on a block using LWW semantics.
     pub fn set_content_type(&mut self, id: &BlockId, content_type: ContentType) -> Result<()> {
         let ts = self.tick();
@@ -2942,6 +2956,36 @@ mod tests {
 
         assert_eq!(restored.blocks.len(), 1);
         assert_eq!(restored.blocks[0].content, "Hello");
+    }
+
+    /// The reasoning-continuity signature set on a Thinking block survives the
+    /// snapshot → postcard → snapshot round-trip (the path persistence and
+    /// fork-copy take). Without this, a rehydrated thinking block would lose
+    /// its verifier and the next Anthropic turn would 400.
+    #[test]
+    fn signature_survives_snapshot_postcard_roundtrip() {
+        let mut store = test_store();
+        let id = store
+            .insert_block(
+                None,
+                None,
+                Role::Model,
+                BlockKind::Thinking,
+                "reasoning",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+
+        store.set_signature(&id, Some("sig_xyz".into())).unwrap();
+        // Visible on the live snapshot…
+        let snap = store.snapshot();
+        assert_eq!(snap.blocks[0].signature.as_deref(), Some("sig_xyz"));
+
+        // …and after a persistence round-trip.
+        let bytes = postcard::to_allocvec(&snap).expect("serialize");
+        let restored: StoreSnapshot = postcard::from_bytes(&bytes).expect("deserialize");
+        assert_eq!(restored.blocks[0].signature.as_deref(), Some("sig_xyz"));
     }
 
     /// Verify that CrdtBlockStore → snapshot → BlockDocument preserves block ordering.

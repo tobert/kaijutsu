@@ -496,7 +496,8 @@ impl BlockDocument {
             tool_call_id,
             exit_code,
             is_error,
-            stderr: None, // Legacy document predates separate stderr
+            stderr: None,    // Legacy document predates separate stderr
+            signature: None, // Legacy document predates reasoning signatures
             output,
             tool_use_id: None, // Legacy document predates tool_use_id
             source_context,

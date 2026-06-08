@@ -33,6 +33,12 @@ use super::{ContentBlock, Message, MessageContent, Role};
 pub(crate) struct HydrationState {
     messages: Vec<Message>,
     assistant_text: Option<String>,
+    /// Accumulated reasoning for the in-progress assistant turn: the
+    /// concatenated thinking text and the latest continuity signature.
+    /// Mirrors `llm_stream`'s in-session accumulator — consecutive Thinking
+    /// blocks collapse into one `Reasoning` block emitted before the text.
+    /// Only signed Thinking blocks land here; signatureless ones are dropped.
+    assistant_reasoning: Option<(String, Option<String>)>,
     tool_uses: Vec<ContentBlock>,
     tool_results: Vec<ContentBlock>,
     /// Pending user-initiated shell commands, keyed by ToolCall BlockId.
@@ -46,6 +52,7 @@ impl HydrationState {
         Self {
             messages: Vec::new(),
             assistant_text: None,
+            assistant_reasoning: None,
             tool_uses: Vec::new(),
             tool_results: Vec::new(),
             user_shell_pending: HashMap::new(),
@@ -74,10 +81,7 @@ impl HydrationState {
         if block.excluded {
             return;
         }
-        if matches!(
-            block.kind,
-            BlockKind::Thinking | BlockKind::File | BlockKind::Trace
-        ) {
+        if matches!(block.kind, BlockKind::File | BlockKind::Trace) {
             return;
         }
         // Skip System blocks unless they're Drift, Error, Notification, or Resource (D-34)
@@ -115,6 +119,36 @@ impl HydrationState {
                     .and_then(|v| v.get("code").and_then(|c| c.as_str().map(String::from)))
                     .unwrap_or_else(|| block.content.clone());
                 self.user_shell_pending.insert(block.id, code);
+            }
+            (_, BlockKind::Thinking) => {
+                // Rehydrate reasoning *only* when the block carries a continuity
+                // signature — the opaque marker that says "this is rehydratable"
+                // (real Anthropic/Gemini signature, or a DeepSeek nonce). A
+                // signatureless Thinking block (generic/local model, or a
+                // legacy/older-wire block) is dropped, preserving prior behavior:
+                // Anthropic rejects a thinking block echoed back without a valid
+                // signature. Cross-provider safety (e.g. not feeding a DeepSeek
+                // nonce to Anthropic) is a fork/rc-policy concern handled above
+                // the kernel, so the token is treated as opaque here.
+                let Some(signature) = block.signature.clone() else {
+                    return;
+                };
+                // A new assistant turn begins — flush any pending tool results
+                // from the prior turn, same as Model/Text below.
+                self.flush_tool_results();
+                match &mut self.assistant_reasoning {
+                    // Consecutive Thinking blocks collapse: concatenate text,
+                    // keep the latest signature (mirrors llm_stream's
+                    // single-accumulator in-session model).
+                    Some((text, sig)) => {
+                        text.push('\n');
+                        text.push_str(&block.content);
+                        *sig = Some(signature);
+                    }
+                    None => {
+                        self.assistant_reasoning = Some((block.content.clone(), Some(signature)));
+                    }
+                }
             }
             (BlockRole::Model, BlockKind::Text) => {
                 // Flush pending tool results before accumulating assistant text
@@ -522,21 +556,29 @@ impl HydrationState {
         cleaned
     }
 
-    /// Flush any pending assistant text + tool_uses into a message.
+    /// Flush any pending assistant reasoning + text + tool_uses into a message.
     fn flush_assistant(&mut self) {
+        // Always reset reasoning, even on the drop paths below.
+        let reasoning = self.assistant_reasoning.take();
         if self.assistant_text.is_none() && self.tool_uses.is_empty() {
+            // A lone Reasoning block can't stand as an assistant message (the
+            // API requires accompanying text or tool_use), so it's dropped here.
             return;
         }
-        if self.tool_uses.is_empty() {
-            // Plain text assistant message
-            if let Some(text) = self.assistant_text.take() {
+        let text = self.assistant_text.take();
+        let tool_uses = std::mem::take(&mut self.tool_uses);
+        if reasoning.is_none() && tool_uses.is_empty() {
+            // Plain text assistant message — keep the simple Text representation
+            // so existing single-text-turn behavior is unchanged.
+            if let Some(text) = text {
                 self.messages.push(Message::assistant(text));
             }
         } else {
-            // Assistant message with tool uses (optionally preceded by text)
-            let text = self.assistant_text.take();
-            let tool_uses = std::mem::take(&mut self.tool_uses);
-            self.messages.push(Message::with_tool_uses(text, tool_uses));
+            // Reasoning and/or tool uses present: emit a Blocks message with
+            // reasoning first, then text, then tool uses.
+            self.messages.push(Message::with_reasoning_text_and_tool_uses(
+                reasoning, text, tool_uses,
+            ));
         }
     }
 

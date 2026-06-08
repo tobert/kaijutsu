@@ -711,6 +711,17 @@ async fn process_llm_stream(
                     if let Some(sig) = signature
                         && !sig.is_empty()
                     {
+                        // Persist the token on the Thinking block so a later
+                        // fork / cold-start / attach can rehydrate the reasoning
+                        // (the hydrator only rehydrates *signed* Thinking blocks
+                        // — see `llm::hydrate`). Best-effort: a failed write
+                        // loses cross-turn continuity but never the turn.
+                        if let Some(ref block_id) = current_block_id
+                            && let Err(e) =
+                                documents.set_signature(context_id, block_id, Some(sig.clone()))
+                        {
+                            log::warn!("Failed to persist thinking signature: {}", e);
+                        }
                         assistant_thinking_signature = Some(sig);
                     }
                     if let Some(ref block_id) = current_block_id {

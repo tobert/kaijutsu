@@ -62,7 +62,20 @@ pub struct StateMachine {
     tool_calls: BTreeMap<usize, ToolAccum>,
     stop_reason: Option<String>,
     usage: Option<Usage>,
+    /// DeepSeek-V4-style providers (`reasoning_required`) round-trip reasoning
+    /// as plain `reasoning_content` and have no per-block verifier. When this is
+    /// set, `ThinkingEnd` carries a sentinel nonce instead of `None` so the
+    /// reasoning is marked rehydratable — the build path ignores the value and
+    /// re-emits the text as `reasoning_content`. Generic OpenAI-compatible
+    /// providers leave this `false`, so their reasoning is dropped on rehydrate
+    /// (matching prior behavior). See [`kaijutsu_types::BlockSnapshot::signature`].
+    reasoning_required: bool,
 }
+
+/// Sentinel token marking openai-compatible reasoning as rehydratable. Opaque —
+/// the value is never read back (only its presence gates rehydration); the build
+/// path re-emits the reasoning *text* as `reasoning_content`.
+const REASONING_NONCE: &str = "openai-compat-reasoning";
 
 impl Default for Phase {
     fn default() -> Self {
@@ -71,8 +84,17 @@ impl Default for Phase {
 }
 
 impl StateMachine {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(reasoning_required: bool) -> Self {
+        Self {
+            reasoning_required,
+            ..Default::default()
+        }
+    }
+
+    /// The `ThinkingEnd` signature for this provider: a rehydration nonce for
+    /// `reasoning_required` providers, else `None`.
+    fn thinking_signature(&self) -> Option<String> {
+        self.reasoning_required.then(|| REASONING_NONCE.to_string())
     }
 
     pub fn step(&mut self, event: OpenAiSseEvent) -> Vec<StreamEvent> {
@@ -170,7 +192,9 @@ impl StateMachine {
     /// no-op.
     fn close_open_block(&mut self, out: &mut Vec<StreamEvent>) {
         match self.phase {
-            Phase::Thinking => out.push(StreamEvent::ThinkingEnd { signature: None }),
+            Phase::Thinking => out.push(StreamEvent::ThinkingEnd {
+                signature: self.thinking_signature(),
+            }),
             Phase::Text => out.push(StreamEvent::TextEnd),
             Phase::None => {}
         }
@@ -239,9 +263,13 @@ mod tests {
     use std::convert::Infallible;
 
     async fn run(payload: &str) -> Vec<StreamEvent> {
+        run_with(payload, false).await
+    }
+
+    async fn run_with(payload: &str, reasoning_required: bool) -> Vec<StreamEvent> {
         let bytes = bytes::Bytes::from(payload.to_string());
         let stream = futures::stream::iter(vec![Ok::<_, Infallible>(bytes)]).eventsource();
-        let mut sm = StateMachine::new();
+        let mut sm = StateMachine::new(reasoning_required);
         let mut out = Vec::new();
         let mut stream = Box::pin(stream);
         while let Some(item) = stream.next().await {
@@ -330,6 +358,24 @@ data: [DONE]
                     })),
                 },
             ]
+        );
+    }
+
+    /// DeepSeek-V4-style providers (`reasoning_required`) mark their reasoning
+    /// rehydratable: `ThinkingEnd` carries the sentinel nonce instead of `None`.
+    #[tokio::test]
+    async fn reasoning_required_stamps_rehydration_nonce_on_thinking_end() {
+        let events = run_with(REASONING_THEN_TEXT, true).await;
+        let thinking_end = events
+            .iter()
+            .find(|e| matches!(e, StreamEvent::ThinkingEnd { .. }))
+            .expect("a ThinkingEnd is emitted");
+        assert_eq!(
+            thinking_end,
+            &StreamEvent::ThinkingEnd {
+                signature: Some(REASONING_NONCE.to_string()),
+            },
+            "reasoning_required marks the reasoning rehydratable"
         );
     }
 

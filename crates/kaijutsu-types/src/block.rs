@@ -1226,6 +1226,19 @@ pub struct BlockSnapshot {
     /// on the shared `tool_meta_at` clock); `None` until the tool finishes.
     #[serde(default)]
     pub stderr: Option<String>,
+    /// Provider reasoning-continuity token for `Thinking` blocks — an opaque,
+    /// provider-agnostic marker that says "this reasoning is rehydratable."
+    /// Carries the verbatim Anthropic `signature` (or Gemini `thoughtSignature`)
+    /// that the API requires when echoing thinking back during a tool-use cycle;
+    /// carries a sentinel nonce for providers (e.g. DeepSeek V4) that round-trip
+    /// reasoning as plain text but want it included on rehydration. `None` means
+    /// "not rehydratable" — the hydrator drops the block (the default for
+    /// generic/local OpenAI-compatible models and legacy/older-wire blocks).
+    /// The token is opaque to the hydrator: cross-provider safety (e.g. not
+    /// feeding a DeepSeek nonce to Anthropic) is a fork/rc-policy concern, not a
+    /// kernel one. See `llm::hydrate`.
+    #[serde(default)]
+    pub signature: Option<String>,
     /// Structured output data for richer formatting (tables, trees).
     /// Used for shell output blocks to enable per-viewer rendering.
     ///
@@ -1390,6 +1403,7 @@ impl BlockSnapshot {
             exit_code: None,
             is_error: false,
             stderr: None,
+            signature: None,
             output: None,
             source_context: None,
             source_model: None,
@@ -1438,6 +1452,7 @@ impl BlockSnapshot {
             exit_code: None,
             is_error: false,
             stderr: None,
+            signature: None,
             output: None,
             source_context: None,
             source_model: None,
@@ -1498,6 +1513,7 @@ impl BlockSnapshot {
             exit_code: None,
             is_error: false,
             stderr: None,
+            signature: None,
             output: None,
             source_context: None,
             source_model: None,
@@ -1558,6 +1574,7 @@ impl BlockSnapshot {
             exit_code,
             is_error,
             stderr: None,
+            signature: None,
             output: None,
             source_context: None,
             source_model: None,
@@ -1622,6 +1639,7 @@ impl BlockSnapshot {
             exit_code,
             is_error,
             stderr: None,
+            signature: None,
             output,
             source_context: None,
             source_model: None,
@@ -1677,6 +1695,7 @@ impl BlockSnapshot {
             exit_code: None,
             is_error: false,
             stderr: None,
+            signature: None,
             output: None,
             source_context: Some(source_context),
             source_model,
@@ -1730,6 +1749,7 @@ impl BlockSnapshot {
             exit_code: None,
             is_error: false,
             stderr: None,
+            signature: None,
             output: None,
             source_context: None,
             source_model: None,
@@ -1783,6 +1803,7 @@ impl BlockSnapshot {
             exit_code: None,
             is_error: false,
             stderr: None,
+            signature: None,
             output: None,
             source_context: None,
             source_model: None,
@@ -1832,6 +1853,7 @@ impl BlockSnapshot {
             exit_code: None,
             is_error: false,
             stderr: None,
+            signature: None,
             output: None,
             source_context: None,
             source_model: None,
@@ -1892,6 +1914,7 @@ impl BlockSnapshot {
             exit_code: None,
             is_error: false,
             stderr: None,
+            signature: None,
             output: None,
             source_context: None,
             source_model: None,
@@ -1950,6 +1973,7 @@ impl BlockSnapshot {
             exit_code: None,
             is_error: false,
             stderr: None,
+            signature: None,
             output: None,
             source_context: None,
             source_model: None,
@@ -2012,6 +2036,7 @@ impl BlockSnapshot {
             && self.tool_call_id == other.tool_call_id
             && self.exit_code == other.exit_code
             && self.is_error == other.is_error
+            && self.signature == other.signature
             && self.output == other.output
             && self.tool_use_id == other.tool_use_id
             && self.source_context == other.source_context
@@ -2074,6 +2099,7 @@ impl BlockSnapshotBuilder {
                 exit_code: None,
                 is_error: false,
             stderr: None,
+            signature: None,
                 output: None,
                 source_context: None,
                 source_model: None,
@@ -2159,6 +2185,13 @@ impl BlockSnapshotBuilder {
 
     pub fn stderr(mut self, stderr: impl Into<String>) -> Self {
         self.snap.stderr = Some(stderr.into());
+        self
+    }
+
+    /// Set the reasoning-continuity token (Thinking blocks). See
+    /// [`BlockSnapshot::signature`].
+    pub fn signature(mut self, signature: impl Into<String>) -> Self {
+        self.snap.signature = Some(signature.into());
         self
     }
 

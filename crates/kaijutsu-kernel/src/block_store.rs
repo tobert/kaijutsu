@@ -1545,6 +1545,33 @@ impl BlockStore {
         Ok(())
     }
 
+    /// Set the reasoning-continuity token on a block (Thinking blocks).
+    ///
+    /// Write-once at `ThinkingEnd`. Like `stderr`, the value isn't a DTE op and
+    /// isn't carried on `BlockMetadata`, so it has no live flow event — it rides
+    /// the `StoreSnapshot` (postcard) used for persistence and fork-copy. That's
+    /// all hydration needs: the kernel rebuilds messages from its own block
+    /// store, not from the Cap'n Proto wire. See
+    /// [`kaijutsu_types::BlockSnapshot::signature`].
+    pub fn set_signature(
+        &self,
+        context_id: ContextId,
+        block_id: &BlockId,
+        signature: Option<String>,
+    ) -> BlockStoreResult<()> {
+        let ops = {
+            let mut entry = self
+                .get_mut(context_id)
+                .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+            let frontier_before = entry.doc.frontier();
+            entry.doc.set_signature(block_id, signature)?;
+            entry.touch(self.principal_id());
+            entry.doc.ops_since(&frontier_before)
+        };
+        self.journal_op(context_id, ops)?;
+        Ok(())
+    }
+
     /// Set structured output data on a block.
     ///
     /// Output data provides formatting information (tables, trees) for richer output.

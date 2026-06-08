@@ -88,6 +88,7 @@ mod tests {
             exit_code: None,
             is_error: false,
             stderr: None,
+            signature: None,
             source_context: None,
             source_model: None,
             drift_kind: None,

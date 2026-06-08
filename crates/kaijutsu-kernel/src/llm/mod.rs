@@ -2128,10 +2128,92 @@ mod tests {
             ];
 
             let msgs = hydrate_from_blocks(&blocks);
-            // Thinking blocks are still skipped
+            // Signatureless thinking blocks are still skipped (not rehydratable).
             assert_eq!(msgs.len(), 2);
             assert_eq!(msgs[0].as_text(), Some("Hello"));
             assert_eq!(msgs[1].as_text(), Some("Hi!"));
+        }
+
+        /// A Thinking block carrying a signature is rehydratable: it becomes a
+        /// `Reasoning` content block at the head of the assistant message,
+        /// before the text, with its signature preserved verbatim (Anthropic
+        /// rejects a tampered/absent signature on a tool-use cycle).
+        #[test]
+        fn signed_thinking_rehydrates_as_reasoning_before_text() {
+            let c = ctx();
+            let u = user();
+            let m = model();
+
+            let mut thinking =
+                BlockSnapshot::thinking(BlockId::new(c, m, 0), None, "let me reason");
+            thinking.signature = Some("sig_abc123".into());
+
+            let blocks = vec![
+                BlockSnapshot::text(BlockId::new(c, u, 0), None, BlockRole::User, "Hello"),
+                thinking,
+                BlockSnapshot::text(BlockId::new(c, m, 1), None, BlockRole::Model, "Hi!"),
+            ];
+
+            let msgs = hydrate_from_blocks(&blocks);
+            assert_eq!(msgs.len(), 2, "user + one assistant turn");
+            assert_eq!(msgs[1].role, Role::Assistant);
+            match &msgs[1].content {
+                MessageContent::Blocks(blocks) => {
+                    assert!(
+                        matches!(
+                            &blocks[0],
+                            ContentBlock::Reasoning { text, signature }
+                                if text == "let me reason"
+                                    && signature.as_deref() == Some("sig_abc123")
+                        ),
+                        "reasoning leads the assistant message: {:?}",
+                        blocks[0]
+                    );
+                    assert!(
+                        matches!(&blocks[1], ContentBlock::Text { text } if text == "Hi!"),
+                        "text follows reasoning: {:?}",
+                        blocks[1]
+                    );
+                }
+                other => panic!("expected Blocks, got {other:?}"),
+            }
+        }
+
+        /// Two consecutive signed thinking blocks in one turn collapse into a
+        /// single Reasoning block (text concatenated, latest signature kept) —
+        /// matching the in-session accumulator in `llm_stream`.
+        #[test]
+        fn consecutive_signed_thinking_collapse_into_one_reasoning() {
+            let c = ctx();
+            let m = model();
+
+            let mut t1 = BlockSnapshot::thinking(BlockId::new(c, m, 0), None, "first");
+            t1.signature = Some("sig1".into());
+            let mut t2 = BlockSnapshot::thinking(BlockId::new(c, m, 1), None, "second");
+            t2.signature = Some("sig2".into());
+
+            let blocks = vec![
+                t1,
+                t2,
+                BlockSnapshot::text(BlockId::new(c, m, 2), None, BlockRole::Model, "answer"),
+            ];
+
+            let msgs = hydrate_from_blocks(&blocks);
+            assert_eq!(msgs.len(), 1);
+            match &msgs[0].content {
+                MessageContent::Blocks(blocks) => match &blocks[0] {
+                    ContentBlock::Reasoning { text, signature } => {
+                        assert_eq!(text, "first\nsecond", "thinking text concatenated");
+                        assert_eq!(
+                            signature.as_deref(),
+                            Some("sig2"),
+                            "latest signature wins"
+                        );
+                    }
+                    other => panic!("expected Reasoning first, got {other:?}"),
+                },
+                other => panic!("expected Blocks, got {other:?}"),
+            }
         }
 
         // ── Error block hydration ──────────────────────────────────────

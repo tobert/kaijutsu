@@ -128,6 +128,10 @@ pub struct BlockContent {
     /// Standard error stream, persisted separately from `content` (stdout).
     /// Set once at tool completion via [`set_stderr`](Self::set_stderr).
     stderr: Option<String>,
+    /// Reasoning-continuity token for Thinking blocks. Set once at
+    /// `ThinkingEnd` via [`set_signature`](Self::set_signature). See
+    /// [`kaijutsu_types::BlockSnapshot::signature`].
+    signature: Option<String>,
     source_context: Option<crate::ContextId>,
     source_model: Option<String>,
     drift_kind: Option<crate::DriftKind>,
@@ -179,6 +183,7 @@ impl BlockContent {
             tool_use_id: None,
             output: None,
             stderr: None,
+            signature: None,
             source_context: None,
             source_model: None,
             drift_kind: None,
@@ -232,6 +237,7 @@ impl BlockContent {
         block.tool_use_id = snap.tool_use_id.clone();
         block.output = snap.output.clone();
         block.stderr = snap.stderr.clone();
+        block.signature = snap.signature.clone();
         block.source_context = snap.source_context;
         block.source_model = snap.source_model.clone();
         block.drift_kind = snap.drift_kind;
@@ -276,6 +282,7 @@ impl BlockContent {
             tool_use_id: snap.tool_use_id.clone(),
             output: snap.output.clone(),
             stderr: snap.stderr.clone(),
+            signature: snap.signature.clone(),
             source_context: snap.source_context,
             source_model: snap.source_model.clone(),
             drift_kind: snap.drift_kind,
@@ -426,6 +433,15 @@ impl BlockContent {
         self.stderr = stderr;
     }
 
+    pub fn signature(&self) -> Option<&str> {
+        self.signature.as_deref()
+    }
+
+    /// Set the reasoning-continuity token (write-once at `ThinkingEnd`).
+    pub fn set_signature(&mut self, signature: Option<String>) {
+        self.signature = signature;
+    }
+
     pub fn source_context(&self) -> Option<crate::ContextId> {
         self.source_context
     }
@@ -561,6 +577,7 @@ impl BlockContent {
             exit_code: self.header.exit_code,
             is_error: self.header.is_error,
             stderr: self.stderr.clone(),
+            signature: self.signature.clone(),
             output: self.output.clone(),
             source_context: self.source_context,
             source_model: self.source_model.clone(),
