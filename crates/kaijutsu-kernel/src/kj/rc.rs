@@ -10,12 +10,77 @@
 //! surface, so they bypass the gated `builtin.file:write` tool). Lifecycle
 //! dispatch reads the same files; see `kj/lifecycle.rs`.
 
+use clap::{Parser, Subcommand};
 use kaijutsu_types::ContentType;
 use regex::Regex;
 use std::sync::OnceLock;
 
-use super::parse::extract_named_arg;
-use super::{KjCaller, KjDispatcher, KjResult};
+use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "rc",
+    about = "Run-control lifecycle scripts at /etc/rc/<type>/<verb>/SXX-name.{kai,md}",
+    disable_help_subcommand = true,
+    no_binary_name = true
+)]
+struct RcArgs {
+    #[command(subcommand)]
+    command: RcCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum RcCommand {
+    /// Install a script. `--content <body>` (or piped stdin) is the script text.
+    Add {
+        /// Canonical path: /etc/rc/<type>/<verb>/SXX-name.{kai,md}
+        path: String,
+        /// Script body (stdin is piped here for `kj rc add` when omitted)
+        #[arg(long)]
+        content: Option<String>,
+    },
+    /// List installed scripts, optionally filtered.
+    #[command(alias = "ls")]
+    List {
+        /// Filter by context_type
+        #[arg(long = "type")]
+        type_filter: Option<String>,
+        /// Filter by verb (create|fork|attach|drift|tick)
+        #[arg(long = "verb")]
+        verb_filter: Option<String>,
+    },
+    /// Remove a script.
+    #[command(alias = "remove")]
+    Rm {
+        /// Canonical rc path to remove
+        path: String,
+    },
+    /// Print one script's content + metadata.
+    #[command(alias = "cat")]
+    Show {
+        /// Canonical rc path to show
+        path: String,
+        /// Emit a JSON object instead of a labelled view
+        #[arg(long)]
+        json: bool,
+    },
+    /// Replace a script's content.
+    #[command(alias = "update")]
+    Edit {
+        /// Canonical rc path to edit
+        path: String,
+        /// Replacement body
+        #[arg(long)]
+        content: Option<String>,
+    },
+    /// Overwrite built-in seed scripts from the embedded defaults
+    /// (destructive: clobbers edits to seeded paths).
+    Reseed {
+        /// Limit the reseed to one context_type
+        #[arg(long = "type")]
+        type_filter: Option<String>,
+    },
+}
 
 /// Canonical rc path format. `attach` is a reserved verb — scripts install fine
 /// but lifecycle dispatch is a no-op until that hook is wired (tracked in
@@ -65,32 +130,47 @@ pub fn parse_rc_path(path: &str) -> Result<RcPathParts, String> {
 impl KjDispatcher {
     pub(crate) async fn dispatch_rc(&self, argv: &[String], caller: &KjCaller) -> KjResult {
         if argv.is_empty() {
-            return KjResult::Err(self.rc_help());
+            return clap_help_for::<RcArgs>();
         }
+        let parsed = match RcArgs::try_parse_from(argv) {
+            Ok(p) => p,
+            Err(e) => {
+                if matches!(
+                    e.kind(),
+                    clap::error::ErrorKind::DisplayHelp
+                        | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+                ) {
+                    return KjResult::ok_ephemeral(e.to_string(), ContentType::Plain);
+                }
+                return KjResult::Err(format!("kj rc: {e}"));
+            }
+        };
         // Writing /etc/rc lifecycle scripts is gated on `rc-write`. `kj rc`
         // writes go through the admin-only rc_cache (not builtin.file:write), so
         // this is the *only* place the rc-write capability is enforced for the
         // kj surface. Reads (list/show) stay ungated.
-        if matches!(argv[0].as_str(), "add" | "rm" | "remove" | "edit" | "update" | "reseed") {
-            if let Err(denied) = self.require_cap(caller, crate::mcp::Capability::RcWrite, "rc") {
-                return denied;
-            }
+        if matches!(
+            parsed.command,
+            RcCommand::Add { .. }
+                | RcCommand::Rm { .. }
+                | RcCommand::Edit { .. }
+                | RcCommand::Reseed { .. }
+        ) && let Err(denied) = self.require_cap(caller, crate::mcp::Capability::RcWrite, "rc")
+        {
+            return denied;
         }
-        match argv[0].as_str() {
-            "add" => self.rc_add(argv, caller).await,
-            "list" | "ls" => self.rc_list(argv).await,
-            "rm" | "remove" => self.rc_rm(argv).await,
-            "show" | "cat" => self.rc_show(argv).await,
-            "edit" | "update" => self.rc_edit(argv).await,
-            "reseed" => self.rc_reseed(argv).await,
-            "help" | "--help" | "-h" => {
-                KjResult::ok_ephemeral(self.rc_help(), ContentType::Markdown)
+        match parsed.command {
+            RcCommand::Add { path, content } => {
+                self.rc_add(&path, content.as_deref(), caller).await
             }
-            other => KjResult::Err(format!(
-                "kj rc: unknown subcommand '{}'\n\n{}",
-                other,
-                self.rc_help()
-            )),
+            RcCommand::List {
+                type_filter,
+                verb_filter,
+            } => self.rc_list(type_filter.as_deref(), verb_filter.as_deref()).await,
+            RcCommand::Rm { path } => self.rc_rm(&path).await,
+            RcCommand::Show { path, json } => self.rc_show(&path, json).await,
+            RcCommand::Edit { path, content } => self.rc_edit(&path, content.as_deref()).await,
+            RcCommand::Reseed { type_filter } => self.rc_reseed(type_filter.as_deref()).await,
         }
     }
 
@@ -102,75 +182,13 @@ impl KjDispatcher {
         self.kernel().file_cache(self.block_store())
     }
 
-    fn rc_help(&self) -> String {
-        // Inline help; if the docs/help/ tree gets a kj-rc.md later, swap
-        // for include_str! to match preset/workspace style.
-        r#"# kj rc — run-control lifecycle scripts
-
-Scripts run at context lifecycle moments based on `context_type`. The path
-encodes everything: `/etc/rc/<context_type>/<verb>/SXX-name.{kai,md}`.
-
-## Commands
-
-- `kj rc add <path> --content <body>` — install a script
-- `kj rc list [--type=...] [--verb=...]` — list installed scripts
-- `kj rc show <path> [--json]` — print one script's content + metadata
-- `kj rc edit <path> --content <body>` — replace a script's content
-- `kj rc rm <path>` — remove a script
-- `kj rc reseed [--type <ctx_type>]` — overwrite built-in seed scripts from the embedded defaults (destructive: clobbers edits to seeded paths)
-
-Scripts are files under `/etc/rc` (`~/.config/kaijutsu/rc/`); these
-commands edit them through the CRDT file cache. You can also edit the
-files directly with an external editor — dispatch picks up changes on the
-next lifecycle event. All `.kai` scripts run under the kernel-default
-timeout.
-
-## Verbs
-
-- `create` — fires when a fresh context is created
-- `fork` — fires when a context is forked from a parent
-- `attach`, `drift` — reserved (lifecycle not yet wired)
-
-## Ordering
-
-Scripts run lexically by `(sort_key, name)`. Use 2- or 3-digit padding
-consistently per directory: `S05`, `S10` sort correctly; `S5`, `S10`
-do NOT (`S10` < `S5` lexically).
-
-## File types
-
-- `.md` — content is inserted as a block in the new context
-- `.kai` — content is executed via kaish with `KJ_CONTEXT`,
-  `KJ_VERB`, and (for fork) `KJ_PARENT_CONTEXT` overlay vars
-
-## Example
-
-```
-echo "You are a planner. Be concise." | \\
-    kj rc add /etc/rc/planner/create/S00-prompt.md
-kj context create my-plan --type=planner
-```
-"#
-        .to_string()
-    }
-
-    async fn rc_add(&self, argv: &[String], _caller: &KjCaller) -> KjResult {
-        let path = match argv.get(1) {
-            Some(p) => p.clone(),
-            None => {
-                return KjResult::Err(
-                    "kj rc add: missing <path>\nusage: kj rc add <path> --content <body>"
-                        .to_string(),
-                );
-            }
-        };
-
-        let parts = match parse_rc_path(&path) {
+    async fn rc_add(&self, path: &str, content: Option<&str>, _caller: &KjCaller) -> KjResult {
+        let parts = match parse_rc_path(path) {
             Ok(p) => p,
             Err(e) => return KjResult::Err(format!("kj rc add: {e}")),
         };
 
-        let content = match extract_named_arg(argv, &["--content"]) {
+        let content = match content {
             Some(c) => c,
             None => {
                 return KjResult::Err(
@@ -182,10 +200,10 @@ kj context create my-plan --type=planner
 
         let cache = self.rc_cache();
         // `add` must not clobber an existing script — use `edit` for that.
-        if cache.exists(&path).await {
+        if cache.exists(path).await {
             return KjResult::Err(format!("kj rc add: '{path}' already exists (use edit)"));
         }
-        if let Err(e) = self.write_rc_file(&cache, &path, &content).await {
+        if let Err(e) = self.write_rc_file(&cache, path, content).await {
             return KjResult::Err(format!("kj rc add: {e}"));
         }
         KjResult::ok(format!(
@@ -208,10 +226,7 @@ kj context create my-plan --type=planner
         cache.flush_one(path).await
     }
 
-    async fn rc_list(&self, argv: &[String]) -> KjResult {
-        let type_filter = extract_named_arg(argv, &["--type"]);
-        let verb_filter = extract_named_arg(argv, &["--verb"]);
-
+    async fn rc_list(&self, type_filter: Option<&str>, verb_filter: Option<&str>) -> KjResult {
         let mut paths = match self.walk_rc_paths().await {
             Ok(p) => p,
             Err(e) => return KjResult::Err(format!("kj rc list: {e}")),
@@ -221,8 +236,8 @@ kj context create my-plan --type=planner
                 Ok(parts) => parts,
                 Err(_) => return false, // stray non-canonical file
             };
-            type_filter.as_ref().is_none_or(|t| parts.context_type == *t)
-                && verb_filter.as_ref().is_none_or(|v| parts.verb == *v)
+            type_filter.is_none_or(|t| parts.context_type == t)
+                && verb_filter.is_none_or(|v| parts.verb == v)
         });
         paths.sort();
 
@@ -272,24 +287,13 @@ kj context create my-plan --type=planner
         Ok(out)
     }
 
-    async fn rc_show(&self, argv: &[String]) -> KjResult {
-        let path = match argv.get(1) {
-            Some(p) => p.clone(),
-            None => {
-                return KjResult::Err(
-                    "kj rc show: missing <path>\nusage: kj rc show <path> [--json]"
-                        .to_string(),
-                );
-            }
-        };
-        let json = super::parse::has_flag(argv, &["--json"]);
-
-        let parts = match parse_rc_path(&path) {
+    async fn rc_show(&self, path: &str, json: bool) -> KjResult {
+        let parts = match parse_rc_path(path) {
             Ok(p) => p,
             Err(e) => return KjResult::Err(format!("kj rc show: {e}")),
         };
         let cache = self.rc_cache();
-        let content = match cache.read_content(&path).await {
+        let content = match cache.read_content(path).await {
             Ok(c) => c,
             Err(_) => return KjResult::Err(format!("kj rc show: '{path}' not found")),
         };
@@ -328,21 +332,12 @@ kj context create my-plan --type=planner
         KjResult::ok_typed_with_data(out, ContentType::Markdown, record)
     }
 
-    async fn rc_edit(&self, argv: &[String]) -> KjResult {
-        let path = match argv.get(1) {
-            Some(p) => p.clone(),
-            None => {
-                return KjResult::Err(
-                    "kj rc edit: missing <path>\nusage: kj rc edit <path> --content <body>"
-                        .to_string(),
-                );
-            }
-        };
-        if let Err(e) = parse_rc_path(&path) {
+    async fn rc_edit(&self, path: &str, content: Option<&str>) -> KjResult {
+        if let Err(e) = parse_rc_path(path) {
             return KjResult::Err(format!("kj rc edit: {e}"));
         }
 
-        let content = match extract_named_arg(argv, &["--content"]) {
+        let content = match content {
             Some(c) => c,
             None => {
                 return KjResult::Err(
@@ -352,19 +347,17 @@ kj context create my-plan --type=planner
         };
 
         let cache = self.rc_cache();
-        if !cache.exists(&path).await {
+        if !cache.exists(path).await {
             return KjResult::Err(format!("kj rc edit: '{path}' not found"));
         }
-        if let Err(e) = self.write_rc_file(&cache, &path, &content).await {
+        if let Err(e) = self.write_rc_file(&cache, path, content).await {
             return KjResult::Err(format!("kj rc edit: {e}"));
         }
         KjResult::ok(format!("edited rc script '{path}' (content)"))
     }
 
-    async fn rc_reseed(&self, argv: &[String]) -> KjResult {
-        let type_filter = extract_named_arg(argv, &["--type"]);
-
-        if let Some(t) = type_filter.as_deref() {
+    async fn rc_reseed(&self, type_filter: Option<&str>) -> KjResult {
+        if let Some(t) = type_filter {
             let allowed = crate::seed_scripts::seeded_context_types();
             if !allowed.contains(&t) {
                 return KjResult::Err(format!(
@@ -380,7 +373,7 @@ kj context create my-plan --type=planner
         let cache = self.rc_cache();
         let mut count = 0usize;
         for (seed_path, body) in crate::seed_scripts::seed_files() {
-            if let Some(t) = type_filter.as_deref() {
+            if let Some(t) = type_filter {
                 let seg = seed_path
                     .strip_prefix(crate::seed_scripts::RC_VFS_ROOT)
                     .and_then(|r| r.split('/').next());
@@ -394,7 +387,7 @@ kj context create my-plan --type=planner
             count += 1;
         }
 
-        let scope = match &type_filter {
+        let scope = match type_filter {
             Some(t) => format!(" (context_type={t})"),
             None => String::new(),
         };
@@ -403,25 +396,16 @@ kj context create my-plan --type=planner
         ))
     }
 
-    async fn rc_rm(&self, argv: &[String]) -> KjResult {
+    async fn rc_rm(&self, path: &str) -> KjResult {
         use crate::vfs::VfsOps;
 
-        let path = match argv.get(1) {
-            Some(p) => p.clone(),
-            None => {
-                return KjResult::Err(
-                    "kj rc rm: missing <path>\nusage: kj rc rm <path>".to_string(),
-                );
-            }
-        };
-
         let cache = self.rc_cache();
-        if !cache.exists(&path).await {
+        if !cache.exists(path).await {
             return KjResult::Err(format!("kj rc rm: '{path}' not found"));
         }
         // Drop the cached CRDT doc, then unlink the backing file.
-        cache.invalidate(&path);
-        if let Err(e) = self.kernel().vfs().unlink(std::path::Path::new(&path)).await {
+        cache.invalidate(path);
+        if let Err(e) = self.kernel().vfs().unlink(std::path::Path::new(path)).await {
             return KjResult::Err(format!("kj rc rm: unlink '{path}': {e}"));
         }
         KjResult::ok(format!("removed rc script '{path}'"))
