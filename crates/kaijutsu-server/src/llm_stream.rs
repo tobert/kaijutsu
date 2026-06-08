@@ -584,17 +584,16 @@ async fn process_llm_stream(
         > = std::collections::HashMap::new();
         // Collect text output for conversation history
         let mut assistant_text = String::new();
-        // Collect thinking output for in-call continuity (A3). Reset per
-        // iteration so it represents *this* turn's reasoning, not prior
-        // turns'. Cross-turn continuity stays out of scope — the hydrator
-        // continues to skip Thinking blocks in CRDT history per design.
-        let mut assistant_thinking = String::new();
-        // Provider verification signature for the accumulated thinking
-        // (Anthropic's `signature_delta` payload, surfaced via
-        // ThinkingEnd). Carried alongside the prose into the assistant
-        // message so Anthropic accepts the reasoning chain on the next
-        // tool-use turn.
-        let mut assistant_thinking_signature: Option<String> = None;
+        // Collect thinking output for in-call continuity (A3), one
+        // `(text, signature)` entry **per** thinking block (ThinkingStart opens
+        // a new entry; deltas append to it; ThinkingEnd stamps its signature).
+        // Kept separate — never merged — because Anthropic verifies each
+        // `signature_delta` against its own block's text; a later turn echoes
+        // them back unmodified and in order. Reset per agentic-loop iteration so
+        // it holds *this* turn's reasoning. This is the same per-block shape the
+        // hydrator reconstructs from CRDT history, so live and rehydrated turns
+        // serialize identically.
+        let mut assistant_reasoning: Vec<(String, Option<String>)> = Vec::new();
 
         log::debug!("Entering stream event loop");
         let mut stream_cancelled = false;
@@ -665,6 +664,9 @@ async fn process_llm_stream(
             log::debug!("Received stream event: {:?}", event);
             match event {
                 StreamEvent::ThinkingStart => {
+                    // Open a fresh reasoning entry for this block (its deltas
+                    // append here; ThinkingEnd stamps its signature).
+                    assistant_reasoning.push((String::new(), None));
                     match documents.insert_block_as(
                         context_id,
                         None,
@@ -687,8 +689,13 @@ async fn process_llm_stream(
                 StreamEvent::ThinkingDelta(text) => {
                     // In-call thinking continuity (A3): accumulate alongside
                     // the CRDT block so the next agentic-loop iteration can
-                    // include reasoning in the assistant message.
-                    assistant_thinking.push_str(&text);
+                    // include reasoning in the assistant message. Append to the
+                    // current block's entry (defensive: open one if a delta
+                    // arrives before ThinkingStart).
+                    match assistant_reasoning.last_mut() {
+                        Some((t, _)) => t.push_str(&text),
+                        None => assistant_reasoning.push((text.clone(), None)),
+                    }
                     if let Some(ref block_id) = current_block_id
                         && let Err(e) = documents.append_text_as(
                             context_id,
@@ -702,15 +709,17 @@ async fn process_llm_stream(
                 }
 
                 StreamEvent::ThinkingEnd { signature } => {
-                    // Capture the provider's reasoning signature so the
-                    // next agentic-loop iteration can echo the thinking
-                    // back with its verifier (required by Anthropic
-                    // when extended thinking is enabled and tool_use is
-                    // in the same turn). `None` when the provider
-                    // doesn't emit one — leave the accumulator alone.
+                    // Stamp this block's verifier (Anthropic's `signature_delta`,
+                    // surfaced via ThinkingEnd) onto its own reasoning entry — a
+                    // later turn echoes each thinking block back unmodified with
+                    // its matching signature. `None` when the provider doesn't
+                    // emit one.
                     if let Some(sig) = signature
                         && !sig.is_empty()
                     {
+                        if let Some((_, slot)) = assistant_reasoning.last_mut() {
+                            *slot = Some(sig.clone());
+                        }
                         // Persist the token on the Thinking block so a later
                         // fork / cold-start / attach can rehydrate the reasoning
                         // (the hydrator only rehydrates *signed* Thinking blocks
@@ -722,7 +731,6 @@ async fn process_llm_stream(
                         {
                             log::warn!("Failed to persist thinking signature: {}", e);
                         }
-                        assistant_thinking_signature = Some(sig);
                     }
                     if let Some(ref block_id) = current_block_id {
                         let _ = documents.set_status(context_id, block_id, Status::Done);
@@ -1180,18 +1188,13 @@ async fn process_llm_stream(
         }
 
         // Add assistant message with tool uses to conversation. Preserve
-        // accumulated thinking (A3) so multi-step tool turns keep the
-        // model's chain-of-thought intact within this `process_llm_stream`
-        // invocation. Signature comes from the provider via
-        // `StreamEvent::ThinkingEnd.signature` — load-bearing for
-        // Anthropic when extended thinking is enabled and tool_use is
-        // in the same turn.
-        let reasoning = (!assistant_thinking.is_empty()).then(|| {
-            (
-                std::mem::take(&mut assistant_thinking),
-                assistant_thinking_signature.take(),
-            )
-        });
+        // accumulated thinking (A3), one Reasoning block per thinking block, so
+        // multi-step tool turns keep the model's chain-of-thought intact within
+        // this `process_llm_stream` invocation. Each signature comes from the
+        // provider via `StreamEvent::ThinkingEnd.signature` — load-bearing for
+        // Anthropic when extended thinking is enabled and tool_use is in the
+        // same turn (the builder skips any empty-text entries).
+        let reasoning = std::mem::take(&mut assistant_reasoning);
         let text = (!assistant_text.is_empty()).then(|| std::mem::take(&mut assistant_text));
         messages.push(LlmMessage::with_reasoning_text_and_tool_uses(
             reasoning,

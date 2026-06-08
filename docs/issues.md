@@ -39,10 +39,6 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
     postcard `StoreSnapshot` (persistence + fork-copy), which is all kernel-local
     hydration needs. Add a `BlockSnapshot.signature` field + rpc encode/decode if
     cross-kernel drift or app-side round-trips ever need to preserve it.
-  - **Multi-block reasoning:** consecutive Thinking blocks collapse to one
-    `Reasoning` (latest signature wins) — our own simplification, matching
-    `llm_stream`'s in-session accumulator, *not* an Anthropic requirement.
-    Revisit if interleaved thinking needs per-block signatures preserved.
 
 ## Persistence & Sync
 

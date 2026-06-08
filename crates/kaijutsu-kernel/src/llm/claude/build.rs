@@ -510,7 +510,7 @@ mod tests {
     #[test]
     fn reasoning_block_round_trips_with_signature() {
         let messages = vec![Message::with_reasoning_text_and_tool_uses(
-            Some(("let me think".into(), Some("sig_xyz".into()))),
+            vec![("let me think".into(), Some("sig_xyz".into()))],
             Some("answer".into()),
             vec![],
         )];

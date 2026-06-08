@@ -169,22 +169,29 @@ impl Message {
 
     /// Create an assistant message with tool uses.
     pub fn with_tool_uses(text: Option<String>, tool_uses: Vec<ContentBlock>) -> Self {
-        Self::with_reasoning_text_and_tool_uses(None, text, tool_uses)
+        Self::with_reasoning_text_and_tool_uses(Vec::new(), text, tool_uses)
     }
 
-    /// Create an assistant message with optional reasoning, text, and tool
-    /// uses. Used by the agentic-loop driver to preserve thinking across
-    /// tool-use iterations (A3). Reasoning blocks are emitted *before* text
-    /// and tool uses so providers see the reasoning chain in order.
+    /// Create an assistant message with reasoning, text, and tool uses. Used by
+    /// the agentic-loop driver to preserve thinking across tool-use iterations
+    /// (A3).
+    ///
+    /// `reasoning` is a list of `(text, signature)` pairs, **one per thinking
+    /// block** — they are emitted in order as separate `Reasoning` blocks ahead
+    /// of the text and tool uses, *not* merged. Anthropic requires each thinking
+    /// block echoed back unmodified with its own signature (the signature is a
+    /// verifier over that block's exact text), so collapsing distinct blocks
+    /// would produce a signature mismatch. Empty-text entries are skipped.
     pub fn with_reasoning_text_and_tool_uses(
-        reasoning: Option<(String, Option<String>)>,
+        reasoning: Vec<(String, Option<String>)>,
         text: Option<String>,
         tool_uses: Vec<ContentBlock>,
     ) -> Self {
         let mut blocks = Vec::new();
-        if let Some((reasoning_text, signature)) = reasoning
-            && !reasoning_text.is_empty()
-        {
+        for (reasoning_text, signature) in reasoning {
+            if reasoning_text.is_empty() {
+                continue;
+            }
             blocks.push(ContentBlock::Reasoning {
                 text: reasoning_text,
                 signature,
@@ -2179,11 +2186,12 @@ mod tests {
             }
         }
 
-        /// Two consecutive signed thinking blocks in one turn collapse into a
-        /// single Reasoning block (text concatenated, latest signature kept) —
-        /// matching the in-session accumulator in `llm_stream`.
+        /// Two signed thinking blocks in one turn are preserved as two separate
+        /// `Reasoning` blocks, in order, each keeping its own signature — they
+        /// are NOT merged (Anthropic verifies each signature against its own
+        /// block's text, so concatenating would invalidate the verifier).
         #[test]
-        fn consecutive_signed_thinking_collapse_into_one_reasoning() {
+        fn consecutive_signed_thinking_kept_as_separate_reasoning() {
             let c = ctx();
             let m = model();
 
@@ -2201,17 +2209,31 @@ mod tests {
             let msgs = hydrate_from_blocks(&blocks);
             assert_eq!(msgs.len(), 1);
             match &msgs[0].content {
-                MessageContent::Blocks(blocks) => match &blocks[0] {
-                    ContentBlock::Reasoning { text, signature } => {
-                        assert_eq!(text, "first\nsecond", "thinking text concatenated");
-                        assert_eq!(
-                            signature.as_deref(),
-                            Some("sig2"),
-                            "latest signature wins"
-                        );
-                    }
-                    other => panic!("expected Reasoning first, got {other:?}"),
-                },
+                MessageContent::Blocks(blocks) => {
+                    assert!(
+                        matches!(
+                            &blocks[0],
+                            ContentBlock::Reasoning { text, signature }
+                                if text == "first" && signature.as_deref() == Some("sig1")
+                        ),
+                        "first reasoning block intact: {:?}",
+                        blocks[0]
+                    );
+                    assert!(
+                        matches!(
+                            &blocks[1],
+                            ContentBlock::Reasoning { text, signature }
+                                if text == "second" && signature.as_deref() == Some("sig2")
+                        ),
+                        "second reasoning block intact: {:?}",
+                        blocks[1]
+                    );
+                    assert!(
+                        matches!(&blocks[2], ContentBlock::Text { text } if text == "answer"),
+                        "text follows both reasoning blocks: {:?}",
+                        blocks[2]
+                    );
+                }
                 other => panic!("expected Blocks, got {other:?}"),
             }
         }

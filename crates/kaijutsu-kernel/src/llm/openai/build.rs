@@ -323,7 +323,7 @@ mod tests {
         // V4 contract: the chain-of-thought is echoed back, separate from
         // content — required on tool-call turns, ignored otherwise.
         let msg = Message::with_reasoning_text_and_tool_uses(
-            Some(("internal thoughts".into(), Some("sig".into()))),
+            vec![("internal thoughts".into(), Some("sig".into()))],
             Some("the answer".into()),
             vec![],
         );
@@ -544,7 +544,7 @@ mod tests {
         // Genuine reasoning is preserved regardless of the flag — a local
         // reasoning model (Gemma-4) emits it and the round-trip keeps it.
         let msg = Message::with_reasoning_text_and_tool_uses(
-            Some(("real thoughts".into(), None)),
+            vec![("real thoughts".into(), None)],
             Some("the answer".into()),
             vec![],
         );

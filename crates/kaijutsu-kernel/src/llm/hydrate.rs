@@ -33,12 +33,13 @@ use super::{ContentBlock, Message, MessageContent, Role};
 pub(crate) struct HydrationState {
     messages: Vec<Message>,
     assistant_text: Option<String>,
-    /// Accumulated reasoning for the in-progress assistant turn: the
-    /// concatenated thinking text and the latest continuity signature.
-    /// Mirrors `llm_stream`'s in-session accumulator — consecutive Thinking
-    /// blocks collapse into one `Reasoning` block emitted before the text.
-    /// Only signed Thinking blocks land here; signatureless ones are dropped.
-    assistant_reasoning: Option<(String, Option<String>)>,
+    /// Reasoning accumulated for the in-progress assistant turn — one
+    /// `(text, signature)` entry **per** Thinking block, in order. Emitted as
+    /// separate `Reasoning` blocks ahead of the turn's text (a turn's thinking
+    /// blocks are *not* merged — Anthropic verifies each signature against its
+    /// own block). Only signed Thinking blocks land here; signatureless ones
+    /// are dropped.
+    assistant_reasoning: Vec<(String, Option<String>)>,
     tool_uses: Vec<ContentBlock>,
     tool_results: Vec<ContentBlock>,
     /// Pending user-initiated shell commands, keyed by ToolCall BlockId.
@@ -52,7 +53,7 @@ impl HydrationState {
         Self {
             messages: Vec::new(),
             assistant_text: None,
-            assistant_reasoning: None,
+            assistant_reasoning: Vec::new(),
             tool_uses: Vec::new(),
             tool_results: Vec::new(),
             user_shell_pending: HashMap::new(),
@@ -136,19 +137,10 @@ impl HydrationState {
                 // A new assistant turn begins — flush any pending tool results
                 // from the prior turn, same as Model/Text below.
                 self.flush_tool_results();
-                match &mut self.assistant_reasoning {
-                    // Consecutive Thinking blocks collapse: concatenate text,
-                    // keep the latest signature (mirrors llm_stream's
-                    // single-accumulator in-session model).
-                    Some((text, sig)) => {
-                        text.push('\n');
-                        text.push_str(&block.content);
-                        *sig = Some(signature);
-                    }
-                    None => {
-                        self.assistant_reasoning = Some((block.content.clone(), Some(signature)));
-                    }
-                }
+                // One entry per Thinking block — preserved separately so each
+                // signature stays paired with its own text (no merging).
+                self.assistant_reasoning
+                    .push((block.content.clone(), Some(signature)));
             }
             (BlockRole::Model, BlockKind::Text) => {
                 // Flush pending tool results before accumulating assistant text
@@ -559,15 +551,15 @@ impl HydrationState {
     /// Flush any pending assistant reasoning + text + tool_uses into a message.
     fn flush_assistant(&mut self) {
         // Always reset reasoning, even on the drop paths below.
-        let reasoning = self.assistant_reasoning.take();
+        let reasoning = std::mem::take(&mut self.assistant_reasoning);
         if self.assistant_text.is_none() && self.tool_uses.is_empty() {
-            // A lone Reasoning block can't stand as an assistant message (the
-            // API requires accompanying text or tool_use), so it's dropped here.
+            // Lone Reasoning blocks can't stand as an assistant message (the
+            // API requires accompanying text or tool_use), so they're dropped.
             return;
         }
         let text = self.assistant_text.take();
         let tool_uses = std::mem::take(&mut self.tool_uses);
-        if reasoning.is_none() && tool_uses.is_empty() {
+        if reasoning.is_empty() && tool_uses.is_empty() {
             // Plain text assistant message — keep the simple Text representation
             // so existing single-text-turn behavior is unchanged.
             if let Some(text) = text {
