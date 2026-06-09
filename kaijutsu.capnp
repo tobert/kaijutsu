@@ -611,7 +611,7 @@ struct HistoryEntry {
 struct ShellExecResult {
   code @0 :Int64;           # Exit code (0 = success)
   ok @1 :Bool;              # Convenience: code == 0
-  stdout @2 :Data;          # Raw bytes (may be binary — images, postcard, etc.)
+  stdout @2 :Data;          # Raw bytes (may be binary — images, serialized blobs, etc.)
   stderr @3 :Text;          # Always text (diagnostics, warnings)
   data @4 :ShellValue;      # Parsed result value (structured)
   outputData @5 :OutputData; # Structured output for tables/trees

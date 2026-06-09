@@ -2060,9 +2060,9 @@ impl BlockStore {
 
             let mut max_seq = base_seq;
             let mut total_bytes: u64 = 0;
+            let mut replayed: u64 = 0;
+            let mut poisoned = false;
             for (seq, payload_bytes) in &oplog_entries {
-                max_seq = max_seq.max(*seq);
-                total_bytes += payload_bytes.len() as u64;
                 match codec::decode::<SyncPayload>(payload_bytes) {
                     Ok(payload) => {
                         if let Err(e) = crdt_store.merge_ops(payload) {
@@ -2070,8 +2070,9 @@ impl BlockStore {
                                 document_id = %context_id.to_hex(),
                                 seq = seq,
                                 error = %e,
-                                "Failed to replay oplog entry, halting replay"
+                                "Failed to replay oplog entry; skipping document so partial state is not served and unreplayed ops are not truncated"
                             );
+                            poisoned = true;
                             break;
                         }
                     }
@@ -2080,17 +2081,33 @@ impl BlockStore {
                             document_id = %context_id.to_hex(),
                             seq = seq,
                             error = %e,
-                            "Failed to deserialize oplog entry, halting replay"
+                            "Failed to deserialize oplog entry; skipping document so partial state is not served and unreplayed ops are not truncated"
                         );
+                        poisoned = true;
                         break;
                     }
                 }
+                // Advance bookkeeping only for entries that actually applied, so
+                // `next_journal_seq` never points past an unreplayed entry — a
+                // later compaction truncates the oplog up to `next_journal_seq`
+                // and would otherwise permanently drop the ops we couldn't replay.
+                max_seq = max_seq.max(*seq);
+                total_bytes += payload_bytes.len() as u64;
+                replayed += 1;
+            }
+
+            // A document whose oplog could not be fully replayed is left out of
+            // the in-memory store entirely (matching the snapshot-failure paths
+            // above) rather than served as coherent-but-partial. Its oplog rows
+            // stay intact on disk for recovery.
+            if poisoned {
+                continue;
             }
 
             if !oplog_entries.is_empty() {
                 tracing::debug!(
                     document_id = %context_id.to_hex(),
-                    replayed = oplog_entries.len(),
+                    replayed = replayed,
                     max_seq = max_seq,
                     "Replayed oplog entries"
                 );
@@ -2105,7 +2122,7 @@ impl BlockStore {
                 last_agent: RwLock::new(principal_id),
                 sync_generation: AtomicU64::new(0),
                 next_journal_seq: AtomicU64::new(max_seq as u64),
-                uncompacted_count: AtomicU64::new(oplog_entries.len() as u64),
+                uncompacted_count: AtomicU64::new(replayed),
                 uncompacted_bytes: AtomicU64::new(total_bytes),
             };
 

@@ -60,8 +60,10 @@ impl SyncedInput {
         })
     }
 
-    /// Apply a local edit and return ops to send to server.
-    pub fn edit(&mut self, pos: usize, insert: &str, delete: usize) -> Vec<u8> {
+    /// Apply a local edit and return the ops to send to the server — or an
+    /// encode error, so a failed local edit surfaces to the caller instead of
+    /// vanishing as empty ops.
+    pub fn edit(&mut self, pos: usize, insert: &str, delete: usize) -> Result<Vec<u8>, String> {
         let frontier_before = self.doc.version().clone();
         let text_len = self
             .doc
@@ -81,17 +83,7 @@ impl SyncedInput {
             }
         }
         let ops = self.doc.ops_since_owned(&frontier_before);
-        // TODO: `edit` returns `Vec<u8>` with no error channel, so an encode
-        // failure here is dropped on the floor (empty ops = a silently-lost
-        // local edit). Surface it loudly for now; revisit the signature to
-        // return `Result` so callers can react to the failure.
-        match kaijutsu_types::codec::encode(&ops) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                tracing::error!("failed to encode input ops (local edit lost): {}", e);
-                Vec::new()
-            }
-        }
+        kaijutsu_types::codec::encode(&ops).map_err(|e| format!("encode input ops: {}", e))
     }
 
     /// Get current text content.
@@ -149,30 +141,30 @@ mod tests {
     #[test]
     fn test_edit_insert() {
         let mut input = SyncedInput::new(test_context_id(), test_principal_id());
-        let _ops = input.edit(0, "hello", 0);
+        let _ops = input.edit(0, "hello", 0).unwrap();
         assert_eq!(input.text(), "hello");
     }
 
     #[test]
     fn test_edit_delete() {
         let mut input = SyncedInput::new(test_context_id(), test_principal_id());
-        input.edit(0, "hello world", 0);
-        let _ops = input.edit(5, "", 6); // delete " world"
+        input.edit(0, "hello world", 0).unwrap();
+        let _ops = input.edit(5, "", 6).unwrap(); // delete " world"
         assert_eq!(input.text(), "hello");
     }
 
     #[test]
     fn test_edit_replace() {
         let mut input = SyncedInput::new(test_context_id(), test_principal_id());
-        input.edit(0, "hello", 0);
-        let _ops = input.edit(0, "goodbye", 5);
+        input.edit(0, "hello", 0).unwrap();
+        let _ops = input.edit(0, "goodbye", 5).unwrap();
         assert_eq!(input.text(), "goodbye");
     }
 
     #[test]
     fn test_clear() {
         let mut input = SyncedInput::new(test_context_id(), test_principal_id());
-        input.edit(0, "some text", 0);
+        input.edit(0, "some text", 0).unwrap();
         input.clear();
         assert_eq!(input.text(), "");
     }
@@ -191,7 +183,7 @@ mod tests {
         let mut input_b = SyncedInput::from_state(ctx, test_principal_id(), &full_ops).unwrap();
 
         // Now an incremental edit on A can be applied to B
-        let ops = input_a.edit(0, "synced!", 0);
+        let ops = input_a.edit(0, "synced!", 0).unwrap();
         input_b.apply_remote_ops(&ops).unwrap();
         assert_eq!(input_b.text(), "synced!");
     }
@@ -201,7 +193,7 @@ mod tests {
         let ctx = test_context_id();
         let pid = test_principal_id();
         let mut input = SyncedInput::new(ctx, pid);
-        input.edit(0, "persisted", 0);
+        input.edit(0, "persisted", 0).unwrap();
 
         // Serialize full state (ops since root)
         let full_ops = {
