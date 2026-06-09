@@ -59,6 +59,7 @@ impl KjDispatcher {
             semantic_index,
             block_source,
             false,
+            false,
         )
         .await
     }
@@ -84,6 +85,34 @@ impl KjDispatcher {
             semantic_index,
             block_source,
             true,
+            false,
+        )
+        .await
+    }
+
+    /// Like [`Self::materialize_context_kaish`] but the materialized shell is
+    /// **read-only**: filesystem mutations and external commands are refused by
+    /// construction, while reads — real files and the CRDT `/v/docs` /
+    /// `/v/input` views — still work. Backs the explorer's `read_only_shell`.
+    /// Unprivileged (the read-only role is never the rc control plane).
+    pub async fn materialize_context_kaish_read_only(
+        &self,
+        name: &str,
+        principal: PrincipalId,
+        context_id: ContextId,
+        session_id: SessionId,
+        semantic_index: Option<Arc<kaijutsu_index::SemanticIndex>>,
+        block_source: Arc<dyn kaijutsu_index::BlockSource>,
+    ) -> Result<EmbeddedKaish> {
+        self.materialize_context_kaish_inner(
+            name,
+            principal,
+            context_id,
+            session_id,
+            semantic_index,
+            block_source,
+            false,
+            true,
         )
         .await
     }
@@ -98,6 +127,7 @@ impl KjDispatcher {
         semantic_index: Option<Arc<kaijutsu_index::SemanticIndex>>,
         block_source: Arc<dyn kaijutsu_index::BlockSource>,
         privileged: bool,
+        read_only: bool,
     ) -> Result<EmbeddedKaish> {
         // Fresh, isolated session map: this kaish lives for one invocation and
         // tracks exactly one session→context mapping. No cross-invocation
@@ -126,17 +156,31 @@ impl KjDispatcher {
             }
         };
 
-        let kaish = EmbeddedKaish::with_identity(
-            name,
-            self.block_store().clone(),
-            self.kernel().clone(),
-            None,
-            principal,
-            context_id,
-            session_id,
-            session_contexts,
-            configure_tools,
-        )?;
+        let kaish = if read_only {
+            EmbeddedKaish::with_identity_read_only(
+                name,
+                self.block_store().clone(),
+                self.kernel().clone(),
+                None,
+                principal,
+                context_id,
+                session_id,
+                session_contexts,
+                configure_tools,
+            )?
+        } else {
+            EmbeddedKaish::with_identity(
+                name,
+                self.block_store().clone(),
+                self.kernel().clone(),
+                None,
+                principal,
+                context_id,
+                session_id,
+                session_contexts,
+                configure_tools,
+            )?
+        };
 
         // Seed the env half of the context's durable state.
         kaish.apply_context_config(self.kernel_db(), context_id).await;
@@ -251,5 +295,56 @@ mod tests {
             "[]",
             "transient scope must not leak between materialized instances",
         );
+    }
+
+    /// The model shell's synthesis fix: `KjDispatcher::block_source` surfaces a
+    /// context's real block snapshots (what `kj search`/synthesis consume),
+    /// where the rc/hook `NoopBlockSource` is deliberately blind. Also pins the
+    /// `semantic_index` install round-trip. Without this wiring the model's
+    /// `shell` / `read_only_shell` ran with degraded (empty) block search.
+    #[tokio::test]
+    async fn block_source_surfaces_real_blocks_where_noop_is_blind() {
+        use crate::kj::lifecycle::NoopBlockSource;
+        use kaijutsu_index::BlockSource as _;
+        use kaijutsu_types::{BlockKind, ContentType, DocKind, Role, Status};
+
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("synth"), None, principal);
+
+        // Seed one block into the context's document.
+        d.block_store()
+            .create_document(ctx, DocKind::Conversation, None)
+            .expect("create document");
+        d.block_store()
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::Model,
+                BlockKind::Text,
+                "hello synthesis",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .expect("insert block");
+
+        // The real source sees the block; NoopBlockSource (rc/hook path) does not.
+        let real = d.block_source().block_snapshots(ctx).expect("real snapshots");
+        assert!(
+            !real.is_empty(),
+            "block_source must surface the context's blocks (the synthesis fix)",
+        );
+        let noop = NoopBlockSource.block_snapshots(ctx).expect("noop snapshots");
+        assert!(
+            noop.is_empty(),
+            "NoopBlockSource is the degraded path — it surfaces nothing",
+        );
+
+        // The index install round-trips (server wires it at bootstrap; None
+        // when embeddings are off — the model shell then degrades gracefully).
+        assert!(d.semantic_index().is_none(), "no index installed by default");
+        d.set_semantic_index(None);
+        assert!(d.semantic_index().is_none());
     }
 }

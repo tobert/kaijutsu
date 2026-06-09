@@ -1268,6 +1268,11 @@ pub async fn create_shared_kernel(
     // lifecycle, kaish hook bodies) can construct KjBuiltin without
     // threading an Arc through every method.
     kj_dispatcher.set_self_arc();
+    // Install the semantic index so in-kernel shell materialization
+    // (the model's `shell` / `read_only_shell`) can pair it with a
+    // block-backed source — the index is built here (it needs the ONNX
+    // embedder) but consumed kernel-side. `None` when embeddings are off.
+    kj_dispatcher.set_semantic_index(semantic_index.clone());
     // Wire the dispatcher into the broker so HookBody::Kaish can
     // register `kj` as a tool inside hook kaish sessions.
     kernel_arc
@@ -5573,8 +5578,11 @@ async fn materialize_context_shell(
             conn.session_id,
         )
     };
-    let block_source: Arc<dyn kaijutsu_index::BlockSource> =
-        Arc::new(BlockStoreSource(kernel.documents.clone()));
+    // One materialization path for both shells: read the index + block source
+    // off the dispatcher (the server installs the index there at bootstrap via
+    // `set_semantic_index`), the same accessors the in-kernel model shell uses.
+    // `dispatcher.semantic_index()` mirrors `kernel.semantic_index` — installed
+    // from the same Arc — so the human and model shells can never drift apart.
     kernel
         .kj_dispatcher
         .materialize_context_kaish(
@@ -5582,8 +5590,8 @@ async fn materialize_context_shell(
             principal,
             context_id,
             session_id,
-            kernel.semantic_index.clone(),
-            block_source,
+            kernel.kj_dispatcher.semantic_index(),
+            kernel.kj_dispatcher.block_source(),
         )
         .await
         .map_err(|e| capnp::Error::failed(format!("kaish materialization failed: {}", e)))

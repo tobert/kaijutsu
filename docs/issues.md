@@ -77,29 +77,6 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 - **LLM streaming rewrite:** Move `process_llm_stream` onto `StreamingBlockHandle`.
 - **Block content abstraction:** Blocks as containers for multiple content artifacts.
 - **MCP `progress` → `StreamingBlockHandle` bridge.**
-- **`builtin.shell` synthesis index:** the new in-kernel `shell` broker tool
-  (`mcp/servers/shell.rs`, the model-facing projection of the `shell` facade)
-  materializes its kaish with `NoopBlockSource` + no semantic index (rc/hooks
-  parity), so `kj`'s synthesis/search tools are degraded inside it — context/
-  drift/fork and plain shell work. Wire the real `SemanticIndex` + a block-backed
-  `BlockSource` (the server path already has both) through to
-  `materialize_context_kaish` so the model's shell gets full `kj` search.
-- **Read-only `kaish` for `explorer` (`read_only_shell`):** `explorer` is the
-  only read-only role and so far gets *no* shell — `facade:shell` is an
-  unrestricted exec/write surface (external commands, redirection, and kaish
-  file builtins all bypass the per-tool `file:read` narrowing via `MountBackend`,
-  not the broker), so granting it would erase the read-only invariant. Add a
-  second facade-projected broker tool, `read_only_shell`, mirroring the
-  `builtin.shell` server (`mcp/servers/shell.rs`) but materializing kaish in a
-  genuinely read-only mode: read-only mounts (`LocalBackend::read_only`,
-  `mount_backend.rs`) **plus** external-command execution disabled — the config
-  the new standalone read-only-kaish MCP server already runs (it improved RO
-  considerably; reuse that recipe). Gate it on its own capability via the
-  `FACADE_PROJECTED_INSTANCES` pattern (`mcp/binding.rs`), e.g.
-  `facade:shell_readonly`, and grant it in
-  `assets/defaults/rc/explorer/create/S10-binding.kai`. Keep the constraint in
-  the tool *name* so the model doesn't waste turns attempting writes. A context
-  gets one shell or the other, never both.
 
 ## Domain-Specific (ABC Parser & Engraving, Index)
 

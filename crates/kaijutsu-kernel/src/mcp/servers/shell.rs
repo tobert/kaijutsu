@@ -28,8 +28,6 @@ use serde::Deserialize;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-use crate::kj::lifecycle::NoopBlockSource;
-
 use super::super::broker::Broker;
 use super::super::context::CallContext;
 use super::super::error::{McpError, McpResult};
@@ -53,11 +51,30 @@ const DESCRIPTION: &str = "Run a command in your current kernel context using \
     output. Returns combined stdout (stderr appended when present); a nonzero \
     exit code is reported as an error.";
 
-/// In-kernel broker server backing the `shell` tool. Holds `Weak<Broker>` (the
-/// broker owns this instance's `Arc`) and reaches the shared `KjDispatcher`
-/// through the broker, materializing a throwaway context kaish per call.
+const DESCRIPTION_READ_ONLY: &str = "Run a READ-ONLY command in your current \
+    kernel context using kaish (会sh). Same Bourne-like shell with guardrails \
+    (no word splitting, strict globs, `case ... esac`, pre-validation), but \
+    this shell cannot mutate anything: every file write/delete/move and every \
+    external command is refused. Use it to inspect — read files, `grep`, \
+    `find`, walk the tree, and read the CRDT document/input views under \
+    `/v/docs` and `/v/input`; `kj` is in scope for read-only context \
+    introspection. Returns combined stdout (stderr appended when present); a \
+    nonzero exit code is reported as an error.";
+
+/// In-kernel broker server backing the `shell` / `read_only_shell` tool. Holds
+/// `Weak<Broker>` (the broker owns this instance's `Arc`) and reaches the
+/// shared `KjDispatcher` through the broker, materializing a throwaway context
+/// kaish per call. One struct, two flavours selected at construction: the
+/// writable `shell` (`facade:shell`) and the read-only `read_only_shell`
+/// (`facade:shell_readonly`) the explorer gets. The constraint lives in the
+/// *tool name* so the model never wastes a turn attempting a write it can't do.
 pub struct ShellServer {
     instance_id: InstanceId,
+    /// The model-facing tool name (`shell` or `read_only_shell`).
+    tool: &'static str,
+    /// When true, materialize a read-only context kaish (no writes, no external
+    /// commands; reads — incl. CRDT views — still work).
+    read_only: bool,
     broker: Weak<Broker>,
     notif_tx: broadcast::Sender<ServerNotification>,
 }
@@ -65,13 +82,38 @@ pub struct ShellServer {
 impl ShellServer {
     pub const INSTANCE: &'static str = "builtin.shell";
     pub const TOOL: &'static str = "shell";
+    pub const INSTANCE_READ_ONLY: &'static str = "builtin.shell_readonly";
+    pub const TOOL_READ_ONLY: &'static str = "read_only_shell";
 
+    /// The writable `shell` tool (gated by `facade:shell`).
     pub fn new(broker: Weak<Broker>) -> Self {
         let (notif_tx, _) = broadcast::channel(16);
         Self {
             instance_id: InstanceId::new(Self::INSTANCE),
+            tool: Self::TOOL,
+            read_only: false,
             broker,
             notif_tx,
+        }
+    }
+
+    /// The read-only `read_only_shell` tool (gated by `facade:shell_readonly`).
+    pub fn new_read_only(broker: Weak<Broker>) -> Self {
+        let (notif_tx, _) = broadcast::channel(16);
+        Self {
+            instance_id: InstanceId::new(Self::INSTANCE_READ_ONLY),
+            tool: Self::TOOL_READ_ONLY,
+            read_only: true,
+            broker,
+            notif_tx,
+        }
+    }
+
+    fn description(&self) -> &'static str {
+        if self.read_only {
+            DESCRIPTION_READ_ONLY
+        } else {
+            DESCRIPTION
         }
     }
 
@@ -93,8 +135,8 @@ impl McpServerLike for ShellServer {
         let schema = schemars::schema_for!(ShellParams);
         Ok(vec![KernelTool {
             instance: self.instance_id.clone(),
-            name: Self::TOOL.to_string(),
-            description: Some(DESCRIPTION.to_string()),
+            name: self.tool.to_string(),
+            description: Some(self.description().to_string()),
             input_schema: serde_json::to_value(schema).map_err(McpError::InvalidParams)?,
         }])
     }
@@ -105,7 +147,7 @@ impl McpServerLike for ShellServer {
         ctx: &CallContext,
         _cancel: CancellationToken,
     ) -> McpResult<KernelToolResult> {
-        if params.tool != Self::TOOL {
+        if params.tool != self.tool {
             return Err(McpError::ToolNotFound {
                 instance: self.instance_id.clone(),
                 tool: params.tool,
@@ -129,17 +171,37 @@ impl McpServerLike for ShellServer {
                 reason: "kj dispatcher not wired (Broker::set_kj_dispatcher)".to_string(),
             })?;
 
-        let kaish = dispatcher
-            .materialize_context_kaish(
-                "model-shell",
-                ctx.principal_id,
-                ctx.context_id,
-                ctx.session_id,
-                None,
-                Arc::new(NoopBlockSource),
-            )
-            .await
-            .map_err(|e| McpError::Protocol(format!("materialize context shell: {e}")))?;
+        // Pair the kernel's semantic index with a block-backed source so the
+        // model's `kj search`/synthesis tools work inside the shell. Both come
+        // from the dispatcher (the server installs the index at bootstrap);
+        // when embeddings aren't configured the index is `None` and `kj` falls
+        // back to non-semantic search rather than failing.
+        let semantic_index = dispatcher.semantic_index();
+        let block_source = dispatcher.block_source();
+        let kaish = if self.read_only {
+            dispatcher
+                .materialize_context_kaish_read_only(
+                    "model-shell-ro",
+                    ctx.principal_id,
+                    ctx.context_id,
+                    ctx.session_id,
+                    semantic_index,
+                    block_source,
+                )
+                .await
+        } else {
+            dispatcher
+                .materialize_context_kaish(
+                    "model-shell",
+                    ctx.principal_id,
+                    ctx.context_id,
+                    ctx.session_id,
+                    semantic_index,
+                    block_source,
+                )
+                .await
+        }
+        .map_err(|e| McpError::Protocol(format!("materialize context shell: {e}")))?;
 
         let result = kaish
             .execute_with_options(&parsed.command, kaish_kernel::ExecuteOptions::default())
@@ -199,8 +261,10 @@ mod tests {
     use crate::mcp::{InstancePolicy, KernelCallParams};
     use kaijutsu_types::{PrincipalId, SessionId};
 
-    /// An `Arc<KjDispatcher>` wired into a fresh broker with the `ShellServer`
-    /// registered — the runtime shape (`set_self_arc` + `set_kj_dispatcher`).
+    /// An `Arc<KjDispatcher>` wired into a fresh broker with BOTH the writable
+    /// and read-only `ShellServer`s registered — the runtime shape
+    /// (`set_self_arc` + `set_kj_dispatcher`), so facade gating across the two
+    /// can be exercised together.
     async fn wired() -> (Arc<Broker>, Arc<crate::kj::KjDispatcher>) {
         let d = Arc::new(test_dispatcher().await);
         d.set_self_arc();
@@ -213,7 +277,22 @@ mod tests {
             )
             .await
             .unwrap();
+        broker
+            .register(
+                Arc::new(ShellServer::new_read_only(Arc::downgrade(&broker))),
+                InstancePolicy::default(),
+            )
+            .await
+            .unwrap();
         (broker, d)
+    }
+
+    fn call_ro(command: &str) -> KernelCallParams {
+        KernelCallParams {
+            instance: InstanceId::new(ShellServer::INSTANCE_READ_ONLY),
+            tool: ShellServer::TOOL_READ_ONLY.to_string(),
+            arguments: serde_json::json!({ "command": command }),
+        }
     }
 
     fn call(command: &str) -> KernelCallParams {
@@ -339,5 +418,85 @@ mod tests {
             serde_json::json!(3),
             "structured envelope carries the exit code"
         );
+    }
+
+    /// The explorer's loadout: `facade:shell_readonly` (and NOT `facade:shell`).
+    /// It must see exactly the `read_only_shell` tool and NOT the writable
+    /// `shell` — one shell or the other, never both, for a narrow role.
+    #[tokio::test]
+    async fn read_only_role_sees_only_the_read_only_shell() {
+        let (broker, d) = wired().await;
+        let principal = PrincipalId::new();
+        let ctx_id = register_context(&d, Some("ro"), None, principal);
+
+        let mut binding = ContextToolBinding::new();
+        binding.grant(Capability::Facade("shell_readonly".into()));
+        broker.set_binding(ctx_id, binding).await;
+
+        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
+        let visible = broker.list_visible_tools(ctx_id, &cc).await.unwrap();
+        assert!(
+            visible.iter().any(|(name, _)| name == "read_only_shell"),
+            "facade:shell_readonly must expose read_only_shell: {visible:?}"
+        );
+        assert!(
+            !visible.iter().any(|(name, _)| name == "shell"),
+            "facade:shell_readonly must NOT expose the writable shell: {visible:?}"
+        );
+    }
+
+    /// The mirror: a `facade:shell` (writable) role sees `shell` and NOT
+    /// `read_only_shell`. Together with the test above, this is the "one shell
+    /// or the other" invariant for the narrow roles.
+    #[tokio::test]
+    async fn writable_role_does_not_see_the_read_only_shell() {
+        let (broker, d) = wired().await;
+        let principal = PrincipalId::new();
+        let ctx_id = register_context(&d, Some("rw"), None, principal);
+
+        let mut binding = ContextToolBinding::new();
+        binding.grant(Capability::Facade("shell".into()));
+        broker.set_binding(ctx_id, binding).await;
+
+        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
+        let visible = broker.list_visible_tools(ctx_id, &cc).await.unwrap();
+        assert!(
+            visible.iter().any(|(name, _)| name == "shell"),
+            "facade:shell must expose the writable shell: {visible:?}"
+        );
+        assert!(
+            !visible.iter().any(|(name, _)| name == "read_only_shell"),
+            "facade:shell must NOT expose read_only_shell: {visible:?}"
+        );
+    }
+
+    /// End-to-end through `broker.call_tool`: `facade:shell_readonly` lets the
+    /// model run a *read* command and get its output. Refusal of writes /
+    /// external commands is enforced structurally and unit-tested at the
+    /// `MountBackend` / `ReadOnlyFs` layers; here we prove the gate opens for a
+    /// read and the command actually runs in the read-only materialization.
+    #[tokio::test]
+    async fn read_only_shell_runs_a_read_command() {
+        let (broker, d) = wired().await;
+        let principal = PrincipalId::new();
+        let ctx_id = register_context(&d, Some("roexec"), None, principal);
+
+        let mut binding = ContextToolBinding::new();
+        binding.grant(Capability::Facade("shell_readonly".into()));
+        broker.set_binding(ctx_id, binding).await;
+
+        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
+        let result = broker
+            .call_tool(call_ro("echo hello-ro"), &cc, CancellationToken::new())
+            .await
+            .expect("read_only_shell call should succeed");
+
+        assert!(!result.is_error, "echo should not be an error: {result:?}");
+        match result.content.first().expect("content") {
+            ToolContent::Text(s) => {
+                assert!(s.contains("hello-ro"), "stdout missing, got: {s:?}")
+            }
+            other => panic!("expected text content, got {other:?}"),
+        }
     }
 }

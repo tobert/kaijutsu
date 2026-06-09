@@ -46,6 +46,7 @@ use super::docs_filesystem::KaijutsuFilesystem;
 use super::input_filesystem::InputFilesystem;
 use super::kaish_backend::KaijutsuBackend;
 use super::mount_backend::MountBackend;
+use super::read_only_fs::ReadOnlyFs;
 use super::context_engine::{SessionContextExt, SessionContextMap};
 
 /// Embedded kaish executor backed by CRDT blocks.
@@ -98,6 +99,7 @@ impl EmbeddedKaish {
     ///
     /// The `configure_tools` callback receives the map and session ID so callers
     /// can register tools (like KjBuiltin) that need context awareness.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_identity(
         name: &str,
         blocks: SharedBlockStore,
@@ -106,7 +108,71 @@ impl EmbeddedKaish {
         principal_id: PrincipalId,
         context_id: ContextId,
         session_id: SessionId,
-                session_contexts: SessionContextMap,
+        session_contexts: SessionContextMap,
+        configure_tools: impl FnOnce(SessionContextMap, SessionId, &mut kaish_kernel::ToolRegistry),
+    ) -> Result<Self> {
+        Self::with_identity_mode(
+            name,
+            blocks,
+            kernel,
+            project_root,
+            principal_id,
+            context_id,
+            session_id,
+            session_contexts,
+            false,
+            configure_tools,
+        )
+    }
+
+    /// Like [`Self::with_identity`] but the materialized shell is **read-only**:
+    /// every filesystem mutation and every external command is refused by
+    /// construction, while reads — real files *and* the CRDT document views at
+    /// `/v/docs` / `/v/input` — still work. Backs the explorer's
+    /// `read_only_shell` (see `mcp/servers/shell.rs`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_identity_read_only(
+        name: &str,
+        blocks: SharedBlockStore,
+        kernel: Arc<KaijutsuKernel>,
+        project_root: Option<PathBuf>,
+        principal_id: PrincipalId,
+        context_id: ContextId,
+        session_id: SessionId,
+        session_contexts: SessionContextMap,
+        configure_tools: impl FnOnce(SessionContextMap, SessionId, &mut kaish_kernel::ToolRegistry),
+    ) -> Result<Self> {
+        Self::with_identity_mode(
+            name,
+            blocks,
+            kernel,
+            project_root,
+            principal_id,
+            context_id,
+            session_id,
+            session_contexts,
+            true,
+            configure_tools,
+        )
+    }
+
+    /// Shared builder for [`Self::with_identity`] /
+    /// [`Self::with_identity_read_only`]. When `read_only` is set, the
+    /// `MountBackend` refuses every mutation, the `/v/*` CRDT mounts are wrapped
+    /// read-only, and external command execution is disabled — three structural
+    /// levers, mirroring kaibo's read-only sandbox recipe (`sandbox.rs`) adapted
+    /// to kaijutsu's *shared*, CRDT-backed mount table.
+    #[allow(clippy::too_many_arguments)]
+    fn with_identity_mode(
+        name: &str,
+        blocks: SharedBlockStore,
+        kernel: Arc<KaijutsuKernel>,
+        project_root: Option<PathBuf>,
+        principal_id: PrincipalId,
+        context_id: ContextId,
+        session_id: SessionId,
+        session_contexts: SessionContextMap,
+        read_only: bool,
         configure_tools: impl FnOnce(SessionContextMap, SessionId, &mut kaish_kernel::ToolRegistry),
     ) -> Result<Self> {
         // Initialize session map entry if missing
@@ -131,11 +197,23 @@ impl EmbeddedKaish {
                     ));
         let mount_table = kernel.vfs().clone();
 
-        let mount_backend: Arc<dyn KernelBackend> = Arc::new(MountBackend::new(
-            mount_table,
-            docs_backend.clone(),
-            file_cache,
-        ));
+        // Read-only mode refuses every mutation at the MountBackend boundary
+        // (real files + the CRDT FileDocumentCache), regardless of whether the
+        // shared mount is writable. The `/v/*` CRDT mounts bypass MountBackend,
+        // so they're wrapped separately below.
+        let mount_backend: Arc<dyn KernelBackend> = if read_only {
+            Arc::new(MountBackend::new_read_only(
+                mount_table,
+                docs_backend.clone(),
+                file_cache,
+            ))
+        } else {
+            Arc::new(MountBackend::new(
+                mount_table,
+                docs_backend.clone(),
+                file_cache,
+            ))
+        };
 
         let docs_fs = Arc::new(KaijutsuFilesystem::new(docs_backend));
 
@@ -174,6 +252,29 @@ impl EmbeddedKaish {
         // `ExecuteOptions::with_timeout` for stricter per-context bounds.
         config.request_timeout = Some(kernel.timeouts().kaish_request_timeout);
 
+        // Read-only's third lever (belt-and-suspenders alongside the read-only
+        // MountBackend + read-only `/v/*` mounts): no external commands. So a
+        // read-only shell can't shell out to `rm`/`git commit`/etc. and write
+        // through a path the VFS doesn't gate.
+        if read_only {
+            config = config.with_allow_external_commands(false);
+        }
+
+        // The CRDT document views (`/v/docs`, `/v/input`) are mounted directly
+        // on the kaish VFS, bypassing MountBackend — so in read-only mode they
+        // get their own structural gate via `ReadOnlyFs` (reads delegate,
+        // writes refuse). Otherwise they mount writable.
+        let docs_mount: Arc<dyn kaish_kernel::vfs::Filesystem> = if read_only {
+            Arc::new(ReadOnlyFs::new(docs_fs))
+        } else {
+            docs_fs
+        };
+        let input_mount: Arc<dyn kaish_kernel::vfs::Filesystem> = if read_only {
+            Arc::new(ReadOnlyFs::new(input_fs))
+        } else {
+            input_fs
+        };
+
         let ctx_for_tools = session_contexts.clone();
         let sid_for_tools = session_id;
         let timeouts = kernel.timeouts().clone();
@@ -181,8 +282,8 @@ impl EmbeddedKaish {
             mount_backend,
             config,
             |vfs| {
-                vfs.mount_arc("/v/docs", docs_fs);
-                vfs.mount_arc("/v/input", input_fs);
+                vfs.mount_arc("/v/docs", docs_mount);
+                vfs.mount_arc("/v/input", input_mount);
             },
             |tools| {
                 configure_tools(ctx_for_tools, sid_for_tools, tools);

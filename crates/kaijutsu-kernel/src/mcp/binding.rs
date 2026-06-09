@@ -41,7 +41,7 @@ pub type ResolvedName = (InstanceId, String);
 /// whose tool roster is built from broker tools, not facades — gets a shell.
 /// The facade bit gates all three reach paths (human box, external MCP,
 /// in-kernel tool) so shell policy stays single-axis.
-pub const KNOWN_FACADES: &[&str] = &["shell", "edit_input", "submit_input"];
+pub const KNOWN_FACADES: &[&str] = &["shell", "shell_readonly", "edit_input", "submit_input"];
 
 /// The `kj` *authority* capabilities — bare-word grants that gate the
 /// escalation-relevant `kj` verbs which never reach the broker `call_tool` path
@@ -70,7 +70,16 @@ pub const KNOWN_AUTHORITIES: &[&str] = &["drive", "fork", "drift", "transport", 
 /// (e.g. `director`, `composer`) silently loses the model's shell. So the
 /// binding treats a projected instance as allowed exactly when its backing
 /// facade is allowed. One bit — `facade:shell` — governs both surfaces.
-pub const FACADE_PROJECTED_INSTANCES: &[(&str, &str)] = &[("builtin.shell", "shell")];
+/// `shell_readonly` is the read-only twin: it projects `builtin.shell_readonly`
+/// (the `read_only_shell` tool) for roles that must not write or shell out (the
+/// `explorer`). A read-only role grants `facade:shell_readonly` and never
+/// `facade:shell`, so it sees one shell, not both. Broad `facade:*` roles match
+/// both projections and see both tools — a harmless strict subset, accepted to
+/// keep the gate single-axis.
+pub const FACADE_PROJECTED_INSTANCES: &[(&str, &str)] = &[
+    ("builtin.shell", "shell"),
+    ("builtin.shell_readonly", "shell_readonly"),
+];
 
 /// A single capability grant or query. The allow-set is the positive surface a
 /// context may use. `Instance`/`Tool`/`Facade` are the granular grants;

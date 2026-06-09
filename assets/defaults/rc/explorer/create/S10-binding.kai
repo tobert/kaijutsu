@@ -1,4 +1,9 @@
 # explorer: read-only allow-set (capability narrowing).
+# The read-only shell: reads (files + CRDT /v views), grep, find — no writes,
+# no external commands. `facade:shell_readonly` projects the `read_only_shell`
+# broker tool into the model's roster. The explorer never grants `facade:shell`
+# (the writable shell), so it gets exactly one shell, the read-only one.
+kj binding allow "facade:shell_readonly"
 kj binding allow "builtin.file:read"
 kj binding allow "builtin.file:glob"
 kj binding allow "builtin.file:grep"

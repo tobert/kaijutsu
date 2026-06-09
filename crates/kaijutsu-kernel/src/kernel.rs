@@ -569,6 +569,21 @@ impl Kernel {
             .register_silently(shell_server, InstancePolicy::for_kernel(self))
             .await?;
 
+        // builtin.shell_readonly — the read-only twin (`read_only_shell` tool)
+        // for roles that must not write or shell out (the `explorer`). Same
+        // facade-projection mechanism (FACADE_PROJECTED_INSTANCES), gated by
+        // `facade:shell_readonly`. The constraint rides in the tool *name* so
+        // the model never attempts a write it can't perform. A read-only role
+        // never grants `facade:shell`, so it gets this shell or the writable
+        // one, not both (broad `*`/`facade:*` roles may see both — a harmless
+        // strict subset).
+        let read_only_shell_server = Arc::new(
+            crate::mcp::servers::ShellServer::new_read_only(Arc::downgrade(&self.broker)),
+        );
+        self.broker
+            .register_silently(read_only_shell_server, InstancePolicy::for_kernel(self))
+            .await?;
+
         Ok(())
     }
 

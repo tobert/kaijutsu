@@ -49,10 +49,18 @@ pub struct MountBackend {
     file_cache: Arc<FileDocumentCache>,
     /// CRDT backend for document tool dispatch.
     docs_tools: Arc<KaijutsuBackend>,
+    /// When true, every mutating op is refused structurally with
+    /// `PermissionDenied` *before* it can reach the shared mount table or CRDT
+    /// cache — the read-only invariant for the explorer's `read_only_shell`.
+    /// Reads (real files and CRDT documents) still pass through. This gates the
+    /// real-FS + `FileDocumentCache` surface; the kaish-VFS `/v/docs` and
+    /// `/v/input` mounts are gated separately by wrapping them in
+    /// [`super::read_only_fs::ReadOnlyFs`] (they don't route through here).
+    read_only: bool,
 }
 
 impl MountBackend {
-    /// Create a new MountBackend.
+    /// Create a new writable MountBackend.
     pub fn new(
         mount_table: Arc<MountTable>,
         docs_tools: Arc<KaijutsuBackend>,
@@ -62,7 +70,39 @@ impl MountBackend {
             mount_table,
             file_cache,
             docs_tools,
+            read_only: false,
         }
+    }
+
+    /// Create a read-only MountBackend: reads pass through, every mutation is
+    /// refused at this boundary regardless of whether the underlying mount is
+    /// writable. Used to materialize the explorer's `read_only_shell` over the
+    /// *shared* mount table without exposing a write path.
+    pub fn new_read_only(
+        mount_table: Arc<MountTable>,
+        docs_tools: Arc<KaijutsuBackend>,
+        file_cache: Arc<FileDocumentCache>,
+    ) -> Self {
+        Self {
+            mount_table,
+            file_cache,
+            docs_tools,
+            read_only: true,
+        }
+    }
+
+    /// The single read-only gate every mutating op consults. Returns
+    /// `Err(PermissionDenied)` when this backend is read-only, `Ok(())`
+    /// otherwise — so the op refuses by construction rather than relying on the
+    /// underlying mount's own (possibly writable) policy.
+    fn deny_if_read_only(&self, op: &str, path: &Path) -> BackendResult<()> {
+        if self.read_only {
+            return Err(BackendError::PermissionDenied(format!(
+                "{op} {}: read-only shell (no writes)",
+                path.display()
+            )));
+        }
+        Ok(())
     }
 
     /// Canonicalize an (already absolute) backend path into the cache key form,
@@ -244,6 +284,7 @@ impl KernelBackend for MountBackend {
     }
 
     async fn write(&self, path: &Path, content: &[u8], mode: WriteMode) -> BackendResult<()> {
+        self.deny_if_read_only("write", path)?;
         // Read-only / OS mounts never touch the cache: let the VFS reject the
         // write cleanly rather than poison the cache with an un-flushable edit.
         if !self.mount_table.is_writable(path).await {
@@ -299,6 +340,7 @@ impl KernelBackend for MountBackend {
     }
 
     async fn append(&self, path: &Path, content: &[u8]) -> BackendResult<()> {
+        self.deny_if_read_only("append", path)?;
         if !self.mount_table.is_writable(path).await {
             return self.raw_append(path, content).await;
         }
@@ -328,6 +370,7 @@ impl KernelBackend for MountBackend {
     }
 
     async fn patch(&self, path: &Path, ops: &[PatchOp]) -> BackendResult<()> {
+        self.deny_if_read_only("patch", path)?;
         // Writable mounts apply through the CRDT cache (source of truth);
         // read-only/OS paths read+write straight through the VFS (which rejects
         // the write cleanly).
@@ -518,6 +561,7 @@ impl KernelBackend for MountBackend {
     }
 
     async fn mkdir(&self, path: &Path) -> BackendResult<()> {
+        self.deny_if_read_only("mkdir", path)?;
         self.mount_table
             .mkdir(path, 0o755)
             .await
@@ -526,6 +570,7 @@ impl KernelBackend for MountBackend {
     }
 
     async fn set_mtime(&self, path: &Path, mtime: std::time::SystemTime) -> BackendResult<()> {
+        self.deny_if_read_only("touch", path)?;
         // `touch` on an existing file routes through the VFS — never escape to
         // the host via a real-path. A read-only mount's `setattr` rejects
         // cleanly (the VFS error maps to a BackendError), satisfying the
@@ -545,6 +590,7 @@ impl KernelBackend for MountBackend {
     }
 
     async fn remove(&self, path: &Path, recursive: bool) -> BackendResult<()> {
+        self.deny_if_read_only("remove", path)?;
         if recursive {
             // Walk and remove children first
             self.remove_recursive(path).await
@@ -567,6 +613,7 @@ impl KernelBackend for MountBackend {
     }
 
     async fn rename(&self, from: &Path, to: &Path) -> BackendResult<()> {
+        self.deny_if_read_only("rename", from)?;
         self.mount_table
             .rename(from, to)
             .await
@@ -581,6 +628,7 @@ impl KernelBackend for MountBackend {
     }
 
     async fn symlink(&self, target: &Path, link: &Path) -> BackendResult<()> {
+        self.deny_if_read_only("symlink", link)?;
         self.mount_table
             .symlink(link, target)
             .await
@@ -614,7 +662,7 @@ impl KernelBackend for MountBackend {
     // =========================================================================
 
     fn read_only(&self) -> bool {
-        false
+        self.read_only
     }
 
     fn backend_type(&self) -> &str {
@@ -896,6 +944,66 @@ mod tests {
         assert_eq!(backend.read(&file, None).await.unwrap(), b"on-disk");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `new_read_only` is the structural read-only *mode* (for the explorer's
+    /// `read_only_shell`): it refuses every mutation regardless of whether the
+    /// underlying mount is writable, while reads — including CRDT-backed text —
+    /// still pass through. This is the gate that lets the explorer inspect a
+    /// live, *writable* project tree without a write path. Distinct from
+    /// `readonly_mount_passes_through_and_does_not_poison`, which exercises a
+    /// per-mount read-only *backend* under a writable MountBackend.
+    #[tokio::test]
+    async fn read_only_mode_refuses_writes_over_a_writable_mount() {
+        let blocks = shared_block_store(PrincipalId::system());
+        let kernel = Arc::new(KaijutsuKernel::new_ephemeral("test-ro-mode").await);
+        let sid = kaijutsu_types::SessionId::new();
+        let session_contexts = crate::runtime::context_engine::session_context_map();
+        session_contexts.insert(sid, kaijutsu_types::ContextId::new());
+
+        // A genuinely writable mount — the read-only behaviour must come from
+        // the backend mode, NOT from the mount being read-only.
+        let mount_table = Arc::new(MountTable::new());
+        mount_table.mount("/tmp", MemoryBackend::new()).await;
+        let file_cache = Arc::new(FileDocumentCache::new(blocks.clone(), mount_table.clone()));
+        let docs = Arc::new(KaijutsuBackend::new(
+            blocks,
+            kernel,
+            PrincipalId::system(),
+            session_contexts,
+            sid,
+        ));
+
+        // Seed a file through a writable backend sharing the same cache/mount.
+        let writable = MountBackend::new(mount_table.clone(), docs.clone(), file_cache.clone());
+        writable
+            .write(Path::new("/tmp/seed.txt"), b"seeded", WriteMode::Overwrite)
+            .await
+            .unwrap();
+
+        // Now the read-only backend over the SAME (writable) mount table.
+        let ro = MountBackend::new_read_only(mount_table, docs, file_cache);
+        assert!(ro.read_only(), "read_only() must report the mode");
+
+        // Reads pass through (CRDT-backed text included).
+        assert_eq!(ro.read(Path::new("/tmp/seed.txt"), None).await.unwrap(), b"seeded");
+        assert!(ro.list(Path::new("/tmp")).await.is_ok(), "listing is a read");
+
+        // Every mutation is refused with PermissionDenied — by construction,
+        // before reaching the (writable) mount.
+        let w = ro.write(Path::new("/tmp/new.txt"), b"x", WriteMode::Overwrite).await;
+        assert!(matches!(w, Err(BackendError::PermissionDenied(_))), "write: {w:?}");
+        let a = ro.append(Path::new("/tmp/seed.txt"), b"x").await;
+        assert!(matches!(a, Err(BackendError::PermissionDenied(_))), "append: {a:?}");
+        let m = ro.mkdir(Path::new("/tmp/d")).await;
+        assert!(matches!(m, Err(BackendError::PermissionDenied(_))), "mkdir: {m:?}");
+        let r = ro.remove(Path::new("/tmp/seed.txt"), false).await;
+        assert!(matches!(r, Err(BackendError::PermissionDenied(_))), "remove: {r:?}");
+        let mv = ro.rename(Path::new("/tmp/seed.txt"), Path::new("/tmp/moved.txt")).await;
+        assert!(matches!(mv, Err(BackendError::PermissionDenied(_))), "rename: {mv:?}");
+
+        // The refused mutations changed nothing.
+        assert_eq!(ro.read(Path::new("/tmp/seed.txt"), None).await.unwrap(), b"seeded");
     }
 
     #[tokio::test]

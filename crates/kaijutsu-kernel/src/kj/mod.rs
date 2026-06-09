@@ -241,6 +241,13 @@ pub struct KjDispatcher {
     /// call site to thread an Arc through. Set via `set_self_arc` after
     /// `Arc::new(KjDispatcher::new(...))`.
     weak_self: parking_lot::RwLock<Option<std::sync::Weak<KjDispatcher>>>,
+    /// The kernel's semantic index, installed by the server at bootstrap via
+    /// [`Self::set_semantic_index`] (the index needs an ONNX embedder built in
+    /// the server crate, so the kernel can't construct it itself). `None` when
+    /// embeddings aren't configured. In-kernel shell materialization
+    /// ([`crate::mcp::servers::ShellServer`]) reads it so the model's `kj`
+    /// search/synthesis tools work — without it the model shell is degraded.
+    semantic_index: parking_lot::RwLock<Option<Arc<kaijutsu_index::SemanticIndex>>>,
 }
 
 impl KjDispatcher {
@@ -261,6 +268,7 @@ impl KjDispatcher {
             kernel_id,
             kernel,
             weak_self: parking_lot::RwLock::new(None),
+            semantic_index: parking_lot::RwLock::new(None),
         }
     }
 
@@ -268,6 +276,29 @@ impl KjDispatcher {
     /// (which needs `Arc<KjDispatcher>`). Call once after `Arc::new`.
     pub fn set_self_arc(self: &Arc<Self>) {
         *self.weak_self.write() = Some(Arc::downgrade(self));
+    }
+
+    /// Install the kernel's semantic index (built in the server crate, which
+    /// owns the ONNX embedder). Call once at bootstrap after `Arc::new`, like
+    /// [`Self::set_self_arc`]. Pass `None` when embeddings aren't configured —
+    /// the model shell then degrades to non-semantic `kj` search rather than
+    /// failing.
+    pub fn set_semantic_index(&self, index: Option<Arc<kaijutsu_index::SemanticIndex>>) {
+        *self.semantic_index.write() = index;
+    }
+
+    /// The installed semantic index, if any. Read by in-kernel shell
+    /// materialization so the model's `kj search`/synthesis tools work.
+    pub fn semantic_index(&self) -> Option<Arc<kaijutsu_index::SemanticIndex>> {
+        self.semantic_index.read().clone()
+    }
+
+    /// A real `BlockSource` over this dispatcher's block store — hands the
+    /// synthesis tools a context's block snapshots (DB-hydrating on a miss).
+    /// The model shell pairs this with [`Self::semantic_index`]; rc/hook paths
+    /// deliberately pass a `NoopBlockSource` instead.
+    pub fn block_source(&self) -> Arc<dyn kaijutsu_index::BlockSource> {
+        Arc::new(crate::kj::lifecycle::BlockStoreSource(self.blocks.clone()))
     }
 
     /// Upgrade the stored `Weak<Self>` to `Arc<Self>`. Returns `None`

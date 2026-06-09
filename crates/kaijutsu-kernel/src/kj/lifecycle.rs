@@ -553,6 +553,32 @@ impl kaijutsu_index::BlockSource for NoopBlockSource {
     }
 }
 
+/// Real `BlockSource` over the kernel's `SharedBlockStore`: hands `kj`'s
+/// synthesis/search tools the context's block snapshots, hydrating from the DB
+/// on an in-memory miss. This is what the model's `shell` / `read_only_shell`
+/// materialize with (via [`crate::kj::KjDispatcher::block_source`]), so the
+/// model gets full `kj search`/synthesis. rc and hook control-plane scripts
+/// keep [`NoopBlockSource`] — they don't search.
+///
+/// Mirrors the server's `BlockStoreSource` (rpc.rs), kept kernel-local so the
+/// in-kernel shell path doesn't reach across crates for a 10-line adapter; both
+/// wrap the same `SharedBlockStore` API.
+pub(crate) struct BlockStoreSource(pub(crate) crate::block_store::SharedBlockStore);
+
+impl kaijutsu_index::BlockSource for BlockStoreSource {
+    fn block_snapshots(
+        &self,
+        ctx: kaijutsu_types::ContextId,
+    ) -> Result<Vec<kaijutsu_types::BlockSnapshot>, String> {
+        use crate::block_store::BlockStore;
+        // In-memory first; hydrate from the DB on demand for a cold context.
+        if !self.0.contains(ctx) {
+            let _ = self.0.load_one_from_db(ctx);
+        }
+        BlockStore::block_snapshots(&self.0, ctx).map_err(|e| e.to_string())
+    }
+}
+
 fn log_unwired_verb_once(verb: &str) {
     // All four verbs (create / fork / drift / attach) are now wired.
     // Reserved-verb logging stays as a no-op for now so a future
