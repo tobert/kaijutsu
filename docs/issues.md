@@ -8,9 +8,9 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ## Architecture & System Design
 
-- **VFS Multiplexing:** `Kernel` implements `VfsOps` directly (`crates/kaijutsu-kernel/src/kernel.rs:870`). As the VFS grows to support multiple mount backends (local, memory, remote), this might become a bottleneck or overly complex. Consider extracting to a dedicated `VfsManager` or `VfsRouter`.
-- **Server RPC Modularization:** `crates/kaijutsu-server/src/rpc.rs` is a massive file (~292KB). The monolithic implementation of the Cap'n Proto traits should be split into smaller modules by domain (e.g., `rpc/vfs.rs`, `rpc/llm.rs`, `rpc/mcp.rs`).
-- **Cap'n Proto Schema Clarity:** There is slight conceptual overlap between `BlockKind` and `ContentType` in `kaijutsu.capnp`. Consider documenting the strict boundaries (e.g., `BlockKind` is the structural DAG role, `ContentType` is the raw MIME rendering hint).
+- **VFS facade delegation:** `Kernel` implements `VfsOps` directly (`crates/kaijutsu-kernel/src/kernel.rs:984`) as a facade. Backend multiplexing already exists — `MountTable` impls `VfsOps` over `MemoryBackend`/`LocalBackend` (`crates/kaijutsu-kernel/src/vfs/mount.rs:261`). The open question is whether the `Kernel`-level facade should delegate more to `MountTable` (and what stays on `Kernel`), not whether to build a manager from scratch.
+- **Server RPC Modularization:** `crates/kaijutsu-server/src/rpc.rs` is a massive file (~301KB / ~7,000 lines — by far the largest in the server). The monolithic implementation of the Cap'n Proto traits should be split into smaller modules by domain (e.g., `rpc/vfs.rs`, `rpc/llm.rs`, `rpc/mcp.rs`).
+- **Cap'n Proto Schema Clarity (doc-only):** The `BlockKind` vs `ContentType` boundary is already settled — `BlockKind` is the structural DAG role, `ContentType` is the raw MIME rendering hint. Remaining work is purely to write that distinction into `kaijutsu.capnp` as schema comments so it stops reading as overlap.
 - **Context-type tool policy (unified governance):** The `kj` surface is now
   capability-gated — escalation-relevant verbs check the caller's loadout via
   `KjDispatcher::require_cap` (five authority caps: `drive`/`fork`/`drift`/
@@ -38,9 +38,9 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ## Persistence & Sync
 
-- **`KernelDb` connection pool:** Currently `Arc<parking_lot::Mutex<KernelDb>>` in `block_store.rs:69`. This bottleneck prevents utilizing SQLite's WAL mode for concurrent readers. Migrate to `r2d2` or `sqlx` to allow non-blocking reads during LLM streams and heavy writes.
+- **`KernelDb` connection pool:** Currently `Arc<parking_lot::Mutex<KernelDb>>` (`block_store.rs:74`). This bottleneck prevents utilizing SQLite's WAL mode for concurrent readers. Migrate to `r2d2` or `sqlx` to allow non-blocking reads during LLM streams and heavy writes. Note: SQLite serializes *writes* regardless of pooling, so the win is concurrent reads (and only with WAL enabled) — verify WAL before assuming a pool helps; narrowing lock scope may matter as much.
 - **Config CRDT ops:** Config backend needs DTE integration so changes replicate across peers.
-- **CRDT `order_index` BTreeMap:** `blocks_ordered()` is O(N log N). Works correctly but scales poorly; add a secondary sorted index when scale demands.
+- **`blocks_ordered()` allocation churn + sort:** `block_store.rs:185-188` calls `order_key().to_string()` for *every block*, then `sort_by` on the strings — so it's O(N log N) **plus a String allocation per block per call**. It runs on per-frame hot paths (`kaijutsu-app/src/ui/card_stack/sync.rs:48`, `view/components.rs:163`), so the allocation churn is likely the bigger cost than the asymptotics. Fixes: compare `order_key` without stringifying, and/or cache the ordering and invalidate on block change. Add a secondary sorted index when scale demands.
 - **CBOR backward-compat fixture test:** the postcard→versioned-CBOR migration shipped (`kaijutsu_types::codec`, commit fd0b881) — oplog/snapshot persistence is now self-describing with a 1-byte format version, so adding a `#[serde(default)]` field no longer corrupts old blobs. Remaining: a frozen fixture test that decodes an *older-shape* `BlockSnapshot` CBOR blob (fewer fields) and asserts it loads with defaults — the CI regression net guarding the additive-evolution promise. The codec already has unit tests (round-trip, unknown-format → loud `CodecError::UnknownFormat`, empty); this is the missing forward-compat fixture. See auto-memory `tech_debt_binary_serialization_oplog`.
 - **Latch state should persist with the context:** 
   - `set -o latch` mode is per-shell and lost on restart.
@@ -49,7 +49,7 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 ## User Interface (kaijutsu-app) & UX
 
 - **User presence (novel surface):** The compose input is a shared CRDT document. Surfacing in-flight compose state to an opted-in model would enable mid-sentence collaboration. Gate with explicit user opt-in.
-- **Connection Polling Efficiency:** `ActorPlugin` in `crates/kaijutsu-app/src/connection/actor_plugin.rs` polls broadcast channels every frame. While `UpdateMode::reactive` helps, consider event-driven wakeups or bridging async streams directly into Bevy events more efficiently if latency/power becomes an issue.
+- **Connection Polling Efficiency:** `ActorPlugin` in `crates/kaijutsu-app/src/connection/mod.rs` polls broadcast channels every frame. While `UpdateMode::reactive` helps, consider event-driven wakeups or bridging async streams directly into Bevy events more efficiently if latency/power becomes an issue.
 - **Card-stack view:** Card size tuning, read-only scroll on focused card, dive-in (Enter), mouse click to focus, momentum scrolling, camera parallax, streaming card texture updates, card grouping evolution, ambient environment.
 - **Text rendering (MSDF / 次):** TAA temporal super-resolution, glyph spacing per-font tuning, 1-frame blank flash on texture resize, large-context Vello "paint too large" crash.
 

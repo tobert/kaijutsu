@@ -7,5 +7,6 @@ screenshot*.png
 .chainlink/
 .gemini/
 scratch/
+tmp/
 node_modules/
 .hrlauncher.toml
