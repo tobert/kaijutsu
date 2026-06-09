@@ -1,21 +1,16 @@
 # 会術 Kaijutsu
 
-Kaijutsu is a cybernetic AI agent system with a graphical UI that manages contexts in a
-directed acyclic graph (DAG). The DAG supports `fork` and `drift` operations that simplify
-breaking down work as a context develops, and then merging the results, while keeping
-provenance intact.
+Kaijutsu is an AI agent system built around context forking and drifting, with some
+experimental features for agentic music production. The core is the kaijutsu kernel,
+which offers CRDT-based editing primitives to help users and multiple agents work
+in parallel over unreliable networks. To make authentication simple and secure, kaijutsu
+uses an embedded SSH server and ssh keys exclusively to identify users. 
 
-## Features
-
-- Cybernetics-focused design for users and models, aiming to make the flow between
-system components as smooth as possible rather than minimizing or trying to eliminate it.
-- *Multi-Context Multi-Model Drifting*: a context can be forked to explore
-an idea then a summary drifted back to the parent.
-- Conflict-Free Replicated Data Types (CRDT) via [dte](https://github.com/tobert/diamond-types-extended)
-allows safe concurrent edits across workspaces, network interruptions, and *multiple users*.
-- Transport is SSH with ssh key authentication. Works with ssh-agent.
-- Binary Cap'n Proto protocol over SSH
-- User interface built on Bevy and Vello for high performance and beautiful vectors.
+The kaijutsu kernel maintains a DAG (directed acyclic graph) of contexts. Contexts can be forked
+with different models, content redacted/repaired, and other changes that usually mean breaking
+KV caches. Content can be sent across contexts with 'drifting'. Drifts are blocks of content
+that a user or agent can send from one context to another, with the relationship tracked by
+kaijutsu. This can be inspected and visualized in the app or over MCP.
 
 ## Status
 
