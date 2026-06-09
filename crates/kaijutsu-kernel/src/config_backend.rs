@@ -289,10 +289,53 @@ impl ConfigCrdtBackend {
     pub async fn ensure_config(&self, path: &str) -> Result<ConfigSource, ConfigError> {
         let ctx = self.context_id(path);
 
-        // Check if already loaded in CRDT
+        // Check if already loaded in CRDT. Bare existence is not enough: a
+        // halted oplog replay (e.g. postcard schema drift corrupting the
+        // persisted entries) can leave the document registered but *blockless*.
+        // An empty config doc would silently shadow the on-disk file, so we
+        // only trust it when a content block is actually present; otherwise we
+        // fall through and re-seed from disk/default.
         if self.blocks.contains(ctx) {
-            tracing::debug!(path = %path, "config already loaded");
-            return Ok(ConfigSource::Crdt);
+            if self.first_block_id(ctx).is_some() {
+                tracing::debug!(path = %path, "config already loaded");
+                return Ok(ConfigSource::Crdt);
+            }
+            tracing::warn!(
+                path = %path,
+                "config document exists but has no content block (corrupt/halted replay?); re-seeding"
+            );
+            let disk_path = self.config_root.join(path);
+            if disk_path.exists() {
+                self.reload_from_disk(path).await?;
+                return Ok(ConfigSource::Disk);
+            }
+            // No disk file to recover from: seed the embedded default into the
+            // existing (empty) document so the block is present.
+            let content = self
+                .get_default_content(path)
+                .ok_or_else(|| ConfigError::NotFound(path.to_string()))?;
+            if let Some(parent) = disk_path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            tokio::fs::write(&disk_path, &content).await?;
+            self.blocks
+                .insert_block(
+                    ctx,
+                    None,
+                    None,
+                    Role::System,
+                    BlockKind::Text,
+                    &content,
+                    Status::Done,
+                    ContentType::Plain,
+                )
+                .map_err(|e| ConfigError::Crdt(e.to_string()))?;
+            self.emit(ConfigFlow::Loaded {
+                path: path.to_string(),
+                source: ConfigSource::Default,
+                content,
+            });
+            return Ok(ConfigSource::Default);
         }
 
         // Try to load from disk
@@ -793,6 +836,53 @@ mod tests {
 
         // File should exist on disk
         assert!(temp_dir.path().join("theme.toml").exists());
+    }
+
+    /// Regression: a halted oplog replay can leave a config document
+    /// *registered but blockless* (the document context exists, but the
+    /// content block never merged). `ensure_config` must not treat bare
+    /// existence as "loaded" — it has to notice the missing content block and
+    /// re-seed from disk, otherwise the empty doc shadows the on-disk file and
+    /// consumers (e.g. the LLM registry init) read nothing.
+    ///
+    /// This reproduces the "No LLM providers configured" outage: corrupted
+    /// models.toml/theme.toml oplog → empty config doc → registry never
+    /// populated.
+    #[tokio::test]
+    async fn test_ensure_config_recovers_blockless_document() {
+        let blocks = shared_block_store(PrincipalId::system());
+        let temp_dir = TempDir::new().unwrap();
+        let backend = ConfigCrdtBackend::new(blocks.clone(), temp_dir.path().to_path_buf());
+
+        // A real config file exists on disk (the source of truth).
+        let disk_path = temp_dir.path().join("theme.toml");
+        std::fs::write(&disk_path, "bg = \"#abcdef\"\n").unwrap();
+
+        // Simulate a halted replay: the document context exists but carries
+        // no content block (replay broke before the insert op merged).
+        let ctx = config_context_id("theme.toml");
+        blocks
+            .create_document(ctx, DocKind::Config, None)
+            .expect("create empty config document");
+        assert!(blocks.contains(ctx), "document should exist");
+        assert!(
+            backend.first_block_id(ctx).is_none(),
+            "document should be blockless to start"
+        );
+
+        // ensure_config must recover, not short-circuit on bare existence.
+        backend
+            .ensure_config("theme.toml")
+            .await
+            .expect("ensure_config should recover a blockless document");
+
+        let content = backend
+            .get_content("theme.toml")
+            .expect("content must be readable after recovery");
+        assert!(
+            content.contains("#abcdef"),
+            "recovered content should come from disk, got: {content:?}"
+        );
     }
 
     #[tokio::test]

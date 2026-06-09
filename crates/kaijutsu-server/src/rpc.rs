@@ -699,7 +699,10 @@ async fn initialize_kernel_models(
     let content = match config_backend.get_content("models.toml") {
         Ok(c) => c,
         Err(e) => {
-            log::warn!("Failed to read models.toml: {}", e);
+            // ensure_config above re-seeds a blockless/corrupt config doc from
+            // disk, so a read failure here means the recovery itself failed —
+            // a genuinely degraded kernel (no models) rather than routine churn.
+            log::error!("Failed to read models.toml after ensure_config: {}", e);
             return None;
         }
     };
