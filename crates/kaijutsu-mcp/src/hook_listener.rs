@@ -445,7 +445,7 @@ async fn push_ops(remote: &RemoteState) -> anyhow::Result<()> {
     }
 
     let ops_bytes =
-        postcard::to_allocvec(&ops).map_err(|e| anyhow::anyhow!("Serialize error: {e}"))?;
+        kaijutsu_types::codec::encode(&ops).map_err(|e| anyhow::anyhow!("Serialize error: {e}"))?;
 
     remote
         .actor

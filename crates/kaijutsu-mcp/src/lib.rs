@@ -497,7 +497,7 @@ impl KaijutsuMcp {
         }
 
         let ops_bytes =
-            postcard::to_allocvec(&ops).map_err(|e| anyhow::anyhow!("Serialize error: {}", e))?;
+            kaijutsu_types::codec::encode(&ops).map_err(|e| anyhow::anyhow!("Serialize error: {}", e))?;
 
         tracing::debug!(
             ctx = %joined.context_id,
@@ -2166,7 +2166,7 @@ mod tests {
     // apply_server_event tests — exercises the store-based sync path
     //
     // Uses kernel BlockStore as both "server" and "client" to generate proper
-    // SyncPayload (postcard-serialized) ops, matching the real sync protocol.
+    // SyncPayload (CBOR-serialized) ops, matching the real sync protocol.
     // =========================================================================
 
     use kaijutsu_crdt::{BlockId, BlockKind, BlockSnapshot, ContentType, ContextId, PrincipalId, Role, Status};
@@ -2224,14 +2224,14 @@ mod tests {
         (client, sync, server, context_id)
     }
 
-    /// Helper: get SyncPayload from server as postcard bytes.
+    /// Helper: get SyncPayload from server as CBOR bytes.
     fn server_ops_bytes(
         server: &SharedBlockStore,
         ctx_id: ContextId,
         frontier: &HashMap<BlockId, kaijutsu_crdt::Frontier>,
     ) -> Vec<u8> {
         let payload = server.ops_since(ctx_id, frontier).expect("ops_since");
-        postcard::to_allocvec(&payload).expect("serialize SyncPayload")
+        kaijutsu_types::codec::encode(&payload).expect("serialize SyncPayload")
     }
 
     #[test]
@@ -2833,7 +2833,7 @@ mod tests {
         // Resync: feed the server's full snapshot through apply_initial_state,
         // the same bytes get_context_sync ships and resync_store applies.
         let snapshot_bytes =
-            postcard::to_allocvec(&server.get(ctx_id).unwrap().doc.snapshot()).unwrap();
+            kaijutsu_types::codec::encode(&server.get(ctx_id).unwrap().doc.snapshot()).unwrap();
         {
             let mut guard = sync.lock().unwrap();
             let mut entry = store.get_mut(ctx_id).unwrap();

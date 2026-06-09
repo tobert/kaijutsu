@@ -41,7 +41,6 @@ rect_packer = "0.2"
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
-postcard = { workspace = true, features = ["alloc"] }
 
 # Tracing
 tracing = { workspace = true }

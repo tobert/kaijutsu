@@ -102,10 +102,10 @@ mod tests {
     }
 
     #[test]
-    fn test_principal_postcard_roundtrip() {
+    fn test_principal_cbor_roundtrip() {
         let p = Principal::new("amy", "Amy Tobey");
-        let bytes = postcard::to_stdvec(&p).unwrap();
-        let parsed: Principal = postcard::from_bytes(&bytes).unwrap();
+        let bytes = crate::codec::encode(&p).unwrap();
+        let parsed: Principal = crate::codec::decode(&bytes).unwrap();
         assert_eq!(p, parsed);
     }
 

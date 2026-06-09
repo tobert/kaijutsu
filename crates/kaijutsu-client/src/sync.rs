@@ -8,8 +8,8 @@
 //!
 //! The server uses `BlockStore` (per-block DTE instances). Sync payloads are:
 //!
-//! - **Initial state**: `StoreSnapshot` (postcard-encoded) — full block store snapshot
-//! - **Incremental sync**: `SyncPayload` (postcard-encoded) — per-block deltas,
+//! - **Initial state**: `StoreSnapshot` (CBOR-encoded) — full block store snapshot
+//! - **Incremental sync**: `SyncPayload` (CBOR-encoded) — per-block deltas,
 //!   new block snapshots, header updates, and tombstone deletions
 //! - **Frontier**: `HashMap<BlockId, Frontier>` — per-block CRDT versions
 //!
@@ -283,7 +283,7 @@ impl SyncManager {
             snapshot_bytes.len()
         );
 
-        let snapshot: StoreSnapshot = match postcard::from_bytes(snapshot_bytes) {
+        let snapshot: StoreSnapshot = match kaijutsu_types::codec::decode(snapshot_bytes) {
             Ok(s) => s,
             Err(e) => {
                 error!(
@@ -489,7 +489,7 @@ impl SyncManager {
             self.context_id
         );
 
-        let snapshot: StoreSnapshot = match postcard::from_bytes(snapshot_bytes) {
+        let snapshot: StoreSnapshot = match kaijutsu_types::codec::decode(snapshot_bytes) {
             Ok(s) => s,
             Err(e) => {
                 error!(
@@ -532,7 +532,7 @@ impl SyncManager {
         block_id: Option<&BlockId>,
     ) -> Result<SyncResult, SyncError> {
         // Deserialize SyncPayload
-        let payload: SyncPayload = match postcard::from_bytes(ops) {
+        let payload: SyncPayload = match kaijutsu_types::codec::decode(ops) {
             Ok(p) => p,
             Err(e) => {
                 warn!("Failed to deserialize SyncPayload: {}", e);
@@ -714,17 +714,17 @@ mod tests {
         CrdtBlockStore::new(context_id, client_agent())
     }
 
-    /// Helper: serialize a StoreSnapshot to postcard bytes.
+    /// Helper: serialize a StoreSnapshot to CBOR bytes.
     fn snapshot_bytes(store: &CrdtBlockStore) -> Vec<u8> {
-        postcard::to_allocvec(&store.snapshot()).expect("serialize snapshot")
+        kaijutsu_types::codec::encode(&store.snapshot()).expect("serialize snapshot")
     }
 
-    /// Helper: serialize a SyncPayload to postcard bytes.
+    /// Helper: serialize a SyncPayload to CBOR bytes.
     fn sync_payload_bytes(
         store: &CrdtBlockStore,
         frontiers: &HashMap<BlockId, Frontier>,
     ) -> Vec<u8> {
-        postcard::to_allocvec(&store.ops_since(frontiers)).expect("serialize sync payload")
+        kaijutsu_types::codec::encode(&store.ops_since(frontiers)).expect("serialize sync payload")
     }
 
     // =========================================================================

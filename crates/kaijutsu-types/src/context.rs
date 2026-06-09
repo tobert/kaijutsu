@@ -172,11 +172,11 @@ mod tests {
     }
 
     #[test]
-    fn test_context_info_postcard_roundtrip() {
+    fn test_context_info_cbor_roundtrip() {
         let creator = PrincipalId::new();
         let info = Context::new(Some("test".into()), None, creator);
-        let bytes = postcard::to_stdvec(&info).unwrap();
-        let parsed: Context = postcard::from_bytes(&bytes).unwrap();
+        let bytes = crate::codec::encode(&info).unwrap();
+        let parsed: Context = crate::codec::decode(&bytes).unwrap();
         assert_eq!(info, parsed);
     }
 

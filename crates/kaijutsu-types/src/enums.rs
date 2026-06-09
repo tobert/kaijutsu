@@ -255,15 +255,15 @@ mod tests {
     }
 
     #[test]
-    fn fork_kind_postcard_roundtrip() {
+    fn fork_kind_cbor_roundtrip() {
         for kind in [
             ForkKind::Full,
             ForkKind::Shallow,
             ForkKind::Compact,
             ForkKind::Subtree,
         ] {
-            let bytes = postcard::to_stdvec(&kind).unwrap();
-            let parsed: ForkKind = postcard::from_bytes(&bytes).unwrap();
+            let bytes = crate::codec::encode(&kind).unwrap();
+            let parsed: ForkKind = crate::codec::decode(&bytes).unwrap();
             assert_eq!(kind, parsed);
         }
     }
@@ -309,10 +309,10 @@ mod tests {
     }
 
     #[test]
-    fn edge_kind_postcard_roundtrip() {
+    fn edge_kind_cbor_roundtrip() {
         for kind in [EdgeKind::Structural, EdgeKind::Drift] {
-            let bytes = postcard::to_stdvec(&kind).unwrap();
-            let parsed: EdgeKind = postcard::from_bytes(&bytes).unwrap();
+            let bytes = crate::codec::encode(&kind).unwrap();
+            let parsed: EdgeKind = crate::codec::decode(&bytes).unwrap();
             assert_eq!(kind, parsed);
         }
     }
@@ -361,10 +361,10 @@ mod tests {
     }
 
     #[test]
-    fn consent_mode_postcard_roundtrip() {
+    fn consent_mode_cbor_roundtrip() {
         for mode in [ConsentMode::Collaborative, ConsentMode::Autonomous] {
-            let bytes = postcard::to_stdvec(&mode).unwrap();
-            let parsed: ConsentMode = postcard::from_bytes(&bytes).unwrap();
+            let bytes = crate::codec::encode(&mode).unwrap();
+            let parsed: ConsentMode = crate::codec::decode(&bytes).unwrap();
             assert_eq!(mode, parsed);
         }
     }
@@ -418,14 +418,14 @@ mod tests {
     }
 
     #[test]
-    fn context_state_postcard_roundtrip() {
+    fn context_state_cbor_roundtrip() {
         for state in [
             ContextState::Live,
             ContextState::Staging,
             ContextState::Archived,
         ] {
-            let bytes = postcard::to_stdvec(&state).unwrap();
-            let parsed: ContextState = postcard::from_bytes(&bytes).unwrap();
+            let bytes = crate::codec::encode(&state).unwrap();
+            let parsed: ContextState = crate::codec::decode(&bytes).unwrap();
             assert_eq!(state, parsed);
         }
     }
@@ -493,15 +493,15 @@ mod tests {
     }
 
     #[test]
-    fn doc_kind_postcard_roundtrip() {
+    fn doc_kind_cbor_roundtrip() {
         for kind in [
             DocKind::Conversation,
             DocKind::Code,
             DocKind::Text,
             DocKind::Config,
         ] {
-            let bytes = postcard::to_stdvec(&kind).unwrap();
-            let parsed: DocKind = postcard::from_bytes(&bytes).unwrap();
+            let bytes = crate::codec::encode(&kind).unwrap();
+            let parsed: DocKind = crate::codec::decode(&bytes).unwrap();
             assert_eq!(kind, parsed);
         }
     }

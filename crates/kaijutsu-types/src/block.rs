@@ -2533,10 +2533,10 @@ mod tests {
     }
 
     #[test]
-    fn test_block_id_postcard_roundtrip() {
+    fn test_block_id_cbor_roundtrip() {
         let id = BlockId::new(test_context(), test_agent(), 42);
-        let bytes = postcard::to_stdvec(&id).unwrap();
-        let parsed: BlockId = postcard::from_bytes(&bytes).unwrap();
+        let bytes = crate::codec::encode(&id).unwrap();
+        let parsed: BlockId = crate::codec::decode(&bytes).unwrap();
         assert_eq!(id, parsed);
     }
 
@@ -2886,13 +2886,13 @@ mod tests {
     }
 
     #[test]
-    fn test_block_snapshot_postcard_roundtrip() {
+    fn test_block_snapshot_cbor_roundtrip() {
         let ctx = test_context();
         let author = test_agent();
         let id = BlockId::new(ctx, author, 1);
         let snap = BlockSnapshot::text(id, None, Role::User, "hello");
-        let bytes = postcard::to_allocvec(&snap).unwrap();
-        let parsed: BlockSnapshot = postcard::from_bytes(&bytes).unwrap();
+        let bytes = crate::codec::encode(&snap).unwrap();
+        let parsed: BlockSnapshot = crate::codec::decode(&bytes).unwrap();
         assert_eq!(parsed.id, snap.id);
         assert_eq!(parsed.content, "hello");
         assert_eq!(parsed.tool_kind, None);
@@ -2901,7 +2901,7 @@ mod tests {
     }
 
     #[test]
-    fn test_block_snapshot_postcard_roundtrip_with_output() {
+    fn test_block_snapshot_cbor_roundtrip_with_output() {
         let ctx = test_context();
         let author = test_agent();
         let id = BlockId::new(ctx, author, 1);
@@ -2917,8 +2917,8 @@ mod tests {
             Some(output_data.clone()),
             None,
         );
-        let bytes = postcard::to_allocvec(&snap).unwrap();
-        let parsed: BlockSnapshot = postcard::from_bytes(&bytes).unwrap();
+        let bytes = crate::codec::encode(&snap).unwrap();
+        let parsed: BlockSnapshot = crate::codec::decode(&bytes).unwrap();
         assert_eq!(parsed.output, Some(output_data));
         assert_eq!(parsed.content, "raw output");
     }
@@ -3105,12 +3105,12 @@ mod tests {
     }
 
     #[test]
-    fn test_compacted_postcard_roundtrip_false() {
+    fn test_compacted_cbor_roundtrip_false() {
         let id = BlockId::new(test_context(), test_agent(), 1);
         let snap = BlockSnapshot::text(id, None, Role::User, "hello");
         assert!(!snap.compacted);
-        let bytes = postcard::to_allocvec(&snap).unwrap();
-        let parsed: BlockSnapshot = postcard::from_bytes(&bytes).unwrap();
+        let bytes = crate::codec::encode(&snap).unwrap();
+        let parsed: BlockSnapshot = crate::codec::decode(&bytes).unwrap();
         assert!(!parsed.compacted);
     }
 
@@ -4030,10 +4030,10 @@ mod tests {
     }
 
     #[test]
-    fn test_error_payload_postcard_roundtrip() {
+    fn test_error_payload_cbor_roundtrip() {
         let payload = test_payload();
-        let bytes = postcard::to_stdvec(&payload).unwrap();
-        let parsed: ErrorPayload = postcard::from_bytes(&bytes).unwrap();
+        let bytes = crate::codec::encode(&payload).unwrap();
+        let parsed: ErrorPayload = crate::codec::decode(&bytes).unwrap();
         assert_eq!(payload, parsed);
     }
 
@@ -4149,15 +4149,15 @@ mod tests {
     }
 
     #[test]
-    fn test_error_block_snapshot_postcard_roundtrip() {
+    fn test_error_block_snapshot_cbor_roundtrip() {
         let ctx = test_context();
         let agent = test_agent();
         let parent_id = BlockId::new(ctx, agent, 1);
         let id = BlockId::new(ctx, PrincipalId::system(), 2);
         let snap = BlockSnapshot::error_for(id, parent_id, test_payload(), "timeout");
 
-        let bytes = postcard::to_stdvec(&snap).unwrap();
-        let parsed: BlockSnapshot = postcard::from_bytes(&bytes).unwrap();
+        let bytes = crate::codec::encode(&snap).unwrap();
+        let parsed: BlockSnapshot = crate::codec::decode(&bytes).unwrap();
         assert!(parsed.content_eq(&snap));
         assert_eq!(parsed.error, snap.error);
     }
@@ -4346,10 +4346,10 @@ mod tests {
     }
 
     #[test]
-    fn test_notification_payload_postcard_roundtrip() {
+    fn test_notification_payload_cbor_roundtrip() {
         let p = test_notification_payload();
-        let bytes = postcard::to_stdvec(&p).unwrap();
-        let parsed: NotificationPayload = postcard::from_bytes(&bytes).unwrap();
+        let bytes = crate::codec::encode(&p).unwrap();
+        let parsed: NotificationPayload = crate::codec::decode(&bytes).unwrap();
         assert_eq!(p, parsed);
     }
 
@@ -4623,10 +4623,10 @@ mod tests {
     }
 
     #[test]
-    fn test_resource_payload_postcard_roundtrip() {
+    fn test_resource_payload_cbor_roundtrip() {
         let p = blob_resource_payload();
-        let bytes = postcard::to_stdvec(&p).unwrap();
-        let parsed: ResourcePayload = postcard::from_bytes(&bytes).unwrap();
+        let bytes = crate::codec::encode(&p).unwrap();
+        let parsed: ResourcePayload = crate::codec::decode(&bytes).unwrap();
         assert_eq!(p, parsed);
     }
 

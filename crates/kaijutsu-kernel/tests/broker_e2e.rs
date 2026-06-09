@@ -946,6 +946,12 @@ async fn server_notification_reaches_llm_hydrator() {
 
     // Fetch notification blocks via the production query path the app
     // uses. `LocalMock::list_tools` advertises one tool named "fail".
+    //
+    // `setup()` registers the builtin MCP servers into this same context, so
+    // their tool-lifecycle notifications (e.g. builtin.shell add/remove) also
+    // land here. The exit criterion is that the hydrator's `ToolAdded` reaches
+    // the context as a notification block — not that it is the *only* one — so
+    // filter to the instance under test rather than asserting a global count.
     let notif_blocks = fx
         .store
         .query_blocks(
@@ -956,13 +962,23 @@ async fn server_notification_reaches_llm_hydrator() {
             },
         )
         .expect("query_blocks");
+    let hydrator_blocks: Vec<_> = notif_blocks
+        .iter()
+        .filter(|b| {
+            b.notification
+                .as_ref()
+                .is_some_and(|n| n.instance == "test.hydrator")
+        })
+        .collect();
     assert_eq!(
-        notif_blocks.len(),
+        hydrator_blocks.len(),
         1,
-        "expected exactly one ToolAdded notification block, got {:?}",
+        "expected exactly one notification block from test.hydrator, got {:?} \
+         (all notification blocks in context: {:?})",
+        hydrator_blocks,
         notif_blocks
     );
-    let payload = notif_blocks[0]
+    let payload = hydrator_blocks[0]
         .notification
         .as_ref()
         .expect("notification payload must survive CRDT storage");
@@ -980,11 +996,15 @@ async fn server_notification_reaches_llm_hydrator() {
     let msgs = hydrate_from_blocks(&all_blocks);
     let envelope_msg = msgs.iter().find(|m| {
         m.as_text()
-            .map(|t| t.contains("<notification ") && t.contains("</notification>"))
+            .map(|t| {
+                t.contains("<notification ")
+                    && t.contains("</notification>")
+                    && t.contains("instance=\"test.hydrator\"")
+            })
             .unwrap_or(false)
     });
     let text = envelope_msg
-        .expect("at least one LLM message must carry the notification envelope")
+        .expect("an LLM message must carry the test.hydrator notification envelope")
         .as_text()
         .expect("envelope message is text");
     assert!(text.contains("instance=\"test.hydrator\""));

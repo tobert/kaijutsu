@@ -29,7 +29,6 @@ rand_v10 = { package = "rand", version = "0.10" }
 uuid = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-postcard = { workspace = true }
 parking_lot = { workspace = true }
 dashmap = { workspace = true }
 tracing = { workspace = true }

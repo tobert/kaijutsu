@@ -290,7 +290,7 @@ impl ConfigCrdtBackend {
         let ctx = self.context_id(path);
 
         // Check if already loaded in CRDT. Bare existence is not enough: a
-        // halted oplog replay (e.g. postcard schema drift corrupting the
+        // halted oplog replay (e.g. serialization/schema drift corrupting the
         // persisted entries) can leave the document registered but *blockless*.
         // An empty config doc would silently shadow the on-disk file, so we
         // only trust it when a content block is actually present; otherwise we

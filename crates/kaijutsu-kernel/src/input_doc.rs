@@ -13,6 +13,7 @@ use diamond_types_extended::{AgentId, Document, Frontier, SerializedOpsOwned, Uu
 use parking_lot::RwLock;
 
 use kaijutsu_types::PrincipalId;
+use kaijutsu_types::codec;
 
 /// A single context's input document (compose scratchpad).
 ///
@@ -52,7 +53,7 @@ impl InputDocEntry {
 
     /// Create an input document from serialized ops (for DB restore).
     pub fn from_ops(ops_bytes: &[u8], principal_id: PrincipalId) -> Result<Self, String> {
-        let ops: SerializedOpsOwned = postcard::from_bytes(ops_bytes)
+        let ops: SerializedOpsOwned = codec::decode(ops_bytes)
             .map_err(|e| format!("Failed to deserialize input doc ops: {}", e))?;
 
         let mut doc = Document::new();
@@ -105,7 +106,7 @@ impl InputDocEntry {
         self.version.fetch_add(1, Ordering::SeqCst);
 
         let ops = self.doc.ops_since_owned(&frontier_before);
-        let ops_bytes = postcard::to_allocvec(&ops)
+        let ops_bytes = codec::encode(&ops)
             .map_err(|e| format!("Failed to serialize input ops: {}", e))?;
         Ok(ops_bytes)
     }
@@ -118,7 +119,7 @@ impl InputDocEntry {
     /// Get serialized ops since a frontier (for sync).
     pub fn ops_since(&self, frontier: &Frontier) -> Result<Vec<u8>, String> {
         let ops = self.doc.ops_since_owned(frontier);
-        postcard::to_allocvec(&ops).map_err(|e| format!("Failed to serialize ops: {}", e))
+        codec::encode(&ops).map_err(|e| format!("Failed to serialize ops: {}", e))
     }
 
     /// Get all ops from the beginning (for full state transfer).
@@ -128,7 +129,7 @@ impl InputDocEntry {
 
     /// Merge remote ops into this document.
     pub fn merge_ops(&mut self, ops_bytes: &[u8]) -> Result<(), String> {
-        let ops: SerializedOpsOwned = postcard::from_bytes(ops_bytes)
+        let ops: SerializedOpsOwned = codec::decode(ops_bytes)
             .map_err(|e| format!("Failed to deserialize ops: {}", e))?;
         self.doc
             .merge_ops(ops)
@@ -158,7 +159,7 @@ impl InputDocEntry {
         self.version.fetch_add(1, Ordering::SeqCst);
 
         let ops = self.doc.ops_since_owned(&frontier_before);
-        let ops_bytes = postcard::to_allocvec(&ops)
+        let ops_bytes = codec::encode(&ops)
             .map_err(|e| format!("Failed to serialize clear ops: {}", e))?;
 
         Ok((text, ops_bytes))

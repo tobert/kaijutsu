@@ -997,7 +997,7 @@ pub enum InputDocFlow {
     TextOps {
         /// The context whose input doc was modified.
         context_id: ContextId,
-        /// Serialized DTE operations (postcard-encoded SerializedOpsOwned).
+        /// Serialized DTE operations (CBOR-encoded SerializedOpsOwned).
         /// Arc-wrapped to avoid per-subscriber deep cloning.
         ops: Arc<[u8]>,
         /// Origin of this operation.

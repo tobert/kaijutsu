@@ -48,7 +48,7 @@ impl SyncedInput {
         ops: &[u8],
     ) -> Result<Self, String> {
         let remote_ops: SerializedOpsOwned =
-            postcard::from_bytes(ops).map_err(|e| format!("deserialize input ops: {}", e))?;
+            kaijutsu_types::codec::decode(ops).map_err(|e| format!("deserialize input ops: {}", e))?;
         let mut doc = Document::new();
         let agent = doc.create_agent(Uuid::from_bytes(*principal_id.as_bytes()));
         doc.merge_ops(remote_ops)
@@ -81,7 +81,17 @@ impl SyncedInput {
             }
         }
         let ops = self.doc.ops_since_owned(&frontier_before);
-        postcard::to_allocvec(&ops).unwrap_or_default()
+        // TODO: `edit` returns `Vec<u8>` with no error channel, so an encode
+        // failure here is dropped on the floor (empty ops = a silently-lost
+        // local edit). Surface it loudly for now; revisit the signature to
+        // return `Result` so callers can react to the failure.
+        match kaijutsu_types::codec::encode(&ops) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::error!("failed to encode input ops (local edit lost): {}", e);
+                Vec::new()
+            }
+        }
     }
 
     /// Get current text content.
@@ -92,7 +102,7 @@ impl SyncedInput {
     /// Apply remote ops (from `InputTextOps` server event).
     pub fn apply_remote_ops(&mut self, ops: &[u8]) -> Result<(), String> {
         let remote_ops: SerializedOpsOwned =
-            postcard::from_bytes(ops).map_err(|e| format!("deserialize remote ops: {}", e))?;
+            kaijutsu_types::codec::decode(ops).map_err(|e| format!("deserialize remote ops: {}", e))?;
         self.doc
             .merge_ops(remote_ops)
             .map_err(|e| format!("merge remote ops: {}", e))?;
@@ -176,7 +186,7 @@ mod tests {
         let full_ops = {
             let frontier = diamond_types_extended::Frontier::root();
             let ops = input_a.doc.ops_since_owned(&frontier);
-            postcard::to_allocvec(&ops).unwrap()
+            kaijutsu_types::codec::encode(&ops).unwrap()
         };
         let mut input_b = SyncedInput::from_state(ctx, test_principal_id(), &full_ops).unwrap();
 
@@ -197,7 +207,7 @@ mod tests {
         let full_ops = {
             let frontier = diamond_types_extended::Frontier::root();
             let ops = input.doc.ops_since_owned(&frontier);
-            postcard::to_allocvec(&ops).unwrap()
+            kaijutsu_types::codec::encode(&ops).unwrap()
         };
 
         // Reconstruct from state
@@ -230,7 +240,7 @@ mod tests {
         // Client gets full state from server (the normal sync path)
         let full_ops = {
             let ops = server_doc.ops_since_owned(&diamond_types_extended::Frontier::root());
-            postcard::to_allocvec(&ops).unwrap()
+            kaijutsu_types::codec::encode(&ops).unwrap()
         };
         let mut client = SyncedInput::from_state(ctx, test_principal_id(), &full_ops).unwrap();
 
@@ -242,7 +252,7 @@ mod tests {
             }
         });
         let incremental_ops = server_doc.ops_since_owned(&frontier_before);
-        let ops_bytes = postcard::to_allocvec(&incremental_ops).unwrap();
+        let ops_bytes = kaijutsu_types::codec::encode(&incremental_ops).unwrap();
 
         // Client should accept these ops because it has the full causal history
         client.apply_remote_ops(&ops_bytes).unwrap();

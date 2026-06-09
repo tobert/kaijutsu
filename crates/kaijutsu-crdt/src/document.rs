@@ -1340,13 +1340,13 @@ impl BlockDocument {
         self.doc.ops_since_owned(frontier)
     }
 
-    /// Get operations since a frontier as postcard-serialized bytes.
+    /// Get operations since a frontier as serialized bytes.
     ///
-    /// Convenience wrapper so callers don't need a direct postcard dependency.
+    /// Convenience wrapper so callers don't need a direct codec dependency.
     /// Mirrors the `oplog_bytes()` pattern.
     pub fn ops_since_bytes(&self, frontier: &Frontier) -> Result<Vec<u8>> {
         let ops = self.ops_since(frontier);
-        postcard::to_stdvec(&ops).map_err(|e| CrdtError::Serialization(e.to_string()))
+        kaijutsu_types::codec::encode(&ops).map_err(|e| CrdtError::Serialization(e.to_string()))
     }
 
     /// Merge remote operations.
@@ -1500,7 +1500,7 @@ impl BlockDocument {
     /// Get full oplog as serialized bytes (for initial sync).
     pub fn oplog_bytes(&self) -> Result<Vec<u8>> {
         let ops = self.ops_since(&Frontier::root());
-        postcard::to_stdvec(&ops).map_err(|e| CrdtError::Serialization(e.to_string()))
+        kaijutsu_types::codec::encode(&ops).map_err(|e| CrdtError::Serialization(e.to_string()))
     }
 
     /// Create document from serialized oplog (client-side sync).
@@ -1511,7 +1511,7 @@ impl BlockDocument {
     ) -> Result<Self> {
         let mut doc = Document::new();
 
-        let ops: SerializedOpsOwned = postcard::from_bytes(oplog_bytes)
+        let ops: SerializedOpsOwned = kaijutsu_types::codec::decode(oplog_bytes)
             .map_err(|e| CrdtError::Internal(format!("deserialize oplog: {}", e)))?;
         doc.merge_ops(ops)
             .map_err(|e| CrdtError::Internal(format!("merge oplog: {:?}", e)))?;

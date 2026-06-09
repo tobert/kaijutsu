@@ -497,17 +497,17 @@ mod tests {
         store
     }
 
-    /// Helper: serialize a StoreSnapshot to postcard bytes.
+    /// Helper: serialize a StoreSnapshot to CBOR bytes.
     fn snapshot_bytes(store: &CrdtBlockStore) -> Vec<u8> {
-        postcard::to_allocvec(&store.snapshot()).expect("serialize snapshot")
+        kaijutsu_types::codec::encode(&store.snapshot()).expect("serialize snapshot")
     }
 
-    /// Helper: serialize a SyncPayload to postcard bytes.
+    /// Helper: serialize a SyncPayload to CBOR bytes.
     fn sync_payload_bytes(
         store: &CrdtBlockStore,
         frontiers: &HashMap<BlockId, kaijutsu_crdt::Frontier>,
     ) -> Vec<u8> {
-        postcard::to_allocvec(&store.ops_since(frontiers)).expect("serialize sync payload")
+        kaijutsu_types::codec::encode(&store.ops_since(frontiers)).expect("serialize sync payload")
     }
 
     #[test]

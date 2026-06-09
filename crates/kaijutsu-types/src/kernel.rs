@@ -89,10 +89,10 @@ mod tests {
     }
 
     #[test]
-    fn test_postcard_roundtrip() {
+    fn test_cbor_roundtrip() {
         let k = Kernel::new(PrincipalId::new(), Some("test".into()));
-        let bytes = postcard::to_stdvec(&k).unwrap();
-        let parsed: Kernel = postcard::from_bytes(&bytes).unwrap();
+        let bytes = crate::codec::encode(&k).unwrap();
+        let parsed: Kernel = crate::codec::decode(&bytes).unwrap();
         assert_eq!(k, parsed);
     }
 

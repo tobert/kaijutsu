@@ -3057,7 +3057,8 @@ impl kernel::Server for KernelImpl {
         let documents = &self.kernel.documents;
 
         // Deserialize the sync payload
-        let payload: kaijutsu_crdt::block_store::SyncPayload = match postcard::from_bytes(&ops_data)
+        let payload: kaijutsu_crdt::block_store::SyncPayload =
+            match kaijutsu_types::codec::decode(&ops_data)
         {
             Ok(p) => p,
             Err(e) => {

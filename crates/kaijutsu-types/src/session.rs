@@ -74,10 +74,10 @@ mod tests {
     }
 
     #[test]
-    fn test_postcard_roundtrip() {
+    fn test_cbor_roundtrip() {
         let s = Session::new(PrincipalId::new(), KernelId::new());
-        let bytes = postcard::to_stdvec(&s).unwrap();
-        let parsed: Session = postcard::from_bytes(&bytes).unwrap();
+        let bytes = crate::codec::encode(&s).unwrap();
+        let parsed: Session = crate::codec::decode(&bytes).unwrap();
         assert_eq!(s, parsed);
     }
 

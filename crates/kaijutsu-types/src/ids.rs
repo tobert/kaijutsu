@@ -426,37 +426,37 @@ mod tests {
         assert_eq!(id, parsed);
     }
 
-    // ── Postcard roundtrips ─────────────────────────────────────────────
+    // ── CBOR roundtrips ─────────────────────────────────────────────
 
     #[test]
-    fn test_postcard_roundtrip_context_id() {
+    fn test_cbor_roundtrip_context_id() {
         let id = ContextId::new();
-        let bytes = postcard::to_stdvec(&id).unwrap();
-        let parsed: ContextId = postcard::from_bytes(&bytes).unwrap();
+        let bytes = crate::codec::encode(&id).unwrap();
+        let parsed: ContextId = crate::codec::decode(&bytes).unwrap();
         assert_eq!(id, parsed);
     }
 
     #[test]
-    fn test_postcard_roundtrip_kernel_id() {
+    fn test_cbor_roundtrip_kernel_id() {
         let id = KernelId::new();
-        let bytes = postcard::to_stdvec(&id).unwrap();
-        let parsed: KernelId = postcard::from_bytes(&bytes).unwrap();
+        let bytes = crate::codec::encode(&id).unwrap();
+        let parsed: KernelId = crate::codec::decode(&bytes).unwrap();
         assert_eq!(id, parsed);
     }
 
     #[test]
-    fn test_postcard_roundtrip_principal_id() {
+    fn test_cbor_roundtrip_principal_id() {
         let id = PrincipalId::new();
-        let bytes = postcard::to_stdvec(&id).unwrap();
-        let parsed: PrincipalId = postcard::from_bytes(&bytes).unwrap();
+        let bytes = crate::codec::encode(&id).unwrap();
+        let parsed: PrincipalId = crate::codec::decode(&bytes).unwrap();
         assert_eq!(id, parsed);
     }
 
     #[test]
-    fn test_postcard_roundtrip_session_id() {
+    fn test_cbor_roundtrip_session_id() {
         let id = SessionId::new();
-        let bytes = postcard::to_stdvec(&id).unwrap();
-        let parsed: SessionId = postcard::from_bytes(&bytes).unwrap();
+        let bytes = crate::codec::encode(&id).unwrap();
+        let parsed: SessionId = crate::codec::decode(&bytes).unwrap();
         assert_eq!(id, parsed);
     }
 

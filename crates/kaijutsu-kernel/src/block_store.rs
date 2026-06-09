@@ -22,6 +22,7 @@ use kaijutsu_crdt::block_store::{
 };
 use kaijutsu_crdt::{BlockId, BlockKind, BlockSnapshot, ContentType, Role, Status, ToolKind};
 use kaijutsu_types::BlockFilter;
+use kaijutsu_types::codec;
 use kaijutsu_types::{ContextId, DocKind, PrincipalId, WorkspaceId};
 
 use crate::flows::{BlockFlow, InputDocFlow, OpSource, SharedBlockFlowBus, SharedInputDocFlowBus};
@@ -380,7 +381,7 @@ impl BlockStore {
 
     /// Create a document from a serialized store snapshot (for sync from server).
     ///
-    /// Reconstructs the document from a postcard-encoded `StoreSnapshot`.
+    /// Reconstructs the document from a CBOR-encoded `StoreSnapshot`.
     /// Used for initial sync when connecting to a kaijutsu-server.
     pub fn create_document_from_snapshot(
         &self,
@@ -393,7 +394,7 @@ impl BlockStore {
             return Err(BlockStoreError::DocumentAlreadyExists(context_id));
         }
 
-        let snapshot: StoreSnapshot = postcard::from_bytes(snapshot_bytes)
+        let snapshot: StoreSnapshot = codec::decode(snapshot_bytes)
             .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
 
         let principal_id = self.principal_id();
@@ -711,7 +712,7 @@ impl BlockStore {
             return Ok(());
         };
 
-        let payload_bytes = postcard::to_allocvec(&payload)
+        let payload_bytes = codec::encode(&payload)
             .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
         let payload_len = payload_bytes.len() as u64;
 
@@ -755,7 +756,7 @@ impl BlockStore {
             let content = entry.content();
             let version = entry.version() as i64;
             let max_seq = entry.next_journal_seq.load(Ordering::SeqCst);
-            let snapshot_bytes = postcard::to_allocvec(&snapshot)
+            let snapshot_bytes = codec::encode(&snapshot)
                 .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
             (snapshot_bytes, content, version, max_seq)
         };
@@ -794,7 +795,7 @@ impl BlockStore {
         let content = entry.content();
         let version = entry.version() as i64;
 
-        let snapshot_bytes = postcard::to_allocvec(&snapshot)
+        let snapshot_bytes = codec::encode(&snapshot)
             .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
 
         drop(entry);
@@ -963,7 +964,7 @@ impl BlockStore {
 
             // Send incremental ops (just this operation) for efficient sync.
             let ops = entry.doc.ops_since(&frontier_before);
-            let ops_bytes = postcard::to_allocvec(&ops)
+            let ops_bytes = codec::encode(&ops)
                 .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
             entry.touch(effective_agent);
             (block_id, snapshot, ops, ops_bytes)
@@ -1043,7 +1044,7 @@ impl BlockStore {
 
             // Send incremental ops (just this operation) for efficient sync
             let ops = entry.doc.ops_since(&frontier_before);
-            let ops_bytes = postcard::to_allocvec(&ops)
+            let ops_bytes = codec::encode(&ops)
                 .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
             entry.touch(effective_agent);
             (block_id, snapshot, ops, ops_bytes)
@@ -1134,7 +1135,7 @@ impl BlockStore {
 
             // Send incremental ops (just this operation) for efficient sync
             let ops = entry.doc.ops_since(&frontier_before);
-            let ops_bytes = postcard::to_allocvec(&ops)
+            let ops_bytes = codec::encode(&ops)
                 .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
             entry.touch(effective_agent);
             (block_id, snapshot, ops, ops_bytes)
@@ -1191,7 +1192,7 @@ impl BlockStore {
                 .ok_or(BlockStoreError::BlockNotFoundAfterInsert)?;
 
             let ops = entry.doc.ops_since(&frontier_before);
-            let ops_bytes = postcard::to_allocvec(&ops)
+            let ops_bytes = codec::encode(&ops)
                 .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
             entry.touch(effective_agent);
             (block_id, final_snapshot, ops, ops_bytes)
@@ -1295,7 +1296,7 @@ impl BlockStore {
             entry.touch(effective_agent);
             // Get ops since frontier (the edit we just applied)
             let ops = entry.doc.ops_since(&frontier);
-            let ops_bytes = postcard::to_allocvec(&ops)
+            let ops_bytes = codec::encode(&ops)
                 .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
             (ops, ops_bytes)
         };
@@ -1549,7 +1550,7 @@ impl BlockStore {
     ///
     /// Write-once at `ThinkingEnd`. Like `stderr`, the value isn't a DTE op and
     /// isn't carried on `BlockMetadata`, so it has no live flow event — it rides
-    /// the `StoreSnapshot` (postcard) used for persistence and fork-copy. That's
+    /// the `StoreSnapshot` (CBOR) used for persistence and fork-copy. That's
     /// all hydration needs: the kernel rebuilds messages from its own block
     /// store, not from the Cap'n Proto wire. See
     /// [`kaijutsu_types::BlockSnapshot::signature`].
@@ -1668,7 +1669,7 @@ impl BlockStore {
             entry.touch(effective_agent);
             // Get ops since frontier (the append we just applied)
             let ops = entry.doc.ops_since(&frontier);
-            let ops_bytes = postcard::to_allocvec(&ops)
+            let ops_bytes = codec::encode(&ops)
                 .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
             (ops, ops_bytes)
         };
@@ -1770,8 +1771,8 @@ impl BlockStore {
             entry.version.store(version, Ordering::SeqCst);
             let after = entry.doc.blocks_ordered();
             let ops = entry.doc.ops_since(&frontier_before);
-            let ops_bytes =
-                postcard::to_allocvec(&ops).unwrap_or_default();
+            let ops_bytes = codec::encode(&ops)
+                .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
             (
                 version,
                 self.diff_block_events(context_id, &before, &after, ops_bytes),
@@ -1970,7 +1971,7 @@ impl BlockStore {
             .get(context_id)
             .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
         let snapshot = entry.doc.snapshot();
-        let bytes = postcard::to_allocvec(&snapshot)
+        let bytes = codec::encode(&snapshot)
             .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
         Ok((bytes, entry.version()))
     }
@@ -2023,7 +2024,7 @@ impl BlockStore {
             // Load base snapshot if available
             let (mut crdt_store, base_seq) = match db_guard.load_latest_snapshot(context_id) {
                 Ok(Some(snap_row)) => {
-                    match postcard::from_bytes::<StoreSnapshot>(&snap_row.state) {
+                    match codec::decode::<StoreSnapshot>(&snap_row.state) {
                         Ok(store_snapshot) => {
                             tracing::debug!(
                                 document_id = %context_id.to_hex(),
@@ -2062,7 +2063,7 @@ impl BlockStore {
             for (seq, payload_bytes) in &oplog_entries {
                 max_seq = max_seq.max(*seq);
                 total_bytes += payload_bytes.len() as u64;
-                match postcard::from_bytes::<SyncPayload>(payload_bytes) {
+                match codec::decode::<SyncPayload>(payload_bytes) {
                     Ok(payload) => {
                         if let Err(e) = crdt_store.merge_ops(payload) {
                             tracing::error!(
@@ -2148,7 +2149,7 @@ impl BlockStore {
         // Load base snapshot if available
         let (mut crdt_store, base_seq) = match db_guard.load_latest_snapshot(context_id) {
             Ok(Some(snap_row)) => {
-                match postcard::from_bytes::<StoreSnapshot>(&snap_row.state) {
+                match codec::decode::<StoreSnapshot>(&snap_row.state) {
                     Ok(store_snapshot) => {
                         tracing::debug!(
                             document_id = %context_id.to_hex(),
@@ -2187,7 +2188,7 @@ impl BlockStore {
         for (seq, payload_bytes) in &oplog_entries {
             max_seq = max_seq.max(*seq);
             total_bytes += payload_bytes.len() as u64;
-            match postcard::from_bytes::<SyncPayload>(payload_bytes) {
+            match codec::decode::<SyncPayload>(payload_bytes) {
                 Ok(payload) => {
                     if let Err(e) = crdt_store.merge_ops(payload) {
                         tracing::warn!(
@@ -2540,7 +2541,7 @@ impl BlockStore {
                 .ok_or(BlockStoreError::BlockNotFoundAfterInsert)?;
 
             let ops = entry.doc.ops_since(&frontier_before);
-            let ops_bytes = postcard::to_allocvec(&ops)
+            let ops_bytes = codec::encode(&ops)
                 .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
             entry.touch(effective_agent);
             (block_id, snapshot, ops, ops_bytes)
@@ -2684,7 +2685,7 @@ impl BlockStore {
                 .ok_or(BlockStoreError::BlockNotFoundAfterInsert)?;
 
             let ops = entry.doc.ops_since(&frontier_before);
-            let ops_bytes = postcard::to_allocvec(&ops)
+            let ops_bytes = codec::encode(&ops)
                 .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
             entry.touch(effective_agent);
             (block_id, snapshot, ops, ops_bytes)
@@ -2736,7 +2737,7 @@ impl BlockStore {
                 .ok_or(BlockStoreError::BlockNotFoundAfterInsert)?;
 
             let ops = entry.doc.ops_since(&frontier_before);
-            let ops_bytes = postcard::to_allocvec(&ops)
+            let ops_bytes = codec::encode(&ops)
                 .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
             entry.touch(effective_agent);
             (block_id, snapshot, ops, ops_bytes)
@@ -2785,7 +2786,7 @@ impl BlockStore {
                 .ok_or(BlockStoreError::BlockNotFoundAfterInsert)?;
 
             let ops = entry.doc.ops_since(&frontier_before);
-            let ops_bytes = postcard::to_allocvec(&ops)
+            let ops_bytes = codec::encode(&ops)
                 .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
             entry.touch(effective_agent);
             (block_id, snapshot, ops, ops_bytes)
@@ -3573,7 +3574,7 @@ mod tests {
 
         // Deserialize SyncPayload and merge on client
         let payload: SyncPayload =
-            postcard::from_bytes(&ops).expect("should deserialize SyncPayload");
+            codec::decode(&ops).expect("should deserialize SyncPayload");
         client
             .merge_ops(payload)
             .expect("client should merge sync payload");
@@ -3588,7 +3589,7 @@ mod tests {
 
     /// e2e: a coder turn gets monotonic per-context timeline ticks that survive a
     /// persistence (snapshot → reload) roundtrip — the recovery path the kernel
-    /// runs on restart. Exercises CRDT tick assignment → BlockSnapshot → postcard
+    /// runs on restart. Exercises CRDT tick assignment → BlockSnapshot → CBOR
     /// StoreSnapshot → from_snapshot (+ normalize).
     #[test]
     fn test_coder_turn_ticks_survive_persistence_roundtrip() {
@@ -3627,8 +3628,8 @@ mod tests {
 
         // Persist → reload, exactly as the kernel recovers a context on restart.
         let snapshot = store.get(ctx).unwrap().doc.snapshot();
-        let bytes = postcard::to_allocvec(&snapshot).unwrap();
-        let restored: StoreSnapshot = postcard::from_bytes(&bytes).unwrap();
+        let bytes = codec::encode(&snapshot).unwrap();
+        let restored: StoreSnapshot = codec::decode(&bytes).unwrap();
         let reloaded = CrdtBlockStore::from_snapshot(restored, test_agent()).unwrap();
 
         let rblocks = reloaded.blocks_ordered();
@@ -3669,7 +3670,7 @@ mod tests {
             _ => panic!("expected BlockInserted"),
         };
 
-        let payload: SyncPayload = postcard::from_bytes(&ops).unwrap();
+        let payload: SyncPayload = codec::decode(&ops).unwrap();
         client
             .merge_ops(payload)
             .expect("should merge tool_call sync payload");
@@ -3713,7 +3714,7 @@ mod tests {
                 _ => panic!("expected BlockInserted"),
             };
 
-            let payload: SyncPayload = postcard::from_bytes(&ops).unwrap();
+            let payload: SyncPayload = codec::decode(&ops).unwrap();
             client
                 .merge_ops(payload)
                 .expect(&format!("should merge block {i}"));
@@ -3796,7 +3797,7 @@ mod tests {
         // Snapshot before insert
         let initial_snapshot = {
             let entry = server.get(ctx).unwrap();
-            postcard::to_allocvec(&entry.doc.snapshot()).unwrap()
+            codec::encode(&entry.doc.snapshot()).unwrap()
         };
 
         let frontier_before = server.frontier(ctx).unwrap();
@@ -4043,7 +4044,7 @@ mod tests {
         // Verify the oplog can be replayed to reconstruct the merged content.
         let mut replay_store = CrdtBlockStore::new(ctx, creator);
         for (_seq, payload_bytes) in &oplog_entries {
-            let payload: SyncPayload = postcard::from_bytes(payload_bytes).unwrap();
+            let payload: SyncPayload = codec::decode(payload_bytes).unwrap();
             replay_store.merge_ops(payload).unwrap();
         }
         let replayed_content = replay_store.full_text();
@@ -4221,7 +4222,7 @@ mod tests {
         assert_eq!(entries.len(), 2, "should have 2 oplog rows for 2 inserts");
 
         for (i, (_seq, payload_bytes)) in entries.iter().enumerate() {
-            let payload: SyncPayload = postcard::from_bytes(payload_bytes)
+            let payload: SyncPayload = codec::decode(payload_bytes)
                 .unwrap_or_else(|e| panic!("deserialize oplog entry {}: {}", i, e));
             assert!(
                 !payload.new_blocks.is_empty(),
@@ -4308,7 +4309,7 @@ mod tests {
 
         // Decode the second entry and verify it has updated_headers
         let (_seq, payload_bytes) = &entries[1];
-        let payload: SyncPayload = postcard::from_bytes(payload_bytes).unwrap();
+        let payload: SyncPayload = codec::decode(payload_bytes).unwrap();
         assert!(
             !payload.updated_headers.is_empty(),
             "set_status oplog entry should have updated_headers"

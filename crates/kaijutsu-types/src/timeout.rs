@@ -108,10 +108,10 @@ mod tests {
     }
 
     #[test]
-    fn postcard_roundtrip() {
+    fn cbor_roundtrip() {
         let p = TimeoutPolicy::default();
-        let bytes = postcard::to_stdvec(&p).unwrap();
-        let back: TimeoutPolicy = postcard::from_bytes(&bytes).unwrap();
+        let bytes = crate::codec::encode(&p).unwrap();
+        let back: TimeoutPolicy = crate::codec::decode(&bytes).unwrap();
         assert_eq!(p, back);
     }
 }

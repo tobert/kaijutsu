@@ -44,6 +44,7 @@
 //! |-------------------|----------------------------------------------|
 
 pub mod block;
+pub mod codec;
 pub mod compaction;
 pub mod context;
 pub mod enums;

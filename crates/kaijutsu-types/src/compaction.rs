@@ -67,10 +67,10 @@ mod tests {
     }
 
     #[test]
-    fn test_postcard_roundtrip() {
+    fn test_cbor_roundtrip() {
         let b = test_boundary();
-        let bytes = postcard::to_stdvec(&b).unwrap();
-        let parsed: CompactionBoundary = postcard::from_bytes(&bytes).unwrap();
+        let bytes = crate::codec::encode(&b).unwrap();
+        let parsed: CompactionBoundary = crate::codec::decode(&bytes).unwrap();
         assert_eq!(b, parsed);
     }
 }

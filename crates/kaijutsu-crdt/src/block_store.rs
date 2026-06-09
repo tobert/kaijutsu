@@ -1848,9 +1848,9 @@ mod tests {
         );
 
         // Survives a StoreSnapshot round-trip (the sync/persistence path).
-        let bytes = postcard::to_allocvec(&store.snapshot()).unwrap();
+        let bytes = kaijutsu_types::codec::encode(&store.snapshot()).unwrap();
         let restored = BlockStore::from_snapshot(
-            postcard::from_bytes(&bytes).unwrap(),
+            kaijutsu_types::codec::decode(&bytes).unwrap(),
             store.principal_id(),
         )
         .unwrap();
@@ -2936,7 +2936,7 @@ mod tests {
     }
 
     #[test]
-    fn test_snapshot_postcard_roundtrip() {
+    fn test_snapshot_cbor_roundtrip() {
         let mut store = test_store();
         store
             .insert_block(
@@ -2951,19 +2951,19 @@ mod tests {
             .unwrap();
 
         let snapshot = store.snapshot();
-        let bytes = postcard::to_allocvec(&snapshot).expect("serialize");
-        let restored: StoreSnapshot = postcard::from_bytes(&bytes).expect("deserialize");
+        let bytes = kaijutsu_types::codec::encode(&snapshot).expect("serialize");
+        let restored: StoreSnapshot = kaijutsu_types::codec::decode(&bytes).expect("deserialize");
 
         assert_eq!(restored.blocks.len(), 1);
         assert_eq!(restored.blocks[0].content, "Hello");
     }
 
     /// The reasoning-continuity signature set on a Thinking block survives the
-    /// snapshot → postcard → snapshot round-trip (the path persistence and
+    /// snapshot → cbor → snapshot round-trip (the path persistence and
     /// fork-copy take). Without this, a rehydrated thinking block would lose
     /// its verifier and the next Anthropic turn would 400.
     #[test]
-    fn signature_survives_snapshot_postcard_roundtrip() {
+    fn signature_survives_snapshot_cbor_roundtrip() {
         let mut store = test_store();
         let id = store
             .insert_block(
@@ -2983,8 +2983,8 @@ mod tests {
         assert_eq!(snap.blocks[0].signature.as_deref(), Some("sig_xyz"));
 
         // …and after a persistence round-trip.
-        let bytes = postcard::to_allocvec(&snap).expect("serialize");
-        let restored: StoreSnapshot = postcard::from_bytes(&bytes).expect("deserialize");
+        let bytes = kaijutsu_types::codec::encode(&snap).expect("serialize");
+        let restored: StoreSnapshot = kaijutsu_types::codec::decode(&bytes).expect("deserialize");
         assert_eq!(restored.blocks[0].signature.as_deref(), Some("sig_xyz"));
     }
 
