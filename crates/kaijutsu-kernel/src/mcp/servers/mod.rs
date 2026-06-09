@@ -21,6 +21,7 @@ pub mod hooks_builtin;
 pub mod kernel_info;
 pub mod policy_admin;
 pub mod resources_builtin;
+pub mod shell;
 pub mod tool_search;
 
 pub use bindings_builtin::BuiltinBindingsServer;
@@ -31,4 +32,5 @@ pub use hooks_builtin::BuiltinHooksServer;
 pub use kernel_info::KernelInfoServer;
 pub use policy_admin::BuiltinPolicyServer;
 pub use resources_builtin::BuiltinResourcesServer;
+pub use shell::ShellServer;
 pub use tool_search::BuiltinToolSearchServer;

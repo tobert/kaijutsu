@@ -555,6 +555,20 @@ impl Kernel {
             .register_silently(policy_server, InstancePolicy::for_kernel(self))
             .await?;
 
+        // builtin.shell — the in-kernel projection of the `shell` facade as a
+        // broker tool, so the native LLM agent gets a shell (the RPC seam alone
+        // never reached its tool roster). Gated by `facade:shell` via the
+        // binding's facade projection (FACADE_PROJECTED_INSTANCES), NOT a
+        // separate instance grant — one capability covers both surfaces. Holds
+        // Weak<Broker> to reach the kj dispatcher (wired post-bootstrap by
+        // `set_kj_dispatcher`) and materialize a per-context kaish on demand.
+        let shell_server = Arc::new(
+            crate::mcp::servers::ShellServer::new(Arc::downgrade(&self.broker)),
+        );
+        self.broker
+            .register_silently(shell_server, InstancePolicy::for_kernel(self))
+            .await?;
+
         Ok(())
     }
 

@@ -247,6 +247,18 @@ impl Broker {
         *self.kj_dispatcher.write().await = Some(Arc::downgrade(dispatcher));
     }
 
+    /// Upgrade the stashed `Weak<KjDispatcher>` (set via [`Self::set_kj_dispatcher`]).
+    /// `None` if it was never wired (bare-broker unit tests) or the dispatcher
+    /// has been dropped. The `builtin.shell` server uses this to materialize a
+    /// per-context kaish on demand.
+    pub async fn kj_dispatcher(&self) -> Option<Arc<crate::kj::KjDispatcher>> {
+        self.kj_dispatcher
+            .read()
+            .await
+            .as_ref()
+            .and_then(|w| w.upgrade())
+    }
+
     /// Wire the kernel DB handle used to persist `ContextToolBinding` and
     /// `HookTables` across kernel restart (D-54, D-37 setter pattern, hook
     /// persistence follow-up). Call before first binding/hook mutation at

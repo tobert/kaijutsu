@@ -35,6 +35,12 @@ pub type ResolvedName = (InstanceId, String);
 /// (`get_input_state`) is intentionally **not** gated — reading compose text is
 /// benign and gating it traps the `write_input` handler, which reads before it
 /// writes.
+///
+/// The `shell` facade additionally **projects** the in-kernel `builtin.shell`
+/// broker tool (see [`FACADE_PROJECTED_INSTANCES`]) so the native LLM agent —
+/// whose tool roster is built from broker tools, not facades — gets a shell.
+/// The facade bit gates all three reach paths (human box, external MCP,
+/// in-kernel tool) so shell policy stays single-axis.
 pub const KNOWN_FACADES: &[&str] = &["shell", "edit_input", "submit_input"];
 
 /// The `kj` *authority* capabilities — bare-word grants that gate the
@@ -49,6 +55,22 @@ pub const KNOWN_FACADES: &[&str] = &["shell", "edit_input", "submit_input"];
 /// the `context_binding_authorities` table — extensible (a future authority is
 /// a new variant + token, no schema migration).
 pub const KNOWN_AUTHORITIES: &[&str] = &["drive", "fork", "drift", "transport", "operator"];
+
+/// Builtin broker instances that are the in-kernel **projection** of a facade,
+/// as `(instance, facade)` pairs.
+///
+/// A facade like `shell` is reachable two ways that must share ONE capability:
+/// the RPC seam (the human shell box + the external MCP `context_shell`), gated
+/// by `Broker::check_facade`; and a builtin broker tool the in-kernel LLM calls
+/// (`builtin.shell`), gated by [`ContextToolBinding::allows`]. The agent's tool
+/// roster is built from broker tools, which never included facades — so a
+/// native agent "had no shell" regardless of `facade:shell`. The projection
+/// closes that gap WITHOUT forking the policy: gating the tool as an ordinary
+/// `Instance`/`Tool` grant would mean a context with `facade:shell` but no `*`
+/// (e.g. `director`, `composer`) silently loses the model's shell. So the
+/// binding treats a projected instance as allowed exactly when its backing
+/// facade is allowed. One bit — `facade:shell` — governs both surfaces.
+pub const FACADE_PROJECTED_INSTANCES: &[(&str, &str)] = &[("builtin.shell", "shell")];
 
 /// A single capability grant or query. The allow-set is the positive surface a
 /// context may use. `Instance`/`Tool`/`Facade` are the granular grants;
@@ -207,6 +229,21 @@ impl ContextToolBinding {
         self.binding_rc_write
     }
 
+    /// True if this binding grants `facade` — directly or via `facade:*`.
+    fn facade_granted(&self, facade: &str) -> bool {
+        self.all_facades || self.allowed_facades.iter().any(|f| f == facade)
+    }
+
+    /// True if `instance` is a facade-projected builtin (see
+    /// [`FACADE_PROJECTED_INSTANCES`]) whose backing facade this binding grants.
+    /// This is what keeps a facade-backed broker tool (`builtin.shell`) and the
+    /// RPC facade gate single-axis: `facade:shell` lights up both.
+    fn facade_projection_allows(&self, instance: &InstanceId) -> bool {
+        FACADE_PROJECTED_INSTANCES
+            .iter()
+            .any(|(inst, facade)| *inst == instance.as_str() && self.facade_granted(facade))
+    }
+
     /// The single capability predicate every enforcement point consults:
     /// broker `call_tool` (refuse), `list_visible_tools` (hide), and the
     /// facade gate at the RPC layer. Deny-by-default: anything not positively
@@ -219,14 +256,13 @@ impl ContextToolBinding {
             Capability::Tool { instance, tool } => {
                 self.all_instances
                     || self.allowed_instances.contains(instance)
+                    || self.facade_projection_allows(instance)
                     || self
                         .allowed_tools
                         .iter()
                         .any(|(i, t)| i == instance && t == tool)
             }
-            Capability::Facade(name) => {
-                self.all_facades || self.allowed_facades.iter().any(|f| f == name)
-            }
+            Capability::Facade(name) => self.facade_granted(name),
             Capability::AllInstances => self.all_instances,
             Capability::AllFacades => self.all_facades,
             Capability::Admin => self.binding_admin,
@@ -340,6 +376,16 @@ impl ContextToolBinding {
                 out.push(inst.clone());
             }
         }
+        // Facade-projected builtins are candidates when their backing facade is
+        // granted, so `list_visible_tools` selects the server for facade-only
+        // loadouts (director/composer hold `facade:shell` but no instance grant
+        // and no `*`). Without this they'd never reach the per-tool filter.
+        for (inst, facade) in FACADE_PROJECTED_INSTANCES {
+            let id = InstanceId::new(*inst);
+            if self.facade_granted(facade) && !out.contains(&id) {
+                out.push(id);
+            }
+        }
         out
     }
 
@@ -406,6 +452,58 @@ mod tests {
             !b.allows(&Capability::RcWrite),
             "all_instances must NOT imply rc-write"
         );
+    }
+
+    #[test]
+    fn facade_shell_projects_the_builtin_shell_tool() {
+        // The whole point: granting `facade:shell` (and nothing else — no `*`,
+        // no instance grant) must light up the `builtin.shell` broker tool, so
+        // facade-only loadouts (director/composer) get the model's shell. This
+        // is what keeps the RPC seam and the model tool single-axis.
+        let mut b = ContextToolBinding::new();
+        b.grant(Capability::Facade("shell".into()));
+        assert!(
+            b.allows_tool(&inst("builtin.shell"), "shell"),
+            "facade:shell must project the builtin.shell tool"
+        );
+        assert!(
+            b.candidate_instances().contains(&inst("builtin.shell")),
+            "facade:shell must make builtin.shell a list_visible_tools candidate"
+        );
+    }
+
+    #[test]
+    fn facade_wildcard_projects_the_builtin_shell_tool() {
+        // default/coder/mcp grant `facade:*` — that must cover the projection too.
+        let mut b = ContextToolBinding::new();
+        b.grant(Capability::AllFacades);
+        assert!(b.allows_tool(&inst("builtin.shell"), "shell"));
+        assert!(b.candidate_instances().contains(&inst("builtin.shell")));
+    }
+
+    #[test]
+    fn no_facade_denies_the_builtin_shell_tool() {
+        // explorer: read-only, no facade. The shell tool must stay hidden and
+        // uncallable — the projection is the ONLY path to it for a non-`*` role.
+        let mut b = ContextToolBinding::new();
+        b.grant(Capability::Tool {
+            instance: inst("builtin.file"),
+            tool: "read".into(),
+        });
+        assert!(
+            !b.allows_tool(&inst("builtin.shell"), "shell"),
+            "without facade:shell, the builtin.shell tool must be denied"
+        );
+        assert!(!b.candidate_instances().contains(&inst("builtin.shell")));
+    }
+
+    #[test]
+    fn unrelated_facade_does_not_project_the_shell_tool() {
+        // facade:edit_input is a different surface; it must NOT grant shell.
+        let mut b = ContextToolBinding::new();
+        b.grant(Capability::Facade("edit_input".into()));
+        assert!(!b.allows_tool(&inst("builtin.shell"), "shell"));
+        assert!(!b.candidate_instances().contains(&inst("builtin.shell")));
     }
 
     #[test]
@@ -523,9 +621,12 @@ mod tests {
         assert!(b.allows(&Capability::Facade("shell".into())));
         assert!(!b.allows(&Capability::Facade("edit_input".into())));
 
+        // `builtin.shell` joins the candidates because `facade:shell` was
+        // granted above — the facade projects the in-kernel shell tool so the
+        // server is selected by list_visible_tools (FACADE_PROJECTED_INSTANCES).
         let mut cands = b.candidate_instances();
         cands.sort();
-        assert_eq!(cands, vec![inst("block"), inst("file")]);
+        assert_eq!(cands, vec![inst("block"), inst("builtin.shell"), inst("file")]);
     }
 
     #[test]
