@@ -38,12 +38,6 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ## Event Plumbing (FlowBus) — June 2026 audit
 
-- **Delete `ConfigFlow`:** emitted from six sites in `config_backend.rs`,
-  zero subscribers anywhere; config changes propagate via doc sync + file
-  watcher. Remove the flow type (`flows.rs:898-941`), the bus creation
-  (`rpc.rs:936`), and the emit calls. Decision 2026-06-10: delete rather
-  than wire a subscriber; re-add with a real consumer if live-reload UX
-  ever materializes.
 - **Finish the `OutputChanged` migration:** output currently rides the
   *deprecated* `StatusChanged.output` field (`flows.rs:286`) while the
   successor `OutputChanged` variant is published (`block_store.rs:1598`)

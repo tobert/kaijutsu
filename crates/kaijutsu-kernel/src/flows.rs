@@ -196,16 +196,6 @@ impl FlowTopics for BlockFlow {
     }
 }
 
-impl FlowTopics for ConfigFlow {
-    const TOPICS: &[&'static str] = &[
-        "config.loaded",
-        "config.changed",
-        "config.reload_requested",
-        "config.reset",
-        "config.validation_failed",
-    ];
-}
-
 impl FlowTopics for InputDocFlow {
     const TOPICS: &[&'static str] = &["input.text_ops", "input.cleared"];
 }
@@ -900,99 +890,6 @@ impl std::fmt::Display for ConfigSource {
     }
 }
 
-/// Config-related flow events.
-///
-/// These events are emitted when config files are loaded, changed, or reloaded.
-/// The config system supports both file-backed and CRDT-backed config documents.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum ConfigFlow {
-    /// A config file was loaded (at startup or on demand).
-    Loaded {
-        /// Relative path within config directory (e.g., "theme.toml").
-        path: String,
-        /// Where the config was loaded from.
-        source: ConfigSource,
-        /// Content of the loaded config.
-        content: String,
-    },
-
-    /// Config content changed (either from CRDT edit or file watcher).
-    Changed {
-        /// Relative path within config directory.
-        path: String,
-        /// Serialized CRDT operations (for sync).
-        /// Arc-wrapped to avoid per-subscriber deep cloning.
-        ops: Arc<[u8]>,
-        /// Origin of this operation (Local or Remote).
-        source: OpSource,
-    },
-
-    /// User requested a config reload from disk (safety valve).
-    ReloadRequested {
-        /// Relative path within config directory (or "all" for all configs).
-        path: String,
-    },
-
-    /// Config was reset to embedded default.
-    Reset {
-        /// Relative path within config directory.
-        path: String,
-    },
-
-    /// Config validation failed (on flush to disk or apply).
-    ValidationFailed {
-        /// Relative path within config directory.
-        path: String,
-        /// Error message describing the validation failure.
-        error: String,
-        /// Content that failed validation.
-        content: String,
-    },
-}
-
-impl ConfigFlow {
-    /// Get the subject string for this event.
-    pub fn subject(&self) -> &'static str {
-        match self {
-            Self::Loaded { .. } => "config.loaded",
-            Self::Changed { .. } => "config.changed",
-            Self::ReloadRequested { .. } => "config.reload_requested",
-            Self::Reset { .. } => "config.reset",
-            Self::ValidationFailed { .. } => "config.validation_failed",
-        }
-    }
-
-    /// Get the path for this event.
-    pub fn path(&self) -> &str {
-        match self {
-            Self::Loaded { path, .. }
-            | Self::Changed { path, .. }
-            | Self::ReloadRequested { path, .. }
-            | Self::Reset { path, .. }
-            | Self::ValidationFailed { path, .. } => path,
-        }
-    }
-
-    /// Get the source of this event (for Changed events).
-    pub fn op_source(&self) -> Option<OpSource> {
-        match self {
-            Self::Changed { source, .. } => Some(*source),
-            _ => None,
-        }
-    }
-
-    /// Check if this event originated locally.
-    pub fn is_local(&self) -> bool {
-        self.op_source() == Some(OpSource::Local)
-    }
-}
-
-impl HasSubject for ConfigFlow {
-    fn subject(&self) -> &'static str {
-        ConfigFlow::subject(self)
-    }
-}
-
 // ============================================================================
 // Input Doc Flow Events
 // ============================================================================
@@ -1138,9 +1035,6 @@ impl HasSubject for TurnFlow {
 /// Thread-safe handle to a BlockFlow bus.
 pub type SharedBlockFlowBus = Arc<FlowBus<BlockFlow>>;
 
-/// Thread-safe handle to a ConfigFlow bus.
-pub type SharedConfigFlowBus = Arc<FlowBus<ConfigFlow>>;
-
 /// Thread-safe handle to an InputDocFlow bus.
 pub type SharedInputDocFlowBus = Arc<FlowBus<InputDocFlow>>;
 
@@ -1149,11 +1043,6 @@ pub type SharedTurnFlowBus = Arc<FlowBus<TurnFlow>>;
 
 /// Create a new shared block flow bus.
 pub fn shared_block_flow_bus(capacity: usize) -> SharedBlockFlowBus {
-    Arc::new(FlowBus::new(capacity))
-}
-
-/// Create a new shared config flow bus.
-pub fn shared_config_flow_bus(capacity: usize) -> SharedConfigFlowBus {
     Arc::new(FlowBus::new(capacity))
 }
 
@@ -1586,29 +1475,6 @@ mod tests {
     // ====================================================================
 
     #[tokio::test]
-    async fn test_config_flow_topics() {
-        let bus: FlowBus<ConfigFlow> = FlowBus::new(16);
-        let mut loaded_sub = bus.subscribe("config.loaded");
-        let mut changed_sub = bus.subscribe("config.changed");
-
-        bus.publish(ConfigFlow::Loaded {
-            path: "theme.toml".into(),
-            source: ConfigSource::Disk,
-            content: "{}".into(),
-        });
-        bus.publish(ConfigFlow::Changed {
-            path: "theme.toml".into(),
-            ops: Arc::from(vec![]),
-            source: OpSource::Local,
-        });
-
-        assert!(loaded_sub.try_recv().is_some());
-        assert!(loaded_sub.try_recv().is_none());
-        assert!(changed_sub.try_recv().is_some());
-        assert!(changed_sub.try_recv().is_none());
-    }
-
-    #[tokio::test]
     async fn test_input_doc_flow_topics() {
         let bus: FlowBus<InputDocFlow> = FlowBus::new(16);
         let mut ops_sub = bus.subscribe("input.text_ops");
@@ -1839,45 +1705,6 @@ mod tests {
         }
 
         assert_subjects_registered(&variants, BlockFlow::TOPICS);
-    }
-
-    #[test]
-    fn test_config_flow_all_subjects_in_topics() {
-        let variants = vec![
-            ConfigFlow::Loaded {
-                path: "theme.toml".into(),
-                source: ConfigSource::Disk,
-                content: "{}".into(),
-            },
-            ConfigFlow::Changed {
-                path: "theme.toml".into(),
-                ops: Arc::from(Vec::<u8>::new()),
-                source: OpSource::Local,
-            },
-            ConfigFlow::ReloadRequested {
-                path: "theme.toml".into(),
-            },
-            ConfigFlow::Reset {
-                path: "theme.toml".into(),
-            },
-            ConfigFlow::ValidationFailed {
-                path: "theme.toml".into(),
-                error: "bad".into(),
-                content: "{".into(),
-            },
-        ];
-
-        for v in &variants {
-            match v {
-                ConfigFlow::Loaded { .. }
-                | ConfigFlow::Changed { .. }
-                | ConfigFlow::ReloadRequested { .. }
-                | ConfigFlow::Reset { .. }
-                | ConfigFlow::ValidationFailed { .. } => {}
-            }
-        }
-
-        assert_subjects_registered(&variants, ConfigFlow::TOPICS);
     }
 
     #[test]

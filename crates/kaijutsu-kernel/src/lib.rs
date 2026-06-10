@@ -118,7 +118,6 @@ pub use file_tools::{
 // broadcast on each ExternalMcpServer.
 pub use flows::{
     BlockFlow,
-    ConfigFlow,
     ConfigSource,
     FlowBus,
     FlowMessage,
@@ -126,11 +125,9 @@ pub use flows::{
     InputDocFlow,
     OpSource,
     SharedBlockFlowBus,
-    SharedConfigFlowBus,
     SharedInputDocFlowBus,
     Subscription,
     shared_block_flow_bus,
-    shared_config_flow_bus,
     shared_input_doc_flow_bus,
 };
 pub use input_doc::InputDocEntry;

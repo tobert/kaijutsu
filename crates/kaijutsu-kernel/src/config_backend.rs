@@ -40,7 +40,7 @@ use tokio::sync::mpsc;
 use kaijutsu_crdt::{BlockId, BlockKind, ContentType, ContextId, Role, Status};
 
 use crate::block_store::SharedBlockStore;
-use crate::flows::{ConfigFlow, ConfigSource, OpSource, SharedConfigFlowBus};
+use crate::flows::ConfigSource;
 use kaijutsu_types::DocKind;
 
 /// Derive a deterministic ContextId from a config path.
@@ -201,8 +201,6 @@ pub struct ConfigCrdtBackend {
     watcher_event_tx: mpsc::Sender<ConfigFileChange>,
     /// Receiver for file change events (moved to watcher task).
     watcher_event_rx: RwLock<Option<mpsc::Receiver<ConfigFileChange>>>,
-    /// FlowBus for config events.
-    config_flows: Option<SharedConfigFlowBus>,
     /// In-progress flush paths (to prevent echo loops).
     flushing: DashMap<String, ()>,
     /// Reverse map: config path -> ContextId (for list_configs).
@@ -220,27 +218,6 @@ impl ConfigCrdtBackend {
             dirty: DirtyTracker::new(Duration::from_millis(500)),
             watcher_event_tx: tx,
             watcher_event_rx: RwLock::new(Some(rx)),
-            config_flows: None,
-            flushing: DashMap::new(),
-            config_paths: DashMap::new(),
-        }
-    }
-
-    /// Create with FlowBus for config events.
-    pub fn with_flows(
-        blocks: SharedBlockStore,
-        config_root: PathBuf,
-        config_flows: SharedConfigFlowBus,
-    ) -> Self {
-        let (tx, rx) = mpsc::channel(256);
-
-        Self {
-            blocks,
-            config_root,
-            dirty: DirtyTracker::new(Duration::from_millis(500)),
-            watcher_event_tx: tx,
-            watcher_event_rx: RwLock::new(Some(rx)),
-            config_flows: Some(config_flows),
             flushing: DashMap::new(),
             config_paths: DashMap::new(),
         }
@@ -274,13 +251,6 @@ impl ConfigCrdtBackend {
             .blocks_ordered()
             .first()
             .map(|b| b.id)
-    }
-
-    /// Emit a ConfigFlow event.
-    fn emit(&self, flow: ConfigFlow) {
-        if let Some(bus) = &self.config_flows {
-            bus.publish(flow);
-        }
     }
 
     /// Ensure a config file exists, loading from disk or creating from default.
@@ -330,11 +300,6 @@ impl ConfigCrdtBackend {
                     ContentType::Plain,
                 )
                 .map_err(|e| ConfigError::Crdt(e.to_string()))?;
-            self.emit(ConfigFlow::Loaded {
-                path: path.to_string(),
-                source: ConfigSource::Default,
-                content,
-            });
             return Ok(ConfigSource::Default);
         }
 
@@ -377,13 +342,6 @@ impl ConfigCrdtBackend {
                 ContentType::Plain,
             )
             .map_err(|e| ConfigError::Crdt(e.to_string()))?;
-
-        // Emit loaded event
-        self.emit(ConfigFlow::Loaded {
-            path: path.to_string(),
-            source,
-            content: content.clone(),
-        });
 
         tracing::info!(path = %path, source = %source, "loaded config");
         Ok(source)
@@ -452,13 +410,6 @@ impl ConfigCrdtBackend {
                 .map_err(|e| ConfigError::Crdt(e.to_string()))?;
         }
 
-        // Emit loaded event
-        self.emit(ConfigFlow::Loaded {
-            path: path.to_string(),
-            source: ConfigSource::Disk,
-            content,
-        });
-
         tracing::info!(path = %path, "reloaded config from disk");
         Ok(())
     }
@@ -517,11 +468,6 @@ impl ConfigCrdtBackend {
         }
         tokio::fs::write(&disk_path, &default_content).await?;
 
-        // Emit reset event
-        self.emit(ConfigFlow::Reset {
-            path: path.to_string(),
-        });
-
         tracing::info!(path = %path, "reset config to default");
         Ok(())
     }
@@ -568,12 +514,6 @@ impl ConfigCrdtBackend {
         // Validate before writing
         let validation = self.validate(path, &content);
         if !validation.valid {
-            // Emit validation failed event
-            self.emit(ConfigFlow::ValidationFailed {
-                path: path.to_string(),
-                error: validation.error.clone().unwrap_or_default(),
-                content: content.clone(),
-            });
             return Ok(validation);
         }
 
@@ -794,13 +734,6 @@ impl ConfigCrdtBackend {
                         )
                         .map_err(|e| ConfigError::Crdt(e.to_string()))?;
                 }
-
-                // Emit changed event (source is Remote since it came from external edit)
-                self.emit(ConfigFlow::Changed {
-                    path: event.path.clone(),
-                    ops: std::sync::Arc::from(Vec::<u8>::new()), // TODO: Could include CRDT ops here
-                    source: OpSource::Remote,
-                });
             }
             ConfigChangeKind::Deleted => {
                 // For config files, we don't delete the CRDT document

@@ -97,13 +97,11 @@ use kaijutsu_kernel::{
     PeerInfo,
     SharedBlockFlowBus,
     SharedBlockStore,
-    SharedConfigFlowBus,
     SharedInputDocFlowBus,
     VfsOps,
     block_store::BlockStore,
     flows::TurnFlow,
     shared_block_flow_bus,
-    shared_config_flow_bus,
     shared_input_doc_flow_bus,
 };
 use kaijutsu_types::{ContextId, KernelId, Principal, PrincipalId, SessionId};
@@ -650,18 +648,13 @@ fn config_dir() -> std::path::PathBuf {
 /// Returns the backend and optional watcher handle.
 async fn create_config_backend(
     documents: SharedBlockStore,
-    config_flows: SharedConfigFlowBus,
     config_path_override: Option<&Path>,
 ) -> (Arc<ConfigCrdtBackend>, Option<ConfigWatcherHandle>) {
     let config_path = config_path_override
         .map(|p| p.to_path_buf())
         .unwrap_or_else(config_dir);
 
-    let backend = Arc::new(ConfigCrdtBackend::with_flows(
-        documents,
-        config_path,
-        config_flows,
-    ));
+    let backend = Arc::new(ConfigCrdtBackend::new(documents, config_path));
 
     // Load base theme config
     if let Err(e) = backend.ensure_config("theme.toml").await {
@@ -934,7 +927,6 @@ pub async fn create_shared_kernel(
 ) -> Result<SharedKernel, capnp::Error> {
     // Create shared FlowBus instances - shared between Kernel and BlockStore
     let block_flows = shared_block_flow_bus(1024);
-    let config_flows = shared_config_flow_bus(256);
     let input_flows = shared_input_doc_flow_bus(256);
 
     // Resolve stable data directory (used for block store DB, kernel DB, semantic index)
@@ -1050,7 +1042,7 @@ pub async fn create_shared_kernel(
 
     // Create config backend
     let (config_backend, config_watcher) =
-        create_config_backend(documents.clone(), config_flows, config_dir).await;
+        create_config_backend(documents.clone(), config_dir).await;
 
     let kernel_arc = Arc::new(kernel);
     let workspace_guard = Some(kaijutsu_kernel::file_tools::WorkspaceGuard::new(
