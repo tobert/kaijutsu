@@ -36,6 +36,92 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   at `fork`, where an rc script decides to elide thinking or downgrade it to
   plain blocks.
 
+## Event Plumbing (FlowBus) — June 2026 audit
+
+- **`ContextSwitched` events dropped at publish (bug, fix first):**
+  `"block.context_switched"` is missing from `BlockFlow::TOPICS`
+  (`flows.rs:176-187`), but the server publishes the variant (`rpc.rs:5898`)
+  and both subscriber loops have handler arms for it (`rpc.rs:2109`, `:4815`).
+  FlowBus pre-creates channels per registered topic, so the publish hits
+  "published to unknown topic" (`flows.rs:599`) and vanishes. Likely a
+  contributing factor to the switch-context-doesn't-change-screens debt.
+  Fix + add a test asserting every variant's `subject()` is in `TOPICS`.
+- **Delete `ConfigFlow`:** emitted from six sites in `config_backend.rs`,
+  zero subscribers anywhere; config changes propagate via doc sync + file
+  watcher. Remove the flow type (`flows.rs:898-941`), the bus creation
+  (`rpc.rs:936`), and the emit calls. Decision 2026-06-10: delete rather
+  than wire a subscriber; re-add with a real consumer if live-reload UX
+  ever materializes.
+- **Finish the `OutputChanged` migration:** output currently rides the
+  *deprecated* `StatusChanged.output` field (`flows.rs:286`) while the
+  successor `OutputChanged` variant is published (`block_store.rs:1598`)
+  then explicitly discarded by both subscriber loops (`rpc.rs:2138`,
+  `:4844`). Make `OutputChanged` a real wire event, migrate clients, then
+  drop the `output` field from `StatusChanged`. Decision 2026-06-10.
+- **`InputDocFlow` wiring is optional by construction:**
+  `block_store.rs:204` holds `Option<SharedInputDocFlowBus>`; forget
+  `set_input_flows()` and input events silently vanish. Consider
+  constructor injection.
+- **`SyncReset` never emitted (intentional, note only):** per-block DTE
+  stores skip compaction so `sync_generation` stays 0 (`rpc.rs:3988`);
+  client receive paths exist but are untested live machinery. Revisit when
+  compaction returns.
+
+## Drift — June 2026 audit
+
+- **Extract `ContextRegistry` from `DriftRouter`:** DriftRouter carries ~7
+  responsibilities (context registry, per-context LLM config, staging
+  queue, dead-letter queue, lost+found lifecycle, context state, trace-ID
+  assignment) — `drift.rs:172-563`. Everything that needs "what contexts
+  exist" takes a dependency on drift, inverting the hierarchy. Pull
+  register/resolve/list/llm-config/trace-id into a `ContextRegistry`;
+  drift keeps the queues. Cold-start hydration (`rpc.rs:1150-1183`) moves
+  with the registry.
+- **`drift_flush` is non-atomic over the router lock:** takes the write
+  lock four separate times (`kj/drift.rs:422`, `:510`, `:516`, `:521`),
+  allowing interleaving with concurrent stage/cancel between windows.
+  Document why that's safe or restructure drain→requeue as one critical
+  section. (The suspected lock-across-await is NOT real — db lock at
+  `:455-471` drops before the `:487` await.)
+- **`kj/drift.rs` orchestration bloat:** push/pull/merge/flush each inline
+  variations of "insert drift block + record edge + run rc lifecycle".
+  Extract the shared operation; the command layer should dispatch, not
+  orchestrate.
+- **Drift distillation half-integrated:** `build_distillation_prompt`
+  machinery sits behind a "drift engines removed" comment + TODO
+  (`drift.rs:602-665`). Decide: integrate or delete.
+
+## Turn Loop (kaijutsu-server/src/llm_stream.rs) — June 2026 audit
+
+- **Silent hydration fallback (fix first):** when block reads fail during
+  mailbox catch-up, the model silently gets an empty session
+  (`llm_stream.rs:371`, has a TODO admitting it). Violates the
+  no-silent-fallbacks directive — surface a loud `BlockKind::Error` block.
+- **Decompose the agentic loop** (after FlowBus settles; they share event
+  paths): mailbox catch-up/snapshot (`:341-391`), cache-breakpoint policy
+  via ad-hoc DB reads (`:500-511`), one-shot image resolution that goes
+  stale across tool iterations (`:403`), dual-layer timeout semantics
+  (`:603-634`) are all inlined in one ~1,235-line file.
+
+## Cleanup — June 2026 audit
+
+- **Delete dead RPC stubs + capnp schema entries** (decision 2026-06-10:
+  all of them; re-add when a phase actually ships them): blob API
+  (`rpc.rs:2785-2835`, "blob API removed"), `register_mcp`/`unregister_mcp`
+  (`rpc.rs:2743`, `:2753`, "offline until Phase 2"), `read_mcp_resource`
+  (`rpc.rs:3103`, "Phase 3"). Purge matching methods from
+  `kaijutsu.capnp`. NOTE: the playback design (docs/playback.md) needs a
+  *narrow read-only CAS fetch-by-hash* RPC — that is a new, scoped method,
+  not a reprieve for the old generic blob API. Delete the old; design the
+  replacement per the playback prep list.
+- **Drop `rhai`/`ron` language-ID mappings** in
+  `file_tools/cache.rs:567,572` — vestigial from the Rhai/RON removal,
+  nothing consumes them.
+- **App-side ABC parse failure renders `Tune::default()` silently**
+  (`kaijutsu-app/src/text/rich.rs:413-423`) — render the kernel's
+  structured ABC error spans instead. Also: the app re-parses ABC on every
+  view; consider a cached AST keyed on block content version.
+
 ## Persistence & Sync
 
 - **`KernelDb` connection pool:** Currently `Arc<parking_lot::Mutex<KernelDb>>` (`block_store.rs:74`). This bottleneck prevents utilizing SQLite's WAL mode for concurrent readers. Migrate to `r2d2` or `sqlx` to allow non-blocking reads during LLM streams and heavy writes. Note: SQLite serializes *writes* regardless of pooling, so the win is concurrent reads (and only with WAL enabled) — verify WAL before assuming a pool helps; narrowing lock scope may matter as much.
@@ -111,6 +197,20 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   today; add a `Midi` variant + renderer, and the scrubbable timeline render.
 - **Trace span attribute:** attach `hyoushigi.tick` on the materialize→insert
   spans now that a producer exists.
+- **Playback via peer sinks — design settled, see `docs/playback.md`:**
+  peers advertise sound output at attach; kernel schedules objects via
+  hyoushigi (materialized beat blocks = the scheduling unit); sinks pull
+  from CAS and fire on a locally-held clock. Decisions 2026-06-10:
+  pull-from-CAS (out-of-band capable later), transport state on FlowBus
+  (new `TransportFlow`), and a **pause/stop verb remap** — pause = mute
+  (clock keeps running, presentation-only, no BeatCommand), stop = clock
+  freeze + OODA disarm (today's `BeatCommand::Pause`/`Stop`,
+  `kj/transport.rs:43-54`). Prep checklist + slices in the doc; slice one
+  is sink advertisement + clock distribution + a local 拍子木 metronome
+  click. Scheduled after the registry extraction + FlowBus cleanups.
+  Longer-term design conversation, not a task yet: unify hyoushigi
+  beat-time and conversation wall-time ("the conversation has a tempo")
+  so the timeline is the kernel's one clock rather than a music sidecar.
 
 ## Testing & Tooling
 
