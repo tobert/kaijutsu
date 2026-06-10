@@ -38,12 +38,6 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ## Event Plumbing (FlowBus) — June 2026 audit
 
-- **Finish the `OutputChanged` migration:** output currently rides the
-  *deprecated* `StatusChanged.output` field (`flows.rs:286`) while the
-  successor `OutputChanged` variant is published (`block_store.rs:1598`)
-  then explicitly discarded by both subscriber loops (`rpc.rs:2138`,
-  `:4844`). Make `OutputChanged` a real wire event, migrate clients, then
-  drop the `output` field from `StatusChanged`. Decision 2026-06-10.
 - **`InputDocFlow` wiring is optional by construction:**
   `block_store.rs:204` holds `Option<SharedInputDocFlowBus>`; forget
   `set_input_flows()` and input events silently vanish. Consider

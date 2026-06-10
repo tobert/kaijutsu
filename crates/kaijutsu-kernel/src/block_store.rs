@@ -1229,20 +1229,13 @@ impl BlockStore {
         };
         self.journal_op(context_id, ops)?;
 
-        // Emit flow event
-        // Include output data if present — output is a struct field that can't
-        // travel via DTE ops, so we piggyback it on StatusChanged
-        let output = {
-            let entry = self.get(context_id);
-            entry
-                .and_then(|e| e.doc.get_block_snapshot(block_id))
-                .and_then(|s| s.output)
-        };
+        // Emit flow event. Output is not carried here — it is a struct field
+        // that can't travel via DTE ops and rides its own `OutputChanged`
+        // event (see `set_output`).
         self.emit(BlockFlow::StatusChanged {
             context_id,
             block_id: *block_id,
             status,
-            output,
             source: OpSource::Local,
         });
 
@@ -1576,8 +1569,8 @@ impl BlockStore {
     /// Set structured output data on a block.
     ///
     /// Output data provides formatting information (tables, trees) for richer output.
-    /// Emits `OutputChanged` flow event. Also piggybacked on `StatusChanged` for
-    /// wire compat — see `set_status`.
+    /// Emits the `OutputChanged` flow event — output is not DTE-tracked, so it
+    /// rides its own event rather than the block text op stream.
     pub fn set_output(
         &self,
         context_id: ContextId,
@@ -1789,8 +1782,10 @@ impl BlockStore {
     /// Compare block snapshots before/after a merge and produce BlockFlow events.
     ///
     /// Detects new blocks (Inserted), removed blocks (Deleted), status changes,
-    /// collapsed changes, and text changes. All events carry `OpSource::Remote`
-    /// and share the same ops blob (CRDT dedup handles multiple merges).
+    /// output changes (OutputChanged — output is not DTE-tracked so it rides its
+    /// own event), collapsed changes, and text changes. All events carry
+    /// `OpSource::Remote` and share the same ops blob (CRDT dedup handles
+    /// multiple merges).
     fn diff_block_events(
         &self,
         context_id: ContextId,
@@ -1842,6 +1837,13 @@ impl BlockStore {
                         context_id,
                         block_id: snap.id,
                         status: snap.status,
+                        source: OpSource::Remote,
+                    });
+                }
+                if old.output != snap.output {
+                    events.push(BlockFlow::OutputChanged {
+                        context_id,
+                        block_id: snap.id,
                         output: snap.output.clone(),
                         source: OpSource::Remote,
                     });
@@ -3550,6 +3552,54 @@ mod tests {
         let bus: SharedBlockFlowBus = Arc::new(FlowBus::new(256));
         let store = BlockStore::with_flows(test_agent(), bus.clone());
         (store, bus)
+    }
+
+    /// `set_output` must publish a dedicated `OutputChanged` flow event — not
+    /// piggyback the output on `StatusChanged`. A subscriber on the bus should
+    /// see the structured output ride its own event, which is what the server
+    /// bridge encodes onto the wire as `onBlockOutputChanged`.
+    #[tokio::test]
+    async fn test_set_output_emits_output_changed() {
+        use kaijutsu_types::{OutputData, OutputNode};
+
+        let (store, bus) = store_with_flows();
+        let mut sub = bus.subscribe("block.>");
+        let ctx = ContextId::new();
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+
+        let block_id = store
+            .insert_block(
+                ctx,
+                None,
+                None,
+                Role::Tool,
+                BlockKind::ToolResult,
+                "",
+                Status::Running,
+                ContentType::Plain,
+            )
+            .unwrap();
+        // Drain the BlockInserted event.
+        while sub.try_recv().is_some() {}
+
+        let output = OutputData::nodes(vec![OutputNode::text("row-one")]);
+        store.set_output(ctx, &block_id, Some(&output)).unwrap();
+
+        // The next event must be OutputChanged carrying our output — never a
+        // StatusChanged with a piggybacked output field (that field is gone).
+        let msg = sub.try_recv().expect("set_output should emit a flow event");
+        match msg.payload {
+            BlockFlow::OutputChanged { output: got, .. } => {
+                assert_eq!(
+                    got,
+                    Some(output),
+                    "OutputChanged must carry the structured output",
+                );
+            }
+            other => panic!("expected OutputChanged, got: {other:?}"),
+        }
     }
 
     /// Test that insert_block emits SyncPayload that can be merged by a client store.

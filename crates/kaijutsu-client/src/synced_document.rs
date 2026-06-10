@@ -80,6 +80,7 @@ impl SyncedDocument {
         match event {
             ServerEvent::BlockTextOps { block_id, .. }
             | ServerEvent::BlockStatusChanged { block_id, .. }
+            | ServerEvent::BlockOutputChanged { block_id, .. }
             | ServerEvent::BlockMetadataChanged { block_id, .. }
             | ServerEvent::BlockDeleted { block_id, .. }
             | ServerEvent::BlockCollapsedChanged { block_id, .. }
@@ -95,6 +96,7 @@ impl SyncedDocument {
             ServerEvent::BlockInserted { context_id, .. }
             | ServerEvent::BlockTextOps { context_id, .. }
             | ServerEvent::BlockStatusChanged { context_id, .. }
+            | ServerEvent::BlockOutputChanged { context_id, .. }
             | ServerEvent::BlockMetadataChanged { context_id, .. }
             | ServerEvent::BlockDeleted { context_id, .. }
             | ServerEvent::BlockCollapsedChanged { context_id, .. }
@@ -282,7 +284,6 @@ impl SyncedDocument {
                 context_id,
                 block_id,
                 status,
-                output,
             } => {
                 if *context_id != self.context_id {
                     return SyncEffect::Ignored;
@@ -290,9 +291,23 @@ impl SyncedDocument {
                 if let Err(e) = self.sync.apply_status_change(&mut self.doc, block_id, *status) {
                     warn!("SyncedDocument: set_status error: {e}");
                 }
-                // Apply piggybacked output data (output is not DTE-tracked)
-                if let Some(output_data) = output
-                    && let Err(e) = self.sync.apply_output_change(&mut self.doc, block_id, Some(output_data.clone()))
+                SyncEffect::Updated {
+                    block_count: self.doc.block_count(),
+                }
+            }
+
+            ServerEvent::BlockOutputChanged {
+                context_id,
+                block_id,
+                output,
+            } => {
+                if *context_id != self.context_id {
+                    return SyncEffect::Ignored;
+                }
+                // Output is not DTE-tracked — apply it directly to the store.
+                if let Err(e) =
+                    self.sync
+                        .apply_output_change(&mut self.doc, block_id, output.clone())
                 {
                     warn!("SyncedDocument: set_output error: {e}");
                 }
@@ -567,6 +582,36 @@ mod tests {
 
         assert!(matches!(effect, SyncEffect::Updated { block_count: 2 }));
         assert_eq!(sd.block_count(), 2);
+    }
+
+    #[test]
+    fn test_apply_event_output_changed() {
+        use kaijutsu_types::{OutputData, OutputNode};
+
+        let ctx = test_context_id();
+        let server = create_server_store(ctx);
+        let block_id = server.blocks_ordered()[0].id;
+        let state = SyncState {
+            context_id: ctx,
+            version: 1,
+            ops: snapshot_bytes(&server),
+        };
+        let mut sd = SyncedDocument::from_sync_state(&state, test_principal_id()).unwrap();
+        assert!(sd.get_block(&block_id).unwrap().output.is_none());
+
+        let output = OutputData::nodes(vec![OutputNode::text("row-one")]);
+        let effect = sd.apply_event(&ServerEvent::BlockOutputChanged {
+            context_id: ctx,
+            block_id,
+            output: Some(output.clone()),
+        });
+
+        assert!(matches!(effect, SyncEffect::Updated { .. }));
+        assert_eq!(
+            sd.get_block(&block_id).unwrap().output,
+            Some(output),
+            "BlockOutputChanged must apply structured output to the block",
+        );
     }
 
     #[test]
@@ -858,7 +903,6 @@ mod tests {
             context_id: ctx,
             block_id: out_id,
             status: kaijutsu_types::Status::Running,
-            output: None,
         });
         // Should be buffered, not dropped
         assert!(matches!(effect, SyncEffect::Updated { block_count: 1 }));
@@ -944,13 +988,11 @@ mod tests {
             context_id: ctx,
             block_id: out_id,
             status: kaijutsu_types::Status::Running,
-            output: None,
         });
         sd.apply_event(&ServerEvent::BlockStatusChanged {
             context_id: ctx,
             block_id: out_id,
             status: kaijutsu_types::Status::Done,
-            output: None,
         });
         assert_eq!(sd.pending_events[&out_id].len(), 2);
 
@@ -977,7 +1019,6 @@ mod tests {
             context_id: other,
             block_id: BlockId::new(other, PrincipalId::new(), 1),
             status: kaijutsu_types::Status::Done,
-            output: None,
         });
 
         // Should NOT be buffered (different context → ignored at inner level)

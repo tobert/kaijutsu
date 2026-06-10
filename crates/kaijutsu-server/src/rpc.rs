@@ -1919,16 +1919,13 @@ impl kernel::Server for KernelImpl {
                                         }
                                     }
                                 }
-                                BlockFlow::StatusChanged { context_id, ref block_id, status, ref output, .. } => {
+                                BlockFlow::StatusChanged { context_id, ref block_id, status, .. } => {
                                     let mut req = callback.on_block_status_changed_request();
                                     {
                                         let mut params = req.get();
                                         params.set_context_id(context_id.as_bytes());
                                         set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
                                         params.set_status(status_to_capnp(status));
-                                        if let Some(output_data) = output {
-                                            build_output_data(params.reborrow().init_output_data(), output_data);
-                                        }
                                     }
                                     match tokio::time::timeout(
                                         CALLBACK_TIMEOUT, req.send().promise,
@@ -2126,9 +2123,37 @@ impl kernel::Server for KernelImpl {
                                         }
                                     }
                                 }
-                                // OutputChanged is piggybacked on StatusChanged
-                                // (see the StatusChanged arm) — no separate wire event.
-                                BlockFlow::OutputChanged { .. } => true,
+                                BlockFlow::OutputChanged { context_id, ref block_id, ref output, .. } => {
+                                    let mut req = callback.on_block_output_changed_request();
+                                    {
+                                        let mut params = req.get();
+                                        params.set_context_id(context_id.as_bytes());
+                                        set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
+                                        if let Some(output_data) = output {
+                                            build_output_data(params.reborrow().init_output(), output_data);
+                                        }
+                                    }
+                                    match tokio::time::timeout(
+                                        CALLBACK_TIMEOUT, req.send().promise,
+                                    ).await {
+                                        Ok(Ok(_)) => true,
+                                        Ok(Err(e)) => {
+                                            log::debug!(
+                                                "FlowBus callback failed for {kernel_id}: {e}",
+                                            );
+                                            false
+                                        }
+                                        Err(_) => {
+                                            log::warn!(
+                                                "FlowBus callback timed out after {:?} \
+                                                 for kernel {kernel_id} — peer is not \
+                                                 reading; dropping subscriber",
+                                                CALLBACK_TIMEOUT,
+                                            );
+                                            false
+                                        }
+                                    }
+                                }
                                 BlockFlow::MetadataChanged { context_id, ref block_id, ref metadata, .. } => {
                                     let mut req = callback.on_block_metadata_changed_request();
                                     {
@@ -4623,16 +4648,13 @@ impl kernel::Server for KernelImpl {
                                         }
                                     }
                                 }
-                                BlockFlow::StatusChanged { context_id, ref block_id, status, ref output, .. } => {
+                                BlockFlow::StatusChanged { context_id, ref block_id, status, .. } => {
                                     let mut req = callback.on_block_status_changed_request();
                                     {
                                         let mut params = req.get();
                                         params.set_context_id(context_id.as_bytes());
                                         set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
                                         params.set_status(status_to_capnp(status));
-                                        if let Some(output_data) = output {
-                                            build_output_data(params.reborrow().init_output_data(), output_data);
-                                        }
                                     }
                                     match tokio::time::timeout(
                                         CALLBACK_TIMEOUT, req.send().promise,
@@ -4830,9 +4852,37 @@ impl kernel::Server for KernelImpl {
                                         }
                                     }
                                 }
-                                // OutputChanged is piggybacked on StatusChanged
-                                // (see the StatusChanged arm) — no separate wire event.
-                                BlockFlow::OutputChanged { .. } => true,
+                                BlockFlow::OutputChanged { context_id, ref block_id, ref output, .. } => {
+                                    let mut req = callback.on_block_output_changed_request();
+                                    {
+                                        let mut params = req.get();
+                                        params.set_context_id(context_id.as_bytes());
+                                        set_block_id_builder(&mut params.reborrow().init_block_id(), block_id);
+                                        if let Some(output_data) = output {
+                                            build_output_data(params.reborrow().init_output(), output_data);
+                                        }
+                                    }
+                                    match tokio::time::timeout(
+                                        CALLBACK_TIMEOUT, req.send().promise,
+                                    ).await {
+                                        Ok(Ok(_)) => true,
+                                        Ok(Err(e)) => {
+                                            log::debug!(
+                                                "FlowBus callback failed for {kernel_id}: {e}",
+                                            );
+                                            false
+                                        }
+                                        Err(_) => {
+                                            log::warn!(
+                                                "FlowBus callback timed out after {:?} \
+                                                 for kernel {kernel_id} — peer is not \
+                                                 reading; dropping subscriber",
+                                                CALLBACK_TIMEOUT,
+                                            );
+                                            false
+                                        }
+                                    }
+                                }
                                 BlockFlow::MetadataChanged { context_id, ref block_id, ref metadata, .. } => {
                                     let mut req = callback.on_block_metadata_changed_request();
                                     {

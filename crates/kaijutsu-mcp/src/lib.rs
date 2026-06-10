@@ -1704,20 +1704,26 @@ fn apply_server_event(
             context_id: event_ctx_id,
             block_id,
             status,
+        } => {
+            if event_ctx_id != context_id {
+                return;
+            }
+            // Use store's set_status — handles version bump and flow events
+            if let Err(e) = store.set_status(context_id, &block_id, status) {
+                tracing::warn!("BlockStatusChanged error: {e}");
+            }
+        }
+        ServerEvent::BlockOutputChanged {
+            context_id: event_ctx_id,
+            block_id,
             ref output,
         } => {
             if event_ctx_id != context_id {
                 return;
             }
-            // Apply piggybacked output data (not DTE-tracked)
-            if let Some(output_data) = output
-                && let Err(e) = store.set_output(context_id, &block_id, Some(output_data))
-            {
-                tracing::warn!("BlockStatusChanged set_output error: {e}");
-            }
-            // Use store's set_status — handles version bump and flow events
-            if let Err(e) = store.set_status(context_id, &block_id, status) {
-                tracing::warn!("BlockStatusChanged error: {e}");
+            // Output is not DTE-tracked — apply it directly to the store.
+            if let Err(e) = store.set_output(context_id, &block_id, output.as_ref()) {
+                tracing::warn!("BlockOutputChanged set_output error: {e}");
             }
         }
         ServerEvent::BlockMetadataChanged {
@@ -2365,7 +2371,6 @@ mod tests {
                 context_id: ctx_id,
                 block_id,
                 status: Status::Error,
-                output: None,
             },
         );
 
@@ -2554,7 +2559,6 @@ mod tests {
                 context_id: ctx_id,
                 block_id: first_new_block,
                 status: Status::Running,
-                output: None,
             },
         );
 
@@ -2663,7 +2667,6 @@ mod tests {
                 context_id: ctx_id,
                 block_id: BlockId::new(ctx_id, ghost_agent, 999),
                 status: Status::Done,
-                output: None,
             },
         );
 

@@ -274,10 +274,6 @@ pub enum BlockFlow {
         block_id: BlockId,
         /// The new status.
         status: Status,
-        /// DEPRECATED: Piggybacked for wire compat. Prefer `OutputChanged` event.
-        /// Remove once `onBlockStatusChanged` drops `outputData` from Cap'n Proto schema.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        output: Option<kaijutsu_types::OutputData>,
         /// Origin of this operation (Local or Remote).
         #[serde(default)]
         source: OpSource,
@@ -1140,7 +1136,6 @@ mod tests {
                 context_id: ctx,
                 block_id: id,
                 status: Status::Done,
-                output: None,
                 source: OpSource::Local,
             }
             .subject(),
@@ -1179,7 +1174,6 @@ mod tests {
             context_id: ctx,
             block_id: id,
             status: Status::Done,
-            output: None,
             source: OpSource::Local,
         };
         assert_eq!(flow.subject(), "block.status");
@@ -1215,7 +1209,6 @@ mod tests {
             context_id: ctx,
             block_id: id,
             status: Status::Done,
-            output: None,
             source: OpSource::Local,
         });
 
@@ -1261,7 +1254,6 @@ mod tests {
             context_id: ctx,
             block_id: id,
             status: Status::Done,
-            output: None,
             source: OpSource::Local,
         });
         bus.publish(BlockFlow::CollapsedChanged {
@@ -1346,7 +1338,6 @@ mod tests {
             context_id: ctx,
             block_id: id,
             status: Status::Running,
-            output: None,
             source: OpSource::Local,
         });
 
@@ -1646,7 +1637,6 @@ mod tests {
                 context_id: ctx,
                 block_id: id,
                 status: Status::Done,
-                output: None,
                 source: OpSource::Local,
             },
             BlockFlow::CollapsedChanged {

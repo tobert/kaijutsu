@@ -169,6 +169,7 @@ pub fn handle_block_events(
             ServerEvent::BlockInserted { context_id, .. }
             | ServerEvent::BlockTextOps { context_id, .. }
             | ServerEvent::BlockStatusChanged { context_id, .. }
+            | ServerEvent::BlockOutputChanged { context_id, .. }
             | ServerEvent::BlockDeleted { context_id, .. }
             | ServerEvent::BlockCollapsedChanged { context_id, .. }
             | ServerEvent::BlockExcludedChanged { context_id, .. }

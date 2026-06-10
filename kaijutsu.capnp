@@ -367,7 +367,7 @@ interface BlockEvents {
   onBlockDeleted @1 (contextId :Data, blockId :BlockId);
   onBlockCollapsed @2 (contextId :Data, blockId :BlockId, collapsed :Bool);
   onBlockMoved @3 (contextId :Data, blockId :BlockId, afterId :BlockId, hasAfterId :Bool);
-  onBlockStatusChanged @4 (contextId :Data, blockId :BlockId, status :Status, outputData :OutputData);
+  onBlockStatusChanged @4 (contextId :Data, blockId :BlockId, status :Status);
   # `seqNum` is a per-context monotonic counter (M2-B2). Clients use it
   # to detect dropped events when the broadcast channel overflows; on a
   # gap, re-fetch via `getContextSync` / `getInputState`.
@@ -388,6 +388,10 @@ interface BlockEvents {
   # directly to the client store — frontier-independent, so it survives a
   # reconnect even when text ops are gated behind a full resync.
   onBlockMetadataChanged @11 (contextId :Data, blockId :BlockId, metadata :BlockMetadata);
+
+  # Structured output data changed (output is not DTE-tracked, so it rides
+  # its own event rather than the block text op stream).
+  onBlockOutputChanged @12 (contextId :Data, blockId :BlockId, output :OutputData);
 }
 
 # ============================================================================

@@ -49,7 +49,12 @@ pub enum ServerEvent {
         context_id: ContextId,
         block_id: BlockId,
         status: kaijutsu_types::Status,
-        /// Structured output data piggybacked on status change (output is not DTE-tracked).
+    },
+    /// A block's structured output data changed. Output is not DTE-tracked, so
+    /// it rides its own event rather than the block text op stream.
+    BlockOutputChanged {
+        context_id: ContextId,
+        block_id: BlockId,
         output: Option<kaijutsu_types::OutputData>,
     },
     /// A block's scalar metadata changed (exit_code, stderr, content_type, …).
@@ -467,21 +472,56 @@ impl block_events::Server for BlockEventsForwarder {
             Err(e) => return Promise::err(e.into()),
         };
 
-        // Parse optional outputData
-        let output = params
-            .get_output_data()
-            .ok()
-            .and_then(|r| crate::rpc::parse_output_data(r).ok())
-            .filter(|d| !d.root.is_empty() || d.headers.is_some());
-
         let event = ServerEvent::BlockStatusChanged {
             context_id,
             block_id,
             status,
-            output,
         };
         if self.event_tx.send(event).is_err() {
             tracing::warn!("Event channel closed, dropping BlockStatusChanged event");
+        }
+        Promise::ok(())
+    }
+
+    fn on_block_output_changed(
+        self: Rc<Self>,
+        params: block_events::OnBlockOutputChangedParams,
+        _results: block_events::OnBlockOutputChangedResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = match params.get() {
+            Ok(p) => p,
+            Err(e) => return Promise::err(e),
+        };
+
+        let context_id = match params.get_context_id() {
+            Ok(s) => match parse_context_id_data(s) {
+                Ok(id) => id,
+                Err(e) => return Promise::err(e),
+            },
+            Err(e) => return Promise::err(e),
+        };
+
+        let block_id = match params.get_block_id() {
+            Ok(b) => match parse_block_id(&b) {
+                Ok(id) => id,
+                Err(e) => return Promise::err(rpc_to_capnp(e)),
+            },
+            Err(e) => return Promise::err(e),
+        };
+
+        let output = params
+            .get_output()
+            .ok()
+            .and_then(|r| crate::rpc::parse_output_data(r).ok())
+            .filter(|d| !d.root.is_empty() || d.headers.is_some());
+
+        let event = ServerEvent::BlockOutputChanged {
+            context_id,
+            block_id,
+            output,
+        };
+        if self.event_tx.send(event).is_err() {
+            tracing::warn!("Event channel closed, dropping BlockOutputChanged event");
         }
         Promise::ok(())
     }
