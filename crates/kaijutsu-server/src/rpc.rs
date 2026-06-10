@@ -2752,30 +2752,6 @@ impl kernel::Server for KernelImpl {
     // =========================================================================
     // MCP (legacy — removed in Phase 1 M5)
     // =========================================================================
-    //
-    // The RPC methods below kept their capnp ordinals so wire compatibility is
-    // preserved, but return `Unimplemented` until Phase 2 rewires external MCP
-    // administration through the broker.
-
-    fn register_mcp(
-        self: Rc<Self>,
-        _params: kernel::RegisterMcpParams,
-        _results: kernel::RegisterMcpResults,
-    ) -> Promise<(), capnp::Error> {
-        Promise::err(capnp::Error::unimplemented(
-            "register_mcp: external MCP admin is offline until Phase 2".into(),
-        ))
-    }
-
-    fn unregister_mcp(
-        self: Rc<Self>,
-        _params: kernel::UnregisterMcpParams,
-        _results: kernel::UnregisterMcpResults,
-    ) -> Promise<(), capnp::Error> {
-        Promise::err(capnp::Error::unimplemented(
-            "unregister_mcp: external MCP admin is offline until Phase 2".into(),
-        ))
-    }
 
     fn list_mcp_servers(
         self: Rc<Self>,
@@ -3013,42 +2989,6 @@ impl kernel::Server for KernelImpl {
         Promise::ok(())
     }
 
-    // =========================================================================
-    // Blob Storage (schema ordinals kept for wire compat, handlers removed)
-    // =========================================================================
-
-    fn write_blob(
-        self: Rc<Self>,
-        _params: kernel::WriteBlobParams,
-        _results: kernel::WriteBlobResults,
-    ) -> Promise<(), capnp::Error> {
-        Promise::err(capnp::Error::unimplemented("blob API removed".into()))
-    }
-
-    fn read_blob(
-        self: Rc<Self>,
-        _params: kernel::ReadBlobParams,
-        _results: kernel::ReadBlobResults,
-    ) -> Promise<(), capnp::Error> {
-        Promise::err(capnp::Error::unimplemented("blob API removed".into()))
-    }
-
-    fn delete_blob(
-        self: Rc<Self>,
-        _params: kernel::DeleteBlobParams,
-        _results: kernel::DeleteBlobResults,
-    ) -> Promise<(), capnp::Error> {
-        Promise::err(capnp::Error::unimplemented("blob API removed".into()))
-    }
-
-    fn list_blobs(
-        self: Rc<Self>,
-        _params: kernel::ListBlobsParams,
-        _results: kernel::ListBlobsResults,
-    ) -> Promise<(), capnp::Error> {
-        Promise::err(capnp::Error::unimplemented("blob API removed".into()))
-    }
-
     fn push_ops(
         self: Rc<Self>,
         params: kernel::PushOpsParams,
@@ -3115,16 +3055,6 @@ impl kernel::Server for KernelImpl {
     ) -> Promise<(), capnp::Error> {
         results.get().init_resources(0);
         Promise::ok(())
-    }
-
-    fn read_mcp_resource(
-        self: Rc<Self>,
-        _params: kernel::ReadMcpResourceParams,
-        _results: kernel::ReadMcpResourceResults,
-    ) -> Promise<(), capnp::Error> {
-        Promise::err(capnp::Error::unimplemented(
-            "read_mcp_resource: offline until Phase 3 resource wiring".into(),
-        ))
     }
 
     fn subscribe_mcp_resources(

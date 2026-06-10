@@ -24,7 +24,7 @@ pub use actor::{
 pub use rpc::{
     Completion, CompletionKind, ConsentMode, ContextInfo, ContextMembership, HistoryEntry,
     Identity, InputState, KernelConfig, KernelHandle, KernelInfo, LlmConfigInfo,
-    LlmProviderInfo, McpResource, McpResourceContents, McpToolResult, MountSpec, PresetInfo,
+    LlmProviderInfo, McpResource, McpToolResult, MountSpec, PresetInfo,
     RpcClient, RpcError, ShellValue, StagedDriftInfo, SubmitResult, SyncState, ToolResult,
     ToolSchema, VersionSnapshot,
 };

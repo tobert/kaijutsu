@@ -630,7 +630,7 @@ struct ShellValue {
     float @3 :Float64;
     string @4 :Text;
     json @5 :Text;       # serde_json::Value serialized
-    blob @6 :Text;       # BlobRef path
+    blob @6 :Text;       # blob path (e.g. /v/blobs/{id})
   }
 }
 
@@ -638,13 +638,6 @@ struct ShellValue {
 struct ShellVar {
   name @0 :Text;
   value @1 :ShellValue;
-}
-
-# Reference to binary data in blob storage (/v/blobs/{id})
-struct BlobRef {
-  id @0 :Text;              # Unique blob identifier
-  size @1 :UInt64;          # Size in bytes
-  contentType @2 :Text;     # MIME type (e.g., "image/png")
 }
 
 struct KernelOutputEvent {
@@ -733,21 +726,6 @@ interface PeerCommands {
 # ============================================================================
 # MCP (Model Context Protocol) Types
 # ============================================================================
-
-struct McpServerConfig {
-  name @0 :Text;              # Unique name for this server (e.g., "git", "exa")
-  command @1 :Text;           # Command to run (e.g., "uvx", "npx") — stdio only
-  args @2 :List(Text);        # Arguments for the command — stdio only
-  env @3 :List(EnvVar);       # Environment variables
-  cwd @4 :Text;               # Working directory (optional) — stdio only
-  transport @5 :Text;         # "stdio" (default) or "streamable_http"
-  url @6 :Text;               # Server URL — streamable_http only
-}
-
-struct EnvVar {
-  key @0 :Text;
-  value @1 :Text;
-}
 
 struct McpServerInfo {
   name @0 :Text;              # Server name
@@ -930,58 +908,55 @@ interface Kernel {
   joinContext @17 (contextId :Data, instance :Text, trace :TraceContext) -> (contextId :Data);
 
   # MCP (Model Context Protocol) management
-  registerMcp @18 (config :McpServerConfig) -> (info :McpServerInfo);
-  unregisterMcp @19 (name :Text);
-  listMcpServers @20 () -> (servers :List(McpServerInfo));
-  callMcpTool @21 (call :McpToolCall, trace :TraceContext) -> (result :McpToolResult);
+  # registerMcp/unregisterMcp removed 2026-06-10; interface ordinals renumbered.
+  listMcpServers @18 () -> (servers :List(McpServerInfo));
+  callMcpTool @19 (call :McpToolCall, trace :TraceContext) -> (result :McpToolResult);
 
   # Shell execution (kaish REPL with block output)
   # Creates ToolCall (ToolKind::Shell) and ToolResult (ToolKind::Shell) blocks, streams output via BlockEvents
-  shellExecute @22 (code :Text, contextId :Data, trace :TraceContext, userInitiated :Bool) -> (commandBlockId :BlockId);
+  shellExecute @20 (code :Text, contextId :Data, trace :TraceContext, userInitiated :Bool) -> (commandBlockId :BlockId);
 
   # Shell state (kaish working directory and last result)
-  getCwd @23 () -> (path :Text);
-  setCwd @24 (path :Text) -> (success :Bool, error :Text);
-  getLastResult @25 () -> (result :ShellExecResult);
+  getCwd @21 () -> (path :Text);
+  setCwd @22 (path :Text) -> (success :Bool, error :Text);
+  getLastResult @23 () -> (result :ShellExecResult);
 
-  # Blob storage (in-memory, size-capped)
-  # Blobs are stored at /v/blobs/{id} in kaish's VFS
-  writeBlob @26 (data :Data, contentType :Text) -> (ref :BlobRef);
-  readBlob @27 (id :Text) -> (data :Data);
-  deleteBlob @28 (id :Text) -> (success :Bool);
-  listBlobs @29 () -> (refs :List(BlobRef));
+  # Blob storage (writeBlob/readBlob/deleteBlob/listBlobs) removed 2026-06-10;
+  # interface ordinals renumbered. The playback design's narrow read-only CAS
+  # fetch-by-hash RPC is a new, scoped method at a fresh ordinal — not a revival
+  # of this generic API.
 
   # Push CRDT operations from client to server for bidirectional sync
   # Returns ack version so client knows ops were accepted and ordered
-  pushOps @30 (contextId :Data, ops :Data, trace :TraceContext) -> (ackVersion :UInt64);
+  pushOps @24 (contextId :Data, ops :Data, trace :TraceContext) -> (ackVersion :UInt64);
 
   # MCP Resource management (push-first with caching)
-  listMcpResources @31 (server :Text, trace :TraceContext) -> (resources :List(McpResource));
-  readMcpResource @32 (server :Text, uri :Text, trace :TraceContext) -> (contents :McpResourceContents, hasContents :Bool);
-  subscribeMcpResources @33 (callback :ResourceEvents, instance :Text);
+  # readMcpResource removed 2026-06-10; interface ordinals renumbered.
+  listMcpResources @25 (server :Text, trace :TraceContext) -> (resources :List(McpResource));
+  subscribeMcpResources @26 (callback :ResourceEvents, instance :Text);
 
   # MCP Roots (client advertises workspaces to servers)
-  setMcpRoots @34 (roots :List(McpRoot));
+  setMcpRoots @27 (roots :List(McpRoot));
 
   # MCP Prompts (poll-based with optional caching)
-  listMcpPrompts @35 (server :Text) -> (prompts :List(McpPrompt));
-  getMcpPrompt @36 (server :Text, name :Text, arguments :Text) -> (messages :List(McpPromptMessage));
+  listMcpPrompts @28 (server :Text) -> (prompts :List(McpPrompt));
+  getMcpPrompt @29 (server :Text, name :Text, arguments :Text) -> (messages :List(McpPromptMessage));
 
   # MCP Progress (push-based streaming)
-  subscribeMcpProgress @37 (callback :ProgressEvents);
+  subscribeMcpProgress @30 (callback :ProgressEvents);
 
   # MCP Elicitation (server-initiated requests for user input)
-  subscribeMcpElicitations @38 (callback :ElicitationEvents, instance :Text);
+  subscribeMcpElicitations @31 (callback :ElicitationEvents, instance :Text);
 
   # MCP Completion (request/response)
-  completeMcp @39 (server :Text, refType :Text, refName :Text, argName :Text, value :Text) -> (result :McpCompletionResult);
+  completeMcp @32 (server :Text, refType :Text, refName :Text, argName :Text, value :Text) -> (result :McpCompletionResult);
 
   # MCP Logging
-  setMcpLogLevel @40 (server :Text, level :Text);
-  subscribeMcpLogs @41 (callback :LoggingEvents);
+  setMcpLogLevel @33 (server :Text, level :Text);
+  subscribeMcpLogs @34 (callback :LoggingEvents);
 
   # MCP Cancellation
-  cancelMcpRequest @42 (server :Text, requestId :Text);
+  cancelMcpRequest @35 (server :Text, requestId :Text);
 
   # ============================================================================
   # Peer Registry (drift navigation transport)
@@ -992,16 +967,16 @@ interface Kernel {
 
   # Attach a peer to this kernel.
   # `commands` is the callback the kernel uses to invoke this peer.
-  attachPeer @43 (config :PeerConfig, commands :PeerCommands) -> (info :PeerInfo);
+  attachPeer @36 (config :PeerConfig, commands :PeerCommands) -> (info :PeerInfo);
 
   # List all attached peers on this kernel.
-  listPeers @44 () -> (peers :List(PeerInfo));
+  listPeers @37 () -> (peers :List(PeerInfo));
 
   # Detach a peer from this kernel.
-  detachPeer @45 (nick :Text);
+  detachPeer @38 (nick :Text);
 
   # Invoke a peer. Params and result are JSON bytes.
-  invokePeer @46 (nick :Text, action :Text, params :Data) -> (result :Data);
+  invokePeer @39 (nick :Text, action :Text, params :Data) -> (result :Data);
 
   # ============================================================================
   # Timeline Navigation (Fork-First Temporal Model)
@@ -1010,10 +985,10 @@ interface Kernel {
   # The past is read-only, but forking is ubiquitous.
 
   # Cherry-pick a block into another context (carries lineage)
-  cherryPickBlock @47 (sourceBlockId :BlockId, targetContextId :Data, trace :TraceContext) -> (newBlockId :BlockId);
+  cherryPickBlock @40 (sourceBlockId :BlockId, targetContextId :Data, trace :TraceContext) -> (newBlockId :BlockId);
 
   # Get context version history for timeline scrubber
-  getContextHistory @48 (contextId :Data, limit :UInt32, trace :TraceContext) -> (snapshots :List(VersionSnapshot));
+  getContextHistory @41 (contextId :Data, limit :UInt32, trace :TraceContext) -> (snapshots :List(VersionSnapshot));
 
   # ============================================================================
   # Configuration (Config as CRDT)
@@ -1021,16 +996,16 @@ interface Kernel {
   # Config files (theme.toml, bindings.toml, models.toml, etc.) are managed as CRDT documents.
 
   # List loaded config documents
-  listConfigs @49 () -> (configs :List(Text));
+  listConfigs @42 () -> (configs :List(Text));
 
   # Reload a config file from disk, discarding CRDT changes (safety valve)
-  reloadConfig @50 (path :Text) -> (success :Bool, error :Text);
+  reloadConfig @43 (path :Text) -> (success :Bool, error :Text);
 
   # Reset a config file to embedded default
-  resetConfig @51 (path :Text) -> (success :Bool, error :Text);
+  resetConfig @44 (path :Text) -> (success :Bool, error :Text);
 
   # Get config content (from CRDT)
-  getConfig @52 (path :Text) -> (content :Text, error :Text);
+  getConfig @45 (path :Text) -> (content :Text, error :Text);
 
   # ============================================================================
   # Multi-Context Drifting (Cross-Context Communication)
@@ -1038,50 +1013,50 @@ interface Kernel {
   # Drift enables content transfer between kernel contexts with provenance tracking.
 
   # Get this kernel's context ID and label
-  getContextId @53 (trace :TraceContext) -> (id :Data, label :Text);
+  getContextId @46 (trace :TraceContext) -> (id :Data, label :Text);
 
   # Configure LLM provider/model for a specific context (per-context model assignment).
   # If contextId is empty/missing, uses the connection's current context.
-  configureLlm @54 (provider :Text, model :Text, trace :TraceContext, contextId :Data) -> (success :Bool, error :Text);
+  configureLlm @47 (provider :Text, model :Text, trace :TraceContext, contextId :Data) -> (success :Bool, error :Text);
 
   # List staged drifts pending flush
-  driftQueue @55 () -> (staged :List(StagedDriftInfo));
+  driftQueue @48 () -> (staged :List(StagedDriftInfo));
 
   # Cancel a staged drift by ID
-  driftCancel @56 (stagedId :UInt64) -> (success :Bool);
+  driftCancel @49 (stagedId :UInt64) -> (success :Bool);
 
   # Rename a context's label
-  renameContext @57 (contextId :Data, label :Text);
+  renameContext @50 (contextId :Data, label :Text);
 
   # ============================================================================
   # LLM Configuration (Per-Kernel Multi-Provider LLM)
   # ============================================================================
 
   # Get current LLM configuration for this kernel
-  getLlmConfig @58 (trace :TraceContext) -> (config :LlmConfigInfo);
+  getLlmConfig @51 (trace :TraceContext) -> (config :LlmConfigInfo);
 
   # Set default LLM provider
-  setDefaultProvider @59 (provider :Text) -> (success :Bool, error :Text);
+  setDefaultProvider @52 (provider :Text) -> (success :Bool, error :Text);
 
   # Set default model for a provider
-  setDefaultModel @60 (provider :Text, model :Text) -> (success :Bool, error :Text);
+  setDefaultModel @53 (provider :Text, model :Text) -> (success :Bool, error :Text);
 
   # ============================================================================
   # Shell Variable Introspection (kaish scope)
   # ============================================================================
 
   # Get a shell variable by name
-  getShellVar @61 (name :Text) -> (value :ShellValue, found :Bool);
+  getShellVar @54 (name :Text) -> (value :ShellValue, found :Bool);
 
   # Set a shell variable
-  setShellVar @62 (name :Text, value :ShellValue) -> (success :Bool, error :Text);
+  setShellVar @55 (name :Text, value :ShellValue) -> (success :Bool, error :Text);
 
   # List all shell variables
-  listShellVars @63 () -> (vars :List(ShellVar));
+  listShellVars @56 () -> (vars :List(ShellVar));
 
   # Compact a context's oplog, bumping sync generation.
   # Connected clients will receive onSyncReset and must re-fetch full state.
-  compactContext @64 (contextId :Data, trace :TraceContext) -> (newSize :UInt64, generation :UInt64);
+  compactContext @57 (contextId :Data, trace :TraceContext) -> (newSize :UInt64, generation :UInt64);
 
   # ============================================================================
   # Input Document (CRDT scratchpad per context)
@@ -1090,36 +1065,36 @@ interface Kernel {
   # Any participant can read/write it. Submit snapshots to conversation block.
 
   # High-level edit: insert text at position, delete characters
-  editInput @65 (contextId :Data, pos :UInt64, insert :Text, delete :UInt64, trace :TraceContext) -> (ackVersion :UInt64);
+  editInput @58 (contextId :Data, pos :UInt64, insert :Text, delete :UInt64, trace :TraceContext) -> (ackVersion :UInt64);
 
   # Full state fetch for join/reconnect recovery
-  getInputState @66 (contextId :Data, trace :TraceContext) -> (content :Text, ops :Data, version :UInt64);
+  getInputState @59 (contextId :Data, trace :TraceContext) -> (content :Text, ops :Data, version :UInt64);
 
   # Raw DTE ops for CRDT-aware clients
-  pushInputOps @67 (contextId :Data, ops :Data, trace :TraceContext) -> (ackVersion :UInt64);
+  pushInputOps @60 (contextId :Data, ops :Data, trace :TraceContext) -> (ackVersion :UInt64);
 
   # Atomic submit: read input, create block, clear input.
   # Mode is explicit — no prefix detection.
-  submitInput @68 (contextId :Data, mode :InputMode, trace :TraceContext) -> (commandBlockId :BlockId);
+  submitInput @61 (contextId :Data, mode :InputMode, trace :TraceContext) -> (commandBlockId :BlockId);
 
   # Semantic search: find contexts similar to a text query
-  searchSimilar @69 (query :Text, k :UInt32, trace :TraceContext) -> (results :List(SimilarContext));
+  searchSimilar @62 (query :Text, k :UInt32, trace :TraceContext) -> (results :List(SimilarContext));
 
   # Context neighbors: find contexts similar to a given context
-  getNeighbors @70 (contextId :Data, k :UInt32, trace :TraceContext) -> (results :List(SimilarContext));
+  getNeighbors @63 (contextId :Data, k :UInt32, trace :TraceContext) -> (results :List(SimilarContext));
 
   # Clustering: group contexts by semantic similarity
-  getClusters @71 (minClusterSize :UInt32, trace :TraceContext) -> (clusters :List(ContextCluster));
+  getClusters @64 (minClusterSize :UInt32, trace :TraceContext) -> (clusters :List(ContextCluster));
 
   # ============================================================================
   # Block Queries (replaces getContextState for block-only fetches)
   # ============================================================================
 
   # Fetch blocks by query: all, byIds, or byFilter
-  getBlocks @72 (contextId :Data, query :BlockQuery, trace :TraceContext) -> (blocks :List(BlockSnapshot));
+  getBlocks @65 (contextId :Data, query :BlockQuery, trace :TraceContext) -> (blocks :List(BlockSnapshot));
 
   # Fetch CRDT sync state only (ops + version, no blocks)
-  getContextSync @73 (contextId :Data, trace :TraceContext) -> (contextId :Data, ops :Data, version :UInt64);
+  getContextSync @66 (contextId :Data, trace :TraceContext) -> (contextId :Data, ops :Data, version :UInt64);
 
   # ============================================================================
   # Filtered Block Subscriptions
@@ -1128,51 +1103,51 @@ interface Kernel {
   # Subscribe to block events with server-side filtering.
   # Like subscribeBlocks @13 but the server applies the filter before sending,
   # reducing bandwidth and client CPU during high-throughput streaming.
-  subscribeBlocksFiltered @74 (callback :BlockEvents, filter :BlockEventFilter, instance :Text);
+  subscribeBlocksFiltered @67 (callback :BlockEvents, filter :BlockEventFilter, instance :Text);
 
   # Interrupt a running LLM stream or shell jobs for a context.
   # immediate=false → soft interrupt (stop agentic loop after current tool turn).
   # immediate=true  → hard interrupt (abort LLM stream + kill all kaish jobs).
   # Returns success=false when context has no active interrupt state (i.e. nothing running).
-  interruptContext @75 (contextId :Data, immediate :Bool, trace :TraceContext) -> (success :Bool);
+  interruptContext @68 (contextId :Data, immediate :Bool, trace :TraceContext) -> (success :Bool);
 
   # List all presets for this kernel
-  listPresets @76 (trace :TraceContext) -> (presets :List(PresetInfo));
+  listPresets @69 (trace :TraceContext) -> (presets :List(PresetInfo));
 
   # Clear the input document for a context (discard draft).
   # Emits InputCleared so all clients can reset their compose state.
-  clearInput @77 (contextId :Data, trace :TraceContext) -> ();
+  clearInput @70 (contextId :Data, trace :TraceContext) -> ();
 
   # Set lifecycle state for a context (e.g., Staging → Live).
-  setContextState @78 (contextId :Data, state :Text, trace :TraceContext) -> (success :Bool, error :Text);
+  setContextState @71 (contextId :Data, state :Text, trace :TraceContext) -> (success :Bool, error :Text);
 
   # Set the excluded flag on a block (staging curation).
-  setBlockExcluded @79 (contextId :Data, blockId :BlockId, excluded :Bool, trace :TraceContext) -> (ackVersion :UInt64);
+  setBlockExcluded @72 (contextId :Data, blockId :BlockId, excluded :Bool, trace :TraceContext) -> (ackVersion :UInt64);
 
   # Move a block to a new position. When `hasAfter` is true, `after` is
   # the block to land after; otherwise the block is parked at the
   # beginning of the document. Mirrors the `has_parent_id` idiom used
   # elsewhere in the schema. CRDT + kernel impls exist; this is the
   # protocol seam (M2-B1).
-  moveBlock @80 (contextId :Data, blockId :BlockId, hasAfter :Bool, after :BlockId, trace :TraceContext) -> (ackVersion :UInt64);
+  moveBlock @73 (contextId :Data, blockId :BlockId, hasAfter :Bool, after :BlockId, trace :TraceContext) -> (ackVersion :UInt64);
 
   # Drop this session's binding to a context. Used by the constellation
   # archive flow so the drift router can mark the context Archived
   # without an active session re-resurrecting it on the next op (M2-B3).
   # Idempotent: returns true if the session held a binding to that
   # context, false otherwise.
-  contextLeave @81 (contextId :Data, trace :TraceContext) -> (left :Bool);
+  contextLeave @74 (contextId :Data, trace :TraceContext) -> (left :Bool);
 
   # Inspect the drift router's dead-letter queue (M2-B4). Non-consuming
   # — pairs with replayDeadLetter. Drifts land here when MAX_DRIFT_RETRIES
   # is exceeded or the target context unregisters before delivery.
-  listDeadLetters @82 (trace :TraceContext) -> (items :List(DeadLetter));
+  listDeadLetters @75 (trace :TraceContext) -> (items :List(DeadLetter));
 
   # Replay a dead-letter item by id: extract from DLQ, reset retry count,
   # push back to the staging queue for another flush attempt. Returns
   # `replayed = false` when the id isn't present (already drained or
   # never queued).
-  replayDeadLetter @83 (id :UInt64, trace :TraceContext) -> (replayed :Bool);
+  replayDeadLetter @76 (id :UInt64, trace :TraceContext) -> (replayed :Bool);
 
   # Cheap liveness probe used by the client's reconnection FSM.
   # Returns the server-assigned kernel ID (so the client can detect a
@@ -1180,9 +1155,9 @@ interface Kernel {
   # in milliseconds since the Unix epoch (for clock-skew diagnostics).
   # Handler must not take any per-context locks — this exists to detect
   # liveness, not to validate kernel state.
-  ping @84 (trace :TraceContext) -> (kernelId :Data, serverTimeMs :UInt64);
+  ping @77 (trace :TraceContext) -> (kernelId :Data, serverTimeMs :UInt64);
 
-  # @85 (checkFacade) retired: facade capability enforcement moved to the
+  # @78 (checkFacade) retired: facade capability enforcement moved to the
   # shared shellExecute / editInput / submitInput handlers (deny-by-default,
   # keyed on the context binding), so humans and agents cross the same gate.
 }

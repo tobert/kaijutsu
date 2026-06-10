@@ -73,7 +73,7 @@ use crate::constants::{
 };
 use crate::rpc::{
     Completion, ContextInfo, HistoryEntry, Identity, InputState, KernelInfo, LlmConfigInfo,
-    McpResource, McpResourceContents, McpToolResult, ShellValue, StagedDriftInfo, SubmitResult,
+    McpResource, McpToolResult, ShellValue, StagedDriftInfo, SubmitResult,
     SyncState, ToolResult, ToolSchema, VersionSnapshot,
 };
 use crate::subscriptions::{
@@ -411,11 +411,6 @@ enum RpcCommand {
         server: String,
         reply: oneshot::Sender<Result<Vec<McpResource>, CallError>>,
     },
-    ReadMcpResource {
-        server: String,
-        uri: String,
-        reply: oneshot::Sender<Result<Option<McpResourceContents>, CallError>>,
-    },
 
     // ── LLM ──────────────────────────────────────────────────────────────
     Prompt {
@@ -550,7 +545,6 @@ impl RpcCommand {
             Self::GetToolSchemas { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::CallMcpTool { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ListMcpResources { reply, .. } => { let _ = reply.send(Err(err)); }
-            Self::ReadMcpResource { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::Prompt { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ConfigureLlm { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetLlmConfig { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -945,20 +939,6 @@ impl ActorHandle {
     pub async fn list_mcp_resources(&self, server: &str) -> Result<Vec<McpResource>, CallError> {
         self.send(|reply| RpcCommand::ListMcpResources {
             server: server.into(),
-            reply,
-        })
-        .await
-    }
-
-    #[tracing::instrument(skip(self))]
-    pub async fn read_mcp_resource(
-        &self,
-        server: &str,
-        uri: &str,
-    ) -> Result<Option<McpResourceContents>, CallError> {
-        self.send(|reply| RpcCommand::ReadMcpResource {
-            server: server.into(),
-            uri: uri.into(),
             reply,
         })
         .await
@@ -2100,9 +2080,6 @@ async fn dispatch_kernel_command(
         // ── MCP Resources ──
         RpcCommand::ListMcpResources { server, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.list_mcp_resources(&server));
-        }
-        RpcCommand::ReadMcpResource { server, uri, reply } => {
-            dispatch!(kernel, reply, close_tx, k, k.read_mcp_resource(&server, &uri));
         }
 
         // ── LLM ──

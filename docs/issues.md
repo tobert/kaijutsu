@@ -81,18 +81,6 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ## Cleanup — June 2026 audit
 
-- **Delete dead RPC stubs + capnp schema entries** (decision 2026-06-10:
-  all of them; re-add when a phase actually ships them): blob API
-  (`rpc.rs:2785-2835`, "blob API removed"), `register_mcp`/`unregister_mcp`
-  (`rpc.rs:2743`, `:2753`, "offline until Phase 2"), `read_mcp_resource`
-  (`rpc.rs:3103`, "Phase 3"). Purge matching methods from
-  `kaijutsu.capnp`. NOTE: the playback design (docs/playback.md) needs a
-  *narrow read-only CAS fetch-by-hash* RPC — that is a new, scoped method,
-  not a reprieve for the old generic blob API. Delete the old; design the
-  replacement per the playback prep list.
-- **Drop `rhai`/`ron` language-ID mappings** in
-  `file_tools/cache.rs:567,572` — vestigial from the Rhai/RON removal,
-  nothing consumes them.
 - **App-side ABC parse failure renders `Tune::default()` silently**
   (`kaijutsu-app/src/text/rich.rs:413-423`) — render the kernel's
   structured ABC error spans instead. Also: the app re-parses ABC on every

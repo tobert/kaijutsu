@@ -866,56 +866,6 @@ impl KernelHandle {
         Ok(result)
     }
 
-    /// Read a resource from an MCP server
-    ///
-    /// Returns the contents of the specified resource.
-    /// Results may be cached on the server for efficiency.
-    #[tracing::instrument(skip(self), name = "rpc_client.read_mcp_resource")]
-    pub async fn read_mcp_resource(
-        &self,
-        server: &str,
-        uri: &str,
-    ) -> Result<Option<McpResourceContents>, RpcError> {
-        let mut request = self.kernel.read_mcp_resource_request();
-        request.get().set_server(server);
-        request.get().set_uri(uri);
-        {
-            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
-            let mut trace = request.get().init_trace();
-            trace.set_traceparent(&traceparent);
-            trace.set_tracestate(&tracestate);
-        }
-        let response = request.send().promise.await?;
-        let result = response.get()?;
-
-        if !result.get_has_contents() {
-            return Ok(None);
-        }
-
-        let contents = result.get_contents()?;
-        let uri = contents.get_uri()?.to_string()?;
-        let mime_type = if contents.get_has_mime_type() {
-            Some(contents.get_mime_type()?.to_string()?)
-        } else {
-            None
-        };
-
-        // Check which union variant is set
-        use crate::kaijutsu_capnp::mcp_resource_contents::Which;
-        match contents.which()? {
-            Which::Text(text) => Ok(Some(McpResourceContents::Text {
-                uri,
-                mime_type,
-                text: text?.to_string()?,
-            })),
-            Which::Blob(blob) => Ok(Some(McpResourceContents::Blob {
-                uri,
-                mime_type,
-                blob: blob?.to_vec(),
-            })),
-        }
-    }
-
     /// Subscribe to MCP resource events.
     ///
     /// `instance` is the client's stable per-session UUID — see
@@ -2486,23 +2436,6 @@ pub struct McpResource {
     pub description: Option<String>,
     /// Optional MIME type
     pub mime_type: Option<String>,
-}
-
-/// Contents of an MCP resource
-#[derive(Debug, Clone)]
-pub enum McpResourceContents {
-    /// Text content
-    Text {
-        uri: String,
-        mime_type: Option<String>,
-        text: String,
-    },
-    /// Binary content (already decoded from base64)
-    Blob {
-        uri: String,
-        mime_type: Option<String>,
-        blob: Vec<u8>,
-    },
 }
 
 // ============================================================================

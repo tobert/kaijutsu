@@ -564,12 +564,10 @@ fn detect_language(path: &str) -> Option<String> {
         "toml" => "toml",
         "yaml" | "yml" => "yaml",
         "json" => "json",
-        "ron" => "ron",
         "md" => "markdown",
         "html" => "html",
         "css" => "css",
         "sql" => "sql",
-        "rhai" => "rhai",
         "wgsl" => "wgsl",
         _ => return None,
     };
@@ -705,5 +703,10 @@ mod tests {
         assert_eq!(detect_language("Cargo.toml"), Some("toml".to_string()));
         assert_eq!(detect_language("noext"), None);
         assert_eq!(detect_language("script.sh"), Some("bash".to_string()));
+        // Rhai/RON were removed from the project (project_rhai_removal); their
+        // language-ID arms are vestigial. Nothing produces or consumes .ron/.rhai
+        // files, so detection must not resurrect them.
+        assert_eq!(detect_language("config.ron"), None);
+        assert_eq!(detect_language("plugin.rhai"), None);
     }
 }
