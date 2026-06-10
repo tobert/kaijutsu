@@ -38,14 +38,6 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ## Event Plumbing (FlowBus) — June 2026 audit
 
-- **`ContextSwitched` events dropped at publish (bug, fix first):**
-  `"block.context_switched"` is missing from `BlockFlow::TOPICS`
-  (`flows.rs:176-187`), but the server publishes the variant (`rpc.rs:5898`)
-  and both subscriber loops have handler arms for it (`rpc.rs:2109`, `:4815`).
-  FlowBus pre-creates channels per registered topic, so the publish hits
-  "published to unknown topic" (`flows.rs:599`) and vanishes. Likely a
-  contributing factor to the switch-context-doesn't-change-screens debt.
-  Fix + add a test asserting every variant's `subject()` is in `TOPICS`.
 - **Delete `ConfigFlow`:** emitted from six sites in `config_backend.rs`,
   zero subscribers anywhere; config changes propagate via doc sync + file
   watcher. Remove the flow type (`flows.rs:898-941`), the bus creation

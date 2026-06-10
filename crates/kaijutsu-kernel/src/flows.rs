@@ -184,6 +184,7 @@ impl FlowTopics for BlockFlow {
         "block.sync_reset",
         "block.output",
         "block.metadata",
+        "block.context_switched",
     ];
 
     fn topic_capacity(topic: &str) -> Option<usize> {
@@ -596,7 +597,13 @@ impl<T: Clone + Send + HasSubject + 'static> FlowBus<T> {
                 Err(async_broadcast::TrySendError::Inactive(_)) => 0,
             }
         } else {
-            tracing::warn!(topic, "published to unknown topic");
+            // A subject without a registered topic means the payload's
+            // FlowTopics::TOPICS list is out of sync with its subject() —
+            // FlowBus pre-creates a channel per topic, so this publish is
+            // silently dropped. That class of bug hid `block.context_switched`
+            // for months. Scream in debug; stay non-crashing in release.
+            debug_assert!(false, "published to unregistered topic {topic:?}");
+            tracing::error!(topic, "published to unknown topic — dropped");
             0
         }
     }
@@ -612,7 +619,10 @@ impl<T: Clone + Send + HasSubject + 'static> FlowBus<T> {
                 Err(_) => 0,
             }
         } else {
-            tracing::warn!(topic, "published to unknown topic");
+            // See `publish`: an unregistered topic is a TOPICS/subject() skew
+            // bug that silently drops the event. Scream in debug.
+            debug_assert!(false, "published to unregistered topic {topic:?}");
+            tracing::error!(topic, "published to unknown topic — dropped");
             0
         }
     }
@@ -1469,9 +1479,10 @@ mod tests {
         let _s2 = bus.subscribe("block.status");
         assert_eq!(bus.subscriber_count(), 2);
 
-        // Wildcard creates one subscription per matching topic (10 for block.*)
+        // Wildcard creates one subscription per matching topic (one per
+        // BlockFlow::TOPICS entry — keep in sync with the registered set).
         let _s3 = bus.subscribe("block.*");
-        assert_eq!(bus.subscriber_count(), 2 + 10);
+        assert_eq!(bus.subscriber_count(), 2 + BlockFlow::TOPICS.len());
     }
 
     /// Subscribe to a pattern that matches no topics.
@@ -1482,13 +1493,14 @@ mod tests {
         assert!(sub.try_recv().is_none());
     }
 
-    /// Publish a flow with a subject not in TOPICS. Should warn, not panic.
-    /// (In practice this can't happen because HasSubject returns known static strings,
-    /// but we verify the guard works.)
+    /// Every subject in TOPICS must have a pre-created channel. (We can't
+    /// construct a BlockFlow whose subject() is unregistered — and publishing
+    /// to an unknown topic now debug_asserts — so we verify the forward
+    /// direction here; the exhaustive `*_all_subjects_in_topics` tests cover
+    /// the reverse, that every variant's subject() is registered.)
     #[test]
     fn test_publish_to_unknown_topic_returns_zero() {
-        // We can't easily create a BlockFlow with an unknown subject,
-        // so instead verify that all known subjects ARE routable.
+        // Verify that all known subjects ARE routable.
         let bus: FlowBus<BlockFlow> = FlowBus::new(64);
         for &topic in BlockFlow::TOPICS {
             assert!(
@@ -1713,6 +1725,216 @@ mod tests {
             completed_sub.try_recv().is_none(),
             "turn.completed must not receive turn.failed"
         );
+    }
+
+    // ====================================================================
+    // Exhaustive subject ⊆ TOPICS coverage (durable regression guard)
+    //
+    // Every variant's subject() MUST be registered in its TOPICS list, or
+    // FlowBus pre-creates no channel for it and publish() drops the event
+    // ("published to unknown topic"). This bit `block.context_switched`.
+    //
+    // Each helper builds ONE of every variant via an exhaustive match (no
+    // `_ =>` arm) so that adding a future variant fails to compile here
+    // until its subject is asserted — the test cannot silently fall behind.
+    // ====================================================================
+
+    fn assert_subjects_registered<T: HasSubject>(variants: &[T], topics: &[&'static str]) {
+        for v in variants {
+            let subject = v.subject();
+            assert!(
+                topics.contains(&subject),
+                "subject {subject:?} is not in TOPICS {topics:?} — \
+                 FlowBus will drop publishes to it"
+            );
+        }
+    }
+
+    #[test]
+    fn test_block_flow_all_subjects_in_topics() {
+        let ctx = ContextId::new();
+        let id = BlockId::new(ctx, PrincipalId::new(), 1);
+        let block = Arc::new(BlockSnapshot::text(id, None, Role::User, "test"));
+
+        let variants = vec![
+            BlockFlow::Inserted {
+                context_id: ctx,
+                block: block.clone(),
+                after_id: None,
+                ops: Arc::from(Vec::<u8>::new()),
+                source: OpSource::Local,
+            },
+            BlockFlow::TextOps {
+                context_id: ctx,
+                block_id: id,
+                ops: Arc::from(Vec::<u8>::new()),
+                source: OpSource::Local,
+                seq_num: 0,
+            },
+            BlockFlow::Deleted {
+                context_id: ctx,
+                block_id: id,
+                source: OpSource::Local,
+            },
+            BlockFlow::StatusChanged {
+                context_id: ctx,
+                block_id: id,
+                status: Status::Done,
+                output: None,
+                source: OpSource::Local,
+            },
+            BlockFlow::CollapsedChanged {
+                context_id: ctx,
+                block_id: id,
+                collapsed: true,
+                source: OpSource::Local,
+            },
+            BlockFlow::ExcludedChanged {
+                context_id: ctx,
+                block_id: id,
+                excluded: true,
+                source: OpSource::Local,
+            },
+            BlockFlow::Moved {
+                context_id: ctx,
+                block_id: id,
+                after_id: None,
+                source: OpSource::Local,
+            },
+            BlockFlow::SyncReset {
+                context_id: ctx,
+                generation: 1,
+            },
+            BlockFlow::OutputChanged {
+                context_id: ctx,
+                block_id: id,
+                output: None,
+                source: OpSource::Local,
+            },
+            BlockFlow::MetadataChanged {
+                context_id: ctx,
+                block_id: id,
+                metadata: kaijutsu_types::BlockMetadata::default(),
+                source: OpSource::Local,
+            },
+            BlockFlow::ContextSwitched { context_id: ctx },
+        ];
+
+        // Exhaustiveness gate: a new variant without an arm here breaks
+        // compilation, forcing this test (and TOPICS) to be updated.
+        for v in &variants {
+            match v {
+                BlockFlow::Inserted { .. }
+                | BlockFlow::TextOps { .. }
+                | BlockFlow::Deleted { .. }
+                | BlockFlow::StatusChanged { .. }
+                | BlockFlow::CollapsedChanged { .. }
+                | BlockFlow::ExcludedChanged { .. }
+                | BlockFlow::Moved { .. }
+                | BlockFlow::SyncReset { .. }
+                | BlockFlow::OutputChanged { .. }
+                | BlockFlow::MetadataChanged { .. }
+                | BlockFlow::ContextSwitched { .. } => {}
+            }
+        }
+
+        assert_subjects_registered(&variants, BlockFlow::TOPICS);
+    }
+
+    #[test]
+    fn test_config_flow_all_subjects_in_topics() {
+        let variants = vec![
+            ConfigFlow::Loaded {
+                path: "theme.toml".into(),
+                source: ConfigSource::Disk,
+                content: "{}".into(),
+            },
+            ConfigFlow::Changed {
+                path: "theme.toml".into(),
+                ops: Arc::from(Vec::<u8>::new()),
+                source: OpSource::Local,
+            },
+            ConfigFlow::ReloadRequested {
+                path: "theme.toml".into(),
+            },
+            ConfigFlow::Reset {
+                path: "theme.toml".into(),
+            },
+            ConfigFlow::ValidationFailed {
+                path: "theme.toml".into(),
+                error: "bad".into(),
+                content: "{".into(),
+            },
+        ];
+
+        for v in &variants {
+            match v {
+                ConfigFlow::Loaded { .. }
+                | ConfigFlow::Changed { .. }
+                | ConfigFlow::ReloadRequested { .. }
+                | ConfigFlow::Reset { .. }
+                | ConfigFlow::ValidationFailed { .. } => {}
+            }
+        }
+
+        assert_subjects_registered(&variants, ConfigFlow::TOPICS);
+    }
+
+    #[test]
+    fn test_input_doc_flow_all_subjects_in_topics() {
+        let ctx = ContextId::new();
+        let variants = vec![
+            InputDocFlow::TextOps {
+                context_id: ctx,
+                ops: Arc::from(Vec::<u8>::new()),
+                source: OpSource::Local,
+                seq_num: 0,
+            },
+            InputDocFlow::Cleared { context_id: ctx },
+        ];
+
+        for v in &variants {
+            match v {
+                InputDocFlow::TextOps { .. } | InputDocFlow::Cleared { .. } => {}
+            }
+        }
+
+        assert_subjects_registered(&variants, InputDocFlow::TOPICS);
+    }
+
+    #[test]
+    fn test_turn_flow_all_subjects_in_topics() {
+        let ctx = ContextId::new();
+        let principal = PrincipalId::new();
+        let after = BlockId::new(ctx, principal, 1);
+        let variants = vec![
+            TurnFlow::Requested {
+                context_id: ctx,
+                after_block_id: after,
+                content: "go".into(),
+                principal_id: principal,
+                model: None,
+            },
+            TurnFlow::Completed {
+                context_id: ctx,
+                principal_id: principal,
+            },
+            TurnFlow::Failed {
+                context_id: ctx,
+                principal_id: principal,
+                error: "boom".into(),
+            },
+        ];
+
+        for v in &variants {
+            match v {
+                TurnFlow::Requested { .. }
+                | TurnFlow::Completed { .. }
+                | TurnFlow::Failed { .. } => {}
+            }
+        }
+
+        assert_subjects_registered(&variants, TurnFlow::TOPICS);
     }
 
     // ====================================================================
