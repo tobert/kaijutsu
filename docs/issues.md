@@ -88,6 +88,35 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ## Persistence & Sync
 
+- **Post-restart block ordering: append `order_key` trusts a stale tick
+  counter (bug, found live 2026-06-10):** `merge_ops` advances `next_seq`
+  and the lamport clock but never `next_tick`
+  (`crates/kaijutsu-crdt/src/block_store.rs:1109`), so after a kernel
+  restart that replays oplog past the last snapshot, `next_tick` sits at
+  the *snapshot* max while replayed blocks carry higher ticks. The append
+  path then derives the new key from the stale tick — even though it holds
+  `after_key` at that moment (`block_store.rs:346-349`) — and the fresh
+  block sorts mid-document. Live symptom: shell output blocks landed at
+  y≈24/11800 of a 14023px conversation while the user watched the bottom.
+  Verified by replaying the on-disk snapshot+oplog for context `019eb15a…`
+  through the real restore path (new insert → position 36/52). Fix
+  direction discussed 2026-06-10 (decouple order from tick rather than
+  patch the counter): (1) append keys derive from the predecessor's
+  fixed-width key (increment), not the tick — tick stays a pure timeline
+  coordinate; (2) enforce appended-key > predecessor-key with a
+  `debug_assert` + loud fallback; (3) `merge_ops` still restores the tick
+  high-water mark — for playback/transport semantics, not ordering.
+  Regression test: snapshot → `merge_ops` → fresh append sorts last
+  (fails today). Open design check: does predecessor-derived append
+  conflict with hyoushigi multi-writer tick plans (`docs/hyoushigi.md`)?
+- **Post-restart oplog journaling gap (investigate — possible data
+  loss):** the persisted oplog for `019eb15a…` (and *every* doc in
+  `kernel.db`) ends 2026-06-10 11:08 EDT, yet the kernel restarted 11:30
+  and 15:30 and live blocks were created all afternoon (shell commands,
+  visible in the app). Post-restart inserts appear to exist in memory
+  only — either the shell path stopped journaling or `append_op` is
+  silently failing. Rank above the ordering bug: if real, everything
+  since the last restart evaporates on the next one.
 - **`KernelDb` connection pool:** Currently `Arc<parking_lot::Mutex<KernelDb>>` (`block_store.rs:74`). This bottleneck prevents utilizing SQLite's WAL mode for concurrent readers. Migrate to `r2d2` or `sqlx` to allow non-blocking reads during LLM streams and heavy writes. Note: SQLite serializes *writes* regardless of pooling, so the win is concurrent reads (and only with WAL enabled) — verify WAL before assuming a pool helps; narrowing lock scope may matter as much.
 - **Config CRDT ops:** Config backend needs DTE integration so changes replicate across peers.
 - **`blocks_ordered()` allocation churn + sort:** `block_store.rs:185-188` calls `order_key().to_string()` for *every block*, then `sort_by` on the strings — so it's O(N log N) **plus a String allocation per block per call**. It runs on per-frame hot paths (`kaijutsu-app/src/ui/card_stack/sync.rs:48`, `view/components.rs:163`), so the allocation churn is likely the bigger cost than the asymptotics. Fixes: compare `order_key` without stringifying, and/or cache the ordering and invalidate on block change. Add a secondary sorted index when scale demands.
@@ -102,6 +131,19 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 - **Connection Polling Efficiency:** `ActorPlugin` in `crates/kaijutsu-app/src/connection/mod.rs` polls broadcast channels every frame. While `UpdateMode::reactive` helps, consider event-driven wakeups or bridging async streams directly into Bevy events more efficiently if latency/power becomes an issue.
 - **Card-stack view:** Card size tuning, read-only scroll on focused card, dive-in (Enter), mouse click to focus, momentum scrolling, camera parallax, streaming card texture updates, card grouping evolution, ambient environment.
 - **Text rendering (MSDF / 次):** TAA temporal super-resolution, glyph spacing per-font tuning, 1-frame blank flash on texture resize, large-context Vello "paint too large" crash.
+- **Auto-follow on local submit:** the conversation only re-engages
+  scroll-follow when already at the bottom
+  (`view/sync.rs:200-206`); a shell-dock submit is a strong signal of
+  intent to watch the result — force `start_following()` on local
+  submits (mirror the `InputCleared` handler at `sync.rs:309`). A
+  "new content below" affordance would cover non-local appends.
+- **Stale GpuImage-preparation comments:** "ImageNode ensures the
+  GpuImage is prepared" (`view/lifecycle.rs:258`,
+  `view/block_render.rs:877-878`) is not how Bevy 0.18 works — GpuImage
+  prep is `AssetEvent`-driven with an inherent one-frame delay (the
+  benign single "MSDF render skipped … target_gpu=false" warn per cell).
+  Correct the comments so the next renderer investigation doesn't chase
+  the wrong layer.
 
 ## Control Plane & Navigation (kj)
 
@@ -180,3 +222,13 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 - **Live eval fork copy scope:** `kj fork` is a full copy. Decide if fork should be selective by default.
 - **russh teardown panic:** `ChannelCloseOnDrop::drop` panics with "there is no reactor running" in tests.
+- **Capnp schema change ⇒ three binaries to bounce:** the dev runner
+  only rebuilds/restarts `kaijutsu-app`; `kaijutsu-server.service`
+  (systemd user unit) and `~/bin/kaijutsu-mcp` (running MCP processes
+  hold the old binary; `cp --remove-destination` to replace, then
+  reconnect MCP) keep stale codegen and fail handshakes with
+  `Message contains non-list pointer where data was expected` (worse
+  now that Kernel interface ordinals renumber on method deletion,
+  e4c8417). Teach `contrib/kaijutsu-runner.sh`/`kj rebuild` to rebuild +
+  restart all three, or at least print a loud reminder when
+  `kaijutsu.capnp` changed.
