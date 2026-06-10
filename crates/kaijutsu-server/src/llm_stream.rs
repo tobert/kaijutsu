@@ -62,6 +62,76 @@ fn insert_pre_stream_error_block(
     }
 }
 
+/// Hydrate the live conversation session for one turn.
+///
+/// Catches the `mailbox` up against the current block log and returns the
+/// wire-history snapshot the LLM should see. On a block-read failure this does
+/// **not** fall back to a partial/empty session — that would silently hand the
+/// model an amnesiac request (no-silent-fallbacks directive). Instead it
+/// surfaces a `BlockKind::Error` block anchored at the user's message and
+/// returns `Err(())`, which the caller turns into an early return so the turn
+/// fails loudly with operator-visible feedback.
+///
+/// `block_snapshots` only fails with `DocumentNotFound`, which means the
+/// context's document is genuinely gone (e.g. evicted/deleted in the async
+/// window between the user-block insert and this task running). In that case
+/// the error-block insert below will itself fail (no document to anchor in);
+/// we log that loudly and still fail the turn — never proceed to the LLM.
+fn hydrate_messages(
+    documents: &SharedBlockStore,
+    context_id: ContextId,
+    after_block_id: &kaijutsu_crdt::BlockId,
+    mailbox: &mut kaijutsu_kernel::ConversationMailbox,
+) -> Result<Vec<LlmMessage>, ()> {
+    let read = documents.block_snapshots(context_id);
+    handle_hydration_outcome(documents, context_id, after_block_id, read, mailbox)
+}
+
+/// Turn a block-log read into the wire-history snapshot, or fail the turn.
+///
+/// Split out from [`hydrate_messages`] so the failure branch is exercisable in
+/// tests with a real (present) document — `BlockStore::block_snapshots` itself
+/// can only fail with `DocumentNotFound`, which would also make the error-block
+/// anchor unreachable, so the read result is injected here.
+fn handle_hydration_outcome(
+    documents: &SharedBlockStore,
+    context_id: ContextId,
+    after_block_id: &kaijutsu_crdt::BlockId,
+    read: kaijutsu_kernel::BlockStoreResult<Vec<kaijutsu_crdt::BlockSnapshot>>,
+    mailbox: &mut kaijutsu_kernel::ConversationMailbox,
+) -> Result<Vec<LlmMessage>, ()> {
+    match read {
+        Ok(blocks) => {
+            let new_blocks = mailbox.catch_up(&blocks);
+            let snapshot = mailbox.snapshot();
+            log::info!(
+                "Mailbox caught up: +{} new blocks, {} messages on the wire for context {}",
+                new_blocks,
+                snapshot.len(),
+                context_id
+            );
+            Ok(snapshot)
+        }
+        Err(e) => {
+            // Hydration failed. Do NOT fall back to the mailbox snapshot +
+            // appended user message — an empty/stale session means the model
+            // sees no history and responds out of nowhere. Surface the failure
+            // and fail the turn.
+            log::error!(
+                "Hydration failed for context {}: {} — failing the turn loudly",
+                context_id,
+                e
+            );
+            let detail = format!(
+                "Could not read conversation history for this context: {e}. \
+                 The turn was stopped instead of sending the model an empty session."
+            );
+            insert_pre_stream_error_block(documents, context_id, after_block_id, &detail);
+            Err(())
+        }
+    }
+}
+
 async fn build_tool_definitions(
     kernel: &Arc<Kernel>,
     context_id: ContextId,
@@ -87,7 +157,6 @@ async fn build_tool_definitions(
 pub(crate) async fn spawn_llm_for_prompt(
     kernel: &SharedKernelState,
     context_id: ContextId,
-    content: &str,
     model: Option<&str>,
     after_block_id: &kaijutsu_crdt::BlockId,
     tool_ctx: kaijutsu_kernel::ExecContext,
@@ -231,14 +300,12 @@ pub(crate) async fn spawn_llm_for_prompt(
         model_name
     );
 
-    let content = content.to_owned();
     let after_block_id = *after_block_id;
 
     tokio::task::spawn_local(process_llm_stream(
         provider,
         documents,
         context_id,
-        content,
         model_name,
         kernel_arc,
         kernel_db,
@@ -286,6 +353,110 @@ mod consent_tests {
     }
 }
 
+#[cfg(test)]
+mod hydration_tests {
+    use super::*;
+    use kaijutsu_kernel::{BlockStoreError, DocumentKind, shared_block_store};
+
+    /// When the block-log read fails during mailbox catch-up, the turn must
+    /// fail loudly: a `BlockKind::Error` block lands in the conversation and the
+    /// caller gets `Err(())` (so it returns early and never sends the LLM an
+    /// empty/partial session). Regression for the silent-fallback that pushed
+    /// `LlmMessage::user(content)` onto an empty mailbox snapshot.
+    #[test]
+    fn hydration_read_failure_surfaces_error_block_and_no_messages() {
+        let documents = shared_block_store(PrincipalId::new());
+        let context_id = ContextId::new();
+        documents
+            .create_document(context_id, DocumentKind::Conversation, None)
+            .expect("create document");
+
+        // Anchor block: the user's just-inserted prompt.
+        let user_block_id = documents
+            .insert_block_as(
+                context_id,
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "hello",
+                Status::Done,
+                ContentType::Plain,
+                Some(PrincipalId::new()),
+            )
+            .expect("insert user block");
+
+        let mut mailbox = kaijutsu_kernel::ConversationMailbox::new();
+
+        // Inject a failing read (the real failure mode: DocumentNotFound).
+        let read = Err(BlockStoreError::DocumentNotFound(context_id));
+        let result = handle_hydration_outcome(
+            &documents,
+            context_id,
+            &user_block_id,
+            read,
+            &mut mailbox,
+        );
+
+        // (b) No messages produced — the caller returns early, so the LLM is
+        // never called with an empty message list.
+        assert!(
+            result.is_err(),
+            "hydration failure must fail the turn, not yield a (possibly empty) message list"
+        );
+
+        // (a) A visible Error block lands in the conversation.
+        let blocks = documents
+            .block_snapshots(context_id)
+            .expect("read blocks after error insert");
+        assert!(
+            blocks.iter().any(|b| b.kind == BlockKind::Error),
+            "expected a BlockKind::Error block to surface the hydration failure, got: {:?}",
+            blocks.iter().map(|b| b.kind).collect::<Vec<_>>()
+        );
+        // And no model/assistant text block was fabricated.
+        assert!(
+            !blocks
+                .iter()
+                .any(|b| b.role == Role::Model && b.kind == BlockKind::Text),
+            "no model turn should have been produced on a failed hydration"
+        );
+    }
+
+    /// A successful read hydrates the mailbox and returns the wire snapshot —
+    /// the happy path still works after the refactor.
+    #[test]
+    fn hydration_read_success_returns_snapshot() {
+        let documents = shared_block_store(PrincipalId::new());
+        let context_id = ContextId::new();
+        documents
+            .create_document(context_id, DocumentKind::Conversation, None)
+            .expect("create document");
+        let user_block_id = documents
+            .insert_block_as(
+                context_id,
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "hello",
+                Status::Done,
+                ContentType::Plain,
+                Some(PrincipalId::new()),
+            )
+            .expect("insert user block");
+
+        let mut mailbox = kaijutsu_kernel::ConversationMailbox::new();
+        let result =
+            hydrate_messages(&documents, context_id, &user_block_id, &mut mailbox);
+        let messages = result.expect("successful hydration");
+        assert!(
+            !messages.is_empty(),
+            "a conversation with a user block must hydrate at least one message"
+        );
+    }
+}
+
 /// Process LLM streaming in a background task with agentic loop.
 ///
 /// Handles all stream events, executes tools, and loops until the model signals
@@ -317,7 +488,6 @@ async fn process_llm_stream(
     provider: Arc<Provider>,
     documents: SharedBlockStore,
     context_id: ContextId,
-    content: String,
     model_name: String,
     kernel: Arc<Kernel>,
     kernel_db: Arc<parking_lot::Mutex<KernelDb>>,
@@ -348,40 +518,12 @@ async fn process_llm_stream(
     // are skipped, so this is O(new blocks), not O(history).
     // block_snapshots() reads from in-memory DashMap; sub-millisecond
     // for typical conversations.
-    let mut messages = match documents.block_snapshots(context_id) {
-        Ok(blocks) => {
-            let new_blocks = mailbox.catch_up(&blocks);
-            let snapshot = mailbox.snapshot();
-            log::info!(
-                "Mailbox caught up: +{} new blocks, {} messages on the wire for context {}",
-                new_blocks,
-                snapshot.len(),
-                context_id
-            );
-            snapshot
-        }
-        Err(e) => {
-            // Snapshot lookup failed — fall back to whatever the
-            // mailbox already has, plus the user message we were
-            // called with. The mailbox may be empty (first prompt
-            // after cache eviction / kernel restart) or stale; the
-            // appended user message at least lets the model see the
-            // current turn.
-            //
-            // TODO: surface this as a user-visible error block
-            // instead of silently falling back. An empty session
-            // means the model sees no history, which produces
-            // confusing responses. Consider inserting a System block
-            // explaining the gap.
-            log::warn!(
-                "Could not read blocks for {}: {}, falling back to mailbox snapshot + appended user message",
-                context_id,
-                e
-            );
-            let mut snapshot = mailbox.snapshot();
-            snapshot.push(LlmMessage::user(&content));
-            snapshot
-        }
+    let mut messages = match hydrate_messages(&documents, context_id, &after_block_id, &mut mailbox)
+    {
+        Ok(messages) => messages,
+        // Hydration failed and surfaced a visible Error block; fail the turn
+        // loudly rather than streaming against an empty/partial session.
+        Err(()) => return,
     };
     // mailbox lock is held through the rest of the stream — same
     // semantics as the previous MutexGuard<Vec<LlmMessage>>: only one
@@ -409,7 +551,6 @@ async fn process_llm_stream(
         )
         .await;
     }
-    let _ = content; // owned String used only for the hydration-failure fallback path above
 
     log::info!(
         "Sending {} messages for context {}",

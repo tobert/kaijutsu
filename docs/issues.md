@@ -85,10 +85,6 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ## Turn Loop (kaijutsu-server/src/llm_stream.rs) — June 2026 audit
 
-- **Silent hydration fallback (fix first):** when block reads fail during
-  mailbox catch-up, the model silently gets an empty session
-  (`llm_stream.rs:371`, has a TODO admitting it). Violates the
-  no-silent-fallbacks directive — surface a loud `BlockKind::Error` block.
 - **Decompose the agentic loop** (after FlowBus settles; they share event
   paths): mailbox catch-up/snapshot (`:341-391`), cache-breakpoint policy
   via ad-hoc DB reads (`:500-511`), one-shot image resolution that goes

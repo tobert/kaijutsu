@@ -358,7 +358,9 @@ pub fn spawn_turn_driver(registry: Arc<ServerRegistry>) {
                 let TurnFlow::Requested {
                     context_id,
                     after_block_id,
-                    content,
+                    // The user block is already in the log (anchored by
+                    // `after_block_id`); hydration reads it from there.
+                    content: _,
                     principal_id,
                     model,
                 } = msg.payload
@@ -380,7 +382,6 @@ pub fn spawn_turn_driver(registry: Arc<ServerRegistry>) {
                 match spawn_llm_for_prompt(
                     kernel,
                     context_id,
-                    &content,
                     model.as_deref(),
                     &after_block_id,
                     tool_ctx,
@@ -2366,7 +2367,6 @@ impl kernel::Server for KernelImpl {
                 spawn_llm_for_prompt(
                     &kernel,
                     context_id,
-                    &content,
                     model.as_deref(),
                     &user_block_id,
                     tool_ctx,
@@ -4221,7 +4221,6 @@ impl kernel::Server for KernelImpl {
                     spawn_llm_for_prompt(
                         &kernel,
                         context_id,
-                        &text,
                         None,
                         &user_block_id,
                         tool_ctx,
