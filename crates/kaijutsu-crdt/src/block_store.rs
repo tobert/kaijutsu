@@ -319,11 +319,16 @@ impl BlockStore {
 
         let base = match after {
             None => {
+                // A freshly-created block (tick is Some) appends to the end of
+                // the timeline like every other fresh insert — the bounded,
+                // monotonic tick key. Prepending before the first block is
+                // reserved for the legacy `tick == None` move-to-front path
+                // (move_block, snapshot restore).
+                if let Some(t) = tick {
+                    return self.order_key_for_tick(t);
+                }
                 if ordered.is_empty() {
                     // First block on the timeline.
-                    if let Some(t) = tick {
-                        return self.order_key_for_tick(t);
-                    }
                     "V".to_string()
                 } else {
                     let first_key = self.blocks[&ordered[0]].order_key();
@@ -1663,7 +1668,13 @@ mod tests {
     }
 
     #[test]
-    fn test_insert_at_beginning() {
+    fn test_insert_after_none_appends_to_end() {
+        // Regression: a freshly-created block carries a fresh monotonic tick, so
+        // `after = None` must APPEND to the end of the timeline — not prepend to
+        // the top. Every production caller that omits `after` (kj block create,
+        // search results, doc/beat/drive inserts) wants append. Move-to-front is
+        // reserved for the legacy `tick == None` path (move_block, snapshot
+        // restore), which is unaffected by this contract.
         let mut store = test_store();
 
         let id1 = store
@@ -1683,14 +1694,25 @@ mod tests {
                 None,
                 Role::User,
                 BlockKind::Text,
-                "Before First",
+                "Second",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+        let id3 = store
+            .insert_block(
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "Third",
                 Status::Done,
                 ContentType::Plain,
             )
             .unwrap();
 
         let order: Vec<_> = store.blocks_ordered().iter().map(|b| b.id).collect();
-        assert_eq!(order, vec![id2, id1]);
+        assert_eq!(order, vec![id1, id2, id3]);
     }
 
     #[test]
