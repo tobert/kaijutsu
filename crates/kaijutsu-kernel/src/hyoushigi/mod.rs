@@ -414,6 +414,14 @@ pub struct MaterializeCursor {
     /// Artifacts of the in-progress cell already inserted — the resume point for
     /// per-artifact retry. 0 unless the previous attempt failed mid-group.
     pub artifacts_done: usize,
+    /// The id of the in-progress cell's already-inserted SOURCE block, carried
+    /// across a mid-group fault so a resume parents the derived siblings to the
+    /// REAL source — never rediscovered from the log tail, which another writer
+    /// (async model output, failure/poison Error blocks) may have advanced past
+    /// the source between the faulting beat and the retry. Invariant: `Some` iff
+    /// `artifacts_done >= 1`; set when artifact 0 lands, cleared at the cell
+    /// boundary.
+    pub source_block_id: Option<BlockId>,
 }
 
 /// Bridge a timeline's newly-committed cells into the context's CRDT block log —
@@ -550,12 +558,17 @@ pub fn materialize_committed(
         let mut src_id: Option<BlockId> = None;
         for (i, (amime, ahash)) in artifacts.iter().enumerate() {
             if i < cursor.artifacts_done {
-                // Already landed on a prior attempt. The source precedes its
-                // siblings, so on a resume past it the source block is the tail of
-                // the prior partial insert — recover its id from `after` to parent
-                // later siblings.
+                // Already landed on a prior attempt. Recover the source id from the
+                // cursor (carried across the fault), NOT from `after`/the log tail —
+                // a concurrent writer may have appended past the source between the
+                // faulting beat and this retry, and parenting a sibling to that
+                // foreign block would silently corrupt the score↔render provenance.
                 if i == 0 {
-                    src_id = after;
+                    src_id = cursor.source_block_id;
+                    debug_assert!(
+                        src_id.is_some(),
+                        "resume with artifacts_done>0 must carry the source block id"
+                    );
                 }
                 continue;
             }
@@ -601,6 +614,9 @@ pub fn materialize_committed(
             )?;
             if i == 0 {
                 src_id = Some(id);
+                // Persist the source id BEFORE advancing artifacts_done — a fault on
+                // the next artifact must resume with this exact id, not the log tail.
+                cursor.source_block_id = Some(id);
             }
             after = Some(id);
             inserted.push(id);
@@ -609,8 +625,11 @@ pub fn materialize_committed(
             cursor.artifacts_done = i + 1;
         }
 
-        // The full group landed — advance past the cell and reset the resume point.
+        // The full group landed — advance past the cell and clear the resume point
+        // (artifacts_done back to 0, source id dropped: the invariant is `Some` iff
+        // a partial group is outstanding).
         cursor.artifacts_done = 0;
+        cursor.source_block_id = None;
         cursor.high_water += 1;
     }
 
@@ -1027,6 +1046,77 @@ mod tests {
             materialize_committed(&tl, &cas, &blocks, ctx, &mut cursor, &derivers).unwrap();
         assert!(again.is_empty(), "second pass is a no-op");
         assert_eq!(blocks.block_snapshots(ctx).unwrap().len(), 2);
+    }
+
+    /// The per-artifact resume must parent the derived sibling to the REAL source
+    /// block of the in-progress cell, NOT whatever happens to be the log tail at
+    /// retry time. The existing T13 pins resume mechanics but never appends between
+    /// the fault and the retry, so its source stays the tail and a tail-recovery
+    /// bug passes silently. Here a foreign writer (async model output, a
+    /// failure/poison Error block) lands between the beats; if the resume rebuilt
+    /// the source id from `last_block_id`, the MIDI sibling would parent that
+    /// foreign block and corrupt the one-hop score↔render provenance playback needs.
+    #[tokio::test]
+    async fn resume_parents_sibling_to_real_source_not_log_tail() {
+        use kaijutsu_types::{BlockKind, ContentType, PrincipalId, Role, Status};
+
+        let (blocks, cas, ctx, _dir) = store_and_cas();
+        let tl = timeline_with_committed_abc(&cas, VAMP_ABC);
+        let mut cursor = MaterializeCursor::default();
+        let derivers = DeriverRegistry::production();
+
+        // Fault the sibling insert (artifact list is [source, MIDI]; the MIDI is
+        // insert #2) so the source lands and the cell faults mid-group — the REAL
+        // boundary, same seam as T13.
+        blocks.arm_insert_fault(2);
+        let r1 = materialize_committed(&tl, &cas, &blocks, ctx, &mut cursor, &derivers);
+        assert!(r1.is_err(), "the injected sibling fault surfaces as Err");
+        assert_eq!(cursor.artifacts_done, 1, "the source landed; resume at the sibling");
+        let source_id = blocks.block_snapshots(ctx).unwrap()[0].id;
+        assert_eq!(
+            cursor.source_block_id,
+            Some(source_id),
+            "the faulting beat carried the source id forward on the cursor"
+        );
+
+        // A foreign writer (async model output, a failure/poison Error block, …)
+        // appends between beats — the source is NO LONGER the log tail.
+        let foreign = blocks
+            .insert_block_as(
+                ctx,
+                None,
+                Some(&source_id),
+                Role::Model,
+                BlockKind::Text,
+                "an interleaved chat/tool/error block",
+                Status::Done,
+                ContentType::Plain,
+                Some(PrincipalId::system()),
+            )
+            .unwrap();
+        assert_ne!(foreign, source_id);
+        assert_eq!(
+            blocks.last_block_id(ctx),
+            Some(foreign),
+            "the log tail is now the foreign block, not the source"
+        );
+
+        // The retry beat resumes the SAME cell at the MIDI sibling (fault spent).
+        let inserted =
+            materialize_committed(&tl, &cas, &blocks, ctx, &mut cursor, &derivers).unwrap();
+        assert_eq!(inserted.len(), 1, "resume inserts exactly the missing MIDI sibling");
+
+        let sib = blocks.get_block_snapshot(ctx, &inserted[0]).unwrap().unwrap();
+        assert_eq!(
+            sib.parent_id,
+            Some(source_id),
+            "the resumed MIDI sibling parents its REAL ABC source, not the log tail"
+        );
+        assert_ne!(
+            sib.parent_id,
+            Some(foreign),
+            "and emphatically NOT the foreign block that became the tail"
+        );
     }
 
     /// Commit the VAMP ABC at a chosen tick via the real `cas_commit` resolver,

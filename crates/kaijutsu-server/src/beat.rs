@@ -394,6 +394,7 @@ impl BeatScheduler {
                             // errors for it.
                             s.cursor.high_water += 1;
                             s.cursor.artifacts_done = 0;
+                            s.cursor.source_block_id = None;
                             s.materialize_failures = 0;
                             log::error!(
                                 "beat: skipping poison cell at high_water={} \
