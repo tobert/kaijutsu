@@ -259,6 +259,24 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   Once a band config exists (multiple chairs on one timeline), decide where the
   track↔chair mapping lives — there is no registry today (track is self-describing
   on every block, by design).
+- **`played_by` collapses to `system()` — `who-played` provenance is degenerate
+  (Chameleon batch 1, F2):** F1 §1.2 records "who played" as `BlockId.principal_id`,
+  meant to be the player's principal. But the composer turn's model-text output
+  block is inserted under `PrincipalId::system()` (`llm_stream.rs` `StreamEvent::TextStart`,
+  the standing model-text convention), and `on_turn_completed` (`beat.rs`) sets
+  `played_by = b.id.principal_id` = `system()`. The OODA `tick` verb also fires
+  under `system()` (`beat.rs::fire_tick`), so `TurnFlow::Completed.principal_id`
+  carries `system()` too — reading it instead of the block author would NOT help.
+  So every materialized score block is authored by `system()` (plus `PrincipalId::beat()`
+  for fallback repeats). **Harmless today** — one model per composer context, and
+  lanes key on `track`, not principal, so no correctness/collision issue (the
+  per-principal seq lane just has a single `system()` writer). **Will mis-attribute**
+  the moment multiple models share a context or we want to distinguish player from
+  transport. Not a one-liner: needs the composer turn to run (and author its
+  output) under a distinct per-player principal. Surfaced in the F2 adversarial
+  review (deepseek+gemini, 2026-06-11); the two silent-failure bugs from that pass
+  (resume parent-id from log tail; hydration-failure publishing no terminal event)
+  were fixed in-slice.
 - **`kj track` listing surface:** no way to enumerate the tracks present on a
   context's timeline. Add a `kj` listing surface (which tracks exist, which
   principals played each) once tracks are user-visible.
