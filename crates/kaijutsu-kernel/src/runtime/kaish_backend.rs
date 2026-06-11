@@ -733,6 +733,8 @@ impl KernelBackend for KaijutsuBackend {
         vec![MountInfo {
             path: std::path::PathBuf::from("/docs"),
             read_only: false,
+            // CRDT-backed mount; residency lives in the BlockStore, not tracked here.
+            resident_bytes: None,
         }]
     }
 }
