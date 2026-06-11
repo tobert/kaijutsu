@@ -8,7 +8,7 @@ use kaijutsu_crdt::{ContextId, KernelId};
 use kaijutsu_types::{
     BlockFilter, BlockId, BlockKind, BlockQuery, BlockSnapshot, BlockSnapshotBuilder, ContentType,
     DriftKind, ErrorCategory, ErrorPayload, ErrorSeverity, ErrorSpan, PrincipalId, Role, Status,
-    Tick, ToolKind,
+    Tick, ToolKind, TrackId,
 };
 use russh::ChannelStream;
 use russh::client::Msg;
@@ -2088,6 +2088,20 @@ pub(crate) fn parse_block_snapshot(
         builder = builder.tick(Tick::new(reader.get_tick()));
     }
 
+    // Hyoushigi track / lane identity (Some only for materialized timeline cells).
+    // A malformed track string on the wire is corruption: warn loudly and drop to
+    // None rather than fabricate a lane (no silent normalization). hasTrack=false
+    // ⇔ None — old writers leave it false.
+    if reader.get_has_track()
+        && let Ok(s) = reader.get_track()
+        && let Ok(s) = s.to_str()
+    {
+        match TrackId::new(s) {
+            Ok(track) => builder = builder.track(track),
+            Err(e) => log::warn!("parse_block_snapshot: invalid track {s:?} on wire: {e}"),
+        }
+    }
+
     // Error payload (for Error blocks)
     if reader.get_has_error_payload()
         && let Ok(ep) = reader.get_error_payload()
@@ -2613,6 +2627,11 @@ mod tests {
             builder.set_tick(tick.get());
         }
 
+        if let Some(ref track) = snap.track {
+            builder.set_has_track(true);
+            builder.set_track(track.as_str());
+        }
+
         if let Some(ref signature) = snap.signature {
             builder.set_has_signature(true);
             builder.set_signature(signature);
@@ -2641,6 +2660,30 @@ mod tests {
         // An ordinary block has no tick, and absence roundtrips as None.
         let plain = BlockSnapshotBuilder::new(id, BlockKind::Text).build();
         assert_eq!(roundtrip_snapshot(&plain).tick, None);
+    }
+
+    /// T18 (design §8 Phase 5) — track survives Rust→capnp→Rust; hasTrack=false ⇔
+    /// None. A materialized block's lane identity crosses the wire verbatim; an
+    /// ordinary block's absent track stays None (old writers leave hasTrack=false).
+    #[test]
+    fn track_capnp_roundtrip() {
+        let id = BlockId {
+            context_id: ContextId::new(),
+            principal_id: PrincipalId::new(),
+            seq: 1,
+        };
+        // Some(track) survives.
+        let snap = BlockSnapshotBuilder::new(id, BlockKind::Text)
+            .track(TrackId::new("bass").unwrap())
+            .build();
+        assert_eq!(
+            roundtrip_snapshot(&snap).track,
+            Some(TrackId::new("bass").unwrap())
+        );
+
+        // None ⇔ hasTrack=false: an ordinary block roundtrips with track absent.
+        let plain = BlockSnapshotBuilder::new(id, BlockKind::Text).build();
+        assert_eq!(roundtrip_snapshot(&plain).track, None);
     }
 
     #[test]

@@ -23,6 +23,12 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   - **Live contexts need reseed/restart:** broadened role loadouts only reach
     newly-created contexts; existing ones keep their old (now authority-less)
     binding until `kj rc reseed` + re-create or a kernel restart.
+- **Zombie RPC session / no session reaping:** the server has warned every
+  60s for 21+ hours that session `019eb229` (an app session predating a
+  Jun 10 GUI restart) is "still active" — there is no reap path for dead
+  sessions. Related: auto-memory `tech_debt_peer_reattach_on_reconnect`
+  (app doesn't re-attach after kernel restart). Found during the
+  2026-06-11 journaling forensics.
 - **LLM providers:**
   - Move per-model knobs out of the config layer (`models.toml`), into the app.
   - Push subscriber for `ConversationMailbox`.
@@ -88,39 +94,34 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ## Persistence & Sync
 
-- **Post-restart block ordering: append `order_key` trusts a stale tick
-  counter (bug, found live 2026-06-10):** `merge_ops` advances `next_seq`
-  and the lamport clock but never `next_tick`
-  (`crates/kaijutsu-crdt/src/block_store.rs:1109`), so after a kernel
-  restart that replays oplog past the last snapshot, `next_tick` sits at
-  the *snapshot* max while replayed blocks carry higher ticks. The append
-  path then derives the new key from the stale tick — even though it holds
-  `after_key` at that moment (`block_store.rs:346-349`) — and the fresh
-  block sorts mid-document. Live symptom: shell output blocks landed at
-  y≈24/11800 of a 14023px conversation while the user watched the bottom.
-  Verified by replaying the on-disk snapshot+oplog for context `019eb15a…`
-  through the real restore path (new insert → position 36/52). Fix
-  direction discussed 2026-06-10 (decouple order from tick rather than
-  patch the counter): (1) append keys derive from the predecessor's
-  fixed-width key (increment), not the tick — tick stays a pure timeline
-  coordinate; (2) enforce appended-key > predecessor-key with a
-  `debug_assert` + loud fallback; (3) `merge_ops` still restores the tick
-  high-water mark — for playback/transport semantics, not ordering.
-  Regression test: snapshot → `merge_ops` → fresh append sorts last
-  (fails today). Open design check: does predecessor-derived append
-  conflict with hyoushigi multi-writer tick plans (`docs/hyoushigi.md`)?
-- **Post-restart oplog journaling gap (investigate — possible data
-  loss):** the persisted oplog for `019eb15a…` (and *every* doc in
-  `kernel.db`) ends 2026-06-10 11:08 EDT, yet the kernel restarted 11:30
-  and 15:30 and live blocks were created all afternoon (shell commands,
-  visible in the app). Post-restart inserts appear to exist in memory
-  only — either the shell path stopped journaling or `append_op` is
-  silently failing. Rank above the ordering bug: if real, everything
-  since the last restart evaporates on the next one.
+- **Post-restart oplog journaling gap — RESOLVED as observation artifact,
+  hardening remains (forensics 2026-06-11): no data loss.** Two confirmed
+  mechanisms produced the misread: (1) timezone double-count — the single
+  Jun 10 restart at 11:30:03 EDT logs itself as `15:30:03Z` and was counted
+  as two restarts ("11:30 and 15:30"); the "afternoon" block activity was
+  14:42–15:08Z = 10:42–11:08 EDT, exactly where the oplog "ends". (2) WAL
+  invisibility — `kernel.db`'s main file was last checkpointed 11:08 while
+  ~4.1 MB of newer ops sat only in `kernel.db-wal`; the kernel never
+  checkpoints proactively (`kernel_db.rs:797-799`), so any bare-file read
+  shows history frozen at the last checkpoint. Post-restart journaling
+  verified working: seq numbering continued at 189, compaction snapshot at
+  11:48:39, and the 11:48 smoke-test block was decoded out of oplog seq
+  197. Hardening to do (Chameleon batch 1 — the block log becomes the
+  stamp-turn WAL):
+  - `journal_op`/`compact_document` silently return `Ok(())` when the
+    store has no db handle (`crates/kaijutsu-kernel/src/block_store.rs:711-713`,
+    `:747-749`) — exactly the feared failure mode, latent. Kernel-side
+    stores must require a db / fail loud per crash-over-corruption; add
+    the silent-no-op guard test (fails today).
+  - `PRAGMA wal_checkpoint(TRUNCATE)` on clean shutdown and after
+    compaction so the main file stops lagging; add the
+    durability-across-kill test (insert via real paths, SIGKILL, reload
+    through `load_from_db`, assert everything present).
+  - Forensics hygiene: tracing logs UTC, systemd speaks local — cite both
+    zones when recording restarts in issue notes.
 - **`KernelDb` connection pool:** Currently `Arc<parking_lot::Mutex<KernelDb>>` (`block_store.rs:74`). This bottleneck prevents utilizing SQLite's WAL mode for concurrent readers. Migrate to `r2d2` or `sqlx` to allow non-blocking reads during LLM streams and heavy writes. Note: SQLite serializes *writes* regardless of pooling, so the win is concurrent reads (and only with WAL enabled) — verify WAL before assuming a pool helps; narrowing lock scope may matter as much.
 - **Config CRDT ops:** Config backend needs DTE integration so changes replicate across peers.
 - **`blocks_ordered()` allocation churn + sort:** `block_store.rs:185-188` calls `order_key().to_string()` for *every block*, then `sort_by` on the strings — so it's O(N log N) **plus a String allocation per block per call**. It runs on per-frame hot paths (`kaijutsu-app/src/ui/card_stack/sync.rs:48`, `view/components.rs:163`), so the allocation churn is likely the bigger cost than the asymptotics. Fixes: compare `order_key` without stringifying, and/or cache the ordering and invalidate on block change. Add a secondary sorted index when scale demands.
-- **CBOR backward-compat fixture test:** the postcard→versioned-CBOR migration shipped (`kaijutsu_types::codec`, commit fd0b881) — oplog/snapshot persistence is now self-describing with a 1-byte format version, so adding a `#[serde(default)]` field no longer corrupts old blobs. Remaining: a frozen fixture test that decodes an *older-shape* `BlockSnapshot` CBOR blob (fewer fields) and asserts it loads with defaults — the CI regression net guarding the additive-evolution promise. The codec already has unit tests (round-trip, unknown-format → loud `CodecError::UnknownFormat`, empty); this is the missing forward-compat fixture. See auto-memory `tech_debt_binary_serialization_oplog`.
 - **Latch state should persist with the context:** 
   - `set -o latch` mode is per-shell and lost on restart.
   - Latch nonces should eventually live in a SQLite table rather than in-memory.
@@ -176,6 +177,10 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 - **ABC multi-tune files vs blocks:** Split tunes across sibling blocks or stack inside one block.
 - **ABC file-header inheritance:** `M:`/`L:`/`Q:` defaults prevent proper inheritance.
 - **ABC features:** `I:linebreak`, `m:` macro expansion, `%%` directives, Unicode escapes/fonts.
+- **ABC duration-summing ruler:** kaijutsu-abc has no total-beats-per-voice
+  machinery; needed to validate that a committed phrase's ABC sums to
+  `beats_per_phrase` (Chameleon eval ruler, new code). The tuplet/broken-rhythm
+  handling in `midi.rs:261-274` is the acceptance spec.
 - **ABC layout:** Linear duration spacing (needs Gould spacing/justification), system bracket/brace, closed-score layout.
 
 ## Hyoushigi / Composer
@@ -188,19 +193,115 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   Follow-up: revisit whether the composing turn also needs `submit_input` vs.
   relying on the turn driver, and trim further if the tick proves it can.
 - **Cadence/tempo should be settable per context:** `kj transport tempo <bpm>`
-  exists, but the OODA cadence (`ooda_every`, default 32 bars) is fixed in
-  `BeatPolicy::composer_default()`. Make the cadence a settable knob (rc-declared
-  and/or a `kj transport` arg), persisted per context. Fine to do later.
+  exists, but the OODA cadence (`ooda_every`, default 8 phrases = 128 beats) is
+  fixed in `BeatPolicy::composer_default()`. Make the cadence a settable knob
+  (rc-declared and/or a `kj transport` arg), persisted per context. Fine to do
+  later.
+- **`kj transport meter` inbound verb (Chameleon batch 1, F2):** add
+  `kj transport meter <beats_per_phrase>` with a `--bars N --beats-per-bar M`
+  convenience that multiplies to beats *at the edge* → new
+  `BeatCommand::SetMeter`. Home is `kj/transport.rs`, and it gets the first
+  bars→beats translation test (the kernel only ever sees beats; bars live in the
+  human-facing arg). Pairs with the cadence-knob item above.
+- **`ooda_every` stays beat-denominated (Chameleon batch 1, F2):** the OODA
+  cadence field is kept in beats even though its default is *expressed* in
+  phrases (`8 * 16`); a phrase-typed `ooda_every` is deliberately deferred —
+  revisit once irregular phrases (per-phrase beat counts) make the beat
+  denomination awkward.
 - **Transport surface beyond `kj`:** app transport buttons / spacebar + a capnp
   transport surface (today `kj transport play|pause|stop|tempo|ooda` only).
-- **Restart re-arm + playhead recovery:** a kernel restart resets composers to
-  stopped and does *not* re-arm them; on re-arm, seed the playhead from the max
-  committed tick rather than 0. (No archive RPC yet → disarm-on-archive also TODO.)
-- **Section-placement policy:** the OODA `abc_to_midi` cell is scheduled a fixed
-  bar ahead (`OODA_LEAD`); a real composer wants musical placement (next section
-  boundary, loop region) and a richer `compute_basis`.
+- **Re-arm-on-restart sweep unwired:** a kernel restart resets composers to
+  stopped and does *not* re-arm them — the only `BeatCommand::Arm` sender is
+  `createContext` (`rpc.rs`). The seeding half is **done** (Chameleon batch 1, F1):
+  `arm` now reads `max_tick(ctx)` and seeds the playhead inside `arm_timeline`'s
+  `or_insert_with`, virgin-only (a non-virgin `seed_playhead` is `Err`), so re-arm
+  is safe whenever wired. Remaining: an actual restart sweep that re-arms persisted
+  composers. (No archive RPC yet → disarm-on-archive also TODO.) **This is one
+  work item with `BeatPolicy` persistence (Chameleon batch 1, F2):** policy
+  (`beats_per_phrase`, `ooda_every`, period) and `beat_count` all evaporate on
+  restart, but persisting them alone is useless because nothing re-arms contexts
+  post-restart at all — the sweep and the persistence land together or not at all.
+- **Materialize-error poison cell → `Error` block on budget exhaustion:** DONE
+  (Chameleon batch 1, F2). The swallow-and-retry-forever loop is gone: a
+  `materialize_committed` failure now escalates to `log::error!` with a per-cell
+  consecutive-failure count, and after `MATERIALIZE_RETRY_BUDGET` (3) failures on
+  the SAME cell the bridge skips it (loudly) so the beat loop always terminates.
+  Pre-F1 the classic trigger was `DuplicateBlock` (fixed structurally by seq
+  lanes); other failure modes (CAS write, insert, underivable committed ABC) now
+  hit the bounded retry-then-skip path. On budget exhaustion `process_one` now
+  surfaces exactly ONE `BlockKind::Error` block (category `Kernel`, anchored at the
+  document tail, authored by `beat()`) — deduped by construction (the skip happens
+  once per poison cell), so the miss is visible in the conversation, not just the
+  logs. Pinned by `poison_cell_skip_surfaces_error_block` (`beat.rs`). The failure
+  count is per-context, so two tracks failing concurrently each get their own
+  budget (no longer one poison stalling the whole beat indefinitely). Separately,
+  the engine *resolve*-failure ledger (`Timeline::failures()`, a different miss
+  class — CAS read miss / validator reject that drops the cell before it commits)
+  drains into one Error block per event past a monotone `failure_water` cursor,
+  pinned by `resolve_failure_surfaces_error_block`.
+- **App track chip + "transport" label for beat():** author chips show the
+  player's principal on played phrases and `beat()`'s on transport fallback
+  repeats — truthful but mildly noisy. Add a track chip (the lane identity) and a
+  "transport" label for `beat()`-authored fallback repeats so a vamp insurance
+  repeat reads as the transport, not a mystery principal.
+- **`ResolverCtx` track-scoped reads await `$HEARD`:** `content_before` stays
+  deliberately track-blind (no current resolver reads it; `CasCommitResolver`
+  reads CAS by hash). The first real consumer of track-scoped reads is `$HEARD` — design
+  that API with its consumer (two-voices rule), not speculatively here.
+- **Optional rc-driven last-good rehydration on arm:** after restart every
+  track's engine history is empty → `UseLastGood` → Skip → **silence until the
+  first good phrase** (locked default). A future rc-driven arm option could
+  rehydrate last-good content from the block log on arm — an opt-in, never the
+  engine default.
+- **Standing per-phrase `UseLastGood` cells (whole-turn-miss hole) (Chameleon
+  batch 1, F2):** `UseLastGood` only fires when a cell was *scheduled* and then
+  squashed; a turn that produces no cell at all (the model never spoke) leaves no
+  cell to fall back on, so the phrase is silent rather than a vamp repeat. The
+  natural hook is the new `phrase_due` boundary: stand up a per-phrase
+  `UseLastGood` cell at each phrase boundary so an unscheduled phrase still vamps
+  the last good one. Out of scope for batch 1; recorded so the hole is known.
+- **Deriver-budget enforcement beyond convention (Chameleon batch 1, F2):** the
+  `Deriver` contract says ≲1 ms per cell (it runs on the beat thread under the
+  timeline lock) but nothing enforces it — today it is a measured convention
+  (T22 prints ~300 µs release for the ABC deriver). Add a timed `debug_assert`
+  (or a soft warn) around `derive()` so a future heavy deriver trips loudly in
+  dev rather than silently stalling the beat under the lock.
+- **In-RAM committed `Vec` / RAM-CAS unbounded growth (Chameleon batch 1, F2):**
+  the timeline's committed `Vec` and RAM CAS grow without bound for a long-armed
+  composer (every phrase appends). **Rotation is the answer** — the chameleon
+  rotation tick-continuity invariant retires old committed history into the
+  durable block log + CAS and starts a fresh window — but it is not built. Until
+  then a marathon set leaks RAM.
+- **Band track↔chair mapping source of truth:** composer-create derives a track
+  from the context label (`TrackId::new`→`slugify`, hard-error on empty slug).
+  Once a band config exists (multiple chairs on one timeline), decide where the
+  track↔chair mapping lives — there is no registry today (track is self-describing
+  on every block, by design).
+- **`kj track` listing surface:** no way to enumerate the tracks present on a
+  context's timeline. Add a `kj` listing surface (which tracks exist, which
+  principals played each) once tracks are user-visible.
+- **Section-placement policy:** the OODA notation cell is scheduled a fixed
+  **one phrase** ahead (`phrase_delta()`; `OODA_LEAD` is gone, Chameleon batch 1,
+  F2); a real composer wants musical placement (next section boundary, loop
+  region) and a richer `compute_basis`.
 - **`Midi` render variant + UI timeline:** `audio/midi` projects to `ContentType::Plain`
   today; add a `Midi` variant + renderer, and the scrubbable timeline render.
+  **Deliberately deferred to its first consumer (playback slice 2), not added in
+  Chameleon batch 1, F2:** `ContentType` is a closed enum that rides
+  `BlockHeader` inside `SyncPayload` ops, and the CBOR codec is fail-loud by
+  design — a new variant breaks old decoders. Per the project rule a variant
+  lands with its renderer, never speculatively. Interim sink key:
+  `Role::Asset && parent_id → ABC source` (one hop); the authoritative mime is in
+  the CAS sidecar.
+- **midi→pcm re-anchor (playback slice 3) (Chameleon batch 1, F2):** the
+  `abc_to_midi` *resolver* is gone — ABC→MIDI is now a barrier-side `Deriver`,
+  not a timeline resolver, so the midi→pcm chain for dumb (PCM-only) sinks has no
+  resolver shape to copy. Two candidate re-anchor shapes to pick between when
+  playback slice 3 lands: (a) a deferred PCM **cell keyed on the derived MIDI
+  hash** (real lead time, scheduled like any resolver), or (b) a measured
+  **budget-excepted deriver** (only if midi→pcm proves fast enough to run at the
+  barrier — almost certainly not, soundfont synthesis is heavy). See
+  `docs/playback.md` item 8.
 - **Trace span attribute:** attach `hyoushigi.tick` on the materialize→insert
   spans now that a producer exists.
 - **Playback via peer sinks — design settled, see `docs/playback.md`:**

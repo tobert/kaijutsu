@@ -23,6 +23,7 @@ use strum::EnumString;
 use crate::OutputData;
 use crate::ids::{ContextId, PrincipalId};
 use crate::tick::Tick;
+use crate::track::TrackId;
 
 /// Globally unique block identifier with typed IDs.
 ///
@@ -140,6 +141,15 @@ pub struct BlockHeader {
     /// Whether this block is collapsed (mutable, LWW via `updated_at`).
     pub collapsed: bool,
     /// Ephemeral blocks are displayed but excluded from LLM hydration.
+    ///
+    /// Also blesses machine-record use: timeline-materialized score blocks
+    /// (notation + derived siblings) ride this flag. They are a durable record
+    /// of the shared score, not turns in the conversation — without the skip,
+    /// every materialized phrase (including fallback repeats) would flood the
+    /// LLM as assistant text. `ephemeral` is the honest skip that exists today;
+    /// the hydration-marker machinery that would express "born past the marker"
+    /// semantically is batch 2, at which point score blocks migrate to it and
+    /// this flag reverts to its narrow human-only meaning.
     pub ephemeral: bool,
     /// User-curated exclusion — block is omitted from hydration.
     /// Unlike `ephemeral` (system-managed), this is toggled by the user
@@ -1182,6 +1192,14 @@ pub struct BlockSnapshot {
     pub compacted: bool,
     /// Ephemeral blocks are displayed but excluded from LLM hydration.
     /// Use for human-only output (help text, status info) that wastes model context.
+    ///
+    /// Also blesses machine-record use: timeline-materialized score blocks
+    /// (notation + derived siblings) ride this flag — a durable record of the
+    /// shared score, not conversation turns. Without the skip, every
+    /// materialized phrase (fallback repeats included) would flood the LLM as
+    /// assistant text. This is the honest skip that exists today; batch 2's
+    /// hydration-marker machinery subsumes it (score blocks migrate to the
+    /// marker, ephemeral reverts to its narrow human-only meaning).
     #[serde(default)]
     pub ephemeral: bool,
     /// User-curated exclusion — block is omitted from hydration.
@@ -1305,6 +1323,20 @@ pub struct BlockSnapshot {
     #[serde(default)]
     pub tick: Option<Tick>,
 
+    /// Stable lane identity (hyoushigi `TrackId`, DAW sense). `Some` ONLY on a
+    /// block materialized from a committed timeline cell — `track.is_some()` is
+    /// the clean "this block came off the timeline" discriminator. Write-once at
+    /// creation (like `tool_name`), never LWW-merged, travels only in `new_blocks`
+    /// snapshots.
+    ///
+    /// LANE IDENTITY ONLY. `track` is the *only* lane key; `id.principal_id` (the
+    /// player) is **never** a lane key — one track's blocks span multiple
+    /// principals (the player plus `PrincipalId::beat()` for fallback repeats and
+    /// literals). `track == None` matches NO track: a legacy/untracked block can
+    /// never satisfy another track's `UseLastGood` or a future `$HEARD` query.
+    #[serde(default)]
+    pub track: Option<TrackId>,
+
     // CRDT metadata
     /// Aggregate Lamport timestamp — `max(all per-field timestamps)`.
     /// Propagated during sync so receivers can advance their clocks.
@@ -1415,6 +1447,7 @@ impl BlockSnapshot {
             content_type: ContentType::Plain,
             order_key: None,
             tick: None,
+            track: None,
             updated_at: 0,
             status_at: 0,
             collapsed_at: 0,
@@ -1464,6 +1497,7 @@ impl BlockSnapshot {
             content_type: ContentType::Plain,
             order_key: None,
             tick: None,
+            track: None,
             updated_at: 0,
             status_at: 0,
             collapsed_at: 0,
@@ -1525,6 +1559,7 @@ impl BlockSnapshot {
             content_type: ContentType::Plain,
             order_key: None,
             tick: None,
+            track: None,
             updated_at: 0,
             status_at: 0,
             collapsed_at: 0,
@@ -1586,6 +1621,7 @@ impl BlockSnapshot {
             content_type: ContentType::Plain,
             order_key: None,
             tick: None,
+            track: None,
             updated_at: 0,
             status_at: 0,
             collapsed_at: 0,
@@ -1651,6 +1687,7 @@ impl BlockSnapshot {
             content_type: ContentType::Plain,
             order_key: None,
             tick: None,
+            track: None,
             updated_at: 0,
             status_at: 0,
             collapsed_at: 0,
@@ -1707,6 +1744,7 @@ impl BlockSnapshot {
             content_type: ContentType::Plain,
             order_key: None,
             tick: None,
+            track: None,
             updated_at: 0,
             status_at: 0,
             collapsed_at: 0,
@@ -1761,6 +1799,7 @@ impl BlockSnapshot {
             content_type: ContentType::Plain,
             order_key: None,
             tick: None,
+            track: None,
             updated_at: 0,
             status_at: 0,
             collapsed_at: 0,
@@ -1815,6 +1854,7 @@ impl BlockSnapshot {
             content_type: ContentType::Plain,
             order_key: None,
             tick: None,
+            track: None,
             updated_at: 0,
             status_at: 0,
             collapsed_at: 0,
@@ -1865,6 +1905,7 @@ impl BlockSnapshot {
             content_type: ContentType::Plain,
             order_key: None,
             tick: None,
+            track: None,
             updated_at: 0,
             status_at: 0,
             collapsed_at: 0,
@@ -1926,6 +1967,7 @@ impl BlockSnapshot {
             content_type: ContentType::Plain,
             order_key: None,
             tick: None,
+            track: None,
             updated_at: 0,
             status_at: 0,
             collapsed_at: 0,
@@ -1985,6 +2027,7 @@ impl BlockSnapshot {
             content_type: ContentType::Plain,
             order_key: None,
             tick: None,
+            track: None,
             updated_at: 0,
             status_at: 0,
             collapsed_at: 0,
@@ -2048,6 +2091,7 @@ impl BlockSnapshot {
             && self.resource == other.resource
             && self.content_type == other.content_type
             && self.order_key == other.order_key
+            && self.track == other.track
     }
 }
 
@@ -2111,6 +2155,7 @@ impl BlockSnapshotBuilder {
                 content_type: ContentType::Plain,
                 order_key: None,
                 tick: None,
+                track: None,
                 updated_at: 0,
                 status_at: 0,
                 collapsed_at: 0,
@@ -2245,6 +2290,14 @@ impl BlockSnapshotBuilder {
 
     pub fn tick(mut self, tick: Tick) -> Self {
         self.snap.tick = Some(tick);
+        self
+    }
+
+    /// Set the materialized block's track (lane identity). Only a block crossing
+    /// the timeline write barrier carries one; `track` is the lane, never the
+    /// author (the author stays `id.principal_id`).
+    pub fn track(mut self, track: TrackId) -> Self {
+        self.snap.track = Some(track);
         self
     }
 

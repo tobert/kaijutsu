@@ -384,15 +384,20 @@ pub fn spawn_turn_driver(registry: Arc<ServerRegistry>) {
                     &after_block_id,
                     tool_ctx,
                     principal_id,
+                    // Announce: this is the autonomous turn-driver path (the
+                    // composer's OODA loop). `process_llm_stream` now publishes
+                    // Completed/Failed at ACTUAL stream end with the real output
+                    // block id (design §7). The old publish-at-spawn here is gone —
+                    // it fired before the model wrote anything and raced the stream,
+                    // so the beat scheduler read the seed prompt instead of the Act.
+                    true,
                 )
                 .await
                 {
-                    Ok(()) => {
-                        kernel.kernel.turn_flows().publish(TurnFlow::Completed {
-                            context_id,
-                            principal_id,
-                        });
-                    }
+                    // Spawn succeeded — the stream owns the terminal Completed/Failed
+                    // publish at its end. Nothing to publish here; doing so would
+                    // double-announce (and at the wrong time, with no output id).
+                    Ok(()) => {}
                     Err(e) => {
                         let err = e.to_string();
                         log::warn!(
@@ -2380,7 +2385,9 @@ impl kernel::Server for KernelImpl {
                     model
                 );
 
-                // Spawn LLM streaming in background
+                // Spawn LLM streaming in background. Interactive human prompt:
+                // announce_completion=false so the composer's OODA Act never
+                // crystallizes a human-prompted turn (design §7).
                 spawn_llm_for_prompt(
                     &kernel,
                     context_id,
@@ -2388,6 +2395,7 @@ impl kernel::Server for KernelImpl {
                     &user_block_id,
                     tool_ctx,
                     user_principal_id,
+                    false,
                 )
                 .await?;
 
@@ -2646,10 +2654,28 @@ impl kernel::Server for KernelImpl {
             // creates the timeline on arm; absent a scheduler (embedded/test)
             // this is a no-op.
             if context_type == "composer" {
+                // Derive the composer's lane from its label (design §5.4): try the
+                // strict constructor first, then the lossy-but-loud slugify. An
+                // empty slug HARD-ERRORS context creation — crash over a silent
+                // shared default lane that would let two composers collide on one
+                // track (the approved decision; loud, never a silent-ish "main").
+                let track = match kaijutsu_types::TrackId::new(label.as_str())
+                    .ok()
+                    .or_else(|| kaijutsu_types::TrackId::slugify(label.as_str()))
+                {
+                    Some(t) => t,
+                    None => {
+                        return Err(capnp::Error::failed(format!(
+                            "composer label {label:?} does not yield a valid track id \
+                             (slug is empty) — refusing to create with a silent shared lane"
+                        )));
+                    }
+                };
                 let armed = kernel.kernel.send_beat_command(
                     kaijutsu_kernel::hyoushigi::BeatCommand::Arm {
                         context_id,
                         policy: kaijutsu_kernel::hyoushigi::BeatPolicy::composer_default(),
+                        track,
                     },
                 );
                 if !armed {
@@ -4164,7 +4190,9 @@ impl kernel::Server for KernelImpl {
                             capnp::Error::failed(format!("failed to insert user block: {}", e))
                         })?;
 
-                    // Spawn LLM streaming in background
+                    // Spawn LLM streaming in background. Interactive chat prompt
+                    // via submit_input: announce_completion=false (design §7) —
+                    // a human-prompted turn never feeds the composer's OODA Act.
                     spawn_llm_for_prompt(
                         &kernel,
                         context_id,
@@ -4172,6 +4200,7 @@ impl kernel::Server for KernelImpl {
                         &user_block_id,
                         tool_ctx,
                         user_principal_id,
+                        false,
                     )
                     .await?;
 
@@ -6072,6 +6101,13 @@ fn set_block_snapshot(
     if let Some(tick) = block.tick {
         builder.set_has_tick(true);
         builder.set_tick(tick.get());
+    }
+
+    // Set hyoushigi track (lane identity) if present — Some only on materialized
+    // timeline cells. The lane, never the author (author stays id.principalId).
+    if let Some(ref track) = block.track {
+        builder.set_has_track(true);
+        builder.set_track(track.as_str());
     }
 
     // Set drift-specific fields if present

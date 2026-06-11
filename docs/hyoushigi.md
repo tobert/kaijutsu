@@ -565,8 +565,9 @@ fallback are exercised by their first user.
 > `context_type` ships (`assets/defaults/rc/composer/` stance + binding + cache +
 > `tick/S10-drive.kai`), is armed on create, and on its coarse OODA cadence (32
 > bars @ 120 BPM default) fires the `tick` verb (`kj drive`) to request the next
-> turn. The first production `Resolver` — `abc_to_midi` — crystallizes
-> ABC-by-hash into SMF MIDI. Note: `block.tick` was unified by commit `3d437d4`
+> turn. (The first production `Resolver` was `abc_to_midi`, crystallizing
+> ABC-by-hash into SMF MIDI; F2 below replaced it with notation-first
+> `cas_commit` + a barrier-side MIDI deriver.) Note: `block.tick` was unified by commit `3d437d4`
 > into a **shared per-context coordinate** (ties allowed; `BlockId` is the unique
 > row id), correcting the earlier "Some only for materialized cells" framing.
 >
@@ -583,17 +584,62 @@ fallback are exercised by their first user.
 > forward-only; revisiting the past is an *export* of committed content, not a
 > seek). The OODA loop is closed: on `turn.completed` for an OODA-armed composer
 > the scheduler reads the model's ABC block, stores it to CAS, and
-> `schedule_abc_cell`s an `abc_to_midi` cell a bar ahead — so a played composer
-> turns model output into MIDI on the beat, end to end.
+> `schedule_abc_cell`s a notation cell **one phrase ahead** (F2; was a fixed bar
+> ahead) — so a played composer turns model output into committed notation, and
+> the write barrier derives the MIDI sibling, on the beat, end to end.
 >
 > **Not yet:** the UI timeline render + transport buttons/spacebar + a capnp
 > transport surface (today `kj transport` only); external-MIDI clock discipline;
-> disarm-on-archive and re-arm-on-restart (no archive RPC yet; restart resets to
-> stopped, doesn't re-arm); seeding the playhead from the max committed tick on
-> re-arm; a richer `compute_basis` / section-placement policy (the MIDI cell is
-> scheduled a fixed bar ahead for now); a `Midi` `ContentType` render variant; and
-> step 6 (audio). **Still open:** attach `hyoushigi.tick` as a span attribute on the materialize→insert
+> disarm-on-archive and the cold-start **re-arm sweep** (no archive RPC yet;
+> restart resets to stopped, doesn't re-arm — but arming is now restart-safe:
+> F2's arm-time playhead seed and log-seeded seq lanes make a future sweep safe
+> by construction); a richer `compute_basis` / section-placement policy (the
+> notation cell is scheduled one phrase ahead for now); a `Midi` `ContentType`
+> render variant; and step 6 (audio). **Still open:** attach `hyoushigi.tick` as a span attribute on the materialize→insert
 > spans (the producer now exists, so this can land).
+>
+> **Order/tick decoupling + track identity (Chameleon batch 1, F1 — landed):**
+> append `order_key`s are now derived from the **predecessor's key** (a
+> width-preserving successor), never from any tick/seq counter — so a stale
+> counter after a restart oplog replay can no longer mis-sort a fresh append.
+> `Tick` is the **pure semantic coordinate** (windowed reads, `$HEARD`,
+> transport), stamped from the per-context tick high-water (restored by
+> `merge_ops` and seeded across forks); `order_key` is the CRDT sibling-ordering
+> index. They co-vary at the sole sequencer but are no longer the same number.
+> **Successor keys are strictly increasing**, so within-beat order = insertion
+> order at the sequencer; ties *at the tick coordinate* remain allowed
+> (shared-coordinate doctrine — `BlockId` is the unique row id), but two appends
+> never share a key. **Lane-vs-author contract:** a materialized block carries a
+> `track` (the stable lane identity, DAW sense — where the clip lives) while
+> `BlockId.principal_id` records **who played** (the player whose turn produced
+> the ABC, or `beat()` when the transport itself filled a vamp). The principal is
+> **never** a lane key; `track` is the only lane identity, and `track == None`
+> matches **no** track — a legacy/untracked block can never satisfy another
+> track's `UseLastGood` or a future `$HEARD` query.
+>
+> **Notation-first materialization + phrase vocabulary (Chameleon batch 1, F2 —
+> landed):** the committed cell is now the **notation itself**. A trivial
+> validating `cas_commit` resolver (replacing `abc_to_midi`) commits the ABC
+> body (`text/vnd.abc`) at the tick; the write barrier
+> (`materialize_committed`) consults a mime-keyed **`DeriverRegistry`** and
+> inserts the MIDI as a **derived sibling block** — same tick, same track,
+> `Role::Asset`, content = 32-hex CAS hash, `parent_id` = the ABC source block.
+> The MIDI never enters the committed log, so the `UseLastGood` pool is
+> notation-pure by construction; fallback copies derive their own sibling at the
+> new tick (the vamp repeat falls out, no second mechanism). The ABC source
+> materializes as `Role::Model` + inline + `ContentType::Abc` → renders as a
+> staff with zero app change. Both blocks are stamped **`ephemeral`** so the
+> score does not flood hydration as assistant text (a batch-1 mitigation;
+> batch-2's hydration marker subsumes it). Derivation runs in **≲1 ms** at the
+> barrier (measured: ~300 µs release, ABC parse + `to_midi` + CAS + two inserts);
+> anything heavier (midi→pcm) stays a timeline resolver, never a deriver. The
+> timebase policy now speaks **`beats_per_phrase`** (`composer_default` = 16,
+> `ooda_every` = 8×16 = 128 beats); `phrase_delta()`/`is_phrase_boundary()` are
+> the only consumers, and `OODA_LEAD` is gone — turns schedule **one phrase
+> ahead**. **Restart safety landed in-slice:** per-principal seq lanes seed from
+> the block log (no `DuplicateBlock` after restart), `seed_playhead` seeds the
+> playhead from the max committed tick at arm (fresh-only, crash on time
+> travel), and `insert_from_snapshot` bumps `next_tick` past a carried tick.
 
 1. **Generalize position first** — land the `Tick` / `TickDelta` split as the
    logical-coordinate-with-pluggable-binding generalization, per the spec'd algebra under

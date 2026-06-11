@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use diamond_types_extended::{Frontier, SerializedOpsOwned};
 
-use crate::content::{BlockContent, base62_encode_padded, order_midpoint};
+use crate::content::{BlockContent, base62_encode_padded, order_key_successor, order_midpoint};
 use crate::{
     BlockHeader, BlockId, BlockKind, BlockSnapshot, ContentType, ContextId, CrdtError, DriftKind,
     MAX_DAG_DEPTH, PrincipalId, Result, Role, Status, Tick, ToolKind,
@@ -76,8 +76,20 @@ pub struct BlockStore {
     /// Blocks indexed by ID.
     blocks: BTreeMap<BlockId, BlockContent>,
 
-    /// Next sequence number for block IDs (agent-local).
-    next_seq: u64,
+    /// Per-principal next-seq lanes. The next seq for principal P = max seq of
+    /// ANY block in this doc minted under P (tombstones included) + 1. Maintained
+    /// on every insert/merge/restore/fork path; the block log is the single
+    /// source of truth and these lanes are derived from it.
+    ///
+    /// BlockId uniqueness is per (context, principal) — NOT per track. Two tracks
+    /// may share a scheduling principal (one model on two chairs; beat() covering
+    /// fallbacks across every track), so the seq lane is keyed by principal, never
+    /// by track. CONTRACT: the principal records who PLAYED (authorship); it is
+    /// never a lane identity. The lane (a forthcoming `track` field) and the
+    /// principal are independent axes — one track's blocks span multiple
+    /// principals (player + beat). Here, seq is just a row id; the musical
+    /// coordinate is `tick`, and ordering is the successor-key axis.
+    seq_lanes: HashMap<PrincipalId, u64>,
 
     /// Store version (bumped on any mutation).
     version: u64,
@@ -99,7 +111,7 @@ impl BlockStore {
             context_id,
             principal_id,
             blocks: BTreeMap::new(),
-            next_seq: 0,
+            seq_lanes: HashMap::new(),
             version: 0,
             lamport_clock: 0,
             next_tick: 0,
@@ -254,9 +266,44 @@ impl BlockStore {
     // =========================================================================
 
     fn new_block_id(&mut self) -> BlockId {
-        let id = BlockId::new(self.context_id, self.principal_id, self.next_seq);
-        self.next_seq += 1;
+        let principal = self.principal_id;
+        let seq = self.seq_lanes.entry(principal).or_insert(0);
+        let id = BlockId::new(self.context_id, principal, *seq);
+        *seq += 1;
         id
+    }
+
+    /// Reserve a fresh `BlockId` under `principal` WITHOUT inserting — bumps the
+    /// principal's seq lane and returns the id. The caller is expected to insert
+    /// it (via `insert_from_snapshot`), but a reserve-then-failed-insert leaves a
+    /// seq gap, which is benign: BlockId requires monotonic-unique, NOT dense.
+    /// Do not "fix" the gap — re-using a reserved seq risks DuplicateBlock.
+    ///
+    /// Materialization reserves under `cell.played_by` (the player, or beat() for
+    /// fallback repeats): fallback repeats are authored by beat(), not the player,
+    /// so the reserved lane is the player's only when the player produced the ABC.
+    pub fn reserve_block_id(&mut self, principal: PrincipalId) -> BlockId {
+        let seq = self.seq_lanes.entry(principal).or_insert(0);
+        let id = BlockId::new(self.context_id, principal, *seq);
+        *seq += 1;
+        id
+    }
+
+    /// The next seq this store would mint for `principal` (test accessor). Equals
+    /// max persisted seq for `principal` + 1 after any restore/merge/fork.
+    pub fn next_seq_for(&self, principal: PrincipalId) -> u64 {
+        self.seq_lanes.get(&principal).copied().unwrap_or(0)
+    }
+
+    /// Advance `principal`'s seq lane to at least `seq + 1`, observing a block
+    /// minted under `principal` (live OR tombstoned). Called on every
+    /// insert/merge/restore/fork path so the lane is always derived from the
+    /// block log — the single source of truth. The `== self.principal_id` guard
+    /// that previously gated this was the DuplicateBlock bug class: it left
+    /// foreign lanes (beat(), other players) invisible to restore.
+    fn observe_seq(&mut self, principal: PrincipalId, seq: u64) {
+        let lane = self.seq_lanes.entry(principal).or_insert(0);
+        *lane = (*lane).max(seq + 1);
     }
 
     // =========================================================================
@@ -286,6 +333,14 @@ impl BlockStore {
     /// alphabet) leaves keyspace below for an explicit move-to-front via
     /// `order_midpoint`. Because the key length is fixed, a monotonic tick yields
     /// monotonically-sorting keys in O(1) — no per-append growth, no full sort.
+    ///
+    /// NOTE (order/tick decoupling, design §2): appends no longer derive their
+    /// key from this function — they take the *successor* of the predecessor's
+    /// key (`order_key_successor`), so a stale tick counter cannot mis-sort. This
+    /// survives only for the empty-store first insert (the sole case where the
+    /// tick legitimately seeds the keyspace) and for `normalize_timeline`
+    /// re-keying of legacy pre-tick blocks. The tick stays the *semantic*
+    /// coordinate stamped on every block; ordering is a separate axis.
     fn order_key_for_tick(&self, tick: i64) -> String {
         // Tick dominates the sort (chronological order within a store); the agent
         // suffix is a low-order tiebreak that keeps keys unique across replicas
@@ -320,12 +375,22 @@ impl BlockStore {
         let base = match after {
             None => {
                 // A freshly-created block (tick is Some) appends to the end of
-                // the timeline like every other fresh insert — the bounded,
-                // monotonic tick key. Prepending before the first block is
-                // reserved for the legacy `tick == None` move-to-front path
-                // (move_block, snapshot restore).
+                // the timeline. The append key derives from the current tail's
+                // key (successor), NEVER from the tick counter — a stale counter
+                // structurally cannot mis-sort an append. The empty store is the
+                // sole case where the tick legitimately seeds the keyspace.
+                // Prepending before the first block stays the legacy
+                // `tick == None` move-to-front path (move_block, snapshot restore).
                 if let Some(t) = tick {
-                    return self.order_key_for_tick(t);
+                    return match ordered.last() {
+                        None => self.order_key_for_tick(t),
+                        Some(last) => {
+                            let last_key = self.blocks[last].order_key();
+                            let new_key = order_key_successor(last_key, &suffix);
+                            debug_assert!(new_key.as_str() > last_key);
+                            new_key
+                        }
+                    };
                 }
                 if ordered.is_empty() {
                     // First block on the timeline.
@@ -344,9 +409,16 @@ impl BlockStore {
                             let next_key = self.blocks[&ordered[idx + 1]].order_key();
                             order_midpoint(&after_key, next_key)
                         } else {
-                            // Appending after the last block.
-                            if let Some(t) = tick {
-                                return self.order_key_for_tick(t);
+                            // Appending after the last block. The key is the
+                            // successor of after_key — derived from the
+                            // predecessor, NEVER from the tick counter (the
+                            // documented bug arm: it previously read the tick
+                            // while already holding after_key, so a stale counter
+                            // mis-sorted the append).
+                            if tick.is_some() {
+                                let new_key = order_key_successor(&after_key, &suffix);
+                                debug_assert!(new_key > after_key);
+                                return new_key;
                             }
                             format!("{after_key}V")
                         }
@@ -359,13 +431,21 @@ impl BlockStore {
                             total_blocks = ordered.len(),
                             "calc_order_key: after_id not found in ordered list, appending to end"
                         );
-                        if let Some(t) = tick {
-                            return self.order_key_for_tick(t);
-                        }
                         if let Some(last) = ordered.last() {
-                            let last_key = self.blocks[last].order_key();
+                            let last_key = self.blocks[last].order_key().to_string();
+                            // Successor of the tail — derived from the predecessor,
+                            // not the tick counter (same substitution as the
+                            // append-after-last arm).
+                            if tick.is_some() {
+                                let new_key = order_key_successor(&last_key, &suffix);
+                                debug_assert!(new_key > last_key);
+                                return new_key;
+                            }
                             format!("{last_key}V")
                         } else {
+                            if let Some(t) = tick {
+                                return self.order_key_for_tick(t);
+                            }
                             "V".to_string()
                         }
                     }
@@ -800,23 +880,57 @@ impl BlockStore {
         after: Option<&BlockId>,
     ) -> Result<BlockId> {
         let block_id = snapshot.id;
-        if snapshot.id.principal_id == self.principal_id {
-            self.next_seq = self.next_seq.max(snapshot.id.seq + 1);
-        }
+        // Seed the minting principal's seq lane from this observed block — for
+        // ANY principal, not just our own. Foreign lanes (beat(), other players)
+        // must advance on restore or the first post-restart materialization
+        // collides (the DuplicateBlock bug class).
+        self.observe_seq(snapshot.id.principal_id, snapshot.id.seq);
 
         if self.blocks.contains_key(&block_id) {
             return Err(CrdtError::DuplicateBlock(block_id));
         }
 
-        // Keep the snapshot's own tick (via from_snapshot). If it carries one — a
-        // hyoushigi-materialized cell stamped with its beat/playhead coordinate —
-        // derive the `order_key` from that tick so CRDT order matches the timeline
-        // coordinate. The tick is a *shared coordinate*, not a row id: several
-        // blocks on the same beat get the same tick and thus the same
-        // `order_key_for_tick`; the `(order_key, BlockId)` sort in
-        // `block_ids_ordered` breaks the within-beat tie deterministically by
-        // `BlockId`. A snapshot with no tick (drift / error / legacy sync) keeps
-        // the fractional legacy path — `None` consumes no local tick.
+        // Keep the snapshot's own tick (via from_snapshot) — the tick is the pure
+        // *semantic* coordinate, never a row id. The `order_key`, by contrast, is
+        // the successor of the predecessor's key on an append (design §2): CRDT
+        // order tracks insertion order at the sole sequencer, so within-beat order
+        // = insertion order and a stale upstream tick cannot mis-sort. Ties at the
+        // tick coordinate remain allowed (shared-coordinate doctrine); a snapshot
+        // with no tick (drift / error / legacy sync) keeps the fractional legacy
+        // path — `None` consumes no local tick.
+        //
+        // Observability: a regressing tick (snapshot tick < predecessor tick) is
+        // safe to sort now but signals an upstream seeding bug — emit and move on.
+        if let Some(snap_tick) = snapshot.tick {
+            let pred_tick = match after {
+                Some(after_id) => self.blocks.get(after_id).and_then(|b| b.tick()),
+                None => self
+                    .block_ids_ordered()
+                    .last()
+                    .and_then(|id| self.blocks.get(id))
+                    .and_then(|b| b.tick()),
+            };
+            if let Some(pred_tick) = pred_tick
+                && snap_tick.get() < pred_tick.get()
+            {
+                tracing::warn!(
+                    block_id = %block_id.to_key(),
+                    snap_tick = snap_tick.get(),
+                    pred_tick = pred_tick.get(),
+                    "insert_from_snapshot: tick regresses below predecessor — upstream seeding bug"
+                );
+            }
+        }
+        // Advance next_tick past a carried tick (design §11.4) — mirroring the
+        // own-mint `next_position` (:355), `merge_ops` (§2.3, :1268), and the fork
+        // paths. A beat block enters here at a tick well above the conversation's
+        // last; without the bump the next ORDINARY append (which mints via
+        // next_position from next_tick) would stamp a lower tick and calc_order_key
+        // would sort the now-visible staff mid-document. next_tick is the durable
+        // tick high-water; an insert that carries a tick must move it.
+        if let Some(snap_tick) = snapshot.tick {
+            self.next_tick = self.next_tick.max(snap_tick.get() + 1);
+        }
         let order_key = self.calc_order_key(after, snapshot.tick.map(|t| t.get()));
         let block = BlockContent::from_snapshot(&snapshot, self.principal_id, order_key);
         self.blocks.insert(block_id, block);
@@ -1118,9 +1232,28 @@ impl BlockStore {
         let has_ops_for: std::collections::HashSet<BlockId> =
             payload.block_ops.iter().map(|(id, _)| *id).collect();
 
+        // Restore the tick high-water across the merge: a freshly-stamped tick
+        // after this merge must exceed every merged tick (design §2.3). Mirrors
+        // the seq-lane restore — semantic correctness (tick values), separate
+        // from ordering correctness which is now successor-key driven.
+        let mut max_tick: Option<i64> = None;
+
         for snap in &payload.new_blocks {
             if !self.blocks.contains_key(&snap.id) {
-                let fallback_key = format!("{:020}", self.blocks.len());
+                // Key-less fallback: when the snapshot carries no order_key (no
+                // live path today, but this function is the merge boundary), an
+                // appended block must sort AFTER existing blocks. The old decimal
+                // `{:020}` minted keys below every 'V' key — a latent PREPEND.
+                // Take the successor of the current tail instead (or the tick key
+                // when the store is empty). from_snapshot only uses this when
+                // snap.order_key is None.
+                let fallback_key = match self.block_ids_ordered().last() {
+                    Some(last) => {
+                        let last_key = self.blocks[last].order_key().to_string();
+                        order_key_successor(&last_key, &self.agent_order_suffix())
+                    }
+                    None => self.order_key_for_tick(self.next_tick),
+                };
                 let block = if has_ops_for.contains(&snap.id) {
                     // DTE ops will provide content with proper causal history.
                     // Bare DTE — no structure creation, sender's ops bring everything.
@@ -1130,11 +1263,19 @@ impl BlockStore {
                     BlockContent::from_snapshot(snap, self.principal_id, fallback_key)
                 };
                 max_remote_ts = max_remote_ts.max(snap.updated_at);
-                self.blocks.insert(snap.id, block);
-                if snap.id.principal_id == self.principal_id {
-                    self.next_seq = self.next_seq.max(snap.id.seq + 1);
+                if let Some(t) = snap.tick {
+                    max_tick = Some(max_tick.map_or(t.get(), |m| m.max(t.get())));
                 }
+                self.blocks.insert(snap.id, block);
+                // Seed the minting principal's seq lane for ANY principal (the
+                // guard deletion — beat()/foreign lanes must advance on restore).
+                self.observe_seq(snap.id.principal_id, snap.id.seq);
             }
+        }
+
+        // Advance next_tick past the high-water of merged ticks (§2.3).
+        if let Some(t) = max_tick {
+            self.next_tick = self.next_tick.max(t + 1);
         }
 
         // Apply header updates (LWW merge)
@@ -1217,8 +1358,14 @@ impl BlockStore {
                 .tool_call_id
                 .map(|tcid| BlockId::new(new_context_id, tcid.principal_id, tcid.seq));
 
-            if snap.id.principal_id == new_principal_id {
-                forked.next_seq = forked.next_seq.max(snap.id.seq + 1);
+            // Seed the forked store's seq lane for EVERY copied block's principal
+            // (not just the fork principal) and advance next_tick past the copied
+            // tick. Chameleon rotation is a shallow fork with a hard tick-
+            // continuity invariant — without all-principal lane + tick seeding,
+            // a rotated head re-mints duplicate low ids/ticks (design §2.4).
+            forked.observe_seq(snap.id.principal_id, snap.id.seq);
+            if let Some(t) = snap.tick {
+                forked.next_tick = forked.next_tick.max(t.get() + 1);
             }
 
             let mut remapped = snap;
@@ -1264,8 +1411,14 @@ impl BlockStore {
                 .tool_call_id
                 .map(|tcid| BlockId::new(new_context_id, tcid.principal_id, tcid.seq));
 
-            if snap.id.principal_id == new_principal_id {
-                forked.next_seq = forked.next_seq.max(snap.id.seq + 1);
+            // Seed the forked store's seq lane for EVERY copied block's principal
+            // (not just the fork principal) and advance next_tick past the copied
+            // tick. Chameleon rotation is a shallow fork with a hard tick-
+            // continuity invariant — without all-principal lane + tick seeding,
+            // a rotated head re-mints duplicate low ids/ticks (design §2.4).
+            forked.observe_seq(snap.id.principal_id, snap.id.seq);
+            if let Some(t) = snap.tick {
+                forked.next_tick = forked.next_tick.max(t.get() + 1);
             }
 
             let mut remapped = snap;
@@ -1330,8 +1483,14 @@ impl BlockStore {
                 .tool_call_id
                 .map(|tcid| BlockId::new(new_context_id, tcid.principal_id, tcid.seq));
 
-            if snap.id.principal_id == new_principal_id {
-                forked.next_seq = forked.next_seq.max(snap.id.seq + 1);
+            // Seed the forked store's seq lane for EVERY copied block's principal
+            // (not just the fork principal) and advance next_tick past the copied
+            // tick. Chameleon rotation is a shallow fork with a hard tick-
+            // continuity invariant — without all-principal lane + tick seeding,
+            // a rotated head re-mints duplicate low ids/ticks (design §2.4).
+            forked.observe_seq(snap.id.principal_id, snap.id.seq);
+            if let Some(t) = snap.tick {
+                forked.next_tick = forked.next_tick.max(t.get() + 1);
             }
 
             let mut remapped = snap;
@@ -1394,17 +1553,32 @@ impl BlockStore {
     pub fn from_snapshot(snapshot: StoreSnapshot, principal_id: PrincipalId) -> Result<Self> {
         let mut store = Self::new(snapshot.context_id, principal_id);
 
-        for (order_seq, (block_snap, history)) in snapshot
+        for (block_snap, history) in snapshot
             .blocks
             .iter()
             .zip(snapshot.block_history.iter())
-            .enumerate()
         {
-            if block_snap.id.principal_id == principal_id {
-                store.next_seq = store.next_seq.max(block_snap.id.seq + 1);
-            }
+            // Seed the seq lane for EVERY observed principal — players, system(),
+            // beat(), drift authors. The old `== principal_id` guard left foreign
+            // lanes invisible, so the first post-restart materialization re-minted
+            // beat()'s seq 0 → DuplicateBlock → silent retry loop. Lane = max
+            // persisted seq for P + 1 (design §3, §6).
+            store.observe_seq(block_snap.id.principal_id, block_snap.id.seq);
 
-            let fallback_key = format!("{:020}", order_seq);
+            // Key-less fallback: a pre-tick legacy snapshot carries no order_key,
+            // so a restored block must sort AFTER the blocks restored before it.
+            // The old decimal `{:020}` minted keys below every 'V' canonical key
+            // (since '0' < 'V') — the same latent PREPEND hazard §2.3 killed in
+            // merge_ops. Take the successor of the current tail instead (or the
+            // tick key when the store is still empty). `from_snapshot` only reaches
+            // this when block_snap.order_key is None.
+            let fallback_key = match store.block_ids_ordered().last() {
+                Some(last) => {
+                    let last_key = store.blocks[last].order_key().to_string();
+                    order_key_successor(&last_key, &store.agent_order_suffix())
+                }
+                None => store.order_key_for_tick(store.next_tick),
+            };
 
             if history.is_empty() {
                 let content =
@@ -1419,7 +1593,10 @@ impl BlockStore {
         }
 
         // Restore tombstones so deletions propagate to peers after compaction.
+        // A deleted block's seq must never be re-minted, so its lane is seeded
+        // too (tombstones included in the max-seq+1 derivation, design §3).
         for id in &snapshot.deleted_blocks {
+            store.observe_seq(id.principal_id, id.seq);
             if !store.blocks.contains_key(id) {
                 let snap = crate::BlockSnapshotBuilder::new(*id, crate::BlockKind::Text)
                     .build();
@@ -2192,12 +2369,14 @@ mod tests {
         assert_eq!(snap.source_context, Some(source_ctx));
     }
 
-    /// A snapshot carrying a hyoushigi `tick` orders by that tick coordinate, not
-    /// by insertion/`after` position: a later-inserted, appended cell with an
-    /// *earlier* tick still sorts first. This is the materialized-cell path —
-    /// CRDT order must track the timeline coordinate.
+    /// Order/tick decoupling (design §2.2): an appended snapshot's order_key is
+    /// the *successor* of the predecessor's key, so within-store order follows
+    /// INSERTION order at the sole sequencer — NOT the tick coordinate. A cell
+    /// appended after another with an earlier tick still sorts last. The tick
+    /// stays the semantic coordinate (stamped on the block), a separate axis from
+    /// ordering. (This replaces the pre-decoupling tick-drives-order assertion.)
     #[test]
-    fn snapshot_tick_drives_order_key_not_insertion_order() {
+    fn appended_snapshot_orders_by_insertion_not_tick() {
         let mut store = test_store();
         let (ctx, prin) = (store.context_id(), store.principal_id());
         let ticked = |seq: u64, tick: i64| {
@@ -2216,14 +2395,22 @@ mod tests {
             .iter()
             .map(|b| b.tick.unwrap().get())
             .collect();
-        assert_eq!(order, vec![3, 5], "order follows the tick coordinate, not the append position");
+        // Successor keys → the later-inserted append sorts last, regardless of its
+        // (earlier) tick. Ticks themselves are preserved verbatim.
+        assert_eq!(
+            order,
+            vec![5, 3],
+            "append order follows insertion at the sequencer, not the tick coordinate"
+        );
     }
 
     /// Two blocks on the *same* beat share a tick — a coordinate, not a row id.
-    /// They get identical `order_key`s; the `(order_key, BlockId)` sort still
-    /// yields a deterministic total order, broken by `BlockId` (seq).
+    /// With successor keys (design §2.2) the append's key is strictly greater
+    /// than its predecessor's, so within-beat order = INSERTION order. Ties at the
+    /// tick coordinate remain allowed; ordering no longer depends on a key-equal
+    /// BlockId tiebreak.
     #[test]
-    fn blocks_on_same_tick_share_coordinate_and_order_by_blockid() {
+    fn blocks_on_same_tick_order_by_insertion() {
         let mut store = test_store();
         let (ctx, prin) = (store.context_id(), store.principal_id());
         let ticked = |seq: u64| {
@@ -2239,11 +2426,15 @@ mod tests {
 
         let ordered = store.blocks_ordered();
         assert_eq!(ordered.len(), 2);
-        // Same tick on both — ties are expected and fine.
+        // Same tick on both — ties at the coordinate are expected and fine.
         assert!(ordered.iter().all(|b| b.tick == Some(Tick::new(7))));
-        // Deterministic: BlockId (seq) breaks the tie, so seq=1 sorts before seq=2.
+        // Insertion order wins: seq=2 was inserted first, then seq=1 appended.
         let seqs: Vec<u64> = ordered.iter().map(|b| b.id.seq).collect();
-        assert_eq!(seqs, vec![1, 2], "within-beat ties resolve deterministically by BlockId");
+        assert_eq!(seqs, vec![2, 1], "within-beat order follows insertion at the sequencer");
+        // And the keys are strictly increasing (successor-derived), not equal.
+        let keys: Vec<String> =
+            ordered.iter().map(|b| b.order_key.clone().unwrap()).collect();
+        assert!(keys[0] < keys[1], "successor keys are strictly increasing within a beat");
     }
 
     #[test]
@@ -3955,5 +4146,460 @@ mod tests {
         // Both converge to Error (greater value wins on tie)
         assert_eq!(ha.status, Status::Error, "Error > Done on tiebreak");
         assert_eq!(ha.status, hb.status, "stores must converge");
+    }
+
+    // ── Order/tick decoupling + seq lanes (design §2, §3) ─────────────────
+
+    /// Build a canonical-keyed, ticked snapshot under an explicit principal.
+    fn snap_for(
+        ctx: ContextId,
+        principal: PrincipalId,
+        seq: u64,
+        tick: i64,
+    ) -> BlockSnapshot {
+        let key = format!("V{}AAAA", base62_encode_padded(tick, 11));
+        crate::BlockSnapshotBuilder::new(BlockId::new(ctx, principal, seq), BlockKind::Text)
+            .tick(Tick::new(tick))
+            .order_key(key)
+            .content(format!("beat-{tick}"))
+            .build()
+    }
+
+    /// T2 — THE locked regression. After restoring a snapshot and merging more
+    /// blocks via the real restore path, a fresh local insert must sort LAST.
+    /// Fails today: a stale `next_tick` mints a mid-document order_key.
+    #[test]
+    fn appends_after_merge_ops_sort_last() {
+        let ctx = ContextId::new();
+        let prin = PrincipalId::new();
+
+        // Store A: 10 blocks (ticks 0..9).
+        let mut store_a = BlockStore::new(ctx, prin);
+        let mut last: Option<BlockId> = None;
+        for _ in 0..10 {
+            let id = store_a
+                .insert_block(
+                    last.as_ref(),
+                    last.as_ref(),
+                    Role::Model,
+                    BlockKind::Text,
+                    "line",
+                    Status::Done,
+                    ContentType::Plain,
+                )
+                .unwrap();
+            last = Some(id);
+        }
+
+        // Restore into B via the real snapshot path.
+        let snapshot = store_a.snapshot();
+        let mut store_b = BlockStore::from_snapshot(snapshot, prin).unwrap();
+
+        // Merge 5 more blocks (ticks 10..14, canonical keys) under a foreign
+        // principal — exactly the oplog-replay restore shape.
+        let foreign = PrincipalId::new();
+        let new_blocks: Vec<BlockSnapshot> = (10..15)
+            .map(|t| snap_for(ctx, foreign, (t - 10) as u64, t))
+            .collect();
+        store_b
+            .merge_ops(SyncPayload {
+                block_ops: vec![],
+                new_blocks,
+                updated_headers: vec![],
+                deleted_blocks: vec![],
+            })
+            .unwrap();
+
+        // A fresh local insert must sort LAST.
+        let fresh = store_b
+            .insert_block(
+                None,
+                None,
+                Role::Model,
+                BlockKind::Text,
+                "fresh",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+        let ordered = store_b.block_ids_ordered();
+        assert_eq!(
+            *ordered.last().unwrap(),
+            fresh,
+            "fresh append must sort last; order_key must not derive from a stale counter"
+        );
+    }
+
+    /// T3 — tick high-water restore. After merging new_blocks with max tick N,
+    /// a fresh insert stamps tick N+1. Pins tick *semantics* separately from
+    /// T2's key ordering. Fails today: merge_ops never touches next_tick.
+    #[test]
+    fn merge_ops_restores_next_tick_high_water() {
+        let ctx = ContextId::new();
+        let prin = PrincipalId::new();
+        let mut store = BlockStore::new(ctx, prin);
+
+        let foreign = PrincipalId::new();
+        let new_blocks: Vec<BlockSnapshot> =
+            (0..5).map(|t| snap_for(ctx, foreign, t as u64, t)).collect();
+        store
+            .merge_ops(SyncPayload {
+                block_ops: vec![],
+                new_blocks,
+                updated_headers: vec![],
+                deleted_blocks: vec![],
+            })
+            .unwrap();
+
+        // Max merged tick is 4 → fresh insert stamps tick 5.
+        let fresh = store
+            .insert_block(
+                None,
+                None,
+                Role::Model,
+                BlockKind::Text,
+                "fresh",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+        let snap = store.get_block_snapshot(&fresh).unwrap();
+        assert_eq!(snap.tick, Some(Tick::new(5)), "tick high-water must advance past merged ticks");
+    }
+
+    /// T19b (design-chameleon-batch1-f2-notation §16, §11.4) — `insert_from_snapshot`
+    /// (the runtime single-snapshot insert that `materialize_committed` rides) must
+    /// bump `next_tick` past a carried tick, exactly as `next_position` /
+    /// `merge_ops` / `fork` already do. Without it, a beat block inserted at tick 50
+    /// leaves `next_tick` at 0, so the next ORDINARY conversation append stamps a
+    /// low tick — and `calc_order_key`'s tick-derived path sorts the now-visible
+    /// staff mid-document. Insert at tick 50; a subsequent `insert_block` must
+    /// carry tick > 50 and sort LAST. *Red: `insert_from_snapshot` never advances
+    /// `next_tick`.* Coordinate with the F0 ordering fork (same counter family).
+    #[test]
+    fn insert_from_snapshot_bumps_next_tick() {
+        let ctx = ContextId::new();
+        let prin = PrincipalId::new();
+        let foreign = PrincipalId::new();
+        let mut store = BlockStore::new(ctx, prin);
+
+        // A beat block lands at tick 50 via the single-snapshot insert path (the
+        // materialize-barrier shape). On a fresh store next_tick starts at 0.
+        let beat_at_50 = snap_for(ctx, foreign, 0, 50);
+        let beat_id = store.insert_from_snapshot(beat_at_50, None).unwrap();
+
+        // next_tick must now be past 50, so an ordinary append stamps tick > 50.
+        let fresh = store
+            .insert_block(
+                Some(&beat_id),
+                Some(&beat_id),
+                Role::Model,
+                BlockKind::Text,
+                "ordinary append",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+        let snap = store.get_block_snapshot(&fresh).unwrap();
+        let appended_tick = snap.tick.expect("the appended block carries a tick");
+        assert!(
+            appended_tick.get() > 50,
+            "an ordinary append after a tick-50 snapshot insert must stamp tick > 50, got {}",
+            appended_tick.get(),
+        );
+
+        // ...and it sorts LAST: a stale next_tick would mint a mid-document key.
+        let ordered = store.block_ids_ordered();
+        assert_eq!(
+            *ordered.last().unwrap(),
+            fresh,
+            "the ordinary append must sort after the snapshot-inserted beat block"
+        );
+    }
+
+    /// T4 — fork variants seed tick + lanes. Parameterized over fork /
+    /// fork_at_version / fork_filtered. Fails today (Self::new + own-principal
+    /// guards). The rotation-critical graft (design §2.4, §3).
+    #[test]
+    fn fork_seeds_tick_and_lanes() {
+        #[derive(Clone, Copy)]
+        enum Variant {
+            Fork,
+            AtVersion,
+            Filtered,
+        }
+
+        for variant in [Variant::Fork, Variant::AtVersion, Variant::Filtered] {
+            let ctx = ContextId::new();
+            let prin = PrincipalId::new();
+            let other = PrincipalId::new(); // P != fork principal
+            let mut store = BlockStore::new(ctx, prin);
+
+            // Blocks authored by P (other), ticks 0..5.
+            for t in 0..5 {
+                store
+                    .insert_from_snapshot(snap_for(ctx, other, t as u64, t), None)
+                    .unwrap();
+            }
+            let max_p_seq = 4u64;
+
+            let new_ctx = ContextId::new();
+            let fork_prin = PrincipalId::new();
+            let forked = match variant {
+                Variant::Fork => store.fork(new_ctx, fork_prin),
+                Variant::AtVersion => store.fork_at_version(new_ctx, fork_prin, u64::MAX),
+                Variant::Filtered => {
+                    store.fork_filtered(new_ctx, fork_prin, u64::MAX, &ForkBlockFilter::default())
+                }
+            };
+            let mut forked = forked;
+
+            // next_seq_for(P) == max P seq + 1.
+            assert_eq!(
+                forked.next_seq_for(other),
+                max_p_seq + 1,
+                "fork must seed the foreign principal's seq lane"
+            );
+
+            // Fresh insert stamps tick N+1 (max copied tick was 4) and sorts last.
+            let fresh = forked
+                .insert_block(
+                    None,
+                    None,
+                    Role::Model,
+                    BlockKind::Text,
+                    "fresh",
+                    Status::Done,
+                    ContentType::Plain,
+                )
+                .unwrap();
+            let snap = forked.get_block_snapshot(&fresh).unwrap();
+            assert_eq!(snap.tick, Some(Tick::new(5)), "fork must seed next_tick past max copied tick");
+            assert_eq!(
+                *forked.block_ids_ordered().last().unwrap(),
+                fresh,
+                "fresh insert into a fork must sort last"
+            );
+        }
+    }
+
+    /// T5 — key-less merge new_blocks append, not prepend. Fails today: the
+    /// decimal `{:020}` fallback sorts below 'V'.
+    #[test]
+    fn keyless_merge_new_blocks_append_not_prepend() {
+        let ctx = ContextId::new();
+        let prin = PrincipalId::new();
+        let mut store = BlockStore::new(ctx, prin);
+
+        // Existing canonical-keyed blocks.
+        let mut last: Option<BlockId> = None;
+        for _ in 0..3 {
+            let id = store
+                .insert_block(
+                    last.as_ref(),
+                    last.as_ref(),
+                    Role::Model,
+                    BlockKind::Text,
+                    "existing",
+                    Status::Done,
+                    ContentType::Plain,
+                )
+                .unwrap();
+            last = Some(id);
+        }
+
+        // Merge a new block WITHOUT a canonical order_key.
+        let foreign = PrincipalId::new();
+        let keyless = crate::BlockSnapshotBuilder::new(
+            BlockId::new(ctx, foreign, 0),
+            BlockKind::Text,
+        )
+        .content("keyless")
+        .build();
+        let keyless_id = keyless.id;
+        store
+            .merge_ops(SyncPayload {
+                block_ops: vec![],
+                new_blocks: vec![keyless],
+                updated_headers: vec![],
+                deleted_blocks: vec![],
+            })
+            .unwrap();
+
+        let ordered = store.block_ids_ordered();
+        assert_eq!(
+            *ordered.last().unwrap(),
+            keyless_id,
+            "key-less merged block must append after existing blocks, not prepend"
+        );
+    }
+
+    /// T6 — seq lanes cover foreign principals after restore. from_snapshot /
+    /// merge_ops / fork each restore blocks authored by P != store principal
+    /// (one a tombstone). Fails today (API absent; own-principal guards).
+    #[test]
+    fn seq_lanes_cover_foreign_principals_after_restore() {
+        let ctx = ContextId::new();
+        let prin = PrincipalId::new();
+        let foreign = PrincipalId::new();
+
+        // Build a source store with foreign-authored blocks (one deleted).
+        let mut src = BlockStore::new(ctx, prin);
+        for t in 0..3 {
+            src.insert_from_snapshot(snap_for(ctx, foreign, t as u64, t), None)
+                .unwrap();
+        }
+        let deleted_id = BlockId::new(ctx, foreign, 3);
+        src.insert_from_snapshot(snap_for(ctx, foreign, 3, 3), None)
+            .unwrap();
+        src.delete_block(&deleted_id).unwrap();
+
+        // (a) from_snapshot restores the foreign lane (tombstone included → max+1).
+        let snapshot = src.snapshot();
+        let restored = BlockStore::from_snapshot(snapshot, prin).unwrap();
+        assert_eq!(
+            restored.next_seq_for(foreign),
+            4,
+            "from_snapshot must seed the foreign lane past the tombstoned max seq"
+        );
+
+        // A subsequent insert of the reserved id does not DuplicateBlock.
+        let mut restored = restored;
+        let reserved = restored.reserve_block_id(foreign);
+        assert_eq!(reserved.seq, 4, "reserved seq is max+1 in the foreign lane");
+        let snap = snap_for(ctx, foreign, reserved.seq, 100);
+        assert!(
+            restored.insert_from_snapshot(snap, None).is_ok(),
+            "inserting the reserved id must not DuplicateBlock"
+        );
+
+        // Own-principal minting via insert_block stays in the store's own lane.
+        let own_before = restored.next_seq_for(prin);
+        restored
+            .insert_block(None, None, Role::Model, BlockKind::Text, "own", Status::Done, ContentType::Plain)
+            .unwrap();
+        assert_eq!(
+            restored.next_seq_for(prin),
+            own_before + 1,
+            "own-principal minting advances only the own lane"
+        );
+
+        // (b) merge_ops seeds a fresh foreign lane.
+        let mut merged = BlockStore::new(ContextId::new(), prin);
+        let mctx = merged.context_id();
+        let merge_blocks: Vec<BlockSnapshot> =
+            (0..3).map(|t| snap_for(mctx, foreign, t as u64, t)).collect();
+        merged
+            .merge_ops(SyncPayload {
+                block_ops: vec![],
+                new_blocks: merge_blocks,
+                updated_headers: vec![],
+                deleted_blocks: vec![],
+            })
+            .unwrap();
+        assert_eq!(merged.next_seq_for(foreign), 3, "merge_ops must seed the foreign lane");
+
+        // (c) fork seeds the foreign lane from the LIVE blocks it copies.
+        // Forks do not carry tombstones, so the deleted seq=3 does not travel —
+        // the fork's lane is max-live-seq + 1 = 3, and seq 3 is free to re-mint
+        // in the fork. (from_snapshot above DOES carry the tombstone → lane 4.)
+        let forked = src.fork(ContextId::new(), prin);
+        assert_eq!(
+            forked.next_seq_for(foreign),
+            3,
+            "fork seeds the foreign lane from copied live blocks (tombstones do not travel)"
+        );
+    }
+
+    /// T6 sub-case — a `from_snapshot`-restored store with MIXED keys (some blocks
+    /// canonical-keyed, later blocks key-less, as a partial pre-tick migration)
+    /// must keep its stored order and interleave with a subsequent `insert_block`.
+    /// The old `format!("{:020}", order_seq)` fallback minted decimal keys that
+    /// sort BELOW every 'V' canonical key (the latent PREPEND §2.3 killed in
+    /// merge_ops but left in from_snapshot): the key-less tail blocks would sort
+    /// ahead of the canonical head blocks in `block_ids_ordered()`, and
+    /// `normalize_timeline` would re-key them in that scrambled order. The
+    /// successor-of-tail fallback keeps the key-less blocks after their canonical
+    /// predecessors.
+    #[test]
+    fn from_snapshot_mixed_keys_interleave_with_fresh_insert() {
+        let ctx = ContextId::new();
+        let prin = PrincipalId::new();
+
+        // Build a real store and snapshot it, then strip the order_key + tick from
+        // the LATER half only — a partial pre-tick migration: the head keeps its
+        // canonical 'V…' keys, the tail is key-less and must still sort after it.
+        let mut src = BlockStore::new(ctx, prin);
+        let mut last: Option<BlockId> = None;
+        let mut ids = Vec::new();
+        for i in 0..4 {
+            let id = src
+                .insert_block(
+                    last.as_ref(),
+                    last.as_ref(),
+                    Role::Model,
+                    BlockKind::Text,
+                    format!("block-{i}"),
+                    Status::Done,
+                    ContentType::Plain,
+                )
+                .unwrap();
+            ids.push(id);
+            last = Some(id);
+        }
+        let mut snapshot = src.snapshot();
+        // Strip keys from the tail half: blocks 2 and 3 become key-less legacy.
+        for b in snapshot.blocks.iter_mut().skip(2) {
+            b.order_key = None;
+            b.tick = None;
+        }
+
+        let mut restored = BlockStore::from_snapshot(snapshot, prin).unwrap();
+        let restored_order = restored.block_ids_ordered();
+        assert_eq!(
+            restored_order, ids,
+            "mixed-key restore keeps the key-less tail after the canonical head"
+        );
+
+        // A fresh local insert must sort AFTER every restored block.
+        let fresh = restored
+            .insert_block(
+                restored_order.last(),
+                restored_order.last(),
+                Role::Model,
+                BlockKind::Text,
+                "fresh",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+        let after = restored.block_ids_ordered();
+        assert_eq!(
+            *after.last().unwrap(),
+            fresh,
+            "a fresh insert after a mixed-key restore sorts last, not below the restored blocks"
+        );
+    }
+
+    /// T7 — reserve_block_id claims and advances. Reserve → seq claimed;
+    /// failed-insert gap is tolerated; subsequent reserve mints +1.
+    #[test]
+    fn reserve_block_id_claims_and_advances() {
+        let ctx = ContextId::new();
+        let prin = PrincipalId::new();
+        let mut store = BlockStore::new(ctx, prin);
+        let player = PrincipalId::new();
+
+        let first = store.reserve_block_id(player);
+        assert_eq!(first.seq, 0, "first reserved seq in a virgin lane is 0");
+        assert_eq!(first.principal_id, player);
+
+        // Simulate a failed insert: we never insert `first`. The lane still
+        // advances — a seq gap is benign (monotonic-unique, not dense).
+        let second = store.reserve_block_id(player);
+        assert_eq!(second.seq, 1, "subsequent reserve mints +1 even if the prior insert failed");
+
+        // next_seq_for reflects the claimed lane.
+        assert_eq!(store.next_seq_for(player), 2);
     }
 }

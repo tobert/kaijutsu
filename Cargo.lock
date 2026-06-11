@@ -5730,6 +5730,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
@@ -5889,13 +5890,14 @@ dependencies = [
  "strum 0.26.3",
  "thiserror 2.0.18",
  "toml 0.8.23",
+ "tracing",
  "trybuild",
  "uuid",
 ]
 
 [[package]]
 name = "kaish-glob"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "async-trait",
  "ignore",
@@ -5904,14 +5906,14 @@ dependencies = [
 
 [[package]]
 name = "kaish-help"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "kaish-types",
 ]
 
 [[package]]
 name = "kaish-kernel"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "ariadne",
@@ -5954,7 +5956,7 @@ dependencies = [
 
 [[package]]
 name = "kaish-tool-api"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "async-trait",
  "clap",
@@ -5963,7 +5965,7 @@ dependencies = [
 
 [[package]]
 name = "kaish-types"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -5973,7 +5975,7 @@ dependencies = [
 
 [[package]]
 name = "kaish-vfs"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "async-trait",
  "kaish-types",

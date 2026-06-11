@@ -16,9 +16,9 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use kaijutsu_cas::ContentHash;
-use kaijutsu_types::{Tick, TickDelta};
+use kaijutsu_types::{PrincipalId, Tick, TickDelta, TrackId};
 
-use crate::cell::{Body, Cell, CellState, Fallback, Recipe};
+use crate::cell::{Body, Cell, CellState, Fallback, Recipe, ResolverId};
 use crate::content::{ContentRef, ContextHash};
 use crate::resolver::{ResolverCtx, Resolver};
 
@@ -75,6 +75,23 @@ pub struct SquashEvent {
     pub recovery: Recovery,
 }
 
+/// A resolve that errored — recorded, never hidden. Sibling to [`SquashEvent`]:
+/// a squash is a *recoverable* misprediction (predicted ≠ actual, but the bytes
+/// were produced); a failure is a resolve that produced nothing (CAS read miss,
+/// validator reject). The ledger is the data source for the "ABC parse-failure
+/// rate" eval ruler and the input to the kernel's per-event Error-block surfacing.
+#[derive(Debug, Clone)]
+pub struct FailureEvent {
+    /// The playhead position when the failure was recorded.
+    pub at: Tick,
+    /// The failed cell's start tick — its intended musical position.
+    pub start: Tick,
+    /// Which resolver erred (the recipe's resolver id).
+    pub resolver: ResolverId,
+    /// The resolver's error string, preserved verbatim for surfacing.
+    pub error: String,
+}
+
 /// Engine bookkeeping wrapped around a deferred [`Cell`].
 struct Scheduled {
     cell: Cell,
@@ -115,6 +132,24 @@ pub enum ScheduleError {
     UnknownResolver(String),
 }
 
+/// Why a [`Timeline::seed_playhead`] call was rejected. Seeding is a
+/// virgin-only operation — a seed attempt on a live timeline is always a caller
+/// bug, and crashing over corruption beats silently rewinding or clobbering an
+/// open future.
+#[derive(Debug, thiserror::Error)]
+pub enum SeedError {
+    #[error(
+        "cannot seed playhead to {at:?}: timeline is not virgin \
+         (playhead {playhead:?}, {future} future cell(s), {committed} committed)"
+    )]
+    NotVirgin {
+        at: Tick,
+        playhead: Tick,
+        future: usize,
+        committed: usize,
+    },
+}
+
 /// A single context's timeline: committed past + open future, over one store.
 pub struct Timeline {
     clock: TickClock,
@@ -130,6 +165,11 @@ pub struct Timeline {
     cas: HashMap<ContentHash, Vec<u8>>,
     /// The squash ledger — the bill, and the anticipation-model feedback.
     squashes: Vec<SquashEvent>,
+    /// The failure ledger — sibling to `squashes`. An erring resolve appends here
+    /// and the cell is removed from `future` (no zombie); the kernel drains this
+    /// past a cursor into one Error block per event so the player reads its own
+    /// failure next turn.
+    failures: Vec<FailureEvent>,
 }
 
 impl Timeline {
@@ -143,6 +183,7 @@ impl Timeline {
             committed: Vec::new(),
             cas: HashMap::new(),
             squashes: Vec::new(),
+            failures: Vec::new(),
         }
     }
 
@@ -157,6 +198,16 @@ impl Timeline {
         self.ambient.insert(key.into(), value.into());
     }
 
+    /// TEST-ONLY: push a pre-built concrete cell straight into the committed log
+    /// WITHOUT crystallizing its bytes into this timeline's RAM-CAS. Lets a kernel
+    /// test construct a committed cref whose bytes are absent from both RAM-CAS and
+    /// durable CAS — the corruption case the materializer must bail on, never
+    /// silently skip.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn push_committed_for_test(&mut self, cell: Cell) {
+        self.committed.push(cell);
+    }
+
     pub fn playhead(&self) -> Tick {
         self.playhead
     }
@@ -165,6 +216,17 @@ impl Timeline {
     }
     pub fn squashes(&self) -> &[SquashEvent] {
         &self.squashes
+    }
+    /// The failure ledger: every resolve that errored, in record order. The
+    /// kernel drains this past a cursor into Error blocks; tests assert the
+    /// preserved error string and the no-zombie invariant.
+    pub fn failures(&self) -> &[FailureEvent] {
+        &self.failures
+    }
+    /// Count of cells still in the open future — used to pin the no-zombie
+    /// invariant (a failed cell must not linger here).
+    pub fn future_len(&self) -> usize {
+        self.future.len()
     }
     /// Fetch crystallized content bytes by hash (in-RAM CAS).
     pub fn content_bytes(&self, hash: &ContentHash) -> Option<&[u8]> {
@@ -209,6 +271,29 @@ impl Timeline {
             final_attempt: false,
             cell,
         });
+        Ok(())
+    }
+
+    /// Seed the playhead to `at` on a **virgin** timeline — the re-arm entry
+    /// point that restores musical time after a restart or rotation, before any
+    /// cell is scheduled or committed.
+    ///
+    /// `Err(SeedError::NotVirgin)` unless `playhead == Tick::ZERO`, the future is
+    /// empty, and the committed log is empty. A seed attempt on a live timeline
+    /// is always a caller bug and must be loud — crash over corruption beats
+    /// silently rewinding the playhead or clobbering an open future. Fires no
+    /// lifecycle actions: it only positions the playhead so the first beat
+    /// advances from real musical time.
+    pub fn seed_playhead(&mut self, at: Tick) -> Result<(), SeedError> {
+        if self.playhead != Tick::ZERO || !self.future.is_empty() || !self.committed.is_empty() {
+            return Err(SeedError::NotVirgin {
+                at,
+                playhead: self.playhead,
+                future: self.future.len(),
+                committed: self.committed.len(),
+            });
+        }
+        self.playhead = at;
         Ok(())
     }
 
@@ -294,10 +379,33 @@ impl Timeline {
                 s.resolution = Some(res);
                 s.cell.state = CellState::Speculated;
             }
-            Err(_) => {
-                // A resolve that errors is a Failed cell — crash over corruption,
-                // never a silent empty commit.
+            Err(err) => {
+                // A resolve that errors records a FailureEvent and the cell is
+                // removed from the open future — a hole, never a silent empty
+                // commit and never a zombie that re-fires every beat. We pass the
+                // cell through `Failed` first so the state-machine asserts stay
+                // honest (Pending/Squashed → Failed is a legal edge), then drop it.
+                debug_assert!(s.cell.state.can_advance_to(CellState::Failed));
                 s.cell.state = CellState::Failed;
+                let start = s.start;
+                // Single-variant enum today; an irrefutable `let` keeps the error
+                // string verbatim (a future variant would force this back to a
+                // match — fine, the ledger only needs a String).
+                let crate::resolver::ResolveError::Failed(error) = err;
+                // `s`'s borrow ends here; the self-field writes below are disjoint.
+                self.failures.push(FailureEvent {
+                    at: self.playhead,
+                    start,
+                    resolver: recipe.resolver.clone(),
+                    error,
+                });
+                // DEFERRED (flagged for Amy, issues.md): routing a Failed cell to
+                // `fire_fallback` instead of dropping it. That would amend the
+                // "crash over corruption, never a silent empty commit" stance —
+                // an approved-later drop-in. The ledger/removal machinery above is
+                // identical whether or not the routing lands; only the next line
+                // changes (`self.fire_fallback(idx)` instead of `swap_remove`).
+                self.future.swap_remove(idx);
             }
         }
     }
@@ -378,37 +486,86 @@ impl Timeline {
         debug_assert!(s.cell.state.can_advance_to(CellState::Committed));
         s.cell.body = Body::Concrete(cref);
         s.cell.state = CellState::Committed;
+
+        // The committing parent's lane + player are the authority for everything
+        // it emits — an emission is part of the committing parent's act. Capture
+        // them before the cell moves into the committed log.
+        let parent_track = s.cell.track.clone();
+        let parent_player = s.cell.played_by;
         self.committed.push(s.cell);
 
         // Emitted cells become real only on commit — a squashed resolution's
         // emissions simply vanish. A loop thus unrolls into distinct memories.
-        for emitted in res.emitted {
+        for mut emitted in res.emitted {
+            // An emission lives inside the parent's track (the only concrete
+            // consumers — MIDI siblings, in-track automation lanes — are
+            // same-track by definition). Stamp it with the parent's lane +
+            // player; a resolver that set divergent values has misread the
+            // contract. Loud on mismatch: hard assert in debug, tracing::error
+            // in release — never silent normalization, but never a Failed cell
+            // mid-performance either.
+            debug_assert_eq!(
+                emitted.track, parent_track,
+                "emitted cell track must match the committing parent's track"
+            );
+            debug_assert_eq!(
+                emitted.played_by, parent_player,
+                "emitted cell played_by must match the committing parent's player"
+            );
+            if emitted.track != parent_track || emitted.played_by != parent_player {
+                // Log BOTH axes (track and player): the guard above checks both, so
+                // a player-only mismatch (track equal, played_by divergent) produces
+                // this same error — without the player fields it would be
+                // indistinguishable from a track mismatch in production logs.
+                tracing::error!(
+                    parent_track = parent_track.as_str(),
+                    emitted_track = emitted.track.as_str(),
+                    parent_player = %parent_player,
+                    emitted_player = %emitted.played_by,
+                    "emitted cell track/player diverged from committing parent; \
+                     stamping with parent's values"
+                );
+            }
+            emitted.track = parent_track.clone();
+            emitted.played_by = parent_player;
             self.absorb_emitted(emitted);
         }
     }
 
     /// The required real-time miss handler. Never undefined behavior.
+    ///
+    /// Fallback repeats and literals are authored by [`PrincipalId::beat()`], not
+    /// by the player: the transport played them. Attributing vamp-insurance to
+    /// the player would be false provenance. They stay on the missing cell's
+    /// `track` — the lane persists even when no player covered this beat.
     fn fire_fallback(&mut self, idx: usize) {
         let s = &self.future[idx];
         let Body::Deferred(recipe) = &s.cell.body else {
             unreachable!("scheduled cells are deferred")
         };
         let span = s.cell.span;
+        let track = s.cell.track.clone();
         match recipe.fallback.clone() {
             Fallback::Skip => {
                 // Emit nothing — the playhead passes a hole.
                 self.future.swap_remove(idx);
             }
             Fallback::UseLastGood => {
-                let last = self.last_committed_content(span.start);
+                // Per-track: a repeat may only reuse THIS lane's last good
+                // content. `track == None`/another-track's content can never
+                // satisfy this track's UseLastGood — `None` (empty lane history)
+                // falls through to silence (Skip), the locked decision.
+                let last = self.last_committed_content_in(&track, span.start);
                 self.future.swap_remove(idx);
                 if let Some(cref) = last {
-                    self.committed.push(Cell::concrete(span, cref));
+                    self.committed
+                        .push(Cell::concrete_on(span, cref, track, PrincipalId::beat()));
                 }
             }
             Fallback::Literal(cref) => {
                 self.future.swap_remove(idx);
-                self.committed.push(Cell::concrete(span, cref));
+                self.committed
+                    .push(Cell::concrete_on(span, cref, track, PrincipalId::beat()));
             }
         }
     }
@@ -434,10 +591,17 @@ impl Timeline {
         }
     }
 
-    fn last_committed_content(&self, before: Tick) -> Option<ContentRef> {
+    /// The most recent committed content **on `track`** at or before `before`.
+    ///
+    /// Lane-scoped by construction: `track` is the only lane key. A cell on
+    /// another lane (or a legacy track-blind cell, were one ever present) can
+    /// never satisfy this track's `UseLastGood` — the player principal is never
+    /// consulted here, because the principal is never a lane key.
+    fn last_committed_content_in(&self, track: &TrackId, before: Tick) -> Option<ContentRef> {
         self.committed
             .iter()
             .filter(|c| c.span.start <= before)
+            .filter(|c| &c.track == track)
             .filter_map(|c| match &c.body {
                 Body::Concrete(cref) => Some((c.span.start, cref.clone())),
                 _ => None,
@@ -463,6 +627,13 @@ impl ResolverCtx for CommittedCtx<'_> {
     fn ambient(&self, key: &str) -> Option<Vec<u8>> {
         self.ambient.get(key).cloned()
     }
+    /// Deliberately **track-blind**: returns the most recent committed content
+    /// across *all* lanes at or before `tick`. No current resolver reads this
+    /// (AbcToMidi reads CAS by hash), and the first real consumer of a
+    /// track-scoped read is `$HEARD` — that API is designed with its consumer
+    /// (two-voices rule), not speculatively widened here. Contrast
+    /// [`Timeline::last_committed_content_in`], which is lane-scoped for the
+    /// `UseLastGood` fallback.
     fn content_before(&self, tick: Tick) -> Option<ContentRef> {
         self.committed
             .iter()
@@ -507,7 +678,14 @@ mod tests {
     }
 
     fn deferred_at(start: i64, fallback: Fallback) -> Cell {
-        Cell::deferred(
+        deferred_at_track(start, fallback, TrackId::solo())
+    }
+
+    /// Like `deferred_at`, but on an explicit lane — drives the cross-track
+    /// `UseLastGood` tests. `played_by` is irrelevant to these tests, so the
+    /// solo-track default (`beat()`) stands.
+    fn deferred_at_track(start: i64, fallback: Fallback, track: TrackId) -> Cell {
+        Cell::deferred_on(
             Span::instant(Tick::new(start)),
             Recipe {
                 resolver: ResolverId::new("echo"),
@@ -515,6 +693,8 @@ mod tests {
                 query: ContextQuery::default(),
                 fallback,
             },
+            track,
+            PrincipalId::beat(),
         )
     }
 
@@ -679,5 +859,334 @@ mod tests {
         tl.advance_to(Tick::new(50));
         let err = tl.schedule(deferred_at(10, Fallback::Skip)).unwrap_err();
         assert!(matches!(err, ScheduleError::InThePast { .. }));
+    }
+
+    /// A resolver that emits one concrete sibling cell on commit. The sibling's
+    /// (track, played_by) are supplied by the test so it can exercise both the
+    /// matching-inheritance and the deliberate-mismatch paths.
+    struct EmitSibling {
+        sibling_track: TrackId,
+        sibling_player: PrincipalId,
+        sibling_tick: i64,
+    }
+
+    impl Resolver for EmitSibling {
+        fn id(&self) -> ResolverId {
+            ResolverId::new("emit")
+        }
+        fn estimate_cost(&self, _p: &Value, _c: &dyn ResolverCtx) -> Duration {
+            Duration::from_secs(1)
+        }
+        fn compute_basis(&self, _p: &Value, _c: &dyn ResolverCtx) -> ContextHash {
+            ContextHash::of(b"stable")
+        }
+        fn resolve(&self, _p: &Value, _c: &dyn ResolverCtx) -> Result<Resolution, ResolveError> {
+            let sibling = Cell::concrete_on(
+                Span::instant(Tick::new(self.sibling_tick)),
+                ContentRef::of(b"sibling", "text/plain"),
+                self.sibling_track.clone(),
+                self.sibling_player,
+            );
+            Ok(Resolution::new(b"parent".to_vec(), "text/plain").with_emitted(vec![sibling]))
+        }
+    }
+
+    fn emit_recipe() -> Recipe {
+        Recipe {
+            resolver: ResolverId::new("emit"),
+            params: Value::Null,
+            query: ContextQuery::default(),
+            fallback: Fallback::Skip,
+        }
+    }
+
+    /// A resolver whose `resolve` always errors with a fixed message — drives the
+    /// failure-ledger path (T5). `estimate_cost`/`compute_basis` are trivially
+    /// stable so the cell reaches `speculate` cleanly before the resolve fails.
+    struct AlwaysFails {
+        message: &'static str,
+    }
+
+    impl Resolver for AlwaysFails {
+        fn id(&self) -> ResolverId {
+            ResolverId::new("always_fails")
+        }
+        fn estimate_cost(&self, _p: &Value, _c: &dyn ResolverCtx) -> Duration {
+            Duration::from_secs(1)
+        }
+        fn compute_basis(&self, _p: &Value, _c: &dyn ResolverCtx) -> ContextHash {
+            ContextHash::of(b"stable")
+        }
+        fn resolve(&self, _p: &Value, _c: &dyn ResolverCtx) -> Result<Resolution, ResolveError> {
+            Err(ResolveError::Failed(self.message.to_string()))
+        }
+    }
+
+    /// T5 — a resolve error records a [`FailureEvent`] (carrying the error string)
+    /// retrievable via `failures()`, removes the cell from the open future (no
+    /// zombie), and commits nothing (a hole, never a fake). The state-machine
+    /// asserts stay intact: the cell passes through `Failed` before removal.
+    #[test]
+    fn resolve_failure_records_event_and_removes_cell() {
+        let clock = TickClock {
+            ticks_per_sec: 1.0,
+            safety_factor: 2.0, // cost 1s → lead 2 → speculate_at = start - 2
+            commit_margin: TickDelta::new(1),
+        };
+        let mut tl = Timeline::new(clock);
+        tl.register_resolver(Box::new(AlwaysFails {
+            message: "CAS read failed: missing entry",
+        }));
+        let track = TrackId::new("solo-lane").unwrap();
+        let cell = Cell::deferred_on(
+            Span::instant(Tick::new(20)),
+            Recipe {
+                resolver: ResolverId::new("always_fails"),
+                params: Value::Null,
+                query: ContextQuery::default(),
+                fallback: Fallback::Skip,
+            },
+            track,
+            PrincipalId::beat(),
+        );
+        tl.schedule(cell).unwrap();
+
+        // Drive past speculate_at (18): resolve errors → ledger + removal.
+        tl.advance_to(Tick::new(20));
+
+        // The ledger holds exactly one event, carrying the resolver's error text.
+        let fails = tl.failures();
+        assert_eq!(fails.len(), 1, "the erring resolve records exactly one event");
+        let ev = &fails[0];
+        assert_eq!(ev.start, Tick::new(20), "event carries the cell's start tick");
+        assert_eq!(ev.resolver, ResolverId::new("always_fails"));
+        assert!(
+            ev.error.contains("CAS read failed"),
+            "the resolver's error string is preserved: {:?}",
+            ev.error
+        );
+
+        // No zombie: the cell is gone from the open future, so the playhead can
+        // never re-trip it.
+        assert_eq!(
+            tl.future_len(),
+            0,
+            "the failed cell is removed from the open future — no zombie"
+        );
+
+        // A hole, never a fake: nothing committed.
+        assert!(
+            tl.committed().is_empty(),
+            "a failed resolve leaves a hole, never a phantom commit"
+        );
+
+        // Advancing again must not re-record: the cell is truly gone.
+        tl.advance_to(Tick::new(40));
+        assert_eq!(tl.failures().len(), 1, "no zombie re-firing on later beats");
+    }
+
+    /// T11 — the locked two-track cross-contamination test. Track B commits good
+    /// content; track A's UseLastGood misses with an empty A-history and must NOT
+    /// pick up B's content. Nothing is committed for A.
+    #[test]
+    fn use_last_good_does_not_cross_tracks() {
+        let clock = TickClock {
+            ticks_per_sec: 1.0,
+            safety_factor: 2.0, // cost 3s → lead 6
+            commit_margin: TickDelta::new(1),
+        };
+        let mut tl = Timeline::new(clock);
+        tl.register_resolver(Box::new(EchoBeat {
+            cost: Duration::from_secs(3), // est_cost 3 ticks
+        }));
+        let track_a = TrackId::new("a").unwrap();
+        let track_b = TrackId::new("b").unwrap();
+
+        tl.set_ambient("beat", *b"A");
+        // B at 20: speculate_at 14, deadline 19. A at 30: speculate_at 24, deadline 29.
+        tl.schedule(deferred_at_track(20, Fallback::Skip, track_b.clone()))
+            .unwrap();
+        tl.schedule(deferred_at_track(30, Fallback::UseLastGood, track_a.clone()))
+            .unwrap();
+
+        tl.advance_to(Tick::new(24)); // B speculates@14 + commits@19 (beat=A); A speculates@24 (beat=A)
+        assert_eq!(tl.committed().len(), 1, "only B has committed so far");
+        assert_eq!(tl.committed()[0].track, track_b);
+
+        tl.set_ambient("beat", *b"Z"); // diverge before A's deadline
+        tl.advance_to(Tick::new(30)); // A deadline@29: budget 1 < est 3 → squash → UseLastGood
+
+        // A's lane has no history → Skip (silence). B's content is NOT duplicated
+        // under A: principal is never a lane key, track is the only lane identity.
+        assert_eq!(tl.squashes().len(), 1);
+        assert_eq!(tl.committed().len(), 1, "A committed nothing — empty lane → Skip");
+        assert_eq!(tl.committed()[0].track, track_b);
+        assert!(
+            tl.committed().iter().all(|c| c.track != track_a),
+            "no cell on track A; B's last-good must not cross lanes"
+        );
+    }
+
+    /// T12 — the locked empty-track → Skip pin. A single track with zero history
+    /// firing UseLastGood resolves to silence: committed stays empty, no panic,
+    /// the playhead passes the hole.
+    #[test]
+    fn use_last_good_on_empty_track_resolves_to_skip() {
+        let clock = TickClock {
+            ticks_per_sec: 1.0,
+            safety_factor: 2.0,
+            commit_margin: TickDelta::new(1),
+        };
+        let mut tl = Timeline::new(clock);
+        tl.register_resolver(Box::new(EchoBeat {
+            cost: Duration::from_secs(3),
+        }));
+        let track = TrackId::new("solo-lane").unwrap();
+        tl.set_ambient("beat", *b"A");
+        tl.schedule(deferred_at_track(20, Fallback::UseLastGood, track.clone()))
+            .unwrap();
+
+        tl.advance_to(Tick::new(14)); // speculate@14 against beat=A
+        tl.set_ambient("beat", *b"Z"); // diverge
+        tl.advance_to(Tick::new(20)); // deadline@19: budget 1 < est 3 → squash → UseLastGood → Skip
+
+        assert_eq!(tl.squashes().len(), 1);
+        assert!(
+            tl.committed().is_empty(),
+            "empty-track UseLastGood resolves to Skip (silence), not a panic or a phantom commit"
+        );
+        assert_eq!(tl.playhead(), Tick::new(20), "playhead passes the hole");
+    }
+
+    /// T13 — emitted cells inherit the committing parent's track + played_by.
+    #[test]
+    fn emitted_cells_inherit_parent_track_and_played_by() {
+        let clock = TickClock {
+            ticks_per_sec: 1.0,
+            safety_factor: 2.0,
+            commit_margin: TickDelta::new(1),
+        };
+        let parent_track = TrackId::new("keys").unwrap();
+        let parent_player = PrincipalId::system();
+
+        let mut tl = Timeline::new(clock);
+        // The sibling is constructed already on the parent's lane + player (the
+        // contract-respecting case).
+        tl.register_resolver(Box::new(EmitSibling {
+            sibling_track: parent_track.clone(),
+            sibling_player: parent_player,
+            sibling_tick: 25, // a recorded memory beside the parent
+        }));
+
+        let parent = Cell::deferred_on(
+            Span::instant(Tick::new(20)),
+            emit_recipe(),
+            parent_track.clone(),
+            parent_player,
+        );
+        tl.schedule(parent).unwrap();
+        tl.advance_to(Tick::new(20)); // parent commits; sibling absorbed
+
+        // Parent + sibling both committed, both on the parent's lane + player.
+        assert_eq!(tl.committed().len(), 2);
+        for c in tl.committed() {
+            assert_eq!(c.track, parent_track, "every committed cell on the parent lane");
+            assert_eq!(c.played_by, parent_player, "every committed cell carries the parent player");
+        }
+    }
+
+    /// T13 (loud half) — an emission whose track diverges from the committing
+    /// parent trips the debug_assert. In release this is `tracing::error` + a
+    /// stamp-with-parent (never silent normalization). Debug test builds panic.
+    #[test]
+    #[should_panic(expected = "emitted cell track must match")]
+    fn emitted_cell_track_mismatch_is_loud() {
+        let parent_track = TrackId::new("keys").unwrap();
+        let mut tl = Timeline::new(TickClock {
+            ticks_per_sec: 1.0,
+            safety_factor: 2.0,
+            commit_margin: TickDelta::new(1),
+        });
+        tl.register_resolver(Box::new(EmitSibling {
+            sibling_track: TrackId::new("wrong-lane").unwrap(), // deliberate mismatch
+            sibling_player: PrincipalId::beat(),
+            sibling_tick: 25,
+        }));
+        let parent = Cell::deferred_on(
+            Span::instant(Tick::new(20)),
+            emit_recipe(),
+            parent_track,
+            PrincipalId::beat(),
+        );
+        tl.schedule(parent).unwrap();
+        tl.advance_to(Tick::new(20)); // commit → emitted-stamp path trips the assert
+    }
+
+    /// T13 (player-mismatch half) — an emission whose track matches the parent but
+    /// whose `played_by` diverges is equally loud: the player-axis debug_assert
+    /// trips in debug, and in release the error log carries both player fields so
+    /// the operator can tell a player-only mismatch from a track mismatch.
+    #[test]
+    #[should_panic(expected = "emitted cell played_by must match")]
+    fn emitted_cell_player_mismatch_is_loud() {
+        let parent_track = TrackId::new("keys").unwrap();
+        let parent_player = PrincipalId::system();
+        let mut tl = Timeline::new(TickClock {
+            ticks_per_sec: 1.0,
+            safety_factor: 2.0,
+            commit_margin: TickDelta::new(1),
+        });
+        tl.register_resolver(Box::new(EmitSibling {
+            sibling_track: parent_track.clone(), // track MATCHES the parent
+            sibling_player: PrincipalId::beat(),  // player DIVERGES from the parent
+            sibling_tick: 25,
+        }));
+        let parent = Cell::deferred_on(
+            Span::instant(Tick::new(20)),
+            emit_recipe(),
+            parent_track,
+            parent_player,
+        );
+        tl.schedule(parent).unwrap();
+        tl.advance_to(Tick::new(20)); // commit → emitted-stamp path trips the player assert
+    }
+
+    /// T14 — seed_playhead is virgin-only. A fresh timeline seeds OK; a seed after
+    /// any schedule or commit is Err(SeedError::NotVirgin) — crash over corruption.
+    #[test]
+    fn seed_playhead_errs_on_non_virgin() {
+        // Virgin: seeding succeeds and positions the playhead.
+        let mut tl = Timeline::new(TickClock::default());
+        assert!(tl.seed_playhead(Tick::new(42)).is_ok());
+        assert_eq!(tl.playhead(), Tick::new(42));
+
+        // After a schedule, the timeline is no longer virgin (open future).
+        let mut tl2 = Timeline::new(TickClock::default());
+        tl2.register_resolver(Box::new(EchoBeat {
+            cost: Duration::from_secs(1),
+        }));
+        tl2.schedule(deferred_at(10, Fallback::Skip)).unwrap();
+        assert!(matches!(
+            tl2.seed_playhead(Tick::new(5)),
+            Err(SeedError::NotVirgin { .. })
+        ));
+
+        // After a commit, likewise non-virgin (committed log non-empty).
+        let mut tl3 = Timeline::new(TickClock {
+            ticks_per_sec: 1.0,
+            safety_factor: 2.0,
+            commit_margin: TickDelta::new(1),
+        });
+        tl3.register_resolver(Box::new(EchoBeat {
+            cost: Duration::from_secs(1),
+        }));
+        tl3.set_ambient("beat", *b"A");
+        tl3.schedule(deferred_at(10, Fallback::Skip)).unwrap();
+        tl3.advance_to(Tick::new(10));
+        assert_eq!(tl3.committed().len(), 1);
+        assert!(matches!(
+            tl3.seed_playhead(Tick::new(3)),
+            Err(SeedError::NotVirgin { .. })
+        ));
     }
 }

@@ -90,6 +90,81 @@ pub(crate) fn order_midpoint(a: &str, b: &str) -> String {
     String::from_utf8(result).unwrap_or_else(|_| "V".to_string())
 }
 
+/// Decode a fixed-width base-62 string to i64. `None` if the string is empty,
+/// any char is not in the BASE62 charset, or the accumulated value overflows
+/// i64.
+///
+/// Empty rejection is deliberate: a zero-length string has no digits, so it is
+/// not a valid canonical key. Returning `None` (not `Some(0)`) keeps a bogus
+/// zero-length pred from feeding `order_key_successor` a `V00000000001…`
+/// successor — fail-loud over a silently-wrong value.
+///
+/// The inverse of [`base62_encode_padded`] for the canonical width-11 keys —
+/// leading '0' padding decodes back to the same number, so the round-trip is
+/// lossless for any non-negative value that fit the chosen width.
+pub(crate) fn base62_decode(s: &str) -> Option<i64> {
+    if s.is_empty() {
+        return None;
+    }
+    let mut n: i64 = 0;
+    for &b in s.as_bytes() {
+        let digit = BASE62.iter().position(|&c| c == b)? as i64;
+        n = n.checked_mul(62)?.checked_add(digit)?;
+    }
+    Some(n)
+}
+
+/// The canonical append key strictly after `pred`, carrying `suffix` (the
+/// inserting agent's 4-char lane).
+///
+/// Ordering NEVER derives from a counter on appends — only from the
+/// predecessor's key — so a stale tick/seq counter structurally cannot
+/// mis-sort an appended block (design §2.1).
+///
+/// Canonical fast path: `pred` is 'V' + 11 base-62 chars (the
+/// `order_key_for_tick` shape; any trailing suffix chars are ignored) → decode
+/// the 11-char number n, checked `n + 1`, re-encode at width 11 →
+/// `"V{n+1}{suffix}"`. O(1) and shape-identical to every existing canonical key.
+///
+/// General fallback (legacy/variable-length pred: `order_midpoint` results,
+/// `"{after}V"` appends, `"{:020}"` decimal restore keys — which sort below 'V'
+/// since '0' < 'V' — or `n + 1` overflow at `i64::MAX`): `"{pred}V{suffix}"`,
+/// strictly greater than `pred` by prefix extension. Emits `tracing::warn`
+/// (this path grows keys and should be rare); never wraps.
+pub(crate) fn order_key_successor(pred: &str, suffix: &str) -> String {
+    // Canonical shape: 'V' + at least 11 base-62 chars. The first 11 after 'V'
+    // are the width-11 number; anything past that is the agent suffix and is
+    // ignored for the increment.
+    let canonical = pred.as_bytes().first() == Some(&b'V') && pred.len() >= 12;
+    if canonical {
+        let number = &pred[1..12];
+        if let Some(n) = base62_decode(number)
+            && let Some(next) = n.checked_add(1)
+        {
+            let key = format!("V{}{}", base62_encode_padded(next, 11), suffix);
+            // Belt and braces: the increment can only sort after pred. If it
+            // somehow didn't, fall through to the prefix-extension fallback
+            // rather than emit a non-monotonic key.
+            if key.as_str() > pred {
+                return key;
+            }
+            tracing::error!(
+                pred = %pred,
+                candidate = %key,
+                "order_key_successor: canonical increment not > pred, using fallback"
+            );
+        }
+    }
+
+    // General fallback: strictly greater than pred by prefix extension. Grows
+    // the key by 5 chars; rare by construction once appends are successor-derived.
+    tracing::warn!(
+        pred = %pred,
+        "order_key_successor: non-canonical predecessor, using prefix-extension fallback"
+    );
+    format!("{pred}V{suffix}")
+}
+
 /// A single block's content and metadata.
 ///
 /// The DTE Document holds the block's text content (character-level CRDT).
@@ -117,6 +192,13 @@ pub struct BlockContent {
     /// match tick order on append. Distinct axis from `order_key` — see
     /// `docs/hyoushigi.md`.
     tick: Option<Tick>,
+
+    /// Stable lane identity (hyoushigi `TrackId`). `Some` ONLY on a block
+    /// materialized from a committed timeline cell — write-once metadata, like
+    /// the snapshot fields below. LANE IDENTITY ONLY: the lane key is never the
+    /// author (the author stays `BlockId.principal_id`); `track == None` matches
+    /// no track.
+    track: Option<kaijutsu_types::TrackId>,
 
     /// Non-Copy snapshot fields that don't belong on BlockHeader.
     /// These are write-once metadata set at creation time.
@@ -177,6 +259,7 @@ impl BlockContent {
             agent,
             order_key,
             tick: None,
+            track: None,
             tool_name: None,
             tool_input: None,
             tool_call_id: None,
@@ -231,6 +314,9 @@ impl BlockContent {
         let header = BlockHeader::from_snapshot(snap);
         let order_key = snap.order_key.clone().unwrap_or(fallback_order_key);
         let mut block = Self::with_content(header, &snap.content, principal_id, order_key, snap.tick);
+        // Lane identity rides through restore with the block (write-once); the
+        // author stays `BlockId.principal_id`, never derived from track.
+        block.track = snap.track.clone();
         block.tool_name = snap.tool_name.clone();
         block.tool_input = snap.tool_input.clone();
         block.tool_call_id = snap.tool_call_id;
@@ -276,6 +362,7 @@ impl BlockContent {
             agent,
             order_key,
             tick: snap.tick,
+            track: snap.track.clone(),
             tool_name: snap.tool_name.clone(),
             tool_input: snap.tool_input.clone(),
             tool_call_id: snap.tool_call_id,
@@ -589,6 +676,7 @@ impl BlockContent {
             content_type: self.header.content_type,
             order_key: Some(self.order_key.clone()),
             tick: self.tick,
+            track: self.track.clone(),
             updated_at: self.header.updated_at,
             status_at: self.header.status_at,
             collapsed_at: self.header.collapsed_at,
@@ -690,5 +778,190 @@ impl BlockContent {
 
         // Recompute aggregate timestamp
         self.header.updated_at = self.header.max_field_ts().max(remote.max_field_ts());
+    }
+}
+
+#[cfg(test)]
+mod successor_tests {
+    use super::*;
+
+    // T1: the order_key_successor unit suite. Pins the append-key primitive
+    // that decouples ordering from the tick counter (design §2.1).
+
+    #[test]
+    fn base62_decode_round_trips_canonical_width() {
+        for n in [0i64, 1, 61, 62, 1234567, i64::MAX] {
+            let enc = base62_encode_padded(n, 11);
+            assert_eq!(base62_decode(&enc), Some(n), "round-trip {n}");
+        }
+    }
+
+    #[test]
+    fn base62_decode_rejects_non_base62_and_empty() {
+        // '+' is not in the base62 charset.
+        assert_eq!(base62_decode("12+34"), None);
+        // The empty string is NOT a valid canonical key — it has no digits, so
+        // there is no number to decode. Returning None (rather than Some(0))
+        // forecloses the zero-prefix footgun: a zero-length pred can never feed a
+        // bogus `V00000000001…` successor. Fail-loud over a silently-wrong value.
+        assert_eq!(base62_decode(""), None);
+    }
+
+    #[test]
+    fn base62_decode_overflow_is_none() {
+        // 12 base62 'z' chars exceed i64::MAX.
+        assert_eq!(base62_decode("zzzzzzzzzzzz"), None);
+    }
+
+    #[test]
+    fn canonical_fast_path_increments_and_carries_suffix() {
+        // V + 11-base62 number + 4-char suffix is the order_key_for_tick shape.
+        let pred = format!("V{}{}", base62_encode_padded(41, 11), "AAAA");
+        let succ = order_key_successor(&pred, "BBBB");
+        // n+1 == 42, re-encoded at width 11, with our own suffix.
+        let expected = format!("V{}{}", base62_encode_padded(42, 11), "BBBB");
+        assert_eq!(succ, expected);
+        assert!(succ > pred, "successor must sort strictly after pred");
+    }
+
+    #[test]
+    fn canonical_fast_path_ignores_trailing_suffix_chars() {
+        // Trailing suffix chars on pred are ignored; only the 11-char number counts.
+        let pred = format!("V{}{}", base62_encode_padded(7, 11), "zzzz");
+        let succ = order_key_successor(&pred, "0000");
+        let expected = format!("V{}{}", base62_encode_padded(8, 11), "0000");
+        assert_eq!(succ, expected);
+    }
+
+    #[test]
+    fn legacy_midpoint_shape_uses_prefix_extension_fallback() {
+        // order_midpoint produces variable-length non-canonical keys.
+        let pred = order_midpoint("V", "Va");
+        let succ = order_key_successor(&pred, "XXXX");
+        assert_eq!(succ, format!("{pred}V{}", "XXXX"));
+        assert!(succ > pred);
+    }
+
+    #[test]
+    fn legacy_after_v_append_shape_uses_fallback() {
+        // The "{after}V" append shape is not canonical (no leading 'V'+11 number
+        // unless after itself was canonical — here it starts with a digit).
+        let pred = "0042V";
+        let succ = order_key_successor(pred, "QQQQ");
+        assert_eq!(succ, format!("{pred}V{}", "QQQQ"));
+        assert!(succ.as_str() > pred);
+    }
+
+    #[test]
+    fn legacy_decimal_restore_key_uses_fallback_and_sorts_after() {
+        // "{:020}" decimal restore keys sort below 'V' ('0' < 'V'); successor must
+        // still be strictly greater than the decimal pred itself.
+        let pred = format!("{:020}", 5);
+        let succ = order_key_successor(&pred, "MMMM");
+        assert_eq!(succ, format!("{pred}V{}", "MMMM"));
+        assert!(succ > pred);
+    }
+
+    #[test]
+    fn i64_max_canonical_falls_back_no_wrap() {
+        // n+1 overflows at i64::MAX → general fallback, never wraps to a small key.
+        let pred = format!("V{}{}", base62_encode_padded(i64::MAX, 11), "AAAA");
+        let succ = order_key_successor(&pred, "BBBB");
+        assert_eq!(succ, format!("{pred}V{}", "BBBB"));
+        assert!(succ > pred, "must not wrap below pred");
+    }
+
+    #[test]
+    fn property_successor_strictly_greater_for_every_shape() {
+        // Property loop: successor(pred) > pred for canonical, midpoint, "{key}V",
+        // decimal, and i64::MAX shapes.
+        let shapes: Vec<String> = vec![
+            format!("V{}{}", base62_encode_padded(0, 11), "aaaa"),
+            format!("V{}{}", base62_encode_padded(1000, 11), "zzzz"),
+            order_midpoint("V", "W"),
+            order_midpoint("Vaaa", "Vaab"),
+            "VabcV".to_string(),
+            format!("{:020}", 0),
+            format!("{:020}", 999),
+            format!("V{}{}", base62_encode_padded(i64::MAX, 11), "0000"),
+        ];
+        for pred in &shapes {
+            for suffix in ["AAAA", "9999", "zzzz"] {
+                let succ = order_key_successor(pred, suffix);
+                assert!(
+                    succ > *pred,
+                    "successor({pred:?}, {suffix:?}) = {succ:?} must be > pred"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod snapshot_threading_tests {
+    use super::*;
+    use kaijutsu_types::{BlockKind, BlockSnapshotBuilder, ContextId, Role, Status, TrackId};
+
+    fn block_id() -> BlockId {
+        BlockId::new(ContextId::new(), PrincipalId::new(), 1)
+    }
+
+    /// T15 (design §8 Phase 5) — the structural field-drop guard.
+    ///
+    /// Any new `BlockSnapshot` field MUST be threaded through `BlockContent`
+    /// (`from_snapshot` and `snapshot()`) in the same change. This round-trips a
+    /// fully-populated snapshot through `BlockContent` and asserts field-by-field
+    /// equality — it would have caught option A's dead `played_by` and will catch
+    /// the next field that someone forgets to copy. `track` is what this slice
+    /// adds; the assertion is deliberately broad so it keeps guarding.
+    #[test]
+    fn block_snapshot_roundtrips_through_block_content_field_by_field() {
+        let id = block_id();
+        // Every Option populated so a dropped field shows up as inequality.
+        let snap = BlockSnapshotBuilder::new(id, BlockKind::Text)
+            .role(Role::Model)
+            .status(Status::Done)
+            .content("hello world")
+            .tick(Tick::new(10))
+            .track(TrackId::new("bass").unwrap())
+            .content_type(ContentType::Markdown)
+            .tool_name("shell")
+            .tool_input("ls")
+            .signature("sig")
+            .order_key("V00000000010".to_string())
+            .build();
+
+        let principal = snap.id.principal_id;
+        let block = BlockContent::from_snapshot(&snap, principal, "fallback".to_string());
+        let round = block.snapshot();
+
+        // The field this slice adds — the one the trap was about.
+        assert_eq!(round.track, snap.track, "track must survive BlockContent");
+        assert_eq!(round.track, Some(TrackId::new("bass").unwrap()));
+        // And the broad guard: every content field equal (content_eq now covers
+        // track too).
+        assert!(
+            round.content_eq(&snap),
+            "round-tripped snapshot must equal the original field-by-field:\n got {round:#?}\n want {snap:#?}"
+        );
+        // Explicit spot-checks for the timeline pair (tick + track travel together).
+        assert_eq!(round.tick, Some(Tick::new(10)));
+        assert_eq!(round.content_type, ContentType::Markdown);
+    }
+
+    /// T16(c) (design §8 Phase 5) — a track-bearing snapshot survives the central
+    /// CBOR codec round-trip. The pre-track frozen fixture and unknown-key
+    /// tolerance live in `kaijutsu_types::codec` tests (the codec's home crate);
+    /// this is the crdt-side companion asserting `Some(track)` round-trips.
+    #[test]
+    fn block_snapshot_cbor_track_round_trip() {
+        let snap = BlockSnapshotBuilder::new(block_id(), BlockKind::Text)
+            .track(TrackId::new("drums").unwrap())
+            .tick(Tick::new(3))
+            .build();
+        let bytes = kaijutsu_types::codec::encode(&snap).expect("encode");
+        let back: BlockSnapshot = kaijutsu_types::codec::decode(&bytes).expect("decode");
+        assert_eq!(back.track, Some(TrackId::new("drums").unwrap()));
+        assert_eq!(back.tick, Some(Tick::new(3)));
     }
 }

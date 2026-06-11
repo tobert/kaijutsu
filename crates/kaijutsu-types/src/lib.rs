@@ -56,6 +56,7 @@ pub mod session;
 pub mod theme;
 pub mod tick;
 pub mod timeout;
+pub mod track;
 
 // Re-export kaish output types for structured tool results.
 pub use kaish_types::output::{EntryType as OutputEntryType, OutputData, OutputNode};
@@ -82,6 +83,7 @@ pub use principal::{Credential, CredentialKind, Principal};
 pub use session::Session;
 pub use tick::{Span, Tick, TickDelta};
 pub use timeout::TimeoutPolicy;
+pub use track::{TrackId, TrackIdError};
 
 /// Current time as Unix milliseconds. Canonical source — used by constructors
 /// throughout the crate and by downstream crates (drift, kernel_db, rpc).

@@ -49,6 +49,15 @@ impl Resolution {
         }
     }
 
+    /// Attach cells this resolve emits into the open future (or the past).
+    ///
+    /// **Track/player inheritance contract:** an emission is part of the
+    /// committing parent's act, so the engine stamps every emitted cell with the
+    /// parent's `track` and `played_by` at commit. A resolver SHOULD construct
+    /// emissions on the same track as its own cell; setting a divergent track or
+    /// player is a contract misread and is loud (debug assert / `tracing::error`)
+    /// but non-fatal — the parent's values win. The concrete consumers (MIDI
+    /// siblings, in-track automation) are same-track by definition.
     pub fn with_emitted(mut self, emitted: Vec<Cell>) -> Self {
         self.emitted = emitted;
         self

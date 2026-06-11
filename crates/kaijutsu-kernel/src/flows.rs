@@ -984,6 +984,16 @@ pub enum TurnFlow {
         context_id: ContextId,
         /// Principal the turn ran as.
         principal_id: PrincipalId,
+        /// The block the turn produced that the OODA **Act** should crystallize
+        /// — the last `Role::Model` / `BlockKind::Text` block this stream
+        /// inserted, or `None` when the turn produced no text. Carried so the
+        /// beat scheduler schedules *that* block's ABC instead of a blind
+        /// last-block read that races the model (F2 §7). `#[serde(default)]`:
+        /// the field is purely additive and rides the in-process FlowBus only —
+        /// `TurnFlow` is never sent over capnp nor journaled, so this is a
+        /// wire-inert in-process extension, not a wire change (F2 §13).
+        #[serde(default)]
+        output_block_id: Option<BlockId>,
     },
 
     /// An autonomous turn failed. Carries the error so `kj wait` (and any
@@ -1537,6 +1547,7 @@ mod tests {
         let delivered = bus.publish(TurnFlow::Completed {
             context_id: ctx,
             principal_id: principal,
+            output_block_id: None,
         });
         assert_eq!(delivered, 1, "exactly one subscriber on turn.completed");
 
@@ -1553,6 +1564,7 @@ mod tests {
             TurnFlow::Completed {
                 context_id,
                 principal_id,
+                ..
             } => {
                 assert_eq!(context_id, ctx);
                 assert_eq!(principal_id, principal);
@@ -1582,6 +1594,72 @@ mod tests {
             completed_sub.try_recv().is_none(),
             "turn.completed must not receive turn.failed"
         );
+    }
+
+    /// F2 §7/§13 — `TurnFlow::Completed` carries the turn's output block id so
+    /// the beat scheduler schedules *that* block's ABC, not a blind last-block
+    /// read. The field rides the in-process FlowBus only (additive, wire-inert);
+    /// it round-trips a real id and tolerates `None` (a turn with no text).
+    #[tokio::test]
+    async fn completed_carries_output_block_id() {
+        let bus: FlowBus<TurnFlow> = FlowBus::new(16);
+        let mut sub = bus.subscribe("turn.completed");
+
+        let ctx = ContextId::new();
+        let principal = PrincipalId::new();
+        let output = BlockId::new(ctx, principal, 42);
+
+        bus.publish(TurnFlow::Completed {
+            context_id: ctx,
+            principal_id: principal,
+            output_block_id: Some(output),
+        });
+        let msg = sub.try_recv().expect("should receive completion");
+        match msg.payload {
+            TurnFlow::Completed {
+                output_block_id, ..
+            } => assert_eq!(output_block_id, Some(output), "the model block id rides Completed"),
+            other => panic!("expected Completed, got {other:?}"),
+        }
+
+        // A turn that produced no text publishes `None` — not an error.
+        bus.publish(TurnFlow::Completed {
+            context_id: ctx,
+            principal_id: principal,
+            output_block_id: None,
+        });
+        let msg = sub.try_recv().expect("should receive the second completion");
+        match msg.payload {
+            TurnFlow::Completed {
+                output_block_id, ..
+            } => assert_eq!(output_block_id, None, "no text → None, never a fabricated id"),
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// `#[serde(default)]` — an older in-process payload (or a serialized form
+    /// that predates the field) decodes with `output_block_id = None` rather
+    /// than failing. TurnFlow is FlowBus-only, but the default keeps the field
+    /// purely additive against any future serialization of the enum.
+    #[test]
+    fn completed_output_block_id_defaults_when_absent() {
+        let ctx = ContextId::new();
+        let principal = PrincipalId::new();
+        // A JSON form lacking the field — decodes to None via #[serde(default)].
+        let json = serde_json::json!({
+            "Completed": {
+                "context_id": ctx,
+                "principal_id": principal
+            }
+        });
+        let decoded: TurnFlow =
+            serde_json::from_value(json).expect("Completed decodes without output_block_id");
+        match decoded {
+            TurnFlow::Completed {
+                output_block_id, ..
+            } => assert_eq!(output_block_id, None),
+            other => panic!("expected Completed, got {other:?}"),
+        }
     }
 
     // ====================================================================
@@ -1735,6 +1813,7 @@ mod tests {
             TurnFlow::Completed {
                 context_id: ctx,
                 principal_id: principal,
+                output_block_id: None,
             },
             TurnFlow::Failed {
                 context_id: ctx,

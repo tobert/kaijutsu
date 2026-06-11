@@ -200,14 +200,21 @@ impl PrincipalId {
         Self(uuid::Uuid::new_v5(&KAIJUTSU_PRINCIPAL_NS, b"system"))
     }
 
-    /// The well-known "beat" principal — author of hyoushigi-materialized cells.
+    /// The well-known "beat" principal — author of transport-*played* cells.
     ///
-    /// A committed timeline cell is crystallized into a block by the beat
-    /// scheduler, not by any human or model. Giving the beat its own deterministic
-    /// author lane keeps its `(principal, seq)` row-id space disjoint from turn
-    /// blocks and `system()` output, so a manually-minted materialization `seq`
-    /// can never collide with a sequencer-minted one. Deterministic (UUIDv5 from
-    /// `b"hyoushigi"`).
+    /// A cell is played by `beat()` when the **transport itself** produced it:
+    /// `UseLastGood` fallback repeats and `Literal` fills. A player-derived cell
+    /// (resolved from the ABC a model/human turn produced) is authored by that
+    /// player, not by `beat()` — attributing vamp-insurance to the player would be
+    /// false provenance, and attributing a real performance to `beat()` would
+    /// erase the player. So `beat()` is the transport's own author lane, not "the
+    /// author of every materialized cell."
+    ///
+    /// Giving the transport its own deterministic author lane keeps its
+    /// `(principal, seq)` row-id space disjoint from turn blocks and `system()`
+    /// output. Note: a track is the lane, `principal_id` is who played — one
+    /// track's blocks span both the player's lane and `beat()`'s. Deterministic
+    /// (UUIDv5 from `b"hyoushigi"`).
     pub fn beat() -> Self {
         Self(uuid::Uuid::new_v5(&KAIJUTSU_PRINCIPAL_NS, b"hyoushigi"))
     }

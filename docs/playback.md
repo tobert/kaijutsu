@@ -95,16 +95,28 @@ art for the shared-tempo session clock: Ableton Link, MIDI clock.
    filtered block subscription to watch for blocks with audio content
    types in armed contexts, then prefetch from CAS. May need a content-
    type filter dimension on `subscribe_blocks_filtered` if labels/kinds
-   aren't sufficient.
+   aren't sufficient. **Interim sink key (Chameleon batch 1, F2):** until
+   `ContentType::Midi` lands (item 9 / playback slice 2), the derived MIDI is
+   a `Role::Asset` block whose `parent_id` points at the ABC source
+   (`ContentType::Abc`); the authoritative mime lives in the CAS sidecar.
+   Sinks **must tolerate a source ABC block with no MIDI sibling** — a SIGKILL
+   between the two inserts (the source is journaled, the sibling not) leaves
+   one un-renderable phrase. Skip it and note it; never silently double or
+   guess. Loud at crash time, never silently doubled (§11.8 of the F2 design).
 
 8. **Resolver chain for dumb sinks.** Smart sinks (app with an embedded
    soundfont synth — oxisynth/rustysynth) take `audio/midi` directly. Dumb
-   sinks (pawlsa-shaped: PCM/WAV only) need a kernel-side `midi→pcm`
-   hyoushigi resolver — pure, idempotent, CAS-to-CAS, same shape as
-   `abc_to_midi` (`hyoushigi/mod.rs:110-234`). Whether the pcm cell is
-   scheduled at all is format negotiation against the attached sinks'
-   advertised formats. Per the two-voices rule, design the sink interface
-   against both concrete sinks (app + MCP) simultaneously.
+   sinks (pawlsa-shaped: PCM/WAV only) need a kernel-side `midi→pcm` step —
+   pure, idempotent, CAS-to-CAS. **Re-anchor (Chameleon batch 1, F2):** the
+   `abc_to_midi` *resolver* no longer exists — notation-first commits made
+   ABC→MIDI a barrier-side **`Deriver`**, not a timeline resolver, so there is
+   no resolver to copy its shape from. The two candidate shapes for the
+   midi→pcm step — a deferred PCM **cell keyed on the derived MIDI hash**, or a
+   measured budget-excepted **deriver** — are recorded in issues.md (playback
+   slice 3); pick one there before building. Whether the step runs at all is
+   format negotiation against the attached sinks' advertised formats. Per the
+   two-voices rule, design the sink interface against both concrete sinks (app
+   + MCP) simultaneously.
 
 9. **`ContentType::Midi` + renderer** (already in issues.md, Hyoushigi) —
    `audio/midi` projects to `Plain` today; the scrubbable timeline render

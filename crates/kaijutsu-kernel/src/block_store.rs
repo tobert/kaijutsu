@@ -23,7 +23,7 @@ use kaijutsu_crdt::block_store::{
 use kaijutsu_crdt::{BlockId, BlockKind, BlockSnapshot, ContentType, Role, Status, ToolKind};
 use kaijutsu_types::BlockFilter;
 use kaijutsu_types::codec;
-use kaijutsu_types::{ContextId, DocKind, PrincipalId, WorkspaceId};
+use kaijutsu_types::{ContextId, DocKind, PrincipalId, Tick, WorkspaceId};
 
 use crate::flows::{BlockFlow, InputDocFlow, OpSource, SharedBlockFlowBus, SharedInputDocFlowBus};
 use crate::input_doc::InputDocEntry;
@@ -202,6 +202,13 @@ pub struct BlockStore {
     block_flows: Option<SharedBlockFlowBus>,
     /// FlowBus for input doc events.
     input_flows: Option<SharedInputDocFlowBus>,
+    /// TEST-ONLY fault injection: when `> 0`, each `insert_from_snapshot_as`
+    /// decrements it, and the call on which it hits exactly 1 returns an error
+    /// instead of inserting. Lets the per-artifact resumability spine
+    /// (`materialize_committed`) be tested without a real journal fault. Always 0
+    /// (no-op) in production builds — the field is `#[cfg(test)]`-gated.
+    #[cfg(test)]
+    fail_insert_countdown: std::sync::atomic::AtomicUsize,
 }
 
 impl BlockStore {
@@ -219,6 +226,8 @@ impl BlockStore {
             principal_id: RwLock::new(principal_id),
             block_flows: None,
             input_flows: None,
+            #[cfg(test)]
+            fail_insert_countdown: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -236,6 +245,8 @@ impl BlockStore {
             principal_id: RwLock::new(principal_id),
             block_flows: Some(block_flows),
             input_flows: None,
+            #[cfg(test)]
+            fail_insert_countdown: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -257,6 +268,8 @@ impl BlockStore {
             principal_id: RwLock::new(principal_id),
             block_flows: None,
             input_flows: None,
+            #[cfg(test)]
+            fail_insert_countdown: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -279,7 +292,17 @@ impl BlockStore {
             principal_id: RwLock::new(principal_id),
             block_flows: Some(block_flows),
             input_flows: None,
+            #[cfg(test)]
+            fail_insert_countdown: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// TEST-ONLY: arm the insert fault injector. A value of `n` fails the `n`th
+    /// subsequent `insert_from_snapshot_as` (1 = the next insert). 0 disarms.
+    #[cfg(test)]
+    pub fn arm_insert_fault(&self, n: usize) {
+        self.fail_insert_countdown
+            .store(n, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Get a reference to the database handle, if one is configured.
@@ -693,6 +716,39 @@ impl BlockStore {
     pub fn last_block_id(&self, context_id: ContextId) -> Option<BlockId> {
         let entry = self.get(context_id)?;
         entry.doc.blocks_ordered().last().map(|b| b.id)
+    }
+
+    /// Reserve a fresh `BlockId` under `principal` without inserting — the
+    /// materialization path mints its id this way (`cell.played_by` becomes the
+    /// principal), then inserts via `insert_from_snapshot_as`. Reserve and insert
+    /// are two lock acquisitions: reserve atomically claims its seq under the
+    /// entry lock, and the single-kernel sole-sequencer invariant covers the rest.
+    /// A reserve-then-failed-insert leaves a benign seq gap (monotonic-unique, not
+    /// dense). Errors loudly if the document is not resident.
+    pub fn reserve_block_id(
+        &self,
+        context_id: ContextId,
+        principal: PrincipalId,
+    ) -> BlockStoreResult<BlockId> {
+        let mut entry = self
+            .get_mut(context_id)
+            .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+        Ok(entry.doc.reserve_block_id(principal))
+    }
+
+    /// The maximum `Tick` over the document's live blocks, or `None` if empty —
+    /// the playhead seed on re-arm (design §4). A scan is fine: arm is rare.
+    /// Errors loudly if the document is not resident.
+    pub fn max_tick(&self, context_id: ContextId) -> BlockStoreResult<Option<Tick>> {
+        let entry = self
+            .get(context_id)
+            .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+        Ok(entry
+            .doc
+            .blocks_ordered()
+            .iter()
+            .filter_map(|b| b.tick)
+            .max())
     }
 
     // =========================================================================
@@ -1175,6 +1231,20 @@ impl BlockStore {
         after: Option<&BlockId>,
         principal_id: Option<PrincipalId>,
     ) -> BlockStoreResult<BlockId> {
+        #[cfg(test)]
+        {
+            use std::sync::atomic::Ordering;
+            // TEST-ONLY fault injection (see field doc): a countdown of N fails the
+            // Nth insert (decrement each call; when the pre-decrement value is 1, the
+            // countdown hits 0 on THIS call → error). Single-threaded in the tests
+            // that use it, so a plain fetch_sub is sufficient.
+            if self.fail_insert_countdown.load(Ordering::SeqCst) > 0 {
+                let prev = self.fail_insert_countdown.fetch_sub(1, Ordering::SeqCst);
+                if prev == 1 {
+                    return Err(BlockStoreError::Db("injected insert fault (test)".into()));
+                }
+            }
+        }
         let after_id = after.cloned();
         let (block_id, final_snapshot, ops, ops_bytes) = {
             let mut entry = self
@@ -3019,6 +3089,56 @@ mod tests {
     }
 
     #[test]
+    fn reserve_block_id_and_max_tick_passthrough() {
+        // Kernel passthrough for the materialization path (design §3, §4):
+        // reserve_block_id claims a fresh seq under an explicit principal (the
+        // player, or beat() for fallbacks), and max_tick reports the high-water
+        // tick over live blocks so arm can seed the playhead.
+        use kaijutsu_types::Tick;
+
+        let store = BlockStore::new(test_agent());
+        let ctx = ContextId::new();
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+
+        // A foreign principal (e.g. a player on a chair) — reserve claims and
+        // advances its own lane, independent of the store principal.
+        let player = PrincipalId::new();
+        let first = store.reserve_block_id(ctx, player).unwrap();
+        assert_eq!(first.seq, 0);
+        assert_eq!(first.principal_id, player);
+        let second = store.reserve_block_id(ctx, player).unwrap();
+        assert_eq!(second.seq, 1, "second reserve mints +1 even without an insert");
+
+        // Missing document is a loud error, not a silent default.
+        let missing = ContextId::new();
+        match store.reserve_block_id(missing, player) {
+            Err(BlockStoreError::DocumentNotFound(id)) => assert_eq!(id, missing),
+            other => panic!("expected DocumentNotFound, got {:?}", other),
+        }
+
+        // max_tick: empty doc → None.
+        assert_eq!(store.max_tick(ctx).unwrap(), None);
+
+        // Insert blocks carrying ticks; max_tick reports the high-water.
+        for t in [0i64, 3, 1] {
+            let snap = kaijutsu_crdt::BlockSnapshotBuilder::new(
+                BlockId::new(ctx, player, store.reserve_block_id(ctx, player).unwrap().seq),
+                BlockKind::Text,
+            )
+            .tick(Tick::new(t))
+            .order_key(format!("V{:0>11}AAAA", t))
+            .content("c")
+            .build();
+            store
+                .insert_from_snapshot_as(ctx, snap, None, Some(player))
+                .unwrap();
+        }
+        assert_eq!(store.max_tick(ctx).unwrap(), Some(Tick::new(3)), "max_tick is the live high-water");
+    }
+
+    #[test]
     fn test_text_ops_seq_monotonic_per_context() {
         // M2-B2: each emitted TextOps event carries a per-context monotonic
         // seq so clients can detect dropped broadcasts.
@@ -4620,6 +4740,118 @@ mod tests {
                 i
             );
         }
+    }
+
+    /// T8 (design §8 Phase 3) — the locked ordering+tick regression, exercised
+    /// through the REAL restore path (load_from_db → from_snapshot → merge_ops
+    /// per oplog row). `test_block_order_preserved` never appends after reload —
+    /// the exact gap this pins. A fresh append after reload must (a) sort LAST in
+    /// the ordered log (successor-derived order key beats any stale next_tick) and
+    /// (b) stamp a tick strictly greater than every pre-reload tick (merge_ops
+    /// restores the tick high-water, §2.3). Both fail under the old tick-driven
+    /// calc_order_key + stale-counter behavior.
+    #[test]
+    fn test_reload_then_append_sorts_last() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, store, ctx, ws) = fresh_db_store(dir.path());
+
+        // A handful of structural inserts seed the keyspace and the tick lane.
+        let mut seed_ids = Vec::new();
+        let mut prev: Option<BlockId> = None;
+        for i in 0..5 {
+            let bid = store
+                .insert_block(
+                    ctx, None, prev.as_ref(), Role::User, BlockKind::Text,
+                    format!("seed-{}", i), Status::Done, ContentType::Plain,
+                )
+                .unwrap();
+            seed_ids.push(bid);
+            prev = Some(bid);
+        }
+
+        // Force compaction: 500 appends to the first block pushes the op count
+        // past COMPACTION_OP_THRESHOLD and writes a snapshot row.
+        let first = seed_ids[0];
+        for i in 0..500 {
+            let ch = (b'a' + (i % 26) as u8) as char;
+            store.append_text(ctx, &first, &ch.to_string()).unwrap();
+        }
+        {
+            let db_guard = db.lock();
+            let snap = db_guard.load_latest_snapshot(ctx).unwrap();
+            assert!(snap.is_some(), "500+ ops must have written a snapshot");
+        }
+
+        // More STRUCTURAL inserts AFTER compaction — these live in the oplog past
+        // the snapshot, so the reload path must replay them via merge_ops (the
+        // arm that restores next_tick, §2.3).
+        for i in 0..3 {
+            let bid = store
+                .insert_block(
+                    ctx, None, prev.as_ref(), Role::User, BlockKind::Text,
+                    format!("post-compact-{}", i), Status::Done, ContentType::Plain,
+                )
+                .unwrap();
+            prev = Some(bid);
+        }
+
+        // Record the pre-reload ordering and the max tick across all live blocks.
+        let snaps_before = store.block_snapshots(ctx).unwrap();
+        let order_before: Vec<BlockId> = snaps_before.iter().map(|s| s.id).collect();
+        let max_tick_before = snaps_before
+            .iter()
+            .filter_map(|s| s.tick)
+            .max()
+            .expect("blocks carry ticks");
+
+        drop(store); // destroy in-memory state — only the DB survives
+
+        // Reload through the REAL path, then append a fresh block.
+        let store2 = drop_and_reload(db, ws);
+
+        // Sanity: the reload reconstructed every pre-reload block in order.
+        let order_reloaded: Vec<BlockId> = store2
+            .block_snapshots(ctx)
+            .unwrap()
+            .iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(
+            order_before, order_reloaded,
+            "reload must reconstruct the pre-reload ordering exactly"
+        );
+
+        let tail = store2.last_block_id(ctx).expect("store has a tail after reload");
+        let appended = store2
+            .insert_block(
+                ctx, None, Some(&tail), Role::User, BlockKind::Text,
+                "appended-after-reload", Status::Done, ContentType::Plain,
+            )
+            .unwrap();
+
+        // (a) The fresh append sorts LAST — successor order key, not a stale
+        //     tick-derived mid-document key.
+        let snaps_after = store2.block_snapshots(ctx).unwrap();
+        assert_eq!(
+            snaps_after.last().map(|s| s.id),
+            Some(appended),
+            "a post-reload append must sort last in the ordered log; \
+             ordering = {:?}",
+            snaps_after.iter().map(|s| s.content.clone()).collect::<Vec<_>>(),
+        );
+
+        // (b) The fresh append's tick strictly exceeds every pre-reload tick —
+        //     merge_ops restored the tick high-water across the snapshot boundary.
+        let appended_tick = snaps_after
+            .iter()
+            .find(|s| s.id == appended)
+            .and_then(|s| s.tick)
+            .expect("the appended block carries a tick");
+        assert!(
+            appended_tick > max_tick_before,
+            "post-reload append tick {:?} must exceed pre-reload max tick {:?}",
+            appended_tick, max_tick_before,
+        );
     }
 
     // ====================================================================

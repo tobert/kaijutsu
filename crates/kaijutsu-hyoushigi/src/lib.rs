@@ -25,7 +25,7 @@ pub mod resolver;
 
 pub use cell::{Body, Cell, CellState, ContextQuery, Fallback, Recipe, ResolverId};
 pub use content::{ContentRef, ContextHash};
-pub use engine::{Recovery, ScheduleError, SquashEvent, TickClock, Timeline};
+pub use engine::{Recovery, ScheduleError, SeedError, SquashEvent, TickClock, Timeline};
 pub use resolver::{ResolveError, Resolution, Resolver, ResolverCtx};
 
 // The CAS hash newtype is the cell-body contract's anchor; re-export it so callers

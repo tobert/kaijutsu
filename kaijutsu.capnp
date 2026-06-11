@@ -136,7 +136,9 @@ struct BlockSnapshot {
   parentId @1 :BlockId;
   hasParentId @2 :Bool;       # True if parentId is set
 
-  # Metadata (author derived from id.principalId — no separate field)
+  # Metadata. Author (who PLAYED) is derived from id.principalId — no separate
+  # field. The hyoushigi `track` below is the LANE (where the clip lives), never
+  # the author; one track's blocks span multiple principals (player + beat()).
   role @3 :Role;
   status @4 :Status;
   kind @5 :BlockKind;
@@ -213,6 +215,12 @@ struct BlockSnapshot {
   # legacy/older-wire blocks.
   signature @37 :Text;
   hasSignature @38 :Bool;     # True if signature is set (distinguishes "" from unset)
+
+  # Hyoushigi track — stable lane identity (DAW sense). Set only on blocks
+  # materialized from a committed timeline cell. Author (who played) remains
+  # id.principalId; track is the lane, never the author.
+  track @39 :Text;
+  hasTrack @40 :Bool;         # True if track is set (None ⇔ hasTrack=false)
 }
 
 # What system produced the error.

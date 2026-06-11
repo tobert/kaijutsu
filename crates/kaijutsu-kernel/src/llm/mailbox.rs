@@ -144,8 +144,8 @@ mod tests {
     use super::*;
     use crate::llm::{ContentBlock, MessageContent, Role, hydrate_from_blocks};
     use kaijutsu_types::{
-        BlockId, BlockKind, BlockSnapshot, BlockSnapshotBuilder, ContextId, PrincipalId,
-        Role as BlockRole,
+        BlockId, BlockKind, BlockSnapshot, BlockSnapshotBuilder, ContentType, ContextId,
+        PrincipalId, Role as BlockRole, Tick,
     };
     use std::cell::Cell;
 
@@ -434,5 +434,88 @@ mod tests {
             assert_eq!(a.role, b.role);
             assert_eq!(a.as_text(), b.as_text());
         }
+    }
+
+    // ── T14 (F2 §8): materialized score blocks are hydration-silent ───────
+    //
+    // The materializer (hyoushigi/mod.rs materialize_committed) stamps both
+    // the ABC source block (Role::Model + Text + ContentType::Abc) and the
+    // derived MIDI sibling (Role::Asset + Text + parent_id + hash content)
+    // `ephemeral = true`. Without that stamp the ABC source would hydrate as
+    // assistant text once per materialized phrase — the flood §8 closes.
+    // This pins the stamp through BOTH conversation entry points that fold
+    // blocks via `translate_block`: bootstrap (`hydrate_from_blocks`) and
+    // the live `ConversationMailbox::catch_up`.
+
+    /// An ABC source block shaped exactly as the materializer emits it:
+    /// Role::Model + Text + ContentType::Abc + a beat tick + `ephemeral`.
+    fn score_abc_block(abc: &str, ephemeral: bool) -> BlockSnapshot {
+        let c = TEST_CTX.with(|v| *v);
+        let p = TEST_PRINCIPAL.with(|v| *v);
+        BlockSnapshotBuilder::new(BlockId::new(c, p, next_seq()), BlockKind::Text)
+            .role(BlockRole::Model)
+            .content(abc)
+            .content_type(ContentType::Abc)
+            .tick(Tick::new(16))
+            .ephemeral(ephemeral)
+            .build()
+    }
+
+    /// The derived MIDI sibling shaped as the materializer emits it:
+    /// Role::Asset + Text + parent_id (score↔render pairing) + 32-hex hash
+    /// content + same tick + `ephemeral`.
+    fn score_midi_sibling(parent: BlockId, hash: &str, ephemeral: bool) -> BlockSnapshot {
+        let c = TEST_CTX.with(|v| *v);
+        let p = TEST_PRINCIPAL.with(|v| *v);
+        BlockSnapshotBuilder::new(BlockId::new(c, p, next_seq()), BlockKind::Text)
+            .role(BlockRole::Asset)
+            .content(hash)
+            .content_type(ContentType::Plain)
+            .tick(Tick::new(16))
+            .parent_id(parent)
+            .ephemeral(ephemeral)
+            .build()
+    }
+
+    #[test]
+    fn materialized_score_blocks_are_hydration_silent() {
+        let abc = "X:1\nM:4/4\nL:1/8\nK:Bb dorian\nB2 d2 f2 a2 |\n";
+        let hash = "0123456789abcdef0123456789abcdef";
+
+        let source = score_abc_block(abc, /* ephemeral */ true);
+        let sibling = score_midi_sibling(source.id, hash, /* ephemeral */ true);
+        let score = vec![source, sibling];
+
+        // Path 1: bootstrap hydration (HydrationState via hydrate_from_blocks).
+        let via_bootstrap = hydrate_from_blocks(&score);
+        assert!(
+            via_bootstrap.is_empty(),
+            "ephemeral score blocks must not hydrate via bootstrap; got {} messages",
+            via_bootstrap.len()
+        );
+
+        // Path 2: live conversation feed (ConversationMailbox::catch_up).
+        let mut mb = ConversationMailbox::new();
+        mb.catch_up(&score);
+        let via_catch_up = mb.snapshot();
+        assert!(
+            via_catch_up.is_empty(),
+            "ephemeral score blocks must not hydrate via catch_up; got {} messages",
+            via_catch_up.len()
+        );
+
+        // Non-vacuity guard: the SAME shape WITHOUT the ephemeral stamp DOES
+        // produce a message — proving the assertions above can fail and so
+        // pin the stamp, not an always-empty translation. The ABC source is
+        // a Model/Text block, which hydrates as one assistant message.
+        let leaky_source = score_abc_block(abc, /* ephemeral */ false);
+        let leaky = vec![leaky_source];
+        let leaked = hydrate_from_blocks(&leaky);
+        assert_eq!(
+            leaked.len(),
+            1,
+            "a non-ephemeral Model/Text score block floods as assistant text — \
+             this is exactly what the ephemeral stamp suppresses"
+        );
     }
 }

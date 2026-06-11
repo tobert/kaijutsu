@@ -511,6 +511,7 @@ impl BlockDocument {
             content_type_at: 0,               // Legacy document predates content_type
             order_key: None,                  // Legacy document uses DTE-backed ordering
             tick: None,
+            track: None,
             updated_at: 0,      // Legacy document predates Lamport propagation
             status_at: 0,
             collapsed_at: 0,

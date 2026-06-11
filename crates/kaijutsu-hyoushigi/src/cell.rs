@@ -1,7 +1,7 @@
 //! Cells: the three-part contract (position, body, state) and the recipe data.
 
 use crate::content::ContentRef;
-use kaijutsu_types::{Span, TickDelta};
+use kaijutsu_types::{PrincipalId, Span, TickDelta, TrackId};
 use serde::{Deserialize, Serialize};
 
 /// Identifier of a resolver, looked up in the engine's registry. Recipes carry
@@ -115,24 +115,55 @@ pub struct Cell {
     pub span: Span,
     pub body: Body,
     pub state: CellState,
+    /// The lane this cell belongs to. Required — an untracked cell is
+    /// meaningless once tracks are first-class. No serde default: a stored
+    /// track-less cell is corruption, and the codec should say so when cell
+    /// persistence lands.
+    ///
+    /// LANE IDENTITY ONLY. `track` is the *only* lane key; `played_by` (the
+    /// scheduling principal) is never a lane key — one track's cells span
+    /// multiple principals (player + `beat()` fallbacks).
+    pub track: TrackId,
+    /// Who played: the principal whose turn produced this content, or
+    /// [`PrincipalId::beat()`] when the transport itself did (fallback repeats,
+    /// literals). Becomes `BlockId.principal_id` at materialization. This is
+    /// provenance, **not** a lane key — attributing a vamp-insurance repeat to a
+    /// player would be false provenance.
+    pub played_by: PrincipalId,
 }
 
 impl Cell {
-    /// A concrete cell is born `Committed`.
-    pub fn concrete(span: Span, content: ContentRef) -> Self {
+    /// A concrete cell is born `Committed`, carrying its lane (`track`) and its
+    /// player (`played_by`).
+    pub fn concrete_on(
+        span: Span,
+        content: ContentRef,
+        track: TrackId,
+        played_by: PrincipalId,
+    ) -> Self {
         Self {
             span,
             body: Body::Concrete(content),
             state: CellState::Committed,
+            track,
+            played_by,
         }
     }
 
-    /// A deferred cell starts `Pending`.
-    pub fn deferred(span: Span, recipe: Recipe) -> Self {
+    /// A deferred cell starts `Pending`, carrying its lane (`track`) and its
+    /// player (`played_by`).
+    pub fn deferred_on(
+        span: Span,
+        recipe: Recipe,
+        track: TrackId,
+        played_by: PrincipalId,
+    ) -> Self {
         Self {
             span,
             body: Body::Deferred(recipe),
             state: CellState::Pending,
+            track,
+            played_by,
         }
     }
 
@@ -158,9 +189,11 @@ mod tests {
 
     #[test]
     fn concrete_is_born_committed() {
-        let c = Cell::concrete(
+        let c = Cell::concrete_on(
             Span::instant(Tick::new(0)),
             ContentRef::of(b"hi", "text/plain"),
+            TrackId::solo(),
+            PrincipalId::beat(),
         );
         assert_eq!(c.state, CellState::Committed);
         assert!(!c.is_deferred());
@@ -168,7 +201,12 @@ mod tests {
 
     #[test]
     fn deferred_starts_pending() {
-        let c = Cell::deferred(Span::instant(Tick::new(4)), recipe());
+        let c = Cell::deferred_on(
+            Span::instant(Tick::new(4)),
+            recipe(),
+            TrackId::solo(),
+            PrincipalId::beat(),
+        );
         assert_eq!(c.state, CellState::Pending);
         assert!(c.is_deferred());
     }

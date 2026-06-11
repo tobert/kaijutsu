@@ -35,8 +35,12 @@ impl Timeline {
         // open string meets the closed render-hint enum.
         let is_text = cref.mime.starts_with("text/");
 
+        // The cell's lane rides onto the block as `track` (lane identity, not the
+        // author — the author is `id.principal_id`, who PLAYED). `track.is_some()`
+        // becomes the "came off the timeline" discriminator downstream.
         let mut b = BlockSnapshotBuilder::new(id, BlockKind::Text)
             .tick(cell.span.start)
+            .track(cell.track.clone())
             .content_type(content_type);
 
         if is_text {
@@ -101,7 +105,7 @@ mod tests {
             bytes: bytes.to_vec(),
             mime: mime.to_string(),
         }));
-        let cell = Cell::deferred(
+        let cell = Cell::deferred_on(
             Span::instant(Tick::new(10)),
             Recipe {
                 resolver: ResolverId::new("fixed"),
@@ -109,6 +113,8 @@ mod tests {
                 query: ContextQuery::default(),
                 fallback: Fallback::Skip,
             },
+            kaijutsu_types::TrackId::solo(),
+            PrincipalId::beat(),
         );
         tl.schedule(cell).unwrap();
         tl.advance_to(Tick::new(10));
@@ -150,9 +156,43 @@ mod tests {
         assert_eq!(block.tick, Some(Tick::new(10)));
     }
 
+    /// T17 (design §8 Phase 5, materialize half) — a materialized snapshot carries
+    /// its cell's lane (`track`) verbatim, for both a player-played cell and a
+    /// `beat()`-played fallback. The block's author (id.principal_id) is the
+    /// caller's concern (it passes the BlockId); materialize only stamps the lane.
+    #[test]
+    fn materialized_snapshot_carries_track() {
+        use kaijutsu_types::TrackId;
+
+        // Player case: a cell on the "bass" lane played by a real principal.
+        let player = PrincipalId::new();
+        let (tl, mut cell) = commit_one("audio/midi", b"MThd-player");
+        cell.track = TrackId::new("bass").unwrap();
+        cell.played_by = player;
+        let id = BlockId::new(ContextId::new(), player, 7);
+        let snap = tl.materialize(&cell, id).unwrap();
+        assert_eq!(
+            snap.track,
+            Some(TrackId::new("bass").unwrap()),
+            "the lane rides onto the snapshot"
+        );
+        // The author is whatever BlockId the caller minted — the lane is NOT the
+        // author. (One track spans player + beat() principals.)
+        assert_eq!(snap.id.principal_id, player);
+
+        // Fallback case: same lane, but the transport played it (beat()).
+        let (tl2, mut fb) = commit_one("audio/midi", b"MThd-vamp");
+        fb.track = TrackId::new("bass").unwrap();
+        fb.played_by = PrincipalId::beat();
+        let id2 = BlockId::new(ContextId::new(), PrincipalId::beat(), 1);
+        let snap2 = tl2.materialize(&fb, id2).unwrap();
+        assert_eq!(snap2.track, Some(TrackId::new("bass").unwrap()));
+        assert_eq!(snap2.id.principal_id, PrincipalId::beat());
+    }
+
     #[test]
     fn deferred_cell_has_nothing_to_materialize() {
-        let cell = Cell::deferred(
+        let cell = Cell::deferred_on(
             Span::instant(Tick::new(1)),
             Recipe {
                 resolver: ResolverId::new("fixed"),
@@ -160,6 +200,8 @@ mod tests {
                 query: ContextQuery::default(),
                 fallback: Fallback::Skip,
             },
+            kaijutsu_types::TrackId::solo(),
+            PrincipalId::beat(),
         );
         let tl = Timeline::new(TickClock::default());
         assert!(tl.materialize(&cell, block_id()).is_none());

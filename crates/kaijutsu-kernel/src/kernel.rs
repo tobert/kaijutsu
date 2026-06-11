@@ -617,9 +617,19 @@ impl Kernel {
     // ========================================================================
 
     /// Arm a context with a hyoushigi timeline driven by `clock`, registering
-    /// the production resolvers onto it. Idempotent: a context already armed
-    /// keeps its live timeline (we never clobber an open future), so re-arming
-    /// is a no-op that returns the existing handle.
+    /// the production resolvers onto it and seeding its playhead to `seed`.
+    /// Idempotent: a context already armed keeps its live timeline (we never
+    /// clobber an open future), so re-arming is a no-op that returns the existing
+    /// handle.
+    ///
+    /// `seed` positions the playhead so musical time stays globally monotone per
+    /// context across restarts/rotations (design §4). It is applied **inside**
+    /// `or_insert_with` — only on the freshly-constructed (virgin-by-construction)
+    /// timeline — so an idempotent re-arm of a LIVE timeline never re-seeds or
+    /// rewinds the playhead, preserving the "never clobber an open future"
+    /// contract above. `seed_playhead` is virgin-only and `.expect()`s here
+    /// because the timeline is brand new; a non-virgin seed would be a kernel bug
+    /// (crash over corruption), not a recoverable condition.
     ///
     /// Arming is the *only* thing that gives a context a timeline — a coder is
     /// never armed, so it has no entry and the beat scheduler never wakes for
@@ -628,12 +638,19 @@ impl Kernel {
         &self,
         context_id: kaijutsu_types::ContextId,
         clock: kaijutsu_hyoushigi::TickClock,
+        seed: kaijutsu_types::Tick,
     ) -> crate::hyoushigi::SharedTimeline {
         self.timelines
             .entry(context_id)
             .or_insert_with(|| {
                 let mut tl = kaijutsu_hyoushigi::Timeline::new(clock);
                 crate::hyoushigi::register_resolvers(&mut tl, self.cas.clone());
+                // Virgin by construction: this closure only fires when the entry
+                // is absent, so the seed always lands on a fresh timeline. A
+                // re-arm hits the existing entry and skips this block entirely —
+                // that is exactly how re-arm avoids re-seeding a live playhead.
+                tl.seed_playhead(seed)
+                    .expect("freshly-constructed timeline must be virgin for seed_playhead");
                 Arc::new(parking_lot::Mutex::new(tl))
             })
             .clone()

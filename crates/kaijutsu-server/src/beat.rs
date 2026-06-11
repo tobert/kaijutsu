@@ -34,21 +34,21 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
+use kaijutsu_crdt::BlockId;
 use kaijutsu_kernel::block_store::SharedBlockStore;
 use kaijutsu_kernel::flows::TurnFlow;
-use kaijutsu_kernel::hyoushigi::{BeatCommand, BeatPolicy, materialize_committed, schedule_abc_cell};
+use kaijutsu_kernel::hyoushigi::{
+    BeatCommand, BeatPolicy, DeriverRegistry, MaterializeCursor, materialize_committed,
+    schedule_abc_cell,
+};
 use kaijutsu_kernel::{Kernel, KjCaller, KjDispatcher};
-use kaijutsu_types::{ContextId, PrincipalId, SessionId, TickDelta};
+use kaijutsu_types::{ContextId, PrincipalId, SessionId, TickDelta, TrackId};
 
 use crate::rpc::ServerRegistry;
 
 /// Ticks the playhead advances per beat (PPQ 1: one tick per beat). The tick is
 /// event-counted, so this is a pure increment, never scaled by elapsed time.
 const STEP: TickDelta = TickDelta::new(1);
-
-/// How far ahead of the playhead an OODA turn's ABC section is scheduled (one bar
-/// at 4/4) — room for the fast abc→midi resolve to speculate before its beat.
-const OODA_LEAD: TickDelta = TickDelta::new(4);
 
 /// Per-armed-context beat bookkeeping. The two transport switches live here.
 struct BeatState {
@@ -58,11 +58,58 @@ struct BeatState {
     playing: bool,
     /// The OODA switch. The `tick` verb fires only when `playing && ooda_armed`.
     ooda_armed: bool,
-    /// Count of committed cells already materialized — the bridge high-water mark.
-    high_water: usize,
+    /// The materialization cursor: how far whole committed cells have crossed the
+    /// write barrier (`high_water`) AND how far the in-progress cell's artifact
+    /// group got (`artifacts_done`), so a beat that fails mid-group resumes at the
+    /// failed artifact rather than re-inserting (and colliding on) the ones that
+    /// already landed. NOT an id source: materialization reserves ids from the
+    /// store's per-principal seq lanes (§3).
+    cursor: MaterializeCursor,
     /// Beats elapsed *while playing* — drives the OODA cadence. Frozen across a
     /// pause, like the playhead.
     beat_count: u64,
+    /// The composer's lane identity — the track its scheduled cells (and so its
+    /// materialized blocks) belong to. Lane identity ONLY, never the author.
+    track: TrackId,
+    /// Consecutive materialize failures on the SAME poison cell — the cell at the
+    /// current `high_water` that has refused to materialize on every retry. Reset
+    /// to 0 the moment any cell crosses (progress was made). When it reaches
+    /// [`MATERIALIZE_RETRY_BUDGET`] the bridge skips the poison cell with a loud
+    /// `error!` so the beat loop never silently retries the same cell forever
+    /// (the pre-F1 swallowed-Result poison channel; worsens with multiple tracks).
+    materialize_failures: u32,
+    /// How far the engine failure ledger (`Timeline::failures()`) has been drained
+    /// into visible `BlockKind::Error` blocks (design §6, §8). Monotone: each
+    /// `process_one` surfaces every event past this cursor, one Error block apiece,
+    /// then advances past them — so a resolve failure is read back by the player
+    /// next turn (the producer-loop principle) and never re-surfaced on later beats.
+    failure_water: usize,
+}
+
+/// How many consecutive beats may fail to materialize the SAME poison cell before
+/// the bridge gives up on it and skips it (loudly). Crash-over-corruption favors a
+/// bounded, observable failure over an unbounded silent retry loop.
+const MATERIALIZE_RETRY_BUDGET: u32 = 3;
+
+/// What to do after a `materialize_committed` error, given how many consecutive
+/// times the SAME poison cell has now failed. Pure so the budget logic is unit-
+/// testable without injecting a real materialize failure.
+#[derive(Debug, PartialEq, Eq)]
+enum PoisonAction {
+    /// Within budget — leave `high_water` un-advanced and retry next beat.
+    Retry,
+    /// Budget exhausted — advance `high_water` past the poison cell and move on.
+    SkipPoison,
+}
+
+/// Decide the poison-cell action. `failures` is the count INCLUDING the failure
+/// that just happened (≥ 1).
+fn poison_action(failures: u32) -> PoisonAction {
+    if failures >= MATERIALIZE_RETRY_BUDGET {
+        PoisonAction::SkipPoison
+    } else {
+        PoisonAction::Retry
+    }
 }
 
 /// What one wake produced: which contexts beat, and which crossed an OODA
@@ -72,6 +119,23 @@ struct BeatState {
 pub struct BeatOutcome {
     pub fired: Vec<ContextId>,
     pub ooda_due: Vec<ContextId>,
+    /// Contexts that crossed a phrase boundary this wake (`beat_count %
+    /// beats_per_phrase == 0`). The observable seam for cue traps / quantized
+    /// flush / standing per-phrase cells; independent of the OODA arm — a phrase
+    /// boundary is a position in musical time, not a turn-firing decision.
+    pub phrase_due: Vec<ContextId>,
+}
+
+/// What one ticked beat crossed: the two cadence questions answered side by side.
+/// `process_one` computes both from the post-increment `beat_count` so the phrase
+/// boundary lands beside the OODA check at the single sequencer.
+#[derive(Debug, Default, Clone, Copy)]
+struct BeatTickReport {
+    /// Crossed an OODA cadence boundary AND OODA is armed — fire the `tick` verb.
+    ooda_due: bool,
+    /// Crossed a phrase boundary — report on `BeatOutcome.phrase_due`. NOT gated
+    /// on the OODA arm: a phrase boundary is a position in musical time.
+    phrase_due: bool,
 }
 
 /// The coalescing beat scheduler / transport. Holds the kernel (timelines +
@@ -84,6 +148,9 @@ pub struct BeatScheduler {
     dispatcher: Option<Arc<KjDispatcher>>,
     heap: BinaryHeap<Reverse<(Instant, ContextId)>>,
     armed: HashMap<ContextId, BeatState>,
+    /// The write-barrier derivation registry (ABC → MIDI). One per scheduler — the
+    /// derivers are stateless and shared across all armed contexts.
+    derivers: DeriverRegistry,
 }
 
 impl BeatScheduler {
@@ -94,6 +161,7 @@ impl BeatScheduler {
             dispatcher: None,
             heap: BinaryHeap::new(),
             armed: HashMap::new(),
+            derivers: DeriverRegistry::production(),
         }
     }
 
@@ -107,8 +175,36 @@ impl BeatScheduler {
     /// beat state, but don't start the clock (no heap entry until `play`). OODA
     /// starts armed. Idempotent — re-arming updates the policy, preserving the
     /// running state and playhead.
-    pub fn arm(&mut self, context_id: ContextId, policy: BeatPolicy) {
-        self.kernel.arm_timeline(context_id, policy.clock());
+    ///
+    /// The playhead is seeded from the document's max committed tick (design §4)
+    /// so musical time stays globally monotone per context across restarts even
+    /// when conversation inserts advanced the coordinate past the last beat
+    /// (chameleon.md:195-198). The seed lands only on a freshly-created timeline
+    /// inside `arm_timeline`'s `or_insert_with`, so a re-arm of a live timeline
+    /// never re-seeds. A failed `max_tick` scan is loud, not silent: we'd rather
+    /// hear it than seed a stale (zero) playhead and mis-place the first beat.
+    ///
+    /// CONSTRAINT (design §11.5): we seed the playhead tick but **deliberately do
+    /// NOT seed the fallback pool** from the persisted block log. The Timeline's
+    /// committed Vec — the `UseLastGood` candidate pool — is born empty here, so a
+    /// freshly (re)armed track resolves `UseLastGood` to Skip until its first good
+    /// phrase. Restart IS an empty track. Seeding the pool from the log would make
+    /// the first phrase after a restart a vamped repeat of a phrase the band has
+    /// no live memory of playing — a silent stale fallback, the exact failure mode
+    /// this project rejects (crash/silence over corruption). Warm-restart vamping,
+    /// if ever wanted, is an explicit opt-in feature (issues.md), never the default
+    /// that falls out of seeding a pool here.
+    pub fn arm(&mut self, context_id: ContextId, policy: BeatPolicy, track: TrackId) {
+        let seed = match self.documents.max_tick(context_id) {
+            Ok(t) => t.unwrap_or(kaijutsu_types::Tick::ZERO),
+            Err(e) => {
+                log::error!(
+                    "beat: max_tick failed for context {context_id}: {e}; seeding playhead to zero"
+                );
+                kaijutsu_types::Tick::ZERO
+            }
+        };
+        self.kernel.arm_timeline(context_id, policy.clock(), seed);
         self.armed
             .entry(context_id)
             .and_modify(|s| s.policy = policy)
@@ -116,8 +212,11 @@ impl BeatScheduler {
                 policy,
                 playing: false,
                 ooda_armed: true,
-                high_water: 0,
+                cursor: MaterializeCursor::default(),
                 beat_count: 0,
+                track,
+                materialize_failures: 0,
+                failure_water: 0,
             });
     }
 
@@ -196,24 +295,27 @@ impl BeatScheduler {
             if !playing {
                 continue; // paused/stopped → drop the stale entry (no re-arm)
             }
-            let ooda_due = self.process_one(ctx);
+            let report = self.process_one(ctx);
             self.heap.push(Reverse((now + period, ctx)));
             outcome.fired.push(ctx);
-            if ooda_due {
+            if report.ooda_due {
                 outcome.ooda_due.push(ctx);
+            }
+            if report.phrase_due {
+                outcome.phrase_due.push(ctx);
             }
         }
         outcome
     }
 
     /// Advance one context by one beat (event-counted), flush whatever committed,
-    /// count the beat, and report whether it crossed an OODA cadence boundary.
-    /// Called only for a playing context.
-    fn process_one(&mut self, ctx: ContextId) -> bool {
+    /// count the beat, and report whether it crossed an OODA cadence and/or a
+    /// phrase boundary. Called only for a playing context.
+    fn process_one(&mut self, ctx: ContextId) -> BeatTickReport {
         let Some(timeline) = self.kernel.timeline(ctx) else {
             // Armed in the scheduler but no timeline in the kernel — shouldn't
             // happen (arming pairs the two), but never panic the driver.
-            return false;
+            return BeatTickReport::default();
         };
         // The beat tick: advance the playhead by one step. Lock held only for the
         // advance; the bridge re-locks internally. No `.await` under the lock.
@@ -224,21 +326,231 @@ impl BeatScheduler {
         }
 
         let cas = self.kernel.cas().clone();
-        let mut high_water = self.armed.get(&ctx).map(|s| s.high_water).unwrap_or(0);
-        match materialize_committed(&timeline, &cas, &self.documents, ctx, &mut high_water) {
+        // Take the cursor out so the &mut borrow of `s.cursor` doesn't collide with
+        // the shared &self.derivers read. Whole-cell progress = `high_water`
+        // advanced; the per-artifact `artifacts_done` makes a mid-group retry
+        // resumable but is NOT counted as poison-clearing progress on its own (a
+        // cell that always fails on the SAME sibling must still trip the budget).
+        let Some(mut cursor) = self.armed.get(&ctx).map(|s| s.cursor) else {
+            return BeatTickReport::default();
+        };
+        let hw_before = cursor.high_water;
+        let result = materialize_committed(
+            &timeline,
+            &cas,
+            &self.documents,
+            ctx,
+            &mut cursor,
+            &self.derivers,
+        );
+        // Set when the SAME cell exhausts MATERIALIZE_RETRY_BUDGET and is skipped:
+        // (skipped high_water index, last error string). Surfaced as ONE Error
+        // block after the borrow of `s` ends — deduped by construction (the skip
+        // happens exactly once per poison cell, when the budget trips).
+        let mut poison_skipped: Option<(usize, String)> = None;
+        match result {
             Ok(_) => {
                 if let Some(s) = self.armed.get_mut(&ctx) {
-                    s.high_water = high_water;
+                    s.cursor = cursor;
+                    s.materialize_failures = 0; // a clean beat clears the poison count
                 }
             }
-            Err(e) => log::warn!("beat: materialize failed for context {ctx}: {e}"),
+            Err(e) => {
+                // The materialize bridge errored. `materialize_committed` advances
+                // `high_water` per crossed cell, so any whole-cell progress means the
+                // poison is a *fresh* cell at the new high_water — persist the
+                // progress and reset the failure count. Zero whole-cell progress means
+                // the SAME cell failed again (possibly after partial-artifact progress
+                // captured in `artifacts_done`): escalate loudly and, once the retry
+                // budget is spent, skip the poison cell so the beat loop never silently
+                // retries forever. (Pre-F1 this was a swallowed `log::warn` with no
+                // loop bound — the §7 poison-cell debt; worse with multiple tracks.)
+                if let Some(s) = self.armed.get_mut(&ctx) {
+                    if cursor.high_water > hw_before {
+                        s.cursor = cursor;
+                        s.materialize_failures = 0;
+                        log::error!(
+                            "beat: materialize failed for context {ctx} after crossing \
+                             {} cell(s) this beat; will retry the next cell: {e}",
+                            cursor.high_water - hw_before
+                        );
+                    } else {
+                        // Persist the partial-artifact resume point even on failure so
+                        // a transient fault clears with a resume, not a re-insert.
+                        s.cursor = cursor;
+                        s.materialize_failures += 1;
+                        let failures = s.materialize_failures;
+                        log::error!(
+                            "beat: materialize failed for context {ctx} on cell at \
+                             high_water={} (consecutive failure #{failures} \
+                             on the same cell): {e}",
+                            cursor.high_water
+                        );
+                        if poison_action(failures) == PoisonAction::SkipPoison {
+                            // Bounded give-up: advance past the poison cell so the
+                            // loop terminates. Reset the per-artifact resume point —
+                            // we are abandoning this cell, not resuming it. The
+                            // operator has already seen MATERIALIZE_RETRY_BUDGET loud
+                            // errors for it.
+                            s.cursor.high_water += 1;
+                            s.cursor.artifacts_done = 0;
+                            s.materialize_failures = 0;
+                            log::error!(
+                                "beat: skipping poison cell at high_water={} \
+                                 for context {ctx} after {MATERIALIZE_RETRY_BUDGET} \
+                                 failed attempts — cell will NOT be materialized",
+                                cursor.high_water
+                            );
+                            // Surface the skip as a visible Error block (closes the
+                            // issues.md poison-cell "remaining" clause): a silently
+                            // dropped phrase is invisible to the player after the
+                            // logs scroll. The skip happens once, so this dedupes
+                            // naturally — no per-beat spam.
+                            poison_skipped = Some((cursor.high_water, e.to_string()));
+                        }
+                    }
+                } else {
+                    log::error!("beat: materialize failed for un-armed context {ctx}: {e}");
+                }
+            }
         }
 
+        // The borrow of `s` has ended — surface the poison-skip as a visible Error
+        // block now (the document insert does not touch `self.armed`). Anchored at
+        // the document tail like the resolve-failure drain (the poison cell never
+        // committed a block to parent to). Insert failure is loud, never swallowed.
+        if let Some((skipped_hw, err)) = poison_skipped {
+            let payload = kaijutsu_types::ErrorPayload {
+                category: kaijutsu_types::ErrorCategory::Kernel,
+                severity: kaijutsu_types::ErrorSeverity::Error,
+                code: None,
+                detail: Some(format!(
+                    "a committed phrase could not be materialized after \
+                     {MATERIALIZE_RETRY_BUDGET} attempts and was skipped: {err}"
+                )),
+                span: None,
+                source_kind: None,
+            };
+            let summary = payload.summary_line();
+            match self.documents.last_block_id(ctx) {
+                Some(anchor) => {
+                    if let Err(e) = self.documents.insert_error_block_as(
+                        ctx,
+                        &anchor,
+                        &payload,
+                        summary,
+                        Some(PrincipalId::beat()),
+                    ) {
+                        log::error!(
+                            "beat: failed to surface poison-skip Error block for {ctx} \
+                             (skipped cell at high_water={skipped_hw}): {e}"
+                        );
+                    }
+                }
+                None => log::error!(
+                    "beat: poison-skip for {ctx} at high_water={skipped_hw} found no anchor block"
+                ),
+            }
+        }
+
+        // Drain the engine failure ledger into visible Error blocks (§6, §8): a
+        // resolve that erred (CAS read miss, validator reject) recorded a
+        // FailureEvent and dropped its cell (a hole, never a fake). Surface each so
+        // the player reads its own failure next turn — the producer-loop principle.
+        self.drain_failures(ctx, &timeline);
+
         let Some(s) = self.armed.get_mut(&ctx) else {
-            return false;
+            return BeatTickReport::default();
         };
         s.beat_count += 1;
-        s.ooda_armed && s.policy.ooda_every > 0 && s.beat_count % s.policy.ooda_every == 0
+        // Both cadence questions answered side by side from the post-increment
+        // beat_count. OODA is gated on the arm (it drives token spend); the phrase
+        // boundary is not (it is a position in musical time, observed regardless).
+        BeatTickReport {
+            ooda_due: s.ooda_armed
+                && s.policy.ooda_every > 0
+                && s.beat_count % s.policy.ooda_every == 0,
+            phrase_due: s.policy.is_phrase_boundary(s.beat_count),
+        }
+    }
+
+    /// Drain the engine failure ledger past `failure_water`, surfacing exactly one
+    /// `BlockKind::Error` block per new `FailureEvent` (design §6, §8). The ledger
+    /// is the data source for the "ABC parse-failure rate" eval ruler AND the
+    /// player's own feedback channel: an erring resolve (CAS read miss, validator
+    /// reject) drops its cell silently in the engine, so the ONLY way the player
+    /// learns of the miss is this surfacing. `failure_water` is monotone, so a
+    /// persistent ledger never re-surfaces a drained event on later beats.
+    ///
+    /// Error blocks anchor at the document tail (the failure carries musical ticks,
+    /// not a source block id — the cell that would have been its anchor never
+    /// committed). A missing anchor or insert failure is loud, never a swallow.
+    fn drain_failures(&mut self, ctx: ContextId, timeline: &kaijutsu_kernel::hyoushigi::SharedTimeline) {
+        // Snapshot the new events under the lock, then release it before touching
+        // the block store (no nested lock; no `.await` was ever here anyway).
+        let new_events: Vec<(kaijutsu_types::Tick, kaijutsu_types::Tick, String, String)> = {
+            let g = timeline.lock();
+            let failures = g.failures();
+            let Some(st) = self.armed.get(&ctx) else {
+                return;
+            };
+            if failures.len() <= st.failure_water {
+                return; // nothing new since the last drain
+            }
+            failures[st.failure_water..]
+                .iter()
+                .map(|ev| {
+                    (ev.at, ev.start, ev.resolver.as_str().to_string(), ev.error.clone())
+                })
+                .collect()
+        };
+
+        for (at, start, resolver, error) in &new_events {
+            let payload = kaijutsu_types::ErrorPayload {
+                category: kaijutsu_types::ErrorCategory::Parse,
+                severity: kaijutsu_types::ErrorSeverity::Error,
+                code: None,
+                detail: Some(format!(
+                    "a scheduled phrase failed to resolve at beat {} (resolver {resolver}): {error}",
+                    start.get()
+                )),
+                span: None,
+                source_kind: None,
+            };
+            let summary = payload.summary_line();
+            // Anchor at the current document tail. A composer context always has at
+            // least its rc/stance blocks, so a tail is expected; its absence is a
+            // structural anomaly we surface loudly rather than silently skip.
+            let Some(anchor) = self.documents.last_block_id(ctx) else {
+                log::error!(
+                    "beat: failure ledger drain for {ctx} found no anchor block for the \
+                     resolve failure at beat {} (resolver {resolver}): {error}",
+                    start.get()
+                );
+                continue;
+            };
+            if let Err(e) = self.documents.insert_error_block_as(
+                ctx,
+                &anchor,
+                &payload,
+                summary,
+                Some(PrincipalId::beat()),
+            ) {
+                log::error!(
+                    "beat: failed to surface resolve-failure Error block for {ctx} \
+                     (failure at playhead {}, start {}): {e}",
+                    at.get(),
+                    start.get()
+                );
+            }
+        }
+
+        // Advance the water past every event observed this beat — even any whose
+        // Error-block insert errored above (already logged loudly). Re-surfacing a
+        // drained event next beat would spam; the ledger length is the cursor.
+        if let Some(st) = self.armed.get_mut(&ctx) {
+            st.failure_water += new_events.len();
+        }
     }
 
     /// Fire the `tick` rc verb for `ctx` — the OODA hook (`kj drive`). Spawned
@@ -268,26 +580,101 @@ impl BeatScheduler {
     }
 
     /// The OODA **Act** handoff: a composer's turn just completed (it wrote ABC),
-    /// so crystallize that ABC onto the timeline. Reads the model's last block as
-    /// the ABC and schedules an `abc_to_midi` cell a bar ahead. Only for an armed,
-    /// OODA-armed context; a non-composer (un-armed) turn is ignored.
-    fn on_turn_completed(&self, ctx: ContextId) {
-        match self.armed.get(&ctx) {
-            Some(st) if st.ooda_armed => {}
+    /// so crystallize **that turn's output block** onto the timeline one phrase
+    /// ahead. The output block id is carried on `TurnFlow::Completed` (F2 §7) —
+    /// the old blind last-block read raced the model (it could read the seed
+    /// prompt, published at spawn) and is gone. Only for an armed, OODA-armed
+    /// context; a non-composer (un-armed) turn is ignored.
+    ///
+    /// `output_block_id`:
+    ///   - `None` → the turn produced no text; nothing to crystallize.
+    ///   - `Some(id)` → fetch exactly that block and run three defense-in-depth
+    ///     guards before scheduling, because the loop can die three ways and each
+    ///     would be a silent feedback loop (the bridge's own output looping back
+    ///     through the Act):
+    ///       1. ephemeral or excluded — system-managed / user-curated, never a
+    ///          player Act. A materialized score block is ephemeral, so this is
+    ///          the structural shield against re-crystallizing our own output.
+    ///       2. track-bearing (`track.is_some()`) — came off the timeline.
+    ///       3. beat()-authored — a legacy transport block.
+    ///     A carried id that trips any guard is a BUG (the publish site should
+    ///     only ever carry a real player Model block), so each is a loud
+    ///     `log::error!`, refused, never silently skipped.
+    fn on_turn_completed(&self, ctx: ContextId, output_block_id: Option<BlockId>) {
+        let (track, lead) = match self.armed.get(&ctx) {
+            // Schedule one phrase of lead ahead of the playhead (design §10): the
+            // fast write-barrier derive has ample room. Replaces the old fixed
+            // 4-beat OODA_LEAD const, which assumed bars; lead now tracks the
+            // policy's phrase length.
+            Some(st) if st.ooda_armed => (st.track.clone(), st.policy.phrase_delta()),
             _ => return, // not an OODA-armed composer we manage
-        }
-        let Some(block_id) = self.documents.last_block_id(ctx) else {
+        };
+        // No output block → the turn produced no text; nothing to crystallize.
+        let Some(block_id) = output_block_id else {
             return;
         };
-        let abc = match self.documents.get_block_snapshot(ctx, &block_id) {
-            Ok(Some(b)) => b.content,
+        let b = match self.documents.get_block_snapshot(ctx, &block_id) {
+            Ok(Some(b)) => b,
+            // A carried id we can't fetch is anomalous but not corruption (the
+            // block may have been evicted); don't crash the driver.
             _ => return,
         };
+        // Guard 1: ephemeral/excluded. A materialized score block rides the
+        // ephemeral flag, so this refuses the bridge's own output structurally.
+        if b.ephemeral || b.excluded {
+            log::error!(
+                "beat: on_turn_completed for {ctx} carried an ephemeral/excluded block \
+                 {block_id} (ephemeral={}, excluded={}) — refusing to re-crystallize \
+                 timeline output as a player Act",
+                b.ephemeral,
+                b.excluded
+            );
+            return;
+        }
+        // Guards 2+3: a track-bearing block came off the timeline; a beat()-
+        // authored block is a legacy transport row. Neither is a player Act.
+        if b.track.is_some() || b.id.principal_id == PrincipalId::beat() {
+            log::error!(
+                "beat: on_turn_completed for {ctx} carried a non-player block {block_id} \
+                 (track={:?}, author={}) — refusing to loop bridge output through the Act",
+                b.track,
+                b.id.principal_id
+            );
+            return;
+        }
+        let abc = b.content;
         if abc.trim().is_empty() {
             return;
         }
-        if let Err(e) = schedule_abc_cell(&self.kernel, ctx, &abc, OODA_LEAD) {
+        // `played_by` is the principal whose turn produced the ABC — the block's
+        // own author (who PLAYED), which becomes the materialized cell's
+        // principal. `track` is the composer's lane.
+        let played_by = b.id.principal_id;
+        if let Err(e) = schedule_abc_cell(&self.kernel, ctx, &abc, lead, track, played_by) {
+            // A refused/failed schedule must be visible to the player, not just
+            // logged (design §7): surface a BlockKind::Error anchored at the
+            // turn's own output block so the player reads its own rejection next
+            // turn. The schedule-time ABC validator (§3) is the usual culprit —
+            // malformed ABC that slipped past the model.
             log::warn!("beat: failed to schedule abc→midi for context {ctx}: {e}");
+            let payload = kaijutsu_types::ErrorPayload {
+                category: kaijutsu_types::ErrorCategory::Stream,
+                severity: kaijutsu_types::ErrorSeverity::Error,
+                code: None,
+                detail: Some(format!("could not schedule your phrase onto the score: {e}")),
+                span: None,
+                source_kind: None,
+            };
+            let summary = payload.summary_line();
+            if let Err(insert_err) = self.documents.insert_error_block_as(
+                ctx,
+                &block_id,
+                &payload,
+                summary,
+                Some(played_by),
+            ) {
+                log::warn!("beat: failed to surface schedule-error block for {ctx}: {insert_err}");
+            }
         }
     }
 
@@ -303,7 +690,9 @@ impl BeatScheduler {
             tokio::select! {
                 biased;
                 msg = ingress.recv() => match msg {
-                    Some(BeatCommand::Arm { context_id, policy }) => self.arm(context_id, policy),
+                    Some(BeatCommand::Arm { context_id, policy, track }) => {
+                        self.arm(context_id, policy, track)
+                    }
                     Some(BeatCommand::Play(ctx)) => self.play(ctx, Instant::now()),
                     Some(BeatCommand::Pause(ctx)) => self.pause(ctx),
                     Some(BeatCommand::Stop(ctx)) => self.stop(ctx),
@@ -318,8 +707,8 @@ impl BeatScheduler {
                 },
                 msg = completed.recv(), if turn_bus_open => match msg {
                     Some(m) => {
-                        if let TurnFlow::Completed { context_id, .. } = m.payload {
-                            self.on_turn_completed(context_id);
+                        if let TurnFlow::Completed { context_id, output_block_id, .. } = m.payload {
+                            self.on_turn_completed(context_id, output_block_id);
                         }
                     }
                     None => turn_bus_open = false, // bus closed → stop polling this arm
@@ -393,10 +782,64 @@ mod tests {
     use kaijutsu_kernel::block_store::{BlockStore, DocumentKind, SharedBlockStore};
     use kaijutsu_kernel::flows::{FlowBus, SharedBlockFlowBus};
     use kaijutsu_kernel::hyoushigi::BeatPolicy;
-    use kaijutsu_types::{ContextId, PrincipalId};
+    use kaijutsu_types::{ContextId, PrincipalId, TrackId};
     use tokio::time::Instant;
 
     use super::BeatScheduler;
+    use super::{MATERIALIZE_RETRY_BUDGET, PoisonAction, poison_action};
+
+    /// The poison-cell retry budget: the bridge retries the SAME failing cell up to
+    /// the budget, then skips it (loudly) so a swallowed materialize error can never
+    /// become a silent infinite retry loop (design §7 / the F1 blocker fix). Pins
+    /// the boundary exactly.
+    #[test]
+    fn poison_action_retries_within_budget_then_skips() {
+        // The first `BUDGET - 1` consecutive failures stay in Retry (leave the
+        // poison cell in place, try again next beat).
+        for failures in 1..MATERIALIZE_RETRY_BUDGET {
+            assert_eq!(
+                poison_action(failures),
+                PoisonAction::Retry,
+                "failure #{failures} (< budget) must retry, not skip"
+            );
+        }
+        // At the budget — and beyond — the bridge gives up and skips the poison
+        // cell so the loop terminates.
+        assert_eq!(
+            poison_action(MATERIALIZE_RETRY_BUDGET),
+            PoisonAction::SkipPoison,
+            "the budget-th consecutive failure must skip the poison cell"
+        );
+        assert_eq!(
+            poison_action(MATERIALIZE_RETRY_BUDGET + 5),
+            PoisonAction::SkipPoison,
+            "past the budget stays SkipPoison"
+        );
+    }
+
+    /// A resolver that always errs — drives a cell into the engine failure ledger
+    /// (§6) so the scheduler-side drain (§8 / T21) can be exercised. Cost ZERO so
+    /// it resolves the instant the playhead reaches the cell's tick (like Marker),
+    /// keeping the beat-test window small.
+    struct AlwaysFails;
+    impl Resolver for AlwaysFails {
+        fn id(&self) -> ResolverId {
+            ResolverId::new("always_fails")
+        }
+        fn estimate_cost(&self, _p: &serde_json::Value, _c: &dyn ResolverCtx) -> Duration {
+            Duration::ZERO
+        }
+        fn compute_basis(&self, _p: &serde_json::Value, _c: &dyn ResolverCtx) -> ContextHash {
+            ContextHash::of(b"stable")
+        }
+        fn resolve(
+            &self,
+            _p: &serde_json::Value,
+            _c: &dyn ResolverCtx,
+        ) -> Result<Resolution, ResolveError> {
+            Err(ResolveError::Failed("CAS read failed: missing entry".to_string()))
+        }
+    }
 
     /// A beat marker: at tick T it emits `beat-T`. Distinct content per beat so
     /// ordering is observable. Stable basis → clean commit, no squashes.
@@ -421,7 +864,7 @@ mod tests {
     }
 
     fn marker_cell(tick: i64) -> Cell {
-        Cell::deferred(
+        Cell::deferred_on(
             Span::instant(Tick::new(tick)),
             Recipe {
                 resolver: ResolverId::new("marker"),
@@ -429,6 +872,8 @@ mod tests {
                 query: ContextQuery::default(),
                 fallback: Fallback::Skip,
             },
+            TrackId::solo(),
+            PrincipalId::beat(),
         )
     }
 
@@ -447,6 +892,7 @@ mod tests {
         let tl = kernel.arm_timeline(
             ctx,
             TickClock { ticks_per_sec: 1.0, safety_factor: 1.0, commit_margin: TickDelta::new(0) },
+            Tick::ZERO,
         );
         let mut g = tl.lock();
         g.register_resolver(Box::new(Marker));
@@ -455,9 +901,14 @@ mod tests {
         }
     }
 
-    /// A 1-second beat policy with a large OODA cadence (cadence won't fire).
+    /// A 1-second beat policy with a large OODA cadence and phrase length (neither
+    /// cadence nor phrase boundaries fire in the span of these tests).
     fn slow_policy() -> BeatPolicy {
-        BeatPolicy { period: Duration::from_secs(1), ooda_every: 1_000_000 }
+        BeatPolicy {
+            period: Duration::from_secs(1),
+            beats_per_phrase: 1_000_000,
+            ooda_every: 1_000_000,
+        }
     }
 
     fn contents(documents: &SharedBlockStore, ctx: ContextId) -> Vec<String> {
@@ -482,7 +933,7 @@ mod tests {
         let base = Instant::now();
 
         // Armed but not played: stopped → no heap entry, no blocks.
-        sched.arm(ctx, slow_policy());
+        sched.arm(ctx, slow_policy(), TrackId::solo());
         assert!(sched.next_wake().is_none(), "arm alone schedules nothing (stopped)");
         let out = sched.fire_due(base + Duration::from_secs(1));
         assert!(out.fired.is_empty());
@@ -516,7 +967,7 @@ mod tests {
 
         let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
         let base = Instant::now();
-        sched.arm(ctx, slow_policy());
+        sched.arm(ctx, slow_policy(), TrackId::solo());
         sched.play(ctx, base);
 
         sched.fire_due(base + Duration::from_secs(1)); // tick 1
@@ -551,7 +1002,7 @@ mod tests {
 
         let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
         let base = Instant::now();
-        sched.arm(a, slow_policy());
+        sched.arm(a, slow_policy(), TrackId::solo());
         sched.play(a, base);
 
         sched.fire_due(base + Duration::from_secs(1));
@@ -559,7 +1010,7 @@ mod tests {
         assert_eq!(contents(&documents, a).len(), 2);
         assert_eq!(contents(&documents, b).len(), 0, "b not playing yet");
 
-        sched.arm(b, slow_policy());
+        sched.arm(b, slow_policy(), TrackId::solo());
         sched.play(b, base + Duration::from_secs(2));
         sched.fire_due(base + Duration::from_secs(3)); // both due
         assert_eq!(contents(&documents, a).len(), 3);
@@ -576,11 +1027,20 @@ mod tests {
         kernel.arm_timeline(
             ctx,
             TickClock { ticks_per_sec: 1.0, safety_factor: 1.0, commit_margin: TickDelta::new(0) },
+            Tick::ZERO,
         );
 
         let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
         let base = Instant::now();
-        sched.arm(ctx, BeatPolicy { period: Duration::from_secs(1), ooda_every: 3 });
+        sched.arm(
+            ctx,
+            BeatPolicy {
+                period: Duration::from_secs(1),
+                beats_per_phrase: 1_000_000,
+                ooda_every: 3,
+            },
+            TrackId::solo(),
+        );
         sched.play(ctx, base);
 
         let mut ooda_beats = Vec::new();
@@ -604,38 +1064,108 @@ mod tests {
         assert!(after.is_empty(), "OODA disarmed → no cadence fires (beat 9 would have)");
     }
 
-    /// The OODA Act handoff: a completed turn's ABC (the last block) is scheduled
-    /// as an abc→midi cell and materializes into a MIDI block on the beat.
+    /// T3 (design-chameleon-batch1-f2-notation §16) — phrase boundaries are
+    /// reported on `BeatOutcome.phrase_due` every `beats_per_phrase` beats. With
+    /// `beats_per_phrase = 4`, beats 4, 8, 12 are phrase-due (and 1-3, 5-7, etc.
+    /// are not). This is the observable seam for cue traps / quantized flush /
+    /// standing per-phrase cells; unlike OODA, it is independent of the OODA arm.
     #[tokio::test]
-    async fn turn_completion_schedules_abc_and_midi_materializes() {
-        use kaijutsu_crdt::{BlockKind, ContentType, Role, Status};
-
+    async fn phrase_boundaries_reported_every_beats_per_phrase() {
         let (kernel, documents) = fresh_kernel_and_docs().await;
         let ctx = ContextId::new();
         documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
-        // Simulate the model turn's ABC output as the last block.
+        kernel.arm_timeline(
+            ctx,
+            TickClock { ticks_per_sec: 1.0, safety_factor: 1.0, commit_margin: TickDelta::new(0) },
+            Tick::ZERO,
+        );
+
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+        let base = Instant::now();
+        // beats_per_phrase = 4; large ooda so the OODA cadence never coincides.
+        sched.arm(
+            ctx,
+            BeatPolicy {
+                period: Duration::from_secs(1),
+                beats_per_phrase: 4,
+                ooda_every: 1_000_000,
+            },
+            TrackId::solo(),
+        );
+        sched.play(ctx, base);
+
+        let mut phrase_beats = Vec::new();
+        for i in 1..=12 {
+            let out = sched.fire_due(base + Duration::from_secs(i));
+            if !out.phrase_due.is_empty() {
+                assert_eq!(out.phrase_due, vec![ctx], "phrase_due names the context");
+                phrase_beats.push(i);
+            }
+        }
+        assert_eq!(
+            phrase_beats,
+            vec![4, 8, 12],
+            "phrase boundary every 4 beats"
+        );
+    }
+
+    /// Insert a player-authored Model/Text ABC block and return its id. The
+    /// shape the turn stream produces: `Role::Model`, no track, a real author.
+    fn insert_player_abc(
+        documents: &SharedBlockStore,
+        ctx: ContextId,
+        player: PrincipalId,
+        abc: &str,
+    ) -> kaijutsu_crdt::BlockId {
+        use kaijutsu_crdt::{BlockKind, ContentType, Role, Status};
         documents
             .insert_block_as(
                 ctx,
                 None,
-                None,
+                documents.last_block_id(ctx).as_ref(),
                 Role::Model,
                 BlockKind::Text,
-                "X:1\nT:Test\nM:4/4\nL:1/8\nK:C\nCDEFGABc|\n".to_string(),
+                abc.to_string(),
                 Status::Done,
                 ContentType::Plain,
-                Some(PrincipalId::new()),
+                Some(player),
             )
-            .unwrap();
+            .unwrap()
+    }
 
-        // arm_timeline registers the real abc_to_midi resolver onto the timeline.
+    /// T17 (design-chameleon-batch1-f2-notation §16) — a completed turn schedules
+    /// its ABC **one phrase ahead** of the playhead, and the ABC+MIDI pair
+    /// materializes on the beat. The lead is `phrase_delta()` (16 at the default,
+    /// here 4 so the test window can reach it), not the deleted fixed-4 OODA_LEAD.
+    /// The output block id is carried explicitly (§7) — no blind last-block read.
+    #[tokio::test]
+    async fn completed_turn_schedules_one_phrase_ahead() {
+        use kaijutsu_crdt::Role;
+
+        let (kernel, documents) = fresh_kernel_and_docs().await;
+        let ctx = ContextId::new();
+        documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+        let player = PrincipalId::new();
+        let abc_block =
+            insert_player_abc(&documents, ctx, player, "X:1\nT:Test\nM:4/4\nL:1/8\nK:C\nCDEFGABc|\n");
+
+        // beats_per_phrase = 4 so the scheduling lead (= phrase_delta() = 4) is
+        // reachable in this 8-beat window; large ooda so the cadence never fires.
+        let phrase = BeatPolicy {
+            period: Duration::from_secs(1),
+            beats_per_phrase: 4,
+            ooda_every: 1_000_000,
+        };
         let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
         let base = Instant::now();
-        sched.arm(ctx, slow_policy());
+        sched.arm(ctx, phrase, TrackId::solo());
         sched.play(ctx, base);
 
         sched.fire_due(base + Duration::from_secs(1)); // playhead → 1
-        sched.on_turn_completed(ctx); // schedules abc→midi at playhead + OODA_LEAD
+        // The cell is scheduled at playhead(1) + phrase_delta()(4) = tick 5. The
+        // one-phrase-ahead start is observable on the materialized block's tick
+        // (asserted below) — `phrase_delta()` (4 here) not the deleted 4-const.
+        sched.on_turn_completed(ctx, Some(abc_block));
 
         let asset_before = documents
             .block_snapshots(ctx)
@@ -645,16 +1175,708 @@ mod tests {
             .count();
         assert_eq!(asset_before, 0, "no MIDI block before the scheduled cell commits");
 
-        // Advance past the scheduled tick so the cell commits and materializes.
+        // Advance past tick 5 so the cell commits and materializes the pair.
         for i in 2..=8 {
             sched.fire_due(base + Duration::from_secs(i));
         }
 
         let snaps = documents.block_snapshots(ctx).unwrap();
-        let midi = snaps.iter().find(|b| b.role == Role::Asset);
-        assert!(midi.is_some(), "an abc→midi MIDI block should have materialized");
-        let midi = midi.unwrap();
-        assert_eq!(midi.content.len(), 32, "binary block content is the 32-hex CAS hash");
-        assert!(midi.tick.is_some(), "the MIDI block carries a beat tick");
+        // The ABC source materializes as a Model staff (ephemeral) and the MIDI
+        // sibling as an Asset hash — the F2 score↔render pair.
+        let midi = snaps
+            .iter()
+            .find(|b| b.role == Role::Asset)
+            .expect("the abc→midi MIDI sibling materialized");
+        assert_eq!(midi.content.len(), 32, "MIDI block content is the 32-hex CAS hash");
+        // The one-phrase-ahead lead is observable here: the cell committed at
+        // tick playhead(1) + phrase_delta()(4) = 5, and the materialized pair
+        // carries that beat coordinate.
+        assert_eq!(
+            midi.tick,
+            Some(Tick::new(5)),
+            "materialized at playhead + phrase_delta() (1 + 4), the one-phrase lead"
+        );
+        assert_eq!(
+            midi.track,
+            Some(TrackId::solo()),
+            "the materialized block carries the composer's lane"
+        );
+        assert_eq!(
+            midi.id.principal_id, player,
+            "the materialized block is authored by the player (played_by), not beat()"
+        );
+    }
+
+    /// T16 (design §16) — THE silent-feedback-loop pin. `on_turn_completed` must
+    /// schedule from the **carried output block id**, with defense-in-depth
+    /// guards so the bridge's own output can never loop back into the OODA Act:
+    ///   - `Completed { None }` → schedules nothing.
+    ///   - a carried id pointing at a materialized (track-bearing) or ephemeral
+    ///     or beat()-authored block → refused (loud), schedules nothing.
+    ///   - a real player Model block → scheduled.
+    #[tokio::test]
+    async fn materialized_abc_is_not_rescheduled_on_turn_completed() {
+        use kaijutsu_crdt::{BlockKind, ContentType, Role, Status};
+
+        let phrase = BeatPolicy {
+            period: Duration::from_secs(1),
+            beats_per_phrase: 4,
+            ooda_every: 1_000_000,
+        };
+
+        // Helper: count scheduled future cells.
+        fn future_len(kernel: &Kernel, ctx: ContextId) -> usize {
+            kernel.timeline(ctx).unwrap().lock().future_len()
+        }
+
+        // — Case None: Completed{None} schedules nothing —
+        {
+            let (kernel, documents) = fresh_kernel_and_docs().await;
+            let ctx = ContextId::new();
+            documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+            let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+            let base = Instant::now();
+            sched.arm(ctx, phrase, TrackId::solo());
+            sched.play(ctx, base);
+            sched.fire_due(base + Duration::from_secs(1));
+            sched.on_turn_completed(ctx, None);
+            assert_eq!(future_len(&kernel, ctx), 0, "None → nothing scheduled");
+        }
+
+        // — Case materialized: a track-bearing block is refused —
+        {
+            let (kernel, documents) = fresh_kernel_and_docs().await;
+            let ctx = ContextId::new();
+            documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+            preseed_markers(&kernel, ctx, 1);
+            let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+            let base = Instant::now();
+            sched.arm(ctx, phrase, TrackId::solo());
+            sched.play(ctx, base);
+            sched.fire_due(base + Duration::from_secs(1)); // marker materializes (track=Some)
+            let materialized = documents.last_block_id(ctx).unwrap();
+            assert!(
+                documents.get_block_snapshot(ctx, &materialized).unwrap().unwrap().track.is_some(),
+                "the marker carries a track"
+            );
+            let future_before = future_len(&kernel, ctx);
+            sched.on_turn_completed(ctx, Some(materialized));
+            assert_eq!(
+                future_len(&kernel, ctx),
+                future_before,
+                "a track-bearing block must not be re-scheduled (the feedback loop)"
+            );
+        }
+
+        // — Case beat()-authored: a legacy transport block is refused —
+        {
+            let (kernel, documents) = fresh_kernel_and_docs().await;
+            let ctx = ContextId::new();
+            documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+            let beat_block = documents
+                .insert_block_as(
+                    ctx,
+                    None,
+                    None,
+                    Role::Model,
+                    BlockKind::Text,
+                    "X:1\nK:C\nCDEF|\n".to_string(),
+                    Status::Done,
+                    ContentType::Plain,
+                    Some(PrincipalId::beat()),
+                )
+                .unwrap();
+            let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+            let base = Instant::now();
+            sched.arm(ctx, phrase, TrackId::solo());
+            sched.play(ctx, base);
+            sched.fire_due(base + Duration::from_secs(1));
+            let future_before = future_len(&kernel, ctx);
+            sched.on_turn_completed(ctx, Some(beat_block));
+            assert_eq!(
+                future_len(&kernel, ctx),
+                future_before,
+                "a beat()-authored block must not be re-scheduled"
+            );
+        }
+
+        // — Case ephemeral: a system-managed ephemeral block is refused —
+        {
+            let (kernel, documents) = fresh_kernel_and_docs().await;
+            let ctx = ContextId::new();
+            documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+            let player = PrincipalId::new();
+            let eph = documents
+                .insert_block_as(
+                    ctx,
+                    None,
+                    None,
+                    Role::Model,
+                    BlockKind::Text,
+                    "X:1\nK:C\nCDEF|\n".to_string(),
+                    Status::Done,
+                    ContentType::Plain,
+                    Some(player),
+                )
+                .unwrap();
+            documents.set_ephemeral(ctx, &eph, true).unwrap();
+            let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+            let base = Instant::now();
+            sched.arm(ctx, phrase, TrackId::solo());
+            sched.play(ctx, base);
+            sched.fire_due(base + Duration::from_secs(1));
+            let future_before = future_len(&kernel, ctx);
+            sched.on_turn_completed(ctx, Some(eph));
+            assert_eq!(
+                future_len(&kernel, ctx),
+                future_before,
+                "an ephemeral block must not be re-scheduled"
+            );
+        }
+
+        // — Case real player Model block: IS scheduled —
+        {
+            let (kernel, documents) = fresh_kernel_and_docs().await;
+            let ctx = ContextId::new();
+            documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+            let player = PrincipalId::new();
+            let abc = insert_player_abc(&documents, ctx, player, "X:1\nK:C\nCDEFGABc|\n");
+            let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+            let base = Instant::now();
+            sched.arm(ctx, phrase, TrackId::solo());
+            sched.play(ctx, base);
+            sched.fire_due(base + Duration::from_secs(1));
+            let future_before = future_len(&kernel, ctx);
+            sched.on_turn_completed(ctx, Some(abc));
+            assert_eq!(
+                future_len(&kernel, ctx),
+                future_before + 1,
+                "a genuine player Model block IS scheduled (one new cell)"
+            );
+        }
+    }
+
+    /// Design §7 — a schedule failure surfaces a visible `BlockKind::Error`, not
+    /// just a log line. Carry a player block whose ABC is malformed: the §3
+    /// schedule-time validator Errs, and `on_turn_completed` anchors an Error
+    /// block at the offending output block so the player reads its own rejection.
+    #[tokio::test]
+    async fn schedule_failure_surfaces_error_block() {
+        use kaijutsu_crdt::BlockKind;
+
+        let (kernel, documents) = fresh_kernel_and_docs().await;
+        let ctx = ContextId::new();
+        documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+        let player = PrincipalId::new();
+        // Not valid ABC — no X:/K: headers, just prose. validate_abc (Strict)
+        // rejects it, so schedule_abc_cell returns Err.
+        let bad = insert_player_abc(&documents, ctx, player, "this is not music at all");
+
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+        let base = Instant::now();
+        sched.arm(
+            ctx,
+            BeatPolicy { period: Duration::from_secs(1), beats_per_phrase: 4, ooda_every: 1_000_000 },
+            TrackId::solo(),
+        );
+        sched.play(ctx, base);
+        sched.fire_due(base + Duration::from_secs(1));
+
+        let errors_before = documents
+            .block_snapshots(ctx)
+            .unwrap()
+            .into_iter()
+            .filter(|b| b.kind == BlockKind::Error)
+            .count();
+        sched.on_turn_completed(ctx, Some(bad));
+        let errors_after: Vec<_> = documents
+            .block_snapshots(ctx)
+            .unwrap()
+            .into_iter()
+            .filter(|b| b.kind == BlockKind::Error)
+            .collect();
+        assert_eq!(
+            errors_after.len(),
+            errors_before + 1,
+            "a failed schedule must surface exactly one visible Error block"
+        );
+        // The Error is anchored at (a child of) the offending output block.
+        assert_eq!(
+            errors_after.last().unwrap().parent_id,
+            Some(bad),
+            "the schedule-error block points back at the player's output block"
+        );
+    }
+
+    /// T20 (design §8 Phase 6) — arming seeds the playhead from the document's
+    /// max committed tick, so musical time stays globally monotone per context
+    /// across restarts. Pre-existing blocks carry ticks to T; arming positions
+    /// the playhead at T; the first beat advances to T+1. Re-arming a LIVE
+    /// timeline must NOT re-seed (seed lands inside `or_insert_with`, virgin-only).
+    #[tokio::test]
+    async fn arm_seeds_playhead_from_max_committed_tick() {
+        use kaijutsu_crdt::{BlockId, BlockKind, BlockSnapshotBuilder};
+
+        let (kernel, documents) = fresh_kernel_and_docs().await;
+        let ctx = ContextId::new();
+        documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+
+        // Pre-insert blocks carrying ticks up to T = 7 (the persisted musical
+        // high-water: what a restart would load before re-arm).
+        let player = PrincipalId::new();
+        let big_t = 7i64;
+        for t in [0i64, 3, big_t, 1] {
+            let seq = documents.reserve_block_id(ctx, player).unwrap().seq;
+            let snap = BlockSnapshotBuilder::new(
+                BlockId::new(ctx, player, seq),
+                BlockKind::Text,
+            )
+            .tick(Tick::new(t))
+            .order_key(format!("V{:0>11}AAAA", t))
+            .content("c")
+            .build();
+            documents.insert_from_snapshot_as(ctx, snap, None, Some(player)).unwrap();
+        }
+        assert_eq!(documents.max_tick(ctx).unwrap(), Some(Tick::new(big_t)));
+
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+
+        // Arm: the playhead seeds to the max committed tick, not Tick::ZERO.
+        sched.arm(ctx, slow_policy(), TrackId::solo());
+        let playhead_after_arm = kernel.timeline(ctx).unwrap().lock().playhead();
+        assert_eq!(
+            playhead_after_arm,
+            Tick::new(big_t),
+            "arm seeds the playhead from max_tick (musical time stays monotone)"
+        );
+
+        // First beat advances from the seeded position: T → T+1.
+        let base = Instant::now();
+        sched.play(ctx, base);
+        sched.fire_due(base + Duration::from_secs(1));
+        let playhead_after_beat = kernel.timeline(ctx).unwrap().lock().playhead();
+        assert_eq!(
+            playhead_after_beat,
+            Tick::new(big_t + 1),
+            "the first beat advances from the seeded playhead, not from zero"
+        );
+
+        // Re-arm of the now-LIVE timeline must NOT re-seed or rewind: the
+        // playhead stays where the beat left it (seed_playhead is virgin-only,
+        // applied inside or_insert_with which never fires on a re-arm).
+        sched.arm(ctx, slow_policy(), TrackId::solo());
+        let playhead_after_rearm = kernel.timeline(ctx).unwrap().lock().playhead();
+        assert_eq!(
+            playhead_after_rearm,
+            Tick::new(big_t + 1),
+            "re-arm of a live timeline never re-seeds (or_insert_with is a no-op)"
+        );
+    }
+
+    /// Pre-insert `count` beat()-authored blocks at seqs `0..count` carrying ticks
+    /// `0..count`, as a restart would load before re-arm. Returns the seqs used.
+    /// The materialize barrier must mint PAST these on the same beat() lane.
+    fn preseed_beat_blocks(
+        documents: &SharedBlockStore,
+        ctx: ContextId,
+        count: u64,
+    ) -> Vec<u64> {
+        use kaijutsu_crdt::{BlockId, BlockKind, BlockSnapshotBuilder};
+        let mut seqs = Vec::new();
+        for i in 0..count {
+            let seq = documents.reserve_block_id(ctx, PrincipalId::beat()).unwrap().seq;
+            let snap = BlockSnapshotBuilder::new(
+                BlockId::new(ctx, PrincipalId::beat(), seq),
+                BlockKind::Text,
+            )
+            .tick(Tick::new(i as i64))
+            .order_key(format!("V{:0>11}AAAA", i))
+            .content(format!("persisted-beat-{i}"))
+            .build();
+            documents.insert_from_snapshot_as(ctx, snap, None, Some(PrincipalId::beat())).unwrap();
+            seqs.push(seq);
+        }
+        seqs
+    }
+
+    /// T18 (design-chameleon-batch1-f2-notation §16, §11.1) — the post-restart
+    /// seq-lane regression, end-to-end through the scheduler. A restart loads
+    /// persisted beat()-authored blocks at seqs 0..=2 but evaporates the
+    /// MaterializeCursor (it counts this-process materialization only; the durable
+    /// cursor is the block-log seq lane). A FRESH scheduler then arms, plays, and
+    /// commits a beat cell. Materialization must mint the new block PAST the
+    /// persisted seqs (≥ 3) off the beat() lane — never re-mint seq 0 →
+    /// `DuplicateBlock` → the known silent poison-retry loop. The lane seed is
+    /// `observe_seq` on the snapshot inserts (F1's structural fix); this pins it
+    /// holds through the real materialize barrier, not just at the store level.
+    #[tokio::test]
+    async fn track_lane_seq_seeds_from_block_log_no_duplicate_after_rearm() {
+        use kaijutsu_crdt::BlockKind;
+
+        let (kernel, documents) = fresh_kernel_and_docs().await;
+        let ctx = ContextId::new();
+        documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+
+        // Persisted beat() blocks at seqs 0,1,2 (a restart's loaded history).
+        let seeded = preseed_beat_blocks(&documents, ctx, 3);
+        assert_eq!(seeded, vec![0, 1, 2], "preseeded the beat() lane 0..=2");
+
+        // A FRESH scheduler (cursor born at high_water=0) arms and materializes a
+        // marker cell — which plays under beat(), the same lane as the persisted
+        // blocks. preseed_markers wins (arm is idempotent) and seeds the timeline.
+        preseed_markers(&kernel, ctx, 1);
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+        let base = Instant::now();
+        sched.arm(ctx, slow_policy(), TrackId::solo());
+        sched.play(ctx, base);
+        sched.fire_due(base + Duration::from_secs(1));
+
+        // No Error block: a DuplicateBlock collision would surface (or wedge) here.
+        let snaps = documents.block_snapshots(ctx).unwrap();
+        let errors = snaps.iter().filter(|b| b.kind == BlockKind::Error).count();
+        assert_eq!(errors, 0, "materialization after re-arm must not error (no DuplicateBlock)");
+
+        // The materialized marker landed on the beat() lane PAST the persisted
+        // seqs — never re-minting seq 0/1/2.
+        let materialized = snaps
+            .iter()
+            .find(|b| b.content == "beat-1")
+            .expect("the marker cell materialized");
+        assert_eq!(
+            materialized.id.principal_id,
+            PrincipalId::beat(),
+            "the transport marker is authored by beat()"
+        );
+        assert!(
+            materialized.id.seq >= 3,
+            "the post-restart materialize must mint past the persisted beat() seqs (0..=2), \
+             got seq {} — a seq ≤ 2 is the DuplicateBlock collision",
+            materialized.id.seq,
+        );
+    }
+
+    /// Pre-arm a context's timeline with `count` always-failing cells at ticks
+    /// `1..=count`. Each will record a `FailureEvent` in the engine ledger when the
+    /// playhead reaches its tick — the data source the scheduler drains into Error
+    /// blocks (§6, §8).
+    fn preseed_failing_cells(kernel: &Kernel, ctx: ContextId, count: i64) {
+        let tl = kernel.arm_timeline(
+            ctx,
+            TickClock { ticks_per_sec: 1.0, safety_factor: 1.0, commit_margin: TickDelta::new(0) },
+            Tick::ZERO,
+        );
+        let mut g = tl.lock();
+        g.register_resolver(Box::new(AlwaysFails));
+        for t in 1..=count {
+            g.schedule(Cell::deferred_on(
+                Span::instant(Tick::new(t)),
+                Recipe {
+                    resolver: ResolverId::new("always_fails"),
+                    params: serde_json::Value::Null,
+                    query: ContextQuery::default(),
+                    fallback: Fallback::Skip,
+                },
+                TrackId::solo(),
+                PrincipalId::beat(),
+            ))
+            .unwrap();
+        }
+    }
+
+    /// T21 (design-chameleon-batch1-f2-notation §16, §6, §8) — a resolve failure
+    /// surfaces a visible `BlockKind::Error` block. The engine records a
+    /// `FailureEvent` per erring resolve; the scheduler drains the ledger past a
+    /// `failure_water` cursor each `process_one`, inserting exactly ONE Error block
+    /// per event — so the player reads its own failure next turn (the producer-loop
+    /// principle), and never a duplicate on later beats. Two failing cells →
+    /// exactly two Error blocks across the run; advancing further adds none.
+    #[tokio::test]
+    async fn resolve_failure_surfaces_error_block() {
+        use kaijutsu_crdt::BlockKind;
+
+        let (kernel, documents) = fresh_kernel_and_docs().await;
+        let ctx = ContextId::new();
+        documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+        // An anchor block so the Error blocks (which parent to the document tail)
+        // have something to attach to.
+        let player = PrincipalId::new();
+        insert_player_abc(&documents, ctx, player, "X:1\nK:C\nCDEF|\n");
+
+        // Two cells that will fail at ticks 1 and 2.
+        preseed_failing_cells(&kernel, ctx, 2);
+
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+        let base = Instant::now();
+        sched.arm(ctx, slow_policy(), TrackId::solo());
+        sched.play(ctx, base);
+
+        let errors = |documents: &SharedBlockStore| -> Vec<String> {
+            documents
+                .block_snapshots(ctx)
+                .unwrap()
+                .into_iter()
+                .filter(|b| b.kind == BlockKind::Error)
+                .map(|b| b.content)
+                .collect()
+        };
+
+        // Beat 1: the tick-1 cell fails → one Error block drained.
+        sched.fire_due(base + Duration::from_secs(1));
+        assert_eq!(errors(&documents).len(), 1, "first failure surfaces one Error block");
+
+        // Beat 2: the tick-2 cell fails → a second, distinct Error block.
+        sched.fire_due(base + Duration::from_secs(2));
+        assert_eq!(errors(&documents).len(), 2, "second failure surfaces a second Error block");
+
+        // Later beats with no new failures must NOT re-drain old events: the
+        // failure_water cursor is monotone, so no duplicates.
+        for i in 3..=6 {
+            sched.fire_due(base + Duration::from_secs(i));
+        }
+        assert_eq!(
+            errors(&documents).len(),
+            2,
+            "failure_water advances past drained events — no duplicate Error blocks"
+        );
+    }
+
+    /// A resolver that COMMITS garbage bytes under the ABC mime — bypassing the
+    /// cas_commit validator — so the cell commits clean but its derivation at the
+    /// write barrier fails every beat (unparseable ABC violates the first-commit
+    /// invariant, §5c). The persistent materialize wedge the poison budget bounds.
+    struct GarbageAbc;
+    impl Resolver for GarbageAbc {
+        fn id(&self) -> ResolverId {
+            ResolverId::new("garbage_abc")
+        }
+        fn estimate_cost(&self, _p: &serde_json::Value, _c: &dyn ResolverCtx) -> Duration {
+            Duration::ZERO
+        }
+        fn compute_basis(&self, _p: &serde_json::Value, _c: &dyn ResolverCtx) -> ContextHash {
+            ContextHash::of(b"stable")
+        }
+        fn resolve(
+            &self,
+            _p: &serde_json::Value,
+            _c: &dyn ResolverCtx,
+        ) -> Result<Resolution, ResolveError> {
+            Ok(Resolution::new(b"this is not abc {{{ ][".to_vec(), "text/vnd.abc"))
+        }
+    }
+
+    /// Design §6 / issues.md poison-cell entry (remaining clause) — when a poison
+    /// cell exhausts `MATERIALIZE_RETRY_BUDGET`, the bounded skip must surface a
+    /// visible `BlockKind::Error` block, not just drop the cell silently from the
+    /// operator's view after the error logs. A committed-but-underivable ABC cell
+    /// wedges materialization every beat; once the budget is spent the scheduler
+    /// skips it AND emits exactly one Error block (deduped — the skip happens once).
+    #[tokio::test]
+    async fn poison_cell_skip_surfaces_error_block() {
+        use kaijutsu_crdt::BlockKind;
+
+        let (kernel, documents) = fresh_kernel_and_docs().await;
+        let ctx = ContextId::new();
+        documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+        // Anchor block for the Error block (parents to the document tail).
+        let player = PrincipalId::new();
+        insert_player_abc(&documents, ctx, player, "X:1\nK:C\nCDEF|\n");
+
+        // One cell at tick 1 that COMMITS clean but can never DERIVE (garbage ABC).
+        let tl = kernel.arm_timeline(
+            ctx,
+            TickClock { ticks_per_sec: 1.0, safety_factor: 1.0, commit_margin: TickDelta::new(0) },
+            Tick::ZERO,
+        );
+        {
+            let mut g = tl.lock();
+            g.register_resolver(Box::new(GarbageAbc));
+            g.schedule(Cell::deferred_on(
+                Span::instant(Tick::new(1)),
+                Recipe {
+                    resolver: ResolverId::new("garbage_abc"),
+                    params: serde_json::Value::Null,
+                    query: ContextQuery::default(),
+                    fallback: Fallback::Skip,
+                },
+                TrackId::solo(),
+                PrincipalId::beat(),
+            ))
+            .unwrap();
+        }
+
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+        let base = Instant::now();
+        sched.arm(ctx, slow_policy(), TrackId::solo());
+        sched.play(ctx, base);
+
+        let errors = |documents: &SharedBlockStore| -> usize {
+            documents
+                .block_snapshots(ctx)
+                .unwrap()
+                .into_iter()
+                .filter(|b| b.kind == BlockKind::Error)
+                .count()
+        };
+
+        // Beats 1..MATERIALIZE_RETRY_BUDGET wedge: the cell commits at tick 1 and
+        // fails to derive every beat (Retry, no Error block yet).
+        for i in 1..MATERIALIZE_RETRY_BUDGET as u64 {
+            sched.fire_due(base + Duration::from_secs(i));
+            assert_eq!(
+                errors(&documents),
+                0,
+                "no poison Error block while still within the retry budget (beat {i})"
+            );
+        }
+
+        // The budget-th failure trips SkipPoison → exactly one Error block.
+        sched.fire_due(base + Duration::from_secs(MATERIALIZE_RETRY_BUDGET as u64));
+        assert_eq!(
+            errors(&documents),
+            1,
+            "budget exhaustion surfaces exactly one poison-skip Error block"
+        );
+
+        // The cell was skipped (high_water advanced past it): later beats add no
+        // duplicate poison Error block.
+        for i in (MATERIALIZE_RETRY_BUDGET as u64 + 1)..(MATERIALIZE_RETRY_BUDGET as u64 + 5) {
+            sched.fire_due(base + Duration::from_secs(i));
+        }
+        assert_eq!(
+            errors(&documents),
+            1,
+            "the skipped poison cell surfaces ONE Error block, not one per later beat"
+        );
+    }
+
+    /// T19 (design §8 Phase 5) — the feedback-loop guard. `on_turn_completed`
+    /// must NOT re-schedule a block that came off the timeline (`track.is_some()`)
+    /// or a legacy transport block (author == beat()) — that would loop the
+    /// bridge's own output back through the OODA Act. A genuine player-ABC block
+    /// (no track, real author) IS scheduled, with that author as `played_by` and
+    /// the composer's lane as `track`.
+    #[tokio::test]
+    async fn on_turn_completed_skips_materialized_blocks() {
+        use kaijutsu_crdt::{BlockKind, ContentType, Role, Status};
+
+        // — Case A: last block already carries a track (came off the timeline) —
+        let (kernel, documents) = fresh_kernel_and_docs().await;
+        let ctx = ContextId::new();
+        documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+        // Materialize one cell so the last block carries track=Some (the shim
+        // cell plays under beat() on the solo() lane).
+        preseed_markers(&kernel, ctx, 1);
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+        let base = Instant::now();
+        sched.arm(ctx, slow_policy(), TrackId::solo());
+        sched.play(ctx, base);
+        sched.fire_due(base + Duration::from_secs(1)); // marker materializes (track=Some)
+        let last = documents
+            .get_block_snapshot(ctx, &documents.last_block_id(ctx).unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(last.track.is_some(), "the materialized marker carries a track");
+
+        // on_turn_completed carrying the track-bearing block's own id schedules
+        // NOTHING — no new Asset (MIDI) block ever appears, even after a lead.
+        // (The carried id is the materialized marker; the guard refuses it.)
+        sched.on_turn_completed(ctx, documents.last_block_id(ctx));
+        for i in 2..=8 {
+            sched.fire_due(base + Duration::from_secs(i));
+        }
+        let assets = documents
+            .block_snapshots(ctx)
+            .unwrap()
+            .into_iter()
+            .filter(|b| b.role == Role::Asset)
+            .count();
+        assert_eq!(
+            assets, 0,
+            "a track-bearing block must not be re-scheduled as ABC (no abc→midi asset)"
+        );
+
+        // — Case B: last block is a beat()-authored legacy block (no track) —
+        let (kernel_b, docs_b) = fresh_kernel_and_docs().await;
+        let cb = ContextId::new();
+        docs_b.create_document(cb, DocumentKind::Conversation, None).unwrap();
+        docs_b
+            .insert_block_as(
+                cb,
+                None,
+                None,
+                Role::Model,
+                BlockKind::Text,
+                "X:1\nK:C\nCDEF|\n".to_string(),
+                Status::Done,
+                ContentType::Plain,
+                Some(PrincipalId::beat()), // legacy transport author
+            )
+            .unwrap();
+        let mut sched_b = BeatScheduler::new(kernel_b.clone(), docs_b.clone());
+        let base_b = Instant::now();
+        sched_b.arm(cb, slow_policy(), TrackId::solo());
+        sched_b.play(cb, base_b);
+        sched_b.fire_due(base_b + Duration::from_secs(1));
+        sched_b.on_turn_completed(cb, docs_b.last_block_id(cb));
+        for i in 2..=8 {
+            sched_b.fire_due(base_b + Duration::from_secs(i));
+        }
+        let assets_b = docs_b
+            .block_snapshots(cb)
+            .unwrap()
+            .into_iter()
+            .filter(|b| b.role == Role::Asset)
+            .count();
+        assert_eq!(
+            assets_b, 0,
+            "a beat()-authored legacy block must not be re-scheduled as ABC"
+        );
+
+        // — Case C: a genuine player-ABC block (no track, real author) IS
+        // scheduled, materializing on the composer's lane under the player —
+        let (kernel_c, docs_c) = fresh_kernel_and_docs().await;
+        let cc = ContextId::new();
+        docs_c.create_document(cc, DocumentKind::Conversation, None).unwrap();
+        let player = PrincipalId::new();
+        docs_c
+            .insert_block_as(
+                cc,
+                None,
+                None,
+                Role::Model,
+                BlockKind::Text,
+                "X:1\nT:Test\nM:4/4\nL:1/8\nK:C\nCDEFGABc|\n".to_string(),
+                Status::Done,
+                ContentType::Plain,
+                Some(player),
+            )
+            .unwrap();
+        let mut sched_c = BeatScheduler::new(kernel_c.clone(), docs_c.clone());
+        let base_c = Instant::now();
+        // Short 4-beat phrase so the scheduling lead (= phrase_delta()) is small
+        // enough to commit within this 8-beat window; large ooda so the cadence
+        // never coincides.
+        sched_c.arm(
+            cc,
+            BeatPolicy { period: Duration::from_secs(1), beats_per_phrase: 4, ooda_every: 1_000_000 },
+            TrackId::solo(),
+        );
+        sched_c.play(cc, base_c);
+        sched_c.fire_due(base_c + Duration::from_secs(1));
+        sched_c.on_turn_completed(cc, docs_c.last_block_id(cc));
+        for i in 2..=8 {
+            sched_c.fire_due(base_c + Duration::from_secs(i));
+        }
+        let midi = docs_c
+            .block_snapshots(cc)
+            .unwrap()
+            .into_iter()
+            .find(|b| b.role == Role::Asset);
+        let midi = midi.expect("a player-ABC block IS scheduled and materializes a MIDI asset");
+        assert_eq!(midi.track, Some(TrackId::solo()), "scheduled on the composer's lane");
+        assert_eq!(
+            midi.id.principal_id, player,
+            "played_by is the ABC block's author (the player), threaded into the cell"
+        );
     }
 }

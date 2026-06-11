@@ -16,6 +16,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock as TokioRwLock;
 
 use kaijutsu_crdt::{BlockKind, ContentType, Role, Status};
+use kaijutsu_kernel::flows::TurnFlow;
 use kaijutsu_kernel::kernel_db::KernelDb;
 use kaijutsu_kernel::llm::stream::{BuildOpts, CacheTarget, StreamEvent};
 use kaijutsu_kernel::llm::{ContentBlock, ToolDefinition};
@@ -161,6 +162,13 @@ pub(crate) async fn spawn_llm_for_prompt(
     after_block_id: &kaijutsu_crdt::BlockId,
     tool_ctx: kaijutsu_kernel::ExecContext,
     user_principal_id: PrincipalId,
+    // `true` only on the autonomous turn-driver path (the composer's OODA loop):
+    // the stream publishes `TurnFlow::Completed`/`Failed` at its end. Interactive
+    // human-prompt callers pass `false` — a human turn must never feed the
+    // composer's OODA Act, so it announces nothing (design §7). This gate is what
+    // keeps the publish-at-stream-end from silently extending Completed to every
+    // interactive prompt.
+    announce_completion: bool,
 ) -> Result<(), capnp::Error> {
     let documents = kernel.documents.clone();
     let kernel_arc = kernel.kernel.clone();
@@ -319,6 +327,7 @@ pub(crate) async fn spawn_llm_for_prompt(
         interrupt,
         interrupt_generation,
         context_interrupts,
+        announce_completion,
     ));
 
     Ok(())
@@ -496,12 +505,19 @@ async fn process_llm_stream(
     system_prompt: String,
     max_output_tokens: u64,
     conversation_cache: Arc<ConversationCache>,
-    // TODO: use for per-user attribution on model-generated blocks
-    _user_principal_id: PrincipalId,
+    // The turn's principal — authors the TurnFlow outcome event (and reserved
+    // for future per-user attribution on model-generated blocks).
+    user_principal_id: PrincipalId,
     tool_ctx: kaijutsu_kernel::ExecContext,
     interrupt: Arc<ContextInterruptState>,
     interrupt_generation: u64,
     context_interrupts: Arc<TokioRwLock<HashMap<ContextId, Arc<ContextInterruptState>>>>,
+    // Only autonomous (turn-driver) turns announce their completion on the
+    // TurnFlow bus; interactive human prompts pass `false` so the composer's
+    // OODA Act never crystallizes a human-prompted turn (design §7). The publish
+    // moved here from the spawn site (rpc.rs:391) so it fires at actual stream
+    // end with the real output block id, not at spawn racing the model.
+    announce_completion: bool,
 ) {
     // Get per-context mailbox lock — held for the entire stream,
     // serializing concurrent prompts to the same context (Fix D+E).
@@ -572,6 +588,19 @@ async fn process_llm_stream(
 
     // Track last inserted block for ordering - each new block goes after the previous
     let mut last_block_id = after_block_id;
+    // The last `Role::Model` / `BlockKind::Text` block this stream produced — the
+    // turn's *output*, which the announced `Completed` carries so the OODA Act
+    // crystallizes that exact block (design §7). `None` until the model emits
+    // text (a tool-only turn, an interrupt before any text, or a hard error all
+    // leave it `None`); a `None` Completed schedules nothing downstream.
+    let mut output_block_id: Option<kaijutsu_crdt::BlockId> = None;
+    // Terminal failure reason for an announced turn. `Some` on any path that
+    // ends the turn without a clean Act (a hard cancel/interrupt); the two
+    // hard-error early returns publish `Failed` inline and never reach the tail.
+    // The scheduler must hear exactly one terminal event per announced turn so
+    // it never waits forever — so the tail publishes Completed-or-Failed, gated
+    // on `announce_completion` (design §7).
+    let mut turn_error: Option<String> = None;
 
     // Agentic loop - continue until model is done or max iterations
     loop {
@@ -708,6 +737,15 @@ async fn process_llm_stream(
                             payload.summary_line(),
                             Some(PrincipalId::system()),
                         );
+                        // Terminal error for an announced turn — publish Failed so
+                        // the scheduler isn't left waiting on this turn forever.
+                        if announce_completion {
+                            kernel.turn_flows().publish(TurnFlow::Failed {
+                                context_id,
+                                principal_id: user_principal_id,
+                                error: format!("LLM stream failed to start: {e}"),
+                            });
+                        }
                         return;
                     }
                 }
@@ -894,6 +932,10 @@ async fn process_llm_stream(
                         Ok(block_id) => {
                             last_block_id = block_id;
                             current_block_id = Some(block_id);
+                            // This is the turn's model-text output. A later text
+                            // block in the same turn supersedes it — Completed
+                            // carries the LAST one, the model's final say.
+                            output_block_id = Some(block_id);
                         }
                         Err(e) => log::error!("Failed to insert text block: {}", e),
                     }
@@ -1061,13 +1103,26 @@ async fn process_llm_stream(
                         payload.summary_line(),
                         Some(PrincipalId::system()),
                     );
+                    // Terminal mid-stream error — Failed (not Completed) so an
+                    // announced turn never leaves the scheduler waiting.
+                    if announce_completion {
+                        kernel.turn_flows().publish(TurnFlow::Failed {
+                            context_id,
+                            principal_id: user_principal_id,
+                            error: format!("LLM stream error: {err}"),
+                        });
+                    }
                     return;
                 }
             }
         }
 
-        // After a hard interrupt, break the agentic loop immediately.
+        // After a hard interrupt, break the agentic loop immediately. A cancelled
+        // turn is terminal-without-Act → Failed for an announced turn (design §7):
+        // the scheduler hears it and moves on rather than waiting on a turn that
+        // will never produce an Act.
         if stream_cancelled {
+            turn_error = Some("turn interrupted before completion".to_string());
             break;
         }
 
@@ -1373,4 +1428,189 @@ async fn process_llm_stream(
     }
 
     log::info!("LLM stream processing complete for cell {}", context_id);
+
+    // Announce the turn outcome at ACTUAL stream end (design §7) — the publish
+    // moved here from the spawn site so it carries the real `output_block_id`
+    // (the model's last text block) rather than firing at spawn and racing the
+    // model. Only announced (autonomous turn-driver) turns publish; interactive
+    // human prompts stay silent so the composer's OODA Act never crystallizes a
+    // human-prompted turn. Exactly one terminal event per announced turn — the
+    // two hard-error early returns already published Failed and never reach here.
+    if announce_completion {
+        match turn_error {
+            None => kernel.turn_flows().publish(TurnFlow::Completed {
+                context_id,
+                principal_id: user_principal_id,
+                output_block_id,
+            }),
+            Some(error) => kernel.turn_flows().publish(TurnFlow::Failed {
+                context_id,
+                principal_id: user_principal_id,
+                error,
+            }),
+        };
+    }
+}
+
+#[cfg(test)]
+mod publish_tests {
+    //! T15 (design-chameleon-batch1-f2-notation §7/§16) — the turn-completion
+    //! publish moves from stream *spawn* (the rpc.rs:391 race) to stream *end*,
+    //! carrying the model's output block id, and only for *announced* turns.
+    //!
+    //! This is the smallest honest test of the publish site (the design allows
+    //! it over the heavy mock-provider SSH e2e harness, which the project's
+    //! test discipline steers away from for --lib runs — russh teardown noise).
+    //! It drives `process_llm_stream` directly with a Mock provider against a
+    //! real ephemeral kernel + block store, so the moved publish and the
+    //! `announce_completion` gate are exercised end-to-end through the actual
+    //! stream loop, not a stub.
+    use super::*;
+    use kaijutsu_kernel::block_store::{BlockStore, DocumentKind};
+    use kaijutsu_kernel::flows::{FlowBus, SharedBlockFlowBus};
+    use kaijutsu_kernel::kernel_db::KernelDb;
+    use kaijutsu_kernel::llm::{MockClient, Provider};
+    use kaijutsu_types::SessionId;
+
+    use crate::interrupt::ContextInterruptState;
+    use crate::rpc::ConversationCache;
+
+    /// Build the args and run one `process_llm_stream` against a Mock provider.
+    /// Returns the documents store and the principal so the caller can inspect
+    /// the inserted blocks.
+    async fn drive_one_turn(
+        announce_completion: bool,
+        kernel: Arc<Kernel>,
+    ) -> (SharedBlockStore, ContextId, PrincipalId) {
+        let bus: SharedBlockFlowBus = Arc::new(FlowBus::new(256));
+        let documents: SharedBlockStore =
+            Arc::new(BlockStore::with_flows(PrincipalId::new(), bus));
+        let ctx = ContextId::new();
+        documents
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+
+        let player = PrincipalId::new();
+        // The user/seed block the turn anchors after.
+        let after = documents
+            .insert_block_as(
+                ctx,
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "write a phrase",
+                Status::Done,
+                ContentType::Plain,
+                Some(player),
+            )
+            .unwrap();
+
+        let provider = Arc::new(Provider::Mock(MockClient::new(
+            "X:1\nK:C\nCDEF|\n",
+        )));
+        let kernel_db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+        let conversation_cache = Arc::new(ConversationCache::new(8));
+        let interrupt = ContextInterruptState::new(1);
+        let context_interrupts = Arc::new(TokioRwLock::new(HashMap::new()));
+        let tool_ctx = kaijutsu_kernel::ExecContext::new(
+            player,
+            ctx,
+            std::path::PathBuf::from("/"),
+            SessionId::new(),
+            kernel.id(),
+        );
+
+        process_llm_stream(
+            provider,
+            documents.clone(),
+            ctx,
+            "mock-model".to_string(),
+            kernel.clone(),
+            kernel_db,
+            vec![],
+            after,
+            "system".to_string(),
+            1024,
+            conversation_cache,
+            player,
+            tool_ctx,
+            interrupt,
+            1,
+            context_interrupts,
+            announce_completion,
+        )
+        .await;
+
+        (documents, ctx, player)
+    }
+
+    /// An announced turn publishes `Completed` only after the stream ends, and
+    /// the event carries the id of the model's text block (the one the OODA Act
+    /// will crystallize) — never the seed prompt, never published at spawn.
+    #[tokio::test]
+    async fn turn_completed_publishes_at_stream_end_with_output_block_id() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let kernel = Arc::new(Kernel::new_ephemeral("publish-test").await);
+                let mut sub = kernel.turn_flows().subscribe("turn.completed");
+
+                // Nothing published before the turn runs.
+                assert!(sub.try_recv().is_none(), "no Completed before the turn");
+
+                let (documents, ctx, _player) = drive_one_turn(true, kernel.clone()).await;
+
+                // The stream has fully ended; exactly one Completed is queued.
+                let msg = sub
+                    .try_recv()
+                    .expect("an announced turn publishes Completed at stream end");
+                let output_id = match msg.payload {
+                    TurnFlow::Completed {
+                        context_id,
+                        output_block_id,
+                        ..
+                    } => {
+                        assert_eq!(context_id, ctx);
+                        output_block_id.expect("the mock turn produced text → Some(id)")
+                    }
+                    other => panic!("expected Completed, got {other:?}"),
+                };
+
+                // The carried id is the model's text block — not the user seed.
+                let snap = documents
+                    .get_block_snapshot(ctx, &output_id)
+                    .unwrap()
+                    .expect("output block exists");
+                assert_eq!(snap.role, Role::Model, "Completed points at the MODEL block");
+                assert_eq!(snap.kind, BlockKind::Text);
+                assert!(
+                    snap.content.contains("CDEF"),
+                    "the output block carries the model's ABC, not the seed prompt"
+                );
+
+                assert!(sub.try_recv().is_none(), "exactly one Completed per turn");
+            })
+            .await;
+    }
+
+    /// An interactive (un-announced) turn publishes NOTHING — the human-prompt
+    /// paths must never feed the composer's OODA Act (design §7).
+    #[tokio::test]
+    async fn interactive_turn_publishes_nothing() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let kernel = Arc::new(Kernel::new_ephemeral("publish-test").await);
+                let mut sub = kernel.turn_flows().subscribe("turn.completed");
+
+                let (_documents, _ctx, _player) = drive_one_turn(false, kernel.clone()).await;
+
+                assert!(
+                    sub.try_recv().is_none(),
+                    "an un-announced (interactive) turn must not publish Completed"
+                );
+            })
+            .await;
+    }
 }

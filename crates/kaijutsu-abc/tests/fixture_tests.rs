@@ -2,7 +2,7 @@
 //!
 //! Each .abc file in tests/fixtures/ is parsed and converted to MIDI.
 
-use kaijutsu_abc::{parse, to_midi, MidiParams};
+use kaijutsu_abc::{parse, to_midi, MidiParams, Mode};
 use std::fs;
 use std::path::Path;
 
@@ -54,6 +54,41 @@ fn test_fixture(name: &str) {
 #[test]
 fn test_fixture_simple_melody() {
     test_fixture("simple_melody");
+}
+
+/// T1 (design-chameleon-batch1-f2-notation §16) — the canonical Chameleon vamp
+/// fixture is the shared phrase every later F2 test schedules. It must parse in
+/// Dorian with zero errors (so it passes the resolver's first-commit ABC
+/// validation) and render playable MIDI (so the write-barrier deriver yields a
+/// real artifact — a vamped phrase must always produce something playable, never
+/// a silent fallback).
+#[test]
+fn chameleon_vamp_fixture_parses_and_renders_midi() {
+    let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("chameleon_vamp.abc");
+    let abc = fs::read_to_string(&fixture_path)
+        .unwrap_or_else(|e| panic!("Failed to read chameleon_vamp fixture: {}", e));
+
+    let result = parse(&abc);
+    assert!(
+        !result.has_errors(),
+        "chameleon_vamp had parse errors: {:?}",
+        result.feedback
+    );
+    assert_eq!(
+        result.value[0].header.key.mode,
+        Mode::Dorian,
+        "the vamp is in B-flat Dorian"
+    );
+
+    let midi = to_midi(&result.value[0], &MidiParams::default());
+    assert_eq!(
+        &midi[0..4],
+        b"MThd",
+        "the vamp must render a valid MIDI header"
+    );
 }
 
 #[test]
@@ -184,6 +219,7 @@ fn test_all_fixtures_have_tests() {
         "ties",
         "triplets",
         "keys",
+        "chameleon_vamp",
     ];
 
     for name in &fixture_names {
