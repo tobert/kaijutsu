@@ -643,18 +643,25 @@ pub(crate) mod test_helpers {
             db.get_or_create_default_workspace(PrincipalId::system())
                 .unwrap();
         }
-        // Ephemeral kernel: rooted at a throwaway temp data_dir so CAS (and any
-        // other data_dir-rooted state) never touches the user's real XDG store.
-        // `Kernel::new` takes a required data_dir (no XDG fallback), so a test
-        // can never accidentally resolve CAS to the user's real store.
-        let kernel = Arc::new(Kernel::new_ephemeral("test").await.with_timeouts(policy));
-        // Mount a private, seeded /etc/rc tree so rc tests exercise the real
-        // file-backed dispatch path (readdir + FileDocumentCache). The temp
-        // dir is intentionally leaked — it lives for the test process.
-        let rc_tmp = std::env::temp_dir()
-            .join(format!("kj-rc-test-{}", ContextId::new().to_hex()));
+        // One throwaway root holds BOTH the kernel data_dir and the seeded
+        // /etc/rc tree, so the kernel's cleanup guard removes them together when
+        // the dispatcher (and its kernel) drops — no leaked `/tmp` dirs across
+        // repeated test runs. `Kernel::new` takes a required data_dir (no XDG
+        // fallback), so a test can never resolve CAS to the user's real store.
+        let root = std::env::temp_dir().join(format!("kj-test-{}", ContextId::new().to_hex()));
+        let kernel_data = root.join("kernel");
+        let rc_tmp = root.join("rc");
+        std::fs::create_dir_all(&kernel_data).expect("create kernel data dir");
         std::fs::create_dir_all(&rc_tmp).expect("create rc test dir");
         crate::seed_scripts::ensure_rc_seed_files(&rc_tmp).expect("seed rc test files");
+        let kernel = Arc::new(
+            Kernel::new("test", &kernel_data)
+                .await
+                .with_timeouts(policy)
+                .with_temp_cleanup(root),
+        );
+        // Mount the private, seeded /etc/rc tree so rc tests exercise the real
+        // file-backed dispatch path (readdir + FileDocumentCache).
         kernel
             .mount("/etc/rc", crate::vfs::LocalBackend::new(&rc_tmp))
             .await;

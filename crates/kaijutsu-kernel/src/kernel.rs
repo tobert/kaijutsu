@@ -96,6 +96,25 @@ pub struct Kernel {
     /// code arms/disarms composer contexts by sending here; absent in embedded /
     /// test setups with no scheduler, where sends are simply no-ops.
     beat_ingress: OnceLock<tokio::sync::mpsc::UnboundedSender<crate::hyoushigi::BeatCommand>>,
+    /// RAII guard for a `new_ephemeral()` data dir: removes the throwaway dir
+    /// when the kernel drops, so repeated test runs don't accumulate `kj-eph-*`
+    /// dirs (each holding a full CAS + DB) in `/tmp`. `None` for kernels rooted
+    /// at a caller-provided `data_dir` (production, embedded). `Arc` keeps the dir
+    /// alive until the last clone of this guard drops.
+    temp_cleanup: Option<std::sync::Arc<TempDirGuard>>,
+}
+
+/// Removes its directory on drop. A tiny owned guard so `new_ephemeral()` test
+/// kernels self-clean their throwaway data dir instead of leaking it for the
+/// process lifetime (the `/tmp` inode accumulation that bites repeated local
+/// test runs).
+struct TempDirGuard(std::path::PathBuf);
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        // Best-effort: a failed cleanup must never panic a dropping kernel.
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 impl std::fmt::Debug for Kernel {
@@ -152,6 +171,7 @@ impl Kernel {
             nonce_stores: dashmap::DashMap::new(),
             timelines: dashmap::DashMap::new(),
             beat_ingress: OnceLock::new(),
+            temp_cleanup: None,
         }
     }
 
@@ -160,14 +180,16 @@ impl Kernel {
     /// For tests and short-lived tooling that need a real on-disk `data_dir`
     /// but must never touch the user's XDG store or share CAS state with any
     /// other kernel. Each call mints a unique `kj-eph-<id>/` under the system
-    /// temp dir, isolating every kernel from every other. The directory is
-    /// leaked for the process lifetime — there is no live handle to drop it
-    /// out from under the kernel.
+    /// temp dir, isolating every kernel from every other. The dir is removed
+    /// when the kernel drops (a `TempDirGuard` on `temp_cleanup`), so repeated
+    /// test runs don't accumulate `kj-eph-*` dirs in `/tmp`.
     pub async fn new_ephemeral(name: impl Into<String>) -> Self {
         let dir = std::env::temp_dir()
             .join(format!("kj-eph-{}", kaijutsu_types::KernelId::new().to_hex()));
         std::fs::create_dir_all(&dir).expect("create ephemeral kernel data dir");
-        Self::new(name, &dir).await
+        let mut kernel = Self::new(name, &dir).await;
+        kernel.temp_cleanup = Some(std::sync::Arc::new(TempDirGuard(dir)));
+        kernel
     }
 
     /// Create a new kernel with a shared FlowBus.
@@ -205,6 +227,7 @@ impl Kernel {
             nonce_stores: dashmap::DashMap::new(),
             timelines: dashmap::DashMap::new(),
             beat_ingress: OnceLock::new(),
+            temp_cleanup: None,
         }
     }
 
@@ -235,6 +258,18 @@ impl Kernel {
     /// shape.
     pub fn with_timeouts(mut self, policy: kaijutsu_types::TimeoutPolicy) -> Self {
         self.timeouts = policy;
+        self
+    }
+
+    /// Builder-style attach of a throwaway-dir cleanup guard (test support).
+    /// The given dir is removed when the kernel drops — use it to root a kernel
+    /// (and any sibling test scaffolding, e.g. a mounted `/etc/rc` tree) under
+    /// one temp dir that self-cleans, instead of leaking it for the process
+    /// lifetime. Must be called pre-`Arc::new` (consumes `self`, like
+    /// `with_timeouts`). `new_ephemeral` sets this for you; this is for tests
+    /// that root a kernel via `new`/`with_flows` at their own temp dir.
+    pub fn with_temp_cleanup(mut self, dir: std::path::PathBuf) -> Self {
+        self.temp_cleanup = Some(std::sync::Arc::new(TempDirGuard(dir)));
         self
     }
 

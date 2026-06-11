@@ -903,8 +903,10 @@ mod tests {
     /// must NOT leave a phantom edit that a later read would serve.
     #[tokio::test]
     async fn readonly_mount_passes_through_and_does_not_poison() {
-        let dir = std::env::temp_dir().join(format!("kj-ro-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        // tempfile: unique + RAII-cleaned (no leaked `/tmp` dir across runs, and
+        // no cross-process collision on a pid-named dir). Held to end of scope.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         std::fs::write(dir.join("ro.txt"), b"on-disk").unwrap();
 
         let blocks = shared_block_store(PrincipalId::system());
@@ -915,7 +917,7 @@ mod tests {
 
         let mount_table = Arc::new(MountTable::new());
         mount_table
-            .mount(dir.to_str().unwrap(), LocalBackend::read_only(&dir))
+            .mount(dir.to_str().unwrap(), LocalBackend::read_only(dir))
             .await;
         let file_cache = Arc::new(FileDocumentCache::new(blocks.clone(), mount_table.clone()));
         let docs = Arc::new(KaijutsuBackend::new(

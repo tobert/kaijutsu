@@ -114,6 +114,25 @@ pub struct SshServerConfig {
     pub data_dir: Option<PathBuf>,
     /// Maximum number of concurrent SSH connections. Default: 100.
     pub max_connections: usize,
+    /// RAII guard for an `ephemeral()` test dir: removes the dir when the config
+    /// (and so the server task that owns it) is dropped, so repeated local test
+    /// runs don't accumulate dirs in `/tmp`. `None` for production / explicit-dir
+    /// configs. `Arc` so the config stays `Clone` (the dir lives until the last
+    /// clone drops).
+    _cleanup: Option<std::sync::Arc<TempDirGuard>>,
+}
+
+/// Removes its directory on drop. A tiny owned guard so `ephemeral()` test
+/// configs self-clean (no leaked `/tmp` dirs across repeated local runs)
+/// WITHOUT pulling `tempfile` — a dev-dependency — into the production
+/// dependency tree just for a test-support constructor.
+struct TempDirGuard(PathBuf);
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        // Best-effort: a failed cleanup must never panic a dropping server.
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 impl SshServerConfig {
@@ -121,24 +140,37 @@ impl SshServerConfig {
     ///
     /// Uses in-memory auth database and allows anonymous connections.
     pub fn ephemeral(port: u16) -> Self {
-        // Use a fresh tempdir so no real configs (mcp.toml etc.) are loaded.
-        // Include PID + timestamp to avoid stale data from PID reuse.
+        // Use a fresh tempdir so no real configs (mcp.toml etc.) load. The name is
+        // unique by construction: PID (cross-process) + timestamp (cross-run) + a
+        // process-wide atomic counter so two `ephemeral()` calls that land in the
+        // same SystemTime tick (parallel tests in one binary) NEVER share a dir — a
+        // shared data_dir means two kernels open the same SQLite DB and
+        // contend/cross-contaminate. The TempDirGuard removes the dir when this
+        // config (owned by the server task) drops, so repeated local runs don't
+        // pile dirs into /tmp (the inode leak that surfaced as the shell-var flake).
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let config_dir =
-            std::env::temp_dir().join(format!("kaijutsu-test-{}-{}", std::process::id(), stamp));
-        std::fs::create_dir_all(&config_dir).ok();
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "kaijutsu-test-{}-{}-{}",
+            std::process::id(),
+            stamp,
+            seq
+        ));
+        std::fs::create_dir_all(&path).ok();
 
         Self {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], port)),
             key_source: KeySource::Ephemeral,
             auth_db_path: None,
             allow_anonymous: true, // Tests need to accept any key
-            config_dir: Some(config_dir.clone()),
-            data_dir: Some(config_dir),
+            config_dir: Some(path.clone()),
+            data_dir: Some(path.clone()),
             max_connections: 100,
+            _cleanup: Some(std::sync::Arc::new(TempDirGuard(path))),
         }
     }
 
@@ -152,6 +184,7 @@ impl SshServerConfig {
             config_dir: None, // Use XDG default
             data_dir: None,   // Use XDG default
             max_connections: 100,
+            _cleanup: None,
         }
     }
 
