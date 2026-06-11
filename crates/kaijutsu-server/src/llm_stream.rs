@@ -538,8 +538,21 @@ async fn process_llm_stream(
     {
         Ok(messages) => messages,
         // Hydration failed and surfaced a visible Error block; fail the turn
-        // loudly rather than streaming against an empty/partial session.
-        Err(()) => return,
+        // loudly rather than streaming against an empty/partial session. This is a
+        // terminal path like any other: an announced turn MUST publish exactly one
+        // terminal event (§7), so emit Failed before returning — otherwise the OODA
+        // Act handoff gets no signal and the turn silently falls off the bus while
+        // every other terminal path announces.
+        Err(()) => {
+            if announce_completion {
+                kernel.turn_flows().publish(TurnFlow::Failed {
+                    context_id,
+                    principal_id: user_principal_id,
+                    error: "hydration failed: could not read conversation history".to_string(),
+                });
+            }
+            return;
+        }
     };
     // mailbox lock is held through the rest of the stream — same
     // semantics as the previous MutexGuard<Vec<LlmMessage>>: only one
@@ -1609,6 +1622,104 @@ mod publish_tests {
                 assert!(
                     sub.try_recv().is_none(),
                     "an un-announced (interactive) turn must not publish Completed"
+                );
+            })
+            .await;
+    }
+
+    /// A hydration failure on an ANNOUNCED turn must still publish exactly one
+    /// terminal event (`Failed`). The early `return` on `Err(())` otherwise leaves
+    /// the OODA Act handoff with NO signal — silently dropping the turn off the
+    /// design's "exactly one terminal event per announced turn" contract (§7),
+    /// while the two stream-error paths and the clean tail all announce. An
+    /// un-announced (interactive) turn stays silent even when hydration fails.
+    async fn drive_failed_hydration(announce_completion: bool, kernel: Arc<Kernel>) -> ContextId {
+        let bus: SharedBlockFlowBus = Arc::new(FlowBus::new(256));
+        let documents: SharedBlockStore =
+            Arc::new(BlockStore::with_flows(PrincipalId::new(), bus));
+        // NO create_document for `ctx` → `block_snapshots` errors DocumentNotFound →
+        // hydration fails before the stream begins. The anchor is fabricated; the
+        // missing document is what we are exercising.
+        let ctx = ContextId::new();
+        let player = PrincipalId::new();
+        let after = kaijutsu_crdt::BlockId::new(ctx, player, 0);
+
+        let provider = Arc::new(Provider::Mock(MockClient::new("X:1\nK:C\nCDEF|\n")));
+        let kernel_db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+        let conversation_cache = Arc::new(ConversationCache::new(8));
+        let interrupt = ContextInterruptState::new(1);
+        let context_interrupts = Arc::new(TokioRwLock::new(HashMap::new()));
+        let tool_ctx = kaijutsu_kernel::ExecContext::new(
+            player,
+            ctx,
+            std::path::PathBuf::from("/"),
+            SessionId::new(),
+            kernel.id(),
+        );
+
+        process_llm_stream(
+            provider,
+            documents,
+            ctx,
+            "mock-model".to_string(),
+            kernel.clone(),
+            kernel_db,
+            vec![],
+            after,
+            "system".to_string(),
+            1024,
+            conversation_cache,
+            player,
+            tool_ctx,
+            interrupt,
+            1,
+            context_interrupts,
+            announce_completion,
+        )
+        .await;
+        ctx
+    }
+
+    #[tokio::test]
+    async fn failed_hydration_publishes_failed_when_announced() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let kernel = Arc::new(Kernel::new_ephemeral("hydrate-fail").await);
+                let mut failed = kernel.turn_flows().subscribe("turn.failed");
+                let mut completed = kernel.turn_flows().subscribe("turn.completed");
+
+                let ctx = drive_failed_hydration(true, kernel.clone()).await;
+
+                let msg = failed
+                    .try_recv()
+                    .expect("an announced turn whose hydration fails must publish Failed");
+                match msg.payload {
+                    TurnFlow::Failed { context_id, .. } => assert_eq!(context_id, ctx),
+                    other => panic!("expected Failed, got {other:?}"),
+                }
+                assert!(failed.try_recv().is_none(), "exactly one terminal event");
+                assert!(
+                    completed.try_recv().is_none(),
+                    "a failed turn never publishes Completed"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn failed_hydration_stays_silent_when_interactive() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let kernel = Arc::new(Kernel::new_ephemeral("hydrate-fail").await);
+                let mut failed = kernel.turn_flows().subscribe("turn.failed");
+
+                let _ctx = drive_failed_hydration(false, kernel.clone()).await;
+
+                assert!(
+                    failed.try_recv().is_none(),
+                    "an interactive turn announces nothing, even on hydration failure"
                 );
             })
             .await;
