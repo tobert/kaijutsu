@@ -1154,6 +1154,29 @@ impl KernelDb {
         Ok(())
     }
 
+    /// Run a WAL checkpoint in TRUNCATE mode: flush committed WAL frames into
+    /// the main database file and shrink the `-wal` file back to zero.
+    ///
+    /// Without proactive checkpoints the WAL grows between SQLite's automatic
+    /// 1000-page checkpoints, and a bare-file read of the main `.db` lags
+    /// behind committed history — the mechanism behind the 2026-06-11
+    /// journaling-forensics misread (no data was lost; the main file was
+    /// simply stale while ~4 MB of newer ops sat only in `kernel.db-wal`).
+    /// Compaction calls this so the main file tracks the oplog.
+    ///
+    /// Returns `(busy, log_frames, checkpointed_frames)` as SQLite reports
+    /// them. `busy == 1` means a concurrent reader/writer on another
+    /// connection prevented a full truncate; the checkpoint is best-effort
+    /// and the caller treats busy as non-fatal.
+    pub fn checkpoint(&self) -> KernelDbResult<(i64, i64, i64)> {
+        let row = self.conn.query_row(
+            "PRAGMA wal_checkpoint(TRUNCATE)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        Ok(row)
+    }
+
     // ========================================================================
     // Input Document Op-Log
     // ========================================================================
@@ -3243,6 +3266,63 @@ mod tests {
         let db = KernelDb::in_memory().unwrap();
         // Apply schema again — should not error.
         db.conn.execute_batch(SCHEMA).unwrap();
+    }
+
+    // ── WAL checkpoint ──────────────────────────────────────────────────
+
+    /// `checkpoint()` (TRUNCATE) must flush committed frames into the main
+    /// file and shrink the `-wal` file back to zero. Guards the proactive
+    /// checkpoint that compaction relies on so a bare-file read of the main
+    /// `.db` stops lagging committed history (2026-06-11 forensics). On-disk
+    /// db required — `in_memory()` has no WAL file.
+    #[test]
+    fn checkpoint_truncates_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ckpt.db");
+        let wal_path = dir.path().join("ckpt.db-wal");
+
+        let db = KernelDb::open(&db_path).unwrap();
+        let ws_id = db
+            .get_or_create_default_workspace(PrincipalId::system())
+            .unwrap();
+        let doc = ContextId::new();
+        db.insert_document(&DocumentRow {
+            document_id: doc,
+            workspace_id: ws_id,
+            doc_kind: DocKind::Conversation,
+            language: None,
+            path: None,
+            created_at: now_millis() as i64,
+            created_by: PrincipalId::system(),
+        })
+        .unwrap();
+
+        // 200 × 4 KiB ops ≈ 800 KiB — grows the WAL but stays under SQLite's
+        // 1000-page (~4 MiB) auto-checkpoint, so the WAL is non-empty and
+        // un-truncated when we reach the manual checkpoint below.
+        let payload = vec![0xABu8; 4096];
+        for seq in 1..=200 {
+            db.append_op(doc, seq, &payload).unwrap();
+        }
+
+        let wal_before = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+        assert!(
+            wal_before > 0,
+            "WAL should have grown after 200 appends, got {wal_before} bytes",
+        );
+
+        let (busy, _log, _checkpointed) = db.checkpoint().unwrap();
+        assert_eq!(busy, 0, "single-connection checkpoint must not be busy");
+
+        // The behavioral proof: TRUNCATE shrinks the -wal file back to zero,
+        // so a bare-file read of the main .db now reflects all 200 ops. (The
+        // log/checkpointed frame counts are version-dependent for TRUNCATE and
+        // not asserted.)
+        let wal_after = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+        assert_eq!(
+            wal_after, 0,
+            "TRUNCATE checkpoint should zero the -wal file, got {wal_after} bytes",
+        );
     }
 
     // ── 2. Context lifecycle ────────────────────────────────────────────

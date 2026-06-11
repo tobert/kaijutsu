@@ -106,17 +106,30 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   shows history frozen at the last checkpoint. Post-restart journaling
   verified working: seq numbering continued at 189, compaction snapshot at
   11:48:39, and the 11:48 smoke-test block was decoded out of oplog seq
-  197. Hardening to do (Chameleon batch 1 — the block log becomes the
+  197. Hardening (Chameleon batch 1 — the block log becomes the
   stamp-turn WAL):
-  - `journal_op`/`compact_document` silently return `Ok(())` when the
-    store has no db handle (`crates/kaijutsu-kernel/src/block_store.rs:711-713`,
-    `:747-749`) — exactly the feared failure mode, latent. Kernel-side
-    stores must require a db / fail loud per crash-over-corruption; add
-    the silent-no-op guard test (fails today).
-  - `PRAGMA wal_checkpoint(TRUNCATE)` on clean shutdown and after
-    compaction so the main file stops lagging; add the
-    durability-across-kill test (insert via real paths, SIGKILL, reload
-    through `load_from_db`, assert everything present).
+  - DONE (2026-06-11) — fail-loud guard. The five journaling writes
+    (`journal_op`, `compact_document`, `write_initial_snapshot`,
+    `journal_and_maybe_compact_input`, `compact_input_doc`) routed through
+    `BlockStore::journaling_db()`: a store that declares persistence
+    (`with_db*`, `persistent = true`) with no db handle now returns
+    `NoDatabaseConfigured` instead of silently dropping the op; replica
+    stores (`new`/`with_flows`) keep their legitimate no-op. Guard test
+    `persistent_store_journaling_without_db_fails_loud` (red-first).
+  - DONE (2026-06-11) — `PRAGMA wal_checkpoint(TRUNCATE)` after compaction
+    via `KernelDb::checkpoint()`, called from `compact_document` /
+    `compact_input_doc`, so the main file stops lagging. Tests:
+    `kernel_db::checkpoint_truncates_wal`, `block_store::test_durability_across_kill`
+    (insert via real paths, leak/forget the connection to simulate SIGKILL,
+    reopen a fresh connection, `load_from_db`, assert everything present).
+  - REMAINING — graceful-shutdown WAL checkpoint. `SharedKernelState::drop`
+    does a best-effort checkpoint, but it only fires on a clean process exit;
+    the server's `run()` loop never returns and the process dies on
+    SIGKILL/SIGTERM without unwinding, so systemd `stop` skips it. The
+    proactive compaction checkpoint covers durability (no loss either way);
+    this gap only affects bare-file forensics between the last compaction and
+    shutdown. Fix: a `tokio::signal` SIGTERM handler that checkpoints before
+    exit (needs the run loop to become interruptible — bigger than the rest).
   - Forensics hygiene: tracing logs UTC, systemd speaks local — cite both
     zones when recording restarts in issue notes.
 - **`KernelDb` connection pool:** Currently `Arc<parking_lot::Mutex<KernelDb>>` (`block_store.rs:74`). This bottleneck prevents utilizing SQLite's WAL mode for concurrent readers. Migrate to `r2d2` or `sqlx` to allow non-blocking reads during LLM streams and heavy writes. Note: SQLite serializes *writes* regardless of pooling, so the win is concurrent reads (and only with WAL enabled) — verify WAL before assuming a pool helps; narrowing lock scope may matter as much.

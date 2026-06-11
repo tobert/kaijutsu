@@ -193,6 +193,13 @@ pub struct BlockStore {
     input_text_seqs: DashMap<ContextId, AtomicU64>,
     /// Database for persistence (unified KernelDb).
     db: Option<DbHandle>,
+    /// Whether this store is expected to persist (kernel-side). When `true`, a
+    /// missing `db` at journal time is a fatal invariant violation (crash over
+    /// silent durability loss), not a no-op. Replica stores (app scratch,
+    /// client sync) set this `false` and journaling legitimately no-ops.
+    /// Set together with `db` at construction: `with_db*` → `true`,
+    /// `new`/`with_flows` → `false`.
+    persistent: bool,
     /// Kernel ID for document rows.
         /// Default workspace ID for new documents.
     default_workspace_id: Option<WorkspaceId>,
@@ -222,6 +229,7 @@ impl BlockStore {
             block_text_seqs: DashMap::new(),
             input_text_seqs: DashMap::new(),
             db: None,
+            persistent: false,
                         default_workspace_id: None,
             principal_id: RwLock::new(principal_id),
             block_flows: None,
@@ -241,6 +249,7 @@ impl BlockStore {
             block_text_seqs: DashMap::new(),
             input_text_seqs: DashMap::new(),
             db: None,
+            persistent: false,
                         default_workspace_id: None,
             principal_id: RwLock::new(principal_id),
             block_flows: Some(block_flows),
@@ -264,6 +273,7 @@ impl BlockStore {
             block_text_seqs: DashMap::new(),
             input_text_seqs: DashMap::new(),
             db: Some(db),
+            persistent: true,
                         default_workspace_id: Some(default_workspace_id),
             principal_id: RwLock::new(principal_id),
             block_flows: None,
@@ -288,6 +298,7 @@ impl BlockStore {
             block_text_seqs: DashMap::new(),
             input_text_seqs: DashMap::new(),
             db: Some(db),
+            persistent: true,
                         default_workspace_id: Some(default_workspace_id),
             principal_id: RwLock::new(principal_id),
             block_flows: Some(block_flows),
@@ -295,6 +306,17 @@ impl BlockStore {
             #[cfg(test)]
             fail_insert_countdown: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// TEST-ONLY: construct a store that *declares* persistence but has no db
+    /// handle — the pathological state the journaling guard must reject. In
+    /// production this state is unconstructable (`db` and `persistent` are set
+    /// together), so it exists only to exercise the fail-loud invariant.
+    #[cfg(test)]
+    pub fn persistent_without_db(principal_id: PrincipalId) -> Self {
+        let mut store = Self::new(principal_id);
+        store.persistent = true;
+        store
     }
 
     /// TEST-ONLY: arm the insert fault injector. A value of `n` fails the `n`th
@@ -750,6 +772,23 @@ impl BlockStore {
     // Block Operations
     // =========================================================================
 
+    /// Resolve the db handle for a journaling write, enforcing the persistence
+    /// invariant. Returns:
+    /// - `Ok(Some(db))` — persist to this handle.
+    /// - `Ok(None)` — a replica store (`persistent == false`): journaling is a
+    ///   legitimate no-op (app scratch store, client sync replica).
+    /// - `Err(NoDatabaseConfigured)` — a store that declared itself persistent
+    ///   has no db handle. This is the feared silent-durability-loss footgun
+    ///   (`block_store.rs` historically `return Ok(())`'d here); we crash over
+    ///   corruption rather than drop the op on the floor.
+    fn journaling_db(&self) -> BlockStoreResult<Option<&DbHandle>> {
+        match self.db.as_ref() {
+            Some(db) => Ok(Some(db)),
+            None if self.persistent => Err(BlockStoreError::NoDatabaseConfigured),
+            None => Ok(None),
+        }
+    }
+
     /// Journal an op to the append-only oplog.
     ///
     /// Serializes the SyncPayload, appends it to the `oplog` table, and
@@ -759,7 +798,7 @@ impl BlockStore {
         context_id: ContextId,
         payload: SyncPayload,
     ) -> BlockStoreResult<()> {
-        let Some(db) = self.db.as_ref() else {
+        let Some(db) = self.journaling_db()? else {
             return Ok(());
         };
 
@@ -795,7 +834,7 @@ impl BlockStore {
 
     /// Run compaction: snapshot the current state and truncate the oplog.
     fn compact_document(&self, context_id: ContextId) -> BlockStoreResult<()> {
-        let Some(db) = self.db.as_ref() else {
+        let Some(db) = self.journaling_db()? else {
             return Ok(());
         };
 
@@ -823,6 +862,17 @@ impl BlockStore {
                     &content,
                 )
                 .map_err(|e| BlockStoreError::Db(e.to_string()))?;
+            // Flush the just-truncated oplog out of the WAL so the main file
+            // stops lagging committed history. Best-effort: a busy checkpoint
+            // (a concurrent reader on another connection) is non-fatal.
+            if let Ok((busy, _, _)) = db_guard.checkpoint()
+                && busy != 0
+            {
+                tracing::debug!(
+                    document_id = %context_id.to_hex(),
+                    "wal_checkpoint(TRUNCATE) busy after doc compaction",
+                );
+            }
         }
 
         if let Some(entry) = self.get(context_id) {
@@ -835,7 +885,7 @@ impl BlockStore {
 
     /// Write an initial snapshot for a newly forked document (no oplog).
     fn write_initial_snapshot(&self, context_id: ContextId) -> BlockStoreResult<()> {
-        let Some(db) = self.db.as_ref() else {
+        let Some(db) = self.journaling_db()? else {
             return Ok(());
         };
 
@@ -873,7 +923,7 @@ impl BlockStore {
         context_id: ContextId,
         ops: &[u8],
     ) -> BlockStoreResult<()> {
-        let Some(db) = &self.db else {
+        let Some(db) = self.journaling_db()? else {
             return Ok(());
         };
 
@@ -908,7 +958,7 @@ impl BlockStore {
 
     /// Compact an input document: snapshot + truncate oplog.
     fn compact_input_doc(&self, context_id: ContextId) -> BlockStoreResult<()> {
-        let Some(db) = &self.db else {
+        let Some(db) = self.journaling_db()? else {
             return Ok(());
         };
 
@@ -937,6 +987,15 @@ impl BlockStore {
                     &content,
                 )
                 .map_err(|e| BlockStoreError::Db(e.to_string()))?;
+            // Flush the just-truncated input oplog out of the WAL too.
+            if let Ok((busy, _, _)) = db_guard.checkpoint()
+                && busy != 0
+            {
+                tracing::debug!(
+                    document_id = %context_id.to_hex(),
+                    "wal_checkpoint(TRUNCATE) busy after input compaction",
+                );
+            }
         }
 
         if let Some(count) = self.input_uncompacted.get(&context_id) {
@@ -4234,6 +4293,93 @@ mod tests {
             replayed_content.contains("merge_ops persistence test"),
             "Replayed oplog should produce merged content, got: {:?}",
             replayed_content,
+        );
+    }
+
+    /// A store that declares persistence (`with_db*`) but reaches a journaling
+    /// write with no db handle must FAIL LOUD, not silently drop the op — the
+    /// historical `return Ok(())` footgun, crash over corruption. Replica
+    /// stores (`new`/`with_flows`) keep their legitimate no-op, exercised
+    /// implicitly by every db-less test in this module.
+    #[test]
+    fn persistent_store_journaling_without_db_fails_loud() {
+        let store = BlockStore::persistent_without_db(PrincipalId::system());
+        let ctx = ContextId::new();
+        // create_document is metadata-only (no journaling write), so it
+        // succeeds even db-less; it sets the doc up so insert_block reaches
+        // journal_op.
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .expect("create_document is metadata-only; no journaling write");
+
+        let err = store
+            .insert_block(
+                ctx, None, None, Role::User, BlockKind::Text,
+                "must not be silently dropped", Status::Done, ContentType::Plain,
+            )
+            .expect_err("a persistent store with no db must fail loud at journal time");
+        assert!(
+            matches!(err, BlockStoreError::NoDatabaseConfigured),
+            "expected NoDatabaseConfigured, got {err:?}",
+        );
+    }
+
+    /// Durability across an *unclean* kill: a live store commits via the real
+    /// insert/append paths, then both the store and its SQLite connection are
+    /// leaked (never closed, never checkpointed) to simulate SIGKILL. A brand
+    /// new connection opening the same files must recover everything from the
+    /// on-disk main file + WAL via `load_from_db`. Distinct from the
+    /// `test_drop_reload_*` tests above, which reuse the live connection and so
+    /// never exercise fresh-open WAL recovery.
+    #[test]
+    fn test_durability_across_kill() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("kill.db");
+        let creator = PrincipalId::system();
+        let ctx = ContextId::new();
+
+        // Phase 1 — a "live kernel" writes, then dies without a clean close.
+        let ws_id = {
+            let db = Arc::new(parking_lot::Mutex::new(
+                KernelDb::open(&db_path).expect("open DB"),
+            ));
+            let ws_id = db
+                .lock()
+                .get_or_create_default_workspace(creator)
+                .expect("create workspace");
+            let store = BlockStore::with_db(db.clone(), ws_id, creator);
+            store
+                .create_document(ctx, DocumentKind::Conversation, None)
+                .expect("create document");
+            let block_id = store
+                .insert_block(
+                    ctx, None, None, Role::User, BlockKind::Text,
+                    "before the kill", Status::Done, ContentType::Plain,
+                )
+                .expect("insert block");
+            store
+                .append_text(ctx, &block_id, " — appended")
+                .expect("append text");
+
+            // SIGKILL simulation: leak both the in-memory CRDT state and the
+            // SQLite connection so neither is cleanly closed or checkpointed.
+            // Whatever was committed must survive in the on-disk files alone.
+            std::mem::forget(store);
+            std::mem::forget(db);
+            ws_id
+        };
+
+        // Phase 2 — a fresh connection opens the same files and recovers.
+        let db2 = Arc::new(parking_lot::Mutex::new(
+            KernelDb::open(&db_path).expect("reopen DB"),
+        ));
+        let store2 = BlockStore::with_db(db2, ws_id, creator);
+        store2.load_from_db().expect("load_from_db");
+
+        let content = store2.get_content(ctx).expect("get content");
+        assert_eq!(
+            content, "before the kill — appended",
+            "committed blocks must survive an unclean kill (recovered from WAL)",
         );
     }
 

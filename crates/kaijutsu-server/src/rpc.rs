@@ -274,6 +274,28 @@ pub struct SharedKernelState {
 
 pub type SharedKernel = Arc<SharedKernelState>;
 
+impl Drop for SharedKernelState {
+    fn drop(&mut self) {
+        // Best-effort WAL checkpoint on clean teardown so the main `.db` file
+        // doesn't linger behind committed history after exit. This fires only
+        // when the LAST `Arc<SharedKernelState>` drops — a clean process exit
+        // or test teardown. It does NOT run on SIGKILL/SIGTERM: the server's
+        // run loop never returns and the process dies without unwinding. So
+        // this is insurance, not the primary durability path — the proactive
+        // checkpoint after each compaction is (see `BlockStore::compact_*`).
+        // The remaining gap (a SIGTERM handler for systemd `stop`) is tracked
+        // in docs/issues.md under "graceful-shutdown WAL checkpoint".
+        let db = self.kernel_db.lock();
+        match db.checkpoint() {
+            Ok((busy, _, _)) if busy != 0 => {
+                log::debug!("shutdown wal_checkpoint(TRUNCATE) busy; WAL left for next open");
+            }
+            Ok(_) => {}
+            Err(e) => log::warn!("shutdown wal_checkpoint failed: {e}"),
+        }
+    }
+}
+
 impl SharedKernelState {
     /// Create a fresh `ContextInterruptState` for a new prompt, replacing any previous entry.
     ///
