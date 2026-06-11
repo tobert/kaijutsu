@@ -1247,12 +1247,20 @@ impl BlockStore {
                 // Take the successor of the current tail instead (or the tick key
                 // when the store is empty). from_snapshot only uses this when
                 // snap.order_key is None.
-                let fallback_key = match self.block_ids_ordered().last() {
-                    Some(last) => {
-                        let last_key = self.blocks[last].order_key().to_string();
-                        order_key_successor(&last_key, &self.agent_order_suffix())
+                // Only the key-less legacy path needs a fallback; the
+                // successor-of-tail costs an O(n) ordered scan, so skip it when the
+                // snapshot already carries its order_key (the common case — keeps
+                // restore linear instead of O(n²) over a large merge).
+                let fallback_key = if snap.order_key.is_some() {
+                    String::new()
+                } else {
+                    match self.block_ids_ordered().last() {
+                        Some(last) => {
+                            let last_key = self.blocks[last].order_key().to_string();
+                            order_key_successor(&last_key, &self.agent_order_suffix())
+                        }
+                        None => self.order_key_for_tick(self.next_tick),
                     }
-                    None => self.order_key_for_tick(self.next_tick),
                 };
                 let block = if has_ops_for.contains(&snap.id) {
                     // DTE ops will provide content with proper causal history.
@@ -1572,12 +1580,20 @@ impl BlockStore {
             // merge_ops. Take the successor of the current tail instead (or the
             // tick key when the store is still empty). `from_snapshot` only reaches
             // this when block_snap.order_key is None.
-            let fallback_key = match store.block_ids_ordered().last() {
-                Some(last) => {
-                    let last_key = store.blocks[last].order_key().to_string();
-                    order_key_successor(&last_key, &store.agent_order_suffix())
+            // Only the key-less legacy path needs a fallback; the successor-of-tail
+            // costs an O(n) ordered scan, so skip it when the snapshot already
+            // carries its order_key (the common case — keeps restore linear instead
+            // of O(n²) over a large document).
+            let fallback_key = if block_snap.order_key.is_some() {
+                String::new()
+            } else {
+                match store.block_ids_ordered().last() {
+                    Some(last) => {
+                        let last_key = store.blocks[last].order_key().to_string();
+                        order_key_successor(&last_key, &store.agent_order_suffix())
+                    }
+                    None => store.order_key_for_tick(store.next_tick),
                 }
-                None => store.order_key_for_tick(store.next_tick),
             };
 
             if history.is_empty() {

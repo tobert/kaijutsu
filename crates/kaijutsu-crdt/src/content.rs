@@ -134,26 +134,31 @@ pub(crate) fn base62_decode(s: &str) -> Option<i64> {
 pub(crate) fn order_key_successor(pred: &str, suffix: &str) -> String {
     // Canonical shape: 'V' + at least 11 base-62 chars. The first 11 after 'V'
     // are the width-11 number; anything past that is the agent suffix and is
-    // ignored for the increment.
-    let canonical = pred.as_bytes().first() == Some(&b'V') && pred.len() >= 12;
-    if canonical {
-        let number = &pred[1..12];
-        if let Some(n) = base62_decode(number)
-            && let Some(next) = n.checked_add(1)
-        {
-            let key = format!("V{}{}", base62_encode_padded(next, 11), suffix);
-            // Belt and braces: the increment can only sort after pred. If it
-            // somehow didn't, fall through to the prefix-extension fallback
-            // rather than emit a non-monotonic key.
-            if key.as_str() > pred {
-                return key;
-            }
-            tracing::error!(
-                pred = %pred,
-                candidate = %key,
-                "order_key_successor: canonical increment not > pred, using fallback"
-            );
+    // ignored for the increment. `get(1..12)` returns None if pred is shorter
+    // than 12 bytes OR 12 isn't a char boundary (a non-ASCII legacy key) — both
+    // fall through to the prefix-extension fallback rather than panicking on a
+    // byte slice.
+    let number = if pred.as_bytes().first() == Some(&b'V') {
+        pred.get(1..12)
+    } else {
+        None
+    };
+    if let Some(number) = number
+        && let Some(n) = base62_decode(number)
+        && let Some(next) = n.checked_add(1)
+    {
+        let key = format!("V{}{}", base62_encode_padded(next, 11), suffix);
+        // Belt and braces: the increment can only sort after pred. If it
+        // somehow didn't, fall through to the prefix-extension fallback
+        // rather than emit a non-monotonic key.
+        if key.as_str() > pred {
+            return key;
         }
+        tracing::error!(
+            pred = %pred,
+            candidate = %key,
+            "order_key_successor: canonical increment not > pred, using fallback"
+        );
     }
 
     // General fallback: strictly greater than pred by prefix extension. Grows
@@ -869,6 +874,22 @@ mod successor_tests {
         let succ = order_key_successor(&pred, "BBBB");
         assert_eq!(succ, format!("{pred}V{}", "BBBB"));
         assert!(succ > pred, "must not wrap below pred");
+    }
+
+    #[test]
+    fn multibyte_predecessor_falls_back_without_panic() {
+        // A non-ASCII pred starting with 'V' must NOT panic on the `[1..12]` byte
+        // slice (12 may land mid-codepoint) — it falls through to the prefix
+        // extension. Order keys are ASCII by construction, so this is belt-and-
+        // braces against a malformed/legacy key, never a live path.
+        // 'V' + 9 ASCII (bytes 1..=9) + a 4-byte emoji at bytes 10..=13, so byte 12
+        // lands mid-codepoint — `&pred[1..12]` would have panicked; `get(1..12)`
+        // returns None and we fall through.
+        let pred = "V012345678🎷";
+        assert!(!pred.is_char_boundary(12), "byte 12 must split the emoji for this pin");
+        let succ = order_key_successor(pred, "BBBB");
+        assert_eq!(succ, format!("{pred}V{}", "BBBB"));
+        assert!(succ.as_str() > pred, "fallback still sorts strictly after pred");
     }
 
     #[test]
