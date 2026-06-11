@@ -743,12 +743,7 @@ impl BlockStore {
         let entry = self
             .get(context_id)
             .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
-        Ok(entry
-            .doc
-            .blocks_ordered()
-            .iter()
-            .filter_map(|b| b.tick)
-            .max())
+        Ok(entry.doc.max_tick())
     }
 
     // =========================================================================

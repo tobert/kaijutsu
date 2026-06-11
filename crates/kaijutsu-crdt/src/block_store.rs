@@ -200,6 +200,18 @@ impl BlockStore {
         ordered.into_iter().map(|(_, id)| id).collect()
     }
 
+    /// The maximum `Tick` over live blocks, or `None` if none carry one. A direct
+    /// O(N) scan — no ordering sort, no snapshot allocation — for the re-arm
+    /// playhead seed (the ordered/allocating `blocks_ordered` path is gratuitous
+    /// here since only the max matters, not document order).
+    pub fn max_tick(&self) -> Option<Tick> {
+        self.blocks
+            .values()
+            .filter(|b| !b.is_deleted())
+            .filter_map(|b| b.tick())
+            .max()
+    }
+
     /// Get blocks in document order as snapshots.
     pub fn blocks_ordered(&self) -> Vec<BlockSnapshot> {
         self.block_ids_ordered()
@@ -4333,11 +4345,12 @@ mod tests {
         );
     }
 
-    /// T4 — fork variants seed tick + lanes. Parameterized over fork /
+    /// T4 — fork variants seed tick + seq lanes. Parameterized over fork /
     /// fork_at_version / fork_filtered. Fails today (Self::new + own-principal
-    /// guards). The rotation-critical graft (design §2.4, §3).
+    /// guards). The rotation-critical graft (design §2.4, §3). ("Seq lanes" =
+    /// per-principal id counters; "lane" the track concept is unrelated.)
     #[test]
-    fn fork_seeds_tick_and_lanes() {
+    fn fork_seeds_tick_and_seq_lanes() {
         #[derive(Clone, Copy)]
         enum Variant {
             Fork,

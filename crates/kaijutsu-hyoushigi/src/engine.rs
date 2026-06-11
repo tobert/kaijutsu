@@ -682,8 +682,9 @@ mod tests {
     }
 
     /// Like `deferred_at`, but on an explicit lane — drives the cross-track
-    /// `UseLastGood` tests. `played_by` is irrelevant to these tests, so the
-    /// solo-track default (`beat()`) stands.
+    /// `UseLastGood` tests. `played_by` is irrelevant to these tests, so it
+    /// defaults to `PrincipalId::beat()` (the author axis, independent of the
+    /// `track` lane — the two are distinct coordinates).
     fn deferred_at_track(start: i64, fallback: Fallback, track: TrackId) -> Cell {
         Cell::deferred_on(
             Span::instant(Tick::new(start)),
