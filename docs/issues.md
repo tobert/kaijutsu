@@ -221,24 +221,6 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   (`beats_per_phrase`, `ooda_every`, period) and `beat_count` all evaporate on
   restart, but persisting them alone is useless because nothing re-arms contexts
   post-restart at all — the sweep and the persistence land together or not at all.
-- **Materialize-error poison cell → `Error` block on budget exhaustion:** DONE
-  (Chameleon batch 1, F2). The swallow-and-retry-forever loop is gone: a
-  `materialize_committed` failure now escalates to `log::error!` with a per-cell
-  consecutive-failure count, and after `MATERIALIZE_RETRY_BUDGET` (3) failures on
-  the SAME cell the bridge skips it (loudly) so the beat loop always terminates.
-  Pre-F1 the classic trigger was `DuplicateBlock` (fixed structurally by seq
-  lanes); other failure modes (CAS write, insert, underivable committed ABC) now
-  hit the bounded retry-then-skip path. On budget exhaustion `process_one` now
-  surfaces exactly ONE `BlockKind::Error` block (category `Kernel`, anchored at the
-  document tail, authored by `beat()`) — deduped by construction (the skip happens
-  once per poison cell), so the miss is visible in the conversation, not just the
-  logs. Pinned by `poison_cell_skip_surfaces_error_block` (`beat.rs`). The failure
-  count is per-context, so two tracks failing concurrently each get their own
-  budget (no longer one poison stalling the whole beat indefinitely). Separately,
-  the engine *resolve*-failure ledger (`Timeline::failures()`, a different miss
-  class — CAS read miss / validator reject that drops the cell before it commits)
-  drains into one Error block per event past a monotone `failure_water` cursor,
-  pinned by `resolve_failure_surfaces_error_block`.
 - **App track chip + "transport" label for beat():** author chips show the
   player's principal on played phrases and `beat()`'s on transport fallback
   repeats — truthful but mildly noisy. Add a track chip (the lane identity) and a
