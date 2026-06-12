@@ -29,6 +29,7 @@ pub mod llm;
 pub mod mcp;
 pub mod peers;
 pub mod runtime;
+pub mod seed_presets;
 pub mod seed_scripts;
 pub mod state;
 pub mod vfs;
