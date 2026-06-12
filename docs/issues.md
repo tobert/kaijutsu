@@ -332,14 +332,13 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   reduce*: save tokens for a long-running iterating player. Copy cost is a
   non-issue (storage cheap); the axis is KV-cache strategy. Two unbuilt
   primitives this model implies:
-  - **`kj fork --exclude <block>…` on FULL fork.** Today `fork_full`
-    (`kj/fork.rs:171`) calls the *unfiltered* `fork_document` — a full fork
-    copies everything, no way to drop a block. The capability already exists
-    (`ForkBlockFilter.exclude_block_ids` + `fork_document_filtered`, used by
-    `--shallow`); it's just not wired onto full fork. Needed for the
-    orchestrator-repair case ("fork X *without* the huge block that blew it up").
-    Bounded: add the flag, route `fork_full` through `fork_document_filtered`
-    when exclusions are present.
+  - **[DONE 2026-06-12] `kj fork --exclude <block>…` on FULL fork** (commit
+    c51544d). `fork_full` now routes through `fork_document_filtered` with
+    `exclude_block_ids` when `--exclude` is given (else the plain unfiltered copy,
+    zero overhead). Fail-loud validation (parses + exists in source, like
+    `--mark`). The orchestrator-repair case works. Scoped to full fork —
+    `--shallow`/`--compact` already filter and don't read `--exclude` yet (wire
+    it there if a thin fork ever needs ad-hoc exclusions).
   - **A snapshot/savepoint marker verb (speculative, not-now).** No general "tag
     this point to fork-from / rotate-at / reference later" verb exists. Closest
     today: `kj context hydrate --mark <block>` (hydration prefix only, one per

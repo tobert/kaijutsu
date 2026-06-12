@@ -974,9 +974,9 @@ mod tests {
         }
     }
 
-    /// A FULL fork is a deliberate clone, not a player spawn: windowing it at the
-    /// tail would pin its whole inherited log (the cost-bomb). The script leaves
-    /// it un-windowed — full history stays live, no policy set.
+    /// A FULL fork (regular `kj fork`) is the take-it-all / new-KV-cache path,
+    /// not a player spawn — windowing is a thin-fork concern, so the script
+    /// leaves a full fork un-windowed (full history stays live, no policy set).
     #[tokio::test]
     async fn composer_fork_hydrate_skips_a_full_clone() {
         let (_d, _child, policy) = run_composer_fork_hydrate(ForkKind::Full).await;

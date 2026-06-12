@@ -1,4 +1,16 @@
-//! Fork subcommand: deep-copy the current context's document.
+//! Fork subcommand: spawn a child context from the current one.
+//!
+//! Two strategies, by KV-cache intent (copy cost is a non-issue — storage is
+//! cheap):
+//! - **Full fork** (default) — take the whole context into a fresh lineage = a
+//!   NEW KV cache (resume-a-session-as-another-model, orchestrator repair,
+//!   drift-a-summary-back). `--exclude <block>…` drops a few named blocks (the
+//!   repair case); otherwise it's a plain deep copy.
+//! - **Thin fork** (`--shallow` / `--compact` / `--as`) — reuse/reduce: a leaner
+//!   child for a long-running iterating player. Routes through
+//!   `fork_document_filtered`. (See `docs/chameleon.md` "Players are rc
+//!   programs"; the open question of a thin fork's exact copy shape — last-N vs
+//!   prefix-preserving — is in `docs/issues.md`.)
 
 use std::collections::HashMap;
 
