@@ -105,8 +105,10 @@ band owns time — the transport (拍子木) does.
   editing them (the self-introspection-kernel pattern; less logic in Rust).
   Worked out across a long design thread; what got us here is below the line.
   Locked consequences:
-  - **Thin fork = rc-rebuilds.** A player is spawned by a thin (`--shallow`)
-    fork that keeps ~nothing; the child's `composer/fork/` rc re-establishes
+  - **Thin fork = rc-rebuilds.** A player is spawned by a `spawn`-preset fork
+    (`kj fork --preset spawn` per the 2026-06-12 fork-filters design,
+    `docs/fork-filters.md`; formerly `--shallow`) that keeps ~nothing; the
+    child's `composer/fork/` rc re-establishes
     setup (stance/chart/patch-sheet — already declarative) and arms itself
     (`kj transport ooda on --context <child>`; parent disarms — pure rc, the
     verb already takes `--context`). Carrying recent notation into the child is
@@ -119,7 +121,7 @@ band owns time — the transport (拍子木) does.
     small, so the fork rc re-anchoring the marker at the child tail (mirror of
     `create`) is cheap and correct, no env-var / `--show` needed.
   - **Fork-lineage IS song form.** Each thin fork is a section/movement; the
-    page-turn is the player **self-`kj fork --shallow`-ing on a horizon**. The
+    page-turn is the player **self-`kj fork --preset spawn`-ing on a horizon**. The
     time-well's fork-lineage-down grammar draws the performance natively.
   - **Producer edits are horizon-latched.** Scripts snapshot at instantiation
     (updates don't leak into a live context), so a producer's rc edit lands at
@@ -328,8 +330,10 @@ a closed cold segment; the player's label moves to the new head. Log
 rotation, literally. A day of playing = a short chain of segments in the
 DAG (one fork edge per rotation — the time-well's fork-lineage grammar draws
 it natively); the app attaches only to the live head, so dense history never
-reaches the renderer. This is also the second concrete voice for the
-fork-selectivity revisit (`kj fork` is a full copy today).
+reaches the renderer. This was also the second concrete voice for the
+fork-selectivity revisit — resolved 2026-06-12 in `docs/fork-filters.md`
+(interval selection + presets; the `window`/`spawn` factory presets are
+exactly these two voices, brought to the design together).
 
 Rotation invariants:
 

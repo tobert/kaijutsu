@@ -339,39 +339,53 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
     `--mark`). The orchestrator-repair case works. Scoped to full fork —
     `--shallow`/`--compact` already filter and don't read `--exclude` yet (wire
     it there if a thin fork ever needs ad-hoc exclusions).
-  - **A snapshot/savepoint marker verb (speculative, not-now).** No general "tag
-    this point to fork-from / rotate-at / reference later" verb exists. Closest
-    today: `kj context hydrate --mark <block>` (hydration prefix only, one per
-    ctx) and the `compacted` flag set by `kj compact`'s threshold auto-compaction
-    (not a manual savepoint). Would pair with `--exclude` (name the block) and
-    the time-well's fork-lineage navigation. Revisit when the orchestrator work
-    needs it.
-  - **OPEN design question before more thin-fork code — what shape does a thin
-    fork copy?** `--shallow` today keeps the *last-N* blocks (`max_blocks`), which
-    Amy flagged as a weak primitive. But "thin = KV *reuse*" implies preserving
-    the parent's cached prefix `[0,P]` byte-for-byte (= `select_hydration_window`'s
-    keep-set, `[0,P] ∪ tail`), NOT last-N — last-N breaks the prefix → cache miss.
-    This tensions with the locked "thin fork = rc-rebuilds" (rebuild produces
-    *fresh* bytes → also a cache miss). Likely resolution: rc-rebuilds is fine for
-    the **cache-less local bass** (token reduction is the win, no prefix to
-    reuse); **prefix-preservation** (`[0,P] ∪ tail` copy filter) is what an
-    **API-model** chair would want for true KV reuse. Decide before reshaping
-    `--shallow` or trusting the composer/fork hydrate script's re-anchor-at-tail
-    for non-local chairs.
+  - **A snapshot/savepoint marker verb (speculative, not-now — direction set
+    2026-06-12).** Absorbed by the fork-filters range grammar as a future
+    **label endpoint** (`docs/fork-filters.md`): a savepoint is a colon-free
+    name on a block, usable as a range endpoint (`kj fork --include 0:bridge`)
+    — no new fork machinery, no verb semantics of its own. Still not-now;
+    build labels when the orchestrator work or the time-well wants named
+    points.
+  - **[RESOLVED 2026-06-12] What shape does a thin fork copy?** Answered by
+    the fork-filters design (`docs/fork-filters.md`): there is no single
+    "thin shape" — the kernel primitive is an **interval selection** over the
+    ordered block log (`kept = (base ∩ ∪inc) \ ∪exc`, order-free, resolved at
+    fork instant), and the shapes are **factory presets**: `window` = the
+    hydration keep-set `[0,P] ∪ tail` (prefix-preserving — the KV-reuse /
+    API-chair case; loud error if the parent has no policy row) and `spawn` =
+    ~nothing (rc-rebuilds — the player case; fresh bytes are the *feature*,
+    that's the horizon-latch edit channel). The rc-rebuilds-vs-prefix tension
+    dissolves: different intents, chosen per fork. last-N is retired with
+    `--shallow`/`--depth` (spelled `--include end-N:`). Hydration policy row
+    travels whenever the marked block survives the selection (mechanical
+    `(principal, seq)` remap) — which also resolves "fork drops the policy"
+    by construction. Coding plan in `tsugi.md`.
+  - **Presets as a deep kaijutsu concept (design thread, 2026-06-12).**
+    Preset = a named **ensemble of argument values**, not a behavior — the
+    audio patch-recall model (hit "e-piano", every knob moves, same synth).
+    Extends the existing model/prompt preset table (normalized `preset_args`
+    child table, verb-scoped from day one) to carry fork filters; a `player`
+    patch can move filter + model knobs in one recall. Recall-then-tweak:
+    scalars override, filters compose under the include invariant; recall is
+    a snapshot (horizon-latched, like rc scripts). Fork is the only wired
+    verb for now — generalizing to other verbs (discovery, user banks,
+    sharing) deserves its own design session.
 
   **Remaining follow-ups (deferred — from the same review):**
-  - **P1 — tool-pair / turn-boundary tail snap (latent until composer gets
-    tools).** The block-count tail can start mid-tool-pair: an orphan
-    `tool_result` is *dropped* by the snapshot repair (no 400, but silent content
-    loss) and a marker landing on a `tool_call` injects a synthetic "interrupted"
-    result every turn forever. Fix when tools arrive: snap `tail_start` (and the
-    create-time marker) back to a turn boundary (nearest preceding `User/Text`,
-    never start on `ToolResult`/`Model`-continuation).
-  - **P1 — no archive seam marker.** Prefix and tail concatenate with no
-    "[N blocks archived]" signal; two `Model/Text` fragments across the gap can
-    even merge into one assistant message (false continuity). Inject a synthetic
-    user-role seam between prefix and tail when `tail_start > prefix_end` (lands
-    after the prefix, so cache stays stable; also forces the flush).
+  - **P1 ×2 — absorbed into the shared SEAM MODULE (re-prioritized
+    2026-06-12: FIRST in the fork-filters build order).** The tool-pair /
+    turn-boundary tail snap (orphan `tool_result` silently dropped by the
+    snapshot repair; a marker on a `tool_call` injects a synthetic
+    "interrupted" result every turn forever) and the missing archive seam
+    (prefix+tail concatenate with no "[N blocks archived]" signal; cross-gap
+    `Model/Text` fragments can merge into false continuity) were "latent
+    until composer gets tools" as hydration bugs — but fork-filters' hand-cut
+    ranges make both reachable immediately. One first-class module owns every
+    keep-set cut edge: turn-boundary snapping (never start an interval on
+    `ToolResult`/`Model`-continuation), synthetic user-role seam injection
+    (after the prefix, cache-stable), tool-pair integrity. Consumers:
+    `rehydrate_windowed`, fork selection, the pull primitive. Contract in
+    `docs/fork-filters.md`.
   - **[FIXED 2026-06-12] Fail-loud on corrupt/unreadable policy.** The
     DB-read-failure path and corrupt stored policy (unparseable marker / window
     < 1) used to degrade silently to full history. Now `get_hydration_policy`
@@ -486,7 +500,6 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ## Testing & Tooling
 
-- **Live eval fork copy scope:** `kj fork` is a full copy. Decide if fork should be selective by default.
 - **russh teardown panic:** `ChannelCloseOnDrop::drop` panics with "there is no reactor running" in tests.
 - **Capnp schema change ⇒ three binaries to bounce:** the dev runner
   only rebuilds/restarts `kaijutsu-app`; `kaijutsu-server.service`
