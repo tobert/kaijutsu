@@ -1,5 +1,15 @@
 # Conversation as Session
 
+> **Status (2026-06-12): implemented, since refined.** The "hydrate once at
+> boundary events, append-only thereafter" invariant below now has one
+> deliberate exception: a context with a hydration policy
+> (`kj context hydrate --window N`) rebuilds a *windowed* wire per turn via
+> `ConversationMailbox::rehydrate_windowed` — prefix byte-stable, tail
+> sliding (see `docs/chameleon.md`, "RC-driven hydration marker"). The
+> fork-side selection/seam design that leans on the same keep-set is
+> `docs/fork-filters.md`. The rest of this doc is accurate as the original
+> design record.
+
 ## Goal
 
 Stop rebuilding the LLM-bound message list from the block log on every turn.

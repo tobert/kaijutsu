@@ -122,11 +122,18 @@ kj fork --name approach-a --prompt "investigate the auth module"     # injects a
 ```
 
 Notes:
-- `kj fork` **auto-switches** to the child. To stay where you are, switch
-  back: `kj context switch <parent-label>`.
+- `kj fork` **stays on the parent** (POSIX `fork()` semantics) and returns
+  the child id in `.data`. Pass `--switch` to move your session into the
+  child.
 - `--compact` runs an LLM distillation of the parent's history into the
   child's first block.
-- `--prompt "..."` injects a drift block into the child as it's created.
+- `--prompt "..."` injects a drift block into the child as it's created
+  AND drives the child's first autonomous turn — the child starts working
+  while you keep going.
+- `--exclude <block>` (repeatable) forks everything *except* named blocks —
+  the repair path for a context poisoned by a giant tool output.
+- Fork selectivity is growing into range filters + factory presets
+  (`full`/`window`/`spawn`) — design locked in `docs/fork-filters.md`.
 
 ### 3. Drift between contexts
 
@@ -185,12 +192,10 @@ forward work needs a bigger model.
 ### 6. Parallel exploration
 
 ```bash
-kj fork --name approach-a --prompt "try X"
-kj context switch <orchestrator-label>
-kj fork --name approach-b --prompt "try Y"
-kj context switch <orchestrator-label>
+kj fork --name approach-a --prompt "try X"   # stays on the orchestrator;
+kj fork --name approach-b --prompt "try Y"   # each child starts its own turn
 
-# (each child runs to completion via submits — driven by an Agent or User)
+# (children run autonomously; --prompt drove their first turn)
 
 kj drift pull approach-a "summarize what you tried"
 kj drift pull approach-b "summarize what you tried"

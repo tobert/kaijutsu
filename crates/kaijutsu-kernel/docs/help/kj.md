@@ -16,12 +16,12 @@ Commands accept a context reference wherever `<ctx>` appears:
 ### Parallel Exploration
 
 ```bash
-# Fork two approaches from the current context
-kj fork --name approach-a
-kj fork --name approach-b
+# Fork two approaches — you stay on the parent (POSIX fork semantics);
+# --prompt drives each child's first autonomous turn
+kj fork --name approach-a --prompt "try X"
+kj fork --name approach-b --prompt "try Y"
 
-# Work in approach-a, then pull findings into parent
-kj context switch .parent
+# Pull findings back into the parent
 kj drift pull approach-a "summarize what you tried"
 kj drift pull approach-b "summarize what you tried"
 ```
@@ -44,22 +44,25 @@ kj drift merge
 ## Commands
 
 ```
+attach          Attach to an existing context and run its rc attach lifecycle
+binding         show, allow, revoke, reset — a context's tool-capability allow-set
 block           list, ls, inspect, count, read, create, append, history, diff, edit, status
 cache           list, add, clear — Claude prompt-cache breakpoints
 cas             put, get, ls, info, rm — content-addressed blob storage
-context (ctx)   list, info, switch, create, set, log, move, archive, remove, retag
+context (ctx)   list, info, switch, create, set, log, move, archive, remove, retag, hydrate
 doc             list, tree, create, delete — storage layer (all kinds, not just conversation)
-fork            Fork current context (--shallow, --compact, --as)
-drive           Clock one autonomous turn on a context (--prompt)
 drift           push, pull, merge, flush, queue, cancel, history
+drive           Clock one autonomous turn on a context (--prompt)
+fork            Fork current context (--exclude, --shallow, --compact, --as, --switch)
 model           Show a context's effective model (--context <ref>)
 models          List configured providers, their models, and --model aliases
-transport       play, pause, stop, tempo <bpm>, ooda <on|off> — composer beat/playhead control
-prompt          list, show, inject — MCP prompt discovery and injection
+policy          show, set — a registered instance's per-call QoS policy
 preset          list, show, save, remove
+rc              add, list, rm, show, edit, reseed — lifecycle scripts (/etc/rc/<type>/<verb>/)
 search          <pattern> — regex search across blocks (--all, --context, --kind, --role)
+stage           commit, status, include, exclude — curate a staged (liminal) fork
+transport       play, pause, stop, tempo <bpm>, ooda <on|off> — composer beat/playhead control
 workspace (ws)  list, show, create, add, bind, remove
-synth           all, <ctx>, status — semantic indexing + keyword synthesis
 ```
 
 Run `kj <command> help` for detailed subcommand reference.

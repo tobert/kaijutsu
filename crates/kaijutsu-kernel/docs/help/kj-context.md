@@ -16,6 +16,7 @@ move <ctx> <new-parent>      Reparent a context                  (alias: mv)
 archive <ctx>                Soft-delete (latched — needs --confirm)
 remove <ctx>                 Hard-delete (latched)                (alias: rm)
 retag <label> <ctx>          Move a label to a different context (latched)
+hydrate [<ctx>] [flags]      Set/clear the hydration window policy (Operator-gated)
 ```
 
 `<ctx>` accepts a label, a full/short context id, or `.` for the current context.
@@ -57,6 +58,24 @@ kj context log .
 # Remove an env var
 kj context unset review --env RUST_LOG
 ```
+
+## Hydration window (cost guard)
+
+A windowed context hydrates only `[0, marker] ∪ last-window` instead of its
+whole history — the cost guard for long-running contexts driven at tempo
+(composer players). The marker pins a durable prefix; the tail slides.
+
+```bash
+kj context hydrate --window 16                  # window this context, marker at tail
+kj context hydrate bass --window 16 --mark <block-key>
+kj context hydrate bass --clear                 # back to hydrate-everything
+```
+
+`--window 0` is rejected; `--mark` must name a block in the target context
+(fail-loud). Operator-gated; rc lifecycle scripts run privileged (composer
+`create` rc sets `--window 16`). Design: `docs/chameleon.md` "RC-driven
+hydration marker"; the fork-side keep-set sharing this shape is
+`docs/fork-filters.md`.
 
 ## Model vs fork
 

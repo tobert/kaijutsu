@@ -290,8 +290,9 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
   **Player spawn = thin fork + rc-rebuilds (LOCKED 2026-06-12).** Resolves
   "fork drops the hydration policy" — see the "Players are rc programs" decision
-  in `docs/chameleon.md`. A player is spawned by a thin (`--shallow`) fork that
-  keeps ~nothing; the child's `composer/fork/` rc re-establishes setup and
+  in `docs/chameleon.md`. A player is spawned by a `spawn`-preset fork
+  (`kj fork --preset spawn` per `docs/fork-filters.md`; formerly `--shallow`)
+  that keeps ~nothing; the child's `composer/fork/` rc re-establishes setup and
   re-runs `kj context hydrate --window N` (mirror of `create`, marker defaults
   to the child's tail). Because the child is thin, re-anchoring at the tail is
   cheap and correct — which is *why* we dropped the alternative (copy the row /
@@ -312,7 +313,7 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
     read, three consumers** (`$HEARD` indexable array, fork-carry, marker
     archive). Strong signal it's the right primitive; keeps the carry in rc.
   - **Defer — horizon self-fork-rotate (page-turns / song sections).** The
-    player self-`kj fork --shallow`s on a phrase horizon; fork-lineage becomes
+    player self-`kj fork --preset spawn`s on a phrase horizon; fork-lineage becomes
     song form. Two trigger forms: **(a) now** a `composer/tick/SXX-rotate.kai`
     that fires every tick (`$PHRASE` is seeded) and acts only at the horizon
     (`phrase mod N == 0`) — zero new machinery; **(b) later** a declarative
@@ -328,17 +329,31 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 - **Fork primitives — full/thin mental model (Amy, 2026-06-12).** Full fork
   (regular `kj fork`) is the *powerful* path: take the whole context into a fresh
   lineage = a **new KV cache** (resume-a-session-as-another-model, orchestrator
-  repair, drift-a-summary-back). Thin fork (`--shallow`/`--compact`) is *reuse/
-  reduce*: save tokens for a long-running iterating player. Copy cost is a
-  non-issue (storage cheap); the axis is KV-cache strategy. Two unbuilt
-  primitives this model implies:
+  repair, drift-a-summary-back). Thin fork is *reuse/reduce*: save tokens for
+  a long-running iterating player (now the `window`/`spawn` factory presets
+  per `docs/fork-filters.md`; `--shallow` retiring, `--compact` unchanged).
+  Copy cost is a non-issue (storage cheap); the axis is KV-cache strategy.
+  Two unbuilt primitives this model implied (both since designed):
   - **[DONE 2026-06-12] `kj fork --exclude <block>…` on FULL fork** (commit
     c51544d). `fork_full` now routes through `fork_document_filtered` with
     `exclude_block_ids` when `--exclude` is given (else the plain unfiltered copy,
     zero overhead). Fail-loud validation (parses + exists in source, like
-    `--mark`). The orchestrator-repair case works. Scoped to full fork —
-    `--shallow`/`--compact` already filter and don't read `--exclude` yet (wire
-    it there if a thin fork ever needs ad-hoc exclusions).
+    `--mark`). The orchestrator-repair case works. Scoped to full fork at the
+    time; superseded by the fork-filters algebra (`docs/fork-filters.md`) where
+    `--exclude` composes with any base — block-key form stays a dedicated flag,
+    ranges arrive with `--include`/`--exclude <range>`.
+  - **`spawn` must seed ticks from the PARENT snapshot (slice-3 requirement,
+    found in the 2026-06-12 doc sweep).** `fork_filtered` seeds the child's
+    `next_tick` + per-principal seq lanes only from *copied* blocks
+    (`block_store.rs` ~L1511, the batch-1 f1-track fix). A `spawn` fork copies
+    ~nothing → nothing to seed from → a page-turned player re-mints ticks from
+    0: exactly the duplicate-low-tick/DuplicateBlock hazard f1-track fixed, and
+    it breaks the rotation invariant "tick continuity across segments" (musical
+    time is global + monotone, never reset). Fix when building the presets:
+    any selection that drops the max-tick block seeds from the parent's *full*
+    snapshot, not the kept set. (`--compact` has the same hole today — empty
+    document, no seeding at all — latent only because no composer context uses
+    it.)
   - **A snapshot/savepoint marker verb (speculative, not-now — direction set
     2026-06-12).** Absorbed by the fork-filters range grammar as a future
     **label endpoint** (`docs/fork-filters.md`): a savepoint is a colon-free
