@@ -46,7 +46,7 @@ pub struct FontDataMap {
 
 impl FontDataMap {
     /// Register font data for a FontId (no-op if already present).
-    pub fn register(&mut self, font: &bevy_vello::parley::FontData) {
+    pub fn register(&mut self, font: &parley::FontData) {
         let id = FontId::from_parley(font);
         self.data
             .entry(id)

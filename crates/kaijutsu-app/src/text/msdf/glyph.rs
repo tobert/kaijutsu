@@ -13,7 +13,7 @@ pub struct FontId(usize);
 
 impl FontId {
     /// Create a FontId from a Parley FontData's data pointer.
-    pub fn from_parley(font: &bevy_vello::parley::FontData) -> Self {
+    pub fn from_parley(font: &parley::FontData) -> Self {
         Self(font.data.data().as_ptr() as usize)
     }
 }

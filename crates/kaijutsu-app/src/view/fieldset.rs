@@ -4,7 +4,6 @@
 //! This module only handles role group lines — horizontal dividers with inset labels.
 
 use bevy::prelude::*;
-use bevy_vello::vello;
 use vello::kurbo::{Affine, Cap, Line, Stroke};
 use vello::peniko::{Brush, Fill};
 
@@ -115,7 +114,7 @@ fn draw_label_text(
 
     for line in layout.lines() {
         for item in line.items() {
-            let bevy_vello::parley::PositionedLayoutItem::GlyphRun(glyph_run) = item else {
+            let parley::PositionedLayoutItem::GlyphRun(glyph_run) = item else {
                 continue;
             };
             let mut gx = glyph_run.offset();

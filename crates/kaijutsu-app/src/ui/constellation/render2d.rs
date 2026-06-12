@@ -7,8 +7,8 @@
 
 use bevy::prelude::*;
 use bevy_vello::prelude::{UiVelloScene, UiVelloText};
-use bevy_vello::vello::kurbo::{Affine, BezPath, Cap, Point, RoundedRect, Stroke};
-use bevy_vello::vello::peniko::{Color as VelloColor, Fill};
+use kurbo::{Affine, BezPath, Cap, Point, RoundedRect, Stroke};
+use peniko::{Color as VelloColor, Fill};
 
 use kaijutsu_types::ContextId;
 
@@ -362,7 +362,7 @@ fn update_card_visuals(
         let card_w = (base_card_width * scale) as f64;
         let card_h = (CARD_HEIGHT * scale) as f64;
 
-        let mut scene = bevy_vello::vello::Scene::new();
+        let mut scene = vello::Scene::new();
         let rect = RoundedRect::new(0.0, 0.0, card_w, card_h, CARD_CORNER_RADIUS);
 
         // Distance-based opacity: focused=1.0, 1 hop=0.85, 2 hops=0.7, 3+=0.5
@@ -514,7 +514,7 @@ fn rebuild_edge_scene(
 
     let edge_color = bevy_to_vello_color(theme.fg_dim.with_alpha(0.4));
 
-    let mut vello_scene = bevy_vello::vello::Scene::new();
+    let mut vello_scene = vello::Scene::new();
 
     for node in &constellation.nodes {
         let Some(forked_from) = node.forked_from else {
@@ -645,7 +645,7 @@ pub(super) fn format_recency(last_activity: f64, now: f64) -> String {
 /// - compact: dotted 1.5px
 /// - subtree: solid 2.5px (thicker)
 fn draw_edge(
-    scene: &mut bevy_vello::vello::Scene,
+    scene: &mut vello::Scene,
     from: Vec2,
     to: Vec2,
     color: VelloColor,

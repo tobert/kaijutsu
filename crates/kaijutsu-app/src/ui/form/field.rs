@@ -89,7 +89,7 @@ fn rebuild_one_field_border(
         theme.border
     };
 
-    let mut scene = bevy_vello::vello::Scene::new();
+    let mut scene = vello::Scene::new();
     build_form_field_border(&mut scene, size.x as f64, size.y as f64, color, 4.0, 1.0);
     *scene_component = UiVelloScene::from(scene);
 }
@@ -108,7 +108,7 @@ pub fn sync_modal_panel_scene(
             continue;
         }
 
-        let mut scene = bevy_vello::vello::Scene::new();
+        let mut scene = vello::Scene::new();
         build_modal_panel(
             &mut scene,
             size.x as f64,
@@ -139,7 +139,7 @@ pub fn sync_form_button_scenes(
             theme.fg_dim.with_alpha(0.2)
         };
 
-        let mut scene = bevy_vello::vello::Scene::new();
+        let mut scene = vello::Scene::new();
         build_button_bg(&mut scene, size.x as f64, size.y as f64, bg, 4.0);
         *scene_component = UiVelloScene::from(scene);
     }
@@ -178,7 +178,7 @@ pub fn sync_row_highlights(
             row.0 == list.selected && list.items.get(row.0).is_some_and(|item| !item.is_header);
 
         if is_selected {
-            let mut scene = bevy_vello::vello::Scene::new();
+            let mut scene = vello::Scene::new();
             build_row_highlight(
                 &mut scene,
                 size.x as f64,
@@ -203,7 +203,7 @@ pub fn sync_row_highlights(
         let is_cursor = row.0 == tree.cursor;
 
         if is_cursor {
-            let mut scene = bevy_vello::vello::Scene::new();
+            let mut scene = vello::Scene::new();
             build_row_highlight(
                 &mut scene,
                 size.x as f64,
@@ -235,7 +235,7 @@ pub fn sync_form_overlay_scene(
             continue;
         }
 
-        let mut scene = bevy_vello::vello::Scene::new();
+        let mut scene = vello::Scene::new();
         build_overlay_bg(&mut scene, size.x as f64, size.y as f64, theme.bg);
         *scene_component = UiVelloScene::from(scene);
     }

@@ -317,7 +317,7 @@ pub fn build_shell_dock_glyphs(
                 if let Some(ref mut atlas) = atlas {
                     for line in layout.lines() {
                         for item in line.items() {
-                            if let bevy_vello::parley::PositionedLayoutItem::GlyphRun(gr) = item {
+                            if let parley::PositionedLayoutItem::GlyphRun(gr) = item {
                                 font_data_map.register(gr.run().font());
                             }
                         }
@@ -344,10 +344,10 @@ pub fn build_shell_dock_glyphs(
             }
 
             // Always recompute cursor geometry when anything changed
-            let cursor = bevy_vello::parley::editing::Cursor::from_byte_index(
+            let cursor = parley::editing::Cursor::from_byte_index(
                 &layout,
                 cursor_byte_offset,
-                bevy_vello::parley::layout::Affinity::Upstream,
+                parley::layout::Affinity::Upstream,
             );
             let geom = cursor.geometry(&layout, 2.0);
             cursor_geom.x = text_offset.0 + geom.x0;

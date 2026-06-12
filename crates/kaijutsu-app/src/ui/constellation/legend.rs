@@ -6,8 +6,8 @@
 
 use bevy::prelude::*;
 use bevy_vello::prelude::UiVelloScene;
-use bevy_vello::vello::kurbo::RoundedRect;
-use bevy_vello::vello::peniko::{Color as VelloColor, Fill};
+use kurbo::RoundedRect;
+use peniko::{Color as VelloColor, Fill};
 
 use super::{Constellation, ConstellationContainer};
 use crate::text::truncate_chars;
@@ -101,11 +101,11 @@ fn spawn_legend_panel(
     // Build background scene (renders in Vello pass, not UI pass — won't cover Vello text)
     let bg_color = theme.panel_bg.with_alpha(0.85).to_srgba();
     let vello_bg = VelloColor::new([bg_color.red, bg_color.green, bg_color.blue, bg_color.alpha]);
-    let mut scene = bevy_vello::vello::Scene::new();
+    let mut scene = vello::Scene::new();
     let rect = RoundedRect::new(0.0, 0.0, 160.0, 120.0, 4.0);
     scene.fill(
         Fill::NonZero,
-        bevy_vello::vello::kurbo::Affine::IDENTITY,
+        kurbo::Affine::IDENTITY,
         vello_bg,
         None,
         &rect,

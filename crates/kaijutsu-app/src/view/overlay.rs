@@ -9,7 +9,6 @@
 
 use bevy::prelude::*;
 use bevy::ui::ComputedNode;
-use bevy_vello::parley;
 use bevy_vello::prelude::{VelloFont, VelloTextAlign, VelloTextStyle};
 
 use crate::cell::block_border::{BlockBorderStyle, BorderAnimation, BorderKind, BorderPadding};
@@ -319,7 +318,7 @@ pub fn build_overlay_glyphs(
                 if let Some(ref mut atlas) = atlas {
                     for line in layout.lines() {
                         for item in line.items() {
-                            if let bevy_vello::parley::PositionedLayoutItem::GlyphRun(gr) = item {
+                            if let parley::PositionedLayoutItem::GlyphRun(gr) = item {
                                 font_data_map.register(gr.run().font());
                             }
                         }

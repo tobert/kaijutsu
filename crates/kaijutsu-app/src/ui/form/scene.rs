@@ -5,7 +5,6 @@
 //! Analogous to `view/fieldset.rs` for conversation block borders.
 
 use bevy::prelude::*;
-use bevy_vello::vello;
 use vello::kurbo::{Affine, Cap, RoundedRect, Stroke};
 use vello::peniko::Fill;
 

@@ -17,7 +17,6 @@ use bevy::render::{
     texture::GpuImage,
 };
 use bevy_vello::prelude::*;
-use bevy_vello::vello;
 use vello::kurbo::Affine;
 use vello::peniko::Fill;
 
@@ -433,7 +432,7 @@ pub fn build_block_scenes(
                 if let Some(ref mut atlas) = atlas {
                     for line in layout.lines() {
                         for item in line.items() {
-                            if let bevy_vello::parley::PositionedLayoutItem::GlyphRun(gr) = item {
+                            if let parley::PositionedLayoutItem::GlyphRun(gr) = item {
                                 font_data_map.register(gr.run().font());
                             }
                         }
@@ -550,7 +549,7 @@ pub fn build_block_scenes(
                 if let Some(ref mut atlas) = atlas {
                     for line in parley_layout.lines() {
                         for item in line.items() {
-                            if let bevy_vello::parley::PositionedLayoutItem::GlyphRun(gr) = item {
+                            if let parley::PositionedLayoutItem::GlyphRun(gr) = item {
                                 font_data_map.register(gr.run().font());
                             }
                         }
@@ -612,7 +611,7 @@ pub fn build_block_scenes(
                 if let Some(ref mut atlas) = atlas {
                     for line in layout.lines() {
                         for item in line.items() {
-                            if let bevy_vello::parley::PositionedLayoutItem::GlyphRun(gr) = item {
+                            if let parley::PositionedLayoutItem::GlyphRun(gr) = item {
                                 font_data_map.register(gr.run().font());
                             }
                         }
@@ -683,7 +682,7 @@ pub fn build_block_scenes(
 
                     for line in label_layout.lines() {
                         for item in line.items() {
-                            if let bevy_vello::parley::PositionedLayoutItem::GlyphRun(gr) = item {
+                            if let parley::PositionedLayoutItem::GlyphRun(gr) = item {
                                 font_data_map.register(gr.run().font());
                             }
                         }
@@ -722,7 +721,7 @@ pub fn build_block_scenes(
 
                     for line in label_layout.lines() {
                         for item in line.items() {
-                            if let bevy_vello::parley::PositionedLayoutItem::GlyphRun(gr) = item {
+                            if let parley::PositionedLayoutItem::GlyphRun(gr) = item {
                                 font_data_map.register(gr.run().font());
                             }
                         }
@@ -773,7 +772,7 @@ pub fn build_block_scenes(
             let cb_offset = (cb_x as f64, cb_y as f64);
             for line in cb_layout.lines() {
                 for item in line.items() {
-                    if let bevy_vello::parley::PositionedLayoutItem::GlyphRun(gr) = item {
+                    if let parley::PositionedLayoutItem::GlyphRun(gr) = item {
                         font_data_map.register(gr.run().font());
                     }
                 }

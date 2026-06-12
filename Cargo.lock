@@ -5646,10 +5646,13 @@ dependencies = [
  "kaijutsu-telemetry",
  "kaijutsu-types",
  "kaish-kernel",
+ "kurbo",
  "log",
  "logos",
  "modalkit",
  "msdfgen",
+ "parley",
+ "peniko",
  "pollster",
  "pulldown-cmark",
  "rect_packer",
@@ -5665,6 +5668,7 @@ dependencies = [
  "tracing-subscriber",
  "ttf-parser 0.19.2",
  "uuid",
+ "vello",
  "whoami",
 ]
 

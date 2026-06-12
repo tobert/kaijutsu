@@ -3,8 +3,7 @@
 //! Extracts positioned glyph data from Parley layouts for MSDF rendering.
 //! Parley measures, MSDF renders — both use the same font data and metrics.
 
-use bevy_vello::parley;
-use bevy_vello::vello::peniko::Brush;
+use peniko::Brush;
 
 use super::atlas::MsdfAtlas;
 use super::glyph::{FontId, GlyphKey, PositionedGlyph};

@@ -6,8 +6,8 @@
 
 use bevy::prelude::*;
 use bevy_vello::prelude::{UiVelloScene, UiVelloText};
-use bevy_vello::vello::kurbo::{Affine, RoundedRect};
-use bevy_vello::vello::peniko::{Color as VelloColor, Fill};
+use kurbo::{Affine, RoundedRect};
+use peniko::{Color as VelloColor, Fill};
 
 use super::{Constellation, ConstellationContainer};
 use crate::ui::screen::Screen;
@@ -50,7 +50,7 @@ fn spawn_detail_sidebar(
     // Background scene (Vello — won't occlude Vello text)
     let bg_color = theme.panel_bg.with_alpha(0.90).to_srgba();
     let vello_bg = VelloColor::new([bg_color.red, bg_color.green, bg_color.blue, bg_color.alpha]);
-    let mut scene = bevy_vello::vello::Scene::new();
+    let mut scene = vello::Scene::new();
     let rect = RoundedRect::new(0.0, 0.0, 280.0, 300.0, 6.0);
     scene.fill(Fill::NonZero, Affine::IDENTITY, vello_bg, None, &rect);
 
@@ -175,7 +175,7 @@ fn update_detail_content(
             accent_srgba.alpha,
         ]);
 
-        let mut scene = bevy_vello::vello::Scene::new();
+        let mut scene = vello::Scene::new();
         let rect = RoundedRect::new(0.0, 0.0, 280.0, 300.0, 6.0);
         scene.fill(Fill::NonZero, Affine::IDENTITY, vello_bg, None, &rect);
 
@@ -321,7 +321,7 @@ fn spawn_divider(commands: &mut Commands, theme: &Theme) -> Entity {
     let vello_border =
         VelloColor::new([border_srgba.red, border_srgba.green, border_srgba.blue, 0.3]);
 
-    let mut scene = bevy_vello::vello::Scene::new();
+    let mut scene = vello::Scene::new();
     let line_rect = RoundedRect::new(0.0, 0.0, 256.0, 1.0, 0.0);
     scene.fill(
         Fill::NonZero,

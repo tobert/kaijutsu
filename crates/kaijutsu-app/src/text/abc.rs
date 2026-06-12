@@ -6,7 +6,6 @@
 
 use bevy::prelude::default;
 use bevy_vello::prelude::*;
-use bevy_vello::vello;
 use vello::kurbo::{Affine, BezPath, Cap, Line, Stroke};
 use vello::peniko::{Brush, Fill};
 

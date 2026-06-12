@@ -10,7 +10,6 @@
 //! Rendering is pure Vello `BezPath` — no text layout involved.
 
 use bevy::prelude::Color;
-use bevy_vello::vello;
 use vello::kurbo::{BezPath, Cap, Join, Point, Stroke};
 use vello::peniko::{Brush, Fill};
 

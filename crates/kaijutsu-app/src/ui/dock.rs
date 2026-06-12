@@ -11,7 +11,6 @@ use std::collections::VecDeque;
 
 use bevy::prelude::*;
 use bevy_vello::prelude::{UiVelloScene, VelloFont, VelloTextAlign, VelloTextStyle};
-use bevy_vello::vello;
 use vello::kurbo::Affine;
 use vello::peniko::Fill;
 
@@ -199,7 +198,7 @@ fn draw_dock_text(
 
     for line in layout.lines() {
         for item in line.items() {
-            let bevy_vello::parley::PositionedLayoutItem::GlyphRun(glyph_run) = item else {
+            let parley::PositionedLayoutItem::GlyphRun(glyph_run) = item else {
                 continue;
             };
             let mut gx = glyph_run.offset();
