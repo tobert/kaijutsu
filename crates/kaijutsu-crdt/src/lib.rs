@@ -28,6 +28,7 @@ mod dag;
 mod document;
 mod error;
 mod ops;
+pub mod selection;
 
 // Re-export types from kaijutsu-types
 pub use kaijutsu_types::{
@@ -40,6 +41,7 @@ pub use kaijutsu_types::{
 
 // New architecture
 pub use block_store::{BlockStore, ForkBlockFilter, StoreSnapshot, SyncPayload};
+pub use selection::{IntervalSet, SelectionError, resolve_keep_set, window_base};
 pub use content::BlockContent;
 pub use dag::ConversationDAG;
 

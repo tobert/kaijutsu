@@ -79,20 +79,13 @@ fn hydration_keep_set(
     marker: Option<BlockId>,
     window: usize,
 ) -> Vec<Range<usize>> {
-    let len = blocks.len();
-    let Some(marker) = marker else {
-        return vec![0..len];
-    };
-    let Some(marker_idx) = blocks.iter().position(|b| b.id == marker) else {
-        return vec![0..len];
-    };
-    let prefix_end = marker_idx + 1;
-    let tail_start = len.saturating_sub(window);
-    // Prefix `[0, marker]` and the last `window` blocks. They may overlap when
-    // the window reaches into or behind the prefix — `plan_splice` merges, so a
-    // short log returns whole with no gap and no duplicate. A zero `window`
-    // gives an empty `len..len` tail run, which the splicer drops.
-    vec![0..prefix_end, tail_start..len]
+    // Resolve the marker `BlockId` to its position, then defer to the single
+    // definition of the `window` shape shared with the fork side. A `None` or
+    // stale (not-found) marker resolves to no index → the whole log. The result
+    // is a canonical (sorted, disjoint, merged) keep-set; `plan_splice` owns the
+    // order-dependent cut hygiene (snapping, tool-pairs, archived-gap seams).
+    let marker_idx = marker.and_then(|m| blocks.iter().position(|b| b.id == m));
+    kaijutsu_crdt::window_base(blocks.len(), marker_idx, window).into_runs()
 }
 
 impl ConversationMailbox {
@@ -323,10 +316,13 @@ mod tests {
 
     // ── hydration_keep_set: the order-free `window` runs ──────────────────
     //
-    // These pin the keep-set *producer* (prefix run ∪ tail run). Cut hygiene —
-    // snapping, tool-pairs, archived-gap seams — is plan_splice's job and lives
-    // in `llm::splice` tests; the windowed end-to-end behavior is exercised by
-    // the `rehydrate_windowed_*` tests below.
+    // These pin the keep-set *producer* — now `kaijutsu_crdt::window_base`, the
+    // shape shared with the fork side. It returns a canonical (merged) set, so
+    // an overlapping prefix/tail collapses here rather than in the splicer; the
+    // wire result is identical either way. Cut hygiene — snapping, tool-pairs,
+    // archived-gap seams — remains plan_splice's job and lives in `llm::splice`
+    // tests; the windowed end-to-end behavior is exercised by the
+    // `rehydrate_windowed_*` tests below.
 
     /// A run of `n` user blocks, so position in the log is observable by content
     /// ("b0".."b{n-1}"). Each gets a unique id via the per-thread seq.
@@ -353,27 +349,27 @@ mod tests {
     }
 
     #[test]
-    fn keep_set_overlap_emits_overlapping_runs() {
+    fn keep_set_overlap_merges_to_whole_log() {
         // 5 blocks, marker = b2 (prefix [0,3)), window 4 → tail_start 1. The
-        // runs overlap; plan_splice (its own tests) merges them to the whole log
-        // with no seam.
+        // prefix and tail overlap; the canonical producer merges them to the
+        // whole log (with no gap, so the splicer emits no seam).
         let blocks = run_of(5);
         let marker = blocks[2].id;
         assert_eq!(
             super::hydration_keep_set(&blocks, Some(marker), 4),
-            vec![0..3, 1..5],
+            vec![0..5],
         );
     }
 
     #[test]
-    fn keep_set_zero_window_is_prefix_then_empty_tail() {
-        // window 0 → tail run is `len..len` (empty); the splicer drops it,
-        // leaving just the prefix.
+    fn keep_set_zero_window_is_prefix_only() {
+        // window 0 → tail run is empty (`len..len`); the canonical producer
+        // drops it, leaving just the prefix.
         let blocks = run_of(6);
         let marker = blocks[1].id;
         assert_eq!(
             super::hydration_keep_set(&blocks, Some(marker), 0),
-            vec![0..2, 6..6],
+            vec![0..2],
         );
     }
 
