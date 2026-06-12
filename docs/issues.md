@@ -342,18 +342,49 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
     time; superseded by the fork-filters algebra (`docs/fork-filters.md`) where
     `--exclude` composes with any base — block-key form stays a dedicated flag,
     ranges arrive with `--include`/`--exclude <range>`.
-  - **`spawn` must seed ticks from the PARENT snapshot (slice-3 requirement,
-    found in the 2026-06-12 doc sweep).** `fork_filtered` seeds the child's
-    `next_tick` + per-principal seq lanes only from *copied* blocks
-    (`block_store.rs` ~L1511, the batch-1 f1-track fix). A `spawn` fork copies
-    ~nothing → nothing to seed from → a page-turned player re-mints ticks from
-    0: exactly the duplicate-low-tick/DuplicateBlock hazard f1-track fixed, and
-    it breaks the rotation invariant "tick continuity across segments" (musical
-    time is global + monotone, never reset). Fix when building the presets:
-    any selection that drops the max-tick block seeds from the parent's *full*
-    snapshot, not the kept set. (`--compact` has the same hole today — empty
-    document, no seeding at all — latent only because no composer context uses
-    it.)
+  - **[RESOLVED 2026-06-12 #2] Empty-selection fork seeds `next_tick = 0` —
+    that's correct, not a hazard (Amy's call).** A `spawn` (or `--compact`)
+    fork copies ~nothing, so there's nothing to seed from and the child's
+    timeline starts at tick 0. A `spawn` is a *birth*, not a rotation: a fresh
+    player has no prior segment to be continuous with, so tick 0 is the right
+    floor. The tick-continuity invariant (`docs/chameleon.md`) is a property of
+    **rotation**, where the fork carries a tail window — that fork copies the
+    max-tick block, so `fork_filtered` already seeds `next_tick` past it from
+    the *copied* set (`block_store.rs` ~L1511, the batch-1 f1-track fix);
+    unchanged and correct. DuplicateBlock can't arise from a low tick anyway —
+    block identity is `(context, principal, seq)` and the child holds a fresh
+    `context_id`. The one open edge is a *partial* selection that drops the
+    max-tick tail while keeping earlier ticked blocks (no composer preset does
+    this today); decide rotation-vs-fresh intent if such a preset ever lands.
+  - **[FOUNDATION FIXED 2026-06-12 #2, slice 2c — field retirement still
+    slice 4] `fork_filtered` truncated in the WRONG order.** `fork_filtered`
+    now builds its positional universe in document (`order_key`) order, so the
+    `selection` keep-set AND `max_blocks` index the timeline, not BlockId
+    order. `max_blocks` is correct in the interim (test:
+    `fork_filtered_max_blocks_keeps_most_recent_by_timeline`); the field is
+    marked deprecated and is retired in slice 4, spelled `--include end-N:`.
+    Original analysis preserved below. Two orders exist:
+    `BlockId` Ord is `(context_id, principal_id, seq)`, so `BTreeMap<BlockId>`
+    iteration (what `fork_filtered` walks at `block_store.rs:1475`) is
+    **principal-major, seq-minor**; document order is `order_key` (derived from
+    `tick`), exposed canonically by `block_ids_ordered()` (`:191`). The
+    `max_blocks` truncation comment (`:1489`, "keep the most recent (by
+    order_key, since BTreeMap is ordered)") asserts a **false equivalence** —
+    BTreeMap is ordered by BlockId, not order_key. They coincide only for a
+    single principal whose seq tracks tick; they diverge for **any
+    multi-principal context** (beat()+player, multiple models, drift author,
+    multi-user — the normal case), where `.skip(skip)` keeps one principal's
+    tail, not the N most recent by timeline. Live only via `kj fork
+    --depth`/`--shallow` (`fork.rs:426`) — the flag already slated for
+    retirement. `fork`/`fork_at_version` copy *all* blocks (each keeps its own
+    order_key, child re-sorts), so they're unaffected; `fork_filtered` is the
+    only position-dependent path. **Fix (chosen): fold `--depth N` into the
+    selection engine as `--include end-N:` over the `block_ids_ordered()`
+    snapshot (correct by construction), retire the `max_blocks` field. Add a
+    test proving position ≠ BlockId order on a multi-principal log so the
+    divergence can't silently return.** The comment is not an intentional
+    design choice — it contradicts the crate's own documented order model
+    (`block_store.rs:79–91`: "ordering is the successor-key axis").
   - **A snapshot/savepoint marker verb (speculative, not-now — direction set
     2026-06-12).** Absorbed by the fork-filters range grammar as a future
     **label endpoint** (`docs/fork-filters.md`): a savepoint is a colon-free

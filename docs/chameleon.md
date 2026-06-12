@@ -343,8 +343,11 @@ Rotation invariants:
   tell a rotation happened.
 - **Tick continuity** — the new segment's timeline/playhead seeds from the
   old segment's committed max; musical time is global and monotone across
-  segments, never reset. (Adjacent to hyoushigi's "seed playhead on re-arm"
-  open item.)
+  segments, never reset. This is a property of *rotation*, which carries a
+  tail window (and so copies the max-tick block — `fork_filtered` seeds from
+  the copied set). A *spawn* birth copies nothing and correctly starts at
+  tick 0; there is no prior segment to continue. (Adjacent to hyoushigi's
+  "seed playhead on re-arm" open item.)
 - **Quantized to safe boundaries** — rotation fires between turns at a
   phrase boundary (a trap is the natural trigger: every N blocks or M
   phrases, quantized), so it can never split a tool_use/tool_result group or
