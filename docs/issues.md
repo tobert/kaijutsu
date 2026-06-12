@@ -288,21 +288,52 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
     the anomaly"; none did. Fix: `rehydrate_windowed` now `warn!`s (recurring,
     every turn) when the marker doesn't resolve and windowing is bypassed.
 
-  **Remaining follow-ups (deferred — MEDIUM/LOW from the same review):**
-  - **MEDIUM — fork drops the hydration policy.** `fork_context_config` copies
-    shell/env/binding but not `context_hydration`; there's no `composer/fork/`
-    rc. Since fork is a full block copy, a forked composer inherits the whole
-    log *and* full hydration (guard off, big first-turn spike). Block ids survive
-    the copy, so `INSERT … SELECT` the row would work, or add a
-    `composer/fork/S30-hydrate.kai`. Pairs with the marker-advance producer work.
-  - **MEDIUM — tool-pair / turn-boundary tail snap (latent until composer gets
+  **Player spawn = thin fork + rc-rebuilds (LOCKED 2026-06-12).** Resolves
+  "fork drops the hydration policy" — see the "Players are rc programs" decision
+  in `docs/chameleon.md`. A player is spawned by a thin (`--shallow`) fork that
+  keeps ~nothing; the child's `composer/fork/` rc re-establishes setup and
+  re-runs `kj context hydrate --window N` (mirror of `create`, marker defaults
+  to the child's tail). Because the child is thin, re-anchoring at the tail is
+  cheap and correct — which is *why* we dropped the alternative (copy the row /
+  preserve `P_parent` via a new `KJ_PARENT_HYDRATION_MARKER` read surface): a
+  thin child makes the naive re-anchor right, so the read surface isn't needed
+  for fork. (We considered it; the thin fork dissolved the need.) What this
+  needs, sequenced:
+  - **Lock now (small):** `composer/fork/S30-hydrate.kai` (rebuild + re-mark)
+    and confirm a composer fork is thin. `kj transport ooda on|off --context`
+    already exists, so transport-follow (arm child / disarm parent) is pure rc.
+  - **Verify in code first:** the disarm-parent → `fork` → arm-child **ordering
+    race** across the beat scheduler's tick — the only spot that might need a
+    Rust assist rather than script. Everything else is rc.
+  - **Build when convenient — the windowed-notation pull primitive.** No
+    cross-context block-copy verb exists today; a player carrying recent
+    notation into its thin-forked child needs one. This is the *same* windowed
+    read as `$HEARD`'s push→pull follow-up and the marker-archive read — **one
+    read, three consumers** (`$HEARD` indexable array, fork-carry, marker
+    archive). Strong signal it's the right primitive; keeps the carry in rc.
+  - **Defer — horizon self-fork-rotate (page-turns / song sections).** The
+    player self-`kj fork --shallow`s on a phrase horizon; fork-lineage becomes
+    song form. Two trigger forms: **(a) now** a `composer/tick/SXX-rotate.kai`
+    that fires every tick (`$PHRASE` is seeded) and acts only at the horizon
+    (`phrase mod N == 0`) — zero new machinery; **(b) later** a declarative
+    "fire script at tick T" timeline scheduler riding `schedule_abc_cell`'s
+    rails, worth building once the producer schedules more than rotates
+    (section/tempo/dynamics events — clear second consumers). Prototype with
+    (a), graduate to (b). Not needed for solo-bass slice 1 (the marker bounds
+    cost; thin-fork-at-spawn gives the lean start).
+  - **Marker-advance on durable revision** still pairs here: when the producer
+    writes revision blocks, re-run `kj context hydrate` to advance P. Pure rc
+    once the producer exists.
+
+  **Remaining follow-ups (deferred — from the same review):**
+  - **P1 — tool-pair / turn-boundary tail snap (latent until composer gets
     tools).** The block-count tail can start mid-tool-pair: an orphan
     `tool_result` is *dropped* by the snapshot repair (no 400, but silent content
     loss) and a marker landing on a `tool_call` injects a synthetic "interrupted"
     result every turn forever. Fix when tools arrive: snap `tail_start` (and the
     create-time marker) back to a turn boundary (nearest preceding `User/Text`,
     never start on `ToolResult`/`Model`-continuation).
-  - **MEDIUM — no archive seam marker.** Prefix and tail concatenate with no
+  - **P1 — no archive seam marker.** Prefix and tail concatenate with no
     "[N blocks archived]" signal; two `Model/Text` fragments across the gap can
     even merge into one assistant message (false continuity). Inject a synthetic
     user-role seam between prefix and tail when `tail_start > prefix_end` (lands
@@ -318,12 +349,11 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
     loud-warn + fail-safe-to-whole-log: that's the one genuine "show more, never
     corrupt" case, and failing it would kill a composer just because a block was
     excluded. (Tests: `hydration_policy_{zero_window,unparseable_marker}_is_loud_error`.)
-  - **Marker advance on durable revision** — P is set once at create; the
-    producer path that moves it forward (re-run `kj context hydrate` after
-    writing revision blocks) lands with the producer.
-  - **RAM/disk still unbounded** — windowing bounds *tokens*, not memory; cold
-    start loads the full log to window it. Rotation/shallow-fork is the storage
-    answer (separate, unbuilt — see the in-RAM committed `Vec` growth item).
+  - **RAM/disk accumulates — and that's fine (LOCKED 2026-06-12).** Windowing
+    bounds *tokens*, not memory; cold start loads the full log to window it.
+    Rotation-for-space is **dropped** (storage on btrfs+sqlite is cheap; blocks
+    stay real and stored so the app shows the whole performance). The thin fork
+    is for lean-spawn/structure, not storage — see the player-spawn block above.
   - **`window` counts RAW blocks, not turns/phrases** (~2-3 blocks per OODA turn,
     and composer score/Trace blocks are hydration-silent so the *visible* tail is
     smaller still) — revisit if a phrase/turn-denominated window reads cleaner.

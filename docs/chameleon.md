@@ -100,6 +100,38 @@ band owns time — the transport (拍子木) does.
   drifted to the player. ABC-only output (no tool calls) is ideal
   small-local-model UX — the symbolic decisions accidentally made the player
   role exactly the shape small models are good at.
+- **Players are rc programs; the producer authors them (2026-06-12).** A
+  player's behavior lives in its rc scripts, not Rust — the producer steers by
+  editing them (the self-introspection-kernel pattern; less logic in Rust).
+  Worked out across a long design thread; what got us here is below the line.
+  Locked consequences:
+  - **Thin fork = rc-rebuilds.** A player is spawned by a thin (`--shallow`)
+    fork that keeps ~nothing; the child's `composer/fork/` rc re-establishes
+    setup (stance/chart/patch-sheet — already declarative) and arms itself
+    (`kj transport ooda on --context <child>`; parent disarms — pure rc, the
+    verb already takes `--context`). Carrying recent notation into the child is
+    an rc-scripted block copy, not a fork-filter feature — and folds into the
+    `$HEARD` push→pull read (one windowed-notation read, three consumers:
+    `$HEARD`, fork-carry, marker-archive). We chose rc-rebuilds over
+    preserving the parent's setup blocks because setup is *already* declarative
+    rc, so a fork just re-runs it — which also dissolves the "preserve
+    `P_parent`, build a read surface" detour: a thin child's tail-at-fork is
+    small, so the fork rc re-anchoring the marker at the child tail (mirror of
+    `create`) is cheap and correct, no env-var / `--show` needed.
+  - **Fork-lineage IS song form.** Each thin fork is a section/movement; the
+    page-turn is the player **self-`kj fork --shallow`-ing on a horizon**. The
+    time-well's fork-lineage-down grammar draws the performance natively.
+  - **Producer edits are horizon-latched.** Scripts snapshot at instantiation
+    (updates don't leak into a live context), so a producer's rc edit lands at
+    the player's *next* page-turn — musically right (direction changes on a
+    section boundary, never mid-phrase). The snapshot-on-instantiation behavior
+    is the *update channel* here, not a limitation.
+  - **The marker owns cost; the fork owns structure.** Rotation is NOT a
+    storage/cost mechanism — storage on btrfs+sqlite is cheap, and the hydration
+    marker already bounds per-call tokens. All blocks stay real and stored: the
+    app shows the whole performance, the parent keeps everything (browsable via
+    fork-lineage). The thin fork's only jobs are lean-player spawn, song
+    structure, and rc-refresh.
 
 ## Timeline gap analysis (vs. hyoushigi as landed)
 
@@ -230,7 +262,8 @@ Rust side is a *minimal mechanism*; the *policy* lives in rc. As built:
   `catch_up` can't express; bounded to prefix + window). The `[0, marker]`
   prefix is byte-stable across rebuilds, so the wire prompt cache still aligns.
 - **Wired** into `process_llm_stream`/`hydrate_messages`: reads the policy each
-  turn (read failure → full history), windows when set. Applies on **cold start**
+  turn (read failure or corrupt policy → fail the turn loudly — see *Hardened*
+  below), windows when set. Applies on **cold start**
   too — the same path a restart re-hydrates through, so the persisted marker
   bounds cold-start hydration as well as steady state (restart is a non-event).
 - **Surface** — `kj context hydrate [<ctx>] --window <N> [--mark <block>] |
@@ -243,16 +276,52 @@ revision** (re-running `kj context hydrate` after the producer writes revision
 blocks), NOT per turn — so there is no per-turn rc hook, declarative-window
 (Shape 1) over the imperative rc-advanced boundary (Shape 2).
 
+**Hardened (2026-06-12, independent review — Fable + Gemini + DeepSeek,
+unanimous).** The first cut shipped TDD-green but un-reviewed; three reviewers
+found the core selector math clean (no off-by-one) but surfaced a real
+corruption bug and a cluster of silent-failure gaps. Fixed, all TDD:
+- **CRITICAL — windowed→full scramble.** The `ConversationMailbox` persists
+  across turns; after a windowed turn `seen` has a hole where the archived
+  middle was, so a later un-windowed `catch_up` folded the middle and *appended*
+  it after the tail → out-of-order wire (silent corruption). Fixed with a
+  `windowed` flag: `catch_up` rebuilds from scratch on the windowed→full
+  transition.
+- **Fail-loud, not fail-safe-silent, on bad policy.** A DB read error or a
+  *corrupt* persisted policy (unparseable marker / `window < 1`) now returns
+  `Err` and **fails the turn** rather than silently hydrating everything —
+  silently disabling the cost guard on a context driving at tempo is the wrong
+  fallback (per the kernel's "silent fallbacks are a mistake" stance). The
+  **runtime** stale-marker case (marker parses + names a real block id but it's
+  absent from the log — e.g. excluded) *keeps* the warn + fail-safe-to-whole-log
+  fail-safe: that's the one genuine "show more, never corrupt" case, and failing
+  it would kill a player just because a block was excluded.
+- **Validated surface.** `--mark` is checked against the context (was:
+  parseable-only → guard silently off forever); `--window 0` is rejected (it
+  drops the current turn from the wire).
+
 Deferred / honest edges: **(a)** the marker-advance-on-durable-revision flow
 isn't built (P is set once at create; the producer path that moves it forward
 comes with the producer). **(b)** Windowing bounds *tokens*, not *RAM/disk* —
-cold start still loads the full log to window it; rotation/shallow-fork is the
-storage answer (separate, unbuilt). **(c)** `window` counts **blocks**, not
+cold start still loads the full log to window it — but **accumulation is fine**
+(storage is cheap; rotation-for-space is dropped — see the rotation reframe
+below). **(c)** `window` counts **blocks**, not
 turns/phrases (~2-3 blocks per OODA turn). **(d)** the composer's S20 cache
 breakpoints sit at message indices that windowing shifts — harmless for the
 local bass (no prompt cache), to reconcile when API-model chairs join.
 
-**Rotation (Amy, 2026-06-10) — the growth answer:** cap context length and
+**Reframed (2026-06-12): rotation is structure, not storage.** Storage on
+btrfs+sqlite is cheap and the hydration marker already bounds per-call cost — so
+the "growth answer" framing below is **not** the driver, and rotation-for-space
+is dropped. The shallow/thin fork *survives* with a different, now-locked
+purpose: spawning lean players and turning the page on song sections (see the
+"Players are rc programs" decision). Blocks accumulate freely; nothing is
+rotated for space. The invariants below **carry over unchanged** to the
+page-turn fork — they're exactly what makes a self-fork invisible to the player.
+The original growth reasoning is kept because it's how we arrived at the
+thin-fork mechanism and these invariants.
+
+**Rotation (Amy, 2026-06-10) — the growth answer [superseded as the *driver*;
+mechanism + invariants retained]:** cap context length and
 cycle via **shallow fork** — "fork without history": copy the program
 (behind the marker) + the tail window, nothing else; the old context becomes
 a closed cold segment; the player's label moves to the new head. Log
