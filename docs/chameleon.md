@@ -4,12 +4,14 @@
 > 2026-06-11 (tracks not voices, phrases not bars in the kernel, silence
 > until first good). Batch 1 substrate corrections 1-3 (track on Cell,
 > notation-first commits, phrase vocabulary) have **shipped**. Batch 2 began
-> 2026-06-11: the **transport report now-facts** (`$TICK`/`$PHRASE`/`$TEMPO`
-> heartbeat scalars seeded into the `tick` lifecycle; `kj drive --prompt` now
-> writes the report as a durable, hydrating block) shipped; `$HEARD`, the
-> quantized mailbox flush, and the cost-guard hydration marker are deferred
-> (see mechanism 4-6 below). Companion doc: `hyoushigi.md` (the timing
-> substrate this builds on).
+> 2026-06-11: the **transport report** shipped — `$TICK`/`$PHRASE`/`$TEMPO`
+> heartbeat scalars + a `$HEARD` JSON window of recent committed notation,
+> seeded into the `tick` lifecycle; `kj drive --prompt` now writes the report
+> as a durable, hydrating block. `$HEARD` ships as a pragmatic JSON-string push
+> (the array form + read-on-demand pull are follow-ups on the arrays/hashes
+> plan). The quantized mailbox flush and the cost-guard hydration marker are
+> still deferred (see mechanism 4-6 below). Companion doc: `hyoushigi.md` (the
+> timing substrate this builds on).
 
 Chameleon teaches models to play music to a beat, starting with a small local
 model playing the bass line of Herbie Hancock's *Chameleon* (the Head Hunters
@@ -147,19 +149,25 @@ concept — *track* — collapses most of the gap:
    `S10-drive.kai`. `kj drive --prompt` now **writes the report as a real
    User block** (it was silently dropped before — the turn driver reads the
    seed from the log, not `TurnFlow.content`), so the report hydrates as the
-   fresh user turn. **Still open:** (a) the *quantized mailbox flush* — async
-   inbound events (sibling messages, shell output) emitting their digest on the
-   grid crossing rather than the next turn; not load-bearing for a solo player,
-   wanted at band time. (b) *window contents* → `$HEARD` (see 5). (c) *measured
-   reach k* — stubbed/omitted; turns still schedule a fixed one phrase ahead.
+   fresh user turn. *Window contents* → `$HEARD` (see 5) also landed. **Still
+   open:** (a) the *quantized mailbox flush* — async inbound events (sibling
+   messages, shell output) emitting their digest on the grid crossing rather
+   than the next turn; not load-bearing for a solo player, wanted at band time.
+   (b) *measured reach k* — stubbed/omitted; turns still schedule a fixed one
+   phrase ahead.
 5. **kaish heartbeat vars** — the scalar now-facts (`$TICK`/`$PHRASE`/`$TEMPO`)
-   **landed** with mechanism 4. `$HEARD` is **deferred and re-shaped to a
-   pull**: rather than the kernel pre-computing and injecting a window every
-   turn, the drive script will *read the committed past on demand* (a kaish
-   read of recent score blocks across tracks) when it wants what siblings
-   played. It only pays off with a second player — slice one is a solo bass
-   whose own hydrated history is its continuity — so it's built then, on the
-   block-log windowed-read primitive, not speculatively now. Traps later.
+   **landed** with mechanism 4, and so did **`$HEARD`** — as a **pragmatic
+   JSON-string push**: `beat.rs::heard_json` reads the committed notation in the
+   last `HEARD_WINDOW_PHRASES` (block-log tick-window, `ContentType::Abc` only,
+   all tracks, oldest→newest) and seeds it as a JSON array string the model
+   reads natively in the prompt. This matters **even solo**: materialized score
+   blocks are `ephemeral` (hydration-silent), so `$HEARD` is the *only* channel
+   that shows a player its own prior phrases. Two follow-ups when the
+   arrays/hashes plan lands (Chameleon is its first consumer): expose `$HEARD`
+   as a real kaish **array of hashes** (indexable, `for phrase in $HEARD`), and
+   re-shape **push → pull** (a `kj`-reachable read so the script chooses
+   depth/track rather than a fixed injected window — shares the windowed read
+   with the RC hydration-marker archive verb). TODOs on the code. Traps later.
 
 **Cost guard:**
 

@@ -42,7 +42,9 @@ use kaijutsu_kernel::hyoushigi::{
     schedule_abc_cell,
 };
 use kaijutsu_kernel::{Kernel, KjCaller, KjDispatcher};
-use kaijutsu_types::{ContextId, PrincipalId, SessionId, Tick, TickDelta, TrackId};
+use kaijutsu_types::{
+    BlockSnapshot, ContentType, ContextId, PrincipalId, SessionId, Tick, TickDelta, TrackId,
+};
 
 use crate::rpc::ServerRegistry;
 
@@ -142,6 +144,70 @@ fn transport_vars(playhead: Tick, beat_count: u64, policy: &BeatPolicy) -> [(Str
         ("PHRASE".to_string(), phrase.to_string()),
         ("TEMPO".to_string(), bpm.to_string()),
     ]
+}
+
+/// How many phrases of recent committed notation `$HEARD` carries. Covers the
+/// previous OODA cycle (default cadence = 8 phrases) so a player sees the
+/// section it last produced; older notation falls out of the window.
+///
+/// TODO(chameleon batch 2): make this tunable per context (rc-declared and/or a
+/// `kj transport` knob), alongside the cadence/tempo knobs in `docs/issues.md`.
+const HEARD_WINDOW_PHRASES: u64 = 8;
+
+/// One recent committed score phrase, as `$HEARD` exposes it: where it sits on
+/// the timeline (`tick`), which lane (`track`), and the notation itself (`abc`).
+#[derive(serde::Serialize)]
+struct HeardEntry {
+    tick: i64,
+    track: String,
+    abc: String,
+}
+
+/// Build the `$HEARD` JSON: committed notation within the last `window` ticks of
+/// `now`, oldest→newest, across all tracks (a band view; solo bass just yields
+/// its own lane). **Why a var at all, solo:** materialized score blocks are
+/// `ephemeral` (hydration-silent), so a player composing its next phrase cannot
+/// see its own prior notation from the conversation — `$HEARD` is the only
+/// channel that shows what was just played.
+///
+/// A JSON *string* (not a kaish array) — models read it natively in the prompt,
+/// and it needs no arrays/hashes support. The derived MIDI sibling is excluded
+/// (`ContentType::Abc` only) so `$HEARD` stays notation-pure, like the
+/// `UseLastGood` pool. Pure for unit-testing.
+///
+/// TODO(chameleon batch 2): this is the pragmatic push stopgap. Two follow-ups
+/// when the kaish arrays/hashes plan lands (Chameleon is its first consumer):
+///   1. Expose `$HEARD` as a real kaish **array of hashes** (one entry per
+///      phrase) instead of a JSON string the script can't index — so a drive
+///      script can `for phrase in $HEARD` / read `${phrase.abc}` natively.
+///   2. Re-shape push → **pull**: a kaish read of the committed past on demand
+///      (`kj`-reachable windowed read) so the script chooses depth/track rather
+///      than the kernel injecting a fixed window every turn. Shares this read
+///      with the RC hydration-marker archive verb (`docs/chameleon.md`).
+fn heard_json(blocks: &[BlockSnapshot], now: Tick, window: TickDelta) -> String {
+    let since = now - window;
+    let mut entries: Vec<(Tick, HeardEntry)> = blocks
+        .iter()
+        .filter(|b| b.content_type == ContentType::Abc)
+        .filter_map(|b| {
+            let tick = b.tick?;
+            if tick < since {
+                return None;
+            }
+            let track = b
+                .track
+                .as_ref()
+                .map(|t| t.as_str().to_string())
+                .unwrap_or_default();
+            Some((tick, HeardEntry { tick: tick.get(), track, abc: b.content.clone() }))
+        })
+        .collect();
+    // Oldest→newest so the player reads its line in playing order. `Tick` is
+    // `Ord`; ties (shared-coordinate doctrine) keep block-log order via the
+    // stable sort.
+    entries.sort_by_key(|(t, _)| *t);
+    let list: Vec<HeardEntry> = entries.into_iter().map(|(_, e)| e).collect();
+    serde_json::to_string(&list).unwrap_or_else(|_| "[]".to_string())
 }
 
 /// What one wake produced: which contexts beat, and which crossed an OODA
@@ -605,9 +671,22 @@ impl BeatScheduler {
                     .timeline(ctx)
                     .map(|t| t.lock().playhead())
                     .unwrap_or(Tick::ZERO);
-                transport_vars(playhead, st.beat_count, &st.policy)
-                    .into_iter()
-                    .collect()
+                let mut vars: HashMap<String, String> =
+                    transport_vars(playhead, st.beat_count, &st.policy)
+                        .into_iter()
+                        .collect();
+                // $HEARD: the recent committed notation the player composes
+                // against. A read failure degrades to an empty list (the player
+                // composes from the chart + now-facts), never a dropped beat.
+                let window =
+                    TickDelta::new((HEARD_WINDOW_PHRASES * st.policy.beats_per_phrase) as i64);
+                let heard = self
+                    .documents
+                    .block_snapshots(ctx)
+                    .map(|blocks| heard_json(&blocks, playhead, window))
+                    .unwrap_or_else(|_| "[]".to_string());
+                vars.insert("HEARD".to_string(), heard);
+                vars
             }
             None => HashMap::new(),
         };
@@ -836,7 +915,81 @@ mod tests {
     use tokio::time::Instant;
 
     use super::BeatScheduler;
-    use super::{MATERIALIZE_RETRY_BUDGET, PoisonAction, poison_action, transport_vars};
+    use super::{
+        MATERIALIZE_RETRY_BUDGET, PoisonAction, heard_json, poison_action, transport_vars,
+    };
+    use kaijutsu_types::{
+        BlockId, BlockKind, BlockSnapshot, BlockSnapshotBuilder, ContentType, Role as BlockRole,
+    };
+
+    /// A committed score block shaped as the materializer emits the ABC source:
+    /// `Role::Model` + `ContentType::Abc` + a tick + a track.
+    fn abc_block(seq: u64, tick: i64, track: &str, abc: &str) -> BlockSnapshot {
+        BlockSnapshotBuilder::new(
+            BlockId::new(ContextId::new(), PrincipalId::new(), seq),
+            BlockKind::Text,
+        )
+        .role(BlockRole::Model)
+        .content(abc)
+        .content_type(ContentType::Abc)
+        .tick(Tick::new(tick))
+        .track(TrackId::new(track).unwrap())
+        .build()
+    }
+
+    /// `$HEARD` collects committed notation in the window, oldest→newest, with
+    /// track labels — the recent line the player composes against.
+    #[test]
+    fn heard_json_collects_recent_notation_in_order() {
+        // Built out of order to prove the sort; window 32 ticks (2 phrases).
+        let blocks = vec![
+            abc_block(2, 16, "bass", "B2"),
+            abc_block(1, 0, "bass", "A2"),
+            abc_block(3, 32, "bass", "C2"),
+        ];
+        let json = heard_json(&blocks, Tick::new(32), TickDelta::new(32));
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        let arr = v.as_array().expect("array");
+        assert_eq!(arr.len(), 3, "all three in [0,32] window");
+        assert_eq!(arr[0]["tick"], 0, "oldest first");
+        assert_eq!(arr[0]["abc"], "A2");
+        assert_eq!(arr[0]["track"], "bass");
+        assert_eq!(arr[2]["tick"], 32, "newest last");
+        assert_eq!(arr[2]["abc"], "C2");
+    }
+
+    /// The window drops notation older than `now - window`, and MIDI siblings
+    /// (non-Abc) never enter — `$HEARD` is notation-pure.
+    #[test]
+    fn heard_json_excludes_old_and_non_notation() {
+        let midi_sibling = BlockSnapshotBuilder::new(
+            BlockId::new(ContextId::new(), PrincipalId::new(), 99),
+            BlockKind::Text,
+        )
+        .role(BlockRole::Asset)
+        .content("deadbeefdeadbeefdeadbeefdeadbeef")
+        .content_type(ContentType::Plain)
+        .tick(Tick::new(48))
+        .track(TrackId::new("bass").unwrap())
+        .build();
+        let blocks = vec![
+            abc_block(1, 0, "bass", "OLD"),  // tick 0 < since(32) → dropped
+            abc_block(2, 16, "bass", "OLD"), // tick 16 < since(32) → dropped
+            abc_block(3, 48, "bass", "KEEP"),
+            midi_sibling, // non-Abc → never included
+        ];
+        let json = heard_json(&blocks, Tick::new(64), TickDelta::new(32));
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "only the in-window notation block survives");
+        assert_eq!(arr[0]["abc"], "KEEP");
+    }
+
+    /// No notation yet → an empty JSON array (a fresh player, not an error).
+    #[test]
+    fn heard_json_empty_is_array() {
+        assert_eq!(heard_json(&[], Tick::new(0), TickDelta::new(32)), "[]");
+    }
 
     fn vars_map(pairs: [(String, String); 3]) -> std::collections::HashMap<String, String> {
         pairs.into_iter().collect()

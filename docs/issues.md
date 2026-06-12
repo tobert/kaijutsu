@@ -239,18 +239,21 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   repeats — truthful but mildly noisy. Add a track chip (the lane identity) and a
   "transport" label for `beat()`-authored fallback repeats so a vamp insurance
   repeat reads as the transport, not a mystery principal.
-- **`$HEARD` re-shaped to a pull (Chameleon batch 2, 2026-06-11):** `$HEARD` is
-  **no longer a pushed var.** Rather than the kernel computing a window and
-  injecting it every turn, the drive script will *read the committed past on
-  demand* — a kaish read of recent score blocks across tracks (a block-log
-  windowed read, since committed cells leave the in-RAM `Timeline.committed` at
-  the barrier but the durable blocks carry `tick`+`track` and sync). Built when
-  a **second player** makes it load-bearing (slice one is solo bass; its own
-  hydrated history is its continuity), on that windowed-read primitive — which
-  the RC hydration-marker archive verb also wants. `content_before` in
-  `ResolverCtx` stays deliberately track-blind regardless (no resolver reads it;
-  `CasCommitResolver` reads CAS by hash). Design the read API with its consumer
-  (two-voices rule), not speculatively here.
+- **`$HEARD` shipped as a JSON push; array + pull are follow-ups (Chameleon
+  batch 2, 2026-06-11):** `$HEARD` ships as a pragmatic **JSON-string push** —
+  `beat.rs::heard_json` reads committed notation in the last
+  `HEARD_WINDOW_PHRASES` (block-log tick-window, `ContentType::Abc` only, all
+  tracks) and seeds it as a JSON array string. Load-bearing **even solo**: score
+  blocks are `ephemeral` (hydration-silent), so this is the only way a player
+  sees its own prior phrases. **Two follow-ups (TODOs on the code), when the
+  kaish arrays/hashes plan lands:** (1) expose `$HEARD` as a real kaish **array
+  of hashes** (indexable, `for phrase in $HEARD`) instead of a JSON string the
+  script can't index; (2) re-shape **push → pull** — a `kj`-reachable windowed
+  read so the script chooses depth/track rather than a fixed injected window
+  (shares the read with the RC hydration-marker archive verb). Also open:
+  per-context window tuning (`HEARD_WINDOW_PHRASES` is a const). `content_before`
+  in `ResolverCtx` stays deliberately track-blind regardless (no resolver reads
+  it; `CasCommitResolver` reads CAS by hash).
 - **Transport-report cost guard — the RC-driven hydration marker (Chameleon
   batch 2, 2026-06-11):** mechanism 4's transport report now ships as a durable
   block — `kj drive --prompt "<report>"` writes a real User block each phrase
