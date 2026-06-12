@@ -4,21 +4,25 @@
 # and re-hydrate its whole inherited history every turn. (Numbered S40 so it runs
 # after the shared S30-cache fork breakpoint; create-side is S30.)
 #
-# Players are spawned by a THIN fork (`kj fork --shallow` / `--compact` / `--as`):
-# the child's block log is lean, so re-anchoring the window at its current tail
-# (mirror of the create-side script — the marker defaults to the tail) is cheap
-# and CORRECT: pin the lean seed (this fork's rebuilt stance + binding + whatever
-# the thin fork carried), then slide a window over the phrases that follow. This
-# is why the player-spawn design is rc-rebuilds + thin fork: a thin child makes
-# re-anchor-at-tail right, with no need to read the parent's marker.
+# The two fork strategies differ by KV-cache intent, not by copy cost (copying
+# blocks is cheap):
+#  • THIN fork (`kj fork --shallow` / `--compact` / `--as`) — reuse/reduce: keep
+#    the cached prefix small and save tokens for a long-running iterating player.
+#    The child's log is lean, so re-anchoring the window at its current tail
+#    (mirror of create — the marker defaults to the tail) is cheap and CORRECT:
+#    pin the lean seed (this fork's rebuilt stance + binding + whatever it carried)
+#    and slide a window over the phrases that follow. A thin child makes
+#    re-anchor-at-tail right with no need to read the parent's marker — which is
+#    why the player-spawn design is thin-fork + rc-rebuilds.
+#  • FULL fork (regular `kj fork`) — the powerful path: take the whole context
+#    (optionally minus a few explicitly-excluded blocks) into a fresh lineage = a
+#    NEW KV cache (resume a session as another model, orchestrator repair, drift a
+#    summary back, …). Windowing is a thin-fork concern, NOT this one: a full fork
+#    is by definition "take it all, fresh start", so we do NOT auto-window it. (The
+#    only marker available here is the tail — `[0, tail]` = the entire log — which
+#    isn't what a full-fork caller wants anyway.) An operator who later arms a full
+#    clone and wants it windowed runs `kj context hydrate --window N` by hand.
 # See docs/chameleon.md, "Players are rc programs" + the hydration marker.
-#
-# A FULL fork is a deliberate clone of the WHOLE performance, not a player spawn:
-# its inherited log is the entire history, so windowing it at the tail would pin
-# all of it (`[0, tail]` = everything) — the cost-bomb the guard exists to
-# prevent. We leave a full fork UN-windowed: it keeps the full history live (the
-# clone intent), is not expected to drive at tempo, and an operator can window it
-# by hand (`kj context hydrate --window N`) if they arm it.
 #
 # KJ_FORK_INFO is {"kind":"full|shallow|compact|subtree","parent":"<hex>"}. Match
 # the kind field precisely. Runs privileged in the fork lifecycle, so it clears
