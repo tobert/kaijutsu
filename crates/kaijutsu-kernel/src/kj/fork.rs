@@ -49,6 +49,11 @@ pub(crate) struct ForkArgs {
     /// Compact (distill) fork
     #[arg(long)]
     compact: bool,
+    /// Exclude specific blocks from a FULL fork (repeatable). Block key in
+    /// `context:agent:seq` form. The full fork copies everything else — the
+    /// orchestrator-repair path ("fork X without the block that blew it up").
+    #[arg(long)]
+    exclude: Vec<String>,
 }
 
 /// Resolved provider+model for a fork.
@@ -167,8 +172,55 @@ impl KjDispatcher {
             Err(e) => return KjResult::Err(format!("kj fork: {e}")),
         };
 
-        // Deep-copy the BlockStore document
-        if let Err(e) = self.block_store().fork_document(source_id, new_id) {
+        // Validate --exclude block ids against the source BEFORE any mutations,
+        // and build the fork filter. A full fork takes the whole context; this is
+        // the escape hatch to drop a few named blocks (orchestrator repair). A
+        // typo/wrong-context id fails LOUD (consistent with `kj context hydrate
+        // --mark`) — a silent no-op would leave the offending block in the
+        // "repaired" child. Empty --exclude → the plain unfiltered full copy.
+        let exclude_filter = if args.exclude.is_empty() {
+            None
+        } else {
+            let mut ids = std::collections::HashSet::new();
+            for key in &args.exclude {
+                let Some(id) = kaijutsu_types::BlockId::from_key(key) else {
+                    return KjResult::Err(format!("kj fork: invalid --exclude block id '{key}'"));
+                };
+                match self.block_store().get_block_snapshot(source_id, &id) {
+                    Ok(Some(_)) => {
+                        ids.insert(id.to_key());
+                    }
+                    Ok(None) => {
+                        return KjResult::Err(format!(
+                            "kj fork: --exclude block '{key}' is not in this context"
+                        ));
+                    }
+                    Err(e) => {
+                        return KjResult::Err(format!(
+                            "kj fork: could not verify --exclude block '{key}': {e}"
+                        ));
+                    }
+                }
+            }
+            Some(kaijutsu_crdt::ForkBlockFilter {
+                exclude_block_ids: ids,
+                ..Default::default()
+            })
+        };
+
+        // Deep-copy the BlockStore document. Plain full copy by default; when
+        // --exclude was given, route through the filtered copy (full fork still
+        // takes everything else).
+        let copy = match &exclude_filter {
+            Some(filter) => self.block_store().fork_document_filtered(
+                source_id,
+                new_id,
+                kaijutsu_types::now_millis(),
+                filter,
+            ),
+            None => self.block_store().fork_document(source_id, new_id),
+        };
+        if let Err(e) = copy {
             return KjResult::Err(format!("kj fork: failed to copy document: {e}"));
         }
 
@@ -1333,6 +1385,102 @@ mod tests {
             contexts
                 .iter()
                 .any(|r| r.label.as_deref() == Some("branch"))
+        );
+    }
+
+    /// Insert a Text block into `ctx` and return its id — for exercising
+    /// `--exclude` against a known block.
+    fn insert_text(
+        d: &crate::KjDispatcher,
+        ctx: kaijutsu_types::ContextId,
+        principal: PrincipalId,
+        body: &str,
+    ) -> kaijutsu_crdt::BlockId {
+        d.block_store()
+            .insert_block_as(
+                ctx,
+                None,
+                None,
+                kaijutsu_crdt::Role::User,
+                kaijutsu_crdt::BlockKind::Text,
+                body.to_string(),
+                kaijutsu_crdt::Status::Done,
+                kaijutsu_crdt::ContentType::Plain,
+                Some(principal),
+            )
+            .unwrap()
+    }
+
+    /// Full fork's power path: `--exclude <block>` drops that block from the
+    /// child (the orchestrator-repair case — "fork X without the huge block that
+    /// blew it up") while copying everything else. Today full fork copies
+    /// everything; this wires the existing ForkBlockFilter onto it.
+    #[tokio::test]
+    async fn fork_exclude_drops_named_block_keeps_rest() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("source"), None, principal);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        insert_text(&d, source, principal, "keep1");
+        let drop_id = insert_text(&d, source, principal, "DROPME");
+        insert_text(&d, source, principal, "keep2");
+
+        let c = caller_with_context(source);
+        let result = d
+            .dispatch(
+                &[s("fork"), s("--name"), s("repaired"), s("--exclude"), s(&drop_id.to_key())],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "fork --exclude failed: {}", result.message());
+
+        let child = d
+            .kernel_db()
+            .lock()
+            .find_context_by_label("repaired")
+            .unwrap()
+            .unwrap()
+            .context_id;
+        let contents: Vec<String> = d
+            .block_store()
+            .block_snapshots(child)
+            .unwrap()
+            .iter()
+            .map(|b| b.content.clone())
+            .collect();
+        assert!(contents.iter().any(|c| c.contains("keep1")), "kept blocks: {contents:?}");
+        assert!(contents.iter().any(|c| c.contains("keep2")), "kept blocks: {contents:?}");
+        assert!(
+            !contents.iter().any(|c| c.contains("DROPME")),
+            "the excluded block must not be copied into the child: {contents:?}"
+        );
+    }
+
+    /// Fail-loud (consistent with `kj context hydrate --mark`): a `--exclude`
+    /// block id that doesn't exist in the source is a typo, not a silent no-op
+    /// (which would leave the offending block in the repaired child).
+    #[tokio::test]
+    async fn fork_exclude_rejects_block_not_in_source() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("source"), None, principal);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        insert_text(&d, source, principal, "real");
+        let phantom = kaijutsu_crdt::BlockId::new(source, PrincipalId::new(), 9999).to_key();
+
+        let c = caller_with_context(source);
+        let result = d
+            .dispatch(&[s("fork"), s("--exclude"), s(&phantom)], &c)
+            .await;
+        assert!(!result.is_ok(), "a --exclude block not in the source must error");
+        assert!(
+            result.message().contains("not in") || result.message().contains("not found"),
+            "msg: {}",
+            result.message()
         );
     }
 
