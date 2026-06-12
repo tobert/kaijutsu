@@ -137,6 +137,8 @@ fn main() {
         .add_plugins(input::InputPlugin)
         // Cell editing
         .add_plugins(cell::CellPlugin)
+        // Offscreen vello rasterizer (kaijutsu-owned; bevy_vello-escape phase 2)
+        .add_plugins(view::vello_rasterizer::VelloRasterizerPlugin)
         // Per-block Vello texture rendering
         .add_plugins(view::block_render::BlockRenderPlugin)
         // Peer transport (drift navigation: kernel → app invocations)

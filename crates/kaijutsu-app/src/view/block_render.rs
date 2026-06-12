@@ -970,18 +970,18 @@ pub fn extract_block_scenes(
 /// dirty blocks, then unlocks.
 pub fn render_block_textures(
     mut extracted: ResMut<ExtractedBlockScenes>,
-    renderer: Res<bevy_vello::render::VelloRenderer>,
+    renderer: Res<crate::view::vello_rasterizer::VelloRasterizer>,
     device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
     gpu_images: Res<RenderAssets<GpuImage>>,
-    render_settings: Res<bevy_vello::render::VelloRenderSettings>,
+    render_settings: Res<crate::view::vello_rasterizer::VelloRasterizerSettings>,
 ) {
     if extracted.items.is_empty() {
         return;
     }
 
     let Ok(mut vello_renderer) = renderer.lock() else {
-        warn!("Failed to lock VelloRenderer for block texture rendering");
+        warn!("Failed to lock VelloRasterizer for block texture rendering");
         return;
     };
 

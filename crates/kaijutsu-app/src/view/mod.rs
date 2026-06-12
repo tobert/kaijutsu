@@ -23,6 +23,7 @@ pub mod shell_dock;
 pub mod scroll;
 pub mod submit;
 pub mod sync;
+pub mod vello_rasterizer;
 
 // Re-export all public types
 pub use components::*;
