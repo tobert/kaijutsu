@@ -35,6 +35,7 @@ mod hydrate;
 pub mod image_cache;
 pub mod mailbox;
 pub mod openai;
+mod splice;
 pub mod stream;
 pub mod system_prompt;
 pub mod toml_config;
