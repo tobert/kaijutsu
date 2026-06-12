@@ -214,27 +214,43 @@ machinery is the precedent. Convergence worth noting: pinned-prefix +
 sliding-window is precisely how attention-sink / StreamingLLM inference
 manages context at the attention level — same shape, one layer up.
 
-**RC-drives-the-marker (Amy, 2026-06-11) — keep policy out of Rust.** Don't
-hardcode "how much to keep" in the kernel. The Rust side is a *minimal
-mechanism*: the hydration policy on `ConversationMailbox` above (keep
-`[0, marker] ∪ [now − window, now]`, default marker = ∞) plus a `kj` verb that
-advances the marker / archives the blocks between it and the window. The
-*policy and trigger* live in **rc**: an **on-turn rc hook** (a `tick`-time or a
-new `turn`/`drive` lifecycle script) that, in composer mode, does roughly "mark
-the last N blocks archived, then reset the context's hydration to checkpoint +
-new — so only fresh blocks past the marker hydrate next turn." This is the
-self-introspection-kernel pattern: the model's own lifecycle scripts manage how
-much of its past it carries, the same way they already manage cache breakpoints
-and system-prompt slots. Marker-advance reuses the existing exclude/edit-at-
-boundary rule (a queued exclusion takes effect at the boundary), so there is no
-separate marker machinery to invent — the rc hook is just the policy author.
-This is the **cost guard** for the per-phrase report blocks that mechanism 4 now
-writes: without it, `kj drive --prompt` appends one durable User block per
-phrase forever (fine while hand-testing below tempo; a leak once a set runs at
-120 BPM). Build it before slice one runs sustained at tempo. Open: where the
-on-turn hook lives (reuse `tick`, or a dedicated post-turn verb so the marker
-advances *after* the model reads, not before), and the windowed archive `kj`
-surface (shares the block-log windowed-read primitive `$HEARD`'s pull wants).
+**RC-drives-the-marker (Amy, 2026-06-11) — keep policy out of Rust. SHIPPED
+(first cut, 2026-06-11).** Don't hardcode "how much to keep" in the kernel. The
+Rust side is a *minimal mechanism*; the *policy* lives in rc. As built:
+
+- **Window selector** — `select_hydration_window(blocks, marker, window)`
+  (`llm/mailbox.rs`) returns `[0, marker] ∪ last-window`, deduped where prefix
+  and tail meet, and **fails safe to the whole log** if the marker is stale
+  (never hide context behind a broken marker).
+- **Durable policy** — a per-context `context_hydration` table (`marker` =
+  `BlockId::to_key()`, `window_size`); accessors `set/get/clear_hydration_policy`.
+  Absent row = hydrate everything (every non-composer context, untouched).
+- **Mailbox rebuild** — `ConversationMailbox::rehydrate_windowed` rebuilds the
+  windowed view each turn (a sliding tail can drop a block, which the append-only
+  `catch_up` can't express; bounded to prefix + window). The `[0, marker]`
+  prefix is byte-stable across rebuilds, so the wire prompt cache still aligns.
+- **Wired** into `process_llm_stream`/`hydrate_messages`: reads the policy each
+  turn (read failure → full history), windows when set. Applies on **cold start**
+  too — the same path a restart re-hydrates through, so the persisted marker
+  bounds cold-start hydration as well as steady state (restart is a non-event).
+- **Surface** — `kj context hydrate [<ctx>] --window <N> [--mark <block>] |
+  --clear` (Operator-gated); the marker defaults to the current tail. The
+  composer `create` rc (`S30-hydrate.kai`) sets `--window 16` once at birth —
+  policy in rc, the self-introspection-kernel pattern.
+
+**The tail slides in memory; the row is upserted only at create + on a durable
+revision** (re-running `kj context hydrate` after the producer writes revision
+blocks), NOT per turn — so there is no per-turn rc hook, declarative-window
+(Shape 1) over the imperative rc-advanced boundary (Shape 2).
+
+Deferred / honest edges: **(a)** the marker-advance-on-durable-revision flow
+isn't built (P is set once at create; the producer path that moves it forward
+comes with the producer). **(b)** Windowing bounds *tokens*, not *RAM/disk* —
+cold start still loads the full log to window it; rotation/shallow-fork is the
+storage answer (separate, unbuilt). **(c)** `window` counts **blocks**, not
+turns/phrases (~2-3 blocks per OODA turn). **(d)** the composer's S20 cache
+breakpoints sit at message indices that windowing shifts — harmless for the
+local bass (no prompt cache), to reconcile when API-model chairs join.
 
 **Rotation (Amy, 2026-06-10) — the growth answer:** cap context length and
 cycle via **shallow fork** — "fork without history": copy the program

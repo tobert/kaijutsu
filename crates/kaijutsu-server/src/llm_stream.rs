@@ -83,9 +83,14 @@ fn hydrate_messages(
     context_id: ContextId,
     after_block_id: &kaijutsu_crdt::BlockId,
     mailbox: &mut kaijutsu_kernel::ConversationMailbox,
+    // The hydration window policy `(marker, window)`, or `None` to hydrate the
+    // whole history (the default; every non-composer context). When set, the
+    // turn hydrates only `[0, marker] ∪ last-window` — the cost guard for
+    // endless composer logs (design: docs/chameleon.md).
+    policy: Option<(kaijutsu_crdt::BlockId, u32)>,
 ) -> Result<Vec<LlmMessage>, ()> {
     let read = documents.block_snapshots(context_id);
-    handle_hydration_outcome(documents, context_id, after_block_id, read, mailbox)
+    handle_hydration_outcome(documents, context_id, after_block_id, read, mailbox, policy)
 }
 
 /// Turn a block-log read into the wire-history snapshot, or fail the turn.
@@ -100,18 +105,39 @@ fn handle_hydration_outcome(
     after_block_id: &kaijutsu_crdt::BlockId,
     read: kaijutsu_kernel::BlockStoreResult<Vec<kaijutsu_crdt::BlockSnapshot>>,
     mailbox: &mut kaijutsu_kernel::ConversationMailbox,
+    policy: Option<(kaijutsu_crdt::BlockId, u32)>,
 ) -> Result<Vec<LlmMessage>, ()> {
     match read {
         Ok(blocks) => {
-            let new_blocks = mailbox.catch_up(&blocks);
-            let snapshot = mailbox.snapshot();
-            log::info!(
-                "Mailbox caught up: +{} new blocks, {} messages on the wire for context {}",
-                new_blocks,
-                snapshot.len(),
-                context_id
-            );
-            Ok(snapshot)
+            match policy {
+                // Windowed context: rebuild `[0, marker] ∪ last-window` each turn
+                // (a sliding tail can drop a block, which the append-only
+                // catch_up can't express). Applies on cold start too — this is
+                // the same path a restart re-hydrates through, so the marker
+                // bounds cold-start hydration as well as steady state.
+                Some((marker, window)) => {
+                    mailbox.rehydrate_windowed(&blocks, marker, window as usize);
+                    let snapshot = mailbox.snapshot();
+                    log::info!(
+                        "Mailbox windowed-rehydrated (marker {marker}, window {window}): \
+                         {} blocks in log → {} messages on the wire for context {context_id}",
+                        blocks.len(),
+                        snapshot.len(),
+                    );
+                    Ok(snapshot)
+                }
+                None => {
+                    let new_blocks = mailbox.catch_up(&blocks);
+                    let snapshot = mailbox.snapshot();
+                    log::info!(
+                        "Mailbox caught up: +{} new blocks, {} messages on the wire for context {}",
+                        new_blocks,
+                        snapshot.len(),
+                        context_id
+                    );
+                    Ok(snapshot)
+                }
+            }
         }
         Err(e) => {
             // Hydration failed. Do NOT fall back to the mailbox snapshot +
@@ -405,6 +431,7 @@ mod hydration_tests {
             &user_block_id,
             read,
             &mut mailbox,
+            None,
         );
 
         // (b) No messages produced — the caller returns early, so the LLM is
@@ -457,11 +484,63 @@ mod hydration_tests {
 
         let mut mailbox = kaijutsu_kernel::ConversationMailbox::new();
         let result =
-            hydrate_messages(&documents, context_id, &user_block_id, &mut mailbox);
+            hydrate_messages(&documents, context_id, &user_block_id, &mut mailbox, None);
         let messages = result.expect("successful hydration");
         assert!(
             !messages.is_empty(),
             "a conversation with a user block must hydrate at least one message"
+        );
+    }
+
+    /// With a hydration policy `Some((marker, window))`, the turn hydrates only
+    /// `[0, marker] ∪ last-window` — the archived middle never reaches the wire.
+    /// Pins the windowed branch of the hydrate path end to end (read → window →
+    /// snapshot), where a mis-wire (e.g. always passing None) would hide.
+    #[test]
+    fn windowed_policy_hydrates_prefix_and_tail_skips_middle() {
+        let documents = shared_block_store(PrincipalId::new());
+        let context_id = ContextId::new();
+        documents
+            .create_document(context_id, DocumentKind::Conversation, None)
+            .expect("create document");
+        let p = PrincipalId::new();
+        let insert = |role, content: &str| {
+            documents
+                .insert_block_as(
+                    context_id,
+                    None,
+                    None,
+                    role,
+                    BlockKind::Text,
+                    content,
+                    Status::Done,
+                    ContentType::Plain,
+                    Some(p),
+                )
+                .expect("insert")
+        };
+        insert(Role::User, "q0");
+        let marker = insert(Role::Model, "a0"); // prefix end = [q0, a0]
+        insert(Role::User, "q1-ARCHIVED");
+        insert(Role::Model, "a1-ARCHIVED");
+        insert(Role::User, "q2");
+        let last = insert(Role::Model, "a2"); // tail (window 2) = [q2, a2]
+
+        let mut mailbox = kaijutsu_kernel::ConversationMailbox::new();
+        let messages =
+            hydrate_messages(&documents, context_id, &last, &mut mailbox, Some((marker, 2)))
+                .expect("windowed hydration");
+        let wire: String = messages
+            .iter()
+            .filter_map(|m| m.as_text().map(str::to_string))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for kept in ["q0", "a0", "q2", "a2"] {
+            assert!(wire.contains(kept), "windowed wire must keep {kept}; got: {wire}");
+        }
+        assert!(
+            !wire.contains("ARCHIVED"),
+            "the archived middle must not reach the wire; got: {wire}"
         );
     }
 }
@@ -534,8 +613,26 @@ async fn process_llm_stream(
     // are skipped, so this is O(new blocks), not O(history).
     // block_snapshots() reads from in-memory DashMap; sub-millisecond
     // for typical conversations.
-    let mut messages = match hydrate_messages(&documents, context_id, &after_block_id, &mut mailbox)
-    {
+    // Read the per-context hydration window policy. A read failure fails SAFE to
+    // full history (None) rather than hiding the turn's context behind a marker
+    // we couldn't load — never hydrate less because the policy lookup broke.
+    let hydration_policy = match kernel_db.lock().get_hydration_policy(context_id) {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!(
+                "Hydration policy read failed for context {context_id}: {e}; \
+                 hydrating full history"
+            );
+            None
+        }
+    };
+    let mut messages = match hydrate_messages(
+        &documents,
+        context_id,
+        &after_block_id,
+        &mut mailbox,
+        hydration_policy,
+    ) {
         Ok(messages) => messages,
         // Hydration failed and surfaced a visible Error block; fail the turn
         // loudly rather than streaming against an empty/partial session. This is a

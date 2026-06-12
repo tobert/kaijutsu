@@ -44,6 +44,46 @@ pub struct ConversationMailbox {
     materialized: bool,
 }
 
+/// Select the blocks a windowed conversation hydrates: the pinned prefix
+/// `[0, marker]` ∪ the sliding tail (the last `window` blocks), skipping the
+/// archived middle. The cost guard for endless composer logs — without it a
+/// context driving at tempo hydrates its whole history every turn (design:
+/// `docs/chameleon.md`, the hydration marker).
+///
+/// `marker == None` → **no windowing**, every block in order (today's behavior,
+/// and every non-composer context — they never set a marker). With a marker the
+/// result is `blocks[0..=marker] ++ blocks[len-window..]`, deduped where the
+/// prefix and tail meet or overlap (a short log with no middle returns whole).
+///
+/// **Fail-safe on a stale marker:** a `marker` naming a block not in `blocks` is
+/// a bug (markers point at durable blocks), but we return *every* block rather
+/// than hide context behind a marker that went stale — never hydrate less
+/// because the marker is wrong. The caller logs the anomaly.
+pub(crate) fn select_hydration_window(
+    blocks: &[BlockSnapshot],
+    marker: Option<BlockId>,
+    window: usize,
+) -> Vec<&BlockSnapshot> {
+    let Some(marker) = marker else {
+        return blocks.iter().collect();
+    };
+    // Prefix is `[0, marker]` inclusive, so the end is one past the marker.
+    // A stale marker (not in the log) fails safe to the whole log.
+    let Some(marker_idx) = blocks.iter().position(|b| b.id == marker) else {
+        return blocks.iter().collect();
+    };
+    let prefix_end = marker_idx + 1;
+    // Tail is the last `window` blocks, but never reaching back into (or behind)
+    // the prefix — `max(prefix_end)` collapses an overlapping prefix+tail into a
+    // contiguous whole, so a short log returns every block with no gap and no
+    // duplicate.
+    let tail_start = blocks.len().saturating_sub(window).max(prefix_end);
+    blocks[..prefix_end]
+        .iter()
+        .chain(blocks[tail_start..].iter())
+        .collect()
+}
+
 impl ConversationMailbox {
     /// Create an empty, un-materialized mailbox.
     pub fn new() -> Self {
@@ -122,6 +162,39 @@ impl ConversationMailbox {
         new_blocks
     }
 
+    /// Rebuild the session against a **windowed** view of the log: discard the
+    /// accumulated state and re-fold exactly `[0, marker] ∪ last-window`
+    /// ([`select_hydration_window`]). The windowed counterpart to [`catch_up`].
+    ///
+    /// Why a rebuild and not an incremental fold: a sliding tail means a block
+    /// can fall *out* of the window as new turns arrive, which the append-only
+    /// `catch_up` can't express. So a windowed context rebuilds every turn —
+    /// bounded work (prefix + window), not O(history). The `[0, marker]` prefix
+    /// is byte-identical on every rebuild, so the wire prompt cache still aligns
+    /// on it; only the sliding tail re-streams.
+    ///
+    /// Parents are resolved against the **full** log (not just the window) so an
+    /// `Error` block whose parent is archived still folds correctly.
+    ///
+    /// [`catch_up`]: Self::catch_up
+    pub fn rehydrate_windowed(
+        &mut self,
+        blocks: &[BlockSnapshot],
+        marker: BlockId,
+        window: usize,
+    ) {
+        self.state = HydrationState::new();
+        self.seen.clear();
+        let by_id: HashMap<BlockId, &BlockSnapshot> =
+            blocks.iter().map(|b| (b.id, b)).collect();
+        for block in select_hydration_window(blocks, Some(marker), window) {
+            let parent = block.parent_id.and_then(|pid| by_id.get(&pid).copied());
+            self.state.translate_block(block, parent);
+            self.seen.insert(block.id);
+        }
+        self.materialized = true;
+    }
+
     /// Return the current wire-history view.
     ///
     /// Clones the internal state, runs final flush +
@@ -197,6 +270,139 @@ mod tests {
                 }
             }),
         }
+    }
+
+    // ── select_hydration_window: [0, marker] ∪ last-window ────────────────
+
+    /// A run of `n` user blocks, so position in the log is observable by content
+    /// ("b0".."b{n-1}"). Each gets a unique id via the per-thread seq.
+    fn run_of(n: usize) -> Vec<BlockSnapshot> {
+        (0..n).map(|i| user_text(&format!("b{i}"))).collect()
+    }
+
+    fn contents_of(refs: &[&BlockSnapshot]) -> Vec<String> {
+        refs.iter().map(|b| b.content.clone()).collect()
+    }
+
+    #[test]
+    fn window_none_marker_returns_all_in_order() {
+        let blocks = run_of(5);
+        let got = super::select_hydration_window(&blocks, None, 2);
+        assert_eq!(contents_of(&got), vec!["b0", "b1", "b2", "b3", "b4"]);
+    }
+
+    #[test]
+    fn window_pins_prefix_and_tail_skips_middle() {
+        // 10 blocks, marker = b2 (prefix [b0,b1,b2]), window 3 (tail [b7,b8,b9]).
+        // The middle [b3..b6] is archived — never hydrated.
+        let blocks = run_of(10);
+        let marker = blocks[2].id;
+        let got = super::select_hydration_window(&blocks, Some(marker), 3);
+        assert_eq!(
+            contents_of(&got),
+            vec!["b0", "b1", "b2", "b7", "b8", "b9"],
+            "prefix [0,marker] ∪ last-3, middle skipped"
+        );
+    }
+
+    #[test]
+    fn window_overlap_returns_all_no_gap() {
+        // 5 blocks, marker = b2 (prefix 3), window 4 → tail would start at b1,
+        // but the prefix already covers it: return all 5, no duplicate, no gap.
+        let blocks = run_of(5);
+        let marker = blocks[2].id;
+        let got = super::select_hydration_window(&blocks, Some(marker), 4);
+        assert_eq!(contents_of(&got), vec!["b0", "b1", "b2", "b3", "b4"]);
+    }
+
+    #[test]
+    fn window_zero_tail_is_prefix_only() {
+        let blocks = run_of(6);
+        let marker = blocks[1].id;
+        let got = super::select_hydration_window(&blocks, Some(marker), 0);
+        assert_eq!(contents_of(&got), vec!["b0", "b1"], "empty tail → just the prefix");
+    }
+
+    #[test]
+    fn window_stale_marker_fails_safe_to_all() {
+        // A marker naming a block not in the log → return everything, never less.
+        let blocks = run_of(4);
+        let absent = BlockId::new(
+            TEST_CTX.with(|v| *v),
+            TEST_PRINCIPAL.with(|v| *v),
+            9999,
+        );
+        let got = super::select_hydration_window(&blocks, Some(absent), 1);
+        assert_eq!(
+            contents_of(&got),
+            vec!["b0", "b1", "b2", "b3"],
+            "stale marker must not hide context"
+        );
+    }
+
+    #[test]
+    fn rehydrate_windowed_folds_prefix_and_tail_skips_middle() {
+        // A 6-block conversation; marker = the 2nd block (prefix = first two),
+        // window 2 (last two). The middle exchange is archived — its text must
+        // not reach the wire.
+        let blocks = vec![
+            user_text("q0"),
+            model_text("a0"),
+            user_text("q1-ARCHIVED"),
+            model_text("a1-ARCHIVED"),
+            user_text("q2"),
+            model_text("a2"),
+        ];
+        let marker = blocks[1].id;
+
+        let mut mb = ConversationMailbox::new();
+        mb.rehydrate_windowed(&blocks, marker, 2);
+        let wire: String = mb
+            .snapshot()
+            .iter()
+            .filter_map(|m| m.as_text().map(str::to_string))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(mb.is_materialized());
+        for kept in ["q0", "a0", "q2", "a2"] {
+            assert!(wire.contains(kept), "windowed wire must keep {kept}; got: {wire}");
+        }
+        assert!(!wire.contains("ARCHIVED"), "middle must be skipped; got: {wire}");
+    }
+
+    #[test]
+    fn rehydrate_windowed_is_idempotent_and_resets_prior_state() {
+        // Calling it twice yields the same wire (a windowed context rebuilds
+        // each turn), and a prior full catch_up doesn't leak archived blocks.
+        let blocks = vec![
+            user_text("p0"),
+            model_text("p1"),
+            user_text("mid-GONE"),
+            user_text("t0"),
+            model_text("t1"),
+        ];
+        let marker = blocks[1].id;
+
+        let mut mb = ConversationMailbox::new();
+        mb.catch_up(&blocks); // full hydrate first (mid-GONE folded in)
+        mb.rehydrate_windowed(&blocks, marker, 2); // then window it
+        let first: String = mb
+            .snapshot()
+            .iter()
+            .filter_map(|m| m.as_text().map(str::to_string))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!first.contains("GONE"), "rebuild must drop the previously-folded middle");
+
+        mb.rehydrate_windowed(&blocks, marker, 2);
+        let second: String = mb
+            .snapshot()
+            .iter()
+            .filter_map(|m| m.as_text().map(str::to_string))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(first, second, "windowed rebuild is stable turn-to-turn");
     }
 
     #[test]

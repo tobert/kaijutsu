@@ -9,11 +9,11 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::str::FromStr;
 
-use rusqlite::{Connection, Result as SqliteResult, params};
+use rusqlite::{Connection, OptionalExtension, Result as SqliteResult, params};
 use tracing::{info, warn};
 
 use kaijutsu_types::{
-    ConsentMode, ContextId, ContextState, DocKind, EdgeKind, ForkKind, KernelId, PresetId,
+    BlockId, ConsentMode, ContextId, ContextState, DocKind, EdgeKind, ForkKind, KernelId, PresetId,
     PrincipalId, WorkspaceId,
 };
 
@@ -551,6 +551,25 @@ CREATE TABLE IF NOT EXISTS cache_breakpoints (
 );
 CREATE INDEX IF NOT EXISTS idx_cache_breakpoints_ctx
     ON cache_breakpoints(context_id);
+
+-- ── Context Hydration Marker (Chameleon batch 2) ────────────────
+-- The hydration-marker cost guard: a windowed context hydrates only
+-- `[0, marker] ∪ last-window_size` instead of its whole history, so a
+-- composer driving at tempo doesn't re-send endless turns every turn.
+-- A row exists ONLY for windowed contexts; its ABSENCE = hydrate
+-- everything (today's behavior, every non-composer context — the
+-- default needs zero rows and touches no read path that lacks a marker).
+--   marker       BlockId::to_key() — the pinned-prefix end P; [0,P] always hydrates
+--   window_size  the sliding tail length W (last-W blocks)
+-- Both-or-nothing (a policy needs both), so one NOT NULL row carries it.
+-- The tail slides in memory each turn; this row is upserted only at
+-- create + on a durable revision (marker advance). CASCADE on ctx delete.
+CREATE TABLE IF NOT EXISTS context_hydration (
+    context_id  BLOB    NOT NULL PRIMARY KEY
+        REFERENCES contexts(context_id) ON DELETE CASCADE,
+    marker      TEXT    NOT NULL,
+    window_size INTEGER NOT NULL
+);
 "#;
 
 // ============================================================================
@@ -2893,6 +2912,79 @@ impl KernelDb {
         Ok(deleted as u64)
     }
 
+    /// Set (upsert) the hydration window policy for `context_id`: from now on the
+    /// conversation hydrates only `[0, marker] ∪ last-window_size`, not its whole
+    /// history. `marker` is the pinned-prefix end P (a durable block — `[0,P]`
+    /// always hydrates and stays cache-stable); `window_size` is the sliding tail
+    /// W. The cost guard for endless composer logs (design: `docs/chameleon.md`,
+    /// the hydration marker). Upserted at composer-create and on a durable
+    /// revision (marker advance) — NOT per turn; the tail slides in memory.
+    pub fn set_hydration_policy(
+        &self,
+        context_id: ContextId,
+        marker: BlockId,
+        window_size: u32,
+    ) -> KernelDbResult<()> {
+        self.conn.execute(
+            "INSERT INTO context_hydration (context_id, marker, window_size)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(context_id) DO UPDATE SET marker = ?2, window_size = ?3",
+            params![
+                blob_param(context_id.as_bytes()),
+                marker.to_key(),
+                window_size,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Read the hydration window policy for `context_id`, or `None` when unset —
+    /// `None` means hydrate everything (the default; every non-composer context).
+    /// A stored marker that no longer parses is corruption in this one row; we
+    /// drop the policy with a `warn!` (→ hydrate everything) rather than crash the
+    /// hydrate path — never hide a turn's context behind a broken marker.
+    pub fn get_hydration_policy(
+        &self,
+        context_id: ContextId,
+    ) -> KernelDbResult<Option<(BlockId, u32)>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT marker, window_size FROM context_hydration WHERE context_id = ?1",
+                params![blob_param(context_id.as_bytes())],
+                |row| {
+                    let marker: String = row.get(0)?;
+                    let window: i64 = row.get(1)?;
+                    Ok((marker, window))
+                },
+            )
+            .optional()?;
+        let Some((marker_key, window)) = row else {
+            return Ok(None);
+        };
+        match BlockId::from_key(&marker_key) {
+            Some(marker) => Ok(Some((marker, window.max(0) as u32))),
+            None => {
+                warn!(
+                    context = %context_id.short(),
+                    marker = %marker_key,
+                    "hydration marker unparseable; dropping policy (hydrate everything)"
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// Clear the hydration policy for `context_id` → revert to hydrating
+    /// everything. Returns the row count (0 or 1).
+    pub fn clear_hydration_policy(&self, context_id: ContextId) -> KernelDbResult<u64> {
+        let deleted = self.conn.execute(
+            "DELETE FROM context_hydration WHERE context_id = ?1",
+            params![blob_param(context_id.as_bytes())],
+        )?;
+        Ok(deleted as u64)
+    }
+
     // ========================================================================
     // Context Config Fork + Workspace Query
     // ========================================================================
@@ -4795,6 +4887,64 @@ mod tests {
         assert_eq!(bps[0], CacheTarget::Tools(CacheTtl::Extended));
         assert_eq!(bps[1], CacheTarget::System(CacheTtl::Ephemeral));
         assert_eq!(bps[2], CacheTarget::MessageIndex(7, CacheTtl::Extended));
+    }
+
+    #[test]
+    fn hydration_policy_unset_is_none() {
+        // No row → None → hydrate everything (the default for every context).
+        let db = KernelDb::in_memory().unwrap();
+        assert!(db.get_hydration_policy(ContextId::new()).unwrap().is_none());
+    }
+
+    #[test]
+    fn hydration_policy_set_get_round_trip() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("hydra-rt"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+
+        let marker = BlockId::new(ctx.context_id, PrincipalId::new(), 4);
+        db.set_hydration_policy(ctx.context_id, marker, 12).unwrap();
+
+        let got = db.get_hydration_policy(ctx.context_id).unwrap();
+        assert_eq!(got, Some((marker, 12)), "marker + window survive write→read");
+    }
+
+    #[test]
+    fn hydration_policy_upsert_advances_marker_in_place() {
+        // Advancing the marker (a durable revision) is a single in-place upsert,
+        // not a second row — the PK is context_id.
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("hydra-up"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+
+        let p1 = BlockId::new(ctx.context_id, PrincipalId::new(), 2);
+        let p2 = BlockId::new(ctx.context_id, PrincipalId::new(), 9);
+        db.set_hydration_policy(ctx.context_id, p1, 8).unwrap();
+        db.set_hydration_policy(ctx.context_id, p2, 16).unwrap();
+
+        assert_eq!(
+            db.get_hydration_policy(ctx.context_id).unwrap(),
+            Some((p2, 16)),
+            "the second set overwrites the first (in-place advance)"
+        );
+    }
+
+    #[test]
+    fn hydration_policy_clear_reverts_to_none() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("hydra-clear"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+
+        let marker = BlockId::new(ctx.context_id, PrincipalId::new(), 1);
+        db.set_hydration_policy(ctx.context_id, marker, 4).unwrap();
+        assert_eq!(db.clear_hydration_policy(ctx.context_id).unwrap(), 1);
+        assert!(
+            db.get_hydration_policy(ctx.context_id).unwrap().is_none(),
+            "cleared policy reverts to hydrate-everything"
+        );
     }
 
     #[test]

@@ -1,0 +1,19 @@
+# Composer hydration window — the cost guard for endless score logs.
+#
+# A composer drives a turn every OODA cycle, forever. Without a window it would
+# re-hydrate its WHOLE history every turn, and the transport-report + ABC blocks
+# each turn add up — tokens grow without bound at tempo. This pins everything
+# created so far (stance, binding) as the cached prefix and slides a window over
+# the turns that follow: the model sees the program (system slot) + the recent
+# phrases, never the archived middle.
+#
+# The prefix marker defaults to the context's current tail (everything earlier
+# create scripts produced). `--window` is the sliding tail size in *blocks* —
+# at ~2-3 blocks per OODA turn, 16 keeps roughly the last 5-8 turns. Tune it
+# here. The window slides in memory each turn (no per-turn write); to advance the
+# pinned prefix later on a durable revision, re-run `kj context hydrate`.
+# See docs/chameleon.md, the hydration marker.
+#
+# Runs privileged in the create lifecycle, so it clears the Operator gate even
+# under the composer's narrowed loadout (which doesn't grant it directly).
+kj context hydrate --window 16

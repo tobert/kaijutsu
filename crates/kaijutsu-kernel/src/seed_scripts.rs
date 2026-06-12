@@ -83,6 +83,9 @@ const COMPOSER_BINDING_BODY: &str =
 const COMPOSER_TICK_BODY: &str =
     include_str!("../../../assets/defaults/rc/composer/tick/S10-drive.kai");
 
+const COMPOSER_HYDRATE_BODY: &str =
+    include_str!("../../../assets/defaults/rc/composer/create/S30-hydrate.kai");
+
 /// The embedded seed manifest: `(canonical /etc/rc path, body)`. The path
 /// encodes `context_type / verb / sort_key / name / ext`; nothing else is
 /// stored (provenance comes from the CRDT block's principal on write).
@@ -129,6 +132,7 @@ const SEED_FILES: &[(&str, &str)] = &[
     ("/etc/rc/composer/create/S00-stance.md", COMPOSER_STANCE_BODY),
     ("/etc/rc/composer/create/S10-binding.kai", COMPOSER_BINDING_BODY),
     ("/etc/rc/composer/create/S20-cache.kai", CACHE_CREATE_BODY),
+    ("/etc/rc/composer/create/S30-hydrate.kai", COMPOSER_HYDRATE_BODY),
     ("/etc/rc/composer/fork/S30-cache.kai", CACHE_FORK_BODY),
     ("/etc/rc/composer/drift/S40-cache.kai", CACHE_DRIFT_BODY),
     ("/etc/rc/composer/tick/S10-drive.kai", COMPOSER_TICK_BODY),
@@ -337,5 +341,21 @@ mod tests {
             .expect("tick rc path must parse");
         assert_eq!(parts.context_type, "composer");
         assert_eq!(parts.verb, "tick");
+    }
+
+    /// The composer seeds the hydration-window guard at create — `kj context
+    /// hydrate` pins the prefix + sets the sliding tail so a self-driving
+    /// composer doesn't re-hydrate its whole history every turn (the cost guard).
+    #[test]
+    fn composer_seeds_include_hydration_window() {
+        let body = SEED_FILES
+            .iter()
+            .find(|(p, _)| *p == "/etc/rc/composer/create/S30-hydrate.kai")
+            .map(|(_, b)| *b)
+            .expect("composer must seed the hydration-window script");
+        assert!(
+            body.contains("kj context hydrate"),
+            "the hydrate seed must set a window via `kj context hydrate`"
+        );
     }
 }

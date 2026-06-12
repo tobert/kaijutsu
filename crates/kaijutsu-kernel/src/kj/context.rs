@@ -1,7 +1,7 @@
 //! Context subcommands: list, info, switch, create, set, log, move, archive, remove, retag.
 
 use clap::{Args, Parser, Subcommand};
-use kaijutsu_types::{ConsentMode, ContentType, ContextId, ContextState, EdgeKind};
+use kaijutsu_types::{BlockId, ConsentMode, ContentType, ContextId, ContextState, EdgeKind};
 
 use crate::kernel_db::{ContextEdgeRow, ContextRow, ContextShellRow};
 
@@ -124,6 +124,20 @@ enum ContextCommand {
     Remove { context: String },
     /// Move a label to a different context (latched).
     Retag { label: String, context: String },
+    /// Set or clear the conversation hydration window — `[0, marker] ∪ last-N`
+    /// instead of the whole history (the cost guard for endless composer logs).
+    Hydrate {
+        context: Option<String>,
+        /// Keep the last N blocks as the sliding tail (with the pinned prefix).
+        #[arg(long)]
+        window: Option<u32>,
+        /// Pin the prefix end at this block key (default: the current tail).
+        #[arg(long)]
+        mark: Option<String>,
+        /// Remove the hydration window — hydrate everything again.
+        #[arg(long, conflicts_with_all = ["window", "mark"])]
+        clear: bool,
+    },
 }
 
 /// Settable context configuration shared by `create` and `set`.
@@ -326,6 +340,7 @@ impl KjDispatcher {
                 | ContextCommand::Archive { .. }
                 | ContextCommand::Remove { .. }
                 | ContextCommand::Retag { .. }
+                | ContextCommand::Hydrate { .. }
         ) && let Err(denied) =
             self.require_cap(caller, crate::mcp::Capability::Operator, "context")
         {
@@ -368,6 +383,12 @@ impl KjDispatcher {
             ContextCommand::Retag { label, context } => {
                 self.context_retag(&label, &context, caller).await
             }
+            ContextCommand::Hydrate {
+                context,
+                window,
+                mark,
+                clear,
+            } => self.context_hydrate(context.as_deref(), window, mark.as_deref(), clear, caller),
         }
     }
 
@@ -782,6 +803,88 @@ impl KjDispatcher {
             }
         } else {
             KjResult::Err("kj context unset: requires --env KEY".to_string())
+        }
+    }
+
+    /// `kj context hydrate [<ctx>] --window <N> [--mark <block>]` / `--clear` —
+    /// set or clear the conversation hydration window.
+    ///
+    /// With a window the context hydrates only `[0, marker] ∪ last-N` instead of
+    /// its whole history — the cost guard for endless composer logs (design:
+    /// `docs/chameleon.md`, the hydration marker). The prefix marker defaults to
+    /// the context's current tail (pin everything so far, slide a window over what
+    /// comes next); a composer's `create` rc sets this once. `--clear` reverts to
+    /// hydrating everything. Advancing the marker on a durable revision is the
+    /// same call again — an in-place upsert, not a per-turn write (the tail slides
+    /// in memory).
+    fn context_hydrate(
+        &self,
+        target_arg: Option<&str>,
+        window: Option<u32>,
+        mark: Option<&str>,
+        clear: bool,
+        caller: &KjCaller,
+    ) -> KjResult {
+        let target_id = {
+            let db = self.kernel_db().lock();
+            match super::refs::resolve_context_arg(target_arg, caller, &db) {
+                Ok(id) => id,
+                Err(e) => return KjResult::Err(format!("kj context hydrate: {e}")),
+            }
+        };
+
+        if clear {
+            return match self.kernel_db().lock().clear_hydration_policy(target_id) {
+                Ok(0) => KjResult::ok("hydration window already unset".to_string()),
+                Ok(_) => {
+                    KjResult::ok("hydration window cleared — hydrating everything".to_string())
+                }
+                Err(e) => KjResult::Err(format!("kj context hydrate: {e}")),
+            };
+        }
+
+        let Some(window) = window else {
+            return KjResult::Err(
+                "kj context hydrate: --window <N> is required (or --clear)".to_string(),
+            );
+        };
+
+        // The prefix marker: an explicit `--mark` block key, or the context's
+        // current tail (pin everything up to now).
+        let marker = match mark {
+            Some(key) => match BlockId::from_key(key) {
+                Some(id) => id,
+                None => {
+                    return KjResult::Err(format!(
+                        "kj context hydrate: invalid --mark block id '{key}'"
+                    ));
+                }
+            },
+            None => match self.block_store().last_block_id(target_id) {
+                Some(id) => id,
+                None => {
+                    return KjResult::Err(
+                        "kj context hydrate: context has no blocks to anchor the prefix marker"
+                            .to_string(),
+                    );
+                }
+            },
+        };
+
+        match self
+            .kernel_db()
+            .lock()
+            .set_hydration_policy(target_id, marker, window)
+        {
+            Ok(()) => KjResult::ok_with_data(
+                format!("hydration window set — prefix ≤ {marker}, tail {window} blocks"),
+                serde_json::json!({
+                    "context_id": target_id.to_hex(),
+                    "marker": marker.to_key(),
+                    "window": window,
+                }),
+            ),
+            Err(e) => KjResult::Err(format!("kj context hydrate: {e}")),
         }
     }
 
@@ -1356,6 +1459,60 @@ mod tests {
             "expected 'unknown provider' error, got: {}",
             result.message()
         );
+    }
+
+    #[tokio::test]
+    async fn context_hydrate_sets_marks_tail_and_clears() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("hydra"), None, principal);
+        // Seed a block so the default prefix marker (current tail) resolves.
+        d.block_store()
+            .create_document(ctx, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        let tail = d
+            .block_store()
+            .insert_block_as(
+                ctx,
+                None,
+                None,
+                kaijutsu_crdt::Role::User,
+                kaijutsu_crdt::BlockKind::Text,
+                "seed".to_string(),
+                kaijutsu_crdt::Status::Done,
+                kaijutsu_crdt::ContentType::Plain,
+                Some(principal),
+            )
+            .unwrap();
+        let c = caller_with_context(ctx);
+
+        let r = d
+            .dispatch(&[s("context"), s("hydrate"), s("--window"), s("5")], &c)
+            .await;
+        assert!(r.is_ok(), "hydrate failed: {}", r.message());
+        assert_eq!(
+            d.kernel_db().lock().get_hydration_policy(ctx).unwrap(),
+            Some((tail, 5)),
+            "marker defaults to the current tail, window 5"
+        );
+
+        let r2 = d.dispatch(&[s("context"), s("hydrate"), s("--clear")], &c).await;
+        assert!(r2.is_ok(), "clear failed: {}", r2.message());
+        assert!(
+            d.kernel_db().lock().get_hydration_policy(ctx).unwrap().is_none(),
+            "clear reverts to hydrate-everything"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_hydrate_requires_window_or_clear() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("hydra2"), None, principal);
+        let c = caller_with_context(ctx);
+        let r = d.dispatch(&[s("context"), s("hydrate")], &c).await;
+        assert!(!r.is_ok(), "bare hydrate must error (no --window, no --clear)");
+        assert!(r.message().contains("--window"), "got: {}", r.message());
     }
 
     #[tokio::test]

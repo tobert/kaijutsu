@@ -254,20 +254,28 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   per-context window tuning (`HEARD_WINDOW_PHRASES` is a const). `content_before`
   in `ResolverCtx` stays deliberately track-blind regardless (no resolver reads
   it; `CasCommitResolver` reads CAS by hash).
-- **Transport-report cost guard — the RC-driven hydration marker (Chameleon
-  batch 2, 2026-06-11):** mechanism 4's transport report now ships as a durable
-  block — `kj drive --prompt "<report>"` writes a real User block each phrase
-  (`kj/drive.rs`; previously the prompt was silently dropped). That's correct
-  but **appends one block per phrase forever**. The guard is the **RC-driven
-  hydration marker** (design in `docs/chameleon.md`): a minimal Rust hydration
-  policy on `ConversationMailbox` (keep `[0, marker] ∪ [now − window, now]`,
-  default marker = ∞) + a `kj` verb that advances the marker / archives the
-  middle + an **on-turn rc hook** that calls it in composer mode (policy lives
-  in rc, not Rust). Reuses the existing exclude/edit-at-boundary rule. **Build
-  before slice one runs sustained at tempo** — fine while hand-testing below
-  tempo. Open: hook placement (reuse `tick` vs. a post-turn verb so the marker
-  advances *after* the model reads), and the windowed archive surface (shared
-  with `$HEARD`'s pull).
+- **RC-driven hydration marker — SHIPPED first cut (Chameleon batch 2,
+  2026-06-11):** the cost guard for the per-phrase report blocks mechanism 4
+  writes. A windowed context hydrates only `[0, marker] ∪ last-window` instead
+  of its whole history. As built: `select_hydration_window` (`llm/mailbox.rs`,
+  fail-safe on stale marker) + a `context_hydration` table
+  (`set/get/clear_hydration_policy`) + `ConversationMailbox::rehydrate_windowed`
+  (per-turn rebuild, prefix byte-stable) wired into `process_llm_stream` (also
+  cold-start, so restart-safe) + `kj context hydrate --window/--mark/--clear`
+  (Operator-gated) + the composer `S30-hydrate.kai` create seed (`--window 16`).
+  Declarative window (the tail slides in memory; row upserted only at create +
+  durable revision, no per-turn hook). Remaining follow-ups:
+  - **Marker advance on durable revision** — P is set once at create; the
+    producer path that moves it forward (re-run `kj context hydrate` after
+    writing revision blocks) lands with the producer.
+  - **RAM/disk still unbounded** — windowing bounds *tokens*, not memory; cold
+    start loads the full log to window it. Rotation/shallow-fork is the storage
+    answer (separate, unbuilt — see the in-RAM committed `Vec` growth item).
+  - **`window` counts blocks, not turns/phrases** (~2-3 blocks per OODA turn) —
+    revisit if a phrase/turn-denominated window reads cleaner.
+  - **Cache-breakpoint ↔ window interaction** — the composer's S20 cache
+    breakpoints sit at message indices that windowing shifts; harmless for the
+    local bass (no prompt cache), reconcile when API-model chairs join.
 - **Optional rc-driven last-good rehydration on arm:** after restart every
   track's engine history is empty → `UseLastGood` → Skip → **silence until the
   first good phrase** (locked default). A future rc-driven arm option could
