@@ -588,4 +588,16 @@ impl HydrationState {
         self.flush_assistant();
         self.flush_tool_results();
     }
+
+    /// Inject a synthetic user-role seam marking `archived` source blocks
+    /// dropped between two kept runs of a windowed/forked hydration. Flushes
+    /// pending assistant/tool state first so the seam lands on a clean message
+    /// boundary. Safe to follow a `tool_result` (also a user message): the wire
+    /// API merges consecutive same-role messages into one turn. The splicer
+    /// ([`super::splice`]) decides *where* a seam belongs; this just renders it.
+    pub(crate) fn push_seam(&mut self, archived: usize) {
+        self.flush_all();
+        self.messages
+            .push(Message::user(format!("[{archived} blocks archived]")));
+    }
 }

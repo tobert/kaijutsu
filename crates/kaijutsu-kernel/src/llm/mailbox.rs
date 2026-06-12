@@ -20,12 +20,14 @@
 //! [`HydrationState`]: super::hydrate::HydrationState
 
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 
 use kaijutsu_types::{BlockId, BlockSnapshot};
 use tracing::warn;
 
 use super::Message;
 use super::hydrate::HydrationState;
+use super::splice::{SpliceItem, plan_splice};
 
 /// Live conversation session for one context.
 ///
@@ -55,44 +57,42 @@ pub struct ConversationMailbox {
     windowed: bool,
 }
 
-/// Select the blocks a windowed conversation hydrates: the pinned prefix
-/// `[0, marker]` ∪ the sliding tail (the last `window` blocks), skipping the
-/// archived middle. The cost guard for endless composer logs — without it a
-/// context driving at tempo hydrates its whole history every turn (design:
-/// `docs/chameleon.md`, the hydration marker).
+/// The keep-set a windowed conversation hydrates, as its maximal runs over the
+/// log: the pinned prefix `[0, marker]` and the sliding tail (the last `window`
+/// blocks). This is the order-free `window` selection — the cost guard for
+/// endless composer logs (design: `docs/chameleon.md`, the hydration marker).
+/// Cut hygiene (turn-boundary snapping, tool-pair integrity, archived-gap
+/// seams) is applied separately by [`plan_splice`] when the runs are walked.
 ///
-/// `marker == None` → **no windowing**, every block in order (today's behavior,
-/// and every non-composer context — they never set a marker). With a marker the
-/// result is `blocks[0..=marker] ++ blocks[len-window..]`, deduped where the
-/// prefix and tail meet or overlap (a short log with no middle returns whole).
+/// `marker == None` → **no windowing**, the whole log `[0, len)` (today's
+/// behavior, and every non-composer context — they never set a marker). With a
+/// marker the runs are `[0, marker+1)` and `[len-window, len)`; these may
+/// overlap (a short log, or a window reaching into/behind the prefix) — that's
+/// fine, `plan_splice` merges them into a seamless whole.
 ///
 /// **Fail-safe on a stale marker:** a `marker` naming a block not in `blocks` is
-/// a bug (markers point at durable blocks), but we return *every* block rather
+/// a bug (markers point at durable blocks), but we return the whole log rather
 /// than hide context behind a marker that went stale — never hydrate less
 /// because the marker is wrong. The caller logs the anomaly.
-pub(crate) fn select_hydration_window(
+fn hydration_keep_set(
     blocks: &[BlockSnapshot],
     marker: Option<BlockId>,
     window: usize,
-) -> Vec<&BlockSnapshot> {
+) -> Vec<Range<usize>> {
+    let len = blocks.len();
     let Some(marker) = marker else {
-        return blocks.iter().collect();
+        return vec![0..len];
     };
-    // Prefix is `[0, marker]` inclusive, so the end is one past the marker.
-    // A stale marker (not in the log) fails safe to the whole log.
     let Some(marker_idx) = blocks.iter().position(|b| b.id == marker) else {
-        return blocks.iter().collect();
+        return vec![0..len];
     };
     let prefix_end = marker_idx + 1;
-    // Tail is the last `window` blocks, but never reaching back into (or behind)
-    // the prefix — `max(prefix_end)` collapses an overlapping prefix+tail into a
-    // contiguous whole, so a short log returns every block with no gap and no
-    // duplicate.
-    let tail_start = blocks.len().saturating_sub(window).max(prefix_end);
-    blocks[..prefix_end]
-        .iter()
-        .chain(blocks[tail_start..].iter())
-        .collect()
+    let tail_start = len.saturating_sub(window);
+    // Prefix `[0, marker]` and the last `window` blocks. They may overlap when
+    // the window reaches into or behind the prefix — `plan_splice` merges, so a
+    // short log returns whole with no gap and no duplicate. A zero `window`
+    // gives an empty `len..len` tail run, which the splicer drops.
+    vec![0..prefix_end, tail_start..len]
 }
 
 impl ConversationMailbox {
@@ -187,7 +187,8 @@ impl ConversationMailbox {
 
     /// Rebuild the session against a **windowed** view of the log: discard the
     /// accumulated state and re-fold exactly `[0, marker] ∪ last-window`
-    /// ([`select_hydration_window`]). The windowed counterpart to [`catch_up`].
+    /// ([`hydration_keep_set`]), spliced clean. The windowed counterpart to
+    /// [`catch_up`].
     ///
     /// Why a rebuild and not an incremental fold: a sliding tail means a block
     /// can fall *out* of the window as new turns arrive, which the append-only
@@ -223,10 +224,21 @@ impl ConversationMailbox {
         self.seen.clear();
         let by_id: HashMap<BlockId, &BlockSnapshot> =
             blocks.iter().map(|b| (b.id, b)).collect();
-        for block in select_hydration_window(blocks, Some(marker), window) {
-            let parent = block.parent_id.and_then(|pid| by_id.get(&pid).copied());
-            self.state.translate_block(block, parent);
-            self.seen.insert(block.id);
+        // The order-free `window` keep-set, spliced clean: turn-boundary snaps,
+        // tool-pairs kept whole, archived gaps marked with a user-role seam.
+        let keep_set = hydration_keep_set(blocks, Some(marker), window);
+        for item in plan_splice(blocks, &keep_set) {
+            match item {
+                SpliceItem::Keep(i) => {
+                    let block = &blocks[i];
+                    let parent = block.parent_id.and_then(|pid| by_id.get(&pid).copied());
+                    self.state.translate_block(block, parent);
+                    self.seen.insert(block.id);
+                }
+                SpliceItem::Seam { archived } => {
+                    self.state.push_seam(archived);
+                }
+            }
         }
         self.materialized = true;
         self.windowed = true;
@@ -309,7 +321,12 @@ mod tests {
         }
     }
 
-    // ── select_hydration_window: [0, marker] ∪ last-window ────────────────
+    // ── hydration_keep_set: the order-free `window` runs ──────────────────
+    //
+    // These pin the keep-set *producer* (prefix run ∪ tail run). Cut hygiene —
+    // snapping, tool-pairs, archived-gap seams — is plan_splice's job and lives
+    // in `llm::splice` tests; the windowed end-to-end behavior is exercised by
+    // the `rehydrate_windowed_*` tests below.
 
     /// A run of `n` user blocks, so position in the log is observable by content
     /// ("b0".."b{n-1}"). Each gets a unique id via the per-thread seq.
@@ -317,62 +334,57 @@ mod tests {
         (0..n).map(|i| user_text(&format!("b{i}"))).collect()
     }
 
-    fn contents_of(refs: &[&BlockSnapshot]) -> Vec<String> {
-        refs.iter().map(|b| b.content.clone()).collect()
-    }
-
     #[test]
-    fn window_none_marker_returns_all_in_order() {
+    fn keep_set_none_marker_is_whole_log() {
         let blocks = run_of(5);
-        let got = super::select_hydration_window(&blocks, None, 2);
-        assert_eq!(contents_of(&got), vec!["b0", "b1", "b2", "b3", "b4"]);
+        assert_eq!(super::hydration_keep_set(&blocks, None, 2), vec![0..5]);
     }
 
     #[test]
-    fn window_pins_prefix_and_tail_skips_middle() {
-        // 10 blocks, marker = b2 (prefix [b0,b1,b2]), window 3 (tail [b7,b8,b9]).
-        // The middle [b3..b6] is archived — never hydrated.
+    fn keep_set_prefix_and_tail() {
+        // 10 blocks, marker = b2 (prefix [0,3)), window 3 (tail [7,10)). The
+        // middle [3,7) is the archived gap.
         let blocks = run_of(10);
         let marker = blocks[2].id;
-        let got = super::select_hydration_window(&blocks, Some(marker), 3);
         assert_eq!(
-            contents_of(&got),
-            vec!["b0", "b1", "b2", "b7", "b8", "b9"],
-            "prefix [0,marker] ∪ last-3, middle skipped"
+            super::hydration_keep_set(&blocks, Some(marker), 3),
+            vec![0..3, 7..10],
         );
     }
 
     #[test]
-    fn window_overlap_returns_all_no_gap() {
-        // 5 blocks, marker = b2 (prefix 3), window 4 → tail would start at b1,
-        // but the prefix already covers it: return all 5, no duplicate, no gap.
+    fn keep_set_overlap_emits_overlapping_runs() {
+        // 5 blocks, marker = b2 (prefix [0,3)), window 4 → tail_start 1. The
+        // runs overlap; plan_splice (its own tests) merges them to the whole log
+        // with no seam.
         let blocks = run_of(5);
         let marker = blocks[2].id;
-        let got = super::select_hydration_window(&blocks, Some(marker), 4);
-        assert_eq!(contents_of(&got), vec!["b0", "b1", "b2", "b3", "b4"]);
+        assert_eq!(
+            super::hydration_keep_set(&blocks, Some(marker), 4),
+            vec![0..3, 1..5],
+        );
     }
 
     #[test]
-    fn window_zero_tail_is_prefix_only() {
+    fn keep_set_zero_window_is_prefix_then_empty_tail() {
+        // window 0 → tail run is `len..len` (empty); the splicer drops it,
+        // leaving just the prefix.
         let blocks = run_of(6);
         let marker = blocks[1].id;
-        let got = super::select_hydration_window(&blocks, Some(marker), 0);
-        assert_eq!(contents_of(&got), vec!["b0", "b1"], "empty tail → just the prefix");
+        assert_eq!(
+            super::hydration_keep_set(&blocks, Some(marker), 0),
+            vec![0..2, 6..6],
+        );
     }
 
     #[test]
-    fn window_stale_marker_fails_safe_to_all() {
-        // A marker naming a block not in the log → return everything, never less.
+    fn keep_set_stale_marker_fails_safe_to_whole_log() {
+        // A marker naming a block not in the log → the whole log, never less.
         let blocks = run_of(4);
-        let absent = BlockId::new(
-            TEST_CTX.with(|v| *v),
-            TEST_PRINCIPAL.with(|v| *v),
-            9999,
-        );
-        let got = super::select_hydration_window(&blocks, Some(absent), 1);
+        let absent = BlockId::new(TEST_CTX.with(|v| *v), TEST_PRINCIPAL.with(|v| *v), 9999);
         assert_eq!(
-            contents_of(&got),
-            vec!["b0", "b1", "b2", "b3"],
+            super::hydration_keep_set(&blocks, Some(absent), 1),
+            vec![0..4],
             "stale marker must not hide context"
         );
     }
@@ -406,6 +418,13 @@ mod tests {
             assert!(wire.contains(kept), "windowed wire must keep {kept}; got: {wire}");
         }
         assert!(!wire.contains("ARCHIVED"), "middle must be skipped; got: {wire}");
+        // The archived middle (q1, a1 — 2 blocks) leaves a visible seam between
+        // the pinned prefix and the sliding tail, so the cross-gap Model/Text
+        // fragments can't merge into false continuity.
+        assert!(
+            wire.contains("2 blocks archived"),
+            "a seam must mark the archived gap; got: {wire}"
+        );
     }
 
     #[test]
