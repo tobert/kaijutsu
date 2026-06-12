@@ -8,6 +8,19 @@
 # is the score, MIDI a render. This script is the user-editable seam — change
 # the prompt, gate the drive on conditions, or add pre-beat bookkeeping here.
 #
+# The beat scheduler seeds this run with the transport heartbeat — the
+# present-tense now-facts, overwritten each beat:
+#   $TICK   — the playhead's logical tick (beat index)
+#   $PHRASE — phrases elapsed while playing
+#   $TEMPO  — tempo in whole BPM
+# Composed into the --prompt below, they become the turn's transport report:
+# the fresh suffix the player reads each beat. (What sibling tracks just played
+# — $HEARD — is a future pull, a kaish read of the committed past, not seeded
+# here; slice one is a solo bass whose own hydrated history is its continuity.)
+#
+# `kj drive --prompt` writes the report as a real User block, so the model
+# hydrates it as the fresh user turn (not a discarded seed).
+#
 # No positional context: the tick lifecycle runs with this context as the
 # current one, so `kj drive` targets it (avoids passing the raw id as an arg).
-kj drive --prompt "Beat boundary: review your own turns so far and compose the next section as ABC notation."
+kj drive --prompt "Transport: tick $TICK, phrase $PHRASE, $TEMPO BPM. Review your turns so far and compose the next phrase as ABC notation."

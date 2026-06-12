@@ -42,7 +42,7 @@ use kaijutsu_kernel::hyoushigi::{
     schedule_abc_cell,
 };
 use kaijutsu_kernel::{Kernel, KjCaller, KjDispatcher};
-use kaijutsu_types::{ContextId, PrincipalId, SessionId, TickDelta, TrackId};
+use kaijutsu_types::{ContextId, PrincipalId, SessionId, Tick, TickDelta, TrackId};
 
 use crate::rpc::ServerRegistry;
 
@@ -110,6 +110,38 @@ fn poison_action(failures: u32) -> PoisonAction {
     } else {
         PoisonAction::Retry
     }
+}
+
+/// The transport heartbeat vars seeded into the `tick` rc lifecycle at each OODA
+/// boundary — the present-tense facts a player composes against ("you are at
+/// phrase 8, tick 128, 120 BPM"). Returned as `(name, value)` pairs the
+/// lifecycle folds into the kaish env (referenced as `$TICK` / `$PHRASE` /
+/// `$TEMPO` in `S10-drive.kai`).
+///
+/// `$HEARD` — the windowed look-back at sibling tracks' recent phrases — is
+/// deliberately NOT here. It's a **pull** (a kaish read of the committed past,
+/// built when a second player makes it load-bearing), not a var pushed every
+/// turn. Slice one is a solo bass: its own hydrated history is its continuity.
+/// (Design: `docs/chameleon.md`, transport report.)
+///
+/// Pure so the formatting is unit-testable without a live scheduler.
+fn transport_vars(playhead: Tick, beat_count: u64, policy: &BeatPolicy) -> [(String, String); 3] {
+    // Phrases elapsed while playing (0-based). A zero `beats_per_phrase` has no
+    // phrasing → phrase 0, never a divide-by-zero (mirrors `is_phrase_boundary`).
+    let phrase = if policy.beats_per_phrase > 0 {
+        beat_count / policy.beats_per_phrase
+    } else {
+        0
+    };
+    // BPM from the beat period. Tempos are whole numbers in practice (the
+    // `kj transport tempo` verb takes integer BPM); round to the nearest.
+    let secs = policy.period.as_secs_f64();
+    let bpm = if secs > 0.0 { (60.0 / secs).round() as u64 } else { 0 };
+    [
+        ("TICK".to_string(), playhead.get().to_string()),
+        ("PHRASE".to_string(), phrase.to_string()),
+        ("TEMPO".to_string(), bpm.to_string()),
+    ]
 }
 
 /// What one wake produced: which contexts beat, and which crossed an OODA
@@ -562,6 +594,23 @@ impl BeatScheduler {
         let Some(dispatcher) = self.dispatcher.clone() else {
             return;
         };
+        // Snapshot the transport heartbeat now, on the scheduler thread with the
+        // beat state in hand, so the spawned lifecycle seeds it as $TICK/$PHRASE/
+        // $TEMPO. Reading the playhead here (not in the spawned task) keeps the
+        // facts coherent with the beat that triggered this fire.
+        let vars: HashMap<String, String> = match self.armed.get(&ctx) {
+            Some(st) => {
+                let playhead = self
+                    .kernel
+                    .timeline(ctx)
+                    .map(|t| t.lock().playhead())
+                    .unwrap_or(Tick::ZERO);
+                transport_vars(playhead, st.beat_count, &st.policy)
+                    .into_iter()
+                    .collect()
+            }
+            None => HashMap::new(),
+        };
         tokio::task::spawn_local(async move {
             let caller = KjCaller {
                 principal_id: PrincipalId::system(),
@@ -572,7 +621,7 @@ impl BeatScheduler {
                 privileged: false,
             };
             if let Err(e) = dispatcher
-                .run_rc_lifecycle("tick", ctx, None, None, None, &caller)
+                .run_rc_lifecycle_with_vars("tick", ctx, None, None, None, &vars, &caller)
                 .await
             {
                 log::warn!("beat: tick verb failed for context {ctx}: {e}");
@@ -787,7 +836,52 @@ mod tests {
     use tokio::time::Instant;
 
     use super::BeatScheduler;
-    use super::{MATERIALIZE_RETRY_BUDGET, PoisonAction, poison_action};
+    use super::{MATERIALIZE_RETRY_BUDGET, PoisonAction, poison_action, transport_vars};
+
+    fn vars_map(pairs: [(String, String); 3]) -> std::collections::HashMap<String, String> {
+        pairs.into_iter().collect()
+    }
+
+    /// The transport heartbeat reports the present-tense now-facts: playhead
+    /// tick, phrases elapsed, and tempo in whole BPM. These are what a player
+    /// composes its next phrase against; `$HEARD` is deliberately absent (a pull,
+    /// not a pushed var — see `transport_vars` docs).
+    #[test]
+    fn transport_vars_report_now_facts() {
+        // composer_default: 500 ms/beat (= 120 BPM), 16 beats/phrase.
+        let m = vars_map(transport_vars(Tick::new(128), 128, &BeatPolicy::composer_default()));
+        assert_eq!(m["TICK"], "128", "playhead tick verbatim");
+        assert_eq!(m["PHRASE"], "8", "128 beats / 16 per phrase = phrase 8");
+        assert_eq!(m["TEMPO"], "120", "500 ms/beat rounds to 120 BPM");
+    }
+
+    /// A faster tempo and a mid-phrase playhead: tick is exact, phrase floors,
+    /// BPM rounds. Guards the formatting against off-by-one phrase math.
+    #[test]
+    fn transport_vars_floor_phrase_and_round_bpm() {
+        let policy = BeatPolicy {
+            period: Duration::from_millis(300), // 200 BPM
+            beats_per_phrase: 16,
+            ooda_every: 16,
+        };
+        let m = vars_map(transport_vars(Tick::new(40), 40, &policy));
+        assert_eq!(m["TICK"], "40");
+        assert_eq!(m["PHRASE"], "2", "40 / 16 floors to 2 (mid third phrase)");
+        assert_eq!(m["TEMPO"], "200", "300 ms/beat = 200 BPM");
+    }
+
+    /// Defensive: a zero `beats_per_phrase` (no phrasing) reports phrase 0 rather
+    /// than dividing by zero — same guard as `is_phrase_boundary`.
+    #[test]
+    fn transport_vars_zero_phrase_guard() {
+        let policy = BeatPolicy {
+            period: Duration::from_millis(500),
+            beats_per_phrase: 0,
+            ooda_every: 1,
+        };
+        let m = vars_map(transport_vars(Tick::new(5), 5, &policy));
+        assert_eq!(m["PHRASE"], "0", "no phrasing → phrase 0, never a divide-by-zero");
+    }
 
     /// The poison-cell retry budget: the bridge retries the SAME failing cell up to
     /// the budget, then skips it (loudly) so a swallowed materialize error can never

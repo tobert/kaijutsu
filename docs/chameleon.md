@@ -3,9 +3,13 @@
 > Status: design jam 2026-06-10; batch 1 selected and vocabulary locked
 > 2026-06-11 (tracks not voices, phrases not bars in the kernel, silence
 > until first good). Batch 1 substrate corrections 1-3 (track on Cell,
-> notation-first commits, phrase vocabulary) have **shipped**; the new
-> mechanisms (4-6) and the slices below are not yet started. Companion doc:
-> `hyoushigi.md` (the timing substrate this builds on).
+> notation-first commits, phrase vocabulary) have **shipped**. Batch 2 began
+> 2026-06-11: the **transport report now-facts** (`$TICK`/`$PHRASE`/`$TEMPO`
+> heartbeat scalars seeded into the `tick` lifecycle; `kj drive --prompt` now
+> writes the report as a durable, hydrating block) shipped; `$HEARD`, the
+> quantized mailbox flush, and the cost-guard hydration marker are deferred
+> (see mechanism 4-6 below). Companion doc: `hyoushigi.md` (the timing
+> substrate this builds on).
 
 Chameleon teaches models to play music to a beat, starting with a small local
 model playing the bass line of Herbie Hancock's *Chameleon* (the Head Hunters
@@ -132,13 +136,30 @@ concept — *track* — collapses most of the gap:
 
 **New mechanisms:**
 
-4. **Quantized flush + transport report** — mailbox accumulation emits its
-   digest when the playhead crosses a grid line; turn preamble = transport
-   report (now-tick, tempo, bars elapsed, window contents, measured reach k).
-   The seam: hyoushigi stays ignorant of conversations, the mailbox ignorant
-   of tempo.
-5. **kaish heartbeat vars** early; `$HEARD` rides the arrays/hashes plan
-   (Chameleon is that plan's concrete first consumer). Traps later.
+4. **Quantized flush + transport report** — turn preamble = transport report
+   (now-tick, tempo, phrases elapsed, window contents, measured reach k); the
+   seam keeps hyoushigi ignorant of conversations and the mailbox ignorant of
+   tempo, with the beat scheduler as the third party that assembles the facts.
+   **Partially landed (2026-06-11):** the *now-facts* half — playhead tick,
+   phrases elapsed, tempo — ships as the `$TICK`/`$PHRASE`/`$TEMPO` heartbeat
+   scalars (`beat.rs::transport_vars`), seeded into the `tick` rc lifecycle via
+   `run_rc_lifecycle_with_vars` and composed into the drive prompt by
+   `S10-drive.kai`. `kj drive --prompt` now **writes the report as a real
+   User block** (it was silently dropped before — the turn driver reads the
+   seed from the log, not `TurnFlow.content`), so the report hydrates as the
+   fresh user turn. **Still open:** (a) the *quantized mailbox flush* — async
+   inbound events (sibling messages, shell output) emitting their digest on the
+   grid crossing rather than the next turn; not load-bearing for a solo player,
+   wanted at band time. (b) *window contents* → `$HEARD` (see 5). (c) *measured
+   reach k* — stubbed/omitted; turns still schedule a fixed one phrase ahead.
+5. **kaish heartbeat vars** — the scalar now-facts (`$TICK`/`$PHRASE`/`$TEMPO`)
+   **landed** with mechanism 4. `$HEARD` is **deferred and re-shaped to a
+   pull**: rather than the kernel pre-computing and injecting a window every
+   turn, the drive script will *read the committed past on demand* (a kaish
+   read of recent score blocks across tracks) when it wants what siblings
+   played. It only pays off with a second player — slice one is a solo bass
+   whose own hydrated history is its continuity — so it's built then, on the
+   block-log windowed-read primitive, not speculatively now. Traps later.
 
 **Cost guard:**
 
@@ -184,6 +205,28 @@ by `ConversationMailbox` (default = today's behavior, marker = ∞); exclusion
 machinery is the precedent. Convergence worth noting: pinned-prefix +
 sliding-window is precisely how attention-sink / StreamingLLM inference
 manages context at the attention level — same shape, one layer up.
+
+**RC-drives-the-marker (Amy, 2026-06-11) — keep policy out of Rust.** Don't
+hardcode "how much to keep" in the kernel. The Rust side is a *minimal
+mechanism*: the hydration policy on `ConversationMailbox` above (keep
+`[0, marker] ∪ [now − window, now]`, default marker = ∞) plus a `kj` verb that
+advances the marker / archives the blocks between it and the window. The
+*policy and trigger* live in **rc**: an **on-turn rc hook** (a `tick`-time or a
+new `turn`/`drive` lifecycle script) that, in composer mode, does roughly "mark
+the last N blocks archived, then reset the context's hydration to checkpoint +
+new — so only fresh blocks past the marker hydrate next turn." This is the
+self-introspection-kernel pattern: the model's own lifecycle scripts manage how
+much of its past it carries, the same way they already manage cache breakpoints
+and system-prompt slots. Marker-advance reuses the existing exclude/edit-at-
+boundary rule (a queued exclusion takes effect at the boundary), so there is no
+separate marker machinery to invent — the rc hook is just the policy author.
+This is the **cost guard** for the per-phrase report blocks that mechanism 4 now
+writes: without it, `kj drive --prompt` appends one durable User block per
+phrase forever (fine while hand-testing below tempo; a leak once a set runs at
+120 BPM). Build it before slice one runs sustained at tempo. Open: where the
+on-turn hook lives (reuse `tick`, or a dedicated post-turn verb so the marker
+advances *after* the model reads, not before), and the windowed archive `kj`
+surface (shares the block-log windowed-read primitive `$HEARD`'s pull wants).
 
 **Rotation (Amy, 2026-06-10) — the growth answer:** cap context length and
 cycle via **shallow fork** — "fork without history": copy the program

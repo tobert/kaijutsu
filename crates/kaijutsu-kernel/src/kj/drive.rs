@@ -63,13 +63,6 @@ impl KjDispatcher {
             return denied;
         }
 
-        // --prompt is the optional seed; when omitted the turn runs against
-        // whatever is already in the context's block log (the drift-then-drive
-        // path). The seed lives in TurnFlow::Requested.content, which is only a
-        // hydration-failure fallback, so an empty string is correct when no
-        // prompt is given.
-        let seed: String = parsed.prompt.unwrap_or_default();
-
         // The positional target context; default to the caller's current
         // context (".") when omitted. `kj drive` drives here; `kj drive
         // <label-or-id>` drives another context.
@@ -86,12 +79,48 @@ impl KjDispatcher {
         // A context with no blocks has nothing to anchor a turn after — there's
         // no document/history to act on. Crash loudly rather than publish a
         // turn request with no valid anchor.
-        let Some(after) = self.block_store().last_block_id(target) else {
+        let Some(tail) = self.block_store().last_block_id(target) else {
             return KjResult::Err(format!(
                 "kj drive: context '{}' has no blocks to anchor a turn after; \
                  there is nothing to drive",
                 target.to_hex()
             ));
+        };
+
+        // --prompt is the optional seed. When given, WRITE it as a real
+        // User/Text block (authored by the caller) and anchor the turn after
+        // it, so the model hydrates it as the fresh user turn. This is the
+        // composer's transport-report seam: the beat fires `kj drive --prompt
+        // "<report>"`, and the report becomes a durable, hydrating block.
+        //
+        // When omitted, the turn runs against whatever is already in the log
+        // (the drift-then-drive path) — no block is written, and `after`
+        // anchors at the current tail. TurnFlow.content keeps the prompt string
+        // (or "") purely as a hydration-failure fallback; the turn driver reads
+        // the authoritative seed from the log, not from `content`.
+        let seed: String = parsed.prompt.clone().unwrap_or_default();
+        let after = match parsed.prompt.as_deref() {
+            Some(prompt) => {
+                match self.block_store().insert_block_as(
+                    target,
+                    None,
+                    Some(&tail),
+                    kaijutsu_crdt::Role::User,
+                    kaijutsu_crdt::BlockKind::Text,
+                    prompt.to_string(),
+                    kaijutsu_crdt::Status::Done,
+                    ContentType::Plain,
+                    Some(caller.principal_id),
+                ) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        return KjResult::Err(format!(
+                            "kj drive: failed to write seed block: {e}"
+                        ));
+                    }
+                }
+            }
+            None => tail,
         };
 
         let delivered =
@@ -239,6 +268,68 @@ mod tests {
             }
             other => panic!("expected Requested, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn drive_with_prompt_writes_seed_block_and_anchors_turn() {
+        // The composer's transport report rides in as this seed block: a
+        // `kj drive --prompt "<report>"` must WRITE the prompt as a real
+        // User/Text block (authored by the caller) and anchor the turn after
+        // it, so the model hydrates it as the fresh user turn. Before this
+        // fix the prompt was dropped — it only rode TurnFlow.content, which the
+        // turn driver ignores (rpc.rs reads the seed from the log).
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("here"), None, principal);
+        seed_with_block(&d, ctx, principal);
+        let c = caller_with_context(ctx);
+        let mut sub = d.kernel().turn_flows().subscribe("turn.requested");
+
+        let before = d.block_store().block_snapshots(ctx).unwrap().len();
+        let result = d.dispatch(&[s("drive"), s("--prompt"), s("go")], &c).await;
+        assert!(result.is_ok(), "drive failed: {}", result.message());
+
+        let blocks = d.block_store().block_snapshots(ctx).unwrap();
+        assert_eq!(blocks.len(), before + 1, "one seed block appended");
+        let seed = blocks.last().unwrap();
+        assert_eq!(seed.content, "go", "seed block carries the prompt");
+        assert_eq!(seed.role, kaijutsu_crdt::Role::User, "seed is the user turn");
+        assert_eq!(seed.kind, kaijutsu_crdt::BlockKind::Text);
+        assert_eq!(
+            seed.id.principal_id, c.principal_id,
+            "seed authored by the driving caller"
+        );
+
+        let msg = sub.try_recv().expect("drive --prompt should publish");
+        match msg.payload {
+            crate::flows::TurnFlow::Requested {
+                after_block_id, ..
+            } => {
+                assert_eq!(
+                    after_block_id, seed.id,
+                    "the turn anchors AFTER the seed block, not the prior tail"
+                );
+            }
+            other => panic!("expected Requested, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn drive_without_prompt_writes_no_block() {
+        // The drift-then-drive path: bare `kj drive` runs against whatever is
+        // already in the log and must NOT append a seed block.
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("here"), None, principal);
+        seed_with_block(&d, ctx, principal);
+        let c = caller_with_context(ctx);
+        let _sub = d.kernel().turn_flows().subscribe("turn.requested");
+
+        let before = d.block_store().block_snapshots(ctx).unwrap().len();
+        let result = d.dispatch(&[s("drive")], &c).await;
+        assert!(result.is_ok(), "drive failed: {}", result.message());
+        let after = d.block_store().block_snapshots(ctx).unwrap().len();
+        assert_eq!(after, before, "no --prompt means no seed block appended");
     }
 
     #[tokio::test]

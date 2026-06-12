@@ -99,6 +99,7 @@ mod tests {
             content_type: ContentType::Plain,
             order_key: None,
             tick: None,
+            track: None,
             updated_at: 0,
             status_at: 0,
             collapsed_at: 0,

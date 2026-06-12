@@ -239,10 +239,32 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   repeats — truthful but mildly noisy. Add a track chip (the lane identity) and a
   "transport" label for `beat()`-authored fallback repeats so a vamp insurance
   repeat reads as the transport, not a mystery principal.
-- **`ResolverCtx` track-scoped reads await `$HEARD`:** `content_before` stays
-  deliberately track-blind (no current resolver reads it; `CasCommitResolver`
-  reads CAS by hash). The first real consumer of track-scoped reads is `$HEARD` — design
-  that API with its consumer (two-voices rule), not speculatively here.
+- **`$HEARD` re-shaped to a pull (Chameleon batch 2, 2026-06-11):** `$HEARD` is
+  **no longer a pushed var.** Rather than the kernel computing a window and
+  injecting it every turn, the drive script will *read the committed past on
+  demand* — a kaish read of recent score blocks across tracks (a block-log
+  windowed read, since committed cells leave the in-RAM `Timeline.committed` at
+  the barrier but the durable blocks carry `tick`+`track` and sync). Built when
+  a **second player** makes it load-bearing (slice one is solo bass; its own
+  hydrated history is its continuity), on that windowed-read primitive — which
+  the RC hydration-marker archive verb also wants. `content_before` in
+  `ResolverCtx` stays deliberately track-blind regardless (no resolver reads it;
+  `CasCommitResolver` reads CAS by hash). Design the read API with its consumer
+  (two-voices rule), not speculatively here.
+- **Transport-report cost guard — the RC-driven hydration marker (Chameleon
+  batch 2, 2026-06-11):** mechanism 4's transport report now ships as a durable
+  block — `kj drive --prompt "<report>"` writes a real User block each phrase
+  (`kj/drive.rs`; previously the prompt was silently dropped). That's correct
+  but **appends one block per phrase forever**. The guard is the **RC-driven
+  hydration marker** (design in `docs/chameleon.md`): a minimal Rust hydration
+  policy on `ConversationMailbox` (keep `[0, marker] ∪ [now − window, now]`,
+  default marker = ∞) + a `kj` verb that advances the marker / archives the
+  middle + an **on-turn rc hook** that calls it in composer mode (policy lives
+  in rc, not Rust). Reuses the existing exclude/edit-at-boundary rule. **Build
+  before slice one runs sustained at tempo** — fine while hand-testing below
+  tempo. Open: hook placement (reuse `tick` vs. a post-turn verb so the marker
+  advances *after* the model reads), and the windowed archive surface (shared
+  with `$HEARD`'s pull).
 - **Optional rc-driven last-good rehydration on arm:** after restart every
   track's engine history is empty → `UseLastGood` → Skip → **silence until the
   first good phrase** (locked default). A future rc-driven arm option could

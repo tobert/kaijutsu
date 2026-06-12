@@ -95,10 +95,6 @@ fn verb_is_wired(verb: &str) -> bool {
 impl KjDispatcher {
     /// Run rc lifecycle scripts for `(context_type, verb)` against the
     /// **new** context. See module docs for failure semantics.
-    #[tracing::instrument(
-        skip(self, drift_info, caller),
-        fields(verb = %verb, ctx = %new_id.short(), rc_depth = caller.rc_depth),
-    )]
     pub async fn run_rc_lifecycle(
         &self,
         verb: &str,
@@ -106,6 +102,50 @@ impl KjDispatcher {
         parent_id: Option<ContextId>,
         fork_kind: Option<ForkKind>,
         drift_info: Option<DriftInfo>,
+        caller: &KjCaller,
+    ) -> Result<(), String> {
+        self.run_rc_lifecycle_inner(
+            verb, new_id, parent_id, fork_kind, drift_info, &HashMap::new(), caller,
+        )
+        .await
+    }
+
+    /// Like [`run_rc_lifecycle`](Self::run_rc_lifecycle), but seeds `extra_vars`
+    /// into every `.kai` script's kaish environment alongside the standard
+    /// `KJ_*` vars. The composer beat scheduler uses this to hand the `tick`
+    /// lifecycle its transport heartbeat (`$TICK` / `$PHRASE` / `$TEMPO`) so
+    /// `S10-drive.kai` can compose the turn's transport report. Bare names (no
+    /// `KJ_` prefix) per the heartbeat-var taxonomy in `docs/chameleon.md`.
+    #[allow(clippy::too_many_arguments)] // mirrors the lifecycle param shape
+    pub async fn run_rc_lifecycle_with_vars(
+        &self,
+        verb: &str,
+        new_id: ContextId,
+        parent_id: Option<ContextId>,
+        fork_kind: Option<ForkKind>,
+        drift_info: Option<DriftInfo>,
+        extra_vars: &HashMap<String, String>,
+        caller: &KjCaller,
+    ) -> Result<(), String> {
+        self.run_rc_lifecycle_inner(
+            verb, new_id, parent_id, fork_kind, drift_info, extra_vars, caller,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)] // mirrors the lifecycle param shape
+    #[tracing::instrument(
+        skip(self, drift_info, extra_vars, caller),
+        fields(verb = %verb, ctx = %new_id.short(), rc_depth = caller.rc_depth),
+    )]
+    async fn run_rc_lifecycle_inner(
+        &self,
+        verb: &str,
+        new_id: ContextId,
+        parent_id: Option<ContextId>,
+        fork_kind: Option<ForkKind>,
+        drift_info: Option<DriftInfo>,
+        extra_vars: &HashMap<String, String>,
         caller: &KjCaller,
     ) -> Result<(), String> {
         if !verb_is_wired(verb) {
@@ -180,6 +220,7 @@ impl KjDispatcher {
                         verb,
                         script,
                         child_depth,
+                        extra_vars,
                         caller.principal_id,
                     )
                     .await
@@ -297,6 +338,7 @@ async fn run_kai_script(
     verb: &str,
     script: &RcScript,
     child_depth: u8,
+    extra_vars: &HashMap<String, String>,
     principal: PrincipalId,
 ) {
     use kaijutsu_types::SessionId;
@@ -392,6 +434,13 @@ async fn run_kai_script(
             "KJ_DRIFT_INFO".into(),
             kaish_kernel::ast::Value::String(json.to_string()),
         );
+    }
+
+    // Caller-supplied vars (the composer's transport heartbeat: $TICK/$PHRASE/
+    // $TEMPO). Folded in last; a deliberate KJ_* collision would override, but
+    // the heartbeat names don't use that prefix.
+    for (k, v) in extra_vars {
+        vars.insert(k.clone(), kaish_kernel::ast::Value::String(v.clone()));
     }
 
     // Every `.kai` script runs under the kernel-wide `rc_script_timeout`
@@ -761,6 +810,95 @@ mod tests {
         assert!(
             body.contains("S00-echo.kai") || body.contains("S00"),
             "trace block must reference the script path or sort key, got: {body}"
+        );
+    }
+
+    /// The composer transport seam: `run_rc_lifecycle_with_vars` must seed the
+    /// extra vars into the `.kai` env so a `tick` script can read `$TICK` /
+    /// `$PHRASE` / `$TEMPO` and compose the turn's transport report. Echoes the
+    /// vars and asserts they round-trip through the captured Trace block.
+    #[tokio::test]
+    async fn rc_lifecycle_with_vars_seeds_kai_env() {
+        let d = test_dispatcher().await;
+        install_script(
+            &d,
+            "/etc/rc/test/tick/S00-report.kai",
+            "test",
+            "tick",
+            "S00",
+            "report",
+            "kai",
+            "echo \"tick=$TICK phrase=$PHRASE tempo=$TEMPO\"",
+        )
+        .await;
+        let caller = unjoined_caller();
+        let result = d
+            .dispatch(&argv(&["context", "create", "ctx-tick", "--type", "test"]), &caller)
+            .await;
+        assert!(result.is_ok(), "create failed: {}", result.message());
+        let new_id = lookup_context_id(&d, "ctx-tick");
+
+        let vars: std::collections::HashMap<String, String> = [
+            ("TICK".to_string(), "128".to_string()),
+            ("PHRASE".to_string(), "8".to_string()),
+            ("TEMPO".to_string(), "120".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        d.run_rc_lifecycle_with_vars("tick", new_id, None, None, None, &vars, &caller)
+            .await
+            .expect("tick lifecycle");
+
+        let snapshots = d.block_store().block_snapshots(new_id).expect("snapshots");
+        let trace = snapshots
+            .iter()
+            .find(|b| b.kind == kaijutsu_types::BlockKind::Trace)
+            .expect("the echoing tick script produced a trace block");
+        assert!(
+            trace.content.contains("tick=128 phrase=8 tempo=120"),
+            "heartbeat vars must reach the .kai env, got: {}",
+            trace.content
+        );
+    }
+
+    /// Non-vacuity guard for the seam above: with NO extra vars, the same script
+    /// sees empty `$TICK`/`$PHRASE`/`$TEMPO` — proving the assertion pins the
+    /// seeding, not an always-populated env.
+    #[tokio::test]
+    async fn rc_lifecycle_without_vars_leaves_heartbeat_empty() {
+        let d = test_dispatcher().await;
+        install_script(
+            &d,
+            "/etc/rc/test/tick/S00-report.kai",
+            "test",
+            "tick",
+            "S00",
+            "report",
+            "kai",
+            "echo \"tick=$TICK phrase=$PHRASE tempo=$TEMPO\"",
+        )
+        .await;
+        let caller = unjoined_caller();
+        let result = d
+            .dispatch(&argv(&["context", "create", "ctx-novars", "--type", "test"]), &caller)
+            .await;
+        assert!(result.is_ok(), "create failed: {}", result.message());
+        let new_id = lookup_context_id(&d, "ctx-novars");
+
+        // The plain lifecycle (no extra vars) leaves the heartbeat unset.
+        d.run_rc_lifecycle("tick", new_id, None, None, None, &caller)
+            .await
+            .expect("tick lifecycle");
+
+        let snapshots = d.block_store().block_snapshots(new_id).expect("snapshots");
+        let trace = snapshots
+            .iter()
+            .find(|b| b.kind == kaijutsu_types::BlockKind::Trace)
+            .expect("the echoing tick script produced a trace block");
+        assert!(
+            trace.content.contains("tick= phrase= tempo="),
+            "without seeded vars the heartbeat must be empty, got: {}",
+            trace.content
         );
     }
 
