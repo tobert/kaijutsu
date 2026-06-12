@@ -9,7 +9,6 @@
 //! (more specific fence pattern), then SVG, then falls back to markdown.
 
 use bevy::prelude::*;
-use bevy_vello::prelude::*;
 use vello::kurbo::Affine;
 use vello::peniko::{Brush, Fill};
 

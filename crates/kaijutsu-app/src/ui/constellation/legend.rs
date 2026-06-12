@@ -6,6 +6,7 @@
 
 use bevy::prelude::*;
 use bevy_vello::prelude::UiVelloScene;
+use bevy_vello::prelude::VelloFont;
 use kurbo::RoundedRect;
 use peniko::{Color as VelloColor, Fill};
 
@@ -222,7 +223,7 @@ fn update_legend_content(
 
 fn spawn_legend_text(
     commands: &mut Commands,
-    font: &Handle<bevy_vello::prelude::VelloFont>,
+    font: &Handle<VelloFont>,
     text: &str,
     color: Color,
     font_size: f32,

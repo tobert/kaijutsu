@@ -10,7 +10,8 @@
 use std::collections::VecDeque;
 
 use bevy::prelude::*;
-use bevy_vello::prelude::{UiVelloScene, VelloFont, VelloTextAlign, VelloTextStyle};
+use bevy_vello::prelude::UiVelloScene;
+use crate::text::shaping::{VelloFont, VelloTextAlign, VelloTextStyle};
 use vello::kurbo::Affine;
 use vello::peniko::Fill;
 
@@ -46,7 +47,7 @@ impl DockSparkline {
         self.data.values.push(value);
     }
 }
-use crate::text::{FontHandles, bevy_color_to_brush};
+use crate::text::{ShapingFonts, bevy_color_to_brush};
 use crate::ui::constellation::{ActivityState, Constellation};
 use crate::ui::drift::DriftState;
 use crate::ui::theme::Theme;
@@ -355,7 +356,7 @@ pub fn render_north_dock(
     dock_state: Res<DockState>,
     theme: Res<Theme>,
     fonts: Res<Assets<VelloFont>>,
-    font_handles: Res<FontHandles>,
+    font_handles: Res<ShapingFonts>,
     mut query: Query<(&mut UiVelloScene, &ComputedNode), With<NorthDock>>,
 ) {
     if !dock_state.is_changed() && !theme.is_changed() {
@@ -472,7 +473,7 @@ pub fn render_south_dock(
     dock_state: Res<DockState>,
     theme: Res<Theme>,
     fonts: Res<Assets<VelloFont>>,
-    font_handles: Res<FontHandles>,
+    font_handles: Res<ShapingFonts>,
     mut query: Query<(&mut UiVelloScene, &ComputedNode), With<SouthDock>>,
     mut hit_regions: ResMut<DockHitRegions>,
 ) {

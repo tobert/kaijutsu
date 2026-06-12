@@ -10,11 +10,12 @@ pub mod msdf;
 mod plugin;
 mod resources;
 pub mod rich;
+pub mod shaping;
 pub mod sparkline;
 
 pub use components::{KjTextEffects, bevy_color_to_brush, vello_style};
 pub use plugin::KjTextPlugin;
-pub use resources::{FontHandles, SvgFontDb, TextMetrics};
+pub use resources::{FontHandles, ShapingFonts, SvgFontDb, TextMetrics};
 pub use rich::RichContent;
 
 /// Char-aware truncation (safe for multi-byte UTF-8).

@@ -6,7 +6,7 @@
 
 use bevy::prelude::*;
 use bevy::ui::ComputedNode;
-use bevy_vello::prelude::{VelloFont, VelloTextAlign, VelloTextStyle};
+use crate::text::shaping::{VelloFont, VelloFontAxes, VelloTextAlign, VelloTextStyle};
 
 use crate::cell::block_border::{BlockBorderStyle, BorderAnimation, BorderKind, BorderPadding};
 use crate::cell::InputOverlay;
@@ -14,7 +14,7 @@ use crate::input::focus::ActiveSurface;
 use crate::input::FocusArea;
 use crate::shaders::BlockFxMaterial;
 use crate::text::msdf::{BlockRenderMethod, FontDataMap, MsdfBlockGlyphs, collect_msdf_glyphs};
-use crate::text::{FontHandles, TextMetrics, bevy_color_to_brush};
+use crate::text::{ShapingFonts, TextMetrics, bevy_color_to_brush};
 use crate::ui::theme::Theme;
 use crate::view::block_render::{BlockScene, BlockTexture};
 use crate::view::components::OverlayCursorGeometry;
@@ -228,7 +228,7 @@ pub fn build_shell_dock_glyphs(
         With<MsdfShellDockText>,
     >,
     fonts: Res<Assets<VelloFont>>,
-    font_handles: Res<FontHandles>,
+    font_handles: Res<ShapingFonts>,
     theme: Res<Theme>,
     text_metrics: Res<TextMetrics>,
     mut atlas: Option<ResMut<crate::text::msdf::MsdfAtlas>>,
@@ -297,10 +297,9 @@ pub fn build_shell_dock_glyphs(
             };
 
             let style = VelloTextStyle {
-                font: font_handles.mono.clone(),
                 brush: text_brush,
                 font_size: text_metrics.cell_font_size,
-                font_axes: bevy_vello::integrations::text::VelloFontAxes {
+                font_axes: VelloFontAxes {
                     weight: Some(200.0),
                     ..default()
                 },

@@ -5,7 +5,7 @@
 //! + ImageNode for CPU-rasterized Vello rendering with Bevy flex layout.
 
 use bevy::prelude::*;
-use bevy_vello::prelude::VelloFont;
+use crate::text::shaping::VelloFont;
 
 use crate::cell::{
     BlockCell, BlockCellContainer, BlockCellLayout, BlockId, CellEditor, LayoutGeneration,
@@ -21,7 +21,7 @@ pub struct EditorEntities {
     /// The ConversationContainer entity (flex parent for BlockCells).
     pub conversation_container: Option<Entity>,
 }
-use crate::text::FontHandles;
+use crate::text::ShapingFonts;
 use crate::ui::timeline::TimelineVisibility;
 
 // ============================================================================
@@ -146,7 +146,7 @@ pub fn spawn_block_cells(
     mut containers: Query<&mut BlockCellContainer>,
     existing_block_cells: Query<Entity, With<BlockCell>>,
     mut layout_gen: ResMut<LayoutGeneration>,
-    font_handles: Res<FontHandles>,
+    font_handles: Res<ShapingFonts>,
     fonts: Res<Assets<VelloFont>>,
     mut scroll_state: ResMut<crate::cell::ConversationScrollState>,
     mut fx_materials: ResMut<Assets<BlockFxMaterial>>,

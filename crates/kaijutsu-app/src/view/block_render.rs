@@ -16,7 +16,7 @@ use bevy::render::{
     renderer::{RenderDevice, RenderQueue},
     texture::GpuImage,
 };
-use bevy_vello::prelude::*;
+use crate::text::shaping::{VelloFont, VelloFontAxes, VelloTextAlign, VelloTextStyle};
 use vello::kurbo::Affine;
 use vello::peniko::Fill;
 
@@ -30,7 +30,7 @@ use crate::text::msdf::{
 };
 use crate::text::rich::{RichContent, RichContentKind, SVG_MAX_HEIGHT};
 use crate::text::{
-    FontHandles, KjTextEffects, TextMetrics, bevy_color_to_brush,
+    ShapingFonts, KjTextEffects, TextMetrics, bevy_color_to_brush,
 };
 use crate::text::components::rainbow_brush;
 use crate::text::markdown::MarkdownColors;
@@ -306,7 +306,7 @@ pub fn build_block_scenes(
         With<BlockCell>,
     >,
     fonts: Res<Assets<VelloFont>>,
-    font_handles: Res<FontHandles>,
+    font_handles: Res<ShapingFonts>,
     theme: Res<Theme>,
     text_metrics: Res<TextMetrics>,
     time: Res<Time>,
@@ -399,10 +399,9 @@ pub fn build_block_scenes(
 
         // Build text style
         let style = VelloTextStyle {
-            font: font_handles.mono.clone(),
             brush: text_brush.clone(),
             font_size: text_metrics.cell_font_size,
-            font_axes: bevy_vello::integrations::text::VelloFontAxes {
+            font_axes: VelloFontAxes {
                 weight: Some(200.0),
                 ..default()
             },
@@ -647,7 +646,6 @@ pub fn build_block_scenes(
 
                 let label_brush = bevy_color_to_brush(border_style.color);
                 let label_style = VelloTextStyle {
-                    font: font_handles.mono.clone(),
                     brush: label_brush.clone(),
                     font_size: label_font_size,
                     ..default()
@@ -753,7 +751,6 @@ pub fn build_block_scenes(
                 .unwrap_or(Color::srgba(0.5, 0.55, 0.65, cb_alpha));
             let cb_brush = bevy_color_to_brush(cb_color);
             let cb_style = VelloTextStyle {
-                font: font_handles.mono.clone(),
                 brush: cb_brush.clone(),
                 font_size: cb_font_size,
                 ..default()
@@ -804,7 +801,7 @@ pub fn build_role_group_scenes(
         Changed<ComputedNode>,
     >,
     fonts: Res<Assets<VelloFont>>,
-    font_handles: Res<FontHandles>,
+    font_handles: Res<ShapingFonts>,
     theme: Res<Theme>,
 ) {
     let font = fonts.get(&font_handles.mono);

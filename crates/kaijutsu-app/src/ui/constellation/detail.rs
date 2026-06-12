@@ -6,6 +6,7 @@
 
 use bevy::prelude::*;
 use bevy_vello::prelude::{UiVelloScene, UiVelloText};
+use bevy_vello::prelude::VelloFont;
 use kurbo::{Affine, RoundedRect};
 use peniko::{Color as VelloColor, Fill};
 
@@ -287,7 +288,7 @@ fn update_detail_content(
 
 fn spawn_detail_text(
     commands: &mut Commands,
-    font: &Handle<bevy_vello::prelude::VelloFont>,
+    font: &Handle<VelloFont>,
     text: &str,
     color: Color,
     font_size: f32,

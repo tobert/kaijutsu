@@ -5,7 +5,7 @@
 //! so kaijutsu-abc stays a leaf crate.
 
 use bevy::prelude::default;
-use bevy_vello::prelude::*;
+use crate::text::shaping::{VelloFont, VelloTextAlign, VelloTextStyle};
 use vello::kurbo::{Affine, BezPath, Cap, Line, Stroke};
 use vello::peniko::{Brush, Fill};
 

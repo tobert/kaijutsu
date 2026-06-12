@@ -7,11 +7,10 @@ use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 use bevy::winit::{EventLoopProxyWrapper, WinitUserEvent};
 use bevy_vello::VelloPlugin;
-use bevy_vello::integrations::text::VelloFontAxes;
-use bevy_vello::prelude::*;
 
 use super::msdf::{FontDataMap, MsdfGenerator};
-use super::resources::{FontHandles, SvgFontDb, TextMetrics};
+use super::resources::{FontHandles, ShapingFonts, SvgFontDb, TextMetrics};
+use super::shaping::{ShapingPlugin, VelloFont, VelloFontAxes, VelloTextAlign, VelloTextStyle};
 
 /// Plugin that enables Vello + MSDF text rendering.
 ///
@@ -24,7 +23,9 @@ pub struct KjTextPlugin;
 impl Plugin for KjTextPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(VelloPlugin::default())
+            .add_plugins(ShapingPlugin)
             .init_resource::<FontHandles>()
+            .init_resource::<ShapingFonts>()
             .init_resource::<TextMetrics>()
             .init_resource::<SvgFontDb>()
             .insert_resource(MsdfGenerator::new())
@@ -96,11 +97,29 @@ fn poll_msdf_generator(
     atlas.sync_to_gpu(&mut images);
 }
 
-/// Load bundled fonts into VelloFont asset handles.
-fn load_fonts(asset_server: Res<AssetServer>, mut font_handles: ResMut<FontHandles>) {
-    font_handles.mono = asset_server.load("fonts/CascadiaCodeNF.ttf");
-    font_handles.serif = asset_server.load("fonts/NotoSerif-Regular.ttf");
-    font_handles.cjk = asset_server.load("fonts/NotoSansCJKJP-Light.ttf");
+/// Load bundled fonts for both font paths.
+///
+/// The same three `.ttf` files load twice — once as bevy_vello's `VelloFont`
+/// for the UI-chrome path (`FontHandles`), once as our shaping `VelloFont`
+/// (`ShapingFonts`). The double-load is a transition cost; it collapses when
+/// the UI chrome retires in phase 4 (bevy_vello-escape).
+fn load_fonts(
+    asset_server: Res<AssetServer>,
+    mut font_handles: ResMut<FontHandles>,
+    mut shaping_fonts: ResMut<ShapingFonts>,
+) {
+    const MONO: &str = "fonts/CascadiaCodeNF.ttf";
+    const SERIF: &str = "fonts/NotoSerif-Regular.ttf";
+    const CJK: &str = "fonts/NotoSansCJKJP-Light.ttf";
+
+    font_handles.mono = asset_server.load(MONO);
+    font_handles.serif = asset_server.load(SERIF);
+    font_handles.cjk = asset_server.load(CJK);
+
+    shaping_fonts.mono = asset_server.load(MONO);
+    shaping_fonts.serif = asset_server.load(SERIF);
+    shaping_fonts.cjk = asset_server.load(CJK);
+
     info!("Loaded Vello fonts: CascadiaCodeNF, NotoSerif, NotoSansCJKJP");
 }
 
@@ -157,7 +176,7 @@ fn load_svg_fontdb(mut svg_fontdb: ResMut<SvgFontDb>, theme: Res<crate::ui::them
 /// real Parley-measured metrics. This ensures cursor positioning matches
 /// what bevy_vello renders — critical for accurate cursor placement.
 fn update_text_metrics_from_font(
-    font_handles: Res<FontHandles>,
+    shaping_fonts: Res<ShapingFonts>,
     fonts: Res<Assets<VelloFont>>,
     mut text_metrics: ResMut<TextMetrics>,
 ) {
@@ -165,12 +184,11 @@ fn update_text_metrics_from_font(
     if text_metrics.cell_line_height_from_font && text_metrics.cell_char_width_from_font {
         return;
     }
-    let Some(font) = fonts.get(&font_handles.mono) else {
+    let Some(font) = fonts.get(&shaping_fonts.mono) else {
         return;
     };
     let style = VelloTextStyle {
         font_size: text_metrics.cell_font_size,
-        font: font_handles.mono.clone(),
         font_axes: VelloFontAxes {
             weight: Some(200.0),
             ..default()

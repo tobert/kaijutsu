@@ -8,6 +8,7 @@ use vello::kurbo::{Affine, Cap, Line, Stroke};
 use vello::peniko::{Brush, Fill};
 
 use crate::text::components::bevy_color_to_brush;
+use crate::text::shaping::{VelloFont, VelloTextAlign, VelloTextStyle};
 
 // ============================================================================
 // CONSTANTS
@@ -40,7 +41,7 @@ pub fn build_role_group_line(
     height: f64,
     role_label: &str,
     color: Color,
-    font: Option<&bevy_vello::prelude::VelloFont>,
+    font: Option<&VelloFont>,
 ) {
     let brush = bevy_color_to_brush(color);
     let stroke = Stroke::new(1.0).with_caps(Cap::Butt);
@@ -92,10 +93,10 @@ fn draw_label_text(
     text: &str,
     x: f64,
     y: f64,
-    font: &bevy_vello::prelude::VelloFont,
+    font: &VelloFont,
     brush: &Brush,
 ) {
-    let style = bevy_vello::prelude::VelloTextStyle {
+    let style = VelloTextStyle {
         font_size: ROLE_LABEL_FONT_SIZE,
         ..default()
     };
@@ -103,7 +104,7 @@ fn draw_label_text(
     let layout = font.layout(
         text,
         &style,
-        bevy_vello::prelude::VelloTextAlign::Left,
+        VelloTextAlign::Left,
         None,
     );
 
@@ -148,16 +149,16 @@ fn draw_label_text(
 }
 
 /// Measure label width using font layout or a heuristic fallback.
-fn measure_label_width(label: &str, font: Option<&bevy_vello::prelude::VelloFont>) -> f64 {
+fn measure_label_width(label: &str, font: Option<&VelloFont>) -> f64 {
     if let Some(font) = font {
-        let style = bevy_vello::prelude::VelloTextStyle {
+        let style = VelloTextStyle {
             font_size: ROLE_LABEL_FONT_SIZE,
             ..default()
         };
         let layout = font.layout(
             label,
             &style,
-            bevy_vello::prelude::VelloTextAlign::Left,
+            VelloTextAlign::Left,
             None,
         );
         layout.width() as f64
