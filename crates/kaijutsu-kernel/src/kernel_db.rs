@@ -152,6 +152,15 @@ pub struct PresetRow {
     pub created_by: PrincipalId,
 }
 
+/// One normalized, verb-scoped preset argument (a row of `preset_args`). The
+/// "filter knobs" a patch recalls — e.g. `("include", "0:5")` under verb
+/// `"fork"`. Repeatable arg names carry multiple `PresetArg`s.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PresetArg {
+    pub arg_name: String,
+    pub arg_value: String,
+}
+
 /// A workspace row.
 #[derive(Debug, Clone)]
 pub struct WorkspaceRow {
@@ -281,6 +290,22 @@ CREATE TABLE IF NOT EXISTS presets (
     created_at   INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
     created_by   BLOB NOT NULL
 );
+
+-- Normalized, verb-scoped preset arguments (the "filter knobs" of a patch —
+-- model knobs stay as columns on `presets`). Repeatable args (e.g. several
+-- --exclude ranges) are multiple rows; the composite PK dedups identical ones
+-- (the selection algebra is order-free, so a repeat is meaningless). Verb-
+-- scoped from day one so the concept generalizes without a migration. See
+-- docs/fork-filters.md ("Presets = patch recall").
+CREATE TABLE IF NOT EXISTS preset_args (
+    preset_id  BLOB NOT NULL REFERENCES presets(preset_id) ON DELETE CASCADE,
+    verb       TEXT NOT NULL,
+    arg_name   TEXT NOT NULL,
+    arg_value  TEXT NOT NULL,
+    PRIMARY KEY (preset_id, verb, arg_name, arg_value)
+);
+CREATE INDEX IF NOT EXISTS idx_preset_args_lookup
+    ON preset_args(preset_id, verb);
 
 -- ── Documents (CRDT content layer) ─────────────────────────────
 CREATE TABLE IF NOT EXISTS documents (
@@ -2029,13 +2054,64 @@ impl KernelDb {
         Ok(())
     }
 
-    /// Delete a preset. Returns true if it existed.
+    /// Delete a preset. Returns true if it existed. Its `preset_args` rows
+    /// cascade-delete with it.
     pub fn delete_preset(&self, id: PresetId) -> KernelDbResult<bool> {
         let deleted = self.conn.execute(
             "DELETE FROM presets WHERE preset_id = ?1",
             params![blob_param(id.as_bytes())],
         )?;
         Ok(deleted > 0)
+    }
+
+    /// Replace all args for `(preset_id, verb)` with `args`, transactionally.
+    /// Empty `args` clears the verb's args. Idempotent — duplicate
+    /// `(arg_name, arg_value)` pairs collapse via the composite PK.
+    pub fn set_preset_args(
+        &mut self,
+        preset_id: PresetId,
+        verb: &str,
+        args: &[PresetArg],
+    ) -> KernelDbResult<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM preset_args WHERE preset_id = ?1 AND verb = ?2",
+            params![blob_param(preset_id.as_bytes()), verb],
+        )?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO preset_args (preset_id, verb, arg_name, arg_value)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for a in args {
+                stmt.execute(params![
+                    blob_param(preset_id.as_bytes()),
+                    verb,
+                    a.arg_name,
+                    a.arg_value,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Read the args for `(preset_id, verb)`, ordered by `(arg_name,
+    /// arg_value)` for a stable round-trip. The selection algebra is order-free,
+    /// so value-order is purely for determinism.
+    pub fn get_preset_args(&self, preset_id: PresetId, verb: &str) -> KernelDbResult<Vec<PresetArg>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT arg_name, arg_value FROM preset_args
+             WHERE preset_id = ?1 AND verb = ?2
+             ORDER BY arg_name, arg_value",
+        )?;
+        let rows = stmt.query_map(params![blob_param(preset_id.as_bytes()), verb], |row| {
+            Ok(PresetArg {
+                arg_name: row.get(0)?,
+                arg_value: row.get(1)?,
+            })
+        })?;
+        Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
     }
 
     // ========================================================================
@@ -3384,6 +3460,80 @@ mod tests {
         // degrade to None — that would erase fork provenance.
         assert!(fork_kind_from_sql(Some("shallow".into())).is_err());
         assert!(fork_kind_from_sql(Some("garbage".into())).is_err());
+    }
+
+    fn insert_test_preset(db: &KernelDb, label: &str) -> PresetId {
+        let pid = PresetId::new();
+        db.insert_preset(&PresetRow {
+            preset_id: pid,
+            label: label.into(),
+            description: None,
+            provider: None,
+            model: None,
+            system_prompt: None,
+            consent_mode: ConsentMode::Collaborative,
+            created_at: now_millis() as i64,
+            created_by: PrincipalId::new(),
+        })
+        .unwrap();
+        pid
+    }
+
+    fn arg(name: &str, value: &str) -> PresetArg {
+        PresetArg { arg_name: name.into(), arg_value: value.into() }
+    }
+
+    #[test]
+    fn preset_args_roundtrip_verb_scoped_and_dedup() {
+        let mut db = KernelDb::in_memory().unwrap();
+        let pid = insert_test_preset(&db, "window");
+
+        assert!(db.get_preset_args(pid, "fork").unwrap().is_empty());
+
+        // Repeated --exclude plus a duplicate that must collapse via the PK.
+        db.set_preset_args(
+            pid,
+            "fork",
+            &[
+                arg("exclude", "10:12"),
+                arg("exclude", "0:5"),
+                arg("exclude", "0:5"),
+                arg("window", "16"),
+            ],
+        )
+        .unwrap();
+
+        // Ordered by (arg_name, arg_value); the dup is gone.
+        assert_eq!(
+            db.get_preset_args(pid, "fork").unwrap(),
+            vec![arg("exclude", "0:5"), arg("exclude", "10:12"), arg("window", "16")]
+        );
+
+        // Verb-scoped: another verb is independent and doesn't disturb fork.
+        db.set_preset_args(pid, "context", &[arg("model", "x")]).unwrap();
+        assert_eq!(db.get_preset_args(pid, "fork").unwrap().len(), 3);
+
+        // Replace semantics: re-setting fork wipes the prior set.
+        db.set_preset_args(pid, "fork", &[arg("include", "end-5:")]).unwrap();
+        assert_eq!(db.get_preset_args(pid, "fork").unwrap(), vec![arg("include", "end-5:")]);
+
+        // Empty clears.
+        db.set_preset_args(pid, "fork", &[]).unwrap();
+        assert!(db.get_preset_args(pid, "fork").unwrap().is_empty());
+    }
+
+    #[test]
+    fn preset_args_cascade_on_preset_delete() {
+        let mut db = KernelDb::in_memory().unwrap();
+        let pid = insert_test_preset(&db, "spawn");
+        db.set_preset_args(pid, "fork", &[arg("include", ":0")]).unwrap();
+        assert_eq!(db.get_preset_args(pid, "fork").unwrap().len(), 1);
+
+        assert!(db.delete_preset(pid).unwrap());
+        assert!(
+            db.get_preset_args(pid, "fork").unwrap().is_empty(),
+            "preset_args must cascade-delete with the preset"
+        );
     }
 
     // ── 1. Schema idempotent ────────────────────────────────────────────
