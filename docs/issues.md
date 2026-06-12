@@ -325,6 +325,41 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
     writes revision blocks, re-run `kj context hydrate` to advance P. Pure rc
     once the producer exists.
 
+- **Fork primitives — full/thin mental model (Amy, 2026-06-12).** Full fork
+  (regular `kj fork`) is the *powerful* path: take the whole context into a fresh
+  lineage = a **new KV cache** (resume-a-session-as-another-model, orchestrator
+  repair, drift-a-summary-back). Thin fork (`--shallow`/`--compact`) is *reuse/
+  reduce*: save tokens for a long-running iterating player. Copy cost is a
+  non-issue (storage cheap); the axis is KV-cache strategy. Two unbuilt
+  primitives this model implies:
+  - **`kj fork --exclude <block>…` on FULL fork.** Today `fork_full`
+    (`kj/fork.rs:171`) calls the *unfiltered* `fork_document` — a full fork
+    copies everything, no way to drop a block. The capability already exists
+    (`ForkBlockFilter.exclude_block_ids` + `fork_document_filtered`, used by
+    `--shallow`); it's just not wired onto full fork. Needed for the
+    orchestrator-repair case ("fork X *without* the huge block that blew it up").
+    Bounded: add the flag, route `fork_full` through `fork_document_filtered`
+    when exclusions are present.
+  - **A snapshot/savepoint marker verb (speculative, not-now).** No general "tag
+    this point to fork-from / rotate-at / reference later" verb exists. Closest
+    today: `kj context hydrate --mark <block>` (hydration prefix only, one per
+    ctx) and the `compacted` flag set by `kj compact`'s threshold auto-compaction
+    (not a manual savepoint). Would pair with `--exclude` (name the block) and
+    the time-well's fork-lineage navigation. Revisit when the orchestrator work
+    needs it.
+  - **OPEN design question before more thin-fork code — what shape does a thin
+    fork copy?** `--shallow` today keeps the *last-N* blocks (`max_blocks`), which
+    Amy flagged as a weak primitive. But "thin = KV *reuse*" implies preserving
+    the parent's cached prefix `[0,P]` byte-for-byte (= `select_hydration_window`'s
+    keep-set, `[0,P] ∪ tail`), NOT last-N — last-N breaks the prefix → cache miss.
+    This tensions with the locked "thin fork = rc-rebuilds" (rebuild produces
+    *fresh* bytes → also a cache miss). Likely resolution: rc-rebuilds is fine for
+    the **cache-less local bass** (token reduction is the win, no prefix to
+    reuse); **prefix-preservation** (`[0,P] ∪ tail` copy filter) is what an
+    **API-model** chair would want for true KV reuse. Decide before reshaping
+    `--shallow` or trusting the composer/fork hydrate script's re-anchor-at-tail
+    for non-local chairs.
+
   **Remaining follow-ups (deferred — from the same review):**
   - **P1 — tool-pair / turn-boundary tail snap (latent until composer gets
     tools).** The block-count tail can start mid-tool-pair: an orphan
