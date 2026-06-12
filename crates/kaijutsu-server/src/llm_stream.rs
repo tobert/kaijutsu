@@ -613,17 +613,26 @@ async fn process_llm_stream(
     // are skipped, so this is O(new blocks), not O(history).
     // block_snapshots() reads from in-memory DashMap; sub-millisecond
     // for typical conversations.
-    // Read the per-context hydration window policy. A read failure fails SAFE to
-    // full history (None) rather than hiding the turn's context behind a marker
-    // we couldn't load — never hydrate less because the policy lookup broke.
+    // Read the per-context hydration window policy. A read failure (DB error) or
+    // a corrupt stored policy (unparseable marker / bad window) is a LOUD failure,
+    // not a silent degrade: quietly hydrating full history would disable the cost
+    // guard on a context driving at tempo (unbounded spend) — a silent fallback on
+    // a safety mechanism. Fail the turn like any other hydration failure; an
+    // announced turn must still publish exactly one terminal event (§7).
     let hydration_policy = match kernel_db.lock().get_hydration_policy(context_id) {
         Ok(p) => p,
         Err(e) => {
-            log::warn!(
-                "Hydration policy read failed for context {context_id}: {e}; \
-                 hydrating full history"
+            log::error!(
+                "Hydration policy read failed for context {context_id}: {e}; failing the turn"
             );
-            None
+            if announce_completion {
+                kernel.turn_flows().publish(TurnFlow::Failed {
+                    context_id,
+                    principal_id: user_principal_id,
+                    error: format!("hydration policy unreadable: {e}"),
+                });
+            }
+            return;
         }
     };
     let mut messages = match hydrate_messages(

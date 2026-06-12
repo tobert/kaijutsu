@@ -2940,9 +2940,12 @@ impl KernelDb {
 
     /// Read the hydration window policy for `context_id`, or `None` when unset —
     /// `None` means hydrate everything (the default; every non-composer context).
-    /// A stored marker that no longer parses is corruption in this one row; we
-    /// drop the policy with a `warn!` (→ hydrate everything) rather than crash the
-    /// hydrate path — never hide a turn's context behind a broken marker.
+    /// A *present but malformed* row (window < 1, or a marker that no longer
+    /// parses) is corruption, and returns `Err(Validation)` so the caller fails
+    /// the turn loudly. Silently degrading corrupt config to "hydrate everything"
+    /// would disable the cost guard on a context driving at tempo (unbounded
+    /// spend) — a silent fallback on a safety mechanism. Absent row = legible
+    /// default (`Ok(None)`); malformed presence = loud failure.
     pub fn get_hydration_policy(
         &self,
         context_id: ContextId,
@@ -2962,16 +2965,22 @@ impl KernelDb {
         let Some((marker_key, window)) = row else {
             return Ok(None);
         };
+        // A 0/negative window or an unparseable marker is CORRUPT stored state,
+        // not a legible policy. Refuse loudly (the caller fails the turn) rather
+        // than silently degrade to full history — disabling the cost guard on a
+        // context driving at tempo is a silent fallback on a safety mechanism.
+        if window < 1 {
+            return Err(KernelDbError::Validation(format!(
+                "context {} hydration policy has window {window} (< 1) — corrupt",
+                context_id.short()
+            )));
+        }
         match BlockId::from_key(&marker_key) {
-            Some(marker) => Ok(Some((marker, window.max(0) as u32))),
-            None => {
-                warn!(
-                    context = %context_id.short(),
-                    marker = %marker_key,
-                    "hydration marker unparseable; dropping policy (hydrate everything)"
-                );
-                Ok(None)
-            }
+            Some(marker) => Ok(Some((marker, window as u32))),
+            None => Err(KernelDbError::Validation(format!(
+                "context {} hydration marker {marker_key:?} is unparseable — corrupt",
+                context_id.short()
+            ))),
         }
     }
 
@@ -4928,6 +4937,54 @@ mod tests {
             db.get_hydration_policy(ctx.context_id).unwrap(),
             Some((p2, 16)),
             "the second set overwrites the first (in-place advance)"
+        );
+    }
+
+    #[test]
+    fn hydration_policy_zero_window_is_loud_error() {
+        // A window of 0 (corrupt row, or a hand-written DB edit) would window to
+        // prefix-only and drop the current turn from the wire. Corrupt config is
+        // a LOUD failure (the caller fails the turn), not a silent degrade to
+        // hydrate-everything that disables the cost guard.
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("hydra-zero"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+
+        let marker = BlockId::new(ctx.context_id, PrincipalId::new(), 3);
+        db.set_hydration_policy(ctx.context_id, marker, 0).unwrap();
+        assert!(
+            matches!(
+                db.get_hydration_policy(ctx.context_id),
+                Err(KernelDbError::Validation(_))
+            ),
+            "a 0 window is corrupt → loud Validation error, not silent None"
+        );
+    }
+
+    #[test]
+    fn hydration_policy_unparseable_marker_is_loud_error() {
+        // A stored marker that no longer parses is corruption in this one row.
+        // Same stance as a bad window: refuse loudly, don't silently hydrate all.
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("hydra-badmark"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+
+        // Write a malformed marker straight into the row (bypass the typed setter).
+        db.conn
+            .execute(
+                "INSERT INTO context_hydration (context_id, marker, window_size)
+                 VALUES (?1, ?2, ?3)",
+                params![blob_param(ctx.context_id.as_bytes()), "not-a-block-id", 8],
+            )
+            .unwrap();
+        assert!(
+            matches!(
+                db.get_hydration_policy(ctx.context_id),
+                Err(KernelDbError::Validation(_))
+            ),
+            "an unparseable marker is corrupt → loud Validation error"
         );
     }
 

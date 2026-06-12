@@ -264,18 +264,73 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   cold-start, so restart-safe) + `kj context hydrate --window/--mark/--clear`
   (Operator-gated) + the composer `S30-hydrate.kai` create seed (`--window 16`).
   Declarative window (the tail slides in memory; row upserted only at create +
-  durable revision, no per-turn hook). Remaining follow-ups:
+  durable revision, no per-turn hook).
+
+  **Independent review 2026-06-12 (Fable + Gemini 3.1 Pro + DeepSeek V4-Pro,
+  unanimous). CRITICAL + HIGH batch FIXED (TDD):**
+  - **[FIXED] CRITICAL — windowed→full scramble.** The mailbox persists across
+    turns; after a windowed turn `seen` has a hole where the archived middle was,
+    so a later un-windowed `catch_up` (via `--clear`, or a fail-safe-to-None on
+    DB-read failure / unparseable marker) folded the middle and *appended* it
+    after the tail → out-of-order wire `[prefix, tail, …middle]` (silent
+    corruption). Fix: `ConversationMailbox.windowed` flag; `catch_up` rebuilds
+    from scratch on the windowed→full transition. Test
+    `catch_up_after_windowed_rebuilds_full_in_chronological_order`.
+  - **[FIXED] HIGH — `--mark` not validated against the context.** A parseable
+    but non-existent marker persisted durably, then fail-safe-to-whole-log every
+    turn = cost guard silently OFF forever. Fix: `context_hydrate` now verifies
+    the block exists in the target ctx (`get_block_snapshot`) before persisting.
+  - **[FIXED] HIGH — `--window 0` dropped the current turn.** Prefix-only wire,
+    so the just-inserted prompt never reached the model. Fix: verb rejects
+    `--window 0`; `get_hydration_policy` reads a 0/negative row as None (corrupt
+    → hydrate everything).
+  - **[FIXED] HIGH — stale marker was silent.** The doc claimed "the caller logs
+    the anomaly"; none did. Fix: `rehydrate_windowed` now `warn!`s (recurring,
+    every turn) when the marker doesn't resolve and windowing is bypassed.
+
+  **Remaining follow-ups (deferred — MEDIUM/LOW from the same review):**
+  - **MEDIUM — fork drops the hydration policy.** `fork_context_config` copies
+    shell/env/binding but not `context_hydration`; there's no `composer/fork/`
+    rc. Since fork is a full block copy, a forked composer inherits the whole
+    log *and* full hydration (guard off, big first-turn spike). Block ids survive
+    the copy, so `INSERT … SELECT` the row would work, or add a
+    `composer/fork/S30-hydrate.kai`. Pairs with the marker-advance producer work.
+  - **MEDIUM — tool-pair / turn-boundary tail snap (latent until composer gets
+    tools).** The block-count tail can start mid-tool-pair: an orphan
+    `tool_result` is *dropped* by the snapshot repair (no 400, but silent content
+    loss) and a marker landing on a `tool_call` injects a synthetic "interrupted"
+    result every turn forever. Fix when tools arrive: snap `tail_start` (and the
+    create-time marker) back to a turn boundary (nearest preceding `User/Text`,
+    never start on `ToolResult`/`Model`-continuation).
+  - **MEDIUM — no archive seam marker.** Prefix and tail concatenate with no
+    "[N blocks archived]" signal; two `Model/Text` fragments across the gap can
+    even merge into one assistant message (false continuity). Inject a synthetic
+    user-role seam between prefix and tail when `tail_start > prefix_end` (lands
+    after the prefix, so cache stays stable; also forces the flush).
+  - **[FIXED 2026-06-12] Fail-loud on corrupt/unreadable policy.** The
+    DB-read-failure path and corrupt stored policy (unparseable marker / window
+    < 1) used to degrade silently to full history. Now `get_hydration_policy`
+    returns `Err(Validation)` on corruption and `process_llm_stream` fails the
+    turn (publishes `TurnFlow::Failed`) on any policy-read error — a silent
+    fallback on a safety mechanism is worse than a loud stop. The **runtime**
+    stale-marker case (marker parses + names a real block id, but it's absent
+    from the log — e.g. the block was excluded) is *deliberately* kept as
+    loud-warn + fail-safe-to-whole-log: that's the one genuine "show more, never
+    corrupt" case, and failing it would kill a composer just because a block was
+    excluded. (Tests: `hydration_policy_{zero_window,unparseable_marker}_is_loud_error`.)
   - **Marker advance on durable revision** — P is set once at create; the
     producer path that moves it forward (re-run `kj context hydrate` after
     writing revision blocks) lands with the producer.
   - **RAM/disk still unbounded** — windowing bounds *tokens*, not memory; cold
     start loads the full log to window it. Rotation/shallow-fork is the storage
     answer (separate, unbuilt — see the in-RAM committed `Vec` growth item).
-  - **`window` counts blocks, not turns/phrases** (~2-3 blocks per OODA turn) —
-    revisit if a phrase/turn-denominated window reads cleaner.
+  - **`window` counts RAW blocks, not turns/phrases** (~2-3 blocks per OODA turn,
+    and composer score/Trace blocks are hydration-silent so the *visible* tail is
+    smaller still) — revisit if a phrase/turn-denominated window reads cleaner.
   - **Cache-breakpoint ↔ window interaction** — the composer's S20 cache
     breakpoints sit at message indices that windowing shifts; harmless for the
-    local bass (no prompt cache), reconcile when API-model chairs join.
+    local bass (no prompt cache; composer sets no breakpoints today so the
+    byte-stable prefix is inert), reconcile when API-model chairs join.
 - **Optional rc-driven last-good rehydration on arm:** after restart every
   track's engine history is empty → `UseLastGood` → Skip → **silence until the
   first good phrase** (locked default). A future rc-driven arm option could

@@ -22,6 +22,7 @@
 use std::collections::{HashMap, HashSet};
 
 use kaijutsu_types::{BlockId, BlockSnapshot};
+use tracing::warn;
 
 use super::Message;
 use super::hydrate::HydrationState;
@@ -42,6 +43,16 @@ pub struct ConversationMailbox {
     /// this context (and it might genuinely be empty)" apart from
     /// "cache miss — need to hydrate."
     materialized: bool,
+    /// True when the current `state`/`seen` were built by a windowed
+    /// rebuild ([`rehydrate_windowed`]), so `seen` has a HOLE where the
+    /// archived middle was. An incremental [`catch_up`] over that hole
+    /// would fold the now-"unseen" middle and append it *after* the tail
+    /// — a scrambled, out-of-order wire. The flag makes `catch_up` rebuild
+    /// from scratch on the windowed→full transition instead.
+    ///
+    /// [`rehydrate_windowed`]: Self::rehydrate_windowed
+    /// [`catch_up`]: Self::catch_up
+    windowed: bool,
 }
 
 /// Select the blocks a windowed conversation hydrates: the pinned prefix
@@ -91,6 +102,7 @@ impl ConversationMailbox {
             state: HydrationState::new(),
             seen: HashSet::new(),
             materialized: false,
+            windowed: false,
         }
     }
 
@@ -146,6 +158,17 @@ impl ConversationMailbox {
     /// than re-hydrating the entire conversation, and works without
     /// a separate BlockFlow subscriber.
     pub fn catch_up(&mut self, blocks: &[BlockSnapshot]) -> usize {
+        // Windowed→full transition: the prior windowed rebuild left a HOLE in
+        // `seen` (the archived middle). An incremental fold would translate
+        // those now-"unseen" middle blocks and append them *after* the tail —
+        // a scrambled, out-of-order wire. Discard the windowed state and rebuild
+        // the whole log in chronological order. (Reached via `kj context hydrate
+        // --clear` or a fail-safe-to-None policy read.)
+        if self.windowed {
+            self.state = HydrationState::new();
+            self.seen.clear();
+            self.windowed = false;
+        }
         let by_id: HashMap<BlockId, &BlockSnapshot> =
             blocks.iter().map(|b| (b.id, b)).collect();
         let mut new_blocks = 0usize;
@@ -183,6 +206,19 @@ impl ConversationMailbox {
         marker: BlockId,
         window: usize,
     ) {
+        // A marker that doesn't resolve fails safe to the whole log (never hide
+        // context behind a stale marker) — but that silently turns the cost
+        // guard OFF on a context driving at tempo, the exact failure this
+        // feature exists to prevent. Warn loudly and recurringly (this runs
+        // every turn) so the anomaly is observable above the info-level numbers.
+        if !blocks.iter().any(|b| b.id == marker) {
+            warn!(
+                marker = %marker,
+                blocks = blocks.len(),
+                "hydration marker not in block log; windowing bypassed — \
+                 hydrating FULL history (cost guard OFF). Re-set with `kj context hydrate`."
+            );
+        }
         self.state = HydrationState::new();
         self.seen.clear();
         let by_id: HashMap<BlockId, &BlockSnapshot> =
@@ -193,6 +229,7 @@ impl ConversationMailbox {
             self.seen.insert(block.id);
         }
         self.materialized = true;
+        self.windowed = true;
     }
 
     /// Return the current wire-history view.
@@ -403,6 +440,51 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert_eq!(first, second, "windowed rebuild is stable turn-to-turn");
+    }
+
+    #[test]
+    fn catch_up_after_windowed_rebuilds_full_in_chronological_order() {
+        // The CRITICAL transition: a mailbox windowed last turn (its `seen` set
+        // has a HOLE where the archived middle was) then hydrated full this turn
+        // (policy cleared, or a fail-safe-to-None on DB error / unparseable
+        // marker). A naive incremental catch_up would fold the now-"unseen"
+        // middle and APPEND it after the tail → [prefix, tail, …middle], a
+        // scrambled out-of-order wire. catch_up must rebuild the full log in
+        // chronological order instead.
+        let blocks = vec![
+            user_text("u0"),
+            model_text("a0"),
+            user_text("u1-MID"),
+            model_text("a1-MID"),
+            user_text("u2"),
+            model_text("a2"),
+        ];
+        let marker = blocks[1].id; // prefix [u0, a0]; window 2 → tail [u2, a2]
+
+        let mut mb = ConversationMailbox::new();
+        mb.rehydrate_windowed(&blocks, marker, 2); // middle archived
+        mb.catch_up(&blocks); // policy gone → full history
+
+        let after_transition: Vec<(Role, Option<String>)> = mb
+            .snapshot()
+            .iter()
+            .map(|m| (m.role, m.as_text().map(str::to_string)))
+            .collect();
+
+        // Ground truth: a mailbox that only ever did a full catch_up.
+        let mut fresh = ConversationMailbox::new();
+        fresh.catch_up(&blocks);
+        let expected: Vec<(Role, Option<String>)> = fresh
+            .snapshot()
+            .iter()
+            .map(|m| (m.role, m.as_text().map(str::to_string)))
+            .collect();
+
+        assert_eq!(
+            after_transition, expected,
+            "catch_up after a windowed turn must rebuild full chronological history, \
+             not append the archived middle after the tail"
+        );
     }
 
     #[test]

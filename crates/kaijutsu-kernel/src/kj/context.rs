@@ -849,11 +849,41 @@ impl KjDispatcher {
             );
         };
 
+        // window 0 → prefix-only → the just-inserted user prompt (which lives in
+        // the tail) never reaches the wire; the turn answers a prompt the model
+        // can't see, or 400s on an assistant-final / empty messages array. The
+        // sliding tail must keep at least the triggering turn.
+        if window == 0 {
+            return KjResult::Err(
+                "kj context hydrate: --window must be ≥ 1 (0 would drop the current turn \
+                 from the wire); use --clear to hydrate everything"
+                    .to_string(),
+            );
+        }
+
         // The prefix marker: an explicit `--mark` block key, or the context's
         // current tail (pin everything up to now).
         let marker = match mark {
             Some(key) => match BlockId::from_key(key) {
-                Some(id) => id,
+                Some(id) => {
+                    // A parseable but non-existent marker would persist durably
+                    // and then fail-safe to the whole log every turn — the cost
+                    // guard silently OFF forever. Validate it lives in THIS
+                    // context before persisting.
+                    match self.block_store().get_block_snapshot(target_id, &id) {
+                        Ok(Some(_)) => id,
+                        Ok(None) => {
+                            return KjResult::Err(format!(
+                                "kj context hydrate: --mark block '{key}' is not in this context"
+                            ));
+                        }
+                        Err(e) => {
+                            return KjResult::Err(format!(
+                                "kj context hydrate: could not verify --mark block '{key}': {e}"
+                            ));
+                        }
+                    }
+                }
                 None => {
                     return KjResult::Err(format!(
                         "kj context hydrate: invalid --mark block id '{key}'"
@@ -1513,6 +1543,89 @@ mod tests {
         let r = d.dispatch(&[s("context"), s("hydrate")], &c).await;
         assert!(!r.is_ok(), "bare hydrate must error (no --window, no --clear)");
         assert!(r.message().contains("--window"), "got: {}", r.message());
+    }
+
+    #[tokio::test]
+    async fn context_hydrate_rejects_window_zero() {
+        // window 0 → prefix-only → the just-inserted user prompt (in the tail)
+        // never reaches the wire; the turn answers a prompt the model can't see
+        // (or 400s on an assistant-final / empty messages). Reject at the verb.
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("hydra-w0"), None, principal);
+        d.block_store()
+            .create_document(ctx, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        d.block_store()
+            .insert_block_as(
+                ctx,
+                None,
+                None,
+                kaijutsu_crdt::Role::User,
+                kaijutsu_crdt::BlockKind::Text,
+                "seed".to_string(),
+                kaijutsu_crdt::Status::Done,
+                kaijutsu_crdt::ContentType::Plain,
+                Some(principal),
+            )
+            .unwrap();
+        let c = caller_with_context(ctx);
+
+        let r = d
+            .dispatch(&[s("context"), s("hydrate"), s("--window"), s("0")], &c)
+            .await;
+        assert!(!r.is_ok(), "--window 0 must error");
+        assert!(r.message().contains("window"), "got: {}", r.message());
+        assert!(
+            d.kernel_db().lock().get_hydration_policy(ctx).unwrap().is_none(),
+            "a rejected --window 0 must not persist a policy"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_hydrate_rejects_mark_not_in_context() {
+        // A parseable but non-existent --mark would persist durably, then
+        // fail-safe to the whole log every turn — the cost guard silently OFF
+        // forever. Validate the block exists in the target context.
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("hydra-mark"), None, principal);
+        d.block_store()
+            .create_document(ctx, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        d.block_store()
+            .insert_block_as(
+                ctx,
+                None,
+                None,
+                kaijutsu_crdt::Role::User,
+                kaijutsu_crdt::BlockKind::Text,
+                "seed".to_string(),
+                kaijutsu_crdt::Status::Done,
+                kaijutsu_crdt::ContentType::Plain,
+                Some(principal),
+            )
+            .unwrap();
+        let c = caller_with_context(ctx);
+
+        // Parseable BlockId, but never inserted into this context.
+        let phantom = kaijutsu_crdt::BlockId::new(ctx, PrincipalId::new(), 9999).to_key();
+        let r = d
+            .dispatch(
+                &[s("context"), s("hydrate"), s("--window"), s("4"), s("--mark"), s(&phantom)],
+                &c,
+            )
+            .await;
+        assert!(!r.is_ok(), "a --mark not in the context must error");
+        assert!(
+            r.message().contains("not in") || r.message().contains("not found"),
+            "got: {}",
+            r.message()
+        );
+        assert!(
+            d.kernel_db().lock().get_hydration_policy(ctx).unwrap().is_none(),
+            "a rejected --mark must not persist a policy"
+        );
     }
 
     #[tokio::test]
