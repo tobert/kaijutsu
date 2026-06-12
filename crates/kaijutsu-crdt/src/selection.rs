@@ -246,6 +246,91 @@ pub fn window_base(len: usize, marker_idx: Option<usize>, window: usize) -> Inte
     IntervalSet::from_ranges([0..prefix_end, tail_start..len])
 }
 
+/// Why a range spec failed to parse. Carries the offending text so the CLI can
+/// quote it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RangeError {
+    /// Not `[lo]:[hi]` — missing or extra colons (block keys with their own
+    /// colons stay out of inline ranges; use the dedicated `--exclude <key>`).
+    NotARange(String),
+    /// An endpoint wasn't `<int> | end | end-<int>` (e.g. a negative, a tick
+    /// `t8`, or a label — all reserved for later, not v1).
+    BadEndpoint(String),
+    /// Resolved to `lo > hi` — a reversed range, almost certainly a mistake.
+    Reversed { lo: usize, hi: usize },
+}
+
+impl fmt::Display for RangeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RangeError::NotARange(s) => write!(
+                f,
+                "'{s}' is not a range — expected [lo]:[hi] with a single colon"
+            ),
+            RangeError::BadEndpoint(s) => write!(
+                f,
+                "'{s}' is not a valid endpoint — expected an integer, `end`, or `end-N`"
+            ),
+            RangeError::Reversed { lo, hi } => {
+                write!(f, "range start {lo} is past its end {hi}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RangeError {}
+
+/// Resolve one endpoint of the v1 grammar (`<int> | end | end-<int>`) against
+/// `len`. Empty (`""`) is the caller's job (it supplies the side's default).
+/// `end-N` saturates at 0 (no negatives in v1). The result is NOT yet clamped
+/// to `len` — the caller clamps after both endpoints resolve.
+fn parse_endpoint(s: &str, len: usize) -> Result<usize, RangeError> {
+    if s == "end" {
+        return Ok(len);
+    }
+    if let Some(n) = s.strip_prefix("end-") {
+        let n: usize = n.parse().map_err(|_| RangeError::BadEndpoint(s.to_string()))?;
+        return Ok(len.saturating_sub(n));
+    }
+    s.parse::<usize>()
+        .map_err(|_| RangeError::BadEndpoint(s.to_string()))
+}
+
+/// Parse a v1 range spec — `[endpoint]:[endpoint]`, half-open `[lo, hi)` —
+/// resolved against the snapshot length `len`. The grammar:
+///
+/// ```text
+/// range    := [endpoint] ':' [endpoint]
+/// endpoint := <int> | end | end-<int>
+/// ```
+///
+/// Missing `lo` defaults to `0`, missing `hi` to `end` (`len`). Both endpoints
+/// are clamped to `[0, len]` (you can't address past the end — `0:100` on a
+/// 5-block log is `0:5`, and `end` exists precisely so you don't guess the
+/// length). `lo == hi` is a valid empty range (e.g. `end-0:` is the empty tail
+/// the `window` zero-case relies on); `lo > hi` is a [`RangeError::Reversed`].
+/// Reserved endpoint forms (ticks `t8`, labels `bridge`) and negatives are
+/// [`RangeError::BadEndpoint`] in v1.
+pub fn parse_range(spec: &str, len: usize) -> Result<Range<usize>, RangeError> {
+    let (lo_s, hi_s) = spec
+        .split_once(':')
+        .ok_or_else(|| RangeError::NotARange(spec.to_string()))?;
+    // A second colon means three+ parts — not a v1 range.
+    if hi_s.contains(':') {
+        return Err(RangeError::NotARange(spec.to_string()));
+    }
+
+    let lo = if lo_s.is_empty() { 0 } else { parse_endpoint(lo_s, len)? };
+    let hi = if hi_s.is_empty() { len } else { parse_endpoint(hi_s, len)? };
+
+    let lo = lo.min(len);
+    let hi = hi.min(len);
+    if lo > hi {
+        return Err(RangeError::Reversed { lo, hi });
+    }
+    Ok(lo..hi)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -414,5 +499,66 @@ mod tests {
         // The rehydrate scenario: marker idx 1 (prefix [0,2)), window 2 over
         // len 6 (tail [4,6)) → a real gap the splicer will seam.
         assert_eq!(window_base(6, Some(1), 2), set(&[0..2, 4..6]));
+    }
+
+    // ── parse_range: the v1 range grammar ────────────────────────────────
+
+    #[test]
+    fn parse_range_grammar_examples() {
+        // The examples from docs/fork-filters.md, len = 10.
+        assert_eq!(parse_range("0:5", 10).unwrap(), 0..5);
+        assert_eq!(parse_range(":5", 10).unwrap(), 0..5);
+        assert_eq!(parse_range("5:", 10).unwrap(), 5..10);
+        assert_eq!(parse_range(":", 10).unwrap(), 0..10);
+        assert_eq!(parse_range("0:end", 10).unwrap(), 0..10);
+        assert_eq!(parse_range("end-5:", 10).unwrap(), 5..10);
+        assert_eq!(parse_range("end-5:end", 10).unwrap(), 5..10);
+    }
+
+    #[test]
+    fn parse_range_end_minus_saturates_and_empty_tail_is_valid() {
+        // end-0: is the empty tail the `window` zero-case relies on.
+        assert_eq!(parse_range("end-0:", 6).unwrap(), 6..6);
+        // end-N saturates at 0 (no negatives in v1).
+        assert_eq!(parse_range("end-100:", 5).unwrap(), 0..5);
+    }
+
+    #[test]
+    fn parse_range_clamps_to_len() {
+        // You can't address past the end; `end` exists so you don't guess.
+        assert_eq!(parse_range("0:100", 5).unwrap(), 0..5);
+        assert_eq!(parse_range("8:9", 5).unwrap(), 5..5); // both past end → empty
+    }
+
+    #[test]
+    fn parse_range_reversed_is_an_error() {
+        assert_eq!(parse_range("5:3", 10), Err(RangeError::Reversed { lo: 5, hi: 3 }));
+        assert_eq!(parse_range("7:4", 10), Err(RangeError::Reversed { lo: 7, hi: 4 }));
+    }
+
+    #[test]
+    fn parse_range_rejects_non_ranges() {
+        // No colon at all.
+        assert_eq!(parse_range("5", 10), Err(RangeError::NotARange("5".into())));
+        // Block-key shaped (extra colons) stays out of inline ranges.
+        assert_eq!(parse_range("a:b:42", 10), Err(RangeError::NotARange("a:b:42".into())));
+    }
+
+    #[test]
+    fn parse_range_rejects_reserved_and_bad_endpoints() {
+        // Reserved-for-later forms parse as bad endpoints in v1.
+        assert!(matches!(parse_range("t8:t16", 10), Err(RangeError::BadEndpoint(_)))); // ticks
+        assert!(matches!(parse_range("0:bridge", 10), Err(RangeError::BadEndpoint(_)))); // labels
+        assert!(matches!(parse_range("-5:", 10), Err(RangeError::BadEndpoint(_)))); // negatives
+        assert!(matches!(parse_range("end-:5", 10), Err(RangeError::BadEndpoint(_)))); // malformed end-
+        assert!(matches!(parse_range("x:5", 10), Err(RangeError::BadEndpoint(_))));
+    }
+
+    #[test]
+    fn parsed_ranges_feed_the_set_algebra() {
+        // The whole point: parse several specs into an IntervalSet.
+        let specs = ["0:2", "end-3:"];
+        let parsed: Vec<_> = specs.iter().map(|s| parse_range(s, 10).unwrap()).collect();
+        assert_eq!(IntervalSet::from_ranges(parsed), set(&[0..2, 7..10]));
     }
 }

@@ -41,7 +41,9 @@ pub use kaijutsu_types::{
 
 // New architecture
 pub use block_store::{BlockStore, ForkBlockFilter, StoreSnapshot, SyncPayload};
-pub use selection::{IntervalSet, SelectionError, resolve_keep_set, window_base};
+pub use selection::{
+    IntervalSet, RangeError, SelectionError, parse_range, resolve_keep_set, window_base,
+};
 pub use content::BlockContent;
 pub use dag::ConversationDAG;
 
