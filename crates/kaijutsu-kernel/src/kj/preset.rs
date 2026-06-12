@@ -53,6 +53,9 @@ enum PresetCommand {
         /// Preset label to delete
         label: String,
     },
+    /// Restore the reserved factory presets (full/window/spawn) to their
+    /// embedded defaults.
+    Reseed,
 }
 
 impl KjDispatcher {
@@ -77,7 +80,7 @@ impl KjDispatcher {
         // Preset mutation is operator authority; list/show stay ungated.
         if matches!(
             parsed.command,
-            PresetCommand::Save { .. } | PresetCommand::Remove { .. }
+            PresetCommand::Save { .. } | PresetCommand::Remove { .. } | PresetCommand::Reseed
         ) && let Err(denied) =
             self.require_cap(caller, crate::mcp::Capability::Operator, "preset")
         {
@@ -95,6 +98,7 @@ impl KjDispatcher {
                 desc,
             } => self.preset_save(&label, model, system_prompt, consent, desc, caller),
             PresetCommand::Remove { label } => self.preset_remove(&label, caller),
+            PresetCommand::Reseed => self.preset_reseed(caller),
         }
     }
 
@@ -177,6 +181,13 @@ impl KjDispatcher {
         desc: Option<String>,
         caller: &KjCaller,
     ) -> KjResult {
+        if crate::seed_presets::is_reserved_preset_label(label) {
+            return KjResult::Err(format!(
+                "kj preset save: '{label}' is a reserved factory preset; \
+                 use `kj preset reseed` to restore it"
+            ));
+        }
+
         let (provider, model) = model_spec
             .as_deref()
             .map(parse_model_spec)
@@ -234,8 +245,25 @@ impl KjDispatcher {
         }
     }
 
+    /// `kj preset reseed` — restore the reserved factory presets.
+    fn preset_reseed(&self, caller: &KjCaller) -> KjResult {
+        let mut db = self.kernel_db().lock();
+        match crate::seed_presets::reseed_factory_presets(&mut db, caller.principal_id) {
+            Ok(n) => KjResult::ok(format!(
+                "reseeded {n} factory presets (full, window, spawn)"
+            )),
+            Err(e) => KjResult::Err(format!("kj preset reseed: {e}")),
+        }
+    }
+
     /// `kj preset remove <label>` — delete a preset (latched).
     fn preset_remove(&self, label: &str, caller: &KjCaller) -> KjResult {
+        if crate::seed_presets::is_reserved_preset_label(label) {
+            return KjResult::Err(format!(
+                "kj preset remove: '{label}' is a reserved factory preset and cannot be removed"
+            ));
+        }
+
         let db = self.kernel_db().lock();
 
         let preset = match db.get_preset_by_label(label) {
@@ -327,6 +355,62 @@ mod tests {
             .await;
         assert!(!result.is_ok());
         assert!(result.message().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn preset_save_rejects_reserved_label() {
+        let d = test_dispatcher().await;
+        let ctx = register_context(&d, Some("ctx"), None, PrincipalId::new());
+        let c = caller_with_context(ctx);
+        let result = d
+            .dispatch(
+                &[s("preset"), s("save"), s("window"), s("--model"), s("a/b")],
+                &c,
+            )
+            .await;
+        assert!(!result.is_ok(), "saving over a factory preset must fail");
+        assert!(result.message().contains("reserved"), "got: {}", result.message());
+    }
+
+    #[tokio::test]
+    async fn preset_remove_rejects_reserved_label() {
+        let d = test_dispatcher().await;
+        let ctx = register_context(&d, Some("ctx"), None, PrincipalId::new());
+        let c = caller_with_context(ctx);
+        let result = d.dispatch(&[s("preset"), s("remove"), s("spawn")], &c).await;
+        assert!(!result.is_ok(), "removing a factory preset must fail");
+        assert!(result.message().contains("reserved"), "got: {}", result.message());
+    }
+
+    #[tokio::test]
+    async fn preset_reseed_creates_the_three_factory_presets() {
+        use crate::kj::KjResult;
+        let d = test_dispatcher().await;
+        let ctx = register_context(&d, Some("ctx"), None, PrincipalId::new());
+        let c = caller_with_context(ctx);
+
+        // The test dispatcher doesn't run the rpc init hook, so they start absent.
+        let before = d.dispatch(&[s("preset"), s("list")], &c).await;
+        assert_eq!(before.message(), "(no presets)");
+
+        let reseed = d.dispatch(&[s("preset"), s("reseed")], &c).await;
+        assert!(reseed.is_ok(), "got: {}", reseed.message());
+
+        let list = d.dispatch(&[s("preset"), s("list")], &c).await;
+        match list {
+            KjResult::Ok { data: Some(v), .. } => {
+                let labels: Vec<&str> = v
+                    .as_array()
+                    .expect("array")
+                    .iter()
+                    .filter_map(|x| x.as_str())
+                    .collect();
+                for expected in ["full", "window", "spawn"] {
+                    assert!(labels.contains(&expected), "missing {expected}; got {labels:?}");
+                }
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
     }
 
     #[tokio::test]

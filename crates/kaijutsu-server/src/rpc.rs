@@ -1051,9 +1051,16 @@ pub async fn create_shared_kernel(
     // Wrap KernelDb in Arc<Mutex> and create auto-workspaces
     let kernel_db_arc = Arc::new(parking_lot::Mutex::new(kernel_db));
     let default_ws_id = {
-        let db = kernel_db_arc.lock();
-        db.get_or_create_default_workspace(PrincipalId::system())
-            .unwrap()
+        let mut db = kernel_db_arc.lock();
+        let ws = db
+            .get_or_create_default_workspace(PrincipalId::system())
+            .unwrap();
+        // Seed the reserved factory fork presets (full/window/spawn) — the
+        // floor pattern (insert only if absent). Fail loud on error rather than
+        // ship a kernel where `kj fork --preset` has nothing to recall.
+        kaijutsu_kernel::seed_presets::ensure_factory_presets(&mut db, PrincipalId::system())
+            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+        ws
     };
 
     // Create block store backed by unified KernelDb
