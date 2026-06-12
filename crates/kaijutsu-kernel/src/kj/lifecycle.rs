@@ -902,6 +902,90 @@ mod tests {
         );
     }
 
+    /// Helper: seed a child context with one block so the default hydration
+    /// marker (`last_block_id`) resolves, then run the fork lifecycle with the
+    /// given fork kind against the REAL shipped composer fork-hydrate script.
+    /// Returns the child's hydration policy after the lifecycle.
+    async fn run_composer_fork_hydrate(
+        fork_kind: ForkKind,
+    ) -> (
+        std::sync::Arc<KjDispatcher>,
+        ContextId,
+        Option<(kaijutsu_crdt::BlockId, u32)>,
+    ) {
+        // Arc + set_self_arc so the .kai script can reach the `kj` builtin
+        // (the script runs `kj context hydrate`); see `rc_kai_can_call_kj`.
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
+        // Install the real shipped script under a test type so the fork verb
+        // dispatches it — pins the test to the actual seeded body, not a copy.
+        install_rc_script_file(
+            &d,
+            "/etc/rc/test/fork/S40-hydrate.kai",
+            include_str!("../../../../assets/defaults/rc/composer/fork/S40-hydrate.kai"),
+        )
+        .await;
+
+        let principal = PrincipalId::new();
+        let parent = register_context(&d, Some("parent"), None, principal);
+        let child = register_context(&d, Some("child"), Some(parent), principal);
+        set_context_type(&d, child, "test");
+        // The child needs a block for the default prefix marker to resolve.
+        d.block_store()
+            .create_document(child, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        d.block_store()
+            .insert_block_as(
+                child,
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "seed".to_string(),
+                Status::Done,
+                ContentType::Plain,
+                Some(principal),
+            )
+            .unwrap();
+
+        let caller = caller_with_context(child);
+        d.run_rc_lifecycle("fork", child, Some(parent), Some(fork_kind), None, &caller)
+            .await
+            .expect("fork lifecycle");
+        // The script must not have errored (e.g. a denied/failed `kj` call).
+        assert!(
+            !block_kinds_in(&d, child).contains(&BlockKind::Error),
+            "fork-hydrate script errored: {:?}",
+            block_contents_in(&d, child)
+        );
+        let policy = d.kernel_db().lock().get_hydration_policy(child).unwrap();
+        (d, child, policy)
+    }
+
+    /// A THIN fork (shallow) is the player-spawn path: the fork-hydrate script
+    /// re-establishes the window on the lean child (it would otherwise drive at
+    /// tempo with full history — the create-side script doesn't run on fork).
+    #[tokio::test]
+    async fn composer_fork_hydrate_windows_a_thin_fork() {
+        let (_d, _child, policy) = run_composer_fork_hydrate(ForkKind::Shallow).await;
+        match policy {
+            Some((_marker, window)) => assert_eq!(window, 16, "thin fork gets the --window 16 guard"),
+            None => panic!("a thin (shallow) fork must set a hydration window"),
+        }
+    }
+
+    /// A FULL fork is a deliberate clone, not a player spawn: windowing it at the
+    /// tail would pin its whole inherited log (the cost-bomb). The script leaves
+    /// it un-windowed — full history stays live, no policy set.
+    #[tokio::test]
+    async fn composer_fork_hydrate_skips_a_full_clone() {
+        let (_d, _child, policy) = run_composer_fork_hydrate(ForkKind::Full).await;
+        assert!(
+            policy.is_none(),
+            "a full clone must NOT be windowed (it would pin the whole inherited log); got {policy:?}"
+        );
+    }
+
     #[tokio::test]
     async fn rc_kai_silent_success_inserts_no_trace_block() {
         let d = test_dispatcher().await;

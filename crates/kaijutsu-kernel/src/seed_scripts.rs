@@ -85,6 +85,11 @@ const COMPOSER_TICK_BODY: &str =
 
 const COMPOSER_HYDRATE_BODY: &str =
     include_str!("../../../assets/defaults/rc/composer/create/S30-hydrate.kai");
+// Fork-side hydration: re-establish the window on a forked player (the create
+// script doesn't run on fork). Distinct body from create — it branches on
+// KJ_FORK_INFO to skip a full clone (which would pin its whole inherited log).
+const COMPOSER_FORK_HYDRATE_BODY: &str =
+    include_str!("../../../assets/defaults/rc/composer/fork/S40-hydrate.kai");
 
 /// The embedded seed manifest: `(canonical /etc/rc path, body)`. The path
 /// encodes `context_type / verb / sort_key / name / ext`; nothing else is
@@ -134,6 +139,7 @@ const SEED_FILES: &[(&str, &str)] = &[
     ("/etc/rc/composer/create/S20-cache.kai", CACHE_CREATE_BODY),
     ("/etc/rc/composer/create/S30-hydrate.kai", COMPOSER_HYDRATE_BODY),
     ("/etc/rc/composer/fork/S30-cache.kai", CACHE_FORK_BODY),
+    ("/etc/rc/composer/fork/S40-hydrate.kai", COMPOSER_FORK_HYDRATE_BODY),
     ("/etc/rc/composer/drift/S40-cache.kai", CACHE_DRIFT_BODY),
     ("/etc/rc/composer/tick/S10-drive.kai", COMPOSER_TICK_BODY),
 ];
@@ -356,6 +362,27 @@ mod tests {
         assert!(
             body.contains("kj context hydrate"),
             "the hydrate seed must set a window via `kj context hydrate`"
+        );
+    }
+
+    /// The composer ALSO seeds a fork-side hydration script — the create script
+    /// doesn't run on fork, so a forked player needs its own window re-established
+    /// (else it drives at tempo with full history). It branches on KJ_FORK_INFO:
+    /// window a thin fork, skip a full clone (which would pin its whole log).
+    #[test]
+    fn composer_fork_seeds_include_hydration_window() {
+        let body = SEED_FILES
+            .iter()
+            .find(|(p, _)| *p == "/etc/rc/composer/fork/S40-hydrate.kai")
+            .map(|(_, b)| *b)
+            .expect("composer must seed a fork-side hydration script");
+        assert!(
+            body.contains("kj context hydrate"),
+            "the fork hydrate seed must set a window via `kj context hydrate`"
+        );
+        assert!(
+            body.contains("KJ_FORK_INFO") && body.contains("full"),
+            "the fork hydrate seed must branch on fork kind (skip a full clone)"
         );
     }
 }
