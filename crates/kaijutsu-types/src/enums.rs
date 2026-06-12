@@ -21,8 +21,10 @@ pub enum ForkKind {
     /// Full deep copy of parent state.
     #[default]
     Full,
-    /// Shallow fork — shares block history, diverges on new writes.
-    Shallow,
+    /// Selection-driven fork — a subset of the parent's blocks chosen by an
+    /// interval selection (`window` / `spawn` presets, or ad-hoc
+    /// `--include`/`--exclude` ranges). See `docs/fork-filters.md`.
+    Filtered,
     /// Fork from a compaction boundary.
     Compact,
     /// Fork of a subtree (subset of parent's blocks).
@@ -33,7 +35,7 @@ impl ForkKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Full => "full",
-            Self::Shallow => "shallow",
+            Self::Filtered => "filtered",
             Self::Compact => "compact",
             Self::Subtree => "subtree",
         }
@@ -223,7 +225,7 @@ mod tests {
     fn fork_kind_as_str_roundtrip() {
         for kind in [
             ForkKind::Full,
-            ForkKind::Shallow,
+            ForkKind::Filtered,
             ForkKind::Compact,
             ForkKind::Subtree,
         ] {
@@ -236,7 +238,15 @@ mod tests {
     #[test]
     fn fork_kind_case_insensitive() {
         assert_eq!(ForkKind::from_str("FULL").unwrap(), ForkKind::Full);
-        assert_eq!(ForkKind::from_str("Shallow").unwrap(), ForkKind::Shallow);
+        assert_eq!(ForkKind::from_str("Filtered").unwrap(), ForkKind::Filtered);
+    }
+
+    #[test]
+    fn fork_kind_rejects_unknown() {
+        // No silent fallback — an unknown kind must fail to parse so the codec
+        // layer can crash rather than erase provenance.
+        assert!(ForkKind::from_str("shallow").is_err(), "retired variant must not parse");
+        assert!(ForkKind::from_str("bogus").is_err());
     }
 
     #[test]
@@ -258,7 +268,7 @@ mod tests {
     fn fork_kind_cbor_roundtrip() {
         for kind in [
             ForkKind::Full,
-            ForkKind::Shallow,
+            ForkKind::Filtered,
             ForkKind::Compact,
             ForkKind::Subtree,
         ] {

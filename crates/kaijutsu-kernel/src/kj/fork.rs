@@ -457,7 +457,7 @@ impl KjDispatcher {
                 created_at: kaijutsu_types::now_millis() as i64,
                 created_by: caller.principal_id,
                 forked_from: Some(source_id),
-                fork_kind: Some(ForkKind::Shallow),
+                fork_kind: Some(ForkKind::Filtered),
                 archived_at: None,
                 workspace_id: source_ws,
                 preset_id: None,
@@ -565,7 +565,7 @@ impl KjDispatcher {
         if let Err(e) = self.inject_fork_marker(
             new_id,
             source_id,
-            ForkKind::Shallow,
+            ForkKind::Filtered,
             block_count,
             source_label.as_deref(),
             staging,
@@ -579,7 +579,7 @@ impl KjDispatcher {
                 "fork",
                 new_id,
                 Some(source_id),
-                Some(ForkKind::Shallow),
+                Some(ForkKind::Filtered),
                 None,
                 caller,
             )

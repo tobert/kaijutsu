@@ -967,7 +967,7 @@ mod tests {
     /// tempo with full history — the create-side script doesn't run on fork).
     #[tokio::test]
     async fn composer_fork_hydrate_windows_a_thin_fork() {
-        let (_d, _child, policy) = run_composer_fork_hydrate(ForkKind::Shallow).await;
+        let (_d, _child, policy) = run_composer_fork_hydrate(ForkKind::Filtered).await;
         match policy {
             Some((_marker, window)) => assert_eq!(window, 16, "thin fork gets the --window 16 guard"),
             None => panic!("a thin (shallow) fork must set a hydration window"),

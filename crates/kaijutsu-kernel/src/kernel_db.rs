@@ -736,9 +736,21 @@ fn context_state_from_sql(s: &str) -> ContextState {
     })
 }
 
-/// Parse ForkKind from TEXT column.
-fn fork_kind_from_sql(s: Option<String>) -> Option<ForkKind> {
-    s.and_then(|v| ForkKind::from_str(&v).ok())
+/// Parse ForkKind from a TEXT column. NULL → `None`. An unknown non-null value
+/// is a HARD error — a corrupt or forward-incompatible row must crash, never
+/// silently degrade to `None` (which would erase fork provenance). Crash over
+/// corruption.
+fn fork_kind_from_sql(s: Option<String>) -> SqliteResult<Option<ForkKind>> {
+    match s {
+        None => Ok(None),
+        Some(v) => ForkKind::from_str(&v).map(Some).map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                11,
+                rusqlite::types::Type::Text,
+                format!("unknown ForkKind '{v}'").into(),
+            )
+        }),
+    }
 }
 
 /// Parse DocKind from TEXT column.
@@ -3234,7 +3246,7 @@ fn row_to_context_row(row: &rusqlite::Row<'_>) -> SqliteResult<ContextRow> {
         created_at: row.get(8)?,
         created_by: read_principal_id(row, 9)?,
         forked_from: read_opt_context_id(row, 10)?,
-        fork_kind: fork_kind_from_sql(fork_kind_str),
+        fork_kind: fork_kind_from_sql(fork_kind_str)?,
         archived_at: row.get(12)?,
         workspace_id: read_opt_workspace_id(row, 13)?,
         preset_id: read_opt_preset_id(row, 14)?,
@@ -3359,6 +3371,20 @@ fn make_edge(source: ContextId, target: ContextId, kind: EdgeKind) -> ContextEdg
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fork_kind_from_sql_fails_loud_on_unknown() {
+        // NULL column → None; known value parses.
+        assert!(fork_kind_from_sql(None).unwrap().is_none());
+        assert_eq!(
+            fork_kind_from_sql(Some("filtered".into())).unwrap(),
+            Some(ForkKind::Filtered)
+        );
+        // A retired ('shallow') or corrupt value must ERROR, never silently
+        // degrade to None — that would erase fork provenance.
+        assert!(fork_kind_from_sql(Some("shallow".into())).is_err());
+        assert!(fork_kind_from_sql(Some("garbage".into())).is_err());
+    }
 
     // ── 1. Schema idempotent ────────────────────────────────────────────
 
@@ -3520,7 +3546,7 @@ mod tests {
 
         let mut grandchild = make_context_row(Some("grandchild"));
         grandchild.forked_from = Some(child.context_id);
-        grandchild.fork_kind = Some(ForkKind::Shallow);
+        grandchild.fork_kind = Some(ForkKind::Filtered);
         insert_context_with_doc(&db, &grandchild, ws_id);
 
         let lineage = db.fork_lineage(grandchild.context_id).unwrap();
