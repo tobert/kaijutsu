@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use diamond_types_extended::{Frontier, SerializedOpsOwned};
 
 use crate::content::{BlockContent, base62_encode_padded, order_key_successor, order_midpoint};
+use crate::selection::IntervalSet;
 use crate::{
     BlockHeader, BlockId, BlockKind, BlockSnapshot, ContentType, ContextId, CrdtError, DriftKind,
     MAX_DAG_DEPTH, PrincipalId, Result, Role, Status, Tick, ToolKind,
@@ -27,9 +28,23 @@ pub struct ForkBlockFilter {
     /// Skip blocks with these Role names (e.g., "Tool", "Model").
     pub exclude_roles: HashSet<String>,
     /// Limit total blocks (None = unlimited). Keeps the most recent blocks.
+    ///
+    /// DEPRECATED — retiring in the fork-filters slice-4 CLI work, spelled
+    /// `--include end-N:` over the interval selection. Only `kj fork
+    /// --depth`/`--shallow` sets it. As of the selection refactor it truncates
+    /// the *document-ordered* (order_key) snapshot, so it now keeps the N most
+    /// recent by timeline — the earlier BTreeMap/BlockId-order bug is gone.
     pub max_blocks: Option<usize>,
     /// Skip specific blocks by BlockId key (context:agent:seq format).
     pub exclude_block_ids: HashSet<String>,
+    /// Positional keep-set over the order_key-sorted, non-deleted,
+    /// before-`before_timestamp` snapshot at the fork instant — the interval
+    /// selection (`kept = (base ∩ ∪inc) \ ∪exc`, see `crate::selection` and
+    /// `docs/fork-filters.md`). `None` keeps every position; the predicate
+    /// excludes above still apply on top. Positions are resolved upstream
+    /// (preset + CLI ranges + include-invariant check), so applying it here is
+    /// infallible.
+    pub selection: Option<IntervalSet>,
 }
 
 impl ForkBlockFilter {
@@ -1469,24 +1484,38 @@ impl BlockStore {
     ) -> Self {
         let mut forked = Self::new(new_context_id, new_principal_id);
 
-        // Collect passing blocks first (for max_blocks truncation)
-        let mut passing: Vec<(&BlockContent, BlockSnapshot)> = Vec::new();
+        // Build the positional universe in DOCUMENT order — order_key, BlockId
+        // tiebreak — NOT `blocks.values()` (a `BTreeMap<BlockId>` is ordered by
+        // (context, principal, seq), i.e. principal-major, which diverges from
+        // timeline order in any multi-principal context). The interval
+        // selection and `max_blocks` both index this ordering.
+        let mut universe: Vec<(&BlockId, &BlockContent)> = self
+            .blocks
+            .iter()
+            .filter(|(_, b)| !b.is_deleted() && b.header().created_at <= before_timestamp)
+            .collect();
+        universe.sort_by(|(ia, a), (ib, b)| a.order_key().cmp(b.order_key()).then_with(|| ia.cmp(ib)));
 
-        for block in self.blocks.values() {
-            if block.is_deleted() {
-                continue;
-            }
-            if block.header().created_at > before_timestamp {
+        // Survivors, kept in document order: drop positions outside the resolved
+        // selection (if any), then drop blocks the predicate excludes
+        // (kind/role/compacted/id). Both are subtractions and compose.
+        let mut passing: Vec<(&BlockContent, BlockSnapshot)> = Vec::new();
+        for (pos, (_id, block)) in universe.iter().enumerate() {
+            if let Some(sel) = &filter.selection
+                && !sel.contains_position(pos)
+            {
                 continue;
             }
             let snap = block.snapshot();
             if !filter.matches(&snap) {
                 continue;
             }
-            passing.push((block, snap));
+            passing.push((*block, snap));
         }
 
-        // Apply max_blocks — keep the most recent (by order_key, since BTreeMap is ordered)
+        // max_blocks — keep the most recent N. `passing` is in document
+        // (order_key) order, so this keeps the timeline tail, not a BlockId-order
+        // tail. (Deprecated: retiring for `--include end-N:` in slice-4 CLI.)
         if let Some(max) = filter.max_blocks
             && passing.len() > max
         {
@@ -3576,6 +3605,78 @@ mod tests {
         let forked = store.fork_filtered(new_ctx, new_agent, u64::MAX, &filter);
 
         assert_eq!(forked.block_count(), 2, "Should only keep last 2 blocks");
+    }
+
+    /// A log authored by two principals, interleaved in TIME: document order
+    /// (by tick/order_key) is t0,t1,t2,t3, but `BTreeMap<BlockId>` order is
+    /// principal-major — all of `p_lo`'s blocks (ticks 1,3) then all of
+    /// `p_hi`'s (ticks 0,2) → [1,3,0,2]. Any position-dependent fork op that
+    /// walks `blocks.values()` instead of order_key order will pick wrong.
+    fn interleaved_principal_log() -> BlockStore {
+        let ctx = ContextId::new();
+        let (a, b) = (PrincipalId::new(), PrincipalId::new());
+        let (p_lo, p_hi) = if a < b { (a, b) } else { (b, a) };
+        let mut store = BlockStore::new(ctx, p_lo);
+        let new_blocks = vec![
+            snap_for(ctx, p_hi, 0, 0),
+            snap_for(ctx, p_lo, 0, 1),
+            snap_for(ctx, p_hi, 1, 2),
+            snap_for(ctx, p_lo, 1, 3),
+        ];
+        store
+            .merge_ops(SyncPayload {
+                block_ops: vec![],
+                new_blocks,
+                updated_headers: vec![],
+                deleted_blocks: vec![],
+            })
+            .unwrap();
+        store
+    }
+
+    /// Ticks of a store's blocks in document order.
+    fn doc_ticks(store: &BlockStore) -> Vec<i64> {
+        store
+            .block_ids_ordered()
+            .iter()
+            .map(|id| store.get_block_snapshot(id).unwrap().tick.unwrap().get())
+            .collect()
+    }
+
+    #[test]
+    fn fork_filtered_selection_indexes_document_order_not_blockid() {
+        let store = interleaved_principal_log();
+        // Fixture sanity: document order is by tick, BTreeMap order is not.
+        assert_eq!(doc_ticks(&store), vec![0, 1, 2, 3], "fixture: document order is by tick");
+
+        // `end-2:` over the 4-block document = positions 2..4 = ticks {2,3}.
+        let filter = ForkBlockFilter {
+            selection: Some(IntervalSet::from_ranges([2..4])),
+            ..Default::default()
+        };
+        let forked = store.fork_filtered(ContextId::new(), PrincipalId::new(), u64::MAX, &filter);
+        assert_eq!(
+            doc_ticks(&forked),
+            vec![2, 3],
+            "selection must index document (order_key) order, not principal-major BlockId order"
+        );
+    }
+
+    #[test]
+    fn fork_filtered_max_blocks_keeps_most_recent_by_timeline() {
+        let store = interleaved_principal_log();
+        // max_blocks=2 must keep the 2 most recent *by timeline* (ticks 2,3),
+        // not the last 2 in BTreeMap order (ticks 0,2).
+        let filter = ForkBlockFilter {
+            max_blocks: Some(2),
+            ..Default::default()
+        };
+        let forked = store.fork_filtered(ContextId::new(), PrincipalId::new(), u64::MAX, &filter);
+        assert_eq!(
+            doc_ticks(&forked),
+            vec![2, 3],
+            "max_blocks must keep the most recent by timeline, not by BlockId order"
+        );
     }
 
     #[test]
