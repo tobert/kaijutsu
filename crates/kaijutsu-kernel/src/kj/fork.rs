@@ -61,9 +61,17 @@ pub(crate) struct ForkArgs {
     /// Compact (distill) fork
     #[arg(long)]
     compact: bool,
-    /// Exclude specific blocks from a FULL fork (repeatable). Block key in
-    /// `context:agent:seq` form. The full fork copies everything else — the
-    /// orchestrator-repair path ("fork X without the block that blew it up").
+    /// Include only these ranges (repeatable). A range is `[lo]:[hi]`,
+    /// half-open `[lo, hi)`, endpoints `int | end | end-N` (e.g. `0:5`,
+    /// `end-10:`, `:`). Narrows the selection; every explicit `--include` must
+    /// survive the resolved keep-set or the fork refuses (no silent winner).
+    #[arg(long)]
+    include: Vec<String>,
+    /// Exclude from the fork (repeatable). Either a range (`10:20`, `end-3:` —
+    /// same grammar as `--include`) or an exact block key in `context:agent:seq`
+    /// form (the orchestrator-repair path, "fork X without the block that blew
+    /// it up"). A value with the wrong colon count for a range is taken as a
+    /// block key and must exist in the source.
     #[arg(long)]
     exclude: Vec<String>,
 }
@@ -74,6 +82,48 @@ struct ResolvedModel {
     model: Option<String>,
     /// True when `--model` was explicitly given (needs `configure_llm` call).
     explicit: bool,
+}
+
+/// The fork-time interval selection, resolved at the fork instant from the
+/// recalled preset patch (`base` + stored include/exclude rows) composed with
+/// the on-this-command `--include` / `--exclude` ranges, plus the dedicated
+/// `--exclude <block-key>` exact drops. See `docs/fork-filters.md`.
+struct ForkSelection {
+    /// Positional keep-set over the parent's fork-instant ordered snapshot.
+    /// `None` only on the plain full-copy fast path (base `full`, nothing
+    /// narrowing) — which keeps the history-preserving `fork_document` copy
+    /// instead of the snapshot-rebuilding filtered copy.
+    selection: Option<kaijutsu_crdt::IntervalSet>,
+    /// CLI `--exclude <block-key>` exact-form drops, validated present in the
+    /// source. Composed as a predicate exclusion on top of the positional
+    /// selection (the orchestrator-repair path).
+    exclude_block_ids: std::collections::HashSet<String>,
+    /// True when the fork narrows the parent → `ForkKind::Filtered` + the
+    /// filtered copy path. False = a plain full copy (`ForkKind::Full`).
+    filtered: bool,
+}
+
+/// Parse a list of range specs into a canonical [`IntervalSet`], surfacing the
+/// offending spec alongside the [`RangeError`] for a quotable message.
+fn parse_range_specs(
+    specs: &[String],
+    len: usize,
+) -> Result<kaijutsu_crdt::IntervalSet, (String, kaijutsu_crdt::RangeError)> {
+    let mut ranges = Vec::with_capacity(specs.len());
+    for s in specs {
+        let r = kaijutsu_crdt::parse_range(s, len).map_err(|e| (s.clone(), e))?;
+        ranges.push(r);
+    }
+    Ok(kaijutsu_crdt::IntervalSet::from_ranges(ranges))
+}
+
+/// Render canonical runs as `lo:hi, …` for an error message naming the
+/// positions that violated the include invariant.
+fn fmt_runs(runs: &[std::ops::Range<usize>]) -> String {
+    runs.iter()
+        .map(|r| format!("{}:{}", r.start, r.end))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 impl KjDispatcher {
@@ -120,6 +170,163 @@ impl KjDispatcher {
                 explicit: false,
             }),
         }
+    }
+
+    /// Recall a preset patch and compose it with the CLI ranges into the
+    /// fork-time keep-set (`kept = (base ∩ ∪cli_inc) \ ∪exc`), resolved against
+    /// the parent's fork-instant ordered snapshot.
+    ///
+    /// Composition (Amy 2026-06-12 #2): a preset's stored includes WIDEN the
+    /// recalled base (a patch may resurrect a section) and are NOT
+    /// invariant-checked — only on-this-command CLI `--include`s are sacred and
+    /// get the loud include invariant. Excludes union across layers (preset rows
+    /// ∪ CLI). `--exclude` values that aren't ranges are taken as exact block
+    /// keys (validated present) and ride as a predicate exclusion.
+    async fn resolve_fork_selection(
+        &self,
+        source_id: ContextId,
+        preset_label: Option<&str>,
+        cli_includes: &[String],
+        cli_excludes: &[String],
+    ) -> Result<ForkSelection, String> {
+        use kaijutsu_crdt::{IntervalSet, RangeError, SelectionError};
+
+        // The fork-instant ordered snapshot — the universe positions address
+        // (order_key / BlockId order, the same `fork_filtered` rebuilds). We read
+        // length + the marker index here; the copy re-derives positions itself.
+        let snapshots = self
+            .block_store()
+            .block_snapshots(source_id)
+            .map_err(|e| format!("could not read source blocks: {e}"))?;
+        let len = snapshots.len();
+
+        // ── Recall the preset patch (a snapshot — later edits don't reach an
+        // already-forked context). Factory `full`/`window`/`spawn` carry only a
+        // `base` row; a user patch may add `include`/`exclude` rows. Other arg
+        // names (model knobs) are applied via `apply_preset`, not here.
+        let mut base_selector = "full".to_string();
+        let mut preset_inc_specs: Vec<String> = Vec::new();
+        let mut preset_exc_specs: Vec<String> = Vec::new();
+        if let Some(label) = preset_label {
+            let preset_id = {
+                let db = self.kernel_db().lock();
+                db.get_preset_by_label(label)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| format!("preset '{label}' not found"))?
+                    .preset_id
+            };
+            let args = {
+                let db = self.kernel_db().lock();
+                db.get_preset_args(preset_id, "fork").map_err(|e| e.to_string())?
+            };
+            for a in args {
+                match a.arg_name.as_str() {
+                    "base" => base_selector = a.arg_value,
+                    "include" => preset_inc_specs.push(a.arg_value),
+                    "exclude" => preset_exc_specs.push(a.arg_value),
+                    _ => {}
+                }
+            }
+        }
+
+        // ── Resolve the base selector → IntervalSet over [0, len) ───────────
+        let base_is_full = base_selector == "full";
+        let base = match base_selector.as_str() {
+            "full" => IntervalSet::full(len),
+            "spawn" => IntervalSet::empty(),
+            "window" => {
+                // The `window` shape reads the PARENT's hydration policy. No row
+                // = a configuration mistake ("no notch is defined here"), loud per
+                // docs/fork-filters.md — not a degenerate full.
+                let policy = {
+                    let db = self.kernel_db().lock();
+                    db.get_hydration_policy(source_id).map_err(|e| e.to_string())?
+                };
+                let (marker, window) = policy.ok_or_else(|| {
+                    "preset 'window' needs a hydration policy on the parent, but none is set \
+                     — mark one with `kj context hydrate --mark`, or pick a different preset"
+                        .to_string()
+                })?;
+                // A marker absent from the snapshot is anomalous (markers point at
+                // durable blocks) — fail-safe to the whole log rather than hide
+                // context behind a stale marker (matches the hydrate side).
+                let marker_idx = snapshots.iter().position(|b| b.id == marker);
+                if marker_idx.is_none() {
+                    tracing::warn!(
+                        context_id = %source_id,
+                        "kj fork --preset window: hydration marker not in snapshot; \
+                         carrying the whole log"
+                    );
+                }
+                kaijutsu_crdt::window_base(len, marker_idx, window as usize)
+            }
+            other => {
+                // Forward-looking: a user patch may store a literal range as base.
+                let r = kaijutsu_crdt::parse_range(other, len)
+                    .map_err(|e| format!("preset base '{other}': {e}"))?;
+                IntervalSet::from_ranges([r])
+            }
+        };
+
+        // Preset includes WIDEN the base; preset excludes union into the
+        // subtraction set.
+        let preset_inc = parse_range_specs(&preset_inc_specs, len)
+            .map_err(|(s, e)| format!("preset include '{s}': {e}"))?;
+        let preset_exc = parse_range_specs(&preset_exc_specs, len)
+            .map_err(|(s, e)| format!("preset exclude '{s}': {e}"))?;
+        let effective_base = base.union(&preset_inc);
+
+        // CLI includes — ranges only, sacred (the loud include invariant).
+        let cli_inc = parse_range_specs(cli_includes, len)
+            .map_err(|(s, e)| format!("--include '{s}': {e}"))?;
+        let cli_inc_opt = if cli_includes.is_empty() { None } else { Some(cli_inc) };
+
+        // CLI excludes — a range, or (NotARange = the wrong colon count) the exact
+        // `--exclude <block-key>` form. A typo'd/absent key fails LOUD: a silent
+        // no-op would leave the offending block in a "repaired" child.
+        let mut cli_exc_ranges: Vec<std::ops::Range<usize>> = Vec::new();
+        let mut exclude_block_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for spec in cli_excludes {
+            match kaijutsu_crdt::parse_range(spec, len) {
+                Ok(r) => cli_exc_ranges.push(r),
+                Err(RangeError::NotARange(_)) => {
+                    let id = kaijutsu_types::BlockId::from_key(spec).ok_or_else(|| {
+                        format!("--exclude '{spec}': not a range and not a valid block key")
+                    })?;
+                    if !snapshots.iter().any(|b| b.id == id) {
+                        return Err(format!("--exclude block '{spec}' is not in this context"));
+                    }
+                    exclude_block_ids.insert(id.to_key());
+                }
+                Err(e) => return Err(format!("--exclude '{spec}': {e}")),
+            }
+        }
+        let excludes = preset_exc.union(&IntervalSet::from_ranges(cli_exc_ranges));
+
+        // ── Compose: kept = (effective_base ∩ ∪cli_inc) \ ∪exc ──────────────
+        let kept = kaijutsu_crdt::resolve_keep_set(&effective_base, cli_inc_opt.as_ref(), &excludes)
+            .map_err(|SelectionError::IncludeViolation { missing }| {
+                format!(
+                    "--include conflicts with the selection: positions {} fall outside the kept \
+                     set (a preset's shape or an exclude removed them). Drop the preset, adjust \
+                     the range, or exclude explicitly.",
+                    fmt_runs(&missing)
+                )
+            })?;
+
+        // Plain full-copy fast path: base `full`, nothing narrowing → keep the
+        // history-preserving `fork_document` copy + ForkKind::Full. Any preset
+        // base other than full, any include, or any exclusion narrows.
+        let narrows = !base_is_full
+            || cli_inc_opt.is_some()
+            || !excludes.is_empty()
+            || !exclude_block_ids.is_empty();
+
+        Ok(ForkSelection {
+            selection: if narrows { Some(kept) } else { None },
+            exclude_block_ids,
+            filtered: narrows,
+        })
     }
 
     pub(crate) async fn dispatch_fork(&self, argv: &[String], caller: &KjCaller) -> KjResult {
@@ -184,53 +391,46 @@ impl KjDispatcher {
             Err(e) => return KjResult::Err(format!("kj fork: {e}")),
         };
 
-        // Validate --exclude block ids against the source BEFORE any mutations,
-        // and build the fork filter. A full fork takes the whole context; this is
-        // the escape hatch to drop a few named blocks (orchestrator repair). A
-        // typo/wrong-context id fails LOUD (consistent with `kj context hydrate
-        // --mark`) — a silent no-op would leave the offending block in the
-        // "repaired" child. Empty --exclude → the plain unfiltered full copy.
-        let exclude_filter = if args.exclude.is_empty() {
-            None
+        // Recall the preset patch + compose the CLI ranges into the fork-time
+        // keep-set, BEFORE any mutations. A range/preset/key error (including the
+        // loud include invariant, and a typo'd `--exclude` block key) fails here.
+        let selection = match self
+            .resolve_fork_selection(
+                source_id,
+                preset_label.as_deref(),
+                &args.include,
+                &args.exclude,
+            )
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => return KjResult::Err(format!("kj fork: {e}")),
+        };
+        // A narrowing selection is a Filtered fork; a plain full copy stays Full.
+        let fork_kind = if selection.filtered {
+            ForkKind::Filtered
         } else {
-            let mut ids = std::collections::HashSet::new();
-            for key in &args.exclude {
-                let Some(id) = kaijutsu_types::BlockId::from_key(key) else {
-                    return KjResult::Err(format!("kj fork: invalid --exclude block id '{key}'"));
-                };
-                match self.block_store().get_block_snapshot(source_id, &id) {
-                    Ok(Some(_)) => {
-                        ids.insert(id.to_key());
-                    }
-                    Ok(None) => {
-                        return KjResult::Err(format!(
-                            "kj fork: --exclude block '{key}' is not in this context"
-                        ));
-                    }
-                    Err(e) => {
-                        return KjResult::Err(format!(
-                            "kj fork: could not verify --exclude block '{key}': {e}"
-                        ));
-                    }
-                }
-            }
-            Some(kaijutsu_crdt::ForkBlockFilter {
-                exclude_block_ids: ids,
-                ..Default::default()
-            })
+            ForkKind::Full
         };
 
-        // Deep-copy the BlockStore document. Plain full copy by default; when
-        // --exclude was given, route through the filtered copy (full fork still
-        // takes everything else).
-        let copy = match &exclude_filter {
-            Some(filter) => self.block_store().fork_document_filtered(
+        // Deep-copy the BlockStore document. Plain full copy by default (the
+        // history-preserving path); a narrowing selection routes through the
+        // filtered copy (snapshot-rebuilt with the positional keep-set +
+        // block-key drops).
+        let copy = if selection.filtered {
+            let filter = kaijutsu_crdt::ForkBlockFilter {
+                selection: selection.selection.clone(),
+                exclude_block_ids: selection.exclude_block_ids.clone(),
+                ..Default::default()
+            };
+            self.block_store().fork_document_filtered(
                 source_id,
                 new_id,
                 kaijutsu_types::now_millis(),
-                filter,
-            ),
-            None => self.block_store().fork_document(source_id, new_id),
+                &filter,
+            )
+        } else {
+            self.block_store().fork_document(source_id, new_id)
         };
         if let Err(e) = copy {
             return KjResult::Err(format!("kj fork: failed to copy document: {e}"));
@@ -263,7 +463,7 @@ impl KjDispatcher {
                 created_at: kaijutsu_types::now_millis() as i64,
                 created_by: caller.principal_id,
                 forked_from: Some(source_id),
-                fork_kind: Some(ForkKind::Full),
+                fork_kind: Some(fork_kind),
                 archived_at: None,
                 workspace_id: source_ws,
                 preset_id: None,
@@ -370,7 +570,7 @@ impl KjDispatcher {
         if let Err(e) = self.inject_fork_marker(
             new_id,
             source_id,
-            ForkKind::Full,
+            fork_kind,
             block_count,
             source_label.as_deref(),
             staging,
@@ -386,7 +586,7 @@ impl KjDispatcher {
         // Run rc fork-lifecycle scripts. Failures surface as Error
         // blocks in the new context — they don't abort the fork.
         if let Err(e) = self
-            .run_rc_lifecycle("fork", new_id, Some(source_id), Some(ForkKind::Full), None, caller)
+            .run_rc_lifecycle("fork", new_id, Some(source_id), Some(fork_kind), None, caller)
             .await
         {
             tracing::warn!("rc fork lifecycle: {e}");
@@ -1364,7 +1564,7 @@ fn inherit_parent_context_type(
 #[cfg(test)]
 mod tests {
     use crate::kj::test_helpers::*;
-    use kaijutsu_types::PrincipalId;
+    use kaijutsu_types::{ForkKind, PrincipalId};
 
     fn s(v: &str) -> String {
         v.to_string()
@@ -1494,6 +1694,225 @@ mod tests {
             "msg: {}",
             result.message()
         );
+    }
+
+    // ── slice 3c: preset recall + range composition at fork ──────────────
+
+    /// Seed the factory presets (full/window/spawn) — production does this at
+    /// rpc init; the test dispatcher doesn't, so recall tests do it explicitly.
+    fn seed_factory_presets(d: &crate::KjDispatcher) {
+        let mut db = d.kernel_db().lock();
+        crate::seed_presets::ensure_factory_presets(&mut db, PrincipalId::system()).unwrap();
+    }
+
+    /// Ordered conversation contents of a context (document order).
+    fn ordered_contents(d: &crate::KjDispatcher, ctx: kaijutsu_types::ContextId) -> Vec<String> {
+        d.block_store()
+            .block_snapshots(ctx)
+            .unwrap()
+            .iter()
+            .map(|b| b.content.clone())
+            .collect()
+    }
+
+    fn child_id(d: &crate::KjDispatcher, label: &str) -> kaijutsu_types::ContextId {
+        d.kernel_db()
+            .lock()
+            .find_context_by_label(label)
+            .unwrap()
+            .unwrap()
+            .context_id
+    }
+
+    /// A source context with five distinct, position-tagged text blocks.
+    async fn source_with_five(
+        d: &crate::KjDispatcher,
+        principal: PrincipalId,
+    ) -> (kaijutsu_types::ContextId, Vec<String>) {
+        let source = register_context(d, Some("source"), None, principal);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        for body in ["alpha", "bravo", "charlie", "delta", "echo"] {
+            insert_text(d, source, principal, body);
+        }
+        let pc = ordered_contents(d, source);
+        assert_eq!(pc.len(), 5, "source ordering: {pc:?}");
+        (source, pc)
+    }
+
+    fn fork_kind_of(d: &crate::KjDispatcher, ctx: kaijutsu_types::ContextId) -> Option<ForkKind> {
+        d.kernel_db().lock().get_context(ctx).unwrap().unwrap().fork_kind
+    }
+
+    /// `--preset spawn` copies ~nothing: the player-birth shape. None of the
+    /// parent's conversation blocks reach the child; the fork is `Filtered`.
+    #[tokio::test]
+    async fn fork_preset_spawn_copies_no_parent_blocks() {
+        let d = test_dispatcher().await;
+        seed_factory_presets(&d);
+        let principal = PrincipalId::new();
+        let (source, pc) = source_with_five(&d, principal).await;
+
+        let c = caller_with_context(source);
+        let result = d
+            .dispatch(&[s("fork"), s("--name"), s("born"), s("--preset"), s("spawn")], &c)
+            .await;
+        assert!(result.is_ok(), "spawn fork failed: {}", result.message());
+
+        let child = child_id(&d, "born");
+        let kid = ordered_contents(&d, child);
+        for body in &pc {
+            assert!(
+                !kid.iter().any(|c| c.contains(body.as_str())),
+                "spawn must copy no parent block; found {body:?} in {kid:?}"
+            );
+        }
+        assert_eq!(fork_kind_of(&d, child), Some(ForkKind::Filtered));
+    }
+
+    /// `--preset full` is the all-pass base: every parent block survives, and
+    /// the fork stays `Full` (the history-preserving plain copy).
+    #[tokio::test]
+    async fn fork_preset_full_copies_everything() {
+        let d = test_dispatcher().await;
+        seed_factory_presets(&d);
+        let principal = PrincipalId::new();
+        let (source, pc) = source_with_five(&d, principal).await;
+
+        let c = caller_with_context(source);
+        let result = d
+            .dispatch(&[s("fork"), s("--name"), s("whole"), s("--preset"), s("full")], &c)
+            .await;
+        assert!(result.is_ok(), "full fork failed: {}", result.message());
+
+        let child = child_id(&d, "whole");
+        let kid = ordered_contents(&d, child);
+        for body in &pc {
+            assert!(kid.iter().any(|c| c.contains(body.as_str())), "missing {body:?} in {kid:?}");
+        }
+        assert_eq!(fork_kind_of(&d, child), Some(ForkKind::Full));
+    }
+
+    /// `--include 0:2` narrows to the first two positions; the rest are dropped.
+    #[tokio::test]
+    async fn fork_include_range_keeps_only_that_window() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let (source, pc) = source_with_five(&d, principal).await;
+
+        let c = caller_with_context(source);
+        let result = d
+            .dispatch(&[s("fork"), s("--name"), s("head"), s("--include"), s("0:2")], &c)
+            .await;
+        assert!(result.is_ok(), "include fork failed: {}", result.message());
+
+        let child = child_id(&d, "head");
+        let kid = ordered_contents(&d, child);
+        assert!(kid.iter().any(|c| c.contains(&pc[0])), "kept pos0 {:?}: {kid:?}", pc[0]);
+        assert!(kid.iter().any(|c| c.contains(&pc[1])), "kept pos1 {:?}: {kid:?}", pc[1]);
+        for body in &pc[2..] {
+            assert!(!kid.iter().any(|c| c.contains(body.as_str())), "dropped {body:?}: {kid:?}");
+        }
+        assert_eq!(fork_kind_of(&d, child), Some(ForkKind::Filtered));
+    }
+
+    /// `--exclude 1:4` carves a middle notch: positions 0 and 4 survive.
+    #[tokio::test]
+    async fn fork_exclude_range_carves_middle() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let (source, pc) = source_with_five(&d, principal).await;
+
+        let c = caller_with_context(source);
+        let result = d
+            .dispatch(&[s("fork"), s("--name"), s("notched"), s("--exclude"), s("1:4")], &c)
+            .await;
+        assert!(result.is_ok(), "exclude-range fork failed: {}", result.message());
+
+        let child = child_id(&d, "notched");
+        let kid = ordered_contents(&d, child);
+        assert!(kid.iter().any(|c| c.contains(&pc[0])), "kept pos0: {kid:?}");
+        assert!(kid.iter().any(|c| c.contains(&pc[4])), "kept pos4: {kid:?}");
+        for body in &pc[1..4] {
+            assert!(!kid.iter().any(|c| c.contains(body.as_str())), "dropped {body:?}: {kid:?}");
+        }
+        assert_eq!(fork_kind_of(&d, child), Some(ForkKind::Filtered));
+    }
+
+    /// The loud include invariant: `--include 0:3 --exclude 1:2` contradict on
+    /// one line — no silent excludes-win, the fork refuses naming the positions.
+    #[tokio::test]
+    async fn fork_include_exclude_contradiction_is_loud() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let (source, _pc) = source_with_five(&d, principal).await;
+
+        let c = caller_with_context(source);
+        let result = d
+            .dispatch(
+                &[s("fork"), s("--include"), s("0:3"), s("--exclude"), s("1:2")],
+                &c,
+            )
+            .await;
+        assert!(!result.is_ok(), "contradiction must error");
+        assert!(
+            result.message().contains("conflicts") && result.message().contains("1:2"),
+            "should name the offending positions: {}",
+            result.message()
+        );
+    }
+
+    /// `--preset window` reads the parent's hydration policy row; absent = a
+    /// configuration mistake, loud per docs/fork-filters.md (not a degenerate
+    /// full copy).
+    #[tokio::test]
+    async fn fork_preset_window_without_policy_errors() {
+        let d = test_dispatcher().await;
+        seed_factory_presets(&d);
+        let principal = PrincipalId::new();
+        let (source, _pc) = source_with_five(&d, principal).await;
+
+        let c = caller_with_context(source);
+        let result = d
+            .dispatch(&[s("fork"), s("--preset"), s("window")], &c)
+            .await;
+        assert!(!result.is_ok(), "window with no policy must error");
+        assert!(
+            result.message().contains("hydration policy"),
+            "msg should explain the missing policy: {}",
+            result.message()
+        );
+    }
+
+    /// `--preset window` with a policy in place recalls the `[0,marker] ∪ tail`
+    /// shape — the prefix and tail survive, the middle is notched out.
+    #[tokio::test]
+    async fn fork_preset_window_recalls_prefix_and_tail() {
+        let d = test_dispatcher().await;
+        seed_factory_presets(&d);
+        let principal = PrincipalId::new();
+        let (source, pc) = source_with_five(&d, principal).await;
+
+        // Mark position 0 as the pinned prefix end, window=1 → keep [0,0] ∪ last1
+        // = positions 0 and 4; 1..4 notched.
+        let marker = d.block_store().block_snapshots(source).unwrap()[0].id;
+        d.kernel_db().lock().set_hydration_policy(source, marker, 1).unwrap();
+
+        let c = caller_with_context(source);
+        let result = d
+            .dispatch(&[s("fork"), s("--name"), s("win"), s("--preset"), s("window")], &c)
+            .await;
+        assert!(result.is_ok(), "window fork failed: {}", result.message());
+
+        let child = child_id(&d, "win");
+        let kid = ordered_contents(&d, child);
+        assert!(kid.iter().any(|c| c.contains(&pc[0])), "kept prefix pos0: {kid:?}");
+        assert!(kid.iter().any(|c| c.contains(&pc[4])), "kept tail pos4: {kid:?}");
+        for body in &pc[1..4] {
+            assert!(!kid.iter().any(|c| c.contains(body.as_str())), "notched {body:?}: {kid:?}");
+        }
+        assert_eq!(fork_kind_of(&d, child), Some(ForkKind::Filtered));
     }
 
     #[tokio::test]
