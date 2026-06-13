@@ -32,7 +32,7 @@ avian2d = "0.6"
 
 # Text rendering (Vello-based + MSDF): we own the rasterizer + shaping +
 # scene→texture primitive. Direct vello stack, version-pinned so vello_svg 0.9
-# dedups onto vello 0.7. Design record: docs/bevy_vello-escape.md.
+# dedups onto vello 0.7.
 vello = "0.7.0"
 vello_svg = "0.9.0"
 parley = "0.7.0"

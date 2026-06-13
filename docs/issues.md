@@ -141,18 +141,29 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ## User Interface (kaijutsu-app) & UX
 
-- **Rename `BlockScene` → `BlockContent`:** after the vello-primitive unification it no
-  longer holds a scene (scene + `built_*` moved to `VelloUiScene`); it's now pure
-  build-bookkeeping (`content_version`/`last_built_version`/`scene_version`/
-  `text`/`color`). Name is misleading. Mechanical rename across `block_render.rs`,
+- **Rename `BlockScene` → `BlockContent`:** the component no longer holds a
+  scene (scene + `built_*` live on `VelloUiScene`); it's now pure build-
+  bookkeeping (`content_version`/`last_built_version`/`scene_version`/`text`/
+  `color`). Name is misleading. Mechanical rename across `block_render.rs`,
   `lifecycle.rs`, `overlay.rs`, `shell_dock.rs`, `render.rs`.
-- **Verify Vello-content cell composite (vello-primitive unification):** confirm an
-  ABC/SVG/sparkline *cell* (`has_vello_content == true`) rasterizes via
-  `render_vello_scenes` then composites MSDF labels on top — needs a conversation
-  with rich content; verified all MSDF-only surfaces but not this combination.
+- **Verify two unexercised render surfaces:** (1) a Vello-content *cell*
+  (ABC/SVG/sparkline, `has_vello_content == true`) rasterizing via
+  `render_vello_scenes` then compositing MSDF labels on top — needs a
+  conversation with rich content; (2) the unfocused-pane summary, the one
+  surface on Bevy's native `Text` pipeline (`tiling_reconciler`), needs a
+  multi-pane layout. All MSDF-only surfaces + docks + role borders verified.
 - **User presence (novel surface):** The compose input is a shared CRDT document. Surfacing in-flight compose state to an opted-in model would enable mid-sentence collaboration. Gate with explicit user opt-in.
 - **Connection Polling Efficiency:** `ActorPlugin` in `crates/kaijutsu-app/src/connection/mod.rs` polls broadcast channels every frame. While `UpdateMode::reactive` helps, consider event-driven wakeups or bridging async streams directly into Bevy events more efficiently if latency/power becomes an issue.
 - **Card-stack view:** Card size tuning, read-only scroll on focused card, dive-in (Enter), mouse click to focus, momentum scrolling, camera parallax, streaming card texture updates, card grouping evolution, ambient environment.
+- **Card-stack texture quality (3D direction):** the renderer presents vello/MSDF
+  content as textures on cards, so the 3D move brings (a) **mipmaps** on block/card
+  textures — cards receding in perspective shimmer without them; (b) **reading-mode
+  hi-res re-render** — promoting a card close to the camera re-renders its content at
+  higher resolution (discrete, debounced — same machinery as re-render-on-change);
+  (c) **MSDF live-quad escape hatch** — MSDF's scale-independence is spent at bake
+  time, so if reading-mode text quality disappoints, render MSDF as live quads in the
+  3D scene (the atlas + shaping pipeline already support it; a renderer change, not
+  architectural). Arbitrary zoom over vector content is explicitly declined.
 - **Text rendering (MSDF / 次):** TAA temporal super-resolution, glyph spacing per-font tuning, 1-frame blank flash on texture resize, large-context Vello "paint too large" crash.
 - **Auto-follow on local submit:** the conversation only re-engages
   scroll-follow when already at the bottom
@@ -185,6 +196,37 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 - **TurnFlow bus lossy + in-memory:** overflow eviction is now LOUD (`FlowBus::publish` warns when a full channel drops a slow subscriber's oldest event, `flows.rs`); the zero-subscriber case was already surfaced by `kj drive`/`kj fork --prompt`. Durable delivery (persistence) for `turn.*` remains the follow-up.
 - **Headless turn cwd is `/`:** Decide whether to thread the context's stored shell cwd into the headless `ExecContext`.
 - **`--switch --prompt` double-drives:** Clarify semantics when both human and autonomous turn try to drive a child.
+
+### kj / MCP ergonomics (UX)
+
+- **FOOTGUN — `kj <cmd> help` creates a context.** `kj context create help`
+  parses `help` as a positional *label* and silently creates a context named
+  "help" instead of printing subcommand help (observed 2026-06-13 while
+  orchestrating Chameleon over MCP). `kj <cmd> --help` is also wrong: it falls
+  through to the generic top-level `kj help` rather than the subcommand's clap
+  help. Fix: route a bare `help` / `--help` token to clap's per-subcommand help
+  before positional binding; at minimum special-case `help` so creative/
+  destructive verbs don't treat it as data.
+- **MIDI / blob readback is a two-step with no single tool.** A derived block
+  (e.g. ABC→MIDI sibling) stores a 32-hex CAS hash as its `content`, and the
+  block is `ephemeral` (won't hydrate into the conversation). Retrieving the
+  bytes is: enumerate blocks (`kj block` / `kaijutsu://docs/{doc}`) → find the
+  `audio/midi` sibling → read its hash → `kj cas get <hash> --out <file>`. There
+  is no MCP/`kj` "give me the rendered artifact for this turn" affordance. Add a
+  `kj block cat`/blob-by-block helper (and/or an MCP resource that resolves a
+  block's CAS content) so consumers don't hand-assemble the hash lookup.
+- **Stale rc seed survives a DB clear → missing authorities.** rc scripts live
+  as host files under `~/.config/kaijutsu/rc/<type>/<verb>/`, read via the CRDT
+  file cache; `ensure_rc_seed_files()` only writes a file **when absent**.
+  Clearing the kernel DB does not touch `~/.config`, so pre-existing seed files
+  never upgrade to the newer embedded default. Symptom (2026-06-13): a fresh
+  `mcp` context had the old 125-byte binding (`*` + `facade:*` only), missing the
+  `drive`/`fork`/`drift`/`transport`/`operator` authorities the current embedded
+  `PERMISSIVE_BINDING_BODY` grants — so the context could not run `kj transport`
+  and could not self-widen (`allow` needs a binding-admin/rc context). Need a
+  versioned-seed / force-reseed path (bump-and-overwrite when the embedded
+  default changes), or the planned CLI flag / kernel-side setting for the MCP
+  default loadout. Workaround used: hand-refresh the host `S10-binding.kai`.
 
 ## Tool System Follow-ups (post-Phase 5)
 

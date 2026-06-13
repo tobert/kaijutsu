@@ -229,10 +229,9 @@ This doc is one piece of the app-reset effort:
    reattach. App boots straight into the conversation (`ConversationRoot`
    Visible). Orphaned input Actions + contexts + bindings + handler systems
    removed; the constellation-driven dock activity widget and
-   `sync_model_info_to_constellation` dropped. Also retired ~half the
-   phase-4 `UiVello*` sites (everything in `form/` + `constellation/`)
-   by deletion — see `docs/bevy_vello-escape.md`. `cargo check` clean, 237 app
-   tests pass.
+   `sync_model_info_to_constellation` dropped. Also retired ~half the legacy
+   `UiVello*` chrome sites (everything in `form/` + `constellation/`) by
+   deletion. `cargo check` clean, 237 app tests pass.
 3. **Kernel KV** (this doc):
    - **3a — primitive [DONE]** — the `Kv` primitive: `KvDocument` (a flat
      `key→String` LWW Map over a DTE `Document`, in `kaijutsu-crdt`) plus the
