@@ -188,8 +188,28 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   versioned-seed / force-reseed path (bump-and-overwrite when the embedded
   default changes), or the planned CLI flag / kernel-side setting for the MCP
   default loadout. Workaround used: hand-refresh the host `S10-binding.kai`.
-
-## Tool System Follow-ups (post-Phase 5)
+- **Model alias not resolved via `kj --model`.** `kj context create/set --model
+  local` stores the alias verbatim and ships it to the *default* provider at
+  turn time → `not_found_error: model: local` (observed 2026-06-13). Aliases
+  (`local`, `local-fast`, …) are defined in `models.toml [model_aliases]` and
+  resolve in some paths but not the `kj` context-model setter. Resolve aliases
+  where the model spec is stored/applied (or at turn dispatch), not only in the
+  provider list. Workaround: pass the explicit `provider/model` spec
+  (`lemonade/Gemma-4-E4B-it-GGUF`).
+- **`local` is a kaish reserved word (like `set`).** `--model local` lexes as
+  the `local` builtin keyword → `found ';' expected identifier`. Same class as
+  the `set` reserved-word gotcha; quote it (`--model "local"`) or pass the full
+  spec. Consider letting reserved words bind as plain args after a flag.
+- **Local-model turn HANGS silently when given tools.** A small local model
+  (Gemma-4-E4B via lemonade) handed the full tool palette
+  (`[providers.lemonade.default_tools] type = "all"`) emits a thinking block and
+  then stalls — GPU goes cold, no `Completed`, no error, turn never terminates
+  (observed 2026-06-13). Lemonade itself is fine (direct stream completes in
+  <1s); the hang is in the new local-model + tool-call turn path. Counter to the
+  fail-loud stance — a stuck turn should time out / surface an error. Also: the
+  player loadout should not be `all` tools for a small model (the composer rc is
+  now tool-free); make per-provider/per-context `default_tools` the norm for
+  players, and add a turn-level watchdog so a wedged tool loop fails loudly.
 
 - **`StreamingBlockHandle` implementation:** Single-block streaming primitive.
 - **LLM streaming rewrite:** Move `process_llm_stream` onto `StreamingBlockHandle`.
@@ -210,25 +230,16 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ## Hyoushigi / Composer
 
-- **Composer `kj` loadout — narrowed (kj capability gates).** `composer` now
-  seeds its own `assets/defaults/rc/composer/create/S10-binding.kai`: `drive` +
-  the block/read tooling + facades, *not* `fork`/`drift`/`transport`/`operator`.
-  The tick (`kj drive`) runs under this loadout, so narrowing the binding now
-  actually gates self-driving (it didn't before `kj` grew capability gates).
-  Follow-up: revisit whether the composing turn also needs `submit_input` vs.
-  relying on the turn driver, and trim further if the tick proves it can.
-- **OODA has never been driven end-to-end (runtime validation gap).** Every
-  link is wired and unit-tested — `kj context create --type composer` auto-arms
-  (rpc.rs ~2685), the beat scheduler ticks, `composer/tick/S10-drive.kai` runs
-  `kj drive`, `spawn_turn_driver` runs the model turn, `on_turn_completed` →
-  `schedule_abc_cell` → materialize → `$HEARD` feeds back — but no real composer
-  has completed a live OODA cycle. The first live run IS the integration test;
-  expect it to surface something the unit tests didn't (mailbox windowing under
-  a real turn, drive-seed hydration, ABC validation on live model output,
-  cadence feel). To run: `kj context create --type composer --name <lane>
-  --model <prov/model>` then `kj transport play`. For a fast demo loop crank
-  `kj transport tempo` (the cadence-knob below is the clean fix). With a local
-  model up (lemonade) this is the immediate next validation.
+- **Composer `kj` loadout — tool-free (2026-06-13).** `composer` seeds
+  `assets/defaults/rc/composer/create/S10-binding.kai` granting only `drive`:
+  no `builtin.*` tool instances, no `facade:shell`/`submit_input`, no
+  `fork`/`drift`/`transport`/`operator`. A player is an ABC-only voice — its
+  turn text *is* the score (`on_turn_completed` eager-parses it), so it needs no
+  tools, and a small local model handed the full palette stalls the turn. The
+  generic ABC-output primer rides the system slot (`create/S15-abc-primer.md`);
+  the gig (key/tune/register) belongs to the stance + producer chart, NOT the
+  base rc — migrate any song-specific primer content to the producer/chart
+  layer when it lands ("big models author vocabularies").
 - **Cadence/tempo should be settable per context:** `kj transport tempo <bpm>`
   exists, but the OODA cadence (`ooda_every`, default 8 phrases = 128 beats) is
   fixed in `BeatPolicy::composer_default()`. Make the cadence a settable knob

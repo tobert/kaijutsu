@@ -5,17 +5,14 @@
 # the capability that gates self-driving — narrowing the binding now actually
 # stops the tick (it didn't before kj grew capability gates).
 #
-# Granted: drive (the tick) + the block/read tooling a composing turn needs to
-# author music (abc/midi/svg blocks) and read its own context, plus the facades
-# to invoke kj and advance turns.
+# A player is an ABC-only voice: its turn output text *is* the score for the
+# phrase (on_turn_completed eager-parses it; no tool call required). So we grant
+# NO model-visible tools — a small local model plays best with an empty tool
+# palette (Chameleon: "ABC-only output is ideal small-local-model UX"), and it
+# sidesteps the tool-call turn path entirely (a small model handed the full
+# palette stalls the turn). Only `drive` (the tick) is granted.
 kj binding allow "drive"
-kj binding allow "builtin.block"
-kj binding allow "builtin.file:read"
-kj binding allow "builtin.resources"
-kj binding allow "builtin.kernel_info"
-kj binding allow "builtin.tool_search"
-kj binding allow "facade:shell"
-kj binding allow "facade:submit_input"
-# Deliberately NOT granted: fork, drift, transport, operator, admin, rc-write,
-# file:write/edit. A composer drives itself; it does not fork, merge drift,
-# run the transport (the operator/app does), or perform context lifecycle.
+# Deliberately NOT granted: any builtin.* tool instance (block/file/resources/
+# kernel_info/tool_search), facade:shell, facade:submit_input, and fork/drift/
+# transport/operator/admin/rc-write. A composer drives itself and emits ABC text;
+# it does not call tools, fork, merge drift, run the transport, or do lifecycle.

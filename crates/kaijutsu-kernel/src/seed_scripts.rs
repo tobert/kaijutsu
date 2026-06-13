@@ -80,6 +80,12 @@ const COMPOSER_STANCE_BODY: &str =
 const COMPOSER_BINDING_BODY: &str =
     include_str!("../../../assets/defaults/rc/composer/create/S10-binding.kai");
 
+// Generic ABC-output primer (system slot): output-format rules + header order +
+// note/rhythm basics so a player emits parseable ABC and only ABC. The gig
+// (key/tune/register) comes from the stance + producer chart, NOT here.
+const COMPOSER_ABC_PRIMER_BODY: &str =
+    include_str!("../../../assets/defaults/rc/composer/create/S15-abc-primer.md");
+
 const COMPOSER_TICK_BODY: &str =
     include_str!("../../../assets/defaults/rc/composer/tick/S10-drive.kai");
 
@@ -136,6 +142,7 @@ const SEED_FILES: &[(&str, &str)] = &[
     // self-driving.
     ("/etc/rc/composer/create/S00-stance.md", COMPOSER_STANCE_BODY),
     ("/etc/rc/composer/create/S10-binding.kai", COMPOSER_BINDING_BODY),
+    ("/etc/rc/composer/create/S15-abc-primer.md", COMPOSER_ABC_PRIMER_BODY),
     ("/etc/rc/composer/create/S20-cache.kai", CACHE_CREATE_BODY),
     ("/etc/rc/composer/create/S30-hydrate.kai", COMPOSER_HYDRATE_BODY),
     ("/etc/rc/composer/fork/S30-cache.kai", CACHE_FORK_BODY),

@@ -600,6 +600,26 @@ impl KjDispatcher {
         // /etc/rc/default/<verb>/.
         let context_type = cfg.type_spec.take().unwrap_or_else(|| "default".to_string());
 
+        // For composers, derive the beat lane (track) from the label up front,
+        // so a label that yields no valid track id fails BEFORE we create an
+        // orphan context. The arm itself happens after the rc lifecycle (below).
+        let composer_track = if context_type == "composer" {
+            match kaijutsu_types::TrackId::new(label)
+                .ok()
+                .or_else(|| kaijutsu_types::TrackId::slugify(label))
+            {
+                Some(t) => Some(t),
+                None => {
+                    return KjResult::Err(format!(
+                        "kj context create: composer label {label:?} yields no valid \
+                         track id (slug is empty) — refusing a silent shared lane"
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+
         // Validate + resolve the rest before any mutation so a typo'd
         // --model/--consent/--env can't leave an orphan context behind.
         let resolved_model = match self.resolve_context_config(&cfg).await {
@@ -679,6 +699,27 @@ impl KjDispatcher {
             .await
         {
             tracing::warn!("rc create lifecycle: {e}");
+        }
+
+        // Arm the beat for composer contexts so the scheduler drives the
+        // playhead. This mirrors the capnp `CreateContext` path
+        // (`create_context_inner` in kaijutsu-server/src/rpc.rs) — without it, a
+        // composer created via `kj` (the path the Chameleon player-spawn rc
+        // uses) is never armed: `kj transport play` is ignored ("play on
+        // un-armed context") and the OODA Act never crystallizes. Absent a
+        // scheduler (embedded/test) `send_beat_command` returns false → no-op.
+        if let Some(track) = composer_track {
+            let armed = self.kernel().send_beat_command(crate::hyoushigi::BeatCommand::Arm {
+                context_id: new_id,
+                policy: crate::hyoushigi::BeatPolicy::composer_default(),
+                track,
+            });
+            if !armed {
+                tracing::warn!(
+                    "composer {} created but no beat scheduler is wired — it will not beat",
+                    new_id.short()
+                );
+            }
         }
 
         let mut msg = format!("created context '{}' ({})", label, new_id.short());
@@ -2126,6 +2167,63 @@ mod tests {
         assert_eq!(env.len(), 1);
         assert_eq!(env[0].key, "RUST_LOG");
         assert_eq!(env[0].value, "debug");
+    }
+
+    #[tokio::test]
+    async fn context_create_composer_arms_the_beat() {
+        // A composer created via `kj` MUST arm the beat scheduler. The OODA Act
+        // (ABC→cell→MIDI) never fires for an un-armed context and
+        // `kj transport play` is silently ignored ("play on un-armed context").
+        // Regression: the arm lived only in the capnp CreateContext path
+        // (`create_context_inner`), so `kj`-spawned players — the Chameleon
+        // player-spawn path — were created but never beat. A non-composer must
+        // NOT arm.
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let parent = register_context(&d, Some("parent"), None, principal);
+
+        // Own the only beat ingress so we can observe what create sends.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        assert!(d.kernel().set_beat_ingress(tx), "test owns the ingress");
+
+        let c = caller_with_context(parent);
+
+        // Default type: no beat command.
+        let r = d
+            .dispatch(&[s("context"), s("create"), s("plain")], &c)
+            .await;
+        assert!(r.is_ok(), "default create failed: {}", r.message());
+        assert!(
+            rx.try_recv().is_err(),
+            "a non-composer context must not arm the beat"
+        );
+
+        // Composer type: arms, with a track derived from the label.
+        let r = d
+            .dispatch(
+                &[s("context"), s("create"), s("bassline"), s("--type"), s("composer")],
+                &c,
+            )
+            .await;
+        assert!(r.is_ok(), "composer create failed: {}", r.message());
+
+        let id = {
+            let db = d.kernel_db().lock();
+            db.resolve_context("bassline").expect("bassline exists")
+        };
+        let expected_track = kaijutsu_types::TrackId::new("bassline")
+            .ok()
+            .or_else(|| kaijutsu_types::TrackId::slugify("bassline"))
+            .expect("bassline yields a valid track");
+        match rx.try_recv() {
+            Ok(crate::hyoushigi::BeatCommand::Arm {
+                context_id, track, ..
+            }) => {
+                assert_eq!(context_id, id, "arms the composer we just created");
+                assert_eq!(track, expected_track, "track derives from the label");
+            }
+            other => panic!("composer create must send BeatCommand::Arm, got {other:?}"),
+        }
     }
 
     #[tokio::test]
