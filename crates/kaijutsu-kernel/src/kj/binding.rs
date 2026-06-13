@@ -2,7 +2,7 @@
 //!
 //! This is the rc-native setter the capability-policy work hangs off: rc
 //! `.kai` create scripts call it to give a `context_type` its loadout, and
-//! external agents can call it through `context_shell`. It delegates to the
+//! external agents can call it through `shell`. It delegates to the
 //! broker's binding API (`binding`/`set_binding`/`clear_binding`), which both
 //! persists (`KernelDb`) and fires the per-tool add/remove notifications.
 //!
@@ -554,8 +554,8 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_capability("facade:context_shell").unwrap(),
-            Capability::Facade("context_shell".into())
+            parse_capability("facade:shell").unwrap(),
+            Capability::Facade("shell".into())
         );
         assert_eq!(parse_capability("admin").unwrap(), Capability::Admin);
         assert_eq!(parse_capability("rc-write").unwrap(), Capability::RcWrite);

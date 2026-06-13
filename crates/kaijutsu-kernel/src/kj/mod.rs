@@ -2,7 +2,7 @@
 //!
 //! Three modalities, one implementation:
 //! - kaish builtin (`kj context list --tree`)
-//! - MCP tool (`context_shell("kj context list --tree")`)
+//! - MCP tool (`shell("kj context list --tree")`)
 //! - Future: standalone CLI binary
 //!
 //! All commands go through `KjDispatcher`, which holds Arc refs to shared

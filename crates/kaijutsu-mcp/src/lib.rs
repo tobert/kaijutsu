@@ -841,11 +841,11 @@ impl KaijutsuMcp {
     }
 
     #[tool(
-        description = "Execute a kaish command through the kernel. Returns a JSON object: {stdout, stderr, exit_code, status, block_id, content_type, ephemeral, data, elapsed_ms}. `stdout` and `stderr` are separate (stderr is empty when the command wrote none). Detect failure via exit_code != 0 (or status == 'timeout'/'stream_closed') rather than text-matching; exit_code may be null if it hasn't replicated yet — treat null as unknown, not success. `data` is the kj structured payload when present (e.g. `kj context list` returns an array of context labels). Output also lands as CRDT blocks observable in kaijutsu-app. Requires --connect and register_session.",
+        description = "Execute a kaish command in your current kernel context. The shell is context-bound — '.' references this context in kj commands, and durable cwd/env carry across calls. Full kaish: pipes, variables, scripting, plus `kj` for context/drift/fork management (run `kj help`). Returns a JSON object: {stdout, stderr, exit_code, status, block_id, content_type, ephemeral, data, elapsed_ms}. `stdout` and `stderr` are separate (stderr is empty when the command wrote none). Detect failure via exit_code != 0 (or status == 'timeout'/'stream_closed') rather than text-matching; exit_code may be null if it hasn't replicated yet — treat null as unknown, not success. `data` is the kj structured payload when present (arrays for list commands, objects for inspect). Output also lands as CRDT blocks observable in kaijutsu-app. Examples: 'kj context list --tree', 'kj fork --name alt', 'ls /mnt/project | grep rs'. Requires --connect and register_session.",
         annotations(open_world_hint = true)
     )]
     #[tracing::instrument(skip(self, req), name = "mcp.shell")]
-    async fn shell(&self, Parameters(req): Parameters<ShellRequest>) -> String {
+    pub async fn shell(&self, Parameters(req): Parameters<ShellRequest>) -> String {
         let (ctx_id, actor) = match self.require_joined().await {
             Ok(v) => v,
             Err(e) => return e,
@@ -877,47 +877,6 @@ impl KaijutsuMcp {
             &req.command,
             timeout_secs,
             "Shell command",
-        )
-        .await
-        .to_json()
-    }
-
-    #[tool(
-        description = "Context-bound kaish shell. Executes commands in your current kernel context — '.' references it in kj commands. Full kaish: pipes, variables, scripting. Returns the same JSON envelope as `shell`: {stdout, stderr, exit_code, status, block_id, content_type, ephemeral, data, elapsed_ms}. stdout/stderr are separate; detect failure via exit_code != 0 (null exit_code means unknown, not success); `data` carries kj's structured payload (arrays for list commands, objects for inspect). Run `kj help` for context/drift/fork management. Examples: 'kj context list --tree', 'kj fork --name alt', 'kj drift push impl \"found the bug\"', 'ls /mnt/project | grep rs'. Requires --connect and register_session.",
-        annotations(open_world_hint = true)
-    )]
-    #[tracing::instrument(skip(self, req), name = "mcp.context_shell")]
-    pub async fn context_shell(&self, Parameters(req): Parameters<ContextShellRequest>) -> String {
-        // Route through shell_execute — same path as the shell tool.
-        // The command is passed verbatim to kaish (no auto-prepending).
-        let (ctx_id, actor) = match self.require_joined().await {
-            Ok(v) => v,
-            Err(e) => return e,
-        };
-        let remote = match self.remote() {
-            Some(r) => r,
-            None => return "Error: shell requires --connect to server".to_string(),
-        };
-        let cmd_block_id = match actor.shell_execute(&req.command, ctx_id, false).await {
-            Ok(id) => id,
-            Err(e) => return format!("Error starting command: {e}"),
-        };
-
-        tracing::info!(
-            command = %req.command,
-            cmd_block = %cmd_block_id.to_key(),
-            ctx = %ctx_id,
-            "Context shell command dispatched"
-        );
-
-        let timeout_secs = req.timeout_secs.unwrap_or(300).min(600);
-        self.execute_and_poll_shell(
-            remote,
-            ctx_id,
-            cmd_block_id,
-            &req.command,
-            timeout_secs,
-            "Context shell command",
         )
         .await
         .to_json()

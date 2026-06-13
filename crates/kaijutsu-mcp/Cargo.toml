@@ -44,6 +44,6 @@ regex = { workspace = true }
 
 [dev-dependencies]
 # e2e tests stand up a real ephemeral SSH server and drive the full MCP
-# store-replica + poll path against it (see tests/e2e_context_shell.rs).
+# store-replica + poll path against it (see tests/e2e_shell.rs).
 kaijutsu-server = { path = "../kaijutsu-server" }
 log = { workspace = true }

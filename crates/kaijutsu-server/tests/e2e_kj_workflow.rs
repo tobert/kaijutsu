@@ -397,7 +397,7 @@ fn test_shell_echo_e2e() {
 }
 
 // ============================================================================
-// Exit code propagation (gates structured context_shell return)
+// Exit code propagation (gates structured shell return)
 // ============================================================================
 
 /// `shell_execute` must persist the kaish exit code on the ToolResult block.

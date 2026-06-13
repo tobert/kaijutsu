@@ -240,10 +240,10 @@ the drift with a submit — its own `submit_input` to that context, or an
 
 Workarounds for today, what would unbreak each.
 
-### `context_shell` returns structured JSON
+### `shell` returns structured JSON
 
-`context_shell` and `shell` return a JSON envelope, not bare stdout. Parse
-it; don't text-match the body.
+The `shell` tool returns a JSON envelope, not bare stdout. Parse it; don't
+text-match the body.
 
 ```json
 {
@@ -310,12 +310,12 @@ kj context switch <parent-label>
 ### Drift / fork / context live on `kj`, not as broker tools
 
 **Shape:** `tool_search "drift"`, `"fork"`, `"context"` return empty matches
-— by design. These verbs live in `kj` (via `context_shell`) rather than as
+— by design. These verbs live in `kj` (via `shell`) rather than as
 individual broker tools. The tool-surface footprint of lifting 30+ verbs
 into broker namespace was judged worse than keeping `kj` as the rich
 entry point. See `docs/kj-cleanup.md` for the locked direction.
 
-**How to use them:** drive `context_shell "kj …"`. The new structured return
+**How to use them:** drive `shell "kj …"`. The new structured return
 gives you `exit_code` for failure detection and `data` for structured
 results — no text-matching needed. Completion (bash/zsh/fish + in-process
 hooks) is a follow-up once kaish migrates to clap_derive.
@@ -328,30 +328,30 @@ A short recipe that exercises the basics: register, observe, fork, drift.
 # 1. Register and look around
 register_session label="orchestrator"
 kaish_exec whoami                              # confirm registered context
-context_shell "kj context list --tree"         # see the DAG (read result block)
+shell "kj context list --tree"         # see the DAG (read result block)
 
 # 2. Fork an explorer with a different binding
-context_shell "kj fork --name explorer --model anthropic/claude-haiku-4-5-20251001"
+shell "kj fork --name explorer --model anthropic/claude-haiku-4-5-20251001"
 # fork auto-switches — switch back:
-context_shell "kj context switch orchestrator"
+shell "kj context switch orchestrator"
 
 # 3. Send the explorer a starting prompt via drift
-context_shell 'kj drift push explorer "investigate the auth module"'
-context_shell "kj drift flush"
+shell 'kj drift push explorer "investigate the auth module"'
+shell "kj drift flush"
 
 # 4. Move to the explorer and let it think
-context_shell "kj context switch explorer"
+shell "kj context switch explorer"
 write_input text="investigate as instructed; report findings"
 submit_input
 # wait, then block_list to see the binding's response
 
 # 5. Pull the explorer's findings back
-context_shell "kj context switch orchestrator"
-context_shell 'kj drift pull explorer "summarize what you found"'
+shell "kj context switch orchestrator"
+shell 'kj drift pull explorer "summarize what you found"'
 # new drift block in orchestrator's history; submit again to use it
 ```
 
-Each `context_shell` call returns the structured JSON envelope. Read
+Each `shell` call returns the structured JSON envelope. Read
 `exit_code` to detect failures; read `data` when a `kj … list` /
 `kj … inspect` call provides one. The verbs themselves stay in `kj` —
 that namespace is the design center, not a transitional surface.

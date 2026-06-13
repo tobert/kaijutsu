@@ -460,8 +460,8 @@ CREATE TABLE IF NOT EXISTS context_binding_tools (
     PRIMARY KEY (context_id, instance_id, original_tool)
 );
 
--- Facade grants (Vec<String>) — non-broker tool surfaces (context_shell,
--- shell, *_input). order_idx preserves insertion order.
+-- Facade grants (Vec<String>) — non-broker tool surfaces (shell,
+-- *_input). order_idx preserves insertion order.
 CREATE TABLE IF NOT EXISTS context_binding_facades (
     context_id BLOB    NOT NULL REFERENCES context_bindings(context_id) ON DELETE CASCADE,
     facade_id  TEXT    NOT NULL,

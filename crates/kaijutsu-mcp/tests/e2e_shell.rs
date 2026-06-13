@@ -2,13 +2,13 @@
 //!
 //! These stand up a real ephemeral SSH server (the full SSH + Cap'n Proto
 //! stack) and drive `KaijutsuMcp` exactly as a connected agent would:
-//! `connect_with_config` → `register_session` → `context_shell`. This is the
+//! `connect_with_config` → `register_session` → `shell`. This is the
 //! layer that had no coverage — the in-`src` unit tests only exercise the
 //! local (no-server) input path, and the server-side integration tests use the
 //! raw `kernel.subscribe_output()` channel rather than the MCP's
 //! SyncManager-backed store replica + `execute_and_poll_shell`.
 //!
-//! The motivating bug: `context_shell` returned an empty `stdout` even though
+//! The motivating bug: `shell` returned an empty `stdout` even though
 //! the server produced output, because the completion poll read the store the
 //! instant it saw `Done` — before the background sync listener had applied the
 //! preceding text ops. A faithful e2e is the only thing that catches that
@@ -21,7 +21,7 @@ use tokio::net::TcpListener;
 use tokio::task::LocalSet;
 
 use kaijutsu_client::{KeySource, SshConfig};
-use kaijutsu_mcp::{ContextShellRequest, KaijutsuMcp, RegisterSessionRequest};
+use kaijutsu_mcp::{KaijutsuMcp, RegisterSessionRequest, ShellRequest};
 use kaijutsu_server::{SshServer, SshServerConfig};
 
 /// capnp-rpc requires a current-thread runtime with a LocalSet.
@@ -88,9 +88,9 @@ async fn register_with_retry(mcp: &KaijutsuMcp, label: &str) -> serde_json::Valu
 }
 
 /// The core regression guard: a command's stdout must survive the trip through
-/// the store replica and land in the `context_shell` envelope.
+/// the store replica and land in the `shell` envelope.
 #[test]
-fn context_shell_returns_stdout() {
+fn shell_returns_stdout() {
     run_local(async {
         let addr = start_server().await;
         let mcp = connect_mcp(addr).await;
@@ -102,7 +102,7 @@ fn context_shell_returns_stdout() {
         );
 
         let out = mcp
-            .context_shell(Parameters(ContextShellRequest {
+            .shell(Parameters(ShellRequest {
                 command: "echo hello".to_string(),
                 timeout_secs: Some(30),
             }))
@@ -131,7 +131,7 @@ fn context_shell_returns_stdout() {
 /// store replica diverging after the first command (stale frontier, stranded
 /// text ops).
 #[test]
-fn context_shell_sequential_commands() {
+fn shell_sequential_commands() {
     run_local(async {
         let addr = start_server().await;
         let mcp = connect_mcp(addr).await;
@@ -140,7 +140,7 @@ fn context_shell_sequential_commands() {
 
         for n in 1..=3 {
             let out = mcp
-                .context_shell(Parameters(ContextShellRequest {
+                .shell(Parameters(ShellRequest {
                     command: format!("echo line{n}"),
                     timeout_secs: Some(30),
                 }))

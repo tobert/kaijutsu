@@ -29,8 +29,8 @@ pub type ResolvedName = (InstanceId, String);
 /// app and external agents cross. The same [`ContextToolBinding::allows`]
 /// predicate is consulted there.
 ///
-/// Collapsed surfaces: `shell` covers both the `shell` and `context_shell` MCP
-/// tools (one `shell_execute` RPC); `edit_input` covers both `write_input` and
+/// Collapsed surfaces: `shell` is the single context-bound shell MCP tool (one
+/// `shell_execute` RPC); `edit_input` covers both `write_input` and
 /// `edit_input` (write is edit-with-full-delete). `read_input`
 /// (`get_input_state`) is intentionally **not** gated — reading compose text is
 /// benign and gating it traps the `write_input` handler, which reads before it
@@ -60,7 +60,7 @@ pub const KNOWN_AUTHORITIES: &[&str] = &["drive", "fork", "drift", "transport", 
 /// as `(instance, facade)` pairs.
 ///
 /// A facade like `shell` is reachable two ways that must share ONE capability:
-/// the RPC seam (the human shell box + the external MCP `context_shell`), gated
+/// the RPC seam (the human shell box + the external MCP `shell`), gated
 /// by `Broker::check_facade`; and a builtin broker tool the in-kernel LLM calls
 /// (`builtin.shell`), gated by [`ContextToolBinding::allows`]. The agent's tool
 /// roster is built from broker tools, which never included facades — so a

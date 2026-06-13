@@ -1,7 +1,7 @@
 //! MCP request and response types.
 //!
 //! Slim surface after the MCP cleanup (see docs/kj-cleanup.md):
-//! - shell / context_shell for command execution
+//! - shell for context-bound command execution
 //! - kaish_exec as the escape hatch into kernel tools
 //! - {read,write,edit,submit}_input for the shared input scratchpad
 //! - register_session, invoke_peer for peer/session concerns
@@ -34,29 +34,21 @@ fn default_empty_params() -> String {
     "{}".to_string()
 }
 
-/// Execute a kaish command through the kernel's embedded shell.
-/// Output is written to CRDT blocks and observable in kaijutsu-app.
+/// Execute a kaish command in the caller's kernel context. The shell is
+/// context-bound — `.` references the current context in kj commands, durable
+/// cwd/env carry across calls, and `kj` builtins are available for
+/// context/drift/fork management. Output is written to CRDT blocks and
+/// observable in kaijutsu-app.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ShellRequest {
-    /// The kaish command to execute (e.g., "cargo check", "git status", "ls -la")
-    #[schemars(description = "The kaish command to execute (e.g., 'cargo check', 'git status')")]
+    /// The kaish command to execute, run in your current kernel context
+    /// (e.g., "cargo check", "git status", "kj context list --tree",
+    /// "kj fork --name alt"). Standard kaish works: pipes, variables, scripting.
+    #[schemars(
+        description = "kaish command to execute in the current kernel context (e.g., 'cargo check', 'kj context list --tree')"
+    )]
     pub command: String,
     /// Timeout in seconds (default: 300)
-    #[schemars(description = "Timeout in seconds (default: 300, max: 600)")]
-    pub timeout_secs: Option<u64>,
-}
-
-/// Context-bound kaish shell. Commands execute in the caller's kernel context.
-/// kj builtins available for context/drift/fork management.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct ContextShellRequest {
-    /// kaish command to execute. The shell is bound to your current context.
-    /// kj commands are available (e.g., "kj context list --tree",
-    /// "kj fork --name alt", "kj drift push impl 'found it'").
-    /// Standard kaish also works (pipes, variables, scripting).
-    #[schemars(description = "kaish command to execute in the current kernel context")]
-    pub command: String,
-    /// Timeout in seconds (default: 300, max: 600)
     #[schemars(description = "Timeout in seconds (default: 300, max: 600)")]
     pub timeout_secs: Option<u64>,
 }

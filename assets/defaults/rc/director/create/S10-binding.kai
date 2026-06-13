@@ -22,8 +22,8 @@ kj binding allow "fork"
 kj binding allow "drift"
 kj binding allow "transport"
 kj binding allow "operator"
-# Facades: full interaction surface (shell + edit + submit). `shell` covers
-# both shell and context_shell; `edit_input` covers write_input too.
+# Facades: full interaction surface (shell + edit + submit). `shell` is the
+# context-bound shell tool; `edit_input` covers write_input too.
 kj binding allow "facade:shell"
 kj binding allow "facade:edit_input"
 kj binding allow "facade:submit_input"
