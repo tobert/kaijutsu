@@ -81,7 +81,7 @@ use kaijutsu_client::{
 };
 use kaijutsu_crdt::{BlockId, ContextId, ConversationDAG, PrincipalId};
 use kaijutsu_kernel::{SharedBlockStore, shared_block_store};
-use tokio::sync::Notify;
+use tokio::sync::watch;
 
 // Re-export public types
 use helpers::*;
@@ -255,9 +255,12 @@ pub struct RemoteState {
     /// `lock()`) and `lock()` is a cheap non-async critical section — held only
     /// for fast doc reads/applies, never across an `.await`.
     pub synced: Arc<parking_lot::Mutex<Option<SyncedDocument>>>,
-    /// Wake signal: the background listener calls `notify_waiters()` after each
-    /// applied event so waiters (e.g. the shell completion poll) re-read.
-    pub change: Arc<Notify>,
+    /// Wake signal: a monotonic generation counter the background listener bumps
+    /// (`send_modify`) after each applied event. Waiters (the shell completion
+    /// poll) `subscribe()` and `await changed()`. Unlike a bare `Notify`, the
+    /// watch channel records the version, so a bump between a waiter's state
+    /// check and its `changed().await` is not lost.
+    pub change: watch::Sender<u64>,
     /// Joined context state (None until register_session is called)
     pub joined: Arc<tokio::sync::RwLock<Option<JoinedContext>>>,
     /// Shared context_id for hook listener (updated by register_session)
@@ -422,7 +425,7 @@ impl KaijutsuMcp {
                 // SyncedDocument is built once the context is known, in
                 // register_session. `change` wakes the shell poll on each apply.
                 synced: Arc::new(parking_lot::Mutex::new(None)),
-                change: Arc::new(Notify::new()),
+                change: watch::channel(0u64).0,
                 joined: Arc::new(tokio::sync::RwLock::new(None)),
                 shared_context_id,
             }),
@@ -685,6 +688,10 @@ impl KaijutsuMcp {
         };
 
         // Phase 1 — wait until the ToolResult reaches a terminal status locally.
+        // Subscribe to the change generation BEFORE the first check: the watch
+        // channel records the version, so a bump that lands between our check
+        // and the `changed().await` below is still observed (no lost wakeup).
+        let mut change_rx = remote.change.subscribe();
         let local = loop {
             if let Some(snap) = find_terminal() {
                 break snap;
@@ -696,9 +703,9 @@ impl KaijutsuMcp {
                     elapsed_ms: start.elapsed().as_millis() as u64,
                 };
             }
-            // Wait on the change signal; the 500ms fallback bounds any Notify
-            // lost-wakeup between the check above and the wait registration.
-            let _ = tokio::time::timeout(fallback_interval, remote.change.notified()).await;
+            // Wait for the next applied event; the fallback tick is now just a
+            // safety net (the watch channel makes lost wakeups impossible).
+            let _ = tokio::time::timeout(fallback_interval, change_rx.changed()).await;
         };
 
         // Phase 2 — read the AUTHORITATIVE final block from the server. A shell
@@ -1007,7 +1014,7 @@ impl KaijutsuMcp {
             let mut event_rx = remote.actor.subscribe_events();
             let mut status_rx = remote.actor.subscribe_status();
             let synced_bg = Arc::clone(&remote.synced);
-            let change_bg = Arc::clone(&remote.change);
+            let change_bg = remote.change.clone();
             let actor_bg = remote.actor.clone();
             let ctx_id_bg = context_id;
 
@@ -1024,12 +1031,12 @@ impl KaijutsuMcp {
                                 if matches!(effect, Some(SyncEffect::NeedsResync)) {
                                     resync_synced(&actor_bg, &synced_bg, ctx_id_bg).await;
                                 }
-                                change_bg.notify_waiters();
+                                change_bg.send_modify(|g| *g = g.wrapping_add(1));
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                                 tracing::warn!("Missed {n} events, forcing full resync");
                                 resync_synced(&actor_bg, &synced_bg, ctx_id_bg).await;
-                                change_bg.notify_waiters();
+                                change_bg.send_modify(|g| *g = g.wrapping_add(1));
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         },
@@ -1040,7 +1047,7 @@ impl KaijutsuMcp {
                                     "Reconnected — resyncing MCP synced document",
                                 );
                                 resync_synced(&actor_bg, &synced_bg, ctx_id_bg).await;
-                                change_bg.notify_waiters();
+                                change_bg.send_modify(|g| *g = g.wrapping_add(1));
                             }
                             // A lagged status stream may have DROPPED a Connected
                             // transition — we can't tell, so resync to be safe.
@@ -1050,7 +1057,7 @@ impl KaijutsuMcp {
                                     "Status stream lagged ({n}) — resyncing in case a reconnect was missed",
                                 );
                                 resync_synced(&actor_bg, &synced_bg, ctx_id_bg).await;
-                                change_bg.notify_waiters();
+                                change_bg.send_modify(|g| *g = g.wrapping_add(1));
                             }
                             Ok(_) => {}
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => {}

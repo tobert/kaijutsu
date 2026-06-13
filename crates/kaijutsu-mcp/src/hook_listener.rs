@@ -325,7 +325,7 @@ impl HookListener {
                 tracing::warn!("Hook insert_block error: {e}");
             }
             drop(guard);
-            remote.change.notify_waiters();
+            remote.change.send_modify(|g| *g = g.wrapping_add(1));
         }
     }
 
@@ -409,7 +409,7 @@ impl HookListener {
                 }
             }
             drop(guard);
-            remote.change.notify_waiters();
+            remote.change.send_modify(|g| *g = g.wrapping_add(1));
         }
     }
 
