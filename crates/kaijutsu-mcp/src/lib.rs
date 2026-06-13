@@ -250,10 +250,11 @@ pub struct RemoteState {
     /// Send+Sync actor handle for RPC operations
     pub actor: ActorHandle,
     /// The single joined context's synced CRDT document — `None` until
-    /// `register_session`. Owns the `SyncManager`; the background listener is
-    /// the *only* writer, so reads see a consistent, in-order-applied snapshot
-    /// (out-of-order events are buffered+replayed by `SyncedDocument`).
-    pub synced: Arc<Mutex<Option<SyncedDocument>>>,
+    /// `register_session`. Owns the `SyncManager`. `parking_lot::Mutex`: the
+    /// guard never poisons (a panic under lock can't cascade-kill every later
+    /// `lock()`) and `lock()` is a cheap non-async critical section — held only
+    /// for fast doc reads/applies, never across an `.await`.
+    pub synced: Arc<parking_lot::Mutex<Option<SyncedDocument>>>,
     /// Wake signal: the background listener calls `notify_waiters()` after each
     /// applied event so waiters (e.g. the shell completion poll) re-read.
     pub change: Arc<Notify>,
@@ -420,7 +421,7 @@ impl KaijutsuMcp {
                 actor,
                 // SyncedDocument is built once the context is known, in
                 // register_session. `change` wakes the shell poll on each apply.
-                synced: Arc::new(Mutex::new(None)),
+                synced: Arc::new(parking_lot::Mutex::new(None)),
                 change: Arc::new(Notify::new()),
                 joined: Arc::new(tokio::sync::RwLock::new(None)),
                 shared_context_id,
@@ -467,7 +468,7 @@ impl KaijutsuMcp {
         match &self.backend {
             Backend::Local(store) => store.get(ctx).map(|e| f(&e.doc)),
             Backend::Remote(remote) => {
-                let guard = remote.synced.lock().expect("synced mutex poisoned");
+                let guard = remote.synced.lock();
                 // The Remote backend holds exactly one context. Honor the
                 // requested `ctx`: a query for a different context must miss
                 // (return None), not silently read the joined document.
@@ -486,7 +487,6 @@ impl KaijutsuMcp {
             Backend::Remote(remote) => remote
                 .synced
                 .lock()
-                .expect("synced mutex poisoned")
                 .as_ref()
                 .map(|d| vec![d.context_id()])
                 .unwrap_or_default(),
@@ -548,10 +548,7 @@ impl KaijutsuMcp {
         // the owned payload before dropping the lock — never hold it across the
         // push await below.
         let ops = {
-            let guard = remote
-                .synced
-                .lock()
-                .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
+            let guard = remote.synced.lock();
             let doc = guard
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("No synced document"))?;
@@ -674,7 +671,7 @@ impl KaijutsuMcp {
         // Completion check — finds the finished ToolResult child of our command
         // block (Done/Error) in the local SyncedDocument.
         let find_terminal = || -> Option<kaijutsu_crdt::BlockSnapshot> {
-            let guard = remote.synced.lock().expect("synced mutex poisoned");
+            let guard = remote.synced.lock();
             let doc = guard.as_ref()?;
             doc.blocks().into_iter().find(|b| {
                 b.parent_id.as_ref() == Some(&cmd_block_id)
@@ -996,7 +993,7 @@ impl KaijutsuMcp {
             Err(e) => return format!("Error building synced document: {e}"),
         };
         {
-            let mut g = remote.synced.lock().expect("synced mutex poisoned");
+            let mut g = remote.synced.lock();
             *g = Some(synced_doc);
         }
 
@@ -1021,7 +1018,7 @@ impl KaijutsuMcp {
                             Ok(event) => {
                                 // Apply under the lock, drop it before any await.
                                 let effect = {
-                                    let mut g = synced_bg.lock().expect("synced mutex poisoned");
+                                    let mut g = synced_bg.lock();
                                     g.as_mut().map(|s| s.apply_event(&event))
                                 };
                                 if matches!(effect, Some(SyncEffect::NeedsResync)) {
@@ -1667,7 +1664,7 @@ impl KaijutsuMcp {
 /// the apply re-takes the lock briefly.
 async fn resync_synced(
     actor: &ActorHandle,
-    synced: &Arc<Mutex<Option<SyncedDocument>>>,
+    synced: &Arc<parking_lot::Mutex<Option<SyncedDocument>>>,
     context_id: ContextId,
 ) {
     let sync_state = match actor.get_context_sync(context_id).await {
@@ -1677,7 +1674,7 @@ async fn resync_synced(
             return;
         }
     };
-    let mut guard = synced.lock().expect("synced mutex poisoned");
+    let mut guard = synced.lock();
     let Some(doc) = guard.as_mut() else {
         tracing::warn!(%context_id, "resync skipped — no synced document");
         return;

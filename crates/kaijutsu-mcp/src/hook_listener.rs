@@ -310,7 +310,7 @@ impl HookListener {
         }
         // Remote mode: author into the joined SyncedDocument, then wake waiters.
         if let Some(remote) = &self.remote {
-            let mut guard = remote.synced.lock().expect("synced mutex poisoned");
+            let mut guard = remote.synced.lock();
             if let Some(doc) = guard.as_mut()
                 && let Err(e) = doc.doc_mut().insert_block(
                     None,
@@ -381,7 +381,7 @@ impl HookListener {
         // Remote mode: author the call + result into the SyncedDocument under
         // one lock (sequentially, so the result's parent exists), then wake.
         if let Some(remote) = &self.remote {
-            let mut guard = remote.synced.lock().expect("synced mutex poisoned");
+            let mut guard = remote.synced.lock();
             if let Some(doc) = guard.as_mut() {
                 let call_id = match doc.doc_mut().insert_tool_call(
                     None,
@@ -485,10 +485,7 @@ async fn push_ops(remote: &RemoteState) -> anyhow::Result<()> {
     // Collect ops since the sync frontier from the SyncedDocument. Extract the
     // owned payload before dropping the lock — never hold it across the await.
     let ops = {
-        let guard = remote
-            .synced
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock error: {e}"))?;
+        let guard = remote.synced.lock();
         let doc = guard
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("No synced document"))?;

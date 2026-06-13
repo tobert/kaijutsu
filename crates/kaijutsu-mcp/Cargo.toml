@@ -19,6 +19,7 @@ kaijutsu-agent-tools.workspace = true
 kaijutsu-telemetry.workspace = true
 tokio.workspace = true
 futures.workspace = true
+parking_lot.workspace = true
 anyhow.workspace = true
 whoami.workspace = true
 clap.workspace = true
