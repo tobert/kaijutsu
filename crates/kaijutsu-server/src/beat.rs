@@ -872,6 +872,19 @@ impl BeatScheduler {
             ) {
                 log::warn!("beat: failed to surface schedule-error block for {ctx}: {insert_err}");
             }
+            // Quarantine the malformed phrase from future hydration windows so a
+            // windowed player can't copy its own bad output next turn. The block
+            // stays in the durable log (forward-only record); the anchored Error
+            // block above — NOT excluded — still carries the rejection feedback,
+            // so the player reads *that* it failed without re-reading *what* it
+            // got wrong. Takes effect next turn (rehydrate_windowed re-reads the
+            // excluded flag). Best-effort: a failed exclude just means the bad
+            // phrase lingers in the window, not corruption.
+            if let Err(excl_err) = self.documents.set_excluded(ctx, &block_id, true) {
+                log::warn!(
+                    "beat: failed to exclude malformed phrase {block_id} for {ctx}: {excl_err}"
+                );
+            }
         }
     }
 
@@ -1841,6 +1854,17 @@ mod tests {
             errors_after.last().unwrap().parent_id,
             Some(bad),
             "the schedule-error block points back at the player's output block"
+        );
+        // The malformed phrase is quarantined: excluded from future hydration
+        // windows so the model can't copy its own bad ABC next turn. The block
+        // stays in the durable log; the Error block above carries the feedback.
+        let bad_snap = documents
+            .get_block_snapshot(ctx, &bad)
+            .unwrap()
+            .expect("the offending output block still exists in the log");
+        assert!(
+            bad_snap.excluded,
+            "a phrase that fails to schedule must be excluded from future hydration"
         );
     }
 
