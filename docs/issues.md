@@ -42,15 +42,6 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   at `fork`, where an rc script decides to elide thinking or downgrade it to
   plain blocks.
 
-## Event Plumbing (FlowBus) — June 2026 audit
-
-- **`SyncReset` never emitted (intentional, note only):** per-block DTE
-  stores skip compaction so `sync_generation` stays 0 (`rpc.rs:3988`); the
-  client receive path is dormant. Now unit-tested
-  (`synced_document.rs::test_sync_reset_clears_pending_then_recovers`: reset
-  clears the out-of-order buffer + `NeedsResync` + apply_sync_state recovers),
-  so the machinery won't silently rot until compaction returns.
-
 ## Drift — June 2026 audit
 
 - **Extract `ContextRegistry` from `DriftRouter`:** DriftRouter carries ~7
@@ -94,44 +85,14 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ## Persistence & Sync
 
-- **Post-restart oplog journaling gap — RESOLVED as observation artifact,
-  hardening remains (forensics 2026-06-11): no data loss.** Two confirmed
-  mechanisms produced the misread: (1) timezone double-count — the single
-  Jun 10 restart at 11:30:03 EDT logs itself as `15:30:03Z` and was counted
-  as two restarts ("11:30 and 15:30"); the "afternoon" block activity was
-  14:42–15:08Z = 10:42–11:08 EDT, exactly where the oplog "ends". (2) WAL
-  invisibility — `kernel.db`'s main file was last checkpointed 11:08 while
-  ~4.1 MB of newer ops sat only in `kernel.db-wal`; the kernel never
-  checkpoints proactively (`kernel_db.rs:797-799`), so any bare-file read
-  shows history frozen at the last checkpoint. Post-restart journaling
-  verified working: seq numbering continued at 189, compaction snapshot at
-  11:48:39, and the 11:48 smoke-test block was decoded out of oplog seq
-  197. Hardening (Chameleon batch 1 — the block log becomes the
-  stamp-turn WAL):
-  - DONE (2026-06-11) — fail-loud guard. The five journaling writes
-    (`journal_op`, `compact_document`, `write_initial_snapshot`,
-    `journal_and_maybe_compact_input`, `compact_input_doc`) routed through
-    `BlockStore::journaling_db()`: a store that declares persistence
-    (`with_db*`, `persistent = true`) with no db handle now returns
-    `NoDatabaseConfigured` instead of silently dropping the op; replica
-    stores (`new`/`with_flows`) keep their legitimate no-op. Guard test
-    `persistent_store_journaling_without_db_fails_loud` (red-first).
-  - DONE (2026-06-11) — `PRAGMA wal_checkpoint(TRUNCATE)` after compaction
-    via `KernelDb::checkpoint()`, called from `compact_document` /
-    `compact_input_doc`, so the main file stops lagging. Tests:
-    `kernel_db::checkpoint_truncates_wal`, `block_store::test_durability_across_kill`
-    (insert via real paths, leak/forget the connection to simulate SIGKILL,
-    reopen a fresh connection, `load_from_db`, assert everything present).
-  - REMAINING — graceful-shutdown WAL checkpoint. `SharedKernelState::drop`
-    does a best-effort checkpoint, but it only fires on a clean process exit;
-    the server's `run()` loop never returns and the process dies on
-    SIGKILL/SIGTERM without unwinding, so systemd `stop` skips it. The
-    proactive compaction checkpoint covers durability (no loss either way);
-    this gap only affects bare-file forensics between the last compaction and
-    shutdown. Fix: a `tokio::signal` SIGTERM handler that checkpoints before
-    exit (needs the run loop to become interruptible — bigger than the rest).
-  - Forensics hygiene: tracing logs UTC, systemd speaks local — cite both
-    zones when recording restarts in issue notes.
+- **Graceful-shutdown WAL checkpoint on SIGTERM:** `SharedKernelState::drop`
+  checkpoints only on clean exit, but the server `run()` loop never returns and
+  dies on SIGKILL/SIGTERM without unwinding, so systemd `stop` skips it.
+  Proactive compaction checkpoints cover durability (no data loss); this gap
+  only affects bare-file forensics between the last compaction and shutdown.
+  Fix: a `tokio::signal` SIGTERM handler that checkpoints before exit (needs the
+  run loop to become interruptible). Forensics hygiene: tracing logs UTC,
+  systemd speaks local — cite both zones when recording restart times.
 - **`KernelDb` connection pool:** Currently `Arc<parking_lot::Mutex<KernelDb>>` (`block_store.rs:74`). This bottleneck prevents utilizing SQLite's WAL mode for concurrent readers. Migrate to `r2d2` or `sqlx` to allow non-blocking reads during LLM streams and heavy writes. Note: SQLite serializes *writes* regardless of pooling, so the win is concurrent reads (and only with WAL enabled) — verify WAL before assuming a pool helps; narrowing lock scope may matter as much.
 - **Config CRDT ops:** Config backend needs DTE integration so changes replicate across peers.
 - **`blocks_ordered()` allocation churn + sort:** `block_store.rs:185-188` calls `order_key().to_string()` for *every block*, then `sort_by` on the strings — so it's O(N log N) **plus a String allocation per block per call**. It runs on per-frame hot paths (`kaijutsu-app/src/ui/card_stack/sync.rs:48`, `view/components.rs:163`), so the allocation churn is likely the bigger cost than the asymptotics. Fixes: compare `order_key` without stringifying, and/or cache the ordering and invalidate on block change. Add a secondary sorted index when scale demands.
@@ -318,41 +279,8 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   per-context window tuning (`HEARD_WINDOW_PHRASES` is a const). `content_before`
   in `ResolverCtx` stays deliberately track-blind regardless (no resolver reads
   it; `CasCommitResolver` reads CAS by hash).
-- **RC-driven hydration marker — SHIPPED first cut (Chameleon batch 2,
-  2026-06-11):** the cost guard for the per-phrase report blocks mechanism 4
-  writes. A windowed context hydrates only `[0, marker] ∪ last-window` instead
-  of its whole history. As built: `select_hydration_window` (`llm/mailbox.rs`,
-  fail-safe on stale marker) + a `context_hydration` table
-  (`set/get/clear_hydration_policy`) + `ConversationMailbox::rehydrate_windowed`
-  (per-turn rebuild, prefix byte-stable) wired into `process_llm_stream` (also
-  cold-start, so restart-safe) + `kj context hydrate --window/--mark/--clear`
-  (Operator-gated) + the composer `S30-hydrate.kai` create seed (`--window 16`).
-  Declarative window (the tail slides in memory; row upserted only at create +
-  durable revision, no per-turn hook).
-
-  **Independent review 2026-06-12 (Fable + Gemini 3.1 Pro + DeepSeek V4-Pro,
-  unanimous). CRITICAL + HIGH batch FIXED (TDD):**
-  - **[FIXED] CRITICAL — windowed→full scramble.** The mailbox persists across
-    turns; after a windowed turn `seen` has a hole where the archived middle was,
-    so a later un-windowed `catch_up` (via `--clear`, or a fail-safe-to-None on
-    DB-read failure / unparseable marker) folded the middle and *appended* it
-    after the tail → out-of-order wire `[prefix, tail, …middle]` (silent
-    corruption). Fix: `ConversationMailbox.windowed` flag; `catch_up` rebuilds
-    from scratch on the windowed→full transition. Test
-    `catch_up_after_windowed_rebuilds_full_in_chronological_order`.
-  - **[FIXED] HIGH — `--mark` not validated against the context.** A parseable
-    but non-existent marker persisted durably, then fail-safe-to-whole-log every
-    turn = cost guard silently OFF forever. Fix: `context_hydrate` now verifies
-    the block exists in the target ctx (`get_block_snapshot`) before persisting.
-  - **[FIXED] HIGH — `--window 0` dropped the current turn.** Prefix-only wire,
-    so the just-inserted prompt never reached the model. Fix: verb rejects
-    `--window 0`; `get_hydration_policy` reads a 0/negative row as None (corrupt
-    → hydrate everything).
-  - **[FIXED] HIGH — stale marker was silent.** The doc claimed "the caller logs
-    the anomaly"; none did. Fix: `rehydrate_windowed` now `warn!`s (recurring,
-    every turn) when the marker doesn't resolve and windowing is bypassed.
-
-  **Player spawn = thin fork + rc-rebuilds (LOCKED 2026-06-12).** Resolves
+- **Player spawn = thin fork + rc-rebuilds (hydration marker SHIPPED + review-
+  hardened 2026-06-12; design LOCKED 2026-06-12).** Resolves
   "fork drops the hydration policy" — see the "Players are rc programs" decision
   in `docs/chameleon.md`. A player is spawned by a `spawn`-preset fork
   (`kj fork --preset spawn` per `docs/fork-filters.md`; formerly `--shallow`)
@@ -367,41 +295,14 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   - **Lock now (small):** `composer/fork/S30-hydrate.kai` (rebuild + re-mark)
     and confirm a composer fork is thin. `kj transport ooda on|off --context`
     already exists, so transport-follow (arm child / disarm parent) is pure rc.
-  - **Verify in code first:** the disarm-parent → `fork` → arm-child **ordering
-    race** across the beat scheduler's tick. **VERIFIED 2026-06-12 (Opus +
-    DeepSeek review) — REAL, and it needs Rust: the rotate *trigger* cannot be
-    pure rc.** Root cause: `fire_tick` (`beat.rs:659`) spawns the `tick` rc
-    fire-and-forget (`spawn_local`), and `kj transport ooda off` only *enqueues*
-    `BeatCommand::SetOoda{P,false}` on the same ingress the single-task scheduler
-    reads — so the parent's disarm is **asynchronous relative to the scheduler's
-    own clock**. Between firing tick T (which spawns the rotate rc) and that
-    `SetOoda` being dequeued, the scheduler keeps P armed and keeps ticking it.
-    Failure modes: (1) **stray parent ticks** — extra `tick` rc runs (token spend
-    + turn requests) on a context that already forked away, until the disarm
-    lands; the `phrase mod N` gate blocks a *second* rotate in the common case,
-    so usually ≤1 stray tick. (2) **double-fork** — only pathological (disarm
-    delayed ≥ a full rotate period, or `ooda_every ≥ N·beats_per_phrase` so
-    consecutive ooda ticks both hit the horizon). `biased` select only *reduces*
-    the window (a ready disarm wins over a ready deadline); it is not the root and
-    cannot close it. **Two fixes evaluated:** an "atomic Rotate `BeatCommand`"
-    does NOT close it (still async via ingress — only fixes the child-armed-while-
-    parent-armed half-state, not the stray ticks); a rotate-specific in-flight
-    latch works only if the scheduler knows the rotate condition. **Cleanest:
-    move the horizon decision into the scheduler** — e.g.
-    `BeatCommand::RotateOnPhrase { parent, modulus, child_preset }` stored in
-    `BeatState`, checked synchronously in `fire_due` at ooda time, disarming the
-    parent + arming the child atomically with zero async gap. So `composer/fork/`
-    setup stays rc, but the *detach-at-horizon trigger* is Rust. **IMPLEMENTED
-    2026-06-12:** `BeatCommand::SetRotate{ctx, every_phrases}` +
-    `BeatState.rotate_every_phrases` + `kj transport rotate --every N | off`; at a
-    phrase horizon where `phrase % N == 0`, `fire_due` `stop`s the parent
-    synchronously (not re-pushed → no further ticks) and reports `rotate_due`
-    (suppressing a coincident `ooda_due`), and the run loop fires the `rotate` rc
-    lifecycle fire-and-forget. The rotate ACTION (a `composer/rotate/*.kai` that
-    forks `--preset spawn` + arms the child) is still rc and unwritten — when it
-    lands it's race-free because the parent is already stopped. Tests: scheduler
-    (`rotate_horizon_retires_parent_synchronously`, `rotate_cadence_gates_on_the_
-    modulus`, `no_rotate_when_cadence_unset`) + verb (`transport_rotate_*`).
+  - **Rotate action rc (unwritten):** the scheduler-side detach-at-horizon
+    trigger is built — `BeatCommand::SetRotate{ctx, every_phrases}` +
+    `kj transport rotate --every N | off`; at a phrase horizon (`phrase % N == 0`)
+    `fire_due` `stop`s the parent synchronously (no further ticks) and fires the
+    `rotate` rc lifecycle. Still unwritten: the rotate ACTION itself, a
+    `composer/rotate/*.kai` that forks `--preset spawn` + arms the child. Race-free
+    when it lands (the parent is already stopped). (The ordering race that forced
+    the trigger into Rust rather than pure rc is closed by this synchronous stop.)
   - **Build when convenient — the windowed-notation pull primitive.** No
     cross-context block-copy verb exists today; a player carrying recent
     notation into its thin-forked child needs one. This is the *same* windowed
@@ -428,62 +329,19 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 - **Fork primitives — full/thin mental model (Amy, 2026-06-12).** Full fork
   (regular `kj fork`) is the *powerful* path: take the whole context into a fresh
   lineage = a **new KV cache** (resume-a-session-as-another-model, orchestrator
-  repair, drift-a-summary-back). Thin fork is *reuse/reduce*: save tokens for
-  a long-running iterating player (now the `window`/`spawn` factory presets
-  per `docs/fork-filters.md`; `--shallow` retiring, `--compact` unchanged).
-  Copy cost is a non-issue (storage cheap); the axis is KV-cache strategy.
-  Two unbuilt primitives this model implied (both since designed):
-  - **[DONE 2026-06-12] `kj fork --exclude <block>…` on FULL fork** (commit
-    c51544d). `fork_full` now routes through `fork_document_filtered` with
-    `exclude_block_ids` when `--exclude` is given (else the plain unfiltered copy,
-    zero overhead). Fail-loud validation (parses + exists in source, like
-    `--mark`). The orchestrator-repair case works. Scoped to full fork at the
-    time; superseded by the fork-filters algebra (`docs/fork-filters.md`) where
-    `--exclude` composes with any base — block-key form stays a dedicated flag,
-    ranges arrive with `--include`/`--exclude <range>`.
-  - **[RESOLVED 2026-06-12 #2] Empty-selection fork seeds `next_tick = 0` —
-    that's correct, not a hazard (Amy's call).** A `spawn` (or `--compact`)
-    fork copies ~nothing, so there's nothing to seed from and the child's
-    timeline starts at tick 0. A `spawn` is a *birth*, not a rotation: a fresh
-    player has no prior segment to be continuous with, so tick 0 is the right
-    floor. The tick-continuity invariant (`docs/chameleon.md`) is a property of
-    **rotation**, where the fork carries a tail window — that fork copies the
-    max-tick block, so `fork_filtered` already seeds `next_tick` past it from
-    the *copied* set (`block_store.rs` ~L1511, the batch-1 f1-track fix);
-    unchanged and correct. DuplicateBlock can't arise from a low tick anyway —
-    block identity is `(context, principal, seq)` and the child holds a fresh
-    `context_id`. The one open edge is a *partial* selection that drops the
-    max-tick tail while keeping earlier ticked blocks (no composer preset does
-    this today); decide rotation-vs-fresh intent if such a preset ever lands.
-  - **[FOUNDATION FIXED 2026-06-12 #2, slice 2c — field retirement still
-    slice 4] `fork_filtered` truncated in the WRONG order.** `fork_filtered`
-    now builds its positional universe in document (`order_key`) order, so the
-    `selection` keep-set AND `max_blocks` index the timeline, not BlockId
-    order. `max_blocks` is correct in the interim (test:
-    `fork_filtered_max_blocks_keeps_most_recent_by_timeline`); the field is
-    marked deprecated and is retired in slice 4, spelled `--include end-N:`.
-    Original analysis preserved below. Two orders exist:
-    `BlockId` Ord is `(context_id, principal_id, seq)`, so `BTreeMap<BlockId>`
-    iteration (what `fork_filtered` walks at `block_store.rs:1475`) is
-    **principal-major, seq-minor**; document order is `order_key` (derived from
-    `tick`), exposed canonically by `block_ids_ordered()` (`:191`). The
-    `max_blocks` truncation comment (`:1489`, "keep the most recent (by
-    order_key, since BTreeMap is ordered)") asserts a **false equivalence** —
-    BTreeMap is ordered by BlockId, not order_key. They coincide only for a
-    single principal whose seq tracks tick; they diverge for **any
-    multi-principal context** (beat()+player, multiple models, drift author,
-    multi-user — the normal case), where `.skip(skip)` keeps one principal's
-    tail, not the N most recent by timeline. Live only via `kj fork
-    --depth`/`--shallow` (`fork.rs:426`) — the flag already slated for
-    retirement. `fork`/`fork_at_version` copy *all* blocks (each keeps its own
-    order_key, child re-sorts), so they're unaffected; `fork_filtered` is the
-    only position-dependent path. **Fix (chosen): fold `--depth N` into the
-    selection engine as `--include end-N:` over the `block_ids_ordered()`
-    snapshot (correct by construction), retire the `max_blocks` field. Add a
-    test proving position ≠ BlockId order on a multi-principal log so the
-    divergence can't silently return.** The comment is not an intentional
-    design choice — it contradicts the crate's own documented order model
-    (`block_store.rs:79–91`: "ordering is the successor-key axis").
+  repair, drift-a-summary-back). Thin fork is *reuse/reduce*: save tokens for a
+  long-running iterating player (the `window`/`spawn` factory presets per
+  `docs/fork-filters.md`). Copy cost is a non-issue (storage cheap); the axis is
+  KV-cache strategy. Remaining open primitives:
+  - **Retire the `max_blocks` fork field (slice 4):** `fork_filtered` now builds
+    its positional universe in document (`order_key`) order, so `max_blocks`
+    indexes the timeline correctly in the interim (test
+    `fork_filtered_max_blocks_keeps_most_recent_by_timeline`), but the field is
+    only deprecated, not removed. Fold `--depth N` into the selection engine as
+    `--include end-N:` over the `block_ids_ordered()` snapshot and delete the
+    field. (BlockId order is `(context, principal, seq)` — principal-major; it
+    only coincides with timeline order for a single principal, so a multi-principal
+    `max_blocks` over raw BTreeMap iteration was the original bug.)
   - **A snapshot/savepoint marker verb (speculative, not-now — direction set
     2026-06-12).** Absorbed by the fork-filters range grammar as a future
     **label endpoint** (`docs/fork-filters.md`): a savepoint is a colon-free
@@ -491,20 +349,6 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
     — no new fork machinery, no verb semantics of its own. Still not-now;
     build labels when the orchestrator work or the time-well wants named
     points.
-  - **[RESOLVED 2026-06-12] What shape does a thin fork copy?** Answered by
-    the fork-filters design (`docs/fork-filters.md`): there is no single
-    "thin shape" — the kernel primitive is an **interval selection** over the
-    ordered block log (`kept = (base ∩ ∪inc) \ ∪exc`, order-free, resolved at
-    fork instant), and the shapes are **factory presets**: `window` = the
-    hydration keep-set `[0,P] ∪ tail` (prefix-preserving — the KV-reuse /
-    API-chair case; loud error if the parent has no policy row) and `spawn` =
-    ~nothing (rc-rebuilds — the player case; fresh bytes are the *feature*,
-    that's the horizon-latch edit channel). The rc-rebuilds-vs-prefix tension
-    dissolves: different intents, chosen per fork. last-N is retired with
-    `--shallow`/`--depth` (spelled `--include end-N:`). Hydration policy row
-    travels whenever the marked block survives the selection (mechanical
-    `(principal, seq)` remap) — which also resolves "fork drops the policy"
-    by construction. Coding plan in `tsugi.md`.
   - **Presets as a deep kaijutsu concept (design thread, 2026-06-12).**
     Preset = a named **ensemble of argument values**, not a behavior — the
     audio patch-recall model (hit "e-piano", every knob moves, same synth).
@@ -531,22 +375,6 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
     (after the prefix, cache-stable), tool-pair integrity. Consumers:
     `rehydrate_windowed`, fork selection, the pull primitive. Contract in
     `docs/fork-filters.md`.
-  - **[FIXED 2026-06-12] Fail-loud on corrupt/unreadable policy.** The
-    DB-read-failure path and corrupt stored policy (unparseable marker / window
-    < 1) used to degrade silently to full history. Now `get_hydration_policy`
-    returns `Err(Validation)` on corruption and `process_llm_stream` fails the
-    turn (publishes `TurnFlow::Failed`) on any policy-read error — a silent
-    fallback on a safety mechanism is worse than a loud stop. The **runtime**
-    stale-marker case (marker parses + names a real block id, but it's absent
-    from the log — e.g. the block was excluded) is *deliberately* kept as
-    loud-warn + fail-safe-to-whole-log: that's the one genuine "show more, never
-    corrupt" case, and failing it would kill a composer just because a block was
-    excluded. (Tests: `hydration_policy_{zero_window,unparseable_marker}_is_loud_error`.)
-  - **RAM/disk accumulates — and that's fine (LOCKED 2026-06-12).** Windowing
-    bounds *tokens*, not memory; cold start loads the full log to window it.
-    Rotation-for-space is **dropped** (storage on btrfs+sqlite is cheap; blocks
-    stay real and stored so the app shows the whole performance). The thin fork
-    is for lean-spawn/structure, not storage — see the player-spawn block above.
   - **`window` counts RAW blocks, not turns/phrases** (~2-3 blocks per OODA turn,
     and composer score/Trace blocks are hydration-silent so the *visible* tail is
     smaller still) — revisit if a phrase/turn-denominated window reads cleaner.
@@ -665,12 +493,6 @@ the *remaining* findings, triaged.
   where a block authored mid-resync is still lost — cleanest via a command
   channel that makes the bg task the true sole writer (authoring + push + resync
   all serialized in one task).
-- **[DONE 2026-06-13] bg event-listener panic silently swallowed** — supervisor
-  task now awaits the JoinHandle and logs warn/debug/error by outcome (`2a16fdf`).
-- **[DONE 2026-06-13] `std::sync::Mutex` poisoning / thread-block** — `synced`
-  moved to `parking_lot::Mutex` (`72e686d`).
-- **[DONE 2026-06-13] Notify lost-wakeup** — `change` is now a `watch::Sender<u64>`
-  generation counter; poll subscribes then `await changed()` (`3870a23`).
 - **MED — multi-context operations silently collapse to one in Remote.**
   `search_context`, `list_resources`, the `kaijutsu://docs` reader, and
   completions call `context_ids()`, which in Remote returns only the single
