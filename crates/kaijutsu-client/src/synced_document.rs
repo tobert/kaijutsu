@@ -651,6 +651,71 @@ mod tests {
         assert!(!sd.is_synced());
     }
 
+    /// Fuller coverage of the SyncReset receive path (server-side SyncReset is
+    /// dormant — compaction is skipped — so this is the only exercise of the
+    /// machinery, docs/issues.md): a buffered out-of-order event must be
+    /// discarded on reset, and a subsequent apply_sync_state must recover.
+    #[test]
+    fn test_sync_reset_clears_pending_then_recovers() {
+        let ctx = test_context_id();
+        let server = create_server_store(ctx);
+        let state = SyncState {
+            context_id: ctx,
+            version: 1,
+            ops: snapshot_bytes(&server),
+        };
+        let mut sd = SyncedDocument::from_sync_state(&state, test_principal_id()).unwrap();
+        assert!(sd.is_synced());
+        let blocks_before = sd.block_count();
+
+        // Buffer an out-of-order event for a block the client doesn't know yet
+        // (its BlockInserted hasn't arrived).
+        let unknown = {
+            let mut other = create_server_store(ctx);
+            other
+                .insert_block(
+                    None,
+                    None,
+                    Role::Model,
+                    BlockKind::Text,
+                    "not yet inserted client-side",
+                    Status::Running,
+                    ContentType::Plain,
+                )
+                .unwrap()
+        };
+        let effect = sd.apply_event(&ServerEvent::BlockStatusChanged {
+            context_id: ctx,
+            block_id: unknown,
+            status: kaijutsu_types::Status::Running,
+        });
+        assert!(matches!(effect, SyncEffect::Updated { .. }));
+        assert_eq!(sd.pending_events.len(), 1, "out-of-order event should buffer");
+
+        // SyncReset: needs a full resync AND discards the now-stale buffer.
+        let effect = sd.apply_event(&ServerEvent::SyncReset {
+            context_id: ctx,
+            generation: 7,
+        });
+        assert_eq!(effect, SyncEffect::NeedsResync);
+        assert!(!sd.is_synced());
+        assert!(
+            sd.pending_events.is_empty(),
+            "SyncReset must clear the pending buffer"
+        );
+
+        // Recover from a fresh server snapshot.
+        let recovered = SyncState {
+            context_id: ctx,
+            version: 2,
+            ops: snapshot_bytes(&server),
+        };
+        let effect = sd.apply_sync_state(&recovered).unwrap();
+        assert!(matches!(effect, SyncEffect::FullSync { .. }));
+        assert!(sd.is_synced());
+        assert_eq!(sd.block_count(), blocks_before);
+    }
+
     #[test]
     fn test_apply_event_text_via_snapshot() {
         // Per-block DTE: after merge_ops creates a block from snapshot,

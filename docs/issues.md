@@ -45,9 +45,11 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 ## Event Plumbing (FlowBus) — June 2026 audit
 
 - **`SyncReset` never emitted (intentional, note only):** per-block DTE
-  stores skip compaction so `sync_generation` stays 0 (`rpc.rs:3988`);
-  client receive paths exist but are untested live machinery. Revisit when
-  compaction returns.
+  stores skip compaction so `sync_generation` stays 0 (`rpc.rs:3988`); the
+  client receive path is dormant. Now unit-tested
+  (`synced_document.rs::test_sync_reset_clears_pending_then_recovers`: reset
+  clears the out-of-order buffer + `NeedsResync` + apply_sync_state recovers),
+  so the machinery won't silently rot until compaction returns.
 
 ## Drift — June 2026 audit
 
