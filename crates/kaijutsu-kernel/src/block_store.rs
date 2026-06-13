@@ -283,12 +283,17 @@ impl BlockStore {
         }
     }
 
-    /// Create a block store with unified KernelDb persistence and FlowBus.
+    /// Create a block store with unified KernelDb persistence and both FlowBuses.
+    ///
+    /// Takes `input_flows` by value (not a forgettable `set_input_flows` call):
+    /// the input-doc bus is wired at construction so input events can't silently
+    /// vanish because a setter was missed.
     pub fn with_db_and_flows(
         db: DbHandle,
                 default_workspace_id: WorkspaceId,
         principal_id: PrincipalId,
         block_flows: SharedBlockFlowBus,
+        input_flows: SharedInputDocFlowBus,
     ) -> Self {
         Self {
             documents: DashMap::new(),
@@ -302,7 +307,7 @@ impl BlockStore {
                         default_workspace_id: Some(default_workspace_id),
             principal_id: RwLock::new(principal_id),
             block_flows: Some(block_flows),
-            input_flows: None,
+            input_flows: Some(input_flows),
             #[cfg(test)]
             fail_insert_countdown: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -2384,11 +2389,6 @@ impl BlockStore {
     // =========================================================================
     // Input Document Operations
     // =========================================================================
-
-    /// Set the input document flow bus.
-    pub fn set_input_flows(&mut self, bus: SharedInputDocFlowBus) {
-        self.input_flows = Some(bus);
-    }
 
     /// Get the input flow bus.
     pub fn input_flows(&self) -> Option<&SharedInputDocFlowBus> {

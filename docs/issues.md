@@ -44,10 +44,6 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ## Event Plumbing (FlowBus) — June 2026 audit
 
-- **`InputDocFlow` wiring is optional by construction:**
-  `block_store.rs:204` holds `Option<SharedInputDocFlowBus>`; forget
-  `set_input_flows()` and input events silently vanish. Consider
-  constructor injection.
 - **`SyncReset` never emitted (intentional, note only):** per-block DTE
   stores skip compaction so `sync_generation` stays 0 (`rpc.rs:3988`);
   client receive paths exist but are untested live machinery. Revisit when

@@ -668,9 +668,13 @@ fn create_block_store_with_kernel_db(
     block_flows: SharedBlockFlowBus,
     input_flows: SharedInputDocFlowBus,
 ) -> Result<SharedBlockStore, String> {
-    let mut inner =
-        BlockStore::with_db_and_flows(db, default_workspace_id, principal_id, block_flows);
-    inner.set_input_flows(input_flows);
+    let inner = BlockStore::with_db_and_flows(
+        db,
+        default_workspace_id,
+        principal_id,
+        block_flows,
+        input_flows,
+    );
     let store = Arc::new(inner);
     store.load_from_db().map_err(|e| {
         format!("Failed to load documents from DB (refusing to start with empty store): {e}")
@@ -2083,7 +2087,7 @@ impl kernel::Server for KernelImpl {
             // Uses tokio::select! to multiplex block + input doc events on one callback
             tokio::task::spawn_local(async move {
                 let mut block_sub = block_flows.subscribe("block.*");
-                // Input flows are optional (only present if set_input_flows was called)
+                // Input flows are optional at this subscription site.
                 let mut input_sub = input_flows.map(|f| f.subscribe("input.*"));
                 log::debug!(
                     "Started FlowBus subscription for kernel {} (input_flows={})",
