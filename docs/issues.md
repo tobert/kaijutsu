@@ -60,7 +60,9 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   exist" takes a dependency on drift, inverting the hierarchy. Pull
   register/resolve/list/llm-config/trace-id into a `ContextRegistry`;
   drift keeps the queues. Cold-start hydration (`rpc.rs:1150-1183`) moves
-  with the registry.
+  with the registry. (Considered 2026-06-13; deferred — it's a cohesive
+  multi-file extraction touching drift.rs + rpc.rs + every "what contexts
+  exist" caller, best done when the kernel isn't under concurrent edit.)
 - **`drift_flush` is non-atomic over the router lock:** takes the write
   lock four separate times (`kj/drift.rs:422`, `:510`, `:516`, `:521`),
   allowing interleaving with concurrent stage/cancel between windows.
