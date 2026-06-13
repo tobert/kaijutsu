@@ -15,7 +15,7 @@ use crate::cell::block_border::{
 use crate::cell::BlockCell;
 use crate::input::FocusArea;
 use crate::ui::theme::Theme;
-use crate::view::block_render::BlockScene;
+use crate::view::vello_ui_texture::VelloUiScene;
 use crate::view::components::{MsdfOverlayText, OverlayCursorGeometry};
 
 /// Plugin that registers shader effect materials and sync systems.
@@ -40,7 +40,7 @@ fn sync_block_fx(
             Has<MsdfOverlayText>,
             Has<crate::view::shell_dock::MsdfShellDockText>,
             Option<&OverlayCursorGeometry>,
-            Option<&BlockScene>,
+            Option<&VelloUiScene>,
             Option<&BlockExcludedState>,
         ),
         Or<(With<BlockCell>, With<MsdfOverlayText>, With<crate::view::shell_dock::MsdfShellDockText>)>,

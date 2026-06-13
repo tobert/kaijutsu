@@ -262,11 +262,8 @@ pub fn spawn_block_cells(
                     BlockCell::new(*block_id),
                     BlockCellLayout::default(),
                     crate::view::block_render::BlockScene::default(),
-                    crate::view::block_render::BlockTexture {
-                        image: Handle::default(),
-                        width: 1,
-                        height: 1,
-                    },
+                    crate::view::vello_ui_texture::VelloUiScene::default(),
+                    crate::view::vello_ui_texture::VelloUiTexture::default(),
                     crate::text::msdf::MsdfBlockGlyphs::default(),
                     crate::text::msdf::BlockRenderMethod::default(),
                     ImageNode::default(),

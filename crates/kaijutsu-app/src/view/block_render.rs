@@ -12,7 +12,7 @@ use bevy::prelude::*;
 use bevy::render::{
     Extract, ExtractSchedule, Render, RenderApp, RenderSystems,
     render_asset::RenderAssets,
-    render_resource::{Extent3d, PipelineCache, TextureDimension, TextureFormat, TextureUsages},
+    render_resource::PipelineCache,
     renderer::{RenderDevice, RenderQueue},
     texture::GpuImage,
 };
@@ -43,21 +43,23 @@ use crate::view::vello_ui_texture::{VelloUiScene, VelloUiTexture};
 // COMPONENTS
 // ============================================================================
 
-/// Per-block rendering state. Stores the built vello scene and metadata.
+/// Per-block content + bookkeeping (the build-decision side of a block cell).
+///
+/// The rasterizable scene + built dimensions live on the sibling
+/// [`VelloUiScene`]; this component carries only what the *build* systems need
+/// to decide when to rebuild (content versions, formatted text, color). The
+/// name is historical — it no longer holds a scene; rename to `BlockContent` is
+/// a tracked follow-up.
 #[derive(Component)]
 pub struct BlockScene {
-    /// The complete vello scene: text + border + rich content.
-    pub scene: vello::Scene,
     /// Content version from sync_block_cell_buffers.
     pub content_version: u64,
     /// Content version that was last built into a scene.
     pub last_built_version: u64,
-    /// Monotonic counter bumped each time the scene is rebuilt.
+    /// Monotonic counter bumped each rebuild. Double duty: drives the MSDF
+    /// glyph version (= scene_version) and, on the Vello path, is copied into
+    /// `VelloUiScene.version` to gate vello rasterization.
     pub scene_version: u64,
-    /// Logical width the scene was built at.
-    pub built_width: f32,
-    /// Logical height from text measurement (includes border padding).
-    pub built_height: f32,
     /// Formatted text content (set by sync_block_cell_buffers).
     pub text: String,
     /// Text color (set by sync_block_cell_buffers).
@@ -67,49 +69,13 @@ pub struct BlockScene {
 impl Default for BlockScene {
     fn default() -> Self {
         Self {
-            scene: vello::Scene::new(),
             content_version: 0,
             last_built_version: 0,
             scene_version: 0,
-            built_width: 0.0,
-            built_height: 0.0,
             text: String::new(),
             color: Color::WHITE,
         }
     }
-}
-
-/// Per-block GPU texture handle and dimensions (physical pixels).
-#[derive(Component)]
-pub struct BlockTexture {
-    pub image: Handle<Image>,
-    pub width: u32,
-    pub height: u32,
-}
-
-// ============================================================================
-// RENDER WORLD TYPES
-// ============================================================================
-
-/// A single extracted block scene ready for GPU rendering.
-struct ExtractedBlockSceneItem {
-    scene: vello::Scene,
-    image_handle: Handle<Image>,
-    width: u32,
-    height: u32,
-    /// Logical width the scene was built at (before scale/clamp).
-    built_width: f32,
-    /// Logical height the scene was built at (before scale/clamp).
-    built_height: f32,
-    version: u64,
-}
-
-/// Resource holding extracted block scenes and version tracking.
-#[derive(Resource, Default)]
-pub struct ExtractedBlockScenes {
-    items: Vec<ExtractedBlockSceneItem>,
-    /// Last successfully rendered version per image handle.
-    last_rendered: HashMap<AssetId<Image>, u64>,
 }
 
 // ============================================================================
@@ -148,31 +114,24 @@ impl Plugin for BlockRenderPlugin {
             return;
         };
 
+        // Block cells + MSDF text surfaces rasterize their vello scene via the
+        // generic VelloUiTexturePlugin (extract_vello_scenes / render_vello_scenes);
+        // this plugin owns only the MSDF compositing pass, which runs *after* the
+        // generic vello render so borders/content land in the texture first.
         render_app
-            .init_resource::<ExtractedBlockScenes>()
             .init_resource::<ExtractedMsdfAtlas>()
             .init_resource::<ExtractedMsdfBlockData>()
             .init_resource::<ExtractedMsdfRenderParams>()
             .add_systems(
                 ExtractSchedule,
-                (
-                    extract_block_scenes,
-                    extract_msdf_atlas,
-                    extract_msdf_blocks,
-                    extract_msdf_render_params,
-                ),
+                (extract_msdf_atlas, extract_msdf_blocks, extract_msdf_render_params),
             )
             .add_systems(
                 Render,
-                (
-                    render_block_textures
-                        .in_set(RenderSystems::Render)
-                        .run_if(|scenes: Res<ExtractedBlockScenes>| !scenes.items.is_empty()),
-                    render_msdf_block_textures
-                        .in_set(RenderSystems::Render)
-                        .after(render_block_textures)
-                        .run_if(|msdf: Res<ExtractedMsdfBlockData>| !msdf.items.is_empty()),
-                ),
+                render_msdf_block_textures
+                    .in_set(RenderSystems::Render)
+                    .after(crate::view::vello_ui_texture::render_vello_scenes)
+                    .run_if(|msdf: Res<ExtractedMsdfBlockData>| !msdf.items.is_empty()),
             );
     }
 
@@ -260,27 +219,6 @@ pub struct GpuTextureLimits {
     pub max_texture_dim: u32,
 }
 
-/// Create a render-target texture with the required format and usage flags.
-pub fn create_block_texture(images: &mut Assets<Image>, w: u32, h: u32) -> Handle<Image> {
-    let size = Extent3d {
-        width: w.max(1),
-        height: h.max(1),
-        depth_or_array_layers: 1,
-    };
-    let mut image = Image::new(
-        size,
-        TextureDimension::D2,
-        vec![0u8; (size.width * size.height * 4) as usize],
-        TextureFormat::Rgba8Unorm,
-        default(),
-    );
-    image.texture_descriptor.usage = TextureUsages::TEXTURE_BINDING
-        | TextureUsages::COPY_DST
-        | TextureUsages::STORAGE_BINDING
-        | TextureUsages::RENDER_ATTACHMENT;
-    images.add(image)
-}
-
 // ============================================================================
 // MAIN WORLD SYSTEMS
 // ============================================================================
@@ -295,6 +233,7 @@ pub fn build_block_scenes(
         (
             Entity,
             &mut BlockScene,
+            &mut VelloUiScene,
             &ComputedNode,
             &mut Node,
             Option<&RichContent>,
@@ -333,7 +272,7 @@ pub fn build_block_scenes(
     let rainbow_phase = (time.elapsed_secs() * 0.25) % 1.0;
 
     for (
-        entity, mut block_scene, computed, mut node, rich, border, vis, effects,
+        entity, mut block_scene, mut ui_scene, computed, mut node, rich, border, vis, effects,
         mut msdf_glyphs, mut render_method, excluded_state,
     ) in block_cells.iter_mut()
     {
@@ -352,7 +291,7 @@ pub fn build_block_scenes(
         // and don't need CPU-side scene rebuilds AFTER the first build. But we must
         // rebuild once when the flag first becomes true so msdf_glyphs.rainbow is set.
         let version_changed = block_scene.content_version != block_scene.last_built_version;
-        let width_changed = (block_scene.built_width - width).abs() > 1.0;
+        let width_changed = (ui_scene.built_width - width).abs() > 1.0;
         let is_rainbow = effects.is_some_and(|e| e.rainbow);
         let has_animation = border.is_some_and(|b| b.animation != BorderAnimation::None);
         let never_built = block_scene.last_built_version == 0;
@@ -788,11 +727,21 @@ pub fn build_block_scenes(
             node.height = target_height;
         }
 
-        block_scene.scene = scene;
-        block_scene.built_width = width;
-        block_scene.built_height = total_height;
+        ui_scene.scene = scene;
+        ui_scene.built_width = width;
+        ui_scene.built_height = total_height;
         block_scene.last_built_version = block_scene.content_version;
         block_scene.scene_version = block_scene.scene_version.wrapping_add(1);
+
+        // Gate vello rasterization to Vello blocks. MSDF cells leave
+        // `ui_scene.version` untouched so the generic extract skips their (empty)
+        // scene — `render_msdf_block_textures` clears the texture itself
+        // (`has_vello_content == false`). Vello blocks adopt `scene_version` so
+        // the extract's `version > last_rendered` gate fires. This reproduces the
+        // old `render_method != Msdf` extract skip.
+        if *render_method == BlockRenderMethod::Vello {
+            ui_scene.version = block_scene.scene_version;
+        }
     }
 }
 
@@ -850,11 +799,11 @@ pub fn build_role_group_scenes(
 /// Resize block textures to match physical pixel dimensions.
 ///
 /// Runs after build_block_scenes so built_width/built_height are up to date.
-/// Block cells update their `BlockFxMaterial` texture binding.
-/// Role group borders update their `ImageNode` directly.
+/// Block cells (and the MSDF overlay/shell-dock text surfaces) update their
+/// `BlockFxMaterial` texture binding alongside the `ImageNode`.
 pub fn resize_block_textures(
     mut block_query: Query<
-        (&BlockScene, &mut BlockTexture, &MaterialNode<BlockFxMaterial>, &mut ImageNode),
+        (&VelloUiScene, &mut VelloUiTexture, &MaterialNode<BlockFxMaterial>, &mut ImageNode),
         (
             Or<(With<BlockCell>, With<crate::view::components::MsdfOverlayText>, With<crate::view::shell_dock::MsdfShellDockText>)>,
             Without<RoleGroupBorder>,
@@ -876,13 +825,16 @@ pub fn resize_block_textures(
             continue;
         }
 
-        let target_w = (scene.built_width * scale).ceil() as u32;
-        let target_h = (scene.built_height * scale).ceil() as u32;
-        let target_w = target_w.clamp(1, max_dim);
-        let target_h = target_h.clamp(1, max_dim);
+        let (target_w, target_h) = crate::view::vello_ui_texture::vello_texture_dims(
+            scene.built_width,
+            scene.built_height,
+            scale,
+            max_dim,
+        );
 
         if texture.width != target_w || texture.height != target_h {
-            let new_handle = create_block_texture(&mut images, target_w, target_h);
+            let new_handle =
+                crate::view::vello_ui_texture::create_vello_texture(&mut images, target_w, target_h);
             if let Some(mat) = fx_materials.get_mut(&mat_node.0) {
                 mat.texture = new_handle.clone();
             }
@@ -939,131 +891,6 @@ pub fn resize_role_group_textures(
 // ============================================================================
 // RENDER WORLD SYSTEMS
 // ============================================================================
-
-/// Extract dirty block scenes from the main world.
-///
-/// Runs in ExtractSchedule. Compares scene_version against last rendered
-/// version to determine which scenes need GPU re-rendering.
-pub fn extract_block_scenes(
-    mut extracted: ResMut<ExtractedBlockScenes>,
-    query: Extract<Query<(
-        &BlockScene,
-        &BlockTexture,
-        Option<&BlockRenderMethod>,
-    )>>,
-) {
-    extracted.items.clear();
-
-    for (scene, texture, render_method) in query.iter() {
-        if scene.scene_version == 0 {
-            continue;
-        }
-
-        // MSDF blocks skip Vello entirely — text is rendered by the MSDF pass.
-        // Borders will be replaced by shader-drawn borders later; borderless for now.
-        if render_method == Some(&BlockRenderMethod::Msdf) {
-            continue;
-        }
-
-        let asset_id = texture.image.id();
-        let last = extracted.last_rendered.get(&asset_id).copied().unwrap_or(0);
-        if scene.scene_version > last {
-            extracted.items.push(ExtractedBlockSceneItem {
-                scene: scene.scene.clone(),
-                image_handle: texture.image.clone(),
-                width: texture.width,
-                height: texture.height,
-                built_width: scene.built_width,
-                built_height: scene.built_height,
-                version: scene.scene_version,
-            });
-        }
-    }
-}
-
-/// Render extracted block scenes to their per-block textures.
-///
-/// Runs in the Render schedule. Locks VelloRenderer once and renders all
-/// dirty blocks, then unlocks.
-pub fn render_block_textures(
-    mut extracted: ResMut<ExtractedBlockScenes>,
-    renderer: Res<crate::view::vello_rasterizer::VelloRasterizer>,
-    device: Res<RenderDevice>,
-    queue: Res<RenderQueue>,
-    gpu_images: Res<RenderAssets<GpuImage>>,
-    render_settings: Res<crate::view::vello_rasterizer::VelloRasterizerSettings>,
-) {
-    if extracted.items.is_empty() {
-        return;
-    }
-
-    let Ok(mut vello_renderer) = renderer.lock() else {
-        warn!("Failed to lock VelloRasterizer for block texture rendering");
-        return;
-    };
-
-    let items: Vec<_> = extracted.items.drain(..).collect();
-
-    for item in items {
-        let Some(gpu_image) = gpu_images.get(&item.image_handle) else {
-            // GpuImage not ready yet — don't update last_rendered so
-            // next frame's extract will re-include this scene.
-            continue;
-        };
-
-        if item.width == 0 || item.height == 0 {
-            continue;
-        }
-
-        let params = vello::RenderParams {
-            base_color: vello::peniko::Color::TRANSPARENT,
-            width: item.width,
-            height: item.height,
-            antialiasing_method: render_settings.antialiasing,
-        };
-
-        // Scale the Vello scene to match physical texture dimensions.
-        // This handles both:
-        // - High-DPI (texture is larger than logical scene due to scale_factor)
-        // - max_dim clamping (texture is smaller than logical scene)
-        // Without scaling, Vello content (borders, SVG) would be misaligned
-        // with MSDF text which renders in NDC and inherently fills the texture.
-        let sx = item.width as f64 / item.built_width.max(1.0) as f64;
-        let sy = item.height as f64 / item.built_height.max(1.0) as f64;
-        let needs_scale = (sx - 1.0).abs() > 0.001 || (sy - 1.0).abs() > 0.001;
-
-        let fitted_scene;
-        let scene_to_render = if needs_scale {
-            fitted_scene = {
-                let mut s = vello::Scene::new();
-                s.append(
-                    &item.scene,
-                    Some(Affine::scale_non_uniform(sx, sy)),
-                );
-                s
-            };
-            &fitted_scene
-        } else {
-            &item.scene
-        };
-
-        if let Err(e) = vello_renderer.render_to_texture(
-            device.wgpu_device(),
-            &queue,
-            scene_to_render,
-            &gpu_image.texture_view,
-            &params,
-        ) {
-            warn!("Block texture render failed: {e}");
-            continue;
-        }
-
-        // Track successful render
-        extracted
-            .last_rendered
-            .insert(item.image_handle.id(), item.version);
-    }
-}
 
 /// Render MSDF text glyphs to per-block textures.
 ///
@@ -1230,8 +1057,8 @@ fn extract_msdf_blocks(
         Query<(
             &MsdfBlockGlyphs,
             &BlockRenderMethod,
-            &BlockScene,
-            &BlockTexture,
+            &VelloUiScene,
+            &VelloUiTexture,
         )>,
     >,
 ) {

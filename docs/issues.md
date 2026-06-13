@@ -141,6 +141,15 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ## User Interface (kaijutsu-app) & UX
 
+- **Rename `BlockScene` → `BlockContent`:** after bevy_vello-escape phase 4 it no
+  longer holds a scene (scene + `built_*` moved to `VelloUiScene`); it's now pure
+  build-bookkeeping (`content_version`/`last_built_version`/`scene_version`/
+  `text`/`color`). Name is misleading. Mechanical rename across `block_render.rs`,
+  `lifecycle.rs`, `overlay.rs`, `shell_dock.rs`, `render.rs`.
+- **Verify Vello-content cell composite (bevy_vello-escape phase 4):** confirm an
+  ABC/SVG/sparkline *cell* (`has_vello_content == true`) rasterizes via
+  `render_vello_scenes` then composites MSDF labels on top — needs a conversation
+  with rich content; verified all MSDF-only surfaces but not this combination.
 - **User presence (novel surface):** The compose input is a shared CRDT document. Surfacing in-flight compose state to an opted-in model would enable mid-sentence collaboration. Gate with explicit user opt-in.
 - **Connection Polling Efficiency:** `ActorPlugin` in `crates/kaijutsu-app/src/connection/mod.rs` polls broadcast channels every frame. While `UpdateMode::reactive` helps, consider event-driven wakeups or bridging async streams directly into Bevy events more efficiently if latency/power becomes an issue.
 - **Card-stack view:** Card size tuning, read-only scroll on focused card, dive-in (Enter), mouse click to focus, momentum scrolling, camera parallax, streaming card texture updates, card grouping evolution, ambient environment.

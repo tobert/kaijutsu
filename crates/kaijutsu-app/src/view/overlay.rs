@@ -18,7 +18,8 @@ use crate::shaders::BlockFxMaterial;
 use crate::text::msdf::{BlockRenderMethod, FontDataMap, MsdfBlockGlyphs, collect_msdf_glyphs};
 use crate::text::{ShapingFonts, TextMetrics, bevy_color_to_brush};
 use crate::ui::theme::Theme;
-use crate::view::block_render::{BlockScene, BlockTexture};
+use crate::view::block_render::BlockScene;
+use crate::view::vello_ui_texture::{VelloUiScene, VelloUiTexture};
 use crate::view::components::OverlayCursorGeometry;
 
 // ============================================================================
@@ -103,11 +104,8 @@ pub fn spawn_input_overlay(
             parent.spawn((
                 MsdfOverlayText,
                 BlockScene::default(),
-                BlockTexture {
-                    image: Handle::default(),
-                    width: 1,
-                    height: 1,
-                },
+                VelloUiScene::default(),
+                VelloUiTexture::default(),
                 MsdfBlockGlyphs::default(),
                 BlockRenderMethod::Msdf,
                 ImageNode::default(),
@@ -211,6 +209,7 @@ pub fn build_overlay_glyphs(
     mut msdf_children: Query<
         (
             &mut BlockScene,
+            &mut VelloUiScene,
             &mut MsdfBlockGlyphs,
             &BlockBorderStyle,
             &ComputedNode,
@@ -234,6 +233,7 @@ pub fn build_overlay_glyphs(
         for child in children.iter() {
             let Ok((
                 mut block_scene,
+                mut ui_scene,
                 mut msdf_glyphs,
                 border_style,
                 computed,
@@ -253,7 +253,7 @@ pub fn build_overlay_glyphs(
             // cursor-only requires just geometry recomputation.
             let display = overlay.display_text();
             let cursor_byte_offset = overlay.display_cursor_offset();
-            let width_changed = (block_scene.built_width - width).abs() > 1.0;
+            let width_changed = (ui_scene.built_width - width).abs() > 1.0;
             let text_changed = block_scene.text != display;
             let cursor_changed = cursor_geom.last_cursor_offset != cursor_byte_offset;
             let new_kind = crate::input::vim::mode_kind(overlay.vim_mode.as_deref());
@@ -333,8 +333,8 @@ pub fn build_overlay_glyphs(
                 // Round to physical pixel boundary — see block_render.rs comment.
                 let scale = text_metrics.scale_factor;
                 let total_height = ((content_height + pad.top + pad.bottom) * scale).round() / scale;
-                block_scene.built_width = width;
-                block_scene.built_height = total_height;
+                ui_scene.built_width = width;
+                ui_scene.built_height = total_height;
                 block_scene.text = display.to_string();
                 block_scene.color = text_color;
                 block_scene.content_version = block_scene.content_version.wrapping_add(1);

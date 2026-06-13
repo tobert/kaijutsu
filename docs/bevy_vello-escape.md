@@ -197,10 +197,32 @@ Known costs of the 3D direction, none new:
         dedicated `resize_role_group_textures` (shared `vello_texture_dims`).
         They now ride `extract_vello_scenes`/`render_vello_scenes`; the block
         extract/render still serves cells until step 4.
-     4. **[TODO]** Split `BlockScene` (render fields → `VelloUiScene`,
-        bookkeeping stays) across cells + `view/overlay.rs` +
-        `view/shell_dock.rs` + `shaders/mod.rs` (reads `built_*`); delete
-        `block_render`'s own extract/render. The hot path — verified alone.
+     4. **[DONE — `BlockTexture` deleted]** Split `BlockScene`: render fields
+        (`scene`/`built_*`) → `VelloUiScene`; bookkeeping (`content_version`/
+        `last_built_version`/`scene_version`/`text`/`color`) stays. Swapped
+        `BlockTexture`→`VelloUiTexture` across cells + `view/overlay.rs` +
+        `view/shell_dock.rs` (also read by the MSDF extract + material binding);
+        `shaders/mod.rs` reads `built_*` off `VelloUiScene`. Deleted
+        `block_render`'s `extract_block_scenes`/`render_block_textures`/
+        `create_block_texture`; cells now ride the generic extract/render, with
+        `render_msdf_block_textures` ordered `.after(render_vello_scenes)`.
+        **MSDF gate:** `scene_version` (bumped every rebuild) stays the monotonic
+        base for `msdf_glyphs.version`; `VelloUiScene.version` is set
+        `= scene_version` ONLY on the Vello path, so MSDF cells leave it
+        untouched and the generic extract skips their empty scene (the MSDF pass
+        clears the texture itself via `has_vello_content == false`) — exactly the
+        old `render_method != Msdf` skip.
+
+        Verified live: block-cell MSDF text (+rainbow), role border, chat overlay
+        (+breathing-border material), shell dock (+accent-border material), both
+        docks. **Not yet exercised:** a Vello-content *cell* (ABC/SVG/sparkline,
+        `has_vello_content == true`) where `render_vello_scenes` rasterizes the
+        scene and MSDF composites labels on top — needs a real conversation with
+        rich content. Logic unchanged vs. old path (same composite, same
+        ordering); only the texture component was renamed.
+
+   `BlockScene` is now misnamed (holds no scene) — rename to `BlockContent` is a
+   tracked follow-up (docs/issues.md).
 
      The `VelloView` marker, `VelloPlugin`, chrome `FontHandles`, and the
      `UiVelloText` in `tiling_reconciler` stay until steps 3–4 + the
