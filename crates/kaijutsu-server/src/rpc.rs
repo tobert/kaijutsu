@@ -1366,31 +1366,32 @@ pub async fn create_shared_kernel(
         subscription_registry: Arc::new(parking_lot::Mutex::new(HashMap::new())),
     };
 
-    // Genesis bootstrap: a brand-new kernel (nothing recovered above) is unusable
-    // until something creates the first context. Rather than require a manual
-    // `kj context create` or a client-side dialog, seed one fully-privileged
-    // `coder` context here — the broad rc loadout (drive/fork/drift/transport/
-    // operator + the coder stance). Trigger is strictly *zero contexts at cold
-    // start*; once any context exists this never fires. Fail-loud: a kernel that
-    // can't seed its first context is broken, same stance as the recovery read above.
+    // ROOT bootstrap: a brand-new kernel (nothing recovered above) has no
+    // contexts. Seed a single `director` context, `ROOT` — the binding-admin
+    // root of the tree (admin + rc-write). ROOT deliberately *can't* drive LLM
+    // turns (a director loadout has no drive/fork authority); the operator
+    // creates a coder (or any other type) from it when a conversational context
+    // is needed. Trigger is strictly *zero contexts at cold start*; once any
+    // context exists this never fires. Fail-loud: a kernel that can't seed its
+    // root context is broken, same stance as the recovery read above.
     if all_contexts.is_empty() {
-        let genesis_id = ContextId::new();
+        let root_id = ContextId::new();
         log::info!(
-            "No contexts at cold start — seeding genesis coder context {}",
-            genesis_id.short()
+            "No contexts at cold start — seeding ROOT director context {}",
+            root_id.short()
         );
         create_context_inner(
             &shared,
-            genesis_id,
-            "coder",
-            Some("genesis"),
+            root_id,
+            "director",
+            Some("ROOT"),
             PrincipalId::system(),
             None,
             SessionId::new(),
         )
         .await
         .map_err(|e| {
-            capnp::Error::failed(format!("failed to seed genesis context: {e}"))
+            capnp::Error::failed(format!("failed to seed ROOT context: {e}"))
         })?;
     }
 

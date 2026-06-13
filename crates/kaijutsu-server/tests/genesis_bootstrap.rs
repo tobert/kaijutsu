@@ -1,6 +1,8 @@
-//! Genesis bootstrap: a brand-new kernel (empty data dir → zero contexts)
-//! seeds exactly one fully-privileged `coder` context at cold start, so the
-//! app is usable without a manual `kj context create`.
+//! ROOT bootstrap: a brand-new kernel (empty data dir → zero contexts) seeds
+//! exactly one `director` context, `ROOT`, at cold start — the binding-admin
+//! root of the tree. ROOT deliberately can't drive turns itself (no drive/fork
+//! authority); the operator creates a coder (or any other type) from it when a
+//! conversational context is needed.
 //!
 //! Trigger is strictly *zero contexts at cold start* — once any context exists
 //! the `all_contexts.is_empty()` guard suppresses reseeding (recovery loads the
@@ -10,11 +12,11 @@
 use kaijutsu_types::PrincipalId;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn empty_kernel_seeds_one_genesis_coder_context() {
+async fn empty_kernel_seeds_one_root_director_context() {
     let tmp = tempfile::tempdir().unwrap();
 
     // config_dir = None → embedded rc/config defaults; data_dir = fresh tempdir
-    // → an empty KernelDb, so the genesis bootstrap must fire.
+    // → an empty KernelDb, so the ROOT bootstrap must fire.
     let shared = kaijutsu_server::rpc::create_shared_kernel(None, Some(tmp.path()))
         .await
         .expect("create_shared_kernel should succeed on an empty data dir");
@@ -27,29 +29,29 @@ async fn empty_kernel_seeds_one_genesis_coder_context() {
     assert_eq!(
         contexts.len(),
         1,
-        "an empty kernel should seed exactly one genesis context, got {}",
+        "an empty kernel should seed exactly one ROOT context, got {}",
         contexts.len()
     );
 
-    let genesis = &contexts[0];
+    let root = &contexts[0];
     assert_eq!(
-        genesis.context_type, "coder",
-        "genesis must be a coder context (the fully-privileged loadout)"
+        root.context_type, "director",
+        "ROOT must be a director context (the binding-admin loadout)"
     );
     assert_eq!(
-        genesis.label.as_deref(),
-        Some("genesis"),
-        "genesis context should carry the 'genesis' label"
+        root.label.as_deref(),
+        Some("ROOT"),
+        "the bootstrap context should carry the 'ROOT' label"
     );
     assert_eq!(
-        genesis.created_by,
+        root.created_by,
         PrincipalId::system(),
-        "genesis is authored by the system principal"
+        "ROOT is authored by the system principal"
     );
 
     // The full create recipe ran: the Conversation document exists for it.
     assert!(
-        shared.documents.contains(genesis.context_id),
-        "genesis context must have its Conversation document created"
+        shared.documents.contains(root.context_id),
+        "ROOT context must have its Conversation document created"
     );
 }
