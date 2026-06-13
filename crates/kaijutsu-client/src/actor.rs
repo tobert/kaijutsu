@@ -1261,6 +1261,13 @@ struct RpcActor {
     context_id: Option<ContextId>,
     /// Context returned by the most recent `join_context`.
     joined_context_id: Option<ContextId>,
+    /// Peer registration the actor re-establishes on every reconnect. Set by
+    /// the `AttachPeer` command and persisted, mirroring `context_id` — the
+    /// kernel's `PeerRegistry` resets on restart, so without this the app
+    /// becomes uninvokable after a kernel cycle until it respawns
+    /// (tech_debt_peer_reattach_on_reconnect). The `Sender` is cheap to clone
+    /// and the capnp callback is rebuilt from it on each attach.
+    peer_registration: Option<(PeerConfig, std::sync::mpsc::Sender<PeerInvocation>)>,
 
     /// Owned during `Connected`. Replaced atomically on successful handshake.
     connection: Option<ConnectionState>,
@@ -1303,6 +1310,7 @@ impl RpcActor {
             bound_kernel_id: None,
             context_id,
             joined_context_id: None,
+            peer_registration: None,
             connection: None,
             ping_task: None,
             connecting_task: None,
@@ -1367,6 +1375,7 @@ impl RpcActor {
             self.context_id,
             self.instance.clone(),
             self.event_tx.clone(),
+            self.peer_registration.clone(),
         );
         self.connecting_task = Some(task);
         self.broadcast_state();
@@ -1575,6 +1584,33 @@ impl RpcActor {
                         }
                         let _ = reply.send(result);
                     }
+                    .instrument(span),
+                );
+            }
+            RpcCommand::AttachPeer {
+                config,
+                invocation_tx,
+                reply,
+            } => {
+                // Remember the registration so the actor re-attaches on every
+                // reconnect (mirrors how `context_id` drives re-join). Clone for
+                // storage, then dispatch the attach itself as usual. Clones of
+                // `conn` are taken before the `self` mutation so the immutable
+                // borrow is released first.
+                let client = conn.client.clone();
+                let kernel = conn.kernel.clone();
+                self.peer_registration = Some((config.clone(), invocation_tx.clone()));
+                tokio::task::spawn_local(
+                    dispatch_kernel_command(
+                        RpcCommand::AttachPeer {
+                            config,
+                            invocation_tx,
+                            reply,
+                        },
+                        client,
+                        kernel,
+                        close_tx,
+                    )
                     .instrument(span),
                 );
             }
@@ -1794,9 +1830,10 @@ fn spawn_handshake(
     context_id: Option<ContextId>,
     instance: String,
     event_tx: broadcast::Sender<ServerEvent>,
+    peer_registration: Option<(PeerConfig, std::sync::mpsc::Sender<PeerInvocation>)>,
 ) -> JoinHandle<ConnectOutcome> {
     tokio::task::spawn_local(async move {
-        connect_handshake(config, context_id, instance, event_tx).await
+        connect_handshake(config, context_id, instance, event_tx, peer_registration).await
     })
 }
 
@@ -1805,6 +1842,7 @@ async fn connect_handshake(
     context_id: Option<ContextId>,
     instance: String,
     event_tx: broadcast::Sender<ServerEvent>,
+    peer_registration: Option<(PeerConfig, std::sync::mpsc::Sender<PeerInvocation>)>,
 ) -> ConnectOutcome {
     // 1. SSH dial + auth + channel open (with per-phase deadline).
     let client = match tokio::time::timeout(SSH_DIAL_TIMEOUT, connect_ssh(config)).await {
@@ -1879,6 +1917,23 @@ async fn connect_handshake(
     } else {
         None
     };
+
+    // 3.5. Re-attach as a peer if a registration is remembered, so the kernel's
+    //      PeerRegistry repopulates after a restart (the original
+    //      tech_debt_peer_reattach_on_reconnect). Only fires on reconnects —
+    //      `peer_registration` is None until the app's first `attach_peer`,
+    //      which lands after the initial connect. Best-effort: a failure here
+    //      must NOT abort an otherwise-healthy handshake (peers are a
+    //      convenience, and the kernel may simply not be ready for the callback
+    //      yet); we log and continue rather than forcing another reconnect.
+    if let Some((cfg, inv_tx)) = &peer_registration {
+        match tokio::time::timeout(RPC_CALL_TIMEOUT, kernel.attach_peer(cfg, inv_tx.clone())).await
+        {
+            Ok(Ok(_)) => log::info!("Re-attached peer '{}' on connect", cfg.nick),
+            Ok(Err(e)) => log::warn!("peer re-attach failed (non-fatal): {e}"),
+            Err(_) => log::warn!("peer re-attach timed out (non-fatal)"),
+        }
+    }
 
     // 4. Subscribe to block + resource events in parallel under a single
     //    deadline. If either fails, the whole handshake fails — we don't
