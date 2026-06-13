@@ -24,6 +24,7 @@ pub mod scroll;
 pub mod submit;
 pub mod sync;
 pub mod vello_rasterizer;
+pub mod vello_ui_texture;
 
 // Re-export all public types
 pub use components::*;

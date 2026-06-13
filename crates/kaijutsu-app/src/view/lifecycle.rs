@@ -393,12 +393,8 @@ pub fn sync_role_headers(
             .spawn((
                 RoleGroupBorder { role, block_id },
                 RoleGroupBorderLayout::default(),
-                crate::view::block_render::BlockScene::default(),
-                crate::view::block_render::BlockTexture {
-                    image: Handle::default(),
-                    width: 1,
-                    height: 1,
-                },
+                crate::view::vello_ui_texture::VelloUiScene::default(),
+                crate::view::vello_ui_texture::VelloUiTexture::default(),
                 ImageNode::default(),
                 Node {
                     width: Val::Percent(100.0),

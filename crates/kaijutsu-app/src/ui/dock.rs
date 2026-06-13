@@ -1,6 +1,7 @@
 //! Vello-drawn dock bars (North + South).
 //!
-//! Each dock is a single Bevy entity with `UiVelloScene`. All text is drawn
+//! Each dock is a single Bevy entity with `VelloUiScene` + `VelloUiTexture` +
+//! `ImageNode` (the kaijutsu-owned vello→texture primitive). All text is drawn
 //! directly into the Vello scene — no child entities, no flex layout for widgets.
 //!
 //! `DockState` resource holds all widget data. Data-gathering systems write to
@@ -10,8 +11,11 @@
 use std::collections::VecDeque;
 
 use bevy::prelude::*;
-use bevy_vello::prelude::UiVelloScene;
 use crate::text::shaping::{VelloFont, VelloTextAlign, VelloTextStyle};
+use crate::view::block_render::GpuTextureLimits;
+use crate::view::vello_ui_texture::{
+    VelloUiScene, VelloUiTexture, create_vello_texture, vello_texture_dims,
+};
 use vello::kurbo::Affine;
 use vello::peniko::Fill;
 
@@ -322,7 +326,9 @@ pub fn spawn_docks(
                 ..default()
             },
             BorderColor::all(theme.border),
-            UiVelloScene::default(),
+            ImageNode::default(),
+            VelloUiScene::default(),
+            VelloUiTexture::default(),
             GlobalZIndex(crate::constants::ZLayer::HUD),
         ))
         .id();
@@ -339,7 +345,9 @@ pub fn spawn_docks(
                 ..default()
             },
             BorderColor::all(theme.border),
-            UiVelloScene::default(),
+            ImageNode::default(),
+            VelloUiScene::default(),
+            VelloUiTexture::default(),
             GlobalZIndex(crate::constants::ZLayer::HUD),
         ))
         .id();
@@ -356,17 +364,21 @@ pub fn render_north_dock(
     theme: Res<Theme>,
     fonts: Res<Assets<VelloFont>>,
     font_handles: Res<ShapingFonts>,
-    mut query: Query<(&mut UiVelloScene, &ComputedNode), With<NorthDock>>,
+    mut query: Query<(&mut VelloUiScene, &ComputedNode), With<NorthDock>>,
 ) {
-    if !dock_state.is_changed() && !theme.is_changed() {
+    let Ok((mut scene_comp, computed)) = query.single_mut() else {
+        return;
+    };
+
+    // Rebuild on data/theme change or when the dock changed width (right-aligned
+    // groups must reflow; a stale-width scene would otherwise stretch onto the
+    // resized texture).
+    let width_changed = (scene_comp.built_width - computed.size().x).abs() > 0.5;
+    if !dock_state.is_changed() && !theme.is_changed() && !width_changed {
         return;
     }
 
     let Some(font) = fonts.get(&font_handles.mono) else {
-        return;
-    };
-
-    let Ok((mut scene_comp, computed)) = query.single_mut() else {
         return;
     };
 
@@ -462,7 +474,10 @@ pub fn render_north_dock(
         &conn_brush,
     );
 
-    *scene_comp = UiVelloScene::from(scene);
+    scene_comp.scene = scene;
+    scene_comp.built_width = computed.size().x;
+    scene_comp.built_height = computed.size().y;
+    scene_comp.version = scene_comp.version.wrapping_add(1).max(1);
 }
 
 /// Render the South dock scene.
@@ -473,18 +488,19 @@ pub fn render_south_dock(
     theme: Res<Theme>,
     fonts: Res<Assets<VelloFont>>,
     font_handles: Res<ShapingFonts>,
-    mut query: Query<(&mut UiVelloScene, &ComputedNode), With<SouthDock>>,
+    mut query: Query<(&mut VelloUiScene, &ComputedNode), With<SouthDock>>,
     mut hit_regions: ResMut<DockHitRegions>,
 ) {
-    if !dock_state.is_changed() && !theme.is_changed() {
+    let Ok((mut scene_comp, computed)) = query.single_mut() else {
+        return;
+    };
+
+    let width_changed = (scene_comp.built_width - computed.size().x).abs() > 0.5;
+    if !dock_state.is_changed() && !theme.is_changed() && !width_changed {
         return;
     }
 
     let Some(font) = fonts.get(&font_handles.mono) else {
-        return;
-    };
-
-    let Ok((mut scene_comp, computed)) = query.single_mut() else {
         return;
     };
 
@@ -617,7 +633,42 @@ pub fn render_south_dock(
         }
     }
 
-    *scene_comp = UiVelloScene::from(scene);
+    scene_comp.scene = scene;
+    scene_comp.built_width = computed.size().x;
+    scene_comp.built_height = computed.size().y;
+    scene_comp.version = scene_comp.version.wrapping_add(1).max(1);
+}
+
+/// Size each dock's render texture to its laid-out node (physical pixels) and
+/// repoint the `ImageNode` when it changes. Mirrors `block_render`'s resize but
+/// sizes from `ComputedNode` (full-width bar) rather than measured content.
+pub fn resize_dock_textures(
+    mut query: Query<
+        (&ComputedNode, &mut VelloUiTexture, &mut ImageNode),
+        Or<(With<NorthDock>, With<SouthDock>)>,
+    >,
+    text_metrics: Res<crate::text::TextMetrics>,
+    gpu_limits: Res<GpuTextureLimits>,
+    mut images: ResMut<Assets<Image>>,
+) {
+    let scale = text_metrics.scale_factor;
+    let max_dim = gpu_limits.max_texture_dim;
+
+    for (computed, mut texture, mut image_node) in query.iter_mut() {
+        let size = computed.size();
+        if size.x <= 0.0 || size.y <= 0.0 {
+            continue;
+        }
+
+        let (target_w, target_h) = vello_texture_dims(size.x, size.y, scale, max_dim);
+        if texture.width != target_w || texture.height != target_h {
+            let new_handle = create_vello_texture(&mut images, target_w, target_h);
+            image_node.image = new_handle.clone();
+            texture.image = new_handle;
+            texture.width = target_w;
+            texture.height = target_h;
+        }
+    }
 }
 
 // ============================================================================
@@ -1134,7 +1185,12 @@ impl Plugin for DockPlugin {
             )
             .add_systems(
                 PostUpdate,
-                (render_north_dock, render_south_dock).after(bevy::ui::UiSystems::Layout),
+                (
+                    (render_north_dock, render_south_dock).after(bevy::ui::UiSystems::Layout),
+                    resize_dock_textures
+                        .after(render_north_dock)
+                        .after(render_south_dock),
+                ),
             );
     }
 }

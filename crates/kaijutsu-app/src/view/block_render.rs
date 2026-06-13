@@ -37,6 +37,7 @@ use crate::text::markdown::MarkdownColors;
 use crate::text::sparkline::{SparklineColors, build_sparkline_paths, render_sparkline_scene};
 use crate::ui::theme::Theme;
 use crate::view::fieldset;
+use crate::view::vello_ui_texture::{VelloUiScene, VelloUiTexture};
 
 // ============================================================================
 // COMPONENTS
@@ -138,6 +139,7 @@ impl Plugin for BlockRenderPlugin {
                     .after(build_block_scenes)
                     .after(build_role_group_scenes)
                     .after(crate::view::overlay::build_overlay_glyphs),
+                resize_role_group_textures.after(build_role_group_scenes),
             ),
         );
 
@@ -797,7 +799,7 @@ pub fn build_block_scenes(
 /// Build vello scenes for role group border entities.
 pub fn build_role_group_scenes(
     mut role_borders: Query<
-        (&RoleGroupBorder, &mut BlockScene, &ComputedNode),
+        (&RoleGroupBorder, &mut VelloUiScene, &ComputedNode),
         Changed<ComputedNode>,
     >,
     fonts: Res<Assets<VelloFont>>,
@@ -806,7 +808,7 @@ pub fn build_role_group_scenes(
 ) {
     let font = fonts.get(&font_handles.mono);
 
-    for (border, mut block_scene, computed) in role_borders.iter_mut() {
+    for (border, mut ui_scene, computed) in role_borders.iter_mut() {
         let size = computed.size();
         if size.x < 1.0 {
             continue;
@@ -838,10 +840,10 @@ pub fn build_role_group_scenes(
             font,
         );
 
-        block_scene.scene = scene;
-        block_scene.built_width = size.x;
-        block_scene.built_height = height;
-        block_scene.scene_version = block_scene.scene_version.wrapping_add(1);
+        ui_scene.scene = scene;
+        ui_scene.built_width = size.x;
+        ui_scene.built_height = height;
+        ui_scene.version = ui_scene.version.wrapping_add(1).max(1);
     }
 }
 
@@ -857,10 +859,6 @@ pub fn resize_block_textures(
             Or<(With<BlockCell>, With<crate::view::components::MsdfOverlayText>, With<crate::view::shell_dock::MsdfShellDockText>)>,
             Without<RoleGroupBorder>,
         ),
-    >,
-    mut role_query: Query<
-        (&BlockScene, &mut BlockTexture, &mut ImageNode),
-        (With<RoleGroupBorder>, Without<BlockCell>),
     >,
     text_metrics: Res<TextMetrics>,
     gpu_limits: Res<GpuTextureLimits>,
@@ -894,20 +892,42 @@ pub fn resize_block_textures(
             texture.height = target_h;
         }
     }
+}
 
-    // Role group borders: update ImageNode directly (no shader effects)
+/// Size role-group-border textures to their measured content (physical pixels).
+///
+/// Role borders carry the generic `VelloUiScene`/`VelloUiTexture` (plain
+/// `ImageNode`, no material), so this is the simple sibling of
+/// `resize_block_textures`'s former role branch — split out when the borders
+/// migrated onto the shared vello→texture primitive.
+pub fn resize_role_group_textures(
+    mut role_query: Query<
+        (&VelloUiScene, &mut VelloUiTexture, &mut ImageNode),
+        With<RoleGroupBorder>,
+    >,
+    text_metrics: Res<TextMetrics>,
+    gpu_limits: Res<GpuTextureLimits>,
+    mut images: ResMut<Assets<Image>>,
+) {
+    let scale = text_metrics.scale_factor;
+    let max_dim = gpu_limits.max_texture_dim;
+
     for (scene, mut texture, mut image_node) in role_query.iter_mut() {
         if scene.built_width <= 0.0 || scene.built_height <= 0.0 {
             continue;
         }
 
-        let target_w = (scene.built_width * scale).ceil() as u32;
-        let target_h = (scene.built_height * scale).ceil() as u32;
-        let target_w = target_w.clamp(1, max_dim);
-        let target_h = target_h.clamp(1, max_dim);
+        let (target_w, target_h) =
+            crate::view::vello_ui_texture::vello_texture_dims(
+                scene.built_width,
+                scene.built_height,
+                scale,
+                max_dim,
+            );
 
         if texture.width != target_w || texture.height != target_h {
-            let new_handle = create_block_texture(&mut images, target_w, target_h);
+            let new_handle =
+                crate::view::vello_ui_texture::create_vello_texture(&mut images, target_w, target_h);
             image_node.image = new_handle.clone();
             texture.image = new_handle;
             texture.width = target_w;

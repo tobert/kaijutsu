@@ -162,15 +162,50 @@ Known costs of the 3D direction, none new:
    the `bevy_vello` dependency, archive the fork.
    - **[Partial — `24c73b3`]** The app-reset demolition (docs/kernel-kv.md §2)
      deleted `form/` and `constellation/` outright, removing roughly half the
-     phase-4 `UiVello*` sites by deletion rather than conversion. As of
-     2026-06-13, ~10 `UiVelloScene` + ~11 `UiVelloText` references remain, all
-     in the *kept* conversation view and needing real conversion (not deletion):
-     `ui/dock.rs` (the bulk — ~8), `ui/tiling_reconciler.rs`, `text/` (rich,
-     components, resources, shaping), `cell/block_border.rs`, `view/` (render,
-     mod, lifecycle). `ui/dock.rs` is the natural first target. The `VelloView`
-     camera marker and the `bevy_vello` dep stay until the last of these land,
-     at which point `ShapingFonts` merges back into `FontHandles` and the fork
-     archives.
+     phase-4 `UiVello*` sites by deletion rather than conversion. Audit of the
+     *kept* conversation view found only **two live render sites** —
+     `ui/dock.rs` and one `UiVelloText` in `ui/tiling_reconciler.rs:537`; every
+     other `UiVello*` grep hit is a doc comment. The remaining `bevy_vello`
+     coupling is then just: the `VelloPlugin`/`VelloView` pair, the chrome
+     `FontHandles` (`VelloFont`-typed), and the phase-3c SVG-via-`bevy_vello`
+     calls.
+
+   - **Generic primitive (decided 2026-06-13).** Rather than convert each site
+     to a bespoke scene-to-texture copy of `block_render`, we unify. A diff of
+     `block_render`'s three internal systems showed the **render** path is
+     byte-for-byte generic and **extract** is generic-minus-the-MSDF-filter;
+     only **scene-building** and **sizing** are genuinely per-consumer. So the
+     scene→`ImageNode`-texture pattern is extracted into
+     `view/vello_ui_texture.rs`: `VelloUiScene` + `VelloUiTexture` +
+     `extract_vello_scenes` + `render_vello_scenes` + `VelloUiTexturePlugin`,
+     plus a pure, unit-tested `vello_texture_dims()` sizing helper and
+     `create_vello_texture()`. Consumers own their scene-build + resize systems;
+     `version > last_rendered` is the sole re-rasterize signal (`0` = skip, so
+     MSDF cells just stay `0`). End state: dock, role-group borders, block
+     cells, overlay text, and shell-dock text all ride one extract/render.
+
+     Migration sequence (each compiles + verifies independently):
+     1. **[DONE]** Primitive module + tests.
+     2. **[DONE — pending live verify]** `ui/dock.rs` → first consumer; dropped
+        its `UiVelloScene` import. Added a width-change rebuild trigger (the
+        old `UiVelloScene` composite masked stale-width reflow; the texture path
+        would stretch it).
+     3. **[DONE — pending live verify]** Migrated `block_render`'s
+        role-group-border branch onto the primitive: `build_role_group_scenes`
+        writes `VelloUiScene`; borders spawn with `VelloUiScene`/`VelloUiTexture`
+        (`lifecycle.rs`); the role branch left `resize_block_textures` for a
+        dedicated `resize_role_group_textures` (shared `vello_texture_dims`).
+        They now ride `extract_vello_scenes`/`render_vello_scenes`; the block
+        extract/render still serves cells until step 4.
+     4. **[TODO]** Split `BlockScene` (render fields → `VelloUiScene`,
+        bookkeeping stays) across cells + `view/overlay.rs` +
+        `view/shell_dock.rs` + `shaders/mod.rs` (reads `built_*`); delete
+        `block_render`'s own extract/render. The hot path — verified alone.
+
+     The `VelloView` marker, `VelloPlugin`, chrome `FontHandles`, and the
+     `UiVelloText` in `tiling_reconciler` stay until steps 3–4 + the
+     `tiling_reconciler` summary (→ native `Text`) + phase-3c land; then
+     `ShapingFonts` merges back into `FontHandles` and the fork archives.
 
 Phases 1–3 are done and were independent of the UI rewrite; phase 4 rides the
 rewrite's schedule. No big-bang swap.
