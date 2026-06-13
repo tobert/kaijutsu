@@ -205,11 +205,24 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   actually gates self-driving (it didn't before `kj` grew capability gates).
   Follow-up: revisit whether the composing turn also needs `submit_input` vs.
   relying on the turn driver, and trim further if the tick proves it can.
+- **OODA has never been driven end-to-end (runtime validation gap).** Every
+  link is wired and unit-tested — `kj context create --type composer` auto-arms
+  (rpc.rs ~2685), the beat scheduler ticks, `composer/tick/S10-drive.kai` runs
+  `kj drive`, `spawn_turn_driver` runs the model turn, `on_turn_completed` →
+  `schedule_abc_cell` → materialize → `$HEARD` feeds back — but no real composer
+  has completed a live OODA cycle. The first live run IS the integration test;
+  expect it to surface something the unit tests didn't (mailbox windowing under
+  a real turn, drive-seed hydration, ABC validation on live model output,
+  cadence feel). To run: `kj context create --type composer --name <lane>
+  --model <prov/model>` then `kj transport play`. For a fast demo loop crank
+  `kj transport tempo` (the cadence-knob below is the clean fix). With a local
+  model up (lemonade) this is the immediate next validation.
 - **Cadence/tempo should be settable per context:** `kj transport tempo <bpm>`
   exists, but the OODA cadence (`ooda_every`, default 8 phrases = 128 beats) is
   fixed in `BeatPolicy::composer_default()`. Make the cadence a settable knob
   (rc-declared and/or a `kj transport` arg), persisted per context. Fine to do
-  later.
+  later. (Until then, a high BPM via `kj transport tempo` shrinks the wall-clock
+  per OODA turn for testing — 128 beats @ 1000 BPM ≈ 7.7 s.)
 - **`kj transport meter` inbound verb (Chameleon batch 1, F2):** add
   `kj transport meter <beats_per_phrase>` with a `--bars N --beats-per-bar M`
   convenience that multiplies to beats *at the edge* → new
