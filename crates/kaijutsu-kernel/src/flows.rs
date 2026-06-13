@@ -571,8 +571,17 @@ impl<T: Clone + Send + HasSubject + 'static> FlowBus<T> {
             // the oldest message on the receiver side is dropped.
             match tx.try_broadcast(msg) {
                 Ok(None) => tx.receiver_count(),
-                Ok(Some(_returned)) => {
-                    // All receivers full and no overflow? Shouldn't happen with set_overflow(true).
+                Ok(Some(_evicted)) => {
+                    // Overflow is enabled, so a full channel evicts its OLDEST
+                    // message to make room for this one — a slow subscriber just
+                    // lost an event. That was silent; make it loud. (Durable
+                    // delivery, e.g. for turn.*, is the larger "revisit with
+                    // persistence" follow-up in docs/issues.md.)
+                    tracing::warn!(
+                        topic,
+                        receivers = tx.receiver_count(),
+                        "FlowBus overflow — a slow subscriber dropped the oldest event"
+                    );
                     tx.receiver_count()
                 }
                 Err(async_broadcast::TrySendError::Closed(_)) => 0,
