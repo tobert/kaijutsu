@@ -1065,7 +1065,33 @@ impl KaijutsuMcp {
                     }
                 }
             });
-            bg_handle.abort_handle()
+            let abort = bg_handle.abort_handle();
+            // Supervise the listener. It is the sole writer of the
+            // SyncedDocument; if it panics or its event stream closes, the
+            // document stops updating and every shell poll silently degrades to
+            // its fallback timer (then a timeout). Surface that loudly instead
+            // of leaving it to look like a hang. The supervisor self-terminates
+            // when the listener resolves (including on teardown abort), so it
+            // needs no separate cancellation.
+            let sup_ctx = context_id;
+            tokio::spawn(async move {
+                match bg_handle.await {
+                    Ok(()) => tracing::warn!(
+                        context_id = %sup_ctx,
+                        "MCP event listener exited (server event stream closed); \
+                         synced document will no longer update — reconnect needed",
+                    ),
+                    Err(e) if e.is_cancelled() => tracing::debug!(
+                        context_id = %sup_ctx,
+                        "MCP event listener cancelled (session teardown)",
+                    ),
+                    Err(e) => tracing::error!(
+                        context_id = %sup_ctx,
+                        "MCP event listener PANICKED: {e}; synced document frozen — reconnect needed",
+                    ),
+                }
+            });
+            abort
         };
 
         // 6. Write JoinedContext
