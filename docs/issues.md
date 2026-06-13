@@ -327,8 +327,17 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
     `BeatCommand::RotateOnPhrase { parent, modulus, child_preset }` stored in
     `BeatState`, checked synchronously in `fire_due` at ooda time, disarming the
     parent + arming the child atomically with zero async gap. So `composer/fork/`
-    setup stays rc, but the *detach-at-horizon trigger* is Rust. (Implementation
-    deferred — this entry is the verification result.)
+    setup stays rc, but the *detach-at-horizon trigger* is Rust. **IMPLEMENTED
+    2026-06-12:** `BeatCommand::SetRotate{ctx, every_phrases}` +
+    `BeatState.rotate_every_phrases` + `kj transport rotate --every N | off`; at a
+    phrase horizon where `phrase % N == 0`, `fire_due` `stop`s the parent
+    synchronously (not re-pushed → no further ticks) and reports `rotate_due`
+    (suppressing a coincident `ooda_due`), and the run loop fires the `rotate` rc
+    lifecycle fire-and-forget. The rotate ACTION (a `composer/rotate/*.kai` that
+    forks `--preset spawn` + arms the child) is still rc and unwritten — when it
+    lands it's race-free because the parent is already stopped. Tests: scheduler
+    (`rotate_horizon_retires_parent_synchronously`, `rotate_cadence_gates_on_the_
+    modulus`, `no_rotate_when_cadence_unset`) + verb (`transport_rotate_*`).
   - **Build when convenient — the windowed-notation pull primitive.** No
     cross-context block-copy verb exists today; a player carrying recent
     notation into its thin-forked child needs one. This is the *same* windowed

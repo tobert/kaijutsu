@@ -68,6 +68,21 @@ enum TransportCommand {
         #[arg(long)]
         context: Option<String>,
     },
+    /// Set (or clear) the self-fork rotate cadence — the page-turn. At every
+    /// phrase horizon where `phrase % N == 0` the scheduler retires this context
+    /// and fires the `rotate` rc lifecycle (fork a `spawn` child + arm it). The
+    /// detach is synchronous in the scheduler (Rust), so it can't race the beat;
+    /// the fork/arm action stays rc.
+    Rotate {
+        /// Phrases per rotation (positive). Omit and pass `off` to disable.
+        #[arg(long)]
+        every: Option<u64>,
+        /// `off` to clear the rotate cadence.
+        state: Option<String>,
+        /// Target context: . (default) | <label> | <hex prefix>
+        #[arg(long)]
+        context: Option<String>,
+    },
 }
 
 impl TransportCommand {
@@ -78,7 +93,8 @@ impl TransportCommand {
             | TransportCommand::Pause { context }
             | TransportCommand::Stop { context }
             | TransportCommand::Tempo { context, .. }
-            | TransportCommand::Ooda { context, .. } => context.as_deref(),
+            | TransportCommand::Ooda { context, .. }
+            | TransportCommand::Rotate { context, .. } => context.as_deref(),
         }
     }
 
@@ -90,6 +106,7 @@ impl TransportCommand {
             TransportCommand::Stop { .. } => "stop",
             TransportCommand::Tempo { .. } => "tempo",
             TransportCommand::Ooda { .. } => "ooda",
+            TransportCommand::Rotate { .. } => "rotate",
         }
     }
 }
@@ -163,6 +180,30 @@ impl KjDispatcher {
                     BeatCommand::SetOoda { context_id: ctx, armed },
                     format!("OODA {}", if armed { "armed" } else { "disarmed" }),
                 )
+            }
+            TransportCommand::Rotate { every, state, .. } => {
+                let every_phrases = match (every, state.as_deref()) {
+                    // `off` clears the cadence.
+                    (_, Some("off")) => None,
+                    (Some(n), _) if *n > 0 => Some(*n),
+                    (Some(_), _) => {
+                        return KjResult::Err(
+                            "kj transport rotate: --every needs a positive phrase count".to_string(),
+                        );
+                    }
+                    (None, _) => {
+                        return KjResult::Err(
+                            "kj transport rotate: pass `--every N` to set the cadence, or `off` to \
+                             clear it"
+                                .to_string(),
+                        );
+                    }
+                };
+                let verb = match every_phrases {
+                    Some(n) => format!("rotate every {n} phrase(s)"),
+                    None => "rotate off".to_string(),
+                };
+                (BeatCommand::SetRotate { context_id: ctx, every_phrases }, verb)
             }
         };
 
@@ -256,6 +297,65 @@ mod tests {
             }
             other => panic!("expected SetOoda, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn transport_rotate_every_sets_cadence() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("c"), None, principal);
+        let c = caller_with_context(ctx);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        d.kernel().set_beat_ingress(tx);
+
+        let result = d
+            .dispatch(&[s("transport"), s("rotate"), s("--every"), s("8")], &c)
+            .await;
+        assert!(result.is_ok(), "rotate --every failed: {}", result.message());
+        match rx.try_recv().expect("a SetRotate should be sent") {
+            BeatCommand::SetRotate { context_id, every_phrases } => {
+                assert_eq!(context_id, ctx);
+                assert_eq!(every_phrases, Some(8));
+            }
+            other => panic!("expected SetRotate, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_rotate_off_clears_cadence() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("c"), None, principal);
+        let c = caller_with_context(ctx);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        d.kernel().set_beat_ingress(tx);
+
+        let result = d.dispatch(&[s("transport"), s("rotate"), s("off")], &c).await;
+        assert!(result.is_ok(), "rotate off failed: {}", result.message());
+        match rx.try_recv().expect("a SetRotate should be sent") {
+            BeatCommand::SetRotate { every_phrases, .. } => {
+                assert_eq!(every_phrases, None, "off clears the cadence");
+            }
+            other => panic!("expected SetRotate, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_rotate_needs_every_or_off() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("c"), None, principal);
+        let c = caller_with_context(ctx);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        d.kernel().set_beat_ingress(tx);
+
+        let result = d.dispatch(&[s("transport"), s("rotate")], &c).await;
+        assert!(!result.is_ok(), "bare rotate must error");
+        assert!(
+            result.message().contains("--every") && result.message().contains("off"),
+            "should teach the two forms: {}",
+            result.message()
+        );
     }
 
     #[tokio::test]

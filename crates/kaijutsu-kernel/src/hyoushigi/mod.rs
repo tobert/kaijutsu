@@ -119,6 +119,14 @@ pub enum BeatCommand {
     SetTempo { context_id: ContextId, period: Duration },
     /// Arm or disarm the OODA loop without touching the clock.
     SetOoda { context_id: ContextId, armed: bool },
+    /// Set (or clear, with `None`) the self-fork rotate cadence in phrases. At
+    /// every phrase horizon where `phrase % every_phrases == 0` the scheduler
+    /// retires the context (synchronous `stop`) and fires the `rotate` rc
+    /// lifecycle — the page-turn. The horizon decision lives in the scheduler
+    /// (Rust), not the rc, so the parent's disarm is synchronous with the beat
+    /// clock and can't race a stray tick (see `docs/issues.md`); the rotate
+    /// *action* (fork + arm child) stays rc. `Some(0)` is treated as `None`.
+    SetRotate { context_id: ContextId, every_phrases: Option<u64> },
     /// Disarm a context entirely — drop its timeline and beat state (e.g. on
     /// archive).
     Disarm(ContextId),

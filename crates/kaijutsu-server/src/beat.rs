@@ -60,6 +60,15 @@ struct BeatState {
     playing: bool,
     /// The OODA switch. The `tick` verb fires only when `playing && ooda_armed`.
     ooda_armed: bool,
+    /// Self-fork rotate cadence, in phrases. `Some(n)` (n>0) = at every phrase
+    /// horizon where `phrase % n == 0` the scheduler retires this context
+    /// (synchronous `stop`) and fires the `rotate` rc lifecycle — the page-turn
+    /// (`docs/chameleon.md`). The horizon decision lives HERE in Rust, not in the
+    /// rc, precisely so the parent's disarm is synchronous with the scheduler's
+    /// own clock (an rc disarm via `kj transport ooda off` is async through the
+    /// ingress → a stray-tick / double-fork race; see `docs/issues.md`). `None` =
+    /// no rotation (the default; the rc `fork`/`arm` *action* is still rc).
+    rotate_every_phrases: Option<u64>,
     /// The materialization cursor: how far whole committed cells have crossed the
     /// write barrier (`high_water`) AND how far the in-progress cell's artifact
     /// group got (`artifacts_done`), so a beat that fails mid-group resumes at the
@@ -222,6 +231,11 @@ pub struct BeatOutcome {
     /// flush / standing per-phrase cells; independent of the OODA arm — a phrase
     /// boundary is a position in musical time, not a turn-firing decision.
     pub phrase_due: Vec<ContextId>,
+    /// Contexts that hit a rotate horizon this wake. The scheduler has ALREADY
+    /// `stop`ped each one synchronously (so no further tick can fire for it); the
+    /// run loop fires the `rotate` rc lifecycle for them. A rotating context
+    /// appears here and NOT in `ooda_due`/`phrase_due` (it retired this beat).
+    pub rotate_due: Vec<ContextId>,
 }
 
 /// What one ticked beat crossed: the two cadence questions answered side by side.
@@ -234,6 +248,10 @@ struct BeatTickReport {
     /// Crossed a phrase boundary — report on `BeatOutcome.phrase_due`. NOT gated
     /// on the OODA arm: a phrase boundary is a position in musical time.
     phrase_due: bool,
+    /// Hit a rotate horizon (`rotate_every_phrases` set AND this phrase boundary
+    /// satisfies `phrase % n == 0`). Drives the synchronous parent-retire +
+    /// `rotate` lifecycle in `fire_due`.
+    rotate_due: bool,
 }
 
 /// The coalescing beat scheduler / transport. Holds the kernel (timelines +
@@ -310,6 +328,7 @@ impl BeatScheduler {
                 policy,
                 playing: false,
                 ooda_armed: true,
+                rotate_every_phrases: None,
                 cursor: MaterializeCursor::default(),
                 beat_count: 0,
                 track,
@@ -363,6 +382,14 @@ impl BeatScheduler {
         }
     }
 
+    /// Set (or clear, with `None`) the self-fork rotate cadence in phrases. A
+    /// `Some(0)` is treated as `None` (no rotation) — never a `% 0`.
+    pub fn set_rotate(&mut self, context_id: ContextId, every_phrases: Option<u64>) {
+        if let Some(st) = self.armed.get_mut(&context_id) {
+            st.rotate_every_phrases = every_phrases.filter(|n| *n > 0);
+        }
+    }
+
     /// Disarm a context entirely: drop beat state and the kernel timeline. The
     /// heap entry is skipped lazily on pop.
     pub fn disarm(&mut self, context_id: ContextId) {
@@ -394,8 +421,21 @@ impl BeatScheduler {
                 continue; // paused/stopped → drop the stale entry (no re-arm)
             }
             let report = self.process_one(ctx);
-            self.heap.push(Reverse((now + period, ctx)));
             outcome.fired.push(ctx);
+            // Rotate horizon: retire the parent SYNCHRONOUSLY, right here, in the
+            // same step that decided to rotate — before the loop can `select!`
+            // again, so no stray tick can fire for it and no second rotate can
+            // race in. `stop` (pause clock + disarm OODA) leaves the entry
+            // quiescent (zero cost, blocks/timeline preserved for the app). It is
+            // NOT re-pushed onto the heap → the parent's beat ends here. The
+            // `rotate` rc (fork + arm child) runs fire-and-forget; that async work
+            // is safe now that the parent is stopped.
+            if report.rotate_due {
+                self.stop(ctx);
+                outcome.rotate_due.push(ctx);
+                continue;
+            }
+            self.heap.push(Reverse((now + period, ctx)));
             if report.ooda_due {
                 outcome.ooda_due.push(ctx);
             }
@@ -562,14 +602,27 @@ impl BeatScheduler {
             return BeatTickReport::default();
         };
         s.beat_count += 1;
-        // Both cadence questions answered side by side from the post-increment
+        // The cadence questions answered side by side from the post-increment
         // beat_count. OODA is gated on the arm (it drives token spend); the phrase
         // boundary is not (it is a position in musical time, observed regardless).
+        let phrase_due = s.policy.is_phrase_boundary(s.beat_count);
+        // Rotate horizon: a phrase boundary whose phrase index is a multiple of
+        // the configured cadence. `beat_count` is post-increment, so the first
+        // boundary is phrase 1 (beat_count == beats_per_phrase) — a birth never
+        // self-rotates. Gated on `playing` (a stopped context can't rotate) but
+        // NOT on `ooda_armed`: a player paused mid-OODA still owes its page-turn.
+        let rotate_due = phrase_due
+            && s.policy.beats_per_phrase > 0
+            && s.rotate_every_phrases.is_some_and(|n| {
+                let phrase = s.beat_count / s.policy.beats_per_phrase;
+                phrase % n == 0
+            });
         BeatTickReport {
             ooda_due: s.ooda_armed
                 && s.policy.ooda_every > 0
                 && s.beat_count % s.policy.ooda_every == 0,
-            phrase_due: s.policy.is_phrase_boundary(s.beat_count),
+            phrase_due,
+            rotate_due,
         }
     }
 
@@ -652,44 +705,44 @@ impl BeatScheduler {
         }
     }
 
-    /// Fire the `tick` rc verb for `ctx` — the OODA hook (`kj drive`). Spawned
-    /// fire-and-forget on the local set so the scheduler never blocks; the verb's
-    /// kaish only *requests* a turn (publishes `TurnFlow::Requested`), returning
-    /// fast — the model turn runs on the turn-driver thread.
-    fn fire_tick(&self, ctx: ContextId) {
+    /// Snapshot the transport heartbeat for `ctx` — `$TICK`/`$PHRASE`/`$TEMPO`
+    /// plus the `$HEARD` notation window — read NOW, on the scheduler thread with
+    /// the beat state in hand, so a spawned lifecycle sees facts coherent with the
+    /// beat that triggered it. Empty when the context isn't armed.
+    fn transport_env(&self, ctx: ContextId) -> HashMap<String, String> {
+        let Some(st) = self.armed.get(&ctx) else {
+            return HashMap::new();
+        };
+        let playhead = self
+            .kernel
+            .timeline(ctx)
+            .map(|t| t.lock().playhead())
+            .unwrap_or(Tick::ZERO);
+        let mut vars: HashMap<String, String> =
+            transport_vars(playhead, st.beat_count, &st.policy)
+                .into_iter()
+                .collect();
+        // $HEARD: the recent committed notation the player composes against. A
+        // read failure degrades to an empty list (the player composes from the
+        // chart + now-facts), never a dropped beat.
+        let window = TickDelta::new((HEARD_WINDOW_PHRASES * st.policy.beats_per_phrase) as i64);
+        let heard = self
+            .documents
+            .block_snapshots(ctx)
+            .map(|blocks| heard_json(&blocks, playhead, window))
+            .unwrap_or_else(|_| "[]".to_string());
+        vars.insert("HEARD".to_string(), heard);
+        vars
+    }
+
+    /// Fire an rc lifecycle `verb` for `ctx`, fire-and-forget on the local set so
+    /// the scheduler never blocks. The transport env is snapshotted synchronously
+    /// (on this thread) and moved into the spawned task.
+    fn fire_lifecycle(&self, ctx: ContextId, verb: &'static str) {
         let Some(dispatcher) = self.dispatcher.clone() else {
             return;
         };
-        // Snapshot the transport heartbeat now, on the scheduler thread with the
-        // beat state in hand, so the spawned lifecycle seeds it as $TICK/$PHRASE/
-        // $TEMPO. Reading the playhead here (not in the spawned task) keeps the
-        // facts coherent with the beat that triggered this fire.
-        let vars: HashMap<String, String> = match self.armed.get(&ctx) {
-            Some(st) => {
-                let playhead = self
-                    .kernel
-                    .timeline(ctx)
-                    .map(|t| t.lock().playhead())
-                    .unwrap_or(Tick::ZERO);
-                let mut vars: HashMap<String, String> =
-                    transport_vars(playhead, st.beat_count, &st.policy)
-                        .into_iter()
-                        .collect();
-                // $HEARD: the recent committed notation the player composes
-                // against. A read failure degrades to an empty list (the player
-                // composes from the chart + now-facts), never a dropped beat.
-                let window =
-                    TickDelta::new((HEARD_WINDOW_PHRASES * st.policy.beats_per_phrase) as i64);
-                let heard = self
-                    .documents
-                    .block_snapshots(ctx)
-                    .map(|blocks| heard_json(&blocks, playhead, window))
-                    .unwrap_or_else(|_| "[]".to_string());
-                vars.insert("HEARD".to_string(), heard);
-                vars
-            }
-            None => HashMap::new(),
-        };
+        let vars = self.transport_env(ctx);
         tokio::task::spawn_local(async move {
             let caller = KjCaller {
                 principal_id: PrincipalId::system(),
@@ -700,12 +753,27 @@ impl BeatScheduler {
                 privileged: false,
             };
             if let Err(e) = dispatcher
-                .run_rc_lifecycle_with_vars("tick", ctx, None, None, None, &vars, &caller)
+                .run_rc_lifecycle_with_vars(verb, ctx, None, None, None, &vars, &caller)
                 .await
             {
-                log::warn!("beat: tick verb failed for context {ctx}: {e}");
+                log::warn!("beat: {verb} verb failed for context {ctx}: {e}");
             }
         });
+    }
+
+    /// Fire the `tick` rc verb — the OODA hook (`kj drive`). Its kaish only
+    /// *requests* a turn (publishes `TurnFlow::Requested`), returning fast; the
+    /// model turn runs on the turn-driver thread.
+    fn fire_tick(&self, ctx: ContextId) {
+        self.fire_lifecycle(ctx, "tick");
+    }
+
+    /// Fire the `rotate` rc verb — the page-turn (`docs/chameleon.md`). Called for
+    /// a context the scheduler has ALREADY `stop`ped this beat (the synchronous
+    /// detach in `fire_due`), so the script's `kj fork --preset spawn` + arm-child
+    /// runs with no parent still on the clock to race. Absent rc scripts → no-op.
+    fn fire_rotate(&self, ctx: ContextId) {
+        self.fire_lifecycle(ctx, "rotate");
     }
 
     /// The OODA **Act** handoff: a composer's turn just completed (it wrote ABC),
@@ -831,6 +899,9 @@ impl BeatScheduler {
                     Some(BeatCommand::SetOoda { context_id, armed }) => {
                         self.set_ooda(context_id, armed)
                     }
+                    Some(BeatCommand::SetRotate { context_id, every_phrases }) => {
+                        self.set_rotate(context_id, every_phrases)
+                    }
                     Some(BeatCommand::Disarm(ctx)) => self.disarm(ctx),
                     None => break, // all senders dropped → shut down
                 },
@@ -846,6 +917,11 @@ impl BeatScheduler {
                     let outcome = self.fire_due(Instant::now());
                     for ctx in outcome.ooda_due {
                         self.fire_tick(ctx);
+                    }
+                    // Rotate-due contexts were already `stop`ped synchronously in
+                    // fire_due; fire their page-turn lifecycle (fork + arm child).
+                    for ctx in outcome.rotate_due {
+                        self.fire_rotate(ctx);
                     }
                 }
             }
@@ -1355,6 +1431,118 @@ mod tests {
             vec![4, 8, 12],
             "phrase boundary every 4 beats"
         );
+    }
+
+    /// The rotate-race fix (docs/issues.md): at a rotate horizon the scheduler
+    /// retires the parent SYNCHRONOUSLY in `fire_due` — it reports `rotate_due`
+    /// (NOT `ooda_due`, even when the OODA cadence coincides) and the parent does
+    /// not fire again. This is what closes the stray-tick / double-fork race that
+    /// a pure-rc `kj transport ooda off` (async via the ingress) could not.
+    #[tokio::test]
+    async fn rotate_horizon_retires_parent_synchronously() {
+        let (kernel, documents) = fresh_kernel_and_docs().await;
+        let ctx = ContextId::new();
+        documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+        kernel.arm_timeline(
+            ctx,
+            TickClock { ticks_per_sec: 1.0, safety_factor: 1.0, commit_margin: TickDelta::new(0) },
+            Tick::ZERO,
+        );
+
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+        let base = Instant::now();
+        // phrase = 2 beats; OODA also every 2 beats so the rotate beat COINCIDES
+        // with an OODA boundary — proving rotate suppresses the stray ooda tick.
+        sched.arm(
+            ctx,
+            BeatPolicy { period: Duration::from_secs(1), beats_per_phrase: 2, ooda_every: 2 },
+            TrackId::solo(),
+        );
+        sched.set_rotate(ctx, Some(1)); // rotate every phrase
+        sched.play(ctx, base);
+
+        // Beat 1: mid-phrase — nothing due.
+        let b1 = sched.fire_due(base + Duration::from_secs(1));
+        assert_eq!(b1.fired, vec![ctx]);
+        assert!(b1.rotate_due.is_empty() && b1.ooda_due.is_empty());
+
+        // Beat 2: phrase 1 horizon → rotate. Reported on rotate_due, and NOT on
+        // ooda_due even though 2 % ooda_every == 0 (the rotate suppresses it).
+        let b2 = sched.fire_due(base + Duration::from_secs(2));
+        assert_eq!(b2.rotate_due, vec![ctx], "horizon reports rotate_due");
+        assert!(b2.ooda_due.is_empty(), "rotate suppresses the coincident ooda tick");
+        assert!(!sched.armed.get(&ctx).unwrap().playing, "parent stopped synchronously");
+        assert!(!sched.armed.get(&ctx).unwrap().ooda_armed, "parent OODA disarmed");
+
+        // Beat 3+: the parent was not re-armed → it never fires again. No stray
+        // ticks could leak between the rotate decision and a (now unnecessary)
+        // async disarm, because there is no async disarm.
+        let b3 = sched.fire_due(base + Duration::from_secs(3));
+        assert!(b3.fired.is_empty(), "retired parent does not tick again");
+    }
+
+    /// Rotation only fires at `phrase % every == 0`: with `every = 2` and a
+    /// 2-beat phrase, phrase 1 (beat 2) is a phrase boundary but NOT a rotate
+    /// horizon — it ticks normally; phrase 2 (beat 4) rotates.
+    #[tokio::test]
+    async fn rotate_cadence_gates_on_the_modulus() {
+        let (kernel, documents) = fresh_kernel_and_docs().await;
+        let ctx = ContextId::new();
+        documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+        kernel.arm_timeline(
+            ctx,
+            TickClock { ticks_per_sec: 1.0, safety_factor: 1.0, commit_margin: TickDelta::new(0) },
+            Tick::ZERO,
+        );
+
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+        let base = Instant::now();
+        sched.arm(
+            ctx,
+            BeatPolicy { period: Duration::from_secs(1), beats_per_phrase: 2, ooda_every: 1_000_000 },
+            TrackId::solo(),
+        );
+        sched.set_rotate(ctx, Some(2)); // rotate every 2 phrases
+        sched.play(ctx, base);
+
+        let mut rotate_beats = Vec::new();
+        for i in 1..=4 {
+            let out = sched.fire_due(base + Duration::from_secs(i));
+            if !out.rotate_due.is_empty() {
+                rotate_beats.push(i);
+                break; // parent retires here; later wakes won't fire it
+            }
+        }
+        assert_eq!(rotate_beats, vec![4], "phrase 2 (beat 4) is the first rotate horizon, not phrase 1");
+    }
+
+    /// With no rotate cadence set, a phrase horizon is a normal beat — no
+    /// rotate_due, the context keeps ticking (the default, non-rotating player).
+    #[tokio::test]
+    async fn no_rotate_when_cadence_unset() {
+        let (kernel, documents) = fresh_kernel_and_docs().await;
+        let ctx = ContextId::new();
+        documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+        kernel.arm_timeline(
+            ctx,
+            TickClock { ticks_per_sec: 1.0, safety_factor: 1.0, commit_margin: TickDelta::new(0) },
+            Tick::ZERO,
+        );
+
+        let mut sched = BeatScheduler::new(kernel.clone(), documents.clone());
+        let base = Instant::now();
+        sched.arm(
+            ctx,
+            BeatPolicy { period: Duration::from_secs(1), beats_per_phrase: 2, ooda_every: 1_000_000 },
+            TrackId::solo(),
+        );
+        sched.play(ctx, base);
+
+        for i in 1..=4 {
+            let out = sched.fire_due(base + Duration::from_secs(i));
+            assert!(out.rotate_due.is_empty(), "no rotate cadence → never rotate (beat {i})");
+            assert_eq!(out.fired, vec![ctx], "keeps ticking (beat {i})");
+        }
     }
 
     /// Insert a player-authored Model/Text ABC block and return its id. The
