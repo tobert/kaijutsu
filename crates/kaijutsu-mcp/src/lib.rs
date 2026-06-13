@@ -299,8 +299,9 @@ impl Default for McpServerState {
 pub struct KaijutsuMcp {
     backend: Backend,
     tool_router: ToolRouter<Self>,
-    /// Held for the rmcp prompt surface; no prompts are served yet, so the
-    /// field is constructed but not yet read.
+    /// Backing router for the served prompts (analyze_document, search_context,
+    /// editing_assistant). Wired into rmcp via `#[prompt_handler]`; the field
+    /// itself isn't read directly, hence the allow.
     #[allow(dead_code)]
     prompt_router: PromptRouter<Self>,
     server_state: McpServerState,
@@ -467,7 +468,13 @@ impl KaijutsuMcp {
             Backend::Local(store) => store.get(ctx).map(|e| f(&e.doc)),
             Backend::Remote(remote) => {
                 let guard = remote.synced.lock().expect("synced mutex poisoned");
-                guard.as_ref().map(|d| f(d.doc()))
+                // The Remote backend holds exactly one context. Honor the
+                // requested `ctx`: a query for a different context must miss
+                // (return None), not silently read the joined document.
+                guard
+                    .as_ref()
+                    .filter(|d| d.context_id() == ctx)
+                    .map(|d| f(d.doc()))
             }
         }
     }
@@ -479,8 +486,9 @@ impl KaijutsuMcp {
             Backend::Remote(remote) => remote
                 .synced
                 .lock()
-                .ok()
-                .and_then(|g| g.as_ref().map(|d| vec![d.context_id()]))
+                .expect("synced mutex poisoned")
+                .as_ref()
+                .map(|d| vec![d.context_id()])
                 .unwrap_or_default(),
         }
     }
@@ -660,17 +668,11 @@ impl KaijutsuMcp {
         timeout_secs: u64,
         label: &str,
     ) -> ShellCompletion {
-        // The SyncedDocument is single-context; `ctx_id` is retained for
-        // call-site clarity but reads come straight from the joined doc.
-        let _ = ctx_id;
         let start = std::time::Instant::now();
         let fallback_interval = tokio::time::Duration::from_millis(500);
 
         // Completion check — finds the finished ToolResult child of our command
-        // block in the SyncedDocument. The single background listener applies
-        // events in order and buffers out-of-order ones, so a Done/Error status
-        // here implies content + exit_code are already applied: a consistent
-        // snapshot, never the empty-stdout race the two-receiver design had.
+        // block (Done/Error) in the local SyncedDocument.
         let find_terminal = || -> Option<kaijutsu_crdt::BlockSnapshot> {
             let guard = remote.synced.lock().expect("synced mutex poisoned");
             let doc = guard.as_ref()?;
@@ -685,39 +687,10 @@ impl KaijutsuMcp {
             })
         };
 
-        // Once the ToolResult reaches a terminal status, give `exit_code` a
-        // brief window to replicate: it rides `BlockMetadataChanged`, a
-        // different event/topic than the status change, so it can land a beat
-        // after `Done`. Returning the instant we see `Done` would report a null
-        // code for a command that actually succeeded. In the common case the
-        // metadata event arrives within a notify tick or two — far under the
-        // cap — so this rarely adds latency; the cap only bounds the rare path
-        // where no exit_code ever arrives (e.g. a kaish-level exec failure).
-        let mut terminal_since: Option<std::time::Instant> = None;
-        let exit_code_grace = std::time::Duration::from_millis(1000);
-
-        loop {
+        // Phase 1 — wait until the ToolResult reaches a terminal status locally.
+        let local = loop {
             if let Some(snap) = find_terminal() {
-                let graced = terminal_since
-                    .map(|t| t.elapsed() >= exit_code_grace)
-                    .unwrap_or(false);
-                if snap.exit_code.is_some() || graced {
-                    tracing::info!(
-                        command = %command,
-                        status = %snap.status.as_str(),
-                        exit_code = ?snap.exit_code,
-                        output_len = snap.content.len(),
-                        elapsed_ms = start.elapsed().as_millis() as u64,
-                        "{label} completed"
-                    );
-                    return ShellCompletion::Done {
-                        snapshot: snap,
-                        elapsed_ms: start.elapsed().as_millis() as u64,
-                    };
-                }
-                if terminal_since.is_none() {
-                    terminal_since = Some(std::time::Instant::now());
-                }
+                break snap;
             }
             if start.elapsed().as_secs() > timeout_secs {
                 return ShellCompletion::Timeout {
@@ -726,11 +699,53 @@ impl KaijutsuMcp {
                     elapsed_ms: start.elapsed().as_millis() as u64,
                 };
             }
-            // Wait for the listener to apply the next event (it calls
-            // `notify_waiters` after each), then re-check. The fallback tick
-            // bounds any lost-wakeup latency between the check above and the
-            // wait registration to `fallback_interval`.
+            // Wait on the change signal; the 500ms fallback bounds any Notify
+            // lost-wakeup between the check above and the wait registration.
             let _ = tokio::time::timeout(fallback_interval, remote.change.notified()).await;
+        };
+
+        // Phase 2 — read the AUTHORITATIVE final block from the server. A shell
+        // result's content (BlockTextOps), exit_code/stderr (BlockMetadataChanged)
+        // and status (BlockStatusChanged) ride three independently-reorderable
+        // topics, so a locally-applied terminal `status` does NOT guarantee
+        // content/exit_code have replicated — any of the three can arrive last,
+        // which would surface empty stdout / null exit_code. But the server writes
+        // content+exit_code BEFORE flipping status (program order), so a snapshot
+        // taken after we observe Done is guaranteed complete. Decode it into a
+        // throwaway document (no write to the shared doc → no race with the
+        // sole-writer bg listener) and read just this block.
+        // TODO(perf): this pulls the full context snapshot per shell command; a
+        // per-block read RPC would avoid that for large contexts (docs/issues.md).
+        match remote.actor.get_context_sync(ctx_id).await {
+            Ok(state) => match SyncedDocument::from_sync_state(&state, self.session_principal) {
+                Ok(doc) => {
+                    if let Some(snap) = doc.get_block(&local.id) {
+                        let elapsed_ms = start.elapsed().as_millis() as u64;
+                        tracing::info!(
+                            command = %command,
+                            status = %snap.status.as_str(),
+                            exit_code = ?snap.exit_code,
+                            output_len = snap.content.len(),
+                            elapsed_ms,
+                            "{label} completed"
+                        );
+                        return ShellCompletion::Done {
+                            snapshot: snap,
+                            elapsed_ms,
+                        };
+                    }
+                    tracing::warn!("{label}: authoritative snapshot missing block, using local");
+                }
+                Err(e) => {
+                    tracing::warn!("{label}: authoritative decode failed: {e}, using local")
+                }
+            },
+            Err(e) => tracing::warn!("{label}: authoritative fetch failed: {e}, using local"),
+        }
+        // Fallback to the local terminal snapshot if the authoritative read failed.
+        ShellCompletion::Done {
+            snapshot: local,
+            elapsed_ms: start.elapsed().as_millis() as u64,
         }
     }
 }

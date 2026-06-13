@@ -592,6 +592,76 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   beat-time and conversation wall-time ("the conversation has a tempo")
   so the timeline is the kernel's one clock rather than a music sidecar.
 
+## kaijutsu-mcp — June 2026 SyncedDocument migration review
+
+Surfaced by a DeepSeek (concurrency) + Gemini (architecture) review of commit
+`ac5f518` (Remote backend cut over to `kaijutsu_client::SyncedDocument`). The
+dropped-stdout bug and the content/exit_code completion race are fixed (poll now
+does an authoritative `get_context_sync` read after terminal status); these are
+the *remaining* findings, triaged.
+
+- **HIGH — `hook_listener` breaks the single-writer invariant + resync TOCTOU.**
+  The bg listener is documented as the sole writer of `synced`, but
+  `HookListener` also writes (`doc_mut().insert_*` under `synced.lock()`,
+  `crates/kaijutsu-mcp/src/hook_listener.rs`). During `resync_synced`'s
+  `get_context_sync().await` (no lock held), a hook can author blocks into the
+  old doc, then `apply_sync_state` replaces it wholesale → hook-authored blocks
+  silently lost. Fix: either route hook authoring through the bg task (a
+  command channel), or have `resync_synced` re-apply locally-authored ops that
+  landed in the fetch→apply gap.
+- **HIGH — hook push frontier never advances → re-pushes ops every hook event.**
+  `push_ops` computes `ops_since(doc.sync().frontier())`; locally-authored
+  blocks don't advance the SyncManager (inbound) frontier, so every hook event
+  re-sends all prior locally-authored ops (idempotent server-side, but O(N)
+  bandwidth). Fix: track a separate `last_pushed` frontier and advance it after
+  a successful push.
+- **HIGH — bg event-listener panic is silently swallowed.** The `tokio::spawn`
+  JoinHandle is kept only for its AbortHandle; nobody observes it. If
+  `apply_event` panics, the listener dies, `notify_waiters` never fires again,
+  and every shell poll degrades to the 500ms fallback forever (looks like a
+  hang). Fix: supervise the task (log+surface on join) or `is_finished()`-check
+  it in the poll.
+- **MED — `std::sync::Mutex` + poisoning on a single-threaded (LocalSet)
+  runtime.** Holding `synced.lock()` blocks the whole thread (not just the
+  task), and any panic-under-lock poisons it, cascading every
+  `.expect("synced mutex poisoned")`. Switching to `parking_lot::Mutex`
+  removes poisoning and the blocking-vs-async hazard in one move.
+- **MED — Notify lost-wakeup adds up to 500ms poll latency.** Classic check→
+  await TOCTOU on `tokio::sync::Notify`; the 500ms fallback prevents a hang but
+  not the latency. Fix: a `tokio::sync::watch` carrying a monotonic generation
+  counter (read gen, then `changed()` — no window).
+- **MED — multi-context operations silently collapse to one in Remote.**
+  `search_context`, `list_resources`, the `kaijutsu://docs` reader, and
+  completions call `context_ids()`, which in Remote returns only the single
+  joined context (`crates/kaijutsu-mcp/src/lib.rs`). A global search now silently
+  skips every other context on the server. Fix: add an async
+  `actor.list_contexts()`-backed lister for Remote multi-context surfaces.
+- **MED — resource/prompt handlers hardcode `kind = "Conversation"` for Remote**
+  (`analyze_document`, doc-tree, `read_resource`). Loses the real context type.
+  Fix: carry the kind through the sync state or a metadata RPC.
+- **MED — Remote input tools vs Local divergence:** Local `read/write/edit_input`
+  swallow `create_input_doc` errors via `let _ =`; `submit_input` is
+  unimplemented in Local mode. Either implement Local submit or document the gap.
+- **LOW — hook insert/push failures only `warn!` then return `allow`.** The
+  agent proceeds while its action's CRDT blocks are silently dropped — counter
+  to the crash-loud stance. Consider returning `deny` (or a visible error) on
+  push/insert failure.
+- **LOW — `SyncedDocument::pending_events` not drained on `apply_sync_state`**
+  (`crates/kaijutsu-client/src/synced_document.rs`): events buffered before a
+  resync are never replayed against the new doc. Harmless if the server snapshot
+  is always ahead of the buffered events; otherwise a silent loss.
+- **LOW — dead `push_to_server` on `KaijutsuMcp`** (lib.rs): nothing calls it
+  (the hook listener has its own `push_ops`); carries the same stale-frontier
+  bug. Delete or consolidate.
+- **PERF follow-up — the shell poll's authoritative read pulls the full context
+  snapshot per command** (`execute_and_poll_shell`, Phase 2). Fine for short MCP
+  contexts; a per-block read RPC (`actor.get_block(ctx, id)`) would avoid the
+  O(blocks) transfer for large conversations.
+- **TEST gaps beyond `tests/e2e_context_shell.rs`:** no coverage for Remote
+  input tools, the hook-listener socket path, prompts, resources, or
+  reconnect/resync. Add e2e cases (the harness in `e2e_context_shell.rs`
+  generalizes).
+
 ## Testing & Tooling
 
 - **russh teardown panic:** `ChannelCloseOnDrop::drop` panics with "there is no reactor running" in tests.
