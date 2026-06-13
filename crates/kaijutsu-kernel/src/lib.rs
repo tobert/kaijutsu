@@ -25,6 +25,7 @@ pub mod input_doc;
 pub mod kernel;
 pub mod kernel_db;
 pub mod kj;
+pub mod kv;
 pub mod llm;
 pub mod mcp;
 pub mod peers;

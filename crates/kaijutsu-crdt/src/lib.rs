@@ -27,6 +27,7 @@ pub(crate) mod content;
 mod dag;
 mod document;
 mod error;
+mod kv_document;
 mod ops;
 pub mod selection;
 
@@ -49,6 +50,9 @@ pub use dag::ConversationDAG;
 
 // Legacy (still used by downstream crates)
 pub use document::{BlockDocument, DocumentSnapshot};
+
+// Kernel KV store (flat key→string LWW Map)
+pub use kv_document::KvDocument;
 
 pub use error::CrdtError;
 pub use ops::{Frontier, LV, SerializedOps, SerializedOpsOwned};

@@ -186,6 +186,9 @@ pub enum DocKind {
     /// Configuration file (theme.toml, models.toml).
     #[strum(serialize = "config")]
     Config,
+    /// Kernel key–value store (flat key→string LWW map). See `docs/kernel-kv.md`.
+    #[strum(serialize = "kv")]
+    Kv,
 }
 
 impl DocKind {
@@ -195,6 +198,7 @@ impl DocKind {
             Self::Code => "code",
             Self::Text => "text",
             Self::Config => "config",
+            Self::Kv => "kv",
         }
     }
 }

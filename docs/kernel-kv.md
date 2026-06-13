@@ -226,8 +226,34 @@ This doc is one piece of the app-reset effort:
    collapse `Screen` to `Conversation`. App boots into the bootstrap context's
    tiling conversation.
 3. **Kernel KV** (this doc):
-   - **3a** — the `Kv` primitive (DTE `Map` + KernelDb journaling + TTL-ready
-     envelope) and the capnp `get/set/keys/watch` surface.
+   - **3a — primitive [DONE]** — the `Kv` primitive: `KvDocument` (a flat
+     `key→String` LWW Map over a DTE `Document`, in `kaijutsu-crdt`) plus the
+     kernel `Kv` store (`kaijutsu-kernel/src/kv.rs`) with KernelDb oplog
+     journaling, snapshot/compaction, the versioned envelope, the 64 KB cap, and
+     fail-loud `NoDatabaseConfigured`. Reserved well-known document id
+     (`uuid5("kaijutsu:kv:root")`), `DocKind::Kv`, handle-implies-row honored.
+     18 tests across both crates (convergence, persistence reopen, compaction
+     reopen, advisory TTL, corrupt-envelope-surfaces, value cap, watch).
+     **Scope corrections vs the design above:**
+     - *Envelope is JSON, not raw CBOR.* DTE registers are typed
+       (`Nil/Bool/Int/Float/Str`) and hold no bytes, so the envelope rides as a
+       JSON string in the register. `v` still gives reader-side version
+       dispatch; JSON keeps values inspectable/diffable, which the design wanted
+       anyway. (The oplog *ops* are still versioned CBOR via `codec`.)
+     - *Compaction trigger resolved.* Op-count since snapshot, threshold **200**
+       — tuned below the block log's append-oriented 500 because KV is
+       overwrite-heavy. Validated by `survives_compaction_and_reopen` (churns
+       one key past the threshold, then reopens). The compaction **rebuilds the
+       in-memory doc from the snapshot** so the live history matches what cold
+       start deterministically reproduces — without that, post-snapshot ops
+       replay as `DataMissing` (same reason the block store rebuilds on
+       compact). The snapshot is key-sorted to make that rebuild deterministic.
+     - *Delete-under-LWW resolved.* Delete is a `Nil` tombstone: `get`/`keys`
+       treat it absent, a later `set` resurrects the key (last-writer-wins, the
+       intended model) — confirmed by `deleted_key_can_be_resurrected`.
+     - *Watch granularity.* v1 is a whole-store `tokio::broadcast`; prefix
+       filtering is the watcher's job (deferred per the open question below).
+   - **3a — capnp surface** — `get/set/delete/keys/watch` on the wire + RPC.
    - **3b** — `kj kv` verbs.
    - **3c** — app adoption: seed `client-id`, store/read
      `<client-id>.current_context`, subscribe via `watch`. Closes the reattach
@@ -241,15 +267,13 @@ Resolved into the design above: value-size discipline (hard 64 KB cap at
 `set`), envelope evolution (`v` + `cas_token`), TTL (advisory-only in v1, leases
 later), keys pagination (cursor-shaped signature). Still genuinely open:
 
-- **Compaction trigger for churn (validate during 3a).** Confirm the actual
-  compaction trigger against an overwrite-heavy access pattern before relying on
-  it; decide between an op-count-since-snapshot trigger, a time debounce, or the
-  document-per-key escape hatch. (Don't trust review-cited constants — verify in
-  `block_store.rs`.)
+- **~~Compaction trigger for churn~~ [RESOLVED in 3a].** Op-count-since-snapshot,
+  threshold 200, with in-memory rebuild on compact. See the 3a note above.
 - **Watch granularity.** Per-key, per-prefix, or whole-store change streams?
+  v1 ships **whole-store** (`tokio::broadcast`, watcher filters by prefix).
   Per-prefix matches the namespace convention but costs more bookkeeping (the
-  block-log flow bus is per-document, not per-prefix).
-- **Delete semantics under LWW.** A delete is a tombstone; verify against
-  diamond-types-extended's actual `Map` semantics whether a late concurrent
-  `set` resurrects a deleted key, and whether that's acceptable (it usually is
-  for this store — last-writer-wins is the intended model).
+  block-log flow bus is per-document, not per-prefix) — revisit if a hot watcher
+  on a busy store proves the broadcast+filter wasteful.
+- **~~Delete semantics under LWW~~ [RESOLVED in 3a].** `Nil` tombstone; a late
+  concurrent `set` resurrects the key (intended last-writer-wins). Confirmed by
+  `deleted_key_can_be_resurrected`.
