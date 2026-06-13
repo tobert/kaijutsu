@@ -133,6 +133,11 @@ pub enum RpcResultMessage {
     },
     /// Context created on server — spawn an actor to join it.
     ContextCreated(ContextId),
+    /// Restore the last-viewed context on (re)connect, read from the kernel KV
+    /// (`<client-id>.current_context`). Drained into a `ContextSwitchRequested`
+    /// so it travels the same join path as any switch. Closes the reattach bug
+    /// (tech_debt_peer_reattach_on_reconnect).
+    RestoreContext(ContextId),
     /// Generic RPC error (for toast/notification).
     RpcError { operation: String, error: String },
 }
@@ -187,10 +192,64 @@ impl Plugin for ActorPlugin {
                 poll_connection_status,
                 poll_rpc_results,
                 update_connection_state,
+                restore_context_on_message,
             )
                 .chain(),
         );
+        // The current-context persistence observer runs independently — it only
+        // needs to see the latest `DocumentCache::active_id`.
+        app.add_systems(Update, persist_current_context);
     }
+}
+
+/// Drain [`RpcResultMessage::RestoreContext`] into a [`ContextSwitchRequested`]
+/// so a reconnect rejoins the last-viewed context through the normal switch
+/// path (which spawns the actor and fetches state).
+fn restore_context_on_message(
+    mut results: bevy::prelude::MessageReader<RpcResultMessage>,
+    mut switch_writer: bevy::prelude::MessageWriter<crate::cell::ContextSwitchRequested>,
+) {
+    for msg in results.read() {
+        if let RpcResultMessage::RestoreContext(context_id) = msg {
+            switch_writer.write(crate::cell::ContextSwitchRequested {
+                context_id: *context_id,
+            });
+        }
+    }
+}
+
+/// Persist the active context to the kernel KV whenever it changes, so the next
+/// (re)connect can restore it. A single observer over `DocumentCache::active_id`
+/// captures every switch source — app UI, MCP-peer `switch_context`, and the
+/// restore itself (a harmless re-write of the same value). Fire-and-forget: a
+/// failed write is logged, never fatal (per-client view state is a convenience).
+fn persist_current_context(
+    doc_cache: Res<crate::cell::DocumentCache>,
+    actor: Option<Res<RpcActor>>,
+    client_id: Res<crate::connection::client_id::ClientId>,
+    mut last_written: Local<Option<ContextId>>,
+) {
+    let active = doc_cache.active_id();
+    if active == *last_written {
+        return;
+    }
+    // Only advance the high-water mark once we've actually dispatched a write
+    // for a concrete id — a transient `None` (e.g. context left) shouldn't make
+    // us forget the last persisted value.
+    let (Some(actor), Some(id)) = (actor, active) else {
+        return;
+    };
+    *last_written = Some(id);
+    let handle = actor.handle.clone();
+    let key = client_id.current_context_key();
+    let value = id.to_string();
+    bevy::tasks::IoTaskPool::get()
+        .spawn(async move {
+            if let Err(e) = handle.kv_set(&key, &value, None).await {
+                log::warn!("persist current_context failed: {e}");
+            }
+        })
+        .detach();
 }
 
 // ============================================================================
@@ -207,6 +266,7 @@ fn poll_bootstrap_results(
     result_channel: Res<RpcResultChannel>,
     invocation_channel: Res<crate::peers::PeerInvocationChannel>,
     event_loop_proxy: Res<EventLoopProxyWrapper>,
+    client_id: Res<crate::connection::client_id::ClientId>,
 ) {
     let Ok(mut rx) = channel.rx.lock() else {
         return;
@@ -238,6 +298,7 @@ fn poll_bootstrap_results(
                 let tx = result_channel.sender();
                 let inv_tx = invocation_channel.tx.clone();
                 let ctx_id = context_id;
+                let cc_key = client_id.current_context_key();
                 bevy::tasks::IoTaskPool::get()
                     .spawn(async move {
                         let mut status_rx = h.subscribe_status();
@@ -338,15 +399,35 @@ fn poll_bootstrap_results(
                             return;
                         }
 
-                        // 3. No context specified — fetch context list to populate the context strip
+                        // 3. No context specified — fetch the context list, then
+                        //    restore the last-viewed context from the kernel KV if
+                        //    it still exists (closes the reattach bug). The read is
+                        //    best-effort: any KV hiccup just falls through to the
+                        //    list and the normal first-context selection.
+                        let saved_ctx = h
+                            .kv_get(&cc_key)
+                            .await
+                            .ok()
+                            .flatten()
+                            .and_then(|s| ContextId::parse(&s).ok());
                         match h.list_contexts().await {
                             Ok(contexts) => {
                                 log::info!(
                                     "Bootstrap: list_contexts returned {} contexts",
                                     contexts.len()
                                 );
+                                let restore = saved_ctx
+                                    .filter(|id| contexts.iter().any(|c| c.id == *id));
                                 let _ =
                                     tx.send(RpcResultMessage::DriftContextsReceived { contexts });
+                                if let Some(id) = restore {
+                                    log::info!("Restoring last-viewed context {id}");
+                                    let _ = tx.send(RpcResultMessage::RestoreContext(id));
+                                } else if let Some(id) = saved_ctx {
+                                    log::info!(
+                                        "Saved context {id} no longer exists; not restoring"
+                                    );
+                                }
                             }
                             Err(e) => {
                                 log::warn!("Bootstrap: list_contexts failed: {e}");

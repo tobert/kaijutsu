@@ -145,6 +145,11 @@ fn main() {
         .add_plugins(peers::PeersPlugin)
         // Shader effects
         .add_plugins(shaders::ShaderFxPlugin)
+        // Stable per-installation client id, for per-client KV namespacing
+        // (docs/kernel-kv.md). Seeded before the connection plugin's systems run.
+        .insert_resource(connection::client_id::ClientId(
+            connection::client_id::load_or_seed(),
+        ))
         // Connection plugin (spawns background thread)
         .add_plugins(connection::ActorPlugin { ssh_config })
         // App screen state management

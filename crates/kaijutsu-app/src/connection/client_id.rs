@@ -14,7 +14,22 @@
 
 use std::path::{Path, PathBuf};
 
+use bevy::prelude::Resource;
 use uuid::Uuid;
+
+/// The installation's stable client id, as a Bevy resource.
+///
+/// Seeded once at startup ([`load_or_seed`]). Used to namespace per-client KV
+/// state so two app instances don't clobber each other's view state.
+#[derive(Resource, Clone, Copy, Debug)]
+pub struct ClientId(pub Uuid);
+
+impl ClientId {
+    /// The KV key this client stores its current context under.
+    pub fn current_context_key(&self) -> String {
+        format!("{}.current_context", self.0)
+    }
+}
 
 /// File name under the data dir holding the client-id UUID (hyphenated text).
 const CLIENT_ID_FILE: &str = "client-id";
