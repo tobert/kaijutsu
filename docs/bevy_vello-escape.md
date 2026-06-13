@@ -161,12 +161,16 @@ Known costs of the 3D direction, none new:
    last `UiVello*` goes: merge `ShapingFonts` back into `FontHandles`, delete
    the `bevy_vello` dependency, archive the fork.
    - **[Partial — `24c73b3`]** The app-reset demolition (docs/kernel-kv.md §2)
-     deleted `form/` and `constellation/` outright, removing **roughly half**
-     the phase-4 `UiVello*` sites by deletion rather than conversion. Remaining
-     sites live in the *kept* conversation view and need real conversion (not
-     deletion): `text/` (rich text + components), `view/render.rs`,
-     `cell/block_border.rs`, `ui/dock.rs`, `ui/tiling_reconciler.rs`. The
-     `VelloView` camera marker and the `bevy_vello` dep stay until those land.
+     deleted `form/` and `constellation/` outright, removing roughly half the
+     phase-4 `UiVello*` sites by deletion rather than conversion. As of
+     2026-06-13, ~10 `UiVelloScene` + ~11 `UiVelloText` references remain, all
+     in the *kept* conversation view and needing real conversion (not deletion):
+     `ui/dock.rs` (the bulk — ~8), `ui/tiling_reconciler.rs`, `text/` (rich,
+     components, resources, shaping), `cell/block_border.rs`, `view/` (render,
+     mod, lifecycle). `ui/dock.rs` is the natural first target. The `VelloView`
+     camera marker and the `bevy_vello` dep stay until the last of these land,
+     at which point `ShapingFonts` merges back into `FontHandles` and the fork
+     archives.
 
 Phases 1–3 are done and were independent of the UI rewrite; phase 4 rides the
 rewrite's schedule. No big-bang swap.
