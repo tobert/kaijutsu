@@ -436,6 +436,31 @@ impl KjDispatcher {
             return KjResult::Err(format!("kj fork: failed to copy document: {e}"));
         }
 
+        // 3d — hydration policy travel. The policy row travels iff the marked
+        // block survived the selection. The marker remap is mechanical: fork
+        // preserves `(principal, seq)` and rewrites only the context part, so
+        // `P_child = BlockId::new(child_ctx, P.principal_id, P.seq)` (see
+        // `docs/fork-filters.md`). This ONE rule yields all the documented
+        // cases — full: marker always copied → travels; window: marker is the
+        // prefix end, in the kept set by construction → travels; spawn: nothing
+        // copied → marker absent → dropped (child rc re-marks); ad-hoc: iff the
+        // marker survived. A *corrupt* parent policy fails the fork loud (same
+        // posture as the hydrate side), not a silent drop.
+        let parent_policy = match self.kernel_db().lock().get_hydration_policy(source_id) {
+            Ok(p) => p,
+            Err(e) => return KjResult::Err(format!("kj fork: {e}")),
+        };
+        let child_marker = parent_policy
+            .as_ref()
+            .map(|(m, _)| kaijutsu_types::BlockId::new(new_id, m.principal_id, m.seq));
+        let policy_travels = child_marker.as_ref().is_some_and(|cm| {
+            self.block_store()
+                .get_block_snapshot(new_id, cm)
+                .ok()
+                .flatten()
+                .is_some()
+        });
+
         // Write-through: KernelDb then DriftRouter
         {
             let mut db = self.kernel_db().lock();
@@ -503,6 +528,15 @@ impl KjDispatcher {
             if let Err(e) = db.insert_edge(&edge) {
                 return KjResult::Err(format!("kj fork: failed to insert structural edge: {e}"));
             }
+
+            // Carry the hydration policy when its marker survived (3d). The
+            // child row exists now, so the `context_hydration` FK is satisfied.
+            if policy_travels
+                && let (Some((_, window)), Some(cm)) = (&parent_policy, &child_marker)
+                && let Err(e) = db.set_hydration_policy(new_id, *cm, *window)
+            {
+                return KjResult::Err(format!("kj fork: failed to carry hydration policy: {e}"));
+            }
         }
 
         // Register in DriftRouter (inherits parent's model)
@@ -567,6 +601,15 @@ impl KjDispatcher {
             .block_snapshots(new_id)
             .map(|b| b.len())
             .unwrap_or(0);
+        // When the parent had a policy but the marker fell outside the
+        // selection, the drop is visible in the marker (not silent) — softer
+        // than the hydrate-side fail-loud, because a fresh fork's rc lifecycle
+        // re-marks downstream.
+        let policy_note = if parent_policy.is_some() && !policy_travels {
+            Some("hydration policy not carried (marker fell outside the selection)")
+        } else {
+            None
+        };
         if let Err(e) = self.inject_fork_marker(
             new_id,
             source_id,
@@ -574,6 +617,7 @@ impl KjDispatcher {
             block_count,
             source_label.as_deref(),
             staging,
+            policy_note,
         ) {
             tracing::warn!("kj fork: failed to inject fork marker: {e}");
         }
@@ -769,6 +813,7 @@ impl KjDispatcher {
             block_count,
             source_label.as_deref(),
             staging,
+            None,
         ) {
             tracing::warn!("kj fork --shallow: failed to inject fork marker: {e}");
         }
@@ -988,6 +1033,7 @@ impl KjDispatcher {
             block_count,
             source_label.as_deref(),
             staging,
+            None,
         ) {
             tracing::warn!("kj fork --compact: failed to inject fork marker: {e}");
         }
@@ -1248,6 +1294,7 @@ impl KjDispatcher {
             template_nodes.len(),
             Some(&template_ref),
             staging,
+            None,
         ) {
             tracing::warn!("kj fork --as: failed to inject fork marker: {e}");
         }
@@ -1466,6 +1513,7 @@ impl KjDispatcher {
     ///
     /// The marker summarizes the fork operation (source, kind, block count) and is
     /// excluded from LLM hydration so it doesn't waste model context.
+    #[allow(clippy::too_many_arguments)] // a marker is summarized from many facets
     fn inject_fork_marker(
         &self,
         target_id: ContextId,
@@ -1474,18 +1522,25 @@ impl KjDispatcher {
         block_count: usize,
         source_label: Option<&str>,
         staging: bool,
+        // A visible note appended to the marker — e.g. a dropped hydration
+        // policy (3d). `None` for the plain marker.
+        note: Option<&str>,
     ) -> Result<(), String> {
         use kaijutsu_crdt::DriftKind;
 
         let source_short = source_id.short();
         let source_display = source_label.unwrap_or(&source_short);
-        let content = format!(
+        let mut content = format!(
             "forked from '{}' ({}) — {} copy, {} blocks",
             source_display,
             source_short,
             fork_kind.as_str(),
             block_count,
         );
+        if let Some(note) = note {
+            content.push_str(" — ");
+            content.push_str(note);
+        }
 
         let after = self.block_store().last_block_id(target_id);
         let block_id = self
@@ -1913,6 +1968,124 @@ mod tests {
             assert!(!kid.iter().any(|c| c.contains(body.as_str())), "notched {body:?}: {kid:?}");
         }
         assert_eq!(fork_kind_of(&d, child), Some(ForkKind::Filtered));
+    }
+
+    // ── slice 3d: hydration policy travel (marker-survives rule) ─────────
+
+    fn child_policy(
+        d: &crate::KjDispatcher,
+        ctx: kaijutsu_types::ContextId,
+    ) -> Option<(kaijutsu_crdt::BlockId, u32)> {
+        d.kernel_db().lock().get_hydration_policy(ctx).unwrap()
+    }
+
+    /// A full fork carries the parent's hydration policy: the marker remaps by
+    /// `(principal, seq)` onto the child context (resolves the "fork drops the
+    /// policy" backlog entry by construction).
+    #[tokio::test]
+    async fn fork_full_carries_hydration_policy() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let (source, _pc) = source_with_five(&d, principal).await;
+        let marker = d.block_store().block_snapshots(source).unwrap()[2].id;
+        d.kernel_db().lock().set_hydration_policy(source, marker, 3).unwrap();
+
+        let c = caller_with_context(source);
+        let result = d.dispatch(&[s("fork"), s("--name"), s("kid")], &c).await;
+        assert!(result.is_ok(), "fork failed: {}", result.message());
+
+        let child = child_id(&d, "kid");
+        let (cm, w) = child_policy(&d, child).expect("policy carried");
+        assert_eq!(w, 3);
+        // Marker remapped: same (principal, seq), child's context part.
+        assert_eq!(cm.principal_id, marker.principal_id);
+        assert_eq!(cm.seq, marker.seq);
+        assert_eq!(cm.context_id, child);
+        // And the carried marker actually points at a surviving child block.
+        assert!(
+            d.block_store().get_block_snapshot(child, &cm).unwrap().is_some(),
+            "carried marker must resolve in the child"
+        );
+    }
+
+    /// A `spawn` fork copies nothing, so the marker can't survive: the policy is
+    /// dropped (the child rc re-marks) and the fork marker says so visibly.
+    #[tokio::test]
+    async fn fork_spawn_drops_policy_with_visible_note() {
+        let d = test_dispatcher().await;
+        seed_factory_presets(&d);
+        let principal = PrincipalId::new();
+        let (source, _pc) = source_with_five(&d, principal).await;
+        let marker = d.block_store().block_snapshots(source).unwrap()[0].id;
+        d.kernel_db().lock().set_hydration_policy(source, marker, 2).unwrap();
+
+        let c = caller_with_context(source);
+        let result = d
+            .dispatch(&[s("fork"), s("--name"), s("born"), s("--preset"), s("spawn")], &c)
+            .await;
+        assert!(result.is_ok(), "spawn fork failed: {}", result.message());
+
+        let child = child_id(&d, "born");
+        assert!(child_policy(&d, child).is_none(), "spawn must not carry the policy");
+        let kid = ordered_contents(&d, child);
+        assert!(
+            kid.iter().any(|c| c.contains("hydration policy not carried")),
+            "the drop must be visible in the fork marker: {kid:?}"
+        );
+    }
+
+    /// A `window` fork keeps the marker (the prefix end) by construction, so the
+    /// policy travels — no drop note.
+    #[tokio::test]
+    async fn fork_window_preset_carries_policy() {
+        let d = test_dispatcher().await;
+        seed_factory_presets(&d);
+        let principal = PrincipalId::new();
+        let (source, _pc) = source_with_five(&d, principal).await;
+        let marker = d.block_store().block_snapshots(source).unwrap()[1].id;
+        d.kernel_db().lock().set_hydration_policy(source, marker, 2).unwrap();
+
+        let c = caller_with_context(source);
+        let result = d
+            .dispatch(&[s("fork"), s("--name"), s("win"), s("--preset"), s("window")], &c)
+            .await;
+        assert!(result.is_ok(), "window fork failed: {}", result.message());
+
+        let child = child_id(&d, "win");
+        let (cm, w) = child_policy(&d, child).expect("window carries the policy");
+        assert_eq!((cm.principal_id, cm.seq, w), (marker.principal_id, marker.seq, 2));
+        let kid = ordered_contents(&d, child);
+        assert!(
+            !kid.iter().any(|c| c.contains("not carried")),
+            "no drop note when the marker survives: {kid:?}"
+        );
+    }
+
+    /// An ad-hoc range that excludes the marked block drops the policy (visible
+    /// note) — the "iff the marker survived" case.
+    #[tokio::test]
+    async fn fork_adhoc_range_dropping_marker_drops_policy() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let (source, _pc) = source_with_five(&d, principal).await;
+        // Mark position 0, then keep only the tail (2:end) — the marker is
+        // outside the selection, so the policy must not travel.
+        let marker = d.block_store().block_snapshots(source).unwrap()[0].id;
+        d.kernel_db().lock().set_hydration_policy(source, marker, 2).unwrap();
+
+        let c = caller_with_context(source);
+        let result = d
+            .dispatch(&[s("fork"), s("--name"), s("tailonly"), s("--include"), s("2:end")], &c)
+            .await;
+        assert!(result.is_ok(), "ad-hoc fork failed: {}", result.message());
+
+        let child = child_id(&d, "tailonly");
+        assert!(child_policy(&d, child).is_none(), "dropped-marker fork must not carry policy");
+        let kid = ordered_contents(&d, child);
+        assert!(
+            kid.iter().any(|c| c.contains("hydration policy not carried")),
+            "drop must be visible: {kid:?}"
+        );
     }
 
     #[tokio::test]
