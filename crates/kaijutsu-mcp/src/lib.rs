@@ -1687,6 +1687,45 @@ impl KaijutsuMcp {
 // Background Event Listener
 // ============================================================================
 
+/// Push locally-authored ops (hook-captured blocks) to the server.
+///
+/// The base is the SyncManager's inbound frontier, so this re-sends every
+/// local op each call — wasteful but safe (server-side CRDT merge is
+/// idempotent). Eliminating the re-send needs a dedicated "pushed" frontier;
+/// that, plus making this the sole writer so a resync can't race local
+/// authoring, is the cohesive follow-up tracked in docs/issues.md.
+///
+/// Computes the payload under the lock, then releases it before the push await.
+pub(crate) async fn flush_local_ops(
+    actor: &ActorHandle,
+    synced: &Arc<parking_lot::Mutex<Option<SyncedDocument>>>,
+    context_id: ContextId,
+) {
+    let ops = {
+        let guard = synced.lock();
+        let Some(doc) = guard.as_ref() else { return };
+        let frontier = doc.sync().frontier().cloned().unwrap_or_default();
+        doc.doc().ops_since(&frontier)
+    };
+    if ops.block_ops.is_empty()
+        && ops.new_blocks.is_empty()
+        && ops.updated_headers.is_empty()
+        && ops.deleted_blocks.is_empty()
+    {
+        return;
+    }
+    let bytes = match kaijutsu_types::codec::encode(&ops) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(%context_id, "flush_local_ops encode failed: {e}");
+            return;
+        }
+    };
+    if let Err(e) = actor.push_ops(context_id, &bytes).await {
+        tracing::warn!(%context_id, "flush_local_ops push failed: {e}");
+    }
+}
+
 /// Re-fetch the server's full snapshot and realign the SyncedDocument.
 ///
 /// This is the catch-up that a bare re-subscribe skips. After a reconnect, a
@@ -1695,11 +1734,18 @@ impl KaijutsuMcp {
 /// document from the server's current state and resets the frontier so future
 /// incremental ops merge cleanly. The async fetch happens with NO lock held;
 /// the apply re-takes the lock briefly.
+///
+/// We FLUSH locally-authored ops first: `apply_sync_state` replaces the document
+/// wholesale, so any hook-authored blocks the server hasn't seen would be wiped.
+/// Pushing them before the fetch means the snapshot reflects them and they
+/// survive. (Residual: a block authored in the flush→apply window is still lost
+/// — closing that needs the sole-writer restructure noted in docs/issues.md.)
 async fn resync_synced(
     actor: &ActorHandle,
     synced: &Arc<parking_lot::Mutex<Option<SyncedDocument>>>,
     context_id: ContextId,
 ) {
+    flush_local_ops(actor, synced, context_id).await;
     let sync_state = match actor.get_context_sync(context_id).await {
         Ok(s) => s,
         Err(e) => {

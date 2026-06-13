@@ -481,36 +481,8 @@ async fn push_ops(remote: &RemoteState) -> anyhow::Result<()> {
             .map(|j| j.context_id)
             .ok_or_else(|| anyhow::anyhow!("No active context — register_session not called"))?
     };
-
-    // Collect ops since the sync frontier from the SyncedDocument. Extract the
-    // owned payload before dropping the lock — never hold it across the await.
-    let ops = {
-        let guard = remote.synced.lock();
-        let doc = guard
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("No synced document"))?;
-        let frontier = doc.sync().frontier().cloned().unwrap_or_default();
-        doc.doc().ops_since(&frontier)
-    };
-
-    // Check for empty payload before serializing
-    if ops.block_ops.is_empty()
-        && ops.new_blocks.is_empty()
-        && ops.updated_headers.is_empty()
-        && ops.deleted_blocks.is_empty()
-    {
-        return Ok(()); // No ops
-    }
-
-    let ops_bytes =
-        kaijutsu_types::codec::encode(&ops).map_err(|e| anyhow::anyhow!("Serialize error: {e}"))?;
-
-    remote
-        .actor
-        .push_ops(context_id, &ops_bytes)
-        .await
-        .map_err(|e| anyhow::anyhow!("Push ops: {e}"))?;
-
+    // Shared with resync's flush, so the two paths can't diverge.
+    crate::flush_local_ops(&remote.actor, &remote.synced, context_id).await;
     Ok(())
 }
 

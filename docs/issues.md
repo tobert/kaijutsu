@@ -600,36 +600,26 @@ dropped-stdout bug and the content/exit_code completion race are fixed (poll now
 does an authoritative `get_context_sync` read after terminal status); these are
 the *remaining* findings, triaged.
 
-- **HIGH — `hook_listener` breaks the single-writer invariant + resync TOCTOU.**
-  The bg listener is documented as the sole writer of `synced`, but
-  `HookListener` also writes (`doc_mut().insert_*` under `synced.lock()`,
-  `crates/kaijutsu-mcp/src/hook_listener.rs`). During `resync_synced`'s
-  `get_context_sync().await` (no lock held), a hook can author blocks into the
-  old doc, then `apply_sync_state` replaces it wholesale → hook-authored blocks
-  silently lost. Fix: either route hook authoring through the bg task (a
-  command channel), or have `resync_synced` re-apply locally-authored ops that
-  landed in the fetch→apply gap.
-- **HIGH — hook push frontier never advances → re-pushes ops every hook event.**
-  `push_ops` computes `ops_since(doc.sync().frontier())`; locally-authored
-  blocks don't advance the SyncManager (inbound) frontier, so every hook event
-  re-sends all prior locally-authored ops (idempotent server-side, but O(N)
-  bandwidth). Fix: track a separate `last_pushed` frontier and advance it after
-  a successful push.
-- **HIGH — bg event-listener panic is silently swallowed.** The `tokio::spawn`
-  JoinHandle is kept only for its AbortHandle; nobody observes it. If
-  `apply_event` panics, the listener dies, `notify_waiters` never fires again,
-  and every shell poll degrades to the 500ms fallback forever (looks like a
-  hang). Fix: supervise the task (log+surface on join) or `is_finished()`-check
-  it in the poll.
-- **MED — `std::sync::Mutex` + poisoning on a single-threaded (LocalSet)
-  runtime.** Holding `synced.lock()` blocks the whole thread (not just the
-  task), and any panic-under-lock poisons it, cascading every
-  `.expect("synced mutex poisoned")`. Switching to `parking_lot::Mutex`
-  removes poisoning and the blocking-vs-async hazard in one move.
-- **MED — Notify lost-wakeup adds up to 500ms poll latency.** Classic check→
-  await TOCTOU on `tokio::sync::Notify`; the 500ms fallback prevents a hang but
-  not the latency. Fix: a `tokio::sync::watch` carrying a monotonic generation
-  counter (read gen, then `changed()` — no window).
+- **HIGH (PARTIAL) — hook authoring vs resync: sole-writer + pushed-frontier.**
+  `HookListener` writes blocks directly (`doc_mut().insert_*` under
+  `synced.lock()`), so the bg listener is NOT the sole writer. `apply_sync_state`
+  replaces the doc wholesale, so un-pushed hook blocks could be wiped on resync;
+  and `push_ops` bases `ops_since` on the inbound SyncManager frontier, which
+  local authoring never advances → every hook event re-pushes all prior local
+  ops (idempotent but O(N)). MITIGATED 2026-06-13: `resync_synced` now FLUSHES
+  local ops (`flush_local_ops`) before fetching the snapshot, so hook blocks
+  round-trip through the server and survive the common case. REMAINING (cohesive
+  follow-up, needs design + CRDT-frontier testing): (a) a dedicated "pushed"
+  frontier so flush stops re-sending; (b) close the residual flush→apply window
+  where a block authored mid-resync is still lost — cleanest via a command
+  channel that makes the bg task the true sole writer (authoring + push + resync
+  all serialized in one task).
+- **[DONE 2026-06-13] bg event-listener panic silently swallowed** — supervisor
+  task now awaits the JoinHandle and logs warn/debug/error by outcome (`2a16fdf`).
+- **[DONE 2026-06-13] `std::sync::Mutex` poisoning / thread-block** — `synced`
+  moved to `parking_lot::Mutex` (`72e686d`).
+- **[DONE 2026-06-13] Notify lost-wakeup** — `change` is now a `watch::Sender<u64>`
+  generation counter; poll subscribes then `await changed()` (`3870a23`).
 - **MED — multi-context operations silently collapse to one in Remote.**
   `search_context`, `list_resources`, the `kaijutsu://docs` reader, and
   completions call `context_ids()`, which in Remote returns only the single
