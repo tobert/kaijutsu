@@ -77,11 +77,11 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
 use kaijutsu_client::{
-    ActorHandle, ConnectionStatus, ServerEvent, SshConfig, SyncManager, connect_ssh, spawn_actor,
+    ActorHandle, ConnectionStatus, SshConfig, SyncEffect, SyncedDocument, connect_ssh, spawn_actor,
 };
 use kaijutsu_crdt::{BlockId, ContextId, ConversationDAG, PrincipalId};
-use kaijutsu_kernel::block_store::DocumentKind as DocKind;
-use kaijutsu_kernel::{SharedBlockStore, shared_block_flow_bus, shared_block_store};
+use kaijutsu_kernel::{SharedBlockStore, shared_block_store};
+use tokio::sync::Notify;
 
 // Re-export public types
 use helpers::*;
@@ -153,6 +153,11 @@ enum ShellCompletion {
         timeout_secs: u64,
         elapsed_ms: u64,
     },
+    /// Reserved for connection-loss detection. The current SyncedDocument poll
+    /// degrades a mid-command disconnect to `Timeout` (it waits on `change`
+    /// rather than the raw event stream); this variant + its `to_json` arm are
+    /// kept for when the poll learns to surface a closed connection directly.
+    #[allow(dead_code)]
     StreamClosed {
         cmd_block_id: BlockId,
         elapsed_ms: u64,
@@ -244,8 +249,14 @@ pub struct RemoteState {
     pub kernel_id: kaijutsu_crdt::KernelId,
     /// Send+Sync actor handle for RPC operations
     pub actor: ActorHandle,
-    /// Local block store — starts empty, populated by register_session.
-    pub store: SharedBlockStore,
+    /// The single joined context's synced CRDT document — `None` until
+    /// `register_session`. Owns the `SyncManager`; the background listener is
+    /// the *only* writer, so reads see a consistent, in-order-applied snapshot
+    /// (out-of-order events are buffered+replayed by `SyncedDocument`).
+    pub synced: Arc<Mutex<Option<SyncedDocument>>>,
+    /// Wake signal: the background listener calls `notify_waiters()` after each
+    /// applied event so waiters (e.g. the shell completion poll) re-read.
+    pub change: Arc<Notify>,
     /// Joined context state (None until register_session is called)
     pub joined: Arc<tokio::sync::RwLock<Option<JoinedContext>>>,
     /// Shared context_id for hook listener (updated by register_session)
@@ -257,8 +268,6 @@ pub struct RemoteState {
 pub struct JoinedContext {
     /// Context ID we joined
     pub context_id: kaijutsu_crdt::ContextId,
-    /// Frontier-tracking sync state machine.
-    pub sync: Arc<Mutex<SyncManager>>,
     /// Abort handle for the background event listener.
     _bg_task: Arc<AbortOnDrop>,
 }
@@ -362,7 +371,23 @@ impl KaijutsuMcp {
             username: whoami::username(),
             ..SshConfig::default()
         };
+        Self::connect_with_config(config, context_name, cc_session_id).await
+    }
 
+    /// Connect using an explicit [`SshConfig`].
+    ///
+    /// This is the seam `connect` delegates to. It exists so callers (and the
+    /// e2e test harness) can point the full MCP machinery — actor, store,
+    /// background sync listener, poll path — at a server reachable only with a
+    /// non-default config (e.g. an ephemeral test server using
+    /// `KeySource::ephemeral()` + `insecure`). Must be called within a
+    /// `LocalSet`. Like `connect`, it establishes the connection and spawns the
+    /// actor but does NOT join a context — call `register_session` for that.
+    pub async fn connect_with_config(
+        config: SshConfig,
+        context_name: &str,
+        cc_session_id: Option<&str>,
+    ) -> Result<Self, anyhow::Error> {
         tracing::debug!(?config, "Connecting via SSH");
 
         let client = connect_ssh(config.clone()).await?;
@@ -388,17 +413,14 @@ impl KaijutsuMcp {
         let shared_context_id = Arc::new(Mutex::new(None));
         let session_principal = PrincipalId::new();
 
-        // Create an empty store — populated by register_session
-        let store = std::sync::Arc::new(kaijutsu_kernel::BlockStore::with_flows(
-            session_principal,
-            shared_block_flow_bus(1024),
-        ));
-
         Ok(Self {
             backend: Backend::Remote(RemoteState {
                 kernel_id: kernel_id_typed,
                 actor,
-                store,
+                // SyncedDocument is built once the context is known, in
+                // register_session. `change` wakes the shell poll on each apply.
+                synced: Arc::new(Mutex::new(None)),
+                change: Arc::new(Notify::new()),
                 joined: Arc::new(tokio::sync::RwLock::new(None)),
                 shared_context_id,
             }),
@@ -423,17 +445,6 @@ impl KaijutsuMcp {
         &self.session_id
     }
 
-    /// Get the underlying store for tool operations.
-    ///
-    /// For Remote mode, returns the store which starts empty and is populated
-    /// by `register_session`.
-    fn store(&self) -> &SharedBlockStore {
-        match &self.backend {
-            Backend::Local(store) => store,
-            Backend::Remote(remote) => &remote.store,
-        }
-    }
-
     /// Get the remote state if connected to a server.
     fn remote(&self) -> Option<&RemoteState> {
         match &self.backend {
@@ -442,15 +453,65 @@ impl KaijutsuMcp {
         }
     }
 
+    /// Run `f` against a context's CRDT document, regardless of backend, and
+    /// return its result (or `None` if the context isn't resident). Local reads
+    /// the multi-context kernel store; Remote reads the single joined
+    /// `SyncedDocument`. The closure runs while the backend's guard/lock is
+    /// held — keep it cheap and never `.await` inside it.
+    fn with_doc<R>(
+        &self,
+        ctx: ContextId,
+        f: impl FnOnce(&kaijutsu_crdt::block_store::BlockStore) -> R,
+    ) -> Option<R> {
+        match &self.backend {
+            Backend::Local(store) => store.get(ctx).map(|e| f(&e.doc)),
+            Backend::Remote(remote) => {
+                let guard = remote.synced.lock().expect("synced mutex poisoned");
+                guard.as_ref().map(|d| f(d.doc()))
+            }
+        }
+    }
+
+    /// Resident context ids. Remote exposes only the single joined context.
+    fn context_ids(&self) -> Vec<ContextId> {
+        match &self.backend {
+            Backend::Local(store) => store.list_ids(),
+            Backend::Remote(remote) => remote
+                .synced
+                .lock()
+                .ok()
+                .and_then(|g| g.as_ref().map(|d| vec![d.context_id()]))
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Whether `ctx` is resident in this backend.
+    fn contains_context(&self, ctx: ContextId) -> bool {
+        self.with_doc(ctx, |_| ()).is_some()
+    }
+
+    /// Read one block snapshot, regardless of backend.
+    fn read_block(&self, ctx: ContextId, id: &BlockId) -> Option<kaijutsu_crdt::BlockSnapshot> {
+        self.with_doc(ctx, |doc| doc.get_block_snapshot(id)).flatten()
+    }
+
+    /// Resolve a block-id string to `(ContextId, BlockId)` if it's resident,
+    /// regardless of backend. Replaces the free `find_block(store, ..)` helper.
+    fn locate_block(&self, block_id_str: &str) -> Option<(ContextId, BlockId)> {
+        let block_id = parse_block_id(block_id_str)?;
+        let ctx = block_id.context_id;
+        self.read_block(ctx, &block_id).map(|_| (ctx, block_id))
+    }
+
     /// Get the joined context's context_id and sync state.
     /// Returns an error string if no context has been joined (register_session not called).
-    async fn require_joined(&self) -> Result<(ContextId, &SharedBlockStore, &ActorHandle), String> {
+    async fn require_joined(&self) -> Result<(ContextId, &ActorHandle), String> {
         match &self.backend {
             Backend::Local(_) => Err("Error: not connected to server".to_string()),
             Backend::Remote(remote) => {
                 let guard = remote.joined.read().await;
                 match guard.as_ref() {
-                    Some(joined) => Ok((joined.context_id, &remote.store, &remote.actor)),
+                    Some(joined) => Ok((joined.context_id, &remote.actor)),
                     None => {
                         Err("Error: no active context — call register_session first".to_string())
                     }
@@ -467,24 +528,28 @@ impl KaijutsuMcp {
             .remote()
             .ok_or_else(|| anyhow::anyhow!("Not connected to server"))?;
 
-        let guard = remote.joined.read().await;
-        let joined = guard
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("No active context — call register_session first"))?;
-
-        // Get ops since last sync frontier from SyncManager
-        let frontier = {
-            let sync = joined
-                .sync
-                .lock()
-                .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
-            sync.frontier().cloned().unwrap_or_default()
+        let context_id = {
+            let guard = remote.joined.read().await;
+            guard
+                .as_ref()
+                .map(|j| j.context_id)
+                .ok_or_else(|| anyhow::anyhow!("No active context — call register_session first"))?
         };
 
-        let ops = remote
-            .store
-            .ops_since(joined.context_id, &frontier)
-            .map_err(|e| anyhow::anyhow!(e))?;
+        // Collect ops since the sync frontier from the SyncedDocument. Extract
+        // the owned payload before dropping the lock — never hold it across the
+        // push await below.
+        let ops = {
+            let guard = remote
+                .synced
+                .lock()
+                .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
+            let doc = guard
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("No synced document"))?;
+            let frontier = doc.sync().frontier().cloned().unwrap_or_default();
+            doc.doc().ops_since(&frontier)
+        };
 
         // Check for empty payload before serializing
         if ops.block_ops.is_empty()
@@ -500,7 +565,7 @@ impl KaijutsuMcp {
             kaijutsu_types::codec::encode(&ops).map_err(|e| anyhow::anyhow!("Serialize error: {}", e))?;
 
         tracing::debug!(
-            ctx = %joined.context_id,
+            ctx = %context_id,
             ops_bytes = ops_bytes.len(),
             "Pushing ops to server"
         );
@@ -508,11 +573,11 @@ impl KaijutsuMcp {
         // Push via persistent actor (no reconnect dance)
         let ack_version = remote
             .actor
-            .push_ops(joined.context_id, &ops_bytes)
+            .push_ops(context_id, &ops_bytes)
             .await
             .map_err(|e| anyhow::anyhow!("Push ops: {e}"))?;
 
-        tracing::info!(ctx = %joined.context_id, ack_version, "Pushed ops");
+        tracing::info!(ctx = %context_id, ack_version, "Pushed ops");
 
         let ops_count = ops_bytes.len() / 50; // Rough estimate
         Ok((ops_count.max(1), ack_version))
@@ -595,16 +660,21 @@ impl KaijutsuMcp {
         timeout_secs: u64,
         label: &str,
     ) -> ShellCompletion {
+        // The SyncedDocument is single-context; `ctx_id` is retained for
+        // call-site clarity but reads come straight from the joined doc.
+        let _ = ctx_id;
         let start = std::time::Instant::now();
-        let mut event_rx = remote.actor.subscribe_events();
         let fallback_interval = tokio::time::Duration::from_millis(500);
 
-        // Completion check — looks for a finished ToolResult child of our command block.
-        // One shell command produces exactly one ToolResult child, so parent_id match is sufficient.
-        let check_completion = |source: &str| -> Option<kaijutsu_crdt::BlockSnapshot> {
-            let entry = remote.store.get(ctx_id)?;
-            let blocks = entry.doc.blocks_ordered();
-            let output = blocks.iter().find(|b| {
+        // Completion check — finds the finished ToolResult child of our command
+        // block in the SyncedDocument. The single background listener applies
+        // events in order and buffers out-of-order ones, so a Done/Error status
+        // here implies content + exit_code are already applied: a consistent
+        // snapshot, never the empty-stdout race the two-receiver design had.
+        let find_terminal = || -> Option<kaijutsu_crdt::BlockSnapshot> {
+            let guard = remote.synced.lock().expect("synced mutex poisoned");
+            let doc = guard.as_ref()?;
+            doc.blocks().into_iter().find(|b| {
                 b.parent_id.as_ref() == Some(&cmd_block_id)
                     && b.is_shell()
                     && b.kind == kaijutsu_crdt::BlockKind::ToolResult
@@ -612,19 +682,43 @@ impl KaijutsuMcp {
                         b.status,
                         kaijutsu_crdt::Status::Done | kaijutsu_crdt::Status::Error
                     )
-            })?;
-            tracing::info!(
-                command = %command,
-                status = %output.status.as_str(),
-                exit_code = ?output.exit_code,
-                output_len = output.content.len(),
-                elapsed_ms = start.elapsed().as_millis() as u64,
-                "{label} completed (via {source})"
-            );
-            Some((*output).clone())
+            })
         };
 
+        // Once the ToolResult reaches a terminal status, give `exit_code` a
+        // brief window to replicate: it rides `BlockMetadataChanged`, a
+        // different event/topic than the status change, so it can land a beat
+        // after `Done`. Returning the instant we see `Done` would report a null
+        // code for a command that actually succeeded. In the common case the
+        // metadata event arrives within a notify tick or two — far under the
+        // cap — so this rarely adds latency; the cap only bounds the rare path
+        // where no exit_code ever arrives (e.g. a kaish-level exec failure).
+        let mut terminal_since: Option<std::time::Instant> = None;
+        let exit_code_grace = std::time::Duration::from_millis(1000);
+
         loop {
+            if let Some(snap) = find_terminal() {
+                let graced = terminal_since
+                    .map(|t| t.elapsed() >= exit_code_grace)
+                    .unwrap_or(false);
+                if snap.exit_code.is_some() || graced {
+                    tracing::info!(
+                        command = %command,
+                        status = %snap.status.as_str(),
+                        exit_code = ?snap.exit_code,
+                        output_len = snap.content.len(),
+                        elapsed_ms = start.elapsed().as_millis() as u64,
+                        "{label} completed"
+                    );
+                    return ShellCompletion::Done {
+                        snapshot: snap,
+                        elapsed_ms: start.elapsed().as_millis() as u64,
+                    };
+                }
+                if terminal_since.is_none() {
+                    terminal_since = Some(std::time::Instant::now());
+                }
+            }
             if start.elapsed().as_secs() > timeout_secs {
                 return ShellCompletion::Timeout {
                     cmd_block_id,
@@ -632,48 +726,11 @@ impl KaijutsuMcp {
                     elapsed_ms: start.elapsed().as_millis() as u64,
                 };
             }
-
-            // Wait for either an event or the fallback timeout
-            let event = tokio::time::timeout(fallback_interval, event_rx.recv()).await;
-
-            match event {
-                Ok(Ok(ServerEvent::BlockStatusChanged {
-                    status: kaijutsu_crdt::Status::Done | kaijutsu_crdt::Status::Error,
-                    ..
-                })) => {
-                    if let Some(snap) = check_completion("event") {
-                        return ShellCompletion::Done {
-                            snapshot: snap,
-                            elapsed_ms: start.elapsed().as_millis() as u64,
-                        };
-                    }
-                }
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
-                    return ShellCompletion::StreamClosed {
-                        cmd_block_id,
-                        elapsed_ms: start.elapsed().as_millis() as u64,
-                    };
-                }
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(n))) => {
-                    tracing::warn!(skipped = n, "Event stream lagged, checking store");
-                    if let Some(snap) = check_completion("lagged") {
-                        return ShellCompletion::Done {
-                            snapshot: snap,
-                            elapsed_ms: start.elapsed().as_millis() as u64,
-                        };
-                    }
-                }
-                Err(_timeout) => {
-                    // 500ms fallback — check store state
-                    if let Some(snap) = check_completion("fallback") {
-                        return ShellCompletion::Done {
-                            snapshot: snap,
-                            elapsed_ms: start.elapsed().as_millis() as u64,
-                        };
-                    }
-                }
-                _ => continue, // Other events — keep waiting
-            }
+            // Wait for the listener to apply the next event (it calls
+            // `notify_waiters` after each), then re-check. The fallback tick
+            // bounds any lost-wakeup latency between the check above and the
+            // wait registration to `fallback_interval`.
+            let _ = tokio::time::timeout(fallback_interval, remote.change.notified()).await;
         }
     }
 }
@@ -770,7 +827,7 @@ impl KaijutsuMcp {
     )]
     #[tracing::instrument(skip(self, req), name = "mcp.shell")]
     async fn shell(&self, Parameters(req): Parameters<ShellRequest>) -> String {
-        let (ctx_id, _store, actor) = match self.require_joined().await {
+        let (ctx_id, actor) = match self.require_joined().await {
             Ok(v) => v,
             Err(e) => return e,
         };
@@ -811,10 +868,10 @@ impl KaijutsuMcp {
         annotations(open_world_hint = true)
     )]
     #[tracing::instrument(skip(self, req), name = "mcp.context_shell")]
-    async fn context_shell(&self, Parameters(req): Parameters<ContextShellRequest>) -> String {
+    pub async fn context_shell(&self, Parameters(req): Parameters<ContextShellRequest>) -> String {
         // Route through shell_execute — same path as the shell tool.
         // The command is passed verbatim to kaish (no auto-prepending).
-        let (ctx_id, _store, actor) = match self.require_joined().await {
+        let (ctx_id, actor) = match self.require_joined().await {
             Ok(v) => v,
             Err(e) => return e,
         };
@@ -860,7 +917,7 @@ impl KaijutsuMcp {
         )
     )]
     #[tracing::instrument(skip(self, req), name = "mcp.register_session")]
-    async fn register_session(
+    pub async fn register_session(
         &self,
         Parameters(req): Parameters<RegisterSessionRequest>,
     ) -> String {
@@ -915,51 +972,30 @@ impl KaijutsuMcp {
             Err(e) => return format!("Error syncing context: {e}"),
         };
 
-        // 4. Populate the store
-        if !sync_state.ops.is_empty() {
-            if let Err(e) = remote.store.create_document_from_snapshot(
-                sync_state.context_id,
-                DocKind::Conversation,
-                None,
-                &sync_state.ops,
-            ) {
-                return format!("Error populating store: {e}");
-            }
-        } else if let Err(e) =
-            remote
-                .store
-                .create_document(sync_state.context_id, DocKind::Conversation, None)
+        // 4. Build the synced document from the server snapshot. SyncedDocument
+        // owns the SyncManager and buffers out-of-order events (text ops /
+        // status changes that arrive before their BlockInserted), replaying
+        // them on insert — the fix for the dropped-stdout bug.
+        let synced_doc = match SyncedDocument::from_sync_state(&sync_state, self.session_principal) {
+            Ok(d) => d,
+            Err(e) => return format!("Error building synced document: {e}"),
+        };
         {
-            return format!("Error creating document: {e}");
+            let mut g = remote.synced.lock().expect("synced mutex poisoned");
+            *g = Some(synced_doc);
         }
 
-        // 5. Init SyncManager
-        let frontier = remote
-            .store
-            .frontier(sync_state.context_id)
-            .unwrap_or_default();
-        let sync = SyncManager::with_state(Some(sync_state.context_id), Some(frontier));
-        let sync_arc = Arc::new(Mutex::new(sync));
-
-        // 6. Spawn background event listener.
-        //
-        // Besides applying events, this task keeps the store replica from
-        // silently diverging from the server (the root of the empty-stdout-
-        // after-reconnect bug). It triggers a full resync — re-fetch the
-        // server snapshot and realign the SyncManager frontier — on three
-        // signals:
-        //   * a `Connected` status (every one received here is a *re*connect,
-        //     since we were already connected when we subscribed),
-        //   * a broadcast `Lagged` (dropped events → frontier may be stale),
-        //   * the SyncManager landing in `needs_full_sync` after an event
-        //     (an incremental merge failed and stranded text ops).
-        // Without this, a reconnect re-subscribes but never catches up, so
-        // stdout edits never replicate while status changes still do.
+        // 5. Spawn the single background event listener — the ONLY writer of the
+        // SyncedDocument. It applies each event, then wakes waiters (the shell
+        // completion poll) via `change`. A `NeedsResync` effect, a broadcast
+        // `Lagged`, or a reconnect (`Connected`) triggers a full resync from the
+        // server snapshot. Single applier + wake-on-change replaces the old
+        // two-receiver race (poll read the store before the listener applied).
         let bg_abort = {
             let mut event_rx = remote.actor.subscribe_events();
             let mut status_rx = remote.actor.subscribe_status();
-            let store_bg = Arc::clone(&remote.store);
-            let sync_bg = Arc::clone(&sync_arc);
+            let synced_bg = Arc::clone(&remote.synced);
+            let change_bg = Arc::clone(&remote.change);
             let actor_bg = remote.actor.clone();
             let ctx_id_bg = context_id;
 
@@ -968,21 +1004,20 @@ impl KaijutsuMcp {
                     tokio::select! {
                         ev = event_rx.recv() => match ev {
                             Ok(event) => {
-                                apply_server_event(&store_bg, &sync_bg, ctx_id_bg, event);
-                                // An incremental merge may have reset the
-                                // frontier; if so, recover by full resync
-                                // rather than stranding future text ops.
-                                let needs = sync_bg
-                                    .lock()
-                                    .expect("sync mutex poisoned")
-                                    .needs_full_sync(ctx_id_bg);
-                                if needs {
-                                    resync_store(&actor_bg, &store_bg, &sync_bg, ctx_id_bg).await;
+                                // Apply under the lock, drop it before any await.
+                                let effect = {
+                                    let mut g = synced_bg.lock().expect("synced mutex poisoned");
+                                    g.as_mut().map(|s| s.apply_event(&event))
+                                };
+                                if matches!(effect, Some(SyncEffect::NeedsResync)) {
+                                    resync_synced(&actor_bg, &synced_bg, ctx_id_bg).await;
                                 }
+                                change_bg.notify_waiters();
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                                 tracing::warn!("Missed {n} events, forcing full resync");
-                                resync_store(&actor_bg, &store_bg, &sync_bg, ctx_id_bg).await;
+                                resync_synced(&actor_bg, &synced_bg, ctx_id_bg).await;
+                                change_bg.notify_waiters();
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         },
@@ -990,22 +1025,21 @@ impl KaijutsuMcp {
                             Ok(ConnectionStatus::Connected { .. }) => {
                                 tracing::info!(
                                     context_id = %ctx_id_bg,
-                                    "Reconnected — resyncing MCP store replica",
+                                    "Reconnected — resyncing MCP synced document",
                                 );
-                                resync_store(&actor_bg, &store_bg, &sync_bg, ctx_id_bg).await;
+                                resync_synced(&actor_bg, &synced_bg, ctx_id_bg).await;
+                                change_bg.notify_waiters();
                             }
                             // A lagged status stream may have DROPPED a Connected
-                            // transition — we can't tell, so resync to be safe
-                            // rather than silently miss a reconnect's catch-up.
+                            // transition — we can't tell, so resync to be safe.
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                                 tracing::warn!(
                                     context_id = %ctx_id_bg,
                                     "Status stream lagged ({n}) — resyncing in case a reconnect was missed",
                                 );
-                                resync_store(&actor_bg, &store_bg, &sync_bg, ctx_id_bg).await;
+                                resync_synced(&actor_bg, &synced_bg, ctx_id_bg).await;
+                                change_bg.notify_waiters();
                             }
-                            // Other statuses need no catch-up; a closed status
-                            // stream just means no more transitions.
                             Ok(_) => {}
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
                         },
@@ -1015,12 +1049,11 @@ impl KaijutsuMcp {
             bg_handle.abort_handle()
         };
 
-        // 7. Write JoinedContext
+        // 6. Write JoinedContext
         {
             let mut guard = remote.joined.write().await;
             *guard = Some(JoinedContext {
                 context_id,
-                sync: sync_arc,
                 _bg_task: Arc::new(AbortOnDrop(bg_abort)),
             });
         }
@@ -1054,7 +1087,7 @@ impl KaijutsuMcp {
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
     #[tracing::instrument(skip(self), name = "mcp.whoami")]
-    async fn whoami(&self) -> String {
+    pub async fn whoami(&self) -> String {
         let session_id = self.session_id.lock().ok().and_then(|g| g.clone());
 
         let actor = match self.actor() {
@@ -1323,29 +1356,36 @@ impl KaijutsuMcp {
             )
         })?;
 
-        let entry = self.store().get(context_id).ok_or_else(|| {
+        let focus = args.focus.as_deref().unwrap_or("all");
+
+        // Pull blocks, structure tree, and version under one guard (works for
+        // both backends), then build the prompt text.
+        let want_structure = focus == "all" || focus == "structure";
+        let extracted = self.with_doc(context_id, |doc| {
+            let blocks = doc.blocks_ordered();
+            let tree_lines = if want_structure {
+                let dag = ConversationDAG::from_store(doc);
+                Some(format_dag_tree(&dag, None, false))
+            } else {
+                None
+            };
+            (blocks, tree_lines, doc.version())
+        });
+        let (blocks, tree_lines, version) = extracted.ok_or_else(|| {
             McpError::invalid_params(format!("Document '{}' not found", args.document_id), None)
         })?;
-
-        let focus = args.focus.as_deref().unwrap_or("all");
-        let blocks = entry.doc.blocks_ordered();
 
         let mut content = String::new();
 
         // Document overview
         content.push_str(&format!("# Document: {}\n\n", args.document_id));
-        content.push_str(&format!("**Kind:** {}\n", entry.kind.as_str()));
-        if let Some(ref lang) = entry.language {
-            content.push_str(&format!("**Language:** {}\n", lang));
-        }
+        content.push_str("**Kind:** Conversation\n");
         content.push_str(&format!("**Block count:** {}\n", blocks.len()));
-        content.push_str(&format!("**Version:** {}\n\n", entry.version()));
+        content.push_str(&format!("**Version:** {}\n\n", version));
 
         // Structure analysis
-        if focus == "all" || focus == "structure" {
+        if let Some(tree_lines) = tree_lines {
             content.push_str("## Structure\n\n");
-            let dag = ConversationDAG::from_store(&entry.doc);
-            let tree_lines = format_dag_tree(&dag, None, false);
             for line in tree_lines {
                 content.push_str(&line);
                 content.push('\n');
@@ -1422,7 +1462,7 @@ impl KaijutsuMcp {
             let id = ContextId::parse(doc_id).map_err(|e| {
                 McpError::invalid_params(format!("Invalid document ID '{}': {}", doc_id, e), None)
             })?;
-            if self.store().contains(id) {
+            if self.contains_context(id) {
                 vec![id]
             } else {
                 return Err(McpError::invalid_params(
@@ -1431,7 +1471,7 @@ impl KaijutsuMcp {
                 ));
             }
         } else {
-            self.store().list_ids()
+            self.context_ids()
         };
 
         let mut content = String::new();
@@ -1441,10 +1481,9 @@ impl KaijutsuMcp {
         let context_lines = 3;
 
         for context_id in context_ids {
-            let snapshots = match self.store().block_snapshots(context_id) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
+            let snapshots = self
+                .with_doc(context_id, |doc| doc.blocks_ordered())
+                .unwrap_or_default();
 
             for snapshot in snapshots {
                 let lines: Vec<&str> = snapshot.content.lines().collect();
@@ -1512,18 +1551,12 @@ impl KaijutsuMcp {
         &self,
         Parameters(args): Parameters<EditingAssistantArgs>,
     ) -> Result<GetPromptResult, McpError> {
-        let (context_id, block_id) = find_block(self.store(), &args.block_id).ok_or_else(|| {
+        let (context_id, block_id) = self.locate_block(&args.block_id).ok_or_else(|| {
             McpError::invalid_params(format!("Block '{}' not found", args.block_id), None)
         })?;
 
-        let entry = self
-            .store()
-            .get(context_id)
-            .ok_or_else(|| McpError::invalid_params("Document not found", None))?;
-
-        let snapshot = entry
-            .doc
-            .get_block_snapshot(&block_id)
+        let snapshot = self
+            .read_block(context_id, &block_id)
             .ok_or_else(|| McpError::invalid_params("Block not found", None))?;
 
         let edit_type = args.edit_type.as_deref().unwrap_or("refine");
@@ -1546,7 +1579,7 @@ impl KaijutsuMcp {
 
         // Add parent context if available
         if let Some(parent_id) = snapshot.parent_id
-            && let Some(parent_snap) = entry.doc.get_block_snapshot(&parent_id)
+            && let Some(parent_snap) = self.read_block(context_id, &parent_id)
         {
             content.push_str("## Parent Context\n\n");
             let preview = if parent_snap.content.len() > 500 {
@@ -1609,19 +1642,17 @@ impl KaijutsuMcp {
 // Background Event Listener
 // ============================================================================
 
-/// Re-fetch the server's full snapshot and realign the store + frontier.
+/// Re-fetch the server's full snapshot and realign the SyncedDocument.
 ///
-/// This is the catch-up that a bare re-subscribe skips. After a reconnect (or
-/// a lag / failed incremental merge), the client replica can diverge: status
-/// changes keep applying directly while text ops stall behind a stale
-/// frontier. Pulling `get_context_sync` and feeding it through
-/// `apply_initial_state` rebuilds the document from the server's current state
-/// (content, exit_code, stderr — everything) and resets the frontier so future
-/// incremental ops merge cleanly.
-async fn resync_store(
+/// This is the catch-up that a bare re-subscribe skips. After a reconnect, a
+/// lag, or a `NeedsResync` effect, the client replica can diverge. Pulling
+/// `get_context_sync` and feeding it through `apply_sync_state` rebuilds the
+/// document from the server's current state and resets the frontier so future
+/// incremental ops merge cleanly. The async fetch happens with NO lock held;
+/// the apply re-takes the lock briefly.
+async fn resync_synced(
     actor: &ActorHandle,
-    store: &SharedBlockStore,
-    sync: &Arc<Mutex<SyncManager>>,
+    synced: &Arc<Mutex<Option<SyncedDocument>>>,
     context_id: ContextId,
 ) {
     let sync_state = match actor.get_context_sync(context_id).await {
@@ -1631,135 +1662,19 @@ async fn resync_store(
             return;
         }
     };
-    if sync_state.ops.is_empty() {
-        tracing::debug!(%context_id, "resync skipped — empty server snapshot");
-        return;
-    }
-    let mut sync_guard = sync.lock().expect("sync mutex poisoned");
-    let Some(mut entry) = store.get_mut(context_id) else {
-        tracing::warn!(%context_id, "resync skipped — context not resident in store");
+    let mut guard = synced.lock().expect("synced mutex poisoned");
+    let Some(doc) = guard.as_mut() else {
+        tracing::warn!(%context_id, "resync skipped — no synced document");
         return;
     };
-    match sync_guard.apply_initial_state(&mut entry.doc, context_id, &sync_state.ops) {
-        Ok(_) => {
-            entry.touch(PrincipalId::system());
-            tracing::info!(%context_id, "MCP store replica resynced from server snapshot");
+    match doc.apply_sync_state(&sync_state) {
+        Ok(effect) => {
+            tracing::info!(%context_id, ?effect, "MCP synced document resynced from server snapshot");
         }
-        Err(e) => tracing::warn!(%context_id, "resync apply_initial_state failed: {e}"),
+        Err(e) => tracing::warn!(%context_id, "resync apply_sync_state failed: {e}"),
     }
 }
 
-/// Apply a server event to the store's BlockDocument via SyncManager.
-///
-/// Called by the background event listener spawned in `connect()`.
-/// Only handles CRDT-relevant events (BlockInserted, BlockTextOps, BlockStatusChanged).
-/// Uses the store as the single source of truth — all MCP tools read from the store.
-fn apply_server_event(
-    store: &SharedBlockStore,
-    sync: &Arc<Mutex<SyncManager>>,
-    context_id: ContextId,
-    event: ServerEvent,
-) {
-    match event {
-        ServerEvent::BlockInserted {
-            context_id: event_ctx_id,
-            block,
-            ops,
-            ..
-        } => {
-            if event_ctx_id != context_id {
-                return;
-            }
-            let mut s = sync.lock().expect("sync mutex poisoned");
-            if let Some(mut entry) = store.get_mut(context_id) {
-                match s.apply_block_inserted(&mut entry.doc, event_ctx_id, &block, &ops) {
-                    Ok(_) => {
-                        entry.touch(PrincipalId::system());
-                        tracing::trace!(block = ?block.id, "Applied BlockInserted");
-                    }
-                    Err(e) => tracing::warn!(block = ?block.id, "BlockInserted sync error: {e}"),
-                }
-            }
-        }
-        ServerEvent::BlockTextOps {
-            context_id: event_ctx_id,
-            ops,
-            ..
-        } => {
-            if event_ctx_id != context_id {
-                return;
-            }
-            let mut s = sync.lock().expect("sync mutex poisoned");
-            if let Some(mut entry) = store.get_mut(context_id) {
-                match s.apply_text_ops(&mut entry.doc, event_ctx_id, &ops) {
-                    Ok(_) => {
-                        entry.touch(PrincipalId::system());
-                        tracing::trace!("Applied BlockTextOps");
-                    }
-                    Err(e) => tracing::warn!("BlockTextOps sync error: {e}"),
-                }
-            }
-        }
-        ServerEvent::BlockStatusChanged {
-            context_id: event_ctx_id,
-            block_id,
-            status,
-        } => {
-            if event_ctx_id != context_id {
-                return;
-            }
-            // Use store's set_status — handles version bump and flow events
-            if let Err(e) = store.set_status(context_id, &block_id, status) {
-                tracing::warn!("BlockStatusChanged error: {e}");
-            }
-        }
-        ServerEvent::BlockOutputChanged {
-            context_id: event_ctx_id,
-            block_id,
-            ref output,
-        } => {
-            if event_ctx_id != context_id {
-                return;
-            }
-            // Output is not DTE-tracked — apply it directly to the store.
-            if let Err(e) = store.set_output(context_id, &block_id, output.as_ref()) {
-                tracing::warn!("BlockOutputChanged set_output error: {e}");
-            }
-        }
-        ServerEvent::BlockMetadataChanged {
-            context_id: event_ctx_id,
-            block_id,
-            ref metadata,
-        } => {
-            if event_ctx_id != context_id {
-                return;
-            }
-            // Scalar metadata is not DTE-tracked — apply it directly to the
-            // store, bypassing the SyncManager frontier. This is what makes
-            // exit_code/stderr survive a reconnect: unlike text ops, these
-            // never get stranded behind a needs-full-sync gate.
-            if let Err(e) = store.set_exit_code(context_id, &block_id, metadata.exit_code) {
-                tracing::warn!("BlockMetadataChanged set_exit_code error: {e}");
-            }
-            if let Err(e) = store.set_stderr(context_id, &block_id, metadata.stderr.clone()) {
-                tracing::warn!("BlockMetadataChanged set_stderr error: {e}");
-            }
-            if let Err(e) = store.set_content_type(context_id, &block_id, metadata.content_type) {
-                tracing::warn!("BlockMetadataChanged set_content_type error: {e}");
-            }
-            if let Err(e) = store.set_ephemeral(context_id, &block_id, metadata.ephemeral) {
-                tracing::warn!("BlockMetadataChanged set_ephemeral error: {e}");
-            }
-            if let Err(e) =
-                store.set_tool_use_id(context_id, &block_id, metadata.tool_use_id.clone())
-            {
-                tracing::warn!("BlockMetadataChanged set_tool_use_id error: {e}");
-            }
-        }
-        // Other event variants don't affect CRDT state
-        _ => {}
-    }
-}
 
 #[tool_handler]
 #[prompt_handler]
@@ -1812,8 +1727,9 @@ impl ServerHandler for KaijutsuMcp {
             );
 
             // Add each document as a resource
-            for doc_id in self.store().list_ids() {
-                if let Some(entry) = self.store().get(doc_id) {
+            for doc_id in self.context_ids() {
+                let blocks = self.with_doc(doc_id, |doc| doc.blocks_ordered());
+                if let Some(blocks) = blocks {
                     let doc_hex = doc_id.to_hex();
                     resources.push(
                         RawResource {
@@ -1821,9 +1737,8 @@ impl ServerHandler for KaijutsuMcp {
                             name: doc_hex.clone(),
                             title: Some(format!("Document: {}", doc_hex)),
                             description: Some(format!(
-                                "{} document with {} blocks",
-                                entry.kind.as_str(),
-                                entry.doc.blocks_ordered().len()
+                                "Conversation document with {} blocks",
+                                blocks.len()
                             )),
                             mime_type: Some("application/json".to_string()),
                             size: None,
@@ -1834,7 +1749,7 @@ impl ServerHandler for KaijutsuMcp {
                     );
 
                     // Add each block as a resource
-                    for snapshot in entry.doc.blocks_ordered() {
+                    for snapshot in blocks {
                         let block_key = snapshot.id.to_key();
                         resources.push(
                             RawResource {
@@ -1882,18 +1797,15 @@ impl ServerHandler for KaijutsuMcp {
             if uri == "kaijutsu://docs" {
                 // Return list of all documents
                 let docs: Vec<serde_json::Value> = self
-                    .store()
-                    .list_ids()
+                    .context_ids()
                     .iter()
                     .map(|id| {
-                        let (kind, block_count) = self
-                            .store()
-                            .get(*id)
-                            .map(|e| (e.kind.as_str().to_string(), e.doc.blocks_ordered().len()))
-                            .unwrap_or(("unknown".to_string(), 0));
+                        let block_count = self
+                            .with_doc(*id, |doc| doc.blocks_ordered().len())
+                            .unwrap_or(0);
                         serde_json::json!({
                             "id": id.to_hex(),
-                            "kind": kind,
+                            "kind": "Conversation",
                             "block_count": block_count
                         })
                     })
@@ -1916,34 +1828,35 @@ impl ServerHandler for KaijutsuMcp {
                     )
                 })?;
                 // Return document metadata and block list
-                let entry = self.store().get(doc_ctx_id).ok_or_else(|| {
+                let extracted = self.with_doc(doc_ctx_id, |doc| {
+                    let blocks: Vec<serde_json::Value> = doc
+                        .blocks_ordered()
+                        .iter()
+                        .map(|s| {
+                            serde_json::json!({
+                                "id": s.id.to_key(),
+                                "role": s.role.as_str(),
+                                "kind": s.kind.as_str(),
+                                "status": s.status.as_str(),
+                                "content_preview": if s.content.len() > 100 {
+                                    format!("{}...", &s.content[..100])
+                                } else {
+                                    s.content.clone()
+                                }
+                            })
+                        })
+                        .collect();
+                    (blocks, doc.version())
+                });
+                let (blocks, version) = extracted.ok_or_else(|| {
                     McpError::invalid_params(format!("Document '{}' not found", doc_id_str), None)
                 })?;
 
-                let blocks: Vec<serde_json::Value> = entry
-                    .doc
-                    .blocks_ordered()
-                    .iter()
-                    .map(|s| {
-                        serde_json::json!({
-                            "id": s.id.to_key(),
-                            "role": s.role.as_str(),
-                            "kind": s.kind.as_str(),
-                            "status": s.status.as_str(),
-                            "content_preview": if s.content.len() > 100 {
-                                format!("{}...", &s.content[..100])
-                            } else {
-                                s.content.clone()
-                            }
-                        })
-                    })
-                    .collect();
-
                 let result = serde_json::json!({
                     "id": doc_id_str,
-                    "kind": entry.kind.as_str(),
-                    "language": entry.language,
-                    "version": entry.version(),
+                    "kind": "Conversation",
+                    "language": serde_json::Value::Null,
+                    "version": version,
                     "blocks": blocks
                 });
 
@@ -1970,7 +1883,7 @@ impl ServerHandler for KaijutsuMcp {
                 let block_key = parts[1];
 
                 let (found_ctx_id, block_id) =
-                    find_block(self.store(), block_key).ok_or_else(|| {
+                    self.locate_block(block_key).ok_or_else(|| {
                         McpError::invalid_params(
                             format!(
                                 "Block '{}' not found in document '{}'",
@@ -1980,13 +1893,8 @@ impl ServerHandler for KaijutsuMcp {
                         )
                     })?;
 
-                let entry = self.store().get(found_ctx_id).ok_or_else(|| {
-                    McpError::invalid_params(format!("Document '{}' not found", doc_id_str), None)
-                })?;
-
-                let snapshot = entry
-                    .doc
-                    .get_block_snapshot(&block_id)
+                let snapshot = self
+                    .read_block(found_ctx_id, &block_id)
                     .ok_or_else(|| McpError::invalid_params("Block not found", None))?;
 
                 return Ok(ReadResourceResult::new(vec![ResourceContents::text(
@@ -2056,8 +1964,7 @@ impl ServerHandler for KaijutsuMcp {
                                 || request.argument.name == "block_id"
                             {
                                 // Complete document IDs
-                                self.store()
-                                    .list_ids()
+                                self.context_ids()
                                     .into_iter()
                                     .map(|id| id.to_hex())
                                     .filter(|id| id.contains(&request.argument.value))
@@ -2083,8 +1990,7 @@ impl ServerHandler for KaijutsuMcp {
                         }
                         "search_context" => {
                             if request.argument.name == "document_id" {
-                                self.store()
-                                    .list_ids()
+                                self.context_ids()
                                     .into_iter()
                                     .map(|id| id.to_hex())
                                     .filter(|id| id.contains(&request.argument.value))
@@ -2101,8 +2007,7 @@ impl ServerHandler for KaijutsuMcp {
                     // Complete resource URIs
                     let prefix = &resource_ref.uri;
                     if prefix.starts_with("kaijutsu://docs") {
-                        self.store()
-                            .list_ids()
+                        self.context_ids()
                             .into_iter()
                             .map(|id| format!("kaijutsu://docs/{}", id.to_hex()))
                             .filter(|uri| uri.contains(&request.argument.value))
@@ -2167,693 +2072,7 @@ impl ServerHandler for KaijutsuMcp {
 mod tests {
     use super::*;
 
-
-    // =========================================================================
-    // apply_server_event tests — exercises the store-based sync path
-    //
-    // Uses kernel BlockStore as both "server" and "client" to generate proper
-    // SyncPayload (CBOR-serialized) ops, matching the real sync protocol.
-    // =========================================================================
-
-    use kaijutsu_crdt::{BlockId, BlockKind, BlockSnapshot, ContentType, ContextId, PrincipalId, Role, Status};
-    use std::collections::HashMap;
-
-    /// Helper: create a synced client/server pair with one block ("Hello from server").
-    ///
-    /// The server store inserts the block, then the client store syncs from it
-    /// via `ops_since` + `merge_ops`, so both share CRDT causal history.
-    /// Returns (client_store, sync_manager, server_store, context_id).
-    fn setup_synced_store() -> (
-        SharedBlockStore,
-        Arc<Mutex<SyncManager>>,
-        SharedBlockStore,
-        ContextId,
-    ) {
-        let context_id = ContextId::new();
-
-        // Server store — the authoritative source
-        let server = shared_block_store(PrincipalId::new());
-        server
-            .create_document(context_id, DocKind::Conversation, None)
-            .expect("create server document");
-        server
-            .insert_block(
-                context_id,
-                None,
-                None,
-                Role::User,
-                BlockKind::Text,
-                "Hello from server",
-                Status::Done,
-                ContentType::Plain,
-            )
-            .expect("insert block on server");
-
-        // Client store — synced from server via SyncPayload
-        let client = shared_block_store(PrincipalId::system());
-        client
-            .create_document(context_id, DocKind::Conversation, None)
-            .expect("create client document");
-        let initial_payload = server
-            .ops_since(context_id, &HashMap::new())
-            .expect("ops_since from empty frontier");
-        client
-            .merge_ops(context_id, initial_payload)
-            .expect("initial sync merge");
-
-        let frontier = client.frontier(context_id).unwrap_or_default();
-        let sync = Arc::new(Mutex::new(SyncManager::with_state(
-            Some(context_id),
-            Some(frontier),
-        )));
-
-        (client, sync, server, context_id)
-    }
-
-    /// Helper: get SyncPayload from server as CBOR bytes.
-    fn server_ops_bytes(
-        server: &SharedBlockStore,
-        ctx_id: ContextId,
-        frontier: &HashMap<BlockId, kaijutsu_crdt::Frontier>,
-    ) -> Vec<u8> {
-        let payload = server.ops_since(ctx_id, frontier).expect("ops_since");
-        kaijutsu_types::codec::encode(&payload).expect("serialize SyncPayload")
-    }
-
-    #[test]
-    fn test_apply_block_inserted_updates_store() {
-        let (store, sync, server, ctx_id) = setup_synced_store();
-
-        // Server inserts a new block
-        let pre_frontier = server.frontier(ctx_id).unwrap();
-        let block_id = server
-            .insert_block(
-                ctx_id,
-                None,
-                None,
-                Role::Model,
-                BlockKind::Text,
-                "New block from server",
-                Status::Done,
-                ContentType::Plain,
-            )
-            .expect("insert");
-        let ops_bytes = server_ops_bytes(&server, ctx_id, &pre_frontier);
-        let block = server
-            .get(ctx_id)
-            .unwrap()
-            .doc
-            .get_block_snapshot(&block_id)
-            .unwrap();
-
-        // Before applying: store should have 1 block
-        assert_eq!(
-            store.get(ctx_id).unwrap().doc.block_count(),
-            1,
-            "Store should have 1 block before event"
-        );
-
-        // Apply the event through our function
-        apply_server_event(
-            &store,
-            &sync,
-            ctx_id,
-            ServerEvent::BlockInserted {
-                context_id: ctx_id,
-                block: Box::new(block),
-                ops: ops_bytes,
-            },
-        );
-
-        // After: store should have 2 blocks
-        let entry = store.get(ctx_id).expect("doc exists");
-        assert_eq!(
-            entry.doc.block_count(),
-            2,
-            "Store should have 2 blocks after BlockInserted"
-        );
-        assert!(
-            entry.doc.full_text().contains("New block from server"),
-            "Store should contain the new block's content"
-        );
-    }
-
-    #[test]
-    fn test_apply_text_ops_updates_store() {
-        let (store, sync, server, ctx_id) = setup_synced_store();
-
-        // Get the block ID of the existing block on the server
-        let block_id = server.block_snapshots(ctx_id).unwrap()[0].id;
-
-        // Server edits the block's text
-        let pre_frontier = server.frontier(ctx_id).unwrap();
-        server
-            .edit_text(ctx_id, &block_id, 17, " — updated!", 0)
-            .expect("edit");
-        let ops_bytes = server_ops_bytes(&server, ctx_id, &pre_frontier);
-
-        // Before: store has original text
-        assert!(
-            store
-                .get(ctx_id)
-                .unwrap()
-                .doc
-                .full_text()
-                .contains("Hello from server"),
-            "Store should have original text"
-        );
-
-        apply_server_event(
-            &store,
-            &sync,
-            ctx_id,
-            ServerEvent::BlockTextOps {
-                context_id: ctx_id,
-                block_id,
-                ops: ops_bytes,
-                seq_num: 0,
-            },
-        );
-
-        // After: store should have updated text
-        let entry = store.get(ctx_id).expect("doc exists");
-        assert!(
-            entry.doc.full_text().contains("— updated!"),
-            "Store should contain the edited text, got: {}",
-            entry.doc.full_text()
-        );
-    }
-
-    #[test]
-    fn test_apply_status_changed_updates_store() {
-        let (store, sync, server, ctx_id) = setup_synced_store();
-
-        let block_id = server.block_snapshots(ctx_id).unwrap()[0].id;
-
-        // The block starts as Done (from BlockSnapshot::text constructor)
-        assert_eq!(
-            store
-                .get(ctx_id)
-                .unwrap()
-                .doc
-                .get_block_snapshot(&block_id)
-                .unwrap()
-                .status,
-            Status::Done,
-        );
-
-        // Apply status change to Error
-        apply_server_event(
-            &store,
-            &sync,
-            ctx_id,
-            ServerEvent::BlockStatusChanged {
-                context_id: ctx_id,
-                block_id,
-                status: Status::Error,
-            },
-        );
-
-        // Store should reflect the new status
-        let entry = store.get(ctx_id).expect("doc exists");
-        let snap = entry
-            .doc
-            .get_block_snapshot(&block_id)
-            .expect("block exists");
-        assert_eq!(
-            snap.status,
-            Status::Error,
-            "Status should be Error after event"
-        );
-    }
-
-    #[test]
-    fn test_apply_event_wrong_document_ignored() {
-        let (store, sync, server, ctx_id) = setup_synced_store();
-
-        // Server inserts a new block
-        let pre_frontier = server.frontier(ctx_id).unwrap();
-        let block_id = server
-            .insert_block(
-                ctx_id,
-                None,
-                None,
-                Role::Model,
-                BlockKind::Text,
-                "Should not appear",
-                Status::Done,
-                ContentType::Plain,
-            )
-            .expect("insert");
-        let ops_bytes = server_ops_bytes(&server, ctx_id, &pre_frontier);
-        let block = server
-            .get(ctx_id)
-            .unwrap()
-            .doc
-            .get_block_snapshot(&block_id)
-            .unwrap();
-
-        // Apply with WRONG context_id — should be silently ignored
-        let wrong_ctx = ContextId::new();
-        apply_server_event(
-            &store,
-            &sync,
-            ctx_id,
-            ServerEvent::BlockInserted {
-                context_id: wrong_ctx,
-                block: Box::new(block),
-                ops: ops_bytes,
-            },
-        );
-
-        // Store should still have only 1 block
-        assert_eq!(
-            store.get(ctx_id).unwrap().doc.block_count(),
-            1,
-            "Store should not be affected by events for other documents"
-        );
-    }
-
-    #[test]
-    fn test_apply_event_bumps_store_version() {
-        let (store, sync, server, ctx_id) = setup_synced_store();
-
-        let version_before = store.get(ctx_id).unwrap().version();
-
-        // Apply a block insert
-        let pre_frontier = server.frontier(ctx_id).unwrap();
-        let block_id = server
-            .insert_block(
-                ctx_id,
-                None,
-                None,
-                Role::User,
-                BlockKind::Text,
-                "Version bump test",
-                Status::Done,
-                ContentType::Plain,
-            )
-            .expect("insert");
-        let ops_bytes = server_ops_bytes(&server, ctx_id, &pre_frontier);
-        let block = server
-            .get(ctx_id)
-            .unwrap()
-            .doc
-            .get_block_snapshot(&block_id)
-            .unwrap();
-
-        apply_server_event(
-            &store,
-            &sync,
-            ctx_id,
-            ServerEvent::BlockInserted {
-                context_id: ctx_id,
-                block: Box::new(block),
-                ops: ops_bytes,
-            },
-        );
-
-        let version_after = store.get(ctx_id).unwrap().version();
-        assert!(
-            version_after > version_before,
-            "Store version should increase after event: before={version_before}, after={version_after}"
-        );
-    }
-
-    #[test]
-    fn test_store_reads_consistent_after_multiple_events() {
-        let (store, sync, server, ctx_id) = setup_synced_store();
-
-        // Simulate a burst of events: 3 block inserts + a text edit + a status change
-        let mut inserted_ids = Vec::new();
-        for i in 0..3 {
-            let pre = server.frontier(ctx_id).unwrap();
-            let bid = server
-                .insert_block(
-                    ctx_id,
-                    None,
-                    None,
-                    Role::Model,
-                    BlockKind::Text,
-                    &format!("Block {i}"),
-                    Status::Done,
-                    ContentType::Plain,
-                )
-                .expect("insert");
-            let ops = server_ops_bytes(&server, ctx_id, &pre);
-            let block = server
-                .get(ctx_id)
-                .unwrap()
-                .doc
-                .get_block_snapshot(&bid)
-                .unwrap();
-            inserted_ids.push(bid);
-
-            apply_server_event(
-                &store,
-                &sync,
-                ctx_id,
-                ServerEvent::BlockInserted {
-                    context_id: ctx_id,
-                    block: Box::new(block),
-                    ops,
-                },
-            );
-        }
-
-        // Now edit the last-inserted block's text ("Block 2" → "Block 2 — edited")
-        let last_block_id = inserted_ids[2];
-        let last_content_len = server
-            .get(ctx_id)
-            .unwrap()
-            .doc
-            .get_block_snapshot(&last_block_id)
-            .unwrap()
-            .content
-            .len();
-        let pre = server.frontier(ctx_id).unwrap();
-        server
-            .edit_text(ctx_id, &last_block_id, last_content_len, " — edited", 0)
-            .expect("edit");
-        let ops = server_ops_bytes(&server, ctx_id, &pre);
-
-        apply_server_event(
-            &store,
-            &sync,
-            ctx_id,
-            ServerEvent::BlockTextOps {
-                context_id: ctx_id,
-                block_id: last_block_id,
-                ops,
-                seq_num: 0,
-            },
-        );
-
-        // Status change on the first inserted block
-        let first_new_block = inserted_ids[0];
-        apply_server_event(
-            &store,
-            &sync,
-            ctx_id,
-            ServerEvent::BlockStatusChanged {
-                context_id: ctx_id,
-                block_id: first_new_block,
-                status: Status::Running,
-            },
-        );
-
-        // Verify everything is visible through store.get() — the path MCP tools use
-        let entry = store.get(ctx_id).expect("doc exists");
-        let text = entry.doc.full_text();
-        let block_count = entry.doc.block_count();
-
-        assert_eq!(block_count, 4, "1 original + 3 inserted");
-        assert!(
-            text.contains("Hello from server"),
-            "Original content preserved, got: {text}"
-        );
-        assert!(
-            text.contains("Block 0"),
-            "First inserted block, got: {text}"
-        );
-        assert!(
-            text.contains("Block 1"),
-            "Second inserted block, got: {text}"
-        );
-        assert!(text.contains("— edited"), "Text edit applied, got: {text}");
-
-        let first_snap = entry
-            .doc
-            .get_block_snapshot(&first_new_block)
-            .expect("block exists");
-        assert_eq!(first_snap.status, Status::Running, "Status change applied");
-    }
-
-    #[test]
-    fn test_corrupted_ops_dont_corrupt_store() {
-        let (store, sync, server, ctx_id) = setup_synced_store();
-
-        let original_block_count = store.get(ctx_id).unwrap().doc.block_count();
-        let original_version = store.get(ctx_id).unwrap().version();
-        let block_id = server.block_snapshots(ctx_id).unwrap()[0].id;
-
-        // Apply BlockInserted with garbage ops
-        let evil_agent = PrincipalId::new();
-        apply_server_event(
-            &store,
-            &sync,
-            ctx_id,
-            ServerEvent::BlockInserted {
-                context_id: ctx_id,
-                // This block already exists (idempotent skip), but let's also test garbage ops
-                // with a "new" block that doesn't exist yet
-                block: Box::new(BlockSnapshot::text(
-                    BlockId::new(ctx_id, evil_agent, 99),
-                    None,
-                    Role::User,
-                    "corrupted block",
-                )),
-                ops: vec![0xFF, 0xDE, 0xAD, 0xBE, 0xEF],
-            },
-        );
-
-        // Store should be unchanged — no corruption
-        {
-            let entry = store.get(ctx_id).unwrap();
-            assert_eq!(
-                entry.doc.block_count(),
-                original_block_count,
-                "Block count unchanged after corrupt ops"
-            );
-            assert_eq!(
-                entry.version(),
-                original_version,
-                "Version unchanged — touch() not called on error"
-            );
-        } // Drop DashMap Ref before next event needs get_mut()
-
-        // Apply BlockTextOps with garbage ops
-        apply_server_event(
-            &store,
-            &sync,
-            ctx_id,
-            ServerEvent::BlockTextOps {
-                context_id: ctx_id,
-                block_id,
-                ops: vec![0xBA, 0xAD, 0xF0, 0x0D],
-                seq_num: 0,
-            },
-        );
-
-        // Store content should be unchanged
-        let entry = store.get(ctx_id).unwrap();
-        assert!(
-            entry.doc.full_text().contains("Hello from server"),
-            "Original content preserved after corrupt text ops"
-        );
-    }
-
-    #[test]
-    fn test_status_change_for_nonexistent_block() {
-        let (store, sync, _server, ctx_id) = setup_synced_store();
-
-        // Send status change for a block that doesn't exist
-        let ghost_agent = PrincipalId::new();
-        apply_server_event(
-            &store,
-            &sync,
-            ctx_id,
-            ServerEvent::BlockStatusChanged {
-                context_id: ctx_id,
-                block_id: BlockId::new(ctx_id, ghost_agent, 999),
-                status: Status::Done,
-            },
-        );
-
-        // Store should not crash, version might or might not change depending on
-        // whether set_status errors before or after touch. The important thing
-        // is no panic and no corruption.
-        let entry = store.get(ctx_id).unwrap();
-        assert_eq!(entry.doc.block_count(), 1, "Block count unchanged");
-        assert!(
-            entry.doc.full_text().contains("Hello from server"),
-            "Content unchanged"
-        );
-    }
-
-    #[test]
-    fn test_reset_then_incremental_event_preserves_blocks() {
-        let (store, sync, server, ctx_id) = setup_synced_store();
-
-        // Verify initial state
-        assert_eq!(store.get(ctx_id).unwrap().doc.block_count(), 1);
-
-        // Simulate Lagged — reset SyncManager (sets needs_full_sync = true)
-        sync.lock().unwrap().reset();
-
-        // Server adds a new block. Ops are incremental (not full oplog) —
-        // this is what would arrive after missing some events.
-        let pre_frontier = server.frontier(ctx_id).unwrap();
-        let block_id = server
-            .insert_block(
-                ctx_id,
-                None,
-                None,
-                Role::Model,
-                BlockKind::Text,
-                "Post-reset block",
-                Status::Done,
-                ContentType::Plain,
-            )
-            .expect("insert");
-        let ops_bytes = server_ops_bytes(&server, ctx_id, &pre_frontier);
-        let block = server
-            .get(ctx_id)
-            .unwrap()
-            .doc
-            .get_block_snapshot(&block_id)
-            .unwrap();
-
-        apply_server_event(
-            &store,
-            &sync,
-            ctx_id,
-            ServerEvent::BlockInserted {
-                context_id: ctx_id,
-                block: Box::new(block),
-                ops: ops_bytes,
-            },
-        );
-
-        // Critical check: do we still have BOTH blocks?
-        // SyncManager should try incremental merge first (doc is not empty).
-        // If incremental succeeds, both blocks are preserved.
-        // If it falls through to do_full_sync with incremental ops, we lose block 1.
-        let entry = store.get(ctx_id).unwrap();
-        assert_eq!(
-            entry.doc.block_count(),
-            2,
-            "Both original and new block should be preserved after reset + incremental event"
-        );
-        assert!(
-            entry.doc.full_text().contains("Hello from server"),
-            "Original block content preserved after reset recovery"
-        );
-        assert!(
-            entry.doc.full_text().contains("Post-reset block"),
-            "New block content present after reset recovery"
-        );
-    }
-
-    #[test]
-    fn test_metadata_changed_applies_independent_of_frontier() {
-        // exit_code + stderr must reach the client store even when the
-        // SyncManager frontier is reset (text ops would be skipped here). This
-        // is what makes them survive a reconnect: they ride MetadataChanged,
-        // not the frontier-gated text stream.
-        let (store, sync, server, ctx_id) = setup_synced_store();
-        let block_id = server.block_snapshots(ctx_id).unwrap()[0].id;
-
-        // Server records the real exit code + stderr.
-        server.set_exit_code(ctx_id, &block_id, Some(7)).unwrap();
-        server
-            .set_stderr(ctx_id, &block_id, Some("boom\n".to_string()))
-            .unwrap();
-        let metadata = server
-            .get(ctx_id)
-            .unwrap()
-            .doc
-            .get_block_snapshot(&block_id)
-            .unwrap()
-            .metadata();
-
-        // Simulate a degraded connection: frontier reset → text ops would skip.
-        sync.lock().unwrap().reset();
-        assert!(sync.lock().unwrap().needs_full_sync(ctx_id));
-
-        apply_server_event(
-            &store,
-            &sync,
-            ctx_id,
-            ServerEvent::BlockMetadataChanged {
-                context_id: ctx_id,
-                block_id,
-                metadata,
-            },
-        );
-
-        let snap = store
-            .get(ctx_id)
-            .unwrap()
-            .doc
-            .get_block_snapshot(&block_id)
-            .unwrap();
-        assert_eq!(snap.exit_code, Some(7), "exit_code applied despite reset frontier");
-        assert_eq!(
-            snap.stderr.as_deref(),
-            Some("boom\n"),
-            "stderr applied despite reset frontier"
-        );
-    }
-
-    #[test]
-    fn test_resync_via_initial_state_recovers_stranded_content() {
-        // The core reconnect bug, deterministically: with a reset frontier the
-        // client SKIPS text ops, so stdout written on the server never lands —
-        // exactly the empty-stdout symptom. A full resync (what `resync_store`
-        // performs via get_context_sync + apply_initial_state) must recover it.
-        let (store, sync, server, ctx_id) = setup_synced_store();
-        let block_id = server.block_snapshots(ctx_id).unwrap()[0].id;
-
-        // Degrade: frontier reset (as after a lag / failed incremental merge).
-        sync.lock().unwrap().reset();
-
-        // Server appends stdout to the existing block (an edit, NOT a new
-        // block — so no BlockInserted will ever come to rescue the frontier).
-        let pre_frontier = server.frontier(ctx_id).unwrap();
-        server
-            .edit_text(ctx_id, &block_id, 17, " STDOUT-X", 0)
-            .expect("edit");
-        let text_ops = server_ops_bytes(&server, ctx_id, &pre_frontier);
-
-        // The text op is skipped while needs_full_sync — content stays stale.
-        apply_server_event(
-            &store,
-            &sync,
-            ctx_id,
-            ServerEvent::BlockTextOps {
-                context_id: ctx_id,
-                block_id,
-                ops: text_ops,
-                seq_num: 1,
-            },
-        );
-        assert!(
-            !store.get(ctx_id).unwrap().doc.full_text().contains("STDOUT-X"),
-            "precondition: text op is stranded by the reset frontier"
-        );
-
-        // Resync: feed the server's full snapshot through apply_initial_state,
-        // the same bytes get_context_sync ships and resync_store applies.
-        let snapshot_bytes =
-            kaijutsu_types::codec::encode(&server.get(ctx_id).unwrap().doc.snapshot()).unwrap();
-        {
-            let mut guard = sync.lock().unwrap();
-            let mut entry = store.get_mut(ctx_id).unwrap();
-            guard
-                .apply_initial_state(&mut entry.doc, ctx_id, &snapshot_bytes)
-                .expect("resync apply_initial_state");
-        }
-
-        assert!(
-            store.get(ctx_id).unwrap().doc.full_text().contains("STDOUT-X"),
-            "resync recovers the stranded stdout"
-        );
-        assert!(
-            !sync.lock().unwrap().needs_full_sync(ctx_id),
-            "frontier realigned after resync"
-        );
-    }
+    use kaijutsu_crdt::ContextId;
 
     // =========================================================================
     // Input Document Tools (Local mode)

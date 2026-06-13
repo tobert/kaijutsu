@@ -27,8 +27,9 @@ const DEFAULT_MAX_BLOCK_SIZE: usize = 4096;
 
 /// Hook listener — receives events over a Unix socket and writes CRDT blocks.
 pub struct HookListener {
-    /// Block store — shared with the MCP server.
-    store: SharedBlockStore,
+    /// Local-mode block store (in-process). `None` in remote mode, where blocks
+    /// are authored into the `RemoteState`'s `SyncedDocument` and pushed up.
+    local_store: Option<SharedBlockStore>,
     /// Shared context ID — updated by register_session (None until then).
     shared_context_id: Arc<Mutex<Option<ContextId>>>,
     /// Fixed context ID for local mode (not shared).
@@ -55,7 +56,7 @@ impl HookListener {
     /// Create a listener backed by a local-only store.
     pub fn local(store: SharedBlockStore, context_id: ContextId) -> Self {
         Self {
-            store,
+            local_store: Some(store),
             shared_context_id: Arc::new(Mutex::new(None)),
             local_context_id: Some(context_id),
             remote: None,
@@ -74,7 +75,7 @@ impl HookListener {
         session_id: Arc<Mutex<Option<String>>>,
     ) -> Self {
         Self {
-            store: remote.store.clone(),
+            local_store: None,
             shared_context_id,
             local_context_id: None,
             remote: Some(remote),
@@ -291,18 +292,40 @@ impl HookListener {
             tracing::debug!("Hook insert_text_block: no context yet (register_session not called)");
             return;
         };
-        if let Err(e) = self.store.insert_block_as(
-            ctx_id,
-            None, // parent
-            None, // after (append)
-            role,
-            BlockKind::Text,
-            content,
-            Status::Done,
-            ContentType::Plain,
-            Some(PrincipalId::system()),
-        ) {
-            tracing::warn!("Hook insert_block error: {e}");
+        if let Some(store) = &self.local_store {
+            if let Err(e) = store.insert_block_as(
+                ctx_id,
+                None, // parent
+                None, // after (append)
+                role,
+                BlockKind::Text,
+                content,
+                Status::Done,
+                ContentType::Plain,
+                Some(PrincipalId::system()),
+            ) {
+                tracing::warn!("Hook insert_block error: {e}");
+            }
+            return;
+        }
+        // Remote mode: author into the joined SyncedDocument, then wake waiters.
+        if let Some(remote) = &self.remote {
+            let mut guard = remote.synced.lock().expect("synced mutex poisoned");
+            if let Some(doc) = guard.as_mut()
+                && let Err(e) = doc.doc_mut().insert_block(
+                    None,
+                    None,
+                    role,
+                    BlockKind::Text,
+                    content,
+                    Status::Done,
+                    ContentType::Plain,
+                )
+            {
+                tracing::warn!("Hook insert_block error: {e}");
+            }
+            drop(guard);
+            remote.change.notify_waiters();
         }
     }
 
@@ -313,27 +336,7 @@ impl HookListener {
             );
             return;
         };
-        // Insert tool call block
         let input = tool.input.clone();
-        let call_id = match self.store.insert_tool_call_as(
-            ctx_id,
-            None,
-            None,
-            &tool.name,
-            input,
-            Some(ToolKind::Mcp),
-            Some(PrincipalId::system()),
-            None,
-            None,
-        ) {
-            Ok(id) => id,
-            Err(e) => {
-                tracing::warn!("Hook insert_tool_call error: {e}");
-                return;
-            }
-        };
-
-        // Insert tool result block
         let content = if is_error {
             tool.error.as_deref().unwrap_or("(error)")
         } else {
@@ -341,18 +344,72 @@ impl HookListener {
         };
         let truncated = truncate(content, self.max_block_size);
 
-        if let Err(e) = self.store.insert_tool_result_as(
-            ctx_id,
-            &call_id,
-            None,
-            &truncated,
-            is_error,
-            None,
-            Some(ToolKind::Mcp),
-            Some(PrincipalId::system()),
-            None,
-        ) {
-            tracing::warn!("Hook insert_tool_result error: {e}");
+        if let Some(store) = &self.local_store {
+            // Insert tool call block
+            let call_id = match store.insert_tool_call_as(
+                ctx_id,
+                None,
+                None,
+                &tool.name,
+                input,
+                Some(ToolKind::Mcp),
+                Some(PrincipalId::system()),
+                None,
+                None,
+            ) {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::warn!("Hook insert_tool_call error: {e}");
+                    return;
+                }
+            };
+            if let Err(e) = store.insert_tool_result_as(
+                ctx_id,
+                &call_id,
+                None,
+                &truncated,
+                is_error,
+                None,
+                Some(ToolKind::Mcp),
+                Some(PrincipalId::system()),
+                None,
+            ) {
+                tracing::warn!("Hook insert_tool_result error: {e}");
+            }
+            return;
+        }
+        // Remote mode: author the call + result into the SyncedDocument under
+        // one lock (sequentially, so the result's parent exists), then wake.
+        if let Some(remote) = &self.remote {
+            let mut guard = remote.synced.lock().expect("synced mutex poisoned");
+            if let Some(doc) = guard.as_mut() {
+                let call_id = match doc.doc_mut().insert_tool_call(
+                    None,
+                    None,
+                    &tool.name,
+                    input,
+                    Some(ToolKind::Mcp),
+                    None,
+                ) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        tracing::warn!("Hook insert_tool_call error: {e}");
+                        return;
+                    }
+                };
+                if let Err(e) = doc.doc_mut().insert_tool_result_block(
+                    &call_id,
+                    None,
+                    &truncated,
+                    is_error,
+                    None,
+                    Some(ToolKind::Mcp),
+                ) {
+                    tracing::warn!("Hook insert_tool_result error: {e}");
+                }
+            }
+            drop(guard);
+            remote.change.notify_waiters();
         }
     }
 
@@ -417,23 +474,27 @@ impl HookListener {
 
 /// Push local ops to the server. Mirrors `KaijutsuMcp::push_to_server()`.
 async fn push_ops(remote: &RemoteState) -> anyhow::Result<()> {
-    let guard = remote.joined.read().await;
-    let joined = guard
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("No active context — register_session not called"))?;
-
-    let frontier = {
-        let sync = joined
-            .sync
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock error: {e}"))?;
-        sync.frontier().cloned().unwrap_or_default()
+    let context_id = {
+        let guard = remote.joined.read().await;
+        guard
+            .as_ref()
+            .map(|j| j.context_id)
+            .ok_or_else(|| anyhow::anyhow!("No active context — register_session not called"))?
     };
 
-    let ops = remote
-        .store
-        .ops_since(joined.context_id, &frontier)
-        .map_err(|e| anyhow::anyhow!(e))?;
+    // Collect ops since the sync frontier from the SyncedDocument. Extract the
+    // owned payload before dropping the lock — never hold it across the await.
+    let ops = {
+        let guard = remote
+            .synced
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock error: {e}"))?;
+        let doc = guard
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No synced document"))?;
+        let frontier = doc.sync().frontier().cloned().unwrap_or_default();
+        doc.doc().ops_since(&frontier)
+    };
 
     // Check for empty payload before serializing
     if ops.block_ops.is_empty()
@@ -449,7 +510,7 @@ async fn push_ops(remote: &RemoteState) -> anyhow::Result<()> {
 
     remote
         .actor
-        .push_ops(joined.context_id, &ops_bytes)
+        .push_ops(context_id, &ops_bytes)
         .await
         .map_err(|e| anyhow::anyhow!("Push ops: {e}"))?;
 
