@@ -304,8 +304,31 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
     and confirm a composer fork is thin. `kj transport ooda on|off --context`
     already exists, so transport-follow (arm child / disarm parent) is pure rc.
   - **Verify in code first:** the disarm-parent → `fork` → arm-child **ordering
-    race** across the beat scheduler's tick — the only spot that might need a
-    Rust assist rather than script. Everything else is rc.
+    race** across the beat scheduler's tick. **VERIFIED 2026-06-12 (Opus +
+    DeepSeek review) — REAL, and it needs Rust: the rotate *trigger* cannot be
+    pure rc.** Root cause: `fire_tick` (`beat.rs:659`) spawns the `tick` rc
+    fire-and-forget (`spawn_local`), and `kj transport ooda off` only *enqueues*
+    `BeatCommand::SetOoda{P,false}` on the same ingress the single-task scheduler
+    reads — so the parent's disarm is **asynchronous relative to the scheduler's
+    own clock**. Between firing tick T (which spawns the rotate rc) and that
+    `SetOoda` being dequeued, the scheduler keeps P armed and keeps ticking it.
+    Failure modes: (1) **stray parent ticks** — extra `tick` rc runs (token spend
+    + turn requests) on a context that already forked away, until the disarm
+    lands; the `phrase mod N` gate blocks a *second* rotate in the common case,
+    so usually ≤1 stray tick. (2) **double-fork** — only pathological (disarm
+    delayed ≥ a full rotate period, or `ooda_every ≥ N·beats_per_phrase` so
+    consecutive ooda ticks both hit the horizon). `biased` select only *reduces*
+    the window (a ready disarm wins over a ready deadline); it is not the root and
+    cannot close it. **Two fixes evaluated:** an "atomic Rotate `BeatCommand`"
+    does NOT close it (still async via ingress — only fixes the child-armed-while-
+    parent-armed half-state, not the stray ticks); a rotate-specific in-flight
+    latch works only if the scheduler knows the rotate condition. **Cleanest:
+    move the horizon decision into the scheduler** — e.g.
+    `BeatCommand::RotateOnPhrase { parent, modulus, child_preset }` stored in
+    `BeatState`, checked synchronously in `fire_due` at ooda time, disarming the
+    parent + arming the child atomically with zero async gap. So `composer/fork/`
+    setup stays rc, but the *detach-at-horizon trigger* is Rust. (Implementation
+    deferred — this entry is the verification result.)
   - **Build when convenient — the windowed-notation pull primitive.** No
     cross-context block-copy verb exists today; a player carrying recent
     notation into its thin-forked child needs one. This is the *same* windowed
@@ -314,14 +337,17 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
     archive). Strong signal it's the right primitive; keeps the carry in rc.
   - **Defer — horizon self-fork-rotate (page-turns / song sections).** The
     player self-`kj fork --preset spawn`s on a phrase horizon; fork-lineage becomes
-    song form. Two trigger forms: **(a) now** a `composer/tick/SXX-rotate.kai`
-    that fires every tick (`$PHRASE` is seeded) and acts only at the horizon
-    (`phrase mod N == 0`) — zero new machinery; **(b) later** a declarative
-    "fire script at tick T" timeline scheduler riding `schedule_abc_cell`'s
-    rails, worth building once the producer schedules more than rotates
-    (section/tempo/dynamics events — clear second consumers). Prototype with
-    (a), graduate to (b). Not needed for solo-bass slice 1 (the marker bounds
-    cost; thin-fork-at-spawn gives the lean start).
+    song form. Two trigger forms: **(a)** a `composer/tick/SXX-rotate.kai` that
+    fires every tick (`$PHRASE` is seeded) and acts only at the horizon
+    (`phrase mod N == 0`) — **NOT zero new machinery after all** (see the verified
+    ordering race above: the rc disarm is async, so pure-rc rotation leaks stray
+    parent ticks); the horizon trigger must be scheduler-side Rust
+    (`RotateOnPhrase`), with `composer/fork/` doing only the rebuild; **(b) later**
+    a declarative "fire script at tick T" timeline scheduler riding
+    `schedule_abc_cell`'s rails, worth building once the producer schedules more
+    than rotates (section/tempo/dynamics events — clear second consumers). Not
+    needed for solo-bass slice 1 (the marker bounds cost; thin-fork-at-spawn gives
+    the lean start).
   - **Marker-advance on durable revision** still pairs here: when the producer
     writes revision blocks, re-run `kj context hydrate` to advance P. Pure rc
     once the producer exists.
