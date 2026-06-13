@@ -59,7 +59,7 @@ model           Show a context's effective model (--context <ref>)
 models          List configured providers, their models, and --model aliases
 policy          show, set — a registered instance's per-call QoS policy
 preset          list, show, save, remove
-rc              add, list, rm, show, edit, reseed — lifecycle scripts (/etc/rc/<type>/<verb>/)
+rc              add, list, rm, show, edit, reset — lifecycle scripts (/etc/rc/<type>/<verb>/)
 search          <pattern> — regex search across blocks (--all, --context, --kind, --role)
 stage           commit, status, include, exclude — curate a staged (liminal) fork
 transport       play, pause, stop, tempo <bpm>, ooda <on|off> — composer beat/playhead control

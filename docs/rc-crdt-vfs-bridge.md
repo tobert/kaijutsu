@@ -7,6 +7,20 @@ Status: **shipped (increments 1–3).** rc scripts are now files under
 *not* implied by `*`/`facade:*`); the rest of `/etc` is denied flat. Host
 `vim` and `kj rc` are unaffected. Supersedes the earlier A/B/C analysis.
 
+> **Update (2026-06-13): live is truth; bootstrap-once, not a floor.** The
+> per-boot floor (write-default-if-missing every boot) drifted — repo-dropped
+> seeds lingered on disk and deleted seeds resurrected, so the deployed tree
+> and the repo disagreed about which files exist. Resolved by making the
+> deployed tree the live source of truth: embedded defaults seed it **only on
+> a fresh install** (rc tree absent/empty); boot never auto-writes it again.
+> Per-file recovery is **`kj rc reset <path>`** (restore one script from its
+> embedded seed, recreating it if `rm`'d); bulk reseed/harvest is dropped —
+> moving config between live and repo is git + kai scripts. Embedding moved
+> from a hand-maintained `include_str!` manifest to **`include_dir!`** over
+> `assets/defaults/rc/`, so adding/removing a seed is just a file. The edit
+> surface (host `vim`, `kj rc edit`, in-app `vi`) is unchanged. Decision 2's
+> third bullet and the increment-2 reseed note below are superseded by this.
+
 Per the shared-trust model this is an **ergonomic nudge**, not a security
 wall: the kernel runs with the user's full rights, so the gate exists to
 make the deliberate path (a role granted `rc-write`, or `kj rc`) easier than

@@ -35,8 +35,8 @@ kaijutsu-telemetry = { path = "crates/kaijutsu-telemetry" }
 kaijutsu-agent-tools = { path = "crates/kaijutsu-agent-tools" }
 
 # Kaish (execution engine + client) — local path until next release
-kaish-kernel = { path = "../kaish/crates/kaish-kernel" }
-kaish-glob = { path = "../kaish/crates/kaish-glob" }
+kaish-kernel = "0.8"
+kaish-glob = "0.8"
 
 # Cap'n Proto
 capnp = "0.25"
@@ -68,6 +68,7 @@ whoami = "1.5"
 uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
 strum = { version = "0.26", features = ["derive"] }
 regex = "1"
+include_dir = "0.7"
 dirs = "6"
 hostname = "0.3"
 dunce = "1"

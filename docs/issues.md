@@ -8,6 +8,13 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ## Architecture & System Design
 
+- **`kj doc list` counts the KV singleton (5 doc tests red).** Since `init_kv`
+  was wired into `test_dispatcher` (`kj/mod.rs`, commit `99ab3c6`), the KV
+  singleton doc (`824658110b55…`, kind `kv`) shows up in `kj doc list`, inflating
+  every count by one — `kj::doc::tests::doc_list_*` (5 tests) assert the old
+  counts and fail. Pre-existing, surfaced 2026-06-13. Decide intent: should `doc
+  list` exclude the `kv` kind (it's not a user document), or should the tests
+  account for it? Likely the former — the KV store is infrastructure, not a doc.
 - **VFS facade delegation:** `Kernel` implements `VfsOps` directly (`crates/kaijutsu-kernel/src/kernel.rs:984`) as a facade. Backend multiplexing already exists — `MountTable` impls `VfsOps` over `MemoryBackend`/`LocalBackend` (`crates/kaijutsu-kernel/src/vfs/mount.rs:261`). The open question is whether the `Kernel`-level facade should delegate more to `MountTable` (and what stays on `Kernel`), not whether to build a manager from scratch.
 - **Server RPC Modularization:** `crates/kaijutsu-server/src/rpc.rs` is a massive file (~301KB / ~7,000 lines — by far the largest in the server). The monolithic implementation of the Cap'n Proto traits should be split into smaller modules by domain (e.g., `rpc/vfs.rs`, `rpc/llm.rs`, `rpc/mcp.rs`).
 - **Cap'n Proto Schema Clarity (doc-only):** The `BlockKind` vs `ContentType` boundary is already settled — `BlockKind` is the structural DAG role, `ContentType` is the raw MIME rendering hint. Remaining work is purely to write that distinction into `kaijutsu.capnp` as schema comments so it stops reading as overlap.
@@ -20,9 +27,11 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   - Dynamic / principal-scoped overrides.
   - Self-lockout ergonomics (narrowing binding to exclude `builtin.bindings`).
   - Per-principal budgets + fair queuing.
-  - **Live contexts need reseed/restart:** broadened role loadouts only reach
+  - **Live contexts need re-create/restart:** broadened role loadouts only reach
     newly-created contexts; existing ones keep their old (now authority-less)
-    binding until `kj rc reseed` + re-create or a kernel restart.
+    binding until they're re-created or the kernel restarts. (Editing the seed
+    via `kj rc edit` / `kj rc reset` changes what *new* contexts get, not live
+    ones — rc fires at lifecycle boundaries, not retroactively.)
 - **Zombie RPC session / no session reaping:** the server has warned every
   60s for 21+ hours that session `019eb229` (an app session predating a
   Jun 10 GUI restart) is "still active" — there is no reap path for dead
@@ -41,6 +50,21 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   in history (a DeepSeek nonce fed to Anthropic 400s); allow the transition only
   at `fork`, where an rc script decides to elide thinking or downgrade it to
   plain blocks.
+- **Cold start seeds no binding-admin context (want a ROOT director).** The
+  bootstrap (`kaijutsu-server/src/rpc.rs:1369`) seeds exactly one **`coder`**
+  context (`genesis`) when the kernel comes up with zero contexts — nothing with
+  `admin`/`rc-write`. Consequence: any binding-admin op (e.g. repairing a live
+  context whose loadout came from a stale seed — see the stale-rc entry under
+  Control Plane — or running `kj rc reseed`, which needs `rc-write`) requires
+  manually `kj context create <x> --type director` first, since only rc-privileged
+  callers or an `admin`-capped context can widen another's loadout, and no
+  user-facing shell is rc-privileged. Want: a fresh kernel seeds a **ROOT
+  director** (the `director` type already grants `admin`+`rc-write`). Design
+  wrinkle: a `director` loadout has **no `drive`/`fork` authority**, so ROOT can't
+  itself be the conversational default the app opens into — either seed *both*
+  (ROOT director + a usable coder), or have ROOT spawn the coder and let the app
+  default to the coder. Confirmed not implemented as of 2026-06-13; genesis was
+  repaired by hand this session via a throwaway director.
 
 ## Drift — June 2026 audit
 
@@ -176,18 +200,25 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   is no MCP/`kj` "give me the rendered artifact for this turn" affordance. Add a
   `kj block cat`/blob-by-block helper (and/or an MCP resource that resolves a
   block's CAS content) so consumers don't hand-assemble the hash lookup.
-- **Stale rc seed survives a DB clear → missing authorities.** rc scripts live
-  as host files under `~/.config/kaijutsu/rc/<type>/<verb>/`, read via the CRDT
-  file cache; `ensure_rc_seed_files()` only writes a file **when absent**.
-  Clearing the kernel DB does not touch `~/.config`, so pre-existing seed files
-  never upgrade to the newer embedded default. Symptom (2026-06-13): a fresh
-  `mcp` context had the old 125-byte binding (`*` + `facade:*` only), missing the
+- **Stale rc seed → missing authorities (per-file upgrade is now `kj rc reset`).**
+  rc scripts live as host files under `~/.config/kaijutsu/rc/<type>/<verb>/`; the
+  deployed tree is the live source of truth and boot only bootstraps it when
+  fresh (2026-06-13 model change), so a pre-existing seed file never auto-upgrades
+  to a newer embedded default. Symptom (2026-06-13): a fresh `mcp` context had the
+  old 125-byte binding (`*` + `facade:*` only), missing the
   `drive`/`fork`/`drift`/`transport`/`operator` authorities the current embedded
-  `PERMISSIVE_BINDING_BODY` grants — so the context could not run `kj transport`
-  and could not self-widen (`allow` needs a binding-admin/rc context). Need a
-  versioned-seed / force-reseed path (bump-and-overwrite when the embedded
-  default changes), or the planned CLI flag / kernel-side setting for the MCP
-  default loadout. Workaround used: hand-refresh the host `S10-binding.kai`.
+  binding grants — so it could not run `kj transport` or self-widen (`allow` needs
+  a binding-admin/rc context). **Targeted fix: `kj rc reset
+  /etc/rc/mcp/create/S10-binding.kai`** (restore that file from its embedded
+  seed). Remaining gap: nothing *detects* a live seed has drifted behind the
+  embedded default — `reset` is a manual pull, by design (live is truth). A
+  staleness indicator (compare live body vs `seed_body()`, e.g. in `kj rc list`)
+  would surface "this file is behind its seed" without reintroducing auto-overwrite.
+  Recurred for `coder`/`genesis` 2026-06-13 (same 2-line seed). The live-context
+  half is worse than the seed half: `reset`/`reseed` only fix *future* contexts —
+  a context already created from a stale seed keeps its broken loadout and can only
+  be repaired from a binding-admin context, which the cold-start bootstrap doesn't
+  provide (see "Cold start seeds no binding-admin context" under Architecture).
 - **Model alias not resolved via `kj --model`.** `kj context create/set --model
   local` stores the alias verbatim and ships it to the *default* provider at
   turn time → `not_found_error: model: local` (observed 2026-06-13). Aliases
@@ -210,6 +241,18 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   player loadout should not be `all` tools for a small model (the composer rc is
   now tool-free); make per-provider/per-context `default_tools` the norm for
   players, and add a turn-level watchdog so a wedged tool loop fails loudly.
+- **`shell` MCP tool drops kj's structured `data`.** The `mcp__kaijutsu__shell`
+  result's `data` field is `null` even for `kj` verbs that emit a structured
+  payload via `KjResult::ok_with_data` (`kj context list`/`info` return full
+  context-id arrays/records; `context.rs:402,411,518`). Consumers are forced to
+  scrape `stdout` (short ids only) or read `kernel.db` directly for full UUIDs
+  (observed 2026-06-13 while setting the app's `current_context` KV). Plumb `data`
+  through the shell tool's result.
+- **`--json` rejected at `kj` leaf subcommands.** The root `--json` global doesn't
+  bind at leaves: both `kj context list --json` and `kj --json context list` error
+  `unexpected argument '--json'`, so there's no way to get structured output for a
+  subcommand over the shell tool. Make `--json` a true global (bind at every leaf,
+  per the clap-reflection model) or document the working invocation.
 
 - **`StreamingBlockHandle` implementation:** Single-block streaming primitive.
 - **LLM streaming rewrite:** Move `process_llm_stream` onto `StreamingBlockHandle`.

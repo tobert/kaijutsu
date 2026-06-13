@@ -73,12 +73,12 @@ enum RcCommand {
         #[arg(long)]
         content: Option<String>,
     },
-    /// Overwrite built-in seed scripts from the embedded defaults
-    /// (destructive: clobbers edits to seeded paths).
-    Reseed {
-        /// Limit the reseed to one context_type
-        #[arg(long = "type")]
-        type_filter: Option<String>,
+    /// Restore one script to its embedded seed (targeted recovery from a
+    /// botched edit; recreates the file if it was removed). Errors if the
+    /// path has no built-in seed — there is nothing to reset it to.
+    Reset {
+        /// Canonical rc path to restore from the embedded default
+        path: String,
     },
 }
 
@@ -154,7 +154,7 @@ impl KjDispatcher {
             RcCommand::Add { .. }
                 | RcCommand::Rm { .. }
                 | RcCommand::Edit { .. }
-                | RcCommand::Reseed { .. }
+                | RcCommand::Reset { .. }
         ) && let Err(denied) = self.require_cap(caller, crate::mcp::Capability::RcWrite, "rc")
         {
             return denied;
@@ -170,7 +170,7 @@ impl KjDispatcher {
             RcCommand::Rm { path } => self.rc_rm(&path).await,
             RcCommand::Show { path, json } => self.rc_show(&path, json).await,
             RcCommand::Edit { path, content } => self.rc_edit(&path, content.as_deref()).await,
-            RcCommand::Reseed { type_filter } => self.rc_reseed(type_filter.as_deref()).await,
+            RcCommand::Reset { path } => self.rc_reset(&path).await,
         }
     }
 
@@ -356,44 +356,25 @@ impl KjDispatcher {
         KjResult::ok(format!("edited rc script '{path}' (content)"))
     }
 
-    async fn rc_reseed(&self, type_filter: Option<&str>) -> KjResult {
-        if let Some(t) = type_filter {
-            let allowed = crate::seed_scripts::seeded_context_types();
-            if !allowed.contains(&t) {
-                return KjResult::Err(format!(
-                    "kj rc reseed: '{t}' has no built-in seed scripts\n\
-                     known context_types with seeds: {}",
-                    allowed.join(", ")
-                ));
-            }
+    /// Restore one script to its embedded seed. Targeted recovery: unlike a
+    /// bulk reseed, it touches exactly the path you name, and create-or-replace
+    /// means it also recovers a file you `rm`'d. Errors (no silent no-op) when
+    /// the path ships no embedded seed — there is nothing to reset it to.
+    async fn rc_reset(&self, path: &str) -> KjResult {
+        if let Err(e) = parse_rc_path(path) {
+            return KjResult::Err(format!("kj rc reset: {e}"));
         }
-
-        // Write each embedded seed back through the cache (→ disk). Matches
-        // the type filter against the canonical path's context_type segment.
-        let cache = self.rc_cache();
-        let mut count = 0usize;
-        for (seed_path, body) in crate::seed_scripts::seed_files() {
-            if let Some(t) = type_filter {
-                let seg = seed_path
-                    .strip_prefix(crate::seed_scripts::RC_VFS_ROOT)
-                    .and_then(|r| r.split('/').next());
-                if seg != Some(t) {
-                    continue;
-                }
-            }
-            if let Err(e) = self.write_rc_file(&cache, seed_path, body).await {
-                return KjResult::Err(format!("kj rc reseed: {seed_path}: {e}"));
-            }
-            count += 1;
-        }
-
-        let scope = match type_filter {
-            Some(t) => format!(" (context_type={t})"),
-            None => String::new(),
+        let Some(body) = crate::seed_scripts::seed_body(path) else {
+            return KjResult::Err(format!(
+                "kj rc reset: '{path}' has no built-in seed (nothing to reset to)\n\
+                 only paths shipped under assets/defaults/rc can be reset"
+            ));
         };
-        KjResult::ok(format!(
-            "reseeded {count} rc script(s){scope} from embedded defaults"
-        ))
+        let cache = self.rc_cache();
+        if let Err(e) = self.write_rc_file(&cache, path, body).await {
+            return KjResult::Err(format!("kj rc reset: {e}"));
+        }
+        KjResult::ok(format!("reset rc script '{path}' to its embedded seed"))
     }
 
     async fn rc_rm(&self, path: &str) -> KjResult {
@@ -636,9 +617,10 @@ mod tests {
         }
     }
 
-    /// `kj rc reseed` overwrites user edits on seeded paths.
+    /// `kj rc reset <path>` restores a single seeded script to its embedded
+    /// default, undoing a user edit — targeted recovery, not a bulk reseed.
     #[tokio::test]
-    async fn rc_reseed_overwrites_user_edit_on_seeded_path() {
+    async fn rc_reset_restores_seeded_path_after_edit() {
         use crate::kj::test_helpers::*;
         use crate::kj::KjResult;
 
@@ -646,8 +628,7 @@ mod tests {
         let c = test_caller();
         let s = |v: &str| v.to_string();
 
-        // Edit a default seed (test_dispatcher's KernelDb has seeds because
-        // it goes through ensure_seeded_rc_scripts).
+        // Botch a default seed (test_dispatcher's tree is bootstrap-seeded).
         d.dispatch(
             &[
                 s("rc"),
@@ -660,21 +641,63 @@ mod tests {
         )
         .await;
 
-        let result = d.dispatch(&[s("rc"), s("reseed")], &c).await;
-        assert!(matches!(result, KjResult::Ok { .. }), "reseed failed: {result:?}");
+        let result = d
+            .dispatch(
+                &[s("rc"), s("reset"), s("/etc/rc/default/create/S20-cache.kai")],
+                &c,
+            )
+            .await;
+        assert!(matches!(result, KjResult::Ok { .. }), "reset failed: {result:?}");
 
         let restored = read_rc(&d, "/etc/rc/default/create/S20-cache.kai")
             .await
-            .expect("seed file present after reseed");
+            .expect("seed file present after reset");
         assert!(
             restored.contains("kj cache add --target=tools"),
-            "reseed didn't restore: {restored}"
+            "reset didn't restore: {restored}"
         );
     }
 
-    /// `kj rc reseed --type unknown` errors instead of silently no-oping.
+    /// `kj rc reset <path>` recreates a script the user `rm`'d — recovery
+    /// works even when the live file is gone, since the seed is the source.
     #[tokio::test]
-    async fn rc_reseed_unknown_type_errors() {
+    async fn rc_reset_recreates_removed_seeded_path() {
+        use crate::kj::test_helpers::*;
+        use crate::kj::KjResult;
+
+        let d = test_dispatcher().await;
+        let c = test_caller();
+        let s = |v: &str| v.to_string();
+
+        d.dispatch(
+            &[s("rc"), s("rm"), s("/etc/rc/default/create/S20-cache.kai")],
+            &c,
+        )
+        .await;
+        assert!(
+            read_rc(&d, "/etc/rc/default/create/S20-cache.kai").await.is_none(),
+            "precondition: file removed"
+        );
+
+        let result = d
+            .dispatch(
+                &[s("rc"), s("reset"), s("/etc/rc/default/create/S20-cache.kai")],
+                &c,
+            )
+            .await;
+        assert!(matches!(result, KjResult::Ok { .. }), "reset failed: {result:?}");
+        assert!(
+            read_rc(&d, "/etc/rc/default/create/S20-cache.kai")
+                .await
+                .is_some_and(|b| b.contains("kj cache add --target=tools")),
+            "reset should recreate the removed seed from its embedded default"
+        );
+    }
+
+    /// `kj rc reset <unseeded>` errors instead of silently no-oping — there
+    /// is no embedded default to reset a user-authored script to.
+    #[tokio::test]
+    async fn rc_reset_unseeded_path_errors() {
         use crate::kj::test_helpers::*;
         use crate::kj::KjResult;
 
@@ -684,7 +707,7 @@ mod tests {
 
         let result = d
             .dispatch(
-                &[s("rc"), s("reseed"), s("--type"), s("nope")],
+                &[s("rc"), s("reset"), s("/etc/rc/mine/create/S00-custom.kai")],
                 &c,
             )
             .await;
@@ -694,6 +717,39 @@ mod tests {
             }
             other => panic!("expected Err, got {other:?}"),
         }
+    }
+
+    /// `kj rc reset` must succeed when a multi-byte seed doc (the stances:
+    /// 改善, em-dashes, …) is already warm in the cache — the production state
+    /// once an mcp/coder context has loaded its stance. Guards the
+    /// create_or_replace byte/char overrun via the reset write path.
+    #[tokio::test]
+    async fn rc_reset_succeeds_with_cached_multibyte_stance() {
+        use crate::kj::test_helpers::*;
+        use crate::kj::KjResult;
+
+        let d = test_dispatcher().await;
+        let c = test_caller();
+        let s = |v: &str| v.to_string();
+
+        // Warm the cache with a multi-byte stance, as a create lifecycle would.
+        let _ = d
+            .kernel()
+            .file_cache(d.block_store())
+            .read_content("/etc/rc/mcp/create/S00-stance.md")
+            .await
+            .expect("seeded stance is readable");
+
+        let result = d
+            .dispatch(
+                &[s("rc"), s("reset"), s("/etc/rc/mcp/create/S00-stance.md")],
+                &c,
+            )
+            .await;
+        assert!(
+            matches!(result, KjResult::Ok { .. }),
+            "reset over a cached multi-byte stance must succeed, got: {result:?}"
+        );
     }
 
     /// `kj rc list` emits full absolute paths as iteration handles so
@@ -754,33 +810,4 @@ mod tests {
         }
     }
 
-    /// `kj rc reseed` (no filter) must succeed even when a seed doc with
-    /// multi-byte UTF-8 (the stances: 改善, em-dashes, …) is already in the
-    /// cache — the production state when a live mcp context has loaded its
-    /// stance. Reproduces the create_or_replace byte/char overrun via the
-    /// reseed path end-to-end.
-    #[tokio::test]
-    async fn rc_reseed_succeeds_with_cached_multibyte_stance() {
-        use crate::kj::test_helpers::*;
-        use crate::kj::KjResult;
-
-        let d = test_dispatcher().await;
-        let c = test_caller();
-        let s = |v: &str| v.to_string();
-
-        // Warm the cache with a multi-byte stance, as an mcp/coder context's
-        // create lifecycle would (read_content loads + caches the doc).
-        let _ = d
-            .kernel()
-            .file_cache(d.block_store())
-            .read_content("/etc/rc/mcp/create/S00-stance.md")
-            .await
-            .expect("seeded stance is readable");
-
-        let result = d.dispatch(&[s("rc"), s("reseed")], &c).await;
-        assert!(
-            matches!(result, KjResult::Ok { .. }),
-            "reseed over a cached multi-byte stance must succeed, got: {result:?}"
-        );
-    }
 }

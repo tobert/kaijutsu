@@ -15,6 +15,7 @@ uuid = { workspace = true }
 tracing = { workspace = true }
 dunce = { workspace = true }
 regex = { workspace = true }
+include_dir = { workspace = true }
 clap = { workspace = true }
 
 # CRDT

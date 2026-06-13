@@ -1035,35 +1035,47 @@ pub async fn create_shared_kernel(
     // Read-write rc tree: ~/.config/kaijutsu/rc mounted at /etc/rc. Longest-
     // prefix wins over the read-only `/`, so this overrides only the rc
     // subtree — the host's real /etc is never touched. rc lifecycle scripts
-    // live here as files; embedded defaults are written to disk if absent
-    // (the floor pattern), so a fresh install boots with a populated tree.
+    // live here as files and this deployed tree is the live source of truth:
+    // what `kj rc edit` / the in-app `vi` mutate and what dispatch runs.
     let rc_dir = config_dir
         .map(|p| p.to_path_buf())
         .unwrap_or_else(self::config_dir)
         .join("rc");
-    // One-time migration: a pre-files DB may carry user `kj rc add/edit`
-    // customizations in the legacy rc_scripts table. Write them to disk
-    // first (only if the file is absent) so the floor seed below doesn't
-    // shadow them. New DBs have no such table → this is a no-op.
-    for (path, content) in kernel_db.legacy_rc_scripts() {
-        if let Some(rel) = path.strip_prefix(kaijutsu_kernel::seed_scripts::RC_VFS_ROOT) {
-            let dest = rc_dir.join(rel);
-            if !dest.exists() {
-                if let Some(parent) = dest.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                if let Err(e) = std::fs::write(&dest, &content) {
-                    log::error!("rc migration: write {}: {e}", dest.display());
-                } else {
-                    log::info!("rc migration: {path} -> {}", dest.display());
+    // Bootstrap-once: the embedded defaults seed the tree only on a genuinely
+    // fresh install (absent or empty). After that, boot never auto-writes the
+    // live tree again — a script you `rm`'d stays gone, a repo-dropped seed
+    // does not linger or resurrect (live is truth). Per-file recovery is
+    // `kj rc reset <path>`; bulk push/pull is left to git + kai scripts.
+    let fresh = std::fs::read_dir(&rc_dir)
+        .map(|mut entries| entries.next().is_none())
+        .unwrap_or(true); // unreadable/absent → treat as fresh
+    if fresh {
+        // One-time migration: a pre-files DB may carry user `kj rc add/edit`
+        // customizations in the legacy rc_scripts table. Write them first (only
+        // if absent) so the bootstrap seed below fills in the rest without
+        // shadowing them. New DBs have no such table → this is a no-op.
+        for (path, content) in kernel_db.legacy_rc_scripts() {
+            if let Some(rel) = path.strip_prefix(kaijutsu_kernel::seed_scripts::RC_VFS_ROOT) {
+                let dest = rc_dir.join(rel);
+                if !dest.exists() {
+                    if let Some(parent) = dest.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    if let Err(e) = std::fs::write(&dest, &content) {
+                        log::error!("rc migration: write {}: {e}", dest.display());
+                    } else {
+                        log::info!("rc migration: {path} -> {}", dest.display());
+                    }
                 }
             }
         }
-    }
-    match kaijutsu_kernel::seed_scripts::ensure_rc_seed_files(&rc_dir) {
-        Ok(n) if n > 0 => log::info!("seeded {n} rc script file(s) into {}", rc_dir.display()),
-        Ok(_) => {}
-        Err(e) => log::error!("rc seed-to-disk failed for {}: {e}", rc_dir.display()),
+        match kaijutsu_kernel::seed_scripts::ensure_rc_seed_files(&rc_dir) {
+            Ok(n) => log::info!(
+                "bootstrapped {n} rc script file(s) into fresh tree {}",
+                rc_dir.display()
+            ),
+            Err(e) => log::error!("rc seed-to-disk failed for {}: {e}", rc_dir.display()),
+        }
     }
     kernel.mount("/etc/rc", LocalBackend::new(&rc_dir)).await;
 

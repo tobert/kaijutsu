@@ -147,7 +147,7 @@ that only moves filter knobs; a future `player` patch moves both
 (spawn-shaped filter + the local bass model) in one recall.
 
 - **Factory presets** ship embedded, names reserved (same pattern as
-  `assets/defaults/rc` + reseed):
+  the `assets/defaults/rc` seed tree):
   - `full` — all-pass; the default when no `--preset` is given.
   - `window` — the hydration keep-set `[0,P] ∪ tail`, read from the
     parent's `context_hydration` row at recall. **No policy row on the
