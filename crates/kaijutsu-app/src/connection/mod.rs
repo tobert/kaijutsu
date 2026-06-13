@@ -6,6 +6,7 @@
 
 pub mod actor_plugin;
 pub mod bootstrap;
+pub mod client_id;
 
 pub use actor_plugin::{
     ActorPlugin, RpcActor, RpcConnectionState, RpcResultChannel, RpcResultMessage,
