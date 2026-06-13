@@ -261,11 +261,26 @@ This doc is one piece of the app-reset effort:
        intended model) — confirmed by `deleted_key_can_be_resurrected`.
      - *Watch granularity.* v1 is a whole-store `tokio::broadcast`; prefix
        filtering is the watcher's job (deferred per the open question below).
-   - **3a — capnp surface** — `get/set/delete/keys/watch` on the wire + RPC.
-   - **3b** — `kj kv` verbs.
-   - **3c** — app adoption: seed `client-id`, store/read
-     `<client-id>.current_context`, subscribe via `watch`. Closes the reattach
-     bug.
+   - **3a — capnp surface [DONE — `1a638bc`]** — `kvGet/kvSet/kvDelete/kvKeys/
+     kvWatch` on the Kernel interface (@78–@82) + a `KvEvents` callback;
+     `Kernel::init_kv` late-wires the store at server startup (fail-loud); RPC
+     impls (CRUD synchronous; `kvWatch` bridges the whole-store broadcast to the
+     callback, lifetime tied to the connection cancel token, drop-on-lag).
+   - **3b [DONE — `99ab3c6`]** — `kj kv get|set|delete|keys` (no cap gate; the
+     store is shared-trust env). Follows the `.data` convention.
+   - **3c — app adoption** (in progress):
+     - **client surface [DONE — `dee5b13`]** — `RpcClient` + `ActorHandle`
+       `kv_get/kv_set/kv_delete/kv_keys`. KV is reachable end-to-end.
+     - **client-id [DONE — `243ee14`]** — seed/read a UUID at
+       `~/.local/share/kaijutsu/client-id`; corrupt → replaced, unwritable →
+       ephemeral.
+     - **reconnect wiring [pending]** — on connect read
+       `<client-id>.current_context` and rejoin it (bootstrap step 3, the "no
+       context specified" branch in `connection/actor_plugin.rs`); on
+       join/switch write it back; optional `watch` for live cross-instance
+       sync. This is the behavioral change that closes
+       `tech_debt_peer_reattach_on_reconnect` — the fragile path that note
+       flags — so it wants verification in the running app, not a blind land.
 
 ---
 
