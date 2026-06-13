@@ -222,9 +222,17 @@ This doc is one piece of the app-reset effort:
    that both the RPC and the bootstrap call. Test: `tests/genesis_bootstrap.rs`.
    Unblocks the demolition by removing the constellation's "create context"
    entry point.
-2. **Demolition** — delete `ui/card_stack/`, `ui/constellation/`, `ui/form/`;
-   collapse `Screen` to `Conversation`. App boots into the bootstrap context's
-   tiling conversation.
+2. **Demolition [DONE — `24c73b3`]** — deleted `ui/card_stack/`,
+   `ui/constellation/`, `ui/form/` (~5,617 LOC, 20 files); collapsed `Screen`
+   to a single `Conversation` (default), keeping the state machine so
+   `OnEnter` still drives initial visibility/focus and future screens can
+   reattach. App boots straight into the conversation (`ConversationRoot`
+   Visible). Orphaned input Actions + contexts + bindings + handler systems
+   removed; the constellation-driven dock activity widget and
+   `sync_model_info_to_constellation` dropped. Also retired ~half the
+   bevy_vello phase-4 `UiVello*` sites (everything in `form/` + `constellation/`)
+   by deletion — see `docs/bevy_vello-escape.md`. `cargo check` clean, 237 app
+   tests pass.
 3. **Kernel KV** (this doc):
    - **3a — primitive [DONE]** — the `Kv` primitive: `KvDocument` (a flat
      `key→String` LWW Map over a DTE `Document`, in `kaijutsu-crdt`) plus the
