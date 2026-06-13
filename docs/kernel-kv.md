@@ -230,7 +230,7 @@ This doc is one piece of the app-reset effort:
    Visible). Orphaned input Actions + contexts + bindings + handler systems
    removed; the constellation-driven dock activity widget and
    `sync_model_info_to_constellation` dropped. Also retired ~half the
-   bevy_vello phase-4 `UiVello*` sites (everything in `form/` + `constellation/`)
+   phase-4 `UiVello*` sites (everything in `form/` + `constellation/`)
    by deletion — see `docs/bevy_vello-escape.md`. `cargo check` clean, 237 app
    tests pass.
 3. **Kernel KV** (this doc):

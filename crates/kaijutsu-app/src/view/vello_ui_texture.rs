@@ -1,5 +1,4 @@
-//! Generic "vello `Scene` → UI `ImageNode` texture" primitive (bevy_vello-escape
-//! phase 4).
+//! Generic "vello `Scene` → UI `ImageNode` texture" primitive.
 //!
 //! Any UI entity that wants vector content draws a `vello::Scene` into a
 //! [`VelloUiScene`] and carries a [`VelloUiTexture`] + `ImageNode`. An extract

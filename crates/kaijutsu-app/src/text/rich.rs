@@ -3,7 +3,7 @@
 //! Supports multiple content formats via `RichContentKind`:
 //! - **Markdown**: per-span brush coloring (headings, code, bold, etc.)
 //! - **Sparkline**: inline timeseries mini-charts (pure Vello vector paths)
-//! - **SVG**: inline vector graphics (via bevy_vello's `load_svg_from_str`)
+//! - **SVG**: inline vector graphics (via `vello_svg` + `usvg`)
 //!
 //! Detection is centralized in `detect_rich_content()` — tries sparkline first
 //! (more specific fence pattern), then SVG, then falls back to markdown.
@@ -145,8 +145,8 @@ pub fn brush_at_offset(span_brushes: &[SpanBrush], offset: usize) -> Option<&Bru
 
 /// Render a Parley layout to a vello Scene with per-span brushes.
 ///
-/// This is a modified version of bevy_vello's `VelloFont::render()` that
-/// uses per-glyph-run brush lookup instead of a single global brush.
+/// Walks the Parley layout's glyph runs and emits them into the scene, using
+/// per-glyph-run brush lookup instead of a single global brush.
 pub fn render_layout_with_brushes(
     scene: &mut vello::Scene,
     layout: &parley::Layout<Brush>,
@@ -313,17 +313,17 @@ fn try_parse_svg(
         return None;
     }
 
-    let result = if let Some(fdb) = svg_fontdb {
-        let options = fdb.usvg_options();
-        bevy_vello::integrations::svg::load_svg_from_str_with_options(svg_str, &options)
-    } else {
-        bevy_vello::integrations::svg::load_svg_from_str(svg_str)
+    let options = match svg_fontdb {
+        Some(fdb) => fdb.usvg_options(),
+        None => vello_svg::usvg::Options::default(),
     };
 
-    match result {
-        Ok(svg) => {
+    match vello_svg::usvg::Tree::from_str(svg_str, &options) {
+        Ok(tree) => {
+            let scene = vello_svg::render_tree(&tree);
+            let size = tree.size();
             let source = Arc::new(svg_str.to_string());
-            Some((svg.scene, svg.width, svg.height, source))
+            Some((Arc::new(scene), size.width(), size.height(), source))
         }
         Err(e) => {
             // During streaming (Status::Running), incomplete SVG is expected to

@@ -231,8 +231,8 @@ pub fn sync_block_cell_buffers(
 
 /// Layout BlockCells — compute indentation levels from DAG nesting.
 ///
-/// Heights are determined by Parley text measurement via bevy_vello's
-/// ContentSize, not by manual estimation. This system only sets indent_level.
+/// Heights are determined by Parley text measurement, not by manual
+/// estimation. This system only sets indent_level.
 pub fn layout_block_cells(
     entities: Res<EditorEntities>,
     main_cells: Query<&CellEditor, With<MainCell>>,
@@ -571,7 +571,7 @@ pub fn highlight_focused_block(
 
 /// Cull off-screen block cells by toggling Visibility.
 ///
-/// Blocks entirely outside the visible scroll range are hidden so bevy_vello
+/// Blocks entirely outside the visible scroll range are hidden so the renderer
 /// skips them during extract — no Parley layout, no Vello scene encoding.
 /// A margin of one screen height above/below prevents pop-in during fast scroll.
 ///

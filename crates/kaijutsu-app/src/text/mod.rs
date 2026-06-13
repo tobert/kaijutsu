@@ -1,7 +1,8 @@
-//! Text rendering module using Vello (vector graphics).
+//! Text rendering module.
 //!
-//! Provides GPU-accelerated text rendering via bevy_vello, which uses
-//! Parley for text layout and Vello for vector path rendering.
+//! GPU-accelerated text via two paths sharing one Parley shaping source: MSDF
+//! glyphs (shader-quality text) and Vello-rasterized vector content (SVG, ABC,
+//! sparklines, borders).
 
 pub mod abc;
 pub mod components;
@@ -13,9 +14,9 @@ pub mod rich;
 pub mod shaping;
 pub mod sparkline;
 
-pub use components::{KjTextEffects, bevy_color_to_brush, vello_style};
+pub use components::{KjTextEffects, bevy_color_to_brush};
 pub use plugin::KjTextPlugin;
-pub use resources::{FontHandles, ShapingFonts, SvgFontDb, TextMetrics};
+pub use resources::{ShapingFonts, SvgFontDb, TextMetrics};
 pub use rich::RichContent;
 
 /// Char-aware truncation (safe for multi-byte UTF-8).

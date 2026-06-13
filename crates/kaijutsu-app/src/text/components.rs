@@ -1,11 +1,6 @@
-//! Vello text components and style types for Kaijutsu.
-//!
-//! Thin wrappers and marker components that map kaijutsu concepts
-//! onto bevy_vello's text rendering.
+//! Text effect markers and color/brush helpers for Kaijutsu.
 
 use bevy::prelude::*;
-use bevy_vello::integrations::text::VelloFontAxes;
-use bevy_vello::prelude::*;
 
 /// Rainbow color cycling effect marker.
 ///
@@ -13,23 +8,6 @@ use bevy_vello::prelude::*;
 #[derive(Component, Default, Clone, PartialEq, Eq)]
 pub struct KjTextEffects {
     pub rainbow: bool,
-}
-
-/// Build a `VelloTextStyle` from font handle, color, and size.
-///
-/// Replaces the per-frame sync that `KjUiText` + `sync_kj_ui_text` used to do.
-/// Call this at spawn time to construct a fully-styled `UiVelloText`.
-pub fn vello_style(font: &Handle<VelloFont>, color: Color, font_size: f32) -> VelloTextStyle {
-    VelloTextStyle {
-        font: font.clone(),
-        brush: bevy_color_to_brush(color),
-        font_size,
-        font_axes: VelloFontAxes {
-            weight: Some(200.0),
-            ..default()
-        },
-        ..default()
-    }
 }
 
 /// Convert a Bevy `Color` to a Vello `Brush::Solid`.

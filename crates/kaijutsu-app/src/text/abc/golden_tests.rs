@@ -6,7 +6,7 @@
 //!
 //! Snippets are pure-staff ABC (no T:/C: text fields) so the test
 //! never needs a `VelloFont`. If we later add lyric/title goldens
-//! we'll need to plumb a bevy_vello font here.
+//! we'll need to plumb a shaping `VelloFont` here.
 
 use vello::wgpu;
 use image::{ImageBuffer, Rgba, RgbaImage};

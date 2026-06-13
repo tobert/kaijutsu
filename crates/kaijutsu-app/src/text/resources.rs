@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use bevy::prelude::*;
-use bevy_vello::integrations::svg::usvg;
+use vello_svg::usvg;
 
 /// Shared font database for SVG `<text>` rendering.
 ///
@@ -36,28 +36,9 @@ impl Default for SvgFontDb {
     }
 }
 
-/// Loaded font handles for the bevy_vello UI-chrome path (`UiVelloText`).
-///
-/// Still bevy_vello-typed because `UiVelloText`/`vello_style` consume
-/// `bevy_vello::VelloFont`. Retires with the UI chrome in phase 4; the
-/// kaijutsu-owned shaping path uses [`ShapingFonts`] instead.
-#[derive(Resource, Clone, Default)]
-pub struct FontHandles {
-    /// Monospace font (primary — code, blocks, compose).
-    pub mono: Handle<bevy_vello::prelude::VelloFont>,
-    /// Serif font (secondary — headings, prose).
-    pub serif: Handle<bevy_vello::prelude::VelloFont>,
-    /// CJK font (Noto Sans CJK JP Light — Japanese/Chinese/Korean glyphs).
-    pub cjk: Handle<bevy_vello::prelude::VelloFont>,
-}
-
-/// Loaded font handles for the kaijutsu-owned shaping path (bevy_vello-escape
-/// phase 3): MSDF extraction and scene-rendered rich text both shape through
-/// these via `VelloFont::layout`, keeping one shaping source.
-///
-/// Separate from [`FontHandles`] during the transition — same `.ttf` files,
-/// loaded a second time as our asset type. Collapses to the only font
-/// resource once the UI chrome (and bevy_vello) retire in phase 4.
+/// Loaded font handles for the kaijutsu-owned shaping path: MSDF extraction and
+/// scene-rendered rich text both shape through these via `VelloFont::layout`,
+/// keeping one shaping source. The sole font resource for the app's text.
 #[derive(Resource, Clone, Default)]
 pub struct ShapingFonts {
     /// Monospace font (primary — code, blocks, compose).

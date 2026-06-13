@@ -2,6 +2,11 @@
 
 *Retiring the bevy_vello fork in favor of direct vello + parley integration.*
 
+> **STATUS: COMPLETE (2026-06-13).** `bevy_vello` is no longer a dependency of
+> `kaijutsu-app`. All phases shipped; the fork is archived. This document is the
+> historical design record — it is intentionally the one place the `bevy_vello`
+> name survives in the tree.
+
 We maintain six patches on a fork of bevy_vello (`tobert/bevy_vello`, branch
 `fix/ui-node-padding`, consumed as a path dep from `crates/kaijutsu-app`).
 Upstream has gone quiet. Rather than upstream the patches into a dormant
@@ -224,10 +229,20 @@ Known costs of the 3D direction, none new:
    `BlockScene` is now misnamed (holds no scene) — rename to `BlockContent` is a
    tracked follow-up (docs/issues.md).
 
-     The `VelloView` marker, `VelloPlugin`, chrome `FontHandles`, and the
-     `UiVelloText` in `tiling_reconciler` stay until steps 3–4 + the
-     `tiling_reconciler` summary (→ native `Text`) + phase-3c land; then
-     `ShapingFonts` merges back into `FontHandles` and the fork archives.
+   - **[DONE] Chrome teardown + dep removal.** The last `UiVelloText`
+     (`tiling_reconciler` unfocused-pane summary) became a native Bevy `Text`
+     node — the one surface using Bevy's text pipeline, a pragmatic choice for a
+     dimmed secondary label. Phase-3c SVG moved to direct `vello_svg`/`usvg`
+     (`text/rich.rs`, `SvgFontDb`). Chrome `FontHandles` deleted (`ShapingFonts`
+     is now the sole font resource); `vello_style`/`VelloFontAxes` chrome helpers
+     removed. `VelloPlugin` and the `VelloView` camera marker removed. The
+     `bevy_vello` path-dep is **gone from `Cargo.toml`**; `cargo tree` confirms
+     it's no longer in the graph, and `vello_svg 0.9` dedups onto `vello 0.7`.
+     All in-tree `bevy_vello` mentions cleaned from code/other-docs; the name
+     survives only here (the design record) by intent.
 
-Phases 1–3 are done and were independent of the UI rewrite; phase 4 rides the
-rewrite's schedule. No big-bang swap.
+Outcome: kaijutsu owns the full vector path — offscreen `vello::Renderer`
+(`vello_rasterizer`), the parley shaping core (`text/shaping`), and the generic
+`Scene`→`ImageNode`-texture primitive (`vello_ui_texture`) shared by block cells,
+role borders, docks, and the MSDF overlay/shell-dock surfaces. No big-bang swap;
+each phase shipped and was verified on its own.

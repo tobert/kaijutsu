@@ -2116,7 +2116,7 @@ mod tests {
                     s("--name"),
                     s("research"),
                     s("--pwd"),
-                    s("/home/user/src/bevy_vello"),
+                    s("/home/user/src/myproject"),
                 ],
                 &c,
             )
@@ -2129,7 +2129,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let shell = db.get_context_shell(child.context_id).unwrap().unwrap();
-        assert_eq!(shell.cwd, Some("/home/user/src/bevy_vello".into()));
+        assert_eq!(shell.cwd, Some("/home/user/src/myproject".into()));
     }
 
     /// Register a mock LLM provider on the kernel so --model validation passes.

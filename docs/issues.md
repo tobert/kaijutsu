@@ -141,12 +141,12 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ## User Interface (kaijutsu-app) & UX
 
-- **Rename `BlockScene` → `BlockContent`:** after bevy_vello-escape phase 4 it no
+- **Rename `BlockScene` → `BlockContent`:** after the vello-primitive unification it no
   longer holds a scene (scene + `built_*` moved to `VelloUiScene`); it's now pure
   build-bookkeeping (`content_version`/`last_built_version`/`scene_version`/
   `text`/`color`). Name is misleading. Mechanical rename across `block_render.rs`,
   `lifecycle.rs`, `overlay.rs`, `shell_dock.rs`, `render.rs`.
-- **Verify Vello-content cell composite (bevy_vello-escape phase 4):** confirm an
+- **Verify Vello-content cell composite (vello-primitive unification):** confirm an
   ABC/SVG/sparkline *cell* (`has_vello_content == true`) rasterizes via
   `render_vello_scenes` then composites MSDF labels on top — needs a conversation
   with rich content; verified all MSDF-only surfaces but not this combination.

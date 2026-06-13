@@ -1,19 +1,16 @@
-//! Offscreen vello rasterizer owned by kaijutsu (bevy_vello-escape phase 2).
+//! Offscreen vello rasterizer owned by kaijutsu.
 //!
 //! A `vello::Renderer` lives in the render world and rasterizes a built
 //! `vello::Scene` to a texture view via `render_to_texture`. This is the one
 //! piece of the vello integration we actually need — vello as an offscreen
-//! rasterizer presented on an `ImageNode`/mesh — and the deepest coupling to
-//! bevy_vello (whose `render::VelloRenderer` resource we were borrowing).
+//! rasterizer presented on an `ImageNode`/mesh. Owning the renderer means that
+//! when Bevy bumps the render API we migrate ~50 lines we control. Init pattern:
+//! settings in `build()`, renderer in `finish()` once `RenderDevice` exists,
+//! with a CPU safe-mode fallback — trimmed to the single `render_to_texture`
+//! use case, no UI compositing pass, no canvas.
 //!
-//! Owning it here severs that coupling: when Bevy bumps the render API we
-//! migrate ~50 lines we control instead of chasing a dormant fork. The init
-//! pattern mirrors bevy_vello's (settings in `build()`, renderer in `finish()`
-//! once `RenderDevice` exists) and the CPU safe-mode fallback, trimmed to the
-//! single `render_to_texture` use case — no UI compositing pass, no canvas.
-//!
-//! Consumers: `block_render::render_block_textures` today; phase-4
-//! scene-to-texture sites as the UI rewrite lands them.
+//! Consumers reach it through `vello_ui_texture::render_vello_scenes` (block
+//! cells, role borders, docks, MSDF text surfaces).
 
 use std::sync::{Arc, Mutex};
 

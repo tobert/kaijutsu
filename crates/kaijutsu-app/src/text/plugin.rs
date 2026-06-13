@@ -6,25 +6,24 @@
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 use bevy::winit::{EventLoopProxyWrapper, WinitUserEvent};
-use bevy_vello::VelloPlugin;
 
 use super::msdf::{FontDataMap, MsdfGenerator};
-use super::resources::{FontHandles, ShapingFonts, SvgFontDb, TextMetrics};
+use super::resources::{ShapingFonts, SvgFontDb, TextMetrics};
 use super::shaping::{ShapingPlugin, VelloFont, VelloFontAxes, VelloTextAlign, VelloTextStyle};
 
 /// Plugin that enables Vello + MSDF text rendering.
 ///
 /// Sets up:
-/// - VelloPlugin (vector renderer for SVG, borders, etc.)
 /// - MSDF atlas, generator, and font data map
 /// - Font loading and DPI-aware text metrics
+///
+/// Vector rasterization (SVG, borders, ABC, sparklines) is owned by
+/// `VelloRasterizerPlugin` + `VelloUiTexturePlugin`.
 pub struct KjTextPlugin;
 
 impl Plugin for KjTextPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins(VelloPlugin::default())
-            .add_plugins(ShapingPlugin)
-            .init_resource::<FontHandles>()
+        app.add_plugins(ShapingPlugin)
             .init_resource::<ShapingFonts>()
             .init_resource::<TextMetrics>()
             .init_resource::<SvgFontDb>()
@@ -97,24 +96,14 @@ fn poll_msdf_generator(
     atlas.sync_to_gpu(&mut images);
 }
 
-/// Load bundled fonts for both font paths.
-///
-/// The same three `.ttf` files load twice — once as bevy_vello's `VelloFont`
-/// for the UI-chrome path (`FontHandles`), once as our shaping `VelloFont`
-/// (`ShapingFonts`). The double-load is a transition cost; it collapses when
-/// the UI chrome retires in phase 4 (bevy_vello-escape).
+/// Load bundled fonts for the kaijutsu-owned shaping path (`ShapingFonts`).
 fn load_fonts(
     asset_server: Res<AssetServer>,
-    mut font_handles: ResMut<FontHandles>,
     mut shaping_fonts: ResMut<ShapingFonts>,
 ) {
     const MONO: &str = "fonts/CascadiaCodeNF.ttf";
     const SERIF: &str = "fonts/NotoSerif-Regular.ttf";
     const CJK: &str = "fonts/NotoSansCJKJP-Light.ttf";
-
-    font_handles.mono = asset_server.load(MONO);
-    font_handles.serif = asset_server.load(SERIF);
-    font_handles.cjk = asset_server.load(CJK);
 
     shaping_fonts.mono = asset_server.load(MONO);
     shaping_fonts.serif = asset_server.load(SERIF);
@@ -129,8 +118,8 @@ fn load_fonts(
 /// referenced fonts are in its database. Without this, `<text>` elements
 /// are silently dropped from rendered SVGs.
 fn load_svg_fontdb(mut svg_fontdb: ResMut<SvgFontDb>, theme: Res<crate::ui::theme::Theme>) {
-    use bevy_vello::integrations::svg::usvg::fontdb;
     use std::sync::Arc;
+    use vello_svg::usvg::fontdb;
 
     let mut db = fontdb::Database::new();
 
@@ -174,7 +163,7 @@ fn load_svg_fontdb(mut svg_fontdb: ResMut<SvgFontDb>, theme: Res<crate::ui::them
 ///
 /// Fires once after the mono font asset loads, replacing the defaults with
 /// real Parley-measured metrics. This ensures cursor positioning matches
-/// what bevy_vello renders — critical for accurate cursor placement.
+/// what the renderer draws — critical for accurate cursor placement.
 fn update_text_metrics_from_font(
     shaping_fonts: Res<ShapingFonts>,
     fonts: Res<Assets<VelloFont>>,

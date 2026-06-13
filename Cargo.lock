@@ -2046,18 +2046,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bevy_vello"
-version = "0.13.1"
-dependencies = [
- "bevy",
- "parley",
- "thiserror 2.0.18",
- "tracing",
- "vello",
- "vello_svg",
-]
-
-[[package]]
 name = "bevy_window"
 version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5627,7 +5615,6 @@ dependencies = [
  "bevy_mesh",
  "bevy_remote",
  "bevy_tweening",
- "bevy_vello",
  "bytemuck",
  "capnp",
  "capnp-rpc",
@@ -5669,6 +5656,7 @@ dependencies = [
  "ttf-parser 0.19.2",
  "uuid",
  "vello",
+ "vello_svg",
  "whoami",
 ]
 
@@ -5904,7 +5892,7 @@ dependencies = [
 
 [[package]]
 name = "kaish-glob"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "async-trait",
  "ignore",
@@ -5913,14 +5901,14 @@ dependencies = [
 
 [[package]]
 name = "kaish-help"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "kaish-types",
 ]
 
 [[package]]
 name = "kaish-kernel"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "anyhow",
  "ariadne",
@@ -5963,7 +5951,7 @@ dependencies = [
 
 [[package]]
 name = "kaish-tool-api"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "async-trait",
  "clap",
@@ -5972,7 +5960,7 @@ dependencies = [
 
 [[package]]
 name = "kaish-types"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -5982,7 +5970,7 @@ dependencies = [
 
 [[package]]
 name = "kaish-vfs"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "async-trait",
  "kaish-types",

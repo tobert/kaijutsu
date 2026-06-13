@@ -17,9 +17,8 @@ kaijutsu. This can be inspected and visualized in the app or over MCP.
 **Kaijutsu is not released yet**. The kernel feels solid and reliable, and
 diamond-types-extended seems to be stable. The UI is coming along.
 
-You may need my branches of bevy_vello and kaish for this to build. Kaish
-will go back to cargo versions soon, and I'm working to upstream the bevy_vello
-patches.
+You may need my branch of kaish for this to build. Kaish will go back to
+cargo versions soon.
 
 -Amy
 

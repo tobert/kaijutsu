@@ -46,7 +46,7 @@ toml = { workspace = true }
 # ABC music notation
 kaijutsu-abc.workspace = true
 
-# SVG validation (kernel-side, same version as bevy_vello's dependency)
+# SVG validation (kernel-side)
 usvg = "0.46"
 
 # File pattern matching

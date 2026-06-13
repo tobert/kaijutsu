@@ -1,8 +1,8 @@
 //! ABC notation → Vello scene rendering.
 //!
 //! Converts `Vec<EngravingElement>` from `kaijutsu-abc` into a `vello::Scene`.
-//! Lives in kaijutsu-app (which has both bevy_vello and kaijutsu-abc deps)
-//! so kaijutsu-abc stays a leaf crate.
+//! Lives in kaijutsu-app (which has both the vello render deps and
+//! kaijutsu-abc) so kaijutsu-abc stays a leaf crate.
 
 use bevy::prelude::default;
 use crate::text::shaping::{VelloFont, VelloTextAlign, VelloTextStyle};

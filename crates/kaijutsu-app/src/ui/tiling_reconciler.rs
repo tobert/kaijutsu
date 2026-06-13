@@ -32,8 +32,6 @@ use bevy::prelude::*;
 use super::theme::Theme;
 use super::tiling::*;
 use crate::cell::ConversationContainer;
-use crate::text::{FontHandles, vello_style};
-use bevy_vello::prelude::UiVelloText;
 
 // ============================================================================
 // MARKERS
@@ -465,7 +463,7 @@ pub fn sync_unfocused_pane_summaries(
     mut commands: Commands,
     tree: Res<TilingTree>,
     theme: Res<Theme>,
-    font_handles: Res<FontHandles>,
+    asset_server: Res<AssetServer>,
     doc_cache: Res<crate::cell::DocumentCache>,
     conv_containers: Query<
         (Entity, &PaneMarker, &PaneSavedState, Option<&Children>),
@@ -531,14 +529,20 @@ pub fn sync_unfocused_pane_summaries(
                     format!("@{}", context_label)
                 };
 
+                // The unfocused-pane summary is the one surface rendered with
+                // Bevy's native text pipeline rather than the MSDF/Vello path —
+                // a deliberate pragmatic choice for a dimmed, secondary label.
+                // Our bundled mono font keeps it visually consistent.
                 let summary_entity = commands
                     .spawn((
                         UnfocusedPaneSummary,
-                        UiVelloText {
-                            value: summary_text,
-                            style: vello_style(&font_handles.mono, theme.fg_dim, 14.0),
+                        Text::new(summary_text),
+                        TextFont {
+                            font: asset_server.load("fonts/CascadiaCodeNF.ttf"),
+                            font_size: 14.0,
                             ..default()
                         },
+                        TextColor(theme.fg_dim),
                         Node {
                             width: Val::Percent(100.0),
                             padding: UiRect::all(Val::Px(16.0)),

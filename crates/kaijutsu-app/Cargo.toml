@@ -30,13 +30,11 @@ bevy_remote.workspace = true
 bevy_tweening = { git = "https://github.com/djeedai/bevy_tweening", branch = "main" }
 avian2d = "0.6"
 
-# Text rendering (Vello-based + MSDF)
-# bevy_vello escape (docs/bevy_vello-escape.md): direct vello/parley/kurbo/peniko
-# deps, version-locked to the fork's pins so Cargo dedups to the same crate
-# instances. Lets us swap raw-scene imports off bevy_vello before owning the
-# renderer (phase 2). `picking` feature dropped — zero customers (MeshPickingPlugin).
-bevy_vello = { path = "/home/atobey/src/wt/pr6", features = ["text", "svg"] }
+# Text rendering (Vello-based + MSDF): we own the rasterizer + shaping +
+# scene→texture primitive. Direct vello stack, version-pinned so vello_svg 0.9
+# dedups onto vello 0.7. Design record: docs/bevy_vello-escape.md.
 vello = "0.7.0"
+vello_svg = "0.9.0"
 parley = "0.7.0"
 kurbo = "0.13.0"
 peniko = "0.6.0"

@@ -1,4 +1,4 @@
-//! The parley shaping context (bevy_vello-escape phase 3).
+//! The parley shaping context.
 //!
 //! One global `FontContext` holds the shared font collection; each thread gets
 //! a cheap clone plus its own `LayoutContext`. This is the single shaping

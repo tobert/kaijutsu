@@ -1,8 +1,6 @@
-//! Text-style data types fed into `VelloFont::layout` (bevy_vello-escape phase 3).
+//! Text-style data types fed into `VelloFont::layout`.
 //!
-//! Ported from the fork's `integrations::text` minus the UI/world components
-//! (`UiVelloText`, `VelloText2d`, `VelloTextAnchor`) — those belong to the UI
-//! render path that retires in phase 4. We keep only what `layout()` reads.
+//! Only what `layout()` reads — style, font axes, alignment.
 
 /// Re-export so call sites keep `OverflowWrap` without a parley import.
 pub use parley::OverflowWrap;
