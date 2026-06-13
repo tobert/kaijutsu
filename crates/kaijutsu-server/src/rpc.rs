@@ -641,6 +641,25 @@ fn kernel_data_dir() -> std::path::PathBuf {
     dir
 }
 
+/// Resolve the kernel KV store, or an RPC fault if it was never wired (only an
+/// embedded/test kernel that skipped `init_kv` lands here).
+fn kv_store(
+    kernel: &SharedKernel,
+) -> Result<Arc<kaijutsu_kernel::kv::Kv>, capnp::Error> {
+    kernel
+        .kernel
+        .kv()
+        .cloned()
+        .ok_or_else(|| capnp::Error::failed("kernel KV store not initialized".into()))
+}
+
+/// Map a KV error to an RPC fault. Used on read-path errors (e.g. a corrupt
+/// envelope, which we surface rather than swallow); write-path errors are
+/// reported in-band on `kvSet`.
+fn kv_err(e: kaijutsu_kernel::kv::KvError) -> capnp::Error {
+    capnp::Error::failed(format!("kv: {e}"))
+}
+
 /// Create a BlockStore backed by the shared KernelDb.
 fn create_block_store_with_kernel_db(
     db: Arc<parking_lot::Mutex<KernelDb>>,
@@ -1094,6 +1113,13 @@ pub async fn create_shared_kernel(
     // Share this exact instance with the kaish MountBackend so both surfaces
     // map a real file to the same CRDT document.
     kernel_arc.set_file_cache(file_cache_for_broker.clone());
+
+    // Wire the kernel KV store now that the KernelDb handle exists. Fail loud:
+    // a kernel that can't rebuild its persisted env should not come up pretending
+    // the store is empty (docs/kernel-kv.md).
+    kernel_arc
+        .init_kv(kernel_db_arc.clone())
+        .map_err(|e| capnp::Error::failed(format!("Failed to initialize kernel KV: {e}")))?;
     if let Err(e) = kernel_arc
         .register_builtin_mcp_servers(
             documents.clone(),
@@ -4015,6 +4041,156 @@ impl kernel::Server for KernelImpl {
             }
             .instrument(span),
         )
+    }
+
+    // ========================================================================
+    // Kernel Key–Value Store (docs/kernel-kv.md)
+    // ========================================================================
+
+    fn kv_get(
+        self: Rc<Self>,
+        params: kernel::KvGetParams,
+        mut results: kernel::KvGetResults,
+    ) -> Promise<(), capnp::Error> {
+        let _span = tracing::info_span!("rpc", method = "kv_get").entered();
+        let key = pry!(pry!(pry!(params.get()).get_key()).to_str()).to_owned();
+        let kv = pry!(kv_store(&self.kernel));
+        match pry!(kv.get(&key).map_err(kv_err)) {
+            Some(value) => {
+                let mut b = results.get();
+                b.set_found(true);
+                b.set_value(&value);
+            }
+            None => results.get().set_found(false),
+        }
+        Promise::ok(())
+    }
+
+    fn kv_set(
+        self: Rc<Self>,
+        params: kernel::KvSetParams,
+        mut results: kernel::KvSetResults,
+    ) -> Promise<(), capnp::Error> {
+        let _span = tracing::info_span!("rpc", method = "kv_set").entered();
+        let p = pry!(params.get());
+        let key = pry!(pry!(p.get_key()).to_str()).to_owned();
+        let value = pry!(pry!(p.get_value()).to_str()).to_owned();
+        let expires_at = if p.get_has_expires_at() {
+            Some(p.get_expires_at())
+        } else {
+            None
+        };
+        let kv = pry!(kv_store(&self.kernel));
+        let mut b = results.get();
+        match kv.set(&key, &value, expires_at) {
+            Ok(()) => {
+                b.set_success(true);
+                b.set_error("");
+            }
+            Err(e) => {
+                // A bad write (value-too-large, persistence fault) is reported
+                // in-band, not as an RPC fault — the caller decides what to do.
+                b.set_success(false);
+                b.set_error(&e.to_string());
+            }
+        }
+        Promise::ok(())
+    }
+
+    fn kv_delete(
+        self: Rc<Self>,
+        params: kernel::KvDeleteParams,
+        mut results: kernel::KvDeleteResults,
+    ) -> Promise<(), capnp::Error> {
+        let _span = tracing::info_span!("rpc", method = "kv_delete").entered();
+        let key = pry!(pry!(pry!(params.get()).get_key()).to_str()).to_owned();
+        let kv = pry!(kv_store(&self.kernel));
+        let existed = pry!(kv.delete(&key).map_err(kv_err));
+        results.get().set_existed(existed);
+        Promise::ok(())
+    }
+
+    fn kv_keys(
+        self: Rc<Self>,
+        params: kernel::KvKeysParams,
+        mut results: kernel::KvKeysResults,
+    ) -> Promise<(), capnp::Error> {
+        let _span = tracing::info_span!("rpc", method = "kv_keys").entered();
+        let p = pry!(params.get());
+        let prefix = if p.get_has_prefix() {
+            Some(pry!(pry!(p.get_prefix()).to_str()).to_owned())
+        } else {
+            None
+        };
+        let kv = pry!(kv_store(&self.kernel));
+        let page = kv.keys(prefix.as_deref(), None, None);
+        let mut list = results.get().init_keys(page.keys.len() as u32);
+        for (i, k) in page.keys.iter().enumerate() {
+            list.set(i as u32, k);
+        }
+        // next_cursor is always absent in v1; the schema carries it for later.
+        results.get().set_has_next_cursor(false);
+        Promise::ok(())
+    }
+
+    fn kv_watch(
+        self: Rc<Self>,
+        params: kernel::KvWatchParams,
+        _results: kernel::KvWatchResults,
+    ) -> Promise<(), capnp::Error> {
+        let _span = tracing::info_span!("rpc", method = "kv_watch").entered();
+        let callback = pry!(pry!(params.get()).get_callback());
+        let kv = pry!(kv_store(&self.kernel));
+        let mut rx = kv.subscribe();
+        let conn_cancel = self.connection.borrow().cancel_token();
+
+        // Bridge the whole-store broadcast to the client callback. Lifetime is
+        // tied to the connection cancel token (same baseline as subscribe_blocks);
+        // a reconnect from the same client leaves the old bridge to drain and
+        // die on cancel rather than deduping — acceptable for a low-rate env
+        // store (the per-(principal,instance) dedup the block stream grew is a
+        // later refinement if a hot watcher proves it needed).
+        tokio::task::spawn_local(async move {
+            const CALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+            loop {
+                tokio::select! {
+                    _ = conn_cancel.cancelled() => break,
+                    recv = rx.recv() => match recv {
+                        Ok(change) => {
+                            let mut req = callback.on_change_request();
+                            {
+                                let mut b = req.get();
+                                b.set_key(&change.key);
+                                match &change.value {
+                                    Some(v) => { b.set_value(v); b.set_deleted(false); }
+                                    None => { b.set_value(""); b.set_deleted(true); }
+                                }
+                            }
+                            match tokio::time::timeout(CALLBACK_TIMEOUT, req.send().promise).await {
+                                Ok(Ok(_)) => {}
+                                Ok(Err(e)) => {
+                                    log::debug!("kv watch callback failed: {e}; dropping subscriber");
+                                    break;
+                                }
+                                Err(_) => {
+                                    log::warn!("kv watch callback timed out; dropping subscriber");
+                                    break;
+                                }
+                            }
+                        }
+                        // Lagged: the watcher fell behind the broadcast ring. The
+                        // client must full-resync (kvKeys) — drop and let it
+                        // re-subscribe rather than deliver a torn view.
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            log::warn!("kv watch lagged by {n}; dropping subscriber (client should resync)");
+                            break;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }
+        });
+        Promise::ok(())
     }
 
     fn compact_context(

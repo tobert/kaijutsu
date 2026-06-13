@@ -102,6 +102,12 @@ pub struct Kernel {
     /// at a caller-provided `data_dir` (production, embedded). `Arc` keeps the dir
     /// alive until the last clone of this guard drops.
     temp_cleanup: Option<std::sync::Arc<TempDirGuard>>,
+    /// Kernel key–value store — the persistent, synced `env` (see
+    /// `docs/kernel-kv.md`). Late-wired by the server once the `KernelDb` handle
+    /// exists (`init_kv`), since the store journals to the oplog. Absent in
+    /// embedded/test kernels that never call `init_kv`; `kv()` returns `None`
+    /// there and callers degrade rather than panic.
+    kv: OnceLock<Arc<crate::kv::Kv>>,
 }
 
 /// Removes its directory on drop. A tiny owned guard so `new_ephemeral()` test
@@ -172,6 +178,7 @@ impl Kernel {
             timelines: dashmap::DashMap::new(),
             beat_ingress: OnceLock::new(),
             temp_cleanup: None,
+            kv: OnceLock::new(),
         }
     }
 
@@ -228,6 +235,7 @@ impl Kernel {
             timelines: dashmap::DashMap::new(),
             beat_ingress: OnceLock::new(),
             temp_cleanup: None,
+            kv: OnceLock::new(),
         }
     }
 
@@ -725,6 +733,32 @@ impl Kernel {
             Some(tx) => tx.send(cmd).is_ok(),
             None => false,
         }
+    }
+
+    // ========================================================================
+    // Key–value store
+    // ========================================================================
+
+    /// Initialize the kernel KV store against `db`. Called once by the server at
+    /// startup, where the `KernelDb` handle lives. Builds a persistent [`Kv`]
+    /// (rebuilding live state from the oplog) and installs it. Returns whether it
+    /// was newly set (`false` if already installed). Fail-loud: a DB error here
+    /// surfaces rather than leaving the kernel KV-less.
+    pub fn init_kv(
+        &self,
+        db: crate::block_store::DbHandle,
+    ) -> Result<bool, crate::kv::KvError> {
+        if self.kv.get().is_some() {
+            return Ok(false);
+        }
+        let kv = crate::kv::Kv::persistent(db, PrincipalId::system())?;
+        Ok(self.kv.set(Arc::new(kv)).is_ok())
+    }
+
+    /// The kernel KV store, or `None` in an embedded/test kernel that never
+    /// called [`init_kv`](Self::init_kv). Callers degrade rather than panic.
+    pub fn kv(&self) -> Option<&Arc<crate::kv::Kv>> {
+        self.kv.get()
     }
 
     // ========================================================================

@@ -1168,6 +1168,41 @@ interface Kernel {
   # @78 (checkFacade) retired: facade capability enforcement moved to the
   # shared shellExecute / editInput / submitInput handlers (deny-by-default,
   # keyed on the context binding), so humans and agents cross the same gate.
+  # Its ordinal is reused below for kvGet (capnp forbids ordinal holes; the old
+  # method is gone from every client, so the reuse is wire-safe).
+
+  # ============================================================================
+  # Kernel Key–Value Store (persistent, synced env — docs/kernel-kv.md)
+  # ============================================================================
+  # A small, durable, collaborative key→string store. Keys are flat UTF-8
+  # strings (dotted namespaces are convention, not mechanism); values are
+  # strings (structured data is the caller's JSON). No per-key ACLs — a
+  # single-user shared-trust kernel.
+
+  # Read a key. `found = false` when absent, deleted, or advisory-expired.
+  kvGet @78 (key :Text) -> (value :Text, found :Bool);
+
+  # Set a key. `hasExpiresAt` gates the advisory absolute expiry (writer-clock
+  # ms). Returns an error string on the 64 KB value cap or a persistence fault.
+  kvSet @79 (key :Text, value :Text, hasExpiresAt :Bool, expiresAt :Int64) -> (success :Bool, error :Text);
+
+  # Delete a key. `existed` reports whether a live value was present.
+  kvDelete @80 (key :Text) -> (existed :Bool);
+
+  # List keys, optionally filtered by prefix. `nextCursor` is reserved for
+  # future pagination (always absent in v1).
+  kvKeys @81 (prefix :Text, hasPrefix :Bool) -> (keys :List(Text), nextCursor :Text, hasNextCursor :Bool);
+
+  # Subscribe to whole-store changes (callback fires per set/delete). The
+  # client filters by prefix; v1 streams the whole store.
+  kvWatch @82 (callback :KvEvents);
+}
+
+# Callback interface for receiving kernel KV change events.
+interface KvEvents {
+  # A key changed. `deleted = true` means the key was removed (`value` empty);
+  # otherwise `value` is the new value.
+  onChange @0 (key :Text, value :Text, deleted :Bool);
 }
 
 # A staged drift that exceeded its retry budget or whose target dropped
