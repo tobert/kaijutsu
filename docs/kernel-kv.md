@@ -274,13 +274,22 @@ This doc is one piece of the app-reset effort:
      - **client-id [DONE — `243ee14`]** — seed/read a UUID at
        `~/.local/share/kaijutsu/client-id`; corrupt → replaced, unwritable →
        ephemeral.
-     - **reconnect wiring [pending]** — on connect read
-       `<client-id>.current_context` and rejoin it (bootstrap step 3, the "no
-       context specified" branch in `connection/actor_plugin.rs`); on
-       join/switch write it back; optional `watch` for live cross-instance
-       sync. This is the behavioral change that closes
-       `tech_debt_peer_reattach_on_reconnect` — the fragile path that note
-       flags — so it wants verification in the running app, not a blind land.
+     - **reconnect wiring [DONE — needs live verification]** — `ClientId`
+       resource seeded from the client-id file; `persist_current_context`
+       observes `DocumentCache::active_id` and writes
+       `<client-id>.current_context` on every change (one chokepoint → captures
+       app UI, MCP-peer `switch_context`, and the restore itself); on connect
+       with no joined context, bootstrap reads the saved context and, if it
+       still exists, emits `RpcResultMessage::RestoreContext`, drained into a
+       `ContextSwitchRequested` that travels the normal join path. Best-effort:
+       a KV hiccup or deleted saved context degrades to prior behavior.
+       Addresses the context-restore half of
+       `tech_debt_peer_reattach_on_reconnect`. Compiles + 239 app tests pass;
+       the reconnect/restore *behavior* still wants verification in the running
+       app on the GPU box (can't be exercised by `cargo test`).
+     - **watch [deferred]** — `kvWatch` exists on the wire + a client-side
+       subscription is the next refinement for live cross-instance sync; the
+       reattach fix doesn't need it (read-on-connect suffices).
 
 ---
 
