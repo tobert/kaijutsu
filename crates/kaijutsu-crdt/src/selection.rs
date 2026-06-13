@@ -158,7 +158,8 @@ impl IntervalSet {
 }
 
 /// Why a selection refused. Carries machine-usable data; the CLI layer
-/// (slice 4) formats the human message, naming the offending preset/range.
+/// (`kj fork`'s `resolve_fork_selection`) formats the human message, naming the
+/// offending preset/range.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelectionError {
     /// One or more explicitly `--include`d positions did not survive into the

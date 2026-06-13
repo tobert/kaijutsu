@@ -1,16 +1,18 @@
 //! Fork subcommand: spawn a child context from the current one.
 //!
-//! Two strategies, by KV-cache intent (copy cost is a non-issue — storage is
-//! cheap):
-//! - **Full fork** (default) — take the whole context into a fresh lineage = a
-//!   NEW KV cache (resume-a-session-as-another-model, orchestrator repair,
-//!   drift-a-summary-back). `--exclude <block>…` drops a few named blocks (the
-//!   repair case); otherwise it's a plain deep copy.
-//! - **Thin fork** (`--shallow` / `--compact` / `--as`) — reuse/reduce: a leaner
-//!   child for a long-running iterating player. Routes through
-//!   `fork_document_filtered`. (See `docs/chameleon.md` "Players are rc
-//!   programs"; the open question of a thin fork's exact copy shape — last-N vs
-//!   prefix-preserving — is in `docs/issues.md`.)
+//! Fork strategy is KV-cache strategy (copy cost is a non-issue — storage is
+//! cheap). Every shape is an **interval selection** over the parent's ordered
+//! block log (`docs/fork-filters.md`): a preset supplies the `base`, `--include`
+//! / `--exclude` ranges refine it, and the result drives the copy.
+//! - **Full fork** (default, no narrowing) — the whole context into a fresh
+//!   lineage = a NEW KV cache (resume-as-another-model, orchestrator repair,
+//!   drift-a-summary-back). Preserves DTE history (the plain `fork_document`).
+//! - **Filtered fork** — any narrowing selection (`--preset window|spawn`, a
+//!   user patch, or ad-hoc `--include`/`--exclude` ranges; `--exclude <block>`
+//!   exact-key drops still ride here). Routes through `fork_document_filtered`.
+//!   Last-N is spelled `--include end-N:` (the retired `--shallow`/`--depth`).
+//! - **Compact fork** (`--compact`) — distill a summary seed (`fork_compact`).
+//! - **Subtree fork** (`--as`) — clone a template subtree (`fork_subtree`).
 
 use std::collections::HashMap;
 
@@ -43,9 +45,6 @@ pub(crate) struct ForkArgs {
     /// Distillation model for compact forks
     #[arg(long = "distill-model")]
     distill_model: Option<String>,
-    /// Shallow-fork depth (block count)
-    #[arg(long)]
-    depth: Option<usize>,
     /// Subtree template context ref; presence selects subtree mode
     #[arg(long = "as")]
     as_template: Option<String>,
@@ -55,9 +54,6 @@ pub(crate) struct ForkArgs {
     /// Move the session to the child after forking
     #[arg(long)]
     switch: bool,
-    /// Shallow fork (last N blocks)
-    #[arg(long)]
-    shallow: bool,
     /// Compact (distill) fork
     #[arg(long)]
     compact: bool,
@@ -188,16 +184,23 @@ impl KjDispatcher {
         preset_label: Option<&str>,
         cli_includes: &[String],
         cli_excludes: &[String],
+        before_timestamp: u64,
     ) -> Result<ForkSelection, String> {
         use kaijutsu_crdt::{IntervalSet, RangeError, SelectionError};
 
         // The fork-instant ordered snapshot — the universe positions address
-        // (order_key / BlockId order, the same `fork_filtered` rebuilds). We read
-        // length + the marker index here; the copy re-derives positions itself.
-        let snapshots = self
+        // (order_key / BlockId order, the same `fork_filtered` rebuilds). MUST be
+        // filtered by the SAME `before_timestamp` the copy uses: a block appended
+        // between this read and the copy would shift every tail position by one,
+        // so the resolved selection would index the wrong blocks. One timestamp,
+        // captured by the caller, threads through both.
+        let snapshots: Vec<_> = self
             .block_store()
             .block_snapshots(source_id)
-            .map_err(|e| format!("could not read source blocks: {e}"))?;
+            .map_err(|e| format!("could not read source blocks: {e}"))?
+            .into_iter()
+            .filter(|s| s.created_at <= before_timestamp)
+            .collect();
         let len = snapshots.len();
 
         // ── Recall the preset patch (a snapshot — later edits don't reach an
@@ -304,15 +307,46 @@ impl KjDispatcher {
         let excludes = preset_exc.union(&IntervalSet::from_ranges(cli_exc_ranges));
 
         // ── Compose: kept = (effective_base ∩ ∪cli_inc) \ ∪exc ──────────────
+        // The include invariant names the culprit: the preset's shape (when one
+        // was recalled) or an exclude. No silent winner.
         let kept = kaijutsu_crdt::resolve_keep_set(&effective_base, cli_inc_opt.as_ref(), &excludes)
             .map_err(|SelectionError::IncludeViolation { missing }| {
+                let culprit = match preset_label {
+                    Some(label) => format!("preset '{label}' or an exclude"),
+                    None => "an exclude".to_string(),
+                };
                 format!(
                     "--include conflicts with the selection: positions {} fall outside the kept \
-                     set (a preset's shape or an exclude removed them). Drop the preset, adjust \
-                     the range, or exclude explicitly.",
+                     set ({culprit} removed them). Drop the preset, adjust the range, or exclude \
+                     explicitly.",
                     fmt_runs(&missing)
                 )
             })?;
+
+        // Block-key excludes are a PREDICATE applied during the copy, not part of
+        // the positional `excludes` set — so `resolve_keep_set` can't see them eat
+        // an explicit include. Close that hole here: an exact `--exclude <key>`
+        // landing on a CLI-`--include`d position is the same loud contradiction
+        // (`--include 0:5 --exclude <block@2>` must refuse, no silent winner).
+        if let Some(inc) = &cli_inc_opt
+            && !exclude_block_ids.is_empty()
+        {
+            let clobbered: Vec<String> = snapshots
+                .iter()
+                .enumerate()
+                .filter(|(pos, snap)| {
+                    inc.contains_position(*pos) && exclude_block_ids.contains(&snap.id.to_key())
+                })
+                .map(|(pos, snap)| format!("{} (position {pos})", snap.id.to_key()))
+                .collect();
+            if !clobbered.is_empty() {
+                return Err(format!(
+                    "--include conflicts with --exclude: the block-key exclude(s) {} sit inside an \
+                     explicit --include range. Drop the --exclude or narrow the --include.",
+                    clobbered.join(", ")
+                ));
+            }
+        }
 
         // Plain full-copy fast path: base `full`, nothing narrowing → keep the
         // history-preserving `fork_document` copy + ForkKind::Full. Any preset
@@ -349,9 +383,6 @@ impl KjDispatcher {
             return denied;
         }
 
-        if args.shallow {
-            return self.fork_shallow(&args, caller).await;
-        }
         if args.compact {
             return self.fork_compact(&args, caller).await;
         }
@@ -391,6 +422,11 @@ impl KjDispatcher {
             Err(e) => return KjResult::Err(format!("kj fork: {e}")),
         };
 
+        // One fork-instant timestamp threads through selection resolution AND the
+        // copy, so both address the SAME block universe (no off-by-one from a
+        // concurrent append between the two reads).
+        let fork_ts = kaijutsu_types::now_millis();
+
         // Recall the preset patch + compose the CLI ranges into the fork-time
         // keep-set, BEFORE any mutations. A range/preset/key error (including the
         // loud include invariant, and a typo'd `--exclude` block key) fails here.
@@ -400,6 +436,7 @@ impl KjDispatcher {
                 preset_label.as_deref(),
                 &args.include,
                 &args.exclude,
+                fork_ts,
             )
             .await
         {
@@ -423,12 +460,8 @@ impl KjDispatcher {
                 exclude_block_ids: selection.exclude_block_ids.clone(),
                 ..Default::default()
             };
-            self.block_store().fork_document_filtered(
-                source_id,
-                new_id,
-                kaijutsu_types::now_millis(),
-                &filter,
-            )
+            self.block_store()
+                .fork_document_filtered(source_id, new_id, fork_ts, &filter)
         } else {
             self.block_store().fork_document(source_id, new_id)
         };
@@ -641,211 +674,6 @@ impl KjDispatcher {
         let short = new_id.short();
         let display = label.as_deref().unwrap_or(&short);
         let message = format!("forked to '{}' ({})", display, short);
-        self.fork_outcome(new_id, label.as_deref(), switch, message)
-    }
-
-    async fn fork_shallow(&self, args: &ForkArgs, caller: &KjCaller) -> KjResult {
-        let label = args.name.clone();
-        let prompt = args.prompt.clone();
-        let preset_label = args.preset.clone();
-        let pwd_override = args.pwd.clone();
-        let staging = args.stage;
-        let depth: usize = args.depth.unwrap_or(50);
-
-        let source_id = match caller.require_context() {
-            Ok(id) => id,
-            Err(e) => return e,
-        };
-        let new_id = ContextId::new();
-
-        // Validate --model BEFORE any mutations
-        let resolved = match self.resolve_fork_model(args.model.as_deref(), source_id).await {
-            Ok(r) => r,
-            Err(e) => return KjResult::Err(format!("kj fork --shallow: {e}")),
-        };
-
-        // Shallow fork with block filter — include all blocks up to now;
-        // max_blocks handles truncation to the most recent N.
-        let filter = kaijutsu_crdt::ForkBlockFilter {
-            max_blocks: Some(depth),
-            exclude_compacted: true,
-            ..Default::default()
-        };
-        let before_timestamp = kaijutsu_types::now_millis();
-        if let Err(e) =
-            self.block_store()
-                .fork_document_filtered(source_id, new_id, before_timestamp, &filter)
-        {
-            return KjResult::Err(format!("kj fork --shallow: {e}"));
-        }
-
-        // Write-through
-        {
-            let mut db = self.kernel_db().lock();
-
-            let source_ws = db
-                .get_context(source_id)
-                .ok()
-                .flatten()
-                .and_then(|r| r.workspace_id);
-
-            let row = ContextRow {
-                context_id: new_id,
-                                label: label.clone(),
-                provider: resolved.provider.clone(),
-                model: resolved.model.clone(),
-                system_prompt: None,
-                consent_mode: ConsentMode::Collaborative,
-                context_state: if staging { ContextState::Staging } else { ContextState::Live },
-                context_type: "default".to_string(),
-                created_at: kaijutsu_types::now_millis() as i64,
-                created_by: caller.principal_id,
-                forked_from: Some(source_id),
-                fork_kind: Some(ForkKind::Filtered),
-                archived_at: None,
-                workspace_id: source_ws,
-                preset_id: None,
-            };
-            let default_ws =
-                match db.get_or_create_default_workspace(caller.principal_id) {
-                    Ok(id) => id,
-                    Err(e) => return KjResult::Err(format!("kj fork --shallow: {e}")),
-                };
-            // Context row + shell/env/binding copy land in one transaction, so
-            // a failure can't strand a committed-but-misconfigured context.
-            if let Err(e) = db.insert_forked_context(&row, default_ws, source_id) {
-                return KjResult::Err(format!("kj fork --shallow: {e}"));
-            }
-
-            if let Some(ref pwd) = pwd_override {
-                let shell = ContextShellRow {
-                    context_id: new_id,
-                    cwd: Some(pwd.clone()),
-                    updated_at: kaijutsu_types::now_millis() as i64,
-                };
-                if let Err(e) = db.upsert_context_shell(&shell) {
-                    return KjResult::Err(format!("kj fork --shallow: failed to set --pwd: {e}"));
-                }
-            }
-
-            let edge = ContextEdgeRow {
-                edge_id: uuid::Uuid::now_v7(),
-                source_id,
-                target_id: new_id,
-                kind: EdgeKind::Structural,
-                metadata: None,
-                created_at: kaijutsu_types::now_millis() as i64,
-            };
-            if let Err(e) = db.insert_edge(&edge) {
-                return KjResult::Err(format!(
-                    "kj fork --shallow: failed to insert structural edge: {e}"
-                ));
-            }
-        }
-
-        {
-            let mut drift = self.drift_router().write();
-            if let Err(e) =
-                drift.register_fork(new_id, label.as_deref(), source_id, caller.principal_id)
-            {
-                return KjResult::Err(format!(
-                    "kj fork --shallow: parent context not in router: {e}"
-                ));
-            }
-            if staging
-                && let Err(e) = drift.set_state(new_id, ContextState::Staging)
-            {
-                return KjResult::Err(format!("kj fork --shallow: failed to set staging state: {e}"));
-            }
-            if resolved.explicit {
-                match (&resolved.provider, &resolved.model) {
-                    (Some(p), Some(m)) => {
-                        if let Err(e) = drift.configure_llm(new_id, p, m) {
-                            return KjResult::Err(format!(
-                                "kj fork --shallow: failed to configure model: {e}"
-                            ));
-                        }
-                    }
-                    _ => {
-                        return KjResult::Err(
-                            "kj fork --shallow: --model resolved without both provider and model"
-                                .to_string(),
-                        );
-                    }
-                }
-            }
-        }
-
-        if let Some(ref preset) = preset_label
-            && let Err(e) = self.apply_preset(new_id, preset).await
-        {
-            return KjResult::Err(format!(
-                "kj fork --shallow: failed to apply preset '{preset}': {e}"
-            ));
-        }
-
-        if let Some(note) = &prompt
-            && let Err(e) = self.inject_fork_note(new_id, source_id, note)
-        {
-            return KjResult::Err(format!(
-                "kj fork --shallow: failed to inject fork note: {e}"
-            ));
-        }
-
-        self.apply_fork_mcp_exclusions(new_id).await;
-
-        let source_label = {
-            let db = self.kernel_db().lock();
-            db.get_context(source_id)
-                .ok()
-                .flatten()
-                .and_then(|r| r.label)
-        };
-        let block_count = self
-            .block_store()
-            .block_snapshots(new_id)
-            .map(|b| b.len())
-            .unwrap_or(0);
-        if let Err(e) = self.inject_fork_marker(
-            new_id,
-            source_id,
-            ForkKind::Filtered,
-            block_count,
-            source_label.as_deref(),
-            staging,
-            None,
-        ) {
-            tracing::warn!("kj fork --shallow: failed to inject fork marker: {e}");
-        }
-
-        inherit_parent_context_type(self, new_id, source_id);
-        if let Err(e) = self
-            .run_rc_lifecycle(
-                "fork",
-                new_id,
-                Some(source_id),
-                Some(ForkKind::Filtered),
-                None,
-                caller,
-            )
-            .await
-        {
-            tracing::warn!("rc fork lifecycle (shallow): {e}");
-        }
-
-        // POSIX-style: drive the child's autonomous turn (if --prompt) after all
-        // fork-time block injections + rc lifecycle, then honor stay-on-parent
-        // default / --switch via fork_outcome.
-        let switch = args.switch;
-        self.request_child_turn(new_id, prompt.as_deref(), staging, caller);
-        let short = new_id.short();
-        let display = label.as_deref().unwrap_or(&short);
-        let message = format!(
-            "shallow-forked to '{}' ({}, depth {})",
-            display,
-            new_id.short(),
-            depth
-        );
         self.fork_outcome(new_id, label.as_deref(), switch, message)
     }
 
@@ -1918,6 +1746,57 @@ mod tests {
         );
     }
 
+    /// The include invariant covers block-key excludes too: an exact
+    /// `--exclude <key>` landing inside an explicit `--include` range must
+    /// refuse loud (no silent winner), even though block-key drops are a
+    /// predicate applied during the copy, not a positional subtraction.
+    #[tokio::test]
+    async fn fork_include_with_blockkey_exclude_inside_is_loud() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let (source, _pc) = source_with_five(&d, principal).await;
+        // The block at position 2 is inside --include 0:4; excluding it by key
+        // must contradict the include.
+        let key2 = d.block_store().block_snapshots(source).unwrap()[2].id.to_key();
+
+        let c = caller_with_context(source);
+        let result = d
+            .dispatch(
+                &[s("fork"), s("--include"), s("0:4"), s("--exclude"), s(&key2)],
+                &c,
+            )
+            .await;
+        assert!(!result.is_ok(), "block-key exclude inside an include must error");
+        assert!(
+            result.message().contains("conflicts") && result.message().contains("position 2"),
+            "should name the clobbered block/position: {}",
+            result.message()
+        );
+    }
+
+    /// A block-key exclude OUTSIDE the include range is fine (the repair case
+    /// still composes with a narrowing include).
+    #[tokio::test]
+    async fn fork_include_with_blockkey_exclude_outside_is_ok() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let (source, pc) = source_with_five(&d, principal).await;
+        let key4 = d.block_store().block_snapshots(source).unwrap()[4].id.to_key();
+
+        let c = caller_with_context(source);
+        let result = d
+            .dispatch(
+                &[s("fork"), s("--name"), s("ok"), s("--include"), s("0:3"), s("--exclude"), s(&key4)],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "exclude outside the include must compose: {}", result.message());
+        let kid = ordered_contents(&d, child_id(&d, "ok"));
+        for body in &pc[0..3] {
+            assert!(kid.iter().any(|c| c.contains(body.as_str())), "kept {body:?}: {kid:?}");
+        }
+    }
+
     /// `--preset window` reads the parent's hydration policy row; absent = a
     /// configuration mistake, loud per docs/fork-filters.md (not a degenerate
     /// full copy).
@@ -2644,83 +2523,6 @@ mod tests {
     // the caller, bare fork drives nothing. Mirrors the fork_full reference
     // tests above (fork_with_prompt_requests_turn / _without_ / _switch_).
     // ====================================================================
-
-    #[tokio::test]
-    async fn fork_shallow_with_prompt_requests_turn() {
-        let d = test_dispatcher().await;
-        let principal = PrincipalId::new();
-        let source = register_context(&d, Some("parent"), None, principal);
-        d.block_store()
-            .create_document(source, crate::DocumentKind::Conversation, None)
-            .unwrap();
-        let c = caller_with_context(source);
-        let mut sub = d.kernel().turn_flows().subscribe("turn.requested");
-
-        let result = d
-            .dispatch(
-                &[s("fork"), s("--shallow"), s("--prompt"), s("explore shallow")],
-                &c,
-            )
-            .await;
-        assert!(result.is_ok(), "fork failed: {}", result.message());
-
-        let msg = sub
-            .try_recv()
-            .expect("fork --shallow --prompt should publish a turn request");
-        match msg.payload {
-            crate::flows::TurnFlow::Requested {
-                context_id,
-                principal_id,
-                content,
-                ..
-            } => {
-                assert_ne!(context_id, source, "the turn targets the child, not parent");
-                assert_eq!(principal_id, c.principal_id);
-                assert_eq!(content, "explore shallow");
-            }
-            other => panic!("expected Requested, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn fork_shallow_without_prompt_requests_no_turn() {
-        let d = test_dispatcher().await;
-        let principal = PrincipalId::new();
-        let source = register_context(&d, Some("parent"), None, principal);
-        d.block_store()
-            .create_document(source, crate::DocumentKind::Conversation, None)
-            .unwrap();
-        let c = caller_with_context(source);
-        let mut sub = d.kernel().turn_flows().subscribe("turn.requested");
-
-        let result = d.dispatch(&[s("fork"), s("--shallow")], &c).await;
-        assert!(result.is_ok(), "fork failed: {}", result.message());
-        assert!(
-            sub.try_recv().is_none(),
-            "a bare shallow fork must not request a turn"
-        );
-    }
-
-    #[tokio::test]
-    async fn fork_shallow_switch_flag_moves_to_child() {
-        let d = test_dispatcher().await;
-        let principal = PrincipalId::new();
-        let source = register_context(&d, Some("parent"), None, principal);
-        d.block_store()
-            .create_document(source, crate::DocumentKind::Conversation, None)
-            .unwrap();
-        let c = caller_with_context(source);
-
-        let result = d
-            .dispatch(&[s("fork"), s("--shallow"), s("--switch")], &c)
-            .await;
-        match &result {
-            super::super::KjResult::Switch(id, _msg) => {
-                assert_ne!(*id, source, "--switch should move to a new child context");
-            }
-            other => panic!("expected Switch with --switch, got: {}", other.message()),
-        }
-    }
 
     /// Register a mock LLM provider (set as default), configure it on `source`,
     /// and seed `source` with a block so compact's distillation step (an LLM
