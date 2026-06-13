@@ -1324,6 +1324,34 @@ pub async fn create_shared_kernel(
         subscription_registry: Arc::new(parking_lot::Mutex::new(HashMap::new())),
     };
 
+    // Genesis bootstrap: a brand-new kernel (nothing recovered above) is unusable
+    // until something creates the first context. Rather than require a manual
+    // `kj context create` or a client-side dialog, seed one fully-privileged
+    // `coder` context here — the broad rc loadout (drive/fork/drift/transport/
+    // operator + the coder stance). Trigger is strictly *zero contexts at cold
+    // start*; once any context exists this never fires. Fail-loud: a kernel that
+    // can't seed its first context is broken, same stance as the recovery read above.
+    if all_contexts.is_empty() {
+        let genesis_id = ContextId::new();
+        log::info!(
+            "No contexts at cold start — seeding genesis coder context {}",
+            genesis_id.short()
+        );
+        create_context_inner(
+            &shared,
+            genesis_id,
+            "coder",
+            Some("genesis"),
+            PrincipalId::system(),
+            None,
+            SessionId::new(),
+        )
+        .await
+        .map_err(|e| {
+            capnp::Error::failed(format!("failed to seed genesis context: {e}"))
+        })?;
+    }
+
     Ok(Arc::new(shared))
 }
 
@@ -1410,6 +1438,174 @@ impl KernelImpl {
     ) -> Self {
         Self { kernel, connection }
     }
+}
+
+/// The shared context-creation recipe, called by both the `createContext` RPC
+/// and the cold-start genesis bootstrap (`create_shared_kernel`).
+///
+/// Does, in order: create the Conversation document + input doc, read LLM
+/// defaults, write the KernelDb row (rolling back the document on failure),
+/// register in the DriftRouter (rolling back the row + document on failure),
+/// run the `create` rc lifecycle for `context_type` (failure is logged, not
+/// fatal — it surfaces as Error blocks in the new context), and arm the beat
+/// for composer contexts. Hard failures (document / DB / drift) return `Err`;
+/// everything downstream is best-effort. Wire-result writing is the caller's
+/// job — this never touches capnp results.
+#[allow(clippy::too_many_arguments)]
+async fn create_context_inner(
+    state: &SharedKernelState,
+    context_id: ContextId,
+    context_type: &str,
+    label: Option<&str>,
+    created_by: PrincipalId,
+    parent_ctx: Option<ContextId>,
+    session_id: SessionId,
+) -> Result<(), capnp::Error> {
+    // Create the conversation document for this context.
+    if let Err(e) =
+        state
+            .documents
+            .create_document(context_id, kaijutsu_types::DocKind::Conversation, None)
+    {
+        return Err(capnp::Error::failed(format!(
+            "Failed to create document for context {}: {}",
+            context_id, e
+        )));
+    }
+
+    // Create the input document for this context (non-fatal).
+    if let Err(e) = state.documents.create_input_doc(context_id) {
+        log::warn!(
+            "Failed to create input doc for context {}: {}",
+            context_id,
+            e
+        );
+    }
+
+    // Read LLM defaults so new contexts start with a model set. If no provider
+    // is configured, leave both None so the user gets a clear error on use
+    // rather than a silently-injected hardcoded model.
+    let (default_provider, default_model) = {
+        let registry = state.kernel.llm().read().await;
+        let provider = registry.default_provider_name().map(|s| s.to_string());
+        let model = registry.default_model().map(|s| s.to_string());
+        if provider.is_none() && model.is_none() {
+            log::warn!("No LLM provider configured — new context will have no model set");
+        }
+        (provider, model)
+    };
+
+    // Write-through: KernelDb first, then DriftRouter. Both must succeed or we
+    // roll in-memory state back — never a ghost live-in-memory-but-missing-from-DB
+    // context (lost on restart), nor a DB row without a drift entry.
+    {
+        let db = state.kernel_db.lock();
+        let row = ContextRow {
+            context_id,
+            label: label.map(|s| s.to_string()),
+            provider: default_provider.clone(),
+            model: default_model.clone(),
+            system_prompt: None,
+            consent_mode: kaijutsu_kernel::control::ConsentMode::Collaborative,
+            context_state: kaijutsu_types::ContextState::Live,
+            context_type: context_type.to_string(),
+            created_at: kaijutsu_types::now_millis() as i64,
+            created_by,
+            forked_from: parent_ctx,
+            fork_kind: None,
+            archived_at: None,
+            workspace_id: None,
+            preset_id: None,
+        };
+        let default_ws = db
+            .get_or_create_default_workspace(row.created_by)
+            .unwrap_or_else(|_| kaijutsu_types::WorkspaceId::new());
+        if let Err(e) = db.insert_context_with_document(&row, default_ws) {
+            drop(db);
+            let _ = state.documents.delete_document(context_id);
+            return Err(capnp::Error::failed(format!(
+                "KernelDb insert_context failed for {}: {}",
+                context_id.short(),
+                e
+            )));
+        }
+    }
+
+    {
+        let mut drift = state.kernel.drift().write();
+        if let Err(e) = drift.register(context_id, label, parent_ctx, created_by) {
+            drop(drift);
+            let _ = state.kernel_db.lock().delete_context(context_id);
+            let _ = state.documents.delete_document(context_id);
+            return Err(capnp::Error::failed(format!("label conflict: {e}")));
+        }
+        if let (Some(p), Some(m)) = (&default_provider, &default_model) {
+            let _ = drift.configure_llm(context_id, p, m);
+        }
+        log::info!(
+            "Created context {} (label={:?}) in kernel DriftRouter",
+            context_id,
+            label
+        );
+    }
+
+    // Run rc create-lifecycle scripts for this context_type — the same hook
+    // `kj context create` fires. Failures surface as Error blocks in the new
+    // context; they don't abort creation.
+    let rc_caller = kaijutsu_kernel::KjCaller {
+        principal_id: created_by,
+        context_id: Some(context_id),
+        session_id,
+        confirmed: false,
+        rc_depth: 0,
+        // The privileged binding-write path is the rc kaish
+        // (materialize_context_kaish_rc), not this caller, so it stays unprivileged.
+        privileged: false,
+    };
+    if let Err(e) = state
+        .kj_dispatcher
+        .run_rc_lifecycle("create", context_id, parent_ctx, None, None, &rc_caller)
+        .await
+    {
+        log::warn!("rc create lifecycle for {}: {e}", context_id.short());
+    }
+
+    // Arm the beat for context types that own one (composer). A composer's
+    // playhead can't block, so the beat scheduler drives it; coders are never
+    // armed. Absent a scheduler (embedded/test) this is a no-op.
+    if context_type == "composer" {
+        let label = label.unwrap_or("");
+        // Derive the composer's lane from its label: strict constructor first,
+        // then lossy-but-loud slugify. An empty slug HARD-ERRORS creation rather
+        // than silently sharing a default lane (two composers would collide).
+        let track = match kaijutsu_types::TrackId::new(label)
+            .ok()
+            .or_else(|| kaijutsu_types::TrackId::slugify(label))
+        {
+            Some(t) => t,
+            None => {
+                return Err(capnp::Error::failed(format!(
+                    "composer label {label:?} does not yield a valid track id \
+                     (slug is empty) — refusing to create with a silent shared lane"
+                )));
+            }
+        };
+        let armed = state.kernel.send_beat_command(
+            kaijutsu_kernel::hyoushigi::BeatCommand::Arm {
+                context_id,
+                policy: kaijutsu_kernel::hyoushigi::BeatPolicy::composer_default(),
+                track,
+            },
+        );
+        if !armed {
+            log::warn!(
+                "composer {} created but no beat scheduler is wired — it will not beat",
+                context_id.short()
+            );
+        }
+    }
+
+    Ok(())
 }
 
 impl kernel::Server for KernelImpl {
@@ -2555,166 +2751,22 @@ impl kernel::Server for KernelImpl {
 
         Promise::from_future(async move {
             let context_id = ContextId::new();
-
-            // Create the document for this context
-            if let Err(e) = kernel.documents.create_document(
-                context_id,
-                kaijutsu_types::DocKind::Conversation,
-                None,
-            ) {
-                return Err(capnp::Error::failed(format!(
-                    "Failed to create document for context {}: {}",
-                    context_id, e
-                )));
-            }
-
-            // Create the input document for this context
-            if let Err(e) = kernel.documents.create_input_doc(context_id) {
-                log::warn!(
-                    "Failed to create input doc for context {}: {}",
-                    context_id,
-                    e
-                );
-            }
-
+            let created_by = connection.borrow().principal.id;
             let label_ref = if label.is_empty() {
                 None
             } else {
                 Some(label.as_str())
             };
-            let created_by = connection.borrow().principal.id;
-
-            // Read LLM defaults so new contexts start with a model set.
-            // If no provider is configured, don't silently inject a hardcoded model —
-            // let both be None so the user gets a clear error when they try to use LLM.
-            let (default_provider, default_model) = {
-                let registry = kernel.kernel.llm().read().await;
-                let provider = registry.default_provider_name().map(|s| s.to_string());
-                let model = registry.default_model().map(|s| s.to_string());
-                if provider.is_none() && model.is_none() {
-                    log::warn!("No LLM provider configured — new context will have no model set");
-                }
-                (provider, model)
-            };
-
-            // Write-through: KernelDb first, then DriftRouter. Both steps must
-            // succeed or we roll in-memory state back — we never want a ghost
-            // that is live in memory but missing from the DB (lost on restart)
-            // nor a DB row without a drift entry.
-            {
-                let db = kernel.kernel_db.lock();
-                let row = ContextRow {
-                    context_id,
-                                        label: label_ref.map(|s| s.to_string()),
-                    provider: default_provider.clone(),
-                    model: default_model.clone(),
-                    system_prompt: None,
-                    consent_mode: kaijutsu_kernel::control::ConsentMode::Collaborative,
-                    context_state: kaijutsu_types::ContextState::Live,
-                    context_type: context_type.clone(),
-                    created_at: kaijutsu_types::now_millis() as i64,
-                    created_by,
-                    forked_from: parent_ctx,
-                    fork_kind: None,
-                    archived_at: None,
-                    workspace_id: None,
-                    preset_id: None,
-                };
-                let default_ws = db
-                    .get_or_create_default_workspace(row.created_by)
-                    .unwrap_or_else(|_| kaijutsu_types::WorkspaceId::new());
-                if let Err(e) = db.insert_context_with_document(&row, default_ws) {
-                    drop(db);
-                    let _ = kernel.documents.delete_document(context_id);
-                    return Err(capnp::Error::failed(format!(
-                        "KernelDb insert_context failed for {}: {}",
-                        context_id.short(),
-                        e
-                    )));
-                }
-            }
-
-            {
-                let mut drift = kernel.kernel.drift().write();
-                if let Err(e) = drift.register(context_id, label_ref, parent_ctx, created_by) {
-                    drop(drift);
-                    let _ = kernel.kernel_db.lock().delete_context(context_id);
-                    let _ = kernel.documents.delete_document(context_id);
-                    return Err(capnp::Error::failed(format!("label conflict: {e}")));
-                }
-                if let (Some(p), Some(m)) = (&default_provider, &default_model) {
-                    let _ = drift.configure_llm(context_id, p, m);
-                }
-                log::info!(
-                    "Created context {} (label={:?}) in kernel DriftRouter",
-                    context_id,
-                    label_ref
-                );
-            }
-
-            // Run rc create-lifecycle scripts for this context_type — the same
-            // hook `kj context create` fires. Without this, app- and MCP-born
-            // contexts (which take this RPC path, not the kj dispatcher) would
-            // silently skip their stance / cache / policy seeding. Failures
-            // surface as Error blocks in the new context; they don't abort
-            // creation.
-            let rc_caller = kaijutsu_kernel::KjCaller {
-                principal_id: created_by,
-                context_id: Some(context_id),
+            create_context_inner(
+                &kernel,
+                context_id,
+                &context_type,
+                label_ref,
+                created_by,
+                parent_ctx,
                 session_id,
-                confirmed: false,
-                rc_depth: 0,
-                // Bookkeeping caller for run_rc_lifecycle; the privileged
-                // binding-write path is the rc kaish (materialize_context_kaish_rc),
-                // not this caller, so it stays unprivileged.
-                privileged: false,
-            };
-            if let Err(e) = kernel
-                .kj_dispatcher
-                .run_rc_lifecycle("create", context_id, parent_ctx, None, None, &rc_caller)
-                .await
-            {
-                log::warn!("rc create lifecycle for {}: {e}", context_id.short());
-            }
-
-            // Arm the beat for context types that own one. A composer's playhead
-            // can't block, so the beat scheduler drives it; coders are never
-            // armed (they have no heap entry and cost nothing). The scheduler
-            // creates the timeline on arm; absent a scheduler (embedded/test)
-            // this is a no-op.
-            if context_type == "composer" {
-                // Derive the composer's lane from its label (design §5.4): try the
-                // strict constructor first, then the lossy-but-loud slugify. An
-                // empty slug HARD-ERRORS context creation — crash over a silent
-                // shared default lane that would let two composers collide on one
-                // track (the approved decision; loud, never a silent-ish "main").
-                let track = match kaijutsu_types::TrackId::new(label.as_str())
-                    .ok()
-                    .or_else(|| kaijutsu_types::TrackId::slugify(label.as_str()))
-                {
-                    Some(t) => t,
-                    None => {
-                        return Err(capnp::Error::failed(format!(
-                            "composer label {label:?} does not yield a valid track id \
-                             (slug is empty) — refusing to create with a silent shared lane"
-                        )));
-                    }
-                };
-                let armed = kernel.kernel.send_beat_command(
-                    kaijutsu_kernel::hyoushigi::BeatCommand::Arm {
-                        context_id,
-                        policy: kaijutsu_kernel::hyoushigi::BeatPolicy::composer_default(),
-                        track,
-                    },
-                );
-                if !armed {
-                    log::warn!(
-                        "composer {} created but no beat scheduler is wired — it will not beat",
-                        context_id.short()
-                    );
-                }
-            }
-
+            )
+            .await?;
             results.get().set_id(context_id.as_bytes());
             Ok(())
         })
