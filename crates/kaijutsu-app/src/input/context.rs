@@ -1,7 +1,6 @@
 //! Input context — derived from FocusArea and Screen to determine which bindings are active.
 //!
 //! Each `FocusArea` maps to a set of active `InputContext` values.
-//! `Screen::Constellation` activates the `Constellation` input context.
 //! The dispatcher checks bindings against active contexts to determine matches.
 
 use bevy::prelude::*;
@@ -21,8 +20,6 @@ pub enum InputContext {
     TextInput,
     /// Active when Conversation block list has focus: j/k, f, Tab
     Navigation,
-    /// Active when Constellation screen is active: hjkl spatial, zoom, fork
-    Constellation,
     /// Active when a modal dialog is open: Enter/Escape/j/k
     Dialog,
 }
@@ -59,13 +56,6 @@ pub fn sync_input_context(
 
     // Global is always active
     active.0.push(InputContext::Global);
-
-    // Screen-level context: Constellation input bindings are active on the
-    // Constellation screen (unless a FocusStack dialog overrides)
-    if matches!(screen.get(), Screen::Constellation) && !matches!(*focus, FocusArea::Dialog) {
-        active.0.push(InputContext::Constellation);
-        return;
-    }
 
     // Within-conversation focus areas
     match focus.as_ref() {

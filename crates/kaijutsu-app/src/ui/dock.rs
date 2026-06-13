@@ -48,7 +48,6 @@ impl DockSparkline {
     }
 }
 use crate::text::{ShapingFonts, bevy_color_to_brush};
-use crate::ui::constellation::{ActivityState, Constellation};
 use crate::ui::drift::DriftState;
 use crate::ui::theme::Theme;
 
@@ -691,8 +690,6 @@ pub fn update_mode(
     let vim_mode = overlay_q.iter().next().and_then(|o| o.vim_mode.clone());
 
     let (color, label) = match screen.get() {
-        Screen::Constellation => (theme.mode_visual, &theme.mode_label_constellation),
-        Screen::ConversationStack => (theme.mode_visual, &theme.mode_label_stack),
         Screen::Conversation => match focus_area.as_ref() {
             FocusArea::Compose | FocusArea::Dialog => {
                 vim_mode_to_dock(&vim_mode, &theme)
@@ -934,18 +931,12 @@ pub fn update_hints(
 
     use crate::ui::screen::Screen;
     let hints = match screen.get() {
-        Screen::Constellation => {
-            "Enter: switch \u{2502} m: model \u{2502} n: new \u{2502} Tab: compose \u{2502} Esc: back"
-        }
-        Screen::ConversationStack => {
-            "j/k: navigate \u{2502} Esc: back \u{2502} v: list view \u{2502} `: constellation"
-        }
         Screen::Conversation => match focus_area.as_ref() {
             FocusArea::Compose => {
                 "Enter: submit \u{2502} Shift+Enter: newline \u{2502} Ctrl+Z: shell \u{2502} Esc Esc: dismiss"
             }
             FocusArea::Conversation => {
-                "i: chat \u{2502} Ctrl+Z: shell \u{2502} j/k: navigate \u{2502} f: expand \u{2502} `: constellation \u{2502} Alt+hjkl: pane"
+                "i: chat \u{2502} Ctrl+Z: shell \u{2502} j/k: navigate \u{2502} Alt+hjkl: pane"
             }
             FocusArea::Dialog => "Enter: confirm \u{2502} Esc: cancel \u{2502} j/k: navigate",
         },
@@ -1052,44 +1043,6 @@ fn shorten_model_name(model: &str) -> String {
     m.to_string()
 }
 
-/// Update agent activity — summarizes non-idle activity across constellation nodes.
-pub fn update_agent_activity(
-    constellation: Res<Constellation>,
-    theme: Res<Theme>,
-    mut dock: ResMut<DockState>,
-) {
-    if !constellation.is_changed() {
-        return;
-    }
-
-    let mut streaming = 0u32;
-    let mut waiting = 0u32;
-    let mut active = 0u32;
-
-    for node in &constellation.nodes {
-        match node.activity {
-            ActivityState::Streaming => streaming += 1,
-            ActivityState::Waiting => waiting += 1,
-            ActivityState::Active => active += 1,
-            _ => {}
-        }
-    }
-
-    let total_active = streaming + waiting + active;
-    let (text, color) = if streaming == 1 && total_active == 1 {
-        ("streaming".to_string(), theme.accent)
-    } else if total_active > 0 {
-        (format!("{} active", total_active), theme.accent)
-    } else {
-        (String::new(), theme.fg_dim)
-    };
-
-    if dock.agent_activity.text != text {
-        dock.agent_activity.text = text;
-        dock.agent_activity.color = color;
-    }
-}
-
 /// Tracks running block counts for the BlockActivity widget.
 #[derive(Default)]
 pub(crate) struct BlockActivityCounts {
@@ -1175,7 +1128,6 @@ impl Plugin for DockPlugin {
                     update_hints,
                     update_event_pulse,
                     update_model_badge,
-                    update_agent_activity,
                     update_block_activity,
                     handle_dock_click,
                 ),

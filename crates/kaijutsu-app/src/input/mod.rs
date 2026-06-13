@@ -151,7 +151,7 @@ impl Plugin for InputPlugin {
 
         // Dispatch phase: raw input → ActionFired/TextInputReceived
         // vim_dispatch_compose runs when compose is focused (VimMachine owns keyboard).
-        // dispatch_input handles everything else (Navigation, Constellation, gamepad, mouse).
+        // dispatch_input handles everything else (Navigation, gamepad, mouse).
         app.add_systems(
             Update,
             (
@@ -171,10 +171,6 @@ impl Plugin for InputPlugin {
                 systems::handle_toggle_surface,
                 systems::handle_unfocus,
                 systems::handle_interrupt,
-                systems::handle_toggle_constellation,
-                systems::handle_toggle_stack_view,
-                systems::handle_stack_navigation
-                    .run_if(in_state(crate::ui::screen::Screen::ConversationStack)),
                 // App-level actions (global)
                 systems::handle_quit,
                 systems::handle_debug_toggle,
@@ -183,12 +179,8 @@ impl Plugin for InputPlugin {
                 systems::handle_tiling,
                 // Navigation context
                 systems::handle_navigate_blocks.run_if(focus::in_conversation),
-                systems::handle_expand_block.run_if(focus::in_conversation),
                 systems::handle_collapse_toggle.run_if(focus::in_conversation),
                 systems::handle_toggle_block_excluded.run_if(focus::in_conversation),
-                // Constellation context (gated by Screen state, not FocusArea)
-                systems::handle_constellation_nav
-                    .run_if(in_state(crate::ui::screen::Screen::Constellation)),
                 // Scrolling (multi-context)
                 systems::handle_scroll.run_if(focus::scroll_context_active),
                 // Text input context

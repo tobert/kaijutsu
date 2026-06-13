@@ -149,14 +149,10 @@ fn main() {
         .add_plugins(connection::ActorPlugin { ssh_config })
         // App screen state management
         .add_plugins(ui::state::AppScreenPlugin)
-        // Screen state machine (Constellation/Conversation/ForkForm transitions)
+        // Screen state machine (single Conversation screen)
         .add_plugins(ui::screen::ScreenPlugin)
         // Commands (vim-style : commands)
         .add_plugins(commands::CommandsPlugin)
-        // Constellation - context navigation as visual node graph
-        .add_plugins(ui::constellation::ConstellationPlugin)
-        // Conversation Stack — 3D cascading card view
-        .add_plugins(ui::card_stack::CardStackPlugin)
         // Tiling WM — layout tree, reconciler, and widget update systems
         .add_plugins(ui::tiling::TilingPlugin)
         .add_plugins(ui::tiling_reconciler::TilingReconcilerPlugin)
@@ -291,8 +287,8 @@ fn setup_ui(mut commands: Commands) {
                 ZIndex(constants::ZLayer::CONTENT),
             ))
             .with_children(|content| {
-                // CONVERSATION VIEW (hidden initially — Constellation is default)
-                // The tiling reconciler spawns ConversationContainer inside
+                // CONVERSATION VIEW (visible immediately — the only screen).
+                // The tiling reconciler spawns ConversationContainer inside.
                 content.spawn((
                     ui::state::ConversationRoot,
                     Node {
@@ -301,7 +297,7 @@ fn setup_ui(mut commands: Commands) {
                         flex_direction: FlexDirection::Column,
                         ..default()
                     },
-                    Visibility::Hidden,
+                    Visibility::Inherited,
                 ));
             });
         });

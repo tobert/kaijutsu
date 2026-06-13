@@ -296,7 +296,6 @@ fn context_to_str(ctx: InputContext) -> String {
         InputContext::Global => "Global",
         InputContext::Navigation => "Navigation",
         InputContext::TextInput => "TextInput",
-        InputContext::Constellation => "Constellation",
         InputContext::Dialog => "Dialog",
     }
     .to_string()
@@ -307,7 +306,6 @@ fn parse_context(s: &str) -> Result<InputContext, String> {
         "Global" => Ok(InputContext::Global),
         "Navigation" => Ok(InputContext::Navigation),
         "TextInput" => Ok(InputContext::TextInput),
-        "Constellation" => Ok(InputContext::Constellation),
         "Dialog" => Ok(InputContext::Dialog),
         _ => Err(format!("unknown context '{s}'")),
     }
@@ -330,8 +328,6 @@ fn action_to_str(a: &Action) -> String {
         Action::FocusPrevBlock => "FocusPrevBlock".into(),
         Action::FocusFirstBlock => "FocusFirstBlock".into(),
         Action::FocusLastBlock => "FocusLastBlock".into(),
-        Action::ExpandBlock => "ExpandBlock".into(),
-        Action::ToggleStackView => "ToggleStackView".into(),
         Action::CollapseToggle => "CollapseToggle".into(),
         Action::ScrollDelta(d) => format!("ScrollDelta:{d}"),
         Action::HalfPageUp => "HalfPageUp".into(),
@@ -348,16 +344,6 @@ fn action_to_str(a: &Action) -> String {
         Action::GrowPane => "GrowPane".into(),
         Action::ShrinkPane => "ShrinkPane".into(),
         Action::TogglePreviousPaneFocus => "TogglePreviousPaneFocus".into(),
-        Action::ToggleConstellation => "ToggleConstellation".into(),
-        Action::SpatialNav(v) => format!("SpatialNav:{},{}", v.x, v.y),
-        Action::Pan(v) => format!("Pan:{},{}", v.x, v.y),
-        Action::ZoomIn => "ZoomIn".into(),
-        Action::ZoomOut => "ZoomOut".into(),
-        Action::ZoomReset => "ZoomReset".into(),
-        Action::ConstellationCreate => "ConstellationCreate".into(),
-        Action::ConstellationModelPicker => "ConstellationModelPicker".into(),
-        Action::ConstellationArchive => "ConstellationArchive".into(),
-        Action::ToggleAlternate => "ToggleAlternate".into(),
         Action::Submit => "Submit".into(),
         Action::Backspace => "Backspace".into(),
         Action::Delete => "Delete".into(),
@@ -403,8 +389,6 @@ fn parse_action(s: &str) -> Result<Action, String> {
         "FocusPrevBlock" => Ok(Action::FocusPrevBlock),
         "FocusFirstBlock" => Ok(Action::FocusFirstBlock),
         "FocusLastBlock" => Ok(Action::FocusLastBlock),
-        "ExpandBlock" => Ok(Action::ExpandBlock),
-        "ToggleStackView" => Ok(Action::ToggleStackView),
         "CollapseToggle" => Ok(Action::CollapseToggle),
         "HalfPageUp" => Ok(Action::HalfPageUp),
         "HalfPageDown" => Ok(Action::HalfPageDown),
@@ -420,14 +404,6 @@ fn parse_action(s: &str) -> Result<Action, String> {
         "GrowPane" => Ok(Action::GrowPane),
         "ShrinkPane" => Ok(Action::ShrinkPane),
         "TogglePreviousPaneFocus" => Ok(Action::TogglePreviousPaneFocus),
-        "ToggleConstellation" => Ok(Action::ToggleConstellation),
-        "ZoomIn" => Ok(Action::ZoomIn),
-        "ZoomOut" => Ok(Action::ZoomOut),
-        "ZoomReset" => Ok(Action::ZoomReset),
-        "ConstellationCreate" => Ok(Action::ConstellationCreate),
-        "ConstellationModelPicker" => Ok(Action::ConstellationModelPicker),
-        "ConstellationArchive" => Ok(Action::ConstellationArchive),
-        "ToggleAlternate" => Ok(Action::ToggleAlternate),
         "Submit" => Ok(Action::Submit),
         "Backspace" => Ok(Action::Backspace),
         "Delete" => Ok(Action::Delete),
@@ -453,8 +429,6 @@ fn parse_action(s: &str) -> Result<Action, String> {
         // sensible zero/false value so tersely-typed user TOML keeps working.
         "InterruptContext" => Ok(Action::InterruptContext { immediate: false }),
         "ScrollDelta" => Ok(Action::ScrollDelta(0.0)),
-        "SpatialNav" => Ok(Action::SpatialNav(Vec2::ZERO)),
-        "Pan" => Ok(Action::Pan(Vec2::ZERO)),
         _ => Err(format!("unknown action '{s}'")),
     }
 }
@@ -467,8 +441,6 @@ fn parse_action_with_payload(name: &str, payload: &str) -> Result<Action, String
                 .map_err(|e| format!("ScrollDelta payload '{payload}' must be a float: {e}"))?;
             Ok(Action::ScrollDelta(delta))
         }
-        "SpatialNav" => Ok(Action::SpatialNav(parse_vec2(name, payload)?)),
-        "Pan" => Ok(Action::Pan(parse_vec2(name, payload)?)),
         "InterruptContext" => {
             let immediate: bool = payload
                 .parse()
@@ -479,19 +451,6 @@ fn parse_action_with_payload(name: &str, payload: &str) -> Result<Action, String
             "action '{name}' does not take a payload (got ':{payload}')"
         )),
     }
-}
-
-fn parse_vec2(name: &str, payload: &str) -> Result<Vec2, String> {
-    let (x_str, y_str) = payload
-        .split_once(',')
-        .ok_or_else(|| format!("{name} payload '{payload}' must be 'x,y'"))?;
-    let x: f32 = x_str
-        .parse()
-        .map_err(|e| format!("{name} x component '{x_str}' must be a float: {e}"))?;
-    let y: f32 = y_str
-        .parse()
-        .map_err(|e| format!("{name} y component '{y_str}' must be a float: {e}"))?;
-    Ok(Vec2::new(x, y))
 }
 
 fn parse_key_code(s: &str) -> Result<KeyCode, String> {
@@ -612,8 +571,6 @@ mod tests {
         "FocusPrevBlock",
         "FocusFirstBlock",
         "FocusLastBlock",
-        "ExpandBlock",
-        "ToggleStackView",
         "CollapseToggle",
         "HalfPageUp",
         "HalfPageDown",
@@ -629,14 +586,6 @@ mod tests {
         "GrowPane",
         "ShrinkPane",
         "TogglePreviousPaneFocus",
-        "ToggleConstellation",
-        "ZoomIn",
-        "ZoomOut",
-        "ZoomReset",
-        "ConstellationCreate",
-        "ConstellationModelPicker",
-        "ConstellationArchive",
-        "ToggleAlternate",
         "Submit",
         "Backspace",
         "Delete",
@@ -752,13 +701,7 @@ mod tests {
         "RightThumb",
     ];
 
-    const ALL_CONTEXTS: &[&str] = &[
-        "Global",
-        "Navigation",
-        "TextInput",
-        "Constellation",
-        "Dialog",
-    ];
+    const ALL_CONTEXTS: &[&str] = &["Global", "Navigation", "TextInput", "Dialog"];
 
     #[test]
     fn test_parse_action_all_variants() {

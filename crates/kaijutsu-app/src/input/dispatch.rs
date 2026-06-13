@@ -54,7 +54,7 @@ pub fn dispatch_input(
     // --- Keyboard ---
     // When TextInput context is active, keyboard events are handled by
     // vim_dispatch_compose (the VimMachine). We still process keyboard
-    // events here for non-TextInput contexts (Navigation, Constellation, etc.).
+    // events here for non-TextInput contexts (Navigation, etc.).
     let vim_owns_keyboard = active_contexts.contains(InputContext::TextInput);
 
     for event in keyboard.read() {
@@ -114,12 +114,6 @@ pub fn dispatch_input(
         if active_contexts.contains(InputContext::Navigation) && left.y.abs() > THRESHOLD {
             let scroll_speed = -left.y * 500.0 * dt;
             action_writer.write(ActionFired(Action::ScrollDelta(scroll_speed)));
-        }
-
-        // Left stick → pan (Constellation context)
-        // Scale pan direction by dt so constellation camera moves consistently.
-        if active_contexts.contains(InputContext::Constellation) && left.length() > THRESHOLD {
-            action_writer.write(ActionFired(Action::Pan(left * dt * 60.0)));
         }
     } else {
         // No gamepad connected — zero out
@@ -184,7 +178,6 @@ fn context_priority(ctx: InputContext) -> usize {
         InputContext::Global => 0,
         InputContext::Navigation => 1,
         InputContext::TextInput => 1,
-        InputContext::Constellation => 1,
         InputContext::Dialog => 2, // Dialog beats everything
     }
 }

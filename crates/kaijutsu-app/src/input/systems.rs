@@ -16,8 +16,6 @@ use super::focus::FocusArea;
 /// Handle CycleFocusForward and CycleFocusBackward actions.
 ///
 /// Within-conversation Tab cycle: Compose → Conversation → Compose.
-/// Screen-level toggling (Constellation ↔ Conversation) is handled by
-/// `handle_toggle_constellation` via `NextState<Screen>`.
 pub fn handle_focus_cycle(mut actions: MessageReader<ActionFired>, mut focus: ResMut<FocusArea>) {
     for ActionFired(action) in actions.read() {
         match action {
@@ -161,17 +159,13 @@ pub fn handle_toggle_surface(
 ///
 /// Escape precedence:
 /// 1. FocusArea::Dialog → ignored (handled by dialog systems via FocusStack)
-/// 2. Screen::Constellation → go to Conversation
-/// 3. FocusArea::Compose → FocusArea::Conversation
+/// 2. FocusArea::Compose → FocusArea::Conversation
 pub fn handle_unfocus(
     mut actions: MessageReader<ActionFired>,
     mut focus: ResMut<FocusArea>,
     mut surface: ResMut<super::focus::ActiveSurface>,
-    screen: Res<State<crate::ui::screen::Screen>>,
-    mut next_screen: ResMut<NextState<crate::ui::screen::Screen>>,
     mut vim: ResMut<crate::input::vim::VimMachineResource>,
 ) {
-    use crate::ui::screen::Screen;
     for ActionFired(action) in actions.read() {
         if !matches!(action, Action::Unfocus) {
             continue;
@@ -182,13 +176,7 @@ pub fn handle_unfocus(
             continue;
         }
 
-        // 2. Screen-level: Escape on Constellation → go to Conversation
-        if matches!(screen.get(), Screen::Constellation) {
-            next_screen.set(Screen::Conversation);
-            continue;
-        }
-
-        // 3. Normal focus transitions
+        // 2. Normal focus transitions
         if matches!(focus.as_ref(), FocusArea::Compose) {
             // Reset vim to Normal mode when leaving compose
             use modalkit::keybindings::BindingMachine;
@@ -348,29 +336,6 @@ pub fn handle_screenshot(mut commands: Commands, mut actions: MessageReader<Acti
     }
 }
 
-/// Handle ToggleConstellation action — toggles between Screen::Constellation and
-/// Screen::Conversation via the state machine. OnEnter/OnExit systems handle
-/// visibility, camera activation, and focus.
-pub fn handle_toggle_constellation(
-    mut actions: MessageReader<ActionFired>,
-    screen: Res<State<crate::ui::screen::Screen>>,
-    mut next_screen: ResMut<NextState<crate::ui::screen::Screen>>,
-) {
-    use crate::ui::screen::Screen;
-    for ActionFired(action) in actions.read() {
-        if !matches!(action, Action::ToggleConstellation) {
-            continue;
-        }
-
-        match screen.get() {
-            Screen::Constellation => next_screen.set(Screen::Conversation),
-            Screen::Conversation | Screen::ConversationStack => {
-                next_screen.set(Screen::Constellation);
-            }
-        }
-    }
-}
-
 // ============================================================================
 // BLOCK NAVIGATION
 // ============================================================================
@@ -508,7 +473,7 @@ fn scroll_to_block_visible(scroll_state: &mut ConversationScrollState, layout: &
 /// Handle scroll actions (ScrollDelta, HalfPageUp/Down, ScrollToEnd/Top).
 ///
 /// Only active in Conversation or Compose focus (scrolling the conversation).
-/// Prevents gamepad scroll leaking into dialogs or constellation.
+/// Prevents gamepad scroll leaking into dialogs.
 pub fn handle_scroll(
     mut actions: MessageReader<ActionFired>,
     mut scroll_state: ResMut<ConversationScrollState>,
@@ -540,82 +505,8 @@ pub fn handle_scroll(
 }
 
 // ============================================================================
-// EXPAND / COLLAPSE / VIEW POP
+// COLLAPSE
 // ============================================================================
-
-/// Handle ExpandBlock action (placeholder — ExpandedBlockView was removed).
-pub fn handle_expand_block(mut actions: MessageReader<ActionFired>) {
-    for ActionFired(action) in actions.read() {
-        if matches!(action, Action::ExpandBlock) {
-            info!("ExpandBlock action received (view removed)");
-        }
-    }
-}
-
-/// Handle ToggleStackView action — switch between Conversation and ConversationStack.
-pub fn handle_toggle_stack_view(
-    mut actions: MessageReader<ActionFired>,
-    screen: Res<State<crate::ui::screen::Screen>>,
-    mut next_screen: ResMut<NextState<crate::ui::screen::Screen>>,
-) {
-    use crate::ui::screen::Screen;
-    for ActionFired(action) in actions.read() {
-        if !matches!(action, Action::ToggleStackView) {
-            continue;
-        }
-        match screen.get() {
-            Screen::Conversation => next_screen.set(Screen::ConversationStack),
-            Screen::ConversationStack => next_screen.set(Screen::Conversation),
-            _ => {} // ignore from constellation
-        }
-    }
-}
-
-/// Handle navigation within the card stack view.
-///
-/// Browse mode: j/k navigate, Enter enters reading mode.
-/// Reading mode: j/k blocked (future: modalkit), Escape exits to browse.
-/// Browse + Escape: exits stack view entirely → Conversation screen.
-pub fn handle_stack_navigation(
-    mut actions: MessageReader<ActionFired>,
-    mut stack_state: ResMut<crate::ui::card_stack::CardStackState>,
-    mut view_mode: ResMut<crate::ui::card_stack::StackViewMode>,
-    mut next_screen: ResMut<NextState<crate::ui::screen::Screen>>,
-    mut reading_tx: ResMut<crate::ui::card_stack::ReadingTransition>,
-    params: Res<crate::ui::card_stack::CardStackLayout>,
-) {
-    use crate::ui::card_stack::StackViewMode;
-
-    for ActionFired(action) in actions.read() {
-        let is_browse = matches!(*view_mode, StackViewMode::Browse);
-
-        match action {
-            Action::FocusNextBlock if is_browse => stack_state.focus_next(),
-            Action::FocusPrevBlock if is_browse => stack_state.focus_prev(),
-            Action::FocusFirstBlock if is_browse => stack_state.focus_first(),
-            Action::FocusLastBlock if is_browse => stack_state.focus_last(),
-            // Scroll in reading mode
-            Action::FocusNextBlock => reading_tx.scroll_offset += params.reading_scroll_step,
-            Action::FocusPrevBlock => reading_tx.scroll_offset -= params.reading_scroll_step,
-            Action::Activate => {
-                if is_browse && stack_state.card_count > 0 {
-                    *view_mode = StackViewMode::Reading {
-                        source_index: stack_state.focused_index,
-                    };
-                }
-            }
-            Action::Unfocus => match *view_mode {
-                StackViewMode::Reading { .. } => {
-                    *view_mode = StackViewMode::Browse;
-                }
-                StackViewMode::Browse => {
-                    next_screen.set(crate::ui::screen::Screen::Conversation);
-                }
-            },
-            _ => {}
-        }
-    }
-}
 
 /// Handle CollapseToggle action (toggle thinking block collapse).
 ///
@@ -783,111 +674,6 @@ pub fn handle_tiling(mut actions: MessageReader<ActionFired>, mut tree: ResMut<T
             Action::TogglePreviousPaneFocus => {
                 tree.toggle_focus();
                 info!("Tiling: toggle focus → {}", tree.focused);
-            }
-            _ => {}
-        }
-    }
-}
-
-// ============================================================================
-// CONSTELLATION NAVIGATION
-// ============================================================================
-
-use crate::ui::constellation::{
-    Constellation, ConstellationCamera, NewContextConfig, create_or_fork_context,
-    find_nearest_in_direction, model_picker::OpenModelPicker,
-};
-
-/// Handle constellation navigation actions (spatial nav, pan, zoom, fork, model picker).
-///
-/// Guarded by `in_state(Screen::Constellation)` — prevents Activate/Pan/etc from
-/// leaking when a Dialog overlays the (still-visible) constellation.
-pub fn handle_constellation_nav(
-    mut actions: MessageReader<ActionFired>,
-    mut next_screen: ResMut<NextState<crate::ui::screen::Screen>>,
-    mut constellation: ResMut<Constellation>,
-    mut camera: ResMut<ConstellationCamera>,
-    mut switch_writer: MessageWriter<crate::cell::ContextSwitchRequested>,
-    mut model_writer: MessageWriter<OpenModelPicker>,
-    conn_state: Res<crate::connection::RpcConnectionState>,
-    new_ctx_config: Res<NewContextConfig>,
-    actor: Option<Res<crate::connection::RpcActor>>,
-    result_channel: Res<crate::connection::RpcResultChannel>,
-) {
-    for ActionFired(action) in actions.read() {
-        match action {
-            Action::SpatialNav(direction) => {
-                if let Some(target_id) = find_nearest_in_direction(&constellation, *direction) {
-                    constellation.focus(target_id);
-                }
-            }
-            Action::Pan(direction) => {
-                let pan_speed = 50.0;
-                camera.target_offset += *direction * pan_speed;
-            }
-            Action::ZoomIn => {
-                camera.target_zoom = (camera.target_zoom * 1.25).min(4.0);
-            }
-            Action::ZoomOut => {
-                camera.target_zoom = (camera.target_zoom / 1.25).max(0.25);
-            }
-            Action::ZoomReset => {
-                camera.reset();
-            }
-            Action::Activate => {
-                // Enter → switch context and go to conversation
-                if let Some(focus_id) = constellation.focus_id {
-                    info!("Constellation: switching to {}", focus_id);
-                    switch_writer.write(crate::cell::ContextSwitchRequested {
-                        context_id: focus_id,
-                    });
-                    next_screen.set(crate::ui::screen::Screen::Conversation);
-                }
-            }
-            Action::ToggleAlternate => {
-                if let Some(alt_id) = constellation.alternate_id {
-                    constellation.focus(alt_id);
-                    switch_writer.write(crate::cell::ContextSwitchRequested { context_id: alt_id });
-                    next_screen.set(crate::ui::screen::Screen::Conversation);
-                }
-            }
-            Action::ConstellationCreate => {
-                if let Some(ref actor) = actor {
-                    info!("Constellation: creating new context");
-                    create_or_fork_context(&new_ctx_config, actor, &result_channel, &conn_state);
-                } else {
-                    info!("Constellation: no actor available for context creation");
-                }
-            }
-            Action::ConstellationModelPicker => {
-                if let Some(focus_id) = constellation.focus_id {
-                    model_writer.write(OpenModelPicker {
-                        context_name: focus_id.to_string(),
-                    });
-                }
-            }
-            Action::ConstellationArchive => {
-                if let Some(focus_id) = constellation.focus_id
-                    && let Some(ref actor) = actor
-                {
-                    let handle = actor.handle.clone();
-                    let short_id = focus_id.short();
-                    // Execute from root context, not the context being archived
-                    let exec_ctx = constellation.root_of(focus_id).unwrap_or(focus_id);
-                    let cmd = format!("kj context archive {}", short_id);
-                    info!(
-                        "Constellation: archiving {} via shell (exec from {})",
-                        short_id,
-                        exec_ctx.short()
-                    );
-                    bevy::tasks::IoTaskPool::get()
-                        .spawn(async move {
-                            if let Err(e) = handle.shell_execute(&cmd, exec_ctx, true).await {
-                                log::error!("archive command failed: {e}");
-                            }
-                        })
-                        .detach();
-                }
             }
             _ => {}
         }

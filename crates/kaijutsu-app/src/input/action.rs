@@ -14,7 +14,7 @@ pub enum Action {
     // ========================================================================
     // Focus management
     // ========================================================================
-    /// Tab — cycle focus forward through Compose → Conversation → Constellation → ...
+    /// Tab — cycle focus forward through Compose → Conversation → ...
     CycleFocusForward,
     /// Shift+Tab — cycle focus backward
     CycleFocusBackward,
@@ -26,12 +26,10 @@ pub enum Action {
     ToggleSurface,
     /// Context-dependent "go up" (Escape)
     /// - TextInput → Conversation
-    /// - Constellation → close, return to Conversation
     /// - Dialog → cancel
     Unfocus,
     /// Context-dependent "do the thing" (Enter)
     /// - Navigation: edit focused User Text block
-    /// - Constellation: switch to focused context
     /// - Dialog: confirm
     /// - Dashboard: select
     Activate,
@@ -47,10 +45,6 @@ pub enum Action {
     FocusFirstBlock,
     /// End / Shift+G — focus last block
     FocusLastBlock,
-    /// f — expand focused block to full-screen reader
-    ExpandBlock,
-    /// v — toggle between conversation list and 3D card stack view
-    ToggleStackView,
     /// Tab on thinking block — toggle collapse
     CollapseToggle,
 
@@ -91,37 +85,6 @@ pub enum Action {
     ShrinkPane,
     /// Ctrl+^ — toggle between current and previous pane focus
     TogglePreviousPaneFocus,
-
-    // ========================================================================
-    // Constellation (constellation focused)
-    // ========================================================================
-    /// Backtick — toggle constellation overlay
-    ToggleConstellation,
-    /// Spatial navigation between constellation nodes.
-    /// Keyboard hjkl bindings removed — use gamepad DPad (Phase N: gamepad workflow).
-    // Phase N: gamepad workflow — DPad constellation nav
-    SpatialNav(Vec2),
-    /// Pan the constellation camera.
-    /// Keyboard Shift+hjkl bindings removed — gamepad left stick (Phase N: gamepad workflow).
-    // Phase N: gamepad workflow — analog stick pan/orbit
-    Pan(Vec2),
-    /// Zoom in — gamepad only for now (Phase N: gamepad workflow).
-    // Phase N: gamepad workflow
-    ZoomIn,
-    /// Zoom out — gamepad only for now (Phase N: gamepad workflow).
-    // Phase N: gamepad workflow
-    ZoomOut,
-    /// Reset zoom — gamepad only for now (Phase N: gamepad workflow).
-    // Phase N: gamepad workflow
-    ZoomReset,
-    /// n in constellation — create new context immediately
-    ConstellationCreate,
-    /// m in constellation — open model picker
-    ConstellationModelPicker,
-    /// a in constellation — archive focused context
-    ConstellationArchive,
-    /// Ctrl+^ — toggle alternate context
-    ToggleAlternate,
 
     // ========================================================================
     // Text editing (Compose or EditingBlock focused)

@@ -530,7 +530,7 @@ pub struct ComposeError {
 
 /// Message requesting a context switch.
 ///
-/// Emitted by constellation navigation (gt/gT/Ctrl-^/click) and the
+/// Emitted by context-switch affordances (gt/gT/Ctrl-^/click) and the
 /// context strip widget. The `handle_context_switch` system processes
 /// this to swap documents from the DocumentCache.
 #[derive(Message, Clone, Debug)]

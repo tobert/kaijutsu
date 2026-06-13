@@ -153,8 +153,8 @@ impl Plugin for ActorPlugin {
 
         let ssh_config = self.ssh_config.clone();
 
-        // Initial connection — no context joined. Constellation populates from
-        // list_contexts(); user picks or creates a context explicitly.
+        // Initial connection — no context joined. The context strip populates
+        // from list_contexts(); user picks or creates a context explicitly.
         // kernel_id is None: server is authoritative and reveals it during
         // bind_kernel (see actor.rs `try_connect_inner`).
         let _ = bootstrap_channel.tx.send(BootstrapCommand::SpawnActor {
@@ -338,7 +338,7 @@ fn poll_bootstrap_results(
                             return;
                         }
 
-                        // 3. No context specified — fetch context list to populate constellation
+                        // 3. No context specified — fetch context list to populate the context strip
                         match h.list_contexts().await {
                             Ok(contexts) => {
                                 log::info!(

@@ -1,22 +1,17 @@
 //! Screen state machine — the single authority for which full-viewport view is active.
 //!
-//! Replaces the ad-hoc `ConstellationVisible` resource + `FocusArea::Constellation`
-//! coupling with Bevy's `States` system. Each screen gets `OnEnter`/`OnExit` schedules
-//! for visibility management and cleanup.
-//!
-//! ## Screens
-//!
-//! - `Constellation` — 2.5D context navigation graph (default)
-//! - `Conversation` — chat/shell conversation view
+//! After the app reset there is a single screen, `Conversation`. The state
+//! machine is retained (rather than removed) so that `OnEnter(Screen::Conversation)`
+//! still drives the initial visibility + focus setup, and so future screens can
+//! be reintroduced without rewiring `run_if(in_state(...))` call sites.
 //!
 //! ## Design
 //!
-//! Long-lived entities (3D scene, containers, block cells) persist across transitions
-//! and are shown/hidden via Visibility + camera `is_active`.
+//! Long-lived entities (containers, block cells) persist and are shown via
+//! Visibility on screen enter.
 
 use bevy::prelude::*;
 
-use super::constellation::ConstellationContainer;
 use super::state::ConversationRoot;
 use crate::cell::{BlockCell, RoleGroupBorder};
 
@@ -27,13 +22,9 @@ use crate::cell::{BlockCell, RoleGroupBorder};
 /// `OnEnter`/`OnExit` schedules handle visibility transitions.
 #[derive(States, Clone, Copy, Default, Eq, PartialEq, Hash, Debug, Reflect)]
 pub enum Screen {
-    /// 2.5D context navigation graph (default — app starts here).
+    /// Chat/shell conversation view (the only screen).
     #[default]
-    Constellation,
-    /// Chat/shell conversation view.
     Conversation,
-    /// 3D cascading card stack view of conversation history.
-    ConversationStack,
 }
 
 /// Plugin that registers the Screen state and its transition systems.
@@ -43,50 +34,10 @@ impl Plugin for ScreenPlugin {
     fn build(&self, app: &mut App) {
         app.init_state::<Screen>().register_type::<Screen>();
 
-        // ── Constellation ──
-        app.add_systems(
-            OnEnter(Screen::Constellation),
-            (
-                show_constellation_container,
-                hide_conversation_root,
-                hide_cell_text,
-            ),
-        );
-        app.add_systems(
-            OnExit(Screen::Constellation),
-            (hide_constellation_container,),
-        );
-
         // ── Conversation ──
         app.add_systems(
             OnEnter(Screen::Conversation),
-            (
-                show_conversation_root,
-                hide_constellation_container,
-                show_cell_text,
-                set_focus_conversation,
-            ),
-        );
-
-        // ── ConversationStack ──
-        app.add_systems(
-            OnEnter(Screen::ConversationStack),
-            (
-                hide_conversation_root,
-                hide_constellation_container,
-                hide_cell_text,
-                set_focus_conversation, // reuse Navigation input context
-            ),
-        );
-        // ConversationStack OnExit: card_stack plugin handles its own entity cleanup.
-        // Conversation or Constellation OnEnter will show the right things.
-
-        // ── Continuous ──
-        // Hide newly-added text entities that appear while not in conversation
-        // (e.g., block cells created by background sync while constellation is showing).
-        app.add_systems(
-            Update,
-            hide_new_cell_text_outside_conversation.run_if(not(in_state(Screen::Conversation))),
+            (show_conversation_root, show_cell_text, set_focus_conversation),
         );
     }
 }
@@ -95,58 +46,10 @@ impl Plugin for ScreenPlugin {
 // OnEnter/OnExit SYSTEMS
 // ============================================================================
 
-/// Show the constellation container.
-fn show_constellation_container(
-    mut containers: Query<
-        &mut Visibility,
-        (With<ConstellationContainer>, Without<ConversationRoot>),
-    >,
-) {
-    for mut vis in containers.iter_mut() {
-        *vis = Visibility::Inherited;
-    }
-}
-
-/// Hide the constellation container.
-fn hide_constellation_container(
-    mut containers: Query<
-        &mut Visibility,
-        (With<ConstellationContainer>, Without<ConversationRoot>),
-    >,
-) {
-    for mut vis in containers.iter_mut() {
-        *vis = Visibility::Hidden;
-    }
-}
-
 /// Show the conversation root.
-fn show_conversation_root(
-    mut roots: Query<&mut Visibility, (With<ConversationRoot>, Without<ConstellationContainer>)>,
-) {
+fn show_conversation_root(mut roots: Query<&mut Visibility, With<ConversationRoot>>) {
     for mut vis in roots.iter_mut() {
         *vis = Visibility::Inherited;
-    }
-}
-
-/// Hide the conversation root.
-fn hide_conversation_root(
-    mut roots: Query<&mut Visibility, (With<ConversationRoot>, Without<ConstellationContainer>)>,
-) {
-    for mut vis in roots.iter_mut() {
-        *vis = Visibility::Hidden;
-    }
-}
-
-/// Hide block cells and role headers when leaving conversation.
-fn hide_cell_text(
-    mut block_cells: Query<&mut Visibility, (With<BlockCell>, Without<RoleGroupBorder>)>,
-    mut role_headers: Query<&mut Visibility, (With<RoleGroupBorder>, Without<BlockCell>)>,
-) {
-    for mut vis in block_cells.iter_mut() {
-        *vis = Visibility::Hidden;
-    }
-    for mut vis in role_headers.iter_mut() {
-        *vis = Visibility::Hidden;
     }
 }
 
@@ -169,17 +72,4 @@ fn show_cell_text(
 /// Entering conversation view = navigation mode by default.
 fn set_focus_conversation(mut focus: ResMut<crate::input::focus::FocusArea>) {
     *focus = crate::input::focus::FocusArea::Conversation;
-}
-
-/// Hide newly-added block cells and role headers when not in conversation view.
-///
-/// Block cells may be created by background sync while the constellation or
-/// fork form is showing. Without this, they'd bleed through until the next
-/// screen transition.
-fn hide_new_cell_text_outside_conversation(
-    mut new_blocks: Query<&mut Visibility, Or<(Added<BlockCell>, Added<RoleGroupBorder>)>>,
-) {
-    for mut vis in new_blocks.iter_mut() {
-        *vis = Visibility::Hidden;
-    }
 }

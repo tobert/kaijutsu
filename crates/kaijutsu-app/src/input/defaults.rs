@@ -100,13 +100,13 @@ pub fn default_bindings() -> Vec<Binding> {
         "Grow pane",
     ));
 
-    // Ctrl+^ (Ctrl+6) — toggle previous pane/alternate context
+    // Ctrl+^ (Ctrl+6) — toggle between current and previous pane focus
     b.push(Binding::key_mod(
         KeyCode::Digit6,
         Modifiers::CTRL,
         InputContext::Global,
-        Action::ToggleAlternate,
-        "Toggle alternate",
+        Action::TogglePreviousPaneFocus,
+        "Toggle previous pane focus",
     ));
 
     // ====================================================================
@@ -143,18 +143,6 @@ pub fn default_bindings() -> Vec<Binding> {
         InputContext::Navigation,
         Action::FocusLastBlock,
         "Last block",
-    ));
-    b.push(Binding::key(
-        KeyCode::KeyF,
-        InputContext::Navigation,
-        Action::ExpandBlock,
-        "Expand block",
-    ));
-    b.push(Binding::key(
-        KeyCode::KeyV,
-        InputContext::Navigation,
-        Action::ToggleStackView,
-        "Toggle stack view",
     ));
     b.push(Binding::key(
         KeyCode::KeyX,
@@ -263,82 +251,6 @@ pub fn default_bindings() -> Vec<Binding> {
         "Scroll to end",
     ));
 
-    // Backtick toggles constellation
-    b.push(Binding::key(
-        KeyCode::Backquote,
-        InputContext::Navigation,
-        Action::ToggleConstellation,
-        "Toggle constellation",
-    ));
-
-    // ====================================================================
-    // Constellation (force-directed graph focused)
-    // ====================================================================
-
-    // Spatial navigation (hjkl)
-    b.push(Binding::key(
-        KeyCode::KeyH,
-        InputContext::Constellation,
-        Action::SpatialNav(Vec2::new(-1.0, 0.0)),
-        "Navigate left",
-    ));
-    b.push(Binding::key(
-        KeyCode::KeyL,
-        InputContext::Constellation,
-        Action::SpatialNav(Vec2::new(1.0, 0.0)),
-        "Navigate right",
-    ));
-    b.push(Binding::key(
-        KeyCode::KeyK,
-        InputContext::Constellation,
-        Action::SpatialNav(Vec2::new(0.0, -1.0)),
-        "Navigate up",
-    ));
-    b.push(Binding::key(
-        KeyCode::KeyJ,
-        InputContext::Constellation,
-        Action::SpatialNav(Vec2::new(0.0, 1.0)),
-        "Navigate down",
-    ));
-
-    // Actions
-    b.push(Binding::key(
-        KeyCode::Enter,
-        InputContext::Constellation,
-        Action::Activate,
-        "Switch to context",
-    ));
-    b.push(Binding::key(
-        KeyCode::KeyN,
-        InputContext::Constellation,
-        Action::ConstellationCreate,
-        "New context",
-    ));
-    b.push(Binding::key(
-        KeyCode::KeyM,
-        InputContext::Constellation,
-        Action::ConstellationModelPicker,
-        "Model picker",
-    ));
-    b.push(Binding::key(
-        KeyCode::KeyA,
-        InputContext::Constellation,
-        Action::ConstellationArchive,
-        "Archive context",
-    ));
-    b.push(Binding::key(
-        KeyCode::Tab,
-        InputContext::Constellation,
-        Action::CycleFocusForward,
-        "Cycle focus",
-    ));
-    b.push(Binding::key(
-        KeyCode::Escape,
-        InputContext::Constellation,
-        Action::Unfocus,
-        "Close constellation",
-    ));
-
     // ====================================================================
     // TextInput (compose area — owned by VimMachine)
     // ====================================================================
@@ -427,12 +339,6 @@ pub fn default_bindings() -> Vec<Binding> {
     ));
     b.push(Binding::gamepad(
         GamepadButton::South,
-        InputContext::Constellation,
-        Action::Activate,
-        "Switch to context",
-    ));
-    b.push(Binding::gamepad(
-        GamepadButton::South,
         InputContext::Dialog,
         Action::Activate,
         "Confirm",
@@ -446,7 +352,7 @@ pub fn default_bindings() -> Vec<Binding> {
         "Back / Cancel",
     ));
 
-    // DPad — block navigation + constellation spatial nav
+    // DPad — block navigation
     b.push(Binding::gamepad(
         GamepadButton::DPadUp,
         InputContext::Navigation,
@@ -458,30 +364,6 @@ pub fn default_bindings() -> Vec<Binding> {
         InputContext::Navigation,
         Action::FocusNextBlock,
         "Next block",
-    ));
-    b.push(Binding::gamepad(
-        GamepadButton::DPadLeft,
-        InputContext::Constellation,
-        Action::SpatialNav(Vec2::new(-1.0, 0.0)),
-        "Navigate left",
-    ));
-    b.push(Binding::gamepad(
-        GamepadButton::DPadRight,
-        InputContext::Constellation,
-        Action::SpatialNav(Vec2::new(1.0, 0.0)),
-        "Navigate right",
-    ));
-    b.push(Binding::gamepad(
-        GamepadButton::DPadUp,
-        InputContext::Constellation,
-        Action::SpatialNav(Vec2::new(0.0, -1.0)),
-        "Navigate up",
-    ));
-    b.push(Binding::gamepad(
-        GamepadButton::DPadDown,
-        InputContext::Constellation,
-        Action::SpatialNav(Vec2::new(0.0, 1.0)),
-        "Navigate down",
     ));
     b.push(Binding::gamepad(
         GamepadButton::DPadUp,
@@ -510,28 +392,12 @@ pub fn default_bindings() -> Vec<Binding> {
         "Page down",
     ));
 
-    // Start — toggle constellation
-    b.push(Binding::gamepad(
-        GamepadButton::Start,
-        InputContext::Global,
-        Action::ToggleConstellation,
-        "Toggle constellation",
-    ));
-
     // North (Y/△) — cycle focus
     b.push(Binding::gamepad(
         GamepadButton::North,
         InputContext::Navigation,
         Action::CycleFocusForward,
         "Cycle focus",
-    ));
-
-    // West (X/□) — expand block
-    b.push(Binding::gamepad(
-        GamepadButton::West,
-        InputContext::Navigation,
-        Action::ExpandBlock,
-        "Expand block",
     ));
 
     b
