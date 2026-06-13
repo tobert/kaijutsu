@@ -240,6 +240,37 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   the gig (key/tune/register) belongs to the stance + producer chart, NOT the
   base rc — migrate any song-specific primer content to the producer/chart
   layer when it lands ("big models author vocabularies").
+- **Decouple the OODA Act from ABC (generalize the loop primitive).** The Act
+  path is hardwired to one notation: `on_turn_completed` → `schedule_abc_cell`
+  eager-*parses ABC* to validate, and the `DeriverRegistry` derives MIDI from
+  it. The loop *shape* — drive → validate turn output → crystallize a cell →
+  derive sibling artifacts — is general and would serve other loops: a
+  MIDI-native model (emits MIDI directly, no ABC), non-music content, or any
+  "model produces structured artifact on a beat" workflow. Generalize to a
+  content-type-keyed `schedule_cell(content, content_type)` where validation is
+  pluggable (the player's track/role declares its expected content type) and
+  derivation stays the already-content-type-keyed `DeriverRegistry`. Then the
+  malformed-quarantine (just shipped, beat.rs:850 `set_excluded`) and the
+  header-carry follow-up below both become per-content-type validator behavior,
+  not ABC special cases. Keep ABC as the first registered validator/deriver.
+- **Header-carry for headerless player output (robustness).** A windowed player
+  naturally emits a bare continuation body (no `X:`/`K:` header) once it has a
+  full tune in its context; the schedule-time validator then rejects it. Today
+  we lean on the tick prompt to demand a complete tune every turn — brittle for
+  small models. Robust fix: in the score scheduler, if the output is a bare body
+  for a track with a last-good tune, prepend that track's last-good header
+  before validating/deriving. Pairs with the decouple above (a per-content-type
+  "complete the fragment" step).
+- **Composers are not re-armed on kernel cold-start (fail-silent).** Auto-arm
+  fires only on context *create* (`create_context_inner` / kj `context_create`,
+  via `BeatCommand::Arm`); the beat scheduler starts with an empty `armed` map
+  on restart and nothing re-arms existing composer contexts from the DB. So a
+  kernel restart silently stops every composer's beat until it is re-created —
+  and there is no `kj transport arm` verb to recover (only play/pause/stop/
+  tempo/ooda/rotate, all no-ops on an un-armed context). Re-arm live composers
+  on cold start (scan `context_type = composer`, `Arm` each, seeding the
+  playhead from max committed tick as the create path does). Adjacent to
+  `tech_debt_peer_reattach_on_reconnect` (restart-recovery gaps).
 - **Cadence/tempo should be settable per context:** `kj transport tempo <bpm>`
   exists, but the OODA cadence (`ooda_every`, default 8 phrases = 128 beats) is
   fixed in `BeatPolicy::composer_default()`. Make the cadence a settable knob
@@ -531,9 +562,9 @@ the *remaining* findings, triaged.
   snapshot per command** (`execute_and_poll_shell`, Phase 2). Fine for short MCP
   contexts; a per-block read RPC (`actor.get_block(ctx, id)`) would avoid the
   O(blocks) transfer for large conversations.
-- **TEST gaps beyond `tests/e2e_context_shell.rs`:** no coverage for Remote
+- **TEST gaps beyond `tests/e2e_shell.rs`:** no coverage for Remote
   input tools, the hook-listener socket path, prompts, resources, or
-  reconnect/resync. Add e2e cases (the harness in `e2e_context_shell.rs`
+  reconnect/resync. Add e2e cases (the harness in `e2e_shell.rs`
   generalizes).
 
 ## Testing & Tooling
