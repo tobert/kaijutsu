@@ -25,12 +25,31 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
     binding until they're re-created or the kernel restarts. (Editing the seed
     via `kj rc edit` / `kj rc reset` changes what *new* contexts get, not live
     ones — rc fires at lifecycle boundaries, not retroactively.)
-- **Zombie RPC session / no session reaping:** the server has warned every
-  60s for 21+ hours that session `019eb229` (an app session predating a
-  Jun 10 GUI restart) is "still active" — there is no reap path for dead
-  sessions. Related: auto-memory `tech_debt_peer_reattach_on_reconnect`
-  (app doesn't re-attach after kernel restart). Found during the
-  2026-06-11 journaling forensics.
+- **RPC session reaping — mostly closed (2026-06-14).** The original report
+  ("warned every 60s for 21+ hours that session `019eb229` is still active —
+  no reap path") was two conflated problems, both now addressed:
+  - *Reaping* is handled at the transport layer by SSH **keepalive**
+    (`ssh.rs` server `Config`, added 2026-05-24: 30s × 3 ≈ 90s dead-peer
+    detection — postdates the 21h zombie). A vanished peer's transport now
+    EOFs, `rpc_system.await` returns, and `ConnectionState::Drop` removes the
+    `session_contexts` entry. Verified on the live server (booted 2026-06-13):
+    every session that was ever warned about *ended cleanly*, including ones
+    open for hours; no surviving zombie.
+  - *The watchdog was a false alarm.* `run_rpc_watchdog` logged `WARN ...
+    still active` every 60s for the entire life of **any** session, so a
+    healthy hour-long connection emitted ~58 lines — it could not tell a
+    long-lived session from a wedge, burying the one signal it existed to
+    surface. Now **activity-gated** (`ssh.rs`): an `ActivityStream` wrapper
+    stamps a timestamp on every byte read/written, and the watchdog warns only
+    when a connection is open but idle past `RPC_IDLE_WARN_THRESHOLD` (120s,
+    above the keepalive reap window).
+  - **Residual (by design, low):** a *truly* wedged `current_thread` LocalSet
+    (a blocking handler) can't be force-killed from outside without thread
+    injection, and the in-thread watchdog goes quiet with it — that silence is
+    the only remaining signal. Not worth chasing until it actually recurs.
+  - Related: auto-memory `tech_debt_peer_reattach_on_reconnect` (app doesn't
+    re-attach after kernel restart). Original find: 2026-06-11 journaling
+    forensics.
 - **LLM providers:**
   - Move per-model knobs out of the config layer (`models.toml`), into the app.
   - Push subscriber for `ConversationMailbox`.

@@ -3,13 +3,16 @@
 //! Accepts SSH connections and provides Cap'n Proto RPC over channels.
 //! Public key authentication with user identity from SQLite.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
 use parking_lot::Mutex;
@@ -420,7 +423,11 @@ async fn run_rpc(
     principal: Principal,
     registry: Arc<ServerRegistry>,
 ) {
-    let stream = stream.compat();
+    // Stamp a liveness timestamp on every byte that moves in either
+    // direction, so the watchdog can tell a healthy long-lived session
+    // (traffic flowing) from a genuinely stalled one (open but silent).
+    let last_activity = Rc::new(Cell::new(Instant::now()));
+    let stream = ActivityStream::new(stream.compat(), last_activity.clone());
     let (reader, writer) = futures::AsyncReadExt::split(stream);
 
     let session_contexts = registry.kernel.session_contexts.clone();
@@ -455,8 +462,15 @@ async fn run_rpc(
     let watchdog_token = watchdog_cancel.clone();
     let watchdog_username = principal.username.clone();
     let watchdog_session = session_id;
+    let watchdog_activity = last_activity.clone();
     let watchdog = tokio::task::spawn_local(async move {
-        run_rpc_watchdog(watchdog_token, watchdog_username, watchdog_session).await
+        run_rpc_watchdog(
+            watchdog_token,
+            watchdog_username,
+            watchdog_session,
+            watchdog_activity,
+        )
+        .await
     });
 
     let rpc_result = rpc_system.await;
@@ -480,39 +494,123 @@ async fn run_rpc(
     // can't be skipped when the future is dropped without completing.
 }
 
-/// Interval between watchdog "still alive" log lines.
-///
-/// Short enough that a wedged session shows up within a minute; long enough
-/// that healthy sessions don't spam.
-const RPC_WATCHDOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+/// How often the watchdog wakes to check connection liveness.
+const RPC_WATCHDOG_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Watchdog companion to `run_rpc`. Logs while the RPC system is awaited.
+/// Only warn once a connection has been *open but silent* this long.
 ///
-/// Cancelled by the parent when `rpc_system` returns. If the LocalSet itself
-/// wedges (the failure mode this codebase has hit before), the watchdog
-/// keeps logging because it's on the same LocalSet — that's actually useful:
-/// if the watchdog also goes quiet, the wedge is at the executor level, not
-/// just one task.
+/// Sits comfortably above the SSH keepalive's dead-peer detection window
+/// (`keepalive_interval` 30s × `keepalive_max` 3 ≈ 90s, see the server
+/// `Config`): a peer that vanishes is reaped by keepalive — its transport
+/// EOFs, `rpc_system` returns, and the watchdog is cancelled — before it
+/// ever crosses this threshold. So a warn here means the connection is still
+/// open and still passing keepalive yet moving no RPC bytes: a genuine stall
+/// worth surfacing, not the routine long-lived session that the old
+/// "still active" line warned about every minute.
+const RPC_IDLE_WARN_THRESHOLD: Duration = Duration::from_secs(120);
+
+/// Decide whether an idle duration warrants a stall warning. Pulled out so
+/// the boundary is unit-testable without driving the whole watchdog loop.
+fn should_warn_idle(idle: Duration) -> bool {
+    idle >= RPC_IDLE_WARN_THRESHOLD
+}
+
+/// Watchdog companion to `run_rpc`. Warns only when the RPC connection is
+/// *open but stalled* — no bytes moving in either direction for
+/// [`RPC_IDLE_WARN_THRESHOLD`].
+///
+/// `last_activity` is stamped by [`ActivityStream`] on every read/write, so a
+/// healthy long-lived session keeps it fresh and never warns; a wedged
+/// `rpc_system` (the failure mode this codebase has hit before) stops moving
+/// bytes and trips the warn. Cancelled by the parent when `rpc_system`
+/// returns. If the LocalSet itself wedges the watchdog goes quiet too — that
+/// silence is itself the signal that the wedge is at the executor level.
 async fn run_rpc_watchdog(
     cancel: tokio_util::sync::CancellationToken,
     username: String,
     session_id: kaijutsu_types::SessionId,
+    last_activity: Rc<Cell<Instant>>,
 ) {
-    let start = std::time::Instant::now();
     let mut tick = tokio::time::interval(RPC_WATCHDOG_INTERVAL);
     tick.tick().await; // first tick fires immediately; drop it
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
             _ = tick.tick() => {
-                log::warn!(
-                    "RPC session for {} session={} still active after {:?}",
-                    username,
-                    session_id.short(),
-                    start.elapsed(),
-                );
+                let idle = last_activity.get().elapsed();
+                if should_warn_idle(idle) {
+                    log::warn!(
+                        "RPC session for {} session={} open but idle for {:?} \
+                         (no RPC traffic) — possible stall",
+                        username,
+                        session_id.short(),
+                        idle,
+                    );
+                }
             }
         }
+    }
+}
+
+/// Wraps an `AsyncRead + AsyncWrite` stream, stamping `last_activity` whenever
+/// bytes actually move in either direction. This is the RPC watchdog's
+/// liveness signal: it distinguishes a healthy long-lived connection (traffic
+/// flowing) from one that is open but stalled. A zero-byte poll (EOF, or a
+/// spurious wakeup) is deliberately *not* counted as activity — otherwise a
+/// dead reader spinning on EOF would look alive.
+struct ActivityStream<S> {
+    inner: S,
+    last_activity: Rc<Cell<Instant>>,
+}
+
+impl<S> ActivityStream<S> {
+    fn new(inner: S, last_activity: Rc<Cell<Instant>>) -> Self {
+        Self {
+            inner,
+            last_activity,
+        }
+    }
+}
+
+impl<S: futures::io::AsyncRead + Unpin> futures::io::AsyncRead for ActivityStream<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let result = Pin::new(&mut this.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(n)) = &result
+            && *n > 0
+        {
+            this.last_activity.set(Instant::now());
+        }
+        result
+    }
+}
+
+impl<S: futures::io::AsyncWrite + Unpin> futures::io::AsyncWrite for ActivityStream<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let result = Pin::new(&mut this.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = &result
+            && *n > 0
+        {
+            this.last_activity.set(Instant::now());
+        }
+        result
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_close(cx)
     }
 }
 
@@ -820,5 +918,69 @@ impl server::Handler for ConnectionHandler {
     ) -> Result<(), Self::Error> {
         log::debug!("Channel {} closed", channel);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::{AsyncReadExt, AsyncWriteExt};
+
+    /// An `Instant` far enough in the past that any real `Instant::now()`
+    /// taken during the test is strictly newer — lets us assert "got stamped"
+    /// without sleeping.
+    fn stale_instant() -> Instant {
+        Instant::now() - Duration::from_secs(3600)
+    }
+
+    #[tokio::test]
+    async fn activity_stream_stamps_on_read() {
+        let last = Rc::new(Cell::new(stale_instant()));
+        let before = last.get();
+        let mut stream = ActivityStream::new(futures::io::Cursor::new(vec![1u8, 2, 3, 4]), last.clone());
+
+        let mut buf = [0u8; 4];
+        let n = stream.read(&mut buf).await.unwrap();
+
+        assert_eq!(n, 4);
+        assert!(last.get() > before, "a non-empty read must refresh last_activity");
+    }
+
+    #[tokio::test]
+    async fn activity_stream_stamps_on_write() {
+        let last = Rc::new(Cell::new(stale_instant()));
+        let before = last.get();
+        let mut stream = ActivityStream::new(futures::io::Cursor::new(Vec::new()), last.clone());
+
+        let n = stream.write(&[1u8, 2, 3]).await.unwrap();
+
+        assert_eq!(n, 3);
+        assert!(last.get() > before, "a non-empty write must refresh last_activity");
+    }
+
+    #[tokio::test]
+    async fn activity_stream_does_not_stamp_on_eof() {
+        let last = Rc::new(Cell::new(stale_instant()));
+        let before = last.get();
+        // Empty cursor: the first read is EOF (Ok(0)).
+        let mut stream = ActivityStream::new(futures::io::Cursor::new(Vec::<u8>::new()), last.clone());
+
+        let mut buf = [0u8; 4];
+        let n = stream.read(&mut buf).await.unwrap();
+
+        assert_eq!(n, 0);
+        assert_eq!(
+            last.get(),
+            before,
+            "an EOF (zero-byte) read must NOT count as activity",
+        );
+    }
+
+    #[test]
+    fn should_warn_idle_only_past_threshold() {
+        assert!(!should_warn_idle(Duration::from_secs(0)));
+        assert!(!should_warn_idle(RPC_IDLE_WARN_THRESHOLD - Duration::from_secs(1)));
+        assert!(should_warn_idle(RPC_IDLE_WARN_THRESHOLD));
+        assert!(should_warn_idle(RPC_IDLE_WARN_THRESHOLD + Duration::from_secs(1)));
     }
 }
