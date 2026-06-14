@@ -8,13 +8,6 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ## Architecture & System Design
 
-- **`kj doc list` counts the KV singleton (5 doc tests red).** Since `init_kv`
-  was wired into `test_dispatcher` (`kj/mod.rs`, commit `99ab3c6`), the KV
-  singleton doc (`824658110b55…`, kind `kv`) shows up in `kj doc list`, inflating
-  every count by one — `kj::doc::tests::doc_list_*` (5 tests) assert the old
-  counts and fail. Pre-existing, surfaced 2026-06-13. Decide intent: should `doc
-  list` exclude the `kv` kind (it's not a user document), or should the tests
-  account for it? Likely the former — the KV store is infrastructure, not a doc.
 - **VFS facade delegation:** `Kernel` implements `VfsOps` directly (`crates/kaijutsu-kernel/src/kernel.rs:984`) as a facade. Backend multiplexing already exists — `MountTable` impls `VfsOps` over `MemoryBackend`/`LocalBackend` (`crates/kaijutsu-kernel/src/vfs/mount.rs:261`). The open question is whether the `Kernel`-level facade should delegate more to `MountTable` (and what stays on `Kernel`), not whether to build a manager from scratch.
 - **Server RPC Modularization:** `crates/kaijutsu-server/src/rpc.rs` is a massive file (~301KB / ~7,000 lines — by far the largest in the server). The monolithic implementation of the Cap'n Proto traits should be split into smaller modules by domain (e.g., `rpc/vfs.rs`, `rpc/llm.rs`, `rpc/mcp.rs`).
 - **Cap'n Proto Schema Clarity (doc-only):** The `BlockKind` vs `ContentType` boundary is already settled — `BlockKind` is the structural DAG role, `ContentType` is the raw MIME rendering hint. Remaining work is purely to write that distinction into `kaijutsu.capnp` as schema comments so it stops reading as overlap.
