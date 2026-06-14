@@ -184,14 +184,6 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ### kj / MCP ergonomics (UX)
 
-- **FOOTGUN — `kj <cmd> help` creates a context.** `kj context create help`
-  parses `help` as a positional *label* and silently creates a context named
-  "help" instead of printing subcommand help (observed 2026-06-13 while
-  orchestrating Chameleon over MCP). `kj <cmd> --help` is also wrong: it falls
-  through to the generic top-level `kj help` rather than the subcommand's clap
-  help. Fix: route a bare `help` / `--help` token to clap's per-subcommand help
-  before positional binding; at minimum special-case `help` so creative/
-  destructive verbs don't treat it as data.
 - **MIDI / blob readback is a two-step with no single tool.** A derived block
   (e.g. ABC→MIDI sibling) stores a 32-hex CAS hash as its `content`, and the
   block is `ephemeral` (won't hydrate into the conversation). Retrieving the
@@ -219,18 +211,15 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   a context already created from a stale seed keeps its broken loadout and can only
   be repaired from a binding-admin context, which the cold-start bootstrap doesn't
   provide (see "Cold start seeds no binding-admin context" under Architecture).
-- **Model alias not resolved via `kj --model`.** `kj context create/set --model
-  local` stores the alias verbatim and ships it to the *default* provider at
-  turn time → `not_found_error: model: local` (observed 2026-06-13). Aliases
-  (`local`, `local-fast`, …) are defined in `models.toml [model_aliases]` and
-  resolve in some paths but not the `kj` context-model setter. Resolve aliases
-  where the model spec is stored/applied (or at turn dispatch), not only in the
-  provider list. Workaround: pass the explicit `provider/model` spec
-  (`lemonade/Gemma-4-E4B-it-GGUF`).
 - **`local` is a kaish reserved word (like `set`).** `--model local` lexes as
   the `local` builtin keyword → `found ';' expected identifier`. Same class as
   the `set` reserved-word gotcha; quote it (`--model "local"`) or pass the full
   spec. Consider letting reserved words bind as plain args after a flag.
+  (kaish-lexer change in `~/src/kaish`, not kaijutsu-side.) NOTE: alias
+  *resolution* is now fixed — `kj context create/set --model "local"` expands
+  the `models.toml [model_aliases]` entry to its concrete `provider/model`
+  before storage (`resolve_context_config`, 2026-06-14), so the quoted form
+  works end-to-end; only the bare-`local` lexer footgun remains.
 - **Local-model turn HANGS silently when given tools.** A small local model
   (Gemma-4-E4B via lemonade) handed the full tool palette
   (`[providers.lemonade.default_tools] type = "all"`) emits a thinking block and
@@ -241,18 +230,24 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   player loadout should not be `all` tools for a small model (the composer rc is
   now tool-free); make per-provider/per-context `default_tools` the norm for
   players, and add a turn-level watchdog so a wedged tool loop fails loudly.
-- **`shell` MCP tool drops kj's structured `data`.** The `mcp__kaijutsu__shell`
-  result's `data` field is `null` even for `kj` verbs that emit a structured
-  payload via `KjResult::ok_with_data` (`kj context list`/`info` return full
-  context-id arrays/records; `context.rs:402,411,518`). Consumers are forced to
-  scrape `stdout` (short ids only) or read `kernel.db` directly for full UUIDs
-  (observed 2026-06-13 while setting the app's `current_context` KV). Plumb `data`
-  through the shell tool's result.
-- **`--json` rejected at `kj` leaf subcommands.** The root `--json` global doesn't
-  bind at leaves: both `kj context list --json` and `kj --json context list` error
-  `unexpected argument '--json'`, so there's no way to get structured output for a
-  subcommand over the shell tool. Make `--json` a true global (bind at every leaf,
-  per the clap-reflection model) or document the working invocation.
+- **`shell` MCP tool drops kj's structured `data` (needs a persisted block
+  field).** The `mcp__kaijutsu__shell` result's `data` is `null` even for `kj`
+  verbs that emit a structured payload (`kj context list`/`info`). Root cause
+  (traced 2026-06-14): kj sets `ExecResult.data` (a kaish `Value`), but the
+  server's `shell_execute` only persists `ExecResult.output()` (`OutputData`)
+  onto the result block (`rpc.rs:6104` → `set_output`), and the MCP `data` field
+  reads `snapshot.output` (`kaijutsu-mcp/src/lib.rs:192`). `.data` and `.output`
+  are distinct fields, so the kj payload never round-trips. **Workaround now
+  available:** `kj <cmd> --json` returns the payload in the result `stdout` as a
+  `{ok, exit_code, message, data}` envelope (shipped 2026-06-14), so MCP
+  consumers can parse `data` from the json body without the block round-trip.
+  Proper fix (deferred — crosses layers): persist the kj `.data` JSON on the
+  result block. The block carries only `output: OutputData`, which can't
+  faithfully hold arbitrary JSON (e.g. an inspect object), so this wants a new
+  persisted structured field threaded through `kaijutsu-crdt` (content/document/
+  block_store) + the capnp `BlockSnapshot` wire + the snapshot type, then set in
+  `shell_execute` and read in the MCP `to_json`. CBOR oplog evolution is additive
+  (safe), but the capnp surface is the real work.
 
 - **`StreamingBlockHandle` implementation:** Single-block streaming primitive.
 - **LLM streaming rewrite:** Move `process_llm_stream` onto `StreamingBlockHandle`.

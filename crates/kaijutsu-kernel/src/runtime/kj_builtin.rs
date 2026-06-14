@@ -468,6 +468,14 @@ impl Tool for KjBuiltin {
         let confirm_nonce = crate::kj::parse::extract_named_arg(&argv, &["--confirm"]);
         crate::kj::parse::strip_named_arg(&mut argv, &["--confirm"]);
 
+        // Extract the global --json flag before dispatch. The per-subcommand
+        // clap parsers don't declare it (it's a kj-wide presentation flag), so
+        // leaving it in argv would make `kj context list --json` fail with
+        // "unexpected argument". When set, the KjResult is rendered as a JSON
+        // envelope after dispatch instead of the human text.
+        let json_requested = crate::kj::parse::has_flag(&argv, &["--json"]);
+        argv.retain(|a| a != "--json");
+
         // Stdin → --content for `kj rc add` / `kj rc edit`. Lets shell
         // pipelines author multi-line .md / .kai scripts:
         //   cat prompt.md | kj rc add /etc/rc/coder/create/S00-stance.md
@@ -511,7 +519,7 @@ impl Tool for KjBuiltin {
 
         let result = self.dispatcher.dispatch(&argv, &caller).await;
 
-        match result {
+        let exec = match result {
             KjResult::Ok {
                 message,
                 content_type,
@@ -563,8 +571,53 @@ impl Tool for KjBuiltin {
                     format!("kj {} --confirm {}", original_argv, nonce)
                 })
             }
+        };
+
+        // --json post-processing: re-render the ExecResult as a JSON envelope on
+        // stdout while preserving the exit code and the side effects already
+        // applied above (a `Switch` has switched, a `Latch` has latched). The
+        // structured `.data` rides along so `kaish-last` / for-loops still see
+        // it; the human-readable text moves into the envelope's `message`.
+        if json_requested {
+            return render_json_envelope(exec);
         }
+        exec
     }
+}
+
+/// Wrap an already-produced [`ExecResult`] in the `kj --json` envelope:
+/// `{ "ok", "exit_code", "message", "data" }`. The original exit code is
+/// preserved (nonzero on failure, 2 on a latch prompt) so `$?`/scripting still
+/// works; the body becomes the JSON object with `content_type=application/json`.
+fn render_json_envelope(exec: ExecResult) -> ExecResult {
+    let ok = exec.code == 0;
+    // On failure the human message lives in `.err`; on success it's stdout.
+    let stdout = exec.text_out().into_owned();
+    let message = if exec.err.is_empty() {
+        stdout
+    } else {
+        exec.err.clone()
+    };
+    let data_json = exec
+        .data
+        .as_ref()
+        .map(kaish_kernel::interpreter::value_to_json)
+        .unwrap_or(serde_json::Value::Null);
+    let envelope = serde_json::json!({
+        "ok": ok,
+        "exit_code": exec.code,
+        "message": message,
+        "data": data_json,
+    });
+
+    let mut out = ExecResult::success(envelope.to_string());
+    out.code = exec.code;
+    out.content_type = Some("application/json".to_string());
+    // Preserve the iteration-friendly structured payload and any baggage
+    // (e.g. the ephemeral marker) the original result carried.
+    out.data = exec.data;
+    out.baggage = exec.baggage;
+    out
 }
 
 /// Build a command scope string from argv for nonce validation.
@@ -726,6 +779,87 @@ mod tests {
             );
         }
         let _ = beta; // touched above; keep the binding live
+    }
+
+    /// `kj context list --json` (flag AFTER the subcommand) must emit the JSON
+    /// envelope, not error with "unexpected argument". The whole point of item 3:
+    /// `--json` binds at the leaf even though no leaf declares it.
+    #[tokio::test]
+    async fn json_flag_after_subcommand_emits_envelope() {
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+        let principal = PrincipalId::new();
+        let alpha = register_context(&dispatcher, Some("alpha"), None, principal);
+        register_context(&dispatcher, Some("beta"), None, principal);
+        let kaish = embedded_with_kj(dispatcher.clone(), alpha).await;
+
+        let res = kaish
+            .execute_with_options("kj context list --json", ExecuteOptions::default())
+            .await
+            .expect("kaish exec");
+        assert!(res.ok(), "context list --json exit != 0: {res:?}");
+
+        let stdout = res.text_out();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("stdout not JSON ({e}): {stdout}"));
+        assert_eq!(parsed["ok"], serde_json::json!(true));
+        assert_eq!(parsed["exit_code"], serde_json::json!(0));
+        // `kj context list` emits a `data` array of context handles — it must
+        // survive into the envelope.
+        let data = parsed["data"].as_array().expect("data is an array");
+        let labels: Vec<&str> = data.iter().filter_map(|v| v.as_str()).collect();
+        assert!(
+            labels.contains(&"alpha") && labels.contains(&"beta"),
+            "envelope data must carry context handles: {labels:?}"
+        );
+    }
+
+    /// `kj --json context list` (flag BEFORE the subcommand) is the other form
+    /// the issue called out — it must work identically.
+    #[tokio::test]
+    async fn json_flag_before_subcommand_emits_envelope() {
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+        let principal = PrincipalId::new();
+        let alpha = register_context(&dispatcher, Some("alpha"), None, principal);
+        let kaish = embedded_with_kj(dispatcher.clone(), alpha).await;
+
+        let res = kaish
+            .execute_with_options("kj --json context list", ExecuteOptions::default())
+            .await
+            .expect("kaish exec");
+        assert!(res.ok(), "--json context list exit != 0: {res:?}");
+        let parsed: serde_json::Value = serde_json::from_str(&res.text_out())
+            .unwrap_or_else(|e| panic!("stdout not JSON ({e}): {}", res.text_out()));
+        assert_eq!(parsed["ok"], serde_json::json!(true));
+    }
+
+    /// An error under `--json` still produces a parseable envelope with
+    /// `ok=false` and a nonzero exit code (the message moves into the envelope).
+    #[tokio::test]
+    async fn json_flag_renders_errors_as_envelope() {
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+        let principal = PrincipalId::new();
+        let ctx = register_context(&dispatcher, Some("alpha"), None, principal);
+        let kaish = embedded_with_kj(dispatcher.clone(), ctx).await;
+
+        // A context ref that resolves to nothing → KjResult::Err.
+        let res = kaish
+            .execute_with_options(
+                "kj context info no-such-context --json",
+                ExecuteOptions::default(),
+            )
+            .await
+            .expect("kaish exec");
+        assert!(!res.ok(), "errored command should keep nonzero exit: {res:?}");
+        let parsed: serde_json::Value = serde_json::from_str(&res.text_out())
+            .unwrap_or_else(|e| panic!("error envelope not JSON ({e}): {}", res.text_out()));
+        assert_eq!(parsed["ok"], serde_json::json!(false));
+        assert!(
+            parsed["message"].as_str().is_some_and(|m| !m.is_empty()),
+            "error envelope must carry a message: {parsed}"
+        );
     }
 
     /// A latch nonce issued for the canonical scope (`kj context remove`,

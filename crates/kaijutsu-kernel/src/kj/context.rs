@@ -180,18 +180,35 @@ impl KjDispatcher {
     ) -> Result<Option<ResolvedModel>, String> {
         let resolved_model = match cfg.model_spec {
             Some(ref spec) if !spec.is_empty() => {
-                let (mut provider, model) = parse_model_spec(spec);
+                let (mut provider, mut model) = parse_model_spec(spec);
                 let registry = self.kernel().llm().read().await;
                 if let Some(ref p) = provider {
                     // Explicit provider — must exist.
                     if registry.get(p).is_none() {
                         return Err(format!("unknown provider '{p}'"));
                     }
-                } else if let Some(ref m) = model {
-                    // Bare model name — resolve provider from the registry default.
-                    match registry.default_provider_name() {
-                        Some(p) => provider = Some(p.to_string()),
-                        None => return Err(format!("no provider configured for model '{m}'")),
+                } else if let Some(m) = model.clone() {
+                    // Bare name: resolve a `models.toml` alias FIRST (e.g.
+                    // `local`, `local-fast`), then fall back to "a model on the
+                    // default provider". Before this, `--model local` stored the
+                    // alias verbatim and shipped "local" to the default provider
+                    // at turn time → `not_found_error: model: local`.
+                    if let Some((alias_provider, alias_model)) = registry.resolve_alias(&m) {
+                        let alias_provider = alias_provider.to_string();
+                        if registry.get(&alias_provider).is_none() {
+                            return Err(format!(
+                                "model alias '{m}' points at unknown provider '{alias_provider}'"
+                            ));
+                        }
+                        model = Some(alias_model.to_string());
+                        provider = Some(alias_provider);
+                    } else {
+                        match registry.default_provider_name() {
+                            Some(p) => provider = Some(p.to_string()),
+                            None => {
+                                return Err(format!("no provider configured for model '{m}'"));
+                            }
+                        }
                     }
                 }
                 Some(ResolvedModel { provider, model })
@@ -2110,6 +2127,105 @@ mod tests {
         let handle = router.get(id).expect("kid registered in drift");
         assert_eq!(handle.provider.as_deref(), Some("mock"));
         assert_eq!(handle.model.as_deref(), Some("test-model"));
+    }
+
+    #[tokio::test]
+    async fn context_create_resolves_model_alias() {
+        // `--model local` must expand the `models.toml` alias to its concrete
+        // provider/model BEFORE storage — otherwise "local" ships to the default
+        // provider at turn time and 404s (`not_found_error: model: local`).
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let parent = register_context(&d, Some("parent"), None, principal);
+
+        // Register a provider + a `local` alias pointing at it.
+        {
+            use crate::llm::toml_config::ModelAlias;
+            use crate::llm::{MockClient, Provider};
+            use std::collections::HashMap;
+            use std::sync::Arc;
+            let mock = Arc::new(Provider::Mock(MockClient::new("lemonade")));
+            let mut registry = d.kernel().llm().write().await;
+            registry.register("lemonade", mock);
+            let mut aliases = HashMap::new();
+            aliases.insert(
+                "local".to_string(),
+                ModelAlias {
+                    provider: "lemonade".to_string(),
+                    model: "Gemma-4-E4B-it-GGUF".to_string(),
+                },
+            );
+            registry.set_model_aliases(aliases);
+        }
+
+        let c = caller_with_context(parent);
+        let result = d
+            .dispatch(
+                &[s("context"), s("create"), s("kid"), s("--model"), s("local")],
+                &c,
+            )
+            .await;
+        assert!(result.is_ok(), "create failed: {}", result.message());
+
+        let id = {
+            let db = d.kernel_db().lock();
+            db.resolve_context("kid").expect("kid should exist")
+        };
+        // Both the drift handle and the persisted row carry the RESOLVED target,
+        // never the literal alias "local".
+        {
+            let router = d.drift_router().read();
+            let handle = router.get(id).expect("kid registered in drift");
+            assert_eq!(handle.provider.as_deref(), Some("lemonade"));
+            assert_eq!(handle.model.as_deref(), Some("Gemma-4-E4B-it-GGUF"));
+        }
+        let db = d.kernel_db().lock();
+        let row = db.get_context(id).unwrap().expect("kid row");
+        assert_eq!(row.provider.as_deref(), Some("lemonade"));
+        assert_eq!(
+            row.model.as_deref(),
+            Some("Gemma-4-E4B-it-GGUF"),
+            "stored model must be the resolved alias target, not 'local'"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_set_resolves_model_alias() {
+        // The same resolution must apply to `kj context set --model <alias>`
+        // (create and set share `resolve_context_config`).
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let target = register_context(&d, Some("target"), None, principal);
+
+        {
+            use crate::llm::toml_config::ModelAlias;
+            use crate::llm::{MockClient, Provider};
+            use std::collections::HashMap;
+            use std::sync::Arc;
+            let mock = Arc::new(Provider::Mock(MockClient::new("lemonade")));
+            let mut registry = d.kernel().llm().write().await;
+            registry.register("lemonade", mock);
+            let mut aliases = HashMap::new();
+            aliases.insert(
+                "local".to_string(),
+                ModelAlias {
+                    provider: "lemonade".to_string(),
+                    model: "Gemma-4-E4B-it-GGUF".to_string(),
+                },
+            );
+            registry.set_model_aliases(aliases);
+        }
+
+        let c = caller_with_context(target);
+        let result = d
+            .dispatch(&[s("context"), s("set"), s("--model"), s("local")], &c)
+            .await;
+        assert!(result.is_ok(), "set failed: {}", result.message());
+
+        let db = d.kernel_db().lock();
+        let row = db.get_context(target).unwrap().expect("target row");
+        assert_eq!(row.provider.as_deref(), Some("lemonade"));
+        assert_eq!(row.model.as_deref(), Some("Gemma-4-E4B-it-GGUF"));
     }
 
     #[tokio::test]

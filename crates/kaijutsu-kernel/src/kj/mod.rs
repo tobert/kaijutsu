@@ -325,6 +325,13 @@ impl KjDispatcher {
             return KjResult::Err(self.help());
         }
 
+        // Footgun guard: a trailing bare `help` (e.g. `kj context create help`)
+        // would otherwise bind as a positional and silently mint a context named
+        // "help". Rewrite it to `--help` so clap renders the leaf's help. Flag
+        // values (`--name help`) and non-trailing positionals are left intact.
+        let argv_owned = parse::normalize_trailing_help(argv);
+        let argv = argv_owned.as_slice();
+
         let cmd = argv[0].as_str();
 
         // Commands that don't strictly require an active context
@@ -595,6 +602,17 @@ pub(crate) fn kj_command() -> clap::Command {
                 .long("confirm")
                 .action(clap::ArgAction::Set)
                 .help("Latch confirmation nonce"),
+        )
+        // Root-level (global) flag: like `--confirm`, kj extracts `--json` in
+        // KjBuiltin::execute before dispatch (the per-subcommand clap parsers
+        // don't declare it), so it isn't on any leaf's struct. Declaring it here
+        // puts it in the reflected top-level params and kaish's binder merges
+        // root params onto every leaf, so `kj context list --json` binds.
+        .arg(
+            clap::Arg::new("json")
+                .long("json")
+                .action(clap::ArgAction::SetTrue)
+                .help("Emit a JSON envelope {ok, exit_code, message, data} instead of human text"),
         )
         .subcommand(context::ContextArgs::command())
         .subcommand(workspace::WorkspaceArgs::command())
@@ -898,6 +916,93 @@ mod unjoined_context_tests {
         assert!(
             matches!(result, KjResult::Ok { .. }),
             "kj help should succeed without a joined context, got {result:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod help_footgun_tests {
+    //! Regression: a trailing bare `help` after a creative/destructive verb must
+    //! render the leaf's clap help, NOT bind as a positional value (which used to
+    //! silently mint a context named "help").
+
+    use super::test_helpers::*;
+    use super::*;
+
+    fn s(v: &str) -> String {
+        v.to_string()
+    }
+
+    #[tokio::test]
+    async fn context_create_help_shows_help_and_creates_nothing() {
+        let d = test_dispatcher().await;
+        let caller = test_caller();
+
+        let result = d
+            .dispatch(&[s("context"), s("create"), s("help")], &caller)
+            .await;
+
+        // It rendered help (ephemeral Ok), not a creation/switch result.
+        match &result {
+            KjResult::Ok {
+                message,
+                ephemeral,
+                ..
+            } => {
+                assert!(*ephemeral, "help output should be ephemeral: {result:?}");
+                assert!(
+                    message.to_lowercase().contains("usage"),
+                    "expected clap help text, got: {message}"
+                );
+            }
+            other => panic!("expected help Ok, got {other:?}"),
+        }
+
+        // The headline guarantee: no context named "help" was born.
+        let created = d
+            .kernel_db()
+            .lock()
+            .find_context_by_label("help")
+            .expect("db query ok");
+        assert!(
+            created.is_none(),
+            "`kj context create help` must not mint a context labelled 'help'"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_bare_help_shows_subcommand_help() {
+        let d = test_dispatcher().await;
+        let caller = test_caller();
+        let result = d.dispatch(&[s("context"), s("help")], &caller).await;
+        assert!(
+            matches!(&result, KjResult::Ok { ephemeral: true, .. }),
+            "`kj context help` should render context help, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn name_flag_value_help_is_not_treated_as_help_request() {
+        // `--name help` is a deliberate label, not a help request — the context
+        // is actually created.
+        let d = test_dispatcher().await;
+        let parent = register_context(&d, Some("parent"), None, PrincipalId::new());
+        let caller = caller_with_context(parent);
+        let result = d
+            .dispatch(&[s("context"), s("create"), s("--name"), s("help")], &caller)
+            .await;
+        assert!(
+            !matches!(&result, KjResult::Ok { message, .. } if message.to_lowercase().contains("usage")),
+            "`--name help` must not trigger help rendering, got {result:?}"
+        );
+        let created = d
+            .kernel_db()
+            .lock()
+            .find_context_by_label("help")
+            .expect("db query ok");
+        assert!(
+            created.is_some(),
+            "`kj context create --name help` should mint a context labelled 'help'"
         );
     }
 }

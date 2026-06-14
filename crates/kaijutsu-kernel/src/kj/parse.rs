@@ -47,6 +47,36 @@ pub fn extract_all_named_args(argv: &[String], names: &[&str]) -> Vec<String> {
     values
 }
 
+/// Rewrite a trailing bare `help` token to `--help` so clap renders the leaf
+/// subcommand's help instead of binding `help` as a positional value.
+///
+/// Guards the footgun where `kj context create help` silently mints a context
+/// labelled "help" (the verb's positional `label` swallows the bare token,
+/// since the clap structs `disable_help_subcommand`). We only touch a `help`
+/// that is **last** and **not the value of a preceding flag** — so
+/// `kj context create --name help` (a deliberate "help" label via `--name`)
+/// and `kj context retag help target` (help as a non-trailing positional) are
+/// left untouched. Returns the argv unchanged when no rewrite applies.
+pub fn normalize_trailing_help(argv: &[String]) -> Vec<String> {
+    let mut out = argv.to_vec();
+    if let Some(last) = out.last()
+        && last == "help"
+    {
+        // A `help` riding behind a flag (`--name help`, `-m help`) is that
+        // flag's value, not a help request — leave it alone.
+        let after_flag = out
+            .len()
+            .checked_sub(2)
+            .and_then(|i| out.get(i))
+            .is_some_and(|prev| prev.starts_with('-'));
+        if !after_flag {
+            let idx = out.len() - 1;
+            out[idx] = "--help".to_string();
+        }
+    }
+    out
+}
+
 /// Parse a model spec like "anthropic/claude-opus-4-6" into (provider, model).
 ///
 /// Returns (None, None) for empty strings, (None, Some(model)) for bare model names.
@@ -111,6 +141,49 @@ mod tests {
         let argv = vec![s("--path"), s("/a"), s("--path"), s("/b"), s("other")];
         let vals = extract_all_named_args(&argv, &["--path"]);
         assert_eq!(vals, vec![s("/a"), s("/b")]);
+    }
+
+    #[test]
+    fn normalize_trailing_help_rewrites_bare_positional() {
+        // The footgun: `kj context create help` — without rewrite, `help` is the
+        // positional label and a context named "help" is born.
+        let argv = vec![s("context"), s("create"), s("help")];
+        assert_eq!(
+            normalize_trailing_help(&argv),
+            vec![s("context"), s("create"), s("--help")]
+        );
+    }
+
+    #[test]
+    fn normalize_trailing_help_rewrites_bare_subcommand_help() {
+        let argv = vec![s("context"), s("help")];
+        assert_eq!(
+            normalize_trailing_help(&argv),
+            vec![s("context"), s("--help")]
+        );
+    }
+
+    #[test]
+    fn normalize_trailing_help_leaves_flag_value_alone() {
+        // `--name help` deliberately labels a context "help" — not a help request.
+        let argv = vec![s("context"), s("create"), s("--name"), s("help")];
+        assert_eq!(normalize_trailing_help(&argv), argv);
+        // Short flag form too.
+        let argv2 = vec![s("context"), s("create"), s("-n"), s("help")];
+        assert_eq!(normalize_trailing_help(&argv2), argv2);
+    }
+
+    #[test]
+    fn normalize_trailing_help_leaves_nontrailing_positional_alone() {
+        // `retag help target` — `help` is the source label, not trailing.
+        let argv = vec![s("context"), s("retag"), s("help"), s("target")];
+        assert_eq!(normalize_trailing_help(&argv), argv);
+    }
+
+    #[test]
+    fn normalize_trailing_help_passthrough_when_absent() {
+        let argv = vec![s("context"), s("list"), s("--tree")];
+        assert_eq!(normalize_trailing_help(&argv), argv);
     }
 
     #[test]
