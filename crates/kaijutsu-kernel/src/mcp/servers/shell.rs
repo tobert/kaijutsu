@@ -227,6 +227,14 @@ fn shell_result_to_kernel(result: kaish_kernel::interpreter::ExecResult) -> Kern
     let stderr = result.err.clone();
     let exit_code = result.code;
     let is_error = exit_code != 0;
+    // kj verbs (and any builtin that opts in) attach a structured `.data`
+    // payload — context-id arrays for list commands, records for inspect. Carry
+    // it into the structured envelope so programmatic consumers don't scrape
+    // stdout. `null` when the command set no data (external commands, echo, …).
+    let data = result
+        .data
+        .as_ref()
+        .map(kaish_kernel::interpreter::value_to_json);
 
     let mut body = stdout.clone();
     let mut push_line = |s: &str| {
@@ -249,6 +257,7 @@ fn shell_result_to_kernel(result: kaish_kernel::interpreter::ExecResult) -> Kern
             "stdout": stdout,
             "stderr": stderr,
             "exit_code": exit_code,
+            "data": data,
         })),
     }
 }
@@ -329,6 +338,62 @@ mod tests {
             }
             other => panic!("expected text content, got {other:?}"),
         }
+    }
+
+    /// A `kj` verb's structured `.data` must survive into the tool result's
+    /// `structured` envelope — consumers read full context handles from `data`
+    /// instead of scraping stdout (which renders short ids in a table).
+    #[tokio::test]
+    async fn kj_data_payload_reaches_structured_envelope() {
+        let (broker, d) = wired().await;
+        let principal = PrincipalId::new();
+        let ctx_id = register_context(&d, Some("alpha"), None, principal);
+        register_context(&d, Some("beta"), None, principal);
+
+        let mut binding = ContextToolBinding::new();
+        binding.grant(Capability::Facade("shell".into()));
+        broker.set_binding(ctx_id, binding).await;
+
+        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
+        let result = broker
+            .call_tool(call("kj context list"), &cc, CancellationToken::new())
+            .await
+            .expect("kj context list should succeed");
+
+        assert!(!result.is_error, "kj context list errored: {result:?}");
+        let structured = result.structured.expect("structured envelope present");
+        let data = structured
+            .get("data")
+            .and_then(|d| d.as_array())
+            .unwrap_or_else(|| panic!("data must be a JSON array, got: {structured}"));
+        let labels: Vec<&str> = data.iter().filter_map(|v| v.as_str()).collect();
+        assert!(
+            labels.contains(&"alpha") && labels.contains(&"beta"),
+            "structured data must carry context handles: {labels:?}"
+        );
+    }
+
+    /// An `echo` (no structured data) leaves `data` null — the field is present
+    /// but empty, never fabricated.
+    #[tokio::test]
+    async fn plain_command_leaves_data_null() {
+        let (broker, d) = wired().await;
+        let principal = PrincipalId::new();
+        let ctx_id = register_context(&d, Some("sh"), None, principal);
+        let mut binding = ContextToolBinding::new();
+        binding.grant(Capability::Facade("shell".into()));
+        broker.set_binding(ctx_id, binding).await;
+
+        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
+        let result = broker
+            .call_tool(call("echo hi"), &cc, CancellationToken::new())
+            .await
+            .expect("echo should succeed");
+        let structured = result.structured.expect("structured envelope present");
+        assert!(
+            structured.get("data").is_some_and(|d| d.is_null()),
+            "echo must leave data null, got: {structured}"
+        );
     }
 
     /// Deny-by-default: a context WITHOUT `facade:shell` (here a read-only-ish

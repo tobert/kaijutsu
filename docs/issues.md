@@ -230,24 +230,23 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   player loadout should not be `all` tools for a small model (the composer rc is
   now tool-free); make per-provider/per-context `default_tools` the norm for
   players, and add a turn-level watchdog so a wedged tool loop fails loudly.
-- **`shell` MCP tool drops kj's structured `data` (needs a persisted block
-  field).** The `mcp__kaijutsu__shell` result's `data` is `null` even for `kj`
-  verbs that emit a structured payload (`kj context list`/`info`). Root cause
-  (traced 2026-06-14): kj sets `ExecResult.data` (a kaish `Value`), but the
-  server's `shell_execute` only persists `ExecResult.output()` (`OutputData`)
-  onto the result block (`rpc.rs:6104` → `set_output`), and the MCP `data` field
-  reads `snapshot.output` (`kaijutsu-mcp/src/lib.rs:192`). `.data` and `.output`
-  are distinct fields, so the kj payload never round-trips. **Workaround now
-  available:** `kj <cmd> --json` returns the payload in the result `stdout` as a
-  `{ok, exit_code, message, data}` envelope (shipped 2026-06-14), so MCP
-  consumers can parse `data` from the json body without the block round-trip.
-  Proper fix (deferred — crosses layers): persist the kj `.data` JSON on the
-  result block. The block carries only `output: OutputData`, which can't
-  faithfully hold arbitrary JSON (e.g. an inspect object), so this wants a new
-  persisted structured field threaded through `kaijutsu-crdt` (content/document/
-  block_store) + the capnp `BlockSnapshot` wire + the snapshot type, then set in
-  `shell_execute` and read in the MCP `to_json`. CBOR oplog evolution is additive
-  (safe), but the capnp surface is the real work.
+- **P3 — external `mcp__kaijutsu__shell` `data` needs a persisted block field.**
+  The *in-kernel* `builtin.shell` now carries kj's `.data` in its `structured`
+  envelope (shipped 2026-06-14, `mcp/servers/shell.rs`), and `kj <cmd> --json`
+  returns the payload in stdout for any consumer. The remaining gap is the
+  *external* `mcp__kaijutsu__shell`, which observes the result via CRDT sync
+  (polls a block snapshot, reads `snapshot.output`) rather than a return value.
+  Root cause (traced 2026-06-14): kj sets `ExecResult.data` (a kaish `Value`),
+  but the server's `shell_execute` only persists `ExecResult.output()`
+  (`OutputData`) onto the block (`rpc.rs:6104` → `set_output`), and the block
+  carries only `output: OutputData` — which can't faithfully hold arbitrary JSON
+  (an inspect object). Faithful fix: a new persisted `data` field on the block,
+  mirroring the `.output` vs `.data` split — thread through `kaijutsu-types`
+  `BlockSnapshot`, `kaijutsu-crdt` (content/document/block_store), the capnp
+  `BlockSnapshot` wire (the real cost — three-binary bounce), then `set_data` in
+  `shell_execute` and read it in the MCP `to_json` (`kaijutsu-mcp/src/lib.rs`).
+  CBOR oplog evolution is additive (safe); capnp is the work. P3 because the
+  `--json` envelope already unblocks consumers today.
 
 - **`StreamingBlockHandle` implementation:** Single-block streaming primitive.
 - **LLM streaming rewrite:** Move `process_llm_stream` onto `StreamingBlockHandle`.
