@@ -1,0 +1,12 @@
+[package]
+name = "kaijutsu-viz"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "D3-inspired scales and layout primitives for kaijutsu's bespoke data-driven views"
+
+[dependencies]
+
+[dev-dependencies]
+proptest = "1"
