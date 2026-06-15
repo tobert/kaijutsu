@@ -8,5 +8,6 @@ screenshot*.png
 .gemini/
 scratch/
 tmp/
+proptest-regressions/
 node_modules/
 .hrlauncher.toml
