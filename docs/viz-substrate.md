@@ -22,7 +22,7 @@ the first consumer needs; resist abstraction until a second consumer exists
 (see "ViewSpec — deferred" — this is the project's own stated rule:
 two concrete implementations before an abstraction).
 
-Estimated size: a few hundred lines for join + scales + the Layout trait. The
+Estimated size: a few hundred lines for join + scales + layout. The
 layout *algorithm* and the card rendering are the real work, and they belong to
 the consumer, not the substrate.
 
@@ -95,28 +95,39 @@ lives in `Assets<Material>`, not on the entity, so opacity tweens either touch t
 asset or use a custom material field — position/scale via `Transform` are free.
 Transitions are never a build step; they run throughout.
 
-### 4. Layouts — PORT THE TRAIT, write one algorithm ourselves.
+### 4. Layouts — write one algorithm; trait + state both turned out unneeded.
 
 ```
-trait Layout {
-    // Stateless algorithm; persisted slot assignments live in `state`.
-    fn layout(&self, graph: &ContextForest, state: &mut LayoutState)
-        -> HashMap<ContextId, Vec3>;
-}
+// SHIPPED (kaijutsu-viz::layout): one concrete layout, pure & stateless.
+fn compute(&self, entries: &[ContextEntry<Id>]) -> BTreeMap<Id, LayoutPos>;
 ```
 
 Decoupled from rendering and from the join. The join writes layout output to
 `Transform`s; Bevy tweens animate the delta.
 
-**Not pure — it carries `LayoutState`** (pattern borrowed from egui_graphs:
-stateless algorithm + persisted state). The compacting-list band and the band-1
-recency clock must *remember* each context's slot across ticks — a fresh
-`data → positions` recompute would re-derive positions from the current set, which
-is exactly the count-relative reflow we banned. `LayoutState` holds the durable
-slot table (which angular position each `ContextId` occupies in its band); `layout`
-reads it, assigns new entrants at the growing edge, and applies the deterministic
-one-slot compaction on exit. This is what makes the two motion invariants (below)
-enforceable.
+**It is pure and stateless — `LayoutState` was not needed** (an earlier draft, by
+analogy to egui_graphs, assumed a persisted slot table). The spike disproved that:
+each card's angle derives from its **stable `order_key`** (the kernel's CRDT tick /
+UUIDv7, unique within a band) at a **fixed angular pitch**, so re-deriving from the
+current set on every tick is *not* the count-relative reflow we banned — the
+`order_key` already carries the durable per-context identity a slot table would
+have held. The two motion invariants then hold on a pure function:
+*append* (a context with the max `order_key`) lands at the growing edge and moves
+nothing; *conclude* (removal) shifts only later-in-band cards by exactly one pitch.
+(Precondition: `order_key` unique per band — kernel-guaranteed. Ties would make
+the stable sort depend on input order; that's the one thing state would buy, and we
+don't need it.)
+
+**No `Layout` trait yet.** There is one concrete `CompactingBandLayout`. Per the
+crate's own rule (two implementations before an abstraction — same reasoning as
+ViewSpec), the trait waits for the second layout (the dive-in / freer tree layout).
+
+**Output is dependency-free 2D.** `LayoutPos { band, x, y }` (`f32`); the Bevy app
+lifts it to `glam::Vec3` at its boundary (mapping band → well depth). This keeps
+kaijutsu-viz zero-dependency and dodges lockstep with Bevy's pinned `glam`
+(0.30.10; the tree already carries a second `glam` 0.31 — proof of the hazard).
+`kurbo` (2D/f64, already present via vello) is for card *rasterization*, not 3D
+scene coordinates — wrong layer.
 
 The *which algorithm* question is settled — see "The layout — DECIDED: three
 lifecycle bands" below.
@@ -371,18 +382,24 @@ the second screen lands — which is exactly when the time-well view ships.
 
 ## Build order
 
-1. **Scales** (`scale_time`, `scale_linear`, the quantized 3-band radial scale;
-   `scale_band` deferred to the dive-in). Pure, TDD-first, invert round-trip as a
-   failing-capable test. Consumer-agnostic, so safe to land first.
-2. **Keyed join** with the two-cadence behavior baked in: layout tick from a
-   `listContexts` diff, data tick from `subscribeBlocksFiltered`. Foundation for
-   everything; test the enter/update/exit diff against a synthetic context set.
-3. **`Layout` trait** + the **compacting-list band layout** as first algorithm.
-   Test the two motion invariants: `enter` (append) moves nothing existing;
-   `exit` (conclude) produces exactly the one-slot compaction; a status-only data
-   tick moves nothing.
+*Status (June 2026): steps 1–3 shipped in `crates/kaijutsu-viz/` — pure,
+dependency-free, TDD, deepseek-reviewed. The remaining steps are the
+integration-flavoured work (Bevy app + RPC client + kernel).*
+
+1. ✅ **Scales** (`ScaleLinear`, `ScaleTime`, `ScaleThreshold` + `RadialBands` —
+   the quantized 3-band radial; `scale_band` deferred to the dive-in). Pure,
+   invert round-trip proptests.
+2. ✅ **Keyed join** — the reconciler core (`Join<K,V>`: `reconcile` enter/update/
+   exit value-change-aware + idempotent; `touch` set-preserving data-tick update;
+   `needs_relayout()` = the structural two-cadence line). The *wiring* to
+   `listContexts` (layout tick) / `subscribeBlocksFiltered` (data tick) is the
+   integration step (needs app + client).
+3. ✅ **Compacting band layout** (`assign_band` + `CompactingBandLayout::compute`)
+   — pure & stateless; the two motion invariants as proptests. No `Layout` trait
+   (one impl; trait waits for the dive-in layout).
 4. **Card** schema + billboarding + the join writing `ContextHandleInfo` →
-   card components; live status glyph from the block-event data tick.
+   card components; live status glyph from the block-event data tick. *(First
+   Bevy-side step — `LayoutPos` → `glam::Vec3` lift lives here.)*
 5. **`conclude` wire work** (gap 0) — the operation + `concludedAt` + lifecycle
    value. Without it band 0 has no exit and the radial axis is inert.
 6. **Active view** = band 0 (the hot compacting list) + band 1 (recent-concluded
@@ -436,8 +453,11 @@ closed the layout question (three lifecycle bands). These remain genuinely open:
   in a frame loop — it blocks to convergence. Still may never be needed (the well is
   deterministic geometry, not force).
 - **Borrowed patterns (not dependencies):**
-  - *egui_graphs* — the stateless `Layout` + persisted `LayoutState` split (adopted
-    above) and pluggable extra-forces shape.
+  - *egui_graphs* — the stateless-algorithm + persisted-`LayoutState` split was
+    *considered* but the spike showed the compacting layout needs no persisted
+    state (the stable `order_key` already carries per-context identity). Keep the
+    split in mind for the force-based dive-in, where it would apply; the
+    pluggable-extra-forces shape is the part worth borrowing there.
   - *Rerun `re_view_graph`* — for the dive-in / any future relational view: keep a
     *persistent* sim and **re-heat alpha on structural change** rather than resetting,
     and seed new nodes near their neighbours (`Node::fixed_position` pins anchors), so
