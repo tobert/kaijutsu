@@ -271,6 +271,19 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 - **ABC multi-tune files vs blocks:** Split tunes across sibling blocks or stack inside one block.
 - **ABC file-header inheritance:** `M:`/`L:`/`Q:` defaults prevent proper inheritance.
 - **ABC features:** `I:linebreak`, `m:` macro expansion, `%%` directives, Unicode escapes/fonts.
+
+## Viz substrate (kaijutsu-viz) — see docs/viz-substrate.md
+
+- **`ScaleLinear`/`ScaleTime` round-trip loses precision under extreme
+  domain→range compression** (≳10³–10⁸×): inverting through a tiny range
+  amplifies f64 representation error past any sane tolerance. This is an f64
+  limitation, not a logic bug — the `invert` algebra is exact. The proptest
+  strategy constrains the compression ratio to a realistic band (`rwidth_factor`
+  ∈ [0.1, 10]) so the property isn't flaky; the well's actual domains (time, band
+  fractions) never approach the pathological ratio. Follow-up if it ever bites: a
+  one-line doc note on `ScaleLinear` about the compression boundary (parallel to
+  the existing 2³ ms note on `ScaleTime`). Discovered during the scales spike
+  (deepseek review N3), 2026-06-15.
 - **ABC duration-summing ruler:** kaijutsu-abc has no total-beats-per-voice
   machinery; needed to validate that a committed phrase's ABC sums to
   `beats_per_phrase` (Chameleon eval ruler, new code). The tuplet/broken-rhythm
