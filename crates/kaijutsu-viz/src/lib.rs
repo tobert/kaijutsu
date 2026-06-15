@@ -18,4 +18,5 @@
 //! `invert_extent`. `invert(scale(x)) ≈ x` is a property-tested invariant.
 
 pub mod join;
+pub mod layout;
 pub mod scales;
