@@ -17,4 +17,5 @@
 //! Every continuous scale ships `invert`; every threshold scale ships
 //! `invert_extent`. `invert(scale(x)) ≈ x` is a property-tested invariant.
 
+pub mod join;
 pub mod scales;
