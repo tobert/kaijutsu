@@ -2,13 +2,13 @@
 //!
 //! Provider-agnostic types that flow from per-provider `Client::stream()`
 //! into the CRDT block writer in `kaijutsu-server`. Each per-provider
-//! client (currently `super::claude`, `super::gemini`) owns translation
-//! from kaijutsu's `Message` / `ContentBlock` into the provider's native
-//! wire shape and emits the events below.
+//! client (`super::claude`, `super::openai`, `super::deepseek`) owns
+//! translation from kaijutsu's `Message` / `ContentBlock` into the
+//! provider's native wire shape and emits the events below.
 //!
 //! ```text
 //! ┌──────────────────┐   ┌──────────────────┐
-//! │ claude::Client   │   │ gemini::Client   │   …
+//! │ claude::Client   │   │ openai::Client   │   …
 //! │   .stream(opts)  │   │   .stream(opts)  │
 //! └────────┬─────────┘   └────────┬─────────┘
 //!          │                      │
@@ -18,11 +18,6 @@
 //!          │   (CRDT block writer in server)  │
 //!          └──────────────────────────────────┘
 //! ```
-//!
-//! Phase 1: shapes are defined; provider `stream()` methods return a loud
-//! "not yet implemented" error (see `crates/kaijutsu-kernel/src/llm/claude/mod.rs`
-//! and `…/gemini/mod.rs`). Phase 2 lands the Claude wire implementation;
-//! Phase 3 lands Gemini.
 
 use serde::{Deserialize, Serialize};
 
@@ -271,7 +266,6 @@ impl Usage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UsageExtra {
     Claude(ClaudeUsageExtra),
-    Gemini(GeminiUsageExtra),
     /// Any OpenAI-compatible chat-completions provider (DeepSeek, a local
     /// lemonade/llama.cpp server, Ollama, OpenAI itself). DeepSeek populates
     /// the cache split + reasoning tokens; leaner servers leave them zero.
@@ -282,11 +276,6 @@ pub enum UsageExtra {
 pub struct ClaudeUsageExtra {
     pub cache_read_input_tokens: u64,
     pub cache_creation_input_tokens: u64,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GeminiUsageExtra {
-    pub cached_content_tokens: u64,
 }
 
 /// Usage extras for OpenAI-compatible chat-completions providers.

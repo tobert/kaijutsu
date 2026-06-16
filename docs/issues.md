@@ -129,7 +129,17 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   Fix: a `tokio::signal` SIGTERM handler that checkpoints before exit (needs the
   run loop to become interruptible). Forensics hygiene: tracing logs UTC,
   systemd speaks local — cite both zones when recording restart times.
-- **`KernelDb` connection pool:** Currently `Arc<parking_lot::Mutex<KernelDb>>` (`block_store.rs:74`). This bottleneck prevents utilizing SQLite's WAL mode for concurrent readers. Migrate to `r2d2` or `sqlx` to allow non-blocking reads during LLM streams and heavy writes. Note: SQLite serializes *writes* regardless of pooling, so the win is concurrent reads (and only with WAL enabled) — verify WAL before assuming a pool helps; narrowing lock scope may matter as much.
+- **`KernelDb` connection pool + god-table — DEFERRED ON PURPOSE (2026-06-16).**
+  Currently `Arc<parking_lot::Mutex<KernelDb>>` (`block_store.rs:74`); the file is
+  one ~20-table module and every write serializes on the one lock. Recognized
+  smell, **not being acted on**: the justifying pressure (measured write-contention
+  under concurrent contexts) isn't expected soon, so we revisit only when it's an
+  observed problem — do not pre-emptively refactor (annotated at the top of
+  `kernel_db.rs`). When it does come up: the single mutex prevents using WAL for
+  concurrent readers; migrating to `r2d2`/`sqlx` would allow non-blocking reads
+  during LLM streams. Note SQLite serializes *writes* regardless of pooling, so
+  the win is concurrent reads (WAL only) — verify WAL first; narrowing lock scope
+  may matter as much.
 - **Config CRDT ops:** Config backend needs DTE integration so changes replicate across peers.
 - **`blocks_ordered()` allocation churn + sort:** `block_store.rs:185-188` calls `order_key().to_string()` for *every block*, then `sort_by` on the strings — so it's O(N log N) **plus a String allocation per block per call**. It runs on per-frame hot paths (`kaijutsu-app/src/ui/card_stack/sync.rs:48`, `view/components.rs:163`), so the allocation churn is likely the bigger cost than the asymptotics. Fixes: compare `order_key` without stringifying, and/or cache the ordering and invalidate on block change. Add a secondary sorted index when scale demands.
 - **Latch state should persist with the context:** 
@@ -232,16 +242,32 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   the `models.toml [model_aliases]` entry to its concrete `provider/model`
   before storage (`resolve_context_config`, 2026-06-14), so the quoted form
   works end-to-end; only the bare-`local` lexer footgun remains.
-- **Local-model turn HANGS silently when given tools.** A small local model
-  (Gemma-4-E4B via lemonade) handed the full tool palette
-  (`[providers.lemonade.default_tools] type = "all"`) emits a thinking block and
-  then stalls — GPU goes cold, no `Completed`, no error, turn never terminates
-  (observed 2026-06-13). Lemonade itself is fine (direct stream completes in
-  <1s); the hang is in the new local-model + tool-call turn path. Counter to the
-  fail-loud stance — a stuck turn should time out / surface an error. Also: the
-  player loadout should not be `all` tools for a small model (the composer rc is
-  now tool-free); make per-provider/per-context `default_tools` the norm for
-  players, and add a turn-level watchdog so a wedged tool loop fails loudly.
+- **Local-model turn watchdog — mostly closed; two narrow gaps remain (re-triaged
+  2026-06-16).** The original report ("small local model + full tool palette emits
+  a thinking block then stalls — GPU cold, no `Completed`, no error, turn never
+  terminates", observed 2026-06-13) was addressed on two fronts, both verified in
+  code at HEAD (not re-reproduced):
+  - *Watchdog already exists* (landed `3fdcf79`, 2026-05-10 — a month **before** the
+    report). The turn loop has a dual-layer timeout: `llm_idle_timeout` (30s) wraps
+    **every** `stream.next_event()` (`llm_stream.rs:912`,`:944`) and
+    `llm_request_timeout` (300s) is the total cap (`:903`,`:934`); both emit
+    `StreamEvent::Error` → `TurnFlow::Failed`. Tool calls are individually capped at
+    `TOOL_TIMEOUT_SECS` 120s + interrupt propagation (`:1361`), and they run in a
+    per-tool loop (no unbounded collective). So the mid-turn cold-GPU stall the
+    report describes **should fail loud within 30s at HEAD**. `TimeoutPolicy` is
+    kernel-wide (`kaijutsu-types/src/timeout.rs`); per-model/per-context overrides
+    are the open knob if 30s/300s ever prove wrong for a slow local model.
+  - *The trigger was also removed* — the composer/player rc loadout is now tool-free
+    (see "Composer `kj` loadout — tool-free" under Hyoushigi), so small players no
+    longer get the full palette that provoked the stall.
+  - **Residual (small, genuinely unguarded):** (a) the `provider.stream()` start
+    `.await` (`llm_stream.rs:815`) has retry/backoff but **no explicit timeout** — a
+    provider that accepts the connection but never returns the response object leans
+    on reqwest's defaults; (b) pre-stream hydration / cache reads have no timeout, so
+    a wedge *before* the stream loop emits no terminal event. Both are off the
+    mid-turn path the report hit. Fix each with an explicit timeout + a regression
+    test that wedges the path and asserts a loud `TurnFlow::Failed`. Still worth:
+    make per-provider/per-context `default_tools` the norm so players never get `all`.
 - **P3 — external `mcp__kaijutsu__shell` `data` needs a persisted block field.**
   The *in-kernel* `builtin.shell` now carries kj's `.data` in its `structured`
   envelope (shipped 2026-06-14, `mcp/servers/shell.rs`), and `kj <cmd> --json`
@@ -702,14 +728,14 @@ local.rs:354`) — it opens the file but doesn't set the timestamp, yet mtime is
 load-bearing for `FileDocumentCache` staleness detection.
 
 **LLM providers:**
-- **Gemini is a dead stub** — `prompt`/`stream` return `Unavailable`, yet
-  `available_models()` advertises three uncallable models
-  (`kaijutsu-kernel/src/llm/gemini/mod.rs:64`). A config pointing at Gemini fails
-  only at runtime. The `unrig` effort intended a real Gemini provider; finishing
-  it (or removing the variant + its advertised models) is the open work.
-- Stale doc: `Provider::prompt_with_system` comment still says "Phase 1:
-  real-provider variants return Unavailable" (`llm/mod.rs:484`) — false for Claude
-  and OpenAI now.
+- **Gemini stub removed (2026-06-16).** The dead `Provider::Gemini` (returned
+  `Unavailable`, advertised uncallable models), its module, `UsageExtra::Gemini`,
+  and `gemini_from_env` were deleted. Remaining work when Gemini is actually
+  wanted: add a real provider, OR point the OpenAI-compatible core at Google's
+  OpenAI-shaped endpoint (likely zero new code). Tracked in `project_unrig`
+  auto-memory.
+  (The stale "Phase 1: real-provider variants return Unavailable" doc comments in
+  `llm/mod.rs` + `llm/stream.rs` were corrected in the same pass.)
 
 **`kj` single-source guarantee is manual** — `dispatch()` routing and
 `kj_command()` schema tree must be hand-kept in sync; a subcommand added to one

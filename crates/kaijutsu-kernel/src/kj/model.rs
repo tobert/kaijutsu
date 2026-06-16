@@ -246,7 +246,7 @@ mod tests {
 
     use crate::kj::test_helpers::*;
     use crate::llm::toml_config::ModelAlias;
-    use crate::llm::{Provider, ProviderConfig, claude, gemini};
+    use crate::llm::{Provider, ProviderConfig, claude, deepseek};
     use kaijutsu_types::PrincipalId;
 
     fn s(v: &str) -> String {
@@ -258,7 +258,7 @@ mod tests {
     async fn seed_registry(d: &crate::kj::KjDispatcher) {
         let mut reg = d.kernel().llm().write().await;
         reg.register("anthropic", Arc::new(Provider::Claude(claude::Client::new("fake"))));
-        reg.register("gemini", Arc::new(Provider::Gemini(gemini::Client::new("fake"))));
+        reg.register("deepseek", Arc::new(Provider::DeepSeek(deepseek::Client::new("fake"))));
         reg.set_default("anthropic");
         reg.set_default_model("claude-opus-4-8");
         reg.set_provider_configs(vec![
@@ -289,7 +289,7 @@ mod tests {
         assert!(result.is_ok(), "models failed: {}", result.message());
         let msg = result.message();
         assert!(msg.contains("anthropic"), "lists anthropic provider: {msg}");
-        assert!(msg.contains("gemini"), "lists gemini provider: {msg}");
+        assert!(msg.contains("deepseek"), "lists deepseek provider: {msg}");
         assert!(msg.contains("fast"), "lists the alias: {msg}");
         assert!(
             msg.contains("default provider"),

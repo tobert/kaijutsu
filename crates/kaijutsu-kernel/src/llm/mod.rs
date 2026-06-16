@@ -1,6 +1,6 @@
 //! LLM provider abstraction for kaijutsu kernels.
 //!
-//! Per-provider modules (`claude`, `gemini`) own their native wire shapes
+//! Per-provider modules (`claude`, `openai`, `deepseek`) own their native wire shapes
 //! and translate kaijutsu's `Message` / `ContentBlock` into provider
 //! requests. Dispatch is an explicit `match Provider` over a closed-set
 //! enum — adding a provider means a new variant plus a new arm at each
@@ -18,19 +18,18 @@
 //!           │                │                    │
 //!           ▼                ▼                    ▼
 //!     ┌──────────────────────────────────────────────────┐
-//!     │  llm/claude/   llm/gemini/   (more later)        │
+//!     │  llm/claude/  llm/openai/  llm/deepseek/          │
 //!     │   Client::stream(opts, messages) → StreamEvent…  │
 //!     └──────────────────────────────────────────────────┘
 //! ```
 //!
-//! Phase 1: contract + skeleton. Provider `Client::stream()` returns a
-//! loud "not yet implemented" error. Phase 2 lands Claude; Phase 3
-//! Gemini.
+//! Claude, the OpenAI-compatible core, and DeepSeek are live. Gemini is
+//! not implemented — add a real provider (or point the OpenAI-compatible
+//! core at Google's OpenAI-shaped endpoint) when it's needed.
 
 pub mod claude;
 pub mod config;
 pub mod deepseek;
-pub mod gemini;
 mod hydrate;
 pub mod image_cache;
 pub mod mailbox;
@@ -49,8 +48,8 @@ pub use toml_config::{
     load_llm_config_toml, load_models_config_toml,
 };
 pub use stream::{
-    BuildOpts, CacheTarget, CacheTtl, ClaudeUsageExtra, FinishReason, GeminiUsageExtra,
-    OpenAiCompatUsageExtra, StreamError, StreamEvent, UsageExtra,
+    BuildOpts, CacheTarget, CacheTtl, ClaudeUsageExtra, FinishReason, OpenAiCompatUsageExtra,
+    StreamError, StreamEvent, UsageExtra,
 };
 
 use serde::{Deserialize, Serialize};
@@ -353,8 +352,6 @@ pub type LlmResult<T> = Result<T, LlmError>;
 pub enum Provider {
     /// Anthropic Claude (see `llm/claude/`).
     Claude(claude::Client),
-    /// Google Gemini (see `llm/gemini/`).
-    Gemini(gemini::Client),
     /// DeepSeek — a preset over the OpenAI-compatible client, with required
     /// auth + the V4 reasoning-echo quirk (see `llm/deepseek/`).
     DeepSeek(deepseek::Client),
@@ -371,7 +368,7 @@ impl Provider {
     /// Create a provider from configuration.
     ///
     /// The `provider_type` string maps to the enum variant: `anthropic`/
-    /// `claude`, `gemini`, `deepseek`, and the OpenAI-compatible family
+    /// `claude`, `deepseek`, and the OpenAI-compatible family
     /// (`openai`, `ollama`, `lemonade`, `local`). Unknown types return
     /// [`LlmError::Unavailable`] rather than silently falling back —
     /// surfacing the mismatch is the point.
@@ -386,16 +383,6 @@ impl Provider {
                     client = client.with_base_url(url);
                 }
                 Ok(Self::Claude(client))
-            }
-            "gemini" => {
-                let api_key = config
-                    .resolve_api_key()
-                    .ok_or_else(|| LlmError::AuthError("No API key for Gemini".into()))?;
-                let mut client = gemini::Client::new(api_key);
-                if let Some(ref url) = config.base_url {
-                    client = client.with_base_url(url);
-                }
-                Ok(Self::Gemini(client))
             }
             "deepseek" => {
                 let api_key = config
@@ -433,7 +420,7 @@ impl Provider {
             }
             other => Err(LlmError::Unavailable(format!(
                 "Unknown or unsupported provider type: {other} \
-                 (supported: anthropic, gemini, deepseek, openai, ollama, lemonade, local)"
+                 (supported: anthropic, deepseek, openai, ollama, lemonade, local)"
             ))),
         }
     }
@@ -441,12 +428,6 @@ impl Provider {
     /// Create a Claude provider from `ANTHROPIC_API_KEY`.
     pub fn anthropic_from_env() -> LlmResult<Self> {
         let config = ProviderConfig::new("anthropic").with_api_key_env("ANTHROPIC_API_KEY");
-        Self::from_config(&config)
-    }
-
-    /// Create a Gemini provider from `GEMINI_API_KEY`.
-    pub fn gemini_from_env() -> LlmResult<Self> {
-        let config = ProviderConfig::new("gemini").with_api_key_env("GEMINI_API_KEY");
         Self::from_config(&config)
     }
 
@@ -465,7 +446,6 @@ impl Provider {
     pub fn name(&self) -> &str {
         match self {
             Self::Claude(_) => "anthropic",
-            Self::Gemini(_) => "gemini",
             Self::DeepSeek(_) => "deepseek",
             Self::OpenAi(c) => c.provider_name(),
             #[cfg(any(test, feature = "test-mock"))]
@@ -481,9 +461,8 @@ impl Provider {
 
     /// One-shot prompt with optional system preamble.
     ///
-    /// Phase 1: real-provider variants return [`LlmError::Unavailable`].
-    /// Mock returns its canned response (used by `KjDispatcher::summarize`
-    /// in tests).
+    /// Claude / DeepSeek / OpenAi hit their provider; Mock returns its
+    /// canned response (used by `KjDispatcher::summarize` in tests).
     #[tracing::instrument(skip(self, system, prompt), fields(llm.model = %model, llm.provider = self.name()))]
     pub async fn prompt_with_system(
         &self,
@@ -493,7 +472,6 @@ impl Provider {
     ) -> LlmResult<String> {
         match self {
             Self::Claude(client) => client.prompt(model, system, prompt).await,
-            Self::Gemini(client) => client.prompt(model, system, prompt).await,
             Self::DeepSeek(client) => client.prompt(model, system, prompt).await,
             Self::OpenAi(client) => client.prompt(model, system, prompt).await,
             #[cfg(any(test, feature = "test-mock"))]
@@ -503,8 +481,8 @@ impl Provider {
 
     /// Start a streaming completion.
     ///
-    /// Phase 1: real-provider variants return [`LlmError::Unavailable`].
-    /// Mock replays its canned response as a well-formed text stream
+    /// Claude / DeepSeek / OpenAi stream from their provider; Mock
+    /// replays its canned response as a well-formed text stream
     /// (`TextStart → TextDelta → TextEnd → Done`) so tests can exercise the
     /// full streaming turn — including the autonomous fork-and-act path —
     /// without a live provider.
@@ -518,10 +496,6 @@ impl Provider {
             Self::Claude(client) => {
                 let stream = client.stream(opts, messages).await?;
                 Ok(ProviderStream::Claude(stream))
-            }
-            Self::Gemini(client) => {
-                let stream = client.stream(opts, messages).await?;
-                Ok(ProviderStream::Gemini(stream))
             }
             // DeepSeek delegates to the OpenAI-compatible client, so both
             // yield an `openai::Stream` under the one `ProviderStream::OpenAi`.
@@ -555,7 +529,6 @@ impl Provider {
     pub fn available_models(&self) -> Vec<&'static str> {
         match self {
             Self::Claude(c) => c.available_models(),
-            Self::Gemini(c) => c.available_models(),
             Self::DeepSeek(c) => c.available_models(),
             Self::OpenAi(c) => c.available_models(),
             #[cfg(any(test, feature = "test-mock"))]
@@ -571,7 +544,6 @@ impl Provider {
 /// Each call dispatches with an explicit `match` — no trait object.
 pub enum ProviderStream {
     Claude(claude::Stream),
-    Gemini(gemini::Stream),
     /// Every OpenAI-compatible provider (DeepSeek and the generic `OpenAi`
     /// variant) streams through the one `openai::Stream`.
     OpenAi(openai::Stream),
@@ -587,7 +559,6 @@ impl ProviderStream {
     pub async fn next_event(&mut self) -> Option<StreamEvent> {
         match self {
             Self::Claude(s) => s.next_event().await,
-            Self::Gemini(s) => s.next_event().await,
             Self::OpenAi(s) => s.next_event().await,
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(events) => events.pop_front(),
@@ -598,7 +569,6 @@ impl ProviderStream {
     pub fn cancel(&self) {
         match self {
             Self::Claude(s) => s.cancel(),
-            Self::Gemini(s) => s.cancel(),
             Self::OpenAi(s) => s.cancel(),
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(_) => {}
@@ -991,8 +961,8 @@ mod tests {
             "anthropic"
         );
         assert_eq!(
-            Provider::Gemini(gemini::Client::new("fake")).name(),
-            "gemini"
+            Provider::DeepSeek(deepseek::Client::new("fake")).name(),
+            "deepseek"
         );
     }
 

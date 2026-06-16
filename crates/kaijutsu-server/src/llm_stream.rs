@@ -1131,8 +1131,7 @@ async fn process_llm_stream(
                     // Map the provider-specific usage extra into the shared
                     // TokenCounts shape. DeepSeek reports an automatic-cache
                     // hit/miss split + reasoning tokens; Anthropic reports
-                    // cache read/creation. Gemini's cached-content tokens
-                    // land on cache_read too. Unknown / absent → zeros.
+                    // cache read/creation. Unknown / absent → zeros.
                     use kaijutsu_kernel::llm::UsageExtra;
                     let (cache_read, cache_write, reasoning) = match &extra {
                         Some(UsageExtra::OpenAiCompat(d)) => {
@@ -1143,7 +1142,6 @@ async fn process_llm_stream(
                             c.cache_creation_input_tokens,
                             0,
                         ),
-                        Some(UsageExtra::Gemini(g)) => (g.cached_content_tokens, 0, 0),
                         None => (0, 0, 0),
                     };
 

@@ -4,6 +4,17 @@
 //! BLOB-encoded typed IDs, in-memory constructor for tests.
 //!
 //! All timestamps are Unix milliseconds (matching `now_millis()`).
+//!
+//! ## Known shape, deferred on purpose
+//!
+//! This file is large (~20 tables, many methods) and the live handle is a single
+//! `Arc<Mutex<KernelDb>>`, so every write serializes on one lock. That is a
+//! recognized "god-table + single-mutex" smell — and we are **deliberately not
+//! splitting it yet**. The pressure that would justify the churn (measured
+//! write-contention under concurrent contexts) is not expected any time soon;
+//! revisit only when it's an actual, observed problem. Tracked, with the
+//! connection-pool angle, in `docs/issues.md` (Persistence & Sync) and
+//! `docs/architecture/kernel.md`. Don't pre-emptively refactor.
 
 use std::collections::HashSet;
 use std::path::Path;
