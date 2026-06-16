@@ -1051,7 +1051,6 @@ impl KernelHandle {
                 crate::kaijutsu_capnp::DriftKind::Pull => DriftKind::Pull,
                 crate::kaijutsu_capnp::DriftKind::Merge => DriftKind::Merge,
                 crate::kaijutsu_capnp::DriftKind::Distill => DriftKind::Distill,
-                crate::kaijutsu_capnp::DriftKind::Commit => DriftKind::Commit,
                 crate::kaijutsu_capnp::DriftKind::Notification => DriftKind::Notification,
                 crate::kaijutsu_capnp::DriftKind::Fork => DriftKind::Fork,
             };
@@ -2132,7 +2131,6 @@ pub(crate) fn parse_block_snapshot(
             crate::kaijutsu_capnp::DriftKind::Pull => DriftKind::Pull,
             crate::kaijutsu_capnp::DriftKind::Merge => DriftKind::Merge,
             crate::kaijutsu_capnp::DriftKind::Distill => DriftKind::Distill,
-            crate::kaijutsu_capnp::DriftKind::Commit => DriftKind::Commit,
             crate::kaijutsu_capnp::DriftKind::Notification => DriftKind::Notification,
             crate::kaijutsu_capnp::DriftKind::Fork => DriftKind::Fork,
         };

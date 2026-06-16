@@ -6650,7 +6650,6 @@ fn drift_kind_to_capnp(dk: kaijutsu_crdt::DriftKind) -> crate::kaijutsu_capnp::D
         kaijutsu_crdt::DriftKind::Pull => crate::kaijutsu_capnp::DriftKind::Pull,
         kaijutsu_crdt::DriftKind::Merge => crate::kaijutsu_capnp::DriftKind::Merge,
         kaijutsu_crdt::DriftKind::Distill => crate::kaijutsu_capnp::DriftKind::Distill,
-        kaijutsu_crdt::DriftKind::Commit => crate::kaijutsu_capnp::DriftKind::Commit,
         kaijutsu_crdt::DriftKind::Notification => crate::kaijutsu_capnp::DriftKind::Notification,
         kaijutsu_crdt::DriftKind::Fork => crate::kaijutsu_capnp::DriftKind::Fork,
     }

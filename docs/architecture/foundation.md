@@ -161,7 +161,7 @@ doc per tracked file), **Text** (static markdown), **Config** (theme/models TOML
   violation.
 - `BlockSnapshot` is a 30+-field flat struct with no discriminated union; invalid
   field combinations aren't type-prevented on deserialize.
-- Vestigial/dead: `is_error` flagged "legacy" (`block.rs:1237`), `DriftKind::Commit`
-  "no live producer" (`block.rs:1122`), `DriftKind::Notification` vs
-  `BlockKind::Notification` name collision, the `ephemeral` dual-use deferred to
-  "batch 2".
+- Vestigial/dead: `is_error` flagged "legacy" (`block.rs:1237`),
+  `DriftKind::Notification` vs `BlockKind::Notification` name collision, the
+  `ephemeral` dual-use deferred to "batch 2". (`DriftKind::Commit`, the dead git
+  variant, was removed 2026-06-16 — including from the capnp wire enum.)

@@ -58,7 +58,7 @@ enum Status {
 # Block content type — 9 variants covering what a block *is*.
 # Mechanism metadata lives in companion enums:
 # - ToolKind on ToolCall/ToolResult: which execution engine (Shell, Mcp, Builtin)
-# - DriftKind on Drift: how content transferred (Push, Pull, Merge, Distill, Commit)
+# - DriftKind on Drift: how content transferred (Push, Pull, Merge, Distill)
 # - ErrorPayload on Error: structured diagnostics
 # - NotificationPayload on Notification: broker-emitted tool/log events
 # - ResourcePayload on Resource: MCP resource contents
@@ -122,9 +122,11 @@ enum DriftKind {
   pull @1;          # User pulled/requested content
   merge @2;         # Context merge (fork coming home)
   distill @3;       # LLM-summarized before transfer
-  commit @4;        # Git commit recorded as conversation provenance
-  notification @5;  # External notification (MCP resource updates, system events)
-  fork @6;          # Fork marker (ephemeral, summarizes the fork operation)
+  notification @4;  # External notification (MCP resource updates, system events)
+  fork @5;          # Fork marker (ephemeral, summarizes the fork operation)
+  # NB: `commit @4` (git provenance) was removed 2026-06-16; notification/fork
+  # renumbered down. Wire-only change (capnp is transient; persistence is CBOR
+  # by name) but requires server+app+mcp rebuilt together.
 }
 
 # Flat block snapshot — all fields present, some unused depending on kind.
@@ -164,7 +166,7 @@ struct BlockSnapshot {
   # Drift-specific fields (cross-context transfer)
   sourceContext @16 :Data;    # 16-byte ContextId of originating context
   sourceModel @17 :Text;      # Model that produced this content
-  driftKind @18 :DriftKind;   # How this block arrived (push/pull/merge/distill/commit)
+  driftKind @18 :DriftKind;   # How this block arrived (push/pull/merge/distill)
   hasDriftKind @19 :Bool;     # True if driftKind is set (enum default 0=push is valid)
 
   # Tool mechanism metadata (ToolCall / ToolResult)

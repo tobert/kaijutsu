@@ -1117,9 +1117,6 @@ pub enum DriftKind {
     Merge,
     /// LLM-summarized before transfer.
     Distill,
-    /// Git commit recorded as conversation provenance.
-    /// Reserved — no live producer after git backend deletion (commit 0ec3210).
-    Commit,
     /// External notification injected into the conversation.
     /// Used for MCP resource updates, system events, etc.
     Notification,
@@ -1142,7 +1139,6 @@ impl DriftKind {
             DriftKind::Pull => "pull",
             DriftKind::Merge => "merge",
             DriftKind::Distill => "distill",
-            DriftKind::Commit => "commit",
             DriftKind::Notification => "notification",
             DriftKind::Fork => "fork",
         }
@@ -2694,7 +2690,8 @@ mod tests {
         assert_eq!(DriftKind::from_str("pull"), Some(DriftKind::Pull));
         assert_eq!(DriftKind::from_str("merge"), Some(DriftKind::Merge));
         assert_eq!(DriftKind::from_str("distill"), Some(DriftKind::Distill));
-        assert_eq!(DriftKind::from_str("commit"), Some(DriftKind::Commit));
+        // `commit` was removed (git provenance) — no longer a valid kind.
+        assert_eq!(DriftKind::from_str("commit"), None);
         assert_eq!(DriftKind::from_str("PUSH"), Some(DriftKind::Push));
         assert_eq!(DriftKind::from_str("invalid"), None);
     }

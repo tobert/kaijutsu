@@ -135,8 +135,6 @@ pub struct Theme {
     pub block_drift_pull: Color,
     /// Drift merge block text color (purple — structural)
     pub block_drift_merge: Color,
-    /// Drift commit block text color (green — like git)
-    pub block_drift_commit: Color,
     /// Notification block text color (muted cyan — broker tool/log events)
     pub block_notification: Color,
     /// Resource block text color (muted teal — MCP resource read-through)
@@ -440,7 +438,6 @@ impl Default for Theme {
             block_drift_push: Color::srgb(0.490, 0.812, 1.00), // #7dcfff cyan
             block_drift_pull: Color::srgb(0.478, 0.635, 0.969), // #7aa2f7 blue
             block_drift_merge: Color::srgb(0.733, 0.604, 0.969), // #bb9af7 purple
-            block_drift_commit: Color::srgb(0.620, 0.808, 0.416), // #9ece6a green
             block_notification: Color::srgb(0.490, 0.694, 0.753), // #7db1c0 muted cyan
             block_resource: Color::srgb(0.447, 0.757, 0.667), // #72c1aa muted teal
 

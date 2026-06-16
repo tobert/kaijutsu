@@ -55,7 +55,6 @@ pub fn block_color(block: &BlockSnapshot, theme: &Theme) -> bevy::prelude::Color
             Some(DriftKind::Push) => theme.block_drift_push,
             Some(DriftKind::Pull) | Some(DriftKind::Distill) => theme.block_drift_pull,
             Some(DriftKind::Merge) => theme.block_drift_merge,
-            Some(DriftKind::Commit) => theme.block_drift_commit,
             Some(DriftKind::Notification) => theme.block_drift_pull,
             Some(DriftKind::Fork) => theme.block_drift_merge,
             None => theme.fg_dim,
@@ -104,13 +103,6 @@ fn format_drift_block(block: &BlockSnapshot, local_ctx: Option<ContextId>) -> St
             format!(
                 "\u{21c4} merged from {} ({})\n{}",
                 ctx_label, model, block.content
-            )
-        }
-        Some(DriftKind::Commit) => {
-            format!(
-                "# {}  {}",
-                ctx_label,
-                block.content.lines().next().unwrap_or("")
             )
         }
         Some(DriftKind::Notification) => {
