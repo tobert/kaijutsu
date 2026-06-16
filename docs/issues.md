@@ -653,3 +653,116 @@ the *remaining* findings, triaged.
   e4c8417). Teach `contrib/kaijutsu-runner.sh`/`kj rebuild` to rebuild +
   restart all three, or at least print a loud reminder when
   `kaijutsu.capnp` changed.
+
+---
+
+## Architecture mapping pass — 2026-06-16
+
+New observations from the crate-by-crate architecture sweep (see
+`docs/architecture/`). Not fixed; recorded for later. Items that confirm an
+existing entry are marked *(confirms above)*.
+
+**Silent fallbacks (violate the "crash over confuse" stance):**
+- `Kernel::list_tool_defs_via_broker` returns `Vec::new()` on *any* broker error
+  (`kaijutsu-kernel/src/kernel.rs:467`) — a broken binding silently presents the
+  LLM a tool-less context, no log/trace.
+- `dispatch_tool_via_broker` does `broker.binding(...).unwrap_or_default()`
+  (`kernel.rs:346`) — binding-fetch failure silently becomes deny-all; surfaces
+  later as a confusing `ToolNotFound`.
+- `MountBackend::read` falls through to raw on-disk content on *any*
+  `FileDocumentCache::read_content` error, not just "missing/binary"
+  (`kaijutsu-kernel/src/runtime/mount_backend.rs:267`) — a CRDT error could serve
+  stale bytes.
+- Additive `ALTER TABLE` migrations swallow SQL errors with `let _ =`
+  (`kaijutsu-kernel/src/kernel_db.rs:873`) — a real failure surfaces as a
+  confusing read-time error later.
+
+**CRDT data model:**
+- **Dual storage impls.** `BlockStore` (target) and `BlockDocument` (legacy) are
+  both `pub` and in use; the legacy path returns newer fields
+  (`ephemeral`/`stderr`/`signature`/`track`) as hardcoded `None`/`false`
+  (`kaijutsu-crdt/src/document.rs:482`) and retains the duplicate-block seq bug
+  fixed in `BlockStore` (`document.rs:892` vs `block_store.rs:320`). Pick a
+  migration deadline.
+- `calc_order_key` calls `block_ids_ordered()` (O(N) sort) on **every** insert
+  (`kaijutsu-crdt/src/block_store.rs:390`); the bench exposing it is `#[ignore]`d.
+- Tombstones aren't a first-class `BlockSnapshot` field — they ride a side
+  `deleted_blocks` list re-applied by hand (`block_store.rs:1637`).
+- `StoreSnapshot` has a breaking-format note with no migration path ("delete
+  existing databases when upgrading", `block_store.rs:1680`).
+
+**UTF-8 offset hazard:**
+- `EditEngine` passes **byte** offsets/lengths to `block_store.edit_text`
+  (`kaijutsu-kernel/src/file_tools/edit.rs:132`) while `FileDocumentCache` is
+  careful to use **char** counts (`cache.rs:276`). Multi-byte content can corrupt
+  the CRDT splice. Audit `edit_text`'s parameter semantics and unify.
+
+**`LocalBackend::setattr` mtime is a no-op** (`kaijutsu-kernel/src/vfs/backends/
+local.rs:354`) — it opens the file but doesn't set the timestamp, yet mtime is
+load-bearing for `FileDocumentCache` staleness detection.
+
+**LLM providers:**
+- **Gemini is a dead stub** — `prompt`/`stream` return `Unavailable`, yet
+  `available_models()` advertises three uncallable models
+  (`kaijutsu-kernel/src/llm/gemini/mod.rs:64`). A config pointing at Gemini fails
+  only at runtime. The `unrig` effort intended a real Gemini provider; finishing
+  it (or removing the variant + its advertised models) is the open work.
+- Stale doc: `Provider::prompt_with_system` comment still says "Phase 1:
+  real-provider variants return Unavailable" (`llm/mod.rs:484`) — false for Claude
+  and OpenAI now.
+
+**`kj` single-source guarantee is manual** — `dispatch()` routing and
+`kj_command()` schema tree must be hand-kept in sync; a subcommand added to one
+but not the other is unreflectable (`kaijutsu-kernel/src/kj/mod.rs:589`).
+
+**Types-crate layering** — `ThemeData` (~60 visual fields + `include_str!` of
+`assets/defaults/theme.toml`) lives in the foundational `kaijutsu-types`
+(`theme.rs:59`). Belongs in a UI/config crate.
+
+**`kaijutsu-index`:**
+- `rebuild()` is a TODO stub (`lib.rs:214`) — evicted HNSW slots accumulate
+  forever.
+- Metadata lock held across ONNX `embed()` (`lib.rs:160`) serializes all
+  `index_context` calls.
+- `ort` uses `download-binaries` — fetches ONNX Runtime at build time, breaks
+  air-gapped builds.
+
+**`kaijutsu-cas`** — no refcounting/GC (`remove` is unconditional,
+`store.rs:330`); object+metadata write isn't atomic (crash between leaves a
+metadataless blob, `store.rs:254`).
+
+**`kaijutsu-telemetry`** — the Bevy path leaks a `tokio::runtime::Runtime` and
+upcasts its `EnterGuard` to `'static` (`otel.rs:28`); soundness rests on the
+leaked runtime outliving the guard.
+
+**`kaijutsu-client`:**
+- Backoff reset bug — `finish_closing` reads `self.state` *after* `mem::replace`
+  moved it to `Idle` (`actor.rs:1451`), so the attempt counter isn't preserved
+  through `Closing → Cooldown`; backoff always resets to 1 s after a post-connect
+  failure.
+- `is_disconnect_error` matches on the capnp error `Display` text
+  (`actor.rs:1214`) — fragile; a capnp formatting change would stop triggering
+  reconnect. Prefer a typed `ErrorKind::Disconnected` match.
+- Peer-reattach residual: initial `attach_peer` isn't remembered until the first
+  *successful* user call, so a kernel restart before that leaves the peer
+  un-reattached (`actor.rs:1933`). *(extends `tech_debt_peer_reattach_on_reconnect`)*
+
+**App (`kaijutsu-app`):**
+- Triple Chat/Shell discriminator — `FocusArea` + `ActiveSurface` +
+  `InputOverlay.mode` (the last unread by submit); collapse to
+  `FocusArea::Compose(ActiveSurface)` (`input/focus.rs:71`,`:116`,
+  `view/components.rs:285`).
+- 77 `#[allow(dead_code)]` suppressors for future-phase API — prefer
+  `#[cfg(feature)]` so dead-code discovery still works.
+
+**`kaijutsu-abc`** — `to_abc()` round-trip silently drops
+`InlineField`/`Decoration`/`VoiceSwitch` (`lib.rs:406`); tuplet writer omits the
+optional `:r` count (`lib.rs:366`).
+
+**Server `unwrap()`** — `create_shared_kernel` panics on workspace-insert failure
+(`rpc.rs:1092`) instead of `?`-propagating like its neighbors.
+
+**Cap'n Proto evolution is comment-only** — no `@version`; removed-method ordinals
+are renumbered/reused with a "safe because all clients updated" comment
+(`kaijutsu.capnp:921`,`:933`,`:1169`). *(confirms above — fragile with 7+ dependent
+crates)*
