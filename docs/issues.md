@@ -121,6 +121,18 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ## Persistence & Sync
 
+- **CRDT-owned config/rc — direction LOCKED 2026-06-16 (design: `docs/config-crdt-ownership.md`).**
+  CRDT becomes the sole owner of config + rc; embedded Rust (`assets/defaults/`,
+  `include_dir!`/`include_str!`) seeds it once — no host-disk write-through/reload.
+  This **deletes** the dual-ownership silent-fallback cluster for the rc/config
+  mounts *by construction* — supersedes, for those mounts, the `MountBackend::read`
+  stale-bytes serve, the `append` wipe, the `LocalBackend::setattr` mtime no-op, and
+  the stale-rc-seed entries elsewhere in this file. Seam = the mount table;
+  `/v/docs`/`KaijutsuFilesystem` is the existing pattern. Slices: (1) unified
+  CRDT-config backend (`UUIDv5(path)→DocKind::Config` + a path manifest for
+  `readdir`) + migrate rc; (2) config TOMLs drop the `ConfigCrdtBackend` debounced
+  host flush. Editing = `kj rc set` (the `$EDITOR`-on-host-file path retires;
+  update CLAUDE.md). Cutover = hard reset. Deferred: CRDT scratch mount. No code yet.
 - **Graceful-shutdown WAL checkpoint on SIGTERM:** `SharedKernelState::drop`
   checkpoints only on clean exit, but the server `run()` loop never returns and
   dies on SIGKILL/SIGTERM without unwinding, so systemd `stop` skips it.
