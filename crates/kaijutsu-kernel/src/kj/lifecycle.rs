@@ -36,8 +36,6 @@ use kaijutsu_types::{
     BlockKind, ContentType, ContextId, DriftKind, ForkKind, PrincipalId, Role, Status,
 };
 
-use crate::file_tools::CacheReadError;
-
 use super::{KjCaller, KjDispatcher};
 
 /// One rc script resolved from the `/etc/rc` file tree for a single
@@ -279,28 +277,19 @@ impl KjDispatcher {
         // `{sort_key}-{name}.{ext}`, so S00 < S10 and ties break on name.
         names.sort();
 
-        let cache = self.kernel().file_cache(self.block_store());
         let mut scripts = Vec::with_capacity(names.len());
         for name in names {
             let path = format!("{dir}/{name}");
-            // A Backend error here means the CRDT store is broken — boot WITHOUT
-            // the stance is worse than failing loud (stance = the model's ethical
-            // posture). A NotCached result is structurally impossible here: we
-            // just enumerated this file from the VFS, so it exists and is text
-            // (only .kai/.md files are collected). Treat NotCached as a Backend
-            // error too — something has gone wrong if a just-enumerated rc script
-            // can't be read.
-            let content = match cache.try_read_content(&path).await {
-                Ok(c) => c,
-                Err(CacheReadError::Backend(e)) => {
-                    return Err(format!("rc lifecycle: read {path}: {e}"));
-                }
-                Err(CacheReadError::NotCached) => {
-                    return Err(format!(
-                        "rc lifecycle: read {path}: file not accessible (binary or vanished after directory listing)"
-                    ));
-                }
+            // Read straight from the CRDT-native rc backend (no FileDocumentCache
+            // mirror). Any read failure on a file we just enumerated is
+            // corruption — boot WITHOUT the stance is worse than failing loud
+            // (stance = the model's ethical posture), so this stays fatal.
+            let bytes = match vfs.read_all(std::path::Path::new(&path)).await {
+                Ok(b) => b,
+                Err(e) => return Err(format!("rc lifecycle: read {path}: {e}")),
             };
+            let content = String::from_utf8(bytes)
+                .map_err(|e| format!("rc lifecycle: read {path}: not valid UTF-8: {e}"))?;
             let (sort_key, extension) = parse_rc_filename(&name);
             scripts.push(RcScript {
                 path,

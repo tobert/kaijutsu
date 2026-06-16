@@ -15,8 +15,6 @@ use kaijutsu_types::ContentType;
 use regex::Regex;
 use std::sync::OnceLock;
 
-use crate::file_tools::CacheReadError;
-
 use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
 
 #[derive(Parser, Debug)]
@@ -176,14 +174,6 @@ impl KjDispatcher {
         }
     }
 
-    /// The shared CRDT file cache that backs `/etc/rc`. `kj rc` writes go
-    /// through this rather than the gated `builtin.file:write` tool; the
-    /// rc-write capability is enforced up front in [`Self::dispatch_rc`] so the
-    /// two write paths (`kj rc` and `builtin.file`) share the same gate.
-    fn rc_cache(&self) -> std::sync::Arc<crate::file_tools::FileDocumentCache> {
-        self.kernel().file_cache(self.block_store())
-    }
-
     async fn rc_add(&self, path: &str, content: Option<&str>, _caller: &KjCaller) -> KjResult {
         let parts = match parse_rc_path(path) {
             Ok(p) => p,
@@ -200,12 +190,11 @@ impl KjDispatcher {
             }
         };
 
-        let cache = self.rc_cache();
         // `add` must not clobber an existing script — use `edit` for that.
-        if cache.exists(path).await {
+        if self.rc_exists(path).await {
             return KjResult::Err(format!("kj rc add: '{path}' already exists (use edit)"));
         }
-        if let Err(e) = self.write_rc_file(&cache, path, content).await {
+        if let Err(e) = self.write_rc_file(path, content).await {
             return KjResult::Err(format!("kj rc add: {e}"));
         }
         KjResult::ok(format!(
@@ -214,18 +203,48 @@ impl KjDispatcher {
         ))
     }
 
-    /// Write `content` to the rc file at `path` through the CRDT cache and
-    /// flush it to disk, so dispatch (which reads through the same cache)
-    /// and external tools (`vim`, readdir) all see the new bytes.
-    async fn write_rc_file(
-        &self,
-        cache: &crate::file_tools::FileDocumentCache,
-        path: &str,
-        content: &str,
-    ) -> Result<(), String> {
-        cache.create_or_replace(path, content).await?;
-        cache.mark_dirty(path);
-        cache.flush_one(path).await
+    /// Write `content` to the rc script at `path` straight through the VFS to
+    /// the CRDT-native `/etc/rc` backend. There is no host file and no
+    /// FileDocumentCache mirror: the CRDT document IS the script. Dispatch
+    /// (`load_rc_scripts`) reads the same document through the same VFS.
+    async fn write_rc_file(&self, path: &str, content: &str) -> Result<(), String> {
+        use crate::vfs::VfsOps;
+        self.kernel()
+            .vfs()
+            .write_all(std::path::Path::new(path), content.as_bytes())
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Whether an rc script exists at `path` (a file, not a virtual directory).
+    async fn rc_exists(&self, path: &str) -> bool {
+        use crate::vfs::VfsOps;
+        self.kernel()
+            .vfs()
+            .getattr(std::path::Path::new(path))
+            .await
+            .map(|a| a.is_file())
+            .unwrap_or(false)
+    }
+
+    /// Read an rc script's content from the VFS. `Ok(None)` for an absent
+    /// script (NotFound / no mount); `Err` for a real backend failure or
+    /// non-UTF-8 content — never masked as "not found".
+    async fn read_rc_content(&self, path: &str) -> Result<Option<String>, String> {
+        use crate::vfs::{VfsError, VfsOps};
+        let bytes = match self
+            .kernel()
+            .vfs()
+            .read_all(std::path::Path::new(path))
+            .await
+        {
+            Ok(b) => b,
+            Err(VfsError::NotFound(_)) | Err(VfsError::NoMountPoint(_)) => return Ok(None),
+            Err(e) => return Err(e.to_string()),
+        };
+        String::from_utf8(bytes)
+            .map(Some)
+            .map_err(|e| format!("not valid UTF-8: {e}"))
     }
 
     async fn rc_list(&self, type_filter: Option<&str>, verb_filter: Option<&str>) -> KjResult {
@@ -294,18 +313,13 @@ impl KjDispatcher {
             Ok(p) => p,
             Err(e) => return KjResult::Err(format!("kj rc show: {e}")),
         };
-        let cache = self.rc_cache();
-        // NotCached = script absent or binary — surface as "not found".
-        // Backend = real CRDT error — surface the detail so the user can
-        // diagnose a broken store rather than getting a misleading "not found".
-        let content = match cache.try_read_content(path).await {
-            Ok(c) => c,
-            Err(CacheReadError::NotCached) => {
-                return KjResult::Err(format!("kj rc show: '{path}' not found"))
-            }
-            Err(CacheReadError::Backend(e)) => {
-                return KjResult::Err(format!("kj rc show: '{path}': {e}"))
-            }
+        // Read straight from the CRDT-native backend. NotFound = absent script;
+        // any other VfsError is a real backend failure (surfaced, not masked as
+        // "not found").
+        let content = match self.read_rc_content(path).await {
+            Ok(Some(c)) => c,
+            Ok(None) => return KjResult::Err(format!("kj rc show: '{path}' not found")),
+            Err(e) => return KjResult::Err(format!("kj rc show: '{path}': {e}")),
         };
 
         // Metadata is derived from the canonical path; provenance lives in
@@ -356,11 +370,10 @@ impl KjDispatcher {
             }
         };
 
-        let cache = self.rc_cache();
-        if !cache.exists(path).await {
+        if !self.rc_exists(path).await {
             return KjResult::Err(format!("kj rc edit: '{path}' not found"));
         }
-        if let Err(e) = self.write_rc_file(&cache, path, content).await {
+        if let Err(e) = self.write_rc_file(path, content).await {
             return KjResult::Err(format!("kj rc edit: {e}"));
         }
         KjResult::ok(format!("edited rc script '{path}' (content)"))
@@ -380,8 +393,7 @@ impl KjDispatcher {
                  only paths shipped under assets/defaults/rc can be reset"
             ));
         };
-        let cache = self.rc_cache();
-        if let Err(e) = self.write_rc_file(&cache, path, body).await {
+        if let Err(e) = self.write_rc_file(path, body).await {
             return KjResult::Err(format!("kj rc reset: {e}"));
         }
         KjResult::ok(format!("reset rc script '{path}' to its embedded seed"))
@@ -390,12 +402,10 @@ impl KjDispatcher {
     async fn rc_rm(&self, path: &str) -> KjResult {
         use crate::vfs::VfsOps;
 
-        let cache = self.rc_cache();
-        if !cache.exists(path).await {
+        if !self.rc_exists(path).await {
             return KjResult::Err(format!("kj rc rm: '{path}' not found"));
         }
-        // Drop the cached CRDT doc, then unlink the backing file.
-        cache.invalidate(path);
+        // Delete the CRDT document directly (no host file, no cache mirror).
         if let Err(e) = self.kernel().vfs().unlink(std::path::Path::new(path)).await {
             return KjResult::Err(format!("kj rc rm: unlink '{path}': {e}"));
         }
@@ -467,7 +477,7 @@ mod tests {
         use crate::kj::test_helpers::*;
         use crate::kj::KjResult;
 
-        let d = test_dispatcher().await;
+        let d = test_dispatcher_crdt_rc().await;
         let c = test_caller();
         let s = |v: &str| v.to_string();
 
@@ -519,7 +529,7 @@ mod tests {
         use crate::kj::test_helpers::*;
         use crate::kj::KjResult;
 
-        let d = test_dispatcher().await;
+        let d = test_dispatcher_crdt_rc().await;
         let c = test_caller();
         let s = |v: &str| v.to_string();
 
@@ -535,14 +545,17 @@ mod tests {
         }
     }
 
-    /// Read an rc script's content back through the file cache (the same
-    /// path dispatch reads), so tests verify the on-disk file, not a row.
+    /// Read an rc script's content back through the VFS (the same path
+    /// dispatch reads), so tests verify the live CRDT document.
     async fn read_rc(d: &KjDispatcher, path: &str) -> Option<String> {
-        d.kernel()
-            .file_cache(d.block_store())
-            .read_content(path)
+        use crate::vfs::VfsOps;
+        let bytes = d
+            .kernel()
+            .vfs()
+            .read_all(std::path::Path::new(path))
             .await
-            .ok()
+            .ok()?;
+        String::from_utf8(bytes).ok()
     }
 
     /// `kj rc edit` replaces a script's content in the file.
@@ -551,7 +564,7 @@ mod tests {
         use crate::kj::test_helpers::*;
         use crate::kj::KjResult;
 
-        let d = test_dispatcher().await;
+        let d = test_dispatcher_crdt_rc().await;
         let c = test_caller();
         let s = |v: &str| v.to_string();
 
@@ -593,7 +606,7 @@ mod tests {
         use crate::kj::test_helpers::*;
         use crate::kj::KjResult;
 
-        let d = test_dispatcher().await;
+        let d = test_dispatcher_crdt_rc().await;
         let c = test_caller();
         let s = |v: &str| v.to_string();
 
@@ -634,7 +647,7 @@ mod tests {
         use crate::kj::test_helpers::*;
         use crate::kj::KjResult;
 
-        let d = test_dispatcher().await;
+        let d = test_dispatcher_crdt_rc().await;
         let c = test_caller();
         let s = |v: &str| v.to_string();
 
@@ -675,7 +688,7 @@ mod tests {
         use crate::kj::test_helpers::*;
         use crate::kj::KjResult;
 
-        let d = test_dispatcher().await;
+        let d = test_dispatcher_crdt_rc().await;
         let c = test_caller();
         let s = |v: &str| v.to_string();
 
@@ -711,7 +724,7 @@ mod tests {
         use crate::kj::test_helpers::*;
         use crate::kj::KjResult;
 
-        let d = test_dispatcher().await;
+        let d = test_dispatcher_crdt_rc().await;
         let c = test_caller();
         let s = |v: &str| v.to_string();
 
@@ -738,7 +751,7 @@ mod tests {
         use crate::kj::test_helpers::*;
         use crate::kj::KjResult;
 
-        let d = test_dispatcher().await;
+        let d = test_dispatcher_crdt_rc().await;
         let c = test_caller();
         let s = |v: &str| v.to_string();
 
@@ -769,7 +782,7 @@ mod tests {
         use crate::kj::test_helpers::*;
         use crate::kj::KjResult;
 
-        let d = test_dispatcher().await;
+        let d = test_dispatcher_crdt_rc().await;
         let c = test_caller();
         let s = |v: &str| v.to_string();
 

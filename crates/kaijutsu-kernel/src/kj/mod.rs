@@ -639,7 +639,7 @@ pub(crate) fn kj_command() -> clap::Command {
 #[cfg(test)]
 pub(crate) mod test_helpers {
     use super::*;
-    use crate::block_store::shared_block_store;
+    use crate::block_store::{shared_block_store, shared_block_store_with_db};
     use crate::drift::shared_drift_router;
     use crate::kernel_db::KernelDb;
 
@@ -684,8 +684,11 @@ pub(crate) mod test_helpers {
                 .with_timeouts(policy)
                 .with_temp_cleanup(root),
         );
-        // Mount the private, seeded /etc/rc tree so rc tests exercise the real
-        // file-backed dispatch path (readdir + FileDocumentCache).
+        // Mount a host-backed /etc/rc tree (LocalBackend). `kj rc` is now
+        // VFS-direct, so it works over either backend; this keeps the broadly-
+        // used dispatcher db-less (a DB-backed block store deadlocks unrelated
+        // fork tests — see test_dispatcher_crdt_rc). The CRDT-native backend is
+        // covered by its own unit tests + test_dispatcher_crdt_rc.
         kernel
             .mount("/etc/rc", crate::vfs::LocalBackend::new(&rc_tmp))
             .await;
@@ -697,18 +700,59 @@ pub(crate) mod test_helpers {
         KjDispatcher::new(drift, blocks, kernel_db, kernel)
     }
 
-    /// Install an rc script as a file in the mounted `/etc/rc` tree, through
-    /// the same CRDT cache `kj rc` uses. Async because the cache flush is.
+    /// A dispatcher whose `/etc/rc` is the **real CRDT-native backend**
+    /// ([`ConfigCrdtFs`]), seeded from the embedded defaults — the production
+    /// wiring. Use this for `kj rc` / lifecycle tests that must exercise the
+    /// CRDT path end-to-end (readdir over the `documents` manifest + VFS-direct
+    /// reads/writes), not just the backend-agnostic kj layer.
+    ///
+    /// It uses a **DB-backed block store** (the manifest needs the `documents`
+    /// table populated). That is faithful to production but currently deadlocks
+    /// the `kj::fork` tests under a shared in-memory DB handle — a latent
+    /// lock-ordering issue tracked separately — so it is deliberately *not* the
+    /// global `test_dispatcher`; only rc-scoped tests (which never fork) use it.
+    ///
+    /// [`ConfigCrdtFs`]: crate::runtime::config_crdt_fs::ConfigCrdtFs
+    pub async fn test_dispatcher_crdt_rc() -> KjDispatcher {
+        let drift = shared_drift_router();
+        let kernel_db = Arc::new(parking_lot::Mutex::new(
+            KernelDb::in_memory().expect("in-memory KernelDb"),
+        ));
+        let ws_id = {
+            let db = kernel_db.lock();
+            db.get_or_create_default_workspace(PrincipalId::system())
+                .unwrap()
+        };
+        let blocks =
+            shared_block_store_with_db(kernel_db.clone(), ws_id, PrincipalId::system());
+        let root = std::env::temp_dir().join(format!("kj-rc-test-{}", ContextId::new().to_hex()));
+        let kernel_data = root.join("kernel");
+        std::fs::create_dir_all(&kernel_data).expect("create kernel data dir");
+        let kernel = Arc::new(
+            Kernel::new("test", &kernel_data)
+                .await
+                .with_temp_cleanup(root),
+        );
+        let rc_fs = crate::runtime::config_crdt_fs::ConfigCrdtFs::new(blocks.clone(), "/etc/rc");
+        rc_fs.seed_from_embedded().expect("seed rc into CRDT");
+        kernel.mount("/etc/rc", rc_fs).await;
+        kernel
+            .init_kv(kernel_db.clone())
+            .expect("init kernel KV for test dispatcher");
+        KjDispatcher::new(drift, blocks, kernel_db, kernel)
+    }
+
+    /// Install an rc script in the mounted `/etc/rc` tree, through the same
+    /// VFS-direct path `kj rc` uses (write straight to the CRDT-native backend,
+    /// no FileDocumentCache mirror).
     pub async fn install_rc_script_file(dispatcher: &KjDispatcher, path: &str, content: &str) {
-        let cache = dispatcher
+        use crate::vfs::VfsOps;
+        dispatcher
             .kernel()
-            .file_cache(dispatcher.block_store());
-        cache
-            .create_or_replace(path, content)
+            .vfs()
+            .write_all(std::path::Path::new(path), content.as_bytes())
             .await
             .expect("write rc script file");
-        cache.mark_dirty(path);
-        cache.flush_one(path).await.expect("flush rc script file");
     }
 
     /// Create a KjCaller with fresh IDs for testing.
