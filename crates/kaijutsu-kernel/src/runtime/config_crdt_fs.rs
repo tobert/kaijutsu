@@ -173,6 +173,41 @@ impl ConfigCrdtFs {
             .map(|e| *e.value())
             .unwrap_or(SystemTime::UNIX_EPOCH)
     }
+
+    /// True when this backend owns no documents yet — the "fresh install" gate.
+    /// Replaces the old host-dir-empty check: seeding is keyed on the CRDT
+    /// namespace being empty, not on a host directory.
+    pub fn is_empty(&self) -> bool {
+        self.blocks
+            .documents_under_path(&self.root)
+            .map(|rows| rows.is_empty())
+            .unwrap_or(true)
+    }
+
+    /// Seed every embedded rc default ([`crate::seed_scripts::seed_files`]) into
+    /// the CRDT, skipping any path already present. Returns the count newly
+    /// written. This replaces `ensure_rc_seed_files` (embedded → host disk): the
+    /// embedded tree is the seed, the CRDT is the owner thereafter.
+    ///
+    /// Per the crash-over-corruption stance a write failure aborts loudly — a
+    /// half-seeded rc tree is corruption, and the caller decides whether a fork
+    /// can proceed without its stance script.
+    pub fn seed_from_embedded(&self) -> VfsResult<usize> {
+        let mut written = 0usize;
+        for (canonical, body) in crate::seed_scripts::seed_files() {
+            // `seed_files` yields canonical `/etc/rc/...` paths; only seed those
+            // that fall under this backend's root, and only if absent.
+            if !canonical.starts_with(&self.root) {
+                continue;
+            }
+            if self.content_of(&canonical).is_some() {
+                continue;
+            }
+            self.put_content(&canonical, body)?;
+            written += 1;
+        }
+        Ok(written)
+    }
 }
 
 #[async_trait]
@@ -545,5 +580,54 @@ mod tests {
             .unwrap();
         let mid = fs.read(p("a/create/S00-x.kai"), 6, 5).await.unwrap();
         assert_eq!(mid, b"world");
+    }
+
+    #[tokio::test]
+    async fn seed_from_embedded_populates_and_is_idempotent() {
+        let fs = fs();
+        assert!(fs.is_empty(), "a fresh backend owns nothing");
+
+        let n = fs.seed_from_embedded().unwrap();
+        assert_eq!(
+            n,
+            crate::seed_scripts::seed_files().len(),
+            "every embedded seed should be written on a fresh backend"
+        );
+        assert!(!fs.is_empty(), "seeded backend is no longer empty");
+
+        // A known seed round-trips through the CRDT (read via the VFS, not disk).
+        let stance = fs
+            .read_all(p("coder/create/S00-stance.md"))
+            .await
+            .expect("coder stance must seed");
+        assert!(!stance.is_empty());
+
+        // readdir reflects the seeded tree.
+        let types: Vec<_> = fs
+            .readdir(p(""))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(types.contains(&"coder".to_string()), "types: {types:?}");
+        assert!(types.contains(&"default".to_string()), "types: {types:?}");
+
+        // Second seed writes nothing (idempotent: paths already present).
+        assert_eq!(fs.seed_from_embedded().unwrap(), 0);
+    }
+
+    /// A user edit must survive re-seeding — seed only fills absent paths, it
+    /// never clobbers live content (parity with the old host `ensure` contract).
+    #[tokio::test]
+    async fn re_seed_preserves_user_edits() {
+        let fs = fs();
+        fs.seed_from_embedded().unwrap();
+        fs.write_all(p("coder/create/S00-stance.md"), b"# my override")
+            .await
+            .unwrap();
+        assert_eq!(fs.seed_from_embedded().unwrap(), 0, "nothing new to seed");
+        let got = fs.read_all(p("coder/create/S00-stance.md")).await.unwrap();
+        assert_eq!(got, b"# my override", "re-seed clobbered a live edit");
     }
 }
