@@ -15,6 +15,7 @@ pub mod block_store;
 pub mod block_tools;
 pub mod image;
 pub mod config_backend;
+pub mod config_doc;
 pub mod control;
 pub mod drift;
 pub mod execution;

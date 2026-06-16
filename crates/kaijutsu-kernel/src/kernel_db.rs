@@ -1126,6 +1126,24 @@ impl KernelDb {
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
     }
 
+    /// List documents whose `path` falls strictly *under* `dir` (i.e. matches
+    /// `<dir>/...`), ordered by path. This is the prefix-scan that backs
+    /// `readdir` for the CRDT-native config/rc backend: the `documents` table
+    /// *is* the path manifest (every path-carrying doc is one entry). `dir`
+    /// must not end in `/`; the exact `dir` row itself is excluded.
+    pub fn list_documents_under_path(&self, dir: &str) -> KernelDbResult<Vec<DocumentRow>> {
+        // SQLite LIKE: rc/config paths contain no `%`/`_`, so no ESCAPE needed.
+        let pattern = format!("{dir}/%");
+        let mut stmt = self.conn.prepare(
+            "SELECT document_id, workspace_id, doc_kind,
+                    language, path, created_at, created_by
+             FROM documents WHERE path LIKE ?1
+             ORDER BY path",
+        )?;
+        let rows = stmt.query_map(params![pattern], row_to_document_row)?;
+        Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
+    }
+
     /// Delete a document (CASCADE deletes snapshots, input_docs, and context).
     pub fn delete_document(&self, id: ContextId) -> KernelDbResult<bool> {
         let deleted = self.conn.execute(

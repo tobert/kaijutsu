@@ -429,6 +429,74 @@ impl BlockStore {
         }
     }
 
+    /// Create a document that carries a filesystem `path` in its `documents`
+    /// row. Used by the CRDT-native config/rc backend (`ConfigCrdtFs`): the
+    /// path makes the `documents` table double as the readdir manifest
+    /// (`list_documents_under_path`), so the doc and its manifest entry are one
+    /// write, not two stores to drift. Otherwise identical to
+    /// [`create_document`](Self::create_document).
+    pub fn create_document_with_path(
+        &self,
+        context_id: ContextId,
+        kind: DocKind,
+        language: Option<String>,
+        path: String,
+    ) -> BlockStoreResult<()> {
+        use dashmap::mapref::entry::Entry;
+
+        match self.documents.entry(context_id) {
+            Entry::Occupied(_) => Err(BlockStoreError::DocumentAlreadyExists(context_id)),
+            Entry::Vacant(vacant) => {
+                let principal_id = self.principal_id();
+
+                if let Some(db) = &self.db {
+                    let db_guard = db.lock();
+                    let row = DocumentRow {
+                        document_id: context_id,
+                        workspace_id: self.default_workspace_id.unwrap_or_default(),
+                        doc_kind: kind,
+                        language: language.clone(),
+                        path: Some(path),
+                        created_at: kaijutsu_types::now_millis() as i64,
+                        created_by: principal_id,
+                    };
+                    match db_guard.insert_document(&row) {
+                        Ok(()) => {}
+                        Err(e)
+                            if e.to_string().contains("UNIQUE constraint")
+                                || e.to_string().contains("already exists") =>
+                        {
+                            tracing::warn!(context_id = %context_id.to_hex(), "Document already in DB but not in memory, recovering");
+                        }
+                        Err(e) => return Err(BlockStoreError::Db(e.to_string())),
+                    }
+                }
+
+                let entry = DocumentEntry::new(context_id, kind, language, principal_id);
+                vacant.insert(entry);
+
+                Ok(())
+            }
+        }
+    }
+
+    /// List the persisted `documents` rows whose path falls under `dir`
+    /// (the readdir manifest for [`create_document_with_path`]). Empty when
+    /// there is no DB. Returns `(path, context_id)` pairs for every descendant.
+    pub fn documents_under_path(&self, dir: &str) -> BlockStoreResult<Vec<(String, ContextId)>> {
+        let Some(db) = self.db.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let rows = db
+            .lock()
+            .list_documents_under_path(dir)
+            .map_err(|e| BlockStoreError::Db(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| r.path.map(|p| (p, r.document_id)))
+            .collect())
+    }
+
     /// Create a document from a serialized store snapshot (for sync from server).
     ///
     /// Reconstructs the document from a CBOR-encoded `StoreSnapshot`.

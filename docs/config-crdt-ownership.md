@@ -110,8 +110,29 @@ fought in `get_or_load`, one level up.)
 scheme can't reconstruct a directory listing, and `load_rc_scripts` needs
 `readdir /etc/rc/<type>/<verb>`. So the store carries a **path manifest** — seeded
 from the embedded `include_dir!` tree, mutated by `kj rc add`/`rm` — that backs
-prefix-readdir. Manifest as a CRDT doc or a `kernel.db` index (implementer's call;
-both persist and both give SQL/scan prefix queries).
+prefix-readdir.
+
+**Manifest = the existing `documents` table (no new table).** DECIDED 2026-06-16
+after reading the schema: `documents(document_id, workspace_id, doc_kind, path,
+…)` already has a `path` column, a `UNIQUE(workspace_id, path)` index, and
+`list_documents_by_kind`. `BlockStore::create_document` already writes a
+`documents` row — today with `path: None`. So config/rc docs just need to carry
+their path (a `create_document_with_path` variant), and `readdir` is
+`list_documents_by_kind(Config)` filtered by the `/etc/rc/…` prefix, deriving
+immediate children in Rust. The doc and its manifest row are written together by
+the same `create_document` call → no separate-table dual-write to drift (the
+manifest *is* the document registry).
+
+**Read-path routing & cache coherence.** rc reads/writes route through the VFS
+(`MountTable → ConfigCrdtFs`) **directly**, bypassing `FileDocumentCache` for the
+kernel-internal callers (`kj rc`, `load_rc_scripts`) — mirroring a CRDT into
+another CRDT is the exact sync we're deleting. The one remaining cache consumer is
+an agent `builtin.file:read /etc/rc/…`; to keep that coherent without a host file,
+`ConfigCrdtFs` returns an **in-memory advancing mtime** from `getattr` (bumped on
+write), so the cache's existing staleness check reloads after a `kj rc set`. This
+mtime is a *version stamp on the single source of truth*, not a host-vs-CRDT sync
+— the "which is truth?" bug class stays gone by construction. (Future cleanup,
+issues.md: teach `FileDocumentCache` to pass through CRDT-native mounts entirely.)
 
 ---
 
@@ -181,9 +202,18 @@ vim-the-rc-file.)
    `kj rc reseed` (CRDT ← embedded) and the staleness-vs-embedded story (the
    issues.md "staleness indicator" want partly dissolves — drift is now
    CRDT-vs-embedded, surfaced by an explicit reseed, not silent host drift).
-2. **Manifest storage** — CRDT doc vs `kernel.db` index (implementer's call; note
-   the choice when it lands).
-3. **Project-source F1 residual.** ~~Still real for `~/src`/`/tmp`~~ — RESOLVED:
+2. **Manifest storage** — DECIDED 2026-06-16: **`kernel.db` index** (a `path →
+   doc id` table). Persists with everything else, clean SQL prefix scan for
+   `readdir`, no CRDT-doc enumeration/serialize gymnastics. Matches the
+   handle-implies-row persistence backbone.
+3. **Backend shape** — DECIDED 2026-06-16: `ConfigCrdtBackend` is *not* a `VfsOps`
+   backend (direct-access API + TOML watcher/flush, never mounted), so slice 1
+   builds a **new `VfsOps` backend (`ConfigCrdtFs`)** that reuses
+   `config_context_id` + the `DocKind::Config` single-block doc helpers (extracted
+   to a shared module) and mounts at `/etc/rc`. TOMLs stay on `ConfigCrdtBackend`'s
+   direct API for slice 1; they converge in slice 2 when the host flush dies. This
+   keeps the mount-readdir lifetime from tangling with the soon-to-die TOML flush.
+4. **Project-source F1 residual.** ~~Still real for `~/src`/`/tmp`~~ — RESOLVED:
    `reload_block_from_disk` now returns typed `CacheReadError` (Backend on store
    failure, NotCached only for removed/binary), `get_or_load` delegates to
    `try_get_or_load` (F3 duplication gone), and a stale-reload regression test

@@ -15,6 +15,7 @@
 //! - `context_engine` — per-session "current context" registry.
 //! - `kj_builtin` — the `kj` kaish Tool.
 
+pub mod config_crdt_fs;
 pub mod context_engine;
 pub mod docs_filesystem;
 pub mod embedded_kaish;

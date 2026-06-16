@@ -40,20 +40,9 @@ use tokio::sync::mpsc;
 use kaijutsu_crdt::{BlockId, BlockKind, ContentType, ContextId, Role, Status};
 
 use crate::block_store::SharedBlockStore;
+use crate::config_doc::{self, config_context_id};
 use crate::flows::ConfigSource;
 use kaijutsu_types::DocKind;
-
-/// Derive a deterministic ContextId from a config path.
-///
-/// Config documents aren't real contexts, but BlockStore is keyed by ContextId.
-/// We use UUIDv5 (namespace: URL) so the same path always maps to the same ID.
-fn config_context_id(path: &str) -> ContextId {
-    let uuid = uuid::Uuid::new_v5(
-        &uuid::Uuid::NAMESPACE_URL,
-        format!("kaijutsu:config:{}", path).as_bytes(),
-    );
-    ContextId::from_bytes(*uuid.as_bytes())
-}
 
 /// Embedded default theme content (TOML).
 pub const DEFAULT_THEME: &str = include_str!("../../../assets/defaults/theme.toml");
@@ -245,12 +234,7 @@ impl ConfigCrdtBackend {
     /// Config documents have exactly one block. Returns None if the document
     /// doesn't exist or has no blocks yet.
     fn first_block_id(&self, ctx: ContextId) -> Option<BlockId> {
-        self.blocks
-            .get(ctx)?
-            .doc
-            .blocks_ordered()
-            .first()
-            .map(|b| b.id)
+        config_doc::first_block_id(&self.blocks, ctx)
     }
 
     /// Ensure a config file exists, loading from disk or creating from default.
