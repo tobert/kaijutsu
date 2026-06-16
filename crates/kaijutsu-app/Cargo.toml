@@ -17,6 +17,7 @@ kaijutsu-crdt.workspace = true
 kaijutsu-client.workspace = true
 kaijutsu-kernel.workspace = true
 kaijutsu-types.workspace = true
+kaijutsu-viz.workspace = true
 kaijutsu-telemetry.workspace = true
 
 # kaish (for syntax validation)

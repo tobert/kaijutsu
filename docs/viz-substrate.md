@@ -309,17 +309,18 @@ encoding rules, not new rendering code.
 The substrate works with what exists, but the *full* time-well grammar needs
 fields that aren't on the wire yet. Named here so they're not a surprise:
 
-0. **The `conclude` verb + lifecycle distinction** — *the load-bearing addition.*
-   The band-0→band-1 transition is an **explicit, intentional** "this context is
-   done" act (the kaijutsu equivalent of `exit`-ing a mux window). It must be
-   distinct from a **transient detach** (app restart, dropped connection, closed
-   lid), which must **not** demote — a detached-but-not-concluded context stays
-   hot in band 0. Today `contextLeave @74` marks a context archived on leave,
-   which conflates the two; the model needs (a) a `conclude` operation, (b) a
-   `concludedAt` timestamp on `ContextHandleInfo` to give band 1 its recency rank
-   and the LRU eviction order, and (c) a lifecycle value for "concluded" distinct
-   from transient-detached and from `archived`. Bands 1/2 are then just a
-   client-side recency split over concluded contexts (no per-band wire state).
+0. ✅ **The `conclude` verb + lifecycle distinction** — *the load-bearing
+   addition, SHIPPED (step 5).* The band-0→band-1 transition is an **explicit,
+   intentional** "this context is done" act (the kaijutsu equivalent of
+   `exit`-ing a mux window), distinct from a **transient detach** (app restart,
+   dropped connection, closed lid) which must **not** demote. Resolved as: (a) a
+   `conclude @83` operation; (b) `concludedAt @13` on `ContextHandleInfo`, giving
+   band 1 its recency rank; (c) `ContextState::Concluded`, distinct from
+   transient-detached (stays `Live`) and from `archived` (hidden). Bands 1/2 are
+   a client-side recency split over `concluded_at`; archived contexts are
+   filtered out of the well. *(Note: the old claim that `contextLeave @74`
+   "marks a context archived on leave" was already stale — `contextLeave` only
+   drops the session binding; archive is a separate `archive_context` call.)*
    `conclude` is reversible (fork/recover from the haystack) but deliberately not
    first-class — no prominent un-conclude affordance.
 1. **Block / message count** — `ContextHandleInfo` has none. Needed only if card
@@ -383,8 +384,10 @@ the second screen lands — which is exactly when the time-well view ships.
 ## Build order
 
 *Status (June 2026): steps 1–3 shipped in `crates/kaijutsu-viz/` — pure,
-dependency-free, TDD, deepseek-reviewed. The remaining steps are the
-integration-flavoured work (Bevy app + RPC client + kernel).*
+dependency-free, TDD, deepseek-reviewed. **Step 4 shipped** in
+`crates/kaijutsu-app/src/view/time_well/` (Ctrl+W enters, Esc leaves) — the
+first concrete consumer. The remaining steps are the `conclude` wire work
+(step 5) and the two concrete views (6–7).*
 
 1. ✅ **Scales** (`ScaleLinear`, `ScaleTime`, `ScaleThreshold` + `RadialBands` —
    the quantized 3-band radial; `scale_band` deferred to the dive-in). Pure,
@@ -397,11 +400,44 @@ integration-flavoured work (Bevy app + RPC client + kernel).*
 3. ✅ **Compacting band layout** (`assign_band` + `CompactingBandLayout::compute`)
    — pure & stateless; the two motion invariants as proptests. No `Layout` trait
    (one impl; trait waits for the dive-in layout).
-4. **Card** schema + billboarding + the join writing `ContextHandleInfo` →
+4. ✅ **Card** schema + billboarding + the join writing `ContextHandleInfo` →
    card components; live status glyph from the block-event data tick. *(First
-   Bevy-side step — `LayoutPos` → `glam::Vec3` lift lives here.)*
-5. **`conclude` wire work** (gap 0) — the operation + `concludedAt` + lifecycle
-   value. Without it band 0 has no exit and the radial axis is inert.
+   Bevy-side step — `LayoutPos` → `glam::Vec3` lift lives here.)* Shipped in
+   `view/time_well/`:
+   - `card.rs` — pure `ContextInfo`→`CardData` map + band assignment + layout +
+     the `Vec3` lift (8 unit tests). `ContextInfo` gained `PartialEq, Eq` so it
+     can be a `Join` value.
+   - `scene.rs` — `Screen::TimeWell` + a `Camera3d` well (the 3D camera owns the
+     background at order 0; the existing 2D UI camera moves to order 1 with a
+     transparent clear so the dock hint composites on top). Cards are
+     double-sided billboarded quads eased toward a `CardTarget` (exponential
+     smoothing — the "transitions are Bevy's job" stance).
+   - `sync.rs` — the layout tick rides the **existing `DriftState` poll** of
+     `listContexts` (no new poll), reconciles the `Join`, spawns/despawns, and
+     writes targets; plus the data tick (`apply_block_status`) tapping the
+     existing `ServerEvent::BlockStatusChanged` stream.
+   - `text.rs` — a parley-`Layout` → `vello::Scene` glyph encoder + per-card RTT
+     texture (the documented vello route, since the app's normal text path is
+     MSDF and doesn't fit a free 3D quad). **Gotcha:** `VelloFont::layout` does
+     not push the brush onto the layout (MSDF supplies color separately), so the
+     brush must be passed explicitly to the glyph draw — reading
+     `glyph_run.style().brush` yields parley's default black.
+
+   *Step-4 simplifications to revisit:* lifecycle bands use `archived` as a
+   `concluded` proxy until step 5 lands `concludedAt` (single point of change in
+   `card.rs::assign_bands`); the status data tick reflects only already-subscribed
+   contexts — a `subscribeBlocksFiltered` over the full visible set is the
+   follow-up (gap 3). Card sizing/zoom for readability is cosmetic polish.
+5. ✅ **`conclude` wire work** (gap 0) — shipped. `conclude @83` RPC +
+   `concludedAt @13` on `ContextHandleInfo` + `ContextState::Concluded` +
+   `concluded_at` column (additive migration). `conclude` is distinct from
+   `archive`: it sets state `Concluded` + stamps `concluded_at` (reversible via
+   fork, idempotent), while `archive` hides the context from the well entirely.
+   Driven by `kj context conclude <ref>` (alias `done`, ungated/unlatched —
+   routine, not destructive) and `KernelHandle::conclude`. The well replaced its
+   `archived`-proxy with the real `concluded_at` and filters archived out of the
+   snapshot. Verified end-to-end: concluding a context migrates its card from the
+   hot rim to the recent-concluded ring. Open Question #1 below is resolved.
 6. **Active view** = band 0 (the hot compacting list) + band 1 (recent-concluded
    clock), keyboard `ctrl-a 0–9` on band 0. First concrete consumer.
 7. **Haystack view** = band 2 as the second concrete consumer (semantic; wire in
@@ -422,9 +458,11 @@ throughout.
 The capnp closed events-vs-polling and forest-vs-DAG; the workflow grounding
 closed the layout question (three lifecycle bands). These remain genuinely open:
 
-1. **`conclude` wire shape** (gap 0) — exact RPC + lifecycle enum, and how it
-   relates to the existing `contextLeave @74` / `setContextState @71` / `archived`
-   surface. The one addition a real consumer needs first.
+1. ✅ ~~**`conclude` wire shape** (gap 0)~~ — RESOLVED (step 5): `conclude @83`
+   + `ContextState::Concluded` + `concludedAt`, distinct from `archived`;
+   `setContextState @71` keeps its `Staging→Live` v1 gate (conclude is its own
+   verb, not a state-set), and `contextLeave @74` is unrelated (session-binding
+   drop only).
 2. **Band 1 angle — literal clock-face or just a recency-ordered arc?** Decided
    it's recency, not lineage; the open part is whether it reads as a 12-o'clock
    "most recent" clock or a simpler newest-first sweep.

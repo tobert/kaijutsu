@@ -1191,6 +1191,7 @@ pub async fn create_shared_kernel(
                     archived_at: None,
                     workspace_id: None,
                     preset_id: None,
+                    concluded_at: None,
                 };
                 let default_ws = db
                     .get_or_create_default_workspace(row.created_by)
@@ -1559,6 +1560,7 @@ async fn create_context_inner(
             archived_at: None,
             workspace_id: None,
             preset_id: None,
+            concluded_at: None,
         };
         let default_ws = db
             .get_or_create_default_workspace(row.created_by)
@@ -2732,6 +2734,7 @@ impl kernel::Server for KernelImpl {
                     if let Some(row) = db_map.get(&ctx.id) {
                         c.set_fork_kind(row.fork_kind.as_ref().map(|fk| fk.as_str()).unwrap_or(""));
                         c.set_archived_at(row.archived_at.map(|ts| ts as u64).unwrap_or(0));
+                        c.set_concluded_at(row.concluded_at.map(|ts| ts as u64).unwrap_or(0));
                         c.set_context_type(&row.context_type);
                     }
 
@@ -5434,6 +5437,95 @@ impl kernel::Server for KernelImpl {
             context_id.short(),
             new_state
         );
+        results.get().set_success(true);
+        Promise::ok(())
+    }
+
+    fn conclude(
+        self: Rc<Self>,
+        params: kernel::ConcludeParams,
+        mut results: kernel::ConcludeResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let _trace_guard = extract_rpc_trace(p.get_trace(), "conclude").entered();
+        let context_id_bytes = pry!(p.get_context_id());
+        let context_id = pry!(
+            ContextId::try_from_slice(context_id_bytes)
+                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
+        );
+
+        let drift_router = self.kernel.kernel.drift().clone();
+
+        // Inspect current state for idempotency + guards.
+        {
+            let drift = match drift_router.try_read() {
+                Some(d) => d,
+                None => {
+                    results.get().set_success(false);
+                    results.get().set_error("drift router busy");
+                    return Promise::ok(());
+                }
+            };
+            use kaijutsu_types::ContextState::*;
+            match drift.context_state(context_id) {
+                None => {
+                    results.get().set_success(false);
+                    results.get().set_error("context not found");
+                    return Promise::ok(());
+                }
+                // Idempotent: re-concluding a concluded context succeeds without
+                // restamping `concluded_at`.
+                Some(Concluded) => {
+                    results.get().set_success(true);
+                    return Promise::ok(());
+                }
+                Some(Archived) => {
+                    results.get().set_success(false);
+                    results
+                        .get()
+                        .set_error("cannot conclude an archived context");
+                    return Promise::ok(());
+                }
+                Some(Live) | Some(Staging) => {}
+            }
+        }
+
+        // Persist first — KernelDb holds the authoritative `concluded_at` stamp.
+        {
+            let db = self.kernel.kernel_db.lock();
+            match db.conclude_context(context_id) {
+                Ok(true) => {}
+                Ok(false) => {
+                    results.get().set_success(false);
+                    results.get().set_error(
+                        "context could not be concluded (already concluded, archived, or unknown)",
+                    );
+                    return Promise::ok(());
+                }
+                Err(e) => {
+                    results.get().set_success(false);
+                    results.get().set_error(&e.to_string());
+                    return Promise::ok(());
+                }
+            }
+        }
+
+        // Reflect in the DriftRouter so `listContexts` shows the new state
+        // immediately. If the router is busy, the DB is already authoritative and
+        // `concluded_at` drives the client's banding regardless — report success.
+        match drift_router.try_write() {
+            Some(mut drift) => {
+                if let Err(e) = drift.set_state(context_id, kaijutsu_types::ContextState::Concluded)
+                {
+                    log::error!("conclude: drift set_state failed: {e}");
+                }
+            }
+            None => {
+                log::warn!("conclude: drift router busy (write); DB concluded, router state lags");
+            }
+        }
+
+        log::info!("conclude: context={}", context_id.short());
         results.get().set_success(true);
         Promise::ok(())
     }

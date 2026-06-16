@@ -274,6 +274,17 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ## Viz substrate (kaijutsu-viz) — see docs/viz-substrate.md
 
+- **Time-well step-4 polish (shipped 2026-06-16, `view/time_well/`):**
+  - *Fixed-pitch overlap:* band slots use a fixed angular pitch (TAU/24) so
+    append stays motion-free; but a band with >24 cards wraps slots onto each
+    other (coincident cards → z-fight/draw-swap; `AlphaMode::Mask` mitigates the
+    sort but not coincidence). Real fix for very full bands: sub-rings, smaller
+    cards, or radius LOD. Band 0 is meant for ~10 so this only bites test data.
+  - *Status coverage:* the data tick reflects only already-subscribed contexts;
+    a `subscribeBlocksFiltered` over the full visible set so every rim card
+    pulses is the follow-up (gap 3).
+  - *Readability:* card sizing/camera zoom is functional but text is small at
+    the default framing; tune when the active view (step 6) lands.
 - **`ScaleLinear`/`ScaleTime` round-trip loses precision under extreme
   domain→range compression** (≳10³–10⁸×): inverting through a tiny range
   amplifies f64 representation error past any sane tolerance. This is an f64

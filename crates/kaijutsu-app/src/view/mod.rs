@@ -23,6 +23,7 @@ pub mod shell_dock;
 pub mod scroll;
 pub mod submit;
 pub mod sync;
+pub mod time_well;
 pub mod vello_rasterizer;
 pub mod vello_ui_texture;
 

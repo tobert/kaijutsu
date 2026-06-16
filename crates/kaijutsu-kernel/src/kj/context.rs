@@ -119,6 +119,10 @@ enum ContextCommand {
     },
     /// Soft-delete a context (latched).
     Archive { context: String },
+    /// Conclude a context — mark this work "done" (the time-well's hot→recent
+    /// transition). Reversible via fork; not latched, not destructive.
+    #[command(alias = "done")]
+    Conclude { context: String },
     /// Permanently delete a context (latched).
     #[command(alias = "rm")]
     Remove { context: String },
@@ -396,6 +400,7 @@ impl KjDispatcher {
                 new_parent,
             } => self.context_move(&context, &new_parent, caller).await,
             ContextCommand::Archive { context } => self.context_archive(&context, caller).await,
+            ContextCommand::Conclude { context } => self.context_conclude(&context, caller).await,
             ContextCommand::Remove { context } => self.context_remove(&context, caller).await,
             ContextCommand::Retag { label, context } => {
                 self.context_retag(&label, &context, caller).await
@@ -669,6 +674,7 @@ impl KjDispatcher {
                 archived_at: None,
                 workspace_id: None,
                 preset_id: None,
+                concluded_at: None,
             };
             if let Err(e) = db.insert_context_with_document(&row, default_ws) {
                 return KjResult::Err(format!("kj context create: {e}"));
@@ -788,6 +794,7 @@ impl KjDispatcher {
                 archived_at: None,
                 workspace_id: None,
                 preset_id: None,
+                concluded_at: None,
             };
             if let Err(e) = db.insert_context_with_document(&row, default_ws) {
                 return KjResult::Err(format!("kj context scratch: {e}"));
@@ -1130,6 +1137,44 @@ impl KjDispatcher {
         // in Phase 1 M5. Phase 2 will re-introduce via broker + coalescer.
 
         KjResult::ok(format!("archived {} context(s)", archived_ids.len()))
+    }
+
+    /// `kj context conclude <ctx>` — the explicit "this work is done" act.
+    ///
+    /// Sets `concluded_at` + the `Concluded` lifecycle state (KernelDb first as
+    /// the authoritative stamp, then the in-memory drift router so `listContexts`
+    /// reflects it immediately). Single context — unlike archive it does NOT
+    /// recurse into children. Reversible by forking; idempotent (re-concluding a
+    /// concluded context is a no-op success).
+    async fn context_conclude(&self, ctx_ref: &str, caller: &KjCaller) -> KjResult {
+        let target_id = {
+            let db = self.kernel_db().lock();
+            match super::refs::resolve_context_arg(Some(ctx_ref), caller, &db) {
+                Ok(id) => id,
+                Err(e) => return KjResult::Err(format!("kj context conclude: {e}")),
+            }
+        };
+
+        let newly = {
+            let db = self.kernel_db().lock();
+            match db.conclude_context(target_id) {
+                Ok(v) => v,
+                Err(e) => return KjResult::Err(format!("kj context conclude: {e}")),
+            }
+        };
+
+        // Reflect in the drift router (Live/Staging → Concluded). Harmless if the
+        // context was already concluded.
+        {
+            let mut drift = self.drift_router().write();
+            let _ = drift.set_state(target_id, ContextState::Concluded);
+        }
+
+        if newly {
+            KjResult::ok(format!("concluded {}", target_id.short()))
+        } else {
+            KjResult::ok(format!("{} already concluded", target_id.short()))
+        }
     }
 
     /// `kj context remove <ctx>` — permanently delete a context (latched).

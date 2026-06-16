@@ -75,6 +75,8 @@ pub struct ContextRow {
     pub forked_from: Option<ContextId>,
     pub fork_kind: Option<ForkKind>,
     pub archived_at: Option<i64>,
+    /// Unix-millis of the explicit `conclude` act, or `None` if still open.
+    pub concluded_at: Option<i64>,
     pub workspace_id: Option<WorkspaceId>,
     pub preset_id: Option<PresetId>,
 }
@@ -340,6 +342,7 @@ CREATE TABLE IF NOT EXISTS contexts (
     forked_from  BLOB REFERENCES contexts(context_id) ON DELETE SET NULL,
     fork_kind    TEXT,
     archived_at  INTEGER,
+    concluded_at INTEGER,
     workspace_id BLOB REFERENCES workspaces(workspace_id) ON DELETE SET NULL,
     preset_id    BLOB REFERENCES presets(preset_id) ON DELETE SET NULL
 );
@@ -865,6 +868,7 @@ impl KernelDb {
     fn apply_additive_migrations(conn: &Connection) {
         let alters = [
             "ALTER TABLE context_bindings ADD COLUMN binding_rc_write INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE contexts ADD COLUMN concluded_at INTEGER",
         ];
         for sql in alters {
             // Ignore "duplicate column name" (column already present); a real
@@ -1433,12 +1437,12 @@ impl KernelDb {
                 context_id, label, provider, model,
                 system_prompt, consent_mode, context_state, context_type,
                 created_at, created_by, forked_from, fork_kind,
-                archived_at, workspace_id, preset_id
+                archived_at, workspace_id, preset_id, concluded_at
             ) VALUES (
                 ?1, ?2, ?3, ?4,
                 ?5, ?6, ?7, ?8, ?9,
                 ?10, ?11, ?12,
-                ?13, ?14, ?15
+                ?13, ?14, ?15, ?16
             )",
                 params![
                     blob_param(row.context_id.as_bytes()),
@@ -1456,6 +1460,7 @@ impl KernelDb {
                     row.archived_at,
                     row.workspace_id.as_ref().map(|id| id.as_bytes().to_vec()),
                     row.preset_id.as_ref().map(|id| id.as_bytes().to_vec()),
+                    row.concluded_at,
                 ],
             )
             .map_err(|e| {
@@ -1474,7 +1479,7 @@ impl KernelDb {
             "SELECT context_id, label, provider, model,
                     system_prompt, consent_mode, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
-                    archived_at, workspace_id, preset_id
+                    archived_at, workspace_id, preset_id, concluded_at
              FROM contexts WHERE context_id = ?1",
         )?;
 
@@ -1608,13 +1613,31 @@ impl KernelDb {
         Ok(updated > 0)
     }
 
+    /// Conclude a context: set `context_state = 'concluded'` and stamp
+    /// `concluded_at` (first time only — idempotent re-conclude keeps the
+    /// original timestamp). Only an active (non-archived) context can be
+    /// concluded. Returns `true` if a row was newly concluded, `false` if the
+    /// context was unknown, archived, or already concluded.
+    pub fn conclude_context(&self, id: ContextId) -> KernelDbResult<bool> {
+        let now = now_millis();
+        let updated = self.conn.execute(
+            "UPDATE contexts
+                SET context_state = 'concluded', concluded_at = ?1
+             WHERE context_id = ?2
+               AND archived_at IS NULL
+               AND concluded_at IS NULL",
+            params![now, blob_param(id.as_bytes())],
+        )?;
+        Ok(updated > 0)
+    }
+
     /// List active (non-archived) contexts.
     pub fn list_active_contexts(&self) -> KernelDbResult<Vec<ContextRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT context_id, label, provider, model,
                     system_prompt, consent_mode, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
-                    archived_at, workspace_id, preset_id
+                    archived_at, workspace_id, preset_id, concluded_at
              FROM contexts
              WHERE archived_at IS NULL
              ORDER BY created_at",
@@ -1630,7 +1653,7 @@ impl KernelDb {
             "SELECT context_id, label, provider, model,
                     system_prompt, consent_mode, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
-                    archived_at, workspace_id, preset_id
+                    archived_at, workspace_id, preset_id, concluded_at
              FROM contexts
              ORDER BY created_at",
         )?;
@@ -1667,7 +1690,7 @@ impl KernelDb {
             "SELECT c.context_id, c.label, c.provider, c.model,
                     c.system_prompt, c.consent_mode, c.context_state, c.context_type,
                     c.created_at, c.created_by, c.forked_from, c.fork_kind,
-                    c.archived_at, c.workspace_id, c.preset_id
+                    c.archived_at, c.workspace_id, c.preset_id, c.concluded_at
              FROM contexts c
              JOIN context_edges e ON e.source_id = c.context_id
              WHERE e.target_id = ?1 AND e.kind = 'structural'",
@@ -1685,7 +1708,7 @@ impl KernelDb {
             "SELECT c.context_id, c.label, c.provider, c.model,
                     c.system_prompt, c.consent_mode, c.context_state, c.context_type,
                     c.created_at, c.created_by, c.forked_from, c.fork_kind,
-                    c.archived_at, c.workspace_id, c.preset_id
+                    c.archived_at, c.workspace_id, c.preset_id, c.concluded_at
              FROM contexts c
              JOIN context_edges e ON e.target_id = c.context_id
              WHERE e.source_id = ?1 AND e.kind = 'structural'
@@ -1722,7 +1745,7 @@ impl KernelDb {
             SELECT c.context_id, c.label, c.provider, c.model,
                    c.system_prompt, c.consent_mode, c.context_state, c.context_type,
                    c.created_at, c.created_by, c.forked_from, c.fork_kind,
-                   c.archived_at, c.workspace_id, c.preset_id,
+                   c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
                    dag.depth
             FROM dag
             JOIN contexts c ON c.context_id = dag.ctx_id
@@ -1731,7 +1754,7 @@ impl KernelDb {
 
         let rows = stmt.query_map([], |row| {
             let ctx = row_to_context_row(row)?;
-            let depth: i64 = row.get(15)?;
+            let depth: i64 = row.get(16)?;
             Ok((ctx, depth))
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
@@ -1752,7 +1775,7 @@ impl KernelDb {
             SELECT c.context_id, c.label, c.provider, c.model,
                    c.system_prompt, c.consent_mode, c.context_state, c.context_type,
                    c.created_at, c.created_by, c.forked_from, c.fork_kind,
-                   c.archived_at, c.workspace_id, c.preset_id,
+                   c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
                    lineage.depth
             FROM lineage
             JOIN contexts c ON c.context_id = lineage.ctx_id
@@ -1761,7 +1784,7 @@ impl KernelDb {
 
         let rows = stmt.query_map(params![blob_param(context_id.as_bytes())], |row| {
             let ctx = row_to_context_row(row)?;
-            let depth: i64 = row.get(15)?;
+            let depth: i64 = row.get(16)?;
             Ok((ctx, depth))
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
@@ -1781,7 +1804,7 @@ impl KernelDb {
             SELECT c.context_id, c.label, c.provider, c.model,
                    c.system_prompt, c.consent_mode, c.context_state, c.context_type,
                    c.created_at, c.created_by, c.forked_from, c.fork_kind,
-                   c.archived_at, c.workspace_id, c.preset_id,
+                   c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
                    subtree.depth
             FROM subtree
             JOIN contexts c ON c.context_id = subtree.ctx_id
@@ -1790,7 +1813,7 @@ impl KernelDb {
 
         let rows = stmt.query_map(params![blob_param(root_id.as_bytes())], |row| {
             let ctx = row_to_context_row(row)?;
-            let depth: i64 = row.get(15)?;
+            let depth: i64 = row.get(16)?;
             Ok((ctx, depth))
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
@@ -3275,7 +3298,7 @@ impl KernelDb {
             "SELECT context_id, label, provider, model,
                     system_prompt, consent_mode, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
-                    archived_at, workspace_id, preset_id
+                    archived_at, workspace_id, preset_id, concluded_at
              FROM contexts WHERE label = ?1",
         )?;
 
@@ -3326,6 +3349,7 @@ fn row_to_context_row(row: &rusqlite::Row<'_>) -> SqliteResult<ContextRow> {
         archived_at: row.get(12)?,
         workspace_id: read_opt_workspace_id(row, 13)?,
         preset_id: read_opt_preset_id(row, 14)?,
+        concluded_at: row.get(15)?,
     })
 }
 
@@ -3401,6 +3425,7 @@ fn make_context_row(label: Option<&str>) -> ContextRow {
         archived_at: None,
         workspace_id: None,
         preset_id: None,
+        concluded_at: None,
     }
 }
 
@@ -3633,6 +3658,49 @@ mod tests {
         let all = db.list_all_contexts().unwrap();
         assert_eq!(all.len(), 1);
         assert!(all[0].archived_at.is_some());
+    }
+
+    #[test]
+    fn conclude_context_sets_state_timestamp_and_is_idempotent() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let row = make_context_row(Some("worky"));
+        let cid = row.context_id;
+        insert_context_with_doc(&db, &row, ws_id);
+
+        // Fresh context: open (no concluded_at, Live).
+        let loaded = db.get_context(cid).unwrap().unwrap();
+        assert_eq!(loaded.concluded_at, None);
+        assert_eq!(loaded.context_state, ContextState::Live);
+
+        // First conclude: newly concluded → true, stamps state + timestamp.
+        assert!(db.conclude_context(cid).unwrap());
+        let loaded = db.get_context(cid).unwrap().unwrap();
+        assert_eq!(loaded.context_state, ContextState::Concluded);
+        let stamp = loaded.concluded_at.expect("concluded_at set");
+        assert!(stamp > 0);
+
+        // Idempotent: re-conclude → false, original timestamp preserved.
+        assert!(!db.conclude_context(cid).unwrap());
+        let loaded = db.get_context(cid).unwrap().unwrap();
+        assert_eq!(loaded.concluded_at, Some(stamp));
+
+        // Concluded is NOT archived — still visible to list_active_contexts.
+        let active = db.list_active_contexts().unwrap();
+        assert_eq!(active.len(), 1, "concluded context stays active (not hidden)");
+    }
+
+    #[test]
+    fn conclude_context_rejects_archived() {
+        let db = KernelDb::in_memory().unwrap();
+        let ws_id = setup_test_db(&db);
+        let row = make_context_row(Some("gone"));
+        let cid = row.context_id;
+        insert_context_with_doc(&db, &row, ws_id);
+
+        assert!(db.archive_context(cid).unwrap());
+        // Archived contexts can't be concluded (guard in the UPDATE).
+        assert!(!db.conclude_context(cid).unwrap());
     }
 
     // ── 3. Label validation: colon ──────────────────────────────────────
@@ -4193,6 +4261,7 @@ mod tests {
             archived_at: None,
             workspace_id: None,
             preset_id: None,
+            concluded_at: None,
         };
 
         let ctx = row.to_context();
@@ -4229,6 +4298,7 @@ mod tests {
             archived_at: None,
             workspace_id: None,
             preset_id: None,
+            concluded_at: None,
         };
         insert_context_with_doc(&db, &parent, ws_id);
 
@@ -4250,6 +4320,7 @@ mod tests {
             archived_at: None,
             workspace_id: None,
             preset_id: None,
+            concluded_at: None,
         };
         insert_context_with_doc(&db, &child, ws_id);
 
@@ -4323,6 +4394,7 @@ mod tests {
             archived_at: None,
             workspace_id: Some(WorkspaceId::new()), // doesn't exist
             preset_id: None,
+            concluded_at: None,
         };
         let err = db.insert_context(&row).unwrap_err();
         assert!(

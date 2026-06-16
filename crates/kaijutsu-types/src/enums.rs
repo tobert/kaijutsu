@@ -129,7 +129,10 @@ pub enum ContextState {
     Live,
     /// Post-fork curation — user can toggle excluded, LLM blocked.
     Staging,
-    /// Frozen (future-proofing).
+    /// Explicitly concluded ("done") — recoverable via fork; recency-ranked by
+    /// `concluded_at`. Distinct from a transient detach (which stays `Live`).
+    Concluded,
+    /// Frozen / hidden (future-proofing).
     Archived,
 }
 
@@ -138,6 +141,7 @@ impl ContextState {
         match self {
             Self::Live => "live",
             Self::Staging => "staging",
+            Self::Concluded => "concluded",
             Self::Archived => "archived",
         }
     }
@@ -395,6 +399,7 @@ mod tests {
         for state in [
             ContextState::Live,
             ContextState::Staging,
+            ContextState::Concluded,
             ContextState::Archived,
         ] {
             let s = state.as_str();
@@ -419,6 +424,7 @@ mod tests {
     fn context_state_display() {
         assert_eq!(format!("{}", ContextState::Live), "live");
         assert_eq!(format!("{}", ContextState::Staging), "staging");
+        assert_eq!(format!("{}", ContextState::Concluded), "concluded");
         assert_eq!(format!("{}", ContextState::Archived), "archived");
     }
 
@@ -436,6 +442,7 @@ mod tests {
         for state in [
             ContextState::Live,
             ContextState::Staging,
+            ContextState::Concluded,
             ContextState::Archived,
         ] {
             let bytes = crate::codec::encode(&state).unwrap();

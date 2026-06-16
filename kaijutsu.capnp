@@ -433,8 +433,9 @@ struct ContextHandleInfo {
   archivedAt @8 :UInt64;          # 0 = active, else Unix millis when archived
   keywords @9 :List(Text);        # Synthesis keywords (empty if not yet synthesized)
   topBlockPreview @10 :Text;      # Preview of most representative block (empty if none)
-  contextState @11 :Text;         # "live"/"staging"/"archived" (default "live")
+  contextState @11 :Text;         # "live"/"staging"/"concluded"/"archived" (default "live")
   contextType @12 :Text;          # rc bucket / mode bundle (default "default")
+  concludedAt @13 :UInt64;        # 0 = not concluded, else Unix millis of the explicit `conclude` act
 }
 
 struct PresetInfo {
@@ -1196,6 +1197,16 @@ interface Kernel {
   # Subscribe to whole-store changes (callback fires per set/delete). The
   # client filters by prefix; v1 streams the whole store.
   kvWatch @82 (callback :KvEvents);
+
+  # Conclude a context: the explicit "this work is done" act (the kaijutsu
+  # equivalent of exit-ing a mux window). Sets contextState = "concluded" and
+  # stamps `concludedAt`. Distinct from a transient detach (contextLeave, which
+  # must NOT demote) and from archive (which hides the context). Reversible by
+  # forking/recovering from the concluded set — deliberately not first-class, so
+  # there is no dedicated un-conclude verb. Idempotent: re-concluding a concluded
+  # context succeeds without restamping. `success = false` with `error` set when
+  # the context can't be concluded (unknown / already archived).
+  conclude @83 (contextId :Data, trace :TraceContext) -> (success :Bool, error :Text);
 }
 
 # Callback interface for receiving kernel KV change events.

@@ -747,6 +747,9 @@ pub fn update_mode(
             }
             FocusArea::Conversation => (theme.mode_normal, &theme.mode_label_normal),
         },
+        // The well owns the viewport; the conversation dock is hidden, but keep
+        // the mode indicator coherent rather than panicking.
+        Screen::TimeWell => (theme.mode_normal, &theme.mode_label_normal),
     };
 
     if dock.mode.text != *label || dock.mode.color != color {
@@ -991,6 +994,7 @@ pub fn update_hints(
             }
             FocusArea::Dialog => "Enter: confirm \u{2502} Esc: cancel \u{2502} j/k: navigate",
         },
+        Screen::TimeWell => "Esc: back to conversation \u{2502} (time well)",
     };
 
     if dock.hints.text != hints {

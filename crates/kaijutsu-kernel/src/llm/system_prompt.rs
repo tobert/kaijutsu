@@ -158,11 +158,9 @@ pub fn extract_system_prompt_sections(blocks: &[BlockSnapshot]) -> Vec<String> {
 }
 
 fn state_to_str(state: ContextState) -> &'static str {
-    match state {
-        ContextState::Live => "live",
-        ContextState::Staging => "staging",
-        ContextState::Archived => "archived",
-    }
+    // Delegates to the canonical mapping so a new lifecycle value can't drift
+    // out of sync with the system prompt.
+    state.as_str()
 }
 
 fn xml_escape(s: &str) -> String {

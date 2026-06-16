@@ -5651,6 +5651,7 @@ dependencies = [
  "kaijutsu-kernel",
  "kaijutsu-telemetry",
  "kaijutsu-types",
+ "kaijutsu-viz",
  "kaish-kernel",
  "kurbo",
  "log",

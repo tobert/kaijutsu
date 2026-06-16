@@ -194,7 +194,7 @@ pub struct ContextMembership {
 }
 
 /// Context within a kernel (rich info from ContextHandleInfo wire type)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextInfo {
     pub id: ContextId,
     pub label: String,
@@ -211,6 +211,9 @@ pub struct ContextInfo {
     pub context_type: String,
     /// Whether this context has been archived.
     pub archived: bool,
+    /// Unix-millis of the explicit `conclude` act, or `None` if still open.
+    /// Drives the time-well's lifecycle banding (recent-concluded vs haystack).
+    pub concluded_at: Option<u64>,
     /// Synthesis keywords (empty if not yet synthesized).
     pub keywords: Vec<String>,
     /// Preview of the most representative block (empty if none).
@@ -1084,6 +1087,31 @@ impl KernelHandle {
         Ok(())
     }
 
+    /// Conclude a context — the explicit "this work is done" act. Sets the
+    /// context to the `concluded` lifecycle state and stamps `concludedAt`
+    /// server-side. Idempotent (re-concluding succeeds without restamping).
+    /// Returns a [`RpcError::ServerError`] with the server's message when the
+    /// context can't be concluded (unknown / archived).
+    #[tracing::instrument(skip(self), name = "rpc_client.conclude")]
+    pub async fn conclude(&self, context_id: ContextId) -> Result<(), RpcError> {
+        let mut request = self.kernel.conclude_request();
+        request.get().set_context_id(context_id.as_bytes());
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        let response = request.send().promise.await?;
+        let reader = response.get()?;
+        if reader.get_success() {
+            Ok(())
+        } else {
+            let msg = reader.get_error()?.to_str().unwrap_or("conclude failed");
+            Err(RpcError::ServerError(msg.to_string()))
+        }
+    }
+
     // ========================================================================
     // LLM Configuration
     // ========================================================================
@@ -1896,6 +1924,10 @@ fn parse_context_info(
         Some(fork_kind_str.to_string())
     };
     let archived = reader.get_archived_at() > 0;
+    let concluded_at = match reader.get_concluded_at() {
+        0 => None,
+        ts => Some(ts),
+    };
 
     let context_type_str = reader.get_context_type()?.to_str().unwrap_or("");
     let context_type = if context_type_str.is_empty() {
@@ -1937,6 +1969,7 @@ fn parse_context_info(
         fork_kind,
         context_type,
         archived,
+        concluded_at,
         keywords,
         top_block_preview,
     })

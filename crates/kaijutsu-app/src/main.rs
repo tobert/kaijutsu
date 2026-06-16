@@ -166,6 +166,8 @@ fn main() {
         .add_plugins(ui::dock::DockPlugin)
         // Drift state - context list + staged queue polling
         .add_plugins(ui::drift::DriftPlugin)
+        // Time-well context browser (radial 3D well; Ctrl+W to enter, Esc to leave)
+        .add_plugins(view::time_well::TimeWellPlugin)
         // Timeline navigation - temporal scrubbing through history
         .add_plugins(ui::timeline::TimelinePlugin)
         // Animation tweening for smooth mode transitions

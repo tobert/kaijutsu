@@ -279,6 +279,7 @@ mod tests {
             archived_at: None,
             workspace_id: None,
             preset_id: None,
+            concluded_at: None,
         }
     }
 

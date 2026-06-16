@@ -22,9 +22,12 @@ use crate::cell::{BlockCell, RoleGroupBorder};
 /// `OnEnter`/`OnExit` schedules handle visibility transitions.
 #[derive(States, Clone, Copy, Default, Eq, PartialEq, Hash, Debug, Reflect)]
 pub enum Screen {
-    /// Chat/shell conversation view (the only screen).
+    /// Chat/shell conversation view.
     #[default]
     Conversation,
+    /// Time-well context browser — the radial 3D well of context cards.
+    /// Full-viewport; conversation chrome is hidden while it is active.
+    TimeWell,
 }
 
 /// Plugin that registers the Screen state and its transition systems.
@@ -38,6 +41,16 @@ impl Plugin for ScreenPlugin {
         app.add_systems(
             OnEnter(Screen::Conversation),
             (show_conversation_root, show_cell_text, set_focus_conversation),
+        );
+
+        // ── TimeWell ──
+        // Hide the conversation chrome so the 3D well owns the viewport. The
+        // well's own camera + card entities are managed by the time_well plugin's
+        // OnEnter/OnExit systems. Returning to Conversation re-shows the chrome
+        // via the OnEnter(Conversation) systems above.
+        app.add_systems(
+            OnEnter(Screen::TimeWell),
+            (hide_conversation_root, hide_cell_text),
         );
     }
 }
@@ -63,6 +76,26 @@ fn show_cell_text(
     }
     for mut vis in role_headers.iter_mut() {
         *vis = Visibility::Inherited;
+    }
+}
+
+/// Hide the conversation root when leaving for the time well.
+fn hide_conversation_root(mut roots: Query<&mut Visibility, With<ConversationRoot>>) {
+    for mut vis in roots.iter_mut() {
+        *vis = Visibility::Hidden;
+    }
+}
+
+/// Hide block cells and role headers while the time well owns the viewport.
+fn hide_cell_text(
+    mut block_cells: Query<&mut Visibility, (With<BlockCell>, Without<RoleGroupBorder>)>,
+    mut role_headers: Query<&mut Visibility, (With<RoleGroupBorder>, Without<BlockCell>)>,
+) {
+    for mut vis in block_cells.iter_mut() {
+        *vis = Visibility::Hidden;
+    }
+    for mut vis in role_headers.iter_mut() {
+        *vis = Visibility::Hidden;
     }
 }
 

@@ -525,6 +525,7 @@ impl KjDispatcher {
                 archived_at: None,
                 workspace_id: source_ws,
                 preset_id: None,
+                concluded_at: None,
             };
             let default_ws =
                 match db.get_or_create_default_workspace(caller.principal_id) {
@@ -769,6 +770,7 @@ impl KjDispatcher {
                 archived_at: None,
                 workspace_id: source_ws,
                 preset_id: None,
+                concluded_at: None,
             };
             let default_ws =
                 match db.get_or_create_default_workspace(caller.principal_id) {
@@ -1001,6 +1003,8 @@ impl KjDispatcher {
                     archived_at: None,
                     workspace_id: row.workspace_id,
                     preset_id: row.preset_id,
+                    // A fresh fork is live, never inherits concluded status.
+                    concluded_at: None,
                 };
                 let default_ws =
                     match db.get_or_create_default_workspace(caller.principal_id) {
