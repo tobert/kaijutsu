@@ -293,6 +293,10 @@ enum RpcCommand {
     ListContexts {
         reply: oneshot::Sender<Result<Vec<ContextInfo>, CallError>>,
     },
+    Conclude {
+        context_id: ContextId,
+        reply: oneshot::Sender<Result<(), CallError>>,
+    },
     CreateContext {
         label: String,
         context_type: String,
@@ -542,6 +546,7 @@ impl RpcCommand {
             Self::DriftCancel { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetContextId { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ListContexts { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::Conclude { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::CreateContext { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::PushOps { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetBlocks { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -663,6 +668,13 @@ impl ActorHandle {
     #[tracing::instrument(skip(self))]
     pub async fn list_contexts(&self) -> Result<Vec<ContextInfo>, CallError> {
         self.send(|reply| RpcCommand::ListContexts { reply }).await
+    }
+
+    /// Conclude a context — the explicit "done" act (sets `concluded`/stamps
+    /// `concludedAt` server-side). Idempotent.
+    #[tracing::instrument(skip(self))]
+    pub async fn conclude(&self, context_id: ContextId) -> Result<(), CallError> {
+        self.send(|reply| RpcCommand::Conclude { context_id, reply }).await
     }
 
     #[tracing::instrument(skip(self))]
@@ -2058,6 +2070,9 @@ async fn dispatch_kernel_command(
         }
         RpcCommand::ListContexts { reply } => {
             dispatch!(kernel, reply, close_tx, k, k.list_contexts());
+        }
+        RpcCommand::Conclude { context_id, reply } => {
+            dispatch!(kernel, reply, close_tx, k, k.conclude(context_id));
         }
         RpcCommand::CreateContext {
             label,

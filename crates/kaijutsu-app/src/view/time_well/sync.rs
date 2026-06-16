@@ -84,6 +84,24 @@ pub fn sync_time_well(
         .collect();
     let positions = layout_positions(&contexts, &bands, &state.layout);
 
+    // ── Band-0 slot order: hot ids ascending by id (= the layout's slot order,
+    // since order_key is the id rank). This is what `0–9` address. ──
+    let mut hot_order: Vec<ContextId> = contexts
+        .iter()
+        .filter(|c| band_by_id.get(&c.id) == Some(&kaijutsu_viz::layout::Band::Hot))
+        .map(|c| c.id)
+        .collect();
+    hot_order.sort_unstable();
+    state.hot_order = hot_order;
+    // Keep selection valid: drop it if its context left the well; default to the
+    // first hot slot when nothing (valid) is selected.
+    let selection_valid = state
+        .selected
+        .is_some_and(|id| state.entities.contains_key(&id) || state.join.contains(&id));
+    if !selection_valid {
+        state.selected = state.hot_order.first().copied();
+    }
+
     // Resolve a target Vec3 per id up front (needs &state.geom).
     let geom = state.geom;
     let target_of = |id: &ContextId| positions.get(id).map(|p| lift(p, &geom));

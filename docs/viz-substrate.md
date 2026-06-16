@@ -438,8 +438,17 @@ first concrete consumer. The remaining steps are the `conclude` wire work
    `archived`-proxy with the real `concluded_at` and filters archived out of the
    snapshot. Verified end-to-end: concluding a context migrates its card from the
    hot rim to the recent-concluded ring. Open Question #1 below is resolved.
-6. **Active view** = band 0 (the hot compacting list) + band 1 (recent-concluded
-   clock), keyboard `ctrl-a 0–9` on band 0. First concrete consumer.
+6. 🟡 **Active view** = band 0 (hot compacting list) + band 1 (recent-concluded).
+   Band-0 keyboard interaction shipped (`scene::well_keyboard`): **plain `0–9`**
+   selects the hot card at that slot and switches to it (the tmux-`ctrl-a`
+   prefix was dropped — the well is a dedicated full-screen nav surface, so no
+   prefix is needed; decided with Amy 2026-06-16); arrows/Tab move the selection,
+   Enter switches, `c` concludes the selected (→ `ActorHandle::conclude` →
+   `KernelHandle::conclude`), Esc returns. Selection is highlighted by a scale
+   pop. Verified e2e: digit-switch changes the active context + exits; `c`
+   migrates the selected card hot→recent. *Remaining for step 6:* band-1 angle
+   refinement (the "clock" vs newest-first sweep — open question #2); the
+   selection highlight could be richer than a scale bump.
 7. **Haystack view** = band 2 as the second concrete consumer (semantic; wire in
    `searchSimilar`/`getNeighbors`/`getClusters`, cluster labels, on-demand
    lineage, drift-particle layer + its wire additions).

@@ -34,11 +34,13 @@ impl Plugin for TimeWellPlugin {
             .add_systems(
                 Update,
                 (
+                    scene::well_keyboard,
                     sync::sync_time_well,
                     sync::apply_block_status,
                     text::build_card_scenes,
                     scene::move_cards_toward_target,
                     scene::billboard_cards,
+                    scene::highlight_selection,
                 )
                     .chain()
                     .run_if(in_state(Screen::TimeWell)),

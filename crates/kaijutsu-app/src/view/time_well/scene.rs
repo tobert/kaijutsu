@@ -57,6 +57,11 @@ pub struct TimeWellState {
     pub geom: WellGeometry,
     /// Shared quad mesh for every card (built lazily on first enter).
     pub card_mesh: Option<Handle<Mesh>>,
+    /// Band-0 (hot) context ids in slot order — what `0–9` address. Rebuilt each
+    /// layout tick.
+    pub hot_order: Vec<ContextId>,
+    /// The currently-selected card (highlighted; the target of Enter / `c`).
+    pub selected: Option<ContextId>,
 }
 
 impl Default for TimeWellState {
@@ -91,6 +96,8 @@ impl Default for TimeWellState {
             layout: CompactingBandLayout::new(config),
             geom: WellGeometry::default(),
             card_mesh: None,
+            hot_order: Vec::new(),
+            selected: None,
         }
     }
 }
@@ -224,9 +231,107 @@ pub fn toggle_time_well(
     }
 }
 
+/// Digit-to-slot mapping for band-0 addressing (`0–9`).
+const DIGIT_KEYS: [(KeyCode, usize); 10] = [
+    (KeyCode::Digit0, 0),
+    (KeyCode::Digit1, 1),
+    (KeyCode::Digit2, 2),
+    (KeyCode::Digit3, 3),
+    (KeyCode::Digit4, 4),
+    (KeyCode::Digit5, 5),
+    (KeyCode::Digit6, 6),
+    (KeyCode::Digit7, 7),
+    (KeyCode::Digit8, 8),
+    (KeyCode::Digit9, 9),
+];
+
+/// Band-0 keyboard interaction (the active view): `0–9` select + switch to the
+/// hot card at that slot; arrows/Tab move the selection; Enter switches to the
+/// selected; `c` concludes the selected. Esc (back to conversation) lives in
+/// [`toggle_time_well`].
+pub fn well_keyboard(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut state: ResMut<TimeWellState>,
+    mut switch: MessageWriter<crate::view::components::ContextSwitchRequested>,
+    mut next: ResMut<NextState<Screen>>,
+    actor: Option<Res<crate::connection::RpcActor>>,
+) {
+    // `0–9`: jump straight to that hot slot and drop back into the conversation.
+    for (kc, n) in DIGIT_KEYS {
+        if keys.just_pressed(kc)
+            && let Some(&id) = state.hot_order.get(n)
+        {
+            switch.write(crate::view::components::ContextSwitchRequested { context_id: id });
+            next.set(Screen::Conversation);
+            return;
+        }
+    }
+
+    // Arrows / Tab move the selection around the hot ring.
+    let dir = if keys.just_pressed(KeyCode::ArrowDown)
+        || keys.just_pressed(KeyCode::ArrowRight)
+        || keys.just_pressed(KeyCode::Tab)
+    {
+        1i32
+    } else if keys.just_pressed(KeyCode::ArrowUp) || keys.just_pressed(KeyCode::ArrowLeft) {
+        -1
+    } else {
+        0
+    };
+    if dir != 0 && !state.hot_order.is_empty() {
+        let len = state.hot_order.len() as i32;
+        let cur = state
+            .selected
+            .and_then(|s| state.hot_order.iter().position(|&x| x == s))
+            .unwrap_or(0) as i32;
+        let idx = (((cur + dir) % len) + len) % len;
+        state.selected = Some(state.hot_order[idx as usize]);
+    }
+
+    // Enter: switch to the selected card.
+    if keys.just_pressed(KeyCode::Enter)
+        && let Some(id) = state.selected
+    {
+        switch.write(crate::view::components::ContextSwitchRequested { context_id: id });
+        next.set(Screen::Conversation);
+        return;
+    }
+
+    // `c`: conclude the selected context (fire-and-forget over RPC; the next
+    // DriftState poll re-bands its card from the hot rim to the recent ring).
+    if keys.just_pressed(KeyCode::KeyC)
+        && let Some(id) = state.selected
+        && let Some(actor) = actor
+    {
+        let handle = actor.handle.clone();
+        bevy::tasks::IoTaskPool::get()
+            .spawn(async move {
+                if let Err(e) = handle.conclude(id).await {
+                    log::warn!("well: conclude {} failed: {e}", id.short());
+                }
+            })
+            .detach();
+        info!("well: conclude {}", id.short());
+    }
+}
+
 // ============================================================================
 // PER-FRAME SYSTEMS
 // ============================================================================
+
+/// Pop the selected card (scale up) and settle the rest, easing for a soft feel.
+pub fn highlight_selection(state: Res<TimeWellState>, mut cards: Query<(&Card, &mut Transform)>) {
+    for (card, mut tf) in cards.iter_mut() {
+        let target = if Some(card.context_id) == state.selected {
+            1.3
+        } else {
+            1.0
+        };
+        let s = tf.scale.x;
+        let eased = s + (target - s) * 0.25;
+        tf.scale = Vec3::splat(eased);
+    }
+}
 
 /// Billboard every card to face the well camera. No built-in billboard in 0.18;
 /// this is the one-line `looking_at` per card the design doc calls for.
