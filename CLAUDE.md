@@ -17,11 +17,13 @@ from client applications.
 The kernel restates the cybernetic / 改善 / TDD coding posture in its
 own rc lifecycle: `/etc/rc/coder/create/S00-stance.md` reaches the
 model via the system-prompt slot for every context with
-`context_type=coder`. rc scripts are files under `/etc/rc`
-(`~/.config/kaijutsu/rc/`, read via the CRDT file cache); the embedded
-defaults live in `assets/defaults/rc/`. Edit a live script with
-`kj rc edit /etc/rc/coder/create/S00-stance.md` (or just `vim` the file);
-`kj rc reseed` restores the embedded default.
+`context_type=coder`. rc scripts at `/etc/rc` are **CRDT-owned** (the
+kernel is the sole owner — no host file, no write-through); the embedded
+defaults under `assets/defaults/rc/` seed the CRDT once on a fresh kernel.
+Edit a live script with `kj rc edit /etc/rc/coder/create/S00-stance.md`
+(there is no host file to `vim`); `kj rc reset <path>` restores one script
+to its embedded default. Change the shipped default by editing
+`assets/defaults/rc/` (the in-repo seed). See `docs/config-crdt-ownership.md`.
 
 ## Crate Structure
 

@@ -1032,56 +1032,10 @@ pub async fn create_shared_kernel(
     // Read-write /tmp for scratch/interop with external tools
     kernel.mount("/tmp", LocalBackend::new("/tmp")).await;
 
-    // Read-write rc tree: ~/.config/kaijutsu/rc mounted at /etc/rc. Longest-
-    // prefix wins over the read-only `/`, so this overrides only the rc
-    // subtree — the host's real /etc is never touched. rc lifecycle scripts
-    // live here as files and this deployed tree is the live source of truth:
-    // what `kj rc edit` / the in-app `vi` mutate and what dispatch runs.
-    let rc_dir = config_dir
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(self::config_dir)
-        .join("rc");
-    // Bootstrap-once: the embedded defaults seed the tree only on a genuinely
-    // fresh install (absent or empty). After that, boot never auto-writes the
-    // live tree again — a script you `rm`'d stays gone, a repo-dropped seed
-    // does not linger or resurrect (live is truth). Per-file recovery is
-    // `kj rc reset <path>`; bulk push/pull is left to git + kai scripts.
-    let fresh = std::fs::read_dir(&rc_dir)
-        .map(|mut entries| entries.next().is_none())
-        .unwrap_or(true); // unreadable/absent → treat as fresh
-    if fresh {
-        // One-time migration: a pre-files DB may carry user `kj rc add/edit`
-        // customizations in the legacy rc_scripts table. Write them first (only
-        // if absent) so the bootstrap seed below fills in the rest without
-        // shadowing them. New DBs have no such table → this is a no-op.
-        for (path, content) in kernel_db.legacy_rc_scripts() {
-            if let Some(rel) = path.strip_prefix(kaijutsu_kernel::seed_scripts::RC_VFS_ROOT) {
-                let dest = rc_dir.join(rel);
-                if !dest.exists() {
-                    if let Some(parent) = dest.parent() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                    if let Err(e) = std::fs::write(&dest, &content) {
-                        log::error!("rc migration: write {}: {e}", dest.display());
-                    } else {
-                        log::info!("rc migration: {path} -> {}", dest.display());
-                    }
-                }
-            }
-        }
-        match kaijutsu_kernel::seed_scripts::ensure_rc_seed_files(&rc_dir) {
-            Ok(n) => log::info!(
-                "bootstrapped {n} rc script file(s) into fresh tree {}",
-                rc_dir.display()
-            ),
-            Err(e) => log::error!("rc seed-to-disk failed for {}: {e}", rc_dir.display()),
-        }
-    }
-    kernel.mount("/etc/rc", LocalBackend::new(&rc_dir)).await;
-
-    // Freeze the mount table — security perimeter is now fixed.
-    // No more mount/unmount via RPC after this point.
-    kernel.freeze_mounts();
+    // The rc tree at /etc/rc is CRDT-owned (docs/config-crdt-ownership.md): no
+    // host mount, no host-disk seeding. It is mounted below, once the block
+    // store exists (the CRDT-native backend maps onto it) — and the mount table
+    // is frozen there, after every mount is in place.
 
     // Wrap KernelDb in Arc<Mutex> and create auto-workspaces
     let kernel_db_arc = Arc::new(parking_lot::Mutex::new(kernel_db));
@@ -1108,6 +1062,30 @@ pub async fn create_shared_kernel(
         input_flows,
     )
     .map_err(capnp::Error::failed)?;
+
+    // Mount the CRDT-native rc backend at /etc/rc (longest-prefix wins over the
+    // read-only `/`; the host's real /etc is never touched). The block store's
+    // load_from_db has already replayed any persisted rc Config docs; seed from
+    // the embedded defaults only when the rc namespace is still empty (a
+    // genuinely fresh kernel). After that the CRDT owns the content: a script
+    // you `rm`'d stays gone, a repo-dropped seed does not resurrect. Per-file
+    // recovery is `kj rc reset <path>`. Seeding failure is fatal — a kernel
+    // without its stance scripts must not come up pretending all is well.
+    let rc_fs = kaijutsu_kernel::runtime::config_crdt_fs::ConfigCrdtFs::new(
+        documents.clone(),
+        "/etc/rc",
+    );
+    if rc_fs.is_empty() {
+        let n = rc_fs.seed_from_embedded().map_err(|e| {
+            capnp::Error::failed(format!("rc seed into CRDT failed: {e}"))
+        })?;
+        log::info!("seeded {n} rc script(s) into the CRDT (fresh kernel)");
+    }
+    kernel.mount("/etc/rc", rc_fs).await;
+
+    // Freeze the mount table — security perimeter is now fixed.
+    // No more mount/unmount via RPC after this point.
+    kernel.freeze_mounts();
 
     // Create config backend
     let (config_backend, config_watcher) =
