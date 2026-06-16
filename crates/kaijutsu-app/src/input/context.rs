@@ -57,6 +57,15 @@ pub fn sync_input_context(
     // Global is always active
     active.0.push(InputContext::Global);
 
+    // The time-well is a dedicated full-screen surface that reads raw keyboard
+    // input directly (see `view::time_well::scene`). While it owns the screen, no
+    // conversation/compose binding contexts are active — otherwise well-nav keys
+    // like Tab (CycleFocusForward) and Space/i (SummonChat) leak into the compose
+    // layer and pop the prompt modal over the well. Only `Global` survives.
+    if matches!(screen.get(), Screen::TimeWell) {
+        return;
+    }
+
     // Within-conversation focus areas
     match focus.as_ref() {
         FocusArea::Compose => {

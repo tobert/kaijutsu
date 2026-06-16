@@ -144,10 +144,23 @@ pub fn assign_bands(contexts: &[ContextInfo]) -> Vec<Band> {
 /// context id.
 ///
 /// `bands` must be positionally aligned with `contexts` (as produced by
-/// [`assign_bands`]). The per-context `order_key` is the context's **rank in
-/// time order** — ids are UUIDv7, so sorting by id is creation order and is
-/// guaranteed unique, satisfying the layout's "unique `order_key` per band"
-/// precondition (no ties → stable slots independent of poll order).
+/// [`assign_bands`]). The `order_key` is **per-band**, because the two coordinates
+/// carry orthogonal meaning (see `docs/viz-substrate.md`, "The three bands"):
+///
+/// - **Hot** and **Haystack** key on the context's **creation rank** — id is a
+///   UUIDv7, so sorting by id is creation order and is guaranteed unique. Hot's
+///   slot order then matches the `0–9` digit addressing (`scene::hot_order` sorts
+///   by id), so muscle memory and geometry agree.
+/// - **RecentConcluded** keys on **conclusion recency** (`concluded_at` descending,
+///   id-tiebroken), so band-1 angle is "a clock of what I just finished": the
+///   most-recently-concluded context takes the anchor slot (0) and older
+///   conclusions sweep outward. This is the band whose angle the design assigns to
+///   *recency*, not creation — keying it on id (the old behavior) put it on the
+///   wrong axis.
+///
+/// Both rankings are dense and collision-free within their band, satisfying the
+/// layout's "unique `order_key` per band" precondition (no ties → stable slots
+/// independent of poll order).
 pub fn layout_positions(
     contexts: &[ContextInfo],
     bands: &[Band],
@@ -159,18 +172,41 @@ pub fn layout_positions(
         "bands must align with contexts"
     );
 
-    // Rank by id (UUIDv7 = time order, unique) → dense, collision-free order_key.
+    // Creation rank by id (UUIDv7 = time order, unique) for Hot / Haystack.
     let mut ids: Vec<ContextId> = contexts.iter().map(|c| c.id).collect();
     ids.sort_unstable();
-    let rank = |id: &ContextId| ids.binary_search(id).expect("id present") as i64;
+    let id_rank = |id: &ContextId| ids.binary_search(id).expect("id present") as i64;
+
+    // Recency rank for band 1: most-recently-concluded first (→ order_key 0 →
+    // anchor slot). Ties on `concluded_at` break by id ascending, matching the
+    // same tie-break `assign_band` uses to pick the top-N window — so the window
+    // membership and the angular order are derived consistently.
+    let mut recent: Vec<&ContextInfo> = contexts
+        .iter()
+        .zip(bands.iter())
+        .filter(|(_, b)| **b == Band::RecentConcluded)
+        .map(|(c, _)| c)
+        .collect();
+    recent.sort_by(|a, b| b.concluded_at.cmp(&a.concluded_at).then(a.id.cmp(&b.id)));
+    let recency_rank: std::collections::HashMap<ContextId, i64> = recent
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.id, i as i64))
+        .collect();
 
     let entries: Vec<ContextEntry<ContextId>> = contexts
         .iter()
         .zip(bands.iter())
-        .map(|(c, &band)| ContextEntry {
-            id: c.id,
-            band,
-            order_key: rank(&c.id),
+        .map(|(c, &band)| {
+            let order_key = match band {
+                Band::RecentConcluded => recency_rank[&c.id],
+                _ => id_rank(&c.id),
+            };
+            ContextEntry {
+                id: c.id,
+                band,
+                order_key,
+            }
         })
         .collect();
 
@@ -357,6 +393,54 @@ mod tests {
                 c.id
             );
         }
+    }
+
+    #[test]
+    fn band1_angle_tracks_conclusion_recency_not_id_order() {
+        use kaijutsu_viz::layout::{CompactingBandLayout, LayoutConfig};
+        let layout = CompactingBandLayout::new(LayoutConfig::default_config());
+
+        // Three concluded contexts whose *id* order (1<2<3) deliberately differs
+        // from their *conclusion* order: id 2 concluded last, id 1 first. With all
+        // three inside the recent-concluded window they share band 1, where angle
+        // must encode conclusion recency — so the newest (id 2) takes the anchor
+        // slot, not the lowest id.
+        let mk = |n: u8, concluded: u64| {
+            let mut c = ctx(id_of(n), "");
+            c.concluded_at = Some(concluded);
+            c
+        };
+        let contexts = vec![
+            mk(1, 100), // oldest conclusion
+            mk(2, 300), // newest conclusion
+            mk(3, 200), // middle
+        ];
+        let bands = assign_bands(&contexts);
+        assert!(
+            bands.iter().all(|&b| b == Band::RecentConcluded),
+            "all three should be recent-concluded for this N"
+        );
+        let pos = layout_positions(&contexts, &bands, &layout);
+
+        // Band-1 mid radius for the default config (total 300, 3 bands) is 150;
+        // slot 0 sits at the band's start angle (0 here) → (150, 0).
+        let r = 150.0_f32;
+        let slot = |s: usize| {
+            let pitch = std::f64::consts::TAU / 12.0; // default_config pitch
+            let theta = s as f64 * pitch;
+            ((r as f64 * theta.cos()) as f32, (r as f64 * theta.sin()) as f32)
+        };
+        let approx = |a: (f32, f32), b: (f32, f32)| {
+            (a.0 - b.0).abs() < 1e-2 && (a.1 - b.1).abs() < 1e-2
+        };
+
+        let p = |n: u8| (pos[&id_of(n)].x, pos[&id_of(n)].y);
+        // Newest conclusion (id 2) → slot 0 (anchor); middle (id 3) → slot 1;
+        // oldest (id 1) → slot 2. If angle had keyed on id order, id 1 would be
+        // at slot 0 and this would fail.
+        assert!(approx(p(2), slot(0)), "newest concluded must take the anchor slot 0, got {:?}", p(2));
+        assert!(approx(p(3), slot(1)), "middle conclusion must take slot 1, got {:?}", p(3));
+        assert!(approx(p(1), slot(2)), "oldest conclusion must take slot 2, got {:?}", p(1));
     }
 
     #[test]

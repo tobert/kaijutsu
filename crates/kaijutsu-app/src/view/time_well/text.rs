@@ -15,7 +15,7 @@
 
 use bevy::prelude::*;
 use vello::Scene;
-use vello::kurbo::{Affine, RoundedRect};
+use vello::kurbo::{Affine, RoundedRect, Stroke};
 use vello::peniko::{Brush, Color as VColor, Fill};
 
 use super::scene::{CARD_TEX_H, CARD_TEX_W, Card, accent_color};
@@ -181,6 +181,32 @@ fn build_card_scene(card: &Card, font: &VelloFont) -> Scene {
         };
         let l = font.layout(&tail, &style, VelloTextAlign::Left, max_advance);
         draw_layout(&mut scene, &l, (PAD as f64, y as f64), &brush);
+    }
+
+    // ── Selection ring (drawn last, on top): a saturated outer halo stroke under
+    // a bright inner edge, reading as a glow around the card. Both strokes are
+    // opaque on purpose — the card material is `AlphaMode::Mask(0.5)`, which clamps
+    // alpha to binary, so a translucent glow would simply be discarded. We fake the
+    // falloff with width + color instead. Only present when selected; the
+    // `selected` flag flips on select/deselect, rebuilding this scene. ──
+    if card.selected {
+        // Outer halo: wide, saturated blue, just inside the texture bounds.
+        let ring = RoundedRect::new(3.5, 3.5, (w - 3.5) as f64, (h - 3.5) as f64, 13.0);
+        scene.stroke(
+            &Stroke::new(7.0),
+            Affine::IDENTITY,
+            &Brush::Solid(VColor::new([0.20, 0.55, 0.95, 1.0])),
+            None,
+            &ring,
+        );
+        // Bright inner edge over the halo.
+        scene.stroke(
+            &Stroke::new(2.5),
+            Affine::IDENTITY,
+            &Brush::Solid(VColor::new([0.90, 0.97, 1.0, 1.0])),
+            None,
+            &ring,
+        );
     }
 
     scene

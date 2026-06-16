@@ -154,6 +154,7 @@ pub fn sync_time_well(
                     context_id: id,
                     data,
                     status: None,
+                    selected: false,
                 },
                 CardTarget(pos),
                 Mesh3d(card_mesh.clone()),

@@ -8,6 +8,8 @@ use bevy::prelude::*;
 use kaijutsu_types::ContextId;
 use kaijutsu_viz::layout::CompactingBandLayout;
 
+use kaijutsu_viz::layout::Band;
+
 use super::card::{CardData, WellGeometry};
 use crate::ui::screen::Screen;
 
@@ -25,6 +27,11 @@ pub struct Card {
     /// Live status from block events; `None` until a status event arrives for
     /// this context. The data tick mutates this without ever relaying out.
     pub status: Option<kaijutsu_types::Status>,
+    /// Whether this card is the current selection. Drives the in-texture
+    /// selection ring (see `text::build_card_scene`); flipped by
+    /// [`highlight_selection`] only when it actually changes, so a card's scene
+    /// rebuilds on select/deselect but not every frame.
+    pub selected: bool,
 }
 
 /// Parent entity owning all card entities + the well camera. Despawned (with its
@@ -73,7 +80,14 @@ impl Default for TimeWellState {
         // would z-fight / swap under transparent sorting; keeping pitch * count
         // < TAU avoids that for the expected card counts.
         let pitch = std::f64::consts::TAU / 24.0;
+        // Band 1 (RecentConcluded) anchors at the top (12 o'clock, +Y) so the
+        // "clock of what I just finished" reads newest-up; older conclusions sweep
+        // counter-clockwise from there. Hot/Haystack start at 0 (3 o'clock). The
+        // band-1 order_key is conclusion-recency (see `card::layout_positions`), so
+        // slot 0 == anchor == most-recently-concluded.
+        let band1_anchor = std::f64::consts::FRAC_PI_2;
         let config = LayoutConfig {
+            // Index order is [Haystack, RecentConcluded, Hot] (Band::index).
             total_radius: 300.0,
             band_angles: [
                 BandAngleConfig {
@@ -81,7 +95,7 @@ impl Default for TimeWellState {
                     pitch,
                 },
                 BandAngleConfig {
-                    start_angle: 0.0,
+                    start_angle: band1_anchor,
                     pitch,
                 },
                 BandAngleConfig {
@@ -319,14 +333,40 @@ pub fn well_keyboard(
 // PER-FRAME SYSTEMS
 // ============================================================================
 
-/// Pop the selected card (scale up) and settle the rest, easing for a soft feel.
-pub fn highlight_selection(state: Res<TimeWellState>, mut cards: Query<(&Card, &mut Transform)>) {
-    for (card, mut tf) in cards.iter_mut() {
-        let target = if Some(card.context_id) == state.selected {
-            1.3
-        } else {
-            1.0
-        };
+/// Per-band base card scale. Colder bands render smaller — the design's "history
+/// grows denser, not bigger": at the tighter inner radii, full-size cards would
+/// overlap into an unreadable pile, so each band shrinks to roughly fit its ring
+/// pitch. (This is the interim before the step-7 chip/sediment LOD; it reads as
+/// depth/coldness in the meantime.)
+fn band_base_scale(band: Band) -> f32 {
+    match band {
+        Band::Hot => 1.0,
+        Band::RecentConcluded => 0.62,
+        Band::Haystack => 0.42,
+    }
+}
+
+/// Scale each card toward its per-band base size, popping the selected one. The
+/// `selected` flag is written so its texture grows a selection ring; it is only
+/// written when it flips, so the ring rebuilds on select/deselect without
+/// re-rasterizing the card every frame. The scale tween itself runs every frame
+/// (eased) for a soft feel.
+pub fn highlight_selection(
+    state: Res<TimeWellState>,
+    mut cards: Query<(&mut Card, &mut Transform)>,
+) {
+    for (mut card, mut tf) in cards.iter_mut() {
+        let is_sel = Some(card.context_id) == state.selected;
+
+        // Ring flag: write through the `Mut` only on a real change so we don't
+        // trip `Changed<Card>` (the scene-rebuild trigger) every frame.
+        if card.selected != is_sel {
+            card.selected = is_sel;
+        }
+
+        // Target = the band's base size, popped by 1.35× while selected.
+        let base = band_base_scale(card.data.band);
+        let target = if is_sel { base * 1.35 } else { base };
         let s = tf.scale.x;
         let eased = s + (target - s) * 0.25;
         tf.scale = Vec3::splat(eased);
