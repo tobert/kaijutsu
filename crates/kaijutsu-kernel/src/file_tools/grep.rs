@@ -8,7 +8,7 @@ use serde::Deserialize;
 use crate::execution::{ExecContext, ExecResult};
 use crate::vfs::{MountTable, VfsOps};
 
-use super::cache::FileDocumentCache;
+use super::cache::{CacheReadError, FileDocumentCache};
 use super::guard::WorkspaceGuard;
 use super::path::resolve_str;
 use super::vfs_walker::VfsWalkerAdapter;
@@ -120,15 +120,26 @@ impl GrepEngine {
             let path_str = file_path.display().to_string();
 
             // Try reading from CRDT cache first (sees uncommitted edits),
-            // fall back to raw VFS read with pre-flight size check
-            let content = match self.cache.read_content(&path_str).await {
+            // fall back to raw VFS read with pre-flight size check.
+            // NotCached = binary or absent → fall through to VFS (correct).
+            // Backend = real CRDT error → emit a warning line and skip; a
+            // swallowed Backend error would produce silent false negatives,
+            // so we surface it in output rather than silently continuing.
+            let content = match self.cache.try_read_content(&path_str).await {
                 Ok(c) => {
                     if c.len() > MAX_FILE_SIZE {
                         continue;
                     }
                     c
                 }
-                Err(_) => {
+                Err(CacheReadError::Backend(e)) => {
+                    // Emit a visible warning in the result so the caller knows
+                    // a file was skipped due to a real error, not just because
+                    // it was binary. False negatives are worse than noisy output.
+                    output.push_str(&format!("# WARNING: skipped {} (CRDT error: {})\n", path_str, e));
+                    continue;
+                }
+                Err(CacheReadError::NotCached) => {
                     // Check size before loading to avoid OOM on huge files
                     if let Ok(attr) = self.vfs.getattr(file_path).await
                         && attr.size as usize > MAX_FILE_SIZE
@@ -138,7 +149,7 @@ impl GrepEngine {
                     match self.vfs.read_all(file_path).await {
                         Ok(bytes) => match String::from_utf8(bytes) {
                             Ok(s) => s,
-                            Err(_) => continue, // skip binary files
+                            Err(_) => continue, // binary file — skip silently
                         },
                         Err(_) => continue,
                     }

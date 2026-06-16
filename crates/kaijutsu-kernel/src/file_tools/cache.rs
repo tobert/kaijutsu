@@ -18,6 +18,34 @@ use kaijutsu_types::DocKind;
 /// Default maximum cached file documents.
 const DEFAULT_MAX_CACHED: usize = 64;
 
+/// Typed error from [`FileDocumentCache::try_read_content`].
+///
+/// The two variants must be treated differently by callers:
+/// - [`CacheReadError::NotCached`] is **benign**: the file is absent, binary,
+///   or otherwise not representable in the CRDT text substrate. Callers *may*
+///   fall through to a raw VFS read or treat the file as absent.
+/// - [`CacheReadError::Backend`] is a **real failure** (CRDT store I/O, block
+///   not found in a live document, etc.). Callers *must* surface it — serving
+///   stale or empty bytes in place of a Backend error is silent data corruption.
+#[derive(Debug)]
+pub enum CacheReadError {
+    /// File is absent, became binary, or can't be decoded as UTF-8.
+    /// Benign: fall through to a raw read or treat as absent.
+    NotCached,
+    /// A real backend or CRDT store error. Surface it; never silently substitute
+    /// stale bytes or an empty string.
+    Backend(String),
+}
+
+impl std::fmt::Display for CacheReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CacheReadError::NotCached => write!(f, "file not in CRDT cache (binary or missing)"),
+            CacheReadError::Backend(e) => write!(f, "{e}"),
+        }
+    }
+}
+
 /// A cached file backed by a CRDT document.
 struct CachedFileDoc {
     /// Deterministic ContextId derived from the file path.
@@ -229,19 +257,190 @@ impl FileDocumentCache {
     }
 
     /// Read the current content of a file (reflects any CRDT edits).
+    ///
+    /// This is the legacy opaque-error wrapper kept for call sites that already
+    /// have an appropriate error context (e.g. `ExecResult::failure`). New call
+    /// sites that need to distinguish a benign miss from a real failure should
+    /// use [`try_read_content`](Self::try_read_content) instead.
     pub async fn read_content(&self, path: &str) -> Result<String, String> {
-        let (ctx_id, block_id) = self.get_or_load(path).await?;
+        self.try_read_content(path)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Like [`read_content`](Self::read_content) but returns a typed
+    /// [`CacheReadError`] so callers can distinguish benign misses from real
+    /// failures.
+    ///
+    /// Error classification:
+    /// - VFS "not found" → [`CacheReadError::NotCached`] (file absent; benign)
+    /// - UTF-8 decode failure → [`CacheReadError::NotCached`] (binary file; benign)
+    /// - Any other VFS or CRDT store error → [`CacheReadError::Backend`] (real)
+    pub async fn try_read_content(&self, path: &str) -> Result<String, CacheReadError> {
+        let (ctx_id, block_id) = self
+            .try_get_or_load(path)
+            .await
+            .map_err(|e| match e {
+                CacheReadError::NotCached => CacheReadError::NotCached,
+                CacheReadError::Backend(msg) => CacheReadError::Backend(msg),
+            })?;
 
         let snapshots = self
             .block_store
             .block_snapshots(ctx_id)
-            .map_err(|e| format!("failed to read {}: {}", path, e))?;
+            .map_err(|e| CacheReadError::Backend(format!("failed to read {}: {}", path, e)))?;
 
+        // A block missing from a live document is a real inconsistency (Backend),
+        // not a benign miss — the document exists but is structurally broken.
         snapshots
             .iter()
             .find(|s| s.id == block_id)
             .map(|s| s.content.clone())
-            .ok_or_else(|| format!("block not found in document for {}", path))
+            .ok_or_else(|| {
+                CacheReadError::Backend(format!("block not found in document for {}", path))
+            })
+    }
+
+    /// Typed variant of [`get_or_load`](Self::get_or_load): classifies errors at
+    /// the source so callers can act on benign misses separately from real
+    /// backend failures.
+    async fn try_get_or_load(&self, path: &str) -> Result<(ContextId, BlockId), CacheReadError> {
+        let ctx_id = file_context_id(path);
+        let vfs_path = std::path::Path::new(path);
+
+        // Fast path: already cached — same as get_or_load.
+        let cached = {
+            let mut cache = self.cache.write();
+            cache.get_mut(&ctx_id).map(|e| {
+                e.last_access = Instant::now();
+                (e.context_id, e.block_id, e.dirty, e.loaded_mtime)
+            })
+        };
+        if let Some((cid, bid, dirty, loaded_mtime)) = cached {
+            if dirty {
+                return Ok((cid, bid));
+            }
+            let disk_mtime = self.vfs.getattr(vfs_path).await.ok().map(|a| a.mtime);
+            let stale = matches!((disk_mtime, loaded_mtime), (Some(d), Some(l)) if d > l);
+            if !stale {
+                return Ok((cid, bid));
+            }
+            match self.reload_block_from_disk(ctx_id, &bid, path).await {
+                Ok(()) => return Ok((cid, bid)),
+                Err(_) => {
+                    // Reload failures (binary, unreadable, removed) are benign:
+                    // the file just can't live in the CRDT substrate any more.
+                    // Drop the stale entry and let the caller fall through to a
+                    // raw VFS read — this matches get_or_load's behaviour.
+                    self.cache.write().remove(&ctx_id);
+                    return Err(CacheReadError::NotCached);
+                }
+            }
+        }
+
+        // Cache miss: load from VFS. Classify errors.
+        // VfsError::NotFound is the typed variant. VfsError::Io wraps OS errors
+        // (from io::From<io::Error>), so a missing file arrives as
+        // VfsError::Io(ErrorKind::NotFound) from the LocalBackend's getattr call
+        // — we must detect both forms and treat them as NotCached (benign).
+        let content = match self.vfs.read_all(vfs_path).await {
+            Ok(bytes) => bytes,
+            Err(crate::vfs::VfsError::NotFound(_)) => {
+                return Err(CacheReadError::NotCached);
+            }
+            Err(crate::vfs::VfsError::Io(ref io_err))
+                if io_err.kind() == std::io::ErrorKind::NotFound =>
+            {
+                // LocalBackend maps ENOENT through io::Error → VfsError::Io.
+                return Err(CacheReadError::NotCached);
+            }
+            Err(e) => {
+                return Err(CacheReadError::Backend(format!(
+                    "failed to read {}: {}",
+                    path, e
+                )));
+            }
+        };
+
+        let text = match String::from_utf8(content) {
+            Ok(s) => s,
+            Err(_) => {
+                // Binary file — not an error, just not representable as CRDT text.
+                return Err(CacheReadError::NotCached);
+            }
+        };
+
+        let loaded_mtime = self.vfs.getattr(vfs_path).await.ok().map(|a| a.mtime);
+        let language = detect_language(path);
+
+        let block_id = match self
+            .block_store
+            .create_document(ctx_id, DocKind::Code, language)
+        {
+            Ok(()) => self
+                .block_store
+                .insert_block(
+                    ctx_id,
+                    None,
+                    None,
+                    Role::System,
+                    BlockKind::Text,
+                    text,
+                    Status::Done,
+                    ContentType::Plain,
+                )
+                .map_err(|e| {
+                    CacheReadError::Backend(format!(
+                        "failed to insert block for {}: {}",
+                        path, e
+                    ))
+                })?,
+            Err(_) => {
+                {
+                    let mut cache = self.cache.write();
+                    if let Some(entry) = cache.get_mut(&ctx_id) {
+                        entry.last_access = Instant::now();
+                        return Ok((entry.context_id, entry.block_id));
+                    }
+                }
+                let snapshots = self
+                    .block_store
+                    .block_snapshots(ctx_id)
+                    .map_err(|e| {
+                        CacheReadError::Backend(format!(
+                            "failed to read existing doc {}: {}",
+                            path, e
+                        ))
+                    })?;
+                snapshots
+                    .first()
+                    .map(|s| s.id)
+                    .ok_or_else(|| {
+                        CacheReadError::Backend(format!(
+                            "document {} exists but has no blocks",
+                            path
+                        ))
+                    })?
+            }
+        };
+
+        {
+            let mut cache = self.cache.write();
+            self.evict_if_needed(&mut cache);
+            cache.insert(
+                ctx_id,
+                CachedFileDoc {
+                    context_id: ctx_id,
+                    path: path.to_string(),
+                    block_id,
+                    dirty: false,
+                    last_access: Instant::now(),
+                    loaded_mtime,
+                },
+            );
+        }
+
+        Ok((ctx_id, block_id))
     }
 
     /// Create or replace a file's content.
@@ -708,5 +907,88 @@ mod tests {
         // files, so detection must not resurrect them.
         assert_eq!(detect_language("config.ron"), None);
         assert_eq!(detect_language("plugin.rhai"), None);
+    }
+
+    /// Regression: a Backend error on `try_read_content` must be returned as
+    /// `Err(CacheReadError::Backend(...))`, NOT silently collapsed to
+    /// `Err(CacheReadError::NotCached)`. This test MUST FAIL on any code that
+    /// flattens Backend into NotCached (e.g. via `unwrap_or(NotCached)`).
+    ///
+    /// Technique: write a file through the cache to populate the in-memory entry,
+    /// then delete the CRDT document from the block store so the next
+    /// `block_snapshots` call fails — simulating a store inconsistency.
+    #[tokio::test]
+    async fn try_read_content_backend_error_is_not_swallowed_as_not_cached() {
+        let (vfs, cache) = tmp_cache().await;
+
+        // Write through the cache so the CRDT document exists.
+        vfs.write_all(p("/tmp/backend_err.txt"), b"content")
+            .await
+            .unwrap();
+        assert_eq!(
+            cache.read_content("/tmp/backend_err.txt").await.unwrap(),
+            "content"
+        );
+
+        // Destroy the CRDT document (simulates store corruption / inconsistency).
+        // The cache entry (in-memory) still points to the now-gone context_id.
+        let ctx_id = file_context_id("/tmp/backend_err.txt");
+        cache
+            .block_store
+            .delete_document(ctx_id)
+            .expect("setup: delete_document must succeed");
+
+        // try_read_content must return Backend, not NotCached.
+        // A NotCached result would cause callers to fall through to a raw disk
+        // read and silently serve stale on-disk bytes — silent data corruption.
+        let err = cache
+            .try_read_content("/tmp/backend_err.txt")
+            .await
+            .expect_err("must fail after block store deletion");
+        assert!(
+            matches!(err, CacheReadError::Backend(_)),
+            "expected Backend, got NotCached — old code swallowed the error"
+        );
+    }
+
+    /// Regression: `try_read_content` on a binary file (not UTF-8 representable
+    /// in the CRDT substrate) must return `NotCached`, not `Backend`. Callers
+    /// such as grep fall through to a raw VFS read for binary files and must
+    /// not be blocked by a spurious backend error.
+    #[tokio::test]
+    async fn try_read_content_binary_file_is_not_cached() {
+        let (vfs, cache) = tmp_cache().await;
+
+        // Write binary content (invalid UTF-8) directly to the VFS.
+        vfs.write_all(p("/tmp/binary.bin"), b"\xff\xfe\x00\x01binary")
+            .await
+            .unwrap();
+
+        // Must be NotCached — not a backend error. Old code returned an opaque
+        // String error that callers couldn't distinguish from a real failure.
+        let err = cache
+            .try_read_content("/tmp/binary.bin")
+            .await
+            .expect_err("binary file must not decode as CRDT text");
+        assert!(
+            matches!(err, CacheReadError::NotCached),
+            "binary file must be NotCached, not Backend: {:?}", err
+        );
+    }
+
+    /// Regression: `try_read_content` on a file that doesn't exist must return
+    /// `NotCached` (benign fallthrough), not `Backend`.
+    #[tokio::test]
+    async fn try_read_content_absent_file_is_not_cached() {
+        let (_vfs, cache) = tmp_cache().await;
+
+        let err = cache
+            .try_read_content("/tmp/no_such_file_xyz.txt")
+            .await
+            .expect_err("absent file must fail");
+        assert!(
+            matches!(err, CacheReadError::NotCached),
+            "absent file must be NotCached, not Backend: {:?}", err
+        );
     }
 }

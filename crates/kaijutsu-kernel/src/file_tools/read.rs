@@ -6,7 +6,7 @@ use serde::Deserialize;
 
 use crate::execution::{ExecContext, ExecResult};
 
-use super::cache::FileDocumentCache;
+use super::cache::{CacheReadError, FileDocumentCache};
 use super::guard::WorkspaceGuard;
 use super::path::resolve_str;
 
@@ -68,9 +68,16 @@ impl ReadEngine {
             return Ok(denied);
         }
 
-        match self.cache.read_content(&path).await {
+        // NotCached (binary or missing) → explicit not-found message so the
+        // model gets a clear signal rather than a generic error string.
+        // Backend → real error; surface it so wrong content is never returned.
+        match self.cache.try_read_content(&path).await {
             Ok(content) => Ok(ExecResult::success(render(&content, &path, p.offset, p.limit))),
-            Err(e) => Ok(ExecResult::failure(1, e)),
+            Err(CacheReadError::NotCached) => Ok(ExecResult::failure(
+                1,
+                format!("{}: not found or not a text file", path),
+            )),
+            Err(CacheReadError::Backend(e)) => Ok(ExecResult::failure(1, e)),
         }
     }
 }

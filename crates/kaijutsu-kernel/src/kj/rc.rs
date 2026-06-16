@@ -15,6 +15,8 @@ use kaijutsu_types::ContentType;
 use regex::Regex;
 use std::sync::OnceLock;
 
+use crate::file_tools::CacheReadError;
+
 use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
 
 #[derive(Parser, Debug)]
@@ -293,9 +295,17 @@ impl KjDispatcher {
             Err(e) => return KjResult::Err(format!("kj rc show: {e}")),
         };
         let cache = self.rc_cache();
-        let content = match cache.read_content(path).await {
+        // NotCached = script absent or binary — surface as "not found".
+        // Backend = real CRDT error — surface the detail so the user can
+        // diagnose a broken store rather than getting a misleading "not found".
+        let content = match cache.try_read_content(path).await {
             Ok(c) => c,
-            Err(_) => return KjResult::Err(format!("kj rc show: '{path}' not found")),
+            Err(CacheReadError::NotCached) => {
+                return KjResult::Err(format!("kj rc show: '{path}' not found"))
+            }
+            Err(CacheReadError::Backend(e)) => {
+                return KjResult::Err(format!("kj rc show: '{path}': {e}"))
+            }
         };
 
         // Metadata is derived from the canonical path; provenance lives in

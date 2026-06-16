@@ -25,7 +25,7 @@ use kaish_kernel::{
 };
 
 use crate::file_tools::path::resolve_str;
-use crate::file_tools::FileDocumentCache;
+use crate::file_tools::{CacheReadError, FileDocumentCache};
 use crate::vfs::{FileType, MountTable, SetAttr, VfsError, VfsOps};
 
 use super::kaish_backend::KaijutsuBackend;
@@ -266,11 +266,18 @@ impl KernelBackend for MountBackend {
         // mint a CRDT document — pass it straight through the VFS.
         if self.mount_table.is_writable(path).await {
             let key = self.cache_key(path)?;
-            if let Ok(text) = self.file_cache.read_content(&key).await {
-                return Ok(apply_range(text.into_bytes(), range));
+            match self.file_cache.try_read_content(&key).await {
+                Ok(text) => return Ok(apply_range(text.into_bytes(), range)),
+                Err(CacheReadError::NotCached) => {
+                    // Missing or binary: fall through to a raw read so `cat`
+                    // on a binary or absent file still works as expected.
+                }
+                Err(CacheReadError::Backend(e)) => {
+                    // A real CRDT/store error: refuse to serve stale disk bytes
+                    // in its place — that would be silent data corruption.
+                    return Err(BackendError::Io(e));
+                }
             }
-            // Missing or binary: fall through to a raw read so `cat` on a
-            // binary still works.
         }
         if !self.mount_table.exists(path).await {
             return Err(BackendError::NotFound(path.display().to_string()));
@@ -354,8 +361,21 @@ impl KernelBackend for MountBackend {
                 return Ok(());
             }
         };
-        // Append onto current CRDT content (empty if the file is new).
-        let existing = self.file_cache.read_content(&key).await.unwrap_or_default();
+        // Append onto current CRDT content.
+        // NotCached = new file or binary; treat as empty (correct for append-to-new).
+        // Backend = real store error; refuse — unwrap_or_default() here would
+        // silently wipe the file by appending `suffix` onto "" and overwriting.
+        let existing = match self.file_cache.try_read_content(&key).await {
+            Ok(text) => text,
+            Err(CacheReadError::NotCached) => String::new(),
+            Err(CacheReadError::Backend(e)) => {
+                return Err(BackendError::Io(format!(
+                    "append {}: cannot read current content (would wipe file): {}",
+                    path.display(),
+                    e
+                )));
+            }
+        };
         let combined = format!("{existing}{suffix}");
         self.file_cache
             .create_or_replace(&key, &combined)
@@ -377,10 +397,19 @@ impl KernelBackend for MountBackend {
         let writable = self.mount_table.is_writable(path).await;
         let key = self.cache_key(path)?;
         let mut text = if writable {
-            self.file_cache
-                .read_content(&key)
-                .await
-                .map_err(BackendError::Io)?
+            // For patch on a writable mount, both NotCached and Backend are
+            // errors: we can't safely apply patch ops without the current content.
+            // NotCached means the file is absent or binary — patching it is a
+            // caller mistake; surface NotFound so the caller gets a clear signal.
+            match self.file_cache.try_read_content(&key).await {
+                Ok(t) => t,
+                Err(CacheReadError::NotCached) => {
+                    return Err(BackendError::NotFound(path.display().to_string()));
+                }
+                Err(CacheReadError::Backend(e)) => {
+                    return Err(BackendError::Io(e));
+                }
+            }
         } else {
             let bytes = self
                 .mount_table
@@ -1027,5 +1056,137 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(data, b"hello world");
+    }
+
+    /// Regression: a Backend error during `append`'s pre-read must NOT wipe the
+    /// file by appending `suffix` onto "" and overwriting. The old code used
+    /// `read_content(...).unwrap_or_default()`, which mapped a real backend
+    /// failure to an empty string — effectively truncating the file to just the
+    /// appended suffix.
+    ///
+    /// This test MUST FAIL on code that uses `unwrap_or_default()` on the read
+    /// (or any variant that silently falls back to empty on a Backend error).
+    #[tokio::test]
+    async fn append_backend_error_does_not_wipe_file() {
+        let blocks = shared_block_store(PrincipalId::system());
+        let kernel = Arc::new(KaijutsuKernel::new_ephemeral("test-append-nowipe").await);
+        let sid = kaijutsu_types::SessionId::new();
+        let session_contexts = crate::runtime::context_engine::session_context_map();
+        session_contexts.insert(sid, kaijutsu_types::ContextId::new());
+
+        let mount_table = Arc::new(MountTable::new());
+        mount_table.mount("/tmp", MemoryBackend::new()).await;
+        let file_cache = Arc::new(FileDocumentCache::new(blocks.clone(), mount_table.clone()));
+        let docs = Arc::new(KaijutsuBackend::new(
+            blocks,
+            kernel,
+            PrincipalId::system(),
+            session_contexts,
+            sid,
+        ));
+        let backend = MountBackend::new(mount_table, docs, file_cache.clone());
+
+        // Write the initial file content through the backend.
+        backend
+            .write(Path::new("/tmp/nowipe.txt"), b"keep me", WriteMode::Overwrite)
+            .await
+            .unwrap();
+
+        // Verify the file is readable before we induce the fault.
+        assert_eq!(
+            backend.read(Path::new("/tmp/nowipe.txt"), None).await.unwrap(),
+            b"keep me"
+        );
+
+        // Destroy the CRDT document from the block store to simulate a Backend
+        // error on the next read — the in-memory cache entry still points to
+        // the now-gone context_id.
+        let ctx_id = {
+            use uuid::Uuid;
+            use kaijutsu_crdt::ContextId;
+            let uuid = Uuid::new_v5(
+                &Uuid::NAMESPACE_URL,
+                b"kaijutsu:file:/tmp/nowipe.txt",
+            );
+            ContextId::from_bytes(*uuid.as_bytes())
+        };
+        file_cache
+            .block_store()
+            .delete_document(ctx_id)
+            .expect("setup: delete_document must succeed");
+
+        // Append must FAIL (Backend error) rather than wipe the file.
+        let result = backend.append(Path::new("/tmp/nowipe.txt"), b" suffix").await;
+        assert!(
+            result.is_err(),
+            "append over a broken block store must fail, not silently wipe the file"
+        );
+
+        // The underlying VFS file must still contain the original content.
+        // On old code this would contain only " suffix" (the file was wiped).
+        let raw = backend
+            .mount_table
+            .read_all(Path::new("/tmp/nowipe.txt"))
+            .await
+            .unwrap();
+        assert_eq!(
+            raw, b"keep me",
+            "file must not be wiped by a failed append: got {:?}",
+            String::from_utf8_lossy(&raw)
+        );
+    }
+
+    /// Regression: a Backend error during `read` must return `Err`, NOT fall
+    /// through to serve stale on-disk bytes. The old code used a blanket `if
+    /// let Ok(text) = read_content(...)` which silently served disk content when
+    /// the CRDT store was broken — silent data corruption.
+    ///
+    /// This test MUST FAIL on code that uses `if let Ok(text) = read_content`
+    /// (or any pattern that falls through on ALL errors, not just NotCached).
+    #[tokio::test]
+    async fn read_backend_error_does_not_serve_stale_disk_bytes() {
+        let blocks = shared_block_store(PrincipalId::system());
+        let kernel = Arc::new(KaijutsuKernel::new_ephemeral("test-read-nostalefallback").await);
+        let sid = kaijutsu_types::SessionId::new();
+        let session_contexts = crate::runtime::context_engine::session_context_map();
+        session_contexts.insert(sid, kaijutsu_types::ContextId::new());
+
+        let mount_table = Arc::new(MountTable::new());
+        mount_table.mount("/tmp", MemoryBackend::new()).await;
+        let file_cache = Arc::new(FileDocumentCache::new(blocks.clone(), mount_table.clone()));
+        let docs = Arc::new(KaijutsuBackend::new(
+            blocks,
+            kernel,
+            PrincipalId::system(),
+            session_contexts,
+            sid,
+        ));
+        let backend = MountBackend::new(mount_table.clone(), docs, file_cache.clone());
+
+        // Write the file through the backend so it's in the CRDT cache AND on disk.
+        backend
+            .write(Path::new("/tmp/stale.txt"), b"crdt-content", WriteMode::Overwrite)
+            .await
+            .unwrap();
+
+        // Destroy the CRDT document to force a Backend error on next read.
+        let ctx_id = {
+            use uuid::Uuid;
+            use kaijutsu_crdt::ContextId;
+            let uuid = Uuid::new_v5(&Uuid::NAMESPACE_URL, b"kaijutsu:file:/tmp/stale.txt");
+            ContextId::from_bytes(*uuid.as_bytes())
+        };
+        file_cache
+            .block_store()
+            .delete_document(ctx_id)
+            .expect("setup: delete_document must succeed");
+
+        // On old code: Backend error → falls through → serves "crdt-content"
+        // from disk (stale, wrong). On new code: must return Err.
+        let result = backend.read(Path::new("/tmp/stale.txt"), None).await;
+        assert!(
+            result.is_err(),
+            "read must return Err on a Backend error, not serve stale disk bytes"
+        );
     }
 }

@@ -6,7 +6,7 @@ use serde::Deserialize;
 
 use crate::execution::{ExecContext, ExecResult};
 
-use super::cache::FileDocumentCache;
+use super::cache::{CacheReadError, FileDocumentCache};
 use super::guard::WorkspaceGuard;
 use super::path::{deny_etc_write, is_rc_path, rc_write_denied, resolve_str};
 
@@ -147,8 +147,22 @@ impl EditEngine {
             ));
         }
 
-        // Build context around the first replacement for confirmation
-        let updated = self.cache.read_content(&path).await.unwrap_or_default();
+        // Build context around the first replacement for confirmation.
+        // This is a post-write display read; a Backend error here means the
+        // edit landed but we can't build a preview — surface it rather than
+        // showing an empty/wrong snippet that could mislead the caller.
+        // NotCached is implausible (we just wrote it) but treat it as empty
+        // preview rather than failing the whole operation.
+        let updated = match self.cache.try_read_content(&path).await {
+            Ok(c) => c,
+            Err(CacheReadError::Backend(e)) => {
+                return Ok(ExecResult::failure(
+                    1,
+                    format!("edit succeeded but post-write read failed for {}: {}", path, e),
+                ));
+            }
+            Err(CacheReadError::NotCached) => String::new(),
+        };
         let first_pos = updated.find(&p.new_string).unwrap_or(0);
         let context = extract_context(&updated, first_pos, p.new_string.len());
 

@@ -41,7 +41,7 @@ pub mod vfs_walker;
 pub mod whoami;
 pub mod write;
 
-pub use cache::FileDocumentCache;
+pub use cache::{CacheReadError, FileDocumentCache};
 pub use edit::EditEngine;
 pub use glob::GlobEngine;
 pub use grep::GrepEngine;

@@ -36,6 +36,8 @@ use kaijutsu_types::{
     BlockKind, ContentType, ContextId, DriftKind, ForkKind, PrincipalId, Role, Status,
 };
 
+use crate::file_tools::CacheReadError;
+
 use super::{KjCaller, KjDispatcher};
 
 /// One rc script resolved from the `/etc/rc` file tree for a single
@@ -281,10 +283,24 @@ impl KjDispatcher {
         let mut scripts = Vec::with_capacity(names.len());
         for name in names {
             let path = format!("{dir}/{name}");
-            let content = cache
-                .read_content(&path)
-                .await
-                .map_err(|e| format!("rc lifecycle: read {path}: {e}"))?;
+            // A Backend error here means the CRDT store is broken — boot WITHOUT
+            // the stance is worse than failing loud (stance = the model's ethical
+            // posture). A NotCached result is structurally impossible here: we
+            // just enumerated this file from the VFS, so it exists and is text
+            // (only .kai/.md files are collected). Treat NotCached as a Backend
+            // error too — something has gone wrong if a just-enumerated rc script
+            // can't be read.
+            let content = match cache.try_read_content(&path).await {
+                Ok(c) => c,
+                Err(CacheReadError::Backend(e)) => {
+                    return Err(format!("rc lifecycle: read {path}: {e}"));
+                }
+                Err(CacheReadError::NotCached) => {
+                    return Err(format!(
+                        "rc lifecycle: read {path}: file not accessible (binary or vanished after directory listing)"
+                    ));
+                }
+            };
             let (sort_key, extension) = parse_rc_filename(&name);
             scripts.push(RcScript {
                 path,
