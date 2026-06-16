@@ -136,7 +136,17 @@ issues.md: teach `FileDocumentCache` to pass through CRDT-native mounts entirely
 
 ---
 
-## Slice 1 — build the unified store, migrate rc
+## Slice 1 — build the unified store, migrate rc — ✅ SHIPPED 2026-06-16
+
+Landed across `debfb33` (foundation: `ConfigCrdtFs` + `config_doc` shared model +
+`documents`-table manifest), `2b763c6` (seeding), `49c819a` (kj rc + load_rc_scripts
+VFS-direct), `a2c1045` (production cutover at `rpc.rs` + CLAUDE.md). The CRDT is now
+the sole owner of `/etc/rc`. **Live verification on the GPU runner (restart the
+server, create a coder context, confirm the stance loads) is still pending — needs
+a `systemctl --user restart` an agent shell can't do.** Build steps below are the
+as-built record.
+
+
 
 1. **Generalize `ConfigCrdtBackend`** into the unified CRDT-config backend:
    `UUIDv5(path) → DocKind::Config` doc over hierarchical paths, plus the path

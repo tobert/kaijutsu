@@ -121,18 +121,34 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ## Persistence & Sync
 
-- **CRDT-owned config/rc — direction LOCKED 2026-06-16 (design: `docs/config-crdt-ownership.md`).**
-  CRDT becomes the sole owner of config + rc; embedded Rust (`assets/defaults/`,
-  `include_dir!`/`include_str!`) seeds it once — no host-disk write-through/reload.
-  This **deletes** the dual-ownership silent-fallback cluster for the rc/config
-  mounts *by construction* — supersedes, for those mounts, the `MountBackend::read`
-  stale-bytes serve, the `append` wipe, the `LocalBackend::setattr` mtime no-op, and
-  the stale-rc-seed entries elsewhere in this file. Seam = the mount table;
-  `/v/docs`/`KaijutsuFilesystem` is the existing pattern. Slices: (1) unified
-  CRDT-config backend (`UUIDv5(path)→DocKind::Config` + a path manifest for
-  `readdir`) + migrate rc; (2) config TOMLs drop the `ConfigCrdtBackend` debounced
-  host flush. Editing = `kj rc set` (the `$EDITOR`-on-host-file path retires;
-  update CLAUDE.md). Cutover = hard reset. Deferred: CRDT scratch mount. No code yet.
+- **CRDT-owned config/rc (design: `docs/config-crdt-ownership.md`).** CRDT is the
+  sole owner of config + rc; embedded Rust seeds it once — no host-disk
+  write-through/reload, which **deletes** the dual-ownership silent-fallback cluster
+  for these mounts by construction (supersedes the `MountBackend::read` stale-bytes
+  serve, `append` wipe, `LocalBackend::setattr` mtime no-op, and stale-rc-seed
+  entries elsewhere here, for the rc mount).
+  - **Slice 1 (rc) — ✅ SHIPPED 2026-06-16** (`debfb33`/`2b763c6`/`49c819a`/`a2c1045`):
+    `ConfigCrdtFs` VfsOps backend (`UUIDv5(path)→DocKind::Config`, `documents` table
+    *is* the readdir manifest), seeded from embedded; `/etc/rc` remounted on it; `kj
+    rc` + `load_rc_scripts` route VFS-direct. ⚠ **Live runner verification pending**
+    (needs a server restart).
+  - **Slice 2 (config TOMLs) — TODO:** drop the `ConfigCrdtBackend` debounced host
+    flush; TOMLs converge onto the same CRDT-sole-owner rule + `config_doc` model.
+  - Deferred: CRDT scratch mount.
+- **rc cutover follow-ups (from slice 1):**
+  - **DB-backed test block-store deadlocks `kj::fork` tests.** `test_dispatcher_crdt_rc`
+    (DB-backed block store sharing the in-memory `KernelDb` handle) hangs the
+    `kj::fork` tests — a latent lock-ordering / re-entrant-`parking_lot` issue.
+    Worked around by keeping the *global* `test_dispatcher` db-less + LocalBackend;
+    only rc-scoped tests use the CRDT dispatcher. Production runs db-backed and fork
+    works there, so it's likely test-harness-specific — but worth a look (could flag
+    a real reentrancy risk). Until fixed, the global rc test tree is still host-disk
+    (`ensure_rc_seed_files` + LocalBackend), inconsistent with production.
+  - **Teach `FileDocumentCache` to pass through CRDT-native mounts.** `ConfigCrdtFs`
+    carries an in-memory advancing mtime purely so the cache (used by agent
+    `builtin.file:read /etc/rc/…`) reloads after a `kj rc` write. Cleaner: the cache
+    skips mirroring `real_path()==None` mounts entirely (read straight through),
+    dropping the mtime workaround. Touches all cache consumers — separate slice.
 - **Graceful-shutdown WAL checkpoint on SIGTERM:** `SharedKernelState::drop`
   checkpoints only on clean exit, but the server `run()` loop never returns and
   dies on SIGKILL/SIGTERM without unwinding, so systemd `stop` skips it.
