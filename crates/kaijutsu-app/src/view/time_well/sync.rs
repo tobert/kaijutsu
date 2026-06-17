@@ -162,6 +162,9 @@ pub fn sync_time_well(
                     width: tex_w,
                     height: tex_h,
                 },
+                // MSDF text composites on top of the vello decor in this texture.
+                crate::text::msdf::MsdfBlockGlyphs::default(),
+                crate::text::msdf::BlockRenderMethod::Vello,
                 Name::new(format!("Card({})", id.short())),
             ))
             .id();

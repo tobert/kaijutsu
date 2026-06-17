@@ -272,6 +272,9 @@ pub fn enter_time_well(
             width: READING_TEX_W as u32,
             height: READING_TEX_H as u32,
         },
+        // MSDF text composites on top of the vello decor in this texture.
+        crate::text::msdf::MsdfBlockGlyphs::default(),
+        crate::text::msdf::BlockRenderMethod::Vello,
         Name::new("ReadingCard"),
     ));
 

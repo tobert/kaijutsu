@@ -1,17 +1,17 @@
-//! Card text rendering: shape with the app's `VelloFont` and encode into a
-//! `vello::Scene` that the shared `vello_ui_texture` RTT primitive rasterizes
-//! onto each card quad (see `docs/viz-substrate.md`, "Rendering notes").
+//! Card text + decor rendering.
 //!
-//! The app's normal text path is MSDF (atlas + a bespoke pipeline tied to UI
-//! cells), which doesn't fit a free-floating 3D quad. So cards take the other
-//! documented route: a `vello::Scene` per card, rasterized to a per-card texture
-//! sampled by the card material. This module owns the parley-`Layout` → `Scene`
-//! glyph encoder and the per-card scene builder.
+//! Card **text** goes through the app's MSDF pipeline (crisp at any zoom, shared
+//! atlas — fixes the focus-dolly softening vello had): [`card_text_glyphs`] lays
+//! out each field with parley and collects positioned MSDF glyphs into the
+//! card's [`MsdfBlockGlyphs`], which the existing block MSDF render pass
+//! composites into the card texture. Card **decor** (accent bg, top bar, status
+//! dot, selection/lineage rings) is a small `vello::Scene` rasterized into the
+//! same texture *underneath* the text (`BlockRenderMethod::Vello` → MSDF
+//! composites on top — exactly how block borders + text coexist). The
+//! `WellCardMaterial` samples the composited texture.
 //!
-//! NB: `VelloFont::layout` does **not** push the brush into the parley builder —
-//! the MSDF path supplies color separately, so the layout's glyph runs carry
-//! parley's default (black). We therefore pass the brush explicitly to
-//! [`draw_layout`] rather than reading `glyph_run.style().brush`.
+//! Vello-for-decor is interim: the rings/bg can move to `well_card.wgsl` (SDF)
+//! later to drop vello from the well entirely (see docs/viz-substrate.md).
 
 use bevy::prelude::*;
 use vello::Scene;
@@ -26,58 +26,12 @@ use super::scene::{
 };
 use crate::text::ShapingFonts;
 use crate::text::components::bevy_color_to_brush;
+use crate::text::msdf::{FontDataMap, MsdfAtlas, MsdfBlockGlyphs, PositionedGlyph, collect_msdf_glyphs};
 use crate::text::shaping::{VelloFont, VelloTextAlign, VelloTextStyle};
+use crate::view::vello_ui_texture::VelloUiScene;
 
 /// Inner padding (logical px in the card-texture space).
 const PAD: f32 = 14.0;
-
-/// Encode a shaped parley layout into `scene`, translated to `origin`, painted
-/// with `brush`.
-///
-/// The canonical parley→vello glyph walk: per `GlyphRun`, accumulate the pen x
-/// from each glyph's advance and emit `vello::Glyph`s with the run's font, size,
-/// and variable-font coords. The brush is supplied by the caller because the
-/// app's shaper doesn't carry it on the layout (see module note).
-pub fn draw_layout(
-    scene: &mut Scene,
-    layout: &parley::Layout<Brush>,
-    origin: (f64, f64),
-    brush: &Brush,
-) {
-    for line in layout.lines() {
-        for item in line.items() {
-            let parley::PositionedLayoutItem::GlyphRun(glyph_run) = item else {
-                continue;
-            };
-            let mut pen_x = glyph_run.offset();
-            let pen_y = glyph_run.baseline();
-            let run = glyph_run.run();
-            let font = run.font();
-            let font_size = run.font_size();
-            let coords = run.normalized_coords();
-
-            scene
-                .draw_glyphs(font)
-                .brush(brush)
-                .font_size(font_size)
-                .normalized_coords(coords)
-                .transform(Affine::translate(origin))
-                .draw(
-                    Fill::NonZero,
-                    glyph_run.glyphs().map(|g| {
-                        let gx = pen_x + g.x;
-                        let gy = pen_y - g.y;
-                        pen_x += g.advance;
-                        vello::Glyph {
-                            id: g.id,
-                            x: gx,
-                            y: gy,
-                        }
-                    }),
-                );
-        }
-    }
-}
 
 /// Status → glyph color. `None` (no status seen yet) draws no dot.
 fn status_color(status: Option<kaijutsu_types::Status>) -> Option<VColor> {
@@ -90,18 +44,13 @@ fn status_color(status: Option<kaijutsu_types::Status>) -> Option<VColor> {
     })
 }
 
-/// Build the vello scene for one card at a target `(w, h)`: an accent
-/// rounded-rect background with the title, model badge, fork badge, and a
-/// keyword/preview line stacked inside.
-///
-/// All metrics scale by `s = h / CARD_TEX_H` off the small rim-card reference,
-/// so the same code renders both the tiny ring cards (`CARD_TEX_W/H`) and the
-/// large center-bottom reading slot crisply (vello rasterizes vectors at the
-/// target size). The reading slot keeps the rim aspect ratio so `s` is uniform.
-fn build_card_scene(card: &Card, font: &VelloFont, w: f32, h: f32) -> Scene {
+/// Build the card **decor** vello scene at a target `(w, h)`: accent bg, top
+/// bar, status dot, and selection/lineage rings — everything *except* the text
+/// (which is MSDF, composited on top). Metrics scale by `s = h / CARD_TEX_H` off
+/// the rim-card reference so the same code serves rim cards and the focus card.
+fn build_card_decor(card: &Card, w: f32, h: f32) -> Scene {
     let mut scene = Scene::new();
-    let s = h / CARD_TEX_H; // scale relative to the reference rim card
-    let pad = PAD * s;
+    let s = h / CARD_TEX_H;
     let data = &card.data;
 
     // ── Background: accent rounded rect. ──
@@ -115,7 +64,7 @@ fn build_card_scene(card: &Card, font: &VelloFont, w: f32, h: f32) -> Scene {
     );
     scene.fill(Fill::NonZero, Affine::IDENTITY, &bg, None, &rect);
 
-    // A subtle top accent bar so cards read as cards even before text loads.
+    // A subtle top accent bar.
     let bar = vello::kurbo::Rect::new(
         (8.0 * s) as f64,
         (5.0 * s) as f64,
@@ -130,7 +79,6 @@ fn build_card_scene(card: &Card, font: &VelloFont, w: f32, h: f32) -> Scene {
         let cx = (w - 18.0 * s) as f64;
         let cy = (18.0 * s) as f64;
         let dot = vello::kurbo::Circle::new((cx, cy), (7.0 * s) as f64);
-        // Dark halo so the dot reads on any accent.
         let halo = vello::kurbo::Circle::new((cx, cy), (9.0 * s) as f64);
         scene.fill(
             Fill::NonZero,
@@ -139,95 +87,10 @@ fn build_card_scene(card: &Card, font: &VelloFont, w: f32, h: f32) -> Scene {
             None,
             &halo,
         );
-        scene.fill(
-            Fill::NonZero,
-            Affine::IDENTITY,
-            &Brush::Solid(color),
-            None,
-            &dot,
-        );
+        scene.fill(Fill::NonZero, Affine::IDENTITY, &Brush::Solid(color), None, &dot);
     }
 
-    let max_advance = Some(w - 2.0 * pad);
-    let mut y = pad + 6.0 * s;
-
-    // ── Title. ──
-    let title_brush = bevy_color_to_brush(Color::srgb(0.98, 0.99, 1.0));
-    let title_style = VelloTextStyle {
-        font_size: 22.0 * s,
-        line_height: 1.1,
-        ..default()
-    };
-    let title = font.layout(&data.title, &title_style, VelloTextAlign::Left, max_advance);
-    let title_h = title.height();
-    draw_layout(&mut scene, &title, (pad as f64, y as f64), &title_brush);
-    y += title_h + 6.0 * s;
-
-    // ── Model badge. ──
-    if !data.model_badge.is_empty() {
-        let brush = bevy_color_to_brush(Color::srgba(1.0, 1.0, 1.0, 0.85));
-        let style = VelloTextStyle {
-            font_size: 14.0 * s,
-            ..default()
-        };
-        let badge = font.layout(&data.model_badge, &style, VelloTextAlign::Left, max_advance);
-        let bh = badge.height();
-        draw_layout(&mut scene, &badge, (pad as f64, y as f64), &brush);
-        y += bh + 4.0 * s;
-    }
-
-    // ── Fork badge (small, dim). ──
-    if let Some(fork) = &data.fork_badge {
-        let brush = bevy_color_to_brush(Color::srgba(1.0, 1.0, 1.0, 0.65));
-        let style = VelloTextStyle {
-            font_size: 12.0 * s,
-            ..default()
-        };
-        let label = format!("⑂ {fork}");
-        let l = font.layout(&label, &style, VelloTextAlign::Left, max_advance);
-        let lh = l.height();
-        draw_layout(&mut scene, &l, (pad as f64, y as f64), &brush);
-        y += lh + 4.0 * s;
-    }
-
-    // ── Keywords or preview, whichever is present, filling remaining space. ──
-    let tail = if !data.keywords.is_empty() {
-        data.keywords.join(" · ")
-    } else {
-        data.preview.clone().unwrap_or_default()
-    };
-    if !tail.is_empty() && y < h - pad {
-        let brush = bevy_color_to_brush(Color::srgba(0.92, 0.95, 1.0, 0.72));
-        let style = VelloTextStyle {
-            font_size: 12.0 * s,
-            line_height: 1.15,
-            ..default()
-        };
-        let l = font.layout(&tail, &style, VelloTextAlign::Left, max_advance);
-        draw_layout(&mut scene, &l, (pad as f64, y as f64), &brush);
-    }
-
-    // ── Cluster label (haystack only): a bottom-anchored tag naming the semantic
-    // cluster this card was grouped into (`get_clusters`, kernel-synthesized).
-    // Only set for band-2 cards, so it doubles as the haystack's visual signal. ──
-    if let Some(cluster) = &data.cluster_label {
-        let style = VelloTextStyle {
-            font_size: 13.0 * s,
-            ..default()
-        };
-        let text = format!("◇ {cluster}");
-        let l = font.layout(&text, &style, VelloTextAlign::Left, max_advance);
-        let lh = l.height();
-        let fy = h - pad - lh; // anchor to the bottom edge
-        let brush = bevy_color_to_brush(Color::srgba(0.86, 0.93, 1.0, 0.95));
-        draw_layout(&mut scene, &l, (pad as f64, fy as f64), &brush);
-    }
-
-    // ── Lineage ring: an amber edge marking a fork-ancestor of the selection
-    // (the on-demand lineage overlay). Distinct hue from the blue selection ring
-    // so ancestry reads apart from the selection itself; a card is never both
-    // (ancestors exclude the selected card). Opaque for the same Mask-alpha
-    // reason as the selection ring. ──
+    // ── Lineage ring: amber edge marking a fork-ancestor of the selection. ──
     if card.in_lineage {
         let inset = (3.5 * s) as f64;
         let ring = RoundedRect::new(inset, inset, (w - 3.5 * s) as f64, (h - 3.5 * s) as f64, (13.0 * s) as f64);
@@ -240,14 +103,8 @@ fn build_card_scene(card: &Card, font: &VelloFont, w: f32, h: f32) -> Scene {
         );
     }
 
-    // ── Selection ring (drawn last, on top): a saturated outer halo stroke under
-    // a bright inner edge, reading as a glow around the card. Both strokes are
-    // opaque on purpose — the card material is `AlphaMode::Mask(0.5)`, which clamps
-    // alpha to binary, so a translucent glow would simply be discarded. We fake the
-    // falloff with width + color instead. Only present when selected; the
-    // `selected` flag flips on select/deselect, rebuilding this scene. ──
+    // ── Selection ring: saturated blue halo + bright inner edge. ──
     if card.selected {
-        // Outer halo: wide, saturated blue, just inside the texture bounds.
         let inset = (3.5 * s) as f64;
         let ring = RoundedRect::new(inset, inset, (w - 3.5 * s) as f64, (h - 3.5 * s) as f64, (13.0 * s) as f64);
         scene.stroke(
@@ -257,7 +114,6 @@ fn build_card_scene(card: &Card, font: &VelloFont, w: f32, h: f32) -> Scene {
             None,
             &ring,
         );
-        // Bright inner edge over the halo.
         scene.stroke(
             &Stroke::new((2.5 * s) as f64),
             Affine::IDENTITY,
@@ -270,55 +126,187 @@ fn build_card_scene(card: &Card, font: &VelloFont, w: f32, h: f32) -> Scene {
     scene
 }
 
-/// Rebuild the vello scene for any card whose data changed (or that was just
-/// spawned, where `VelloUiScene::version == 0`). Bumps `version` so the shared
-/// extract/render path re-rasterizes the card texture.
+/// Register a layout's fonts and collect its MSDF glyphs at `offset`, colored by
+/// `brush`, appending into `out`.
+fn collect_field(
+    layout: &parley::Layout<Brush>,
+    offset: (f64, f64),
+    brush: &Brush,
+    atlas: &mut MsdfAtlas,
+    font_data_map: &mut FontDataMap,
+    out: &mut Vec<PositionedGlyph>,
+) {
+    for line in layout.lines() {
+        for item in line.items() {
+            if let parley::PositionedLayoutItem::GlyphRun(gr) = item {
+                font_data_map.register(gr.run().font());
+            }
+        }
+    }
+    out.extend(collect_msdf_glyphs(layout, &[], brush, offset, atlas));
+}
+
+/// Lay out the card's text fields and collect MSDF glyphs (crisp text). Mirrors
+/// the old vello field stacking — each field's glyphs land at the same `(pad, y)`
+/// origin and color the vello text used, so the layout is unchanged, only the
+/// rasterizer (MSDF, not vello).
+fn card_text_glyphs(
+    card: &Card,
+    font: &VelloFont,
+    w: f32,
+    h: f32,
+    atlas: &mut MsdfAtlas,
+    font_data_map: &mut FontDataMap,
+) -> Vec<PositionedGlyph> {
+    let s = h / CARD_TEX_H;
+    let pad = PAD * s;
+    let data = &card.data;
+    let max_advance = Some(w - 2.0 * pad);
+    let mut out = Vec::new();
+    let mut y = pad + 6.0 * s;
+
+    // ── Title. ──
+    let title_brush = bevy_color_to_brush(Color::srgb(0.98, 0.99, 1.0));
+    let title = font.layout(
+        &data.title,
+        &VelloTextStyle { font_size: 22.0 * s, line_height: 1.1, ..default() },
+        VelloTextAlign::Left,
+        max_advance,
+    );
+    let title_h = title.height();
+    collect_field(&title, (pad as f64, y as f64), &title_brush, atlas, font_data_map, &mut out);
+    y += title_h + 6.0 * s;
+
+    // ── Model badge. ──
+    if !data.model_badge.is_empty() {
+        let brush = bevy_color_to_brush(Color::srgba(1.0, 1.0, 1.0, 0.85));
+        let badge = font.layout(
+            &data.model_badge,
+            &VelloTextStyle { font_size: 14.0 * s, ..default() },
+            VelloTextAlign::Left,
+            max_advance,
+        );
+        let bh = badge.height();
+        collect_field(&badge, (pad as f64, y as f64), &brush, atlas, font_data_map, &mut out);
+        y += bh + 4.0 * s;
+    }
+
+    // ── Fork badge. ──
+    if let Some(fork) = &data.fork_badge {
+        let brush = bevy_color_to_brush(Color::srgba(1.0, 1.0, 1.0, 0.65));
+        let label = format!("⑂ {fork}");
+        let l = font.layout(
+            &label,
+            &VelloTextStyle { font_size: 12.0 * s, ..default() },
+            VelloTextAlign::Left,
+            max_advance,
+        );
+        let lh = l.height();
+        collect_field(&l, (pad as f64, y as f64), &brush, atlas, font_data_map, &mut out);
+        y += lh + 4.0 * s;
+    }
+
+    // ── Keywords or preview. ──
+    let tail = if !data.keywords.is_empty() {
+        data.keywords.join(" · ")
+    } else {
+        data.preview.clone().unwrap_or_default()
+    };
+    if !tail.is_empty() && y < h - pad {
+        let brush = bevy_color_to_brush(Color::srgba(0.92, 0.95, 1.0, 0.72));
+        let l = font.layout(
+            &tail,
+            &VelloTextStyle { font_size: 12.0 * s, line_height: 1.15, ..default() },
+            VelloTextAlign::Left,
+            max_advance,
+        );
+        collect_field(&l, (pad as f64, y as f64), &brush, atlas, font_data_map, &mut out);
+    }
+
+    // ── Cluster label (haystack only), bottom-anchored. ──
+    if let Some(cluster) = &data.cluster_label {
+        let brush = bevy_color_to_brush(Color::srgba(0.86, 0.93, 1.0, 0.95));
+        let text = format!("◇ {cluster}");
+        let l = font.layout(
+            &text,
+            &VelloTextStyle { font_size: 13.0 * s, ..default() },
+            VelloTextAlign::Left,
+            max_advance,
+        );
+        let lh = l.height();
+        let fy = h - pad - lh;
+        collect_field(&l, (pad as f64, fy as f64), &brush, atlas, font_data_map, &mut out);
+    }
+
+    out
+}
+
+/// Rebuild a rim card's decor scene + MSDF text glyphs when its data changes.
+/// The decor (vello) + glyphs (MSDF) composite into the one card texture.
 pub fn build_card_scenes(
     fonts: Res<Assets<VelloFont>>,
     font_handles: Res<ShapingFonts>,
-    mut query: Query<(&Card, &mut crate::view::vello_ui_texture::VelloUiScene), Changed<Card>>,
+    mut atlas: Option<ResMut<MsdfAtlas>>,
+    mut font_data_map: ResMut<FontDataMap>,
+    mut query: Query<(&Card, &mut VelloUiScene, &mut MsdfBlockGlyphs), Changed<Card>>,
 ) {
     let Some(font) = fonts.get(&font_handles.mono) else {
         return; // font still loading; retry next change
     };
-    for (card, mut ui) in query.iter_mut() {
-        ui.scene = build_card_scene(card, font, CARD_TEX_W, CARD_TEX_H);
+    for (card, mut ui, mut msdf) in query.iter_mut() {
+        ui.scene = build_card_decor(card, CARD_TEX_W, CARD_TEX_H);
         ui.built_width = CARD_TEX_W;
         ui.built_height = CARD_TEX_H;
         ui.version = ui.version.wrapping_add(1);
+
+        if let Some(atlas) = atlas.as_deref_mut() {
+            msdf.glyphs = card_text_glyphs(card, font, CARD_TEX_W, CARD_TEX_H, atlas, &mut font_data_map);
+            msdf.version = msdf.version.wrapping_add(1);
+        }
     }
 }
 
-/// Render the current selection into the center-bottom reading slot at readable
-/// size. Rebuilds only when the selection *changes* (tracked in a `Local`), so a
-/// static selection costs nothing; clears the slot when nothing is selected.
+/// Render the current selection into the center-bottom focus card (decor + MSDF
+/// text) at the larger reading size. Rebuilds only when the selection changes.
 pub fn update_reading_card(
     fonts: Res<Assets<VelloFont>>,
     font_handles: Res<ShapingFonts>,
+    mut atlas: Option<ResMut<MsdfAtlas>>,
+    mut font_data_map: ResMut<FontDataMap>,
     state: Res<TimeWellState>,
     cards: Query<&Card>,
-    mut reading: Query<&mut crate::view::vello_ui_texture::VelloUiScene, With<ReadingCard>>,
+    mut reading: Query<(&mut VelloUiScene, &mut MsdfBlockGlyphs), With<ReadingCard>>,
     mut last: Local<Option<ContextId>>,
 ) {
     if state.selected == *last {
         return;
     }
     let Some(font) = fonts.get(&font_handles.mono) else {
-        return; // font still loading; selection unchanged-check will retry
+        return;
     };
-    let Ok(mut ui) = reading.single_mut() else {
-        return; // reading card not spawned yet
+    let Ok((mut ui, mut msdf)) = reading.single_mut() else {
+        return; // focus card not spawned yet
     };
     *last = state.selected;
 
     ui.built_width = READING_TEX_W;
     ui.built_height = READING_TEX_H;
-    ui.scene = match state
+    match state
         .selected
         .and_then(|sel| cards.iter().find(|c| c.context_id == sel))
     {
-        Some(card) => build_card_scene(card, font, READING_TEX_W, READING_TEX_H),
-        None => Scene::new(), // nothing selected → blank plate
-    };
+        Some(card) => {
+            ui.scene = build_card_decor(card, READING_TEX_W, READING_TEX_H);
+            if let Some(atlas) = atlas.as_deref_mut() {
+                msdf.glyphs =
+                    card_text_glyphs(card, font, READING_TEX_W, READING_TEX_H, atlas, &mut font_data_map);
+            }
+        }
+        None => {
+            ui.scene = Scene::new();
+            msdf.glyphs.clear();
+        }
+    }
     ui.version = ui.version.wrapping_add(1);
+    msdf.version = msdf.version.wrapping_add(1);
 }
