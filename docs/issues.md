@@ -344,6 +344,17 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ## Viz substrate (kaijutsu-viz) — see docs/viz-substrate.md
 
+- **Time-well HDR+Bloom breaks the two-camera composite (BLOCKER for card
+  bling), 2026-06-17.** Adding `Bloom` (→ `#[require(Hdr)]`) + `Tonemapping` to
+  the `TimeWellCamera` (3D, order 0) makes the cards vanish — the log confirms
+  they still *spawn* (`+19 cards`), they just don't render; only the `WELL_BG`
+  clear + the order-1 2D UI camera survive. The well mixes an HDR 3D camera
+  (order 0) with the app's LDR 2D UI camera (order 1, `ClearColorConfig::None`)
+  on one target; HDR breaks that compositing. Reverted to unblock. HDR+Bloom is
+  the prerequisite for any glow on the cards (step 7.6), so this must be solved
+  first — likely make the UI camera HDR too, or split via `RenderLayers` / render
+  the well to its own HDR target, or move bloom off the shared target. Repro:
+  add `Bloom::NATURAL` to `enter_time_well`'s camera, enter the well (Ctrl+W).
 - **Time-well step-4 polish (shipped 2026-06-16, `view/time_well/`):**
   - *Fixed-pitch overlap:* band slots use a fixed angular pitch (TAU/24) so
     append stays motion-free; but a band with >24 cards wraps slots onto each
