@@ -38,6 +38,11 @@ pub struct Card {
     /// [`highlight_lineage`] only on change, same rebuild discipline as
     /// `selected`.
     pub in_lineage: bool,
+    /// Whether this context is an endpoint (source or target) of a staged drift.
+    /// Drives the drift shimmer — an animated HDR sheen sweeping the card body
+    /// (the "drift = shimmer" bling). Flipped by [`highlight_drift`] only on
+    /// change, same rebuild discipline as `selected`/`in_lineage`.
+    pub drifting: bool,
 }
 
 /// Parent entity owning all card entities + the well camera. Despawned (with its
@@ -547,6 +552,22 @@ pub fn highlight_lineage(state: Res<TimeWellState>, mut cards: Query<&mut Card>)
         let in_lin = lineage.contains(&card.context_id);
         if card.in_lineage != in_lin {
             card.in_lineage = in_lin;
+        }
+    }
+}
+
+/// Drift shimmer overlay: flag every card whose context is an endpoint (source or
+/// target) of a staged drift, so the shader sweeps an animated HDR sheen across it
+/// (the "drift = shimmer" bling). Reads the staged queue off the shared
+/// [`DriftState`] poll — no extra wire. Like [`highlight_lineage`], the flag is
+/// written only when it flips, so the shimmer turns on/off without re-rasterizing
+/// every card every poll. Empty staged queue → nothing shimmers.
+pub fn highlight_drift(drift: Res<crate::ui::drift::DriftState>, mut cards: Query<&mut Card>) {
+    let drifting = super::card::drift_endpoints(&drift.staged);
+    for mut card in cards.iter_mut() {
+        let is_drifting = drifting.contains(&card.context_id);
+        if card.drifting != is_drifting {
+            card.drifting = is_drifting;
         }
     }
 }

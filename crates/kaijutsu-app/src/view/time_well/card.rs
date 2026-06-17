@@ -307,6 +307,21 @@ pub fn ancestors(
     out
 }
 
+/// Collect the context ids that are endpoints (source **or** target) of any
+/// staged drift. A card whose context is in this set shimmers (the "drift =
+/// shimmer" bling): something is staged to flow into or out of it. Pure over the
+/// staged queue so it's unit-testable without the kernel.
+pub fn drift_endpoints(
+    staged: &[kaijutsu_client::StagedDriftInfo],
+) -> std::collections::HashSet<ContextId> {
+    let mut out = std::collections::HashSet::new();
+    for d in staged {
+        out.insert(d.source_ctx);
+        out.insert(d.target_ctx);
+    }
+    out
+}
+
 /// Lift a 2D [`LayoutPos`] into the 3D well.
 ///
 /// `(x, y)` are the ring-plane coordinates from the layout; the band selects the
@@ -346,6 +361,36 @@ mod tests {
         let mut b = [0u8; 16];
         b[0] = n;
         ContextId::from_bytes(b)
+    }
+
+    fn staged(id: u64, source: ContextId, target: ContextId) -> kaijutsu_client::StagedDriftInfo {
+        kaijutsu_client::StagedDriftInfo {
+            id,
+            source_ctx: source,
+            target_ctx: target,
+            content: String::new(),
+            source_model: String::new(),
+            drift_kind: kaijutsu_types::DriftKind::Push,
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn drift_endpoints_collects_both_ends() {
+        let (a, b, c, d) = (id_of(1), id_of(2), id_of(3), id_of(4));
+        let set = drift_endpoints(&[staged(1, a, b), staged(2, c, d)]);
+        // Both source and target of every staged drift shimmer.
+        assert_eq!(set.len(), 4);
+        for id in [a, b, c, d] {
+            assert!(set.contains(&id));
+        }
+        // A context with no staged drift does not.
+        assert!(!set.contains(&id_of(9)));
+    }
+
+    #[test]
+    fn drift_endpoints_empty_is_empty() {
+        assert!(drift_endpoints(&[]).is_empty());
     }
 
     #[test]

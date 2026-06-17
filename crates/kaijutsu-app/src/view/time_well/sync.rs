@@ -153,6 +153,7 @@ pub fn sync_time_well(
                     status: Some(info.live_status),
                     selected: false,
                     in_lineage: false,
+                    drifting: false,
                 },
                 CardTarget(pos),
                 Mesh3d(card_mesh.clone()),

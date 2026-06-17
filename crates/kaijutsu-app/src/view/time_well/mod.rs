@@ -46,6 +46,7 @@ impl Plugin for TimeWellPlugin {
                     scene::billboard_cards,
                     scene::highlight_selection,
                     scene::highlight_lineage,
+                    scene::highlight_drift,
                 )
                     .chain()
                     .run_if(in_state(Screen::TimeWell)),

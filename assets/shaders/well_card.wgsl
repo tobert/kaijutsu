@@ -17,7 +17,7 @@
 @group(#{MATERIAL_BIND_GROUP}) @binding(0) var card_texture: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(1) var card_sampler: sampler;
 @group(#{MATERIAL_BIND_GROUP}) @binding(2) var<uniform> accent: vec4<f32>;
-@group(#{MATERIAL_BIND_GROUP}) @binding(3) var<uniform> params: vec4<f32>; // [selected, in_lineage, status, _]
+@group(#{MATERIAL_BIND_GROUP}) @binding(3) var<uniform> params: vec4<f32>; // [selected, in_lineage, status, drifting]
 @group(#{MATERIAL_BIND_GROUP}) @binding(4) var<uniform> shape: vec4<f32>;  // [aspect, corner_radius, ring_width, inset]
 
 // Signed distance to a rounded box centered at origin, half-size `b`, radius `r`.
@@ -41,9 +41,20 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let aa = fwidth(d) + 1e-4;
     let inside = 1.0 - smoothstep(0.0, aa, d);
 
+    let t = globals.time;
+
     // Accent body.
     var col = accent.rgb;
     var alpha = accent.a * inside;
+
+    // Drift sheen (under the text): a narrow bright band sweeping diagonally across
+    // the body when this context is a staged-drift endpoint. HDR so it spills into
+    // bloom — reads as energy drifting through the card. (params.w = drifting.)
+    if (params.w > 0.5) {
+        let phase = fract((pc.x + pc.y) * 0.9 - t * 0.5);
+        let sheen = smoothstep(0.46, 0.50, phase) - smoothstep(0.50, 0.54, phase);
+        col += vec3<f32>(0.55, 0.80, 1.0) * sheen * 2.2 * inside;
+    }
 
     // MSDF text on top (text texture is transparent except glyphs).
     let text = textureSample(card_texture, card_sampler, in.uv);
@@ -53,7 +64,6 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // Ring band hugging the inner edge of the rounded box. HDR colors below push
     // the band well past 1.0 so the bloom pass blooms it into a glow halo.
     let band = (1.0 - smoothstep(ring_w, ring_w + aa, abs(d))) * inside;
-    let t = globals.time;
     let status = params.z;
 
     // --- Status rim (base layer; selection/lineage draw over it) ---

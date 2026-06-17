@@ -28,10 +28,11 @@ use crate::view::vello_ui_texture::VelloUiScene;
 /// Inner padding (logical px in the card-texture space).
 const PAD: f32 = 14.0;
 
-/// `WellCardMaterial.params` for a card: `[selected, in_lineage, status, _]`.
+/// `WellCardMaterial.params` for a card: `[selected, in_lineage, status, drifting]`.
 /// `status` is a float code the shader switches on for the rim FX: pending/none →
 /// 0, running → 1 (breathing pulse), done → 2 (no rim), error → 3 (steady red).
-/// Animation reads `globals.time` in the shader, so the 4th slot is unused.
+/// `drifting` (0/1) gates the drift sheen sweep. Time-based animation reads
+/// `globals.time` in the shader.
 fn card_params(card: &Card) -> Vec4 {
     use kaijutsu_types::Status;
     let status = match card.status {
@@ -44,7 +45,7 @@ fn card_params(card: &Card) -> Vec4 {
         if card.selected { 1.0 } else { 0.0 },
         if card.in_lineage { 1.0 } else { 0.0 },
         status,
-        0.0,
+        if card.drifting { 1.0 } else { 0.0 },
     )
 }
 
