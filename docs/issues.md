@@ -375,48 +375,77 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   `shell_execute` and read it in the MCP `to_json` (`kaijutsu-mcp/src/lib.rs`).
   CBOR oplog evolution is additive (safe); capnp is the work. P3 because the
   `--json` envelope already unblocks consumers today.
-- **External `mcp__kaijutsu__shell` hangs to timeout (observed 2026-06-17).**
-  After a server+app restart, *every* external shell call timed out — `echo hi`
-  at 20s, `kj context list --tree` at 300s — returning a `block_id` but never the
-  output (`status: "timeout"`). The command-result never syncs back over the
-  `SyncedDocument` remote path; `submit_input`/`write_input`/`whoami` (non-CRDT-poll
-  paths) stayed responsive, and `listContexts` (the well's drift poll) was fine, so
-  it is specifically the shell-output replication, not the kernel. Same family as
-  the P3 above + the SyncedDocument review below (`project_mcp_synceddocument_sync`).
-  Made it impossible to stage/inspect contexts over MCP during time-well verification.
+- **External `mcp__kaijutsu__shell` hangs to timeout — ✅ ROOT-CAUSED + FIXED
+  2026-06-17.** Symptom: after a server+app restart, *every* external shell call
+  timed out — `echo hi` at 20s, `kj context list --tree` at 300s — returning a
+  `block_id` but never the output (`status: "timeout"`); non-CRDT-poll paths
+  (`whoami`/`submit_input`/`listContexts`) stayed responsive, isolating it to
+  shell-output replication. **Root cause (not the network — it's localhost):
+  executor starvation on the MCP client's single-threaded RPC LocalSet, converted
+  into a *permanent silent* failure by a too-aggressive server reap.** Three
+  compounding factors: (1) the MCP subscribed to block events **kernel-wide**
+  (`BlockEventFilter::default()`, `context_ids` empty = all contexts), firehosing
+  it with every other context's events after a restart (cold-start re-hydration +
+  app's director/composer/drift traffic); (2) every delivered event woke the shell
+  poll's `find_terminal`, which called `blocks_ordered()` (the `order_key().to_string()`
+  per-block re-sort, see the perf entry below) under the lock; (3) `from_sync_state`
+  replays the full op-log synchronously on that same thread (register_session +
+  every shell call's Phase 2). Stacked on one `current_thread` executor, a
+  multi-second stall is easy — and the server's FlowBus bridge **broke the
+  subscription permanently on the first 5s callback timeout** (`rpc.rs` `if !success
+  { break }`), so the MCP went silent for the rest of the connection with no
+  re-subscribe path. Fixes shipped: **(1)** server bridge tolerates transient
+  callback stalls via `SubscriberHealth` (reap only after 3 consecutive failures,
+  a success resets; the load-bearing 5s timeout stays — it protects the server's
+  RpcSystem); both bridge loops + unit tests. **(2)** client `resubscribe_blocks`
+  primitive (same `instance` ⇒ server replaces the prior sub); MCP calls it on a
+  shell-poll timeout to recover without a full reconnect. **(3)** block subscription
+  is now **scoped to the joined context** (`block_events_client_and_filter`):
+  handshake scopes from the re-joined context, and `JoinedContext` re-subscribes
+  scoped after register_session — cutting foreign-context volume to zero (also kills
+  the factor-2 `blocks_ordered()` churn for foreign events). Verified: server +
+  client unit tests, `kaijutsu-mcp` `e2e_shell` (incl. sequential commands),
+  `rpc_integration`/`context_sync` green. ⚠ **Live runner verification still
+  pending** (needs a server+app restart to reproduce the original conditions).
+  Related: P3 above + `project_mcp_synceddocument_sync`.
 - **mcp-context default model is an invalid id (observed 2026-06-17).** A context
   created via `register_session` (context_type `mcp`/`default`) defaulted to
   `anthropic/claude-haiku-4-5-20250101` (also seen as `…-20250929`) — a wrong date;
   the valid id is `claude-haiku-4-5-20251001`. Chat turns fail with
   `not_found_error` after 3 attempts. Fix the default model id wherever mcp/default
   contexts are seeded.
-- **`builtin.file` `edit` tool corrupted `docs/issues.md` mid-edit (observed
-  2026-06-17, THE_DIRECTOR `019ed674` → this very file).** This is the *kaijutsu
-  kernel's* `builtin.file` `edit` tool, driven by the director inside its context
-  over MCP/`kj` — NOT Claude Code's host-side `Edit`. (For the record: the repair
-  below was done with Claude Code `Edit` against the host FS, a different codebase
-  that never exercises this path — so the clean repair is no evidence the kernel
-  tool works; if anything the contrast is the tell.) Driving `builtin.file edit`
-  to *append* a backlog entry instead spliced and destroyed content: it duplicated
-  a bullet, fused the `### kj / MCP ergonomics (UX)` header onto the body of the
-  MIDI bullet, and dropped/merged lines across the 250–281 region — while reporting
-  `Replaced 1 occurrence` each time. Contributing factors:
-  (a) the **diff preview lied** — it showed stale pre-edit line numbers and
-  interleaved old/new text, so the confirmation couldn't be trusted and the model
-  kept re-editing a file it thought hadn't changed; (b) line-numbered `read`
-  output carries a leading-space/line-number prefix that is *not* the on-disk
-  bytes, so whitespace-exact `old_string` matching kept failing (`old_string not
-  found`) and pushed toward increasingly fragile edits; (c) **recovery was
-  impossible from inside the context** — `git` isn't on the kaish PATH, and
-  `cat -A` / `ls -d` aren't supported, so the model couldn't diff against HEAD or
-  revert. Net: an append-only intent became destructive. Fixes to consider:
-  make `edit` verify post-edit state against the requested op (fail loud on
-  splice), render the diff preview from true on-disk bytes with correct line
-  numbers, and either expose `git`/a revert affordance in the context shell or a
-  `kj block diff --original`-style recovery path. (File hand-repaired 2026-06-17
-  via Claude Code `Edit`; this entry is the post-mortem.) **A dedicated session on
-  the `builtin.file` edit/read tools is queued next** — treat the contributing
-  factors above as that session's starting checklist.
+- **`builtin.file` edit/read hardening — ✅ MOSTLY RESOLVED 2026-06-17** (the
+  `docs/issues.md` corruption post-mortem, THE_DIRECTOR `019ed674`). **Root cause
+  (the one the original post-mortem missed):** `edit` computed match positions
+  with `str::match_indices` (BYTE offsets) and `old_string.len()` (BYTE length),
+  then passed them to the **character**-indexed CRDT `BlockStore::edit_text`. On
+  any file with multibyte UTF-8 before the edit site (issues.md is full of `→ ✅
+  改善 ≳ ×`) the offset/length drifted, so it spliced/over-deleted at the wrong
+  place while honestly reporting `Replaced 1 occurrence` (the byte search *did*
+  find a match). The reported contributing factors were real but secondary: (a)
+  the "lying" diff preview was the CRDT faithfully rendering already-corrupted
+  bytes; (b) the line-numbered `read` prefix vs whitespace-exact matching is now
+  sidestepped by hashline anchors; (c) in-context recovery (no `git`/revert) is
+  still open. **Shipped** (`crates/kaijutsu-kernel/src/file_tools/`):
+  - byte→char offset conversion + char-count delete length (`edit.rs`
+    `plan_string_edit`/`byte_to_char`);
+  - **fail-loud post-write verification** — an independently-computed `expected`
+    string is compared to the read-back; any mismatch fails the op instead of
+    reporting false success (the directive: crash over corruption);
+  - **hashline addressing** (per "The Harness Problem" / anthropics/claude-code
+    #25775): `read` now prints `LINE:hash→ content`; `edit` gained an `anchor`
+    mode (`N:hash` or `N:hash..M:hash`) that re-verifies the line hash before
+    writing — a stale anchor fails loud with the current hashes. Subsumes factor
+    (b); the model addresses a line by reference instead of retyping it;
+  - CRLF terminator preservation on anchor edits; empty-file/edge-case guards;
+  - unit + e2e broker tests (multibyte round-trip, anchor round-trip, stale-anchor
+    fail-loud); two DeepSeek/kaibo reviews + a `/code-review` pass.
+  **Remaining (small):** (1) in-context recovery affordance — expose `git`/a
+  revert or `kj block diff --original` in the kaish shell (factor c, untouched);
+  (2) the post-write verification reads the CRDT cache, not the VFS disk, so a
+  faulty flush is only caught by `flush_one`'s own error (documented in `edit.rs`);
+  (3) `FileDocumentCache` CRDT-native pass-through (already tracked under
+  Persistence & Sync) would let `read`'s hashes anchor `/etc/rc` cleanly.
 
 - **`StreamingBlockHandle` implementation:** Single-block streaming primitive.
 - **LLM streaming rewrite:** Move `process_llm_stream` onto `StreamingBlockHandle`.
