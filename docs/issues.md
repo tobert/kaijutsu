@@ -390,12 +390,17 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   the valid id is `claude-haiku-4-5-20251001`. Chat turns fail with
   `not_found_error` after 3 attempts. Fix the default model id wherever mcp/default
   contexts are seeded.
-- **File `edit` tool corrupted `docs/issues.md` mid-edit (observed 2026-06-17,
-  THE_DIRECTOR `019ed674` → this very file).** A director driving the `builtin.file`
-  `edit` tool to *append* a backlog entry instead spliced and destroyed content:
-  it duplicated a bullet, fused the `### kj / MCP ergonomics (UX)` header onto the
-  body of the MIDI bullet, and dropped/merged lines across the 250–281 region —
-  while reporting `Replaced 1 occurrence` each time. Contributing factors:
+- **`builtin.file` `edit` tool corrupted `docs/issues.md` mid-edit (observed
+  2026-06-17, THE_DIRECTOR `019ed674` → this very file).** This is the *kaijutsu
+  kernel's* `builtin.file` `edit` tool, driven by the director inside its context
+  over MCP/`kj` — NOT Claude Code's host-side `Edit`. (For the record: the repair
+  below was done with Claude Code `Edit` against the host FS, a different codebase
+  that never exercises this path — so the clean repair is no evidence the kernel
+  tool works; if anything the contrast is the tell.) Driving `builtin.file edit`
+  to *append* a backlog entry instead spliced and destroyed content: it duplicated
+  a bullet, fused the `### kj / MCP ergonomics (UX)` header onto the body of the
+  MIDI bullet, and dropped/merged lines across the 250–281 region — while reporting
+  `Replaced 1 occurrence` each time. Contributing factors:
   (a) the **diff preview lied** — it showed stale pre-edit line numbers and
   interleaved old/new text, so the confirmation couldn't be trusted and the model
   kept re-editing a file it thought hadn't changed; (b) line-numbered `read`
@@ -408,8 +413,10 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   make `edit` verify post-edit state against the requested op (fail loud on
   splice), render the diff preview from true on-disk bytes with correct line
   numbers, and either expose `git`/a revert affordance in the context shell or a
-  `kj block diff --original`-style recovery path. (The file was hand-repaired
-  2026-06-17; this entry is the post-mortem.)
+  `kj block diff --original`-style recovery path. (File hand-repaired 2026-06-17
+  via Claude Code `Edit`; this entry is the post-mortem.) **A dedicated session on
+  the `builtin.file` edit/read tools is queued next** — treat the contributing
+  factors above as that session's starting checklist.
 
 - **`StreamingBlockHandle` implementation:** Single-block streaming primitive.
 - **LLM streaming rewrite:** Move `process_llm_stream` onto `StreamingBlockHandle`.
