@@ -565,6 +565,34 @@ nothing a card needs that MSDF+SDF don't. The app already has the pieces:
   spawn in `sync.rs` swaps off `StandardMaterial`. Vello stays for SVG/ABC blocks
   (arbitrary vector), just not for cards.
 
+**MSDF migration — de-risked plan (2026-06-17).** The key unlock: the MSDF
+render pipeline's extract query is **generic** —
+`Query<(&MsdfBlockGlyphs, &BlockRenderMethod, &VelloUiScene, &VelloUiTexture)>`
+(`block_render::extract_msdf_blocks`) — *not* coupled to `BlockCell`. So any
+entity with those components gets its glyphs rendered into its texture by the
+existing render-world pass. **No render-world changes needed.** Slice-1
+(`WellCardMaterial`) is shipped. Remaining (main-world only):
+1. Add `MsdfBlockGlyphs` + `BlockRenderMethod::Vello` to card entities (rim cards
+   in `sync.rs`, focus card in `scene.rs`). `Vello` method = MSDF composites on
+   top of the vello content (the bg).
+2. Both card-text systems collect glyphs: `text::build_card_scenes` (rim,
+   `CARD_TEX`) **and** `text::update_reading_card` (focus, `READING_TEX`). Each
+   needs `ResMut<MsdfAtlas>` + `ResMut<FontDataMap>`; for each text field
+   (title/model/fork/tail/cluster) lay out with parley (already done), register
+   fonts (`font_data_map.register`), and `collect_msdf_glyphs(layout, &[],
+   &fallback_brush, (pad, y), atlas)` accumulating into `MsdfBlockGlyphs.glyphs`
+   at the field's `(pad, y)` offset (same origin the vello `draw_layout` used).
+   The vello scene then draws **only** the decor (accent bg + top bar + status
+   dot); text moves to MSDF (crisp at any zoom — fixes the focus-dolly softening).
+3. **Ring-move:** drop the selection/lineage rings from the vello decor; draw
+   them in `well_card.wgsl` as SDF rounded-rect strokes keyed off the `params`
+   uniform (`selected`, `in_lineage`), updated per-card by a small system from
+   `Card.selected`/`in_lineage` (mirrors `sync_block_fx`). The accent bg can stay
+   vello for now (static content) or move to SDF later.
+- *Watch-outs:* glyphs are async — the atlas generates them over a few frames, so
+  cards may show decor-only text-blank for ~1–2 frames after a change (fine).
+  Two systems now share `MsdfAtlas` (ResMut) → they serialize, no conflict.
+
 **Glow via in-shader SDF, NOT bloom (corrected 2026-06-17).** The app has no HDR
 anywhere — in a context the only camera is a single LDR `Camera2d`
 (`main.rs::setup_camera`); the well adds the lone 3D camera on enter. The app's
