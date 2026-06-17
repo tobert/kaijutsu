@@ -193,10 +193,29 @@ impl ConfigCrdtFs {
     /// half-seeded rc tree is corruption, and the caller decides whether a fork
     /// can proceed without its stance script.
     pub fn seed_from_embedded(&self) -> VfsResult<usize> {
+        self.seed_entries(crate::seed_scripts::seed_files())
+    }
+
+    /// Seed `(canonical path, body)` entries into the CRDT, skipping any path
+    /// already present or not under this backend's root. Returns the count
+    /// newly written. This is the shared absent-only, fail-loud seed core —
+    /// [`seed_from_embedded`] (rc, from the embedded tree) and the config
+    /// mount (from [`crate::config_seed::config_seed_files`]) both call it, so
+    /// one rule serves rc AND config.
+    ///
+    /// Per the crash-over-corruption stance a write failure aborts loudly — a
+    /// half-seeded namespace is corruption, and the caller decides whether to
+    /// proceed without it.
+    ///
+    /// [`seed_from_embedded`]: Self::seed_from_embedded
+    pub fn seed_entries(
+        &self,
+        entries: impl IntoIterator<Item = (String, &'static str)>,
+    ) -> VfsResult<usize> {
         let mut written = 0usize;
-        for (canonical, body) in crate::seed_scripts::seed_files() {
-            // `seed_files` yields canonical `/etc/rc/...` paths; only seed those
-            // that fall under this backend's root, and only if absent.
+        for (canonical, body) in entries {
+            // Only seed paths that fall under this backend's root, and only if
+            // absent (a live user edit is never clobbered).
             if !canonical.starts_with(&self.root) {
                 continue;
             }
@@ -615,6 +634,40 @@ mod tests {
 
         // Second seed writes nothing (idempotent: paths already present).
         assert_eq!(fs.seed_from_embedded().unwrap(), 0);
+    }
+
+    /// The same backend, mounted at `/etc/config`, owns the config files via
+    /// the shared `seed_entries` core — proving one backend type serves rc AND
+    /// config (slice 2). A known config file round-trips through the VFS.
+    #[tokio::test]
+    async fn config_mount_seeds_and_reads_via_seed_entries() {
+        let creator = PrincipalId::system();
+        let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+        let ws_id = db.lock().get_or_create_default_workspace(creator).unwrap();
+        let blocks = shared_block_store_with_db(db, ws_id, creator);
+        let fs = ConfigCrdtFs::new(blocks, "/etc/config");
+
+        assert!(fs.is_empty(), "fresh config mount owns nothing");
+        let n = fs.seed_entries(crate::config_seed::config_seed_files()).unwrap();
+        assert_eq!(n, 4, "the four config files seed on a fresh mount");
+
+        // models.toml round-trips through the VFS (read mount-relative).
+        let models = fs.read_all(p("models.toml")).await.unwrap();
+        assert_eq!(models, crate::config_seed::DEFAULT_MODELS_CONFIG.as_bytes());
+
+        // readdir lists the flat config set.
+        let entries: Vec<_> = fs
+            .readdir(p(""))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(entries.contains(&"theme.toml".to_string()), "entries: {entries:?}");
+        assert!(entries.contains(&"system.md".to_string()), "entries: {entries:?}");
+
+        // Idempotent: a second seed writes nothing.
+        assert_eq!(fs.seed_entries(crate::config_seed::config_seed_files()).unwrap(), 0);
     }
 
     /// A user edit must survive re-seeding — seed only fills absent paths, it

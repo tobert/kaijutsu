@@ -192,14 +192,61 @@ real customization lands in `assets/defaults/rc/`).
 
 ---
 
-## Slice 2 — config TOMLs drop the host flush
+## Slice 2 — config TOMLs converge onto `ConfigCrdtFs`
 
-The TOMLs already live in the (now-unified) backend; this slice removes their
-host-disk coupling to match rc:
-- Drop the debounced host flush (`config_backend.rs:316–320` write path + the
-  debounce timer).
-- Embedded seeds the CRDT once; CRDT owns thereafter; no host read-back on startup.
-- Editing via `kj` set / reseed (parallel to rc); same hard-reset cutover.
+**Decided 2026-06-17 (with Amy):** *converge* — delete `ConfigCrdtBackend`
+entirely and mount a second `ConfigCrdtFs` (the slice-1 VfsOps backend, already
+written generic for "the `/etc/rc` tree **and, later, the config TOMLs**") at
+`/etc/config`. One backend *type*, one rule for rc AND config. Scope: **all four
+files** (`theme.toml`, `models.toml`, `mcp.toml`, `system.md`), including
+migrating the app to read theme over RPC.
+
+### Why the old one-paragraph sketch was wrong
+Slice-1 reconnaissance found config consumers are **heterogeneous** — they do
+*not* all flow through the CRDT today:
+- `models.toml` → kernel reads via `config_backend` (CRDT) — clean to converge.
+- `system.md` → kernel reads via `config_backend` (CRDT) — clean to converge.
+- `theme.toml` → **the app** reads the host file directly (`theme_loader.rs`,
+  separate process, no RPC). The kernel never reads its *content*; `ensure_config`
+  only writes the host file *so the app can read it*. So for theme, the host file
+  is load-bearing for the app — dropping the host write breaks app theming unless
+  the app fetches theme over RPC.
+- `mcp.toml` → effectively inert (a `DEFAULT_MCP_CONFIG` const, no live loader
+  found); converge the doc, no reader to re-point.
+- The capnp config RPCs (`listConfigs`/`reloadConfig`/`resetConfig`/`getConfig`)
+  are effectively unused client-side (no client wrappers exist) — low-risk to
+  reshape, but the app theme migration *adds* a `getConfig` client wrapper.
+
+### Build order (kernel-first, TDD, committable stages)
+1. **Relocate the embedded `DEFAULT_*` consts** (`DEFAULT_THEME`,
+   `DEFAULT_MODELS_CONFIG`, `DEFAULT_MCP_CONFIG`, `DEFAULT_SYSTEM_PROMPT`) out of
+   `config_backend.rs` (into `config_doc.rs` / a small seed module) so deleting
+   the backend keeps `kaijutsu_kernel::DEFAULT_SYSTEM_PROMPT` et al. exported.
+2. **Config seed source + generalized seeding.** `config_seed_files() →
+   [("/etc/config/theme.toml", DEFAULT_THEME), …]`; extract `ConfigCrdtFs`'s
+   absent-only, fail-loud seed core (`seed_entries`) so both rc and config seed
+   through it.
+3. **Mount** a `ConfigCrdtFs` at `/etc/config` in `rpc.rs` setup; seed embedded
+   once (fresh-namespace gate via `is_empty`).
+4. **Re-point kernel readers** to the VFS: `initialize_kernel_models`
+   (`/etc/config/models.toml`) and `llm_stream` (`/etc/config/system.md`). The
+   parse-fail "reload from disk" safety valve becomes "reset that doc to embedded"
+   (no disk to fall back to) — loud, not silent.
+5. **Delete `ConfigCrdtBackend`** (`config_backend.rs`), the watcher, the
+   `config_backend`/`config_watcher` fields on `SharedKernelState`, and
+   `create_config_backend`.
+6. **Reshape the capnp config RPC handlers** to route through the VFS:
+   `getConfig`/`listConfigs`/`resetConfig` over `/etc/config`; `reloadConfig`
+   (disk reload is meaningless now) → reseed-from-embedded.
+7. **`kj config`** command (`kj/config.rs`) mirroring `kj rc`: `show`/`list`/
+   `set`/`reset`, gated on a new `Capability::ConfigWrite`, driven through
+   `self.kernel().vfs()`. TDD.
+8. **App theme over RPC**: add a `getConfig` client wrapper + actor method; the
+   app fetches `theme.toml` after connect and applies it (startup loads default
+   synchronously, theme arrives post-connect). Drop the host theme read + the
+   theme half of `write_default_configs_if_missing` (`bindings.toml` stays
+   app-side host config — it is not a kernel config). Live hot-reload-on-edit may
+   land as a follow-up if a CRDT subscription is needed.
 
 (One rule for all config; loses the vim-the-toml affordance, parallel to retiring
 vim-the-rc-file.)

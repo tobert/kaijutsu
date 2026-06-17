@@ -44,20 +44,13 @@ use crate::config_doc::{self, config_context_id};
 use crate::flows::ConfigSource;
 use kaijutsu_types::DocKind;
 
-/// Embedded default theme content (TOML).
-pub const DEFAULT_THEME: &str = include_str!("../../../assets/defaults/theme.toml");
-
-/// Embedded default models configuration (LLM providers + embedding, TOML).
-pub const DEFAULT_MODELS_CONFIG: &str = include_str!("../../../assets/defaults/models.toml");
-
-/// Alias for backwards compatibility.
-pub const DEFAULT_LLM_CONFIG: &str = DEFAULT_MODELS_CONFIG;
-
-/// Embedded default MCP server configuration (TOML).
-pub const DEFAULT_MCP_CONFIG: &str = include_str!("../../../assets/defaults/mcp.toml");
-
-/// Embedded default system prompt.
-pub const DEFAULT_SYSTEM_PROMPT: &str = include_str!("../../../assets/defaults/system.md");
+// The embedded default config bodies live in `crate::config_seed` (slice 2):
+// they outlive this disk-coupled backend, which is being deleted. Re-exported
+// here so existing `config_backend::DEFAULT_*` paths keep resolving until then.
+pub use crate::config_seed::{
+    DEFAULT_LLM_CONFIG, DEFAULT_MCP_CONFIG, DEFAULT_MODELS_CONFIG, DEFAULT_SYSTEM_PROMPT,
+    DEFAULT_THEME,
+};
 
 /// Tracks dirty config files that need flushing to disk.
 struct DirtyTracker {

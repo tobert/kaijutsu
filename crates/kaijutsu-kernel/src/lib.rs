@@ -16,6 +16,7 @@ pub mod block_tools;
 pub mod image;
 pub mod config_backend;
 pub mod config_doc;
+pub mod config_seed;
 pub mod control;
 pub mod drift;
 pub mod execution;
@@ -49,9 +50,8 @@ pub use block_tools::{
     BlockReadEngine, BlockSearchEngine, BlockSpliceEngine, BlockStatusEngine, EditOp,
     ImgBlockEngine, ImgBlockFromPathEngine, KernelSearchEngine, SvgBlockEngine,
 };
-pub use config_backend::{
-    ConfigCrdtBackend, ConfigWatcherHandle, DEFAULT_SYSTEM_PROMPT, ValidationResult,
-};
+pub use config_backend::{ConfigCrdtBackend, ConfigWatcherHandle, ValidationResult};
+pub use config_seed::DEFAULT_SYSTEM_PROMPT;
 pub use control::ConsentMode;
 pub use kaijutsu_types::DocKind;
 pub use kernel::Kernel;
