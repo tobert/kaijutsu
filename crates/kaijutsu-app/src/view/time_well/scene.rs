@@ -198,17 +198,19 @@ const CAMERA_EASE_RATE: f32 = 4.0;
 /// paints the viewport before the UI composites on top).
 const WELL_BG: Color = Color::srgb(0.04, 0.05, 0.07);
 
-/// Build the well: spawn the 3D camera + root, and re-order the existing 2D UI
-/// camera to composite on top of the 3D render (transparent clear) so the dock
-/// hint bar stays visible while the well owns the background. The shared card
-/// mesh is built once.
+/// Build the well: repurpose the shared app camera (mark it `TimeWellCamera`,
+/// swap its clear color to the well background, and frame the rings) and spawn
+/// the root + focus card. There is no second camera — the conversation UI and the
+/// well's 3D meshes share the one always-on `Camera3d` (see `main::setup_camera`),
+/// so the old 3D-background / 2D-overlay composite is gone. The shared card mesh
+/// is built once.
 pub fn enter_time_well(
     mut commands: Commands,
     mut state: ResMut<TimeWellState>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<crate::shaders::WellCardMaterial>>,
     mut images: ResMut<Assets<Image>>,
-    mut ui_cameras: Query<&mut Camera, With<Camera2d>>,
+    mut app_camera: Query<(Entity, &mut Camera, &mut Transform), With<Camera3d>>,
 ) {
     // Fresh entry always starts in the overview (not focused).
     state.focused = false;
@@ -218,14 +220,16 @@ pub fn enter_time_well(
         state.card_mesh = Some(meshes.add(Rectangle::new(CARD_WIDTH, CARD_HEIGHT)));
     }
 
-    // The 3D well camera renders the background (order 0); the UI camera moves
-    // above it (order 1) and stops clearing so the dock chrome composites over
-    // the well instead of painting an opaque background over it.
-    let mut n_ui = 0;
-    for mut cam in ui_cameras.iter_mut() {
-        cam.order = 1;
-        cam.clear_color = ClearColorConfig::None;
-        n_ui += 1;
+    // Repurpose the one app camera for the well: mark it so the well's per-frame
+    // camera systems (`ease_camera_to_selection`, `billboard_cards`) find it, swap
+    // its clear color to the well background, and set the base framing — pulled
+    // back and tilted up so the full hot rim (radius ≈ 420) sits in the top
+    // ~two-thirds, with the colder bands receding behind it.
+    if let Ok((cam_entity, mut cam, mut tf)) = app_camera.single_mut() {
+        commands.entity(cam_entity).insert(TimeWellCamera);
+        cam.clear_color = ClearColorConfig::Custom(WELL_BG);
+        *tf = Transform::from_xyz(0.0, 80.0, 920.0)
+            .looking_at(Vec3::new(0.0, 80.0, -200.0), Vec3::Y);
     }
 
     commands.spawn((
@@ -233,21 +237,6 @@ pub fn enter_time_well(
         Transform::default(),
         Visibility::Inherited,
         Name::new("TimeWellRoot"),
-    ));
-
-    // Camera framing: pulled back and tilted up a touch so the full hot rim
-    // (radius ≈ 420) sits in the top ~two-thirds, above the reading panel; the
-    // colder bands recede behind it.
-    commands.spawn((
-        TimeWellCamera,
-        Camera3d::default(),
-        Camera {
-            order: 0,
-            clear_color: ClearColorConfig::Custom(WELL_BG),
-            ..default()
-        },
-        Transform::from_xyz(0.0, 80.0, 920.0).looking_at(Vec3::new(0.0, 80.0, -200.0), Vec3::Y),
-        Name::new("TimeWellCamera"),
     ));
 
     // Focus card: an in-world 3D card floating lower-center at the mouth of the
@@ -281,27 +270,23 @@ pub fn enter_time_well(
         Name::new("ReadingCard"),
     ));
 
-    info!("time-well: entered ({n_ui} ui camera(s) set to overlay)");
+    info!("time-well: entered (shared app camera repurposed for the well)");
 }
 
-/// Tear the well down: despawn the camera + all cards, clear the id→entity map
-/// and join state, and re-enable the 2D UI camera.
+/// Tear the well down: despawn the root + all cards, clear the id→entity map and
+/// join state, and hand the shared app camera back to the conversation (drop the
+/// well marker, restore the theme background clear). The camera itself is *not*
+/// despawned — it is the app's one always-on camera.
 pub fn exit_time_well(
     mut commands: Commands,
     mut state: ResMut<TimeWellState>,
     theme: Res<crate::ui::theme::Theme>,
     roots: Query<Entity, With<TimeWellRoot>>,
-    cameras: Query<Entity, With<TimeWellCamera>>,
     cards: Query<Entity, With<Card>>,
     reading: Query<Entity, With<ReadingCard>>,
-    mut ui_cameras: Query<&mut Camera, With<Camera2d>>,
+    mut app_camera: Query<(Entity, &mut Camera), With<TimeWellCamera>>,
 ) {
-    for e in roots
-        .iter()
-        .chain(cameras.iter())
-        .chain(cards.iter())
-        .chain(reading.iter())
-    {
+    for e in roots.iter().chain(cards.iter()).chain(reading.iter()) {
         commands.entity(e).despawn();
     }
 
@@ -311,10 +296,10 @@ pub fn exit_time_well(
     // re-polled by DriftState; nothing durable is lost).
     state.join = kaijutsu_viz::join::Join::new();
 
-    // Restore the UI camera to its standalone configuration (order 0, opaque
-    // theme background) now that the well camera is gone.
-    for mut cam in ui_cameras.iter_mut() {
-        cam.order = 0;
+    // Hand the shared camera back to the conversation: drop the well marker (so
+    // the well's camera systems stop driving it) and restore the theme clear.
+    if let Ok((cam_entity, mut cam)) = app_camera.single_mut() {
+        commands.entity(cam_entity).remove::<TimeWellCamera>();
         cam.clear_color = ClearColorConfig::Custom(theme.bg);
     }
 

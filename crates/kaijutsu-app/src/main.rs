@@ -197,14 +197,33 @@ fn main() {
         .run();
 }
 
-/// Setup 2D camera for UI.
+/// Setup the single, always-on app camera.
+///
+/// It is a `Camera3d` (not `Camera2d`) so the time well's 3D card meshes and the
+/// conversation UI share **one** camera — the well no longer spawns its own, and
+/// the old two-camera composite (3D background + 2D overlay) is gone. Bevy UI
+/// renders on whatever camera is the default UI target; with a single camera that
+/// is this one (`IsDefaultUiCamera` makes it explicit), and the UI pass runs
+/// *after* tonemapping/bloom, so conversation UI is untouched by either.
+///
+/// `Hdr` + `Bloom` make the 3D well cards glow (the main pass is tonemapped); the
+/// conversation UI renders after tonemapping, so its colors are placeholder-only
+/// and not a concern here (per Amy).
 fn setup_camera(mut commands: Commands, theme: Res<ui::theme::Theme>) {
+    use bevy::core_pipeline::tonemapping::Tonemapping;
+    use bevy::post_process::bloom::Bloom;
+    use bevy::render::view::Hdr;
     commands.spawn((
-        Camera2d,
+        Camera3d::default(),
         Camera {
             clear_color: ClearColorConfig::Custom(theme.bg),
             ..default()
         },
+        Hdr,
+        Bloom::NATURAL,
+        Tonemapping::TonyMcMapface,
+        IsDefaultUiCamera,
+        Name::new("AppCamera"),
     ));
 }
 

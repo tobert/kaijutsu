@@ -344,19 +344,19 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ## Viz substrate (kaijutsu-viz) — see docs/viz-substrate.md
 
-- **Time-well HDR+Bloom breaks the two-camera composite — DEFERRED, not a
-  blocker after all, 2026-06-17.** Adding `Bloom` (→ `#[require(Hdr)]`) +
-  `Tonemapping` to the `TimeWellCamera` (3D, order 0) makes the cards vanish —
-  the log confirms they still *spawn* (`+19 cards`), they just don't render; only
-  `WELL_BG` + the order-1 2D UI camera survive. The well mixes an HDR 3D camera
-  with the app's LDR 2D `Camera2d` (order 1, `ClearColorConfig::None`) on one
-  target; HDR breaks that compositing. Reverted. **Reframe:** the app glows
-  *without* bloom — `block_fx.wgsl` does SDF border glow + text halo as
-  fragment-shader falloff (no HDR anywhere in the app). So the well cards should
-  glow the same way (in-shader SDF in `WellCardMaterial`), and HDR bloom is only
-  ever wanted for *true light-bloom* polish — at which point this two-camera issue
-  must be solved (UI camera HDR too / `RenderLayers` split / well to its own HDR
-  target). Repro: add `Bloom::NATURAL` to `enter_time_well`'s camera, Ctrl+W.
+- **Time-well HDR+Bloom — ✅ RESOLVED 2026-06-17 via a single shared camera.**
+  The earlier failure (adding `Bloom` to the `TimeWellCamera` made the cards
+  vanish) was the *two-camera* mismatch: an HDR 3D camera (order 0) composited
+  with the app's LDR `Camera2d` (order 1, `ClearColorConfig::None`) on one target.
+  Fix: the app now has **one always-on `Camera3d`** (`main::setup_camera`, marked
+  `IsDefaultUiCamera`) with `Hdr` + `Bloom::NATURAL` + `Tonemapping::TonyMcMapface`.
+  Bevy UI renders on it (the UI pass runs *after* tonemapping/bloom, so the
+  conversation UI is untouched), and the well repurposes the same camera on enter
+  (adds the `TimeWellCamera` marker + swaps the clear color) instead of spawning
+  its own. No second camera, no composite, no `Camera2d` anywhere. Well cards
+  (3D meshes) now bloom; the conversation is visually unchanged. Driving the
+  cards' SDF rims/pulses to HDR (>1.0) so they bloom brightly is the follow-on
+  (`WellCardMaterial` `params`/emissive).
 - **Time-well step-4 polish (shipped 2026-06-16, `view/time_well/`):**
   - *Fixed-pitch overlap:* band slots use a fixed angular pitch (TAU/24) so
     append stays motion-free; but a band with >24 cards wraps slots onto each

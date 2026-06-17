@@ -593,18 +593,21 @@ existing render-world pass. **No render-world changes needed.** Slice-1
   cards may show decor-only text-blank for ~1–2 frames after a change (fine).
   Two systems now share `MsdfAtlas` (ResMut) → they serialize, no conflict.
 
-**Glow via in-shader SDF, NOT bloom (corrected 2026-06-17).** The app has no HDR
-anywhere — in a context the only camera is a single LDR `Camera2d`
-(`main.rs::setup_camera`); the well adds the lone 3D camera on enter. The app's
-glow is already fake SDF falloff in the fragment shader (`block_fx.wgsl`:
-`glow_radius`/`glow_intensity`, text halo) — no bloom. So `WellCardMaterial`
-should glow the **same way** (SDF in-shader), matching the rest of the app and
-needing no HDR. HDR+Bloom was tried and (a) broke the well's two-camera composite
-(cards vanish — see issues.md) and (b) isn't how kaijutsu glows; it's deferred to
-an optional *true light-bloom* polish far later. So the bling vocabulary
-(selection = rim, status = pulse, drift = shimmer, band = LOD/desaturation) is all
-SDF-in-shader, documented as a uniform contract like `block_fx`'s. `MeshTag(u32)`
-per-instance params only if batching matters at scale (not yet).
+**Glow via HDR + Bloom on a single shared camera (2026-06-17).** The app now has
+**one always-on `Camera3d`** (`main.rs::setup_camera`, `IsDefaultUiCamera`) with
+`Hdr` + `Bloom::NATURAL` + `Tonemapping::TonyMcMapface`. Bevy UI renders on it —
+the UI pass runs *after* tonemapping/bloom in the render graph, so the
+conversation UI is untouched — and the well repurposes the same camera on enter
+(adds the `TimeWellCamera` marker, swaps the clear color) rather than spawning its
+own. That dissolved the old two-camera composite (an HDR 3D camera + an LDR
+`Camera2d` on one target made the cards vanish; see issues.md) and there is no
+`Camera2d` anywhere now. The well cards are 3D meshes in the main pass, so they
+bloom. The bling vocabulary (selection = rim, status = pulse, drift = shimmer,
+band = LOD/desaturation) is SDF in `well_card.wgsl` driven to **HDR (>1.0)** values
+via the `params` uniform so the bright rims/pulses spill into bloom (the
+conversation's own glow stays the LDR SDF falloff in `block_fx.wgsl` — it does not
+bloom, which is fine). `MeshTag(u32)` per-instance params only if batching matters
+at scale (not yet).
 
 ---
 
