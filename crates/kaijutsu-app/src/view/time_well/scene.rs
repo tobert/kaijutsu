@@ -206,7 +206,7 @@ pub fn enter_time_well(
     mut commands: Commands,
     mut state: ResMut<TimeWellState>,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut materials: ResMut<Assets<crate::shaders::WellCardMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut ui_cameras: Query<&mut Camera, With<Camera2d>>,
 ) {
@@ -256,14 +256,9 @@ pub fn enter_time_well(
     // `update_reading_card` fills its texture (blank until a selection exists).
     let focus_mesh = meshes.add(Rectangle::new(FOCUS_QUAD_W, FOCUS_QUAD_H));
     let focus_image = create_vello_texture(&mut images, READING_TEX_W as u32, READING_TEX_H as u32);
-    let focus_material = materials.add(StandardMaterial {
-        base_color: Color::WHITE,
-        base_color_texture: Some(focus_image.clone()),
-        unlit: true,
-        cull_mode: None,
-        double_sided: true,
-        alpha_mode: AlphaMode::Mask(0.5),
-        ..default()
+    let focus_material = materials.add(crate::shaders::WellCardMaterial {
+        texture: focus_image.clone(),
+        params: Vec4::ZERO,
     });
     commands.spawn((
         ReadingCard,

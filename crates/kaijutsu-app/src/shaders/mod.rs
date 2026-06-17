@@ -4,10 +4,12 @@
 //! post-processing (SDF border glow, animation, text halo, cursor beam).
 
 pub mod block_fx_material;
+pub mod well_card_material;
 
 use bevy::prelude::*;
 
 pub use block_fx_material::BlockFxMaterial;
+pub use well_card_material::WellCardMaterial;
 
 use crate::cell::block_border::{
     BlockBorderStyle, BlockExcludedState, BorderAnimation, BorderKind, BorderLabelMetrics,

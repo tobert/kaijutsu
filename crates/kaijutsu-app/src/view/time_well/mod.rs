@@ -25,7 +25,8 @@ pub struct TimeWellPlugin;
 
 impl Plugin for TimeWellPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<scene::TimeWellState>()
+        app.add_plugins(MaterialPlugin::<crate::shaders::WellCardMaterial>::default())
+            .init_resource::<scene::TimeWellState>()
             .add_systems(OnEnter(Screen::TimeWell), scene::enter_time_well)
             .add_systems(OnExit(Screen::TimeWell), scene::exit_time_well)
             // The toggle runs in every screen (it decides based on current state).

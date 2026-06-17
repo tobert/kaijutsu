@@ -31,7 +31,7 @@ pub fn sync_time_well(
     mut commands: Commands,
     mut state: ResMut<TimeWellState>,
     drift: Res<crate::ui::drift::DriftState>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut materials: ResMut<Assets<crate::shaders::WellCardMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut cards: Query<(&mut Card, &mut CardTarget)>,
 ) {
@@ -131,23 +131,15 @@ pub fn sync_time_well(
         let pos = target_of(&id).unwrap_or(Vec3::ZERO);
 
         // Per-card RTT texture: the vello scene (accent bg + text, built by
-        // `text::build_card_scenes`) rasterizes into this and the material
-        // samples it. White base color so the texture's own colors show through;
-        // Blend so the rounded-rect corners stay transparent.
+        // `text::build_card_scenes`) rasterizes into this and the `WellCardMaterial`
+        // samples it (the texture = content layer; the shader is where slice-2 FX
+        // will live). Masked alpha keeps the rounded-rect corners transparent.
         let tex_w = CARD_TEX_W as u32;
         let tex_h = CARD_TEX_H as u32;
         let image = create_vello_texture(&mut images, tex_w, tex_h);
-        let material = materials.add(StandardMaterial {
-            base_color: Color::WHITE,
-            base_color_texture: Some(image.clone()),
-            unlit: true,
-            cull_mode: None,
-            double_sided: true,
-            // Mask, not Blend: masked alpha is order-independent, so cards never
-            // swap draw order under transparent depth-sorting (the bg is opaque;
-            // only the rounded corners fall below the cutoff and get discarded).
-            alpha_mode: AlphaMode::Mask(0.5),
-            ..default()
+        let material = materials.add(crate::shaders::WellCardMaterial {
+            texture: image.clone(),
+            params: Vec4::ZERO,
         });
 
         let entity = commands
