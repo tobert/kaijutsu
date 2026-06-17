@@ -229,6 +229,21 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   benign single "MSDF render skipped … target_gpu=false" warn per cell).
   Correct the comments so the next renderer investigation doesn't chase
   the wrong layer.
+- **Error blocks stick to the bottom of the screen and obstruct new content
+  (observed 2026-06-17, THE_DIRECTOR session `019ed674`).** `system/error`
+  blocks render pinned to the bottom of the conversation view; as new content
+  arrives they don't scroll away with it and start occluding live output. The
+  ordering *is* correct in the CRDT — after an app restart the same errors
+  re-sort into their proper timeline position — so this is a view-side
+  sort/placement bug (errors are laid out by a different key than their tick),
+  not a data bug. Low priority for now; logged to revisit.
+- **Triple-Esc does not interrupt a running agentic loop (observed 2026-06-17,
+  same session).** Tapping Esc three times while a context was mid-drive
+  (autonomous turn / tool loop) did not cancel or interrupt it — the loop ran to
+  completion. Expected an abort path on rapid-Esc analogous to the
+  double-tap-dismiss pattern. Need to wire a keyboard interrupt that reaches the
+  in-flight drive/turn (InterruptState → kernel turn cancellation), not just the
+  compose overlay.
 
 ## Control Plane & Navigation (kj)
 
@@ -247,6 +262,37 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 - **TurnFlow bus lossy + in-memory:** overflow eviction is now LOUD (`FlowBus::publish` warns when a full channel drops a slow subscriber's oldest event, `flows.rs`); the zero-subscriber case was already surfaced by `kj drive`/`kj fork --prompt`. Durable delivery (persistence) for `turn.*` remains the follow-up.
 - **Headless turn cwd is `/`:** Decide whether to thread the context's stored shell cwd into the headless `ExecContext`.
 - **`--switch --prompt` double-drives:** Clarify semantics when both human and autonomous turn try to drive a child.
+- **Context-type ↔ fork asymmetry (discovery 2026-06-17, fork code is fresh —
+  worth a code-side look).** `--type` exists only on `kj context create`
+  (rc-dispatch `context_type` → selects which `/etc/rc/<type>/` bundle runs), NOT
+  on `kj fork`. Fork inherits the parent's type and re-runs the *parent type's*
+  `fork/` bundle, so **there is no way to fork into a different type** — switching
+  type means `kj context create --type <T> --parent <src>`, which gives a
+  structural edge but (apparently) none of fork's history/preset copy semantics.
+  Observed: a `context create --parent .` shows `Fork: <id> ()` — empty parens
+  where `kj fork` shows the preset (e.g. `Full`/`Window`). Open questions for the
+  fork/create code (`kj/fork.rs`, `kj/mod.rs` context_create, `rpc.rs`
+  create_context_inner): (a) is the type-on-fork omission deliberate or just
+  unbuilt? (b) does `context create --parent` copy ANY blocks, or only wire the
+  DAG edge — i.e. does a director created this way see what it needs to coordinate,
+  or start blank? (c) should `kj fork --type <T>` exist (fork history + run the
+  *target* type's create/fork bundle) for the common "branch this work into a
+  director/explorer" move? Surfaced while standing up a `director` context to
+  experiment with coordination.
+  - *Reconfirmed 2026-06-17: the child's block log was its own rc output (`system/text` stance,
+    `system/notification` tool-adds, S10/S20 rc traces) plus the seed
+    `--prompt`; **zero blocks copied from the parent**. So the create-with-
+    parent path starts the child blank (correct for a clean coder, wrong if
+    you wanted fork's history). Strengthens the case for (c) `kj fork --type`:
+    the director's natural move is "branch this work into a coder *with* the
+    working context," which neither verb currently does in one step.
+- **`$HOME` env var is empty in the context shell (minor; `~` now fixed).**
+  `~` expansion is fixed by a kaish upgrade (2026-06-17), so `~/path` resolves.
+  The remaining gap is the `$HOME` *variable*: it's still empty in both the
+  read-only and full shell, so `$HOME/path` resolves to nothing while bare `~`
+  works. Decide whether the headless `ExecContext` should seed `HOME` from the
+  context's stored cwd/user (adjacent to "Headless turn cwd is `/`" above) so the
+  variable and the tilde agree. Absolute paths always work.
 
 ### kj / MCP ergonomics (UX)
 
@@ -329,6 +375,41 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   `shell_execute` and read it in the MCP `to_json` (`kaijutsu-mcp/src/lib.rs`).
   CBOR oplog evolution is additive (safe); capnp is the work. P3 because the
   `--json` envelope already unblocks consumers today.
+- **External `mcp__kaijutsu__shell` hangs to timeout (observed 2026-06-17).**
+  After a server+app restart, *every* external shell call timed out — `echo hi`
+  at 20s, `kj context list --tree` at 300s — returning a `block_id` but never the
+  output (`status: "timeout"`). The command-result never syncs back over the
+  `SyncedDocument` remote path; `submit_input`/`write_input`/`whoami` (non-CRDT-poll
+  paths) stayed responsive, and `listContexts` (the well's drift poll) was fine, so
+  it is specifically the shell-output replication, not the kernel. Same family as
+  the P3 above + the SyncedDocument review below (`project_mcp_synceddocument_sync`).
+  Made it impossible to stage/inspect contexts over MCP during time-well verification.
+- **mcp-context default model is an invalid id (observed 2026-06-17).** A context
+  created via `register_session` (context_type `mcp`/`default`) defaulted to
+  `anthropic/claude-haiku-4-5-20250101` (also seen as `…-20250929`) — a wrong date;
+  the valid id is `claude-haiku-4-5-20251001`. Chat turns fail with
+  `not_found_error` after 3 attempts. Fix the default model id wherever mcp/default
+  contexts are seeded.
+- **File `edit` tool corrupted `docs/issues.md` mid-edit (observed 2026-06-17,
+  THE_DIRECTOR `019ed674` → this very file).** A director driving the `builtin.file`
+  `edit` tool to *append* a backlog entry instead spliced and destroyed content:
+  it duplicated a bullet, fused the `### kj / MCP ergonomics (UX)` header onto the
+  body of the MIDI bullet, and dropped/merged lines across the 250–281 region —
+  while reporting `Replaced 1 occurrence` each time. Contributing factors:
+  (a) the **diff preview lied** — it showed stale pre-edit line numbers and
+  interleaved old/new text, so the confirmation couldn't be trusted and the model
+  kept re-editing a file it thought hadn't changed; (b) line-numbered `read`
+  output carries a leading-space/line-number prefix that is *not* the on-disk
+  bytes, so whitespace-exact `old_string` matching kept failing (`old_string not
+  found`) and pushed toward increasingly fragile edits; (c) **recovery was
+  impossible from inside the context** — `git` isn't on the kaish PATH, and
+  `cat -A` / `ls -d` aren't supported, so the model couldn't diff against HEAD or
+  revert. Net: an append-only intent became destructive. Fixes to consider:
+  make `edit` verify post-edit state against the requested op (fail loud on
+  splice), render the diff preview from true on-disk bytes with correct line
+  numbers, and either expose `git`/a revert affordance in the context shell or a
+  `kj block diff --original`-style recovery path. (The file was hand-repaired
+  2026-06-17; this entry is the post-mortem.)
 
 - **`StreamingBlockHandle` implementation:** Single-block streaming primitive.
 - **LLM streaming rewrite:** Move `process_llm_stream` onto `StreamingBlockHandle`.
@@ -363,9 +444,14 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
     other (coincident cards → z-fight/draw-swap; `AlphaMode::Mask` mitigates the
     sort but not coincidence). Real fix for very full bands: sub-rings, smaller
     cards, or radius LOD. Band 0 is meant for ~10 so this only bites test data.
-  - *Status coverage:* the data tick reflects only already-subscribed contexts;
-    a `subscribeBlocksFiltered` over the full visible set so every rim card
-    pulses is the follow-up (gap 3).
+  - *Status coverage (gap 3):* ✅ RESOLVED 2026-06-17 (`df3b65b`) — not via
+    `subscribeBlocksFiltered` but via a kernel-derived `ContextInfo.liveStatus`
+    @14: the server reads each context's block statuses in timeline order
+    (`derive_context_live_status`: any Running→Running, else tail Error→Error,
+    else idle) and ships it on every `listContexts` poll. The well sets
+    `Card.status` from it for every visible card, driving the rim pulse; the
+    event-based `apply_block_status` is retired (single source = the poll;
+    the breathe itself is continuous via `globals.time`). Thin-client aligned.
   - *Readability:* card sizing/camera zoom is functional but text is small at
     the default framing; tune when the active view (step 6) lands.
 - **`ScaleLinear`/`ScaleTime` round-trip loses precision under extreme
