@@ -565,12 +565,18 @@ nothing a card needs that MSDF+SDF don't. The app already has the pieces:
   spawn in `sync.rs` swaps off `StandardMaterial`. Vello stays for SVG/ABC blocks
   (arbitrary vector), just not for cards.
 
-**Prerequisite, independent + shipped first:** **HDR + Bloom on the well camera**
-(`TimeWellCamera.hdr = true` + `Bloom`) — without it emissive reads bright, not
-glowy. Then the material; then the bling vocabulary (status = pulse, selection =
-rim, drift = shimmer, band = LOD/desaturation), documented as a uniform contract
-like `block_fx`'s. `MeshTag(u32)` per-instance params only if batching matters at
-scale (the well's card count doesn't yet require it).
+**Glow via in-shader SDF, NOT bloom (corrected 2026-06-17).** The app has no HDR
+anywhere — in a context the only camera is a single LDR `Camera2d`
+(`main.rs::setup_camera`); the well adds the lone 3D camera on enter. The app's
+glow is already fake SDF falloff in the fragment shader (`block_fx.wgsl`:
+`glow_radius`/`glow_intensity`, text halo) — no bloom. So `WellCardMaterial`
+should glow the **same way** (SDF in-shader), matching the rest of the app and
+needing no HDR. HDR+Bloom was tried and (a) broke the well's two-camera composite
+(cards vanish — see issues.md) and (b) isn't how kaijutsu glows; it's deferred to
+an optional *true light-bloom* polish far later. So the bling vocabulary
+(selection = rim, status = pulse, drift = shimmer, band = LOD/desaturation) is all
+SDF-in-shader, documented as a uniform contract like `block_fx`'s. `MeshTag(u32)`
+per-instance params only if batching matters at scale (not yet).
 
 ---
 
