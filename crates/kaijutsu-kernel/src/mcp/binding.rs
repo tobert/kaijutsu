@@ -54,7 +54,8 @@ pub const KNOWN_FACADES: &[&str] = &["shell", "shell_readonly", "edit_input", "s
 /// Stored as a normalized set (`ContextToolBinding::authorities`) persisted in
 /// the `context_binding_authorities` table — extensible (a future authority is
 /// a new variant + token, no schema migration).
-pub const KNOWN_AUTHORITIES: &[&str] = &["drive", "fork", "drift", "transport", "operator"];
+pub const KNOWN_AUTHORITIES: &[&str] =
+    &["drive", "fork", "drift", "transport", "operator", "config-write"];
 
 /// Builtin broker instances that are the in-kernel **projection** of a facade,
 /// as `(instance, facade)` pairs.
@@ -125,6 +126,15 @@ pub enum Capability {
     /// and `kj attach`. Operator authority over the durable structure, kept
     /// distinct from `Admin` (which is narrowly loadout-write).
     Operator,
+    /// `kj config set/reset` — may write the CRDT-owned config files at
+    /// `/etc/config` (models.toml, system.md, theme.toml, mcp.toml). The config
+    /// analogue of [`RcWrite`]: dedicated so a broad loadout (e.g. `coder` with
+    /// "*") can't silently rewrite which model runs or the base system prompt.
+    /// `kj config` writes go straight through the VFS (not the gated file tool),
+    /// so this is enforced in the `kj config` dispatcher.
+    ///
+    /// [`RcWrite`]: Capability::RcWrite
+    ConfigWrite,
 }
 
 impl Capability {
@@ -140,6 +150,7 @@ impl Capability {
             Capability::Drift => "drift",
             Capability::Transport => "transport",
             Capability::Operator => "operator",
+            Capability::ConfigWrite => "config-write",
             _ => return None,
         })
     }
@@ -153,6 +164,7 @@ impl Capability {
             "drift" => Capability::Drift,
             "transport" => Capability::Transport,
             "operator" => Capability::Operator,
+            "config-write" => Capability::ConfigWrite,
             _ => return None,
         })
     }
@@ -283,7 +295,8 @@ impl ContextToolBinding {
             | Capability::Fork
             | Capability::Drift
             | Capability::Transport
-            | Capability::Operator => {
+            | Capability::Operator
+            | Capability::ConfigWrite => {
                 cap.authority_name().is_some_and(|n| self.authorities.contains(n))
             }
         }
@@ -322,7 +335,8 @@ impl ContextToolBinding {
             | Capability::Fork
             | Capability::Drift
             | Capability::Transport
-            | Capability::Operator) => {
+            | Capability::Operator
+            | Capability::ConfigWrite) => {
                 if let Some(n) = c.authority_name() {
                     self.authorities.insert(n.to_string());
                 }
@@ -350,7 +364,8 @@ impl ContextToolBinding {
             | Capability::Fork
             | Capability::Drift
             | Capability::Transport
-            | Capability::Operator => {
+            | Capability::Operator
+            | Capability::ConfigWrite => {
                 if let Some(n) = cap.authority_name() {
                     self.authorities.remove(n);
                 }

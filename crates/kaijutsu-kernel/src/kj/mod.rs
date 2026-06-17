@@ -14,6 +14,7 @@ pub mod block;
 pub mod cache;
 pub mod cas;
 pub mod compact;
+pub mod config;
 pub mod context;
 pub mod context_shell;
 pub mod doc;
@@ -355,6 +356,9 @@ impl KjDispatcher {
         if cmd == "rc" {
             return self.dispatch_rc(&argv[1..], caller).await;
         }
+        if cmd == "config" {
+            return self.dispatch_config(&argv[1..], caller).await;
+        }
         // `kj block` operates by --context ref when given one, so it can
         // run without an active context.
         if cmd == "block" {
@@ -619,6 +623,7 @@ pub(crate) fn kj_command() -> clap::Command {
         .subcommand(preset::PresetArgs::command())
         .subcommand(cas::CasArgs::command())
         .subcommand(rc::RcArgs::command())
+        .subcommand(config::ConfigArgs::command())
         .subcommand(block::BlockArgs::command())
         .subcommand(binding::BindingArgs::command())
         .subcommand(policy::PolicyArgs::command())
@@ -736,6 +741,14 @@ pub(crate) mod test_helpers {
         let rc_fs = crate::runtime::config_crdt_fs::ConfigCrdtFs::new(blocks.clone(), "/etc/rc");
         rc_fs.seed_from_embedded().expect("seed rc into CRDT");
         kernel.mount("/etc/rc", rc_fs).await;
+        // Config files live on the same CRDT-native backend type at /etc/config
+        // (slice 2) — seed it too so `kj config` tests exercise the real path.
+        let config_fs =
+            crate::runtime::config_crdt_fs::ConfigCrdtFs::new(blocks.clone(), "/etc/config");
+        config_fs
+            .seed_entries(crate::config_seed::config_seed_files())
+            .expect("seed config into CRDT");
+        kernel.mount("/etc/config", config_fs).await;
         kernel
             .init_kv(kernel_db.clone())
             .expect("init kernel KV for test dispatcher");
@@ -864,6 +877,7 @@ pub(crate) mod test_helpers {
             binding.grant(crate::mcp::Capability::Drift);
             binding.grant(crate::mcp::Capability::Transport);
             binding.grant(crate::mcp::Capability::Operator);
+            binding.grant(crate::mcp::Capability::ConfigWrite);
             db.upsert_context_binding(id, &binding).unwrap();
         }
 

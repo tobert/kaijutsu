@@ -14,6 +14,10 @@ kj binding allow "admin"
 kj binding allow "builtin.file:write"
 kj binding allow "builtin.file:edit"
 kj binding allow "rc-write"
+# config-write opens `kj config set/reset` over the CRDT-owned /etc/config files
+# (models.toml, system.md, theme.toml, mcp.toml). The config analogue of rc-write
+# — dedicated, not implied by the grants above.
+kj binding allow "config-write"
 # kj verb authorities: a director coordinates contexts end-to-end — drives and
 # forks them, merges drift, runs the transport, and performs context/workspace
 # lifecycle. Explicit grants (NOT implied by any of the above).
