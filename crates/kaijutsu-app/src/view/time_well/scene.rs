@@ -258,7 +258,9 @@ pub fn enter_time_well(
     let focus_image = create_vello_texture(&mut images, READING_TEX_W as u32, READING_TEX_H as u32);
     let focus_material = materials.add(crate::shaders::WellCardMaterial {
         texture: focus_image.clone(),
+        accent: Vec4::ZERO, // filled by update_reading_card on the first selection
         params: Vec4::ZERO,
+        shape: card_shape(),
     });
     commands.spawn((
         ReadingCard,
@@ -272,9 +274,10 @@ pub fn enter_time_well(
             width: READING_TEX_W as u32,
             height: READING_TEX_H as u32,
         },
-        // MSDF text composites on top of the vello decor in this texture.
+        // MSDF owns this texture (clears + renders text on transparent); the
+        // shader draws the body. No vello.
         crate::text::msdf::MsdfBlockGlyphs::default(),
-        crate::text::msdf::BlockRenderMethod::Vello,
+        crate::text::msdf::BlockRenderMethod::Msdf,
         Name::new("ReadingCard"),
     ));
 
@@ -665,6 +668,20 @@ pub fn move_cards_toward_target(time: Res<Time>, mut cards: Query<(&mut Transfor
 /// Placeholder until the theme grows a context-type palette; hashes the bucket
 /// to a hue so distinct context types read as distinct colors and the same type
 /// is stable across frames.
+/// Accent bucket → linear-rgba [`Vec4`] for `WellCardMaterial.accent` (the card
+/// body color the shader fills). Alpha 0.94 (matches the old vello bg).
+pub fn accent_vec4(accent: &str) -> Vec4 {
+    let c = accent_color(accent).to_linear();
+    Vec4::new(c.red, c.green, c.blue, 0.94)
+}
+
+/// `WellCardMaterial.shape` = `[aspect (CARD_TEX_W/H = 1.6), corner_radius,
+/// ring_width, inset]` in the shader's aspect-corrected UV space. Same for rim
+/// and focus cards (both 1.6 aspect).
+pub fn card_shape() -> Vec4 {
+    Vec4::new(1.6, 0.06, 0.045, 0.012)
+}
+
 pub fn accent_color(accent: &str) -> Color {
     // FNV-1a over the bytes → hue. Stable, dependency-free.
     let mut h: u32 = 2166136261;

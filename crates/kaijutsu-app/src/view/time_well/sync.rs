@@ -139,7 +139,9 @@ pub fn sync_time_well(
         let image = create_vello_texture(&mut images, tex_w, tex_h);
         let material = materials.add(crate::shaders::WellCardMaterial {
             texture: image.clone(),
+            accent: super::scene::accent_vec4(&data.accent),
             params: Vec4::ZERO,
+            shape: super::scene::card_shape(),
         });
 
         let entity = commands
@@ -162,9 +164,10 @@ pub fn sync_time_well(
                     width: tex_w,
                     height: tex_h,
                 },
-                // MSDF text composites on top of the vello decor in this texture.
+                // MSDF owns this texture (clears + renders text on transparent);
+                // the shader draws the body. No vello.
                 crate::text::msdf::MsdfBlockGlyphs::default(),
-                crate::text::msdf::BlockRenderMethod::Vello,
+                crate::text::msdf::BlockRenderMethod::Msdf,
                 Name::new(format!("Card({})", id.short())),
             ))
             .id();

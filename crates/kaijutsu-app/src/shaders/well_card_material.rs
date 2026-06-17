@@ -1,15 +1,11 @@
-//! Well card material — the 3D card foundation for the time well.
+//! Well card material — the 3D card for the time well (rim cards + focus card).
 //!
-//! `WellCardMaterial` is a 3D `Material` (unlike `BlockFxMaterial`, which is a 2D
-//! `UiMaterial`) for the billboarded cards + focus card in `view/time_well/`. It
-//! samples the card's RTT texture (the text/content layer) and is the home for
-//! the in-shader SDF glow / rings / status FX (slice 2) — the same "texture =
-//! content, shader = FX" split `block_fx` uses, lifted onto a 3D quad. Glow is
-//! fragment-shader SDF falloff (no HDR/bloom), matching the rest of the app.
-//!
-//! Slice 1 (this): parity with the old unlit `StandardMaterial` — sample the
-//! texture, Mask alpha. The `params` uniform is wired now so slice 2 can drive
-//! FX without a layout change.
+//! `WellCardMaterial` is a 3D `Material` that draws the *entire* card on the GPU:
+//! the accent rounded-rect background, the selection/lineage rings (SDF, from
+//! `params`), and the MSDF text composited on top (the `texture`, which the MSDF
+//! pass renders text-on-transparent into). This is the vello-free well — vello no
+//! longer touches card textures (it stays for SVG/ABC elsewhere). Glow is SDF in
+//! the fragment shader (no HDR/bloom), matching `block_fx`.
 
 use bevy::prelude::*;
 use bevy::render::render_resource::AsBindGroup;
@@ -18,15 +14,23 @@ use bevy::shader::ShaderRef;
 /// Material for a single time-well card (rim card or focus card).
 #[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
 pub struct WellCardMaterial {
-    /// The card's RTT content texture (accent bg + text, rasterized per card).
+    /// MSDF text texture (text on transparent — the MSDF pass clears + renders it).
     #[texture(0)]
     #[sampler(1)]
     pub texture: Handle<Image>,
 
-    /// Reserved for slice-2 SDF FX: `[selected, in_lineage, status, time]`.
-    /// Unused in slice 1 (sampled trivially so the binding isn't stripped).
+    /// Accent background color (linear rgba). Fills the rounded-rect body.
     #[uniform(2)]
+    pub accent: Vec4,
+
+    /// `[selected, in_lineage, status, time]` — drives the rings (and future FX).
+    #[uniform(3)]
     pub params: Vec4,
+
+    /// `[aspect (w/h), corner_radius, ring_width, inset]` in the shader's
+    /// aspect-corrected UV space.
+    #[uniform(4)]
+    pub shape: Vec4,
 }
 
 impl Material for WellCardMaterial {
@@ -35,8 +39,8 @@ impl Material for WellCardMaterial {
     }
 
     fn alpha_mode(&self) -> AlphaMode {
-        // Masked alpha is order-independent (the bg is opaque; only the rounded
-        // corners fall below the cutoff), matching the old StandardMaterial.
+        // Masked alpha is order-independent (the rounded-rect body is opaque; only
+        // outside the corners falls below the cutoff and is discarded).
         AlphaMode::Mask(0.5)
     }
 }
