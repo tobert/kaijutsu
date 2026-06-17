@@ -168,6 +168,21 @@ pub const FOCUS_QUAD_H: f32 = 237.5;
 /// camera) so it floats in front of the rings at the mouth of the well.
 pub const FOCUS_CARD_POS: Vec3 = Vec3::new(0.0, -40.0, 260.0);
 
+/// Camera distance in front of the focus card when focused (larger = card fills
+/// less of the frame). Tuned a touch back so the focused card isn't oversized.
+const FOCUS_DOLLY: f32 = 430.0;
+
+/// Per-band recline (radians) layered on the billboard so cards lie along the
+/// funnel slope like the concept (mockup 27): the hot rim stands ~upright, colder
+/// bands tilt back toward horizontal as they descend into the well. Tunable.
+fn card_tilt(band: Band) -> f32 {
+    match band {
+        Band::Hot => 0.10,
+        Band::RecentConcluded => 0.32,
+        Band::Haystack => 0.55,
+    }
+}
+
 /// Exponential-smoothing rate for card motion (higher = snappier).
 const CARD_EASE_RATE: f32 = 8.0;
 
@@ -576,8 +591,9 @@ pub fn ease_camera_to_selection(
     };
 
     let (desired_pos, desired_look) = if state.focused {
-        // Dolly to a tight head-on framing of the focus card so it fills the view.
-        (FOCUS_CARD_POS + Vec3::new(0.0, 0.0, 360.0), FOCUS_CARD_POS)
+        // Dolly to a head-on framing of the focus card so it dominates the view
+        // (distance tuned so it fills most of the frame without overflowing).
+        (FOCUS_CARD_POS + Vec3::new(0.0, 0.0, FOCUS_DOLLY), FOCUS_CARD_POS)
     } else {
         let selected_pos = state
             .selected
@@ -609,20 +625,26 @@ pub fn ease_camera_to_selection(
 /// this is the one-line `looking_at` per card the design doc calls for.
 pub fn billboard_cards(
     camera: Query<&GlobalTransform, With<TimeWellCamera>>,
-    mut cards: Query<&mut Transform, Or<(With<Card>, With<ReadingCard>)>>,
+    mut cards: Query<(&mut Transform, Option<&Card>), Or<(With<Card>, With<ReadingCard>)>>,
 ) {
     let Ok(cam) = camera.single() else {
         return;
     };
     let cam_pos = cam.translation();
-    for mut tf in cards.iter_mut() {
+    for (mut tf, card) in cards.iter_mut() {
         // Orient the quad's visible (+Z) face toward the camera, keeping world-up
         // so text stays upright. `looking_at` points -Z at its target, so aim it
         // at the point opposite the camera (the quad mirror of the camera ray).
         let away = tf.translation * 2.0 - cam_pos;
-        tf.rotation = Transform::from_translation(tf.translation)
+        let mut rot = Transform::from_translation(tf.translation)
             .looking_at(away, Vec3::Y)
             .rotation;
+        // Ring cards recline by band so they lie along the funnel slope (concept
+        // mockup 27); the focus card (no `Card`) stays head-on.
+        if let Some(card) = card {
+            rot *= Quat::from_rotation_x(-card_tilt(card.data.band));
+        }
+        tf.rotation = rot;
     }
 }
 

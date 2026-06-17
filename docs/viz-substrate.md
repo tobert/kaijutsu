@@ -525,6 +525,53 @@ keyboard-driven precursor to the eventual "dive through the focused card → it
 unfolds into the conversation" JOIN transition (mockup 34); the reading slot is
 that focused card, parked rather than dived-through.
 
+**Evolved (2026-06-17):** the flat 2D bottom panel was tried and rejected — it
+read as generic web chrome ("a JavaScript thing"). The focus presentation is now
+an **in-world 3D card** floating lower-center at the mouth of the well, and a
+**two-stage Enter** drives it: from the overview, **Enter focuses** (the camera
+dollies head-on into the focus card so it fills the view), **Esc backs out**, and
+a **second Enter commits** (switch to the context + leave). The camera also
+**leans toward the selection** in the overview (eased). See step 7.5/7.6 in the
+build order; the JOIN dive is the committing Enter continuing *through* the card.
+
+---
+
+## Card foundation & shader bling (step 7.6 — decided 2026-06-17)
+
+Cards now have a **per-band recline** (`scene::card_tilt`: hot ~upright, colder
+bands tilt back) layered on the billboard so they lie along the funnel slope like
+mockup 27. The next foundation work makes the well *look cool* (Amy's bar: not
+"another JavaScript thing") — decided direction:
+
+**Drop vello for cards; use MSDF text + SDF shapes in a 3D card material.** Vello
+RTT was the step-4 expedient for free 3D quads, but (a) it rasterizes at a fixed
+texture resolution → blurry when the camera dollies in on focus, and (b) it adds
+nothing a card needs that MSDF+SDF don't. The app already has the pieces:
+- **MSDF** (`text/msdf/`) is a generic "positioned glyphs + target texture →
+  render" pipeline (`renderer.rs`); the block coupling is only in its *driver*.
+  It stays **crisp at any zoom** and shares the atlas/parley path with the rest
+  of the app. Cards get an MSDF glyph set (parley layout of their fields, via
+  `layout_bridge`) rendered into the card texture.
+- **SDF shapes + glow** — the card's accent background, rounded-rect, selection /
+  lineage rings, and status pulse move *out of the baked texture* and *into the
+  card material* as SDF (the exact split `block_fx.wgsl` already uses for 2D
+  blocks: texture = text content, shader = border/glow/animation). Baked pixels
+  can't animate cheaply; shader uniforms can.
+- **3D card `Material`** — port `assets/shaders/stack_card.wgsl` (holographic edge
+  glow, chromatic aberration, time shimmer, LOD, back-face — left from the
+  conversation stack; shader intact, Rust `Material` dropped in the app reset)
+  into a `WellCardMaterial` (`AsBindGroup`: glow color/intensity, time,
+  selection/lineage/status flags, band LOD) + register `MaterialPlugin`; the card
+  spawn in `sync.rs` swaps off `StandardMaterial`. Vello stays for SVG/ABC blocks
+  (arbitrary vector), just not for cards.
+
+**Prerequisite, independent + shipped first:** **HDR + Bloom on the well camera**
+(`TimeWellCamera.hdr = true` + `Bloom`) — without it emissive reads bright, not
+glowy. Then the material; then the bling vocabulary (status = pulse, selection =
+rim, drift = shimmer, band = LOD/desaturation), documented as a uniform contract
+like `block_fx`'s. `MeshTag(u32)` per-instance params only if batching matters at
+scale (the well's card count doesn't yet require it).
+
 ---
 
 ## Open questions that remain
