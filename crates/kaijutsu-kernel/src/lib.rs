@@ -14,7 +14,6 @@
 pub mod block_store;
 pub mod block_tools;
 pub mod image;
-pub mod config_backend;
 pub mod config_doc;
 pub mod config_seed;
 pub mod control;
@@ -50,7 +49,6 @@ pub use block_tools::{
     BlockReadEngine, BlockSearchEngine, BlockSpliceEngine, BlockStatusEngine, EditOp,
     ImgBlockEngine, ImgBlockFromPathEngine, KernelSearchEngine, SvgBlockEngine,
 };
-pub use config_backend::{ConfigCrdtBackend, ConfigWatcherHandle, ValidationResult};
 pub use config_seed::DEFAULT_SYSTEM_PROMPT;
 pub use control::ConsentMode;
 pub use kaijutsu_types::DocKind;
@@ -121,7 +119,6 @@ pub use file_tools::{
 // broadcast on each ExternalMcpServer.
 pub use flows::{
     BlockFlow,
-    ConfigSource,
     FlowBus,
     FlowMessage,
     HasSubject,

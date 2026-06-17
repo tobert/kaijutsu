@@ -869,31 +869,6 @@ impl<T: Clone + Send + 'static> std::fmt::Debug for Subscription<T> {
     }
 }
 
-// ============================================================================
-// Config Flow Events
-// ============================================================================
-
-/// Source of a config file load.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum ConfigSource {
-    /// Loaded from disk file.
-    #[default]
-    Disk,
-    /// Loaded from CRDT (possibly edited by agent/user).
-    Crdt,
-    /// Using embedded default (fallback).
-    Default,
-}
-
-impl std::fmt::Display for ConfigSource {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Disk => write!(f, "disk"),
-            Self::Crdt => write!(f, "crdt"),
-            Self::Default => write!(f, "default"),
-        }
-    }
-}
 
 // ============================================================================
 // Input Doc Flow Events

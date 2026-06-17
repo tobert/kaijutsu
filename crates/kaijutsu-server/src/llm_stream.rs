@@ -199,7 +199,6 @@ pub(crate) async fn spawn_llm_for_prompt(
     let documents = kernel.documents.clone();
     let kernel_arc = kernel.kernel.clone();
     let kernel_db = kernel.kernel_db.clone();
-    let config_backend = kernel.config_backend.clone();
     let conversation_cache = kernel.conversation_cache.clone();
     let kj_dispatcher = kernel.kj_dispatcher.clone();
     // Create a fresh interrupt state for this prompt (replaces any previous entry).
@@ -208,14 +207,25 @@ pub(crate) async fn spawn_llm_for_prompt(
     let (interrupt, interrupt_generation) = kernel.create_interrupt(context_id).await;
     let context_interrupts = kernel.context_interrupts.clone();
 
-    // Load system prompt from config
+    // Load system prompt from the CRDT-owned config (sole owner; seeded from the
+    // embedded default on a fresh kernel). A read/UTF-8 failure falls back to the
+    // embedded default — loudly, never a silent empty prompt.
     let system_prompt = {
-        if let Err(e) = config_backend.ensure_config("system.md").await {
-            log::warn!("Failed to ensure system.md config: {}", e);
+        use kaijutsu_kernel::vfs::VfsOps;
+        match kernel_arc
+            .vfs()
+            .read_all(std::path::Path::new("/etc/config/system.md"))
+            .await
+        {
+            Ok(bytes) => String::from_utf8(bytes).unwrap_or_else(|e| {
+                log::warn!("system.md in the CRDT is not UTF-8: {e}; using embedded default");
+                kaijutsu_kernel::DEFAULT_SYSTEM_PROMPT.to_string()
+            }),
+            Err(e) => {
+                log::warn!("read /etc/config/system.md failed: {e}; using embedded default");
+                kaijutsu_kernel::DEFAULT_SYSTEM_PROMPT.to_string()
+            }
         }
-        config_backend
-            .get_content("system.md")
-            .unwrap_or_else(|_| kaijutsu_kernel::DEFAULT_SYSTEM_PROMPT.to_string())
     };
 
     // Read per-context model from DriftRouter (quick read, release lock).

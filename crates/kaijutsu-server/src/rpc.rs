@@ -82,9 +82,6 @@ use kaijutsu_kernel::kernel_db::{ContextRow, ContextShellRow, KernelDb};
 use kaijutsu_kernel::{
     // FlowBus
     BlockFlow,
-    // Config
-    ConfigCrdtBackend,
-    ConfigWatcherHandle,
     // Conversation session
     ConversationMailbox,
     InputDocFlow,
@@ -238,8 +235,6 @@ pub struct SharedKernelState {
     pub name: String,
     pub kernel: Arc<Kernel>,
     pub documents: SharedBlockStore,
-    pub config_backend: Arc<ConfigCrdtBackend>,
-    pub config_watcher: Option<ConfigWatcherHandle>,
     pub conversation_cache: Arc<ConversationCache>,
     /// SQLite persistence for context metadata, edges, presets, workspaces.
     /// Arc<parking_lot::Mutex> (not tokio) — shared with KjDispatcher, all ops sync and sub-ms.
@@ -688,115 +683,96 @@ fn create_block_store_with_kernel_db(
 
 /// Get the config directory path.
 /// Returns: ~/.config/kaijutsu/
-fn config_dir() -> std::path::PathBuf {
-    kaish_kernel::xdg_config_home().join("kaijutsu")
-}
-
-/// Create and initialize the config CRDT backend.
-///
-/// This loads config files into CRDT documents and starts the file watcher.
-/// Returns the backend and optional watcher handle.
-async fn create_config_backend(
-    documents: SharedBlockStore,
-    config_path_override: Option<&Path>,
-) -> (Arc<ConfigCrdtBackend>, Option<ConfigWatcherHandle>) {
-    let config_path = config_path_override
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(config_dir);
-
-    let backend = Arc::new(ConfigCrdtBackend::new(documents, config_path));
-
-    // Load base theme config
-    if let Err(e) = backend.ensure_config("theme.toml").await {
-        log::warn!("Failed to load theme.toml: {}", e);
+/// Map a config RPC `path` (a bare name like `theme.toml`, or an already-full
+/// `/etc/config/…` path) to its canonical path under the config mount. Config is
+/// a flat namespace, so this is just a root prepend when the caller passed a
+/// bare name.
+fn config_canonical(path: &str) -> String {
+    const ROOT: &str = "/etc/config";
+    let trimmed = path.trim();
+    if trimmed == ROOT || trimmed.starts_with(&format!("{ROOT}/")) {
+        trimmed.to_string()
+    } else {
+        format!("{ROOT}/{}", trimmed.trim_start_matches('/'))
     }
-
-    // Start the file watcher
-    let watcher = match backend.start_watcher() {
-        Ok(handle) => {
-            log::info!("Config file watcher started");
-            Some(handle)
-        }
-        Err(e) => {
-            log::warn!("Failed to start config watcher: {}", e);
-            None
-        }
-    };
-
-    (backend, watcher)
 }
 
-/// Initialize a kernel's LLM registry from its config backend.
+/// Restore a config file to its embedded default by writing the seed body into
+/// the CRDT through the VFS. Returns `(success, error_message)`. Errors loudly
+/// (no silent no-op) when the path ships no embedded default.
+async fn reset_config_to_embedded(kernel: &Arc<Kernel>, path: &str) -> (bool, String) {
+    use kaijutsu_kernel::vfs::VfsOps;
+    let canonical = config_canonical(path);
+    let Some(body) = kaijutsu_kernel::config_seed::config_seed_body(&canonical) else {
+        return (
+            false,
+            format!("no embedded default for config '{canonical}' (nothing to reset to)"),
+        );
+    };
+    match kernel
+        .vfs()
+        .write_all(std::path::Path::new(&canonical), body.as_bytes())
+        .await
+    {
+        Ok(()) => (true, String::new()),
+        Err(e) => (false, format!("{e}")),
+    }
+}
+
+/// Initialize a kernel's LLM registry from the CRDT-owned `models.toml`.
 ///
-/// Loads `models.toml` from the config CRDT, parses it, and populates
-/// the kernel's `LlmRegistry` with providers and aliases. Returns the
-/// embedding config if present (for semantic index initialization).
+/// Reads `/etc/config/models.toml` through the VFS (the CRDT is the sole owner,
+/// seeded from the embedded default on a fresh kernel), parses it, and populates
+/// the kernel's `LlmRegistry`. Returns the embedding config if present.
+///
+/// There is no host disk to fall back to. A read/parse failure falls back to the
+/// **embedded default** — loudly, and without overwriting the user's content
+/// (they repair it with `kj config reset /etc/config/models.toml`) — because a
+/// kernel with no LLM registry is useless.
 async fn initialize_kernel_models(
     kernel: &Arc<Kernel>,
-    config_backend: &Arc<ConfigCrdtBackend>,
 ) -> Option<kaijutsu_kernel::EmbeddingModelConfig> {
-    if let Err(e) = config_backend.ensure_config("models.toml").await {
-        log::warn!("Failed to load models.toml: {}", e);
-        return None;
-    }
+    use kaijutsu_kernel::vfs::VfsOps;
 
-    let content = match config_backend.get_content("models.toml") {
-        Ok(c) => c,
+    const MODELS_PATH: &str = "/etc/config/models.toml";
+    let raw = match kernel.vfs().read_all(std::path::Path::new(MODELS_PATH)).await {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
         Err(e) => {
-            // ensure_config above re-seeds a blockless/corrupt config doc from
-            // disk, so a read failure here means the recovery itself failed —
-            // a genuinely degraded kernel (no models) rather than routine churn.
-            log::error!("Failed to read models.toml after ensure_config: {}", e);
-            return None;
+            log::error!(
+                "read {MODELS_PATH} from CRDT failed: {e}; booting on embedded default models"
+            );
+            kaijutsu_kernel::config_seed::DEFAULT_MODELS_CONFIG.to_string()
         }
     };
 
-    match kaijutsu_kernel::load_models_config_toml(&content) {
-        Ok(models_config) => match kaijutsu_kernel::initialize_llm_registry(&models_config.llm) {
-            Ok(registry) => {
-                *kernel.llm().write().await = registry;
-                log::info!("Initialized kernel LLM registry from models.toml");
-                models_config.embedding
-            }
-            Err(e) => {
-                log::error!("Failed to initialize LLM registry: {}", e);
-                None
-            }
-        },
-        Err(e) => {
-            log::warn!("Failed to parse models.toml: {}, reloading from disk", e);
-            if let Err(reload_err) = config_backend.reload_from_disk("models.toml").await {
-                log::error!("Failed to reload models.toml from disk: {}", reload_err);
-                return None;
-            }
-            let content = match config_backend.get_content("models.toml") {
+    let models_config = match kaijutsu_kernel::load_models_config_toml(&raw) {
+        Ok(c) => c,
+        Err(parse_err) => {
+            log::error!(
+                "{MODELS_PATH} in the CRDT is unparseable ({parse_err}); booting on embedded \
+                 default models — repair with `kj config reset {MODELS_PATH}`"
+            );
+            match kaijutsu_kernel::load_models_config_toml(
+                kaijutsu_kernel::config_seed::DEFAULT_MODELS_CONFIG,
+            ) {
                 Ok(c) => c,
                 Err(e) => {
-                    log::error!("Failed to read reloaded models.toml: {}", e);
+                    log::error!("embedded default models.toml failed to parse: {e}");
                     return None;
                 }
-            };
-            match kaijutsu_kernel::load_models_config_toml(&content) {
-                Ok(models_config) => {
-                    match kaijutsu_kernel::initialize_llm_registry(&models_config.llm) {
-                        Ok(registry) => {
-                            *kernel.llm().write().await = registry;
-                            log::info!(
-                                "Initialized kernel LLM registry from models.toml (reloaded)"
-                            );
-                            models_config.embedding
-                        }
-                        Err(e) => {
-                            log::error!("Failed to initialize LLM registry after reload: {}", e);
-                            None
-                        }
-                    }
-                }
-                Err(e) => {
-                    log::error!("Failed to parse models.toml even after reload: {}", e);
-                    None
-                }
             }
+        }
+    };
+
+    match kaijutsu_kernel::initialize_llm_registry(&models_config.llm) {
+        Ok(registry) => {
+            *kernel.llm().write().await = registry;
+            log::info!("Initialized kernel LLM registry from {MODELS_PATH}");
+            models_config.embedding
+        }
+        Err(e) => {
+            log::error!("Failed to initialize LLM registry: {e}");
+            None
         }
     }
 }
@@ -972,7 +948,10 @@ impl kaijutsu_index::StatusReceiver for FlowBusStatusReceiver {
 /// persistence, default context, config backend, block tools, LLM, and MCP.
 /// The returned `SharedKernel` is shared across all connections via `Arc`.
 pub async fn create_shared_kernel(
-    config_dir: Option<&Path>,
+    // Config is now CRDT-owned (slice 2): the kernel no longer reads a host
+    // config directory. This param is vestigial — `ServerConfig.config_dir` and
+    // its CLI flag should be retired (tracked in docs/issues.md).
+    _config_dir: Option<&Path>,
     data_dir: Option<&Path>,
 ) -> Result<SharedKernel, capnp::Error> {
     // Create shared FlowBus instances - shared between Kernel and BlockStore
@@ -1083,13 +1062,27 @@ pub async fn create_shared_kernel(
     }
     kernel.mount("/etc/rc", rc_fs).await;
 
+    // Config files (theme/models/mcp.toml + system.md) at /etc/config are
+    // CRDT-owned too (slice 2, docs/config-crdt-ownership.md): the SAME backend
+    // type as rc, one rule, no host file. Seed the embedded defaults only when
+    // the config namespace is still empty (a genuinely fresh kernel); after that
+    // the CRDT owns the content. Per-file recovery is `kj config reset`. Seeding
+    // failure is fatal — a kernel without a parseable models.toml is useless.
+    let config_fs = kaijutsu_kernel::runtime::config_crdt_fs::ConfigCrdtFs::new(
+        documents.clone(),
+        "/etc/config",
+    );
+    if config_fs.is_empty() {
+        let n = config_fs
+            .seed_entries(kaijutsu_kernel::config_seed::config_seed_files())
+            .map_err(|e| capnp::Error::failed(format!("config seed into CRDT failed: {e}")))?;
+        log::info!("seeded {n} config file(s) into the CRDT (fresh kernel)");
+    }
+    kernel.mount("/etc/config", config_fs).await;
+
     // Freeze the mount table — security perimeter is now fixed.
     // No more mount/unmount via RPC after this point.
     kernel.freeze_mounts();
-
-    // Create config backend
-    let (config_backend, config_watcher) =
-        create_config_backend(documents.clone(), config_dir).await;
 
     let kernel_arc = Arc::new(kernel);
     let workspace_guard = Some(kaijutsu_kernel::file_tools::WorkspaceGuard::new(
@@ -1231,7 +1224,7 @@ pub async fn create_shared_kernel(
     }
 
     // Initialize LLM registry + embedding config from models.toml
-    let embedding_config = initialize_kernel_models(&kernel_arc, &config_backend).await;
+    let embedding_config = initialize_kernel_models(&kernel_arc).await;
 
     // External MCP admin (register_mcp / list_mcp / etc.) is offline
     // until Phase 2 wires it onto the broker.
@@ -1333,8 +1326,6 @@ pub async fn create_shared_kernel(
         name: id_str,
         kernel: kernel_arc,
         documents,
-        config_backend,
-        config_watcher,
         conversation_cache: Arc::new(ConversationCache::new(64)),
         kernel_db: kernel_db_arc,
         semantic_index,
@@ -3538,39 +3529,55 @@ impl kernel::Server for KernelImpl {
         _params: kernel::ListConfigsParams,
         mut results: kernel::ListConfigsResults,
     ) -> Promise<(), capnp::Error> {
-        let _span = tracing::info_span!("rpc", method = "list_configs").entered();
-
-        let configs = self.kernel.config_backend.list_configs();
-        let mut builder = results.get().init_configs(configs.len() as u32);
-        for (i, config) in configs.iter().enumerate() {
-            builder.set(i as u32, config);
-        }
-
-        Promise::ok(())
+        let kernel = self.kernel.kernel.clone();
+        let span = tracing::info_span!("rpc", method = "list_configs");
+        Promise::from_future(
+            async move {
+                use kaijutsu_kernel::vfs::VfsOps;
+                // Config is CRDT-owned; the live set is whatever the /etc/config
+                // mount holds. Bare file names, matching the old surface.
+                let names: Vec<String> = match kernel
+                    .vfs()
+                    .readdir(std::path::Path::new("/etc/config"))
+                    .await
+                {
+                    Ok(entries) => entries
+                        .into_iter()
+                        .filter(|e| e.kind.is_file())
+                        .map(|e| e.name)
+                        .collect(),
+                    Err(e) => {
+                        log::warn!("list_configs: readdir /etc/config failed: {e}");
+                        Vec::new()
+                    }
+                };
+                let mut builder = results.get().init_configs(names.len() as u32);
+                for (i, name) in names.iter().enumerate() {
+                    builder.set(i as u32, name);
+                }
+                Ok(())
+            }
+            .instrument(span),
+        )
     }
 
+    /// Disk reload is meaningless now that the CRDT is the sole owner — there is
+    /// no host file to reload from. `reloadConfig` is repurposed as "restore this
+    /// config to its embedded default" (same as `resetConfig`); kept on the wire
+    /// for client compatibility.
     fn reload_config(
         self: Rc<Self>,
         params: kernel::ReloadConfigParams,
         mut results: kernel::ReloadConfigResults,
     ) -> Promise<(), capnp::Error> {
         let path = pry!(pry!(pry!(params.get()).get_path()).to_str()).to_owned();
-        let config_backend = self.kernel.config_backend.clone();
-
+        let kernel = self.kernel.kernel.clone();
         let span = tracing::info_span!("rpc", method = "reload_config");
         Promise::from_future(
             async move {
-                match config_backend.reload_from_disk(&path).await {
-                    Ok(()) => {
-                        results.get().set_success(true);
-                        results.get().set_error("");
-                    }
-                    Err(e) => {
-                        results.get().set_success(false);
-                        results.get().set_error(format!("{}", e));
-                    }
-                }
-
+                let (ok, err) = reset_config_to_embedded(&kernel, &path).await;
+                results.get().set_success(ok);
+                results.get().set_error(&err);
                 Ok(())
             }
             .instrument(span),
@@ -3583,22 +3590,13 @@ impl kernel::Server for KernelImpl {
         mut results: kernel::ResetConfigResults,
     ) -> Promise<(), capnp::Error> {
         let path = pry!(pry!(pry!(params.get()).get_path()).to_str()).to_owned();
-        let config_backend = self.kernel.config_backend.clone();
-
+        let kernel = self.kernel.kernel.clone();
         let span = tracing::info_span!("rpc", method = "reset_config");
         Promise::from_future(
             async move {
-                match config_backend.reset_to_default(&path).await {
-                    Ok(()) => {
-                        results.get().set_success(true);
-                        results.get().set_error("");
-                    }
-                    Err(e) => {
-                        results.get().set_success(false);
-                        results.get().set_error(format!("{}", e));
-                    }
-                }
-
+                let (ok, err) = reset_config_to_embedded(&kernel, &path).await;
+                results.get().set_success(ok);
+                results.get().set_error(&err);
                 Ok(())
             }
             .instrument(span),
@@ -3610,21 +3608,39 @@ impl kernel::Server for KernelImpl {
         params: kernel::GetConfigParams,
         mut results: kernel::GetConfigResults,
     ) -> Promise<(), capnp::Error> {
-        let _span = tracing::info_span!("rpc", method = "get_config").entered();
         let path = pry!(pry!(pry!(params.get()).get_path()).to_str()).to_owned();
-
-        match self.kernel.config_backend.get_content(&path) {
-            Ok(content) => {
-                results.get().set_content(&content);
-                results.get().set_error("");
+        let kernel = self.kernel.kernel.clone();
+        let span = tracing::info_span!("rpc", method = "get_config");
+        Promise::from_future(
+            async move {
+                use kaijutsu_kernel::vfs::VfsOps;
+                let canonical = config_canonical(&path);
+                match kernel
+                    .vfs()
+                    .read_all(std::path::Path::new(&canonical))
+                    .await
+                {
+                    Ok(bytes) => match String::from_utf8(bytes) {
+                        Ok(content) => {
+                            results.get().set_content(&content);
+                            results.get().set_error("");
+                        }
+                        Err(e) => {
+                            results.get().set_content("");
+                            results
+                                .get()
+                                .set_error(&format!("config {canonical} is not UTF-8: {e}"));
+                        }
+                    },
+                    Err(e) => {
+                        results.get().set_content("");
+                        results.get().set_error(&format!("{e}"));
+                    }
+                }
+                Ok(())
             }
-            Err(e) => {
-                results.get().set_content("");
-                results.get().set_error(format!("{}", e));
-            }
-        }
-
-        Promise::ok(())
+            .instrument(span),
+        )
     }
 
     // ========================================================================
