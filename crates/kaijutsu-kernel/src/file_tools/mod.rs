@@ -35,6 +35,7 @@ pub mod edit;
 pub mod glob;
 pub mod grep;
 pub mod guard;
+pub mod hashline;
 pub mod path;
 pub mod read;
 pub mod vfs_walker;

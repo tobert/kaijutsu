@@ -44,19 +44,30 @@ pub struct ReadParams {
     pub limit: Option<u32>,
 }
 
-/// Parameters for the `edit` tool.
+/// Parameters for the `edit` tool. Two addressing modes — pass exactly one of
+/// `old_string` (string mode) or `anchor` (hashline mode).
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EditParams {
     /// File path to edit.
     pub path: String,
-    /// Exact string to find and replace.
-    pub old_string: String,
-    /// Replacement text.
+    /// String mode: exact substring to find and replace (whitespace-exact).
+    /// Mutually exclusive with `anchor`.
+    #[serde(default)]
+    pub old_string: Option<String>,
+    /// Replacement text. In hashline mode this is the full new content for the
+    /// anchored line(s); an empty string deletes them.
     pub new_string: String,
-    /// Replace all occurrences (default: false).
+    /// String mode only: replace every occurrence instead of requiring a unique
+    /// match (default: false).
     #[serde(default)]
     pub replace_all: bool,
+    /// Hashline mode: address a line or range by the `N:hash` anchors that
+    /// `read` prints — `42:a3f1` for one line, `42:a3f1..45:0e9c` for an
+    /// inclusive range. The hash is reverified before writing, so a stale edit
+    /// fails loud instead of corrupting. Mutually exclusive with `old_string`.
+    #[serde(default)]
+    pub anchor: Option<String>,
 }
 
 /// Parameters for the `write` tool.
@@ -247,12 +258,138 @@ impl McpServerLike for FileToolsServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block_store::{shared_block_store_with_db, DocumentKind};
+    use crate::block_store::{shared_block_store, shared_block_store_with_db, DocumentKind};
     use crate::file_tools::FileDocumentCache;
     use crate::kernel_db::KernelDb;
     use crate::mcp::{Broker, InstancePolicy, ToolContent};
+    use crate::vfs::backends::MemoryBackend;
     use crate::vfs::MountTable;
     use kaijutsu_types::PrincipalId;
+
+    /// Build a broker fronting a `builtin.file` server over a MemoryBackend at
+    /// /tmp, pre-seeded with `content` at `path`. Returns the broker and a handle
+    /// to the same cache so tests can assert the post-edit content directly.
+    async fn broker_with_file(path: &str, content: &str) -> (Arc<Broker>, Arc<FileDocumentCache>) {
+        let blocks = shared_block_store(PrincipalId::system());
+        let vfs = Arc::new(MountTable::new());
+        vfs.mount("/tmp", MemoryBackend::new()).await;
+        let cache = Arc::new(FileDocumentCache::new(blocks, vfs.clone()));
+        cache.create_or_replace(path, content).await.unwrap();
+
+        let server = Arc::new(FileToolsServer::new(cache.clone(), vfs, None));
+        let broker = Arc::new(Broker::new());
+        broker
+            .register(server, InstancePolicy::default())
+            .await
+            .unwrap();
+        (broker, cache)
+    }
+
+    async fn call(broker: &Broker, tool: &str, args: serde_json::Value) -> KernelToolResult {
+        broker
+            .call_tool(
+                KernelCallParams {
+                    instance: InstanceId::new(FileToolsServer::INSTANCE),
+                    tool: tool.to_string(),
+                    arguments: args,
+                },
+                &CallContext::test(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap()
+    }
+
+    fn text_of(r: &KernelToolResult) -> String {
+        match r.content.first() {
+            Some(ToolContent::Text(s)) => s.clone(),
+            other => panic!("expected text content, got {other:?}"),
+        }
+    }
+
+    /// End-to-end through the broker: the docs/issues.md corruption class — a
+    /// substring edit on a file with multibyte content *before* the match. The
+    /// byte/char bug would splice at the wrong place; here the file must come out
+    /// exactly right.
+    #[tokio::test]
+    async fn edit_multibyte_string_mode_round_trips_via_broker() {
+        let path = "/tmp/issues.md";
+        let content = "# 改善\n\n- α bullet\n- target line →\n";
+        let (broker, cache) = broker_with_file(path, content).await;
+
+        let res = call(
+            &broker,
+            "edit",
+            serde_json::json!({
+                "path": path,
+                "old_string": "target line →",
+                "new_string": "REPLACED",
+            }),
+        )
+        .await;
+        assert!(!res.is_error, "edit failed: {}", text_of(&res));
+        assert_eq!(
+            cache.read_content(path).await.unwrap(),
+            "# 改善\n\n- α bullet\n- REPLACED\n"
+        );
+    }
+
+    /// End-to-end hashline round trip: read to learn a line's `N:hash`, then edit
+    /// by anchor. Exercises read's annotation and edit's anchor path together.
+    #[tokio::test]
+    async fn edit_anchor_mode_round_trips_via_broker() {
+        let path = "/tmp/doc.md";
+        let content = "# 改善\n\n- α bullet\n- target line →\n";
+        let (broker, cache) = broker_with_file(path, content).await;
+
+        let read = call(&broker, "read", serde_json::json!({ "path": path })).await;
+        let rendered = text_of(&read);
+        // The line we want shows as `   4:hash→ - target line →`. Take the text
+        // before the FIRST `→` (the separator) as the `N:hash` anchor.
+        let line = rendered
+            .lines()
+            .find(|l| l.contains("target"))
+            .expect("read output should contain the target line");
+        let anchor = line.split_once('→').unwrap().0.trim().to_string();
+
+        let res = call(
+            &broker,
+            "edit",
+            serde_json::json!({
+                "path": path,
+                "anchor": anchor,
+                "new_string": "- done",
+            }),
+        )
+        .await;
+        assert!(!res.is_error, "anchor edit failed: {}", text_of(&res));
+        assert_eq!(
+            cache.read_content(path).await.unwrap(),
+            "# 改善\n\n- α bullet\n- done\n"
+        );
+    }
+
+    /// A stale anchor (wrong hash) must fail loud, not splice the wrong line.
+    #[tokio::test]
+    async fn edit_stale_anchor_fails_loud_via_broker() {
+        let path = "/tmp/stale.md";
+        let (broker, cache) = broker_with_file(path, "one\ntwo\nthree\n").await;
+
+        let res = call(
+            &broker,
+            "edit",
+            serde_json::json!({
+                "path": path,
+                "anchor": "2:0000",
+                "new_string": "X",
+            }),
+        )
+        .await;
+        assert!(res.is_error, "stale anchor should fail");
+        assert!(text_of(&res).contains("stale"), "got: {}", text_of(&res));
+        // File untouched.
+        assert_eq!(cache.read_content(path).await.unwrap(), "one\ntwo\nthree\n");
+    }
 
     #[tokio::test]
     async fn glob_via_broker() {

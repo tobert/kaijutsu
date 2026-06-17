@@ -8,6 +8,7 @@ use crate::execution::{ExecContext, ExecResult};
 
 use super::cache::{CacheReadError, FileDocumentCache};
 use super::guard::WorkspaceGuard;
+use super::hashline::line_hash;
 use super::path::resolve_str;
 
 /// Default cap on lines returned when `limit` is omitted — bounds output so a
@@ -43,7 +44,10 @@ struct ReadParams {
 
 impl ReadEngine {
     pub fn description(&self) -> &str {
-        "Read file content with optional line numbers and windowed ranges"
+        "Read file content. Each line is shown as `LINE:hash→ content`; the \
+         `LINE:hash` prefix is metadata (not file bytes) — pass it to `edit` as \
+         an `anchor` to replace that line without retyping it. Supports \
+         windowing via offset/limit."
     }
 
     #[tracing::instrument(skip(self, params, ctx), name = "engine.read")]
@@ -82,9 +86,11 @@ impl ReadEngine {
     }
 }
 
-/// Render file content as 1-indexed `cat -n`-style lines, windowed by `offset`
-/// (1-indexed start line) and `limit` (defaulting to [`DEFAULT_LINE_LIMIT`]),
-/// with over-long lines truncated and a footer when the window is partial.
+/// Render file content as 1-indexed `LINE:hash→ content` lines, windowed by
+/// `offset` (1-indexed start line) and `limit` (defaulting to
+/// [`DEFAULT_LINE_LIMIT`]), with over-long lines truncated and a footer when the
+/// window is partial. The `hash` is the [`line_hash`] of the full (untruncated)
+/// line — `edit`'s `anchor` mode addresses lines by it.
 fn render(content: &str, path: &str, offset: Option<u32>, limit: Option<u32>) -> String {
     if content.is_empty() {
         return format!("(empty file: {})", path);
@@ -113,7 +119,17 @@ fn render(content: &str, path: &str, offset: Option<u32>, limit: Option<u32>) ->
         .enumerate()
         .skip(start)
         .take(end - start)
-        .map(|(i, line)| format!("{:>width$}→ {}", i + 1, truncate_line(line), width = width))
+        .map(|(i, line)| {
+            // Hash the full line (not the truncated display) so `edit --anchor`
+            // re-hashes the same bytes and the anchor stays valid.
+            format!(
+                "{:>width$}:{}→ {}",
+                i + 1,
+                line_hash(line),
+                truncate_line(line),
+                width = width
+            )
+        })
         .collect();
 
     // Footer only when the window doesn't cover the whole file, so the model
@@ -155,8 +171,15 @@ mod tests {
         let content = "a\nb\nc\nd\n";
         // offset=2 should start at line 2 ("b"), not line 3.
         let out = render(content, "/x", Some(2), Some(1));
-        assert!(out.contains("2→ b"), "got: {out}");
-        assert!(!out.contains("3→ c"));
+        assert!(out.contains(&format!("2:{}→ b", line_hash("b"))), "got: {out}");
+        assert!(!out.contains("→ c"));
+    }
+
+    #[test]
+    fn lines_carry_a_content_hash() {
+        let out = render("alpha\n", "/x", None, None);
+        // `LINE:hash→ content` — the anchor `edit` addresses lines by.
+        assert!(out.contains(&format!("1:{}→ alpha", line_hash("alpha"))), "got: {out}");
     }
 
     #[test]
@@ -172,8 +195,8 @@ mod tests {
     fn full_short_file_has_no_footer() {
         let out = render("one\ntwo\n", "/x", None, None);
         assert!(!out.contains("lines total"));
-        assert!(out.contains("1→ one"));
-        assert!(out.contains("2→ two"));
+        assert!(out.contains(&format!("1:{}→ one", line_hash("one"))));
+        assert!(out.contains(&format!("2:{}→ two", line_hash("two"))));
     }
 
     #[test]
@@ -182,7 +205,9 @@ mod tests {
         let content = format!("{long}\nshort\n");
         let out = render(&content, "/x", None, None);
         assert!(out.contains("(+50 chars truncated)"), "got: {out}");
-        assert!(out.contains("2→ short"));
+        assert!(out.contains(&format!("2:{}→ short", line_hash("short"))));
+        // The hash is over the full line, not the truncated display.
+        assert!(out.contains(&format!("1:{}", line_hash(&long))), "got: {out}");
     }
 
     #[test]
