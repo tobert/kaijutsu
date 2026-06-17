@@ -132,8 +132,15 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
     *is* the readdir manifest), seeded from embedded; `/etc/rc` remounted on it; `kj
     rc` + `load_rc_scripts` route VFS-direct. ⚠ **Live runner verification pending**
     (needs a server restart).
-  - **Slice 2 (config TOMLs) — TODO:** drop the `ConfigCrdtBackend` debounced host
-    flush; TOMLs converge onto the same CRDT-sole-owner rule + `config_doc` model.
+  - **Slice 2 (config TOMLs) — ✅ SHIPPED 2026-06-17** (`93c72a7`/`fdd1c18`/`9e581aa`/
+    `a30b266`/`6f2ce9f`): `ConfigCrdtBackend` (debounced host flush + watcher + dirty
+    tracker + disk read-back) **deleted**; a second `ConfigCrdtFs` mounts at
+    `/etc/config`, seeded from embedded (or, on a fresh kernel, from a host
+    `config_dir` if provided — a one-time seed source for tests, never set in
+    production). Readers (models.toml, system.md) route VFS-direct; `kj config
+    show/list/set/reset` is the editing surface, gated on a new `config-write`
+    authority; the app fetches `theme.toml` over RPC (`get_config`) on connect.
+    ⚠ **Live runner verification pending** (needs a server restart), same as slice 1.
   - Deferred: CRDT scratch mount.
 - **rc cutover follow-ups (from slice 1):**
   - **DB-backed test block-store deadlocks `kj::fork` tests.** `test_dispatcher_crdt_rc`
@@ -168,7 +175,16 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   during LLM streams. Note SQLite serializes *writes* regardless of pooling, so
   the win is concurrent reads (WAL only) — verify WAL first; narrowing lock scope
   may matter as much.
-- **Config CRDT ops:** Config backend needs DTE integration so changes replicate across peers.
+- **Config CRDT ops:** config docs (`DocKind::Config` on `ConfigCrdtFs`) need DTE
+  integration so config/rc changes replicate across peers.
+- **Theme hot-reload-on-edit (slice 2 follow-up):** the app fetches `theme.toml`
+  over RPC only on connect (`apply_theme_from_rpc`). A live `kj config set
+  /etc/config/theme.toml` won't re-theme a running app until reconnect. Closing it
+  needs the app to subscribe to the config doc (or a config-changed notification)
+  and re-fetch. Low priority — theme edits are rare and a reconnect already picks
+  them up.
+- **`kj config` help doc:** add `crates/kaijutsu-kernel/docs/help/kj-config.md`
+  (parallel to the rc/cache help docs) once the surface settles.
 - **`blocks_ordered()` allocation churn + sort:** `block_store.rs:185-188` calls `order_key().to_string()` for *every block*, then `sort_by` on the strings — so it's O(N log N) **plus a String allocation per block per call**. It runs on per-frame hot paths (`kaijutsu-app/src/ui/card_stack/sync.rs:48`, `view/components.rs:163`), so the allocation churn is likely the bigger cost than the asymptotics. Fixes: compare `order_key` without stringifying, and/or cache the ordering and invalidate on block change. Add a secondary sorted index when scale demands.
 - **Latch state should persist with the context:** 
   - `set -o latch` mode is per-shell and lost on restart.

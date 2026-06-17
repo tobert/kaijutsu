@@ -192,7 +192,17 @@ real customization lands in `assets/defaults/rc/`).
 
 ---
 
-## Slice 2 — config TOMLs converge onto `ConfigCrdtFs`
+## Slice 2 — config TOMLs converge onto `ConfigCrdtFs` — ✅ SHIPPED 2026-06-17
+
+Landed across `93c72a7` (config_seed module + generalized seeding), `fdd1c18`
+(the /etc/config mount + reader re-point + ConfigCrdtBackend deletion + RPC
+reshape), `9e581aa` (kj config + config-write capability), `a30b266` (app theme
+over RPC), and `6f2ce9f` (config_dir revived as a one-time seed source for the
+test harnesses). The CRDT is now the sole owner of all config (theme/models/
+mcp.toml + system.md). **Live verification on the GPU runner (restart the
+server, confirm the app themes over RPC and models.toml drives a turn) is still
+pending — needs a `systemctl --user restart` an agent shell can't do**, same as
+slice 1. The build order below is the as-built record.
 
 **Decided 2026-06-17 (with Amy):** *converge* — delete `ConfigCrdtBackend`
 entirely and mount a second `ConfigCrdtFs` (the slice-1 VfsOps backend, already
