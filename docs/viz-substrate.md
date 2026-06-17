@@ -335,11 +335,16 @@ fields that aren't on the wire yet. Named here so they're not a surprise:
    events per visible context. Fine for the rim; if overview ever needs
    "streaming" on a context whose blocks aren't subscribed, a context-level
    status field or event would be required. Defer until proven necessary.
-4. **Drift edges (context → context)** — the "drift arcs above the rim" grammar
-   needs which contexts are drifting to which. Today only `driftQueue @48`
-   (staged, pending) and per-block `Drift` snapshots exist; there is no
-   "context-to-context drift edge list" RPC. This is haystack/active-decoration
-   work, not foundational — defer with the drift-particle layer.
+4. **Drift edges (context → context)** — partially closed 2026-06-17. The per-card
+   **drift shimmer** ("drift = shimmer" bling) shipped using the existing
+   `driftQueue @48` (staged) — a card whose context is a staged-drift endpoint
+   (source or target) sweeps an HDR sheen (`card::drift_endpoints` +
+   `scene::highlight_drift`, no wire change). What still needs the wire is the
+   **drift *arcs/particles between* cards** ("drift arcs above the rim"): that
+   wants a context-to-context drift edge *list* (active + historical, not just
+   pending), which neither `driftQueue` nor per-block `Drift` snapshots give as a
+   context-pair list. Still deferred with the drift-particle layer; the per-card
+   shimmer is the foundational step that didn't need it.
 
 Gap 0 is the one a real consumer hits first (the well's whole radial axis is
 lifecycle); gaps 1 and 4 are further real wire additions; 2 and 3 are client-side
@@ -468,8 +473,12 @@ first concrete consumer. The remaining steps are the `conclude` wire work
    - **On-demand lineage overlay** (7c): selecting a card lights up its
      fork-ancestry (`card::ancestors` walks `forked_from`, cycle-safe) with an
      amber ring distinct from the blue selection ring. No wire change.
-   - *Remaining for step 7:* the **drift-particle layer** (needs the
-     context→context drift-edge wire addition — gap 4, deferred); richer
+   - *Drift shimmer (2026-06-17):* a card whose context is a staged-drift endpoint
+     sweeps an animated HDR sheen (`card::drift_endpoints` + `scene::highlight_drift`,
+     params.w; `well_card.wgsl`). No wire change. Completes the bling vocabulary.
+   - *Remaining for step 7:* the **drift arcs/particle layer *between* cards**
+     (still needs the context→context drift-edge *list* wire — gap 4, deferred —
+     the per-card shimmer above is the foundational step that didn't); richer
      per-cluster label placement (currently per-card footer, not a cluster arc);
      wiring `search_similar`/`get_neighbors` into an app affordance (the surface
      exists, no consumer yet).
