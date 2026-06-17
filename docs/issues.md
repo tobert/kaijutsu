@@ -405,9 +405,16 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   scoped after register_session — cutting foreign-context volume to zero (also kills
   the factor-2 `blocks_ordered()` churn for foreign events). Verified: server +
   client unit tests, `kaijutsu-mcp` `e2e_shell` (incl. sequential commands),
-  `rpc_integration`/`context_sync` green. ⚠ **Live runner verification still
-  pending** (needs a server+app restart to reproduce the original conditions).
-  Related: P3 above + `project_mcp_synceddocument_sync`.
+  `rpc_integration`/`context_sync` green. **Live verification 2026-06-17:** after a
+  server+app rebuild/restart, `echo hi` (257ms) and `kj context list --tree` (285ms,
+  was the 300s-timeout command) and sequential calls all returned `status: "done"`
+  against a *busy* 24-context kernel (running composers + THE_DIRECTOR ⇒ live
+  foreign-context event flow) — the original symptom is gone. Note this exercised
+  the **server fix (`SubscriberHealth`) + the OLD MCP client** (this session's MCP
+  binary predates the build), so fix (1) — the load-bearing one — is verified live;
+  the client-side scoping + resubscribe (2,3) ride in the MCP binary and are
+  covered by `e2e_shell` until a session whose MCP binary is rebuilt confirms them
+  in situ. Related: P3 above + `project_mcp_synceddocument_sync`.
 - **mcp-context default model is an invalid id (observed 2026-06-17).** A context
   created via `register_session` (context_type `mcp`/`default`) defaulted to
   `anthropic/claude-haiku-4-5-20250101` (also seen as `…-20250929`) — a wrong date;

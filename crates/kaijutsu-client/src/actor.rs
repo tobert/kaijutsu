@@ -521,6 +521,14 @@ enum RpcCommand {
         reply: oneshot::Sender<Result<ContextId, CallError>>,
     },
 
+    // ── Re-subscribe block events (inline — uses live connection) ───────
+    /// Re-issue the block-events subscription scoped to the actor's current
+    /// context. Recovers a subscription the server may have reaped after a
+    /// sustained callback stall, without a full reconnect.
+    ResubscribeBlocks {
+        reply: oneshot::Sender<Result<(), CallError>>,
+    },
+
     // ── Peers ────────────────────────────────────────────────────────────
     AttachPeer {
         config: PeerConfig,
@@ -609,6 +617,7 @@ impl RpcCommand {
             Self::Whoami { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ListKernels { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::JoinContext { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::ResubscribeBlocks { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::AttachPeer { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::InvokePeer { reply, .. } => { let _ = reply.send(Err(err)); }
         }
@@ -1218,6 +1227,17 @@ impl ActorHandle {
         .await
     }
 
+    /// Re-issue the block-events subscription, scoped to the actor's current
+    /// context. Use to recover delivery the server may have reaped after a
+    /// sustained callback stall (e.g. after an MCP shell call times out)
+    /// without forcing a full reconnect. Best-effort: returns once the actor
+    /// has dispatched the re-subscribe.
+    #[tracing::instrument(skip(self))]
+    pub async fn resubscribe_blocks(&self) -> Result<(), CallError> {
+        self.send(|reply| RpcCommand::ResubscribeBlocks { reply })
+            .await
+    }
+
     // ── World-level ──────────────────────────────────────────────────────
 
     #[tracing::instrument(skip(self))]
@@ -1330,6 +1350,14 @@ struct RpcActor {
     /// Context the actor will re-join on every reconnect. Set by the
     /// `JoinContext` command and persisted across reconnects.
     context_id: Option<ContextId>,
+    /// When true, block-event subscriptions are scoped to `context_id` (the
+    /// single context this client cares about) instead of kernel-wide. Set by
+    /// single-context clients like the MCP server, whose single-threaded RPC
+    /// LocalSet is starved by foreign-context event volume. The multi-context
+    /// app leaves this false — it routes every context's block events by
+    /// `context_id` into a per-context `DocumentCache`, so it genuinely needs
+    /// kernel-wide delivery.
+    scope_blocks_to_context: bool,
     /// Context returned by the most recent `join_context`.
     joined_context_id: Option<ContextId>,
     /// Peer registration the actor re-establishes on every reconnect. Set by
@@ -1368,6 +1396,7 @@ impl RpcActor {
         config: SshConfig,
         context_id: Option<ContextId>,
         instance: String,
+        scope_blocks_to_context: bool,
         rx: mpsc::Receiver<ChannelCmd>,
         event_tx: broadcast::Sender<ServerEvent>,
         status_tx: broadcast::Sender<ConnectionStatus>,
@@ -1380,6 +1409,7 @@ impl RpcActor {
             state: ActorState::Idle,
             bound_kernel_id: None,
             context_id,
+            scope_blocks_to_context,
             joined_context_id: None,
             peer_registration: None,
             connection: None,
@@ -1445,6 +1475,7 @@ impl RpcActor {
             self.config.clone(),
             self.context_id,
             self.instance.clone(),
+            self.scope_blocks_to_context,
             self.event_tx.clone(),
             self.peer_registration.clone(),
         );
@@ -1658,6 +1689,14 @@ impl RpcActor {
                     .instrument(span),
                 );
             }
+            RpcCommand::ResubscribeBlocks { reply } => {
+                // Inline: uses the live connection's kernel via the actor's
+                // own scoped re-subscribe helper. Fire-and-forget on the wire;
+                // we ack the caller immediately (the subscription replaces the
+                // prior one on the server by (principal, instance)).
+                self.resubscribe_blocks();
+                let _ = reply.send(Ok(()));
+            }
             RpcCommand::AttachPeer {
                 config,
                 invocation_tx,
@@ -1701,9 +1740,59 @@ impl RpcActor {
             InternalMsg::JoinedContext(ctx) => {
                 self.context_id = Some(ctx);
                 self.joined_context_id = Some(ctx);
+                // For single-context clients, re-scope block events to this
+                // context now that we know it. The initial subscription (made
+                // at connect, before any context existed) is kernel-wide;
+                // leaving it unscoped floods the client with every other
+                // context's block events. The re-subscribe carries the same
+                // `instance`, so the server replaces the unscoped subscription
+                // rather than stacking. Multi-context clients (the app) skip
+                // this — they need kernel-wide delivery.
+                if self.scope_blocks_to_context {
+                    self.resubscribe_blocks();
+                }
                 self.broadcast_state();
             }
         }
+    }
+
+    /// (Re)issue the block-events subscription on the live connection, scoped
+    /// to the actor's current `context_id`. Best-effort and fire-and-forget: a
+    /// failure logs and leaves the prior subscription in place (the server
+    /// keeps it until replaced or the connection drops). No-op when not
+    /// Connected. Used both to re-scope after a `JoinContext` and to recover a
+    /// subscription the server may have reaped after a sustained callback stall
+    /// (the client-side half of the 2026-06-17 shell-timeout fix).
+    fn resubscribe_blocks(&self) {
+        let Some(conn) = self.connection.as_ref() else {
+            return;
+        };
+        let kernel = conn.kernel.clone();
+        let event_tx = self.event_tx.clone();
+        let instance = self.instance.clone();
+        // Scope to the joined context only for single-context clients; a
+        // kernel-wide client re-subscribes kernel-wide (None), matching its
+        // handshake subscription.
+        let context_id = if self.scope_blocks_to_context {
+            self.context_id
+        } else {
+            None
+        };
+        tokio::task::spawn_local(async move {
+            let (block_client, filter) = block_events_client_and_filter(&event_tx, context_id);
+            match tokio::time::timeout(
+                SUBSCRIBE_TIMEOUT,
+                kernel.subscribe_blocks_filtered(block_client, &filter, &instance),
+            )
+            .await
+            {
+                Ok(Ok(())) => {
+                    log::debug!("Re-subscribed block events scoped to {context_id:?}")
+                }
+                Ok(Err(e)) => log::warn!("Block re-subscribe failed (non-fatal): {e}"),
+                Err(_) => log::warn!("Block re-subscribe timed out (non-fatal)"),
+            }
+        });
     }
 
     /// Cancel any running ping/handshake tasks. Used during shutdown.
@@ -1900,18 +1989,56 @@ fn spawn_handshake(
     config: SshConfig,
     context_id: Option<ContextId>,
     instance: String,
+    scope_blocks_to_context: bool,
     event_tx: broadcast::Sender<ServerEvent>,
     peer_registration: Option<(PeerConfig, std::sync::mpsc::Sender<PeerInvocation>)>,
 ) -> JoinHandle<ConnectOutcome> {
     tokio::task::spawn_local(async move {
-        connect_handshake(config, context_id, instance, event_tx, peer_registration).await
+        connect_handshake(
+            config,
+            context_id,
+            instance,
+            scope_blocks_to_context,
+            event_tx,
+            peer_registration,
+        )
+        .await
     })
+}
+
+/// Build the block-events callback client + its filter, scoped to
+/// `context_id` when known. Empty filter = kernel-wide delivery (every
+/// context's block events), which floods a single-context client and can starve
+/// its single-threaded RPC executor past the server's 5s callback deadline (the
+/// 2026-06-17 MCP shell-timeout stall). Same `instance` on re-subscribe ⇒ the
+/// server replaces the prior subscription for this (principal, instance) rather
+/// than stacking, so re-scoping is safe.
+fn block_events_client_and_filter(
+    event_tx: &broadcast::Sender<ServerEvent>,
+    context_id: Option<ContextId>,
+) -> (
+    crate::kaijutsu_capnp::block_events::Client,
+    kaijutsu_types::BlockEventFilter,
+) {
+    let block_fwd = BlockEventsForwarder {
+        event_tx: event_tx.clone(),
+    };
+    let block_client: crate::kaijutsu_capnp::block_events::Client =
+        capnp_rpc::new_client(block_fwd);
+    let filter = context_id
+        .map(|ctx| kaijutsu_types::BlockEventFilter {
+            context_ids: vec![ctx],
+            ..Default::default()
+        })
+        .unwrap_or_default();
+    (block_client, filter)
 }
 
 async fn connect_handshake(
     config: SshConfig,
     context_id: Option<ContextId>,
     instance: String,
+    scope_blocks_to_context: bool,
     event_tx: broadcast::Sender<ServerEvent>,
     peer_registration: Option<(PeerConfig, std::sync::mpsc::Sender<PeerInvocation>)>,
 ) -> ConnectOutcome {
@@ -2009,12 +2136,22 @@ async fn connect_handshake(
     // 4. Subscribe to block + resource events in parallel under a single
     //    deadline. If either fails, the whole handshake fails — we don't
     //    want to enter Connected without subscriptions.
-    let block_fwd = BlockEventsForwarder {
-        event_tx: event_tx.clone(),
+    //
+    //    Scope block events to the joined context. An empty filter is
+    //    kernel-wide delivery — every context's block events firehosed at a
+    //    single-context client. On a single-threaded RPC LocalSet that
+    //    foreign-context volume can starve the executor past the server's 5s
+    //    callback deadline (the 2026-06-17 MCP "every shell call times out"
+    //    stall). When no context is joined yet (first connect before
+    //    register_session), we fall back to kernel-wide and re-scope on the
+    //    JoinedContext that follows. Multi-context clients (the app) leave
+    //    `scope_blocks_to_context` false and always subscribe kernel-wide.
+    let filter_context = if scope_blocks_to_context {
+        joined_context
+    } else {
+        None
     };
-    let block_client: crate::kaijutsu_capnp::block_events::Client =
-        capnp_rpc::new_client(block_fwd);
-    let filter = kaijutsu_types::BlockEventFilter::default();
+    let (block_client, filter) = block_events_client_and_filter(&event_tx, filter_context);
 
     let resource_fwd = ResourceEventsForwarder {
         event_tx: event_tx.clone(),
@@ -2388,6 +2525,13 @@ async fn dispatch_kernel_command(
             )));
         }
 
+        // ── ResubscribeBlocks handled inline by RpcActor::dispatch ──
+        RpcCommand::ResubscribeBlocks { reply } => {
+            let _ = reply.send(Err(CallError::Rpc(
+                "resubscribe_blocks leaked into kernel dispatch (bug)".into(),
+            )));
+        }
+
         // ── Peers ──
         RpcCommand::AttachPeer {
             config, invocation_tx, reply,
@@ -2456,10 +2600,18 @@ fn system_now_ms() -> u64 {
 /// transition. If `None`, the actor connects but doesn't bind to a context;
 /// later calls to `ActorHandle::join_context` set this and persist for
 /// future reconnects.
+///
+/// `scope_blocks_to_context` makes block-event subscriptions track the joined
+/// context instead of being kernel-wide. Single-context clients (e.g. the MCP
+/// server) should pass `true` — kernel-wide delivery firehoses their
+/// single-threaded RPC executor with foreign-context events. Multi-context
+/// clients (the app, which routes every context's events into a per-context
+/// cache) must pass `false`.
 pub fn spawn_actor(
     config: SshConfig,
     context_id: Option<ContextId>,
     instance: String,
+    scope_blocks_to_context: bool,
 ) -> ActorHandle {
     let (tx, rx) = mpsc::channel::<ChannelCmd>(CHANNEL_CAPACITY);
     let (event_tx, _) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
@@ -2469,6 +2621,7 @@ pub fn spawn_actor(
         config,
         context_id,
         instance,
+        scope_blocks_to_context,
         rx,
         event_tx.clone(),
         status_tx.clone(),

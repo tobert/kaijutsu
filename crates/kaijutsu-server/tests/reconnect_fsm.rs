@@ -117,7 +117,7 @@ fn spawn_test_actor(addr: SocketAddr, instance: &str) -> ActorHandle {
         key_source: KeySource::ephemeral(),
         insecure: true,
     };
-    spawn_actor(config, None, instance.to_string())
+    spawn_actor(config, None, instance.to_string(), false)
 }
 
 /// Poll the status broadcast until a predicate matches, or panic on timeout.

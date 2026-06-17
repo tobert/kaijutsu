@@ -411,7 +411,11 @@ impl KaijutsuMcp {
         drop(client);
 
         // Spawn actor with no context — it will join via register_session.
-        let actor = spawn_actor(config, None, "mcp-server".to_string());
+        // scope_blocks_to_context = true: the MCP is single-context, and its
+        // single-threaded RPC LocalSet is starved by kernel-wide foreign-context
+        // event volume (the 2026-06-17 shell-timeout stall). Scoping the block
+        // subscription to the joined context cuts that volume to zero.
+        let actor = spawn_actor(config, None, "mcp-server".to_string(), true);
 
         tracing::info!("RPC actor spawned, persistent connection ready");
 
@@ -697,6 +701,16 @@ impl KaijutsuMcp {
                 break snap;
             }
             if start.elapsed().as_secs() > timeout_secs {
+                // A timeout is the precise signal that block-event delivery may
+                // be dead — the server can reap a subscription after a sustained
+                // callback stall, and the client is never told (the broadcast
+                // channel stays open, just silent). Re-subscribe so the *next*
+                // shell call recovers without a full reconnect. Best-effort:
+                // the resubscribe replaces any prior subscription by
+                // (principal, instance) on the server.
+                if let Err(e) = remote.actor.resubscribe_blocks().await {
+                    tracing::warn!("{label}: resubscribe after timeout failed: {e}");
+                }
                 return ShellCompletion::Timeout {
                     cmd_block_id,
                     timeout_secs,

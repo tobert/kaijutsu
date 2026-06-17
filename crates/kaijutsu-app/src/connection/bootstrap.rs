@@ -126,10 +126,14 @@ fn bootstrap_thread(
                             // kernel_id on every successful connect. It's
                             // included in BootstrapResult only so callers can
                             // log it for the in-flight cycle.
+                            // scope_blocks_to_context = false: the app routes
+                            // every context's block events into a per-context
+                            // DocumentCache, so it needs kernel-wide delivery.
                             let handle = kaijutsu_client::spawn_actor(
                                 config,
                                 context_id,
                                 instance,
+                                false,
                             );
 
                             let _ = result_tx.send(BootstrapResult::ActorReady {

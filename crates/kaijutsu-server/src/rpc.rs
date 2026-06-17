@@ -2099,6 +2099,7 @@ impl kernel::Server for KernelImpl {
                 let mut block_sub = block_flows.subscribe("block.*");
                 // Input flows are optional at this subscription site.
                 let mut input_sub = input_flows.map(|f| f.subscribe("input.*"));
+                let mut health = SubscriberHealth::new(MAX_SUBSCRIBER_FAILURES);
                 log::debug!(
                     "Started FlowBus subscription for kernel {} (input_flows={})",
                     kernel_id.to_hex(),
@@ -2523,11 +2524,15 @@ impl kernel::Server for KernelImpl {
                         else => break,
                     };
 
-                    // If callback fails (client disconnected), stop the bridge task
-                    if !success {
-                        log::debug!(
-                            "FlowBus bridge task for kernel {} stopping: callback failed",
-                            kernel_id
+                    // Tolerate a transient client-executor stall; reap only on
+                    // sustained failure (see SubscriberHealth). Breaking on the
+                    // first failure permanently severed delivery silently.
+                    if !health.record(success) {
+                        log::warn!(
+                            "FlowBus bridge task for kernel {} stopping: \
+                             {} consecutive callback failures — reaping subscriber",
+                            kernel_id,
+                            MAX_SUBSCRIBER_FAILURES,
                         );
                         break;
                     }
@@ -4835,6 +4840,7 @@ impl kernel::Server for KernelImpl {
             let task = tokio::task::spawn_local(async move {
                 let mut block_sub = block_flows.subscribe(subscribe_pattern);
                 let mut input_sub = input_flows.map(|f| f.subscribe("input.*"));
+                let mut health = SubscriberHealth::new(MAX_SUBSCRIBER_FAILURES);
                 log::debug!(
                     "Started filtered FlowBus subscription for kernel {} (filter_active={}, pattern={})",
                     kernel_id.to_hex(),
@@ -5256,10 +5262,19 @@ impl kernel::Server for KernelImpl {
                         else => break,
                     };
 
-                    if !success {
-                        log::debug!(
-                            "Filtered FlowBus bridge task for kernel {} stopping: callback failed",
-                            kernel_id
+                    // A single failed/timed-out callback is treated as a
+                    // transient client-executor stall, not a dead peer: drop
+                    // this event and keep the subscription. Reap only after
+                    // MAX_SUBSCRIBER_FAILURES consecutive failures (a success
+                    // resets the count). Breaking on the first failure was the
+                    // 2026-06-17 "every shell call times out after restart"
+                    // bug — it silently and permanently severed delivery.
+                    if !health.record(success) {
+                        log::warn!(
+                            "Filtered FlowBus bridge task for kernel {} stopping: \
+                             {} consecutive callback failures — reaping subscriber",
+                            kernel_id,
+                            MAX_SUBSCRIBER_FAILURES,
                         );
                         break;
                     }
@@ -6925,6 +6940,61 @@ fn derive_context_live_status(statuses_in_order: &[kaijutsu_crdt::Status]) -> ka
     }
 }
 
+/// Failure tolerance for a FlowBus→client callback bridge.
+///
+/// The per-callback 5s timeout (see `CALLBACK_TIMEOUT`) is load-bearing: a
+/// stalled client must not pin the server's RpcSystem by blocking
+/// `promise.await` on the shared SSH socket. But a *single* timeout or error
+/// does NOT mean the peer is dead — it usually means the client's
+/// single-threaded executor was transiently busy (e.g. an MCP client mid
+/// `from_sync_state`, or burst-processing a kernel-wide event stream). The old
+/// behavior — `break` on the first failure — turned that transient stall into a
+/// *permanent, silent* loss of the subscription: the bridge task ended, the
+/// client was never told, and every later shell poll timed out forever (the
+/// 2026-06-17 "every external shell call times out after restart" bug).
+///
+/// This counter tolerates short bursts of failure and reaps only a
+/// *sustained* one. A truly-dead peer is still caught: each failed callback
+/// has already burned its 5s timeout, so `max_consecutive_failures` strikes
+/// bound the reap delay (3 × 5s = 15s), well under the ~90s SSH keepalive that
+/// tears the whole connection down for a genuinely vanished peer. A single
+/// success resets the count.
+#[derive(Debug)]
+struct SubscriberHealth {
+    consecutive_failures: u32,
+    max_consecutive_failures: u32,
+}
+
+impl SubscriberHealth {
+    fn new(max_consecutive_failures: u32) -> Self {
+        Self {
+            consecutive_failures: 0,
+            max_consecutive_failures,
+        }
+    }
+
+    /// Record a callback outcome. Returns `true` to keep the subscription
+    /// alive, `false` to reap it. A success resets the strike count; a failure
+    /// reaps only once `max_consecutive_failures` strikes accumulate
+    /// back-to-back.
+    fn record(&mut self, ok: bool) -> bool {
+        if ok {
+            self.consecutive_failures = 0;
+            true
+        } else {
+            self.consecutive_failures += 1;
+            self.consecutive_failures < self.max_consecutive_failures
+        }
+    }
+}
+
+/// Consecutive callback failures tolerated before a FlowBus bridge is reaped.
+/// At the 5s per-callback timeout, 3 strikes ≈ 15s of sustained failure — long
+/// enough to ride out a transient client-executor stall, short enough that a
+/// wedged subscriber is dropped well before the SSH keepalive reaps the
+/// connection.
+const MAX_SUBSCRIBER_FAILURES: u32 = 3;
+
 /// Convert a CRDT Status to Cap'n Proto Status.
 fn status_to_capnp(status: kaijutsu_crdt::Status) -> crate::kaijutsu_capnp::Status {
     match status {
@@ -7483,6 +7553,54 @@ mod live_status_tests {
             derive_context_live_status(&[Status::Error, Status::Done]),
             Status::Pending
         );
+    }
+}
+
+#[cfg(test)]
+mod subscriber_health_tests {
+    //! `SubscriberHealth` — the strike counter that keeps a transient client
+    //! stall from permanently severing a FlowBus subscription (the 2026-06-17
+    //! "every external shell call times out after restart" regression). Reaping
+    //! is for *sustained* failure only; a success resets.
+    use super::SubscriberHealth;
+
+    #[test]
+    fn single_failure_does_not_reap() {
+        let mut h = SubscriberHealth::new(3);
+        // One transient timeout must NOT kill the subscription — this is the
+        // whole bug: the old code broke here and the MCP went silent forever.
+        assert!(h.record(false), "a single failure must keep the bridge alive");
+    }
+
+    #[test]
+    fn sustained_failure_reaps_at_threshold() {
+        let mut h = SubscriberHealth::new(3);
+        assert!(h.record(false)); // strike 1
+        assert!(h.record(false)); // strike 2
+        assert!(
+            !h.record(false),
+            "the 3rd consecutive failure reaps the subscriber"
+        );
+    }
+
+    #[test]
+    fn success_resets_the_strike_count() {
+        let mut h = SubscriberHealth::new(3);
+        assert!(h.record(false)); // strike 1
+        assert!(h.record(false)); // strike 2
+        assert!(h.record(true), "success keeps it alive and resets");
+        // Strikes were reset, so we can absorb two more before the third reaps.
+        assert!(h.record(false)); // strike 1 again
+        assert!(h.record(false)); // strike 2 again
+        assert!(!h.record(false), "reaps only on 3 *consecutive* failures");
+    }
+
+    #[test]
+    fn steady_success_never_reaps() {
+        let mut h = SubscriberHealth::new(3);
+        for _ in 0..100 {
+            assert!(h.record(true));
+        }
     }
 }
 
