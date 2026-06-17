@@ -14,7 +14,7 @@ use bevy::prelude::*;
 use kaijutsu_client::ContextInfo;
 use kaijutsu_types::ContextId;
 
-use super::card::{ClusterAssignment, assign_bands, band_orders, card_from, layout_positions, lift};
+use super::card::{ClusterAssignment, assign_bands, card_from, spiral_order, spiral_pos, spiral_scale};
 use super::scene::{CARD_TEX_H, CARD_TEX_W, Card, CardTarget, TimeWellState};
 use crate::connection::{RpcActor, RpcResultChannel, RpcResultMessage};
 use crate::view::vello_ui_texture::{VelloUiScene, VelloUiTexture, create_vello_texture};
@@ -84,26 +84,25 @@ pub fn sync_time_well(
     // labels in the spawn/refresh loops below without re-borrowing `state`
     // (which those loops mutate). It's haystack-sized — a cheap clone.
     let cluster_of = state.cluster_of.clone();
-    // Per-band slot order is the single source of truth: the layout derives every
-    // order_key from it, keyboard nav walks it, and `0–9` index its Hot vector.
-    let orders = band_orders(&contexts, &bands, &cluster_of);
-    let positions = layout_positions(&contexts, &bands, &orders, &state.layout);
-    state.band_order = orders;
+    // The whole well as one ordered spiral (mouth → throat). A card's index here
+    // is its position on the vortex and its odometer address; nav walks it.
+    let order = spiral_order(&contexts, &bands, &cluster_of);
+    let index_of: HashMap<ContextId, usize> =
+        order.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+    state.spiral_order = order;
 
     // Keep selection valid: drop it if its context left the well; default to the
-    // first hot slot when nothing (valid) is selected.
+    // mouth (index 0) when nothing (valid) is selected.
     let selection_valid = state
         .selected
         .is_some_and(|id| state.entities.contains_key(&id) || state.join.contains(&id));
     if !selection_valid {
-        state.selected = state.band_order[kaijutsu_viz::layout::Band::Hot.index()]
-            .first()
-            .copied();
+        state.selected = state.spiral_order.first().copied();
     }
 
-    // Resolve a target Vec3 per id up front (needs &state.geom).
-    let geom = state.geom;
-    let target_of = |id: &ContextId| positions.get(id).map(|p| lift(p, &geom));
+    // Resolve a target position + base scale per id from its spiral index.
+    let target_of = |id: &ContextId| index_of.get(id).map(|&i| spiral_pos(i));
+    let scale_of = |id: &ContextId| index_of.get(id).map(|&i| spiral_scale(i)).unwrap_or(1.0);
 
     // ── Spawn entered cards at their resolved position. ──
     let card_mesh = state
@@ -154,6 +153,7 @@ pub fn sync_time_well(
                     selected: false,
                     in_lineage: false,
                     drifting: false,
+                    base_scale: scale_of(&id),
                 },
                 CardTarget(pos),
                 Mesh3d(card_mesh.clone()),
@@ -186,6 +186,12 @@ pub fn sync_time_well(
         };
         if let Some(pos) = target_of(&id) {
             target.0 = pos;
+        }
+        // Base scale follows the card's (possibly shifted) spiral index. Guarded
+        // so a static card doesn't trip `Changed<Card>` (text rebuild) each poll.
+        let ns = scale_of(&id);
+        if (card.base_scale - ns).abs() > 1e-3 {
+            card.base_scale = ns;
         }
         if let Some(info) = state.join.get(&id) {
             let band = band_by_id.get(&id).copied().unwrap_or(card.data.band);

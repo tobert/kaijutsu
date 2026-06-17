@@ -10,53 +10,16 @@
 //! The Bevy systems in the sibling modules call these functions; the cards they
 //! produce are written onto entity components by the join system.
 
-use bevy::math::Vec3;
+use bevy::math::{Quat, Vec3};
 use kaijutsu_client::ContextInfo;
 use kaijutsu_types::ContextId;
-use kaijutsu_viz::layout::{
-    Band, CompactingBandLayout, ContextEntry, ContextLifecycle, LayoutPos, assign_band,
-};
+use kaijutsu_viz::layout::{Band, ContextLifecycle, assign_band};
 
 /// How many of the most-recent concluded contexts live in band 1
 /// (`RecentConcluded`) before falling into the band-2 haystack. Matches the
 /// "last N = 10" rule from the design doc.
 pub const N_RECENT_CONCLUDED: usize = 10;
 
-/// 3D geometry for lifting a 2D [`LayoutPos`] into the well.
-///
-/// The 2D layout places each card on a ring (`x`, `y`) whose radius already
-/// encodes the band; the lift adds the **depth** axis so the rings stack into a
-/// funnel. Hot (the outermost, largest ring) sits at the rim near the camera;
-/// each colder band recedes by `depth_step` into the well.
-#[derive(Debug, Clone, Copy)]
-pub struct WellGeometry {
-    /// Per-band depth (along -Z, into the screen), indexed by [`Band::index`]:
-    /// `[Haystack, RecentConcluded, Hot]`.
-    pub band_depth: [f32; 3],
-}
-
-impl WellGeometry {
-    /// A funnel where each colder band recedes by `depth_step` units.
-    ///
-    /// Hot (rim) is at depth 0; recent-concluded one step back; the haystack two
-    /// steps back. The 2D layout's smaller radii for colder bands plus this
-    /// receding depth give the well its funnel profile.
-    pub fn stepped(depth_step: f32) -> Self {
-        Self {
-            band_depth: [
-                -2.0 * depth_step, // Haystack  (index 0, innermost, deepest)
-                -depth_step,       // RecentConcluded (index 1)
-                0.0,               // Hot (index 2, rim, at the mouth of the well)
-            ],
-        }
-    }
-}
-
-impl Default for WellGeometry {
-    fn default() -> Self {
-        Self::stepped(200.0)
-    }
-}
 
 /// Card-model fields derived from a single [`ContextInfo`]. Pure data, no Bevy.
 ///
@@ -213,46 +176,6 @@ pub fn band_orders(
     [haystack, recent, hot]
 }
 
-/// Run the contexts through the compacting band layout, returning a position per
-/// context id. Each entry's `order_key` is its index within its band's
-/// [`BandOrders`] vector — so the angular slot, the keyboard slot, and the digit
-/// addressing are all the same ranking, by construction.
-pub fn layout_positions(
-    contexts: &[ContextInfo],
-    bands: &[Band],
-    orders: &BandOrders,
-    layout: &CompactingBandLayout,
-) -> std::collections::BTreeMap<ContextId, LayoutPos> {
-    debug_assert_eq!(
-        contexts.len(),
-        bands.len(),
-        "bands must align with contexts"
-    );
-
-    // id → slot index within its band (ids are unique per band, and each id
-    // lives in exactly one band's vector, so one flat map suffices).
-    let mut rank: std::collections::HashMap<ContextId, i64> = std::collections::HashMap::new();
-    for band_vec in orders {
-        for (i, id) in band_vec.iter().enumerate() {
-            rank.insert(*id, i as i64);
-        }
-    }
-
-    let entries: Vec<ContextEntry<ContextId>> = contexts
-        .iter()
-        .zip(bands.iter())
-        .map(|(c, &band)| ContextEntry {
-            id: c.id,
-            band,
-            // A context always appears in its band's order vector; default 0
-            // only as a defensive fallback (never hit in practice).
-            order_key: rank.get(&c.id).copied().unwrap_or(0),
-        })
-        .collect();
-
-    layout.compute(&entries)
-}
-
 /// Dense, collision-free order keys for the haystack band that group same-cluster
 /// contexts angularly adjacent.
 ///
@@ -322,13 +245,86 @@ pub fn drift_endpoints(
     out
 }
 
-/// Lift a 2D [`LayoutPos`] into the 3D well.
-///
-/// `(x, y)` are the ring-plane coordinates from the layout; the band selects the
-/// depth from [`WellGeometry`]. The app writes the result onto the card's
-/// `Transform` (tweened, not snapped).
-pub fn lift(pos: &LayoutPos, geom: &WellGeometry) -> Vec3 {
-    Vec3::new(pos.x, pos.y, geom.band_depth[pos.band.index()])
+/// Pitch (radians) the whole well is tipped back about its X (horizontal) axis.
+/// Negative tips the throat **down-and-away** so the mouth opens toward the
+/// camera (the well-axis recline we designed). The single knob for the recline.
+pub const WELL_TILT: f32 = -0.95;
+
+/// The well's recline as a rotation about +X by [`WELL_TILT`]. Applied to card
+/// positions in [`spiral_pos`] and to the ring deck so both share one funnel axis.
+pub fn well_tilt_quat() -> Quat {
+    Quat::from_rotation_x(WELL_TILT)
+}
+
+// ============================================================================
+// VORTEX SPIRAL (the "one continuous well" layout)
+// ============================================================================
+//
+// Instead of three discrete rings, every card sits on a single spiral funnel
+// indexed mouth → throat. Radius shrinks and depth grows geometrically per
+// index, so cards wind inward and downward and *asymptotically crowd the event
+// horizon* — the older a context (the further along the spiral), the deeper it
+// falls toward the singularity. Append-stable: a card's position depends only on
+// its integer index, so appending never reflows earlier cards.
+
+/// Rim radius at the mouth (index 0). Pulled in so cards sit closer together
+/// rather than flung wide across the rim.
+const SPIRAL_R_MOUTH: f32 = 330.0;
+/// Radius the spiral asymptotes to — the event-horizon ring at the throat. Cards
+/// only approach it as the spiral grows long; with few contexts the arm stays in
+/// the upper funnel, leaving an *empty* stretch above the horizon (nothing has
+/// fallen in yet — it fills as contexts age). That gap is meaningful, not a bug.
+const SPIRAL_R_THROAT: f32 = 48.0;
+/// Throat depth (funnel-local −Z) the spiral asymptotes to.
+const SPIRAL_DEPTH: f32 = -560.0;
+/// Per-index geometric decay (how fast the spiral winds in + down). Gentle, so a
+/// short arm spreads evenly down the upper funnel instead of bunching at center.
+const SPIRAL_DECAY: f32 = 0.93;
+/// Radians wound per index (~12 cards per revolution) — a tighter, denser arm.
+const SPIRAL_ANGLE_STEP: f32 = 0.50;
+/// Card base scale at the throat (mouth cards are 1.0). Kept high so cards stay
+/// readable as they descend (bigger overall, per Amy).
+const SPIRAL_SCALE_THROAT: f32 = 0.52;
+
+/// Funnel-local spiral position for the card at `index` (0 = mouth). See module
+/// note above: geometric inward/downward decay so cards pile toward the throat.
+fn spiral_local(index: usize) -> Vec3 {
+    let f = SPIRAL_DECAY.powi(index as i32); // 1 → 0 as index grows
+    let radius = SPIRAL_R_THROAT + (SPIRAL_R_MOUTH - SPIRAL_R_THROAT) * f;
+    let depth = SPIRAL_DEPTH * (1.0 - f);
+    let angle = index as f32 * SPIRAL_ANGLE_STEP;
+    Vec3::new(radius * angle.cos(), radius * angle.sin(), depth)
+}
+
+/// World position of the card at spiral `index`: the funnel-local spiral tipped
+/// back by [`WELL_TILT`] (same recline as everything else in the well).
+pub fn spiral_pos(index: usize) -> Vec3 {
+    well_tilt_quat() * spiral_local(index)
+}
+
+/// Per-card base scale along the spiral: 1.0 at the mouth, shrinking toward
+/// [`SPIRAL_SCALE_THROAT`] at the throat so the vortex reads as receding depth.
+pub fn spiral_scale(index: usize) -> f32 {
+    let f = SPIRAL_DECAY.powi(index as i32);
+    SPIRAL_SCALE_THROAT + (1.0 - SPIRAL_SCALE_THROAT) * f
+}
+
+/// The whole well as one ordered spiral, **mouth → throat**: live (hot) first,
+/// then recently-concluded, then the haystack — each zone kept in its existing
+/// slot order (so recency + cluster grouping survive inside the sequence). The
+/// index into this vector is both a card's position on the vortex and its
+/// odometer address (Left/Right = ±1, Up/Down = ±10, digits = the first decade).
+pub fn spiral_order(
+    contexts: &[ContextInfo],
+    bands: &[Band],
+    cluster_of: &std::collections::HashMap<ContextId, ClusterAssignment>,
+) -> Vec<ContextId> {
+    let orders = band_orders(contexts, bands, cluster_of);
+    let mut out = Vec::new();
+    for b in [Band::Hot, Band::RecentConcluded, Band::Haystack] {
+        out.extend_from_slice(&orders[b.index()]);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -483,129 +479,49 @@ mod tests {
     }
 
     #[test]
-    fn lift_passes_xy_and_maps_band_to_depth() {
-        let geom = WellGeometry::stepped(100.0);
-        let hot = lift(
-            &LayoutPos {
-                band: Band::Hot,
-                x: 3.0,
-                y: 4.0,
-            },
-            &geom,
-        );
-        assert_eq!(hot, Vec3::new(3.0, 4.0, 0.0));
-
-        let recent = lift(
-            &LayoutPos {
-                band: Band::RecentConcluded,
-                x: 1.0,
-                y: 2.0,
-            },
-            &geom,
-        );
-        assert_eq!(recent, Vec3::new(1.0, 2.0, -100.0));
-
-        let haystack = lift(
-            &LayoutPos {
-                band: Band::Haystack,
-                x: 0.0,
-                y: 0.0,
-            },
-            &geom,
-        );
-        assert_eq!(haystack, Vec3::new(0.0, 0.0, -200.0));
+    fn spiral_winds_inward_and_down_then_asymptotes() {
+        let r = |v: Vec3| (v.x * v.x + v.y * v.y).sqrt();
+        let (mouth, mid, deep) = (spiral_local(0), spiral_local(10), spiral_local(40));
+        assert!(r(mouth) > r(mid) && r(mid) > r(deep), "radius winds inward");
+        assert!(mid.z < mouth.z && deep.z < mid.z, "descends toward the throat");
+        // Cards pile at the event horizon rather than collapsing through it.
+        assert!(r(deep) >= SPIRAL_R_THROAT - 1.0, "radius asymptotes to the horizon");
+        assert!(deep.z > SPIRAL_DEPTH - 1.0, "depth asymptotes to the throat");
     }
 
     #[test]
-    fn layout_assigns_a_position_per_context() {
-        use kaijutsu_viz::layout::{CompactingBandLayout, LayoutConfig};
-
-        let contexts: Vec<ContextInfo> = (0..3u8).map(|n| ctx(id_of(n), "")).collect();
-        let bands = assign_bands(&contexts);
-        let layout = CompactingBandLayout::new(LayoutConfig::default_config());
-        let orders = band_orders(&contexts, &bands, &std::collections::HashMap::new());
-        let positions = layout_positions(&contexts, &bands, &orders, &layout);
-
-        assert_eq!(positions.len(), 3);
-        for c in &contexts {
-            assert!(
-                positions.contains_key(&c.id),
-                "missing position for {:?}",
-                c.id
-            );
-        }
+    fn spiral_pos_is_append_stable_and_tipped() {
+        assert_eq!(spiral_pos(7), spiral_pos(7), "position keys only on index");
+        // After the recline the funnel's depth maps mostly to world-Y, so the
+        // robust world-space invariant is "deeper cards sit lower". (Funnel-local
+        // depth monotonicity is covered by `spiral_winds_inward_and_down…`.)
+        let (near, far) = (spiral_pos(2), spiral_pos(30));
+        assert!(far.y < near.y, "deeper card sits lower after the recline");
     }
 
     #[test]
-    fn band1_angle_tracks_conclusion_recency_not_id_order() {
-        use kaijutsu_viz::layout::{CompactingBandLayout, LayoutConfig};
-        let layout = CompactingBandLayout::new(LayoutConfig::default_config());
-
-        // Three concluded contexts whose *id* order (1<2<3) deliberately differs
-        // from their *conclusion* order: id 2 concluded last, id 1 first. With all
-        // three inside the recent-concluded window they share band 1, where angle
-        // must encode conclusion recency — so the newest (id 2) takes the anchor
-        // slot, not the lowest id.
-        let mk = |n: u8, concluded: u64| {
-            let mut c = ctx(id_of(n), "");
-            c.concluded_at = Some(concluded);
-            c
-        };
-        let contexts = vec![
-            mk(1, 100), // oldest conclusion
-            mk(2, 300), // newest conclusion
-            mk(3, 200), // middle
-        ];
-        let bands = assign_bands(&contexts);
+    fn spiral_scale_shrinks_to_a_floor() {
+        assert!(spiral_scale(0) > spiral_scale(8), "cards shrink down the spiral");
+        assert!(spiral_scale(0) <= 1.0 + 1e-4, "mouth scale ~1.0");
         assert!(
-            bands.iter().all(|&b| b == Band::RecentConcluded),
-            "all three should be recent-concluded for this N"
+            spiral_scale(500) >= SPIRAL_SCALE_THROAT - 1e-4,
+            "scale is floored at the throat"
         );
-        let orders = band_orders(&contexts, &bands, &std::collections::HashMap::new());
-        let pos = layout_positions(&contexts, &bands, &orders, &layout);
-
-        // Band-1 mid radius for the default config (total 300, 3 bands) is 150;
-        // slot 0 sits at the band's start angle (0 here) → (150, 0).
-        let r = 150.0_f32;
-        let slot = |s: usize| {
-            let pitch = std::f64::consts::TAU / 12.0; // default_config pitch
-            let theta = s as f64 * pitch;
-            ((r as f64 * theta.cos()) as f32, (r as f64 * theta.sin()) as f32)
-        };
-        let approx = |a: (f32, f32), b: (f32, f32)| {
-            (a.0 - b.0).abs() < 1e-2 && (a.1 - b.1).abs() < 1e-2
-        };
-
-        let p = |n: u8| (pos[&id_of(n)].x, pos[&id_of(n)].y);
-        // Newest conclusion (id 2) → slot 0 (anchor); middle (id 3) → slot 1;
-        // oldest (id 1) → slot 2. If angle had keyed on id order, id 1 would be
-        // at slot 0 and this would fail.
-        assert!(approx(p(2), slot(0)), "newest concluded must take the anchor slot 0, got {:?}", p(2));
-        assert!(approx(p(3), slot(1)), "middle conclusion must take slot 1, got {:?}", p(3));
-        assert!(approx(p(1), slot(2)), "oldest conclusion must take slot 2, got {:?}", p(1));
     }
 
     #[test]
-    fn append_does_not_move_existing_hot_cards() {
-        use kaijutsu_viz::layout::{CompactingBandLayout, LayoutConfig};
-        let layout = CompactingBandLayout::new(LayoutConfig::default_config());
-
-        let before: Vec<ContextInfo> = (1..=3u8).map(|n| ctx(id_of(n), "")).collect();
-        let bands_b = assign_bands(&before);
-        let orders_b = band_orders(&before, &bands_b, &std::collections::HashMap::new());
-        let pos_b = layout_positions(&before, &bands_b, &orders_b, &layout);
-
-        // Append a newer context (larger id → later in time order → growing edge).
-        let mut after = before.clone();
-        after.push(ctx(id_of(4), ""));
-        let bands_a = assign_bands(&after);
-        let orders_a = band_orders(&after, &bands_a, &std::collections::HashMap::new());
-        let pos_a = layout_positions(&after, &bands_a, &orders_a, &layout);
-
-        // Every pre-existing card keeps its exact slot.
-        for c in &before {
-            assert_eq!(pos_b[&c.id], pos_a[&c.id], "append moved {:?}", c.id);
-        }
+    fn spiral_order_runs_hot_then_recent_then_haystack() {
+        let contexts = vec![
+            ctx(id_of(3), "hay"),
+            ctx(id_of(1), "hot"),
+            ctx(id_of(2), "rec"),
+        ];
+        // Bands aligned with contexts (not derived here — we're testing the flatten).
+        let bands = vec![Band::Haystack, Band::Hot, Band::RecentConcluded];
+        let order = spiral_order(&contexts, &bands, &std::collections::HashMap::new());
+        assert_eq!(order.first(), Some(&id_of(1)), "hot leads at the mouth");
+        assert_eq!(order.last(), Some(&id_of(3)), "haystack trails at the throat");
+        assert_eq!(order, vec![id_of(1), id_of(2), id_of(3)], "hot → recent → haystack");
     }
 
     fn cluster(id: u32, label: &str) -> ClusterAssignment {

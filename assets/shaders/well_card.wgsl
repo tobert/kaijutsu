@@ -47,13 +47,15 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     var col = accent.rgb;
     var alpha = accent.a * inside;
 
-    // Drift sheen (under the text): a narrow bright band sweeping diagonally across
-    // the body when this context is a staged-drift endpoint. HDR so it spills into
-    // bloom — reads as energy drifting through the card. (params.w = drifting.)
+    // Drift sheen (under the text): a narrow band sweeping diagonally across the
+    // body when this context is a staged-drift endpoint. Kept **LDR** (<1.0,
+    // muted) so it does NOT bloom — staged drift is *passive* structural state,
+    // not action, and the bright/blooming vocabulary is reserved for live system
+    // activity (the base ring deck + the Running rim). (params.w = drifting.)
     if (params.w > 0.5) {
         let phase = fract((pc.x + pc.y) * 0.9 - t * 0.5);
         let sheen = smoothstep(0.46, 0.50, phase) - smoothstep(0.50, 0.54, phase);
-        col += vec3<f32>(0.55, 0.80, 1.0) * sheen * 2.2 * inside;
+        col += vec3<f32>(0.30, 0.42, 0.55) * sheen * 0.5 * inside;
     }
 
     // MSDF text on top (text texture is transparent except glyphs).

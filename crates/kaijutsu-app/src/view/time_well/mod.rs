@@ -10,8 +10,12 @@
 //! - [`scene`] — the 3D scene: camera, root, screen toggle, billboarding, card
 //!   motion, components, and live state resource.
 //! - [`sync`] — the layout tick: keyed-join reconcile → spawn/despawn → layout.
+//! - [`activity`] — the well's pulse: kernel-event stream → ring energy + ripples
+//!   driving the base ring deck (unit-tested math).
 
+pub mod activity;
 pub mod card;
+pub mod hud;
 pub mod scene;
 pub mod sync;
 pub mod text;
@@ -26,9 +30,17 @@ pub struct TimeWellPlugin;
 impl Plugin for TimeWellPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(MaterialPlugin::<crate::shaders::WellCardMaterial>::default())
+            .add_plugins(MaterialPlugin::<crate::shaders::WellRingsMaterial>::default())
             .init_resource::<scene::TimeWellState>()
-            .add_systems(OnEnter(Screen::TimeWell), scene::enter_time_well)
-            .add_systems(OnExit(Screen::TimeWell), scene::exit_time_well)
+            .init_resource::<activity::RingActivity>()
+            .add_systems(
+                OnEnter(Screen::TimeWell),
+                (scene::enter_time_well, hud::spawn_well_hud),
+            )
+            .add_systems(
+                OnExit(Screen::TimeWell),
+                (scene::exit_time_well, hud::despawn_well_hud),
+            )
             // The toggle runs in every screen (it decides based on current state).
             .add_systems(Update, scene::toggle_time_well)
             // Well-only per-frame work.
@@ -47,6 +59,10 @@ impl Plugin for TimeWellPlugin {
                     scene::highlight_selection,
                     scene::highlight_lineage,
                     scene::highlight_drift,
+                    scene::accumulate_ring_activity,
+                    scene::tick_and_sync_rings,
+                    scene::sync_focus_card_visibility,
+                    hud::update_well_hud,
                 )
                     .chain()
                     .run_if(in_state(Screen::TimeWell)),

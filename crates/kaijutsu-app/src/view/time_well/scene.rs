@@ -6,11 +6,9 @@ use std::collections::HashMap;
 
 use bevy::prelude::*;
 use kaijutsu_types::ContextId;
-use kaijutsu_viz::layout::CompactingBandLayout;
-
 use kaijutsu_viz::layout::Band;
 
-use super::card::{CardData, WellGeometry};
+use super::card::CardData;
 use crate::ui::screen::Screen;
 use crate::view::vello_ui_texture::{VelloUiScene, VelloUiTexture, create_vello_texture};
 
@@ -43,6 +41,10 @@ pub struct Card {
     /// (the "drift = shimmer" bling). Flipped by [`highlight_drift`] only on
     /// change, same rebuild discipline as `selected`/`in_lineage`.
     pub drifting: bool,
+    /// Base render scale from this card's position on the vortex spiral (1.0 at
+    /// the mouth, shrinking toward the throat — see [`super::card::spiral_scale`]).
+    /// [`highlight_selection`] eases toward this, popping the selection.
+    pub base_scale: f32,
 }
 
 /// Parent entity owning all card entities + the well camera. Despawned (with its
@@ -60,6 +62,13 @@ pub struct TimeWellCamera;
 #[derive(Component)]
 pub struct ReadingCard;
 
+/// The well's base ring deck: a flat disc behind the cards (XY plane) that
+/// renders the concentric rings + spiral core + activity ripples (the well's
+/// "pulse"). Driven by [`WellRingsMaterial`] uniforms from [`tick_and_sync_rings`].
+/// Despawned on exit alongside the root.
+#[derive(Component)]
+pub struct WellRingsDeck;
+
 /// Where a card wants to be. A smoothing system eases `Transform.translation`
 /// toward this each frame — the "transitions are Bevy's job" stance from the
 /// design doc (no transition system, just a tween on `Transform`).
@@ -71,21 +80,20 @@ pub struct CardTarget(pub Vec3);
 // ============================================================================
 
 /// Live well state that survives across frames: the keyed join, the id→entity
-/// map, the layout engine, the 3D geometry, and the shared mesh / per-accent
-/// material handles built on first enter.
+/// map, the spiral order, and the shared mesh / per-accent material handles built
+/// on first enter.
 #[derive(Resource)]
 pub struct TimeWellState {
     pub join: kaijutsu_viz::join::Join<ContextId, kaijutsu_client::ContextInfo>,
     pub entities: HashMap<ContextId, Entity>,
-    pub layout: CompactingBandLayout,
-    pub geom: WellGeometry,
     /// Shared quad mesh for every card (built lazily on first enter).
     pub card_mesh: Option<Handle<Mesh>>,
-    /// Each band's context ids in angular slot order (indexed by `Band::index`:
-    /// `[Haystack, RecentConcluded, Hot]`), rebuilt each layout tick. The single
-    /// source of slot order: keyboard nav walks these, `0–9` index the Hot
-    /// vector, and the layout's `order_key` is derived from the same ordering.
-    pub band_order: super::card::BandOrders,
+    /// The whole well as one ordered spiral, **mouth → throat** (live → recent →
+    /// haystack, each zone in its slot order — see [`super::card::spiral_order`]),
+    /// rebuilt each layout tick. The single source of nav order: a card's index
+    /// here is its position on the vortex *and* its odometer address (Left/Right
+    /// = ±1, Up/Down = ±10, digits = the first decade at the mouth).
+    pub spiral_order: Vec<ContextId>,
     /// The currently-selected card (highlighted; the target of Enter / `c`).
     pub selected: Option<ContextId>,
     /// Whether the well is *focused* on the selection: Enter (from the overview)
@@ -102,46 +110,11 @@ pub struct TimeWellState {
 
 impl Default for TimeWellState {
     fn default() -> Self {
-        use kaijutsu_viz::layout::{BandAngleConfig, LayoutConfig};
-        // Fixed pitch (append-stable — NOT count-relative), but smaller than the
-        // crate default's TAU/12 so a realistically-full band (~up to 24) spreads
-        // around the ring without slots wrapping onto each other. Coincident cards
-        // would z-fight / swap under transparent sorting; keeping pitch * count
-        // < TAU avoids that for the expected card counts.
-        let pitch = std::f64::consts::TAU / 24.0;
-        // Band 1 (RecentConcluded) anchors at the top (12 o'clock, +Y) so the
-        // "clock of what I just finished" reads newest-up; older conclusions sweep
-        // counter-clockwise from there. Hot/Haystack start at 0 (3 o'clock). The
-        // band-1 order_key is conclusion-recency (see `card::layout_positions`), so
-        // slot 0 == anchor == most-recently-concluded.
-        let band1_anchor = std::f64::consts::FRAC_PI_2;
-        let config = LayoutConfig {
-            // Index order is [Haystack, RecentConcluded, Hot] (Band::index).
-            // Wider than center-tight so the hot rim reaches out toward the window
-            // edges (Amy 2026-06-17) rather than hugging the middle.
-            total_radius: 420.0,
-            band_angles: [
-                BandAngleConfig {
-                    start_angle: 0.0,
-                    pitch,
-                },
-                BandAngleConfig {
-                    start_angle: band1_anchor,
-                    pitch,
-                },
-                BandAngleConfig {
-                    start_angle: 0.0,
-                    pitch,
-                },
-            ],
-        };
         Self {
             join: kaijutsu_viz::join::Join::new(),
             entities: HashMap::new(),
-            layout: CompactingBandLayout::new(config),
-            geom: WellGeometry::default(),
             card_mesh: None,
-            band_order: [Vec::new(), Vec::new(), Vec::new()],
+            spiral_order: Vec::new(),
             selected: None,
             focused: false,
             cluster_of: HashMap::new(),
@@ -149,9 +122,11 @@ impl Default for TimeWellState {
     }
 }
 
-/// Logical card size in well units (the quad geometry).
-pub const CARD_WIDTH: f32 = 64.0;
-pub const CARD_HEIGHT: f32 = 40.0;
+/// Logical card size in well units (the quad geometry). Bigger than the original
+/// 64×40 so the spiral's cards read larger and closer together (1.6 aspect, to
+/// match the card texture so text isn't distorted).
+pub const CARD_WIDTH: f32 = 88.0;
+pub const CARD_HEIGHT: f32 = 55.0;
 
 /// Card texture size (logical px the vello scene is built in, then rasterized).
 /// 4× the quad units, same 1.6 aspect, so text stays crisp when sampled.
@@ -177,14 +152,26 @@ pub const FOCUS_CARD_POS: Vec3 = Vec3::new(0.0, -40.0, 260.0);
 /// less of the frame). Tuned a touch back so the focused card isn't oversized.
 const FOCUS_DOLLY: f32 = 430.0;
 
-/// Per-band recline (radians) layered on the billboard so cards lie along the
-/// funnel slope like the concept (mockup 27): the hot rim stands ~upright, colder
-/// bands tilt back toward horizontal as they descend into the well. Tunable.
+/// Side length of the square ring-deck quad (world units). Comfortably larger
+/// than the hot rim (`total_radius` 420) so the unit disc the shader draws fills
+/// the well; the corners outside the disc are transparent.
+const RING_DECK_SIZE: f32 = 1100.0;
+
+/// Depth (along the funnel's local −Z) of the ring deck: just past the deepest
+/// band so it is the **throat floor** of the funnel. Lifted + tilted by the
+/// shared [`super::card::well_tilt_quat`] so the spiral core sits at the low,
+/// receded throat and faces up toward the camera.
+const RING_DECK_DEPTH: f32 = -460.0;
+
+/// Per-band recline (radians) layered on the billboard. With the whole funnel now
+/// reclined in space (see [`super::card::WELL_TILT`]), the cards read their 3D
+/// form from their *positions* and should face the camera cleanly, so the recline
+/// is off. Kept as a per-band knob in case a slight lean reads better. Tunable.
 fn card_tilt(band: Band) -> f32 {
     match band {
-        Band::Hot => 0.10,
-        Band::RecentConcluded => 0.32,
-        Band::Haystack => 0.55,
+        Band::Hot => 0.0,
+        Band::RecentConcluded => 0.0,
+        Band::Haystack => 0.0,
     }
 }
 
@@ -214,6 +201,7 @@ pub fn enter_time_well(
     mut state: ResMut<TimeWellState>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<crate::shaders::WellCardMaterial>>,
+    mut ring_materials: ResMut<Assets<crate::shaders::WellRingsMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut app_camera: Query<(Entity, &mut Camera, &mut Transform), With<Camera3d>>,
 ) {
@@ -233,8 +221,7 @@ pub fn enter_time_well(
     if let Ok((cam_entity, mut cam, mut tf)) = app_camera.single_mut() {
         commands.entity(cam_entity).insert(TimeWellCamera);
         cam.clear_color = ClearColorConfig::Custom(WELL_BG);
-        *tf = Transform::from_xyz(0.0, 80.0, 920.0)
-            .looking_at(Vec3::new(0.0, 80.0, -200.0), Vec3::Y);
+        *tf = Transform::from_translation(CAM_BASE_POS).looking_at(CAM_BASE_LOOK, Vec3::Y);
     }
 
     commands.spawn((
@@ -242,6 +229,34 @@ pub fn enter_time_well(
         Transform::default(),
         Visibility::Inherited,
         Name::new("TimeWellRoot"),
+    ));
+
+    // Base ring deck: a flat disc behind the cards that renders the well's pulse
+    // (concentric rings + spiral core + activity ripples). Driven per-frame by
+    // `tick_and_sync_rings`. Not billboarded — it faces the camera (+Z) as a
+    // fixed floor; the shader fades its square corners to nothing.
+    let deck_mesh = meshes.add(Rectangle::new(RING_DECK_SIZE, RING_DECK_SIZE));
+    // Warm gold core + cyan-blue rings (the concept-art palette, mockups 27/33).
+    let deck_material = ring_materials.add(crate::shaders::WellRingsMaterial::new(
+        Vec4::new(1.0, 0.62, 0.20, 1.0),
+        Vec4::new(0.35, 0.62, 1.0, 1.0),
+    ));
+    // Tilt + place the deck on the same reclined funnel axis as the cards: its
+    // center rides to the throat (lifted depth) and its face tips up toward the
+    // camera, so the spiral core reads as the bottom of the vortex.
+    let tilt = super::card::well_tilt_quat();
+    let deck_pos = tilt * Vec3::new(0.0, 0.0, RING_DECK_DEPTH);
+    commands.spawn((
+        WellRingsDeck,
+        Mesh3d(deck_mesh),
+        MeshMaterial3d(deck_material),
+        Transform {
+            translation: deck_pos,
+            rotation: tilt,
+            scale: Vec3::ONE,
+        },
+        Visibility::Inherited,
+        Name::new("WellRingsDeck"),
     ));
 
     // Focus card: an in-world 3D card floating lower-center at the mouth of the
@@ -289,9 +304,15 @@ pub fn exit_time_well(
     roots: Query<Entity, With<TimeWellRoot>>,
     cards: Query<Entity, With<Card>>,
     reading: Query<Entity, With<ReadingCard>>,
+    decks: Query<Entity, With<WellRingsDeck>>,
     mut app_camera: Query<(Entity, &mut Camera), With<TimeWellCamera>>,
 ) {
-    for e in roots.iter().chain(cards.iter()).chain(reading.iter()) {
+    for e in roots
+        .iter()
+        .chain(cards.iter())
+        .chain(reading.iter())
+        .chain(decks.iter())
+    {
         commands.entity(e).despawn();
     }
 
@@ -349,26 +370,13 @@ const DIGIT_KEYS: [(KeyCode, usize); 10] = [
     (KeyCode::Digit9, 9),
 ];
 
-/// First selectable card when nothing is selected: the warmest non-empty band's
-/// first slot (Hot → Recent → Haystack).
-fn first_filled_slot(band_order: &super::card::BandOrders) -> Option<ContextId> {
-    [
-        Band::Hot.index(),
-        Band::RecentConcluded.index(),
-        Band::Haystack.index(),
-    ]
-    .into_iter()
-    .find_map(|bi| band_order[bi].first().copied())
-}
-
-/// Time-well keyboard navigation: a 2D walk over the rings.
-/// - `0–9` — hot quick-jump: select + switch + exit (muscle memory).
-/// - **Left/Right/Tab** — move within the current band's angular slot order.
-/// - **Up/Down** — hop bands; Up warms toward the rim (Haystack→Recent→Hot),
-///   Down cools toward the core. Skips empty bands; keeps the nearest slot.
-/// - **Enter** switches to the selection; **`c`** concludes it.
+/// Time-well keyboard navigation: an **odometer walk along the vortex spiral**.
+/// - `0–9` — quick-jump to that index near the mouth: select + switch + exit.
+/// - **Left / Right / Tab** — step ∓1 / ±1 along the spiral (one neighbour).
+/// - **Up / Down** — leap ∓10 / ±10 (toward the mouth / down toward the throat).
+/// - **Enter** focuses then commits; **`c`** concludes the selection.
 ///
-/// Esc (back to conversation) lives in [`toggle_time_well`].
+/// Esc (focus-aware, back to conversation) is handled below.
 pub fn well_keyboard(
     keys: Res<ButtonInput<KeyCode>>,
     mut state: ResMut<TimeWellState>,
@@ -376,10 +384,12 @@ pub fn well_keyboard(
     mut next: ResMut<NextState<Screen>>,
     actor: Option<Res<crate::connection::RpcActor>>,
 ) {
-    // `0–9`: jump straight to that hot slot and drop back into the conversation.
+    let len = state.spiral_order.len();
+
+    // `0–9`: jump straight to that mouth-end index and drop into the conversation.
     for (kc, n) in DIGIT_KEYS {
         if keys.just_pressed(kc)
-            && let Some(&id) = state.band_order[Band::Hot.index()].get(n)
+            && let Some(&id) = state.spiral_order.get(n)
         {
             switch.write(crate::view::components::ContextSwitchRequested { context_id: id });
             next.set(Screen::Conversation);
@@ -387,62 +397,31 @@ pub fn well_keyboard(
         }
     }
 
-    // Locate the current selection as (band index, slot within band).
-    let current = state.selected.and_then(|sel| {
-        (0..3).find_map(|bi| {
-            state.band_order[bi]
-                .iter()
-                .position(|&x| x == sel)
-                .map(|slot| (bi, slot))
-        })
-    });
+    // Index of the current selection on the spiral (None → start at the mouth).
+    let current = state
+        .selected
+        .and_then(|sel| state.spiral_order.iter().position(|&x| x == sel));
 
-    // Up/Down hop bands (+1 = toward Hot/rim); Left/Right/Tab move within a band.
-    // Band-hop takes priority so a stray combined press never double-moves.
-    let hop = if keys.just_pressed(KeyCode::ArrowUp) {
-        1i32
+    // Left/Right = ±1 along the spiral; Up/Down = ±10 (the odometer's tens),
+    // Up toward the mouth (−), Down toward the throat (+).
+    let step = if keys.just_pressed(KeyCode::ArrowUp) {
+        -10
     } else if keys.just_pressed(KeyCode::ArrowDown) {
-        -1
-    } else {
-        0
-    };
-    let within = if keys.just_pressed(KeyCode::ArrowRight) || keys.just_pressed(KeyCode::Tab) {
-        1i32
+        10
+    } else if keys.just_pressed(KeyCode::ArrowRight) || keys.just_pressed(KeyCode::Tab) {
+        1
     } else if keys.just_pressed(KeyCode::ArrowLeft) {
         -1
     } else {
         0
     };
 
-    if hop != 0 {
-        match current {
-            Some((bi, slot)) => {
-                // Walk to the nearest non-empty band in the hop direction.
-                let mut tb = bi as i32 + hop;
-                while (0..3).contains(&tb) {
-                    let band = &state.band_order[tb as usize];
-                    if !band.is_empty() {
-                        let idx = slot.min(band.len() - 1);
-                        state.selected = Some(band[idx]);
-                        break;
-                    }
-                    tb += hop;
-                }
-            }
-            None => state.selected = first_filled_slot(&state.band_order),
-        }
-    } else if within != 0 {
-        match current {
-            Some((bi, slot)) => {
-                let band = &state.band_order[bi];
-                if !band.is_empty() {
-                    let len = band.len() as i32;
-                    let idx = (((slot as i32 + within) % len) + len) % len;
-                    state.selected = Some(band[idx as usize]);
-                }
-            }
-            None => state.selected = first_filled_slot(&state.band_order),
-        }
+    if step != 0 && len > 0 {
+        let idx = match current {
+            Some(i) => (i as i32 + step).clamp(0, len as i32 - 1) as usize,
+            None => 0, // nothing selected yet → the mouth
+        };
+        state.selected = state.spiral_order.get(idx).copied();
     }
 
     // Enter is two-stage: from the overview it *focuses* (the camera dollies into
@@ -493,24 +472,11 @@ pub fn well_keyboard(
 // PER-FRAME SYSTEMS
 // ============================================================================
 
-/// Per-band base card scale. Colder bands render smaller — the design's "history
-/// grows denser, not bigger": at the tighter inner radii, full-size cards would
-/// overlap into an unreadable pile, so each band shrinks to roughly fit its ring
-/// pitch. (This is the interim before the step-7 chip/sediment LOD; it reads as
-/// depth/coldness in the meantime.)
-fn band_base_scale(band: Band) -> f32 {
-    match band {
-        Band::Hot => 1.0,
-        Band::RecentConcluded => 0.62,
-        Band::Haystack => 0.42,
-    }
-}
-
-/// Scale each card toward its per-band base size, popping the selected one. The
-/// `selected` flag is written so its texture grows a selection ring; it is only
-/// written when it flips, so the ring rebuilds on select/deselect without
-/// re-rasterizing the card every frame. The scale tween itself runs every frame
-/// (eased) for a soft feel.
+/// Scale each card toward its spiral base size (set in `sync` from
+/// [`super::card::spiral_scale`] — full at the mouth, shrinking toward the
+/// throat), popping the selected one. The `selected` flag is written only when it
+/// flips so the selection ring rebuilds on select/deselect without re-rasterizing
+/// every frame; the scale tween itself runs every frame (eased) for a soft feel.
 pub fn highlight_selection(
     state: Res<TimeWellState>,
     mut cards: Query<(&mut Card, &mut Transform)>,
@@ -524,8 +490,8 @@ pub fn highlight_selection(
             card.selected = is_sel;
         }
 
-        // Target = the band's base size, popped by 1.35× while selected.
-        let base = band_base_scale(card.data.band);
+        // Target = the card's spiral base size, popped by 1.35× while selected.
+        let base = card.base_scale;
         let target = if is_sel { base * 1.35 } else { base };
         let s = tf.scale.x;
         let eased = s + (target - s) * 0.25;
@@ -572,10 +538,91 @@ pub fn highlight_drift(drift: Res<crate::ui::drift::DriftState>, mut cards: Quer
     }
 }
 
-/// Base camera framing (matches `enter_time_well`): the resting pose the view
-/// returns to when nothing is selected.
-const CAM_BASE_POS: Vec3 = Vec3::new(0.0, 80.0, 920.0);
-const CAM_BASE_LOOK: Vec3 = Vec3::new(0.0, 80.0, -200.0);
+/// Show the in-world focus card only when *focused* (Enter-to-focus / the dive).
+/// In the overview it stays hidden so the well's mouth — the glowing core +
+/// activity rings — is the open browser space and the selected card's detail
+/// reads off the edge HUD instead (see [`super::hud`]). Also sidesteps the
+/// blank-white empty-selection state, which only the focus card ever showed.
+pub fn sync_focus_card_visibility(
+    state: Res<TimeWellState>,
+    mut card: Query<&mut Visibility, With<ReadingCard>>,
+) {
+    let want = if state.focused {
+        Visibility::Inherited
+    } else {
+        Visibility::Hidden
+    };
+    if let Ok(mut vis) = card.single_mut()
+        && *vis != want
+    {
+        *vis = want;
+    }
+}
+
+/// Ingest the kernel-wide event stream into the well's pulse. Every block event
+/// (token streaming weighs most — see [`super::activity::event_signal`]) raises
+/// the global energy and fires a **ripple at the producing context's ring
+/// angle** (`atan2(card.y, card.x)`), so a busy conversation throws a wavefront
+/// out from its direction on the deck. Events for contexts not currently shown
+/// still raise the global energy (ripple fired at angle 0).
+pub fn accumulate_ring_activity(
+    mut events: MessageReader<crate::connection::ServerEventMessage>,
+    mut activity: ResMut<super::activity::RingActivity>,
+    cards: Query<(&Card, &CardTarget)>,
+) {
+    for crate::connection::ServerEventMessage(ev) in events.read() {
+        if let Some((ctx, weight)) = super::activity::event_signal(ev) {
+            let angle = cards
+                .iter()
+                .find(|(c, _)| c.context_id == ctx)
+                .map(|(_, t)| t.0.y.atan2(t.0.x))
+                .unwrap_or(0.0);
+            activity.record(ctx, angle, weight);
+        }
+    }
+}
+
+/// Advance the well's pulse and push it into the deck material uniforms: the
+/// global `energy` (ring brightness / flow / core spin) and the packed ripple
+/// array (`[cos, sin, age_norm, intensity]`, unused slots `intensity = 0`).
+pub fn tick_and_sync_rings(
+    time: Res<Time>,
+    mut activity: ResMut<super::activity::RingActivity>,
+    mut ring_materials: ResMut<Assets<crate::shaders::WellRingsMaterial>>,
+    deck: Query<&MeshMaterial3d<crate::shaders::WellRingsMaterial>, With<WellRingsDeck>>,
+) {
+    activity.tick(time.delta_secs());
+
+    let Ok(handle) = deck.single() else {
+        return;
+    };
+    let Some(mat) = ring_materials.get_mut(&handle.0) else {
+        return;
+    };
+
+    mat.energy.x = activity.energy;
+
+    let mut packed = [Vec4::ZERO; super::activity::MAX_RIPPLES];
+    for (i, r) in activity
+        .ripples
+        .iter()
+        .take(super::activity::MAX_RIPPLES)
+        .enumerate()
+    {
+        let age_norm = (r.age / super::activity::RIPPLE_LIFETIME).clamp(0.0, 1.0);
+        packed[i] = Vec4::new(r.angle.cos(), r.angle.sin(), age_norm, r.intensity);
+    }
+    mat.ripples = packed;
+}
+
+/// Base camera framing. The well's recline now lives in the *geometry* (the
+/// funnel is tipped back about X, see [`super::card::WELL_TILT`]), so the camera
+/// only needs a gentle downward look *into* the flared mouth. Aiming a little
+/// above the origin drops the low throat toward bottom-center of the frame, with
+/// the mouth opening up toward the camera (the concept well, mockups 27/31). Both
+/// the recline angle and this pose are the two knobs we tune together.
+const CAM_BASE_POS: Vec3 = Vec3::new(0.0, 240.0, 900.0);
+const CAM_BASE_LOOK: Vec3 = Vec3::new(0.0, 40.0, -150.0);
 
 /// Ease the well camera between two poses, exponentially smoothed (slower than
 /// the cards, so the view glides):

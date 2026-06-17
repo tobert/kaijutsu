@@ -5,11 +5,13 @@
 
 pub mod block_fx_material;
 pub mod well_card_material;
+pub mod well_rings_material;
 
 use bevy::prelude::*;
 
 pub use block_fx_material::BlockFxMaterial;
 pub use well_card_material::WellCardMaterial;
+pub use well_rings_material::WellRingsMaterial;
 
 use crate::cell::block_border::{
     BlockBorderStyle, BlockExcludedState, BorderAnimation, BorderKind, BorderLabelMetrics,

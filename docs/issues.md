@@ -497,6 +497,24 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
     the breathe itself is continuous via `globals.time`). Thin-client aligned.
   - *Readability:* card sizing/camera zoom is functional but text is small at
     the default framing; tune when the active view (step 6) lands.
+- **Time-well — deferred UI ideas (parked 2026-06-17, picking up the activity
+  layer instead).** All real, none blocking; the active iteration is the
+  base-ring kernel-activity indicator (see `viz-substrate.md` step 7.7):
+  - *JOIN dive (mockup 34):* the committing Enter currently just switches
+    context + leaves. The cool version continues the camera *through* the focus
+    card so it unfolds into the conversation — one continuous focus→enter
+    gesture. Polish ideas: fade/dim ring cards while focused; tune focus-card
+    size/pos (it's large in the overview). See `viz-substrate.md` step 7.5/7.6.
+  - *Clean Running-pulse re-check:* the per-context teal Running rim is
+    mechanism-proven (identical shader path as the verified selection/lineage
+    rims) but never caught in a clean live screenshot — the earlier attempt was
+    blocked by the (now-fixed) MCP-shell hang + a bad mcp default model id. A
+    ~5-sec re-check once a working-model turn can be staged. NOTE: the
+    base-ring activity work below may re-tier the per-context cue anyway.
+  - *Drift arcs / particle layer (gap 4):* the bigger drift visualization —
+    arcs/particles *between* the source/target cards, not just the per-card
+    shimmer already shipped. Needs a new context→context drift-edge *list* wire
+    (the per-card shimmer rode the existing staged-queue poll; arcs can't).
 - **`ScaleLinear`/`ScaleTime` round-trip loses precision under extreme
   domain→range compression** (≳10³–10⁸×): inverting through a tiny range
   amplifies f64 representation error past any sane tolerance. This is an f64

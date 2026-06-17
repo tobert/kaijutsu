@@ -620,6 +620,66 @@ at scale (not yet).
 
 ---
 
+## The pulse: kernel-activity rings (step 7.7 — 2026-06-17)
+
+The bright/animated vocabulary was being spent on *passive* info (the drift
+shimmer). Re-tiered so **bright = live action**: a base **ring deck** behind the
+cards renders the well's pulse, driven by the **kernel-wide `ServerEvent` stream
+the app already receives** (zero new wire — token streaming weighs most). Idle =
+dim/calm; busy = bright rings + faster flow + a faster-spinning core. Each event
+fires a **ripple at the producing context's ring angle** (`atan2(card.y, card.x)`)
+— activity localizes to *which* conversation is moving. The drift shimmer was
+dropped to LDR (no bloom) so it reads as the passive structural state it is.
+Code: `view/time_well/activity.rs` (pure energy/ripple model, unit-tested),
+`shaders/well_rings_material.rs` + `assets/shaders/well_rings.wgsl`,
+`scene::{accumulate_ring_activity, tick_and_sync_rings}`.
+
+## The edge HUD (step 7.7)
+
+Selection detail fans to the **four screen edges** (N identity · E specs · W
+lineage · S preview) instead of a panel pulled into the center, so the well's
+mouth stays the open browser. The in-world focus card is hidden in the overview
+(shown only on Enter-focus). First cut renders with native Bevy `Text`; a
+vello/MSDF styling pass + dropping the focus card for good is the follow-up.
+Code: `view/time_well/hud.rs` (formatters unit-tested).
+
+## The vortex: one continuous spiral + tipped axis (step 7.8 — 2026-06-17)
+
+Decided with Amy: drop the three discrete rings; make the well a **single
+continuous vortex**, which is more honest to the lifecycle metaphor (age = how
+far you've fallen down the funnel) and to the concept art.
+
+- **Tipped funnel axis.** The whole well is reclined about X by `card::WELL_TILT`
+  (the *geometry* carries the recline, not the camera): the mouth opens up toward
+  the viewer, the throat drops low-and-away. This is the right lever — camera
+  pitch alone can't move the throat off the line of sight; tipping the axis can.
+  Cards billboard, so they face the viewer regardless; the per-band recline is
+  retired.
+- **Continuous spiral (option B).** Every card sits on one log-style spiral
+  indexed mouth → throat (`card::spiral_pos`/`spiral_scale`/`spiral_order`):
+  radius shrinks + depth grows geometrically per index, so cards wind inward and
+  down and asymptotically crowd the throat. Append-stable (position keys only on
+  the integer index). The lifecycle order (hot → recent → haystack, each zone in
+  its `band_orders` slot order) is preserved *as the sequence*. A short arm stays
+  in the upper funnel, leaving an **intentional empty stretch above the horizon**
+  — nothing has fallen in yet; it fills as contexts age.
+- **Odometer navigation.** B keeps number-addressability: the spiral index is the
+  address. **Left/Right = ±1, Up/Down = ±10**, digits `0–9` = the first decade at
+  the mouth. (Replaced band-hop; `scene::well_keyboard`.)
+- **Accretion-horizon throat.** The ring deck's center is an **accretion-disk
+  event horizon**: a dark singularity ringed by a hot HDR glow with log-spiral
+  arms and a rotating Doppler-bright side (`well_rings.wgsl`) — the bottom of the
+  vortex the haystack falls into.
+- **Superseded + removed.** The band-positioning path (`lift`, `layout_positions`,
+  `WellGeometry`, `CompactingBandLayout` usage, the `layout`/`geom` state fields)
+  is deleted — the spiral replaced it. `band_orders`/`assign_bands`/
+  `haystack_order_keys` survive (they still order the sequence + label clusters).
+
+Tuning knobs live as named constants (`SPIRAL_R_MOUTH`/`_DECAY`/`_ANGLE_STEP`/
+`_SCALE_THROAT`, `WELL_TILT`, `CARD_WIDTH/HEIGHT`, camera `CAM_BASE_*`).
+
+---
+
 ## Open questions that remain
 
 The capnp closed events-vs-polling and forest-vs-DAG; the workflow grounding
