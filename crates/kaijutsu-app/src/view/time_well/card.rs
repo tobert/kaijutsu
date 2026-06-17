@@ -159,31 +159,68 @@ pub fn assign_bands(contexts: &[ContextInfo]) -> Vec<Band> {
     assign_band(&lifecycles, N_RECENT_CONCLUDED)
 }
 
-/// Run the contexts through the compacting band layout, returning a position per
-/// context id.
+/// Each band's context ids in **angular slot order**, indexed by [`Band::index`]
+/// (`[Haystack, RecentConcluded, Hot]`). This is the single source of slot
+/// order: the layout derives every `order_key` from it (so angle == slot), and
+/// keyboard navigation walks the same vectors (so the keys match the visuals).
 ///
-/// `bands` must be positionally aligned with `contexts` (as produced by
-/// [`assign_bands`]). The `order_key` is **per-band**, because the two coordinates
-/// carry orthogonal meaning (see `docs/viz-substrate.md`, "The three bands"):
-///
-/// - **Hot** and **Haystack** key on the context's **creation rank** — id is a
-///   UUIDv7, so sorting by id is creation order and is guaranteed unique. Hot's
-///   slot order then matches the `0–9` digit addressing (`scene::hot_order` sorts
-///   by id), so muscle memory and geometry agree.
-/// - **RecentConcluded** keys on **conclusion recency** (`concluded_at` descending,
-///   id-tiebroken), so band-1 angle is "a clock of what I just finished": the
-///   most-recently-concluded context takes the anchor slot (0) and older
-///   conclusions sweep outward. This is the band whose angle the design assigns to
-///   *recency*, not creation — keying it on id (the old behavior) put it on the
-///   wrong axis.
-///
-/// Both rankings are dense and collision-free within their band, satisfying the
-/// layout's "unique `order_key` per band" precondition (no ties → stable slots
-/// independent of poll order).
-pub fn layout_positions(
+/// Per-band ordering (the orthogonal-meaning rule from "The three bands"):
+/// - **Hot** — id ascending (UUIDv7 = creation order, unique); this is what the
+///   `0–9` digit keys address.
+/// - **RecentConcluded** — most-recently-concluded first (`concluded_at`
+///   descending, id-tiebroken), so band-1 angle is "a clock of what I just
+///   finished" and slot 0 is the newest conclusion.
+/// - **Haystack** — semantic-cluster grouping (`haystack_order_keys`):
+///   same-cluster contexts adjacent, unclustered trailing.
+pub type BandOrders = [Vec<ContextId>; 3];
+
+/// Compute each band's [`BandOrders`] slot order over the current set.
+pub fn band_orders(
     contexts: &[ContextInfo],
     bands: &[Band],
     cluster_of: &std::collections::HashMap<ContextId, ClusterAssignment>,
+) -> BandOrders {
+    debug_assert_eq!(
+        contexts.len(),
+        bands.len(),
+        "bands must align with contexts"
+    );
+    let in_band = |want: Band| -> Vec<&ContextInfo> {
+        contexts
+            .iter()
+            .zip(bands.iter())
+            .filter(move |(_, b)| **b == want)
+            .map(|(c, _)| c)
+            .collect()
+    };
+
+    // Hot: id ascending (creation order; matches the `0–9` addressing).
+    let mut hot: Vec<ContextId> = in_band(Band::Hot).iter().map(|c| c.id).collect();
+    hot.sort_unstable();
+
+    // RecentConcluded: newest conclusion first, id-tiebroken.
+    let mut recent = in_band(Band::RecentConcluded);
+    recent.sort_by(|a, b| b.concluded_at.cmp(&a.concluded_at).then(a.id.cmp(&b.id)));
+    let recent: Vec<ContextId> = recent.into_iter().map(|c| c.id).collect();
+
+    // Haystack: cluster-grouped (sort by the haystack rank).
+    let haystack_ids: Vec<ContextId> = in_band(Band::Haystack).iter().map(|c| c.id).collect();
+    let keys = haystack_order_keys(&haystack_ids, cluster_of);
+    let mut haystack = haystack_ids;
+    haystack.sort_by_key(|id| keys[id]);
+
+    // Index order is [Haystack, RecentConcluded, Hot] = Band::index.
+    [haystack, recent, hot]
+}
+
+/// Run the contexts through the compacting band layout, returning a position per
+/// context id. Each entry's `order_key` is its index within its band's
+/// [`BandOrders`] vector — so the angular slot, the keyboard slot, and the digit
+/// addressing are all the same ranking, by construction.
+pub fn layout_positions(
+    contexts: &[ContextInfo],
+    bands: &[Band],
+    orders: &BandOrders,
     layout: &CompactingBandLayout,
 ) -> std::collections::BTreeMap<ContextId, LayoutPos> {
     debug_assert_eq!(
@@ -192,53 +229,24 @@ pub fn layout_positions(
         "bands must align with contexts"
     );
 
-    // Creation rank by id (UUIDv7 = time order, unique) for Hot.
-    let mut ids: Vec<ContextId> = contexts.iter().map(|c| c.id).collect();
-    ids.sort_unstable();
-    let id_rank = |id: &ContextId| ids.binary_search(id).expect("id present") as i64;
-
-    // Haystack angle re-encodes to *semantic cluster* (the band's whole point):
-    // same-cluster contexts sit angularly adjacent. Compute dense ranks over just
-    // the haystack contexts, grouped by cluster (see `haystack_order_keys`).
-    let haystack_ids: Vec<ContextId> = contexts
-        .iter()
-        .zip(bands.iter())
-        .filter(|(_, b)| **b == Band::Haystack)
-        .map(|(c, _)| c.id)
-        .collect();
-    let haystack_rank = haystack_order_keys(&haystack_ids, cluster_of);
-
-    // Recency rank for band 1: most-recently-concluded first (→ order_key 0 →
-    // anchor slot). Ties on `concluded_at` break by id ascending, matching the
-    // same tie-break `assign_band` uses to pick the top-N window — so the window
-    // membership and the angular order are derived consistently.
-    let mut recent: Vec<&ContextInfo> = contexts
-        .iter()
-        .zip(bands.iter())
-        .filter(|(_, b)| **b == Band::RecentConcluded)
-        .map(|(c, _)| c)
-        .collect();
-    recent.sort_by(|a, b| b.concluded_at.cmp(&a.concluded_at).then(a.id.cmp(&b.id)));
-    let recency_rank: std::collections::HashMap<ContextId, i64> = recent
-        .iter()
-        .enumerate()
-        .map(|(i, c)| (c.id, i as i64))
-        .collect();
+    // id → slot index within its band (ids are unique per band, and each id
+    // lives in exactly one band's vector, so one flat map suffices).
+    let mut rank: std::collections::HashMap<ContextId, i64> = std::collections::HashMap::new();
+    for band_vec in orders {
+        for (i, id) in band_vec.iter().enumerate() {
+            rank.insert(*id, i as i64);
+        }
+    }
 
     let entries: Vec<ContextEntry<ContextId>> = contexts
         .iter()
         .zip(bands.iter())
-        .map(|(c, &band)| {
-            let order_key = match band {
-                Band::RecentConcluded => recency_rank[&c.id],
-                Band::Haystack => haystack_rank[&c.id],
-                Band::Hot => id_rank(&c.id),
-            };
-            ContextEntry {
-                id: c.id,
-                band,
-                order_key,
-            }
+        .map(|(c, &band)| ContextEntry {
+            id: c.id,
+            band,
+            // A context always appears in its band's order vector; default 0
+            // only as a defensive fallback (never hit in practice).
+            order_key: rank.get(&c.id).copied().unwrap_or(0),
         })
         .collect();
 
@@ -469,7 +477,8 @@ mod tests {
         let contexts: Vec<ContextInfo> = (0..3u8).map(|n| ctx(id_of(n), "")).collect();
         let bands = assign_bands(&contexts);
         let layout = CompactingBandLayout::new(LayoutConfig::default_config());
-        let positions = layout_positions(&contexts, &bands, &std::collections::HashMap::new(), &layout);
+        let orders = band_orders(&contexts, &bands, &std::collections::HashMap::new());
+        let positions = layout_positions(&contexts, &bands, &orders, &layout);
 
         assert_eq!(positions.len(), 3);
         for c in &contexts {
@@ -506,7 +515,8 @@ mod tests {
             bands.iter().all(|&b| b == Band::RecentConcluded),
             "all three should be recent-concluded for this N"
         );
-        let pos = layout_positions(&contexts, &bands, &std::collections::HashMap::new(), &layout);
+        let orders = band_orders(&contexts, &bands, &std::collections::HashMap::new());
+        let pos = layout_positions(&contexts, &bands, &orders, &layout);
 
         // Band-1 mid radius for the default config (total 300, 3 bands) is 150;
         // slot 0 sits at the band's start angle (0 here) → (150, 0).
@@ -536,13 +546,15 @@ mod tests {
 
         let before: Vec<ContextInfo> = (1..=3u8).map(|n| ctx(id_of(n), "")).collect();
         let bands_b = assign_bands(&before);
-        let pos_b = layout_positions(&before, &bands_b, &std::collections::HashMap::new(), &layout);
+        let orders_b = band_orders(&before, &bands_b, &std::collections::HashMap::new());
+        let pos_b = layout_positions(&before, &bands_b, &orders_b, &layout);
 
         // Append a newer context (larger id → later in time order → growing edge).
         let mut after = before.clone();
         after.push(ctx(id_of(4), ""));
         let bands_a = assign_bands(&after);
-        let pos_a = layout_positions(&after, &bands_a, &std::collections::HashMap::new(), &layout);
+        let orders_a = band_orders(&after, &bands_a, &std::collections::HashMap::new());
+        let pos_a = layout_positions(&after, &bands_a, &orders_a, &layout);
 
         // Every pre-existing card keeps its exact slot.
         for c in &before {
@@ -598,6 +610,40 @@ mod tests {
             haystack_order_keys(&reverse, &map),
             "haystack keys must depend only on (cluster, id), not input order"
         );
+    }
+
+    #[test]
+    fn band_orders_rank_each_band_by_its_own_axis() {
+        use kaijutsu_viz::layout::Band;
+        use std::collections::HashMap;
+
+        // Hot: two open contexts (ids 5, 3) → expect id-ascending [3, 5].
+        let mut hot_a = ctx(id_of(5), "");
+        hot_a.created_at = 10;
+        let mut hot_b = ctx(id_of(3), "");
+        hot_b.created_at = 11;
+        // Recent: two concluded; id 9 concluded later than id 8 → recency [9, 8].
+        let mut rec_old = ctx(id_of(8), "");
+        rec_old.concluded_at = Some(100);
+        let mut rec_new = ctx(id_of(9), "");
+        rec_new.concluded_at = Some(200);
+
+        let contexts = vec![hot_a, hot_b, rec_old, rec_new];
+        // Force the bands explicitly (don't depend on assign_bands' N window here).
+        let bands = vec![Band::Hot, Band::Hot, Band::RecentConcluded, Band::RecentConcluded];
+
+        let orders = band_orders(&contexts, &bands, &HashMap::new());
+        assert_eq!(
+            orders[Band::Hot.index()],
+            vec![id_of(3), id_of(5)],
+            "hot orders by id ascending"
+        );
+        assert_eq!(
+            orders[Band::RecentConcluded.index()],
+            vec![id_of(9), id_of(8)],
+            "recent orders newest-conclusion first"
+        );
+        assert!(orders[Band::Haystack.index()].is_empty());
     }
 
     #[test]

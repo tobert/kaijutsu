@@ -18,7 +18,12 @@ use vello::Scene;
 use vello::kurbo::{Affine, RoundedRect, Stroke};
 use vello::peniko::{Brush, Color as VColor, Fill};
 
-use super::scene::{CARD_TEX_H, CARD_TEX_W, Card, accent_color};
+use kaijutsu_types::ContextId;
+
+use super::scene::{
+    CARD_TEX_H, CARD_TEX_W, Card, READING_TEX_H, READING_TEX_W, ReadingCard, TimeWellState,
+    accent_color,
+};
 use crate::text::ShapingFonts;
 use crate::text::components::bevy_color_to_brush;
 use crate::text::shaping::{VelloFont, VelloTextAlign, VelloTextStyle};
@@ -85,29 +90,48 @@ fn status_color(status: Option<kaijutsu_types::Status>) -> Option<VColor> {
     })
 }
 
-/// Build the vello scene for one card: an accent rounded-rect background with the
-/// title, model badge, fork badge, and a keyword/preview line stacked inside.
-fn build_card_scene(card: &Card, font: &VelloFont) -> Scene {
+/// Build the vello scene for one card at a target `(w, h)`: an accent
+/// rounded-rect background with the title, model badge, fork badge, and a
+/// keyword/preview line stacked inside.
+///
+/// All metrics scale by `s = h / CARD_TEX_H` off the small rim-card reference,
+/// so the same code renders both the tiny ring cards (`CARD_TEX_W/H`) and the
+/// large center-bottom reading slot crisply (vello rasterizes vectors at the
+/// target size). The reading slot keeps the rim aspect ratio so `s` is uniform.
+fn build_card_scene(card: &Card, font: &VelloFont, w: f32, h: f32) -> Scene {
     let mut scene = Scene::new();
-    let w = CARD_TEX_W;
-    let h = CARD_TEX_H;
+    let s = h / CARD_TEX_H; // scale relative to the reference rim card
+    let pad = PAD * s;
     let data = &card.data;
 
     // ── Background: accent rounded rect. ──
     let bg = bevy_color_to_brush(accent_color(&data.accent).with_alpha(0.94));
-    let rect = RoundedRect::new(1.0, 1.0, (w - 1.0) as f64, (h - 1.0) as f64, 14.0);
+    let rect = RoundedRect::new(
+        s as f64,
+        s as f64,
+        (w - s) as f64,
+        (h - s) as f64,
+        (14.0 * s) as f64,
+    );
     scene.fill(Fill::NonZero, Affine::IDENTITY, &bg, None, &rect);
 
     // A subtle top accent bar so cards read as cards even before text loads.
-    let bar = vello::kurbo::Rect::new(8.0, 5.0, (w - 8.0) as f64, 9.0);
+    let bar = vello::kurbo::Rect::new(
+        (8.0 * s) as f64,
+        (5.0 * s) as f64,
+        (w - 8.0 * s) as f64,
+        (9.0 * s) as f64,
+    );
     let bar_brush = Brush::Solid(VColor::new([1.0, 1.0, 1.0, 0.16]));
     scene.fill(Fill::NonZero, Affine::IDENTITY, &bar_brush, None, &bar);
 
     // ── Live status glyph (top-right dot), data-tick driven. ──
     if let Some(color) = status_color(card.status) {
-        let dot = vello::kurbo::Circle::new(((w - 18.0) as f64, 18.0), 7.0);
+        let cx = (w - 18.0 * s) as f64;
+        let cy = (18.0 * s) as f64;
+        let dot = vello::kurbo::Circle::new((cx, cy), (7.0 * s) as f64);
         // Dark halo so the dot reads on any accent.
-        let halo = vello::kurbo::Circle::new(((w - 18.0) as f64, 18.0), 9.0);
+        let halo = vello::kurbo::Circle::new((cx, cy), (9.0 * s) as f64);
         scene.fill(
             Fill::NonZero,
             Affine::IDENTITY,
@@ -124,46 +148,46 @@ fn build_card_scene(card: &Card, font: &VelloFont) -> Scene {
         );
     }
 
-    let max_advance = Some(w - 2.0 * PAD);
-    let mut y = PAD + 6.0;
+    let max_advance = Some(w - 2.0 * pad);
+    let mut y = pad + 6.0 * s;
 
     // ── Title. ──
     let title_brush = bevy_color_to_brush(Color::srgb(0.98, 0.99, 1.0));
     let title_style = VelloTextStyle {
-        font_size: 22.0,
+        font_size: 22.0 * s,
         line_height: 1.1,
         ..default()
     };
     let title = font.layout(&data.title, &title_style, VelloTextAlign::Left, max_advance);
     let title_h = title.height();
-    draw_layout(&mut scene, &title, (PAD as f64, y as f64), &title_brush);
-    y += title_h + 6.0;
+    draw_layout(&mut scene, &title, (pad as f64, y as f64), &title_brush);
+    y += title_h + 6.0 * s;
 
     // ── Model badge. ──
     if !data.model_badge.is_empty() {
         let brush = bevy_color_to_brush(Color::srgba(1.0, 1.0, 1.0, 0.85));
         let style = VelloTextStyle {
-            font_size: 14.0,
+            font_size: 14.0 * s,
             ..default()
         };
         let badge = font.layout(&data.model_badge, &style, VelloTextAlign::Left, max_advance);
         let bh = badge.height();
-        draw_layout(&mut scene, &badge, (PAD as f64, y as f64), &brush);
-        y += bh + 4.0;
+        draw_layout(&mut scene, &badge, (pad as f64, y as f64), &brush);
+        y += bh + 4.0 * s;
     }
 
     // ── Fork badge (small, dim). ──
     if let Some(fork) = &data.fork_badge {
         let brush = bevy_color_to_brush(Color::srgba(1.0, 1.0, 1.0, 0.65));
         let style = VelloTextStyle {
-            font_size: 12.0,
+            font_size: 12.0 * s,
             ..default()
         };
         let label = format!("⑂ {fork}");
         let l = font.layout(&label, &style, VelloTextAlign::Left, max_advance);
         let lh = l.height();
-        draw_layout(&mut scene, &l, (PAD as f64, y as f64), &brush);
-        y += lh + 4.0;
+        draw_layout(&mut scene, &l, (pad as f64, y as f64), &brush);
+        y += lh + 4.0 * s;
     }
 
     // ── Keywords or preview, whichever is present, filling remaining space. ──
@@ -172,15 +196,15 @@ fn build_card_scene(card: &Card, font: &VelloFont) -> Scene {
     } else {
         data.preview.clone().unwrap_or_default()
     };
-    if !tail.is_empty() && y < h - PAD {
+    if !tail.is_empty() && y < h - pad {
         let brush = bevy_color_to_brush(Color::srgba(0.92, 0.95, 1.0, 0.72));
         let style = VelloTextStyle {
-            font_size: 12.0,
+            font_size: 12.0 * s,
             line_height: 1.15,
             ..default()
         };
         let l = font.layout(&tail, &style, VelloTextAlign::Left, max_advance);
-        draw_layout(&mut scene, &l, (PAD as f64, y as f64), &brush);
+        draw_layout(&mut scene, &l, (pad as f64, y as f64), &brush);
     }
 
     // ── Cluster label (haystack only): a bottom-anchored tag naming the semantic
@@ -188,15 +212,15 @@ fn build_card_scene(card: &Card, font: &VelloFont) -> Scene {
     // Only set for band-2 cards, so it doubles as the haystack's visual signal. ──
     if let Some(cluster) = &data.cluster_label {
         let style = VelloTextStyle {
-            font_size: 13.0,
+            font_size: 13.0 * s,
             ..default()
         };
         let text = format!("◇ {cluster}");
         let l = font.layout(&text, &style, VelloTextAlign::Left, max_advance);
         let lh = l.height();
-        let fy = h - PAD - lh; // anchor to the bottom edge
+        let fy = h - pad - lh; // anchor to the bottom edge
         let brush = bevy_color_to_brush(Color::srgba(0.86, 0.93, 1.0, 0.95));
-        draw_layout(&mut scene, &l, (PAD as f64, fy as f64), &brush);
+        draw_layout(&mut scene, &l, (pad as f64, fy as f64), &brush);
     }
 
     // ── Lineage ring: an amber edge marking a fork-ancestor of the selection
@@ -205,9 +229,10 @@ fn build_card_scene(card: &Card, font: &VelloFont) -> Scene {
     // (ancestors exclude the selected card). Opaque for the same Mask-alpha
     // reason as the selection ring. ──
     if card.in_lineage {
-        let ring = RoundedRect::new(3.5, 3.5, (w - 3.5) as f64, (h - 3.5) as f64, 13.0);
+        let inset = (3.5 * s) as f64;
+        let ring = RoundedRect::new(inset, inset, (w - 3.5 * s) as f64, (h - 3.5 * s) as f64, (13.0 * s) as f64);
         scene.stroke(
-            &Stroke::new(5.0),
+            &Stroke::new((5.0 * s) as f64),
             Affine::IDENTITY,
             &Brush::Solid(VColor::new([0.95, 0.70, 0.20, 1.0])),
             None,
@@ -223,9 +248,10 @@ fn build_card_scene(card: &Card, font: &VelloFont) -> Scene {
     // `selected` flag flips on select/deselect, rebuilding this scene. ──
     if card.selected {
         // Outer halo: wide, saturated blue, just inside the texture bounds.
-        let ring = RoundedRect::new(3.5, 3.5, (w - 3.5) as f64, (h - 3.5) as f64, 13.0);
+        let inset = (3.5 * s) as f64;
+        let ring = RoundedRect::new(inset, inset, (w - 3.5 * s) as f64, (h - 3.5 * s) as f64, (13.0 * s) as f64);
         scene.stroke(
-            &Stroke::new(7.0),
+            &Stroke::new((7.0 * s) as f64),
             Affine::IDENTITY,
             &Brush::Solid(VColor::new([0.20, 0.55, 0.95, 1.0])),
             None,
@@ -233,7 +259,7 @@ fn build_card_scene(card: &Card, font: &VelloFont) -> Scene {
         );
         // Bright inner edge over the halo.
         scene.stroke(
-            &Stroke::new(2.5),
+            &Stroke::new((2.5 * s) as f64),
             Affine::IDENTITY,
             &Brush::Solid(VColor::new([0.90, 0.97, 1.0, 1.0])),
             None,
@@ -256,9 +282,43 @@ pub fn build_card_scenes(
         return; // font still loading; retry next change
     };
     for (card, mut ui) in query.iter_mut() {
-        ui.scene = build_card_scene(card, font);
+        ui.scene = build_card_scene(card, font, CARD_TEX_W, CARD_TEX_H);
         ui.built_width = CARD_TEX_W;
         ui.built_height = CARD_TEX_H;
         ui.version = ui.version.wrapping_add(1);
     }
+}
+
+/// Render the current selection into the center-bottom reading slot at readable
+/// size. Rebuilds only when the selection *changes* (tracked in a `Local`), so a
+/// static selection costs nothing; clears the slot when nothing is selected.
+pub fn update_reading_card(
+    fonts: Res<Assets<VelloFont>>,
+    font_handles: Res<ShapingFonts>,
+    state: Res<TimeWellState>,
+    cards: Query<&Card>,
+    mut reading: Query<&mut crate::view::vello_ui_texture::VelloUiScene, With<ReadingCard>>,
+    mut last: Local<Option<ContextId>>,
+) {
+    if state.selected == *last {
+        return;
+    }
+    let Some(font) = fonts.get(&font_handles.mono) else {
+        return; // font still loading; selection unchanged-check will retry
+    };
+    let Ok(mut ui) = reading.single_mut() else {
+        return; // reading card not spawned yet
+    };
+    *last = state.selected;
+
+    ui.built_width = READING_TEX_W;
+    ui.built_height = READING_TEX_H;
+    ui.scene = match state
+        .selected
+        .and_then(|sel| cards.iter().find(|c| c.context_id == sel))
+    {
+        Some(card) => build_card_scene(card, font, READING_TEX_W, READING_TEX_H),
+        None => Scene::new(), // nothing selected → blank plate
+    };
+    ui.version = ui.version.wrapping_add(1);
 }

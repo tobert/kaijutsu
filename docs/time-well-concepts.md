@@ -45,6 +45,18 @@ system/subgraph dives in: that subgraph re-lays-out on the same table with
 its full topology, optimized for itself. Overview never overloads; detail is
 opt-in per subgraph.
 
+> **Refinement (2026-06-17 — keyboard browse + reading slot; engineering in
+> `docs/viz-substrate.md` "Navigation & the reading slot").** The first GPU
+> framing showed ring cards are too small to read and the keyboard only walked
+> the hot rim. So selection became a 2D walk over the rings — **left/right**
+> within a band, **up/down** to hop bands (up warms toward the rim, down cools
+> toward the core), `0–9` still a hot quick-jump — and a **center-bottom reading
+> slot** renders the current selection at full, legible size with the rings
+> staying behind it as the spatial index. This is the keyboard precursor to the
+> mockup-34 JOIN dive: the reading slot *is* the focused card, parked rather than
+> dived-through. (Zooming the whole well to enlarge cards was tried and rejected
+> — it crops the side cards.)
+
 ### Visual grammar
 
 - **Two flow systems, never mixed**: fork lineage descends the well wall

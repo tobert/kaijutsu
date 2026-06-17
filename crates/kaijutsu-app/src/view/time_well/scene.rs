@@ -12,6 +12,7 @@ use kaijutsu_viz::layout::Band;
 
 use super::card::{CardData, WellGeometry};
 use crate::ui::screen::Screen;
+use crate::view::vello_ui_texture::{VelloUiScene, VelloUiTexture, create_vello_texture};
 
 // ============================================================================
 // COMPONENTS
@@ -48,6 +49,12 @@ pub struct TimeWellRoot;
 #[derive(Component)]
 pub struct TimeWellCamera;
 
+/// The center-bottom reading slot: a single large card, parented to the camera
+/// (HUD-stable), that renders the current selection at readable size. Updated by
+/// `text::update_reading_card` on selection change.
+#[derive(Component)]
+pub struct ReadingCard;
+
 /// Where a card wants to be. A smoothing system eases `Transform.translation`
 /// toward this each frame — the "transitions are Bevy's job" stance from the
 /// design doc (no transition system, just a tween on `Transform`).
@@ -69,9 +76,11 @@ pub struct TimeWellState {
     pub geom: WellGeometry,
     /// Shared quad mesh for every card (built lazily on first enter).
     pub card_mesh: Option<Handle<Mesh>>,
-    /// Band-0 (hot) context ids in slot order — what `0–9` address. Rebuilt each
-    /// layout tick.
-    pub hot_order: Vec<ContextId>,
+    /// Each band's context ids in angular slot order (indexed by `Band::index`:
+    /// `[Haystack, RecentConcluded, Hot]`), rebuilt each layout tick. The single
+    /// source of slot order: keyboard nav walks these, `0–9` index the Hot
+    /// vector, and the layout's `order_key` is derived from the same ordering.
+    pub band_order: super::card::BandOrders,
     /// The currently-selected card (highlighted; the target of Enter / `c`).
     pub selected: Option<ContextId>,
     /// Per-context semantic-cluster assignment (id + kernel label), refreshed by
@@ -98,7 +107,9 @@ impl Default for TimeWellState {
         let band1_anchor = std::f64::consts::FRAC_PI_2;
         let config = LayoutConfig {
             // Index order is [Haystack, RecentConcluded, Hot] (Band::index).
-            total_radius: 300.0,
+            // Wider than center-tight so the hot rim reaches out toward the window
+            // edges (Amy 2026-06-17) rather than hugging the middle.
+            total_radius: 420.0,
             band_angles: [
                 BandAngleConfig {
                     start_angle: 0.0,
@@ -120,7 +131,7 @@ impl Default for TimeWellState {
             layout: CompactingBandLayout::new(config),
             geom: WellGeometry::default(),
             card_mesh: None,
-            hot_order: Vec::new(),
+            band_order: [Vec::new(), Vec::new(), Vec::new()],
             selected: None,
             cluster_of: HashMap::new(),
         }
@@ -135,6 +146,15 @@ pub const CARD_HEIGHT: f32 = 40.0;
 /// 4× the quad units, same 1.6 aspect, so text stays crisp when sampled.
 pub const CARD_TEX_W: f32 = 256.0;
 pub const CARD_TEX_H: f32 = 160.0;
+
+/// Reading-slot texture size: a wide bar (~16:3) matching the full-width
+/// bottom-third UI panel it's sampled onto, so text isn't stretched.
+/// `build_card_scene` scales its metrics off the height.
+pub const READING_TEX_W: f32 = 1066.0;
+pub const READING_TEX_H: f32 = 200.0;
+
+/// Fraction of the window height the reading panel occupies (anchored bottom).
+pub const READING_PANEL_FRAC: f32 = 0.33;
 
 /// Exponential-smoothing rate for card motion (higher = snappier).
 const CARD_EASE_RATE: f32 = 8.0;
@@ -155,6 +175,7 @@ pub fn enter_time_well(
     mut commands: Commands,
     mut state: ResMut<TimeWellState>,
     mut meshes: ResMut<Assets<Mesh>>,
+    mut images: ResMut<Assets<Image>>,
     mut ui_cameras: Query<&mut Camera, With<Camera2d>>,
 ) {
     // Build the shared card quad once.
@@ -179,9 +200,9 @@ pub fn enter_time_well(
         Name::new("TimeWellRoot"),
     ));
 
-    // Camera looking down the well's depth axis. The well lives in z ∈ [-400, 0];
-    // sit back far enough to frame the hot rim (radius ≈ 250) and the receding
-    // colder bands.
+    // Camera framing: pulled back and tilted up a touch so the full hot rim
+    // (radius ≈ 420) sits in the top ~two-thirds, above the reading panel; the
+    // colder bands recede behind it.
     commands.spawn((
         TimeWellCamera,
         Camera3d::default(),
@@ -190,8 +211,34 @@ pub fn enter_time_well(
             clear_color: ClearColorConfig::Custom(WELL_BG),
             ..default()
         },
-        Transform::from_xyz(0.0, 0.0, 700.0).looking_at(Vec3::new(0.0, 0.0, -200.0), Vec3::Y),
+        Transform::from_xyz(0.0, 80.0, 920.0).looking_at(Vec3::new(0.0, 80.0, -200.0), Vec3::Y),
         Name::new("TimeWellCamera"),
+    ));
+
+    // Reading slot: a full-width panel across the bottom third, composited over
+    // the well by the order-1 UI camera. It's a 2D UI node (exact placement, no
+    // perspective) sampling the shared RTT texture; `update_reading_card` fills
+    // the texture from the current selection (blank until one exists).
+    let reading_image = create_vello_texture(&mut images, READING_TEX_W as u32, READING_TEX_H as u32);
+    commands.spawn((
+        ReadingCard,
+        Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px(0.0),
+            right: Val::Px(0.0),
+            bottom: Val::Px(0.0),
+            width: Val::Percent(100.0),
+            height: Val::Percent(READING_PANEL_FRAC * 100.0),
+            ..default()
+        },
+        ImageNode::new(reading_image.clone()),
+        VelloUiScene::default(),
+        VelloUiTexture {
+            image: reading_image,
+            width: READING_TEX_W as u32,
+            height: READING_TEX_H as u32,
+        },
+        Name::new("ReadingCard"),
     ));
 
     info!("time-well: entered ({n_ui} ui camera(s) set to overlay)");
@@ -206,9 +253,15 @@ pub fn exit_time_well(
     roots: Query<Entity, With<TimeWellRoot>>,
     cameras: Query<Entity, With<TimeWellCamera>>,
     cards: Query<Entity, With<Card>>,
+    reading: Query<Entity, With<ReadingCard>>,
     mut ui_cameras: Query<&mut Camera, With<Camera2d>>,
 ) {
-    for e in roots.iter().chain(cameras.iter()).chain(cards.iter()) {
+    for e in roots
+        .iter()
+        .chain(cameras.iter())
+        .chain(cards.iter())
+        .chain(reading.iter())
+    {
         commands.entity(e).despawn();
     }
 
@@ -270,10 +323,26 @@ const DIGIT_KEYS: [(KeyCode, usize); 10] = [
     (KeyCode::Digit9, 9),
 ];
 
-/// Band-0 keyboard interaction (the active view): `0–9` select + switch to the
-/// hot card at that slot; arrows/Tab move the selection; Enter switches to the
-/// selected; `c` concludes the selected. Esc (back to conversation) lives in
-/// [`toggle_time_well`].
+/// First selectable card when nothing is selected: the warmest non-empty band's
+/// first slot (Hot → Recent → Haystack).
+fn first_filled_slot(band_order: &super::card::BandOrders) -> Option<ContextId> {
+    [
+        Band::Hot.index(),
+        Band::RecentConcluded.index(),
+        Band::Haystack.index(),
+    ]
+    .into_iter()
+    .find_map(|bi| band_order[bi].first().copied())
+}
+
+/// Time-well keyboard navigation: a 2D walk over the rings.
+/// - `0–9` — hot quick-jump: select + switch + exit (muscle memory).
+/// - **Left/Right/Tab** — move within the current band's angular slot order.
+/// - **Up/Down** — hop bands; Up warms toward the rim (Haystack→Recent→Hot),
+///   Down cools toward the core. Skips empty bands; keeps the nearest slot.
+/// - **Enter** switches to the selection; **`c`** concludes it.
+///
+/// Esc (back to conversation) lives in [`toggle_time_well`].
 pub fn well_keyboard(
     keys: Res<ButtonInput<KeyCode>>,
     mut state: ResMut<TimeWellState>,
@@ -284,7 +353,7 @@ pub fn well_keyboard(
     // `0–9`: jump straight to that hot slot and drop back into the conversation.
     for (kc, n) in DIGIT_KEYS {
         if keys.just_pressed(kc)
-            && let Some(&id) = state.hot_order.get(n)
+            && let Some(&id) = state.band_order[Band::Hot.index()].get(n)
         {
             switch.write(crate::view::components::ContextSwitchRequested { context_id: id });
             next.set(Screen::Conversation);
@@ -292,25 +361,62 @@ pub fn well_keyboard(
         }
     }
 
-    // Arrows / Tab move the selection around the hot ring.
-    let dir = if keys.just_pressed(KeyCode::ArrowDown)
-        || keys.just_pressed(KeyCode::ArrowRight)
-        || keys.just_pressed(KeyCode::Tab)
-    {
+    // Locate the current selection as (band index, slot within band).
+    let current = state.selected.and_then(|sel| {
+        (0..3).find_map(|bi| {
+            state.band_order[bi]
+                .iter()
+                .position(|&x| x == sel)
+                .map(|slot| (bi, slot))
+        })
+    });
+
+    // Up/Down hop bands (+1 = toward Hot/rim); Left/Right/Tab move within a band.
+    // Band-hop takes priority so a stray combined press never double-moves.
+    let hop = if keys.just_pressed(KeyCode::ArrowUp) {
         1i32
-    } else if keys.just_pressed(KeyCode::ArrowUp) || keys.just_pressed(KeyCode::ArrowLeft) {
+    } else if keys.just_pressed(KeyCode::ArrowDown) {
         -1
     } else {
         0
     };
-    if dir != 0 && !state.hot_order.is_empty() {
-        let len = state.hot_order.len() as i32;
-        let cur = state
-            .selected
-            .and_then(|s| state.hot_order.iter().position(|&x| x == s))
-            .unwrap_or(0) as i32;
-        let idx = (((cur + dir) % len) + len) % len;
-        state.selected = Some(state.hot_order[idx as usize]);
+    let within = if keys.just_pressed(KeyCode::ArrowRight) || keys.just_pressed(KeyCode::Tab) {
+        1i32
+    } else if keys.just_pressed(KeyCode::ArrowLeft) {
+        -1
+    } else {
+        0
+    };
+
+    if hop != 0 {
+        match current {
+            Some((bi, slot)) => {
+                // Walk to the nearest non-empty band in the hop direction.
+                let mut tb = bi as i32 + hop;
+                while (0..3).contains(&tb) {
+                    let band = &state.band_order[tb as usize];
+                    if !band.is_empty() {
+                        let idx = slot.min(band.len() - 1);
+                        state.selected = Some(band[idx]);
+                        break;
+                    }
+                    tb += hop;
+                }
+            }
+            None => state.selected = first_filled_slot(&state.band_order),
+        }
+    } else if within != 0 {
+        match current {
+            Some((bi, slot)) => {
+                let band = &state.band_order[bi];
+                if !band.is_empty() {
+                    let len = band.len() as i32;
+                    let idx = (((slot as i32 + within) % len) + len) % len;
+                    state.selected = Some(band[idx as usize]);
+                }
+            }
+            None => state.selected = first_filled_slot(&state.band_order),
+        }
     }
 
     // Enter: switch to the selected card.

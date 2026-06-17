@@ -16,7 +16,7 @@ use kaijutsu_types::ContextId;
 
 use kaijutsu_client::ServerEvent;
 
-use super::card::{ClusterAssignment, assign_bands, card_from, layout_positions, lift};
+use super::card::{ClusterAssignment, assign_bands, band_orders, card_from, layout_positions, lift};
 use super::scene::{CARD_TEX_H, CARD_TEX_W, Card, CardTarget, TimeWellState};
 use crate::connection::{RpcActor, RpcResultChannel, RpcResultMessage, ServerEventMessage};
 use crate::view::vello_ui_texture::{VelloUiScene, VelloUiTexture, create_vello_texture};
@@ -82,28 +82,25 @@ pub fn sync_time_well(
         .map(|c| c.id)
         .zip(bands.iter().copied())
         .collect();
-    // Snapshot the cluster map so we can both pass it to the layout and read
+    // Snapshot the cluster map so we can both feed the slot ordering and read
     // labels in the spawn/refresh loops below without re-borrowing `state`
     // (which those loops mutate). It's haystack-sized — a cheap clone.
     let cluster_of = state.cluster_of.clone();
-    let positions = layout_positions(&contexts, &bands, &cluster_of, &state.layout);
+    // Per-band slot order is the single source of truth: the layout derives every
+    // order_key from it, keyboard nav walks it, and `0–9` index its Hot vector.
+    let orders = band_orders(&contexts, &bands, &cluster_of);
+    let positions = layout_positions(&contexts, &bands, &orders, &state.layout);
+    state.band_order = orders;
 
-    // ── Band-0 slot order: hot ids ascending by id (= the layout's slot order,
-    // since order_key is the id rank). This is what `0–9` address. ──
-    let mut hot_order: Vec<ContextId> = contexts
-        .iter()
-        .filter(|c| band_by_id.get(&c.id) == Some(&kaijutsu_viz::layout::Band::Hot))
-        .map(|c| c.id)
-        .collect();
-    hot_order.sort_unstable();
-    state.hot_order = hot_order;
     // Keep selection valid: drop it if its context left the well; default to the
     // first hot slot when nothing (valid) is selected.
     let selection_valid = state
         .selected
         .is_some_and(|id| state.entities.contains_key(&id) || state.join.contains(&id));
     if !selection_valid {
-        state.selected = state.hot_order.first().copied();
+        state.selected = state.band_order[kaijutsu_viz::layout::Band::Hot.index()]
+            .first()
+            .copied();
     }
 
     // Resolve a target Vec3 per id up front (needs &state.geom).

@@ -483,6 +483,50 @@ throughout.
 
 ---
 
+## Navigation & the reading slot (step 7.5)
+
+The first GPU framing exposed two real problems: cards on the rings are too
+small to *read*, and the keyboard only moved *within* the hot rim — there was no
+way to walk into the colder bands. Pushing the camera closer to enlarge cards
+just crops the side cards (tried; rejected). The fix is two coupled additions
+that together make the well browsable, decided with Amy 2026-06-17:
+
+**Cross-band navigation.** Selection moves on a 2D grid over the rings, not a
+1D hot list:
+- **Left / Right / Tab** — move *within* the current band, in its angular slot
+  order (the same `order_key` ranking the layout uses, so keyboard order ==
+  visual order). Wraps.
+- **Up / Down** — *hop bands*. Up warms toward the rim (Haystack → Recent →
+  Hot), Down cools toward the core (Hot → Recent → Haystack). Landing slot =
+  the nearest index in the target band (clamped), so the selection stays roughly
+  where your eye is.
+- **`0–9`** — unchanged: a hot-rim quick-jump that selects + switches + exits.
+  Muscle memory for "I know which one"; the arrows are the *browse* path.
+- **Enter** switches to the selection; **`c`** concludes it; **Esc** leaves.
+
+This needs each band's slot order, not just the hot list. The per-band order is
+the single source of truth: `card::band_orders(contexts, bands, cluster_of) ->
+[Vec<ContextId>; 3]` (indexed by `Band::index`) produces each band's ids in
+angular slot order, and `layout_positions` derives every entry's `order_key`
+from its index in that vector — so the keyboard, the angle, and the digit
+addressing can never disagree. `TimeWellState.band_order` holds it, rebuilt each
+layout tick (it subsumes the old `hot_order`).
+
+**The reading slot.** A reserved **center-bottom detail card** renders the
+current selection at a readable size while the rings stay behind it as the
+spatial index — the legibility answer that zoom couldn't give. Implementation:
+one `ReadingCard` entity parented to the well camera at a fixed lower-center
+local offset (so it's HUD-stable regardless of camera motion), a larger quad +
+higher-res RTT texture, re-rendered on selection change. To keep one render
+path, `text::build_card_scene` is parameterized by `(w, h)` with font sizes/pad
+derived as fractions of the dimensions — the rim cards pass the small size, the
+reading slot passes a large one, and vello rasterizes both crisply. This is the
+keyboard-driven precursor to the eventual "dive through the focused card → it
+unfolds into the conversation" JOIN transition (mockup 34); the reading slot is
+that focused card, parked rather than dived-through.
+
+---
+
 ## Open questions that remain
 
 The capnp closed events-vs-polling and forest-vs-DAG; the workflow grounding
