@@ -218,6 +218,10 @@ pub struct ContextInfo {
     pub keywords: Vec<String>,
     /// Preview of the most representative block (empty if none).
     pub top_block_preview: Option<String>,
+    /// Live activity, derived kernel-side from the context's block statuses:
+    /// `Running` = actively working, `Error` = its most recent turn failed, else
+    /// `Pending` (idle). Drives the time-well card pulse. Defaults to `Pending`.
+    pub live_status: Status,
 }
 
 /// A context returned by semantic search (`search_similar`) or neighbor lookup
@@ -2104,6 +2108,13 @@ fn parse_context_info(
         None
     };
 
+    let live_status = match reader.get_live_status()? {
+        crate::kaijutsu_capnp::Status::Pending => Status::Pending,
+        crate::kaijutsu_capnp::Status::Running => Status::Running,
+        crate::kaijutsu_capnp::Status::Done => Status::Done,
+        crate::kaijutsu_capnp::Status::Error => Status::Error,
+    };
+
     Ok(ContextInfo {
         id,
         label,
@@ -2118,6 +2129,7 @@ fn parse_context_info(
         concluded_at,
         keywords,
         top_block_preview,
+        live_status,
     })
 }
 

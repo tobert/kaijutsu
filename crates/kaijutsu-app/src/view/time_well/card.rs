@@ -336,6 +336,7 @@ mod tests {
             concluded_at: None,
             keywords: Vec::new(),
             top_block_preview: None,
+            live_status: kaijutsu_types::Status::Pending,
         }
     }
 

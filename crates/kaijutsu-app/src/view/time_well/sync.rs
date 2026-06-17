@@ -14,11 +14,9 @@ use bevy::prelude::*;
 use kaijutsu_client::ContextInfo;
 use kaijutsu_types::ContextId;
 
-use kaijutsu_client::ServerEvent;
-
 use super::card::{ClusterAssignment, assign_bands, band_orders, card_from, layout_positions, lift};
 use super::scene::{CARD_TEX_H, CARD_TEX_W, Card, CardTarget, TimeWellState};
-use crate::connection::{RpcActor, RpcResultChannel, RpcResultMessage, ServerEventMessage};
+use crate::connection::{RpcActor, RpcResultChannel, RpcResultMessage};
 use crate::view::vello_ui_texture::{VelloUiScene, VelloUiTexture, create_vello_texture};
 
 /// Reconcile the well against the latest polled context list.
@@ -149,7 +147,10 @@ pub fn sync_time_well(
                 Card {
                     context_id: id,
                     data,
-                    status: None,
+                    // Live activity comes straight off the poll now (kernel-derived,
+                    // see `ContextInfo.live_status`) — covers every visible card, not
+                    // just the active context. Drives the card pulse.
+                    status: Some(info.live_status),
                     selected: false,
                     in_lineage: false,
                 },
@@ -194,34 +195,11 @@ pub fn sync_time_well(
             if card.data != next {
                 card.data = next;
             }
-        }
-    }
-}
-
-/// The **data tick**: map block status events onto the matching card's `status`.
-///
-/// Taps the app's existing `ServerEvent` stream (the same one drift listens to).
-/// A status change mutates only `Card.status` — never the entity set or
-/// positions — so it triggers a card-scene rebuild (the status glyph) but never
-/// a relayout, honoring the two-cadence split from `docs/viz-substrate.md`.
-///
-/// Coverage note: this reflects only contexts the app is *already subscribed to*
-/// (active / cached). A dedicated `subscribeBlocksFiltered` over the full visible
-/// set — so every rim card pulses — is the documented follow-up (gap 3).
-pub fn apply_block_status(
-    mut events: MessageReader<ServerEventMessage>,
-    mut cards: Query<&mut Card>,
-) {
-    for ServerEventMessage(ev) in events.read() {
-        let ServerEvent::BlockStatusChanged {
-            context_id, status, ..
-        } = ev
-        else {
-            continue;
-        };
-        for mut card in cards.iter_mut() {
-            if card.context_id == *context_id && card.status != Some(*status) {
-                card.status = Some(*status);
+            // Live status rides the same poll; same change-guard so the pulse
+            // flips without re-rasterizing static cards every poll.
+            let next_status = Some(info.live_status);
+            if card.status != next_status {
+                card.status = next_status;
             }
         }
     }

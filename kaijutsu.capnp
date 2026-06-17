@@ -438,6 +438,7 @@ struct ContextHandleInfo {
   contextState @11 :Text;         # "live"/"staging"/"concluded"/"archived" (default "live")
   contextType @12 :Text;          # rc bucket / mode bundle (default "default")
   concludedAt @13 :UInt64;        # 0 = not concluded, else Unix millis of the explicit `conclude` act
+  liveStatus @14 :Status;         # live activity: running (working) / error (last turn failed) / else idle
 }
 
 struct PresetInfo {

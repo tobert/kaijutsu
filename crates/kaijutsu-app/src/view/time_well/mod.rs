@@ -39,7 +39,6 @@ impl Plugin for TimeWellPlugin {
                     sync::poll_clusters,
                     sync::apply_clusters,
                     sync::sync_time_well,
-                    sync::apply_block_status,
                     text::build_card_scenes,
                     text::update_reading_card,
                     scene::move_cards_toward_target,

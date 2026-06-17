@@ -2689,6 +2689,7 @@ impl kernel::Server for KernelImpl {
         let kernel_db_arc = self.kernel.kernel_db.clone();
         let _kernel_id = self.kernel.id;
         let semantic_index = self.kernel.semantic_index.clone();
+        let documents = self.kernel.documents.clone();
 
         let span = extract_rpc_trace(pry!(params.get()).get_trace(), "list_contexts");
         Promise::from_future(
@@ -2747,6 +2748,20 @@ impl kernel::Server for KernelImpl {
                             c.set_top_block_preview(preview);
                         }
                     }
+
+                    // Live activity for the time-well pulse (Running = working,
+                    // Error = last turn failed). Derived from the context's block
+                    // statuses in timeline order; computed kernel-side so the client
+                    // stays thin. (Per-poll full snapshot is fine at this scale; a
+                    // cached per-context status is the optimization if it bites.)
+                    let live = match documents.block_snapshots(ctx.id) {
+                        Ok(blocks) => {
+                            let statuses: Vec<_> = blocks.iter().map(|b| b.status).collect();
+                            derive_context_live_status(&statuses)
+                        }
+                        Err(_) => kaijutsu_crdt::Status::Pending,
+                    };
+                    c.set_live_status(status_to_capnp(live));
                 }
 
                 Ok(())
@@ -6889,6 +6904,27 @@ fn parse_block_event_filter(
     }
 }
 
+/// Derive a context's *live* status from its block statuses in timeline order
+/// (as returned by `block_snapshots`, i.e. `blocks_ordered`):
+///
+/// - any block `Running` → `Running` (the context is actively working);
+/// - else the tail block `Error` → `Error` (its most recent turn failed);
+/// - else `Pending` (idle — no rim in the time well).
+///
+/// Non-sticky by construction: a new turn appends a `Running` block, so a past
+/// error is superseded the moment work resumes. Pure over the ordered statuses
+/// so it is unit-testable without a block store.
+fn derive_context_live_status(statuses_in_order: &[kaijutsu_crdt::Status]) -> kaijutsu_crdt::Status {
+    use kaijutsu_crdt::Status;
+    if statuses_in_order.iter().any(|s| *s == Status::Running) {
+        Status::Running
+    } else if statuses_in_order.last() == Some(&Status::Error) {
+        Status::Error
+    } else {
+        Status::Pending
+    }
+}
+
 /// Convert a CRDT Status to Cap'n Proto Status.
 fn status_to_capnp(status: kaijutsu_crdt::Status) -> crate::kaijutsu_capnp::Status {
     match status {
@@ -7395,6 +7431,60 @@ impl vfs::Server for VfsImpl {
 // ============================================================================
 // Synthesis (Rhai-driven keyword extraction + representative block selection)
 // ============================================================================
+
+#[cfg(test)]
+mod live_status_tests {
+    //! `derive_context_live_status` — the per-context pulse signal the time well
+    //! reads off `listContexts`. Locks in the running-wins / error-only-if-tail /
+    //! non-sticky semantics.
+    use super::derive_context_live_status;
+    use kaijutsu_crdt::Status;
+
+    #[test]
+    fn empty_is_idle() {
+        assert_eq!(derive_context_live_status(&[]), Status::Pending);
+    }
+
+    #[test]
+    fn all_done_is_idle() {
+        assert_eq!(
+            derive_context_live_status(&[Status::Done, Status::Done]),
+            Status::Pending
+        );
+    }
+
+    #[test]
+    fn any_running_wins() {
+        // A running block anywhere means the context is actively working, even if
+        // the tail block is already Done or the head errored earlier.
+        assert_eq!(
+            derive_context_live_status(&[Status::Done, Status::Running, Status::Done]),
+            Status::Running
+        );
+        assert_eq!(
+            derive_context_live_status(&[Status::Error, Status::Running]),
+            Status::Running
+        );
+    }
+
+    #[test]
+    fn tail_error_is_error() {
+        assert_eq!(
+            derive_context_live_status(&[Status::Done, Status::Error]),
+            Status::Error
+        );
+    }
+
+    #[test]
+    fn non_tail_error_is_superseded() {
+        // An error that is not the most recent block has been superseded by later
+        // work — no red rim. (Non-sticky: a new turn appended Done after it.)
+        assert_eq!(
+            derive_context_live_status(&[Status::Error, Status::Done]),
+            Status::Pending
+        );
+    }
+}
 
 #[cfg(test)]
 mod connection_state_tests {
