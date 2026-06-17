@@ -104,6 +104,37 @@ pub struct SearchResult {
 pub struct ClusterInfo {
     pub cluster_id: usize,
     pub context_ids: Vec<ContextId>,
+    /// Kernel-synthesized label for the cluster (the top keyword shared across
+    /// its members), or `None` when no member has synthesis keywords.
+    pub label: Option<String>,
+}
+
+/// Pick a cluster label from its members' synthesis keywords.
+///
+/// Tallies each keyword's summed score across all members and returns the
+/// highest-scoring term. Score ties break alphabetically (smaller term wins) so
+/// the label is deterministic regardless of member iteration order. Returns
+/// `None` when no member contributed any keyword.
+fn pick_cluster_label<'a>(
+    member_keywords: impl IntoIterator<Item = &'a [(String, f32)]>,
+) -> Option<String> {
+    let mut totals: std::collections::HashMap<&str, f32> = std::collections::HashMap::new();
+    for kws in member_keywords {
+        for (term, score) in kws {
+            *totals.entry(term.as_str()).or_insert(0.0) += *score;
+        }
+    }
+    totals
+        .into_iter()
+        .max_by(|(a_term, a_score), (b_term, b_score)| {
+            a_score
+                .partial_cmp(b_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                // On a score tie, the alphabetically smaller term should win, so
+                // it must compare as "greater" for max_by: compare b's term to a's.
+                .then_with(|| b_term.cmp(a_term))
+        })
+        .map(|(term, _)| term.to_string())
 }
 
 // ============================================================================
@@ -306,9 +337,18 @@ impl SemanticIndex {
                 }
             }
             if !context_ids.is_empty() {
+                // Synthesize a label from members' keywords (kernel-side, so the
+                // client just renders it — see thin-client/smart-kernel rule).
+                let synth = self.synthesis_cache();
+                let kw_lists: Vec<Vec<(String, f32)>> = context_ids
+                    .iter()
+                    .filter_map(|id| synth.get_any(*id).map(|s| s.keywords))
+                    .collect();
+                let label = pick_cluster_label(kw_lists.iter().map(|v| v.as_slice()));
                 clusters.push(ClusterInfo {
                     cluster_id,
                     context_ids,
+                    label,
                 });
             }
         }
@@ -360,6 +400,44 @@ mod tests {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     use tempfile::TempDir;
+
+    fn kw(pairs: &[(&str, f32)]) -> Vec<(String, f32)> {
+        pairs.iter().map(|(t, s)| (t.to_string(), *s)).collect()
+    }
+
+    #[test]
+    fn cluster_label_picks_highest_summed_keyword() {
+        // "rust" totals 0.6+0.5=1.1 across two members; "async" only 0.9; "gpu" 0.4.
+        let m1 = kw(&[("rust", 0.6), ("gpu", 0.4)]);
+        let m2 = kw(&[("rust", 0.5), ("async", 0.9)]);
+        let label = pick_cluster_label([m1.as_slice(), m2.as_slice()]);
+        assert_eq!(label.as_deref(), Some("rust"));
+    }
+
+    #[test]
+    fn cluster_label_breaks_score_ties_alphabetically() {
+        // Both terms total 1.0; the alphabetically smaller ("alpha") wins,
+        // regardless of member order.
+        let m1 = kw(&[("zeta", 1.0)]);
+        let m2 = kw(&[("alpha", 1.0)]);
+        assert_eq!(
+            pick_cluster_label([m1.as_slice(), m2.as_slice()]).as_deref(),
+            Some("alpha")
+        );
+        assert_eq!(
+            pick_cluster_label([m2.as_slice(), m1.as_slice()]).as_deref(),
+            Some("alpha")
+        );
+    }
+
+    #[test]
+    fn cluster_label_none_when_no_keywords() {
+        let empty: Vec<Vec<(String, f32)>> = vec![vec![], vec![]];
+        assert_eq!(
+            pick_cluster_label(empty.iter().map(|v| v.as_slice())),
+            None
+        );
+    }
 
     /// Deterministic mock embedder for testing.
     ///

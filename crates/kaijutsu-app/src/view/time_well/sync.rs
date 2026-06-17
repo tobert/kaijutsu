@@ -16,9 +16,9 @@ use kaijutsu_types::ContextId;
 
 use kaijutsu_client::ServerEvent;
 
-use super::card::{assign_bands, card_from, layout_positions, lift};
+use super::card::{ClusterAssignment, assign_bands, card_from, layout_positions, lift};
 use super::scene::{CARD_TEX_H, CARD_TEX_W, Card, CardTarget, TimeWellState};
-use crate::connection::ServerEventMessage;
+use crate::connection::{RpcActor, RpcResultChannel, RpcResultMessage, ServerEventMessage};
 use crate::view::vello_ui_texture::{VelloUiScene, VelloUiTexture, create_vello_texture};
 
 /// Reconcile the well against the latest polled context list.
@@ -82,7 +82,11 @@ pub fn sync_time_well(
         .map(|c| c.id)
         .zip(bands.iter().copied())
         .collect();
-    let positions = layout_positions(&contexts, &bands, &state.layout);
+    // Snapshot the cluster map so we can both pass it to the layout and read
+    // labels in the spawn/refresh loops below without re-borrowing `state`
+    // (which those loops mutate). It's haystack-sized — a cheap clone.
+    let cluster_of = state.cluster_of.clone();
+    let positions = layout_positions(&contexts, &bands, &cluster_of, &state.layout);
 
     // ── Band-0 slot order: hot ids ascending by id (= the layout's slot order,
     // since order_key is the id rank). This is what `0–9` address. ──
@@ -125,7 +129,8 @@ pub fn sync_time_well(
             .get(&id)
             .copied()
             .unwrap_or(kaijutsu_viz::layout::Band::Hot);
-        let data = card_from(&info, band);
+        let cluster_label = cluster_of.get(&id).map(|a| a.label.clone());
+        let data = card_from(&info, band, cluster_label);
         let pos = target_of(&id).unwrap_or(Vec3::ZERO);
 
         // Per-card RTT texture: the vello scene (accent bg + text, built by
@@ -155,6 +160,7 @@ pub fn sync_time_well(
                     data,
                     status: None,
                     selected: false,
+                    in_lineage: false,
                 },
                 CardTarget(pos),
                 Mesh3d(card_mesh.clone()),
@@ -188,7 +194,8 @@ pub fn sync_time_well(
             let band = band_by_id.get(&id).copied().unwrap_or(card.data.band);
             // Only rewrite when the derived card actually changed, so `Changed<Card>`
             // (the scene-rebuild trigger) doesn't fire every poll for static cards.
-            let next = card_from(info, band);
+            let cluster_label = cluster_of.get(&id).map(|a| a.label.clone());
+            let next = card_from(info, band, cluster_label);
             if card.data != next {
                 card.data = next;
             }
@@ -221,6 +228,79 @@ pub fn apply_block_status(
             if card.context_id == *context_id && card.status != Some(*status) {
                 card.status = Some(*status);
             }
+        }
+    }
+}
+
+/// How often to poll semantic clusters for the haystack (seconds). Clusters
+/// change slowly, so this is a coarse cadence — independent of the drift poll.
+const CLUSTER_POLL_INTERVAL: f64 = 8.0;
+
+/// Smallest cluster the haystack cares about — pairs and up; a singleton isn't a
+/// cluster worth grouping or labeling.
+const MIN_CLUSTER_SIZE: u32 = 2;
+
+/// Poll semantic clusters (the band-2 angle + label source) while the well is
+/// open.
+///
+/// Mirrors `ui::drift::poll_drift_state`: clone the handle, spawn an IO task,
+/// ship the result back over `RpcResultChannel`. Throttled and well-only (the
+/// haystack is the only consumer). An empty result — e.g. the kernel has no
+/// semantic index — is fine: band-2 then falls back to creation-id order.
+pub fn poll_clusters(
+    actor: Option<Res<RpcActor>>,
+    time: Res<Time>,
+    mut last_poll: Local<f64>,
+    result_channel: Res<RpcResultChannel>,
+) {
+    let Some(actor) = actor else { return };
+    let elapsed = time.elapsed_secs_f64();
+    if elapsed - *last_poll < CLUSTER_POLL_INTERVAL {
+        return;
+    }
+    *last_poll = elapsed;
+
+    let handle = actor.handle.clone();
+    let tx = result_channel.sender();
+    bevy::tasks::IoTaskPool::get()
+        .spawn(async move {
+            match handle.get_clusters(MIN_CLUSTER_SIZE).await {
+                Ok(clusters) => {
+                    let _ = tx.send(RpcResultMessage::ClustersReceived { clusters });
+                }
+                Err(e) => log::debug!("time-well: get_clusters failed: {e}"),
+            }
+        })
+        .detach();
+}
+
+/// Drain `ClustersReceived` into `TimeWellState.cluster_of` (id → assignment).
+///
+/// A separate `MessageReader` from drift's drain — Bevy readers keep independent
+/// cursors, so this doesn't steal events from the drift drain. Each event is a
+/// complete cluster snapshot, so we rebuild the whole id→assignment map.
+pub fn apply_clusters(
+    mut state: ResMut<TimeWellState>,
+    mut events: MessageReader<RpcResultMessage>,
+) {
+    for ev in events.read() {
+        if let RpcResultMessage::ClustersReceived { clusters } = ev {
+            let mut map: HashMap<ContextId, ClusterAssignment> = HashMap::new();
+            for c in clusters {
+                let assignment = ClusterAssignment {
+                    cluster_id: c.cluster_id,
+                    label: c.label.clone(),
+                };
+                for id in &c.context_ids {
+                    map.insert(*id, assignment.clone());
+                }
+            }
+            debug!(
+                "time-well clusters: {} clusters, {} contexts assigned",
+                clusters.len(),
+                map.len()
+            );
+            state.cluster_of = map;
         }
     }
 }

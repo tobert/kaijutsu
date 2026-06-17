@@ -126,6 +126,11 @@ pub enum RpcResultMessage {
     DriftQueueReceived {
         staged: Vec<kaijutsu_client::StagedDriftInfo>,
     },
+    /// Semantic clusters received (time-well band-2 poll). Drained into
+    /// `TimeWellState.clusters` to drive the haystack's cluster-grouped angle.
+    ClustersReceived {
+        clusters: Vec<kaijutsu_client::ContextCluster>,
+    },
     /// Input document state received (for initializing SyncedInput on context join).
     InputStateReceived {
         context_id: ContextId,

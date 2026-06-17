@@ -220,6 +220,26 @@ pub struct ContextInfo {
     pub top_block_preview: Option<String>,
 }
 
+/// A context returned by semantic search (`search_similar`) or neighbor lookup
+/// (`get_neighbors`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SimilarContext {
+    pub context_id: ContextId,
+    /// Cosine similarity in `[0.0, 1.0]`.
+    pub score: f32,
+    /// Context label, or empty string if the kernel had none.
+    pub label: String,
+}
+
+/// A semantic cluster of contexts (`get_clusters`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContextCluster {
+    pub cluster_id: u32,
+    pub context_ids: Vec<ContextId>,
+    /// Kernel-synthesized label (top shared keyword), or empty string if none.
+    pub label: String,
+}
+
 /// Preset template info from the server.
 #[derive(Debug, Clone)]
 pub struct PresetInfo {
@@ -318,6 +338,89 @@ impl KernelHandle {
             result.push(parse_context_info(&ctx)?);
         }
         Ok(result)
+    }
+
+    /// Semantic search: find contexts similar to a free-text query.
+    ///
+    /// Returns up to `k` results ranked by cosine similarity. Empty when the
+    /// kernel has no semantic index.
+    #[tracing::instrument(skip(self, query), name = "rpc_client.search_similar")]
+    pub async fn search_similar(
+        &self,
+        query: &str,
+        k: u32,
+    ) -> Result<Vec<SimilarContext>, RpcError> {
+        let mut request = self.kernel.search_similar_request();
+        request.get().set_query(query);
+        request.get().set_k(k);
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        let response = request.send().promise.await?;
+        let results = response.get()?.get_results()?;
+        let mut out = Vec::with_capacity(results.len() as usize);
+        for r in results.iter() {
+            out.push(parse_similar_context(&r)?);
+        }
+        Ok(out)
+    }
+
+    /// Find contexts semantically similar to a given context.
+    ///
+    /// Returns up to `k` neighbors ranked by cosine similarity. Empty when the
+    /// kernel has no semantic index.
+    #[tracing::instrument(skip(self), name = "rpc_client.get_neighbors")]
+    pub async fn get_neighbors(
+        &self,
+        context_id: ContextId,
+        k: u32,
+    ) -> Result<Vec<SimilarContext>, RpcError> {
+        let mut request = self.kernel.get_neighbors_request();
+        request.get().set_context_id(context_id.as_bytes());
+        request.get().set_k(k);
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        let response = request.send().promise.await?;
+        let results = response.get()?.get_results()?;
+        let mut out = Vec::with_capacity(results.len() as usize);
+        for r in results.iter() {
+            out.push(parse_similar_context(&r)?);
+        }
+        Ok(out)
+    }
+
+    /// Group contexts into semantic clusters.
+    ///
+    /// Only clusters with at least `min_cluster_size` members are returned; each
+    /// carries a kernel-synthesized [`label`](ContextCluster::label). Empty when
+    /// the kernel has no semantic index.
+    #[tracing::instrument(skip(self), name = "rpc_client.get_clusters")]
+    pub async fn get_clusters(
+        &self,
+        min_cluster_size: u32,
+    ) -> Result<Vec<ContextCluster>, RpcError> {
+        let mut request = self.kernel.get_clusters_request();
+        request.get().set_min_cluster_size(min_cluster_size);
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        let response = request.send().promise.await?;
+        let clusters = response.get()?.get_clusters()?;
+        let mut out = Vec::with_capacity(clusters.len() as usize);
+        for c in clusters.iter() {
+            out.push(parse_context_cluster(&c)?);
+        }
+        Ok(out)
     }
 
     /// Create a new context with an optional label.
@@ -1906,6 +2009,33 @@ fn parse_kernel_id(data: &[u8]) -> Result<KernelId, RpcError> {
             "invalid kernel ID: expected 16 bytes, got {}",
             data.len()
         ))
+    })
+}
+
+/// Parse a `SimilarContext` from the wire (search/neighbor results).
+fn parse_similar_context(
+    reader: &crate::kaijutsu_capnp::similar_context::Reader<'_>,
+) -> Result<SimilarContext, RpcError> {
+    Ok(SimilarContext {
+        context_id: parse_context_id(reader.get_context_id()?)?,
+        score: reader.get_score(),
+        label: reader.get_label()?.to_string()?,
+    })
+}
+
+/// Parse a `ContextCluster` from the wire (`get_clusters`).
+fn parse_context_cluster(
+    reader: &crate::kaijutsu_capnp::context_cluster::Reader<'_>,
+) -> Result<ContextCluster, RpcError> {
+    let ids = reader.get_context_ids()?;
+    let mut context_ids = Vec::with_capacity(ids.len() as usize);
+    for id in ids.iter() {
+        context_ids.push(parse_context_id(id?)?);
+    }
+    Ok(ContextCluster {
+        cluster_id: reader.get_cluster_id(),
+        context_ids,
+        label: reader.get_label()?.to_string()?,
     })
 }
 

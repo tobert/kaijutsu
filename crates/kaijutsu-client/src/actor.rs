@@ -72,9 +72,9 @@ use crate::constants::{
     SUBSCRIBE_TIMEOUT,
 };
 use crate::rpc::{
-    Completion, ContextInfo, HistoryEntry, Identity, InputState, KernelInfo, LlmConfigInfo,
-    McpResource, McpToolResult, ShellValue, StagedDriftInfo, SubmitResult,
-    SyncState, ToolResult, ToolSchema, VersionSnapshot,
+    Completion, ContextCluster, ContextInfo, HistoryEntry, Identity, InputState, KernelInfo,
+    LlmConfigInfo, McpResource, McpToolResult, ShellValue, SimilarContext, StagedDriftInfo,
+    SubmitResult, SyncState, ToolResult, ToolSchema, VersionSnapshot,
 };
 use crate::subscriptions::{
     BlockEventsForwarder, ConnectionStatus, ResourceEventsForwarder, ServerEvent,
@@ -296,6 +296,20 @@ enum RpcCommand {
     Conclude {
         context_id: ContextId,
         reply: oneshot::Sender<Result<(), CallError>>,
+    },
+    SearchSimilar {
+        query: String,
+        k: u32,
+        reply: oneshot::Sender<Result<Vec<SimilarContext>, CallError>>,
+    },
+    GetNeighbors {
+        context_id: ContextId,
+        k: u32,
+        reply: oneshot::Sender<Result<Vec<SimilarContext>, CallError>>,
+    },
+    GetClusters {
+        min_cluster_size: u32,
+        reply: oneshot::Sender<Result<Vec<ContextCluster>, CallError>>,
     },
     CreateContext {
         label: String,
@@ -551,6 +565,9 @@ impl RpcCommand {
             Self::GetContextId { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ListContexts { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::Conclude { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::SearchSimilar { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::GetNeighbors { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::GetClusters { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::CreateContext { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::PushOps { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetBlocks { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -680,6 +697,37 @@ impl ActorHandle {
     #[tracing::instrument(skip(self))]
     pub async fn conclude(&self, context_id: ContextId) -> Result<(), CallError> {
         self.send(|reply| RpcCommand::Conclude { context_id, reply }).await
+    }
+
+    /// Semantic search: contexts similar to a free-text query (top `k`).
+    #[tracing::instrument(skip(self, query))]
+    pub async fn search_similar(
+        &self,
+        query: &str,
+        k: u32,
+    ) -> Result<Vec<SimilarContext>, CallError> {
+        let query = query.to_string();
+        self.send(|reply| RpcCommand::SearchSimilar { query, k, reply }).await
+    }
+
+    /// Contexts semantically similar to a given context (top `k` neighbors).
+    #[tracing::instrument(skip(self))]
+    pub async fn get_neighbors(
+        &self,
+        context_id: ContextId,
+        k: u32,
+    ) -> Result<Vec<SimilarContext>, CallError> {
+        self.send(|reply| RpcCommand::GetNeighbors { context_id, k, reply }).await
+    }
+
+    /// Semantic clusters of contexts (only clusters with ≥ `min_cluster_size`
+    /// members; each kernel-labeled).
+    #[tracing::instrument(skip(self))]
+    pub async fn get_clusters(
+        &self,
+        min_cluster_size: u32,
+    ) -> Result<Vec<ContextCluster>, CallError> {
+        self.send(|reply| RpcCommand::GetClusters { min_cluster_size, reply }).await
     }
 
     #[tracing::instrument(skip(self))]
@@ -2084,6 +2132,15 @@ async fn dispatch_kernel_command(
         }
         RpcCommand::Conclude { context_id, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.conclude(context_id));
+        }
+        RpcCommand::SearchSimilar { query, k: topk, reply } => {
+            dispatch!(kernel, reply, close_tx, k, k.search_similar(&query, topk));
+        }
+        RpcCommand::GetNeighbors { context_id, k: topk, reply } => {
+            dispatch!(kernel, reply, close_tx, k, k.get_neighbors(context_id, topk));
+        }
+        RpcCommand::GetClusters { min_cluster_size, reply } => {
+            dispatch!(kernel, reply, close_tx, k, k.get_clusters(min_cluster_size));
         }
         RpcCommand::CreateContext {
             label,

@@ -183,6 +183,38 @@ fn build_card_scene(card: &Card, font: &VelloFont) -> Scene {
         draw_layout(&mut scene, &l, (PAD as f64, y as f64), &brush);
     }
 
+    // ── Cluster label (haystack only): a bottom-anchored tag naming the semantic
+    // cluster this card was grouped into (`get_clusters`, kernel-synthesized).
+    // Only set for band-2 cards, so it doubles as the haystack's visual signal. ──
+    if let Some(cluster) = &data.cluster_label {
+        let style = VelloTextStyle {
+            font_size: 13.0,
+            ..default()
+        };
+        let text = format!("◇ {cluster}");
+        let l = font.layout(&text, &style, VelloTextAlign::Left, max_advance);
+        let lh = l.height();
+        let fy = h - PAD - lh; // anchor to the bottom edge
+        let brush = bevy_color_to_brush(Color::srgba(0.86, 0.93, 1.0, 0.95));
+        draw_layout(&mut scene, &l, (PAD as f64, fy as f64), &brush);
+    }
+
+    // ── Lineage ring: an amber edge marking a fork-ancestor of the selection
+    // (the on-demand lineage overlay). Distinct hue from the blue selection ring
+    // so ancestry reads apart from the selection itself; a card is never both
+    // (ancestors exclude the selected card). Opaque for the same Mask-alpha
+    // reason as the selection ring. ──
+    if card.in_lineage {
+        let ring = RoundedRect::new(3.5, 3.5, (w - 3.5) as f64, (h - 3.5) as f64, 13.0);
+        scene.stroke(
+            &Stroke::new(5.0),
+            Affine::IDENTITY,
+            &Brush::Solid(VColor::new([0.95, 0.70, 0.20, 1.0])),
+            None,
+            &ring,
+        );
+    }
+
     // ── Selection ring (drawn last, on top): a saturated outer halo stroke under
     // a bright inner edge, reading as a glow around the card. Both strokes are
     // opaque on purpose — the card material is `AlphaMode::Mask(0.5)`, which clamps

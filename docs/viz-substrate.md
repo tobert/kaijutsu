@@ -449,9 +449,30 @@ first concrete consumer. The remaining steps are the `conclude` wire work
    migrates the selected card hot→recent. *Remaining for step 6:* band-1 angle
    refinement (the "clock" vs newest-first sweep — open question #2); the
    selection highlight could be richer than a scale bump.
-7. **Haystack view** = band 2 as the second concrete consumer (semantic; wire in
-   `searchSimilar`/`getNeighbors`/`getClusters`, cluster labels, on-demand
-   lineage, drift-particle layer + its wire additions).
+7. 🟡 **Haystack view** = band 2 as the second concrete consumer (semantic).
+   Shipped this slice:
+   - **Client RPC surface** (7a): `search_similar` / `get_neighbors` /
+     `get_clusters` on `KernelHandle` + `ActorHandle` (the server impls already
+     existed against `kernel.semantic_index`; the client just didn't expose
+     them). New `SimilarContext` / `ContextCluster` client types.
+   - **Cluster labels are kernel-synthesized** (thin-client rule): a new
+     `ContextCluster.label @2` wire field; the index's `clusters()` derives the
+     label from members' synthesis keywords (top summed term, alpha-tiebroken)
+     and the server copies it to the wire. The app never derives labels.
+   - **Band-2 semantic angle** (7b): the well polls `get_clusters` on a coarse
+     well-only cadence; haystack `order_key` now groups same-cluster contexts
+     angularly adjacent (`card::haystack_order_keys`) instead of creation-id
+     order — band-2 angle finally encodes semantic cluster. Empty clusters (no
+     semantic index) fall back to id order. Haystack cards render a `◇ <label>`
+     footer tag.
+   - **On-demand lineage overlay** (7c): selecting a card lights up its
+     fork-ancestry (`card::ancestors` walks `forked_from`, cycle-safe) with an
+     amber ring distinct from the blue selection ring. No wire change.
+   - *Remaining for step 7:* the **drift-particle layer** (needs the
+     context→context drift-edge wire addition — gap 4, deferred); richer
+     per-cluster label placement (currently per-card footer, not a cluster arc);
+     wiring `search_similar`/`get_neighbors` into an app affordance (the surface
+     exists, no consumer yet).
 8. **ViewSpec**: extract from the two consumers now that both exist.
 
 `fjadra` (pure-Rust d3-force port) only if a free-form *relational* view proves

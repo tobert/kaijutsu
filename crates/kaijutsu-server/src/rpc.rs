@@ -4651,6 +4651,9 @@ impl kernel::Server for KernelImpl {
                 for (i, c) in clusters.iter().enumerate() {
                     let mut entry = list.reborrow().get(i as u32);
                     entry.set_cluster_id(c.cluster_id as u32);
+                    if let Some(ref label) = c.label {
+                        entry.set_label(label);
+                    }
                     let mut ids = entry.init_context_ids(c.context_ids.len() as u32);
                     for (j, ctx_id) in c.context_ids.iter().enumerate() {
                         ids.set(j as u32, ctx_id.as_bytes());

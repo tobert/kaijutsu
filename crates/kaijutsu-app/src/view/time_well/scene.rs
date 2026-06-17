@@ -32,6 +32,11 @@ pub struct Card {
     /// [`highlight_selection`] only when it actually changes, so a card's scene
     /// rebuilds on select/deselect but not every frame.
     pub selected: bool,
+    /// Whether this card is a fork-ancestor of the current selection. Drives the
+    /// lineage ring (distinct from the selection ring); flipped by
+    /// [`highlight_lineage`] only on change, same rebuild discipline as
+    /// `selected`.
+    pub in_lineage: bool,
 }
 
 /// Parent entity owning all card entities + the well camera. Despawned (with its
@@ -69,6 +74,11 @@ pub struct TimeWellState {
     pub hot_order: Vec<ContextId>,
     /// The currently-selected card (highlighted; the target of Enter / `c`).
     pub selected: Option<ContextId>,
+    /// Per-context semantic-cluster assignment (id + kernel label), refreshed by
+    /// the band-2 `get_clusters` poll. Drives the haystack's cluster-grouped
+    /// angle and the cluster label on haystack cards. Empty when the kernel has
+    /// no semantic index — band-2 then falls back to creation-id order.
+    pub cluster_of: HashMap<ContextId, super::card::ClusterAssignment>,
 }
 
 impl Default for TimeWellState {
@@ -112,6 +122,7 @@ impl Default for TimeWellState {
             card_mesh: None,
             hot_order: Vec::new(),
             selected: None,
+            cluster_of: HashMap::new(),
         }
     }
 }
@@ -370,6 +381,29 @@ pub fn highlight_selection(
         let s = tf.scale.x;
         let eased = s + (target - s) * 0.25;
         tf.scale = Vec3::splat(eased);
+    }
+}
+
+/// On-demand lineage overlay: light up the fork-ancestry of the selection.
+///
+/// Walks the selected context's `forked_from` chain (via the join's
+/// `ContextInfo`) and flags each ancestor card's `in_lineage`. Like
+/// [`highlight_selection`], the flag is written only when it flips, so the
+/// lineage ring rebuilds on select-change without re-rasterizing every frame.
+/// Nothing selected → no lineage.
+pub fn highlight_lineage(state: Res<TimeWellState>, mut cards: Query<&mut Card>) {
+    use std::collections::HashSet;
+    let lineage: HashSet<ContextId> = match state.selected {
+        Some(sel) => super::card::ancestors(sel, |id| {
+            state.join.get(&id).and_then(|c| c.forked_from)
+        }),
+        None => HashSet::new(),
+    };
+    for mut card in cards.iter_mut() {
+        let in_lin = lineage.contains(&card.context_id);
+        if card.in_lineage != in_lin {
+            card.in_lineage = in_lin;
+        }
     }
 }
 

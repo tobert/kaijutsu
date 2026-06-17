@@ -83,6 +83,18 @@ pub struct CardData {
     pub band: Band,
     /// Parent context for lineage overlay (`None` for a root).
     pub forked_from: Option<ContextId>,
+    /// Kernel-synthesized semantic-cluster label, set only for haystack (band-2)
+    /// cards that belong to a cluster. `None` for hot/recent cards and for
+    /// unclustered haystack cards.
+    pub cluster_label: Option<String>,
+}
+
+/// A context's semantic-cluster assignment (from `get_clusters`): the cluster id
+/// (drives haystack angular grouping) and the kernel-synthesized label.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterAssignment {
+    pub cluster_id: u32,
+    pub label: String,
 }
 
 /// Build a [`CardData`] from a [`ContextInfo`] and its pre-assigned [`Band`].
@@ -90,7 +102,7 @@ pub struct CardData {
 /// Band is passed in (not derived here) because it depends on the *whole set* —
 /// see [`assign_bands`]. Everything else is a per-context field map with the
 /// fallbacks the design doc's card table specifies.
-pub fn card_from(info: &ContextInfo, band: Band) -> CardData {
+pub fn card_from(info: &ContextInfo, band: Band, cluster_label: Option<String>) -> CardData {
     let title = info.id.display_or(Some(info.label.as_str()));
 
     let accent = if info.context_type.is_empty() {
@@ -118,6 +130,13 @@ pub fn card_from(info: &ContextInfo, band: Band) -> CardData {
         preview: info.top_block_preview.clone(),
         band,
         forked_from: info.forked_from,
+        // Only haystack cards carry a cluster label; the caller passes `None`
+        // for hot/recent cards (their angle encodes a different axis).
+        cluster_label: if band == Band::Haystack {
+            cluster_label
+        } else {
+            None
+        },
     }
 }
 
@@ -164,6 +183,7 @@ pub fn assign_bands(contexts: &[ContextInfo]) -> Vec<Band> {
 pub fn layout_positions(
     contexts: &[ContextInfo],
     bands: &[Band],
+    cluster_of: &std::collections::HashMap<ContextId, ClusterAssignment>,
     layout: &CompactingBandLayout,
 ) -> std::collections::BTreeMap<ContextId, LayoutPos> {
     debug_assert_eq!(
@@ -172,10 +192,21 @@ pub fn layout_positions(
         "bands must align with contexts"
     );
 
-    // Creation rank by id (UUIDv7 = time order, unique) for Hot / Haystack.
+    // Creation rank by id (UUIDv7 = time order, unique) for Hot.
     let mut ids: Vec<ContextId> = contexts.iter().map(|c| c.id).collect();
     ids.sort_unstable();
     let id_rank = |id: &ContextId| ids.binary_search(id).expect("id present") as i64;
+
+    // Haystack angle re-encodes to *semantic cluster* (the band's whole point):
+    // same-cluster contexts sit angularly adjacent. Compute dense ranks over just
+    // the haystack contexts, grouped by cluster (see `haystack_order_keys`).
+    let haystack_ids: Vec<ContextId> = contexts
+        .iter()
+        .zip(bands.iter())
+        .filter(|(_, b)| **b == Band::Haystack)
+        .map(|(c, _)| c.id)
+        .collect();
+    let haystack_rank = haystack_order_keys(&haystack_ids, cluster_of);
 
     // Recency rank for band 1: most-recently-concluded first (→ order_key 0 →
     // anchor slot). Ties on `concluded_at` break by id ascending, matching the
@@ -200,7 +231,8 @@ pub fn layout_positions(
         .map(|(c, &band)| {
             let order_key = match band {
                 Band::RecentConcluded => recency_rank[&c.id],
-                _ => id_rank(&c.id),
+                Band::Haystack => haystack_rank[&c.id],
+                Band::Hot => id_rank(&c.id),
             };
             ContextEntry {
                 id: c.id,
@@ -211,6 +243,60 @@ pub fn layout_positions(
         .collect();
 
     layout.compute(&entries)
+}
+
+/// Dense, collision-free order keys for the haystack band that group same-cluster
+/// contexts angularly adjacent.
+///
+/// Contexts are ranked `0..n` after sorting by `(cluster_id, id)`, with
+/// **unclustered** contexts (no entry in `cluster_of`) trailing after all
+/// clusters (sorted among themselves by id). This makes band-2 angle encode
+/// *semantic cluster* — the design's job for the haystack — while staying
+/// deterministic: the keys depend only on cluster membership and id, never on
+/// input order, so re-deriving each poll is stable until clustering changes.
+pub fn haystack_order_keys(
+    contexts: &[ContextId],
+    cluster_of: &std::collections::HashMap<ContextId, ClusterAssignment>,
+) -> std::collections::HashMap<ContextId, i64> {
+    use std::cmp::Ordering;
+    let mut sorted = contexts.to_vec();
+    sorted.sort_by(|a, b| {
+        let ca = cluster_of.get(a).map(|c| c.cluster_id);
+        let cb = cluster_of.get(b).map(|c| c.cluster_id);
+        match (ca, cb) {
+            (Some(x), Some(y)) => x.cmp(&y).then_with(|| a.cmp(b)),
+            (Some(_), None) => Ordering::Less, // clustered before unclustered
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => a.cmp(b),
+        }
+    });
+    sorted
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (*id, i as i64))
+        .collect()
+}
+
+/// Walk the fork lineage of `start` upward, returning the set of its ancestor
+/// context ids (parents, grandparents, … to the root). Excludes `start` itself.
+///
+/// `parent_of` maps a context to its `forked_from` parent (`None` at a root). The
+/// walk is cycle-safe — a parent already seen ends it — so a malformed lineage
+/// can't hang the overlay. Drives the on-demand lineage highlight: select a card,
+/// its ancestry lights up (`docs/viz-substrate.md`, band-0 lineage overlay).
+pub fn ancestors(
+    start: ContextId,
+    parent_of: impl Fn(ContextId) -> Option<ContextId>,
+) -> std::collections::HashSet<ContextId> {
+    let mut out = std::collections::HashSet::new();
+    let mut cur = parent_of(start);
+    while let Some(p) = cur {
+        if !out.insert(p) {
+            break; // cycle guard
+        }
+        cur = parent_of(p);
+    }
+    out
 }
 
 /// Lift a 2D [`LayoutPos`] into the 3D well.
@@ -256,10 +342,10 @@ mod tests {
     #[test]
     fn title_prefers_label_falls_back_to_short_id() {
         let id = id_of(1);
-        let labeled = card_from(&ctx(id, "my work"), Band::Hot);
+        let labeled = card_from(&ctx(id, "my work"), Band::Hot, None);
         assert_eq!(labeled.title, "my work");
 
-        let unlabeled = card_from(&ctx(id, ""), Band::Hot);
+        let unlabeled = card_from(&ctx(id, ""), Band::Hot, None);
         assert_eq!(unlabeled.title, id.short());
     }
 
@@ -268,10 +354,10 @@ mod tests {
         let mut info = ctx(id_of(1), "x");
         info.context_type = "coder".to_string();
         info.provider = "anthropic".to_string();
-        assert_eq!(card_from(&info, Band::Hot).accent, "coder");
+        assert_eq!(card_from(&info, Band::Hot, None).accent, "coder");
 
         info.context_type = String::new();
-        assert_eq!(card_from(&info, Band::Hot).accent, "anthropic");
+        assert_eq!(card_from(&info, Band::Hot, None).accent, "anthropic");
     }
 
     #[test]
@@ -280,28 +366,28 @@ mod tests {
         info.provider = "anthropic".to_string();
         info.model = "claude-opus-4-8".to_string();
         assert_eq!(
-            card_from(&info, Band::Hot).model_badge,
+            card_from(&info, Band::Hot, None).model_badge,
             "anthropic/claude-opus-4-8"
         );
 
         info.model = String::new();
-        assert_eq!(card_from(&info, Band::Hot).model_badge, "anthropic");
+        assert_eq!(card_from(&info, Band::Hot, None).model_badge, "anthropic");
 
         info.provider = String::new();
-        assert_eq!(card_from(&info, Band::Hot).model_badge, "");
+        assert_eq!(card_from(&info, Band::Hot, None).model_badge, "");
     }
 
     #[test]
     fn fork_badge_present_only_for_nonempty_fork_kind() {
         let mut info = ctx(id_of(1), "x");
-        assert_eq!(card_from(&info, Band::Hot).fork_badge, None);
+        assert_eq!(card_from(&info, Band::Hot, None).fork_badge, None);
 
         info.fork_kind = Some(String::new());
-        assert_eq!(card_from(&info, Band::Hot).fork_badge, None);
+        assert_eq!(card_from(&info, Band::Hot, None).fork_badge, None);
 
         info.fork_kind = Some("subtree".to_string());
         assert_eq!(
-            card_from(&info, Band::Hot).fork_badge,
+            card_from(&info, Band::Hot, None).fork_badge,
             Some("subtree".to_string())
         );
     }
@@ -383,7 +469,7 @@ mod tests {
         let contexts: Vec<ContextInfo> = (0..3u8).map(|n| ctx(id_of(n), "")).collect();
         let bands = assign_bands(&contexts);
         let layout = CompactingBandLayout::new(LayoutConfig::default_config());
-        let positions = layout_positions(&contexts, &bands, &layout);
+        let positions = layout_positions(&contexts, &bands, &std::collections::HashMap::new(), &layout);
 
         assert_eq!(positions.len(), 3);
         for c in &contexts {
@@ -420,7 +506,7 @@ mod tests {
             bands.iter().all(|&b| b == Band::RecentConcluded),
             "all three should be recent-concluded for this N"
         );
-        let pos = layout_positions(&contexts, &bands, &layout);
+        let pos = layout_positions(&contexts, &bands, &std::collections::HashMap::new(), &layout);
 
         // Band-1 mid radius for the default config (total 300, 3 bands) is 150;
         // slot 0 sits at the band's start angle (0 here) → (150, 0).
@@ -450,17 +536,113 @@ mod tests {
 
         let before: Vec<ContextInfo> = (1..=3u8).map(|n| ctx(id_of(n), "")).collect();
         let bands_b = assign_bands(&before);
-        let pos_b = layout_positions(&before, &bands_b, &layout);
+        let pos_b = layout_positions(&before, &bands_b, &std::collections::HashMap::new(), &layout);
 
         // Append a newer context (larger id → later in time order → growing edge).
         let mut after = before.clone();
         after.push(ctx(id_of(4), ""));
         let bands_a = assign_bands(&after);
-        let pos_a = layout_positions(&after, &bands_a, &layout);
+        let pos_a = layout_positions(&after, &bands_a, &std::collections::HashMap::new(), &layout);
 
         // Every pre-existing card keeps its exact slot.
         for c in &before {
             assert_eq!(pos_b[&c.id], pos_a[&c.id], "append moved {:?}", c.id);
         }
+    }
+
+    fn cluster(id: u32, label: &str) -> ClusterAssignment {
+        ClusterAssignment {
+            cluster_id: id,
+            label: label.to_string(),
+        }
+    }
+
+    #[test]
+    fn haystack_keys_group_same_cluster_adjacent() {
+        use std::collections::HashMap;
+        // ids 1,3 in cluster 7; ids 2,4 in cluster 2; id 5 unclustered.
+        let mut map = HashMap::new();
+        map.insert(id_of(1), cluster(7, "rust"));
+        map.insert(id_of(3), cluster(7, "rust"));
+        map.insert(id_of(2), cluster(2, "music"));
+        map.insert(id_of(4), cluster(2, "music"));
+        let ids: Vec<ContextId> = (1..=5u8).map(id_of).collect();
+
+        let keys = haystack_order_keys(&ids, &map);
+
+        // Order: cluster 2 (ids 2,4), then cluster 7 (ids 1,3), then unclustered (5).
+        let mut by_rank: Vec<(i64, ContextId)> =
+            keys.iter().map(|(id, k)| (*k, *id)).collect();
+        by_rank.sort();
+        let order: Vec<ContextId> = by_rank.into_iter().map(|(_, id)| id).collect();
+        assert_eq!(
+            order,
+            vec![id_of(2), id_of(4), id_of(1), id_of(3), id_of(5)]
+        );
+        // Dense + collision-free.
+        let mut ranks: Vec<i64> = keys.values().copied().collect();
+        ranks.sort();
+        assert_eq!(ranks, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn haystack_keys_are_order_independent() {
+        use std::collections::HashMap;
+        let mut map = HashMap::new();
+        map.insert(id_of(1), cluster(1, "a"));
+        map.insert(id_of(2), cluster(1, "a"));
+        let forward: Vec<ContextId> = vec![id_of(1), id_of(2), id_of(3)];
+        let reverse: Vec<ContextId> = vec![id_of(3), id_of(2), id_of(1)];
+        assert_eq!(
+            haystack_order_keys(&forward, &map),
+            haystack_order_keys(&reverse, &map),
+            "haystack keys must depend only on (cluster, id), not input order"
+        );
+    }
+
+    #[test]
+    fn ancestors_walks_fork_chain_to_root() {
+        use std::collections::HashMap;
+        // 4 → 3 → 2 → 1(root). parent_of(1) = None.
+        let mut parent: HashMap<ContextId, ContextId> = HashMap::new();
+        parent.insert(id_of(4), id_of(3));
+        parent.insert(id_of(3), id_of(2));
+        parent.insert(id_of(2), id_of(1));
+        let lookup = |id: ContextId| parent.get(&id).copied();
+
+        let anc = ancestors(id_of(4), lookup);
+        assert_eq!(anc.len(), 3);
+        for n in [1u8, 2, 3] {
+            assert!(anc.contains(&id_of(n)), "missing ancestor {n}");
+        }
+        // `start` itself is not in its own ancestry.
+        assert!(!anc.contains(&id_of(4)));
+        // A root has no ancestors.
+        assert!(ancestors(id_of(1), lookup).is_empty());
+    }
+
+    #[test]
+    fn ancestors_is_cycle_safe() {
+        use std::collections::HashMap;
+        // Pathological cycle 1 → 2 → 1; the walk must terminate.
+        let mut parent: HashMap<ContextId, ContextId> = HashMap::new();
+        parent.insert(id_of(1), id_of(2));
+        parent.insert(id_of(2), id_of(1));
+        let anc = ancestors(id_of(1), |id| parent.get(&id).copied());
+        // Both nodes seen once, then the cycle is cut.
+        assert_eq!(anc.len(), 2);
+    }
+
+    #[test]
+    fn cluster_label_set_only_for_haystack() {
+        let info = ctx(id_of(1), "x");
+        // Haystack card carries the label.
+        let hay = card_from(&info, Band::Haystack, Some("rust".to_string()));
+        assert_eq!(hay.cluster_label.as_deref(), Some("rust"));
+        // Hot / recent cards never carry a cluster label, even if one is passed.
+        let hot = card_from(&info, Band::Hot, Some("rust".to_string()));
+        assert_eq!(hot.cluster_label, None);
+        let recent = card_from(&info, Band::RecentConcluded, Some("rust".to_string()));
+        assert_eq!(recent.cluster_label, None);
     }
 }

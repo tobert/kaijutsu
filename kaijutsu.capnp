@@ -457,6 +457,7 @@ struct SimilarContext {
 struct ContextCluster {
   clusterId @0 :UInt32;
   contextIds @1 :List(Data);  # List of 16-byte ContextIds
+  label @2 :Text;             # Kernel-synthesized cluster label (e.g. top shared keyword); empty if none
 }
 
 struct KernelConfig {

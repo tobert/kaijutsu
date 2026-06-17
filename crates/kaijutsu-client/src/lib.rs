@@ -22,11 +22,11 @@ pub use actor::{
     spawn_actor,
 };
 pub use rpc::{
-    Completion, CompletionKind, ConsentMode, ContextInfo, ContextMembership, HistoryEntry,
-    Identity, InputState, KernelConfig, KernelHandle, KernelInfo, LlmConfigInfo,
+    Completion, CompletionKind, ConsentMode, ContextCluster, ContextInfo, ContextMembership,
+    HistoryEntry, Identity, InputState, KernelConfig, KernelHandle, KernelInfo, LlmConfigInfo,
     LlmProviderInfo, McpResource, McpToolResult, MountSpec, PresetInfo,
-    RpcClient, RpcError, ShellValue, StagedDriftInfo, SubmitResult, SyncState, ToolResult,
-    ToolSchema, VersionSnapshot,
+    RpcClient, RpcError, ShellValue, SimilarContext, StagedDriftInfo, SubmitResult, SyncState,
+    ToolResult, ToolSchema, VersionSnapshot,
 };
 pub use ssh::{KeySource, SshChannels, SshClient, SshConfig, SshError};
 pub use subscriptions::{ConnectionStatus, OutputEvent, ServerEvent, SyncGeneration};
