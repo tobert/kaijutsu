@@ -138,6 +138,10 @@ pub enum RpcResultMessage {
     /// so it travels the same join path as any switch. Closes the reattach bug
     /// (tech_debt_peer_reattach_on_reconnect).
     RestoreContext(ContextId),
+    /// CRDT-owned `theme.toml` content, fetched over RPC on connect (the app no
+    /// longer reads a host theme file — slice 2). Parsed and applied to the
+    /// `Theme` resource by `apply_theme_from_rpc`.
+    ThemeReceived(String),
     /// Generic RPC error (for toast/notification).
     RpcError { operation: String, error: String },
 }
@@ -193,12 +197,45 @@ impl Plugin for ActorPlugin {
                 poll_rpc_results,
                 update_connection_state,
                 restore_context_on_message,
+                apply_theme_from_rpc,
             )
                 .chain(),
         );
         // The current-context persistence observer runs independently — it only
         // needs to see the latest `DocumentCache::active_id`.
         app.add_systems(Update, persist_current_context);
+    }
+}
+
+/// Apply a theme fetched over RPC. Slice 2: the app no longer reads a host
+/// `theme.toml` — the kernel is the sole owner, so theme arrives as a
+/// [`RpcResultMessage::ThemeReceived`] on connect and replaces the `Theme`
+/// resource (theme-reading systems pick it up next frame). A parse failure is
+/// surfaced as a toast and leaves the current theme intact — never a silent
+/// revert to default.
+fn apply_theme_from_rpc(
+    mut results: MessageReader<RpcResultMessage>,
+    mut theme: ResMut<crate::ui::theme::Theme>,
+    mut error_queue: ResMut<crate::view::components::GlobalErrorQueue>,
+    time: Res<Time>,
+) {
+    for result in results.read() {
+        if let RpcResultMessage::ThemeReceived(toml) = result {
+            match crate::ui::theme_loader::parse_theme_toml(toml) {
+                Ok(parsed) => {
+                    *theme = parsed;
+                    log::info!("applied theme from kernel config (RPC)");
+                }
+                Err(e) => {
+                    log::error!("theme.toml from kernel is unparseable: {e}");
+                    error_queue.push(
+                        "config",
+                        format!("theme.toml: {e}"),
+                        time.elapsed_secs_f64(),
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -322,6 +359,20 @@ fn poll_bootstrap_results(
                                     log::warn!("Bootstrap aborted: status channel closed");
                                     return;
                                 }
+                            }
+                        }
+
+                        // 0. Fetch the CRDT-owned theme over RPC. The app no
+                        // longer reads a host theme.toml (slice 2): the kernel
+                        // is the sole owner. Best-effort — a failure keeps the
+                        // default theme already in place. Done before the
+                        // context branches below (both of which can `return`).
+                        match h.get_config("theme.toml".to_string()).await {
+                            Ok(toml) => {
+                                let _ = tx.send(RpcResultMessage::ThemeReceived(toml));
+                            }
+                            Err(e) => {
+                                log::warn!("theme fetch over RPC failed: {e}; keeping default theme")
                             }
                         }
 

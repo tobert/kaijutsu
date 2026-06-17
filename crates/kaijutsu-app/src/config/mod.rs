@@ -1,7 +1,11 @@
 //! TOML config loader for app-side configuration.
 //!
-//! Loads theme from `theme.toml` and bindings from `bindings.toml`.
-//! Falls back to compiled-in defaults if files don't exist or have errors.
+//! Loads **bindings** from the host `bindings.toml` (app-only config). The
+//! **theme** is no longer a host file: it is CRDT-owned by the kernel (slice 2,
+//! `docs/config-crdt-ownership.md`) and fetched over RPC on connect
+//! (`apply_theme_from_rpc`), so the app starts on `Theme::default()` and the
+//! real theme arrives once connected. Bindings stay host-side because they are
+//! purely client-local and the kernel has no notion of them.
 
 use bevy::prelude::*;
 use std::path::Path;
@@ -10,7 +14,6 @@ use crate::input::binding::Binding;
 use crate::input::bindings_config::{self, bindings_to_toml};
 use crate::input::defaults::default_bindings;
 use crate::ui::theme::Theme;
-use crate::ui::theme_loader::{self, ThemeConfigError};
 use crate::view::components::GlobalErrorQueue;
 
 /// Errors collected while loading `theme.toml`/`bindings.toml` at startup.
@@ -49,27 +52,14 @@ pub fn load_app_config() -> AppConfig {
     };
 
     let mut errors = Vec::new();
-    let theme = load_theme_toml(&config_dir, &mut errors);
+    // Theme is CRDT-owned and fetched over RPC on connect; start on the default.
+    let theme = Theme::default();
     let bindings = load_bindings_toml(&config_dir, &mut errors);
 
     AppConfig {
         theme,
         bindings,
         errors,
-    }
-}
-
-fn load_theme_toml(config_dir: &Path, errors: &mut Vec<String>) -> Theme {
-    let theme_path = config_dir.join("theme.toml");
-    match theme_loader::load_theme_from_path(&theme_path) {
-        Ok(theme) => theme,
-        Err(e) => {
-            error!("{e}");
-            errors.push(match &e {
-                ThemeConfigError::Io { .. } | ThemeConfigError::Parse { .. } => e.to_string(),
-            });
-            Theme::default()
-        }
     }
 }
 
@@ -107,7 +97,10 @@ fn load_bindings_toml(config_dir: &Path, errors: &mut Vec<String>) -> Vec<Bindin
     }
 }
 
-/// Write default config files to the user config dir if they don't exist.
+/// Write default app-only config files to the user config dir if they don't
+/// exist. Only `bindings.toml` lives on host disk now — the theme is CRDT-owned
+/// by the kernel (slice 2) and seeded there, so the app no longer writes a host
+/// `theme.toml`.
 pub fn write_default_configs_if_missing() {
     let Some(config_dir) = dirs::config_dir().map(|p| p.join("kaijutsu")) else {
         return;
@@ -125,16 +118,6 @@ pub fn write_default_configs_if_missing() {
         match std::fs::write(&bindings_path, &content) {
             Ok(()) => info!("Wrote default bindings to {:?}", bindings_path),
             Err(e) => warn!("Could not write bindings to {:?}: {}", bindings_path, e),
-        }
-    }
-
-    // Write default theme as TOML
-    let theme_path = config_dir.join("theme.toml");
-    if !theme_path.exists() {
-        let content = include_str!("../../../../assets/defaults/theme.toml");
-        match std::fs::write(&theme_path, content) {
-            Ok(()) => info!("Wrote default theme to {:?}", theme_path),
-            Err(e) => warn!("Could not write theme to {:?}: {}", theme_path, e),
         }
     }
 }

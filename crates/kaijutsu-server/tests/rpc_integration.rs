@@ -58,6 +58,26 @@ fn test_kernel_appears_in_list() {
     });
 }
 
+/// get_config reads the CRDT-owned config over the wire (client → SSH → capnp →
+/// rpc.rs → /etc/config VFS). A fresh kernel seeds the embedded defaults, so
+/// theme.toml comes back non-empty; an unknown file is a loud error, not "".
+#[test]
+fn test_get_config_reads_crdt_owned_theme() {
+    run_local(async {
+        let addr = start_server().await;
+        let client = connect_client(addr).await;
+        let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
+
+        // Seeded theme.toml round-trips (bare name resolves under /etc/config).
+        let theme = kernel.get_config("theme.toml").await.unwrap();
+        assert!(theme.contains("bg"), "seeded theme.toml should carry bg: {theme}");
+
+        // Unknown config file surfaces an error rather than empty content.
+        let err = kernel.get_config("nonesuch.toml").await;
+        assert!(err.is_err(), "unknown config must error, got {err:?}");
+    });
+}
+
 #[test]
 fn test_create_context_returns_valid_id() {
     run_local(async {

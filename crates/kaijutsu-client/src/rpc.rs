@@ -1154,6 +1154,23 @@ impl KernelHandle {
         })
     }
 
+    /// Read a CRDT-owned config file's content (e.g. `theme.toml`). The kernel
+    /// is the sole owner; this is how out-of-kernel surfaces (the app) read
+    /// config without touching a host file. Returns the content on success or a
+    /// `ServerError` carrying the kernel's message.
+    #[tracing::instrument(skip(self), name = "rpc_client.get_config")]
+    pub async fn get_config(&self, path: &str) -> Result<String, RpcError> {
+        let mut request = self.kernel.get_config_request();
+        request.get().set_path(path);
+        let response = request.send().promise.await?;
+        let reader = response.get()?;
+        let error = reader.get_error()?.to_str().unwrap_or("");
+        if !error.is_empty() {
+            return Err(RpcError::ServerError(error.to_string()));
+        }
+        Ok(reader.get_content()?.to_string()?)
+    }
+
     /// Set the default LLM provider
     #[tracing::instrument(skip(self), name = "rpc_client.set_default_provider")]
     pub async fn set_default_provider(&self, provider: &str) -> Result<bool, RpcError> {

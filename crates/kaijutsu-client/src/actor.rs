@@ -452,6 +452,10 @@ enum RpcCommand {
     GetLlmConfig {
         reply: oneshot::Sender<Result<LlmConfigInfo, CallError>>,
     },
+    GetConfig {
+        path: String,
+        reply: oneshot::Sender<Result<String, CallError>>,
+    },
     SetDefaultProvider {
         provider: String,
         reply: oneshot::Sender<Result<bool, CallError>>,
@@ -577,6 +581,7 @@ impl RpcCommand {
             Self::Prompt { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ConfigureLlm { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetLlmConfig { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::GetConfig { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::SetDefaultProvider { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::SetDefaultModel { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::CherryPickBlock { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -1062,6 +1067,12 @@ impl ActorHandle {
     #[tracing::instrument(skip(self))]
     pub async fn get_llm_config(&self) -> Result<LlmConfigInfo, CallError> {
         self.send(|reply| RpcCommand::GetLlmConfig { reply }).await
+    }
+
+    /// Read a CRDT-owned config file's content (e.g. `theme.toml`) over RPC.
+    #[tracing::instrument(skip(self))]
+    pub async fn get_config(&self, path: String) -> Result<String, CallError> {
+        self.send(|reply| RpcCommand::GetConfig { path, reply }).await
     }
 
     #[tracing::instrument(skip(self))]
@@ -2254,6 +2265,9 @@ async fn dispatch_kernel_command(
         }
         RpcCommand::GetLlmConfig { reply } => {
             dispatch!(kernel, reply, close_tx, k, k.get_llm_config());
+        }
+        RpcCommand::GetConfig { path, reply } => {
+            dispatch!(kernel, reply, close_tx, k, k.get_config(&path));
         }
         RpcCommand::SetDefaultProvider { provider, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.set_default_provider(&provider));
