@@ -208,9 +208,9 @@ impl ConfigCrdtFs {
     /// proceed without it.
     ///
     /// [`seed_from_embedded`]: Self::seed_from_embedded
-    pub fn seed_entries(
+    pub fn seed_entries<S: AsRef<str>>(
         &self,
-        entries: impl IntoIterator<Item = (String, &'static str)>,
+        entries: impl IntoIterator<Item = (String, S)>,
     ) -> VfsResult<usize> {
         let mut written = 0usize;
         for (canonical, body) in entries {
@@ -222,7 +222,7 @@ impl ConfigCrdtFs {
             if self.content_of(&canonical).is_some() {
                 continue;
             }
-            self.put_content(&canonical, body)?;
+            self.put_content(&canonical, body.as_ref())?;
             written += 1;
         }
         Ok(written)

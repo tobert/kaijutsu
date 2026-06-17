@@ -697,6 +697,16 @@ fn config_canonical(path: &str) -> String {
     }
 }
 
+/// One-time seed override for a `/etc/config/<name>` path: the body of a host
+/// file under `config_dir`, if both the dir and file exist. Returns `None`
+/// (→ caller uses the embedded default) when no dir is given or no host file is
+/// present. This is a bootstrap source only — never read again after seeding.
+fn config_seed_override(config_dir: Option<&Path>, canonical: &str) -> Option<String> {
+    let dir = config_dir?;
+    let name = canonical.strip_prefix("/etc/config/")?;
+    std::fs::read_to_string(dir.join(name)).ok()
+}
+
 /// Restore a config file to its embedded default by writing the seed body into
 /// the CRDT through the VFS. Returns `(success, error_message)`. Errors loudly
 /// (no silent no-op) when the path ships no embedded default.
@@ -948,10 +958,11 @@ impl kaijutsu_index::StatusReceiver for FlowBusStatusReceiver {
 /// persistence, default context, config backend, block tools, LLM, and MCP.
 /// The returned `SharedKernel` is shared across all connections via `Arc`.
 pub async fn create_shared_kernel(
-    // Config is now CRDT-owned (slice 2): the kernel no longer reads a host
-    // config directory. This param is vestigial — `ServerConfig.config_dir` and
-    // its CLI flag should be retired (tracked in docs/issues.md).
-    _config_dir: Option<&Path>,
+    // One-time CRDT config seed source on a fresh kernel (see the /etc/config
+    // mount below). NOT ongoing ownership: production passes None (embedded
+    // defaults; the kernel never reads the user's host config). Tests point it
+    // at a tempdir to inject a mock models.toml.
+    config_dir: Option<&Path>,
     data_dir: Option<&Path>,
 ) -> Result<SharedKernel, capnp::Error> {
     // Create shared FlowBus instances - shared between Kernel and BlockStore
@@ -1073,8 +1084,23 @@ pub async fn create_shared_kernel(
         "/etc/config",
     );
     if config_fs.is_empty() {
+        // One-time bootstrap seed of a fresh config namespace. `config_dir`
+        // (when provided) is a seed *source*, NOT ongoing ownership: for each
+        // config file, a host file under that dir supplies the body if present,
+        // else the embedded default. Production passes None → embedded only (the
+        // hard-reset cutover: the kernel never reads the user's host config).
+        // Tests point config_dir at a tempdir to inject a mock models.toml.
+        // After this, the CRDT is the sole owner — no host read/flush/reload.
+        let seed: Vec<(String, String)> = kaijutsu_kernel::config_seed::config_seed_files()
+            .into_iter()
+            .map(|(canonical, embedded)| {
+                let body = config_seed_override(config_dir, &canonical)
+                    .unwrap_or_else(|| embedded.to_string());
+                (canonical, body)
+            })
+            .collect();
         let n = config_fs
-            .seed_entries(kaijutsu_kernel::config_seed::config_seed_files())
+            .seed_entries(seed)
             .map_err(|e| capnp::Error::failed(format!("config seed into CRDT failed: {e}")))?;
         log::info!("seeded {n} config file(s) into the CRDT (fresh kernel)");
     }
