@@ -211,7 +211,7 @@ fn main() {
 /// and not a concern here (per Amy).
 fn setup_camera(mut commands: Commands, theme: Res<ui::theme::Theme>) {
     use bevy::core_pipeline::tonemapping::Tonemapping;
-    use bevy::post_process::bloom::Bloom;
+    use bevy::post_process::bloom::{Bloom, BloomPrefilter};
     use bevy::render::view::Hdr;
     commands.spawn((
         Camera3d::default(),
@@ -220,7 +220,19 @@ fn setup_camera(mut commands: Commands, theme: Res<ui::theme::Theme>) {
             ..default()
         },
         Hdr,
-        Bloom::NATURAL,
+        // Thresholded additive bloom: only HDR (>1.0) pixels bloom, so the LDR card
+        // bodies stay crisp and the well's HDR "bling" (selection rim, status
+        // pulse — see `well_card.wgsl`) reads as a deliberate glow signal rather
+        // than an all-over wash. (`OLD_SCHOOL` is already additive + thresholded;
+        // we just raise the threshold above the body brightness and lift intensity.)
+        Bloom {
+            intensity: 0.30,
+            prefilter: BloomPrefilter {
+                threshold: 1.0,
+                threshold_softness: 0.3,
+            },
+            ..Bloom::OLD_SCHOOL
+        },
         Tonemapping::TonyMcMapface,
         IsDefaultUiCamera,
         Name::new("AppCamera"),

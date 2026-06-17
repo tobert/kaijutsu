@@ -28,13 +28,23 @@ use crate::view::vello_ui_texture::VelloUiScene;
 /// Inner padding (logical px in the card-texture space).
 const PAD: f32 = 14.0;
 
-/// `WellCardMaterial.params` for a card: `[selected, in_lineage, status, time]`.
+/// `WellCardMaterial.params` for a card: `[selected, in_lineage, status, _]`.
+/// `status` is a float code the shader switches on for the rim FX: pending/none →
+/// 0, running → 1 (breathing pulse), done → 2 (no rim), error → 3 (steady red).
+/// Animation reads `globals.time` in the shader, so the 4th slot is unused.
 fn card_params(card: &Card) -> Vec4 {
+    use kaijutsu_types::Status;
+    let status = match card.status {
+        Some(Status::Running) => 1.0,
+        Some(Status::Done) => 2.0,
+        Some(Status::Error) => 3.0,
+        _ => 0.0, // None or Pending
+    };
     Vec4::new(
         if card.selected { 1.0 } else { 0.0 },
         if card.in_lineage { 1.0 } else { 0.0 },
-        0.0, // status: reserved (the dot is a follow-up)
-        0.0, // time: reserved (animation is the bloom-pass)
+        status,
+        0.0,
     )
 }
 

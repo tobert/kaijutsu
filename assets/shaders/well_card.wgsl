@@ -1,16 +1,23 @@
 // Well Card Shader — 3D material for time-well cards (rim + focus).
 //
 // Draws the whole card on the GPU (vello-free): an accent rounded-rect body
-// (SDF), selection/lineage rings (SDF, from `params`), and the MSDF text
-// composited on top (the `card_texture`, rendered text-on-transparent by the
-// MSDF pass). Masked alpha → the rounded corners discard cleanly.
+// (SDF), the MSDF text composited on top, and the "bling" rings/pulses as SDF
+// emitting **HDR** (>1.0) color so they spill into the camera's bloom pass (the
+// app renders on one HDR `Camera3d`; see `main::setup_camera`). The bloom blur
+// turns each bright rim into a glow halo that extends past the card silhouette —
+// which the masked alpha alone could never do (rounded corners discard below the
+// cutoff, so a soft falloff *inside* alpha is impossible; bloom does it instead).
+//
+// `params = [selected, in_lineage, status, _]`; `status`: 0/1 pending → 0,
+// running → 1, done → 2, error → 3. Animation reads `globals.time` directly.
 
 #import bevy_pbr::forward_io::VertexOutput
+#import bevy_pbr::mesh_view_bindings::globals
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(0) var card_texture: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(1) var card_sampler: sampler;
 @group(#{MATERIAL_BIND_GROUP}) @binding(2) var<uniform> accent: vec4<f32>;
-@group(#{MATERIAL_BIND_GROUP}) @binding(3) var<uniform> params: vec4<f32>; // [selected, in_lineage, status, time]
+@group(#{MATERIAL_BIND_GROUP}) @binding(3) var<uniform> params: vec4<f32>; // [selected, in_lineage, status, _]
 @group(#{MATERIAL_BIND_GROUP}) @binding(4) var<uniform> shape: vec4<f32>;  // [aspect, corner_radius, ring_width, inset]
 
 // Signed distance to a rounded box centered at origin, half-size `b`, radius `r`.
@@ -43,14 +50,35 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     col = mix(col, text.rgb, text.a);
     alpha = max(alpha, text.a * inside);
 
-    // Ring band hugging the inner edge of the rounded box.
+    // Ring band hugging the inner edge of the rounded box. HDR colors below push
+    // the band well past 1.0 so the bloom pass blooms it into a glow halo.
     let band = (1.0 - smoothstep(ring_w, ring_w + aa, abs(d))) * inside;
-    if (params.y > 0.5) { // lineage (amber)
-        col = mix(col, vec3<f32>(0.95, 0.70, 0.20), band);
+    let t = globals.time;
+    let status = params.z;
+
+    // --- Status rim (base layer; selection/lineage draw over it) ---
+    if (status > 2.5) {
+        // Error: a steady, hot red rim.
+        col = mix(col, vec3<f32>(1.0, 0.16, 0.12) * 3.5, band);
+        alpha = max(alpha, band);
+    } else if (status > 0.5 && status < 1.5) {
+        // Running: a breathing teal rim — the "this context is thinking" pulse.
+        let pulse = 0.5 + 0.5 * sin(t * 4.0);
+        let glow = vec3<f32>(0.40, 0.95, 0.80) * (1.6 + 2.6 * pulse);
+        col = mix(col, glow, band * (0.45 + 0.55 * pulse));
         alpha = max(alpha, band);
     }
-    if (params.x > 0.5) { // selection (blue) — over lineage
-        col = mix(col, vec3<f32>(0.40, 0.68, 1.0), band);
+
+    // --- Lineage ring (amber, HDR) ---
+    if (params.y > 0.5) {
+        col = mix(col, vec3<f32>(0.95, 0.70, 0.20) * 2.6, band);
+        alpha = max(alpha, band);
+    }
+
+    // --- Selection ring (blue, HDR, gentle breathe) — on top of everything ---
+    if (params.x > 0.5) {
+        let pulse = 0.85 + 0.15 * sin(t * 3.0);
+        col = mix(col, vec3<f32>(0.40, 0.68, 1.0) * (3.4 * pulse), band);
         alpha = max(alpha, band);
     }
 
