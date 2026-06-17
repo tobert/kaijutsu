@@ -57,4 +57,11 @@ mod tests {
     fn distinct_lines_usually_differ() {
         assert_ne!(line_hash("foo"), line_hash("bar"));
     }
+
+    #[test]
+    fn matches_reference_fnv1a_low16() {
+        // Cross-check against an external FNV-1a (low 16 bits, %04x): proves the
+        // anchor hash is reproducible outside the kernel.
+        assert_eq!(line_hash("alpha"), "202b");
+    }
 }
