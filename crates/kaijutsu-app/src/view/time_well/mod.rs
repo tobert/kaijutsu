@@ -42,6 +42,7 @@ impl Plugin for TimeWellPlugin {
                     text::build_card_scenes,
                     text::update_reading_card,
                     scene::move_cards_toward_target,
+                    scene::ease_camera_to_selection,
                     scene::billboard_cards,
                     scene::highlight_selection,
                     scene::highlight_lineage,

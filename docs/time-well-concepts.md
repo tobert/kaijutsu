@@ -56,6 +56,14 @@ opt-in per subgraph.
 > mockup-34 JOIN dive: the reading slot *is* the focused card, parked rather than
 > dived-through. (Zooming the whole well to enlarge cards was tried and rejected
 > — it crops the side cards.)
+>
+> **Aesthetic stance (Amy, 2026-06-17):** the time well should *look cool* — not
+> "yet another JavaScript thing." The full-width 2D bottom panel works
+> functionally but reads as generic web chrome. The intended direction is
+> **in-world, camera-driven**: the focus presentation should live in the 3D well
+> (the camera eases toward / dives into the selected card so it grows in place),
+> not as a flat HTML-style overlay. Camera movement is both the framing fix and
+> the aesthetic: motion + depth, not panels.
 
 ### Visual grammar
 

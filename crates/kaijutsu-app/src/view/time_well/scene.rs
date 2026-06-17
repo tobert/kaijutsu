@@ -159,6 +159,10 @@ pub const READING_PANEL_FRAC: f32 = 0.33;
 /// Exponential-smoothing rate for card motion (higher = snappier).
 const CARD_EASE_RATE: f32 = 8.0;
 
+/// Exponential-smoothing rate for the camera follow (lower = a slower, weightier
+/// glide than the cards, so the view leans rather than snaps).
+const CAMERA_EASE_RATE: f32 = 4.0;
+
 // ============================================================================
 // ENTER / EXIT
 // ============================================================================
@@ -511,6 +515,56 @@ pub fn highlight_lineage(state: Res<TimeWellState>, mut cards: Query<&mut Card>)
             card.in_lineage = in_lin;
         }
     }
+}
+
+/// Base camera framing (matches `enter_time_well`): the resting pose the view
+/// returns to when nothing is selected.
+const CAM_BASE_POS: Vec3 = Vec3::new(0.0, 80.0, 920.0);
+const CAM_BASE_LOOK: Vec3 = Vec3::new(0.0, 80.0, -200.0);
+
+/// Ease the well camera so the view *leans* toward the current selection — the
+/// first step of the camera-driven focus (in-world motion instead of a flat HUD).
+///
+/// The look-point and a little x-parallax slide partway toward the selected
+/// card's settled position (`CardTarget`, so the camera tracks where the card is
+/// going, not its mid-tween jitter), then ease in with exponential smoothing —
+/// slower than the cards, so the view glides. Nothing selected → return to the
+/// base framing. Deliberately partial (leans, doesn't recenter) so the whole well
+/// stays legible; the full dive-through is the later JOIN transition.
+pub fn ease_camera_to_selection(
+    time: Res<Time>,
+    state: Res<TimeWellState>,
+    cards: Query<(&Card, &CardTarget)>,
+    mut cam: Query<&mut Transform, With<TimeWellCamera>>,
+) {
+    let Ok(mut tf) = cam.single_mut() else {
+        return;
+    };
+
+    let selected_pos = state
+        .selected
+        .and_then(|sel| cards.iter().find(|(c, _)| c.context_id == sel))
+        .map(|(_, t)| t.0);
+
+    let (desired_pos, desired_look) = match selected_pos {
+        Some(p) => {
+            // Lean the look-point toward the selection; nudge the camera x for a
+            // touch of parallax. Fractions kept low so the overview survives.
+            let look = Vec3::new(
+                p.x * 0.4,
+                CAM_BASE_LOOK.y + (p.y - CAM_BASE_LOOK.y) * 0.3,
+                CAM_BASE_LOOK.z,
+            );
+            let pos = Vec3::new(p.x * 0.18, CAM_BASE_POS.y, CAM_BASE_POS.z);
+            (pos, look)
+        }
+        None => (CAM_BASE_POS, CAM_BASE_LOOK),
+    };
+
+    let desired = Transform::from_translation(desired_pos).looking_at(desired_look, Vec3::Y);
+    let alpha = 1.0 - (-CAMERA_EASE_RATE * time.delta_secs()).exp();
+    tf.translation = tf.translation.lerp(desired.translation, alpha);
+    tf.rotation = tf.rotation.slerp(desired.rotation, alpha);
 }
 
 /// Billboard every card to face the well camera. No built-in billboard in 0.18;
