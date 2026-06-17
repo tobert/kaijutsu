@@ -83,6 +83,11 @@ pub struct TimeWellState {
     pub band_order: super::card::BandOrders,
     /// The currently-selected card (highlighted; the target of Enter / `c`).
     pub selected: Option<ContextId>,
+    /// Whether the well is *focused* on the selection: Enter (from the overview)
+    /// dollies the camera into the focus card; Esc backs out; a second Enter
+    /// (while focused) commits — switches to the context. Drives the camera pose
+    /// in [`ease_camera_to_selection`].
+    pub focused: bool,
     /// Per-context semantic-cluster assignment (id + kernel label), refreshed by
     /// the band-2 `get_clusters` poll. Drives the haystack's cluster-grouped
     /// angle and the cluster label on haystack cards. Empty when the kernel has
@@ -133,6 +138,7 @@ impl Default for TimeWellState {
             card_mesh: None,
             band_order: [Vec::new(), Vec::new(), Vec::new()],
             selected: None,
+            focused: false,
             cluster_of: HashMap::new(),
         }
     }
@@ -147,14 +153,20 @@ pub const CARD_HEIGHT: f32 = 40.0;
 pub const CARD_TEX_W: f32 = 256.0;
 pub const CARD_TEX_H: f32 = 160.0;
 
-/// Reading-slot texture size: a wide bar (~16:3) matching the full-width
-/// bottom-third UI panel it's sampled onto, so text isn't stretched.
-/// `build_card_scene` scales its metrics off the height.
-pub const READING_TEX_W: f32 = 1066.0;
-pub const READING_TEX_H: f32 = 200.0;
+/// Focus-card texture size (logical px the vello scene is built in). A tall card
+/// aspect (1.6) — the in-world focus card is a card, not a bar. High-res so it
+/// stays crisp when the camera dollies in on focus.
+pub const READING_TEX_W: f32 = 512.0;
+pub const READING_TEX_H: f32 = 320.0;
 
-/// Fraction of the window height the reading panel occupies (anchored bottom).
-pub const READING_PANEL_FRAC: f32 = 0.33;
+/// In-world focus-card quad size (well units, 1.6 aspect — much larger than a
+/// rim card so it reads as the focus pedestal lower-center of the well).
+pub const FOCUS_QUAD_W: f32 = 380.0;
+pub const FOCUS_QUAD_H: f32 = 237.5;
+
+/// World position of the focus card: lower-center and forward (+Z, toward the
+/// camera) so it floats in front of the rings at the mouth of the well.
+pub const FOCUS_CARD_POS: Vec3 = Vec3::new(0.0, -40.0, 260.0);
 
 /// Exponential-smoothing rate for card motion (higher = snappier).
 const CARD_EASE_RATE: f32 = 8.0;
@@ -179,9 +191,13 @@ pub fn enter_time_well(
     mut commands: Commands,
     mut state: ResMut<TimeWellState>,
     mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut ui_cameras: Query<&mut Camera, With<Camera2d>>,
 ) {
+    // Fresh entry always starts in the overview (not focused).
+    state.focused = false;
+
     // Build the shared card quad once.
     if state.card_mesh.is_none() {
         state.card_mesh = Some(meshes.add(Rectangle::new(CARD_WIDTH, CARD_HEIGHT)));
@@ -219,26 +235,30 @@ pub fn enter_time_well(
         Name::new("TimeWellCamera"),
     ));
 
-    // Reading slot: a full-width panel across the bottom third, composited over
-    // the well by the order-1 UI camera. It's a 2D UI node (exact placement, no
-    // perspective) sampling the shared RTT texture; `update_reading_card` fills
-    // the texture from the current selection (blank until one exists).
-    let reading_image = create_vello_texture(&mut images, READING_TEX_W as u32, READING_TEX_H as u32);
+    // Focus card: an in-world 3D card floating lower-center at the mouth of the
+    // well (not a flat HUD panel — it lives in the scene, billboarded, and the
+    // camera dollies into it on focus). It renders the current selection;
+    // `update_reading_card` fills its texture (blank until a selection exists).
+    let focus_mesh = meshes.add(Rectangle::new(FOCUS_QUAD_W, FOCUS_QUAD_H));
+    let focus_image = create_vello_texture(&mut images, READING_TEX_W as u32, READING_TEX_H as u32);
+    let focus_material = materials.add(StandardMaterial {
+        base_color: Color::WHITE,
+        base_color_texture: Some(focus_image.clone()),
+        unlit: true,
+        cull_mode: None,
+        double_sided: true,
+        alpha_mode: AlphaMode::Mask(0.5),
+        ..default()
+    });
     commands.spawn((
         ReadingCard,
-        Node {
-            position_type: PositionType::Absolute,
-            left: Val::Px(0.0),
-            right: Val::Px(0.0),
-            bottom: Val::Px(0.0),
-            width: Val::Percent(100.0),
-            height: Val::Percent(READING_PANEL_FRAC * 100.0),
-            ..default()
-        },
-        ImageNode::new(reading_image.clone()),
+        Mesh3d(focus_mesh),
+        MeshMaterial3d(focus_material),
+        Transform::from_translation(FOCUS_CARD_POS),
+        Visibility::Inherited,
         VelloUiScene::default(),
         VelloUiTexture {
-            image: reading_image,
+            image: focus_image,
             width: READING_TEX_W as u32,
             height: READING_TEX_H as u32,
         },
@@ -270,6 +290,7 @@ pub fn exit_time_well(
     }
 
     state.entities.clear();
+    state.focused = false;
     // Reset the join so re-entering rebuilds from scratch (the contexts are
     // re-polled by DriftState; nothing durable is lost).
     state.join = kaijutsu_viz::join::Join::new();
@@ -288,27 +309,22 @@ pub fn exit_time_well(
 // TOGGLE
 // ============================================================================
 
-/// Toggle into the well with Ctrl+W (when not typing); leave with Esc.
+/// Enter the well with Ctrl+W (when not typing). Leaving is Esc, handled in
+/// [`well_keyboard`] so it can be focus-aware (Esc backs out of focus first,
+/// then leaves the well).
 pub fn toggle_time_well(
     keys: Res<ButtonInput<KeyCode>>,
     focus_area: Res<crate::input::focus::FocusArea>,
     screen: Res<State<Screen>>,
     mut next: ResMut<NextState<Screen>>,
 ) {
-    match screen.get() {
-        Screen::Conversation => {
-            if focus_area.is_text_input() {
-                return;
-            }
-            let ctrl = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
-            if ctrl && keys.just_pressed(KeyCode::KeyW) {
-                next.set(Screen::TimeWell);
-            }
+    if *screen.get() == Screen::Conversation {
+        if focus_area.is_text_input() {
+            return;
         }
-        Screen::TimeWell => {
-            if keys.just_pressed(KeyCode::Escape) {
-                next.set(Screen::Conversation);
-            }
+        let ctrl = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
+        if ctrl && keys.just_pressed(KeyCode::KeyW) {
+            next.set(Screen::TimeWell);
         }
     }
 }
@@ -423,12 +439,29 @@ pub fn well_keyboard(
         }
     }
 
-    // Enter: switch to the selected card.
-    if keys.just_pressed(KeyCode::Enter)
-        && let Some(id) = state.selected
-    {
-        switch.write(crate::view::components::ContextSwitchRequested { context_id: id });
-        next.set(Screen::Conversation);
+    // Enter is two-stage: from the overview it *focuses* (the camera dollies into
+    // the focus card); a second Enter while focused *commits* — switches to the
+    // context and leaves the well.
+    if keys.just_pressed(KeyCode::Enter) {
+        if state.focused {
+            if let Some(id) = state.selected {
+                switch.write(crate::view::components::ContextSwitchRequested { context_id: id });
+                next.set(Screen::Conversation);
+            }
+        } else if state.selected.is_some() {
+            state.focused = true;
+        }
+        return;
+    }
+
+    // Esc backs out: from focus it returns to the overview; from the overview it
+    // leaves the well. (This is why Esc lives here, not in `toggle_time_well`.)
+    if keys.just_pressed(KeyCode::Escape) {
+        if state.focused {
+            state.focused = false;
+        } else {
+            next.set(Screen::Conversation);
+        }
         return;
     }
 
@@ -522,15 +555,16 @@ pub fn highlight_lineage(state: Res<TimeWellState>, mut cards: Query<&mut Card>)
 const CAM_BASE_POS: Vec3 = Vec3::new(0.0, 80.0, 920.0);
 const CAM_BASE_LOOK: Vec3 = Vec3::new(0.0, 80.0, -200.0);
 
-/// Ease the well camera so the view *leans* toward the current selection — the
-/// first step of the camera-driven focus (in-world motion instead of a flat HUD).
+/// Ease the well camera between two poses, exponentially smoothed (slower than
+/// the cards, so the view glides):
+/// - **focused** → dolly straight in front of the focus card so it fills the
+///   view (the Enter-to-focus zoom; Esc backs out).
+/// - **overview** → *lean* toward the current selection (look-point + a little
+///   x-parallax slide partway toward the selected card's settled `CardTarget`),
+///   keeping the whole well legible. Nothing selected → the base framing.
 ///
-/// The look-point and a little x-parallax slide partway toward the selected
-/// card's settled position (`CardTarget`, so the camera tracks where the card is
-/// going, not its mid-tween jitter), then ease in with exponential smoothing —
-/// slower than the cards, so the view glides. Nothing selected → return to the
-/// base framing. Deliberately partial (leans, doesn't recenter) so the whole well
-/// stays legible; the full dive-through is the later JOIN transition.
+/// The full dive *through* the card into the conversation is the later JOIN
+/// transition; here Enter-focus only zooms to the pedestal.
 pub fn ease_camera_to_selection(
     time: Res<Time>,
     state: Res<TimeWellState>,
@@ -541,24 +575,28 @@ pub fn ease_camera_to_selection(
         return;
     };
 
-    let selected_pos = state
-        .selected
-        .and_then(|sel| cards.iter().find(|(c, _)| c.context_id == sel))
-        .map(|(_, t)| t.0);
-
-    let (desired_pos, desired_look) = match selected_pos {
-        Some(p) => {
-            // Lean the look-point toward the selection; nudge the camera x for a
-            // touch of parallax. Fractions kept low so the overview survives.
-            let look = Vec3::new(
-                p.x * 0.4,
-                CAM_BASE_LOOK.y + (p.y - CAM_BASE_LOOK.y) * 0.3,
-                CAM_BASE_LOOK.z,
-            );
-            let pos = Vec3::new(p.x * 0.18, CAM_BASE_POS.y, CAM_BASE_POS.z);
-            (pos, look)
+    let (desired_pos, desired_look) = if state.focused {
+        // Dolly to a tight head-on framing of the focus card so it fills the view.
+        (FOCUS_CARD_POS + Vec3::new(0.0, 0.0, 360.0), FOCUS_CARD_POS)
+    } else {
+        let selected_pos = state
+            .selected
+            .and_then(|sel| cards.iter().find(|(c, _)| c.context_id == sel))
+            .map(|(_, t)| t.0);
+        match selected_pos {
+            Some(p) => {
+                // Lean the look-point toward the selection; nudge the camera x for
+                // a touch of parallax. Fractions kept low so the overview survives.
+                let look = Vec3::new(
+                    p.x * 0.4,
+                    CAM_BASE_LOOK.y + (p.y - CAM_BASE_LOOK.y) * 0.3,
+                    CAM_BASE_LOOK.z,
+                );
+                let pos = Vec3::new(p.x * 0.18, CAM_BASE_POS.y, CAM_BASE_POS.z);
+                (pos, look)
+            }
+            None => (CAM_BASE_POS, CAM_BASE_LOOK),
         }
-        None => (CAM_BASE_POS, CAM_BASE_LOOK),
     };
 
     let desired = Transform::from_translation(desired_pos).looking_at(desired_look, Vec3::Y);
@@ -571,7 +609,7 @@ pub fn ease_camera_to_selection(
 /// this is the one-line `looking_at` per card the design doc calls for.
 pub fn billboard_cards(
     camera: Query<&GlobalTransform, With<TimeWellCamera>>,
-    mut cards: Query<&mut Transform, With<Card>>,
+    mut cards: Query<&mut Transform, Or<(With<Card>, With<ReadingCard>)>>,
 ) {
     let Ok(cam) = camera.single() else {
         return;
