@@ -55,7 +55,7 @@ enum Status {
   error @3;
 }
 
-# Block content type — 9 variants covering what a block *is*.
+# Block content type — 10 variants covering what a block *is*.
 # Mechanism metadata lives in companion enums:
 # - ToolKind on ToolCall/ToolResult: which execution engine (Shell, Mcp, Builtin)
 # - DriftKind on Drift: how content transferred (Push, Pull, Merge, Distill)
@@ -84,38 +84,6 @@ enum ToolKind {
   builtin @2;   # Kernel builtin tool (no external process)
 }
 
-# Submit routing: explicit mode instead of prefix-sniffing.
-enum InputMode {
-  chat @0;
-  shell @1;
-}
-
-# Discriminant for BlockFlow event variants (for subscription filtering).
-enum BlockFlowKind {
-  inserted @0;
-  textOps @1;
-  deleted @2;
-  statusChanged @3;
-  collapsedChanged @4;
-  moved @5;
-  syncReset @6;
-  outputChanged @7;
-  metadataChanged @8;
-  contextSwitched @9;
-  excludedChanged @10;
-}
-
-# Server-side filter for block event subscriptions.
-# Empty lists = unconstrained. All constraints are AND'd.
-struct BlockEventFilter {
-  contextIds @0 :List(Data);         # 16-byte ContextId UUIDs
-  hasContextIds @1 :Bool;            # Needed because empty list ≠ unconstrained
-  eventTypes @2 :List(BlockFlowKind);
-  hasEventTypes @3 :Bool;
-  blockKinds @4 :List(BlockKind);
-  hasBlockKinds @5 :Bool;
-}
-
 # How a drift block arrived from another context.
 enum DriftKind {
   push @0;          # User manually pushed content
@@ -124,106 +92,17 @@ enum DriftKind {
   distill @3;       # LLM-summarized before transfer
   notification @4;  # External notification (MCP resource updates, system events)
   fork @5;          # Fork marker (ephemeral, summarizes the fork operation)
-  # NB: `commit @4` (git provenance) was removed 2026-06-16; notification/fork
-  # renumbered down. Wire-only change (capnp is transient; persistence is CBOR
-  # by name) but requires server+app+mcp rebuilt together.
 }
 
-# Flat block snapshot — all fields present, some unused depending on kind.
-struct BlockSnapshot {
-  # Core identity
-  id @0 :BlockId;
-
-  # DAG structure
-  parentId @1 :BlockId;
-  hasParentId @2 :Bool;       # True if parentId is set
-
-  # Metadata. Author (who PLAYED) is derived from id.principalId — no separate
-  # field. The hyoushigi `track` below is the LANE (where the clip lives), never
-  # the author; one track's blocks span multiple principals (player + beat()).
-  role @3 :Role;
-  status @4 :Status;
-  kind @5 :BlockKind;
-  createdAt @6 :UInt64;       # Unix timestamp in milliseconds
-
-  # Content (all blocks)
-  content @7 :Text;           # Main text content
-  collapsed @8 :Bool;         # For thinking blocks
-
-  # Tool-specific fields (toolCall)
-  toolName @9 :Text;          # Tool name for toolCall
-  toolInput @10 :Text;        # JSON-encoded input for toolCall
-
-  # Tool-specific fields (toolResult)
-  toolCallId @11 :BlockId;    # Reference to parent toolCall block
-  exitCode @12 :Int32;        # Exit code for toolResult
-  hasExitCode @13 :Bool;      # True if exitCode is set (Int32 value type)
-  isError @14 :Bool;          # True if toolResult is an error
-
-  # Structured output data for richer formatting (typed Cap'n Proto struct)
-  outputData @15 :OutputData;
-
-  # Drift-specific fields (cross-context transfer)
-  sourceContext @16 :Data;    # 16-byte ContextId of originating context
-  sourceModel @17 :Text;      # Model that produced this content
-  driftKind @18 :DriftKind;   # How this block arrived (push/pull/merge/distill)
-  hasDriftKind @19 :Bool;     # True if driftKind is set (enum default 0=push is valid)
-
-  # Tool mechanism metadata (ToolCall / ToolResult)
-  toolKind @20 :ToolKind;     # Which execution engine (shell/mcp/builtin)
-  hasToolKind @21 :Bool;      # True if toolKind is set (enum default 0=shell is valid)
-
-  # File metadata (File blocks)
-  filePath @22 :Text;         # Path for file-kind blocks (e.g. "/src/main.rs")
-
-  # LLM-assigned tool invocation ID (e.g. "toolu_01ABC...")
-  toolUseId @23 :Text;        # Present on ToolCall and ToolResult blocks
-
-  # MIME content type hint (e.g. "text/markdown", "image/svg+xml")
-  contentType @24 :Text;      # Optional — consumers fall back to heuristic detection
-
-  # Ephemeral blocks are displayed but excluded from LLM hydration.
-  # Use for human-only output (help text, status info) that wastes model context.
-  ephemeral @25 :Bool;
-
-  # User-curated exclusion — block is omitted from hydration.
-  # Unlike ephemeral (system-managed), toggled by the user during staging.
-  excluded @26 :Bool;
-
-  # Error-specific fields (Error blocks)
-  errorPayload @27 :ErrorPayload;
-  hasErrorPayload @28 :Bool;
-
-  # Notification-specific fields (Notification blocks)
-  notificationPayload @29 :NotificationPayload;
-  hasNotificationPayload @30 :Bool;
-
-  # Resource-specific fields (Resource blocks)
-  resourcePayload @31 :ResourcePayload;
-  hasResourcePayload @32 :Bool;
-
-  # Standard error stream (toolResult) — persisted separately from content (stdout)
-  stderr @33 :Text;
-  hasStderr @34 :Bool;        # True if stderr is set (distinguishes "" from unset)
-
-  # Hyoushigi timeline coordinate — Some only for blocks materialized from a
-  # committed timeline cell; absent on every ordinary block.
-  tick @35 :Int64;
-  hasTick @36 :Bool;          # True if tick is set (Int64 value type)
-
-  # Reasoning-continuity token for Thinking blocks — opaque, provider-agnostic
-  # marker ("rehydratable"): the verbatim Anthropic/Gemini signature, or a
-  # provider nonce. Absent (hasSignature=false) on non-reasoning blocks and
-  # legacy/older-wire blocks.
-  signature @37 :Text;
-  hasSignature @38 :Bool;     # True if signature is set (distinguishes "" from unset)
-
-  # Hyoushigi track — stable lane identity (DAW sense). Set only on blocks
-  # materialized from a committed timeline cell. Author (who played) remains
-  # id.principalId; track is the lane, never the author.
-  track @39 :Text;
-  hasTrack @40 :Bool;         # True if track is set (None ⇔ hasTrack=false)
+# Submit routing: explicit mode instead of prefix-sniffing.
+enum InputMode {
+  chat @0;
+  shell @1;
 }
+
+# ============================================================================
+# Block Payloads (kind-specific structured fields on BlockSnapshot)
+# ============================================================================
 
 # What system produced the error.
 enum ErrorCategory {
@@ -287,7 +166,7 @@ struct NotificationPayload {
   detail @7 :Text;              # Expandable body — empty = None
 }
 
-# Structured resource payload for Resource blocks (Phase 3 — D-42).
+# Structured resource payload for Resource blocks.
 # Exactly one of `text`/`blobBase64` is populated per read, signaled by the
 # corresponding `has*` flag. Binary bodies stay base64-encoded end-to-end.
 struct ResourcePayload {
@@ -305,6 +184,91 @@ struct ResourcePayload {
   parentResourceBlockId @11 :BlockId;
 }
 
+# Flat block snapshot — all fields present, some unused depending on kind.
+struct BlockSnapshot {
+  # Identity. Author (who PLAYED) is derived from id.principalId — there is no
+  # separate author field. The hyoushigi `track` below is the LANE (where the
+  # clip lives), never the author; one track's blocks span multiple principals
+  # (player + beat()).
+  id @0 :BlockId;
+
+  # DAG structure
+  parentId @1 :BlockId;
+  hasParentId @2 :Bool;          # True if parentId is set
+
+  # Classification
+  role @3 :Role;
+  status @4 :Status;
+  kind @5 :BlockKind;
+  createdAt @6 :UInt64;          # Unix timestamp in milliseconds
+
+  # Content (all blocks)
+  content @7 :Text;              # Main text content
+  contentType @8 :Text;         # MIME hint (e.g. "text/markdown"); empty = heuristic detection
+  collapsed @9 :Bool;           # For thinking blocks
+
+  # Hydration control
+  # ephemeral: displayed but excluded from LLM hydration (system-managed —
+  #   human-only output like help text/status that would waste model context).
+  # excluded: user-curated exclusion, toggled during staging.
+  ephemeral @10 :Bool;
+  excluded @11 :Bool;
+
+  # Tool call (toolCall)
+  toolName @12 :Text;            # Tool name for toolCall
+  toolInput @13 :Text;           # JSON-encoded input for toolCall
+  toolUseId @14 :Text;           # LLM-assigned invocation ID ("toolu_01ABC…") — on ToolCall + ToolResult
+  toolKind @15 :ToolKind;        # Which execution engine (shell/mcp/builtin)
+  hasToolKind @16 :Bool;         # True if toolKind is set (enum default 0=shell is valid)
+
+  # Tool result (toolResult)
+  toolCallId @17 :BlockId;       # Reference to parent toolCall block
+  exitCode @18 :Int32;           # Exit code for toolResult
+  hasExitCode @19 :Bool;         # True if exitCode is set (Int32 value type)
+  isError @20 :Bool;             # True if toolResult is an error
+  stderr @21 :Text;              # Standard error stream — persisted separately from content (stdout)
+  hasStderr @22 :Bool;           # True if stderr is set (distinguishes "" from unset)
+
+  # Structured output data for richer formatting (typed Cap'n Proto struct)
+  outputData @23 :OutputData;
+
+  # File metadata (file blocks)
+  filePath @24 :Text;            # Path for file-kind blocks (e.g. "/src/main.rs")
+
+  # Drift (cross-context transfer)
+  sourceContext @25 :Data;       # 16-byte ContextId of originating context
+  sourceModel @26 :Text;         # Model that produced this content
+  driftKind @27 :DriftKind;      # How this block arrived (push/pull/merge/distill)
+  hasDriftKind @28 :Bool;        # True if driftKind is set (enum default 0=push is valid)
+
+  # Error payload (error blocks)
+  errorPayload @29 :ErrorPayload;
+  hasErrorPayload @30 :Bool;
+
+  # Notification payload (notification blocks)
+  notificationPayload @31 :NotificationPayload;
+  hasNotificationPayload @32 :Bool;
+
+  # Resource payload (resource blocks)
+  resourcePayload @33 :ResourcePayload;
+  hasResourcePayload @34 :Bool;
+
+  # Hyoushigi timeline — set only on blocks materialized from a committed
+  # timeline cell; absent on every ordinary block. `tick` is the timeline
+  # coordinate; `track` is the stable lane identity (DAW sense), never the
+  # author (author stays id.principalId).
+  tick @35 :Int64;
+  hasTick @36 :Bool;             # True if tick is set (Int64 value type)
+  track @37 :Text;
+  hasTrack @38 :Bool;            # True if track is set (None ⇔ hasTrack=false)
+
+  # Reasoning-continuity token for Thinking blocks — opaque, provider-agnostic
+  # "rehydratable" marker: verbatim Anthropic/Gemini signature, or a provider
+  # nonce. Absent on non-reasoning and legacy/older-wire blocks.
+  signature @39 :Text;
+  hasSignature @40 :Bool;        # True if signature is set (distinguishes "" from unset)
+}
+
 # Full context state — blocks + CRDT oplog for sync
 struct ContextState {
   contextId @0 :Data;   # 16-byte ContextId (UUIDv7)
@@ -313,45 +277,34 @@ struct ContextState {
   ops @3 :Data;         # Full oplog bytes for CRDT sync
 }
 
-# Query for fetching blocks — union of all/byIds/byFilter
-struct BlockQuery {
-  union {
-    all @0 :Void;
-    byIds @1 :List(BlockId);
-    byFilter @2 :BlockFilter;
-  }
+# ============================================================================
+# Block Events & Subscriptions
+# ============================================================================
+
+# Discriminant for BlockFlow event variants (for subscription filtering).
+enum BlockFlowKind {
+  inserted @0;
+  textOps @1;
+  deleted @2;
+  statusChanged @3;
+  collapsedChanged @4;
+  moved @5;
+  syncReset @6;
+  outputChanged @7;
+  metadataChanged @8;
+  contextSwitched @9;
+  excludedChanged @10;
 }
 
-# Filter criteria for block queries
-struct BlockFilter {
-  kinds @0 :List(BlockKind);
-  hasKinds @1 :Bool;
-  roles @2 :List(Role);
-  hasRoles @3 :Bool;
-  statuses @4 :List(Status);
-  hasStatuses @5 :Bool;
-  excludeCompacted @6 :Bool;
-  limit @7 :UInt32;
-  maxDepth @8 :UInt32;
-  parentId @9 :BlockId;
-  hasParentId @10 :Bool;
-}
-
-# What changed at a given version
-enum ChangeKind {
-  blockAdded @0;
-  blockDeleted @1;
-  edit @2;
-  statusChange @3;
-}
-
-# Snapshot of a context version for timeline navigation
-struct VersionSnapshot {
-  version @0 :UInt64;         # Context version number
-  timestamp @1 :UInt64;       # Unix millis when this version was created
-  blockCount @2 :UInt32;      # Number of blocks at this version
-  changeKind @3 :ChangeKind;
-  changedBlockId @4 :BlockId; # The block that changed (if applicable)
+# Server-side filter for block event subscriptions.
+# Empty lists = unconstrained. All constraints are AND'd.
+struct BlockEventFilter {
+  contextIds @0 :List(Data);         # 16-byte ContextId UUIDs
+  hasContextIds @1 :Bool;            # Needed because empty list ≠ unconstrained
+  eventTypes @2 :List(BlockFlowKind);
+  hasEventTypes @3 :Bool;
+  blockKinds @4 :List(BlockKind);
+  hasBlockKinds @5 :Bool;
 }
 
 # Scalar block metadata carried by onBlockMetadataChanged.
@@ -402,6 +355,51 @@ interface BlockEvents {
   # Structured output data changed (output is not DTE-tracked, so it rides
   # its own event rather than the block text op stream).
   onBlockOutputChanged @12 (contextId :Data, blockId :BlockId, output :OutputData);
+}
+
+# ============================================================================
+# Block Queries & Timeline
+# ============================================================================
+
+# Query for fetching blocks — union of all/byIds/byFilter
+struct BlockQuery {
+  union {
+    all @0 :Void;
+    byIds @1 :List(BlockId);
+    byFilter @2 :BlockFilter;
+  }
+}
+
+# Filter criteria for block queries
+struct BlockFilter {
+  kinds @0 :List(BlockKind);
+  hasKinds @1 :Bool;
+  roles @2 :List(Role);
+  hasRoles @3 :Bool;
+  statuses @4 :List(Status);
+  hasStatuses @5 :Bool;
+  excludeCompacted @6 :Bool;
+  limit @7 :UInt32;
+  maxDepth @8 :UInt32;
+  parentId @9 :BlockId;
+  hasParentId @10 :Bool;
+}
+
+# What changed at a given version
+enum ChangeKind {
+  blockAdded @0;
+  blockDeleted @1;
+  edit @2;
+  statusChange @3;
+}
+
+# Snapshot of a context version for timeline navigation
+struct VersionSnapshot {
+  version @0 :UInt64;         # Context version number
+  timestamp @1 :UInt64;       # Unix millis when this version was created
+  blockCount @2 :UInt32;      # Number of blocks at this version
+  changeKind @3 :ChangeKind;
+  changedBlockId @4 :BlockId; # The block that changed (if applicable)
 }
 
 # ============================================================================
@@ -509,6 +507,20 @@ struct StagedDriftInfo {
   sourceModel @4 :Text;
   driftKind @5 :DriftKind;
   createdAt @6 :UInt64;
+}
+
+# A staged drift that exceeded its retry budget or whose target dropped
+# out of the drift router. Mirrors `kaijutsu_kernel::drift::StagedDrift`.
+struct DeadLetter {
+  id @0 :UInt64;
+  sourceCtx @1 :Data;
+  targetCtx @2 :Data;
+  content @3 :Text;
+  sourceModel @4 :Text;       # empty when not known
+  hasSourceModel @5 :Bool;
+  driftKind @6 :Text;
+  createdAt @7 :UInt64;
+  retryCount @8 :UInt32;
 }
 
 # ============================================================================
@@ -877,6 +889,17 @@ interface LoggingEvents {
 }
 
 # ============================================================================
+# Kernel KV Events
+# ============================================================================
+
+# Callback interface for receiving kernel KV change events.
+interface KvEvents {
+  # A key changed. `deleted = true` means the key was removed (`value` empty);
+  # otherwise `value` is the new value.
+  onChange @0 (key :Text, value :Text, deleted :Bool);
+}
+
+# ============================================================================
 # Server Interfaces
 # ============================================================================
 
@@ -890,277 +913,10 @@ interface World {
 }
 
 interface Kernel {
-  # Info
+  # ==========================================================================
+  # Kernel info & liveness
+  # ==========================================================================
   getInfo @0 (trace :TraceContext) -> (info :KernelInfo);
-
-  # kaish execution
-  execute @1 (code :Text, trace :TraceContext) -> (execId :UInt64);
-  interrupt @2 (execId :UInt64, trace :TraceContext);
-  complete @3 (partial :Text, cursor :UInt32, trace :TraceContext) -> (completions :List(Completion));
-  subscribeOutput @4 (callback :KernelOutput);
-  getCommandHistory @5 (limit :UInt32, trace :TraceContext) -> (entries :List(HistoryEntry));
-
-  # VFS
-  vfs @6 () -> (vfs :Vfs);
-  listMounts @7 () -> (mounts :List(MountInfo));
-  mount @8 (path :Text, source :Text, writable :Bool);
-  unmount @9 (path :Text) -> (success :Bool);
-
-  # Tool execution
-  executeTool @10 (call :ToolCall, trace :TraceContext) -> (result :ToolResult);
-  getToolSchemas @11 (trace :TraceContext) -> (schemas :List(ToolSchema));
-  subscribeBlocks @12 (callback :BlockEvents);
-  getContextState @13 (contextId :Data, trace :TraceContext) -> (state :ContextState);
-
-  # LLM operations
-  prompt @14 (request :LlmRequest, trace :TraceContext) -> (promptId :Text);
-
-  # Context management (ContextId = 16-byte UUIDv7 as Data)
-  listContexts @15 (trace :TraceContext) -> (contexts :List(ContextHandleInfo));
-  createContext @16 (label :Text, contextType :Text) -> (id :Data);
-  joinContext @17 (contextId :Data, instance :Text, trace :TraceContext) -> (contextId :Data);
-
-  # MCP (Model Context Protocol) management
-  # registerMcp/unregisterMcp removed 2026-06-10; interface ordinals renumbered.
-  listMcpServers @18 () -> (servers :List(McpServerInfo));
-  callMcpTool @19 (call :McpToolCall, trace :TraceContext) -> (result :McpToolResult);
-
-  # Shell execution (kaish REPL with block output)
-  # Creates ToolCall (ToolKind::Shell) and ToolResult (ToolKind::Shell) blocks, streams output via BlockEvents
-  shellExecute @20 (code :Text, contextId :Data, trace :TraceContext, userInitiated :Bool) -> (commandBlockId :BlockId);
-
-  # Shell state (kaish working directory and last result)
-  getCwd @21 () -> (path :Text);
-  setCwd @22 (path :Text) -> (success :Bool, error :Text);
-  getLastResult @23 () -> (result :ShellExecResult);
-
-  # Blob storage (writeBlob/readBlob/deleteBlob/listBlobs) removed 2026-06-10;
-  # interface ordinals renumbered. The playback design's narrow read-only CAS
-  # fetch-by-hash RPC is a new, scoped method at a fresh ordinal — not a revival
-  # of this generic API.
-
-  # Push CRDT operations from client to server for bidirectional sync
-  # Returns ack version so client knows ops were accepted and ordered
-  pushOps @24 (contextId :Data, ops :Data, trace :TraceContext) -> (ackVersion :UInt64);
-
-  # MCP Resource management (push-first with caching)
-  # readMcpResource removed 2026-06-10; interface ordinals renumbered.
-  listMcpResources @25 (server :Text, trace :TraceContext) -> (resources :List(McpResource));
-  subscribeMcpResources @26 (callback :ResourceEvents, instance :Text);
-
-  # MCP Roots (client advertises workspaces to servers)
-  setMcpRoots @27 (roots :List(McpRoot));
-
-  # MCP Prompts (poll-based with optional caching)
-  listMcpPrompts @28 (server :Text) -> (prompts :List(McpPrompt));
-  getMcpPrompt @29 (server :Text, name :Text, arguments :Text) -> (messages :List(McpPromptMessage));
-
-  # MCP Progress (push-based streaming)
-  subscribeMcpProgress @30 (callback :ProgressEvents);
-
-  # MCP Elicitation (server-initiated requests for user input)
-  subscribeMcpElicitations @31 (callback :ElicitationEvents, instance :Text);
-
-  # MCP Completion (request/response)
-  completeMcp @32 (server :Text, refType :Text, refName :Text, argName :Text, value :Text) -> (result :McpCompletionResult);
-
-  # MCP Logging
-  setMcpLogLevel @33 (server :Text, level :Text);
-  subscribeMcpLogs @34 (callback :LoggingEvents);
-
-  # MCP Cancellation
-  cancelMcpRequest @35 (server :Text, requestId :Text);
-
-  # ============================================================================
-  # Peer Registry (drift navigation transport)
-  # ============================================================================
-  # Peers are named RPC participants (the Bevy app, MCP servers, future
-  # clients) that the kernel can dispatch invocations to. The transport is
-  # how MCP-driven agents tell the app to switch contexts, etc.
-
-  # Attach a peer to this kernel.
-  # `commands` is the callback the kernel uses to invoke this peer.
-  attachPeer @36 (config :PeerConfig, commands :PeerCommands) -> (info :PeerInfo);
-
-  # List all attached peers on this kernel.
-  listPeers @37 () -> (peers :List(PeerInfo));
-
-  # Detach a peer from this kernel.
-  detachPeer @38 (nick :Text);
-
-  # Invoke a peer. Params and result are JSON bytes.
-  invokePeer @39 (nick :Text, action :Text, params :Data) -> (result :Data);
-
-  # ============================================================================
-  # Timeline Navigation (Fork-First Temporal Model)
-  # ============================================================================
-  # Navigate through context history with fork and cherry-pick operations.
-  # The past is read-only, but forking is ubiquitous.
-
-  # Cherry-pick a block into another context (carries lineage)
-  cherryPickBlock @40 (sourceBlockId :BlockId, targetContextId :Data, trace :TraceContext) -> (newBlockId :BlockId);
-
-  # Get context version history for timeline scrubber
-  getContextHistory @41 (contextId :Data, limit :UInt32, trace :TraceContext) -> (snapshots :List(VersionSnapshot));
-
-  # ============================================================================
-  # Configuration (Config as CRDT)
-  # ============================================================================
-  # Config files (theme.toml, bindings.toml, models.toml, etc.) are managed as CRDT documents.
-
-  # List loaded config documents
-  listConfigs @42 () -> (configs :List(Text));
-
-  # Reload a config file from disk, discarding CRDT changes (safety valve)
-  reloadConfig @43 (path :Text) -> (success :Bool, error :Text);
-
-  # Reset a config file to embedded default
-  resetConfig @44 (path :Text) -> (success :Bool, error :Text);
-
-  # Get config content (from CRDT)
-  getConfig @45 (path :Text) -> (content :Text, error :Text);
-
-  # ============================================================================
-  # Multi-Context Drifting (Cross-Context Communication)
-  # ============================================================================
-  # Drift enables content transfer between kernel contexts with provenance tracking.
-
-  # Get this kernel's context ID and label
-  getContextId @46 (trace :TraceContext) -> (id :Data, label :Text);
-
-  # Configure LLM provider/model for a specific context (per-context model assignment).
-  # If contextId is empty/missing, uses the connection's current context.
-  configureLlm @47 (provider :Text, model :Text, trace :TraceContext, contextId :Data) -> (success :Bool, error :Text);
-
-  # List staged drifts pending flush
-  driftQueue @48 () -> (staged :List(StagedDriftInfo));
-
-  # Cancel a staged drift by ID
-  driftCancel @49 (stagedId :UInt64) -> (success :Bool);
-
-  # Rename a context's label
-  renameContext @50 (contextId :Data, label :Text);
-
-  # ============================================================================
-  # LLM Configuration (Per-Kernel Multi-Provider LLM)
-  # ============================================================================
-
-  # Get current LLM configuration for this kernel
-  getLlmConfig @51 (trace :TraceContext) -> (config :LlmConfigInfo);
-
-  # Set default LLM provider
-  setDefaultProvider @52 (provider :Text) -> (success :Bool, error :Text);
-
-  # Set default model for a provider
-  setDefaultModel @53 (provider :Text, model :Text) -> (success :Bool, error :Text);
-
-  # ============================================================================
-  # Shell Variable Introspection (kaish scope)
-  # ============================================================================
-
-  # Get a shell variable by name
-  getShellVar @54 (name :Text) -> (value :ShellValue, found :Bool);
-
-  # Set a shell variable
-  setShellVar @55 (name :Text, value :ShellValue) -> (success :Bool, error :Text);
-
-  # List all shell variables
-  listShellVars @56 () -> (vars :List(ShellVar));
-
-  # Compact a context's oplog, bumping sync generation.
-  # Connected clients will receive onSyncReset and must re-fetch full state.
-  compactContext @57 (contextId :Data, trace :TraceContext) -> (newSize :UInt64, generation :UInt64);
-
-  # ============================================================================
-  # Input Document (CRDT scratchpad per context)
-  # ============================================================================
-  # Each context has a companion CRDT text document for compose input.
-  # Any participant can read/write it. Submit snapshots to conversation block.
-
-  # High-level edit: insert text at position, delete characters
-  editInput @58 (contextId :Data, pos :UInt64, insert :Text, delete :UInt64, trace :TraceContext) -> (ackVersion :UInt64);
-
-  # Full state fetch for join/reconnect recovery
-  getInputState @59 (contextId :Data, trace :TraceContext) -> (content :Text, ops :Data, version :UInt64);
-
-  # Raw DTE ops for CRDT-aware clients
-  pushInputOps @60 (contextId :Data, ops :Data, trace :TraceContext) -> (ackVersion :UInt64);
-
-  # Atomic submit: read input, create block, clear input.
-  # Mode is explicit — no prefix detection.
-  submitInput @61 (contextId :Data, mode :InputMode, trace :TraceContext) -> (commandBlockId :BlockId);
-
-  # Semantic search: find contexts similar to a text query
-  searchSimilar @62 (query :Text, k :UInt32, trace :TraceContext) -> (results :List(SimilarContext));
-
-  # Context neighbors: find contexts similar to a given context
-  getNeighbors @63 (contextId :Data, k :UInt32, trace :TraceContext) -> (results :List(SimilarContext));
-
-  # Clustering: group contexts by semantic similarity
-  getClusters @64 (minClusterSize :UInt32, trace :TraceContext) -> (clusters :List(ContextCluster));
-
-  # ============================================================================
-  # Block Queries (replaces getContextState for block-only fetches)
-  # ============================================================================
-
-  # Fetch blocks by query: all, byIds, or byFilter
-  getBlocks @65 (contextId :Data, query :BlockQuery, trace :TraceContext) -> (blocks :List(BlockSnapshot));
-
-  # Fetch CRDT sync state only (ops + version, no blocks)
-  getContextSync @66 (contextId :Data, trace :TraceContext) -> (contextId :Data, ops :Data, version :UInt64);
-
-  # ============================================================================
-  # Filtered Block Subscriptions
-  # ============================================================================
-
-  # Subscribe to block events with server-side filtering.
-  # Like subscribeBlocks @13 but the server applies the filter before sending,
-  # reducing bandwidth and client CPU during high-throughput streaming.
-  subscribeBlocksFiltered @67 (callback :BlockEvents, filter :BlockEventFilter, instance :Text);
-
-  # Interrupt a running LLM stream or shell jobs for a context.
-  # immediate=false → soft interrupt (stop agentic loop after current tool turn).
-  # immediate=true  → hard interrupt (abort LLM stream + kill all kaish jobs).
-  # Returns success=false when context has no active interrupt state (i.e. nothing running).
-  interruptContext @68 (contextId :Data, immediate :Bool, trace :TraceContext) -> (success :Bool);
-
-  # List all presets for this kernel
-  listPresets @69 (trace :TraceContext) -> (presets :List(PresetInfo));
-
-  # Clear the input document for a context (discard draft).
-  # Emits InputCleared so all clients can reset their compose state.
-  clearInput @70 (contextId :Data, trace :TraceContext) -> ();
-
-  # Set lifecycle state for a context (e.g., Staging → Live).
-  setContextState @71 (contextId :Data, state :Text, trace :TraceContext) -> (success :Bool, error :Text);
-
-  # Set the excluded flag on a block (staging curation).
-  setBlockExcluded @72 (contextId :Data, blockId :BlockId, excluded :Bool, trace :TraceContext) -> (ackVersion :UInt64);
-
-  # Move a block to a new position. When `hasAfter` is true, `after` is
-  # the block to land after; otherwise the block is parked at the
-  # beginning of the document. Mirrors the `has_parent_id` idiom used
-  # elsewhere in the schema. CRDT + kernel impls exist; this is the
-  # protocol seam (M2-B1).
-  moveBlock @73 (contextId :Data, blockId :BlockId, hasAfter :Bool, after :BlockId, trace :TraceContext) -> (ackVersion :UInt64);
-
-  # Drop this session's binding to a context. Used by the constellation
-  # archive flow so the drift router can mark the context Archived
-  # without an active session re-resurrecting it on the next op (M2-B3).
-  # Idempotent: returns true if the session held a binding to that
-  # context, false otherwise.
-  contextLeave @74 (contextId :Data, trace :TraceContext) -> (left :Bool);
-
-  # Inspect the drift router's dead-letter queue (M2-B4). Non-consuming
-  # — pairs with replayDeadLetter. Drifts land here when MAX_DRIFT_RETRIES
-  # is exceeded or the target context unregisters before delivery.
-  listDeadLetters @75 (trace :TraceContext) -> (items :List(DeadLetter));
-
-  # Replay a dead-letter item by id: extract from DLQ, reset retry count,
-  # push back to the staging queue for another flush attempt. Returns
-  # `replayed = false` when the id isn't present (already drained or
-  # never queued).
-  replayDeadLetter @76 (id :UInt64, trace :TraceContext) -> (replayed :Bool);
 
   # Cheap liveness probe used by the client's reconnection FSM.
   # Returns the server-assigned kernel ID (so the client can detect a
@@ -1168,39 +924,74 @@ interface Kernel {
   # in milliseconds since the Unix epoch (for clock-skew diagnostics).
   # Handler must not take any per-context locks — this exists to detect
   # liveness, not to validate kernel state.
-  ping @77 (trace :TraceContext) -> (kernelId :Data, serverTimeMs :UInt64);
+  ping @1 (trace :TraceContext) -> (kernelId :Data, serverTimeMs :UInt64);
 
-  # @78 (checkFacade) retired: facade capability enforcement moved to the
-  # shared shellExecute / editInput / submitInput handlers (deny-by-default,
-  # keyed on the context binding), so humans and agents cross the same gate.
-  # Its ordinal is reused below for kvGet (capnp forbids ordinal holes; the old
-  # method is gone from every client, so the reuse is wire-safe).
+  # ==========================================================================
+  # kaish execution
+  # ==========================================================================
+  execute @2 (code :Text, trace :TraceContext) -> (execId :UInt64);
+  interrupt @3 (execId :UInt64, trace :TraceContext);
+  complete @4 (partial :Text, cursor :UInt32, trace :TraceContext) -> (completions :List(Completion));
+  subscribeOutput @5 (callback :KernelOutput);
+  getCommandHistory @6 (limit :UInt32, trace :TraceContext) -> (entries :List(HistoryEntry));
 
-  # ============================================================================
-  # Kernel Key–Value Store (persistent, synced env — docs/kernel-kv.md)
-  # ============================================================================
-  # A small, durable, collaborative key→string store. Keys are flat UTF-8
-  # strings (dotted namespaces are convention, not mechanism); values are
-  # strings (structured data is the caller's JSON). No per-key ACLs — a
-  # single-user shared-trust kernel.
+  # ==========================================================================
+  # Shell (kaish REPL with block output)
+  # ==========================================================================
+  # Creates ToolCall (ToolKind::Shell) and ToolResult (ToolKind::Shell) blocks, streams output via BlockEvents
+  shellExecute @7 (code :Text, contextId :Data, trace :TraceContext, userInitiated :Bool) -> (commandBlockId :BlockId);
 
-  # Read a key. `found = false` when absent, deleted, or advisory-expired.
-  kvGet @78 (key :Text) -> (value :Text, found :Bool);
+  # Shell state (kaish working directory and last result)
+  getCwd @8 () -> (path :Text);
+  setCwd @9 (path :Text) -> (success :Bool, error :Text);
+  getLastResult @10 () -> (result :ShellExecResult);
 
-  # Set a key. `hasExpiresAt` gates the advisory absolute expiry (writer-clock
-  # ms). Returns an error string on the 64 KB value cap or a persistence fault.
-  kvSet @79 (key :Text, value :Text, hasExpiresAt :Bool, expiresAt :Int64) -> (success :Bool, error :Text);
+  # Shell variable introspection (kaish scope)
+  getShellVar @11 (name :Text) -> (value :ShellValue, found :Bool);
+  setShellVar @12 (name :Text, value :ShellValue) -> (success :Bool, error :Text);
+  listShellVars @13 () -> (vars :List(ShellVar));
 
-  # Delete a key. `existed` reports whether a live value was present.
-  kvDelete @80 (key :Text) -> (existed :Bool);
+  # ==========================================================================
+  # VFS & mounts
+  # ==========================================================================
+  vfs @14 () -> (vfs :Vfs);
+  listMounts @15 () -> (mounts :List(MountInfo));
+  mount @16 (path :Text, source :Text, writable :Bool);
+  unmount @17 (path :Text) -> (success :Bool);
 
-  # List keys, optionally filtered by prefix. `nextCursor` is reserved for
-  # future pagination (always absent in v1).
-  kvKeys @81 (prefix :Text, hasPrefix :Bool) -> (keys :List(Text), nextCursor :Text, hasNextCursor :Bool);
+  # ==========================================================================
+  # Tool execution
+  # ==========================================================================
+  executeTool @18 (call :ToolCall, trace :TraceContext) -> (result :ToolResult);
+  getToolSchemas @19 (trace :TraceContext) -> (schemas :List(ToolSchema));
 
-  # Subscribe to whole-store changes (callback fires per set/delete). The
-  # client filters by prefix; v1 streams the whole store.
-  kvWatch @82 (callback :KvEvents);
+  # ==========================================================================
+  # LLM operations & configuration (per-kernel multi-provider)
+  # ==========================================================================
+  prompt @20 (request :LlmRequest, trace :TraceContext) -> (promptId :Text);
+  getLlmConfig @21 (trace :TraceContext) -> (config :LlmConfigInfo);
+  setDefaultProvider @22 (provider :Text) -> (success :Bool, error :Text);
+  setDefaultModel @23 (provider :Text, model :Text) -> (success :Bool, error :Text);
+
+  # Configure LLM provider/model for a specific context (per-context model assignment).
+  # If contextId is empty/missing, uses the connection's current context.
+  configureLlm @24 (provider :Text, model :Text, trace :TraceContext, contextId :Data) -> (success :Bool, error :Text);
+
+  # ==========================================================================
+  # Context management & lifecycle (ContextId = 16-byte UUIDv7 as Data)
+  # ==========================================================================
+  listContexts @25 (trace :TraceContext) -> (contexts :List(ContextHandleInfo));
+  createContext @26 (label :Text, contextType :Text) -> (id :Data);
+  joinContext @27 (contextId :Data, instance :Text, trace :TraceContext) -> (contextId :Data);
+
+  # Get this kernel's context ID and label
+  getContextId @28 (trace :TraceContext) -> (id :Data, label :Text);
+
+  # Rename a context's label
+  renameContext @29 (contextId :Data, label :Text);
+
+  # Set lifecycle state for a context (e.g., Staging → Live).
+  setContextState @30 (contextId :Data, state :Text, trace :TraceContext) -> (success :Bool, error :Text);
 
   # Conclude a context: the explicit "this work is done" act (the kaijutsu
   # equivalent of exit-ing a mux window). Sets contextState = "concluded" and
@@ -1210,28 +1001,229 @@ interface Kernel {
   # there is no dedicated un-conclude verb. Idempotent: re-concluding a concluded
   # context succeeds without restamping. `success = false` with `error` set when
   # the context can't be concluded (unknown / already archived).
-  conclude @83 (contextId :Data, trace :TraceContext) -> (success :Bool, error :Text);
-}
+  conclude @31 (contextId :Data, trace :TraceContext) -> (success :Bool, error :Text);
 
-# Callback interface for receiving kernel KV change events.
-interface KvEvents {
-  # A key changed. `deleted = true` means the key was removed (`value` empty);
-  # otherwise `value` is the new value.
-  onChange @0 (key :Text, value :Text, deleted :Bool);
-}
+  # Drop this session's binding to a context. Used by the constellation
+  # archive flow so the drift router can mark the context Archived
+  # without an active session re-resurrecting it on the next op.
+  # Idempotent: returns true if the session held a binding to that
+  # context, false otherwise.
+  contextLeave @32 (contextId :Data, trace :TraceContext) -> (left :Bool);
 
-# A staged drift that exceeded its retry budget or whose target dropped
-# out of the drift router. Mirrors `kaijutsu_kernel::drift::StagedDrift`.
-struct DeadLetter {
-  id @0 :UInt64;
-  sourceCtx @1 :Data;
-  targetCtx @2 :Data;
-  content @3 :Text;
-  sourceModel @4 :Text;       # empty when not known
-  hasSourceModel @5 :Bool;
-  driftKind @6 :Text;
-  createdAt @7 :UInt64;
-  retryCount @8 :UInt32;
+  # List all presets for this kernel
+  listPresets @33 (trace :TraceContext) -> (presets :List(PresetInfo));
+
+  # ==========================================================================
+  # Blocks: queries & CRDT sync
+  # ==========================================================================
+  getContextState @34 (contextId :Data, trace :TraceContext) -> (state :ContextState);
+
+  # Fetch blocks by query: all, byIds, or byFilter
+  getBlocks @35 (contextId :Data, query :BlockQuery, trace :TraceContext) -> (blocks :List(BlockSnapshot));
+
+  # Fetch CRDT sync state only (ops + version, no blocks)
+  getContextSync @36 (contextId :Data, trace :TraceContext) -> (contextId :Data, ops :Data, version :UInt64);
+
+  # Push CRDT operations from client to server for bidirectional sync.
+  # Returns ack version so client knows ops were accepted and ordered.
+  pushOps @37 (contextId :Data, ops :Data, trace :TraceContext) -> (ackVersion :UInt64);
+
+  # Compact a context's oplog, bumping sync generation.
+  # Connected clients will receive onSyncReset and must re-fetch full state.
+  compactContext @38 (contextId :Data, trace :TraceContext) -> (newSize :UInt64, generation :UInt64);
+
+  # ==========================================================================
+  # Blocks: subscriptions
+  # ==========================================================================
+  subscribeBlocks @39 (callback :BlockEvents);
+
+  # Subscribe to block events with server-side filtering.
+  # Like subscribeBlocks but the server applies the filter before sending,
+  # reducing bandwidth and client CPU during high-throughput streaming.
+  subscribeBlocksFiltered @40 (callback :BlockEvents, filter :BlockEventFilter, instance :Text);
+
+  # ==========================================================================
+  # Blocks: mutation & curation
+  # ==========================================================================
+  # Set the excluded flag on a block (staging curation).
+  setBlockExcluded @41 (contextId :Data, blockId :BlockId, excluded :Bool, trace :TraceContext) -> (ackVersion :UInt64);
+
+  # Move a block to a new position. When `hasAfter` is true, `after` is
+  # the block to land after; otherwise the block is parked at the
+  # beginning of the document. Mirrors the `has_parent_id` idiom used
+  # elsewhere in the schema.
+  moveBlock @42 (contextId :Data, blockId :BlockId, hasAfter :Bool, after :BlockId, trace :TraceContext) -> (ackVersion :UInt64);
+
+  # ==========================================================================
+  # Turn control
+  # ==========================================================================
+  # Interrupt a running LLM stream or shell jobs for a context.
+  # immediate=false → soft interrupt (stop agentic loop after current tool turn).
+  # immediate=true  → hard interrupt (abort LLM stream + kill all kaish jobs).
+  # Returns success=false when context has no active interrupt state (i.e. nothing running).
+  interruptContext @43 (contextId :Data, immediate :Bool, trace :TraceContext) -> (success :Bool);
+
+  # ==========================================================================
+  # Input document (CRDT scratchpad per context)
+  # ==========================================================================
+  # Each context has a companion CRDT text document for compose input.
+  # Any participant can read/write it. Submit snapshots to conversation block.
+
+  # High-level edit: insert text at position, delete characters
+  editInput @44 (contextId :Data, pos :UInt64, insert :Text, delete :UInt64, trace :TraceContext) -> (ackVersion :UInt64);
+
+  # Full state fetch for join/reconnect recovery
+  getInputState @45 (contextId :Data, trace :TraceContext) -> (content :Text, ops :Data, version :UInt64);
+
+  # Raw DTE ops for CRDT-aware clients
+  pushInputOps @46 (contextId :Data, ops :Data, trace :TraceContext) -> (ackVersion :UInt64);
+
+  # Atomic submit: read input, create block, clear input.
+  # Mode is explicit — no prefix detection.
+  submitInput @47 (contextId :Data, mode :InputMode, trace :TraceContext) -> (commandBlockId :BlockId);
+
+  # Clear the input document for a context (discard draft).
+  # Emits InputCleared so all clients can reset their compose state.
+  clearInput @48 (contextId :Data, trace :TraceContext) -> ();
+
+  # ==========================================================================
+  # Timeline navigation (fork-first temporal model)
+  # ==========================================================================
+  # The past is read-only, but forking is ubiquitous.
+
+  # Cherry-pick a block into another context (carries lineage)
+  cherryPickBlock @49 (sourceBlockId :BlockId, targetContextId :Data, trace :TraceContext) -> (newBlockId :BlockId);
+
+  # Get context version history for timeline scrubber
+  getContextHistory @50 (contextId :Data, limit :UInt32, trace :TraceContext) -> (snapshots :List(VersionSnapshot));
+
+  # ==========================================================================
+  # Semantic search & clustering
+  # ==========================================================================
+  # Semantic search: find contexts similar to a text query
+  searchSimilar @51 (query :Text, k :UInt32, trace :TraceContext) -> (results :List(SimilarContext));
+
+  # Context neighbors: find contexts similar to a given context
+  getNeighbors @52 (contextId :Data, k :UInt32, trace :TraceContext) -> (results :List(SimilarContext));
+
+  # Clustering: group contexts by semantic similarity
+  getClusters @53 (minClusterSize :UInt32, trace :TraceContext) -> (clusters :List(ContextCluster));
+
+  # ==========================================================================
+  # Drift (cross-context communication with provenance)
+  # ==========================================================================
+  # List staged drifts pending flush
+  driftQueue @54 () -> (staged :List(StagedDriftInfo));
+
+  # Cancel a staged drift by ID
+  driftCancel @55 (stagedId :UInt64) -> (success :Bool);
+
+  # Inspect the drift router's dead-letter queue. Non-consuming — pairs with
+  # replayDeadLetter. Drifts land here when MAX_DRIFT_RETRIES is exceeded or
+  # the target context unregisters before delivery.
+  listDeadLetters @56 (trace :TraceContext) -> (items :List(DeadLetter));
+
+  # Replay a dead-letter item by id: extract from DLQ, reset retry count,
+  # push back to the staging queue for another flush attempt. Returns
+  # `replayed = false` when the id isn't present (already drained or
+  # never queued).
+  replayDeadLetter @57 (id :UInt64, trace :TraceContext) -> (replayed :Bool);
+
+  # ==========================================================================
+  # Configuration (config as CRDT)
+  # ==========================================================================
+  # Config files (theme.toml, bindings.toml, models.toml, etc.) are managed as CRDT documents.
+
+  # List loaded config documents
+  listConfigs @58 () -> (configs :List(Text));
+
+  # Reload a config file from disk, discarding CRDT changes (safety valve)
+  reloadConfig @59 (path :Text) -> (success :Bool, error :Text);
+
+  # Reset a config file to embedded default
+  resetConfig @60 (path :Text) -> (success :Bool, error :Text);
+
+  # Get config content (from CRDT)
+  getConfig @61 (path :Text) -> (content :Text, error :Text);
+
+  # ==========================================================================
+  # MCP (Model Context Protocol) management
+  # ==========================================================================
+  listMcpServers @62 () -> (servers :List(McpServerInfo));
+  callMcpTool @63 (call :McpToolCall, trace :TraceContext) -> (result :McpToolResult);
+
+  # MCP Resources (push-first with caching)
+  listMcpResources @64 (server :Text, trace :TraceContext) -> (resources :List(McpResource));
+  subscribeMcpResources @65 (callback :ResourceEvents, instance :Text);
+
+  # MCP Roots (client advertises workspaces to servers)
+  setMcpRoots @66 (roots :List(McpRoot));
+
+  # MCP Prompts (poll-based with optional caching)
+  listMcpPrompts @67 (server :Text) -> (prompts :List(McpPrompt));
+  getMcpPrompt @68 (server :Text, name :Text, arguments :Text) -> (messages :List(McpPromptMessage));
+
+  # MCP Progress (push-based streaming)
+  subscribeMcpProgress @69 (callback :ProgressEvents);
+
+  # MCP Elicitation (server-initiated requests for user input)
+  subscribeMcpElicitations @70 (callback :ElicitationEvents, instance :Text);
+
+  # MCP Completion (request/response)
+  completeMcp @71 (server :Text, refType :Text, refName :Text, argName :Text, value :Text) -> (result :McpCompletionResult);
+
+  # MCP Logging
+  setMcpLogLevel @72 (server :Text, level :Text);
+  subscribeMcpLogs @73 (callback :LoggingEvents);
+
+  # MCP Cancellation
+  cancelMcpRequest @74 (server :Text, requestId :Text);
+
+  # ==========================================================================
+  # Peer registry (drift navigation transport)
+  # ==========================================================================
+  # Peers are named RPC participants (the Bevy app, MCP servers, future
+  # clients) that the kernel can dispatch invocations to. The transport is
+  # how MCP-driven agents tell the app to switch contexts, etc.
+
+  # Attach a peer to this kernel.
+  # `commands` is the callback the kernel uses to invoke this peer.
+  attachPeer @75 (config :PeerConfig, commands :PeerCommands) -> (info :PeerInfo);
+
+  # List all attached peers on this kernel.
+  listPeers @76 () -> (peers :List(PeerInfo));
+
+  # Detach a peer from this kernel.
+  detachPeer @77 (nick :Text);
+
+  # Invoke a peer. Params and result are JSON bytes.
+  invokePeer @78 (nick :Text, action :Text, params :Data) -> (result :Data);
+
+  # ==========================================================================
+  # Kernel key–value store (persistent, synced env — docs/kernel-kv.md)
+  # ==========================================================================
+  # A small, durable, collaborative key→string store. Keys are flat UTF-8
+  # strings (dotted namespaces are convention, not mechanism); values are
+  # strings (structured data is the caller's JSON). No per-key ACLs — a
+  # single-user shared-trust kernel.
+
+  # Read a key. `found = false` when absent, deleted, or advisory-expired.
+  kvGet @79 (key :Text) -> (value :Text, found :Bool);
+
+  # Set a key. `hasExpiresAt` gates the advisory absolute expiry (writer-clock
+  # ms). Returns an error string on the 64 KB value cap or a persistence fault.
+  kvSet @80 (key :Text, value :Text, hasExpiresAt :Bool, expiresAt :Int64) -> (success :Bool, error :Text);
+
+  # Delete a key. `existed` reports whether a live value was present.
+  kvDelete @81 (key :Text) -> (existed :Bool);
+
+  # List keys, optionally filtered by prefix. `nextCursor` is reserved for
+  # future pagination (always absent in v1).
+  kvKeys @82 (prefix :Text, hasPrefix :Bool) -> (keys :List(Text), nextCursor :Text, hasNextCursor :Bool);
+
+  # Subscribe to whole-store changes (callback fires per set/delete). The
+  # client filters by prefix; v1 streams the whole store.
+  kvWatch @83 (callback :KvEvents);
 }
 
 # ============================================================================
