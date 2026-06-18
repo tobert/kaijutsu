@@ -505,7 +505,7 @@ fn truncate(s: &str, max_len: usize) -> String {
 ///
 /// Uses `$XDG_RUNTIME_DIR/kaijutsu/hook-{ppid}.sock` where PPID is the
 /// parent process ID. Both the MCP server and adapter scripts are children
-/// of the same agent process (Claude/Gemini), so they independently compute
+/// of the same agent process (Claude Code), so they independently compute
 /// the same path.
 ///
 /// Returns `None` if `$XDG_RUNTIME_DIR` is not set — we don't fall back to

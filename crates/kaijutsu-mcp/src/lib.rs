@@ -1,7 +1,7 @@
 //! MCP server exposing kaijutsu CRDT kernel.
 //!
 //! Provides tools for document and block manipulation via Model Context Protocol,
-//! enabling agents like Claude Code, Gemini CLI, and opencode to collaborate
+//! enabling agents like Claude Code and opencode to collaborate
 //! on shared CRDT state.
 //!
 //! ## Backends

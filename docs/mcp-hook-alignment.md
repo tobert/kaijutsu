@@ -93,9 +93,10 @@ the role decides *which* events we even want to wire.
   `shell` tool. It does **not** fit a **passive mirror** of an external Claude Code
   session, where no LLM is reading that stance at all — blocks just accrete.
 - **Decision (pre-made):** hook-fed contexts get their own context_type — a
-  *mirror* bundle — separate from `mcp`. Candidate name: `mirror` (generic) or
-  `claude-code` (source-specific). Recommend **`mirror`**: the same machinery serves
-  gemini-cli/cursor later, and `source` already carries the tool name on each event.
+  *mirror* bundle — separate from `mcp`. Candidate name: `mirror` (source-neutral)
+  or `claude-code` (source-specific). Recommend **`mirror`**: a passive-shadow
+  bundle named for what it does, not who feeds it — Claude Code is the only adapter
+  today and the `event.source` field already carries the tool name if that changes.
   A mirror's rc stance is minimal/absent (no model drives it); its value is in
   `create` doing context setup and `drift` cache-reset only if the mirror is ever
   forked into a live conversation.
@@ -200,5 +201,5 @@ Steps 1–2 are independent and safe to start the moment the role is confirmed. 
   here; those are correctness bugs *within* the chosen role, this note is the role
   and alignment frame around them.
 - `crates/kaijutsu-mcp/src/{hook_listener.rs,hook_types.rs,lib.rs,main.rs}` — impl.
-- `contrib/{claude-hooks.json,adapters/claude.sh,adapters/gemini.sh}` — wire-in.
+- `contrib/{claude-hooks.json,adapters/claude.sh,adapters/claude-to-kaijutsu.jq}` — wire-in.
 - `assets/defaults/rc/mcp/` — current driver bundle (mirror bundle to be added).

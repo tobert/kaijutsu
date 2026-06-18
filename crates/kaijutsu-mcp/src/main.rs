@@ -1,6 +1,6 @@
 //! Kaijutsu MCP server binary.
 //!
-//! Exposes the CRDT kernel to MCP clients (Claude Code, Gemini CLI, opencode).
+//! Exposes the CRDT kernel to MCP clients (Claude Code, opencode).
 //!
 //! ## Subcommands
 //!
@@ -118,7 +118,7 @@ async fn main() -> Result<()> {
 
 /// MCP stdio server + hook socket listener.
 async fn run_serve(args: ServeArgs) -> Result<()> {
-    // Detect hosting agent (Claude Code, Gemini CLI, etc.)
+    // Detect hosting agent (Claude Code, etc.)
     let agent = kaijutsu_agent_tools::detect();
     if let Some(ref a) = agent {
         tracing::info!(

@@ -14,7 +14,7 @@ use serde_json::Value;
 pub struct HookEvent {
     /// Event type: `session.start`, `tool.after`, `prompt.submit`, etc.
     pub event: String,
-    /// Source tool identifier: `claude-code`, `gemini-cli`, `cursor`, etc.
+    /// Source tool identifier. `claude-code` is the only adapter today.
     pub source: String,
     /// Opaque session ID from the source tool.
     #[serde(default, skip_serializing_if = "Option::is_none")]

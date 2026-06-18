@@ -859,8 +859,8 @@ the *remaining* findings, triaged.
   where a block authored mid-resync is still lost — cleanest via a command
   channel that makes the bg task the true sole writer (authoring + push + resync
   all serialized in one task).
-- **LOW — `agent.compact` hook event is mapped but unhandled.** The adapters map
-  Claude `PreCompact` / Gemini `PreCompress` → `agent.compact`, but
+- **LOW — `agent.compact` hook event is mapped but unhandled.** The adapter maps
+  Claude `PreCompact` → `agent.compact`, but
   `HookListener::process_event` has no arm for it (falls to `_ => {}`), so a
   compaction boundary silently produces no block. Either author a System/Trace block
   marking the compaction, or drop the mapping. (Found during the 2026-06-18 bitrot
