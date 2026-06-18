@@ -40,12 +40,16 @@ pub enum HudSlot {
     North,
     East,
     West,
+    /// Bottom preview — formatter + tests kept, but currently **not spawned**
+    /// (hidden); add back to [`HudSlot::ALL`] to show it again.
+    #[allow(dead_code)]
     South,
 }
 
 impl HudSlot {
-    /// All four slots, for spawn iteration.
-    pub const ALL: [HudSlot; 4] = [HudSlot::North, HudSlot::East, HudSlot::West, HudSlot::South];
+    /// The spawned slots. South is intentionally omitted (hidden) — the open
+    /// bottom keeps the vortex throat clear; re-add it here to bring it back.
+    pub const ALL: [HudSlot; 3] = [HudSlot::North, HudSlot::East, HudSlot::West];
 }
 
 /// Container marker for the whole HUD (despawned together on exit).
@@ -64,21 +68,25 @@ pub struct HudText(String);
 /// front of every card (which live hundreds of units further down the funnel).
 const HUD_DEPTH: f32 = 100.0;
 /// Fraction of the frustum half-extent each panel center sits inboard of the edge.
-const HUD_MARGIN: f32 = 0.16;
+const HUD_MARGIN: f32 = 0.12;
 /// Texture-space font size + inner padding for the readout text.
-const HUD_FONT_SIZE: f32 = 20.0;
-const HUD_PAD: f32 = 16.0;
-/// Plate alpha — a dim translucent backing tinted by the selection's accent so
-/// the HUD reads as part of the selection and text stays legible against bloom.
-const HUD_PLATE_ALPHA: f32 = 0.24;
+const HUD_FONT_SIZE: f32 = 23.0;
+/// Inner padding (texture px) — keeps the text inset from the frame so the panel
+/// has breathing room inside its border.
+const HUD_PAD: f32 = 30.0;
+/// Border strength (the `WellCardMaterial.border` alpha) and an HDR gain so the
+/// outline blooms gently. No body fill — the panel is a glowing frame tinted by
+/// the selection's accent, so unequal panel sizes still read as a set.
+const HUD_BORDER_STRENGTH: f32 = 1.0;
+const HUD_BORDER_GAIN: f32 = 1.8;
 
 /// Per-slot texture (logical authoring) size. N/S are wide-short, E/W tall-narrow;
 /// the quad aspect tracks this so text never distorts.
 fn hud_tex_dims(slot: HudSlot) -> (u32, u32) {
     match slot {
-        HudSlot::North => (520, 104),
+        HudSlot::North => (560, 120),
         HudSlot::South => (560, 150),
-        HudSlot::East | HudSlot::West => (260, 400),
+        HudSlot::East | HudSlot::West => (300, 300),
     }
 }
 
@@ -98,11 +106,11 @@ fn hud_quad_size(slot: HudSlot, half_w: f32, half_h: f32) -> Vec2 {
     let aspect = tw as f32 / th as f32;
     match slot {
         HudSlot::North | HudSlot::South => {
-            let w = half_w * 0.56;
+            let w = half_w * 0.50;
             Vec2::new(w, w / aspect)
         }
         HudSlot::East | HudSlot::West => {
-            let h = half_h * 0.78;
+            let h = half_h * 0.46;
             Vec2::new(h * aspect, h)
         }
     }
@@ -112,7 +120,8 @@ fn hud_quad_size(slot: HudSlot, half_w: f32, half_h: f32) -> Vec2 {
 /// inset]` — same rounded-rect knobs as a card but the slot's own aspect.
 fn hud_shape(slot: HudSlot) -> Vec4 {
     let (tw, th) = hud_tex_dims(slot);
-    Vec4::new(tw as f32 / th as f32, 0.06, 0.045, 0.012)
+    // [aspect, corner_radius, ring_width (thin frame), inset].
+    Vec4::new(tw as f32 / th as f32, 0.05, 0.018, 0.012)
 }
 
 /// Local-space placement of one edge slot, computed from the camera frustum so it
@@ -176,9 +185,10 @@ pub fn spawn_well_hud(
         let (image, panel) = create_msdf_panel(&mut images, tw, th);
         let material = materials.add(WellCardMaterial {
             texture: image,
-            accent: Vec4::ZERO, // transparent until a selection drives it
+            accent: Vec4::ZERO, // no body fill — the panel is a glowing frame
             params: Vec4::ZERO, // plain panel: no selection/lineage/status rings
             shape: hud_shape(slot),
+            border: Vec4::ZERO, // outline driven by the selection in update_well_hud
         });
         commands
             .spawn((
@@ -236,11 +246,16 @@ pub fn update_well_hud(
     };
     let selected = state.selected.and_then(|sel| cards.iter().find(|c| c.context_id == sel));
 
-    // Plate tint echoes the selection's accent (dim, translucent); none → clear.
-    let plate = match selected {
+    // Border outline echoes the selection's accent (HDR so it blooms); none → off.
+    let border = match selected {
         Some(card) => {
             let c = accent_color(&card.data.accent).to_linear();
-            Vec4::new(c.red, c.green, c.blue, HUD_PLATE_ALPHA)
+            Vec4::new(
+                c.red * HUD_BORDER_GAIN,
+                c.green * HUD_BORDER_GAIN,
+                c.blue * HUD_BORDER_GAIN,
+                HUD_BORDER_STRENGTH,
+            )
         }
         None => Vec4::ZERO,
     };
@@ -262,7 +277,7 @@ pub fn update_well_hud(
         last.0 = next.clone();
 
         if let Some(mat) = materials.get_mut(&mat_node.0) {
-            mat.accent = plate;
+            mat.border = border;
         }
 
         let glyphs = match (next.is_empty(), atlas.as_deref_mut()) {

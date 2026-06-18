@@ -35,6 +35,13 @@ pub struct WellCardMaterial {
     /// aspect-corrected UV space.
     #[uniform(4)]
     pub shape: Vec4,
+
+    /// `[r, g, b, strength]` — a steady outline drawn from the SDF ring band,
+    /// independent of the `params` selection/lineage/status rings. Used by the
+    /// HUD panels (a glowing border around an empty interior); cards leave it
+    /// `Vec4::ZERO` (strength 0 → no border, unchanged look). HDR rgb blooms.
+    #[uniform(5)]
+    pub border: Vec4,
 }
 
 impl Material for WellCardMaterial {

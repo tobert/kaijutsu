@@ -140,6 +140,7 @@ pub fn sync_time_well(
             accent: super::scene::accent_vec4(&data.accent),
             params: Vec4::ZERO,
             shape: super::scene::card_shape(),
+            border: Vec4::ZERO,
         });
 
         let entity = commands

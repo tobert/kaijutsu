@@ -271,6 +271,7 @@ pub fn enter_time_well(
         accent: Vec4::ZERO, // filled by update_reading_card on the first selection
         params: Vec4::ZERO,
         shape: card_shape(),
+        border: Vec4::ZERO,
     });
     commands.spawn((
         ReadingCard,

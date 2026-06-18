@@ -19,6 +19,7 @@
 @group(#{MATERIAL_BIND_GROUP}) @binding(2) var<uniform> accent: vec4<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(3) var<uniform> params: vec4<f32>; // [selected, in_lineage, status, drifting]
 @group(#{MATERIAL_BIND_GROUP}) @binding(4) var<uniform> shape: vec4<f32>;  // [aspect, corner_radius, ring_width, inset]
+@group(#{MATERIAL_BIND_GROUP}) @binding(5) var<uniform> border: vec4<f32>; // [r, g, b, strength] — steady outline (HUD); cards leave strength 0
 
 // Signed distance to a rounded box centered at origin, half-size `b`, radius `r`.
 fn sd_round_box(p: vec2<f32>, b: vec2<f32>, r: f32) -> f32 {
@@ -66,6 +67,14 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // Ring band hugging the inner edge of the rounded box. HDR colors below push
     // the band well past 1.0 so the bloom pass blooms it into a glow halo.
     let band = (1.0 - smoothstep(ring_w, ring_w + aa, abs(d))) * inside;
+
+    // Steady border (HUD panels: a glowing outline framing an empty interior, so
+    // panels read as panels without a body fill). Cards leave `border.a == 0`.
+    if (border.a > 0.001) {
+        col = mix(col, border.rgb, band * border.a);
+        alpha = max(alpha, band * border.a);
+    }
+
     let status = params.z;
 
     // --- Status rim (base layer; selection/lineage draw over it) ---
