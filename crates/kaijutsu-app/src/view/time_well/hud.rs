@@ -67,10 +67,18 @@ pub struct HudText(String);
 /// camera children, so this is constant in screen space and always renders in
 /// front of every card (which live hundreds of units further down the funnel).
 const HUD_DEPTH: f32 = 100.0;
-/// Fraction of the frustum half-extent each panel center sits inboard of the edge.
-const HUD_MARGIN: f32 = 0.12;
+/// Gap from the frustum edge, as a fraction of the half-extent — the size-aware
+/// fit in `hud_transform` keeps each panel's outer edge exactly this far in, so
+/// a small value hugs the screen edge.
+const HUD_MARGIN: f32 = 0.02;
+/// Extra downward drop (fraction of half-height) for the E/W corner panels so
+/// their top edge clears the app's persistent top status bar. N is center-top
+/// and clears the bar's left/right labels on its own.
+const HUD_EW_TOP_DROP: f32 = 0.15;
 /// Texture-space font size + inner padding for the readout text.
-const HUD_FONT_SIZE: f32 = 23.0;
+const HUD_FONT_SIZE: f32 = 27.0;
+/// North's context-name (first line) is rendered this much larger than the body.
+const HUD_TITLE_SCALE: f32 = 1.667;
 /// Inner padding (texture px) — keeps the text inset from the frame so the panel
 /// has breathing room inside its border.
 const HUD_PAD: f32 = 30.0;
@@ -84,9 +92,9 @@ const HUD_BORDER_GAIN: f32 = 1.8;
 /// the quad aspect tracks this so text never distorts.
 fn hud_tex_dims(slot: HudSlot) -> (u32, u32) {
     match slot {
-        HudSlot::North => (560, 120),
+        HudSlot::North => (660, 220),
         HudSlot::South => (560, 150),
-        HudSlot::East | HudSlot::West => (300, 300),
+        HudSlot::East | HudSlot::West => (440, 340),
     }
 }
 
@@ -106,7 +114,7 @@ fn hud_quad_size(slot: HudSlot, half_w: f32, half_h: f32) -> Vec2 {
     let aspect = tw as f32 / th as f32;
     match slot {
         HudSlot::North | HudSlot::South => {
-            let w = half_w * 0.50;
+            let w = half_w * 0.60;
             Vec2::new(w, w / aspect)
         }
         HudSlot::East | HudSlot::West => {
@@ -124,11 +132,12 @@ fn hud_shape(slot: HudSlot) -> Vec4 {
     Vec4::new(tw as f32 / th as f32, 0.05, 0.018, 0.012)
 }
 
-/// Local-space placement of one edge slot, computed from the camera frustum so it
-/// adapts to window aspect. At local depth `depth` in front of the camera the
-/// frustum half-extents are `half_h = depth·tan(fov_y/2)` and `half_w = half_h·
-/// aspect`; each slot's center sits `margin` (fraction of the half-extent) inboard
-/// of the edge it hugs, on the plane `z = -depth` (the camera looks down local -Z).
+/// The frustum **edge/corner anchor** for a slot, in camera-local space. At local
+/// depth `depth` the frustum half-extents are `half_h = depth·tan(fov_y/2)` and
+/// `half_w = half_h·aspect`; the anchor sits `margin` (fraction of the half-extent)
+/// inboard of the edge, on the plane `z = -depth` (camera looks down local -Z).
+/// N anchors top-center; **E/W anchor to the top corners** (they share N's top
+/// row and grow downward — `hud_transform` fits the panel in from the anchor).
 pub fn hud_slot_offset(slot: HudSlot, fov_y: f32, aspect: f32, depth: f32, margin: f32) -> Vec3 {
     let half_h = depth * (fov_y * 0.5).tan();
     let half_w = half_h * aspect;
@@ -136,8 +145,8 @@ pub fn hud_slot_offset(slot: HudSlot, fov_y: f32, aspect: f32, depth: f32, margi
     match slot {
         HudSlot::North => Vec3::new(0.0, half_h * inset, -depth),
         HudSlot::South => Vec3::new(0.0, -half_h * inset, -depth),
-        HudSlot::East => Vec3::new(half_w * inset, 0.0, -depth),
-        HudSlot::West => Vec3::new(-half_w * inset, 0.0, -depth),
+        HudSlot::East => Vec3::new(half_w * inset, half_h * (inset - HUD_EW_TOP_DROP), -depth),
+        HudSlot::West => Vec3::new(-half_w * inset, half_h * (inset - HUD_EW_TOP_DROP), -depth),
     }
 }
 
@@ -148,8 +157,18 @@ fn hud_transform(slot: HudSlot, fov_y: f32, aspect: f32) -> Transform {
     let half_h = HUD_DEPTH * (fov_y * 0.5).tan();
     let half_w = half_h * aspect;
     let size = hud_quad_size(slot, half_w, half_h);
-    Transform::from_translation(hud_slot_offset(slot, fov_y, aspect, HUD_DEPTH, HUD_MARGIN))
-        .with_scale(Vec3::new(size.x, size.y, 1.0))
+    let anchor = hud_slot_offset(slot, fov_y, aspect, HUD_DEPTH, HUD_MARGIN);
+    // Fit the panel fully inside from its edge/corner anchor: pull horizontally
+    // toward center by half-width (a center-anchored panel like N stays at x=0 —
+    // note `f32::signum(0.0)` is 1.0, so guard the zero case) and always down
+    // from the top anchor by half-height.
+    let cx = if anchor.x == 0.0 {
+        0.0
+    } else {
+        anchor.x - anchor.x.signum() * size.x * 0.5
+    };
+    let cy = anchor.y - size.y * 0.5;
+    Transform::from_translation(Vec3::new(cx, cy, anchor.z)).with_scale(Vec3::new(size.x, size.y, 1.0))
 }
 
 /// Read `(fov_y, aspect)` off a camera projection, falling back to sane defaults
@@ -288,8 +307,40 @@ pub fn update_well_hud(
     }
 }
 
+/// Lay out one string at `font_size` into MSDF glyphs at `offset`, returning the
+/// glyphs and the laid-out block height (for stacking).
+fn layout_line(
+    text: &str,
+    font: &VelloFont,
+    font_size: f32,
+    max_advance: Option<f32>,
+    align: VelloTextAlign,
+    offset: (f64, f64),
+    atlas: &mut MsdfAtlas,
+    font_data_map: &mut FontDataMap,
+) -> (Vec<PositionedGlyph>, f32) {
+    let layout = font.layout(
+        text,
+        &VelloTextStyle { font_size, line_height: 1.2, ..default() },
+        align,
+        max_advance,
+    );
+    for line in layout.lines() {
+        for item in line.items() {
+            if let parley::PositionedLayoutItem::GlyphRun(gr) = item {
+                font_data_map.register(gr.run().font());
+            }
+        }
+    }
+    let brush = bevy_color_to_brush(Color::srgb(0.95, 0.97, 1.0));
+    let glyphs = collect_msdf_glyphs(&layout, &[], &brush, offset, atlas);
+    (glyphs, layout.height())
+}
+
 /// Lay out a (possibly multi-line) readout string into MSDF glyphs for a slot,
-/// wrapped to the slot's texture width and aligned per [`hud_align`].
+/// wrapped to the slot's texture width and aligned per [`hud_align`]. North gets
+/// special treatment: its first line is the **context name**, rendered
+/// [`HUD_TITLE_SCALE`]× larger than the rest, then the status line below it.
 fn layout_hud_text(
     text: &str,
     font: &VelloFont,
@@ -299,22 +350,32 @@ fn layout_hud_text(
 ) -> Vec<PositionedGlyph> {
     let (tw, _th) = hud_tex_dims(slot);
     let max_advance = Some(tw as f32 - 2.0 * HUD_PAD);
-    let layout = font.layout(
-        text,
-        &VelloTextStyle { font_size: HUD_FONT_SIZE, line_height: 1.25, ..default() },
-        hud_align(slot),
-        max_advance,
-    );
-    // Register every run's font with the atlas before collecting glyphs.
-    for line in layout.lines() {
-        for item in line.items() {
-            if let parley::PositionedLayoutItem::GlyphRun(gr) = item {
-                font_data_map.register(gr.run().font());
-            }
+    let align = hud_align(slot);
+    let pad = HUD_PAD as f64;
+
+    if slot == HudSlot::North {
+        // Title (context name) big; remainder (type · status) normal, below it.
+        let mut parts = text.splitn(2, '\n');
+        let title = parts.next().unwrap_or("");
+        let rest = parts.next().unwrap_or("");
+        let (mut out, title_h) = layout_line(
+            title, font, HUD_FONT_SIZE * HUD_TITLE_SCALE, max_advance, align, (pad, pad),
+            atlas, font_data_map,
+        );
+        if !rest.is_empty() {
+            let y = pad + title_h as f64 + 6.0;
+            let (sub, _) = layout_line(
+                rest, font, HUD_FONT_SIZE, max_advance, align, (pad, y), atlas, font_data_map,
+            );
+            out.extend(sub);
         }
+        return out;
     }
-    let brush = bevy_color_to_brush(Color::srgb(0.95, 0.97, 1.0));
-    collect_msdf_glyphs(&layout, &[], &brush, (HUD_PAD as f64, HUD_PAD as f64), atlas)
+
+    let (glyphs, _) = layout_line(
+        text, font, HUD_FONT_SIZE, max_advance, align, (pad, pad), atlas, font_data_map,
+    );
+    glyphs
 }
 
 fn status_label(status: Option<Status>) -> &'static str {
@@ -340,27 +401,24 @@ fn hud_north(d: &super::card::CardData, status: Option<Status>) -> String {
 }
 
 fn hud_east(d: &super::card::CardData) -> String {
-    let mut s = String::new();
-    s.push_str("SPECS\n");
-    s.push_str(&format!(
-        "model    {}\n",
-        if d.model_badge.is_empty() { "—" } else { &d.model_badge }
-    ));
-    s.push_str(&format!(
-        "fork     {}\n",
-        d.fork_badge.as_deref().unwrap_or("—")
-    ));
-    s.push_str(&format!("band     {}\n", band_label(d.band)));
     let keys = if d.keywords.is_empty() {
         "—".to_string()
     } else {
         d.keywords.join(", ")
     };
-    s.push_str(&format!("keywords {keys}"));
+    let mut lines = vec![
+        format!("model    {}", if d.model_badge.is_empty() { "—" } else { &d.model_badge }),
+        format!("fork     {}", d.fork_badge.as_deref().unwrap_or("—")),
+        format!("band     {}", band_label(d.band)),
+        format!("keywords {keys}"),
+    ];
     if let Some(c) = &d.cluster_label {
-        s.push_str(&format!("\ncluster  ◇ {c}"));
+        lines.push(format!("cluster  ◇ {c}"));
     }
-    s
+    // Longest line at the top, tapering to shortest — the block nests into the
+    // top corner (label columns stay aligned; only the row order changes).
+    lines.sort_by_key(|l| std::cmp::Reverse(l.chars().count()));
+    format!("SPECS\n{}", lines.join("\n"))
 }
 
 fn hud_west(selected: ContextId, state: &TimeWellState) -> String {
@@ -494,11 +552,14 @@ mod tests {
         assert!(s.y < 0.0, "south is below center");
         assert!(e.x > 0.0, "east is right of center");
         assert!(w.x < 0.0, "west is left of center");
-        // N/S centered horizontally, E/W centered vertically.
+        // N centered horizontally; E/W anchor to the top corners but drop a bit
+        // below N's row to clear the top status bar.
         assert_eq!(n.x, 0.0);
         assert_eq!(s.x, 0.0);
-        assert_eq!(e.y, 0.0);
-        assert_eq!(w.y, 0.0);
+        assert!(e.y < n.y, "east drops below the top row to clear the bar");
+        assert!(e.y > 0.0, "but is still in the upper half");
+        assert_eq!(e.y, w.y, "east/west share the dropped top row");
+        assert_eq!(e.x, -w.x, "east/west are symmetric");
     }
 
     #[test]
