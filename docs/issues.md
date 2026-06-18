@@ -498,18 +498,19 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   - *Readability:* card sizing/camera zoom is functional but text is small at
     the default framing; tune when the active view (step 6) lands.
 - **Edge HUD → in-scene MSDF panels — ✅ SHIPPED 2026-06-18.** The HUD's
-  first-prototype four flat Bevy `Text` nodes are now in-scene **MSDF panels**:
-  3D quads parented to the well camera (screen-stable, always face it, no
-  billboard), sampling the `WellCardMaterial` accent plate (dim, tinted by the
-  selection's accent) and rasterizing MSDF text — HDR/bloom + depth, the same
-  visual language as the cards. Positioned at the camera frustum edges via the
-  pure, unit-tested `hud_slot_offset` (adapts to window aspect; re-derived each
-  frame so it survives resize). Built on a new shared `view/time_well/panel.rs`
-  primitive (`create_msdf_panel` + `commit_panel_glyphs`) that the rim cards and
-  reading card also now use. Landed alongside the RTT rename/split (see below).
-  HUD-layout polish remaining (tunable, non-blocking): per-slot font sizes read a
-  touch small at default framing; the E specs panel wraps a long model badge; the
-  S preview panel height vs the 160-char snippet.
+  first-prototype flat Bevy `Text` nodes are now in-scene **MSDF panels**: 3D
+  quads parented to the well camera (screen-stable, no billboard), drawn as thin
+  glowing **accent-tinted borders** with no body fill (`WellCardMaterial.border`
+  uniform), MSDF text inside — HDR/bloom + depth, same vocabulary as the cards.
+  N is centered top with the context name in a larger font; E/W tuck into the top
+  corners (below the status bar); S is hidden. Placed via the pure, unit-tested
+  `hud_slot_offset` (aspect-adaptive, re-derived each frame; size-aware fit hugs
+  the screen edge). Built on the shared `view/time_well/panel.rs` primitive
+  (`create_msdf_panel` + `commit_panel_glyphs`), also used by the rim/reading
+  cards. All knobs are consts at the top of `hud.rs`. Follow-ups (non-blocking):
+  - The mid/lower **E/W sides are now open canvas** — candidates for the drift
+    arcs / activity layer or a secondary readout.
+  - The E specs panel wraps a long model badge (cosmetic).
 - **RTT type rename + split — ✅ SHIPPED 2026-06-18.** `view/vello_ui_texture.rs`
   → `view/ui_rtt.rs`; `VelloUiTexture` → `UiRttTexture` (now also carries the
   content-neutral `built_width/height`), `VelloUiScene` → `UiVectorScene`
