@@ -1,24 +1,32 @@
-//! Generic "vello `Scene` → UI `ImageNode` texture" primitive.
+//! Generic "render-to-texture → UI `ImageNode`" primitive.
 //!
-//! Any UI entity that wants vector content draws a `vello::Scene` into a
-//! [`VelloUiScene`] and carries a [`VelloUiTexture`] + `ImageNode`. An extract
-//! system ships dirty scenes into the render world; a render system locks the
-//! shared [`VelloRasterizer`] and rasterizes each into its texture, scaled from
-//! the scene's logical build space to the physical texture. This is the one
-//! piece of vello we keep — vello as an offscreen rasterizer presented on an
-//! `ImageNode` — generalized out of `block_render` so docks, role-group
-//! borders, block cells, and future chrome share one extract/render path
-//! instead of each owning a near-identical copy.
+//! Any UI entity that wants offscreen-rasterized content carries a
+//! [`UiRttTexture`] (the GPU render target + the logical size its content was
+//! authored in) and, *if* that content is vector art, a [`UiVectorScene`] (a
+//! `vello::Scene` + a re-render version). An extract system ships dirty vector
+//! scenes into the render world; a render system locks the shared
+//! [`VelloRasterizer`] and rasterizes each into its texture, scaled from the
+//! logical build space to the physical texture. This is the one piece of vello
+//! we keep — vello as an offscreen rasterizer presented on an `ImageNode` —
+//! generalized out of `block_render` so docks, role-group borders, block cells,
+//! and future chrome share one extract/render path instead of each owning a
+//! near-identical copy.
+//!
+//! The texture is **content-neutral**: the same [`UiRttTexture`] is the target
+//! for vector (vello) content *and* for MSDF glyph content (see
+//! `text::msdf`). MSDF surfaces carry a [`UiRttTexture`] but **no**
+//! [`UiVectorScene`] — they are rasterized by the MSDF pass, not the vello pass.
 //!
 //! Consumers own two things the primitive deliberately does *not*:
 //! - **scene building** — what to draw, in `built_width`×`built_height` logical
-//!   space (a PostUpdate system that writes [`VelloUiScene`] and bumps `version`).
+//!   space (a PostUpdate system that writes [`UiVectorScene`] and bumps `version`).
 //! - **sizing** — how big the texture should be (a resize system; most call
-//!   [`vello_texture_dims`] to turn a logical size + scale factor into clamped
-//!   physical dimensions, then realloc via [`create_vello_texture`]).
+//!   [`ui_rtt_texture_dims`] to turn a logical size + scale factor into clamped
+//!   physical dimensions, then realloc via [`create_ui_rtt_texture`]).
 //!
-//! Bumping `version` past the last rendered value is the sole "re-rasterize me"
-//! signal; `version == 0` means never-built and is skipped.
+//! Bumping [`UiVectorScene::version`] past the last rendered value is the sole
+//! "re-rasterize me" signal for vector content; `version == 0` means never-built
+//! and is skipped.
 
 use std::collections::HashMap;
 
@@ -38,42 +46,50 @@ use crate::view::vello_rasterizer::{VelloRasterizer, VelloRasterizerSettings};
 // COMPONENTS
 // ============================================================================
 
-/// A built `vello::Scene` awaiting rasterization into a sibling [`VelloUiTexture`].
+/// The GPU render-target texture an entity's content rasterizes into (physical
+/// pixels), shared with the entity's `ImageNode` (and any material that samples
+/// it). Content-neutral: targets both vello vector content ([`UiVectorScene`])
+/// and MSDF glyph content.
 ///
-/// Consumers build `scene` in `built_width`×`built_height` *logical* pixel space
-/// and bump `version`; the render path scales the scene to the texture's physical
-/// size, so logical-space coordinates stay DPI-independent.
+/// Also carries the **logical** size the content was authored in
+/// (`built_width`×`built_height`); the render paths scale from this logical
+/// space to the physical texture, so authoring coordinates stay DPI-independent.
+#[derive(Component, Default)]
+pub struct UiRttTexture {
+    pub image: Handle<Image>,
+    /// Physical texture width (px).
+    pub width: u32,
+    /// Physical texture height (px).
+    pub height: u32,
+    /// Logical width the content was built at (pre scale/clamp).
+    pub built_width: f32,
+    /// Logical height the content was built at (pre scale/clamp).
+    pub built_height: f32,
+}
+
+/// A built `vello::Scene` awaiting rasterization into its sibling
+/// [`UiRttTexture`]. Carried **only** by entities whose content is vector art —
+/// MSDF surfaces have a [`UiRttTexture`] but no `UiVectorScene`.
+///
+/// Consumers build `scene` in the texture's `built_width`×`built_height` logical
+/// space and bump `version`; the render path scales the scene to the texture's
+/// physical size.
 #[derive(Component)]
-pub struct VelloUiScene {
+pub struct UiVectorScene {
     /// The vector content to rasterize.
     pub scene: vello::Scene,
-    /// Logical width the scene was built at (pre scale/clamp).
-    pub built_width: f32,
-    /// Logical height the scene was built at (pre scale/clamp).
-    pub built_height: f32,
     /// Monotonic re-render signal. `0` = never built (skipped by extract); bump
     /// to request a fresh rasterization.
     pub version: u64,
 }
 
-impl Default for VelloUiScene {
+impl Default for UiVectorScene {
     fn default() -> Self {
         Self {
             scene: vello::Scene::new(),
-            built_width: 0.0,
-            built_height: 0.0,
             version: 0,
         }
     }
-}
-
-/// The GPU texture a [`VelloUiScene`] rasterizes into (physical pixels), shared
-/// with the entity's `ImageNode` (and any material that samples it).
-#[derive(Component, Default)]
-pub struct VelloUiTexture {
-    pub image: Handle<Image>,
-    pub width: u32,
-    pub height: u32,
 }
 
 // ============================================================================
@@ -85,7 +101,7 @@ pub struct VelloUiTexture {
 ///
 /// Each dimension is `ceil(logical * scale)`, clamped to `[1, max_dim]` — never
 /// zero (an empty texture is invalid) and never past the GPU/vello tile ceiling.
-pub fn vello_texture_dims(
+pub fn ui_rtt_texture_dims(
     logical_width: f32,
     logical_height: f32,
     scale: f32,
@@ -97,7 +113,7 @@ pub fn vello_texture_dims(
 }
 
 /// Create a render-target texture with the format + usage flags vello needs.
-pub fn create_vello_texture(images: &mut Assets<Image>, w: u32, h: u32) -> Handle<Image> {
+pub fn create_ui_rtt_texture(images: &mut Assets<Image>, w: u32, h: u32) -> Handle<Image> {
     let size = Extent3d {
         width: w.max(1),
         height: h.max(1),
@@ -139,14 +155,15 @@ pub struct ExtractedVelloScenes {
     last_rendered: HashMap<AssetId<Image>, u64>,
 }
 
-/// Extract dirty [`VelloUiScene`]s from the main world.
+/// Extract dirty [`UiVectorScene`]s from the main world.
 ///
 /// Pushes any scene whose `version` exceeds the last rendered version for its
-/// texture (and is non-zero). Mirrors `block_render::extract_block_scenes` minus
-/// the block-only MSDF filter — MSDF cells simply leave `version == 0`.
+/// texture (and is non-zero). Entities without a `UiVectorScene` (pure MSDF
+/// surfaces) are skipped by the query; dual-mode blocks in MSDF mode leave
+/// `version == 0`.
 pub fn extract_vello_scenes(
     mut extracted: ResMut<ExtractedVelloScenes>,
-    query: Extract<Query<(&VelloUiScene, &VelloUiTexture)>>,
+    query: Extract<Query<(&UiVectorScene, &UiRttTexture)>>,
 ) {
     extracted.items.clear();
 
@@ -163,8 +180,8 @@ pub fn extract_vello_scenes(
                 image_handle: texture.image.clone(),
                 width: texture.width,
                 height: texture.height,
-                built_width: scene.built_width,
-                built_height: scene.built_height,
+                built_width: texture.built_width,
+                built_height: texture.built_height,
                 version: scene.version,
             });
         }
@@ -255,11 +272,11 @@ pub fn render_vello_scenes(
 ///
 /// Depends on `VelloRasterizerPlugin` (the shared `vello::Renderer`) already
 /// being present. Consumers add their own main-world scene-build + resize
-/// systems and spawn entities carrying `VelloUiScene` + `VelloUiTexture` +
-/// `ImageNode`.
-pub struct VelloUiTexturePlugin;
+/// systems and spawn entities carrying [`UiRttTexture`] + `ImageNode` (plus a
+/// [`UiVectorScene`] for vector content).
+pub struct UiRttPlugin;
 
-impl Plugin for VelloUiTexturePlugin {
+impl Plugin for UiRttPlugin {
     fn build(&self, app: &mut App) {
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
@@ -279,32 +296,32 @@ impl Plugin for VelloUiTexturePlugin {
 
 #[cfg(test)]
 mod tests {
-    use super::vello_texture_dims;
+    use super::ui_rtt_texture_dims;
 
     #[test]
     fn scales_logical_by_factor() {
         // 1x: physical == logical (ceil of exact values).
-        assert_eq!(vello_texture_dims(100.0, 40.0, 1.0, 8192), (100, 40));
+        assert_eq!(ui_rtt_texture_dims(100.0, 40.0, 1.0, 8192), (100, 40));
         // 2x HiDPI doubles both axes.
-        assert_eq!(vello_texture_dims(100.0, 40.0, 2.0, 8192), (200, 80));
+        assert_eq!(ui_rtt_texture_dims(100.0, 40.0, 2.0, 8192), (200, 80));
     }
 
     #[test]
     fn ceils_fractional_pixels() {
         // 100 * 1.5 = 150 exact; 41 * 1.5 = 61.5 → ceil 62.
-        assert_eq!(vello_texture_dims(100.0, 41.0, 1.5, 8192), (150, 62));
+        assert_eq!(ui_rtt_texture_dims(100.0, 41.0, 1.5, 8192), (150, 62));
     }
 
     #[test]
     fn clamps_to_max_dim() {
         // A tall block past the GPU/vello ceiling clamps; width stays.
-        assert_eq!(vello_texture_dims(1280.0, 20000.0, 1.0, 8192), (1280, 8192));
+        assert_eq!(ui_rtt_texture_dims(1280.0, 20000.0, 1.0, 8192), (1280, 8192));
     }
 
     #[test]
     fn never_zero() {
         // Zero or sub-pixel logical size still yields a valid 1px texture.
-        assert_eq!(vello_texture_dims(0.0, 0.0, 2.0, 8192), (1, 1));
-        assert_eq!(vello_texture_dims(0.1, 0.1, 1.0, 8192), (1, 1));
+        assert_eq!(ui_rtt_texture_dims(0.0, 0.0, 2.0, 8192), (1, 1));
+        assert_eq!(ui_rtt_texture_dims(0.1, 0.1, 1.0, 8192), (1, 1));
     }
 }

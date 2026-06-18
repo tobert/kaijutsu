@@ -10,7 +10,7 @@ use kaijutsu_viz::layout::Band;
 
 use super::card::CardData;
 use crate::ui::screen::Screen;
-use crate::view::vello_ui_texture::{VelloUiScene, VelloUiTexture, create_vello_texture};
+use super::panel::create_msdf_panel;
 
 // ============================================================================
 // COMPONENTS
@@ -264,9 +264,10 @@ pub fn enter_time_well(
     // camera dollies into it on focus). It renders the current selection;
     // `update_reading_card` fills its texture (blank until a selection exists).
     let focus_mesh = meshes.add(Rectangle::new(FOCUS_QUAD_W, FOCUS_QUAD_H));
-    let focus_image = create_vello_texture(&mut images, READING_TEX_W as u32, READING_TEX_H as u32);
+    let (focus_image, panel) =
+        create_msdf_panel(&mut images, READING_TEX_W as u32, READING_TEX_H as u32);
     let focus_material = materials.add(crate::shaders::WellCardMaterial {
-        texture: focus_image.clone(),
+        texture: focus_image,
         accent: Vec4::ZERO, // filled by update_reading_card on the first selection
         params: Vec4::ZERO,
         shape: card_shape(),
@@ -277,16 +278,9 @@ pub fn enter_time_well(
         MeshMaterial3d(focus_material),
         Transform::from_translation(FOCUS_CARD_POS),
         Visibility::Inherited,
-        VelloUiScene::default(),
-        VelloUiTexture {
-            image: focus_image,
-            width: READING_TEX_W as u32,
-            height: READING_TEX_H as u32,
-        },
         // MSDF owns this texture (clears + renders text on transparent); the
-        // shader draws the body. No vello.
-        crate::text::msdf::MsdfBlockGlyphs::default(),
-        crate::text::msdf::BlockRenderMethod::Msdf,
+        // shader draws the body. No vello — pure MSDF, no UiVectorScene.
+        panel,
         Name::new("ReadingCard"),
     ));
 

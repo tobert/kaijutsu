@@ -14,6 +14,7 @@ use vello::peniko::Brush;
 
 use kaijutsu_types::ContextId;
 
+use super::panel::commit_panel_glyphs;
 use super::scene::{
     CARD_TEX_H, CARD_TEX_W, Card, READING_TEX_H, READING_TEX_W, ReadingCard, TimeWellState,
     accent_vec4,
@@ -23,7 +24,6 @@ use crate::text::ShapingFonts;
 use crate::text::components::bevy_color_to_brush;
 use crate::text::msdf::{FontDataMap, MsdfAtlas, MsdfBlockGlyphs, PositionedGlyph, collect_msdf_glyphs};
 use crate::text::shaping::{VelloFont, VelloTextAlign, VelloTextStyle};
-use crate::view::vello_ui_texture::VelloUiScene;
 
 /// Inner padding (logical px in the card-texture space).
 const PAD: f32 = 14.0;
@@ -173,7 +173,6 @@ pub fn build_card_scenes(
     mut query: Query<
         (
             &Card,
-            &mut VelloUiScene,
             &mut MsdfBlockGlyphs,
             &MeshMaterial3d<WellCardMaterial>,
         ),
@@ -183,16 +182,13 @@ pub fn build_card_scenes(
     let Some(font) = fonts.get(&font_handles.mono) else {
         return; // font still loading; retry next change
     };
-    for (card, mut ui, mut msdf, mat_node) in query.iter_mut() {
-        // The texture's logical build size (for MSDF scaling). No vello render —
-        // version stays 0 so the generic vello pass skips it; the MSDF pass clears
-        // and owns the texture.
-        ui.built_width = CARD_TEX_W;
-        ui.built_height = CARD_TEX_H;
-
+    for (card, mut msdf, mat_node) in query.iter_mut() {
+        // Pure MSDF surface: the build size lives on the card's `UiRttTexture`
+        // (set once at spawn); the MSDF pass clears and owns the texture. No
+        // vello scene — the shader draws the body.
         if let Some(atlas) = atlas.as_deref_mut() {
-            msdf.glyphs = card_text_glyphs(card, font, CARD_TEX_W, CARD_TEX_H, atlas, &mut font_data_map);
-            msdf.version = msdf.version.wrapping_add(1);
+            let glyphs = card_text_glyphs(card, font, CARD_TEX_W, CARD_TEX_H, atlas, &mut font_data_map);
+            commit_panel_glyphs(&mut msdf, glyphs);
         }
 
         if let Some(mat) = materials.get_mut(&mat_node.0) {
@@ -213,7 +209,7 @@ pub fn update_reading_card(
     state: Res<TimeWellState>,
     cards: Query<&Card>,
     mut reading: Query<
-        (&mut VelloUiScene, &mut MsdfBlockGlyphs, &MeshMaterial3d<WellCardMaterial>),
+        (&mut MsdfBlockGlyphs, &MeshMaterial3d<WellCardMaterial>),
         With<ReadingCard>,
     >,
     mut last: Local<Option<ContextId>>,
@@ -224,35 +220,35 @@ pub fn update_reading_card(
     let Some(font) = fonts.get(&font_handles.mono) else {
         return;
     };
-    let Ok((mut ui, mut msdf, mat_node)) = reading.single_mut() else {
+    let Ok((mut msdf, mat_node)) = reading.single_mut() else {
         return; // focus card not spawned yet
     };
     *last = state.selected;
 
-    ui.built_width = READING_TEX_W;
-    ui.built_height = READING_TEX_H;
-
-    match state
+    // Build size lives on the focus card's `UiRttTexture` (set at spawn).
+    let glyphs = match state
         .selected
         .and_then(|sel| cards.iter().find(|c| c.context_id == sel))
     {
         Some(card) => {
-            if let Some(atlas) = atlas.as_deref_mut() {
-                msdf.glyphs =
-                    card_text_glyphs(card, font, READING_TEX_W, READING_TEX_H, atlas, &mut font_data_map);
-            }
             if let Some(mat) = materials.get_mut(&mat_node.0) {
                 mat.accent = accent_vec4(&card.data.accent);
                 // The focus card is the selection — no selection/lineage ring on it.
                 mat.params = Vec4::ZERO;
             }
+            match atlas.as_deref_mut() {
+                Some(atlas) => {
+                    card_text_glyphs(card, font, READING_TEX_W, READING_TEX_H, atlas, &mut font_data_map)
+                }
+                None => Vec::new(),
+            }
         }
         None => {
-            msdf.glyphs.clear();
             if let Some(mat) = materials.get_mut(&mat_node.0) {
                 mat.accent = Vec4::ZERO; // blank plate
             }
+            Vec::new()
         }
-    }
-    msdf.version = msdf.version.wrapping_add(1);
+    };
+    commit_panel_glyphs(&mut msdf, glyphs);
 }

@@ -19,7 +19,7 @@ use crate::cell::block_border::{
 use crate::cell::BlockCell;
 use crate::input::FocusArea;
 use crate::ui::theme::Theme;
-use crate::view::vello_ui_texture::VelloUiScene;
+use crate::view::ui_rtt::UiRttTexture;
 use crate::view::components::{MsdfOverlayText, OverlayCursorGeometry};
 
 /// Plugin that registers shader effect materials and sync systems.
@@ -44,7 +44,7 @@ fn sync_block_fx(
             Has<MsdfOverlayText>,
             Has<crate::view::shell_dock::MsdfShellDockText>,
             Option<&OverlayCursorGeometry>,
-            Option<&VelloUiScene>,
+            &UiRttTexture,
             Option<&BlockExcludedState>,
         ),
         Or<(With<BlockCell>, With<MsdfOverlayText>, With<crate::view::shell_dock::MsdfShellDockText>)>,
@@ -60,7 +60,7 @@ fn sync_block_fx(
 
     let show_cursor = matches!(*focus, FocusArea::Compose);
 
-    for (mat_node, border, label_metrics, is_chat_overlay, is_shell_dock, cursor_geom, block_scene, excluded_state) in query.iter() {
+    for (mat_node, border, label_metrics, is_chat_overlay, is_shell_dock, cursor_geom, rtt, excluded_state) in query.iter() {
         let is_overlay = is_chat_overlay || is_shell_dock;
         let Some(mat) = fx_materials.get_mut(&mat_node.0) else {
             continue;
@@ -143,8 +143,8 @@ fn sync_block_fx(
 
         // Cursor (overlay only) — width and color depend on vim mode.
         if is_overlay && show_cursor {
-            if let (Some(geom), Some(scene)) = (cursor_geom, block_scene) {
-                if geom.height > 0.0 && scene.built_width > 0.0 && scene.built_height > 0.0 {
+            if let Some(geom) = cursor_geom {
+                if geom.height > 0.0 && rtt.built_width > 0.0 && rtt.built_height > 0.0 {
                     use crate::input::vim::CursorKind;
                     // Block-cursor width: a fraction of line height. Mono
                     // fonts cluster around ~0.55× height; this is close
@@ -170,10 +170,10 @@ fn sync_block_fx(
                     };
 
                     if rect_w > 0.0 && rect_h > 0.0 {
-                        let cx = rect_x / scene.built_width;
-                        let cy = rect_y / scene.built_height;
-                        let cw = rect_w / scene.built_width;
-                        let ch = rect_h / scene.built_height;
+                        let cx = rect_x / rtt.built_width;
+                        let cy = rect_y / rtt.built_height;
+                        let cw = rect_w / rtt.built_width;
+                        let ch = rect_h / rtt.built_height;
                         mat.cursor_params = Vec4::new(cx, cy, cw, ch);
                         mat.cursor_color = Vec4::new(color.x, color.y, color.z, color.w);
                     } else {
@@ -183,10 +183,10 @@ fn sync_block_fx(
 
                     // Selection rect (Visual mode) — pixel rect → UV.
                     if geom.selection_width > 0.0 && geom.selection_height > 0.0 {
-                        let sx = geom.selection_x as f32 / scene.built_width;
-                        let sy = geom.selection_y as f32 / scene.built_height;
-                        let sw = geom.selection_width as f32 / scene.built_width;
-                        let sh = geom.selection_height as f32 / scene.built_height;
+                        let sx = geom.selection_x as f32 / rtt.built_width;
+                        let sy = geom.selection_y as f32 / rtt.built_height;
+                        let sw = geom.selection_width as f32 / rtt.built_width;
+                        let sh = geom.selection_height as f32 / rtt.built_height;
                         mat.selection_params = Vec4::new(sx, sy, sw, sh);
                         let s = theme.selection_bg.to_srgba();
                         mat.selection_color = Vec4::new(s.red, s.green, s.blue, s.alpha);

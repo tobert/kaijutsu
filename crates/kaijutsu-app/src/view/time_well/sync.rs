@@ -17,7 +17,7 @@ use kaijutsu_types::ContextId;
 use super::card::{ClusterAssignment, assign_bands, card_from, spiral_order, spiral_pos, spiral_scale};
 use super::scene::{CARD_TEX_H, CARD_TEX_W, Card, CardTarget, TimeWellState};
 use crate::connection::{RpcActor, RpcResultChannel, RpcResultMessage};
-use crate::view::vello_ui_texture::{VelloUiScene, VelloUiTexture, create_vello_texture};
+use super::panel::create_msdf_panel;
 
 /// Reconcile the well against the latest polled context list.
 ///
@@ -131,11 +131,12 @@ pub fn sync_time_well(
         // `text::build_card_scenes`) rasterizes into this and the `WellCardMaterial`
         // samples it (the texture = content layer; the shader is where slice-2 FX
         // will live). Masked alpha keeps the rounded-rect corners transparent.
-        let tex_w = CARD_TEX_W as u32;
-        let tex_h = CARD_TEX_H as u32;
-        let image = create_vello_texture(&mut images, tex_w, tex_h);
+        // Per-card MSDF panel: the RTT texture `text::build_card_scenes` lays glyphs
+        // into and the `WellCardMaterial` samples (the texture = content layer; the
+        // shader draws the body + rims). Masked alpha keeps the corners transparent.
+        let (image, panel) = create_msdf_panel(&mut images, CARD_TEX_W as u32, CARD_TEX_H as u32);
         let material = materials.add(crate::shaders::WellCardMaterial {
-            texture: image.clone(),
+            texture: image,
             accent: super::scene::accent_vec4(&data.accent),
             params: Vec4::ZERO,
             shape: super::scene::card_shape(),
@@ -160,16 +161,7 @@ pub fn sync_time_well(
                 MeshMaterial3d(material),
                 Transform::from_translation(pos),
                 Visibility::Inherited,
-                VelloUiScene::default(),
-                VelloUiTexture {
-                    image,
-                    width: tex_w,
-                    height: tex_h,
-                },
-                // MSDF owns this texture (clears + renders text on transparent);
-                // the shader draws the body. No vello.
-                crate::text::msdf::MsdfBlockGlyphs::default(),
-                crate::text::msdf::BlockRenderMethod::Msdf,
+                panel,
                 Name::new(format!("Card({})", id.short())),
             ))
             .id();

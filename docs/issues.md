@@ -497,6 +497,27 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
     the breathe itself is continuous via `globals.time`). Thin-client aligned.
   - *Readability:* card sizing/camera zoom is functional but text is small at
     the default framing; tune when the active view (step 6) lands.
+- **Edge HUD → in-scene MSDF panels — ✅ SHIPPED 2026-06-18.** The HUD's
+  first-prototype four flat Bevy `Text` nodes are now in-scene **MSDF panels**:
+  3D quads parented to the well camera (screen-stable, always face it, no
+  billboard), sampling the `WellCardMaterial` accent plate (dim, tinted by the
+  selection's accent) and rasterizing MSDF text — HDR/bloom + depth, the same
+  visual language as the cards. Positioned at the camera frustum edges via the
+  pure, unit-tested `hud_slot_offset` (adapts to window aspect; re-derived each
+  frame so it survives resize). Built on a new shared `view/time_well/panel.rs`
+  primitive (`create_msdf_panel` + `commit_panel_glyphs`) that the rim cards and
+  reading card also now use. Landed alongside the RTT rename/split (see below).
+  HUD-layout polish remaining (tunable, non-blocking): per-slot font sizes read a
+  touch small at default framing; the E specs panel wraps a long model badge; the
+  S preview panel height vs the 160-char snippet.
+- **RTT type rename + split — ✅ SHIPPED 2026-06-18.** `view/vello_ui_texture.rs`
+  → `view/ui_rtt.rs`; `VelloUiTexture` → `UiRttTexture` (now also carries the
+  content-neutral `built_width/height`), `VelloUiScene` → `UiVectorScene`
+  (`{scene, version}`, vello-only). Pure-MSDF surfaces (well cards/reading/HUD,
+  overlay, shell-dock) carry **no** vello type; dual-mode block cells +
+  role-group borders keep `UiVectorScene`. Follow-up (optional, low): `overlay.rs`
+  / `shell_dock.rs` could also adopt `create_msdf_panel`/`commit_panel_glyphs`
+  for their MSDF surfaces (Phase 0 already dropped their vector type).
 - **Time-well — deferred UI ideas (parked 2026-06-17, picking up the activity
   layer instead).** All real, none blocking; the active iteration is the
   base-ring kernel-activity indicator (see `viz-substrate.md` step 7.7):

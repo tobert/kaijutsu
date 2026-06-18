@@ -262,8 +262,8 @@ pub fn spawn_block_cells(
                     BlockCell::new(*block_id),
                     BlockCellLayout::default(),
                     crate::view::block_render::BlockScene::default(),
-                    crate::view::vello_ui_texture::VelloUiScene::default(),
-                    crate::view::vello_ui_texture::VelloUiTexture::default(),
+                    crate::view::ui_rtt::UiVectorScene::default(),
+                    crate::view::ui_rtt::UiRttTexture::default(),
                     crate::text::msdf::MsdfBlockGlyphs::default(),
                     crate::text::msdf::BlockRenderMethod::default(),
                     ImageNode::default(),
@@ -390,8 +390,8 @@ pub fn sync_role_headers(
             .spawn((
                 RoleGroupBorder { role, block_id },
                 RoleGroupBorderLayout::default(),
-                crate::view::vello_ui_texture::VelloUiScene::default(),
-                crate::view::vello_ui_texture::VelloUiTexture::default(),
+                crate::view::ui_rtt::UiVectorScene::default(),
+                crate::view::ui_rtt::UiRttTexture::default(),
                 ImageNode::default(),
                 Node {
                     width: Val::Percent(100.0),

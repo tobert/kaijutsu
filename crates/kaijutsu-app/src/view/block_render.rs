@@ -37,7 +37,7 @@ use crate::text::markdown::MarkdownColors;
 use crate::text::sparkline::{SparklineColors, build_sparkline_paths, render_sparkline_scene};
 use crate::ui::theme::Theme;
 use crate::view::fieldset;
-use crate::view::vello_ui_texture::{VelloUiScene, VelloUiTexture};
+use crate::view::ui_rtt::{UiVectorScene, UiRttTexture};
 
 // ============================================================================
 // COMPONENTS
@@ -46,7 +46,7 @@ use crate::view::vello_ui_texture::{VelloUiScene, VelloUiTexture};
 /// Per-block content + bookkeeping (the build-decision side of a block cell).
 ///
 /// The rasterizable scene + built dimensions live on the sibling
-/// [`VelloUiScene`]; this component carries only what the *build* systems need
+/// [`UiVectorScene`]; this component carries only what the *build* systems need
 /// to decide when to rebuild (content versions, formatted text, color). The
 /// name is historical — it no longer holds a scene; rename to `BlockContent` is
 /// a tracked follow-up.
@@ -58,7 +58,7 @@ pub struct BlockScene {
     pub last_built_version: u64,
     /// Monotonic counter bumped each rebuild. Double duty: drives the MSDF
     /// glyph version (= scene_version) and, on the Vello path, is copied into
-    /// `VelloUiScene.version` to gate vello rasterization.
+    /// `UiVectorScene.version` to gate vello rasterization.
     pub scene_version: u64,
     /// Formatted text content (set by sync_block_cell_buffers).
     pub text: String,
@@ -115,7 +115,7 @@ impl Plugin for BlockRenderPlugin {
         };
 
         // Block cells + MSDF text surfaces rasterize their vello scene via the
-        // generic VelloUiTexturePlugin (extract_vello_scenes / render_vello_scenes);
+        // generic UiRttPlugin (extract_vello_scenes / render_vello_scenes);
         // this plugin owns only the MSDF compositing pass, which runs *after* the
         // generic vello render so borders/content land in the texture first.
         render_app
@@ -130,7 +130,7 @@ impl Plugin for BlockRenderPlugin {
                 Render,
                 render_msdf_block_textures
                     .in_set(RenderSystems::Render)
-                    .after(crate::view::vello_ui_texture::render_vello_scenes)
+                    .after(crate::view::ui_rtt::render_vello_scenes)
                     .run_if(|msdf: Res<ExtractedMsdfBlockData>| !msdf.items.is_empty()),
             );
     }
@@ -233,7 +233,8 @@ pub fn build_block_scenes(
         (
             Entity,
             &mut BlockScene,
-            &mut VelloUiScene,
+            &mut UiVectorScene,
+            &mut UiRttTexture,
             &ComputedNode,
             &mut Node,
             Option<&RichContent>,
@@ -272,7 +273,7 @@ pub fn build_block_scenes(
     let rainbow_phase = (time.elapsed_secs() * 0.25) % 1.0;
 
     for (
-        entity, mut block_scene, mut ui_scene, computed, mut node, rich, border, vis, effects,
+        entity, mut block_scene, mut ui_scene, mut rtt, computed, mut node, rich, border, vis, effects,
         mut msdf_glyphs, mut render_method, excluded_state,
     ) in block_cells.iter_mut()
     {
@@ -291,7 +292,7 @@ pub fn build_block_scenes(
         // and don't need CPU-side scene rebuilds AFTER the first build. But we must
         // rebuild once when the flag first becomes true so msdf_glyphs.rainbow is set.
         let version_changed = block_scene.content_version != block_scene.last_built_version;
-        let width_changed = (ui_scene.built_width - width).abs() > 1.0;
+        let width_changed = (rtt.built_width - width).abs() > 1.0;
         let is_rainbow = effects.is_some_and(|e| e.rainbow);
         let has_animation = border.is_some_and(|b| b.animation != BorderAnimation::None);
         let never_built = block_scene.last_built_version == 0;
@@ -728,8 +729,8 @@ pub fn build_block_scenes(
         }
 
         ui_scene.scene = scene;
-        ui_scene.built_width = width;
-        ui_scene.built_height = total_height;
+        rtt.built_width = width;
+        rtt.built_height = total_height;
         block_scene.last_built_version = block_scene.content_version;
         block_scene.scene_version = block_scene.scene_version.wrapping_add(1);
 
@@ -748,7 +749,7 @@ pub fn build_block_scenes(
 /// Build vello scenes for role group border entities.
 pub fn build_role_group_scenes(
     mut role_borders: Query<
-        (&RoleGroupBorder, &mut VelloUiScene, &ComputedNode),
+        (&RoleGroupBorder, &mut UiVectorScene, &mut UiRttTexture, &ComputedNode),
         Changed<ComputedNode>,
     >,
     fonts: Res<Assets<VelloFont>>,
@@ -757,7 +758,7 @@ pub fn build_role_group_scenes(
 ) {
     let font = fonts.get(&font_handles.mono);
 
-    for (border, mut ui_scene, computed) in role_borders.iter_mut() {
+    for (border, mut ui_scene, mut rtt, computed) in role_borders.iter_mut() {
         let size = computed.size();
         if size.x < 1.0 {
             continue;
@@ -790,8 +791,8 @@ pub fn build_role_group_scenes(
         );
 
         ui_scene.scene = scene;
-        ui_scene.built_width = size.x;
-        ui_scene.built_height = height;
+        rtt.built_width = size.x;
+        rtt.built_height = height;
         ui_scene.version = ui_scene.version.wrapping_add(1).max(1);
     }
 }
@@ -803,7 +804,7 @@ pub fn build_role_group_scenes(
 /// `BlockFxMaterial` texture binding alongside the `ImageNode`.
 pub fn resize_block_textures(
     mut block_query: Query<
-        (&VelloUiScene, &mut VelloUiTexture, &MaterialNode<BlockFxMaterial>, &mut ImageNode),
+        (&mut UiRttTexture, &MaterialNode<BlockFxMaterial>, &mut ImageNode),
         (
             Or<(With<BlockCell>, With<crate::view::components::MsdfOverlayText>, With<crate::view::shell_dock::MsdfShellDockText>)>,
             Without<RoleGroupBorder>,
@@ -820,21 +821,21 @@ pub fn resize_block_textures(
     // Block cells: update material + ImageNode texture bindings.
     // ImageNode ensures GpuImage is prepared by Bevy's RenderAssetPlugin.
     // MaterialNode's shader reads from the same texture for post-processing.
-    for (scene, mut texture, mat_node, mut image_node) in block_query.iter_mut() {
-        if scene.built_width <= 0.0 || scene.built_height <= 0.0 {
+    for (mut texture, mat_node, mut image_node) in block_query.iter_mut() {
+        if texture.built_width <= 0.0 || texture.built_height <= 0.0 {
             continue;
         }
 
-        let (target_w, target_h) = crate::view::vello_ui_texture::vello_texture_dims(
-            scene.built_width,
-            scene.built_height,
+        let (target_w, target_h) = crate::view::ui_rtt::ui_rtt_texture_dims(
+            texture.built_width,
+            texture.built_height,
             scale,
             max_dim,
         );
 
         if texture.width != target_w || texture.height != target_h {
             let new_handle =
-                crate::view::vello_ui_texture::create_vello_texture(&mut images, target_w, target_h);
+                crate::view::ui_rtt::create_ui_rtt_texture(&mut images, target_w, target_h);
             if let Some(mat) = fx_materials.get_mut(&mat_node.0) {
                 mat.texture = new_handle.clone();
             }
@@ -848,13 +849,13 @@ pub fn resize_block_textures(
 
 /// Size role-group-border textures to their measured content (physical pixels).
 ///
-/// Role borders carry the generic `VelloUiScene`/`VelloUiTexture` (plain
+/// Role borders carry the generic `UiVectorScene`/`UiRttTexture` (plain
 /// `ImageNode`, no material), so this is the simple sibling of
 /// `resize_block_textures`'s former role branch — split out when the borders
 /// migrated onto the shared vello→texture primitive.
 pub fn resize_role_group_textures(
     mut role_query: Query<
-        (&VelloUiScene, &mut VelloUiTexture, &mut ImageNode),
+        (&mut UiRttTexture, &mut ImageNode),
         With<RoleGroupBorder>,
     >,
     text_metrics: Res<TextMetrics>,
@@ -864,22 +865,22 @@ pub fn resize_role_group_textures(
     let scale = text_metrics.scale_factor;
     let max_dim = gpu_limits.max_texture_dim;
 
-    for (scene, mut texture, mut image_node) in role_query.iter_mut() {
-        if scene.built_width <= 0.0 || scene.built_height <= 0.0 {
+    for (mut texture, mut image_node) in role_query.iter_mut() {
+        if texture.built_width <= 0.0 || texture.built_height <= 0.0 {
             continue;
         }
 
         let (target_w, target_h) =
-            crate::view::vello_ui_texture::vello_texture_dims(
-                scene.built_width,
-                scene.built_height,
+            crate::view::ui_rtt::ui_rtt_texture_dims(
+                texture.built_width,
+                texture.built_height,
                 scale,
                 max_dim,
             );
 
         if texture.width != target_w || texture.height != target_h {
             let new_handle =
-                crate::view::vello_ui_texture::create_vello_texture(&mut images, target_w, target_h);
+                crate::view::ui_rtt::create_ui_rtt_texture(&mut images, target_w, target_h);
             image_node.image = new_handle.clone();
             texture.image = new_handle;
             texture.width = target_w;
@@ -1057,14 +1058,13 @@ fn extract_msdf_blocks(
         Query<(
             &MsdfBlockGlyphs,
             &BlockRenderMethod,
-            &VelloUiScene,
-            &VelloUiTexture,
+            &UiRttTexture,
         )>,
     >,
 ) {
     extracted.items.clear();
 
-    for (msdf_glyphs, render_method, scene, texture) in query.iter() {
+    for (msdf_glyphs, render_method, texture) in query.iter() {
         let asset_id = texture.image.id();
         let last = extracted.last_rendered.get(&asset_id).copied().unwrap_or(0);
         if !should_extract_msdf_block(msdf_glyphs.version, msdf_glyphs.glyphs.is_empty(), last) {
@@ -1078,8 +1078,8 @@ fn extract_msdf_blocks(
             image_handle: texture.image.clone(),
             width: texture.width,
             height: texture.height,
-            built_width: scene.built_width,
-            built_height: scene.built_height,
+            built_width: texture.built_width,
+            built_height: texture.built_height,
             version: msdf_glyphs.version,
             rainbow: msdf_glyphs.rainbow,
             has_vello_content: has_vello,

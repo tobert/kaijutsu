@@ -1,6 +1,6 @@
 //! Vello-drawn dock bars (North + South).
 //!
-//! Each dock is a single Bevy entity with `VelloUiScene` + `VelloUiTexture` +
+//! Each dock is a single Bevy entity with `UiVectorScene` + `UiRttTexture` +
 //! `ImageNode` (the kaijutsu-owned vello→texture primitive). All text is drawn
 //! directly into the Vello scene — no child entities, no flex layout for widgets.
 //!
@@ -13,8 +13,8 @@ use std::collections::VecDeque;
 use bevy::prelude::*;
 use crate::text::shaping::{VelloFont, VelloTextAlign, VelloTextStyle};
 use crate::view::block_render::GpuTextureLimits;
-use crate::view::vello_ui_texture::{
-    VelloUiScene, VelloUiTexture, create_vello_texture, vello_texture_dims,
+use crate::view::ui_rtt::{
+    UiVectorScene, UiRttTexture, create_ui_rtt_texture, ui_rtt_texture_dims,
 };
 use vello::kurbo::Affine;
 use vello::peniko::Fill;
@@ -327,8 +327,8 @@ pub fn spawn_docks(
             },
             BorderColor::all(theme.border),
             ImageNode::default(),
-            VelloUiScene::default(),
-            VelloUiTexture::default(),
+            UiVectorScene::default(),
+            UiRttTexture::default(),
             GlobalZIndex(crate::constants::ZLayer::HUD),
         ))
         .id();
@@ -346,8 +346,8 @@ pub fn spawn_docks(
             },
             BorderColor::all(theme.border),
             ImageNode::default(),
-            VelloUiScene::default(),
-            VelloUiTexture::default(),
+            UiVectorScene::default(),
+            UiRttTexture::default(),
             GlobalZIndex(crate::constants::ZLayer::HUD),
         ))
         .id();
@@ -364,16 +364,16 @@ pub fn render_north_dock(
     theme: Res<Theme>,
     fonts: Res<Assets<VelloFont>>,
     font_handles: Res<ShapingFonts>,
-    mut query: Query<(&mut VelloUiScene, &ComputedNode), With<NorthDock>>,
+    mut query: Query<(&mut UiVectorScene, &mut UiRttTexture, &ComputedNode), With<NorthDock>>,
 ) {
-    let Ok((mut scene_comp, computed)) = query.single_mut() else {
+    let Ok((mut scene_comp, mut rtt, computed)) = query.single_mut() else {
         return;
     };
 
     // Rebuild on data/theme change or when the dock changed width (right-aligned
     // groups must reflow; a stale-width scene would otherwise stretch onto the
     // resized texture).
-    let width_changed = (scene_comp.built_width - computed.size().x).abs() > 0.5;
+    let width_changed = (rtt.built_width - computed.size().x).abs() > 0.5;
     if !dock_state.is_changed() && !theme.is_changed() && !width_changed {
         return;
     }
@@ -475,8 +475,8 @@ pub fn render_north_dock(
     );
 
     scene_comp.scene = scene;
-    scene_comp.built_width = computed.size().x;
-    scene_comp.built_height = computed.size().y;
+    rtt.built_width = computed.size().x;
+    rtt.built_height = computed.size().y;
     scene_comp.version = scene_comp.version.wrapping_add(1).max(1);
 }
 
@@ -488,14 +488,14 @@ pub fn render_south_dock(
     theme: Res<Theme>,
     fonts: Res<Assets<VelloFont>>,
     font_handles: Res<ShapingFonts>,
-    mut query: Query<(&mut VelloUiScene, &ComputedNode), With<SouthDock>>,
+    mut query: Query<(&mut UiVectorScene, &mut UiRttTexture, &ComputedNode), With<SouthDock>>,
     mut hit_regions: ResMut<DockHitRegions>,
 ) {
-    let Ok((mut scene_comp, computed)) = query.single_mut() else {
+    let Ok((mut scene_comp, mut rtt, computed)) = query.single_mut() else {
         return;
     };
 
-    let width_changed = (scene_comp.built_width - computed.size().x).abs() > 0.5;
+    let width_changed = (rtt.built_width - computed.size().x).abs() > 0.5;
     if !dock_state.is_changed() && !theme.is_changed() && !width_changed {
         return;
     }
@@ -634,8 +634,8 @@ pub fn render_south_dock(
     }
 
     scene_comp.scene = scene;
-    scene_comp.built_width = computed.size().x;
-    scene_comp.built_height = computed.size().y;
+    rtt.built_width = computed.size().x;
+    rtt.built_height = computed.size().y;
     scene_comp.version = scene_comp.version.wrapping_add(1).max(1);
 }
 
@@ -644,7 +644,7 @@ pub fn render_south_dock(
 /// sizes from `ComputedNode` (full-width bar) rather than measured content.
 pub fn resize_dock_textures(
     mut query: Query<
-        (&ComputedNode, &mut VelloUiTexture, &mut ImageNode),
+        (&ComputedNode, &mut UiRttTexture, &mut ImageNode),
         Or<(With<NorthDock>, With<SouthDock>)>,
     >,
     text_metrics: Res<crate::text::TextMetrics>,
@@ -660,9 +660,9 @@ pub fn resize_dock_textures(
             continue;
         }
 
-        let (target_w, target_h) = vello_texture_dims(size.x, size.y, scale, max_dim);
+        let (target_w, target_h) = ui_rtt_texture_dims(size.x, size.y, scale, max_dim);
         if texture.width != target_w || texture.height != target_h {
-            let new_handle = create_vello_texture(&mut images, target_w, target_h);
+            let new_handle = create_ui_rtt_texture(&mut images, target_w, target_h);
             image_node.image = new_handle.clone();
             texture.image = new_handle;
             texture.width = target_w;

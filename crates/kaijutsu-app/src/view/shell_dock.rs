@@ -17,7 +17,7 @@ use crate::text::msdf::{BlockRenderMethod, FontDataMap, MsdfBlockGlyphs, collect
 use crate::text::{ShapingFonts, TextMetrics, bevy_color_to_brush};
 use crate::ui::theme::Theme;
 use crate::view::block_render::BlockScene;
-use crate::view::vello_ui_texture::{VelloUiScene, VelloUiTexture};
+use crate::view::ui_rtt::UiRttTexture;
 use crate::view::components::OverlayCursorGeometry;
 use crate::view::overlay::OverlayStyle;
 
@@ -97,8 +97,7 @@ pub fn spawn_shell_dock(
             parent.spawn((
                 MsdfShellDockText,
                 BlockScene::default(),
-                VelloUiScene::default(),
-                VelloUiTexture::default(),
+                UiRttTexture::default(),
                 MsdfBlockGlyphs::default(),
                 BlockRenderMethod::Msdf,
                 ImageNode::default(),
@@ -217,7 +216,7 @@ pub fn build_shell_dock_glyphs(
     mut msdf_children: Query<
         (
             &mut BlockScene,
-            &mut VelloUiScene,
+            &mut UiRttTexture,
             &mut MsdfBlockGlyphs,
             &BlockBorderStyle,
             &ComputedNode,
@@ -241,7 +240,7 @@ pub fn build_shell_dock_glyphs(
         for child in children.iter() {
             let Ok((
                 mut block_scene,
-                mut ui_scene,
+                mut rtt,
                 mut msdf_glyphs,
                 border_style,
                 computed,
@@ -266,7 +265,7 @@ pub fn build_shell_dock_glyphs(
 
             let cursor_byte_offset = 2 + overlay.cursor; // "$ " = 2 bytes
 
-            let width_changed = (ui_scene.built_width - width).abs() > 1.0;
+            let width_changed = (rtt.built_width - width).abs() > 1.0;
             let text_changed = block_scene.text != display;
             let cursor_changed = cursor_geom.last_cursor_offset != cursor_byte_offset;
 
@@ -331,8 +330,8 @@ pub fn build_shell_dock_glyphs(
                 // Round to physical pixel boundary — see block_render.rs comment.
                 let scale = text_metrics.scale_factor;
                 let total_height = ((content_height + pad.top + pad.bottom) * scale).round() / scale;
-                ui_scene.built_width = width;
-                ui_scene.built_height = total_height;
+                rtt.built_width = width;
+                rtt.built_height = total_height;
                 block_scene.text = display;
                 block_scene.color = text_color;
                 block_scene.content_version = block_scene.content_version.wrapping_add(1);

@@ -18,7 +18,7 @@ use super::shaping::{ShapingPlugin, VelloFont, VelloFontAxes, VelloTextAlign, Ve
 /// - Font loading and DPI-aware text metrics
 ///
 /// Vector rasterization (SVG, borders, ABC, sparklines) is owned by
-/// `VelloRasterizerPlugin` + `VelloUiTexturePlugin`.
+/// `VelloRasterizerPlugin` + `UiRttPlugin`.
 pub struct KjTextPlugin;
 
 impl Plugin for KjTextPlugin {

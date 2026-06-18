@@ -25,7 +25,7 @@ pub mod submit;
 pub mod sync;
 pub mod time_well;
 pub mod vello_rasterizer;
-pub mod vello_ui_texture;
+pub mod ui_rtt;
 
 // Re-export all public types
 pub use components::*;

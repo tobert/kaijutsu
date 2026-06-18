@@ -8,19 +8,33 @@
 //! - **W** (left): lineage — the fork-ancestry chain (this ◂ parent ◂ …).
 //! - **S** (bottom): preview — a snippet of the most representative block.
 //!
-//! First cut renders with Bevy's native `Text` (the bundled mono font, same as
-//! the unfocused-pane summary); a vello/MSDF styling pass can follow if the data
-//! layout lands. Spawned on enter, despawned on exit, refreshed each frame but
-//! only rewritten when the formatted text actually changes (no per-frame
-//! relayout).
+//! Each readout is an **in-scene MSDF panel** (the shared [`super::panel`]
+//! primitive): a 3D quad **parented to the well camera**, so it rides the frame
+//! (screen-stable) yet lives in the scene — HDR/bloom, depth, and the
+//! `WellCardMaterial` accent plate, same visual language as the cards. Being a
+//! camera child it always faces the camera (no billboard system). Panels are
+//! positioned at the camera's frustum edges via [`hud_slot_offset`], derived
+//! from the live `Projection` so they adapt to window aspect.
+//!
+//! Spawned on enter, despawned on exit, repositioned each frame
+//! ([`position_well_hud`]), and re-laid-out only when the formatted text actually
+//! changes ([`update_well_hud`] — no per-frame relayout).
+
+use std::f32::consts::FRAC_PI_4;
 
 use bevy::prelude::*;
 use kaijutsu_types::{ContextId, Status};
 use kaijutsu_viz::layout::Band;
 
-use super::scene::{Card, TimeWellState};
+use super::panel::{commit_panel_glyphs, create_msdf_panel};
+use super::scene::{Card, TimeWellState, accent_color};
+use crate::shaders::WellCardMaterial;
+use crate::text::ShapingFonts;
+use crate::text::components::bevy_color_to_brush;
+use crate::text::msdf::{FontDataMap, MsdfAtlas, MsdfBlockGlyphs, PositionedGlyph, collect_msdf_glyphs};
+use crate::text::shaping::{VelloFont, VelloTextAlign, VelloTextStyle};
 
-/// Which edge a HUD text node lives on. Shared despawn happens via this query.
+/// Which edge a HUD panel lives on. Shared despawn happens via [`WellHud`].
 #[derive(Component, Clone, Copy, PartialEq, Eq)]
 pub enum HudSlot {
     North,
@@ -29,125 +43,209 @@ pub enum HudSlot {
     South,
 }
 
+impl HudSlot {
+    /// All four slots, for spawn iteration.
+    pub const ALL: [HudSlot; 4] = [HudSlot::North, HudSlot::East, HudSlot::West, HudSlot::South];
+}
+
 /// Container marker for the whole HUD (despawned together on exit).
 #[derive(Component)]
 pub struct WellHud;
 
-const HUD_FONT: &str = "fonts/CascadiaCodeNF.ttf";
+/// The last formatted string a panel rendered — change-guards the MSDF relayout
+/// so an unchanged edge never rebuilds its glyphs.
+#[derive(Component, Default)]
+pub struct HudText(String);
 
-/// Spawn the four edge HUD readouts (empty until a selection drives them).
-pub fn spawn_well_hud(mut commands: Commands, asset_server: Res<AssetServer>, theme: Res<crate::ui::theme::Theme>) {
-    let font = asset_server.load(HUD_FONT);
+// ── Layout tuning (all derived from the frustum; px values are texture-space). ──
 
-    // N + S are centered horizontally via a full-width flex container; E + W are
-    // narrow boxes anchored to the side, vertically centered.
-    spawn_centered(
-        &mut commands,
-        HudSlot::North,
-        &font,
-        theme.fg,
-        18.0,
-        Some(Val::Px(16.0)),
-        None,
-    );
-    spawn_centered(
-        &mut commands,
-        HudSlot::South,
-        &font,
-        theme.fg_dim,
-        13.0,
-        None,
-        Some(Val::Px(56.0)),
-    );
-    spawn_side(&mut commands, HudSlot::East, &font, theme.fg_dim, false);
-    spawn_side(&mut commands, HudSlot::West, &font, theme.fg_dim, true);
-}
+/// Local distance in front of the camera the HUD plane sits at. The panels are
+/// camera children, so this is constant in screen space and always renders in
+/// front of every card (which live hundreds of units further down the funnel).
+const HUD_DEPTH: f32 = 100.0;
+/// Fraction of the frustum half-extent each panel center sits inboard of the edge.
+const HUD_MARGIN: f32 = 0.16;
+/// Texture-space font size + inner padding for the readout text.
+const HUD_FONT_SIZE: f32 = 20.0;
+const HUD_PAD: f32 = 16.0;
+/// Plate alpha — a dim translucent backing tinted by the selection's accent so
+/// the HUD reads as part of the selection and text stays legible against bloom.
+const HUD_PLATE_ALPHA: f32 = 0.24;
 
-/// A centered top/bottom readout: a full-width flex row that centers its text.
-fn spawn_centered(
-    commands: &mut Commands,
-    slot: HudSlot,
-    font: &Handle<Font>,
-    color: Color,
-    size: f32,
-    top: Option<Val>,
-    bottom: Option<Val>,
-) {
-    commands
-        .spawn((
-            WellHud,
-            Node {
-                position_type: PositionType::Absolute,
-                left: Val::Px(0.0),
-                right: Val::Px(0.0),
-                top: top.unwrap_or(Val::Auto),
-                bottom: bottom.unwrap_or(Val::Auto),
-                justify_content: JustifyContent::Center,
-                ..default()
-            },
-        ))
-        .with_children(|p| {
-            p.spawn((
-                slot,
-                Text::new(""),
-                TextFont {
-                    font: font.clone(),
-                    font_size: size,
-                    ..default()
-                },
-                TextColor(color),
-                TextLayout::new_with_justify(Justify::Center),
-            ));
-        });
-}
-
-/// A side (E/W) readout: a narrow absolute box, vertically centered-ish.
-fn spawn_side(commands: &mut Commands, slot: HudSlot, font: &Handle<Font>, color: Color, west: bool) {
-    let mut node = Node {
-        position_type: PositionType::Absolute,
-        top: Val::Percent(26.0),
-        width: Val::Px(300.0),
-        ..default()
-    };
-    if west {
-        node.left = Val::Px(28.0);
-    } else {
-        node.right = Val::Px(28.0);
-        node.justify_content = JustifyContent::FlexEnd;
+/// Per-slot texture (logical authoring) size. N/S are wide-short, E/W tall-narrow;
+/// the quad aspect tracks this so text never distorts.
+fn hud_tex_dims(slot: HudSlot) -> (u32, u32) {
+    match slot {
+        HudSlot::North => (520, 104),
+        HudSlot::South => (560, 150),
+        HudSlot::East | HudSlot::West => (260, 400),
     }
-    commands.spawn((
-        WellHud,
-        slot,
-        Text::new(""),
-        TextFont {
-            font: font.clone(),
-            font_size: 13.0,
-            ..default()
-        },
-        TextColor(color),
-        TextLayout::new_with_justify(if west { Justify::Left } else { Justify::Right }),
-        node,
-    ));
 }
 
-/// Despawn the whole HUD on exit.
+/// Text alignment inside a panel.
+fn hud_align(slot: HudSlot) -> VelloTextAlign {
+    match slot {
+        HudSlot::North | HudSlot::South => VelloTextAlign::Middle,
+        HudSlot::East | HudSlot::West => VelloTextAlign::Left,
+    }
+}
+
+/// World quad size (well units) for a slot, derived from the frustum half-extents
+/// so panels stay screen-proportional across aspect/FOV. Width/height keep the
+/// slot's texture aspect (no text distortion).
+fn hud_quad_size(slot: HudSlot, half_w: f32, half_h: f32) -> Vec2 {
+    let (tw, th) = hud_tex_dims(slot);
+    let aspect = tw as f32 / th as f32;
+    match slot {
+        HudSlot::North | HudSlot::South => {
+            let w = half_w * 0.56;
+            Vec2::new(w, w / aspect)
+        }
+        HudSlot::East | HudSlot::West => {
+            let h = half_h * 0.78;
+            Vec2::new(h * aspect, h)
+        }
+    }
+}
+
+/// `WellCardMaterial.shape` for a HUD panel: `[aspect, corner_radius, ring_width,
+/// inset]` — same rounded-rect knobs as a card but the slot's own aspect.
+fn hud_shape(slot: HudSlot) -> Vec4 {
+    let (tw, th) = hud_tex_dims(slot);
+    Vec4::new(tw as f32 / th as f32, 0.06, 0.045, 0.012)
+}
+
+/// Local-space placement of one edge slot, computed from the camera frustum so it
+/// adapts to window aspect. At local depth `depth` in front of the camera the
+/// frustum half-extents are `half_h = depth·tan(fov_y/2)` and `half_w = half_h·
+/// aspect`; each slot's center sits `margin` (fraction of the half-extent) inboard
+/// of the edge it hugs, on the plane `z = -depth` (the camera looks down local -Z).
+pub fn hud_slot_offset(slot: HudSlot, fov_y: f32, aspect: f32, depth: f32, margin: f32) -> Vec3 {
+    let half_h = depth * (fov_y * 0.5).tan();
+    let half_w = half_h * aspect;
+    let inset = 1.0 - margin;
+    match slot {
+        HudSlot::North => Vec3::new(0.0, half_h * inset, -depth),
+        HudSlot::South => Vec3::new(0.0, -half_h * inset, -depth),
+        HudSlot::East => Vec3::new(half_w * inset, 0.0, -depth),
+        HudSlot::West => Vec3::new(-half_w * inset, 0.0, -depth),
+    }
+}
+
+/// Full child-local transform for a slot: edge offset + a scale that sizes the
+/// shared unit quad to [`hud_quad_size`]. Recomputed on spawn and every frame
+/// ([`position_well_hud`]) so the HUD stays edge-locked across window resizes.
+fn hud_transform(slot: HudSlot, fov_y: f32, aspect: f32) -> Transform {
+    let half_h = HUD_DEPTH * (fov_y * 0.5).tan();
+    let half_w = half_h * aspect;
+    let size = hud_quad_size(slot, half_w, half_h);
+    Transform::from_translation(hud_slot_offset(slot, fov_y, aspect, HUD_DEPTH, HUD_MARGIN))
+        .with_scale(Vec3::new(size.x, size.y, 1.0))
+}
+
+/// Read `(fov_y, aspect)` off a camera projection, falling back to sane defaults
+/// for a non-perspective projection (the well always uses perspective).
+fn read_perspective(projection: &Projection) -> (f32, f32) {
+    match projection {
+        Projection::Perspective(p) => (p.fov, p.aspect_ratio),
+        _ => (FRAC_PI_4, 16.0 / 9.0),
+    }
+}
+
+/// Spawn the four edge HUD panels as children of the well camera (empty until a
+/// selection drives them). The app camera always exists, so this queries
+/// `With<Camera3d>` directly — no ordering dependency on `enter_time_well`.
+pub fn spawn_well_hud(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<WellCardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+    camera: Query<(Entity, &Projection), With<Camera3d>>,
+) {
+    let Ok((cam_entity, projection)) = camera.single() else {
+        warn!("well HUD: no Camera3d to parent panels to");
+        return;
+    };
+    let (fov_y, aspect) = read_perspective(projection);
+
+    // Shared unit quad; per-panel size rides on Transform.scale.
+    let quad = meshes.add(Rectangle::new(1.0, 1.0));
+
+    for slot in HudSlot::ALL {
+        let (tw, th) = hud_tex_dims(slot);
+        let (image, panel) = create_msdf_panel(&mut images, tw, th);
+        let material = materials.add(WellCardMaterial {
+            texture: image,
+            accent: Vec4::ZERO, // transparent until a selection drives it
+            params: Vec4::ZERO, // plain panel: no selection/lineage/status rings
+            shape: hud_shape(slot),
+        });
+        commands
+            .spawn((
+                WellHud,
+                slot,
+                HudText::default(),
+                Mesh3d(quad.clone()),
+                MeshMaterial3d(material),
+                hud_transform(slot, fov_y, aspect),
+                Visibility::Inherited,
+                panel,
+                Name::new("WellHudPanel"),
+            ))
+            .insert(ChildOf(cam_entity));
+    }
+}
+
+/// Despawn the whole HUD on exit (the camera, their parent, survives).
 pub fn despawn_well_hud(mut commands: Commands, hud: Query<Entity, With<WellHud>>) {
     for e in hud.iter() {
         commands.entity(e).despawn();
     }
 }
 
-/// Refresh the four readouts from the current selection. Recomputes every frame
-/// (cheap formatting) but writes a `Text` only when its string changes, so
-/// unchanged edges never re-layout. Nothing selected → all edges blank.
+/// Keep each panel edge-locked: re-derive its transform from the live projection
+/// (cheap — four `Vec3`s) so the HUD tracks window-aspect/FOV changes.
+pub fn position_well_hud(
+    camera: Query<&Projection, With<Camera3d>>,
+    mut panels: Query<(&HudSlot, &mut Transform), With<WellHud>>,
+) {
+    let Ok(projection) = camera.single() else {
+        return;
+    };
+    let (fov_y, aspect) = read_perspective(projection);
+    for (slot, mut tf) in panels.iter_mut() {
+        *tf = hud_transform(*slot, fov_y, aspect);
+    }
+}
+
+/// Refresh the four readouts from the current selection. Recomputes the formatted
+/// string every frame (cheap) but only re-lays-out MSDF glyphs — and re-tints the
+/// plate — when a panel's string actually changes. Nothing selected → blank.
 pub fn update_well_hud(
     state: Res<TimeWellState>,
     cards: Query<&Card>,
-    mut hud: Query<(&HudSlot, &mut Text)>,
+    fonts: Res<Assets<VelloFont>>,
+    font_handles: Res<ShapingFonts>,
+    mut atlas: Option<ResMut<MsdfAtlas>>,
+    mut font_data_map: ResMut<FontDataMap>,
+    mut materials: ResMut<Assets<WellCardMaterial>>,
+    mut panels: Query<(&HudSlot, &mut HudText, &mut MsdfBlockGlyphs, &MeshMaterial3d<WellCardMaterial>)>,
 ) {
+    let Some(font) = fonts.get(&font_handles.mono) else {
+        return; // font still loading
+    };
     let selected = state.selected.and_then(|sel| cards.iter().find(|c| c.context_id == sel));
 
-    for (slot, mut text) in hud.iter_mut() {
+    // Plate tint echoes the selection's accent (dim, translucent); none → clear.
+    let plate = match selected {
+        Some(card) => {
+            let c = accent_color(&card.data.accent).to_linear();
+            Vec4::new(c.red, c.green, c.blue, HUD_PLATE_ALPHA)
+        }
+        None => Vec4::ZERO,
+    };
+
+    for (slot, mut last, mut msdf, mat_node) in panels.iter_mut() {
         let next = match (selected, slot) {
             (Some(card), HudSlot::North) => hud_north(&card.data, card.status),
             (Some(card), HudSlot::East) => hud_east(&card.data),
@@ -155,10 +253,53 @@ pub fn update_well_hud(
             (Some(card), HudSlot::South) => hud_south(&card.data),
             (None, _) => String::new(),
         };
-        if text.0 != next {
-            text.0 = next;
+        // Skip unchanged text — but always do the first build (version 0) even
+        // for empty text, so the freshly-allocated texture is cleared to
+        // transparent (otherwise an always-empty panel shows raw GPU pixels).
+        if last.0 == next && msdf.version != 0 {
+            continue;
+        }
+        last.0 = next.clone();
+
+        if let Some(mat) = materials.get_mut(&mat_node.0) {
+            mat.accent = plate;
+        }
+
+        let glyphs = match (next.is_empty(), atlas.as_deref_mut()) {
+            (false, Some(atlas)) => layout_hud_text(&next, font, *slot, atlas, &mut font_data_map),
+            _ => Vec::new(),
+        };
+        commit_panel_glyphs(&mut msdf, glyphs);
+    }
+}
+
+/// Lay out a (possibly multi-line) readout string into MSDF glyphs for a slot,
+/// wrapped to the slot's texture width and aligned per [`hud_align`].
+fn layout_hud_text(
+    text: &str,
+    font: &VelloFont,
+    slot: HudSlot,
+    atlas: &mut MsdfAtlas,
+    font_data_map: &mut FontDataMap,
+) -> Vec<PositionedGlyph> {
+    let (tw, _th) = hud_tex_dims(slot);
+    let max_advance = Some(tw as f32 - 2.0 * HUD_PAD);
+    let layout = font.layout(
+        text,
+        &VelloTextStyle { font_size: HUD_FONT_SIZE, line_height: 1.25, ..default() },
+        hud_align(slot),
+        max_advance,
+    );
+    // Register every run's font with the atlas before collecting glyphs.
+    for line in layout.lines() {
+        for item in line.items() {
+            if let parley::PositionedLayoutItem::GlyphRun(gr) = item {
+                font_data_map.register(gr.run().font());
+            }
         }
     }
+    let brush = bevy_color_to_brush(Color::srgb(0.95, 0.97, 1.0));
+    collect_msdf_glyphs(&layout, &[], &brush, (HUD_PAD as f64, HUD_PAD as f64), atlas)
 }
 
 fn status_label(status: Option<Status>) -> &'static str {
@@ -321,5 +462,69 @@ mod tests {
 
         c.preview = Some("short".into());
         assert_eq!(hud_south(&c), "short", "short preview passes through");
+    }
+
+    // ── hud_slot_offset: frustum-edge placement math ──
+
+    const D: f32 = 100.0;
+
+    #[test]
+    fn slots_sit_on_their_edges() {
+        let (fov, aspect, m) = (FRAC_PI_4, 16.0 / 9.0, 0.16);
+        let n = hud_slot_offset(HudSlot::North, fov, aspect, D, m);
+        let s = hud_slot_offset(HudSlot::South, fov, aspect, D, m);
+        let e = hud_slot_offset(HudSlot::East, fov, aspect, D, m);
+        let w = hud_slot_offset(HudSlot::West, fov, aspect, D, m);
+        assert!(n.y > 0.0, "north is above center");
+        assert!(s.y < 0.0, "south is below center");
+        assert!(e.x > 0.0, "east is right of center");
+        assert!(w.x < 0.0, "west is left of center");
+        // N/S centered horizontally, E/W centered vertically.
+        assert_eq!(n.x, 0.0);
+        assert_eq!(s.x, 0.0);
+        assert_eq!(e.y, 0.0);
+        assert_eq!(w.y, 0.0);
+    }
+
+    #[test]
+    fn all_slots_share_one_plane() {
+        let (fov, aspect, m) = (FRAC_PI_4, 1.5, 0.1);
+        let z = hud_slot_offset(HudSlot::North, fov, aspect, D, m).z;
+        assert_eq!(z, -D, "panels sit at -depth in front of the camera");
+        for slot in HudSlot::ALL {
+            assert_eq!(hud_slot_offset(slot, fov, aspect, D, m).z, z, "shared plane");
+        }
+    }
+
+    #[test]
+    fn wider_aspect_pushes_sides_out_but_not_top() {
+        let (fov, m) = (FRAC_PI_4, 0.12);
+        let narrow = hud_slot_offset(HudSlot::East, fov, 1.0, D, m).x;
+        let wide = hud_slot_offset(HudSlot::East, fov, 2.0, D, m).x;
+        assert!(wide > narrow, "east moves further right as aspect widens");
+        // North's vertical placement is aspect-independent.
+        let n1 = hud_slot_offset(HudSlot::North, fov, 1.0, D, m).y;
+        let n2 = hud_slot_offset(HudSlot::North, fov, 2.0, D, m).y;
+        assert_eq!(n1, n2, "north.y does not depend on aspect");
+    }
+
+    #[test]
+    fn depth_scales_extents_linearly() {
+        let (fov, aspect, m) = (FRAC_PI_4, 1.6, 0.1);
+        let near = hud_slot_offset(HudSlot::North, fov, aspect, D, m);
+        let far = hud_slot_offset(HudSlot::North, fov, aspect, 2.0 * D, m);
+        assert!((far.y - 2.0 * near.y).abs() < 1e-3, "doubling depth doubles half-height");
+        assert!((far.z - 2.0 * near.z).abs() < 1e-3, "and the in-front distance");
+    }
+
+    #[test]
+    fn margin_zero_lands_on_the_frustum_edge() {
+        let (fov, aspect) = (FRAC_PI_4, 1.6);
+        let half_h = D * (fov * 0.5).tan();
+        let on_edge = hud_slot_offset(HudSlot::North, fov, aspect, D, 0.0).y;
+        assert!((on_edge - half_h).abs() < 1e-3, "margin 0 → center on the edge");
+        // A positive margin pulls it inboard (smaller |y|).
+        let inboard = hud_slot_offset(HudSlot::North, fov, aspect, D, 0.2).y;
+        assert!(inboard < on_edge, "margin pulls the panel inboard");
     }
 }

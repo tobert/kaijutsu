@@ -9,7 +9,7 @@
 //! with a CPU safe-mode fallback — trimmed to the single `render_to_texture`
 //! use case, no UI compositing pass, no canvas.
 //!
-//! Consumers reach it through `vello_ui_texture::render_vello_scenes` (block
+//! Consumers reach it through `ui_rtt::render_vello_scenes` (block
 //! cells, role borders, docks, MSDF text surfaces).
 
 use std::sync::{Arc, Mutex};
