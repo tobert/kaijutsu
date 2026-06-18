@@ -1,0 +1,9 @@
+{
+  "session_id": "a1b2c3d4-0000-0000-0000-000000000002",
+  "transcript_path": "/home/user/.claude/projects/demo/transcript.jsonl",
+  "cwd": "/home/user/src/demo",
+  "hook_event_name": "PostToolUseFailure",
+  "tool_name": "Bash",
+  "tool_input": { "command": "false", "description": "Fail on purpose" },
+  "error": "Command exited with code 1"
+}

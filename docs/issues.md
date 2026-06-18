@@ -859,6 +859,17 @@ the *remaining* findings, triaged.
   where a block authored mid-resync is still lost — cleanest via a command
   channel that makes the bg task the true sole writer (authoring + push + resync
   all serialized in one task).
+- **LOW — `agent.compact` hook event is mapped but unhandled.** The adapters map
+  Claude `PreCompact` / Gemini `PreCompress` → `agent.compact`, but
+  `HookListener::process_event` has no arm for it (falls to `_ => {}`), so a
+  compaction boundary silently produces no block. Either author a System/Trace block
+  marking the compaction, or drop the mapping. (Found during the 2026-06-18 bitrot
+  pass; see `docs/mcp-hook-alignment.md`.)
+- **LOW — `claude-hooks.json` uses a repo-relative adapter path.** `command:
+  "contrib/adapters/claude.sh"` only resolves when Claude Code's cwd is the kaijutsu
+  repo root. The adapter itself now resolves its own filter via `BASH_SOURCE` dir, so
+  only the settings.json entry is cwd-sensitive. Document the absolute-path
+  requirement in the sample, or have install copy an absolute path.
 - **MED — multi-context operations silently collapse to one in Remote.**
   `search_context`, `list_resources`, the `kaijutsu://docs` reader, and
   completions call `context_ids()`, which in Remote returns only the single

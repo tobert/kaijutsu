@@ -1,0 +1,8 @@
+{
+  "session_id": "a1b2c3d4-0000-0000-0000-000000000005",
+  "transcript_path": "/home/user/.claude/projects/demo/transcript.jsonl",
+  "cwd": "/home/user/src/demo",
+  "hook_event_name": "SessionStart",
+  "source": "startup",
+  "model": "claude-opus-4-8"
+}

@@ -7,6 +7,10 @@
 # Fail-open: if kaijutsu-mcp is unreachable, exits 0 so the agent continues.
 set -euo pipefail
 
+# Resolve this script's directory so the jq field-map filter is found
+# regardless of the cwd Gemini invokes us from.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # Read Gemini's hook payload from stdin
 INPUT=$(cat)
 EVENT_NAME=$(echo "$INPUT" | jq -r '.hook_event_name // empty')
@@ -27,25 +31,16 @@ case "$EVENT_NAME" in
     *)                exit 0 ;;  # Unknown event, pass through
 esac
 
-# Build kaijutsu payload with jq
-KJ_INPUT=$(echo "$INPUT" | jq --arg event "$KJ_EVENT" '{
-    event: $event,
-    source: "gemini-cli",
-    session_id: .session_id,
-    cwd: .cwd,
-    transcript_path: .transcript_path,
-    prompt: .prompt,
-    response: .response,
-    tool: (if .tool_name then {
-        name: .tool_name,
-        input: .tool_input,
-        output: (.tool_response.llmContent // .tool_response // null),
-        error: (.tool_response.error // null)
-    } else null end),
-    agent_id: .agent_id,
-    agent_type: .agent_type,
-    reason: .reason
-}')
+# Build kaijutsu payload — field map lives in gemini-to-kaijutsu.jq (single
+# source of truth, parallel to claude-to-kaijutsu.jq).
+KJ_INPUT=$(echo "$INPUT" | jq --arg event "$KJ_EVENT" -f "$SCRIPT_DIR/gemini-to-kaijutsu.jq")
+
+# Transform-only escape hatch: print the kaijutsu payload and exit without
+# touching the socket.
+if [ -n "${KJ_HOOK_DRYRUN:-}" ]; then
+    echo "$KJ_INPUT"
+    exit 0
+fi
 
 # Socket discovery
 SOCK="${KJ_HOOK_SOCKET:-${XDG_RUNTIME_DIR:-/tmp}/kaijutsu/hook-${PPID}.sock}"

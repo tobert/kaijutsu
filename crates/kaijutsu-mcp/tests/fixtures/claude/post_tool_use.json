@@ -1,0 +1,9 @@
+{
+  "session_id": "a1b2c3d4-0000-0000-0000-000000000001",
+  "transcript_path": "/home/user/.claude/projects/demo/transcript.jsonl",
+  "cwd": "/home/user/src/demo",
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Bash",
+  "tool_input": { "command": "ls -la", "description": "List files" },
+  "tool_output": "total 0\ndrwxr-xr-x 2 user user 40 Jun 18 10:00 ."
+}

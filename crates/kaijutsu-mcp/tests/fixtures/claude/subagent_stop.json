@@ -1,0 +1,9 @@
+{
+  "session_id": "a1b2c3d4-0000-0000-0000-000000000003",
+  "transcript_path": "/home/user/.claude/projects/demo/transcript.jsonl",
+  "cwd": "/home/user/src/demo",
+  "hook_event_name": "SubagentStop",
+  "agent_id": "agent-7f2654d6",
+  "agent_type": "Explore",
+  "agent_name": "explore-the-codebase"
+}
