@@ -230,13 +230,14 @@ impl EmbeddedKaish {
         // async, so `restore_cwd_from_db` does it post-construction — see
         // `materialize_context_kaish`.
         // kaijutsu overrides the backend with MountBackend (see below), so the
-        // config's vfs_mode is moot — what matters is the cwd and the MCP-grade
+        // config's vfs_mode is moot — what matters is the cwd and the agent-grade
         // ignore/output-limit presets (gitignore-aware walks + capped output).
         // Build them explicitly via the builder chain rather than a bundled
-        // constructor so this survives kaish config-API churn.
+        // constructor so this survives kaish config-API churn. (kaish 0.9 renamed
+        // these `mcp()` presets to `agent()` — same sandboxed-agent behavior.)
         let mut config = KaishConfig::named(name)
-            .with_ignore_config(IgnoreConfig::mcp())
-            .with_output_limit(OutputLimitConfig::mcp())
+            .with_ignore_config(IgnoreConfig::agent())
+            .with_output_limit(OutputLimitConfig::agent())
             // Latch nonces must outlive this per-execute shell: a nonce issued
             // by one command (e.g. `kj context retag`) is confirmed by the
             // *next* command in a fresh `EmbeddedKaish`. The store is keyed by

@@ -2515,6 +2515,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "chrono-tz"
+version = "0.10.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6139a8597ed92cf816dfb33f5dd6cf0bb93a6adc938f11039f371bc5bcd26c3"
+dependencies = [
+ "chrono",
+ "phf",
+]
+
+[[package]]
 name = "chumsky"
 version = "1.0.0-alpha.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5920,9 +5930,9 @@ dependencies = [
 
 [[package]]
 name = "kaish-glob"
-version = "0.8.2"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "89f0bedf13b3418a7ec911bf0fb3fd0c9afd7cfed9ca28f5835be55edb82a96f"
+checksum = "868f33bffc2574e15b1f0e95f35242781e4cb7bd9834307929a324440d4946f9"
 dependencies = [
  "async-trait",
  "ignore",
@@ -5931,18 +5941,18 @@ dependencies = [
 
 [[package]]
 name = "kaish-help"
-version = "0.8.2"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf1cc885829229aa9dce7231adc287276c273a3133e4710c95698b5da22d6c3f"
+checksum = "86409a898ec7075582df301a92b779eafe187606ec84923750f07cb207fc04e2"
 dependencies = [
  "kaish-types",
 ]
 
 [[package]]
 name = "kaish-kernel"
-version = "0.8.2"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0dbbd0215812dd521f9f625427048fcec0f3a5e61533e2637992147d76eab959"
+checksum = "398391c4b14ae5ad38903786946aea3f60de9dcc766318addc262bcde06420b5"
 dependencies = [
  "anyhow",
  "ariadne",
@@ -5950,6 +5960,7 @@ dependencies = [
  "base64 0.22.1",
  "bstr",
  "chrono",
+ "chrono-tz",
  "chumsky",
  "clap",
  "digest 0.10.7",
@@ -5985,9 +5996,9 @@ dependencies = [
 
 [[package]]
 name = "kaish-tool-api"
-version = "0.8.2"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20312783a89e45aa7c1de7e3f564457c83c0418e1db26b0a665e655ea254352e"
+checksum = "0ccb53fcb5f0ebb6bfef939199d86689bfe5fd920e38b1e121925b540cb2a39f"
 dependencies = [
  "async-trait",
  "clap",
@@ -5996,10 +6007,11 @@ dependencies = [
 
 [[package]]
 name = "kaish-types"
-version = "0.8.2"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04b3c10af5fa6e5388ab1f8bd768eaa03d6194d437a2fe9ae4265d31facd1cf4"
+checksum = "ab674433bd72c43972089d3454e8b291e3ba67bedb3cf03d52fddf3c63fa9eee"
 dependencies = [
+ "base64 0.22.1",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -6008,11 +6020,12 @@ dependencies = [
 
 [[package]]
 name = "kaish-vfs"
-version = "0.8.2"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "49c6faebb49125d4b696164bed6d5a751ad3fe395a609592f5219dc78ead0be0"
+checksum = "c9c8f771613845ac69b9401d1c510d833bc37c95100c089a5e4839dd83208926"
 dependencies = [
  "async-trait",
+ "getrandom 0.3.4",
  "kaish-types",
  "tokio",
 ]
@@ -7782,6 +7795,24 @@ checksum = "44dc769b75f93afdddd8c7fa12d685292ddeff1e66f7f0f3a234cf1818afe892"
 dependencies = [
  "base64ct",
  "ctutils",
+]
+
+[[package]]
+name = "phf"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "913273894cec178f401a31ec4b656318d95473527be05c0752cc41cdc32be8b7"
+dependencies = [
+ "phf_shared",
+]
+
+[[package]]
+name = "phf_shared"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06005508882fb681fd97892ecff4b7fd0fee13ef1aa569f8695dae7ab9099981"
+dependencies = [
+ "siphasher",
 ]
 
 [[package]]

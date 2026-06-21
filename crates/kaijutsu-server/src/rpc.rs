@@ -5799,7 +5799,7 @@ fn value_to_shell_value(mut builder: shell_value::Builder<'_>, value: &kaish_ker
         Value::Float(f) => builder.set_float(*f),
         Value::String(s) => builder.set_string(s),
         Value::Json(j) => builder.set_json(serde_json::to_string(j).unwrap_or_default()),
-        Value::Blob(b) => builder.set_blob(&b.id),
+        Value::Bytes(b) => builder.set_bytes(b),
     }
 }
 
@@ -5820,15 +5820,11 @@ fn shell_value_to_value(
                 .map_err(|e| capnp::Error::failed(format!("invalid JSON: {}", e)))?;
             Ok(Value::Json(parsed))
         }
-        shell_value::Blob(b) => {
-            let id = b?.to_str()?.to_owned();
-            Ok(Value::Blob(kaish_kernel::ast::BlobRef {
-                id,
-                size: 0,
-                content_type: String::new(),
-                hash: None,
-            }))
-        }
+        shell_value::Bytes(b) => Ok(Value::Bytes(b?.to_vec())),
+        // LEGACY: kaish 0.9 dropped Value::Blob, so this only arrives from an
+        // older peer. The payload is a path string, not bytes — surface it as a
+        // String rather than mis-decoding it as binary.
+        shell_value::Blob(b) => Ok(Value::String(b?.to_str()?.to_owned())),
     }
 }
 
@@ -5950,7 +5946,9 @@ fn value_to_env_string(value: &kaish_kernel::ast::Value) -> String {
         Value::Float(f) => f.to_string(),
         Value::String(s) => s.clone(),
         Value::Json(j) => serde_json::to_string(j).unwrap_or_default(),
-        Value::Blob(b) => b.id.clone(),
+        // String-only env is lossy by design; the base64 envelope is the most
+        // faithful (round-trippable) text form for inline binary.
+        Value::Bytes(_) => kaish_kernel::interpreter::value_to_json(value).to_string(),
     }
 }
 
@@ -7601,6 +7599,67 @@ mod subscriber_health_tests {
         for _ in 0..100 {
             assert!(h.record(true));
         }
+    }
+}
+
+#[cfg(test)]
+mod shell_value_conversion_tests {
+    //! `value_to_shell_value` / `shell_value_to_value` — the kaish `ast::Value`
+    //! ⇄ Cap'n Proto `ShellValue` bridge. Locks in the kaish 0.9 migration where
+    //! `Value::Blob(BlobRef)` became `Value::Bytes(Vec<u8>)`: inline binary must
+    //! survive the wire byte-for-byte (no base64-string fudge, no lossy decode),
+    //! and a legacy `blob` from an older peer must surface as a String path.
+    use super::{shell_value_to_value, value_to_shell_value};
+    use crate::kaijutsu_capnp::shell_value;
+    use kaish_kernel::ast::Value;
+
+    fn round_trip(value: &Value) -> Value {
+        let mut msg = capnp::message::Builder::new_default();
+        value_to_shell_value(msg.init_root::<shell_value::Builder>(), value);
+        let reader = msg
+            .get_root_as_reader::<shell_value::Reader>()
+            .expect("read back shell_value");
+        shell_value_to_value(reader).expect("decode shell_value")
+    }
+
+    #[test]
+    fn bytes_round_trip_is_byte_exact() {
+        // Includes a NUL and a non-UTF-8 byte (0xFF) — exactly the payloads a
+        // base64-into-Text shortcut or a lossy String decode would corrupt.
+        let original = Value::Bytes(vec![0x00, 0x01, 0xFF, 0xFE, b'h', b'i']);
+        assert_eq!(round_trip(&original), original);
+    }
+
+    #[test]
+    fn empty_bytes_survive() {
+        assert_eq!(round_trip(&Value::Bytes(vec![])), Value::Bytes(vec![]));
+    }
+
+    #[test]
+    fn scalars_round_trip() {
+        for v in [
+            Value::Null,
+            Value::Bool(true),
+            Value::Int(-7),
+            Value::String("こんにちは".into()),
+        ] {
+            assert_eq!(round_trip(&v), v);
+        }
+    }
+
+    #[test]
+    fn legacy_blob_decodes_to_string_path() {
+        // kaish 0.9 never produces `blob`, but an older peer might. It carries a
+        // path string, so it must come back as a String — never mis-typed as
+        // binary, never dropped.
+        let mut msg = capnp::message::Builder::new_default();
+        msg.init_root::<shell_value::Builder>()
+            .set_blob("/v/blobs/deadbeef");
+        let reader = msg.get_root_as_reader::<shell_value::Reader>().unwrap();
+        assert_eq!(
+            shell_value_to_value(reader).unwrap(),
+            Value::String("/v/blobs/deadbeef".into())
+        );
     }
 }
 

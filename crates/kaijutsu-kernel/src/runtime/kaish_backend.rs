@@ -967,12 +967,10 @@ pub fn kaish_value_to_json(value: &kaish_kernel::ast::Value) -> JsonValue {
         Value::Bool(b) => JsonValue::Bool(*b),
         Value::Null => JsonValue::Null,
         Value::Json(json) => json.clone(),
-        Value::Blob(blob_ref) => serde_json::json!({
-            "_type": "blob",
-            "id": blob_ref.id,
-            "size": blob_ref.size,
-            "content_type": blob_ref.content_type,
-        }),
+        // kaish 0.9: Value::Blob → Value::Bytes (inline binary). Delegate to the
+        // canonical converter so we emit kaish's exact base64 envelope
+        // ({_type:"bytes",encoding:"base64",data,len}) rather than re-deriving it.
+        Value::Bytes(_) => kaish_kernel::interpreter::value_to_json(value),
     }
 }
 

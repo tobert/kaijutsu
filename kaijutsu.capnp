@@ -655,7 +655,8 @@ struct ShellValue {
     float @3 :Float64;
     string @4 :Text;
     json @5 :Text;       # serde_json::Value serialized
-    blob @6 :Text;       # blob path (e.g. /v/blobs/{id})
+    blob @6 :Text;       # LEGACY: kaish dropped Value::Blob in 0.9; never produced now
+    bytes @7 :Data;      # inline binary (kaish Value::Bytes) — raw bytes on wire
   }
 }
 

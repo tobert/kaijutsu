@@ -1678,7 +1678,10 @@ fn read_shell_value(
                 .map_err(|e| RpcError::ServerError(format!("invalid JSON: {}", e)))?;
             Ok(ShellValue::Json(parsed))
         }
-        shell_value::Blob(b) => Ok(ShellValue::Blob(b?.to_string()?)),
+        shell_value::Bytes(b) => Ok(ShellValue::Bytes(b?.to_vec())),
+        // LEGACY: kaish 0.9 dropped Value::Blob; a `blob` only arrives from an
+        // older peer and carries a path string, so surface it as a String.
+        shell_value::Blob(b) => Ok(ShellValue::String(b?.to_string()?)),
     }
 }
 
@@ -1694,7 +1697,7 @@ fn write_shell_value(
         ShellValue::Float(f) => builder.set_float(*f),
         ShellValue::String(s) => builder.set_string(s),
         ShellValue::Json(j) => builder.set_json(serde_json::to_string(j).unwrap_or_default()),
-        ShellValue::Blob(b) => builder.set_blob(b),
+        ShellValue::Bytes(b) => builder.set_bytes(b),
     }
 }
 
@@ -2640,8 +2643,8 @@ pub enum ShellValue {
     String(String),
     /// JSON-serialized structured data.
     Json(serde_json::Value),
-    /// Blob reference path.
-    Blob(String),
+    /// Inline binary data (kaish 0.9 `Value::Bytes`).
+    Bytes(Vec<u8>),
 }
 
 // ============================================================================
@@ -2735,6 +2738,50 @@ pub enum RpcError {
 mod tests {
     use super::*;
     use capnp::message::Builder as MessageBuilder;
+
+    /// `write_shell_value` → `read_shell_value` round-trip — the client mirror of
+    /// the kaish 0.9 `Value::Blob` → `Value::Bytes` migration. Locks in that
+    /// inline binary survives the wire byte-for-byte and a legacy `blob` from an
+    /// older peer decodes to a String path. (Server-side has the symmetric test.)
+    fn roundtrip_shell_value(value: &ShellValue) -> ShellValue {
+        let mut message = MessageBuilder::new_default();
+        write_shell_value(
+            message.init_root::<crate::kaijutsu_capnp::shell_value::Builder>(),
+            value,
+        );
+        let reader = message
+            .get_root_as_reader::<crate::kaijutsu_capnp::shell_value::Reader>()
+            .expect("read back shell_value");
+        read_shell_value(reader).expect("decode shell_value")
+    }
+
+    #[test]
+    fn shell_value_bytes_round_trip_is_byte_exact() {
+        // NUL + non-UTF-8 byte: exactly what a String-decode or base64 fudge corrupts.
+        let original = ShellValue::Bytes(vec![0x00, 0x01, 0xFF, 0xFE, b'h', b'i']);
+        assert_eq!(roundtrip_shell_value(&original), original);
+        assert_eq!(
+            roundtrip_shell_value(&ShellValue::Bytes(vec![])),
+            ShellValue::Bytes(vec![])
+        );
+    }
+
+    #[test]
+    fn shell_value_legacy_blob_decodes_to_string() {
+        // kaish 0.9 never produces `blob`; an older peer's path string must
+        // survive as a String, never mis-typed as binary or dropped.
+        let mut message = MessageBuilder::new_default();
+        message
+            .init_root::<crate::kaijutsu_capnp::shell_value::Builder>()
+            .set_blob("/v/blobs/deadbeef");
+        let reader = message
+            .get_root_as_reader::<crate::kaijutsu_capnp::shell_value::Reader>()
+            .unwrap();
+        assert_eq!(
+            read_shell_value(reader).unwrap(),
+            ShellValue::String("/v/blobs/deadbeef".into())
+        );
+    }
 
     /// Helper: build a BlockSnapshot capnp message, set fields, then parse it back
     /// through `parse_block_snapshot` to verify roundtrip fidelity.
