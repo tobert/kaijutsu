@@ -482,8 +482,13 @@ impl BlockStore {
 
     /// List the persisted `documents` rows whose path falls under `dir`
     /// (the readdir manifest for [`create_document_with_path`]). Empty when
-    /// there is no DB. Returns `(path, context_id)` pairs for every descendant.
-    pub fn documents_under_path(&self, dir: &str) -> BlockStoreResult<Vec<(String, ContextId)>> {
+    /// there is no DB. Returns `(path, context_id, doc_kind)` for every
+    /// descendant — `doc_kind` lets `ConfigCrdtFs::readdir` emit
+    /// `FileType::Symlink` for link docs without a second lookup per entry.
+    pub fn documents_under_path(
+        &self,
+        dir: &str,
+    ) -> BlockStoreResult<Vec<(String, ContextId, DocKind)>> {
         let Some(db) = self.db.as_ref() else {
             return Ok(Vec::new());
         };
@@ -493,7 +498,7 @@ impl BlockStore {
             .map_err(|e| BlockStoreError::Db(e.to_string()))?;
         Ok(rows
             .into_iter()
-            .filter_map(|r| r.path.map(|p| (p, r.document_id)))
+            .filter_map(|r| r.path.map(|p| (p, r.document_id, r.doc_kind)))
             .collect())
     }
 
@@ -566,6 +571,14 @@ impl BlockStore {
     /// Check if a document exists.
     pub fn contains(&self, context_id: ContextId) -> bool {
         self.documents.contains_key(&context_id)
+    }
+
+    /// The [`DocKind`] of a document, or `None` if it does not exist. Used by
+    /// `ConfigCrdtFs` to tell a symlink doc (`DocKind::Symlink`, content = link
+    /// target) apart from a regular file doc whose content happens to look like
+    /// a path — the git-style "mode bit" check.
+    pub fn document_kind(&self, context_id: ContextId) -> Option<DocKind> {
+        self.documents.get(&context_id).map(|r| r.kind)
     }
 
     /// Delete a document.

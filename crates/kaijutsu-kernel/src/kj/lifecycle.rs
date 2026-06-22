@@ -267,9 +267,14 @@ impl KjDispatcher {
             Err(e) => return Err(format!("rc lifecycle: readdir {dir}: {e}")),
         };
 
+        // Include symlinks alongside regular files: an init.d-style link
+        // (`coder/create/S10-binding.kai → lib/create/binding.kai`) composes a
+        // shared script into this verb dir. The *link's* `SXX-name.ext` governs
+        // ordering and which extension-handler runs; `read_all` auto-follows the
+        // link to the target's content.
         let mut names: Vec<String> = entries
             .into_iter()
-            .filter(|e| e.kind.is_file())
+            .filter(|e| e.kind.is_file() || e.kind.is_symlink())
             .map(|e| e.name)
             .filter(|n| n.ends_with(".kai") || n.ends_with(".md"))
             .collect();
@@ -739,6 +744,51 @@ mod tests {
         assert!(
             contents.iter().any(|c| c.contains("You are a test context")),
             "expected .md content as block, got: {contents:?}"
+        );
+    }
+
+    /// init.d-style composition: a context type pulls in a shared `.md` stance
+    /// via a symlink in its `create/` dir. The lifecycle must follow the link
+    /// and insert the *target's full content* as a block — proving both the
+    /// readdir filter includes symlinks and `read_all` follows + sizes the
+    /// target (not the short link path).
+    #[tokio::test]
+    async fn rc_create_follows_symlinked_md() {
+        use crate::vfs::VfsOps;
+        // The CRDT-native /etc/rc mount (production backend) — symlink targets
+        // are VFS-absolute paths it resolves within the mount, unlike the
+        // host-backed LocalBackend the plain test_dispatcher uses.
+        let d = test_dispatcher_crdt_rc().await;
+        // The shared, canonical stance lives once under a `lib` type.
+        install_rc_script_file(
+            &d,
+            "/etc/rc/lib/create/S00-shared.md",
+            "You are composed from a shared stance fragment. Be terse.",
+        )
+        .await;
+        // The consuming type composes it in by symlink.
+        d.kernel()
+            .vfs()
+            .symlink(
+                std::path::Path::new("/etc/rc/test/create/S00-stance.md"),
+                std::path::Path::new("/etc/rc/lib/create/S00-shared.md"),
+            )
+            .await
+            .expect("create rc symlink");
+
+        let caller = unjoined_caller();
+        let result = d
+            .dispatch(&argv(&["context", "create", "ctx-link", "--type", "test"]), &caller)
+            .await;
+        assert!(result.is_ok(), "create failed: {}", result.message());
+
+        let new_id = lookup_context_id(&d, "ctx-link");
+        let contents = block_contents_in(&d, new_id);
+        assert!(
+            contents
+                .iter()
+                .any(|c| c.contains("composed from a shared stance fragment")),
+            "expected symlinked .md target content as block, got: {contents:?}"
         );
     }
 

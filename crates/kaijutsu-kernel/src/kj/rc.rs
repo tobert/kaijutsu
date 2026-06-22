@@ -247,6 +247,19 @@ impl KjDispatcher {
             .map_err(|e| format!("not valid UTF-8: {e}"))
     }
 
+    /// The raw symlink target at `path`, or `None` when the path is not a link
+    /// (regular file, absent, or unmounted). Used to annotate `kj rc list`/`show`
+    /// so init.d-style composed links read as links, not opaque files.
+    async fn rc_link_target(&self, path: &str) -> Option<String> {
+        use crate::vfs::VfsOps;
+        self.kernel()
+            .vfs()
+            .readlink(std::path::Path::new(path))
+            .await
+            .ok()
+            .map(|t| t.to_string_lossy().into_owned())
+    }
+
     async fn rc_list(&self, type_filter: Option<&str>, verb_filter: Option<&str>) -> KjResult {
         let mut paths = match self.walk_rc_paths().await {
             Ok(p) => p,
@@ -262,15 +275,26 @@ impl KjDispatcher {
         });
         paths.sort();
 
-        // Iteration handles: full rc-script paths (the resolver key for
-        // `kj rc rm` / `kj rc show`), absolute so there's nothing to truncate.
+        if paths.is_empty() {
+            return KjResult::ok_with_data(
+                "(no rc scripts)".to_string(),
+                serde_json::Value::Array(Vec::new()),
+            );
+        }
+
+        // `data` stays an array of full path strings (the resolver keys for
+        // `kj rc rm`/`show`) per the kj structured-data convention. The link
+        // target is an annotation on the *human* line only: `link → target`.
         let data = serde_json::Value::Array(
             paths.iter().cloned().map(serde_json::Value::String).collect(),
         );
-        if paths.is_empty() {
-            return KjResult::ok_with_data("(no rc scripts)".to_string(), data);
+        let mut lines = Vec::with_capacity(paths.len());
+        for p in &paths {
+            match self.rc_link_target(p).await {
+                Some(target) => lines.push(format!("  {p} → {target}")),
+                None => lines.push(format!("  {p}")),
+            }
         }
-        let lines: Vec<String> = paths.iter().map(|p| format!("  {p}")).collect();
         KjResult::ok_with_data(lines.join("\n"), data)
     }
 
@@ -298,7 +322,12 @@ impl KjDispatcher {
             let type_dir = format!("/etc/rc/{}", type_e.name);
             for verb_e in entries(vfs, &type_dir).await?.into_iter().filter(|e| e.kind.is_dir()) {
                 let verb_dir = format!("{type_dir}/{}", verb_e.name);
-                for file_e in entries(vfs, &verb_dir).await?.into_iter().filter(|e| e.kind.is_file()) {
+                for file_e in entries(vfs, &verb_dir)
+                    .await?
+                    .into_iter()
+                    // Include symlinks: init.d-style composed scripts are links.
+                    .filter(|e| e.kind.is_file() || e.kind.is_symlink())
+                {
                     if file_e.name.ends_with(".kai") || file_e.name.ends_with(".md") {
                         out.push(format!("{verb_dir}/{}", file_e.name));
                     }
@@ -322,6 +351,10 @@ impl KjDispatcher {
             Err(e) => return KjResult::Err(format!("kj rc show: '{path}': {e}")),
         };
 
+        // When `path` is a symlink, `content` above is the *followed target's*
+        // body (read_all follows links). Surface the link relationship too.
+        let symlink_target = self.rc_link_target(path).await;
+
         // Metadata is derived from the canonical path; provenance lives in
         // the CRDT block, not here.
         let record = serde_json::json!({
@@ -331,6 +364,7 @@ impl KjDispatcher {
             "sort_key": parts.sort_key,
             "name": parts.name,
             "extension": parts.extension,
+            "symlink": symlink_target,
             "content_length": content.len(),
             "content": content,
         });
@@ -339,16 +373,23 @@ impl KjDispatcher {
             return KjResult::ok_with_data(record.to_string(), record);
         }
 
+        // A symlink gets an explicit `→ target` header line; the fenced content
+        // below is what the link resolves to.
+        let link_line = match &symlink_target {
+            Some(t) => format!("symlink:    → {t}\n"),
+            None => String::new(),
+        };
         // Fence content with the extension so .md renders as markdown and
         // .kai displays as a shell-ish block in surfaces that highlight it.
         let out = format!(
-            "path:       {}\ntype:       {}\nverb:       {}\nsort_key:   {}\nname:       {}\nextension:  {}\nlength:     {} bytes\n\n```{}\n{}\n```\n",
+            "path:       {}\ntype:       {}\nverb:       {}\nsort_key:   {}\nname:       {}\nextension:  {}\n{}length:     {} bytes\n\n```{}\n{}\n```\n",
             path,
             parts.context_type,
             parts.verb,
             parts.sort_key,
             parts.name,
             parts.extension,
+            link_line,
             content.len(),
             parts.extension,
             content,
@@ -827,6 +868,93 @@ mod tests {
                 assert!(
                     paths.contains(&"/etc/rc/test/create/S01-second.kai"),
                     "missing S01 in: {paths:?}"
+                );
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
+    }
+
+    /// A composed (symlinked) rc script shows up in `kj rc list` with a
+    /// `→ target` annotation, and `kj rc show` reports the link target plus the
+    /// *followed* content. The link is created via `ln -s`-equivalent
+    /// (`vfs().symlink`) — there is no `kj rc link`; the general VFS op is the
+    /// surface.
+    #[tokio::test]
+    async fn rc_list_and_show_surface_symlinks() {
+        use crate::kj::test_helpers::*;
+        use crate::kj::KjResult;
+        use crate::vfs::VfsOps;
+
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        let s = |v: &str| v.to_string();
+
+        // The shared canonical body under a `lib` type.
+        d.dispatch(
+            &[
+                s("rc"),
+                s("add"),
+                s("/etc/rc/lib/create/S00-binding.kai"),
+                s("--content"),
+                s("kj binding allow rc-write"),
+            ],
+            &c,
+        )
+        .await;
+        // Compose it into `coder` by symlink (the init.d move).
+        d.kernel()
+            .vfs()
+            .symlink(
+                std::path::Path::new("/etc/rc/composed/create/S10-binding.kai"),
+                std::path::Path::new("/etc/rc/lib/create/S00-binding.kai"),
+            )
+            .await
+            .expect("create rc symlink");
+
+        // list: the link path appears in data (stable resolver key) and the
+        // human message carries the `→ target` annotation.
+        let listed = d.dispatch(&[s("rc"), s("list")], &c).await;
+        match listed {
+            KjResult::Ok { data: Some(v), message, .. } => {
+                let paths: Vec<&str> = v
+                    .as_array()
+                    .expect("array")
+                    .iter()
+                    .filter_map(|x| x.as_str())
+                    .collect();
+                assert!(
+                    paths.contains(&"/etc/rc/composed/create/S10-binding.kai"),
+                    "symlink missing from list data: {paths:?}"
+                );
+                assert!(
+                    message.contains(
+                        "/etc/rc/composed/create/S10-binding.kai → /etc/rc/lib/create/S00-binding.kai"
+                    ),
+                    "list message lacks arrow annotation: {message}"
+                );
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
+
+        // show: reports the link target and the followed content.
+        let shown = d
+            .dispatch(
+                &[s("rc"), s("show"), s("/etc/rc/composed/create/S10-binding.kai")],
+                &c,
+            )
+            .await;
+        match shown {
+            KjResult::Ok { data: Some(v), .. } => {
+                let obj = v.as_object().expect("object");
+                assert_eq!(
+                    obj["symlink"].as_str(),
+                    Some("/etc/rc/lib/create/S00-binding.kai"),
+                    "show should report link target"
+                );
+                assert_eq!(
+                    obj["content"].as_str(),
+                    Some("kj binding allow rc-write"),
+                    "show should follow the link to target content"
                 );
             }
             other => panic!("expected Ok with data, got {other:?}"),

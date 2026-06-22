@@ -629,6 +629,48 @@ mod tests {
         );
     }
 
+    /// The kaish surface for init.d-style rc composition: an agent shell does
+    /// `ln -s` over the `/etc/rc` CRDT mount, and `cat` through the link returns
+    /// the *target's* content. This proves the path is wired end-to-end —
+    /// kaish `ln`/`cat` builtins → MountBackend → MountTable → ConfigCrdtFs —
+    /// with no rc-specific shell code. (KaijutsuBackend's `/docs/` block scheme
+    /// is a separate thing and keeps its honest "not supported" stub.)
+    #[tokio::test]
+    async fn ln_s_over_rc_mount_creates_followable_link() {
+        let blocks = shared_block_store(kaijutsu_types::PrincipalId::system());
+        let kernel = Arc::new(KaijutsuKernel::new_ephemeral("test-ln").await);
+        // Mount the production rc backend over the same block store the shell uses.
+        let rc_fs =
+            crate::runtime::config_crdt_fs::ConfigCrdtFs::new(blocks.clone(), "/etc/rc");
+        kernel.mount("/etc/rc", rc_fs).await;
+        let kaish = EmbeddedKaish::new("test-ln", blocks, kernel, None).unwrap();
+
+        let run = |cmd: &'static str| {
+            let k = &kaish;
+            async move {
+                k.execute_with_options(cmd, ExecuteOptions::default())
+                    .await
+                    .unwrap_or_else(|e| panic!("`{cmd}` failed: {e}"))
+            }
+        };
+
+        // A shared script body, written once under a `lib` type.
+        let r = run("echo shared-body > /etc/rc/lib/create/binding.kai").await;
+        assert!(r.ok(), "echo>: {}", r.text_out());
+        // Compose it into a context type by symlink.
+        let r = run(
+            "ln -s /etc/rc/lib/create/binding.kai /etc/rc/coder/create/S10-binding.kai",
+        )
+        .await;
+        assert!(r.ok(), "ln -s: {}", r.text_out());
+        // `cat` through the link follows to the target's content.
+        let r = run("cat /etc/rc/coder/create/S10-binding.kai").await;
+        assert_eq!(r.text_out().trim(), "shared-body");
+        // `readlink` reports the raw target.
+        let r = run("readlink /etc/rc/coder/create/S10-binding.kai").await;
+        assert_eq!(r.text_out().trim(), "/etc/rc/lib/create/binding.kai");
+    }
+
     #[tokio::test]
     async fn test_embedded_kaish_variables() {
         let blocks = shared_block_store(kaijutsu_types::PrincipalId::system());

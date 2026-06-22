@@ -193,6 +193,12 @@ pub enum DocKind {
     /// Kernel key–value store (flat key→string LWW map). See `docs/kernel-kv.md`.
     #[strum(serialize = "kv")]
     Kv,
+    /// Symbolic link. Git-style: the single block's content *is* the link
+    /// target path; this kind is the authoritative "mode bit" that tells a
+    /// reader to follow rather than treat the content as a file body. See
+    /// `ConfigCrdtFs`.
+    #[strum(serialize = "symlink")]
+    Symlink,
 }
 
 impl DocKind {
@@ -203,6 +209,7 @@ impl DocKind {
             Self::Text => "text",
             Self::Config => "config",
             Self::Kv => "kv",
+            Self::Symlink => "symlink",
         }
     }
 }
@@ -467,6 +474,8 @@ mod tests {
             DocKind::Code,
             DocKind::Text,
             DocKind::Config,
+            DocKind::Kv,
+            DocKind::Symlink,
         ] {
             let s = kind.as_str();
             let parsed = DocKind::from_str(s).unwrap();

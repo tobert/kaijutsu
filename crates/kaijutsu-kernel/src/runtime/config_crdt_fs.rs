@@ -31,10 +31,16 @@ use std::time::SystemTime;
 
 use dashmap::DashMap;
 use kaijutsu_crdt::{BlockKind, ContentType, Role, Status};
+use kaijutsu_types::DocKind;
 
 use crate::block_store::SharedBlockStore;
 use crate::config_doc::{self, config_context_id, CONFIG_DOC_KIND};
 use crate::vfs::{DirEntry, FileAttr, FileType, SetAttr, StatFs, VfsError, VfsOps, VfsResult};
+
+/// Max symlink hops before [`VfsError::TooManySymlinks`]. Guards against cycles
+/// (`a → b → a`) and pathological chains. POSIX uses values around 8–40; rc
+/// composition needs only one or two hops, so 8 is generous.
+const MAX_SYMLINK_DEPTH: usize = 8;
 
 /// CRDT-native VFS backend owning a path subtree (e.g. `/etc/rc`).
 pub struct ConfigCrdtFs {
@@ -114,6 +120,73 @@ impl ConfigCrdtFs {
             .documents_under_path(canonical)
             .map(|rows| !rows.is_empty())
             .unwrap_or(false)
+    }
+
+    /// The link target of the symlink document at `canonical`, or `None` when no
+    /// symlink lives there. This is the git-style "mode bit" check: a doc is a
+    /// link iff its [`DocKind`] is `Symlink` — never inferred from content, which
+    /// for a link *is* the target string and would otherwise read as a file body.
+    fn link_target(&self, canonical: &str) -> Option<String> {
+        let ctx = config_context_id(canonical);
+        if self.blocks.document_kind(ctx) != Some(DocKind::Symlink) {
+            return None;
+        }
+        config_doc::read_content(&self.blocks, ctx)
+    }
+
+    /// Resolve a target string (the link body) against the link's own path into
+    /// a canonical absolute path under this mount. Absolute targets are taken
+    /// as-is (normalized); relative targets resolve against the link's parent
+    /// directory — POSIX symlink semantics. Fails loud if the result escapes the
+    /// mount root: cross-mount resolution would have to go through the
+    /// `MountTable` (and its permission gate), which this backend cannot see.
+    fn resolve_target(&self, link_canonical: &str, target: &str) -> VfsResult<String> {
+        let joined = if target.starts_with('/') {
+            target.to_string()
+        } else {
+            let parent = link_canonical.rsplit_once('/').map_or("", |(p, _)| p);
+            format!("{parent}/{target}")
+        };
+        let norm = normalize_abs(&joined);
+        let under_root =
+            norm == self.root || norm.starts_with(&format!("{}/", self.root));
+        if !under_root {
+            return Err(VfsError::other(format!(
+                "symlink target {norm} escapes mount {}",
+                self.root
+            )));
+        }
+        Ok(norm)
+    }
+
+    /// Follow a symlink chain to its terminal canonical path, capped at
+    /// [`MAX_SYMLINK_DEPTH`] hops. The terminal path need not exist (a dangling
+    /// link resolves fine here and surfaces as `NotFound` only when read) — but
+    /// a cycle or an over-long chain fails loud with `TooManySymlinks`. A
+    /// non-symlink path resolves to itself.
+    fn resolve(&self, canonical: &str) -> VfsResult<String> {
+        let mut current = canonical.to_string();
+        for _ in 0..MAX_SYMLINK_DEPTH {
+            match self.link_target(&current) {
+                None => return Ok(current),
+                Some(target) => current = self.resolve_target(&current, &target)?,
+            }
+        }
+        Err(VfsError::TooManySymlinks)
+    }
+
+    /// Create the symlink document at `canonical` whose single block holds the
+    /// raw `target` string (git-style). Caller guarantees nothing already lives
+    /// at the path.
+    fn put_link(&self, canonical: &str, target: &str) -> VfsResult<()> {
+        let ctx = config_context_id(canonical);
+        let crdt_err = |e: String| VfsError::other(format!("crdt: {e}"));
+        self.blocks
+            .create_document_with_path(ctx, DocKind::Symlink, None, canonical.to_string())
+            .map_err(|e| crdt_err(e.to_string()))?;
+        self.insert_block(ctx, target).map_err(crdt_err)?;
+        self.mtimes.insert(canonical.to_string(), SystemTime::now());
+        Ok(())
     }
 
     /// Replace (or seed) the single-block content of the document at `canonical`.
@@ -229,10 +302,35 @@ impl ConfigCrdtFs {
     }
 }
 
+/// Normalize an absolute path string: collapse `//`, drop `.`, resolve `..`
+/// (popping the prior segment). Returns a clean absolute path (`/a/b/c`). Used
+/// to canonicalize a symlink target before keying its document.
+fn normalize_abs(path: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for seg in path.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            s => out.push(s),
+        }
+    }
+    format!("/{}", out.join("/"))
+}
+
 #[async_trait]
 impl VfsOps for ConfigCrdtFs {
     async fn getattr(&self, path: &Path) -> VfsResult<FileAttr> {
         let canonical = self.canonical(path);
+        // lstat-like: report the link itself, not its target (matches
+        // LocalBackend, which uses `symlink_metadata`). Must precede the file
+        // branch — a link's content *is* the target and would read as a file.
+        if let Some(target) = self.link_target(&canonical) {
+            let mut attr = FileAttr::symlink(target.len() as u64);
+            attr.mtime = self.mtime_of(&canonical);
+            return Ok(attr);
+        }
         if let Some(content) = self.content_of(&canonical) {
             let mut attr = FileAttr::file(content.len() as u64, 0o644);
             attr.mtime = self.mtime_of(&canonical);
@@ -263,7 +361,7 @@ impl VfsOps for ConfigCrdtFs {
         // a (virtual) directory; otherwise a file.
         let prefix = format!("{canonical}/");
         let mut seen = std::collections::BTreeMap::new();
-        for (p, _ctx) in rows {
+        for (p, _ctx, kind) in rows {
             let Some(rest) = p.strip_prefix(&prefix) else {
                 continue;
             };
@@ -272,7 +370,15 @@ impl VfsOps for ConfigCrdtFs {
                     seen.entry(dir.to_string()).or_insert(FileType::Directory);
                 }
                 None => {
-                    seen.insert(rest.to_string(), FileType::File);
+                    // A leaf doc is a symlink or a regular file per its kind
+                    // (the git-style mode bit), so `ls`/readdir and
+                    // `load_rc_scripts` can see links without a follow-up stat.
+                    let ft = if kind == DocKind::Symlink {
+                        FileType::Symlink
+                    } else {
+                        FileType::File
+                    };
+                    seen.insert(rest.to_string(), ft);
                 }
             }
         }
@@ -283,7 +389,10 @@ impl VfsOps for ConfigCrdtFs {
     }
 
     async fn read(&self, path: &Path, offset: u64, size: u32) -> VfsResult<Vec<u8>> {
-        let canonical = self.canonical(path);
+        // Auto-follow symlinks (POSIX `read` semantics) so every consumer —
+        // `load_rc_scripts`, an agent `builtin.file:read`, `cat` — gets the
+        // target's bytes for free. A dangling link surfaces here as NotFound.
+        let canonical = self.resolve(&self.canonical(path))?;
         match self.content_of(&canonical) {
             Some(content) => {
                 let bytes = content.into_bytes();
@@ -296,12 +405,34 @@ impl VfsOps for ConfigCrdtFs {
         }
     }
 
+    /// Read the whole file, following symlinks. Overridden because the trait's
+    /// default sizes the read from `getattr`, which for a link is lstat-like and
+    /// reports the *target-string* length — that would truncate the followed
+    /// content (and silently shorten an rc script behind a link). Here we size
+    /// from the resolved target. This is the path `load_rc_scripts` takes.
+    async fn read_all(&self, path: &Path) -> VfsResult<Vec<u8>> {
+        let canonical = self.resolve(&self.canonical(path))?;
+        match self.content_of(&canonical) {
+            Some(content) => Ok(content.into_bytes()),
+            None if self.is_dir(&canonical) => Err(VfsError::is_a_directory(canonical)),
+            None => Err(VfsError::not_found(canonical)),
+        }
+    }
+
     async fn readlink(&self, path: &Path) -> VfsResult<PathBuf> {
-        Err(VfsError::NotASymlink(self.canonical(path)))
+        let canonical = self.canonical(path);
+        // The raw stored target, unresolved (POSIX `readlink`).
+        match self.link_target(&canonical) {
+            Some(target) => Ok(PathBuf::from(target)),
+            None => Err(VfsError::NotASymlink(canonical)),
+        }
     }
 
     async fn write(&self, path: &Path, offset: u64, data: &[u8]) -> VfsResult<u32> {
-        let canonical = self.canonical(path);
+        // Follow symlinks (POSIX): a write through a link edits its target, so a
+        // link never gets silently overwritten with file bytes. A write through
+        // a dangling link creates the target.
+        let canonical = self.resolve(&self.canonical(path))?;
         if self.is_dir(&canonical) && self.content_of(&canonical).is_none() {
             return Err(VfsError::is_a_directory(canonical));
         }
@@ -380,13 +511,23 @@ impl VfsOps for ConfigCrdtFs {
     async fn rename(&self, from: &Path, to: &Path) -> VfsResult<()> {
         let from_c = self.canonical(from);
         let to_c = self.canonical(to);
-        let Some(content) = self.content_of(&from_c) else {
+        let from_link = self.link_target(&from_c);
+        // content_of is Some for a file *or* a link (its body is the target);
+        // None for both means the source is absent.
+        let from_content = self.content_of(&from_c);
+        if from_link.is_none() && from_content.is_none() {
             return Err(VfsError::not_found(from_c));
-        };
+        }
         if self.content_of(&to_c).is_some() {
             return Err(VfsError::already_exists(to_c));
         }
-        self.put_content(&to_c, &content)?;
+        // Preserve link-ness: a renamed symlink stays a symlink rather than
+        // collapsing into a regular file whose body is the target path.
+        if let Some(target) = from_link {
+            self.put_link(&to_c, &target)?;
+        } else {
+            self.put_content(&to_c, &from_content.unwrap())?;
+        }
         let ctx = config_context_id(&from_c);
         self.blocks
             .delete_document(ctx)
@@ -396,7 +537,7 @@ impl VfsOps for ConfigCrdtFs {
     }
 
     async fn truncate(&self, path: &Path, size: u64) -> VfsResult<()> {
-        let canonical = self.canonical(path);
+        let canonical = self.resolve(&self.canonical(path))?;
         let mut buf = self
             .content_of(&canonical)
             .ok_or_else(|| VfsError::not_found(canonical.clone()))?
@@ -419,11 +560,26 @@ impl VfsOps for ConfigCrdtFs {
         self.getattr(Path::new(&canonical[self.root.len()..])).await
     }
 
-    async fn symlink(&self, path: &Path, _target: &Path) -> VfsResult<FileAttr> {
-        Err(VfsError::other(format!(
-            "symlinks unsupported in CRDT config backend: {}",
-            self.canonical(path)
-        )))
+    async fn symlink(&self, path: &Path, target: &Path) -> VfsResult<FileAttr> {
+        let canonical = self.canonical(path);
+        // content_of returns Some for a file *or* an existing link (its body is
+        // the target), so this rejects clobbering either.
+        if self.content_of(&canonical).is_some() {
+            return Err(VfsError::already_exists(canonical));
+        }
+        if self.is_dir(&canonical) {
+            return Err(VfsError::is_a_directory(canonical));
+        }
+        let target_str = target.to_string_lossy();
+        if target_str.is_empty() {
+            return Err(VfsError::other(format!(
+                "symlink {canonical}: empty target"
+            )));
+        }
+        // Dangling targets are allowed at create time (git/POSIX) — resolution
+        // failure surfaces loudly on read, not here.
+        self.put_link(&canonical, &target_str)?;
+        Ok(FileAttr::symlink(target_str.len() as u64))
     }
 
     async fn link(&self, _oldpath: &Path, newpath: &Path) -> VfsResult<FileAttr> {
@@ -668,6 +824,177 @@ mod tests {
 
         // Idempotent: a second seed writes nothing.
         assert_eq!(fs.seed_entries(crate::config_seed::config_seed_files()).unwrap(), 0);
+    }
+
+    // ── symlinks (init.d-style rc composition) ──────────────────────────
+
+    #[tokio::test]
+    async fn symlink_read_follows_to_target() {
+        let fs = fs();
+        fs.write_all(p("lib/create/binding.kai"), b"allow rc-write")
+            .await
+            .unwrap();
+        fs.symlink(
+            p("coder/create/S10-binding.kai"),
+            Path::new("/etc/rc/lib/create/binding.kai"),
+        )
+        .await
+        .unwrap();
+
+        // read auto-follows the link to the target's bytes.
+        let got = fs.read_all(p("coder/create/S10-binding.kai")).await.unwrap();
+        assert_eq!(got, b"allow rc-write");
+
+        // readlink returns the raw stored target, unresolved.
+        let target = fs.readlink(p("coder/create/S10-binding.kai")).await.unwrap();
+        assert_eq!(target, Path::new("/etc/rc/lib/create/binding.kai"));
+
+        // getattr is lstat-like: it reports the link itself.
+        let attr = fs.getattr(p("coder/create/S10-binding.kai")).await.unwrap();
+        assert_eq!(attr.kind, FileType::Symlink);
+    }
+
+    #[tokio::test]
+    async fn readdir_reports_symlink_kind() {
+        let fs = fs();
+        fs.write_all(p("lib/create/stance.md"), b"be kind")
+            .await
+            .unwrap();
+        fs.symlink(
+            p("coder/create/S00-stance.md"),
+            Path::new("/etc/rc/lib/create/stance.md"),
+        )
+        .await
+        .unwrap();
+
+        let entries = fs.readdir(p("coder/create")).await.unwrap();
+        let e = entries.iter().find(|e| e.name == "S00-stance.md").unwrap();
+        assert_eq!(e.kind, FileType::Symlink);
+    }
+
+    #[tokio::test]
+    async fn symlink_relative_target_resolves_against_link_dir() {
+        let fs = fs();
+        fs.write_all(p("coder/create/real.kai"), b"body").await.unwrap();
+        // Relative target resolves against the link's parent dir.
+        fs.symlink(p("coder/create/S05-link.kai"), Path::new("real.kai"))
+            .await
+            .unwrap();
+        let got = fs.read_all(p("coder/create/S05-link.kai")).await.unwrap();
+        assert_eq!(got, b"body");
+
+        // A `..`-relative target resolves too.
+        fs.write_all(p("lib/create/shared.kai"), b"shared").await.unwrap();
+        fs.symlink(
+            p("coder/create/S06-shared.kai"),
+            Path::new("../../lib/create/shared.kai"),
+        )
+        .await
+        .unwrap();
+        let got = fs.read_all(p("coder/create/S06-shared.kai")).await.unwrap();
+        assert_eq!(got, b"shared");
+    }
+
+    #[tokio::test]
+    async fn symlink_cycle_fails_loud() {
+        let fs = fs();
+        fs.symlink(p("a/create/S00-x.kai"), Path::new("/etc/rc/a/create/S00-y.kai"))
+            .await
+            .unwrap();
+        fs.symlink(p("a/create/S00-y.kai"), Path::new("/etc/rc/a/create/S00-x.kai"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            fs.read_all(p("a/create/S00-x.kai")).await,
+            Err(VfsError::TooManySymlinks)
+        ));
+    }
+
+    #[tokio::test]
+    async fn dangling_symlink_creates_ok_but_read_is_not_found() {
+        let fs = fs();
+        // Creating a link to a non-existent target succeeds (git/POSIX).
+        fs.symlink(
+            p("coder/create/S00-gone.md"),
+            Path::new("/etc/rc/lib/create/missing.md"),
+        )
+        .await
+        .unwrap();
+        // The link exists (getattr/readlink work)…
+        assert_eq!(
+            fs.readlink(p("coder/create/S00-gone.md")).await.unwrap(),
+            Path::new("/etc/rc/lib/create/missing.md")
+        );
+        // …but reading through it fails loud, not as empty content.
+        assert!(matches!(
+            fs.read_all(p("coder/create/S00-gone.md")).await,
+            Err(VfsError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn symlink_target_escaping_mount_fails_on_read() {
+        let fs = fs();
+        fs.symlink(p("coder/create/S00-evil.md"), Path::new("/etc/config/theme.toml"))
+            .await
+            .unwrap();
+        // Resolution is confined to the mount root — a cross-mount target is
+        // rejected loudly rather than silently reaching another backend's data.
+        let err = fs.read_all(p("coder/create/S00-evil.md")).await.unwrap_err();
+        assert!(
+            format!("{err}").contains("escapes mount"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_through_symlink_edits_target_not_link() {
+        let fs = fs();
+        fs.write_all(p("lib/create/real.kai"), b"v1").await.unwrap();
+        fs.symlink(
+            p("coder/create/S10-real.kai"),
+            Path::new("/etc/rc/lib/create/real.kai"),
+        )
+        .await
+        .unwrap();
+
+        fs.write_all(p("coder/create/S10-real.kai"), b"v2").await.unwrap();
+
+        // The target changed…
+        assert_eq!(fs.read_all(p("lib/create/real.kai")).await.unwrap(), b"v2");
+        // …and the link is still a link (not collapsed into a file).
+        assert_eq!(
+            fs.getattr(p("coder/create/S10-real.kai")).await.unwrap().kind,
+            FileType::Symlink
+        );
+    }
+
+    #[tokio::test]
+    async fn unlink_removes_link_not_target() {
+        let fs = fs();
+        fs.write_all(p("lib/create/real.kai"), b"keep").await.unwrap();
+        fs.symlink(
+            p("coder/create/S10-real.kai"),
+            Path::new("/etc/rc/lib/create/real.kai"),
+        )
+        .await
+        .unwrap();
+
+        fs.unlink(p("coder/create/S10-real.kai")).await.unwrap();
+        assert!(!fs.exists(p("coder/create/S10-real.kai")).await, "link gone");
+        // The target survives.
+        assert_eq!(fs.read_all(p("lib/create/real.kai")).await.unwrap(), b"keep");
+    }
+
+    #[tokio::test]
+    async fn symlink_over_existing_path_conflicts() {
+        let fs = fs();
+        fs.write_all(p("coder/create/S00-x.kai"), b"file").await.unwrap();
+        assert!(matches!(
+            fs.symlink(p("coder/create/S00-x.kai"), Path::new("/etc/rc/lib/y.kai"))
+                .await,
+            Err(VfsError::AlreadyExists(_))
+        ));
     }
 
     /// A user edit must survive re-seeding — seed only fills absent paths, it

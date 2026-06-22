@@ -295,6 +295,17 @@ impl VfsOps for MountTable {
         fs.read(&relative, offset, size).await
     }
 
+    /// Delegate `read_all` to the owning backend rather than using the trait
+    /// default (getattr + read). The default sizes from `getattr`, which is
+    /// lstat-like for a symlink and reports the *link path* length — that would
+    /// truncate a followed target (e.g. a short link path masking a long rc
+    /// script). A backend that follows symlinks (`ConfigCrdtFs`) sizes from the
+    /// resolved target in its own `read_all`, so the read must reach it.
+    async fn read_all(&self, path: &Path) -> VfsResult<Vec<u8>> {
+        let (fs, relative) = self.find_mount(path).await?;
+        fs.read_all(&relative).await
+    }
+
     async fn readlink(&self, path: &Path) -> VfsResult<PathBuf> {
         let (fs, relative) = self.find_mount(path).await?;
         fs.readlink(&relative).await
