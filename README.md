@@ -134,7 +134,7 @@ text rendering, theming, and the UI architecture.
 
 | Doc | Purpose |
 |-----|---------|
-| [docs/design-notes.md](docs/design-notes.md) | Origin, terminology, design explorations |
+| [docs/instrument-design.md](docs/instrument-design.md) | The instrument stance — principles for system-message design |
 | [docs/telemetry.md](docs/telemetry.md) | OpenTelemetry integration |
 | [docs/abc-reference.md](docs/abc-reference.md) | ABC music notation reference |
 | [docs/issues.md](docs/issues.md) | Live work items not yet in code |
