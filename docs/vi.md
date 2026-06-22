@@ -246,11 +246,15 @@ accept last-writer semantics for pass 1 and note it.
 **Slice 1 — kernel, headless, test-first** (no GUI):
 
 1. ✅ `resolve_editor_target` (shipped, `editor.rs`).
-2. `kaijutsu-editor` crate: `EditorCore` + `EditOp`, built on modalkit. Pure
+2. ✅ `kaijutsu-editor` crate: `EditorCore` + `EditOp`, built on modalkit. Pure
    unit tests (keys → ops + state). *Test layer 1.*
-3. Kernel editor-session registry + the `editor_*` surface (kj verbs + MCP
-   tools). e2e lifecycle tests via the live-eval/`e2e_shell` harness. *Test
-   layer 2.*
+3. Kernel editor-session registry + the `editor_*` surface.
+   - ✅ `EditorSessions` registry (`editor.rs`): open/keys/state/save/quit,
+     keystrokes mirror onto the owning CRDT block, checkpoint-backed `ZQ`
+     rollback. e2e lifecycle tests against a live block store. *Test layer 2.*
+   - ⬜ Surface it: kj verbs (`kj editor open/keys/…`) + MCP tools + the
+     kernel-wide registry behind a mutex (the `!Send` `EditorCore` stays inside
+     sync critical sections — see the registry doc).
 4. `vi`/`edit` builtin + `kj rc edit <path>` (no `--content`) → `editor_open`.
 
 **Slice 2 — app, on the runner** (verify visually):

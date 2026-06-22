@@ -5803,6 +5803,7 @@ dependencies = [
  "kaijutsu-abc",
  "kaijutsu-cas",
  "kaijutsu-crdt",
+ "kaijutsu-editor",
  "kaijutsu-hyoushigi",
  "kaijutsu-index",
  "kaijutsu-telemetry",

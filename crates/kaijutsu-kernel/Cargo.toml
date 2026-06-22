@@ -22,6 +22,7 @@ clap = { workspace = true }
 diamond-types-extended.workspace = true
 kaijutsu-crdt.workspace = true
 kaijutsu-types.workspace = true
+kaijutsu-editor.workspace = true
 kaijutsu-cas.workspace = true
 
 # Hyoushigi — per-context timeline engine (the beat substrate)

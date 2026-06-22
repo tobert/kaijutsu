@@ -31,6 +31,7 @@ kaijutsu-cas = { path = "crates/kaijutsu-cas" }
 kaijutsu-hyoushigi = { path = "crates/kaijutsu-hyoushigi" }
 kaijutsu-viz = { path = "crates/kaijutsu-viz" }
 kaijutsu-types = { path = "crates/kaijutsu-types" }
+kaijutsu-editor = { path = "crates/kaijutsu-editor" }
 kaijutsu-crdt = { path = "crates/kaijutsu-crdt" }
 kaijutsu-kernel = { path = "crates/kaijutsu-kernel" }
 kaijutsu-client = { path = "crates/kaijutsu-client" }
