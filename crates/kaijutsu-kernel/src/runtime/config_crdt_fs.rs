@@ -616,7 +616,7 @@ mod tests {
 
         // A known seed round-trips through the CRDT (read via the VFS, not disk).
         let stance = fs
-            .read_all(p("coder/create/S00-stance.md"))
+            .read_all(p("coder/create/S00-stance.kai"))
             .await
             .expect("coder stance must seed");
         assert!(!stance.is_empty());
