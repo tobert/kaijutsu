@@ -26,6 +26,7 @@ pub mod kv;
 pub mod parse;
 pub mod policy;
 pub mod preset;
+pub mod editor;
 pub mod rc;
 pub mod lifecycle;
 pub mod model;
@@ -356,6 +357,12 @@ impl KjDispatcher {
         if cmd == "rc" {
             return self.dispatch_rc(&argv[1..], caller).await;
         }
+        // `kj editor` drives kernel-owned editor sessions by path; the session
+        // binds to whatever block owns the path, so no active context is needed
+        // (same exemption as `kj rc`).
+        if cmd == "editor" {
+            return self.dispatch_editor(&argv[1..], caller).await;
+        }
         if cmd == "config" {
             return self.dispatch_config(&argv[1..], caller).await;
         }
@@ -623,6 +630,7 @@ pub(crate) fn kj_command() -> clap::Command {
         .subcommand(preset::PresetArgs::command())
         .subcommand(cas::CasArgs::command())
         .subcommand(rc::RcArgs::command())
+        .subcommand(editor::EditorArgs::command())
         .subcommand(config::ConfigArgs::command())
         .subcommand(block::BlockArgs::command())
         .subcommand(binding::BindingArgs::command())

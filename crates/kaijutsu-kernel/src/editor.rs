@@ -96,6 +96,18 @@ use kaijutsu_editor::EditorCore;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EditorSessionId(u64);
 
+impl EditorSessionId {
+    /// The raw handle value — the currency the `kj editor` / wire surface uses.
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
+
+    /// Reconstruct a handle from a wire value.
+    pub fn from_u64(n: u64) -> Self {
+        EditorSessionId(n)
+    }
+}
+
 /// A renderer-facing snapshot of a session: what to draw, plus dirtiness.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EditorState {

@@ -252,9 +252,15 @@ accept last-writer semantics for pass 1 and note it.
    - ✅ `EditorSessions` registry (`editor.rs`): open/keys/state/save/quit,
      keystrokes mirror onto the owning CRDT block, checkpoint-backed `ZQ`
      rollback. e2e lifecycle tests against a live block store. *Test layer 2.*
-   - ⬜ Surface it: kj verbs (`kj editor open/keys/…`) + MCP tools + the
-     kernel-wide registry behind a mutex (the `!Send` `EditorCore` stays inside
-     sync critical sections — see the registry doc).
+   - ✅ Kernel-wide registry behind a mutex (`SendSessions`; the `!Send`
+     `EditorCore` stays inside sync critical sections), exposed as
+     `Kernel::editor_open/keys/state/save/quit`.
+   - ✅ `kj editor open/keys/state/save/quit` verbs (`kj/editor.rs`); e2e test
+     proves `keys` mutates the real rc doc (read back via VFS) and `quit` rolls
+     it back.
+   - ⬜ MCP tools: deferred — a model can already drive via `kj editor` through
+     the shell (the hybrid kj-rich/MCP-narrow stance). Add a narrow MCP wrapper
+     only if a non-shell driver needs it.
 4. `vi`/`edit` builtin + `kj rc edit <path>` (no `--content`) → `editor_open`.
 
 **Slice 2 — app, on the runner** (verify visually):
