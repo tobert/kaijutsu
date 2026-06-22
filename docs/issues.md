@@ -6,6 +6,28 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 
 ---
 
+## Instrument reframing & RC stances (follow-ups from the 2026-06-22 pass)
+
+The pass that reframed kaijutsu as an instrument, rewrote the rc create-stances,
+and renamed `composer→musician` / `explorer→toolie` left these threads open:
+
+- **Shared synth ethos is duplicated inline.** `coder`/`director`/`mcp` stances
+  each carry the collaborator ethos. Lift it into one shared fragment composed by
+  a `.kai` (`kj block create --role system --kind text`) once the duplication
+  bites. The `coder` stance is already a `.kai` (branches on the bound model), so
+  the mechanism is proven.
+- **Toolie taxonomy:** today's `toolie` is the read-only kind (kaibo-explorer
+  style). Add a second, Edit-capable toolie that does bounded editing work —
+  distinct binding + stance.
+- **Future `composer` context_type:** a musically-enabled *synth director* that
+  drives many `musician` contexts interactively. The name is now free (the old
+  beat-voice `composer` became `musician`).
+- **`orchestration.md` needs a fuller rewrite:** stale persona content (personas
+  yanked 2026-05-02) and example `explorer` labels remain; only the top-level
+  framing was moved off the control register this pass.
+- **README doc-table** repoints to `docs/instrument-design.md` in the working
+  tree but is uncommitted until that doc lands.
+
 ## Architecture & System Design
 
 - **VFS facade delegation:** `Kernel` implements `VfsOps` directly (`crates/kaijutsu-kernel/src/kernel.rs:984`) as a facade. Backend multiplexing already exists — `MountTable` impls `VfsOps` over `MemoryBackend`/`LocalBackend` (`crates/kaijutsu-kernel/src/vfs/mount.rs:261`). The open question is whether the `Kernel`-level facade should delegate more to `MountTable` (and what stays on `Kernel`), not whether to build a manager from scratch.
