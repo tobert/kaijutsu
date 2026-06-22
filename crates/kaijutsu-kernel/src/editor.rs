@@ -230,6 +230,21 @@ impl EditorSessions {
     }
 }
 
+/// [`EditorSessions`] wrapped to assert `Send`, so the registry can be a field
+/// of the shared (`Send + Sync`) kernel behind a sync mutex.
+///
+/// SAFETY: `EditorCore` is `!Send` only *structurally* — modalkit's `VimMachine`
+/// holds a `Box<dyn Dialog>` with no `Send` bound. We never install a dialog
+/// (there is no command-bar dialog UI in the kernel), so it carries no
+/// thread-affine state. Every access is serialized through the kernel's mutex
+/// (one thread touches a session at a time); the only thread crossing is the
+/// lock handoff, which moves plain data. This mirrors the app's documented
+/// `unsafe impl Send for VimMachineResource`.
+pub struct SendSessions(pub EditorSessions);
+
+// SAFETY: see the type doc above — no thread-affine state; access is serialized.
+unsafe impl Send for SendSessions {}
+
 /// Build a renderer-facing state, marking dirty against `checkpoint`.
 fn state_of(core: &mut EditorCore, checkpoint: &str) -> EditorState {
     let text = core.text();

@@ -108,6 +108,11 @@ pub struct Kernel {
     /// embedded/test kernels that never call `init_kv`; `kv()` returns `None`
     /// there and callers degrade rather than panic.
     kv: OnceLock<Arc<crate::kv::Kv>>,
+    /// Open in-app editor sessions (`vi`/`kj editor`). The registry is
+    /// kernel-owned so any peer can drive it and the app renders it. Behind a
+    /// sync mutex because every editor op is synchronous — modalkit's `!Send`
+    /// `EditorCore` never crosses an await (see [`crate::editor::SendSessions`]).
+    editor_sessions: parking_lot::Mutex<crate::editor::SendSessions>,
 }
 
 /// Removes its directory on drop. A tiny owned guard so `new_ephemeral()` test
@@ -179,6 +184,9 @@ impl Kernel {
             beat_ingress: OnceLock::new(),
             temp_cleanup: None,
             kv: OnceLock::new(),
+            editor_sessions: parking_lot::Mutex::new(crate::editor::SendSessions(
+                crate::editor::EditorSessions::new(),
+            )),
         }
     }
 
@@ -236,6 +244,9 @@ impl Kernel {
             beat_ingress: OnceLock::new(),
             temp_cleanup: None,
             kv: OnceLock::new(),
+            editor_sessions: parking_lot::Mutex::new(crate::editor::SendSessions(
+                crate::editor::EditorSessions::new(),
+            )),
         }
     }
 
@@ -822,6 +833,59 @@ impl Kernel {
             .clone()
     }
 
+    // ── Editor sessions ───────────────────────────────────────────────────
+
+    /// Open an in-app editor on `path`, binding to the CRDT block that owns its
+    /// text (config/rc → the ConfigCrdtFs block; ordinary file → its file-doc).
+    /// Returns the session handle + initial state; fails loud if the path names
+    /// no editable document.
+    pub async fn editor_open(
+        &self,
+        path: &str,
+        blocks: &crate::block_store::SharedBlockStore,
+    ) -> Result<(crate::editor::EditorSessionId, crate::editor::EditorState), String> {
+        let file_cache = self.file_cache(blocks);
+        // Resolve (the only async step) BEFORE taking the sync mutex, so the
+        // `!Send` `EditorCore` never coexists with an await.
+        let target = crate::editor::resolve_editor_target(path, blocks, &file_cache).await?;
+        self.editor_sessions.lock().0.open(path, target, blocks)
+    }
+
+    /// Feed keys to an open session, mirroring the edits onto the CRDT block.
+    pub fn editor_keys(
+        &self,
+        id: crate::editor::EditorSessionId,
+        keys: &str,
+        blocks: &crate::block_store::SharedBlockStore,
+    ) -> Result<crate::editor::EditorState, String> {
+        self.editor_sessions.lock().0.keys(id, keys, blocks)
+    }
+
+    /// Current state of an open session.
+    pub fn editor_state(
+        &self,
+        id: crate::editor::EditorSessionId,
+    ) -> Result<crate::editor::EditorState, String> {
+        self.editor_sessions.lock().0.state(id)
+    }
+
+    /// `ZZ` — checkpoint the session's buffer as saved.
+    pub fn editor_save(
+        &self,
+        id: crate::editor::EditorSessionId,
+    ) -> Result<crate::editor::EditorState, String> {
+        self.editor_sessions.lock().0.save(id)
+    }
+
+    /// `ZQ` — roll the block back to the session's checkpoint and close it.
+    pub fn editor_quit(
+        &self,
+        id: crate::editor::EditorSessionId,
+        blocks: &crate::block_store::SharedBlockStore,
+    ) -> Result<(), String> {
+        self.editor_sessions.lock().0.quit(id, blocks)
+    }
+
     /// Get the latch-nonce store for a context, creating it on first use.
     ///
     /// The returned `NonceStore` is `Arc`-backed and `Clone`; clones share the
@@ -1145,6 +1209,45 @@ mod tests {
     async fn test_kernel_creation() {
         let kernel = Kernel::new_ephemeral("test").await;
         assert_eq!(kernel.name().await, "test");
+    }
+
+    /// Drive the kernel-owned editor surface end to end: open an rc block, type,
+    /// observe state, roll back. Proves the methods + the `!Send` registry
+    /// integration work through the shared kernel.
+    #[tokio::test]
+    async fn editor_session_roundtrip_through_kernel() {
+        use crate::block_store::shared_block_store_with_db;
+        use crate::kernel_db::KernelDb;
+        use crate::runtime::config_crdt_fs::ConfigCrdtFs;
+        use crate::vfs::VfsOps as _;
+        use kaijutsu_crdt::PrincipalId;
+        use std::path::Path;
+
+        let kernel = Kernel::new_ephemeral("test").await;
+
+        // Seed an rc script through its owning ConfigCrdtFs backend.
+        let creator = PrincipalId::system();
+        let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+        let ws = db.lock().get_or_create_default_workspace(creator).unwrap();
+        let blocks = shared_block_store_with_db(db, ws, creator);
+        ConfigCrdtFs::new(blocks.clone(), "/etc/rc")
+            .write_all(Path::new("coder/create/S00.kai"), b"hello")
+            .await
+            .unwrap();
+        let path = "/etc/rc/coder/create/S00.kai";
+
+        // Open → type → state reflects, all through the kernel surface.
+        let (id, st) = kernel.editor_open(path, &blocks).await.unwrap();
+        assert_eq!(st.text, "hello");
+        let st = kernel.editor_keys(id, "iX<Esc>", &blocks).unwrap();
+        assert_eq!(st.text, "Xhello");
+        assert!(st.dirty);
+        assert_eq!(kernel.editor_state(id).unwrap().text, "Xhello");
+
+        // ZQ rolls the block back and closes the session.
+        kernel.editor_quit(id, &blocks).unwrap();
+        let err = kernel.editor_keys(id, "x", &blocks).unwrap_err();
+        assert!(err.contains("no such session"), "got: {err}");
     }
 
     #[tokio::test]
