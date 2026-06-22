@@ -18,6 +18,7 @@ pub mod config_doc;
 pub mod config_seed;
 pub mod control;
 pub mod drift;
+pub mod editor;
 pub mod execution;
 pub mod file_tools;
 pub mod flows;
