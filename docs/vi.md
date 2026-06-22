@@ -279,6 +279,13 @@ working feature, but all of it blocks calling it finished**:
   submitting peer (risk #3) before multi-user.
 - **Any optimistic-mirror / latency hack** in the app renderer (if we add one)
   gets revisited once measured.
+- **Trailing-newline fidelity.** modalkit's `EditRope` is line-terminated, so
+  `EditorCore` can't tell `"hello"` from `"hello\n"`; it strips one terminator at
+  the boundary. The kernel binding must remember the loaded terminator and
+  re-apply on save (ties into the CRLF/hashline preservation concerns).
+- **`EditOp` granularity.** `apply_keys` emits one contiguous prefix/suffix diff
+  per keystroke; a multi-site change (macro, multi-cursor) would need a richer
+  diff. Fine for pass 1; revisit with multi-cursor.
 
 Mirror the live items into `docs/issues.md` (the backlog/pressure-valve) as they
 appear, and delete them here + there when they ship.

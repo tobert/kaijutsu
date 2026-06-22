@@ -5744,6 +5744,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kaijutsu-editor"
+version = "0.1.0"
+dependencies = [
+ "editor-types",
+ "modalkit",
+]
+
+[[package]]
 name = "kaijutsu-hyoushigi"
 version = "0.1.0"
 dependencies = [
