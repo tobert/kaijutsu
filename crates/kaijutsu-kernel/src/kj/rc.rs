@@ -223,7 +223,9 @@ impl KjDispatcher {
             .vfs()
             .getattr(std::path::Path::new(path))
             .await
-            .map(|a| a.is_file())
+            // A symlinked (composed) script counts as present: `rm`/`add`-clobber
+            // and `reset`-replace must see it, not treat it as absent.
+            .map(|a| a.is_file() || a.is_symlink())
             .unwrap_or(false)
     }
 
@@ -414,6 +416,18 @@ impl KjDispatcher {
         if !self.rc_exists(path).await {
             return KjResult::Err(format!("kj rc edit: '{path}' not found"));
         }
+        // Refuse to edit *through* a composed link: a write would silently edit
+        // the shared target (every type that links it), which is almost never
+        // what `kj rc edit <this path>` means. Make the choice explicit — edit
+        // the target to change all, or rm+add here to diverge.
+        if let Some(target) = self.rc_link_target(path).await {
+            return KjResult::Err(format!(
+                "kj rc edit: '{path}' is a composed symlink → {target}\n\
+                 editing it would change the shared script for every type that links it.\n\
+                 - to change all: kj rc edit {target} --content …\n\
+                 - to diverge just this one: kj rc rm {path} && kj rc add {path} --content …"
+            ));
+        }
         if let Err(e) = self.write_rc_file(path, content).await {
             return KjResult::Err(format!("kj rc edit: {e}"));
         }
@@ -425,6 +439,7 @@ impl KjDispatcher {
     /// means it also recovers a file you `rm`'d. Errors (no silent no-op) when
     /// the path ships no embedded seed — there is nothing to reset it to.
     async fn rc_reset(&self, path: &str) -> KjResult {
+        use crate::vfs::VfsOps;
         if let Err(e) = parse_rc_path(path) {
             return KjResult::Err(format!("kj rc reset: {e}"));
         }
@@ -434,10 +449,41 @@ impl KjDispatcher {
                  only paths shipped under assets/defaults/rc can be reset"
             ));
         };
-        if let Err(e) = self.write_rc_file(path, body).await {
+        // A seed whose body is a path to another seeded script restores as a
+        // symlink (init.d composition), not a literal file — mirror seeding.
+        let known: std::collections::HashSet<String> = crate::seed_scripts::seed_files()
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+        let link = crate::runtime::config_crdt_fs::seed_link_target(path, body, &known);
+
+        // create-or-replace: drop any existing doc (file OR link) first, so a
+        // write never accidentally follows a live symlink into its target.
+        if self.rc_exists(path).await
+            && let Err(e) = self.kernel().vfs().unlink(std::path::Path::new(path)).await
+        {
+            return KjResult::Err(format!("kj rc reset: unlink '{path}': {e}"));
+        }
+
+        let outcome = match &link {
+            Some(target) => self
+                .kernel()
+                .vfs()
+                .symlink(std::path::Path::new(path), std::path::Path::new(target))
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+            None => self.write_rc_file(path, body).await,
+        };
+        if let Err(e) = outcome {
             return KjResult::Err(format!("kj rc reset: {e}"));
         }
-        KjResult::ok(format!("reset rc script '{path}' to its embedded seed"))
+        match link {
+            Some(target) => KjResult::ok(format!(
+                "reset rc script '{path}' to its embedded seed (symlink → {target})"
+            )),
+            None => KjResult::ok(format!("reset rc script '{path}' to its embedded seed")),
+        }
     }
 
     async fn rc_rm(&self, path: &str) -> KjResult {
@@ -692,12 +738,14 @@ mod tests {
         let c = test_caller();
         let s = |v: &str| v.to_string();
 
-        // Botch a default seed (test_dispatcher's tree is bootstrap-seeded).
+        // Botch a content seed — the coder stance is a real .kai body (not a
+        // composed link), so this exercises content restore. (Cache/binding
+        // paths are now seed symlinks; see rc_reset_restores_a_seed_symlink.)
         d.dispatch(
             &[
                 s("rc"),
                 s("edit"),
-                s("/etc/rc/default/create/S20-cache.kai"),
+                s("/etc/rc/coder/create/S00-stance.kai"),
                 s("--content"),
                 s("# user override"),
             ],
@@ -707,19 +755,105 @@ mod tests {
 
         let result = d
             .dispatch(
+                &[s("rc"), s("reset"), s("/etc/rc/coder/create/S00-stance.kai")],
+                &c,
+            )
+            .await;
+        assert!(matches!(result, KjResult::Ok { .. }), "reset failed: {result:?}");
+
+        let restored = read_rc(&d, "/etc/rc/coder/create/S00-stance.kai")
+            .await
+            .expect("seed file present after reset");
+        assert!(
+            restored.contains("coder stance"),
+            "reset didn't restore: {restored}"
+        );
+    }
+
+    /// `kj rc edit` refuses to write *through* a composed link — that would
+    /// silently edit the shared target for every type that links it. The error
+    /// names the target and the two explicit paths (edit-all vs diverge).
+    #[tokio::test]
+    async fn rc_edit_refuses_to_edit_through_a_link() {
+        use crate::kj::test_helpers::*;
+        use crate::kj::KjResult;
+
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        let s = |v: &str| v.to_string();
+
+        let result = d
+            .dispatch(
+                &[
+                    s("rc"),
+                    s("edit"),
+                    s("/etc/rc/default/create/S20-cache.kai"),
+                    s("--content"),
+                    s("# nope"),
+                ],
+                &c,
+            )
+            .await;
+        match result {
+            KjResult::Err(msg) => {
+                assert!(msg.contains("composed symlink"), "msg: {msg}");
+                assert!(msg.contains("/etc/rc/lib/create/S20-cache.kai"), "msg: {msg}");
+            }
+            other => panic!("expected Err, got {other:?}"),
+        }
+        // The shared canonical body is untouched.
+        let body = read_rc(&d, "/etc/rc/lib/create/S20-cache.kai").await.unwrap();
+        assert!(body.contains("kj cache add --target=tools"), "lib body altered: {body}");
+    }
+
+    /// `kj rc reset` of a *composed* (seed-symlink) path restores the symlink,
+    /// not a literal file containing the target path. The cache scripts ship as
+    /// init.d-style links into `/etc/rc/lib`.
+    #[tokio::test]
+    async fn rc_reset_restores_a_seed_symlink() {
+        use crate::kj::test_helpers::*;
+        use crate::kj::KjResult;
+
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        let s = |v: &str| v.to_string();
+
+        // Remove the composed cache link, then reset it.
+        d.dispatch(
+            &[s("rc"), s("rm"), s("/etc/rc/default/create/S20-cache.kai")],
+            &c,
+        )
+        .await;
+        let result = d
+            .dispatch(
                 &[s("rc"), s("reset"), s("/etc/rc/default/create/S20-cache.kai")],
                 &c,
             )
             .await;
         assert!(matches!(result, KjResult::Ok { .. }), "reset failed: {result:?}");
 
-        let restored = read_rc(&d, "/etc/rc/default/create/S20-cache.kai")
-            .await
-            .expect("seed file present after reset");
-        assert!(
-            restored.contains("kj cache add --target=tools"),
-            "reset didn't restore: {restored}"
-        );
+        // show reports it as a symlink into lib, and follows to the cache body.
+        let shown = d
+            .dispatch(
+                &[s("rc"), s("show"), s("/etc/rc/default/create/S20-cache.kai")],
+                &c,
+            )
+            .await;
+        match shown {
+            KjResult::Ok { data: Some(v), .. } => {
+                let obj = v.as_object().expect("object");
+                assert_eq!(
+                    obj["symlink"].as_str(),
+                    Some("/etc/rc/lib/create/S20-cache.kai"),
+                    "reset should restore the seed symlink, got: {obj:?}"
+                );
+                assert!(
+                    obj["content"].as_str().unwrap().contains("kj cache add --target=tools"),
+                    "link should follow to the canonical cache body"
+                );
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
     }
 
     /// `kj rc reset <path>` recreates a script the user `rm`'d — recovery

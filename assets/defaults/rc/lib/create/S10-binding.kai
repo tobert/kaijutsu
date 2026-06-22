@@ -1,0 +1,11 @@
+# Broad loadout: every instance + every facade (explicit; deny-by-default).
+kj binding allow "*"
+kj binding allow "facade:*"
+# kj verb authorities are explicit — NOT implied by "*". Broad roles are fully
+# capable: drive/fork turns, merge drift, run the transport, and perform
+# context/workspace/preset/doc lifecycle.
+kj binding allow "drive"
+kj binding allow "fork"
+kj binding allow "drift"
+kj binding allow "transport"
+kj binding allow "operator"

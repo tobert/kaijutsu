@@ -285,17 +285,29 @@ impl ConfigCrdtFs {
         &self,
         entries: impl IntoIterator<Item = (String, S)>,
     ) -> VfsResult<usize> {
+        // Collect first so seed symlinks resolve against the *full* set: a seed
+        // file whose body is just a path to another seeded path becomes a
+        // symlink (the in-repo init.d composition format — see
+        // [`seed_link_target`]). Order-independent: we check the path set, not
+        // what's already written.
+        let entries: Vec<(String, S)> = entries.into_iter().collect();
+        let known: std::collections::HashSet<String> =
+            entries.iter().map(|(p, _)| p.clone()).collect();
+
         let mut written = 0usize;
-        for (canonical, body) in entries {
+        for (canonical, body) in &entries {
             // Only seed paths that fall under this backend's root, and only if
             // absent (a live user edit is never clobbered).
             if !canonical.starts_with(&self.root) {
                 continue;
             }
-            if self.content_of(&canonical).is_some() {
+            if self.content_of(canonical).is_some() {
                 continue;
             }
-            self.put_content(&canonical, body.as_ref())?;
+            match seed_link_target(canonical, body.as_ref(), &known) {
+                Some(target) => self.put_link(canonical, &target)?,
+                None => self.put_content(canonical, body.as_ref())?,
+            }
             written += 1;
         }
         Ok(written)
@@ -317,6 +329,36 @@ fn normalize_abs(path: &str) -> String {
         }
     }
     format!("/{}", out.join("/"))
+}
+
+/// If `body` is a **seed symlink** — its sole content a path resolving to
+/// another seeded path in `known` — return the raw target string; otherwise
+/// `None` (seed it as a literal file).
+///
+/// This is the in-repo init.d composition format: a checked-in seed file whose
+/// content is just the target path seeds as a symlink instead of a literal
+/// file. `include_dir!` can't carry real symlinks (it follows them and embeds
+/// the target's bytes), so the link relationship rides in the file *content*
+/// and is reconstructed here. Detection is deliberately confined to the
+/// authored, closed seed set and guarded by "the target must be a real seeded
+/// path", so a one-line script can't be mistaken for a link.
+pub fn seed_link_target(
+    link_path: &str,
+    body: &str,
+    known: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let t = body.trim();
+    // A link body is a single path token, not a script: one line, path-shaped.
+    if t.is_empty() || t.contains('\n') || !t.contains('/') {
+        return None;
+    }
+    let resolved = if t.starts_with('/') {
+        normalize_abs(t)
+    } else {
+        let parent = link_path.rsplit_once('/').map_or("", |(p, _)| p);
+        normalize_abs(&format!("{parent}/{t}"))
+    };
+    (resolved != link_path && known.contains(&resolved)).then(|| t.to_string())
 }
 
 #[async_trait]
@@ -824,6 +866,92 @@ mod tests {
 
         // Idempotent: a second seed writes nothing.
         assert_eq!(fs.seed_entries(crate::config_seed::config_seed_files()).unwrap(), 0);
+    }
+
+    // ── seed-symlink detection (in-repo init.d composition format) ──────
+
+    #[test]
+    fn seed_link_target_detects_resolving_paths_only() {
+        let known: std::collections::HashSet<String> = [
+            "/etc/rc/lib/create/S20-cache.kai",
+            "/etc/rc/coder/create/S20-cache.kai",
+            "/etc/rc/coder/create/S00-stance.kai",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+        // Absolute path resolving to a known seed → link (raw target returned).
+        assert_eq!(
+            seed_link_target(
+                "/etc/rc/coder/create/S20-cache.kai",
+                "/etc/rc/lib/create/S20-cache.kai\n",
+                &known,
+            ),
+            Some("/etc/rc/lib/create/S20-cache.kai".to_string())
+        );
+        // Relative path resolving against the link's parent → link.
+        assert_eq!(
+            seed_link_target(
+                "/etc/rc/coder/create/S20-cache.kai",
+                "../../lib/create/S20-cache.kai",
+                &known,
+            ),
+            Some("../../lib/create/S20-cache.kai".to_string())
+        );
+        // A real (multi-line) script body → NOT a link.
+        assert_eq!(
+            seed_link_target(
+                "/etc/rc/coder/create/S00-stance.kai",
+                "# stance\nkj block create --role system\n",
+                &known,
+            ),
+            None
+        );
+        // A single path-shaped line that does NOT resolve to a seed → NOT a
+        // link (the guard against mistaking a one-line script for a link).
+        assert_eq!(
+            seed_link_target(
+                "/etc/rc/coder/create/S00-stance.kai",
+                "/etc/rc/nope/create/x.kai",
+                &known,
+            ),
+            None
+        );
+        // A self-referential path is not a link.
+        assert_eq!(
+            seed_link_target(
+                "/etc/rc/coder/create/S20-cache.kai",
+                "/etc/rc/coder/create/S20-cache.kai",
+                &known,
+            ),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_entries_reconstructs_symlink_from_path_body() {
+        let fs = fs();
+        // Two entries: a canonical body and a path-content link to it.
+        let entries = vec![
+            (
+                "/etc/rc/lib/create/S20-cache.kai".to_string(),
+                "kj cache add --target=tools --ttl=extended",
+            ),
+            (
+                "/etc/rc/coder/create/S20-cache.kai".to_string(),
+                "/etc/rc/lib/create/S20-cache.kai",
+            ),
+        ];
+        let n = fs.seed_entries(entries).unwrap();
+        assert_eq!(n, 2);
+
+        // The per-type path seeded as a real symlink (not a file of the path).
+        let attr = fs.getattr(p("coder/create/S20-cache.kai")).await.unwrap();
+        assert_eq!(attr.kind, FileType::Symlink);
+        // …and reading it follows to the canonical body.
+        let got = fs.read_all(p("coder/create/S20-cache.kai")).await.unwrap();
+        assert_eq!(got, b"kj cache add --target=tools --ttl=extended");
     }
 
     // ── symlinks (init.d-style rc composition) ──────────────────────────

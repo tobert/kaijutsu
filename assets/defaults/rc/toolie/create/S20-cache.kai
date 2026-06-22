@@ -1,7 +1,1 @@
-# rc on-create cache breakpoints (docs/help/kj-cache.md).
-# Tools array is fixed per session → 1h cache.
-# System prompt may shift on rc edits / model swaps → 5m.
-# --flag=value because the kj tool schema does not declare these flag
-# names; bare --flag args otherwise parse as bool flags in kaish.
-kj cache add --target=tools  --ttl=extended
-kj cache add --target=system --ttl=ephemeral
+/etc/rc/lib/create/S20-cache.kai

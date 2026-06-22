@@ -158,13 +158,23 @@ mod tests {
             "default/drift/S40-cache.kai",
             "coder/create/S00-stance.kai",
             "coder/create/S20-cache.kai",
+            // The init.d-style canonical bodies the per-type scripts link to.
+            "lib/create/S20-cache.kai",
+            "lib/create/S10-binding.kai",
         ] {
             assert!(read(dir.path(), rel).is_some(), "missing seed: {rel}");
         }
-        // Cache recipe content round-trips from the embedded asset.
-        assert!(read(dir.path(), "default/create/S20-cache.kai")
+        // Cache recipe content lives once in lib/ (the canonical body)…
+        assert!(read(dir.path(), "lib/create/S20-cache.kai")
             .unwrap()
             .contains("kj cache add --target=tools"));
+        // …and the per-type copy is a seed symlink — its body is just the
+        // target path (ConfigCrdtFs reconstructs the link on seed; the legacy
+        // host-disk path writes the path string verbatim).
+        assert_eq!(
+            read(dir.path(), "default/create/S20-cache.kai").unwrap().trim(),
+            "/etc/rc/lib/create/S20-cache.kai"
+        );
     }
 
     #[test]
@@ -208,10 +218,16 @@ mod tests {
 
     #[test]
     fn seed_body_resolves_embedded_default() {
-        // A seeded path resolves to its embedded body…
-        let body = seed_body("/etc/rc/default/create/S20-cache.kai")
-            .expect("default cache seed must exist");
+        // The canonical cache body lives in lib/ …
+        let body = seed_body("/etc/rc/lib/create/S20-cache.kai")
+            .expect("lib cache seed must exist");
         assert!(body.contains("kj cache add --target=tools"));
+        // …and a per-type path's seed body is just the link target (a seed
+        // symlink — reconstructed into an actual link by ConfigCrdtFs::seed).
+        assert_eq!(
+            seed_body("/etc/rc/default/create/S20-cache.kai").unwrap().trim(),
+            "/etc/rc/lib/create/S20-cache.kai"
+        );
         // …and a path with no embedded seed is None (the `kj rc reset` guard).
         assert!(
             seed_body("/etc/rc/none/create/S00-noop.kai").is_none(),
