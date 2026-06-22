@@ -307,11 +307,21 @@ impl EmbeddedKaish {
     /// options (`ExecuteOptions::default()`), the kaish kernel falls back to
     /// the kernel-wide `request_timeout` set by this factory from
     /// `Kernel::timeouts().kaish_request_timeout`.
+    ///
+    /// Every call also parents the kaish kernel's execution span onto the
+    /// embedder's active OTel trace (W3C `traceparent`/`tracestate` pulled from
+    /// the current `tracing` span via [`kaijutsu_telemetry::inject_trace_context`])
+    /// so kernel spans are not orphaned. The wiring is a no-op when OTel is
+    /// inactive (empty carrier) or when a caller has already set its own
+    /// `traceparent` — see [`merge_trace_context`].
     pub async fn execute_with_options(
         &self,
         code: &str,
         opts: ExecuteOptions,
     ) -> Result<ExecResult> {
+        let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+        let context_id = self.context_id().map(|cid| cid.to_string());
+        let opts = merge_trace_context(opts, traceparent, tracestate, context_id);
         self.kernel.execute_with_options(code, opts).await
     }
 
@@ -475,10 +485,118 @@ impl EmbeddedKaish {
     }
 }
 
+/// Merge ambient W3C trace context (and a context-id baggage tag) into per-call
+/// `ExecuteOptions`.
+///
+/// `traceparent`/`tracestate` come from
+/// [`kaijutsu_telemetry::inject_trace_context`], which yields empty strings when
+/// no OTel context is active. The rules, mirroring the W3C spec and kaish's
+/// `ExecuteOptions` contract:
+///
+/// - **A caller-set `traceparent` is a full hand-off.** When `opts.traceparent`
+///   is already populated, the caller owns this call's telemetry context end to
+///   end; we touch nothing — not the parent, not baggage. No current caller does
+///   this (rc lifecycle and hook bodies build their own `opts` but leave
+///   `traceparent` unset, so they still get ambient context + baggage below); the
+///   branch reserves the seam for an embedder that threads an external trace.
+/// - **No ambient context is a true no-op.** An empty `traceparent` means OTel is
+///   inactive (or no span is entered); we add nothing — *including* baggage — so
+///   an OTel-off build never spuriously seeds a local trace root via baggage.
+/// - `tracestate` is meaningless without a `traceparent`, so it rides along only
+///   when we set the parent, and only if non-empty.
+/// - `context_id`, when present, is added as `kj.context_id` baggage so every
+///   downstream kaish span carries the kaijutsu context it ran for. We don't
+///   clobber an existing entry.
+fn merge_trace_context(
+    mut opts: ExecuteOptions,
+    traceparent: String,
+    tracestate: String,
+    context_id: Option<String>,
+) -> ExecuteOptions {
+    // The caller owns its telemetry context — hands off entirely (incl. baggage).
+    if opts.traceparent.is_some() {
+        return opts;
+    }
+    // No ambient context (OTel inactive) — stay a true no-op.
+    if traceparent.is_empty() {
+        return opts;
+    }
+    opts.traceparent = Some(traceparent);
+    if !tracestate.is_empty() {
+        opts.tracestate = Some(tracestate);
+    }
+    if let Some(cid) = context_id {
+        opts.baggage.entry("kj.context_id".to_string()).or_insert(cid);
+    }
+    opts
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::block_store::shared_block_store;
+
+    const TP: &str = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+    const TS: &str = "vendor=value";
+
+    #[test]
+    fn merge_trace_context_no_ambient_is_noop() {
+        // OTel inactive → inject yields empty strings → nothing is touched,
+        // including baggage. The execution path must stay a true no-op.
+        let opts = merge_trace_context(
+            ExecuteOptions::default(),
+            String::new(),
+            String::new(),
+            Some("ctx-123".to_string()),
+        );
+        assert!(opts.traceparent.is_none());
+        assert!(opts.tracestate.is_none());
+        assert!(opts.baggage.is_empty());
+    }
+
+    #[test]
+    fn merge_trace_context_sets_parent_state_and_baggage() {
+        let opts = merge_trace_context(
+            ExecuteOptions::default(),
+            TP.to_string(),
+            TS.to_string(),
+            Some("ctx-123".to_string()),
+        );
+        assert_eq!(opts.traceparent.as_deref(), Some(TP));
+        assert_eq!(opts.tracestate.as_deref(), Some(TS));
+        assert_eq!(opts.baggage.get("kj.context_id").map(String::as_str), Some("ctx-123"));
+    }
+
+    #[test]
+    fn merge_trace_context_respects_caller_parent() {
+        // A caller that already set a traceparent keeps it untouched, and we
+        // don't smuggle baggage in behind their back.
+        let caller = ExecuteOptions::default().with_traceparent("caller-parent");
+        let opts = merge_trace_context(
+            caller,
+            TP.to_string(),
+            TS.to_string(),
+            Some("ctx-123".to_string()),
+        );
+        assert_eq!(opts.traceparent.as_deref(), Some("caller-parent"));
+        assert!(opts.tracestate.is_none());
+        assert!(opts.baggage.is_empty());
+    }
+
+    #[test]
+    fn merge_trace_context_empty_tracestate_omitted() {
+        // tracestate is meaningless without a parent and absent when the SDK
+        // produced none — set the parent, leave tracestate unset.
+        let opts = merge_trace_context(
+            ExecuteOptions::default(),
+            TP.to_string(),
+            String::new(),
+            None,
+        );
+        assert_eq!(opts.traceparent.as_deref(), Some(TP));
+        assert!(opts.tracestate.is_none());
+        assert!(opts.baggage.is_empty());
+    }
 
     #[tokio::test]
     async fn test_embedded_kaish_creation() {
@@ -490,6 +608,25 @@ mod tests {
 
         let kaish = kaish.unwrap();
         assert_eq!(kaish.name(), "test-kernel");
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_options_feeds_stdin() {
+        let blocks = shared_block_store(kaijutsu_types::PrincipalId::system());
+        let kernel = Arc::new(KaijutsuKernel::new_ephemeral("test-stdin").await);
+        let kaish = EmbeddedKaish::new("test-stdin", blocks, kernel, None).unwrap();
+
+        // `cat` with no operands reads stdin; the embedder seam (`with_stdin`)
+        // must feed it through, and the trace-context wrapper must not drop it.
+        let result = kaish
+            .execute_with_options("cat", ExecuteOptions::default().with_stdin("piped-in\n"))
+            .await
+            .unwrap();
+        assert_eq!(
+            result.text_out().trim(),
+            "piped-in",
+            "stdin from ExecuteOptions::with_stdin should reach the first reader",
+        );
     }
 
     #[tokio::test]

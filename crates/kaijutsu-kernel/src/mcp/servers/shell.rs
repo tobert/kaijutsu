@@ -39,6 +39,13 @@ use super::super::types::{InstanceId, KernelCallParams, KernelTool, KernelToolRe
 pub struct ShellParams {
     /// kaish command to run in your current kernel context.
     pub command: String,
+    /// Optional standard input fed to the first stdin-reading command in
+    /// `command` (e.g. `jq '.name'`, `grep foo`, `patch`). Lets you pipe a
+    /// payload you already have — a generated document, a block's text — into a
+    /// pipeline without first writing a temp file. A command that reads no
+    /// stdin ignores it.
+    #[serde(default)]
+    pub stdin: Option<String>,
 }
 
 const DESCRIPTION: &str = "Run a command in your current kernel context using \
@@ -203,8 +210,12 @@ impl McpServerLike for ShellServer {
         }
         .map_err(|e| McpError::Protocol(format!("materialize context shell: {e}")))?;
 
+        let mut opts = kaish_kernel::ExecuteOptions::default();
+        if let Some(stdin) = parsed.stdin {
+            opts = opts.with_stdin(stdin);
+        }
         let result = kaish
-            .execute_with_options(&parsed.command, kaish_kernel::ExecuteOptions::default())
+            .execute_with_options(&parsed.command, opts)
             .await
             .map_err(|e| McpError::Protocol(format!("shell execution failed: {e}")))?;
 
