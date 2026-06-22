@@ -11,15 +11,17 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
 The pass that reframed kaijutsu as an instrument, rewrote the rc create-stances,
 and renamed `composer→musician` / `explorer→toolie` left these threads open:
 
-- **Shared synth ethos is duplicated inline.** `coder`/`director`/`mcp` stances
-  each carry the collaborator ethos. Two composition mechanisms now exist to lift
-  it into one shared fragment: (1) a `.kai` that `cat`s a shared file and emits a
-  block (`kj block create --role system --kind text`) — best for model-variant
-  logic, already proven by the `coder` stance; (2) **rc symlinks** (init.d-style)
-  — `ln -s /etc/rc/lib/create/S00-ethos.md /etc/rc/coder/create/S00-ethos.md`
-  shares a *static* fragment with no script. `ConfigCrdtFs` supports symlinks and
-  `load_rc_scripts`/`kj rc list`/`show` follow them (shipped 2026-06-22). Use the
-  symlink for a verbatim shared fragment, the `.kai` when content must branch.
+- **rc DRY — whole-file done, stance-fragment deferred (2026-06-22).** The
+  duplicated whole-file scripts (3 cache bodies × 5 types, broad binding ×3) are
+  now single canonical bodies under a `lib` context_type, composed in by
+  init.d-style symlinks (`ConfigCrdtFs` follows; seed format = a seed file whose
+  body is just a target path; `kj rc` is link-aware). What's *not* done:
+  factoring the shared collaborator ethos out of the `coder`/`director`/`mcp`
+  stances — assessed and **dropped**, the reframe made those genuinely distinct
+  voices with only faint shared sentiment, not a verbatim block worth a fragment.
+  If a real shared stance fragment emerges later, the mechanisms exist: a symlink
+  for a verbatim fragment, or a `.kai` that `cat`s a shared file and emits a block
+  when content must branch on the bound model (proven by the `coder` stance).
 - **Toolie taxonomy:** today's `toolie` is the read-only kind (kaibo-explorer
   style). Add a second, Edit-capable toolie that does bounded editing work —
   distinct binding + stance.
