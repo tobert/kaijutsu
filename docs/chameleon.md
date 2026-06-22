@@ -108,7 +108,7 @@ band owns time — the transport (拍子木) does.
   - **Thin fork = rc-rebuilds.** A player is spawned by a `spawn`-preset fork
     (`kj fork --preset spawn` per the 2026-06-12 fork-filters design,
     `docs/fork-filters.md`; formerly `--shallow`) that keeps ~nothing; the
-    child's `composer/fork/` rc re-establishes
+    child's `musician/fork/` rc re-establishes
     setup (stance/chart/patch-sheet — already declarative) and arms itself
     (`kj transport ooda on --context <child>`; parent disarms — pure rc, the
     verb already takes `--context`). Carrying recent notation into the child is
@@ -258,7 +258,7 @@ Rust side is a *minimal mechanism*; the *policy* lives in rc. As built:
   (never hide context behind a broken marker).
 - **Durable policy** — a per-context `context_hydration` table (`marker` =
   `BlockId::to_key()`, `window_size`); accessors `set/get/clear_hydration_policy`.
-  Absent row = hydrate everything (every non-composer context, untouched).
+  Absent row = hydrate everything (every non-musician context, untouched).
 - **Mailbox rebuild** — `ConversationMailbox::rehydrate_windowed` rebuilds the
   windowed view each turn (a sliding tail can drop a block, which the append-only
   `catch_up` can't express; bounded to prefix + window). The `[0, marker]`
@@ -270,7 +270,7 @@ Rust side is a *minimal mechanism*; the *policy* lives in rc. As built:
   bounds cold-start hydration as well as steady state (restart is a non-event).
 - **Surface** — `kj context hydrate [<ctx>] --window <N> [--mark <block>] |
   --clear` (Operator-gated); the marker defaults to the current tail. The
-  composer `create` rc (`S30-hydrate.kai`) sets `--window 16` once at birth —
+  musician `create` rc (`S30-hydrate.kai`) sets `--window 16` once at birth —
   policy in rc, the self-introspection-kernel pattern.
 
 **The tail slides in memory; the row is upserted only at create + on a durable
@@ -307,7 +307,7 @@ comes with the producer). **(b)** Windowing bounds *tokens*, not *RAM/disk* —
 cold start still loads the full log to window it — but **accumulation is fine**
 (storage is cheap; rotation-for-space is dropped — see the rotation reframe
 below). **(c)** `window` counts **blocks**, not
-turns/phrases (~2-3 blocks per OODA turn). **(d)** the composer's S20 cache
+turns/phrases (~2-3 blocks per OODA turn). **(d)** the musician's S20 cache
 breakpoints sit at message indices that windowing shifts — harmless for the
 local bass (no prompt cache), to reconcile when API-model chairs join.
 
@@ -372,7 +372,7 @@ Rotation invariants:
   *musically* invisible (one slow turn, no uncovered dropped beat).
   Re-hydration byte drift is real but harmless — one-time miss, then warm
   (known sources: `tool_use_id` fallback to `block.id.to_key()` at
-  hydrate.rs:161; rc-fork block injection — composer fork rc should stay
+  hydrate.rs:161; rc-fork block injection — musician fork rc should stay
   lean). Measure, don't guess: rulers track turn-after-rotation latency +
   fallback-fire-on-rotation; revisit the continuation fork only if cadence
   must rise to where warmups bite.

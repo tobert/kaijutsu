@@ -213,7 +213,7 @@ owning the cut edges of any keep-set:
 
 Consumers: hydrate (`rehydrate_windowed`), fork selection, the pull
 primitive. This absorbs the two review P1s (tool-pair tail snap, archive
-seam) — they were "latent until composer gets tools" for hydration, but
+seam) — they were "latent until musician gets tools" for hydration, but
 **hand-cut ranges make them reachable immediately**, which is why the
 seam module is *first* in the build order.
 

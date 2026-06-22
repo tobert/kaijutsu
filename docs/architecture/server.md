@@ -6,7 +6,7 @@ Code is truth; verified 2026-06-16.*
 
 `kaijutsu-server` is the only process that holds a live `Kernel`. It authenticates
 SSH clients, multiplexes many RPC sessions onto the one shared kernel, streams LLM
-tokens into CRDT blocks, drives the composer beat loop, and persists SSH identity.
+tokens into CRDT blocks, drives the musician beat loop, and persists SSH identity.
 
 ---
 
@@ -94,7 +94,7 @@ publishes `TurnFlow::Completed { output_block_id }` for autonomous turns.
 ## Beat scheduler (`src/beat.rs`)
 
 `BeatScheduler` (`:261`) is a server-lifetime task on its own OS thread, driving
-composer contexts' hyoushigi timelines. A min-heap of `(Instant, ContextId)`, a
+musician contexts' hyoushigi timelines. A min-heap of `(Instant, ContextId)`, a
 `BeatCommand` ingress channel, and a `TurnFlow::Completed` subscription. Commands:
 Arm, Play, Pause, Stop, SetTempo, SetOoda, SetRotate, Disarm. `STEP = TickDelta(1)`
 — the playhead is **event-counted, never wall-clock-scaled** (freeze = pause,

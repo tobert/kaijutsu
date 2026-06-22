@@ -277,7 +277,7 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   DAG edge — i.e. does a director created this way see what it needs to coordinate,
   or start blank? (c) should `kj fork --type <T>` exist (fork history + run the
   *target* type's create/fork bundle) for the common "branch this work into a
-  director/explorer" move? Surfaced while standing up a `director` context to
+  director/toolie" move? Surfaced while standing up a `director` context to
   experiment with coordination.
   - *Reconfirmed 2026-06-17: the child's block log was its own rc output (`system/text` stance,
     `system/notification` tool-adds, S10/S20 rc traces) plus the seed
@@ -347,8 +347,8 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
     report describes **should fail loud within 30s at HEAD**. `TimeoutPolicy` is
     kernel-wide (`kaijutsu-types/src/timeout.rs`); per-model/per-context overrides
     are the open knob if 30s/300s ever prove wrong for a slow local model.
-  - *The trigger was also removed* — the composer/player rc loadout is now tool-free
-    (see "Composer `kj` loadout — tool-free" under Hyoushigi), so small players no
+  - *The trigger was also removed* — the musician/player rc loadout is now tool-free
+    (see "Musician `kj` loadout — tool-free" under Hyoushigi), so small players no
     longer get the full palette that provoked the stall.
   - **Residual (small, genuinely unguarded):** (a) the `provider.stream()` start
     `.await` (`llm_stream.rs:815`) has retry/backoff but **no explicit timeout** — a
@@ -402,7 +402,7 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   compounding factors: (1) the MCP subscribed to block events **kernel-wide**
   (`BlockEventFilter::default()`, `context_ids` empty = all contexts), firehosing
   it with every other context's events after a restart (cold-start re-hydration +
-  app's director/composer/drift traffic); (2) every delivered event woke the shell
+  app's director/musician/drift traffic); (2) every delivered event woke the shell
   poll's `find_terminal`, which called `blocks_ordered()` (the `order_key().to_string()`
   per-block re-sort, see the perf entry below) under the lock; (3) `from_sync_state`
   replays the full op-log synchronously on that same thread (register_session +
@@ -424,7 +424,7 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   `rpc_integration`/`context_sync` green. **Live verification 2026-06-17:** after a
   server+app rebuild/restart, `echo hi` (257ms) and `kj context list --tree` (285ms,
   was the 300s-timeout command) and sequential calls all returned `status: "done"`
-  against a *busy* 24-context kernel (running composers + THE_DIRECTOR ⇒ live
+  against a *busy* 24-context kernel (running musicians + THE_DIRECTOR ⇒ live
   foreign-context event flow) — the original symptom is gone. Note this exercised
   the **server fix (`SubscriberHealth`) + the OLD MCP client** (this session's MCP
   binary predates the build), so fix (1) — the load-bearing one — is verified live;
@@ -569,10 +569,10 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   handling in `midi.rs:261-274` is the acceptance spec.
 - **ABC layout:** Linear duration spacing (needs Gould spacing/justification), system bracket/brace, closed-score layout.
 
-## Hyoushigi / Composer
+## Hyoushigi / Musician
 
-- **Composer `kj` loadout — tool-free (2026-06-13).** `composer` seeds
-  `assets/defaults/rc/composer/create/S10-binding.kai` granting only `drive`:
+- **Musician `kj` loadout — tool-free (2026-06-13).** `musician` seeds
+  `assets/defaults/rc/musician/create/S10-binding.kai` granting only `drive`:
   no `builtin.*` tool instances, no `facade:shell`/`submit_input`, no
   `fork`/`drift`/`transport`/`operator`. A player is an ABC-only voice — its
   turn text *is* the score (`on_turn_completed` eager-parses it), so it needs no
@@ -602,19 +602,19 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   for a track with a last-good tune, prepend that track's last-good header
   before validating/deriving. Pairs with the decouple above (a per-content-type
   "complete the fragment" step).
-- **Composers are not re-armed on kernel cold-start (fail-silent).** Auto-arm
+- **Musicians are not re-armed on kernel cold-start (fail-silent).** Auto-arm
   fires only on context *create* (`create_context_inner` / kj `context_create`,
   via `BeatCommand::Arm`); the beat scheduler starts with an empty `armed` map
-  on restart and nothing re-arms existing composer contexts from the DB. So a
-  kernel restart silently stops every composer's beat until it is re-created —
+  on restart and nothing re-arms existing musician contexts from the DB. So a
+  kernel restart silently stops every musician's beat until it is re-created —
   and there is no `kj transport arm` verb to recover (only play/pause/stop/
-  tempo/ooda/rotate, all no-ops on an un-armed context). Re-arm live composers
-  on cold start (scan `context_type = composer`, `Arm` each, seeding the
+  tempo/ooda/rotate, all no-ops on an un-armed context). Re-arm live musicians
+  on cold start (scan `context_type = musician`, `Arm` each, seeding the
   playhead from max committed tick as the create path does). Adjacent to
   `tech_debt_peer_reattach_on_reconnect` (restart-recovery gaps).
 - **Cadence/tempo should be settable per context:** `kj transport tempo <bpm>`
   exists, but the OODA cadence (`ooda_every`, default 8 phrases = 128 beats) is
-  fixed in `BeatPolicy::composer_default()`. Make the cadence a settable knob
+  fixed in `BeatPolicy::musician_default()`. Make the cadence a settable knob
   (rc-declared and/or a `kj transport` arg), persisted per context. Fine to do
   later. (Until then, a high BPM via `kj transport tempo` shrinks the wall-clock
   per OODA turn for testing — 128 beats @ 1000 BPM ≈ 7.7 s.)
@@ -631,13 +631,13 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   denomination awkward.
 - **Transport surface beyond `kj`:** app transport buttons / spacebar + a capnp
   transport surface (today `kj transport play|pause|stop|tempo|ooda` only).
-- **Re-arm-on-restart sweep unwired:** a kernel restart resets composers to
+- **Re-arm-on-restart sweep unwired:** a kernel restart resets musicians to
   stopped and does *not* re-arm them — the only `BeatCommand::Arm` sender is
   `createContext` (`rpc.rs`). The seeding half is **done** (Chameleon batch 1, F1):
   `arm` now reads `max_tick(ctx)` and seeds the playhead inside `arm_timeline`'s
   `or_insert_with`, virgin-only (a non-virgin `seed_playhead` is `Err`), so re-arm
   is safe whenever wired. Remaining: an actual restart sweep that re-arms persisted
-  composers. (No archive RPC yet → disarm-on-archive also TODO.) **This is one
+  musicians. (No archive RPC yet → disarm-on-archive also TODO.) **This is one
   work item with `BeatPolicy` persistence (Chameleon batch 1, F2):** policy
   (`beats_per_phrase`, `ooda_every`, period) and `beat_count` all evaporate on
   restart, but persisting them alone is useless because nothing re-arms contexts
@@ -667,7 +667,7 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   "fork drops the hydration policy" — see the "Players are rc programs" decision
   in `docs/chameleon.md`. A player is spawned by a `spawn`-preset fork
   (`kj fork --preset spawn` per `docs/fork-filters.md`; formerly `--shallow`)
-  that keeps ~nothing; the child's `composer/fork/` rc re-establishes setup and
+  that keeps ~nothing; the child's `musician/fork/` rc re-establishes setup and
   re-runs `kj context hydrate --window N` (mirror of `create`, marker defaults
   to the child's tail). Because the child is thin, re-anchoring at the tail is
   cheap and correct — which is *why* we dropped the alternative (copy the row /
@@ -675,15 +675,15 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   thin child makes the naive re-anchor right, so the read surface isn't needed
   for fork. (We considered it; the thin fork dissolved the need.) What this
   needs, sequenced:
-  - **Lock now (small):** `composer/fork/S30-hydrate.kai` (rebuild + re-mark)
-    and confirm a composer fork is thin. `kj transport ooda on|off --context`
+  - **Lock now (small):** `musician/fork/S30-hydrate.kai` (rebuild + re-mark)
+    and confirm a musician fork is thin. `kj transport ooda on|off --context`
     already exists, so transport-follow (arm child / disarm parent) is pure rc.
   - **Rotate action rc (unwritten):** the scheduler-side detach-at-horizon
     trigger is built — `BeatCommand::SetRotate{ctx, every_phrases}` +
     `kj transport rotate --every N | off`; at a phrase horizon (`phrase % N == 0`)
     `fire_due` `stop`s the parent synchronously (no further ticks) and fires the
     `rotate` rc lifecycle. Still unwritten: the rotate ACTION itself, a
-    `composer/rotate/*.kai` that forks `--preset spawn` + arms the child. Race-free
+    `musician/rotate/*.kai` that forks `--preset spawn` + arms the child. Race-free
     when it lands (the parent is already stopped). (The ordering race that forced
     the trigger into Rust rather than pure rc is closed by this synchronous stop.)
   - **Build when convenient — the windowed-notation pull primitive.** No
@@ -694,12 +694,12 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
     archive). Strong signal it's the right primitive; keeps the carry in rc.
   - **Defer — horizon self-fork-rotate (page-turns / song sections).** The
     player self-`kj fork --preset spawn`s on a phrase horizon; fork-lineage becomes
-    song form. Two trigger forms: **(a)** a `composer/tick/SXX-rotate.kai` that
+    song form. Two trigger forms: **(a)** a `musician/tick/SXX-rotate.kai` that
     fires every tick (`$PHRASE` is seeded) and acts only at the horizon
     (`phrase mod N == 0`) — **NOT zero new machinery after all** (see the verified
     ordering race above: the rc disarm is async, so pure-rc rotation leaks stray
     parent ticks); the horizon trigger must be scheduler-side Rust
-    (`RotateOnPhrase`), with `composer/fork/` doing only the rebuild; **(b) later**
+    (`RotateOnPhrase`), with `musician/fork/` doing only the rebuild; **(b) later**
     a declarative "fire script at tick T" timeline scheduler riding
     `schedule_abc_cell`'s rails, worth building once the producer schedules more
     than rotates (section/tempo/dynamics events — clear second consumers). Not
@@ -751,7 +751,7 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
     "interrupted" result every turn forever) and the missing archive seam
     (prefix+tail concatenate with no "[N blocks archived]" signal; cross-gap
     `Model/Text` fragments can merge into false continuity) were "latent
-    until composer gets tools" as hydration bugs — but fork-filters' hand-cut
+    until musician gets tools" as hydration bugs — but fork-filters' hand-cut
     ranges make both reachable immediately. One first-class module owns every
     keep-set cut edge: turn-boundary snapping (never start an interval on
     `ToolResult`/`Model`-continuation), synthetic user-role seam injection
@@ -759,11 +759,11 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
     `rehydrate_windowed`, fork selection, the pull primitive. Contract in
     `docs/fork-filters.md`.
   - **`window` counts RAW blocks, not turns/phrases** (~2-3 blocks per OODA turn,
-    and composer score/Trace blocks are hydration-silent so the *visible* tail is
+    and musician score/Trace blocks are hydration-silent so the *visible* tail is
     smaller still) — revisit if a phrase/turn-denominated window reads cleaner.
-  - **Cache-breakpoint ↔ window interaction** — the composer's S20 cache
+  - **Cache-breakpoint ↔ window interaction** — the musician's S20 cache
     breakpoints sit at message indices that windowing shifts; harmless for the
-    local bass (no prompt cache; composer sets no breakpoints today so the
+    local bass (no prompt cache; musician sets no breakpoints today so the
     byte-stable prefix is inert), reconcile when API-model chairs join.
 - **Optional rc-driven last-good rehydration on arm:** after restart every
   track's engine history is empty → `UseLastGood` → Skip → **silence until the
@@ -785,29 +785,29 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   dev rather than silently stalling the beat under the lock.
 - **In-RAM committed `Vec` / RAM-CAS unbounded growth (Chameleon batch 1, F2):**
   the timeline's committed `Vec` and RAM CAS grow without bound for a long-armed
-  composer (every phrase appends). **Rotation is the answer** — the chameleon
+  musician (every phrase appends). **Rotation is the answer** — the chameleon
   rotation tick-continuity invariant retires old committed history into the
   durable block log + CAS and starts a fresh window — but it is not built. Until
   then a marathon set leaks RAM.
-- **Band track↔chair mapping source of truth:** composer-create derives a track
+- **Band track↔chair mapping source of truth:** musician-create derives a track
   from the context label (`TrackId::new`→`slugify`, hard-error on empty slug).
   Once a band config exists (multiple chairs on one timeline), decide where the
   track↔chair mapping lives — there is no registry today (track is self-describing
   on every block, by design).
 - **`played_by` collapses to `system()` — `who-played` provenance is degenerate
   (Chameleon batch 1, F2):** F1 §1.2 records "who played" as `BlockId.principal_id`,
-  meant to be the player's principal. But the composer turn's model-text output
+  meant to be the player's principal. But the musician turn's model-text output
   block is inserted under `PrincipalId::system()` (`llm_stream.rs` `StreamEvent::TextStart`,
   the standing model-text convention), and `on_turn_completed` (`beat.rs`) sets
   `played_by = b.id.principal_id` = `system()`. The OODA `tick` verb also fires
   under `system()` (`beat.rs::fire_tick`), so `TurnFlow::Completed.principal_id`
   carries `system()` too — reading it instead of the block author would NOT help.
   So every materialized score block is authored by `system()` (plus `PrincipalId::beat()`
-  for fallback repeats). **Harmless today** — one model per composer context, and
+  for fallback repeats). **Harmless today** — one model per musician context, and
   lanes key on `track`, not principal, so no correctness/collision issue (the
   per-principal seq lane just has a single `system()` writer). **Will mis-attribute**
   the moment multiple models share a context or we want to distinguish player from
-  transport. Not a one-liner: needs the composer turn to run (and author its
+  transport. Not a one-liner: needs the musician turn to run (and author its
   output) under a distinct per-player principal. Surfaced in the F2 adversarial
   review (deepseek+gemini, 2026-06-11); the two silent-failure bugs from that pass
   (resume parent-id from log tail; hydration-failure publishing no terminal event)
@@ -817,7 +817,7 @@ Organized by area. Keep entries terse — link to file:line when a pointer makes
   principals played each) once tracks are user-visible.
 - **Section-placement policy:** the OODA notation cell is scheduled a fixed
   **one phrase** ahead (`phrase_delta()`; `OODA_LEAD` is gone, Chameleon batch 1,
-  F2); a real composer wants musical placement (next section boundary, loop
+  F2); a real musician wants musical placement (next section boundary, loop
   region) and a richer `compute_basis`.
 - **`Midi` render variant + UI timeline:** `audio/midi` projects to `ContentType::Plain`
   today; add a `Midi` variant + renderer, and the scrubbable timeline render.

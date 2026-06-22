@@ -33,7 +33,7 @@ impl TrackId {
     /// truncate to 64. Returns None when the result is empty.
     /// Emits tracing::info when the slug differs from the input.
     pub fn slugify(label: &str) -> Option<Self>;
-    /// The single-lane composer's default chair until band config exists.
+    /// The single-lane musician's default chair until band config exists.
     pub fn solo() -> Self;  // "solo"
     pub fn as_str(&self) -> &str;
 }
@@ -129,7 +129,7 @@ seq_lanes: HashMap<PrincipalId, u64>,
 - `Kernel::arm_timeline(context_id, clock, seed: Tick)` (kernel.rs:627-640): seed applied **inside `or_insert_with`** on the freshly-constructed timeline (`.expect()` there — virgin by construction), so idempotent re-arm of a live timeline never re-seeds (preserves the "never clobber an open future" contract :620-622 and arm_is_idempotent, kernel hyoushigi/mod.rs tests).
 - New kernel-store helper `BlockStore::max_tick(&self, context_id) -> BlockStoreResult<Option<Tick>>` (beside `last_block_id`, kernel block_store.rs:693) — max over live blocks' ticks; arm is rare, a scan is fine.
 - `BeatScheduler::arm` (beat.rs:110-122) computes `documents.max_tick(ctx)` and passes it to `arm_timeline`. Correct under the shared-coordinate doctrine even when conversation inserts advanced the coordinate past the last beat: musical time is global and monotone per context (chameleon.md:195-198).
-- Interaction with `insert_from_snapshot`'s tick-derived placement (:820): post-§2.2 an unseeded playhead can no longer mis-SORT; seeding keeps the **semantic** tick honest (windowed reads, `$HEARD`, rotation). Both land together. Note: nothing re-arms composers after restart today (the only Arm sender is createContext, server rpc.rs:2648) — this design makes re-arm *safe whenever wired*; the re-arm sweep stays on the not-yet list (issues.md).
+- Interaction with `insert_from_snapshot`'s tick-derived placement (:820): post-§2.2 an unseeded playhead can no longer mis-SORT; seeding keeps the **semantic** tick honest (windowed reads, `$HEARD`, rotation). Both land together. Note: nothing re-arms musicians after restart today (the only Arm sender is createContext, server rpc.rs:2648) — this design makes re-arm *safe whenever wired*; the re-arm sweep stays on the not-yet list (issues.md).
 
 ## 5. Track threading
 
@@ -171,7 +171,7 @@ Constructors become `Cell::concrete(span, content, track, played_by)` / `Cell::d
 
 - `schedule_abc_cell` (kernel hyoushigi/mod.rs:123-147): gains `track: TrackId, played_by: PrincipalId` params; builds the Cell with them. TrackId being a validated newtype makes "reject an invalid track" structural — no unvalidated string can reach scheduling.
 - `materialize_committed` (kernel hyoushigi/mod.rs:255-304): delete `BlockId::new(ctx, beat(), *high_water as u64)` (:288) → `let block_id = blocks.reserve_block_id(context_id, cell.played_by)?;` and insert via `insert_from_snapshot_as(ctx, snapshot, after.as_ref(), Some(cell.played_by))` (:292-297, replacing `Some(PrincipalId::beat())`). Add `debug_assert_eq!(block_id.principal_id, cell.played_by)`. `high_water` keeps its name and its sole remaining meaning — the bridge watermark (count of committed cells materialized); its doc comment (:246-250) drops the "doubles as the seq" clause. Order-key agent suffixes now vary **per player** (insert_from_snapshot_as sets the doc principal, kernel block_store.rs:1184) — correct: the suffix is the replica tiebreak, not identity, and ordering never depends on it post-§2.2.
-- `BeatState` (beat.rs:54-66) gains `track: TrackId`; `BeatCommand::Arm` (kernel hyoushigi/mod.rs ~:74) gains `track: TrackId`. The composer create site (server rpc.rs:2648-2661) derives it: `TrackId::new(label).ok().or_else(|| TrackId::slugify(label))` — slugify is loud (tracing::info when it differs) and **hard-errors context creation when the slug is empty** (crash over a silent shared default). [User-level flag: see open calls, §9.]
+- `BeatState` (beat.rs:54-66) gains `track: TrackId`; `BeatCommand::Arm` (kernel hyoushigi/mod.rs ~:74) gains `track: TrackId`. The musician create site (server rpc.rs:2648-2661) derives it: `TrackId::new(label).ok().or_else(|| TrackId::slugify(label))` — slugify is loud (tracing::info when it differs) and **hard-errors context creation when the slug is empty** (crash over a silent shared default). [User-level flag: see open calls, §9.]
 - `on_turn_completed` (beat.rs:274-292): passes `st.track` and `played_by = b.id.principal_id` (the ABC block's author — already fetched at :282) into `schedule_abc_cell`. **Feedback-loop guard lands in this slice (judge-mandated one-liner):** after fetching the snapshot, `if b.track.is_some() || b.id.principal_id == PrincipalId::beat() { return; }` — never re-schedule a materialized block (or a legacy beat() block) as if it were a model's ABC. The full fix (carrying the turn's output block id on `TurnFlow::Completed`) is fork 2's call — explicit handoff: fork 2 should adopt `track.is_some()` as its discriminator or replace this guard wholesale, in one place.
 
 ## 6. Restart semantics (exact walk)
@@ -232,7 +232,7 @@ Run `cargo check` first to confirm the build is green (it is — do not carry th
 - **T9** `materialize_after_reload_mints_fresh_seq_no_duplicate` (kernel hyoushigi/mod.rs tests, beside bridge_materializes_committed_cell_into_block_and_cas :378): materialize one cell (persists a track block), drop_and_reload, fresh timeline + high_water=0, materialize again → Ok, seq = old max + 1. *Fails today with CrdtError::DuplicateBlock swallowed at beat.rs:234 — THE hazard test; written against phase-2/5 code, proves the fix is structural.*
 
 **Phase 4 — track types + engine (kaijutsu-types, kaijutsu-hyoushigi):**
-- **T10** `track_id_validation` (track.rs): accepts `bass`/`solo`/`a-1_x`; rejects empty, whitespace, >64, uppercase, spaces, unicode; `slugify("My Composer") == Some("my-composer")`, `slugify("🎵") == None`; serde-transparent round-trip. *Fails by absence.*
+- **T10** `track_id_validation` (track.rs): accepts `bass`/`solo`/`a-1_x`; rejects empty, whitespace, >64, uppercase, spaces, unicode; `slugify("My Musician") == Some("my-musician")`, `slugify("🎵") == None`; serde-transparent round-trip. *Fails by absence.*
 - **T11** `use_last_good_does_not_cross_tracks` (engine.rs, extend `deferred_at` helper :509 with track): track B commits at tick 5; track A schedules UseLastGood at tick 10 with empty A-history and misses (diverged basis, no budget) → NOTHING committed for A; B's content not duplicated under A. *The locked two-track cross-contamination test; fails (compile, then behavior — :437-447 is track-blind).*
 - **T12** `use_last_good_on_empty_track_resolves_to_skip`: single track, zero history, UseLastGood miss → committed stays empty, no panic, playhead passes. *Pins the locked empty-track→Skip decision (asserted nowhere today per recon).*
 - **T13** `emitted_cells_inherit_parent_track_and_played_by`: resolver emits a concrete sibling → absorbed cell carries parent's track + played_by; a deliberately mismatched emission triggers debug_assert (debug) / tracing::error (release, assert via log capture or a counter). *Compile-fail first.*
@@ -249,7 +249,7 @@ Run `cargo check` first to confirm the build is green (it is — do not carry th
 
 **Phase 6 — playhead seeding wiring (server):**
 - **T20** `arm_seeds_playhead_from_max_committed_tick` (beat.rs tests): pre-insert blocks with ticks to T; arm; playhead == T; first beat advances to T+1; re-arm of the live timeline does NOT re-seed. *Fails today (fresh Timeline starts at 0; beat.rs:110-122 never seeds).*
-- Implement: §4 kernel/server half (arm_timeline param, max_tick call, BeatCommand::Arm track + composer-create derivation).
+- Implement: §4 kernel/server half (arm_timeline param, max_tick call, BeatCommand::Arm track + musician-create derivation).
 
 **Phase 7 — budget + docs (procedure, not pass/fail):**
 - **T21** `cargo test -p kaijutsu-crdt bench_append_hot_path -- --ignored --nocapture` (block_store.rs:1524-1530) before and after — successor parse/encode + HashMap lane on the append path must hold the budget this bench was written for.
@@ -272,7 +272,7 @@ Run `cargo check` first to confirm the build is green (it is — do not carry th
 13. `crates/kaijutsu-kernel/src/block_store.rs` — NEW reserve_block_id(context_id, principal) (entry-lock pattern of :1171-1184); NEW max_tick(context_id) (beside :693); restore tests T8.
 14. `crates/kaijutsu-kernel/src/kernel.rs` :627-640 — arm_timeline gains seed: Tick, applied inside or_insert_with.
 15. `crates/kaijutsu-server/src/beat.rs` — BeatState.track + high_water comment (:54-66); arm :110-122 max_tick seed + track; on_turn_completed :274-292 guard + track/played_by params; tests T19/T20.
-16. `crates/kaijutsu-server/src/rpc.rs` — :2648-2661 composer create: TrackId from label (new/slugify, hard-error on empty slug), pass on Arm; :5961/:6074 capnp track write.
+16. `crates/kaijutsu-server/src/rpc.rs` — :2648-2661 musician create: TrackId from label (new/slugify, hard-error on empty slug), pass on Arm; :5961/:6074 capnp track write.
 17. `crates/kaijutsu-client/src/rpc.rs` — :1910/:2088 capnp track read; :2613 round-trip builder.
 18. `docs/hyoushigi.md`, `docs/issues.md` — per Phase 7.
 
@@ -282,5 +282,5 @@ Run `cargo check` first to confirm the build is green (it is — do not carry th
 
 **Flagged for Amy (do not block implementation start — phases 1-4 are unaffected):**
 1. **TrackId charset** `[a-z0-9_-]{1,64}` lowercase-only: loosening later is easy, tightening is breaking — confirm before the validator freezes (affects Phase 4).
-2. **Composer-create track derivation**: label → TrackId::new, else slugify (loud), else **hard-error createContext**. Alternative on the table: fixed "main" fallback with a warn (softer, but a silent-ish shared lane). Affects only the rpc.rs:2648 site (Phase 6).
+2. **Musician-create track derivation**: label → TrackId::new, else slugify (loud), else **hard-error createContext**. Alternative on the table: fixed "main" fallback with a warn (softer, but a silent-ish shared lane). Affects only the rpc.rs:2648 site (Phase 6).
 3. **Fork 2 handoff**: this slice's on_turn_completed guard is `track.is_some() || author == beat()`; fork 2 chooses to keep that discriminator or carry the output block id on TurnFlow::Completed — one decision, made once, there.

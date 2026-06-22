@@ -16,15 +16,15 @@ order over time*, where the next thing must be ready before the moment it's need
 
 - **Coding** — a turn goes in, a turn comes out, tools fire. Slow, and a human is
   usually waiting, so the clock can stop and wait too.
-- **Composing** — a "composer" context aware of an ongoing beat (synced to an external
+- **Composing** — a "musician" context aware of an ongoing beat (synced to an external
   MIDI clock), reactive to MIDI and environment events, taking turns that may be
   beat-driven. The beat does **not** wait for a model turn.
 - **Audio** — sample-rate content driven by hardware; the DAC never waits.
 
-Coding and audio are the two ends; the composer sits between them and is the reason
+Coding and audio are the two ends; the musician sits between them and is the reason
 hyoushigi exists as one engine rather than three special cases. It needs the LLM-turn
 reactivity of a coding context **and** the can't-stop-the-clock discipline of audio,
-at once. A design that serves only the easy end (coding) would not carry the composer;
+at once. A design that serves only the easy end (coding) would not carry the musician;
 a design that serves the hard end (audio) carries all three. So we design for the hard
 end and let the easy end use a dormant subset.
 
@@ -118,7 +118,7 @@ time that won't wait?**
 | Context | Clock driver | Can block? | Speculation |
 |---|---|---|---|
 | coding (human in loop) | agent events; a human waiting | **yes** | dormant — degenerates to optional prefetch |
-| composer | external MIDI clock / beat | **no** | load-bearing |
+| musician | external MIDI clock / beat | **no** | load-bearing |
 | audio | hardware DAC | **no** | mandatory, large lead times |
 
 When the clock can block, the playhead simply advances as resolves complete, *never*
@@ -127,7 +127,7 @@ the whole speculative apparatus sits idle. When the clock can't block, the resol
 content must be ready *before* the playhead arrives or the fallback fires — so it has to
 be staged ahead, against a predicted context, and squashed when the prediction breaks.
 
-This is why the composer is the hard, defining case. Its clock can't block (the beat
+This is why the musician is the hard, defining case. Its clock can't block (the beat
 marches) **and** its resolver is slow and expensive (an LLM turn, or synthesis). That is
 precisely the corner where speculation is neither optional nor cheap — and it's the only
 corner a coding-only design would never have to face.
@@ -260,9 +260,9 @@ prior art is *structural, not semantic*: blocks are already a synced, restart-su
 CRDT log, so materializing committed cells **as** blocks is cheap. The temporal schema
 over them — positions, lifecycle, the resolver dispatch — is the part we build.
 
-## The composer playhead: beat-aware, turn-reactive
+## The musician playhead: beat-aware, turn-reactive
 
-A composer context's playhead is driven by an **external beat** — your MIDI clock — and
+A musician context's playhead is driven by an **external beat** — your MIDI clock — and
 its turns are reactive: MIDI input, environment events, and sibling-context messages
 arrive and are quantized to the grid. A turn may be *beat-driven* (fire on a beat
 boundary) rather than on-demand. Because the beat won't wait for a model turn, the next
@@ -407,7 +407,7 @@ a kernel-owned task tagged with `ContextId`, scheduled and run by the kernel exa
 the virtual ticker. (A future read-only `jobs` projection into the context shell could
 *display* a context's kernel jobs/next-wakeups for debugging, without owning them there.)
 A durable, cross-beat background job — a synthesis that lives across many beats — is
-genuinely new surface and is deferred until the composer needs it.
+genuinely new surface and is deferred until the musician needs it.
 
 ### Clients run hyoushigi too
 
@@ -481,7 +481,7 @@ queryable and well-ordered, which is exactly what writing it into the block log 
   holding an optional human caption and `output` unchanged for structured shell
   rendering.
 - **Beat policy is derived from two bits, with one declared knob.** `!clock_can_block`
-  (composer, audio) → **quantize-and-stage**, mandatory. `clock_can_block && has_waiter`
+  (musician, audio) → **quantize-and-stage**, mandatory. `clock_can_block && has_waiter`
   (a human/sync RPC blocked on one answer) → **advance-now** — never hold a 5 ms answer
   to a 500 ms beat. `clock_can_block && !has_waiter` (autonomous/headless coding) → a
   **declared** policy that *defaults to advance-now*, opt into quantize when you want the
@@ -521,14 +521,14 @@ queryable and well-ordered, which is exactly what writing it into the block log 
 - **Beat cadence (the residue of beat policy).** The *policy* — quantize vs. advance-now
   — is settled above; what stays open is the tuning: the beat *period* per context, and
   whether sibling contexts can share one clock for ensemble drive. Both want the real
-  composer to tune against, and the cadence wants confirming against the autonomous-turn
+  musician to tune against, and the cadence wants confirming against the autonomous-turn
   FlowBus and the mailbox flush boundary.
 
 ## Sequencing
 
 The first proof is deliberately **not** the easy (coding) end. A coding context @ ~1 PPQ
 blocks, so it would build the whole speculative apparatus and never run it — shipping a
-speculation engine that has never speculated. So the first proof is a **composer-lite**
+speculation engine that has never speculated. So the first proof is a **musician-lite**
 context: the smallest thing whose clock *can't block*, so speculation, squash, and
 fallback are exercised by their first user.
 
@@ -550,7 +550,7 @@ fallback are exercised by their first user.
 > for resolves (the actual interval timer is the kernel/client integrator's job,
 > keeping the crate runtime-agnostic).
 >
-> **Kernel integration (landed — the composer slice):** hyoushigi is no longer an
+> **Kernel integration (landed — the musician slice):** hyoushigi is no longer an
 > island. `kaijutsu-kernel` depends on it and owns a per-context `timelines`
 > registry (`arm_timeline`/`timeline`/`disarm_timeline`); `Resolver` gained a
 > `Send + Sync` bound so a timeline can be pumped from a scheduler thread. The
@@ -561,8 +561,8 @@ fallback are exercised by their first user.
 > (`hyoushigi::materialize_committed`): committed cell → durable CAS → ticked
 > `BlockSnapshot` → `insert_from_snapshot` (now tick-aware: `order_key` derives
 > from the cell's beat coordinate). Materialized cells are authored by
-> `PrincipalId::beat()`. The **`tick` rc verb** is wired; the **composer**
-> `context_type` ships (`assets/defaults/rc/composer/` stance + binding + cache +
+> `PrincipalId::beat()`. The **`tick` rc verb** is wired; the **musician**
+> `context_type` ships (`assets/defaults/rc/musician/` stance + binding + cache +
 > `tick/S10-drive.kai`), is armed on create, and on its coarse OODA cadence (32
 > bars @ 120 BPM default) fires the `tick` verb (`kj drive`) to request the next
 > turn. (The first production `Resolver` was `abc_to_midi`, crystallizing
@@ -571,7 +571,7 @@ fallback are exercised by their first user.
 > into a **shared per-context coordinate** (ties allowed; `BlockId` is the unique
 > row id), correcting the earlier "Some only for materialized cells" framing.
 >
-> **Transport + closed OODA loop (landed):** the scheduler is the composer's
+> **Transport + closed OODA loop (landed):** the scheduler is the musician's
 > **transport**, with two independent switches — the **clock** (`play`/`pause`/
 > `stop`) and the **OODA-arm** — driven by `kj transport play|pause|stop|tempo
 > <bpm>|ooda <on|off>` (→ `BeatCommand` over the kernel ingress). The context tick
@@ -582,10 +582,10 @@ fallback are exercised by their first user.
 > happened." Contexts arm **stopped** on create (and after restart) — no surprise
 > token spend; explicit `play` starts. There is **no rewind** (the playhead is
 > forward-only; revisiting the past is an *export* of committed content, not a
-> seek). The OODA loop is closed: on `turn.completed` for an OODA-armed composer
+> seek). The OODA loop is closed: on `turn.completed` for an OODA-armed musician
 > the scheduler reads the model's ABC block, stores it to CAS, and
 > `schedule_abc_cell`s a notation cell **one phrase ahead** (F2; was a fixed bar
-> ahead) — so a played composer turns model output into committed notation, and
+> ahead) — so a played musician turns model output into committed notation, and
 > the write barrier derives the MIDI sibling, on the beat, end to end.
 >
 > **Not yet:** the UI timeline render + transport buttons/spacebar + a capnp
@@ -633,7 +633,7 @@ fallback are exercised by their first user.
 > batch-2's hydration marker subsumes it). Derivation runs in **≲1 ms** at the
 > barrier (measured: ~300 µs release, ABC parse + `to_midi` + CAS + two inserts);
 > anything heavier (midi→pcm) stays a timeline resolver, never a deriver. The
-> timebase policy now speaks **`beats_per_phrase`** (`composer_default` = 16,
+> timebase policy now speaks **`beats_per_phrase`** (`musician_default` = 16,
 > `ooda_every` = 8×16 = 128 beats); `phrase_delta()`/`is_phrase_boundary()` are
 > the only consumers, and `OODA_LEAD` is gone — turns schedule **one phrase
 > ahead**. **Restart safety landed in-slice:** per-principal seq lanes seed from
@@ -653,11 +653,11 @@ fallback are exercised by their first user.
    questions get answered, not deferred: `order_key`-vs-`tick`, and `content`/`output`/
    `ContentType` vs. `ContentRef`. Single-writer to start, so the write-barrier-vs-CRDT
    problem is sidestepped (and gated before any collaborative timeline).
-4. **First proof — composer-lite.** A context driven by a minimal *internal* beat (no
+4. **First proof — musician-lite.** A context driven by a minimal *internal* beat (no
    external MIDI yet) whose playhead can't block, one `Resolver`, and a real
    speculate→commit-or-squash→fallback loop against a first `compute_basis`. This forces
    the hard core to actually run. Render the resulting timeline in the UI.
-5. **Real composer** — discipline the beat to an *external* MIDI clock, add the composer
+5. **Real musician** — discipline the beat to an *external* MIDI clock, add the musician
    `context_type` (rc scripts, tool policy), and a MIDI resolver via `kaijutsu-abc`.
 6. **Then the fast end** — audio drivers (hardware-clocked), and the distributed timebase
    for clients that need to follow a context's beat.

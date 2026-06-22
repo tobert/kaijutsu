@@ -46,7 +46,7 @@ art for the shared-tempo session clock: Ableton Link, MIDI clock.
 
   This is a **verb remap**: `BeatCommand::Pause` (clock hold) becomes the
   backing for `stop`; the `pause` verb stops sending BeatCommands entirely.
-  Sweep doc-comments (`kj/transport.rs:1-14`) and the composer rc loadout
+  Sweep doc-comments (`kj/transport.rs:1-14`) and the musician rc loadout
   when remapping.
 
 ## Architecture prep (ordered)

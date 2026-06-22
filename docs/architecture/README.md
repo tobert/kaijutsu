@@ -101,7 +101,7 @@ together:
 | Peers | `PeerRegistry` | Reverse-RPC callbacks (the Bevy app, external MCP) for `invoke_peer`. |
 | Blobs | `Arc<FileStore>` (CAS) | Content-addressed binary store (images, large payloads). |
 | KV | `Arc<Kv>` | Persistent CRDT key-value store (client current-context, etc.). |
-| Timelines | `DashMap<ContextId, SharedTimeline>` | Per-context hyoushigi beat engines (armed composer contexts only). |
+| Timelines | `DashMap<ContextId, SharedTimeline>` | Per-context hyoushigi beat engines (armed musician contexts only). |
 | Persistence | `KernelDb` (SQLite) | ~20 tables: contexts, edges, documents, oplog+snapshots, bindings, hooks, KV journal. |
 
 The kernel **does not run an LLM turn itself** — that is the server's job
@@ -202,7 +202,7 @@ The end-to-end path, prompt to pixels:
 8. **Render.** The Bevy app copies mirror blocks into per-block cells and renders
    each to its own GPU texture via the two-pass vello/MSDF pipeline.
 
-For **composer contexts** (the Chameleon music work), a second loop runs: the
+For **musician contexts** (the Chameleon music work), a second loop runs: the
 **beat scheduler** (`kaijutsu-server/src/beat.rs`) drives an event-counted
 playhead, fires the `tick` rc verb, requests a turn via `TurnFlow`, and on
 completion crystallizes the turn's output as an ABC cell one phrase ahead on the
