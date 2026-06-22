@@ -12,10 +12,14 @@ The pass that reframed kaijutsu as an instrument, rewrote the rc create-stances,
 and renamed `composer→musician` / `explorer→toolie` left these threads open:
 
 - **Shared synth ethos is duplicated inline.** `coder`/`director`/`mcp` stances
-  each carry the collaborator ethos. Lift it into one shared fragment composed by
-  a `.kai` (`kj block create --role system --kind text`) once the duplication
-  bites. The `coder` stance is already a `.kai` (branches on the bound model), so
-  the mechanism is proven.
+  each carry the collaborator ethos. Two composition mechanisms now exist to lift
+  it into one shared fragment: (1) a `.kai` that `cat`s a shared file and emits a
+  block (`kj block create --role system --kind text`) — best for model-variant
+  logic, already proven by the `coder` stance; (2) **rc symlinks** (init.d-style)
+  — `ln -s /etc/rc/lib/create/S00-ethos.md /etc/rc/coder/create/S00-ethos.md`
+  shares a *static* fragment with no script. `ConfigCrdtFs` supports symlinks and
+  `load_rc_scripts`/`kj rc list`/`show` follow them (shipped 2026-06-22). Use the
+  symlink for a verbatim shared fragment, the `.kai` when content must branch.
 - **Toolie taxonomy:** today's `toolie` is the read-only kind (kaibo-explorer
   style). Add a second, Edit-capable toolie that does bounded editing work —
   distinct binding + stance.
