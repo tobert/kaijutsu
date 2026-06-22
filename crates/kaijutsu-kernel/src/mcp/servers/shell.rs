@@ -48,25 +48,11 @@ pub struct ShellParams {
     pub stdin: Option<String>,
 }
 
-const DESCRIPTION: &str = "Run a command in your current kernel context using \
-    kaish (会sh), a Bourne-like shell with guardrails: no word splitting ($VAR \
-    is always one argument — use `split` to split), strict globs (zero matches \
-    is an error, not a silent pass-through), `case ... esac` instead of `test \
-    \"$x\" = ...`, and pre-validation (syntax errors are caught before anything \
-    runs, so a command never half-executes). `kj` is in scope for \
-    context/drift/fork management; builtins accept --json for structured \
-    output. Returns combined stdout (stderr appended when present); a nonzero \
-    exit code is reported as an error.";
+const DESCRIPTION: &str =
+    include_str!("../../../../../assets/defaults/prompts/shell-tool.md");
 
-const DESCRIPTION_READ_ONLY: &str = "Run a READ-ONLY command in your current \
-    kernel context using kaish (会sh). Same Bourne-like shell with guardrails \
-    (no word splitting, strict globs, `case ... esac`, pre-validation), but \
-    this shell cannot mutate anything: every file write/delete/move and every \
-    external command is refused. Use it to inspect — read files, `grep`, \
-    `find`, walk the tree, and read the CRDT document/input views under \
-    `/v/docs` and `/v/input`; `kj` is in scope for read-only context \
-    introspection. Returns combined stdout (stderr appended when present); a \
-    nonzero exit code is reported as an error.";
+const DESCRIPTION_READ_ONLY: &str =
+    include_str!("../../../../../assets/defaults/prompts/shell-readonly-tool.md");
 
 /// In-kernel broker server backing the `shell` / `read_only_shell` tool. Holds
 /// `Weak<Broker>` (the broker owns this instance's `Arc`) and reaches the
