@@ -48,6 +48,11 @@ pub struct EditorCore {
     store: Store<EmptyInfo>,
     group: CursorGroupId,
     viewport: ViewportContext<Cursor>,
+    /// True while modalkit's command-line / search bar (`:`, `/`, `?`) is
+    /// focused. That bar is a *separate* buffer we don't implement; its edit
+    /// actions must not touch the document (else the query text leaks in). Set
+    /// on `CommandBar(Focus)`, cleared when the prompt submits/aborts.
+    command_line: bool,
 }
 
 impl EditorCore {
@@ -68,6 +73,7 @@ impl EditorCore {
             store: Store::default(),
             group,
             viewport: ViewportContext::default(),
+            command_line: false,
         }
     }
 
@@ -107,11 +113,20 @@ impl EditorCore {
             let before = strip_one_trailing_newline(&self.buffer.get_text());
             self.machine.input_key(key);
             while let Some((action, ctx)) = self.machine.pop() {
-                if let Action::Editor(ea) = action {
-                    let ictx = (self.group, &self.viewport, &ctx);
-                    // Editing errors (e.g. motion off the end) are non-fatal vim
-                    // behavior, not corruption — drop them and keep the buffer.
-                    let _ = self.buffer.editor_command(&ea, &ictx, &mut self.store);
+                match action {
+                    // `:`/`/`/`?` focus the command-line/search bar — a separate
+                    // buffer we don't implement. Its subsequent edit actions are
+                    // meant for *that* buffer; applying them to the document is
+                    // the corruption bug. Suppress edits until the prompt closes.
+                    Action::CommandBar(_) => self.command_line = true,
+                    Action::Prompt(_) => self.command_line = false,
+                    Action::Editor(ea) if !self.command_line => {
+                        let ictx = (self.group, &self.viewport, &ctx);
+                        // Editing errors (e.g. motion off the end) are non-fatal
+                        // vim behavior, not corruption — drop them, keep the buffer.
+                        let _ = self.buffer.editor_command(&ea, &ictx, &mut self.store);
+                    }
+                    _ => {}
                 }
             }
             let after = strip_one_trailing_newline(&self.buffer.get_text());
@@ -323,14 +338,11 @@ mod tests {
         }
     }
 
-    /// KNOWN GAP (tracked in docs/vi.md): command-line (`:`) and search (`/`·`?`)
-    /// route through modalkit's prompt infrastructure we don't wire yet — and
-    /// today their query text *leaks into the buffer* (corruption, not just a
-    /// missing feature). This spec encodes the desired safe behavior (a no-op
-    /// until the prompt is wired) and fails until we guard prompt-mode keys.
+    /// Command-line (`:`) and search (`/`·`?`) route through modalkit's prompt
+    /// infrastructure we don't wire yet. They must be a safe no-op on the
+    /// document, not leak their query text into it. (Fixed: `EditorCore`
+    /// suppresses document edits while the command bar is focused.)
     #[test]
-    #[ignore = "known gap: prompt-initiating keys (: / ?) leak into the buffer; \
-                fix = swallow keys while the machine is in command-line/search mode"]
     fn command_line_keys_must_not_corrupt_the_buffer() {
         let mut ed = EditorCore::new("hello");
         ed.apply_keys(":d<CR>");
@@ -339,6 +351,10 @@ mod tests {
         let mut ed = EditorCore::new("hello world");
         ed.apply_keys("/wor<CR>");
         assert_eq!(ed.text(), "hello world", "an unhandled search must not edit the buffer");
+
+        // ...and normal editing must resume once the prompt closes (flag cleared).
+        ed.apply_keys("x");
+        assert_eq!(ed.text(), "ello world", "editing resumes after the command-line closes");
     }
 
     #[test]

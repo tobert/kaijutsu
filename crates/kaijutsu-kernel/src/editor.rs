@@ -125,8 +125,14 @@ struct EditorSession {
     target: EditorTarget,
     #[allow(dead_code)] // carried for save-to-disk of file docs (TBD) + diagnostics
     path: String,
-    /// Text as of the last open/save — the `ZQ` rollback target.
-    saved_text: String,
+    /// Normalized (terminator-stripped) content as of the last open/save — the
+    /// dirty/`ZQ` checkpoint. Matches `EditorCore`'s normalized view so dirty
+    /// compares like-to-like (a newline-terminated block opens clean).
+    saved_content: String,
+    /// The block's trailing terminator (`"\n"` or `""`) captured at open.
+    /// `EditorCore` strips modalkit's line terminator, so the terminator lives
+    /// here; edits mirror as diffs (never touching it) and `ZQ` re-applies it.
+    terminator: String,
 }
 
 /// The kernel's registry of open editor sessions.
@@ -155,9 +161,13 @@ impl EditorSessions {
         target: EditorTarget,
         blocks: &SharedBlockStore,
     ) -> Result<(EditorSessionId, EditorState), String> {
-        let text = block_text(blocks, &target)?;
-        let mut core = EditorCore::new(&text);
-        let state = state_of(&mut core, &text);
+        let raw = block_text(blocks, &target)?;
+        let mut core = EditorCore::new(&raw);
+        // EditorCore strips modalkit's terminator; keep the block's own
+        // terminator aside so dirty/rollback compare against the normalized view.
+        let terminator = if raw.ends_with('\n') { "\n" } else { "" }.to_string();
+        let saved_content = core.text();
+        let state = state_of(&mut core, &saved_content);
         let id = EditorSessionId(self.next_id);
         self.next_id += 1;
         self.sessions.insert(
@@ -166,7 +176,8 @@ impl EditorSessions {
                 core,
                 target,
                 path: path.to_string(),
-                saved_text: text,
+                saved_content,
+                terminator,
             },
         );
         Ok((id, state))
@@ -194,14 +205,14 @@ impl EditorSessions {
                 )
                 .map_err(|e| format!("editor keys: CRDT mirror failed: {e}"))?;
         }
-        let saved = session.saved_text.clone();
+        let saved = session.saved_content.clone();
         Ok(state_of(&mut session.core, &saved))
     }
 
     /// Current state of a session.
     pub fn state(&mut self, id: EditorSessionId) -> Result<EditorState, String> {
         let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
-        let saved = session.saved_text.clone();
+        let saved = session.saved_content.clone();
         Ok(state_of(&mut session.core, &saved))
     }
 
@@ -210,8 +221,8 @@ impl EditorSessions {
     /// file-doc disk flush is TBD (see `docs/vi.md` tech-debt sweep).
     pub fn save(&mut self, id: EditorSessionId) -> Result<EditorState, String> {
         let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
-        session.saved_text = session.core.text();
-        let saved = session.saved_text.clone();
+        session.saved_content = session.core.text();
+        let saved = session.saved_content.clone();
         Ok(state_of(&mut session.core, &saved))
     }
 
@@ -221,14 +232,17 @@ impl EditorSessions {
     /// checkpoint (last-writer w.r.t. concurrent peer edits — see `docs/vi.md`).
     pub fn quit(&mut self, id: EditorSessionId, blocks: &SharedBlockStore) -> Result<(), String> {
         let session = self.sessions.remove(&id).ok_or_else(|| no_session(id))?;
+        // Restore the normalized checkpoint *plus* the block's terminator, so a
+        // rollback never strips a trailing newline the block opened with.
+        let restore = format!("{}{}", session.saved_content, session.terminator);
         let current = block_text(blocks, &session.target)?;
-        if current != session.saved_text {
+        if current != restore {
             blocks
                 .edit_text(
                     session.target.context_id,
                     &session.target.block_id,
                     0,
-                    &session.saved_text,
+                    &restore,
                     current.chars().count(),
                 )
                 .map_err(|e| format!("editor quit: rollback failed: {e}"))?;
@@ -449,6 +463,29 @@ mod session_tests {
 
         // Rolls back to the *saved* checkpoint, keeping the saved edit.
         assert_eq!(block_text(&blocks, &target).unwrap(), "Xhello");
+    }
+
+    #[tokio::test]
+    async fn newline_terminated_block_opens_clean_and_quit_preserves_terminator() {
+        // modalkit's rope is line-terminated and EditorCore normalizes it away;
+        // the session must compare/roll back against the *normalized* view so a
+        // newline-terminated block opens clean (not spuriously dirty) and keeps
+        // its terminator through a quit-rollback.
+        let (blocks, target) = seeded(b"hello\n").await;
+        let mut sessions = EditorSessions::new();
+        let (id, st) = sessions.open(RC_PATH, target, &blocks).unwrap();
+        assert_eq!(st.text, "hello");
+        assert!(!st.dirty, "a newline-terminated block must open clean");
+
+        sessions.keys(id, "iX<Esc>", &blocks).unwrap();
+        assert_eq!(block_text(&blocks, &target).unwrap(), "Xhello\n");
+
+        sessions.quit(id, &blocks).unwrap();
+        assert_eq!(
+            block_text(&blocks, &target).unwrap(),
+            "hello\n",
+            "quit must restore content AND the trailing newline"
+        );
     }
 
     #[tokio::test]

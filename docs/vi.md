@@ -248,7 +248,7 @@ accept last-writer semantics for pass 1 and note it.
 1. ✅ `resolve_editor_target` (shipped, `editor.rs`).
 2. ✅ `kaijutsu-editor` crate: `EditorCore` + `EditOp`, built on modalkit. Pure
    unit tests (keys → ops + state). *Test layer 1.*
-3. Kernel editor-session registry + the `editor_*` surface.
+3. ✅ Kernel editor-session registry + the `editor_*` surface.
    - ✅ `EditorSessions` registry (`editor.rs`): open/keys/state/save/quit,
      keystrokes mirror onto the owning CRDT block, checkpoint-backed `ZQ`
      rollback. e2e lifecycle tests against a live block store. *Test layer 2.*
@@ -271,6 +271,35 @@ accept last-writer semantics for pass 1 and note it.
 
 ---
 
+## Picking up next session (state as of 2026-06-22)
+
+**Slice 1 is done, headless and green.** The whole editing increment is built and
+test-driven with no GUI: resolver → `kaijutsu-editor` `EditorCore` (pure modalkit
+vim) → kernel `EditorSessions` (mounted, `Send`-wrapped) → `kj editor` verbs. A
+model or a shell can drive a real vi session against any rc/config block *now*.
+**25 editor tests green** (14 in `kaijutsu-editor`, 11 in `kaijutsu-kernel`).
+
+Commits this session: `110bd95` resolver · `5383402` `EditorCore` · `e0b3ec3`
+session registry · `8ca5674` kernel mount · `bc11e2c` `kj editor` · `cf5e663`
+coverage battery · (this pass) corruption + trailing-newline fixes.
+
+**Fix pass complete** (the reason we paused before slice 2): both bugs the tests
+uncovered are fixed + pinned — prompt-key buffer corruption (`:`/`/` no longer
+leak) and trailing-newline consistency (newline-terminated blocks open clean,
+`ZQ` preserves the terminator). Dot-repeat (`.`) is a documented deferred no-op.
+
+**Next is step 4** (still kernel/headless): a `vi`/`edit` kaish builtin and
+making bare `kj rc edit <path>` (no `--content`) call `editor_open` instead of
+erroring (`kj/rc.rs:402`) — the ergonomic entry points. One open choice: whether
+step 4 also fires the `open_editor` peer signal now (only matters once the slice-2
+renderer exists) or just returns a session id for headless driving until then.
+
+**Then slice 2** — the app renderer (`Screen::Editor` + MSDF panel), on the
+runner. The renderer adds *no editing logic*; it renders `editor_state` and
+forwards keys. Deferred items live in the tech-debt sweep above.
+
+---
+
 ## Tech debt — sweep before "done"
 
 vi is not done until we circle back and clean up the scaffolding the build
@@ -289,28 +318,35 @@ working feature, but all of it blocks calling it finished**:
   submitting peer (risk #3) before multi-user.
 - **Any optimistic-mirror / latency hack** in the app renderer (if we add one)
   gets revisited once measured.
-- **Trailing-newline fidelity.** modalkit's `EditRope` is line-terminated, so
-  `EditorCore` can't tell `"hello"` from `"hello\n"`; it strips one terminator at
-  the boundary. The kernel binding must remember the loaded terminator and
-  re-apply on save (ties into the CRLF/hashline preservation concerns).
+- **Trailing-newline consistency — ✅ FIXED.** modalkit's `EditRope` is
+  line-terminated; `EditorCore` strips one terminator, and the **session** now
+  keeps the block's terminator aside (`EditorSession.terminator`) so dirty/
+  rollback compare against the normalized view: a newline-terminated block opens
+  clean and `ZQ` re-applies the terminator. Spec:
+  `newline_terminated_block_opens_clean_and_quit_preserves_terminator`. Residual
+  (deferred): full byte-fidelity for exotic/CRLF terminators ties into the
+  hashline/CRLF preservation work.
 - **`EditOp` granularity.** `apply_keys` emits one contiguous prefix/suffix diff
   per keystroke; a multi-site change (macro, multi-cursor) would need a richer
   diff. Fine for pass 1; revisit with multi-cursor.
-- **⚠ Prompt-key buffer corruption (real bug, not just a gap).** Command-line
-  (`:`) and search (`/`·`?`) route through modalkit's prompt infrastructure we
-  don't wire — and today their query text *leaks into the buffer* (`:d<CR>` →
-  `"dhello"`). This violates crash-over-corruption. Until the `:`/`/` surface is
-  built, swallow keys while the machine is in command-line/search mode. Spec
-  pinned: `kaijutsu-editor` `command_line_keys_must_not_corrupt_the_buffer`
-  (`#[ignore]` until fixed). Dot-repeat (`.`) is a plain no-op (safe), deferred.
+- **Prompt-key buffer corruption — ✅ FIXED.** `:`/`/`/`?` focus modalkit's
+  command-line/search bar (a separate buffer we don't implement); `EditorCore`
+  now suppresses document edits while that bar is focused (set on
+  `CommandBar(Focus)`, cleared on `Prompt(Submit|Abort)`), so an unwired
+  `:`/`/` is a safe no-op and editing resumes after. Spec:
+  `command_line_keys_must_not_corrupt_the_buffer`.
+- **Dot-repeat (`.`) — deferred (not corruption).** Produces no edit action in
+  our minimal modalkit setup (inert no-op). Wiring real `.` repeat needs
+  modalkit's last-edit-sequence machinery; revisit when the `:`/search surface
+  is built.
 
 ### Command surface the e2e covers (verified)
 
 `kaijutsu-editor`'s `coverage` test battery is the executable map: the e2e drives
 the full **normal-mode editing surface** headless — motions, operators, counts,
 linewise ops, inserts (`i`/`a`/`A`/`o`), registers (yank→paste), **undo `u` +
-redo `<C-r>`**, visual-mode + operator, find-char. *Not* covered (and corrupting,
-above): `:` ex-commands, `/`·`?` search; (`.` dot-repeat is an inert no-op).
+redo `<C-r>`**, visual-mode + operator, find-char. *Not yet* wired (safe no-ops
+now, not corruption): `:` ex-commands, `/`·`?` search, `.` dot-repeat.
 
 Mirror the live items into `docs/issues.md` (the backlog/pressure-valve) as they
 appear, and delete them here + there when they ship.
