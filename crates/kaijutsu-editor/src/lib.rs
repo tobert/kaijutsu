@@ -263,6 +263,84 @@ mod tests {
         assert_eq!(ed.text(), "hello");
     }
 
+    /// Coverage map for the editing surface the e2e can drive end to end. Each
+    /// case is real modalkit vim flowing through `apply_keys` → buffer; the
+    /// *whole* `kj editor`/kernel-session stack observes exactly these
+    /// text/cursor/mode changes. This battery IS the answer to "how much of vi
+    /// can we test headless" — the normal-mode editing surface, in full.
+    mod coverage {
+        use super::*;
+
+        /// `(initial, keys, expected_text)` — assert the resulting buffer.
+        fn case(initial: &str, keys: &str, expected: &str) {
+            let mut ed = EditorCore::new(initial);
+            ed.apply_keys(keys);
+            assert_eq!(ed.text(), expected, "keys {keys:?} on {initial:?}");
+        }
+
+        #[test]
+        fn operators_motions_counts() {
+            case("hello", "x", "ello"); // delete char
+            case("hello", "3x", "lo"); // count
+            case("hello world", "dw", "world"); // delete word
+            case("foo bar", "wde", "foo "); // motion then delete-to-word-end
+            case("hello world", "cwbye<Esc>", "bye world"); // change word
+            case("hello", "rZ", "Zello"); // replace char
+        }
+
+        #[test]
+        fn linewise_and_inserts() {
+            case("a\nb\nc", "dd", "b\nc"); // delete line
+            case("a\nb\nc", "2dd", "c"); // count linewise
+            case("hi", "A!<Esc>", "hi!"); // append-EOL insert
+            case("a", "onew<Esc>", "a\nnew"); // open line below
+        }
+
+        #[test]
+        fn registers_yank_and_paste() {
+            case("x", "yyp", "x\nx"); // yank line, paste below
+            case("a\nb", "ddp", "b\na"); // delete line, paste below
+        }
+
+        #[test]
+        fn undo_and_redo() {
+            case("hello", "xu", "hello"); // delete then undo
+            case("hello", "xu<C-r>", "ello"); // delete, undo, redo (Ctrl-R)
+        }
+
+        #[test]
+        fn visual_mode_operator() {
+            case("hello world", "v$d", ""); // visual to EOL, delete the line
+        }
+
+        #[test]
+        fn find_char_is_a_motion() {
+            // `f` doesn't change text; it moves the cursor onto the target.
+            let mut ed = EditorCore::new("hello world");
+            ed.apply_keys("fw");
+            assert_eq!(ed.text(), "hello world");
+            assert_eq!(ed.cursor(), 6, "f w lands on the 'w' of world");
+        }
+    }
+
+    /// KNOWN GAP (tracked in docs/vi.md): command-line (`:`) and search (`/`·`?`)
+    /// route through modalkit's prompt infrastructure we don't wire yet — and
+    /// today their query text *leaks into the buffer* (corruption, not just a
+    /// missing feature). This spec encodes the desired safe behavior (a no-op
+    /// until the prompt is wired) and fails until we guard prompt-mode keys.
+    #[test]
+    #[ignore = "known gap: prompt-initiating keys (: / ?) leak into the buffer; \
+                fix = swallow keys while the machine is in command-line/search mode"]
+    fn command_line_keys_must_not_corrupt_the_buffer() {
+        let mut ed = EditorCore::new("hello");
+        ed.apply_keys(":d<CR>");
+        assert_eq!(ed.text(), "hello", "an unhandled ex-command must not edit the buffer");
+
+        let mut ed = EditorCore::new("hello world");
+        ed.apply_keys("/wor<CR>");
+        assert_eq!(ed.text(), "hello world", "an unhandled search must not edit the buffer");
+    }
+
     #[test]
     fn diff_op_handles_utf8_chars() {
         // café → cafés: insert one char after the multibyte é. Char-indexed

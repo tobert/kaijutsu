@@ -296,6 +296,21 @@ working feature, but all of it blocks calling it finished**:
 - **`EditOp` granularity.** `apply_keys` emits one contiguous prefix/suffix diff
   per keystroke; a multi-site change (macro, multi-cursor) would need a richer
   diff. Fine for pass 1; revisit with multi-cursor.
+- **⚠ Prompt-key buffer corruption (real bug, not just a gap).** Command-line
+  (`:`) and search (`/`·`?`) route through modalkit's prompt infrastructure we
+  don't wire — and today their query text *leaks into the buffer* (`:d<CR>` →
+  `"dhello"`). This violates crash-over-corruption. Until the `:`/`/` surface is
+  built, swallow keys while the machine is in command-line/search mode. Spec
+  pinned: `kaijutsu-editor` `command_line_keys_must_not_corrupt_the_buffer`
+  (`#[ignore]` until fixed). Dot-repeat (`.`) is a plain no-op (safe), deferred.
+
+### Command surface the e2e covers (verified)
+
+`kaijutsu-editor`'s `coverage` test battery is the executable map: the e2e drives
+the full **normal-mode editing surface** headless — motions, operators, counts,
+linewise ops, inserts (`i`/`a`/`A`/`o`), registers (yank→paste), **undo `u` +
+redo `<C-r>`**, visual-mode + operator, find-char. *Not* covered (and corrupting,
+above): `:` ex-commands, `/`·`?` search; (`.` dot-repeat is an inert no-op).
 
 Mirror the live items into `docs/issues.md` (the backlog/pressure-valve) as they
 appear, and delete them here + there when they ship.
