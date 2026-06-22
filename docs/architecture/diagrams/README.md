@@ -7,7 +7,7 @@ artifact, editable by re-running the generator.
 | File | Shows | Referenced by |
 |---|---|---|
 | `01-system-topology.svg` | clients → SSH/Cap'n Proto → server → the one shared Kernel + its stores | [README](../README.md#process--transport-model) |
-| `02-kernel-anatomy.svg` | persistence & the CRDT journal lifecycle (write → oplog → snapshot → cold-start replay) | [README](../README.md#the-kernel-an-orchestration-hub), [kernel](../kernel.md) |
+| `02-kernel-anatomy.svg` | persistence & the CRDT journal lifecycle (write → oplog → snapshot → cold-start replay) | [README](../README.md#the-kernel-the-instruments-body), [kernel](../kernel.md) |
 | `03-context-vs-conversation.svg` | durable multi-writer context vs append-only hydrated conversation; exclude/edit → fork | [README](../README.md#the-data-model-context-vs-conversation) |
 | `04-turn-flow.svg` | a turn end-to-end, prompt to pixels, with the agentic loop | [README](../README.md#how-a-turn-flows) |
 | `05-mcp-broker.svg` | the single tool-dispatch pipeline; builtin vs external servers | [README](../README.md#tool-dispatch-the-mcp-broker) |

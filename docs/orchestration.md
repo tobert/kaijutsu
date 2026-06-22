@@ -1,9 +1,9 @@
 # Orchestration in Kaijutsu
 
-How to drive multi-model, multi-context work — whether you're at the kj prompt
-or driving via MCP. This guide is written for both audiences: the **User** who
-wants to coordinate a team of bindings, and the **Agent** that needs to read,
-plan, and direct from inside an MCP session.
+How to play multi-model, multi-context work — whether you're at the kj prompt or
+through MCP. This guide is written for both audiences: the **User** who wants to
+play across a set of bindings, and the **Agent** that needs to read, plan, and
+direct from inside an MCP session.
 
 ## Mental Model
 
@@ -37,8 +37,8 @@ is not the same as the model bound to it.**
 
 An Agent (Claude, over MCP) can be wired to a context whose binding is Haiku.
 When the Agent calls `submit_input`, the kernel runs a turn for *Haiku*, not
-the Agent. The Agent is the operator at the controls; Haiku is the model in
-the binding.
+the Agent. The Agent has its hands at the keyboard; Haiku is the voice the
+binding plays in.
 
 This is the key to multi-model orchestration: an Agent reads, plans, drifts,
 and invokes; the per-context binding does the per-context thinking. Different

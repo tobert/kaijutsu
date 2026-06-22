@@ -6,6 +6,11 @@ which offers CRDT-based editing primitives to help users and multiple agents wor
 in parallel over unreliable networks. To make authentication simple and secure, kaijutsu
 uses an embedded SSH server and ssh keys exclusively to identify users. 
 
+The stance behind all of it: kaijutsu is an instrument, not a harness. You play
+it, a model plays it, and if you hand someone a connected app they play it too —
+many hands on one keyboard. The kernel is the instrument's body: it supplies what
+a turn needs and doesn't play the turn itself.
+
 The kaijutsu kernel maintains a DAG (directed acyclic graph) of contexts. Contexts can be forked
 with different models, content redacted/repaired, and other changes that usually mean breaking
 KV caches. Content can be sent across contexts with 'drifting'. Drifts are blocks of content
@@ -45,10 +50,11 @@ read this first when learning the codebase.
 
 ### kaijutsu-kernel
 
-The kernel wraps up your filesystem, models, MCPs, and contexts in a remote server
-over ssh. It provides its own VFS, an MCP broker for tool dispatch, an LLM registry,
-an agent registry, a drift router, and a pub/sub FlowBus. Contexts can be forked
-any time, at which point the context can be edited and even switch models and tools.
+The kernel holds your filesystem, models, MCPs, and contexts behind a remote SSH
+server — the shared body everyone plays. It offers its own VFS, an MCP broker for
+tool dispatch, an LLM registry, a drift router, and a pub/sub FlowBus. Contexts can
+be forked any time, at which point the context can be edited and even switch models
+and tools.
 
 ### kaijutsu-crdt
 

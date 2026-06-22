@@ -2,8 +2,9 @@
 
 Kaijutsu is an cybernetic system for multi-user multi-model multi-context collaboration.
 
-The kaijutsu kernel manages context data, model interactions, workspaces,
-and tools. It offers an SSH protocol with Cap'n'Proto over channels.
+The kaijutsu kernel holds context data, model interactions, workspaces, and
+tools — the shared body that people and models play together. It offers an SSH
+protocol with Cap'n'Proto over channels.
 
 kaijutsu-app is a Bevy 0.18 user interface that offers a completely programmable and rich
 surface for agent interactions, including inline SVG and rendering ABC to standard music

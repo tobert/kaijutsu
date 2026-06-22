@@ -1,7 +1,7 @@
 # The kernel
 
 *Deep-dive companion to [README.md](README.md). Covers `kaijutsu-kernel` — the
-largest crate (~82k LOC) and the orchestration hub. Code is truth; verified
+largest crate (~82k LOC) and the instrument's body. Code is truth; verified
 2026-06-16.*
 
 The kernel owns context data, model interactions, the VFS, and tools. It does

@@ -13,7 +13,7 @@ older doc disagree, the code wins and this document tries to say so.
 - **[overview](README.md)** — this file: the system in one read.
 - **[foundation.md](foundation.md)** — `kaijutsu-types` + `kaijutsu-crdt` + the
   Cap'n Proto wire schema. The shared vocabulary and the CRDT data model.
-- **[kernel.md](kernel.md)** — `kaijutsu-kernel`: the orchestration hub (VFS,
+- **[kernel.md](kernel.md)** — `kaijutsu-kernel`: the instrument's body (VFS,
   block store, MCP broker, LLM, drift, KV, persistence, the embedded shell).
 - **[server.md](server.md)** — `kaijutsu-server`: SSH transport, the Cap'n Proto
   RPC surface, LLM streaming, the beat scheduler, auth.
@@ -82,7 +82,7 @@ capability allow-set on each context (see [Trust model](#trust-model)).
 
 ---
 
-## The kernel: an orchestration hub
+## The kernel: the instrument's body
 
 ![Kernel anatomy](diagrams/02-kernel-anatomy.svg)
 
