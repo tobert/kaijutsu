@@ -200,6 +200,18 @@ impl VfsOps for LocalBackend {
         Ok(buffer)
     }
 
+    /// Read the whole file, following symlinks. Overridden because the trait
+    /// default sizes the read from `getattr`, which here is lstat-like
+    /// (`symlink_metadata`) and reports the *link-path* length for a symlink —
+    /// the default would then cap the followed read at that size and truncate a
+    /// link to a longer file. `resolve` canonicalizes (follows the link) and we
+    /// read to EOF, so the size comes from the real target. A dangling link
+    /// fails loud here (canonicalize errors), not as truncated/empty content.
+    async fn read_all(&self, path: &Path) -> VfsResult<Vec<u8>> {
+        let full_path = self.resolve(path).await?;
+        fs::read(&full_path).await.map_err(VfsError::from)
+    }
+
     async fn readlink(&self, path: &Path) -> VfsResult<PathBuf> {
         // Don't use resolve() here - it follows symlinks via canonicalize()
         // Instead, just join and do a simpler security check
@@ -540,6 +552,27 @@ mod tests {
 
         let target = backend.readlink(Path::new("link.txt")).await.unwrap();
         assert_eq!(target, Path::new("target.txt"));
+    }
+
+    /// `read_all` through a symlink must return the *target's* full content, not
+    /// truncate to the link-path length. The trait default sizes from `getattr`
+    /// (lstat — link-path bytes), so a link to a longer file would read short;
+    /// the override reads to EOF after following. Regression for the issue noted
+    /// in docs/issues.md.
+    #[tokio::test]
+    async fn read_all_follows_symlink_without_truncating() {
+        let (backend, _dir) = setup().await;
+        // Body deliberately much longer than the link path ("l.txt" = 5 bytes).
+        let body = b"this body is far longer than the link path name";
+        backend.create(Path::new("target.txt"), 0o644).await.unwrap();
+        backend.write(Path::new("target.txt"), 0, body).await.unwrap();
+        backend
+            .symlink(Path::new("l.txt"), Path::new("target.txt"))
+            .await
+            .unwrap();
+
+        let got = backend.read_all(Path::new("l.txt")).await.unwrap();
+        assert_eq!(got, body, "read_all truncated a followed symlink");
     }
 
     #[tokio::test]
