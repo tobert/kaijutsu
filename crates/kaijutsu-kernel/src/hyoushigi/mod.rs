@@ -29,7 +29,7 @@ use crate::kernel::Kernel;
 
 /// How a context's beat runs: the wall-clock period of one beat, and how many
 /// beats make one coarse **OODA** cadence (when the `tick` rc verb fires). For a
-/// composer these are the two musical knobs (defaulted from tempo + bars).
+/// musician these are the two musical knobs (defaulted from tempo + bars).
 #[derive(Debug, Clone, Copy)]
 pub struct BeatPolicy {
     /// Wall-clock duration of one beat (e.g. a quarter note).
@@ -48,11 +48,11 @@ pub struct BeatPolicy {
 }
 
 impl BeatPolicy {
-    /// The composer default: a quarter note at 120 BPM (500 ms/beat) in 4/4, a
+    /// The musician default: a quarter note at 120 BPM (500 ms/beat) in 4/4, a
     /// 16-beat phrase (a 4-bar phrase in 4/4 collapsed at this edge), OODA every 8
     /// phrases (= 128 beats ≈ 64 s; numerically identical to the old 32*4, no
     /// cadence change). Tunable per context via rc.
-    pub fn composer_default() -> Self {
+    pub fn musician_default() -> Self {
         Self {
             period: Duration::from_millis(500),
             beats_per_phrase: 16,
@@ -99,8 +99,8 @@ impl BeatPolicy {
 pub enum BeatCommand {
     /// Arm a context with a beat policy, **stopped** (no surprise token spend):
     /// the timeline is created and beat state registered, but the clock isn't
-    /// running until `Play`. Sent when a composer context is created/forked.
-    /// `track` is the composer's lane identity (its default chair) — the lane the
+    /// running until `Play`. Sent when a musician context is created/forked.
+    /// `track` is the musician's lane identity (its default chair) — the lane the
     /// scheduled cells (and so the materialized blocks) belong to.
     Arm {
         context_id: ContextId,
@@ -154,7 +154,7 @@ const ABC_MIME: &str = "text/vnd.abc";
 /// [`kaijutsu_abc::parse`] (Generous). Generous *never* reports errors and always
 /// fabricates a tune from arbitrary bytes — using it here would make every
 /// validation gate (schedule, resolve, derive) vacuous, the exact opposite of the
-/// design's "three loud gates". A scheduled composer phrase claims to be a
+/// design's "three loud gates". A scheduled musician phrase claims to be a
 /// complete tune (it carries X:/M:/K: headers), so Strict is the honest validator:
 /// it is what catches `malformed_abc_rejected_at_schedule`'s garbage. A vamped
 /// phrase must yield playable output (no silent fallback to empty MIDI); the only
@@ -256,7 +256,7 @@ pub fn schedule_abc_cell(
 /// resolver — notation today (`text/vnd.abc`), automation cells tomorrow (same
 /// recipe shape, different mime).
 ///
-/// This is the composer OODA loop's **Act** step, and it is deliberately a *pure*
+/// This is the musician OODA loop's **Act** step, and it is deliberately a *pure*
 /// resolver — idempotent, side-effect-free, safe to speculate and discard. It
 /// reads bytes by **hash** from `params` (the `hash` the source content was stored
 /// under), not from the committed timeline view, so the block log and the timeline
@@ -1617,14 +1617,14 @@ mod tests {
         assert!(std::sync::Arc::ptr_eq(&a, &b), "re-arm returns the same timeline");
     }
 
-    /// T2 (design-chameleon-batch1-f2-notation §16) — the composer default speaks
+    /// T2 (design-chameleon-batch1-f2-notation §16) — the musician default speaks
     /// in phrases. `beats_per_phrase` is the kernel's only musical chunking unit
     /// above the beat (16 = a 4-bar phrase in 4/4); the OODA cadence stays
     /// beat-denominated at 128 (= the old 32*4, no change). Consumers go through
     /// `phrase_delta()`/`is_phrase_boundary()`, never the raw field.
     #[test]
-    fn composer_default_speaks_phrases() {
-        let p = super::BeatPolicy::composer_default();
+    fn musician_default_speaks_phrases() {
+        let p = super::BeatPolicy::musician_default();
         assert_eq!(p.beats_per_phrase, 16, "a 4-bar phrase in 4/4 is 16 beats");
         assert_eq!(p.ooda_every, 128, "OODA cadence stays beat-denominated (8 phrases = 128 beats)");
         assert_eq!(p.phrase_delta(), TickDelta::new(16), "one phrase of lead is 16 beat-ticks");

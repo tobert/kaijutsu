@@ -117,7 +117,7 @@ impl TrackId {
         Some(Self::new(slug).expect("slugify output is a valid track id by construction"))
     }
 
-    /// The single-lane composer's default chair until band config exists.
+    /// The single-lane musician's default chair until band config exists.
     pub fn solo() -> Self {
         Self("solo".to_string())
     }
@@ -169,8 +169,8 @@ mod tests {
 
         // slugify: documented total mapping.
         assert_eq!(
-            TrackId::slugify("My Composer"),
-            Some(TrackId::new("my-composer").unwrap())
+            TrackId::slugify("My Musician"),
+            Some(TrackId::new("my-musician").unwrap())
         );
         // Collapse runs, trim edges.
         assert_eq!(

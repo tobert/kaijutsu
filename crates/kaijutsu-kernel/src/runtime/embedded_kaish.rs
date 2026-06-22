@@ -128,7 +128,7 @@ impl EmbeddedKaish {
     /// Like [`Self::with_identity`] but the materialized shell is **read-only**:
     /// every filesystem mutation and every external command is refused by
     /// construction, while reads — real files *and* the CRDT document views at
-    /// `/v/docs` / `/v/input` — still work. Backs the explorer's
+    /// `/v/docs` / `/v/input` — still work. Backs the toolie's
     /// `read_only_shell` (see `mcp/servers/shell.rs`).
     #[allow(clippy::too_many_arguments)]
     pub fn with_identity_read_only(

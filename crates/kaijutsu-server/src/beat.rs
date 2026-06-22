@@ -1,5 +1,5 @@
 //! The single coalescing beat scheduler — kaijutsu's one active timing thing,
-//! and the composer's **transport**.
+//! and the musician's **transport**.
 //!
 //! `kaijutsu-hyoushigi` is runtime-agnostic: a `Timeline` advances only when
 //! something drives its playhead. This module is that driver on the kernel side
@@ -79,7 +79,7 @@ struct BeatState {
     /// Beats elapsed *while playing* — drives the OODA cadence. Frozen across a
     /// pause, like the playhead.
     beat_count: u64,
-    /// The composer's lane identity — the track its scheduled cells (and so its
+    /// The musician's lane identity — the track its scheduled cells (and so its
     /// materialized blocks) belong to. Lane identity ONLY, never the author.
     track: TrackId,
     /// Consecutive materialize failures on the SAME poison cell — the cell at the
@@ -670,7 +670,7 @@ impl BeatScheduler {
                 source_kind: None,
             };
             let summary = payload.summary_line();
-            // Anchor at the current document tail. A composer context always has at
+            // Anchor at the current document tail. A musician context always has at
             // least its rc/stance blocks, so a tail is expected; its absence is a
             // structural anomaly we surface loudly rather than silently skip.
             let Some(anchor) = self.documents.last_block_id(ctx) else {
@@ -776,12 +776,12 @@ impl BeatScheduler {
         self.fire_lifecycle(ctx, "rotate");
     }
 
-    /// The OODA **Act** handoff: a composer's turn just completed (it wrote ABC),
+    /// The OODA **Act** handoff: a musician's turn just completed (it wrote ABC),
     /// so crystallize **that turn's output block** onto the timeline one phrase
     /// ahead. The output block id is carried on `TurnFlow::Completed` (F2 §7) —
     /// the old blind last-block read raced the model (it could read the seed
     /// prompt, published at spawn) and is gone. Only for an armed, OODA-armed
-    /// context; a non-composer (un-armed) turn is ignored.
+    /// context; a non-musician (un-armed) turn is ignored.
     ///
     /// `output_block_id`:
     ///   - `None` → the turn produced no text; nothing to crystallize.
@@ -804,7 +804,7 @@ impl BeatScheduler {
             // 4-beat OODA_LEAD const, which assumed bars; lead now tracks the
             // policy's phrase length.
             Some(st) if st.ooda_armed => (st.track.clone(), st.policy.phrase_delta()),
-            _ => return, // not an OODA-armed composer we manage
+            _ => return, // not an OODA-armed musician we manage
         };
         // No output block → the turn produced no text; nothing to crystallize.
         let Some(block_id) = output_block_id else {
@@ -845,7 +845,7 @@ impl BeatScheduler {
         }
         // `played_by` is the principal whose turn produced the ABC — the block's
         // own author (who PLAYED), which becomes the materialized cell's
-        // principal. `track` is the composer's lane.
+        // principal. `track` is the musician's lane.
         let played_by = b.id.principal_id;
         if let Err(e) = schedule_abc_cell(&self.kernel, ctx, &abc, lead, track, played_by) {
             // A refused/failed schedule must be visible to the player, not just
@@ -955,7 +955,7 @@ async fn sleep_until_opt(deadline: Option<Instant>) {
 /// Spawn the server-lifetime beat scheduler on its own thread (turn-driver
 /// pattern: dedicated current-thread runtime + LocalSet, since firing the `tick`
 /// verb uses `spawn_local`). Installs the ingress sender on the kernel so the rc
-/// lifecycle and `kj transport` can arm/drive composer contexts.
+/// lifecycle and `kj transport` can arm/drive musician contexts.
 pub fn spawn_beat_scheduler(registry: Arc<ServerRegistry>) {
     let (tx, rx) = mpsc::unbounded_channel::<BeatCommand>();
     registry.kernel.kernel.set_beat_ingress(tx);
@@ -1090,8 +1090,8 @@ mod tests {
     /// not a pushed var — see `transport_vars` docs).
     #[test]
     fn transport_vars_report_now_facts() {
-        // composer_default: 500 ms/beat (= 120 BPM), 16 beats/phrase.
-        let m = vars_map(transport_vars(Tick::new(128), 128, &BeatPolicy::composer_default()));
+        // musician_default: 500 ms/beat (= 120 BPM), 16 beats/phrase.
+        let m = vars_map(transport_vars(Tick::new(128), 128, &BeatPolicy::musician_default()));
         assert_eq!(m["TICK"], "128", "playhead tick verbatim");
         assert_eq!(m["PHRASE"], "8", "128 beats / 16 per phrase = phrase 8");
         assert_eq!(m["TEMPO"], "120", "500 ms/beat rounds to 120 BPM");
@@ -1648,7 +1648,7 @@ mod tests {
         assert_eq!(
             midi.track,
             Some(TrackId::solo()),
-            "the materialized block carries the composer's lane"
+            "the materialized block carries the musician's lane"
         );
         assert_eq!(
             midi.id.principal_id, player,
@@ -2214,7 +2214,7 @@ mod tests {
     /// or a legacy transport block (author == beat()) — that would loop the
     /// bridge's own output back through the OODA Act. A genuine player-ABC block
     /// (no track, real author) IS scheduled, with that author as `played_by` and
-    /// the composer's lane as `track`.
+    /// the musician's lane as `track`.
     #[tokio::test]
     async fn on_turn_completed_skips_materialized_blocks() {
         use kaijutsu_crdt::{BlockKind, ContentType, Role, Status};
@@ -2293,7 +2293,7 @@ mod tests {
         );
 
         // — Case C: a genuine player-ABC block (no track, real author) IS
-        // scheduled, materializing on the composer's lane under the player —
+        // scheduled, materializing on the musician's lane under the player —
         let (kernel_c, docs_c) = fresh_kernel_and_docs().await;
         let cc = ContextId::new();
         docs_c.create_document(cc, DocumentKind::Conversation, None).unwrap();
@@ -2333,7 +2333,7 @@ mod tests {
             .into_iter()
             .find(|b| b.role == Role::Asset);
         let midi = midi.expect("a player-ABC block IS scheduled and materializes a MIDI asset");
-        assert_eq!(midi.track, Some(TrackId::solo()), "scheduled on the composer's lane");
+        assert_eq!(midi.track, Some(TrackId::solo()), "scheduled on the musician's lane");
         assert_eq!(
             midi.id.principal_id, player,
             "played_by is the ABC block's author (the player), threaded into the cell"

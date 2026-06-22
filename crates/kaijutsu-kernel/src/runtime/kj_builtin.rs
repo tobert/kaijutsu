@@ -914,7 +914,7 @@ mod tests {
             "/etc/rc/coder/",
             "/etc/rc/mcp/",
             "/etc/rc/director/",
-            "/etc/rc/explorer/",
+            "/etc/rc/toolie/",
         ] {
             assert!(
                 !stdout.contains(other),
@@ -968,12 +968,12 @@ mod tests {
     }
 
     /// `kj context create <label> --type <t>` must land the context_type on
-    /// the row for BOTH the space form (`--type explorer`) and the equals
-    /// form (`--type=explorer`). Regression: when `--type` is absent from the
+    /// the row for BOTH the space form (`--type toolie`) and the equals
+    /// form (`--type=toolie`). Regression: when `--type` is absent from the
     /// kj tool schema, kaish parses the space form as a bool flag + a stray
     /// positional, the value is divorced, and create silently falls back to
     /// the permissive "default" context_type — a privilege-escalation-by-typo
-    /// (read-only `explorer` becomes the default loadout). The equals form is
+    /// (read-only `toolie` becomes the default loadout). The equals form is
     /// the control: it binds regardless of the schema, so if both asserts
     /// pass we know the space form genuinely round-tripped.
     #[tokio::test]
@@ -987,7 +987,7 @@ mod tests {
         // Space form.
         let res = kaish
             .execute_with_options(
-                "kj context create exp --type explorer",
+                "kj context create exp --type toolie",
                 ExecuteOptions::default(),
             )
             .await
@@ -997,7 +997,7 @@ mod tests {
         // Equals form (control).
         let res2 = kaish
             .execute_with_options(
-                "kj context create exp2 --type=explorer",
+                "kj context create exp2 --type=toolie",
                 ExecuteOptions::default(),
             )
             .await
@@ -1010,16 +1010,16 @@ mod tests {
             .unwrap()
             .expect("exp context exists");
         assert_eq!(
-            exp.context_type, "explorer",
-            "space-form `--type explorer` must set context_type, not silently default"
+            exp.context_type, "toolie",
+            "space-form `--type toolie` must set context_type, not silently default"
         );
         let exp2 = db
             .find_context_by_label("exp2")
             .unwrap()
             .expect("exp2 context exists");
         assert_eq!(
-            exp2.context_type, "explorer",
-            "eq-form `--type=explorer` must set context_type"
+            exp2.context_type, "toolie",
+            "eq-form `--type=toolie` must set context_type"
         );
     }
 

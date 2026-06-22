@@ -58,7 +58,7 @@ impl KjDispatcher {
         };
 
         // Self-driving is gated: the caller's loadout must hold `drive`. This is
-        // what makes narrowing a composer's binding actually stop its OODA tick.
+        // what makes narrowing a musician's binding actually stop its OODA tick.
         if let Err(denied) = self.require_cap(caller, crate::mcp::Capability::Drive, "drive") {
             return denied;
         }
@@ -90,7 +90,7 @@ impl KjDispatcher {
         // --prompt is the optional seed. When given, WRITE it as a real
         // User/Text block (authored by the caller) and anchor the turn after
         // it, so the model hydrates it as the fresh user turn. This is the
-        // composer's transport-report seam: the beat fires `kj drive --prompt
+        // musician's transport-report seam: the beat fires `kj drive --prompt
         // "<report>"`, and the report becomes a durable, hydrating block.
         //
         // When omitted, the turn runs against whatever is already in the log
@@ -272,7 +272,7 @@ mod tests {
 
     #[tokio::test]
     async fn drive_with_prompt_writes_seed_block_and_anchors_turn() {
-        // The composer's transport report rides in as this seed block: a
+        // The musician's transport report rides in as this seed block: a
         // `kj drive --prompt "<report>"` must WRITE the prompt as a real
         // User/Text block (authored by the caller) and anchor the turn after
         // it, so the model hydrates it as the fresh user turn. Before this
@@ -404,7 +404,7 @@ mod tests {
 
     #[tokio::test]
     async fn drive_denied_without_drive_capability() {
-        // The gate that makes narrowing a composer's binding actually stop its
+        // The gate that makes narrowing a musician's binding actually stop its
         // OODA tick: a non-privileged caller whose loadout lacks `drive` is
         // refused before any turn is requested.
         let d = test_dispatcher().await;

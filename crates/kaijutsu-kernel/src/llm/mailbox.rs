@@ -60,12 +60,12 @@ pub struct ConversationMailbox {
 /// The keep-set a windowed conversation hydrates, as its maximal runs over the
 /// log: the pinned prefix `[0, marker]` and the sliding tail (the last `window`
 /// blocks). This is the order-free `window` selection — the cost guard for
-/// endless composer logs (design: `docs/chameleon.md`, the hydration marker).
+/// endless musician logs (design: `docs/chameleon.md`, the hydration marker).
 /// Cut hygiene (turn-boundary snapping, tool-pair integrity, archived-gap
 /// seams) is applied separately by [`plan_splice`] when the runs are walked.
 ///
 /// `marker == None` → **no windowing**, the whole log `[0, len)` (today's
-/// behavior, and every non-composer context — they never set a marker). With a
+/// behavior, and every non-musician context — they never set a marker). With a
 /// marker the runs are `[0, marker+1)` and `[len-window, len)`; these may
 /// overlap (a short log, or a window reaching into/behind the prefix) — that's
 /// fine, `plan_splice` merges them into a seamless whole.

@@ -1,6 +1,6 @@
-# Composer hydration window on FORK — re-establish the cost guard on a forked
-# player. The create-side script (composer/create/S30-hydrate.kai) does not run
-# on fork, so without this a forked composer would drive at tempo with NO window
+# Musician hydration window on FORK — re-establish the cost guard on a forked
+# player. The create-side script (musician/create/S30-hydrate.kai) does not run
+# on fork, so without this a forked musician would drive at tempo with NO window
 # and re-hydrate its whole inherited history every turn. (Numbered S40 so it runs
 # after the shared S30-cache fork breakpoint; create-side is S30.)
 #

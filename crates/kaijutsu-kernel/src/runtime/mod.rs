@@ -11,7 +11,7 @@
 //! - `mount_backend` — kaish's filesystem root, wires VFS mounts to kaish.
 //! - `docs_filesystem` — `/v/docs` (CRDT blocks-as-files).
 //! - `input_filesystem` — `/v/input` (compose CRDT).
-//! - `read_only_fs` — read-only wrapper for the `/v/*` CRDT mounts (explorer).
+//! - `read_only_fs` — read-only wrapper for the `/v/*` CRDT mounts (toolie).
 //! - `context_engine` — per-session "current context" registry.
 //! - `kj_builtin` — the `kj` kaish Tool.
 

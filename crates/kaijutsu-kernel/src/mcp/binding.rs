@@ -49,7 +49,7 @@ pub const KNOWN_FACADES: &[&str] = &["shell", "shell_readonly", "edit_input", "s
 /// these are **deliberately not implied by `*`**: a broad loadout (`coder` with
 /// "*") must not silently be able to self-drive, fork, merge drift, drive the
 /// transport, or perform context/workspace/preset/doc lifecycle. The narrow
-/// roles (`explorer`, `composer`) grant exactly the ones they need.
+/// roles (`toolie`, `musician`) grant exactly the ones they need.
 ///
 /// Stored as a normalized set (`ContextToolBinding::authorities`) persisted in
 /// the `context_binding_authorities` table — extensible (a future authority is
@@ -68,12 +68,12 @@ pub const KNOWN_AUTHORITIES: &[&str] =
 /// native agent "had no shell" regardless of `facade:shell`. The projection
 /// closes that gap WITHOUT forking the policy: gating the tool as an ordinary
 /// `Instance`/`Tool` grant would mean a context with `facade:shell` but no `*`
-/// (e.g. `director`, `composer`) silently loses the model's shell. So the
+/// (e.g. `director`, `musician`) silently loses the model's shell. So the
 /// binding treats a projected instance as allowed exactly when its backing
 /// facade is allowed. One bit — `facade:shell` — governs both surfaces.
 /// `shell_readonly` is the read-only twin: it projects `builtin.shell_readonly`
 /// (the `read_only_shell` tool) for roles that must not write or shell out (the
-/// `explorer`). A read-only role grants `facade:shell_readonly` and never
+/// `toolie`). A read-only role grants `facade:shell_readonly` and never
 /// `facade:shell`, so it sees one shell, not both. Broad `facade:*` roles match
 /// both projections and see both tools — a harmless strict subset, accepted to
 /// keep the gate single-axis.
@@ -112,7 +112,7 @@ pub enum Capability {
     /// privileged lifecycle script by accident — that's an ergonomic nudge,
     /// not a hard wall (host `vim` and `kj rc` always work).
     RcWrite,
-    /// `kj drive` — clock an autonomous turn. The composer OODA tick runs under
+    /// `kj drive` — clock an autonomous turn. The musician OODA tick runs under
     /// its context's loadout, so this is the cap that gates self-driving.
     Drive,
     /// `kj fork` — snapshot a context into a child.
@@ -402,7 +402,7 @@ impl ContextToolBinding {
         }
         // Facade-projected builtins are candidates when their backing facade is
         // granted, so `list_visible_tools` selects the server for facade-only
-        // loadouts (director/composer hold `facade:shell` but no instance grant
+        // loadouts (director/musician hold `facade:shell` but no instance grant
         // and no `*`). Without this they'd never reach the per-tool filter.
         for (inst, facade) in FACADE_PROJECTED_INSTANCES {
             let id = InstanceId::new(*inst);
@@ -482,7 +482,7 @@ mod tests {
     fn facade_shell_projects_the_builtin_shell_tool() {
         // The whole point: granting `facade:shell` (and nothing else — no `*`,
         // no instance grant) must light up the `builtin.shell` broker tool, so
-        // facade-only loadouts (director/composer) get the model's shell. This
+        // facade-only loadouts (director/musician) get the model's shell. This
         // is what keeps the RPC seam and the model tool single-axis.
         let mut b = ContextToolBinding::new();
         b.grant(Capability::Facade("shell".into()));
@@ -507,7 +507,7 @@ mod tests {
 
     #[test]
     fn no_facade_denies_the_builtin_shell_tool() {
-        // explorer: read-only, no facade. The shell tool must stay hidden and
+        // toolie: read-only, no facade. The shell tool must stay hidden and
         // uncallable — the projection is the ONLY path to it for a non-`*` role.
         let mut b = ContextToolBinding::new();
         b.grant(Capability::Tool {

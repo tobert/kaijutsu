@@ -84,9 +84,9 @@ fn hydrate_messages(
     after_block_id: &kaijutsu_crdt::BlockId,
     mailbox: &mut kaijutsu_kernel::ConversationMailbox,
     // The hydration window policy `(marker, window)`, or `None` to hydrate the
-    // whole history (the default; every non-composer context). When set, the
+    // whole history (the default; every non-musician context). When set, the
     // turn hydrates only `[0, marker] ∪ last-window` — the cost guard for
-    // endless composer logs (design: docs/chameleon.md).
+    // endless musician logs (design: docs/chameleon.md).
     policy: Option<(kaijutsu_crdt::BlockId, u32)>,
 ) -> Result<Vec<LlmMessage>, ()> {
     let read = documents.block_snapshots(context_id);
@@ -188,10 +188,10 @@ pub(crate) async fn spawn_llm_for_prompt(
     after_block_id: &kaijutsu_crdt::BlockId,
     tool_ctx: kaijutsu_kernel::ExecContext,
     user_principal_id: PrincipalId,
-    // `true` only on the autonomous turn-driver path (the composer's OODA loop):
+    // `true` only on the autonomous turn-driver path (the musician's OODA loop):
     // the stream publishes `TurnFlow::Completed`/`Failed` at its end. Interactive
     // human-prompt callers pass `false` — a human turn must never feed the
-    // composer's OODA Act, so it announces nothing (design §7). This gate is what
+    // musician's OODA Act, so it announces nothing (design §7). This gate is what
     // keeps the publish-at-stream-end from silently extending Completed to every
     // interactive prompt.
     announce_completion: bool,
@@ -602,7 +602,7 @@ async fn process_llm_stream(
     interrupt_generation: u64,
     context_interrupts: Arc<TokioRwLock<HashMap<ContextId, Arc<ContextInterruptState>>>>,
     // Only autonomous (turn-driver) turns announce their completion on the
-    // TurnFlow bus; interactive human prompts pass `false` so the composer's
+    // TurnFlow bus; interactive human prompts pass `false` so the musician's
     // OODA Act never crystallizes a human-prompted turn (design §7). The publish
     // moved here from the spawn site (rpc.rs:391) so it fires at actual stream
     // end with the real output block id, not at spawn racing the model.
@@ -1560,7 +1560,7 @@ async fn process_llm_stream(
     // moved here from the spawn site so it carries the real `output_block_id`
     // (the model's last text block) rather than firing at spawn and racing the
     // model. Only announced (autonomous turn-driver) turns publish; interactive
-    // human prompts stay silent so the composer's OODA Act never crystallizes a
+    // human prompts stay silent so the musician's OODA Act never crystallizes a
     // human-prompted turn. Exactly one terminal event per announced turn — the
     // two hard-error early returns already published Failed and never reach here.
     if announce_completion {
@@ -1722,7 +1722,7 @@ mod publish_tests {
     }
 
     /// An interactive (un-announced) turn publishes NOTHING — the human-prompt
-    /// paths must never feed the composer's OODA Act (design §7).
+    /// paths must never feed the musician's OODA Act (design §7).
     #[tokio::test]
     async fn interactive_turn_publishes_nothing() {
         let local = tokio::task::LocalSet::new();

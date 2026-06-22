@@ -1,4 +1,4 @@
-//! Transport subcommand: the composer's play/stop/pause/tempo control surface.
+//! Transport subcommand: the musician's play/stop/pause/tempo control surface.
 //!
 //! The playhead *is* a transport position (拍子木 marks *now* and stages *what's
 //! next*), so `kj transport` exposes it. Two switches per context: the **clock**
@@ -23,7 +23,7 @@ use crate::hyoushigi::BeatCommand;
 #[derive(Parser, Debug)]
 #[command(
     name = "transport",
-    about = "Transport control for a context's beat (the composer playhead)",
+    about = "Transport control for a context's beat (the musician playhead)",
     disable_help_subcommand = true,
     no_binary_name = true
 )]

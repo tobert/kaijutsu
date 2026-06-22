@@ -1,7 +1,7 @@
-//! Slice 5: explorer/director role bundles seeded via rc.
+//! Slice 5: toolie/director role bundles seeded via rc.
 //!
 //! These exercise the full path the capability-policy work delivers:
-//! `kj context create --type explorer` runs the seeded rc `create` scripts,
+//! `kj context create --type toolie` runs the seeded rc `create` scripts,
 //! whose `S10-binding.kai` calls `kj binding allow …` to narrow the new
 //! context to a read-only allow-set — and that allow-set is then enforced at
 //! `call_tool`. Running the real kaish scripts is the point: a malformed
@@ -116,57 +116,57 @@ async fn fx_broker_check(
 }
 
 #[tokio::test]
-async fn explorer_role_seeds_readonly_allow_set_and_refuses_writes() {
+async fn toolie_role_seeds_readonly_allow_set_and_refuses_writes() {
     let h = harness().await;
-    let ctx = create_typed(&h, "exp", "explorer").await;
+    let ctx = create_typed(&h, "exp", "toolie").await;
 
     let binding = h
         .kernel
         .broker()
         .binding(&ctx)
         .await
-        .expect("explorer rc must seed a binding");
+        .expect("toolie rc must seed a binding");
     let file = InstanceId::new("builtin.file");
     let block = InstanceId::new("builtin.block");
 
     // Read-oriented grants present…
-    assert!(binding.allows_tool(&file, "read"), "explorer should allow file read");
-    assert!(binding.allows_tool(&file, "grep"), "explorer should allow file grep");
-    assert!(binding.allows_tool(&file, "glob"), "explorer should allow file glob");
+    assert!(binding.allows_tool(&file, "read"), "toolie should allow file read");
+    assert!(binding.allows_tool(&file, "grep"), "toolie should allow file grep");
+    assert!(binding.allows_tool(&file, "glob"), "toolie should allow file glob");
     assert!(
         binding.allows_tool(&block, "block_read"),
-        "explorer should allow block_read"
+        "toolie should allow block_read"
     );
     // …mutating siblings withheld.
     assert!(
         !binding.allows_tool(&file, "write"),
-        "explorer must NOT allow file write"
+        "toolie must NOT allow file write"
     );
     assert!(
         !binding.allows_tool(&file, "edit"),
-        "explorer must NOT allow file edit"
+        "toolie must NOT allow file edit"
     );
     assert!(
         !binding.allows_tool(&block, "block_create"),
-        "explorer must NOT allow block_create"
+        "toolie must NOT allow block_create"
     );
 
-    // Facades: explorer holds none (reading the compose buffer is ungated, so
+    // Facades: toolie holds none (reading the compose buffer is ungated, so
     // a read-only role needs no facade). The shell facade is refused.
-    assert!(!binding.is_admin(), "explorer must NOT be a binding admin");
+    assert!(!binding.is_admin(), "toolie must NOT be a binding admin");
     assert!(
         matches!(
             fx_broker_check(&h, &ctx, "shell").await,
             Err(McpError::FacadeDenied { .. })
         ),
-        "explorer shell facade must be refused"
+        "toolie shell facade must be refused"
     );
     assert!(
         matches!(
             fx_broker_check(&h, &ctx, "submit_input").await,
             Err(McpError::FacadeDenied { .. })
         ),
-        "explorer submit_input facade must be refused"
+        "toolie submit_input facade must be refused"
     );
 
     // Enforced at the call path: a write is refused, not silently dropped.
@@ -186,7 +186,7 @@ async fn explorer_role_seeds_readonly_allow_set_and_refuses_writes() {
         .await;
     assert!(
         matches!(denied, Err(McpError::CapabilityDenied { .. })),
-        "explorer write must be refused, got {denied:?}"
+        "toolie write must be refused, got {denied:?}"
     );
 }
 

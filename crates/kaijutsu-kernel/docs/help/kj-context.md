@@ -63,7 +63,7 @@ kj context unset review --env RUST_LOG
 
 A windowed context hydrates only `[0, marker] ∪ last-window` instead of its
 whole history — the cost guard for long-running contexts driven at tempo
-(composer players). The marker pins a durable prefix; the tail slides.
+(musician players). The marker pins a durable prefix; the tail slides.
 
 ```bash
 kj context hydrate --window 16                  # window this context, marker at tail
@@ -72,7 +72,7 @@ kj context hydrate bass --clear                 # back to hydrate-everything
 ```
 
 `--window 0` is rejected; `--mark` must name a block in the target context
-(fail-loud). Operator-gated; rc lifecycle scripts run privileged (composer
+(fail-loud). Operator-gated; rc lifecycle scripts run privileged (musician
 `create` rc sets `--window 16`). Design: `docs/chameleon.md` "RC-driven
 hydration marker"; the fork-side keep-set sharing this shape is
 `docs/fork-filters.md`.

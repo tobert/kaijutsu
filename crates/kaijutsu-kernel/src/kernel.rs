@@ -85,7 +85,7 @@ pub struct Kernel {
     /// and reports "invalid nonce".
     nonce_stores: dashmap::DashMap<kaijutsu_types::ContextId, kaish_kernel::nonce::NonceStore>,
     /// Per-context hyoushigi timelines — the live open future for contexts that
-    /// own a beat (composer, audio). A context is **armed** by inserting it here;
+    /// own a beat (musician, audio). A context is **armed** by inserting it here;
     /// a context with no entry (every coder) has no timeline and costs nothing.
     /// The beat scheduler in `kaijutsu-server` pumps these; the turn-completion
     /// handler schedules cells onto them. Sharded by `ContextId` like
@@ -93,7 +93,7 @@ pub struct Kernel {
     timelines: dashmap::DashMap<kaijutsu_types::ContextId, crate::hyoushigi::SharedTimeline>,
     /// Ingress to the beat scheduler. Installed by the server at startup (the
     /// scheduler lives there, since it needs the block store too). Kernel-side rc
-    /// code arms/disarms composer contexts by sending here; absent in embedded /
+    /// code arms/disarms musician contexts by sending here; absent in embedded /
     /// test setups with no scheduler, where sends are simply no-ops.
     beat_ingress: OnceLock<tokio::sync::mpsc::UnboundedSender<crate::hyoushigi::BeatCommand>>,
     /// RAII guard for a `new_ephemeral()` data dir: removes the throwaway dir
@@ -613,7 +613,7 @@ impl Kernel {
             .await?;
 
         // builtin.shell_readonly — the read-only twin (`read_only_shell` tool)
-        // for roles that must not write or shell out (the `explorer`). Same
+        // for roles that must not write or shell out (the `toolie`). Same
         // facade-projection mechanism (FACADE_PROJECTED_INSTANCES), gated by
         // `facade:shell_readonly`. The constraint rides in the tool *name* so
         // the model never attempts a write it can't perform. A read-only role
@@ -726,7 +726,7 @@ impl Kernel {
     /// Send a command to the beat scheduler, if one is installed. Returns whether
     /// it was delivered — `false` when no scheduler is wired (embedded/test) or
     /// the scheduler has shut down. Callers decide whether that's fatal; arming a
-    /// composer with no scheduler simply means it never beats (no silent
+    /// musician with no scheduler simply means it never beats (no silent
     /// corruption, just no beat).
     pub fn send_beat_command(&self, cmd: crate::hyoushigi::BeatCommand) -> bool {
         match self.beat_ingress.get() {

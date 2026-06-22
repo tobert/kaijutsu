@@ -467,7 +467,7 @@ impl KjDispatcher {
     /// the facade gate, and like them it is **deny-by-default**.
     ///
     /// The capability is checked against the caller's *own* context binding —
-    /// the loadout the actor operates under (so a composer's `drive` grant
+    /// the loadout the actor operates under (so a musician's `drive` grant
     /// gates its OODA tick even when it drives a sibling). The authoritative
     /// binding is read from `KernelDb` (which `broker.set_binding` always
     /// writes through), keeping this synchronous so both the sync and async

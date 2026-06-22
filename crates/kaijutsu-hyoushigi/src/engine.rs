@@ -1,6 +1,6 @@
 //! The in-memory speculative engine: a single-context [`Timeline`].
 //!
-//! This is the first proof of the hard core — a **composer-lite** timeline whose
+//! This is the first proof of the hard core — a **musician-lite** timeline whose
 //! playhead *can't block*. Time is driven by an external beat (here, manual
 //! [`Timeline::advance_to`] calls standing in for the internal beat — which also
 //! makes the loop deterministic and replayable, exactly what TDD wants). Because

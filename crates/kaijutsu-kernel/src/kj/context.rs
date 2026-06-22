@@ -129,7 +129,7 @@ enum ContextCommand {
     /// Move a label to a different context (latched).
     Retag { label: String, context: String },
     /// Set or clear the conversation hydration window — `[0, marker] ∪ last-N`
-    /// instead of the whole history (the cost guard for endless composer logs).
+    /// instead of the whole history (the cost guard for endless musician logs).
     Hydrate {
         context: Option<String>,
         /// Keep the last N blocks as the sliding tail (with the pinned prefix).
@@ -622,10 +622,10 @@ impl KjDispatcher {
         // /etc/rc/default/<verb>/.
         let context_type = cfg.type_spec.take().unwrap_or_else(|| "default".to_string());
 
-        // For composers, derive the beat lane (track) from the label up front,
+        // For musicians, derive the beat lane (track) from the label up front,
         // so a label that yields no valid track id fails BEFORE we create an
         // orphan context. The arm itself happens after the rc lifecycle (below).
-        let composer_track = if context_type == "composer" {
+        let musician_track = if context_type == "musician" {
             match kaijutsu_types::TrackId::new(label)
                 .ok()
                 .or_else(|| kaijutsu_types::TrackId::slugify(label))
@@ -633,7 +633,7 @@ impl KjDispatcher {
                 Some(t) => Some(t),
                 None => {
                     return KjResult::Err(format!(
-                        "kj context create: composer label {label:?} yields no valid \
+                        "kj context create: musician label {label:?} yields no valid \
                          track id (slug is empty) — refusing a silent shared lane"
                     ));
                 }
@@ -724,22 +724,22 @@ impl KjDispatcher {
             tracing::warn!("rc create lifecycle: {e}");
         }
 
-        // Arm the beat for composer contexts so the scheduler drives the
+        // Arm the beat for musician contexts so the scheduler drives the
         // playhead. This mirrors the capnp `CreateContext` path
         // (`create_context_inner` in kaijutsu-server/src/rpc.rs) — without it, a
-        // composer created via `kj` (the path the Chameleon player-spawn rc
+        // musician created via `kj` (the path the Chameleon player-spawn rc
         // uses) is never armed: `kj transport play` is ignored ("play on
         // un-armed context") and the OODA Act never crystallizes. Absent a
         // scheduler (embedded/test) `send_beat_command` returns false → no-op.
-        if let Some(track) = composer_track {
+        if let Some(track) = musician_track {
             let armed = self.kernel().send_beat_command(crate::hyoushigi::BeatCommand::Arm {
                 context_id: new_id,
-                policy: crate::hyoushigi::BeatPolicy::composer_default(),
+                policy: crate::hyoushigi::BeatPolicy::musician_default(),
                 track,
             });
             if !armed {
                 tracing::warn!(
-                    "composer {} created but no beat scheduler is wired — it will not beat",
+                    "musician {} created but no beat scheduler is wired — it will not beat",
                     new_id.short()
                 );
             }
@@ -875,10 +875,10 @@ impl KjDispatcher {
     /// set or clear the conversation hydration window.
     ///
     /// With a window the context hydrates only `[0, marker] ∪ last-N` instead of
-    /// its whole history — the cost guard for endless composer logs (design:
+    /// its whole history — the cost guard for endless musician logs (design:
     /// `docs/chameleon.md`, the hydration marker). The prefix marker defaults to
     /// the context's current tail (pin everything so far, slide a window over what
-    /// comes next); a composer's `create` rc sets this once. `--clear` reverts to
+    /// comes next); a musician's `create` rc sets this once. `--clear` reverts to
     /// hydrating everything. Advancing the marker on a durable revision is the
     /// same call again — an in-place upsert, not a per-turn write (the tail slides
     /// in memory).
@@ -2331,13 +2331,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn context_create_composer_arms_the_beat() {
-        // A composer created via `kj` MUST arm the beat scheduler. The OODA Act
+    async fn context_create_musician_arms_the_beat() {
+        // A musician created via `kj` MUST arm the beat scheduler. The OODA Act
         // (ABC→cell→MIDI) never fires for an un-armed context and
         // `kj transport play` is silently ignored ("play on un-armed context").
         // Regression: the arm lived only in the capnp CreateContext path
         // (`create_context_inner`), so `kj`-spawned players — the Chameleon
-        // player-spawn path — were created but never beat. A non-composer must
+        // player-spawn path — were created but never beat. A non-musician must
         // NOT arm.
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
@@ -2356,17 +2356,17 @@ mod tests {
         assert!(r.is_ok(), "default create failed: {}", r.message());
         assert!(
             rx.try_recv().is_err(),
-            "a non-composer context must not arm the beat"
+            "a non-musician context must not arm the beat"
         );
 
-        // Composer type: arms, with a track derived from the label.
+        // Musician type: arms, with a track derived from the label.
         let r = d
             .dispatch(
-                &[s("context"), s("create"), s("bassline"), s("--type"), s("composer")],
+                &[s("context"), s("create"), s("bassline"), s("--type"), s("musician")],
                 &c,
             )
             .await;
-        assert!(r.is_ok(), "composer create failed: {}", r.message());
+        assert!(r.is_ok(), "musician create failed: {}", r.message());
 
         let id = {
             let db = d.kernel_db().lock();
@@ -2380,10 +2380,10 @@ mod tests {
             Ok(crate::hyoushigi::BeatCommand::Arm {
                 context_id, track, ..
             }) => {
-                assert_eq!(context_id, id, "arms the composer we just created");
+                assert_eq!(context_id, id, "arms the musician we just created");
                 assert_eq!(track, expected_track, "track derives from the label");
             }
-            other => panic!("composer create must send BeatCommand::Arm, got {other:?}"),
+            other => panic!("musician create must send BeatCommand::Arm, got {other:?}"),
         }
     }
 

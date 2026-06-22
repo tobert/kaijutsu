@@ -1,6 +1,6 @@
-# composer: a narrowed loadout for the hyoushigi OODA self-driver.
+# musician: a narrowed loadout for the hyoushigi OODA self-driver.
 #
-# A composer reuses the broad loadout only by *fork inheritance*; created fresh
+# A musician reuses the broad loadout only by *fork inheritance*; created fresh
 # it lands here. The OODA tick runs `kj drive` under THIS loadout, so `drive` is
 # the capability that gates self-driving — narrowing the binding now actually
 # stops the tick (it didn't before kj grew capability gates).
@@ -14,5 +14,5 @@
 kj binding allow "drive"
 # Deliberately NOT granted: any builtin.* tool instance (block/file/resources/
 # kernel_info/tool_search), facade:shell, facade:submit_input, and fork/drift/
-# transport/operator/admin/rc-write. A composer drives itself and emits ABC text;
+# transport/operator/admin/rc-write. A musician drives itself and emits ABC text;
 # it does not call tools, fork, merge drift, run the transport, or do lifecycle.

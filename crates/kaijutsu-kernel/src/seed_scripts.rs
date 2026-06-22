@@ -9,10 +9,10 @@
 //!   `context_type`. Without this seed, fresh kernels miss all cache
 //!   breakpoints until the user installs them by hand.
 //! - `/etc/rc/<type>/**` — the worked examples of real context_types
-//!   (coder, mcp, explorer, director, composer). Each ships an
-//!   `S00-stance.md` so the kernel-side contract is self-contained
-//!   (independent of any per-client CLAUDE.md), a binding loadout, and the
-//!   cache recipe.
+//!   (coder, mcp, toolie, director, musician). Most ship an `S00-stance`
+//!   (`.md`, or `.kai` when the stance tunes itself to the bound model) so the
+//!   kernel-side contract is self-contained (independent of any per-client
+//!   CLAUDE.md), a binding loadout, and the cache recipe.
 //!
 //! ## Storage
 //!
@@ -156,7 +156,7 @@ mod tests {
             "default/create/S20-cache.kai",
             "default/fork/S30-cache.kai",
             "default/drift/S40-cache.kai",
-            "coder/create/S00-stance.md",
+            "coder/create/S00-stance.kai",
             "coder/create/S20-cache.kai",
         ] {
             assert!(read(dir.path(), rel).is_some(), "missing seed: {rel}");
@@ -193,9 +193,9 @@ mod tests {
         // Spot-check the roles the embedded tree ships.
         for expected in [
             "/etc/rc/default/create/S20-cache.kai",
-            "/etc/rc/coder/create/S00-stance.md",
-            "/etc/rc/composer/tick/S10-drive.kai",
-            "/etc/rc/composer/create/S00-stance.md",
+            "/etc/rc/coder/create/S00-stance.kai",
+            "/etc/rc/musician/tick/S10-drive.kai",
+            "/etc/rc/musician/create/S00-stance.md",
         ] {
             assert!(paths.contains(&expected.to_string()), "missing seed: {expected}");
         }
@@ -219,46 +219,46 @@ mod tests {
         );
     }
 
-    /// The composer ships a `tick` (beat) verb script and a stance — the beat
-    /// hook and persona that make a created composer self-compose.
+    /// The musician ships a `tick` (beat) verb script and a stance — the beat
+    /// hook and persona that make a created musician self-compose.
     #[test]
-    fn composer_seeds_include_beat_tick_verb() {
+    fn musician_seeds_include_beat_tick_verb() {
         assert!(
-            seed_body("/etc/rc/composer/tick/S10-drive.kai").is_some(),
-            "composer must seed a tick/beat script"
+            seed_body("/etc/rc/musician/tick/S10-drive.kai").is_some(),
+            "musician must seed a tick/beat script"
         );
         assert!(
-            seed_body("/etc/rc/composer/create/S00-stance.md").is_some(),
-            "composer must seed a stance"
+            seed_body("/etc/rc/musician/create/S00-stance.md").is_some(),
+            "musician must seed a stance"
         );
         // The tick verb is wired into the rc path grammar.
-        let parts = crate::kj::rc::parse_rc_path("/etc/rc/composer/tick/S10-drive.kai")
+        let parts = crate::kj::rc::parse_rc_path("/etc/rc/musician/tick/S10-drive.kai")
             .expect("tick rc path must parse");
-        assert_eq!(parts.context_type, "composer");
+        assert_eq!(parts.context_type, "musician");
         assert_eq!(parts.verb, "tick");
     }
 
-    /// The composer seeds the hydration-window guard at create — `kj context
+    /// The musician seeds the hydration-window guard at create — `kj context
     /// hydrate` pins the prefix + sets the sliding tail so a self-driving
-    /// composer doesn't re-hydrate its whole history every turn (the cost guard).
+    /// musician doesn't re-hydrate its whole history every turn (the cost guard).
     #[test]
-    fn composer_seeds_include_hydration_window() {
-        let body = seed_body("/etc/rc/composer/create/S30-hydrate.kai")
-            .expect("composer must seed the hydration-window script");
+    fn musician_seeds_include_hydration_window() {
+        let body = seed_body("/etc/rc/musician/create/S30-hydrate.kai")
+            .expect("musician must seed the hydration-window script");
         assert!(
             body.contains("kj context hydrate"),
             "the hydrate seed must set a window via `kj context hydrate`"
         );
     }
 
-    /// The composer ALSO seeds a fork-side hydration script — the create script
+    /// The musician ALSO seeds a fork-side hydration script — the create script
     /// doesn't run on fork, so a forked player needs its own window re-established
     /// (else it drives at tempo with full history). It branches on KJ_FORK_INFO:
     /// window a thin fork, skip a full clone (which would pin its whole log).
     #[test]
-    fn composer_fork_seeds_include_hydration_window() {
-        let body = seed_body("/etc/rc/composer/fork/S40-hydrate.kai")
-            .expect("composer must seed a fork-side hydration script");
+    fn musician_fork_seeds_include_hydration_window() {
+        let body = seed_body("/etc/rc/musician/fork/S40-hydrate.kai")
+            .expect("musician must seed a fork-side hydration script");
         assert!(
             body.contains("kj context hydrate"),
             "the fork hydrate seed must set a window via `kj context hydrate`"

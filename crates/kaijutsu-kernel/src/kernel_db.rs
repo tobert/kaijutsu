@@ -594,9 +594,9 @@ CREATE INDEX IF NOT EXISTS idx_cache_breakpoints_ctx
 -- ── Context Hydration Marker (Chameleon batch 2) ────────────────
 -- The hydration-marker cost guard: a windowed context hydrates only
 -- `[0, marker] ∪ last-window_size` instead of its whole history, so a
--- composer driving at tempo doesn't re-send endless turns every turn.
+-- musician driving at tempo doesn't re-send endless turns every turn.
 -- A row exists ONLY for windowed contexts; its ABSENCE = hydrate
--- everything (today's behavior, every non-composer context — the
+-- everything (today's behavior, every non-musician context — the
 -- default needs zero rows and touches no read path that lacks a marker).
 --   marker       BlockId::to_key() — the pinned-prefix end P; [0,P] always hydrates
 --   window_size  the sliding tail length W (last-W blocks)
@@ -3056,8 +3056,8 @@ impl KernelDb {
     /// conversation hydrates only `[0, marker] ∪ last-window_size`, not its whole
     /// history. `marker` is the pinned-prefix end P (a durable block — `[0,P]`
     /// always hydrates and stays cache-stable); `window_size` is the sliding tail
-    /// W. The cost guard for endless composer logs (design: `docs/chameleon.md`,
-    /// the hydration marker). Upserted at composer-create and on a durable
+    /// W. The cost guard for endless musician logs (design: `docs/chameleon.md`,
+    /// the hydration marker). Upserted at musician-create and on a durable
     /// revision (marker advance) — NOT per turn; the tail slides in memory.
     pub fn set_hydration_policy(
         &self,
@@ -3079,7 +3079,7 @@ impl KernelDb {
     }
 
     /// Read the hydration window policy for `context_id`, or `None` when unset —
-    /// `None` means hydrate everything (the default; every non-composer context).
+    /// `None` means hydrate everything (the default; every non-musician context).
     /// A *present but malformed* row (window < 1, or a marker that no longer
     /// parses) is corruption, and returns `Err(Validation)` so the caller fails
     /// the turn loudly. Silently degrading corrupt config to "hydrate everything"
@@ -4606,7 +4606,7 @@ mod tests {
         insert_context_with_doc(&db, &ctx, ws_id);
 
         // A tool-granular role bundle: no instance-wide grants, just specific
-        // tools plus a facade. This is the explorer shape (slice 5).
+        // tools plus a facade. This is the toolie shape (slice 5).
         let mut original = ContextToolBinding::new();
         original.grant(Capability::Tool {
             instance: InstanceId::new("builtin.file"),

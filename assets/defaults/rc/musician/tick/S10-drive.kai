@@ -1,4 +1,4 @@
-# Composer beat — the OODA cadence hook.
+# Musician beat — the OODA cadence hook.
 #
 # Fired by the kernel beat scheduler on this context's coarse cadence
 # (default: every 8 phrases of 16 beats @ 120 BPM). `kj drive` publishes a
@@ -25,4 +25,4 @@
 #
 # No positional context: the tick lifecycle runs with this context as the
 # current one, so `kj drive` targets it (avoids passing the raw id as an arg).
-kj drive --prompt "Transport: tick $TICK, phrase $PHRASE, $TEMPO BPM. Recent notation (JSON): $HEARD. Compose the next phrase and output it as a COMPLETE, self-contained ABC tune EVERY turn — full header (X:, T:, M:, L:, K:) then the body — never a bare phrase or a continuation; the score parser rejects a body without a header. Raw ABC only: no prose, no code fences."
+kj drive --prompt "Transport: tick $TICK, phrase $PHRASE, $TEMPO BPM. Recently played (JSON): $HEARD. Play the next phrase and give it as one complete, self-contained ABC tune every turn — a full header (X:, T:, M:, L:, K:) then the body, never a bare phrase or a continuation: the score parser rejects a body without a header. Raw ABC only — no prose, no code fences."

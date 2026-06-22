@@ -1,6 +1,6 @@
-# Composer hydration window — the cost guard for endless score logs.
+# Musician hydration window — the cost guard for endless score logs.
 #
-# A composer drives a turn every OODA cycle, forever. Without a window it would
+# A musician drives a turn every OODA cycle, forever. Without a window it would
 # re-hydrate its WHOLE history every turn, and the transport-report + ABC blocks
 # each turn add up — tokens grow without bound at tempo. This pins everything
 # created so far (stance, binding) as the cached prefix and slides a window over
@@ -15,5 +15,5 @@
 # See docs/chameleon.md, the hydration marker.
 #
 # Runs privileged in the create lifecycle, so it clears the Operator gate even
-# under the composer's narrowed loadout (which doesn't grant it directly).
+# under the musician's narrowed loadout (which doesn't grant it directly).
 kj context hydrate --window 16

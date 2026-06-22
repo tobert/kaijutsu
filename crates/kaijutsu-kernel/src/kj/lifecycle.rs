@@ -83,7 +83,7 @@ pub const VERB_FORK: &str = "fork";
 pub const VERB_ATTACH: &str = "attach";
 pub const VERB_DRIFT: &str = "drift";
 /// The beat verb: fired by the kernel beat scheduler on a context's coarse OODA
-/// cadence (e.g. every N bars for a composer). Its scripts are the per-beat work
+/// cadence (e.g. every N bars for a musician). Its scripts are the per-beat work
 /// hook — typically `kj drive` to request the next OODA turn. Materialized the
 /// same throwaway-kaish way the other verbs are; no new runtime.
 pub const VERB_TICK: &str = "tick";
@@ -112,7 +112,7 @@ impl KjDispatcher {
 
     /// Like [`run_rc_lifecycle`](Self::run_rc_lifecycle), but seeds `extra_vars`
     /// into every `.kai` script's kaish environment alongside the standard
-    /// `KJ_*` vars. The composer beat scheduler uses this to hand the `tick`
+    /// `KJ_*` vars. The musician beat scheduler uses this to hand the `tick`
     /// lifecycle its transport heartbeat (`$TICK` / `$PHRASE` / `$TEMPO`) so
     /// `S10-drive.kai` can compose the turn's transport report. Bare names (no
     /// `KJ_` prefix) per the heartbeat-var taxonomy in `docs/chameleon.md`.
@@ -441,7 +441,7 @@ async fn run_kai_script(
         );
     }
 
-    // Caller-supplied vars (the composer's transport heartbeat: $TICK/$PHRASE/
+    // Caller-supplied vars (the musician's transport heartbeat: $TICK/$PHRASE/
     // $TEMPO). Folded in last; a deliberate KJ_* collision would override, but
     // the heartbeat names don't use that prefix.
     for (k, v) in extra_vars {
@@ -818,7 +818,7 @@ mod tests {
         );
     }
 
-    /// The composer transport seam: `run_rc_lifecycle_with_vars` must seed the
+    /// The musician transport seam: `run_rc_lifecycle_with_vars` must seed the
     /// extra vars into the `.kai` env so a `tick` script can read `$TICK` /
     /// `$PHRASE` / `$TEMPO` and compose the turn's transport report. Echoes the
     /// vars and asserts they round-trip through the captured Trace block.
@@ -909,9 +909,9 @@ mod tests {
 
     /// Helper: seed a child context with one block so the default hydration
     /// marker (`last_block_id`) resolves, then run the fork lifecycle with the
-    /// given fork kind against the REAL shipped composer fork-hydrate script.
+    /// given fork kind against the REAL shipped musician fork-hydrate script.
     /// Returns the child's hydration policy after the lifecycle.
-    async fn run_composer_fork_hydrate(
+    async fn run_musician_fork_hydrate(
         fork_kind: ForkKind,
     ) -> (
         std::sync::Arc<KjDispatcher>,
@@ -927,7 +927,7 @@ mod tests {
         install_rc_script_file(
             &d,
             "/etc/rc/test/fork/S40-hydrate.kai",
-            include_str!("../../../../assets/defaults/rc/composer/fork/S40-hydrate.kai"),
+            include_str!("../../../../assets/defaults/rc/musician/fork/S40-hydrate.kai"),
         )
         .await;
 
@@ -971,8 +971,8 @@ mod tests {
     /// re-establishes the window on the lean child (it would otherwise drive at
     /// tempo with full history — the create-side script doesn't run on fork).
     #[tokio::test]
-    async fn composer_fork_hydrate_windows_a_thin_fork() {
-        let (_d, _child, policy) = run_composer_fork_hydrate(ForkKind::Filtered).await;
+    async fn musician_fork_hydrate_windows_a_thin_fork() {
+        let (_d, _child, policy) = run_musician_fork_hydrate(ForkKind::Filtered).await;
         match policy {
             Some((_marker, window)) => assert_eq!(window, 16, "thin fork gets the --window 16 guard"),
             None => panic!("a thin (shallow) fork must set a hydration window"),
@@ -983,8 +983,8 @@ mod tests {
     /// not a player spawn — windowing is a thin-fork concern, so the script
     /// leaves a full fork un-windowed (full history stays live, no policy set).
     #[tokio::test]
-    async fn composer_fork_hydrate_skips_a_full_clone() {
-        let (_d, _child, policy) = run_composer_fork_hydrate(ForkKind::Full).await;
+    async fn musician_fork_hydrate_skips_a_full_clone() {
+        let (_d, _child, policy) = run_musician_fork_hydrate(ForkKind::Full).await;
         assert!(
             policy.is_none(),
             "a full clone must NOT be windowed (it would pin the whole inherited log); got {policy:?}"

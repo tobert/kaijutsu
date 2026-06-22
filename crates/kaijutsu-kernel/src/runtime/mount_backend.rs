@@ -51,7 +51,7 @@ pub struct MountBackend {
     docs_tools: Arc<KaijutsuBackend>,
     /// When true, every mutating op is refused structurally with
     /// `PermissionDenied` *before* it can reach the shared mount table or CRDT
-    /// cache — the read-only invariant for the explorer's `read_only_shell`.
+    /// cache — the read-only invariant for the toolie's `read_only_shell`.
     /// Reads (real files and CRDT documents) still pass through. This gates the
     /// real-FS + `FileDocumentCache` surface; the kaish-VFS `/v/docs` and
     /// `/v/input` mounts are gated separately by wrapping them in
@@ -76,7 +76,7 @@ impl MountBackend {
 
     /// Create a read-only MountBackend: reads pass through, every mutation is
     /// refused at this boundary regardless of whether the underlying mount is
-    /// writable. Used to materialize the explorer's `read_only_shell` over the
+    /// writable. Used to materialize the toolie's `read_only_shell` over the
     /// *shared* mount table without exposing a write path.
     pub fn new_read_only(
         mount_table: Arc<MountTable>,
@@ -977,10 +977,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// `new_read_only` is the structural read-only *mode* (for the explorer's
+    /// `new_read_only` is the structural read-only *mode* (for the toolie's
     /// `read_only_shell`): it refuses every mutation regardless of whether the
     /// underlying mount is writable, while reads — including CRDT-backed text —
-    /// still pass through. This is the gate that lets the explorer inspect a
+    /// still pass through. This is the gate that lets the toolie inspect a
     /// live, *writable* project tree without a write path. Distinct from
     /// `readonly_mount_passes_through_and_does_not_poison`, which exercises a
     /// per-mount read-only *backend* under a writable MountBackend.

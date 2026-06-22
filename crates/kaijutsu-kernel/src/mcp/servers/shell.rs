@@ -17,8 +17,8 @@
 //! and can call `shell` exactly when its binding grants `facade:shell` — the
 //! same bit that gates the RPC seam. There is no second capability to keep in
 //! sync, and no rc-script change: every role that already had `facade:shell`
-//! (default/coder/mcp via `facade:*`, director/composer explicitly) gets the
-//! tool; `explorer` (no facade) stays excluded.
+//! (default/coder/mcp via `facade:*`, director/musician explicitly) gets the
+//! tool; `toolie` (no facade) stays excluded.
 
 use std::sync::{Arc, Weak};
 
@@ -73,7 +73,7 @@ const DESCRIPTION_READ_ONLY: &str = "Run a READ-ONLY command in your current \
 /// shared `KjDispatcher` through the broker, materializing a throwaway context
 /// kaish per call. One struct, two flavours selected at construction: the
 /// writable `shell` (`facade:shell`) and the read-only `read_only_shell`
-/// (`facade:shell_readonly`) the explorer gets. The constraint lives in the
+/// (`facade:shell_readonly`) the toolie gets. The constraint lives in the
 /// *tool name* so the model never wastes a turn attempting a write it can't do.
 pub struct ShellServer {
     instance_id: InstanceId,
@@ -325,7 +325,7 @@ mod tests {
 
     /// End-to-end through `broker.call_tool`: `facade:shell` alone (no `*`, no
     /// instance grant) must let the model run a command. This is the whole
-    /// point — facade-only loadouts (director/composer) get a working shell.
+    /// point — facade-only loadouts (director/musician) get a working shell.
     #[tokio::test]
     async fn facade_shell_runs_a_command_through_the_broker() {
         let (broker, d) = wired().await;
@@ -496,7 +496,7 @@ mod tests {
         );
     }
 
-    /// The explorer's loadout: `facade:shell_readonly` (and NOT `facade:shell`).
+    /// The toolie's loadout: `facade:shell_readonly` (and NOT `facade:shell`).
     /// It must see exactly the `read_only_shell` tool and NOT the writable
     /// `shell` — one shell or the other, never both, for a narrow role.
     #[tokio::test]

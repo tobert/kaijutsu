@@ -296,8 +296,8 @@ impl SshServer {
         crate::rpc::spawn_turn_driver(registry.clone());
 
         // The single coalescing beat scheduler: drives per-context hyoushigi
-        // timelines on their wall-clock beat (composer contexts). Installs its
-        // ingress on the kernel so the rc lifecycle can arm/disarm composers.
+        // timelines on their wall-clock beat (musician contexts). Installs its
+        // ingress on the kernel so the rc lifecycle can arm/disarm musicians.
         crate::beat::spawn_beat_scheduler(registry.clone());
 
         let active_connections = Arc::new(AtomicUsize::new(0));

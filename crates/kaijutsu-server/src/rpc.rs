@@ -402,7 +402,7 @@ pub fn spawn_turn_driver(registry: Arc<ServerRegistry>) {
                     tool_ctx,
                     principal_id,
                     // Announce: this is the autonomous turn-driver path (the
-                    // composer's OODA loop). `process_llm_stream` now publishes
+                    // musician's OODA loop). `process_llm_stream` now publishes
                     // Completed/Failed at ACTUAL stream end with the real output
                     // block id (design §7). The old publish-at-spawn here is gone —
                     // it fired before the model wrote anything and raced the stream,
@@ -1487,7 +1487,7 @@ impl KernelImpl {
 /// register in the DriftRouter (rolling back the row + document on failure),
 /// run the `create` rc lifecycle for `context_type` (failure is logged, not
 /// fatal — it surfaces as Error blocks in the new context), and arm the beat
-/// for composer contexts. Hard failures (document / DB / drift) return `Err`;
+/// for musician contexts. Hard failures (document / DB / drift) return `Err`;
 /// everything downstream is best-effort. Wire-result writing is the caller's
 /// job — this never touches capnp results.
 #[allow(clippy::too_many_arguments)]
@@ -1610,14 +1610,14 @@ async fn create_context_inner(
         log::warn!("rc create lifecycle for {}: {e}", context_id.short());
     }
 
-    // Arm the beat for context types that own one (composer). A composer's
+    // Arm the beat for context types that own one (musician). A musician's
     // playhead can't block, so the beat scheduler drives it; coders are never
     // armed. Absent a scheduler (embedded/test) this is a no-op.
-    if context_type == "composer" {
+    if context_type == "musician" {
         let label = label.unwrap_or("");
-        // Derive the composer's lane from its label: strict constructor first,
+        // Derive the musician's lane from its label: strict constructor first,
         // then lossy-but-loud slugify. An empty slug HARD-ERRORS creation rather
-        // than silently sharing a default lane (two composers would collide).
+        // than silently sharing a default lane (two musicians would collide).
         let track = match kaijutsu_types::TrackId::new(label)
             .ok()
             .or_else(|| kaijutsu_types::TrackId::slugify(label))
@@ -1625,7 +1625,7 @@ async fn create_context_inner(
             Some(t) => t,
             None => {
                 return Err(capnp::Error::failed(format!(
-                    "composer label {label:?} does not yield a valid track id \
+                    "musician label {label:?} does not yield a valid track id \
                      (slug is empty) — refusing to create with a silent shared lane"
                 )));
             }
@@ -1633,13 +1633,13 @@ async fn create_context_inner(
         let armed = state.kernel.send_beat_command(
             kaijutsu_kernel::hyoushigi::BeatCommand::Arm {
                 context_id,
-                policy: kaijutsu_kernel::hyoushigi::BeatPolicy::composer_default(),
+                policy: kaijutsu_kernel::hyoushigi::BeatPolicy::musician_default(),
                 track,
             },
         );
         if !armed {
             log::warn!(
-                "composer {} created but no beat scheduler is wired — it will not beat",
+                "musician {} created but no beat scheduler is wired — it will not beat",
                 context_id.short()
             );
         }
@@ -2656,7 +2656,7 @@ impl kernel::Server for KernelImpl {
                 );
 
                 // Spawn LLM streaming in background. Interactive human prompt:
-                // announce_completion=false so the composer's OODA Act never
+                // announce_completion=false so the musician's OODA Act never
                 // crystallizes a human-prompted turn (design §7).
                 spawn_llm_for_prompt(
                     &kernel,
@@ -4509,7 +4509,7 @@ impl kernel::Server for KernelImpl {
 
                     // Spawn LLM streaming in background. Interactive chat prompt
                     // via submit_input: announce_completion=false (design §7) —
-                    // a human-prompted turn never feeds the composer's OODA Act.
+                    // a human-prompted turn never feeds the musician's OODA Act.
                     spawn_llm_for_prompt(
                         &kernel,
                         context_id,

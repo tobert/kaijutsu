@@ -62,7 +62,7 @@ preset          list, show, save, remove
 rc              add, list, rm, show, edit, reset — lifecycle scripts (/etc/rc/<type>/<verb>/)
 search          <pattern> — regex search across blocks (--all, --context, --kind, --role)
 stage           commit, status, include, exclude — curate a staged (liminal) fork
-transport       play, pause, stop, tempo <bpm>, ooda <on|off> — composer beat/playhead control
+transport       play, pause, stop, tempo <bpm>, ooda <on|off> — musician beat/playhead control
 workspace (ws)  list, show, create, add, bind, remove
 ```
 

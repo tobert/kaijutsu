@@ -1312,7 +1312,7 @@ pub struct BlockSnapshot {
     /// (coalesced events in one beat window). Uniqueness is `BlockId`'s job; the
     /// `(order_key, BlockId)` sort in `block_ids_ordered` breaks within-beat ties
     /// deterministically. The block store stamps every block (a coder's playhead
-    /// advances ~one per turn; a composer's is beat-driven), so this is `Some`
+    /// advances ~one per turn; a musician's is beat-driven), so this is `Some`
     /// for live blocks and `None` only for legacy/older-wire blocks. Distinct from
     /// `order_key` (the sibling index, derived from the tick on appends) and from
     /// DAG parentage (an orthogonal cross-context axis). See `docs/hyoushigi.md`.
