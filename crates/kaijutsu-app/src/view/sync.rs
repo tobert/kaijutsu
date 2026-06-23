@@ -10,7 +10,28 @@ use crate::cell::{
     MainCell, ViewingConversation,
 };
 use crate::connection::{RpcResultMessage, ServerEventMessage};
+use crate::ui::screen::Screen;
 use kaijutsu_client::ServerEvent;
+
+/// The `Screen` a *landed* context switch should reveal, or `None` if the
+/// current screen already shows the active context.
+///
+/// A context's conversation lives on [`Screen::Conversation`]. Any full-viewport
+/// screen that hides it — the time well today, the editor later — must yield to
+/// Conversation when a context switch lands, so the user actually sees the
+/// context they (or the kernel) switched to. This is the *general* fix for the
+/// switch-doesn't-drive-Screen gap: it keys on the screen being left, not on
+/// which writer requested the switch, so every switch path (peer `switch_context`,
+/// server-pushed `ContextSwitched` from fork / `kj context switch`, the dock, …)
+/// reveals the context uniformly. The editor-open signal is the mirror of this:
+/// it drives `Screen::Editor` from its *own* landing handler, not through here.
+fn screen_revealing_switched_context(current: Screen) -> Option<Screen> {
+    match current {
+        Screen::Conversation => None,
+        // Time well (and future editor) hide the conversation; reveal it.
+        _ => Some(Screen::Conversation),
+    }
+}
 
 /// Handle block events from the server, routing through DocumentCache.
 ///
@@ -392,6 +413,8 @@ pub fn handle_context_switch(
     mut pending_switch: ResMut<crate::cell::PendingContextSwitch>,
     bootstrap: Res<crate::connection::BootstrapChannel>,
     conn_state: Res<crate::connection::RpcConnectionState>,
+    screen: Res<State<Screen>>,
+    mut next_screen: ResMut<NextState<Screen>>,
 ) {
     for event in switch_events.read() {
         let ctx_id = event.context_id;
@@ -451,6 +474,16 @@ pub fn handle_context_switch(
         }
 
         doc_cache.set_active(ctx_id);
+
+        // A landed switch is an intent to *view* this context. If a
+        // full-viewport screen is hiding the conversation (time well today,
+        // editor later), yield to it so the switch is actually visible. Keying
+        // on the screen being left — not the switch's source — is what makes
+        // this general: every writer that funnels here reveals uniformly.
+        if let Some(target) = screen_revealing_switched_context(*screen.get()) {
+            info!("Context switch revealing {:?} from {:?}", target, screen.get());
+            next_screen.set(target);
+        }
 
         if let Some(cached) = doc_cache.get(ctx_id) {
             scroll_state.offset = cached.scroll_offset;
@@ -531,5 +564,33 @@ pub fn check_cache_staleness(
                 }
             })
             .detach();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Already on Conversation → no transition (don't churn the FSM on every
+    /// in-conversation switch, e.g. dock clicks).
+    #[test]
+    fn switching_while_on_conversation_does_not_transition() {
+        assert_eq!(
+            screen_revealing_switched_context(Screen::Conversation),
+            None
+        );
+    }
+
+    /// The bug this fixes: a switch landing while the time well owns the
+    /// viewport must reveal the conversation, not leave the user staring at the
+    /// well. Covers both the peer `switch_context` action and the server-pushed
+    /// `ContextSwitched` (fork / `kj context switch`) — both funnel through
+    /// `handle_context_switch`, which is where this decision is applied.
+    #[test]
+    fn switching_while_in_time_well_reveals_conversation() {
+        assert_eq!(
+            screen_revealing_switched_context(Screen::TimeWell),
+            Some(Screen::Conversation)
+        );
     }
 }
