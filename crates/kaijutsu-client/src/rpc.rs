@@ -1400,6 +1400,7 @@ impl KernelHandle {
         {
             let mut cfg = request.get().init_config();
             cfg.set_nick(&config.nick);
+            cfg.set_instance(&config.instance);
             request.get().set_commands(commands_client);
         }
 

@@ -733,7 +733,9 @@ struct StatFs {
 
 # Configuration for attaching a peer.
 struct PeerConfig {
-  nick @0 :Text;              # Stable address (e.g. "kaijutsu-app")
+  nick @0 :Text;              # Stable address / role (e.g. "kaijutsu-app"); shared across windows.
+  instance @1 :Text;          # Unique-per-process token (a UUID the peer mints once), so two
+                              # windows of the same nick coexist. Empty → keyed by nick (back-compat).
 }
 
 # Information about an attached peer.

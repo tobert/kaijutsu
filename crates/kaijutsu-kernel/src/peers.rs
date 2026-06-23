@@ -198,6 +198,29 @@ impl PeerRegistry {
             .collect()
     }
 
+    /// Detach a peer by key **only if its currently-registered sender is the
+    /// one passed** (same channel). This is the bridge task's self-detach: when
+    /// a re-attach has already replaced the entry under this key (same nick, or
+    /// a reconnect reusing an instance), the *old* task must NOT remove the
+    /// *new* owner's registration — `same_channel` is false, so it's a no-op.
+    /// Returns whether it removed the entry.
+    pub fn detach_if_sender(
+        &mut self,
+        key: &str,
+        sender: &mpsc::Sender<InvokeRequest>,
+    ) -> bool {
+        let is_mine = self
+            .invoke_senders
+            .get(key)
+            .map(|s| s.same_channel(sender))
+            .unwrap_or(false);
+        if is_mine {
+            self.invoke_senders.remove(key);
+            self.peers.remove(key);
+        }
+        is_mine
+    }
+
     /// Belt-and-suspenders cleanup: drop any peer whose invoke channel is
     /// closed (its bridge task / receiver is gone). The primary cleanup is the
     /// bridge task self-detaching on `conn_cancel`; this catches stragglers a
@@ -381,6 +404,33 @@ mod tests {
         assert_eq!(registry.senders_by_principal(amy).len(), 1);
         assert_eq!(registry.senders_by_principal(other).len(), 1);
         assert_eq!(registry.senders_by_principal(PrincipalId::new()).len(), 0);
+    }
+
+    /// The re-attach-replace hazard: an old bridge task self-detaching must not
+    /// remove the entry a newer attach installed under the same key.
+    #[test]
+    fn detach_if_sender_only_removes_its_own_registration() {
+        let mut registry = PeerRegistry::new();
+        let p = PrincipalId::new();
+        let (tx_old, _r_old) = mpsc::channel(8);
+        registry
+            .attach(cfg_inst("kaijutsu-app", "win", p), Some(tx_old.clone()))
+            .unwrap();
+        // A reconnect reuses the same key, replacing with a new channel.
+        let (tx_new, _r_new) = mpsc::channel(8);
+        registry
+            .attach(cfg_inst("kaijutsu-app", "win", p), Some(tx_new.clone()))
+            .unwrap();
+
+        // The OLD task's self-detach must be a no-op (it's no longer the owner).
+        assert!(!registry.detach_if_sender("win", &tx_old));
+        assert!(
+            registry.get_invoke_sender_by_instance("win").is_some(),
+            "new registration must survive the old task's self-detach"
+        );
+        // The NEW owner's self-detach removes it.
+        assert!(registry.detach_if_sender("win", &tx_new));
+        assert!(registry.get_invoke_sender_by_instance("win").is_none());
     }
 
     /// `reap_closed` drops a peer whose invoke receiver has been dropped (its

@@ -546,9 +546,12 @@ enum RpcCommand {
 // ── Client-side peer types ──────────────────────────────────────────────────
 
 /// Configuration for attaching as a peer to the kernel.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PeerConfig {
     pub nick: String,
+    /// Unique-per-process token (a UUID minted once at startup) so two windows
+    /// of the same `nick` coexist in the registry. Empty → keyed by nick.
+    pub instance: String,
 }
 
 /// Result from a successful peer attachment.

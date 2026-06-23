@@ -1105,6 +1105,17 @@ impl Kernel {
         self.peers.write().await.detach(nick)
     }
 
+    /// Detach a peer by key only if `sender` is still its registered channel —
+    /// the bridge task's self-detach, safe against a re-attach having replaced
+    /// the entry. Returns whether it removed anything.
+    pub async fn detach_peer_if_sender(
+        &self,
+        key: &str,
+        sender: &tokio::sync::mpsc::Sender<InvokeRequest>,
+    ) -> bool {
+        self.peers.write().await.detach_if_sender(key, sender)
+    }
+
     /// Get information about an attached peer.
     pub async fn get_peer(&self, nick: &str) -> Option<PeerInfo> {
         self.peers.read().await.get(nick).cloned()

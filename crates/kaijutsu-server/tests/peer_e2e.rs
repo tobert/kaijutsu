@@ -57,6 +57,7 @@ fn test_invoke_peer_round_trip() {
             .attach_peer(
                 &PeerConfig {
                     nick: "echo".to_string(),
+                    ..Default::default()
                 },
                 tx,
             )
@@ -114,6 +115,7 @@ fn test_reattach_replaces_invocation_channel() {
             .attach_peer(
                 &PeerConfig {
                     nick: "kaijutsu-app".to_string(),
+                    ..Default::default()
                 },
                 tx_old,
             )
@@ -128,6 +130,7 @@ fn test_reattach_replaces_invocation_channel() {
             .attach_peer(
                 &PeerConfig {
                     nick: "kaijutsu-app".to_string(),
+                    ..Default::default()
                 },
                 tx_new,
             )

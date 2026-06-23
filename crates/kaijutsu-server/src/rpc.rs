@@ -3278,10 +3278,15 @@ impl kernel::Server for KernelImpl {
             .to_owned();
 
         // Stamp the peer's principal from the authoritative connection identity
-        // — never trusted from the client. `instance` is wired in a follow-up
-        // (capnp field); empty for now keys the peer by nick as before.
+        // — never trusted from the client. The client-supplied `instance` is
+        // just a uniqueness token (no trust claim); empty keys the peer by nick.
         let principal = self.connection.borrow().principal.id;
-        let instance = String::new();
+        let instance = config_reader
+            .get_instance()
+            .ok()
+            .and_then(|t| t.to_str().ok())
+            .unwrap_or("")
+            .to_owned();
         // The key this peer is stored under — derived the same way the registry
         // does, so the bridge task can self-detach exactly this entry.
         let detach_key = peer_key(&nick, &instance);
@@ -3311,6 +3316,12 @@ impl kernel::Server for KernelImpl {
                     let nick_for_task = nick.clone();
                     let bridge_kernel = kernel_arc.clone();
                     let detach_key_for_task = detach_key.clone();
+                    // A clone of our own sender, used purely as an identity token
+                    // for self-detach: we remove our registry entry only if it's
+                    // still ours (a re-attach may have replaced it). Holding it
+                    // also keeps `rx` open, so the task exits on conn_cancel, not
+                    // on a transient sender drop.
+                    let tx_self = tx.clone();
 
                     // Bridge task: recv InvokeRequest from channel, call capnp callback.
                     // Per-invoke timeout matches the client-side bound (15s) so a
@@ -3354,11 +3365,16 @@ impl kernel::Server for KernelImpl {
                         }
                         // Self-detach this exact peer so a dropped connection's
                         // window can't linger in the registry (and out of any
-                        // principal/nick fan-out). reap_closed is the backstop.
-                        bridge_kernel.detach_peer(&detach_key_for_task).await;
+                        // principal/nick fan-out) — but only if we're still the
+                        // registered owner, so an old task can't clobber a peer
+                        // that re-attached under the same key. reap_closed is the
+                        // backstop for anything this misses.
+                        let removed = bridge_kernel
+                            .detach_peer_if_sender(&detach_key_for_task, &tx_self)
+                            .await;
                         log::debug!(
-                            "Peer invoke bridge for '{}' ended; detached {}",
-                            nick_for_task, detach_key_for_task,
+                            "Peer invoke bridge for '{}' ended; self-detach {} = {}",
+                            nick_for_task, detach_key_for_task, removed,
                         );
                     });
 

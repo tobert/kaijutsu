@@ -18,6 +18,15 @@ use tokio::sync::{broadcast, mpsc};
 
 use super::bootstrap::{self, BootstrapChannel, BootstrapCommand};
 
+/// This process's peer `instance` — minted once, stable for the window's life,
+/// distinct from every other window's. Lets the kernel address THIS app among
+/// several connected ones (and survives reconnect: same instance replaces its
+/// own registry entry rather than spawning a duplicate).
+fn app_peer_instance() -> &'static str {
+    static INSTANCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    INSTANCE.get_or_init(|| format!("kaijutsu-app-{}", uuid::Uuid::new_v4()))
+}
+
 // ============================================================================
 // Resources
 // ============================================================================
@@ -403,6 +412,11 @@ fn poll_bootstrap_results(
                                 .spawn(async move {
                                     let config = kaijutsu_client::PeerConfig {
                                         nick: "kaijutsu-app".to_string(),
+                                        // Stable for this process, fresh per window — so
+                                        // two app windows coexist in the peer registry and
+                                        // the kernel can address a specific one. Reused
+                                        // across reconnects (same instance → replaces).
+                                        instance: app_peer_instance().to_string(),
                                     };
                                     match h2.attach_peer(config, inv_tx2).await {
                                         Ok(info) => {
