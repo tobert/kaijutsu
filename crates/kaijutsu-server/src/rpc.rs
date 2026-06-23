@@ -1423,6 +1423,10 @@ impl world::Server for WorldImpl {
         let mut identity = results.get().init_identity();
         identity.set_username(&conn.principal.username);
         identity.set_display_name(&conn.principal.display_name);
+        // principalId @2 exists on the wire but was never populated — the
+        // canonical principal-population gap. The server is authoritative for
+        // the connection's identity, so stamp it from conn.principal here.
+        identity.set_principal_id(conn.principal.id.as_bytes());
         Promise::ok(())
     }
 

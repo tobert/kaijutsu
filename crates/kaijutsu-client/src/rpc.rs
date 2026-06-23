@@ -121,6 +121,11 @@ impl RpcClient {
         Ok(Identity {
             username: identity.get_username()?.to_string()?,
             display_name: identity.get_display_name()?.to_string()?,
+            // The server always stamps principalId now; an empty/invalid one is
+            // a protocol error, not a thing to paper over with a wrong default.
+            principal_id: PrincipalId::try_from_slice(identity.get_principal_id()?).ok_or_else(
+                || RpcError::ServerError("whoami: missing/invalid principalId".to_string()),
+            )?,
         })
     }
 
@@ -169,6 +174,10 @@ impl RpcClient {
 pub struct Identity {
     pub username: String,
     pub display_name: String,
+    /// The authenticated principal (server-stamped). Lets a client know *its
+    /// own* PrincipalId — needed e.g. to register a peer under its principal
+    /// for principal-scoped kernel→app addressing.
+    pub principal_id: PrincipalId,
 }
 
 #[derive(Debug, Clone)]
