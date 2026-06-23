@@ -10,6 +10,48 @@ Newest work first within each area; dates are when the work landed.
 
 ---
 
+## In-app vi editor
+
+Editing as a kernel-owned session: `EditorCore` (pure modalkit vim) → kernel
+`EditorSessions` → tool-shaped surface, with the Bevy app as one renderer among
+many drivers. Design + live state: `docs/vi.md`. Memory: `project_vi_editor`.
+
+### Front doors + slice-2 groundwork (landed 2026-06-23)
+
+Slice 1 (kernel, headless) was already green; this stretch added the ergonomic
+front doors and started the app-renderer groundwork.
+
+- **`vi`/`edit` builtin + `kj rc edit` opens the editor** (`82cd5f8`). A real
+  kaish `Tool` (`ViBuiltin`, registered in `context_shell.rs` under both names)
+  and bare `kj rc edit <path>` (no `--content`) both open a session via the one
+  shared `Kernel::editor_open` primitive — three front doors, one primitive, one
+  `EditorState::to_json` shape. Decisions (Amy): a real builtin, not a `kj editor
+  open` alias; session-id-only (no peer signal until slice 2). Verified live over
+  MCP (`vi`/`edit`/`keys`/`state`/`quit`).
+- **Render-path decision: Design A** (`docs/vi.md` risk #7). The app will render
+  the editor from a kernel-served `editor_state` channel and never join the
+  editor context into `DocumentCache` — so the feared `DocKind`-discriminator
+  collision can't occur (the cache only holds *joined* contexts; ops for
+  un-joined contexts are dropped). Item "DocKind discriminator" evaporated.
+- **General Screen-transition fix** (`116ed57`). A landed context switch now
+  drives the `Screen` FSM (`screen_revealing_switched_context`), so a
+  kernel/peer-driven `switch_context` or server-pushed `ContextSwitched` while
+  the app is in the time well reveals the conversation instead of stranding the
+  user in the well — closing `tech_debt_switch_context_screen_transition`.
+  Runner-verified (in the well → `kj context switch` → pops to conversation).
+- **invoke_peer double-encoding fix** (`4614c29`). Object `params` arrived at the
+  MCP server as a JSON *string*; `normalize_peer_params` unwraps one layer.
+  Surfaced verifying the Screen fix; de-risks slice-2's editor-open signal.
+- **App-id addressing groundwork** (decisions: submitter-aware routing with
+  principal fallback; build the infra now). `whoami` now stamps `principalId`
+  (`55d285e`) — the canonical principal-population gap (the wire field existed,
+  nobody set it). The peer registry is now keyed by a per-peer `instance` with
+  server-stamped `principal` and by-nick/principal/instance addressing
+  (`41e236c`), fixing the latent "second app window evicts the first" clobber.
+  Remaining (Slice C): the capnp `instance` field, the app minting a per-process
+  instance, and connection-drop peer cleanup (else closed windows leak) — then
+  the slice-2 `open_editor` signal consumes it.
+
 ## Time-well context browser
 
 The radial 3D "well" of context cards (`docs/viz-substrate.md` build order;
