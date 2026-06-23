@@ -15,8 +15,8 @@ use kaijutsu_crdt::{ContextId, KernelId};
 use kaijutsu_types::{BlockId, BlockSnapshot};
 use tokio::sync::broadcast;
 
-use crate::kaijutsu_capnp::{block_events, kernel_output, resource_events};
-use crate::rpc::{parse_block_id, parse_block_snapshot};
+use crate::kaijutsu_capnp::{block_events, editor_events, kernel_output, resource_events};
+use crate::rpc::{EditorState, parse_block_id, parse_block_snapshot, parse_editor_state};
 
 // ============================================================================
 // Event Types
@@ -108,6 +108,11 @@ pub enum ServerEvent {
     ResourceListChanged { server: String },
     /// Server-side context switch (fork, context switch command).
     ContextSwitched { context_id: ContextId },
+    /// An in-app editor session's state changed (keystroke, save, or — later —
+    /// a remote CRDT merge). Carries the full renderer-facing snapshot.
+    EditorStateChanged { state: EditorState },
+    /// An in-app editor session closed (`ZQ`/quit). Renderers drop it.
+    EditorClosed { session_id: u64 },
 }
 
 /// Connection lifecycle status broadcast by the reconnect FSM.
@@ -196,6 +201,83 @@ fn parse_status(status: crate::kaijutsu_capnp::Status) -> kaijutsu_types::Status
         crate::kaijutsu_capnp::Status::Running => kaijutsu_types::Status::Running,
         crate::kaijutsu_capnp::Status::Done => kaijutsu_types::Status::Done,
         crate::kaijutsu_capnp::Status::Error => kaijutsu_types::Status::Error,
+    }
+}
+
+// ============================================================================
+// Editor Events Forwarder
+// ============================================================================
+
+/// Implements the Cap'n Proto `EditorEvents::Server` trait, forwarding each
+/// editor-session push into the shared `broadcast::Sender<ServerEvent>`.
+pub(crate) struct EditorEventsForwarder {
+    pub event_tx: broadcast::Sender<ServerEvent>,
+}
+
+/// Build an `EditorEvents` callback client plus the receiver its pushes land on.
+///
+/// Pass the returned client to [`KernelHandle::subscribe_editor`](crate::rpc::KernelHandle::subscribe_editor);
+/// drain the receiver for [`ServerEvent::EditorStateChanged`] /
+/// [`ServerEvent::EditorClosed`]. The app's editor renderer and the headless
+/// e2e tests share this one wiring — the single place the push callback is built.
+pub fn editor_events_channel(
+    capacity: usize,
+) -> (
+    crate::kaijutsu_capnp::editor_events::Client,
+    broadcast::Receiver<ServerEvent>,
+) {
+    let (tx, rx) = broadcast::channel(capacity);
+    let client: crate::kaijutsu_capnp::editor_events::Client =
+        capnp_rpc::new_client(EditorEventsForwarder { event_tx: tx });
+    (client, rx)
+}
+
+#[allow(refining_impl_trait)]
+impl editor_events::Server for EditorEventsForwarder {
+    fn on_editor_state(
+        self: Rc<Self>,
+        params: editor_events::OnEditorStateParams,
+        _results: editor_events::OnEditorStateResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = match params.get() {
+            Ok(p) => p,
+            Err(e) => return Promise::err(e),
+        };
+        let state: EditorState = match params.get_state() {
+            Ok(r) => match parse_editor_state(r) {
+                Ok(s) => s,
+                Err(e) => return Promise::err(rpc_to_capnp(e)),
+            },
+            Err(e) => return Promise::err(e),
+        };
+        if self
+            .event_tx
+            .send(ServerEvent::EditorStateChanged { state })
+            .is_err()
+        {
+            tracing::warn!("Event channel closed, dropping EditorStateChanged event");
+        }
+        Promise::ok(())
+    }
+
+    fn on_editor_closed(
+        self: Rc<Self>,
+        params: editor_events::OnEditorClosedParams,
+        _results: editor_events::OnEditorClosedResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = match params.get() {
+            Ok(p) => p,
+            Err(e) => return Promise::err(e),
+        };
+        let session_id = params.get_session_id();
+        if self
+            .event_tx
+            .send(ServerEvent::EditorClosed { session_id })
+            .is_err()
+        {
+            tracing::warn!("Event channel closed, dropping EditorClosed event");
+        }
+        Promise::ok(())
     }
 }
 

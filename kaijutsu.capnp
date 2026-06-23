@@ -357,6 +357,24 @@ interface BlockEvents {
   onBlockOutputChanged @12 (contextId :Data, blockId :BlockId, output :OutputData);
 }
 
+# Renderer-facing snapshot of an in-app editor session (the vi/edit builtin).
+# Carries everything a renderer draws; see docs/vi.md.
+struct EditorState {
+  session @0 :UInt64;
+  text @1 :Text;
+  cursor @2 :UInt64;     # char offset of the cursor
+  mode @3 :Text;         # vim mode label; "" = none/normal
+  dirty @4 :Bool;        # buffer differs from the last open/save checkpoint
+}
+
+# Callback for receiving editor-session state pushes (the in-app vi editor).
+# The push channel exists so a peer's CRDT merge into an open block reaches
+# every renderer the instant it lands — collaborative editing, not poll lag.
+interface EditorEvents {
+  onEditorState @0 (state :EditorState);
+  onEditorClosed @1 (sessionId :UInt64);
+}
+
 # ============================================================================
 # Block Queries & Timeline
 # ============================================================================
@@ -1227,6 +1245,22 @@ interface Kernel {
   # Subscribe to whole-store changes (callback fires per set/delete). The
   # client filters by prefix; v1 streams the whole store.
   kvWatch @83 (callback :KvEvents);
+
+  # ==========================================================================
+  # In-app editor sessions (the vi/edit builtin; see docs/vi.md)
+  # ==========================================================================
+  # A kernel-owned vi session bound to the CRDT block that owns a path's text.
+  # Session ids are global (no contextId needed); the path resolves the owner.
+  # Renderers draw `editorState`/`subscribeEditor` and forward keys to
+  # `editorKeys`. Edits mirror onto the CRDT block — rc/config permission errors
+  # surface here loudly (crash over corruption).
+  editorOpen @84 (path :Text, trace :TraceContext) -> (state :EditorState);
+  editorKeys @85 (sessionId :UInt64, keys :Text, trace :TraceContext) -> (state :EditorState);
+  editorState @86 (sessionId :UInt64, trace :TraceContext) -> (state :EditorState);
+  editorSave @87 (sessionId :UInt64, trace :TraceContext) -> (state :EditorState);
+  editorQuit @88 (sessionId :UInt64, trace :TraceContext) -> ();
+  # Push channel: server streams editor state changes (incl. future remote merges).
+  subscribeEditor @89 (callback :EditorEvents);
 }
 
 # ============================================================================

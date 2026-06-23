@@ -23,13 +23,15 @@ pub use actor::{
 };
 pub use rpc::{
     Completion, CompletionKind, ConsentMode, ContextCluster, ContextInfo, ContextMembership,
-    HistoryEntry, Identity, InputState, KernelConfig, KernelHandle, KernelInfo, LlmConfigInfo,
-    LlmProviderInfo, McpResource, McpToolResult, MountSpec, PresetInfo,
+    EditorState, HistoryEntry, Identity, InputState, KernelConfig, KernelHandle, KernelInfo,
+    LlmConfigInfo, LlmProviderInfo, McpResource, McpToolResult, MountSpec, PresetInfo,
     RpcClient, RpcError, ShellValue, SimilarContext, StagedDriftInfo, SubmitResult, SyncState,
     ToolResult, ToolSchema, VersionSnapshot,
 };
 pub use ssh::{KeySource, SshChannels, SshClient, SshConfig, SshError};
-pub use subscriptions::{ConnectionStatus, OutputEvent, ServerEvent, SyncGeneration};
+pub use subscriptions::{
+    ConnectionStatus, OutputEvent, ServerEvent, SyncGeneration, editor_events_channel,
+};
 pub use sync::{SkipReason, SyncError, SyncManager, SyncResult};
 pub use synced_document::{SyncEffect, SyncedDocument};
 pub use synced_input::SyncedInput;

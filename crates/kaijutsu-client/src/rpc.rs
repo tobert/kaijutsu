@@ -853,6 +853,101 @@ impl KernelHandle {
     }
 
     // =========================================================================
+    // In-app editor sessions (the vi/edit builtin; see docs/vi.md)
+    // =========================================================================
+
+    /// Open an editor session on `path`, binding to the CRDT block that owns its
+    /// text. Returns the initial state (carrying the new session id).
+    #[tracing::instrument(skip(self), name = "rpc_client.editor_open")]
+    pub async fn editor_open(&self, path: &str) -> Result<EditorState, RpcError> {
+        let mut request = self.kernel.editor_open_request();
+        request.get().set_path(path);
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        let response = request.send().promise.await?;
+        parse_editor_state(response.get()?.get_state()?)
+    }
+
+    /// Feed vim-notation keys to an open session; returns the new state.
+    #[tracing::instrument(skip(self), name = "rpc_client.editor_keys")]
+    pub async fn editor_keys(&self, session_id: u64, keys: &str) -> Result<EditorState, RpcError> {
+        let mut request = self.kernel.editor_keys_request();
+        request.get().set_session_id(session_id);
+        request.get().set_keys(keys);
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        let response = request.send().promise.await?;
+        parse_editor_state(response.get()?.get_state()?)
+    }
+
+    /// Read the current state of an open session.
+    #[tracing::instrument(skip(self), name = "rpc_client.editor_state")]
+    pub async fn editor_state(&self, session_id: u64) -> Result<EditorState, RpcError> {
+        let mut request = self.kernel.editor_state_request();
+        request.get().set_session_id(session_id);
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        let response = request.send().promise.await?;
+        parse_editor_state(response.get()?.get_state()?)
+    }
+
+    /// `ZZ` — checkpoint the session's buffer as saved; returns the clean state.
+    #[tracing::instrument(skip(self), name = "rpc_client.editor_save")]
+    pub async fn editor_save(&self, session_id: u64) -> Result<EditorState, RpcError> {
+        let mut request = self.kernel.editor_save_request();
+        request.get().set_session_id(session_id);
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        let response = request.send().promise.await?;
+        parse_editor_state(response.get()?.get_state()?)
+    }
+
+    /// `ZQ` — roll the block back to the session's checkpoint and close it.
+    #[tracing::instrument(skip(self), name = "rpc_client.editor_quit")]
+    pub async fn editor_quit(&self, session_id: u64) -> Result<(), RpcError> {
+        let mut request = self.kernel.editor_quit_request();
+        request.get().set_session_id(session_id);
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        request.send().promise.await?;
+        Ok(())
+    }
+
+    /// Subscribe to editor-session state pushes (the in-app vi editor channel).
+    /// The server streams `EditorState` changes (and future remote merges) to
+    /// `callback` until the connection drops.
+    #[tracing::instrument(skip(self, callback), name = "rpc_client.subscribe_editor")]
+    pub async fn subscribe_editor(
+        &self,
+        callback: crate::kaijutsu_capnp::editor_events::Client,
+    ) -> Result<(), RpcError> {
+        let mut request = self.kernel.subscribe_editor_request();
+        request.get().set_callback(callback);
+        request.send().promise.await?;
+        Ok(())
+    }
+
+    // =========================================================================
     // MCP Tool operations
     // =========================================================================
 
@@ -2683,6 +2778,33 @@ pub struct InputState {
     pub content: String,
     pub ops: Vec<u8>,
     pub version: u64,
+}
+
+/// Renderer-facing snapshot of an in-app editor session (the vi/edit builtin).
+/// The client form of the kernel's `EditorState` (see docs/vi.md). `mode` is
+/// `None` when the wire `mode` is empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditorState {
+    pub session: u64,
+    pub text: String,
+    pub cursor: u64,
+    pub mode: Option<String>,
+    pub dirty: bool,
+}
+
+/// Parse a capnp `EditorState` reader into the client struct. Shared by the
+/// `editor_*` RPC methods and the `EditorEvents` push forwarder.
+pub(crate) fn parse_editor_state(
+    r: crate::kaijutsu_capnp::editor_state::Reader<'_>,
+) -> Result<EditorState, RpcError> {
+    let mode = r.get_mode()?.to_string()?;
+    Ok(EditorState {
+        session: r.get_session(),
+        text: r.get_text()?.to_string()?,
+        cursor: r.get_cursor(),
+        mode: if mode.is_empty() { None } else { Some(mode) },
+        dirty: r.get_dirty(),
+    })
 }
 
 /// Result from a kernel tool execution (executeTool @16).

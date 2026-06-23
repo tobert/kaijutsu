@@ -98,6 +98,7 @@ use kaijutsu_kernel::{
     SharedInputDocFlowBus,
     VfsOps,
     block_store::BlockStore,
+    flows::EditorFlow,
     flows::TurnFlow,
     shared_block_flow_bus,
     shared_input_doc_flow_bus,
@@ -2544,6 +2545,168 @@ impl kernel::Server for KernelImpl {
                 }
 
                 log::debug!("FlowBus bridge task for kernel {} ended", kernel_id);
+            });
+        }
+        Promise::ok(())
+    }
+
+    // ── In-app editor sessions (the vi/edit builtin; see docs/vi.md) ────────
+    // Thin wire wrappers over the kernel's `editor_*` primitives. Session ids
+    // are global; the path resolves the owning CRDT block. Edits mirror onto
+    // that block — rc/config permission errors surface here loudly.
+
+    fn editor_open(
+        self: Rc<Self>,
+        params: kernel::EditorOpenParams,
+        mut results: kernel::EditorOpenResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let span = extract_rpc_trace(p.get_trace(), "editor_open");
+        let path = pry!(pry!(p.get_path()).to_str()).to_owned();
+        let kernel = self.kernel.clone();
+        Promise::from_future(
+            async move {
+                match kernel.kernel.editor_open(&path, &kernel.documents).await {
+                    Ok((id, state)) => {
+                        set_editor_state(results.get().init_state(), id.as_u64(), &state);
+                        Ok(())
+                    }
+                    Err(e) => Err(capnp::Error::failed(format!("editor_open failed: {e}"))),
+                }
+            }
+            .instrument(span),
+        )
+    }
+
+    fn editor_keys(
+        self: Rc<Self>,
+        params: kernel::EditorKeysParams,
+        mut results: kernel::EditorKeysResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let _guard = extract_rpc_trace(p.get_trace(), "editor_keys").entered();
+        let session_id = p.get_session_id();
+        let keys = pry!(pry!(p.get_keys()).to_str()).to_owned();
+        let id = kaijutsu_kernel::editor::EditorSessionId::from_u64(session_id);
+        match self
+            .kernel
+            .kernel
+            .editor_keys(id, &keys, &self.kernel.documents)
+        {
+            Ok(state) => {
+                set_editor_state(results.get().init_state(), session_id, &state);
+                Promise::ok(())
+            }
+            Err(e) => Promise::err(capnp::Error::failed(format!("editor_keys failed: {e}"))),
+        }
+    }
+
+    fn editor_state(
+        self: Rc<Self>,
+        params: kernel::EditorStateParams,
+        mut results: kernel::EditorStateResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let _guard = extract_rpc_trace(p.get_trace(), "editor_state").entered();
+        let session_id = p.get_session_id();
+        let id = kaijutsu_kernel::editor::EditorSessionId::from_u64(session_id);
+        match self.kernel.kernel.editor_state(id) {
+            Ok(state) => {
+                set_editor_state(results.get().init_state(), session_id, &state);
+                Promise::ok(())
+            }
+            Err(e) => Promise::err(capnp::Error::failed(format!("editor_state failed: {e}"))),
+        }
+    }
+
+    fn editor_save(
+        self: Rc<Self>,
+        params: kernel::EditorSaveParams,
+        mut results: kernel::EditorSaveResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let _guard = extract_rpc_trace(p.get_trace(), "editor_save").entered();
+        let session_id = p.get_session_id();
+        let id = kaijutsu_kernel::editor::EditorSessionId::from_u64(session_id);
+        match self.kernel.kernel.editor_save(id) {
+            Ok(state) => {
+                set_editor_state(results.get().init_state(), session_id, &state);
+                Promise::ok(())
+            }
+            Err(e) => Promise::err(capnp::Error::failed(format!("editor_save failed: {e}"))),
+        }
+    }
+
+    fn editor_quit(
+        self: Rc<Self>,
+        params: kernel::EditorQuitParams,
+        _results: kernel::EditorQuitResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let _guard = extract_rpc_trace(p.get_trace(), "editor_quit").entered();
+        let session_id = p.get_session_id();
+        let id = kaijutsu_kernel::editor::EditorSessionId::from_u64(session_id);
+        match self.kernel.kernel.editor_quit(id, &self.kernel.documents) {
+            Ok(()) => Promise::ok(()),
+            Err(e) => Promise::err(capnp::Error::failed(format!("editor_quit failed: {e}"))),
+        }
+    }
+
+    /// Push channel: forward `EditorFlow` events to the subscriber's callback.
+    /// Mirrors `subscribe_blocks` — a per-connection bridge task with the same
+    /// cancellation + callback-timeout + health-reaping discipline.
+    fn subscribe_editor(
+        self: Rc<Self>,
+        params: kernel::SubscribeEditorParams,
+        _results: kernel::SubscribeEditorResults,
+    ) -> Promise<(), capnp::Error> {
+        let _span = tracing::info_span!("rpc", method = "subscribe_editor").entered();
+        let callback = pry!(pry!(params.get()).get_callback());
+        {
+            let editor_flows = self.kernel.kernel.editor_flows().clone();
+            let kernel_id = self.kernel.id;
+            let conn_cancel = self.connection.borrow().cancel_token();
+
+            tokio::task::spawn_local(async move {
+                let mut sub = editor_flows.subscribe("editor.*");
+                let mut health = SubscriberHealth::new(MAX_SUBSCRIBER_FAILURES);
+                const CALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+                log::debug!("Started editor subscription for kernel {}", kernel_id);
+
+                loop {
+                    let success = tokio::select! {
+                        _ = conn_cancel.cancelled() => {
+                            log::debug!("editor bridge cancelled with connection");
+                            break;
+                        }
+                        Some(msg) = sub.recv() => {
+                            match msg.payload {
+                                EditorFlow::StateChanged { session_id, ref state } => {
+                                    let mut req = callback.on_editor_state_request();
+                                    set_editor_state(req.get().init_state(), session_id, state);
+                                    await_editor_callback(req.send().promise, CALLBACK_TIMEOUT, kernel_id).await
+                                }
+                                EditorFlow::Closed { session_id } => {
+                                    let mut req = callback.on_editor_closed_request();
+                                    req.get().set_session_id(session_id);
+                                    await_editor_callback(req.send().promise, CALLBACK_TIMEOUT, kernel_id).await
+                                }
+                            }
+                        }
+                        else => break,
+                    };
+
+                    if !health.record(success) {
+                        log::warn!(
+                            "editor bridge for kernel {} stopping: {} consecutive \
+                             callback failures — reaping subscriber",
+                            kernel_id,
+                            MAX_SUBSCRIBER_FAILURES,
+                        );
+                        break;
+                    }
+                }
+                log::debug!("editor bridge task for kernel {} ended", kernel_id);
             });
         }
         Promise::ok(())
@@ -7009,6 +7172,46 @@ fn derive_context_live_status(statuses_in_order: &[kaijutsu_crdt::Status]) -> ka
 /// *sustained* one. A truly-dead peer is still caught: each failed callback
 /// has already burned its 5s timeout, so `max_consecutive_failures` strikes
 /// bound the reap delay (3 × 5s = 15s), well under the ~90s SSH keepalive that
+/// Fill an `EditorState` capnp builder from the kernel's editor state + the
+/// session id (carried alongside, since the kernel state struct omits it).
+/// `mode: None` maps to `""` on the wire.
+fn set_editor_state(
+    mut b: crate::kaijutsu_capnp::editor_state::Builder<'_>,
+    session_id: u64,
+    state: &kaijutsu_kernel::editor::EditorState,
+) {
+    b.set_session(session_id);
+    b.set_text(&state.text);
+    b.set_cursor(state.cursor as u64);
+    b.set_mode(state.mode.as_deref().unwrap_or(""));
+    b.set_dirty(state.dirty);
+}
+
+/// Await an editor-callback round-trip with the shared callback timeout,
+/// returning `true` on success (mirrors the per-event Ok/timeout/err handling
+/// in `subscribe_blocks`). Generic over the callback's response type since the
+/// bridge only cares whether the peer accepted the push.
+async fn await_editor_callback<T>(
+    promise: impl std::future::Future<Output = Result<T, capnp::Error>>,
+    timeout: std::time::Duration,
+    kernel_id: impl std::fmt::Display,
+) -> bool {
+    match tokio::time::timeout(timeout, promise).await {
+        Ok(Ok(_)) => true,
+        Ok(Err(e)) => {
+            log::debug!("editor callback failed for {kernel_id}: {e}");
+            false
+        }
+        Err(_) => {
+            log::warn!(
+                "editor callback timed out after {timeout:?} for kernel {kernel_id} \
+                 — peer is not reading; dropping subscriber"
+            );
+            false
+        }
+    }
+}
+
 /// tears the whole connection down for a genuinely vanished peer. A single
 /// success resets the count.
 #[derive(Debug)]

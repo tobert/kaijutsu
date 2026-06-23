@@ -280,9 +280,12 @@ accept last-writer semantics for pass 1 and note it.
      drift between front doors). 3 vi-builtin tests + the rewired rc test green.
 
 **Slice 2 — app, on the runner** (verify visually). Render path = **Design A**
-(decided 2026-06-23): the app gets editor state over a dedicated `editor_state`
-channel (push or poll, like the time-well polls `get_clusters`) and never joins
-the editor context into `DocumentCache` (see risk #7). Groundwork first:
+(decided 2026-06-23): the app gets editor state over a dedicated channel and
+never joins the editor context into `DocumentCache` (see risk #7). **Channel =
+push, not poll** (decided 2026-06-23, Amy): a `subscribeEditor` callback mirroring
+`subscribeBlocks`, so remote CRDT merges into an open block reach every renderer
+the instant they land — collaborative editing is the point, and poll would lag it.
+The concrete wire/build plan is **"Slice 2 build plan" below**. Groundwork first:
 
 0a. ✅ **General Screen-transition fix** (commit `116ed57`). `handle_context_switch`
     (`view/sync.rs`) now drives the `Screen` FSM on a *landed* switch:
@@ -309,9 +312,134 @@ the editor context into `DocumentCache` (see risk #7). Groundwork first:
     **verify the submitter-side `KjCaller.principal` is populated** (Amy's
     principal-population caveat — whoami + peer-principal are done). Live
     2-window coexistence check wants a second window.
-5. `Screen::Editor` + MSDF panel rendering `editor_state`; key forwarding to
+5. `Screen::Editor` + MSDF panel rendering editor state; key forwarding to
    `editor_keys`; cursor quad + selection rects from parley.
 6. Optimistic local mirror only if latency demands it.
+
+---
+
+## Slice 2 build plan (2026-06-23) — dependency-ordered, test-first where headless
+
+Slice-2 groundwork (0a Screen-transition, 0b app-id addressing) is **done**. The five
+steps below are the remaining work, ordered so each is testable before the next
+depends on it. Steps 1–2 are headless (e2e harness, no GPU); steps 3–5 are the
+runner-verified renderer. **Render channel = push** (`subscribeEditor`).
+
+### Step 1 — editor wire surface (headless, TDD). *The gate for everything app-side.*
+
+> **1a SHIPPED (2026-06-23).** The full request/response surface + the push
+> subscription are wired and green over real SSH + Cap'n Proto. capnp:
+> `EditorState` struct + `editorOpen/Keys/State/Save/Quit @84–88` + `EditorEvents`
+> (`onEditorState`/`onEditorClosed`) + `subscribeEditor @89`. Kernel: `EditorFlow`
+> on a new `editor_flows` bus; `editor_keys`/`editor_save` publish `StateChanged`,
+> `editor_quit` publishes `Closed`. Server: 5 handlers + a `subscribe_editor`
+> bridge (mirrors `subscribe_blocks` — cancel + callback-timeout + health-reap).
+> Client: `KernelHandle::editor_*` + `subscribe_editor`; `EditorState` +
+> `parse_editor_state`; `EditorEventsForwarder` + the public
+> `editor_events_channel()` building block; `ServerEvent::EditorStateChanged`/
+> `EditorClosed`. e2e: `crates/kaijutsu-server/tests/editor_wire.rs` (2 tests) —
+> open/keys/state/quit + rollback over the wire, and keys/save/quit pushes
+> received on the subscription. **Deferred to 1b** (its own task): the actor
+> auto-resubscribe-on-connect (the renderer in step 4 consumes
+> `editor_events_channel`), and the remote-merge push below.
+
+There is **zero** capnp plumbing for the editor today; the `Kernel::editor_*`
+methods (`kernel.rs:842–887`, return `editor::EditorState`) never cross the wire.
+Add a request/response surface **plus** a push subscription, mirroring the input-doc
+surface (`editInput`/`getInputState`, capnp `@44–48`) and the block subscription
+(`subscribeBlocks @39` + `BlockEvents`).
+
+- **`kaijutsu.capnp`** (next free method is `@84`; add an `EditorState` struct):
+  - `struct EditorState { session @0 :UInt64; text @1 :Text; cursor @2 :UInt64; mode @3 :Text; dirty @4 :Bool; }`
+  - `editorOpen  @84 (path :Text, trace :TraceContext) -> (state :EditorState)` —
+    no `contextId`: the path resolves the owning block; session ids are global.
+  - `editorKeys  @85 (sessionId :UInt64, keys :Text, trace :TraceContext) -> (state :EditorState)`
+  - `editorState @86 (sessionId :UInt64, trace :TraceContext) -> (state :EditorState)`
+  - `editorSave  @87 (sessionId :UInt64, trace :TraceContext) -> (state :EditorState)`
+  - `editorQuit  @88 (sessionId :UInt64, trace :TraceContext) -> ()`
+  - `interface EditorEvents { onEditorState @0 (sessionId :UInt64, state :EditorState); onEditorClosed @1 (sessionId :UInt64); }`
+  - `subscribeEditor @89 (callback :EditorEvents)`
+- **Kernel push source** (`flows.rs`): add `EditorFlow::StateChanged { session_id, state }` /
+  `Closed { session_id }` with topics `editor.state_changed` / `editor.closed`, and a
+  bus on the kernel (clone-able like `block_flows()`). Split into two passes:
+  - **1a (local-edit push):** the kernel's `editor_keys/save/quit` publish after the
+    registry mutates (`kernel.rs:855–887`). `EditorCore` is `!Send` and the registry
+    is pure, so the kernel wrapper (which already holds the bus) is the publish site,
+    not `EditorSessions`. The subscription goes live + e2e-testable here.
+  - **1b (remote-merge push — risk #2, the reason push beats poll):** `EditorCore`
+    has **no `apply_remote_ops` yet**. Build it (merge a peer's CRDT ops into the
+    buffer + transform this session's cursor), wire it where block `TextOps` apply to
+    a block an open session is bound to, and publish `StateChanged` there. This is the
+    cursor-reconciliation chunk; deferred to its own pass with the concurrent-merge test.
+- **Server** (`rpc.rs`): five request handlers (copy the `editInput`/`getInputState`
+  shape, ~`4345–4426`; trace-extract; facade-gate the mutators `editorKeys/Save/Quit`,
+  leave `editorState` ungated) + a `subscribe_editor` bridge task copying
+  `subscribe_blocks` (`rpc.rs:2081+`): `spawn_local`, `editor_flows.subscribe("editor.*")`,
+  match `EditorFlow` → `callback.on_editor_state_request()`.
+- **Client** (`rpc.rs` + `actor.rs`): five façade methods (copy `edit_input`/
+  `get_input_state`, `client/src/rpc.rs:1562–1652`); an `EditorEventsForwarder`
+  implementing `editor_events::Server` (copy `BlockEventsForwarder`,
+  `subscriptions.rs:165–203`) forwarding to a new `ServerEvent::EditorStateChanged`/
+  `EditorClosed`; subscribe in the actor on connect/reconnect (mirror
+  `resubscribe_blocks`, `actor.rs:1769–1799`).
+- **Test (layer 2++):** e2e in `kaijutsu-server` (reuse `e2e_shell`/live-eval): open via
+  the client RPC, send keys, assert pushed `EditorState` arrives on the subscription
+  and matches `editorState`; assert a second session's remote edit pushes a
+  `StateChanged` to the first. No GPU.
+
+### Step 2 — `open_editor` peer signal (headless-testable kernel half).
+
+Today `editor_open` is **session-id-only** — it returns a handle but fires no peer
+signal (deferred from step 4 on purpose). Wire it now:
+
+- **Kernel**: at the `vi`/`edit`/`kj rc edit` open path, after opening the session,
+  `invoke_peer` the requesting app with action `"open_editor"` and params
+  `{ session, context_id, path }`. **Submitter-aware:** target the submitting peer's
+  `instance` (`peers.rs:172`), fall back to `senders_by_principal` (`peers.rs:190`)
+  for that principal's other windows, then the single `APP_PEER_NICK` as last resort.
+  **Confront the flagged gap first:** verify the submitter-side `KjCaller.principal`
+  is actually populated at this path (whoami + peer-principal are fixed; this submitter
+  side is unverified — Amy's caveat). If it is nil, fixing population is part of this step.
+- **App**: new arm in `dispatch_peer_action` (`peers/systems.rs:39–106`,
+  `"open_editor"`): deserialize params, write `EditorOpenRequested { session, context_id, path }`.
+
+### Step 3 — `Screen::Editor` FSM + landing handler.
+
+- Add `Editor` to `Screen` (`ui/screen.rs:18–31`); `OnEnter(Editor)` hides conversation
+  chrome (mirror `TimeWell` enter/exit, `time_well/mod.rs:37–71`), `OnExit` restores.
+- `screen_revealing_switched_context` (`view/sync.rs:18–34`) already treats any
+  non-Conversation screen as "reveal Conversation on a context switch" — `Editor`
+  inherits that for free (a `kj context switch` while editing pops to conversation).
+- New landing system `handle_editor_open` (mirror `handle_context_switch`,
+  `view/sync.rs:409–498`): reads `EditorOpenRequested`, stores the session in an
+  `ActiveEditor` resource, `next_screen.set(Screen::Editor)`.
+
+### Step 4 — MSDF panel renderer (on the runner).
+
+- Reuse the panel primitive: `create_msdf_panel` + `commit_panel_glyphs`
+  (`time_well/panel.rs:31–58`); spawn one editor panel on `OnEnter(Editor)`.
+- An `EditorEventsForwarder` event drains (step 1) into the `ActiveEditor` resource;
+  a render system (gated `run_if(in_state(Screen::Editor))`) rebuilds the parley
+  `Layout` from the editor text (`text/shaping/font.rs:34–67` `layout`), collects
+  glyphs (`collect_msdf_glyphs`, `time_well/text.rs:54–70`), and commits on change.
+- **Cursor quad + selection rects:** reuse the compose precedent verbatim —
+  `parley::editing::Cursor::from_byte_index(&layout, byte, Affinity::Upstream)
+  .geometry(&layout, 2.0)` and the `OverlayCursorGeometry` → `BlockFxMaterial`
+  `cursor_params`/`selection_params` shader uniforms (`view/overlay.rs:348–400`,
+  `shaders/mod.rs:145–196`). Editor cursor byte = char-offset→byte over the text.
+
+### Step 5 — key forwarding.
+
+- `editor_dispatch_keys` system gated `run_if(in_state(Screen::Editor))`: drain
+  `KeyboardInput`, translate to modalkit/vim key-notation strings, `IoTaskPool`-spawn
+  `handle.editor_keys(ctx, session, keys)` (mirror `apply_insert`/`apply_delete`,
+  `input/vim/dispatch.rs:127–195`). The push subscription returns the new state — no
+  optimistic mirror until latency is measured (step 6, deferred).
+
+**Wire-surface debt to retire at "done":** every new capnp method/struct re-justified
+(the tech-debt sweep). `subscribeEditor` earns its keep via the remote-merge push;
+the five request methods mirror the input-doc surface. Fold landed pieces out of
+`docs/issues.md` as they ship.
 
 ---
 

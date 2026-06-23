@@ -23,7 +23,8 @@ use crate::control::ConsentMode;
 use crate::drift::{SharedDriftRouter, shared_drift_router};
 use crate::execution::{ExecContext, ExecResult};
 use crate::flows::{
-    SharedBlockFlowBus, SharedTurnFlowBus, shared_block_flow_bus, shared_turn_flow_bus,
+    SharedBlockFlowBus, SharedEditorFlowBus, SharedTurnFlowBus, shared_block_flow_bus,
+    shared_editor_flow_bus, shared_turn_flow_bus,
 };
 use crate::llm::{LlmRegistry, Provider};
 use crate::mcp::Broker;
@@ -113,6 +114,11 @@ pub struct Kernel {
     /// sync mutex because every editor op is synchronous — modalkit's `!Send`
     /// `EditorCore` never crosses an await (see [`crate::editor::SendSessions`]).
     editor_sessions: parking_lot::Mutex<crate::editor::SendSessions>,
+    /// FlowBus for editor-session state changes — the push channel the app
+    /// renders from. `editor_keys`/`editor_save` publish `StateChanged`,
+    /// `editor_quit` publishes `Closed`; the server's `subscribe_editor` bridge
+    /// serializes these onto the `EditorEvents` capnp callback.
+    editor_flows: SharedEditorFlowBus,
 }
 
 /// Removes its directory on drop. A tiny owned guard so `new_ephemeral()` test
@@ -187,6 +193,7 @@ impl Kernel {
             editor_sessions: parking_lot::Mutex::new(crate::editor::SendSessions(
                 crate::editor::EditorSessions::new(),
             )),
+            editor_flows: shared_editor_flow_bus(DEFAULT_FLOW_CAPACITY),
         }
     }
 
@@ -247,6 +254,7 @@ impl Kernel {
             editor_sessions: parking_lot::Mutex::new(crate::editor::SendSessions(
                 crate::editor::EditorSessions::new(),
             )),
+            editor_flows: shared_editor_flow_bus(DEFAULT_FLOW_CAPACITY),
         }
     }
 
@@ -646,6 +654,12 @@ impl Kernel {
         &self.block_flows
     }
 
+    /// Get the editor flows bus — the editor-state push channel. The server's
+    /// `subscribe_editor` bridge subscribes here and forwards to a client.
+    pub fn editor_flows(&self) -> &SharedEditorFlowBus {
+        &self.editor_flows
+    }
+
     /// Get the turn flows bus (autonomous turn requests).
     pub fn turn_flows(&self) -> &SharedTurnFlowBus {
         &self.turn_flows
@@ -852,13 +866,17 @@ impl Kernel {
     }
 
     /// Feed keys to an open session, mirroring the edits onto the CRDT block.
+    /// Publishes the new state on the editor push channel so every renderer of
+    /// this session updates.
     pub fn editor_keys(
         &self,
         id: crate::editor::EditorSessionId,
         keys: &str,
         blocks: &crate::block_store::SharedBlockStore,
     ) -> Result<crate::editor::EditorState, String> {
-        self.editor_sessions.lock().0.keys(id, keys, blocks)
+        let state = self.editor_sessions.lock().0.keys(id, keys, blocks)?;
+        self.publish_editor_state(id, &state);
+        Ok(state)
     }
 
     /// Current state of an open session.
@@ -869,21 +887,42 @@ impl Kernel {
         self.editor_sessions.lock().0.state(id)
     }
 
-    /// `ZZ` — checkpoint the session's buffer as saved.
+    /// `ZZ` — checkpoint the session's buffer as saved. Publishes the now-clean
+    /// state (dirty flips false) so renderers reflect the save.
     pub fn editor_save(
         &self,
         id: crate::editor::EditorSessionId,
     ) -> Result<crate::editor::EditorState, String> {
-        self.editor_sessions.lock().0.save(id)
+        let state = self.editor_sessions.lock().0.save(id)?;
+        self.publish_editor_state(id, &state);
+        Ok(state)
     }
 
     /// `ZQ` — roll the block back to the session's checkpoint and close it.
+    /// Publishes `Closed` so renderers drop the session.
     pub fn editor_quit(
         &self,
         id: crate::editor::EditorSessionId,
         blocks: &crate::block_store::SharedBlockStore,
     ) -> Result<(), String> {
-        self.editor_sessions.lock().0.quit(id, blocks)
+        self.editor_sessions.lock().0.quit(id, blocks)?;
+        self.editor_flows.publish(crate::flows::EditorFlow::Closed {
+            session_id: id.as_u64(),
+        });
+        Ok(())
+    }
+
+    /// Publish a session's current state on the editor push channel.
+    fn publish_editor_state(
+        &self,
+        id: crate::editor::EditorSessionId,
+        state: &crate::editor::EditorState,
+    ) {
+        self.editor_flows
+            .publish(crate::flows::EditorFlow::StateChanged {
+                session_id: id.as_u64(),
+                state: state.clone(),
+            });
     }
 
     /// Get the latch-nonce store for a context, creating it on first use.

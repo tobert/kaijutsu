@@ -106,7 +106,12 @@ impl SyncedDocument {
             | ServerEvent::InputTextOps { context_id, .. }
             | ServerEvent::InputCleared { context_id, .. }
             | ServerEvent::ContextSwitched { context_id, .. } => Some(*context_id),
-            ServerEvent::ResourceUpdated { .. } | ServerEvent::ResourceListChanged { .. } => None,
+            // Editor events are session-scoped, not context-scoped — the
+            // editor renders off its own subscription, not the doc cache.
+            ServerEvent::ResourceUpdated { .. }
+            | ServerEvent::ResourceListChanged { .. }
+            | ServerEvent::EditorStateChanged { .. }
+            | ServerEvent::EditorClosed { .. } => None,
         }
     }
 
@@ -414,12 +419,16 @@ impl SyncedDocument {
                 SyncEffect::NeedsResync
             }
 
-            // Resource and input document events don't affect conversation document state
+            // Resource, input document, and editor events don't affect
+            // conversation document state. The editor renders off its own
+            // session subscription, never the conversation doc cache (Design A).
             ServerEvent::ResourceUpdated { .. }
             | ServerEvent::ResourceListChanged { .. }
             | ServerEvent::InputTextOps { .. }
             | ServerEvent::InputCleared { .. }
-            | ServerEvent::ContextSwitched { .. } => SyncEffect::Ignored,
+            | ServerEvent::ContextSwitched { .. }
+            | ServerEvent::EditorStateChanged { .. }
+            | ServerEvent::EditorClosed { .. } => SyncEffect::Ignored,
         }
     }
 

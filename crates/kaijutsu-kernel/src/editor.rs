@@ -115,7 +115,10 @@ impl EditorSessionId {
 }
 
 /// A renderer-facing snapshot of a session: what to draw, plus dirtiness.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Serialize`/`Deserialize` so it can ride the in-process [`EditorFlow`](crate::flows::EditorFlow)
+/// bus (the push channel the `subscribe_editor` bridge serializes to the wire).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EditorState {
     pub text: String,
     pub cursor: usize,

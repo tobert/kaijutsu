@@ -204,6 +204,10 @@ impl FlowTopics for TurnFlow {
     const TOPICS: &[&'static str] = &["turn.requested", "turn.completed", "turn.failed"];
 }
 
+impl FlowTopics for EditorFlow {
+    const TOPICS: &[&'static str] = &["editor.state_changed", "editor.closed"];
+}
+
 // ============================================================================
 // Block Flow Events
 // ============================================================================
@@ -1019,6 +1023,63 @@ impl HasSubject for TurnFlow {
 }
 
 // ============================================================================
+// Editor Flow Events
+// ============================================================================
+
+/// Editor-session flow events — the push channel for the in-app vi editor.
+///
+/// A session's renderer-facing [`EditorState`](crate::editor::EditorState)
+/// changed, or a session closed. Rides the in-process FlowBus only (like
+/// [`TurnFlow`]); the server's `subscribe_editor` bridge serializes each event
+/// onto the `EditorEvents` capnp callback so every renderer of a session sees
+/// state the instant it lands — the reason the editor channel is push, not poll.
+///
+/// Published by the kernel's `editor_keys`/`editor_save` (→ `StateChanged`) and
+/// `editor_quit` (→ `Closed`). The remote-merge producer — a *peer's* CRDT edit
+/// reconciling into an open session — wires in with `EditorCore::apply_remote_ops`
+/// (vi.md step 1b) and publishes `StateChanged` from the block `TextOps` path.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum EditorFlow {
+    /// A session's state changed (a keystroke landed, a save moved the
+    /// checkpoint, or a remote op merged). Carries the full snapshot so the
+    /// bridge needs no follow-up read.
+    StateChanged {
+        /// The session whose state changed (`EditorSessionId::as_u64`).
+        session_id: u64,
+        /// The new renderer-facing snapshot.
+        state: crate::editor::EditorState,
+    },
+    /// A session closed (`ZQ`/quit). Renderers drop it.
+    Closed {
+        /// The session that closed.
+        session_id: u64,
+    },
+}
+
+impl EditorFlow {
+    /// Get the subject string for this event.
+    pub fn subject(&self) -> &'static str {
+        match self {
+            Self::StateChanged { .. } => "editor.state_changed",
+            Self::Closed { .. } => "editor.closed",
+        }
+    }
+
+    /// The session this event concerns.
+    pub fn session_id(&self) -> u64 {
+        match self {
+            Self::StateChanged { session_id, .. } | Self::Closed { session_id } => *session_id,
+        }
+    }
+}
+
+impl HasSubject for EditorFlow {
+    fn subject(&self) -> &'static str {
+        EditorFlow::subject(self)
+    }
+}
+
+// ============================================================================
 // Shared FlowBus Handle
 // ============================================================================
 
@@ -1030,6 +1091,9 @@ pub type SharedInputDocFlowBus = Arc<FlowBus<InputDocFlow>>;
 
 /// Thread-safe handle to a TurnFlow bus.
 pub type SharedTurnFlowBus = Arc<FlowBus<TurnFlow>>;
+
+/// Thread-safe handle to an EditorFlow bus.
+pub type SharedEditorFlowBus = Arc<FlowBus<EditorFlow>>;
 
 /// Create a new shared block flow bus.
 pub fn shared_block_flow_bus(capacity: usize) -> SharedBlockFlowBus {
@@ -1043,6 +1107,11 @@ pub fn shared_input_doc_flow_bus(capacity: usize) -> SharedInputDocFlowBus {
 
 /// Create a new shared turn flow bus.
 pub fn shared_turn_flow_bus(capacity: usize) -> SharedTurnFlowBus {
+    Arc::new(FlowBus::new(capacity))
+}
+
+/// Create a new shared editor flow bus.
+pub fn shared_editor_flow_bus(capacity: usize) -> SharedEditorFlowBus {
     Arc::new(FlowBus::new(capacity))
 }
 
