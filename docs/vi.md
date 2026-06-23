@@ -284,13 +284,15 @@ accept last-writer semantics for pass 1 and note it.
 channel (push or poll, like the time-well polls `get_clusters`) and never joins
 the editor context into `DocumentCache` (see risk #7). Groundwork first:
 
-0a. **General Screen-transition fix** (the editor-open signal needs it): a
-    kernel→app navigation action must actually drive the `Screen` FSM. Today a
-    peer `switch_context` swaps `DocumentCache` active but never touches `Screen`
-    (`view/sync.rs` `handle_context_switch` — the
-    `tech_debt_switch_context_screen_transition` gap). Fix it generally so
-    `switch_context` → `Screen::Conversation` and `editor_open` → `Screen::Editor`
-    flow through one mechanism.
+0a. ✅ **General Screen-transition fix** (commit `116ed57`). `handle_context_switch`
+    (`view/sync.rs`) now drives the `Screen` FSM on a *landed* switch:
+    `screen_revealing_switched_context` keys on the screen being left, so every
+    switch writer (peer `switch_context`, server-pushed `ContextSwitched` from
+    fork / `kj context switch`, dock, …) reveals the conversation uniformly —
+    closing the `tech_debt_switch_context_screen_transition` gap. Editor-open is
+    the mirror: it drives `Screen::Editor` from its own landing handler, not here.
+    Verified live on the runner (in the well → `kj context switch` → pops to
+    Conversation). Decision logic unit-tested.
 0b. **App-id addressing** (multi-app): the peer registry keys by the shared nick
     `"kaijutsu-app"` (last attach wins) — can't target a *specific* app. Thread
     per-app identity (principal/session) so the editor-open signal pops on the

@@ -882,6 +882,27 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   beat-time and conversation wall-time ("the conversation has a tempo")
   so the timeline is the kernel's one clock rather than a music sidecar.
 
+## kaijutsu-mcp — invoke_peer double-encodes object params (found 2026-06-23)
+
+Calling the `invoke_peer` MCP tool with an object `params` (e.g. `{"context_id":
+"019ec11b"}` for `switch_context`) fails: the app's `dispatch_peer_action`
+rejects it with `invalid type: string "{\"context_id\": ...}", expected struct
+Params`. Diagnosis: `InvokePeerRequest.params` is `serde_json::Value`
+(`models.rs:144`) and the server does the right thing
+(`serde_json::to_vec(&req.params)`, `lib.rs:1166`) — but `req.params` *arrives*
+as a `Value::String` holding the JSON text, not a `Value::Object`. So the
+tool-call layer stringified the object one extra time before it reached the
+server; `to_vec` then emits a quoted JSON string and the app's `from_slice`
+sees a string. Surfaced now because `invoke_peer` is rarely exercised (Amy:
+"we haven't used it much until now"). **Proposed fix (server-side, tolerant):**
+in `invoke_peer`, if `req.params` is a `Value::String`, attempt to parse it as
+JSON and use the result (accept either an object or a JSON-string-of-an-object);
+fail loud if neither parses. Real root may be client-side arg encoding for
+`serde_json::Value` fields — worth confirming. Blocked the isolated peer-path
+verification of the Screen-transition fix; verified instead via the
+server-pushed `ContextSwitched` path (`kj context switch`), which exercises the
+same `handle_context_switch` landing.
+
 ## kaijutsu-mcp — capnp schema skew breaks subscribe (found 2026-06-23)
 
 After `systemctl --user restart kaijutsu-server` onto a fresh `target/debug`
