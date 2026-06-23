@@ -1078,10 +1078,13 @@ impl Kernel {
             reply: reply_tx,
         };
 
-        sender
-            .send(request)
-            .await
-            .map_err(|_| PeerError::Disconnected(format!("{}: channel closed", nick)))?;
+        if sender.send(request).await.is_err() {
+            // The bridge task is gone — its self-detach on conn_cancel should
+            // have removed it, but reap as a backstop so a dead window can't
+            // linger in the registry (and out of fan-out).
+            self.peers.write().await.reap_closed();
+            return Err(PeerError::Disconnected(format!("{}: channel closed", nick)));
+        }
 
         let response = tokio::time::timeout(PEER_INVOKE_TIMEOUT, reply_rx)
             .await

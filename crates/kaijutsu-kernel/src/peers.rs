@@ -34,8 +34,10 @@ pub struct PeerConfig {
 }
 
 /// The registry key for a peer: its unique `instance`, or `nick` when no
-/// instance was supplied (single-peer back-compat).
-fn peer_key(nick: &str, instance: &str) -> String {
+/// instance was supplied (single-peer back-compat). Public so the server can
+/// derive the same key a peer was attached under (e.g. for bridge-task
+/// self-detach) without duplicating the rule.
+pub fn peer_key(nick: &str, instance: &str) -> String {
     if instance.is_empty() {
         nick.to_string()
     } else {
@@ -194,6 +196,25 @@ impl PeerRegistry {
             .filter(|p| p.principal == Some(principal))
             .filter_map(|p| self.invoke_senders.get(&p.key()).cloned())
             .collect()
+    }
+
+    /// Belt-and-suspenders cleanup: drop any peer whose invoke channel is
+    /// closed (its bridge task / receiver is gone). The primary cleanup is the
+    /// bridge task self-detaching on `conn_cancel`; this catches stragglers a
+    /// missed cancel or a panicked task would otherwise leave behind, so a
+    /// fan-out never keeps invoking a dead window. Returns how many it reaped.
+    pub fn reap_closed(&mut self) -> usize {
+        let dead: Vec<String> = self
+            .invoke_senders
+            .iter()
+            .filter(|(_, s)| s.is_closed())
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in &dead {
+            self.invoke_senders.remove(key);
+            self.peers.remove(key);
+        }
+        dead.len()
     }
 
     /// Get a peer by its registry key.
@@ -360,6 +381,30 @@ mod tests {
         assert_eq!(registry.senders_by_principal(amy).len(), 1);
         assert_eq!(registry.senders_by_principal(other).len(), 1);
         assert_eq!(registry.senders_by_principal(PrincipalId::new()).len(), 0);
+    }
+
+    /// `reap_closed` drops a peer whose invoke receiver has been dropped (its
+    /// bridge task ended) — the belt-and-suspenders backstop to self-detach.
+    #[test]
+    fn reap_closed_drops_dead_channels_only() {
+        let mut registry = PeerRegistry::new();
+        let p = PrincipalId::new();
+        let (tx_live, _rx_live) = mpsc::channel(8);
+        let (tx_dead, rx_dead) = mpsc::channel(8);
+        registry
+            .attach(cfg_inst("kaijutsu-app", "live", p), Some(tx_live))
+            .unwrap();
+        registry
+            .attach(cfg_inst("kaijutsu-app", "dead", p), Some(tx_dead))
+            .unwrap();
+
+        // Kill the "dead" window's receiver (as its bridge task ending would).
+        drop(rx_dead);
+
+        assert_eq!(registry.reap_closed(), 1, "only the dead channel is reaped");
+        assert_eq!(registry.count(), 1);
+        assert!(registry.get_invoke_sender_by_instance("live").is_some());
+        assert!(registry.get_invoke_sender_by_instance("dead").is_none());
     }
 
     /// `get_invoke_sender(nick)` (back-compat single-target) returns the most

@@ -90,6 +90,7 @@ use kaijutsu_kernel::{
     Kernel,
     LocalBackend,
     // Peers (drift navigation transport)
+    peer_key,
     PeerConfig,
     PeerInfo,
     SharedBlockFlowBus,
@@ -3280,9 +3281,13 @@ impl kernel::Server for KernelImpl {
         // — never trusted from the client. `instance` is wired in a follow-up
         // (capnp field); empty for now keys the peer by nick as before.
         let principal = self.connection.borrow().principal.id;
+        let instance = String::new();
+        // The key this peer is stored under — derived the same way the registry
+        // does, so the bridge task can self-detach exactly this entry.
+        let detach_key = peer_key(&nick, &instance);
         let config = PeerConfig {
             nick: nick.clone(),
-            instance: String::new(),
+            instance,
             principal: Some(principal),
         };
 
@@ -3292,6 +3297,10 @@ impl kernel::Server for KernelImpl {
         let commands_callback = params_reader.get_commands().ok();
 
         let kernel_arc = self.kernel.kernel.clone();
+        // Wake the bridge task when this connection drops (Drop fires
+        // conn_cancel), so it can self-detach instead of lingering on rx.recv()
+        // with a dead callback — the same idiom the FlowBus bridges use.
+        let conn_cancel = self.connection.borrow().cancel_token();
 
         let span = tracing::info_span!("rpc", method = "attach_peer");
         Promise::from_future(
@@ -3300,6 +3309,8 @@ impl kernel::Server for KernelImpl {
                 let invoke_sender = if let Some(callback) = commands_callback {
                     let (tx, mut rx) = tokio::sync::mpsc::channel::<InvokeRequest>(32);
                     let nick_for_task = nick.clone();
+                    let bridge_kernel = kernel_arc.clone();
+                    let detach_key_for_task = detach_key.clone();
 
                     // Bridge task: recv InvokeRequest from channel, call capnp callback.
                     // Per-invoke timeout matches the client-side bound (15s) so a
@@ -3307,7 +3318,15 @@ impl kernel::Server for KernelImpl {
                     const PEER_INVOKE_TIMEOUT: std::time::Duration =
                         std::time::Duration::from_secs(20);
                     tokio::task::spawn_local(async move {
-                        while let Some(request) = rx.recv().await {
+                        loop {
+                            let request = tokio::select! {
+                                // Connection dropped: stop waiting and self-detach.
+                                _ = conn_cancel.cancelled() => break,
+                                maybe = rx.recv() => match maybe {
+                                    Some(request) => request,
+                                    None => break,
+                                },
+                            };
                             let mut req = callback.invoke_request();
                             {
                                 let mut p = req.get();
@@ -3333,7 +3352,14 @@ impl kernel::Server for KernelImpl {
                                 );
                             }
                         }
-                        log::debug!("Peer invoke bridge for '{}' ended", nick_for_task);
+                        // Self-detach this exact peer so a dropped connection's
+                        // window can't linger in the registry (and out of any
+                        // principal/nick fan-out). reap_closed is the backstop.
+                        bridge_kernel.detach_peer(&detach_key_for_task).await;
+                        log::debug!(
+                            "Peer invoke bridge for '{}' ended; detached {}",
+                            nick_for_task, detach_key_for_task,
+                        );
                     });
 
                     Some(tx)

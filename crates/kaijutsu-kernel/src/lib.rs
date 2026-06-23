@@ -39,7 +39,7 @@ pub mod vfs;
 
 pub use peers::{
     InvokeRequest, InvokeResponse, PeerConfig, PeerError, PeerInfo, PeerRegistry,
-    SharedPeerRegistry, shared_peer_registry,
+    SharedPeerRegistry, peer_key, shared_peer_registry,
 };
 pub use block_store::DocumentKind;
 pub use block_store::{
