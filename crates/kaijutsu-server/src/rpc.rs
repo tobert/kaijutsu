@@ -3276,7 +3276,15 @@ impl kernel::Server for KernelImpl {
             .unwrap_or("unknown")
             .to_owned();
 
-        let config = PeerConfig { nick: nick.clone() };
+        // Stamp the peer's principal from the authoritative connection identity
+        // — never trusted from the client. `instance` is wired in a follow-up
+        // (capnp field); empty for now keys the peer by nick as before.
+        let principal = self.connection.borrow().principal.id;
+        let config = PeerConfig {
+            nick: nick.clone(),
+            instance: String::new(),
+            principal: Some(principal),
+        };
 
         // Extract optional PeerCommands callback for reverse invocation.
         // get_commands() returns Err for null/missing capability pointers —
