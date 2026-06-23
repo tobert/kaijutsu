@@ -882,6 +882,22 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   beat-time and conversation wall-time ("the conversation has a tempo")
   so the timeline is the kernel's one clock rather than a music sidecar.
 
+## kaijutsu-mcp — capnp schema skew breaks subscribe (found 2026-06-23)
+
+After `systemctl --user restart kaijutsu-server` onto a fresh `target/debug`
+build, `register_session` fails in its subscribe step with `Unimplemented:
+method kernel::Server::list_mcp_prompts not implemented` (@67 in the schema).
+**Not a missing handler** — no client code calls `list_mcp_prompts`; the index
+is landing on the wrong method slot, i.e. the **MCP client binary Claude Code
+launches was built against a different `kaijutsu.capnp` than the running
+server** (capnp identifies methods by index, reports the *server's* name for
+that slot). Same "fresh server + old MCP-client binary" state the 2026-06-17
+signoff noted. The MCP feature-expansion that widened the schema around @60–@74
+landed in `a31d802` (2026-02-01). **Fix:** rebuild/reinstall the kaijutsu MCP
+client binary so its schema matches the server (it's launched outside an agent
+shell). Until then the over-the-wire MCP shell is down; headless kernel tests
+are unaffected. Blocked a live vi smoke-test (vi proven by 1200 headless tests).
+
 ## kaijutsu-mcp — June 2026 SyncedDocument migration review
 
 Surfaced by a DeepSeek (concurrency) + Gemini (architecture) review of commit

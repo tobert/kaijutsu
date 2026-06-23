@@ -232,12 +232,18 @@ accept last-writer semantics for pass 1 and note it.
 6. **Enter binding.** Compose uses `submit_on_enter()` (Enter submits). The editor
    needs Enter to insert a newline — a *separate* `VimBindings` set inside
    `EditorCore`, not the app.
-7. **A renderable editor surface, distinct from the conversation timeline.**
-   Resolved by the substrate decision (MSDF panel + `Screen::Editor`). Residual:
-   the app routes block events to the conversation MainCell (`view/sync.rs`) and
-   the doc cache is conversation-keyed (`view/document.rs`); the editor renders
-   from `editor_state`, sidestepping that path — but a file-doc cache entry still
-   wants a `DocKind` discriminator so the two don't collide.
+7. ~~**A renderable editor surface, distinct from the conversation timeline.**~~
+   Resolved by the substrate decision (MSDF panel + `Screen::Editor`) **and the
+   render-path decision (Amy, 2026-06-23): Design A — the app renders the editor
+   from a kernel-served `editor_state` channel and NEVER joins the editor's
+   context into `DocumentCache`.** The feared `DocKind`-discriminator collision
+   cannot occur: the app's cache only holds contexts it explicitly *joins*, and
+   block ops for an un-joined context are dropped (`view/sync.rs` — the
+   `BlockTextOps` handler only applies to an existing cache entry). So there is
+   no editor cache entry to collide with a conversation, and **no `DocKind`
+   discriminator is needed** (rejected Design B: joining the editor context into
+   `DocumentCache`, which would have required `DocKind` on the wire + a cache
+   discriminator). The editor is cleanly separated from the conversation cache.
 
 ---
 
@@ -273,8 +279,23 @@ accept last-writer semantics for pass 1 and note it.
      `vi`/`edit` builtin, and `kj rc edit` all emit the identical record (no
      drift between front doors). 3 vi-builtin tests + the rewired rc test green.
 
-**Slice 2 — app, on the runner** (verify visually):
+**Slice 2 — app, on the runner** (verify visually). Render path = **Design A**
+(decided 2026-06-23): the app gets editor state over a dedicated `editor_state`
+channel (push or poll, like the time-well polls `get_clusters`) and never joins
+the editor context into `DocumentCache` (see risk #7). Groundwork first:
 
+0a. **General Screen-transition fix** (the editor-open signal needs it): a
+    kernel→app navigation action must actually drive the `Screen` FSM. Today a
+    peer `switch_context` swaps `DocumentCache` active but never touches `Screen`
+    (`view/sync.rs` `handle_context_switch` — the
+    `tech_debt_switch_context_screen_transition` gap). Fix it generally so
+    `switch_context` → `Screen::Conversation` and `editor_open` → `Screen::Editor`
+    flow through one mechanism.
+0b. **App-id addressing** (multi-app): the peer registry keys by the shared nick
+    `"kaijutsu-app"` (last attach wins) — can't target a *specific* app. Thread
+    per-app identity (principal/session) so the editor-open signal pops on the
+    app that requested it. Trace + plumb (`kernel.rs` `invoke_peer`, `peers.rs`,
+    app `connection/actor_plugin.rs`).
 5. `Screen::Editor` + MSDF panel rendering `editor_state`; key forwarding to
    `editor_keys`; cursor quad + selection rects from parley.
 6. Optimistic local mirror only if latency demands it.
