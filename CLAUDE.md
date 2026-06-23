@@ -51,6 +51,23 @@ Most testing happens on a Linux server with a real GPU that the user can connect
 
 The Bevy BRP tools work directly. Take screenshots frequently.
 
+## Working Notes (three-file pattern)
+
+Three markdown files carry the work between sessions; keep them current **as you go**,
+not at the end:
+
+- **`signoff.md`** (repo root, *ephemeral, not committed*) — the living handoff a fresh
+  process can't reconstruct: what we were doing and what's next. The lead context writes
+  it from our real conversation (autocompaction is off on purpose). Melt it into the two
+  durable docs and delete it once its content has a home.
+- **`docs/issues.md`** (committed) — the open-work backlog and pressure valve. Record
+  out-of-scope work here before moving on; **delete an entry when it ships** (move the
+  story to the devlog if it's worth keeping). Code is truth; this tracks what's *not* in
+  the code yet.
+- **`docs/devlog.md`** (committed) — narrative history of landed work and the decisions
+  behind it. Not authoritative (`git log` + the design docs are); this is the story. Add
+  an entry when something ships and the "how we got here" is worth keeping.
+
 ## Git Conventions
 
 - Working on main (early development); parallel work on the same repo is common

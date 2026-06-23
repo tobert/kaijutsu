@@ -2,7 +2,7 @@
 
 Live work items distilled from prior design and TODO docs, plus architectural observations from code reviews. Code is truth; this exists to track what's *not* in the code yet.
 
-Organized by area. Keep entries terse — link to file:line when a pointer makes the work concrete. When an item ships, delete the entry.
+Organized by area. Keep entries terse — link to file:line when a pointer makes the work concrete. When an item ships, delete the entry — if the "how we got here" is worth keeping, move the narrative to [`devlog.md`](devlog.md) (the landed-work story). See the three-file working-notes pattern in `CLAUDE.md`.
 
 ---
 
@@ -497,6 +497,17 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   faulty flush is only caught by `flush_one`'s own error (documented in `edit.rs`);
   (3) `FileDocumentCache` CRDT-native pass-through (already tracked under
   Persistence & Sync) would let `read`'s hashes anchor `/etc/rc` cleanly.
+  - **kaish-side build-out — design direction (not yet built).** The hash is an
+    *edit-addressing* feature, so the kaish read surface wants **two read modes**:
+    keep `cat`/`tail`/`sed`/`grep` streaming + **hash-free** (logs/huge files; never
+    materialize), and put hashes only on a **bounded, dedicated `read` verb**
+    (window-scoped hash, range arg, `--json`) paired with `edit --anchor`. To serve
+    **kaibo** (only has `run_kaish`), push `line_hash` *up* into the kaish crate
+    (`~/src/kaish`) as a builtin; the MCP tools become thin wrappers. Rejected: a
+    `hashread`/`hashedit` pair (the edit half duplicates `edit --anchor`; doubles
+    standing tool-desc tokens) and `cat -H` (cat is the large-file streaming dumper —
+    a hash flag invites whole-file hashing). Add a size guard so the hashline reader
+    declines huge files. (Kaish-crate work, kaijutsu-driven.)
 
 - **`StreamingBlockHandle` implementation:** Single-block streaming primitive.
 - **LLM streaming rewrite:** Move `process_llm_stream` onto `StreamingBlockHandle`.
@@ -541,6 +552,13 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
     the breathe itself is continuous via `globals.time`). Thin-client aligned.
   - *Readability:* card sizing/camera zoom is functional but text is small at
     the default framing; tune when the active view (step 6) lands.
+  - *Band-1 sweep direction (cosmetic taste call):* band-1 currently sweeps CCW
+    from the top anchor (positive pitch). A literal clock-face vs. this
+    newest-first sweep is unsettled — the recency *ordering* is settled, the
+    visual sweep is one constant flip away (`scene.rs` `band1_anchor` / pitch sign).
+  - *Hot rim fills only the top semicircle (cosmetic):* ~13 cards from 3 o'clock
+    CCW over 0–180°; the bottom half of the screen is unused. Rebalance the hot
+    start angle if it bugs you.
 - **Edge HUD → in-scene MSDF panels — ✅ SHIPPED 2026-06-18.** The HUD's
   first-prototype flat Bevy `Text` nodes are now in-scene **MSDF panels**: 3D
   quads parented to the well camera (screen-stable, no billboard), drawn as thin
