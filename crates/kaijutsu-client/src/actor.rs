@@ -77,7 +77,8 @@ use crate::rpc::{
     SubmitResult, SyncState, ToolResult, ToolSchema, VersionSnapshot,
 };
 use crate::subscriptions::{
-    BlockEventsForwarder, ConnectionStatus, ResourceEventsForwarder, ServerEvent,
+    BlockEventsForwarder, ConnectionStatus, EditorEventsForwarder, ResourceEventsForwarder,
+    ServerEvent,
 };
 use crate::{ConnectError, KernelHandle, RpcClient, SshConfig, connect_ssh};
 
@@ -2162,14 +2163,25 @@ async fn connect_handshake(
     let resource_client: crate::kaijutsu_capnp::resource_events::Client =
         capnp_rpc::new_client(resource_fwd);
 
+    // Editor push events ride the same shared `event_tx` ServerEvent broadcast,
+    // so `EditorStateChanged`/`EditorClosed` reach the app via the same stream
+    // the renderer drains. The editor subscription is kernel-wide (session ids
+    // are global; no per-context filter).
+    let editor_fwd = EditorEventsForwarder {
+        event_tx: event_tx.clone(),
+    };
+    let editor_client: crate::kaijutsu_capnp::editor_events::Client =
+        capnp_rpc::new_client(editor_fwd);
+
     let subscribe_block = kernel.subscribe_blocks_filtered(block_client, &filter, &instance);
     let subscribe_resource = kernel.subscribe_mcp_resources(resource_client, &instance);
+    let subscribe_editor = kernel.subscribe_editor(editor_client);
 
-    // `try_join!` short-circuits: if either subscription fails, the other is
+    // `try_join!` short-circuits: if any subscription fails, the others are
     // cancelled and we return immediately. `futures::future::join` would wait
-    // for both, eating budget for nothing.
+    // for all, eating budget for nothing.
     let subscribe_both = async {
-        tokio::try_join!(subscribe_block, subscribe_resource)
+        tokio::try_join!(subscribe_block, subscribe_resource, subscribe_editor)
             .map(|_| ())
             .map_err(|e| format!("subscribe: {e}"))
     };

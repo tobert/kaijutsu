@@ -81,10 +81,17 @@ fn dispatch_peer_action(
         }
 
         "open_editor" => {
+            // The signal is self-contained: session id + path + the initial
+            // editor snapshot (text/cursor/mode/dirty), so the renderer can draw
+            // immediately. Shape mirrors the kernel's `EditorState::to_json` + path.
             #[derive(serde::Deserialize)]
             struct Params {
                 session: u64,
                 path: String,
+                text: String,
+                cursor: u64,
+                mode: Option<String>,
+                dirty: bool,
             }
             let p: Params =
                 serde_json::from_slice(params).map_err(|e| format!("invalid params: {e}"))?;
@@ -93,8 +100,14 @@ fn dispatch_peer_action(
             // (`view::editor::handle_editor_open`), mirroring how a context
             // switch drives Conversation — the editor owns its transition.
             editor_writer.write(EditorOpenRequested {
-                session: p.session,
                 path: p.path.clone(),
+                state: kaijutsu_client::EditorState {
+                    session: p.session,
+                    text: p.text,
+                    cursor: p.cursor,
+                    mode: p.mode,
+                    dirty: p.dirty,
+                },
             });
 
             serde_json::to_vec(&serde_json::json!({

@@ -1196,10 +1196,16 @@ impl Kernel {
         &self,
         session: crate::editor::EditorSessionId,
         path: &str,
+        state: &crate::editor::EditorState,
         submitter: Option<kaijutsu_types::PrincipalId>,
     ) {
-        let params = serde_json::json!({ "session": session.as_u64(), "path": path });
-        let params = match serde_json::to_vec(&params) {
+        // Carry the initial state in the signal so the renderer has text to draw
+        // the instant it lands — no fetch, no race against the first push. Reuses
+        // the shared `EditorState::to_json` shape (`{session,text,cursor,mode,dirty}`)
+        // plus the path; subsequent `editor.state_changed` pushes carry updates.
+        let mut params_json = state.to_json(session);
+        params_json["path"] = serde_json::Value::String(path.to_string());
+        let params = match serde_json::to_vec(&params_json) {
             Ok(p) => p,
             Err(e) => {
                 tracing::error!("open_editor: failed to encode signal params: {e}");
@@ -1252,7 +1258,7 @@ impl Kernel {
         submitter: Option<kaijutsu_types::PrincipalId>,
     ) -> Result<(crate::editor::EditorSessionId, crate::editor::EditorState), String> {
         let (id, state) = self.editor_open(path, blocks).await?;
-        self.signal_open_editor(id, path, submitter).await;
+        self.signal_open_editor(id, path, &state, submitter).await;
         Ok((id, state))
     }
 
