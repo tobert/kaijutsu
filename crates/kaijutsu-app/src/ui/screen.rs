@@ -28,6 +28,10 @@ pub enum Screen {
     /// Time-well context browser — the radial 3D well of context cards.
     /// Full-viewport; conversation chrome is hidden while it is active.
     TimeWell,
+    /// In-app vi editor — an MSDF panel rendering a kernel editor session.
+    /// Full-viewport; conversation chrome is hidden while it is active. Entered
+    /// by the `open_editor` peer signal (see `view::editor`).
+    Editor,
 }
 
 /// Plugin that registers the Screen state and its transition systems.
@@ -50,6 +54,16 @@ impl Plugin for ScreenPlugin {
         // via the OnEnter(Conversation) systems above.
         app.add_systems(
             OnEnter(Screen::TimeWell),
+            (hide_conversation_root, hide_cell_text),
+        );
+
+        // ── Editor ──
+        // Like the time well, the editor owns the viewport: hide the conversation
+        // chrome on enter. Its MSDF panel + camera are managed by the editor
+        // plugin (docs/vi.md step 4). Returning to Conversation re-shows the
+        // chrome via the OnEnter(Conversation) systems above.
+        app.add_systems(
+            OnEnter(Screen::Editor),
             (hide_conversation_root, hide_cell_text),
         );
     }

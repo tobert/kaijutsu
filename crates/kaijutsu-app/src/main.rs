@@ -168,6 +168,8 @@ fn main() {
         .add_plugins(ui::drift::DriftPlugin)
         // Time-well context browser (radial 3D well; Ctrl+W to enter, Esc to leave)
         .add_plugins(view::time_well::TimeWellPlugin)
+        // In-app vi editor — screen/landing foundation (open_editor signal → Screen::Editor)
+        .add_plugins(view::editor::EditorPlugin)
         // Timeline navigation - temporal scrubbing through history
         .add_plugins(ui::timeline::TimelinePlugin)
         // Animation tweening for smooth mode transitions

@@ -14,6 +14,7 @@ pub mod brp_methods;
 pub mod components;
 pub mod cursor;
 pub mod document;
+pub mod editor;
 pub mod fieldset;
 pub mod format;
 pub mod lifecycle;

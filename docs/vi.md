@@ -428,16 +428,23 @@ surface (`editInput`/`getInputState`, capnp `@44–48`) and the block subscripti
 > dead code): a `dispatch_peer_action("open_editor")` arm deserializes `{session, path}`
 > and writes `EditorOpenRequested`; the landing handler drives `Screen::Editor`.
 
-### Step 3 — `Screen::Editor` FSM + landing handler.
+### Step 3 — `Screen::Editor` FSM + landing handler. **SHIPPED (2026-06-23).**
 
-- Add `Editor` to `Screen` (`ui/screen.rs:18–31`); `OnEnter(Editor)` hides conversation
-  chrome (mirror `TimeWell` enter/exit, `time_well/mod.rs:37–71`), `OnExit` restores.
-- `screen_revealing_switched_context` (`view/sync.rs:18–34`) already treats any
-  non-Conversation screen as "reveal Conversation on a context switch" — `Editor`
-  inherits that for free (a `kj context switch` while editing pops to conversation).
-- New landing system `handle_editor_open` (mirror `handle_context_switch`,
-  `view/sync.rs:409–498`): reads `EditorOpenRequested`, stores the session in an
-  `ActiveEditor` resource, `next_screen.set(Screen::Editor)`.
+- `Screen::Editor` variant added (`ui/screen.rs`); `OnEnter(Editor)` hides conversation
+  chrome (reuses the `TimeWell` hide systems), `OnEnter(Conversation)` restores.
+- `screen_revealing_switched_context` (`view/sync.rs`) already treats any
+  non-Conversation screen as "reveal Conversation on a context switch", so `Editor`
+  inherits the escape-on-switch for free (a `kj context switch` while editing pops out).
+- New app module `view::editor` (`EditorPlugin`): `EditorOpenRequested {session, path}`
+  message + `ActiveEditor` resource (holds `EditorSessionView`); landing system
+  `handle_editor_open` (mirror of `handle_context_switch`'s reveal) stores the session
+  and `next_screen.set(Screen::Editor)`. Provisional `editor_exit_on_esc` (Esc → Conversation)
+  so the screen isn't a trap — step 5 replaces it with real key forwarding + `ZZ`/`ZQ`.
+- Peer dispatch: `dispatch_peer_action("open_editor")` (`peers/systems.rs`) deserializes
+  `{session, path}` and writes `EditorOpenRequested` (mirror of the `switch_context` arm).
+- `dock.rs` mode/hints matches got an `Editor` arm. Compile-checked headless; the visual
+  payoff (a panel that draws) is step 4. `ActiveEditor.session`/`path` are written now,
+  read by the step-4 renderer.
 
 ### Step 4 — MSDF panel renderer (on the runner).
 

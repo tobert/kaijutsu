@@ -6,6 +6,7 @@ use bevy::prelude::*;
 use crate::ui::drift::DriftState;
 use crate::view::components::ContextSwitchRequested;
 use crate::view::document::DocumentCache;
+use crate::view::editor::EditorOpenRequested;
 
 /// Poll the peer invocation channel and dispatch actions.
 ///
@@ -16,6 +17,7 @@ pub fn poll_peer_invocations(
     doc_cache: Res<DocumentCache>,
     drift: Res<DriftState>,
     mut switch_writer: MessageWriter<ContextSwitchRequested>,
+    mut editor_writer: MessageWriter<EditorOpenRequested>,
 ) {
     let rx = match channel.rx.lock() {
         Ok(guard) => guard,
@@ -31,6 +33,7 @@ pub fn poll_peer_invocations(
             &doc_cache,
             &drift,
             &mut switch_writer,
+            &mut editor_writer,
         );
         let _ = invocation.reply.send(result);
     }
@@ -42,6 +45,7 @@ fn dispatch_peer_action(
     doc_cache: &DocumentCache,
     drift: &DriftState,
     switch_writer: &mut MessageWriter<ContextSwitchRequested>,
+    editor_writer: &mut MessageWriter<EditorOpenRequested>,
 ) -> Result<Vec<u8>, String> {
     match action {
         "switch_context" => {
@@ -72,6 +76,30 @@ fn dispatch_peer_action(
             serde_json::to_vec(&serde_json::json!({
                 "context_id": ctx_id.to_string(),
                 "was_cached": was_cached,
+            }))
+            .map_err(|e| format!("serialize: {e}"))
+        }
+
+        "open_editor" => {
+            #[derive(serde::Deserialize)]
+            struct Params {
+                session: u64,
+                path: String,
+            }
+            let p: Params =
+                serde_json::from_slice(params).map_err(|e| format!("invalid params: {e}"))?;
+
+            // Drive the editor screen from its own landing handler
+            // (`view::editor::handle_editor_open`), mirroring how a context
+            // switch drives Conversation — the editor owns its transition.
+            editor_writer.write(EditorOpenRequested {
+                session: p.session,
+                path: p.path.clone(),
+            });
+
+            serde_json::to_vec(&serde_json::json!({
+                "session": p.session,
+                "path": p.path,
             }))
             .map_err(|e| format!("serialize: {e}"))
         }
