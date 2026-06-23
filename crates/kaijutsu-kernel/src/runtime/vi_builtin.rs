@@ -8,9 +8,10 @@
 //! it needs to open an editor) `kj rc edit` route through. One primitive, many
 //! front doors.
 //!
-//! Pass 1 is session-id-only: opening returns a handle for headless driving
-//! (`kj editor keys <id> …`); it does not yet signal the app peer to pop a
-//! renderer (that lands with slice 2's `Screen::Editor`). See `docs/vi.md`.
+//! Opening signals the submitter's app windows to pop a renderer (the
+//! `open_editor` peer signal, via `Kernel::editor_open_signaled`), threading the
+//! caller's principal off the `ExecContext`. Best-effort: a headless `vi` (a
+//! model, a test) with no app still opens a real session. See `docs/vi.md`.
 
 use std::sync::Arc;
 
@@ -20,6 +21,7 @@ use kaish_kernel::interpreter::ExecResult;
 use kaish_kernel::tools::{ParamSchema, ToolArgs, ToolCtx, ToolSchema};
 use kaish_kernel::{ast::Value, Tool};
 
+use crate::execution::ExecContext;
 use crate::kj::KjDispatcher;
 
 /// kaish builtin that opens an editor session via `Kernel::editor_open`.
@@ -58,7 +60,7 @@ impl Tool for ViBuiltin {
         )
     }
 
-    async fn execute(&self, args: ToolArgs, _ctx: &mut dyn ToolCtx) -> ExecResult {
+    async fn execute(&self, args: ToolArgs, ctx: &mut dyn ToolCtx) -> ExecResult {
         let path = match args.positional.first() {
             Some(Value::String(s)) => s.clone(),
             Some(other) => format!("{other:?}"),
@@ -70,8 +72,22 @@ impl Tool for ViBuiltin {
             }
         };
 
+        // The submitter is the execution's principal — `open_editor` fans the
+        // renderer signal to *their* app windows. Downcast through the trait's
+        // escape hatch (the kj builtin does the same); absent off the kernel
+        // ExecContext (a portable test surface), fall back to the app nick.
+        let submitter = ctx
+            .as_any_mut()
+            .downcast_mut::<ExecContext>()
+            .map(|ec| ec.principal_id);
+
         let blocks = self.dispatcher.block_store();
-        match self.dispatcher.kernel().editor_open(&path, blocks).await {
+        match self
+            .dispatcher
+            .kernel()
+            .editor_open_signaled(&path, blocks, submitter)
+            .await
+        {
             Ok((id, st)) => {
                 let session = id.as_u64();
                 let mut result = ExecResult::success(format!(

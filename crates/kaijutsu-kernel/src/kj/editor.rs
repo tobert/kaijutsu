@@ -62,7 +62,7 @@ fn state_json(id: EditorSessionId, st: &EditorState) -> serde_json::Value {
 }
 
 impl KjDispatcher {
-    pub(crate) async fn dispatch_editor(&self, argv: &[String], _caller: &KjCaller) -> KjResult {
+    pub(crate) async fn dispatch_editor(&self, argv: &[String], caller: &KjCaller) -> KjResult {
         if argv.is_empty() {
             return clap_help_for::<EditorArgs>();
         }
@@ -86,7 +86,10 @@ impl KjDispatcher {
         let kernel = self.kernel();
         let blocks = self.block_store();
         match parsed.command {
-            EditorCommand::Open { path } => match kernel.editor_open(&path, blocks).await {
+            EditorCommand::Open { path } => match kernel
+                .editor_open_signaled(&path, blocks, Some(caller.principal_id))
+                .await
+            {
                 Ok((id, st)) => KjResult::ok_with_data(
                     format!("opened editor session {} on {path}", id.as_u64()),
                     state_json(id, &st),

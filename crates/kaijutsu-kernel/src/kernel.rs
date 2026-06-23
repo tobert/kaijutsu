@@ -1124,8 +1124,6 @@ impl Kernel {
         action: &str,
         params: Vec<u8>,
     ) -> Result<Vec<u8>, PeerError> {
-        const PEER_INVOKE_TIMEOUT: Duration = Duration::from_secs(30);
-
         let sender = {
             let registry = self.peers.read().await;
             registry
@@ -1133,6 +1131,27 @@ impl Kernel {
                 .ok_or_else(|| PeerError::NotFound(nick.to_string()))?
         };
         // RwLock released before the async send
+        let result = Self::send_invoke(&sender, action, params, nick).await;
+        if matches!(result, Err(PeerError::Disconnected(_))) {
+            // The bridge task is gone — its self-detach on conn_cancel should
+            // have removed it, but reap as a backstop so a dead window can't
+            // linger in the registry (and out of fan-out).
+            self.peers.write().await.reap_closed();
+        }
+        result
+    }
+
+    /// Send one invoke request to an already-resolved peer channel and await the
+    /// reply. Shared by [`invoke_peer`](Self::invoke_peer) (single nick target)
+    /// and [`signal_open_editor`](Self::signal_open_editor) (principal fan-out).
+    /// `label` is only for error context.
+    async fn send_invoke(
+        sender: &tokio::sync::mpsc::Sender<InvokeRequest>,
+        action: &str,
+        params: Vec<u8>,
+        label: &str,
+    ) -> Result<Vec<u8>, PeerError> {
+        const PEER_INVOKE_TIMEOUT: Duration = Duration::from_secs(30);
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         let request = InvokeRequest {
@@ -1142,25 +1161,99 @@ impl Kernel {
         };
 
         if sender.send(request).await.is_err() {
-            // The bridge task is gone — its self-detach on conn_cancel should
-            // have removed it, but reap as a backstop so a dead window can't
-            // linger in the registry (and out of fan-out).
-            self.peers.write().await.reap_closed();
-            return Err(PeerError::Disconnected(format!("{}: channel closed", nick)));
+            return Err(PeerError::Disconnected(format!("{label}: channel closed")));
         }
 
         let response = tokio::time::timeout(PEER_INVOKE_TIMEOUT, reply_rx)
             .await
             .map_err(|_| {
                 PeerError::Timeout(format!(
-                    "{}: no reply after {}s",
-                    nick,
+                    "{label}: no reply after {}s",
                     PEER_INVOKE_TIMEOUT.as_secs()
                 ))
             })?
-            .map_err(|_| PeerError::Disconnected(format!("{}: handler dropped reply", nick)))?;
+            .map_err(|_| PeerError::Disconnected(format!("{label}: handler dropped reply")))?;
 
         response.result.map_err(PeerError::InvocationFailed)
+    }
+
+    /// Signal app renderers to open on `session`/`path` — the `open_editor` peer
+    /// nudge that pops a `Screen::Editor`. **Submitter-aware:** fans out to the
+    /// submitter principal's app windows (the server-stamped principal — the
+    /// app-id addressing infra), falling back to the well-known
+    /// [`APP_PEER_NICK`](crate::editor::APP_PEER_NICK) when that principal owns
+    /// no window (e.g. a model running `vi` headless).
+    ///
+    /// Best-effort: the editor session is already open, so a missing or
+    /// unreachable renderer is **logged, never fatal** — a headless driver
+    /// (`kj editor keys …`) needs no app. Observable (a warn line), not silent.
+    ///
+    /// Exact-window targeting (by the submitter's `instance`) is a follow-up:
+    /// the app's `instance` is not yet threaded onto the execute path
+    /// (`ConnectionState`→`ExecContext`), so principal fan-out is the current
+    /// precision. See `docs/vi.md`.
+    pub async fn signal_open_editor(
+        &self,
+        session: crate::editor::EditorSessionId,
+        path: &str,
+        submitter: Option<kaijutsu_types::PrincipalId>,
+    ) {
+        let params = serde_json::json!({ "session": session.as_u64(), "path": path });
+        let params = match serde_json::to_vec(&params) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!("open_editor: failed to encode signal params: {e}");
+                return;
+            }
+        };
+
+        // Target the submitter's app windows; fall back to the well-known nick.
+        let targets = {
+            let reg = self.peers.read().await;
+            let by_principal = submitter
+                .map(|p| reg.senders_by_principal(p))
+                .unwrap_or_default();
+            if by_principal.is_empty() {
+                reg.get_invoke_sender(crate::editor::APP_PEER_NICK)
+                    .into_iter()
+                    .collect()
+            } else {
+                by_principal
+            }
+        };
+
+        if targets.is_empty() {
+            tracing::warn!(
+                "open_editor: no app peer to signal for session {} (headless?) — \
+                 the session is open; drive it with `kj editor keys {0} …`",
+                session.as_u64()
+            );
+            return;
+        }
+
+        for sender in &targets {
+            if let Err(e) = Self::send_invoke(sender, "open_editor", params.clone(), "open_editor").await
+            {
+                tracing::warn!("open_editor: signal to an app window failed (non-fatal): {e}");
+            }
+        }
+    }
+
+    /// [`editor_open`](Self::editor_open) **plus** the `open_editor` peer signal
+    /// to the submitter's app windows. The ergonomic front doors (`vi`/`edit`,
+    /// `kj editor open`, `kj rc edit`) use this so a human's `vi foo` pops a
+    /// renderer; the wire `editorOpen` handler and tests call the plain
+    /// `editor_open` (they are the renderer / a driver and need no nudge). One
+    /// signal site, threaded the submitter principal from each door's caller.
+    pub async fn editor_open_signaled(
+        &self,
+        path: &str,
+        blocks: &crate::block_store::SharedBlockStore,
+        submitter: Option<kaijutsu_types::PrincipalId>,
+    ) -> Result<(crate::editor::EditorSessionId, crate::editor::EditorState), String> {
+        let (id, state) = self.editor_open(path, blocks).await?;
+        self.signal_open_editor(id, path, submitter).await;
+        Ok((id, state))
     }
 
     /// Detach a peer from this kernel.

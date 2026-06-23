@@ -15,7 +15,7 @@ use std::time::Duration;
 use tokio::sync::broadcast::Receiver;
 
 use common::{connect_client, run_local, start_server};
-use kaijutsu_client::{EditorState, ServerEvent, editor_events_channel};
+use kaijutsu_client::{EditorState, PeerConfig, ServerEvent, editor_events_channel};
 
 /// A script the server seeds into the rc CRDT on a fresh kernel — guaranteed to
 /// exist, so `editorOpen` binds to a real config-owned block.
@@ -185,5 +185,65 @@ fn a_peer_edit_reconciles_and_pushes_merged_state_to_a_sibling_session() {
 
         kernel.editor_quit(a.session).await.unwrap();
         kernel.editor_quit(b.session).await.unwrap();
+    });
+}
+
+#[test]
+fn vi_over_the_shell_signals_the_app_peer_to_open_a_renderer() {
+    // The `open_editor` peer signal (vi.md step 2): a human's `vi <path>` in the
+    // app shell must nudge the submitter's app windows to pop a renderer. We
+    // attach as the well-known app peer, run `vi` over the same connection's
+    // shell, and assert the peer receives an `open_editor` invocation carrying
+    // the session + path — submitter-aware fan-out reaching our window.
+    run_local(async {
+        let addr = start_server().await;
+        let client = connect_client(addr).await;
+        let (kernel, _) = client.bind_kernel().await.unwrap();
+
+        // The shell needs an active context to materialize `vi`.
+        let ctx = kernel.create_context("editor-signal").await.unwrap();
+        kernel.join_context(ctx, "app-instance").await.unwrap();
+
+        // Attach as the app peer; a worker thread captures invocations onto a
+        // channel the async test can await, and replies so the kernel's
+        // best-effort signal completes cleanly.
+        let (inv_tx, inv_rx) = std::sync::mpsc::channel::<kaijutsu_client::PeerInvocation>();
+        let (cap_tx, mut cap_rx) = tokio::sync::mpsc::unbounded_channel::<(String, Vec<u8>)>();
+        std::thread::spawn(move || {
+            while let Ok(inv) = inv_rx.recv() {
+                let _ = cap_tx.send((inv.action.clone(), inv.params.clone()));
+                let _ = inv.reply.send(Ok(b"ok".to_vec()));
+            }
+        });
+        kernel
+            .attach_peer(
+                &PeerConfig {
+                    nick: "kaijutsu-app".to_string(),
+                    ..Default::default()
+                },
+                inv_tx,
+            )
+            .await
+            .expect("attach as app peer");
+
+        // Run `vi` over the shell — the builtin opens a session and fires the
+        // open_editor signal to the submitter's app windows (us).
+        kernel
+            .execute(&format!("vi {RC_PATH}"))
+            .await
+            .expect("execute vi");
+
+        // The app peer receives open_editor with {session, path}.
+        let (action, params) = tokio::time::timeout(Duration::from_secs(10), cap_rx.recv())
+            .await
+            .expect("timed out waiting for the open_editor signal")
+            .expect("capture channel closed");
+        assert_eq!(action, "open_editor", "the signal action");
+        let v: serde_json::Value = serde_json::from_slice(&params).expect("params are JSON");
+        assert_eq!(v["path"], RC_PATH, "signal carries the path");
+        assert!(
+            v["session"].as_u64().is_some(),
+            "signal carries a numeric session id: {v}"
+        );
     });
 }

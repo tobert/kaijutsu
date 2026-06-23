@@ -401,21 +401,32 @@ surface (`editInput`/`getInputState`, capnp `@44–48`) and the block subscripti
   and matches `editorState`; assert a second session's remote edit pushes a
   `StateChanged` to the first. No GPU.
 
-### Step 2 — `open_editor` peer signal (headless-testable kernel half).
+### Step 2 — `open_editor` peer signal.
 
-Today `editor_open` is **session-id-only** — it returns a handle but fires no peer
-signal (deferred from step 4 on purpose). Wire it now:
-
-- **Kernel**: at the `vi`/`edit`/`kj rc edit` open path, after opening the session,
-  `invoke_peer` the requesting app with action `"open_editor"` and params
-  `{ session, context_id, path }`. **Submitter-aware:** target the submitting peer's
-  `instance` (`peers.rs:172`), fall back to `senders_by_principal` (`peers.rs:190`)
-  for that principal's other windows, then the single `APP_PEER_NICK` as last resort.
-  **Confront the flagged gap first:** verify the submitter-side `KjCaller.principal`
-  is actually populated at this path (whoami + peer-principal are fixed; this submitter
-  side is unverified — Amy's caveat). If it is nil, fixing population is part of this step.
-- **App**: new arm in `dispatch_peer_action` (`peers/systems.rs:39–106`,
-  `"open_editor"`): deserialize params, write `EditorOpenRequested { session, context_id, path }`.
+> **Kernel half SHIPPED (2026-06-23).** `Kernel::signal_open_editor(session, path,
+> submitter)` fans the `open_editor` invoke to the **submitter principal's** app
+> windows (`senders_by_principal` — the server-stamped principal from 0b), falling
+> back to `APP_PEER_NICK` when that principal owns no window (a headless `vi`). Params
+> are `{session, path}` — **no `context_id`** (Design A: the app renders off the editor
+> subscription by session id, never joins the editor context, so it isn't needed).
+> Best-effort: the session is already open, so a missing renderer is a `warn`, never
+> fatal. `Kernel::editor_open_signaled` = `editor_open` + the signal; the three front
+> doors call it (`vi`/`edit` builtin downcasts `ctx`→`ExecContext` for the principal;
+> `kj editor open` + `kj rc edit` thread `caller.principal_id`). The wire `editorOpen`
+> + tests keep the plain `editor_open` (they are the renderer / a driver). e2e in
+> `editor_wire.rs`: attach as `kaijutsu-app`, run `vi` over the shell, assert the peer
+> receives `open_editor` with the session + path.
+>
+> **Caveat resolved:** `KjCaller.principal_id` / `ExecContext.principal_id` **are**
+> populated on the real path (server stamps from `conn.principal.id`); the submitter
+> principal reaches all three doors. **Deferred (own follow-up):** exact-window
+> targeting by the submitter's `instance` — the app's `instance` isn't threaded onto
+> the execute path (`ConnectionState`→`ExecContext`), so principal fan-out (all the
+> user's windows pop) is the current precision.
+>
+> **App side lands in step 3** (it needs `Screen::Editor` as its consumer, else it's
+> dead code): a `dispatch_peer_action("open_editor")` arm deserializes `{session, path}`
+> and writes `EditorOpenRequested`; the landing handler drives `Screen::Editor`.
 
 ### Step 3 — `Screen::Editor` FSM + landing handler.
 

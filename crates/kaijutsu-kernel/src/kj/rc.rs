@@ -170,7 +170,9 @@ impl KjDispatcher {
             } => self.rc_list(type_filter.as_deref(), verb_filter.as_deref()).await,
             RcCommand::Rm { path } => self.rc_rm(&path).await,
             RcCommand::Show { path, json } => self.rc_show(&path, json).await,
-            RcCommand::Edit { path, content } => self.rc_edit(&path, content.as_deref()).await,
+            RcCommand::Edit { path, content } => {
+                self.rc_edit(&path, content.as_deref(), caller).await
+            }
             RcCommand::Reset { path } => self.rc_reset(&path).await,
         }
     }
@@ -400,7 +402,7 @@ impl KjDispatcher {
         KjResult::ok_typed_with_data(out, ContentType::Markdown, record)
     }
 
-    async fn rc_edit(&self, path: &str, content: Option<&str>) -> KjResult {
+    async fn rc_edit(&self, path: &str, content: Option<&str>, caller: &KjCaller) -> KjResult {
         if let Err(e) = parse_rc_path(path) {
             return KjResult::Err(format!("kj rc edit: {e}"));
         }
@@ -423,12 +425,16 @@ impl KjDispatcher {
         }
 
         // No `--content` → open an interactive editor session on the owning CRDT
-        // block (docs/vi.md step 4), the same `Kernel::editor_open` primitive the
-        // `vi`/`edit` builtin and `kj editor open` route through. Session-id-only
-        // for now: a driver (`kj editor keys …`) or the slice-2 app renderer
-        // takes it from here — no peer signal yet.
+        // block, the same `Kernel::editor_open` primitive the `vi`/`edit` builtin
+        // and `kj editor open` route through, and signal the submitter's app
+        // windows to pop a renderer (`open_editor`). A headless driver
+        // (`kj editor keys …`) with no app still gets a real session.
         let Some(content) = content else {
-            return match self.kernel().editor_open(path, self.block_store()).await {
+            return match self
+                .kernel()
+                .editor_open_signaled(path, self.block_store(), Some(caller.principal_id))
+                .await
+            {
                 Ok((id, st)) => KjResult::ok_with_data(
                     format!(
                         "opened editor session {id} on {path} \
