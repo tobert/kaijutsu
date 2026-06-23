@@ -446,19 +446,29 @@ surface (`editInput`/`getInputState`, capnp `@44–48`) and the block subscripti
   payoff (a panel that draws) is step 4. `ActiveEditor.session`/`path` are written now,
   read by the step-4 renderer.
 
-### Step 4 — MSDF panel renderer (on the runner).
+### Step 4 — MSDF panel renderer (on the runner). **SHIPPED + runner-verified (2026-06-23).**
 
-- Reuse the panel primitive: `create_msdf_panel` + `commit_panel_glyphs`
-  (`time_well/panel.rs:31–58`); spawn one editor panel on `OnEnter(Editor)`.
-- An `EditorEventsForwarder` event drains (step 1) into the `ActiveEditor` resource;
-  a render system (gated `run_if(in_state(Screen::Editor))`) rebuilds the parley
-  `Layout` from the editor text (`text/shaping/font.rs:34–67` `layout`), collects
-  glyphs (`collect_msdf_glyphs`, `time_well/text.rs:54–70`), and commits on change.
-- **Cursor quad + selection rects:** reuse the compose precedent verbatim —
-  `parley::editing::Cursor::from_byte_index(&layout, byte, Affinity::Upstream)
-  .geometry(&layout, 2.0)` and the `OverlayCursorGeometry` → `BlockFxMaterial`
-  `cursor_params`/`selection_params` shader uniforms (`view/overlay.rs:348–400`,
-  `shaders/mod.rs:145–196`). Editor cursor byte = char-offset→byte over the text.
+Split into **4a** (state flow) + **4b** (the panel), both committed.
+
+- **4a — editor state reaches the app.** The kernel `open_editor` signal now carries
+  the **initial `EditorState`** (so the renderer has text to draw immediately — no
+  fetch, no race). The client actor `subscribe_editor`s on connect via an
+  `EditorEventsForwarder` sharing the actor's `event_tx`, so `EditorStateChanged`/
+  `EditorClosed` ride the same `ServerEvent` stream the app drains. `view::editor`
+  `handle_editor_events` keeps `ActiveEditor.state` fresh (own keystrokes, peer merges)
+  and pops to Conversation on close.
+- **4b — the panel.** `view::editor::render` reuses `create_msdf_panel` +
+  `commit_panel_glyphs`; `spawn_editor_panel` on `OnEnter(Editor)` places a 460×287.5
+  (1.6-aspect) MSDF quad at `z=-380` (inside the default perspective frustum — no
+  camera choreography, the conversation camera rests at identity), `despawn` on exit.
+  `render_editor_panel` (gated `in_state(Editor)`, on `ActiveEditor` change) lays the
+  buffer out with the **mono** font (`font.layout`, 17pt) and collects MSDF glyphs.
+  **Runner-verified:** `vi <rc path>` over the kernel → the app pops `Screen::Editor`
+  and renders the full rc binding script; `Esc` returns to the conversation.
+- **Follow-up (not yet):** the **cursor quad + selection rects** — reuse the compose
+  precedent (`parley::editing::Cursor::from_byte_index(..).geometry`, the
+  `OverlayCursorGeometry` → shader-uniform path, `view/overlay.rs`, `shaders/mod.rs`).
+  Editor cursor byte = char-offset→byte over the text. The panel draws text only today.
 
 ### Step 5 — key forwarding.
 

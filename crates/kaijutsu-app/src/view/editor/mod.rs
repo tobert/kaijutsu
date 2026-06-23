@@ -13,6 +13,8 @@ use kaijutsu_client::{EditorState, ServerEvent};
 use crate::connection::ServerEventMessage;
 use crate::ui::screen::Screen;
 
+mod render;
+
 /// A kernel `open_editor` signal landed: the submitter ran `vi <path>` and the
 /// kernel opened session `session`. Written by the peer dispatcher
 /// (`peers::systems`), consumed by [`handle_editor_open`]. Carries the **initial
@@ -127,6 +129,15 @@ impl Plugin for EditorPlugin {
         app.add_message::<EditorOpenRequested>()
             .init_resource::<ActiveEditor>()
             .add_systems(Update, (handle_editor_open, handle_editor_events))
-            .add_systems(Update, editor_exit_on_esc.run_if(in_state(Screen::Editor)));
+            .add_systems(OnEnter(Screen::Editor), render::spawn_editor_panel)
+            .add_systems(OnExit(Screen::Editor), render::despawn_editor_panel)
+            .add_systems(
+                Update,
+                (
+                    render::render_editor_panel,
+                    editor_exit_on_esc,
+                )
+                    .run_if(in_state(Screen::Editor)),
+            );
     }
 }
