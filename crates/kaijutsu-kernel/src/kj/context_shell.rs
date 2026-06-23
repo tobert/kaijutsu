@@ -140,21 +140,30 @@ impl KjDispatcher {
         // back to the bare kaish surface if `set_self_arc` was never called
         // (some test dispatchers don't bother).
         let dispatcher = self.self_arc();
-        let configure_tools = move |scm: SessionContextMap,
-                                    sid: SessionId,
-                                    tools: &mut kaish_kernel::ToolRegistry| {
-            if let Some(d) = dispatcher {
-                tools.register(crate::runtime::kj_builtin::KjBuiltin::new(
-                    d,
-                    scm,
-                    principal,
-                    sid,
-                    semantic_index,
-                    block_source,
-                    privileged,
-                ));
-            }
-        };
+        let configure_tools =
+            move |scm: SessionContextMap,
+                  sid: SessionId,
+                  tools: &mut kaish_kernel::ToolRegistry| {
+                if let Some(d) = dispatcher {
+                    // `vi`/`edit`: the ergonomic front doors onto the kernel's
+                    // editor surface, sharing `Kernel::editor_open` with `kj editor`
+                    // (docs/vi.md). Registered before `kj` is consumed by the move.
+                    tools.register(crate::runtime::vi_builtin::ViBuiltin::new(d.clone(), "vi"));
+                    tools.register(crate::runtime::vi_builtin::ViBuiltin::new(
+                        d.clone(),
+                        "edit",
+                    ));
+                    tools.register(crate::runtime::kj_builtin::KjBuiltin::new(
+                        d,
+                        scm,
+                        principal,
+                        sid,
+                        semantic_index,
+                        block_source,
+                        privileged,
+                    ));
+                }
+            };
 
         let kaish = if read_only {
             EmbeddedKaish::with_identity_read_only(
@@ -183,13 +192,18 @@ impl KjDispatcher {
         };
 
         // Seed the env half of the context's durable state.
-        kaish.apply_context_config(self.kernel_db(), context_id).await;
+        kaish
+            .apply_context_config(self.kernel_db(), context_id)
+            .await;
 
         // Restore the persisted cwd, validated against the shell's backend (the
         // VFS namespace `cd` uses — a host-FS check would wrongly reject
         // VFS-only cwds like /scratch or /v/docs). A persisted cwd that no
         // longer resolves is surfaced, not silently dropped.
-        if let Err(dead) = kaish.restore_cwd_from_db(self.kernel_db(), context_id).await {
+        if let Err(dead) = kaish
+            .restore_cwd_from_db(self.kernel_db(), context_id)
+            .await
+        {
             tracing::warn!(
                 context = %context_id.to_hex(),
                 cwd = %dead.display(),
@@ -330,12 +344,17 @@ mod tests {
             .expect("insert block");
 
         // The real source sees the block; NoopBlockSource (rc/hook path) does not.
-        let real = d.block_source().block_snapshots(ctx).expect("real snapshots");
+        let real = d
+            .block_source()
+            .block_snapshots(ctx)
+            .expect("real snapshots");
         assert!(
             !real.is_empty(),
             "block_source must surface the context's blocks (the synthesis fix)",
         );
-        let noop = NoopBlockSource.block_snapshots(ctx).expect("noop snapshots");
+        let noop = NoopBlockSource
+            .block_snapshots(ctx)
+            .expect("noop snapshots");
         assert!(
             noop.is_empty(),
             "NoopBlockSource is the degraded path — it surfaces nothing",
@@ -343,7 +362,10 @@ mod tests {
 
         // The index install round-trips (server wires it at bootstrap; None
         // when embeddings are off — the model shell then degrades gracefully).
-        assert!(d.semantic_index().is_none(), "no index installed by default");
+        assert!(
+            d.semantic_index().is_none(),
+            "no index installed by default"
+        );
         d.set_semantic_index(None);
         assert!(d.semantic_index().is_none());
     }

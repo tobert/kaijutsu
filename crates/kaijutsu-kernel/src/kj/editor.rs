@@ -55,15 +55,10 @@ enum EditorCommand {
 }
 
 /// Structured `.data` for one session's state — an object (inspect-style), so
-/// `kj editor state --json` yields a single record a driver can read.
+/// `kj editor state --json` yields a single record a driver can read. The shape
+/// lives on [`EditorState`] so every editor front door emits the same record.
 fn state_json(id: EditorSessionId, st: &EditorState) -> serde_json::Value {
-    serde_json::json!({
-        "session": id.as_u64(),
-        "text": st.text,
-        "cursor": st.cursor,
-        "mode": st.mode,
-        "dirty": st.dirty,
-    })
+    st.to_json(id)
 }
 
 impl KjDispatcher {
@@ -79,7 +74,10 @@ impl KjDispatcher {
                     clap::error::ErrorKind::DisplayHelp
                         | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
                 ) {
-                    return KjResult::ok_ephemeral(e.to_string(), kaijutsu_types::ContentType::Plain);
+                    return KjResult::ok_ephemeral(
+                        e.to_string(),
+                        kaijutsu_types::ContentType::Plain,
+                    );
                 }
                 return KjResult::Err(format!("kj editor: {e}"));
             }
@@ -99,7 +97,11 @@ impl KjDispatcher {
                 let id = EditorSessionId::from_u64(session);
                 match kernel.editor_keys(id, &keys, blocks) {
                     Ok(st) => KjResult::ok_with_data(
-                        format!("session {session}: {} mode, {} chars", mode_label(&st), st.text.chars().count()),
+                        format!(
+                            "session {session}: {} mode, {} chars",
+                            mode_label(&st),
+                            st.text.chars().count()
+                        ),
                         state_json(id, &st),
                     ),
                     Err(e) => KjResult::Err(format!("kj editor keys: {e}")),
@@ -109,7 +111,11 @@ impl KjDispatcher {
                 let id = EditorSessionId::from_u64(session);
                 match kernel.editor_state(id) {
                     Ok(st) => KjResult::ok_with_data(
-                        format!("session {session}: {} mode{}", mode_label(&st), if st.dirty { ", modified" } else { "" }),
+                        format!(
+                            "session {session}: {} mode{}",
+                            mode_label(&st),
+                            if st.dirty { ", modified" } else { "" }
+                        ),
                         state_json(id, &st),
                     ),
                     Err(e) => KjResult::Err(format!("kj editor state: {e}")),
@@ -128,7 +134,9 @@ impl KjDispatcher {
             EditorCommand::Quit { session } => {
                 let id = EditorSessionId::from_u64(session);
                 match kernel.editor_quit(id, blocks) {
-                    Ok(()) => KjResult::ok(format!("session {session}: closed (rolled back to checkpoint)")),
+                    Ok(()) => KjResult::ok(format!(
+                        "session {session}: closed (rolled back to checkpoint)"
+                    )),
                     Err(e) => KjResult::Err(format!("kj editor quit: {e}")),
                 }
             }
@@ -138,7 +146,11 @@ impl KjDispatcher {
 
 /// Human label for the vim mode banner (`None` == normal).
 fn mode_label(st: &EditorState) -> &str {
-    st.mode.as_deref().map(str::trim).map(|s| s.trim_matches('-').trim()).unwrap_or("NORMAL")
+    st.mode
+        .as_deref()
+        .map(str::trim)
+        .map(|s| s.trim_matches('-').trim())
+        .unwrap_or("NORMAL")
 }
 
 #[cfg(test)]
@@ -195,7 +207,9 @@ mod tests {
         );
 
         // State reports the live buffer + dirty.
-        let st = d.dispatch(&[s("editor"), s("state"), id.to_string()], &c).await;
+        let st = d
+            .dispatch(&[s("editor"), s("state"), id.to_string()], &c)
+            .await;
         match st {
             KjResult::Ok { data: Some(dd), .. } => {
                 assert_eq!(dd["text"], "Xhello");
@@ -205,7 +219,8 @@ mod tests {
         }
 
         // ZQ rolls the rc doc back to what we opened.
-        d.dispatch(&[s("editor"), s("quit"), id.to_string()], &c).await;
+        d.dispatch(&[s("editor"), s("quit"), id.to_string()], &c)
+            .await;
         assert_eq!(
             read_rc(&d, P).await.as_deref(),
             Some("hello"),

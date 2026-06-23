@@ -64,12 +64,13 @@ enum RcCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Replace a script's content.
+    /// Edit a script. With `--content` (or piped stdin) it replaces the body;
+    /// with no body it opens an interactive vi editor session on the script.
     #[command(alias = "update")]
     Edit {
         /// Canonical rc path to edit
         path: String,
-        /// Replacement body
+        /// Replacement body (omit to open the editor instead)
         #[arg(long)]
         content: Option<String>,
     },
@@ -404,22 +405,14 @@ impl KjDispatcher {
             return KjResult::Err(format!("kj rc edit: {e}"));
         }
 
-        let content = match content {
-            Some(c) => c,
-            None => {
-                return KjResult::Err(
-                    "kj rc edit: nothing to change\nsupply --content <body>".to_string(),
-                );
-            }
-        };
-
         if !self.rc_exists(path).await {
             return KjResult::Err(format!("kj rc edit: '{path}' not found"));
         }
         // Refuse to edit *through* a composed link: a write would silently edit
         // the shared target (every type that links it), which is almost never
         // what `kj rc edit <this path>` means. Make the choice explicit — edit
-        // the target to change all, or rm+add here to diverge.
+        // the target to change all, or rm+add here to diverge. Applies to both
+        // the `--content` replace and the interactive editor below.
         if let Some(target) = self.rc_link_target(path).await {
             return KjResult::Err(format!(
                 "kj rc edit: '{path}' is a composed symlink → {target}\n\
@@ -428,6 +421,26 @@ impl KjDispatcher {
                  - to diverge just this one: kj rc rm {path} && kj rc add {path} --content …"
             ));
         }
+
+        // No `--content` → open an interactive editor session on the owning CRDT
+        // block (docs/vi.md step 4), the same `Kernel::editor_open` primitive the
+        // `vi`/`edit` builtin and `kj editor open` route through. Session-id-only
+        // for now: a driver (`kj editor keys …`) or the slice-2 app renderer
+        // takes it from here — no peer signal yet.
+        let Some(content) = content else {
+            return match self.kernel().editor_open(path, self.block_store()).await {
+                Ok((id, st)) => KjResult::ok_with_data(
+                    format!(
+                        "opened editor session {id} on {path} \
+                         — drive it with `kj editor keys {id} …`",
+                        id = id.as_u64(),
+                    ),
+                    st.to_json(id),
+                ),
+                Err(e) => KjResult::Err(format!("kj rc edit: {e}")),
+            };
+        };
+
         if let Err(e) = self.write_rc_file(path, content).await {
             return KjResult::Err(format!("kj rc edit: {e}"));
         }
@@ -687,9 +700,12 @@ mod tests {
         );
     }
 
-    /// `kj rc edit` with no --content is a user error, not a no-op.
+    /// `kj rc edit <path>` with no --content opens an interactive editor session
+    /// on the owning block (docs/vi.md step 4) — the ergonomic entry point, not
+    /// the old "nothing to change" error. It returns a session handle + the
+    /// block's current text in `.data` for a driver to take over.
     #[tokio::test]
-    async fn rc_edit_requires_at_least_one_field() {
+    async fn rc_edit_without_content_opens_an_editor_session() {
         use crate::kj::test_helpers::*;
         use crate::kj::KjResult;
 
@@ -720,10 +736,18 @@ mod tests {
             )
             .await;
         match result {
-            KjResult::Err(msg) => {
-                assert!(msg.contains("nothing to change"), "msg: {msg}")
+            KjResult::Ok { message, data: Some(d), .. } => {
+                assert!(
+                    message.contains("opened editor session"),
+                    "msg: {message}"
+                );
+                assert_eq!(d["text"], "noop", "session must bind the owning block");
+                assert!(
+                    d["session"].as_u64().is_some(),
+                    "data carries a numeric session id: {d}"
+                );
             }
-            other => panic!("expected Err, got {other:?}"),
+            other => panic!("expected ok-with-data session, got {other:?}"),
         }
     }
 

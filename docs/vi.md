@@ -261,7 +261,17 @@ accept last-writer semantics for pass 1 and note it.
    - ⬜ MCP tools: deferred — a model can already drive via `kj editor` through
      the shell (the hybrid kj-rich/MCP-narrow stance). Add a narrow MCP wrapper
      only if a non-shell driver needs it.
-4. `vi`/`edit` builtin + `kj rc edit <path>` (no `--content`) → `editor_open`.
+4. ✅ `vi`/`edit` builtin + `kj rc edit <path>` (no `--content`) → `editor_open`.
+   - ✅ `ViBuiltin` (`runtime/vi_builtin.rs`): a real kaish `Tool` registered
+     under both `vi` and `edit` (`kj/context_shell.rs`), calling the shared
+     `Kernel::editor_open` primitive. Session-id-only — opens, returns the
+     handle + initial state; **no peer signal yet** (lands with slice 2).
+   - ✅ Bare `kj rc edit <path>` (no `--content`) opens an editor session via
+     the *same* primitive instead of erroring (`kj/rc.rs::rc_edit`); the
+     `--content`/stdin replace path is unchanged.
+   - ✅ One shared state shape: `EditorState::to_json` — `kj editor`, the
+     `vi`/`edit` builtin, and `kj rc edit` all emit the identical record (no
+     drift between front doors). 3 vi-builtin tests + the rewired rc test green.
 
 **Slice 2 — app, on the runner** (verify visually):
 
@@ -271,32 +281,34 @@ accept last-writer semantics for pass 1 and note it.
 
 ---
 
-## Picking up next session (state as of 2026-06-22)
+## Picking up next session (state as of 2026-06-23)
 
-**Slice 1 is done, headless and green.** The whole editing increment is built and
-test-driven with no GUI: resolver → `kaijutsu-editor` `EditorCore` (pure modalkit
-vim) → kernel `EditorSessions` (mounted, `Send`-wrapped) → `kj editor` verbs. A
-model or a shell can drive a real vi session against any rc/config block *now*.
-**25 editor tests green** (14 in `kaijutsu-editor`, 11 in `kaijutsu-kernel`).
+**Slice 1 AND step 4 are done, headless and green.** The whole editing increment
+plus its ergonomic front doors are built and test-driven with no GUI: resolver →
+`kaijutsu-editor` `EditorCore` (pure modalkit vim) → kernel `EditorSessions`
+(mounted, `Send`-wrapped) → `kj editor` verbs → `vi`/`edit` builtin + bare
+`kj rc edit`. A model or a shell can open a real vi session against any rc/config
+block with `vi <path>` *now*. **28 editor tests green** (14 in `kaijutsu-editor`,
+14 in `kaijutsu-kernel`).
 
-Commits this session: `110bd95` resolver · `5383402` `EditorCore` · `e0b3ec3`
-session registry · `8ca5674` kernel mount · `bc11e2c` `kj editor` · `cf5e663`
-coverage battery · (this pass) corruption + trailing-newline fixes.
+Slice-1 commits: `110bd95` resolver · `5383402` `EditorCore` · `e0b3ec3` session
+registry · `8ca5674` kernel mount · `bc11e2c` `kj editor` · `cf5e663` coverage
+battery · `4bf2c28` corruption + trailing-newline fixes. Step 4 (this pass):
+`ViBuiltin` + `kj rc edit` editor-open + shared `EditorState::to_json`.
 
-**Fix pass complete** (the reason we paused before slice 2): both bugs the tests
-uncovered are fixed + pinned — prompt-key buffer corruption (`:`/`/` no longer
-leak) and trailing-newline consistency (newline-terminated blocks open clean,
-`ZQ` preserves the terminator). Dot-repeat (`.`) is a documented deferred no-op.
+**Step-4 decisions (Amy, 2026-06-23):** `vi`/`edit` is a *real* kaish builtin
+(not a `kj editor open` alias); `kj` reaches the editor through the same shared
+`Kernel::editor_open` primitive when it needs one (so there's no duplicated
+logic — the three front doors all funnel to one kernel method + one
+`EditorState::to_json` shape). Opening is **session-id-only**: it returns a
+handle for headless driving and does **not** fire the `open_editor` peer signal
+yet — that wiring waits for the slice-2 renderer (avoids the `APP_PEER_NICK` /
+`switch_context`-Screen gaps until there's something to render).
 
-**Next is step 4** (still kernel/headless): a `vi`/`edit` kaish builtin and
-making bare `kj rc edit <path>` (no `--content`) call `editor_open` instead of
-erroring (`kj/rc.rs:402`) — the ergonomic entry points. One open choice: whether
-step 4 also fires the `open_editor` peer signal now (only matters once the slice-2
-renderer exists) or just returns a session id for headless driving until then.
-
-**Then slice 2** — the app renderer (`Screen::Editor` + MSDF panel), on the
+**Next is slice 2** — the app renderer (`Screen::Editor` + MSDF panel), on the
 runner. The renderer adds *no editing logic*; it renders `editor_state` and
-forwards keys. Deferred items live in the tech-debt sweep above.
+forwards keys. The `open_editor` peer signal (risk #3) gets wired here, where it
+finally has a renderer to target. Deferred items live in the tech-debt sweep above.
 
 ---
 
@@ -368,7 +380,9 @@ as hints, grep the symbol.
 | **MSDF panel primitive** (renderer) | `crates/kaijutsu-app/src/view/time_well/panel.rs`; template `view/time_well/text.rs` (`update_reading_card`), `scene.rs:63` (`ReadingCard`) |
 | **Screen FSM** (add `Screen::Editor`) | `crates/kaijutsu-app/src/ui/screen.rs` |
 | Cursor / selection geometry | parley 0.7 `Cursor::from_byte_index(..).geometry`, `Selection::geometry` (`editing/{cursor,selection}.rs`) |
-| `kj rc edit` (entry point) | `crates/kaijutsu-kernel/src/kj/rc.rs:402` (`rc_edit`) |
+| `kj rc edit` (entry point) | `crates/kaijutsu-kernel/src/kj/rc.rs` (`rc_edit` — no-`--content` → `editor_open`) |
+| **`vi`/`edit` builtin** (front door) | `crates/kaijutsu-kernel/src/runtime/vi_builtin.rs` (`ViBuiltin`); registered in `kj/context_shell.rs` |
+| Shared editor-state shape | `crates/kaijutsu-kernel/src/editor.rs` (`EditorState::to_json`) |
 | File doc cache | `crates/kaijutsu-kernel/src/file_tools/cache.rs` (`get_or_load`, `file_context_id`) |
 | Config doc owner | `crates/kaijutsu-kernel/src/config_doc.rs` (`config_context_id`, `first_block_id`) |
 | CRDT version / ops_since | `diamond-types-extended` `document.rs:107,321` |

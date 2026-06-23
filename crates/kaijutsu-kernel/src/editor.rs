@@ -74,13 +74,19 @@ pub async fn resolve_editor_target(
         let block_id = first_block_id(blocks, context_id).ok_or_else(|| {
             format!("open editor: config document '{path}' does not exist (nothing to edit)")
         })?;
-        Ok(EditorTarget { context_id, block_id })
+        Ok(EditorTarget {
+            context_id,
+            block_id,
+        })
     } else {
         let (context_id, block_id) = file_cache
             .get_or_load(path)
             .await
             .map_err(|e| format!("open editor: cannot open '{path}': {e}"))?;
-        Ok(EditorTarget { context_id, block_id })
+        Ok(EditorTarget {
+            context_id,
+            block_id,
+        })
     }
 }
 
@@ -116,6 +122,22 @@ pub struct EditorState {
     pub mode: Option<String>,
     /// Whether the buffer differs from the last open/save checkpoint.
     pub dirty: bool,
+}
+
+impl EditorState {
+    /// Structured `.data` for one session, stamped with its handle — the single
+    /// shape every editor front door emits (`kj editor`, the `vi`/`edit`
+    /// builtin, `kj rc edit`). Object form (inspect-style) so a driver reads one
+    /// record. Keeping it here means the shape can't drift between front doors.
+    pub fn to_json(&self, session: EditorSessionId) -> serde_json::Value {
+        serde_json::json!({
+            "session": session.as_u64(),
+            "text": self.text,
+            "cursor": self.cursor,
+            "mode": self.mode,
+            "dirty": self.dirty,
+        })
+    }
 }
 
 /// One open editor: a pure [`EditorCore`] bound to the CRDT block that owns the
@@ -277,7 +299,12 @@ fn state_of(core: &mut EditorCore, checkpoint: &str) -> EditorState {
     let dirty = text != checkpoint;
     let cursor = core.cursor();
     let mode = core.mode();
-    EditorState { text, cursor, mode, dirty }
+    EditorState {
+        text,
+        cursor,
+        mode,
+        dirty,
+    }
 }
 
 fn no_session(id: EditorSessionId) -> String {
@@ -343,7 +370,8 @@ mod tests {
 
         // A bare FileDocumentCache is never consulted for a config path; the
         // resolver must answer from the ConfigCrdtFs owner instead.
-        let file_cache = FileDocumentCache::new(blocks.clone(), Arc::new(crate::vfs::MountTable::new()));
+        let file_cache =
+            FileDocumentCache::new(blocks.clone(), Arc::new(crate::vfs::MountTable::new()));
 
         let full = "/etc/rc/coder/create/S00-stance.kai";
         let target = resolve_editor_target(full, &blocks, &file_cache)
@@ -352,7 +380,10 @@ mod tests {
 
         // The target is the ConfigCrdtFs-owned document, NOT a file-doc copy.
         let expected_ctx = config_context_id(full);
-        assert_eq!(target.context_id, expected_ctx, "must bind the config owner");
+        assert_eq!(
+            target.context_id, expected_ctx,
+            "must bind the config owner"
+        );
         assert_eq!(
             target.block_id,
             first_block_id(&blocks, expected_ctx).unwrap(),
@@ -363,13 +394,17 @@ mod tests {
     #[tokio::test]
     async fn missing_config_doc_fails_loud_not_empty() {
         let blocks = blocks_with_db();
-        let file_cache = FileDocumentCache::new(blocks.clone(), Arc::new(crate::vfs::MountTable::new()));
+        let file_cache =
+            FileDocumentCache::new(blocks.clone(), Arc::new(crate::vfs::MountTable::new()));
 
         // No document was ever seeded at this path.
         let err = resolve_editor_target("/etc/rc/nope/create/S00.kai", &blocks, &file_cache)
             .await
             .expect_err("a phantom config doc must error, not open an empty editor");
-        assert!(err.contains("does not exist"), "fail-loud message, got: {err}");
+        assert!(
+            err.contains("does not exist"),
+            "fail-loud message, got: {err}"
+        );
     }
 }
 
