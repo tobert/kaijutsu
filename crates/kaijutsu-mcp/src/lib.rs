@@ -1163,7 +1163,7 @@ impl KaijutsuMcp {
             None => return "Error: invoke_peer requires --connect".to_string(),
         };
 
-        let params = match serde_json::to_vec(&req.params) {
+        let params = match serde_json::to_vec(&normalize_peer_params(&req.params)) {
             Ok(v) => v,
             Err(e) => return format!("Error: failed to serialize params: {e}"),
         };
@@ -2132,9 +2132,65 @@ impl ServerHandler for KaijutsuMcp {
     }
 }
 
+/// Normalize peer-invocation `params` before serializing to the wire bytes the
+/// peer's `dispatch_peer_action` deserializes.
+///
+/// Peers (e.g. the app's `switch_context`) expect an object/array payload. But
+/// an object passed to the `invoke_peer` MCP tool can arrive here double-encoded
+/// as a JSON *string* (a `Value::String` holding `"{...}"`) — `serde_json::to_vec`
+/// would then emit a quoted string and the peer's `from_slice::<Params>` would
+/// see a string, not a struct. So if `params` is a string that itself decodes to
+/// a JSON object or array, unwrap that one layer. A genuine scalar/string param
+/// (whose text is not JSON object/array) is passed through unchanged — we only
+/// undo the specific double-encoding, never reinterpret real string values.
+fn normalize_peer_params(params: &serde_json::Value) -> serde_json::Value {
+    if let serde_json::Value::String(s) = params
+        && let Ok(inner @ (serde_json::Value::Object(_) | serde_json::Value::Array(_))) =
+            serde_json::from_str::<serde_json::Value>(s)
+    {
+        tracing::debug!("invoke_peer: unwrapped double-encoded JSON params");
+        return inner;
+    }
+    params.clone()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bug: an object param arrives double-encoded as a JSON string. We must
+    /// unwrap exactly one layer so the peer receives an object, not a string.
+    #[test]
+    fn normalize_unwraps_double_encoded_object() {
+        let double = serde_json::Value::String(r#"{"context_id":"019ec11b"}"#.to_string());
+        let got = normalize_peer_params(&double);
+        assert_eq!(got, serde_json::json!({"context_id": "019ec11b"}));
+    }
+
+    /// A correctly-passed object is left untouched (idempotent for the good case).
+    #[test]
+    fn normalize_passes_through_real_object() {
+        let obj = serde_json::json!({"context_id": "019ec11b"});
+        assert_eq!(normalize_peer_params(&obj), obj);
+    }
+
+    /// A double-encoded array unwraps too.
+    #[test]
+    fn normalize_unwraps_double_encoded_array() {
+        let double = serde_json::Value::String(r#"[1,2,3]"#.to_string());
+        assert_eq!(normalize_peer_params(&double), serde_json::json!([1, 2, 3]));
+    }
+
+    /// A genuine string value (not JSON object/array) is preserved — we only
+    /// undo the object/array double-encoding, never reinterpret real strings.
+    #[test]
+    fn normalize_preserves_genuine_string() {
+        let s = serde_json::Value::String("hello".to_string());
+        assert_eq!(normalize_peer_params(&s), s);
+        // A bare-number string is also a real string here, not an object/array.
+        let n = serde_json::Value::String("123".to_string());
+        assert_eq!(normalize_peer_params(&n), n);
+    }
 
     use kaijutsu_crdt::ContextId;
 
