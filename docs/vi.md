@@ -366,11 +366,25 @@ surface (`editInput`/`getInputState`, capnp `@44–48`) and the block subscripti
     registry mutates (`kernel.rs:855–887`). `EditorCore` is `!Send` and the registry
     is pure, so the kernel wrapper (which already holds the bus) is the publish site,
     not `EditorSessions`. The subscription goes live + e2e-testable here.
-  - **1b (remote-merge push — risk #2, the reason push beats poll):** `EditorCore`
-    has **no `apply_remote_ops` yet**. Build it (merge a peer's CRDT ops into the
-    buffer + transform this session's cursor), wire it where block `TextOps` apply to
-    a block an open session is bound to, and publish `StateChanged` there. This is the
-    cursor-reconciliation chunk; deferred to its own pass with the concurrent-merge test.
+  - **1b SHIPPED (2026-06-23) — remote-merge push (risk #2, the reason push beats
+    poll).** `EditorCore::apply_remote_text(new_text) -> bool` reconciles the buffer to
+    the block's *merged* truth and transforms the leader cursor against the single-region
+    diff (edit-before shifts, edit-after leaves, straddle lands at the replacement end);
+    identical text returns `false` (the self-write-echo skip). `EditorSessions::reconcile_block`
+    finds sessions bound to `(ctx, block)`, skips self-writes (their buffer already equals
+    the block — the mirror is faithful), merges stale siblings, returns the changed states;
+    `Kernel::editor_reconcile_block` publishes them. The server's `spawn_editor_reconciler`
+    (one per kernel, dedicated thread + LocalSet, mirrors `spawn_turn_driver`) drains
+    `block.text_ops` and drives it — so a sibling session / MCP edit / streaming turn that
+    writes a bound block pushes the merged state. Tests: 4 in `kaijutsu-editor`
+    (`apply_remote_text` + cursor transform), 2 in `kaijutsu-kernel` (`reconcile_block`
+    self-skip + unbound no-op), 1 e2e in `editor_wire.rs` (two sessions on one block; A's
+    edit pushes merged state to B — over the wire). **Pass-1 scope:** text-level reconcile
+    (the block is the merged truth, so re-read is canonical) with a one-region cursor
+    transform; `set_text` resets undo history (a remote merge is disruptive anyway), and
+    richer multi-site op transforms remain future work. **Still deferred:** the app actor's
+    auto-resubscribe-on-connect — that's step-4 renderer wiring (it consumes
+    `editor_events_channel`), not a kernel concern.
 - **Server** (`rpc.rs`): five request handlers (copy the `editInput`/`getInputState`
   shape, ~`4345–4426`; trace-extract; facade-gate the mutators `editorKeys/Save/Quit`,
   leave `editorState` ungated) + a `subscribe_editor` bridge task copying

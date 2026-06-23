@@ -464,6 +464,56 @@ pub fn spawn_turn_driver(registry: Arc<ServerRegistry>) {
     }
 }
 
+/// Spawn the server-lifetime editor reconciler — the remote-merge half of the
+/// editor push channel (docs/vi.md step 1b).
+///
+/// It drains the kernel's `block.text_ops` FlowBus and, for each edited block,
+/// reconciles any open editor session bound to that block against the block's
+/// merged text and pushes the new state. A session's own mirror write is a
+/// no-op (its buffer already equals the block), so this only fires for *other*
+/// writers — a sibling editor session, an MCP file edit, a streaming turn.
+///
+/// One reconciler for the whole server: the block flow is a broadcast, so a
+/// per-connection subscriber would reconcile each edit once per connection. The
+/// dedicated thread + LocalSet mirrors `spawn_turn_driver` (the reconcile path
+/// touches the `!Send` editor sessions behind the kernel mutex).
+pub fn spawn_editor_reconciler(registry: Arc<ServerRegistry>) {
+    let builder = std::thread::Builder::new().name("editor-reconciler".to_string());
+    if let Err(e) = builder.spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                log::error!("editor-reconciler: failed to build runtime: {e}");
+                return;
+            }
+        };
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async move {
+            let kernel = &registry.kernel;
+            let mut sub = kernel.kernel.block_flows().subscribe("block.text_ops");
+            log::info!("Editor reconciler online");
+            while let Some(msg) = sub.recv().await {
+                if let BlockFlow::TextOps {
+                    context_id,
+                    ref block_id,
+                    ..
+                } = msg.payload
+                {
+                    kernel
+                        .kernel
+                        .editor_reconcile_block(context_id, *block_id, &kernel.documents);
+                }
+            }
+            log::warn!("Editor reconciler: block flow closed, exiting");
+        });
+    }) {
+        log::error!("Failed to spawn editor-reconciler thread: {e}");
+    }
+}
+
 /// A background execution tracked by exec_id.
 struct RunningExecution {
     cancel: CancellationToken,

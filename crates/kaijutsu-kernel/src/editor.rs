@@ -234,6 +234,52 @@ impl EditorSessions {
         Ok(state_of(&mut session.core, &saved))
     }
 
+    /// Reconcile every open session bound to `(context_id, block_id)` against
+    /// the block's *current* text, after some **other** writer (a sibling editor
+    /// session, an MCP file edit, a streaming turn) mutated it. Returns the
+    /// `(id, new state)` of every session whose buffer actually changed — the
+    /// caller publishes those on the editor push channel.
+    ///
+    /// A session whose buffer already matches the block is skipped: that is the
+    /// session's *own* mirror write echoing back through the block flow (the
+    /// mirror is faithful, so its buffer equals the block), and reconciling it
+    /// would jolt the cursor on every keystroke. Reads the block at most once,
+    /// and only when a session is actually bound here, so the hot path (no
+    /// editor open, or an unrelated block) costs just the match scan.
+    pub fn reconcile_block(
+        &mut self,
+        context_id: ContextId,
+        block_id: BlockId,
+        blocks: &SharedBlockStore,
+    ) -> Vec<(EditorSessionId, EditorState)> {
+        let bound: Vec<EditorSessionId> = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.target.context_id == context_id && s.target.block_id == block_id)
+            .map(|(id, _)| *id)
+            .collect();
+        if bound.is_empty() {
+            return Vec::new();
+        }
+        // The block's text is the merged truth; reconcile against its normalized
+        // (terminator-stripped) view, matching EditorCore's normalized buffer.
+        let raw = match block_text(blocks, &EditorTarget { context_id, block_id }) {
+            Ok(t) => t,
+            Err(_) => return Vec::new(), // block gone (deleted) — nothing to do
+        };
+        let merged = raw.strip_suffix('\n').unwrap_or(&raw);
+
+        let mut changed = Vec::new();
+        for id in bound {
+            let session = self.sessions.get_mut(&id).expect("just collected");
+            if session.core.apply_remote_text(merged) {
+                let saved = session.saved_content.clone();
+                changed.push((id, state_of(&mut session.core, &saved)));
+            }
+        }
+        changed
+    }
+
     /// Current state of a session.
     pub fn state(&mut self, id: EditorSessionId) -> Result<EditorState, String> {
         let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
@@ -524,6 +570,40 @@ mod session_tests {
             "hello\n",
             "quit must restore content AND the trailing newline"
         );
+    }
+
+    #[tokio::test]
+    async fn reconcile_skips_self_write_and_merges_a_sibling() {
+        // Two sessions on one block: when A writes (mirroring onto the block),
+        // reconcile_block must SKIP A (its buffer already matches — the mirror
+        // is faithful) and MERGE the stale sibling B, reporting only B.
+        let (blocks, target) = seeded(b"hello").await;
+        let mut sessions = EditorSessions::new();
+        let (a, _) = sessions.open(RC_PATH, target, &blocks).unwrap();
+        let (b, _) = sessions.open(RC_PATH, target, &blocks).unwrap();
+
+        sessions.keys(a, "iX<Esc>", &blocks).unwrap();
+        assert_eq!(block_text(&blocks, &target).unwrap(), "Xhello");
+
+        let changed = sessions.reconcile_block(target.context_id, target.block_id, &blocks);
+        assert_eq!(changed.len(), 1, "only the stale sibling reconciles");
+        assert_eq!(changed[0].0, b, "it is session B that moved");
+        assert_eq!(changed[0].1.text, "Xhello", "B merged A's edit");
+        assert!(changed[0].1.dirty, "B now differs from its open checkpoint");
+
+        // Idempotent: a second reconcile against the unchanged block is a no-op
+        // for everyone (both buffers now match the block).
+        let again = sessions.reconcile_block(target.context_id, target.block_id, &blocks);
+        assert!(again.is_empty(), "nothing stale → no reconcile");
+    }
+
+    #[tokio::test]
+    async fn reconcile_with_no_bound_session_is_a_noop() {
+        let (blocks, target) = seeded(b"hello").await;
+        let mut sessions = EditorSessions::new();
+        // No editor open on this block — the hot path must do nothing.
+        let changed = sessions.reconcile_block(target.context_id, target.block_id, &blocks);
+        assert!(changed.is_empty());
     }
 
     #[tokio::test]

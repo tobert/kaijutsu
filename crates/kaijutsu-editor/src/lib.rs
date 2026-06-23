@@ -101,6 +101,32 @@ impl EditorCore {
         self.machine.show_mode()
     }
 
+    /// Reconcile the buffer to `new_text` — the authoritative, already-merged
+    /// CRDT block content after a **peer's** edit landed on the bound block —
+    /// and transform the leader cursor so it tracks the change. Returns whether
+    /// the buffer actually changed; `false` when `new_text` already equals the
+    /// buffer (e.g. this session's own mirrored write echoing back through the
+    /// block flow — the caller relies on this to skip self-writes).
+    ///
+    /// Pass 1 reconciles at the **text level**: the block is the merged truth,
+    /// so a re-read is canonical, and the single-region [`diff_op`] drives a
+    /// one-region cursor transform (an edit fully before the cursor shifts it by
+    /// the net length change; an edit at/after it leaves it put; a straddling
+    /// edit lands it at the end of the replacement). Richer multi-site op
+    /// transforms are future work (docs/vi.md risk #2). `set_text` resets undo
+    /// history — acceptable: a remote merge is already a disruptive event.
+    pub fn apply_remote_text(&mut self, new_text: &str) -> bool {
+        let old = self.text();
+        let Some(op) = diff_op(&old, new_text) else {
+            return false; // identical — nothing to merge (self-write echo)
+        };
+        let new_cursor = transform_cursor(self.cursor(), &op).min(new_text.chars().count());
+        self.buffer.set_text(new_text);
+        let (line, col) = line_col(new_text, new_cursor);
+        self.buffer.set_leader(self.group, Cursor::new(line, col));
+        true
+    }
+
     /// Feed a key sequence in vim notation (`"ihello<Esc>"`, `"dw"`, `"<C-w>"`)
     /// and return the char-indexed [`EditOp`]s it produced — one per keystroke
     /// that changed the buffer (no-op keystrokes emit nothing).
@@ -169,6 +195,40 @@ fn diff_op(before: &str, after: &str) -> Option<EditOp> {
         insert: a[prefix..a.len() - suffix].iter().collect(),
         delete: b.len() - prefix - suffix,
     })
+}
+
+/// Transform a char-offset cursor against a single [`EditOp`] applied to the
+/// same buffer (used when a peer's edit merges in). The three cases mirror
+/// standard operational-transform cursor adjustment:
+/// - edit entirely **before** the cursor → shift by the net length change;
+/// - edit at or **after** the cursor → cursor unaffected;
+/// - edit **straddling** the cursor → land at the end of the inserted region.
+fn transform_cursor(cursor: usize, op: &EditOp) -> usize {
+    let insert_len = op.insert.chars().count();
+    if op.offset + op.delete <= cursor {
+        // `op.delete <= cursor` here, so the subtraction can't underflow.
+        cursor - op.delete + insert_len
+    } else if op.offset >= cursor {
+        cursor
+    } else {
+        op.offset + insert_len
+    }
+}
+
+/// Convert a char offset into a `(line, column)` pair over `text` — the form
+/// modalkit's [`Cursor::new`] wants. Clamps implicitly by stopping at the end.
+fn line_col(text: &str, char_off: usize) -> (usize, usize) {
+    let mut line = 0;
+    let mut col = 0;
+    for ch in text.chars().take(char_off) {
+        if ch == '\n' {
+            line += 1;
+            col = 0;
+        } else {
+            col += 1;
+        }
+    }
+    (line, col)
 }
 
 /// Parse vim key notation into `TerminalKey`s. Literal chars map to themselves;
@@ -355,6 +415,50 @@ mod tests {
         // ...and normal editing must resume once the prompt closes (flag cleared).
         ed.apply_keys("x");
         assert_eq!(ed.text(), "ello world", "editing resumes after the command-line closes");
+    }
+
+    #[test]
+    fn apply_remote_text_identical_is_a_noop() {
+        // The self-write echo case: a session's own mirrored edit comes back
+        // through the block flow as the same text. apply_remote_text must report
+        // "nothing changed" so the caller skips it (no spurious push, no cursor
+        // jump on every keystroke).
+        let mut ed = EditorCore::new("hello");
+        assert!(!ed.apply_remote_text("hello"), "identical text is a no-op");
+        assert_eq!(ed.text(), "hello");
+    }
+
+    #[test]
+    fn apply_remote_text_insert_before_cursor_shifts_it() {
+        // Cursor sits on 'l' (offset 3) of "hello"; a peer inserts "AB" at the
+        // start. The merged text is "ABhello" and the cursor tracks its char,
+        // landing at offset 5.
+        let mut ed = EditorCore::new("hello");
+        ed.apply_keys("lll"); // move to offset 3
+        assert_eq!(ed.cursor(), 3);
+        assert!(ed.apply_remote_text("ABhello"));
+        assert_eq!(ed.text(), "ABhello");
+        assert_eq!(ed.cursor(), 5, "cursor shifted by the inserted length");
+    }
+
+    #[test]
+    fn apply_remote_text_insert_after_cursor_leaves_it() {
+        // Cursor at offset 1; a peer appends at the end. The cursor is unmoved.
+        let mut ed = EditorCore::new("hello");
+        ed.apply_keys("l"); // offset 1
+        assert_eq!(ed.cursor(), 1);
+        assert!(ed.apply_remote_text("hello world"));
+        assert_eq!(ed.text(), "hello world");
+        assert_eq!(ed.cursor(), 1, "an edit after the cursor doesn't move it");
+    }
+
+    #[test]
+    fn apply_remote_text_merges_multiline_content() {
+        // A peer's edit can introduce newlines; the cursor maps to the right
+        // (line, col). Insert "x\n" before the cursor at offset 0.
+        let mut ed = EditorCore::new("a");
+        assert!(ed.apply_remote_text("x\na"));
+        assert_eq!(ed.text(), "x\na");
     }
 
     #[test]

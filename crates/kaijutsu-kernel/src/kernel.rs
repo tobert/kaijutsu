@@ -925,6 +925,30 @@ impl Kernel {
             });
     }
 
+    /// Reconcile open editor sessions after a block's text changed underneath
+    /// them (a sibling session, MCP edit, or streaming turn wrote it), and push
+    /// the new state for every session that actually moved. Driven by the
+    /// server's editor-reconciler task off the block flow; a no-op when nothing
+    /// is bound to this block (the common case). A session's *own* mirror write
+    /// is skipped (its buffer already matches), so this never echoes a
+    /// self-edit. This is the remote-merge half of the push channel — the reason
+    /// the editor channel is push, not poll (docs/vi.md step 1b).
+    pub fn editor_reconcile_block(
+        &self,
+        context_id: kaijutsu_types::ContextId,
+        block_id: kaijutsu_crdt::BlockId,
+        blocks: &crate::block_store::SharedBlockStore,
+    ) {
+        let changed = self
+            .editor_sessions
+            .lock()
+            .0
+            .reconcile_block(context_id, block_id, blocks);
+        for (id, state) in &changed {
+            self.publish_editor_state(*id, state);
+        }
+    }
+
     /// Get the latch-nonce store for a context, creating it on first use.
     ///
     /// The returned `NonceStore` is `Arc`-backed and `Clone`; clones share the

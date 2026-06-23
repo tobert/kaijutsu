@@ -34,6 +34,21 @@ async fn recv_state(rx: &mut Receiver<ServerEvent>) -> EditorState {
     }
 }
 
+/// Drain the push channel until a `EditorStateChanged` for a *specific* session
+/// arrives (other sessions' pushes are stepped over).
+async fn recv_state_for(rx: &mut Receiver<ServerEvent>, session: u64) -> EditorState {
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+            Ok(Ok(ServerEvent::EditorStateChanged { state })) if state.session == session => {
+                return state;
+            }
+            Ok(Ok(_)) => continue,
+            Ok(Err(e)) => panic!("editor push channel error: {e}"),
+            Err(_) => panic!("timed out waiting for session {session}'s EditorStateChanged"),
+        }
+    }
+}
+
 /// Drain until an `EditorClosed` arrives.
 async fn recv_closed(rx: &mut Receiver<ServerEvent>) -> u64 {
     loop {
@@ -129,5 +144,46 @@ fn editor_save_clears_dirty_and_pushes_over_the_wire() {
         // The server is ephemeral per test, so no restoration is needed; just
         // close the session cleanly.
         kernel.editor_quit(session).await.unwrap();
+    });
+}
+
+#[test]
+fn a_peer_edit_reconciles_and_pushes_merged_state_to_a_sibling_session() {
+    // The remote-merge half of the push channel (vi.md step 1b): two editor
+    // sessions bound to the SAME block. When A writes, the server's editor
+    // reconciler must merge A's edit into B's stale buffer and push B's new
+    // state — even though B made no edit. This is the reason the channel is
+    // push, not poll.
+    run_local(async {
+        let addr = start_server().await;
+        let client = connect_client(addr).await;
+        let (kernel, _) = client.bind_kernel().await.unwrap();
+
+        let (callback, mut rx) = editor_events_channel(64);
+        kernel.subscribe_editor(callback).await.unwrap();
+
+        // Two sessions on the same rc path → both bind to the same owning block.
+        let a = kernel.editor_open(RC_PATH).await.unwrap();
+        let b = kernel.editor_open(RC_PATH).await.unwrap();
+        assert_ne!(a.session, b.session, "distinct session handles");
+        let original = b.text.clone();
+        assert!(!b.dirty, "B opens clean");
+
+        // Session A inserts 'Z' at the start; the edit mirrors onto the shared
+        // CRDT block and emits a block.text_ops the reconciler observes.
+        let a_after = kernel.editor_keys(a.session, "iZ<Esc>").await.unwrap();
+        assert_eq!(a_after.text, format!("Z{original}"));
+
+        // The reconciler pushes the merged state to B (the sibling that did NOT
+        // edit). B's buffer was stale; now it reflects A's edit.
+        let b_pushed = recv_state_for(&mut rx, b.session).await;
+        assert_eq!(
+            b_pushed.text, a_after.text,
+            "B must see A's edit merged into its buffer"
+        );
+        assert!(b_pushed.dirty, "B's buffer now differs from the checkpoint it opened on");
+
+        kernel.editor_quit(a.session).await.unwrap();
+        kernel.editor_quit(b.session).await.unwrap();
     });
 }

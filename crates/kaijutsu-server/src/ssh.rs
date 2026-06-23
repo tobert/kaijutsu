@@ -300,6 +300,10 @@ impl SshServer {
         // ingress on the kernel so the rc lifecycle can arm/disarm musicians.
         crate::beat::spawn_beat_scheduler(registry.clone());
 
+        // The single editor reconciler: pushes merged state to open editor
+        // sessions when a *peer* writes a block one is bound to (see vi.md 1b).
+        crate::rpc::spawn_editor_reconciler(registry.clone());
+
         let active_connections = Arc::new(AtomicUsize::new(0));
         log::info!("Max connections: {}", self.config.max_connections);
 
