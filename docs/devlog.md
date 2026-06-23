@@ -42,15 +42,27 @@ front doors and started the app-renderer groundwork.
 - **invoke_peer double-encoding fix** (`4614c29`). Object `params` arrived at the
   MCP server as a JSON *string*; `normalize_peer_params` unwraps one layer.
   Surfaced verifying the Screen fix; de-risks slice-2's editor-open signal.
-- **App-id addressing groundwork** (decisions: submitter-aware routing with
-  principal fallback; build the infra now). `whoami` now stamps `principalId`
-  (`55d285e`) — the canonical principal-population gap (the wire field existed,
-  nobody set it). The peer registry is now keyed by a per-peer `instance` with
-  server-stamped `principal` and by-nick/principal/instance addressing
-  (`41e236c`), fixing the latent "second app window evicts the first" clobber.
-  Remaining (Slice C): the capnp `instance` field, the app minting a per-process
-  instance, and connection-drop peer cleanup (else closed windows leak) — then
-  the slice-2 `open_editor` signal consumes it.
+- **App-id addressing infrastructure** (decisions: submitter-aware routing with
+  principal fallback; build the infra now). Built in slices, all committed +
+  tested + single-window runner-verified:
+  - `whoami` stamps `principalId` (`55d285e`) — the canonical
+    principal-population gap (wire field existed, nobody set it; server is
+    authoritative).
+  - Peer registry keyed by per-window `instance` + server-stamped `principal` +
+    by-nick/principal/instance addressing (`41e236c`), fixing the latent "second
+    window evicts the first" clobber.
+  - Bridge-task self-detach on `conn_cancel` + `reap_closed` backstop
+    (`bdcc0b2a`) — the peer-invoke bridge previously lingered on connection drop
+    (parked on `rx.recv()` with the registry holding the sender); now it follows
+    the FlowBus bridges' cancel idiom.
+  - capnp `instance` + app mints a per-process UUID + a `same_channel`
+    self-detach **identity guard** (`63ff4d7a`) — the peer e2e caught that an old
+    task's self-detach would otherwise clobber a peer that re-attached under the
+    same key (reconnect / same nick). Verified live: the app registers under a
+    real instance and a `kj context switch` reaches it through the new registry.
+  Remaining (slice-2, with `open_editor`): capture the submitter at
+  `editor_open` and route (verify `KjCaller.principal` is populated there); live
+  2-window coexistence check.
 
 ## Time-well context browser
 

@@ -293,11 +293,22 @@ the editor context into `DocumentCache` (see risk #7). Groundwork first:
     the mirror: it drives `Screen::Editor` from its own landing handler, not here.
     Verified live on the runner (in the well → `kj context switch` → pops to
     Conversation). Decision logic unit-tested.
-0b. **App-id addressing** (multi-app): the peer registry keys by the shared nick
-    `"kaijutsu-app"` (last attach wins) — can't target a *specific* app. Thread
-    per-app identity (principal/session) so the editor-open signal pops on the
-    app that requested it. Trace + plumb (`kernel.rs` `invoke_peer`, `peers.rs`,
-    app `connection/actor_plugin.rs`).
+0b. ✅ **App-id addressing infrastructure** (multi-app). The peer registry no
+    longer clobbers (it keyed by the shared nick, last-attach-wins); it's now
+    keyed by a per-window `instance` with server-stamped `principal` and
+    by-nick/principal/instance addressing — so the editor-open signal can target
+    the requesting app (submitter-aware) or fan out to a principal's windows
+    (fallback). Commits: `55d285e` (whoami `principalId` — the principal-population
+    gap), `41e236c` (registry), `bdcc0b2a` (bridge-task self-detach on
+    `conn_cancel` + `reap_closed` — fixes a latent lingering-task leak),
+    `63ff4d7a` (capnp `instance` + app mints a per-process UUID + `same_channel`
+    self-detach identity guard so a re-attach can't be clobbered). 11 registry +
+    3 peer-e2e tests; single-window runner-verified (`kj context switch` reaches
+    the instance-keyed app). **Remaining for the routing itself (slice-2, with
+    `open_editor`):** capture the submitter at `editor_open` and pick the target;
+    **verify the submitter-side `KjCaller.principal` is populated** (Amy's
+    principal-population caveat — whoami + peer-principal are done). Live
+    2-window coexistence check wants a second window.
 5. `Screen::Editor` + MSDF panel rendering `editor_state`; key forwarding to
    `editor_keys`; cursor quad + selection rects from parley.
 6. Optimistic local mirror only if latency demands it.
