@@ -5,6 +5,7 @@
 
 pub mod actor;
 pub mod constants;
+pub mod document_store;
 pub mod rpc;
 pub mod ssh;
 pub mod subscriptions;
@@ -28,6 +29,7 @@ pub use rpc::{
     RpcClient, RpcError, ShellValue, SimilarContext, StagedDriftInfo, SubmitResult, SyncState,
     ToolResult, ToolSchema, VersionSnapshot,
 };
+pub use document_store::{DocumentEntry, DocumentStore};
 pub use ssh::{KeySource, SshChannels, SshClient, SshConfig, SshError};
 pub use subscriptions::{
     ConnectionStatus, OutputEvent, ServerEvent, SyncGeneration, editor_events_channel,
