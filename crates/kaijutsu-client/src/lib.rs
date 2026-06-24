@@ -31,9 +31,7 @@ pub use rpc::{
 };
 pub use document_store::{DocumentEntry, DocumentStore};
 pub use ssh::{KeySource, SshChannels, SshClient, SshConfig, SshError};
-pub use subscriptions::{
-    ConnectionStatus, OutputEvent, ServerEvent, SyncGeneration, editor_events_channel,
-};
+pub use subscriptions::{ConnectionStatus, OutputEvent, ServerEvent, editor_events_channel};
 pub use sync::{SkipReason, SyncError, SyncManager, SyncResult};
 pub use synced_document::{SyncEffect, SyncedDocument};
 pub use synced_input::SyncedInput;

@@ -48,7 +48,6 @@ pub fn handle_block_events(
     layout_gen: Res<LayoutGeneration>,
     mut pending_switch: ResMut<crate::cell::PendingContextSwitch>,
     mut switch_writer: MessageWriter<crate::cell::ContextSwitchRequested>,
-    mut sync_gen: ResMut<crate::connection::actor_plugin::SyncGeneration>,
     session_principal: Res<crate::cell::SessionPrincipal>,
     actor: Option<Res<crate::connection::RpcActor>>,
     channel: Res<crate::connection::RpcResultChannel>,
@@ -67,43 +66,30 @@ pub fn handle_block_events(
             } => {
                 let ctx_id = membership.context_id;
 
-                if !doc_cache.contains(ctx_id) {
-                    let mut synced = kaijutsu_client::SyncedDocument::new(ctx_id, principal_id);
-
-                    if let Some(state) = initial_sync {
-                        match synced.apply_sync_state(state) {
-                            Ok(effect) => {
-                                info!("Cache: initial sync for {} effect: {:?}", ctx_id, effect);
-                            }
-                            Err(e) => {
-                                error!("Cache: initial sync error for {}: {}", ctx_id, e);
-                            }
+                match initial_sync {
+                    // The store creates-or-refreshes the doc and marks it synced.
+                    Some(state) => {
+                        match doc_cache.apply_sync(ctx_id, state, principal_id, || {
+                            membership.context_id.short()
+                        }) {
+                            Ok(created) => info!(
+                                "Cache: {} for {}",
+                                if created { "initial sync" } else { "reconnect refresh" },
+                                ctx_id
+                            ),
+                            Err(e) => error!("Cache: sync error for {}: {}", ctx_id, e),
                         }
                     }
-
-                    let cached = CachedDocument {
-                        synced,
-                        input: None,
-                        input_pending_clear: false,
-                        context_name: membership.context_id.short(),
-                        synced_at_generation: sync_gen.0,
-                        last_accessed: std::time::Instant::now(),
-                        scroll_offset: 0.0,
-                    };
-                    doc_cache.insert(ctx_id, cached);
-                } else if let Some(state) = initial_sync
-                    && let Some(cached) = doc_cache.get_mut(ctx_id)
-                {
-                    match cached.synced.apply_sync_state(state) {
-                        Ok(effect) => {
-                            info!(
-                                "Cache: reconnect refresh for {} effect: {:?}",
-                                ctx_id, effect
+                    // The initial fetch failed — start an empty doc so the view
+                    // has something to render; the staleness path fills it later.
+                    None => {
+                        if !doc_cache.contains(ctx_id) {
+                            let synced = kaijutsu_client::SyncedDocument::new(ctx_id, principal_id);
+                            let generation = doc_cache.generation();
+                            doc_cache.insert(
+                                ctx_id,
+                                CachedDocument::new(synced, membership.context_id.short(), generation),
                             );
-                            cached.synced_at_generation = sync_gen.0;
-                        }
-                        Err(e) => {
-                            error!("Cache: reconnect refresh error for {}: {}", ctx_id, e);
                         }
                     }
                 }
@@ -182,20 +168,15 @@ pub fn handle_block_events(
             }
             RpcResultMessage::ContextResynced { context_id, sync } => {
                 // A staleness re-fetch (post-reconnect / post-lag) delivered the
-                // full CRDT state. Merge it into the cached doc — the idempotent
-                // catch-up that heals blocks lost while the transport was down.
-                // Only an already-cached doc is refreshed; an unknown context is
-                // hydrated by the join bootstrap, not here.
+                // full CRDT state. Merge it via the store — the idempotent catch-up
+                // that heals blocks lost while the transport was down. Only an
+                // already-cached doc is refreshed; an unknown/evicted context is
+                // not resurrected here (the join bootstrap hydrates fresh ones).
                 let ctx_id = *context_id;
-                if let Some(cached) = doc_cache.get_mut(ctx_id) {
-                    match cached.synced.apply_sync_state(sync) {
-                        Ok(effect) => {
-                            info!("Cache: staleness re-sync for {} effect: {:?}", ctx_id, effect);
-                            cached.synced_at_generation = sync_gen.0;
-                        }
-                        Err(e) => {
-                            error!("Cache: staleness re-sync error for {}: {}", ctx_id, e);
-                        }
+                if doc_cache.contains(ctx_id) {
+                    match doc_cache.apply_sync(ctx_id, sync, principal_id, String::new) {
+                        Ok(_) => info!("Cache: staleness re-sync for {}", ctx_id),
+                        Err(e) => error!("Cache: staleness re-sync error for {}: {}", ctx_id, e),
                     }
                 }
             }
@@ -206,54 +187,24 @@ pub fn handle_block_events(
     // Handle streamed block events
     for ServerEventMessage(event) in server_events.read() {
         // An actor-delivered post-reconnect resync carries the full CRDT state,
-        // not a streamed delta — merge it via apply_sync_state (idempotent) and
-        // mark the doc fresh so check_cache_staleness won't re-fetch it. This is
-        // the eager catch-up for the joined context; non-joined docs re-sync
-        // lazily off the SyncGeneration bump (ServerEvent::Reconnected).
+        // not a streamed delta — merge it via the store (idempotent), which marks
+        // the doc fresh so check_cache_staleness won't re-fetch it. The eager
+        // catch-up for the joined context; non-joined docs re-sync lazily off the
+        // generation bump (ServerEvent::Reconnected).
         if let ServerEvent::ContextResynced { sync } = event {
             let ctx_id = sync.context_id;
-            if let Some(cached) = doc_cache.get_mut(ctx_id) {
-                match cached.synced.apply_sync_state(sync) {
-                    Ok(effect) => {
-                        info!("Cache: actor re-sync for {} effect: {:?}", ctx_id, effect);
-                        cached.synced_at_generation = sync_gen.0;
-                    }
+            if doc_cache.contains(ctx_id) {
+                match doc_cache.apply_sync(ctx_id, sync, principal_id, String::new) {
+                    Ok(_) => info!("Cache: actor re-sync for {}", ctx_id),
                     Err(e) => error!("Cache: actor re-sync error for {}: {}", ctx_id, e),
                 }
             }
             continue;
         }
 
-        let event_ctx_id = match event {
-            ServerEvent::BlockInserted { context_id, .. }
-            | ServerEvent::BlockTextOps { context_id, .. }
-            | ServerEvent::BlockStatusChanged { context_id, .. }
-            | ServerEvent::BlockOutputChanged { context_id, .. }
-            | ServerEvent::BlockDeleted { context_id, .. }
-            | ServerEvent::BlockCollapsedChanged { context_id, .. }
-            | ServerEvent::BlockExcludedChanged { context_id, .. }
-            | ServerEvent::BlockMoved { context_id, .. }
-            | ServerEvent::SyncReset { context_id, .. } => Some(*context_id),
-            _ => None,
-        };
-
-        if let Some(ctx_id) = event_ctx_id
-            && let Some(cached) = doc_cache.get_mut(ctx_id)
-        {
-            let effect = cached.synced.apply_event(event);
-            match &effect {
-                kaijutsu_client::SyncEffect::Updated { .. }
-                | kaijutsu_client::SyncEffect::FullSync { .. } => {
-                    cached.synced_at_generation = sync_gen.0;
-                }
-                kaijutsu_client::SyncEffect::NeedsResync => {
-                    cached.synced_at_generation = 0;
-                    sync_gen.0 = sync_gen.0.wrapping_add(1);
-                }
-                kaijutsu_client::SyncEffect::Ignored => {}
-            }
-            trace!("Cache: event for {}: {:?}", ctx_id, effect);
-        }
+        // The store routes the event to its context's doc and keeps the
+        // generation/staleness in step (a NeedsResync bumps internally).
+        doc_cache.apply_server_event(event);
     }
 
     if was_at_bottom
@@ -553,65 +504,56 @@ pub fn handle_server_context_switch(
     }
 }
 
-/// Check if the active document is stale and trigger re-fetch.
+/// Re-fetch the active document when the store marks it stale (after a
+/// generation bump from reconnect or broadcast lag). The store owns the
+/// staleness decision; this system only performs the IO and routes the result
+/// back through `ContextResynced` for the store to merge.
 pub fn check_cache_staleness(
     doc_cache: Res<crate::cell::DocumentCache>,
-    sync_gen: Res<crate::connection::actor_plugin::SyncGeneration>,
     actor: Option<Res<crate::connection::RpcActor>>,
     channel: Res<crate::connection::RpcResultChannel>,
     mut checked_gen: Local<u64>,
 ) {
-    if sync_gen.0 == *checked_gen {
+    let generation = doc_cache.generation();
+    if generation == *checked_gen {
         return;
     }
-    *checked_gen = sync_gen.0;
+    *checked_gen = generation;
 
-    let Some(active_id) = doc_cache.active_id() else {
+    let Some(ctx_id) = doc_cache.stale_active() else {
+        return;
+    };
+    let Some(ref actor) = actor else {
         return;
     };
 
-    let Some(cached) = doc_cache.get(active_id) else {
-        return;
-    };
+    info!("Staleness detected: active doc {} behind generation {}", ctx_id, generation);
 
-    if cached.synced_at_generation < sync_gen.0 {
-        let Some(ref actor) = actor else {
-            return;
-        };
+    let handle = actor.handle.clone();
+    let tx = channel.sender();
 
-        info!(
-            "Staleness detected: active doc {} synced_at={} < current={}",
-            active_id, cached.synced_at_generation, sync_gen.0
-        );
-
-        let handle = actor.handle.clone();
-        let ctx_id = active_id;
-        let tx = channel.sender();
-
-        bevy::tasks::IoTaskPool::get()
-            .spawn(async move {
-                match handle.get_context_sync(ctx_id).await {
-                    Ok(sync) => {
-                        info!(
-                            "Staleness re-fetch complete for {}: {} bytes oplog — applying",
-                            ctx_id,
-                            sync.ops.len()
-                        );
-                        // Route the fetched state back to the main thread to be
-                        // merged into the cached document. Fetching and dropping
-                        // it (the old behavior) left the doc gap-stale.
-                        let _ = tx.send(RpcResultMessage::ContextResynced {
-                            context_id: ctx_id,
-                            sync,
-                        });
-                    }
-                    Err(e) => {
-                        warn!("Staleness re-fetch failed for {}: {}", ctx_id, e);
-                    }
+    bevy::tasks::IoTaskPool::get()
+        .spawn(async move {
+            match handle.get_context_sync(ctx_id).await {
+                Ok(sync) => {
+                    info!(
+                        "Staleness re-fetch complete for {}: {} bytes oplog — applying",
+                        ctx_id,
+                        sync.ops.len()
+                    );
+                    // Route the fetched state back to the main thread; the store
+                    // merges it (and marks the doc fresh).
+                    let _ = tx.send(RpcResultMessage::ContextResynced {
+                        context_id: ctx_id,
+                        sync,
+                    });
                 }
-            })
-            .detach();
-    }
+                Err(e) => {
+                    warn!("Staleness re-fetch failed for {}: {}", ctx_id, e);
+                }
+            }
+        })
+        .detach();
 }
 
 #[cfg(test)]

@@ -89,10 +89,6 @@ impl RpcResultChannel {
     }
 }
 
-/// Monotonic generation — bumped on broadcast lag or reconnect.
-#[derive(Resource, Default)]
-pub struct SyncGeneration(pub u64);
-
 // ============================================================================
 // Bevy Messages (written by poll systems, read by consumer systems)
 // ============================================================================
@@ -211,8 +207,7 @@ impl Plugin for ActorPlugin {
             .insert_resource(RpcConnectionState {
                 ssh_config,
                 ..Default::default()
-            })
-            .init_resource::<SyncGeneration>();
+            });
 
         // Register messages
         app.add_message::<ServerEventMessage>()
@@ -240,13 +235,14 @@ impl Plugin for ActorPlugin {
     }
 }
 
-/// Bump [`SyncGeneration`] when the actor reports a reconnect, so the active
-/// document re-syncs after a transport flake (laptop sleep, Wi-Fi blip). The
-/// reconnect handshake re-subscribes the block *stream*, but blocks the kernel
-/// published *during* the outage went to the dropped subscription and are gone;
-/// without a re-fetch the view stays gap-stale until a manual context switch
-/// respawns the actor. The bump drives [`crate::view::sync::check_cache_staleness`]
-/// to re-fetch and merge the full CRDT state (idempotent).
+/// Bump the document store's generation when the actor reports a reconnect, so
+/// the active document re-syncs after a transport flake (laptop sleep, Wi-Fi
+/// blip). The reconnect handshake re-subscribes the block *stream*, but blocks
+/// the kernel published *during* the outage went to the dropped subscription and
+/// are gone; without a re-fetch the view stays gap-stale until a manual context
+/// switch respawns the actor. The bump drives
+/// [`crate::view::sync::check_cache_staleness`] to re-fetch and merge the full
+/// CRDT state (idempotent).
 ///
 /// Detection lives in the actor ([`kaijutsu_client`]): it owns the reconnect FSM,
 /// so it emits [`ServerEvent::Reconnected`] only on a real reconnect (never the
@@ -254,14 +250,14 @@ impl Plugin for ActorPlugin {
 /// reacts — no re-derivation from the `ConnectionStatus` stream.
 fn bump_sync_generation_on_reconnect(
     mut server_events: MessageReader<ServerEventMessage>,
-    mut sync_gen: ResMut<SyncGeneration>,
+    mut doc_cache: ResMut<crate::cell::DocumentCache>,
 ) {
     for ServerEventMessage(event) in server_events.read() {
         if matches!(event, ServerEvent::Reconnected) {
-            sync_gen.0 = sync_gen.0.wrapping_add(1);
+            let generation = doc_cache.bump_generation();
             log::info!(
                 "reconnect signalled — bumped sync generation to {} for active-doc re-sync",
-                sync_gen.0
+                generation
             );
         }
     }
@@ -571,7 +567,7 @@ fn poll_bootstrap_results(
 fn poll_server_events(
     actor: Option<Res<RpcActor>>,
     mut events: MessageWriter<ServerEventMessage>,
-    mut sync_gen: ResMut<SyncGeneration>,
+    mut doc_cache: ResMut<crate::cell::DocumentCache>,
     mut receiver: Local<Option<broadcast::Receiver<kaijutsu_client::ServerEvent>>>,
     event_loop_proxy: Res<EventLoopProxyWrapper>,
 ) {
@@ -598,7 +594,7 @@ fn poll_server_events(
             }
             Err(broadcast::error::TryRecvError::Lagged(n)) => {
                 log::warn!("Server event broadcast lagged by {n} messages");
-                sync_gen.0 += 1;
+                doc_cache.bump_generation();
             }
             Err(broadcast::error::TryRecvError::Empty) => {
                 break;

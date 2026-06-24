@@ -173,12 +173,6 @@ pub enum ConnectionStatus {
     Terminal { reason: String },
 }
 
-/// Monotonic generation counter — bumped on lag or reconnect.
-///
-/// Consumers can compare generations to detect stale data.
-#[derive(Clone, Debug, Default)]
-pub struct SyncGeneration(pub u64);
-
 // ============================================================================
 // Block Events Forwarder
 // ============================================================================
