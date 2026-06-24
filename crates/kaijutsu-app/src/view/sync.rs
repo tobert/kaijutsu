@@ -398,6 +398,7 @@ pub fn sync_main_cell_to_conversation(
 pub fn handle_context_switch(
     mut switch_events: MessageReader<crate::cell::ContextSwitchRequested>,
     mut doc_cache: ResMut<crate::cell::DocumentCache>,
+    mut scroll_offsets: ResMut<crate::cell::ScrollOffsets>,
     mut scroll_state: ResMut<ConversationScrollState>,
     mut pending_switch: ResMut<crate::cell::PendingContextSwitch>,
     bootstrap: Res<crate::connection::BootstrapChannel>,
@@ -456,10 +457,9 @@ pub fn handle_context_switch(
             continue;
         }
 
-        if let Some(active_id) = doc_cache.active_id()
-            && let Some(cached) = doc_cache.get_mut(active_id)
-        {
-            cached.scroll_offset = scroll_state.offset;
+        // Save the outgoing context's scroll position (view state).
+        if let Some(active_id) = doc_cache.active_id() {
+            scroll_offsets.0.insert(active_id, scroll_state.offset);
         }
 
         doc_cache.set_active(ctx_id);
@@ -474,14 +474,13 @@ pub fn handle_context_switch(
             next_screen.set(target);
         }
 
-        if let Some(cached) = doc_cache.get(ctx_id) {
-            scroll_state.offset = cached.scroll_offset;
-            scroll_state.target_offset = cached.scroll_offset;
+        // Restore the incoming context's saved scroll (default: top).
+        if doc_cache.contains(ctx_id) {
+            let offset = scroll_offsets.0.get(&ctx_id).copied().unwrap_or(0.0);
+            scroll_state.offset = offset;
+            scroll_state.target_offset = offset;
             scroll_state.following = false;
-            info!(
-                "Context switch complete: {} (scroll: {:.0})",
-                ctx_id, cached.scroll_offset
-            );
+            info!("Context switch complete: {} (scroll: {:.0})", ctx_id, offset);
         }
     }
 }

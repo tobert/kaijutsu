@@ -32,10 +32,6 @@ pub struct DocumentEntry {
     pub synced_at_generation: u64,
     /// When this document was last accessed (for LRU eviction).
     pub last_accessed: Instant,
-    /// Saved scroll offset (restored on switch-back). View state today; kept on
-    /// the entry for now to avoid churning consumers — a later increment lifts it
-    /// to an app-side companion.
-    pub scroll_offset: f32,
     /// Set after submit/escape×3 to suppress late-arriving TextOps and
     /// SyncedInput restoration. Cleared when `InputCleared` arrives from
     /// the server and triggers a clean re-fetch.
@@ -44,7 +40,7 @@ pub struct DocumentEntry {
 
 impl DocumentEntry {
     /// A freshly-synced entry around `synced`, marked current at `generation`.
-    /// Input is unset until fetched; scroll starts at the top.
+    /// Input is unset until fetched.
     pub fn new(synced: SyncedDocument, context_name: String, generation: u64) -> Self {
         Self {
             synced,
@@ -52,7 +48,6 @@ impl DocumentEntry {
             context_name,
             synced_at_generation: generation,
             last_accessed: Instant::now(),
-            scroll_offset: 0.0,
             input_pending_clear: false,
         }
     }

@@ -104,6 +104,7 @@ impl Plugin for CellPlugin {
             .init_resource::<LayoutGeneration>()
             .init_resource::<SessionPrincipal>()
             .init_resource::<DocumentCache>()
+            .init_resource::<crate::cell::ScrollOffsets>()
             .init_resource::<PendingContextSwitch>()
             .init_resource::<EditorEntities>()
             .init_resource::<OverlaySummonState>()

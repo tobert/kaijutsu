@@ -30,5 +30,5 @@ pub mod ui_rtt;
 
 // Re-export all public types
 pub use components::*;
-pub use document::DocumentCache;
+pub use document::{DocumentCache, ScrollOffsets};
 pub use lifecycle::EditorEntities;
