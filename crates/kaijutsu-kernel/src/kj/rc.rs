@@ -160,7 +160,19 @@ impl KjDispatcher {
         {
             return denied;
         }
-        match parsed.command {
+        // A direct rc write touches the ConfigCrdtFs block, not the
+        // FileDocumentCache shadow that backs kaish `cat`/file tools — capture
+        // the path so we can drop that stale shadow after a successful write.
+        // (The `edit`-opens-editor branch is covered too: invalidation is a
+        // harmless reload there, and the editor self-invalidates on its writes.)
+        let write_path = match &parsed.command {
+            RcCommand::Add { path, .. }
+            | RcCommand::Rm { path }
+            | RcCommand::Edit { path, .. }
+            | RcCommand::Reset { path } => Some(path.clone()),
+            _ => None,
+        };
+        let result = match parsed.command {
             RcCommand::Add { path, content } => {
                 self.rc_add(&path, content.as_deref(), caller).await
             }
@@ -174,7 +186,13 @@ impl KjDispatcher {
                 self.rc_edit(&path, content.as_deref(), caller).await
             }
             RcCommand::Reset { path } => self.rc_reset(&path).await,
+        };
+        if let Some(path) = write_path
+            && matches!(result, KjResult::Ok { .. })
+        {
+            self.kernel().invalidate_config_file_cache(&path);
         }
+        result
     }
 
     async fn rc_add(&self, path: &str, content: Option<&str>, _caller: &KjCaller) -> KjResult {
@@ -703,6 +721,63 @@ mod tests {
         assert_eq!(
             read_rc(&d, "/etc/rc/edittest/create/S00-foo.kai").await.as_deref(),
             Some("echo new"),
+        );
+    }
+
+    /// `kj rc edit` of a config path drops the FileDocumentCache shadow, so a
+    /// later kaish `cat`/file-tool read sees the new content — not the copy
+    /// cached before the edit. A direct config-block write bypasses the cache, so
+    /// the rc dispatch must invalidate it (same hook the vi editor uses).
+    #[tokio::test]
+    async fn rc_edit_invalidates_the_file_cache_shadow() {
+        use crate::block_store::SharedBlockStore;
+        use crate::file_tools::FileDocumentCache;
+        use crate::kj::test_helpers::*;
+        use crate::kj::KjResult;
+        use kaijutsu_crdt::{BlockId, ContextId};
+        use std::sync::Arc;
+
+        fn block_content(blocks: &SharedBlockStore, ctx: ContextId, block: &BlockId) -> String {
+            blocks
+                .block_snapshots(ctx)
+                .unwrap()
+                .into_iter()
+                .find(|s| s.id == *block)
+                .expect("shadow block present")
+                .content
+        }
+
+        let d = test_dispatcher_crdt_rc().await;
+        let c = test_caller();
+        let s = |v: &str| v.to_string();
+        let path = "/etc/rc/cachetest/create/S00-foo.kai";
+
+        // Install the shared file cache over the dispatcher's store + kernel VFS.
+        let cache = Arc::new(FileDocumentCache::new(
+            d.block_store().clone(),
+            d.kernel().vfs().clone(),
+        ));
+        assert!(d.kernel().set_file_cache(cache.clone()), "cache installs");
+
+        // Create the script, then read it through the cache to populate a shadow.
+        d.dispatch(&[s("rc"), s("add"), s(path), s("--content"), s("echo old")], &c)
+            .await;
+        let (sctx, sblock) = cache.get_or_load(path).await.unwrap();
+        assert_eq!(block_content(d.block_store(), sctx, &sblock), "echo old");
+
+        // Edit the config block directly via kj rc.
+        let result = d
+            .dispatch(&[s("rc"), s("edit"), s(path), s("--content"), s("echo new")], &c)
+            .await;
+        assert!(matches!(result, KjResult::Ok { .. }), "edit failed: {result:?}");
+
+        // The next cache read must reflect the edit — the dispatch hook dropped
+        // the stale shadow (without it the surviving shadow re-serves "echo old").
+        let (sctx2, sblock2) = cache.get_or_load(path).await.unwrap();
+        assert_eq!(
+            block_content(d.block_store(), sctx2, &sblock2),
+            "echo new",
+            "kaish read sees the kj rc edit after invalidation"
         );
     }
 

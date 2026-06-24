@@ -114,12 +114,27 @@ impl KjDispatcher {
         {
             return denied;
         }
-        match parsed.command {
+        // A direct config write touches the ConfigCrdtFs block, not the
+        // FileDocumentCache shadow that backs kaish `cat`/file tools — capture
+        // the canonical path so we can drop the stale shadow after a success.
+        let write_path = match &parsed.command {
+            ConfigCommand::Set { path, .. } | ConfigCommand::Reset { path } => {
+                config_canonical(path).ok()
+            }
+            _ => None,
+        };
+        let result = match parsed.command {
             ConfigCommand::List { json } => self.config_list(json).await,
             ConfigCommand::Show { path, json } => self.config_show(&path, json).await,
             ConfigCommand::Set { path, content } => self.config_set(&path, content.as_deref()).await,
             ConfigCommand::Reset { path } => self.config_reset(&path).await,
+        };
+        if let Some(canonical) = write_path
+            && matches!(result, KjResult::Ok { .. })
+        {
+            self.kernel().invalidate_config_file_cache(&canonical);
         }
+        result
     }
 
     /// Read a config file's content from the VFS. `Ok(None)` for an absent file

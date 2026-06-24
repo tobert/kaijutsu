@@ -886,7 +886,9 @@ impl Kernel {
         };
         // The mirror (and any ZZ/ZQ rollback) wrote the block; drop the file
         // cache's now-stale shadow so a kaish `cat` re-reads fresh.
-        self.invalidate_editor_file_cache(path.as_deref(), blocks);
+        if let Some(path) = path.as_deref() {
+            self.invalidate_config_file_cache(path);
+        }
         match outcome {
             crate::editor::KeysOutcome::Updated(state) => {
                 self.publish_editor_state(id, &state);
@@ -934,7 +936,9 @@ impl Kernel {
             path
         };
         // The rollback wrote the block; drop the file cache's stale shadow.
-        self.invalidate_editor_file_cache(path.as_deref(), blocks);
+        if let Some(path) = path.as_deref() {
+            self.invalidate_config_file_cache(path);
+        }
         self.editor_flows.publish(crate::flows::EditorFlow::Closed {
             session_id: id.as_u64(),
         });
@@ -948,18 +952,24 @@ impl Kernel {
     /// `config_context_id`) leaves it stale, and the symlink-lstat mtime can't
     /// self-heal it. Regular-file editors bind the cache's own block, so they
     /// need no invalidation (a `None`/non-config path is a no-op).
-    fn invalidate_editor_file_cache(
-        &self,
-        path: Option<&str>,
-        blocks: &crate::block_store::SharedBlockStore,
-    ) {
-        if let Some(path) = path
-            && crate::editor::config_owned(path)
-            && let Err(e) = self.file_cache(blocks).invalidate_document(path)
+    /// Invalidate the shared [`FileDocumentCache`] shadow for a **config** path
+    /// after a write that touched the `ConfigCrdtFs` block **directly** (the vi
+    /// editor's block mirror, `kj rc edit/reset/add/rm`, `kj config set/reset`).
+    ///
+    /// Config paths get a separate `file_context_id` shadow doc that backs the
+    /// kaish `cat`/file-tool read path; a direct config-block write leaves it
+    /// stale (and the symlink-lstat mtime can't self-heal it). Every such writer
+    /// calls this so the next read reloads. A no-op for non-config paths and
+    /// before the cache is installed (tests/embedded). Uses the *installed*
+    /// cache, so callers don't need a block-store handle.
+    pub fn invalidate_config_file_cache(&self, path: &str) {
+        if crate::editor::config_owned(path)
+            && let Some(cache) = self.file_cache.get()
+            && let Err(e) = cache.invalidate_document(path)
         {
-            // The cache shadow is now inconsistent with the edited config block;
+            // The cache shadow is now inconsistent with the written config block;
             // a later kaish `cat` could serve stale text. Loud, not swallowed.
-            tracing::warn!("editor: failed to invalidate file cache for {path}: {e}");
+            tracing::warn!("failed to invalidate file cache for {path}: {e}");
         }
     }
 
