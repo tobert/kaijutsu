@@ -1,0 +1,15 @@
+# mcp: producer / orchestrator governance grants.
+#
+# The `mcp` context_type is where most orchestration / producer work happens —
+# Claude Code drives kaijutsu over MCP (cheap on the Anthropic subscription),
+# while kaijutsu itself runs local / cheaper models to keep API spend down. That
+# producer role iterates on the kernel's own CRDT-owned config-as-code, so it
+# holds the rc + config governance caps *on top of* the broad loadout composed in
+# by S10 (the shared `lib` binding: "*", facade:*, drive/fork/drift/transport/
+# operator).
+#
+# These are deny-by-default and NOT implied by "*": a broad role must not be able
+# to rewrite a privileged lifecycle script or swap which model runs by accident.
+# Granting them here is the explicit, intentional opt-in for the producer voice.
+kj binding allow "rc-write"      # kj rc edit/reset + file-tool writes under /etc/rc
+kj binding allow "config-write"  # kj config set/reset over the /etc/config CRDT files

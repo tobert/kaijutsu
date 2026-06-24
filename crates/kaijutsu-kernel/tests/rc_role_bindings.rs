@@ -245,3 +245,35 @@ async fn director_role_seeds_block_tooling_but_not_file_writes() {
         );
     }
 }
+
+#[tokio::test]
+async fn mcp_role_holds_rc_and_config_governance() {
+    // The `mcp` context_type is the producer/orchestrator voice (Claude Code
+    // over MCP, cheaper than API rates). On top of the shared broad loadout it
+    // adds the rc + config governance caps via S15-governance.kai, so it can
+    // iterate on the kernel's own CRDT-owned config-as-code.
+    //
+    // NB: the broad loadout itself (S10 → lib via a CRDT symlink) is NOT asserted
+    // here — this harness mounts /etc/rc as a host `LocalBackend`, which doesn't
+    // follow the `ConfigCrdtFs` symlink the shared binding is composed through.
+    // S15 is a plain script, so it runs and grants regardless; the symlink
+    // composition is covered where ConfigCrdtFs is in play.
+    let h = harness().await;
+    let ctx = create_typed(&h, "mcp-role", "mcp").await;
+    let binding = h
+        .kernel
+        .broker()
+        .binding(&ctx)
+        .await
+        .expect("mcp rc must seed a binding");
+
+    // The governance caps added by S15 — deny-by-default, NOT implied by '*'.
+    assert!(
+        binding.allows(&Capability::RcWrite),
+        "mcp should hold rc-write so kj rc edit/reset + /etc/rc edits work"
+    );
+    assert!(
+        binding.allows(&Capability::ConfigWrite),
+        "mcp should hold config-write for /etc/config governance"
+    );
+}
