@@ -192,7 +192,10 @@ impl EditorState {
 struct EditorSession {
     core: EditorCore,
     target: EditorTarget,
-    #[allow(dead_code)] // carried for save-to-disk of file docs (TBD) + diagnostics
+    /// The path the editor was opened on (as the caller named it — e.g. a
+    /// `coder/*` symlink, before resolution). Used to invalidate the shared
+    /// `FileDocumentCache` after a write so a kaish `cat` of this path re-reads
+    /// the just-edited block instead of a stale shadow copy.
     path: String,
     /// Normalized (terminator-stripped) content as of the last open/save — the
     /// dirty/`ZQ` checkpoint. Matches `EditorCore`'s normalized view so dirty
@@ -360,6 +363,13 @@ impl EditorSessions {
         let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
         let saved = session.saved_content.clone();
         Ok(state_of(&mut session.core, &saved))
+    }
+
+    /// The path a session was opened on, or `None` if no such session. Captured
+    /// before a `ZZ`/`ZQ` (which drops the session) so the caller can invalidate
+    /// the file cache for it afterward.
+    pub fn session_path(&self, id: EditorSessionId) -> Option<String> {
+        self.sessions.get(&id).map(|s| s.path.clone())
     }
 
     /// `ZZ` — checkpoint the current buffer as saved, returning the now-clean

@@ -876,7 +876,17 @@ impl Kernel {
         keys: &str,
         blocks: &crate::block_store::SharedBlockStore,
     ) -> Result<crate::editor::EditorState, String> {
-        let outcome = self.editor_sessions.lock().0.keys(id, keys, blocks)?;
+        // Capture the path and feed the keys under one lock — a ZZ/ZQ in the
+        // batch drops the session, so the path must be read first.
+        let (path, outcome) = {
+            let mut sessions = self.editor_sessions.lock();
+            let path = sessions.0.session_path(id);
+            let outcome = sessions.0.keys(id, keys, blocks)?;
+            (path, outcome)
+        };
+        // The mirror (and any ZZ/ZQ rollback) wrote the block; drop the file
+        // cache's now-stale shadow so a kaish `cat` re-reads fresh.
+        self.invalidate_editor_file_cache(path.as_deref(), blocks);
         match outcome {
             crate::editor::KeysOutcome::Updated(state) => {
                 self.publish_editor_state(id, &state);
@@ -917,11 +927,40 @@ impl Kernel {
         id: crate::editor::EditorSessionId,
         blocks: &crate::block_store::SharedBlockStore,
     ) -> Result<(), String> {
-        self.editor_sessions.lock().0.quit(id, blocks)?;
+        let path = {
+            let mut sessions = self.editor_sessions.lock();
+            let path = sessions.0.session_path(id);
+            sessions.0.quit(id, blocks)?;
+            path
+        };
+        // The rollback wrote the block; drop the file cache's stale shadow.
+        self.invalidate_editor_file_cache(path.as_deref(), blocks);
         self.editor_flows.publish(crate::flows::EditorFlow::Closed {
             session_id: id.as_u64(),
         });
         Ok(())
+    }
+
+    /// Drop the shared [`FileDocumentCache`] shadow for an editor-written
+    /// **config** path, so a kaish `cat` / file tool re-reads the just-edited
+    /// `ConfigCrdtFs` block instead of a stale copy. Config paths get a separate
+    /// `file_context_id` shadow document; a direct editor block write (keyed by
+    /// `config_context_id`) leaves it stale, and the symlink-lstat mtime can't
+    /// self-heal it. Regular-file editors bind the cache's own block, so they
+    /// need no invalidation (a `None`/non-config path is a no-op).
+    fn invalidate_editor_file_cache(
+        &self,
+        path: Option<&str>,
+        blocks: &crate::block_store::SharedBlockStore,
+    ) {
+        if let Some(path) = path
+            && crate::editor::config_owned(path)
+            && let Err(e) = self.file_cache(blocks).invalidate_document(path)
+        {
+            // The cache shadow is now inconsistent with the edited config block;
+            // a later kaish `cat` could serve stale text. Loud, not swallowed.
+            tracing::warn!("editor: failed to invalidate file cache for {path}: {e}");
+        }
     }
 
     /// Publish a session's current state on the editor push channel.
@@ -1436,6 +1475,76 @@ mod tests {
         kernel.editor_quit(id, &blocks).unwrap();
         let err = kernel.editor_keys(id, "x", &blocks).unwrap_err();
         assert!(err.contains("no such session"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn editor_edit_invalidates_the_file_cache_shadow() {
+        // A config path gets a *shadow* copy in the FileDocumentCache (keyed by
+        // file_context_id) separate from the ConfigCrdtFs block the editor writes
+        // (config_context_id). A direct editor block write would leave that shadow
+        // stale — so a kaish `cat` after an in-app edit would serve old bytes.
+        // Kernel::editor_keys must invalidate the shadow so the next read reloads.
+        use crate::block_store::{shared_block_store_with_db, SharedBlockStore};
+        use crate::file_tools::FileDocumentCache;
+        use crate::kernel_db::KernelDb;
+        use crate::runtime::config_crdt_fs::ConfigCrdtFs;
+        use crate::vfs::VfsOps as _;
+        use kaijutsu_crdt::{BlockId, ContextId, PrincipalId};
+        use std::path::Path;
+
+        fn block_content(blocks: &SharedBlockStore, ctx: ContextId, block: &BlockId) -> String {
+            blocks
+                .block_snapshots(ctx)
+                .unwrap()
+                .into_iter()
+                .find(|s| s.id == *block)
+                .expect("shadow block present")
+                .content
+        }
+
+        let kernel = Kernel::new_ephemeral("test").await;
+        let creator = PrincipalId::system();
+        let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+        let ws = db.lock().get_or_create_default_workspace(creator).unwrap();
+        let blocks = shared_block_store_with_db(db, ws, creator);
+
+        // Mount the rc backend on the kernel VFS (so the cache reads through it),
+        // then seed a config script over the same store.
+        kernel
+            .mount("/etc/rc", ConfigCrdtFs::new(blocks.clone(), "/etc/rc"))
+            .await;
+        ConfigCrdtFs::new(blocks.clone(), "/etc/rc")
+            .write_all(Path::new("coder/create/S00.kai"), b"hello")
+            .await
+            .unwrap();
+        let path = "/etc/rc/coder/create/S00.kai";
+
+        // One shared file cache over the same store + kernel VFS — the editor's
+        // invalidation and our reads must hit the same instance.
+        let cache = Arc::new(FileDocumentCache::new(blocks.clone(), kernel.vfs().clone()));
+        assert!(kernel.set_file_cache(cache.clone()), "cache installs");
+
+        // Populate the shadow from the source.
+        let (sctx, sblock) = cache.get_or_load(path).await.unwrap();
+        assert_eq!(
+            block_content(&blocks, sctx, &sblock),
+            "hello",
+            "shadow loads the source content"
+        );
+
+        // Edit the config block through the editor (insert X at the front).
+        let (id, _) = kernel.editor_open(path, &blocks).await.unwrap();
+        kernel.editor_keys(id, "iX<Esc>", &blocks).unwrap();
+
+        // The next read must reflect the edit — proving the shadow was dropped and
+        // reloaded, not re-served stale. (With a plain cache-entry invalidate the
+        // surviving shadow doc would re-serve "hello" and this fails.)
+        let (sctx2, sblock2) = cache.get_or_load(path).await.unwrap();
+        assert_eq!(
+            block_content(&blocks, sctx2, &sblock2),
+            "Xhello",
+            "kaish read sees the editor's edit after invalidation"
+        );
     }
 
     #[tokio::test]

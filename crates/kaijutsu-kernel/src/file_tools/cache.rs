@@ -436,6 +436,27 @@ impl FileDocumentCache {
         self.cache.write().remove(&ctx_id);
     }
 
+    /// Like [`invalidate`](Self::invalidate), but also drops the **backing shadow
+    /// document** so the next read fully reloads from the VFS.
+    ///
+    /// Plain `invalidate` only removes the in-memory entry; the shadow CRDT doc
+    /// (at `file_context_id(path)`) survives, and the next `get_or_load`
+    /// re-registers that same — now stale — block (the `create_document` already
+    /// exists → snapshot-and-reuse path). That's correct for a self-contained
+    /// file (the doc *is* the truth), but wrong for a **config shadow**: the real
+    /// owner is the `config_context_id` block, and when *that* changed underneath
+    /// us (e.g. the vi editor wrote it directly), the shadow must be rebuilt from
+    /// the VFS, not re-served. Deleting the shadow doc forces the clean-reload
+    /// path. The shadow is a pure cache materialization, so dropping it is safe;
+    /// a delete failure is surfaced (never a swallowed stale serve).
+    pub fn invalidate_document(&self, path: &str) -> Result<(), String> {
+        let ctx_id = file_context_id(path);
+        self.cache.write().remove(&ctx_id);
+        self.block_store
+            .delete_document(ctx_id)
+            .map_err(|e| format!("invalidate_document({path}): {e}"))
+    }
+
     /// Mark a file as dirty (needs flush to VFS).
     pub fn mark_dirty(&self, path: &str) {
         let ctx_id = file_context_id(path);
