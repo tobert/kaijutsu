@@ -1558,6 +1558,34 @@ impl RpcActor {
         // (e.g. a headless client) is fine.
         if is_reconnect {
             let _ = self.event_tx.send(ServerEvent::Reconnected);
+
+            // Eagerly re-fetch the joined context's full CRDT state and deliver
+            // it, so renderers converge on what the stream missed during the
+            // outage without waiting for a view-driven staleness re-fetch. The
+            // actor owns the reconnect, so this orchestration belongs here. The
+            // block stream was already re-subscribed in the handshake, so the
+            // fetch reflects the current truth. Fire-and-forget on the new
+            // connection; a failure just falls back to the coarse `Reconnected`
+            // signal renderers already react to.
+            if let Some(ctx) = self.joined_context_id {
+                let kernel = self
+                    .connection
+                    .as_ref()
+                    .expect("connection set above")
+                    .kernel
+                    .clone();
+                let event_tx = self.event_tx.clone();
+                tokio::task::spawn_local(async move {
+                    match kernel.get_context_sync(ctx).await {
+                        Ok(sync) => {
+                            let _ = event_tx.send(ServerEvent::ContextResynced { sync });
+                        }
+                        Err(e) => {
+                            log::warn!("post-reconnect resync fetch failed for {ctx}: {e}")
+                        }
+                    }
+                });
+            }
         }
 
         self.broadcast_state();

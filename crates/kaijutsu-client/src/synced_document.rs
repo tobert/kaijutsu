@@ -108,6 +108,8 @@ impl SyncedDocument {
             | ServerEvent::ContextSwitched { context_id, .. } => Some(*context_id),
             // Editor events are session-scoped, not context-scoped — the
             // editor renders off its own subscription, not the doc cache.
+            // A post-reconnect resync delivery names its target context inline.
+            ServerEvent::ContextResynced { sync } => Some(sync.context_id),
             // Connection- and session-scoped events carry no context.
             ServerEvent::ResourceUpdated { .. }
             | ServerEvent::ResourceListChanged { .. }
@@ -431,9 +433,11 @@ impl SyncedDocument {
             | ServerEvent::ContextSwitched { .. }
             | ServerEvent::EditorStateChanged { .. }
             | ServerEvent::EditorClosed { .. }
-            // Reconnected is a connection-level signal — the consumer re-syncs
-            // the doc via `get_context_sync`, the event itself touches nothing.
-            | ServerEvent::Reconnected => SyncEffect::Ignored,
+            // Reconnected is a connection-level signal, and a ContextResynced
+            // delivery is applied via `apply_sync_state` (not the streamed-event
+            // path) — neither touches the doc here.
+            | ServerEvent::Reconnected
+            | ServerEvent::ContextResynced { .. } => SyncEffect::Ignored,
         }
     }
 

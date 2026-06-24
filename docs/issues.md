@@ -87,15 +87,16 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
     the free signal; never the first connect). The app just reacts (bumps
     `SyncGeneration`); the `ReconnectTracker` fold + its app unit tests are gone. The
     cuttable-proxy e2e asserts the actor emits `Reconnected`.
-  - **REMAINING — re-fetch delivery:** on reconnect the actor could re-fetch
-    `get_context_sync` for its joined context and *deliver it as an event the app already
-    applies* (the `initial_sync` path), so the e2e covers the *whole* loop (kernel→app
-    convergence), not just the substrate + the signal. **Wrinkle that keeps part
-    app-side:** the actor's `joined_context_id` is singular, but the app's
-    `DocumentCache` is multi-context and the *active viewed* doc is genuinely app state —
-    so "which context to refresh" stays in the app. Decide: actor auto-resyncs its
-    joined context (risks a dual resync path with the app's `check_cache_staleness`) vs.
-    keep the app driving the fetch off the `Reconnected` signal (current).
+  - **DONE — re-fetch delivery:** `enter_connected` now spawns a re-fetch of the joined
+    context's `get_context_sync` and emits `ServerEvent::ContextResynced { sync }`; the
+    app merges it via `apply_sync_state` (and marks the doc fresh so
+    `check_cache_staleness` won't re-fetch it). The e2e applies the *delivered*
+    `SyncState` and asserts it reconstructs the gap block — the whole client-side loop,
+    not just the signal. The **multi-context wrinkle** resolved as a clean division (not
+    a dual path): the actor eagerly delivers its *joined* context; `Reconnected`'s
+    `SyncGeneration` bump is the *coarse* backstop that re-syncs *non-joined* cached docs
+    lazily on next view (+ the lag case). The joined+active context is covered by the
+    eager delivery, so no redundant fetch in the common case.
   - **CLEANUP:** there are now **two `SyncGeneration` types** — `kaijutsu-client`
     (`subscriptions.rs`, doc-commented "bumped on lag or reconnect", currently unused)
     and the app's own (`actor_plugin.rs`, the wired one). The client one was clearly

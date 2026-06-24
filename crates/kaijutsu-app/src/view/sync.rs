@@ -205,6 +205,25 @@ pub fn handle_block_events(
 
     // Handle streamed block events
     for ServerEventMessage(event) in server_events.read() {
+        // An actor-delivered post-reconnect resync carries the full CRDT state,
+        // not a streamed delta — merge it via apply_sync_state (idempotent) and
+        // mark the doc fresh so check_cache_staleness won't re-fetch it. This is
+        // the eager catch-up for the joined context; non-joined docs re-sync
+        // lazily off the SyncGeneration bump (ServerEvent::Reconnected).
+        if let ServerEvent::ContextResynced { sync } = event {
+            let ctx_id = sync.context_id;
+            if let Some(cached) = doc_cache.get_mut(ctx_id) {
+                match cached.synced.apply_sync_state(sync) {
+                    Ok(effect) => {
+                        info!("Cache: actor re-sync for {} effect: {:?}", ctx_id, effect);
+                        cached.synced_at_generation = sync_gen.0;
+                    }
+                    Err(e) => error!("Cache: actor re-sync error for {}: {}", ctx_id, e),
+                }
+            }
+            continue;
+        }
+
         let event_ctx_id = match event {
             ServerEvent::BlockInserted { context_id, .. }
             | ServerEvent::BlockTextOps { context_id, .. }

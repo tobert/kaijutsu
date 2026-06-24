@@ -18,9 +18,9 @@ use tokio::task::{JoinHandle, LocalSet};
 
 use kaijutsu_client::{
     ActorHandle, CallError, ConnectionStatus, KeySource, NotReadyReason, ServerEvent, SshConfig,
-    spawn_actor,
+    SyncState, SyncedDocument, spawn_actor,
 };
-use kaijutsu_crdt::ContextId;
+use kaijutsu_crdt::{ContextId, PrincipalId};
 use kaijutsu_server::{SshServer, SshServerConfig};
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -594,6 +594,26 @@ async fn saw_reconnected_event(
     }
 }
 
+/// Drain the event stream for the actor's eager post-reconnect resync delivery,
+/// returning its `SyncState`.
+async fn wait_for_context_resync(
+    rx: &mut broadcast::Receiver<ServerEvent>,
+    timeout: Duration,
+) -> Option<SyncState> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Ok(ServerEvent::ContextResynced { sync })) => return Some(sync),
+            Ok(Ok(_)) | Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => return None,
+        }
+    }
+}
+
 /// Poll until the actor sees at least `want` blocks for `ctx`, or panic.
 async fn wait_for_blocks_at_least(
     actor: &ActorHandle,
@@ -735,6 +755,22 @@ fn reconnect_resyncs_blocks_appended_during_outage() {
         assert!(
             saw_reconnected_event(&mut reader_events, Duration::from_secs(5)).await,
             "actor must emit ServerEvent::Reconnected after a reconnect"
+        );
+
+        // ...and eagerly DELIVER the joined context's re-fetched state. Applying
+        // that delivered SyncState reconstructs the doc *including the block
+        // appended during the outage* — the whole client-side loop (reconnect →
+        // actor re-fetches → delivers), not just the signal or the substrate.
+        let resync = wait_for_context_resync(&mut reader_events, Duration::from_secs(10))
+            .await
+            .expect("actor must deliver ServerEvent::ContextResynced after a reconnect");
+        assert_eq!(resync.context_id, ctx, "resync delivery names the joined context");
+        let doc =
+            SyncedDocument::from_sync_state(&resync, PrincipalId::new()).expect("apply resync");
+        assert!(
+            doc.block_count() >= gap_count,
+            "delivered resync must contain the gap block: {} < {gap_count}",
+            doc.block_count(),
         );
 
         // The reconnected reader can now re-fetch the gap block. Before the fix

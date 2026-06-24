@@ -16,7 +16,7 @@ use kaijutsu_types::{BlockId, BlockSnapshot};
 use tokio::sync::broadcast;
 
 use crate::kaijutsu_capnp::{block_events, editor_events, kernel_output, resource_events};
-use crate::rpc::{EditorState, parse_block_id, parse_block_snapshot, parse_editor_state};
+use crate::rpc::{EditorState, SyncState, parse_block_id, parse_block_snapshot, parse_editor_state};
 
 // ============================================================================
 // Event Types
@@ -119,7 +119,18 @@ pub enum ServerEvent {
     /// should re-sync their active view. Emitted by the actor itself, which owns
     /// the FSM and so is the natural place to know a reconnect happened (rather
     /// than re-deriving it downstream from the `ConnectionStatus` stream).
+    ///
+    /// This is the *coarse* signal: it marks every cached doc stale so a
+    /// non-joined context re-syncs when next viewed. The actor also eagerly
+    /// re-fetches its joined context and delivers it as [`ServerEvent::ContextResynced`].
     Reconnected,
+    /// The actor re-fetched a context's full CRDT state after a reconnect and is
+    /// delivering it for renderers to merge (`apply_sync_state`) — the eager
+    /// catch-up for the context the client was on, so work done during the outage
+    /// converges without waiting for a view-driven staleness re-fetch. The
+    /// orchestration lives in the actor (which owns the reconnect); the renderer
+    /// just applies. `sync.context_id` names the target.
+    ContextResynced { sync: SyncState },
 }
 
 /// Connection lifecycle status broadcast by the reconnect FSM.
