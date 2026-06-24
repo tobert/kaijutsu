@@ -141,71 +141,83 @@ fn sync_block_fx(
             mat.label_gaps = Vec4::ZERO;
         }
 
-        // Cursor (overlay only) — width and color depend on vim mode.
-        if is_overlay && show_cursor {
-            if let Some(geom) = cursor_geom {
-                if geom.height > 0.0 && rtt.built_width > 0.0 && rtt.built_height > 0.0 {
-                    use crate::input::vim::CursorKind;
-                    // Block-cursor width: a fraction of line height. Mono
-                    // fonts cluster around ~0.55× height; this is close
-                    // enough without re-querying parley for cluster advance.
-                    let block_width = (geom.height as f32 * 0.55).max(2.0);
-                    let glyph_h = geom.height as f32;
-                    let (rect_x, rect_y, rect_w, rect_h, color) = match geom.kind {
-                        CursorKind::Beam => {
-                            (geom.x as f32, geom.y as f32, 2.0, glyph_h, theme.cursor_insert)
-                        }
-                        CursorKind::Block => {
-                            (geom.x as f32, geom.y as f32, block_width, glyph_h, theme.cursor_normal)
-                        }
-                        CursorKind::Underline => {
-                            // Thin bar at the glyph baseline — vim Replace.
-                            let bar_h = (glyph_h * 0.12).max(2.0);
-                            let y = geom.y as f32 + glyph_h - bar_h;
-                            (geom.x as f32, y, block_width, bar_h, theme.cursor_replace)
-                        }
-                        // Hidden — selection rect renders instead. Zero rect
-                        // skips the shader's cursor composite.
-                        CursorKind::Hidden => (0.0, 0.0, 0.0, 0.0, Vec4::ZERO),
-                    };
-
-                    if rect_w > 0.0 && rect_h > 0.0 {
-                        let cx = rect_x / rtt.built_width;
-                        let cy = rect_y / rtt.built_height;
-                        let cw = rect_w / rtt.built_width;
-                        let ch = rect_h / rtt.built_height;
-                        mat.cursor_params = Vec4::new(cx, cy, cw, ch);
-                        mat.cursor_color = Vec4::new(color.x, color.y, color.z, color.w);
-                    } else {
-                        mat.cursor_params = Vec4::ZERO;
-                        mat.cursor_color = Vec4::ZERO;
-                    }
-
-                    // Selection rect (Visual mode) — pixel rect → UV.
-                    if geom.selection_width > 0.0 && geom.selection_height > 0.0 {
-                        let sx = geom.selection_x as f32 / rtt.built_width;
-                        let sy = geom.selection_y as f32 / rtt.built_height;
-                        let sw = geom.selection_width as f32 / rtt.built_width;
-                        let sh = geom.selection_height as f32 / rtt.built_height;
-                        mat.selection_params = Vec4::new(sx, sy, sw, sh);
-                        let s = theme.selection_bg.to_srgba();
-                        mat.selection_color = Vec4::new(s.red, s.green, s.blue, s.alpha);
-                    } else {
-                        mat.selection_params = Vec4::ZERO;
-                        mat.selection_color = Vec4::ZERO;
-                    }
-                } else {
-                    mat.cursor_params = Vec4::ZERO;
-                    mat.cursor_color = Vec4::ZERO;
-                    mat.selection_params = Vec4::ZERO;
-                    mat.selection_color = Vec4::ZERO;
-                }
+        // Cursor (overlay only) — width and color depend on vim mode. Shared
+        // with the editor surface via `cursor_selection_uniforms`.
+        let (cp, cc, sp, sc) = match (is_overlay && show_cursor, cursor_geom) {
+            (true, Some(geom)) => {
+                cursor_selection_uniforms(geom, rtt.built_width, rtt.built_height, &theme)
             }
-        } else {
-            mat.cursor_params = Vec4::ZERO;
-            mat.cursor_color = Vec4::ZERO;
-            mat.selection_params = Vec4::ZERO;
-            mat.selection_color = Vec4::ZERO;
-        }
+            _ => (Vec4::ZERO, Vec4::ZERO, Vec4::ZERO, Vec4::ZERO),
+        };
+        mat.cursor_params = cp;
+        mat.cursor_color = cc;
+        mat.selection_params = sp;
+        mat.selection_color = sc;
     }
+}
+
+/// Compute the cursor + selection material uniforms from cursor geometry, in UV
+/// space: `(cursor_params, cursor_color, selection_params, selection_color)`.
+///
+/// Shared by the compose overlay ([`sync_block_fx`]) and the editor surface
+/// (`view::editor::render::sync_editor_cursor`) so the cursor beam/block/underline
+/// shapes and the selection highlight render identically. `rtt_w`/`rtt_h` are the
+/// surface's logical build dimensions (pixel rects → UV). Returns all-zero (no
+/// composite) when there is no cursor to draw.
+pub fn cursor_selection_uniforms(
+    geom: &OverlayCursorGeometry,
+    rtt_w: f32,
+    rtt_h: f32,
+    theme: &Theme,
+) -> (Vec4, Vec4, Vec4, Vec4) {
+    use crate::input::vim::CursorKind;
+    if geom.height <= 0.0 || rtt_w <= 0.0 || rtt_h <= 0.0 {
+        return (Vec4::ZERO, Vec4::ZERO, Vec4::ZERO, Vec4::ZERO);
+    }
+
+    // Block-cursor width: a fraction of line height. Mono fonts cluster around
+    // ~0.55× height; close enough without re-querying parley for cluster advance.
+    let block_width = (geom.height as f32 * 0.55).max(2.0);
+    let glyph_h = geom.height as f32;
+    let (rect_x, rect_y, rect_w, rect_h, color) = match geom.kind {
+        CursorKind::Beam => (geom.x as f32, geom.y as f32, 2.0, glyph_h, theme.cursor_insert),
+        CursorKind::Block => {
+            (geom.x as f32, geom.y as f32, block_width, glyph_h, theme.cursor_normal)
+        }
+        CursorKind::Underline => {
+            // Thin bar at the glyph baseline — vim Replace.
+            let bar_h = (glyph_h * 0.12).max(2.0);
+            let y = geom.y as f32 + glyph_h - bar_h;
+            (geom.x as f32, y, block_width, bar_h, theme.cursor_replace)
+        }
+        // Hidden — selection rect renders instead. Zero rect skips the composite.
+        CursorKind::Hidden => (0.0, 0.0, 0.0, 0.0, Vec4::ZERO),
+    };
+
+    let (cursor_params, cursor_color) = if rect_w > 0.0 && rect_h > 0.0 {
+        (
+            Vec4::new(rect_x / rtt_w, rect_y / rtt_h, rect_w / rtt_w, rect_h / rtt_h),
+            Vec4::new(color.x, color.y, color.z, color.w),
+        )
+    } else {
+        (Vec4::ZERO, Vec4::ZERO)
+    };
+
+    let (selection_params, selection_color) =
+        if geom.selection_width > 0.0 && geom.selection_height > 0.0 {
+            let s = theme.selection_bg.to_srgba();
+            (
+                Vec4::new(
+                    geom.selection_x as f32 / rtt_w,
+                    geom.selection_y as f32 / rtt_h,
+                    geom.selection_width as f32 / rtt_w,
+                    geom.selection_height as f32 / rtt_h,
+                ),
+                Vec4::new(s.red, s.green, s.blue, s.alpha),
+            )
+        } else {
+            (Vec4::ZERO, Vec4::ZERO)
+        };
+
+    (cursor_params, cursor_color, selection_params, selection_color)
 }

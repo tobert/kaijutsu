@@ -16,7 +16,7 @@ use crate::connection::{RpcActor, ServerEventMessage};
 use crate::ui::screen::Screen;
 
 mod keys;
-mod render;
+pub mod render;
 
 /// A kernel `open_editor` signal landed: the submitter ran `vi <path>` and the
 /// kernel opened session `session`. Written by the peer dispatcher
@@ -175,9 +175,15 @@ impl Plugin for EditorPlugin {
             .add_systems(OnExit(Screen::Editor), render::despawn_editor_panel)
             .add_systems(
                 Update,
+                editor_dispatch_keys.run_if(in_state(Screen::Editor)),
+            )
+            // The surface build needs ComputedNode, so it runs post-layout; the
+            // cursor sync reads the geometry the build just computed.
+            .add_systems(
+                PostUpdate,
                 (
-                    render::render_editor_panel,
-                    editor_dispatch_keys,
+                    render::build_editor_surface.after(bevy::ui::UiSystems::Layout),
+                    render::sync_editor_cursor.after(render::build_editor_surface),
                 )
                     .run_if(in_state(Screen::Editor)),
             );

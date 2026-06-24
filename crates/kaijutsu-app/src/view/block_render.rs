@@ -806,7 +806,12 @@ pub fn resize_block_textures(
     mut block_query: Query<
         (&mut UiRttTexture, &MaterialNode<BlockFxMaterial>, &mut ImageNode),
         (
-            Or<(With<BlockCell>, With<crate::view::components::MsdfOverlayText>, With<crate::view::shell_dock::MsdfShellDockText>)>,
+            Or<(
+                With<BlockCell>,
+                With<crate::view::components::MsdfOverlayText>,
+                With<crate::view::shell_dock::MsdfShellDockText>,
+                With<crate::view::editor::render::EditorSurface>,
+            )>,
             Without<RoleGroupBorder>,
         ),
     >,
