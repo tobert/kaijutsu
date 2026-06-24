@@ -7,12 +7,15 @@
 //! `editor_keys` land in later slices (docs/vi.md steps 4–5); this is the
 //! screen/landing foundation.
 
+use bevy::input::keyboard::KeyboardInput;
 use bevy::prelude::*;
+use bevy::tasks::IoTaskPool;
 use kaijutsu_client::{EditorState, ServerEvent};
 
-use crate::connection::ServerEventMessage;
+use crate::connection::{RpcActor, ServerEventMessage};
 use crate::ui::screen::Screen;
 
+mod keys;
 mod render;
 
 /// A kernel `open_editor` signal landed: the submitter ran `vi <path>` and the
@@ -106,17 +109,56 @@ fn handle_editor_events(
     }
 }
 
-/// Provisional exit: Esc leaves the editor back to the conversation. Step 5
-/// replaces this with real key forwarding (Esc → normal mode) plus `ZZ`/`ZQ`;
-/// for now it keeps the editor screen from being a trap during runner testing.
-fn editor_exit_on_esc(
+/// Forward keystrokes on `Screen::Editor` to the kernel's `editor_keys`. The app
+/// is a pure key forwarder: it ships one keystroke per call in vi notation and
+/// lets the kernel's `EditorCore` (the real VimMachine) interpret it. The push
+/// channel echoes the resulting state back to [`ActiveEditor`], so the panel
+/// re-renders as you type.
+///
+/// This replaces the provisional Esc-exits-screen hatch. `Esc` is now an
+/// ordinary key (→ normal mode). `ZZ`/`ZQ` also travel as ordinary keys: the
+/// kernel — which alone knows the true mode, so it never mistakes an *inserted*
+/// `ZZ` for a quit — saves/discards and drops the session, then pushes
+/// `EditorClosed`, which [`handle_editor_events`] turns into the screen pop. No
+/// app-side mode tracking, no quit detection.
+fn editor_dispatch_keys(
+    mut keyboard: MessageReader<KeyboardInput>,
     keys: Res<ButtonInput<KeyCode>>,
-    mut active: ResMut<ActiveEditor>,
-    mut next_screen: ResMut<NextState<Screen>>,
+    active: Res<ActiveEditor>,
+    actor: Option<Res<RpcActor>>,
 ) {
-    if keys.just_pressed(KeyCode::Escape) {
-        active.session = None;
-        next_screen.set(Screen::Conversation);
+    let Some(view) = active.session.as_ref() else {
+        keyboard.clear();
+        return;
+    };
+    let Some(actor) = actor.as_ref() else {
+        keyboard.clear();
+        return;
+    };
+    let session = view.session;
+
+    for event in keyboard.read() {
+        if !event.state.is_pressed() {
+            continue;
+        }
+        // Bare modifier presses (Shift/Ctrl/… on their own) are never vi keys.
+        if keys::is_modifier_key(event.key_code) {
+            continue;
+        }
+        let ctrl = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
+        let Some(notation) = keys::bevy_to_vi_notation(event, ctrl) else {
+            continue;
+        };
+        let handle = actor.handle.clone();
+        IoTaskPool::get()
+            .spawn(async move {
+                if let Err(e) = handle.editor_keys(session, &notation).await {
+                    warn!("editor_keys({session}, {notation:?}) failed: {e}");
+                }
+                // The new state arrives via the editor push subscription; a
+                // `ZZ`/`ZQ` instead arrives as an `EditorClosed` push.
+            })
+            .detach();
     }
 }
 
@@ -135,7 +177,7 @@ impl Plugin for EditorPlugin {
                 Update,
                 (
                     render::render_editor_panel,
-                    editor_exit_on_esc,
+                    editor_dispatch_keys,
                 )
                     .run_if(in_state(Screen::Editor)),
             );

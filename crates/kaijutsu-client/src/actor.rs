@@ -72,9 +72,9 @@ use crate::constants::{
     SUBSCRIBE_TIMEOUT,
 };
 use crate::rpc::{
-    Completion, ContextCluster, ContextInfo, HistoryEntry, Identity, InputState, KernelInfo,
-    LlmConfigInfo, McpResource, McpToolResult, ShellValue, SimilarContext, StagedDriftInfo,
-    SubmitResult, SyncState, ToolResult, ToolSchema, VersionSnapshot,
+    Completion, ContextCluster, ContextInfo, EditorState, HistoryEntry, Identity, InputState,
+    KernelInfo, LlmConfigInfo, McpResource, McpToolResult, ShellValue, SimilarContext,
+    StagedDriftInfo, SubmitResult, SyncState, ToolResult, ToolSchema, VersionSnapshot,
 };
 use crate::subscriptions::{
     BlockEventsForwarder, ConnectionStatus, EditorEventsForwarder, ResourceEventsForwarder,
@@ -430,6 +430,13 @@ enum RpcCommand {
         reply: oneshot::Sender<Result<(), CallError>>,
     },
 
+    // ── Editor (vi) ──────────────────────────────────────────────────────
+    EditorKeys {
+        session_id: u64,
+        keys: String,
+        reply: oneshot::Sender<Result<EditorState, CallError>>,
+    },
+
     // ── Tool Execution ───────────────────────────────────────────────────
     ExecuteTool {
         tool: String,
@@ -603,6 +610,7 @@ impl RpcCommand {
             Self::PushInputOps { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::SubmitInput { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ClearInput { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::EditorKeys { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ExecuteTool { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetToolSchemas { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::CallMcpTool { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -1046,6 +1054,26 @@ impl ActorHandle {
     pub async fn clear_input(&self, context_id: ContextId) -> Result<(), CallError> {
         self.send(|reply| RpcCommand::ClearInput { context_id, reply })
             .await
+    }
+
+    // ── Editor (vi) ──────────────────────────────────────────────────────
+
+    /// Feed a vi key sequence (kernel notation: `"i"`, `"<Esc>"`, `"dw"`) to an
+    /// open editor session and return the resulting [`EditorState`]. The push
+    /// subscription also echoes this state, so the renderer normally updates
+    /// from there; callers fire-and-forget.
+    #[tracing::instrument(skip(self, keys))]
+    pub async fn editor_keys(
+        &self,
+        session_id: u64,
+        keys: &str,
+    ) -> Result<EditorState, CallError> {
+        self.send(|reply| RpcCommand::EditorKeys {
+            session_id,
+            keys: keys.into(),
+            reply,
+        })
+        .await
     }
 
     // ── Tool Execution ───────────────────────────────────────────────────
@@ -2430,6 +2458,11 @@ async fn dispatch_kernel_command(
         }
         RpcCommand::ClearInput { context_id, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.clear_input(context_id));
+        }
+
+        // ── Editor (vi) ──
+        RpcCommand::EditorKeys { session_id, keys, reply } => {
+            dispatch!(kernel, reply, close_tx, k, k.editor_keys(session_id, &keys));
         }
 
         // ── Tool Execution ──

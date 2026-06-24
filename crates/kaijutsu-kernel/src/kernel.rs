@@ -867,16 +867,28 @@ impl Kernel {
 
     /// Feed keys to an open session, mirroring the edits onto the CRDT block.
     /// Publishes the new state on the editor push channel so every renderer of
-    /// this session updates.
+    /// this session updates. A `ZZ`/`ZQ` in the batch saves/discards and closes
+    /// the session (modalkit disambiguates it from an inserted `ZZ`), publishing
+    /// `Closed` instead — so a key forwarder never needs to detect quit itself.
     pub fn editor_keys(
         &self,
         id: crate::editor::EditorSessionId,
         keys: &str,
         blocks: &crate::block_store::SharedBlockStore,
     ) -> Result<crate::editor::EditorState, String> {
-        let state = self.editor_sessions.lock().0.keys(id, keys, blocks)?;
-        self.publish_editor_state(id, &state);
-        Ok(state)
+        let outcome = self.editor_sessions.lock().0.keys(id, keys, blocks)?;
+        match outcome {
+            crate::editor::KeysOutcome::Updated(state) => {
+                self.publish_editor_state(id, &state);
+                Ok(state)
+            }
+            crate::editor::KeysOutcome::Closed(state) => {
+                self.editor_flows.publish(crate::flows::EditorFlow::Closed {
+                    session_id: id.as_u64(),
+                });
+                Ok(state)
+            }
+        }
     }
 
     /// Current state of an open session.

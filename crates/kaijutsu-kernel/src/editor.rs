@@ -96,7 +96,27 @@ pub async fn resolve_editor_target(
 
 use std::collections::HashMap;
 
-use kaijutsu_editor::EditorCore;
+use kaijutsu_editor::{CloseRequest, EditorCore};
+
+/// The result of feeding a key batch to a session via [`EditorSessions::keys`].
+#[derive(Debug)]
+pub enum KeysOutcome {
+    /// The buffer updated; the new renderer state to push.
+    Updated(EditorState),
+    /// A `ZZ`/`ZQ` closed the session (already saved/discarded + dropped). The
+    /// state is the last view before close; renderers react to the `Closed` push.
+    Closed(EditorState),
+}
+
+impl KeysOutcome {
+    /// The renderer state this outcome carries — the post-edit view, or the
+    /// last view before a `ZZ`/`ZQ` close.
+    pub fn state(&self) -> &EditorState {
+        match self {
+            Self::Updated(s) | Self::Closed(s) => s,
+        }
+    }
+}
 
 /// Handle to one open editor session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -209,29 +229,60 @@ impl EditorSessions {
     }
 
     /// Feed keys to a session, mirror the produced edits onto the CRDT block,
-    /// and return the new state. Fails loud if a mirror write fails — the buffer
+    /// and report the outcome. Fails loud if a mirror write fails — the buffer
     /// and the block must never silently diverge.
+    ///
+    /// If the batch contained a `ZZ`/`ZQ` (which modalkit, owning the real mode,
+    /// distinguishes from an inserted `ZZ`), the session is saved/discarded and
+    /// dropped here and the outcome is [`KeysOutcome::Closed`]; otherwise it is
+    /// [`KeysOutcome::Updated`] with the new renderer state.
     pub fn keys(
         &mut self,
         id: EditorSessionId,
         keys: &str,
         blocks: &SharedBlockStore,
-    ) -> Result<EditorState, String> {
-        let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
-        let ops = session.core.apply_keys(keys);
-        for op in &ops {
-            blocks
-                .edit_text(
-                    session.target.context_id,
-                    &session.target.block_id,
-                    op.offset,
-                    &op.insert,
-                    op.delete,
-                )
-                .map_err(|e| format!("editor keys: CRDT mirror failed: {e}"))?;
+    ) -> Result<KeysOutcome, String> {
+        let close = {
+            let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
+            let ops = session.core.apply_keys(keys);
+            for op in &ops {
+                blocks
+                    .edit_text(
+                        session.target.context_id,
+                        &session.target.block_id,
+                        op.offset,
+                        &op.insert,
+                        op.delete,
+                    )
+                    .map_err(|e| format!("editor keys: CRDT mirror failed: {e}"))?;
+            }
+            session.core.take_close()
+        };
+
+        // `ZZ`/`ZQ` close the session. The returned state is informational (the
+        // last view before close); renderers react to the `Closed` push.
+        if let Some(close) = close {
+            let final_state = match close {
+                CloseRequest::Write => {
+                    // ZZ: checkpoint current as saved (flush to owner), then quit
+                    // — the rollback to that just-taken checkpoint is a no-op.
+                    let state = self.save(id)?;
+                    self.quit(id, blocks)?;
+                    state
+                }
+                CloseRequest::Discard => {
+                    // ZQ: snapshot the view, then roll back to the last checkpoint.
+                    let state = self.state(id)?;
+                    self.quit(id, blocks)?;
+                    state
+                }
+            };
+            return Ok(KeysOutcome::Closed(final_state));
         }
+
+        let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
         let saved = session.saved_content.clone();
-        Ok(state_of(&mut session.core, &saved))
+        Ok(KeysOutcome::Updated(state_of(&mut session.core, &saved)))
     }
 
     /// Reconcile every open session bound to `(context_id, block_id)` against
@@ -497,9 +548,9 @@ mod session_tests {
         assert!(!st.dirty);
 
         // Insert "X" at the start: i X <Esc>.
-        let st = sessions.keys(id, "iX<Esc>", &blocks).unwrap();
-        assert_eq!(st.text, "Xhello");
-        assert!(st.dirty, "buffer diverged from checkpoint");
+        let outcome = sessions.keys(id, "iX<Esc>", &blocks).unwrap();
+        assert_eq!(outcome.state().text, "Xhello");
+        assert!(outcome.state().dirty, "buffer diverged from checkpoint");
 
         // The invariant that makes this surface trustworthy: the CRDT block now
         // equals the editor buffer (edit mirroring is faithful).
@@ -532,6 +583,56 @@ mod session_tests {
         sessions.quit(id, &blocks).unwrap();
         assert_eq!(block_text(&blocks, &target).unwrap(), "hello");
         assert!(!sessions.is_open(id), "quit drops the session");
+    }
+
+    #[tokio::test]
+    async fn zz_through_keys_saves_and_closes() {
+        // The race-free path: a `ZZ` in the key stream (not a separate RPC)
+        // checkpoints the edit and drops the session in one shot.
+        let (blocks, target) = seeded(b"hello").await;
+        let mut sessions = EditorSessions::new();
+        let (id, _) = sessions.open(RC_PATH, target, &blocks).unwrap();
+
+        sessions.keys(id, "iX<Esc>", &blocks).unwrap(); // -> "Xhello"
+        let outcome = sessions.keys(id, "ZZ", &blocks).unwrap();
+        assert!(
+            matches!(outcome, KeysOutcome::Closed(_)),
+            "ZZ closes the session"
+        );
+        assert!(!sessions.is_open(id), "ZZ drops the session");
+        // ZZ keeps the edit (write+quit): the block holds the inserted text.
+        assert_eq!(block_text(&blocks, &target).unwrap(), "Xhello");
+    }
+
+    #[tokio::test]
+    async fn zq_through_keys_discards_and_closes() {
+        let (blocks, target) = seeded(b"hello").await;
+        let mut sessions = EditorSessions::new();
+        let (id, _) = sessions.open(RC_PATH, target, &blocks).unwrap();
+
+        sessions.keys(id, "iX<Esc>", &blocks).unwrap(); // -> "Xhello"
+        let outcome = sessions.keys(id, "ZQ", &blocks).unwrap();
+        assert!(
+            matches!(outcome, KeysOutcome::Closed(_)),
+            "ZQ closes the session"
+        );
+        assert!(!sessions.is_open(id), "ZQ drops the session");
+        // ZQ discards the unsaved edit: the block is back to what we opened.
+        assert_eq!(block_text(&blocks, &target).unwrap(), "hello");
+    }
+
+    #[tokio::test]
+    async fn inserted_zz_is_text_not_close() {
+        // An inserted `ZZ` must stay literal — the kernel relies on modalkit's
+        // mode state, so this never trips the close path.
+        let (blocks, target) = seeded(b"").await;
+        let mut sessions = EditorSessions::new();
+        let (id, _) = sessions.open(RC_PATH, target, &blocks).unwrap();
+
+        let outcome = sessions.keys(id, "iZZ", &blocks).unwrap();
+        assert!(matches!(outcome, KeysOutcome::Updated(_)));
+        assert!(sessions.is_open(id), "inserted ZZ leaves the session open");
+        assert_eq!(block_text(&blocks, &target).unwrap(), "ZZ");
     }
 
     #[tokio::test]

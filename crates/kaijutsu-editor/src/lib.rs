@@ -16,8 +16,8 @@
 //! `docs/vi.md`.
 
 use editor_types::application::EmptyInfo;
-use editor_types::prelude::ViewportContext;
-use editor_types::Action;
+use editor_types::prelude::{CloseFlags, ViewportContext};
+use editor_types::{Action, WindowAction};
 
 use modalkit::actions::Editable;
 use modalkit::editing::buffer::{CursorGroupId, EditBuffer};
@@ -41,6 +41,21 @@ pub struct EditOp {
     pub delete: usize,
 }
 
+/// A `ZZ`/`ZQ` close request modalkit surfaced during [`EditorCore::apply_keys`].
+///
+/// modalkit's vim bindings map `ZZ` → `WindowAction::Close(_, CloseFlags::WQ)`
+/// (write + quit) and `ZQ` → `CloseFlags::FQ` (force quit). We have no window
+/// system, so rather than execute the close we record the *intent* and let the
+/// kernel act on it (checkpoint+drop vs discard+drop) — modalkit, which owns the
+/// real mode state, is the only place that can tell `ZZ` from an inserted `ZZ`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloseRequest {
+    /// `ZZ` — checkpoint (flush) then quit.
+    Write,
+    /// `ZQ` — discard changes since the last checkpoint, then quit.
+    Discard,
+}
+
 /// A pure vi editor over one text buffer.
 pub struct EditorCore {
     machine: VimMachine<TerminalKey, EmptyInfo>,
@@ -53,6 +68,9 @@ pub struct EditorCore {
     /// actions must not touch the document (else the query text leaks in). Set
     /// on `CommandBar(Focus)`, cleared when the prompt submits/aborts.
     command_line: bool,
+    /// A `ZZ`/`ZQ` close intent produced by the last `apply_keys`, awaiting the
+    /// kernel to consume it via [`take_close`](EditorCore::take_close).
+    pending_close: Option<CloseRequest>,
 }
 
 impl EditorCore {
@@ -74,7 +92,15 @@ impl EditorCore {
             group,
             viewport: ViewportContext::default(),
             command_line: false,
+            pending_close: None,
         }
+    }
+
+    /// Take any `ZZ`/`ZQ` close intent the most recent `apply_keys` produced.
+    /// The kernel calls this after every key batch to learn whether the session
+    /// should be saved/discarded and dropped.
+    pub fn take_close(&mut self) -> Option<CloseRequest> {
+        self.pending_close.take()
     }
 
     /// The buffer text, with modalkit's guaranteed trailing newline normalized
@@ -132,6 +158,9 @@ impl EditorCore {
     /// that changed the buffer (no-op keystrokes emit nothing).
     pub fn apply_keys(&mut self, keys: &str) -> Vec<EditOp> {
         let mut ops = Vec::new();
+        // A fresh batch; any close intent from a prior batch was already
+        // consumed by the kernel (or is irrelevant — the session is still open).
+        self.pending_close = None;
         for key in parse_keys(keys) {
             // Diff against the normalized (terminator-stripped) view so emitted
             // offsets are char-indexed into the logical content, matching the
@@ -151,6 +180,18 @@ impl EditorCore {
                         // Editing errors (e.g. motion off the end) are non-fatal
                         // vim behavior, not corruption — drop them, keep the buffer.
                         let _ = self.buffer.editor_command(&ea, &ictx, &mut self.store);
+                    }
+                    // `ZZ`/`ZQ`: modalkit knows the real mode, so it only emits a
+                    // window-close here when the keys truly mean quit (an inserted
+                    // `ZZ` produces InsertText, not this). We have no windows —
+                    // record the intent for the kernel. `WQ` = write+quit (`ZZ`);
+                    // anything else here is force-quit (`ZQ` = `FQ`).
+                    Action::Window(WindowAction::Close(_, flags)) if !self.command_line => {
+                        self.pending_close = Some(if flags.contains(CloseFlags::WRITE) {
+                            CloseRequest::Write
+                        } else {
+                            CloseRequest::Discard
+                        });
                     }
                     _ => {}
                 }
@@ -293,6 +334,51 @@ mod tests {
         assert_eq!(ops.len(), 5);
         assert_eq!(ops[0], EditOp { offset: 0, insert: "h".into(), delete: 0 });
         assert_eq!(ops[4], EditOp { offset: 4, insert: "o".into(), delete: 0 });
+    }
+
+    #[test]
+    fn zz_records_write_close() {
+        let mut ed = EditorCore::new("hello");
+        assert_eq!(ed.take_close(), None, "no close before ZZ");
+        ed.apply_keys("ZZ");
+        assert_eq!(
+            ed.take_close(),
+            Some(CloseRequest::Write),
+            "ZZ is write+quit"
+        );
+        // take_close consumes it.
+        assert_eq!(ed.take_close(), None);
+    }
+
+    #[test]
+    fn zq_records_discard_close() {
+        let mut ed = EditorCore::new("hello");
+        ed.apply_keys("ZQ");
+        assert_eq!(
+            ed.take_close(),
+            Some(CloseRequest::Discard),
+            "ZQ is force-quit (discard)"
+        );
+    }
+
+    #[test]
+    fn inserted_zz_is_text_not_close() {
+        // A `ZZ` typed in insert mode must NOT be read as a quit — modalkit's
+        // mode awareness is exactly why this lives in the core, not the app.
+        let mut ed = EditorCore::new("");
+        ed.apply_keys("iZZ");
+        assert_eq!(ed.text(), "ZZ");
+        assert_eq!(ed.take_close(), None, "insert-mode ZZ is literal text");
+    }
+
+    #[test]
+    fn close_intent_resets_each_batch() {
+        // A normal-mode batch with no quit clears a stale intent.
+        let mut ed = EditorCore::new("hello");
+        ed.apply_keys("ZQ");
+        // Re-open conceptually: a fresh batch of ordinary keys clears the intent.
+        ed.apply_keys("x");
+        assert_eq!(ed.take_close(), None, "non-quit batch leaves no close intent");
     }
 
     #[test]

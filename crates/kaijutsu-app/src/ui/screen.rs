@@ -62,9 +62,14 @@ impl Plugin for ScreenPlugin {
         // chrome on enter. Its MSDF panel + camera are managed by the editor
         // plugin (docs/vi.md step 4). Returning to Conversation re-shows the
         // chrome via the OnEnter(Conversation) systems above.
+        //
+        // Move focus off Compose: the editor forwards raw keystrokes itself
+        // (`view::editor::editor_dispatch_keys`), and `vim_dispatch_compose` is
+        // gated purely on `FocusArea::Compose` — leaving it there would
+        // double-apply every keystroke to the hidden chat overlay.
         app.add_systems(
             OnEnter(Screen::Editor),
-            (hide_conversation_root, hide_cell_text),
+            (hide_conversation_root, hide_cell_text, set_focus_conversation),
         );
     }
 }
