@@ -12,7 +12,7 @@ use bevy::prelude::*;
 use bevy::tasks::IoTaskPool;
 use kaijutsu_client::{EditorState, ServerEvent};
 
-use crate::connection::{RpcActor, ServerEventMessage};
+use crate::connection::{RpcActor, RpcResultChannel, RpcResultMessage, ServerEventMessage};
 use crate::ui::screen::Screen;
 
 mod keys;
@@ -109,6 +109,45 @@ fn handle_editor_events(
     }
 }
 
+/// Does an `editor_keys` failure mean the kernel session is gone (as opposed to
+/// a transient timeout or a dropped connection)? The kernel returns
+/// `editor: no such session N` (see `kaijutsu-kernel/src/editor.rs`) when the
+/// session id isn't in `EditorSessions` — which is exactly what a kernel restart
+/// produces: the sessions are in-memory and don't survive it, while the persisted
+/// `kernel_id` is unchanged, so the reconnect looks ordinary. Match that verdict
+/// (and not a generic error) so a momentary RPC hiccup never evicts a live editor.
+fn is_session_lost_error(err: &str) -> bool {
+    err.contains("no such session")
+}
+
+/// Drop a stale editor session the kernel has disowned. The keystroke path
+/// (`editor_dispatch_keys`) reports `EditorSessionLost` when `editor_keys` comes
+/// back `no such session` — the kernel restarted out from under an open editor,
+/// so the buffer the app is showing is dead (typing echoes nothing; the
+/// "frozen editor" trap). Pop back to the conversation so the user can reopen
+/// cleanly. Scoped to the matching session so a stale report can't evict a
+/// freshly-reopened one.
+fn handle_editor_session_lost(
+    mut results: MessageReader<RpcResultMessage>,
+    mut active: ResMut<ActiveEditor>,
+    mut next_screen: ResMut<NextState<Screen>>,
+) {
+    for result in results.read() {
+        let RpcResultMessage::EditorSessionLost { session } = result else {
+            continue;
+        };
+        if active
+            .session
+            .as_ref()
+            .is_some_and(|v| v.session == *session)
+        {
+            warn!("editor session {session} lost (kernel restarted?); returning to conversation");
+            active.session = None;
+            next_screen.set(Screen::Conversation);
+        }
+    }
+}
+
 /// Forward keystrokes on `Screen::Editor` to the kernel's `editor_keys`. The app
 /// is a pure key forwarder: it ships one keystroke per call in vi notation and
 /// lets the kernel's `EditorCore` (the real VimMachine) interpret it. The push
@@ -126,6 +165,7 @@ fn editor_dispatch_keys(
     keys: Res<ButtonInput<KeyCode>>,
     active: Res<ActiveEditor>,
     actor: Option<Res<RpcActor>>,
+    results: Res<RpcResultChannel>,
 ) {
     let Some(view) = active.session.as_ref() else {
         keyboard.clear();
@@ -150,10 +190,19 @@ fn editor_dispatch_keys(
             continue;
         };
         let handle = actor.handle.clone();
+        let tx = results.sender();
         IoTaskPool::get()
             .spawn(async move {
                 if let Err(e) = handle.editor_keys(session, &notation).await {
-                    warn!("editor_keys({session}, {notation:?}) failed: {e}");
+                    let msg = e.to_string();
+                    warn!("editor_keys({session}, {notation:?}) failed: {msg}");
+                    // A `no such session` verdict means the kernel restarted out
+                    // from under us — report it so the main thread drops the dead
+                    // editor and pops to the conversation (the "frozen editor"
+                    // trap). A transient error leaves the editor in place.
+                    if is_session_lost_error(&msg) {
+                        let _ = tx.send(RpcResultMessage::EditorSessionLost { session });
+                    }
                 }
                 // The new state arrives via the editor push subscription; a
                 // `ZZ`/`ZQ` instead arrives as an `EditorClosed` push.
@@ -170,7 +219,14 @@ impl Plugin for EditorPlugin {
     fn build(&self, app: &mut App) {
         app.add_message::<EditorOpenRequested>()
             .init_resource::<ActiveEditor>()
-            .add_systems(Update, (handle_editor_open, handle_editor_events))
+            .add_systems(
+                Update,
+                (
+                    handle_editor_open,
+                    handle_editor_events,
+                    handle_editor_session_lost,
+                ),
+            )
             .add_systems(OnEnter(Screen::Editor), render::spawn_editor_panel)
             .add_systems(OnExit(Screen::Editor), render::despawn_editor_panel)
             .add_systems(
@@ -187,5 +243,35 @@ impl Plugin for EditorPlugin {
                 )
                     .run_if(in_state(Screen::Editor)),
             );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_such_session_is_session_lost() {
+        // The kernel's verdict for a restarted-away session.
+        assert!(is_session_lost_error("editor: no such session 3"));
+    }
+
+    #[test]
+    fn wire_wrapped_no_such_session_still_matches() {
+        // Over the wire the message is wrapped by capnp/CallError; the
+        // substring still identifies the verdict.
+        assert!(is_session_lost_error(
+            "RPC error: Cap'n Proto error: Failed: remote exception: \
+             Failed: editor: no such session 3"
+        ));
+    }
+
+    #[test]
+    fn transient_errors_are_not_session_lost() {
+        // A timeout or dropped connection must NOT evict a live editor — only
+        // the kernel's explicit "no such session" does.
+        assert!(!is_session_lost_error("connection closed"));
+        assert!(!is_session_lost_error("editor_keys timed out"));
+        assert!(!is_session_lost_error("editor: block not found in 019ef"));
     }
 }

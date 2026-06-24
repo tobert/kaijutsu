@@ -158,6 +158,12 @@ pub enum RpcResultMessage {
     ThemeReceived(String),
     /// Generic RPC error (for toast/notification).
     RpcError { operation: String, error: String },
+    /// An open editor's kernel session is gone: a keystroke to `editor_keys`
+    /// came back `no such session`. The session is in-memory kernel state and
+    /// does not survive a kernel restart (the persisted `kernel_id` is unchanged,
+    /// so a restart is invisible at the connection layer). Drained by
+    /// `view::editor` to drop the stale session and pop back to the conversation.
+    EditorSessionLost { session: u64 },
 }
 
 // ============================================================================
