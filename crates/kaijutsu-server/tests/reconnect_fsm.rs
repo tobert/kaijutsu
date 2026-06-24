@@ -13,11 +13,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, broadcast};
 use tokio::task::{JoinHandle, LocalSet};
 
 use kaijutsu_client::{
-    ActorHandle, CallError, ConnectionStatus, KeySource, NotReadyReason, SshConfig, spawn_actor,
+    ActorHandle, CallError, ConnectionStatus, KeySource, NotReadyReason, ServerEvent, SshConfig,
+    spawn_actor,
 };
 use kaijutsu_crdt::ContextId;
 use kaijutsu_server::{SshServer, SshServerConfig};
@@ -572,6 +573,27 @@ async fn block_count(actor: &ActorHandle, ctx: ContextId) -> usize {
     actor.get_all_blocks(ctx).await.map(|b| b.len()).unwrap_or(0)
 }
 
+/// Drain the event stream looking for the actor's own `Reconnected` signal.
+async fn saw_reconnected_event(
+    rx: &mut broadcast::Receiver<ServerEvent>,
+    timeout: Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Ok(ServerEvent::Reconnected)) => return true,
+            // Other event or a lagged buffer — keep looking.
+            Ok(Ok(_)) | Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+            // Channel closed or our deadline elapsed.
+            Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => return false,
+        }
+    }
+}
+
 /// Poll until the actor sees at least `want` blocks for `ctx`, or panic.
 async fn wait_for_blocks_at_least(
     actor: &ActorHandle,
@@ -654,6 +676,10 @@ fn reconnect_resyncs_blocks_appended_during_outage() {
         reader.join_context(ctx).await.expect("reader join");
         wait_for_blocks_at_least(&reader, ctx, baseline, Duration::from_secs(10), "reader baseline")
             .await;
+        // Watch for the actor's own reconnect signal (detection lives in the
+        // client, not re-derived downstream). Subscribe before the cut so the
+        // post-reconnect `Reconnected` lands in this receiver.
+        let mut reader_events = reader.subscribe_events();
 
         // Cut the transport, then surface the drop by driving a call: an RPC
         // over the dead pipe fails as a disconnect-class error, which signals the
@@ -702,6 +728,14 @@ fn reconnect_resyncs_blocks_appended_during_outage() {
         whoami_with_retry(&reader, Duration::from_secs(30))
             .await
             .expect("reader reconnects after restore");
+
+        // The actor must have announced the reconnect itself — this is the
+        // client-owned detection the app reacts to (bumps SyncGeneration →
+        // re-sync). Not the first connect: only a Connected-after-drop.
+        assert!(
+            saw_reconnected_event(&mut reader_events, Duration::from_secs(5)).await,
+            "actor must emit ServerEvent::Reconnected after a reconnect"
+        );
 
         // The reconnected reader can now re-fetch the gap block. Before the fix
         // the app would never trigger this fetch and stay gap-stale; here we

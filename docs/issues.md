@@ -78,27 +78,29 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   - Related: auto-memory `tech_debt_peer_reattach_on_reconnect` (app doesn't
     re-attach after kernel restart). Original find: 2026-06-11 journaling
     forensics.
-- **Move post-reconnect re-sync orchestration into `kaijutsu-client` (2026-06-24).**
-  The reconnect-driven re-sync now works (see devlog: `SyncGeneration` bumps on a
-  Connected-after-drop, `check_cache_staleness` applies the fetched `SyncState`), but
-  the *orchestration* sits in the Bevy app where it's hard to e2e — and it re-derives
-  knowledge the client actor already owns. Two pieces to push down to the client:
-  (1) **reconnect detection** — the app's `ReconnectTracker` folds the
-  `ConnectionStatus` stream to spot a Connected-after-drop, but the actor *drives* that
-  FSM and already knows; emit it as a first-class signal (e.g. `ServerEvent::Reconnected`)
-  so the `reconnect_fsm` harness tests it against the real FSM, no Bevy. (2) **the
-  re-fetch primitive** — on reconnect the actor should re-fetch `get_context_sync` for
-  its joined context and *deliver it as an event the app already applies* (the
-  `initial_sync` path), so the cuttable-proxy e2e
-  (`reconnect_resyncs_blocks_appended_during_outage`) can assert the *whole* loop, not
-  just the data-path substrate. Same shape as the editor's Design A pushed one boundary
-  out: **client owns sync orchestration, app renders** — a refinement of
-  `feedback_thin_client_smart_kernel` at the app/client seam. **Wrinkle that keeps part
-  app-side:** the actor's `joined_context_id` is singular, but the app's `DocumentCache`
-  is multi-context and the *active viewed* doc is genuinely app state — so "which
-  context to refresh" stays in the app; detection + the re-fetch primitive move to the
-  client. (Moving the whole `DocumentCache` into the client is a separate, bigger
-  refactor.)
+- **Move post-reconnect re-sync orchestration into `kaijutsu-client` — detection DONE,
+  re-fetch delivery remaining (2026-06-24).** Goal: **client owns sync orchestration,
+  app renders** (editor's Design A pushed one boundary out; refines
+  `feedback_thin_client_smart_kernel` at the app/client seam).
+  - **DONE:** reconnect *detection* now lives in the actor — `enter_connected` emits
+    `ServerEvent::Reconnected` on a Connected-after-drop (`bound_kernel_id.is_some()` is
+    the free signal; never the first connect). The app just reacts (bumps
+    `SyncGeneration`); the `ReconnectTracker` fold + its app unit tests are gone. The
+    cuttable-proxy e2e asserts the actor emits `Reconnected`.
+  - **REMAINING — re-fetch delivery:** on reconnect the actor could re-fetch
+    `get_context_sync` for its joined context and *deliver it as an event the app already
+    applies* (the `initial_sync` path), so the e2e covers the *whole* loop (kernel→app
+    convergence), not just the substrate + the signal. **Wrinkle that keeps part
+    app-side:** the actor's `joined_context_id` is singular, but the app's
+    `DocumentCache` is multi-context and the *active viewed* doc is genuinely app state —
+    so "which context to refresh" stays in the app. Decide: actor auto-resyncs its
+    joined context (risks a dual resync path with the app's `check_cache_staleness`) vs.
+    keep the app driving the fetch off the `Reconnected` signal (current).
+  - **CLEANUP:** there are now **two `SyncGeneration` types** — `kaijutsu-client`
+    (`subscriptions.rs`, doc-commented "bumped on lag or reconnect", currently unused)
+    and the app's own (`actor_plugin.rs`, the wired one). The client one was clearly
+    meant for this; fold the app's into it (or delete the dead one) as part of moving the
+    cache. (Moving the whole `DocumentCache` into the client is the bigger refactor.)
 - **LLM providers:**
   - Move per-model knobs out of the config layer (`models.toml`), into the app.
   - Push subscriber for `ConversationMailbox`.

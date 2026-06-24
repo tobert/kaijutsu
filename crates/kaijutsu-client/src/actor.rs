@@ -1522,6 +1522,14 @@ impl RpcActor {
         // the slot).
         self.connecting_task = None;
 
+        // A reconnect (not the first connect) means the block stream we just
+        // re-subscribed missed everything the kernel published during the
+        // outage. `bound_kernel_id` is `Some` iff we've connected before — it's
+        // set on the first connect and never cleared on a drop — so it's the
+        // exact reconnect signal, no extra bookkeeping. We emit `Reconnected`
+        // below, once the new connection is fully in place.
+        let is_reconnect = self.bound_kernel_id.is_some();
+
         self.bound_kernel_id = Some(built.kernel_id);
         self.joined_context_id = built.joined_context;
         self.connection = Some(ConnectionState {
@@ -1544,6 +1552,14 @@ impl RpcActor {
             "Actor connected: kernel_id={} context={:?}",
             built.kernel_id, self.joined_context_id,
         );
+
+        // Tell renderers a reconnect happened so they re-sync the view the
+        // re-subscribed stream can't backfill. Best-effort: no subscribers
+        // (e.g. a headless client) is fine.
+        if is_reconnect {
+            let _ = self.event_tx.send(ServerEvent::Reconnected);
+        }
+
         self.broadcast_state();
     }
 

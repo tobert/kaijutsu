@@ -113,6 +113,13 @@ pub enum ServerEvent {
     EditorStateChanged { state: EditorState },
     /// An in-app editor session closed (`ZQ`/quit). Renderers drop it.
     EditorClosed { session_id: u64 },
+    /// The reconnect FSM re-established a dropped connection — a `Connected` that
+    /// follows a drop, not the first connect. The re-subscribed block stream
+    /// missed everything the kernel published during the outage, so renderers
+    /// should re-sync their active view. Emitted by the actor itself, which owns
+    /// the FSM and so is the natural place to know a reconnect happened (rather
+    /// than re-deriving it downstream from the `ConnectionStatus` stream).
+    Reconnected,
 }
 
 /// Connection lifecycle status broadcast by the reconnect FSM.
