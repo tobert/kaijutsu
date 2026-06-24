@@ -67,7 +67,9 @@ Two committed markdown files carry durable work between sessions; keep them curr
 
 - Working on main (early development); parallel work on the same repo is common
 - Add files by name, avoid wildcards; ephemeral markdown is usually not committed
-- Set Co-Authored-By in commit messages
+- Commit messages explain **why, not what** — summarize the decisions from the working
+  conversation with the user (what we chose, rejected, and why), not the file list.
+- Set Co-Authored-By in commit messages, crediting the model that did the work.
 
 ## Bevy 0.18 Quick Reference
 
