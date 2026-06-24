@@ -158,6 +158,16 @@ pub enum RpcResultMessage {
     ThemeReceived(String),
     /// Generic RPC error (for toast/notification).
     RpcError { operation: String, error: String },
+    /// A staleness re-fetch (`view::sync::check_cache_staleness`, fired by a
+    /// `SyncGeneration` bump on reconnect or broadcast lag) pulled the full CRDT
+    /// sync state for a context. Routed to `handle_block_events`, which merges it
+    /// into the cached document — the idempotent re-sync that heals blocks lost
+    /// during a transport outage. Distinct from `ContextJoined`'s `initial_sync`:
+    /// this refreshes an already-cached doc without re-running the join bootstrap.
+    ContextResynced {
+        context_id: ContextId,
+        sync: kaijutsu_client::SyncState,
+    },
     /// An open editor's kernel session is gone: a keystroke to `editor_keys`
     /// came back `no such session`. The session is in-memory kernel state and
     /// does not survive a kernel restart (the persisted `kernel_id` is unchanged,
@@ -216,6 +226,7 @@ impl Plugin for ActorPlugin {
                 poll_connection_status,
                 poll_rpc_results,
                 update_connection_state,
+                bump_sync_generation_on_reconnect,
                 restore_context_on_message,
                 apply_theme_from_rpc,
             )
@@ -224,6 +235,59 @@ impl Plugin for ActorPlugin {
         // The current-context persistence observer runs independently — it only
         // needs to see the latest `DocumentCache::active_id`.
         app.add_systems(Update, persist_current_context);
+    }
+}
+
+/// Tracks whether the next `Connected` is a *reconnect* (transport dropped and
+/// came back) versus the first-ever connect. Folded over the `ConnectionStatus`
+/// stream by [`bump_sync_generation_on_reconnect`]; kept pure + small so the
+/// sequence logic is unit-testable without a Bevy world.
+#[derive(Clone, Copy, Default)]
+struct ReconnectTracker {
+    /// We have reached `Connected` at least once.
+    ever_connected: bool,
+    /// The most recent status we observed was still `Connected` (no drop since).
+    currently_connected: bool,
+}
+
+impl ReconnectTracker {
+    /// Feed one status (`connected` = is it `Connected`?). Returns `true` iff this
+    /// is a reconnect: a `Connected` that follows a drop after we'd connected
+    /// before. The first connect returns `false` (its hydration is the
+    /// `ActorReady` bootstrap, not a re-sync), and a repeated `Connected` with no
+    /// intervening drop returns `false`.
+    fn observe(&mut self, connected: bool) -> bool {
+        let reconnect = connected && self.ever_connected && !self.currently_connected;
+        if connected {
+            self.ever_connected = true;
+        }
+        self.currently_connected = connected;
+        reconnect
+    }
+}
+
+/// Bump [`SyncGeneration`] on reconnect so the active document re-syncs after a
+/// transport flake (laptop sleep, Wi-Fi blip). The actor's handshake re-subscribes
+/// the block *stream* on every reconnect, but blocks the kernel published *during*
+/// the outage went to the dropped subscription and are gone; without a re-fetch the
+/// view stays gap-stale until a manual context switch respawns the actor. The bump
+/// drives [`crate::view::sync::check_cache_staleness`] to re-fetch and merge the
+/// full CRDT state (idempotent). The first connect does NOT bump — that path
+/// hydrates through the `ActorReady` bootstrap's `initial_sync`.
+fn bump_sync_generation_on_reconnect(
+    mut status_events: MessageReader<ConnectionStatusMessage>,
+    mut sync_gen: ResMut<SyncGeneration>,
+    mut tracker: Local<ReconnectTracker>,
+) {
+    for ConnectionStatusMessage(status) in status_events.read() {
+        let connected = matches!(status, kaijutsu_client::ConnectionStatus::Connected { .. });
+        if tracker.observe(connected) {
+            sync_gen.0 = sync_gen.0.wrapping_add(1);
+            log::info!(
+                "reconnect detected — bumped sync generation to {} for active-doc re-sync",
+                sync_gen.0
+            );
+        }
     }
 }
 
@@ -728,4 +792,55 @@ fn update_connection_state(
 
     // GC old errors (auto-dismiss after 10s)
     error_queue.gc(time.elapsed_secs_f64(), 10.0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fold a sequence of "is this status Connected?" booleans through the
+    /// tracker and return how many reconnects it reported (= SyncGeneration bumps).
+    fn count_reconnects(sequence: &[bool]) -> u32 {
+        let mut tracker = ReconnectTracker::default();
+        sequence.iter().filter(|&&c| tracker.observe(c)).count() as u32
+    }
+
+    #[test]
+    fn first_connect_is_not_a_reconnect() {
+        // Plain startup: a single Connected hydrates via the ActorReady bootstrap.
+        assert_eq!(count_reconnects(&[true]), 0);
+        // Startup through the normal FSM walk (Idle/Connecting are `false`).
+        assert_eq!(count_reconnects(&[false, false, true]), 0);
+    }
+
+    #[test]
+    fn repeated_connected_without_a_drop_does_not_bump() {
+        // Idempotent/duplicate Connected statuses must not trigger a re-sync.
+        assert_eq!(count_reconnects(&[true, true, true]), 0);
+    }
+
+    #[test]
+    fn connected_after_a_drop_is_a_reconnect() {
+        // The laptop-closes case: Connected → drop → Connected bumps once.
+        assert_eq!(count_reconnects(&[true, false, true]), 1);
+        // A full FSM walk through the drop: Connected → Connecting/Cooldown → Connected.
+        assert_eq!(count_reconnects(&[true, false, false, true]), 1);
+    }
+
+    #[test]
+    fn each_reconnect_bumps_once() {
+        // Two separate flakes → two bumps; no double-count within one cycle.
+        assert_eq!(count_reconnects(&[true, false, true, false, true]), 2);
+        assert_eq!(
+            count_reconnects(&[true, false, false, true, true, false, true]),
+            2
+        );
+    }
+
+    #[test]
+    fn a_drop_before_ever_connecting_never_bumps() {
+        // Failed first connect (Cooldown loops) then success is still a first
+        // connect, not a reconnect.
+        assert_eq!(count_reconnects(&[false, false, false, true]), 0);
+    }
 }

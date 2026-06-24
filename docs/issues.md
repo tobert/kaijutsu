@@ -78,6 +78,27 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   - Related: auto-memory `tech_debt_peer_reattach_on_reconnect` (app doesn't
     re-attach after kernel restart). Original find: 2026-06-11 journaling
     forensics.
+- **Move post-reconnect re-sync orchestration into `kaijutsu-client` (2026-06-24).**
+  The reconnect-driven re-sync now works (see devlog: `SyncGeneration` bumps on a
+  Connected-after-drop, `check_cache_staleness` applies the fetched `SyncState`), but
+  the *orchestration* sits in the Bevy app where it's hard to e2e — and it re-derives
+  knowledge the client actor already owns. Two pieces to push down to the client:
+  (1) **reconnect detection** — the app's `ReconnectTracker` folds the
+  `ConnectionStatus` stream to spot a Connected-after-drop, but the actor *drives* that
+  FSM and already knows; emit it as a first-class signal (e.g. `ServerEvent::Reconnected`)
+  so the `reconnect_fsm` harness tests it against the real FSM, no Bevy. (2) **the
+  re-fetch primitive** — on reconnect the actor should re-fetch `get_context_sync` for
+  its joined context and *deliver it as an event the app already applies* (the
+  `initial_sync` path), so the cuttable-proxy e2e
+  (`reconnect_resyncs_blocks_appended_during_outage`) can assert the *whole* loop, not
+  just the data-path substrate. Same shape as the editor's Design A pushed one boundary
+  out: **client owns sync orchestration, app renders** — a refinement of
+  `feedback_thin_client_smart_kernel` at the app/client seam. **Wrinkle that keeps part
+  app-side:** the actor's `joined_context_id` is singular, but the app's `DocumentCache`
+  is multi-context and the *active viewed* doc is genuinely app state — so "which
+  context to refresh" stays in the app; detection + the re-fetch primitive move to the
+  client. (Moving the whole `DocumentCache` into the client is a separate, bigger
+  refactor.)
 - **LLM providers:**
   - Move per-model knobs out of the config layer (`models.toml`), into the app.
   - Push subscriber for `ConversationMailbox`.
@@ -231,6 +252,25 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   conversation with rich content; (2) the unfocused-pane summary, the one
   surface on Bevy's native `Text` pipeline (`tiling_reconciler`), needs a
   multi-pane layout. All MSDF-only surfaces + docks + role borders verified.
+- **User input modes — vi `:` line vs kaish shell vs agent prompt (design, parked
+  2026-06-24).** Wiring `:q`/`:wq`/`:q!` to quit the in-app editor is the immediate
+  itch (muscle memory), but the deeper question is what the editor's `:` line *is*,
+  because the instrument already has command/text surfaces that shouldn't fragment:
+  the **kaish shell** (bottom — this is kaijutsu's "ex": `kj` verbs, pipes, file ops),
+  the **agent prompt** (floating — natural language), and **vi `:`** (today a
+  suppressed no-op stub: `kaijutsu-editor/src/lib.rs` sets `command_line=true` on
+  `Action::CommandBar` to keep `:` from corrupting the buffer, clears it on
+  `Action::Prompt`, but never reads or acts on what was typed). Three stances to
+  decide between: **(A) ex-minimal island** — kernel recognizes just `:w/:q/:wq/:q!/:x`
+  → the existing `editor_save`/`editor_quit` verbs; cheap, but a third command island.
+  **(B) `:` *is* kaish, scoped to the session** — `w`/`q`/`wq` are kaish aliases over
+  the session verbs, everything else is the instrument shell with the editor session
+  in scope (so `:%!fmt` is a real pipe); one language, two framings; pure-vim idioms
+  (`:s///`, ranges) don't come free. **(C) hybrid / universal command line** — quit/
+  write/range-edits stay ex for vim fidelity, unknown `:` falls through to kaish, and
+  at the far end a prefix could even route to the model. Open sub-question: does the
+  agent prompt belong on the same `:` line or stay deliberately separate (NL vs command
+  grammar). Lean is B. Don't implement the island on reflex — decide the surface first.
 - **User presence (novel surface):** The compose input is a shared CRDT document. Surfacing in-flight compose state to an opted-in model would enable mid-sentence collaboration. Gate with explicit user opt-in.
 - **Connection Polling Efficiency:** `ActorPlugin` in `crates/kaijutsu-app/src/connection/mod.rs` polls broadcast channels every frame. While `UpdateMode::reactive` helps, consider event-driven wakeups or bridging async streams directly into Bevy events more efficiently if latency/power becomes an issue.
 - **Card-stack view:** Card size tuning, read-only scroll on focused card, dive-in (Enter), mouse click to focus, momentum scrolling, camera parallax, streaming card texture updates, card grouping evolution, ambient environment.

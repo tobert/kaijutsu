@@ -9,9 +9,10 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 use tokio::task::{JoinHandle, LocalSet};
 
@@ -478,6 +479,246 @@ fn duplicate_instance_subscribes_do_not_wedge() {
         let _id2b = whoami_with_retry(&actor2, Duration::from_secs(5))
             .await
             .expect("actor2 still responds");
+
+        server.stop().await;
+    });
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Cuttable TCP proxy — kernel stays alive while the client transport flakes
+// ────────────────────────────────────────────────────────────────────────────
+
+/// A TCP proxy sitting between client and server that can be severed and
+/// restored on demand. Unlike `ServerHandle::stop` (which kills the kernel),
+/// cutting the proxy only drops the *transport* — the server (and all its
+/// in-memory state) keeps running. This is the "Wi-Fi blip / laptop closes"
+/// failure mode: the kernel never went away, only the pipe to it did.
+struct CuttableProxy {
+    addr: SocketAddr,
+    /// While true, new connections are accepted then immediately dropped so the
+    /// client's reconnect attempts fail fast (rather than hanging the SSH dial).
+    cut: Arc<AtomicBool>,
+    /// Notified on `cut()` to tear down any in-flight forwarded connection.
+    sever: Arc<Notify>,
+    accept_task: JoinHandle<()>,
+}
+
+impl CuttableProxy {
+    /// Bind an ephemeral proxy port forwarding to `upstream`. Spawns the accept
+    /// loop on the current LocalSet.
+    async fn start(upstream: SocketAddr) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cut = Arc::new(AtomicBool::new(false));
+        let sever = Arc::new(Notify::new());
+
+        let cut_loop = cut.clone();
+        let sever_loop = sever.clone();
+        let accept_task = tokio::task::spawn_local(async move {
+            loop {
+                let Ok((mut inbound, _)) = listener.accept().await else {
+                    break;
+                };
+                // Severed: drop the new connection so the client fails fast.
+                if cut_loop.load(Ordering::SeqCst) {
+                    drop(inbound);
+                    continue;
+                }
+                let sever_conn = sever_loop.clone();
+                tokio::task::spawn_local(async move {
+                    let Ok(mut outbound) = TcpStream::connect(upstream).await else {
+                        return;
+                    };
+                    // Forward until either side closes or we're severed.
+                    tokio::select! {
+                        _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound) => {}
+                        _ = sever_conn.notified() => {}
+                    }
+                    // Streams drop here → both TCP halves close → the client sees
+                    // EOF and the FSM leaves Connected.
+                });
+            }
+        });
+
+        CuttableProxy {
+            addr,
+            cut,
+            sever,
+            accept_task,
+        }
+    }
+
+    /// Sever the transport: tear down the live connection and refuse new ones.
+    fn cut(&self) {
+        self.cut.store(true, Ordering::SeqCst);
+        self.sever.notify_waiters();
+    }
+
+    /// Heal: forward new connections again. The kernel never moved.
+    fn restore(&self) {
+        self.cut.store(false, Ordering::SeqCst);
+    }
+}
+
+impl Drop for CuttableProxy {
+    fn drop(&mut self) {
+        self.accept_task.abort();
+    }
+}
+
+/// Count the blocks the kernel currently holds for `ctx` (via this actor).
+/// A transport-down call surfaces as 0 so the poll keeps trying.
+async fn block_count(actor: &ActorHandle, ctx: ContextId) -> usize {
+    actor.get_all_blocks(ctx).await.map(|b| b.len()).unwrap_or(0)
+}
+
+/// Poll until the actor sees at least `want` blocks for `ctx`, or panic.
+async fn wait_for_blocks_at_least(
+    actor: &ActorHandle,
+    ctx: ContextId,
+    want: usize,
+    timeout: Duration,
+    what: &str,
+) -> usize {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let n = block_count(actor, ctx).await;
+        if n >= want {
+            return n;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("{what}: saw {n} blocks, wanted >= {want} within {timeout:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The resilience case the FSM tests don't cover: the *kernel stays alive* while
+/// the client's transport flakes (laptop sleep / Wi-Fi blip). A sibling appends
+/// a block during the outage; after the transport heals, the reconnected client
+/// must be able to see it. This proves the data-path substrate the app's
+/// post-reconnect re-sync (SyncGeneration bump → `check_cache_staleness`) relies
+/// on: the kernel retains work done during the gap, and a reconnect can re-fetch
+/// it. (The app's *automatic* re-sync wiring is unit-tested in
+/// `kaijutsu-app::connection::actor_plugin` + `view::sync`.)
+#[test]
+fn reconnect_resyncs_blocks_appended_during_outage() {
+    run_local(async {
+        let server = start_server_on(None).await;
+        let proxy = CuttableProxy::start(server.addr).await;
+
+        // Writer: connected DIRECTLY to the server, so it survives the cut and
+        // can keep producing blocks during the reader's outage.
+        let writer = spawn_test_actor(server.addr, "direct-writer");
+        let _ = whoami_with_retry(&writer, Duration::from_secs(5))
+            .await
+            .expect("writer connect");
+        let ctx = writer.create_context("resilience").await.expect("create ctx");
+        writer.join_context(ctx).await.expect("writer join");
+
+        // Switch the writer's SHELL into ctx so its commands produce blocks
+        // there (join_context wires event delivery; the exec context is switched
+        // via `kj context switch`). Confirm the shell actually landed in ctx.
+        writer
+            .execute(&format!("kj context switch {ctx}"))
+            .await
+            .expect("switch");
+        let switch_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok((cur, _)) = writer.get_context_id().await
+                && cur == ctx
+            {
+                break;
+            }
+            if tokio::time::Instant::now() >= switch_deadline {
+                panic!("writer shell never switched to {ctx}");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // Land a baseline block (`kj block create` writes a real CRDT block to
+        // the current context — shell stdout does not) and let it settle.
+        let pre = block_count(&writer, ctx).await;
+        writer
+            .execute("kj block create --role user --kind text --content before-outage")
+            .await
+            .expect("pre block");
+        let baseline =
+            wait_for_blocks_at_least(&writer, ctx, pre + 1, Duration::from_secs(10), "baseline")
+                .await;
+
+        // Reader: connected THROUGH the proxy — the one that will flake.
+        let reader = spawn_test_actor(proxy.addr, "flaky-reader");
+        let _ = whoami_with_retry(&reader, Duration::from_secs(5))
+            .await
+            .expect("reader connect");
+        reader.join_context(ctx).await.expect("reader join");
+        wait_for_blocks_at_least(&reader, ctx, baseline, Duration::from_secs(10), "reader baseline")
+            .await;
+
+        // Cut the transport, then surface the drop by driving a call: an RPC
+        // over the dead pipe fails as a disconnect-class error, which signals the
+        // FSM to leave Connected (`run_rpc_call` → `close_tx`) — far faster than
+        // waiting on the 30s liveness ping. Each call is bounded so a hung pipe
+        // counts as "noticed" too.
+        proxy.cut();
+        let drop_deadline = tokio::time::Instant::now() + Duration::from_secs(40);
+        loop {
+            match tokio::time::timeout(Duration::from_secs(3), reader.whoami()).await {
+                Ok(Ok(_)) => {
+                    if tokio::time::Instant::now() >= drop_deadline {
+                        panic!("reader never noticed the cut");
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                // Ok(Err) = call errored, Err = our timeout: the drop surfaced.
+                _ => break,
+            }
+        }
+
+        // During the outage the writer (kernel still alive) appends a block.
+        let pre_gap = block_count(&writer, ctx).await;
+        writer
+            .execute("kj block create --role user --kind text --content during-outage")
+            .await
+            .expect("gap block");
+        let gap_count = wait_for_blocks_at_least(
+            &writer,
+            ctx,
+            pre_gap + 1,
+            Duration::from_secs(10),
+            "gap block lands on the kernel",
+        )
+        .await;
+        assert!(
+            gap_count > baseline,
+            "kernel should hold the block appended during the outage"
+        );
+
+        // Heal the transport. The reader's FSM reconnects on its next attempt
+        // (a Connected-after-drop — the signal the app's SyncGeneration bump
+        // keys on). `whoami_with_retry` rides the Cooldown/Connecting NotReadys
+        // through to the reconnected Connected.
+        proxy.restore();
+        whoami_with_retry(&reader, Duration::from_secs(30))
+            .await
+            .expect("reader reconnects after restore");
+
+        // The reconnected reader can now re-fetch the gap block. Before the fix
+        // the app would never trigger this fetch and stay gap-stale; here we
+        // assert the substrate it depends on — the kernel kept the work and the
+        // reconnected client can see it.
+        let after = wait_for_blocks_at_least(
+            &reader,
+            ctx,
+            gap_count,
+            Duration::from_secs(30),
+            "reader re-syncs the gap block after reconnect",
+        )
+        .await;
+        assert!(
+            after >= gap_count,
+            "reconnected reader must see the block appended during its outage"
+        );
 
         server.stop().await;
     });

@@ -180,6 +180,25 @@ pub fn handle_block_events(
                     }
                 }
             }
+            RpcResultMessage::ContextResynced { context_id, sync } => {
+                // A staleness re-fetch (post-reconnect / post-lag) delivered the
+                // full CRDT state. Merge it into the cached doc — the idempotent
+                // catch-up that heals blocks lost while the transport was down.
+                // Only an already-cached doc is refreshed; an unknown context is
+                // hydrated by the join bootstrap, not here.
+                let ctx_id = *context_id;
+                if let Some(cached) = doc_cache.get_mut(ctx_id) {
+                    match cached.synced.apply_sync_state(sync) {
+                        Ok(effect) => {
+                            info!("Cache: staleness re-sync for {} effect: {:?}", ctx_id, effect);
+                            cached.synced_at_generation = sync_gen.0;
+                        }
+                        Err(e) => {
+                            error!("Cache: staleness re-sync error for {}: {}", ctx_id, e);
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -520,6 +539,7 @@ pub fn check_cache_staleness(
     doc_cache: Res<crate::cell::DocumentCache>,
     sync_gen: Res<crate::connection::actor_plugin::SyncGeneration>,
     actor: Option<Res<crate::connection::RpcActor>>,
+    channel: Res<crate::connection::RpcResultChannel>,
     mut checked_gen: Local<u64>,
 ) {
     if sync_gen.0 == *checked_gen {
@@ -547,16 +567,24 @@ pub fn check_cache_staleness(
 
         let handle = actor.handle.clone();
         let ctx_id = active_id;
+        let tx = channel.sender();
 
         bevy::tasks::IoTaskPool::get()
             .spawn(async move {
                 match handle.get_context_sync(ctx_id).await {
                     Ok(sync) => {
                         info!(
-                            "Staleness re-fetch complete for {}: {} bytes oplog",
+                            "Staleness re-fetch complete for {}: {} bytes oplog — applying",
                             ctx_id,
                             sync.ops.len()
                         );
+                        // Route the fetched state back to the main thread to be
+                        // merged into the cached document. Fetching and dropping
+                        // it (the old behavior) left the doc gap-stale.
+                        let _ = tx.send(RpcResultMessage::ContextResynced {
+                            context_id: ctx_id,
+                            sync,
+                        });
                     }
                     Err(e) => {
                         warn!("Staleness re-fetch failed for {}: {}", ctx_id, e);
