@@ -60,10 +60,8 @@ Two committed markdown files carry durable work between sessions; keep them curr
   out-of-scope work here before moving on; **delete an entry when it ships** (melt the
   story into the devlog if it's worth keeping). Code is truth; this tracks what's *not*
   in the code yet.
-- **`docs/devlog.md`** (committed) — narrative history of landed work and the decisions
-  behind it, from the agent's perspective. Not authoritative (`git log` + the design
-  docs are); this is the story. Add an entry when something ships and the "how we got
-  here" is worth keeping.
+- **`docs/devlog.md`** (committed) — a durable narrative from the agent's perspective.
+  Write your story there.
 
 ## Git Conventions
 
