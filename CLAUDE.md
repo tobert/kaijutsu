@@ -65,9 +65,6 @@ Two committed markdown files carry durable work between sessions; keep them curr
   docs are); this is the story. Add an entry when something ships and the "how we got
   here" is worth keeping.
 
-(The ephemeral cross-session handoff, `signoff.md`, is a personal practice and lives in
-`~/.claude` — keep it out of the repo.)
-
 ## Git Conventions
 
 - Working on main (early development); parallel work on the same repo is common
