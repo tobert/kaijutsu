@@ -15,7 +15,7 @@
 
 use super::error::HookId;
 use super::hook_table::{
-    GlobPattern, HookAction, HookBody, HookEntry, HookPhase, LogSpec,
+    GlobPattern, HookAction, HookBody, HookEntry, McpHookPhase, LogSpec,
 };
 use super::hooks_builtin::BuiltinHookRegistry;
 use super::types::{KernelToolResult, ToolContent};
@@ -27,23 +27,23 @@ pub const ACTION_SHORT_CIRCUIT: &str = "shortcircuit";
 pub const ACTION_DENY: &str = "deny";
 pub const ACTION_LOG: &str = "log";
 
-pub fn phase_to_str(phase: HookPhase) -> &'static str {
+pub fn phase_to_str(phase: McpHookPhase) -> &'static str {
     match phase {
-        HookPhase::PreCall => "pre_call",
-        HookPhase::PostCall => "post_call",
-        HookPhase::OnError => "on_error",
-        HookPhase::OnNotification => "on_notification",
-        HookPhase::ListTools => "list_tools",
+        McpHookPhase::PreCall => "pre_call",
+        McpHookPhase::PostCall => "post_call",
+        McpHookPhase::OnError => "on_error",
+        McpHookPhase::OnNotification => "on_notification",
+        McpHookPhase::ListTools => "list_tools",
     }
 }
 
-pub fn parse_phase(s: &str) -> Option<HookPhase> {
+pub fn parse_phase(s: &str) -> Option<McpHookPhase> {
     match s {
-        "pre_call" => Some(HookPhase::PreCall),
-        "post_call" => Some(HookPhase::PostCall),
-        "on_error" => Some(HookPhase::OnError),
-        "on_notification" => Some(HookPhase::OnNotification),
-        "list_tools" => Some(HookPhase::ListTools),
+        "pre_call" => Some(McpHookPhase::PreCall),
+        "post_call" => Some(McpHookPhase::PostCall),
+        "on_error" => Some(McpHookPhase::OnError),
+        "on_notification" => Some(McpHookPhase::OnNotification),
+        "list_tools" => Some(McpHookPhase::ListTools),
         _ => None,
     }
 }
@@ -74,7 +74,7 @@ fn parse_level(s: &str) -> Option<tracing::Level> {
 /// registry name is stored. Lossy for `ShortCircuit`'s `structured`
 /// field (MCP-side JSON) — persisted hooks do not carry structured
 /// content, only `result_text` + `is_error`.
-pub fn entry_to_row(phase: HookPhase, entry: &HookEntry) -> HookRow {
+pub fn entry_to_row(phase: McpHookPhase, entry: &HookEntry) -> HookRow {
     let phase_str = phase_to_str(phase).to_string();
     let match_instance = entry.match_instance.as_ref().map(|g| g.0.clone());
     let match_tool = entry.match_tool.as_ref().map(|g| g.0.clone());
@@ -199,14 +199,14 @@ impl std::fmt::Display for RowParseError {
     }
 }
 
-/// Reconstruct the live `(HookPhase, HookEntry)` pair. Returns
+/// Reconstruct the live `(McpHookPhase, HookEntry)` pair. Returns
 /// `RowParseError` on any shape violation so the caller
 /// (`Broker::hydrate_hooks_from_db`) can skip and warn rather than abort
 /// the whole hydrate.
 pub fn row_to_entry(
     row: &HookRow,
     registry: &BuiltinHookRegistry,
-) -> Result<(HookPhase, HookEntry), RowParseError> {
+) -> Result<(McpHookPhase, HookEntry), RowParseError> {
     let phase = parse_phase(&row.phase).ok_or_else(|| RowParseError::UnknownPhase(row.phase.clone()))?;
 
     let action = match row.action_kind.as_str() {
@@ -305,12 +305,12 @@ mod tests {
             priority: 7,
             kaish_script_id: None,
         };
-        let row = entry_to_row(HookPhase::PreCall, &entry);
+        let row = entry_to_row(McpHookPhase::PreCall, &entry);
         assert_eq!(row.action_kind, "builtin_invoke");
         assert_eq!(row.action_builtin_name.as_deref(), Some("tracing_audit"));
 
         let (phase2, entry2) = row_to_entry(&row, &registry).unwrap();
-        assert_eq!(phase2, HookPhase::PreCall);
+        assert_eq!(phase2, McpHookPhase::PreCall);
         assert_eq!(entry2.id.0, "rt-builtin");
         assert_eq!(entry2.priority, 7);
         assert_eq!(entry2.match_instance.as_ref().unwrap().0, "builtin.*");
@@ -369,7 +369,7 @@ mod tests {
             priority: 0,
             kaish_script_id: None,
         };
-        let row = entry_to_row(HookPhase::OnError, &entry);
+        let row = entry_to_row(McpHookPhase::OnError, &entry);
         let (_phase, entry2) = row_to_entry(&row, &registry).unwrap();
         match entry2.action {
             HookAction::ShortCircuit(r) => {
@@ -493,7 +493,7 @@ mod tests {
             priority: 0,
             kaish_script_id: None,
         };
-        let row = entry_to_row(HookPhase::PreCall, &inline);
+        let row = entry_to_row(McpHookPhase::PreCall, &inline);
         assert_eq!(row.action_kaish_body.as_deref(), Some("exit 0"));
         assert_eq!(row.action_kaish_script_id, None);
 
@@ -507,7 +507,7 @@ mod tests {
             priority: 0,
             kaish_script_id: Some("shared-script".into()),
         };
-        let row = entry_to_row(HookPhase::PreCall, &scripted);
+        let row = entry_to_row(McpHookPhase::PreCall, &scripted);
         assert_eq!(
             row.action_kaish_body.as_deref(),
             Some("exit 0"),

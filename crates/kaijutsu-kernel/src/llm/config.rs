@@ -1,7 +1,7 @@
 //! LLM provider configuration.
 //!
 //! Tool filtering was retired in Phase 5 D-54; per-context tool visibility
-//! is now expressed via `ContextToolBinding` + `HookPhase::ListTools`. The
+//! is now expressed via `ContextToolBinding` + `McpHookPhase::ListTools`. The
 //! per-provider `default_tools` field and the `ToolConfig` type that fed
 //! into it are gone.
 

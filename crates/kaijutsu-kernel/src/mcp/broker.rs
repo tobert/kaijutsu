@@ -26,7 +26,7 @@ use super::binding::{ContextToolBinding, ResolvedName};
 use super::coalescer::{NotificationCoalescer, ObserveOutcome};
 use super::context::CallContext;
 use super::error::{HookId, McpError, McpResult, PolicyError};
-use super::hook_table::{HookAction, HookBody, HookEntry, HookPhase, HookTables};
+use super::hook_table::{HookAction, HookBody, HookEntry, McpHookPhase, HookTables};
 use super::hooks_builtin::BuiltinHookRegistry;
 use super::policy::InstancePolicy;
 use super::server_like::{McpServerLike, ServerNotification};
@@ -320,11 +320,11 @@ impl Broker {
             match super::hook_persist::row_to_entry(&row, &self.builtin_hooks) {
                 Ok((phase, entry)) => {
                     let table = match phase {
-                        HookPhase::PreCall => &mut hooks.pre_call,
-                        HookPhase::PostCall => &mut hooks.post_call,
-                        HookPhase::OnError => &mut hooks.on_error,
-                        HookPhase::OnNotification => &mut hooks.on_notification,
-                        HookPhase::ListTools => &mut hooks.list_tools,
+                        McpHookPhase::PreCall => &mut hooks.pre_call,
+                        McpHookPhase::PostCall => &mut hooks.post_call,
+                        McpHookPhase::OnError => &mut hooks.on_error,
+                        McpHookPhase::OnNotification => &mut hooks.on_notification,
+                        McpHookPhase::ListTools => &mut hooks.list_tools,
                     };
                     table.entries.push(entry);
                     loaded += 1;
@@ -451,7 +451,7 @@ impl Broker {
     /// is legitimately authoritative there.
     pub async fn persist_hook_insert(
         &self,
-        phase: HookPhase,
+        phase: McpHookPhase,
         entry: &HookEntry,
     ) -> crate::kernel_db::KernelDbResult<()> {
         let db = match self.db.read().await.clone() {
@@ -1276,18 +1276,18 @@ impl Broker {
 
         // PreCall — may short-circuit the call entirely, or deny it outright.
         match self
-            .evaluate_phase(HookPhase::PreCall, &params, ctx, PhasePayload::None)
+            .evaluate_phase(McpHookPhase::PreCall, &params, ctx, PhasePayload::None)
             .await?
         {
             PhaseOutcome::Continue => {}
             PhaseOutcome::ShortCircuit { hook_id, result } => {
-                emit_short_circuit_attribution(HookPhase::PreCall, &hook_id);
+                emit_short_circuit_attribution(McpHookPhase::PreCall, &hook_id);
                 // PostCall still runs on short-circuit per §4.3 evaluation law
                 // — it observes that a (synthetic) result was produced.
                 // Result can itself short-circuit or deny.
                 return match self
                     .evaluate_phase(
-                        HookPhase::PostCall,
+                        McpHookPhase::PostCall,
                         &params,
                         ctx,
                         PhasePayload::Result(&result),
@@ -1296,17 +1296,17 @@ impl Broker {
                 {
                     PhaseOutcome::Continue => Ok(result),
                     PhaseOutcome::ShortCircuit { hook_id, result: r2 } => {
-                        emit_short_circuit_attribution(HookPhase::PostCall, &hook_id);
+                        emit_short_circuit_attribution(McpHookPhase::PostCall, &hook_id);
                         Ok(r2)
                     }
                     PhaseOutcome::Deny { hook_id, reason } => {
-                        emit_deny_attribution(HookPhase::PostCall, &hook_id, &reason);
+                        emit_deny_attribution(McpHookPhase::PostCall, &hook_id, &reason);
                         Err(McpError::Denied { by_hook: hook_id })
                     }
                 };
             }
             PhaseOutcome::Deny { hook_id, reason } => {
-                emit_deny_attribution(HookPhase::PreCall, &hook_id, &reason);
+                emit_deny_attribution(McpHookPhase::PreCall, &hook_id, &reason);
                 return Err(McpError::Denied { by_hook: hook_id });
             }
         }
@@ -1353,7 +1353,7 @@ impl Broker {
                 }
                 match self
                     .evaluate_phase(
-                        HookPhase::PostCall,
+                        McpHookPhase::PostCall,
                         &call_params_for_hooks,
                         ctx,
                         PhasePayload::Result(&result),
@@ -1362,11 +1362,11 @@ impl Broker {
                 {
                     PhaseOutcome::Continue => Ok(result),
                     PhaseOutcome::ShortCircuit { hook_id, result: r2 } => {
-                        emit_short_circuit_attribution(HookPhase::PostCall, &hook_id);
+                        emit_short_circuit_attribution(McpHookPhase::PostCall, &hook_id);
                         Ok(r2)
                     }
                     PhaseOutcome::Deny { hook_id, reason } => {
-                        emit_deny_attribution(HookPhase::PostCall, &hook_id, &reason);
+                        emit_deny_attribution(McpHookPhase::PostCall, &hook_id, &reason);
                         Err(McpError::Denied { by_hook: hook_id })
                     }
                 }
@@ -1393,16 +1393,16 @@ impl Broker {
         err: McpError,
     ) -> McpResult<KernelToolResult> {
         match self
-            .evaluate_phase(HookPhase::OnError, params, ctx, PhasePayload::Error(&err))
+            .evaluate_phase(McpHookPhase::OnError, params, ctx, PhasePayload::Error(&err))
             .await
         {
             Ok(PhaseOutcome::Continue) => Err(err),
             Ok(PhaseOutcome::ShortCircuit { hook_id, result }) => {
-                emit_short_circuit_attribution(HookPhase::OnError, &hook_id);
+                emit_short_circuit_attribution(McpHookPhase::OnError, &hook_id);
                 Ok(result)
             }
             Ok(PhaseOutcome::Deny { hook_id, reason }) => {
-                emit_deny_attribution(HookPhase::OnError, &hook_id, &reason);
+                emit_deny_attribution(McpHookPhase::OnError, &hook_id, &reason);
                 Err(McpError::Denied { by_hook: hook_id })
             }
             Err(eval_err) => {
@@ -1430,7 +1430,7 @@ impl Broker {
     /// recovery is out-of-band; the broker doesn't self-guard.
     async fn evaluate_phase(
         &self,
-        phase: HookPhase,
+        phase: McpHookPhase,
         params: &KernelCallParams,
         ctx: &CallContext,
         payload: PhasePayload<'_>,
@@ -1441,11 +1441,11 @@ impl Broker {
         let snapshot: Vec<(usize, super::hook_table::HookEntry)> = {
             let guard = self.hooks.read().await;
             let table = match phase {
-                HookPhase::PreCall => &guard.pre_call,
-                HookPhase::PostCall => &guard.post_call,
-                HookPhase::OnError => &guard.on_error,
-                HookPhase::OnNotification => &guard.on_notification,
-                HookPhase::ListTools => &guard.list_tools,
+                McpHookPhase::PreCall => &guard.pre_call,
+                McpHookPhase::PostCall => &guard.post_call,
+                McpHookPhase::OnError => &guard.on_error,
+                McpHookPhase::OnNotification => &guard.on_notification,
+                McpHookPhase::ListTools => &guard.list_tools,
             };
             table
                 .entries
@@ -1582,7 +1582,7 @@ impl Broker {
     /// payload in `KJ_TOOL_ARGS` already; no extra var is added.
     async fn run_kaish_hook(
         &self,
-        phase: HookPhase,
+        phase: McpHookPhase,
         body: &str,
         params: &super::types::KernelCallParams,
         ctx: &CallContext,
@@ -1623,11 +1623,11 @@ impl Broker {
             .map_err(|e| format!("kaish hook init failed: {e}"))?;
 
         let phase_str = match phase {
-            HookPhase::PreCall => "pre_call",
-            HookPhase::PostCall => "post_call",
-            HookPhase::OnError => "on_error",
-            HookPhase::OnNotification => "on_notification",
-            HookPhase::ListTools => "list_tools",
+            McpHookPhase::PreCall => "pre_call",
+            McpHookPhase::PostCall => "post_call",
+            McpHookPhase::OnError => "on_error",
+            McpHookPhase::OnNotification => "on_notification",
+            McpHookPhase::ListTools => "list_tools",
         };
 
         let args_json = serde_json::to_string(&params.arguments)
@@ -1912,7 +1912,7 @@ impl Broker {
         let synth_ctx = CallContext::system_for_context(ctx);
         match self
             .evaluate_phase(
-                HookPhase::OnNotification,
+                McpHookPhase::OnNotification,
                 synth_params,
                 &synth_ctx,
                 PhasePayload::None,
@@ -1921,11 +1921,11 @@ impl Broker {
         {
             Ok(PhaseOutcome::Continue) => {}
             Ok(PhaseOutcome::ShortCircuit { hook_id, .. }) => {
-                emit_short_circuit_attribution(HookPhase::OnNotification, &hook_id);
+                emit_short_circuit_attribution(McpHookPhase::OnNotification, &hook_id);
                 return;
             }
             Ok(PhaseOutcome::Deny { hook_id, reason }) => {
-                emit_deny_attribution(HookPhase::OnNotification, &hook_id, &reason);
+                emit_deny_attribution(McpHookPhase::OnNotification, &hook_id, &reason);
                 return;
             }
             Err(e) => {
@@ -2254,7 +2254,7 @@ fn hook_matches(
 /// Tracing attribution for a `ShortCircuit` result — D-49. Event, not a new
 /// span, so the parent `broker.call_tool` span remains the correlation
 /// anchor.
-fn emit_short_circuit_attribution(phase: HookPhase, hook_id: &HookId) {
+fn emit_short_circuit_attribution(phase: McpHookPhase, hook_id: &HookId) {
     tracing::info!(
         hook_id = %format!("hook:{hook_id}"),
         phase = ?phase,
@@ -2264,7 +2264,7 @@ fn emit_short_circuit_attribution(phase: HookPhase, hook_id: &HookId) {
 
 /// Tracing attribution for a `Deny` result. The inner `reason` is recorded
 /// here; the LLM only sees `McpError::Denied { by_hook }` (D-28).
-fn emit_deny_attribution(phase: HookPhase, hook_id: &HookId, reason: &str) {
+fn emit_deny_attribution(phase: McpHookPhase, hook_id: &HookId, reason: &str) {
     tracing::info!(
         hook_id = %format!("hook:{hook_id}"),
         phase = ?phase,
@@ -2467,7 +2467,7 @@ async fn handle_resource_flush(broker: &Arc<Broker>, id: &InstanceId, uri: &str)
                 let synth_ctx = CallContext::system_for_context(ctx_id);
                 match broker
                     .evaluate_phase(
-                        HookPhase::OnNotification,
+                        McpHookPhase::OnNotification,
                         &success_synth,
                         &synth_ctx,
                         PhasePayload::None,
@@ -2477,14 +2477,14 @@ async fn handle_resource_flush(broker: &Arc<Broker>, id: &InstanceId, uri: &str)
                     Ok(PhaseOutcome::Continue) => {}
                     Ok(PhaseOutcome::ShortCircuit { hook_id, .. }) => {
                         emit_short_circuit_attribution(
-                            HookPhase::OnNotification,
+                            McpHookPhase::OnNotification,
                             &hook_id,
                         );
                         continue;
                     }
                     Ok(PhaseOutcome::Deny { hook_id, reason }) => {
                         emit_deny_attribution(
-                            HookPhase::OnNotification,
+                            McpHookPhase::OnNotification,
                             &hook_id,
                             &reason,
                         );
@@ -2537,7 +2537,7 @@ async fn handle_resource_flush(broker: &Arc<Broker>, id: &InstanceId, uri: &str)
                 let synth_ctx = CallContext::system_for_context(ctx_id);
                 match broker
                     .evaluate_phase(
-                        HookPhase::OnNotification,
+                        McpHookPhase::OnNotification,
                         &fail_synth,
                         &synth_ctx,
                         PhasePayload::None,
@@ -2547,14 +2547,14 @@ async fn handle_resource_flush(broker: &Arc<Broker>, id: &InstanceId, uri: &str)
                     Ok(PhaseOutcome::Continue) => {}
                     Ok(PhaseOutcome::ShortCircuit { hook_id, .. }) => {
                         emit_short_circuit_attribution(
-                            HookPhase::OnNotification,
+                            McpHookPhase::OnNotification,
                             &hook_id,
                         );
                         continue;
                     }
                     Ok(PhaseOutcome::Deny { hook_id, reason }) => {
                         emit_deny_attribution(
-                            HookPhase::OnNotification,
+                            McpHookPhase::OnNotification,
                             &hook_id,
                             &reason,
                         );
@@ -5984,7 +5984,7 @@ mod tests {
 
         let entry = log_entry("h1", Some("file_*"));
         broker
-            .persist_hook_insert(HookPhase::PreCall, &entry)
+            .persist_hook_insert(McpHookPhase::PreCall, &entry)
             .await
             .unwrap();
 
@@ -6005,7 +6005,7 @@ mod tests {
         broker.set_db(db.clone()).await;
 
         broker
-            .persist_hook_insert(HookPhase::PreCall, &log_entry("h-del", None))
+            .persist_hook_insert(McpHookPhase::PreCall, &log_entry("h-del", None))
             .await
             .unwrap();
         assert_eq!(db.lock().load_all_hooks().unwrap().len(), 1);
@@ -6029,11 +6029,11 @@ mod tests {
 
         let entry = log_entry("dup", None);
         broker
-            .persist_hook_insert(HookPhase::PreCall, &entry)
+            .persist_hook_insert(McpHookPhase::PreCall, &entry)
             .await
             .expect("first insert occupies the PK");
 
-        let second = broker.persist_hook_insert(HookPhase::PreCall, &entry).await;
+        let second = broker.persist_hook_insert(McpHookPhase::PreCall, &entry).await;
         assert!(
             second.is_err(),
             "duplicate hook_id must surface as Err, not a silent warn",
@@ -6048,7 +6048,7 @@ mod tests {
     async fn persist_hook_insert_no_db_is_ok() {
         let broker = Arc::new(Broker::new());
         broker
-            .persist_hook_insert(HookPhase::PreCall, &log_entry("x", None))
+            .persist_hook_insert(McpHookPhase::PreCall, &log_entry("x", None))
             .await
             .expect("no DB wired is Ok, not an error");
         broker

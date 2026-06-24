@@ -31,7 +31,7 @@ use crate::rpc::{ConversationCache, SharedKernelState};
 ///
 /// Phase 5 M4: `ToolFilter` retired (D-54). Per-context tool curation is
 /// expressed by the `ContextToolBinding`'s `allowed_instances` and by
-/// `HookPhase::ListTools` hooks (D-56) — both applied inside
+/// `McpHookPhase::ListTools` hooks (D-56) — both applied inside
 /// `Broker::list_visible_tools` via `list_tool_defs_via_broker`. This
 /// function now pass-throughs the broker output unmodified.
 /// Surface a configuration / pre-stream failure as a visible error block so the

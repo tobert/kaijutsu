@@ -2064,7 +2064,7 @@ impl kernel::Server for KernelImpl {
 
                 // Phase 5 D-54: tool filter retired. Visibility is now
                 // enforced by the broker's `ContextToolBinding` +
-                // `HookPhase::ListTools` inside `list_visible_tools` and
+                // `McpHookPhase::ListTools` inside `list_visible_tools` and
                 // `dispatch_tool_via_broker`.
 
                 // Dispatch through the Phase 1 broker (M4).

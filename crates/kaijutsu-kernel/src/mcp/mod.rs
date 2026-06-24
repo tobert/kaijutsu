@@ -24,7 +24,7 @@ pub use coalescer::{CoalescePolicy, NotificationCoalescer};
 pub use context::{CallContext, TraceContext};
 pub use error::{CoalescerError, HookId, McpError, McpResult, PolicyError};
 pub use hook_table::{
-    GlobPattern, Hook, HookAction, HookBody, HookEntry, HookPhase, HookTable, HookTables, LogSpec,
+    GlobPattern, Hook, HookAction, HookBody, HookEntry, McpHookPhase, HookTable, HookTables, LogSpec,
 };
 pub use hooks_builtin::{BuiltinHookRegistry, NoOpHook, TracingAuditHook};
 pub use policy::InstancePolicy;

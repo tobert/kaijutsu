@@ -245,3 +245,29 @@ the score (`on_turn_completed` eager-parses ABC). The remaining work — the
 rotate-action rc script, the `--ooda-every` cadence knob, the windowed-notation
 pull primitive (slice 5) — is parked in issues.md. Memory:
 `project_chameleon`, `project_chameleon_first_loop`, `project_composer_transport`.
+
+## Gemini-CLI cache/cost decisions + `McpHookPhase` rename (2026-06-24)
+
+A design session read the Gemini-CLI feature comparison (`docs/issues.md`) through one
+lens: **the Anthropic prompt cache is a prefix match — any byte change in `tools →
+system → messages` invalidates everything after it.** That reframes several "cheap
+wins" as cache footguns (date/cwd in the system prompt is a silent invalidator; the
+fix is *where* it lands, not whether) and several cost levers as cache costs (model
+switching is model-scoped, so classifier routing must be fork-grained). The converged
+decisions are durable in `issues.md` → *Cache & cost — decided direction*: EMA (not PID)
+for the chars→tokens calculator calibrated by provider `usage`; compression dropped
+(SQLite-on-btrfs + organic ~80% flush-to-signoff covers it); a per-turn
+`BeforeModelTurn`/`AfterModelTurn` seam with a **mechanics(Rust) / policy(data) /
+decisions(kaish-hook)** split, so "gemini retries differently" is a policy row, not a
+code fork; hook contract = `HookAction` verdict + stdout→block payload (append-only,
+so a hook physically can't rewrite the cached prefix).
+
+Landed in code: **`HookPhase` → `McpHookPhase`** (108 refs / 10 files). All five
+variants (`PreCall`/`PostCall`/`OnError`/`OnNotification`/`ListTools`) fire around the
+MCP broker, so the *enum* was scoped rather than prefixing each variant — and the
+model-turn seam becomes a clean sibling. Persistence is decoupled (`phase_to_str` maps
+to stable `pre_call`… strings), and the DB is empty anyway, so no migration. Module +
+enum docs now state the MCP scope and forward-reference the sibling surface.
+`cargo build -p kaijutsu-kernel -p kaijutsu-server` green. Remaining prep (input-limit
+table, EMA calculator, `RetryPolicy`, the sibling phase enum + its open reuse-vs-parallel
+fork) is logged in issues.md.

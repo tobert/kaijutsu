@@ -28,7 +28,7 @@ use super::super::broker::Broker;
 use super::super::context::CallContext;
 use super::super::error::{HookId, McpError, McpResult};
 use super::super::hook_table::{
-    GlobPattern, HookAction, HookBody, HookEntry, HookPhase, HookTable, LogSpec,
+    GlobPattern, HookAction, HookBody, HookEntry, McpHookPhase, HookTable, LogSpec,
 };
 use super::super::server_like::{McpServerLike, ServerNotification};
 use super::super::types::{
@@ -166,26 +166,26 @@ impl BuiltinHooksServer {
     }
 }
 
-fn parse_phase(s: &str) -> McpResult<HookPhase> {
+fn parse_phase(s: &str) -> McpResult<McpHookPhase> {
     match s {
-        "pre_call" => Ok(HookPhase::PreCall),
-        "post_call" => Ok(HookPhase::PostCall),
-        "on_error" => Ok(HookPhase::OnError),
-        "on_notification" => Ok(HookPhase::OnNotification),
-        "list_tools" => Ok(HookPhase::ListTools),
+        "pre_call" => Ok(McpHookPhase::PreCall),
+        "post_call" => Ok(McpHookPhase::PostCall),
+        "on_error" => Ok(McpHookPhase::OnError),
+        "on_notification" => Ok(McpHookPhase::OnNotification),
+        "list_tools" => Ok(McpHookPhase::ListTools),
         other => Err(McpError::Protocol(format!(
             "unknown hook phase: {other:?}"
         ))),
     }
 }
 
-fn phase_to_str(phase: HookPhase) -> &'static str {
+fn phase_to_str(phase: McpHookPhase) -> &'static str {
     match phase {
-        HookPhase::PreCall => "pre_call",
-        HookPhase::PostCall => "post_call",
-        HookPhase::OnError => "on_error",
-        HookPhase::OnNotification => "on_notification",
-        HookPhase::ListTools => "list_tools",
+        McpHookPhase::PreCall => "pre_call",
+        McpHookPhase::PostCall => "post_call",
+        McpHookPhase::OnError => "on_error",
+        McpHookPhase::OnNotification => "on_notification",
+        McpHookPhase::ListTools => "list_tools",
     }
 }
 
@@ -197,8 +197,8 @@ fn phase_to_str(phase: HookPhase) -> &'static str {
 /// rather than at first list-tools evaluation. `Kaish` is rejected
 /// unconditionally by `build_hook_action` anyway; called out here for
 /// completeness.
-fn validate_action_for_phase(phase: HookPhase, action: &HookActionWire) -> McpResult<()> {
-    if phase == HookPhase::ListTools {
+fn validate_action_for_phase(phase: McpHookPhase, action: &HookActionWire) -> McpResult<()> {
+    if phase == McpHookPhase::ListTools {
         match action {
             HookActionWire::BuiltinInvoke { .. }
             | HookActionWire::ShortCircuit { .. }
@@ -300,7 +300,7 @@ async fn build_hook_action(
 }
 
 /// JSON summary of one entry (list output; body detail for inspect).
-fn entry_summary_json(phase: HookPhase, entry: &HookEntry, full: bool) -> serde_json::Value {
+fn entry_summary_json(phase: McpHookPhase, entry: &HookEntry, full: bool) -> serde_json::Value {
     let action_json = match &entry.action {
         HookAction::Invoke(HookBody::Builtin { name, .. }) => {
             serde_json::json!({ "type": "builtin_invoke", "name": name })
@@ -590,11 +590,11 @@ impl McpServerLike for BuiltinHooksServer {
                 let hooks = broker.hooks().read().await;
                 let mut out: Vec<serde_json::Value> = Vec::new();
                 for (phase, table) in [
-                    (HookPhase::PreCall, &hooks.pre_call),
-                    (HookPhase::PostCall, &hooks.post_call),
-                    (HookPhase::OnError, &hooks.on_error),
-                    (HookPhase::OnNotification, &hooks.on_notification),
-                    (HookPhase::ListTools, &hooks.list_tools),
+                    (McpHookPhase::PreCall, &hooks.pre_call),
+                    (McpHookPhase::PostCall, &hooks.post_call),
+                    (McpHookPhase::OnError, &hooks.on_error),
+                    (McpHookPhase::OnNotification, &hooks.on_notification),
+                    (McpHookPhase::ListTools, &hooks.list_tools),
                 ] {
                     if filter_phase.is_some() && filter_phase != Some(phase) {
                         continue;
@@ -617,11 +617,11 @@ impl McpServerLike for BuiltinHooksServer {
                 let hooks = broker.hooks().read().await;
                 let mut found: Option<serde_json::Value> = None;
                 for (phase, table) in [
-                    (HookPhase::PreCall, &hooks.pre_call),
-                    (HookPhase::PostCall, &hooks.post_call),
-                    (HookPhase::OnError, &hooks.on_error),
-                    (HookPhase::OnNotification, &hooks.on_notification),
-                    (HookPhase::ListTools, &hooks.list_tools),
+                    (McpHookPhase::PreCall, &hooks.pre_call),
+                    (McpHookPhase::PostCall, &hooks.post_call),
+                    (McpHookPhase::OnError, &hooks.on_error),
+                    (McpHookPhase::OnNotification, &hooks.on_notification),
+                    (McpHookPhase::ListTools, &hooks.list_tools),
                 ] {
                     if let Some(entry) = table.entries.iter().find(|e| e.id.0 == p.hook_id)
                     {
@@ -751,14 +751,14 @@ impl McpServerLike for BuiltinHooksServer {
 
 fn phase_table_mut(
     hooks: &mut super::super::hook_table::HookTables,
-    phase: HookPhase,
+    phase: McpHookPhase,
 ) -> &mut HookTable {
     match phase {
-        HookPhase::PreCall => &mut hooks.pre_call,
-        HookPhase::PostCall => &mut hooks.post_call,
-        HookPhase::OnError => &mut hooks.on_error,
-        HookPhase::OnNotification => &mut hooks.on_notification,
-        HookPhase::ListTools => &mut hooks.list_tools,
+        McpHookPhase::PreCall => &mut hooks.pre_call,
+        McpHookPhase::PostCall => &mut hooks.post_call,
+        McpHookPhase::OnError => &mut hooks.on_error,
+        McpHookPhase::OnNotification => &mut hooks.on_notification,
+        McpHookPhase::ListTools => &mut hooks.list_tools,
     }
 }
 

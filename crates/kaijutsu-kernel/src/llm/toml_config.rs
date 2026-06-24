@@ -262,7 +262,7 @@ fn convert_llm_config(raw: &ModelsToml) -> LlmResult<LlmConfig> {
         config.max_output_tokens = p.max_output_tokens;
         // Phase 5 D-54: any `default_tools` block in TOML is silently
         // dropped; tool visibility is now managed by the broker's
-        // `ContextToolBinding` + `HookPhase::ListTools`.
+        // `ContextToolBinding` + `McpHookPhase::ListTools`.
         let _ = &p.default_tools;
         providers.push(config);
     }

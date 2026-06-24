@@ -155,7 +155,7 @@ impl fmt::Display for ContextState {
 
 // ============================================================================
 // ToolFilter — retired in Phase 5 (D-54).
-// `ContextToolBinding` + `HookPhase::ListTools` subsume allow/deny semantics
+// `ContextToolBinding` + `McpHookPhase::ListTools` subsume allow/deny semantics
 // at the instance+tool granularity operators actually care about. See
 // `docs/tool-system-redesign.md` §8 Phase 5 for the replacement.
 // ============================================================================

@@ -1,5 +1,12 @@
 //! Hook tables — match-action hook engine (§4.3, D-07).
 //!
+//! **Scope: MCP / tool-broker only.** Every [`McpHookPhase`] variant fires
+//! around the broker — `call_tool`, `list_visible_tools`, notifications. The
+//! per-model-turn seam (`BeforeModelTurn` / `AfterModelTurn`, see
+//! `docs/issues.md` → *Cache & cost — decided direction*) is a **separate
+//! sibling surface** on the LLM turn loop, not a variant here; it shares the
+//! [`HookAction`] verdict vocabulary but lives outside this MCP-scoped enum.
+//!
 //! Phase 4 wires evaluation at the four pinch points:
 //! - `PreCall` / `PostCall` / `OnError` — evaluated around
 //!   `Broker::call_tool` (`broker.rs`); see `evaluate_phase`.
@@ -42,8 +49,13 @@ use super::context::CallContext;
 use super::error::{HookId, McpResult};
 use super::types::{KernelCallParams, KernelToolResult};
 
+/// MCP/tool-broker hook phases. All variants fire around the broker; the
+/// model-turn seam is a separate surface (see the module header). Persisted
+/// as stable lower-snake strings (`pre_call`, …) via `hook_persist`, decoupled
+/// from these Rust names — renaming a variant needs a `phase_to_str` update,
+/// not a DB migration.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum HookPhase {
+pub enum McpHookPhase {
     PreCall,
     PostCall,
     OnError,
@@ -134,7 +146,7 @@ pub struct HookEntry {
 
 #[derive(Default)]
 pub struct HookTable {
-    pub phase: Option<HookPhase>,
+    pub phase: Option<McpHookPhase>,
     pub entries: Vec<HookEntry>,
 }
 
