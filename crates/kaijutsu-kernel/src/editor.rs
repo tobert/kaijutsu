@@ -61,6 +61,17 @@ pub fn config_owned(path: &str) -> bool {
         || path.starts_with("/etc/config/")
 }
 
+/// The CRDT config mount root that owns `path` (caller guarantees
+/// [`config_owned`]). Used to follow rc/config symlinks the same way the
+/// `ConfigCrdtFs` mount does — see `resolve_editor_target`.
+fn config_root(path: &str) -> &'static str {
+    if path == "/etc/config" || path.starts_with("/etc/config/") {
+        "/etc/config"
+    } else {
+        "/etc/rc"
+    }
+}
+
 /// Resolve `path` to the `(context, block)` of the CRDT document that owns its
 /// text. Fails loud (no silent empty/placeholder) when a config path names a
 /// document that does not exist — an editor must not open on a phantom block.
@@ -70,7 +81,20 @@ pub async fn resolve_editor_target(
     file_cache: &FileDocumentCache,
 ) -> Result<EditorTarget, String> {
     if config_owned(path) {
-        let context_id = config_context_id(path);
+        // Follow any rc/config symlink to its terminal document FIRST, exactly as
+        // the read/exec path (`ConfigCrdtFs`) does. Without this the editor binds
+        // the *symlink's own* block (e.g. `coder/*` → `lib/*`, the init.d
+        // composition) while reads resolve to the target — so saved edits land on
+        // a block nothing else reads (docs/issues.md). Resolving here makes the
+        // editor and the executor agree on one block.
+        let fs = crate::runtime::config_crdt_fs::ConfigCrdtFs::new(
+            blocks.clone(),
+            config_root(path),
+        );
+        let resolved = fs
+            .resolve_canonical(path)
+            .map_err(|e| format!("open editor: resolve '{path}': {e}"))?;
+        let context_id = config_context_id(&resolved);
         let block_id = first_block_id(blocks, context_id).ok_or_else(|| {
             format!("open editor: config document '{path}' does not exist (nothing to edit)")
         })?;
@@ -488,6 +512,53 @@ mod tests {
             target.block_id,
             first_block_id(&blocks, expected_ctx).unwrap(),
             "must bind the owning block",
+        );
+    }
+
+    #[tokio::test]
+    async fn resolves_symlinked_rc_path_to_its_target_block() {
+        // The init.d composition: `coder/*` rc scripts are symlinks to the
+        // shared `lib/*` source. The editor must bind the TARGET's block — the
+        // one the executor reads — not the symlink's own block, or saved edits
+        // land on a doc nothing else reads (docs/issues.md, fixed here).
+        let blocks = blocks_with_db();
+        let rc = ConfigCrdtFs::new(blocks.clone(), "/etc/rc");
+        // The real source lives under lib/.
+        rc.write_all(Path::new("lib/create/S10-binding.kai"), b"kj binding allow \"*\"")
+            .await
+            .unwrap();
+        // coder/ composes it in via a symlink (absolute target, like the seed).
+        rc.symlink(
+            Path::new("coder/create/S10-binding.kai"),
+            Path::new("/etc/rc/lib/create/S10-binding.kai"),
+        )
+        .await
+        .unwrap();
+
+        let file_cache =
+            FileDocumentCache::new(blocks.clone(), Arc::new(crate::vfs::MountTable::new()));
+
+        let link_path = "/etc/rc/coder/create/S10-binding.kai";
+        let target = resolve_editor_target(link_path, &blocks, &file_cache)
+            .await
+            .expect("symlinked rc path resolves to its target block");
+
+        // Binds the TARGET (lib) document — what the executor reads…
+        let target_ctx = config_context_id("/etc/rc/lib/create/S10-binding.kai");
+        assert_eq!(
+            target.context_id, target_ctx,
+            "must bind the symlink target's owner"
+        );
+        assert_eq!(
+            target.block_id,
+            first_block_id(&blocks, target_ctx).unwrap(),
+            "must bind the target block",
+        );
+        // …and NOT the symlink doc's own (coder-path) context.
+        assert_ne!(
+            target.context_id,
+            config_context_id(link_path),
+            "must not bind the symlink doc itself"
         );
     }
 

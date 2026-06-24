@@ -175,6 +175,17 @@ impl ConfigCrdtFs {
         Err(VfsError::TooManySymlinks)
     }
 
+    /// Follow any symlink chain at `canonical` (an absolute path **already under
+    /// this mount root**, e.g. `/etc/rc/coder/create/S10-binding.kai`) to its
+    /// terminal canonical path. Public so off-backend callers that bind to a
+    /// document by path — notably the vi editor's `resolve_editor_target` — land
+    /// on the SAME terminal block this backend reads/executes, instead of the
+    /// symlink's own block. A non-symlink path resolves to itself; a cycle or an
+    /// over-long chain fails loud.
+    pub fn resolve_canonical(&self, canonical: &str) -> VfsResult<String> {
+        self.resolve(canonical)
+    }
+
     /// Create the symlink document at `canonical` whose single block holds the
     /// raw `target` string (git-style). Caller guarantees nothing already lives
     /// at the path.
