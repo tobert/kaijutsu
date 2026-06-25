@@ -255,25 +255,25 @@ and renamed `composer→musician` / `explorer→toolie` left these threads open:
   conversation with rich content; (2) the unfocused-pane summary, the one
   surface on Bevy's native `Text` pipeline (`tiling_reconciler`), needs a
   multi-pane layout. All MSDF-only surfaces + docks + role borders verified.
-- **User input modes — vi `:` line vs kaish shell vs agent prompt (design, parked
-  2026-06-24).** Wiring `:q`/`:wq`/`:q!` to quit the in-app editor is the immediate
-  itch (muscle memory), but the deeper question is what the editor's `:` line *is*,
-  because the instrument already has command/text surfaces that shouldn't fragment:
-  the **kaish shell** (bottom — this is kaijutsu's "ex": `kj` verbs, pipes, file ops),
-  the **agent prompt** (floating — natural language), and **vi `:`** (today a
-  suppressed no-op stub: `kaijutsu-editor/src/lib.rs` sets `command_line=true` on
-  `Action::CommandBar` to keep `:` from corrupting the buffer, clears it on
-  `Action::Prompt`, but never reads or acts on what was typed). Three stances to
-  decide between: **(A) ex-minimal island** — kernel recognizes just `:w/:q/:wq/:q!/:x`
-  → the existing `editor_save`/`editor_quit` verbs; cheap, but a third command island.
-  **(B) `:` *is* kaish, scoped to the session** — `w`/`q`/`wq` are kaish aliases over
-  the session verbs, everything else is the instrument shell with the editor session
-  in scope (so `:%!fmt` is a real pipe); one language, two framings; pure-vim idioms
-  (`:s///`, ranges) don't come free. **(C) hybrid / universal command line** — quit/
-  write/range-edits stay ex for vim fidelity, unknown `:` falls through to kaish, and
-  at the far end a prefix could even route to the model. Open sub-question: does the
-  agent prompt belong on the same `:` line or stay deliberately separate (NL vs command
-  grammar). Lean is B. Don't implement the island on reflex — decide the surface first.
+- **Vi editor command mode — `:` dialect (Slice 3, `docs/vi.md` → *Command mode*).**
+  Steps 1+2 **shipped** (`ff9efb36` core verbs `:w/:q/:wq/:q!/:x/:w!`; `e9bec018`
+  `:s`/`:%s`/`:N,Ms`) — both runner-verified. Design notes that held: surface stays
+  kernel-owned (app forwards every key); the dialect is its own thing (Rust-regex
+  `:s`, not vim BRE); intent pattern (`CommandRequest`/`take_commands`), **not**
+  modalkit's command machine (its default set lacks `:wq`/`:x` and its commands
+  don't compose). Remaining:
+  - **Step 3 — `:r <file>` / `:r !cmd` + Ctrl+Z-suspend / `fg`-resume.** **`:!`
+    dropped** (2026-06-25): it needed nested editor sessions + a return stack; the
+    shell is already a keystroke away, so use the Unix job-control metaphor instead
+    — Ctrl+Z suspends vi to the shell (local app intercept = also the hung-kernel
+    escape hatch), `fg` (kaish builtin re-fires `open_editor`) resumes it. `:r`
+    makes `Kernel::editor_keys` **async** (first VFS/kaish I/O intent); `EditorCore`
+    gains `EditorIo::{ReadFile,ReadShell}` + `take_io()` + `insert_at_cursor`.
+    Insert at cursor, fail-loud on missing file / denied shell.
+  - **Step 4 — `:e <path>`** (rebind the session to another block) — deferred.
+  - Related separate thread: the Ctrl+Z shell may become a **shadow context**
+    (blocks excluded from the conversation until drifted) — simplify-by-construction,
+    its own design pass; `project_shadow_context_shell` memory.
 - **User presence (novel surface):** The compose input is a shared CRDT document. Surfacing in-flight compose state to an opted-in model would enable mid-sentence collaboration. Gate with explicit user opt-in.
 - **Connection Polling Efficiency:** `ActorPlugin` in `crates/kaijutsu-app/src/connection/mod.rs` polls broadcast channels every frame. While `UpdateMode::reactive` helps, consider event-driven wakeups or bridging async streams directly into Bevy events more efficiently if latency/power becomes an issue.
 - **Card-stack view:** Card size tuning, read-only scroll on focused card, dive-in (Enter), mouse click to focus, momentum scrolling, camera parallax, streaming card texture updates, card grouping evolution, ambient environment.
