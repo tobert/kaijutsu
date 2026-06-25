@@ -435,9 +435,15 @@ fn parse_ex_command(body: &str) -> Result<ParsedLine, String> {
         return Ok(ParsedLine::Io(io));
     }
 
-    // A trailing `!` forces; strip it before matching the verb.
-    let (verb, force) = match body.strip_suffix('!') {
-        Some(v) => (v.trim_end(), true),
+    // A trailing `!` (adjacent — `:w!`, not `:w !`) forces; strip it before
+    // matching the verb. Requiring adjacency keeps `:w !` from silently meaning
+    // force-write (in vim `:w !cmd` pipes to a command; a bare `:w !` here just
+    // fails loud as an unknown verb rather than quietly forcing).
+    let (verb, force) = match body
+        .strip_suffix('!')
+        .filter(|v| !v.ends_with(char::is_whitespace))
+    {
+        Some(v) => (v, true),
         None => (body, false),
     };
     let cmds = match verb {
@@ -646,9 +652,16 @@ fn split_substitute(after_s: &str, delim: char) -> (String, String, String) {
 }
 
 /// Minimal common-prefix/suffix diff of two strings into a single char-indexed
-/// [`EditOp`]. `None` when they are equal. Adequate because each keystroke
-/// produces a single contiguous change; multi-site edits (macros) would need a
-/// richer diff — noted for later.
+/// [`EditOp`]. `None` when they are equal.
+///
+/// Exact for a single contiguous change (every keystroke). A **multi-site**
+/// change — a global `:%s/…/…/g`, or a future macro — collapses to ONE op
+/// spanning first-changed to last-changed: the replacement text is correct
+/// (re-inserting the unchanged middle verbatim), but the op is as large as that
+/// span, not the edits. Fine under the single-writer session lock (the block
+/// ends up right); the caveats are journal size and that a *concurrent* peer
+/// edit inside the spanned-but-unchanged region would be clobbered on mirror. A
+/// true multi-op diff is the fix if/when concurrent same-block editing lands.
 fn diff_op(before: &str, after: &str) -> Option<EditOp> {
     if before == after {
         return None;
@@ -871,6 +884,26 @@ mod tests {
                 CommandRequest::Write { force: true },
                 CommandRequest::Quit { force: true }
             ],
+        );
+    }
+
+    #[test]
+    fn space_before_bang_is_not_a_silent_force() {
+        // `:w!` forces; `:w !` (space-bang) must NOT silently force — it fails
+        // loud as an unknown verb (vim's `:w !cmd` pipe isn't ours).
+        let mut ed = EditorCore::new("hi");
+        ed.apply_keys(":w!<CR>");
+        assert_eq!(
+            commands(&mut ed),
+            vec![CommandRequest::Write { force: true }],
+            ":w! is a forced write"
+        );
+
+        let mut ed = EditorCore::new("hi");
+        ed.apply_keys(":w !<CR>");
+        assert!(
+            ed.take_commands().expect("submit").is_err(),
+            ":w ! is not a silent force-write"
         );
     }
 
