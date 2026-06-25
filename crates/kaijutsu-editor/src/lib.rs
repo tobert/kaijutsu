@@ -79,6 +79,19 @@ pub enum CommandRequest {
     Quit { force: bool },
 }
 
+/// An **async** I/O intent the editor surfaced (`:r`) — content the kernel must
+/// fetch (it owns the VFS / `EmbeddedKaish`; `kaijutsu-editor` is pure), then
+/// feed back via [`insert_at_cursor`](EditorCore::insert_at_cursor). Surfaced
+/// via [`take_io`](EditorCore::take_io). The kernel awaits the fetch *outside*
+/// the session lock, so `EditorCore` never crosses the await.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EditorIo {
+    /// `:r <path>` — read the file's contents and insert at the cursor.
+    ReadFile(String),
+    /// `:r !cmd` — run the command and insert its stdout at the cursor.
+    ReadShell(String),
+}
+
 /// A pure vi editor over one text buffer.
 pub struct EditorCore {
     machine: VimMachine<TerminalKey, EmptyInfo>,
@@ -112,6 +125,11 @@ pub struct EditorCore {
     /// per-keystroke diff turns it into [`EditOp`]s the kernel mirrors (unlike
     /// `:w`/`:q`, substitute is an *edit*, not a session-lifecycle command).
     pending_substitution: Option<Substitution>,
+    /// A `:r` read intent submitted during the current `apply_keys`. Unlike
+    /// substitute, it can't be fulfilled here (async VFS/kaish I/O) — the kernel
+    /// takes it via [`take_io`](EditorCore::take_io), fetches, and calls
+    /// [`insert_at_cursor`](EditorCore::insert_at_cursor).
+    pending_io: Option<EditorIo>,
 }
 
 impl EditorCore {
@@ -142,6 +160,7 @@ impl EditorCore {
             pending_close: None,
             pending_commands: None,
             pending_substitution: None,
+            pending_io: None,
         }
     }
 
@@ -159,6 +178,36 @@ impl EditorCore {
     /// "Not an editor command"). Consumed like [`take_close`](Self::take_close).
     pub fn take_commands(&mut self) -> Option<Result<Vec<CommandRequest>, String>> {
         self.pending_commands.take()
+    }
+
+    /// Take any `:r` read intent the last `apply_keys` submitted. The kernel
+    /// fetches the content (VFS / kaish) and feeds it back via
+    /// [`insert_at_cursor`](Self::insert_at_cursor).
+    pub fn take_io(&mut self) -> Option<EditorIo> {
+        self.pending_io.take()
+    }
+
+    /// Insert `text` at the leader cursor, returning the char-indexed
+    /// [`EditOp`]s for the kernel to mirror onto the CRDT block. The cursor ends
+    /// just past the inserted text. Used by the kernel to complete a `:r` after
+    /// the async fetch. `set_text` resets undo (a bulk paste is disruptive
+    /// anyway — same trade-off as `:s`).
+    pub fn insert_at_cursor(&mut self, text: &str) -> Vec<EditOp> {
+        if text.is_empty() {
+            return Vec::new();
+        }
+        let before = self.text();
+        let cursor = self.cursor();
+        let mut chars: Vec<char> = before.chars().collect();
+        let at = cursor.min(chars.len());
+        let inserted: Vec<char> = text.chars().collect();
+        let inserted_len = inserted.len();
+        chars.splice(at..at, inserted);
+        let after: String = chars.into_iter().collect();
+        self.buffer.set_text(after.as_str());
+        let (line, col) = line_col(&after, at + inserted_len);
+        self.buffer.set_leader(self.group, Cursor::new(line, col));
+        diff_op(&before, &after).into_iter().collect()
     }
 
     /// The command line the renderer should draw, with its prefix — e.g.
@@ -237,6 +286,7 @@ impl EditorCore {
         self.pending_close = None;
         self.pending_commands = None;
         self.pending_substitution = None;
+        self.pending_io = None;
         for key in parse_keys(keys) {
             // Diff against the normalized (terminator-stripped) view so emitted
             // offsets are char-indexed into the logical content, matching the
@@ -268,6 +318,9 @@ impl EditorCore {
                             }
                             Ok(ParsedLine::Substitute(sub)) => {
                                 self.pending_substitution = Some(sub);
+                            }
+                            Ok(ParsedLine::Io(io)) => {
+                                self.pending_io = Some(io);
                             }
                             Ok(ParsedLine::Noop) => {}
                             Err(e) => self.pending_commands = Some(Err(e)),
@@ -350,6 +403,7 @@ fn strip_one_trailing_newline(s: &str) -> String {
 enum ParsedLine {
     Commands(Vec<CommandRequest>),
     Substitute(Substitution),
+    Io(EditorIo),
     Noop,
 }
 
@@ -376,6 +430,9 @@ fn parse_ex_command(body: &str) -> Result<ParsedLine, String> {
 
     if let Some(sub) = parse_substitute(body)? {
         return Ok(ParsedLine::Substitute(sub));
+    }
+    if let Some(io) = parse_read(body)? {
+        return Ok(ParsedLine::Io(io));
     }
 
     // A trailing `!` forces; strip it before matching the verb.
@@ -479,6 +536,53 @@ fn parse_substitute(body: &str) -> Result<Option<Substitution>, String> {
         range,
         global,
     }))
+}
+
+/// Recognize and parse a read line (`:r <file>`, `:r !cmd`, `:r!cmd`, and the
+/// `read` spellings). Returns `Ok(None)` when `body` isn't a read command (the
+/// caller falls through to the lifecycle verbs), `Ok(Some)` when it parses, and
+/// `Err` for a malformed read (`:r` with no argument) — fail loud.
+fn parse_read(body: &str) -> Result<Option<EditorIo>, String> {
+    // Strip the `read`/`r` verb. `read` is tried first so `readme` doesn't read
+    // as `r`+`eadme`; the remainder must then begin with whitespace or `!`
+    // (else it's a longer word like `readme`, not the read command).
+    let after = if let Some(a) = body.strip_prefix("read") {
+        a
+    } else if let Some(a) = body.strip_prefix('r') {
+        a
+    } else {
+        return Ok(None);
+    };
+
+    if let Some(cmd) = after.strip_prefix('!') {
+        return read_shell(cmd); // `:r!cmd`
+    }
+    let Some(arg) = after.strip_prefix(char::is_whitespace) else {
+        // `after` is empty (`:r`/`:read`) or a non-space continuation (`readme`).
+        return if after.is_empty() {
+            Err("'r' requires a file or !command".to_string())
+        } else {
+            Ok(None)
+        };
+    };
+    let arg = arg.trim();
+    if let Some(cmd) = arg.strip_prefix('!') {
+        read_shell(cmd)
+    } else if arg.is_empty() {
+        Err("'r' requires a file path".to_string())
+    } else {
+        Ok(Some(EditorIo::ReadFile(arg.to_string())))
+    }
+}
+
+/// Build a `:r !cmd` shell-read intent, erroring on an empty command.
+fn read_shell(cmd: &str) -> Result<Option<EditorIo>, String> {
+    let cmd = cmd.trim();
+    if cmd.is_empty() {
+        Err("'r !' requires a command".to_string())
+    } else {
+        Ok(Some(EditorIo::ReadShell(cmd.to_string())))
+    }
 }
 
 /// Split a leading line-range off a command body, returning the range and the
@@ -1000,6 +1104,89 @@ mod tests {
                 split_substitute("/a\\/\\w/b/", '/'),
                 ("a/\\w".into(), "b".into(), String::new())
             );
+        }
+    }
+
+    // ── Read (`:r`) — the intent + the kernel-fed insertion ──────────────────
+    //
+    // `:r` is async (the kernel fetches), so EditorCore only emits the intent;
+    // `insert_at_cursor` is the pure half the kernel calls after the fetch.
+
+    mod read {
+        use super::*;
+
+        fn io(keys: &str) -> EditorIo {
+            let mut ed = EditorCore::new("hello");
+            ed.apply_keys(keys);
+            ed.take_io().expect("a read intent was submitted")
+        }
+
+        #[test]
+        fn r_file_emits_read_file() {
+            assert_eq!(io(":r notes.txt<CR>"), EditorIo::ReadFile("notes.txt".into()));
+            assert_eq!(io(":read notes.txt<CR>"), EditorIo::ReadFile("notes.txt".into()));
+        }
+
+        #[test]
+        fn r_bang_emits_read_shell() {
+            assert_eq!(io(":r !date<CR>"), EditorIo::ReadShell("date".into()));
+            assert_eq!(io(":r!date<CR>"), EditorIo::ReadShell("date".into()));
+            assert_eq!(io(":read !ls -la<CR>"), EditorIo::ReadShell("ls -la".into()));
+        }
+
+        #[test]
+        fn read_command_does_not_edit_the_buffer_itself() {
+            // The intent is emitted; the buffer only changes when the kernel
+            // calls insert_at_cursor with the fetched content.
+            let mut ed = EditorCore::new("hello");
+            let ops = ed.apply_keys(":r foo.txt<CR>");
+            assert_eq!(ed.text(), "hello", "no edit until the kernel feeds content");
+            assert!(ops.is_empty());
+            assert!(ed.take_io().is_some());
+        }
+
+        #[test]
+        fn bare_r_requires_an_argument() {
+            let mut ed = EditorCore::new("hello");
+            ed.apply_keys(":r<CR>");
+            assert!(ed.take_io().is_none(), "no intent for a bare :r");
+            assert!(
+                ed.take_commands().expect("submit").is_err(),
+                "bare :r fails loud (requires an arg)"
+            );
+        }
+
+        #[test]
+        fn readme_is_not_a_read_command() {
+            // `readme` starts with `read` but isn't the verb — must not parse as
+            // a read; falls through to the unknown-command error.
+            assert!(parse_read("readme").unwrap().is_none());
+        }
+
+        #[test]
+        fn insert_at_cursor_splices_and_emits_one_op() {
+            let mut ed = EditorCore::new("hello");
+            ed.apply_keys("ll"); // cursor at offset 2
+            let ops = ed.insert_at_cursor("XYZ");
+            assert_eq!(ed.text(), "heXYZllo");
+            assert_eq!(ops, vec![EditOp { offset: 2, insert: "XYZ".into(), delete: 0 }]);
+            assert_eq!(ed.cursor(), 5, "cursor lands just past the insertion");
+        }
+
+        #[test]
+        fn insert_at_cursor_handles_multiline_content() {
+            let mut ed = EditorCore::new("ab");
+            ed.apply_keys("l"); // offset 1
+            let ops = ed.insert_at_cursor("X\nY");
+            assert_eq!(ed.text(), "aX\nYb");
+            assert_eq!(ops, vec![EditOp { offset: 1, insert: "X\nY".into(), delete: 0 }]);
+        }
+
+        #[test]
+        fn insert_empty_is_a_noop() {
+            let mut ed = EditorCore::new("hello");
+            assert!(ed.insert_at_cursor("").is_empty());
+            assert_eq!(ed.text(), "hello");
         }
     }
 

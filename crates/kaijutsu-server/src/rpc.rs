@@ -2634,21 +2634,24 @@ impl kernel::Server for KernelImpl {
         mut results: kernel::EditorKeysResults,
     ) -> Promise<(), capnp::Error> {
         let p = pry!(params.get());
-        let _guard = extract_rpc_trace(p.get_trace(), "editor_keys").entered();
+        let span = extract_rpc_trace(p.get_trace(), "editor_keys");
         let session_id = p.get_session_id();
         let keys = pry!(pry!(p.get_keys()).to_str()).to_owned();
         let id = kaijutsu_kernel::editor::EditorSessionId::from_u64(session_id);
-        match self
-            .kernel
-            .kernel
-            .editor_keys(id, &keys, &self.kernel.documents)
-        {
-            Ok(state) => {
-                set_editor_state(results.get().init_state(), session_id, &state);
-                Promise::ok(())
+        let kernel = self.kernel.clone();
+        // `editor_keys` is async now (a `:r` read awaits a VFS/kaish fetch).
+        Promise::from_future(
+            async move {
+                match kernel.kernel.editor_keys(id, &keys, &kernel.documents).await {
+                    Ok(state) => {
+                        set_editor_state(results.get().init_state(), session_id, &state);
+                        Ok(())
+                    }
+                    Err(e) => Err(capnp::Error::failed(format!("editor_keys failed: {e}"))),
+                }
             }
-            Err(e) => Promise::err(capnp::Error::failed(format!("editor_keys failed: {e}"))),
-        }
+            .instrument(span),
+        )
     }
 
     fn editor_state(

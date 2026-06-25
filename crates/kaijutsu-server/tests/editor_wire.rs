@@ -268,6 +268,39 @@ fn colon_substitute_edits_the_block_over_the_wire() {
 }
 
 #[test]
+fn colon_r_reads_a_file_into_the_buffer_over_the_wire() {
+    // Slice 3: `:r <file>` fetches content (VFS) inside the now-async editor_keys
+    // and splices it at the cursor. Read the editor's own seeded file into itself
+    // at the top — the buffer grows and still contains the original content.
+    run_local(async {
+        let addr = start_server().await;
+        let client = connect_client(addr).await;
+        let (kernel, _) = client.bind_kernel().await.unwrap();
+
+        let opened = kernel.editor_open(RC_PATH).await.unwrap();
+        let session = opened.session;
+        let original = opened.text.clone();
+        assert!(!original.is_empty());
+
+        // Cursor opens at the top; `:r` splices the file's content before it.
+        let after = kernel
+            .editor_keys(session, &format!(":r {RC_PATH}<CR>"))
+            .await
+            .unwrap();
+        assert!(
+            after.text.len() > original.len(),
+            "`:r` grew the buffer with the file's content"
+        );
+        assert!(after.text.contains(original.trim()), "the original content survives");
+        assert!(after.dirty, "`:r` dirties the buffer");
+        assert_eq!(after.command_line, None, "the bar closed after submit");
+
+        // Discard so the seeded rc isn't left mutated (ephemeral server anyway).
+        kernel.editor_keys(session, ":q!<CR>").await.unwrap();
+    });
+}
+
+#[test]
 fn vi_over_the_shell_signals_the_app_peer_to_open_a_renderer() {
     // The `open_editor` peer signal (vi.md step 2): a human's `vi <path>` in the
     // app shell must nudge the submitter's app windows to pop a renderer. We

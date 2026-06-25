@@ -120,7 +120,7 @@ pub async fn resolve_editor_target(
 
 use std::collections::HashMap;
 
-use kaijutsu_editor::{CloseRequest, CommandRequest, EditorCore};
+use kaijutsu_editor::{CloseRequest, CommandRequest, EditorCore, EditorIo};
 
 /// The result of feeding a key batch to a session via [`EditorSessions::keys`].
 #[derive(Debug)]
@@ -407,6 +407,40 @@ impl EditorSessions {
             }
         }
         changed
+    }
+
+    /// Take any `:r` read intent the last [`keys`](Self::keys) batch surfaced on
+    /// a session (the kernel fulfills it asynchronously — fetch, then
+    /// [`insert_text`](Self::insert_text)). `None` if no such session or no
+    /// intent.
+    pub fn take_io(&mut self, id: EditorSessionId) -> Option<EditorIo> {
+        self.sessions.get_mut(&id)?.core.take_io()
+    }
+
+    /// Insert kernel-fetched `text` at the session's cursor (completing a `:r`),
+    /// mirror the produced ops onto the owning CRDT block, and return the new
+    /// state. Fails loud if the mirror write fails.
+    pub fn insert_text(
+        &mut self,
+        id: EditorSessionId,
+        text: &str,
+        blocks: &SharedBlockStore,
+    ) -> Result<EditorState, String> {
+        let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
+        let ops = session.core.insert_at_cursor(text);
+        for op in &ops {
+            blocks
+                .edit_text(
+                    session.target.context_id,
+                    &session.target.block_id,
+                    op.offset,
+                    &op.insert,
+                    op.delete,
+                )
+                .map_err(|e| format!("editor :r: CRDT mirror failed: {e}"))?;
+        }
+        let saved = session.saved_content.clone();
+        Ok(state_of(&mut session.core, &saved))
     }
 
     /// Current state of a session.

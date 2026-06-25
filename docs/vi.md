@@ -643,9 +643,9 @@ contract as buffer/cursor today, no app mode tracking).
      SUBSTITUTED/` rendered in the app; `:q!` restored the block.
    - **Deferred:** bare `:s` (repeat-last) errors for now; `.`/`$` ranges;
      `&`/`~` repeat; substitute undo granularity.
-3. `:r <file>` / `:r !cmd` (read-into-buffer) **+ Ctrl+Z-suspend / `fg`-resume**
-   (job-control escape to the shell). **`:!` dropped** — see "Step 3 design"
-   below. Design locked 2026-06-25; building now.
+3. ✅ **`:r <file>` SHIPPED (2026-06-25).** `:r !cmd` fail-loud-deferred;
+   Ctrl+Z-suspend / `fg`-resume still to build. **`:!` dropped** — see "Step 3
+   design" below.
 4. `:e` if/when wanted.
 
 ### Step 3 design — `:r` + Ctrl+Z/`fg` (locked 2026-06-25; `:!` dropped)
@@ -662,9 +662,12 @@ back. (`:%!filter` buffer-through-command is also out of scope; the shell filter
 
 **What ships:**
 
-1. **`:r <file>` / `:r !cmd`** — slurp a file's contents (VFS) or a command's
-   stdout (kaish) into the buffer **at the cursor**. The one real cost: these are
-   the first **async** intents, so **`Kernel::editor_keys` becomes `async`**:
+1. **`:r <file>`** ✅ SHIPPED (2026-06-25); **`:r !cmd`** fail-loud-deferred
+   (needs a kernel kaish-exec helper via `kj_dispatcher.materialize_context_kaish`
+   + the opener's context threaded onto the session — `:r !cmd` errors clearly
+   meanwhile, pointing at Ctrl+Z). `:r <file>` reads via `FileDocumentCache::
+   read_content` and splices **at the cursor**. The one real cost paid: these are
+   the first **async** intents, so **`Kernel::editor_keys` is now `async`**:
    sync-lock { apply_keys, mirror, `take_io`/`take_close`/`take_commands` } →
    release → **await** the fetch (VFS `FileDocumentCache::get_or_load` for a file;
    the session-context's `EmbeddedKaish` for `!cmd`) → sync-lock {

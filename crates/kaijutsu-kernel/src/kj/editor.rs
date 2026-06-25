@@ -98,7 +98,7 @@ impl KjDispatcher {
             },
             EditorCommand::Keys { session, keys } => {
                 let id = EditorSessionId::from_u64(session);
-                match kernel.editor_keys(id, &keys, blocks) {
+                match kernel.editor_keys(id, &keys, blocks).await {
                     Ok(st) => KjResult::ok_with_data(
                         format!(
                             "session {session}: {} mode, {} chars",

@@ -870,20 +870,45 @@ impl Kernel {
     /// this session updates. A `ZZ`/`ZQ` in the batch saves/discards and closes
     /// the session (modalkit disambiguates it from an inserted `ZZ`), publishing
     /// `Closed` instead — so a key forwarder never needs to detect quit itself.
-    pub fn editor_keys(
+    pub async fn editor_keys(
         &self,
         id: crate::editor::EditorSessionId,
         keys: &str,
         blocks: &crate::block_store::SharedBlockStore,
     ) -> Result<crate::editor::EditorState, String> {
         // Capture the path and feed the keys under one lock — a ZZ/ZQ in the
-        // batch drops the session, so the path must be read first.
-        let (path, outcome) = {
+        // batch drops the session, so the path must be read first. A `:r` read
+        // intent is taken here too (only when the session is still open), then
+        // fulfilled below: the async fetch happens *outside* the lock, so the
+        // `!Send` `EditorCore` never crosses an await (the `SendSessions`
+        // invariant); only the fetched `String` does.
+        let (path, outcome, io) = {
             let mut sessions = self.editor_sessions.lock();
             let path = sessions.0.session_path(id);
             let outcome = sessions.0.keys(id, keys, blocks)?;
-            (path, outcome)
+            let io = if matches!(outcome, crate::editor::KeysOutcome::Updated(_)) {
+                sessions.0.take_io(id)
+            } else {
+                None
+            };
+            (path, outcome, io)
         };
+
+        // Fulfill a `:r` read: fetch the content, then splice it at the cursor.
+        if let Some(io) = io {
+            let content = self.fetch_editor_io(io, blocks).await?;
+            let state = {
+                let mut sessions = self.editor_sessions.lock();
+                sessions.0.insert_text(id, &content, blocks)?
+            };
+            // The block changed; drop the file-cache shadow of the *edited* path.
+            if let Some(path) = path.as_deref() {
+                self.invalidate_config_file_cache(path);
+            }
+            self.publish_editor_state(id, &state);
+            return Ok(state);
+        }
+
         // The mirror (and any ZZ/ZQ rollback) wrote the block; drop the file
         // cache's now-stale shadow so a kaish `cat` re-reads fresh.
         if let Some(path) = path.as_deref() {
@@ -900,6 +925,27 @@ impl Kernel {
                 });
                 Ok(state)
             }
+        }
+    }
+
+    /// Fetch the content for a `:r` read intent. `:r <file>` reads through the
+    /// shared `FileDocumentCache` (the same source the editor and file tools
+    /// use). `:r !cmd` (shell-read) is **not yet implemented** — it needs the
+    /// opener's context threaded onto the session + a kernel kaish-exec helper
+    /// (`kj_dispatcher.materialize_context_kaish`); fail loud meanwhile, pointing
+    /// at the shell (Ctrl+Z) which already does this.
+    async fn fetch_editor_io(
+        &self,
+        io: kaijutsu_editor::EditorIo,
+        blocks: &crate::block_store::SharedBlockStore,
+    ) -> Result<String, String> {
+        match io {
+            kaijutsu_editor::EditorIo::ReadFile(path) => {
+                self.file_cache(blocks).read_content(&path).await
+            }
+            kaijutsu_editor::EditorIo::ReadShell(cmd) => Err(format!(
+                "editor: ':r !{cmd}' is not yet implemented — use Ctrl+Z to the shell"
+            )),
         }
     }
 
@@ -1476,14 +1522,14 @@ mod tests {
         // Open → type → state reflects, all through the kernel surface.
         let (id, st) = kernel.editor_open(path, &blocks).await.unwrap();
         assert_eq!(st.text, "hello");
-        let st = kernel.editor_keys(id, "iX<Esc>", &blocks).unwrap();
+        let st = kernel.editor_keys(id, "iX<Esc>", &blocks).await.unwrap();
         assert_eq!(st.text, "Xhello");
         assert!(st.dirty);
         assert_eq!(kernel.editor_state(id).unwrap().text, "Xhello");
 
         // ZQ rolls the block back and closes the session.
         kernel.editor_quit(id, &blocks).unwrap();
-        let err = kernel.editor_keys(id, "x", &blocks).unwrap_err();
+        let err = kernel.editor_keys(id, "x", &blocks).await.unwrap_err();
         assert!(err.contains("no such session"), "got: {err}");
     }
 
@@ -1544,7 +1590,7 @@ mod tests {
 
         // Edit the config block through the editor (insert X at the front).
         let (id, _) = kernel.editor_open(path, &blocks).await.unwrap();
-        kernel.editor_keys(id, "iX<Esc>", &blocks).unwrap();
+        kernel.editor_keys(id, "iX<Esc>", &blocks).await.unwrap();
 
         // The next read must reflect the edit — proving the shadow was dropped and
         // reloaded, not re-served stale. (With a plain cache-entry invalidate the
@@ -1555,6 +1601,93 @@ mod tests {
             "Xhello",
             "kaish read sees the editor's edit after invalidation"
         );
+    }
+
+    #[tokio::test]
+    async fn editor_colon_r_reads_a_file_into_the_buffer() {
+        // `:r <file>` slurps a file's contents at the cursor — the async fetch
+        // (read_content via the FileDocumentCache) happens inside Kernel::editor_keys
+        // *outside* the session lock; the result mirrors onto the editor's block.
+        use crate::block_store::shared_block_store_with_db;
+        use crate::file_tools::FileDocumentCache;
+        use crate::kernel_db::KernelDb;
+        use crate::runtime::config_crdt_fs::ConfigCrdtFs;
+        use crate::vfs::VfsOps as _;
+        use kaijutsu_crdt::PrincipalId;
+        use std::path::Path;
+
+        let kernel = Kernel::new_ephemeral("test").await;
+        let creator = PrincipalId::system();
+        let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+        let ws = db.lock().get_or_create_default_workspace(creator).unwrap();
+        let blocks = shared_block_store_with_db(db, ws, creator);
+
+        kernel
+            .mount("/etc/rc", ConfigCrdtFs::new(blocks.clone(), "/etc/rc"))
+            .await;
+        let rc = ConfigCrdtFs::new(blocks.clone(), "/etc/rc");
+        // The block we'll edit, and a separate file we'll read into it.
+        rc.write_all(Path::new("coder/create/S00.kai"), b"AB")
+            .await
+            .unwrap();
+        rc.write_all(Path::new("coder/create/snippet.kai"), b"INSERTED")
+            .await
+            .unwrap();
+        let edit_path = "/etc/rc/coder/create/S00.kai";
+        let read_path = "/etc/rc/coder/create/snippet.kai";
+
+        let cache = Arc::new(FileDocumentCache::new(blocks.clone(), kernel.vfs().clone()));
+        assert!(kernel.set_file_cache(cache.clone()));
+
+        let (id, st) = kernel.editor_open(edit_path, &blocks).await.unwrap();
+        assert_eq!(st.text, "AB");
+
+        // Move the cursor one char right (between A and B), then `:r` the file.
+        kernel.editor_keys(id, "l", &blocks).await.unwrap();
+        let after = kernel
+            .editor_keys(id, &format!(":r {read_path}<CR>"), &blocks)
+            .await
+            .unwrap();
+        assert_eq!(after.text, "AINSERTEDB", "file content spliced at the cursor");
+        assert!(after.dirty, ":r dirties the buffer");
+    }
+
+    #[tokio::test]
+    async fn editor_colon_r_shell_fails_loud_for_now() {
+        // `:r !cmd` isn't wired yet (needs a kernel kaish-exec helper + opener
+        // context) — it must fail loud, never silently no-op.
+        use crate::block_store::shared_block_store_with_db;
+        use crate::file_tools::FileDocumentCache;
+        use crate::kernel_db::KernelDb;
+        use crate::runtime::config_crdt_fs::ConfigCrdtFs;
+        use crate::vfs::VfsOps as _;
+        use kaijutsu_crdt::PrincipalId;
+        use std::path::Path;
+
+        let kernel = Kernel::new_ephemeral("test").await;
+        let creator = PrincipalId::system();
+        let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+        let ws = db.lock().get_or_create_default_workspace(creator).unwrap();
+        let blocks = shared_block_store_with_db(db, ws, creator);
+        kernel
+            .mount("/etc/rc", ConfigCrdtFs::new(blocks.clone(), "/etc/rc"))
+            .await;
+        ConfigCrdtFs::new(blocks.clone(), "/etc/rc")
+            .write_all(Path::new("coder/create/S00.kai"), b"hi")
+            .await
+            .unwrap();
+        let cache = Arc::new(FileDocumentCache::new(blocks.clone(), kernel.vfs().clone()));
+        kernel.set_file_cache(cache);
+
+        let (id, _) = kernel
+            .editor_open("/etc/rc/coder/create/S00.kai", &blocks)
+            .await
+            .unwrap();
+        let err = kernel
+            .editor_keys(id, ":r !date<CR>", &blocks)
+            .await
+            .unwrap_err();
+        assert!(err.contains("not yet implemented"), "got: {err}");
     }
 
     #[tokio::test]
