@@ -54,10 +54,15 @@ pub struct FileAttr {
     /// to a path yields a `generation` greater than the prior one, even when two
     /// writes land within a single `mtime` resolution. The file cache compares
     /// this (not `mtime`) to detect external edits, and an SFTP `OPEN` captures
-    /// it to re-verify on `WRITE` (TOCTOU guard). Per-path monotone within one
-    /// backend; values are NOT comparable across backends or paths. `0` means
-    /// "unknown / never observed a write" — host-backed files derive it from
-    /// mtime, CRDT/memory backends source it from a monotonic counter.
+    /// it to re-verify on `WRITE` (TOCTOU guard). Values are NOT comparable
+    /// across backends or paths. `0` means "unknown / never observed a write".
+    ///
+    /// Monotonicity is backend-dependent: CRDT and memory backends source it
+    /// from a per-backend monotonic counter and are **strictly** advancing on
+    /// every content mutation. Host-backed files (`LocalBackend`) derive it from
+    /// mtime-nanos, so it advances with normal external edits but can *step
+    /// backward* if a file's mtime is moved backward (`touch -t`, a restore) —
+    /// the same staleness blind spot the prior mtime comparison had, no worse.
     #[serde(default)]
     pub generation: u64,
     /// Last access time (optional).

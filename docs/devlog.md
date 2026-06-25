@@ -30,14 +30,26 @@ than clamping wall-clock to monotone, or mapping a logical version into a
 `generation: u64`: `ConfigCrdtFs`/`MemoryBackend` source it from a monotonic
 per-backend counter bumped on every content mutation; `LocalBackend` derives it
 from host mtime-nanos. The cache compares generation (`loaded_generation`, the
-`d > l` check), not mtime. `setattr(mtime)` is now honored for display but
-deliberately does not bump generation, so `cp -p`/`touch -d`/rsync no longer
-silently lose mtime *and* a pure attribute touch never triggers a reload. The
-`UNIX_EPOCH` default is replaced by a real backend-creation timestamp. The same
-generation is what a future SFTP `OPEN` will capture for its TOCTOU re-verify —
-handle guard and cache share one primitive. TDD: same-instant strict-advance
-tests on both CRDT and memory backends, plus epoch-default and
-display-only-setattr regressions; full workspace green.
+`d > l` check), not mtime. `setattr(mtime)` is now honored for display on the
+CRDT and memory backends but deliberately does not bump generation, so `cp -p`
+/ `touch -d` / rsync stop silently losing mtime there *and* a pure attribute
+touch never triggers a reload. (`LocalBackend::setattr` mtime is still a no-op —
+a pre-existing item in `issues.md`, untouched here.) The `UNIX_EPOCH` default is
+replaced by a real backend-creation timestamp. The same generation is what a
+future SFTP `OPEN` will capture for its TOCTOU re-verify — handle guard and
+cache share one primitive.
+
+A follow-up kaibo review pass (deepseek + chimera) then caught three real
+defects in the first cut, fixed the same day: a `ConfigCrdtFs::bump()`
+fetch-then-insert race that could *reverse* generation under concurrent writers
+to one path (now a `max`-folded DashMap `entry`); `MemoryBackend::rename`
+carrying the source's stale generation to the destination, regressing it when
+overwriting a higher-generation target (now stamps a fresh generation on every
+moved entry); and a spurious generation bump when `setattr(size=…)` hit a
+directory/symlink where the resize was a no-op. TDD throughout: same-instant
+strict-advance tests on both CRDT and memory backends, a rename-no-regress
+regression, plus epoch-default and display-only-setattr regressions; full
+workspace green.
 
 ---
 

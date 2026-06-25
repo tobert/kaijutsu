@@ -392,7 +392,7 @@ impl VfsOps for MemoryBackend {
             .map_err(|_| VfsError::other("lock poisoned"))?;
 
         // Remove source entry
-        let entry = entries
+        let mut entry = entries
             .remove(&from_normalized)
             .ok_or_else(|| VfsError::not_found(Self::path_str(&from_normalized)))?;
 
@@ -405,15 +405,25 @@ impl VfsOps for MemoryBackend {
                 .collect();
 
             for child in children {
-                if let Some(child_entry) = entries.remove(&child) {
+                if let Some(mut child_entry) = entries.remove(&child) {
                     let relative = child.strip_prefix(&from_normalized).unwrap();
                     let new_path = to_normalized.join(relative);
+                    // A moved entry lands at a *new* path; from the cache's
+                    // per-path view that is fresh content, so it must carry a
+                    // fresh (strictly greater) generation. Without this, moving
+                    // over a destination that previously held a higher
+                    // generation would regress the stamp and a cache holding the
+                    // old destination would serve stale bytes.
+                    child_entry.attr_mut().generation = self.next_gen();
                     entries.insert(new_path, child_entry);
                 }
             }
         }
 
-        // Insert at new location (possibly overwriting)
+        // Insert at new location (possibly overwriting). Stamp a fresh
+        // generation so the destination path never regresses below a value a
+        // cache may already hold (see the child comment above).
+        entry.attr_mut().generation = self.next_gen();
         entries.insert(to_normalized, entry);
         Ok(())
     }
@@ -457,8 +467,10 @@ impl VfsOps for MemoryBackend {
         // A size change is a content mutation — bump the coherence stamp. A
         // pure mtime/perm/uid/gid setattr (e.g. `cp -p`, `touch -d`) is
         // display-only and deliberately does NOT advance generation, so it
-        // never triggers a needless cache reload.
-        let size_changed = set.size.is_some();
+        // never triggers a needless cache reload. `size_changed` is set only
+        // when the resize *actually applied* (a File): `setattr(size=…)` on a
+        // directory or symlink is a silent no-op and must not bump generation.
+        let mut size_changed = false;
 
         // Handle size change (requires access to data for files)
         if let Some(size) = set.size
@@ -466,6 +478,7 @@ impl VfsOps for MemoryBackend {
         {
             data.resize(size as usize, 0);
             attr.size = size;
+            size_changed = true;
         }
 
         // Handle other attribute changes
@@ -704,6 +717,32 @@ mod tests {
         let g2 = fs.getattr(Path::new("/f.txt")).await.unwrap().generation;
         assert_ne!(g1, 0, "a written file must carry a nonzero generation");
         assert!(g2 > g1, "generation must strictly advance: {g1} !< {g2}");
+    }
+
+    #[tokio::test]
+    async fn rename_over_higher_generation_destination_does_not_regress() {
+        // Regression (kaibo review): a moved entry kept its old generation, so
+        // renaming over a destination that had accumulated a higher generation
+        // would regress the stamp — a cache holding the old destination would
+        // then serve stale bytes.
+        let fs = MemoryBackend::new();
+        fs.write_all(Path::new("/src.txt"), b"s").await.unwrap();
+        let g_src = fs.getattr(Path::new("/src.txt")).await.unwrap().generation;
+
+        // Destination accumulates a strictly higher generation.
+        fs.write_all(Path::new("/dst.txt"), b"d1").await.unwrap();
+        fs.write_all(Path::new("/dst.txt"), b"d2").await.unwrap();
+        let g_dst = fs.getattr(Path::new("/dst.txt")).await.unwrap().generation;
+        assert!(g_dst > g_src, "precondition: dst gen {g_dst} > src gen {g_src}");
+
+        fs.rename(Path::new("/src.txt"), Path::new("/dst.txt"))
+            .await
+            .unwrap();
+        let g_after = fs.getattr(Path::new("/dst.txt")).await.unwrap().generation;
+        assert!(
+            g_after > g_dst,
+            "rename must stamp a fresh generation, not regress: {g_after} !> {g_dst}"
+        );
     }
 
     #[tokio::test]

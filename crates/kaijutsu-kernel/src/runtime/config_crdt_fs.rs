@@ -269,9 +269,21 @@ impl ConfigCrdtFs {
 
     /// Record a content mutation at `canonical`: advance the coherence
     /// generation (strictly, from `gen_clock`) and refresh the display mtime.
+    ///
+    /// The drawn value is folded in with `max`, not a blind `insert`: two
+    /// writers racing on the same path each draw a distinct `gen_clock` value,
+    /// but a bare fetch-then-insert could land them out of order and *reverse*
+    /// the stored stamp (writer A draws 5, B draws 6, B inserts 6, A clobbers
+    /// with 5). DashMap's `entry` lock serializes the read-modify-write per key,
+    /// so the higher draw always wins regardless of insert order — generation
+    /// never regresses. (A `getattr` between the draw and the store sees the
+    /// prior value or 0, never a regressed one — a transient that self-heals.)
     fn bump(&self, canonical: &str) {
         let g = self.gen_clock.fetch_add(1, Ordering::Relaxed) + 1;
-        self.generations.insert(canonical.to_string(), g);
+        self.generations
+            .entry(canonical.to_string())
+            .and_modify(|v| *v = (*v).max(g))
+            .or_insert(g);
         self.mtimes.insert(canonical.to_string(), SystemTime::now());
     }
 
