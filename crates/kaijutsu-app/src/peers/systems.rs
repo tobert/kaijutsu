@@ -92,6 +92,8 @@ fn dispatch_peer_action(
                 cursor: u64,
                 mode: Option<String>,
                 dirty: bool,
+                #[serde(default)]
+                command_line: Option<String>,
             }
             let p: Params =
                 serde_json::from_slice(params).map_err(|e| format!("invalid params: {e}"))?;
@@ -107,6 +109,7 @@ fn dispatch_peer_action(
                     cursor: p.cursor,
                     mode: p.mode,
                     dirty: p.dirty,
+                    command_line: p.command_line,
                 },
             });
 

@@ -17,7 +17,7 @@
 
 use editor_types::application::EmptyInfo;
 use editor_types::prelude::{CloseFlags, ViewportContext};
-use editor_types::{Action, WindowAction};
+use editor_types::{Action, CommandBarAction, PromptAction, WindowAction};
 
 use modalkit::actions::Editable;
 use modalkit::editing::buffer::{CursorGroupId, EditBuffer};
@@ -56,6 +56,29 @@ pub enum CloseRequest {
     Discard,
 }
 
+/// An ex-command (`:`-line) intent the editor surfaced — the command-mode
+/// sibling of [`CloseRequest`].
+///
+/// `kaijutsu-editor` is pure (no kernel, no RPC), so it parses the typed `:`
+/// command into *intents* and lets the kernel act on them (`Write` → checkpoint,
+/// `Quit` → drop/rollback) — exactly the [`take_close`](EditorCore::take_close)
+/// pattern, now for the command line. The kernel consumes a batch via
+/// [`take_commands`](EditorCore::take_commands).
+///
+/// Pass-1 dialect (`docs/vi.md` → *Command mode*): `:w :q :wq :q! :x :w!`.
+/// Substitute / shell / read / edit are later passes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommandRequest {
+    /// `:w` / `:w!` — checkpoint (save) the buffer; **stay open**. `force` (`!`)
+    /// is recorded for a future read-only / permission gate (rc/config has none
+    /// today), so it is presently a no-op distinction.
+    Write { force: bool },
+    /// `:q` / `:q!` — quit. `force` (`!`) discards changes since the last
+    /// checkpoint; without it a *dirty* buffer must refuse (vim's "No write
+    /// since last change"), which is the kernel's call to make.
+    Quit { force: bool },
+}
+
 /// A pure vi editor over one text buffer.
 pub struct EditorCore {
     machine: VimMachine<TerminalKey, EmptyInfo>,
@@ -64,13 +87,26 @@ pub struct EditorCore {
     group: CursorGroupId,
     viewport: ViewportContext<Cursor>,
     /// True while modalkit's command-line / search bar (`:`, `/`, `?`) is
-    /// focused. That bar is a *separate* buffer we don't implement; its edit
-    /// actions must not touch the document (else the query text leaks in). Set
-    /// on `CommandBar(Focus)`, cleared when the prompt submits/aborts.
-    command_line: bool,
+    /// focused. That bar is a *separate* buffer (`cmdline`); the document must
+    /// not see its keystrokes. Set on `CommandBar(Focus)`, cleared when the
+    /// prompt submits/aborts.
+    cmdline_active: bool,
+    /// The bar's prefix (`:` for ex-commands, `/`·`?` for search) — kept so the
+    /// renderer can draw the full line (`:wq`) and so submit knows which dialect
+    /// to parse.
+    cmdline_prefix: String,
+    /// The command-line text buffer modalkit's edit actions flow into while the
+    /// bar is focused — a real `EditBuffer`, so backspace / cursor motion work
+    /// like vim's `:`-line. Reset on each focus.
+    cmdline: EditBuffer<EmptyInfo>,
+    cmdline_group: CursorGroupId,
     /// A `ZZ`/`ZQ` close intent produced by the last `apply_keys`, awaiting the
     /// kernel to consume it via [`take_close`](EditorCore::take_close).
     pending_close: Option<CloseRequest>,
+    /// The outcome of a `:`-line submitted during the last `apply_keys`, awaiting
+    /// the kernel via [`take_commands`](EditorCore::take_commands). `None` if no
+    /// command was submitted; `Some(Err)` for an unknown command (fail loud).
+    pending_commands: Option<Result<Vec<CommandRequest>, String>>,
 }
 
 impl EditorCore {
@@ -85,14 +121,21 @@ impl EditorCore {
         let mut buffer = EditBuffer::<EmptyInfo>::from_str(String::new(), text);
         let group = buffer.create_group();
 
+        let mut cmdline = EditBuffer::<EmptyInfo>::from_str(String::new(), "");
+        let cmdline_group = cmdline.create_group();
+
         EditorCore {
             machine,
             buffer,
             store: Store::default(),
             group,
             viewport: ViewportContext::default(),
-            command_line: false,
+            cmdline_active: false,
+            cmdline_prefix: String::new(),
+            cmdline,
+            cmdline_group,
             pending_close: None,
+            pending_commands: None,
         }
     }
 
@@ -101,6 +144,31 @@ impl EditorCore {
     /// should be saved/discarded and dropped.
     pub fn take_close(&mut self) -> Option<CloseRequest> {
         self.pending_close.take()
+    }
+
+    /// Take any `:`-line command batch the most recent `apply_keys` submitted.
+    /// `None` if no command was entered; `Some(Ok(cmds))` for a parsed dialect
+    /// (possibly empty — a bare `:` or an unwired `/` search); `Some(Err(msg))`
+    /// for an unknown command, which the kernel surfaces (fail loud, vim's
+    /// "Not an editor command"). Consumed like [`take_close`](Self::take_close).
+    pub fn take_commands(&mut self) -> Option<Result<Vec<CommandRequest>, String>> {
+        self.pending_commands.take()
+    }
+
+    /// The command line the renderer should draw, with its prefix — e.g.
+    /// `Some(":wq")` while the user is typing an ex-command, `None` when the bar
+    /// is unfocused. The kernel surfaces this on `EditorState` so a renderer can
+    /// show the `:`-strip without tracking mode itself.
+    pub fn command_line(&self) -> Option<String> {
+        if self.cmdline_active {
+            Some(format!(
+                "{}{}",
+                self.cmdline_prefix,
+                strip_one_trailing_newline(&self.cmdline.get_text())
+            ))
+        } else {
+            None
+        }
     }
 
     /// The buffer text, with modalkit's guaranteed trailing newline normalized
@@ -158,9 +226,10 @@ impl EditorCore {
     /// that changed the buffer (no-op keystrokes emit nothing).
     pub fn apply_keys(&mut self, keys: &str) -> Vec<EditOp> {
         let mut ops = Vec::new();
-        // A fresh batch; any close intent from a prior batch was already
+        // A fresh batch; any close/command intent from a prior batch was already
         // consumed by the kernel (or is irrelevant — the session is still open).
         self.pending_close = None;
+        self.pending_commands = None;
         for key in parse_keys(keys) {
             // Diff against the normalized (terminator-stripped) view so emitted
             // offsets are char-indexed into the logical content, matching the
@@ -170,12 +239,36 @@ impl EditorCore {
             while let Some((action, ctx)) = self.machine.pop() {
                 match action {
                     // `:`/`/`/`?` focus the command-line/search bar — a separate
-                    // buffer we don't implement. Its subsequent edit actions are
-                    // meant for *that* buffer; applying them to the document is
-                    // the corruption bug. Suppress edits until the prompt closes.
-                    Action::CommandBar(_) => self.command_line = true,
-                    Action::Prompt(_) => self.command_line = false,
-                    Action::Editor(ea) if !self.command_line => {
+                    // `EditBuffer` (`cmdline`). Reset it and remember the prefix
+                    // so subsequent keystrokes type into it, not the document.
+                    Action::CommandBar(CommandBarAction::Focus(prefix, _ct, _act)) => {
+                        self.cmdline_active = true;
+                        self.cmdline_prefix = prefix;
+                        self.cmdline = EditBuffer::<EmptyInfo>::from_str(String::new(), "");
+                        self.cmdline_group = self.cmdline.create_group();
+                    }
+                    Action::CommandBar(CommandBarAction::Unfocus) => {
+                        self.cmdline_active = false;
+                    }
+                    // `<CR>` in the bar submits: parse the typed line for its
+                    // dialect into command intents the kernel will act on.
+                    Action::Prompt(PromptAction::Submit) if self.cmdline_active => {
+                        let body = strip_one_trailing_newline(&self.cmdline.get_text());
+                        self.pending_commands = Some(parse_command_line(&self.cmdline_prefix, &body));
+                        self.cmdline_active = false;
+                    }
+                    // `<Esc>` / `<C-C>` (Abort) and any other prompt action close
+                    // the bar without running anything.
+                    Action::Prompt(_) if self.cmdline_active => {
+                        self.cmdline_active = false;
+                    }
+                    // While the bar is focused, edits go to `cmdline` — real
+                    // command-line editing (insert, backspace, motion).
+                    Action::Editor(ea) if self.cmdline_active => {
+                        let ictx = (self.cmdline_group, &self.viewport, &ctx);
+                        let _ = self.cmdline.editor_command(&ea, &ictx, &mut self.store);
+                    }
+                    Action::Editor(ea) => {
                         let ictx = (self.group, &self.viewport, &ctx);
                         // Editing errors (e.g. motion off the end) are non-fatal
                         // vim behavior, not corruption — drop them, keep the buffer.
@@ -186,7 +279,7 @@ impl EditorCore {
                     // `ZZ` produces InsertText, not this). We have no windows —
                     // record the intent for the kernel. `WQ` = write+quit (`ZZ`);
                     // anything else here is force-quit (`ZQ` = `FQ`).
-                    Action::Window(WindowAction::Close(_, flags)) if !self.command_line => {
+                    Action::Window(WindowAction::Close(_, flags)) if !self.cmdline_active => {
                         self.pending_close = Some(if flags.contains(CloseFlags::WRITE) {
                             CloseRequest::Write
                         } else {
@@ -208,6 +301,40 @@ impl EditorCore {
 /// Remove at most one trailing `\n` (modalkit's guaranteed line terminator).
 fn strip_one_trailing_newline(s: &str) -> String {
     s.strip_suffix('\n').unwrap_or(s).to_string()
+}
+
+/// Parse a submitted command line into the [`CommandRequest`]s it expands to.
+/// `prefix` selects the dialect: `:` is the ex-command line (pass-1 below);
+/// `/`·`?` are search, **not wired yet** — a safe no-op so an accidental search
+/// never edits the document. `body` is the text after the prefix.
+fn parse_command_line(prefix: &str, body: &str) -> Result<Vec<CommandRequest>, String> {
+    if prefix.starts_with(':') {
+        parse_ex_command(body)
+    } else {
+        // `/`·`?` search — deferred (docs/vi.md). Submitting one does nothing.
+        Ok(Vec::new())
+    }
+}
+
+/// Parse the ex-command dialect (pass 1): `w q wq x exit` with an optional
+/// trailing `!` (force). A bare line (`:`<CR>) is a no-op; an unknown verb is a
+/// fail-loud error the kernel surfaces.
+fn parse_ex_command(body: &str) -> Result<Vec<CommandRequest>, String> {
+    use CommandRequest::{Quit, Write};
+    let body = body.trim();
+    // A trailing `!` forces; strip it before matching the verb.
+    let (verb, force) = match body.strip_suffix('!') {
+        Some(v) => (v.trim_end(), true),
+        None => (body, false),
+    };
+    match verb {
+        "" => Ok(Vec::new()),
+        "w" | "write" => Ok(vec![Write { force }]),
+        "q" | "quit" => Ok(vec![Quit { force }]),
+        "wq" => Ok(vec![Write { force }, Quit { force }]),
+        "x" | "xit" | "exit" => Ok(vec![Write { force }, Quit { force }]),
+        other => Err(format!("Not an editor command: :{other}")),
+    }
 }
 
 /// Minimal common-prefix/suffix diff of two strings into a single char-indexed
@@ -369,6 +496,129 @@ mod tests {
         ed.apply_keys("iZZ");
         assert_eq!(ed.text(), "ZZ");
         assert_eq!(ed.take_close(), None, "insert-mode ZZ is literal text");
+    }
+
+    // ── Command mode (`:` ex-line) ───────────────────────────────────────────
+    //
+    // The dialect is parsed in `kaijutsu-editor` (pure); the kernel acts on the
+    // emitted intents. These prove the parse + the cmdline-buffer capture without
+    // a kernel or GPU — the headless gate for Slice 3.
+
+    /// Drain a batch's command intents, asserting one was submitted and parsed.
+    fn commands(ed: &mut EditorCore) -> Vec<CommandRequest> {
+        ed.take_commands()
+            .expect("a command was submitted")
+            .expect("the command parsed")
+    }
+
+    #[test]
+    fn wq_writes_then_quits() {
+        let mut ed = EditorCore::new("hello");
+        ed.apply_keys(":wq<CR>");
+        assert_eq!(
+            commands(&mut ed),
+            vec![
+                CommandRequest::Write { force: false },
+                CommandRequest::Quit { force: false }
+            ],
+        );
+        // The buffer is untouched — `:wq` is intent, the kernel does the I/O.
+        assert_eq!(ed.text(), "hello");
+    }
+
+    #[test]
+    fn x_is_write_then_quit() {
+        let mut ed = EditorCore::new("hi");
+        ed.apply_keys(":x<CR>");
+        assert_eq!(
+            commands(&mut ed),
+            vec![
+                CommandRequest::Write { force: false },
+                CommandRequest::Quit { force: false }
+            ],
+        );
+    }
+
+    #[test]
+    fn bare_write_stays_open() {
+        let mut ed = EditorCore::new("hi");
+        ed.apply_keys(":w<CR>");
+        assert_eq!(commands(&mut ed), vec![CommandRequest::Write { force: false }]);
+    }
+
+    #[test]
+    fn bang_forces_quit() {
+        let mut ed = EditorCore::new("hi");
+        ed.apply_keys(":q!<CR>");
+        assert_eq!(commands(&mut ed), vec![CommandRequest::Quit { force: true }]);
+    }
+
+    #[test]
+    fn force_write_quit() {
+        let mut ed = EditorCore::new("hi");
+        ed.apply_keys(":wq!<CR>");
+        assert_eq!(
+            commands(&mut ed),
+            vec![
+                CommandRequest::Write { force: true },
+                CommandRequest::Quit { force: true }
+            ],
+        );
+    }
+
+    #[test]
+    fn unknown_command_is_a_fail_loud_error() {
+        let mut ed = EditorCore::new("hi");
+        ed.apply_keys(":frobnicate<CR>");
+        let outcome = ed.take_commands().expect("a command was submitted");
+        assert!(outcome.is_err(), "an unknown verb must surface an error");
+        // ...and it didn't touch the document.
+        assert_eq!(ed.text(), "hi");
+    }
+
+    #[test]
+    fn aborting_the_command_line_runs_nothing() {
+        let mut ed = EditorCore::new("hello");
+        ed.apply_keys(":wq<Esc>");
+        assert_eq!(ed.take_commands(), None, "Esc aborts — no command submitted");
+        assert_eq!(ed.text(), "hello");
+        // Editing resumes after the bar closes.
+        ed.apply_keys("x");
+        assert_eq!(ed.text(), "ello");
+    }
+
+    #[test]
+    fn command_line_text_is_visible_while_typing() {
+        // The renderer draws `command_line()`; it tracks the typed line.
+        let mut ed = EditorCore::new("hello");
+        assert_eq!(ed.command_line(), None, "no bar in normal mode");
+        ed.apply_keys(":w");
+        assert_eq!(ed.command_line().as_deref(), Some(":w"));
+        ed.apply_keys("q");
+        assert_eq!(ed.command_line().as_deref(), Some(":wq"));
+        // Submitting closes the bar.
+        ed.apply_keys("<CR>");
+        assert_eq!(ed.command_line(), None, "bar closes on submit");
+    }
+
+    #[test]
+    fn backspace_edits_the_command_line() {
+        // The cmdline is a real EditBuffer, so a typo is fixable.
+        let mut ed = EditorCore::new("hello");
+        ed.apply_keys(":wx<BS>q<CR>");
+        assert_eq!(commands(&mut ed), vec![
+            CommandRequest::Write { force: false },
+            CommandRequest::Quit { force: false },
+        ]);
+    }
+
+    #[test]
+    fn typed_colon_in_insert_mode_is_text_not_command() {
+        // A `:` in insert mode is literal — mode awareness lives in modalkit.
+        let mut ed = EditorCore::new("");
+        ed.apply_keys("ihttp://x<Esc>");
+        assert_eq!(ed.text(), "http://x");
+        assert_eq!(ed.take_commands(), None, "no command from an inserted colon");
     }
 
     #[test]

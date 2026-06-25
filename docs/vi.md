@@ -143,9 +143,11 @@ same surface is what a model plays.
 3. **Binding tightness: live keystroke sync.** `editor_keys` mirrors each edit to
    the CRDT immediately; remote ops merge back via `apply_remote_ops`. Fully
    collaborative; the rollback story keeps a clean `ZQ` possible.
-4. **Command line: keybind save/quit only** in pass 1 (`ZZ`/`ZQ`, Esc-Esc to
-   close). The `:` command bar is a later pass. (Multi-line *selection-highlight*
-   is **not** a punt — `Selection::geometry` gives it on the MSDF panel.)
+4. **Command line: keybind save/quit in pass 1** (`ZZ`/`ZQ`, Esc-Esc to close);
+   the `:` command bar is **Slice 3 — a distinct editor dialect, kernel-owned, not
+   kaish** (decided 2026-06-24, see *Command mode* below). (Multi-line
+   *selection-highlight* is **not** a punt — `Selection::geometry` gives it on the
+   MSDF panel.)
 5. **Rollback: inverse forward edit against a checkpoint** (see Rollback), now
    held in the session's `EditorCore`.
 6. **Surface: MSDF panel on `Screen::Editor`** (decided 2026-06-22), reusing the
@@ -516,6 +518,118 @@ finally has a renderer to target. Deferred items live in the tech-debt sweep abo
 
 ---
 
+## Command mode — the editor's `:` dialect (Slice 3, design 2026-06-24)
+
+Slices 1–2 made the editor a *pure key-forwarder*: the app ships every key, the
+kernel-owned `EditorCore` (modalkit) owns mode and buffer, and `ZZ`/`ZQ` are
+recognized **kernel-side** (the app never detects mode — step 5 proved app-side
+mode detection races the mode push, corrupting a block; signoff/devlog). Command
+mode extends that seam; it does **not** add an app input surface.
+
+### Two decisions (Amy, 2026-06-24)
+
+1. **Surface stays kernel-owned.** `:` and command mode live in `EditorCore`/
+   modalkit. The app keeps forwarding *every* key (it already forwards `:` — today
+   the kernel sets `command_line=true` and discards it). **Rejected: an app-side
+   `:` input surface** (a "vi-flavored shell dock"). It would reintroduce the
+   step-5 race (the app must detect "now in command-line mode" to capture locally),
+   split the editor's input ownership, and add a third compose surface
+   (`tech_debt_state_flags` already flags the duplication).
+2. **The dialect is its own thing, not kaish.** `:` is a **distinct editor
+   command dialect** (ex-flavored), *not* kaish-scoped-to-the-session (the earlier
+   "option B"). **`:!` is the bridge to kaish**, not the other way around: the
+   dialect emits a shell intent the *kernel* runs through `EmbeddedKaish` — kaish
+   never owns `:`. One language for the editor, a convenience escape to the shell.
+
+### Mechanism — modalkit `CommandMachine` + the intent pattern
+
+modalkit 0.0.25 ships a real command machine (`src/commands.rs`): a `Command`
+trait (primary `name()` + `aliases()`), trie dispatch, `complete_name`/
+`complete_aliases` completion, `CommandStep` (`Continue`/`Stop`/`Again` — commands
+can chain/expand), typed `CommandError` (`InvalidCommand`/`InvalidArgument`/
+`InvalidRange`/`ParseFailed`), and `ParsedCommand: FromStr` so **we own each
+command's grammar** while modalkit owns dispatch/aliasing/completion.
+
+Each command's `exec` emits a **`CommandRequest`** intent — `Write`, `Quit`,
+`Discard`, `Substitute{range, pat, rep, flags}`, `Shell(String)`, `Read(source)`,
+`Edit(path)` — that the kernel consumes. **This is the exact `CloseRequest` /
+`take_close()` pattern we already use for `ZZ`/`ZQ`:** `kaijutsu-editor` is pure
+(no kernel, no RPC), so it surfaces *intent*, and the kernel acts (`Write` →
+checkpoint, `Quit` → drop, `Shell(cmd)` → `EmbeddedKaish` in the session's
+context). Keeps the dialect **headless-TDD-able** in `kaijutsu-editor`:
+`apply_command(":wq")` → asserts `[Write, Quit]`, no GPU, no kernel — the test
+surface the directives want.
+
+**Rendering cost (not free):** modalkit owns the `:`-bar buffer and we currently
+*discard* it (`command_line=true` only guards the document). To render the strip
+and submit on `<CR>`, surface modalkit's command-bar text into a new
+`EditorState` command-line field → capnp bump (we're at @89), pushed over the
+existing `subscribeEditor` channel; the app renders it **read-only** (same
+contract as buffer/cursor today, no app mode tracking).
+
+### The dialect (Amy's set, 2026-06-24)
+
+- **Core (pass 1):** `:w :q :wq :q! :x :w!` — map to the existing
+  `editor_save`/`editor_quit` session verbs via the intents. Proves the intent
+  pipe end-to-end; ships the muscle-memory itch.
+- **Substitute:** `:s/old/new/` and `:%s/old/new/` (+ ranges). **Probe first
+  whether modalkit gives substitute for free** via its edit actions before
+  hand-rolling the parser; ranges lean on `CommandError::InvalidRange`.
+- **Shell convenience:** `:!cmd` (run, show), `:r <file>` (read file into buffer
+  at cursor), `:r !cmd` (read command *output* into buffer at cursor).
+  - **`:!cmd` output destination (Amy):** write output to a **temp file**, pop a
+    **new editor over it**, dismissed with `ZZ`/`:q`. *"Optimize more later."*
+    Architectural consequence to note: this implies **nested editor sessions / a
+    return stack** — the editor must open a second session and return to the first
+    on close. `:r !cmd` is the *other* path (output straight into the current
+    buffer at cursor, no popped editor).
+- **`:e <path>` — note the possibility, deferred.** Rebind the session to another
+  rc/config block without leaving the editor (reuses `resolve_editor_target` +
+  reopen). The command that turns this from "vim clone" into "the rc/config
+  editor's command line," but **can wait**.
+
+### Build order (test-first where headless)
+
+1. ✅ **SHIPPED + RUNNER-VERIFIED (2026-06-25).**
+   `CommandRequest` enum + command-line capture wired into `EditorCore`; the
+   `:`-line surfaces on `EditorState.command_line` (capnp `commandLine @5` + push).
+   **Core verbs** `w/q/wq/q!/x/w!`. **Mechanism note:** modalkit's *command
+   machine* was **not** adopted — its default set lacks `:wq`/`:x` and its
+   commands emit `Action`s that don't compose (one `exec` → one action, so `:wq`
+   can't be write+quit). The load-bearing decision was the **intent pattern**
+   (`CommandRequest` mirroring `CloseRequest`/`take_close()`), so instead:
+   modalkit owns the command-mode *keystroke plumbing* (`CommandBar(Focus)` →
+   type into a real cmdline `EditBuffer` → `Prompt(Submit)`), and we own the
+   grammar (`parse_ex_command`). `:s`/ranges/completion can lean on modalkit's
+   `CommandDescription`/`VimCommandMachine` later (step 2) if wanted.
+   - **`kaijutsu-editor`:** `CommandRequest::{Write{force},Quit{force}}`,
+     `take_commands()`, `command_line()`; the cmdline `EditBuffer` gives real
+     `:`-line editing (backspace/cursor). 11 unit tests.
+   - **kernel `editor.rs`:** `keys()` consumes `take_commands()` →
+     `run_commands()`; `:q` on a *dirty* buffer **refuses** (vim "No write since
+     last change"), `:q!` discards, `:wq`/`:x` save-then-close, `:w` saves+stays.
+     `EditorState.command_line` field. 6 session e2e tests.
+   - **wire:** capnp `commandLine @5`; server `set_editor_state`; client
+     `parse_editor_state` + `EditorState.command_line`; app peer `open_editor`
+     params. 1 new e2e in `editor_wire.rs` (`:wq` over the wire saves+closes; the
+     in-progress `:w` strip rides the state).
+   - **app render:** `view::editor::build_editor_surface` appends a `:`-strip
+     (same mono font, same MSDF surface, bottom of the page) when
+     `command_line.is_some()`. **Runner-verified live:** `vi` opens; `:write quit
+     demo` draws the strip; an unknown `:cmd` is fail-loud (session preserved);
+     `:q!` discards + closes + rolls the block back (no corruption) + pops to
+     conversation. `CMDLINE_BOTTOM_MARGIN` raised to clear the dock status row.
+   - **Render polish (deferred, not blocking):** a *long* document fills the page
+     and underlaps the floating strip — vim reserves the last row; we don't yet
+     shrink the doc layout to do so. And the strip floats above the dock rather
+     than integrating with its status row. Both are pass-2 cosmetics.
+2. `:s` / `:%s` (probe modalkit substitute first).
+3. `:!` (temp-file + nested editor — confronts the session-stack question) and
+   `:r` / `:r !` (read-into-buffer).
+4. `:e` if/when wanted.
+
+---
+
 ## Tech debt — sweep before "done"
 
 vi is not done until we circle back and clean up the scaffolding the build
@@ -555,6 +669,14 @@ working feature, but all of it blocks calling it finished**:
   our minimal modalkit setup (inert no-op). Wiring real `.` repeat needs
   modalkit's last-edit-sequence machinery; revisit when the `:`/search surface
   is built.
+- **`:w!` force is a no-op (Slice 3).** `CommandRequest::Write{force}` carries
+  the bang, but rc/config has no read-only/permission gate to override, so a
+  forced write == a write today. Wire `force` to a real gate when one exists.
+- **Bad `:cmd` errors the RPC instead of the `:` line (Slice 3).** An unknown
+  command makes `editor_keys` return `Err` (fail-loud, which the front door
+  surfaces). vim shows "E492: Not an editor command" on the `:` line and stays
+  put. Render the error on the strip (an `EditorState` message field) when the
+  `:`-line surface grows — for now, fail-loud is the right default.
 
 ### Command surface the e2e covers (verified)
 

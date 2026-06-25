@@ -189,6 +189,52 @@ fn a_peer_edit_reconciles_and_pushes_merged_state_to_a_sibling_session() {
 }
 
 #[test]
+fn colon_commands_save_and_close_over_the_wire() {
+    // Slice 3: the `:`-line dialect rides the existing `editorKeys` surface. A
+    // `:wq` keystroke stream must save the edit and close the session (pushing
+    // Closed), and the in-progress `:`-line must surface on `command_line` so a
+    // renderer can draw the strip without tracking mode.
+    run_local(async {
+        let addr = start_server().await;
+        let client = connect_client(addr).await;
+        let (kernel, _) = client.bind_kernel().await.unwrap();
+
+        let (callback, mut rx) = editor_events_channel(64);
+        kernel.subscribe_editor(callback).await.unwrap();
+
+        let opened = kernel.editor_open(RC_PATH).await.unwrap();
+        let session = opened.session;
+        let original = opened.text.clone();
+
+        // Edit, then type the `:`-line partially: the command line surfaces on
+        // the returned state (the strip a renderer draws).
+        kernel.editor_keys(session, "iZ<Esc>").await.unwrap();
+        let typing = kernel.editor_keys(session, ":w").await.unwrap();
+        assert_eq!(
+            typing.command_line.as_deref(),
+            Some(":w"),
+            "the in-progress :-line rides the state over the wire"
+        );
+
+        // Complete `:wq<CR>`: saves the edit and closes the session.
+        let _ = recv_state(&mut rx).await; // drain prior pushes opportunistically
+        kernel.editor_keys(session, "q<CR>").await.unwrap();
+        assert_eq!(recv_closed(&mut rx).await, session, ":wq pushes Closed");
+
+        // Re-open: `:wq` kept the inserted text (save+quit), unlike ZQ.
+        let reopened = kernel.editor_open(RC_PATH).await.unwrap();
+        assert_eq!(
+            reopened.text,
+            format!("Z{original}"),
+            ":wq persisted the edit on the block"
+        );
+        assert!(reopened.command_line.is_none(), "a fresh open has no :-line");
+        // Ephemeral server per test; just close the session cleanly (clean → :q).
+        kernel.editor_keys(reopened.session, ":q<CR>").await.unwrap();
+    });
+}
+
+#[test]
 fn vi_over_the_shell_signals_the_app_peer_to_open_a_renderer() {
     // The `open_editor` peer signal (vi.md step 2): a human's `vi <path>` in the
     // app shell must nudge the submitter's app windows to pop a renderer. We

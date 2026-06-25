@@ -365,6 +365,7 @@ struct EditorState {
   cursor @2 :UInt64;     # char offset of the cursor
   mode @3 :Text;         # vim mode label; "" = none/normal
   dirty @4 :Bool;        # buffer differs from the last open/save checkpoint
+  commandLine @5 :Text;  # the ":"-line while command mode is active (":wq"); "" = bar unfocused
 }
 
 # Callback for receiving editor-session state pushes (the in-app vi editor).

@@ -2790,6 +2790,9 @@ pub struct EditorState {
     pub cursor: u64,
     pub mode: Option<String>,
     pub dirty: bool,
+    /// The `:`-line a renderer draws while command mode is active (`":wq"`);
+    /// `None` when the bar is unfocused. (docs/vi.md → Command mode.)
+    pub command_line: Option<String>,
 }
 
 /// Parse a capnp `EditorState` reader into the client struct. Shared by the
@@ -2798,12 +2801,18 @@ pub(crate) fn parse_editor_state(
     r: crate::kaijutsu_capnp::editor_state::Reader<'_>,
 ) -> Result<EditorState, RpcError> {
     let mode = r.get_mode()?.to_string()?;
+    let command_line = r.get_command_line()?.to_string()?;
     Ok(EditorState {
         session: r.get_session(),
         text: r.get_text()?.to_string()?,
         cursor: r.get_cursor(),
         mode: if mode.is_empty() { None } else { Some(mode) },
         dirty: r.get_dirty(),
+        command_line: if command_line.is_empty() {
+            None
+        } else {
+            Some(command_line)
+        },
     })
 }
 

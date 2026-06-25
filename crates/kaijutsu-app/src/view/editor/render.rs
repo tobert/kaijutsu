@@ -31,6 +31,10 @@ const PAD: f32 = 28.0;
 /// Top inset, logical px — larger than `PAD` so the first line clears the
 /// top-left "会術 Kaijutsu" HUD title (which renders above the editor page).
 const TOP_MARGIN: f32 = 52.0;
+/// Top inset of the `:`-command strip from the page bottom, logical px — large
+/// enough to clear the dock's bottom status/hint row (which the editor screen
+/// still draws). Reserving a full status row for long docs is later polish.
+const CMDLINE_BOTTOM_MARGIN: f32 = 72.0;
 
 /// Full-window root that paints the dark editor page behind the text child.
 #[derive(Component)]
@@ -107,6 +111,9 @@ pub fn despawn_editor_panel(mut commands: Commands, roots: Query<Entity, With<Ed
 /// on a text/size change; recomputes cursor geometry on any change.
 pub fn build_editor_surface(
     active: Res<ActiveEditor>,
+    // Last-rendered `:`-line, so a strip change (typing, submit) rebuilds the
+    // glyphs even when the document text is unchanged.
+    mut last_cmdline: Local<Option<String>>,
     mut surfaces: Query<
         (
             &mut BlockScene,
@@ -146,13 +153,15 @@ pub fn build_editor_surface(
     let text = &view.state.text;
     let cursor_byte = char_to_byte(text, view.state.cursor as usize);
     let kind = mode_kind(view.state.mode.as_deref());
+    let cmdline = &view.state.command_line;
 
     let size_changed =
         (rtt.built_width - width).abs() > 1.0 || (rtt.built_height - height).abs() > 1.0;
     let text_changed = scene.text != *text;
     let cursor_changed = cursor_geom.last_cursor_offset != cursor_byte;
     let kind_changed = cursor_geom.kind != kind;
-    if !text_changed && !size_changed && !cursor_changed && !kind_changed {
+    let cmdline_changed = last_cmdline.as_ref() != cmdline.as_ref();
+    if !text_changed && !size_changed && !cursor_changed && !kind_changed && !cmdline_changed {
         return;
     }
 
@@ -169,7 +178,7 @@ pub fn build_editor_surface(
 
     let text_offset = (PAD as f64, TOP_MARGIN as f64);
 
-    if text_changed || size_changed {
+    if text_changed || size_changed || cmdline_changed {
         for line in layout.lines() {
             for item in line.items() {
                 if let parley::PositionedLayoutItem::GlyphRun(gr) = item {
@@ -177,7 +186,25 @@ pub fn build_editor_surface(
                 }
             }
         }
-        let g = collect_msdf_glyphs(&layout, &[], &style.brush, text_offset, atlas);
+        let mut g = collect_msdf_glyphs(&layout, &[], &style.brush, text_offset, atlas);
+
+        // The `:`-command strip (Slice 3): laid out with the same mono font and
+        // appended to the same glyph buffer near the page bottom — so the editor
+        // draws its command line read-only, no second surface, no mode tracking.
+        if let Some(cl) = cmdline {
+            let strip_layout = font.layout(cl, &style, VelloTextAlign::Left, Some(content_width));
+            for line in strip_layout.lines() {
+                for item in line.items() {
+                    if let parley::PositionedLayoutItem::GlyphRun(gr) = item {
+                        font_data_map.register(gr.run().font());
+                    }
+                }
+            }
+            let strip_offset = (PAD as f64, (height - CMDLINE_BOTTOM_MARGIN) as f64);
+            let mut strip = collect_msdf_glyphs(&strip_layout, &[], &style.brush, strip_offset, atlas);
+            g.append(&mut strip);
+        }
+
         glyphs.glyphs = g;
         glyphs.version = glyphs.version.wrapping_add(1);
 
@@ -188,6 +215,7 @@ pub fn build_editor_surface(
         scene.content_version = scene.content_version.wrapping_add(1);
         scene.last_built_version = scene.content_version;
         scene.scene_version = scene.scene_version.wrapping_add(1);
+        *last_cmdline = cmdline.clone();
     }
 
     // Cursor geometry (pushed to the material by sync_editor_cursor). Multi-line

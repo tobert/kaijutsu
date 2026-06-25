@@ -120,7 +120,7 @@ pub async fn resolve_editor_target(
 
 use std::collections::HashMap;
 
-use kaijutsu_editor::{CloseRequest, EditorCore};
+use kaijutsu_editor::{CloseRequest, CommandRequest, EditorCore};
 
 /// The result of feeding a key batch to a session via [`EditorSessions::keys`].
 #[derive(Debug)]
@@ -169,6 +169,10 @@ pub struct EditorState {
     pub mode: Option<String>,
     /// Whether the buffer differs from the last open/save checkpoint.
     pub dirty: bool,
+    /// The `:`-line the renderer should draw while command mode is active —
+    /// `Some(":wq")` mid-type, `None` when the bar is unfocused. The kernel owns
+    /// the bar (modalkit); the renderer draws this read-only, tracking no mode.
+    pub command_line: Option<String>,
 }
 
 impl EditorState {
@@ -183,6 +187,7 @@ impl EditorState {
             "cursor": self.cursor,
             "mode": self.mode,
             "dirty": self.dirty,
+            "command_line": self.command_line,
         })
     }
 }
@@ -269,7 +274,7 @@ impl EditorSessions {
         keys: &str,
         blocks: &SharedBlockStore,
     ) -> Result<KeysOutcome, String> {
-        let close = {
+        let (close, commands) = {
             let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
             let ops = session.core.apply_keys(keys);
             for op in &ops {
@@ -283,7 +288,7 @@ impl EditorSessions {
                     )
                     .map_err(|e| format!("editor keys: CRDT mirror failed: {e}"))?;
             }
-            session.core.take_close()
+            (session.core.take_close(), session.core.take_commands())
         };
 
         // `ZZ`/`ZQ` close the session. The returned state is informational (the
@@ -307,9 +312,55 @@ impl EditorSessions {
             return Ok(KeysOutcome::Closed(final_state));
         }
 
+        // A submitted `:`-line (`:w`/`:wq`/`:q!`/…). An unknown command fails
+        // loud (vim's "Not an editor command"); a parsed batch runs in order.
+        if let Some(parsed) = commands {
+            return self.run_commands(id, parsed?, blocks);
+        }
+
         let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
         let saved = session.saved_content.clone();
         Ok(KeysOutcome::Updated(state_of(&mut session.core, &saved)))
+    }
+
+    /// Act on a parsed `:`-command batch (`docs/vi.md` → *Command mode*). `Write`
+    /// checkpoints and stays open; `Quit` closes — refusing a dirty buffer
+    /// without `!` (vim's "No write since last change"). `[Write, Quit]` (`:wq`)
+    /// saves-clean then closes. Returns [`KeysOutcome::Closed`] if a `Quit` ran,
+    /// else [`KeysOutcome::Updated`] with the post-save state.
+    fn run_commands(
+        &mut self,
+        id: EditorSessionId,
+        commands: Vec<CommandRequest>,
+        blocks: &SharedBlockStore,
+    ) -> Result<KeysOutcome, String> {
+        let mut saved_state = None;
+        for cmd in commands {
+            match cmd {
+                // `force` (`:w!`) is reserved for a future read-only/permission
+                // gate; rc/config has none today, so a forced write == a write.
+                CommandRequest::Write { force: _ } => {
+                    saved_state = Some(self.save(id)?);
+                }
+                CommandRequest::Quit { force } => {
+                    let state = self.state(id)?;
+                    if !force && state.dirty {
+                        return Err(
+                            "No write since last change (add ! to override)".to_string()
+                        );
+                    }
+                    self.quit(id, blocks)?;
+                    return Ok(KeysOutcome::Closed(state));
+                }
+            }
+        }
+        // No `Quit` ran (a bare `:w`, or an empty `:` line). Report the post-save
+        // state, or — for a no-op line — the current view.
+        let state = match saved_state {
+            Some(state) => state,
+            None => self.state(id)?,
+        };
+        Ok(KeysOutcome::Updated(state))
     }
 
     /// Reconcile every open session bound to `(context_id, block_id)` against
@@ -433,11 +484,13 @@ fn state_of(core: &mut EditorCore, checkpoint: &str) -> EditorState {
     let dirty = text != checkpoint;
     let cursor = core.cursor();
     let mode = core.mode();
+    let command_line = core.command_line();
     EditorState {
         text,
         cursor,
         mode,
         dirty,
+        command_line,
     }
 }
 
@@ -796,5 +849,100 @@ mod session_tests {
         sessions.quit(id, &blocks).unwrap();
         let err = sessions.keys(id, "x", &blocks).unwrap_err();
         assert!(err.contains("no such session"), "got: {err}");
+    }
+
+    // ── `:` command mode (Slice 3) ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn colon_wq_saves_and_closes() {
+        // `:wq` is the muscle-memory twin of `ZZ` — save the edit, drop the
+        // session, keep the change on the block.
+        let (blocks, target) = seeded(b"hello").await;
+        let mut sessions = EditorSessions::new();
+        let (id, _) = sessions.open(RC_PATH, target, &blocks).unwrap();
+
+        sessions.keys(id, "iX<Esc>", &blocks).unwrap(); // -> "Xhello"
+        let outcome = sessions.keys(id, ":wq<CR>", &blocks).unwrap();
+        assert!(
+            matches!(outcome, KeysOutcome::Closed(_)),
+            ":wq closes the session"
+        );
+        assert!(!sessions.is_open(id), ":wq drops the session");
+        assert_eq!(block_text(&blocks, &target).unwrap(), "Xhello");
+    }
+
+    #[tokio::test]
+    async fn colon_q_refuses_a_dirty_buffer() {
+        // Plain `:q` on unsaved changes must fail loud (vim's "No write since
+        // last change"), not silently lose the edit.
+        let (blocks, target) = seeded(b"hello").await;
+        let mut sessions = EditorSessions::new();
+        let (id, _) = sessions.open(RC_PATH, target, &blocks).unwrap();
+
+        sessions.keys(id, "iX<Esc>", &blocks).unwrap(); // dirty
+        let err = sessions.keys(id, ":q<CR>", &blocks).unwrap_err();
+        assert!(err.contains("No write since last change"), "got: {err}");
+        assert!(sessions.is_open(id), ":q must not drop a dirty session");
+    }
+
+    #[tokio::test]
+    async fn colon_q_bang_discards_and_closes() {
+        let (blocks, target) = seeded(b"hello").await;
+        let mut sessions = EditorSessions::new();
+        let (id, _) = sessions.open(RC_PATH, target, &blocks).unwrap();
+
+        sessions.keys(id, "iX<Esc>", &blocks).unwrap(); // -> "Xhello"
+        let outcome = sessions.keys(id, ":q!<CR>", &blocks).unwrap();
+        assert!(matches!(outcome, KeysOutcome::Closed(_)));
+        assert!(!sessions.is_open(id));
+        // Forced quit rolls back to the open checkpoint.
+        assert_eq!(block_text(&blocks, &target).unwrap(), "hello");
+    }
+
+    #[tokio::test]
+    async fn colon_w_saves_and_stays_open() {
+        let (blocks, target) = seeded(b"hello").await;
+        let mut sessions = EditorSessions::new();
+        let (id, _) = sessions.open(RC_PATH, target, &blocks).unwrap();
+
+        sessions.keys(id, "iX<Esc>", &blocks).unwrap();
+        let outcome = sessions.keys(id, ":w<CR>", &blocks).unwrap();
+        assert!(
+            matches!(outcome, KeysOutcome::Updated(_)),
+            ":w keeps the session open"
+        );
+        assert!(!outcome.state().dirty, ":w clears dirty");
+        assert!(sessions.is_open(id));
+        // A clean `:q` now succeeds.
+        let outcome = sessions.keys(id, ":q<CR>", &blocks).unwrap();
+        assert!(matches!(outcome, KeysOutcome::Closed(_)));
+        assert_eq!(block_text(&blocks, &target).unwrap(), "Xhello");
+    }
+
+    #[tokio::test]
+    async fn unknown_colon_command_fails_loud() {
+        let (blocks, target) = seeded(b"hello").await;
+        let mut sessions = EditorSessions::new();
+        let (id, _) = sessions.open(RC_PATH, target, &blocks).unwrap();
+
+        let err = sessions.keys(id, ":frobnicate<CR>", &blocks).unwrap_err();
+        assert!(err.contains("Not an editor command"), "got: {err}");
+        assert!(sessions.is_open(id), "a bad command leaves the session open");
+    }
+
+    #[tokio::test]
+    async fn command_line_text_rides_the_state() {
+        // While typing the `:`-line, the pushed state carries it so a renderer
+        // can draw the strip without tracking mode.
+        let (blocks, target) = seeded(b"hello").await;
+        let mut sessions = EditorSessions::new();
+        let (id, _) = sessions.open(RC_PATH, target, &blocks).unwrap();
+
+        let outcome = sessions.keys(id, ":w", &blocks).unwrap();
+        assert_eq!(
+            outcome.state().command_line.as_deref(),
+            Some(":w"),
+            "the in-progress command line surfaces on the state"
+        );
     }
 }

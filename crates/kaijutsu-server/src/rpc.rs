@@ -7235,6 +7235,7 @@ fn set_editor_state(
     b.set_cursor(state.cursor as u64);
     b.set_mode(state.mode.as_deref().unwrap_or(""));
     b.set_dirty(state.dirty);
+    b.set_command_line(state.command_line.as_deref().unwrap_or(""));
 }
 
 /// Await an editor-callback round-trip with the shared callback timeout,
