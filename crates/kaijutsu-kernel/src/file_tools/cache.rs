@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime};
+use std::time::Instant;
 
 use kaijutsu_crdt::{BlockId, BlockKind, ContentType, ContextId, Role, Status};
 use parking_lot::RwLock;
@@ -58,11 +58,14 @@ struct CachedFileDoc {
     dirty: bool,
     /// Last access time for LRU eviction.
     last_access: Instant,
-    /// VFS modification time when the content was last loaded from / flushed to
-    /// disk. A clean entry whose backing file has a newer mtime is stale and
-    /// gets reloaded — this is how external edits (cargo, git, the GUI) become
-    /// visible. `None` means we couldn't read an mtime, so we trust the cache.
-    loaded_mtime: Option<SystemTime>,
+    /// VFS `generation` (coherence stamp) when the content was last loaded from
+    /// / flushed to disk. A clean entry whose backing file reports a *greater*
+    /// generation is stale and gets reloaded — this is how external edits
+    /// (cargo, git, the GUI, a sibling writer) become visible. Generation is
+    /// used instead of mtime because it strictly advances even within one mtime
+    /// tick and never steps backward (see `FileAttr::generation`). `None` means
+    /// we couldn't read an attr, so we trust the cache.
+    loaded_generation: Option<u64>,
 }
 
 /// Cache that maps VFS files to CRDT documents.
@@ -170,10 +173,10 @@ impl FileDocumentCache {
                 })?;
         }
 
-        let mtime = self.vfs.getattr(vfs_path).await.ok().map(|a| a.mtime);
+        let generation = self.vfs.getattr(vfs_path).await.ok().map(|a| a.generation);
         let mut cache = self.cache.write();
         if let Some(entry) = cache.get_mut(&ctx_id) {
-            entry.loaded_mtime = mtime;
+            entry.loaded_generation = generation;
             entry.dirty = false;
         }
         Ok(())
@@ -246,15 +249,16 @@ impl FileDocumentCache {
             let mut cache = self.cache.write();
             cache.get_mut(&ctx_id).map(|e| {
                 e.last_access = Instant::now();
-                (e.context_id, e.block_id, e.dirty, e.loaded_mtime)
+                (e.context_id, e.block_id, e.dirty, e.loaded_generation)
             })
         };
-        if let Some((cid, bid, dirty, loaded_mtime)) = cached {
+        if let Some((cid, bid, dirty, loaded_generation)) = cached {
             if dirty {
                 return Ok((cid, bid));
             }
-            let disk_mtime = self.vfs.getattr(vfs_path).await.ok().map(|a| a.mtime);
-            let stale = matches!((disk_mtime, loaded_mtime), (Some(d), Some(l)) if d > l);
+            let disk_generation = self.vfs.getattr(vfs_path).await.ok().map(|a| a.generation);
+            let stale =
+                matches!((disk_generation, loaded_generation), (Some(d), Some(l)) if d > l);
             if !stale {
                 return Ok((cid, bid));
             }
@@ -309,7 +313,7 @@ impl FileDocumentCache {
             }
         };
 
-        let loaded_mtime = self.vfs.getattr(vfs_path).await.ok().map(|a| a.mtime);
+        let loaded_generation = self.vfs.getattr(vfs_path).await.ok().map(|a| a.generation);
         let language = detect_language(path);
 
         let block_id = match self
@@ -374,7 +378,7 @@ impl FileDocumentCache {
                     block_id,
                     dirty: false,
                     last_access: Instant::now(),
-                    loaded_mtime,
+                    loaded_generation,
                 },
             );
         }
@@ -479,7 +483,7 @@ impl FileDocumentCache {
 
         let mut flushed = 0;
         let mut errors: Vec<String> = Vec::new();
-        let mut succeeded: Vec<(ContextId, Option<SystemTime>)> = Vec::new();
+        let mut succeeded: Vec<(ContextId, Option<u64>)> = Vec::new();
 
         for (path, ctx_id, block_id) in &dirty_entries {
             let content = self
@@ -498,8 +502,8 @@ impl FileDocumentCache {
             match self.vfs.write_all(vfs_path, content.as_bytes()).await {
                 Ok(()) => {
                     flushed += 1;
-                    let mtime = self.vfs.getattr(vfs_path).await.ok().map(|a| a.mtime);
-                    succeeded.push((*ctx_id, mtime));
+                    let generation = self.vfs.getattr(vfs_path).await.ok().map(|a| a.generation);
+                    succeeded.push((*ctx_id, generation));
                 }
                 Err(e) => {
                     errors.push(format!("failed to flush {}: {}", path, e));
@@ -508,13 +512,14 @@ impl FileDocumentCache {
         }
 
         // Only clear dirty flags for files that were successfully flushed, and
-        // stamp the post-flush mtime so they aren't seen as externally changed.
+        // stamp the post-flush generation so they aren't seen as externally
+        // changed.
         {
             let mut cache = self.cache.write();
-            for (ctx_id, mtime) in &succeeded {
+            for (ctx_id, generation) in &succeeded {
                 if let Some(entry) = cache.get_mut(ctx_id) {
                     entry.dirty = false;
-                    entry.loaded_mtime = *mtime;
+                    entry.loaded_generation = *generation;
                 }
             }
         }
@@ -561,14 +566,14 @@ impl FileDocumentCache {
             .await
             .map_err(|e| format!("failed to flush {}: {}", path, e))?;
 
-        // Stamp the post-flush mtime so our own write isn't later mistaken for
-        // an external change and needlessly reloaded.
-        let mtime = self.vfs.getattr(vfs_path).await.ok().map(|a| a.mtime);
+        // Stamp the post-flush generation so our own write isn't later mistaken
+        // for an external change and needlessly reloaded.
+        let generation = self.vfs.getattr(vfs_path).await.ok().map(|a| a.generation);
         {
             let mut cache = self.cache.write();
             if let Some(entry) = cache.get_mut(&ctx_id) {
                 entry.dirty = false;
-                entry.loaded_mtime = mtime;
+                entry.loaded_generation = generation;
             }
         }
 
@@ -651,8 +656,8 @@ impl FileDocumentCache {
                     block_id,
                     dirty: false,
                     last_access: Instant::now(),
-                    // Not yet on disk; the next flush stamps the real mtime.
-                    loaded_mtime: None,
+                    // Not yet on disk; the next flush stamps the real generation.
+                    loaded_generation: None,
                 },
             );
         }
@@ -752,7 +757,7 @@ mod tests {
 
     use crate::block_store::shared_block_store;
     use crate::vfs::backends::MemoryBackend;
-    use crate::vfs::{SetAttr, VfsOps};
+    use crate::vfs::VfsOps;
     use kaijutsu_types::PrincipalId;
 
     /// Build a cache over a MemoryBackend mounted at /tmp.
@@ -822,12 +827,10 @@ mod tests {
         vfs.write_all(p("/tmp/f.txt"), b"v1").await.unwrap();
         assert_eq!(cache.read_content("/tmp/f.txt").await.unwrap(), "v1");
 
-        // External writer changes the file with a strictly-newer mtime.
+        // External writer changes the file — the backend bumps its generation,
+        // which is what marks the clean cache entry stale (no mtime fiddling
+        // needed; generation is the coherence signal now).
         vfs.write_all(p("/tmp/f.txt"), b"v2").await.unwrap();
-        let future = SystemTime::now() + std::time::Duration::from_secs(3600);
-        vfs.setattr(p("/tmp/f.txt"), SetAttr::new().with_mtime(future))
-            .await
-            .unwrap();
 
         // Clean entry must reload and serve the new content.
         assert_eq!(cache.read_content("/tmp/f.txt").await.unwrap(), "v2");
@@ -844,12 +847,8 @@ mod tests {
         cache.create_or_replace("/tmp/g.txt", "local-edit").await.unwrap();
         cache.mark_dirty("/tmp/g.txt");
 
-        // External writer also changes the file with a newer mtime.
+        // External writer also changes the file (bumps the backend generation).
         vfs.write_all(p("/tmp/g.txt"), b"disk-v2").await.unwrap();
-        let future = SystemTime::now() + std::time::Duration::from_secs(3600);
-        vfs.setattr(p("/tmp/g.txt"), SetAttr::new().with_mtime(future))
-            .await
-            .unwrap();
 
         // Local edits win — we must not clobber uncommitted work with disk state.
         assert_eq!(cache.read_content("/tmp/g.txt").await.unwrap(), "local-edit");
@@ -980,14 +979,13 @@ mod tests {
             "original"
         );
 
-        // Advance disk mtime so the cached entry looks stale.
-        let future = SystemTime::now() + std::time::Duration::from_secs(3600);
-        vfs.setattr(
-            p("/tmp/stale_reload.txt"),
-            SetAttr::new().with_mtime(future),
-        )
-        .await
-        .unwrap();
+        // Advance the disk *generation* so the cached entry looks stale. An
+        // external content write bumps the backend's generation; a pure
+        // setattr(mtime) deliberately would NOT (it's display-only now), so the
+        // staleness signal must come from a real write.
+        vfs.write_all(p("/tmp/stale_reload.txt"), b"changed on disk")
+            .await
+            .unwrap();
 
         // Break the block store so reload_block_from_disk fails on
         // block_snapshots / edit_text (both hit the store after deletion).

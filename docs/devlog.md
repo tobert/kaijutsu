@@ -10,6 +10,37 @@ Newest work first within each area; dates are when the work landed.
 
 ---
 
+## VFS & filesystem
+
+### `FileAttr.generation` — coherence stamp split from display mtime (landed 2026-06-25)
+
+Prework for exposing the VFS over SFTP (design: `docs/sftp.md`). A Gemini Pro
+review of that design surfaced that the cache leaned on mtime as its coherence
+signal, and Amy flagged the deeper worry: was virtual-file mtime "really a
+counter"? It wasn't — `FileAttr.mtime` is a real `SystemTime` everywhere — but
+`ConfigCrdtFs` had two footguns (seeded files reporting `UNIX_EPOCH`; a silent
+no-op `setattr(mtime)`) and a latent coherence bug: mtime was wall-clock
+`now()` on write, so two writes inside one clock tick didn't advance it, while
+`FileDocumentCache`'s staleness reload requires a strict advance.
+
+Decision (Amy, from a three-way choice): introduce a **generation counter** as
+the real coherence primitive and keep mtime purely for human display — rather
+than clamping wall-clock to monotone, or mapping a logical version into a
+`SystemTime` (which would show 1970-ish garbage in `ls -l`). So `FileAttr` gains
+`generation: u64`: `ConfigCrdtFs`/`MemoryBackend` source it from a monotonic
+per-backend counter bumped on every content mutation; `LocalBackend` derives it
+from host mtime-nanos. The cache compares generation (`loaded_generation`, the
+`d > l` check), not mtime. `setattr(mtime)` is now honored for display but
+deliberately does not bump generation, so `cp -p`/`touch -d`/rsync no longer
+silently lose mtime *and* a pure attribute touch never triggers a reload. The
+`UNIX_EPOCH` default is replaced by a real backend-creation timestamp. The same
+generation is what a future SFTP `OPEN` will capture for its TOCTOU re-verify —
+handle guard and cache share one primitive. TDD: same-instant strict-advance
+tests on both CRDT and memory backends, plus epoch-default and
+display-only-setattr regressions; full workspace green.
+
+---
+
 ## In-app vi editor
 
 Editing as a kernel-owned session: `EditorCore` (pure modalkit vim) → kernel

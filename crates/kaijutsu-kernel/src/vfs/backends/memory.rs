@@ -5,6 +5,7 @@
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::time::SystemTime;
 
@@ -44,6 +45,17 @@ impl Entry {
 #[derive(Debug)]
 pub struct MemoryBackend {
     entries: RwLock<HashMap<PathBuf, Entry>>,
+    /// Monotonic source for `FileAttr::generation`. Bumped on every content
+    /// mutation (write/create/truncate) so the coherence stamp strictly
+    /// advances even within one `SystemTime::now()` tick. Never reused.
+    gen_clock: AtomicU64,
+}
+
+impl MemoryBackend {
+    /// Allocate the next strictly-greater generation stamp.
+    fn next_gen(&self) -> u64 {
+        self.gen_clock.fetch_add(1, Ordering::Relaxed) + 1
+    }
 }
 
 impl Default for MemoryBackend {
@@ -65,6 +77,7 @@ impl MemoryBackend {
         );
         Self {
             entries: RwLock::new(entries),
+            gen_clock: AtomicU64::new(0),
         }
     }
 
@@ -242,6 +255,7 @@ impl VfsOps for MemoryBackend {
                 file_data[offset..offset + data.len()].copy_from_slice(data);
                 attr.size = file_data.len() as u64;
                 attr.mtime = SystemTime::now();
+                attr.generation = self.next_gen();
                 Ok(data.len() as u32)
             }
             Some(Entry::Directory { .. }) => {
@@ -268,7 +282,8 @@ impl VfsOps for MemoryBackend {
             return Err(VfsError::already_exists(Self::path_str(&normalized)));
         }
 
-        let attr = FileAttr::file(0, mode);
+        let mut attr = FileAttr::file(0, mode);
+        attr.generation = self.next_gen();
         entries.insert(
             normalized,
             Entry::File {
@@ -416,6 +431,7 @@ impl VfsOps for MemoryBackend {
                 data.resize(size as usize, 0);
                 attr.size = size;
                 attr.mtime = SystemTime::now();
+                attr.generation = self.next_gen();
                 Ok(())
             }
             Some(Entry::Directory { .. }) => {
@@ -437,6 +453,12 @@ impl VfsOps for MemoryBackend {
         let entry = entries
             .get_mut(&normalized)
             .ok_or_else(|| VfsError::not_found(Self::path_str(&normalized)))?;
+
+        // A size change is a content mutation — bump the coherence stamp. A
+        // pure mtime/perm/uid/gid setattr (e.g. `cp -p`, `touch -d`) is
+        // display-only and deliberately does NOT advance generation, so it
+        // never triggers a needless cache reload.
+        let size_changed = set.size.is_some();
 
         // Handle size change (requires access to data for files)
         if let Some(size) = set.size
@@ -462,6 +484,9 @@ impl VfsOps for MemoryBackend {
         }
         if let Some(gid) = set.gid {
             attr.gid = Some(gid);
+        }
+        if size_changed {
+            attr.generation = self.next_gen();
         }
 
         Ok(entry.attr().clone())
@@ -665,5 +690,36 @@ mod tests {
         let fs = MemoryBackend::new();
         let real = fs.real_path(Path::new("anything")).await.unwrap();
         assert!(real.is_none());
+    }
+
+    #[tokio::test]
+    async fn generation_strictly_advances_on_write() {
+        // /tmp is a MemoryBackend and an SFTP-facing scratch surface: the
+        // coherence stamp must strictly advance per write even back-to-back,
+        // independent of wall-clock resolution.
+        let fs = MemoryBackend::new();
+        fs.write_all(Path::new("/f.txt"), b"a").await.unwrap();
+        let g1 = fs.getattr(Path::new("/f.txt")).await.unwrap().generation;
+        fs.write_all(Path::new("/f.txt"), b"bb").await.unwrap();
+        let g2 = fs.getattr(Path::new("/f.txt")).await.unwrap().generation;
+        assert_ne!(g1, 0, "a written file must carry a nonzero generation");
+        assert!(g2 > g1, "generation must strictly advance: {g1} !< {g2}");
+    }
+
+    #[tokio::test]
+    async fn setattr_mtime_does_not_bump_generation() {
+        let fs = MemoryBackend::new();
+        fs.write_all(Path::new("/f.txt"), b"a").await.unwrap();
+        let g = fs.getattr(Path::new("/f.txt")).await.unwrap().generation;
+        let stamp = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(42);
+        fs.setattr(Path::new("/f.txt"), SetAttr::new().with_mtime(stamp))
+            .await
+            .unwrap();
+        let attr = fs.getattr(Path::new("/f.txt")).await.unwrap();
+        assert_eq!(attr.mtime, stamp, "mtime setattr is honored for display");
+        assert_eq!(
+            attr.generation, g,
+            "a pure mtime setattr must not advance generation"
+        );
     }
 }

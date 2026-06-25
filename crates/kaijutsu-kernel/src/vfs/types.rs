@@ -43,8 +43,23 @@ pub struct FileAttr {
     pub kind: FileType,
     /// Unix permissions (e.g., 0o644).
     pub perm: u32,
-    /// Last modification time.
+    /// Last modification time. **Display only** — for `ls -l`, SFTP attrs, and
+    /// human-facing tools. Coherence decisions use [`generation`], not mtime,
+    /// because mtime is wall-clock and can collide within a tick or step
+    /// backward. See the module docs and `docs/sftp.md`.
+    ///
+    /// [`generation`]: FileAttr::generation
     pub mtime: SystemTime,
+    /// Strictly-advancing content version — the coherence primitive. Each write
+    /// to a path yields a `generation` greater than the prior one, even when two
+    /// writes land within a single `mtime` resolution. The file cache compares
+    /// this (not `mtime`) to detect external edits, and an SFTP `OPEN` captures
+    /// it to re-verify on `WRITE` (TOCTOU guard). Per-path monotone within one
+    /// backend; values are NOT comparable across backends or paths. `0` means
+    /// "unknown / never observed a write" — host-backed files derive it from
+    /// mtime, CRDT/memory backends source it from a monotonic counter.
+    #[serde(default)]
+    pub generation: u64,
     /// Last access time (optional).
     pub atime: Option<SystemTime>,
     /// Creation time (optional).
@@ -66,6 +81,7 @@ impl FileAttr {
             kind: FileType::File,
             perm,
             mtime: now,
+            generation: 0,
             atime: Some(now),
             ctime: Some(now),
             nlink: 1,
@@ -82,6 +98,7 @@ impl FileAttr {
             kind: FileType::Directory,
             perm,
             mtime: now,
+            generation: 0,
             atime: Some(now),
             ctime: Some(now),
             nlink: 2, // . and ..
@@ -98,6 +115,7 @@ impl FileAttr {
             kind: FileType::Symlink,
             perm: 0o777,
             mtime: now,
+            generation: 0,
             atime: Some(now),
             ctime: Some(now),
             nlink: 1,

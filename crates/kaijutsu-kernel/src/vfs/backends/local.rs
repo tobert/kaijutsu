@@ -134,11 +134,25 @@ impl LocalBackend {
             FileType::File
         };
 
+        let mtime = meta
+            .modified()
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        // Host files have no version counter, so derive the coherence stamp from
+        // mtime-nanos: it advances with every external edit (which is exactly
+        // when the cache must reload) and matches the pre-generation behaviour
+        // that compared mtime directly. Nanosecond host mtime resolution makes
+        // same-stamp collisions vanishingly rare in practice.
+        let generation = mtime
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+
         FileAttr {
             size: meta.len(),
             kind,
             perm: meta.permissions().mode(),
-            mtime: meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+            mtime,
+            generation,
             atime: meta.accessed().ok(),
             ctime: meta.created().ok(),
             nlink: meta.nlink() as u32,

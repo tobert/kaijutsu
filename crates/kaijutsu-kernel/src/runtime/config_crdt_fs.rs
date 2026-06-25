@@ -27,6 +27,7 @@
 
 use async_trait::async_trait;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use dashmap::DashMap;
@@ -51,8 +52,20 @@ pub struct ConfigCrdtFs {
     /// canonical path, so the manifest stays coherent with how `kj rc` and the
     /// lifecycle dispatch reason about scripts.
     root: String,
-    /// Per-path version stamp, advanced on write. See module docs.
+    /// Per-path wall-clock mtime, refreshed on write. **Display only** (`ls -l`,
+    /// SFTP attrs); not the coherence signal. See module docs and `generations`.
     mtimes: DashMap<String, SystemTime>,
+    /// Per-path strictly-advancing generation — the coherence stamp the file
+    /// cache compares (and a future SFTP `OPEN` captures for its TOCTOU guard).
+    /// Sourced from `gen_clock`, so two writes within one `SystemTime::now()`
+    /// tick still produce distinct, increasing values. See `docs/sftp.md`.
+    generations: DashMap<String, u64>,
+    /// Monotonic source for `generations`. Never reused, never goes backward.
+    gen_clock: AtomicU64,
+    /// Display-mtime fallback for paths we hold no write record for (seeded
+    /// defaults, freshly-replayed docs). Replaces the old `UNIX_EPOCH` (1970)
+    /// default, which made caching SFTP clients make bad decisions.
+    created: SystemTime,
 }
 
 impl ConfigCrdtFs {
@@ -70,6 +83,9 @@ impl ConfigCrdtFs {
             blocks,
             root,
             mtimes: DashMap::new(),
+            generations: DashMap::new(),
+            gen_clock: AtomicU64::new(0),
+            created: SystemTime::now(),
         }
     }
 
@@ -196,7 +212,7 @@ impl ConfigCrdtFs {
             .create_document_with_path(ctx, DocKind::Symlink, None, canonical.to_string())
             .map_err(|e| crdt_err(e.to_string()))?;
         self.insert_block(ctx, target).map_err(crdt_err)?;
-        self.mtimes.insert(canonical.to_string(), SystemTime::now());
+        self.bump(canonical);
         Ok(())
     }
 
@@ -227,7 +243,7 @@ impl ConfigCrdtFs {
                 .map_err(|e| crdt_err(e.to_string()))?;
             self.insert_block(ctx, text).map_err(crdt_err)?;
         }
-        self.mtimes.insert(canonical.to_string(), SystemTime::now());
+        self.bump(canonical);
         Ok(())
     }
 
@@ -251,11 +267,37 @@ impl ConfigCrdtFs {
             .map_err(|e| e.to_string())
     }
 
+    /// Record a content mutation at `canonical`: advance the coherence
+    /// generation (strictly, from `gen_clock`) and refresh the display mtime.
+    fn bump(&self, canonical: &str) {
+        let g = self.gen_clock.fetch_add(1, Ordering::Relaxed) + 1;
+        self.generations.insert(canonical.to_string(), g);
+        self.mtimes.insert(canonical.to_string(), SystemTime::now());
+    }
+
+    /// Drop the per-path stamps for a removed path. A later recreate gets a
+    /// fresh, higher generation from `gen_clock`, so any cache entry that loaded
+    /// the old file still sees the new one as changed.
+    fn forget(&self, canonical: &str) {
+        self.generations.remove(canonical);
+        self.mtimes.remove(canonical);
+    }
+
+    /// Strictly-advancing coherence stamp for `canonical`; `0` ("unknown") when
+    /// we hold no write record (a seeded default or replayed doc not yet
+    /// mutated through this backend instance).
+    fn gen_of(&self, canonical: &str) -> u64 {
+        self.generations
+            .get(canonical)
+            .map(|e| *e.value())
+            .unwrap_or(0)
+    }
+
     fn mtime_of(&self, canonical: &str) -> SystemTime {
         self.mtimes
             .get(canonical)
             .map(|e| *e.value())
-            .unwrap_or(SystemTime::UNIX_EPOCH)
+            .unwrap_or(self.created)
     }
 
     /// True when this backend owns no documents yet — the "fresh install" gate.
@@ -382,15 +424,20 @@ impl VfsOps for ConfigCrdtFs {
         if let Some(target) = self.link_target(&canonical) {
             let mut attr = FileAttr::symlink(target.len() as u64);
             attr.mtime = self.mtime_of(&canonical);
+            attr.generation = self.gen_of(&canonical);
             return Ok(attr);
         }
         if let Some(content) = self.content_of(&canonical) {
             let mut attr = FileAttr::file(content.len() as u64, 0o644);
             attr.mtime = self.mtime_of(&canonical);
+            attr.generation = self.gen_of(&canonical);
             return Ok(attr);
         }
         if self.is_dir(&canonical) {
-            return Ok(FileAttr::directory(0o755));
+            let mut attr = FileAttr::directory(0o755);
+            attr.mtime = self.mtime_of(&canonical);
+            attr.generation = self.gen_of(&canonical);
+            return Ok(attr);
         }
         Err(VfsError::not_found(canonical))
     }
@@ -519,6 +566,7 @@ impl VfsOps for ConfigCrdtFs {
         self.put_content(&canonical, "")?;
         let mut attr = FileAttr::file(0, 0o644);
         attr.mtime = self.mtime_of(&canonical);
+        attr.generation = self.gen_of(&canonical);
         Ok(attr)
     }
 
@@ -545,7 +593,7 @@ impl VfsOps for ConfigCrdtFs {
         self.blocks
             .delete_document(ctx)
             .map_err(|e| VfsError::other(format!("crdt: {e}")))?;
-        self.mtimes.remove(&canonical);
+        self.forget(&canonical);
         Ok(())
     }
 
@@ -585,7 +633,7 @@ impl VfsOps for ConfigCrdtFs {
         self.blocks
             .delete_document(ctx)
             .map_err(|e| VfsError::other(format!("crdt: {e}")))?;
-        self.mtimes.remove(&from_c);
+        self.forget(&from_c);
         Ok(())
     }
 
@@ -603,12 +651,18 @@ impl VfsOps for ConfigCrdtFs {
     }
 
     async fn setattr(&self, path: &Path, set: SetAttr) -> VfsResult<FileAttr> {
-        // Only size changes have meaning here (truncate/extend the content).
-        // mtime/perm/uid/gid are not host-backed; accept the call but reflect
-        // only what we actually model, so callers don't get a spurious error.
+        // A size change is a content mutation — `truncate` advances generation.
+        // An mtime change is display-only: we now honor it (so `cp -p`, `touch
+        // -d`, rsync's mtime preservation no longer silently vanish) by storing
+        // it in the display-mtime map, but deliberately do NOT bump generation,
+        // so a pure attribute touch never triggers a needless cache reload.
+        // perm/uid/gid stay unmodeled (virtual fs), accepted without error.
         let canonical = self.canonical(path);
         if let Some(size) = set.size {
             self.truncate(path, size).await?;
+        }
+        if let Some(mtime) = set.mtime {
+            self.mtimes.insert(canonical.clone(), mtime);
         }
         self.getattr(Path::new(&canonical[self.root.len()..])).await
     }
@@ -792,6 +846,60 @@ mod tests {
         fs.write_all(p("a/create/S00-x.kai"), b"v2").await.unwrap();
         let m2 = fs.getattr(p("a/create/S00-x.kai")).await.unwrap().mtime;
         assert!(m2 > m1, "mtime must advance on write: {m1:?} !< {m2:?}");
+    }
+
+    /// The guarantee wall-clock mtime cannot make: two writes landing within a
+    /// single `SystemTime` tick still produce strictly-increasing generation,
+    /// so the file cache never serves stale content after a rapid rewrite. This
+    /// is the coherence bug the generation primitive fixes — no `sleep` here, on
+    /// purpose.
+    #[tokio::test]
+    async fn generation_strictly_advances_within_one_mtime_tick() {
+        let fs = fs();
+        fs.write_all(p("a/create/S00-x.kai"), b"v1").await.unwrap();
+        let g1 = fs.getattr(p("a/create/S00-x.kai")).await.unwrap().generation;
+        fs.write_all(p("a/create/S00-x.kai"), b"v2").await.unwrap();
+        let g2 = fs.getattr(p("a/create/S00-x.kai")).await.unwrap().generation;
+        assert_ne!(g1, 0, "a written file must carry a nonzero generation");
+        assert!(g2 > g1, "generation must strictly advance: {g1} !< {g2}");
+    }
+
+    /// Regression: a path with no write record (here a virtual directory) must
+    /// report a real timestamp, not the `UNIX_EPOCH` (1970) the old default
+    /// served — which made caching SFTP clients make bad decisions.
+    #[tokio::test]
+    async fn unwritten_path_mtime_is_not_epoch() {
+        let fs = fs();
+        fs.write_all(p("a/create/S00-x.kai"), b"data").await.unwrap();
+        let dir = fs.getattr(p("a/create")).await.unwrap();
+        assert!(dir.is_dir());
+        assert!(
+            dir.mtime > SystemTime::UNIX_EPOCH,
+            "virtual-dir mtime must be a real timestamp, not the 1970 epoch"
+        );
+    }
+
+    /// `setattr(mtime)` is honored for display (so `cp -p` / `touch -d` / rsync
+    /// mtime-preservation no longer silently vanish) but must NOT advance the
+    /// coherence generation — a pure attribute touch should never trigger a
+    /// cache reload.
+    #[tokio::test]
+    async fn setattr_mtime_is_display_only_and_does_not_bump_generation() {
+        let fs = fs();
+        fs.write_all(p("a/create/S00-x.kai"), b"data").await.unwrap();
+        let g_before = fs.getattr(p("a/create/S00-x.kai")).await.unwrap().generation;
+
+        let stamp = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        fs.setattr(p("a/create/S00-x.kai"), SetAttr::new().with_mtime(stamp))
+            .await
+            .unwrap();
+
+        let attr = fs.getattr(p("a/create/S00-x.kai")).await.unwrap();
+        assert_eq!(attr.mtime, stamp, "setattr(mtime) must be reflected for display");
+        assert_eq!(
+            attr.generation, g_before,
+            "a pure mtime setattr must NOT bump the coherence generation"
+        );
     }
 
     #[tokio::test]
