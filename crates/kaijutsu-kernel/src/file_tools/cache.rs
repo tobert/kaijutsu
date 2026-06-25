@@ -952,9 +952,9 @@ mod tests {
     }
 
     /// Regression (F1 / stale-reload): when a clean cache entry's file has a
-    /// newer mtime on disk, `try_get_or_load` enters the stale-reload path and
-    /// calls `reload_block_from_disk`. If the block store fails at that point
-    /// (e.g. the CRDT document was deleted), the error MUST propagate as
+    /// greater generation on disk, `try_get_or_load` enters the stale-reload
+    /// path and calls `reload_block_from_disk`. If the block store fails at that
+    /// point (e.g. the CRDT document was deleted), the error MUST propagate as
     /// `CacheReadError::Backend` — not be swallowed as `NotCached`.
     ///
     /// The old code blanket-converted every reload error to `NotCached`, which
@@ -962,10 +962,11 @@ mod tests {
     /// `String::new()` as the prior content and overwrite the file with just
     /// the suffix — silent data wipe.
     ///
-    /// Setup: write a file through the cache (clean entry with a known mtime),
-    /// then advance the disk mtime past `loaded_mtime` so the entry is seen as
-    /// stale, then delete the CRDT document so `block_snapshots` inside
-    /// `reload_block_from_disk` returns an error.
+    /// Setup: write a file through the cache (clean entry with a known
+    /// generation), then bump the disk generation past `loaded_generation` with
+    /// an external write so the entry is seen as stale, then delete the CRDT
+    /// document so `block_snapshots` inside `reload_block_from_disk` returns an
+    /// error.
     #[tokio::test]
     async fn stale_reload_backend_error_is_not_swallowed_as_not_cached() {
         let (vfs, cache) = tmp_cache().await;

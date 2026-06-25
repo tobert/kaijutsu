@@ -609,12 +609,13 @@ impl KernelBackend for MountBackend {
             .setattr(path, SetAttr::new().with_mtime(mtime))
             .await
             .map_err(vfs_to_backend)?;
-        // We deliberately don't touch `file_cache` here: for writable
-        // CRDT-backed text files the content is write-through to disk, so a
-        // newer disk mtime simply trips the cache's existing staleness check on
-        // the next read (which reloads and re-pins `loaded_mtime`). That path is
-        // already tested; invalidating here would risk dropping an unflushed
-        // edit, so we let the staleness logic own freshness.
+        // We deliberately don't touch `file_cache` here. The cache keys
+        // freshness on `generation`, not mtime, and a pure mtime `setattr` is
+        // display-only on the CRDT/memory backends — it does NOT advance
+        // generation, so it correctly does NOT trip a reload (a `touch` must not
+        // discard cached content). A real content change is what bumps
+        // generation and trips the staleness check. Invalidating here would risk
+        // dropping an unflushed edit, so we let the staleness logic own freshness.
         Ok(())
     }
 
