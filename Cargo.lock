@@ -5749,6 +5749,7 @@ version = "0.1.0"
 dependencies = [
  "editor-types",
  "modalkit",
+ "regex",
 ]
 
 [[package]]
