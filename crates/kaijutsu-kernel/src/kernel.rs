@@ -894,7 +894,7 @@ impl Kernel {
         // fulfilled below: the async fetch happens *outside* the lock, so the
         // `!Send` `EditorCore` never crosses an await (the `SendSessions`
         // invariant); only the fetched `String` does.
-        let (path, outcome, io) = {
+        let (path, outcome, io, io_cursor) = {
             let mut sessions = self.editor_sessions.lock();
             let path = sessions.0.session_path(id);
             let outcome = sessions.0.keys(id, keys, blocks)?;
@@ -903,15 +903,21 @@ impl Kernel {
             } else {
                 None
             };
-            (path, outcome, io)
+            // Capture the cursor NOW (at `:r` submit), so a keystroke that moves
+            // it while the fetch awaits can't make the read land at the wrong
+            // place (the "wandering cursor" race) — insert happens at this offset.
+            let io_cursor = io.as_ref().and_then(|_| sessions.0.session_cursor(id));
+            (path, outcome, io, io_cursor)
         };
 
-        // Fulfill a `:r` read: fetch the content, then splice it at the cursor.
+        // Fulfill a `:r` read: fetch the content, then splice it at the cursor
+        // captured above (not the live cursor, which may have moved).
         if let Some(io) = io {
             let content = self.fetch_editor_io(io, blocks).await?;
+            let at = io_cursor.unwrap_or(0);
             let state = {
                 let mut sessions = self.editor_sessions.lock();
-                sessions.0.insert_text(id, &content, blocks)?
+                sessions.0.insert_text(id, &content, at, blocks)?
             };
             // The block changed; drop the file-cache shadow of the *edited* path.
             if let Some(path) = path.as_deref() {

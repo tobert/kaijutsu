@@ -193,13 +193,23 @@ impl EditorCore {
     /// the async fetch. `set_text` resets undo (a bulk paste is disruptive
     /// anyway — same trade-off as `:s`).
     pub fn insert_at_cursor(&mut self, text: &str) -> Vec<EditOp> {
+        let at = self.cursor();
+        self.insert_at(text, at)
+    }
+
+    /// Insert `text` at an **explicit** char offset (clamped), returning the
+    /// EditOps to mirror. The kernel uses this for `:r`: it captures the cursor
+    /// at `:r`-submit time and inserts *there*, so a concurrent keystroke that
+    /// moved the cursor during the async fetch can't make the read land at the
+    /// wrong spot (the "wandering cursor" race). The leader moves to the end of
+    /// the insertion (vim's `:r` cursor behavior).
+    pub fn insert_at(&mut self, text: &str, offset: usize) -> Vec<EditOp> {
         if text.is_empty() {
             return Vec::new();
         }
         let before = self.text();
-        let cursor = self.cursor();
         let mut chars: Vec<char> = before.chars().collect();
-        let at = cursor.min(chars.len());
+        let at = offset.min(chars.len());
         let inserted: Vec<char> = text.chars().collect();
         let inserted_len = inserted.len();
         chars.splice(at..at, inserted);
@@ -1220,6 +1230,29 @@ mod tests {
             let mut ed = EditorCore::new("hello");
             assert!(ed.insert_at_cursor("").is_empty());
             assert_eq!(ed.text(), "hello");
+        }
+
+        #[test]
+        fn insert_at_explicit_offset_ignores_the_live_cursor() {
+            // The `:r` wandering-cursor fix: the kernel captures the cursor at
+            // submit time and inserts THERE, even if the live cursor has since
+            // moved. Cursor at 0; insert at the captured offset 2.
+            let mut ed = EditorCore::new("hello");
+            assert_eq!(ed.cursor(), 0, "live cursor still at start");
+            let ops = ed.insert_at("XY", 2);
+            assert_eq!(ed.text(), "heXYllo", "inserted at the captured offset, not the live cursor");
+            assert_eq!(ops, vec![EditOp { offset: 2, insert: "XY".into(), delete: 0 }]);
+            assert_eq!(ed.cursor(), 4, "cursor lands past the insertion");
+        }
+
+        #[test]
+        fn insert_at_clamps_an_out_of_bounds_offset() {
+            // A concurrent delete during a `:r` fetch could leave the captured
+            // offset past the (now shorter) buffer — clamp, never panic.
+            let mut ed = EditorCore::new("hi");
+            let ops = ed.insert_at("!", 99);
+            assert_eq!(ed.text(), "hi!", "clamped to the end");
+            assert_eq!(ops, vec![EditOp { offset: 2, insert: "!".into(), delete: 0 }]);
         }
     }
 

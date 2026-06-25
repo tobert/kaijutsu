@@ -451,17 +451,27 @@ impl EditorSessions {
         self.sessions.get_mut(&id)?.core.take_io()
     }
 
-    /// Insert kernel-fetched `text` at the session's cursor (completing a `:r`),
-    /// mirror the produced ops onto the owning CRDT block, and return the new
-    /// state. Fails loud if the mirror write fails.
+    /// The session's current leader-cursor char offset, or `None` if no such
+    /// session. The kernel captures this at `:r`-submit time so the async insert
+    /// lands where the command was issued, not wherever a concurrent keystroke
+    /// moved the cursor during the fetch.
+    pub fn session_cursor(&mut self, id: EditorSessionId) -> Option<usize> {
+        self.sessions.get_mut(&id).map(|s| s.core.cursor())
+    }
+
+    /// Insert kernel-fetched `text` at `offset` (the cursor captured when the
+    /// `:r` was submitted — see [`session_cursor`](Self::session_cursor)), mirror
+    /// the produced ops onto the owning CRDT block, and return the new state.
+    /// Fails loud if the mirror write fails.
     pub fn insert_text(
         &mut self,
         id: EditorSessionId,
         text: &str,
+        offset: usize,
         blocks: &SharedBlockStore,
     ) -> Result<EditorState, String> {
         let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
-        let ops = session.core.insert_at_cursor(text);
+        let ops = session.core.insert_at(text, offset);
         for op in &ops {
             blocks
                 .edit_text(
