@@ -105,6 +105,54 @@ impl Tool for ViBuiltin {
     }
 }
 
+/// kaish builtin `fg` — re-foreground the editor suspended with Ctrl+Z (the Unix
+/// job-control metaphor: work in vi, Ctrl+Z to the shell, `fg` to come back).
+/// Re-fires the `open_editor` signal for the caller's most-recent session, so the
+/// app pops back to the editor via the same path a fresh `vi` uses.
+pub struct FgBuiltin {
+    dispatcher: Arc<KjDispatcher>,
+}
+
+impl FgBuiltin {
+    pub fn new(dispatcher: Arc<KjDispatcher>) -> Self {
+        Self { dispatcher }
+    }
+}
+
+#[async_trait]
+impl Tool for FgBuiltin {
+    fn name(&self) -> &str {
+        "fg"
+    }
+
+    fn schema(&self) -> ToolSchema {
+        ToolSchema::new(
+            "fg",
+            "Resume the editor you suspended with Ctrl+Z (job-control foreground).",
+        )
+        .example("Return to vi after peeking at the shell", "fg")
+    }
+
+    async fn execute(&self, _args: ToolArgs, ctx: &mut dyn ToolCtx) -> ExecResult {
+        // Same submitter resolution as `vi`: the signal fans to this principal's
+        // app windows. A headless caller (no `ExecContext`) has no window to pop.
+        let submitter = ctx
+            .as_any_mut()
+            .downcast_mut::<ExecContext>()
+            .map(|ec| ec.principal_id);
+
+        match self.dispatcher.kernel().resume_editor(submitter).await {
+            Ok((id, st)) => {
+                let session = id.as_u64();
+                let mut result = ExecResult::success(format!("resuming editor session {session}"));
+                result.data = Some(kaish_kernel::interpreter::json_to_value(st.to_json(id)));
+                result
+            }
+            Err(e) => ExecResult::failure(1, e),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -643,9 +643,9 @@ contract as buffer/cursor today, no app mode tracking).
      SUBSTITUTED/` rendered in the app; `:q!` restored the block.
    - **Deferred:** bare `:s` (repeat-last) errors for now; `.`/`$` ranges;
      `&`/`~` repeat; substitute undo granularity.
-3. ✅ **`:r <file>` SHIPPED (2026-06-25).** `:r !cmd` fail-loud-deferred;
-   Ctrl+Z-suspend / `fg`-resume still to build. **`:!` dropped** — see "Step 3
-   design" below.
+3. ✅ **`:r <file>` + Ctrl+Z/`fg` SHIPPED + runner-verified (2026-06-25).**
+   `:r !cmd` fail-loud-deferred (needs the opener-context capture). **`:!`
+   dropped** — see "Step 3 design" below.
 4. `:e` if/when wanted.
 
 ### Step 3 design — `:r` + Ctrl+Z/`fg` (locked 2026-06-25; `:!` dropped)
@@ -687,20 +687,26 @@ back. (`:%!filter` buffer-through-command is also out of scope; the shell filter
      is why `:r` can't ship as a pure-`EditorCore` half — the dropped intent would
      be a silent fallback; the kernel fulfillment lands in the same increment.
 
-2. **Ctrl+Z suspend / `fg` resume** — the editor↔shell round-trip.
+2. ✅ **Ctrl+Z suspend / `fg` resume SHIPPED + RUNNER-VERIFIED (2026-06-25)** —
+   the editor↔shell round-trip.
    - **Ctrl+Z** in `Screen::Editor`: a *local* app intercept (in
-     `editor_dispatch_keys`) — don't forward the key; leave to conversation+shell
-     but **keep `ActiveEditor` populated** (suspended, not closed; the kernel
-     session is untouched). Because it's local it **also is the hung-kernel escape
-     hatch** (works when the kernel can't answer — unlike kernel-handled `ZZ`/`ZQ`;
-     retires that backlog item). Ctrl+Z is overloaded by screen: in the editor it
-     suspends the foreground job; in the conversation it stays the shell↔chat
-     toggle.
-   - **`fg`** — a kaish builtin: the kernel finds the caller's suspended editor
-     session (most-recent, like job control) and **re-fires the existing
-     `open_editor` signal** → the app re-enters `Screen::Editor`. No new wire
-     surface (reuses step-2's signal + landing handler). Nothing suspended →
-     `fg: no editor session` (mirrors bash).
+     `editor_dispatch_keys`) — don't forward the key; leave to conversation +
+     shell (`FocusArea::Compose` + `ActiveSurface::Shell`) but **keep
+     `ActiveEditor`** (suspended, not closed; kernel session untouched). Local, so
+     it **also is the hung-kernel escape hatch**. (The Action-system
+     Ctrl+Z↔ToggleSurface is suppressed on `Screen::Editor`, so no double-handle.)
+   - **`fg`** — a kaish builtin (`FgBuiltin`): `Kernel::resume_editor` finds the
+     caller's most-recent session (job-control) and **re-fires the existing
+     `open_editor` signal** → the app re-enters `Screen::Editor`. No new wire.
+     Nothing open → `fg: no editor session` (mirrors bash).
+   - **Opener capture / fallback:** the session records its opener principal
+     (`editor_open_as`), but the opener isn't captured on the external-MCP shell
+     path (the `vi` builtin's `ExecContext` downcast doesn't reach there — the
+     *same* gap `:r !cmd` must close: thread the opener context onto the session).
+     So `resume_editor` **prefers** the caller's session and **falls back** to the
+     most-recent editor of any opener — correct for the shared-trust single-user
+     instrument, a multi-user refinement later. Runner-verified: `vi` → Ctrl+Z
+     (→ shell) → `fg` (→ editor) end to end.
 
 **Related (separate thread, NOT part of this):** the Ctrl+Z shell may later become
 a **shadow context** whose blocks are excluded from the agent's conversation until

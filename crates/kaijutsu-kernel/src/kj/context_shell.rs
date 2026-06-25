@@ -153,6 +153,8 @@ impl KjDispatcher {
                         d.clone(),
                         "edit",
                     ));
+                    // `fg` — job-control resume of an editor suspended with Ctrl+Z.
+                    tools.register(crate::runtime::vi_builtin::FgBuiltin::new(d.clone()));
                     tools.register(crate::runtime::kj_builtin::KjBuiltin::new(
                         d,
                         scm,

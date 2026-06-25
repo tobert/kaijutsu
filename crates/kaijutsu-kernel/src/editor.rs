@@ -30,6 +30,7 @@
 //! is the whole point. See `docs/vi.md` ("Path resolution").
 
 use kaijutsu_crdt::{BlockId, ContextId};
+use kaijutsu_types::PrincipalId;
 
 use crate::block_store::SharedBlockStore;
 use crate::config_doc::{config_context_id, first_block_id};
@@ -210,6 +211,10 @@ struct EditorSession {
     /// `EditorCore` strips modalkit's line terminator, so the terminator lives
     /// here; edits mirror as diffs (never touching it) and `ZQ` re-applies it.
     terminator: String,
+    /// The principal that opened the session — the submitter whose app windows
+    /// `open_editor` signals. `fg` uses it to find the caller's suspended editor
+    /// to re-foreground. `None` for a headless open (test / no `ExecContext`).
+    opener: Option<PrincipalId>,
 }
 
 /// The kernel's registry of open editor sessions.
@@ -237,6 +242,7 @@ impl EditorSessions {
         path: &str,
         target: EditorTarget,
         blocks: &SharedBlockStore,
+        opener: Option<PrincipalId>,
     ) -> Result<(EditorSessionId, EditorState), String> {
         let raw = block_text(blocks, &target)?;
         let mut core = EditorCore::new(&raw);
@@ -255,9 +261,37 @@ impl EditorSessions {
                 path: path.to_string(),
                 saved_content,
                 terminator,
+                opener,
             },
         );
         Ok((id, state))
+    }
+
+    /// The most-recently-opened session owned by `principal` (the highest id,
+    /// since ids increment monotonically) and the path it edits — what `fg`
+    /// re-foregrounds. `None` if the principal has no open editor (`fg` then
+    /// reports "no editor session"). The job-control "most recent" semantics.
+    pub fn latest_session_for(
+        &self,
+        principal: PrincipalId,
+    ) -> Option<(EditorSessionId, String)> {
+        self.sessions
+            .iter()
+            .filter(|(_, s)| s.opener == Some(principal))
+            .max_by_key(|(id, _)| id.0)
+            .map(|(id, s)| (*id, s.path.clone()))
+    }
+
+    /// The most-recently-opened session of *any* opener — `fg`'s shared-trust
+    /// fallback when the caller's principal owns none. In a single-user
+    /// instrument "the editor" is unambiguous; precise per-principal targeting
+    /// (and threading the opener through the external-MCP path, which `:r !cmd`
+    /// also needs) is a multi-user refinement. `None` if no editor is open.
+    pub fn latest_session_any(&self) -> Option<(EditorSessionId, String)> {
+        self.sessions
+            .iter()
+            .max_by_key(|(id, _)| id.0)
+            .map(|(id, s)| (*id, s.path.clone()))
     }
 
     /// Feed keys to a session, mirror the produced edits onto the CRDT block,
@@ -711,7 +745,7 @@ mod session_tests {
     async fn keystrokes_mirror_to_the_owning_block() {
         let (blocks, target) = seeded(b"hello").await;
         let mut sessions = EditorSessions::new();
-        let (id, st) = sessions.open(RC_PATH, target, &blocks).unwrap();
+        let (id, st) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
         assert_eq!(st.text, "hello");
         assert!(!st.dirty);
 
@@ -729,7 +763,7 @@ mod session_tests {
     async fn save_clears_dirty_and_moves_the_checkpoint() {
         let (blocks, target) = seeded(b"hello").await;
         let mut sessions = EditorSessions::new();
-        let (id, _) = sessions.open(RC_PATH, target, &blocks).unwrap();
+        let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
 
         sessions.keys(id, "iX<Esc>", &blocks).unwrap();
         let st = sessions.save(id).unwrap();
@@ -741,7 +775,7 @@ mod session_tests {
     async fn quit_rolls_the_block_back_to_the_open_checkpoint() {
         let (blocks, target) = seeded(b"hello").await;
         let mut sessions = EditorSessions::new();
-        let (id, _) = sessions.open(RC_PATH, target, &blocks).unwrap();
+        let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
 
         // Delete the first char, mirror lands on the block...
         sessions.keys(id, "x", &blocks).unwrap();
@@ -759,7 +793,7 @@ mod session_tests {
         // checkpoints the edit and drops the session in one shot.
         let (blocks, target) = seeded(b"hello").await;
         let mut sessions = EditorSessions::new();
-        let (id, _) = sessions.open(RC_PATH, target, &blocks).unwrap();
+        let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
 
         sessions.keys(id, "iX<Esc>", &blocks).unwrap(); // -> "Xhello"
         let outcome = sessions.keys(id, "ZZ", &blocks).unwrap();
@@ -776,7 +810,7 @@ mod session_tests {
     async fn zq_through_keys_discards_and_closes() {
         let (blocks, target) = seeded(b"hello").await;
         let mut sessions = EditorSessions::new();
-        let (id, _) = sessions.open(RC_PATH, target, &blocks).unwrap();
+        let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
 
         sessions.keys(id, "iX<Esc>", &blocks).unwrap(); // -> "Xhello"
         let outcome = sessions.keys(id, "ZQ", &blocks).unwrap();
@@ -795,7 +829,7 @@ mod session_tests {
         // mode state, so this never trips the close path.
         let (blocks, target) = seeded(b"").await;
         let mut sessions = EditorSessions::new();
-        let (id, _) = sessions.open(RC_PATH, target, &blocks).unwrap();
+        let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
 
         let outcome = sessions.keys(id, "iZZ", &blocks).unwrap();
         assert!(matches!(outcome, KeysOutcome::Updated(_)));
@@ -807,7 +841,7 @@ mod session_tests {
     async fn quit_rolls_back_to_last_save_not_to_original() {
         let (blocks, target) = seeded(b"hello").await;
         let mut sessions = EditorSessions::new();
-        let (id, _) = sessions.open(RC_PATH, target, &blocks).unwrap();
+        let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
 
         sessions.keys(id, "iX<Esc>", &blocks).unwrap(); // -> "Xhello"
         sessions.save(id).unwrap(); // checkpoint = "Xhello"
@@ -826,7 +860,7 @@ mod session_tests {
         // its terminator through a quit-rollback.
         let (blocks, target) = seeded(b"hello\n").await;
         let mut sessions = EditorSessions::new();
-        let (id, st) = sessions.open(RC_PATH, target, &blocks).unwrap();
+        let (id, st) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
         assert_eq!(st.text, "hello");
         assert!(!st.dirty, "a newline-terminated block must open clean");
 
@@ -848,8 +882,8 @@ mod session_tests {
         // is faithful) and MERGE the stale sibling B, reporting only B.
         let (blocks, target) = seeded(b"hello").await;
         let mut sessions = EditorSessions::new();
-        let (a, _) = sessions.open(RC_PATH, target, &blocks).unwrap();
-        let (b, _) = sessions.open(RC_PATH, target, &blocks).unwrap();
+        let (a, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+        let (b, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
 
         sessions.keys(a, "iX<Esc>", &blocks).unwrap();
         assert_eq!(block_text(&blocks, &target).unwrap(), "Xhello");
@@ -879,7 +913,7 @@ mod session_tests {
     async fn keys_on_a_dropped_session_fails_loud() {
         let (blocks, target) = seeded(b"hello").await;
         let mut sessions = EditorSessions::new();
-        let (id, _) = sessions.open(RC_PATH, target, &blocks).unwrap();
+        let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
         sessions.quit(id, &blocks).unwrap();
         let err = sessions.keys(id, "x", &blocks).unwrap_err();
         assert!(err.contains("no such session"), "got: {err}");
@@ -893,7 +927,7 @@ mod session_tests {
         // session, keep the change on the block.
         let (blocks, target) = seeded(b"hello").await;
         let mut sessions = EditorSessions::new();
-        let (id, _) = sessions.open(RC_PATH, target, &blocks).unwrap();
+        let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
 
         sessions.keys(id, "iX<Esc>", &blocks).unwrap(); // -> "Xhello"
         let outcome = sessions.keys(id, ":wq<CR>", &blocks).unwrap();
@@ -911,7 +945,7 @@ mod session_tests {
         // last change"), not silently lose the edit.
         let (blocks, target) = seeded(b"hello").await;
         let mut sessions = EditorSessions::new();
-        let (id, _) = sessions.open(RC_PATH, target, &blocks).unwrap();
+        let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
 
         sessions.keys(id, "iX<Esc>", &blocks).unwrap(); // dirty
         let err = sessions.keys(id, ":q<CR>", &blocks).unwrap_err();
@@ -923,7 +957,7 @@ mod session_tests {
     async fn colon_q_bang_discards_and_closes() {
         let (blocks, target) = seeded(b"hello").await;
         let mut sessions = EditorSessions::new();
-        let (id, _) = sessions.open(RC_PATH, target, &blocks).unwrap();
+        let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
 
         sessions.keys(id, "iX<Esc>", &blocks).unwrap(); // -> "Xhello"
         let outcome = sessions.keys(id, ":q!<CR>", &blocks).unwrap();
@@ -937,7 +971,7 @@ mod session_tests {
     async fn colon_w_saves_and_stays_open() {
         let (blocks, target) = seeded(b"hello").await;
         let mut sessions = EditorSessions::new();
-        let (id, _) = sessions.open(RC_PATH, target, &blocks).unwrap();
+        let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
 
         sessions.keys(id, "iX<Esc>", &blocks).unwrap();
         let outcome = sessions.keys(id, ":w<CR>", &blocks).unwrap();
@@ -957,7 +991,7 @@ mod session_tests {
     async fn unknown_colon_command_fails_loud() {
         let (blocks, target) = seeded(b"hello").await;
         let mut sessions = EditorSessions::new();
-        let (id, _) = sessions.open(RC_PATH, target, &blocks).unwrap();
+        let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
 
         let err = sessions.keys(id, ":frobnicate<CR>", &blocks).unwrap_err();
         assert!(err.contains("Not an editor command"), "got: {err}");
@@ -970,7 +1004,7 @@ mod session_tests {
         // keystroke, so a `cat`/exec of the path sees the substituted text.
         let (blocks, target) = seeded(b"alpha beta alpha").await;
         let mut sessions = EditorSessions::new();
-        let (id, _) = sessions.open(RC_PATH, target, &blocks).unwrap();
+        let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
 
         let outcome = sessions.keys(id, ":s/alpha/ALPHA/g<CR>", &blocks).unwrap();
         assert_eq!(outcome.state().text, "ALPHA beta ALPHA");
@@ -983,7 +1017,7 @@ mod session_tests {
     async fn colon_percent_s_then_wq_persists() {
         let (blocks, target) = seeded(b"x y\nx y").await;
         let mut sessions = EditorSessions::new();
-        let (id, _) = sessions.open(RC_PATH, target, &blocks).unwrap();
+        let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
 
         sessions.keys(id, ":%s/x/Z/g<CR>", &blocks).unwrap();
         let outcome = sessions.keys(id, ":wq<CR>", &blocks).unwrap();
@@ -997,7 +1031,7 @@ mod session_tests {
         // A substitution followed by `:q!` discards it (rollback to checkpoint).
         let (blocks, target) = seeded(b"keep me").await;
         let mut sessions = EditorSessions::new();
-        let (id, _) = sessions.open(RC_PATH, target, &blocks).unwrap();
+        let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
 
         sessions.keys(id, ":s/keep/DROP/<CR>", &blocks).unwrap();
         assert_eq!(block_text(&blocks, &target).unwrap(), "DROP me");
@@ -1009,7 +1043,7 @@ mod session_tests {
     async fn bad_substitute_pattern_fails_loud_and_leaves_block_clean() {
         let (blocks, target) = seeded(b"hello").await;
         let mut sessions = EditorSessions::new();
-        let (id, _) = sessions.open(RC_PATH, target, &blocks).unwrap();
+        let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
 
         let err = sessions.keys(id, ":s/[/x/<CR>", &blocks).unwrap_err();
         assert!(err.contains("invalid :s pattern"), "got: {err}");
@@ -1023,13 +1057,44 @@ mod session_tests {
         // can draw the strip without tracking mode.
         let (blocks, target) = seeded(b"hello").await;
         let mut sessions = EditorSessions::new();
-        let (id, _) = sessions.open(RC_PATH, target, &blocks).unwrap();
+        let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
 
         let outcome = sessions.keys(id, ":w", &blocks).unwrap();
         assert_eq!(
             outcome.state().command_line.as_deref(),
             Some(":w"),
             "the in-progress command line surfaces on the state"
+        );
+    }
+
+    #[tokio::test]
+    async fn latest_session_for_finds_the_most_recent_per_principal() {
+        // `fg` resumes the caller's most-recently-opened session (job-control
+        // "most recent"); a principal with no editor gets None.
+        let (blocks, target) = seeded(b"hello").await;
+        let mut sessions = EditorSessions::new();
+        let me = PrincipalId::system();
+        let other = PrincipalId::beat();
+
+        let (_a, _) = sessions.open(RC_PATH, target, &blocks, Some(me)).unwrap();
+        let (b, _) = sessions.open(RC_PATH, target, &blocks, Some(me)).unwrap();
+
+        assert_eq!(
+            sessions.latest_session_for(me).map(|(id, _)| id),
+            Some(b),
+            "the highest (most recent) session id for the principal"
+        );
+        assert_eq!(
+            sessions.latest_session_for(other),
+            None,
+            "a principal with no editor has nothing to foreground"
+        );
+        // An opener-less (headless) session is owned by no principal.
+        let (_c, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+        assert_eq!(
+            sessions.latest_session_for(me).map(|(id, _)| id),
+            Some(b),
+            "a None-opener session doesn't become anyone's fg target"
         );
     }
 }

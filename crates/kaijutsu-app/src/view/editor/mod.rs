@@ -13,6 +13,7 @@ use bevy::tasks::IoTaskPool;
 use kaijutsu_client::{EditorState, ServerEvent};
 
 use crate::connection::{RpcActor, RpcResultChannel, RpcResultMessage, ServerEventMessage};
+use crate::input::focus::{ActiveSurface, FocusArea};
 use crate::ui::screen::Screen;
 
 mod keys;
@@ -166,6 +167,9 @@ fn editor_dispatch_keys(
     active: Res<ActiveEditor>,
     actor: Option<Res<RpcActor>>,
     results: Res<RpcResultChannel>,
+    mut next_screen: ResMut<NextState<Screen>>,
+    mut focus: ResMut<FocusArea>,
+    mut surface: ResMut<ActiveSurface>,
 ) {
     let Some(view) = active.session.as_ref() else {
         keyboard.clear();
@@ -186,6 +190,22 @@ fn editor_dispatch_keys(
             continue;
         }
         let ctrl = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
+
+        // Ctrl+Z suspends the editor to the shell (the job-control metaphor):
+        // leave to the conversation with the shell focused, but keep
+        // `ActiveEditor` — the session stays alive in the kernel as the
+        // "suspended job", and `fg` re-foregrounds it. This is a *local*
+        // intercept (no kernel round-trip), so it also frees a frozen editor when
+        // the kernel is unreachable — the escape hatch. (The Action-system
+        // Ctrl+Z↔ToggleSurface is suppressed on `Screen::Editor`, so there is no
+        // double-handling.) The buffer isn't forwarded `<C-z>`.
+        if ctrl && event.key_code == KeyCode::KeyZ {
+            next_screen.set(Screen::Conversation);
+            *focus = FocusArea::Compose;
+            *surface = ActiveSurface::Shell;
+            return;
+        }
+
         let Some(notation) = keys::bevy_to_vi_notation(event, ctrl) else {
             continue;
         };

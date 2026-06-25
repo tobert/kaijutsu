@@ -858,11 +858,23 @@ impl Kernel {
         path: &str,
         blocks: &crate::block_store::SharedBlockStore,
     ) -> Result<(crate::editor::EditorSessionId, crate::editor::EditorState), String> {
+        self.editor_open_as(path, blocks, None).await
+    }
+
+    /// Open an editor recording the `opener` principal on the session, so `fg`
+    /// can later re-foreground it for that principal. The signaled front doors
+    /// (`vi`/`edit`, `kj editor`, `kj rc edit`) pass the submitter here.
+    pub async fn editor_open_as(
+        &self,
+        path: &str,
+        blocks: &crate::block_store::SharedBlockStore,
+        opener: Option<kaijutsu_types::PrincipalId>,
+    ) -> Result<(crate::editor::EditorSessionId, crate::editor::EditorState), String> {
         let file_cache = self.file_cache(blocks);
         // Resolve (the only async step) BEFORE taking the sync mutex, so the
         // `!Send` `EditorCore` never coexists with an await.
         let target = crate::editor::resolve_editor_target(path, blocks, &file_cache).await?;
-        self.editor_sessions.lock().0.open(path, target, blocks)
+        self.editor_sessions.lock().0.open(path, target, blocks, opener)
     }
 
     /// Feed keys to an open session, mirroring the edits onto the CRDT block.
@@ -1364,8 +1376,37 @@ impl Kernel {
         blocks: &crate::block_store::SharedBlockStore,
         submitter: Option<kaijutsu_types::PrincipalId>,
     ) -> Result<(crate::editor::EditorSessionId, crate::editor::EditorState), String> {
-        let (id, state) = self.editor_open(path, blocks).await?;
+        // Record the opener so `fg` (and a future `:r !cmd`) can find the
+        // submitter's session later.
+        let (id, state) = self.editor_open_as(path, blocks, submitter).await?;
         self.signal_open_editor(id, path, &state, submitter).await;
+        Ok((id, state))
+    }
+
+    /// `fg` — re-foreground the submitter's most-recently-opened editor session
+    /// (job-control resume after a Ctrl+Z suspend). Re-fires the existing
+    /// `open_editor` signal with the session's *current* state, so the app pops
+    /// back to `Screen::Editor` via the same landing handler. Fails loud with
+    /// "no editor session" when the principal has nothing suspended (so the shell
+    /// reports it like bash's `fg: no current job`).
+    pub async fn resume_editor(
+        &self,
+        submitter: Option<kaijutsu_types::PrincipalId>,
+    ) -> Result<(crate::editor::EditorSessionId, crate::editor::EditorState), String> {
+        let (id, path, state) = {
+            let mut sessions = self.editor_sessions.lock();
+            // Prefer the caller's own most-recent session; fall back to the
+            // most-recent editor of any opener (shared-trust single-user — and a
+            // safety net while the opener isn't captured on every front-door
+            // path, e.g. the external-MCP shell).
+            let found = submitter
+                .and_then(|p| sessions.0.latest_session_for(p))
+                .or_else(|| sessions.0.latest_session_any());
+            let (id, path) = found.ok_or_else(|| "fg: no editor session".to_string())?;
+            let state = sessions.0.state(id)?;
+            (id, path, state)
+        };
+        self.signal_open_editor(id, &path, &state, submitter).await;
         Ok((id, state))
     }
 
@@ -1650,6 +1691,55 @@ mod tests {
             .unwrap();
         assert_eq!(after.text, "AINSERTEDB", "file content spliced at the cursor");
         assert!(after.dirty, ":r dirties the buffer");
+    }
+
+    #[tokio::test]
+    async fn resume_editor_finds_the_opener_session_or_fails_loud() {
+        // `fg`: with nothing suspended → fail loud; after a signaled open for a
+        // principal → resume_editor returns that session's current state.
+        use crate::block_store::shared_block_store_with_db;
+        use crate::file_tools::FileDocumentCache;
+        use crate::kernel_db::KernelDb;
+        use crate::runtime::config_crdt_fs::ConfigCrdtFs;
+        use crate::vfs::VfsOps as _;
+        use kaijutsu_crdt::PrincipalId;
+        use std::path::Path;
+
+        let kernel = Kernel::new_ephemeral("test").await;
+        let creator = PrincipalId::system();
+        let db = Arc::new(parking_lot::Mutex::new(KernelDb::in_memory().unwrap()));
+        let ws = db.lock().get_or_create_default_workspace(creator).unwrap();
+        let blocks = shared_block_store_with_db(db, ws, creator);
+        kernel
+            .mount("/etc/rc", ConfigCrdtFs::new(blocks.clone(), "/etc/rc"))
+            .await;
+        ConfigCrdtFs::new(blocks.clone(), "/etc/rc")
+            .write_all(Path::new("coder/create/S00.kai"), b"hello")
+            .await
+            .unwrap();
+        let cache = Arc::new(FileDocumentCache::new(blocks.clone(), kernel.vfs().clone()));
+        kernel.set_file_cache(cache);
+        let path = "/etc/rc/coder/create/S00.kai";
+
+        // Nothing open at all → fail loud (no session to foreground).
+        let me = PrincipalId::system();
+        assert!(
+            kernel.resume_editor(Some(me)).await.is_err(),
+            "fg with nothing open fails loud"
+        );
+        assert!(kernel.resume_editor(None).await.is_err(), "...regardless of principal");
+
+        // Open as `me` (records the opener), then resume finds it by principal.
+        let (id, _) = kernel.editor_open_as(path, &blocks, Some(me)).await.unwrap();
+        let (resumed_id, st) = kernel.resume_editor(Some(me)).await.unwrap();
+        assert_eq!(resumed_id, id, "fg foregrounds the principal's session");
+        assert_eq!(st.text, "hello");
+
+        // Shared-trust fallback: even a caller with no recorded session (or no
+        // principal at all — e.g. an opener-less open via the external MCP path)
+        // resumes the most-recent editor.
+        let (fallback_id, _) = kernel.resume_editor(None).await.unwrap();
+        assert_eq!(fallback_id, id, "fg falls back to the most-recent editor");
     }
 
     #[tokio::test]
