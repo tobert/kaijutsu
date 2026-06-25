@@ -643,9 +643,65 @@ contract as buffer/cursor today, no app mode tracking).
      SUBSTITUTED/` rendered in the app; `:q!` restored the block.
    - **Deferred:** bare `:s` (repeat-last) errors for now; `.`/`$` ranges;
      `&`/`~` repeat; substitute undo granularity.
-3. `:!` (temp-file + nested editor — confronts the session-stack question) and
-   `:r` / `:r !` (read-into-buffer).
+3. `:r` / `:r !` (read-into-buffer), then `:!` (popped editor). **Design locked
+   2026-06-25 — see "Step 3 design" below. Not yet built.**
 4. `:e` if/when wanted.
+
+### Step 3 design — `:r` / `:r !` / `:!` (locked 2026-06-25, not yet built)
+
+Unlike `:s` (a pure buffer transform), step 3 crosses the pure-`EditorCore`
+boundary: `:r`/`:!` need the **kernel** (VFS read, `EmbeddedKaish`), and the
+intent is **async** I/O for the first time. Designed against the two drivers that
+must both work: a **human in the app** and a **headless/model driver** over
+`kj editor keys` (the latter has no screen — which is what settles the stack
+question).
+
+**Locked decisions (Amy, 2026-06-25):**
+1. **`:!cmd` output → an ephemeral, auto-discarded block.** Mint a transient
+   in-memory block holding stdout, open session B on it, **delete it when B
+   closes**. No persistence, no scratch-dir/cleanup-policy question. (Rejected: a
+   persisted temp file in a writable VFS scratch dir; and an inline-into-
+   conversation Trace block that skips the nested editor — the popped editor is
+   the locked UX.)
+2. **Increment order: `:r`/`:r !` first, then `:!`.** The read-into-buffer half
+   has no session stack; build + test it, then tackle the nested editor.
+3. **Return stack is app-side; kernel sessions stay flat.** `:!cmd` just mints
+   session B and fires the existing `open_editor` signal; session A stays alive.
+   The app holds a `Vec<EditorSessionView>` nav stack (like `ScrollOffsets`):
+   open B pushes, B's `EditorClosed` pops back to A (re-render from A's still-live
+   kernel state), empty stack → conversation. A headless driver just gets B's
+   handle and closes it — "which screen on close" is genuinely renderer/view
+   state, so the kernel carries no parent pointer. (Rejected: kernel-side parent
+   pointer — bakes UI navigation into the kernel for no headless benefit.)
+
+**Mechanism (the async-intent shape):**
+- `EditorCore` gains `EditorIo::{ReadFile(path), ReadShell(cmd), Shell(cmd)}`,
+  surfaced via `take_io()` (sibling of `take_commands`), plus a pure
+  `insert_at_cursor(text) -> Vec<EditOp>` the kernel calls after a fetch. `:r`
+  parses to `ReadFile`/`ReadShell`; `:!` (3b) to `Shell`.
+- **`Kernel::editor_keys` becomes `async`** (the real ripple). New shape:
+  sync-lock { apply_keys, mirror, `take_io`/`take_close`/`take_commands` } →
+  release → **await** the I/O (VFS `get_or_load` for `:r <file>`; the context's
+  `EmbeddedKaish` for `:r !cmd`) → sync-lock { `insert_at_cursor(fetched)`,
+  mirror } → publish state. `EditorCore` (`!Send`) never crosses the await — only
+  the fetched `String` does (preserves the `SendSessions` invariant). Callers:
+  the server rpc handler wraps its body in `Promise::from_future`; `kj editor` +
+  tests are already async (just `.await`).
+- Shell runs through the **session's context** `EmbeddedKaish` (its capability
+  allow-set), fail-loud on denial — consistent with the shared-trust-but-gated
+  model. `:r` insertion is **at the cursor** (the design's stated point), not
+  vim's linewise-below — simpler, noted as a possible refinement.
+- **`:!` (3b):** the kernel runs the command, mints an ephemeral block from
+  stdout, opens session B on it, and signals `open_editor` (the existing path).
+  The app pushes B on its nav stack; on B's `EditorClosed` it deletes the block
+  and returns to A. The nested-session lifetime is the only genuinely new kernel
+  concept; everything else reuses the step-1/2 surface.
+
+**Fail-loud:** a missing file, a denied/failed shell command, or an unfulfilled
+intent must surface an error (the `editor_keys` `Err` path) — never a silent
+no-op. This is why `:r` cannot ship as a pure-`EditorCore` half alone (the
+unfulfilled intent would silently drop); the kernel fulfillment lands in the same
+increment.
 
 ---
 
