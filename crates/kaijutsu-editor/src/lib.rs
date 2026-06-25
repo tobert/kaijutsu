@@ -107,6 +107,11 @@ pub struct EditorCore {
     /// the kernel via [`take_commands`](EditorCore::take_commands). `None` if no
     /// command was submitted; `Some(Err)` for an unknown command (fail loud).
     pending_commands: Option<Result<Vec<CommandRequest>, String>>,
+    /// A `:s` substitution submitted during the current `apply_keys`, applied to
+    /// the document buffer right after the keystroke that submitted it — so the
+    /// per-keystroke diff turns it into [`EditOp`]s the kernel mirrors (unlike
+    /// `:w`/`:q`, substitute is an *edit*, not a session-lifecycle command).
+    pending_substitution: Option<Substitution>,
 }
 
 impl EditorCore {
@@ -136,6 +141,7 @@ impl EditorCore {
             cmdline_group,
             pending_close: None,
             pending_commands: None,
+            pending_substitution: None,
         }
     }
 
@@ -230,6 +236,7 @@ impl EditorCore {
         // consumed by the kernel (or is irrelevant — the session is still open).
         self.pending_close = None;
         self.pending_commands = None;
+        self.pending_substitution = None;
         for key in parse_keys(keys) {
             // Diff against the normalized (terminator-stripped) view so emitted
             // offsets are char-indexed into the logical content, matching the
@@ -251,10 +258,20 @@ impl EditorCore {
                         self.cmdline_active = false;
                     }
                     // `<CR>` in the bar submits: parse the typed line for its
-                    // dialect into command intents the kernel will act on.
+                    // dialect. Lifecycle verbs (`:w`/`:q`/…) queue intents the
+                    // kernel acts on; a `:s` queues a buffer edit applied below.
                     Action::Prompt(PromptAction::Submit) if self.cmdline_active => {
                         let body = strip_one_trailing_newline(&self.cmdline.get_text());
-                        self.pending_commands = Some(parse_command_line(&self.cmdline_prefix, &body));
+                        match parse_command_line(&self.cmdline_prefix, &body) {
+                            Ok(ParsedLine::Commands(cmds)) => {
+                                self.pending_commands = Some(Ok(cmds));
+                            }
+                            Ok(ParsedLine::Substitute(sub)) => {
+                                self.pending_substitution = Some(sub);
+                            }
+                            Ok(ParsedLine::Noop) => {}
+                            Err(e) => self.pending_commands = Some(Err(e)),
+                        }
                         self.cmdline_active = false;
                     }
                     // `<Esc>` / `<C-C>` (Abort) and any other prompt action close
@@ -289,12 +306,36 @@ impl EditorCore {
                     _ => {}
                 }
             }
+            // A submitted `:s` edits the document here, so the diff below turns
+            // it into the EditOp(s) the kernel mirrors onto the CRDT block.
+            if let Some(sub) = self.pending_substitution.take() {
+                self.apply_substitution(&sub);
+            }
             let after = strip_one_trailing_newline(&self.buffer.get_text());
             if let Some(op) = diff_op(&before, &after) {
                 ops.push(op);
             }
         }
         ops
+    }
+
+    /// Run a parsed `:s` substitution against the document buffer and move the
+    /// leader cursor onto the result (clamped). A no-match substitution leaves
+    /// the buffer untouched (no EditOp). `set_text` resets undo — acceptable for
+    /// pass 1 (a `:s` is a deliberate bulk edit); finer-grained undo is later
+    /// work, tracked in `docs/vi.md`.
+    fn apply_substitution(&mut self, sub: &Substitution) {
+        let text = self.text();
+        let cursor = self.cursor();
+        let cursor_line = line_col(&text, cursor).0;
+        let new = sub.apply(&text, cursor_line);
+        if new == text {
+            return; // no match — nothing changed
+        }
+        let new_cursor = cursor.min(new.chars().count());
+        self.buffer.set_text(new.as_str());
+        let (line, col) = line_col(&new, new_cursor);
+        self.buffer.set_leader(self.group, Cursor::new(line, col));
     }
 }
 
@@ -303,38 +344,201 @@ fn strip_one_trailing_newline(s: &str) -> String {
     s.strip_suffix('\n').unwrap_or(s).to_string()
 }
 
-/// Parse a submitted command line into the [`CommandRequest`]s it expands to.
-/// `prefix` selects the dialect: `:` is the ex-command line (pass-1 below);
-/// `/`·`?` are search, **not wired yet** — a safe no-op so an accidental search
-/// never edits the document. `body` is the text after the prefix.
-fn parse_command_line(prefix: &str, body: &str) -> Result<Vec<CommandRequest>, String> {
+/// What a submitted `:`-line parsed into. Lifecycle verbs ([`CommandRequest`])
+/// are handed to the kernel; a [`Substitution`] is applied to the buffer here;
+/// [`Noop`](ParsedLine::Noop) is a bare `:` or an unwired `/` search.
+enum ParsedLine {
+    Commands(Vec<CommandRequest>),
+    Substitute(Substitution),
+    Noop,
+}
+
+/// Parse a submitted command line. `prefix` selects the dialect: `:` is the
+/// ex-command line; `/`·`?` are search, **not wired yet** — a safe no-op so an
+/// accidental search never edits the document. `body` is the text after the
+/// prefix.
+fn parse_command_line(prefix: &str, body: &str) -> Result<ParsedLine, String> {
     if prefix.starts_with(':') {
         parse_ex_command(body)
     } else {
         // `/`·`?` search — deferred (docs/vi.md). Submitting one does nothing.
-        Ok(Vec::new())
+        Ok(ParsedLine::Noop)
     }
 }
 
-/// Parse the ex-command dialect (pass 1): `w q wq x exit` with an optional
-/// trailing `!` (force). A bare line (`:`<CR>) is a no-op; an unknown verb is a
-/// fail-loud error the kernel surfaces.
-fn parse_ex_command(body: &str) -> Result<Vec<CommandRequest>, String> {
+/// Parse the ex-command dialect. Substitute (`[range]s/pat/rep/flags`) is
+/// recognized first (it isn't a bare verb); then the lifecycle verbs `w q wq x
+/// exit` with an optional trailing `!` (force). A bare line is a no-op; an
+/// unknown verb is a fail-loud error the kernel surfaces.
+fn parse_ex_command(body: &str) -> Result<ParsedLine, String> {
     use CommandRequest::{Quit, Write};
     let body = body.trim();
+
+    if let Some(sub) = parse_substitute(body)? {
+        return Ok(ParsedLine::Substitute(sub));
+    }
+
     // A trailing `!` forces; strip it before matching the verb.
     let (verb, force) = match body.strip_suffix('!') {
         Some(v) => (v.trim_end(), true),
         None => (body, false),
     };
-    match verb {
-        "" => Ok(Vec::new()),
-        "w" | "write" => Ok(vec![Write { force }]),
-        "q" | "quit" => Ok(vec![Quit { force }]),
-        "wq" => Ok(vec![Write { force }, Quit { force }]),
-        "x" | "xit" | "exit" => Ok(vec![Write { force }, Quit { force }]),
-        other => Err(format!("Not an editor command: :{other}")),
+    let cmds = match verb {
+        "" => Vec::new(),
+        "w" | "write" => vec![Write { force }],
+        "q" | "quit" => vec![Quit { force }],
+        "wq" => vec![Write { force }, Quit { force }],
+        "x" | "xit" | "exit" => vec![Write { force }, Quit { force }],
+        other => return Err(format!("Not an editor command: :{other}")),
+    };
+    Ok(ParsedLine::Commands(cmds))
+}
+
+/// Which lines a `:s` touches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SubRange {
+    /// No range prefix — the line the cursor is on.
+    CurrentLine,
+    /// `%` — the whole buffer.
+    Whole,
+    /// `N` or `N,M` — 1-indexed, inclusive (clamped to the buffer).
+    Lines(usize, usize),
+}
+
+/// A parsed `:s` substitution: a compiled regex applied over a line range,
+/// first-match-per-line unless `global` (`g`). The dialect is **Rust regex**
+/// (and Rust replacement syntax — `$1` capture refs), a deliberate choice over
+/// chasing vim's BRE flavor (docs/vi.md): the `:` line is its own dialect.
+#[derive(Debug)]
+struct Substitution {
+    regex: regex::Regex,
+    replacement: String,
+    range: SubRange,
+    global: bool,
+}
+
+impl Substitution {
+    /// Apply to `text`, where `cursor_line` (0-indexed) is the current line for
+    /// a rangeless `:s`. Returns the new text (equal to `text` on no match).
+    fn apply(&self, text: &str, cursor_line: usize) -> String {
+        let mut lines: Vec<String> = text.split('\n').map(str::to_string).collect();
+        let last = lines.len().saturating_sub(1);
+        let (start, end) = match self.range {
+            SubRange::CurrentLine => (cursor_line.min(last), cursor_line.min(last)),
+            SubRange::Whole => (0, last),
+            // 1-indexed → 0-indexed, clamped; an inverted range touches nothing.
+            SubRange::Lines(a, b) => (a.saturating_sub(1).min(last), b.saturating_sub(1).min(last)),
+        };
+        for line in lines.iter_mut().take(end + 1).skip(start) {
+            *line = if self.global {
+                self.regex.replace_all(line, self.replacement.as_str()).into_owned()
+            } else {
+                self.regex.replace(line, self.replacement.as_str()).into_owned()
+            };
+        }
+        lines.join("\n")
     }
+}
+
+/// Recognize and parse a substitute line (`[range]s<delim>pat<delim>rep<delim>flags`).
+/// Returns `Ok(None)` when `body` isn't a substitute (so the caller falls
+/// through to the lifecycle verbs), `Ok(Some)` when it parses, and `Err` for a
+/// malformed substitute (bad regex, unknown flag, empty pattern) — fail loud.
+fn parse_substitute(body: &str) -> Result<Option<Substitution>, String> {
+    let (range, rest) = split_range(body);
+    let Some(after_s) = rest.strip_prefix('s') else {
+        return Ok(None); // not `s...`
+    };
+    // `s` must be followed by a delimiter (a non-alphanumeric, non-space char);
+    // otherwise this is `set`/`s`/etc., not our substitute.
+    let delim = match after_s.chars().next() {
+        Some(d) if !d.is_alphanumeric() && !d.is_whitespace() => d,
+        _ => return Ok(None),
+    };
+
+    let (pat, rep, flags) = split_substitute(after_s, delim);
+    if pat.is_empty() {
+        return Err("empty :s pattern is not supported".to_string());
+    }
+    let mut global = false;
+    let mut ignore_case = false;
+    for f in flags.chars() {
+        match f {
+            'g' => global = true,
+            'i' => ignore_case = true,
+            other => return Err(format!("unsupported :s flag '{other}'")),
+        }
+    }
+    let regex = regex::RegexBuilder::new(&pat)
+        .case_insensitive(ignore_case)
+        .build()
+        .map_err(|e| format!("invalid :s pattern: {e}"))?;
+    Ok(Some(Substitution {
+        regex,
+        replacement: rep,
+        range,
+        global,
+    }))
+}
+
+/// Split a leading line-range off a command body, returning the range and the
+/// remainder. Supports `%` (whole), `N` / `N,M` (1-indexed); anything else is
+/// [`SubRange::CurrentLine`] with the body untouched.
+fn split_range(body: &str) -> (SubRange, &str) {
+    if let Some(rest) = body.strip_prefix('%') {
+        return (SubRange::Whole, rest);
+    }
+    let d1: String = body.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if d1.is_empty() {
+        return (SubRange::CurrentLine, body);
+    }
+    let after1 = &body[d1.len()..];
+    if let Some(rest2) = after1.strip_prefix(',') {
+        let d2: String = rest2.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !d2.is_empty() {
+            let n = d1.parse().unwrap_or(1);
+            let m = d2.parse().unwrap_or(n);
+            return (SubRange::Lines(n, m), &rest2[d2.len()..]);
+        }
+    }
+    let n = d1.parse().unwrap_or(1);
+    (SubRange::Lines(n, n), after1)
+}
+
+/// Split `<delim>pat<delim>rep<delim>flags` (the text from the first delimiter
+/// onward) into `(pattern, replacement, flags)`. A `\` escapes the delimiter
+/// (kept literal in the pattern); other `\x` escapes pass through to the regex.
+/// A trailing delimiter / omitted sections are allowed (`s/a/b`, `s/a/b/`).
+fn split_substitute(after_s: &str, delim: char) -> (String, String, String) {
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut escaped = false;
+    // Skip the opening delimiter.
+    for c in after_s.chars().skip(1) {
+        if escaped {
+            if c == delim {
+                cur.push(delim); // `\<delim>` → a literal delimiter in the field
+            } else {
+                cur.push('\\');
+                cur.push(c); // keep `\x` for the regex engine (e.g. `\d`)
+            }
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == delim {
+            parts.push(std::mem::take(&mut cur));
+        } else {
+            cur.push(c);
+        }
+    }
+    if escaped {
+        cur.push('\\'); // a dangling trailing backslash
+    }
+    parts.push(cur);
+    let pat = parts.first().cloned().unwrap_or_default();
+    let rep = parts.get(1).cloned().unwrap_or_default();
+    let flags = parts.get(2).cloned().unwrap_or_default();
+    (pat, rep, flags)
 }
 
 /// Minimal common-prefix/suffix diff of two strings into a single char-indexed
@@ -619,6 +823,184 @@ mod tests {
         ed.apply_keys("ihttp://x<Esc>");
         assert_eq!(ed.text(), "http://x");
         assert_eq!(ed.take_commands(), None, "no command from an inserted colon");
+    }
+
+    // ── Substitute (`:s`) ────────────────────────────────────────────────────
+    //
+    // `:s` is an *edit*: it mutates the buffer and flows through the normal
+    // diff→EditOp path. The dialect is Rust regex + Rust replacement syntax.
+    // Extensive on purpose — this is the surface most likely to surprise.
+
+    mod substitute {
+        use super::*;
+
+        /// `(initial, keys, expected_text)` — run a `:s` and assert the buffer.
+        fn sub(initial: &str, keys: &str, expected: &str) {
+            let mut ed = EditorCore::new(initial);
+            ed.apply_keys(keys);
+            assert_eq!(ed.text(), expected, "keys {keys:?} on {initial:?}");
+        }
+
+        #[test]
+        fn current_line_first_match() {
+            sub("foo foo", ":s/foo/bar/<CR>", "bar foo");
+        }
+
+        #[test]
+        fn current_line_global() {
+            sub("foo foo foo", ":s/foo/bar/g<CR>", "bar bar bar");
+        }
+
+        #[test]
+        fn whole_buffer_global() {
+            sub("a a\nb a", ":%s/a/X/g<CR>", "X X\nb X");
+        }
+
+        #[test]
+        fn whole_buffer_first_per_line() {
+            // No `g`: first match on EACH line in range (vim's per-line model).
+            sub("a a\na a", ":%s/a/X/<CR>", "X a\nX a");
+        }
+
+        #[test]
+        fn rangeless_touches_only_the_cursor_line() {
+            let mut ed = EditorCore::new("x x\nx x\nx x");
+            ed.apply_keys("j"); // cursor → line 1
+            ed.apply_keys(":s/x/Y/g<CR>");
+            assert_eq!(ed.text(), "x x\nY Y\nx x", "only the cursor's line changes");
+        }
+
+        #[test]
+        fn numeric_line_range() {
+            sub("x\nx\nx\nx", ":2,3s/x/Y/<CR>", "x\nY\nY\nx");
+        }
+
+        #[test]
+        fn single_numbered_line() {
+            sub("x\nx\nx", ":2s/x/Y/<CR>", "x\nY\nx");
+        }
+
+        #[test]
+        fn regex_metacharacters() {
+            sub("a1b22c", ":s/[0-9]+/#/g<CR>", "a#b#c");
+        }
+
+        #[test]
+        fn capture_group_replacement() {
+            // Rust replacement syntax: `$1`. `${1}` also works; bare `$1` here.
+            sub("key=val", ":s/(\\w+)=(\\w+)/$2=$1/<CR>", "val=key");
+        }
+
+        #[test]
+        fn case_insensitive_flag() {
+            sub("HELLO hello", ":s/hello/hi/gi<CR>", "hi hi");
+        }
+
+        #[test]
+        fn alternate_delimiter() {
+            // vim allows any delimiter; useful when the pattern contains `/`.
+            sub("a/b/c", ":s#/#_#g<CR>", "a_b_c");
+        }
+
+        #[test]
+        fn escaped_delimiter_is_literal() {
+            sub("a/b end", ":s/a\\/b/X/<CR>", "X end");
+        }
+
+        #[test]
+        fn no_match_is_a_noop_and_emits_no_op() {
+            let mut ed = EditorCore::new("hello");
+            let ops = ed.apply_keys(":s/zzz/QQQ/<CR>");
+            assert_eq!(ed.text(), "hello", "no match → buffer unchanged");
+            assert!(ops.is_empty(), "no match → no EditOp to mirror");
+        }
+
+        #[test]
+        fn a_real_substitution_emits_an_editop() {
+            // The kernel mirrors these ops onto the CRDT block — they must exist.
+            let mut ed = EditorCore::new("foo");
+            let ops = ed.apply_keys(":s/foo/barbaz/<CR>");
+            assert_eq!(ed.text(), "barbaz");
+            assert!(!ops.is_empty(), "a substitution must emit at least one EditOp");
+        }
+
+        #[test]
+        fn invalid_regex_is_a_fail_loud_error() {
+            let mut ed = EditorCore::new("hello");
+            ed.apply_keys(":s/[/x/<CR>");
+            let outcome = ed.take_commands().expect("submit happened");
+            assert!(outcome.is_err(), "an unclosed class must error, not edit");
+            assert_eq!(ed.text(), "hello", "the buffer is untouched on a bad pattern");
+        }
+
+        #[test]
+        fn unsupported_flag_is_an_error() {
+            let mut ed = EditorCore::new("hello");
+            ed.apply_keys(":s/h/H/z<CR>");
+            assert!(ed.take_commands().expect("submit").is_err());
+            assert_eq!(ed.text(), "hello");
+        }
+
+        #[test]
+        fn empty_pattern_is_an_error() {
+            let mut ed = EditorCore::new("hello");
+            ed.apply_keys(":s///<CR>");
+            assert!(ed.take_commands().expect("submit").is_err());
+        }
+
+        #[test]
+        fn bare_s_is_not_a_substitute() {
+            // No delimiter → not a substitute; falls through to the verb match,
+            // which doesn't know `s` → fail loud (repeat-last-:s is deferred).
+            let mut ed = EditorCore::new("hello");
+            ed.apply_keys(":s<CR>");
+            let outcome = ed.take_commands().expect("submit");
+            assert!(outcome.is_err(), "bare :s is an unknown command for now");
+            assert_eq!(ed.text(), "hello");
+        }
+
+        #[test]
+        fn set_is_not_mistaken_for_substitute() {
+            // `:set` starts with `s` but `e` is not a delimiter.
+            assert!(parse_substitute("set").unwrap().is_none());
+        }
+
+        #[test]
+        fn cursor_clamps_after_a_shortening_substitution() {
+            let mut ed = EditorCore::new("hello world");
+            ed.apply_keys("$"); // cursor at end (offset 10)
+            ed.apply_keys(":s/world/!/<CR>"); // "hello !" — much shorter
+            assert_eq!(ed.text(), "hello !");
+            assert!(ed.cursor() <= ed.text().chars().count(), "cursor stays in bounds");
+        }
+
+        // ── direct unit tests of the parse helpers ──
+
+        #[test]
+        fn split_range_variants() {
+            assert_eq!(split_range("s/a/b/"), (SubRange::CurrentLine, "s/a/b/"));
+            assert_eq!(split_range("%s/a/b/"), (SubRange::Whole, "s/a/b/"));
+            assert_eq!(split_range("3s/a/b/"), (SubRange::Lines(3, 3), "s/a/b/"));
+            assert_eq!(split_range("2,5s/a/b/"), (SubRange::Lines(2, 5), "s/a/b/"));
+        }
+
+        #[test]
+        fn split_substitute_fields() {
+            assert_eq!(
+                split_substitute("/a/b/g", '/'),
+                ("a".into(), "b".into(), "g".into())
+            );
+            // Omitted trailing sections.
+            assert_eq!(
+                split_substitute("/a/b", '/'),
+                ("a".into(), "b".into(), String::new())
+            );
+            // Escaped delimiter folds into the pattern; `\w` passes through.
+            assert_eq!(
+                split_substitute("/a\\/\\w/b/", '/'),
+                ("a/\\w".into(), "b".into(), String::new())
+            );
+        }
     }
 
     #[test]

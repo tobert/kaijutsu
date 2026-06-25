@@ -931,6 +931,59 @@ mod session_tests {
     }
 
     #[tokio::test]
+    async fn colon_s_substitutes_onto_the_block() {
+        // `:s` is an edit — it must mirror onto the owning CRDT block like any
+        // keystroke, so a `cat`/exec of the path sees the substituted text.
+        let (blocks, target) = seeded(b"alpha beta alpha").await;
+        let mut sessions = EditorSessions::new();
+        let (id, _) = sessions.open(RC_PATH, target, &blocks).unwrap();
+
+        let outcome = sessions.keys(id, ":s/alpha/ALPHA/g<CR>", &blocks).unwrap();
+        assert_eq!(outcome.state().text, "ALPHA beta ALPHA");
+        assert!(outcome.state().dirty, "a substitution dirties the buffer");
+        // The invariant: the block equals the edited buffer.
+        assert_eq!(block_text(&blocks, &target).unwrap(), "ALPHA beta ALPHA");
+    }
+
+    #[tokio::test]
+    async fn colon_percent_s_then_wq_persists() {
+        let (blocks, target) = seeded(b"x y\nx y").await;
+        let mut sessions = EditorSessions::new();
+        let (id, _) = sessions.open(RC_PATH, target, &blocks).unwrap();
+
+        sessions.keys(id, ":%s/x/Z/g<CR>", &blocks).unwrap();
+        let outcome = sessions.keys(id, ":wq<CR>", &blocks).unwrap();
+        assert!(matches!(outcome, KeysOutcome::Closed(_)), ":wq closes");
+        // The substitution survived the save+close.
+        assert_eq!(block_text(&blocks, &target).unwrap(), "Z y\nZ y");
+    }
+
+    #[tokio::test]
+    async fn colon_s_then_q_bang_rolls_back() {
+        // A substitution followed by `:q!` discards it (rollback to checkpoint).
+        let (blocks, target) = seeded(b"keep me").await;
+        let mut sessions = EditorSessions::new();
+        let (id, _) = sessions.open(RC_PATH, target, &blocks).unwrap();
+
+        sessions.keys(id, ":s/keep/DROP/<CR>", &blocks).unwrap();
+        assert_eq!(block_text(&blocks, &target).unwrap(), "DROP me");
+        sessions.keys(id, ":q!<CR>", &blocks).unwrap();
+        assert_eq!(block_text(&blocks, &target).unwrap(), "keep me", ":q! discards :s");
+    }
+
+    #[tokio::test]
+    async fn bad_substitute_pattern_fails_loud_and_leaves_block_clean() {
+        let (blocks, target) = seeded(b"hello").await;
+        let mut sessions = EditorSessions::new();
+        let (id, _) = sessions.open(RC_PATH, target, &blocks).unwrap();
+
+        let err = sessions.keys(id, ":s/[/x/<CR>", &blocks).unwrap_err();
+        assert!(err.contains("invalid :s pattern"), "got: {err}");
+        assert_eq!(block_text(&blocks, &target).unwrap(), "hello", "no edit on a bad pattern");
+        assert!(sessions.is_open(id), "a bad :s leaves the session open");
+    }
+
+    #[tokio::test]
     async fn command_line_text_rides_the_state() {
         // While typing the `:`-line, the pushed state carries it so a renderer
         // can draw the strip without tracking mode.

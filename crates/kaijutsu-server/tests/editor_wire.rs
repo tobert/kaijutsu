@@ -235,6 +235,39 @@ fn colon_commands_save_and_close_over_the_wire() {
 }
 
 #[test]
+fn colon_substitute_edits_the_block_over_the_wire() {
+    // Slice 3 step 2: `:s` is an edit that rides the existing `editorKeys` wire
+    // (keystrokes → EditOps → CRDT). Open a clean block, prepend a known marker
+    // so we have something deterministic to substitute, run `:s`, and read the
+    // result back over the wire.
+    run_local(async {
+        let addr = start_server().await;
+        let client = connect_client(addr).await;
+        let (kernel, _) = client.bind_kernel().await.unwrap();
+
+        let opened = kernel.editor_open(RC_PATH).await.unwrap();
+        let session = opened.session;
+        let original = opened.text.clone();
+
+        // Insert "AAA " at the start so the buffer begins with a known token.
+        let primed = kernel.editor_keys(session, "iAAA <Esc>").await.unwrap();
+        assert_eq!(primed.text, format!("AAA {original}"));
+
+        // Substitute the marker (first match on the current line).
+        let after = kernel.editor_keys(session, ":s/AAA/ZZZ/<CR>").await.unwrap();
+        assert!(after.text.starts_with("ZZZ "), "':s' replaced the marker: {:?}", &after.text[..8.min(after.text.len())]);
+        assert_eq!(after.command_line, None, "the bar closed after submit");
+
+        // editorState confirms the block holds the substitution over the wire.
+        let polled = kernel.editor_state(session).await.unwrap();
+        assert_eq!(polled.text, after.text, "block matches after :s");
+
+        // Discard so the seeded rc isn't left mutated (ephemeral server anyway).
+        kernel.editor_keys(session, ":q!<CR>").await.unwrap();
+    });
+}
+
+#[test]
 fn vi_over_the_shell_signals_the_app_peer_to_open_a_renderer() {
     // The `open_editor` peer signal (vi.md step 2): a human's `vi <path>` in the
     // app shell must nudge the submitter's app windows to pop a renderer. We

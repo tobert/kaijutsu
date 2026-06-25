@@ -623,7 +623,26 @@ contract as buffer/cursor today, no app mode tracking).
      and underlaps the floating strip — vim reserves the last row; we don't yet
      shrink the doc layout to do so. And the strip floats above the dock rather
      than integrating with its status row. Both are pass-2 cosmetics.
-2. `:s` / `:%s` (probe modalkit substitute first).
+2. ✅ **SHIPPED + RUNNER-VERIFIED (2026-06-25).** `:s` / `:%s` / `:N,Ms`.
+   **Probe outcome:** modalkit's `vim_cmd_substitute` is an explicit stub
+   (`"substitution is not yet implemented"`) — nothing to lean on, so hand-rolled.
+   **Dialect = Rust regex + Rust replacement syntax** (`$1` capture refs), a
+   deliberate choice over chasing vim's BRE flavor (the `:` line is its own
+   dialect, not vim-exact). `:s` is an **edit**, not a kernel `CommandRequest`: it
+   mutates the `EditorCore` buffer (`apply_substitution`) and rides the existing
+   diff→`EditOp`→CRDT-mirror path, so the kernel needs no new substitute logic.
+   - Range: none (cursor line), `%` (whole), `N` / `N,M` (1-indexed, clamped).
+     `.`/`$` symbolic ranges deferred.
+   - Flags: `g` (all-per-line, else first), `i` (case-insensitive). Unknown flag
+     → fail-loud error. Arbitrary delimiter (`:s#a#b#`); `\<delim>` escapes it.
+   - Fail-loud: invalid regex / empty pattern / unknown flag → `Err` (block
+     untouched, session open). `set_text` resets undo on a `:s` — pass-1 limitation
+     (a `:s` is a deliberate bulk edit), finer undo later.
+   - Tests: 22 unit (`tests::substitute`) + 4 kernel e2e (mirror / `:wq` persist /
+     `:q!` rollback / bad-pattern fail-loud) + 1 wire e2e. Live: `:s/MARKERWORD/
+     SUBSTITUTED/` rendered in the app; `:q!` restored the block.
+   - **Deferred:** bare `:s` (repeat-last) errors for now; `.`/`$` ranges;
+     `&`/`~` repeat; substitute undo granularity.
 3. `:!` (temp-file + nested editor — confronts the session-stack question) and
    `:r` / `:r !` (read-into-buffer).
 4. `:e` if/when wanted.

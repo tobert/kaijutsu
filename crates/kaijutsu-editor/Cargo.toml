@@ -9,3 +9,4 @@ description = "Pure vi editing engine (EditorCore) — modalkit-driven, no Bevy/
 [dependencies]
 modalkit = { workspace = true }
 editor-types = { workspace = true }
+regex = { workspace = true }
